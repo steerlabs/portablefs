@@ -15,6 +15,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"golang.org/x/sys/unix"
 )
@@ -25,8 +26,12 @@ type inodeKey struct {
 }
 
 type inodeRecord struct {
-	id        uint64
-	key       inodeKey
+	id  uint64
+	key inodeKey
+	// identity is the stable filesystem identity used for coherence. Kernel
+	// inode numbers remain an implementation detail of the FUSE tables; source
+	// publication gates never key correctness on a number the kernel may reuse.
+	identity  publicationIdentity
 	node      *node
 	lookups   uint64
 	inFlight  uint64
@@ -51,6 +56,76 @@ type inodeRecord struct {
 	// to one mutable path makes unlinking either alias strand the shared NodeID or,
 	// worse, route it into a later inode that reuses the old name.
 	aliases map[nameKey]*inodeRecord
+
+	// A LOCAL O_TMPFILE has no namespace alias before its first LINK. The live
+	// open description is the only honest source capability for linkat with
+	// AT_EMPTY_PATH; retaining it here lets graftLink perform that operation
+	// without inventing a path. The handle owns/ultimately closes the descriptor.
+	graftAnonymousFh   uint64
+	graftAnonymousRoot string
+}
+
+type replyNamePublication struct {
+	key        nameKey
+	stable     publicationNamespace
+	record     *inodeRecord
+	coordinate publicationCoordinate
+	reserved   bool
+}
+
+type replyAttrPublication struct {
+	inode      uint64
+	coordinate publicationCoordinate
+}
+
+// replyPublication is everything one kernel response can make cacheable or
+// must keep source-serialized. It is registered by request Unique before the
+// RawFileSystem method returns. Definite no-change replies settle after their
+// physical /dev/fuse write; state-bearing replies settle only after the
+// kernel's later post-VFS PFS_PUBLISH receipt is physically acknowledged.
+type replyPublication struct {
+	names         []replyNamePublication
+	attrs         []replyAttrPublication
+	source        *sourcePublicationLease
+	writeKernelTx uint64
+	// responseConsumptions prevent authority transport EOF from exposing the
+	// session terminal edge until every authority response contributing to this
+	// kernel result is either physically published through PFS_PUBLISH or
+	// fail-closed locally. One FUSE callback may require several bounded read or
+	// staged-write RPCs, so this is deliberately a collection rather than one
+	// token.
+	responseConsumptions []authorityrpc.ResponseConsumption
+
+	// Generic post-VFS publication receipt state, protected by
+	// rawFileSystem.mu. The original response write only signals
+	// originalDone. Cache/source ownership remains retained through the
+	// physical FUSE_PFS_PUBLISH acknowledgment.
+	requestUnique  uint64
+	nodeid         uint64
+	opcode         uint32
+	marked         bool
+	needsPostVFS   bool
+	originalDone   chan struct{}
+	originalWrote  bool
+	originalStatus fuse.Status
+	publicationID  uint64
+	publishUnique  uint64
+}
+
+func (p *replyPublication) empty() bool {
+	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && p.source == nil &&
+		p.writeKernelTx == 0 && len(p.responseConsumptions) == 0 && !p.needsPostVFS
+}
+
+func (p *replyPublication) consumeAuthorityResponse() {
+	if p == nil {
+		return
+	}
+	for _, consumption := range p.responseConsumptions {
+		if consumption != nil {
+			consumption.Consume()
+		}
+	}
 }
 
 // handleKind names which of the four open-object shapes a handle record holds.
@@ -74,6 +149,30 @@ type handleRecord struct {
 	inFlight  uint64
 	closing   bool
 	done      chan struct{}
+}
+
+type writeTransaction struct {
+	kernelTxid     uint64
+	authorityTxid  uint64
+	nodeID         uint64
+	handleID       uint64
+	handleRecord   *handleRecord
+	handle         *fileHandle
+	begun          bool
+	requestedSize  uint64
+	stagedSize     uint64
+	position       uint64
+	rlimitFsize    uint64
+	fileMaxSize    uint64
+	lockOwner      uint64
+	writeFlags     uint32
+	flags          uint32
+	committedSize  uint64
+	assignedOffset uint64
+	postSize       uint64
+	sequence       uint64
+	lease          *sourcePublicationLease
+	commitResolved bool
 }
 
 func (h *handleRecord) is(kind handleKind) bool {
@@ -105,11 +204,17 @@ type rawFileSystem struct {
 	maxRead        uint32
 	maxWrite       uint32
 
-	// profile and the two lifetimes are the cache contract this mount attached
-	// with. An uncached mount publishes zero lifetimes and keeps no registry,
-	// which is what makes that profile a genuine deployment choice rather than
-	// a disabled version of the strict one.
-	profile      CoherenceProfile
+	// writeBeginMu linearizes the mapping from connection-local kernel txids
+	// to the session-monotonic transaction sequence the authority retains for
+	// bounded replay. BEGIN dispatch order is therefore deterministic even when
+	// kernel callbacks arrive concurrently.
+	writeBeginMu sync.Mutex
+	writeMu      sync.Mutex
+	nextWriteTx  uint64
+	writeTx      map[uint64]*writeTransaction
+
+	// The two lifetimes are the single protocol-5 cache contract. Every mount
+	// owns the corresponding repair registry and visibility participation.
 	entryTimeout time.Duration
 	attrTimeout  time.Duration
 	nameCapacity int
@@ -143,7 +248,9 @@ type rawFileSystem struct {
 	// frontend has published to its kernel with a nonzero lifetime. It is what
 	// makes a repair precise: a binding that was never cached needs no
 	// notification, and one that was must get one.
-	cachedNames map[nameKey]*inodeRecord
+	cachedNames       map[nameKey]*inodeRecord
+	cachedStableNames map[publicationNamespace]*inodeRecord
+	cachedNameStable  map[nameKey]publicationNamespace
 	// heldNames and heldInodes are closed to cache admission between PREPARE
 	// and COMPLETE. heldPhase is the exact set the current PREPARE installed,
 	// because COMPLETE's target set is allowed to differ from PREPARE's.
@@ -154,9 +261,24 @@ type rawFileSystem struct {
 	// admitted to the cache and have not finished being written. PREPARE waits
 	// them out so that no entry decided before admission closed can be
 	// installed after COMPLETE has repaired.
-	publishingNames  map[nameKey]int
-	publishingInodes map[uint64]int
-	published        chan struct{}
+	publishingNames     map[nameKey]int
+	publishingInodes    map[uint64]int
+	pendingNames        int
+	published           chan struct{}
+	replyPublications   map[uint64]*replyPublication
+	publishAcks         map[uint64]*replyPublication
+	replyLifecycleArmed bool
+
+	// Source-owned gates close publication before the mutation gets a replay
+	// identity or can put bytes on the wire. Unlike peer visibility state, these
+	// maps are keyed only by stable filesystem identities and exact names.
+	sourceHolds                map[publicationCoordinate]*sourcePublicationLease
+	sourcePublishing           map[publicationCoordinate]int
+	peerHolds                  map[publicationCoordinate]int
+	sourceUnresolvedAttributes map[*sourcePublicationLease]int
+	sourceUnresolvedData       map[*sourcePublicationLease]int
+	peerHeldPhase              []publicationCoordinate
+	sourceChanged              chan struct{}
 
 	// parked is the set of directories whose kernel i_rwsem this mount is
 	// holding for an authority mutation that has not been answered yet.
@@ -178,17 +300,20 @@ type rawFileSystem struct {
 }
 
 var _ fuse.RawFileSystem = (*rawFileSystem)(nil)
+var _ fuse.ReplyWriteLifecycle = (*rawFileSystem)(nil)
 
 func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 	key := itemKey(root.item)
-	record := &inodeRecord{id: fuse.FUSE_ROOT_ID, key: key, node: root, root: true}
+	identity, _ := publicationIdentityFromItem(root.item)
+	record := &inodeRecord{id: fuse.FUSE_ROOT_ID, key: key, identity: identity, node: root, root: true}
 	r := &rawFileSystem{
 		RawFileSystem:  fuse.NewDefaultRawFileSystem(),
 		mount:          mount,
 		requestTimeout: root.requestTimeout,
 		maxRead:        root.maxRead,
 		maxWrite:       root.maxWrite,
-		profile:        mount.profile,
+		entryTimeout:   strictEntryTimeout,
+		attrTimeout:    strictAttrTimeout,
 		nameCapacity:   mount.nameCapacity,
 		grafts:         mount.grafts,
 		backing:        mount.backing,
@@ -200,17 +325,26 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		nextHandle:     1,
 		handles:        make(map[uint64]*handleRecord),
 
-		cachedNames:      make(map[nameKey]*inodeRecord),
-		heldNames:        make(map[nameKey]struct{}),
-		heldInodes:       make(map[uint64]struct{}),
-		parked:           make(map[*inodeRecord]int),
-		repairingParents: make(map[uint64]int),
-		publishingNames:  make(map[nameKey]int),
-		publishingInodes: make(map[uint64]int),
-		published:        make(chan struct{}),
-	}
-	if r.profile == CoherenceStrict {
-		r.entryTimeout, r.attrTimeout = strictEntryTimeout, strictAttrTimeout
+		cachedNames:                make(map[nameKey]*inodeRecord),
+		cachedStableNames:          make(map[publicationNamespace]*inodeRecord),
+		cachedNameStable:           make(map[nameKey]publicationNamespace),
+		heldNames:                  make(map[nameKey]struct{}),
+		heldInodes:                 make(map[uint64]struct{}),
+		parked:                     make(map[*inodeRecord]int),
+		repairingParents:           make(map[uint64]int),
+		publishingNames:            make(map[nameKey]int),
+		publishingInodes:           make(map[uint64]int),
+		published:                  make(chan struct{}),
+		replyPublications:          make(map[uint64]*replyPublication),
+		publishAcks:                make(map[uint64]*replyPublication),
+		nextWriteTx:                1,
+		writeTx:                    make(map[uint64]*writeTransaction),
+		sourceHolds:                make(map[publicationCoordinate]*sourcePublicationLease),
+		sourcePublishing:           make(map[publicationCoordinate]int),
+		peerHolds:                  make(map[publicationCoordinate]int),
+		sourceUnresolvedAttributes: make(map[*sourcePublicationLease]int),
+		sourceUnresolvedData:       make(map[*sourcePublicationLease]int),
+		sourceChanged:              make(chan struct{}),
 	}
 	mount.raw = r
 	return r
@@ -252,97 +386,354 @@ func (r *rawFileSystem) dropCachedNameLocked(key nameKey) {
 		return
 	}
 	delete(r.cachedNames, key)
+	if stable, exists := r.cachedNameStable[key]; exists {
+		if r.cachedStableNames[stable] == record {
+			delete(r.cachedStableNames, stable)
+		}
+		delete(r.cachedNameStable, key)
+	}
 	delete(record.names, key)
+}
+
+func (r *rawFileSystem) bindCachedNameLocked(key nameKey, stable publicationNamespace, record *inodeRecord) {
+	if record == nil {
+		return
+	}
+	// Publication admission reserved capacity before the reply write. Replace
+	// an earlier binding only after the new reply has physically reached the
+	// kernel, preserving the old repair obligation if that write fails.
+	r.dropCachedNameLocked(key)
+	if record.names == nil {
+		record.names = make(map[nameKey]struct{})
+	}
+	r.cachedNames[key] = record
+	r.cachedStableNames[stable] = record
+	r.cachedNameStable[key] = stable
+	record.names[key] = struct{}{}
 }
 
 // admitNameLocked decides the lifetime one directory binding is published with
 // and records the binding when it is cacheable. Uncacheable is always a legal
 // answer: it costs a later LOOKUP and can never be wrong.
-func (r *rawFileSystem) admitNameLocked(parent uint64, name string, record *inodeRecord) (time.Duration, nameKey, bool) {
-	key := nameKey{parent: parent, name: name}
-	if r.profile != CoherenceStrict || record == nil {
-		return 0, key, false
+func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord, name string, record *inodeRecord) (time.Duration, replyNamePublication, bool) {
+	key := nameKey{parent: parent.key.inode, name: name}
+	stable := publicationNamespace{parent: parent.identity, name: name}
+	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: name}
+	publication := replyNamePublication{key: key, stable: stable, record: record, coordinate: coordinate}
+	if record == nil {
+		return 0, publication, false
 	}
 	if _, held := r.heldNames[key]; held {
-		return 0, key, false
+		return 0, publication, false
 	}
 	if _, held := r.heldInodes[record.key.inode]; held {
-		return 0, key, false
+		return 0, publication, false
 	}
-	if _, already := r.cachedNames[key]; !already && len(r.cachedNames) >= r.nameCapacity {
+	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
+		return 0, publication, false
+	}
+	_, already := r.cachedNames[key]
+	if !already && len(r.cachedNames)+r.pendingNames >= r.nameCapacity {
 		// The declared capacity is a promise about how much state this mount
 		// can withdraw, so it is a hard bound. Beyond it the frontend keeps
-		// answering, uncached.
-		return 0, key, false
+		// answering with a zero lifetime.
+		return 0, publication, false
 	}
-	if record.names == nil {
-		record.names = make(map[nameKey]struct{})
+	publication.reserved = !already
+	if publication.reserved {
+		r.pendingNames++
 	}
-	r.cachedNames[key] = record
-	record.names[key] = struct{}{}
 	r.publishingNames[key]++
-	return r.entryTimeout, key, true
+	r.admitSourcePublicationLocked(coordinate)
+	return r.entryTimeout, publication, true
 }
 
-func (r *rawFileSystem) admitAttrLocked(inode uint64) (time.Duration, bool) {
-	if r.profile != CoherenceStrict {
-		return 0, false
-	}
+func (r *rawFileSystem) admitAttrLocked(ctx context.Context, inode uint64, identity publicationIdentity) (time.Duration, publicationCoordinate, bool) {
+	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
 	if _, held := r.heldInodes[inode]; held {
-		return 0, false
+		return 0, coordinate, false
+	}
+	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
+		return 0, coordinate, false
 	}
 	r.publishingInodes[inode]++
-	return r.attrTimeout, true
+	r.admitSourcePublicationLocked(coordinate)
+	return r.attrTimeout, coordinate, true
 }
 
 // settle ends one admitted publication. PREPARE's drain is waiting on exactly
 // this transition, so the wakeup happens under the same lock that decides it.
-func (r *rawFileSystem) settle(key nameKey, name bool, inode uint64, attr bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if name {
-		if r.publishingNames[key]--; r.publishingNames[key] <= 0 {
-			delete(r.publishingNames, key)
-		}
-	}
-	if attr {
-		if r.publishingInodes[inode]--; r.publishingInodes[inode] <= 0 {
-			delete(r.publishingInodes, inode)
-		}
-	}
-	close(r.published)
-	r.published = make(chan struct{})
-}
-
 // publishEntry hands one directory entry to the kernel with the lifetime this
 // mount's cache contract allows for it.
-func (r *rawFileSystem) publishEntry(out *fuse.EntryOut, parent uint64, name string, record *inodeRecord, attr *authoritypb.Attr) {
+func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, parent *inodeRecord, name string, record *inodeRecord, attr *authoritypb.Attr) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		return errors.New("fusev3: entry result escaped its post-VFS reply-publication lifecycle")
+	}
+	// Even a zero-lifetime reply is installed transiently by fuse_iget/d_add
+	// after the daemon response wakes the requester. It therefore needs the
+	// generic post-VFS receipt even when it creates no durable cache obligation.
+	publication.needsPostVFS = true
+	if owner := sourceLeaseFromContext(ctx); owner != nil {
+		if err := owner.attachBinding(ctx, publicationNamespace{parent: parent.identity, name: name}, record.identity); err != nil {
+			return err
+		}
+	}
 	r.mu.Lock()
-	entry, key, cachedName := r.admitNameLocked(parent, name, record)
+	entry, namePublication, cachedName := r.admitNameLocked(ctx, parent, name, record)
 	inode := attr.GetInode()
 	attrLifetime := time.Duration(0)
+	var attrCoordinate publicationCoordinate
 	cachedAttr := false
 	if cachedName {
-		attrLifetime, cachedAttr = r.admitAttrLocked(inode)
+		attrLifetime, attrCoordinate, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
 	}
 	r.mu.Unlock()
+	if cachedName {
+		publication.names = append(publication.names, namePublication)
+	}
+	if cachedAttr {
+		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, coordinate: attrCoordinate})
+	}
 	out.NodeId = record.id
 	out.Generation = 1
 	out.SetEntryTimeout(entry)
 	out.SetAttrTimeout(attrLifetime)
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
-	if cachedName || cachedAttr {
-		r.settle(key, cachedName, inode, cachedAttr)
+	return nil
+}
+
+// publishAnonymousEntry publishes the inode/attribute half of TMPFILE without
+// inventing a namespace binding. Even an attr lifetime of zero still updates
+// kernel inode state after the reply wakes the requester, so SHARED results
+// retain the same generic post-VFS receipt as every other state-bearing reply.
+func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.EntryOut, record *inodeRecord, attr *authoritypb.Attr) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || record == nil || attr == nil {
+		return errors.New("fusev3: anonymous entry escaped its post-VFS reply-publication lifecycle")
 	}
+	publication.needsPostVFS = true
+	r.mu.Lock()
+	lifetime, coordinate, cached := r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
+	r.mu.Unlock()
+	if cached {
+		publication.attrs = append(publication.attrs, replyAttrPublication{inode: attr.GetInode(), coordinate: coordinate})
+	}
+	out.NodeId, out.Generation = record.id, 1
+	out.SetEntryTimeout(0)
+	out.SetAttrTimeout(lifetime)
+	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	return nil
+}
+
+func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublication, successful bool) {
+	if publication.reserved && r.pendingNames > 0 {
+		r.pendingNames--
+	}
+	if successful {
+		r.bindCachedNameLocked(publication.key, publication.stable, publication.record)
+	}
+	if r.publishingNames[publication.key]--; r.publishingNames[publication.key] <= 0 {
+		delete(r.publishingNames, publication.key)
+	}
+	r.settleSourcePublicationLocked(publication.coordinate)
+}
+
+func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublication) {
+	if r.publishingInodes[publication.inode]--; r.publishingInodes[publication.inode] <= 0 {
+		delete(r.publishingInodes, publication.inode)
+	}
+	r.settleSourcePublicationLocked(publication.coordinate)
+}
+
+func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) {
+	for _, name := range publication.names {
+		r.settleNamePublicationLocked(name, successful)
+	}
+	for _, attr := range publication.attrs {
+		r.settleAttrPublicationLocked(attr)
+	}
+	if len(publication.names) != 0 || len(publication.attrs) != 0 {
+		close(r.published)
+		r.published = make(chan struct{})
+	}
+}
+
+func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *replyPublication) error {
+	if unique == 0 || unique >= fuse.PFS_UNIQUE_PUBLISH || unique&1 != 0 {
+		return fmt.Errorf("fusev3: a publication-capable FUSE callback has invalid request identity %#x", unique)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.replyPublications[unique] != nil || r.publishAcks[unique] != nil {
+		return fmt.Errorf("fusev3: FUSE request identity %d registered publication twice", unique)
+	}
+	publication.requestUnique = unique
+	publication.originalDone = make(chan struct{})
+	r.replyPublications[unique] = publication
+	return nil
+}
+
+func (r *rawFileSystem) finishReplyPublicationRegistration(unique uint64, publication *replyPublication) {
+	r.mu.Lock()
+	if r.replyPublications[unique] != publication {
+		r.mu.Unlock()
+		r.mount.revoke(fmt.Errorf("fusev3: FUSE request identity %d lost its reserved reply-publication ownership", unique))
+		return
+	}
+	if publication.empty() {
+		delete(r.replyPublications, unique)
+	}
+	r.mu.Unlock()
+}
+
+// ReplyWriteOrdered joins cache/source-bearing replies to go-fuse's ordered
+// writer boundary. A definite no-change source reply needs only the physical
+// boundary; a state-bearing reply additionally opts into PFS_PUBLISH below.
+func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.replyPublications[unique] != nil || r.publishAcks[unique] != nil
+}
+
+// ReplyPublishMarked freezes a state-bearing original kernel request identity
+// immediately before go-fuse writes its response. Definite no-change replies
+// deliberately return false: there is no kernel state to publish. The patched
+// kernel echoes marked identities in PFS_PUBLISH after real VFS postprocessing.
+func (r *rawFileSystem) ReplyPublishMarked(unique uint64, nodeid uint64, opcode uint32) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.publishAcks[unique] != nil {
+		return false
+	}
+	publication := r.replyPublications[unique]
+	if publication == nil || publication.empty() || !publication.needsPostVFS {
+		return false
+	}
+	if publication.marked || nodeid == 0 || opcode == 0 {
+		return false
+	}
+	publication.nodeid, publication.opcode, publication.marked = nodeid, opcode, true
+	return true
+}
+
+// ReplyWritten is called by the maintained go-fuse fork only after the real
+// /dev/fuse write attempt and after its ordering mutex has been released.
+func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
+	r.mu.Lock()
+	if publication := r.publishAcks[unique]; publication != nil {
+		delete(r.publishAcks, unique)
+		if publication.publishUnique != unique || r.replyPublications[publication.requestUnique] != publication {
+			r.mu.Unlock()
+			if publication.source != nil {
+				publication.source.revoke()
+			}
+			r.mount.revoke(fmt.Errorf("fusev3: PFS_PUBLISH reply %d lost retained ownership", unique))
+			publication.consumeAuthorityResponse()
+			return
+		}
+		delete(r.replyPublications, publication.requestUnique)
+		r.settleReplyPublicationLocked(publication, status.Ok())
+		r.mu.Unlock()
+		if !status.Ok() {
+			if publication.source != nil {
+				publication.source.revoke()
+			}
+			if !r.mount.replyWriteLostAfterObservedUnmount(status) {
+				r.mount.revoke(fmt.Errorf("fusev3: write PFS_PUBLISH acknowledgment %d: %v", unique, status))
+			}
+			publication.consumeAuthorityResponse()
+			return
+		}
+		r.finishWriteTransactionPublication(publication, unique)
+		if publication.source != nil {
+			publication.source.release()
+		}
+		publication.consumeAuthorityResponse()
+		return
+	}
+	publication := r.replyPublications[unique]
+	if publication == nil || publication.originalWrote || publication.needsPostVFS && !publication.marked || !publication.needsPostVFS && publication.marked {
+		r.mu.Unlock()
+		r.mount.revoke(fmt.Errorf("fusev3: ordered FUSE reply %d lost its publication ownership", unique))
+		return
+	}
+	publication.originalWrote = true
+	publication.originalStatus = status
+	close(publication.originalDone)
+	if !status.Ok() {
+		delete(r.replyPublications, unique)
+		if publication.publishUnique != 0 && r.publishAcks[publication.publishUnique] == publication {
+			delete(r.publishAcks, publication.publishUnique)
+		}
+		r.settleReplyPublicationLocked(publication, false)
+		r.mu.Unlock()
+		if publication.source != nil {
+			publication.source.revoke()
+		}
+		if !r.mount.replyWriteLostAfterObservedUnmount(status) {
+			r.mount.revoke(fmt.Errorf("fusev3: publish FUSE reply %d to the kernel: %v", unique, status))
+		}
+		publication.consumeAuthorityResponse()
+		return
+	}
+	if !publication.needsPostVFS {
+		delete(r.replyPublications, unique)
+		r.settleReplyPublicationLocked(publication, true)
+		r.mu.Unlock()
+		r.finishWriteTransactionPublication(publication, unique)
+		if publication.source != nil {
+			publication.source.release()
+		}
+		publication.consumeAuthorityResponse()
+		return
+	}
+	r.mu.Unlock()
+}
+
+func (r *rawFileSystem) finishWriteTransactionPublication(publication *replyPublication, unique uint64) {
+	if publication == nil || publication.writeKernelTx == 0 {
+		return
+	}
+	r.writeMu.Lock()
+	tx := r.writeTx[publication.writeKernelTx]
+	if tx == nil || tx.lease != publication.source || !tx.commitResolved {
+		r.writeMu.Unlock()
+		if publication.source != nil {
+			publication.source.revoke()
+		}
+		r.mount.revoke(fmt.Errorf("fusev3: write publication %d lost transaction ownership", unique))
+		return
+	}
+	delete(r.writeTx, publication.writeKernelTx)
+	r.writeMu.Unlock()
+	r.releaseHandleOperation(tx.handleRecord)
+}
+
+func (r *rawFileSystem) Init(server *fuse.Server) {
+	armed := server != nil && server.ReplyWriteLifecycleArmed()
+	r.mu.Lock()
+	r.replyLifecycleArmed = armed
+	r.mu.Unlock()
+	if !armed {
+		r.mount.revoked.Store(true)
+		r.mount.recordFatalCause(errors.New("fusev3: strict cache publication requires the post-/dev/fuse-reply lifecycle"))
+		if r.mount.cancel != nil {
+			r.mount.cancel()
+		}
+	}
+}
+
+func (r *rawFileSystem) replyLifecycleReady() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.replyLifecycleArmed
 }
 
 // unbindSelf records that this mount's own namespace mutation removed a
 // binding. The VFS drops the dentry from the same operation's reply, so there
 // is nothing left for a later repair to invalidate.
 func (r *rawFileSystem) unbindSelf(parent uint64, name string) {
-	if r.profile != CoherenceStrict {
-		return
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.dropCachedNameLocked(nameKey{parent: parent, name: name})
@@ -350,29 +741,16 @@ func (r *rawFileSystem) unbindSelf(parent uint64, name string) {
 
 // moveSelf follows a rename. The kernel moves the dentry, keeping the lifetime
 // it was published with, so the binding is still cached -- under its new name.
-func (r *rawFileSystem) moveSelf(oldParent uint64, oldName string, newParent uint64, newName string, exchange bool) {
-	if r.profile != CoherenceStrict {
-		return
-	}
+func (r *rawFileSystem) moveSelf(oldParent *inodeRecord, oldName string, newParent *inodeRecord, newName string, exchange bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	from, to := nameKey{parent: oldParent, name: oldName}, nameKey{parent: newParent, name: newName}
+	from, to := nameKey{parent: oldParent.key.inode, name: oldName}, nameKey{parent: newParent.key.inode, name: newName}
 	moved, replaced := r.cachedNames[from], r.cachedNames[to]
 	r.dropCachedNameLocked(from)
 	r.dropCachedNameLocked(to)
-	bind := func(key nameKey, record *inodeRecord) {
-		if record == nil || len(r.cachedNames) >= r.nameCapacity {
-			return
-		}
-		if record.names == nil {
-			record.names = make(map[nameKey]struct{})
-		}
-		r.cachedNames[key] = record
-		record.names[key] = struct{}{}
-	}
-	bind(to, moved)
+	r.bindCachedNameLocked(to, publicationNamespace{parent: newParent.identity, name: newName}, moved)
 	if exchange {
-		bind(from, replaced)
+		r.bindCachedNameLocked(from, publicationNamespace{parent: oldParent.identity, name: oldName}, replaced)
 	}
 }
 
@@ -381,7 +759,7 @@ func itemKey(item *authoritypb.Item) inodeKey {
 }
 
 func validItem(item *authoritypb.Item) bool {
-	return item != nil && item.GetAttr() != nil && item.GetAttr().GetInode() != 0 && len(item.GetToken()) != 0
+	return item != nil && item.GetAttr() != nil && item.GetAttr().GetInode() != 0 && len(item.GetToken()) != 0 && len(item.GetStableIdentity()) == len(publicationIdentity{})
 }
 
 func (r *rawFileSystem) newNode(item *authoritypb.Item) *node {
@@ -401,6 +779,10 @@ func (r *rawFileSystem) intern(ctx context.Context, item *authoritypb.Item) (*in
 	if !validItem(item) {
 		return nil, syscall.EIO
 	}
+	identity, ok := publicationIdentityFromItem(item)
+	if !ok {
+		return nil, syscall.EIO
+	}
 	// Admission is bounded by the same deadline as any other authority round
 	// trip, so a stalled cleanup lane slows lookups and then reports a timeout;
 	// it can never leave a process blocked in the kernel indefinitely.
@@ -413,6 +795,11 @@ func (r *rawFileSystem) intern(ctx context.Context, item *authoritypb.Item) (*in
 	key := itemKey(item)
 	r.mu.Lock()
 	if existing := r.nodesByKey[key]; existing != nil {
+		if existing.identity != identity {
+			r.mu.Unlock()
+			r.mount.abortAsync()
+			return nil, syscall.EIO
+		}
 		if existing.lookups == math.MaxUint64 {
 			r.mu.Unlock()
 			r.mount.abortAsync()
@@ -433,7 +820,7 @@ func (r *rawFileSystem) intern(ctx context.Context, item *authoritypb.Item) (*in
 	}
 	id := r.nextNodeID
 	r.nextNodeID++
-	record := &inodeRecord{id: id, key: key, node: r.newNode(item), lookups: 1}
+	record := &inodeRecord{id: id, key: key, identity: identity, node: r.newNode(item), lookups: 1}
 	r.nodesByID[id] = record
 	r.nodesByKey[key] = record
 	r.mu.Unlock()
@@ -523,7 +910,7 @@ func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
 	// they occupied is free again. No timer or estimate is involved.
 	for key := range record.names {
 		if r.cachedNames[key] == record {
-			delete(r.cachedNames, key)
+			r.dropCachedNameLocked(key)
 		}
 	}
 	record.names = nil
@@ -591,9 +978,6 @@ func (r *rawFileSystem) signalParkedLocked() {
 // It is linearized with COMPLETE arming repairingParents by r.mu; that single
 // order is the liveness property, not timing or the repair-budget watchdog.
 func (r *rawFileSystem) enterParentExclusive(records ...*inodeRecord) (func(), syscall.Errno) {
-	if r.profile != CoherenceStrict {
-		return func() {}, 0
-	}
 	r.mu.Lock()
 	for _, record := range records {
 		if record != nil && r.repairingParents[record.key.inode] != 0 {
@@ -750,18 +1134,49 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	defer r.release(parent)
 	if r.grafts != nil {
 		if handled, status := r.graftLookup(parent, name, out); handled {
+			// A missing route name directly below an authority directory is a
+			// negative result in that SHARED parent. The returned child class
+			// selects positive LOOKUP publication, but ENOENT has no child attr,
+			// so its class is necessarily the parent's. A miss below an already
+			// LOCAL graft directory remains entirely local and unmarked.
+			if status == fuse.Status(syscall.ENOENT) && !parent.graft {
+				ctx, finish, lifecycle := r.mutationContext(header.Unique)
+				if !lifecycle.Ok() {
+					return lifecycle
+				}
+				publication := replyPublicationFromContext(ctx)
+				if publication == nil {
+					finish()
+					r.mount.revoke(errors.New("fusev3: negative graft-root lookup escaped its post-VFS reply-publication lifecycle"))
+					return fuse.Status(syscall.ENOTCONN)
+				}
+				publication.needsPostVFS = true
+				finish()
+			}
 			return status
 		}
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	item, errno := parent.node.Lookup(ctx, name)
 	if errno != 0 {
-		// A negative result is never cached. The authority emits a namespace
-		// event when a name comes into existence, but a cached negative dentry
-		// is state this frontend would have to repair for a name it has no
-		// record of, so it is simply never created.
+		// A strict shared ENOENT is still a kernel-visible publication:
+		// d_lookup_done installs the negative lookup result after this response
+		// wakes the requester, even with a zero lifetime. Retain its ordering
+		// record until the generic post-VFS receipt. Other errors describe no
+		// namespace fact and remain ordinary unmarked replies.
 		out.SetEntryTimeout(0)
+		if errno == syscall.ENOENT {
+			publication := replyPublicationFromContext(ctx)
+			if publication == nil {
+				r.mount.revoke(errors.New("fusev3: negative lookup escaped its post-VFS reply-publication lifecycle"))
+				return fuse.Status(syscall.ENOTCONN)
+			}
+			publication.needsPostVFS = true
+		}
 		return fuse.Status(errno)
 	}
 	record, errno := r.intern(ctx, item)
@@ -769,7 +1184,10 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 		return fuse.Status(errno)
 	}
 	r.bindPath(record, parent, name)
-	r.publishEntry(out, parent.key.inode, name, record, item.GetAttr())
+	if err := r.publishEntry(ctx, out, parent, name, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -819,7 +1237,12 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 			return fuse.EBADF
 		}
 	}
-	return fuse.Status(record.node.Getattr(r.opContext(), handle, out))
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	return fuse.Status(record.node.Getattr(ctx, handle, out))
 }
 
 func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
@@ -851,9 +1274,19 @@ func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *f
 			return fuse.EBADF
 		}
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
-	return fuse.Status(record.node.Setattr(ctx, handle, input, out))
+	if errno := record.node.Setattr(ctx, handle, input, out); errno != 0 {
+		return fuse.Status(errno)
+	}
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	return fuse.OK
 }
 
 func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
@@ -875,7 +1308,10 @@ func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 		out.Fh, out.OpenFlags = id, flags
 		return fuse.OK
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	handle, flags, errno := record.node.Open(ctx, input.Flags)
 	if errno != 0 {
@@ -887,6 +1323,10 @@ func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 		return fuse.EIO
 	}
 	out.Fh, out.OpenFlags = id, flags
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -923,7 +1363,12 @@ func (r *rawFileSystem) Read(_ <-chan struct{}, input *fuse.ReadIn, buf []byte) 
 		return nil, fuse.EBADF
 	}
 	defer r.releaseHandleOperation(handleRecord)
-	result, errno := handle.node.Read(r.opContext(), handle, buf, int64(input.Offset))
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return nil, lifecycle
+	}
+	defer finish()
+	result, errno := handle.node.Read(ctx, handle, buf, int64(input.Offset))
 	return result, fuse.Status(errno)
 }
 
@@ -945,11 +1390,9 @@ func (r *rawFileSystem) Write(_ <-chan struct{}, input *fuse.WriteIn, data []byt
 	if handle == nil {
 		return 0, fuse.EBADF
 	}
-	defer r.releaseHandleOperation(handleRecord)
-	ctx, finish := r.mutationContext()
-	defer finish()
-	written, errno := handle.node.Write(ctx, handle, data, int64(input.Offset))
-	return written, fuse.Status(errno)
+	r.releaseHandleOperation(handleRecord)
+	r.mount.revoke(errors.New("fusev3: kernel sent stock FUSE_WRITE for a SHARED handle under strict coherence"))
+	return 0, fuse.Status(syscall.ENOTCONN)
 }
 
 func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Status {
@@ -968,7 +1411,12 @@ func (r *rawFileSystem) Flush(_ <-chan struct{}, input *fuse.FlushIn) fuse.Statu
 		return fuse.EBADF
 	}
 	defer r.releaseHandleOperation(handleRecord)
-	return fuse.Status(handle.node.Flush(r.opContext(), handle, input.LockOwner))
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	return fuse.Status(handle.node.Flush(ctx, handle, input.LockOwner))
 }
 
 func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
@@ -986,7 +1434,12 @@ func (r *rawFileSystem) Fsync(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Statu
 		return fuse.EBADF
 	}
 	defer r.releaseHandleOperation(handleRecord)
-	return fuse.Status(handle.node.Fsync(r.opContext(), handle, input.FsyncFlags))
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	return fuse.Status(handle.node.Fsync(ctx, handle, input.FsyncFlags))
 }
 
 func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
@@ -1005,7 +1458,10 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 	if !ok {
 		return
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return
+	}
 	defer finish()
 	// RELEASE has no reply, so the kernel has already forgotten this file
 	// description. Discarding a failed close here would leave the authority
@@ -1049,7 +1505,10 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 		return fuse.Status(errno)
 	}
 	defer leave()
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	item, handle, flags, errno := parent.node.Create(ctx, name, input.Flags, input.Mode)
 	if errno != 0 {
@@ -1068,7 +1527,90 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 		return fuse.EIO
 	}
 	r.bindPath(record, parent, name)
-	r.publishEntry(&out.EntryOut, parent.key.inode, name, record, item.GetAttr())
+	if err := r.publishEntry(ctx, &out.EntryOut, parent, name, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	out.Fh, out.OpenFlags = id, flags
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	return fuse.OK
+}
+
+func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
+	if name != "/" {
+		r.mount.revoke(fmt.Errorf("fusev3: TMPFILE carried noncanonical slash name %q", name))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	parent := r.acquire(input.NodeId)
+	if parent == nil {
+		return fuse.Status(syscall.ESTALE)
+	}
+	defer r.release(parent)
+	if parent.key.kind != authoritypb.Attr_DIRECTORY {
+		return fuse.Status(syscall.ENOTDIR)
+	}
+	if parent.graft {
+		path, ok := r.path(parent)
+		if !ok {
+			return fuse.Status(syscall.ESTALE)
+		}
+		fd, errno := r.grafts.Tmpfile(path, input.Flags, input.Mode)
+		if errno != 0 {
+			return fuse.Status(errno)
+		}
+		var st syscall.Stat_t
+		if err := syscall.Fstat(fd, &st); err != nil {
+			_ = unix.Close(fd)
+			return fuse.Status(errnoOfError(err))
+		}
+		record, errno := r.internGraft(parent, "", &st)
+		if errno != 0 {
+			_ = unix.Close(fd)
+			return fuse.Status(errno)
+		}
+		handle := &graftHandle{fd: fd}
+		id, ok := r.addHandle(record, &handleRecord{graftFile: handle})
+		if !ok {
+			_ = handle.close()
+			r.Forget(record.id, 1)
+			return fuse.EIO
+		}
+		r.mu.Lock()
+		record.graftAnonymousFh, record.graftAnonymousRoot = id, r.grafts.Owner(path)
+		r.mu.Unlock()
+		r.publishGraftEntry(&out.EntryOut, record, &st)
+		out.Fh, out.OpenFlags = id, fuse.FOPEN_KEEP_CACHE|fuse.FOPEN_PFS_LOCAL
+		return fuse.OK
+	}
+
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	item, handle, flags, errno := parent.node.Tmpfile(ctx, input.Flags, input.Mode)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	record, errno := r.intern(ctx, item)
+	if errno != 0 {
+		r.closeOrphanedFile(ctx, handle)
+		return fuse.Status(errno)
+	}
+	handle.node = record.node
+	id, ok := r.addHandle(record, &handleRecord{file: handle})
+	if !ok {
+		r.Forget(record.id, 1)
+		r.closeOrphanedFile(ctx, handle)
+		return fuse.EIO
+	}
+	if err := r.publishAnonymousEntry(ctx, &out.EntryOut, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	out.Fh, out.OpenFlags = id, flags
 	return fuse.OK
 }
@@ -1116,7 +1658,10 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 		return fuse.Status(errno)
 	}
 	defer leave()
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	item, errno := parent.node.Mknod(ctx, name, input.Mode, input.Rdev)
 	if errno != 0 {
@@ -1127,7 +1672,14 @@ func (r *rawFileSystem) Mknod(_ <-chan struct{}, input *fuse.MknodIn, name strin
 		return fuse.Status(errno)
 	}
 	r.bindPath(record, parent, name)
-	r.publishEntry(out, parent.key.inode, name, record, item.GetAttr())
+	if err := r.publishEntry(ctx, out, parent, name, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -1158,7 +1710,10 @@ func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name strin
 		return fuse.Status(errno)
 	}
 	defer leave()
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	item, errno := parent.node.Mkdir(ctx, name, input.Mode)
 	if errno != 0 {
@@ -1169,7 +1724,14 @@ func (r *rawFileSystem) Mkdir(_ <-chan struct{}, input *fuse.MkdirIn, name strin
 		return fuse.Status(errno)
 	}
 	r.bindPath(record, parent, name)
-	r.publishEntry(out, parent.key.inode, name, record, item.GetAttr())
+	if err := r.publishEntry(ctx, out, parent, name, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -1208,7 +1770,10 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 		return fuse.Status(admissionErr)
 	}
 	defer leave()
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	var errno syscall.Errno
 	if directory {
@@ -1223,6 +1788,10 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 		// because the notification would need the same lock this syscall holds.
 		r.unbindSelf(parent.key.inode, name)
 		r.unbindPath(parent, name)
+		if err := completeSourcePublication(ctx); err != nil {
+			r.mount.revoke(err)
+			return fuse.Status(syscall.ENOTCONN)
+		}
 	}
 	return fuse.Status(errno)
 }
@@ -1271,20 +1840,32 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 		return fuse.Status(admissionErr)
 	}
 	defer leave()
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
-	errno := oldParent.node.Rename(ctx, oldName, newParent.node, newName, input.Flags)
+	oldRemains, errno := oldParent.node.Rename(ctx, oldName, newParent.node, newName, input.Flags)
 	if errno == 0 {
 		// The route set is a pure function of the declaration, so a rename that
 		// was allowed to happen changed no routing and there is nothing to
 		// remap. What does change is where the moved directory IS, and every
 		// later routing decision under it is made from that.
-		r.rebindRenamed(oldParent, oldName, newParent, newName, input.Flags&renameExchange != 0)
+		exchange := input.Flags&renameExchange != 0
+		if exchange || !oldRemains {
+			r.rebindRenamed(oldParent, oldName, newParent, newName, exchange)
+		}
 		// d_move carries the dentry, and the lifetime it was published with, to
 		// the new name. The binding is still cached; it is cached somewhere
 		// else, and the registry has to say so or a later remote change to the
 		// new name would go unrepaired.
-		r.moveSelf(oldParent.key.inode, oldName, newParent.key.inode, newName, input.Flags&renameExchange != 0)
+		if exchange || !oldRemains {
+			r.moveSelf(oldParent, oldName, newParent, newName, exchange)
+		}
+		if err := completeSourcePublication(ctx); err != nil {
+			r.mount.revoke(err)
+			return fuse.Status(syscall.ENOTCONN)
+		}
 	}
 	return fuse.Status(errno)
 }
@@ -1310,7 +1891,10 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 		return fuse.Status(admissionErr)
 	}
 	defer leave()
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	item, errno := newParent.node.Link(ctx, source.node, name)
 	if errno != 0 {
@@ -1327,7 +1911,14 @@ func (r *rawFileSystem) Link(_ <-chan struct{}, input *fuse.LinkIn, name string,
 		r.mount.revoke(fmt.Errorf("fusev3: link %q applied at the authority but source inode %d can no longer accept a kernel reference", name, input.Oldnodeid))
 		return fuse.Status(syscall.ENOTCONN)
 	}
-	r.publishEntry(out, newParent.key.inode, name, source, item.GetAttr())
+	if err := r.publishEntry(ctx, out, newParent, name, source, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -1354,7 +1945,10 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 		return fuse.Status(admissionErr)
 	}
 	defer leave()
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	item, errno := parent.node.Symlink(ctx, pointedTo, linkName)
 	if errno != 0 {
@@ -1365,7 +1959,14 @@ func (r *rawFileSystem) Symlink(_ <-chan struct{}, header *fuse.InHeader, pointe
 		return fuse.Status(errno)
 	}
 	r.bindPath(record, parent, linkName)
-	r.publishEntry(out, parent.key.inode, linkName, record, item.GetAttr())
+	if err := r.publishEntry(ctx, out, parent, linkName, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -1378,7 +1979,12 @@ func (r *rawFileSystem) Readlink(_ <-chan struct{}, header *fuse.InHeader) ([]by
 	if record.graft {
 		return r.graftReadlink(record)
 	}
-	value, errno := record.node.Readlink(r.opContext())
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return nil, lifecycle
+	}
+	defer finish()
+	value, errno := record.node.Readlink(ctx)
 	return value, fuse.Status(errno)
 }
 
@@ -1391,7 +1997,12 @@ func (r *rawFileSystem) GetXAttr(_ <-chan struct{}, header *fuse.InHeader, name 
 	if record.graft {
 		return 0, fuse.Status(graftXattrErrno)
 	}
-	size, errno := record.node.Getxattr(r.opContext(), name, dest)
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return 0, lifecycle
+	}
+	defer finish()
+	size, errno := record.node.Getxattr(ctx, name, dest)
 	return size, fuse.Status(errno)
 }
 
@@ -1404,7 +2015,10 @@ func (r *rawFileSystem) SetXAttr(_ <-chan struct{}, input *fuse.SetXAttrIn, name
 	if record.graft {
 		return fuse.Status(graftXattrErrno)
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	return fuse.Status(record.node.Setxattr(ctx, name, data, input.Flags))
 }
@@ -1418,7 +2032,12 @@ func (r *rawFileSystem) ListXAttr(_ <-chan struct{}, header *fuse.InHeader, dest
 	if record.graft {
 		return 0, fuse.Status(graftXattrErrno)
 	}
-	size, errno := record.node.Listxattr(r.opContext(), dest)
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return 0, lifecycle
+	}
+	defer finish()
+	size, errno := record.node.Listxattr(ctx, dest)
 	return size, fuse.Status(errno)
 }
 
@@ -1431,9 +2050,19 @@ func (r *rawFileSystem) RemoveXAttr(_ <-chan struct{}, header *fuse.InHeader, na
 	if record.graft {
 		return fuse.Status(graftXattrErrno)
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
-	return fuse.Status(record.node.Removexattr(ctx, name))
+	if errno := record.node.Removexattr(ctx, name); errno != 0 {
+		return fuse.Status(errno)
+	}
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	return fuse.OK
 }
 
 func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
@@ -1454,10 +2083,13 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 		if !ok {
 			return fuse.EIO
 		}
-		out.Fh, out.OpenFlags = id, 0
+		out.Fh, out.OpenFlags = id, fuse.FOPEN_PFS_LOCAL
 		return fuse.OK
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	handle, flags, errno := record.node.OpendirHandle(ctx, input.Flags)
 	if errno != 0 {
@@ -1516,7 +2148,10 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 		return fuse.EBADF
 	}
 	defer r.releaseHandleOperation(handleRecord)
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	if errno := handle.Seekdir(ctx, input.Offset); errno != 0 {
 		return fuse.Status(errno)
@@ -1555,7 +2190,12 @@ func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.St
 		return fuse.EBADF
 	}
 	defer r.releaseHandleOperation(handleRecord)
-	return fuse.Status(handle.Fsyncdir(r.opContext(), input.FsyncFlags))
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	return fuse.Status(handle.Fsyncdir(ctx, input.FsyncFlags))
 }
 
 func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
@@ -1571,7 +2211,10 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 	if !ok {
 		return
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return
+	}
 	defer finish()
 	if errno := handle.dir.close(ctx); errno != 0 {
 		r.mount.cleanupFailed("open-directory close", errno)
@@ -1588,7 +2231,46 @@ func (r *rawFileSystem) StatFs(_ <-chan struct{}, header *fuse.InHeader, out *fu
 	if record.graft {
 		return r.graftStatfs(out)
 	}
-	return fuse.Status(record.node.Statfs(r.opContext(), out))
+	ctx, finish, lifecycle := r.mutationContext(header.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	return fuse.Status(record.node.Statfs(ctx, out))
+}
+
+// SyncFS creates one authority replay mutation which is ordered after every
+// earlier accepted mutation and durably flushes the volume. It deliberately
+// carries no source-publication gate and requests no post-VFS PUBLISH receipt:
+// syncfs changes no local inode, dentry, or attribute state.
+func (r *rawFileSystem) SyncFS(_ <-chan struct{}, input *fuse.SyncFSIn) fuse.Status {
+	if input == nil || input.Padding != 0 || input.NodeId != fuse.FUSE_ROOT_ID {
+		r.mount.revoke(errors.New("fusev3: malformed FUSE_SYNCFS request"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	root := r.acquire(fuse.FUSE_ROOT_ID)
+	if root == nil || root.graft {
+		if root != nil {
+			r.release(root)
+		}
+		r.mount.revoke(errors.New("fusev3: FUSE_SYNCFS lost the authority root"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	defer r.release(root)
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	response, errno := root.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_SyncFs{SyncFs: &authoritypb.SyncFSRequest{}}})
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	if response.GetSyncFs() == nil {
+		r.mount.revoke(errors.New("fusev3: authority returned malformed SyncFS success"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	return fuse.OK
 }
 
 func (r *rawFileSystem) GetLk(_ <-chan struct{}, input *fuse.LkIn, out *fuse.LkOut) fuse.Status {
@@ -1616,7 +2298,12 @@ func (r *rawFileSystem) GetLk(_ <-chan struct{}, input *fuse.LkIn, out *fuse.LkO
 	if handleRecord.inode != record {
 		return fuse.EBADF
 	}
-	return fuse.Status(record.node.Getlk(r.opContext(), input.Owner, &input.Lk, input.LkFlags, &out.Lk))
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	return fuse.Status(record.node.Getlk(ctx, input.Owner, &input.Lk, input.LkFlags, &out.Lk))
 }
 
 func (r *rawFileSystem) SetLk(cancel <-chan struct{}, input *fuse.LkIn) fuse.Status {
@@ -1652,7 +2339,10 @@ func (r *rawFileSystem) setLock(_ <-chan struct{}, input *fuse.LkIn, wait bool) 
 	if handleRecord.inode != record {
 		return fuse.EBADF
 	}
-	ctx, finish := r.mutationContext()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
 	defer finish()
 	if wait {
 		return fuse.Status(record.node.Setlkw(ctx, input.Owner, &input.Lk, input.LkFlags))
@@ -1676,15 +2366,25 @@ func (r *rawFileSystem) OnUnmount() {
 // now an authority-to-frontend direction, and every change to this inode is
 // repaired through it before the mutating call returns on the machine that made
 // it.
-func (r *rawFileSystem) publishAttr(out *fuse.AttrOut, attr *authoritypb.Attr) {
+func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, identity publicationIdentity, attr *authoritypb.Attr) {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		r.mount.revoke(errors.New("fusev3: attribute result escaped its post-VFS reply-publication lifecycle"))
+		fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+		out.SetTimeout(0)
+		return
+	}
+	// Attribute postprocessing updates the inode even when its validity is zero;
+	// retain the reply until that update is on the far side of PFS_PUBLISH.
+	publication.needsPostVFS = true
 	inode := attr.GetInode()
 	r.mu.Lock()
-	lifetime, cached := r.admitAttrLocked(inode)
+	lifetime, coordinate, cached := r.admitAttrLocked(ctx, inode, identity)
 	r.mu.Unlock()
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 	out.SetTimeout(lifetime)
 	if cached {
-		r.settle(nameKey{}, false, inode, true)
+		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, coordinate: coordinate})
 	}
 }
 
@@ -1699,7 +2399,7 @@ func (r *rawFileSystem) publishAttr(out *fuse.AttrOut, attr *authoritypb.Attr) {
 // difference between "your mount was fenced" and "your mount was fenced while
 // it was in the middle of a mkdir in <path>".
 func (m *Mount) withParkedContext(err error) error {
-	if m.profile != CoherenceStrict || m.raw == nil {
+	if m.raw == nil {
 		return err
 	}
 	directories := m.raw.parkedDirectories()
@@ -1721,10 +2421,36 @@ func (m *Mount) failAsync(err error) {
 		err = errors.New("fusev3: mount aborted")
 	}
 	err = m.withParkedContext(err)
+	// Failure discovery and teardown ownership are separate. Several terminal
+	// edges can race (for example SessionDone can arrive while coherence already
+	// holds a route-specific cause). The first edge owns cancellation and
+	// teardown, but every edge owns diagnostic truth and must remain observable.
+	m.recordFatalCause(err)
+	m.scheduleAbort()
+}
+
+// replyWriteLostAfterObservedUnmount distinguishes an expected terminal
+// /dev/fuse reply race from a live-mount publication failure. ENOENT/ENODEV is
+// clean only after the exact recorded mount identity is already absent from
+// mountinfo. A lazy unmount may still have retained file references at that
+// instant, so the frontend closes admission and aborts the remaining FUSE
+// connection; clean Detach is still delayed until that connection actually
+// terminates. Every other write error, and the same errno while the mount is
+// installed, remains fatal.
+func (m *Mount) replyWriteLostAfterObservedUnmount(status fuse.Status) bool {
+	if m == nil || status != fuse.ENOENT && status != fuse.Status(syscall.ENODEV) || m.kernelMount.point == "" {
+		return false
+	}
+	if _, err := m.kernelMount.absent(); err != nil {
+		return false
+	}
+	m.revoked.Store(true)
+	m.scheduleAbort()
+	return true
+}
+
+func (m *Mount) scheduleAbort() {
 	m.abort.Do(func() {
-		m.fatalMu.Lock()
-		m.fatalErr = err
-		m.fatalMu.Unlock()
 		if m.cancel != nil {
 			m.cancel()
 		}
@@ -1733,13 +2459,20 @@ func (m *Mount) failAsync(err error) {
 			// published names and attributes that nothing can correct any more,
 			// so it withdraws them and makes itself unreachable before it even
 			// tries an ordinary unmount.
-			if m.profile == CoherenceStrict {
-				m.withdrawKernelState()
-			}
+			m.withdrawKernelState()
 			if m.server != nil {
 				_ = m.Unmount()
 			}
 			_ = m.Close()
 		}()
 	})
+}
+
+func (m *Mount) recordFatalCause(err error) {
+	if err == nil {
+		return
+	}
+	m.fatalMu.Lock()
+	m.fatalErr = errors.Join(m.fatalErr, err)
+	m.fatalMu.Unlock()
 }

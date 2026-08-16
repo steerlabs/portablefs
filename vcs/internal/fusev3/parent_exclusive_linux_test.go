@@ -62,7 +62,7 @@ func newParkedMkdir(t *testing.T, directory string) *parkedFixture {
 	go func() {
 		defer close(done)
 		out := &fuse.EntryOut{}
-		f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent.NodeId}, Mode: 0o755}, "child", out)
+		f.mkdir(parent.NodeId, "child", out)
 	}()
 	waitFor(t, "the directory mutation to park in the authority", func() bool {
 		return len(f.raw.parkedDirectories()) != 0
@@ -133,19 +133,5 @@ func TestParkedDirectoriesAreForgottenWhenTheMutationIsAnswered(t *testing.T) {
 	f.mount.failAsync(errors.New("unrelated failure"))
 	if message := f.mount.fatalError().Error(); strings.Contains(message, "i_rwsem") {
 		t.Fatalf("terminal cause %q blames a lock this mount was not holding", message)
-	}
-}
-
-func TestAnUncachedMountTracksNoParkedDirectories(t *testing.T) {
-	// An uncached mount caches no binding, so no peer's COMPLETE can ever need
-	// it to invalidate one, and the whole condition is inapplicable. It must not
-	// pay for the bookkeeping either.
-	frontend, _, _ := testRawFileSystem(t, 8)
-	out := &fuse.EntryOut{}
-	if status := frontend.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0o755}, "child", out); status != fuse.OK {
-		t.Fatalf("MKDIR = %v", status)
-	}
-	if directories := frontend.parkedDirectories(); len(directories) != 0 {
-		t.Fatalf("an uncached mount tracked %v", directories)
 	}
 }

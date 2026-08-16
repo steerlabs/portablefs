@@ -44,6 +44,7 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
     case invalidVisibilityPhase(Int)
     case invalidVisibilityScope(Int)
     case invalidVisibilityTarget
+    case sourceVisibilityEventForbidden
     case invalidRoutesChange
     case routesChangeRequiresRemount
     case sequenceGap(expected: UInt64, received: UInt64)
@@ -106,6 +107,8 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
             return "unsupported visibility scope \(scope)"
         case .invalidVisibilityTarget:
             return "visibility target has fields outside its declared scope"
+        case .sourceVisibilityEventForbidden:
+            return "source filesystem visibility events are forbidden"
         case .invalidRoutesChange:
             return "visibility route change has an invalid shape"
         case .routesChangeRequiresRemount:
@@ -307,23 +310,15 @@ public enum PfsMacOSVisibilityPhase: UInt8, Sendable, Equatable {
     case complete = 2
 }
 
-/// Identifies the exact admitted mutation callback that owns the authority
-/// operation. Publication barriers use this ticket—not a path heuristic—to
-/// avoid waiting on the initiator while it waits for the authority reply.
+/// Identifies the authority mutation which produced a peer repair event.
 public struct PfsMacOSMutationInitiator: Sendable, Equatable, Hashable {
     public let sessionID: Data
     public let replaySlot: UInt32
     public let mutationSequence: UInt64
-    /// The pfslocal logical callback ID for this mount's own mutation. Peer
-    /// events carry nil. This is the exact publication lease the callback
-    /// barrier exempts at PREPARE and waits for at source COMPLETE.
-    public let localOperationID: UInt64?
-
     public init(
         sessionID: Data,
         replaySlot: UInt32,
-        mutationSequence: UInt64,
-        localOperationID: UInt64? = nil
+        mutationSequence: UInt64
     ) throws {
         guard sessionID.count == 16 else {
             throw PfsMacOSCoherenceError.invalidSessionIDLength(sessionID.count)
@@ -331,20 +326,14 @@ public struct PfsMacOSMutationInitiator: Sendable, Equatable, Hashable {
         guard mutationSequence > 0 else {
             throw PfsMacOSCoherenceError.invalidSequence(mutationSequence)
         }
-        if let localOperationID, localOperationID == 0 {
-            throw PfsMacOSCoherenceError.invalidSequence(0)
-        }
         self.sessionID = sessionID
         self.replaySlot = replaySlot
         self.mutationSequence = mutationSequence
-        self.localOperationID = localOperationID
     }
 }
 
 /// Every event describes the complete client-side work required for one
-/// authority mutation. Peer COMPLETE acknowledgements precede the mutation
-/// reply. The source COMPLETE is delivered too, but is acknowledged only after
-/// the ordinary initiating callback publishes; the next mutation waits for it.
+/// authority mutation. COMPLETE acknowledgements follow peer kernel repair.
 public struct PfsMacOSCoherenceEvent: Sendable, Equatable {
     public let epoch: Data
     public let sequence: UInt64
@@ -688,20 +677,16 @@ public actor PfsMacOSCoherenceRunner {
     public func completedCursor() -> PfsMacOSVisibilityCursor? { lastCompletedCursor }
 }
 
-/// The PREPARE phase must close ordinary cache-producing callback admission,
-/// wait for already admitted callbacks to publish, and keep the gate closed
-/// through COMPLETE. Implementations must exclude the one initiating callback
-/// identified by the authority contract or a source-mount mutation deadlocks.
+/// Peer PREPARE closes ordinary cache-producing callback admission, waits for
+/// already admitted callbacks to publish, and keeps the gate closed through
+/// COMPLETE acknowledgement. Source mutations use their callback-owned
+/// publication gate and never enter this event stream.
 public protocol PfsMacOSCallbackPublicationBarrier: Sendable {
     func prepare(_ event: PfsMacOSCoherenceEvent) async throws
-    /// For a peer mutation, reopen only after every requested repair has
-    /// completed. For this mount's own mutation, wait until the exact callback
-    /// named by `event.initiator` has published its ordinary FSKit reply, then
-    /// reopen. The authority deliberately defers that source COMPLETE so it
-    /// never asks FSKit to perform nested VFS surgery behind the callback.
+    /// Reopen only after every requested peer repair has completed.
     func resume(_ event: PfsMacOSCoherenceEvent) async throws
     /// Returns true only when this exact peer COMPLETE repair refused at least
-    /// one otherwise queueable ordered callback before acknowledgement.
+    /// one ordered callback before acknowledgement.
     func orderedAdmissionContended(for event: PfsMacOSCoherenceEvent) async -> Bool
     /// Opens admission only after the authority accepted COMPLETE. Between
     /// local repair completion and this edge, overlapping callbacks may park:
@@ -852,19 +837,13 @@ public protocol PfsFSKitNativeCacheRevoker: Sendable {
 
 public struct PfsNativeFSKitCoherenceBackend: PfsMacOSCoherenceBackend {
     public let policy = PfsMacOSCachePolicy.nativeFSKitRevocationV1
-    private let localAuthoritySessionID: Data
     private let revoker: any PfsFSKitNativeCacheRevoker
     private let publicationBarrier: any PfsMacOSCallbackPublicationBarrier
 
     public init(
-        localAuthoritySessionID: Data,
         revoker: any PfsFSKitNativeCacheRevoker,
         publicationBarrier: any PfsMacOSCallbackPublicationBarrier
     ) throws {
-        guard localAuthoritySessionID.count == 16 else {
-            throw PfsMacOSCoherenceError.invalidSessionIDLength(localAuthoritySessionID.count)
-        }
-        self.localAuthoritySessionID = localAuthoritySessionID
         self.revoker = revoker
         self.publicationBarrier = publicationBarrier
     }
@@ -874,15 +853,9 @@ public struct PfsNativeFSKitCoherenceBackend: PfsMacOSCoherenceBackend {
         case .prepare:
             try await publicationBarrier.prepare(event)
         case .complete:
-            // The source's normal FSKit callback is its cache transition. A
-            // nested revocation can be serialized behind that callback and
-            // deadlock. Its deferred COMPLETE waits for callback publication
-            // in `resume` instead.
-            if event.initiator.sessionID != localAuthoritySessionID {
-                for repair in event.repairs {
-                    try Task.checkCancellation()
-                    try await revoker.revoke(repair)
-                }
+            for repair in event.repairs {
+                try Task.checkCancellation()
+                try await revoker.revoke(repair)
             }
             try await publicationBarrier.resume(event)
         }
@@ -1387,7 +1360,6 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
     )
 
     public let policy: PfsMacOSCachePolicy
-    private let localAuthoritySessionID: Data
     private let authenticator: PfsMacOS26RepairAuthenticator
     private let armer: any PfsMacOS26RepairArmer
     private let actuator: any PfsMacOS26RepairActuator
@@ -1395,7 +1367,6 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
 
     public init(
         policy: PfsMacOSCachePolicy = .synchronousVFSRepairV1,
-        localAuthoritySessionID: Data,
         authenticator: PfsMacOS26RepairAuthenticator,
         armer: any PfsMacOS26RepairArmer,
         actuator: any PfsMacOS26RepairActuator,
@@ -1404,10 +1375,6 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
         guard policy == .synchronousVFSRepairV1 || policy == .synchronousVFSRepairV2 else {
             throw PfsMacOSCoherenceError.unsupportedRepair
         }
-        guard localAuthoritySessionID.count == 16 else {
-            throw PfsMacOSCoherenceError.invalidSessionIDLength(localAuthoritySessionID.count)
-        }
-        self.localAuthoritySessionID = localAuthoritySessionID
         self.policy = policy
         self.authenticator = authenticator
         self.armer = armer
@@ -1420,71 +1387,67 @@ public struct PfsMacOS26CoherenceBackend: PfsMacOSCoherenceBackend {
             try await publicationBarrier.prepare(event)
             return
         }
-        if event.initiator.sessionID != localAuthoritySessionID {
-            // Validate the complete repair set before the first mounted-VFS
-            // mutation. A later native-only/object repair must fail macOS 26
-            // closed without leaving earlier pathname surgery partially run.
-            let plans = try makePlans(event: event)
-            let actuationStarted = DispatchTime.now().uptimeNanoseconds
-            if Self.signposter.isEnabled {
-                Self.signposter.emitEvent(
-                    "RepairActuation",
-                    "edge=begin sequence=\(event.sequence) plans=\(plans.count) repairs=\(event.repairs.count)"
-                )
-            }
-            var leases: [any PfsMacOS26RepairArmLease] = []
-            do {
+        // Validate the complete repair set before the first mounted-VFS
+        // mutation. A later native-only/object repair must fail macOS 26
+        // closed without leaving earlier pathname surgery partially run.
+        let plans = try makePlans(event: event)
+        let actuationStarted = DispatchTime.now().uptimeNanoseconds
+        if Self.signposter.isEnabled {
+            Self.signposter.emitEvent(
+                "RepairActuation",
+                "edge=begin sequence=\(event.sequence) plans=\(plans.count) repairs=\(event.repairs.count)"
+            )
+        }
+        var leases: [any PfsMacOS26RepairArmLease] = []
+        do {
                 // Arm and resolve the exact traversal coordinates for the
                 // whole event before the first cache mutation changes the
                 // local namespace index. This also proves every plan is
                 // executable before any mounted-VFS surgery begins.
-                for plan in plans {
-                    try Task.checkCancellation()
-                    leases.append(try await armer.arm(plan))
-                }
-                for (plan, lease) in zip(plans, leases) {
-                    try Task.checkCancellation()
-                    try await lease.activate()
-                    try await actuator.apply(plan)
-                    try await lease.validate()
-                }
+            for plan in plans {
+                try Task.checkCancellation()
+                leases.append(try await armer.arm(plan))
+            }
+            for (plan, lease) in zip(plans, leases) {
+                try Task.checkCancellation()
+                try await lease.activate()
+                try await actuator.apply(plan)
+                try await lease.validate()
+            }
                 // Keep every completed plan armed while the event barrier
                 // resumes: FSKit may emit a prior unlink's close/reclaim tail
                 // after unlinkat has returned and while the next plan runs.
-                try await publicationBarrier.resume(event)
-                for lease in leases {
-                    try await lease.release()
-                }
-                if Self.signposter.isEnabled {
-                    let now = DispatchTime.now().uptimeNanoseconds
-                    let elapsed = now < actuationStarted
-                        ? 0
-                        : (now - actuationStarted) / 1_000
-                    Self.signposter.emitEvent(
-                        "RepairActuation",
-                        "edge=end sequence=\(event.sequence) duration_us=\(elapsed) plans=\(plans.count)"
-                    )
-                }
-            } catch {
-                for lease in leases {
-                    await lease.cancel()
-                }
-                if Self.signposter.isEnabled {
-                    let now = DispatchTime.now().uptimeNanoseconds
-                    let elapsed = now < actuationStarted
-                        ? 0
-                        : (now - actuationStarted) / 1_000
-                    let nsError = error as NSError
-                    Self.signposter.emitEvent(
-                        "RepairActuation",
-                        "edge=failed sequence=\(event.sequence) duration_us=\(elapsed) plans=\(plans.count) domain=\(nsError.domain, privacy: .public) code=\(nsError.code)"
-                    )
-                }
-                throw error
+            try await publicationBarrier.resume(event)
+            for lease in leases {
+                try await lease.release()
             }
-            return
+            if Self.signposter.isEnabled {
+                let now = DispatchTime.now().uptimeNanoseconds
+                let elapsed = now < actuationStarted
+                    ? 0
+                    : (now - actuationStarted) / 1_000
+                Self.signposter.emitEvent(
+                    "RepairActuation",
+                    "edge=end sequence=\(event.sequence) duration_us=\(elapsed) plans=\(plans.count)"
+                )
+            }
+        } catch {
+            for lease in leases {
+                await lease.cancel()
+            }
+            if Self.signposter.isEnabled {
+                let now = DispatchTime.now().uptimeNanoseconds
+                let elapsed = now < actuationStarted
+                    ? 0
+                    : (now - actuationStarted) / 1_000
+                let nsError = error as NSError
+                Self.signposter.emitEvent(
+                    "RepairActuation",
+                    "edge=failed sequence=\(event.sequence) duration_us=\(elapsed) plans=\(plans.count) domain=\(nsError.domain, privacy: .public) code=\(nsError.code)"
+                )
+            }
+            throw error
         }
-        try await publicationBarrier.resume(event)
     }
 
     public func orderedAdmissionContended(

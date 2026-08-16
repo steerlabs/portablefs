@@ -581,6 +581,11 @@ func (a *remoteActor) close() error {
 	return a.command.Wait()
 }
 
+type agentInbound struct {
+	req       request
+	decodeErr error
+}
+
 // runAgent serves the operation vocabulary on stdin/stdout for a remote driver.
 func runAgent(root string) error {
 	local, err := newLocalActor("agent", root)
@@ -589,20 +594,62 @@ func runAgent(root string) error {
 	}
 	reader := bufio.NewReaderSize(os.Stdin, 1<<20)
 	writer := bufio.NewWriterSize(os.Stdout, 1<<20)
+	inbound := make(chan agentInbound)
+	disconnected := make(chan error, 1)
+	go func() {
+		for {
+			line, readErr := reader.ReadBytes('\n')
+			if len(line) == 0 && errors.Is(readErr, io.EOF) {
+				disconnected <- nil
+				return
+			}
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				disconnected <- readErr
+				return
+			}
+			var req request
+			decodeErr := json.Unmarshal(line, &req)
+			inbound <- agentInbound{req: req, decodeErr: decodeErr}
+			if errors.Is(readErr, io.EOF) {
+				disconnected <- nil
+				return
+			}
+		}
+	}()
+
 	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) == 0 && errors.Is(err, io.EOF) {
+		var next agentInbound
+		select {
+		case next = <-inbound:
+		case disconnectErr := <-disconnected:
+			if disconnectErr != nil {
+				return disconnectErr
+			}
 			return writer.Flush()
 		}
-		if err != nil && !errors.Is(err, io.EOF) {
-			return err
-		}
-		var req request
-		var out response
-		if decodeErr := json.Unmarshal(line, &req); decodeErr != nil {
-			out = response{Err: decodeErr.Error()}
+
+		completed := make(chan response, 1)
+		if next.decodeErr != nil {
+			completed <- response{Err: next.decodeErr.Error()}
 		} else {
-			out, _ = local.exec(req)
+			go func() {
+				out, _ := local.exec(next.req)
+				completed <- out
+			}()
+		}
+
+		var out response
+		select {
+		case out = <-completed:
+		case disconnectErr := <-disconnected:
+			// The operation may be blocked in an ordinary filesystem syscall and
+			// cannot be cancelled with a Go context. Returning lets the agent's
+			// main process exit immediately, which kills every goroutine and
+			// closes every descriptor when the owning ssh connection disappears.
+			if disconnectErr != nil {
+				return disconnectErr
+			}
+			return nil
 		}
 		encoded, encodeErr := json.Marshal(out)
 		if encodeErr != nil {

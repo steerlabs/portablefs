@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -96,6 +97,10 @@ type ensureAttachRequest struct {
 	// When present the attach is branchless, served by the standalone v3 data
 	// plane, and never touches the legacy clientcore path.
 	V3 *v3AttachRequest `json:"v3,omitempty"`
+	// observePreKernelMountAbsence is a package-test injection for platforms
+	// that cannot run Darwin getfsstat. It is never decoded from control input;
+	// production always constructs the observer from mountPath + attachRef.
+	observePreKernelMountAbsence authorityrpc.PreKernelMountAbsenceObserver
 }
 
 type attachStatus struct {
@@ -127,6 +132,13 @@ type attachStatus struct {
 type registry struct {
 	mu         sync.RWMutex
 	mutationMu sync.Mutex
+	// fsKitProtocol5Qualification is true only in the separately signed,
+	// build-tagged qualification daemon. Shipping FSKit has no exact peer
+	// namespace/attribute invalidation primitive; macOS 26 also cannot return
+	// the post-mutation attribute snapshots required at the source callback.
+	// Keeping this fact on the registry makes EnsureAttach refuse before it can
+	// construct, dial, or assign an authority session.
+	fsKitProtocol5Qualification bool
 	// unmountMu guards unmounting, the at-most-one-transaction-per-attach map
 	// that lets a second unmount request JOIN a running transaction instead of
 	// queueing another one behind it on mutationMu.
@@ -165,13 +177,32 @@ type registry struct {
 }
 
 func newRegistry(stateDir string) *registry {
+	return newRegistryWithFSKitQualification(stateDir, false)
+}
+
+// newFSKitQualificationRegistry is the explicit package-test/qualification
+// constructor. It is not a runtime fallback: production selects its immutable
+// build fact through newRuntimeRegistry below.
+func newFSKitQualificationRegistry(stateDir string) *registry {
+	return newRegistryWithFSKitQualification(stateDir, true)
+}
+
+func newRuntimeRegistry(stateDir string) *registry {
+	return newRegistryWithFSKitQualification(
+		stateDir,
+		fsKitProtocol5QualificationBuild,
+	)
+}
+
+func newRegistryWithFSKitQualification(stateDir string, qualification bool) *registry {
 	r := &registry{
-		stateDir:    stateDir,
-		byRef:       map[string]*attach{},
-		byKey:       map[string]*attach{},
-		persistReq:  make(chan struct{}, 1),
-		persistStop: make(chan struct{}),
-		persistDone: make(chan struct{}),
+		stateDir:                    stateDir,
+		byRef:                       map[string]*attach{},
+		byKey:                       map[string]*attach{},
+		fsKitProtocol5Qualification: qualification,
+		persistReq:                  make(chan struct{}, 1),
+		persistStop:                 make(chan struct{}),
+		persistDone:                 make(chan struct{}),
 	}
 	// Production constructs registries only after owning both daemon
 	// singleton locks. Start the background worker only after the complete
@@ -324,6 +355,14 @@ func (r *registry) stopPersister() {
 func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach, bool, error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
+	if req.V3 != nil && !r.fsKitProtocol5Qualification {
+		return nil, false, errors.New(
+			"PortableFS protocol-5 macOS mounting is not production-admitted: " +
+				"current FSKit has no exact peer namespace or attribute invalidation primitive, " +
+				"and macOS 26 cannot publish complete post-mutation attributes; " +
+				"the authority session was not opened",
+		)
+	}
 	if req.VolumeID == "" || req.AuthorityURL == "" || req.MountPath == "" ||
 		(req.Branch == "" && req.V3 == nil) {
 		return nil, false, fmt.Errorf("volumeId, branch, authorityUrl, and mountPath are required")
@@ -675,21 +714,21 @@ func (r *registry) unmountFSKitWithContext(
 		r.unmounting[ref] = tx
 		go func() {
 			found, jobID, err := r.runUnmountTransaction(ref, tx, ops)
-			// THE OUTCOME IS PUBLISHED BEFORE THE TRANSACTION BECOMES
-			// UNDISCOVERABLE. Removing the entry first opened a window in which
-			// a retry saw no running transaction and STARTED A SECOND ONE
-			// against an attach the first had already detached, and in which a
-			// joiner's expiring timer could report "unknown attach" for a
-			// detach that had just succeeded. A request that finds the entry in
-			// that window now joins a transaction that is already resolved and
-			// reads its terminal outcome immediately.
-			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
-			close(tx.done)
 			r.unmountMu.Lock()
+			// Publish the outcome to existing joiners and atomically make this
+			// transaction undiscoverable before waking them. If close(done)
+			// happened first, a retry could join a completed failed transaction
+			// in the tiny pre-delete window and receive stale evidence even after
+			// the external mount state had changed. Existing joiners already own
+			// tx, so deleting first loses nothing; close below is their happens-
+			// before edge for outcome. A new retry starts the one next
+			// transaction and observes current kernel state.
+			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
 			if r.unmounting[ref] == tx {
 				delete(r.unmounting, ref)
 			}
 			r.unmountMu.Unlock()
+			close(tx.done)
 		}()
 	} else if force && !tx.force {
 		// ESCALATE the running normal transaction in place.

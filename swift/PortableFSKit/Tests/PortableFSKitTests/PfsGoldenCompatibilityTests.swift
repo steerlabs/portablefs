@@ -42,6 +42,26 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
     #expect(encoded == golden)
 }
 
+@Test func publicationAckSemanticCommitUsesTheFrozenMinor15Fields() throws {
+    var ack = PfsPublicationAck()
+    ack.operationID = 41
+    ack.semanticCommit = .published
+    var envelope = PfsEnvelope()
+    envelope.body = .publicationAck(ack)
+
+    // Four-byte little-endian frame length, Envelope.body field 36, then
+    // PublicationAck.operation_id=2 and semantic_commit=3.
+    let expected = Data([0x07, 0x00, 0x00, 0x00, 0xA2, 0x02, 0x04, 0x10, 0x29, 0x18, 0x01])
+    try assertFrameRoundTrip(envelope, golden: expected)
+    let decoded = try decodeSingleGoldenEnvelope(expected)
+    guard case let .publicationAck(roundTrip)? = decoded.body else {
+        Issue.record("expected publicationAck body")
+        return
+    }
+    #expect(roundTrip.operationID == 41)
+    #expect(roundTrip.semanticCommit == .published)
+}
+
 @Test func goHelloRequestGoldenDecodesAndReencodesByteIdentically() throws {
     let frame = try goldenFrame("hello_request.hex")
     let envelope = try decodeSingleGoldenEnvelope(frame)
@@ -89,12 +109,10 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
 }
 
 /// Protocol minor 6's retraction bit is an ENVELOPE field, so unlike every
-/// other cross-language fixture its whole job is to pin the five scalars that
+/// other cross-language fixture its whole job is to pin the four scalars that
 /// precede the body: request_id, publication_ack_required, operation_id,
-/// publication_retracted and source_phase_queueable, in that order, ahead of
-/// the oneof. Field 5 is deliberately absent and therefore pins its default
-/// false on a daemon-to-frontend reply. A frontend that silently dropped field
-/// 4 would still round-trip every other golden here.
+/// and publication_retracted, in that order, ahead of the oneof. A frontend
+/// that silently dropped field 4 would still round-trip every other golden.
 @Test func goPublicationRetractedGoldenDecodesAndReencodesByteIdentically() throws {
     let frame = try goldenFrame("publication_retracted.hex")
     let envelope = try decodeSingleGoldenEnvelope(frame)
@@ -103,7 +121,6 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
     #expect(envelope.publicationAckRequired)
     #expect(envelope.operationID == 3)
     #expect(envelope.publicationRetracted)
-    #expect(!envelope.sourcePhaseQueueable)
     guard case let .getAttrReply(reply)? = envelope.body else {
         Issue.record("expected getAttrReply body, got \(String(describing: envelope.body))")
         return
@@ -126,34 +143,6 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
     expectedEnvelope.operationID = 3
     expectedEnvelope.publicationRetracted = true
     expectedEnvelope.body = .getAttrReply(expectedReply)
-    try assertFrameRoundTrip(expectedEnvelope, golden: frame)
-}
-
-/// Protocol minor 11's queueability bit is request-only. This fixture is
-/// generated and decoded independently by Go and pins both the field number
-/// and the exact ordered Write body it qualifies.
-@Test func goSourcePhaseQueueableGoldenDecodesAndReencodesByteIdentically() throws {
-    let frame = try goldenFrame("source_phase_queueable.hex")
-    let envelope = try decodeSingleGoldenEnvelope(frame)
-
-    #expect(envelope.requestID == 43)
-    #expect(envelope.operationID == 8)
-    #expect(envelope.sourcePhaseQueueable)
-    guard case let .write(write)? = envelope.body else {
-        Issue.record("expected write body, got \(String(describing: envelope.body))")
-        return
-    }
-    #expect(write.handle == 9)
-    #expect(write.data == Data("x".utf8))
-
-    var expectedWrite = PfsWriteRequest()
-    expectedWrite.handle = 9
-    expectedWrite.data = Data("x".utf8)
-    var expectedEnvelope = PfsEnvelope()
-    expectedEnvelope.requestID = 43
-    expectedEnvelope.operationID = 8
-    expectedEnvelope.sourcePhaseQueueable = true
-    expectedEnvelope.body = .write(expectedWrite)
     try assertFrameRoundTrip(expectedEnvelope, golden: frame)
 }
 

@@ -118,13 +118,51 @@ func clientConfig(o options, token []byte, revision [32]byte) (authorityrpc.Clie
 		DialTimeout:        o.dialTimeout,
 		CancelDrainTimeout: 10 * time.Second,
 		MaxInFlight:        4,
-		// This tool never caches a name or an attribute, so it owes the
-		// authority no repair and must not join the barrier. Declaring strict
-		// here would make an administrative call a participant in every
-		// mutation for as long as it lived.
-		CoherenceProfile: authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED,
-		RoutesRevision:   revision,
+		// Protocol 5 has one coherent session model. This short-lived
+		// administrative client caches no filesystem facts, but still joins and
+		// acknowledges the visibility stream while active. Its absence observer
+		// is exact because this process never creates a kernel mount at all.
+		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
+		CachedNameCapacity: 1,
+		RepairBudget:       10 * time.Second,
+		NamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT,
+		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+			return administrativeAbsenceProof(), nil
+		},
+		RoutesRevision: revision,
 	}, nil
+}
+
+func administrativeAbsenceProof() *authoritypb.MountAbsenceProof {
+	return &authoritypb.MountAbsenceProof{
+		ObservedUnixNanos: time.Now().UnixNano(),
+		Observation:       []byte("route administration process has no kernel mount path or FUSE connection"),
+		Component:         "pfs-coherence-routes/no-kernel-mount",
+	}
+}
+
+// acknowledgeVisibility keeps this deliberately cacheless administrative
+// session inside the same coherent participation model as a real mount. With
+// no kernel facts to repair, each phase is complete as soon as it arrives.
+func acknowledgeVisibility(ctx context.Context, client *authorityrpc.Client, done chan<- error) {
+	cursor := client.InitialVisibilityCursor()
+	event, err := client.NextVisibility(ctx, cursor)
+	for err == nil {
+		event, err = client.NextVisibilityAfterAck(ctx, event.GetCursor(), false)
+	}
+	if ctx.Err() != nil {
+		err = nil
+	}
+	done <- err
+}
+
+func releaseAdministrativeClient(client *authorityrpc.Client, cancelVisibility context.CancelFunc, visibilityDone <-chan error) error {
+	cancelVisibility()
+	visibilityErr := <-visibilityDone
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	releaseErr := client.ReleaseBeforeMount(ctx)
+	cancel()
+	return errors.Join(releaseErr, visibilityErr, client.Close())
 }
 
 // dialOnce makes one attach attempt. The TLS configuration is cloned per
@@ -182,11 +220,16 @@ func applyRoutes(o options, path string) error {
 			return fmt.Errorf("attach with the volume's active routing to apply routes: %w", err)
 		}
 	}
-	defer func() { _ = client.Close() }()
+	visibilityCtx, stopVisibility := context.WithCancel(ctx)
+	visibilityDone := make(chan error, 1)
+	go acknowledgeVisibility(visibilityCtx, client, visibilityDone)
 
 	reply, err := client.ApplyRoutes(ctx, rules.Canonical(), expected)
 	if err != nil {
-		return fmt.Errorf("apply routes: %w", err)
+		return errors.Join(fmt.Errorf("apply routes: %w", err), releaseAdministrativeClient(client, stopVisibility, visibilityDone))
+	}
+	if err := releaseAdministrativeClient(client, stopVisibility, visibilityDone); err != nil {
+		return fmt.Errorf("release route-administration session: %w", err)
 	}
 	fmt.Printf("applied_revision=%x\n", reply.GetRevision())
 	fmt.Printf("applied_canonical_bytes=%d\n", len(reply.GetCanonical()))
@@ -233,7 +276,10 @@ func checkRevisionContract(o options) error {
 	attempts := 1
 	client, err := dialOnce(ctx, cfg)
 	if err == nil {
-		_ = client.Close()
+		visibilityCtx, stopVisibility := context.WithCancel(ctx)
+		visibilityDone := make(chan error, 1)
+		go acknowledgeVisibility(visibilityCtx, client, visibilityDone)
+		_ = releaseAdministrativeClient(client, stopVisibility, visibilityDone)
 		fmt.Printf("stale_attach_refused=false\n")
 		fmt.Printf("attempts=%d\n", attempts)
 		return nil
@@ -278,9 +324,15 @@ func checkRevisionContract(o options) error {
 		fmt.Printf("adopt_error=%s\n", err)
 		return nil
 	}
-	_ = client.Close()
+	visibilityCtx, stopVisibility := context.WithCancel(ctx)
+	visibilityDone := make(chan error, 1)
+	go acknowledgeVisibility(visibilityCtx, client, visibilityDone)
+	releaseErr := releaseAdministrativeClient(client, stopVisibility, visibilityDone)
 	fmt.Printf("attempts=%d\n", attempts)
-	fmt.Printf("adopt_succeeded=true\n")
+	fmt.Printf("adopt_succeeded=%t\n", releaseErr == nil)
+	if releaseErr != nil {
+		fmt.Printf("adopt_error=%s\n", releaseErr)
+	}
 	fmt.Printf("adopt_revision=%x\n", adopted.Revision())
 	return nil
 }

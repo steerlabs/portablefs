@@ -29,9 +29,9 @@ type coherenceCase struct {
 type caseRun struct {
 	a, b actor
 	dir  string
-	// mu guards the recorded results. A case that exceeds its wall clock bound
-	// is reported while its goroutine may still be running, so the reader and
-	// the case body genuinely race without it.
+	// mu guards results recorded by the case's own concurrency probes. The
+	// outer wall bound is process-owned: a timed-out case is killed and reaped,
+	// so none of these goroutines can survive into the next case.
 	mu       sync.Mutex
 	notes    []string
 	failures []string

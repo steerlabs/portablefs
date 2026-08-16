@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -20,13 +21,15 @@ import (
 
 // recordedNotify is one reverse notification the frontend sent to its kernel.
 type recordedNotify struct {
-	kind   string
-	parent uint64
-	child  uint64
-	name   string
-	inode  uint64
-	off    int64
-	length int64
+	kind     string
+	parent   uint64
+	child    uint64
+	name     string
+	inode    uint64
+	off      int64
+	length   int64
+	size     uint64
+	sequence uint64
 }
 
 // fakeNotifier stands in for the kernel's reverse channel. block, when
@@ -38,11 +41,15 @@ type fakeNotifier struct {
 	deleteST fuse.Status
 	entryST  fuse.Status
 	inodeST  fuse.Status
+	sizeST   fuse.Status
 	block    chan struct{}
 	// onDelete, when set, runs on the goroutine issuing a namespace
 	// notification. It is how the ordering of a deferred repair relative to
 	// this frontend's own reply is observed without a kernel.
 	onDelete func()
+	// onSize is the corresponding deterministic arrival hook for exact-size
+	// repair. It runs before the potentially blocking physical notification.
+	onSize func()
 }
 
 func (n *fakeNotifier) wait() {
@@ -66,6 +73,19 @@ func (n *fakeNotifier) InodeNotify(node uint64, off, length int64) fuse.Status {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.inodeST
+}
+
+func (n *fakeNotifier) PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status {
+	n.mu.Lock()
+	hook := n.onSize
+	n.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	n.record(recordedNotify{kind: "size", inode: node, size: size, sequence: sequence})
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.sizeST
 }
 
 func (n *fakeNotifier) EntryNotify(parent uint64, name string) fuse.Status {
@@ -155,10 +175,12 @@ var (
 // strictFixture is a strict frontend with no kernel: the raw filesystem, the
 // notification channel it repairs through, and a programmable authority.
 type strictFixture struct {
+	t      *testing.T
 	raw    *rawFileSystem
 	mount  *Mount
 	rpc    *fakeRPC
 	notify *fakeNotifier
+	unique atomic.Uint64
 }
 
 func newStrictFixture(t *testing.T) *strictFixture {
@@ -171,7 +193,9 @@ func newStrictFixture(t *testing.T) *strictFixture {
 	raw := newRawFileSystem(mount, root)
 	notify := &fakeNotifier{}
 	mount.setNotifier(notify)
-	return &strictFixture{raw: raw, mount: mount, rpc: rpc, notify: notify}
+	fixture := &strictFixture{t: t, raw: raw, mount: mount, rpc: rpc, notify: notify}
+	fixture.unique.Store(2)
+	return fixture
 }
 
 // lookup performs one LOOKUP through the raw filesystem exactly as the kernel
@@ -179,10 +203,41 @@ func newStrictFixture(t *testing.T) *strictFixture {
 func (f *strictFixture) lookup(t *testing.T, parentNode uint64, name string) *fuse.EntryOut {
 	t.Helper()
 	out := &fuse.EntryOut{}
-	if status := f.raw.Lookup(nil, &fuse.InHeader{NodeId: parentNode}, name, out); !status.Ok() {
+	status := f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: parentNode}, name, out)
+	})
+	if !status.Ok() {
 		t.Fatalf("LOOKUP %q = %v", name, status)
 	}
 	return out
+}
+
+// rawCall models the part of go-fuse below RawFileSystem in unit tests: the
+// method returns, its response is successfully written to /dev/fuse, and only
+// then does ReplyWritten settle publication ownership.
+func (f *strictFixture) rawCall(call func(unique uint64) fuse.Status) fuse.Status {
+	unique := f.unique.Add(2)
+	status := call(unique)
+	completeTestReply(f.t, f.raw, unique, fuse.OK)
+	return status
+}
+
+func (f *strictFixture) mkdir(parent uint64, name string, out *fuse.EntryOut) fuse.Status {
+	return f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{Unique: unique, NodeId: parent}, Mode: 0o755}, name, out)
+	})
+}
+
+func (f *strictFixture) unlink(parent uint64, name string) fuse.Status {
+	return f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.Unlink(nil, &fuse.InHeader{Unique: unique, NodeId: parent}, name)
+	})
+}
+
+func (f *strictFixture) rename(oldParent, newParent uint64, oldName, newName string, flags uint32) fuse.Status {
+	return f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{Unique: unique, NodeId: oldParent}, Newdir: newParent, Flags: flags}, oldName, newName)
+	})
 }
 
 // --- the strict profile publishes lifetimes, and records what it published ---
@@ -218,12 +273,23 @@ func TestLookupBetweenPrepareAndCompleteDoesNotRecacheTheOldValue(t *testing.T) 
 	}
 	// A path walk inside the window still gets an answer -- the authority has
 	// not applied yet, so the old value is still the truth -- but it must not
-	// be allowed to survive the mutation.
-	inWindow := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
+	// be allowed to survive the mutation. Zero TTL does not eliminate the
+	// postprocessing race: fuse_iget/d_add still install transient state after
+	// wake, so the result must retain a generic PFS_PUBLISH obligation too.
+	unique := f.unique.Add(2)
+	inWindow := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "victim", inWindow); !status.Ok() {
+		t.Fatalf("in-window LOOKUP = %v", status)
+	}
 	if inWindow.EntryValid != 0 || inWindow.EntryValidNsec != 0 || inWindow.AttrValid != 0 || inWindow.AttrValidNsec != 0 {
 		t.Fatalf("a lookup between PREPARE and COMPLETE published (%d.%09d, %d.%09d); re-caching the pre-mutation value inside the barrier window is exactly what the barrier exists to prevent",
 			inWindow.EntryValid, inWindow.EntryValidNsec, inWindow.AttrValid, inWindow.AttrValidNsec)
 	}
+	if !f.raw.ReplyWriteOrdered(unique) || !f.raw.ReplyPublishMarked(unique, testPublicationNodeID, testPublicationOpcode) {
+		t.Fatal("zero-TTL LOOKUP did not retain a post-VFS publication receipt")
+	}
+	f.raw.ReplyWritten(unique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, unique)
 	if err := f.raw.completeVisibility(targets, false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
@@ -253,8 +319,8 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 	if calls[0].kind != "delete" || calls[0].parent != fuse.FUSE_ROOT_ID || calls[0].name != "victim" || calls[0].child != entry.NodeId {
 		t.Fatalf("namespace repair = %+v; a removal must reach inotify, which only NotifyDelete does", calls[0])
 	}
-	if calls[1].kind != "inode" || calls[1].inode != entry.NodeId || calls[1].off != 0 || calls[1].length != 0 {
-		t.Fatalf("inode repair = %+v; want a whole-file content and attribute invalidation", calls[1])
+	if calls[1].kind != "size" || calls[1].inode != entry.NodeId || calls[1].size != 4096 || calls[1].sequence != 1 {
+		t.Fatalf("inode repair = %+v; want exact size 4096 at the visibility sequence", calls[1])
 	}
 	// A repaired binding is no longer cached, so a second event for the same
 	// name costs nothing and, critically, takes no kernel lock.
@@ -263,9 +329,74 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 		t.Fatalf("second COMPLETE: %v", err)
 	}
 	for _, call := range f.notify.snapshot()[before:] {
-		if call.kind != "inode" {
+		if call.kind != "size" {
 			t.Fatalf("a binding this mount no longer caches was repaired again: %+v", call)
 		}
+	}
+}
+
+func TestCompleteNormalizesInodeRepairs(t *testing.T) {
+	tests := []struct {
+		name     string
+		targets  func(uint64) []*authoritypb.VisibilityTarget
+		wantKind string
+		wantOff  int64
+		wantSize uint64
+	}{
+		{
+			name: "duplicate attributes stay attribute-only",
+			targets: func(inode uint64) []*authoritypb.VisibilityTarget {
+				return []*authoritypb.VisibilityTarget{
+					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
+					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
+				}
+			},
+			wantKind: "inode",
+			wantOff:  -1,
+		},
+		{
+			name: "data dominates attributes",
+			targets: func(inode uint64) []*authoritypb.VisibilityTarget {
+				return []*authoritypb.VisibilityTarget{
+					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
+					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, inode, 4096),
+					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
+				}
+			},
+			wantKind: "size",
+			wantSize: 4096,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
+			if err := f.raw.completeVisibility(test.targets(entry.Attr.Ino), false); err != nil {
+				t.Fatalf("COMPLETE: %v", err)
+			}
+			calls := f.notify.snapshot()
+			if len(calls) != 1 {
+				t.Fatalf("notifications = %+v, want one normalized inode repair", calls)
+			}
+			if call := calls[0]; call.kind != test.wantKind || call.inode != entry.NodeId || call.off != test.wantOff || call.length != 0 || call.size != test.wantSize {
+				t.Fatalf("normalized inode repair = %+v, want kind %q for inode %d", call, test.wantKind, entry.NodeId)
+			}
+		})
+	}
+}
+
+func TestTranslateValidatesDominatedRawTargetsBeforeNormalization(t *testing.T) {
+	f := newStrictFixture(t)
+	data := inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 7, 4096)
+	malformedAttributes := inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, 7, 0)
+	malformedAttributes.Size = 1
+	if _, err := f.raw.translate([]*authoritypb.VisibilityTarget{data, malformedAttributes}); err == nil {
+		t.Fatal("a malformed ATTRIBUTES target hidden behind a dominant DATA target was accepted")
+	}
+	f.raw.mu.Lock()
+	defer f.raw.mu.Unlock()
+	if f.raw.identityDeviceKnown {
+		t.Fatal("a rejected raw event pinned frontend state before every target was validated")
 	}
 }
 
@@ -298,6 +429,35 @@ func TestMissingKernelInodeAlreadySatisfiesInvalidation(t *testing.T) {
 	if len(calls) != 2 || calls[0].kind != "delete" || calls[0].child != entry.NodeId ||
 		calls[1].kind != "inode" || calls[1].inode != entry.NodeId {
 		t.Fatalf("notifications = %+v, want namespace removal followed by the now-absent inode", calls)
+	}
+}
+
+func TestMissingKernelInodeAlreadySatisfiesExactSizeRepair(t *testing.T) {
+	f := newStrictFixture(t)
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
+	f.notify.sizeST = fuse.ENOENT
+	targets := []*authoritypb.VisibilityTarget{
+		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 7, 19),
+	}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatal(err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 27)
+	if err != nil || blocked {
+		t.Fatalf("begin exact-size COMPLETE = (blocked=%t, err=%v)", blocked, err)
+	}
+	if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+		t.Fatalf("exact-size COMPLETE for an evicted inode = %v", err)
+	}
+	calls := f.notify.snapshot()
+	if len(calls) != 1 || calls[0].kind != "size" || calls[0].inode != entry.NodeId || calls[0].size != 19 || calls[0].sequence != 27 {
+		t.Fatalf("exact-size repair = %+v, want absent inode acknowledged at size 19 sequence 27", calls)
+	}
+	f.raw.mu.Lock()
+	held := len(f.raw.peerHeldPhase) != 0 || len(f.raw.peerHolds) != 0
+	f.raw.mu.Unlock()
+	if held {
+		t.Fatal("ENOENT exact-size repair left the peer visibility cut held")
 	}
 }
 
@@ -371,10 +531,10 @@ func TestFailedFinalRepairRevokesWithoutAcknowledgingComplete(t *testing.T) {
 			},
 		},
 		{
-			name: "inode invalidation fails",
+			name: "exact data publication fails",
 			prepare: func(f *strictFixture) []*authoritypb.VisibilityTarget {
 				f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
-				f.notify.inodeST = fuse.Status(syscall.EIO)
+				f.notify.sizeST = fuse.Status(syscall.EIO)
 				return []*authoritypb.VisibilityTarget{inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 7, 0)}
 			},
 		},
@@ -414,183 +574,12 @@ func TestFailedFinalRepairRevokesWithoutAcknowledgingComplete(t *testing.T) {
 	}
 }
 
-func sourceComplete(slot uint32, mutationSequence uint64, targets ...*authoritypb.VisibilityTarget) *authoritypb.VisibilityEvent {
-	event := visibilityEvent(99, authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE, testSelfSession, targets...)
-	event.MutationSlot = slot
-	event.MutationSequence = mutationSequence
-	return event
-}
-
-func startMkdirCallback(f *strictFixture, name string) <-chan fuse.Status {
-	done := make(chan fuse.Status, 1)
-	go func() {
-		out := &fuse.EntryOut{}
-		done <- f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Mode: 0o755}, name, out)
-	}()
-	return done
-}
-
-func startVisibilityLoop(f *strictFixture) {
-	f.rpc.mu.Lock()
-	f.rpc.events = make(chan *authoritypb.VisibilityEvent, 2)
-	f.rpc.mu.Unlock()
-	f.mount.wg.Add(1)
-	go (&coherence{mount: f.mount, session: testSelfSession, budget: 5 * time.Second}).run(f.mount.ctx)
-}
-
-func assertNoVisibilityAck(t *testing.T, f *strictFixture, why string) {
-	t.Helper()
-	timer := time.NewTimer(50 * time.Millisecond)
-	defer timer.Stop()
-	<-timer.C
-	f.rpc.mu.Lock()
-	defer f.rpc.mu.Unlock()
-	if len(f.rpc.acked) != 0 {
-		t.Fatalf("visibility was acknowledged %s: %v", why, f.rpc.acked)
-	}
-}
-
-func TestSelfCompleteWaitsWhenMutationResponseArrivesBeforeEvent(t *testing.T) {
+func TestSourceFilesystemVisibilityPhaseIsAProtocolViolation(t *testing.T) {
 	f := newStrictFixture(t)
-	f.rpc.item = testItem(7, authoritypb.Attr_DIRECTORY, 7)
-	f.rpc.mutationStates = []*authoritypb.MutationState{{Slot: 3, AcceptedSequence: 1}}
-
-	// The transport returns while holding raw.mu, placing the callback after its
-	// response (and after ticket registration) but before intern/publish can
-	// finish filling the FUSE reply.
-	responseDelivered := make(chan struct{})
-	var once sync.Once
-	f.rpc.afterMutation = func() {
-		once.Do(func() {
-			f.raw.mu.Lock()
-			close(responseDelivered)
-		})
-	}
-	done := startMkdirCallback(f, "response-first")
-	<-responseDelivered
-	waitFor(t, "the response ticket to enter the publication ledger", func() bool {
-		f.mount.publications.mu.Lock()
-		defer f.mount.publications.mu.Unlock()
-		return f.mount.publications.bySlot[3] != nil
-	})
-
-	startVisibilityLoop(f)
-	f.rpc.events <- sourceComplete(3, 1, namespaceVisibilityTarget(1, "response-first"))
-	assertNoVisibilityAck(t, f, "while the matching raw callback was still publishing its reply")
-	f.raw.mu.Unlock()
-	if status := <-done; !status.Ok() {
-		t.Fatalf("MKDIR callback = %v", status)
-	}
-	waitFor(t, "COMPLETE acknowledgment after raw reply publication", func() bool {
-		f.rpc.mu.Lock()
-		defer f.rpc.mu.Unlock()
-		return len(f.rpc.acked) == 1
-	})
-}
-
-func TestSelfCompleteWaitsWhenEventArrivesBeforeMutationResponse(t *testing.T) {
-	f := newStrictFixture(t)
-	f.rpc.item = testItem(7, authoritypb.Attr_DIRECTORY, 7)
-	f.rpc.mutationStates = []*authoritypb.MutationState{{Slot: 5, AcceptedSequence: 1}}
-	responseGate := make(chan struct{})
-	f.rpc.block = responseGate
-	done := startMkdirCallback(f, "event-first")
-
-	startVisibilityLoop(f)
-	f.rpc.events <- sourceComplete(5, 1, namespaceVisibilityTarget(1, "event-first"))
-	assertNoVisibilityAck(t, f, "before the matching mutation response had reached its raw callback")
-	close(responseGate)
-	if status := <-done; !status.Ok() {
-		t.Fatalf("MKDIR callback = %v", status)
-	}
-	waitFor(t, "COMPLETE acknowledgment after the late response was published", func() bool {
-		f.rpc.mu.Lock()
-		defer f.rpc.mu.Unlock()
-		return len(f.rpc.acked) == 1
-	})
-}
-
-func TestMutationPublicationLedgerCollapsesOutOfOrderResponsesToOneWatermark(t *testing.T) {
-	ledger := &mutationPublicationLedger{}
-	// A replay slot is released by the transport before the raw callback which
-	// used it necessarily returns, so sequence 2 can be observed and published
-	// while sequence 1 is still filling its FUSE reply.
-	if err := ledger.accept(mutationTicket{slot: 4, sequence: 2}, true); err != nil {
-		t.Fatal(err)
-	}
-	if err := ledger.accept(mutationTicket{slot: 4, sequence: 1}, false); err != nil {
-		t.Fatal(err)
-	}
-	ledger.complete(mutationTicket{slot: 4, sequence: 1})
-
-	ledger.mu.Lock()
-	slot := ledger.bySlot[4]
-	through, tail := slot.through, len(slot.seen)
-	ledger.mu.Unlock()
-	if through != 2 || tail != 0 {
-		t.Fatalf("collapsed slot = (through %d, tail %d), want (2, 0)", through, tail)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := ledger.wait(ctx, mutationTicket{slot: 4, sequence: 1}); err != nil {
-		t.Fatalf("wait for collapsed sequence 1: %v", err)
-	}
-	if err := ledger.wait(ctx, mutationTicket{slot: 4, sequence: 2}); err != nil {
-		t.Fatalf("wait for collapsed sequence 2: %v", err)
-	}
-	cancelled, stop := context.WithCancel(context.Background())
-	stop()
-	if err := ledger.wait(cancelled, mutationTicket{slot: 999, sequence: 1}); err == nil {
-		t.Fatal("an event with no matching response unexpectedly completed")
-	}
-	ledger.mu.Lock()
-	entries := len(ledger.bySlot)
-	ledger.mu.Unlock()
-	if entries != 1 {
-		t.Fatalf("an event-first unknown ticket grew the per-slot ledger to %d entries, want 1", entries)
-	}
-}
-
-// --- the initiator exemption ------------------------------------------------
-
-func TestTheInitiatorNeverRepairsItsOwnMutation(t *testing.T) {
-	f := newStrictFixture(t)
-	f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
-	targets := []*authoritypb.VisibilityTarget{
-		namespaceVisibilityTarget(1, "victim"),
-		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, 7, 0),
-	}
-	// A mount that notified here would be asking the kernel for the parent
-	// directory's i_rwsem, which the syscall that caused this very mutation
-	// holds for the whole authority round trip.
-	if err := f.raw.prepareVisibility(context.Background(), targets, true); err != nil {
-		t.Fatalf("PREPARE: %v", err)
-	}
-	if _, held := f.raw.heldNames[nameKey{parent: 1, name: "victim"}]; held {
-		t.Fatal("the initiating mount gated its own name; its own reply is what rebinds that name, under the same lock")
-	}
-	if err := f.raw.completeVisibility(targets, true); err != nil {
-		t.Fatalf("COMPLETE: %v", err)
-	}
-	if calls := f.notify.snapshot(); len(calls) != 0 {
-		t.Fatalf("the initiating mount issued %+v; the VFS already repaired all of it from this operation's own reply", calls)
-	}
-}
-
-func TestInitiatorStillGatesInodeStateItCannotSerialiseWithALock(t *testing.T) {
-	f := newStrictFixture(t)
-	targets := []*authoritypb.VisibilityTarget{inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 7, 8)}
-	if err := f.raw.prepareVisibility(context.Background(), targets, true); err != nil {
-		t.Fatalf("PREPARE: %v", err)
-	}
-	// stat(2) takes no inode lock, so a concurrent local stat is not ordered
-	// against the write the way a lookup is ordered against a create.
-	out := &fuse.AttrOut{}
-	if status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}}, out); !status.Ok() {
-		t.Fatalf("GETATTR = %v", status)
-	}
-	if out.AttrValid != 0 || out.AttrValidNsec != 0 {
-		t.Fatalf("GETATTR inside the initiator's own barrier published %d.%09d", out.AttrValid, out.AttrValidNsec)
+	event := visibilityEvent(99, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE, testSelfSession,
+		namespaceVisibilityTarget(1, "source-owned"))
+	if err := (&coherence{mount: f.mount, session: testSelfSession, budget: time.Second}).apply(context.Background(), event); err == nil {
+		t.Fatal("the source received a filesystem visibility phase even though its local publication gate owns that cut")
 	}
 }
 
@@ -599,7 +588,7 @@ func TestInitiatorStillGatesInodeStateItCannotSerialiseWithALock(t *testing.T) {
 func TestSelfUnlinkDropsTheBindingSoNoRepairIsAttempted(t *testing.T) {
 	f := newStrictFixture(t)
 	f.lookup(t, fuse.FUSE_ROOT_ID, "doomed")
-	if status := f.raw.Unlink(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "doomed"); !status.Ok() {
+	if status := f.unlink(fuse.FUSE_ROOT_ID, "doomed"); !status.Ok() {
 		t.Fatalf("UNLINK = %v", status)
 	}
 	f.raw.mu.Lock()
@@ -613,7 +602,7 @@ func TestSelfUnlinkDropsTheBindingSoNoRepairIsAttempted(t *testing.T) {
 func TestSelfRenameMovesTheBindingInsteadOfLosingIt(t *testing.T) {
 	f := newStrictFixture(t)
 	f.lookup(t, fuse.FUSE_ROOT_ID, "before")
-	if status := f.raw.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}, "before", "after"); !status.Ok() {
+	if status := f.rename(fuse.FUSE_ROOT_ID, fuse.FUSE_ROOT_ID, "before", "after", 0); !status.Ok() {
 		t.Fatalf("RENAME = %v", status)
 	}
 	f.raw.mu.Lock()
@@ -726,7 +715,6 @@ func TestRepairBudgetBreachRevokesTheMount(t *testing.T) {
 
 func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
 	f := newStrictFixture(t)
-	f.mount.profile = CoherenceStrict
 	// No kernel mount was ever recorded, so no absence can be observed and the
 	// session must be left to die rather than released.
 	if err := f.mount.detach(); err == nil {
@@ -885,24 +873,6 @@ func TestASecondCoordinationDeviceIsRefused(t *testing.T) {
 	}
 }
 
-// --- a reclaim settles its replay sequence immediately ---------------------
-
-// A reclaim runs on no raw FUSE callback, so nothing ever calls finish() for
-// it. Its accepted sequence must settle the moment its response is recorded,
-// or the slot's publication watermark stops advancing and the deferred self
-// COMPLETE of the next visible mutation on that slot waits forever.
-func TestReclaimResponseSettlesItsReplaySequenceImmediately(t *testing.T) {
-	m := &Mount{profile: CoherenceStrict}
-	request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: testToken(1)}}}
-	response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: 4, AcceptedSequence: 1}}
-	if err := m.recordMutationResponse(context.Background(), request, response, nil); err != nil {
-		t.Fatalf("record reclaim response: %v", err)
-	}
-	if err := m.publications.wait(context.Background(), mutationTicket{slot: 4, sequence: 1}); err != nil {
-		t.Fatalf("a reclaim's sequence did not settle on acceptance: %v", err)
-	}
-}
-
 // --- targets missing their coordination facts fail closed ------------------
 
 func TestVisibilityTargetsMissingCoordinationFactsAreRefused(t *testing.T) {
@@ -976,12 +946,10 @@ func TestStrictMountIsRefusedWithoutASessionIdentity(t *testing.T) {
 // --- the visibility lane is reserved out of the transport budget -----------
 
 func TestStrictMountReservesAVisibilityLane(t *testing.T) {
-	uncached := newMount(context.Background(), newFakeRPC(), testConfig(8))
-	defer uncached.cancel()
 	strict := newMount(context.Background(), newFakeRPC(), testStrictConfig(8))
 	defer strict.cancel()
-	if cap(strict.bulk) != cap(uncached.bulk)-visibilityReserve {
-		t.Fatalf("strict bulk lane = %d, uncached = %d; the visibility loop's slot must come out of the bulk budget or it is not reserved at all",
-			cap(strict.bulk), cap(uncached.bulk))
+	want := testStrictConfig(8).MaxInFlight - reclaimLaneWidth(testStrictConfig(8).MaxInFlight) - livenessReserve - visibilityReserve
+	if cap(strict.bulk) != want {
+		t.Fatalf("bulk lane = %d, want %d; visibility and liveness slots must be structurally reserved", cap(strict.bulk), want)
 	}
 }

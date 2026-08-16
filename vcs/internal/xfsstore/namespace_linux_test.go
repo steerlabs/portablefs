@@ -3,6 +3,7 @@
 package xfsstore
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,44 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestTmpfileRetainsCreationAccessAndExactLinkability(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, attr, err := v.Tmpfile(root, 0o400, false)
+	if errors.Is(err, syscall.EOPNOTSUPP) {
+		// The non-production test volume may be overlayfs. Production Open has
+		// already required XFS and qualified O_TMPFILE for write staging.
+		t.Skip("test filesystem does not support O_TMPFILE")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Forget(item)
+	if attr.Kind != KindRegular || attr.Nlink != 0 || attr.Mode.Perm() != 0o400 {
+		t.Fatalf("tmpfile attr = %+v", attr)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatalf("creation-grant open = %v", err)
+	}
+	defer v.CloseOpen(handle)
+	if n, err := v.WriteAt(handle, []byte("tmp"), 0); n != 3 || err != nil {
+		t.Fatalf("write tmpfile = (%d, %v)", n, err)
+	}
+	if linked, err := v.Link(item, root, "linked-tmpfile"); err != nil || linked.Nlink != 1 {
+		t.Fatalf("linkable tmpfile = (%+v, %v)", linked, err)
+	}
+
+	exclusive, _, err := v.Tmpfile(root, 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Forget(exclusive)
+	if _, err := v.Link(exclusive, root, "must-not-link"); err == nil {
+		t.Fatal("O_TMPFILE|O_EXCL inode was linkable")
+	}
+}
 
 // TestLinkReportsAnObservationNotAComputation is the fabricated-attribute
 // defect. Link used to answer with a stat taken before the mutation, with the
@@ -171,8 +210,8 @@ func TestCreateAndChmodRefuseSetuid(t *testing.T) {
 	}
 }
 
-// TestZeroLengthOperations: an empty read is not an end-of-file condition, and
-// an empty append is still assigned the offset the file actually ends at.
+// TestZeroLengthOperations: empty positional I/O is a local no-op. The patched
+// kernel also answers an empty append locally and never starts a transaction.
 func TestZeroLengthOperations(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
@@ -198,23 +237,8 @@ func TestZeroLengthOperations(t *testing.T) {
 		t.Fatalf("ReadAt at EOF = (%d, %v), want io.EOF", n, err)
 	}
 
-	appender, err := v.OpenFile(item, OpenFlags{Write: true, Append: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer v.CloseOpen(appender)
-	n, off, err := v.Append(appender, nil)
-	if n != 0 || err != nil {
-		t.Fatalf("Append(empty) = (%d, %d, %v)", n, off, err)
-	}
-	if off != 10 {
-		t.Fatalf("Append(empty) assigned offset %d, want the end of the file 10", off)
-	}
-	if n, off, err := v.Append(appender, []byte("xy")); n != 2 || off != 10 || err != nil {
-		t.Fatalf("Append = (%d, %d, %v), want (2, 10, nil)", n, off, err)
-	}
-	if n, off, err := v.Append(appender, nil); n != 0 || off != 12 || err != nil {
-		t.Fatalf("Append(empty) after a write = (%d, %d, %v), want (0, 12, nil)", n, off, err)
+	if n, err := v.WriteAt(reader, nil, 10); n != 0 || err != nil {
+		t.Fatalf("WriteAt(empty) = (%d, %v), want (0, nil)", n, err)
 	}
 }
 
@@ -316,9 +340,9 @@ func TestCreateWithARestrictiveModeGrantsAWritableHandle(t *testing.T) {
 	}
 }
 
-// TestCreateGrantCarriesAppendAndTruncate: the two open-time behaviors that
-// still have to reach the handed-over description.
-func TestCreateGrantCarriesAppendAndTruncate(t *testing.T) {
+// TestCreateGrantCarriesAccessAndTruncate verifies that creation access is
+// retained while append remains a per-operation choice, never a sticky fd bit.
+func TestCreateGrantCarriesAccessAndTruncate(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
 	item, _, err := v.Create(root, "appended", 0o444, true)
@@ -329,11 +353,18 @@ func TestCreateGrantCarriesAppendAndTruncate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n, off, err := v.Append(handle, []byte("one")); n != 3 || off != 0 || err != nil {
-		t.Fatalf("Append = (%d, %d, %v)", n, off, err)
+	if n, err := v.WriteAt(handle, []byte("one"), 0); n != 3 || err != nil {
+		t.Fatalf("positional write through append-intent grant = (%d, %v)", n, err)
 	}
-	if n, off, err := v.Append(handle, []byte("two")); n != 3 || off != 3 || err != nil {
-		t.Fatalf("Append = (%d, %d, %v), want offset 3 from the O_APPEND description", n, off, err)
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, off, post, err := target.CommitWrite(bytes.NewReader([]byte("two")), WriteCommit{RequestedSize: 3, RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}, make([]byte, 2)); n != 3 || off != 3 || post.Size != 6 || err != nil {
+		t.Fatalf("per-call append = (%d, %d, %d, %v)", n, off, post, err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if err := v.CloseOpen(handle); err != nil {
 		t.Fatal(err)
@@ -378,8 +409,8 @@ func TestHandleAccessIsTheAccessThatWasAskedFor(t *testing.T) {
 	if _, err := v.WriteAt(reader, []byte("x"), 0); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("WriteAt on a read-only handle = %v, want EBADF", err)
 	}
-	if _, _, err := v.Append(reader, []byte("x")); !errors.Is(err, syscall.EBADF) {
-		t.Fatalf("Append on a read-only handle = %v, want EBADF", err)
+	if _, err := v.PinWriteTarget(reader); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("PinWriteTarget on a read-only handle = %v, want EBADF", err)
 	}
 	if err := v.Truncate(reader, 0); !errors.Is(err, fs.ErrInvalid) {
 		t.Fatalf("Truncate on a read-only handle = %v, want EINVAL", err)

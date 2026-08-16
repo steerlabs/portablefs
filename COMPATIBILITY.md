@@ -30,31 +30,68 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
 ### The authority wire
 
 - **Transport is mutually authenticated TLS 1.3**, with ALPN
-  `portablefs-authority-v3` and authority protocol major `3`. Plaintext is
+  `portablefs-authority-v5` and authority protocol major `5`. Plaintext is
   refused; there is no fallback mode and no environment escape.
 
   The names are worth reading carefully, because two version numbers are in play
-  and they do not mean the same thing. `portablefs-authority-v3` and protocol
-  major `3` name the *authority protocol* generation, not the product
-  generation. Authority protocol 3 makes every capability acquisition an exact
-  replay operation. In particular, Lookup is not a side-effect-free read: its
-  reply transfers an item capability that must be returned exactly once or
-  explicitly reclaimed. A protocol-2 peer can leak the first capability when a
-  successful reply is lost, so peers fail at `Hello` rather than mix lifecycles.
+  and they do not mean the same thing. `portablefs-authority-v5` and protocol
+  major `5` name the *authority protocol* generation, not the product
+  generation. Authority protocol 5 requires exactly one authenticated DATA
+  transport and one authenticated CONTROL transport in the same random
+  connection set. Attach returns only a provisional credential. The session
+  becomes active exactly once, through Activate, after both role bindings and
+  their generations are proven; AbortAttach names the exact attach attempt.
+  A provisional session cannot execute filesystem or visibility operations.
+  There is no single-connection or direct-active-attach compatibility path.
+
+  Protocol 5 retains protocol 4's exact-replay treatment
+  of every capability acquisition. For mutations, the client sends only its
+  owned replay slot and sequence; the authority derives the content identity
+  with a per-epoch secret keyed fingerprint over the full canonical body. The
+  secret and fingerprint never cross the wire, and replay state is discarded
+  with that same epoch. Protocol 5 carries write-transaction DATA fragments in
+  `WriteTransactionRequest.Data` and read payloads in `ReadReply.Data` as the
+  frame's one exact out-of-line bulk body. The protobuf
+  metadata and bulk lengths are both in the frame header; a bulk body on any
+  other message, or an inline copy of either bulk field, is a protocol error.
+  This removes client-side mutation hashing and payload-sized protobuf copies
+  without adding another data path.
+  In particular, Lookup is not a side-effect-free read: its reply transfers an
+  item capability that must be returned exactly once or explicitly reclaimed.
+  Protocol 4 also permits a visibility `Next` request to atomically acknowledge
+  its `after` cursor and long-poll for the successor. Repeating that request
+  after a lost response is safe because the exact last accepted cursor remains
+  idempotent. Protocol 5 replaces source self-phases with one exact
+  source-publication gate: the initiating frontend closes and drains its stable
+  item/name footprint before dispatch, the authority independently derives and
+  validates that same footprint, and PREPARE/COMPLETE are delivered only to
+  other cached participants. On Linux the local gate remains closed through
+  the kernel's operation-specific VFS postprocessing and the physical ACK of a
+  forced `FUSE_PFS_PUBLISH`; a daemon `write(/dev/fuse)` returning is not that
+  boundary. Qualification frontends must supply an equally explicit framework
+  publication verdict. A post-apply local publication failure ends the mount
+  rather than reopening stale state. Protocol-4 single-transport
+  direct activation and protocol-5 paired, provisional activation are
+  wire-incompatible, so peers fail at TLS ALPN and `Hello` rather than mix
+  lifecycles.
 
 - **Both peers name what they require, and refuse on absence.** A session
   requires the `xfs-current-state`, `session-exact-epoch`, `direct-write`,
+  `framed-bulk-data-v1`, `authority-keyed-replay-fingerprint-v1`,
+  `visibility-ack-next-v1`, `mandatory-dual-transport-v1`,
+  `transactional-shared-write-v1`, `strict-linux-mutation-suite-v1`,
+  `terminal-applied-delivery-receipt-v1`,
   `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
-  `classified-visibility-interruption`, `source-phase-queueability`,
+  `classified-visibility-interruption`, `source-publication-gate-v1`,
   `namespace-post-binding-identity`, and `exact-resource-acquisition` features at `Hello`, and `write-through`,
   `no-history`, `no-branches`,
   `direct-io-no-file-mmap`, `user-xattr-readonly`, `single-principal`,
-  `distributed-posix-locks`, `stable-item-identity`, `readdir-plus-items`, and
-  `volume-syncfs-barrier`, and `exact-resource-acquisition` at `Attach`. A
+  `distributed-posix-locks`, `stable-item-identity`, `readdir-plus-items`,
+  `volume-syncfs-barrier`, and `exact-resource-acquisition` at `Activate`. A
   strict attach additionally requires
   `strict-two-phase-visibility`, `exact-parent-repair-interruption`,
-  `classified-visibility-interruption`, `source-phase-queueability`, and
-  `namespace-post-binding-identity` in its attach reply. These strings are the contract's shape written down: an
+  `classified-visibility-interruption`, `source-publication-gate-v1`, and
+  `namespace-post-binding-identity` in its Activate reply. These strings are the contract's shape written down: an
   authority that stopped meeting one of them would be refused rather than
   silently tolerated.
 
@@ -69,7 +106,7 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   and requires a coordinated client and authority upgrade. PortableFS fails
   closed instead of carrying a second compatibility execution path.
 
-- **Requests are object-relative.** Attach returns an opaque root token; lookup
+- **Requests are object-relative.** Activate returns an opaque root token; lookup
   takes a parent token and one raw name component. The authority never accepts a
   host path or a client-supplied inode number, and every token is invalidated at
   an epoch change.
@@ -81,29 +118,24 @@ frozen: write-through acknowledgement, `fsync` on the authoritative descriptor,
 `close` is not an implicit `fsync`, session-exact replay inside an epoch, no
 silent continuation across an epoch, atomic rename, and open-after-unlink. The
 authority implements independent POSIX record and `flock` lock namespaces, and
-Linux FUSE forwards both. macOS FSKit exposes neither lock callback; macOS uses
-authority-serialized `O_EXCL` create or atomic rename for cross-machine
-coordination. FSKit also omits append intent, so cross-machine append atomicity
-is a Linux-only guarantee. These frontend limits are part of the contract, not
-fallback behavior.
+Linux FUSE forwards both. Current FSKit exposes neither lock callback nor the
+cache primitives required for a strict shared filesystem, so production macOS
+mounts are refused before Attach rather than advertising a smaller guarantee.
 
 The explicit refusals are equally frozen, because programs depend on getting an
 errno rather than incoherent data: shared file-backed `mmap`, `setxattr`, device
-nodes, FIFOs, sockets, setuid execution, and cross-volume link and rename.
-The XFS authority and Linux expose unsupported xattr writes as `EOPNOTSUPP`.
-For a production v3 attach, pfslocal advertises the xattr family but separately
-advertises xattr set as unsupported. macOS validates the item and name, refuses
-set/create/replace/upsert before emitting a daemon mutation, and exposes
-Darwin's distinct `EOPNOTSUPP` (102), not `ENOTSUP` (45): XNU interprets 45 as
-permission to create an AppleDouble `._*` sidecar. PortableFS never substitutes
-that second xattr store. Read, list, and removal remain ordinary daemon calls.
+nodes, FIFOs, sockets, setuid execution, and cross-volume link and rename. The
+XFS authority and Linux expose unsupported xattr writes as `EOPNOTSUPP`. The
+macOS xattr mapping remains covered by qualification tests, but it is not a
+production surface while all macOS protocol-5 mounts are refused.
 
 ### Mount transports
 
-Linux mounts through kernel FUSE; macOS mounts through the FSKit extension and
-the `portablefsd` v3 data plane. One transport per platform, no fallback. A host
-that cannot serve its platform's transport fails with guidance rather than
-degrading to a weaker consistency model.
+Linux mounts through kernel FUSE. No currently documented macOS FSKit version
+has a production-admitted PortableFS transport: the CLI refuses before daemon
+startup or Attach, the shipping extension refuses before socket resolution,
+and portablefsd independently refuses before constructing an authority
+transport. There is no fallback, degraded cache policy, or runtime opt-in.
 
 Windows has no declared transport, released client binary, or install path yet.
 The pure `auto` selector carries a stable primitive-gate refusal that any future
@@ -116,56 +148,31 @@ declaring a future transport are in
 
 ### Declared macOS cache policies
 
-A macOS mount names its cache policy and the authority validates it. Three names
-are declared: the frozen `macos26-synchronous-vfs-repair-v1`, the current
-`macos26-synchronous-vfs-repair-v2` compatibility policy, and
-`fskit-native-revocation-v1`, the macOS 27 native policy, which is
-declared so that it can be refused explicitly rather than approximated. An
-unknown policy fails closed with `ENOTSUP`. A policy name means exactly one set
-of semantics forever; a changed contract gets a new name. See
-[docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
+Three cache-policy names remain in the protocol so unsupported and qualification
+clients are rejected precisely: `macos26-synchronous-vfs-repair-v1`,
+`macos26-synchronous-vfs-repair-v2`, and `fskit-native-revocation-v1`. None is a
+production-admitted macOS mount policy. An unknown policy still fails closed;
+an existing name is never reinterpreted as a fallback.
 
-The frozen execution semantics are load-bearing:
+The SDK-26 and SDK-27 adapters remain compile and test lanes for protocol work.
+The SDK-27 lane requires the exact build-time qualification stamp
+`sdk27-live-qualification-only` in the CLI and the compile-time
+`portablefs_macos27_qualification` tag in portablefsd. These are properties of a
+separately signed qualification artifact, not environment toggles. The stamp
+does not admit macOS 26, macOS 28, or a shipping extension. An unsupported
+repair terminates a qualification mount before COMPLETE; passing a qualification
+test does not promote it to product support.
 
-- `macos26-synchronous-vfs-repair-v1` declares the authority's
-  `CALLBACK_SERIALIZED` participant profile. While that participant owes
-  PREPARE or deferred COMPLETE, its new or already-queued mutation is refused
-  definite-preapply with a classified `EINTR` and retained as that replay
-  outcome. The legacy FSKit boundary exposes that `EINTR` unchanged. An
-  overlapping FSKit callback arriving after local PREPARE is refused `EBUSY`
-  before any pfslocal request.
-- `macos26-synchronous-vfs-repair-v2` declares the identity-aware
-  `CALLBACK_SERIALIZED_PIPELINED` profile and translates classified authority
-  interruption to `ECANCELED` at the FSKit edge. macOS 26 may re-enter a
-  mutating callback after `EINTR`, `EBUSY`, or `EAGAIN` with a fresh replay
-  identity, so v2 never exposes those restartable outcomes for a publication
-  refusal. A peer repair, an unknown callback identity, another mutation from
-  the exact callback that initiated the outstanding source phase, or a request
-  whose `source_phase_queueable` proof is false is still interrupted
-  definite-preapply. A distinct nonzero callback from that source may queue
-  through its own PREPARE and deferred COMPLETE only when that exact ordered
-  request carries `source_phase_queueable=true`. True means the Swift frontend
-  committed the request while the callback had submitted no ordinary request
-  of any kind, and will therefore exclude that ordered-only callback from its
-  own-source PREPARE drain. A mixed callback carries false, is revoked and
-  drained locally, and its ordered mutation is interrupted before prepare or
-  apply at the authority. A pristine callback parks locally before dispatch.
-  Source repair never re-enters FSKit and COMPLETE waits only for the initiating
-  callback, so the explicitly proven ordered-only queue has no reverse
-  dependency. After a peer's local COMPLETE, overlapping callbacks likewise
-  park until the authority accepts that exact cursor; the ACK-only gap never
-  reaches mutation order.
-  Once any ordered mutation frame is dispatched, cancellation waits for its
-  exact outcome; loss of that outcome terminates the mount with `EIO`.
-- `fskit-native-revocation-v1` declares the `INDEPENDENT` participant profile.
-  It never inherits callback-serialized interruption. The ordinary CLI refuses
-  macOS 27 before attach until every native repair family is qualified. A
-  separately build-stamped SDK-27 qualification client may exercise the signed
-  development adapter, but an unrepresentable repair terminates that mount
-  before COMPLETE; it is not a supported product attach.
-
-Changing either profile, errno boundary, pre-apply guarantee, or replay meaning
-requires a new cache-policy name.
+The production refusal is architectural. macOS 26 `FSVolume.Operations`
+callbacks cannot return the complete child/item/parent attribute snapshots for
+namespace and write mutations. macOS 27 `FSVolume.Handler` adds most source
+result attributes, but current FSKit still has no documented exact namespace or
+inode-attribute invalidation API for peer changes; its data-cache handler covers
+only retained item data. A source-publication gate, synthetic nested VFS call,
+TTL change, or force-unmount watchdog cannot manufacture either missing
+primitive. See
+[docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md) and
+[docs/macos-27-native-coherence.md](./docs/macos-27-native-coherence.md).
 
 ### The routing declaration
 
@@ -183,11 +190,9 @@ different revision fails closed.
 variable. Documented flags keep their meaning; new flags and new JSON fields may
 appear, and consumers must ignore unknown fields. `lifecycle`,
 `install-macos-app`, and `install-linux-release` are installer and app
-coordination surfaces, not a user contract. Native macOS readiness never asks
-the shell process to open the mounted path: it proves the exact kernel mount,
-requires a live resolved `portablefskit` frontend witness from the daemon, then
-re-proves the kernel identity. Legacy macOS policies retain their separately
-declared descriptor-root handoff.
+coordination surfaces, not a user contract. The shipping macOS mount command
+fails at its FSKit primitive gate before readiness or Attach. Qualification-only
+readiness code remains internal and makes no production compatibility promise.
 
 ### Release identity
 
@@ -205,15 +210,15 @@ Additive evolution with versioning; consumers tolerate additions.
 - New authority operations and new feature strings behind the existing
   handshake, where an authority that lacks them still serves the frozen set.
   `session-reauthorization-v1` is one such optional feature: it adds an exact,
-  session-bound `Reauthorize` operation without making older v3 authorities
-  invalid for standalone mounts. `mount-enrollment-reauthorization-v1` names
+  session-bound `Reauthorize` operation without making older protocol-5
+  authorities invalid for standalone mounts. `mount-enrollment-reauthorization-v1` names
   the Manager-enrollment grant basis; an automatic mount requires it and fails
   its handshake against an older authority instead of changing renewal modes.
 - New optional protobuf fields. Unknown fields are not part of the protocol —
   the canonical request encoding rejects them — so a field is added on both sides
   or not at all.
 - `pfslocal` minor version bumps. The local protocol between `portablefsd` and
-  the FSKit extension is major 1, currently minor 14, and grows additively.
+  the FSKit extension is major 1, currently minor 15, and grows additively.
 - New environment variables, where leaving one unset preserves previous
   behaviour.
 - New authority bounds and timeouts. Their defaults may change; a deployment that

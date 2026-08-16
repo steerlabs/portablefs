@@ -153,6 +153,29 @@ mkdir -m 0700 -- "$control_dir"
 chown "$service_uid:$service_gid" "$control_dir"
 sync -- "$control_dir"
 sync -- "$control_root"
+
+# Transactional writes stage bytes in unnamed O_TMPFILE inodes. Keep that
+# storage outside the user-visible volume namespace, but charge it to the same
+# XFS project and hard limit as the destination data. Otherwise one authority
+# could fill the cell through staging even though its visible volume remained
+# inside quota. The directory is private to the service identity and project
+# inheritance makes every unnamed staging inode part of the same accounting
+# tree.
+write_staging=$control_dir/write-staging
+mkdir -m 0700 -- "$write_staging"
+xfs_quota -x -c "project -s -p $write_staging $project_id" "$mount_target"
+write_staging_attributes=$(LC_ALL=C xfs_io -r -c stat -- "$write_staging")
+write_staging_project=$(printf '%s\n' "$write_staging_attributes" | sed -n 's/^fsxattr\.projid = \([0-9]\{1,\}\)$/\1/p')
+write_staging_xflags=$(printf '%s\n' "$write_staging_attributes" | sed -n 's/^fsxattr\.xflags = 0x\([0-9a-fA-F]\{1,\}\).*$/\1/p')
+[[ $write_staging_project == "$project_id" ]] ||
+  fail "write staging project validation failed: project ID is ${write_staging_project:-unreadable}, want $project_id"
+[[ $write_staging_xflags =~ ^[0-9a-fA-F]+$ ]] || fail "write staging project validation failed: xflags are unreadable"
+(( (16#$write_staging_xflags & 0x200) != 0 )) || fail "write staging project inheritance flag is not set"
+chown "$service_uid:$service_gid" "$write_staging"
+chmod 0700 "$write_staging"
+sync -- "$write_staging"
+sync -- "$control_dir"
+sync -f -- "$mount_root"
 write_registry_record published
 
-echo "provisioned $destination (project $project_id, owner $service_uid:$service_gid, hard limits $block_limit / $inode_limit inodes; visibility state $control_dir/strict-membership)"
+echo "provisioned $destination (project $project_id, owner $service_uid:$service_gid, hard limits $block_limit / $inode_limit inodes; visibility state $control_dir/strict-membership; transactional staging $write_staging)"

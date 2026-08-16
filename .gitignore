@@ -34,10 +34,16 @@ fsio-bin
 vcs/mount
 vcs/spike
 vcs/treehashcheck
+vcs/portablefs-authority
 *.wal
 linux-bins/
 *-linux-amd64
 *.test
+
+# Python/kernel-verifier and checkpatch scratch artifacts
+__pycache__/
+*.py[cod]
+.checkpatch-camelcase.git.
 
 # Additional local build outputs, coverage files, and OS/IDE cruft
 vcs/vcs

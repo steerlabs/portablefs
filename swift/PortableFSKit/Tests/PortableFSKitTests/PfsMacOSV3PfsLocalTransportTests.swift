@@ -25,7 +25,7 @@ private func v3Contract(
     initialCursor: PfsVisibilityCursor? = nil
 ) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 5
     contract.authorityEpoch = epoch
     contract.sessionID = sessionID
     contract.cachePolicy = policy
@@ -58,7 +58,6 @@ private func v3Event(
     sequence: UInt64 = 1,
     phase: PfsVisibilityPhase = .prepare,
     initiatorSessionID: Data = v3PeerSession,
-    localOperationID: UInt64 = 0,
     targets: [PfsVisibilityTarget]
 ) -> PfsV3VisibilityEvent {
     var event = PfsV3VisibilityEvent()
@@ -67,7 +66,6 @@ private func v3Event(
     event.initiatorSessionID = initiatorSessionID
     event.mutationSlot = 7
     event.mutationSequence = 99
-    event.localOperationID = localOperationID
     event.targets = targets
     return event
 }
@@ -124,7 +122,7 @@ extension PfsLocalMockDaemonTests {
     let parsed = try PfsLocalMacOSV3CoherenceTransport.parseContract(
         v3Contract(initialCursor: complete)
     )
-    #expect(parsed.authorityProtocolMajor == 3)
+    #expect(parsed.authorityProtocolMajor == 5)
     #expect(parsed.epoch == v3Epoch)
     #expect(parsed.sessionID == v3LocalSession)
     #expect(parsed.cachePolicy == .synchronousVFSRepairV1)
@@ -292,7 +290,6 @@ extension PfsLocalMockDaemonTests {
 
     #expect(decoded.sequence == 1)
     #expect(decoded.phase == .prepare)
-    #expect(decoded.initiator.localOperationID == nil)
     #expect(decoded.repairs.count == 2)
     guard case let .invalidateData(dataPath, knownParent, knownIdentity, fileID, size) = decoded.repairs[0] else {
         Issue.record("expected data invalidation to subsume the same-coordinate eviction")
@@ -357,46 +354,18 @@ extension PfsLocalMockDaemonTests {
     #expect(name == Data("alias".utf8))
 }
 
-@Test func v3EventDecoderBindsLocalEventsToOneExactPublicationOperation() async throws {
+@Test func v3EventDecoderRejectsSourceFilesystemVisibilityEvents() async throws {
     let root = try v3Identity(1)
     let planner = PfsMacOSRepairPlanner(index: PfsMacOSNamespaceIndex(rootIdentity: root))
     let target = v3Target(scope: .attributes, identity: Data(repeating: 0x44, count: 16))
 
     let local = v3Event(
         initiatorSessionID: v3LocalSession,
-        localOperationID: 123,
-        targets: [target]
-    )
-    let decoded = try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-        local,
-        expectedEpoch: v3Epoch,
-        expectedSessionID: v3LocalSession,
-        planner: planner
-    )
-    #expect(decoded.initiator.localOperationID == 123)
-
-    let missingLocalID = v3Event(
-        initiatorSessionID: v3LocalSession,
-        localOperationID: 0,
         targets: [target]
     )
     await #expect(throws: PfsMacOSCoherenceError.invalidVisibilityTarget) {
         try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            missingLocalID,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
-
-    let forgedPeerID = v3Event(
-        initiatorSessionID: v3PeerSession,
-        localOperationID: 123,
-        targets: [target]
-    )
-    await #expect(throws: PfsMacOSCoherenceError.invalidVisibilityTarget) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            forgedPeerID,
+            local,
             expectedEpoch: v3Epoch,
             expectedSessionID: v3LocalSession,
             planner: planner
@@ -536,7 +505,6 @@ extension PfsLocalMockDaemonTests {
     routes.initiatorSessionID = Data(repeating: 0, count: 16)
     routes.mutationSlot = 0
     routes.mutationSequence = 0
-    routes.localOperationID = 0
     var change = PfsRoutesChange()
     change.revision = Data(repeating: 0xCC, count: 32)
     change.rules = Data("rules".utf8)
@@ -744,7 +712,6 @@ extension PfsLocalMockDaemonTests {
     routeEvent.initiatorSessionID = Data(repeating: 0, count: 16)
     routeEvent.mutationSlot = 0
     routeEvent.mutationSequence = 0
-    routeEvent.localOperationID = 0
     var routes = PfsRoutesChange()
     routes.revision = Data(repeating: 0xDD, count: 32)
     routeEvent.routes = routes

@@ -43,6 +43,14 @@ type options struct {
 	maxItemsPerSession, maxOpensPerSession         uint
 	maxItems, maxOpens                             uint
 	maxRetainedReplyBytes, maxFrameBytesInFlight   uint64
+	writeStaging                                   string
+	maxWriteStagingBytesPerSession                 uint64
+	maxWriteStagingBytes                           uint64
+	maxWriteTransactionsPerSession                 uint
+	maxWriteTransactions                           uint
+	writeTransactionProgressTimeout                time.Duration
+	writeTransactionAbsoluteTimeout                time.Duration
+	terminalDeliveryTimeout                        time.Duration
 	capabilityLifetime                             time.Duration
 	capabilityNonces                               uint
 	sessionLease                                   time.Duration
@@ -76,7 +84,7 @@ func run() error {
 	flag.UintVar(&o.maxRead, "max-read-bytes", 1<<20, "maximum bytes in one read reply")
 	flag.UintVar(&o.maxWrite, "max-write-bytes", 1<<20, "maximum bytes in one write request")
 	flag.UintVar(&o.replaySlots, "max-replay-slots", 256, "maximum concurrent retry slots per session")
-	flag.UintVar(&o.maxSessions, "max-sessions", 1024, "maximum live mount sessions for this volume worker")
+	flag.UintVar(&o.maxSessions, "max-sessions", defaultMaxSessions, "maximum live mount sessions for this volume worker")
 	flag.UintVar(&o.maxLockRecords, "max-lock-records", 65536, "maximum held and waiting POSIX lock records")
 	flag.UintVar(&o.maxItemsPerSession, "max-items-per-session", 8192, "maximum descriptor-backed item capabilities per session")
 	flag.UintVar(&o.maxOpensPerSession, "max-opens-per-session", 4096, "maximum open file descriptions per session")
@@ -84,11 +92,19 @@ func run() error {
 	flag.UintVar(&o.maxOpens, "max-opens", 32768, "maximum open file descriptions for the worker")
 	flag.Uint64Var(&o.maxRetainedReplyBytes, "max-retained-reply-bytes", 512<<20, "total bytes this worker may hold in replay slots")
 	flag.Uint64Var(&o.maxFrameBytesInFlight, "max-frame-bytes-in-flight", 512<<20, "total bytes this worker may have allocated for inbound frames")
+	flag.StringVar(&o.writeStaging, "write-staging-dir", "", "absolute private 0700 directory for unnamed transactional-write staging")
+	flag.Uint64Var(&o.maxWriteStagingBytesPerSession, "max-write-staging-bytes-per-session", 16<<30, "staging bytes reserved by one session")
+	flag.Uint64Var(&o.maxWriteStagingBytes, "max-write-staging-bytes", 64<<30, "staging bytes reserved by this worker")
+	flag.UintVar(&o.maxWriteTransactionsPerSession, "max-write-transactions-per-session", 8, "inert or committing write transactions owned by one session")
+	flag.UintVar(&o.maxWriteTransactions, "max-write-transactions", 4096, "inert or committing write transactions owned by this worker")
+	flag.DurationVar(&o.writeTransactionProgressTimeout, "write-transaction-progress-timeout", 2*time.Minute, "maximum idle interval between write transaction phases")
+	flag.DurationVar(&o.writeTransactionAbsoluteTimeout, "write-transaction-absolute-timeout", 30*time.Minute, "absolute lifetime of inert write staging")
+	flag.DurationVar(&o.terminalDeliveryTimeout, "terminal-delivery-timeout", 45*time.Second, "maximum drain from a terminal exact result through peer repair and source kernel publication receipt")
 	flag.DurationVar(&o.capabilityLifetime, "capability-max-lifetime", 15*time.Minute, "longest capability validity window this authority will honour")
 	flag.UintVar(&o.capabilityNonces, "capability-nonce-records", 65536, "single-use capability records retained until expiry")
 	flag.DurationVar(&o.sessionLease, "session-lease", 2*time.Minute, "renewable session lease")
 	flag.IntVar(&o.maxInFlight, "max-in-flight", 256, "requests concurrently executing per TLS connection")
-	flag.IntVar(&o.maxConnections, "max-connections", 2048, "maximum accepted TLS connections for the worker")
+	flag.IntVar(&o.maxConnections, "max-connections", defaultMaxConnections, "maximum accepted TLS connections for the worker; must be at least 4 times max-sessions")
 	flag.DurationVar(&o.handshakeTimeout, "tls-handshake-timeout", 10*time.Second, "maximum TLS handshake duration")
 	flag.DurationVar(&o.idleTimeout, "connection-idle-timeout", 5*time.Minute, "maximum interval without a complete request frame")
 	flag.DurationVar(&o.writeTimeout, "connection-write-timeout", 30*time.Second, "maximum response frame write duration")
@@ -105,8 +121,8 @@ func run() error {
 		return errors.New("portablefs-authority refuses to run as root; provision XFS first, then run as the volume service owner")
 	}
 	if (o.listen == "" && !systemdSocketAvailable()) || o.volumeID == "" || o.root == "" || o.projectID == 0 ||
-		o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.visibilityMembership == "" {
-		return errors.New("a listen address or one systemd socket, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, and visibility membership file are required")
+		o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.visibilityMembership == "" || o.writeStaging == "" {
+		return errors.New("a listen address or one systemd socket, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, visibility membership file, and write staging directory are required")
 	}
 	hosted := o.productAuthorizationPublicKey != "" || o.productIssuer != "" || o.authorizationDomain != "" ||
 		o.owner != "" || o.cellID != "" || o.authorityID != "" || o.authorityGeneration != 0
@@ -122,9 +138,17 @@ func run() error {
 		o.maxItemsPerSession == 0 || o.maxItemsPerSession > maxUint32 || o.maxOpensPerSession == 0 || o.maxOpensPerSession > maxUint32 ||
 		o.maxItems == 0 || o.maxItems > maxUint32 || o.maxOpens == 0 || o.maxOpens > maxUint32 ||
 		o.maxItemsPerSession > o.maxItems || o.maxOpensPerSession > o.maxOpens ||
+		o.maxWriteStagingBytesPerSession < authorityrpc.RequiredWriteTransactionBytes ||
+		o.maxWriteStagingBytes < o.maxWriteStagingBytesPerSession ||
+		o.maxWriteTransactionsPerSession == 0 || o.maxWriteTransactionsPerSession > maxUint32 ||
+		o.maxWriteTransactions == 0 || o.maxWriteTransactions > maxUint32 || o.maxWriteTransactionsPerSession > o.maxWriteTransactions ||
+		o.writeTransactionProgressTimeout <= 0 || o.writeTransactionAbsoluteTimeout < o.writeTransactionProgressTimeout || o.terminalDeliveryTimeout < o.maxRepairBudget ||
 		o.capabilityLifetime <= 0 || o.capabilityNonces == 0 || o.capabilityNonces > uint(^uint32(0)) ||
 		o.maxInFlight < 2 || uint64(o.maxInFlight) > uint64(maxUint32) || o.maxConnections <= 0 || o.handshakeTimeout <= 0 || o.idleTimeout <= o.sessionLease || o.writeTimeout <= 0 {
 		return errors.New("protocol allocation and replay bounds must be positive uint32 values, and max-in-flight must admit an ordinary request alongside a blocking lock wait")
+	}
+	if err := validateConnectionCapacity(o.maxSessions, o.maxConnections); err != nil {
+		return err
 	}
 	// The reserve straddles a process boundary: the client checks the bounds it
 	// is told against the same constant, so both sides must read it from the
@@ -155,6 +179,11 @@ func run() error {
 		return fmt.Errorf("open authoritative XFS volume: %w", err)
 	}
 	defer store.Close()
+	writeStaging, err := authorityrpc.OpenWriteTransactionStaging(o.writeStaging)
+	if err != nil {
+		return err
+	}
+	defer writeStaging.Close()
 	runtime, err := volumeserver.New(o.volumeID, volumeserver.Config{
 		SessionLease: o.sessionLease, MaxReplaySlots: uint32(o.replaySlots),
 		MaxSessions: uint32(o.maxSessions), MaxLockRecords: uint32(o.maxLockRecords),
@@ -205,7 +234,7 @@ func run() error {
 	// mount from a disagreeing one, so a declaration that will not parse stops
 	// the process here rather than admitting mounts against a topology this
 	// volume does not have.
-	routes, err := authorityrpc.NewRoutesController(store, visibility)
+	routes, err := authorityrpc.NewRoutesController(store, visibility, runtime.Locks())
 	if err != nil {
 		return err
 	}
@@ -254,6 +283,11 @@ func run() error {
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),
 		MaxRetainedReplyBytes: o.maxRetainedReplyBytes,
+		WriteStaging:          writeStaging, MaxWriteTransactionBytes: authorityrpc.RequiredWriteTransactionBytes,
+		MaxWriteStagingBytesPerSession: o.maxWriteStagingBytesPerSession, MaxWriteStagingBytes: o.maxWriteStagingBytes,
+		MaxWriteTransactionsPerSession: uint32(o.maxWriteTransactionsPerSession), MaxWriteTransactions: uint32(o.maxWriteTransactions),
+		WriteTransactionProgressTimeout: o.writeTransactionProgressTimeout, WriteTransactionAbsoluteTimeout: o.writeTransactionAbsoluteTimeout,
+		TerminalDeliveryTimeout: o.terminalDeliveryTimeout,
 		OnStorageFailure: func(err error) {
 			select {
 			case storageFailure <- err:
@@ -287,6 +321,7 @@ func run() error {
 				return
 			case <-ticker.C:
 				runtime.Sweep()
+				handler.SweepWriteTransactions(time.Now())
 			}
 		}
 	}()

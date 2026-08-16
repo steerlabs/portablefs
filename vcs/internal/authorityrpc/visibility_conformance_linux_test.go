@@ -80,8 +80,8 @@ func TestNamespacePostBindingsAppearOnlyInSuccessfulCompleteTargets(t *testing.T
 	}
 
 	rename := &authoritypb.RenameRequest{OldName: []byte("old"), NewName: []byte("new")}
-	renamePrepare := renameVisibilityTargets(rename, parent, parent, object, visibilityCoordinate{}, false, false)
-	renameComplete := renameVisibilityTargets(rename, parent, parent, object, visibilityCoordinate{}, false, true)
+	renamePrepare := renameVisibilityTargets(rename, parent, parent, object, visibilityCoordinate{}, false, visibilityCoordinate{}, false, false)
+	renameComplete := renameVisibilityTargets(rename, parent, parent, object, visibilityCoordinate{}, false, visibilityCoordinate{}, false, true)
 	if renamePrepare[1].PostIdentity != ([16]byte{}) {
 		t.Fatalf("rename PREPARE attested unapplied post-binding %x", renamePrepare[1].PostIdentity)
 	}

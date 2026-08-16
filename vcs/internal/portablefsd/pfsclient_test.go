@@ -156,7 +156,7 @@ func (c *pfsTestClient) call(body any) any {
 		}
 		if env.PublicationAckRequired {
 			if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
-				Body: &pfslocal.PublicationAck{OperationID: operationID},
+				Body: &pfslocal.PublicationAck{OperationID: operationID, SemanticCommit: pfslocal.PublicationSemanticCommitPublished},
 			}); err != nil {
 				c.t.Fatal(err)
 			}
@@ -190,7 +190,7 @@ func (c *pfsTestClient) callMaybe(body any) (any, *pfslocal.ErrorReply) {
 		if er, ok := env.Body.(*pfslocal.ErrorReply); ok {
 			if env.PublicationAckRequired {
 				if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
-					Body: &pfslocal.PublicationAck{OperationID: operationID},
+					Body: &pfslocal.PublicationAck{OperationID: operationID, SemanticCommit: pfslocal.PublicationSemanticCommitPublished},
 				}); err != nil {
 					c.t.Fatal(err)
 				}
@@ -199,7 +199,7 @@ func (c *pfsTestClient) callMaybe(body any) (any, *pfslocal.ErrorReply) {
 		}
 		if env.PublicationAckRequired {
 			if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
-				Body: &pfslocal.PublicationAck{OperationID: operationID},
+				Body: &pfslocal.PublicationAck{OperationID: operationID, SemanticCommit: pfslocal.PublicationSemanticCommitPublished},
 			}); err != nil {
 				c.t.Fatal(err)
 			}
@@ -236,7 +236,7 @@ func (c *pfsTestClient) callErr(body any) *pfslocal.ErrorReply {
 		}
 		if env.PublicationAckRequired {
 			if err := pfslocal.WriteFrame(c.conn, &pfslocal.Envelope{
-				Body: &pfslocal.PublicationAck{OperationID: operationID},
+				Body: &pfslocal.PublicationAck{OperationID: operationID, SemanticCommit: pfslocal.PublicationSemanticCommitPublished},
 			}); err != nil {
 				c.t.Fatal(err)
 			}

@@ -125,13 +125,14 @@ fencing grace — rather than an unbounded volume outage. The grace is
 load-bearing only when the frontend can prove its old kernel cache became
 unservable before the grace ends.
 
-Linux proves it by detaching and aborting FUSE (below). macOS 26 proves it with
-the per-mount supervisor: after a daemon/session liveness failure it
-identity-checks and force-unmounts the exact FSKit mount. Live testing with a
-cached held descriptor showed reads continue for 8.6 seconds, the watchdog
-force-unmounts at about 10 seconds, and every later `pread` fails `EIO`, inside
-the fencing grace. A kernel that refuses forced unmount past the grace remains
-the stated platform residual. See
+Linux proves it in production by detaching and aborting FUSE (below). The
+non-shipping SDK-26 qualification supervisor also identity-checks and force-
+unmounts its exact FSKit mount after daemon/session failure. Historical live
+testing with a cached held descriptor showed reads continue for 8.6 seconds,
+the watchdog force-unmounts at about 10 seconds, and every later `pread` fails
+`EIO`, inside the fencing grace. This evidence shaped terminal fencing but does
+not admit current FSKit as a production frontend; macOS is refused before
+Attach for independent cache-publication gaps. See
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 Participant-scoped fencing is reported to the client as `ESTALE`, never as a
@@ -274,8 +275,8 @@ inside the live namespace and users see no version history. See
 - Recovery of unlinked-but-open file content across an epoch change.
 - Cross-AZ high availability at launch.
 - Automatic failover of any kind.
-- That a macOS frontend can currently prove kernel withdrawal within the
-  fencing grace.
+- Any production macOS frontend today. The retained qualification adapter's
+  force-unmount evidence does not close its source and peer cache boundaries.
 
 ## Verification
 

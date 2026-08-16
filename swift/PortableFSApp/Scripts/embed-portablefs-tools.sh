@@ -113,7 +113,7 @@ build_universal() {
       # portablefs uses AppKit's exact-URL NSWorkspace launcher; portablefsd
       # uses Foundation's app-group resolver. Both shipped Darwin helpers
       # therefore require their real cgo platform boundary.
-      if [ "$tool" = portablefs ] && [ -n "$qualification_build_tags" ]; then
+      if [ -n "$qualification_build_tags" ]; then
         set -- -tags "$qualification_build_tags"
       else
         set --

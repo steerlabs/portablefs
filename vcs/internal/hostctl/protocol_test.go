@@ -15,7 +15,7 @@ func testReleaseIdentity(hexDigit, version string) ReleaseIdentity {
 		IdentitySchema:    1,
 		ControlProtocol:   1,
 		PFSLocalMajor:     1,
-		PFSLocalMinor:     14,
+		PFSLocalMinor:     15,
 	}
 }
 

@@ -20,10 +20,8 @@ func Profile(name string) (fusev3.CoherenceProfile, authoritypb.CoherenceProfile
 	switch name {
 	case "strict":
 		return fusev3.CoherenceStrict, authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT, nil
-	case "uncached":
-		return fusev3.CoherenceUncached, authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED, nil
 	default:
-		return 0, 0, fmt.Errorf("coherence must be strict or uncached, not %q", name)
+		return 0, 0, fmt.Errorf("coherence must be strict, not %q", name)
 	}
 }
 
@@ -36,25 +34,14 @@ type Transport struct {
 	session []byte
 }
 
-// sessionIdentified is the accessor a strict mount cannot do without. The
-// authority's visibility events name their initiator by session ID, and a
-// frontend that cannot tell whether an event is its own must either repair its
-// own in-flight mutation -- which deadlocks against the VFS lock that syscall
-// holds -- or skip repairs it owes. Neither is acceptable, so a strict mount is
-// refused outright when the transport cannot supply it.
-type sessionIdentified interface{ SessionID() []byte }
-
 // NewTransport wraps an attached authority client for fusev3.MountVolume.
-// profile must be the profile the client attached with.
-func NewTransport(client *authorityrpc.Client, profile fusev3.CoherenceProfile) (*Transport, error) {
-	transport := &Transport{Client: client}
-	if identified, ok := any(client).(sessionIdentified); ok {
-		transport.session = identified.SessionID()
-	}
-	if profile == fusev3.CoherenceStrict && len(transport.session) == 0 {
-		return nil, errors.New("strict coherence needs authorityrpc.Client to expose the attach reply's session ID (SessionID() []byte); mount with coherence=uncached until it does")
-	}
-	return transport, nil
+// authorityrpc.Client is concrete and DialClient validates the ACTIVE reply's
+// session ID before returning it, so there is no fallible adapter boundary
+// between an admitted session and MountVolume. Keeping a runtime interface
+// assertion here used to create a nominal post-ACTIVE/pre-kernel failure path
+// which could not occur for this type but still complicated exact cleanup.
+func NewTransport(client *authorityrpc.Client) *Transport {
+	return &Transport{Client: client, session: client.SessionID()}
 }
 
 func (t *Transport) SessionID() []byte { return t.session }

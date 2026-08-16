@@ -114,10 +114,6 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var activeHandles: Int
         public var readRequests: Int
         public var writeRequests: Int
-        /// One entry per ordered mutation frame, in receive order. This is the
-        /// wire-level source-phase scheduling proof supplied by the frontend,
-        /// not a value the mock re-derives from request shape.
-        public var orderedMutationSourcePhaseQueueable: [Bool]
         public var enumerateRequests: Int
         public var getAttrRequests: Int
         public var setAttrRequests: Int
@@ -143,6 +139,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var maxReadLength: UInt32
         public var maxWriteLength: Int
         public var publicationAcks: Int
+        public var publishedPublicationAcks: Int
+        public var notPublishedPublicationAcks: Int
         public var resourceAccepts: Int
         public var resourceAbandons: Int
         /// Exact item-prefix verdict on each resource disposition, in receive
@@ -209,11 +207,6 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var xattrSetErrno: Int32?
         public var xattrListErrno: Int32?
         public var xattrRemoveErrno: Int32?
-        /// Test-only protocol corruption: stamps the request-only scheduling
-        /// bit on daemon replies so the Swift client's directional validator
-        /// can prove it closes the connection before delivering the frame.
-        public var sourcePhaseQueueableOnReplies: Bool
-
         public init(
             attachRef: String = "mock",
             volumeID: String = "mock-volume",
@@ -236,8 +229,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             xattrGetErrno: Int32? = nil,
             xattrSetErrno: Int32? = nil,
             xattrListErrno: Int32? = nil,
-            xattrRemoveErrno: Int32? = nil,
-            sourcePhaseQueueableOnReplies: Bool = false
+            xattrRemoveErrno: Int32? = nil
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
@@ -261,7 +253,6 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.xattrSetErrno = xattrSetErrno
             self.xattrListErrno = xattrListErrno
             self.xattrRemoveErrno = xattrRemoveErrno
-            self.sourcePhaseQueueableOnReplies = sourcePhaseQueueableOnReplies
         }
     }
 
@@ -1043,7 +1034,6 @@ private actor MockFileSystem {
     private var reclaimRequests = 0
     private var readRequests = 0
     private var writeRequests = 0
-    private var orderedMutationSourcePhaseQueueable: [Bool] = []
     private var enumerateRequests = 0
     private var getAttrRequests = 0
     private var setAttrRequests = 0
@@ -1059,6 +1049,8 @@ private actor MockFileSystem {
     private var maxReadLength: UInt32 = 0
     private var maxWriteLength = 0
     private var publicationAcks = 0
+    private var publishedPublicationAcks = 0
+    private var notPublishedPublicationAcks = 0
     private var visibilityAcks: [PfsVisibilityAckRequest] = []
     private var v3LivenessRequests: [PfsV3LivenessRequest] = []
     private var syncVolumeRequests = 0
@@ -1114,7 +1106,6 @@ private actor MockFileSystem {
             activeHandles: handles.count,
             readRequests: readRequests,
             writeRequests: writeRequests,
-            orderedMutationSourcePhaseQueueable: orderedMutationSourcePhaseQueueable,
             enumerateRequests: enumerateRequests,
             getAttrRequests: getAttrRequests,
             setAttrRequests: setAttrRequests,
@@ -1130,6 +1121,8 @@ private actor MockFileSystem {
             maxReadLength: maxReadLength,
             maxWriteLength: maxWriteLength,
             publicationAcks: publicationAcks,
+            publishedPublicationAcks: publishedPublicationAcks,
+            notPublishedPublicationAcks: notPublishedPublicationAcks,
             resourceAccepts: resourceAccepts,
             resourceAbandons: resourceAbandons,
             resourceAcceptedItemCounts: resourceAcceptedItemCounts,
@@ -1153,7 +1146,6 @@ private actor MockFileSystem {
         reclaimRequests = 0
         readRequests = 0
         writeRequests = 0
-        orderedMutationSourcePhaseQueueable.removeAll()
         enumerateRequests = 0
         getAttrRequests = 0
         setAttrRequests = 0
@@ -1172,6 +1164,8 @@ private actor MockFileSystem {
         maxReadLength = 0
         maxWriteLength = 0
         publicationAcks = 0
+        publishedPublicationAcks = 0
+        notPublishedPublicationAcks = 0
         visibilityAcks.removeAll()
         v3LivenessRequests.removeAll()
         syncVolumeRequests = 0
@@ -1247,15 +1241,6 @@ private actor MockFileSystem {
         do {
             guard let body = envelope.body else {
                 throw MockPOSIXError(errno: EINVAL, message: "missing body")
-            }
-            switch body {
-            case .setAttr, .write, .create, .mkdir, .remove, .rename,
-                 .symlink, .hardLink, .xattrSet, .xattrRemove:
-                orderedMutationSourcePhaseQueueable.append(
-                    envelope.sourcePhaseQueueable
-                )
-            default:
-                break
             }
             switch body {
             case .lookup(_), .enumerate(_), .getAttr(_), .setAttr(_),
@@ -1570,7 +1555,10 @@ private actor MockFileSystem {
                 if replacedID == childID {
                     // POSIX specifies a no-op when both names are hard links
                     // to the same inode: neither directory entry is removed.
-                    reply.body = .renameReply(PfsRenameReply())
+                    var response = PfsRenameReply()
+                    response.newPostIdentity = Node.stableIdentity(for: childID)
+                    response.oldPostIdentity = Node.stableIdentity(for: childID)
+                    reply.body = .renameReply(response)
                     break
                 }
                 fromDirectory.children.removeValue(forKey: request.fromName)
@@ -1582,7 +1570,9 @@ private actor MockFileSystem {
                 nodes[childID]?.parent = toDirectory.id
                 bump(fromDirectory)
                 bump(toDirectory)
-                reply.body = .renameReply(PfsRenameReply())
+                var response = PfsRenameReply()
+                response.newPostIdentity = Node.stableIdentity(for: childID)
+                reply.body = .renameReply(response)
             case let .symlink(request):
                 createRequests += 1
                 let directory = try node(for: request.dir)
@@ -1749,7 +1739,6 @@ private actor MockFileSystem {
             errorReply.message = String(describing: error)
             reply.body = .error(errorReply)
         }
-        reply.sourcePhaseQueueable = configuration.sourcePhaseQueueableOnReplies
         return reply
     }
 
@@ -1767,10 +1756,17 @@ private actor MockFileSystem {
                 try? await Task.sleep(nanoseconds: delay)
             }
             guard envelope.requestID == 0,
+                  request.semanticCommit == .published
+                      || request.semanticCommit == .notPublished,
                   session.acknowledgeOperation(request.operationID) else {
                 return .closeConnection
             }
             publicationAcks += 1
+            if request.semanticCommit == .published {
+                publishedPublicationAcks += 1
+            } else {
+                notPublishedPublicationAcks += 1
+            }
             return .continueReading
 
         case let .resourceReplyDisposition(request):

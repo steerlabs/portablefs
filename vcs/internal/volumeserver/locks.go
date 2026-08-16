@@ -515,14 +515,39 @@ func (t *LockTable) Set(lock Lock) error {
 // lock by the operation that made it eligible, inside that operation's critical
 // section, so a grant cannot be stolen between the wake and the acquisition.
 func (t *LockTable) Wait(ctx context.Context, lock Lock) error {
+	wait, err := t.BeginWait(lock)
+	if err != nil {
+		return err
+	}
+	return wait.Await(ctx)
+}
+
+// PendingLock is one admitted blocking acquisition. BeginWait publishes the
+// waiter into the table before returning it, so a topology writer can exclude
+// new admissions, retire every already-published waiter in one table critical
+// section, and then change routing without holding a volume-wide filesystem
+// reader for the duration of F_SETLKW.
+//
+// A PendingLock has exactly one consumer. It is deliberately not a future that
+// can be copied or awaited by several goroutines: the kernel request that owns
+// it is the only operation allowed to observe the grant.
+type PendingLock struct {
+	table  *LockTable
+	waiter *lockWaiter
+}
+
+// BeginWait atomically either grants lock or publishes its waiter. The caller
+// may surround this short admission with another ordering guard and release
+// that guard before Await blocks.
+func (t *LockTable) BeginWait(lock Lock) (*PendingLock, error) {
 	if !validLock(lock) {
-		return errInvalidLock
+		return nil, errInvalidLock
 	}
 	t.mu.Lock()
 	s := t.liveSessionLocked(lock.Owner.Session)
 	if s == nil {
 		t.mu.Unlock()
-		return ErrSessionExpired
+		return nil, ErrSessionExpired
 	}
 	t.nextSeq++
 	w := &lockWaiter{lock: lock, seq: t.nextSeq, session: s, done: make(chan struct{})}
@@ -531,40 +556,83 @@ func (t *LockTable) Wait(ctx context.Context, lock Lock) error {
 		plan := planAcquireLocked(o, lock)
 		err := t.applyPlanLocked(lock.Object, s, plan)
 		t.pruneObjectLocked(lock.Object)
+		t.settleWaiterLocked(w, err)
 		t.mu.Unlock()
-		return err
+		return &PendingLock{table: t, waiter: w}, nil
 	}
 	if t.held+t.waiting+1 > t.maxRecords || s.records+1 > t.maxPerSession {
 		t.mu.Unlock()
-		return ErrAdmission
+		return nil, ErrAdmission
 	}
 	t.insertWaiterLocked(t.objectLocked(lock.Object), w)
 	if t.deadlockLocked(w) {
 		t.cancelWaiterLocked(w, ErrDeadlock)
 		err := w.err
 		t.mu.Unlock()
-		return err
+		return nil, err
 	}
 	t.mu.Unlock()
+	return &PendingLock{table: t, waiter: w}, nil
+}
 
+// Await waits for the one decision made for an admitted lock request. A grant
+// that was installed before context cancellation wins, matching POSIX lock
+// ownership; an interrupted queued waiter is removed before the error returns.
+func (w *PendingLock) Await(ctx context.Context) error {
+	if w == nil || w.table == nil || w.waiter == nil {
+		return errInvalidLock
+	}
 	select {
-	case <-w.done:
+	case <-w.waiter.done:
 	case <-ctx.Done():
-		t.mu.Lock()
+		w.table.mu.Lock()
 		// A grant that landed before the cancellation wins: the record already
 		// exists, and reporting a failure would leave the caller believing it
 		// holds nothing while the table says otherwise.
-		if !w.settled {
-			t.cancelWaiterLocked(w, ctx.Err())
+		if !w.waiter.settled {
+			w.table.cancelWaiterLocked(w.waiter, ctx.Err())
 		}
-		err := w.err
-		t.mu.Unlock()
+		err := w.waiter.err
+		w.table.mu.Unlock()
 		return err
 	}
-	t.mu.Lock()
-	err := w.err
-	t.mu.Unlock()
+	w.table.mu.Lock()
+	err := w.waiter.err
+	w.table.mu.Unlock()
 	return err
+}
+
+// InterruptWaiters atomically retires every queued acquisition without
+// disturbing held records. Routing uses this at the topology transition
+// boundary: all old-revision waits become ESTALE before fencing any holder can
+// release a record and wake them. Removing the complete queue before running a
+// wake cascade is essential; cancelling one waiter at a time could grant the
+// next stale waiter in between cancellations.
+func (t *LockTable) InterruptWaiters(err error) {
+	if err == nil {
+		err = ErrSessionExpired
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var waiters []*lockWaiter
+	for _, session := range t.sessions {
+		for _, byOwner := range session.waiters {
+			for waiter := range byOwner {
+				waiters = append(waiters, waiter)
+			}
+		}
+	}
+	touched := make(map[ObjectKey]struct{}, len(waiters))
+	for _, waiter := range waiters {
+		if o := t.objects[waiter.lock.Object]; o != nil {
+			t.removeWaiterLocked(o, waiter)
+		}
+		t.settleWaiterLocked(waiter, err)
+		touched[waiter.lock.Object] = struct{}{}
+	}
+	for object := range touched {
+		t.pruneObjectLocked(object)
+	}
 }
 
 // Unlock removes owner's coverage of r, splitting records where r punches a

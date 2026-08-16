@@ -37,20 +37,10 @@ set -euo pipefail
 : "${PORTABLEFS_VOLUME_NAME:=coherence-volume}"
 : "${PORTABLEFS_AUTHORITY_PORT:=17443}"
 : "${PORTABLEFS_ATOMIC_REPLACE_ROUNDS:=20}"
-# The kernel-cache contract the mount declares: strict (names and attributes
-# cached, joined to the authority's two-phase visibility barrier) or uncached
-# (nothing cached). Both are supposed to give the same POSIX answers, so this
-# matrix is the right instrument for either.
-#
-# The default is strict, matching portablefs-mount-v3's own default. An earlier
-# revision of this script defaulted to uncached and explained that strict could
-# not mount at all, because authorityrpc.Client did not expose the attach reply's
-# session ID. It does now (Client.SessionID), the strict frontend is implemented
-# in vcs/internal/fusev3/coherence_linux.go, and the matrix measures the cached
-# path by default. Set PORTABLEFS_COHERENCE=uncached to measure the other
-# supported profile with the same case list; both must give the same answers.
-: "${PORTABLEFS_COHERENCE:=strict}"
-# A strict mount declares a kernel-cache bound and a repair deadline, and the
+# Protocol 5 has one kernel-cache contract: every mount participates in strict
+# source-publication and peer-visibility ordering. The harness names that
+# contract explicitly instead of exposing a selector for a weaker path.
+# A mount declares a kernel-cache bound and a repair deadline, and the
 # authority refuses any commitment larger than its own maxima. The shipped
 # defaults agree (mount -repair-budget 15s under authority --max-repair-budget
 # 30s; both cached-name capacities 1<<16), so these are stated here only to pin
@@ -92,7 +82,7 @@ FALSIFIABLE_CASES=(
   remote_chmod_visible
   # remote_chown_visible is deliberately absent: the v3 volume model is
   # single-principal, the volume refuses the ownership change itself, and the
-  # case skips with that reason on every profile. A case that cannot run cannot
+  # case skips with that reason on every mount. A case that cannot run cannot
   # demonstrate that it detects a stale view either.
   remote_utimes_visible
   remote_truncate_grow_readable_eof
@@ -147,7 +137,6 @@ run_host() {
     -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
     -e "PORTABLEFS_AUTHORITY_PORT=${PORTABLEFS_AUTHORITY_PORT}" \
     -e "PORTABLEFS_ATOMIC_REPLACE_ROUNDS=${PORTABLEFS_ATOMIC_REPLACE_ROUNDS}" \
-    -e "PORTABLEFS_COHERENCE=${PORTABLEFS_COHERENCE}" \
     -e "PORTABLEFS_CACHED_NAME_CAPACITY=${PORTABLEFS_CACHED_NAME_CAPACITY}" \
     -e "PORTABLEFS_REPAIR_BUDGET=${PORTABLEFS_REPAIR_BUDGET}" \
     -e "PORTABLEFS_CASE_TIMEOUT=${PORTABLEFS_CASE_TIMEOUT}" \
@@ -219,7 +208,9 @@ build_binaries() {
 
 start_authority() {
   local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
-  local membership=/srv/portablefs/.portablefs-control/$PORTABLEFS_VOLUME_NAME/strict-membership
+  local control=/srv/portablefs/.portablefs-control/$PORTABLEFS_VOLUME_NAME
+  local membership=$control/strict-membership
+  local write_staging=$control/write-staging
   as_service /home/portablefs/bin/pfs-coherence-credentials \
     --dir /home/portablefs/creds --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 ||
     fail "minting the credential set failed" 70
@@ -233,6 +224,7 @@ start_authority() {
     --client-ca /home/portablefs/creds/ca.pem \
     --capability-public-key /home/portablefs/creds/capability-public.pem \
     --visibility-membership-file "$membership" \
+    --write-staging-dir "$write_staging" \
     --max-cached-name-capacity "$PORTABLEFS_CACHED_NAME_CAPACITY" \
     --max-repair-budget "$PORTABLEFS_REPAIR_BUDGET" \
     >/home/portablefs/logs/authority.log 2>&1 &
@@ -326,7 +318,7 @@ start_mount() {
     --tls-server-ca /home/portablefs/creds/ca.pem \
     --tls-server-name authority.portablefs.test \
     --max-frame-bytes 16777216 \
-    --coherence "$PORTABLEFS_COHERENCE" \
+    --coherence strict \
     --cached-name-capacity "$PORTABLEFS_CACHED_NAME_CAPACITY" \
     --repair-budget "$PORTABLEFS_REPAIR_BUDGET" \
     --local-backing "$backing" \
@@ -478,7 +470,7 @@ run_falsifiability_control() {
     --routes-contract-command "$ROUTES_CONTRACT_COMMAND" \
     --label "falsifiability control: mount-A replays first-success pathname observations" \
     --expect "peer_loss_does_not_break_surviving_mount=SKIP:the control must not destroy a mount it still needs" \
-    --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal, so there is no observable ownership change on any profile" \
+    --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal, so there is no observable ownership change on this mount" \
     "${arguments[@]}" \
     --json /home/portablefs/logs/control.json ||
     fail "the falsifiability control did not behave as declared: at least one stale-sensitive case cannot detect a replayed pathname observation and must not be trusted" 71
@@ -498,7 +490,7 @@ run_matrix() {
     --local-route "$PORTABLEFS_LOCAL_ROUTE" \
     --routes-contract-command "$ROUTES_CONTRACT_COMMAND" \
     --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal (docs/xfs-authority-architecture.md), so a chown to another principal is refused by the volume itself and there is no ownership change to observe" \
-    --label "linux ${KERNEL_RELEASE}: two kernel FUSE mounts of one authoritative XFS volume, ${PORTABLEFS_COHERENCE} coherence" \
+    --label "linux ${KERNEL_RELEASE}: two strict kernel FUSE mounts of one authoritative XFS volume" \
     --json /home/portablefs/logs/matrix.json
 }
 
@@ -527,7 +519,7 @@ run_container() {
   # matrix process's own command line, so a pkill pattern would match and kill
   # the driver instead of the mount.
   FENCE_COMMAND="kill -9 ${MOUNT_B_PID}"
-  echo "coherence-matrix-linux: kernel $KERNEL_RELEASE, two independent mounts of volume $PORTABLEFS_VOLUME_NAME, ${PORTABLEFS_COHERENCE} coherence"
+  echo "coherence-matrix-linux: kernel $KERNEL_RELEASE, two independent strict mounts of volume $PORTABLEFS_VOLUME_NAME"
   local both=(/home/portablefs/mount-a /home/portablefs/mount-b)
   assert_mounts_serving "before any phase ran" "${both[@]}"
   run_disjoint_control

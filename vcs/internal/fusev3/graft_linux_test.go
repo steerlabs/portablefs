@@ -3,11 +3,13 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -17,7 +19,27 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
+	"golang.org/x/sys/unix"
 )
+
+func kernelBeforeTmpfileLinkCredentialRelaxation(t *testing.T) (string, bool) {
+	t.Helper()
+	var name unix.Utsname
+	if err := unix.Uname(&name); err != nil {
+		return "unknown", false
+	}
+	release := string(bytes.TrimRight(name.Release[:], "\x00"))
+	parts := strings.SplitN(release, ".", 3)
+	if len(parts) < 2 {
+		return release, false
+	}
+	major, majorErr := strconv.Atoi(parts[0])
+	minor, minorErr := strconv.Atoi(parts[1])
+	if majorErr != nil || minorErr != nil {
+		return release, false
+	}
+	return release, major < 6 || major == 6 && minor < 12
+}
 
 // mustRoutes compiles a rule set from the same declaration syntax a volume
 // carries. The pattern language belongs to localroutes; using the real compiler
@@ -47,7 +69,16 @@ type graftFixture struct {
 
 func newGraftFixture(t *testing.T, routes localroutes.RuleSet, strict bool) *graftFixture {
 	t.Helper()
-	backing := filepath.Join(t.TempDir(), "local")
+	base := t.TempDir()
+	if tmpfileBase := os.Getenv("PFS_TMPFILE_TEST_ROOT"); tmpfileBase != "" {
+		var err error
+		base, err = os.MkdirTemp(tmpfileBase, "fusev3-graft-")
+		if err != nil {
+			t.Fatalf("create graft test root: %v", err)
+		}
+		t.Cleanup(func() { _ = os.RemoveAll(base) })
+	}
+	backing := filepath.Join(base, "local")
 	rpc := newFakeRPC()
 	rpc.session = testSelfSession
 	// Every authority lookup in this fixture answers with a DISTINCT directory,
@@ -77,6 +108,16 @@ func (f *graftFixture) calls() int {
 	return count
 }
 
+func TestEveryGraftAttrIsExplicitlyLocal(t *testing.T) {
+	for _, mode := range []uint32{syscall.S_IFREG | 0o600, syscall.S_IFDIR | 0o700, syscall.S_IFLNK | 0o777} {
+		var out fuse.Attr
+		fillGraftAttr(&syscall.Stat_t{Mode: mode, Ino: 7}, &out, 1, 2)
+		if out.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+			t.Fatalf("mode %#o attr flags = %#x, want exactly PFS_LOCAL", mode, out.Flags)
+		}
+	}
+}
+
 // authorityCalls reports how many requests reached the authority while fn ran.
 // It is the measurement the whole machine-local mechanism exists to move: an
 // operation under a graft must not produce a single one.
@@ -89,7 +130,10 @@ func (f *graftFixture) authorityCalls(fn func()) int {
 func (f *graftFixture) mkdir(t *testing.T, parent uint64, name string) *fuse.EntryOut {
 	t.Helper()
 	out := &fuse.EntryOut{}
-	if status := f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{NodeId: parent}, Mode: 0o755}, name, out); !status.Ok() {
+	status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
+		return f.raw.Mkdir(nil, &fuse.MkdirIn{InHeader: fuse.InHeader{Unique: unique, NodeId: parent}, Mode: 0o755}, name, out)
+	})
+	if !status.Ok() {
 		t.Fatalf("MKDIR %q = %v", name, status)
 	}
 	return out
@@ -98,7 +142,10 @@ func (f *graftFixture) mkdir(t *testing.T, parent uint64, name string) *fuse.Ent
 func (f *graftFixture) lookup(t *testing.T, parent uint64, name string) (*fuse.EntryOut, fuse.Status) {
 	t.Helper()
 	out := &fuse.EntryOut{}
-	return out, f.raw.Lookup(nil, &fuse.InHeader{NodeId: parent}, name, out)
+	status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
+		return f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: parent}, name, out)
+	})
+	return out, status
 }
 
 func (f *graftFixture) mustLookup(t *testing.T, parent uint64, name string) *fuse.EntryOut {
@@ -116,6 +163,9 @@ func (f *graftFixture) createFile(t *testing.T, parent uint64, name string, data
 	input := &fuse.CreateIn{InHeader: fuse.InHeader{NodeId: parent}, Flags: uint32(os.O_RDWR), Mode: 0o644}
 	if status := f.raw.Create(nil, input, name, out); !status.Ok() {
 		t.Fatalf("CREATE %q = %v", name, status)
+	}
+	if out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL || out.OpenFlags != fuse.FOPEN_KEEP_CACHE|fuse.FOPEN_PFS_LOCAL {
+		t.Fatalf("local CREATE classification attr=%#x open=%#x", out.Attr.Flags, out.OpenFlags)
 	}
 	if len(data) != 0 {
 		written, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: out.NodeId}, Fh: out.Fh, Size: uint32(len(data))}, data)
@@ -197,6 +247,139 @@ func TestARouteRootIsCreatedAndServedWithoutOneAuthorityRequest(t *testing.T) {
 	}
 }
 
+func TestStrictLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) {
+	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), true)
+	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
+	baseline := f.calls()
+
+	newLocalFile := func(name string) *fuse.CreateOut {
+		t.Helper()
+		out := &fuse.CreateOut{}
+		in := &fuse.CreateIn{
+			InHeader: fuse.InHeader{NodeId: root.NodeId},
+			Flags:    uint32(unix.O_RDWR), Mode: 0o600,
+		}
+		if status := f.raw.Create(nil, in, name, out); !status.Ok() {
+			t.Fatalf("local CREATE %q = %v", name, status)
+		}
+		return out
+	}
+
+	source := newLocalFile("source")
+	destination := newLocalFile("destination")
+	defer f.raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: source.NodeId}, Fh: source.Fh})
+	defer f.raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: destination.NodeId}, Fh: destination.Fh})
+	if written, status := f.raw.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: source.NodeId}, Fh: source.Fh, Size: 6,
+	}, []byte("direct")); !status.Ok() || written != 6 {
+		t.Fatalf("local source WRITE = (%d, %v)", written, status)
+	}
+	if status := f.raw.Fallocate(nil, &fuse.FallocateIn{
+		InHeader: fuse.InHeader{NodeId: destination.NodeId}, Fh: destination.Fh, Length: 32,
+	}); !status.Ok() {
+		t.Fatalf("local FALLOCATE = %v", status)
+	}
+	if copied, status := f.raw.CopyFileRange(nil, &fuse.CopyFileRangeIn{
+		InHeader: fuse.InHeader{NodeId: source.NodeId}, FhIn: source.Fh,
+		NodeIdOut: destination.NodeId, FhOut: destination.Fh, Len: 6,
+	}); !status.Ok() || copied != 6 {
+		t.Fatalf("local COPY_FILE_RANGE = (%d, %v)", copied, status)
+	}
+	buffer := make([]byte, 6)
+	result, status := f.raw.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: destination.NodeId}, Fh: destination.Fh, Size: 6,
+	}, buffer)
+	if !status.Ok() {
+		t.Fatalf("local destination READ = %v", status)
+	}
+	data, _ := result.Bytes(buffer)
+	if string(data) != "direct" {
+		t.Fatalf("local copied data = %q, want direct", data)
+	}
+
+	linkableUnique := nextTestRequestUnique()
+	linkable := &fuse.CreateOut{}
+	if status := f.raw.Tmpfile(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{Unique: linkableUnique, NodeId: root.NodeId},
+		Flags:    uint32(unix.O_TMPFILE | unix.O_RDWR), Mode: 0o600,
+	}, "/", linkable); status == fuse.Status(syscall.EOPNOTSUPP) && os.Getenv("PFS_TMPFILE_TEST_ROOT") == "" {
+		t.Skip("test filesystem does not support O_TMPFILE; the required tmpfs-backed suite exercises it")
+	} else if !status.Ok() {
+		t.Fatalf("linkable local TMPFILE = %v", status)
+	}
+	if written, status := f.raw.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: linkable.NodeId}, Fh: linkable.Fh, Size: 8,
+	}, []byte("linkable")); !status.Ok() || written != 8 {
+		t.Fatalf("linkable local TMPFILE WRITE = (%d, %v)", written, status)
+	}
+	linked := &fuse.EntryOut{}
+	linkUnique := nextTestRequestUnique()
+	if status := f.raw.Link(nil, &fuse.LinkIn{
+		InHeader: fuse.InHeader{Unique: linkUnique, NodeId: root.NodeId}, Oldnodeid: linkable.NodeId,
+	}, "linked", linked); status == fuse.Status(syscall.ENOENT) {
+		if release, old := kernelBeforeTmpfileLinkCredentialRelaxation(t); old {
+			t.Skipf("kernel %s lacks the >=6.12 unprivileged linkat(AT_EMPTY_PATH) open-credential relaxation required by PortableFS", release)
+		}
+		t.Fatalf("first name for local TMPFILE on supported kernel = %v", status)
+	} else if !status.Ok() {
+		t.Fatalf("first name for local TMPFILE = %v", status)
+	}
+	if linked.NodeId != linkable.NodeId || linked.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL ||
+		f.raw.ReplyWriteOrdered(linkUnique) || f.raw.ReplyPublishMarked(linkUnique, root.NodeId, 13) {
+		t.Fatalf("linked local TMPFILE output/lifecycle = %+v", linked)
+	}
+	if got, status := f.readNode(t, linked.NodeId, 8); !status.Ok() || string(got) != "linkable" {
+		t.Fatalf("linked local TMPFILE READ = (%q, %v)", got, status)
+	}
+	f.raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: linkable.NodeId}, Fh: linkable.Fh})
+	f.raw.Forget(linkable.NodeId, 2) // TMPFILE entry plus the new LINK entry.
+
+	unique := nextTestRequestUnique()
+	tmp := &fuse.CreateOut{}
+	if status := f.raw.Tmpfile(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{Unique: unique, NodeId: root.NodeId},
+		Flags:    uint32(unix.O_TMPFILE | unix.O_RDWR | unix.O_EXCL), Mode: 0o640,
+	}, "/", tmp); !status.Ok() {
+		t.Fatalf("local TMPFILE = %v", status)
+	}
+	if tmp.NodeId == 0 || tmp.Fh == 0 || tmp.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL || tmp.Attr.Nlink != 0 ||
+		tmp.OpenFlags != fuse.FOPEN_KEEP_CACHE|fuse.FOPEN_PFS_LOCAL {
+		t.Fatalf("local TMPFILE output = %+v", tmp)
+	}
+	if f.raw.ReplyWriteOrdered(unique) || f.raw.ReplyPublishMarked(unique, root.NodeId, 51) {
+		t.Fatal("LOCAL TMPFILE entered the SHARED post-VFS publication path")
+	}
+	if status := f.raw.Link(nil, &fuse.LinkIn{
+		InHeader: fuse.InHeader{Unique: nextTestRequestUnique(), NodeId: root.NodeId}, Oldnodeid: tmp.NodeId,
+	}, "forbidden", &fuse.EntryOut{}); status.Ok() {
+		t.Fatal("O_EXCL local TMPFILE became linkable")
+	}
+	// The kernel may forget the anonymous lookup while its open description is
+	// retained. The handle itself must remain the lifetime owner.
+	f.raw.Forget(tmp.NodeId, 1)
+	if written, status := f.raw.Write(nil, &fuse.WriteIn{
+		InHeader: fuse.InHeader{NodeId: tmp.NodeId}, Fh: tmp.Fh, Size: 8,
+	}, []byte("retained")); !status.Ok() || written != 8 {
+		t.Fatalf("forgotten local TMPFILE handle WRITE = (%d, %v)", written, status)
+	}
+	readBuffer := make([]byte, 8)
+	result, status = f.raw.Read(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{NodeId: tmp.NodeId}, Fh: tmp.Fh, Size: 8,
+	}, readBuffer)
+	if !status.Ok() {
+		t.Fatalf("forgotten local TMPFILE handle READ = %v", status)
+	}
+	data, _ = result.Bytes(readBuffer)
+	if string(data) != "retained" {
+		t.Fatalf("forgotten local TMPFILE data = %q", data)
+	}
+	f.raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: tmp.NodeId}, Fh: tmp.Fh})
+
+	if calls := f.calls(); calls != baseline {
+		t.Fatalf("LOCAL tmpfile/range operations cost %d authority calls, want 0", calls-baseline)
+	}
+}
+
 func TestARouteRootWithNoBackingIsAbsentRatherThanSynthesized(t *testing.T) {
 	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), false)
 	var status fuse.Status
@@ -210,6 +393,55 @@ func TestARouteRootWithNoBackingIsAbsentRatherThanSynthesized(t *testing.T) {
 	if active, errno := f.raw.grafts.ActiveRootsUnder(""); errno != 0 || len(active) != 0 {
 		t.Fatalf("active route roots = (%v, %v) after a lookup of a name nothing created; a rule owns a name, it never synthesizes the directory", active, errno)
 	}
+}
+
+func TestNegativeLookupClassificationFollowsItsParent(t *testing.T) {
+	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), false)
+
+	sharedUnique := nextTestRequestUnique()
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: sharedUnique, NodeId: fuse.FUSE_ROOT_ID}, "node_modules", &fuse.EntryOut{}); status != fuse.ENOENT {
+		t.Fatalf("missing route root LOOKUP = %v, want ENOENT", status)
+	}
+	if !f.raw.ReplyWriteOrdered(sharedUnique) || !f.raw.ReplyPublishMarked(sharedUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
+		t.Fatal("negative LOOKUP below SHARED parent was not marked for post-VFS publication")
+	}
+	f.raw.ReplyWritten(sharedUnique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, sharedUnique)
+
+	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
+	localUnique := nextTestRequestUnique()
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: localUnique, NodeId: root.NodeId}, "missing", &fuse.EntryOut{}); status != fuse.ENOENT {
+		t.Fatalf("missing local child LOOKUP = %v, want ENOENT", status)
+	}
+	if f.raw.ReplyWriteOrdered(localUnique) || f.raw.ReplyPublishMarked(localUnique, root.NodeId, testPublicationOpcode) {
+		t.Fatal("negative LOOKUP below LOCAL parent entered shared publication lifecycle")
+	}
+}
+
+func TestDirectoryOpenClassificationMatchesInodeOwnership(t *testing.T) {
+	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), false)
+	shared := &fuse.OpenOut{}
+	if status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
+		return f.raw.OpenDir(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}}, shared)
+	}); !status.Ok() {
+		t.Fatalf("authority OPENDIR = %v", status)
+	}
+	if shared.OpenFlags != fuse.FOPEN_PFS_SHARED {
+		t.Fatalf("authority OPENDIR flags = %#x, want PFS_SHARED", shared.OpenFlags)
+	}
+	f.raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: nextTestRequestUnique(), NodeId: fuse.FUSE_ROOT_ID}, Fh: shared.Fh})
+
+	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
+	local := &fuse.OpenOut{}
+	if status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
+		return f.raw.OpenDir(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: root.NodeId}}, local)
+	}); !status.Ok() {
+		t.Fatalf("graft OPENDIR = %v", status)
+	}
+	if local.OpenFlags != fuse.FOPEN_PFS_LOCAL {
+		t.Fatalf("graft OPENDIR flags = %#x, want PFS_LOCAL", local.OpenFlags)
+	}
+	f.raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: root.NodeId}, Fh: local.Fh})
 }
 
 func TestAFloatingRouteInstantiatesAtDepth(t *testing.T) {
@@ -379,8 +611,11 @@ func TestRenamingAnAncestorOfAnUncreatedRouteRootIsAnOrdinaryRename(t *testing.T
 	if _, status := f.lookup(t, packages.NodeId, "node_modules"); status != fuse.Status(syscall.ENOENT) {
 		t.Fatalf("LOOKUP of an uncreated route root = %v, want ENOENT", status)
 	}
-	rename := &fuse.RenameIn{InHeader: fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}
-	if status := f.raw.Rename(nil, rename, "packages", "modules"); !status.Ok() {
+	status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
+		rename := &fuse.RenameIn{InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}
+		return f.raw.Rename(nil, rename, "packages", "modules")
+	})
+	if !status.Ok() {
 		t.Fatalf("renaming an ancestor with no machine-local content = %v, want success", status)
 	}
 }
@@ -433,7 +668,10 @@ func TestAVolumeListingMergesRouteRootsAndShadowsTheVolumeName(t *testing.T) {
 func (f *graftFixture) list(t *testing.T, nodeID uint64) ([]string, map[string]uint64) {
 	t.Helper()
 	open := &fuse.OpenOut{}
-	if status := f.raw.OpenDir(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: nodeID}}, open); !status.Ok() {
+	status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
+		return f.raw.OpenDir(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: nodeID}}, open)
+	})
+	if !status.Ok() {
 		t.Fatalf("OPENDIR = %v", status)
 	}
 	defer f.raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: nodeID}, Fh: open.Fh})
@@ -443,7 +681,10 @@ func (f *graftFixture) list(t *testing.T, nodeID uint64) ([]string, map[string]u
 	for range 32 {
 		buffer := make([]byte, 4096)
 		list := fuse.NewDirEntryList(buffer, offset)
-		if status := f.raw.ReadDir(nil, &fuse.ReadIn{InHeader: fuse.InHeader{NodeId: nodeID}, Fh: open.Fh, Offset: offset}, list); !status.Ok() {
+		status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
+			return f.raw.ReadDir(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique, NodeId: nodeID}, Fh: open.Fh, Offset: offset}, list)
+		})
+		if !status.Ok() {
 			t.Fatalf("READDIR = %v", status)
 		}
 		produced := false
@@ -522,6 +763,40 @@ func TestGraftedEntriesArePublishedWithTheLocalLifetime(t *testing.T) {
 	}
 	if out.Attr.Uid != f.mount.uid || out.Attr.Gid != f.mount.gid {
 		t.Fatalf("graft owner = (%d, %d), want the identity this mount presents (%d, %d)", out.Attr.Uid, out.Attr.Gid, f.mount.uid, f.mount.gid)
+	}
+}
+
+func TestGraftGetattrByHandleReleasesExactlyOneOperationReference(t *testing.T) {
+	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), true)
+	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
+	created := f.createFile(t, root.NodeId, "held", nil)
+	opened := &fuse.OpenOut{}
+	if status := f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{NodeId: created.NodeId}, Flags: uint32(os.O_RDONLY)}, opened); !status.Ok() {
+		t.Fatalf("OPEN graft file = %v", status)
+	}
+	input := &fuse.GetAttrIn{InHeader: fuse.InHeader{NodeId: created.NodeId}, Flags_: fuse.FUSE_GETATTR_FH, Fh_: opened.Fh}
+	if status := f.raw.GetAttr(nil, input, &fuse.AttrOut{}); !status.Ok() {
+		t.Fatalf("GETATTR by graft handle = %v", status)
+	}
+	f.raw.mu.Lock()
+	handle := f.raw.handles[opened.Fh]
+	inFlight := uint64(0)
+	if handle != nil {
+		inFlight = handle.inFlight
+	}
+	f.raw.mu.Unlock()
+	if handle == nil || inFlight != 0 {
+		t.Fatalf("graft handle after GETATTR = (%v, inFlight=%d), want one live handle with no leaked operation reference", handle != nil, inFlight)
+	}
+	done := make(chan struct{})
+	go func() {
+		f.raw.Release(nil, &fuse.ReleaseIn{Fh: opened.Fh})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("graft RELEASE blocked behind a leaked or underflowed GETATTR handle reference")
 	}
 }
 

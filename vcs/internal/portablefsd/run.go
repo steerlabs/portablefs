@@ -69,7 +69,7 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	s.registry = newRegistry(s.cfg.StateDir)
+	s.registry = newRuntimeRegistry(s.cfg.StateDir)
 	if s.registry.loadErr != nil {
 		return fmt.Errorf("strict persisted attach inventory: %w", s.registry.loadErr)
 	}

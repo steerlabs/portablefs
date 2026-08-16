@@ -126,8 +126,20 @@ func (h *VolumeHandler) refuseProtectedNamespace(id volumeserver.SessionID, req 
 		return object(body.SetXattr.GetItem())
 	case *authoritypb.Request_RemoveXattr:
 		return object(body.RemoveXattr.GetItem())
-	case *authoritypb.Request_Write:
-		return object(body.Write.GetHandle())
+	case *authoritypb.Request_WriteTransaction:
+		// BEGIN resolves and pins the caller's handle. Later phases address the
+		// already-authorized session transaction; ABORT must remain available
+		// after an authorization downgrade.
+		if body.WriteTransaction.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN {
+			return object(body.WriteTransaction.GetHandle())
+		}
+		return nil
+	case *authoritypb.Request_Fallocate:
+		return object(body.Fallocate.GetHandle())
+	case *authoritypb.Request_CopyFileRange:
+		return object(body.CopyFileRange.GetOutputHandle())
+	case *authoritypb.Request_Tmpfile:
+		return object(body.Tmpfile.GetParent())
 	case *authoritypb.Request_Open:
 		flags := body.Open.GetFlags()
 		if flags == nil || !(flags.GetWrite() || flags.GetAppend() || flags.GetTruncate()) {

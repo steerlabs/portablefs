@@ -566,8 +566,7 @@ extension PfsLocalMockDaemonTests {
         initiator: PfsMacOSMutationInitiator(
             sessionID: Data(repeating: 0x72, count: 16),
             replaySlot: 1,
-            mutationSequence: 91,
-            localOperationID: nil
+            mutationSequence: 91
         ),
         repairs: []
     )
@@ -680,8 +679,7 @@ extension PfsLocalMockDaemonTests {
         initiator: PfsMacOSMutationInitiator(
             sessionID: Data(repeating: 0x74, count: 16),
             replaySlot: 1,
-            mutationSequence: 92,
-            localOperationID: nil
+            mutationSequence: 92
         ),
         repairs: [.evictBinding(
             path: try PfsMacOSRelativePath(components: [sourceName]),
@@ -1169,8 +1167,7 @@ extension PfsLocalMockDaemonTests {
         initiator: PfsMacOSMutationInitiator(
             sessionID: Data(repeating: 0x92, count: 16),
             replaySlot: 1,
-            mutationSequence: 93,
-            localOperationID: nil
+            mutationSequence: 93
         ),
         repairs: []
     )

@@ -1,10 +1,18 @@
-# The FSKit Mount (macOS)
+# The FSKit qualification mount (macOS)
 
-`portablefs mount` on macOS has exactly one transport: the `fskit` strategy.
-The CLI drives the same `portablefsd` + FSKit extension pair the PortableFS
-menu-bar app uses. There is deliberately no fallback transport — a Mac that
-cannot serve an FSKit mount fails with install guidance instead of degrading to
-a weaker consistency model.
+Status: **non-shipping qualification path; production refuses before Attach**
+
+No currently documented FSKit version can satisfy PortableFS protocol 5's exact
+source-publication and peer-invalidation boundaries. An ordinary
+`portablefs mount` on macOS therefore fails at the platform gate before starting
+portablefsd or contacting the authority. The shipping extension independently
+refuses before socket resolution, and the shipping daemon refuses a direct
+`EnsureAttach` before constructing an authority transport. There is no fallback
+transport or degraded cache policy.
+
+The mechanics below describe the retained SDK-26/SDK-27 development and
+separately signed qualification path. They are useful for protocol and live-
+kernel testing, but they are not a production mount contract.
 
 `--strategy auto` (the default) resolves to `fskit` on macOS and `fuse` on
 Linux; an explicit `--strategy fskit` requires darwin, and an explicit
@@ -12,60 +20,55 @@ Linux; an explicit `--strategy fskit` requires darwin, and an explicit
 is a pure platform decision that never depends on installed packages or mutable
 host state (`vcs/internal/mounthost`).
 
-What is proven differs by layer, and this document is explicit about the
-boundary. The credential shape, the daemon-owned authority session, the kernel
-mount scheme, and the unmount transaction are implemented and tested here. The
-kernel-cache half is composed and wired — both client indexes, a real publication
-barrier, identity-aware callback-serialized authority ordering, the installed
-repair gate, and direct source/data repair — and targeted behavior is live-proven. It runs under
-an explicitly declared compatibility cache policy with a stated fidelity target
-and two exact callback-coalescing limits. `VolumeCore` admits exactly that
-declared policy and fails `ENOTSUP` on
-any other, including the macOS 27 native one. Every open gate is enumerated in
-[macos-26-coherence-contract.md](./macos-26-coherence-contract.md). Read that
-document before treating a Mac as a shared-write peer.
+What is proven differs by layer. Credential shape, daemon-owned authority
+sessions, the kernel mount scheme, and teardown have qualification coverage.
+The synthetic SDK-26 cache machinery and SDK-27 data-cache adapter also have
+unit and targeted live evidence. None supplies the missing documented peer
+namespace/attribute invalidator, and SDK 26 additionally cannot return complete
+source post-mutation attributes. The exact support boundary is in
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md). A current
+Mac must not be treated as a supported shared-write peer.
 
 ## FSKit API And Deployment Track
 
-The production app, development harness, and Swift package all target macOS
-26.0. That release uses the macOS 26 `FSVolume.Operations`,
+The shipping app, development harness, and Swift package compile from a macOS
+26.0 deployment baseline. The SDK-26 qualification adapter uses
+`FSVolume.Operations`,
 `OpenCloseOperations`, `ReadWriteOperations`, `XattrOperations`, and
-`PathConfOperations` protocols. They remain the compatible production API for
-the deployed OS even though Apple's June 2026 documentation deprecates them in
-favor of the new
+`PathConfOperations`. Those protocols cannot represent the complete source
+result contract and are not a production API for PortableFS, regardless of
+their deployment availability. Apple's June 2026 documentation deprecates them
+in favor of the new
 [`Handler`](https://developer.apple.com/documentation/fskit/fsvolume/handler)
 family.
 
 The replacement handlers, including
 [`DataCacheHandler`](https://developer.apple.com/documentation/fskit/fsvolume/datacachehandler),
 are beta API for the next OS/SDK track and are not present in the stable macOS
-26.5 SDK. They are therefore a macOS 27 release gate, not a reason to raise this
-release's deployment target or to make the macOS 26 adapter depend on beta
-symbols. `VolumeCore` deliberately owns all pfslocal, identity, open handle, and
-filesystem semantics independently of the adapter, so a future
-availability-guarded macOS 27 handler can reuse the same tested core.
+26.5 SDK. The separate SDK-27 adapter compiles against those symbols and can
+reuse `VolumeCore`, but `DataCacheHandler` covers only retained item data. It
+does not establish exact peer namespace or inode-attribute invalidation.
 
-Before claiming macOS 27 support, build that handler in a separate SDK-27 source
-target and CI lane against the final SDK, negotiate the least-permissive correct
-`DataCacheHandler` coherency mode, drive remote invalidations through the
-handler's cache-state API, and pass the signed live-kernel
-read/write/mmap/rename/unlink/remote-invalidation matrix on macOS 27.
-`#available` cannot make unknown SDK symbols compile, and a compiler guard that
-hides an uncompiled implementation is not verification. The macOS 26
-compatibility policy is selected explicitly, never as an automatic fallback, and
-must pass its own matrix on macOS 26; there is no conditional beta
-implementation or silent downgrade in the binary. See
+Before any future support claim, the final SDK must expose every missing
+primitive and a separately compiled adapter must pass the signed live-kernel
+source/peer namespace, data, attribute, rename, unlink, mapping, and failure
+matrix. `#available` cannot make unknown SDK symbols compile, and a compiler
+guard that hides an uncompiled implementation is not verification. See
 [macos-27-native-coherence.md](./macos-27-native-coherence.md) for the SDK-27
-data-cache contract and the namespace and attribute rows that remain unproven.
-The ordinary CLI consequently refuses macOS 27 before authority attach. Only
-the separately signed and build-stamped qualification lane can select the
-native policy; macOS 28 and later remain refused until independently proven.
+data-cache contract and the namespace and attribute rows that remain missing.
+The ordinary CLI refuses every current macOS version before authority Attach.
+Only the separately signed and build-stamped SDK-27 qualification lane can
+select the native candidate policy; the stamp does not admit SDK 26, macOS 28,
+or a shipping extension.
 
 Apple's stable `FSVolume.OpenModes` contains only read and write access bits; it
 does not carry `O_APPEND`. That is the append boundary described under
 [consistency-model.md](./consistency-model.md).
 
-## How A Mount Happens
+## How a qualification mount happens
+
+This transaction is reachable only from explicit development/qualification
+composition. The production gate runs before step 1.
 
 Three cooperating pieces:
 
@@ -81,7 +84,7 @@ portablefs mount ──control socket──▶ portablefsd ◀──frontend soc
    CLI/daemon release, exact daemon executable SHA-256, private control
    protocol, and `pfslocal` major protocol. A healthy compatible daemon is
    adopted — the daemon is per-user and multi-attach, so one instance serves
-   every mount. An incompatible
+   every qualification mount. An incompatible
    live daemon fails closed with clean-stop guidance; the CLI never replaces it
    automatically. Otherwise the unentitled CLI asks `NSWorkspace` to launch the
    exact app bundle that contains it, with running-app substitution disabled,
@@ -137,7 +140,7 @@ so the one foreseeable misconfiguration (the CLI attached to daemon A while the
 installed extension's Info.plist points at daemon B) surfaces as a typed error
 rather than an opaque I/O error afterwards.
 
-The command returns only after two matching kernel mount-table proofs surround
+The qualification command returns only after two matching kernel mount-table proofs surround
 the exact readiness witness declared by the cache policy. macOS 26's
 `macos26-synchronous-vfs-repair-v1/v2` witness is the daemon opening, attesting,
 and retaining the mount-root descriptor its VFS repair channel needs. macOS
@@ -163,7 +166,7 @@ boundary without the other. `DELETE
 /v1/attaches/{ref}` is refused for that reason — it cannot prove exact kernel
 teardown.
 
-## What The Daemon Owns
+## What the qualification daemon owns
 
 `portablefsd` is the v3 data plane, and the split of responsibility across the
 local socket is the point of the design.
@@ -183,7 +186,7 @@ The attach declares, and the authority validates:
 
 | field | value | meaning |
 |---|---|---|
-| cache policy | `macos26-synchronous-vfs-repair-v2` | the current declared macOS 26 compatibility cache policy (`vcs/internal/portablefsd/v3coherence.go`) |
+| cache policy | one exact qualification policy | SDK 26 tests use `macos26-synchronous-vfs-repair-v2`; the separately tagged SDK-27 lane uses `fskit-native-revocation-v1` |
 | cached-name capacity | 65536 | the bound on directory bindings this mount may hold cached (`mountv3.CachedNameCapacity`) |
 | repair budget | 15s | the per-phase deadline the mount commits to before the authority may consider it blocked (`mountv3.RepairBudget`) |
 | routes revision | the empty rule set's revision | see [Machine-Local Dirs](#machine-local-dirs) |
@@ -195,15 +198,17 @@ two numbers bound, what the barrier guarantees, and which live-kernel proofs are
 still outstanding are specified in
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
-## Install And Enable (Once Per Mac)
+## Install and enable (qualification hosts only)
 
-The strategy requires the PortableFS FSKit extension to be registered and
-enabled:
+Live qualification requires the development or separately signed
+qualification FSKit extension to be registered and enabled. Installing the
+shipping app does not admit a production mount:
 
-1. Run the PortableFS installer (`portablefs install-macos-app`). It places the
-   notarized app at the canonical per-user path `~/Applications/PortableFS.app`,
-   links its embedded CLI into `~/.local/bin`, and launches that exact app so
-   macOS registers its File System Extension.
+1. Build and install the separately signed qualification app with the exact
+   qualification stamp/tag. Its installer uses the same canonical per-user app,
+   CLI-link, and extension-registration transaction as the release package. An
+   ordinary release install may prove packaging and registration, but its CLI,
+   extension, and daemon still refuse a production mount.
 2. Open System Settings → General → Login Items & Extensions, scroll to the
    Extensions section, and open the **File System Extensions** category (click
    its ⓘ). Enable the PortableFS extension there. Use the category view
@@ -212,10 +217,10 @@ enabled:
    macOS setting and cannot be automated.
 
 FSKit extensions are user-space: no kernel extension, no reboot, no sudo.
-Exactly one installed PortableFS provider may claim the `pfs` fs type. The
-release installer refuses publication when it finds another provider, such as
-the dev harness's `PortableFSDev.appex`; remove that provider explicitly before
-installing the release app.
+Exactly one installed qualification provider may claim the `pfs` fs type during
+a live run. The installer refuses publication when it finds another provider,
+such as the dev harness's `PortableFSDev.appex`; remove that provider explicitly
+before installing the intended qualification artifact.
 
 The release archive is one `PortableFS.app`. Its unentitled CLI lives at
 `Contents/Helpers/portablefs`; its entitled daemon lives only inside
@@ -249,10 +254,11 @@ Cleanly unmount volumes before upgrading.
   concurrent replacement is restored rather than unlinked.
 - **Roots.** Control lives under the canonical owner-private daemon state.
   The frontend socket lives under the app-group because only the sandboxed
-  FSKit peer consumes it. The macOS 26 compatibility policy also uses the
-  canonical mount-root handoff socket there; the macOS 27 native policy has no
-  such channel. These roots are independently pinned, locked, and safely
-  reconciled; the CLI never resolves the app-group root.
+  qualification FSKit peer consumes it. The SDK-26 qualification policy also
+  uses the canonical mount-root handoff socket there; the SDK-27 native
+  qualification policy has no such channel. These roots are independently
+  pinned, locked, and safely reconciled; the CLI never resolves the app-group
+  root.
 - **Sockets are the authentication boundary.** The daemon creates the socket
   directory 0700 and the sockets 0600; same-user filesystem access is the
   control plane's entire auth model — there is no bearer token on the control
@@ -268,10 +274,11 @@ Cleanly unmount volumes before upgrading.
   access, skip a sequence, change the mount key, or turn keepalive into
   authorization. The endpoint also retains its earlier pending-attach recovery
   role after a daemon restart.
-- **Outlives mounts.** Exact unmount durably removes the attach but leaves the
-  launchd agent running for the next mount. `portablefs daemon stop` is refused
-  on macOS; only the host-owned update transaction may prove zero kernel mounts
-  and zero daemon attaches, unregister the agent, and permit app replacement.
+- **Outlives qualification mounts.** Exact unmount durably removes the attach
+  but leaves the launchd agent running for the next qualification run.
+  `portablefs daemon stop` is refused on macOS; only the host-owned update
+  transaction may prove zero kernel mounts and zero daemon attaches, unregister
+  the agent, and permit app replacement.
 - **Two-phase updates.** The installer wakes the exact installed host and uses
   a credential-checked owner-private Unix-socket session. Before unregistering,
   that host durably records a five-minute activation lease containing the exact
@@ -395,11 +402,13 @@ keep synchronized.
 
 ## Write Path
 
-There is no PortableFS-managed or offline write-back layer and no write-mode
-knob. macOS still has its ordinary kernel page cache: `write(2)` may return when
-that cache accepts bytes, before FSKit sends them to the daemon. `fsync`, FSKit
-synchronize, and normal unmount wait through the authoritative server
-descriptor. PortableFS itself buffers no durable tail on the Mac, so:
+This section records qualification-adapter behavior, not a production macOS
+durability promise. There is no PortableFS-managed or offline write-back layer
+and no write-mode knob. FSKit still has its ordinary kernel page cache:
+`write(2)` may return when that cache accepts bytes, before the framework sends
+them to the daemon. In the qualification adapter, `fsync`, FSKit synchronize,
+and normal unmount wait through the authoritative server descriptor.
+PortableFS itself buffers no durable tail on the Mac, so:
 
 - there is no local WAL, no flush interval, no group-sync window, and no
   unshipped tail that could be lost with the machine;
@@ -415,10 +424,9 @@ descriptor. PortableFS itself buffers no durable tail on the Mac, so:
   skips the trustworthy kernel synchronize pass. It is a revocation path, not a
   durability claim.
 
-This is what makes a mounted path a safe handoff point between machines without
-an explicit barrier discipline: an acknowledged write is already the volume's
-current state for every other mount. `--fast` is retired and fails with a
-pointer at this model.
+These server-side facts do not make a current FSKit-mounted path a safe
+multi-machine handoff point: the missing source and peer cache primitives remain
+decisive. `--fast` is retired and cannot bypass that boundary.
 
 The cost side is equally plain: every mutation is a round trip to the authority,
 so latency to the authority is the write latency. See
@@ -430,19 +438,19 @@ The production XFS authority exposes a deliberately read-only portable xattr
 surface: read/list and removal of pre-existing portable `user.*` attributes are
 real authority operations, while set is refused because XFS attribute-fork
 blocks are outside project-quota accounting. Linux receives `EOPNOTSUPP`
-directly. The production pfslocal resolve advertises `xattrs=true` and
-`xattr_set_supported=false`; macOS validates the item and name and refuses
-set/create/replace/upsert locally without emitting a daemon mutation. The FSKit
-boundary returns Darwin's distinct `EOPNOTSUPP` (102) instead of internal
-`ENOTSUP` (45), because XNU uses 45 to trigger AppleDouble `._*` emulation.
-PortableFS never permits that fallback; XFS remains the single durable
-representation. Read/list/removal continue to forward to the daemon.
+directly. In the qualification pfslocal contract, Resolve advertises
+`xattrs=true` and `xattr_set_supported=false`; the adapter validates the item
+and name and refuses set/create/replace/upsert locally without emitting a daemon
+mutation. Its FSKit boundary returns Darwin's distinct `EOPNOTSUPP` (102)
+instead of internal `ENOTSUP` (45), because XNU uses 45 to trigger AppleDouble
+`._*` emulation. That tested mapping is not a production mount surface while
+the platform gate refuses before Resolve.
 
 ## Machine-Local Dirs
 
-Machine-local routing is a Linux capability today. The macOS v3 attach **refuses
-local-dir and graft options outright** — the daemon rejects the whole attach
-rather than accepting an option it would not serve — and the CLI refuses
+Machine-local routing is a Linux capability today. A qualification macOS v3
+attach **refuses local-dir and graft options outright** — the daemon rejects the
+whole attach rather than accepting an option it would not serve — and the CLI refuses
 `--local-dir` unconditionally on every platform, because a per-machine route
 would hide from one machine a directory every peer still treats as shared, with
 no revision recording it and no peer able to observe it.
@@ -452,7 +460,7 @@ implementation:
 
 - routes are declared volume-wide in the volume's `.portablefs/local-dirs`, and
   the revision a mount presents at attach is the hash of that declaration;
-- `portablefsd` does not join the route adoption protocol, so a macOS attach
+- `portablefsd` does not join the route adoption protocol, so a qualification macOS attach
   declares the **empty** rule set's revision;
 - the authority refuses a mount whose revision is not the volume's active one,
   naming both revisions and the volume's canonical rules. So **a volume that
@@ -476,7 +484,11 @@ capability — is in
 [xfs-authority-architecture.md](./xfs-authority-architecture.md#machine-local-routing), and it is served by the Linux FUSE
 frontend.
 
-## Troubleshooting
+## Qualification troubleshooting
+
+The cases below apply only after deliberately building and installing a
+qualification artifact. An ordinary production command should stop at the
+unsupported-FSKit refusal and must not reach these states.
 
 ### The extension is not enabled
 
@@ -493,8 +505,8 @@ and enable it, then retry
 Do exactly that. If the toggle is missing from System Settings, launch
 PortableFS.app once more so LaunchServices registers the appex, then reopen
 System Settings. If two PortableFS extensions are listed (app and dev harness),
-remove the non-release provider and reinstall; a valid release setup has exactly
-one installed `pfs` provider.
+remove the unintended provider and reinstall; a valid qualification setup has
+exactly one installed `pfs` provider.
 
 If another enabled PortableFS-based product exists, it may remain enabled only
 when both its `FSShortName` and `FSSupportedSchemes` differ from the OSS
@@ -528,8 +540,8 @@ frontend socket. Every process independently resolves the exact signed
 app-group container through Foundation, and the CLI and daemon reject any
 different root or socket. A rebuilt extension can also linger as a stale
 process from a previous version; `pkill -x
-PortableFSDev` (or the app's extension name) forces a fresh instance on the next
-mount.
+PortableFSDev` (or the qualification app's extension name) forces a fresh
+instance on the next mount.
 
 ### A foreign daemon owns a socket
 
@@ -545,18 +557,18 @@ compiled app-group identity and matching signed helper pair.
 
 ### The daemon does not become healthy
 
-`portablefs mount` fails after 15 seconds with the log path. Read
+The qualification mount fails after 15 seconds with the log path. Read
 `~/.local/state/portablefs/portablefsd.log` — the daemon logs why it could not
 start, most often a socket path it cannot create or bind.
 
-### The mount is refused for its routing revision
+### The qualification mount is refused for its routing revision
 
 The volume publishes `.portablefs/local-dirs` and this Mac declared the empty
 rule set. That is the documented boundary above, not a misconfiguration: mount
 the volume from Linux, or have an administrator remove the declaration with
 `ApplyRoutes`.
 
-## Why One Transport, No Fallback
+## Why there is no fallback
 
 Earlier releases fell back to a loopback bridge over the macOS kernel's built-in
 network-filesystem client when the native mount was unavailable. That fallback
@@ -566,15 +578,16 @@ for up to ~60 seconds regardless of server validators, and concurrent appends
 from two machines to one shared file collapsed into whole-file
 last-writer-wins uploads — precisely the shapes agent workspaces hit (tailing a
 log another machine appends to, two mounts sharing state files). A mount that
-sometimes has those semantics is worse than a mount error that says how to get
-the real one. One transport per platform keeps authority ordering uniform.
+sometimes has those semantics is worse than an explicit platform refusal.
+Production macOS currently has no admitted transport; qualification uses FSKit
+only and never substitutes the removed loopback path.
 
-Two framework boundaries stay explicit rather than being papered over. FSKit on
-macOS 26 exposes no general kernel-cache invalidation primitive, which is why
-the cache half uses the declared identity-aware callback-serialized
-compatibility contract and publishes its exact coalescing limits rather than claiming native equivalence
-([macos-26-coherence-contract.md](./macos-26-coherence-contract.md)). And
-current FSKit write callbacks do not expose `O_APPEND` intent, so cross-machine
-atomic append cannot be inferred without misclassifying legitimate positional
-writes; see
-[consistency-model.md](./consistency-model.md).
+The framework boundaries stay explicit rather than being papered over. SDK 26
+has no general kernel-cache invalidation primitive and cannot publish complete
+source result attributes. SDK 27 adds data-cache control and richer results but
+still lacks exact peer namespace and inode-attribute invalidation. Current
+FSKit write callbacks also do not expose `O_APPEND` intent. The
+callback-serialized and native adapters remain qualification instruments; none
+of these gaps is converted into a compatibility policy, heuristic repair, or
+production fallback. See
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
