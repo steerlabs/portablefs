@@ -40,8 +40,7 @@ policy, quota entitlements, billing metadata, and short-lived credentials. It
 does not store file bytes, inode metadata, directory entries, locks, or the
 current filesystem tree and is not on the per-operation data path.
 
-The non-shipping macOS qualification frontend is not a second data plane.
-`portablefsd` owns the same v3
+The macOS FSKit frontend is not a second data plane. `portablefsd` owns the same v3
 authority client used by the Linux architecture: mutual TLS, access capability,
 authority epoch, replay slots, keepalive, route revision, visibility polling,
 fencing, and evidence-bearing detach. The FSKit extension receives only a
@@ -49,22 +48,21 @@ versioned, ordered local stream describing the already-authenticated session and
 its cache obligations, and returns exact cursor acknowledgements. Authority TLS
 credentials and replay secrets never cross the local frontend socket.
 
-macOS 27 is a qualification target because it is the first SDK line with
+macOS 27 is a test target because it is the first SDK line with
 module-initiated synchronous kernel data-cache control. Its documented contract
 still does not provide exact peer namespace or inode-attribute invalidation.
 SDK 26 also cannot return the complete source post-mutation attribute set.
-Production therefore refuses every current macOS version before Attach; an OS
-version number is not accepted as proof. The documented SDK boundary and
-required future live matrix are recorded in
+The shipping macOS 26 product therefore names a best-effort policy rather than
+claiming the exact Linux cache contract. The documented SDK boundary and
+required future exact live matrix are recorded in
 [macos-27-native-coherence.md](./macos-27-native-coherence.md).
 
-The retained SDK-26 `macos26-synchronous-vfs-repair-v2` and SDK-27
-`fskit-native-revocation-v1` implementations are qualification policies only.
-They exercise the same authority, source gate, local indexes, publication
-barrier, repair gate, and fencing architecture without claiming that synthetic
-VFS activity completes a documented kernel-cache transaction. Neither is an
-automatic fallback or silent downgrade. The exact production boundary and
-historical qualification evidence are recorded in
+The shipping SDK-26 `macos26-synchronous-vfs-repair-v2` policy and the test-only
+SDK-27 `fskit-native-revocation-v1` policy exercise the same authority, source
+gate, local indexes, publication barrier, repair gate, and fencing architecture.
+SDK 26 does not claim that synthetic VFS activity completes a documented exact
+kernel-cache transaction. Neither policy is an automatic fallback. The product
+boundary and live evidence are recorded in
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 ## Source of truth
@@ -272,14 +270,14 @@ write-back remains out of scope.
 
 Apple's June 2026 FSKit beta adds `DataCacheHandler`, `noCache`, synchronous
 cache-state changes, invalidate, and revoke. The locally installed Xcode 26.6 /
-macOS 26.5 SDK does not contain those APIs. The SDK-27 qualification adapter
+macOS 26.5 SDK does not contain those APIs. The SDK-27 test adapter
 uses the new data surface, but it still has no exact namespace or inode-
-attribute invalidator. Production support therefore remains gated on a future
+attribute invalidator. Exact support therefore remains gated on a future
 documented SDK/OS plus direct tests for data, attributes, positive and negative
 dentries, rename, unlink, writable mappings, and failed revocation. SDK-27
-qualification never falls back to synthetic VFS repair, and the SDK-26
-qualification policy never claims to be native; a lane that asks for one and is
-offered the other fails closed.
+testing never falls back to synthetic VFS repair, and the SDK-26 product policy
+never claims to be native; a lane that asks for one and is offered the other
+fails closed.
 The platform gate is tracked against Apple's
 [FSKit updates](https://developer.apple.com/documentation/updates/fskit) and
 [`DataCacheHandler`](https://developer.apple.com/documentation/fskit/fsvolume/datacachehandler),
@@ -311,16 +309,16 @@ additional declared repair-budget grace, then discharged. That grace is
 load-bearing only when the frontend can prove that its old kernel cache became
 unservable before the grace ends. Linux does this by revoking published FUSE
 bindings and aborting the connection, after which every request on that mount
-fails `ENOTCONN`. The retained non-shipping SDK-26 qualification supervisor uses
-an identity-checked `MNT_FORCE` watchdog. Live qualification testing with cached
+fails `ENOTCONN`. The SDK-26 product supervisor uses an identity-checked
+`MNT_FORCE` watchdog. Live testing with cached
 bytes on a held descriptor proved that after daemon death the watchdog force-
 unmounted at about 10 seconds and every later `pread` failed `EIO`, inside the
 fencing grace. A kernel that refuses forced unmount past the grace remains the
 explicit residual. A phase that first consumes its ordinary deadline therefore
 costs at most two budgets rather than an unbounded volume outage, and later
 requests on the fenced mount must fail. The SDK-26 force-unmount measurements
-below are historical qualification evidence; they do not admit a production
-macOS participant.
+below establish fail-closed behavior for the best-effort tier; they do not make
+it an exact simultaneous multi-writer participant.
 
 Linux namespace repair uses a strict-kernel dentry-expiration primitive which
 never takes the parent inode's `i_rwsem` and never synthesizes a local unlink.
@@ -341,8 +339,8 @@ frontends revoke during route PREPARE and are fenced before the durable commit;
 a later commit failure does not resurrect them. The
 coordinator still sends the truthful reported active revision in COMPLETE to any
 future frontend that explicitly staged and ACKed PREPARE without leaving, but
-that path is not evidence that today's FUSE mount survived or that a
-qualification FSKit mount is production-admissible. A definite
+that path is not evidence that today's FUSE mount survived or that a macOS
+FSKit mount completed an exact cache cut. A definite
 pre-publication failure reports the old revision with `Applied=false`; a
 post-rename durability-uncertain failure reports the next revision with
 `Applied=true`. Fresh attaches use that reported active revision. The ordinary phase deadline remains the hard
@@ -356,7 +354,7 @@ and recovery needs a new epoch.
 Durable membership is deliberately *not* cleared by fencing. A record is
 deactivated only by `CleanDetach` on the authenticated request for that exact
 session. The official supervisor makes its platform mount terminal before it
-sends the observation: qualification FSKit code checks the exact attach
+sends the observation: FSKit code checks the exact attach
 reference is absent from `getfsstat`; Linux checks the exact mount ID is absent and waits for the exact
 FUSE serving connection to finish. The authority cannot inspect a remote kernel
 and does not claim independent attestation. This is an explicit cooperative-
@@ -365,8 +363,8 @@ delivery failure leaves membership active. A fenced mount is therefore gone
 from this epoch's barrier while still recorded, and a replacement authority
 refuses to serve until fencing covers every recorded old kernel mount.
 
-The macOS 26 Swift implementation is composed only into development and
-qualification FSKit volumes:
+The macOS 26 Swift implementation is composed through the named shipping
+best-effort factory and the development volume:
 the operations adapter maintains the namespace and live-object indexes, the
 publication barrier closes and reopens callback admission, and the repair gate is
 installed at resolve time so that a composition failure fails the mount rather
@@ -388,9 +386,9 @@ later COMPLETE namespace target carries an authority-attested post-binding ident
 that can be matched to the retained mount-local vnode and inode projection. Four exact
 callback-coalescing limits, including a same-vnode mode-only setattr during
 armed attribute refresh, are declared. This
-is a bounded qualification mechanism, not exact native equivalence, and it is
-never selected by shipping composition or as a fallback. The complete support
-boundary and historical live evidence are in
+is a bounded best-effort mechanism, not exact native equivalence, and it is
+selected only by the named shipping SDK-26 composition, never as a fallback.
+The complete support boundary and live evidence are in
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 ## Machine-local routing
@@ -487,14 +485,13 @@ available for pre-existing portable `user.*` attributes. Writable xattrs
 require a future substrate with one kernel-enforced aggregate capacity boundary;
 they are not enabled by a per-inode limit or an in-memory counter.
 
-In the macOS qualification contract, Resolve advertises the xattr family and
+In the macOS product contract, Resolve advertises the xattr family and
 independently declares xattr set unsupported. FSKit validates item/name/mode and refuses
 set/create/replace/upsert locally before emitting a daemon or ordered-mutation
 frame. Its internal refusal is `ENOTSUP` (45), but the FSKit xattr boundary
 exposes `EOPNOTSUPP` (102). XNU reserves 45 to request its AppleDouble `._*`
 fallback; returning 102 keeps XFS as the only durable truth. This local gate
-changes no successful daemon-forwarded read/list or pre-existing removal, but
-it is not a production surface while macOS is refused before Resolve.
+changes no successful daemon-forwarded read/list or pre-existing removal.
 
 The initial volume model is deliberately single-principal, like an agent's
 private workspace rather than a multi-user Unix server. Every XFS inode must be
@@ -574,8 +571,8 @@ historical namespace.
 - Memory scales with active sessions, handles, locks, and bounded retry
   slots—not stored files or keys.
 - Unsupported FUSE operations fail explicitly; they are not emulated with
-  divergent semantics. Current FSKit fails earlier at the production platform
-  gate; qualification adapters also fail unrepresentable operations closed.
+  divergent semantics. macOS 26 advertises its best-effort operation set and
+  fails unrepresentable operations closed.
 
 Scale comes from placing volumes across cells and moving hot volumes to a
 dedicated cell. A measured need for one volume to exceed one cell is a decision
@@ -612,12 +609,13 @@ something in the tree establishes it, and partial progress is stated as partial.
    obtaining a mount ID may use the attempt's random FUSE source as its exact
    identity, but only after that source is absent from the complete mount table
    and no serving loop can still install it. Missing or failed delivery remains
-   fenced and recorded. Qualification macOS code has separately exercised an
+   fenced and recorded. macOS code has separately exercised an
    exact FSKit mount-table absence observation; that does not admit the missing
    cache-coherence primitives.
 
-**Historical non-shipping macOS qualification evidence.** These measurements
-shaped the protocol and fencing design. They are not production acceptance:
+**macOS 26 best-effort evidence.** These measurements shaped the protocol and
+fencing design. They qualify the stated best-effort tier, not exact concurrent
+multi-writer equivalence:
 
 6. **Targeted SDK-26 attribute and data experiment.** A real macOS 26.5 FSKit
    mount and Linux FUSE peer against the XFS authority converged through a
@@ -641,14 +639,14 @@ shaped the protocol and fencing design. They are not production acceptance:
    Desktop, distro, and cloud kernels must fail INIT and never count as a
    weaker run.
 9. Broader performance and soak comparison on package installs, compilers,
-   longer metadata storms, larger I/O, and more concurrent qualification
-   mounts. These results can characterize the adapter but cannot establish
-   production support without the missing documented FSKit primitives. See
+   longer metadata storms, larger I/O, and more concurrent macOS mounts. These
+   results characterize the best-effort tier but cannot establish exact support
+   without the missing documented FSKit primitives. See
    [performance.md](./performance.md).
 10. Frontend liveness fault expansion for daemon freeze, an open-but-dead local
    event socket, and authority partition. Linux revoke/abort is production
-   architecture; SDK-26 force-unmount and daemon-kill revocation are
-   qualification evidence only.
+   architecture; SDK-26 force-unmount and daemon-kill revocation are the
+   best-effort tier's terminal boundary.
 11. File and directory sync fault tests over process kill, kernel crash, detach,
     full disk, quota exhaustion, short writes, and injected `EIO`.
 12. Multi-tenant saturation tests proving bounded RAM and descriptors and fair

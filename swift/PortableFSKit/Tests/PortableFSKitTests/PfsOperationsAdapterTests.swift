@@ -305,7 +305,7 @@ extension PfsLocalMockDaemonTests {
 }
 
 @available(macOS 26.0, *)
-@Test func productionAdapterRefusesBeforeSocketResolution() throws {
+@Test func unconfiguredAdapterRefusesBeforeSocketResolution() throws {
     let identity = try PortableFSModuleIdentity(
         fileSystemTypeName: PortableFSIdentity.fileSystemTypeName,
         resourceScheme: PortableFSIdentity.resourceScheme

@@ -1,7 +1,7 @@
 # Performance
 
-Status: **protocol-5 Linux candidate measured on the exact diagnostic kernel;
-no release SLO yet**
+Status: **protocol-5 Linux exact and macOS 26 best-effort paths measured; no
+release SLO yet**
 
 ## August 15, 2026 protocol-5 Linux measurement
 
@@ -101,38 +101,74 @@ reads at one strict mount, but hardware, network, concurrency, cache state, and
 success semantics differ. These numbers establish that the exact architecture
 is not intrinsically throughput-starved; they do not establish a vendor ranking.
 
-## August 15, 2026 macOS client-path guardrail
+## August 16, 2026 mounted macOS 26 measurement
 
-There is deliberately no mounted macOS protocol-5 throughput number yet. The
-public macOS 26 FSKit API cannot invalidate peer namespace and inode-attribute
-caches with the exact post-publication ordering required by PortableFS. Shipping
-macOS builds therefore refuse protocol-5 Attach before mounting instead of
-silently weakening consistency. This is a functional safety boundary, not a
-performance fallback. The separately pinned macOS 27 adapter also remains a
-qualification target rather than a shipping claim until an SDK 27 host can run
-the complete native cache matrix described in
-[macos-27-native-coherence.md](./macos-27-native-coherence.md).
+The shipping FSKit composition was mounted on an 18-core Apple M5 Max MacBook
+Pro with 128 GiB RAM and macOS 26.5. It used protocol 5 over TLS to an XFS
+authority inside the exact Linux 6.12.100 VZ guest. A strict Linux mount was
+attached to the same volume throughout the measurement. Every bulk run verified
+SHA-256, and writes include `fsync` in the reported durable rate.
 
-The currently usable measurement is a lower-layer client-pipeline guardrail. On
-an 18-core Apple M5 Max MacBook Pro with 128 GiB RAM, macOS 26.5, Xcode 26.6,
-and Swift 6.3.3, the release-build
+| operation | macOS FSKit median |
+| --- | ---: |
+| create | 15.430 ms |
+| 4 KiB write return | 0.010 ms |
+| fsync | 3.634 ms |
+| close | 1.656 ms |
+| warm stat | 0.001 ms |
+| negative lookup | 1.015 ms |
+| open/read/close | 2.344 ms |
+| rename | 16.743 ms |
+| mkdir / rmdir | 6.652 / 12.999 ms |
+| unlink | 16.053 ms |
+| 64 MiB durable write | 128.2 MiB/s |
+| 64 MiB `F_NOCACHE` read | 71.1 MiB/s |
+
+The 4 KiB `write` timing is page-cache acceptance, not authority durability;
+the `fsync` and 64 MiB durable rows are the meaningful completion boundaries.
+The final matching-client 64 MiB write runs were 117.8, 128.8, 128.2, 144.1,
+and 29.7 MiB/s; the low run is retained rather than discarded. Five earlier
+uncached reads were 55.6–75.5 MiB/s and all matched the expected digest.
+
+Before the compatibility writer lease was frozen, the strict Linux mount
+measured 100.8 MiB/s median for the same 64 MiB durable-write shape with the Mac
+attached. That number is retained as historical diagnostic evidence, not a
+supported current operation: Linux visible mutations now return `EBUSY` while
+a macOS 26 mount is active. After a clean Mac unmount transferred write
+ownership, the current Linux client measured 120.9 MiB/s median durable writes
+(103.3–127.1) and 135.3 MiB/s reads (112.3–161.6), with every digest matching.
+Direct XFS in that guest measured 3033.7 MiB/s. The direct number shows the cost
+is dominated by protocol, publication, VM forwarding, and client/framework
+crossings rather than the XFS device.
+
+Historical Archil measurements were 71.5/107.8 MiB/s sequential writes and
+102.9/232.5 MiB/s reads at 1/8 jobs. The Mac FSKit write median is in that
+historical range; the post-handoff Linux write median exceeds both historical
+Archil write observations, while its read median exceeds the single-job figure
+and is below the eight-job figure. Hardware, network, cache state, concurrency,
+and completion semantics differ, so this remains directional context rather
+than a vendor ranking.
+
+The mounted run also found the stated macOS 26 boundary: a Linux truncate of a
+Mac-cached file made FSKit reject the synchronous repair callback. PortableFS
+fenced rather than serving uncertain cache state. The compatibility writer
+lease now prevents that path before XFS apply: Linux readers may remain
+attached, but write ownership transfers only after the Mac cleanly unmounts.
+
+A high-churn namespace characterization ran 100 Mac atomic fsync+rename
+replacements while Linux repeatedly enumerated and read the target. Of 3,000
+Linux observations, 2,996 succeeded and four returned transient `ESTALE`
+(99.87% success); zero successful observations contained torn or mismatched
+bytes, both sessions remained healthy, and 1,000 subsequent observations
+passed. This is the measured macOS-26 best-effort edge, not a throughput or
+exact-coherence claim, and PortableFS does not hide it with an automatic retry.
+
+The lower-layer client-pipeline guardrail remains useful. The release-build
 `readWriteChunkingRoundTripsTwentyMiBFile` test performs an exact 20 MiB write
-and 20 MiB read through `VolumeCore`, the production Unix-socket framing, and
-the mock data-plane implementation. It verifies every returned byte and proves
-that both directions remain split into at most 1 MiB protocol requests. Ten warm
-runs completed in 0.044-0.049 seconds, with an approximately 0.047-second
-median. That is about 851 MiB/s of combined verified client-pipeline byte
-movement. It excludes a
-mounted FSKit kernel path, authority TLS, XFS, durability, and peer publication,
-so it is useful for detecting local framing/copy regressions but must not be
-compared directly with the Linux end-to-end or historical Archil figures.
-
-The same macOS tree passed all 342 Xcode-native tests, ten complete Xcode test
-iterations, the full Swift package under Thread Sanitizer and Address Sanitizer,
-and signed app/extension/service verification. Thread Sanitizer found one race
-in a test-only raw-socket server's stop flag; the helper now owns that lifecycle
-under a lock, and both sanitizer suites pass after the fix. No production data
-path race was reported.
+and 20 MiB read through `VolumeCore`, production Unix-socket framing, and a mock
+data plane. Ten warm runs completed in 0.044–0.049 seconds, about 851 MiB/s of
+combined verified local framing. It excludes FSKit, authority TLS, XFS,
+durability, and peer publication, so it is not an end-to-end throughput claim.
 
 The first controlled v3/protocol-4 investigation was run on August 12-13, 2026.
 The results below are engineering measurements, not a published service SLO.
@@ -296,7 +332,7 @@ gate.
 | `fsops` | Per-syscall latency distributions against a mounted workspace or a plain POSIX directory. Designed to be read against a measured network RTT: roughly one RTT means one round trip, and well under one RTT means the operation was served without the wire. Probe, enumeration, and bulk-write phases. |
 | `netprobe` | The protocol-free network floor to an authority endpoint: TCP connect RTT, TLS handshake cost, sustained upload throughput. This is the lower bound any protocol number must be attributed against. It writes nothing and holds no state. |
 | `tracestat` | Round trips per operation, derived from a `portablefsd` trace by subtracting daemon-side service time from observed wire round trips. Read-only. |
-| `pfs-mount-stress` | A cross-mount stress workload with hashed content and peer done-markers. Its parent-enumeration polling preserves the historical non-shipping macOS qualification experiment; it is not evidence of a supported Mac transport or a protocol-5 namespace workaround. |
+| `pfs-mount-stress` | A cross-mount stress workload with hashed content and peer done-markers. Its parent-enumeration polling preserves a historical Mac experiment; it is not evidence of exact namespace invalidation on macOS 26. |
 | `zratio` | Compressibility and content-defined chunk dedup potential of a real agent corpus. It still runs, but its framing was written against the deleted write-back flusher's batch granularity, so read it as a corpus measurement rather than as a statement about any current code path. |
 | `TestStrictPerformanceAgainstDirectXFS` | Byte-identical syscall latency and 64 MiB throughput against direct XFS, one strict mount, and an actively repairing peer. Emits JSON observations and verifies source/peer SHA-256. Linux protocol-5 qualification only. |
 

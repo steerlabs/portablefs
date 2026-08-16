@@ -21,10 +21,9 @@ described in
   and is not conditioned on whether the volume publishes a declaration.
   `--no-local-dirs` refuses a declaring volume rather than ignoring its
   topology.
-- Production macOS is refused before Attach because current FSKit cannot meet
-  protocol-5 coherence. The retained qualification v3 attach also refuses
-  local-dir and graft options outright (`vcs/internal/portablefsd/v3attach.go`),
-  so a volume that declares routes mounts from Linux. Grafts are Linux-only:
+- macOS v3 refuses local-dir and graft options outright
+  (`vcs/internal/portablefsd/v3attach.go`), so a volume that declares routes
+  mounts from Linux. Grafts are Linux-only:
   `vcs/internal/fusev3/graft_linux.go`, `vcs/internal/localdirs`,
   `vcs/internal/localroutes`.
 - Confinement is `vcs/internal/confinedfs`. Linux requires `openat2(2)` with

@@ -125,14 +125,13 @@ fencing grace — rather than an unbounded volume outage. The grace is
 load-bearing only when the frontend can prove its old kernel cache became
 unservable before the grace ends.
 
-Linux proves it in production by detaching and aborting FUSE (below). The
-non-shipping SDK-26 qualification supervisor also identity-checks and force-
-unmounts its exact FSKit mount after daemon/session failure. Historical live
+Linux proves it by detaching and aborting FUSE (below). The SDK-26 product
+supervisor also identity-checks and force-unmounts its exact FSKit mount after
+daemon/session failure. Live
 testing with a cached held descriptor showed reads continue for 8.6 seconds,
 the watchdog force-unmounts at about 10 seconds, and every later `pread` fails
-`EIO`, inside the fencing grace. This evidence shaped terminal fencing but does
-not admit current FSKit as a production frontend; macOS is refused before
-Attach for independent cache-publication gaps. See
+`EIO`, inside the fencing grace. This is the terminal boundary of the named
+macOS best-effort tier; it does not make that tier exact. See
 [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 
 Participant-scoped fencing is reported to the client as `ESTALE`, never as a

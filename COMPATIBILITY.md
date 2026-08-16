@@ -144,11 +144,13 @@ production surface while all macOS protocol-5 mounts are refused.
 
 ### Mount transports
 
-Linux mounts through kernel FUSE. No currently documented macOS FSKit version
-has a production-admitted PortableFS transport: the CLI refuses before daemon
-startup or Attach, the shipping extension refuses before socket resolution,
-and portablefsd independently refuses before constructing an authority
-transport. There is no fallback, degraded cache policy, or runtime opt-in.
+Linux mounts through kernel FUSE. macOS 26 mounts through the shipping FSKit
+extension under the named `macos26-synchronous-vfs-repair-v2` best-effort
+policy. One active Mac owns the volume's compatibility writer lease; Linux
+peers may read but their visible mutations return `EBUSY`, and a second Mac
+writer is refused before activation. There is no protocol fallback, local
+filesystem substitution, or runtime policy opt-in. macOS 27 remains a separate
+qualification-only native-cache track.
 
 Windows has no declared transport, released client binary, or install path yet.
 The pure `auto` selector carries a stable primitive-gate refusal that any future
@@ -161,29 +163,32 @@ declaring a future transport are in
 
 ### Declared macOS cache policies
 
-Three cache-policy names remain in the protocol so unsupported and qualification
-clients are rejected precisely: `macos26-synchronous-vfs-repair-v1`,
-`macos26-synchronous-vfs-repair-v2`, and `fskit-native-revocation-v1`. None is a
-production-admitted macOS mount policy. An unknown policy still fails closed;
-an existing name is never reinterpreted as a fallback.
+Three cache-policy names remain in the protocol so clients are classified
+precisely: the frozen macOS 26 v1/v2 synchronous-repair policies and
+`fskit-native-revocation-v1`. Shipping macOS 26 selects v2 explicitly; v1 is a
+frozen compatibility spelling and both callback-serialized profiles acquire
+the same exclusive writer lease at authority admission. The native policy is
+qualification-only. An unknown policy still fails closed; no name is
+reinterpreted as another policy.
 
-The SDK-26 and SDK-27 adapters remain compile and test lanes for protocol work.
-The SDK-27 lane requires the exact build-time qualification stamp
+The SDK-27 adapter remains a compile and test lane for protocol work. It
+requires the exact build-time qualification stamp
 `sdk27-live-qualification-only` in the CLI and the compile-time
-`portablefs_macos27_qualification` tag in portablefsd. These are properties of a
+`portablefs_macos27_qualification` packaging tag. These are properties of a
 separately signed qualification artifact, not environment toggles. The stamp
-does not admit macOS 26, macOS 28, or a shipping extension. An unsupported
-repair terminates a qualification mount before COMPLETE; passing a qualification
-test does not promote it to product support.
+does not change macOS 26's product policy or admit macOS 28. An unsupported
+repair terminates a qualification mount before COMPLETE; passing a
+qualification test does not promote the native policy to product support.
 
-The production refusal is architectural. macOS 26 `FSVolume.Operations`
-callbacks cannot return the complete child/item/parent attribute snapshots for
-namespace and write mutations. macOS 27 `FSVolume.Handler` adds most source
-result attributes, but current FSKit still has no documented exact namespace or
-inode-attribute invalidation API for peer changes; its data-cache handler covers
-only retained item data. A source-publication gate, synthetic nested VFS call,
-TTL change, or force-unmount watchdog cannot manufacture either missing
-primitive. See
+The best-effort boundary is architectural. macOS 26 `FSVolume.Operations`
+callbacks cannot return every exact source snapshot or invalidate every peer
+namespace/attribute cache shape. The writer lease prevents a second machine
+from mutating underneath that missing primitive; repair failure still fences.
+macOS 27 `FSVolume.Handler` adds most source result attributes, but current
+FSKit still has no documented exact namespace or inode-attribute invalidation
+API for peer changes; its data-cache handler covers only retained item data. A
+TTL change, polling loop, or hidden retry cannot manufacture those primitives.
+See
 [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md) and
 [docs/macos-27-native-coherence.md](./docs/macos-27-native-coherence.md).
 

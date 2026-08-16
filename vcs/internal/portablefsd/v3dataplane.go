@@ -659,8 +659,11 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	appendWrite := handle.append || request.Append
 	if appendWrite {
 		// Server-positioned append is a mandatory patched-Linux transaction.
-		// Current FSKit production is refused before Attach and qualification
-		// mode must not silently route append through positional Write.
+		// The macOS 26 FSKit API supplies only a kernel-chosen position here;
+		// it cannot carry the authority-owned append intent required for atomic
+		// cross-client append. Refuse an explicit append bit rather than silently
+		// routing it through positional Write. Ordinary macOS O_APPEND remains
+		// inside the documented best-effort platform boundary.
 		return nil, darwinENOTSUP
 	}
 	gate, err := v3ItemSourceGate(item.item, true)
@@ -689,7 +692,7 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	}
 	d.updateAttr(item, response.GetPostAttr())
 	if reply.GetFlags() == v3WriteReplyCommitted|v3WriteReplyPostApply {
-		_ = d.fail(fmt.Errorf("portablefsd: authority committed %d write bytes but FSKit qualification ABI cannot publish post-apply errno %d", reply.GetCommittedSize(), reply.GetError()))
+		_ = d.fail(fmt.Errorf("portablefsd: authority committed %d write bytes but macOS 26 FSKit cannot publish post-apply errno %d", reply.GetCommittedSize(), reply.GetError()))
 		return nil, darwinEIO
 	}
 	return &pfslocal.WriteReply{Written: uint32(reply.GetCommittedSize()), Attr: attr}, 0

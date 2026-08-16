@@ -1441,6 +1441,10 @@ func TestVisibilityRegisterRefusesUnstatedCommitments(t *testing.T) {
 		// unservable has not agreed to the contract: the authority would have to
 		// guess whether a silent participant is deadlocked or merely slow.
 		{"no namespace-repair model", SessionID{5}, VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget}},
+		{"writer lease on a non-macOS repair profile", SessionID{6}, VisibilityCommitment{
+			CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget,
+			NamespaceRepair: NamespaceRepairLocklessExpiration, CompatibilityWriter: true,
+		}},
 	}
 	for _, test := range cases {
 		if err := h.coordinator.Register(test.id, CoherenceStrict, make(chan struct{}), test.commitment); !errors.Is(err, ErrVisibilityProfile) {
@@ -1842,6 +1846,179 @@ func TestVisibilityConcurrentStrictMutatorsSerializeWithoutDeadlock(t *testing.T
 // an unanswered mutation can occupy. Once this participant owes PREPARE, a
 // later mutation must receive a definite pre-apply interruption instead of
 // parking behind the phase and preventing its own repair callback from running.
+func TestMacOS26CompatibilityMountOwnsTheWriterLease(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	mac, linux := SessionID{1}, SessionID{2}
+	terminal := h.fencer.attach(mac)
+	if err := h.coordinator.Register(mac, CoherenceStrict, terminal, VisibilityCommitment{
+		CachedNameCapacity:  testCacheCapacity,
+		RepairBudget:        testRepairBudget,
+		NamespaceRepair:     NamespaceRepairCallbackSerializedPipelined,
+		CompatibilityWriter: true,
+	}); err != nil {
+		t.Fatalf("register macOS compatibility writer: %v", err)
+	}
+	t.Cleanup(func() { h.fencer.FenceSession(mac) })
+	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.resolve(t, linux, "shared")
+
+	prepared, applied := false, false
+	err := executeTestSourceGated(
+		h.coordinator, context.Background(), linux,
+		MutationID{Sequence: 1, FrontendOperationID: 41}, "shared",
+		func() ([]VisibilityTarget, error) {
+			prepared = true
+			return testVisibilityTargets("shared"), nil
+		},
+		func() ([]VisibilityTarget, bool) {
+			applied = true
+			return testVisibilityTargets("shared"), true
+		},
+	)
+	if !errors.Is(err, ErrCompatibilityWriterLease) {
+		t.Fatalf("Linux mutation while macOS 26 is mounted = %v, want ErrCompatibilityWriterLease", err)
+	}
+	if prepared || applied {
+		t.Fatalf("refused peer mutation reached prepare=%v apply=%v", prepared, applied)
+	}
+	if h.fencer.wasFenced(mac) || h.fencer.wasFenced(linux) {
+		t.Fatal("a definite compatibility-writer refusal fenced a healthy mount")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go serviceVisibility(ctx, h.coordinator, linux)
+	if err := executeTestSourceGated(
+		h.coordinator, ctx, mac,
+		MutationID{Sequence: 2, FrontendOperationID: 42}, "shared",
+		testVisibilityPrepare("shared"),
+		func() ([]VisibilityTarget, bool) { return testVisibilityTargets("shared"), true },
+	); err != nil {
+		t.Fatalf("macOS 26 writer mutation: %v", err)
+	}
+
+	h.coordinator.Fence(mac, errors.New("test macOS unmount"))
+	if err := executeTestSourceGated(
+		h.coordinator, ctx, linux,
+		MutationID{Sequence: 3, FrontendOperationID: 43}, "shared",
+		testVisibilityPrepare("shared"),
+		func() ([]VisibilityTarget, bool) { return testVisibilityTargets("shared"), true },
+	); err != nil {
+		t.Fatalf("Linux mutation after macOS lease release: %v", err)
+	}
+}
+
+func TestMacOS26WriterActivationWaitsForAdmittedMutation(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	linux, mac := SessionID{1}, SessionID{2}
+	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairLocklessExpiration)
+
+	applyStarted := make(chan struct{})
+	releaseApply := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- executeTestSourceGated(
+			h.coordinator, context.Background(), linux,
+			MutationID{Sequence: 1, FrontendOperationID: 51}, "before-writer",
+			testVisibilityPrepare("before-writer"),
+			func() ([]VisibilityTarget, bool) {
+				close(applyStarted)
+				<-releaseApply
+				return testVisibilityTargets("before-writer"), true
+			},
+		)
+	}()
+	<-applyStarted
+
+	terminal := h.fencer.attach(mac)
+	activated := make(chan struct{})
+	activationDone := make(chan error, 1)
+	go func() {
+		_, err := h.coordinator.ActivateParticipant(mac, CoherenceStrict, terminal, VisibilityCommitment{
+			CachedNameCapacity:  testCacheCapacity,
+			RepairBudget:        testRepairBudget,
+			NamespaceRepair:     NamespaceRepairCallbackSerializedPipelined,
+			CompatibilityWriter: true,
+		}, nil, func() { close(activated) })
+		activationDone <- err
+	}()
+	select {
+	case <-activated:
+		t.Fatal("compatibility writer activated while an admitted mutation was still applying")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(releaseApply)
+	if err := <-mutationDone; err != nil {
+		t.Fatalf("mutation admitted before writer activation: %v", err)
+	}
+	if err := <-activationDone; err != nil {
+		t.Fatalf("activate compatibility writer: %v", err)
+	}
+	t.Cleanup(func() { h.fencer.FenceSession(mac) })
+
+	prepared := false
+	err := executeTestSourceGated(
+		h.coordinator, context.Background(), linux,
+		MutationID{Sequence: 2, FrontendOperationID: 52}, "after-writer",
+		func() ([]VisibilityTarget, error) {
+			prepared = true
+			return testVisibilityTargets("after-writer"), nil
+		},
+		func() ([]VisibilityTarget, bool) {
+			t.Fatal("mutation applied after the compatibility writer became active")
+			return nil, false
+		},
+	)
+	if !errors.Is(err, ErrCompatibilityWriterLease) {
+		t.Fatalf("mutation after compatibility writer activation = %v, want ErrCompatibilityWriterLease", err)
+	}
+	if prepared {
+		t.Fatal("mutation after compatibility writer activation reached prepare")
+	}
+}
+
+func TestMacOS26CompatibilityWriterAdmissionIsExclusive(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	commitment := VisibilityCommitment{
+		CachedNameCapacity:  testCacheCapacity,
+		RepairBudget:        testRepairBudget,
+		NamespaceRepair:     NamespaceRepairCallbackSerializedPipelined,
+		CompatibilityWriter: true,
+	}
+	first, second := SessionID{1}, SessionID{2}
+	firstTerminal := h.fencer.attach(first)
+	if _, err := h.coordinator.ActivateParticipant(first, CoherenceStrict, firstTerminal, commitment, nil, func() {}); err != nil {
+		t.Fatalf("activate first compatibility writer: %v", err)
+	}
+	t.Cleanup(func() { h.fencer.FenceSession(first) })
+
+	secondTerminal := h.fencer.attach(second)
+	secondCommitted := false
+	if _, err := h.coordinator.ActivateParticipant(second, CoherenceStrict, secondTerminal, commitment, nil, func() {
+		secondCommitted = true
+	}); !errors.Is(err, ErrCompatibilityWriterLease) {
+		t.Fatalf("activate second compatibility writer = %v, want ErrCompatibilityWriterLease", err)
+	}
+	if secondCommitted || h.membership.contains(second) {
+		t.Fatalf("refused second writer committed=%t durable=%t", secondCommitted, h.membership.contains(second))
+	}
+	if _, err := h.coordinator.InitialCursor(second); !errors.Is(err, ErrSessionExpired) {
+		t.Fatalf("refused second writer entered visibility membership: %v", err)
+	}
+
+	h.coordinator.Fence(first, errors.New("test first writer unmount"))
+	if _, err := h.coordinator.ActivateParticipant(second, CoherenceStrict, secondTerminal, commitment, nil, func() {
+		secondCommitted = true
+	}); err != nil {
+		t.Fatalf("activate second writer after handoff: %v", err)
+	}
+	if !secondCommitted || !h.membership.contains(second) {
+		t.Fatalf("second writer after handoff committed=%t durable=%t", secondCommitted, h.membership.contains(second))
+	}
+	t.Cleanup(func() { h.fencer.FenceSession(second) })
+}
+
 func TestVisibilityCallbackSerializedMutationIsInterruptedByPendingRepair(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	participant := SessionID{1}

@@ -8,7 +8,7 @@ package and two Xcode projects.
 - **`PortableFSKit`** — the SwiftPM package (`swift-tools-version: 6.2`,
   `.macOS(.v26)`). It holds everything that is not an app: the pfslocal client
   and its transport, `VolumeCore`, the FSKit Operations adapter, the macOS 26
-  strict coherence composition, the generated protobuf bindings, a mock daemon
+  best-effort coherence composition, the generated protobuf bindings, a mock daemon
   used by the tests, and `PortableFSAppCore`, a small support target for the
   menu-bar app.
 - **`PortableFSApp`** — the shipping product: `PortableFS.app` (a SwiftUI
@@ -47,7 +47,7 @@ downgraded.
 `PortableFSIdentity.swift`. These, with `VolumeCore`, are the only files that
 import FSKit.
 
-**The macOS 26 strict coherence composition** now lives in this target
+**The macOS 26 best-effort coherence composition** now lives in this target
 alongside the above, in five files:
 
 | File | Role |
@@ -97,7 +97,7 @@ concurrent, but consumes one-way ownership dispositions and publication
 acknowledgements on its serial socket reader before admitting the next frame,
 matching the production daemon's wire-order boundary.
 
-The suite is swift-testing, not XCTest. It currently reports **363 tests**,
+The suite is swift-testing, not XCTest. It currently reports **342 tests**,
 covering the pfslocal transport and wire goldens, the Operations
 adapter and its open-handle lifecycle, attribute and error mapping, enumeration
 paging, write acknowledgement, and the macOS 26 coherence stack (namespace and

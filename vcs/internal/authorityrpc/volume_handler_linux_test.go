@@ -272,6 +272,9 @@ func TestWireErrnoPreservesLinuxSyscall(t *testing.T) {
 	if got := wireErrno(volumeserver.ErrVisibilityRetry); got != errnos.EINTR {
 		t.Fatalf("wireErrno(visibility retry) = %d, want EINTR", got)
 	}
+	if got := wireErrno(volumeserver.ErrCompatibilityWriterLease); got != errnos.EBUSY {
+		t.Fatalf("wireErrno(compatibility writer lease) = %d, want EBUSY", got)
+	}
 	// Delegated killpriv and logical sync can both fail after one clean
 	// mutation. The authority retains both causes, but the syscall-visible
 	// result must deterministically preserve the security failure while the EIO

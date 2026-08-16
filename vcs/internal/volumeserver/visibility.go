@@ -56,6 +56,13 @@ var (
 	// callback. Parent-exclusive repair is scoped to an overlapping held parent.
 	// The caller may retry after the phase; no filesystem mutation was executed.
 	ErrVisibilityInterrupted = errors.New("volumeserver: visible mutation interrupted by this participant's pending cache repair")
+	// ErrCompatibilityWriterLease is a definite pre-apply refusal while an
+	// active macOS 26 callback-serialized participant owns the volume's
+	// compatibility writer lease. FSKit 26 cannot synchronously revoke every
+	// peer cache shape, so allowing a second participant to mutate would make an
+	// ordinary remote write capable of fencing the Mac mount. Reads remain
+	// concurrent; unmounting the Mac participant releases this writer lease.
+	ErrCompatibilityWriterLease = errors.New("volumeserver: macOS 26 compatibility mount is the active volume writer")
 	// ErrVisibilityRetry is an internal, definite-preapply dependency for the
 	// lockless Linux frontend. The authority releases the request's FIFO turn;
 	// the frontend releases its source gate, completes the named peer repair,
@@ -466,6 +473,11 @@ type VisibilityCommitment struct {
 	// NamespaceRepair is how this frontend's kernel makes a cached binding
 	// unservable. It has no default: see NamespaceRepair.
 	NamespaceRepair NamespaceRepair
+	// CompatibilityWriter gives this participant sole visible-mutation
+	// authority while it is active. Reads remain concurrent. It is assigned by
+	// the trusted authority handler from either frozen macOS 26 repair profile,
+	// not by an independent peer-controlled flag.
+	CompatibilityWriter bool
 }
 
 // VisibilityResolution is one piece of state a read-path operation is about to
@@ -533,11 +545,12 @@ type visibilityParticipant struct {
 	terminal <-chan struct{}
 	// left closes when this participant is out of the barrier set, so the
 	// watchdog that waits on terminal cannot outlive the participant.
-	left       chan struct{}
-	budget     time.Duration
-	registered time.Time
-	index      *resolvedIndex
-	repair     NamespaceRepair
+	left                chan struct{}
+	budget              time.Duration
+	registered          time.Time
+	index               *resolvedIndex
+	repair              NamespaceRepair
+	compatibilityWriter bool
 }
 
 type visibilityInterruption struct {
@@ -870,6 +883,14 @@ func (c *VisibilityCoordinator) ActivateParticipant(
 		c.mu.Unlock()
 		return VisibilityCursor{}, ErrAdmission
 	}
+	if commitment.CompatibilityWriter {
+		for _, participant := range c.participants {
+			if participant.compatibilityWriter {
+				c.mu.Unlock()
+				return VisibilityCursor{}, ErrCompatibilityWriterLease
+			}
+		}
+	}
 	c.mu.Unlock()
 	select {
 	case <-terminal:
@@ -895,6 +916,7 @@ func (c *VisibilityCoordinator) ActivateParticipant(
 		changed: make(chan struct{}), left: make(chan struct{}),
 		budget: commitment.RepairBudget, registered: c.cfg.Now(),
 		index: index, repair: commitment.NamespaceRepair,
+		compatibilityWriter: commitment.CompatibilityWriter,
 	}
 	c.participants[id] = p
 	c.mu.Unlock()
@@ -997,6 +1019,10 @@ func (c *VisibilityCoordinator) ValidateCommitment(commitment VisibilityCommitme
 		// repaired. Both are worse than refusing a mount that did not say.
 		refusal = fmt.Errorf("%w: mount declared an unsupported namespace-repair model; a strict mount must state lockless-expiration, callback-serialized, callback-serialized-pipelined, or independent",
 			ErrVisibilityProfile)
+	case commitment.CompatibilityWriter &&
+		commitment.NamespaceRepair != NamespaceRepairCallbackSerialized &&
+		commitment.NamespaceRepair != NamespaceRepairCallbackSerializedPipelined:
+		refusal = fmt.Errorf("%w: compatibility writer requires a callback-serialized macOS repair profile", ErrVisibilityProfile)
 	default:
 		return nil
 	}
@@ -1254,6 +1280,13 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	c.mu.Lock()
 	strict := len(c.participants) != 0
 	sourceStrict := c.participants[source] != nil
+	compatibilityWriterBlocked := false
+	for id, participant := range c.participants {
+		if id != source && participant.compatibilityWriter {
+			compatibilityWriterBlocked = true
+			break
+		}
+	}
 	ready, poisoned := c.startupReady, c.poisoned
 	c.mu.Unlock()
 	if !ready {
@@ -1264,6 +1297,12 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	}
 	if sourceStrict && gate == nil {
 		return &VisibilityBarrierError{Err: ErrSourcePublicationGate}
+	}
+	if compatibilityWriterBlocked {
+		// This check precedes FIFO admission and every prepare/apply callback.
+		// EBUSY is therefore a retryable product-policy result, not an uncertain
+		// mutation and not a coherence failure. The Mac may continue serving.
+		return ErrCompatibilityWriterLease
 	}
 	if !strict {
 		// An ACTIVE protocol-5 filesystem session is installed in this map in

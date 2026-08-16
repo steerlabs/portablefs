@@ -134,6 +134,53 @@ evidence with SHA-256 values
 `297d567136fc17c21134a8ba99c1254eaac180b983be3c4ef04d3af5a9aae30a`
 and `ee58b7fff0215c394c7257ad06d261ff21de23d31f6487cd3ccc6bda835c87c2`.
 
+## Post-qualification macOS 26 best-effort addendum
+
+After the exact Linux qualification above, product policy changed to admit the
+existing SDK-26 synchronous-repair implementation as a named best-effort tier.
+This addendum does not alter the historical Linux receipt or claim that macOS
+26 meets the exact Linux cache contract.
+
+The updated signed development app mounted the same hosted protocol-5 volume on
+macOS 26.5 while the exact Linux 6.12.100 client remained attached. The mounted
+matrix passed create, read, write, positioned write, `fsync`, rename, links,
+truncate shrink/extend, negative lookup, multi-megabyte SHA verification,
+immediate Mac-to-Linux visibility, and Linux-to-Mac visibility for a newly
+created file. Writable xattrs returned Darwin `EOPNOTSUPP` as declared.
+
+With the authority, Linux client, and signed Mac app rebuilt from the same
+writer-lease source, five 64 MiB Mac durable-write runs measured a 128.2 MiB/s
+median; five earlier
+`F_NOCACHE` reads measured 71.1 MiB/s with exact digest verification. The Linux
+peer's pre-lease diagnostic measured 100.8 MiB/s median durable writes with the
+Mac attached. Under the frozen lease, Linux writes returned `EBUSY` in 0.3–1.4
+ms without touching XFS. After clean Mac unmount, Linux took ownership and
+measured 120.9 MiB/s writes and 135.3 MiB/s reads; a fresh Mac remount saw the
+exact Linux file and SHA-256. Direct XFS in the same guest measured 3033.7
+MiB/s. These are local hosted-reference measurements, not service SLOs.
+
+A Linux truncate of a file already cached by the Mac exposed the SDK-26 limit:
+FSKit rejected the synthetic repair callback, so PortableFS fenced the Mac
+instead of accepting unproven state. The post-qualification architecture now
+gives an active macOS 26 mount the compatibility writer lease. Linux peers may
+read but receive `EBUSY` for visible mutation until the Mac cleanly unmounts;
+the mutation is refused before XFS apply. macOS 26 also exposes neither cross-
+machine lock callbacks nor authority append intent. Exact concurrent shared
+mutation, distributed locks, and atomic cross-client append remain Linux-only.
+
+The matched stack also ran 100 Mac atomic fsync+rename replacements while the
+Linux peer made 3,000 enumerate-and-read observations. Linux completed 2,996
+and returned four transient `ESTALE` results (99.87% success), with zero torn
+or mismatched generations. Both mounts remained healthy and 1,000 subsequent
+observations passed. This is an explicit macOS-26 best-effort boundary: the
+client reports the stale observation and does not silently retry or fall back.
+Normal create/read/write/pwrite/fsync/chmod/rename/truncate/link/symlink/unlink
+and negative-lookup tests all passed with exact cross-mount state.
+
+The source and documentation changes for this addendum are committed separately
+from the historical `759873f63b52` qualification receipt. The original receipt
+continues to identify the exact Linux source and binaries it qualified.
+
 ## Explicit product boundaries
 
 - Writable xattrs remain `EOPNOTSUPP`: XFS attribute-fork blocks are not

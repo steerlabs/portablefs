@@ -410,40 +410,6 @@ func ensureV3TestAttach(t *testing.T, r *registry, req ensureAttachRequest) *att
 	return a
 }
 
-func TestProductionV3EnsureRefusesBeforeAuthorityTransport(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = listener.Close() })
-	pki := newV3TestPKI(t)
-	r := newRegistry(privateTestDir(t))
-	t.Cleanup(r.stopPersister)
-	req := v3TestEnsureRequest(listener.Addr().String(), pki, "/Volumes/PortableFSV3Refused")
-	if _, created, err := r.ensure(context.Background(), req); err == nil ||
-		created || !strings.Contains(err.Error(), "not production-admitted") ||
-		!strings.Contains(err.Error(), "authority session was not opened") {
-		t.Fatalf("production EnsureAttach = created=%t err=%v", created, err)
-	}
-	if len(r.list()) != 0 {
-		t.Fatal("production refusal allocated a daemon attach")
-	}
-	if tcp, ok := listener.(*net.TCPListener); ok {
-		if err := tcp.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	connection, acceptErr := listener.Accept()
-	if connection != nil {
-		_ = connection.Close()
-		t.Fatal("production refusal opened an authority transport")
-	}
-	var networkErr net.Error
-	if !errors.As(acceptErr, &networkErr) || !networkErr.Timeout() {
-		t.Fatalf("authority transport absence probe = %v, want timeout", acceptErr)
-	}
-}
-
 func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	pki := newV3TestPKI(t)
@@ -505,7 +471,9 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 		EnrollmentExpiresAtMs: enrollmentExpires.UnixMilli(), AuthorityGeneration: 7,
 		InitialAuthorizationExpiresAtMs: initialDeadline.UnixMilli(),
 	}
-	r := newFSKitQualificationRegistry(privateTestDir(t))
+	// The ordinary runtime registry and the historical qualification fixture
+	// now share one macOS 26 protocol-5 admission path.
+	r := newRegistry(privateTestDir(t))
 	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, req)
 	t.Cleanup(a.lifeCancel)

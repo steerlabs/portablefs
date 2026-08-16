@@ -196,7 +196,17 @@ ordinary kernel page-cache writeback still applies: write(2) may return before
 FSKit sends the write, while fsync/synchronize waits through the authority's
 server descriptor. Protocol 5 has one coherence contract: names and attributes
 are cached and repaired through the authority's synchronous visibility barrier.
---coherence may only be strict; legacy uncached mounts are rejected.
+--coherence may only be strict; legacy uncached mounts are rejected. Linux
+implements the exact strict-cache contract. macOS 26 declares the named
+macos26-synchronous-vfs-repair-v2 best-effort cache tier: authority ordering,
+durability, source publication accounting, and terminal fencing remain exact,
+but current FSKit cannot guarantee exact peer namespace or attribute cache
+invalidation. While that Mac is mounted, it owns the compatibility writer lease;
+other clients may read but visible mutations return EBUSY until the Mac cleanly
+unmounts, and a second Mac compatibility writer is refused at attach. Under
+extreme cross-client rename churn, a reader may receive a
+transient ESTALE rather than torn data. The mount command reports the ownership
+boundary before mounting.
 
 Machine-local directories — node_modules, .venv, target — are served from
 machine-local disk instead of the volume. WHICH directories is declared by

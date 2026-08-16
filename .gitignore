@@ -58,3 +58,7 @@ DerivedData/
 cover.out
 coverage.out
 *.coverprofile
+
+# Local qualification receipts can contain mount credentials, machine paths,
+# and historical logs. They are evidence, not source or release artifacts.
+.qualification/

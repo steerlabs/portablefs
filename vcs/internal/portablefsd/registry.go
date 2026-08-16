@@ -132,13 +132,6 @@ type attachStatus struct {
 type registry struct {
 	mu         sync.RWMutex
 	mutationMu sync.Mutex
-	// fsKitProtocol5Qualification is true only in the separately signed,
-	// build-tagged qualification daemon. Shipping FSKit has no exact peer
-	// namespace/attribute invalidation primitive; macOS 26 also cannot return
-	// the post-mutation attribute snapshots required at the source callback.
-	// Keeping this fact on the registry makes EnsureAttach refuse before it can
-	// construct, dial, or assign an authority session.
-	fsKitProtocol5Qualification bool
 	// unmountMu guards unmounting, the at-most-one-transaction-per-attach map
 	// that lets a second unmount request JOIN a running transaction instead of
 	// queueing another one behind it on mutationMu.
@@ -177,32 +170,28 @@ type registry struct {
 }
 
 func newRegistry(stateDir string) *registry {
-	return newRegistryWithFSKitQualification(stateDir, false)
+	return newRegistryWithStateDir(stateDir)
 }
 
-// newFSKitQualificationRegistry is the explicit package-test/qualification
-// constructor. It is not a runtime fallback: production selects its immutable
-// build fact through newRuntimeRegistry below.
+// newFSKitQualificationRegistry is retained as a package-test spelling for the
+// existing protocol-5 fixture inventory. Production and tests now exercise the
+// same macOS 26 cache-policy admission path.
 func newFSKitQualificationRegistry(stateDir string) *registry {
-	return newRegistryWithFSKitQualification(stateDir, true)
+	return newRegistryWithStateDir(stateDir)
 }
 
 func newRuntimeRegistry(stateDir string) *registry {
-	return newRegistryWithFSKitQualification(
-		stateDir,
-		fsKitProtocol5QualificationBuild,
-	)
+	return newRegistryWithStateDir(stateDir)
 }
 
-func newRegistryWithFSKitQualification(stateDir string, qualification bool) *registry {
+func newRegistryWithStateDir(stateDir string) *registry {
 	r := &registry{
-		stateDir:                    stateDir,
-		byRef:                       map[string]*attach{},
-		byKey:                       map[string]*attach{},
-		fsKitProtocol5Qualification: qualification,
-		persistReq:                  make(chan struct{}, 1),
-		persistStop:                 make(chan struct{}),
-		persistDone:                 make(chan struct{}),
+		stateDir:    stateDir,
+		byRef:       map[string]*attach{},
+		byKey:       map[string]*attach{},
+		persistReq:  make(chan struct{}, 1),
+		persistStop: make(chan struct{}),
+		persistDone: make(chan struct{}),
 	}
 	// Production constructs registries only after owning both daemon
 	// singleton locks. Start the background worker only after the complete
@@ -355,14 +344,6 @@ func (r *registry) stopPersister() {
 func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach, bool, error) {
 	r.mutationMu.Lock()
 	defer r.mutationMu.Unlock()
-	if req.V3 != nil && !r.fsKitProtocol5Qualification {
-		return nil, false, errors.New(
-			"PortableFS protocol-5 macOS mounting is not production-admitted: " +
-				"current FSKit has no exact peer namespace or attribute invalidation primitive, " +
-				"and macOS 26 cannot publish complete post-mutation attributes; " +
-				"the authority session was not opened",
-		)
-	}
 	if req.VolumeID == "" || req.AuthorityURL == "" || req.MountPath == "" ||
 		(req.Branch == "" && req.V3 == nil) {
 		return nil, false, fmt.Errorf("volumeId, branch, authorityUrl, and mountPath are required")

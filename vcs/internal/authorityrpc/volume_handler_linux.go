@@ -1664,6 +1664,8 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 		CachedNameCapacity: attach.GetCachedNameCapacity(),
 		RepairBudget:       time.Duration(attach.GetRepairBudgetMillis()) * time.Millisecond,
 		NamespaceRepair:    repair,
+		CompatibilityWriter: repair == volumeserver.NamespaceRepairCallbackSerialized ||
+			repair == volumeserver.NamespaceRepairCallbackSerializedPipelined,
 	}
 	if err := h.Visibility.ValidateCommitment(commitment); err != nil {
 		return h.errorResponse(requestID, err, false)
@@ -3070,6 +3072,9 @@ func wireErrno(err error) int32 {
 	// false EIO to the application.
 	if errors.Is(err, volumeserver.ErrVisibilityInterrupted) || errors.Is(err, volumeserver.ErrVisibilityRetry) {
 		return errnos.EINTR
+	}
+	if errors.Is(err, volumeserver.ErrCompatibilityWriterLease) {
+		return errnos.EBUSY
 	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) && errno > 0 {
