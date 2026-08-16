@@ -57,6 +57,14 @@ measurement variance, not a claim that a peer makes writes faster. The stable
 comparison is semantic: both strict cases hash the same bytes, and the active
 peer has repaired them before the source syscall returns.
 
+Protocol-5 SHARED reads arrive from the authority as bounded in-memory
+`ReadResultData`; they are not descriptor-backed. The Linux frontend therefore
+disables go-fuse's descriptor-splice response path. Attempting that path cannot
+be zero-copy, and at the 1 MiB read bound its pipe request exceeds a typical
+1 MiB pipe ceiling once the FUSE header is included. Selecting `writev`
+directly removes the futile pipe grow/recovery and its per-read warning without
+changing the wire or cache contract.
+
 Against the immediately preceding protocol-5 measurement on this same VM, the
 lockless namespace-repair and internal sequenced-retry candidate reduced the
 one-mount p50 for the measured metadata operations by about 3–17%, reduced the

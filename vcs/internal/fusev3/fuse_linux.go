@@ -473,6 +473,14 @@ func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 		MaxBackground: cfg.MaxBackground,
 		Debug:         cfg.Debug,
 		EnableLocks:   true,
+		// Every SHARED read has already crossed the authority and is returned
+		// from the bounded request buffer as ReadResultData. There is no backing
+		// file descriptor for go-fuse to splice, so its optimistic splice path
+		// can only allocate/grow a pipe and then recover to the byte path. At a
+		// 1 MiB negotiated read it also exceeds the common 1 MiB pipe ceiling by
+		// the FUSE header and logs on every full read. Select the one applicable
+		// path up front: one authority read, then one /dev/fuse writev.
+		DisableSplice: true,
 		// READDIRPLUS stays refused. Now that a strict mount does publish
 		// nonzero entry lifetimes the old reason no longer holds, but the
 		// remaining one is decisive: the authority mints one capability per
@@ -501,6 +509,9 @@ func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 // verifyMountDecisions asserts the coherence-critical choices this frontend
 // makes about the kernel interface before the mount is installed.
 func verifyMountDecisions(options *fuse.MountOptions) error {
+	if !options.DisableSplice {
+		return errors.New("fusev3: splice must be disabled; authority reads are already resident ReadResultData and have no descriptor-backed zero-copy path")
+	}
 	if options.ExtraCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP != 0 ||
 		options.DisabledCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP == 0 {
 		return errors.New("fusev3: shared mmap over direct I/O must be disabled for the whole mount; cross-machine page coherence cannot be provided")
