@@ -657,7 +657,7 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 		fuse.CAP_PASSTHROUGH|fuse.CAP_NO_OPEN_SUPPORT|fuse.CAP_NO_OPENDIR_SUPPORT {
 		t.Fatal("strict mount did not disable passthrough and no-open shortcuts")
 	}
-	if !options.EnableLocks || !options.DisableReadDirPlus || !options.DisableSplice || options.MaxWrite != 64*1024 || options.MaxReadAhead != 0 {
+	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 0 {
 		t.Fatalf("mount options = %#v", options)
 	}
 	foundDefaultPermissions := false
@@ -680,12 +680,6 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a mount that does not forward locks must be refused")
 	}
-	tampered = mountOptions(testConfig(8), 64*1024)
-	tampered.DisableSplice = false
-	if err := verifyMountDecisions(tampered); err == nil {
-		t.Fatal("a mount that retries buffered authority reads through descriptor splice must be refused")
-	}
-	tampered = mountOptions(testConfig(8), 64*1024)
 	tampered.ExtraCapabilities &^= fuse.CAP_ATOMIC_O_TRUNC
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a mount that permits Linux to split open(O_TRUNC) into two mutations must be refused")

@@ -58,12 +58,13 @@ comparison is semantic: both strict cases hash the same bytes, and the active
 peer has repaired them before the source syscall returns.
 
 Protocol-5 SHARED reads arrive from the authority as bounded in-memory
-`ReadResultData`; they are not descriptor-backed. The Linux frontend therefore
-disables go-fuse's descriptor-splice response path. Attempting that path cannot
-be zero-copy, and at the 1 MiB read bound its pipe request exceeds a typical
-1 MiB pipe ceiling once the FUSE header is included. Selecting `writev`
-directly removes the futile pipe grow/recovery and its per-read warning without
-changing the wire or cache contract.
+`ReadResultData`; they are not descriptor-backed. The maintained go-fuse seam
+now classifies a result before acquiring or growing a splice pipe: in-memory
+results remain on the writer-stage `writev` path, while genuinely
+descriptor-backed results retain zero-copy splice. This removes the futile pipe
+grow/recovery (and its per-read warning at the 1 MiB pipe ceiling) without
+moving byte materialization onto the protocol goroutine or changing the wire
+and cache contracts.
 
 Against the immediately preceding protocol-5 measurement on this same VM, the
 lockless namespace-repair and internal sequenced-retry candidate reduced the
