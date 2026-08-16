@@ -423,7 +423,7 @@ func TestPFSWriteRejectedCommitUsesOnlyPhysicalNoChangeBoundary(t *testing.T) {
 	}
 }
 
-func TestPFSWritePeerFirstCommitAbortsStagingAndReturnsStructuredEINTR(t *testing.T) {
+func TestPFSWritePeerFirstCommitWaitsWithoutLeakingEINTR(t *testing.T) {
 	fixture := newStrictFixture(t)
 	nodeID, handle := openWriteTransactionTestHandle(t, fixture)
 	const kernelTxid = 9204
@@ -442,34 +442,17 @@ func TestPFSWritePeerFirstCommitAbortsStagingAndReturnsStructuredEINTR(t *testin
 	if err := fixture.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatalf("install peer-first PREPARE: %v", err)
 	}
-	defer finishPeerVisibility(t, fixture.raw, targets)
 
 	commit := writeTransactionInput(nodeID, handle, kernelTxid, 3, fuse.PFS_WRITE_COMMIT)
 	commit.FragmentOffset = 3
 	commit.Unique = fixture.unique.Add(2)
 	out := &fuse.PFSWriteOut{}
-	if status := fixture.raw.PFSWrite(nil, commit, nil, out); !status.Ok() {
-		t.Fatalf("locally interrupted COMMIT transport = %v", status)
-	}
-	if out.Txid != kernelTxid || out.Flags != fuse.PFS_WRITE_OUT_REJECTED || out.Error != -int32(syscall.EINTR) ||
-		out.CommittedSize != 0 || out.AssignedOffset != 0 || out.PostSize != 0 || out.Sequence != 0 {
-		t.Fatalf("locally interrupted COMMIT result = %+v", out)
-	}
-	if !fixture.raw.ReplyWriteOrdered(commit.Unique) || fixture.raw.ReplyPublishMarked(commit.Unique, nodeID, fuse.PFS_WRITE_OPCODE) {
-		t.Fatal("locally interrupted COMMIT lost its physical-only transaction cleanup boundary")
-	}
-	fixture.raw.writeMu.Lock()
-	_, retainedBeforeWrite := fixture.raw.writeTx[kernelTxid]
-	fixture.raw.writeMu.Unlock()
-	if !retainedBeforeWrite {
-		t.Fatal("locally interrupted transaction retired before its structured reply was physical")
-	}
-	fixture.raw.ReplyWritten(commit.Unique, fuse.OK)
-	fixture.raw.writeMu.Lock()
-	_, retainedAfterWrite := fixture.raw.writeTx[kernelTxid]
-	fixture.raw.writeMu.Unlock()
-	if retainedAfterWrite || fixture.mount.isRevoked() {
-		t.Fatalf("local EINTR completion retained=%t revoked=%t fatal=%v", retainedAfterWrite, fixture.mount.isRevoked(), fixture.mount.fatalError())
+	commitDone := make(chan fuse.Status, 1)
+	go func() { commitDone <- fixture.raw.PFSWrite(nil, commit, nil, out) }()
+	select {
+	case status := <-commitDone:
+		t.Fatalf("item-only COMMIT overtook the prior peer repair: %v", status)
+	case <-time.After(50 * time.Millisecond):
 	}
 	fixture.rpc.snapshot(func(rpc *fakeRPC) {
 		phases := make([]authoritypb.WriteTransactionPhase, 0, len(rpc.writeTransactions))
@@ -479,10 +462,38 @@ func TestPFSWritePeerFirstCommitAbortsStagingAndReturnsStructuredEINTR(t *testin
 		want := []authoritypb.WriteTransactionPhase{
 			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN,
 			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
-			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT,
 		}
 		if !slices.Equal(phases, want) {
-			t.Fatalf("authority phases = %v, want %v", phases, want)
+			t.Fatalf("authority phases before peer repair = %v, want %v", phases, want)
+		}
+	})
+
+	finishPeerVisibility(t, fixture.raw, targets)
+	select {
+	case status := <-commitDone:
+		if !status.Ok() {
+			t.Fatalf("waiting COMMIT transport = %v", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiting COMMIT did not resume after peer repair")
+	}
+	if out.Txid != kernelTxid || out.Flags != fuse.PFS_WRITE_OUT_COMMITTED || out.Error != 0 ||
+		out.CommittedSize != 3 || out.AssignedOffset != 100 || out.PostSize != 103 || out.Sequence != 17 {
+		t.Fatalf("waiting COMMIT result = %+v", out)
+	}
+	finishPrivatePublication(t, fixture, commit.Unique, nodeID, fuse.PFS_WRITE_OPCODE)
+	fixture.rpc.snapshot(func(rpc *fakeRPC) {
+		phases := make([]authoritypb.WriteTransactionPhase, 0, len(rpc.writeTransactions))
+		for _, request := range rpc.writeTransactions {
+			phases = append(phases, request.GetPhase())
+		}
+		want := []authoritypb.WriteTransactionPhase{
+			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN,
+			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+			authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT,
+		}
+		if !slices.Equal(phases, want) {
+			t.Fatalf("authority phases after peer repair = %v, want %v", phases, want)
 		}
 	})
 }

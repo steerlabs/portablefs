@@ -507,9 +507,10 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			}
 
 			// A source cannot be granted while an older peer COMPLETE still has
-			// an exact-size notification physically outstanding. Peer-first is a
-			// definite pre-assignment EINTR, so retry is safe and no authority
-			// mutation can overtake the old size.
+			// an exact-size notification physically outstanding. Item-only
+			// mutations wait behind that older inode repair: surfacing a synthetic
+			// EINTR would make ordinary concurrent writes/truncates fail even
+			// though no application signal interrupted them.
 			if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 				t.Fatal(err)
 			}
@@ -534,15 +535,24 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			f.rpc.mu.Lock()
 			beforeCalls, beforeAssignments := f.rpc.calls, f.rpc.assignments
 			f.rpc.mu.Unlock()
-			refusedUnique := f.unique.Add(2)
-			if status := test.run(f, refusedUnique, entry.NodeId); status != fuse.Status(syscall.EINTR) {
-				t.Fatalf("source while prior exact-size notify is outstanding = %v, want EINTR", status)
+			sourceUnique := f.unique.Add(2)
+			sourceStarted := make(chan struct{})
+			sourceDone := make(chan fuse.Status, 1)
+			go func() {
+				close(sourceStarted)
+				sourceDone <- test.run(f, sourceUnique, entry.NodeId)
+			}()
+			<-sourceStarted
+			select {
+			case status := <-sourceDone:
+				t.Fatalf("item-only source overtook prior exact-size repair: %v", status)
+			case <-time.After(50 * time.Millisecond):
 			}
 			f.rpc.mu.Lock()
 			afterCalls, afterAssignments := f.rpc.calls, f.rpc.assignments
 			f.rpc.mu.Unlock()
 			if afterCalls != beforeCalls || afterAssignments != beforeAssignments {
-				t.Fatalf("peer-first source crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
+				t.Fatalf("waiting item-only source crossed dispatch: calls %d->%d assignments %d->%d", beforeCalls, afterCalls, beforeAssignments, afterAssignments)
 			}
 
 			close(notifyBlock)
@@ -553,12 +563,16 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			f.notify.block, f.notify.onSize = nil, nil
 			f.notify.mu.Unlock()
 
-			// Once the old COMPLETE is acknowledged, this source mutation wins
-			// the FIFO cut. A later peer PREPARE must then remain behind it through
-			// the original response write and the true post-VFS PUBLISH ACK.
-			sourceUnique := f.unique.Add(2)
-			if status := test.run(f, sourceUnique, entry.NodeId); !status.Ok() {
-				t.Fatalf("source after prior COMPLETE = %v", status)
+			// Once the old COMPLETE is acknowledged, the waiting source mutation
+			// wins the FIFO cut. A later peer PREPARE must then remain behind it
+			// through the original response write and true post-VFS PUBLISH ACK.
+			select {
+			case status := <-sourceDone:
+				if !status.Ok() {
+					t.Fatalf("waiting source after prior COMPLETE = %v", status)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("waiting source did not resume after prior COMPLETE")
 			}
 			if !f.raw.ReplyWriteOrdered(sourceUnique) {
 				t.Fatal("successful truncate did not retain source publication ownership")

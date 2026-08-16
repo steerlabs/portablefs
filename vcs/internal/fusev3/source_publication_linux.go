@@ -55,11 +55,12 @@ type publicationNamespace struct {
 	name   string
 }
 
-// errSourcePublicationInterrupted is a definite, pre-dispatch refusal. The
-// peer visibility cut already owns an overlapping coordinate, so a Linux raw
-// callback must yield immediately instead of waiting while it may hold a VFS
-// lock COMPLETE needs. No replay identity has been assigned and no bytes have
-// been sent; returning EINTR to the kernel is therefore safe and retryable.
+// errSourcePublicationInterrupted is a definite, pre-dispatch refusal for a
+// namespace mutation. Such a callback may hold a parent VFS lock which the
+// peer's dentry repair needs, so it must unwind rather than wait behind an
+// older peer cut. Item-only DATA/ATTR callbacks do not hold that namespace
+// lock: they wait for the older exact inode repair instead of leaking a
+// synthetic EINTR through ordinary write/truncate/fallocate syscalls.
 var errSourcePublicationInterrupted = errors.New("fusev3: source publication yielded to an overlapping peer visibility cut")
 
 type namespaceBounds struct {
@@ -314,8 +315,9 @@ func (r *rawFileSystem) peerPublicationOverlapLocked(coordinates map[publication
 
 // acquirePeerPublication linearizes a peer PREPARE with both source gates and
 // ordinary cached-reply admission. The peer cut is installed first. Existing
-// source owners drain through it, while every later overlapping source yields
-// before assignment instead of extending the drain indefinitely.
+// source owners drain through it. A later namespace source yields before
+// assignment because it may hold the VFS lock needed by peer repair; an
+// item-only source safely waits behind the already-owned inode repair.
 func (r *rawFileSystem) acquirePeerPublication(ctx context.Context, targets []*authoritypb.VisibilityTarget, keys visibilityKeys) error {
 	coordinates, err := coordinatesForVisibilityTargets(targets)
 	if err != nil {
@@ -516,10 +518,22 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *auth
 				addBoundCoordinates(coordinates, record.identity, bounds)
 			}
 		}
-		// Peer-first is an asymmetric yield, never a wait: this raw callback
-		// may already hold the VFS lock peer COMPLETE needs. Because the source
-		// gate is still pre-assignment, the refusal is definite and retryable.
+		// A namespace callback may already hold the parent VFS lock peer
+		// COMPLETE needs, so peer-first namespace admission must unwind. An
+		// item-only gate has no namespace lock dependency: waiting here avoids
+		// exposing a synthetic EINTR to applications under ordinary concurrent
+		// data or size mutations while preserving the same FIFO cut.
 		if r.peerPublicationHeldLocked(coordinates) || r.peerOverlapUnresolvedLocked(lease.unresolvedAttributes, lease.unresolvedData) {
+			if len(names) == 0 {
+				changed := r.sourceChanged
+				r.mu.Unlock()
+				select {
+				case <-changed:
+					continue
+				case <-ctx.Done():
+					return nil, fmt.Errorf("fusev3: wait for prior peer inode publication: %w", ctx.Err())
+				}
+			}
 			r.mu.Unlock()
 			return nil, errSourcePublicationInterrupted
 		}
