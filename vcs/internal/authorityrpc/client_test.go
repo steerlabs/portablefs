@@ -832,6 +832,7 @@ func TestSuccessfulActivateWithCorruptStateUsesCommittedCleanupBoundary(t *testi
 			},
 		},
 		epoch: append([]byte(nil), epoch...), proof: cloneProof(proof),
+		fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 	}
 
 	requestResult := make(chan *authoritypb.Request, 1)
@@ -1923,7 +1924,10 @@ func TestDeadConnectionResponseCannotEnterReplacementPendingMap(t *testing.T) {
 	transport.conn = newClient
 	waiter := make(chan callResult, 1)
 	transport.pending[3] = waiter
-	client := &Client{data: transport, epoch: bytes.Repeat([]byte{0x41}, 16), fatalDone: make(chan struct{})}
+	client := &Client{
+		data: transport, epoch: bytes.Repeat([]byte{0x41}, 16),
+		fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
+	}
 	done := make(chan struct{})
 	go func() {
 		client.readLoop(transport, oldClient)
@@ -1975,7 +1979,45 @@ func newTerminalDrainTestClient(dataConn, controlConn net.Conn, drain time.Durat
 		blocking:   lane{permits: make(chan struct{}, 1), slots: make([]clientSlot, 1)},
 		visibility: lane{permits: make(chan struct{}, 1)},
 		liveness:   lane{permits: make(chan struct{}, 1)},
-		epoch:      bytes.Repeat([]byte{0x5a}, 16), fatalDone: make(chan struct{}),
+		epoch:      bytes.Repeat([]byte{0x5a}, 16),
+		fatalDone:  make(chan struct{}), fatalPendingDone: make(chan struct{}),
+	}
+}
+
+func TestSessionDoneCertifiesFinishedLocalEnforcement(t *testing.T) {
+	cause := errors.New("authority transport is terminal")
+	client := &Client{
+		cfg:              ClientConfig{RequireLocalSessionEnforcement: true},
+		fatalDone:        make(chan struct{}),
+		fatalPendingDone: make(chan struct{}),
+	}
+
+	client.signalSessionEnd(cause)
+	select {
+	case <-client.SessionEndPending():
+	case <-time.After(time.Second):
+		t.Fatal("local teardown owner did not observe the terminal transport edge")
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatal("SessionDone became observable before local enforcement finished")
+	default:
+	}
+	if err := client.SessionError(); err != nil {
+		t.Fatalf("SessionError became observable before local enforcement finished: %v", err)
+	}
+	if err := client.SessionEndCause(); !errors.Is(err, cause) {
+		t.Fatalf("SessionEndCause = %v, want %v", err, cause)
+	}
+
+	client.FinishLocalSessionEnforcement()
+	select {
+	case <-client.SessionDone():
+	case <-time.After(time.Second):
+		t.Fatal("SessionDone remained hidden after local enforcement finished")
+	}
+	if err := client.SessionError(); !errors.Is(err, cause) {
+		t.Fatalf("SessionError = %v, want %v", err, cause)
 	}
 }
 

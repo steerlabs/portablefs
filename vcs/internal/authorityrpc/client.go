@@ -85,6 +85,14 @@ type ClientConfig struct {
 	// than infer absence from the mountpoint alone. A refusal or observation
 	// failure is fail-closed: the durable strict-membership record is preserved.
 	ObservePreKernelMountAbsence PreKernelMountAbsenceObserver
+	// RequireLocalSessionEnforcement keeps the public terminal edge behind the
+	// frontend's bounded local withdrawal. The transport still poisons admission
+	// immediately and exposes SessionEndPending to the one teardown owner, but
+	// SessionDone and SessionError do not become observable until that owner calls
+	// FinishLocalSessionEnforcement. Frontends which enable this must call Finish
+	// on every post-attach exit path, regardless of whether every withdrawal step
+	// succeeded; the separately recorded withdrawal outcome carries that truth.
+	RequireLocalSessionEnforcement bool
 }
 
 // MutationIdentity is the replay identity assigned to one authority mutation.
@@ -191,8 +199,11 @@ type Client struct {
 	fatalMu                sync.Mutex
 	fatalErr               error
 	fatalDone              chan struct{}
+	fatalPendingDone       chan struct{}
 	fatalPending           bool
+	fatalPendingPublished  bool
 	fatalPublished         bool
+	localEnforcementDone   bool
 	fatalDrainTimer        *time.Timer
 	responseConsumptions   map[*responseConsumption]struct{}
 	preMountReleaseMu      sync.Mutex
@@ -257,7 +268,7 @@ func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	slots := make([]clientSlot, cfg.ReplaySlots)
 	split := cfg.ReplaySlots - uint32(blockingLimit)
 	c := &Client{
-		cfg: cfg, fatalDone: make(chan struct{}),
+		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 		data:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:    newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
 		ordinary:   lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
@@ -1016,6 +1027,10 @@ func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
 			releaseErr = fmt.Errorf("authorityrpc: detach ACTIVE session before kernel mount: %w", err)
 		}
 	}
+	// No kernel source was installed. The attempt-scoped observation above is
+	// the local enforcement pass for this lifecycle, including when it failed
+	// and the durable authority membership therefore has to remain fenced.
+	c.FinishLocalSessionEnforcement()
 	releaseErr = errors.Join(releaseErr, c.Close())
 	c.preMountReleaseMu.Lock()
 	c.preMountReleaseErr = releaseErr
@@ -1029,14 +1044,46 @@ func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
 // recovery, the authority epoch changed, an exact outcome became uncertain, or
 // the client was closed. A terminal edge poisons new admission immediately,
 // but its public signal waits for every already-parsed retained response to
-// cross the frontend's physical publication boundary. SessionError returns the
-// terminal cause as soon as it is known, including during that bounded drain.
+// cross the frontend's physical publication boundary. When the frontend opted
+// into local enforcement, the public signal also waits for its bounded kernel
+// withdrawal to finish. SessionError becomes observable at the same boundary.
 func (c *Client) SessionDone() <-chan struct{} { return c.fatalDone }
 
 func (c *Client) SessionError() error {
 	c.fatalMu.Lock()
 	defer c.fatalMu.Unlock()
+	if c.cfg.RequireLocalSessionEnforcement && !c.fatalPublished {
+		return nil
+	}
 	return c.fatalErr
+}
+
+// SessionEndPending is the private terminal edge for the local frontend owner.
+// It closes after retained-response publication has either completed or been
+// forcibly revoked, but before SessionDone when local enforcement is required.
+// Status and orchestration consumers must use SessionDone instead: only that
+// edge certifies that the frontend has finished withdrawing local serving state.
+func (c *Client) SessionEndPending() <-chan struct{} { return c.fatalPendingDone }
+
+// SessionEndCause returns the cause to the local teardown owner before the
+// public terminal edge. Other consumers must read SessionError after SessionDone.
+func (c *Client) SessionEndCause() error {
+	c.fatalMu.Lock()
+	defer c.fatalMu.Unlock()
+	return c.fatalErr
+}
+
+// FinishLocalSessionEnforcement releases an opted-in public terminal edge after
+// the frontend's bounded local withdrawal has run. Completion means every step
+// was attempted within its budget, not that every step succeeded; callers keep
+// the detailed outcome separately and must call this even on withdrawal errors.
+func (c *Client) FinishLocalSessionEnforcement() {
+	c.fatalMu.Lock()
+	c.localEnforcementDone = true
+	if c.fatalPendingPublished && !c.fatalPublished {
+		c.publishSessionEndLocked()
+	}
+	c.fatalMu.Unlock()
 }
 
 func (c *Client) signalSessionEnd(err error) {
@@ -1054,7 +1101,7 @@ func (c *Client) signalSessionEnd(err error) {
 	}
 	c.fatalPending = true
 	if len(c.responseConsumptions) == 0 {
-		c.publishSessionEndLocked()
+		c.publishSessionEndPendingLocked()
 		c.fatalMu.Unlock()
 		return
 	}
@@ -1096,8 +1143,8 @@ func (c *Client) beginResponseConsumption(force func(error)) (*responseConsumpti
 func (c *Client) finishResponseConsumption(receipt *responseConsumption) {
 	c.fatalMu.Lock()
 	delete(c.responseConsumptions, receipt)
-	if c.fatalPending && !c.fatalPublished && len(c.responseConsumptions) == 0 {
-		c.publishSessionEndLocked()
+	if c.fatalPending && !c.fatalPendingPublished && len(c.responseConsumptions) == 0 {
+		c.publishSessionEndPendingLocked()
 	}
 	c.fatalMu.Unlock()
 }
@@ -1201,6 +1248,21 @@ func (c *Client) publishSessionEndLocked() {
 	close(c.fatalDone)
 }
 
+func (c *Client) publishSessionEndPendingLocked() {
+	if c.fatalPendingPublished {
+		return
+	}
+	c.fatalPendingPublished = true
+	if c.fatalDrainTimer != nil {
+		c.fatalDrainTimer.Stop()
+		c.fatalDrainTimer = nil
+	}
+	close(c.fatalPendingDone)
+	if !c.cfg.RequireLocalSessionEnforcement || c.localEnforcementDone {
+		c.publishSessionEndLocked()
+	}
+}
+
 // forceResponseConsumptionDrain is the bounded fail-closed escape for a
 // frontend which received an exact authority response but never completed its
 // local publication handshake. Every retained caller supplies a synchronous
@@ -1209,7 +1271,7 @@ func (c *Client) publishSessionEndLocked() {
 // begins teardown.
 func (c *Client) forceResponseConsumptionDrain() {
 	c.fatalMu.Lock()
-	if !c.fatalPending || c.fatalPublished || len(c.responseConsumptions) == 0 {
+	if !c.fatalPending || c.fatalPendingPublished || len(c.responseConsumptions) == 0 {
 		c.fatalDrainTimer = nil
 		c.fatalMu.Unlock()
 		return
@@ -1226,8 +1288,8 @@ func (c *Client) forceResponseConsumptionDrain() {
 	}
 
 	c.fatalMu.Lock()
-	if c.fatalPending && !c.fatalPublished {
-		c.publishSessionEndLocked()
+	if c.fatalPending && !c.fatalPendingPublished {
+		c.publishSessionEndPendingLocked()
 	}
 	c.fatalMu.Unlock()
 }
@@ -1325,7 +1387,7 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 		terminal := c.poisoned.Load()
 		transport.pendingMu.Unlock()
 		if terminal {
-			if err := c.SessionError(); err != nil {
+			if err := c.SessionEndCause(); err != nil {
 				return nil, err
 			}
 			return nil, ErrSessionEnded

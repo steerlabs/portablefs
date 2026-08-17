@@ -2695,6 +2695,12 @@ func (m *Mount) scheduleAbort() {
 			// so it withdraws them and makes itself unreachable before it even
 			// tries an ordinary unmount.
 			outcome := m.withdrawKernelState()
+			// SessionDone is an enforcement certificate, not the trigger for this
+			// work. Publish it only after the bounded ladder has revoked admission,
+			// detached the namespace, attempted every name/data withdrawal, and
+			// aborted the serving connection. Failures remain in outcome, but cannot
+			// leave the public terminal edge waiting forever.
+			m.rpc.FinishLocalSessionEnforcement()
 			// Report first. Everything below can block — the ordinary unmount,
 			// the serving-connection wait inside Close, the authority round trip
 			// — and a revocation the supervisor never hears about is exactly the

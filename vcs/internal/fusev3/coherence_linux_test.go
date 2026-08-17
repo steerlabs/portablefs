@@ -50,6 +50,10 @@ type fakeNotifier struct {
 	// onSize is the corresponding deterministic arrival hook for exact-size
 	// repair. It runs before the potentially blocking physical notification.
 	onSize func()
+	// onInode observes an inode withdrawal before it enters the optional block.
+	// Tests use it to place a terminal-publication assertion inside the retained
+	// page pass rather than infer ordering from goroutine timing.
+	onInode func(uint64, int64, int64)
 }
 
 func (n *fakeNotifier) wait() {
@@ -69,6 +73,12 @@ func (n *fakeNotifier) record(call recordedNotify) {
 }
 
 func (n *fakeNotifier) InodeNotify(node uint64, off, length int64) fuse.Status {
+	n.mu.Lock()
+	hook := n.onInode
+	n.mu.Unlock()
+	if hook != nil {
+		hook(node, off, length)
+	}
 	n.record(recordedNotify{kind: "inode", inode: node, off: off, length: length})
 	n.mu.Lock()
 	defer n.mu.Unlock()

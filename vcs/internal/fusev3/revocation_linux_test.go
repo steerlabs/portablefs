@@ -40,6 +40,38 @@ type fakeWithdrawal struct {
 	slept     []time.Duration
 }
 
+// terminalEnforcementRPC models authorityrpc's two terminal edges: pending is
+// private to the frontend teardown owner, while done is the public certificate
+// released by FinishLocalSessionEnforcement.
+type terminalEnforcementRPC struct {
+	*fakeRPC
+	pending  chan struct{}
+	done     chan struct{}
+	cause    error
+	finish   func()
+	finished sync.Once
+}
+
+func (r *terminalEnforcementRPC) SessionDone() <-chan struct{}       { return r.done }
+func (r *terminalEnforcementRPC) SessionEndPending() <-chan struct{} { return r.pending }
+func (r *terminalEnforcementRPC) SessionEndCause() error             { return r.cause }
+func (r *terminalEnforcementRPC) SessionError() error {
+	select {
+	case <-r.done:
+		return r.cause
+	default:
+		return nil
+	}
+}
+func (r *terminalEnforcementRPC) FinishLocalSessionEnforcement() {
+	r.finished.Do(func() {
+		if r.finish != nil {
+			r.finish()
+		}
+		close(r.done)
+	})
+}
+
 func (f *fakeWithdrawal) ops() kernelWithdrawal {
 	return kernelWithdrawal{
 		detach: func(string) error {
@@ -350,6 +382,92 @@ func TestWithdrawalDropsRetainedPagesBeforeTheAbort(t *testing.T) {
 	}
 	if f.raw.cachedDataHolds(72) {
 		t.Fatal("the ladder left a page-cache withdrawal obligation outstanding")
+	}
+}
+
+// TestSessionDoneWaitsForRetainedPageWithdrawalAttempt pins the externally
+// observable half of the stale-page contract. The authority transport edge may
+// start teardown, but SessionDone cannot close while round one's whole-inode
+// data notification is still blocked. It is released only after that pass and
+// the connection abort have both been attempted, even when the notification
+// itself reports failure.
+func TestSessionDoneWaitsForRetainedPageWithdrawalAttempt(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+	f.openForData(t, entry.NodeId)
+
+	dataStarted := make(chan struct{})
+	releaseData := make(chan struct{})
+	var dataOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseData) }) })
+	f.notify.inodeST = fuse.EIO
+	f.notify.onInode = func(_ uint64, off, length int64) {
+		if off != 0 || length != 0 {
+			return
+		}
+		dataOnce.Do(func() { close(dataStarted) })
+		<-releaseData
+	}
+
+	fake := &fakeWithdrawal{installed: true}
+	finished := make(chan struct {
+		aborts int
+		data   int
+	}, 1)
+	rpc := &terminalEnforcementRPC{
+		fakeRPC: f.rpc,
+		pending: make(chan struct{}),
+		done:    make(chan struct{}),
+		cause:   errors.New("authority session fenced"),
+	}
+	rpc.finish = func() {
+		fake.mu.Lock()
+		aborts := fake.aborts
+		fake.mu.Unlock()
+		data := 0
+		for _, call := range f.notify.snapshot() {
+			if call.kind == "inode" && call.off == 0 && call.length == 0 {
+				data++
+			}
+		}
+		finished <- struct {
+			aborts int
+			data   int
+		}{aborts: aborts, data: data}
+	}
+	f.mount.rpc = rpc
+	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
+	f.mount.withdrawal = fake.ops()
+	f.mount.repairBudget = time.Second
+	close(f.mount.kernelConnectionDone)
+
+	f.mount.wg.Add(1)
+	go f.mount.watchSession(f.mount.ctx, rpc.SessionEndPending())
+	close(rpc.pending)
+	select {
+	case <-dataStarted:
+	case <-time.After(time.Second):
+		t.Fatal("round-one retained-data withdrawal was not attempted")
+	}
+	select {
+	case <-rpc.SessionDone():
+		t.Fatal("SessionDone became observable inside the retained-data withdrawal")
+	default:
+	}
+	releaseOnce.Do(func() { close(releaseData) })
+	select {
+	case <-rpc.SessionDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("SessionDone did not close after the bounded withdrawal ladder")
+	}
+	result := <-finished
+	if result.data != 1 {
+		t.Fatalf("whole-inode data withdrawal attempts at publication = %d, want 1", result.data)
+	}
+	if result.aborts != 1 {
+		t.Fatalf("connection aborts at publication = %d, want 1", result.aborts)
 	}
 }
 

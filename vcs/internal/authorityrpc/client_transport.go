@@ -466,7 +466,7 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 		return ErrTransportBinding
 	}
 	if c.poisoned.Load() {
-		if err := c.SessionError(); err != nil {
+		if err := c.SessionEndCause(); err != nil {
 			return err
 		}
 		return ErrSessionEnded

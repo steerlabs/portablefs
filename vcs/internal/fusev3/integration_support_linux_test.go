@@ -508,6 +508,7 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 	// expiration. Declaring that private primitive prevents accidental admission
 	// of the retired stock parent-lock profile.
 	cfg.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
+	cfg.RequireLocalSessionEnforcement = true
 	cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 		return &authoritypb.MountAbsenceProof{
 			ObservedUnixNanos: time.Now().UnixNano(),

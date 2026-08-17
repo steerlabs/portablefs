@@ -100,6 +100,9 @@ type RPC interface {
 	SessionLease() time.Duration
 	SessionDone() <-chan struct{}
 	SessionError() error
+	SessionEndPending() <-chan struct{}
+	SessionEndCause() error
+	FinishLocalSessionEnforcement()
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallReadRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 	CallIdempotent(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
@@ -304,11 +307,13 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		return nil, errors.New("fusev3: authority session is required")
 	}
 	if mountpoint == "" || !mountid.ValidMountInstance(cfg.MountInstanceID) {
+		rpc.FinishLocalSessionEnforcement()
 		return nil, errors.Join(errors.New("fusev3: mountpoint and valid unique mount-instance identity are required"), rpc.Close())
 	}
 	if cfg.Coherence != CoherenceStrict {
 		// Zero is the legacy uncached wire value. It must fail closed: translating
 		// it would let an old sender attach with semantics it did not request.
+		rpc.FinishLocalSessionEnforcement()
 		return nil, errors.Join(errors.New("fusev3: strict coherence is required"), rpc.Close())
 	}
 	fsName := "portablefs:" + cfg.MountInstanceID
@@ -330,7 +335,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	}
 	maxRead, maxWrite := rpc.IOLimits()
 	lease := rpc.SessionLease()
-	if maxRead == 0 || maxWrite == 0 || lease <= 0 || rpc.SessionDone() == nil {
+	if maxRead == 0 || maxWrite == 0 || lease <= 0 || rpc.SessionDone() == nil || rpc.SessionEndPending() == nil {
 		return failBeforeKernelMount(errors.New("fusev3: invalid negotiated authority bounds"))
 	}
 	if maxRead < kernelMinMaxWrite || maxWrite < kernelMinMaxWrite {
@@ -412,12 +417,14 @@ func releaseUninstalledSession(rpc RPC, fsName, mountpoint string) error {
 	defer cancel()
 	proof, err := observePlannedKernelMountAbsent(fsName, mountpoint)
 	if err != nil {
+		rpc.FinishLocalSessionEnforcement()
 		return errors.Join(fmt.Errorf("fusev3: establish failed-startup mount absence: %w", err), rpc.Close())
 	}
 	err = rpc.DetachAfterUnmount(ctx, proof)
 	if err != nil {
 		err = fmt.Errorf("fusev3: release failed-startup strict session: %w", err)
 	}
+	rpc.FinishLocalSessionEnforcement()
 	return errors.Join(err, rpc.Close())
 }
 
@@ -465,7 +472,7 @@ func reclaimLaneWidth(maxInFlight int) int {
 func (m *Mount) start(lease time.Duration) {
 	m.wg.Add(2 + m.reclaimWorkers)
 	go m.keepAlive(m.ctx, lease)
-	go m.watchSession(m.ctx, m.rpc.SessionDone())
+	go m.watchSession(m.ctx, m.rpc.SessionEndPending())
 	for range m.reclaimWorkers {
 		go m.reclaimLoop(m.ctx)
 	}
@@ -717,7 +724,7 @@ func (m *Mount) watchSession(ctx context.Context, done <-chan struct{}) {
 		return
 	case <-done:
 		if ctx.Err() == nil {
-			err := m.rpc.SessionError()
+			err := m.rpc.SessionEndCause()
 			if err == nil {
 				err = errors.New("authority session ended")
 			}
@@ -968,6 +975,11 @@ func (m *Mount) closeLocked() error {
 	// Any capability still queued for reclaim is released by Detach: ending the
 	// session drops every item and open this session holds.
 	detachErr := m.detach()
+	// Normal unmount and externally observed detach have no revocation ladder,
+	// so their exact absence/connection checks above are the local enforcement
+	// boundary. A terminal revocation already finished this idempotently from
+	// scheduleAbort before it reached Close.
+	m.rpc.FinishLocalSessionEnforcement()
 	m.closeErr = errors.Join(m.fatalError(), detachErr, m.grafts.Close(), m.rpc.Close())
 	return m.closeErr
 }

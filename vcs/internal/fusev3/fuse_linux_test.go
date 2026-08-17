@@ -127,12 +127,15 @@ func newFakeRPC() *fakeRPC {
 	}
 }
 
-func (f *fakeRPC) Root() *authoritypb.Item          { return cloneItem(f.root) }
-func (f *fakeRPC) IOLimits() (uint32, uint32)       { return f.maxRead, f.maxWrite }
-func (f *fakeRPC) MaxWriteTransactionBytes() uint64 { return f.maxWriteTransaction }
-func (f *fakeRPC) SessionLease() time.Duration      { return f.lease }
-func (f *fakeRPC) SessionDone() <-chan struct{}     { return f.done }
-func (f *fakeRPC) SessionError() error              { return nil }
+func (f *fakeRPC) Root() *authoritypb.Item            { return cloneItem(f.root) }
+func (f *fakeRPC) IOLimits() (uint32, uint32)         { return f.maxRead, f.maxWrite }
+func (f *fakeRPC) MaxWriteTransactionBytes() uint64   { return f.maxWriteTransaction }
+func (f *fakeRPC) SessionLease() time.Duration        { return f.lease }
+func (f *fakeRPC) SessionDone() <-chan struct{}       { return f.done }
+func (f *fakeRPC) SessionError() error                { return nil }
+func (f *fakeRPC) SessionEndPending() <-chan struct{} { return f.done }
+func (f *fakeRPC) SessionEndCause() error             { return nil }
+func (f *fakeRPC) FinishLocalSessionEnforcement()     {}
 
 func (f *fakeRPC) Close() error {
 	f.mu.Lock()
