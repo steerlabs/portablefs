@@ -1,0 +1,7 @@
+**
+!deploy/
+!deploy/files/
+!deploy/files/Containerfile
+!deploy/files/Containerfile.dockerignore
+!vcs/
+!vcs/**

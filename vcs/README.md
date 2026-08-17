@@ -25,6 +25,7 @@ OS kernel page caches remain part of each mount contract. For why, read
 | `cmd/portablefs-cell-agent` | The unprivileged outbound reconciliation loop on each Linux storage cell. |
 | `cmd/portablefs-cell-helper` | The narrow root helper that applies only a verified, manager-signed cell plan. Linux only. |
 | `cmd/portablefs-authority-launcher` | The fixed-argument systemd launcher for an isolated per-volume authority. Linux only. |
+| `cmd/portablefs-files` | The bounded read-only HTTP adapter for a colocated product backend. It holds strict, cacheless authority sessions and never mounts a volume. |
 | `cmd/portablefsd` | The per-user daemon. On macOS it is the v3 data plane behind the FSKit extension: it owns the authority session and never exposes authority credentials to the extension. |
 | `cmd/portablefs-mount-v3` | A standalone Linux mount client. This is what the coherence harnesses drive; ordinary users go through `portablefs mount`. |
 
@@ -70,6 +71,8 @@ internal/
                    on.
   localroutes/     Machine-local backing directories, keyed by (volume, route
                    root) so they survive unmount.
+  readonlyfs/      Strict, cacheless, non-mounting authority client used by the
+                   bounded files adapter.
   confinedfs/      The machine-local backing capability boundary: openat2 with
                    RESOLVE_IN_ROOT, failing closed where it is unavailable.
   fskitidentity/   The signed macOS identity tuple: app group, filesystem type,

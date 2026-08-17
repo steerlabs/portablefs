@@ -16,6 +16,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
@@ -70,6 +71,9 @@ type authorityClient interface {
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	Close() error
 	IOLimits() (uint32, uint32)
+	InitialVisibilityCursor() *authoritypb.VisibilityCursor
+	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
+	NextVisibilityAfterAck(context.Context, *authoritypb.VisibilityCursor, bool) (*authoritypb.VisibilityEvent, error)
 	Root() *authoritypb.Item
 	SessionLease() time.Duration
 }
@@ -83,6 +87,7 @@ type Client struct {
 	fatalMu        sync.Mutex
 	fatal          error
 	closeOnce      sync.Once
+	workers        sync.WaitGroup
 }
 
 func Dial(ctx context.Context, config Config) (*Client, error) {
@@ -100,12 +105,23 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	rpc, _, err := mountv3.AttachWithRoutes(ctx, authorityrpc.ClientConfig{
 		AccessToken:        append([]byte(nil), config.Capability...),
 		Address:            config.Address,
+		CachedNameCapacity: 1,
 		CancelDrainTimeout: mountv3.CancelDrainTimeout,
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED,
+		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
 		DialTimeout:        mountv3.DialTimeout,
 		MaxFrame:           mountv3.MaxFrame,
 		MaxInFlight:        mountv3.MaxInFlight,
-		ReplaySlots:        mountv3.ReplaySlots,
+		NamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT,
+		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+			return &authoritypb.MountAbsenceProof{
+				ObservedUnixNanos: time.Now().UnixNano(),
+				Observation:       []byte("portablefs-files has no kernel mount, FUSE connection, or namespace cache"),
+				Component:         "portablefs-files/no-kernel-mount",
+			}, nil
+		},
+		RepairBudget:   10 * time.Second,
+		ReplaySlots:    mountv3.ReplaySlots,
+		RoutesRevision: localroutes.RuleSet{}.Revision(),
 		TLS: &tls.Config{
 			Certificates: []tls.Certificate{identity},
 			MinVersion:   tls.VersionTLS13,
@@ -127,7 +143,19 @@ func newClient(rpc authorityClient, timeout time.Duration) *Client {
 	maxRead, _ := rpc.IOLimits()
 	keepaliveContext, stop := context.WithCancel(context.Background())
 	client := &Client{rpc: rpc, requestTimeout: timeout, maxRead: maxRead, stop: stop, done: make(chan struct{})}
-	go client.keepalive(keepaliveContext)
+	client.workers.Add(2)
+	go func() {
+		defer client.workers.Done()
+		client.keepalive(keepaliveContext)
+	}()
+	go func() {
+		defer client.workers.Done()
+		client.acknowledgeVisibility(keepaliveContext)
+	}()
+	go func() {
+		client.workers.Wait()
+		close(client.done)
+	}()
 	return client
 }
 
@@ -323,7 +351,6 @@ func (c *Client) operationContext(parent context.Context) (context.Context, cont
 }
 
 func (c *Client) keepalive(ctx context.Context) {
-	defer close(c.done)
 	lease := c.rpc.SessionLease()
 	if lease <= 0 {
 		c.fail(errors.New("readonlyfs: authority omitted its session lease"))
@@ -354,10 +381,29 @@ func (c *Client) keepalive(ctx context.Context) {
 	}
 }
 
+// A files reader keeps no kernel or userspace namespace cache. Protocol 5 has
+// one coherent session model, so this cacheless participant still joins the
+// visibility stream and acknowledges each phase only after it has observed it.
+func (c *Client) acknowledgeVisibility(ctx context.Context) {
+	cursor := c.rpc.InitialVisibilityCursor()
+	if cursor == nil {
+		c.fail(errors.New("readonlyfs: authority omitted its initial visibility cursor"))
+		return
+	}
+	event, err := c.rpc.NextVisibility(ctx, cursor)
+	for err == nil {
+		event, err = c.rpc.NextVisibilityAfterAck(ctx, event.GetCursor(), false)
+	}
+	if ctx.Err() == nil {
+		c.fail(fmt.Errorf("readonlyfs: authority visibility stream: %w", err))
+	}
+}
+
 func (c *Client) fail(err error) {
 	c.fatalMu.Lock()
 	if c.fatal == nil {
 		c.fatal = err
+		c.stop()
 		_ = c.rpc.Close()
 	}
 	c.fatalMu.Unlock()

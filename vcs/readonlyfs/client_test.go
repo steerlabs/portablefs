@@ -96,12 +96,37 @@ func TestClientRejectsAuthorityDirectoryPageAboveRequestedBound(t *testing.T) {
 	}
 }
 
+func TestClientAcknowledgesVisibilityWithoutCachingNamespaceState(t *testing.T) {
+	acknowledged := make(chan *authoritypb.VisibilityCursor, 1)
+	rpc := &fakeAuthority{
+		root: testItem(1, authoritypb.Attr_DIRECTORY, []byte("root"), 0),
+		visibilityEvent: &authoritypb.VisibilityEvent{Cursor: &authoritypb.VisibilityCursor{
+			Sequence: 2,
+			Phase:    authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE,
+		}},
+		visibilityAcknowledged: acknowledged,
+	}
+	client := newClient(rpc, time.Second)
+	t.Cleanup(func() { _ = client.Close() })
+
+	select {
+	case cursor := <-acknowledged:
+		if cursor.GetSequence() != 2 || cursor.GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE {
+			t.Fatalf("acknowledged cursor = %v", cursor)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cacheless client did not acknowledge the visibility event")
+	}
+}
+
 type fakeAuthority struct {
 	mu                     sync.Mutex
 	operations             []string
 	oversizedDirectoryPage bool
 	readDirCalls           int
 	root                   *authoritypb.Item
+	visibilityEvent        *authoritypb.VisibilityEvent
+	visibilityAcknowledged chan<- *authoritypb.VisibilityCursor
 }
 
 func (f *fakeAuthority) CallMutation(_ context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -164,8 +189,29 @@ func (f *fakeAuthority) CallRead(_ context.Context, request *authoritypb.Request
 	}
 }
 
-func (f *fakeAuthority) Close() error                { return nil }
-func (f *fakeAuthority) IOLimits() (uint32, uint32)  { return 2, 256 }
+func (f *fakeAuthority) Close() error               { return nil }
+func (f *fakeAuthority) IOLimits() (uint32, uint32) { return 2, 256 }
+func (f *fakeAuthority) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
+	return &authoritypb.VisibilityCursor{Sequence: 1}
+}
+func (f *fakeAuthority) NextVisibility(ctx context.Context, _ *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error) {
+	f.mu.Lock()
+	event := f.visibilityEvent
+	f.visibilityEvent = nil
+	f.mu.Unlock()
+	if event != nil {
+		return event, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (f *fakeAuthority) NextVisibilityAfterAck(ctx context.Context, cursor *authoritypb.VisibilityCursor, _ bool) (*authoritypb.VisibilityEvent, error) {
+	if f.visibilityAcknowledged != nil {
+		f.visibilityAcknowledged <- cursor
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
 func (f *fakeAuthority) Root() *authoritypb.Item     { return f.root }
 func (f *fakeAuthority) SessionLease() time.Duration { return time.Hour }
 
