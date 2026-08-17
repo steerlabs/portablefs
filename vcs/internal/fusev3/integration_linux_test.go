@@ -505,6 +505,12 @@ func TestCrossMountPositiveDentryInvalidation(t *testing.T) {
 // project calls out as a platform hazard: a name that was looked up and found
 // missing must start resolving as soon as the other mount creates it. A cached
 // negative dentry makes the second stat below fail.
+//
+// The repeated probes below are not defensive any more. A strict mount
+// publishes an absence with a real lifetime, so after the first miss the
+// following two are answered by this kernel with no upcall at all, and the only
+// thing that can make the later stat succeed is the creating mount's barrier
+// expiring this entry before its own create(2) returns.
 func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	ghostA, ghostB := f.join(0, "ghost"), f.join(1, "ghost")

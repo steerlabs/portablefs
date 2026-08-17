@@ -64,9 +64,12 @@ type inodeRecord struct {
 }
 
 type replyNamePublication struct {
-	key        nameKey
-	stable     publicationNamespace
-	record     *inodeRecord
+	key    nameKey
+	stable publicationNamespace
+	record *inodeRecord
+	// negative marks a published absence. It carries no record, and it settles
+	// into the negative registry rather than the binding registry.
+	negative   bool
 	coordinate publicationCoordinate
 	reserved   bool
 }
@@ -216,6 +219,10 @@ type rawFileSystem struct {
 	entryTimeout time.Duration
 	attrTimeout  time.Duration
 	nameCapacity int
+	// negativeCapacity is the part of nameCapacity that may be spent on cached
+	// absences. See negativeNameShare for why absences need their own bound
+	// inside the declared total rather than competing freely with bindings.
+	negativeCapacity int
 
 	// grafts serves the volume's machine-local routes, nil when it declares
 	// none. Every routing decision starts with this nil check, so a mount
@@ -249,6 +256,13 @@ type rawFileSystem struct {
 	cachedNames       map[nameKey]*inodeRecord
 	cachedStableNames map[publicationNamespace]*inodeRecord
 	cachedNameStable  map[nameKey]publicationNamespace
+	// cachedNegatives is the same registry for the other half of the namespace:
+	// the (parent inode, name) coordinates this frontend published to its
+	// kernel as cacheable absences. It is a set rather than a map to a record
+	// because an absence names nothing -- which is also why it can never be
+	// reclaimed by FORGET, and must therefore leave only through a repair or
+	// through self-revocation.
+	cachedNegatives map[nameKey]struct{}
 	// heldNames and heldInodes are closed to cache admission between PREPARE
 	// and COMPLETE. heldPhase is the exact set the current PREPARE installed,
 	// because COMPLETE's target set is allowed to differ from PREPARE's.
@@ -259,9 +273,13 @@ type rawFileSystem struct {
 	// admitted to the cache and have not finished being written. PREPARE waits
 	// them out so that no entry decided before admission closed can be
 	// installed after COMPLETE has repaired.
-	publishingNames     map[nameKey]int
-	publishingInodes    map[uint64]int
-	pendingNames        int
+	publishingNames  map[nameKey]int
+	publishingInodes map[uint64]int
+	pendingNames     int
+	// pendingNegatives is the same reservation counter for absences. It is
+	// separate so a burst of probes cannot silently consume the reservations
+	// that bindings were counted against, and vice versa.
+	pendingNegatives    int
 	published           chan struct{}
 	replyPublications   map[uint64]*replyPublication
 	publishAcks         map[uint64]*replyPublication
@@ -303,19 +321,24 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		entryTimeout:   strictEntryTimeout,
 		attrTimeout:    strictAttrTimeout,
 		nameCapacity:   mount.nameCapacity,
-		grafts:         mount.grafts,
-		backing:        mount.backing,
-		nextNodeID:     fuse.FUSE_ROOT_ID + 1,
-		nodesByID:      map[uint64]*inodeRecord{fuse.FUSE_ROOT_ID: record},
-		nodesByKey:     map[inodeKey]*inodeRecord{key: record},
-		graftsByKey:    make(map[inodeKey]*inodeRecord),
-		namedRecords:   make(map[nameKey]*inodeRecord),
-		nextHandle:     1,
-		handles:        make(map[uint64]*handleRecord),
+		// A declared capacity too small to divide still admits one absence:
+		// refusing every negative entry would be a silent behaviour change for
+		// a mount that declared a tiny cache, not a bound anything relies on.
+		negativeCapacity: max(mount.nameCapacity/negativeNameShare, 1),
+		grafts:           mount.grafts,
+		backing:          mount.backing,
+		nextNodeID:       fuse.FUSE_ROOT_ID + 1,
+		nodesByID:        map[uint64]*inodeRecord{fuse.FUSE_ROOT_ID: record},
+		nodesByKey:       map[inodeKey]*inodeRecord{key: record},
+		graftsByKey:      make(map[inodeKey]*inodeRecord),
+		namedRecords:     make(map[nameKey]*inodeRecord),
+		nextHandle:       1,
+		handles:          make(map[uint64]*handleRecord),
 
 		cachedNames:                make(map[nameKey]*inodeRecord),
 		cachedStableNames:          make(map[publicationNamespace]*inodeRecord),
 		cachedNameStable:           make(map[nameKey]publicationNamespace),
+		cachedNegatives:            make(map[nameKey]struct{}),
 		heldNames:                  make(map[nameKey]struct{}),
 		heldInodes:                 make(map[uint64]struct{}),
 		publishingNames:            make(map[nameKey]int),
@@ -381,7 +404,25 @@ func (r *rawFileSystem) dropCachedNameLocked(key nameKey) {
 	delete(record.names, key)
 }
 
+func (r *rawFileSystem) dropCachedNegativeLocked(key nameKey) {
+	delete(r.cachedNegatives, key)
+}
+
+// bindCachedNegativeLocked records one published absence. It withdraws any
+// binding recorded under the same name first: the kernel holds one dentry per
+// name, so the absence it has just installed replaced whatever was there, and a
+// binding registration the kernel no longer holds would later address a
+// NotifyDelete at a child that is not under that name -- which the strict
+// kernel refuses as protocol corruption rather than ignoring.
+func (r *rawFileSystem) bindCachedNegativeLocked(key nameKey) {
+	r.dropCachedNameLocked(key)
+	r.cachedNegatives[key] = struct{}{}
+}
+
 func (r *rawFileSystem) bindCachedNameLocked(key nameKey, stable publicationNamespace, record *inodeRecord) {
+	// The mirror of bindCachedNegativeLocked: a binding the kernel has
+	// installed replaces the absence this mount had published for the name.
+	r.dropCachedNegativeLocked(key)
 	if record == nil {
 		return
 	}
@@ -409,6 +450,14 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 	if record == nil {
 		return 0, publication, false
 	}
+	// The kernel installs this binding from the same reply, replacing any
+	// absence this mount published for the name. That transition happens
+	// whether or not the binding itself turns out to be cacheable, so the
+	// negative registration is withdrawn here rather than at settle. It has to
+	// be: when the mutation that filled the name is this mount's own, the
+	// authority deliberately delivers this mount no repair phase for it, so
+	// this is the only moment at which that absence can be taken back.
+	r.dropCachedNegativeLocked(key)
 	if _, held := r.heldNames[key]; held {
 		return 0, publication, false
 	}
@@ -419,7 +468,7 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 		return 0, publication, false
 	}
 	_, already := r.cachedNames[key]
-	if !already && len(r.cachedNames)+r.pendingNames >= r.nameCapacity {
+	if !already && r.cachedNameTotalLocked() >= r.nameCapacity {
 		// The declared capacity is a promise about how much state this mount
 		// can withdraw, so it is a hard bound. Beyond it the frontend keeps
 		// answering with a zero lifetime.
@@ -428,6 +477,46 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 	publication.reserved = !already
 	if publication.reserved {
 		r.pendingNames++
+	}
+	r.publishingNames[key]++
+	r.admitSourcePublicationLocked(coordinate)
+	return r.entryTimeout, publication, true
+}
+
+// cachedNameTotalLocked is the whole name-cache footprint this mount would have
+// to withdraw right now: every recorded answer plus every reservation an
+// in-flight reply already holds. Bindings and absences are summed because the
+// declared capacity is one promise about kernel state, not two.
+func (r *rawFileSystem) cachedNameTotalLocked() int {
+	return len(r.cachedNames) + len(r.cachedNegatives) + r.pendingNames + r.pendingNegatives
+}
+
+// admitNegativeNameLocked decides the lifetime one proven absence is published
+// with, and records it when it is cacheable. It is deliberately the same
+// decision as admitNameLocked -- the same PREPARE-time held cut, the same
+// source publication gate, the same declared capacity -- because an absence
+// this kernel serves from cache is exactly as much of a repair obligation as a
+// binding it serves from cache. There is no held-inode check because an absence
+// names no inode.
+func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *inodeRecord, name string) (time.Duration, replyNamePublication, bool) {
+	key := nameKey{parent: parent.key.inode, name: name}
+	stable := publicationNamespace{parent: parent.identity, name: name}
+	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: name}
+	publication := replyNamePublication{key: key, stable: stable, negative: true, coordinate: coordinate}
+	if _, held := r.heldNames[key]; held {
+		return 0, publication, false
+	}
+	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
+		return 0, publication, false
+	}
+	_, already := r.cachedNegatives[key]
+	if !already {
+		if len(r.cachedNegatives)+r.pendingNegatives >= r.negativeCapacity ||
+			r.cachedNameTotalLocked() >= r.nameCapacity {
+			return 0, publication, false
+		}
+		publication.reserved = true
+		r.pendingNegatives++
 	}
 	r.publishingNames[key]++
 	r.admitSourcePublicationLocked(coordinate)
@@ -489,6 +578,50 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	return nil
 }
 
+// publishNegativeEntry answers a name that does not exist with the lifetime
+// this mount's cache contract allows for its absence.
+//
+// A cacheable absence is published the way FUSE defines one: a successful reply
+// whose NodeId is zero, which the kernel reads as "no such entry, and that
+// answer is valid for this long". Replying ENOENT is the uncacheable form. The
+// kernel installs a negative dentry either way, but only the zero-NodeId reply
+// carries a lifetime, so ENOENT costs one full authority round trip per probe,
+// forever -- which is what every SQLite transaction (`-journal`, `-wal`), every
+// interpreter's import scan, and every linker's search path spend most of their
+// syscalls on.
+//
+// Absence is cacheable for exactly the reason existence is, and by exactly the
+// same mechanism. A create or rename that fills the name is a visible mutation,
+// the authority's audience for it includes this mount because the failed
+// resolution entered that mount's resolved index just as a successful one would
+// (see lookupForSession), and the barrier expires this entry here before the
+// mutating syscall returns on the machine that made it. The 60s lifetime is not
+// what makes it safe; the repair is.
+func (r *rawFileSystem) publishNegativeEntry(ctx context.Context, out *fuse.EntryOut, parent *inodeRecord, name string) (fuse.Status, error) {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		return fuse.Status(syscall.ENOTCONN), errors.New("fusev3: negative lookup escaped its post-VFS reply-publication lifecycle")
+	}
+	// Even an uncacheable absence is a kernel-visible publication: d_lookup_done
+	// installs the negative result after this response wakes the requester, with
+	// a zero lifetime as much as with a real one. The receipt is therefore
+	// retained whichever lifetime this reply ends up carrying.
+	publication.needsPostVFS = true
+	r.mu.Lock()
+	lifetime, namePublication, cached := r.admitNegativeNameLocked(ctx, parent, name)
+	r.mu.Unlock()
+	if !cached {
+		out.SetEntryTimeout(0)
+		return fuse.Status(syscall.ENOENT), nil
+	}
+	publication.names = append(publication.names, namePublication)
+	// A zero-NodeId reply carries no object, so every other field is written
+	// out fresh rather than left at whatever the pooled request buffer held.
+	*out = fuse.EntryOut{}
+	out.SetEntryTimeout(lifetime)
+	return fuse.OK, nil
+}
+
 // publishAnonymousEntry publishes the inode/attribute half of TMPFILE without
 // inventing a namespace binding. Even an attr lifetime of zero still updates
 // kernel inode state after the reply wakes the requester, so SHARED results
@@ -513,11 +646,23 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 }
 
 func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublication, successful bool) {
-	if publication.reserved && r.pendingNames > 0 {
-		r.pendingNames--
+	switch {
+	case !publication.reserved:
+	case publication.negative:
+		if r.pendingNegatives > 0 {
+			r.pendingNegatives--
+		}
+	default:
+		if r.pendingNames > 0 {
+			r.pendingNames--
+		}
 	}
 	if successful {
-		r.bindCachedNameLocked(publication.key, publication.stable, publication.record)
+		if publication.negative {
+			r.bindCachedNegativeLocked(publication.key)
+		} else {
+			r.bindCachedNameLocked(publication.key, publication.stable, publication.record)
+		}
 	}
 	if r.publishingNames[publication.key]--; r.publishingNames[publication.key] <= 0 {
 		delete(r.publishingNames, publication.key)
@@ -1076,20 +1221,19 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	defer finish()
 	item, errno := parent.node.Lookup(ctx, name)
 	if errno != 0 {
-		// A strict shared ENOENT is still a kernel-visible publication:
-		// d_lookup_done installs the negative lookup result after this response
-		// wakes the requester, even with a zero lifetime. Retain its ordering
-		// record until the generic post-VFS receipt. Other errors describe no
+		// A strict shared ENOENT states a namespace fact, and one this kernel
+		// may serve from cache; publishNegativeEntry decides its lifetime and
+		// retains the ordering record either way. Other errors describe no
 		// namespace fact and remain ordinary unmarked replies.
-		out.SetEntryTimeout(0)
 		if errno == syscall.ENOENT {
-			publication := replyPublicationFromContext(ctx)
-			if publication == nil {
-				r.mount.revoke(errors.New("fusev3: negative lookup escaped its post-VFS reply-publication lifecycle"))
+			status, err := r.publishNegativeEntry(ctx, out, parent, name)
+			if err != nil {
+				r.mount.revoke(err)
 				return fuse.Status(syscall.ENOTCONN)
 			}
-			publication.needsPostVFS = true
+			return status
 		}
+		out.SetEntryTimeout(0)
 		return fuse.Status(errno)
 	}
 	record, errno := r.intern(ctx, item)

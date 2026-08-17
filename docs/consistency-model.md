@@ -126,7 +126,66 @@ resolves, and never polls or retries. It also proves a red result is reachable
 before reporting a green one. See
 [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md).
 
+### Absent names are cached under the same rule
+
+A name that does not exist is a namespace fact like any other, and a strict
+mount caches it. A failed lookup is answered with the FUSE shape that carries a
+lifetime — a successful reply whose `NodeId` is zero — rather than with `ENOENT`,
+which carries none. This is what stops a repeatedly probing workload paying an
+authority round trip per probe forever: every SQLite transaction stats
+`<db>-journal` and `<db>-wal`, every `git status` misses on directory entries
+that are not there, and every interpreter and linker walks a search path made
+almost entirely of absences.
+
+The lifetime is not what makes this safe, exactly as it is not what makes a
+cached binding safe. A cached absence is admitted through the same registry, the
+same PREPARE-time cut, and the same declared capacity as a cached binding, and
+it is withdrawn by the same barrier:
+
+- The failed lookup is declared to the authority. The read path records the
+  `(parent identity, name)` coordinate of a resolution whether or not the name
+  resolved, so the mount that observed the absence is in the audience of any
+  later mutation that fills it. Nothing in the audience computation distinguishes
+  the two cases.
+- A create, rename, link, or mknod that materialises the name therefore reaches
+  this mount as a namespace target, and the mount expires the cached absence and
+  acknowledges COMPLETE *before* the mutating syscall returns on the machine that
+  made it. The repair primitive is the name-only expiry rather than the
+  exact-child delete: an absence has no child identity to validate, no watcher
+  event is owed for a creation performed elsewhere, and the hazard a name-only
+  expiry carries for a binding — expiring a newer one — cannot arise, because the
+  newer answer is precisely the one the mutation created.
+- When the mutation is this mount's own, the authority delivers it no phase, so
+  the reply that installs the new binding withdraws the absence directly. Self
+  revocation withdraws every cached absence beside every cached binding: leaving
+  a stale "not there" behind is exactly as wrong as leaving a stale binding.
+
+Absences count against the capacity a mount declares at attach, because that
+number is the amount of kernel state the mount promises it can repair and must
+be able to walk while dying. They additionally have a bound of their own inside
+that total: nothing reclaims an absence the way `FORGET` reclaims a binding —
+there is no inode for a name that does not exist, so the kernel never reports
+dropping the dentry — and without a share a probe-heavy workload could spend the
+whole budget on names that are not there. Past either bound the mount keeps
+answering `ENOENT` with a zero lifetime, which costs a lookup and can never be
+wrong.
+
+Names served by a machine-local route are the one exception: their absence is
+not cached, because the file that fills such a name is created in the backing
+tree without this frontend necessarily being asked about it, and no authority
+barrier covers that.
+
 ### macOS
+
+macOS reaches the same rule by a different mechanism, so no separate contract is
+stated for it. The authority-side declaration is shared: the audience for a
+mutation is computed from the same recorded resolutions regardless of which
+frontend observed them. On the repair side, FSKit does not let the adapter
+publish an entry lifetime the way a FUSE reply does, so the macOS frontend does
+not choose to cache an absence — the platform's name cache does — and its repair
+vocabulary carries a negative purge for exactly that case: a namespace target for
+which the mount holds no binding but does hold the parent is discharged by
+purging the negative entry rather than by evicting one.
 
 Shipping macOS 26 builds admit the named
 `macos26-synchronous-vfs-repair-v2` best-effort policy. The Mac owns an

@@ -13,28 +13,57 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
+// TestAuthorityNegativeLookupRequiresPostVFSPublication covers both shapes a
+// negative answer can take. A cacheable absence is a success carrying a zero
+// NodeId; an uncacheable one is ENOENT. The kernel installs the negative result
+// after the reply wakes the requester in either case, so both retain the
+// generic post-VFS receipt -- the lifetime decides caching, not ownership.
 func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
-	f := newStrictFixture(t)
-	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetLookup() == nil {
-			return nil, errors.New("unexpected non-LOOKUP request")
-		}
-		return &authoritypb.Response{Errno: int32(syscall.ENOENT)}, nil
+	cases := []struct {
+		name       string
+		cacheable  bool
+		wantStatus fuse.Status
+	}{
+		{"cacheable absence", true, fuse.OK},
+		{"uncacheable absence", false, fuse.ENOENT},
 	}
-	const requestUnique = 6900
-	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: requestUnique, NodeId: fuse.FUSE_ROOT_ID}, "missing", &fuse.EntryOut{}); status != fuse.ENOENT {
-		t.Fatalf("negative LOOKUP = %v, want ENOENT", status)
-	}
-	if !f.raw.ReplyWriteOrdered(requestUnique) {
-		t.Fatal("negative LOOKUP did not retain its physical reply ownership")
-	}
-	if !f.raw.ReplyPublishMarked(requestUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
-		t.Fatal("negative LOOKUP did not request a post-VFS publication receipt")
-	}
-	f.raw.ReplyWritten(requestUnique, fuse.OK)
-	acknowledgeTestPublication(t, f.raw, requestUnique)
-	if f.mount.isRevoked() {
-		t.Fatalf("valid negative LOOKUP publication revoked mount: %v", f.mount.fatalError())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			if !tc.cacheable {
+				// The state a saturated absence registry reaches: no absence may
+				// be published with a lifetime, so ENOENT is the only answer.
+				f.raw.negativeCapacity = 0
+			}
+			f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+				if request.GetLookup() == nil {
+					return nil, errors.New("unexpected non-LOOKUP request")
+				}
+				return &authoritypb.Response{Errno: int32(syscall.ENOENT)}, nil
+			}
+			const requestUnique = 6900
+			out := &fuse.EntryOut{}
+			if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: requestUnique, NodeId: fuse.FUSE_ROOT_ID}, "missing", out); status != tc.wantStatus {
+				t.Fatalf("negative LOOKUP = %v, want %v", status, tc.wantStatus)
+			}
+			if out.NodeId != 0 {
+				t.Fatalf("negative LOOKUP published NodeId %d, want 0", out.NodeId)
+			}
+			if cached := out.EntryValid != 0; cached != tc.cacheable {
+				t.Fatalf("absence lifetime = %d.%09d, cacheable = %t", out.EntryValid, out.EntryValidNsec, tc.cacheable)
+			}
+			if !f.raw.ReplyWriteOrdered(requestUnique) {
+				t.Fatal("negative LOOKUP did not retain its physical reply ownership")
+			}
+			if !f.raw.ReplyPublishMarked(requestUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
+				t.Fatal("negative LOOKUP did not request a post-VFS publication receipt")
+			}
+			f.raw.ReplyWritten(requestUnique, fuse.OK)
+			acknowledgeTestPublication(t, f.raw, requestUnique)
+			if f.mount.isRevoked() {
+				t.Fatalf("valid negative LOOKUP publication revoked mount: %v", f.mount.fatalError())
+			}
+		})
 	}
 }
 

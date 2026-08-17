@@ -60,7 +60,12 @@ type fakeRPC struct {
 	// byName, when non-nil, mints one distinct object per name so a test can
 	// walk a volume path of several different directories. Without it every
 	// lookup answers with the same object and a path has no shape.
-	byName              map[string]*authoritypb.Item
+	byName map[string]*authoritypb.Item
+	// missingNames are the names this authority answers ENOENT for, which is
+	// how a negative resolution is made reachable without a kernel. A name is
+	// removed from the set by whatever creates it, so the miss/create/hit
+	// sequence a probing workload performs can be replayed exactly.
+	missingNames        map[string]bool
 	handle              []byte
 	maxRead             uint32
 	maxWrite            uint32
@@ -316,11 +321,15 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 	case request.GetGetAttr() != nil:
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: cloneItem(f.item).GetAttr()}}}, nil
 	case request.GetLookup() != nil:
+		if f.missingNames[string(request.GetLookup().GetName())] {
+			return &authoritypb.Response{Errno: int32(syscall.ENOENT)}, nil
+		}
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetLookup().GetName())}}}, nil
 	case request.GetMkdir() != nil:
 		if f.mkdirFailure != 0 {
 			return &authoritypb.Response{Errno: int32(f.mkdirFailure)}, nil
 		}
+		delete(f.missingNames, string(request.GetMkdir().GetName()))
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetMkdir().GetName())}}}, nil
 	case request.GetSymlink() != nil:
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetSymlink().GetName())}}}, nil

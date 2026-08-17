@@ -57,12 +57,27 @@ const (
 	strictEntryTimeout = 60 * time.Second
 	strictAttrTimeout  = 60 * time.Second
 
-	// defaultCachedNameCapacity is the number of (parent, name) bindings a
+	// defaultCachedNameCapacity is the number of (parent, name) resolutions a
 	// strict mount is willing to leave resident in its kernel. It is declared
 	// to the authority because it is exactly the amount of state this mount
 	// promises it can repair, and therefore also the amount it must be able to
-	// walk during self-revocation.
+	// walk during self-revocation. Absences count against it exactly like
+	// bindings: a name the kernel answers from cache is a repair obligation
+	// whether the cached answer is "here it is" or "it is not there".
 	defaultCachedNameCapacity = 1 << 16
+
+	// negativeNameShare bounds the part of that capacity spent on absences.
+	// The sub-bound exists because nothing reclaims a negative entry the way
+	// FORGET reclaims a binding: the kernel holds no inode for a name that does
+	// not exist, so it never tells this frontend that it dropped the dentry,
+	// and an absence therefore leaves the registry only through a repair or
+	// through self-revocation. Without a share, a workload that probes for
+	// absent names -- an interpreter walking a search path, a linker trying
+	// every -L directory -- could fill the whole declared budget with absences
+	// and stop the mount caching the names that do exist. A quarter is far more
+	// than any real probe set needs (SQLite probes two names per database) and
+	// leaves the majority of the declared state for real bindings.
+	negativeNameShare = 4
 
 	// defaultRepairBudget is the per-phase deadline a strict mount commits to.
 	// A phase is a handful of write(2) calls on /dev/fuse; the only thing that
@@ -670,11 +685,14 @@ func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKe
 	}
 }
 
-// repair is one kernel cache repair this frontend owes.
+// repair is one kernel cache repair this frontend owes. A namespace repair is
+// negative when the cached answer being taken back was an absence: there is no
+// child identity, and the primitive that expires it differs accordingly.
 type repair struct {
 	parent   uint64
 	child    uint64
 	name     string
+	negative bool
 	inode    uint64
 	data     bool
 	size     uint64
@@ -712,8 +730,21 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 	}
 	completion.work = make([]repair, 0, len(keys.names)+len(keys.inodes))
 	for _, key := range keys.names {
+		// A name this mount cached is cached exactly once, as a binding or as
+		// an absence, because the kernel holds one dentry per name. Both are
+		// answers this kernel would keep serving after the mutation, so both
+		// are resolved here against the same target.
 		record := r.cachedNames[key]
 		if record == nil {
+			if _, absent := r.cachedNegatives[key]; !absent {
+				continue
+			}
+			parent := r.directoryLocked(key.parent)
+			r.dropCachedNegativeLocked(key)
+			if parent == nil {
+				continue
+			}
+			completion.work = append(completion.work, repair{parent: parent.id, name: key.name, negative: true})
 			continue
 		}
 		parent := r.directoryLocked(key.parent)
@@ -815,6 +846,25 @@ func (r *rawFileSystem) applyRepair(item repair) error {
 		// healthy observer after a remote unlink.
 		return nil
 	}
+	if item.negative {
+		// The cached answer being taken back is an absence, so there is no
+		// child identity for the kernel to validate and no watcher event that a
+		// creation on another machine owes this one -- nothing was deleted
+		// here. Expiring the name is the whole repair: the next path walk has
+		// to ask again. The strict kernel routes this expiration through the
+		// same lockless path as NotifyDelete, so it cannot deadlock against an
+		// unanswered namespace callback of this mount.
+		//
+		// Invalidating a name is unconditionally safe in this direction. The
+		// hazard a name-only expiry carries for a binding -- expiring a newer
+		// one that replaced it -- does not exist for an absence: the newer
+		// answer is precisely the one the mutation created, and losing it costs
+		// a LOOKUP rather than correctness.
+		if status := server.EntryNotify(item.parent, item.name); !status.Ok() && status != fuse.ENOENT {
+			return fmt.Errorf("fusev3: expire absent name %q under node %d: %v", item.name, item.parent, status)
+		}
+		return nil
+	}
 	deleteStatus := server.DeleteNotify(item.parent, item.child, item.name)
 	if deleteStatus.Ok() || deleteStatus == fuse.ENOENT {
 		return nil
@@ -839,14 +889,16 @@ func (r *rawFileSystem) releaseHeld() {
 	r.releasePeerPublicationLocked()
 }
 
-// revokeCachedNames walks the exact set of bindings this mount published and
-// takes every one of them back. It is bounded by the cached-name capacity this
-// mount declared at attach, which is precisely why that number is part of the
-// contract: it is the amount of stale state a dying participant has to be able
-// to withdraw.
+// revokeCachedNames walks the exact set of name answers this mount published
+// and takes every one of them back. Absences are withdrawn beside bindings: a
+// dying participant that leaves a cached "not there" behind is exactly as wrong
+// as one that leaves a cached binding, because the name may already exist. The
+// walk is bounded by the cached-name capacity this mount declared at attach,
+// which is precisely why that number is part of the contract: it is the amount
+// of stale state a dying participant has to be able to withdraw.
 func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 	r.mu.Lock()
-	work := make([]repair, 0, len(r.cachedNames))
+	work := make([]repair, 0, len(r.cachedNames)+len(r.cachedNegatives))
 	for key, record := range r.cachedNames {
 		parent := r.directoryLocked(key.parent)
 		if parent == nil {
@@ -854,9 +906,17 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 		}
 		work = append(work, repair{parent: parent.id, child: record.id, name: key.name})
 	}
+	for key := range r.cachedNegatives {
+		parent := r.directoryLocked(key.parent)
+		if parent == nil {
+			continue
+		}
+		work = append(work, repair{parent: parent.id, name: key.name, negative: true})
+	}
 	r.cachedNames = make(map[nameKey]*inodeRecord)
 	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
 	r.cachedNameStable = make(map[nameKey]publicationNamespace)
+	r.cachedNegatives = make(map[nameKey]struct{})
 	r.mu.Unlock()
 	server := r.mount.notifier()
 	if server == nil {
@@ -865,6 +925,10 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 	for _, item := range work {
 		if time.Now().After(deadline) {
 			return
+		}
+		if item.negative {
+			_ = server.EntryNotify(item.parent, item.name)
+			continue
 		}
 		_ = server.DeleteNotify(item.parent, item.child, item.name)
 	}
@@ -1104,6 +1168,11 @@ type kernelNotifier interface {
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
 	PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status
 	DeleteNotify(parent uint64, child uint64, name string) fuse.Status
+	// EntryNotify takes back a cached absence. It is the name-only primitive,
+	// which is the correct one here and only here: an absence has no child
+	// identity to validate, and the strict kernel expires it under the same
+	// lockless path DeleteNotify uses.
+	EntryNotify(parent uint64, name string) fuse.Status
 }
 
 var _ kernelNotifier = (*fuse.Server)(nil)
