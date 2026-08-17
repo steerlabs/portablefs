@@ -483,9 +483,46 @@ func addBoundCoordinates(coordinates map[publicationCoordinate]struct{}, identit
 	}
 }
 
-func (r *rawFileSystem) sourcePublicationsBusyLocked(coordinates map[publicationCoordinate]struct{}, unresolvedAttributes, unresolvedData int) bool {
+// supersedableNegativePublicationLocked encodes the kernel's atomic-open merge
+// guarantee. Once this mount's absence reply has physically reached the kernel,
+// a source mutation for the same name may complete the outer scope which owns
+// its deferred receipt. Foreign or not-yet-written replies stay ordered behind
+// the gate so a racing repair cannot expire an entry before it is installed.
+func (r *rawFileSystem) supersedableNegativePublicationLocked(publication *negativeNamePublication, owner *sourcePublicationLease) bool {
+	if publication == nil || owner == nil || publication.owner != owner.r || publication.reply == nil {
+		return false
+	}
+	reply := publication.reply
+	if reply.owner != owner.r || !reply.originalWrote || !reply.originalStatus.Ok() || reply.source != nil ||
+		len(reply.attrs) != 0 || len(reply.data) != 0 || reply.writeKernelTx != 0 || len(reply.names) == 0 {
+		return false
+	}
+	for _, name := range reply.names {
+		if !name.negative {
+			return false
+		}
+	}
+	return true
+}
+
+func (r *rawFileSystem) sourceCoordinateBusyLocked(coordinate publicationCoordinate, owner *sourcePublicationLease) bool {
+	publishing := r.sourcePublishing[coordinate]
+	if publishing == 0 {
+		return false
+	}
+	if coordinate.kind == publicationNamespaceName {
+		for negative := range r.publishingNegativeNames[coordinate] {
+			if r.supersedableNegativePublicationLocked(negative, owner) {
+				publishing--
+			}
+		}
+	}
+	return publishing != 0
+}
+
+func (r *rawFileSystem) sourcePublicationsBusyLocked(coordinates map[publicationCoordinate]struct{}, unresolvedAttributes, unresolvedData int, owner *sourcePublicationLease) bool {
 	for coordinate := range coordinates {
-		if r.sourcePublishing[coordinate] != 0 {
+		if r.sourceCoordinateBusyLocked(coordinate, owner) {
 			return true
 		}
 	}
@@ -638,7 +675,7 @@ func (l *sourcePublicationLease) refreshPreBindings(ctx context.Context) error {
 func (l *sourcePublicationLease) drain(ctx context.Context) error {
 	for {
 		l.r.mu.Lock()
-		busy := l.r.sourcePublicationsBusyLocked(l.coordinates, l.unresolvedAttributes, l.unresolvedData)
+		busy := l.r.sourcePublicationsBusyLocked(l.coordinates, l.unresolvedAttributes, l.unresolvedData, l)
 		changed := l.r.sourceChanged
 		l.r.mu.Unlock()
 		if !busy {

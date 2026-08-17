@@ -69,9 +69,21 @@ type replyNamePublication struct {
 	record *inodeRecord
 	// negative marks a published absence. It carries no record, and it settles
 	// into the negative registry rather than the binding registry.
-	negative   bool
+	negative      bool
+	negativeState *negativeNamePublication
+	coordinate    publicationCoordinate
+	reserved      bool
+}
+
+// negativeNamePublication is the mutable part of an admitted absence. A
+// materializing mutation marks it superseded before either merged receipt may
+// arrive, so a late receipt cannot put the old absence back in the registry.
+// All fields are protected by rawFileSystem.mu.
+type negativeNamePublication struct {
+	owner      *rawFileSystem
+	reply      *replyPublication
 	coordinate publicationCoordinate
-	reserved   bool
+	superseded bool
 }
 
 type replyAttrPublication struct {
@@ -111,6 +123,7 @@ type replyPublication struct {
 	// rawFileSystem.mu. The original response write only signals
 	// originalDone. Cache/source ownership remains retained through the
 	// physical FUSE_PFS_PUBLISH acknowledgment.
+	owner          *rawFileSystem
 	requestUnique  uint64
 	nodeid         uint64
 	opcode         uint32
@@ -314,6 +327,7 @@ type rawFileSystem struct {
 	// maps are keyed only by stable filesystem identities and exact names.
 	sourceHolds                 map[publicationCoordinate]*sourcePublicationLease
 	sourcePublishing            map[publicationCoordinate]int
+	publishingNegativeNames     map[publicationCoordinate]map[*negativeNamePublication]struct{}
 	peerHolds                   map[publicationCoordinate]int
 	sourceUnresolvedAttributes  map[*sourcePublicationLease]int
 	sourceUnresolvedData        map[*sourcePublicationLease]int
@@ -375,6 +389,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		writeTx:                    make(map[uint64]*writeTransaction),
 		sourceHolds:                make(map[publicationCoordinate]*sourcePublicationLease),
 		sourcePublishing:           make(map[publicationCoordinate]int),
+		publishingNegativeNames:    make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
 		peerHolds:                  make(map[publicationCoordinate]int),
 		sourceUnresolvedAttributes: make(map[*sourcePublicationLease]int),
 		sourceUnresolvedData:       make(map[*sourcePublicationLease]int),
@@ -433,6 +448,19 @@ func (r *rawFileSystem) dropCachedNegativeLocked(key nameKey) {
 	delete(r.cachedNegatives, key)
 }
 
+// supersedeNegativeNameLocked records the stronger fact installed by this
+// mount's own materializing mutation. The registry drop covers an already
+// settled absence; marking admitted absences covers a lookup receipt which the
+// kernel deliberately deferred into the enclosing mutation scope.
+func (r *rawFileSystem) supersedeNegativeNameLocked(key nameKey, coordinate publicationCoordinate) {
+	r.dropCachedNegativeLocked(key)
+	for publication := range r.publishingNegativeNames[coordinate] {
+		if publication.owner == r {
+			publication.superseded = true
+		}
+	}
+}
+
 // bindCachedNegativeLocked records one published absence. It withdraws any
 // binding recorded under the same name first: the kernel holds one dentry per
 // name, so the absence it has just installed replaced whatever was there, and a
@@ -447,7 +475,7 @@ func (r *rawFileSystem) bindCachedNegativeLocked(key nameKey) {
 func (r *rawFileSystem) bindCachedNameLocked(key nameKey, stable publicationNamespace, record *inodeRecord) {
 	// The mirror of bindCachedNegativeLocked: a binding the kernel has
 	// installed replaces the absence this mount had published for the name.
-	r.dropCachedNegativeLocked(key)
+	r.supersedeNegativeNameLocked(key, publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: stable.name})
 	if record == nil {
 		return
 	}
@@ -482,7 +510,7 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 	// be: when the mutation that filled the name is this mount's own, the
 	// authority deliberately delivers this mount no repair phase for it, so
 	// this is the only moment at which that absence can be taken back.
-	r.dropCachedNegativeLocked(key)
+	r.supersedeNegativeNameLocked(key, coordinate)
 	if _, held := r.heldNames[key]; held {
 		return 0, publication, false
 	}
@@ -545,6 +573,12 @@ func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *ino
 	}
 	r.publishingNames[key]++
 	r.admitSourcePublicationLocked(coordinate)
+	state := &negativeNamePublication{owner: r, reply: replyPublicationFromContext(ctx), coordinate: coordinate}
+	publication.negativeState = state
+	if r.publishingNegativeNames[coordinate] == nil {
+		r.publishingNegativeNames[coordinate] = make(map[*negativeNamePublication]struct{})
+	}
+	r.publishingNegativeNames[coordinate][state] = struct{}{}
 	return r.entryTimeout, publication, true
 }
 
@@ -751,9 +785,21 @@ func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublica
 	}
 	if successful {
 		if publication.negative {
-			r.bindCachedNegativeLocked(publication.key)
+			// A materializing callback may have superseded this mount's absence
+			// before the kernel returned the lookup's merged receipt. Settling still
+			// releases publication ownership, but must not resurrect the negative.
+			if publication.negativeState == nil || !publication.negativeState.superseded {
+				r.bindCachedNegativeLocked(publication.key)
+			}
 		} else {
 			r.bindCachedNameLocked(publication.key, publication.stable, publication.record)
+		}
+	}
+	if publication.negativeState != nil {
+		states := r.publishingNegativeNames[publication.negativeState.coordinate]
+		delete(states, publication.negativeState)
+		if len(states) == 0 {
+			delete(r.publishingNegativeNames, publication.negativeState.coordinate)
 		}
 	}
 	if r.publishingNames[publication.key]--; r.publishingNames[publication.key] <= 0 {
@@ -810,6 +856,7 @@ func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *rep
 		return fmt.Errorf("fusev3: FUSE request identity %d registered publication twice", unique)
 	}
 	publication.requestUnique = unique
+	publication.owner = r
 	publication.originalDone = make(chan struct{})
 	r.replyPublications[unique] = publication
 	return nil
@@ -902,6 +949,10 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	publication.originalWrote = true
 	publication.originalStatus = status
 	close(publication.originalDone)
+	// A same-mount source gate may be waiting for exactly this physical edge:
+	// once a negative reply is in the kernel's hands, its enclosing mutation may
+	// supersede it even though the merged post-VFS receipt is still outstanding.
+	r.signalSourceChangedLocked()
 	if !status.Ok() {
 		delete(r.replyPublications, unique)
 		if publication.publishUnique != 0 && r.publishAcks[publication.publishUnique] == publication {
