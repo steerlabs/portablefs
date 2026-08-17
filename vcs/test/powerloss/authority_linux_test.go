@@ -35,7 +35,7 @@ func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 	authority := cell.startAuthority(t, "power-cut")
 	mount, mountpoint := cell.startMount(t, "power-cut", "access-0.token")
 
-	ledgerPath := filepath.Join(gate.workDir, "ledger.json")
+	ledgerPath := filepath.Join(cell.ledgerDir, "ledger.json")
 	driver := cell.runDriver(t, mountpoint, ledgerPath, InstrumentDevice, playground.device.Mark,
 		"--prefix", "power-cut",
 		"--checkpoints", fmt.Sprint(gate.checkpoints),
@@ -126,7 +126,7 @@ func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay
 	t.Helper()
 	authority := cell.startAuthority(t, fmt.Sprintf("kill-%d", round))
 	mount, mountpoint := cell.startMount(t, fmt.Sprintf("kill-%d", round), fmt.Sprintf("access-%d.token", 1+2*round))
-	ledgerPath := filepath.Join(gate.workDir, fmt.Sprintf("process-ledger-%d.json", round))
+	ledgerPath := filepath.Join(cell.ledgerDir, fmt.Sprintf("process-ledger-%d.json", round))
 	driver := cell.runDriver(t, mountpoint, ledgerPath, InstrumentProcess, nil,
 		// Every round writes into its own subtree: checkpoint files are
 		// write-once, and a round that collided with the previous one would

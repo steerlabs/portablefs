@@ -37,6 +37,7 @@ type cell struct {
 	home       string // the service identity's scratch directory
 	staging    string // the write-staging bind mount the authority is given
 	logDir     string
+	ledgerDir  string // where the unprivileged driver writes its ledgers
 }
 
 // provisionCell runs the production provisioner over an already-mounted XFS
@@ -55,8 +56,9 @@ func provisionCell(t *testing.T, gate authorityGate, mountpoint string) *cell {
 		home:       filepath.Join(gate.workDir, "service"),
 		staging:    filepath.Join(gate.workDir, "service", "write-staging"),
 		logDir:     filepath.Join(gate.workDir, "logs"),
+		ledgerDir:  filepath.Join(gate.workDir, "ledgers"),
 	}
-	for _, directory := range []string{c.home, c.staging, c.logDir, filepath.Join(c.home, "tmp")} {
+	for _, directory := range []string{c.home, c.staging, c.logDir, c.ledgerDir, filepath.Join(c.home, "tmp")} {
 		if err := os.MkdirAll(directory, 0o700); err != nil {
 			t.Fatalf("creating %s: %v", directory, err)
 		}
