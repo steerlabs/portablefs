@@ -1805,7 +1805,7 @@ func TestIdempotentWritePhaseSkipsDefensiveRequestClone(t *testing.T) {
 	}
 
 	owned := newDataRequest(2)
-	response, consumption, err := client.CallIdempotentOwnedRetained(context.Background(), owned, func(error) {})
+	response, consumption, err := client.CallIdempotentRetained(context.Background(), owned, func(error) {})
 	if err != nil || response == nil || consumption == nil {
 		t.Fatalf("owned retained call = (%v, %T, %v)", response, consumption, err)
 	}

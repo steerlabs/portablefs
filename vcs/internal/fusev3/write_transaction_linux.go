@@ -98,7 +98,7 @@ func (r *rawFileSystem) writeTransactionCall(ctx context.Context, request *autho
 	if commit {
 		return r.mount.callMutation(ctx, request)
 	}
-	response, consumption, err := r.mount.rpc.CallIdempotentOwnedRetained(
+	response, consumption, err := r.mount.rpc.CallIdempotentRetained(
 		ctx, request, r.mount.forceTerminalResponseRevocation,
 	)
 	if consumption != nil {

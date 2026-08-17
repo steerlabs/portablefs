@@ -54,7 +54,6 @@ type v3DataPlaneClient interface {
 	CallReadRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 	CallIdempotent(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallIdempotentRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
-	CallIdempotentOwnedRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 	CallMutationWithIdentity(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
 	CallMutationWithIdentityRetained(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 }

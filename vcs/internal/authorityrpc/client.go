@@ -1439,18 +1439,12 @@ func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Reques
 	return c.Call(ctx, request)
 }
 
-// CallIdempotentOwned is CallIdempotent under the name PortableFS's staged
-// write path already uses. Request ownership is no longer a per-method
-// distinction — Call transfers it on every path — so the bounded BEGIN, DATA
-// and ABORT phases need no separate entry point, and this stays a name rather
-// than a second code path. COMMIT still uses the replay-slot mutation API.
-func (c *Client) CallIdempotentOwned(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	return c.CallIdempotent(ctx, request)
-}
-
 // CallIdempotentRetained is the staged-write counterpart to
 // CallReadRetained. BEGIN/DATA/ABORT are transport-idempotent but their kernel
 // callback still owns any terminal response until its physical reply write.
+// A parsed response remains retained until the frontend physically exposes the
+// corresponding ordinary reply (or revokes that serving boundary). COMMIT
+// still uses the replay-slot mutation API.
 func (c *Client) CallIdempotentRetained(
 	ctx context.Context,
 	request *authoritypb.Request,
@@ -1458,20 +1452,6 @@ func (c *Client) CallIdempotentRetained(
 ) (*authoritypb.Response, ResponseConsumption, error) {
 	return c.callRetained(force, func() (*authoritypb.Response, error) {
 		return c.CallIdempotent(ctx, request)
-	})
-}
-
-// CallIdempotentOwnedRetained combines the staged write path with the exact
-// response-consumption boundary. A parsed response remains retained until the
-// frontend physically exposes the corresponding ordinary reply (or revokes that
-// serving boundary).
-func (c *Client) CallIdempotentOwnedRetained(
-	ctx context.Context,
-	request *authoritypb.Request,
-	force func(error),
-) (*authoritypb.Response, ResponseConsumption, error) {
-	return c.callRetained(force, func() (*authoritypb.Response, error) {
-		return c.CallIdempotentOwned(ctx, request)
 	})
 }
 

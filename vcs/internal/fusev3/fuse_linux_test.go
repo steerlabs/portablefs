@@ -174,14 +174,6 @@ func (f *fakeRPC) CallIdempotentRetained(
 	return response, consumption, err
 }
 
-func (f *fakeRPC) CallIdempotentOwnedRetained(
-	ctx context.Context,
-	request *authoritypb.Request,
-	force func(error),
-) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
-	return f.CallIdempotentRetained(ctx, request, force)
-}
-
 func (f *fakeRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	return f.CallMutationWithIdentity(ctx, request, nil)
 }

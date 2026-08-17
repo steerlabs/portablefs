@@ -146,13 +146,6 @@ func (f *fakeV3DataClient) CallIdempotentRetained(
 	}
 	return response, &fakeV3ResponseConsumption{consume: func() {}}, nil
 }
-func (f *fakeV3DataClient) CallIdempotentOwnedRetained(
-	ctx context.Context,
-	request *authoritypb.Request,
-	force func(error),
-) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
-	return f.CallIdempotentRetained(ctx, request, force)
-}
 func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request *authoritypb.Request, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
 	f.mu.Lock()
 	f.sequence++

@@ -210,30 +210,6 @@ func (o *mountOpts) automaticEnrollment(clientIdentity *clientTLSIdentity, volum
 	return client, time.UnixMilli(o.authExpiresAtMs), nil
 }
 
-// perfOptions carries the FUSE mount cache options plus the retired write-back
-// engine's durable state location. There is no write-mode knob because v3 has
-// no write-back: every write is a strict write-through transaction, durable at
-// the authority before it is acknowledged, so there is no local tail a knob
-// could trade against.
-type perfOptions struct {
-	// negativeCache forces the negative dentry cache on; negativeCacheOff
-	// forces it off. Neither (the default) keeps the v8 baseline: on.
-	negativeCache    bool
-	negativeCacheOff bool
-	// writebackDir is the engine's durable state directory, keyed by
-	// (volume, branch) so parked streams recover across mount paths.
-	writebackDir string
-	volumeID     string
-	branch       string
-}
-
-func perfOptionsFromEnv(getenv func(string) string) perfOptions {
-	return perfOptions{
-		negativeCache:    getenv("PORTABLEFS_NEGATIVE_CACHE") == "1",
-		negativeCacheOff: getenv("PORTABLEFS_NEGATIVE_CACHE") == "0",
-	}
-}
-
 // storageDirID names the per-(volume, branch) write-back state directory:
 // stable across mount paths so a parked stream recovers wherever the volume
 // mounts next.
