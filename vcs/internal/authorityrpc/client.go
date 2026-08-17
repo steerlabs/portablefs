@@ -85,6 +85,14 @@ type ClientConfig struct {
 	// than infer absence from the mountpoint alone. A refusal or observation
 	// failure is fail-closed: the durable strict-membership record is preserved.
 	ObservePreKernelMountAbsence PreKernelMountAbsenceObserver
+	// RequireLocalSessionEnforcement keeps the public terminal edge behind the
+	// frontend's bounded local withdrawal. The transport still poisons admission
+	// immediately and exposes SessionEndPending to the one teardown owner, but
+	// SessionDone and SessionError do not become observable until that owner calls
+	// FinishLocalSessionEnforcement. Frontends which enable this must call Finish
+	// on every post-attach exit path, regardless of whether every withdrawal step
+	// succeeded; the separately recorded withdrawal outcome carries that truth.
+	RequireLocalSessionEnforcement bool
 }
 
 // MutationIdentity is the replay identity assigned to one authority mutation.
@@ -191,8 +199,11 @@ type Client struct {
 	fatalMu                sync.Mutex
 	fatalErr               error
 	fatalDone              chan struct{}
+	fatalPendingDone       chan struct{}
 	fatalPending           bool
+	fatalPendingPublished  bool
 	fatalPublished         bool
+	localEnforcementDone   bool
 	fatalDrainTimer        *time.Timer
 	responseConsumptions   map[*responseConsumption]struct{}
 	preMountReleaseMu      sync.Mutex
@@ -211,6 +222,14 @@ type clientSlot struct {
 	// the two counters cannot drift apart.
 	sequence uint64
 }
+
+// clientSessionCacheEntries bounds the TLS 1.3 tickets one client keeps. Every
+// dial this client makes uses the same authority server name, so the cache holds
+// one live entry and the remainder is headroom for the tickets an authority
+// issues alongside it. The cache belongs to the Client rather than to the caller
+// supplied *tls.Config: resumption then can never carry one mount's proven
+// identity into another's handshake.
+const clientSessionCacheEntries = 8
 
 func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if cfg.Address == "" || cfg.TLS == nil || cfg.VolumeID == "" || len(cfg.AccessToken) == 0 ||
@@ -238,6 +257,7 @@ func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	cfg.TLS = cfg.TLS.Clone()
 	cfg.TLS.MinVersion = tls.VersionTLS13
 	cfg.TLS.NextProtos = []string{protocolALPN}
+	cfg.TLS.ClientSessionCache = tls.NewLRUClientSessionCache(clientSessionCacheEntries)
 	ordinaryLimit, blockingLimit := blockingWaitLane(cfg.MaxInFlight)
 	if cfg.CachedNameCapacity == 0 || cfg.RepairBudget <= 0 {
 		return nil, errors.New("authorityrpc: strict coherence requires a declared kernel-cache capacity and repair budget")
@@ -248,7 +268,7 @@ func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	slots := make([]clientSlot, cfg.ReplaySlots)
 	split := cfg.ReplaySlots - uint32(blockingLimit)
 	c := &Client{
-		cfg: cfg, fatalDone: make(chan struct{}),
+		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 		data:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:    newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
 		ordinary:   lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
@@ -681,6 +701,12 @@ func (c *Client) ReauthorizeWithCertificate(ctx context.Context, token []byte, s
 	}
 	c.lifecycle.Lock()
 	c.cfg.TLS.Certificates = []tls.Certificate{*replacement}
+	// A resumed TLS session carries the identity proven in the full handshake
+	// that minted its ticket, so tickets held from the retired certificate would
+	// keep authenticating later transports as the retired identity. Drop them
+	// with the rotation: the renewed certificate is the only identity a future
+	// resume may present.
+	c.cfg.TLS.ClientSessionCache = tls.NewLRUClientSessionCache(clientSessionCacheEntries)
 	c.lifecycle.Unlock()
 	return deadline, nil
 }
@@ -1001,6 +1027,10 @@ func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
 			releaseErr = fmt.Errorf("authorityrpc: detach ACTIVE session before kernel mount: %w", err)
 		}
 	}
+	// No kernel source was installed. The attempt-scoped observation above is
+	// the local enforcement pass for this lifecycle, including when it failed
+	// and the durable authority membership therefore has to remain fenced.
+	c.FinishLocalSessionEnforcement()
 	releaseErr = errors.Join(releaseErr, c.Close())
 	c.preMountReleaseMu.Lock()
 	c.preMountReleaseErr = releaseErr
@@ -1014,14 +1044,46 @@ func (c *Client) ReleaseBeforeMount(ctx context.Context) error {
 // recovery, the authority epoch changed, an exact outcome became uncertain, or
 // the client was closed. A terminal edge poisons new admission immediately,
 // but its public signal waits for every already-parsed retained response to
-// cross the frontend's physical publication boundary. SessionError returns the
-// terminal cause as soon as it is known, including during that bounded drain.
+// cross the frontend's physical publication boundary. When the frontend opted
+// into local enforcement, the public signal also waits for its bounded kernel
+// withdrawal to finish. SessionError becomes observable at the same boundary.
 func (c *Client) SessionDone() <-chan struct{} { return c.fatalDone }
 
 func (c *Client) SessionError() error {
 	c.fatalMu.Lock()
 	defer c.fatalMu.Unlock()
+	if c.cfg.RequireLocalSessionEnforcement && !c.fatalPublished {
+		return nil
+	}
 	return c.fatalErr
+}
+
+// SessionEndPending is the private terminal edge for the local frontend owner.
+// It closes after retained-response publication has either completed or been
+// forcibly revoked, but before SessionDone when local enforcement is required.
+// Status and orchestration consumers must use SessionDone instead: only that
+// edge certifies that the frontend has finished withdrawing local serving state.
+func (c *Client) SessionEndPending() <-chan struct{} { return c.fatalPendingDone }
+
+// SessionEndCause returns the cause to the local teardown owner before the
+// public terminal edge. Other consumers must read SessionError after SessionDone.
+func (c *Client) SessionEndCause() error {
+	c.fatalMu.Lock()
+	defer c.fatalMu.Unlock()
+	return c.fatalErr
+}
+
+// FinishLocalSessionEnforcement releases an opted-in public terminal edge after
+// the frontend's bounded local withdrawal has run. Completion means every step
+// was attempted within its budget, not that every step succeeded; callers keep
+// the detailed outcome separately and must call this even on withdrawal errors.
+func (c *Client) FinishLocalSessionEnforcement() {
+	c.fatalMu.Lock()
+	c.localEnforcementDone = true
+	if c.fatalPendingPublished && !c.fatalPublished {
+		c.publishSessionEndLocked()
+	}
+	c.fatalMu.Unlock()
 }
 
 func (c *Client) signalSessionEnd(err error) {
@@ -1039,7 +1101,7 @@ func (c *Client) signalSessionEnd(err error) {
 	}
 	c.fatalPending = true
 	if len(c.responseConsumptions) == 0 {
-		c.publishSessionEndLocked()
+		c.publishSessionEndPendingLocked()
 		c.fatalMu.Unlock()
 		return
 	}
@@ -1081,8 +1143,8 @@ func (c *Client) beginResponseConsumption(force func(error)) (*responseConsumpti
 func (c *Client) finishResponseConsumption(receipt *responseConsumption) {
 	c.fatalMu.Lock()
 	delete(c.responseConsumptions, receipt)
-	if c.fatalPending && !c.fatalPublished && len(c.responseConsumptions) == 0 {
-		c.publishSessionEndLocked()
+	if c.fatalPending && !c.fatalPendingPublished && len(c.responseConsumptions) == 0 {
+		c.publishSessionEndPendingLocked()
 	}
 	c.fatalMu.Unlock()
 }
@@ -1186,6 +1248,21 @@ func (c *Client) publishSessionEndLocked() {
 	close(c.fatalDone)
 }
 
+func (c *Client) publishSessionEndPendingLocked() {
+	if c.fatalPendingPublished {
+		return
+	}
+	c.fatalPendingPublished = true
+	if c.fatalDrainTimer != nil {
+		c.fatalDrainTimer.Stop()
+		c.fatalDrainTimer = nil
+	}
+	close(c.fatalPendingDone)
+	if !c.cfg.RequireLocalSessionEnforcement || c.localEnforcementDone {
+		c.publishSessionEndLocked()
+	}
+}
+
 // forceResponseConsumptionDrain is the bounded fail-closed escape for a
 // frontend which received an exact authority response but never completed its
 // local publication handshake. Every retained caller supplies a synchronous
@@ -1194,7 +1271,7 @@ func (c *Client) publishSessionEndLocked() {
 // begins teardown.
 func (c *Client) forceResponseConsumptionDrain() {
 	c.fatalMu.Lock()
-	if !c.fatalPending || c.fatalPublished || len(c.responseConsumptions) == 0 {
+	if !c.fatalPending || c.fatalPendingPublished || len(c.responseConsumptions) == 0 {
 		c.fatalDrainTimer = nil
 		c.fatalMu.Unlock()
 		return
@@ -1211,8 +1288,8 @@ func (c *Client) forceResponseConsumptionDrain() {
 	}
 
 	c.fatalMu.Lock()
-	if c.fatalPending && !c.fatalPublished {
-		c.publishSessionEndLocked()
+	if c.fatalPending && !c.fatalPendingPublished {
+		c.publishSessionEndPendingLocked()
 	}
 	c.fatalMu.Unlock()
 }
@@ -1231,20 +1308,32 @@ func (c *Client) laneFor(request *authoritypb.Request) *lane {
 	return &c.ordinary
 }
 
-// Call submits one request under this client's admission bounds. Mutations
-// must go through CallMutation, which owns the replay identity.
+// Call submits one request under this client's admission bounds and takes
+// ownership of it for the duration of the call: the physical envelope
+// (request_id, epoch, session) is stamped in place, and stamped again if the
+// same body is replayed after a same-epoch reconnect. The caller must not read
+// or mutate request concurrently, and must not reuse the value afterwards
+// except by handing it back to another call. Mutations must go through
+// CallMutation, which owns the replay identity.
+//
+// Ownership is the contract on every path here because it is the one every
+// caller already satisfies: each constructs a request for one synchronous call
+// and drops it. Copying that request first isolated nothing and made a maximal
+// write pay for a second megabyte.
 func (c *Client) Call(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	admitted, err := c.admitCall(ctx, request)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { <-admitted.permits }()
-	return c.dispatch(ctx, request)
+	return c.dispatchOwned(ctx, request)
 }
 
-// admitCall is the single shape and concurrency boundary for clone-safe and
-// caller-owned non-mutation requests. Mutation calls have their own replay-slot
-// admission because the permit and slot lifetime are intentionally coupled.
+// admitCall is the single shape and concurrency boundary for non-mutation
+// requests. Keeping it ahead of dispatch means a canceled caller never stamps or
+// serializes a request it did not submit. Mutation calls have their own
+// replay-slot admission because the permit and slot lifetime are intentionally
+// coupled.
 func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*lane, error) {
 	if request == nil || request.GetHello() != nil || request.GetAttach() != nil || request.GetResume() != nil ||
 		request.GetActivate() != nil || request.GetAbortAttach() != nil || request.GetCancel() != nil {
@@ -1262,17 +1351,12 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 	return admitted, nil
 }
 
-// dispatch performs one round trip. Admission is the caller's responsibility so
-// that a replay slot is never taken before the permit that bounds it.
-func (c *Client) dispatch(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	request = protoCloneRequest(request)
-	return c.dispatchOwned(ctx, request)
-}
-
-// dispatchOwned stamps and sends a request the client already owns. Mutation
-// dispatch assigns its replay identity once and may need to
-// resend those exact bytes after a same-epoch reconnect; cloning again for each
-// attempt only duplicated large write payloads without adding isolation.
+// dispatchOwned performs one round trip, stamping and sending a request the
+// client owns. Admission is the caller's responsibility so that a replay slot is
+// never taken before the permit that bounds it. Mutation dispatch assigns its
+// replay identity once and may need to resend those exact bytes after a
+// same-epoch reconnect; copying for each attempt only duplicated large write
+// payloads without adding isolation.
 func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	role, err := roleForRequest(request)
 	if err != nil {
@@ -1303,7 +1387,7 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 		terminal := c.poisoned.Load()
 		transport.pendingMu.Unlock()
 		if terminal {
-			if err := c.SessionError(); err != nil {
+			if err := c.SessionEndCause(); err != nil {
 				return nil, err
 			}
 			return nil, ErrSessionEnded
@@ -1417,53 +1501,12 @@ func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Reques
 	return c.Call(ctx, request)
 }
 
-// CallIdempotentOwned is the clone-free variant of CallIdempotent for a caller
-// which transfers exclusive ownership of request for the duration of the call.
-// The client stamps the physical request envelope in place and may stamp it
-// again when replaying the same idempotent body after a same-epoch reconnect.
-// The caller must not inspect or mutate request concurrently.
-//
-// This deliberately remains separate from CallIdempotent: ordinary reads may
-// share request values with their caller and keep the defensive-copy contract.
-// PortableFS uses the owned path only for the bounded BEGIN, DATA, and ABORT
-// phases of one staged write transaction. COMMIT still uses the replay-slot
-// mutation API.
-func (c *Client) CallIdempotentOwned(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	if c.poisoned.Load() {
-		return nil, ErrTransportUncertain
-	}
-	response, err := c.callOwned(ctx, request)
-	if !errors.Is(err, ErrTransportUncertain) {
-		return response, err
-	}
-	role, roleErr := roleForRequest(request)
-	if roleErr != nil {
-		return nil, syscall.EINVAL
-	}
-	if err := c.reconnectTransport(ctx, role); err != nil {
-		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
-			c.signalSessionEnd(err)
-		}
-		return nil, err
-	}
-	return c.callOwned(ctx, request)
-}
-
-// callOwned applies the same admission and request-shape checks as Call but
-// sends the caller-owned protobuf directly. Keeping admission here means a
-// canceled caller does not stamp or serialize a request it never submitted.
-func (c *Client) callOwned(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-	admitted, err := c.admitCall(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { <-admitted.permits }()
-	return c.dispatchOwned(ctx, request)
-}
-
 // CallIdempotentRetained is the staged-write counterpart to
 // CallReadRetained. BEGIN/DATA/ABORT are transport-idempotent but their kernel
 // callback still owns any terminal response until its physical reply write.
+// A parsed response remains retained until the frontend physically exposes the
+// corresponding ordinary reply (or revokes that serving boundary). COMMIT
+// still uses the replay-slot mutation API.
 func (c *Client) CallIdempotentRetained(
 	ctx context.Context,
 	request *authoritypb.Request,
@@ -1471,20 +1514,6 @@ func (c *Client) CallIdempotentRetained(
 ) (*authoritypb.Response, ResponseConsumption, error) {
 	return c.callRetained(force, func() (*authoritypb.Response, error) {
 		return c.CallIdempotent(ctx, request)
-	})
-}
-
-// CallIdempotentOwnedRetained combines the caller-owned, clone-free staged
-// write path with the exact response-consumption boundary. A parsed response
-// remains retained until the frontend physically exposes the corresponding
-// ordinary reply (or revokes that serving boundary).
-func (c *Client) CallIdempotentOwnedRetained(
-	ctx context.Context,
-	request *authoritypb.Request,
-	force func(error),
-) (*authoritypb.Response, ResponseConsumption, error) {
-	return c.callRetained(force, func() (*authoritypb.Response, error) {
-		return c.CallIdempotentOwned(ctx, request)
 	})
 }
 
@@ -1755,9 +1784,6 @@ func (c *Client) closeTransports() error {
 	return first
 }
 
-func protoCloneRequest(request *authoritypb.Request) *authoritypb.Request {
-	return proto.Clone(request).(*authoritypb.Request)
-}
 func cloneProof(proof *authoritypb.SessionProof) *authoritypb.SessionProof {
 	if proof == nil {
 		return nil

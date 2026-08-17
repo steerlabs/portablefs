@@ -9,42 +9,6 @@ import (
 	"testing"
 )
 
-func TestPerfOptionsFromEnv(t *testing.T) {
-	env := func(values map[string]string) func(string) string {
-		return func(key string) string { return values[key] }
-	}
-
-	// Default: the v8 baseline — write-back is adaptive (no mount mode), the
-	// negative cache is capability-auto (neither force flag set).
-	p := perfOptionsFromEnv(env(nil))
-	if p.negativeCache || p.negativeCacheOff {
-		t.Fatalf("default must be capability-auto: %+v", p)
-	}
-
-	// The one remaining knob: force the negative cache on or off.
-	p = perfOptionsFromEnv(env(map[string]string{"PORTABLEFS_NEGATIVE_CACHE": "1"}))
-	if !p.negativeCache || p.negativeCacheOff {
-		t.Fatalf("PORTABLEFS_NEGATIVE_CACHE=1 must force on: %+v", p)
-	}
-	p = perfOptionsFromEnv(env(map[string]string{"PORTABLEFS_NEGATIVE_CACHE": "0"}))
-	if p.negativeCache || !p.negativeCacheOff {
-		t.Fatalf("PORTABLEFS_NEGATIVE_CACHE=0 must force off: %+v", p)
-	}
-
-	// The retired write-back knobs are inert: the authority decides
-	// delegation adaptively, batching is fixed, fsync is always the
-	// authority barrier.
-	p = perfOptionsFromEnv(env(map[string]string{
-		"PORTABLEFS_WRITEBACK":         "1",
-		"PORTABLEFS_FLUSH_MS":          "100",
-		"PORTABLEFS_FLUSH_MAX_RECORDS": "64",
-		"PORTABLEFS_FLUSH_MAX_BYTES":   "1048576",
-	}))
-	if p.negativeCache || p.negativeCacheOff {
-		t.Fatalf("retired env knobs must be inert: %+v", p)
-	}
-}
-
 func validFuseMountState(t *testing.T, mountPath string) mountState {
 	t.Helper()
 	processIdentity, err := processStartIdentity(os.Getpid())

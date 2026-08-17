@@ -117,7 +117,7 @@ func validV3WriteCommit(tx v3WriteTransaction, response *authoritypb.Response) e
 }
 
 func (d *v3DataPlane) callWriteInert(ctx context.Context, operationID uint64, request *authoritypb.Request, want uint32) (*authoritypb.Response, int32) {
-	response, consumption, callErr := d.client.CallIdempotentOwnedRetained(ctx, request, func(cause error) {
+	response, consumption, callErr := d.client.CallIdempotentRetained(ctx, request, func(cause error) {
 		d.revokeRetainedResponse(ctx, errors.Join(
 			errors.New("portablefsd: retained authority write phase crossed its frontend delivery bound"),
 			cause,

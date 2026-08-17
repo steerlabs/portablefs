@@ -4,7 +4,30 @@
 
 package fuse
 
+import "fmt"
+
 const useSingleReader = false
+
+// UnmountLazy removes the mount from its namespace without waiting for open
+// references or the serving loops to exit. Unlike a direct MNT_DETACH syscall,
+// the fusermount path is authorized for the unprivileged user that created the
+// mount. A caller that owns connection teardown can therefore make the path
+// unreachable first, then keep using /dev/fuse to withdraw retained state.
+func (ms *Server) UnmountLazy() error {
+	ms.mountMu.Lock()
+	defer ms.mountMu.Unlock()
+	if ms.mountPoint == "" {
+		return nil
+	}
+	if parseFuseFd(ms.mountPoint) >= 0 {
+		return fmt.Errorf("cannot lazy-unmount magic mountpoint %q; use fusermount -u -z on the real mountpoint", ms.mountPoint)
+	}
+	if err := unmountLazy(ms.mountPoint, ms.opts); err != nil {
+		return err
+	}
+	ms.mountPoint = ""
+	return nil
+}
 
 func (ms *Server) write(req *request) Status {
 	if req.outPayloadSize() == 0 {

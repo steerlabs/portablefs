@@ -120,6 +120,37 @@ def next_publication_id(current: int) -> int:
     return value
 
 
+def write_shape(total: int, max_write: int, request_capacity: int) -> str:
+    if total <= 0 or max_write <= 0 or request_capacity <= 0:
+        raise ProtocolError("invalid write size boundary")
+    return ("one-shot" if total <= max_write and total <= request_capacity
+            else "transaction")
+
+
+def buffered_write_plan(total: int, max_write: int, max_pages: int,
+                        page_size: int, first_page_offset: int
+                        ) -> tuple[str, list[int], int]:
+    if (total <= 0 or max_write <= 0 or max_pages <= 0 or page_size <= 0 or
+            first_page_offset < 0 or first_page_offset >= page_size):
+        raise ProtocolError("invalid buffered write geometry")
+    request_capacity = min(max_write,
+                           max_pages * page_size - first_page_offset)
+    shape = write_shape(total, max_write, request_capacity)
+    if shape == "one-shot":
+        return shape, [total], total
+
+    remaining = total
+    offset = first_page_offset
+    fragments: list[int] = []
+    while remaining:
+        capacity = min(max_write, max_pages * page_size - offset)
+        fragment = min(remaining, capacity)
+        fragments.append(fragment)
+        remaining -= fragment
+        offset = (offset + fragment) % page_size
+    return shape, fragments, sum(fragments)
+
+
 def validate_write_reply(reply: WriteReply, txid: int, expected: int) -> str:
     if reply.txid != txid:
         raise ProtocolError("transaction identity mismatch")
@@ -235,7 +266,10 @@ def validate_open(
     if class_bits != expected:
         raise ProtocolError("open class mismatch")
     if regular and inode_class == "shared":
-        if flags != FOPEN_DIRECT_IO | FOPEN_PFS_SHARED:
+        # Under FUSE_PFS_CACHED_DATA the exact dialect retains the page cache.
+        # FOPEN_DIRECT_IO is not merely unused here, it is refused: it would
+        # route reads around the cache the DATA barrier is written against.
+        if flags != FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED:
             raise ProtocolError("shared regular OPEN is not the exact dialect")
     if directory and inode_class == "shared":
         if flags != FOPEN_PFS_SHARED:
@@ -254,8 +288,20 @@ REQUIRED_INIT = {
     "POSIX_LOCKS",
     "FLOCK_LOCKS",
     "PFS_STRICT",
+    # The private bits are one profile revision. A daemon offering an
+    # incomplete set was built against a different contract and must fail INIT
+    # rather than disagree about the open flags or write shape after mount.
+    "PFS_CACHED_DATA",
+    # Single-fragment writes have one request shape only. This third revision
+    # bit prevents an old daemon from interpreting ONE_SHOT as an unknown phase.
+    "PFS_WRITE_ONESHOT",
+    # Retained pages are withdrawn by the ordered DATA publication alone, so
+    # invalidation is explicit; mtime heuristics would both drop a coherent
+    # cache for nothing and put a GETATTR in front of every read.
+    "EXPLICIT_INVAL_DATA",
 }
 FORBIDDEN_INIT = {
+    "AUTO_INVAL_DATA",
     "WRITEBACK_CACHE",
     "DIRECT_IO_MMAP",
     "INODE_DAX",
@@ -333,7 +379,7 @@ def strict_notify(
         not name or b"\0" in name or b"/" in name or name in (b".", b"..")
     ):
         raise ProtocolError("invalid cached-child component")
-    if code == "INVAL_INODE" and (off != -1 or length != 0):
+    if code == "INVAL_INODE" and (off not in (-1, 0) or length != 0):
         raise ProtocolError("partial inode invalidation is unsequenced")
     if code == "INVAL_ENTRY" and flags != 0:
         raise ProtocolError("entry expiry is outside the strict repair shape")
@@ -347,6 +393,8 @@ def strict_notify(
         raise ProtocolError("reverse repair targeted a LOCAL inode")
     if code in ("INVAL_ENTRY", "DELETE") and not inode.is_dir:
         raise ProtocolError("namespace repair parent is not a directory")
+    if code == "INVAL_INODE" and off == 0:
+        inode.withdraw_data()
     if code in ("INVAL_ENTRY", "DELETE") and resident_child is not None:
         if resident_child.pfs_class != "shared":
             raise ProtocolError("namespace repair targeted a LOCAL child")
@@ -388,13 +436,59 @@ class Tx:
 
 
 class Authority:
-    """In-memory authority with inert staging and one locked commit cut."""
+    """In-memory authority with direct one-shots and one locked commit cut."""
 
     def __init__(self, initial: bytes = b"") -> None:
         self.contents = bytearray(initial)
         self.sequence = 0
         self.transactions: dict[int, Tx] = {}
+        self.one_shot_results: dict[
+            tuple[int, int], tuple[tuple[FrozenWrite, bytes], WriteReply]
+        ] = {}
         self.lock = threading.Lock()
+
+    def _apply(self, txid: int, frozen: FrozenWrite,
+               payload: bytes) -> WriteReply:
+        f = frozen
+        with self.lock:
+            assigned = len(self.contents) if f.append else f.position
+            ceiling = min(f.rlimit, f.file_max)
+            if assigned >= ceiling:
+                flag = (
+                    WRITE_REJECTED_RLIMIT
+                    if f.rlimit != U64_MAX and assigned >= f.rlimit
+                    else WRITE_REJECTED
+                )
+                return WriteReply(txid=txid, flags=flag, error=-errno.EFBIG)
+            committed = min(len(payload), ceiling - assigned)
+            end = assigned + committed
+            if end > len(self.contents):
+                self.contents.extend(b"\0" * (end - len(self.contents)))
+            self.contents[assigned:end] = payload[:committed]
+            self.sequence += 1
+            return WriteReply(
+                txid=txid,
+                committed_size=committed,
+                assigned_offset=assigned,
+                post_size=len(self.contents),
+                sequence=self.sequence,
+                flags=WRITE_COMMITTED,
+            )
+
+    def one_shot(self, slot: int, sequence: int, frozen: FrozenWrite,
+                 payload: bytes) -> WriteReply:
+        if frozen.total <= 0 or len(payload) != frozen.total:
+            raise ProtocolError("one-shot payload does not match geometry")
+        identity = (slot, sequence)
+        fingerprint = (frozen, payload)
+        retained = self.one_shot_results.get(identity)
+        if retained is not None:
+            if retained[0] != fingerprint:
+                raise ProtocolError("one-shot replay changed request")
+            return retained[1]
+        reply = self._apply(0, frozen, payload)
+        self.one_shot_results[identity] = (fingerprint, reply)
+        return reply
 
     def begin(self, txid: int, frozen: FrozenWrite) -> WriteReply:
         if txid <= 0 or frozen.total <= 0 or frozen.file_max <= 0:
@@ -438,37 +532,8 @@ class Authority:
             return tx.result
         if tx.aborted or staged_size != len(tx.staged) or not tx.staged:
             raise ProtocolError("COMMIT prefix mismatch")
-        f = tx.frozen
-        with self.lock:
-            assigned = len(self.contents) if f.append else f.position
-            ceiling = min(f.rlimit, f.file_max)
-            if assigned >= ceiling:
-                flag = (
-                    WRITE_REJECTED_RLIMIT
-                    if f.rlimit != U64_MAX and assigned >= f.rlimit
-                    else WRITE_REJECTED
-                )
-                tx.result = WriteReply(
-                    txid=txid,
-                    flags=flag,
-                    error=-errno.EFBIG,
-                )
-                return tx.result
-            committed = min(staged_size, ceiling - assigned)
-            end = assigned + committed
-            if end > len(self.contents):
-                self.contents.extend(b"\0" * (end - len(self.contents)))
-            self.contents[assigned:end] = tx.staged[:committed]
-            self.sequence += 1
-            tx.result = WriteReply(
-                txid=txid,
-                committed_size=committed,
-                assigned_offset=assigned,
-                post_size=len(self.contents),
-                sequence=self.sequence,
-                flags=WRITE_COMMITTED,
-            )
-            return tx.result
+        tx.result = self._apply(txid, tx.frozen, bytes(tx.staged[:staged_size]))
+        return tx.result
 
 
 @dataclasses.dataclass
@@ -494,6 +559,19 @@ class KernelInode:
         self.sequence = sequence
         self.cache_generation += 1  # full data invalidation, even same EOF
         return "applied"
+
+    def withdraw_data(self) -> None:
+        """fuse_pfs_withdraw_data: the revocation primitive.
+
+        A mount that can no longer participate in the barrier drops every
+        retained page so that no read can be answered inside its kernel.  It
+        carries no authority sequence and must not consume one: a dying mount
+        that advanced the ordered size sequence would make a later real
+        publication look like a replay and be discarded.
+        """
+        if self.pfs_class != "shared":
+            raise ProtocolError("withdrawal is a SHARED-only primitive")
+        self.cache_generation += 1
 
 
 class PublicationGate:
@@ -727,7 +805,7 @@ class AbiAndAdmissionTests(unittest.TestCase):
         for malformed in (0, ATTR_PFS_SHARED | ATTR_PFS_LOCAL):
             with self.assertRaises(ProtocolError):
                 classify_attr(malformed)
-        validate_open("shared", FOPEN_DIRECT_IO | FOPEN_PFS_SHARED)
+        validate_open("shared", FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED)
         validate_open("local", FOPEN_KEEP_CACHE | FOPEN_PFS_LOCAL)
         validate_open(
             "shared", FOPEN_PFS_SHARED, regular=False, directory=True
@@ -739,7 +817,7 @@ class AbiAndAdmissionTests(unittest.TestCase):
             directory=True,
         )
         for forbidden in (
-            FOPEN_KEEP_CACHE,
+            FOPEN_DIRECT_IO,
             FOPEN_NONSEEKABLE,
             FOPEN_CACHE_DIR,
             FOPEN_STREAM,
@@ -749,8 +827,13 @@ class AbiAndAdmissionTests(unittest.TestCase):
         ):
             with self.assertRaises(ProtocolError):
                 validate_open(
-                    "shared", FOPEN_DIRECT_IO | FOPEN_PFS_SHARED | forbidden
+                    "shared", FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED | forbidden
                 )
+        # The retired pair is gone entirely: kernel and daemon ship together,
+        # so a handle offered in the old dialect is a version mismatch, not a
+        # compatible peer.
+        with self.assertRaises(ProtocolError):
+            validate_open("shared", FOPEN_DIRECT_IO | FOPEN_PFS_SHARED)
         for forbidden in (FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE):
             with self.assertRaises(ProtocolError):
                 validate_open(
@@ -784,30 +867,54 @@ class AbiAndAdmissionTests(unittest.TestCase):
         self.assertEqual(getdents(True), ["before", "peer-created"])
         self.assertEqual(rpc_count, 2)
 
-    def test_shared_willneed_never_populates_page_cache(self) -> None:
+    def test_shared_willneed_prefetches_into_a_withdrawable_cache(self) -> None:
+        """POSIX_FADV_WILLNEED is admitted again, and stays coherent.
+
+        The advice used to be discarded on a SHARED handle because the page
+        cache had to stay empty.  It now reaches page_cache_ra_unbounded(),
+        which fills folios under mapping->invalidate_lock held shared -- the
+        same lock the ordered DATA publication takes exclusively.  So a
+        prefetched folio is withdrawn by the next DATA publication exactly like
+        one a read(2) installed, and the model asserts that rather than
+        asserting the advice was ignored.
+        """
         authority = bytearray(b"old")
+        inode = KernelInode(size=len(authority))
         cache: bytes | None = None
         read_folio_calls = 0
 
-        def willneed(shared: bool) -> None:
+        def willneed() -> None:
             nonlocal cache, read_folio_calls
-            if shared:
-                return  # advisory success, deliberately no readahead
+            if cache is not None:
+                return
             read_folio_calls += 1
             cache = bytes(authority)
 
-        willneed(True)
-        self.assertIsNone(cache)
-        self.assertEqual(read_folio_calls, 0)
-        authority[:] = b"new"
-        # A later MAP_PRIVATE fault cannot observe an old prefetched folio:
-        # none was admitted through WILLNEED on the SHARED handle.
-        observed = bytes(authority) if cache is None else cache
-        self.assertEqual(observed, b"new")
+        def exact_data(size: int, sequence: int) -> str:
+            # invalidate_inode_pages2() under the exclusive invalidate lock.
+            nonlocal cache
+            outcome = inode.exact_data(size, sequence)
+            if outcome == "applied":
+                cache = None
+            return outcome
 
-        willneed(False)
-        self.assertEqual(cache, b"new")
+        willneed()
+        self.assertEqual(cache, b"old")
         self.assertEqual(read_folio_calls, 1)
+
+        # A same-length peer overwrite still withdraws the prefetched folio:
+        # the publication is ordered by sequence, never by a size delta.
+        authority[:] = b"new"
+        self.assertEqual(exact_data(len(authority), 1), "applied")
+        self.assertIsNone(cache)
+
+        willneed()
+        self.assertEqual(cache, b"new")
+        self.assertEqual(read_folio_calls, 2)
+
+        # A replayed sequence is a no-op and must not drop a valid cache.
+        self.assertEqual(exact_data(len(authority), 1), "duplicate")
+        self.assertEqual(cache, b"new")
 
     def test_lookup_marker_is_result_classified(self) -> None:
         matrix = {
@@ -823,6 +930,43 @@ class AbiAndAdmissionTests(unittest.TestCase):
 
 
 class TransactionTests(unittest.TestCase):
+    def test_size_class_has_exactly_one_shape_at_max_write_boundary(self) -> None:
+        max_write = 1 << 20
+        self.assertEqual(write_shape(1, max_write, max_write), "one-shot")
+        self.assertEqual(write_shape(max_write, max_write, max_write),
+                         "one-shot")
+        self.assertEqual(write_shape(max_write + 1, max_write, max_write),
+                         "transaction")
+
+    def test_buffered_write_larger_than_page_vector_completes_all_fragments(
+            self) -> None:
+        max_write = 1 << 20
+        for first_page_offset in (208, 3184):
+            with self.subTest(first_page_offset=first_page_offset):
+                shape, fragments, completed = buffered_write_plan(
+                    max_write, max_write, 256, 4096, first_page_offset)
+                self.assertEqual(shape, "transaction")
+                self.assertEqual(
+                    fragments,
+                    [max_write - first_page_offset, first_page_offset],
+                )
+                self.assertEqual(completed, max_write)
+
+    def test_one_shot_append_replay_is_exact_and_uses_no_transaction_id(self) -> None:
+        authority = Authority(b"prefix")
+        frozen = FrozenWrite(4, True, 0, U64_MAX, S64_MAX)
+        reply = authority.one_shot(2, 9, frozen, b"data")
+        self.assertEqual(validate_write_reply(reply, 0, WRITE_COMMITTED),
+                         "committed")
+        self.assertEqual((reply.assigned_offset, reply.post_size), (6, 10))
+        self.assertEqual(authority.contents, b"prefixdata")
+        self.assertEqual(authority.transactions, {})
+        self.assertEqual(authority.one_shot(2, 9, frozen, b"data"), reply)
+        self.assertEqual(authority.sequence, 1)
+        self.assertEqual(authority.contents, b"prefixdata")
+        with self.assertRaises(ProtocolError):
+            authority.one_shot(2, 9, frozen, b"date")
+
     def test_fragmented_append_is_one_visibility_cut(self) -> None:
         authority = Authority(b"prefix")
         frozen = FrozenWrite(9, True, 0, U64_MAX, S64_MAX)
@@ -990,6 +1134,16 @@ class PublicationAndNotifyTests(unittest.TestCase):
         local_file = KernelInode(size=4096, pfs_class="local")
         local_dir = KernelInode(pfs_class="local", is_dir=True)
 
+        before_withdrawal = shared_file.cache_generation
+        self.assertEqual(
+            strict_notify("INVAL_INODE", shared_file, off=0, length=0),
+            "dispatched",
+        )
+        self.assertEqual(
+            shared_file.cache_generation,
+            before_withdrawal + 1,
+            "the exact (0, 0) revocation shape must withdraw retained data",
+        )
         for off, length in ((0, 4096), (-1, 1), (4096, 0)):
             with self.assertRaises(ProtocolError):
                 strict_notify(
@@ -1080,40 +1234,71 @@ class PublicationAndNotifyTests(unittest.TestCase):
             "peer repair expires the binding but does not synthesize a local unlink",
         )
 
-    def test_shared_splice_reads_never_reuse_page_cache(self) -> None:
+    def test_revocation_withdrawal_drops_pages_without_taking_a_sequence(
+        self,
+    ) -> None:
+        inode = KernelInode(size=6)
+        self.assertEqual(inode.exact_data(6, 4), "applied")
+        before = (inode.size, inode.sequence, inode.cache_generation)
+
+        inode.withdraw_data()
+        self.assertEqual((inode.size, inode.sequence), before[:2])
+        self.assertEqual(inode.cache_generation, before[2] + 1)
+
+        # A publication that was already in flight when the mount revoked is
+        # still installable afterwards, because the withdrawal took no sequence.
+        self.assertEqual(inode.exact_data(6, 5), "applied")
+
+        local = KernelInode(pfs_class="local")
+        with self.assertRaises(ProtocolError):
+            local.withdraw_data()
+
+    def test_shared_splice_reads_reuse_a_barrier_withdrawn_page_cache(
+        self,
+    ) -> None:
+        """filemap_splice_read on a SHARED handle, with exact withdrawal.
+
+        The splice used to be forced through copy_splice_read so a SHARED
+        handle could neither populate nor consume the page cache.  It now uses
+        the ordinary filemap path: reuse is what the retained cache is for, and
+        the same ordered DATA publication that withdraws a read(2) folio
+        withdraws a spliced one, because both live in the one mapping the
+        publication invalidates.
+
+        The payload lengths are deliberately equal across the overwrite.  A
+        withdrawal driven by an EOF delta would do nothing here; only the
+        sequence-ordered whole-mapping invalidation is enough.
+        """
         authority = {"contents": b"before", "fuse_reads": 0}
         cached: bytes | None = None
+        inode = KernelInode(size=len(authority["contents"]))
 
-        def splice_read(shared: bool) -> bytes:
+        def splice_read() -> bytes:
             nonlocal cached
-            if shared:
-                authority["fuse_reads"] += 1
-                return authority["contents"]
             if cached is None:
                 authority["fuse_reads"] += 1
                 cached = authority["contents"]
             return cached
 
-        self.assertEqual(splice_read(True), b"before")
-        self.assertEqual(splice_read(True), b"before")
-        self.assertEqual(authority["fuse_reads"], 2)
-        self.assertIsNone(cached)
+        def exact_data(size: int, sequence: int) -> str:
+            nonlocal cached
+            outcome = inode.exact_data(size, sequence)
+            if outcome == "applied":
+                cached = None
+            return outcome
 
-        inode = KernelInode(size=len(authority["contents"]))
+        self.assertEqual(splice_read(), b"before")
+        self.assertEqual(splice_read(), b"before")
+        self.assertEqual(authority["fuse_reads"], 1)
+
         authority["contents"] = b"after!"
-        self.assertEqual(inode.exact_data(len(authority["contents"]), 1),
-                         "applied")
-        self.assertEqual(splice_read(True), b"after!")
-        self.assertEqual(splice_read(True), b"after!")
-        self.assertEqual(authority["fuse_reads"], 4)
+        self.assertEqual(len(authority["contents"]), 6)
+        self.assertEqual(exact_data(len(authority["contents"]), 1), "applied")
         self.assertIsNone(cached)
+        self.assertEqual(splice_read(), b"after!")
+        self.assertEqual(splice_read(), b"after!")
+        self.assertEqual(authority["fuse_reads"], 2)
         self.assertEqual((inode.size, inode.sequence), (6, 1))
-
-        # LOCAL graft handles retain the ordinary cached splice behavior.
-        self.assertEqual(splice_read(False), b"after!")
-        authority["contents"] = b"local-new"
-        self.assertEqual(splice_read(False), b"after!")
-        self.assertEqual(authority["fuse_reads"], 5)
 
     def test_splice_child_scope_publishes_without_finishing_parent(self) -> None:
         parent = {

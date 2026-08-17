@@ -114,6 +114,12 @@ func doInit(server *protocolServer, req *request) {
 	}
 
 	kernelFlags := input.Flags64()
+	const pfsProfileRevision = CAP_PFS_STRICT_COHERENCE | CAP_PFS_CACHED_DATA | CAP_PFS_WRITE_ONESHOT
+	if server.opts.ExtraCapabilities&CAP_PFS_WRITE_ONESHOT != 0 && input.Flags64()&pfsProfileRevision != pfsProfileRevision {
+		log.Printf("kernel does not advertise the exact PortableFS profile revision\n")
+		req.status = EIO
+		return
+	}
 	server.kernelSettings = *input
 	kernelFlags &= (CAP_ASYNC_READ | CAP_BIG_WRITES | CAP_FILE_OPS |
 		CAP_READDIRPLUS | CAP_NO_OPEN_SUPPORT | CAP_PARALLEL_DIROPS | CAP_MAX_PAGES | CAP_RENAME_SWAP | CAP_PASSTHROUGH | CAP_ALLOW_IDMAP |
@@ -156,6 +162,16 @@ func doInit(server *protocolServer, req *request) {
 	}
 	out.setFlags(kernelFlags)
 	if server.opts.MaxReadAhead != 0 && uint32(server.opts.MaxReadAhead) < out.MaxReadAhead {
+		out.MaxReadAhead = uint32(server.opts.MaxReadAhead)
+	}
+	if kernelFlags&CAP_PFS_CACHED_DATA != 0 && server.opts.MaxReadAhead != 0 {
+		// The strict profile negotiates the read-ahead window exactly rather
+		// than clamping the kernel's own request downwards. A SHARED read is
+		// one authority round trip, so the window is what decides how many of
+		// them a sequential reader pays, and it is sized against the same
+		// authority read bound this daemon will honour. The strict kernel
+		// installs this value verbatim instead of taking min() with its
+		// generic VM_READAHEAD_PAGES default.
 		out.MaxReadAhead = uint32(server.opts.MaxReadAhead)
 	}
 	if out.Minor > input.Minor {
@@ -231,7 +247,7 @@ func doPFSWrite(server *protocolServer, req *request) {
 		return
 	}
 	switch in.Phase {
-	case PFS_WRITE_DATA:
+	case PFS_WRITE_DATA, PFS_WRITE_ONE_SHOT:
 		if in.Size == 0 {
 			req.status = EIO
 			return

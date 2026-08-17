@@ -95,10 +95,13 @@ must remount — for these reasons:
 - **Session lease expiry.** Keepalive is a liveness proof; a session that stops
   renewing is reaped along with its locks and handles.
 - **Authorization expiry.** Keepalive cannot extend the signed authorization
-  deadline. A standalone mount must use a new credential and mount again. A
-  hosted live mount may extend its existing session only with the exact next
-  manager-signed `Reauthorize` grant; an expired, broadened, gapped, or changed
-  replay is refused and may fence the session.
+  deadline. Only the exact next signed `Reauthorize` grant for the session
+  extends it, whether a hosted mount obtains it from its manager enrollment or a
+  standalone mount reads it from the rotated `--access-token-file`; an expired,
+  broadened, gapped, or changed replay is refused and may fence the session. A
+  mount that cannot obtain the next grant unmounts itself before the deadline
+  rather than being fenced under load, and must then mount again with a new
+  credential.
 - **Strict participant fencing**, below.
 
 A fenced session never re-establishes itself under the same identity. A zombie
@@ -153,6 +156,66 @@ three steps, strongest first:
 
 Afterwards the mount reports `ENOTCONN`. That is the exact truth: this frontend
 is no longer connected to anything it may speak for.
+
+### The withdrawal escalation ladder
+
+Steps 2 and 3 are not best-effort. `MNT_DETACH` can be refused, and a discarded
+refusal used to leave a dead FUSE mount installed in the namespace: `findmnt`
+still listed `fuse.portablefs`, no mount-absence proof could be produced, and
+the authority's durable strict membership stayed active until an operator
+asserted `--prior-strict-mounts-fenced` by hand.
+
+`Mount.withdrawKernelState` therefore runs a bounded escalation ladder, checking
+every error. Each round detaches, then unconditionally aborts the FUSE
+connection — the abort is what forces the kernel to release the references a
+busy detach could not take back, and it is also the only primitive that unblocks
+a reverse notification parked on a VFS lock — then proves the exact recorded
+mount absent from `/proc/self/mountinfo`. A round that cannot prove absence
+re-issues the detach and repeats, bounded by `withdrawalRounds` and by the
+declared repair budget, because a withdrawal that outlives the budget has
+already lost the race it exists to win.
+
+On success the ordinary `Close` path produces the mount-absence proof and
+delivers `DetachAfterUnmount`, so a self-revoking mount discharges its own
+durable strict membership. On failure nothing is guessed: the outcome records
+that the kernel state was not withdrawn, and the supervisor persists that fact.
+
+### Observing a revocation
+
+Both platforms record the verdict into the mount's state record under
+`~/.local/state/portablefs/mounts/`: `status=revoked`, a machine-readable
+`statusReason`, the engine's own sentence in `statusDetail`, and the transition
+timestamp. The Linux supervisor receives it from the engine through
+`fusev3.Config.OnRevoked`; the macOS supervisor's FSKit revocation watchdog
+(`vcs/cmd/portablefs/internal/cli/fskit_revocation.go`) records it before it
+attempts its forced unmount, because the mount is already revoked whether or not
+the kernel lets go.
+
+The reason vocabulary is shared by both platforms:
+
+| reason | platform | meaning |
+| --- | --- | --- |
+| `session-terminal` | both | the authority session ended permanently |
+| `repair-budget-exceeded` | Linux | a visibility phase outran the declared budget |
+| `routes-changed` | Linux | the volume's route declaration moved under the mount |
+| `coherence-violation` | Linux | the frontend found state it cannot serve coherently |
+| `daemon-unreachable` | macOS | portablefsd stopped answering |
+| `attach-not-owned` | macOS | portablefsd no longer owns this attach |
+| `unclassified` | both | a reason this CLI does not recognize, recorded rather than dropped |
+
+`portablefs mounts` reports `revoked` ahead of every liveness check, and
+`--json` carries `status`, `statusReason`, `statusDetail`,
+`statusChangedAtMs`, and the daemon's `sessionTerminal` verdict. Reporting it
+ahead of liveness is load-bearing: a revoked mount whose withdrawal failed still
+has a running owner process and an installed kernel mount, so every liveness
+check it is subjected to passes. `portablefs doctor` reports the same condition
+under its `attaches` check on both platforms — from portablefsd's attach table
+on macOS, and from the persisted per-mount session state on Linux, which has no
+daemon holding one.
+
+Revocation is terminal and is never downgraded: a later credential verdict
+cannot relabel a mount that refuses to serve as one that merely needs a new
+credential. The remedy is always `portablefs umount` followed by a fresh mount.
 
 ## Coherence poison
 

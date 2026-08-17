@@ -142,12 +142,18 @@ class PatchedSourceTests(unittest.TestCase):
             text.index("static int fuse_notify_inval_inode"):
             text.index("static int fuse_notify_pfs_size")
         ]
-        shape = inode.index(
-            "!outarg.ino || outarg.off != -1 || outarg.len != 0"
+        shape = inode.index("!outarg.ino || outarg.len != 0 ||")
+        self.assertIn(
+            "(outarg.off != -1 && outarg.off != 0)",
+            inode[shape:],
         )
         repair = inode.index("fuse_pfs_reverse_inval_inode")
         self.assertLess(shape, repair)
         self.assertIn("fuse_abort_conn(fc)", inode)
+
+        withdrawal = inode_repair.index("if (off == 0 && len == 0)")
+        self.assertLess(withdrawal, inode_repair.index("fuse_reverse_inval_inode"))
+        self.assertIn("fuse_pfs_withdraw_data(target)", inode_repair[withdrawal:])
 
         entry = text[
             text.index("static int fuse_notify_inval_entry"):
@@ -228,7 +234,7 @@ class PatchedSourceTests(unittest.TestCase):
 
     def test_strict_init_forbids_posix_acl_cache_without_publication(self) -> None:
         text = self.source("fs/fuse/inode.c")
-        start = text.index("if (flags & FUSE_PFS_STRICT_COHERENCE)")
+        start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")
         end = text.index("if (arg->minor >= 9", start)
         admission = text[start:end]
         self.assertIn("FUSE_POSIX_ACL", admission)
@@ -251,7 +257,7 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertLess(provisional, exposed)
         self.assertLess(no_export, exposed)
 
-        start = text.index("if (flags & FUSE_PFS_STRICT_COHERENCE)")
+        start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")
         end = text.index("if (arg->minor >= 9", start)
         admission = text[start:end]
         self.assertIn("stack_depth = FILESYSTEM_MAX_STACK_DEPTH", admission)
@@ -388,18 +394,175 @@ class PatchedSourceTests(unittest.TestCase):
         )
         self.assertNotIn("fs_reply_publish_scope_enter_write", frontend)
 
-    def test_shared_splice_read_always_crosses_direct_read_iter(self) -> None:
+    def test_shared_splice_read_uses_the_coherent_page_cache(self) -> None:
         text = self.source("fs/fuse/file.c")
         start = text.index("static ssize_t fuse_splice_read")
         end = text.index("static ssize_t fuse_splice_write", start)
         splice_read = text[start:end]
         shared = splice_read.index("ff->open_flags & FOPEN_PFS_SHARED")
-        direct = splice_read.index("return copy_splice_read", shared)
-        cached = splice_read.index("return filemap_splice_read")
+        cached = splice_read.index("return filemap_splice_read", shared)
         passthrough = splice_read.index("fuse_file_passthrough")
-        self.assertLess(shared, direct)
-        self.assertLess(direct, passthrough)
-        self.assertLess(direct, cached)
+        self.assertLess(shared, cached)
+        self.assertLess(cached, passthrough)
+        # The bounce-buffered splice is gone: a spliced folio is filled under
+        # the same mapping->invalidate_lock as a read(2) folio and withdrawn by
+        # the same ordered DATA publication, so it is exactly as coherent.
+        self.assertNotIn("return copy_splice_read", splice_read)
+
+    def test_shared_regular_open_is_exactly_keep_cache(self) -> None:
+        text = self.source("fs/fuse/file.c")
+        start = text.index("int fuse_pfs_validate_open")
+        end = text.index("struct fuse_file *fuse_file_alloc", start)
+        validate = text[start:end]
+        self.assertIn(
+            "ff->open_flags !=\n\t\t    (FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED)",
+            validate,
+        )
+        # No compatibility branch: the retired direct-I/O pair is not accepted
+        # anywhere, so a daemon built against the old contract fails closed.
+        self.assertNotIn("(FOPEN_DIRECT_IO | FOPEN_PFS_SHARED)", validate)
+
+    def test_shared_reads_are_routed_to_the_cached_path(self) -> None:
+        text = self.source("fs/fuse/file.c")
+        start = text.index("static ssize_t fuse_file_read_iter")
+        end = text.index("static ssize_t fuse_file_write_iter", start)
+        read_iter = text[start:end]
+        shared = read_iter.index("ff->open_flags & FOPEN_PFS_SHARED")
+        cached = read_iter.index("return fuse_cache_read_iter", shared)
+        direct = read_iter.index("return fuse_direct_read_iter")
+        dax = read_iter.index("FUSE_IS_DAX")
+        self.assertLess(shared, cached)
+        self.assertLess(cached, dax)
+        self.assertLess(cached, direct)
+
+        # Writes are routed by FOPEN_PFS_SHARED, never by direct I/O, which is
+        # what makes dropping FOPEN_DIRECT_IO a read-path change only.
+        start = text.index("static ssize_t fuse_file_write_iter")
+        end = text.index("static ssize_t fuse_splice_read", start)
+        write_iter = text[start:end]
+        self.assertLess(
+            write_iter.index("ff->open_flags & FOPEN_PFS_SHARED"),
+            write_iter.index("ff->open_flags & FOPEN_DIRECT_IO"),
+        )
+
+        # A cached SHARED read does not revalidate EOF: the ordered DATA
+        # publication installs it, and bumps attr_version so a racing GETATTR
+        # reply cannot roll it back.
+        start = text.index("static ssize_t fuse_cache_read_iter")
+        end = text.index("static void fuse_write_args_fill", start)
+        cache_read = text[start:end]
+        self.assertLess(
+            cache_read.index("ff->open_flags & FOPEN_PFS_SHARED"),
+            cache_read.index("fc->auto_inval_data"),
+        )
+
+    def test_shared_mapping_is_private_read_only_and_never_dirties(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/file.c")
+        start = text.index("static int fuse_file_mmap")
+        end = text.index("static int convert_fuse_file_lock", start)
+        mmap = text[start:end]
+        shared = mmap.index("ff->open_flags & FOPEN_PFS_SHARED")
+        refused = mmap.index("vma->vm_flags & VM_MAYSHARE", shared)
+        generic = mmap.index("return generic_file_mmap(file, vma)", refused)
+        direct = mmap.index("ff->open_flags & FOPEN_DIRECT_IO")
+        self.assertLess(shared, refused)
+        self.assertLess(refused, generic)
+        self.assertLess(generic, direct)
+        self.assertIn("return -ENODEV", mmap[refused:generic])
+
+        # A dirty folio is the one thing invalidate_inode_pages2() cannot
+        # withdraw, so the buffered write paths fail closed instead of
+        # producing one.
+        writepages = text[text.index("static int fuse_writepages("):
+                          text.index("static int fuse_write_begin")]
+        self.assertIn("fc->pfs_strict_coherence", writepages)
+        self.assertIn("fuse_abort_conn(fc)", writepages)
+        write_begin = text[text.index("static int fuse_write_begin"):
+                           text.index("static int fuse_write_end")]
+        self.assertIn("fc->pfs_strict_coherence", write_begin)
+        self.assertIn("fuse_abort_conn(fc)", write_begin)
+
+    def test_exact_data_publication_is_ordered_under_the_invalidate_lock(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/inode.c")
+        start = text.index("int fuse_pfs_update_size_locked")
+        end = text.index("int fuse_pfs_update_size(", start)
+        publish = text[start:end]
+        # Ordering is by sequence only. A same-length overwrite carries a
+        # strictly greater sequence and therefore reaches the invalidation;
+        # nothing short-circuits on an unchanged i_size.
+        self.assertLess(
+            publish.index("sequence < fi->pfs_size_sequence"),
+            publish.index("filemap_invalidate_lock(mapping)"),
+        )
+        self.assertLess(
+            publish.index("filemap_invalidate_lock(mapping)"),
+            publish.index("invalidate_inode_pages2(mapping)"),
+        )
+        self.assertNotIn("size == i_size_read", publish)
+        self.assertLess(
+            publish.index("invalidate_inode_pages2(mapping)"),
+            publish.index("fi->pfs_size_sequence = sequence"),
+        )
+
+    def test_revocation_withdraws_pages_under_the_publication_locks(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/inode.c")
+        start = text.index("int fuse_pfs_withdraw_data")
+        end = text.index("int fuse_pfs_update_source_size", start)
+        withdraw = text[start:end]
+        self.assertIn("fi->pfs_class != FUSE_PFS_CLASS_SHARED", withdraw)
+        self.assertLess(
+            withdraw.index("mutex_lock(&fi->pfs_publish_mutex)"),
+            withdraw.index("filemap_invalidate_lock(mapping)"),
+        )
+        self.assertLess(
+            withdraw.index("filemap_invalidate_lock(mapping)"),
+            withdraw.index("invalidate_inode_pages2(mapping)"),
+        )
+        # A withdrawal carries no authority sequence and must not consume one.
+        self.assertNotIn("pfs_size_sequence", withdraw)
+
+        dev = self.source("fs/fuse/dev.c")
+        start = dev.index("static int fuse_pfs_reverse_inval_inode")
+        end = dev.index("static int fuse_pfs_reverse_inval_entry", start)
+        notify = dev[start:end]
+        self.assertLess(
+            notify.index("off == 0 && len == 0"),
+            notify.index("fuse_pfs_withdraw_data(target)"),
+        )
+        self.assertIn("fuse_reverse_inval_inode(fc, nodeid, off, len)", notify)
+
+    def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
+        text = self.source("fs/fuse/inode.c")
+        start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")
+        end = text.index("if (arg->minor >= 9", start)
+        admission = text[start:end]
+        # Any incomplete three-bit revision is a version mismatch and fails
+        # the mount before the first write can select a different shape.
+        self.assertEqual(admission.count("FUSE_PFS_WRITE_ONESHOT"), 3)
+        self.assertIn("The three private bits are one indivisible", admission)
+        self.assertIn("(flags & FUSE_AUTO_INVAL_DATA)", admission)
+        self.assertIn("!(flags & FUSE_EXPLICIT_INVAL_DATA)", admission)
+        self.assertIn("ok = false", admission)
+
+        send = text[text.index("void fuse_send_init"):]
+        self.assertRegex(
+            send,
+            r"FUSE_PFS_STRICT_COHERENCE \| FUSE_PFS_CACHED_DATA \|\s+"
+            r"FUSE_PFS_WRITE_ONESHOT",
+        )
+
+        # The negotiated read-ahead window is taken exactly rather than clamped
+        # to the generic default: it is what bounds how many authority round
+        # trips a sequential reader pays.
+        init_reply = text[text.index("static void process_init_reply"):
+                          text.index("void fuse_send_init")]
+        self.assertIn("fm->sb->s_bdi->ra_pages = ra_pages;", init_reply)
 
     def test_shared_opendir_forbids_persistent_directory_cache(self) -> None:
         text = self.source("fs/fuse/file.c")
@@ -415,29 +578,24 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("ff->open_flags & FOPEN_CACHE_DIR", frontend)
         self.assertIn("fuse_readdir_uncached", frontend)
 
-    def test_shared_willneed_cannot_enter_address_space_readahead(self) -> None:
+    def test_willneed_prefetch_is_admitted_again(self) -> None:
         text = self.source("fs/fuse/file.c")
-        start = text.index("static int fuse_file_fadvise")
-        end = text.index("static const struct file_operations", start)
-        fadvise = text[start:end]
-        shared = fadvise.index("ff->open_flags & FOPEN_PFS_SHARED")
-        willneed = fadvise.index("advice == POSIX_FADV_WILLNEED", shared)
-        generic = fadvise.index("return generic_fadvise", willneed)
-        self.assertLess(shared, willneed)
-        self.assertLess(willneed, generic)
-        self.assertIn("return len < 0 ? -EINVAL : 0", fadvise)
-
+        # The override existed only to keep a direct-I/O SHARED handle's page
+        # cache empty. Prefetch now reaches page_cache_ra_unbounded(), which
+        # fills under mapping->invalidate_lock held shared, so it is withdrawn
+        # by the ordered DATA publication like any other folio.
+        self.assertNotIn("static int fuse_file_fadvise", text)
         operations = text[text.index("static const struct file_operations"):]
-        self.assertIn(".fadvise\t= fuse_file_fadvise", operations)
+        self.assertNotIn(".fadvise\t=", operations)
 
     def test_zero_byte_postapply_publishes_attrs_without_byte_progress(self) -> None:
         text = self.source("fs/fuse/file.c")
-        write = text[text.index("static ssize_t fuse_pfs_write_transaction"):
-                     text.index("static ssize_t fuse_file_read_iter")]
-        self.assertIn("!out.committed_size &&", write)
-        self.assertIn("out.assigned_offset", write)
-        self.assertIn("if (!err && out.committed_size)", write)
-        self.assertIn("if (out.committed_size) {", write)
+        write = text[text.index("static ssize_t fuse_pfs_finish_write"):
+                     text.index("static ssize_t fuse_pfs_write_one_shot")]
+        self.assertIn("!out->committed_size &&", write)
+        self.assertIn("out->assigned_offset", write)
+        self.assertIn("if (!err && out->committed_size)", write)
+        self.assertIn("if (out->committed_size) {", write)
         copy_range = text[text.index("static ssize_t fuse_pfs_copy_file_range"):
                           text.index("static ssize_t fuse_copy_file_range")]
         self.assertIn("!out.result_size &&", copy_range)
@@ -445,6 +603,66 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("return out.result_size ?: out.error", copy_range)
         io_uring = self.source("io_uring/rw.c")
         self.assertIn("if (ret > 0 || has_applied_bytes)", io_uring)
+
+    def test_one_fragment_write_has_one_deterministic_mutating_shape(self) -> None:
+        text = self.source("fs/fuse/file.c")
+        one_shot = text[text.index("static ssize_t fuse_pfs_write_one_shot"):
+                        text.index("static bool fuse_pfs_write_fits_one_shot")]
+        self.assertIn("FUSE_PFS_WRITE_ONE_SHOT", one_shot)
+        self.assertEqual(one_shot.count("fuse_pfs_write_payload_send"), 1)
+        self.assertNotIn("atomic64_inc_return", one_shot)
+        self.assertNotIn("FUSE_PFS_WRITE_BEGIN", one_shot)
+        self.assertNotIn("FUSE_PFS_WRITE_COMMIT", one_shot)
+        self.assertIn(
+            "!extract_err && nbytes != frozen->requested_size", one_shot
+        )
+
+        capacity = text[
+            text.index("static bool fuse_pfs_write_fits_one_shot"):
+            text.index("static ssize_t fuse_pfs_write_transaction")
+        ]
+        self.assertIn("requested > fc->max_write", capacity)
+        self.assertIn("iov_iter_is_kvec(from)", capacity)
+        self.assertIn("iov_iter_single_seg_count(from) == requested", capacity)
+        self.assertIn(
+            "iov_iter_npages(from, fc->max_pages + 1) <= fc->max_pages",
+            capacity,
+        )
+
+        transaction = text[
+            text.index("static ssize_t fuse_pfs_write_transaction"):
+            text.index("static ssize_t fuse_file_read_iter")
+        ]
+        boundary = transaction.index(
+            "if (fuse_pfs_write_fits_one_shot(fc, from, requested))"
+        )
+        txid = transaction.index("atomic64_inc_return(&fc->pfs_write_txid)")
+        self.assertLess(boundary, txid)
+        self.assertIn(
+            "fuse_pfs_write_in_freeze(&frozen, iocb, 0, requested",
+            transaction[:txid],
+        )
+        self.assertIn("FUSE_PFS_WRITE_BEGIN", transaction[txid:])
+        self.assertIn("FUSE_PFS_WRITE_DATA", transaction[txid:])
+        self.assertIn("FUSE_PFS_WRITE_COMMIT", transaction[txid:])
+        self.assertIn("while (iov_iter_count(from))", transaction[txid:])
+        self.assertIn("advanced += nbytes", transaction[txid:])
+
+        payload_args = text[
+            text.index("static void fuse_pfs_write_payload_args"):
+            text.index("static int fuse_pfs_write_payload_send")
+        ]
+        self.assertIn("args->force = true", payload_args)
+        self.assertIn(
+            "args->pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL",
+            payload_args,
+        )
+
+        dev = self.source("fs/fuse/dev.c")
+        marked_start = dev.index("req->in.h.opcode == FUSE_PFS_PUBLISH")
+        marked = dev[marked_start:
+                     dev.index("/* Is it an interrupt reply ID? */", marked_start)]
+        self.assertIn("FUSE_PFS_WRITE_ONE_SHOT", marked)
 
     def test_splice_forces_an_independent_per_iteration_write_scope(self) -> None:
         splice = self.source("fs/splice.c")

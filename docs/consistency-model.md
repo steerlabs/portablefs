@@ -7,7 +7,8 @@ authority addresses. Everything the authority itself holds — sessions, open
 file descriptions, advisory locks, same-epoch replay slots, cancellation state
 — is disposable epoch state. There is no second inode tree, no mutation log, no
 PortableFS-managed or offline write-back cache, and no history. Ordinary kernel
-page caches still exist. The architectural decision behind that is in
+page caches still exist, and on Linux mounts they hold file data — coherently,
+under the same barrier that covers names and attributes. The architectural decision behind that is in
 [xfs-authority-architecture.md](./xfs-authority-architecture.md).
 
 This document states what an application may rely on.
@@ -53,8 +54,11 @@ wire format, not an optional fast path.
 The data-plane acknowledgement and authority application are the same event.
 The application syscall boundary depends on the frontend kernel contract.
 
-- **Linux direct-I/O `write(2)` returns only after authority application.**
-  There is no PortableFS write-back engine or local mutation log.
+- **Linux `write(2)` returns only after authority application.** Writes travel
+  the kernel's strict write transaction, never the page cache: there is no
+  PortableFS write-back engine, no local mutation log, and no dirty page. Reads
+  *are* served from the page cache; see
+  [File data is cached under the same rule](#file-data-is-cached-under-the-same-rule).
 - **In the separately build-stamped macOS qualification policy, macOS may first
   accept bytes into its kernel page cache.** Application
   `write(2)` can return before FSKit submits those bytes. Every FSKit write
@@ -126,7 +130,120 @@ resolves, and never polls or retries. It also proves a red result is reachable
 before reporting a green one. See
 [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md).
 
+### Absent names are cached under the same rule
+
+A name that does not exist is a namespace fact like any other, and a strict
+mount caches it. A failed lookup is answered with the FUSE shape that carries a
+lifetime — a successful reply whose `NodeId` is zero — rather than with `ENOENT`,
+which carries none. This is what stops a repeatedly probing workload paying an
+authority round trip per probe forever: every SQLite transaction stats
+`<db>-journal` and `<db>-wal`, every `git status` misses on directory entries
+that are not there, and every interpreter and linker walks a search path made
+almost entirely of absences.
+
+The lifetime is not what makes this safe, exactly as it is not what makes a
+cached binding safe. A cached absence is admitted through the same registry, the
+same PREPARE-time cut, and the same declared capacity as a cached binding, and
+it is withdrawn by the same barrier:
+
+- The failed lookup is declared to the authority. The read path records the
+  `(parent identity, name)` coordinate of a resolution whether or not the name
+  resolved, so the mount that observed the absence is in the audience of any
+  later mutation that fills it. Nothing in the audience computation distinguishes
+  the two cases.
+- A create, rename, link, or mknod that materialises the name therefore reaches
+  this mount as a namespace target, and the mount expires the cached absence and
+  acknowledges COMPLETE *before* the mutating syscall returns on the machine that
+  made it. The repair primitive is the name-only expiry rather than the
+  exact-child delete: an absence has no child identity to validate, no watcher
+  event is owed for a creation performed elsewhere, and the hazard a name-only
+  expiry carries for a binding — expiring a newer one — cannot arise, because the
+  newer answer is precisely the one the mutation created.
+- When the mutation is this mount's own, the authority delivers it no phase, so
+  the reply that installs the new binding withdraws the absence directly. Self
+  revocation withdraws every cached absence beside every cached binding: leaving
+  a stale "not there" behind is exactly as wrong as leaving a stale binding.
+
+Absences count against the capacity a mount declares at attach, because that
+number is the amount of kernel state the mount promises it can repair and must
+be able to walk while dying. They additionally have a bound of their own inside
+that total: nothing reclaims an absence the way `FORGET` reclaims a binding —
+there is no inode for a name that does not exist, so the kernel never reports
+dropping the dentry — and without a share a probe-heavy workload could spend the
+whole budget on names that are not there. Past either bound the mount keeps
+answering `ENOENT` with a zero lifetime, which costs a lookup and can never be
+wrong.
+
+Names served by a machine-local route are the one exception: their absence is
+not cached, because the file that fills such a name is created in the backing
+tree without this frontend necessarily being asked about it, and no authority
+barrier covers that.
+
+### File data is cached under the same rule
+
+Linux mounts keep file data in the kernel page cache. A `SHARED` regular file is
+opened with exactly `FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED`; the retired
+`FOPEN_DIRECT_IO` pair is refused by the kernel with `-EPROTO`, so there is no
+mode in which a mount serves reads without a page cache.
+
+The guarantee is unchanged and unweakened. After a write returns on mount A, a
+read on mount B returns the new bytes — not eventually, and not after a lifetime
+expires. There is no TTL on file data at all. What enforces it is a lock, not a
+timer:
+
+- **Every page fill holds `mapping->invalidate_lock` shared for the whole
+  authority round trip.** This is true of all of them:
+  `filemap_create_folio` (a `read(2)` miss), `page_cache_ra_unbounded`
+  (read-ahead, including `posix_fadvise(WILLNEED)`), and `filemap_fault`
+  (a `MAP_PRIVATE` fault). Read-ahead completes asynchronously but holds each
+  folio locked until it does.
+- **Every DATA repair takes the same lock exclusively and invalidates the whole
+  mapping.** `FUSE_NOTIFY_PFS_SIZE` carries the exact post-mutation size and the
+  authority visibility sequence; `fuse_pfs_update_size_locked` installs the size,
+  then `truncate_pagecache` and `invalidate_inode_pages2` withdraw every folio,
+  including any that a `MAP_PRIVATE` mapping had faulted into page tables.
+- **The withdrawal is ordered by sequence, never by a size delta.** A
+  same-length overwrite arrives with a strictly greater sequence and invalidates
+  exactly like a grow or a shrink. Only a replayed or already-installed sequence
+  is a no-op, and a conflicting size at the same sequence is a protocol error
+  that fences the mount.
+
+Those two facts partition every read: one that began before the authority
+applied completes and is then withdrawn, and one that begins after the exclusive
+lock is released necessarily fetches post-apply bytes. Because the mutating
+syscall on mount A does not return until every audience mount has acknowledged
+COMPLETE, no reader anywhere can be served pre-write bytes after the write
+returned. A mount that read an inode is in that audience: a `READ` records the
+inode's stable coordinate in the same resolved index a lookup records a name in,
+and a DATA mutation's audience is computed from exactly that coordinate.
+
+Nothing in that cache is ever dirty, which is what makes the withdrawal
+infallible. Writes travel the kernel's strict write transaction rather than the
+page cache; writable shared mappings are refused; write-back caching is refused;
+and `invalidate_inode_pages2` fails only on a dirty folio.
+
+Retained pages are the one cached state a revoked mount cannot bound by
+refusing requests, because a read of a resident folio is answered inside the
+kernel and never becomes a request. Self-revocation therefore drops them
+explicitly: after the namespace detach, the cached-name withdrawal, and the FUSE
+connection abort, the mount issues a whole-inode data withdrawal for every inode
+it declared retainable. The abort is what makes one pass final — no fill can
+succeed on a dead connection — and a withdrawal that fails is reported in the
+revocation verdict rather than presented as a clean teardown. This is the Linux
+answer to the macOS stale-read window recorded in
+[failure-modes.md](./failure-modes.md); it is not reproduced here.
+
 ### macOS
+
+macOS reaches the same rule by a different mechanism, so no separate contract is
+stated for it. The authority-side declaration is shared: the audience for a
+mutation is computed from the same recorded resolutions regardless of which
+frontend observed them. On the repair side, FSKit does not let the adapter
+publish an entry lifetime the way a FUSE reply does, so the macOS frontend does
+not choose to cache an absence — the platform's name cache does — and its repair
+vocabulary carries a negative purge for exactly that case: a namespace target for
+which the mount holds no binding but does hold the parent is discharged by
+purging the negative entry rather than by evicting one.
 
 Shipping macOS 26 builds admit the named
 `macos26-synchronous-vfs-repair-v2` best-effort policy. The Mac owns an
@@ -143,13 +260,22 @@ platform gates are in
 
 ### Shared file-backed mmap is unsupported, not incoherent
 
-PortableFS does not advertise `CAP_DIRECT_IO_ALLOW_MMAP`, so Linux refuses both
-writable and read-only `MAP_SHARED` mappings of a volume file rather than
-creating mapped pages the authority cannot revoke coherently. `MAP_PRIVATE`
-remains available: it is a process-local copy-on-write view that never writes
-through, and POSIX leaves its visibility of later external changes unspecified.
-That is ordinary filesystem behaviour, not a distributed coherence promise.
-See the kernel's
+Linux refuses both writable and read-only `MAP_SHARED` mappings of a volume file
+with `ENODEV`. The reason is no longer that mapped pages cannot be revoked —
+they can, and are — but that a writable shared mapping would produce *dirty*
+pages. A dirty page has not travelled the strict write transaction, so the
+authority never saw it, and it is also the one thing `invalidate_inode_pages2`
+cannot withdraw, which would turn every later DATA repair on that inode into a
+revocation. Read-only `MAP_SHARED` is refused with it because nothing prevents a
+later `mprotect(PROT_WRITE)`.
+
+`MAP_PRIVATE` remains available and is genuinely coherent: it is served from the
+same page cache `read(2)` uses, and the DATA repair unmaps its page-table entries
+along with the folios, so a mapped byte cannot outlive the mutation that replaced
+it. POSIX leaves a private mapping's visibility of later external changes
+unspecified, so this is stronger than required rather than a promise applications
+should depend on for write-through semantics — a private mapping still never
+writes through. See the kernel's
 [FUSE cached/direct/write-back distinction](https://cdn.kernel.org/doc/html/latest/filesystems/fuse/fuse-io.html)
 and the [`MAP_PRIVATE` contract](https://man7.org/linux/man-pages/man2/mmap.2.html).
 

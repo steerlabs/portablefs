@@ -228,7 +228,7 @@ func (v *Volume) Mkdir(parent Capability, name string, mode fs.FileMode) (Capabi
 	if err != nil {
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
-	if err := unix.Fchmodat(fd, "", unixMode, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := v.chmodCapability(fd, KindDirectory, unixMode); err != nil {
 		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}

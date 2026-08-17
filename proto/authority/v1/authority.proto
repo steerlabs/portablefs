@@ -100,6 +100,11 @@ message Request {
     // carries no filesystem authority of its own.
     TerminalDeliveryReceipt terminal_delivery_receipt = 54;
     ApplyRoutesRequest apply_routes = 18;
+    // One shared regular-file write whose complete payload fits in one
+    // negotiated max_write frame. It is a visible mutation in its only shape:
+    // no transaction ID or inert staging phase exists. data is the frame's
+    // exact out-of-line bulk body.
+    OneShotWriteRequest one_shot_write = 55;
   }
 }
 
@@ -197,6 +202,7 @@ message Response {
     CopyFileRangeReply copy_file_range = 40;
     TmpfileReply tmpfile = 41;
     TerminalDeliveryReceiptReply terminal_delivery_receipt = 42;
+    OneShotWriteReply one_shot_write = 44;
   }
 }
 
@@ -778,6 +784,34 @@ message WriteTransactionReply {
   // form requires zero here. Transport/header errors at COMMIT remain
   // ambiguous and fence instead of using this field.
   int32 error = 7;
+}
+
+// OneShotWriteRequest carries the complete payload and syscall geometry for a
+// write no larger than max_write. Its mutation slot/sequence is the sole replay
+// identity; transaction IDs remain reserved for multi-fragment staging.
+message OneShotWriteRequest {
+  bytes handle = 1;
+  uint64 position = 2;
+  // Raw Linux rlim_cur. UINT64_MAX is RLIM_INFINITY and zero is a real limit.
+  uint64 rlimit_fsize = 3;
+  uint64 file_max_size = 4;
+  uint64 lock_owner = 5;
+  uint32 size = 6;
+  uint32 write_flags = 7;
+  // Exact effective per-syscall O_APPEND/O_DSYNC/O_SYNC flags.
+  uint32 flags = 8;
+  bytes data = 9; // transported out of line
+}
+
+// Flags and result semantics are identical to a COMMIT reply. No transaction
+// identity is echoed because this operation never enters the staging ledger.
+message OneShotWriteReply {
+  uint64 committed_size = 1;
+  uint64 assigned_offset = 2;
+  uint64 post_size = 3;
+  uint64 visibility_sequence = 4;
+  uint32 flags = 5;
+  int32 error = 6;
 }
 
 // FallocateRequest mirrors the private pinned-kernel input exactly. mode is a

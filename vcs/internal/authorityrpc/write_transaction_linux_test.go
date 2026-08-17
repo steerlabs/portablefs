@@ -3,20 +3,26 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
+	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 )
 
 type writeTransactionTestTarget struct {
@@ -29,6 +35,11 @@ type writeTransactionTestTarget struct {
 	commitAssigned uint64
 	commitPost     xfsstore.Attr
 	commitErr      error
+	commitSpecs    []xfsstore.WriteCommit
+	directCalls    int
+	directStarted  chan struct{}
+	directRelease  <-chan struct{}
+	directOnce     sync.Once
 }
 
 func (*writeTransactionTestTarget) Coordinate() xfsstore.ObjectCoordinate {
@@ -44,6 +55,27 @@ func (t *writeTransactionTestTarget) CommitWrite(staged io.ReaderAt, spec xfssto
 	defer t.mu.Unlock()
 	t.commitCalls++
 	t.committedData = append(t.committedData, data)
+	t.commitSpecs = append(t.commitSpecs, spec)
+	committed := uint64(len(data))
+	if t.commitSizeSet {
+		committed = t.commitSize
+	}
+	return committed, t.commitAssigned, t.commitPost, t.commitErr
+}
+
+func (t *writeTransactionTestTarget) CommitWriteData(data []byte, spec xfsstore.WriteCommit) (uint64, uint64, xfsstore.Attr, error) {
+	if t.directStarted != nil {
+		t.directOnce.Do(func() { close(t.directStarted) })
+	}
+	if t.directRelease != nil {
+		<-t.directRelease
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.commitCalls++
+	t.directCalls++
+	t.committedData = append(t.committedData, append([]byte(nil), data...))
+	t.commitSpecs = append(t.commitSpecs, spec)
 	committed := uint64(len(data))
 	if t.commitSizeSet {
 		committed = t.commitSize
@@ -81,12 +113,19 @@ func (t *writeTransactionTestTarget) commitSnapshot() (int, [][]byte) {
 	return t.commitCalls, data
 }
 
+func (t *writeTransactionTestTarget) directSnapshot() (int, []xfsstore.WriteCommit) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.directCalls, append([]xfsstore.WriteCommit(nil), t.commitSpecs...)
+}
+
 type writeTransactionTestStore struct {
 	*resourceAdmissionFaultStore
-	mu         sync.Mutex
-	pinErr     error
-	targets    []*writeTransactionTestTarget
-	fenceCalls int
+	mu          sync.Mutex
+	pinErr      error
+	targets     []*writeTransactionTestTarget
+	nextTargets []*writeTransactionTestTarget
+	fenceCalls  int
 }
 
 type writeTransactionTestStage struct {
@@ -180,13 +219,37 @@ func requireWriteTransactionTestBlocked(t *testing.T, result <-chan *authoritypb
 	}
 }
 
+func waitWriteTransactionCapacityQueue(t *testing.T, h *VolumeHandler, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.writeCapacityMu.Lock()
+		got := 0
+		for waiter := h.writeCapacityHead; waiter != nil; waiter = waiter.next {
+			got++
+		}
+		h.writeCapacityMu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("write transaction capacity queue did not reach %d waiters", want)
+}
+
 func (s *writeTransactionTestStore) PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarget, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.pinErr != nil {
 		return nil, s.pinErr
 	}
-	target := &writeTransactionTestTarget{}
+	var target *writeTransactionTestTarget
+	if len(s.nextTargets) != 0 {
+		target = s.nextTargets[0]
+		s.nextTargets = s.nextTargets[1:]
+	} else {
+		target = &writeTransactionTestTarget{}
+	}
 	s.targets = append(s.targets, target)
 	return target, nil
 }
@@ -257,6 +320,172 @@ func newWriteTransactionHarness(t *testing.T, pinErr error) (*VolumeHandler, vol
 		}
 	})
 	return h, credential, store
+}
+
+func TestWriteTransactionStagingUsesSealedMemfd(t *testing.T) {
+	path := t.TempDir()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staging, err := OpenWriteTransactionStaging(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = staging.Close() })
+	stage, err := staging.newFile(4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, ok := stage.(*os.File)
+	if !ok {
+		t.Fatalf("stage type = %T, want *os.File", stage)
+	}
+	fd := int(file.Fd())
+	t.Cleanup(func() { _ = stage.Close() })
+	var statfs unix.Statfs_t
+	if err := unix.Fstatfs(fd, &statfs); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(statfs.Type) != uint64(unix.TMPFS_MAGIC) {
+		t.Fatalf("stage filesystem type = %#x, want tmpfs %#x", statfs.Type, unix.TMPFS_MAGIC)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		t.Fatal(err)
+	}
+	if stat.Nlink != 0 || stat.Size != 4096 {
+		t.Fatalf("memfd stat = nlink %d size %d, want 0/4096", stat.Nlink, stat.Size)
+	}
+	seals, err := unix.FcntlInt(file.Fd(), unix.F_GET_SEALS, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSeals := unix.F_SEAL_GROW | unix.F_SEAL_SHRINK | unix.F_SEAL_SEAL
+	if seals&wantSeals != wantSeals {
+		t.Fatalf("memfd seals = %#x, want at least %#x", seals, wantSeals)
+	}
+	payload := []byte("anonymous")
+	if n, err := stage.WriteAt(payload, 127); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt = (%d, %v)", n, err)
+	}
+	got := make([]byte, len(payload))
+	if n, err := stage.ReadAt(got, 127); err != nil || n != len(got) || !bytes.Equal(got, payload) {
+		t.Fatalf("ReadAt = (%q, %d, %v)", got, n, err)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staging directory contains %d entries, want none", len(entries))
+	}
+}
+
+func referenceWriteTransactionDataFingerprint(t *testing.T, runtime *volumeserver.Authority, request *authoritypb.Request) volumeserver.RequestFingerprint {
+	t.Helper()
+	reference := proto.Clone(request).(*authoritypb.Request)
+	digest := sha256.Sum256(reference.GetWriteTransaction().GetData())
+	reference.GetWriteTransaction().Data = digest[:]
+	fingerprint, err := canonicalFingerprint(runtime, reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fingerprint
+}
+
+func TestWriteTransactionDataFingerprintHashesPayloadOnceAndMatchesReference(t *testing.T) {
+	runtime, err := volumeserver.New("write-data-fingerprint", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &authoritypb.Request{Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+		TransactionId: 7, Handle: bytes.Repeat([]byte{0x42}, 16), RequestedSize: 8,
+		FragmentOffset: 3, Size: 5, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+		Data: []byte("hello"), FileMaxSize: 1 << 20,
+	}}}
+	handler := &VolumeHandler{Runtime: runtime}
+	got, err := writeTransactionFingerprint(handler, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := referenceWriteTransactionDataFingerprint(t, runtime, request); got != want {
+		t.Fatalf("prehashed fingerprint = %x, materialized reference = %x", got, want)
+	}
+
+	digest := sha256.Sum256(request.GetWriteTransaction().GetData())
+	prehashed, err := canonicalFingerprintWithWriteDataDigest(runtime, request, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.GetWriteTransaction().Data = []byte("world")
+	reused, err := canonicalFingerprintWithWriteDataDigest(runtime, request, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prehashed != reused {
+		t.Fatal("canonical traversal re-read DATA after receiving its precomputed digest")
+	}
+	changed, err := writeTransactionFingerprint(handler, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == got {
+		t.Fatal("DATA fingerprint did not cover a changed payload")
+	}
+	request.GetWriteTransaction().FragmentOffset++
+	changedMetadata, err := writeTransactionFingerprint(handler, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedMetadata == changed {
+		t.Fatal("DATA fingerprint did not cover changed canonical metadata")
+	}
+}
+
+func TestWriteTransactionMemfdSweepClosesStageReleasesBudgetAndRetainsTombstone(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	beginAndStageWriteTransaction(t, h, credential, []byte("data"))
+	resources, err := h.writeTransactionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := acquireWriteTransaction(resources, 1)
+	if transaction == nil {
+		t.Fatal("staged transaction is missing")
+	}
+	transaction.mu.Lock()
+	file, ok := transaction.stage.(*os.File)
+	if !ok {
+		t.Fatalf("stage type = %T, want *os.File", transaction.stage)
+	}
+	fd := file.Fd()
+	transaction.progressDeadline = time.Now().Add(-time.Second)
+	transaction.mu.Unlock()
+	transaction.refs.Done()
+
+	h.SweepWriteTransactions(time.Now())
+	if _, err := unix.FcntlInt(fd, unix.F_GETFD, 0); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("swept memfd F_GETFD error = %v, want EBADF", err)
+	}
+	if resources.writeReservedBytes != 0 || resources.writeTransactionCount != 0 ||
+		h.totalWriteStagingBytes != 0 || h.totalWriteTransactions != 0 {
+		t.Fatalf("post-sweep capacity = session bytes %d transactions %d, worker bytes %d transactions %d",
+			resources.writeReservedBytes, resources.writeTransactionCount,
+			h.totalWriteStagingBytes, h.totalWriteTransactions)
+	}
+	resources.writeMu.Lock()
+	terminal := resources.writeTerminal
+	resources.writeMu.Unlock()
+	if terminal == nil || terminal.id != 1 || terminal.kind != writeTransactionTerminalAborted || terminal.staged != 4 {
+		t.Fatalf("sweep tombstone = %+v", terminal)
+	}
+	abort := writeTransactionTestRequest(3, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction())
+	if response.GetErrno() != 0 || response.GetWriteTransaction().GetFlags() != writeTransactionReplyAborted {
+		t.Fatalf("ABORT replay through sweep tombstone = %+v", response)
+	}
 }
 
 func writeTransactionTestRequest(requestID, transactionID uint64, phase authoritypb.WriteTransactionPhase, offset uint64, data []byte) *authoritypb.Request {
@@ -608,6 +837,187 @@ func TestWriteTransactionSweeperNeverClosesActiveData(t *testing.T) {
 	waitWriteTransactionTestSignal(t, stage.closed, "stage cleanup after ABORT")
 }
 
+func TestWriteTransactionAdmissionWaitsForReleasedSlot(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(t.Context(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+	requireWriteTransactionTestBlocked(t, secondResult, "capacity waiter")
+
+	abort := writeTransactionTestRequest(3, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	if response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first ABORT = %+v", response)
+	}
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != 0 || response.GetWriteTransaction().GetFlags() != writeTransactionReplyBegun {
+			t.Fatalf("second BEGIN after release = %+v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("capacity waiter did not proceed after slot release")
+	}
+}
+
+func TestWriteTransactionAdmissionAndStagingMetrics(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	metrics, err := authoritymetrics.New("volume-metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Metrics = metrics
+	h.MaxWriteTransactionsPerSession = 1
+	beginAndStageWriteTransaction(t, h, credential, []byte("data"))
+
+	second := writeTransactionTestRequest(3, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(t.Context(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+
+	var waiting bytes.Buffer
+	if err := metrics.Registry().WritePrometheus(&waiting); err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []string{
+		`portablefs_authority_write_transactions_active{volume="volume-metrics"} 1`,
+		`portablefs_authority_write_transactions_waiting{volume="volume-metrics"} 1`,
+		`portablefs_authority_write_staged_bytes{volume="volume-metrics"} 4`,
+		`portablefs_authority_write_admission_blocks_total{volume="volume-metrics"} 1`,
+	} {
+		if !strings.Contains(waiting.String(), sample+"\n") {
+			t.Errorf("waiting metrics omit %q", sample)
+		}
+	}
+
+	abort := writeTransactionTestRequest(4, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	if response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first ABORT = %+v", response)
+	}
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != 0 {
+			t.Fatalf("second BEGIN = %+v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second transaction did not leave admission")
+	}
+	abort = writeTransactionTestRequest(5, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	if response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("second ABORT = %+v", response)
+	}
+
+	var released bytes.Buffer
+	if err := metrics.Registry().WritePrometheus(&released); err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []string{
+		`portablefs_authority_write_transactions_active{volume="volume-metrics"} 0`,
+		`portablefs_authority_write_transactions_waiting{volume="volume-metrics"} 0`,
+		`portablefs_authority_write_staged_bytes{volume="volume-metrics"} 0`,
+		`portablefs_authority_write_admission_wait_seconds_count{volume="volume-metrics"} 1`,
+	} {
+		if !strings.Contains(released.String(), sample+"\n") {
+			t.Errorf("released metrics omit %q", sample)
+		}
+	}
+}
+
+func TestWriteTransactionAdmissionWakesWithTerminalErrorOnSessionEnd(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(context.Background(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+
+	closed := make(chan struct{})
+	go func() {
+		h.closeSessionResources(credential.ID)
+		close(closed)
+	}()
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != int32(syscall.ESTALE) || response.GetUncertain() {
+			t.Fatalf("terminal capacity waiter = %+v, want definite ESTALE", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session end did not wake capacity waiter")
+	}
+	waitWriteTransactionTestSignal(t, closed, "session cleanup after capacity wait")
+}
+
+func TestWriteTransactionAdmissionWakesOnRuntimeTerminalEdge(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(context.Background(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+	h.Runtime.FenceSession(credential.ID)
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != int32(syscall.ESTALE) || response.GetUncertain() {
+			t.Fatalf("runtime-terminal capacity waiter = %+v, want definite ESTALE", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime terminal edge did not wake capacity waiter")
+	}
+}
+
+func TestWriteTransactionAdmissionDeadlineBoundsWaitAndRetainsBeginOutcome(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	h.WriteTransactionProgressTimeout = 40 * time.Millisecond
+	h.WriteTransactionAbsoluteTimeout = time.Second
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	started := time.Now()
+	response := h.beginWriteTransactionContext(context.Background(), second, credential, second.GetWriteTransaction())
+	if response.GetErrno() != int32(syscall.ETIMEDOUT) || response.GetUncertain() {
+		t.Fatalf("deadline-bounded BEGIN = %+v, want definite ETIMEDOUT", response)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("deadline-bounded BEGIN elapsed %v, want bounded near %v", elapsed, h.WriteTransactionProgressTimeout)
+	}
+	replay := writeTransactionTestRequest(3, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if replayed := h.beginWriteTransaction(replay, credential, replay.GetWriteTransaction()); replayed.GetErrno() != int32(syscall.ETIMEDOUT) {
+		t.Fatalf("deadline BEGIN replay = %+v, want retained ETIMEDOUT", replayed)
+	}
+	resources, err := h.sessionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.writeTransactionCount != 1 || h.totalWriteTransactions != 1 {
+		t.Fatalf("timed-out waiter accounting = session %d, global %d; want one original transaction", resources.writeTransactionCount, h.totalWriteTransactions)
+	}
+}
+
 func TestWriteTransactionDataFailureRetainsExactBeginOutcomeUntilAbort(t *testing.T) {
 	h, credential, _ := newWriteTransactionHarness(t, nil)
 	writeStarted := make(chan struct{})
@@ -831,6 +1241,106 @@ func TestWriteTransactionCommitAppliesStagedPrefixOnceAndReplaysRetainedResult(t
 	}
 	if calls, _ := target.commitSnapshot(); calls != 1 {
 		t.Fatalf("exact replay applied storage %d times, want 1", calls)
+	}
+}
+
+func TestWriteTransactionSweepRejectsOnlyAbandonedCommitAndReplaysOutcome(t *testing.T) {
+	h, credential, store := newWriteTransactionHarness(t, nil)
+	beginAndStageWriteTransaction(t, h, credential, []byte("abc"))
+	target := store.targets[0]
+	commit := writeTransactionTestCommitRequest(3, 1, 3, target.Coordinate().Stable)
+	owner, err := h.markWriteTransactionCommitting(credential.ID, commit, commit.GetWriteTransaction())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := h.sessionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := acquireWriteTransaction(resources, 1)
+	if transaction == nil {
+		t.Fatal("COMMIT transaction was not registered")
+	}
+	transaction.mu.Lock()
+	transaction.absoluteDeadline = time.Now().Add(-time.Second)
+	transaction.mu.Unlock()
+	transaction.refs.Done()
+
+	h.SweepWriteTransactions(time.Now())
+	if active := acquireWriteTransaction(resources, 1); active == nil {
+		t.Fatal("sweeper reclaimed a COMMIT whose handler still owned the outcome")
+	} else {
+		active.refs.Done()
+	}
+	if resources.writeTransactionCount != 1 || h.totalWriteTransactions != 1 {
+		t.Fatalf("active COMMIT accounting = session %d, global %d", resources.writeTransactionCount, h.totalWriteTransactions)
+	}
+
+	h.finishWriteTransactionCommit(credential.ID, commit.GetWriteTransaction(), owner)
+	h.SweepWriteTransactions(time.Now())
+	if abandoned := acquireWriteTransaction(resources, 1); abandoned != nil {
+		abandoned.refs.Done()
+		t.Fatal("sweeper retained an expired abandoned COMMIT")
+	}
+	if resources.writeReservedBytes != 0 || resources.writeTransactionCount != 0 || h.totalWriteStagingBytes != 0 || h.totalWriteTransactions != 0 {
+		t.Fatalf("swept COMMIT accounting = session bytes %d/count %d, global bytes %d/count %d",
+			resources.writeReservedBytes, resources.writeTransactionCount, h.totalWriteStagingBytes, h.totalWriteTransactions)
+	}
+	if target.closeCount() != 1 {
+		t.Fatalf("swept COMMIT target closes = %d, want 1", target.closeCount())
+	}
+
+	replay := writeTransactionTestCommitRequest(4, 1, 3, target.Coordinate().Stable)
+	response := h.commitWriteTransaction(t.Context(), replay, credential, replay.GetWriteTransaction())
+	reply := response.GetWriteTransaction()
+	if response.GetErrno() != 0 || response.GetUncertain() || reply.GetFlags() != writeTransactionReplyRejected ||
+		reply.GetError() != -int32(syscall.ETIMEDOUT) {
+		t.Fatalf("swept COMMIT replay = %+v, want structured ETIMEDOUT rejection", response)
+	}
+	if mutation := response.GetMutation(); mutation.GetSlot() != 0 || mutation.GetAcceptedSequence() != 1 {
+		t.Fatalf("swept COMMIT replay mutation state = %+v", mutation)
+	}
+	secondReplay := writeTransactionTestCommitRequest(5, 1, 3, target.Coordinate().Stable)
+	second := h.commitWriteTransaction(t.Context(), secondReplay, credential, secondReplay.GetWriteTransaction())
+	if second.GetErrno() != 0 || second.GetWriteTransaction().GetFlags() != writeTransactionReplyRejected ||
+		second.GetWriteTransaction().GetError() != -int32(syscall.ETIMEDOUT) {
+		t.Fatalf("retained swept COMMIT replay = %+v", second)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 0 {
+		t.Fatalf("swept COMMIT replay applied storage %d times", calls)
+	}
+}
+
+func TestWriteTransactionReplayCapacityRefusalIsStructuredENOMEM(t *testing.T) {
+	h, credential, store := newWriteTransactionHarness(t, nil)
+	beginAndStageWriteTransaction(t, h, credential, []byte("abc"))
+	target := store.targets[0]
+	h.MaxRetainedReplyBytes = 0
+	commit := writeTransactionTestCommitRequest(3, 1, 3, target.Coordinate().Stable)
+	response := h.commitWriteTransaction(t.Context(), commit, credential, commit.GetWriteTransaction())
+	reply := response.GetWriteTransaction()
+	if response.GetErrno() != 0 || response.GetUncertain() || response.GetMutation() != nil ||
+		reply.GetFlags() != writeTransactionReplyRejected || reply.GetError() != -int32(syscall.ENOMEM) {
+		t.Fatalf("replay-capacity COMMIT = %+v, want unrecorded structured ENOMEM rejection", response)
+	}
+	if response.GetErrno() == int32(syscall.EAGAIN) {
+		t.Fatal("blocking COMMIT exposed EAGAIN")
+	}
+	resources, err := h.sessionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.writeTransactionCount != 0 || h.totalWriteTransactions != 0 {
+		t.Fatalf("replay-capacity rejection retained transaction: session %d, global %d", resources.writeTransactionCount, h.totalWriteTransactions)
+	}
+	replay := writeTransactionTestCommitRequest(4, 1, 3, target.Coordinate().Stable)
+	replayed := h.commitWriteTransaction(t.Context(), replay, credential, replay.GetWriteTransaction())
+	if replayed.GetErrno() != 0 || replayed.GetWriteTransaction().GetFlags() != writeTransactionReplyRejected ||
+		replayed.GetWriteTransaction().GetError() != -int32(syscall.ENOMEM) {
+		t.Fatalf("replay-capacity COMMIT replay = %+v", replayed)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 0 {
+		t.Fatalf("replay-capacity refusal applied storage %d times", calls)
 	}
 }
 

@@ -2,6 +2,7 @@ package authorityrpc
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -67,6 +68,7 @@ const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
 const sessionReauthorizationFeature = "session-reauthorization-v1"
 const mountEnrollmentReauthorizationFeature = "mount-enrollment-reauthorization-v1"
 const strictWriteTransactionFeature = "transactional-shared-write-v1"
+const oneShotWriteFeature = "one-shot-write-v1"
 
 // strictLinuxMutationSuiteFeature proves the authority implements every
 // operation the indivisible patched-kernel profile can issue beyond the write
@@ -103,8 +105,8 @@ const locklessNamespaceRepairFeature = "lockless-namespace-repair-v1"
 const RequiredWriteTransactionBytes uint64 = 0x7ffff000
 
 var (
-	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1", "authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1", "strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1", "exact-resource-acquisition", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
-	requiredAttachFeatures       = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier", "exact-resource-acquisition", strictWriteTransactionFeature}
+	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1", "authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1", "strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1", "exact-resource-acquisition", strictWriteTransactionFeature, oneShotWriteFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
+	requiredAttachFeatures       = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier", "exact-resource-acquisition", strictWriteTransactionFeature, oneShotWriteFeature}
 	requiredStrictAttachFeatures = []string{"strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1"}
 )
 
@@ -177,6 +179,8 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 		// after a grant is downgraded so cleanup can never be held hostage by
 		// current write authorization.
 		return body.WriteTransaction.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT
+	case *authoritypb.Request_OneShotWrite:
+		return true
 	default:
 		return false
 	}
@@ -189,6 +193,7 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 func requestIsVisibleMutation(req *authoritypb.Request) bool {
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_SetAttr,
+		*authoritypb.Request_OneShotWrite,
 		*authoritypb.Request_Fallocate,
 		*authoritypb.Request_CopyFileRange,
 		*authoritypb.Request_Create,
@@ -366,6 +371,22 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 // versions. A replay with different content is therefore rejected without
 // making every client hash a large payload before it can send it.
 func canonicalFingerprint(runtime *volumeserver.Authority, req *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
+	if body := req.GetOneShotWrite(); body != nil {
+		digest := sha256.Sum256(body.GetData())
+		return canonicalFingerprintWithWriteDataDigest(runtime, req, digest)
+	}
+	return canonicalFingerprintWithOptions(runtime, req, canonicalWriteOptions{})
+}
+
+type canonicalWriteOptions struct {
+	writeDataDigest *[sha256.Size]byte
+}
+
+func canonicalFingerprintWithWriteDataDigest(runtime *volumeserver.Authority, req *authoritypb.Request, digest [sha256.Size]byte) (volumeserver.RequestFingerprint, error) {
+	return canonicalFingerprintWithOptions(runtime, req, canonicalWriteOptions{writeDataDigest: &digest})
+}
+
+func canonicalFingerprintWithOptions(runtime *volumeserver.Authority, req *authoritypb.Request, options canonicalWriteOptions) (volumeserver.RequestFingerprint, error) {
 	if runtime == nil {
 		return volumeserver.RequestFingerprint{}, fmt.Errorf("%w: authority runtime is required", errNonCanonical)
 	}
@@ -400,7 +421,7 @@ func canonicalFingerprint(runtime *volumeserver.Authority, req *authoritypb.Requ
 		Body:                         req.GetBody(),
 	}
 	return runtime.ReplayFingerprint(func(writer io.Writer) error {
-		return canonicalWrite(writer, body.ProtoReflect())
+		return canonicalWriteWithOptions(writer, body.ProtoReflect(), options)
 	})
 }
 
@@ -413,6 +434,10 @@ var errNonCanonical = errors.New("authorityrpc: request cannot be canonicalized"
 // authority before XFS saw one byte. Streaming preserves the frozen digest
 // while keeping payload memory O(1).
 func canonicalWrite(writer io.Writer, message protoreflect.Message) error {
+	return canonicalWriteWithOptions(writer, message, canonicalWriteOptions{})
+}
+
+func canonicalWriteWithOptions(writer io.Writer, message protoreflect.Message, options canonicalWriteOptions) error {
 	fields, err := canonicalPresentFields(message)
 	if err != nil {
 		return err
@@ -425,13 +450,13 @@ func canonicalWrite(writer io.Writer, message protoreflect.Message) error {
 		if field.IsList() {
 			list := value.List()
 			for i := 0; i < list.Len(); i++ {
-				if err := canonicalWriteField(writer, field, list.Get(i)); err != nil {
+				if err := canonicalWriteField(writer, field, list.Get(i), options); err != nil {
 					return err
 				}
 			}
 			continue
 		}
-		if err := canonicalWriteField(writer, field, value); err != nil {
+		if err := canonicalWriteField(writer, field, value, options); err != nil {
 			return err
 		}
 	}
@@ -458,7 +483,7 @@ func canonicalPresentFields(message protoreflect.Message) ([]protoreflect.FieldD
 	return present, nil
 }
 
-func canonicalMessageSize(message protoreflect.Message) (int, error) {
+func canonicalMessageSize(message protoreflect.Message, options canonicalWriteOptions) (int, error) {
 	fields, err := canonicalPresentFields(message)
 	if err != nil {
 		return 0, err
@@ -472,7 +497,7 @@ func canonicalMessageSize(message protoreflect.Message) (int, error) {
 		if field.IsList() {
 			list := value.List()
 			for i := 0; i < list.Len(); i++ {
-				size, err := canonicalFieldSize(field, list.Get(i))
+				size, err := canonicalFieldSize(field, list.Get(i), options)
 				if err != nil {
 					return 0, err
 				}
@@ -480,7 +505,7 @@ func canonicalMessageSize(message protoreflect.Message) (int, error) {
 			}
 			continue
 		}
-		size, err := canonicalFieldSize(field, value)
+		size, err := canonicalFieldSize(field, value, options)
 		if err != nil {
 			return 0, err
 		}
@@ -489,7 +514,7 @@ func canonicalMessageSize(message protoreflect.Message) (int, error) {
 	return total, nil
 }
 
-func canonicalFieldSize(field protoreflect.FieldDescriptor, value protoreflect.Value) (int, error) {
+func canonicalFieldSize(field protoreflect.FieldDescriptor, value protoreflect.Value, options canonicalWriteOptions) (int, error) {
 	tag := protowire.SizeTag(field.Number())
 	switch field.Kind() {
 	case protoreflect.BoolKind:
@@ -508,9 +533,12 @@ func canonicalFieldSize(field protoreflect.FieldDescriptor, value protoreflect.V
 	case protoreflect.StringKind:
 		return tag + protowire.SizeBytes(len(value.String())), nil
 	case protoreflect.BytesKind:
+		if options.writeDataDigest != nil && isCanonicalWriteDataField(field) {
+			return tag + protowire.SizeBytes(len(options.writeDataDigest)), nil
+		}
 		return tag + protowire.SizeBytes(len(value.Bytes())), nil
 	case protoreflect.MessageKind:
-		nested, err := canonicalMessageSize(value.Message())
+		nested, err := canonicalMessageSize(value.Message(), options)
 		if err != nil {
 			return 0, err
 		}
@@ -520,7 +548,7 @@ func canonicalFieldSize(field protoreflect.FieldDescriptor, value protoreflect.V
 	}
 }
 
-func canonicalWriteField(writer io.Writer, field protoreflect.FieldDescriptor, value protoreflect.Value) error {
+func canonicalWriteField(writer io.Writer, field protoreflect.FieldDescriptor, value protoreflect.Value, options canonicalWriteOptions) error {
 	var storage [20]byte
 	prefix := storage[:0]
 	number := field.Number()
@@ -548,13 +576,16 @@ func canonicalWriteField(writer io.Writer, field protoreflect.FieldDescriptor, v
 		return err
 	case protoreflect.BytesKind:
 		data := value.Bytes()
+		if options.writeDataDigest != nil && isCanonicalWriteDataField(field) {
+			data = options.writeDataDigest[:]
+		}
 		prefix = protowire.AppendVarint(protowire.AppendTag(prefix, number, protowire.BytesType), uint64(len(data)))
 		if err := writeAll(writer, prefix); err != nil {
 			return err
 		}
 		return writeAll(writer, data)
 	case protoreflect.MessageKind:
-		nested, err := canonicalMessageSize(value.Message())
+		nested, err := canonicalMessageSize(value.Message(), options)
 		if err != nil {
 			return err
 		}
@@ -562,11 +593,21 @@ func canonicalWriteField(writer io.Writer, field protoreflect.FieldDescriptor, v
 		if err := writeAll(writer, prefix); err != nil {
 			return err
 		}
-		return canonicalWrite(writer, value.Message())
+		return canonicalWriteWithOptions(writer, value.Message(), options)
 	default:
 		return fmt.Errorf("%w: unsupported field kind %v", errNonCanonical, field.Kind())
 	}
 	return writeAll(writer, prefix)
+}
+
+func isCanonicalWriteDataField(field protoreflect.FieldDescriptor) bool {
+	switch field.FullName() {
+	case "portablefs.authority.v1.WriteTransactionRequest.data",
+		"portablefs.authority.v1.OneShotWriteRequest.data":
+		return true
+	default:
+		return false
+	}
 }
 
 // canonicalBytes encodes a message as protobuf with fields emitted in strictly

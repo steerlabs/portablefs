@@ -237,6 +237,20 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 		uint64(hello.GetMaxWriteBytes())+uint64(FramePayloadReserve) > uint64(negotiatedFrame) {
 		return fail(errors.New("authorityrpc: I/O payload bounds exceed the negotiated frame"))
 	}
+	// The two bounds are configured independently on the authority but they are
+	// not independent at the mount: a Linux mount sizes max_write from the write
+	// bound and the kernel derives max_read from max_write, so the kernel issues
+	// reads the read bound cannot answer in one request. A smaller read bound
+	// therefore does not make reads smaller, it multiplies the round trips every
+	// read costs, and it does so silently. Refuse it here rather than normalize:
+	// the deployment that wrote the two numbers is the only place the intended
+	// one is known.
+	if hello.GetMaxReadBytes() < hello.GetMaxWriteBytes() {
+		return fail(fmt.Errorf(
+			"authorityrpc: authority read bound %d is below its write bound %d; the kernel sizes reads from the write bound, so every read would be split across round trips",
+			hello.GetMaxReadBytes(), hello.GetMaxWriteBytes(),
+		))
+	}
 	return &transportNegotiation{
 		conn: conn, epoch: append([]byte(nil), response.GetEpoch()...),
 		features: append([]string(nil), hello.GetFeatures()...), maxFrame: negotiatedFrame,
@@ -452,7 +466,7 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 		return ErrTransportBinding
 	}
 	if c.poisoned.Load() {
-		if err := c.SessionError(); err != nil {
+		if err := c.SessionEndCause(); err != nil {
 			return err
 		}
 		return ErrSessionEnded

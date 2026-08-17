@@ -25,6 +25,7 @@ type fuseV3Config struct {
 	backingRoot            string
 	noLocalDirs            bool
 	requireMountEnrollment bool
+	onRevoked              func(mountRevocation)
 }
 
 type fuseV3Mount struct {

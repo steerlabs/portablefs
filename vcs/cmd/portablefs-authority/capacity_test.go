@@ -36,3 +36,28 @@ func TestValidateConnectionCapacity(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultWriteTransactionsPerSession(t *testing.T) {
+	tests := []struct {
+		name                 string
+		maxInFlight          int
+		maxWriteTransactions uint
+		want                 uint
+	}{
+		{name: "stock authority", maxInFlight: defaultMaxInFlight, maxWriteTransactions: defaultMaxWriteTransactions, want: defaultMaxInFlight},
+		{name: "worker bound is smaller", maxInFlight: 512, maxWriteTransactions: 64, want: 64},
+		{name: "connection bound is smaller", maxInFlight: 32, maxWriteTransactions: 4096, want: 32},
+		{name: "invalid connection bound", maxInFlight: 0, maxWriteTransactions: 4096, want: 0},
+		{name: "invalid worker bound", maxInFlight: 32, maxWriteTransactions: 0, want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := defaultWriteTransactionsPerSession(test.maxInFlight, test.maxWriteTransactions); got != test.want {
+				t.Fatalf("defaultWriteTransactionsPerSession(%d, %d) = %d, want %d", test.maxInFlight, test.maxWriteTransactions, got, test.want)
+			}
+		})
+	}
+	if defaultMaxItemsPerSession < 1<<16 {
+		t.Fatalf("default max items per session = %d, below mount cached-name capacity %d", defaultMaxItemsPerSession, 1<<16)
+	}
+}

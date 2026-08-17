@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -24,7 +25,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var errInternal = errors.New("authorityrpc: internal handler failure")
+var (
+	errInternal            = errors.New("authorityrpc: internal handler failure")
+	errCapabilityTableFull = errnos.Sentinel("authorityrpc: descriptor-backed capability table full", syscall.ENFILE)
+)
 
 // readDirReplyOverhead bounds the fixed part of a directory reply: the 16-byte
 // verifier, the EOF flag, and the protobuf tags wrapping the reply inside a
@@ -99,6 +103,7 @@ type VolumeHandler struct {
 	Store       volumeStore
 	Runtime     *volumeserver.Authority
 	Authorizer  Authorizer
+	Metrics     *authoritymetrics.Metrics
 	MaxFrame    uint32
 	MaxRead     uint32
 	MaxWrite    uint32
@@ -174,6 +179,8 @@ type VolumeHandler struct {
 	retainedReplyBytes     uint64
 	reservedReplyBytes     uint64
 	writeCapacityMu        sync.Mutex
+	writeCapacityHead      *writeTransactionCapacityWaiter
+	writeCapacityTail      *writeTransactionCapacityWaiter
 	totalWriteStagingBytes uint64
 	totalWriteTransactions uint32
 }
@@ -233,6 +240,7 @@ type sessionResources struct {
 	writeTerminal         *writeTransactionTerminal
 	writeReservedBytes    uint64
 	writeTransactionCount uint32
+	writeCapacityEnded    bool
 }
 
 type trackedCapability struct {
@@ -1235,7 +1243,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		if body.WriteTransaction.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
 			return h.commitWriteTransaction(ctx, req, cred, body.WriteTransaction)
 		}
-		return h.handleWriteTransaction(req, cred, body.WriteTransaction)
+		return h.handleWriteTransaction(ctx, req, cred, body.WriteTransaction)
+	case *authoritypb.Request_OneShotWrite:
+		return h.handleOneShotWrite(ctx, req, cred, body.OneShotWrite)
 	case *authoritypb.Request_Fallocate:
 		return h.handleFallocate(ctx, req, cred, body.Fallocate)
 	case *authoritypb.Request_CopyFileRange:
@@ -2037,22 +2047,44 @@ func (h *VolumeHandler) mutateVisibleSequence(
 	prepare func() ([]volumeserver.VisibilityTarget, error),
 	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
 ) *authoritypb.Response {
+	var writeCommitOwner *writeTransactionCommitOwner
+	defer func() {
+		if body := req.GetWriteTransaction(); body != nil {
+			h.finishWriteTransactionCommit(cred.ID, body, writeCommitOwner)
+		}
+	}()
 	return h.mutateOperation(ctx, req, cred, func(id volumeserver.MutationID) *authoritypb.Response {
+		definiteRejection := func(err error) *authoritypb.Response {
+			if req.GetOneShotWrite() != nil {
+				return oneShotWriteRejection(err, false)
+			}
+			return h.errorResponse(0, err, false)
+		}
+		writeCommit := req.GetWriteTransaction()
+		if writeCommit != nil {
+			terminal, found, err := h.rejectedWriteTransactionTerminal(req, cred.ID, writeCommit)
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			if found {
+				return terminal
+			}
+		}
 		declaredGate, err := decodeSourcePublicationGate(req)
 		if err != nil || declaredGate == nil {
-			return h.errorResponse(0, syscall.EINVAL, false)
+			return definiteRejection(syscall.EINVAL)
 		}
 		expectedGate, err := h.deriveSourcePublicationGate(req, cred.ID)
 		if err != nil {
-			return h.errorResponse(0, err, false)
+			return definiteRejection(err)
 		}
 		if !sourcePublicationGatesEqual(declaredGate, &expectedGate) {
-			return h.errorResponse(0, syscall.EINVAL, false)
+			return definiteRejection(syscall.EINVAL)
 		}
-		writeCommit := req.GetWriteTransaction()
 		if h.Visibility == nil {
 			if writeCommit != nil {
-				if err := h.markWriteTransactionCommitting(cred.ID, writeCommit); err != nil {
+				writeCommitOwner, err = h.markWriteTransactionCommitting(cred.ID, req, writeCommit)
+				if err != nil {
 					return h.errorResponse(0, err, false)
 				}
 			}
@@ -2062,7 +2094,7 @@ func (h *VolumeHandler) mutateVisibleSequence(
 						return rejected
 					}
 				}
-				return h.errorResponse(0, err, false)
+				return definiteRejection(err)
 			}
 			resp, _ := apply(1)
 			return resp
@@ -2095,7 +2127,8 @@ func (h *VolumeHandler) mutateVisibleSequence(
 			return refreshed, nil
 		}
 		if writeCommit != nil {
-			if err := h.markWriteTransactionCommitting(cred.ID, writeCommit); err != nil {
+			writeCommitOwner, err = h.markWriteTransactionCommitting(cred.ID, req, writeCommit)
+			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
 		}
@@ -2123,6 +2156,11 @@ func (h *VolumeHandler) mutateVisibleSequence(
 			}
 			var barrier *volumeserver.VisibilityBarrierError
 			uncertain := errors.As(err, &barrier) && barrier.Applied
+			if req.GetOneShotWrite() != nil && uncertain && markOneShotWritePostApplyFailure(resp, err) {
+				h.deferStorageFailure(resp, err)
+				h.deferCoherenceFailure(resp, err)
+				return resp
+			}
 			if body := req.GetWriteTransaction(); body != nil && body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
 				if uncertain && markWriteTransactionPostApplyFailure(resp, err) {
 					h.deferStorageFailure(resp, err)
@@ -2151,6 +2189,9 @@ func (h *VolumeHandler) mutateVisibleSequence(
 					"portablefs-authority: visible mutation applied but cache completion failed source=%x slot=%d sequence=%d frontend_operation_id=%d: %v",
 					cred.ID, id.Slot, id.Sequence, id.FrontendOperationID, err,
 				)
+			}
+			if req.GetOneShotWrite() != nil && !errors.Is(err, volumeserver.ErrVisibilityRetry) {
+				return oneShotWriteRejection(err, false)
 			}
 			return h.errorResponse(0, err, uncertain)
 		}
@@ -2215,6 +2256,14 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		}
 	})
 	if err != nil {
+		if body := req.GetWriteTransaction(); body != nil &&
+			body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT &&
+			errors.Is(err, volumeserver.ErrAdmission) {
+			return writeTransactionResponseWithEnvelope(h, req.GetRequestId(), h.rejectUnadmittedWriteTransaction(req, cred.ID, body))
+		}
+		if req.GetOneShotWrite() != nil && errors.Is(err, volumeserver.ErrAdmission) {
+			return writeTransactionResponseWithEnvelope(h, req.GetRequestId(), oneShotWriteRejection(syscall.ENOMEM, false))
+		}
 		// Nothing was recorded for this identity, so the response deliberately
 		// carries no MutationState and the peer's slot stays where it is.
 		return h.errorResponse(req.GetRequestId(), err, false)
@@ -3367,7 +3416,11 @@ func (h *VolumeHandler) reserveCapabilities(id volumeserver.SessionID, items, op
 		uint64(h.totalItems)+uint64(items) > uint64(h.MaxItems) ||
 		uint64(len(resources.opens))+uint64(resources.reservedOpens)+uint64(opens) > uint64(h.MaxOpensPerSession) ||
 		uint64(h.totalOpens)+uint64(opens) > uint64(h.MaxOpens):
-		return nil, volumeserver.ErrAdmission
+		// These are descriptor tables, not a transient execution queue. Waiting
+		// would let lookup/readdir storms pin workers, while EAGAIN is not a legal
+		// blocking pathname result. ENFILE reports the exhausted authority-managed
+		// file table without pretending the caller's own descriptor limit was hit.
+		return nil, errCapabilityTableFull
 	}
 	resources.reservedItems += items
 	resources.reservedOpens += opens
@@ -3433,6 +3486,9 @@ func (r *capabilityReservation) commit(items, opens []trackedCapability) error {
 			resources.opens[open.value] = open.protected
 		}
 	}
+	if r.h.Metrics != nil {
+		r.h.Metrics.ObserveSessionItems(len(resources.items))
+	}
 	r.active = false
 	return nil
 }
@@ -3451,9 +3507,12 @@ func (h *VolumeHandler) trackItem(id volumeserver.SessionID, item xfsstore.Capab
 	case alreadyTracked:
 		resources.items[item] = resources.items[item] || protected
 	case uint64(len(resources.items))+uint64(resources.reservedItems) >= uint64(h.MaxItemsPerSession) || h.totalItems >= h.MaxItems:
-		err = volumeserver.ErrAdmission
+		err = errCapabilityTableFull
 	default:
 		trackCapability(resources.items, item, protected, &h.totalItems)
+		if h.Metrics != nil {
+			h.Metrics.ObserveSessionItems(len(resources.items))
+		}
 	}
 	h.resourcesMu.Unlock()
 	if err != nil {
@@ -3484,7 +3543,7 @@ func (h *VolumeHandler) trackOpen(id volumeserver.SessionID, handle xfsstore.Cap
 	case alreadyTracked:
 		resources.opens[handle] = resources.opens[handle] || protected
 	case uint64(len(resources.opens))+uint64(resources.reservedOpens) >= uint64(h.MaxOpensPerSession) || h.totalOpens >= h.MaxOpens:
-		err = volumeserver.ErrAdmission
+		err = errCapabilityTableFull
 	default:
 		trackCapability(resources.opens, handle, protected, &h.totalOpens)
 	}
@@ -3519,6 +3578,7 @@ func (h *VolumeHandler) takeSessionResourcesLocked(id volumeserver.SessionID, ex
 		return sessionResourceCleanup{}, false
 	}
 	resources.ended = true
+	h.endWriteTransactionCapacityWaits(resources)
 	handles := make([]xfsstore.Capability, 0, len(resources.opens))
 	for handle := range resources.opens {
 		handles = append(handles, handle)

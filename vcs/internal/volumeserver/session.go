@@ -98,6 +98,11 @@ type Config struct {
 	// over-commits the table and gives up that guarantee.
 	MaxLockRecordsPerSession uint32
 	Now                      func() time.Time
+	// Lifecycle observers run under the authority/session locks at the exact
+	// state transition. They must be nonblocking and must not call back into the
+	// Authority; production uses atomic gauges only.
+	OnSessionActive   func(SessionID)
+	OnSessionTerminal func(SessionID)
 }
 
 // sessionCredentialGeneration identifies the authority-minted resume secret.
@@ -685,6 +690,9 @@ func (a *Authority) CommitActivation(token *ActivationToken) {
 	s.state = SessionStateActive
 	s.leaseExpires = minTime(now.Add(a.cfg.SessionLease), s.authorizationDeadline)
 	s.lockLease = a.locks.RegisterSession(s.id, s.leaseExpires)
+	if a.cfg.OnSessionActive != nil {
+		a.cfg.OnSessionActive(s.id)
+	}
 	s.activation = nil
 	token.resolved = true
 	if attempt := a.attempts[token.attempt]; attempt != nil && attempt.session == s {
@@ -913,6 +921,9 @@ func (a *Authority) AttachActiveForTest(slots uint32, peer PeerIdentity, authori
 	// live, and stops at exactly the moment it becomes terminal or its lease
 	// runs out. Registration is the only way a record or waiter can ever exist.
 	s.lockLease = a.locks.RegisterSession(id, s.leaseExpires)
+	if a.cfg.OnSessionActive != nil {
+		a.cfg.OnSessionActive(id)
+	}
 	return SessionCredential{Epoch: a.epoch, ID: id, Generation: sessionCredentialGeneration, Secret: secret, Peer: peer, Access: authorization.Access}, nil
 }
 
@@ -1092,6 +1103,7 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 		return false
 	}
 	if !s.ending {
+		wasActive := s.state == SessionStateActive
 		s.ending = true
 		s.fenced = true
 		if s.state != SessionStateAborted {
@@ -1102,6 +1114,9 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 			delete(a.sessions, id)
 		}
 		a.locks.ReleaseSession(id)
+		if wasActive && a.cfg.OnSessionTerminal != nil {
+			a.cfg.OnSessionTerminal(id)
+		}
 	}
 	if s.active == 0 && !s.cleanupStarted {
 		s.cleanupStarted = true

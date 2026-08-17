@@ -3,12 +3,40 @@ package fuse
 import (
 	"fmt"
 	"os"
+	"reflect"
 	"syscall"
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/internal/testutil"
 	"github.com/moby/sys/mountinfo"
 )
+
+func TestUnmountArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		lazy bool
+		want []string
+	}{
+		{name: "ordinary", want: []string{"-u", "/mount"}},
+		{name: "lazy", lazy: true, want: []string{"-u", "-z", "/mount"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := unmountArgs("/mount", tc.lazy); !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("unmountArgs(lazy=%v) = %q, want %q", tc.lazy, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestUnmountLazyRefusesMagicMountpoint(t *testing.T) {
+	srv := &Server{mountPoint: "/dev/fd/9"}
+	if err := srv.UnmountLazy(); err == nil {
+		t.Fatal("UnmountLazy accepted a magic mountpoint without a real namespace path")
+	}
+	if srv.mountPoint != "/dev/fd/9" {
+		t.Fatalf("failed lazy unmount discarded mountpoint %q", srv.mountPoint)
+	}
+}
 
 // TestMountDevFd tests the special `/dev/fd/N` mountpoint syntax, where a
 // privileged parent process opens /dev/fuse and calls mount() for us.

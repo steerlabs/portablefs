@@ -29,6 +29,8 @@ type fakeRPC struct {
 	mu sync.Mutex
 
 	writeTransactions []*authoritypb.WriteTransactionRequest
+	oneShotWrites     []*authoritypb.OneShotWriteRequest
+	oneShotRequests   []*authoritypb.Request
 	setattrs          []*authoritypb.SetAttrRequest
 	flushes           []*authoritypb.FlushRequest
 	fsyncs            []*authoritypb.FsyncRequest
@@ -60,7 +62,12 @@ type fakeRPC struct {
 	// byName, when non-nil, mints one distinct object per name so a test can
 	// walk a volume path of several different directories. Without it every
 	// lookup answers with the same object and a path has no shape.
-	byName              map[string]*authoritypb.Item
+	byName map[string]*authoritypb.Item
+	// missingNames are the names this authority answers ENOENT for, which is
+	// how a negative resolution is made reachable without a kernel. A name is
+	// removed from the set by whatever creates it, so the miss/create/hit
+	// sequence a probing workload performs can be replayed exactly.
+	missingNames        map[string]bool
 	handle              []byte
 	maxRead             uint32
 	maxWrite            uint32
@@ -120,12 +127,15 @@ func newFakeRPC() *fakeRPC {
 	}
 }
 
-func (f *fakeRPC) Root() *authoritypb.Item          { return cloneItem(f.root) }
-func (f *fakeRPC) IOLimits() (uint32, uint32)       { return f.maxRead, f.maxWrite }
-func (f *fakeRPC) MaxWriteTransactionBytes() uint64 { return f.maxWriteTransaction }
-func (f *fakeRPC) SessionLease() time.Duration      { return f.lease }
-func (f *fakeRPC) SessionDone() <-chan struct{}     { return f.done }
-func (f *fakeRPC) SessionError() error              { return nil }
+func (f *fakeRPC) Root() *authoritypb.Item            { return cloneItem(f.root) }
+func (f *fakeRPC) IOLimits() (uint32, uint32)         { return f.maxRead, f.maxWrite }
+func (f *fakeRPC) MaxWriteTransactionBytes() uint64   { return f.maxWriteTransaction }
+func (f *fakeRPC) SessionLease() time.Duration        { return f.lease }
+func (f *fakeRPC) SessionDone() <-chan struct{}       { return f.done }
+func (f *fakeRPC) SessionError() error                { return nil }
+func (f *fakeRPC) SessionEndPending() <-chan struct{} { return f.done }
+func (f *fakeRPC) SessionEndCause() error             { return nil }
+func (f *fakeRPC) FinishLocalSessionEnforcement()     {}
 
 func (f *fakeRPC) Close() error {
 	f.mu.Lock()
@@ -167,14 +177,6 @@ func (f *fakeRPC) CallIdempotentRetained(
 	consumption := f.takeRetainedConsumptionLocked()
 	f.mu.Unlock()
 	return response, consumption, err
-}
-
-func (f *fakeRPC) CallIdempotentOwnedRetained(
-	ctx context.Context,
-	request *authoritypb.Request,
-	force func(error),
-) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
-	return f.CallIdempotentRetained(ctx, request, force)
 }
 
 func (f *fakeRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -316,11 +318,15 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 	case request.GetGetAttr() != nil:
 		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: cloneItem(f.item).GetAttr()}}}, nil
 	case request.GetLookup() != nil:
+		if f.missingNames[string(request.GetLookup().GetName())] {
+			return &authoritypb.Response{Errno: int32(syscall.ENOENT)}, nil
+		}
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetLookup().GetName())}}}, nil
 	case request.GetMkdir() != nil:
 		if f.mkdirFailure != 0 {
 			return &authoritypb.Response{Errno: int32(f.mkdirFailure)}, nil
 		}
+		delete(f.missingNames, string(request.GetMkdir().GetName()))
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetMkdir().GetName())}}}, nil
 	case request.GetSymlink() != nil:
 		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetSymlink().GetName())}}}, nil
@@ -375,6 +381,22 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 			response.PostAttr = &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(reply.GetPostSize())}
 		}
 		return response, nil
+	case request.GetOneShotWrite() != nil:
+		f.oneShotRequests = append(f.oneShotRequests, proto.Clone(request).(*authoritypb.Request))
+		writeRequest := proto.Clone(request.GetOneShotWrite()).(*authoritypb.OneShotWriteRequest)
+		f.oneShotWrites = append(f.oneShotWrites, writeRequest)
+		assigned := writeRequest.GetPosition()
+		if writeRequest.GetFlags()&uint32(syscall.O_APPEND) != 0 {
+			assigned = 100
+		}
+		postSize := assigned + uint64(writeRequest.GetSize())
+		return &authoritypb.Response{
+			PostAttr: &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)},
+			Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
+				CommittedSize: uint64(writeRequest.GetSize()), AssignedOffset: assigned,
+				PostSize: postSize, VisibilitySequence: 17, Flags: fuse.PFS_WRITE_OUT_COMMITTED,
+			}},
+		}, nil
 	case request.GetSetAttr() != nil:
 		f.setattrs = append(f.setattrs, request.GetSetAttr())
 		return &authoritypb.Response{PostAttr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Mode: 0o600}}, nil
@@ -596,7 +618,7 @@ func testToken(id uint64) []byte {
 
 // --- Defect 8: the direct-I/O decision is explicit and asserted -------------
 
-func TestOpenAndCreateAlwaysReturnDirectIO(t *testing.T) {
+func TestOpenAndCreateAlwaysReturnTheExactCacheablePair(t *testing.T) {
 	mount, _ := testMount(t, 8)
 	n := testNode(mount)
 	openCtx, finishOpen := testMutationContext(t, mount)
@@ -617,9 +639,19 @@ func TestOpenAndCreateAlwaysReturnDirectIO(t *testing.T) {
 	if createFlags != coherentOpenFlags {
 		t.Fatalf("Create OpenFlags = %#x, want exactly %#x", createFlags, coherentOpenFlags)
 	}
-	if createFlags&fuse.FOPEN_KEEP_CACHE != 0 || flags&fuse.FOPEN_KEEP_CACHE != 0 ||
-		createFlags&fuse.FOPEN_PFS_SHARED == 0 || flags&fuse.FOPEN_PFS_SHARED == 0 {
-		t.Fatal("authority opens must be direct, explicitly shared, and never KEEP_CACHE")
+	// The pair is exact in both directions. FOPEN_PFS_SHARED is what routes
+	// writes through the kernel transaction and what makes the kernel refuse
+	// every shared mmap, so it can never be dropped. FOPEN_DIRECT_IO is now
+	// refused by the kernel outright: it would route reads around the page
+	// cache the DATA barrier is written against, and there is no compatibility
+	// mode in which both pairs are accepted.
+	for _, got := range []uint32{flags, createFlags} {
+		if got&fuse.FOPEN_KEEP_CACHE == 0 || got&fuse.FOPEN_PFS_SHARED == 0 {
+			t.Fatalf("authority open flags %#x must be exactly KEEP_CACHE|PFS_SHARED", got)
+		}
+		if got&fuse.FOPEN_DIRECT_IO != 0 {
+			t.Fatalf("authority open flags %#x must never carry FOPEN_DIRECT_IO", got)
+		}
 	}
 }
 
@@ -634,7 +666,7 @@ func TestEveryAuthorityAttrIsExplicitlyShared(t *testing.T) {
 }
 
 func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
-	options := mountOptions(testConfig(8), 64*1024)
+	options := mountOptions(testConfig(8), 128*1024, 64*1024)
 	if options.DisabledCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP == 0 {
 		t.Fatal("shared mmap over direct I/O must be disabled explicitly, not left to kernel defaults")
 	}
@@ -644,8 +676,13 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	if options.ExtraCapabilities&fuse.CAP_ATOMIC_O_TRUNC == 0 {
 		t.Fatal("atomic open-truncate must be explicitly requested")
 	}
-	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 {
-		t.Fatal("the indivisible strict-coherence capability must be explicitly requested")
+	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 ||
+		options.ExtraCapabilities&fuse.CAP_PFS_CACHED_DATA == 0 ||
+		options.ExtraCapabilities&fuse.CAP_PFS_WRITE_ONESHOT == 0 {
+		t.Fatal("every bit of the indivisible strict-coherence revision must be explicitly requested")
+	}
+	if options.DisabledCapabilities&fuse.CAP_AUTO_INVAL_DATA == 0 || !options.ExplicitDataCacheControl {
+		t.Fatal("a retained page cache must be withdrawn by this mount's own repair, never by an mtime heuristic")
 	}
 	if options.ExtraCapabilities&fuse.CAP_HANDLE_KILLPRIV_V2 == 0 {
 		t.Fatal("HANDLE_KILLPRIV_V2 must be explicitly requested")
@@ -657,7 +694,10 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 		fuse.CAP_PASSTHROUGH|fuse.CAP_NO_OPEN_SUPPORT|fuse.CAP_NO_OPENDIR_SUPPORT {
 		t.Fatal("strict mount did not disable passthrough and no-open shortcuts")
 	}
-	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 0 {
+	// The read-ahead window is paired with the authority read bound: reads are
+	// now served from the page cache, so the window is what decides how many
+	// authority round trips a sequential reader pays.
+	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
 		t.Fatalf("mount options = %#v", options)
 	}
 	foundDefaultPermissions := false
@@ -670,12 +710,12 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	if err := verifyMountDecisions(options); err != nil {
 		t.Fatalf("verifyMountDecisions rejected the shipped options: %v", err)
 	}
-	tampered := mountOptions(testConfig(8), 64*1024)
+	tampered := mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.DisabledCapabilities = 0
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a mount that permits shared mmap must be refused")
 	}
-	tampered = mountOptions(testConfig(8), 64*1024)
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.EnableLocks = false
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a mount that does not forward locks must be refused")
@@ -684,10 +724,30 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a mount that permits Linux to split open(O_TRUNC) into two mutations must be refused")
 	}
-	tampered = mountOptions(testConfig(8), 64*1024)
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.ExtraCapabilities |= fuse.CAP_HAS_RESEND
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a strict mount that requests HAS_RESEND must be refused")
+	}
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
+	tampered.ExtraCapabilities &^= fuse.CAP_PFS_CACHED_DATA
+	if err := verifyMountDecisions(tampered); err == nil {
+		t.Fatal("a mount that requests only half the private profile must be refused")
+	}
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
+	tampered.ExtraCapabilities &^= fuse.CAP_PFS_WRITE_ONESHOT
+	if err := verifyMountDecisions(tampered); err == nil {
+		t.Fatal("a mount that omits the one-shot write revision must be refused")
+	}
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
+	tampered.ExplicitDataCacheControl = false
+	if err := verifyMountDecisions(tampered); err == nil {
+		t.Fatal("a mount whose retained pages could be dropped by an mtime heuristic must be refused")
+	}
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
+	tampered.MaxReadAhead = 0
+	if err := verifyMountDecisions(tampered); err == nil {
+		t.Fatal("a mount that leaves the read-ahead window unnegotiated must be refused")
 	}
 }
 
@@ -722,7 +782,8 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 		in.Major, in.Minor = 7, 41
 		return in
 	}
-	required := uint64(fuse.CAP_POSIX_LOCKS | fuse.CAP_FLOCK_LOCKS | fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 | fuse.CAP_PFS_STRICT_COHERENCE)
+	required := uint64(fuse.CAP_POSIX_LOCKS | fuse.CAP_FLOCK_LOCKS | fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 |
+		fuse.CAP_PFS_STRICT_COHERENCE | fuse.CAP_PFS_CACHED_DATA | fuse.CAP_PFS_WRITE_ONESHOT | fuse.CAP_EXPLICIT_INVAL_DATA)
 	if err := verifyKernelGuarantees(notifying(settings(required)), 64*1024); err != nil {
 		t.Fatalf("a lock-forwarding kernel was refused: %v", err)
 	}
@@ -744,6 +805,19 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 	}
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_STRICT_COHERENCE)), 64*1024); err == nil {
 		t.Fatal("a kernel without the indivisible PortableFS strict-coherence contract must be refused")
+	}
+	// The private bits are one profile revision. A kernel offering only the
+	// older cached-data subset implements the retired direct-I/O open pair and would reject
+	// this daemon's very first regular OPEN with -EPROTO, so the mismatch has
+	// to be a failed mount rather than an aborted connection under load.
+	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_CACHED_DATA)), 64*1024); err == nil {
+		t.Fatal("a kernel implementing only the pre-cached-data revision of the contract must be refused")
+	}
+	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_WRITE_ONESHOT)), 64*1024); err == nil {
+		t.Fatal("a kernel implementing only the pre-one-shot revision of the contract must be refused")
+	}
+	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_EXPLICIT_INVAL_DATA)), 64*1024); err == nil {
+		t.Fatal("a kernel that cannot grant explicit data-cache control must be refused; retained pages would be dropped by an mtime heuristic")
 	}
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_HANDLE_KILLPRIV_V2)), 64*1024); err == nil {
 		t.Fatal("a kernel without HANDLE_KILLPRIV_V2 must be refused")

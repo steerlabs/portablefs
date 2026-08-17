@@ -226,6 +226,270 @@ func mustRenameSourceGate(t *testing.T, oldParent *authoritypb.Item, oldName str
 	return mustSourceGate(t, gate, err)
 }
 
+// beginUnsettledNegativeLookup leaves a cacheable absence between its original
+// reply write and its post-VFS receipt, matching the child scope which strict
+// atomic_open merges into the enclosing CREATE scope.
+func beginUnsettledNegativeLookup(t *testing.T, f *strictFixture, name string, written bool) uint64 {
+	t.Helper()
+	f.markMissing(name)
+	unique := f.unique.Add(2)
+	out := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, name, out); !status.Ok() {
+		t.Fatalf("negative LOOKUP %q = %v", name, status)
+	}
+	if out.NodeId != 0 || out.EntryValid == 0 {
+		t.Fatalf("negative LOOKUP %q published NodeId %d with lifetime %d", name, out.NodeId, out.EntryValid)
+	}
+	markTestReply(t, f.raw, unique)
+	if written {
+		f.raw.ReplyWritten(unique, fuse.OK)
+	}
+	return unique
+}
+
+func startRawCreate(f *strictFixture, unique uint64, name string) <-chan fuse.Status {
+	done := make(chan fuse.Status, 1)
+	go func() {
+		done <- f.raw.Create(nil, &fuse.CreateIn{
+			InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
+			Flags:    syscall.O_RDWR | syscall.O_CREAT,
+			Mode:     0o640,
+		}, name, &fuse.CreateOut{})
+	}()
+	return done
+}
+
+func awaitRawStatus(t *testing.T, done <-chan fuse.Status, what string) fuse.Status {
+	t.Helper()
+	select {
+	case status := <-done:
+		return status
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		return fuse.EIO
+	}
+}
+
+func TestWrittenSameMountNegativeDoesNotDeadlockAtomicCreate(t *testing.T) {
+	f := newStrictFixture(t)
+	const name = "atomic-create"
+	lookupUnique := beginUnsettledNegativeLookup(t, f, name, true)
+	f.unmarkMissing(name)
+	createUnique := f.unique.Add(2)
+	status := awaitRawStatus(t, startRawCreate(f, createUnique, name), "CREATE behind its merged negative LOOKUP")
+	if !status.Ok() {
+		t.Fatalf("CREATE behind written same-mount absence = %v", status)
+	}
+
+	// The CREATE reply is physically written before the outer kernel scope sends
+	// either receipt. The lookup receipt is first in merge order.
+	markTestReply(t, f.raw, createUnique)
+	f.raw.ReplyWritten(createUnique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, lookupUnique)
+	f.raw.mu.Lock()
+	_, absentBetweenReceipts := f.raw.cachedNegatives[nameKey{parent: fuse.FUSE_ROOT_ID, name: name}]
+	f.raw.mu.Unlock()
+	if absentBetweenReceipts {
+		t.Fatal("superseded lookup receipt restored the negative registry before the CREATE receipt")
+	}
+	acknowledgeTestPublication(t, f.raw, createUnique)
+	if f.mount.isRevoked() {
+		t.Fatalf("merged negative/CREATE receipts revoked the mount: %v", f.mount.fatalError())
+	}
+}
+
+func TestUnwrittenSameMountNegativeStillBlocksSourceMutation(t *testing.T) {
+	f := newStrictFixture(t)
+	const name = "not-written"
+	lookupUnique := beginUnsettledNegativeLookup(t, f, name, false)
+	f.unmarkMissing(name)
+	f.rpc.mu.Lock()
+	beforeCalls := f.rpc.calls
+	f.rpc.mu.Unlock()
+	createUnique := f.unique.Add(2)
+	done := startRawCreate(f, createUnique, name)
+	waitSourceState(t, f.raw, "CREATE source hold behind the unwritten negative reply", func(raw *rawFileSystem) bool {
+		return len(raw.sourceHolds) != 0
+	})
+	select {
+	case status := <-done:
+		t.Fatalf("CREATE passed an unwritten negative reply: %v", status)
+	default:
+	}
+	f.rpc.mu.Lock()
+	afterCalls := f.rpc.calls
+	f.rpc.mu.Unlock()
+	if afterCalls != beforeCalls {
+		t.Fatalf("blocked CREATE crossed authority dispatch: calls %d -> %d", beforeCalls, afterCalls)
+	}
+
+	// ReplyWritten is the edge which makes this mount's absence supersedable and
+	// wakes the parked source gate even though PFS_PUBLISH remains deferred.
+	f.raw.ReplyWritten(lookupUnique, fuse.OK)
+	if status := awaitRawStatus(t, done, "CREATE after the negative reply write"); !status.Ok() {
+		t.Fatalf("CREATE after negative reply write = %v", status)
+	}
+	markTestReply(t, f.raw, createUnique)
+	f.raw.ReplyWritten(createUnique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, lookupUnique)
+	acknowledgeTestPublication(t, f.raw, createUnique)
+}
+
+func TestDifferentMountNegativeStillBlocksSourceMutation(t *testing.T) {
+	f := newStrictFixture(t)
+	other := newStrictFixture(t)
+	const name = "other-mount"
+	lookupUnique := beginUnsettledNegativeLookup(t, f, name, true)
+	f.unmarkMissing(name)
+
+	// Source-publication registries are mount-local in production. Reassigning
+	// this retained publication's explicit owner models a foreign publication in
+	// the drain predicate and proves that ownership is part of the exception.
+	f.raw.mu.Lock()
+	publication := f.raw.replyPublications[lookupUnique]
+	if publication == nil || len(publication.names) != 1 || publication.names[0].negativeState == nil {
+		f.raw.mu.Unlock()
+		t.Fatal("negative lookup did not retain its publication ownership")
+	}
+	publication.owner = other.raw
+	publication.names[0].negativeState.owner = other.raw
+	f.raw.mu.Unlock()
+
+	createUnique := f.unique.Add(2)
+	done := startRawCreate(f, createUnique, name)
+	waitSourceState(t, f.raw, "CREATE source hold behind the foreign negative", func(raw *rawFileSystem) bool {
+		return len(raw.sourceHolds) != 0
+	})
+	select {
+	case status := <-done:
+		t.Fatalf("CREATE passed a different-mount negative publication: %v", status)
+	default:
+	}
+
+	acknowledgeTestPublication(t, f.raw, lookupUnique)
+	if status := awaitRawStatus(t, done, "CREATE after the foreign negative settled"); !status.Ok() {
+		t.Fatalf("CREATE after foreign negative settlement = %v", status)
+	}
+	markTestReply(t, f.raw, createUnique)
+	f.raw.ReplyWritten(createUnique, fuse.OK)
+	acknowledgeTestPublication(t, f.raw, createUnique)
+}
+
+func TestSupersededNegativeReceiptSettlesAfterCreateWithoutResurrection(t *testing.T) {
+	f := newStrictFixture(t)
+	const name = "late-negative-receipt"
+	lookupUnique := beginUnsettledNegativeLookup(t, f, name, true)
+	f.unmarkMissing(name)
+	createUnique := f.unique.Add(2)
+	if status := awaitRawStatus(t, startRawCreate(f, createUnique, name), "CREATE before reversed receipt settlement"); !status.Ok() {
+		t.Fatalf("CREATE = %v", status)
+	}
+	markTestReply(t, f.raw, createUnique)
+	f.raw.ReplyWritten(createUnique, fuse.OK)
+
+	// Reverse the kernel's normal merge order to make the invariant explicit:
+	// even after the binding receipt has settled and released its source lease,
+	// the older absence receipt is bookkeeping-only and cannot resurrect state.
+	acknowledgeTestPublication(t, f.raw, createUnique)
+	acknowledgeTestPublication(t, f.raw, lookupUnique)
+	f.raw.mu.Lock()
+	_, absent := f.raw.cachedNegatives[nameKey{parent: fuse.FUSE_ROOT_ID, name: name}]
+	negativePublications := len(f.raw.publishingNegativeNames)
+	publishing := len(f.raw.sourcePublishing)
+	f.raw.mu.Unlock()
+	if absent || negativePublications != 0 || publishing != 0 {
+		t.Fatalf("late negative settlement left absent=%t negative-publications=%d source-publications=%d", absent, negativePublications, publishing)
+	}
+	if f.mount.isRevoked() {
+		t.Fatalf("late superseded receipt revoked the mount: %v", f.mount.fatalError())
+	}
+}
+
+func TestEveryNameMaterializingOperationEagerlyDropsCachedNegative(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*strictFixture, uint64, string) fuse.Status
+	}{
+		{
+			name: "create",
+			run: func(f *strictFixture, unique uint64, name string) fuse.Status {
+				return f.raw.Create(nil, &fuse.CreateIn{
+					InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
+					Flags:    syscall.O_RDWR | syscall.O_CREAT, Mode: 0o640,
+				}, name, &fuse.CreateOut{})
+			},
+		},
+		{
+			name: "mknod",
+			run: func(f *strictFixture, unique uint64, name string) fuse.Status {
+				return f.raw.Mknod(nil, &fuse.MknodIn{
+					InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
+					Mode:     syscall.S_IFREG | 0o640,
+				}, name, &fuse.EntryOut{})
+			},
+		},
+		{
+			name: "mkdir",
+			run: func(f *strictFixture, unique uint64, name string) fuse.Status {
+				return f.raw.Mkdir(nil, &fuse.MkdirIn{
+					InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Mode: 0o750,
+				}, name, &fuse.EntryOut{})
+			},
+		},
+		{
+			name: "symlink",
+			run: func(f *strictFixture, unique uint64, name string) fuse.Status {
+				return f.raw.Symlink(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "target", name, &fuse.EntryOut{})
+			},
+		},
+		{
+			name: "link",
+			run: func(f *strictFixture, unique uint64, name string) fuse.Status {
+				source := f.lookup(t, fuse.FUSE_ROOT_ID, "link-source")
+				f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+					if request.GetLink() == nil {
+						return nil, errors.New("unexpected non-LINK request")
+					}
+					return &authoritypb.Response{Body: &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: cloneItem(f.rpc.item)}}}, nil
+				}
+				return f.raw.Link(nil, &fuse.LinkIn{
+					InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Oldnodeid: source.NodeId,
+				}, name, &fuse.EntryOut{})
+			},
+		},
+		{
+			name: "rename target",
+			run: func(f *strictFixture, unique uint64, name string) fuse.Status {
+				f.lookup(t, fuse.FUSE_ROOT_ID, "rename-source")
+				return f.raw.Rename(nil, &fuse.RenameIn{
+					InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID,
+				}, "rename-source", name)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			target := "materialized"
+			key := nameKey{parent: fuse.FUSE_ROOT_ID, name: target}
+			f.raw.mu.Lock()
+			f.raw.cachedNegatives[key] = struct{}{}
+			f.raw.mu.Unlock()
+			unique := f.unique.Add(2)
+			if status := test.run(f, unique, target); !status.Ok() {
+				t.Fatalf("%s = %v", test.name, status)
+			}
+			f.raw.mu.Lock()
+			_, absent := f.raw.cachedNegatives[key]
+			f.raw.mu.Unlock()
+			if absent {
+				t.Fatalf("%s returned while its target was still registered absent", test.name)
+			}
+			completeTestReply(t, f.raw, unique, fuse.OK)
+		})
+	}
+}
+
 func TestEveryLinuxVisibleOperationDeclaresItsExactSourceFootprint(t *testing.T) {
 	type operationCase struct {
 		name   string
@@ -434,9 +698,19 @@ func TestOnlySharedOpenTruncateRequiresPostVFSPublication(t *testing.T) {
 	}, ordinary); !status.Ok() {
 		t.Fatalf("ordinary OPEN = %v", status)
 	}
-	if ordinary.OpenFlags != coherentOpenFlags || f.raw.ReplyWriteOrdered(ordinaryUnique) ||
+	// An ordinary OPEN now publishes one thing -- that this kernel may retain
+	// the inode's pages -- so its reply is write-ordered against reverse
+	// notifications. It still takes no post-VFS receipt: the kernel forbids
+	// marking an unmarked OPEN, and there is nothing to mark, because the
+	// declaration installs no state a repair could miss. Every folio it permits
+	// is separately ordered against the barrier by mapping->invalidate_lock.
+	if ordinary.OpenFlags != coherentOpenFlags || !f.raw.ReplyWriteOrdered(ordinaryUnique) ||
 		f.raw.ReplyPublishMarked(ordinaryUnique, entry.NodeId, 14) {
-		t.Fatal("ordinary classification-only OPEN entered post-VFS publication")
+		t.Fatal("ordinary OPEN must be write-ordered for its retained-data declaration and must not be post-VFS marked")
+	}
+	completeTestReply(t, f.raw, ordinaryUnique, fuse.OK)
+	if !f.raw.cachedDataHolds(entry.Attr.Ino) {
+		t.Fatal("a published retained-data declaration must leave a withdrawal obligation behind")
 	}
 
 	directoryUnique := f.unique.Add(2)

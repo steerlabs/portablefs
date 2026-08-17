@@ -17,7 +17,6 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
-	"golang.org/x/sys/unix"
 )
 
 // CoherenceProfile is the kernel-cache contract a mount declares to the
@@ -57,12 +56,27 @@ const (
 	strictEntryTimeout = 60 * time.Second
 	strictAttrTimeout  = 60 * time.Second
 
-	// defaultCachedNameCapacity is the number of (parent, name) bindings a
+	// defaultCachedNameCapacity is the number of (parent, name) resolutions a
 	// strict mount is willing to leave resident in its kernel. It is declared
 	// to the authority because it is exactly the amount of state this mount
 	// promises it can repair, and therefore also the amount it must be able to
-	// walk during self-revocation.
+	// walk during self-revocation. Absences count against it exactly like
+	// bindings: a name the kernel answers from cache is a repair obligation
+	// whether the cached answer is "here it is" or "it is not there".
 	defaultCachedNameCapacity = 1 << 16
+
+	// negativeNameShare bounds the part of that capacity spent on absences.
+	// The sub-bound exists because nothing reclaims a negative entry the way
+	// FORGET reclaims a binding: the kernel holds no inode for a name that does
+	// not exist, so it never tells this frontend that it dropped the dentry,
+	// and an absence therefore leaves the registry only through a repair or
+	// through self-revocation. Without a share, a workload that probes for
+	// absent names -- an interpreter walking a search path, a linker trying
+	// every -L directory -- could fill the whole declared budget with absences
+	// and stop the mount caching the names that do exist. A quarter is far more
+	// than any real probe set needs (SQLite probes two names per database) and
+	// leaves the majority of the declared state for real bindings.
+	negativeNameShare = 4
 
 	// defaultRepairBudget is the per-phase deadline a strict mount commits to.
 	// A phase is a handful of write(2) calls on /dev/fuse; the only thing that
@@ -427,6 +441,12 @@ func (c *coherence) run(ctx context.Context) {
 	}
 }
 
+// errRepairBudgetExceeded classifies the one revocation cause a supervisor can
+// act on differently: this mount was healthy but too slow to repair. It is a
+// sentinel rather than a formatted string so classifyRevocationReason never has
+// to read prose.
+var errRepairBudgetExceeded = errors.New("fusev3: visibility phase exceeded the repair budget this mount declared")
+
 // applyWithinBudget performs exactly one phase under the deadline this mount
 // declared at attach. A kernel notification cannot be cancelled once it is
 // inside write(2), so the budget is enforced by revoking the mount, which
@@ -434,7 +454,7 @@ func (c *coherence) run(ctx context.Context) {
 // frontend keeps, not a hope that the kernel is quick.
 func (c *coherence) applyWithinBudget(ctx context.Context, event *authoritypb.VisibilityEvent) error {
 	overdue := time.AfterFunc(c.budget, func() {
-		c.mount.revoke(fmt.Errorf("fusev3: visibility phase exceeded the %s repair budget this mount declared", c.budget))
+		c.mount.revoke(fmt.Errorf("%w (%s)", errRepairBudgetExceeded, c.budget))
 	})
 	defer overdue.Stop()
 	return c.apply(ctx, event)
@@ -664,11 +684,14 @@ func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKe
 	}
 }
 
-// repair is one kernel cache repair this frontend owes.
+// repair is one kernel cache repair this frontend owes. A namespace repair is
+// negative when the cached answer being taken back was an absence: there is no
+// child identity, and the primitive that expires it differs accordingly.
 type repair struct {
 	parent   uint64
 	child    uint64
 	name     string
+	negative bool
 	inode    uint64
 	data     bool
 	size     uint64
@@ -706,8 +729,21 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 	}
 	completion.work = make([]repair, 0, len(keys.names)+len(keys.inodes))
 	for _, key := range keys.names {
+		// A name this mount cached is cached exactly once, as a binding or as
+		// an absence, because the kernel holds one dentry per name. Both are
+		// answers this kernel would keep serving after the mutation, so both
+		// are resolved here against the same target.
 		record := r.cachedNames[key]
 		if record == nil {
+			if _, absent := r.cachedNegatives[key]; !absent {
+				continue
+			}
+			parent := r.directoryLocked(key.parent)
+			r.dropCachedNegativeLocked(key)
+			if parent == nil {
+				continue
+			}
+			completion.work = append(completion.work, repair{parent: parent.id, name: key.name, negative: true})
 			continue
 		}
 		parent := r.directoryLocked(key.parent)
@@ -809,6 +845,25 @@ func (r *rawFileSystem) applyRepair(item repair) error {
 		// healthy observer after a remote unlink.
 		return nil
 	}
+	if item.negative {
+		// The cached answer being taken back is an absence, so there is no
+		// child identity for the kernel to validate and no watcher event that a
+		// creation on another machine owes this one -- nothing was deleted
+		// here. Expiring the name is the whole repair: the next path walk has
+		// to ask again. The strict kernel routes this expiration through the
+		// same lockless path as NotifyDelete, so it cannot deadlock against an
+		// unanswered namespace callback of this mount.
+		//
+		// Invalidating a name is unconditionally safe in this direction. The
+		// hazard a name-only expiry carries for a binding -- expiring a newer
+		// one that replaced it -- does not exist for an absence: the newer
+		// answer is precisely the one the mutation created, and losing it costs
+		// a LOOKUP rather than correctness.
+		if status := server.EntryNotify(item.parent, item.name); !status.Ok() && status != fuse.ENOENT {
+			return fmt.Errorf("fusev3: expire absent name %q under node %d: %v", item.name, item.parent, status)
+		}
+		return nil
+	}
 	deleteStatus := server.DeleteNotify(item.parent, item.child, item.name)
 	if deleteStatus.Ok() || deleteStatus == fuse.ENOENT {
 		return nil
@@ -833,14 +888,16 @@ func (r *rawFileSystem) releaseHeld() {
 	r.releasePeerPublicationLocked()
 }
 
-// revokeCachedNames walks the exact set of bindings this mount published and
-// takes every one of them back. It is bounded by the cached-name capacity this
-// mount declared at attach, which is precisely why that number is part of the
-// contract: it is the amount of stale state a dying participant has to be able
-// to withdraw.
+// revokeCachedNames walks the exact set of name answers this mount published
+// and takes every one of them back. Absences are withdrawn beside bindings: a
+// dying participant that leaves a cached "not there" behind is exactly as wrong
+// as one that leaves a cached binding, because the name may already exist. The
+// walk is bounded by the cached-name capacity this mount declared at attach,
+// which is precisely why that number is part of the contract: it is the amount
+// of stale state a dying participant has to be able to withdraw.
 func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 	r.mu.Lock()
-	work := make([]repair, 0, len(r.cachedNames))
+	work := make([]repair, 0, len(r.cachedNames)+len(r.cachedNegatives))
 	for key, record := range r.cachedNames {
 		parent := r.directoryLocked(key.parent)
 		if parent == nil {
@@ -848,9 +905,17 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 		}
 		work = append(work, repair{parent: parent.id, child: record.id, name: key.name})
 	}
+	for key := range r.cachedNegatives {
+		parent := r.directoryLocked(key.parent)
+		if parent == nil {
+			continue
+		}
+		work = append(work, repair{parent: parent.id, name: key.name, negative: true})
+	}
 	r.cachedNames = make(map[nameKey]*inodeRecord)
 	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
 	r.cachedNameStable = make(map[nameKey]publicationNamespace)
+	r.cachedNegatives = make(map[nameKey]struct{})
 	r.mu.Unlock()
 	server := r.mount.notifier()
 	if server == nil {
@@ -860,8 +925,65 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 		if time.Now().After(deadline) {
 			return
 		}
+		if item.negative {
+			_ = server.EntryNotify(item.parent, item.name)
+			continue
+		}
 		_ = server.DeleteNotify(item.parent, item.child, item.name)
 	}
+}
+
+// revokeCachedData drops every page this mount told its kernel it could keep.
+//
+// This is the one withdrawal that has no softer form. A cached name or a cached
+// attribute is only ever an answer the kernel will ask about again once it
+// expires, and until then the serving path can refuse. A retained page is not:
+// with FOPEN_KEEP_CACHE a read of a resident folio is completed inside the
+// kernel with no request reaching this process at all, so revoked.Store(true)
+// and the ENOTCONN choke point in acquireBulk -- which are what bound every
+// other kind of stale service -- cannot see it, let alone refuse it. Neither
+// can the FUSE connection abort at the end of the withdrawal ladder: aborting
+// fails every future request, and a page that needs no request is unaffected.
+// Without this pass a process whose working directory was already inside the
+// mount could keep reading pre-fence bytes for as long as it held the file
+// open. That is exactly the 8.6s stale-read window failure-modes.md records as
+// a known macOS defect, and it is not one this platform is going to reproduce.
+//
+// The walk is bounded by the same declared repair budget the name withdrawal
+// uses. It runs after namespace detach but before connection abort: the mount
+// is already revoked, so the serving path refuses every FUSE_READ, while the
+// notification channel is still alive. The patched kernel serializes this
+// withdrawal with page fills, so one pass is final rather than a race the next
+// reader can undo.
+func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
+	r.mu.Lock()
+	work := make([]repair, 0, len(r.cachedData))
+	for inode, record := range r.cachedData {
+		_ = inode
+		work = append(work, repair{inode: record.id, data: true})
+	}
+	r.cachedData = make(map[uint64]*inodeRecord)
+	r.mu.Unlock()
+	server := r.mount.notifier()
+	if server == nil {
+		return nil
+	}
+	var failures []string
+	for _, item := range work {
+		if time.Now().After(deadline) {
+			failures = append(failures, fmt.Sprintf("data withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-len(failures)))
+			return failures
+		}
+		// ENOENT is the strongest possible outcome: the kernel holds no inode
+		// state at all, so there is nothing left that could answer from the old
+		// pages. Every other failure is recorded, because a page this mount
+		// could not take back is stale data a fenced participant can still
+		// serve, and the operator has to be told that in the revocation report.
+		if status := server.InodeNotify(item.inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
+			failures = append(failures, fmt.Sprintf("withdraw cached data for inode %d: %v", item.inode, status))
+		}
+	}
+	return failures
 }
 
 // revoke makes this mount unusable immediately and permanently. It is the local
@@ -869,13 +991,25 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 // participant died: a strict mount that can no longer repair must stop serving
 // what it already cached rather than continue.
 //
-// The bound on stale service is stated in three parts, strongest first. Every
+// The bound on stale service is stated in four parts, strongest first. Every
 // new request is refused synchronously, before this call returns. From the
 // mount namespace root the tree becomes unreachable in one syscall. For a
 // process whose working directory was already inside the mount, every binding
 // this frontend published is withdrawn within the declared repair budget, after
 // which the connection is aborted and there is no request this mount could
-// answer wrongly at all.
+// answer wrongly at all. Finally -- and this is the part that requests alone
+// cannot cover, because a retained page is served without one -- every inode
+// whose data this mount declared retainable has that data dropped from the
+// kernel before aborting the notification channel. The frontend's revoked
+// admission blocks new fills, and the kernel serializes the withdrawal with
+// any fill already in progress.
+//
+// What that leaves is exact rather than approximate: an already-established
+// MAP_PRIVATE page table entry is torn down by the same
+// invalidate_inode_pages2() the withdrawal performs, so the next access
+// refaults into a dead connection and takes SIGBUS rather than reading stale
+// bytes. If the withdrawal itself fails, that failure is recorded in the
+// revocation report instead of being presented as a clean teardown.
 func (m *Mount) revoke(cause error) {
 	if cause == nil {
 		cause = errors.New("fusev3: strict mount revoked")
@@ -886,21 +1020,222 @@ func (m *Mount) revoke(cause error) {
 	m.failAsync(cause)
 }
 
+// The revocation reason vocabulary. It is the machine-readable half of a
+// revocation report: one bounded token a supervisor can branch on and persist,
+// beside the frontend's own sentence which it can only print. The identical
+// tokens are the ones the macOS supervisor's watchdog produces (see the CLI's
+// fskit_revocation.go), so one operator-facing vocabulary covers both
+// platforms even though the mechanisms behind them cannot be shared.
+const (
+	// RevocationSessionTerminal: the authority session ended permanently, so
+	// nothing can repair this kernel's caches again.
+	RevocationSessionTerminal = "session-terminal"
+	// RevocationRepairBudgetExceeded: this mount was still connected but did
+	// not complete a visibility phase inside the budget it declared at attach.
+	RevocationRepairBudgetExceeded = "repair-budget-exceeded"
+	// RevocationRoutesChanged: the volume's machine-local route declaration
+	// moved under a mount whose topology is fixed for its lifetime.
+	RevocationRoutesChanged = "routes-changed"
+	// RevocationCoherenceViolation: the residual class. This frontend found a
+	// state it cannot serve coherently and stopped being a filesystem.
+	RevocationCoherenceViolation = "coherence-violation"
+)
+
+// classifyRevocationReason reduces the recorded cause to one vocabulary token.
+// Only causes with a sentinel behind them are classified; everything else is a
+// coherence violation, which is the honest default because that is what every
+// unclassified revoke callsite in this package actually is.
+func classifyRevocationReason(cause error) string {
+	switch {
+	case cause == nil:
+		return RevocationCoherenceViolation
+	case errors.Is(cause, errRepairBudgetExceeded):
+		return RevocationRepairBudgetExceeded
+	case errors.Is(cause, errRoutesChanged):
+		return RevocationRoutesChanged
+	case errors.Is(cause, authorityrpc.ErrSessionEnded):
+		return RevocationSessionTerminal
+	default:
+		return RevocationCoherenceViolation
+	}
+}
+
+// RevocationReport is one self-revocation made observable: why this mount
+// stopped serving, and what its escalating withdrawal actually proved about the
+// kernel state it left behind.
+//
+// KernelStateWithdrawn is the load-bearing field. A revoked mount whose kernel
+// mount is still installed is not a tidy failure: the dead FUSE mount remains
+// in the namespace, no mount-absence proof can be produced, and the authority's
+// durable strict membership therefore stays active until an operator discharges
+// it by hand. Reporting false is what lets a supervisor say so instead of
+// showing the mount as live.
+type RevocationReport struct {
+	Reason               string
+	Cause                string
+	KernelStateWithdrawn bool
+	// Withdrawal names every escalation step that failed, in order, as
+	// "<round>/<step>: <error>". It is empty on a first-attempt withdrawal.
+	// A "data-withdrawal" step is the one entry that reports residual stale
+	// service rather than residual mount state: it means retained pages this
+	// mount published could not be dropped, so a process still inside the
+	// mount may read pre-fence bytes.
+	Withdrawal []string
+}
+
+// withdrawalRounds bounds the escalation ladder. Three rounds is the smallest
+// number that expresses the whole escalation — detach, abort, re-detach — and
+// still leaves one round of margin; the ladder is additionally bounded by the
+// repair budget this mount declared, because a withdrawal that outlived the
+// budget has already lost the race it exists to win.
+const withdrawalRounds = 3
+
+// withdrawalRetryDelay is the first inter-round pause, doubled each round. It
+// is short: the kernel references a busy detach could not take back are
+// released by the abort in the same round, not by waiting.
+const withdrawalRetryDelay = 25 * time.Millisecond
+
+// withdrawalOutcome accumulates what the ladder did. installed records whether
+// there was a recorded kernel identity to withdraw at all, which is different
+// from having withdrawn one: a startup that failed before mountinfo yielded an
+// ID has nothing here whose absence could be proven.
+type withdrawalOutcome struct {
+	installed bool
+	withdrawn bool
+	failures  []string
+}
+
+func (o *withdrawalOutcome) record(round int, step string, err error) {
+	if err == nil {
+		return
+	}
+	o.failures = append(o.failures, fmt.Sprintf("%d/%s: %v", round, step, err))
+}
+
+// kernelWithdrawal is the set of kernel primitives the escalation ladder
+// drives. Production binds detach to the mount-owner fusermount helper and the
+// remaining steps to kernel interfaces; a test substitutes them
+// to exercise the escalation without a kernel, which is the only way to cover
+// the failure ladder at all.
+type kernelWithdrawal struct {
+	detach func(point string) error
+	abort  func(kernelMount) error
+	absent func(kernelMount) (MountAbsenceProof, error)
+	sleep  func(time.Duration)
+}
+
+func (m *Mount) productionKernelWithdrawal() kernelWithdrawal {
+	return kernelWithdrawal{
+		detach: func(string) error {
+			if m.server == nil {
+				return errors.New("fusev3: lazy detach has no FUSE server")
+			}
+			return m.server.UnmountLazy()
+		},
+		abort:  func(k kernelMount) error { return k.abortKernelConnection() },
+		absent: func(k kernelMount) (MountAbsenceProof, error) { return k.absent() },
+		sleep:  time.Sleep,
+	}
+}
+
+func (m *Mount) withdrawalOps() kernelWithdrawal {
+	if m.withdrawal.detach != nil {
+		return m.withdrawal
+	}
+	return m.productionKernelWithdrawal()
+}
+
 // withdrawKernelState is the strict half of teardown. It runs on the teardown
-// goroutine because two of its three steps can block, and none of them may
-// block whoever discovered the failure.
-func (m *Mount) withdrawKernelState() {
+// goroutine because most of its steps can block, and none of them may block
+// whoever discovered the failure.
+//
+// Every step's error is checked. A discarded detach failure leaves a dead FUSE
+// mount installed in the namespace with the CLI still reporting it live and
+// the authority still holding this participant's strict membership. So the
+// steps are an escalation ladder instead: lazy-detach through the mount owner's
+// fusermount helper, withdraw retained kernel state while /dev/fuse is still a
+// valid notification channel, abort the connection, then prove absence and
+// repeat if necessary, bounded by
+// withdrawalRounds and by the declared repair budget. Whatever it proves is
+// returned, so the caller can persist a truthful verdict either way.
+func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	m.revoked.Store(true)
+	ops := m.withdrawalOps()
 	installed := m.kernelMount
-	if installed.point != "" {
-		_ = unix.Unmount(installed.point, unix.MNT_DETACH)
+	out := withdrawalOutcome{installed: installed.point != ""}
+
+	// Round one's namespace detach runs before the cached-name withdrawal, so
+	// the tree is already unreachable from the namespace root while the
+	// bindings are being taken back one at a time. The retained-data
+	// withdrawal runs later still but necessarily before the first abort: the
+	// patched kernel makes the pass final, while an aborted go-fuse loop can
+	// close the notification descriptor before userspace reaches it.
+	if out.installed {
+		out.record(1, "detach", ops.detach(installed.point))
 	}
 	if m.raw != nil {
 		m.raw.revokeCachedNames(time.Now().Add(m.repairBudget))
 	}
-	if installed.device != "" {
-		_ = installed.abortKernelConnection()
+	deadline := time.Now().Add(m.repairBudget)
+	if m.raw != nil {
+		for _, failure := range m.raw.revokeCachedData(deadline) {
+			out.record(1, "data-withdrawal", errors.New(failure))
+		}
 	}
+	delay := withdrawalRetryDelay
+	for round := 1; ; round++ {
+		// Aborting is unconditional and is never skipped just because the
+		// detach reported success: it unblocks any request still parked on an
+		// authority operation and terminates the serving connection after the
+		// notification withdrawals above have completed.
+		if installed.device != "" {
+			out.record(round, "abort", ops.abort(installed))
+		}
+		if !out.installed {
+			// No recorded kernel identity: startup failed before mountinfo
+			// yielded one. There is nothing here whose absence this ladder
+			// could prove, and the caller falls back to the ordinary unmount.
+			return out
+		}
+		if _, err := ops.absent(installed); err == nil {
+			out.withdrawn = true
+			return out
+		} else {
+			out.record(round, "absence", err)
+		}
+		if round >= withdrawalRounds || !time.Now().Before(deadline) {
+			return out
+		}
+		ops.sleep(delay)
+		delay *= 2
+		out.record(round+1, "detach", ops.detach(installed.point))
+	}
+}
+
+// reportRevocation hands the supervisor the terminal verdict exactly once, from
+// the teardown goroutine, as soon as the ladder has finished. It deliberately
+// does not wait for Close: when withdrawal fails there may be no later moment
+// at which the supervisor learns anything at all, and an unobserved revocation
+// is the defect this whole path exists to remove.
+//
+// A recorded fatal cause is required. Not every path through the teardown
+// goroutine is a revocation: the benign /dev/fuse reply race that follows an
+// already-observed external unmount schedules the same teardown without
+// recording any cause, and reporting that as a revocation would stamp a
+// terminal verdict onto an ordinary clean unmount.
+func (m *Mount) reportRevocation(out withdrawalOutcome) {
+	observe := m.onRevoked
+	cause := m.fatalError()
+	if observe == nil || cause == nil {
+		return
+	}
+	report := RevocationReport{
+		Reason:               classifyRevocationReason(cause),
+		Cause:                cause.Error(),
+		KernelStateWithdrawn: out.withdrawn,
+		Withdrawal:           out.failures,
+	}
+	m.revokeOnce.Do(func() { observe(report) })
 }
 
 func (m *Mount) isRevoked() bool { return m.revoked.Load() }
@@ -910,9 +1245,21 @@ func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 // an interface so the mapping from a visibility target to a notification can be
 // tested without a kernel; *fuse.Server is the only production implementation.
 type kernelNotifier interface {
+	// InodeNotify(node, -1, 0) withdraws cached attributes only, which is what
+	// an ATTRIBUTES repair owes. InodeNotify(node, 0, 0) is the strict
+	// whole-inode data withdrawal used by self-revocation: the patched kernel
+	// routes that exact shape through fuse_pfs_withdraw_data(), which drops
+	// every retained folio under the same publication mutex and
+	// mapping->invalidate_lock an ordered DATA publication takes, and which
+	// deliberately consumes no authority sequence.
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
 	PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status
 	DeleteNotify(parent uint64, child uint64, name string) fuse.Status
+	// EntryNotify takes back a cached absence. It is the name-only primitive,
+	// which is the correct one here and only here: an absence has no child
+	// identity to validate, and the strict kernel expires it under the same
+	// lockless path DeleteNotify uses.
+	EntryNotify(parent uint64, name string) fuse.Status
 }
 
 var _ kernelNotifier = (*fuse.Server)(nil)

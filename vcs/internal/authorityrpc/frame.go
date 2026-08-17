@@ -70,11 +70,68 @@ func (b *frameBudget) release(n uint32) {
 	b.mu.Unlock()
 }
 
+// framePoolGranularity is the width of one recycled payload class. Classes are
+// linear rather than powers of two because the size that matters is a maximal
+// bulk body plus a small protobuf header: a power-of-two class would round that
+// to twice the frame, and Go satisfies a fresh multi-megabyte allocation out of
+// already-zero pages, so an oversized class loses more on a pool miss than the
+// pool wins on a hit. At 64 KiB a maximal 1 MiB write stays within 6% of its
+// exact size.
+const framePoolGranularity = 64 << 10
+
+// framePoolClasses covers 64 KiB through 4 MiB, which spans every frame a legal
+// authority bound can produce. A smaller frame is a control-sized message whose
+// allocation never shows up next to the TLS record work that produced it, and a
+// larger one is allocated directly rather than parked in a class no other
+// reader would draw from.
+const framePoolClasses = 64
+
+var framePools [framePoolClasses]sync.Pool
+
+// framePoolClass is the pool whose buffers are exactly large enough for size,
+// or -1 when size has no class. framePoolBytes is that class's buffer size.
+func framePoolClass(size int) int {
+	if size < framePoolGranularity {
+		return -1
+	}
+	class := (size+framePoolGranularity-1)/framePoolGranularity - 1
+	if class < 0 || class >= framePoolClasses {
+		return -1
+	}
+	return class
+}
+
+func framePoolBytes(class int) int { return (class + 1) * framePoolGranularity }
+
+// acquireFramePayload returns a size-length buffer whose every byte the caller
+// immediately overwrites with the frame it is reading. A pooled buffer is
+// deliberately not cleared: zeroing a megabyte in order to read a megabyte over
+// it is the cost this pool exists to remove, and a payload is only ever exposed
+// through io.ReadFull, which fails rather than leave a byte unwritten.
+func acquireFramePayload(size int) ([]byte, int) {
+	class := framePoolClass(size)
+	if class < 0 {
+		return make([]byte, size), class
+	}
+	if pooled, _ := framePools[class].Get().(*[]byte); pooled != nil {
+		return (*pooled)[:size], class
+	}
+	return make([]byte, framePoolBytes(class))[:size], class
+}
+
+func releaseFramePayload(payload []byte, class int) {
+	if class < 0 {
+		return
+	}
+	full := payload[:cap(payload)]
+	framePools[class].Put(&full)
+}
+
 // readFrame decodes one framed protobuf message. A frame has two lengths:
 // protobuf metadata followed by an optional out-of-line bulk body. Only
-// WriteTransactionRequest.Data and ReadReply.Data are the only legal bulk
-// bodies. Keeping the payload
-// body outside protobuf removes the full-size marshal and unmarshal copies from
+// WriteTransactionRequest.Data, OneShotWriteRequest.Data, and ReadReply.Data
+// are the only legal bulk bodies. Keeping the payload outside protobuf removes
+// the full-size marshal and unmarshal copies from
 // the data path without creating a second protocol or weakening replay: the
 // reconstructed Request is exactly what the authority's canonical replay
 // fingerprint authenticates.
@@ -84,14 +141,24 @@ func (b *frameBudget) release(n uint32) {
 // server uses readFrameRetained so its reservation covers the lifetime of the
 // zero-copy bulk slice through handler execution.
 func readFrame(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message) error {
-	release, err := readFrameRetained(r, max, budget, wait, message)
+	// The decoded message keeps the frame's bulk slice and this caller has no
+	// later boundary at which that slice dies, so the payload is not recycled.
+	release, err := readFrameInto(r, max, budget, wait, message, false)
 	if release != nil {
 		release()
 	}
 	return err
 }
 
+// readFrameRetained reads one frame whose payload the caller keeps until it
+// runs the returned release. release is the payload's exact end of life: it
+// drops the bulk slice from message and hands the buffer to the next reader, so
+// a caller must be finished with message before running it.
 func readFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message) (func(), error) {
+	return readFrameInto(r, max, budget, wait, message, true)
+}
+
+func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message, recycle bool) (func(), error) {
 	var header [frameHeaderBytes]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, err
@@ -107,10 +174,30 @@ func readFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.D
 			return nil, err
 		}
 	}
+	var payload []byte
+	class := -1
+	if recycle {
+		payload, class = acquireFramePayload(int(total))
+	} else {
+		payload = make([]byte, int(total))
+	}
+	// retained is the carrier that aliases payload once the frame is decoded.
+	// Clearing it in release makes the end of the bulk slice's life explicit
+	// instead of a convention a handler could quietly outlive.
+	var retained *[]byte
 	released := false
 	release := func() {
-		if budget != nil && !released {
-			released = true
+		if released {
+			return
+		}
+		released = true
+		if recycle {
+			if retained != nil {
+				*retained = nil
+			}
+			releaseFramePayload(payload, class)
+		}
+		if budget != nil {
 			budget.release(uint32(total))
 		}
 	}
@@ -118,7 +205,6 @@ func readFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.D
 		release()
 		return nil, err
 	}
-	payload := make([]byte, int(total))
 	if _, err := io.ReadFull(r, payload); err != nil {
 		return fail(err)
 	}
@@ -142,6 +228,7 @@ func readFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.D
 			return fail(fmt.Errorf("%w: %d bytes have no legal carrier", ErrFramePayload, bulkSize))
 		}
 		*carrier = bulk
+		retained = carrier
 	}
 	return release, nil
 }
@@ -192,8 +279,11 @@ func writeFrame(w io.Writer, max uint32, message proto.Message) error {
 func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 	switch typed := message.(type) {
 	case *authoritypb.Request:
-		if appendRequest := typed.GetWriteTransaction(); appendRequest != nil {
-			return &appendRequest.Data, nil
+		if transaction := typed.GetWriteTransaction(); transaction != nil {
+			return &transaction.Data, nil
+		}
+		if write := typed.GetOneShotWrite(); write != nil {
+			return &write.Data, nil
 		}
 	case *authoritypb.Response:
 		if read := typed.GetRead(); read != nil {

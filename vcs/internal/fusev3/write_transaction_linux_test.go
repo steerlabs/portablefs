@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"slices"
@@ -56,6 +57,140 @@ func callWriteTransaction(fixture *strictFixture, input *fuse.PFSWriteIn, data [
 		input.Unique = unique
 		return fixture.raw.PFSWrite(nil, input, data, out)
 	})
+}
+
+func oneShotWriteInput(nodeID, handle uint64, size uint32) *fuse.PFSWriteIn {
+	return &fuse.PFSWriteIn{
+		InHeader:      fuse.InHeader{NodeId: nodeID},
+		Fh:            handle,
+		RequestedSize: uint64(size),
+		RlimitFsize:   kernelMaxRWCount(),
+		FileMaxSize:   kernelMaxRWCount(),
+		LockOwner:     91,
+		WriteFlags:    fuse.WRITE_LOCKOWNER,
+		Flags:         uint32(syscall.O_APPEND),
+		Size:          size,
+		Phase:         fuse.PFS_WRITE_ONE_SHOT,
+	}
+}
+
+func TestPFSWriteOneShotUsesOneRetainedMutationWithoutTransactionID(t *testing.T) {
+	fixture := newStrictFixture(t)
+	nodeID, handle := openWriteTransactionTestHandle(t, fixture)
+	consumption := &recordingResponseConsumption{}
+	fixture.rpc.mu.Lock()
+	fixture.rpc.retainedConsumption = consumption
+	beforeMutations := fixture.rpc.mutationCalls
+	beforeAssignments := fixture.rpc.assignments
+	fixture.rpc.mu.Unlock()
+	fixture.raw.writeMu.Lock()
+	nextBefore := fixture.raw.nextWriteTx
+	fixture.raw.writeMu.Unlock()
+
+	input := oneShotWriteInput(nodeID, handle, 4)
+	input.Unique = fixture.unique.Add(2)
+	out := &fuse.PFSWriteOut{}
+	// BEGIN serialization must be irrelevant to ordinary one-shot mutations.
+	fixture.raw.writeBeginMu.Lock()
+	result := make(chan fuse.Status, 1)
+	go func() { result <- fixture.raw.PFSWrite(nil, input, []byte("data"), out) }()
+	select {
+	case status := <-result:
+		if !status.Ok() {
+			fixture.raw.writeBeginMu.Unlock()
+			t.Fatalf("one-shot PFS_WRITE = %v", status)
+		}
+	case <-time.After(2 * time.Second):
+		fixture.raw.writeBeginMu.Unlock()
+		t.Fatal("one-shot write blocked on BEGIN transaction serialization")
+	}
+	fixture.raw.writeBeginMu.Unlock()
+
+	if out.Txid != 0 || out.Flags != fuse.PFS_WRITE_OUT_COMMITTED || out.CommittedSize != 4 ||
+		out.AssignedOffset != 100 || out.PostSize != 104 || out.Sequence != 17 || out.Error != 0 {
+		t.Fatalf("one-shot result = %+v", out)
+	}
+	fixture.rpc.snapshot(func(rpc *fakeRPC) {
+		if rpc.mutationCalls != beforeMutations+1 || rpc.assignments != beforeAssignments+1 || len(rpc.oneShotWrites) != 1 || len(rpc.writeTransactions) != 0 {
+			t.Fatalf("one-shot authority calls = mutations %d (before %d), assignments %d (before %d), one-shot %d, transactions %d",
+				rpc.mutationCalls, beforeMutations, rpc.assignments, beforeAssignments, len(rpc.oneShotWrites), len(rpc.writeTransactions))
+		}
+		request := rpc.oneShotRequests[0]
+		if request.GetFrontendOperationId() != input.Unique ||
+			!bytes.Equal(request.GetOneShotWrite().GetData(), []byte("data")) || request.GetOneShotWrite().GetSize() != 4 ||
+			len(request.GetSourcePublicationGate().GetTargets()) != 1 {
+			t.Fatalf("one-shot retained mutation request = %+v", request)
+		}
+	})
+	fixture.raw.writeMu.Lock()
+	if fixture.raw.nextWriteTx != nextBefore || len(fixture.raw.writeTx) != 0 {
+		fixture.raw.writeMu.Unlock()
+		t.Fatal("one-shot write consumed or registered a transaction ID")
+	}
+	fixture.raw.writeMu.Unlock()
+	if consumption.calls.Load() != 0 || !fixture.raw.ReplyWriteOrdered(input.Unique) ||
+		!fixture.raw.ReplyPublishMarked(input.Unique, nodeID, fuse.PFS_WRITE_OPCODE) {
+		t.Fatal("one-shot response did not retain its mutation through post-VFS publication")
+	}
+	fixture.raw.ReplyWritten(input.Unique, fuse.OK)
+	if consumption.calls.Load() != 0 {
+		t.Fatal("one-shot response was consumed before PFS_PUBLISH")
+	}
+	publishUnique := fixture.unique.Add(2)
+	publishOut := &fuse.PFSPublishOut{}
+	status := fixture.raw.PFSPublish(nil, &fuse.PFSPublishIn{
+		InHeader: fuse.InHeader{Unique: publishUnique}, RequestUnique: input.Unique,
+		PublicationID: 1, Nodeid: nodeID, Opcode: fuse.PFS_WRITE_OPCODE,
+	}, publishOut)
+	if !status.Ok() {
+		t.Fatalf("one-shot PFS_PUBLISH = %v", status)
+	}
+	fixture.raw.ReplyWritten(publishUnique, fuse.OK)
+	if consumption.calls.Load() != 1 {
+		t.Fatalf("one-shot retained response consumption = %d, want 1", consumption.calls.Load())
+	}
+}
+
+func TestPFSWriteOneShotBoundaryAndDefiniteRejection(t *testing.T) {
+	fixture := newStrictFixture(t)
+	nodeID, handle := openWriteTransactionTestHandle(t, fixture)
+	atLimit := oneShotWriteInput(nodeID, handle, fixture.raw.maxWrite)
+	payload := make([]byte, fixture.raw.maxWrite)
+	if !validOneShotWriteMetadata(func() *fuse.PFSWriteIn { atLimit.Unique = 2; return atLimit }(), payload, fixture.raw.maxWrite) {
+		t.Fatal("one-shot metadata rejected payload exactly at max_write")
+	}
+	overLimit := oneShotWriteInput(nodeID, handle, fixture.raw.maxWrite+1)
+	overLimit.Unique = 2
+	if validOneShotWriteMetadata(overLimit, make([]byte, overLimit.Size), fixture.raw.maxWrite) {
+		t.Fatal("one-shot metadata accepted payload above max_write")
+	}
+
+	consumption := &recordingResponseConsumption{}
+	fixture.rpc.mu.Lock()
+	fixture.rpc.retainedConsumption = consumption
+	fixture.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetOneShotWrite() == nil {
+			return nil, errors.New("unexpected non-one-shot request")
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
+			Flags: fuse.PFS_WRITE_OUT_REJECTED, Error: -int32(syscall.ENOSPC),
+		}}}, nil
+	}
+	fixture.rpc.mu.Unlock()
+	input := oneShotWriteInput(nodeID, handle, 1)
+	input.Unique = fixture.unique.Add(2)
+	out := &fuse.PFSWriteOut{}
+	if status := fixture.raw.PFSWrite(nil, input, []byte("x"), out); !status.Ok() ||
+		out.Flags != fuse.PFS_WRITE_OUT_REJECTED || out.Error != -int32(syscall.ENOSPC) {
+		t.Fatalf("definite one-shot rejection = (%v, %+v)", status, out)
+	}
+	if fixture.raw.ReplyPublishMarked(input.Unique, nodeID, fuse.PFS_WRITE_OPCODE) {
+		t.Fatal("definite one-shot rejection requested post-VFS publication")
+	}
+	fixture.raw.ReplyWritten(input.Unique, fuse.OK)
+	if consumption.calls.Load() != 1 {
+		t.Fatalf("rejected one-shot retained consumption = %d, want 1", consumption.calls.Load())
+	}
 }
 
 func TestPFSWriteInertPhasesRetainAuthorityResponseUntilPhysicalReply(t *testing.T) {

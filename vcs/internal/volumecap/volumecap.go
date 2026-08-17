@@ -141,26 +141,11 @@ func (a *Authorizer) verify(volumeID string, token []byte, peer [32]byte, sessio
 		a.ClockSkew < 0 || a.MaxLifetime <= 0 || a.MaxRetainedNonces <= 0 {
 		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
-	parts := strings.Split(string(token), ".")
-	if len(parts) != 3 || parts[0] != "v1" {
+	claims, payload, signature, err := decode(token)
+	if err != nil {
 		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil || len(payload) == 0 || len(payload) > 4096 {
-		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
-	}
-	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil || len(signature) != ed25519.SignatureSize ||
-		!ed25519.Verify(a.PublicKey, append([]byte(domain), payload...), signature) {
-		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
-	}
-	dec := json.NewDecoder(bytes.NewReader(payload))
-	dec.DisallowUnknownFields()
-	var claims Claims
-	if err := dec.Decode(&claims); err != nil {
-		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
-	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	if !ed25519.Verify(a.PublicKey, append([]byte(domain), payload...), signature) {
 		return volumeserver.Authorization{}, [32]byte{}, ErrInvalid
 	}
 	if claims.VolumeID != volumeID || claims.Subject == "" || claims.Nonce == "" || claims.Expires <= claims.NotBefore {
@@ -320,6 +305,51 @@ func (q *nonceExpiryQueue) Pop() any {
 	last := old[len(old)-1]
 	*q = old[:len(old)-1]
 	return last
+}
+
+// Inspect returns the claims a capability carries without verifying its
+// signature, which is the only thing the holder of a capability can do: the
+// signing key's public half belongs to the authority, and the authority's
+// verdict is the sole authorization. A mount uses it to read the session,
+// sequence and expiry the credential it was handed declares, so it can
+// schedule its own renewal against that expiry and refuse to present a
+// credential that is not the one its next reauthorization needs. Nothing it
+// returns is trusted: the authority verifies the same bytes independently, and
+// a mount that inspected a forgery simply gets refused.
+func Inspect(token []byte) (Claims, error) {
+	claims, _, _, err := decode(token)
+	return claims, err
+}
+
+// decode parses the token structure. It performs every bound and encoding
+// check the format has, and no decision: verify supplies the signature check
+// and the policy, Inspect supplies neither.
+func decode(token []byte) (Claims, []byte, []byte, error) {
+	if len(token) == 0 || len(token) > 8192 {
+		return Claims{}, nil, nil, ErrInvalid
+	}
+	parts := strings.Split(string(token), ".")
+	if len(parts) != 3 || parts[0] != "v1" {
+		return Claims{}, nil, nil, ErrInvalid
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil || len(payload) == 0 || len(payload) > 4096 {
+		return Claims{}, nil, nil, ErrInvalid
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return Claims{}, nil, nil, ErrInvalid
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	var claims Claims
+	if err := decoder.Decode(&claims); err != nil {
+		return Claims{}, nil, nil, ErrInvalid
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return Claims{}, nil, nil, ErrInvalid
+	}
+	return claims, payload, signature, nil
 }
 
 // Sign is used by the control plane and tests. JSON bytes are signed exactly as

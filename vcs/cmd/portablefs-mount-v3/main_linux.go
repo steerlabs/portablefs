@@ -37,7 +37,7 @@ func run() error {
 		authority          = flag.String("authority", "", "authority host:port")
 		volumeID           = flag.String("volume-id", "", "exact volume identity")
 		mountpoint         = flag.String("mountpoint", "", "existing empty mount directory")
-		accessTokenFile    = flag.String("access-token-file", "", "file containing a short-lived volume capability")
+		accessTokenFile    = flag.String("access-token-file", "", "file containing a short-lived volume capability; re-read for reauthorization whenever its issuer rotates it in place")
 		clientCert         = flag.String("tls-cert", "", "client TLS certificate PEM")
 		clientKey          = flag.String("tls-key", "", "client TLS private key PEM")
 		serverCA           = flag.String("tls-server-ca", "", "authority CA certificate PEM")
@@ -172,11 +172,26 @@ func run() error {
 		return err
 	}
 	log.Printf("PortableFS v3 volume %s mounted at %s (%s coherence)", *volumeID, absoluteMount, profile)
+	// The capability this mount attached with is short lived, and ordinary lease
+	// renewal never extends a signed authorization deadline. Renewal re-reads the
+	// same file, so a credential manager that rotates it in place keeps the mount
+	// alive and one that does not still fails closed.
 	done := make(chan struct{})
 	go func() { mount.Wait(); close(done) }()
+	renewal, err := startCredentialRenewal(client, *accessTokenFile, token)
+	if err != nil {
+		return errors.Join(err, shutdown(mount, done, absoluteMount))
+	}
+	defer renewal.Close()
 	select {
 	case <-done:
 		return mount.Close()
+	case err := <-renewal.failed:
+		// The mount still holds a valid authorization for the safety margin the
+		// renewer reserved. Withdrawing it now is the difference between an
+		// orderly unmount and every open file failing when the deadline passes.
+		log.Printf("automatic reauthorization failed closed: %v; unmounting %s", err, absoluteMount)
+		return errors.Join(err, shutdown(mount, done, absoluteMount))
 	case <-ctx.Done():
 		return shutdown(mount, done, absoluteMount)
 	}

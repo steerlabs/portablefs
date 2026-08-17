@@ -85,6 +85,10 @@ const (
 // that declares routes is then refused outright rather than served with its
 // topology ignored.
 func AttachWithRoutes(ctx context.Context, attach authorityrpc.ClientConfig, adopt bool) (*authorityrpc.Client, localroutes.RuleSet, error) {
+	// This package hands the session to the strict Linux FUSE frontend. Its
+	// public terminal edge must certify that the bounded kernel withdrawal has
+	// finished, rather than racing ahead and triggering that withdrawal.
+	attach.RequireLocalSessionEnforcement = true
 	rules := localroutes.RuleSet{}
 	attach.RoutesRevision = rules.Revision()
 	client, err := dialOnce(ctx, attach)

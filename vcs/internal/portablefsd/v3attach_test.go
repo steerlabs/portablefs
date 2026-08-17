@@ -240,7 +240,7 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 			"sequenced-visibility-retry-v1",
 			"lockless-namespace-repair-v1",
 			"source-publication-gate-v1", "namespace-post-binding-identity", "exact-resource-acquisition",
-			"transactional-shared-write-v1", "strict-linux-mutation-suite-v1", "terminal-applied-delivery-receipt-v1",
+			"transactional-shared-write-v1", "one-shot-write-v1", "strict-linux-mutation-suite-v1", "terminal-applied-delivery-receipt-v1",
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
@@ -268,7 +268,7 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 			"sequenced-visibility-retry-v1",
 			"lockless-namespace-repair-v1",
 			"source-publication-gate-v1", "namespace-post-binding-identity", "exact-resource-acquisition",
-			"transactional-shared-write-v1",
+			"transactional-shared-write-v1", "one-shot-write-v1",
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")

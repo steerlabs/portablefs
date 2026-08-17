@@ -30,6 +30,38 @@ func testAuthorization(access Access) Authorization {
 	return Authorization{Access: access, Deadline: time.Unix(10_000, 0)}
 }
 
+func TestSessionLifecycleObserversTrackExactActiveBoundary(t *testing.T) {
+	var active, terminal atomic.Int64
+	now := time.Unix(1_000, 0)
+	authority, err := New("observed", Config{
+		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64,
+		Now:               func() time.Time { return now },
+		OnSessionActive:   func(SessionID) { active.Add(1) },
+		OnSessionTerminal: func(SessionID) { terminal.Add(1) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := AttachAttemptID{1}
+	credential := prepareTestSession(t, authority, &now, attempt)
+	if active.Load() != 0 || terminal.Load() != 0 {
+		t.Fatalf("provisional observers = active %d terminal %d", active.Load(), terminal.Load())
+	}
+	token, err := authority.PrepareActivation(t.Context(), credential, attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority.CommitActivation(token)
+	if active.Load() != 1 || terminal.Load() != 0 {
+		t.Fatalf("active observers = active %d terminal %d", active.Load(), terminal.Load())
+	}
+	authority.FenceSession(credential.ID)
+	authority.FenceSession(credential.ID)
+	if active.Load() != 1 || terminal.Load() != 1 {
+		t.Fatalf("terminal observers = active %d terminal %d", active.Load(), terminal.Load())
+	}
+}
+
 func prepareTestSession(t *testing.T, a *Authority, now *time.Time, attempt AttachAttemptID) SessionCredential {
 	t.Helper()
 	cred, err := a.PrepareAttach(

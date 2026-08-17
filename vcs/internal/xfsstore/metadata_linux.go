@@ -56,7 +56,21 @@ func (v *Volume) Chmod(id Capability, mode fs.FileMode) error {
 	if obj.kind == KindSymlink {
 		return syscall.EOPNOTSUPP
 	}
-	return unix.Fchmodat(obj.fd(), "", unixMode, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	return v.chmodCapability(obj.fd(), obj.kind, unixMode)
+}
+
+// chmodCapability applies a mode to an O_PATH capability descriptor.
+//
+// Fchmodat with AT_EMPTY_PATH is the natural spelling, but Go routes any
+// nonzero flags to fchmodat2(2), which only exists on Linux 6.6+ — on an older
+// authority host every chmod would fail mid-mutation with ENOSYS and fence the
+// epoch. Reopening and fchmod(2) is no substitute: a mode-0 object cannot be
+// reopened by the unprivileged service identity, and restoring such a mode is
+// exactly what Chmod must be able to do. chmod(2) through the /proc magic link
+// is glibc's own pre-fchmodat2 fallback: it needs no open permission, and the
+// held O_PATH descriptor pins the inode the link resolves to.
+func (v *Volume) chmodCapability(fd int, _ Kind, unixMode uint32) error {
+	return unix.Chmod(procFDPath(fd), unixMode)
 }
 
 // Chown uses -1 to leave one side unchanged, matching fchownat. The owner

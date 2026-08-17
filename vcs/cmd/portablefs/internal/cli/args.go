@@ -14,7 +14,7 @@ func newFlagSet(name string) *flag.FlagSet {
 }
 
 // parseArgs parses fs over args while collecting positional arguments, so
-// `portablefs status vol --branch dev` and `portablefs status --branch dev vol`
+// `portablefs route vol --json` and `portablefs route --json vol`
 // both work (stdlib flag stops at the first non-flag token; we resume after it).
 func parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 	var positionals []string

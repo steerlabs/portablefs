@@ -86,10 +86,12 @@ func (c *VisibilityCoordinator) ExecuteRoutesChecked(ctx context.Context, next R
 	}
 	defer turn.release()
 	ticket := VisibilityEvent{Routes: next.clone()}
+	barrierStarted := c.cfg.Now()
 	audience, deliveries, err := c.openRoutesBarrier(&ticket)
 	if err != nil {
 		return 0, &VisibilityBarrierError{Err: err}
 	}
+	defer c.observeBarrier(barrierStarted, len(audience.members))
 	if err := c.awaitAll(deliveries); err != nil {
 		return 0, &VisibilityBarrierError{Err: err}
 	}
