@@ -194,8 +194,7 @@ jobs:
   # the script additionally verifies that each required test reported PASS, so a
   # provisioning regression or a deleted test cannot present as a green run.
   linux-xfs-fuse:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: [self-hosted, linux, arm64, portablefs-strict-6-12-100]
+    runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -223,8 +222,7 @@ jobs:
   # coherence case must fail) and fails the job if a control does not turn a case
   # red. So a green result here is evidence rather than an absence of evidence.
   linux-coherence-matrix:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: [self-hosted, linux, arm64, portablefs-strict-6-12-100]
+    runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
