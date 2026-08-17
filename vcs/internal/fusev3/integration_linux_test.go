@@ -73,11 +73,15 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 	}
 	defer mappedFile.Close()
 
-	// A shared mapping of a FOPEN_DIRECT_IO file is refused by the kernel with
-	// exactly ENODEV (fs/fuse/file.c). Accepting EINVAL or ENOSYS as well would
-	// let an unrelated mmap breakage, or a mount that stopped setting
-	// FOPEN_DIRECT_IO and instead failed for some other reason, pass as if the
-	// coherence contract were being enforced.
+	// A shared mapping of a SHARED regular file is refused by the kernel with
+	// exactly ENODEV (fs/fuse/file.c). The reason survived the move to a
+	// retained page cache and got sharper: a writable shared mapping would
+	// dirty folios that never travel the strict write transaction, and a dirty
+	// folio is the one thing invalidate_inode_pages2() cannot withdraw, so it
+	// would turn every later DATA repair on the inode into a revocation.
+	// Accepting EINVAL or ENOSYS as well would let an unrelated mmap breakage,
+	// or a mount that stopped refusing shared mappings and instead failed for
+	// some other reason, pass as if the contract were being enforced.
 	for _, shared := range []struct {
 		what string
 		prot int
@@ -88,7 +92,7 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 		mapping, err := unix.Mmap(int(mappedFile.Fd()), 0, 4096, shared.prot, unix.MAP_SHARED)
 		if err == nil {
 			_ = unix.Munmap(mapping)
-			t.Fatalf("%s unexpectedly succeeded on a coherent direct-I/O mount", shared.what)
+			t.Fatalf("%s unexpectedly succeeded on a coherent mount", shared.what)
 		}
 		requireErrno(t, err, syscall.ENODEV, shared.what)
 	}
@@ -323,8 +327,20 @@ func TestCreateWithAReadOnlyModeReturnsAWritableHandle(t *testing.T) {
 // "coherence" assertion was not: it reads on the second mount first, mutates on
 // the first, and then reads again through the same descriptor and at the same
 // offset. Every mutation keeps the file length identical, so no size-derived
-// heuristic can rescue a stale page. A mount that dropped FOPEN_DIRECT_IO or
-// started publishing a nonzero attribute timeout fails here.
+// heuristic can rescue a stale page.
+//
+// Since SHARED regular opens became FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED this is
+// also the load-bearing cached-page test, and the same-length payloads are what
+// make it one. The first read populates mount B's page cache; every later read
+// at the same offset is served from that cache unless something withdrew it.
+// Only the ordered DATA publication does -- it invalidates the whole mapping by
+// sequence, never by an EOF delta -- so a kernel that short-circuited the
+// invalidation when i_size was unchanged fails here, as does a mount that
+// stopped joining the barrier's audience for the inode.
+//
+// REQUIRES THE PRIVILEGED RUNNER: this test needs a real strict-coherence
+// kernel and two live mounts. It cannot be exercised by the unit fixtures,
+// which never populate a page cache at all.
 func TestCrossMountContentCoherence(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	nameA, nameB := f.join(0, "content"), f.join(1, "content")
@@ -941,6 +957,13 @@ func TestAuthorityLossFailsCleanlyInsteadOfHanging(t *testing.T) {
 		// Losing the authority means this frontend can no longer be told that
 		// what it cached has changed, so it revokes itself and stops being a
 		// filesystem rather than failing only this operation.
+		//
+		// This read is served through a descriptor whose pages the earlier read
+		// left resident, so with FOPEN_KEEP_CACHE it is also the assertion that
+		// the revocation ladder's whole-inode data withdrawal actually ran: the
+		// kernel could otherwise answer it without any request reaching this
+		// frontend, and neither the revoked check nor the connection abort
+		// would see it.
 		if !errors.Is(err, syscall.ENOTCONN) {
 			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked)", err)
 		}
@@ -1597,5 +1620,175 @@ func TestMetadataWorkloadRPCCost(t *testing.T) {
 	t.Logf("%d authority requests for one steady-state `git status` over %d tracked files (%s)", total, files, strings.Join(breakdown, " "))
 	if lookups >= files/4 {
 		t.Fatalf("coherent cache issued %d LOOKUPs for %d tracked files; repeated path walks must stay below one lookup per four files", lookups, files)
+	}
+}
+
+// TestCachedPagesSurviveRereadsAndDieAtTheBarrier is the direct proof that the
+// retained page cache is both real and coherent. TestCrossMountContentCoherence
+// proves the coherence half; this proves that pages are genuinely being reused
+// in between, which is the whole reason the direct-I/O flag was dropped.
+//
+// The two halves have to be asserted together. A mount that never cached would
+// pass every coherence assertion trivially and deliver none of the performance;
+// a mount that cached without joining the barrier would deliver the performance
+// and be wrong. So the test counts authority READs across repeated reads of the
+// same offsets (reuse) and then asserts the payload flips after a same-length
+// remote overwrite (withdrawal).
+//
+// REQUIRES THE PRIVILEGED RUNNER: it needs a real strict-coherence kernel, two
+// live mounts, and a real page cache.
+func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	nameA, nameB := f.join(0, "cached"), f.join(1, "cached")
+
+	// Several pages, so ordinary read-ahead has something to do and the reuse
+	// is not an artefact of a single-folio file.
+	const size = 64 * 1024
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte('a' + i%26)
+	}
+	mustWrite(t, nameA, payload, 0o600)
+
+	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
+	defer reader.Close()
+	if got := readExactlyAt(t, reader, 0, size, "first full read"); !bytes.Equal(got, payload) {
+		t.Fatal("first cross-mount read returned the wrong bytes")
+	}
+
+	// Only this mount reads in the window below, so the global counter is an
+	// exact per-mount count here.
+	reads := f.countRequests("read", func() {
+		for range 8 {
+			if got := readExactlyAt(t, reader, 0, size, "cached re-read"); !bytes.Equal(got, payload) {
+				t.Fatal("cached re-read returned the wrong bytes")
+			}
+		}
+	})
+	if reads != 0 {
+		t.Fatalf("eight full re-reads issued %d authority READs; FOPEN_KEEP_CACHE is not retaining anything and every read still costs a round trip", reads)
+	}
+
+	// Same length, so nothing size-derived can withdraw the cache: only the
+	// sequence-ordered whole-mapping invalidation the DATA repair performs can.
+	rewritten := make([]byte, size)
+	for i := range rewritten {
+		rewritten[i] = byte('A' + i%26)
+	}
+	mustWrite(t, nameA, rewritten, 0o600)
+	if got := readExactlyAt(t, reader, 0, size, "re-read after a same-length remote rewrite"); !bytes.Equal(got, rewritten) {
+		t.Fatal("a same-length remote rewrite left this mount serving pre-write pages from its kernel; the DATA repair did not withdraw them")
+	}
+
+	// And the cache is repopulated rather than disabled: reuse must survive a
+	// repair, or the first remote write to a file would permanently cost every
+	// later reader a round trip.
+	repopulated := f.countRequests("read", func() {
+		for range 4 {
+			readExactlyAt(t, reader, 0, size, "cached re-read after repair")
+		}
+	})
+	if repopulated != 0 {
+		t.Fatalf("the page cache was not repopulated after a DATA repair: %d further authority READs", repopulated)
+	}
+}
+
+// TestPrivateMappingsAreTornDownByTheDataBarrier covers the one reader that no
+// userspace hook can see. A MAP_PRIVATE page is served straight out of the page
+// tables with no request reaching this frontend at all, so the only thing that
+// can make it coherent is invalidate_inode_pages2() unmapping it inside the
+// DATA repair. If that stopped happening, every other assertion in this suite
+// would still pass and executables and mapped data files would silently go
+// stale.
+//
+// REQUIRES THE PRIVILEGED RUNNER.
+func TestPrivateMappingsAreTornDownByTheDataBarrier(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	nameA, nameB := f.join(0, "mapped-coherent"), f.join(1, "mapped-coherent")
+
+	page := os.Getpagesize()
+	before := bytes.Repeat([]byte{'o'}, page)
+	mustWrite(t, nameA, before, 0o600)
+
+	mapped := mustOpenFile(t, nameB, os.O_RDONLY, 0)
+	defer mapped.Close()
+	view, err := unix.Mmap(int(mapped.Fd()), 0, page, unix.PROT_READ, unix.MAP_PRIVATE)
+	if err != nil {
+		t.Fatalf("MAP_PRIVATE of a shared file: %v", err)
+	}
+	defer unix.Munmap(view)
+	if view[0] != 'o' {
+		t.Fatalf("initial mapped byte = %q", view[0])
+	}
+
+	// Same length again. The mapping is faulted in and its page table entries
+	// are live; only unmap_mapping_folio() inside the repair can take them
+	// back, and if it does the next touch refaults through the authority.
+	after := bytes.Repeat([]byte{'n'}, page)
+	mustWrite(t, nameA, after, 0o600)
+	if view[0] != 'n' {
+		t.Fatalf("mapped byte after a same-length remote rewrite = %q; the DATA repair did not unmap the stale page", view[0])
+	}
+}
+
+// TestRevokedMountCannotServeRetainedPages is the fencing half, and it is the
+// assertion that separates this platform from the macOS defect recorded in
+// docs/failure-modes.md.
+//
+// Every other kind of stale service a revoked mount could commit is bounded by
+// refusing requests. A retained page is not: with FOPEN_KEEP_CACHE the read is
+// answered inside the kernel and never becomes a request, so neither the
+// frontend's revoked check nor the FUSE connection abort can see it. What
+// closes it is the explicit whole-inode withdrawal the revocation ladder issues
+// after the abort. If that regressed, this reader would keep observing
+// pre-fence bytes for as long as it held the file open.
+//
+// REQUIRES THE PRIVILEGED RUNNER: revocation is only observable against a real
+// kernel mount, and the reader has to be a real process holding a real mapping
+// of a real page cache.
+func TestRevokedMountCannotServeRetainedPages(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	nameA, nameB := f.join(0, "fenced"), f.join(1, "fenced")
+
+	const size = 8 * 1024
+	payload := bytes.Repeat([]byte{'z'}, size)
+	mustWrite(t, nameA, payload, 0o600)
+
+	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
+	defer reader.Close()
+	if got := readExactlyAt(t, reader, 0, size, "pre-revocation read"); !bytes.Equal(got, payload) {
+		t.Fatal("pre-revocation read returned the wrong bytes")
+	}
+
+	// The pages are now resident on mount B. Losing the authority is what fences
+	// it: it can no longer be told that what it holds has changed, so it revokes
+	// itself. Then read through the descriptor that is already open -- the exact
+	// case the mount-namespace detach cannot reach.
+	f.stopAuthority()
+	for i := range 2 {
+		t.Logf("mount %d terminal cause: %v", i, f.requireSessionEnded(i, 30*time.Second))
+	}
+
+	outcome := make(chan error, 1)
+	buf := make([]byte, size)
+	go func() {
+		_, err := reader.ReadAt(buf, 0)
+		outcome <- err
+	}()
+	select {
+	case err := <-outcome:
+		if err == nil {
+			t.Fatal("a fenced mount served its retained pages; this is the stale-read window the withdrawal pass exists to close")
+		}
+		// ENOTCONN from the aborted connection, or EIO from a refaulted page
+		// that cannot be filled. Which one depends on where in the teardown the
+		// read landed; pinning that would pin a race rather than a contract.
+		// What must never happen is a successful read.
+		t.Logf("fenced-mount read failed as required: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("a read of retained pages on a fenced mount hung")
+	}
+	if bytes.Equal(buf, payload) {
+		t.Fatal("the fenced read filled the caller's buffer with pre-fence bytes even though it reported an error")
 	}
 }

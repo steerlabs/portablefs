@@ -332,6 +332,15 @@ const (
 	// explicit inode/handle classification, transactional shared writes,
 	// post-VFS publication receipts, and ordered exact-size notification.
 	CAP_PFS_STRICT_COHERENCE = uint64(1) << 63
+	// CAP_PFS_CACHED_DATA is the second half of that same indivisible contract:
+	// a SHARED regular file's open reply is exactly
+	// FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED, so reads are served from this kernel's
+	// page cache and withdrawn by ordered DATA publication instead of being
+	// forced through direct I/O. It is a separate bit only so that a kernel and
+	// a daemon built against different revisions of the private contract fail
+	// INIT rather than disagree about the one exact open flag pair; selecting
+	// either bit without the other is refused by the strict kernel.
+	CAP_PFS_CACHED_DATA = uint64(1) << 62
 )
 
 type InitIn struct {

@@ -62,16 +62,29 @@ const (
 	minMaxInFlight = 8
 
 	// coherentOpenFlags is the only OpenOut.OpenFlags value this frontend may
-	// ever return for an authority-backed regular file. FOPEN_DIRECT_IO is the
-	// single load-bearing line of the whole
-	// coherence claim: it keeps file data out of this kernel's page cache, and
-	// (without CAP_DIRECT_IO_ALLOW_MMAP) it is also what makes the kernel
-	// refuse every shared mmap. Adding FOPEN_KEEP_CACHE, or dropping
-	// FOPEN_DIRECT_IO, would silently let one machine serve reads that never
-	// reached the authority.
-	// FOPEN_PFS_SHARED is the explicit per-handle authority marker consumed by
-	// the negotiated kernel transactional-write path.
-	coherentOpenFlags = fuse.FOPEN_DIRECT_IO | fuse.FOPEN_PFS_SHARED
+	// ever return for an authority-backed regular file, and the strict kernel
+	// rejects any other combination with -EPROTO.
+	//
+	// FOPEN_KEEP_CACHE says this kernel may keep serving clean pages of the
+	// file across opens. What makes that coherent is not a lifetime, it is the
+	// barrier: every folio of a SHARED inode is filled with
+	// mapping->invalidate_lock held shared, with the whole authority READ round
+	// trip inside that hold, and every DATA repair takes the same lock
+	// exclusively and invalidates the entire mapping (PFSSizeNotify ->
+	// fuse_pfs_update_size_locked). A read therefore either completes and is
+	// invalidated, or begins strictly after the authority applied. Because the
+	// mutating syscall on the writing machine does not return until every
+	// audience mount has acknowledged that repair, no reader anywhere can be
+	// served pre-write bytes after the write returned.
+	//
+	// FOPEN_DIRECT_IO is deliberately absent and is refused by the kernel
+	// rather than merely unused. It used to carry the whole coherence claim by
+	// keeping the page cache empty; it now would only reroute reads around the
+	// cache the barrier is written against. It was never what routed writes:
+	// FOPEN_PFS_SHARED alone selects the kernel's transactional-write path, and
+	// it is also what makes the kernel refuse every shared mmap, so no write
+	// can reach a page this kernel holds.
+	coherentOpenFlags = fuse.FOPEN_KEEP_CACHE | fuse.FOPEN_PFS_SHARED
 )
 
 // RPC is the exact authority contract required by the mount. Keeping this
@@ -272,12 +285,20 @@ func (m *Mount) publishAttr(ctx context.Context, out *fuse.AttrOut, item *author
 
 // MountVolume mounts one authority session without a write-back cache.
 //
-// File data is never cached: direct I/O keeps every completed read on the wire
-// to the one active volume authority, and shared mmap stays unavailable because
-// no kernel primitive can revoke a mapped page coherently across machines.
-// Names and attributes are cached only under the authority's two-phase
-// visibility barrier, so a change made on another machine is repaired here
-// before that machine's syscall returns.
+// Names, attributes and file data are all cached, and all three are cached for
+// the same reason: the authority's two-phase visibility barrier repairs them
+// here before the mutating syscall returns on the machine that made the change.
+// For data that repair is a whole-mapping invalidation taken under
+// mapping->invalidate_lock, which is the same lock every page fill holds shared
+// across its authority round trip -- so a read either completes and is
+// invalidated, or begins after the authority applied. Writes never touch that
+// cache: they travel the kernel's strict transaction, and shared mmap stays
+// unavailable, so no page this kernel holds can ever be dirty.
+//
+// What is not cached is a lifetime-based guess. Nothing here is served because
+// a timeout has not expired yet; it is served because no repair has arrived,
+// and a repair is guaranteed to arrive before any other machine could have
+// observed the new value.
 func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config) (*Mount, error) {
 	if rpc == nil {
 		return nil, errors.New("fusev3: authority session is required")
@@ -319,7 +340,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	if got := rpc.MaxWriteTransactionBytes(); got < requiredTransaction {
 		return failBeforeKernelMount(fmt.Errorf("fusev3: authority stages at most %d transaction bytes; this kernel can issue one %d-byte write and PortableFS does not split one syscall into visible mutations", got, requiredTransaction))
 	}
-	options := mountOptions(cfg, maxWrite)
+	options := mountOptions(cfg, maxRead, maxWrite)
 	if err := verifyMountDecisions(options); err != nil {
 		return failBeforeKernelMount(err)
 	}
@@ -477,17 +498,31 @@ func (m *Mount) failedStartupKernelAbsent() error {
 
 // mountOptions builds the kernel interface this frontend is willing to speak.
 //
-// MaxReadAhead is deliberately absent: go-fuse only clamps it when nonzero, so
-// setting it to 0 would express nothing at all, and read-ahead applies only to
-// buffered reads, which FOPEN_DIRECT_IO already excludes.
-func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
+// MaxReadAhead is now load-bearing rather than absent. A SHARED regular file's
+// reads are served from this kernel's page cache, so the read-ahead window is
+// what decides how many authority round trips a sequential reader pays; the
+// strict kernel installs the negotiated value verbatim instead of clamping it
+// to the generic 128 KiB default. It is set to the authority's own read bound
+// so that one read-ahead batch is at most one authority read: a larger window
+// would only split into requests this frontend has to refuse, and a smaller one
+// would leave round trips on the table for no coherence benefit.
+func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 	return &fuse.MountOptions{
 		FsName:        "portablefs:" + cfg.MountInstanceID,
 		Name:          "portablefs",
 		MaxWrite:      int(maxWrite),
+		MaxReadAhead:  int(maxRead),
 		MaxBackground: cfg.MaxBackground,
 		Debug:         cfg.Debug,
 		EnableLocks:   true,
+		// Invalidation is this frontend's own act, never a kernel heuristic.
+		// CAP_AUTO_INVAL_DATA would drop a coherent page cache whenever an
+		// unrelated attribute refresh moved mtime, and -- because
+		// fuse_cache_read_iter() consults fc->auto_inval_data -- would also put
+		// a GETATTR in front of every buffered read. Requesting explicit
+		// control instead is what makes the ordered DATA publication the single
+		// thing that withdraws a page.
+		ExplicitDataCacheControl: true,
 		// READDIRPLUS stays refused. Now that a strict mount does publish
 		// nonzero entry lifetimes the old reason no longer holds, but the
 		// remaining one is decisive: the authority mints one capability per
@@ -497,18 +532,21 @@ func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 		// LOOKUP-equivalent per entry to populate a cache the caller does not
 		// use. Ordinary READDIR plus cached LOOKUPs is strictly less work.
 		DisableReadDirPlus: true,
-		// Shared mmap over direct I/O is a decision of this mount, not an
-		// accident of which capabilities go-fuse happens to forward. The mount
-		// cannot revoke kernel-cached pages when another machine mutates the
-		// same file, so the capability is disabled for the whole mount even if
-		// a future kernel or library change starts offering it by default.
+		// Shared mmap is a decision of this mount, not an accident of which
+		// capabilities go-fuse happens to forward. A writable shared mapping
+		// would dirty pages that never travel the strict write transaction, and
+		// a dirty page is also the one thing invalidate_inode_pages2() cannot
+		// withdraw -- which would turn every later DATA repair on that inode
+		// into a revocation. The capability is disabled for the whole mount
+		// even if a future kernel or library change starts offering it by
+		// default.
 		// Atomic truncate is required, not an optimization. Without it Linux
 		// decomposes open(O_TRUNC) into SETATTR(size=0) followed by OPEN, creating
 		// two independently ordered authority mutations and an avoidable window in
 		// which the truncate applied but the open failed. With it the authority's
 		// OPEN mutation and its exact source gate are the single operation.
-		ExtraCapabilities:    fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 | fuse.CAP_PFS_STRICT_COHERENCE,
-		DisabledCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP | fuse.CAP_PASSTHROUGH | fuse.CAP_NO_OPEN_SUPPORT | fuse.CAP_NO_OPENDIR_SUPPORT,
+		ExtraCapabilities:    fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 | fuse.CAP_PFS_STRICT_COHERENCE | fuse.CAP_PFS_CACHED_DATA,
+		DisabledCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP | fuse.CAP_PASSTHROUGH | fuse.CAP_NO_OPEN_SUPPORT | fuse.CAP_NO_OPENDIR_SUPPORT | fuse.CAP_AUTO_INVAL_DATA,
 		Options:              []string{"default_permissions"},
 	}
 }
@@ -518,7 +556,13 @@ func mountOptions(cfg Config, maxWrite uint32) *fuse.MountOptions {
 func verifyMountDecisions(options *fuse.MountOptions) error {
 	if options.ExtraCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP != 0 ||
 		options.DisabledCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP == 0 {
-		return errors.New("fusev3: shared mmap over direct I/O must be disabled for the whole mount; cross-machine page coherence cannot be provided")
+		return errors.New("fusev3: shared mmap must be disabled for the whole mount; a dirty page neither travels the strict write transaction nor survives a DATA repair")
+	}
+	if options.DisabledCapabilities&fuse.CAP_AUTO_INVAL_DATA == 0 || !options.ExplicitDataCacheControl {
+		return errors.New("fusev3: retained page cache requires explicit data-cache control; an mtime heuristic must not decide when this mount's pages are withdrawn")
+	}
+	if options.MaxReadAhead <= 0 {
+		return errors.New("fusev3: the read-ahead window must be negotiated explicitly; leaving it at the kernel default silently unpairs it from the authority read bound")
 	}
 	if options.DisabledCapabilities&fuse.CAP_PASSTHROUGH == 0 ||
 		options.DisabledCapabilities&fuse.CAP_NO_OPEN_SUPPORT == 0 ||
@@ -534,8 +578,9 @@ func verifyMountDecisions(options *fuse.MountOptions) error {
 	if options.ExtraCapabilities&fuse.CAP_HANDLE_KILLPRIV_V2 == 0 {
 		return errors.New("fusev3: HANDLE_KILLPRIV_V2 must be requested so every transactional write has exact privilege-removal intent")
 	}
-	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 {
-		return errors.New("fusev3: transactional shared writes, classified inodes, publication receipts, and exact-size notify must be requested as one kernel contract")
+	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 ||
+		options.ExtraCapabilities&fuse.CAP_PFS_CACHED_DATA == 0 {
+		return errors.New("fusev3: transactional shared writes, classified inodes, publication receipts, exact-size notify, and cacheable shared data must be requested as one kernel contract")
 	}
 	if options.ExtraCapabilities&fuse.CAP_HAS_RESEND != 0 {
 		return errors.New("fusev3: HAS_RESEND is incompatible with strict publication identity ownership and must not be requested")
@@ -563,6 +608,17 @@ func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 	}
 	if offered&fuse.CAP_PFS_STRICT_COHERENCE == 0 {
 		return fmt.Errorf("fusev3: kernel does not support the PortableFS strict-coherence contract (INIT flags %#x)", offered)
+	}
+	// The two private bits are one profile version. A kernel that offers only
+	// the older half would accept this mount and then reject the very first
+	// regular OPEN with -EPROTO, because the exact allowlisted flag pair it
+	// implements is the retired direct-I/O one. Refusing here makes the version
+	// mismatch a failed mount instead of an aborted connection under load.
+	if offered&fuse.CAP_PFS_CACHED_DATA == 0 {
+		return fmt.Errorf("fusev3: kernel implements an older revision of the strict-coherence contract without cacheable shared data (INIT flags %#x); kernel and userspace ship together and there is no compatible open flag pair", offered)
+	}
+	if offered&fuse.CAP_EXPLICIT_INVAL_DATA == 0 {
+		return fmt.Errorf("fusev3: kernel cannot give this mount explicit data-cache control (INIT flags %#x); retained pages would be withdrawn by an mtime heuristic instead of by the ordered DATA repair", offered)
 	}
 	if offered&fuse.CAP_HANDLE_KILLPRIV_V2 == 0 {
 		return fmt.Errorf("fusev3: kernel does not support HANDLE_KILLPRIV_V2 (INIT flags %#x); shared writes could preserve stale file privileges", offered)

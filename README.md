@@ -147,9 +147,10 @@ narrow but never broaden. See
 - **XFS is the truth.** There is no PortableFS journal, manifest, checkpoint, or
   content index. XFS's own metadata journal is a crash-recovery mechanism inside
   XFS; it is not PortableFS history and is not user-visible.
-- **Protocol writes are through.** Linux direct-I/O `write(2)`, and every write
-  callback FSKit sends, return only after the authority applied the reported
-  bytes to XFS. macOS may acknowledge an application `write(2)` into its ordinary
+- **Protocol writes are through.** Linux `write(2)`, which travels the kernel's
+  strict write transaction rather than any page cache, and every write callback
+  FSKit sends, return only after the authority applied the reported bytes to
+  XFS. macOS may acknowledge an application `write(2)` into its ordinary
   kernel page cache before invoking FSKit; `fsync`/synchronize is the explicit
   authority boundary there. PortableFS adds no daemon or offline write-back tail.
 - **`fsync` means fsync.** A successful `fsync`/`fdatasync` means the authority

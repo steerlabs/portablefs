@@ -235,7 +235,10 @@ def validate_open(
     if class_bits != expected:
         raise ProtocolError("open class mismatch")
     if regular and inode_class == "shared":
-        if flags != FOPEN_DIRECT_IO | FOPEN_PFS_SHARED:
+        # Under FUSE_PFS_CACHED_DATA the exact dialect retains the page cache.
+        # FOPEN_DIRECT_IO is not merely unused here, it is refused: it would
+        # route reads around the cache the DATA barrier is written against.
+        if flags != FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED:
             raise ProtocolError("shared regular OPEN is not the exact dialect")
     if directory and inode_class == "shared":
         if flags != FOPEN_PFS_SHARED:
@@ -254,8 +257,17 @@ REQUIRED_INIT = {
     "POSIX_LOCKS",
     "FLOCK_LOCKS",
     "PFS_STRICT",
+    # The two private bits are one profile version. A daemon offering only one
+    # of them was built against a different contract and must fail INIT rather
+    # than disagree about the open flag pair at first open.
+    "PFS_CACHED_DATA",
+    # Retained pages are withdrawn by the ordered DATA publication alone, so
+    # invalidation is explicit; mtime heuristics would both drop a coherent
+    # cache for nothing and put a GETATTR in front of every read.
+    "EXPLICIT_INVAL_DATA",
 }
 FORBIDDEN_INIT = {
+    "AUTO_INVAL_DATA",
     "WRITEBACK_CACHE",
     "DIRECT_IO_MMAP",
     "INODE_DAX",
@@ -495,6 +507,19 @@ class KernelInode:
         self.cache_generation += 1  # full data invalidation, even same EOF
         return "applied"
 
+    def withdraw_data(self) -> None:
+        """fuse_pfs_withdraw_data: the revocation primitive.
+
+        A mount that can no longer participate in the barrier drops every
+        retained page so that no read can be answered inside its kernel.  It
+        carries no authority sequence and must not consume one: a dying mount
+        that advanced the ordered size sequence would make a later real
+        publication look like a replay and be discarded.
+        """
+        if self.pfs_class != "shared":
+            raise ProtocolError("withdrawal is a SHARED-only primitive")
+        self.cache_generation += 1
+
 
 class PublicationGate:
     def __init__(self) -> None:
@@ -727,7 +752,7 @@ class AbiAndAdmissionTests(unittest.TestCase):
         for malformed in (0, ATTR_PFS_SHARED | ATTR_PFS_LOCAL):
             with self.assertRaises(ProtocolError):
                 classify_attr(malformed)
-        validate_open("shared", FOPEN_DIRECT_IO | FOPEN_PFS_SHARED)
+        validate_open("shared", FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED)
         validate_open("local", FOPEN_KEEP_CACHE | FOPEN_PFS_LOCAL)
         validate_open(
             "shared", FOPEN_PFS_SHARED, regular=False, directory=True
@@ -739,7 +764,7 @@ class AbiAndAdmissionTests(unittest.TestCase):
             directory=True,
         )
         for forbidden in (
-            FOPEN_KEEP_CACHE,
+            FOPEN_DIRECT_IO,
             FOPEN_NONSEEKABLE,
             FOPEN_CACHE_DIR,
             FOPEN_STREAM,
@@ -749,8 +774,13 @@ class AbiAndAdmissionTests(unittest.TestCase):
         ):
             with self.assertRaises(ProtocolError):
                 validate_open(
-                    "shared", FOPEN_DIRECT_IO | FOPEN_PFS_SHARED | forbidden
+                    "shared", FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED | forbidden
                 )
+        # The retired pair is gone entirely: kernel and daemon ship together,
+        # so a handle offered in the old dialect is a version mismatch, not a
+        # compatible peer.
+        with self.assertRaises(ProtocolError):
+            validate_open("shared", FOPEN_DIRECT_IO | FOPEN_PFS_SHARED)
         for forbidden in (FOPEN_CACHE_DIR, FOPEN_KEEP_CACHE):
             with self.assertRaises(ProtocolError):
                 validate_open(
@@ -784,30 +814,54 @@ class AbiAndAdmissionTests(unittest.TestCase):
         self.assertEqual(getdents(True), ["before", "peer-created"])
         self.assertEqual(rpc_count, 2)
 
-    def test_shared_willneed_never_populates_page_cache(self) -> None:
+    def test_shared_willneed_prefetches_into_a_withdrawable_cache(self) -> None:
+        """POSIX_FADV_WILLNEED is admitted again, and stays coherent.
+
+        The advice used to be discarded on a SHARED handle because the page
+        cache had to stay empty.  It now reaches page_cache_ra_unbounded(),
+        which fills folios under mapping->invalidate_lock held shared -- the
+        same lock the ordered DATA publication takes exclusively.  So a
+        prefetched folio is withdrawn by the next DATA publication exactly like
+        one a read(2) installed, and the model asserts that rather than
+        asserting the advice was ignored.
+        """
         authority = bytearray(b"old")
+        inode = KernelInode(size=len(authority))
         cache: bytes | None = None
         read_folio_calls = 0
 
-        def willneed(shared: bool) -> None:
+        def willneed() -> None:
             nonlocal cache, read_folio_calls
-            if shared:
-                return  # advisory success, deliberately no readahead
+            if cache is not None:
+                return
             read_folio_calls += 1
             cache = bytes(authority)
 
-        willneed(True)
-        self.assertIsNone(cache)
-        self.assertEqual(read_folio_calls, 0)
-        authority[:] = b"new"
-        # A later MAP_PRIVATE fault cannot observe an old prefetched folio:
-        # none was admitted through WILLNEED on the SHARED handle.
-        observed = bytes(authority) if cache is None else cache
-        self.assertEqual(observed, b"new")
+        def exact_data(size: int, sequence: int) -> str:
+            # invalidate_inode_pages2() under the exclusive invalidate lock.
+            nonlocal cache
+            outcome = inode.exact_data(size, sequence)
+            if outcome == "applied":
+                cache = None
+            return outcome
 
-        willneed(False)
-        self.assertEqual(cache, b"new")
+        willneed()
+        self.assertEqual(cache, b"old")
         self.assertEqual(read_folio_calls, 1)
+
+        # A same-length peer overwrite still withdraws the prefetched folio:
+        # the publication is ordered by sequence, never by a size delta.
+        authority[:] = b"new"
+        self.assertEqual(exact_data(len(authority), 1), "applied")
+        self.assertIsNone(cache)
+
+        willneed()
+        self.assertEqual(cache, b"new")
+        self.assertEqual(read_folio_calls, 2)
+
+        # A replayed sequence is a no-op and must not drop a valid cache.
+        self.assertEqual(exact_data(len(authority), 1), "duplicate")
+        self.assertEqual(cache, b"new")
 
     def test_lookup_marker_is_result_classified(self) -> None:
         matrix = {
@@ -1080,40 +1134,71 @@ class PublicationAndNotifyTests(unittest.TestCase):
             "peer repair expires the binding but does not synthesize a local unlink",
         )
 
-    def test_shared_splice_reads_never_reuse_page_cache(self) -> None:
+    def test_revocation_withdrawal_drops_pages_without_taking_a_sequence(
+        self,
+    ) -> None:
+        inode = KernelInode(size=6)
+        self.assertEqual(inode.exact_data(6, 4), "applied")
+        before = (inode.size, inode.sequence, inode.cache_generation)
+
+        inode.withdraw_data()
+        self.assertEqual((inode.size, inode.sequence), before[:2])
+        self.assertEqual(inode.cache_generation, before[2] + 1)
+
+        # A publication that was already in flight when the mount revoked is
+        # still installable afterwards, because the withdrawal took no sequence.
+        self.assertEqual(inode.exact_data(6, 5), "applied")
+
+        local = KernelInode(pfs_class="local")
+        with self.assertRaises(ProtocolError):
+            local.withdraw_data()
+
+    def test_shared_splice_reads_reuse_a_barrier_withdrawn_page_cache(
+        self,
+    ) -> None:
+        """filemap_splice_read on a SHARED handle, with exact withdrawal.
+
+        The splice used to be forced through copy_splice_read so a SHARED
+        handle could neither populate nor consume the page cache.  It now uses
+        the ordinary filemap path: reuse is what the retained cache is for, and
+        the same ordered DATA publication that withdraws a read(2) folio
+        withdraws a spliced one, because both live in the one mapping the
+        publication invalidates.
+
+        The payload lengths are deliberately equal across the overwrite.  A
+        withdrawal driven by an EOF delta would do nothing here; only the
+        sequence-ordered whole-mapping invalidation is enough.
+        """
         authority = {"contents": b"before", "fuse_reads": 0}
         cached: bytes | None = None
+        inode = KernelInode(size=len(authority["contents"]))
 
-        def splice_read(shared: bool) -> bytes:
+        def splice_read() -> bytes:
             nonlocal cached
-            if shared:
-                authority["fuse_reads"] += 1
-                return authority["contents"]
             if cached is None:
                 authority["fuse_reads"] += 1
                 cached = authority["contents"]
             return cached
 
-        self.assertEqual(splice_read(True), b"before")
-        self.assertEqual(splice_read(True), b"before")
-        self.assertEqual(authority["fuse_reads"], 2)
-        self.assertIsNone(cached)
+        def exact_data(size: int, sequence: int) -> str:
+            nonlocal cached
+            outcome = inode.exact_data(size, sequence)
+            if outcome == "applied":
+                cached = None
+            return outcome
 
-        inode = KernelInode(size=len(authority["contents"]))
+        self.assertEqual(splice_read(), b"before")
+        self.assertEqual(splice_read(), b"before")
+        self.assertEqual(authority["fuse_reads"], 1)
+
         authority["contents"] = b"after!"
-        self.assertEqual(inode.exact_data(len(authority["contents"]), 1),
-                         "applied")
-        self.assertEqual(splice_read(True), b"after!")
-        self.assertEqual(splice_read(True), b"after!")
-        self.assertEqual(authority["fuse_reads"], 4)
+        self.assertEqual(len(authority["contents"]), 6)
+        self.assertEqual(exact_data(len(authority["contents"]), 1), "applied")
         self.assertIsNone(cached)
+        self.assertEqual(splice_read(), b"after!")
+        self.assertEqual(splice_read(), b"after!")
+        self.assertEqual(authority["fuse_reads"], 2)
         self.assertEqual((inode.size, inode.sequence), (6, 1))
-
-        # LOCAL graft handles retain the ordinary cached splice behavior.
-        self.assertEqual(splice_read(False), b"after!")
-        authority["contents"] = b"local-new"
-        self.assertEqual(splice_read(False), b"after!")
-        self.assertEqual(authority["fuse_reads"], 5)
 
     def test_splice_child_scope_publishes_without_finishing_parent(self) -> None:
         parent = {

@@ -1201,3 +1201,239 @@ func TestStrictMountReservesAVisibilityLane(t *testing.T) {
 		t.Fatalf("bulk lane = %d, want %d; visibility and liveness slots must be structurally reserved", cap(strict.bulk), want)
 	}
 }
+
+// --- retained file data is admitted, drained, and withdrawn like a name -----
+//
+// These cover the third kernel cache a strict mount owns. They are unit tests
+// of the admission and withdrawal bookkeeping only: nothing here populates a
+// real page cache, because nothing below a real kernel can. The end-to-end
+// proof that a cached page is actually withdrawn is
+// TestCrossMountContentCoherence in integration_linux_test.go, which needs the
+// privileged runner.
+
+// openForData performs one OPEN through the raw filesystem exactly as the
+// kernel would, including the physical reply write that settles publication.
+func (f *strictFixture) openForData(t *testing.T, node uint64) *fuse.OpenOut {
+	t.Helper()
+	out := &fuse.OpenOut{}
+	status := f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: node}, Flags: syscall.O_RDONLY}, out)
+	})
+	if !status.Ok() {
+		t.Fatalf("OPEN = %v", status)
+	}
+	return out
+}
+
+func TestOpenPublishesRetainableDataAndRecordsTheObligation(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+
+	out := f.openForData(t, entry.NodeId)
+	if out.OpenFlags != coherentOpenFlags {
+		t.Fatalf("OPEN flags = %#x, want exactly %#x", out.OpenFlags, coherentOpenFlags)
+	}
+	// The obligation is what makes self-revocation able to name this inode. A
+	// mount that hands out FOPEN_KEEP_CACHE without recording it has given the
+	// kernel a cache no withdrawal can address.
+	if !f.raw.cachedDataHolds(72) {
+		t.Fatal("a cacheable OPEN left no page-cache withdrawal obligation behind")
+	}
+}
+
+func TestFailedOpenReplyLeavesNoDataWithdrawalObligation(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+
+	unique := f.unique.Add(2)
+	out := &fuse.OpenOut{}
+	if status := f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Flags: syscall.O_RDONLY}, out); !status.Ok() {
+		t.Fatalf("OPEN = %v", status)
+	}
+	// The reply never reached the kernel, so nothing was ever told it may
+	// retain pages. Recording an obligation here would make revocation address
+	// an inode this kernel holds no cache for.
+	f.raw.ReplyWritten(unique, fuse.ENOENT)
+	if f.raw.cachedDataHolds(72) {
+		t.Fatal("an OPEN reply that never reached the kernel left a withdrawal obligation")
+	}
+}
+
+func TestOpenBetweenPrepareAndCompleteWaitsForTheDataCut(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+
+	targets := []*authoritypb.VisibilityTarget{
+		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 72, 16),
+	}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("PREPARE: %v", err)
+	}
+
+	// Unlike a name or an attribute, cacheability has no zero-lifetime form:
+	// the kernel accepts exactly one open flag pair for a SHARED regular file.
+	// So the callback parks instead of publishing a weaker reply. Parking is
+	// safe here and would not be in a READ: OPEN holds no folio lock and no
+	// mapping->invalidate_lock, so it can never be what a COMPLETE repair is
+	// waiting behind.
+	opened := make(chan *fuse.OpenOut, 1)
+	go func() { opened <- f.openForData(t, entry.NodeId) }()
+	select {
+	case <-opened:
+		t.Fatal("an OPEN inside the DATA barrier window published retainable data before the repair")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if err := f.raw.completeVisibility(targets, false); err != nil {
+		t.Fatalf("COMPLETE: %v", err)
+	}
+	select {
+	case out := <-opened:
+		if out.OpenFlags != coherentOpenFlags {
+			t.Fatalf("OPEN flags after COMPLETE = %#x", out.OpenFlags)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("data admission was not reopened by COMPLETE")
+	}
+	if !f.raw.cachedDataHolds(72) {
+		t.Fatal("the post-COMPLETE OPEN recorded no withdrawal obligation")
+	}
+}
+
+func TestPrepareDrainsAnAlreadyAdmittedDataPublication(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+
+	// Admitted before the cut closes, still unwritten. PREPARE must not be
+	// acknowledged while a reply that grants cacheability is in flight, or the
+	// grant could land in the kernel after COMPLETE had already repaired.
+	unique := f.unique.Add(2)
+	out := &fuse.OpenOut{}
+	if status := f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Flags: syscall.O_RDONLY}, out); !status.Ok() {
+		t.Fatalf("OPEN = %v", status)
+	}
+
+	targets := []*authoritypb.VisibilityTarget{
+		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 72, 16),
+	}
+	prepared := make(chan error, 1)
+	go func() { prepared <- f.raw.prepareVisibility(context.Background(), targets, false) }()
+	select {
+	case err := <-prepared:
+		t.Fatalf("PREPARE drained before the in-flight retained-data reply was written (err=%v)", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	completeTestReply(t, f.raw, unique, fuse.OK)
+	select {
+	case err := <-prepared:
+		if err != nil {
+			t.Fatalf("PREPARE: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PREPARE never drained the settled retained-data publication")
+	}
+	if err := f.raw.completeVisibility(targets, false); err != nil {
+		t.Fatalf("COMPLETE: %v", err)
+	}
+}
+
+func TestForgetReleasesTheDataWithdrawalObligation(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+	out := f.openForData(t, entry.NodeId)
+	f.raw.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: f.unique.Add(2), NodeId: entry.NodeId}, Fh: out.Fh})
+
+	// A DATA repair deliberately does not clear the obligation: it drops the
+	// pages, but a live open description can refault the next instant. Only
+	// FORGET proves the kernel holds no inode at all, and therefore no cache.
+	targets := []*authoritypb.VisibilityTarget{
+		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 72, 16),
+	}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("PREPARE: %v", err)
+	}
+	if err := f.raw.completeVisibility(targets, false); err != nil {
+		t.Fatalf("COMPLETE: %v", err)
+	}
+	if !f.raw.cachedDataHolds(72) {
+		t.Fatal("a DATA repair discarded a withdrawal obligation a live handle can refault")
+	}
+
+	f.raw.Forget(entry.NodeId, 1)
+	if f.raw.cachedDataHolds(72) {
+		t.Fatal("FORGET proved the kernel dropped the inode but the obligation survived")
+	}
+}
+
+func TestRevocationWithdrawsEveryRetainedPage(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{
+		"one": testItem(72, authoritypb.Attr_REGULAR, 72),
+		"two": testItem(73, authoritypb.Attr_REGULAR, 73),
+	}
+	first := f.lookup(t, fuse.FUSE_ROOT_ID, "one")
+	second := f.lookup(t, fuse.FUSE_ROOT_ID, "two")
+	f.openForData(t, first.NodeId)
+	f.openForData(t, second.NodeId)
+
+	failures := f.raw.revokeCachedData(time.Now().Add(time.Minute))
+	if len(failures) != 0 {
+		t.Fatalf("withdrawal failures = %v", failures)
+	}
+	withdrawn := map[uint64]bool{}
+	for _, call := range f.notify.snapshot() {
+		if call.kind != "inode" {
+			continue
+		}
+		// off == 0 && len == 0 is the strict whole-inode data withdrawal the
+		// patched kernel routes through fuse_pfs_withdraw_data(). off == -1
+		// would withdraw attributes only and leave every page resident, which
+		// is precisely the stale-service window this pass exists to close.
+		if call.off != 0 || call.length != 0 {
+			t.Fatalf("data withdrawal used shape off=%d len=%d; only (0,0) drops pages", call.off, call.length)
+		}
+		withdrawn[call.inode] = true
+	}
+	if !withdrawn[first.NodeId] || !withdrawn[second.NodeId] {
+		t.Fatalf("withdrew %v, want both %d and %d", withdrawn, first.NodeId, second.NodeId)
+	}
+	if f.raw.cachedDataHolds(72) || f.raw.cachedDataHolds(73) {
+		t.Fatal("the registry was not cleared by the withdrawal pass")
+	}
+}
+
+func TestRevocationReportsPagesItCouldNotWithdraw(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+	f.openForData(t, entry.NodeId)
+
+	// A page this mount could not take back is stale data a fenced participant
+	// can still serve without any request reaching userspace. That has to reach
+	// the operator as a failure, not be swallowed as a tidy teardown.
+	f.notify.inodeST = fuse.EIO
+	failures := f.raw.revokeCachedData(time.Now().Add(time.Minute))
+	if len(failures) != 1 || !strings.Contains(failures[0], "withdraw cached data") {
+		t.Fatalf("withdrawal failures = %v, want one recorded refusal", failures)
+	}
+}
+
+func TestRevocationTreatsAForgottenInodeAsFullyWithdrawn(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+	f.openForData(t, entry.NodeId)
+
+	// ENOENT is the strongest possible outcome: the kernel holds no inode state
+	// at all, so there is nothing left that could answer from the old pages.
+	f.notify.inodeST = fuse.ENOENT
+	if failures := f.raw.revokeCachedData(time.Now().Add(time.Minute)); len(failures) != 0 {
+		t.Fatalf("an evicted inode was reported as a failed withdrawal: %v", failures)
+	}
+}

@@ -434,9 +434,19 @@ func TestOnlySharedOpenTruncateRequiresPostVFSPublication(t *testing.T) {
 	}, ordinary); !status.Ok() {
 		t.Fatalf("ordinary OPEN = %v", status)
 	}
-	if ordinary.OpenFlags != coherentOpenFlags || f.raw.ReplyWriteOrdered(ordinaryUnique) ||
+	// An ordinary OPEN now publishes one thing -- that this kernel may retain
+	// the inode's pages -- so its reply is write-ordered against reverse
+	// notifications. It still takes no post-VFS receipt: the kernel forbids
+	// marking an unmarked OPEN, and there is nothing to mark, because the
+	// declaration installs no state a repair could miss. Every folio it permits
+	// is separately ordered against the barrier by mapping->invalidate_lock.
+	if ordinary.OpenFlags != coherentOpenFlags || !f.raw.ReplyWriteOrdered(ordinaryUnique) ||
 		f.raw.ReplyPublishMarked(ordinaryUnique, entry.NodeId, 14) {
-		t.Fatal("ordinary classification-only OPEN entered post-VFS publication")
+		t.Fatal("ordinary OPEN must be write-ordered for its retained-data declaration and must not be post-VFS marked")
+	}
+	completeTestReply(t, f.raw, ordinaryUnique, fuse.OK)
+	if !f.raw.cachedDataHolds(entry.Attr.Ino) {
+		t.Fatal("a published retained-data declaration must leave a withdrawal obligation behind")
 	}
 
 	directoryUnique := f.unique.Add(2)

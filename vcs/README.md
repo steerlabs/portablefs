@@ -56,9 +56,9 @@ internal/
   cellhelper/      Durable assignment pinning and the narrow root boundary.
   cellhost/        Closed XFS quota, local authority identity, and systemd host
                    operations derived only from signed volume assignments.
-  fusev3/          The Linux frontend. Raw FUSE, direct I/O, strict source and
-                   peer publication ordering, kernel binding revocation, and
-                   machine-local route grafts.
+  fusev3/          The Linux frontend. Raw FUSE, a barrier-coherent page cache,
+                   strict source and peer publication ordering, kernel binding
+                   and page revocation, and machine-local route grafts.
   portablefsd/     The daemon: attach registry, control API, the v3 attach and
                    its coherence bridge, and the evidence-bearing detach.
   pfslocal/        The local protocol between the daemon and the FSKit

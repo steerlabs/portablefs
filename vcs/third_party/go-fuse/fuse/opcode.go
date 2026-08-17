@@ -158,6 +158,16 @@ func doInit(server *protocolServer, req *request) {
 	if server.opts.MaxReadAhead != 0 && uint32(server.opts.MaxReadAhead) < out.MaxReadAhead {
 		out.MaxReadAhead = uint32(server.opts.MaxReadAhead)
 	}
+	if kernelFlags&CAP_PFS_CACHED_DATA != 0 && server.opts.MaxReadAhead != 0 {
+		// The strict profile negotiates the read-ahead window exactly rather
+		// than clamping the kernel's own request downwards. A SHARED read is
+		// one authority round trip, so the window is what decides how many of
+		// them a sequential reader pays, and it is sized against the same
+		// authority read bound this daemon will honour. The strict kernel
+		// installs this value verbatim instead of taking min() with its
+		// generic VM_READAHEAD_PAGES default.
+		out.MaxReadAhead = uint32(server.opts.MaxReadAhead)
+	}
 	if out.Minor > input.Minor {
 		out.Minor = input.Minor
 	}

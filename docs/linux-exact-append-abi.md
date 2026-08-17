@@ -34,9 +34,14 @@ This is a causal acknowledgement, not a timeout or invalidation heuristic.
 
 ## Strict INIT profile
 
-`FUSE_PFS_STRICT_COHERENCE = 1ULL << 63` denotes the complete profile.  The
-kernel accepts it only when all of the following are true:
+`FUSE_PFS_STRICT_COHERENCE = 1ULL << 63` and `FUSE_PFS_CACHED_DATA = 1ULL << 62`
+together denote the complete profile.  They are one version, not two features:
+selecting either without the other fails INIT, because the two revisions
+disagree about the exact SHARED regular open-flag pair and that disagreement
+would otherwise surface as `-EPROTO` on the first open rather than as a refused
+mount.  The kernel accepts the profile only when all of the following are true:
 
+- both private capability bits are returned;
 - the returned protocol version is exactly 7.41;
 - the mount uses `default_permissions`;
 - `FUSE_ATOMIC_O_TRUNC`, `FUSE_HANDLE_KILLPRIV_V2`, `FUSE_POSIX_LOCKS`, and
@@ -47,7 +52,17 @@ kernel accepts it only when all of the following are true:
   RESEND are absent; and
 - `FUSE_POSIX_ACL` is absent.  ACL caching happens outside the inner GETXATTR
   reply boundary and therefore requires a future dedicated post-cache
-  publication hook before it can be admitted safely.
+  publication hook before it can be admitted safely; and
+- `FUSE_AUTO_INVAL_DATA` is absent and `FUSE_EXPLICIT_INVAL_DATA` is present.
+  Retained pages are withdrawn by ordered DATA publication alone.  An mtime
+  heuristic would drop a coherent cache on unrelated attribute refreshes and,
+  because `fuse_cache_read_iter()` consults `fc->auto_inval_data`, would also put
+  a GETATTR in front of every buffered read.
+
+The negotiated `max_readahead` is installed verbatim rather than clamped to the
+generic `VM_READAHEAD_PAGES` default: a SHARED page fill is one authority round
+trip, so the window is what decides how many of them a sequential reader pays,
+and the daemon sizes it against the same `max_read` bound it will honour.
 
 Any mismatch fails INIT.  A daemon may not negotiate a subset and may not use a
 lower minor version.  Under the accepted profile, unexpected daemon `ENOSYS` is
@@ -127,26 +142,49 @@ Every OPEN and OPENDIR returns exactly one matching handle flag:
 | `FOPEN_PFS_LOCAL` | `1 << 9` |
 
 A SHARED regular handle has the exact open-flag set
-`FOPEN_DIRECT_IO | FOPEN_PFS_SHARED`.  KEEP_CACHE, NONSEEKABLE, CACHE_DIR,
-STREAM, NOFLUSH, PARALLEL_DIRECT_WRITES, and PASSTHROUGH are forbidden.  LOCAL
+`FOPEN_KEEP_CACHE | FOPEN_PFS_SHARED`.  DIRECT_IO, NONSEEKABLE, CACHE_DIR,
+STREAM, NOFLUSH, PARALLEL_DIRECT_WRITES, and PASSTHROUGH are forbidden.
+DIRECT_IO is refused rather than merely unused: it would route reads around the
+page cache the DATA barrier is written against.  It was never what routed
+writes -- `FOPEN_PFS_SHARED` alone selects the strict write transaction in
+`fuse_file_write_iter()` and alone makes the kernel refuse every shared mapping,
+so the retired pair differed from this one only in how reads were served.  There
+is no compatibility mode in which both pairs are accepted.  LOCAL
 grafts retain stock cached behavior and use `FOPEN_PFS_LOCAL`.  A SHARED
 directory handle is exactly `FOPEN_PFS_SHARED`: in particular, CACHE_DIR and
 KEEP_CACHE are forbidden, so every rewind/repeated getdents stream crosses the
 daemon even if a peer repair names a dentry that is already absent locally.
 LOCAL directory handles may retain the stock directory-cache flags.
 
-Every explicit SHARED read/readv and splice/sendfile read crosses the daemon.
-In particular, FUSE splice/sendfile routes SHARED handles through
-`copy_splice_read()`, whose buffers are filled by the handle's direct
-`read_iter`; `filemap_splice_read()` is reserved for LOCAL handles.  This keeps
-repeated shared splice reads out of the page cache and under authority ordering
-just like ordinary direct reads.  Strict negotiation forbids shared direct-I/O
-`MAP_SHARED`; Linux's permitted `MAP_PRIVATE` faults may use clean page-cache
-pages, which every newer DATA sequence invalidates in full under the mapping
-lock.  SHARED `POSIX_FADV_WILLNEED` is deliberately successful but ignored:
-Linux's generic implementation would otherwise invoke address-space readahead
-and populate cache despite the direct-I/O handle.  Other advice retains local
-generic hint/invalidation behavior, and LOCAL WILLNEED retains stock readahead.
+SHARED reads are served from this kernel's page cache: `read`/`readv` route to
+`fuse_cache_read_iter()`, splice/sendfile to `filemap_splice_read()`, and
+`POSIX_FADV_WILLNEED` reaches ordinary address-space readahead.  A repeated read
+of resident bytes therefore does not cross the daemon at all, which is the point.
+
+What makes that coherent is `mapping->invalidate_lock`, not a lifetime.  Every
+path that can insert a folio into a SHARED mapping holds it shared across the
+FUSE READ it issues -- `filemap_create_folio()` for a read miss,
+`page_cache_ra_unbounded()` for read-ahead and WILLNEED, `filemap_fault()` for a
+`MAP_PRIVATE` fault -- or holds the folio locked across an asynchronous
+read-ahead read started under it.  Every newer DATA sequence takes the same lock
+exclusively and invalidates the whole mapping (see *Exact size and data
+notification*).  A read therefore either completes and is invalidated, or begins
+strictly after the authority applied.
+
+`fuse_cache_read_iter()` additionally skips the past-EOF revalidating GETATTR for
+a SHARED handle: `i_size` is installed by the ordered DATA publication, which
+also bumps `fi->attr_version`, so a racing GETATTR reply cannot roll it back and
+issuing one could not observe anything the barrier has not already installed.
+
+Every `MAP_SHARED` mapping of a SHARED file is refused with `ENODEV`, writable or
+not.  A writable shared mapping would produce dirty folios that never travelled
+the write transaction, and a dirty folio is also the only thing
+`invalidate_inode_pages2()` cannot withdraw, which would make every later DATA
+repair on that inode terminal.  `MAP_PRIVATE` is permitted and coherent: its
+folios come from the same cache, and the DATA invalidation unmaps its page-table
+entries along with them.  `fuse_writepages()` and `fuse_write_begin()` fence the
+connection under the strict profile, because reaching either would mean SHARED
+file data left this kernel outside the write transaction.
 
 Positive LOOKUP is classified from the returned child.  Negative LOOKUP has no
 child attr and derives its marker requirement from the parent.  Consequently a
@@ -158,6 +196,7 @@ missing name in a SHARED directory remains marked.
 | Item | Value |
 | --- | ---: |
 | strict capability | bit 63 |
+| cached-data capability | bit 62 |
 | daemon reply PUBLISH marker | `fuse_out_header.unique` bit 62 |
 | exact-size notification | code 10 |
 | transactional write | opcode 4097 |
@@ -380,9 +419,22 @@ For every newer DATA sequence the kernel:
 5. publishes the new sequence only after all steps succeed.
 
 This excludes concurrent filemap/MAP_PRIVATE faults from inserting a clean stale
-page after the invalidation scan.  `invalidate_inode_pages2()` failure is
-terminal.  An older sequence is ignored; equal sequence/equal size is
-idempotent; equal sequence/different size is terminal.
+page after the invalidation scan, and it is what partitions every SHARED read
+into "completed and withdrawn" or "started after apply".  Ordering is by
+sequence only: a same-length overwrite carries a strictly greater sequence and
+reaches step 4 exactly like a grow or a shrink, so nothing short-circuits on an
+unchanged `i_size`.  `invalidate_inode_pages2()` failure is terminal, and cannot
+occur on a SHARED mapping because such a mapping is never dirty.  An older
+sequence is ignored; equal sequence/equal size is idempotent; equal
+sequence/different size is terminal.
+
+`FUSE_NOTIFY_INVAL_INODE` with `off == 0 && len == 0` on a SHARED inode is the
+strict whole-inode data withdrawal (`fuse_pfs_withdraw_data()`).  It takes the
+same publication mutex and mapping lock and performs the same
+`invalidate_inode_pages2()`, but installs no size and consumes no sequence: it
+is the revocation primitive, and a dying mount that advanced the ordered
+sequence would make a later real publication look like a replay.  `off < 0`
+retains the stock attribute-only meaning used by ATTRIBUTES repair.
 
 The strict reverse-notification surface is closed: only INVAL_INODE,
 INVAL_ENTRY, DELETE, and PFS_SIZE are admitted.  The stock repairs have one

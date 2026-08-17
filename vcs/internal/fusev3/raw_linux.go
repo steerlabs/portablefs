@@ -79,6 +79,15 @@ type replyAttrPublication struct {
 	coordinate publicationCoordinate
 }
 
+// replyDataPublication is one OPEN reply's declaration that this kernel may
+// retain the inode's file data. It carries the record as well as the inode
+// number because the withdrawal it obliges is addressed by kernel NodeID.
+type replyDataPublication struct {
+	inode      uint64
+	record     *inodeRecord
+	coordinate publicationCoordinate
+}
+
 // replyPublication is everything one kernel response can make cacheable or
 // must keep source-serialized. It is registered by request Unique before the
 // RawFileSystem method returns. Definite no-change replies settle after their
@@ -87,6 +96,7 @@ type replyAttrPublication struct {
 type replyPublication struct {
 	names         []replyNamePublication
 	attrs         []replyAttrPublication
+	data          []replyDataPublication
 	source        *sourcePublicationLease
 	writeKernelTx uint64
 	// responseConsumptions prevent authority transport EOF from exposing the
@@ -114,7 +124,7 @@ type replyPublication struct {
 }
 
 func (p *replyPublication) empty() bool {
-	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && p.source == nil &&
+	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
 		p.writeKernelTx == 0 && len(p.responseConsumptions) == 0 && !p.needsPostVFS
 }
 
@@ -263,6 +273,20 @@ type rawFileSystem struct {
 	// reclaimed by FORGET, and must therefore leave only through a repair or
 	// through self-revocation.
 	cachedNegatives map[nameKey]struct{}
+	// cachedData is the exact set of authority inodes whose file data this
+	// frontend has told its kernel it may keep. It is keyed by the
+	// coordination inode number a VisibilityTarget carries, and it is the
+	// third kernel cache this mount owes a withdrawal for.
+	//
+	// Unlike a name or an attribute, retained data is not something the kernel
+	// asks about again: with FOPEN_KEEP_CACHE a read of a resident folio is
+	// answered inside the kernel with no request this frontend could refuse.
+	// So this registry exists for exactly one purpose -- self-revocation has to
+	// be able to name every inode whose pages must be dropped before a fenced
+	// mount is left running. Entries are added when an OPEN reply publishes
+	// cacheability and removed only by FORGET, because a live open description
+	// can refault at any moment after a repair.
+	cachedData map[uint64]*inodeRecord
 	// heldNames and heldInodes are closed to cache admission between PREPARE
 	// and COMPLETE. heldPhase is the exact set the current PREPARE installed,
 	// because COMPLETE's target set is allowed to differ from PREPARE's.
@@ -339,6 +363,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		cachedStableNames:          make(map[publicationNamespace]*inodeRecord),
 		cachedNameStable:           make(map[nameKey]publicationNamespace),
 		cachedNegatives:            make(map[nameKey]struct{}),
+		cachedData:                 make(map[uint64]*inodeRecord),
 		heldNames:                  make(map[nameKey]struct{}),
 		heldInodes:                 make(map[uint64]struct{}),
 		publishingNames:            make(map[nameKey]int),
@@ -523,6 +548,73 @@ func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *ino
 	return r.entryTimeout, publication, true
 }
 
+// cachedDataHolds reports whether this mount currently owes a page-cache
+// withdrawal for one coordination inode. It exists so tests can assert the
+// obligation directly rather than inferring it from a notification the
+// withdrawal happens to emit.
+func (r *rawFileSystem) cachedDataHolds(inode uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cachedData[inode] != nil
+}
+
+// admitDataLocked decides whether one OPEN reply may declare this inode's file
+// data retainable, and is the exact peer of admitNameLocked/admitAttrLocked for
+// the third kernel cache a strict mount owns.
+//
+// It differs from them in the one way that matters: a name or an attribute has
+// an uncacheable form -- publish it with a zero lifetime and nothing is left
+// behind -- while the open flag pair is exact, so "cacheable" is the only reply
+// this frontend is allowed to give. Refusal therefore cannot degrade the reply;
+// it can only mean "not yet", and awaitDataAdmission parks the callback until
+// the cut reopens. That is safe precisely where blocking a READ would not be:
+// OPEN holds no folio lock and no mapping->invalidate_lock, so it can never be
+// the thing a COMPLETE repair is waiting behind.
+//
+// heldInodes is the PREPARE-time cut, and DATA dominates ATTRIBUTES for the
+// same kernel inode in translate(), so a DATA target closes this coordinate
+// through exactly the same key an attribute target does. publishingInodes is
+// what drainPublications waits out, so an OPEN admitted before the cut closed
+// still reaches the kernel before PREPARE is acknowledged.
+func (r *rawFileSystem) admitDataLocked(ctx context.Context, inode uint64, identity publicationIdentity) (publicationCoordinate, bool) {
+	coordinate := publicationCoordinate{kind: publicationItemData, item: identity}
+	if _, held := r.heldInodes[inode]; held {
+		return coordinate, false
+	}
+	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
+		return coordinate, false
+	}
+	r.publishingInodes[inode]++
+	r.admitSourcePublicationLocked(coordinate)
+	return coordinate, true
+}
+
+// awaitDataAdmission blocks until this inode's cached-data coordinate is open,
+// then admits it. The wait ends when a peer COMPLETE releases the held cut or
+// an overlapping source lease releases; both signal sourceChanged under r.mu.
+//
+// This cannot deadlock against the repair it is waiting for. A peer COMPLETE's
+// reverse notifications take mapping->invalidate_lock and per-folio locks; this
+// callback holds neither, and it is not counted in publishingInodes until the
+// moment it is admitted, so PREPARE's drain never waits on a parked OPEN.
+func (r *rawFileSystem) awaitDataAdmission(ctx context.Context, inode uint64, identity publicationIdentity) (publicationCoordinate, error) {
+	for {
+		r.mu.Lock()
+		coordinate, admitted := r.admitDataLocked(ctx, inode, identity)
+		if admitted {
+			r.mu.Unlock()
+			return coordinate, nil
+		}
+		changed := r.sourceChanged
+		r.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return coordinate, fmt.Errorf("fusev3: wait to publish retainable file data for inode %d: %w", inode, ctx.Err())
+		}
+	}
+}
+
 func (r *rawFileSystem) admitAttrLocked(ctx context.Context, inode uint64, identity publicationIdentity) (time.Duration, publicationCoordinate, bool) {
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
 	if _, held := r.heldInodes[inode]; held {
@@ -677,6 +769,21 @@ func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublica
 	r.settleSourcePublicationLocked(publication.coordinate)
 }
 
+// settleDataPublicationLocked ends one retained-data declaration. The registry
+// entry is recorded only when the OPEN reply physically reached the kernel: a
+// reply that never landed handed out no cacheability, and recording a
+// withdrawal obligation for it would make self-revocation address an inode this
+// kernel was never told to keep.
+func (r *rawFileSystem) settleDataPublicationLocked(publication replyDataPublication, successful bool) {
+	if r.publishingInodes[publication.inode]--; r.publishingInodes[publication.inode] <= 0 {
+		delete(r.publishingInodes, publication.inode)
+	}
+	if successful && publication.record != nil && !publication.record.reclaimed {
+		r.cachedData[publication.inode] = publication.record
+	}
+	r.settleSourcePublicationLocked(publication.coordinate)
+}
+
 func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) {
 	for _, name := range publication.names {
 		r.settleNamePublicationLocked(name, successful)
@@ -684,7 +791,10 @@ func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublicati
 	for _, attr := range publication.attrs {
 		r.settleAttrPublicationLocked(attr)
 	}
-	if len(publication.names) != 0 || len(publication.attrs) != 0 {
+	for _, data := range publication.data {
+		r.settleDataPublicationLocked(data, successful)
+	}
+	if len(publication.names) != 0 || len(publication.attrs) != 0 || len(publication.data) != 0 {
 		close(r.published)
 		r.published = make(chan struct{})
 	}
@@ -1045,6 +1155,13 @@ func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
 		}
 	}
 	record.names = nil
+	// FORGET also proves the kernel dropped this inode, and an inode it does
+	// not hold has no page cache. The data registry is released on exactly the
+	// same evidence as the name budget rather than on a repair, because a
+	// repair drops the pages a live open description can immediately refault.
+	if r.cachedData[record.key.inode] == record {
+		delete(r.cachedData, record.key.inode)
+	}
 	if record.graft {
 		// A machine-local object holds no authority capability, so there is
 		// nothing for the cleanup lane to hand back.
@@ -1346,6 +1463,44 @@ func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *f
 	return fuse.OK
 }
 
+// publishRetainedData declares that this kernel may keep the inode's file data
+// resident across the handle it is about to receive.
+//
+// It is the OPEN half of the cache contract, and it is deliberately admitted
+// through the same source-publication gate and PREPARE cut that a name or an
+// attribute reply passes. The declaration cannot be softened -- the strict
+// kernel accepts exactly one open flag pair for a SHARED regular file -- so a
+// closed cut parks the callback rather than downgrading the reply.
+//
+// Not calling this and replying anyway would still hand the kernel a retainable
+// cache; it would just hand it one no revocation could name. That is the defect
+// this function exists to prevent, which is why the caller treats a failure as
+// terminal rather than as a reason to reply uncached.
+func (r *rawFileSystem) publishRetainedData(ctx context.Context, record *inodeRecord, attr *authoritypb.Attr) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || record == nil || attr == nil {
+		return errors.New("fusev3: retained-data declaration escaped its post-VFS reply-publication lifecycle")
+	}
+	inode := attr.GetInode()
+	if inode == 0 {
+		return errors.New("fusev3: retained-data declaration has no coordination inode")
+	}
+	// Deliberately no post-VFS receipt. The kernel forbids marking an ordinary
+	// OPEN reply, and it is right to: this declaration installs no state a
+	// repair could miss. It grants permission to retain data whose every folio
+	// is separately ordered against the barrier by mapping->invalidate_lock, so
+	// a COMPLETE that lands between the reply write and fuse_finish_open()
+	// simply leaves KEEP_CACHE describing an already-empty cache. Settling on
+	// the physical response write is therefore the exact boundary: it is what
+	// proves the kernel was told it may retain anything at all.
+	coordinate, err := r.awaitDataAdmission(ctx, inode, record.identity)
+	if err != nil {
+		return err
+	}
+	publication.data = append(publication.data, replyDataPublication{inode: inode, record: record, coordinate: coordinate})
+	return nil
+}
+
 func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 	record := r.acquire(input.NodeId)
 	if record == nil {
@@ -1378,6 +1533,10 @@ func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 	if !ok {
 		r.closeOrphanedFile(ctx, handle)
 		return fuse.EIO
+	}
+	if err := r.publishRetainedData(ctx, record, record.node.item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
 	}
 	out.Fh, out.OpenFlags = id, flags
 	if err := completeSourcePublication(ctx); err != nil {
@@ -1583,6 +1742,10 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 		r.mount.revoke(err)
 		return fuse.Status(syscall.ENOTCONN)
 	}
+	if err := r.publishRetainedData(ctx, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	out.Fh, out.OpenFlags = id, flags
 	if err := completeSourcePublication(ctx); err != nil {
 		r.mount.revoke(err)
@@ -1660,6 +1823,10 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 		return fuse.EIO
 	}
 	if err := r.publishAnonymousEntry(ctx, &out.EntryOut, record, item.GetAttr()); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := r.publishRetainedData(ctx, record, item.GetAttr()); err != nil {
 		r.mount.revoke(err)
 		return fuse.Status(syscall.ENOTCONN)
 	}

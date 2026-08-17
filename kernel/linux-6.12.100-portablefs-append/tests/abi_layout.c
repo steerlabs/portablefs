@@ -8,6 +8,10 @@ _Static_assert(FUSE_KERNEL_VERSION == 7, "FUSE major changed");
 _Static_assert(FUSE_KERNEL_MINOR_VERSION == 41, "strict ABI minor changed");
 _Static_assert(FUSE_PFS_STRICT_COHERENCE == (UINT64_C(1) << 63),
 	       "strict capability bit changed");
+_Static_assert(FUSE_PFS_CACHED_DATA == (UINT64_C(1) << 62),
+	       "cached-data capability bit changed");
+_Static_assert((FUSE_PFS_STRICT_COHERENCE & FUSE_PFS_CACHED_DATA) == 0,
+	       "the two halves of the private profile must be distinct bits");
 _Static_assert(FUSE_PFS_UNIQUE_PUBLISH == (UINT64_C(1) << 62),
 	       "publication marker changed");
 _Static_assert(FUSE_UNIQUE_RESEND == (UINT64_C(1) << 63),

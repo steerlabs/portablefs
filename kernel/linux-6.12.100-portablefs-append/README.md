@@ -8,6 +8,10 @@ The historical directory name says `append`; the implementation now covers the
 whole strict kernel publication boundary:
 
 - exact 7.41 profile negotiation and immutable SHARED/LOCAL classification;
+- cacheable SHARED regular opens (`FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED`) whose
+  page cache is withdrawn by ordered DATA publication under
+  `mapping->invalidate_lock`, plus the whole-inode withdrawal a revoking mount
+  uses to stop serving retained pages;
 - transactional positioned and effective-append writes;
 - a generic post-VFS publication ACK for marked replies;
 - ordered exact-size/full-data invalidation notifications;

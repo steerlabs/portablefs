@@ -934,18 +934,80 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 	}
 }
 
+// revokeCachedData drops every page this mount told its kernel it could keep.
+//
+// This is the one withdrawal that has no softer form. A cached name or a cached
+// attribute is only ever an answer the kernel will ask about again once it
+// expires, and until then the serving path can refuse. A retained page is not:
+// with FOPEN_KEEP_CACHE a read of a resident folio is completed inside the
+// kernel with no request reaching this process at all, so revoked.Store(true)
+// and the ENOTCONN choke point in acquireBulk -- which are what bound every
+// other kind of stale service -- cannot see it, let alone refuse it. Neither
+// can the FUSE connection abort at the end of the withdrawal ladder: aborting
+// fails every future request, and a page that needs no request is unaffected.
+// Without this pass a process whose working directory was already inside the
+// mount could keep reading pre-fence bytes for as long as it held the file
+// open. That is exactly the 8.6s stale-read window failure-modes.md records as
+// a known macOS defect, and it is not one this platform is going to reproduce.
+//
+// The walk is bounded by the same declared repair budget the name withdrawal
+// uses, and it runs after the namespace detach and after the connection abort:
+// the mount is already revoked, so the serving path refuses every FUSE_READ,
+// and once the connection is aborted a fill cannot even be attempted. One pass
+// is therefore final rather than a race the next reader can undo.
+func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
+	r.mu.Lock()
+	work := make([]repair, 0, len(r.cachedData))
+	for inode, record := range r.cachedData {
+		_ = inode
+		work = append(work, repair{inode: record.id, data: true})
+	}
+	r.cachedData = make(map[uint64]*inodeRecord)
+	r.mu.Unlock()
+	server := r.mount.notifier()
+	if server == nil {
+		return nil
+	}
+	var failures []string
+	for _, item := range work {
+		if time.Now().After(deadline) {
+			failures = append(failures, fmt.Sprintf("data withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-len(failures)))
+			return failures
+		}
+		// ENOENT is the strongest possible outcome: the kernel holds no inode
+		// state at all, so there is nothing left that could answer from the old
+		// pages. Every other failure is recorded, because a page this mount
+		// could not take back is stale data a fenced participant can still
+		// serve, and the operator has to be told that in the revocation report.
+		if status := server.InodeNotify(item.inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
+			failures = append(failures, fmt.Sprintf("withdraw cached data for inode %d: %v", item.inode, status))
+		}
+	}
+	return failures
+}
+
 // revoke makes this mount unusable immediately and permanently. It is the local
 // obligation that lets the authority stop freezing a whole volume because one
 // participant died: a strict mount that can no longer repair must stop serving
 // what it already cached rather than continue.
 //
-// The bound on stale service is stated in three parts, strongest first. Every
+// The bound on stale service is stated in four parts, strongest first. Every
 // new request is refused synchronously, before this call returns. From the
 // mount namespace root the tree becomes unreachable in one syscall. For a
 // process whose working directory was already inside the mount, every binding
 // this frontend published is withdrawn within the declared repair budget, after
 // which the connection is aborted and there is no request this mount could
-// answer wrongly at all.
+// answer wrongly at all. Finally -- and this is the part that requests alone
+// cannot cover, because a retained page is served without one -- every inode
+// whose data this mount declared retainable has that data dropped from the
+// kernel, after the abort has made a refill impossible.
+//
+// What that leaves is exact rather than approximate: an already-established
+// MAP_PRIVATE page table entry is torn down by the same
+// invalidate_inode_pages2() the withdrawal performs, so the next access
+// refaults into a dead connection and takes SIGBUS rather than reading stale
+// bytes. If the withdrawal itself fails, that failure is recorded in the
+// revocation report instead of being presented as a clean teardown.
 func (m *Mount) revoke(cause error) {
 	if cause == nil {
 		cause = errors.New("fusev3: strict mount revoked")
@@ -1012,6 +1074,10 @@ type RevocationReport struct {
 	KernelStateWithdrawn bool
 	// Withdrawal names every escalation step that failed, in order, as
 	// "<round>/<step>: <error>". It is empty on a first-attempt withdrawal.
+	// A "data-withdrawal" step is the one entry that reports residual stale
+	// service rather than residual mount state: it means retained pages this
+	// mount published could not be dropped, so a process still inside the
+	// mount may read pre-fence bytes.
 	Withdrawal []string
 }
 
@@ -1093,7 +1159,9 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 
 	// Round one's namespace detach runs before the cached-name withdrawal, so
 	// the tree is already unreachable from the namespace root while the
-	// bindings are being taken back one at a time.
+	// bindings are being taken back one at a time. The retained-data
+	// withdrawal runs later still, immediately after the first abort, because
+	// the abort is what makes it final: see revokeCachedData.
 	if out.installed {
 		out.record(1, "detach", ops.detach(installed.point))
 	}
@@ -1110,6 +1178,16 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 		// release a mount a busy detach could not remove.
 		if installed.device != "" {
 			out.record(round, "abort", ops.abort(installed))
+		}
+		if round == 1 && m.raw != nil {
+			// After the abort no FUSE_READ can be answered, so nothing can
+			// refill the page cache behind this pass and one pass is final.
+			// It is deliberately not skipped when the abort failed: a mount
+			// whose connection is still live is exactly the one whose retained
+			// pages are still reachable.
+			for _, failure := range m.raw.revokeCachedData(deadline) {
+				out.record(round, "data-withdrawal", errors.New(failure))
+			}
 		}
 		if !out.installed {
 			// No recorded kernel identity: startup failed before mountinfo
@@ -1165,6 +1243,13 @@ func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 // an interface so the mapping from a visibility target to a notification can be
 // tested without a kernel; *fuse.Server is the only production implementation.
 type kernelNotifier interface {
+	// InodeNotify(node, -1, 0) withdraws cached attributes only, which is what
+	// an ATTRIBUTES repair owes. InodeNotify(node, 0, 0) is the strict
+	// whole-inode data withdrawal used by self-revocation: the patched kernel
+	// routes that exact shape through fuse_pfs_withdraw_data(), which drops
+	// every retained folio under the same publication mutex and
+	// mapping->invalidate_lock an ordered DATA publication takes, and which
+	// deliberately consumes no authority sequence.
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
 	PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status
 	DeleteNotify(parent uint64, child uint64, name string) fuse.Status

@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
@@ -306,5 +308,80 @@ func TestSuccessfulWithdrawalReportsCleanKernelState(t *testing.T) {
 	mount.reportRevocation(mount.withdrawKernelState())
 	if !report.KernelStateWithdrawn {
 		t.Fatal("a proven-absent mount was not reported withdrawn; the clean-detach proof depends on this")
+	}
+}
+
+// TestWithdrawalDropsRetainedPagesAfterTheAbort is the ladder half of the
+// stale-page story. The other kinds of stale service this mount can commit are
+// bounded by refusing requests; a retained page is not, because a read of a
+// resident folio never becomes a request at all. So the ladder has to drop the
+// pages explicitly, and it has to do it after the connection abort: once the
+// connection is dead no fill can succeed, which is what makes one pass final
+// instead of a race the next reader undoes.
+func TestWithdrawalDropsRetainedPagesAfterTheAbort(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+	f.openForData(t, entry.NodeId)
+
+	fake := &fakeWithdrawal{installed: true, abortReleases: true}
+	// The abort has to be observable relative to the withdrawal, so record the
+	// notifier's call log position at the moment it happens.
+	abortedAfter := -1
+	ops := fake.ops()
+	realAbort := ops.abort
+	ops.abort = func(k kernelMount) error {
+		abortedAfter = len(f.notify.snapshot())
+		return realAbort(k)
+	}
+	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
+	f.mount.withdrawal = ops
+	f.mount.repairBudget = 5 * time.Second
+
+	out := f.mount.withdrawKernelState()
+	if !out.withdrawn {
+		t.Fatalf("withdrawal did not complete: %+v", out)
+	}
+	withdrawn := 0
+	for index, call := range f.notify.snapshot() {
+		if call.kind != "inode" || call.off != 0 || call.length != 0 {
+			continue
+		}
+		withdrawn++
+		if index < abortedAfter {
+			t.Fatalf("dropped pages for inode %d before the connection abort; a fill could still race it", call.inode)
+		}
+	}
+	if withdrawn != 1 {
+		t.Fatalf("whole-inode data withdrawals = %d, want exactly one", withdrawn)
+	}
+	if f.raw.cachedDataHolds(72) {
+		t.Fatal("the ladder left a page-cache withdrawal obligation outstanding")
+	}
+}
+
+// TestWithdrawalReportsPagesTheLadderCouldNotDrop makes the residual stale-read
+// window observable. A supervisor that is told the mount was torn down cleanly
+// while a process inside it can still read pre-fence bytes has been told the
+// wrong thing.
+func TestWithdrawalReportsPagesTheLadderCouldNotDrop(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+	f.openForData(t, entry.NodeId)
+	f.notify.inodeST = fuse.EIO
+
+	fake := &fakeWithdrawal{installed: true, abortReleases: true}
+	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
+	f.mount.withdrawal = fake.ops()
+	f.mount.repairBudget = 5 * time.Second
+
+	out := f.mount.withdrawKernelState()
+	found := false
+	for _, failure := range out.failures {
+		found = found || strings.Contains(failure, "data-withdrawal")
+	}
+	if !found {
+		t.Fatalf("a refused page withdrawal was not reported: %v", out.failures)
 	}
 }
