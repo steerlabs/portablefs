@@ -1,4 +1,4 @@
-From 6471e19ad993ca867d83004d4f707b2a5fdea1ca Mon Sep 17 00:00:00 2001
+From be96ce1bc2a746d202e412004e21bd67a540c46e Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Thu, 13 Aug 2026 08:30:45 -0700
 Subject: [PATCH] fuse: add PortableFS strict-coherence profile
@@ -14,7 +14,7 @@ Subject: [PATCH] fuse: add PortableFS strict-coherence profile
  fs/cachefiles/namei.c                        |    7 +
  fs/coda/file.c                               |    7 +
  fs/erofs/super.c                             |    7 +
- fs/fuse/dev.c                                |  470 ++++++-
+ fs/fuse/dev.c                                |  471 ++++++-
  fs/fuse/dir.c                                |  360 +++++-
  fs/fuse/file.c                               | 1220 +++++++++++++++++-
  fs/fuse/fuse_i.h                             |   79 +-
@@ -34,7 +34,7 @@ Subject: [PATCH] fuse: add PortableFS strict-coherence profile
  include/uapi/linux/fuse.h                    |  144 +++
  io_uring/rw.c                                |   22 +-
  mm/swapfile.c                                |    4 +
- 30 files changed, 2691 insertions(+), 131 deletions(-)
+ 30 files changed, 2692 insertions(+), 131 deletions(-)
 
 diff --git a/drivers/block/loop.c b/drivers/block/loop.c
 index dd4117192..978665072 100644
@@ -217,7 +217,7 @@ index 1640ebc26..34676b1f0 100644
  
  		if (S_ISREG(file_inode(sbi->dif0.file)->i_mode) &&
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index c3e726751..8f8ab7fc3 100644
+index c3e726751..b1078aeb7 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
 @@ -49,6 +49,7 @@ static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
@@ -663,12 +663,13 @@ index c3e726751..8f8ab7fc3 100644
  static int fuse_notify_inval_inode(struct fuse_conn *fc, unsigned int size,
  				   struct fuse_copy_state *cs)
  {
-@@ -1494,15 +1762,71 @@ static int fuse_notify_inval_inode(struct fuse_conn *fc, unsigned int size,
+@@ -1494,15 +1762,72 @@ static int fuse_notify_inval_inode(struct fuse_conn *fc, unsigned int size,
  	if (err)
  		goto err;
  	fuse_copy_finish(cs);
 +	if (fc->pfs_strict_coherence &&
-+	    (!outarg.ino || outarg.off != -1 || outarg.len != 0))
++	    (!outarg.ino || outarg.len != 0 ||
++	     (outarg.off != -1 && outarg.off != 0)))
 +		goto protocol_error;
  
  	down_read(&fc->killsb);
@@ -737,7 +738,7 @@ index c3e726751..8f8ab7fc3 100644
  	return err;
  }
  
-@@ -1540,18 +1864,37 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
+@@ -1540,18 +1865,37 @@ static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
  	if (err)
  		goto err;
  	fuse_copy_finish(cs);
@@ -776,7 +777,7 @@ index c3e726751..8f8ab7fc3 100644
  }
  
  static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
-@@ -1588,18 +1931,37 @@ static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
+@@ -1588,18 +1932,37 @@ static int fuse_notify_delete(struct fuse_conn *fc, unsigned int size,
  	if (err)
  		goto err;
  	fuse_copy_finish(cs);
@@ -815,7 +816,7 @@ index c3e726751..8f8ab7fc3 100644
  }
  
  static int fuse_notify_store(struct fuse_conn *fc, unsigned int size,
-@@ -1904,6 +2266,17 @@ static int fuse_notify_resend(struct fuse_conn *fc)
+@@ -1904,6 +2267,17 @@ static int fuse_notify_resend(struct fuse_conn *fc)
  static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
  		       unsigned int size, struct fuse_copy_state *cs)
  {
@@ -833,7 +834,7 @@ index c3e726751..8f8ab7fc3 100644
  	/* Don't try to move pages (yet) */
  	cs->move_pages = 0;
  
-@@ -1927,8 +2300,15 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
+@@ -1927,8 +2301,15 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
  		return fuse_notify_delete(fc, size, cs);
  
  	case FUSE_NOTIFY_RESEND:
@@ -849,7 +850,7 @@ index c3e726751..8f8ab7fc3 100644
  	default:
  		fuse_copy_finish(cs);
  		return -EINVAL;
-@@ -1984,6 +2364,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -1984,6 +2365,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  	struct fuse_pqueue *fpq = &fud->pq;
  	struct fuse_req *req;
  	struct fuse_out_header oh;
@@ -857,7 +858,7 @@ index c3e726751..8f8ab7fc3 100644
  
  	err = -EINVAL;
  	if (nbytes < sizeof(struct fuse_out_header))
-@@ -2005,6 +2386,13 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2005,6 +2387,13 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  		err = fuse_notify(fc, oh.error, nbytes - sizeof(oh), cs);
  		goto copy_finish;
  	}
@@ -871,7 +872,7 @@ index c3e726751..8f8ab7fc3 100644
  
  	err = -EINVAL;
  	if (oh.error <= -512 || oh.error > 0)
-@@ -2021,6 +2409,25 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2021,6 +2410,25 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  		goto copy_finish;
  	}
  
@@ -897,7 +898,7 @@ index c3e726751..8f8ab7fc3 100644
  	/* Is it an interrupt reply ID? */
  	if (oh.unique & FUSE_INT_REQ_BIT) {
  		__fuse_get_request(req);
-@@ -2029,8 +2436,14 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2029,8 +2437,14 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  		err = 0;
  		if (nbytes != sizeof(struct fuse_out_header))
  			err = -EINVAL;
@@ -914,7 +915,7 @@ index c3e726751..8f8ab7fc3 100644
  		else if (oh.error == -EAGAIN)
  			err = queue_interrupt(req);
  
-@@ -2042,6 +2455,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2042,6 +2456,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  	clear_bit(FR_SENT, &req->flags);
  	list_move(&req->list, &fpq->io);
  	req->out.h = oh;
@@ -922,7 +923,7 @@ index c3e726751..8f8ab7fc3 100644
  	set_bit(FR_LOCKED, &req->flags);
  	spin_unlock(&fpq->lock);
  	cs->req = req;
-@@ -2073,6 +2487,18 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2073,6 +2488,18 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  	goto out;
  }
  
@@ -4441,5 +4442,5 @@ index 552df432c..a8e5df7a3 100644
  	si->swap_file = swap_file;
  	mapping = swap_file->f_mapping;
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

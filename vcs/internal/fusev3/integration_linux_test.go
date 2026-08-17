@@ -1815,7 +1815,8 @@ func TestPrivateMappingsAreTornDownByTheDataBarrier(t *testing.T) {
 // answered inside the kernel and never becomes a request, so neither the
 // frontend's revoked check nor the FUSE connection abort can see it. What
 // closes it is the explicit whole-inode withdrawal the revocation ladder issues
-// after the abort. If that regressed, this reader would keep observing
+// before the abort closes its notification channel. If that regressed, this
+// reader would keep observing
 // pre-fence bytes for as long as it held the file open.
 //
 // REQUIRES THE PRIVILEGED RUNNER: revocation is only observable against a real

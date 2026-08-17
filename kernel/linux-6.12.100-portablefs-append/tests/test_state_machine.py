@@ -354,7 +354,7 @@ def strict_notify(
         not name or b"\0" in name or b"/" in name or name in (b".", b"..")
     ):
         raise ProtocolError("invalid cached-child component")
-    if code == "INVAL_INODE" and (off != -1 or length != 0):
+    if code == "INVAL_INODE" and (off not in (-1, 0) or length != 0):
         raise ProtocolError("partial inode invalidation is unsequenced")
     if code == "INVAL_ENTRY" and flags != 0:
         raise ProtocolError("entry expiry is outside the strict repair shape")
@@ -368,6 +368,8 @@ def strict_notify(
         raise ProtocolError("reverse repair targeted a LOCAL inode")
     if code in ("INVAL_ENTRY", "DELETE") and not inode.is_dir:
         raise ProtocolError("namespace repair parent is not a directory")
+    if code == "INVAL_INODE" and off == 0:
+        inode.withdraw_data()
     if code in ("INVAL_ENTRY", "DELETE") and resident_child is not None:
         if resident_child.pfs_class != "shared":
             raise ProtocolError("namespace repair targeted a LOCAL child")
@@ -1091,6 +1093,16 @@ class PublicationAndNotifyTests(unittest.TestCase):
         local_file = KernelInode(size=4096, pfs_class="local")
         local_dir = KernelInode(pfs_class="local", is_dir=True)
 
+        before_withdrawal = shared_file.cache_generation
+        self.assertEqual(
+            strict_notify("INVAL_INODE", shared_file, off=0, length=0),
+            "dispatched",
+        )
+        self.assertEqual(
+            shared_file.cache_generation,
+            before_withdrawal + 1,
+            "the exact (0, 0) revocation shape must withdraw retained data",
+        )
         for off, length in ((0, 4096), (-1, 1), (4096, 0)):
             with self.assertRaises(ProtocolError):
                 strict_notify(

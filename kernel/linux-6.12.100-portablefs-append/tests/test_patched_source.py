@@ -142,12 +142,18 @@ class PatchedSourceTests(unittest.TestCase):
             text.index("static int fuse_notify_inval_inode"):
             text.index("static int fuse_notify_pfs_size")
         ]
-        shape = inode.index(
-            "!outarg.ino || outarg.off != -1 || outarg.len != 0"
+        shape = inode.index("!outarg.ino || outarg.len != 0 ||")
+        self.assertIn(
+            "(outarg.off != -1 && outarg.off != 0)",
+            inode[shape:],
         )
         repair = inode.index("fuse_pfs_reverse_inval_inode")
         self.assertLess(shape, repair)
         self.assertIn("fuse_abort_conn(fc)", inode)
+
+        withdrawal = inode_repair.index("if (off == 0 && len == 0)")
+        self.assertLess(withdrawal, inode_repair.index("fuse_reverse_inval_inode"))
+        self.assertIn("fuse_pfs_withdraw_data(target)", inode_repair[withdrawal:])
 
         entry = text[
             text.index("static int fuse_notify_inval_entry"):

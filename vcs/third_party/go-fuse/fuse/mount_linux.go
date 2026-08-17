@@ -204,9 +204,21 @@ func mount(mountPoint string, opts *MountOptions, ready chan<- error) (fd int, e
 }
 
 func unmount(mountPoint string, opts *MountOptions) (err error) {
+	return unmountWithMode(mountPoint, opts, false)
+}
+
+func unmountLazy(mountPoint string, opts *MountOptions) error {
+	return unmountWithMode(mountPoint, opts, true)
+}
+
+func unmountWithMode(mountPoint string, opts *MountOptions, lazy bool) (err error) {
 	if opts.DirectMount || opts.DirectMountStrict {
 		// Attempt to directly unmount, if fails fallback to fusermount method
-		err := syscall.Unmount(mountPoint, 0)
+		flags := 0
+		if lazy {
+			flags = syscall.MNT_DETACH
+		}
+		err := syscall.Unmount(mountPoint, flags)
 		if err == nil {
 			return nil
 		}
@@ -220,7 +232,8 @@ func unmount(mountPoint string, opts *MountOptions) (err error) {
 		return err
 	}
 	errBuf := bytes.Buffer{}
-	cmd := exec.Command(bin, "-u", mountPoint)
+	args := unmountArgs(mountPoint, lazy)
+	cmd := exec.Command(bin, args...)
 	cmd.Stderr = &errBuf
 	if opts.Debug {
 		opts.Logger.Printf("unmount: executing %q", cmd.Args)
@@ -231,6 +244,14 @@ func unmount(mountPoint string, opts *MountOptions) (err error) {
 			errBuf.String(), err)
 	}
 	return err
+}
+
+func unmountArgs(mountPoint string, lazy bool) []string {
+	args := []string{"-u"}
+	if lazy {
+		args = append(args, "-z")
+	}
+	return append(args, mountPoint)
 }
 
 // lookPathFallback - search binary in PATH and, if that fails,

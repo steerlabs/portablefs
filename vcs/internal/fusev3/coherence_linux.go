@@ -17,7 +17,6 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
-	"golang.org/x/sys/unix"
 )
 
 // CoherenceProfile is the kernel-cache contract a mount declares to the
@@ -951,10 +950,11 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 // a known macOS defect, and it is not one this platform is going to reproduce.
 //
 // The walk is bounded by the same declared repair budget the name withdrawal
-// uses, and it runs after the namespace detach and after the connection abort:
-// the mount is already revoked, so the serving path refuses every FUSE_READ,
-// and once the connection is aborted a fill cannot even be attempted. One pass
-// is therefore final rather than a race the next reader can undo.
+// uses. It runs after namespace detach but before connection abort: the mount
+// is already revoked, so the serving path refuses every FUSE_READ, while the
+// notification channel is still alive. The patched kernel serializes this
+// withdrawal with page fills, so one pass is final rather than a race the next
+// reader can undo.
 func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 	r.mu.Lock()
 	work := make([]repair, 0, len(r.cachedData))
@@ -1000,7 +1000,9 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 // answer wrongly at all. Finally -- and this is the part that requests alone
 // cannot cover, because a retained page is served without one -- every inode
 // whose data this mount declared retainable has that data dropped from the
-// kernel, after the abort has made a refill impossible.
+// kernel before aborting the notification channel. The frontend's revoked
+// admission blocks new fills, and the kernel serializes the withdrawal with
+// any fill already in progress.
 //
 // What that leaves is exact rather than approximate: an already-established
 // MAP_PRIVATE page table entry is torn down by the same
@@ -1111,9 +1113,10 @@ func (o *withdrawalOutcome) record(round int, step string, err error) {
 }
 
 // kernelWithdrawal is the set of kernel primitives the escalation ladder
-// drives. Production binds them to the real syscalls; a test substitutes them
+// drives. Production binds detach to the mount-owner fusermount helper and the
+// remaining steps to kernel interfaces; a test substitutes them
 // to exercise the escalation without a kernel, which is the only way to cover
-// the failure ladder at all — a unit test cannot make MNT_DETACH return EPERM.
+// the failure ladder at all.
 type kernelWithdrawal struct {
 	detach func(point string) error
 	abort  func(kernelMount) error
@@ -1121,9 +1124,14 @@ type kernelWithdrawal struct {
 	sleep  func(time.Duration)
 }
 
-func productionKernelWithdrawal() kernelWithdrawal {
+func (m *Mount) productionKernelWithdrawal() kernelWithdrawal {
 	return kernelWithdrawal{
-		detach: func(point string) error { return unix.Unmount(point, unix.MNT_DETACH) },
+		detach: func(string) error {
+			if m.server == nil {
+				return errors.New("fusev3: lazy detach has no FUSE server")
+			}
+			return m.server.UnmountLazy()
+		},
 		abort:  func(k kernelMount) error { return k.abortKernelConnection() },
 		absent: func(k kernelMount) (MountAbsenceProof, error) { return k.absent() },
 		sleep:  time.Sleep,
@@ -1134,21 +1142,20 @@ func (m *Mount) withdrawalOps() kernelWithdrawal {
 	if m.withdrawal.detach != nil {
 		return m.withdrawal
 	}
-	return productionKernelWithdrawal()
+	return m.productionKernelWithdrawal()
 }
 
 // withdrawKernelState is the strict half of teardown. It runs on the teardown
 // goroutine because most of its steps can block, and none of them may block
 // whoever discovered the failure.
 //
-// Every step's error is now checked. It used to discard all three, which read
-// as harmless because the happy path is one successful MNT_DETACH — but under
-// load MNT_DETACH can fail, and a discarded failure left a dead FUSE mount
-// installed in the namespace with the CLI still reporting it live and the
-// authority still holding this participant's strict membership. So the steps
-// are an escalation ladder instead: detach, then abort the FUSE connection —
-// which is what makes the kernel drop the references the detach could not take
-// back — then prove absence, then re-detach and repeat, bounded by
+// Every step's error is checked. A discarded detach failure leaves a dead FUSE
+// mount installed in the namespace with the CLI still reporting it live and
+// the authority still holding this participant's strict membership. So the
+// steps are an escalation ladder instead: lazy-detach through the mount owner's
+// fusermount helper, withdraw retained kernel state while /dev/fuse is still a
+// valid notification channel, abort the connection, then prove absence and
+// repeat if necessary, bounded by
 // withdrawalRounds and by the declared repair budget. Whatever it proves is
 // returned, so the caller can persist a truthful verdict either way.
 func (m *Mount) withdrawKernelState() withdrawalOutcome {
@@ -1160,8 +1167,9 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	// Round one's namespace detach runs before the cached-name withdrawal, so
 	// the tree is already unreachable from the namespace root while the
 	// bindings are being taken back one at a time. The retained-data
-	// withdrawal runs later still, immediately after the first abort, because
-	// the abort is what makes it final: see revokeCachedData.
+	// withdrawal runs later still but necessarily before the first abort: the
+	// patched kernel makes the pass final, while an aborted go-fuse loop can
+	// close the notification descriptor before userspace reaches it.
 	if out.installed {
 		out.record(1, "detach", ops.detach(installed.point))
 	}
@@ -1169,25 +1177,19 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 		m.raw.revokeCachedNames(time.Now().Add(m.repairBudget))
 	}
 	deadline := time.Now().Add(m.repairBudget)
+	if m.raw != nil {
+		for _, failure := range m.raw.revokeCachedData(deadline) {
+			out.record(1, "data-withdrawal", errors.New(failure))
+		}
+	}
 	delay := withdrawalRetryDelay
 	for round := 1; ; round++ {
 		// Aborting is unconditional and is never skipped just because the
-		// detach reported success: it is the only primitive that unblocks a
-		// reverse notification already parked on a VFS lock, so it is what
-		// bounds self-revocation, and it is also what forces the kernel to
-		// release a mount a busy detach could not remove.
+		// detach reported success: it unblocks any request still parked on an
+		// authority operation and terminates the serving connection after the
+		// notification withdrawals above have completed.
 		if installed.device != "" {
 			out.record(round, "abort", ops.abort(installed))
-		}
-		if round == 1 && m.raw != nil {
-			// After the abort no FUSE_READ can be answered, so nothing can
-			// refill the page cache behind this pass and one pass is final.
-			// It is deliberately not skipped when the abort failed: a mount
-			// whose connection is still live is exactly the one whose retained
-			// pages are still reachable.
-			for _, failure := range m.raw.revokeCachedData(deadline) {
-				out.record(round, "data-withdrawal", errors.New(failure))
-			}
 		}
 		if !out.installed {
 			// No recorded kernel identity: startup failed before mountinfo

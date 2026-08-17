@@ -44,6 +44,10 @@ type Server struct {
 
 	// Empty if unmounted.
 	mountPoint string
+	// mountMu serializes ordinary unmount with Linux lazy detach. The latter
+	// returns before the serving loops exit, so it cannot use writeMu (which
+	// also protects replies and notifications).
+	mountMu sync.Mutex
 
 	// writeMu serializes close, notify writes, and the selected replies whose
 	// filesystem publication lifecycle requires the same ordering boundary.
@@ -124,6 +128,8 @@ func (ms *Server) RecordLatencies(l LatencyMap) {
 //
 // in this case.
 func (ms *Server) Unmount() (err error) {
+	ms.mountMu.Lock()
+	defer ms.mountMu.Unlock()
 	if ms.mountPoint == "" {
 		return nil
 	}

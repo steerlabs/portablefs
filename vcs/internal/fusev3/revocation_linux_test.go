@@ -17,29 +17,27 @@ import (
 )
 
 // The withdrawal escalation ladder. These tests exist because the failure they
-// cover cannot be produced any other way: a unit test cannot make MNT_DETACH
-// return EPERM, and the defect being fixed here — every error discarded, a dead
+// cover cannot be produced any other way: a unit test cannot make the
+// mount-owner detach helper fail on demand, and the defect being fixed here —
+// every error discarded, a dead
 // FUSE mount left installed, the CLI still calling it live — was invisible
 // precisely because nothing ever observed those errors.
 
 // fakeWithdrawal is a scripted kernel. Each primitive returns the next error in
 // its queue (nil once the queue is exhausted), and absence is answered from a
-// flag the detach steps flip, which is what a real MNT_DETACH does.
+// flag the detach steps flip, which is what a successful lazy unmount does.
 type fakeWithdrawal struct {
 	mu sync.Mutex
 	// detachErrs and abortErrs are consumed one per call.
 	detachErrs []error
 	abortErrs  []error
-	// installed is what mountinfo would still show. A detach clears it only
-	// when it succeeds; an abort clears it when abortReleases is set, which is
-	// the whole point of the escalation — aborting the connection makes the
-	// kernel drop the references a busy detach could not take back.
-	installed     bool
-	abortReleases bool
-	detaches      int
-	aborts        int
-	absences      int
-	slept         []time.Duration
+	// installed is what mountinfo would still show. A lazy detach clears it
+	// when it succeeds. Aborting a FUSE connection does not remove its mount.
+	installed bool
+	detaches  int
+	aborts    int
+	absences  int
+	slept     []time.Duration
 }
 
 func (f *fakeWithdrawal) ops() kernelWithdrawal {
@@ -59,9 +57,6 @@ func (f *fakeWithdrawal) ops() kernelWithdrawal {
 			defer f.mu.Unlock()
 			f.aborts++
 			err := next(&f.abortErrs)
-			if err == nil && f.abortReleases {
-				f.installed = false
-			}
 			return err
 		},
 		absent: func(k kernelMount) (MountAbsenceProof, error) {
@@ -118,14 +113,12 @@ func TestWithdrawalAbortsEvenWhenTheFirstDetachSucceeds(t *testing.T) {
 }
 
 func TestWithdrawalEscalatesFromAFailedDetachThroughAbortToSuccess(t *testing.T) {
-	// The exact production shape: MNT_DETACH is refused under load, the abort
-	// forces the kernel to release the mount, and the re-attempted detach then
-	// succeeds. Discarding the first error is what used to leave the mount
-	// installed forever.
+	// A first lazy-detach failure must not strand the mount. Aborting the FUSE
+	// connection does not remove it, so the ladder must retry the mount-owner
+	// detach and prove that attempt in mountinfo.
 	fake := &fakeWithdrawal{
-		installed:     true,
-		detachErrs:    []error{syscall.EPERM},
-		abortReleases: true,
+		installed:  true,
+		detachErrs: []error{syscall.EPERM},
 	}
 	out := revokingMount(t, fake).withdrawKernelState()
 	if !out.withdrawn {
@@ -144,8 +137,8 @@ func TestWithdrawalEscalatesFromAFailedDetachThroughAbortToSuccess(t *testing.T)
 }
 
 func TestWithdrawalRetriesTheDetachAfterTheAbort(t *testing.T) {
-	// The abort does not release the mount here, so the ladder must actually
-	// re-issue MNT_DETACH rather than merely aborting and hoping.
+	// The abort does not release the mount, so the ladder must actually re-issue
+	// the mount-owner lazy detach rather than merely aborting and hoping.
 	fake := &fakeWithdrawal{
 		installed:  true,
 		detachErrs: []error{syscall.EBUSY},
@@ -311,20 +304,20 @@ func TestSuccessfulWithdrawalReportsCleanKernelState(t *testing.T) {
 	}
 }
 
-// TestWithdrawalDropsRetainedPagesAfterTheAbort is the ladder half of the
+// TestWithdrawalDropsRetainedPagesBeforeTheAbort is the ladder half of the
 // stale-page story. The other kinds of stale service this mount can commit are
 // bounded by refusing requests; a retained page is not, because a read of a
 // resident folio never becomes a request at all. So the ladder has to drop the
-// pages explicitly, and it has to do it after the connection abort: once the
-// connection is dead no fill can succeed, which is what makes one pass final
-// instead of a race the next reader undoes.
-func TestWithdrawalDropsRetainedPagesAfterTheAbort(t *testing.T) {
+// pages explicitly while the reverse-notification descriptor is still alive.
+// revoked admission plus the patched kernel's invalidate-lock serialization
+// makes the pass final before the connection is aborted.
+func TestWithdrawalDropsRetainedPagesBeforeTheAbort(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
 	f.openForData(t, entry.NodeId)
 
-	fake := &fakeWithdrawal{installed: true, abortReleases: true}
+	fake := &fakeWithdrawal{installed: true}
 	// The abort has to be observable relative to the withdrawal, so record the
 	// notifier's call log position at the moment it happens.
 	abortedAfter := -1
@@ -348,8 +341,8 @@ func TestWithdrawalDropsRetainedPagesAfterTheAbort(t *testing.T) {
 			continue
 		}
 		withdrawn++
-		if index < abortedAfter {
-			t.Fatalf("dropped pages for inode %d before the connection abort; a fill could still race it", call.inode)
+		if index >= abortedAfter {
+			t.Fatalf("dropped pages for inode %d after the connection abort closed the notification window", call.inode)
 		}
 	}
 	if withdrawn != 1 {
@@ -371,7 +364,7 @@ func TestWithdrawalReportsPagesTheLadderCouldNotDrop(t *testing.T) {
 	f.openForData(t, entry.NodeId)
 	f.notify.inodeST = fuse.EIO
 
-	fake := &fakeWithdrawal{installed: true, abortReleases: true}
+	fake := &fakeWithdrawal{installed: true}
 	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
 	f.mount.withdrawal = fake.ops()
 	f.mount.repairBudget = 5 * time.Second
