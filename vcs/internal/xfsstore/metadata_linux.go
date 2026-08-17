@@ -56,7 +56,28 @@ func (v *Volume) Chmod(id Capability, mode fs.FileMode) error {
 	if obj.kind == KindSymlink {
 		return syscall.EOPNOTSUPP
 	}
-	return unix.Fchmodat(obj.fd(), "", unixMode, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+	return v.chmodCapability(obj.fd(), obj.kind, unixMode)
+}
+
+// chmodCapability applies a mode to an O_PATH capability descriptor.
+//
+// Fchmodat with AT_EMPTY_PATH is the natural spelling, but Go routes any
+// nonzero flags to fchmodat2(2), which only exists on Linux 6.6+ — on an older
+// authority host every chmod would fail mid-mutation with ENOSYS and fence the
+// epoch. Reopening through /proc/self/fd (which re-verifies device, inode and
+// project) and using plain fchmod(2) has identical no-path-race semantics on
+// every kernel this authority may run on.
+func (v *Volume) chmodCapability(fd int, kind Kind, unixMode uint32) error {
+	flags := unix.O_RDONLY
+	if kind == KindDirectory {
+		flags |= unix.O_DIRECTORY
+	}
+	opened, err := v.reopen(fd, flags, kind)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(opened)
+	return unix.Fchmod(opened, unixMode)
 }
 
 // Chown uses -1 to leave one side unchanged, matching fchownat. The owner
