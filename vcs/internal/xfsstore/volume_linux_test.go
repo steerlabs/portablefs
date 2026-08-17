@@ -33,6 +33,27 @@ func openTestVolume(t *testing.T) *Volume {
 	return v
 }
 
+func writeCommitStage(t testing.TB, data []byte) *os.File {
+	t.Helper()
+	fd, err := unix.MemfdCreate("portablefs-commit-test", unix.MFD_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := os.NewFile(uintptr(fd), "portablefs-commit-test")
+	if file == nil {
+		_ = unix.Close(fd)
+		t.Fatal("os.NewFile returned nil")
+	}
+	t.Cleanup(func() { _ = file.Close() })
+	if err := unix.Ftruncate(fd, int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := file.WriteAt(data, 0); err != nil || n != len(data) {
+		t.Fatalf("stage WriteAt = (%d, %v)", n, err)
+	}
+	return file
+}
+
 func TestOpenAfterUnlinkUsesRetainedFD(t *testing.T) {
 	v := openTestVolume(t)
 	root, err := v.Root()
@@ -95,9 +116,23 @@ func TestPinnedAppendIsPerCallAndSurvivesHandleClose(t *testing.T) {
 	}
 	defer target.Close()
 	data := []byte("ayload")
+	var appendCalls, sendfileCalls int
+	pwritev2 := v.pwritev2
+	v.pwritev2 = func(fd int, buffers [][]byte, offset int64, flags int) (int, error) {
+		appendCalls++
+		return pwritev2(fd, buffers, offset, flags)
+	}
+	sendfile := v.sendfile
+	v.sendfile = func(outFD, inFD int, offset *int64, count int) (int, error) {
+		sendfileCalls++
+		return sendfile(outFD, inFD, offset, count)
+	}
 	committed, assigned, post, err := target.CommitWrite(bytes.NewReader(data), WriteCommit{RequestedSize: uint64(len(data)), RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}, make([]byte, 3))
 	if err != nil || committed != uint64(len(data)) || assigned != 1 || post.Size != int64(1+len(data)) {
 		t.Fatalf("CommitWrite = (%d,%d,%+v,%v)", committed, assigned, post, err)
+	}
+	if appendCalls != 2 || sendfileCalls != 0 {
+		t.Fatalf("append data path = pwritev2:%d sendfile:%d, want 2/0", appendCalls, sendfileCalls)
 	}
 	reader, err := v.OpenFile(item, OpenFlags{Read: true})
 	if err != nil {
@@ -178,11 +213,11 @@ func TestCommitWriteSyncsOnceAfterAllFragments(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer target.Close()
-			var writes, fullSyncs, dataSyncs int
-			pwrite := v.pwrite
-			v.pwrite = func(fd int, data []byte, offset int64) (int, error) {
-				writes++
-				return pwrite(fd, data, offset)
+			var copies, fullSyncs, dataSyncs int
+			sendfile := v.sendfile
+			v.sendfile = func(outFD, inFD int, offset *int64, count int) (int, error) {
+				copies++
+				return sendfile(outFD, inFD, offset, count)
 			}
 			v.fsync = func(int) error { fullSyncs++; return nil }
 			v.fdatasync = func(int) error { dataSyncs++; return nil }
@@ -191,14 +226,90 @@ func TestCommitWriteSyncsOnceAfterAllFragments(t *testing.T) {
 			test.commit.RLimitSize = math.MaxUint64
 			test.commit.FileMaxSize = math.MaxInt64
 			test.commit.Mode = WritePositioned
-			committed, _, _, err := target.CommitWrite(bytes.NewReader(data), test.commit, make([]byte, 2))
+			committed, _, _, err := target.CommitWrite(writeCommitStage(t, data), test.commit, nil)
 			if err != nil || committed != uint64(len(data)) {
 				t.Fatalf("CommitWrite = (%d,%v)", committed, err)
 			}
-			if writes != 4 || fullSyncs != test.wantFull || dataSyncs != test.wantData {
-				t.Fatalf("calls = writes:%d fsync:%d fdatasync:%d, want 4/%d/%d", writes, fullSyncs, dataSyncs, test.wantFull, test.wantData)
+			if copies != 1 || fullSyncs != test.wantFull || dataSyncs != test.wantData {
+				t.Fatalf("calls = sendfile:%d fsync:%d fdatasync:%d, want 1/%d/%d", copies, fullSyncs, dataSyncs, test.wantFull, test.wantData)
 			}
 		})
+	}
+}
+
+func TestCommitWritePositionedSendfileCopiesMemfdAtExactOffset(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "positioned-sendfile", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	if n, err := v.WriteAt(handle, []byte("abcdefghij"), 0); err != nil || n != 10 {
+		t.Fatalf("seed WriteAt = (%d, %v)", n, err)
+	}
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	payload := []byte("WXYZ")
+	committed, assigned, post, err := target.CommitWrite(writeCommitStage(t, payload), WriteCommit{
+		RequestedSize: uint64(len(payload)), Position: 3,
+		RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	}, nil)
+	if err != nil || committed != 4 || assigned != 3 || post.Size != 10 {
+		t.Fatalf("CommitWrite = (%d, %d, size %d, %v)", committed, assigned, post.Size, err)
+	}
+	got := make([]byte, 10)
+	if n, err := v.ReadAt(handle, got, 0); err != nil || n != len(got) || string(got) != "abcWXYZhij" {
+		t.Fatalf("positioned result = %q n=%d err=%v", got, n, err)
+	}
+}
+
+func TestCommitWritePositionedSendfileReturnsExactShortPrefix(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "positioned-sendfile-short", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	stage := writeCommitStage(t, []byte("abcd"))
+	var calls int
+	v.sendfile = func(outFD, inFD int, offset *int64, count int) (int, error) {
+		calls++
+		if count != 4 || *offset != 0 {
+			t.Fatalf("sendfile input = count %d offset %d, want 4/0", count, *offset)
+		}
+		buf := make([]byte, 2)
+		if n, err := unix.Pread(inFD, buf, *offset); err != nil || n != len(buf) {
+			t.Fatalf("seam Pread = (%d, %v)", n, err)
+		}
+		if n, err := unix.Write(outFD, buf); err != nil || n != len(buf) {
+			t.Fatalf("seam Write = (%d, %v)", n, err)
+		}
+		*offset += int64(len(buf))
+		return len(buf), nil
+	}
+	committed, assigned, post, err := target.CommitWrite(stage, WriteCommit{
+		RequestedSize: 4, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	}, nil)
+	if committed != 2 || assigned != 0 || post.Size != 2 || calls != 1 || !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short CommitWrite = (%d, %d, size %d, %v), calls=%d", committed, assigned, post.Size, err, calls)
 	}
 }
 
@@ -229,10 +340,10 @@ func TestCommitWritePrivilegeFailureStillAttemptsAndJoinsLogicalSync(t *testing.
 		syncCalls++
 		return syscall.EIO
 	}
-	committed, assigned, post, err := target.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+	committed, assigned, post, err := target.CommitWrite(writeCommitStage(t, []byte("x")), WriteCommit{
 		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
 		Mode: WritePositioned, Sync: true, KillPrivileges: true,
-	}, make([]byte, 1))
+	}, nil)
 	if committed != 1 || assigned != 0 || post.Size != 1 || privilegeCalls != 1 || syncCalls != 1 ||
 		!errors.Is(err, ErrWritePostApply) || !errors.Is(err, ErrWritePrivilege) ||
 		!errors.Is(err, syscall.EPERM) || !errors.Is(err, syscall.EIO) {
@@ -396,17 +507,17 @@ func TestCommitWriteZeroByteBackendErrorPublishesExactMetadataState(t *testing.T
 	if err := v.CloseOpen(handle); err != nil {
 		t.Fatal(err)
 	}
-	realPwrite := v.pwrite
-	v.pwrite = func(fd int, _ []byte, _ int64) (int, error) {
-		if err := unix.Fchmod(fd, 0o640); err != nil {
+	realSendfile := v.sendfile
+	v.sendfile = func(outFD, _ int, _ *int64, _ int) (int, error) {
+		if err := unix.Fchmod(outFD, 0o640); err != nil {
 			t.Fatal(err)
 		}
-		return 0, syscall.ENOSPC
+		return -1, syscall.ENOSPC
 	}
-	t.Cleanup(func() { v.pwrite = realPwrite })
-	committed, assigned, post, err := target.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+	t.Cleanup(func() { v.sendfile = realSendfile })
+	committed, assigned, post, err := target.CommitWrite(writeCommitStage(t, []byte("x")), WriteCommit{
 		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
-	}, make([]byte, 1))
+	}, nil)
 	if committed != 0 || assigned != 0 || !errors.Is(err, ErrWritePostApply) || !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("zero-byte CommitWrite = (%d, %d, %+v, %v), want exact postapply ENOSPC", committed, assigned, post, err)
 	}
@@ -434,11 +545,11 @@ func TestCommitWriteZeroByteBackendErrorWithLostPostStatIsUncertain(t *testing.T
 	if err := v.CloseOpen(handle); err != nil {
 		t.Fatal(err)
 	}
-	v.pwrite = func(int, []byte, int64) (int, error) { return 0, syscall.ENOSPC }
+	v.sendfile = func(int, int, *int64, int) (int, error) { return -1, syscall.ENOSPC }
 	v.postStat = func(int) (Attr, error) { return Attr{}, syscall.EIO }
-	committed, _, post, err := target.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+	committed, _, post, err := target.CommitWrite(writeCommitStage(t, []byte("x")), WriteCommit{
 		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
-	}, make([]byte, 1))
+	}, nil)
 	if committed != 0 || post != (Attr{}) || !errors.Is(err, ErrOutcomeUncertain) || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("zero-byte CommitWrite lost post-stat = (%d, %+v, %v), want uncertain EIO", committed, post, err)
 	}
@@ -920,9 +1031,9 @@ func TestWriteTransactionRLimitUsesRawLinuxEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	committed, _, _, err := zero.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+	committed, _, _, err := zero.CommitWrite(writeCommitStage(t, []byte("x")), WriteCommit{
 		RequestedSize: 1, RLimitSize: 0, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
-	}, make([]byte, 1))
+	}, nil)
 	_ = zero.Close()
 	var limit *WriteLimitError
 	if committed != 0 || !errors.As(err, &limit) || !limit.RLimit {
@@ -933,9 +1044,9 @@ func TestWriteTransactionRLimitUsesRawLinuxEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	committed, assigned, post, err := unlimited.CommitWrite(bytes.NewReader([]byte("x")), WriteCommit{
+	committed, assigned, post, err := unlimited.CommitWrite(writeCommitStage(t, []byte("x")), WriteCommit{
 		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
-	}, make([]byte, 1))
+	}, nil)
 	_ = unlimited.Close()
 	if err != nil || committed != 1 || assigned != 0 || post.Size != 1 {
 		t.Fatalf("RLIM_INFINITY write = (%d, %d, size %d, %v)", committed, assigned, post.Size, err)
@@ -968,9 +1079,9 @@ func TestWriteTransactionReturnsPositivePrefixAtLimits(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer target.Close()
-			committed, assigned, post, err := target.CommitWrite(bytes.NewReader([]byte("abcd")), WriteCommit{
+			committed, assigned, post, err := target.CommitWrite(writeCommitStage(t, []byte("abcd")), WriteCommit{
 				RequestedSize: 4, RLimitSize: test.rlimit, FileMaxSize: test.fileLimit, Mode: WritePositioned,
-			}, make([]byte, 4))
+			}, nil)
 			var limit *WriteLimitError
 			if committed != 2 || assigned != 0 || post.Size != 2 || !errors.As(err, &limit) {
 				t.Fatalf("limit prefix = (%d, %d, size %d, %v), want positive prefix and typed limit", committed, assigned, post.Size, err)
@@ -1032,6 +1143,49 @@ func TestPinnedAppendAcrossAliasesSerializesWholeTransactions(t *testing.T) {
 	if a.err != nil || b.err != nil || a.assigned == b.assigned || a.assigned+b.assigned != 3 {
 		t.Fatalf("alias append results = %+v %+v", a, b)
 	}
+}
+
+func BenchmarkStagingToTargetCopyPaths(b *testing.B) {
+	const size = 1 << 20
+	stage := writeCommitStage(b, make([]byte, size))
+	target, err := os.CreateTemp(b.TempDir(), "portablefs-copy-benchmark-")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = target.Close() })
+	resetTarget := func() {
+		if err := target.Truncate(0); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := target.Seek(0, io.SeekStart); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.Run("pread-pwrite-bounce", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			resetTarget()
+			scratch := make([]byte, size)
+			if n, err := stage.ReadAt(scratch, 0); err != nil || n != len(scratch) {
+				b.Fatalf("ReadAt = (%d, %v)", n, err)
+			}
+			if n, err := target.WriteAt(scratch, 0); err != nil || n != len(scratch) {
+				b.Fatalf("WriteAt = (%d, %v)", n, err)
+			}
+		}
+	})
+	b.Run("sendfile", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			resetTarget()
+			offset := int64(0)
+			if n, err := unix.Sendfile(int(target.Fd()), int(stage.Fd()), &offset, size); err != nil || n != size {
+				b.Fatalf("Sendfile = (%d, %v)", n, err)
+			}
+		}
+	})
 }
 
 func TestRenameKeepsObjectIdentity(t *testing.T) {

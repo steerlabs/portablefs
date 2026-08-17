@@ -3,7 +3,9 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
+	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 )
 
 type writeTransactionTestTarget struct {
@@ -275,6 +279,172 @@ func newWriteTransactionHarness(t *testing.T, pinErr error) (*VolumeHandler, vol
 		}
 	})
 	return h, credential, store
+}
+
+func TestWriteTransactionStagingUsesSealedMemfd(t *testing.T) {
+	path := t.TempDir()
+	if err := os.Chmod(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	staging, err := OpenWriteTransactionStaging(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = staging.Close() })
+	stage, err := staging.newFile(4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, ok := stage.(*os.File)
+	if !ok {
+		t.Fatalf("stage type = %T, want *os.File", stage)
+	}
+	fd := int(file.Fd())
+	t.Cleanup(func() { _ = stage.Close() })
+	var statfs unix.Statfs_t
+	if err := unix.Fstatfs(fd, &statfs); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(statfs.Type) != uint64(unix.TMPFS_MAGIC) {
+		t.Fatalf("stage filesystem type = %#x, want tmpfs %#x", statfs.Type, unix.TMPFS_MAGIC)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		t.Fatal(err)
+	}
+	if stat.Nlink != 0 || stat.Size != 4096 {
+		t.Fatalf("memfd stat = nlink %d size %d, want 0/4096", stat.Nlink, stat.Size)
+	}
+	seals, err := unix.FcntlInt(file.Fd(), unix.F_GET_SEALS, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSeals := unix.F_SEAL_GROW | unix.F_SEAL_SHRINK | unix.F_SEAL_SEAL
+	if seals&wantSeals != wantSeals {
+		t.Fatalf("memfd seals = %#x, want at least %#x", seals, wantSeals)
+	}
+	payload := []byte("anonymous")
+	if n, err := stage.WriteAt(payload, 127); err != nil || n != len(payload) {
+		t.Fatalf("WriteAt = (%d, %v)", n, err)
+	}
+	got := make([]byte, len(payload))
+	if n, err := stage.ReadAt(got, 127); err != nil || n != len(got) || !bytes.Equal(got, payload) {
+		t.Fatalf("ReadAt = (%q, %d, %v)", got, n, err)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("staging directory contains %d entries, want none", len(entries))
+	}
+}
+
+func referenceWriteTransactionDataFingerprint(t *testing.T, runtime *volumeserver.Authority, request *authoritypb.Request) volumeserver.RequestFingerprint {
+	t.Helper()
+	reference := proto.Clone(request).(*authoritypb.Request)
+	digest := sha256.Sum256(reference.GetWriteTransaction().GetData())
+	reference.GetWriteTransaction().Data = digest[:]
+	fingerprint, err := canonicalFingerprint(runtime, reference)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fingerprint
+}
+
+func TestWriteTransactionDataFingerprintHashesPayloadOnceAndMatchesReference(t *testing.T) {
+	runtime, err := volumeserver.New("write-data-fingerprint", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &authoritypb.Request{Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+		TransactionId: 7, Handle: bytes.Repeat([]byte{0x42}, 16), RequestedSize: 8,
+		FragmentOffset: 3, Size: 5, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+		Data: []byte("hello"), FileMaxSize: 1 << 20,
+	}}}
+	handler := &VolumeHandler{Runtime: runtime}
+	got, err := writeTransactionFingerprint(handler, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := referenceWriteTransactionDataFingerprint(t, runtime, request); got != want {
+		t.Fatalf("prehashed fingerprint = %x, materialized reference = %x", got, want)
+	}
+
+	digest := sha256.Sum256(request.GetWriteTransaction().GetData())
+	prehashed, err := canonicalFingerprintWithWriteDataDigest(runtime, request, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.GetWriteTransaction().Data = []byte("world")
+	reused, err := canonicalFingerprintWithWriteDataDigest(runtime, request, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prehashed != reused {
+		t.Fatal("canonical traversal re-read DATA after receiving its precomputed digest")
+	}
+	changed, err := writeTransactionFingerprint(handler, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == got {
+		t.Fatal("DATA fingerprint did not cover a changed payload")
+	}
+	request.GetWriteTransaction().FragmentOffset++
+	changedMetadata, err := writeTransactionFingerprint(handler, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedMetadata == changed {
+		t.Fatal("DATA fingerprint did not cover changed canonical metadata")
+	}
+}
+
+func TestWriteTransactionMemfdSweepClosesStageReleasesBudgetAndRetainsTombstone(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	beginAndStageWriteTransaction(t, h, credential, []byte("data"))
+	resources, err := h.writeTransactionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := acquireWriteTransaction(resources, 1)
+	if transaction == nil {
+		t.Fatal("staged transaction is missing")
+	}
+	transaction.mu.Lock()
+	file, ok := transaction.stage.(*os.File)
+	if !ok {
+		t.Fatalf("stage type = %T, want *os.File", transaction.stage)
+	}
+	fd := file.Fd()
+	transaction.progressDeadline = time.Now().Add(-time.Second)
+	transaction.mu.Unlock()
+	transaction.refs.Done()
+
+	h.SweepWriteTransactions(time.Now())
+	if _, err := unix.FcntlInt(fd, unix.F_GETFD, 0); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("swept memfd F_GETFD error = %v, want EBADF", err)
+	}
+	if resources.writeReservedBytes != 0 || resources.writeTransactionCount != 0 ||
+		h.totalWriteStagingBytes != 0 || h.totalWriteTransactions != 0 {
+		t.Fatalf("post-sweep capacity = session bytes %d transactions %d, worker bytes %d transactions %d",
+			resources.writeReservedBytes, resources.writeTransactionCount,
+			h.totalWriteStagingBytes, h.totalWriteTransactions)
+	}
+	resources.writeMu.Lock()
+	terminal := resources.writeTerminal
+	resources.writeMu.Unlock()
+	if terminal == nil || terminal.id != 1 || terminal.kind != writeTransactionTerminalAborted || terminal.staged != 4 {
+		t.Fatalf("sweep tombstone = %+v", terminal)
+	}
+	abort := writeTransactionTestRequest(3, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction())
+	if response.GetErrno() != 0 || response.GetWriteTransaction().GetFlags() != writeTransactionReplyAborted {
+		t.Fatalf("ABORT replay through sweep tombstone = %+v", response)
+	}
 }
 
 func writeTransactionTestRequest(requestID, transactionID uint64, phase authoritypb.WriteTransactionPhase, offset uint64, data []byte) *authoritypb.Request {

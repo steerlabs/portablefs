@@ -231,6 +231,7 @@ type Volume struct {
 	// later zero-byte data-path failure.
 	pwrite        func(int, []byte, int64) (int, error)
 	pwritev2      func(int, [][]byte, int64, int) (int, error)
+	sendfile      func(int, int, *int64, int) (int, error)
 	copyFileRange func(int, *int64, int, *int64, int, int) (int, error)
 	postStat      func(int) (Attr, error)
 	fsync         func(int) error
@@ -396,6 +397,7 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		fallocateAllocationUnit: xfsFallocateAllocationUnit,
 		pwrite:                  unix.Pwrite,
 		pwritev2:                unix.Pwritev2,
+		sendfile:                unix.Sendfile,
 		copyFileRange:           unix.CopyFileRange,
 		postStat:                statFD,
 		fsync:                   unix.Fsync,
@@ -1072,7 +1074,8 @@ func (t *writeTarget) CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch 
 	defer t.mu.Unlock()
 	if t.volume == nil || t.res == nil || t.closed || staged == nil || spec.RequestedSize == 0 ||
 		spec.RequestedSize > math.MaxInt64 || spec.Position > math.MaxInt64 ||
-		spec.FileMaxSize > math.MaxInt64 || spec.FileMaxSize == 0 || len(scratch) == 0 ||
+		spec.FileMaxSize > math.MaxInt64 || spec.FileMaxSize == 0 ||
+		spec.Mode == WriteAppend && len(scratch) == 0 ||
 		(spec.Mode != WritePositioned && spec.Mode != WriteAppend) || spec.Mode == WriteAppend && spec.Position != 0 {
 		return 0, 0, Attr{}, fs.ErrInvalid
 	}
@@ -1117,36 +1120,83 @@ func (t *writeTarget) CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch 
 	var applyErr error
 	var postApplyErr error
 	var dispatched bool
-	for committed < limit {
-		chunk := uint64(len(scratch))
-		if remaining := limit - committed; chunk > remaining {
-			chunk = remaining
+	var invalidCopyResult bool
+	if spec.Mode == WritePositioned {
+		stageFD, ok := staged.(interface{ Fd() uintptr })
+		if !ok || stageFD.Fd() > uintptr(math.MaxInt) {
+			return 0, assigned, Attr{}, fs.ErrInvalid
 		}
-		buf := scratch[:int(chunk)]
-		n, readErr := staged.ReadAt(buf, int64(committed))
-		if n != len(buf) || readErr != nil && !errors.Is(readErr, io.EOF) {
-			if committed != 0 {
-				return committed, assigned, Attr{}, outcomeUncertain(firstError(readErr, io.ErrUnexpectedEOF))
-			}
-			return 0, assigned, Attr{}, firstError(readErr, io.ErrUnexpectedEOF)
+		var stageStat unix.Stat_t
+		if err := unix.Fstat(int(stageFD.Fd()), &stageStat); err != nil {
+			return 0, assigned, Attr{}, err
 		}
-		var written int
-		var writeErr error
+		if stageStat.Mode&unix.S_IFMT != unix.S_IFREG || stageStat.Size < int64(limit) {
+			return 0, assigned, Attr{}, io.ErrUnexpectedEOF
+		}
+		// Linux 6.12.100 is the pinned product kernel. Since Linux 5.19,
+		// copy_file_range rejects unlike cross-filesystem pairs such as
+		// memfd(tmpfs)->XFS with EXDEV; sendfile supports regular-file input and
+		// output and keeps this path entirely in-kernel. sendfile has no output
+		// offset argument, so set the destination description's cursor while the
+		// inode mutation lock excludes every PortableFS size-changing operation.
+		// All other regular-file I/O is positioned and does not consume it.
+		if _, err := unix.Seek(t.res.fd, int64(assigned), io.SeekStart); err != nil {
+			return 0, assigned, Attr{}, err
+		}
+		inputOffset := int64(0)
+		n, copyErr := t.volume.sendfile(t.res.fd, int(stageFD.Fd()), &inputOffset, int(limit))
 		dispatched = true
-		if spec.Mode == WriteAppend {
-			written, writeErr = t.volume.pwritev2(t.res.fd, [][]byte{buf}, 0, unix.RWF_APPEND)
-		} else {
-			written, writeErr = t.volume.pwrite(t.res.fd, buf, int64(assigned+committed))
-		}
-		if written > 0 {
-			committed += uint64(written)
-		}
-		if writeErr != nil || written != len(buf) {
-			if writeErr == nil {
-				writeErr = io.ErrShortWrite
+		if n < 0 {
+			if n == -1 && copyErr != nil {
+				n = 0
+			} else {
+				invalidCopyResult = true
+				n = 0
 			}
-			applyErr = writeErr
-			break
+		}
+		if uint64(n) > limit || inputOffset != int64(n) {
+			invalidCopyResult = true
+		}
+		committed = uint64(n)
+		if invalidCopyResult {
+			applyErr = syscall.EIO
+		} else {
+			applyErr = copyErr
+			if copyErr == nil && committed != limit {
+				applyErr = io.ErrShortWrite
+			}
+		}
+	} else {
+		// Atomic append is a property of the destination write syscall. Neither
+		// sendfile nor copy_file_range accepts RWF_APPEND, and deriving EOF before
+		// an ordinary copy would split the append decision from data application.
+		// Retain the positioned staging reads and per-call RWF_APPEND writes for
+		// this mode only.
+		for committed < limit {
+			chunk := uint64(len(scratch))
+			if remaining := limit - committed; chunk > remaining {
+				chunk = remaining
+			}
+			buf := scratch[:int(chunk)]
+			n, readErr := staged.ReadAt(buf, int64(committed))
+			if n != len(buf) || readErr != nil && !errors.Is(readErr, io.EOF) {
+				if committed != 0 {
+					return committed, assigned, Attr{}, outcomeUncertain(firstError(readErr, io.ErrUnexpectedEOF))
+				}
+				return 0, assigned, Attr{}, firstError(readErr, io.ErrUnexpectedEOF)
+			}
+			written, writeErr := t.volume.pwritev2(t.res.fd, [][]byte{buf}, 0, unix.RWF_APPEND)
+			dispatched = true
+			if written > 0 {
+				committed += uint64(written)
+			}
+			if writeErr != nil || written != len(buf) {
+				if writeErr == nil {
+					writeErr = io.ErrShortWrite
+				}
+				applyErr = writeErr
+				break
+			}
 		}
 	}
 	expectedPost := uint64(before.Size)
@@ -1170,6 +1220,9 @@ func (t *writeTarget) CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch 
 		return 0, assigned, Attr{}, statErr
 	}
 	if post.Size < 0 || uint64(post.Size) != expectedPost {
+		return committed, assigned, post, outcomeUncertain(syscall.EIO)
+	}
+	if invalidCopyResult {
 		return committed, assigned, post, outcomeUncertain(syscall.EIO)
 	}
 	if committed == 0 && dispatched {

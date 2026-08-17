@@ -4,6 +4,7 @@ package authorityrpc
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -35,13 +36,12 @@ const (
 	writeTransactionKillSUIDGID uint32 = 1 << 2
 )
 
-// WriteTransactionStaging is a pinned private directory that creates only
-// unnamed O_TMPFILE staging files. Payload bytes therefore never enter the
-// authority namespace or heap, and a process crash lets the kernel reclaim
-// every incomplete transaction without a recovery scan.
+// WriteTransactionStaging creates sealed-size anonymous-memory files. Payload
+// bytes therefore never enter the authority namespace, heap, or served XFS,
+// and a process crash lets the kernel reclaim every incomplete transaction
+// without a recovery scan.
 type WriteTransactionStaging struct {
 	mu             sync.RWMutex
-	dir            *os.File
 	closed         bool
 	newFileForTest func(uint64) (writeTransactionStage, error)
 }
@@ -53,19 +53,25 @@ type writeTransactionStage interface {
 }
 
 func OpenWriteTransactionStaging(path string) (*WriteTransactionStaging, error) {
+	// Keep validating the existing authority configuration surface, but do not
+	// retain or create anything in this directory. Transaction contents live
+	// exclusively in memfd-backed anonymous memory.
 	dir, err := privatepath.OpenExistingDir(path)
 	if err != nil {
 		return nil, fmt.Errorf("open write-transaction staging directory: %w", err)
 	}
-	staging := &WriteTransactionStaging{dir: dir}
+	if err := dir.Close(); err != nil {
+		return nil, fmt.Errorf("close write-transaction staging directory: %w", err)
+	}
+	staging := &WriteTransactionStaging{}
 	probe, err := staging.newFile(1)
 	if err != nil {
 		_ = staging.Close()
-		return nil, fmt.Errorf("qualify O_TMPFILE write staging: %w", err)
+		return nil, fmt.Errorf("qualify memfd write staging: %w", err)
 	}
 	if err := probe.Close(); err != nil {
 		_ = staging.Close()
-		return nil, fmt.Errorf("close O_TMPFILE write-staging probe: %w", err)
+		return nil, fmt.Errorf("close memfd write-staging probe: %w", err)
 	}
 	return staging, nil
 }
@@ -75,7 +81,7 @@ func (s *WriteTransactionStaging) newFile(size uint64) (writeTransactionStage, e
 		return nil, syscall.EINVAL
 	}
 	s.mu.RLock()
-	if s.closed || s.dir == nil {
+	if s.closed {
 		s.mu.RUnlock()
 		return nil, syscall.ESTALE
 	}
@@ -84,7 +90,7 @@ func (s *WriteTransactionStaging) newFile(size uint64) (writeTransactionStage, e
 		return hook(size)
 	}
 	defer s.mu.RUnlock()
-	fd, err := unix.Openat(int(s.dir.Fd()), ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	fd, err := unix.MemfdCreate("portablefs-write-transaction", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 	if err != nil {
 		return nil, err
 	}
@@ -93,10 +99,16 @@ func (s *WriteTransactionStaging) newFile(size uint64) (writeTransactionStage, e
 		_ = unix.Close(fd)
 		return nil, syscall.EIO
 	}
-	// Reserve the complete declared syscall before BEGIN succeeds. DATA is then
-	// a bounded overwrite into already allocated staging rather than a delayed
-	// ENOSPC surprise after the kernel has committed to this transaction.
-	if err := unix.Fallocate(fd, 0, 0, int64(size)); err != nil {
+	// ftruncate establishes and seals the logical bound without allocating or
+	// dirtying served-XFS extents. The session and worker byte reservations are
+	// the sole admission bound on resident staged pages. Staging was never
+	// fsynced, so anonymous memory does not change write-through acknowledgement
+	// or the target descriptor's later fsync durability barrier.
+	if err := unix.Ftruncate(fd, int64(size)); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if _, err := unix.FcntlInt(file.Fd(), unix.F_ADD_SEALS, unix.F_SEAL_GROW|unix.F_SEAL_SHRINK|unix.F_SEAL_SEAL); err != nil {
 		_ = file.Close()
 		return nil, err
 	}
@@ -113,12 +125,7 @@ func (s *WriteTransactionStaging) Close() error {
 		return nil
 	}
 	s.closed = true
-	if s.dir == nil {
-		return nil
-	}
-	err := s.dir.Close()
-	s.dir = nil
-	return err
+	return nil
 }
 
 type writeTransactionState uint8
@@ -314,6 +321,15 @@ func writeTransactionReply(transactionID uint64, flags uint32) *authoritypb.Resp
 func writeTransactionFingerprint(h *VolumeHandler, request *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
 	if h == nil || h.Runtime == nil {
 		return volumeserver.RequestFingerprint{}, syscall.EIO
+	}
+	if body := request.GetWriteTransaction(); body != nil && body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA {
+		// DATA replay identity is epoch-local and never persisted. Hash the bulk
+		// body once, then feed its fixed digest into the keyed canonical request
+		// fingerprint so later canonical traversal never walks the payload again.
+		// SHA-256 still covers every payload byte; the keyed fingerprint covers
+		// the digest and every canonical metadata field.
+		digest := sha256.Sum256(body.GetData())
+		return canonicalFingerprintWithWriteDataDigest(h.Runtime, request, digest)
 	}
 	return canonicalFingerprint(h.Runtime, request)
 }
@@ -922,19 +938,23 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 		stage, target, staged := transaction.stage, transaction.target, transaction.staged
 		metadata := transaction.metadata
 
-		scratchSize := int(h.MaxWrite)
-		if scratchSize <= 0 {
-			scratchSize = 64 << 10
-		}
-		if scratchSize > 1<<20 {
-			scratchSize = 1 << 20
+		var scratch []byte
+		if metadata.mode == xfsstore.WriteAppend {
+			scratchSize := int(h.MaxWrite)
+			if scratchSize <= 0 {
+				scratchSize = 64 << 10
+			}
+			if scratchSize > 1<<20 {
+				scratchSize = 1 << 20
+			}
+			scratch = make([]byte, scratchSize)
 		}
 		committed, assigned, post, applyErr := target.CommitWrite(stage, xfsstore.WriteCommit{
 			RequestedSize: staged, Position: metadata.position, RLimitSize: metadata.rlimitSize,
 			FileMaxSize: metadata.fileMaxSize, Mode: metadata.mode,
 			DataSync: metadata.dataSync, Sync: metadata.sync,
 			KillPrivileges: metadata.writeFlags&writeTransactionKillSUIDGID != 0,
-		}, make([]byte, scratchSize))
+		}, scratch)
 		terminalKind := writeTransactionTerminalCommitted
 		if committed == 0 && applyErr != nil && !errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) &&
 			!errors.Is(applyErr, xfsstore.ErrWritePostApply) {
@@ -1127,9 +1147,9 @@ func (h *VolumeHandler) finishWriteTransactionCommit(id volumeserver.SessionID, 
 
 // resetWriteTransactionForRetry preserves inert staged bytes across the
 // authority's item-only visibility handoff. No XFS callback ran, so retaining
-// the staging file is both exact and avoids copying the user's write into a
-// second BEGIN/DATA sequence. The transaction's absolute lifetime remains
-// fixed; only its ordinary progress deadline advances, bounded by that limit.
+// the memfd is both exact and avoids copying the user's write into a second
+// BEGIN/DATA sequence. The transaction's absolute lifetime remains fixed; only
+// its ordinary progress deadline advances, bounded by that limit.
 func (h *VolumeHandler) resetWriteTransactionForRetry(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) error {
 	resources, err := h.writeTransactionResources(id)
 	if err != nil {
