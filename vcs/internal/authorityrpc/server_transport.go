@@ -66,7 +66,7 @@ func (s *Server) acceptTransportHello(
 	// Hello cannot touch the volume or produce a terminal applied-state result.
 	// Keep it outside the retained transport-response lifecycle because the
 	// handshake uses its own writer before the observed session writer exists.
-	response := s.Handler.Handle(peerContext, request)
+	response := s.dispatchRequest(peerContext, request)
 	if response == nil {
 		return nil, nil, fmt.Errorf("%w: Hello handler returned no response", ErrTransportBinding)
 	}
@@ -196,7 +196,7 @@ func (s *Server) executeTransportRequest(
 		} else {
 			defer pin.Release()
 		}
-		response := handleTransportRequest(s.Handler, ctx, request)
+		response := s.dispatchRequest(ctx, request)
 		defer finishHandlerResponse(s.Handler, request, response)()
 		return writeResponse(request, response)
 	default:
@@ -208,7 +208,7 @@ func (s *Server) executeTransportRequest(
 		} else {
 			defer pin.Release()
 		}
-		response := handleTransportRequest(s.Handler, ctx, request)
+		response := s.dispatchRequest(ctx, request)
 		defer finishHandlerResponse(s.Handler, request, response)()
 		return writeResponse(request, response)
 	}
@@ -237,7 +237,7 @@ func (s *Server) executeTransportBlockedReport(
 	if err := s.registry.beginTerminalResponse(entry, session); err != nil {
 		return err
 	}
-	response := handleTransportRequest(s.Handler, ctx, request)
+	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()
 	writeErr := writeResponse(request, response)
 	if s.registry.finishTerminalResponse(entry) {
@@ -255,7 +255,7 @@ func (s *Server) executeTransportAttach(ctx context.Context, entry *transportCon
 		pair.operation.Unlock()
 		return err
 	}
-	response := handleTransportRequest(s.Handler, ctx, request)
+	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()
 	if !responseSucceeded(response) {
 		pair.operation.Unlock()
@@ -320,7 +320,7 @@ func (s *Server) executeTransportResume(ctx context.Context, entry *transportCon
 		pair.operation.Unlock()
 		return err
 	}
-	response := handleTransportRequest(s.Handler, ctx, request)
+	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()
 	if !responseSucceeded(response) {
 		pair.operation.Unlock()
@@ -362,7 +362,7 @@ func (s *Server) executeTransportActivate(ctx context.Context, entry *transportC
 	if _, err := s.registry.activationWitness(entry, session, activate.GetDataBindingGeneration(), activate.GetControlBindingGeneration()); err != nil {
 		return err
 	}
-	response := handleTransportRequest(s.Handler, ctx, request)
+	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()
 	if !responseSucceeded(response) {
 		return writeResponse(request, response)
@@ -386,7 +386,7 @@ func (s *Server) executeTransportAbort(ctx context.Context, entry *transportConn
 	if err := s.registry.beginTerminalResponse(entry, session); err != nil {
 		return err
 	}
-	response := handleTransportRequest(s.Handler, ctx, request)
+	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()
 	if responseSucceeded(response) {
 		if response.GetAbortAttach() == nil || response.GetAbortAttach().GetState() != authoritypb.SessionState_SESSION_STATE_ABORTED {
@@ -416,7 +416,7 @@ func (s *Server) executeTransportDetach(ctx context.Context, entry *transportCon
 	if err := s.registry.beginTerminalResponse(entry, session); err != nil {
 		return err
 	}
-	response := handleTransportRequest(s.Handler, ctx, request)
+	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()
 	if responseSucceeded(response) {
 		terminateTransportConnections(s.registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)...)

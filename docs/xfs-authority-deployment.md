@@ -159,6 +159,7 @@ optimization.
 ```bash
 portablefs-authority \
   --listen 0.0.0.0:7443 \
+  --admin-listen 127.0.0.1:7444 \
   --volume-id vol_01JXYZ \
   --root /srv/portablefs/vol_01JXYZ \
   --project-id 42001 \
@@ -203,6 +204,24 @@ All ten are mandatory and startup refuses without them.
 | `--terminal-delivery-timeout` | `45s` | bounded drain for an exact terminal applied-state reply, its local kernel publication, and the receipt ACK. Must be at least `--max-repair-budget`; size it above the mount's response-consumption bound plus transport latency. |
 | `--visibility-clock-skew` | `5s` | clock disagreement tolerated when a mount timestamps its own kernel-mount absence |
 | `--max-cached-name-capacity` | `65536` | largest kernel-cache bound a strict mount may declare; sizes the per-session resolved index |
+
+### Admin listener
+
+`--admin-listen` defaults to `127.0.0.1:7444` and serves plaintext HTTP for
+the node-local monitoring agent. It is a separate listener from the mutually
+authenticated TLS data plane. Keep it on loopback or behind an authenticated
+host-local proxy; the endpoint itself has no authentication layer and must not
+be exposed to an untrusted network. Give each worker a distinct admin address
+when several volume workers share one host.
+
+The worker binds both listeners before it begins serving. An unavailable admin
+address is therefore a startup failure, just like an unavailable authority
+address: running without the declared monitoring surface would make a fresh
+deployment deceptively healthy. An unexpected admin HTTP failure after a
+successful bind is different. It is logged as `event=admin_listener_failed`
+and does not stop the data plane; alert on the missing scrape and repair the
+monitoring path without turning an observability fault into a filesystem
+outage.
 
 ### Deployment-sized bounds
 
@@ -679,9 +698,81 @@ namespace — there is nothing to expose, because v3 keeps no history.
 
 ## Monitoring
 
-Monitor EBS status, queue/latency/throughput, filesystem free space and inodes,
-project quota headroom, authority restarts, TLS and capability rejection,
-session count, open descriptors, request latency and error codes, and backup
-restore age. Two log lines deserve alerts of their own: `refused strict attach`
-(a mount declared a bound this authority will not accept) and `fenced strict
-mount` (a mount left the visibility barrier).
+Scrape `http://127.0.0.1:7444/metrics` in Prometheus text exposition format.
+The admin listener also serves:
+
+- `GET /healthz`: HTTP 200 while the process and admin HTTP server are live. It
+  deliberately says nothing about whether the worker can serve filesystem
+  requests.
+- `GET /readyz`: HTTP 200 only while the validated TLS accept loop is active,
+  the volume remains open and unfenced, and a fresh `statx` through the already
+  open authoritative XFS root descriptor succeeds. It returns 503 during
+  startup, shutdown, and after a terminal storage fence. The probe never
+  re-resolves the configured root path.
+
+Every series has the bounded `volume` label. RPC series use a closed opcode
+set; write transactions are split into `write_transaction_begin`, `_data`,
+`_commit`, and `_abort`, because those phases have different load and failure
+profiles. `portablefs_authority_rpc_requests_total` adds one closed `outcome`
+label: `success`, `not_found`, `permission`, `stale`, `invalid`, `saturation`,
+`unsupported`, `conflict`, `canceled`, `storage`, `internal`, `coherence`,
+`routes`, `visibility_interrupted`, `visibility_retry`, `io`, or `other`.
+The storage, internal, coherence, routes, and visibility values come from the
+protocol's explicit failure class; the remaining values group Linux wire
+errnos. No peer-controlled string or numeric request ID becomes a metric
+label.
+
+| Metric | Operational question |
+| --- | --- |
+| `portablefs_authority_rpc_requests_total{opcode,outcome}` | Which operation is failing, saturating, or being retried, and in which semantic errno class? |
+| `portablefs_authority_rpc_duration_seconds{opcode}` | Which operation is consuming the handler latency budget? |
+| `portablefs_authority_active_sessions` | How many mounts are currently ACTIVE, rather than merely provisional or draining? |
+| `portablefs_authority_session_items_high_water` | Has one session approached `--max-items-per-session` since this worker started? The shared root descriptor is excluded, matching the configured bound. |
+| `portablefs_authority_write_transactions_active` | How much of the configured transaction-count admission capacity is occupied? |
+| `portablefs_authority_write_transactions_waiting` | Is the FIFO write admission queue currently saturated? |
+| `portablefs_authority_write_staged_bytes` | How many payload bytes currently live in inert transaction staging? This is actual DATA received, not the larger requested-size reservation. |
+| `portablefs_authority_write_admission_blocks_total` | How often did a BEGIN find transaction-count or byte capacity unavailable? |
+| `portablefs_authority_write_admission_wait_seconds` | How long did blocked BEGIN requests remain in FIFO capacity admission? |
+| `portablefs_authority_visibility_barrier_duration_seconds` | How long did PREPARE, XFS apply, and peer COMPLETE acknowledgment take end to end? |
+| `portablefs_authority_visibility_barrier_audience` | How many peer sessions had cache state to repair for each barrier? Routing changes count every strict participant. |
+| `portablefs_authority_fence_events_total{reason}` | Why was a participant told to revoke: `visibility_lost`, `repair_deadline`, `routes_blocked`, `protocol_violation`, `write_transaction_mismatch`, or `other`? |
+
+The counters and gauges are atomics. RPC counter handles and every label set are
+precomputed at startup; a request does no metric-map lookup, label formatting,
+or allocation. Histograms use fixed buckets and render cumulative buckets only
+at scrape time. The worker has no Prometheus client-library dependency.
+
+Start with these alerts and tune duration windows from production baselines:
+
+- page when `/readyz` is not 200 for a running unit, or when the admin target is
+  absent while the authority TLS port still accepts connections;
+- page on any sustained increase in RPC outcomes `storage`, `internal`, or
+  `coherence`; investigate `io` and `other` immediately because they are
+  unclassified or direct I/O failures even when the epoch has not yet exited;
+- alert when `write_transactions_waiting` remains nonzero, the rate of
+  `write_admission_blocks_total` rises, or admission-wait p95 consumes a
+  material fraction of `--write-transaction-progress-timeout`;
+- alert before active transactions or staged bytes reach their configured
+  worker bounds, and before `session_items_high_water` reaches
+  `--max-items-per-session`;
+- compare visibility-barrier p99 with `--max-repair-budget`. A tail approaching
+  that budget predicts participant fencing; correlate it with audience size to
+  distinguish one slow mount from broad fan-out;
+- alert on every `repair_deadline`, `protocol_violation`, or
+  `write_transaction_mismatch` fence. A visibility-lost fence may accompany a
+  deliberate host loss, but it still leaves durable membership requiring the
+  restart proof described above.
+
+Continue monitoring EBS status and latency, filesystem and project-quota block
+and inode headroom, process restarts, file descriptors, TLS/capability
+rejections at the service boundary, and backup restore age; those facts are
+outside this per-worker registry.
+
+RPC lifecycle results and non-routine failures are also structured on stderr
+with `volume`, `request_id`, `session`, `opcode`, `outcome`, `errno`, and
+`duration_us`. Participant fencing and refused commitments retain the existing
+operator-facing `fenced strict mount` and `refused strict attach` lines, and add
+structured companion events with volume, session, and reason. Routine POSIX
+results such as a missing lookup are counted but not logged per request. Logs
+are for correlation by request ID; metrics and readiness, rather than grepping
+two string literals, are the monitoring contract.

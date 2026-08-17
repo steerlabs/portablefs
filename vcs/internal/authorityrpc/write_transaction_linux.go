@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"os"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -228,8 +230,12 @@ func (c writeTransactionCleanup) finish() {
 	c.transaction.refs.Wait()
 	c.transaction.mu.Lock()
 	stage, target := c.transaction.stage, c.transaction.target
+	staged := c.transaction.staged
 	c.transaction.stage, c.transaction.target = nil, nil
 	c.transaction.mu.Unlock()
+	if staged != 0 && c.handler != nil && c.handler.Metrics != nil {
+		c.handler.Metrics.WriteStagedBytes(-int64(staged))
+	}
 	if stage != nil {
 		_ = stage.Close()
 	}
@@ -436,12 +442,17 @@ func wakeWriteTransactionCapacityWaiterLocked(waiter *writeTransactionCapacityWa
 
 func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, terminal <-chan struct{}, resources *sessionResources, bytes uint64) error {
 	waiter := &writeTransactionCapacityWaiter{resources: resources, ready: make(chan struct{})}
+	waiting := false
+	var waitStarted time.Time
 	for {
 		h.writeCapacityMu.Lock()
 		if resources.writeCapacityEnded {
 			h.removeWriteTransactionCapacityLocked(waiter)
 			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
 			h.writeCapacityMu.Unlock()
+			if waiting && h.Metrics != nil {
+				h.Metrics.WriteAdmissionFinished(time.Since(waitStarted))
+			}
 			return volumeserver.ErrSessionExpired
 		}
 		h.enqueueWriteTransactionCapacityLocked(waiter)
@@ -453,7 +464,20 @@ func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, ter
 			h.totalWriteTransactions++
 			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
 			h.writeCapacityMu.Unlock()
+			if h.Metrics != nil {
+				h.Metrics.WriteTransactionAdmitted()
+				if waiting {
+					h.Metrics.WriteAdmissionFinished(time.Since(waitStarted))
+				}
+			}
 			return nil
+		}
+		if !waiting {
+			waiting = true
+			waitStarted = time.Now()
+			if h.Metrics != nil {
+				h.Metrics.WriteAdmissionBlocked()
+			}
 		}
 		ready := waiter.ready
 		h.writeCapacityMu.Unlock()
@@ -466,6 +490,9 @@ func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, ter
 			h.removeWriteTransactionCapacityLocked(waiter)
 			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
 			h.writeCapacityMu.Unlock()
+			if h.Metrics != nil {
+				h.Metrics.WriteAdmissionFinished(time.Since(waitStarted))
+			}
 			return volumeserver.ErrSessionExpired
 		case <-ctx.Done():
 			h.writeCapacityMu.Lock()
@@ -473,6 +500,9 @@ func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, ter
 			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
 			ended := resources.writeCapacityEnded
 			h.writeCapacityMu.Unlock()
+			if h.Metrics != nil {
+				h.Metrics.WriteAdmissionFinished(time.Since(waitStarted))
+			}
 			if ended {
 				return volumeserver.ErrSessionExpired
 			}
@@ -492,6 +522,9 @@ func (h *VolumeHandler) releaseWriteTransactionCapacity(resources *sessionResour
 	resources.writeTransactionCount--
 	h.totalWriteStagingBytes -= bytes
 	h.totalWriteTransactions--
+	if h.Metrics != nil {
+		h.Metrics.WriteTransactionReleased()
+	}
 	wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
 }
 
@@ -546,6 +579,14 @@ func (h *VolumeHandler) fenceWriteTransactionMismatch(id volumeserver.SessionID)
 	if h.Runtime != nil {
 		h.Runtime.FenceSession(id)
 	}
+	if h.Metrics != nil {
+		h.Metrics.Fence(authoritymetrics.FenceWriteTransactionMismatch)
+	}
+	volume := ""
+	if h.Runtime != nil {
+		volume = h.Runtime.VolumeID()
+	}
+	log.Printf("portablefs-authority: event=fence volume=%q session=%x reason=write_transaction_mismatch", volume, id)
 	return volumeserver.ErrRequestMismatch
 }
 
@@ -788,6 +829,9 @@ func (h *VolumeHandler) stageWriteTransaction(request *authoritypb.Request, cred
 			transaction.lastDataSize = body.GetSize()
 			transaction.lastData = fingerprint
 			transaction.staged += uint64(body.GetSize())
+			if h.Metrics != nil {
+				h.Metrics.WriteStagedBytes(int64(body.GetSize()))
+			}
 			now := time.Now()
 			progress := now.Add(h.WriteTransactionProgressTimeout)
 			if progress.After(transaction.absoluteDeadline) {

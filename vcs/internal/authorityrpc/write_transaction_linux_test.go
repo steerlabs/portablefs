@@ -11,11 +11,13 @@ import (
 	"io"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
@@ -823,6 +825,71 @@ func TestWriteTransactionAdmissionWaitsForReleasedSlot(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("capacity waiter did not proceed after slot release")
+	}
+}
+
+func TestWriteTransactionAdmissionAndStagingMetrics(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	metrics, err := authoritymetrics.New("volume-metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Metrics = metrics
+	h.MaxWriteTransactionsPerSession = 1
+	beginAndStageWriteTransaction(t, h, credential, []byte("data"))
+
+	second := writeTransactionTestRequest(3, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(t.Context(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+
+	var waiting bytes.Buffer
+	if err := metrics.Registry().WritePrometheus(&waiting); err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []string{
+		`portablefs_authority_write_transactions_active{volume="volume-metrics"} 1`,
+		`portablefs_authority_write_transactions_waiting{volume="volume-metrics"} 1`,
+		`portablefs_authority_write_staged_bytes{volume="volume-metrics"} 4`,
+		`portablefs_authority_write_admission_blocks_total{volume="volume-metrics"} 1`,
+	} {
+		if !strings.Contains(waiting.String(), sample+"\n") {
+			t.Errorf("waiting metrics omit %q", sample)
+		}
+	}
+
+	abort := writeTransactionTestRequest(4, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	if response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first ABORT = %+v", response)
+	}
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != 0 {
+			t.Fatalf("second BEGIN = %+v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second transaction did not leave admission")
+	}
+	abort = writeTransactionTestRequest(5, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	if response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("second ABORT = %+v", response)
+	}
+
+	var released bytes.Buffer
+	if err := metrics.Registry().WritePrometheus(&released); err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []string{
+		`portablefs_authority_write_transactions_active{volume="volume-metrics"} 0`,
+		`portablefs_authority_write_transactions_waiting{volume="volume-metrics"} 0`,
+		`portablefs_authority_write_staged_bytes{volume="volume-metrics"} 0`,
+		`portablefs_authority_write_admission_wait_seconds_count{volume="volume-metrics"} 1`,
+	} {
+		if !strings.Contains(released.String(), sample+"\n") {
+			t.Errorf("released metrics omit %q", sample)
+		}
 	}
 }
 

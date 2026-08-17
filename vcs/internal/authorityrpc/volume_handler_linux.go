@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -102,6 +103,7 @@ type VolumeHandler struct {
 	Store       volumeStore
 	Runtime     *volumeserver.Authority
 	Authorizer  Authorizer
+	Metrics     *authoritymetrics.Metrics
 	MaxFrame    uint32
 	MaxRead     uint32
 	MaxWrite    uint32
@@ -3465,6 +3467,9 @@ func (r *capabilityReservation) commit(items, opens []trackedCapability) error {
 			resources.opens[open.value] = open.protected
 		}
 	}
+	if r.h.Metrics != nil {
+		r.h.Metrics.ObserveSessionItems(len(resources.items))
+	}
 	r.active = false
 	return nil
 }
@@ -3486,6 +3491,9 @@ func (h *VolumeHandler) trackItem(id volumeserver.SessionID, item xfsstore.Capab
 		err = errCapabilityTableFull
 	default:
 		trackCapability(resources.items, item, protected, &h.totalItems)
+		if h.Metrics != nil {
+			h.Metrics.ObserveSessionItems(len(resources.items))
+		}
 	}
 	h.resourcesMu.Unlock()
 	if err != nil {

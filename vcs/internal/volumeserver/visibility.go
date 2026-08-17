@@ -721,6 +721,9 @@ type VisibilityConfig struct {
 	// deployment will not admit. The refusal reaches the mount as a bare errno,
 	// so this is the only place both sides of the disagreement are visible.
 	OnRefusedCommitment func(SessionID, error)
+	// OnBarrier observes a successfully opened PREPARE through its terminal
+	// COMPLETE acknowledgment (or bounded failure). It must be nonblocking.
+	OnBarrier func(time.Duration, int)
 }
 
 // VisibilityCoordinator owns disposable event state around durable membership.
@@ -1365,6 +1368,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		MutationSequence:    mutation.Sequence,
 		FrontendOperationID: mutation.FrontendOperationID,
 	}
+	barrierStarted := c.cfg.Now()
 	audience, deliveries, err := c.openBarrier(source, prepareTargets, &ticket)
 	// The PREPARE/apply state is released on every exit from here on, including
 	// the one where opening the barrier itself failed: a reader waiting on a
@@ -1373,6 +1377,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if err != nil {
 		return &VisibilityBarrierError{Err: err}
 	}
+	defer c.observeBarrier(barrierStarted, len(audience.members))
 	if err := c.awaitAll(deliveries); err != nil {
 		return &VisibilityBarrierError{Err: err}
 	}
@@ -1435,6 +1440,17 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		return &VisibilityBarrierError{Applied: true, Err: err}
 	}
 	return nil
+}
+
+func (c *VisibilityCoordinator) observeBarrier(started time.Time, audience int) {
+	if c.cfg.OnBarrier == nil {
+		return
+	}
+	elapsed := c.cfg.Now().Sub(started)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	c.cfg.OnBarrier(elapsed, audience)
 }
 
 // acquireMutationOrder takes the global visible-mutation turn while honoring

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
@@ -145,6 +146,7 @@ func writeObservedResponse(conn net.Conn, maxFrame uint32, timeout time.Duration
 
 type Server struct {
 	Handler        Handler
+	Metrics        *authoritymetrics.Metrics
 	MaxFrame       uint32
 	MaxInFlight    int
 	MaxConnections int
@@ -154,6 +156,9 @@ type Server struct {
 	HandshakeTimeout      time.Duration
 	IdleTimeout           time.Duration
 	WriteTimeout          time.Duration
+	// OnServing observes the lifetime of the validated TLS accept loop. It is
+	// used by readiness only and must be nonblocking.
+	OnServing func(bool)
 
 	budget *frameBudget
 
@@ -204,6 +209,10 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	serveCtx, cancel := context.WithCancel(ctx)
 	connections := make(chan struct{}, s.MaxConnections)
 	var connectionWorkers sync.WaitGroup
+	if s.OnServing != nil {
+		s.OnServing(true)
+		defer s.OnServing(false)
+	}
 	defer func() {
 		cancel()
 		_ = tlsListener.Close()
@@ -364,7 +373,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			// Cancellation must remain processable when every normal execution
 			// slot is occupied. Its handler only validates the epoch and returns
 			// the acknowledgment, so execute it inline outside the normal slots.
-			response := handleTransportRequest(s.Handler, requestCtx, request)
+			response := s.dispatchRequest(requestCtx, request)
 			finishResponse := finishHandlerResponse(s.Handler, request, response)
 			writeErr := writeResponse(request, response)
 			finishResponse()
