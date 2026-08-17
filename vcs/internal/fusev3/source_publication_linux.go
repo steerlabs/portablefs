@@ -494,7 +494,7 @@ func (r *rawFileSystem) supersedableNegativePublicationLocked(publication *negat
 	}
 	reply := publication.reply
 	if reply.owner != owner.r || !reply.originalWrote || !reply.originalStatus.Ok() || reply.source != nil ||
-		len(reply.attrs) != 0 || len(reply.data) != 0 || reply.writeKernelTx != 0 || len(reply.names) == 0 {
+		len(reply.attrs) != 0 || len(reply.data) != 0 || reply.writeKernelTx != 0 || reply.writeHandle != nil || len(reply.names) == 0 {
 		return false
 	}
 	for _, name := range reply.names {

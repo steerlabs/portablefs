@@ -34,14 +34,15 @@ This is a causal acknowledgement, not a timeout or invalidation heuristic.
 
 ## Strict INIT profile
 
-`FUSE_PFS_STRICT_COHERENCE = 1ULL << 63` and `FUSE_PFS_CACHED_DATA = 1ULL << 62`
-together denote the complete profile.  They are one version, not two features:
-selecting either without the other fails INIT, because the two revisions
-disagree about the exact SHARED regular open-flag pair and that disagreement
-would otherwise surface as `-EPROTO` on the first open rather than as a refused
-mount.  The kernel accepts the profile only when all of the following are true:
+`FUSE_PFS_STRICT_COHERENCE = 1ULL << 63`,
+`FUSE_PFS_CACHED_DATA = 1ULL << 62`, and
+`FUSE_PFS_WRITE_ONESHOT = 1ULL << 61` together denote the complete profile.
+They are one revision, not three independent features: selecting an incomplete
+set fails INIT. That keeps a kernel and daemon from disagreeing about either the
+SHARED open flags or the write shape after the mount is live. The kernel accepts
+the profile only when all of the following are true:
 
-- both private capability bits are returned;
+- all three private capability bits are returned;
 - the returned protocol version is exactly 7.41;
 - the mount uses `default_permissions`;
 - `FUSE_ATOMIC_O_TRUNC`, `FUSE_HANDLE_KILLPRIV_V2`, `FUSE_POSIX_LOCKS`, and
@@ -239,15 +240,16 @@ struct fuse_pfs_write_in {
 
 `rlimit_fsize` is the raw 64-bit Linux `rlim_cur`: zero is a real zero-byte
 limit and `UINT64_MAX` is infinity.  `file_max_size` is nonzero and at most
-`S64_MAX`.  The kernel captures one limit snapshot before BEGIN and does not
-reread it between phases.
+`S64_MAX`.  The kernel captures one limit snapshot before selecting the write
+shape and does not reread it during the operation.
 
 Effective append means `position == 0`.  Positioned write means `position` is
 the exact checked nonnegative `ki_pos`.  `flags` is constructed from zero and
 contains only effective `O_APPEND`, `O_DSYNC`, and `O_SYNC`; it never copies
 arbitrary `file->f_flags`.  `write_flags` contains only
 `FUSE_WRITE_LOCKOWNER` and `FUSE_WRITE_KILL_SUIDGID`.  `lock_owner` is zero
-unless LOCKOWNER is set.  Every field is frozen at BEGIN and repeated exactly.
+unless LOCKOWNER is set. Every field is frozen in the one-shot request or at
+BEGIN and repeated exactly across a fragmented transaction.
 
 ### Phases
 
@@ -257,6 +259,14 @@ unless LOCKOWNER is set.  Every field is frozen at BEGIN and repeated exactly.
 | DATA | 2 | `size` bytes | staged prefix | idempotent inert staging |
 | COMMIT | 3 | none | exact staged prefix | one authority mutation |
 | ABORT | 4 | none | 0 | idempotent precommit cleanup |
+| ONE_SHOT | 5 | `size` bytes | 0 | one authority mutation, no staging |
+
+The initial `iov_iter_count` selects exactly one shape. A count at or below
+negotiated `max_write` sends ONE_SHOT with the complete extracted payload,
+write geometry, and `txid == 0`. It neither allocates nor consumes a transaction
+ID. A count above `max_write` consumes the next monotonic transaction ID and
+uses BEGIN, one or more DATA fragments, and COMMIT. These are deterministic
+size classes, not a fallback chain.
 
 BEGIN and DATA do not acquire the source visibility gate and cannot expose
 partial data.  COMMIT acquires the source gate only after prior peer phases have
@@ -271,8 +281,9 @@ protocol errors.  ABORT always uses offset zero because the kernel cannot know
 whether a lost DATA ACK advanced authority staging.  Unknown/already-aborted
 ABORT is successful and idempotent.
 
-COMMIT is forced and uninterruptible once a prefix is staged.  A lost or
-malformed COMMIT reply is outcome-ambiguous and fences the mount.  BEGIN/DATA
+COMMIT is forced and uninterruptible once a prefix is staged. ONE_SHOT is also
+forced because it is already the mutation. A lost or malformed COMMIT or
+ONE_SHOT reply is outcome-ambiguous and fences the mount. BEGIN/DATA
 transport failure triggers best-effort ABORT; failure to confirm that cleanup
 does not imply an XFS mutation because COMMIT was never sent, and bounded
 session expiry owns the inert allocation.
@@ -294,8 +305,9 @@ struct fuse_pfs_write_out {
 ```
 
 Control ACKs use the sole flag BEGUN, STAGED, or ABORTED and zero result fields.
-A clean COMMIT uses sole COMMITTED, a positive committed prefix, assigned
-offset, exact post-size, nonzero nonwrapping sequence, and `error == 0`.
+A clean COMMIT or ONE_SHOT uses sole COMMITTED, a positive committed prefix,
+assigned offset, exact post-size, nonzero nonwrapping sequence, and `error == 0`.
+ONE_SHOT echoes `txid == 0`; transactional replies echo their positive ID.
 
 For append, `post_size` must equal `assigned_offset + committed_size` exactly.
 For positioned overwrite it may be larger, but never smaller than the written
@@ -314,10 +326,12 @@ count independently to install `ki_pos`/OFD position where applicable and emit
 fsnotify/accounting once.  An explicit pwrite does not change OFD position.
 
 Authority data descriptors are deliberately opened without sticky
-`O_SYNC`/`O_DSYNC`.  The frontend freezes effective per-write sync intent in
-BEGIN and the authority performs exactly one fsync/fdatasync after all staged
-fragments and killpriv work; a sticky descriptor would flush every bounded
-backend write and amplify one syscall into many durability barriers.
+`O_SYNC`/`O_DSYNC`. The frontend freezes effective per-write sync intent in
+ONE_SHOT or BEGIN. A one-shot payload is applied directly from the retained
+authority frame with one `pwrite` or `pwritev2(RWF_APPEND)` and no memfd or
+sendfile. A transaction applies its staged prefix at COMMIT. Both shapes perform
+exactly one fsync/fdatasync after data and killpriv work; a sticky descriptor
+would amplify one syscall into multiple durability barriers.
 
 XFS may change killpriv/timestamp attrs before returning zero bytes plus an
 error.  That is represented as marked `COMMITTED | POSTAPPLY_ERROR` with
@@ -627,7 +641,9 @@ re-enabling a stock bypass.
 
 | Failure point | Kernel result |
 | --- | --- |
-| pre-BEGIN local validation | ordinary Linux errno, no request |
+| pre-shape local validation | ordinary Linux errno, no request |
+| ONE_SHOT transport/body failure | outcome ambiguous, fence |
+| definite ONE_SHOT REJECTED | exact errno, mount survives |
 | BEGIN/DATA transport/body failure | best-effort ABORT; malformed protocol fences |
 | definite COMMIT REJECTED | exact errno, mount survives |
 | lost/malformed/transport COMMIT | outcome ambiguous, fence |
@@ -642,8 +658,8 @@ re-enabling a stock bypass.
 ## Lock/order proof
 
 The daemon's coordinate admission/FIFO is the distributed serialization lock.
-BEGIN/DATA are inert and hold no FIFO.  COMMIT obtains the FIFO after older peer
-COMPLETEs, applies once, and retains it.  Kernel postprocessing uses the
+BEGIN/DATA are inert and hold no FIFO. COMMIT and ONE_SHOT obtain the FIFO after
+older peer COMPLETEs, apply once, and retain it. Kernel postprocessing uses the
 per-inode publication mutex and mapping invalidate lock, not `inode_lock`.
 PUBLISH ACK then releases the FIFO.  A newer peer PREPARE cannot enter before
 that ACK.
@@ -652,8 +668,8 @@ No synchronous PUBLISH is sent from a FUSE async completion callback; that
 would deadlock the daemon writer's reply mutex.  Strict transactional write is
 forced synchronous.  Stack scopes are entered by supported VFS/core entry
 points; a direct/out-of-tree SHARED `->write_iter` without a compatible scope
-fences before BEGIN.  Repeated `write_iter` callers use an explicit always-child
-write scope for each transaction: its token is PUBLISHed before the next
+fences before selecting a shape. Repeated `write_iter` callers use an explicit always-child
+write scope for each write operation: its token is PUBLISHed before the next
 iteration, then the still-live outer operation scope is restored.  Reusable
 scope entry returns ownership and no caller may discard that result.
 

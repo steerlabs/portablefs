@@ -114,6 +114,12 @@ func doInit(server *protocolServer, req *request) {
 	}
 
 	kernelFlags := input.Flags64()
+	const pfsProfileRevision = CAP_PFS_STRICT_COHERENCE | CAP_PFS_CACHED_DATA | CAP_PFS_WRITE_ONESHOT
+	if server.opts.ExtraCapabilities&CAP_PFS_WRITE_ONESHOT != 0 && input.Flags64()&pfsProfileRevision != pfsProfileRevision {
+		log.Printf("kernel does not advertise the exact PortableFS profile revision\n")
+		req.status = EIO
+		return
+	}
 	server.kernelSettings = *input
 	kernelFlags &= (CAP_ASYNC_READ | CAP_BIG_WRITES | CAP_FILE_OPS |
 		CAP_READDIRPLUS | CAP_NO_OPEN_SUPPORT | CAP_PARALLEL_DIROPS | CAP_MAX_PAGES | CAP_RENAME_SWAP | CAP_PASSTHROUGH | CAP_ALLOW_IDMAP |
@@ -241,7 +247,7 @@ func doPFSWrite(server *protocolServer, req *request) {
 		return
 	}
 	switch in.Phase {
-	case PFS_WRITE_DATA:
+	case PFS_WRITE_DATA, PFS_WRITE_ONE_SHOT:
 		if in.Size == 0 {
 			req.status = EIO
 			return

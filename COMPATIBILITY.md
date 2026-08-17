@@ -50,7 +50,8 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   with a per-epoch secret keyed fingerprint over the full canonical body. The
   secret and fingerprint never cross the wire, and replay state is discarded
   with that same epoch. Protocol 5 carries write-transaction DATA fragments in
-  `WriteTransactionRequest.Data` and read payloads in `ReadReply.Data` as the
+  `WriteTransactionRequest.Data`, complete single-fragment writes in
+  `OneShotWriteRequest.Data`, and read payloads in `ReadReply.Data` as the
   frame's one exact out-of-line bulk body. The protobuf
   metadata and bulk lengths are both in the frame header; a bulk body on any
   other message, or an inline copy of either bulk field, is a protocol error.
@@ -79,7 +80,7 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   requires the `xfs-current-state`, `session-exact-epoch`, `direct-write`,
   `framed-bulk-data-v1`, `authority-keyed-replay-fingerprint-v1`,
   `visibility-ack-next-v1`, `mandatory-dual-transport-v1`,
-  `transactional-shared-write-v1`, `strict-linux-mutation-suite-v1`,
+  `transactional-shared-write-v1`, `one-shot-write-v1`, `strict-linux-mutation-suite-v1`,
   `terminal-applied-delivery-receipt-v1`,
   `strict-two-phase-visibility`, `classified-visibility-interruption`,
   `sequenced-visibility-retry-v1`, `lockless-namespace-repair-v1`,
@@ -88,7 +89,8 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   `no-history`, `no-branches`,
   `direct-io-no-file-mmap`, `user-xattr-readonly`, `single-principal`,
   `distributed-posix-locks`, `stable-item-identity`, `readdir-plus-items`,
-  `volume-syncfs-barrier`, and `exact-resource-acquisition` at `Activate`. A
+  `volume-syncfs-barrier`, `transactional-shared-write-v1`,
+  `one-shot-write-v1`, and `exact-resource-acquisition` at `Activate`. A
   strict attach additionally requires
   `strict-two-phase-visibility`, `classified-visibility-interruption`,
   `sequenced-visibility-retry-v1`, `lockless-namespace-repair-v1`,
@@ -96,6 +98,12 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   `namespace-post-binding-identity` in its Activate reply. These strings are the contract's shape written down: an
   authority that stopped meeting one of them would be refused rather than
   silently tolerated.
+
+  `one-shot-write-v1` is the additive protocol-5 write operation for a payload
+  no larger than negotiated `max_write`. It is one source-gated replay-slot
+  mutation and has no transaction ID or staging phase. Larger writes use the
+  existing BEGIN/DATA/COMMIT transaction shape. The size boundary selects one
+  shape deterministically; neither shape is a runtime fallback for the other.
 
   The sequenced visibility retry is an internal Linux liveness transaction,
   not an application errno or a timed retry. The authority names the exact

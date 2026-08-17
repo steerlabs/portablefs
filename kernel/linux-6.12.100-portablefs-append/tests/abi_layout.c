@@ -10,8 +10,12 @@ _Static_assert(FUSE_PFS_STRICT_COHERENCE == (UINT64_C(1) << 63),
 	       "strict capability bit changed");
 _Static_assert(FUSE_PFS_CACHED_DATA == (UINT64_C(1) << 62),
 	       "cached-data capability bit changed");
-_Static_assert((FUSE_PFS_STRICT_COHERENCE & FUSE_PFS_CACHED_DATA) == 0,
-	       "the two halves of the private profile must be distinct bits");
+_Static_assert(FUSE_PFS_WRITE_ONESHOT == (UINT64_C(1) << 61),
+	       "one-shot-write capability bit changed");
+_Static_assert(((FUSE_PFS_STRICT_COHERENCE & FUSE_PFS_CACHED_DATA) |
+	       (FUSE_PFS_STRICT_COHERENCE & FUSE_PFS_WRITE_ONESHOT) |
+	       (FUSE_PFS_CACHED_DATA & FUSE_PFS_WRITE_ONESHOT)) == 0,
+	       "private profile revision bits must be distinct");
 _Static_assert(FUSE_PFS_UNIQUE_PUBLISH == (UINT64_C(1) << 62),
 	       "publication marker changed");
 _Static_assert(FUSE_UNIQUE_RESEND == (UINT64_C(1) << 63),
@@ -44,6 +48,7 @@ _Static_assert(FUSE_PFS_WRITE_BEGIN == 1, "BEGIN changed");
 _Static_assert(FUSE_PFS_WRITE_DATA == 2, "DATA changed");
 _Static_assert(FUSE_PFS_WRITE_COMMIT == 3, "COMMIT changed");
 _Static_assert(FUSE_PFS_WRITE_ABORT == 4, "ABORT changed");
+_Static_assert(FUSE_PFS_WRITE_ONE_SHOT == 5, "ONE_SHOT changed");
 _Static_assert(FUSE_PFS_WRITE_OUT_REJECTED == (1U << 4),
 	       "write REJECTED changed");
 _Static_assert(FUSE_PFS_WRITE_OUT_POSTAPPLY_ERROR == (1U << 5),

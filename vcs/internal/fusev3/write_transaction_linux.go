@@ -57,6 +57,31 @@ func validWriteTransactionMetadata(input *fuse.PFSWriteIn, maxTransaction uint64
 	return input.Position <= math.MaxInt64 && input.Position < input.RlimitFsize && input.Position < input.FileMaxSize
 }
 
+func validOneShotWriteMetadata(input *fuse.PFSWriteIn, data []byte, maxWrite uint32) bool {
+	if input == nil || input.Unique == 0 || input.Unique >= fuse.PFS_UNIQUE_PUBLISH || input.Unique&1 != 0 ||
+		input.NodeId == 0 || input.Fh == 0 || input.Txid != 0 || input.RequestedSize == 0 ||
+		input.RequestedSize != uint64(input.Size) || input.Size == 0 || input.Size > maxWrite ||
+		uint64(len(data)) != input.RequestedSize || input.FragmentOffset != 0 || input.FileMaxSize == 0 {
+		return false
+	}
+	allowedFlags := uint32(syscall.O_APPEND | syscall.O_SYNC)
+	if input.Flags&^allowedFlags != 0 {
+		return false
+	}
+	internalSync := uint32(syscall.O_SYNC) &^ uint32(unix.O_DSYNC)
+	if input.Flags&internalSync != 0 && input.Flags&uint32(unix.O_DSYNC) == 0 {
+		return false
+	}
+	allowedWriteFlags := uint32(fuse.WRITE_LOCKOWNER | fuse.WRITE_KILL_SUIDGID)
+	if input.WriteFlags&^allowedWriteFlags != 0 || input.WriteFlags&fuse.WRITE_LOCKOWNER == 0 && input.LockOwner != 0 {
+		return false
+	}
+	if input.Flags&uint32(syscall.O_APPEND) != 0 {
+		return input.Position == 0
+	}
+	return input.Position <= math.MaxInt64 && input.Position < input.RlimitFsize && input.Position < input.FileMaxSize
+}
+
 func writeTransactionPhase(phase uint32) authoritypb.WriteTransactionPhase {
 	switch phase {
 	case fuse.PFS_WRITE_BEGIN:
@@ -149,14 +174,40 @@ func fillWriteTransactionOut(out *fuse.PFSWriteOut, kernelTxid uint64, reply *au
 	}
 }
 
-// PFSWrite implements PortableFS's negotiated multi-frame transaction for
-// every SHARED write. BEGIN/DATA/ABORT are inert idempotent session staging;
-// COMMIT alone acquires the source gate and a retained replay identity.
+func validOneShotWriteReply(reply *authoritypb.OneShotWriteReply) bool {
+	if reply == nil {
+		return false
+	}
+	return validWriteTransactionReply(&authoritypb.WriteTransactionReply{
+		TransactionId: 1, CommittedSize: reply.GetCommittedSize(), AssignedOffset: reply.GetAssignedOffset(),
+		PostSize: reply.GetPostSize(), VisibilitySequence: reply.GetVisibilitySequence(), Flags: reply.GetFlags(), Error: reply.GetError(),
+	}, 1, fuse.PFS_WRITE_OUT_COMMITTED)
+}
+
+func fillOneShotWriteOut(out *fuse.PFSWriteOut, reply *authoritypb.OneShotWriteReply) {
+	*out = fuse.PFSWriteOut{
+		CommittedSize: reply.GetCommittedSize(), AssignedOffset: reply.GetAssignedOffset(), PostSize: reply.GetPostSize(),
+		Sequence: reply.GetVisibilitySequence(), Flags: reply.GetFlags(), Error: reply.GetError(),
+	}
+}
+
+// PFSWrite selects exactly one negotiated shape by size. A one-fragment write
+// commits directly; a larger write uses inert BEGIN/DATA staging followed by
+// the sole mutating COMMIT.
 func (r *rawFileSystem) PFSWrite(_ <-chan struct{}, input *fuse.PFSWriteIn, data []byte, out *fuse.PFSWriteOut) fuse.Status {
-	if out == nil || !validWriteTransactionMetadata(input, r.mount.rpc.MaxWriteTransactionBytes()) {
+	if out == nil {
 		return writeTransactionProtocolError
 	}
 	*out = fuse.PFSWriteOut{}
+	if input != nil && input.Phase == fuse.PFS_WRITE_ONE_SHOT {
+		if !validOneShotWriteMetadata(input, data, r.maxWrite) {
+			return writeTransactionProtocolError
+		}
+		return r.writeOneShot(input, data, out)
+	}
+	if !validWriteTransactionMetadata(input, r.mount.rpc.MaxWriteTransactionBytes()) {
+		return writeTransactionProtocolError
+	}
 	switch input.Phase {
 	case fuse.PFS_WRITE_BEGIN:
 		return r.writeTransactionBegin(input, out)
@@ -169,6 +220,113 @@ func (r *rawFileSystem) PFSWrite(_ <-chan struct{}, input *fuse.PFSWriteIn, data
 	default:
 		return writeTransactionProtocolError
 	}
+}
+
+func (r *rawFileSystem) writeOneShot(input *fuse.PFSWriteIn, data []byte, out *fuse.PFSWriteOut) fuse.Status {
+	handleRecord, handle := r.acquireFileHandle(input.Fh)
+	if handle == nil {
+		return fuse.EBADF
+	}
+	transferred := false
+	defer func() {
+		if !transferred {
+			r.releaseHandleOperation(handleRecord)
+		}
+	}()
+	if handleRecord.inode == nil || input.NodeId != handleRecord.inode.id ||
+		handleRecord.inode.key.kind != authoritypb.Attr_REGULAR || handle.node != handleRecord.inode.node {
+		return fuse.EBADF
+	}
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	gate, err := itemSourceGate(handle.node.item, true)
+	if err != nil {
+		return fuse.EIO
+	}
+	request := &authoritypb.Request{
+		SourcePublicationGate: gate,
+		Body: &authoritypb.Request_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteRequest{
+			Handle: cloneBytes(handle.token), Position: input.Position, RlimitFsize: input.RlimitFsize,
+			FileMaxSize: input.FileMaxSize, LockOwner: input.LockOwner, Size: input.Size,
+			WriteFlags: input.WriteFlags, Flags: input.Flags, Data: data,
+		}},
+	}
+	response, callErr := r.writeTransactionCall(ctx, request, true)
+	if callErr != nil || response == nil || response.GetUncertain() || responseErrno(response) != 0 {
+		responseNil, uncertain, errno, failure := response == nil, false, syscall.Errno(0), authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED
+		if response != nil {
+			uncertain, errno, failure = response.GetUncertain(), responseErrno(response), response.GetFailure()
+		}
+		r.mount.revoke(fmt.Errorf("fusev3: one-shot write outcome is ambiguous: call=%v response_nil=%t uncertain=%t errno=%d failure=%s",
+			callErr, responseNil, uncertain, errno, failure))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	reply := response.GetOneShotWrite()
+	if !validOneShotWriteReply(reply) {
+		r.mount.revoke(errors.New("fusev3: one-shot write returned a malformed result"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	lease := sourceLeaseFromContext(ctx)
+	publication := replyPublicationFromContext(ctx)
+	if lease == nil || publication == nil {
+		r.mount.revoke(errors.New("fusev3: one-shot write escaped source publication ownership"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	publication.writeHandle = handleRecord
+	transferred = true
+	if reply.GetFlags() == fuse.PFS_WRITE_OUT_REJECTED || reply.GetFlags() == fuse.PFS_WRITE_OUT_REJECTED_RLIMIT {
+		if err := completeDefiniteNoChangePublication(ctx); err != nil {
+			r.mount.revoke(err)
+			return fuse.Status(syscall.ENOTCONN)
+		}
+		fillOneShotWriteOut(out, reply)
+		return fuse.OK
+	}
+	postAttr := response.GetPostAttr()
+	if postAttr == nil || postAttr.GetKind() != authoritypb.Attr_REGULAR ||
+		postAttr.GetInode() != handleRecord.inode.key.inode || postAttr.GetSize() < 0 ||
+		uint64(postAttr.GetSize()) != reply.GetPostSize() || reply.GetPostSize() > input.FileMaxSize {
+		r.mount.revoke(errors.New("fusev3: one-shot write omitted its exact regular-file post attributes"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	attrOnlyPostapply := reply.GetCommittedSize() == 0 &&
+		reply.GetFlags() == fuse.PFS_WRITE_OUT_COMMITTED|fuse.PFS_WRITE_OUT_POSTAPPLY_ERROR
+	if attrOnlyPostapply && reply.GetAssignedOffset() != 0 {
+		r.mount.revoke(errors.New("fusev3: zero-byte post-apply one-shot write carried a position"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	appendMode := input.Flags&uint32(syscall.O_APPEND) != 0
+	ceiling := input.FileMaxSize
+	if input.RlimitFsize < ceiling {
+		ceiling = input.RlimitFsize
+	}
+	invalidResult := reply.GetCommittedSize() > uint64(input.Size) || !attrOnlyPostapply &&
+		(reply.GetAssignedOffset() > ceiling || reply.GetCommittedSize() > ceiling-reply.GetAssignedOffset())
+	if invalidResult {
+		r.mount.revoke(errors.New("fusev3: one-shot write exceeded its payload or maximum range"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	end := reply.GetAssignedOffset() + reply.GetCommittedSize()
+	if attrOnlyPostapply {
+		invalidResult = false
+	} else if appendMode {
+		invalidResult = reply.GetPostSize() != end
+	} else {
+		invalidResult = reply.GetAssignedOffset() != input.Position || reply.GetPostSize() < end
+	}
+	if invalidResult {
+		r.mount.revoke(errors.New("fusev3: one-shot write violated its position or post-size geometry"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	fillOneShotWriteOut(out, reply)
+	return fuse.OK
 }
 
 func (r *rawFileSystem) writeTransactionBegin(input *fuse.PFSWriteIn, out *fuse.PFSWriteOut) fuse.Status {

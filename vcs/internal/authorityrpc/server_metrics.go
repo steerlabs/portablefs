@@ -99,6 +99,8 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationClose
 	case *authoritypb.Request_Read:
 		return authoritymetrics.OperationRead
+	case *authoritypb.Request_OneShotWrite:
+		return authoritymetrics.OperationOneShotWrite
 	case *authoritypb.Request_WriteTransaction:
 		switch body.WriteTransaction.GetPhase() {
 		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:

@@ -215,6 +215,12 @@ func (h *VolumeHandler) deriveSourcePublicationGate(req *authoritypb.Request, id
 		}
 		gate, _, err := h.writeTransactionGate(id, body.WriteTransaction)
 		return gate, err
+	case *authoritypb.Request_OneShotWrite:
+		resolved, err := resolver.open(body.OneShotWrite.GetHandle())
+		if err != nil {
+			return volumeserver.SourcePublicationGate{}, err
+		}
+		builder.addItem(resolved.identity, true, true)
 	case *authoritypb.Request_Fallocate:
 		resolved, err := resolver.open(body.Fallocate.GetHandle())
 		if err != nil {

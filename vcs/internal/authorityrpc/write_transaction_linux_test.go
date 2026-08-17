@@ -35,6 +35,11 @@ type writeTransactionTestTarget struct {
 	commitAssigned uint64
 	commitPost     xfsstore.Attr
 	commitErr      error
+	commitSpecs    []xfsstore.WriteCommit
+	directCalls    int
+	directStarted  chan struct{}
+	directRelease  <-chan struct{}
+	directOnce     sync.Once
 }
 
 func (*writeTransactionTestTarget) Coordinate() xfsstore.ObjectCoordinate {
@@ -50,6 +55,27 @@ func (t *writeTransactionTestTarget) CommitWrite(staged io.ReaderAt, spec xfssto
 	defer t.mu.Unlock()
 	t.commitCalls++
 	t.committedData = append(t.committedData, data)
+	t.commitSpecs = append(t.commitSpecs, spec)
+	committed := uint64(len(data))
+	if t.commitSizeSet {
+		committed = t.commitSize
+	}
+	return committed, t.commitAssigned, t.commitPost, t.commitErr
+}
+
+func (t *writeTransactionTestTarget) CommitWriteData(data []byte, spec xfsstore.WriteCommit) (uint64, uint64, xfsstore.Attr, error) {
+	if t.directStarted != nil {
+		t.directOnce.Do(func() { close(t.directStarted) })
+	}
+	if t.directRelease != nil {
+		<-t.directRelease
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.commitCalls++
+	t.directCalls++
+	t.committedData = append(t.committedData, append([]byte(nil), data...))
+	t.commitSpecs = append(t.commitSpecs, spec)
 	committed := uint64(len(data))
 	if t.commitSizeSet {
 		committed = t.commitSize
@@ -87,12 +113,19 @@ func (t *writeTransactionTestTarget) commitSnapshot() (int, [][]byte) {
 	return t.commitCalls, data
 }
 
+func (t *writeTransactionTestTarget) directSnapshot() (int, []xfsstore.WriteCommit) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.directCalls, append([]xfsstore.WriteCommit(nil), t.commitSpecs...)
+}
+
 type writeTransactionTestStore struct {
 	*resourceAdmissionFaultStore
-	mu         sync.Mutex
-	pinErr     error
-	targets    []*writeTransactionTestTarget
-	fenceCalls int
+	mu          sync.Mutex
+	pinErr      error
+	targets     []*writeTransactionTestTarget
+	nextTargets []*writeTransactionTestTarget
+	fenceCalls  int
 }
 
 type writeTransactionTestStage struct {
@@ -210,7 +243,13 @@ func (s *writeTransactionTestStore) PinWriteTarget(xfsstore.Capability) (xfsstor
 	if s.pinErr != nil {
 		return nil, s.pinErr
 	}
-	target := &writeTransactionTestTarget{}
+	var target *writeTransactionTestTarget
+	if len(s.nextTargets) != 0 {
+		target = s.nextTargets[0]
+		s.nextTargets = s.nextTargets[1:]
+	} else {
+		target = &writeTransactionTestTarget{}
+	}
 	s.targets = append(s.targets, target)
 	return target, nil
 }

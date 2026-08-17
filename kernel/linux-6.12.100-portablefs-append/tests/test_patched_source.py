@@ -531,26 +531,25 @@ class PatchedSourceTests(unittest.TestCase):
         )
         self.assertIn("fuse_reverse_inval_inode(fc, nodeid, off, len)", notify)
 
-    def test_strict_init_requires_the_whole_cached_data_profile(self) -> None:
+    def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")
         end = text.index("if (arg->minor >= 9", start)
         admission = text[start:end]
-        # Either bit alone is a version mismatch and fails the mount.
-        self.assertIn(
-            "(flags & (FUSE_PFS_STRICT_COHERENCE |\n"
-            "\t\t\t\t\t      FUSE_PFS_CACHED_DATA)) !=\n"
-            "\t\t\t\t\t    (FUSE_PFS_STRICT_COHERENCE |\n"
-            "\t\t\t\t\t     FUSE_PFS_CACHED_DATA)",
-            admission,
-        )
+        # Any incomplete three-bit revision is a version mismatch and fails
+        # the mount before the first write can select a different shape.
+        self.assertEqual(admission.count("FUSE_PFS_WRITE_ONESHOT"), 3)
+        self.assertIn("The three private bits are one indivisible", admission)
         self.assertIn("(flags & FUSE_AUTO_INVAL_DATA)", admission)
         self.assertIn("!(flags & FUSE_EXPLICIT_INVAL_DATA)", admission)
         self.assertIn("ok = false", admission)
 
         send = text[text.index("void fuse_send_init"):]
-        self.assertIn("FUSE_PFS_STRICT_COHERENCE | FUSE_PFS_CACHED_DATA",
-                      send)
+        self.assertRegex(
+            send,
+            r"FUSE_PFS_STRICT_COHERENCE \| FUSE_PFS_CACHED_DATA \|\s+"
+            r"FUSE_PFS_WRITE_ONESHOT",
+        )
 
         # The negotiated read-ahead window is taken exactly rather than clamped
         # to the generic default: it is what bounds how many authority round
@@ -585,12 +584,12 @@ class PatchedSourceTests(unittest.TestCase):
 
     def test_zero_byte_postapply_publishes_attrs_without_byte_progress(self) -> None:
         text = self.source("fs/fuse/file.c")
-        write = text[text.index("static ssize_t fuse_pfs_write_transaction"):
-                     text.index("static ssize_t fuse_file_read_iter")]
-        self.assertIn("!out.committed_size &&", write)
-        self.assertIn("out.assigned_offset", write)
-        self.assertIn("if (!err && out.committed_size)", write)
-        self.assertIn("if (out.committed_size) {", write)
+        write = text[text.index("static ssize_t fuse_pfs_finish_write"):
+                     text.index("static ssize_t fuse_pfs_write_one_shot")]
+        self.assertIn("!out->committed_size &&", write)
+        self.assertIn("out->assigned_offset", write)
+        self.assertIn("if (!err && out->committed_size)", write)
+        self.assertIn("if (out->committed_size) {", write)
         copy_range = text[text.index("static ssize_t fuse_pfs_copy_file_range"):
                           text.index("static ssize_t fuse_copy_file_range")]
         self.assertIn("!out.result_size &&", copy_range)
@@ -598,6 +597,47 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("return out.result_size ?: out.error", copy_range)
         io_uring = self.source("io_uring/rw.c")
         self.assertIn("if (ret > 0 || has_applied_bytes)", io_uring)
+
+    def test_one_fragment_write_has_one_deterministic_mutating_shape(self) -> None:
+        text = self.source("fs/fuse/file.c")
+        one_shot = text[text.index("static ssize_t fuse_pfs_write_one_shot"):
+                        text.index("static ssize_t fuse_pfs_write_transaction")]
+        self.assertIn("FUSE_PFS_WRITE_ONE_SHOT", one_shot)
+        self.assertEqual(one_shot.count("fuse_pfs_write_payload_send"), 1)
+        self.assertNotIn("atomic64_inc_return", one_shot)
+        self.assertNotIn("FUSE_PFS_WRITE_BEGIN", one_shot)
+        self.assertNotIn("FUSE_PFS_WRITE_COMMIT", one_shot)
+
+        transaction = text[
+            text.index("static ssize_t fuse_pfs_write_transaction"):
+            text.index("static ssize_t fuse_file_read_iter")
+        ]
+        boundary = transaction.index("if (requested <= fc->max_write)")
+        txid = transaction.index("atomic64_inc_return(&fc->pfs_write_txid)")
+        self.assertLess(boundary, txid)
+        self.assertIn(
+            "fuse_pfs_write_in_freeze(&frozen, iocb, 0, requested",
+            transaction[:txid],
+        )
+        self.assertIn("FUSE_PFS_WRITE_BEGIN", transaction[txid:])
+        self.assertIn("FUSE_PFS_WRITE_DATA", transaction[txid:])
+        self.assertIn("FUSE_PFS_WRITE_COMMIT", transaction[txid:])
+
+        payload_args = text[
+            text.index("static void fuse_pfs_write_payload_args"):
+            text.index("static int fuse_pfs_write_payload_send")
+        ]
+        self.assertIn("args->force = true", payload_args)
+        self.assertIn(
+            "args->pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL",
+            payload_args,
+        )
+
+        dev = self.source("fs/fuse/dev.c")
+        marked_start = dev.index("req->in.h.opcode == FUSE_PFS_PUBLISH")
+        marked = dev[marked_start:
+                     dev.index("/* Is it an interrupt reply ID? */", marked_start)]
+        self.assertIn("FUSE_PFS_WRITE_ONE_SHOT", marked)
 
     def test_splice_forces_an_independent_per_iteration_write_scope(self) -> None:
         splice = self.source("fs/splice.c")

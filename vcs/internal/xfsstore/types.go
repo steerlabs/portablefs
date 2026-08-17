@@ -217,12 +217,13 @@ func (*WriteLimitError) Unwrap() error { return syscall.EFBIG }
 // WriteTarget is one pinned writable open description and its immutable XFS
 // identity. Pinning separates handle-table lifetime from one staged write:
 // CLOSE may retire the client handle while a previously accepted transaction
-// still owns the descriptor. CommitWrite is the only shared-file write
-// primitive; the private kernel protocol maps one whole write syscall to one
-// call even when its payload spans many transport frames.
+// still owns the descriptor. CommitWrite applies a staged multi-fragment
+// syscall; CommitWriteData applies a complete retained-frame payload directly.
+// Exactly one primitive is selected by the negotiated max_write boundary.
 type WriteTarget interface {
 	Coordinate() ObjectCoordinate
 	CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch []byte) (committedSize, assignedOffset uint64, post Attr, err error)
+	CommitWriteData(data []byte, spec WriteCommit) (committedSize, assignedOffset uint64, post Attr, err error)
 	Close() error
 }
 

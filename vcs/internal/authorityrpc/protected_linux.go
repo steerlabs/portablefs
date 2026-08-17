@@ -134,6 +134,8 @@ func (h *VolumeHandler) refuseProtectedNamespace(id volumeserver.SessionID, req 
 			return object(body.WriteTransaction.GetHandle())
 		}
 		return nil
+	case *authoritypb.Request_OneShotWrite:
+		return object(body.OneShotWrite.GetHandle())
 	case *authoritypb.Request_Fallocate:
 		return object(body.Fallocate.GetHandle())
 	case *authoritypb.Request_CopyFileRange:

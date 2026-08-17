@@ -271,6 +271,114 @@ func TestCommitWritePositionedSendfileCopiesMemfdAtExactOffset(t *testing.T) {
 	}
 }
 
+func TestCommitWriteDataPositionedUsesExactlyOnePwriteWithoutStaging(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "one-shot-positioned", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	if n, err := v.WriteAt(handle, []byte("abcdefghij"), 0); err != nil || n != 10 {
+		t.Fatalf("seed WriteAt = (%d, %v)", n, err)
+	}
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	realPwrite := v.pwrite
+	var pwriteCalls, pwritev2Calls, sendfileCalls int
+	v.pwrite = func(fd int, data []byte, offset int64) (int, error) {
+		pwriteCalls++
+		if string(data) != "WXYZ" || offset != 3 {
+			t.Fatalf("pwrite input = %q at %d, want WXYZ at 3", data, offset)
+		}
+		return realPwrite(fd, data, offset)
+	}
+	v.pwritev2 = func(int, [][]byte, int64, int) (int, error) {
+		pwritev2Calls++
+		return 0, syscall.EIO
+	}
+	v.sendfile = func(int, int, *int64, int) (int, error) {
+		sendfileCalls++
+		return 0, syscall.EIO
+	}
+	payload := []byte("WXYZ")
+	committed, assigned, post, err := target.CommitWriteData(payload, WriteCommit{
+		RequestedSize: uint64(len(payload)), Position: 3,
+		RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	})
+	if err != nil || committed != 4 || assigned != 3 || post.Size != 10 {
+		t.Fatalf("CommitWriteData = (%d, %d, size %d, %v)", committed, assigned, post.Size, err)
+	}
+	if pwriteCalls != 1 || pwritev2Calls != 0 || sendfileCalls != 0 {
+		t.Fatalf("one-shot positioned path = pwrite:%d pwritev2:%d sendfile:%d, want 1/0/0", pwriteCalls, pwritev2Calls, sendfileCalls)
+	}
+	got := make([]byte, 10)
+	if n, err := v.ReadAt(handle, got, 0); err != nil || n != len(got) || string(got) != "abcWXYZhij" {
+		t.Fatalf("one-shot positioned result = %q n=%d err=%v", got, n, err)
+	}
+}
+
+func TestCommitWriteDataAppendUsesOneRWFAppendCall(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "one-shot-append", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	if n, err := v.WriteAt(handle, []byte("prefix"), 0); err != nil || n != 6 {
+		t.Fatalf("seed WriteAt = (%d, %v)", n, err)
+	}
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	realPwritev2 := v.pwritev2
+	var pwriteCalls, appendCalls, sendfileCalls int
+	v.pwrite = func(int, []byte, int64) (int, error) {
+		pwriteCalls++
+		return 0, syscall.EIO
+	}
+	v.pwritev2 = func(fd int, buffers [][]byte, offset int64, flags int) (int, error) {
+		appendCalls++
+		if len(buffers) != 1 || string(buffers[0]) != "-tail" || offset != 0 || flags != unix.RWF_APPEND {
+			t.Fatalf("pwritev2 input = %q offset %d flags %#x", buffers, offset, flags)
+		}
+		return realPwritev2(fd, buffers, offset, flags)
+	}
+	v.sendfile = func(int, int, *int64, int) (int, error) {
+		sendfileCalls++
+		return 0, syscall.EIO
+	}
+	payload := []byte("-tail")
+	committed, assigned, post, err := target.CommitWriteData(payload, WriteCommit{
+		RequestedSize: uint64(len(payload)), RLimitSize: math.MaxUint64,
+		FileMaxSize: math.MaxInt64, Mode: WriteAppend,
+	})
+	if err != nil || committed != 5 || assigned != 6 || post.Size != 11 {
+		t.Fatalf("append CommitWriteData = (%d, %d, size %d, %v)", committed, assigned, post.Size, err)
+	}
+	if pwriteCalls != 0 || appendCalls != 1 || sendfileCalls != 0 {
+		t.Fatalf("one-shot append path = pwrite:%d pwritev2:%d sendfile:%d, want 0/1/0", pwriteCalls, appendCalls, sendfileCalls)
+	}
+	got := make([]byte, 11)
+	if n, err := v.ReadAt(handle, got, 0); err != nil || n != len(got) || string(got) != "prefix-tail" {
+		t.Fatalf("one-shot append result = %q n=%d err=%v", got, n, err)
+	}
+}
+
 func TestCommitWritePositionedSendfileReturnsExactShortPrefix(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
@@ -1147,7 +1255,8 @@ func TestPinnedAppendAcrossAliasesSerializesWholeTransactions(t *testing.T) {
 
 func BenchmarkStagingToTargetCopyPaths(b *testing.B) {
 	const size = 1 << 20
-	stage := writeCommitStage(b, make([]byte, size))
+	payload := make([]byte, size)
+	stage := writeCommitStage(b, payload)
 	target, err := os.CreateTemp(b.TempDir(), "portablefs-copy-benchmark-")
 	if err != nil {
 		b.Fatal(err)
@@ -1181,8 +1290,21 @@ func BenchmarkStagingToTargetCopyPaths(b *testing.B) {
 		for range b.N {
 			resetTarget()
 			offset := int64(0)
-			if n, err := unix.Sendfile(int(target.Fd()), int(stage.Fd()), &offset, size); err != nil || n != size {
-				b.Fatalf("Sendfile = (%d, %v)", n, err)
+			for offset < size {
+				n, err := unix.Sendfile(int(target.Fd()), int(stage.Fd()), &offset, size-int(offset))
+				if err != nil || n <= 0 {
+					b.Fatalf("Sendfile at %d = (%d, %v)", offset, n, err)
+				}
+			}
+		}
+	})
+	b.Run("direct-pwrite-retained-frame", func(b *testing.B) {
+		b.SetBytes(size)
+		b.ReportAllocs()
+		for range b.N {
+			resetTarget()
+			if n, err := unix.Pwrite(int(target.Fd()), payload, 0); err != nil || n != len(payload) {
+				b.Fatalf("Pwrite = (%d, %v)", n, err)
 			}
 		}
 	})

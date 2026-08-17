@@ -840,6 +840,81 @@ func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
 	}
 }
 
+// TestWriteSizeClassesUseExactAuthorityShapes is gated on the pinned kernel.
+// It proves the small-write optimization at the real /dev/fuse boundary and
+// also pins that the large-write transaction ladder remains the only shape
+// above max_write.
+func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	path := f.join(0, "write-size-classes")
+	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR, 0o600)
+	defer file.Close()
+
+	countWrite := func(write func() error) (oneShot, transactions int) {
+		t.Helper()
+		beforeOneShot := f.counter.count("one-shot-write")
+		beforeTransactions := f.counter.count("write-transaction")
+		if err := write(); err != nil {
+			t.Fatal(err)
+		}
+		return f.counter.count("one-shot-write") - beforeOneShot,
+			f.counter.count("write-transaction") - beforeTransactions
+	}
+
+	positioned := bytes.Repeat([]byte{0x31}, 4096)
+	oneShot, transactions := countWrite(func() error {
+		n, err := file.WriteAt(positioned, 0)
+		if err == nil && n != len(positioned) {
+			return io.ErrShortWrite
+		}
+		return err
+	})
+	if oneShot != 1 || transactions != 0 {
+		t.Fatalf("4 KiB positioned write authority shapes = one-shot %d, transaction phases %d, want 1/0", oneShot, transactions)
+	}
+
+	appendFile := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
+	appendPayload := bytes.Repeat([]byte{0x32}, 4096)
+	oneShot, transactions = countWrite(func() error {
+		n, err := appendFile.Write(appendPayload)
+		if err == nil && n != len(appendPayload) {
+			return io.ErrShortWrite
+		}
+		return err
+	})
+	if err := appendFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if oneShot != 1 || transactions != 0 {
+		t.Fatalf("4 KiB append authority shapes = one-shot %d, transaction phases %d, want 1/0", oneShot, transactions)
+	}
+
+	const maxWrite = 1 << 20
+	large, err := unix.Mmap(-1, 0, maxWrite+1, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Munmap(large)
+	for index := range large {
+		large[index] = 0x33
+	}
+	oneShot, transactions = countWrite(func() error {
+		n, err := unix.Pwrite(int(file.Fd()), large, 2*maxWrite)
+		if err == nil && n != len(large) {
+			return io.ErrShortWrite
+		}
+		return err
+	})
+	if oneShot != 0 || transactions != 4 {
+		t.Fatalf("max_write+1 positioned write authority shapes = one-shot %d, transaction phases %d, want 0/4", oneShot, transactions)
+	}
+	expected := make([]byte, 3*maxWrite+1)
+	copy(expected, positioned)
+	copy(expected[len(positioned):], appendPayload)
+	copy(expected[2*maxWrite:], large)
+	requireContent(t, path, expected, "data after both write-size shapes")
+}
+
 // TestConcurrentCrossMountWritersToOneFile covers two mounts writing the same
 // file at once. Disjoint ranges must all land, and a whole-block rewrite must
 // never tear, because a single kernel write below the negotiated maximum is one

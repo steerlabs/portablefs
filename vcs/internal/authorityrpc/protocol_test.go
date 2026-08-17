@@ -97,7 +97,7 @@ func TestAuthorityProtocolV5RequiresDualTransportAndExactResourceAcquisition(t *
 	if ProtocolMajor != 5 || ProtocolALPN != "portablefs-authority-v5" {
 		t.Fatalf("authority protocol=(major %d, ALPN %q), want (5, portablefs-authority-v5)", ProtocolMajor, ProtocolALPN)
 	}
-	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature, sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature}
+	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", strictWriteTransactionFeature, oneShotWriteFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature, sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature}
 	if !hasFeatures(requiredHelloFeatures, required) {
 		t.Fatalf("Hello features %v omit protocol-5 requirements %v", requiredHelloFeatures, required)
 	}
@@ -121,6 +121,9 @@ func TestAuthorityProtocolV5RequiresDualTransportAndExactResourceAcquisition(t *
 	if !hasFeatures(requiredStrictAttachFeatures, []string{sequencedVisibilityRetryFeature}) {
 		t.Fatalf("strict Attach features %v omit %s", requiredStrictAttachFeatures, sequencedVisibilityRetryFeature)
 	}
+	if !hasFeatures(requiredAttachFeatures, []string{oneShotWriteFeature}) {
+		t.Fatalf("Attach features %v omit %s", requiredAttachFeatures, oneShotWriteFeature)
+	}
 }
 
 func TestSourcePublicationGatePresenceMatchesVisibleOperationMatrix(t *testing.T) {
@@ -131,6 +134,7 @@ func TestSourcePublicationGatePresenceMatchesVisibleOperationMatrix(t *testing.T
 		{name: "setattr", request: &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{}}}},
 		{name: "fallocate", request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{}}}},
 		{name: "copy-file-range", request: &authoritypb.Request{Body: &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{}}}},
+		{name: "one-shot-write", request: &authoritypb.Request{Body: &authoritypb.Request_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteRequest{}}}},
 		{name: "create", request: &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{}}}},
 		{name: "mkdir", request: &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{}}}},
 		{name: "unlink", request: &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{}}}},

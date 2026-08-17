@@ -922,6 +922,8 @@ func requestKind(request *authoritypb.Request) string {
 		return "readdir"
 	case request.GetWriteTransaction() != nil:
 		return "write-transaction"
+	case request.GetOneShotWrite() != nil:
+		return "one-shot-write"
 	case request.GetRead() != nil:
 		return "read"
 	case request.GetSetAttr() != nil:

@@ -35,6 +35,7 @@ const (
 	OperationOpen
 	OperationClose
 	OperationRead
+	OperationOneShotWrite
 	OperationWriteTransactionBegin
 	OperationWriteTransactionData
 	OperationWriteTransactionCommit
@@ -60,7 +61,7 @@ const (
 var operationNames = [...]string{
 	"unknown", "hello", "attach", "resume", "activate", "abort_attach", "keep_alive", "reauthorize", "detach", "cancel",
 	"terminal_delivery_receipt", "next_visibility", "ack_visibility", "apply_routes", "lookup", "getattr", "setattr", "create",
-	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "write_transaction_begin",
+	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "one_shot_write", "write_transaction_begin",
 	"write_transaction_data", "write_transaction_commit", "write_transaction_abort", "fallocate", "copy_file_range", "tmpfile",
 	"fsync", "readdir", "reclaim", "flush", "getxattr", "setxattr", "listxattr", "removexattr", "statfs", "syncfs",
 	"getlock", "setlock",

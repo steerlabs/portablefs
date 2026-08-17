@@ -68,6 +68,7 @@ const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
 const sessionReauthorizationFeature = "session-reauthorization-v1"
 const mountEnrollmentReauthorizationFeature = "mount-enrollment-reauthorization-v1"
 const strictWriteTransactionFeature = "transactional-shared-write-v1"
+const oneShotWriteFeature = "one-shot-write-v1"
 
 // strictLinuxMutationSuiteFeature proves the authority implements every
 // operation the indivisible patched-kernel profile can issue beyond the write
@@ -104,8 +105,8 @@ const locklessNamespaceRepairFeature = "lockless-namespace-repair-v1"
 const RequiredWriteTransactionBytes uint64 = 0x7ffff000
 
 var (
-	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1", "authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1", "strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1", "exact-resource-acquisition", strictWriteTransactionFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
-	requiredAttachFeatures       = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier", "exact-resource-acquisition", strictWriteTransactionFeature}
+	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1", "authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1", "strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1", "exact-resource-acquisition", strictWriteTransactionFeature, oneShotWriteFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
+	requiredAttachFeatures       = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier", "exact-resource-acquisition", strictWriteTransactionFeature, oneShotWriteFeature}
 	requiredStrictAttachFeatures = []string{"strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1"}
 )
 
@@ -178,6 +179,8 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 		// after a grant is downgraded so cleanup can never be held hostage by
 		// current write authorization.
 		return body.WriteTransaction.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT
+	case *authoritypb.Request_OneShotWrite:
+		return true
 	default:
 		return false
 	}
@@ -190,6 +193,7 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 func requestIsVisibleMutation(req *authoritypb.Request) bool {
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_SetAttr,
+		*authoritypb.Request_OneShotWrite,
 		*authoritypb.Request_Fallocate,
 		*authoritypb.Request_CopyFileRange,
 		*authoritypb.Request_Create,
@@ -367,6 +371,10 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 // versions. A replay with different content is therefore rejected without
 // making every client hash a large payload before it can send it.
 func canonicalFingerprint(runtime *volumeserver.Authority, req *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
+	if body := req.GetOneShotWrite(); body != nil {
+		digest := sha256.Sum256(body.GetData())
+		return canonicalFingerprintWithWriteDataDigest(runtime, req, digest)
+	}
 	return canonicalFingerprintWithOptions(runtime, req, canonicalWriteOptions{})
 }
 
@@ -593,7 +601,13 @@ func canonicalWriteField(writer io.Writer, field protoreflect.FieldDescriptor, v
 }
 
 func isCanonicalWriteDataField(field protoreflect.FieldDescriptor) bool {
-	return field.FullName() == "portablefs.authority.v1.WriteTransactionRequest.data"
+	switch field.FullName() {
+	case "portablefs.authority.v1.WriteTransactionRequest.data",
+		"portablefs.authority.v1.OneShotWriteRequest.data":
+		return true
+	default:
+		return false
+	}
 }
 
 // canonicalBytes encodes a message as protobuf with fields emitted in strictly

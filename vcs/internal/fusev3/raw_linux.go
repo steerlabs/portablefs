@@ -111,6 +111,7 @@ type replyPublication struct {
 	data          []replyDataPublication
 	source        *sourcePublicationLease
 	writeKernelTx uint64
+	writeHandle   *handleRecord
 	// responseConsumptions prevent authority transport EOF from exposing the
 	// session terminal edge until every authority response contributing to this
 	// kernel result is either physically published through PFS_PUBLISH or
@@ -138,7 +139,7 @@ type replyPublication struct {
 
 func (p *replyPublication) empty() bool {
 	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
-		p.writeKernelTx == 0 && len(p.responseConsumptions) == 0 && !p.needsPostVFS
+		p.writeKernelTx == 0 && p.writeHandle == nil && len(p.responseConsumptions) == 0 && !p.needsPostVFS
 }
 
 func (p *replyPublication) consumeAuthorityResponse() {
@@ -913,6 +914,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		delete(r.publishAcks, unique)
 		if publication.publishUnique != unique || r.replyPublications[publication.requestUnique] != publication {
 			r.mu.Unlock()
+			r.finishOneShotWritePublication(publication)
 			if publication.source != nil {
 				publication.source.revoke()
 			}
@@ -924,6 +926,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		r.settleReplyPublicationLocked(publication, status.Ok())
 		r.mu.Unlock()
 		if !status.Ok() {
+			r.finishOneShotWritePublication(publication)
 			if publication.source != nil {
 				publication.source.revoke()
 			}
@@ -960,6 +963,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		}
 		r.settleReplyPublicationLocked(publication, false)
 		r.mu.Unlock()
+		r.finishOneShotWritePublication(publication)
 		if publication.source != nil {
 			publication.source.revoke()
 		}
@@ -984,7 +988,11 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 }
 
 func (r *rawFileSystem) finishWriteTransactionPublication(publication *replyPublication, unique uint64) {
-	if publication == nil || publication.writeKernelTx == 0 {
+	if publication == nil {
+		return
+	}
+	r.finishOneShotWritePublication(publication)
+	if publication.writeKernelTx == 0 {
 		return
 	}
 	r.writeMu.Lock()
@@ -1000,6 +1008,16 @@ func (r *rawFileSystem) finishWriteTransactionPublication(publication *replyPubl
 	delete(r.writeTx, publication.writeKernelTx)
 	r.writeMu.Unlock()
 	r.releaseHandleOperation(tx.handleRecord)
+}
+
+func (r *rawFileSystem) finishOneShotWritePublication(publication *replyPublication) {
+	if publication == nil {
+		return
+	}
+	if publication.writeHandle != nil {
+		r.releaseHandleOperation(publication.writeHandle)
+		publication.writeHandle = nil
+	}
 }
 
 func (r *rawFileSystem) Init(server *fuse.Server) {

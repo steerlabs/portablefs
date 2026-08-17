@@ -1244,6 +1244,8 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			return h.commitWriteTransaction(ctx, req, cred, body.WriteTransaction)
 		}
 		return h.handleWriteTransaction(ctx, req, cred, body.WriteTransaction)
+	case *authoritypb.Request_OneShotWrite:
+		return h.handleOneShotWrite(ctx, req, cred, body.OneShotWrite)
 	case *authoritypb.Request_Fallocate:
 		return h.handleFallocate(ctx, req, cred, body.Fallocate)
 	case *authoritypb.Request_CopyFileRange:
@@ -2052,6 +2054,12 @@ func (h *VolumeHandler) mutateVisibleSequence(
 		}
 	}()
 	return h.mutateOperation(ctx, req, cred, func(id volumeserver.MutationID) *authoritypb.Response {
+		definiteRejection := func(err error) *authoritypb.Response {
+			if req.GetOneShotWrite() != nil {
+				return oneShotWriteRejection(err, false)
+			}
+			return h.errorResponse(0, err, false)
+		}
 		writeCommit := req.GetWriteTransaction()
 		if writeCommit != nil {
 			terminal, found, err := h.rejectedWriteTransactionTerminal(req, cred.ID, writeCommit)
@@ -2064,14 +2072,14 @@ func (h *VolumeHandler) mutateVisibleSequence(
 		}
 		declaredGate, err := decodeSourcePublicationGate(req)
 		if err != nil || declaredGate == nil {
-			return h.errorResponse(0, syscall.EINVAL, false)
+			return definiteRejection(syscall.EINVAL)
 		}
 		expectedGate, err := h.deriveSourcePublicationGate(req, cred.ID)
 		if err != nil {
-			return h.errorResponse(0, err, false)
+			return definiteRejection(err)
 		}
 		if !sourcePublicationGatesEqual(declaredGate, &expectedGate) {
-			return h.errorResponse(0, syscall.EINVAL, false)
+			return definiteRejection(syscall.EINVAL)
 		}
 		if h.Visibility == nil {
 			if writeCommit != nil {
@@ -2086,7 +2094,7 @@ func (h *VolumeHandler) mutateVisibleSequence(
 						return rejected
 					}
 				}
-				return h.errorResponse(0, err, false)
+				return definiteRejection(err)
 			}
 			resp, _ := apply(1)
 			return resp
@@ -2148,6 +2156,11 @@ func (h *VolumeHandler) mutateVisibleSequence(
 			}
 			var barrier *volumeserver.VisibilityBarrierError
 			uncertain := errors.As(err, &barrier) && barrier.Applied
+			if req.GetOneShotWrite() != nil && uncertain && markOneShotWritePostApplyFailure(resp, err) {
+				h.deferStorageFailure(resp, err)
+				h.deferCoherenceFailure(resp, err)
+				return resp
+			}
 			if body := req.GetWriteTransaction(); body != nil && body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
 				if uncertain && markWriteTransactionPostApplyFailure(resp, err) {
 					h.deferStorageFailure(resp, err)
@@ -2176,6 +2189,9 @@ func (h *VolumeHandler) mutateVisibleSequence(
 					"portablefs-authority: visible mutation applied but cache completion failed source=%x slot=%d sequence=%d frontend_operation_id=%d: %v",
 					cred.ID, id.Slot, id.Sequence, id.FrontendOperationID, err,
 				)
+			}
+			if req.GetOneShotWrite() != nil && !errors.Is(err, volumeserver.ErrVisibilityRetry) {
+				return oneShotWriteRejection(err, false)
 			}
 			return h.errorResponse(0, err, uncertain)
 		}
@@ -2244,6 +2260,9 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 			body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT &&
 			errors.Is(err, volumeserver.ErrAdmission) {
 			return writeTransactionResponseWithEnvelope(h, req.GetRequestId(), h.rejectUnadmittedWriteTransaction(req, cred.ID, body))
+		}
+		if req.GetOneShotWrite() != nil && errors.Is(err, volumeserver.ErrAdmission) {
+			return writeTransactionResponseWithEnvelope(h, req.GetRequestId(), oneShotWriteRejection(syscall.ENOMEM, false))
 		}
 		// Nothing was recorded for this identity, so the response deliberately
 		// carries no MutationState and the peer's slot stays where it is.

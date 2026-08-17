@@ -12,7 +12,8 @@ whole strict kernel publication boundary:
   page cache is withdrawn by ordered DATA publication under
   `mapping->invalidate_lock`, plus the whole-inode withdrawal a revoking mount
   uses to stop serving retained pages;
-- transactional positioned and effective-append writes;
+- one-request positioned and effective-append writes at or below `max_write`,
+  with the staged transaction ladder retained only above that boundary;
 - a generic post-VFS publication ACK for marked replies;
 - ordered exact-size/full-data invalidation notifications;
 - private full-mode XFS fallocate and SHARED copy-file-range requests;
@@ -70,8 +71,11 @@ PFS_STRICT_STACK_TEST_DIR=/explicit/disposable/strict/path \
 
 ## Qualification status
 
-The exact protocol-5 Linux candidate is qualified on the pinned arm64
-`6.12.100-pfs-strict` diagnostic kernel.  The matching userspace passed the
+The pre-one-shot protocol-5 Linux candidate was qualified on the pinned arm64
+`6.12.100-pfs-strict` diagnostic kernel. The one-shot revision still requires
+the next pinned kernel rebuild and live integration run; its current evidence is
+the dual-architecture object build, source/state suites, and userspace tests.
+The previously matching userspace passed the
 service-identity privileged suite, real two-mount coherence and syscall matrix,
 root-only stacking/export/loop boundaries, direct-XFS oracle, KASAN/lockdep
 post-run scan, full Go normal/race/vet suites, and the native Swift release

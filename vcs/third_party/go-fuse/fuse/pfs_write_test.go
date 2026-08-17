@@ -101,17 +101,18 @@ func TestPFSWriteABIConstants(t *testing.T) {
 	if PFS_WRITE_OPCODE != 4097 || PFS_PUBLISH_OPCODE != 4098 || PFS_FALLOCATE_OPCODE != 4099 || PFS_COPY_FILE_RANGE_OPCODE != 4100 || PFS_UNIQUE_PUBLISH != uint64(1)<<62 ||
 		FOPEN_PFS_SHARED != 1<<8 || FOPEN_PFS_LOCAL != 1<<9 || FUSE_ATTR_PFS_SHARED != 1<<2 ||
 		FUSE_ATTR_PFS_LOCAL != 1<<3 || CAP_PFS_STRICT_COHERENCE != uint64(1)<<63 || NOTIFY_PFS_SIZE != -10 || PFS_PUBLISH_ACK != 1 ||
-		CAP_PFS_CACHED_DATA != uint64(1)<<62 {
+		CAP_PFS_CACHED_DATA != uint64(1)<<62 || CAP_PFS_WRITE_ONESHOT != uint64(1)<<61 {
 		t.Fatalf("private ABI constants changed")
 	}
-	// The two halves of the private profile must be distinct bits: the strict
-	// kernel refuses an INIT that selects one without the other, which is what
+	// The three revision bits of the private profile must be distinct: the strict
+	// kernel refuses an INIT that selects an incomplete set, which is what
 	// makes a kernel/daemon version mismatch a failed mount instead of an
 	// -EPROTO at first open.
-	if CAP_PFS_STRICT_COHERENCE&CAP_PFS_CACHED_DATA != 0 {
+	if CAP_PFS_STRICT_COHERENCE&CAP_PFS_CACHED_DATA != 0 ||
+		CAP_PFS_STRICT_COHERENCE&CAP_PFS_WRITE_ONESHOT != 0 || CAP_PFS_CACHED_DATA&CAP_PFS_WRITE_ONESHOT != 0 {
 		t.Fatalf("private profile capability bits collide")
 	}
-	wantPhases := [...]uint32{PFS_WRITE_BEGIN, PFS_WRITE_DATA, PFS_WRITE_COMMIT, PFS_WRITE_ABORT}
+	wantPhases := [...]uint32{PFS_WRITE_BEGIN, PFS_WRITE_DATA, PFS_WRITE_COMMIT, PFS_WRITE_ABORT, PFS_WRITE_ONE_SHOT}
 	for index, phase := range wantPhases {
 		if phase != uint32(index+1) {
 			t.Fatalf("phase %d = %d", index+1, phase)

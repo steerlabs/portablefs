@@ -172,6 +172,7 @@ verify_patched_tree() {
 
   grep -Eq '^#define FUSE_PFS_STRICT_COHERENCE[[:space:]]+\(1ULL << 63\)$' "$abi_header"
   grep -Eq '^#define FUSE_PFS_CACHED_DATA[[:space:]]+\(1ULL << 62\)$' "$abi_header"
+  grep -Eq '^#define FUSE_PFS_WRITE_ONESHOT[[:space:]]+\(1ULL << 61\)$' "$abi_header"
   grep -Eq '^#define FOPEN_PFS_SHARED[[:space:]]+\(1 << 8\)$' "$abi_header"
   grep -Eq '^#define FOPEN_PFS_LOCAL[[:space:]]+\(1 << 9\)$' "$abi_header"
   grep -Eq '^[[:space:]]*FUSE_PFS_WRITE[[:space:]]*=[[:space:]]*4097,$' "$abi_header"

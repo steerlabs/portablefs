@@ -125,6 +125,53 @@ func TestFrameCarriesWriteTransactionDataOutsideProtobuf(t *testing.T) {
 	}
 }
 
+func TestFrameCarriesOneShotWriteDataOutsideProtobufAndRetainsIt(t *testing.T) {
+	data := bytes.Repeat([]byte{0x5A}, 64<<10)
+	want := &authoritypb.Request{
+		RequestId: 9,
+		Body: &authoritypb.Request_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteRequest{
+			Handle: bytes.Repeat([]byte{0x41}, 16), Size: uint32(len(data)), Data: data,
+		}},
+	}
+	var frame bytes.Buffer
+	if err := writeFrame(&frame, 128<<10, want); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(want.GetOneShotWrite().GetData(), data) {
+		t.Fatal("writeFrame did not restore the caller-owned one-shot payload")
+	}
+	metadataSize := binary.BigEndian.Uint32(frame.Bytes()[:4])
+	bulkSize := binary.BigEndian.Uint32(frame.Bytes()[4:8])
+	if bulkSize != uint32(len(data)) {
+		t.Fatalf("one-shot bulk size = %d, want %d", bulkSize, len(data))
+	}
+	var metadata authoritypb.Request
+	if err := proto.Unmarshal(frame.Bytes()[frameHeaderBytes:frameHeaderBytes+int(metadataSize)], &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if len(metadata.GetOneShotWrite().GetData()) != 0 {
+		t.Fatal("one-shot data was duplicated inside protobuf metadata")
+	}
+
+	var got authoritypb.Request
+	release, err := readFrameRetained(bytes.NewReader(frame.Bytes()), 128<<10, nil, 0, &got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !proto.Equal(want, &got) {
+		release()
+		t.Fatalf("one-shot retained round trip differs: got %v", &got)
+	}
+	if &got.GetOneShotWrite().GetData()[0] == &data[0] {
+		release()
+		t.Fatal("decoded one-shot payload aliases the caller's original slice")
+	}
+	release()
+	if got.GetOneShotWrite().GetData() != nil {
+		t.Fatal("released one-shot payload remains reachable from its carrier")
+	}
+}
+
 func TestWriteFramePartialPrefixAndBulkFailuresPreserveExactReplayBody(t *testing.T) {
 	data := bytes.Repeat([]byte{0x6D}, 4096)
 	request := &authoritypb.Request{

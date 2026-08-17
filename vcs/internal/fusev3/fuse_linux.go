@@ -545,7 +545,7 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 		// two independently ordered authority mutations and an avoidable window in
 		// which the truncate applied but the open failed. With it the authority's
 		// OPEN mutation and its exact source gate are the single operation.
-		ExtraCapabilities:    fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 | fuse.CAP_PFS_STRICT_COHERENCE | fuse.CAP_PFS_CACHED_DATA,
+		ExtraCapabilities:    fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 | fuse.CAP_PFS_STRICT_COHERENCE | fuse.CAP_PFS_CACHED_DATA | fuse.CAP_PFS_WRITE_ONESHOT,
 		DisabledCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP | fuse.CAP_PASSTHROUGH | fuse.CAP_NO_OPEN_SUPPORT | fuse.CAP_NO_OPENDIR_SUPPORT | fuse.CAP_AUTO_INVAL_DATA,
 		Options:              []string{"default_permissions"},
 	}
@@ -579,7 +579,8 @@ func verifyMountDecisions(options *fuse.MountOptions) error {
 		return errors.New("fusev3: HANDLE_KILLPRIV_V2 must be requested so every transactional write has exact privilege-removal intent")
 	}
 	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 ||
-		options.ExtraCapabilities&fuse.CAP_PFS_CACHED_DATA == 0 {
+		options.ExtraCapabilities&fuse.CAP_PFS_CACHED_DATA == 0 ||
+		options.ExtraCapabilities&fuse.CAP_PFS_WRITE_ONESHOT == 0 {
 		return errors.New("fusev3: transactional shared writes, classified inodes, publication receipts, exact-size notify, and cacheable shared data must be requested as one kernel contract")
 	}
 	if options.ExtraCapabilities&fuse.CAP_HAS_RESEND != 0 {
@@ -609,13 +610,16 @@ func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 	if offered&fuse.CAP_PFS_STRICT_COHERENCE == 0 {
 		return fmt.Errorf("fusev3: kernel does not support the PortableFS strict-coherence contract (INIT flags %#x)", offered)
 	}
-	// The two private bits are one profile version. A kernel that offers only
-	// the older half would accept this mount and then reject the very first
+	// The private bits are one profile revision. A kernel that offers only the
+	// older cached-data subset would accept this mount and then reject the very first
 	// regular OPEN with -EPROTO, because the exact allowlisted flag pair it
 	// implements is the retired direct-I/O one. Refusing here makes the version
 	// mismatch a failed mount instead of an aborted connection under load.
 	if offered&fuse.CAP_PFS_CACHED_DATA == 0 {
 		return fmt.Errorf("fusev3: kernel implements an older revision of the strict-coherence contract without cacheable shared data (INIT flags %#x); kernel and userspace ship together and there is no compatible open flag pair", offered)
+	}
+	if offered&fuse.CAP_PFS_WRITE_ONESHOT == 0 {
+		return fmt.Errorf("fusev3: kernel implements an older revision of the strict-coherence contract without one-shot writes (INIT flags %#x); kernel and userspace ship together", offered)
 	}
 	if offered&fuse.CAP_EXPLICIT_INVAL_DATA == 0 {
 		return fmt.Errorf("fusev3: kernel cannot give this mount explicit data-cache control (INIT flags %#x); retained pages would be withdrawn by an mtime heuristic instead of by the ordered DATA repair", offered)
@@ -1226,6 +1230,8 @@ func requestRequiresSourcePublication(request *authoritypb.Request) bool {
 		*authoritypb.Request_RemoveXattr,
 		*authoritypb.Request_Fallocate,
 		*authoritypb.Request_CopyFileRange:
+		return true
+	case *authoritypb.Request_OneShotWrite:
 		return true
 	case *authoritypb.Request_WriteTransaction:
 		return body.WriteTransaction.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT

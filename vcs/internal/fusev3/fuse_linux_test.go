@@ -29,6 +29,8 @@ type fakeRPC struct {
 	mu sync.Mutex
 
 	writeTransactions []*authoritypb.WriteTransactionRequest
+	oneShotWrites     []*authoritypb.OneShotWriteRequest
+	oneShotRequests   []*authoritypb.Request
 	setattrs          []*authoritypb.SetAttrRequest
 	flushes           []*authoritypb.FlushRequest
 	fsyncs            []*authoritypb.FsyncRequest
@@ -376,6 +378,22 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 			response.PostAttr = &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(reply.GetPostSize())}
 		}
 		return response, nil
+	case request.GetOneShotWrite() != nil:
+		f.oneShotRequests = append(f.oneShotRequests, proto.Clone(request).(*authoritypb.Request))
+		writeRequest := proto.Clone(request.GetOneShotWrite()).(*authoritypb.OneShotWriteRequest)
+		f.oneShotWrites = append(f.oneShotWrites, writeRequest)
+		assigned := writeRequest.GetPosition()
+		if writeRequest.GetFlags()&uint32(syscall.O_APPEND) != 0 {
+			assigned = 100
+		}
+		postSize := assigned + uint64(writeRequest.GetSize())
+		return &authoritypb.Response{
+			PostAttr: &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)},
+			Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
+				CommittedSize: uint64(writeRequest.GetSize()), AssignedOffset: assigned,
+				PostSize: postSize, VisibilitySequence: 17, Flags: fuse.PFS_WRITE_OUT_COMMITTED,
+			}},
+		}, nil
 	case request.GetSetAttr() != nil:
 		f.setattrs = append(f.setattrs, request.GetSetAttr())
 		return &authoritypb.Response{PostAttr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Mode: 0o600}}, nil
@@ -656,8 +674,9 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 		t.Fatal("atomic open-truncate must be explicitly requested")
 	}
 	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 ||
-		options.ExtraCapabilities&fuse.CAP_PFS_CACHED_DATA == 0 {
-		t.Fatal("both halves of the indivisible strict-coherence capability must be explicitly requested")
+		options.ExtraCapabilities&fuse.CAP_PFS_CACHED_DATA == 0 ||
+		options.ExtraCapabilities&fuse.CAP_PFS_WRITE_ONESHOT == 0 {
+		t.Fatal("every bit of the indivisible strict-coherence revision must be explicitly requested")
 	}
 	if options.DisabledCapabilities&fuse.CAP_AUTO_INVAL_DATA == 0 || !options.ExplicitDataCacheControl {
 		t.Fatal("a retained page cache must be withdrawn by this mount's own repair, never by an mtime heuristic")
@@ -713,6 +732,11 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 		t.Fatal("a mount that requests only half the private profile must be refused")
 	}
 	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
+	tampered.ExtraCapabilities &^= fuse.CAP_PFS_WRITE_ONESHOT
+	if err := verifyMountDecisions(tampered); err == nil {
+		t.Fatal("a mount that omits the one-shot write revision must be refused")
+	}
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.ExplicitDataCacheControl = false
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a mount whose retained pages could be dropped by an mtime heuristic must be refused")
@@ -756,7 +780,7 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 		return in
 	}
 	required := uint64(fuse.CAP_POSIX_LOCKS | fuse.CAP_FLOCK_LOCKS | fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 |
-		fuse.CAP_PFS_STRICT_COHERENCE | fuse.CAP_PFS_CACHED_DATA | fuse.CAP_EXPLICIT_INVAL_DATA)
+		fuse.CAP_PFS_STRICT_COHERENCE | fuse.CAP_PFS_CACHED_DATA | fuse.CAP_PFS_WRITE_ONESHOT | fuse.CAP_EXPLICIT_INVAL_DATA)
 	if err := verifyKernelGuarantees(notifying(settings(required)), 64*1024); err != nil {
 		t.Fatalf("a lock-forwarding kernel was refused: %v", err)
 	}
@@ -779,12 +803,15 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_STRICT_COHERENCE)), 64*1024); err == nil {
 		t.Fatal("a kernel without the indivisible PortableFS strict-coherence contract must be refused")
 	}
-	// The two private bits are one profile version. A kernel offering only the
-	// older half implements the retired direct-I/O open pair and would reject
+	// The private bits are one profile revision. A kernel offering only the
+	// older cached-data subset implements the retired direct-I/O open pair and would reject
 	// this daemon's very first regular OPEN with -EPROTO, so the mismatch has
 	// to be a failed mount rather than an aborted connection under load.
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_CACHED_DATA)), 64*1024); err == nil {
 		t.Fatal("a kernel implementing only the pre-cached-data revision of the contract must be refused")
+	}
+	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_WRITE_ONESHOT)), 64*1024); err == nil {
+		t.Fatal("a kernel implementing only the pre-one-shot revision of the contract must be refused")
 	}
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_EXPLICIT_INVAL_DATA)), 64*1024); err == nil {
 		t.Fatal("a kernel that cannot grant explicit data-cache control must be refused; retained pages would be dropped by an mtime heuristic")

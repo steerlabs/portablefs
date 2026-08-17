@@ -341,6 +341,10 @@ const (
 	// INIT rather than disagree about the one exact open flag pair; selecting
 	// either bit without the other is refused by the strict kernel.
 	CAP_PFS_CACHED_DATA = uint64(1) << 62
+	// CAP_PFS_WRITE_ONESHOT is the third revision bit of the indivisible
+	// PortableFS profile. It adds the single-fragment commit shape; peers which
+	// do not advertise the complete three-bit revision fail INIT.
+	CAP_PFS_WRITE_ONESHOT = uint64(1) << 61
 )
 
 type InitIn struct {
@@ -957,10 +961,11 @@ type PFSPublishOut struct {
 }
 
 const (
-	PFS_WRITE_BEGIN  = uint32(1)
-	PFS_WRITE_DATA   = uint32(2)
-	PFS_WRITE_COMMIT = uint32(3)
-	PFS_WRITE_ABORT  = uint32(4)
+	PFS_WRITE_BEGIN    = uint32(1)
+	PFS_WRITE_DATA     = uint32(2)
+	PFS_WRITE_COMMIT   = uint32(3)
+	PFS_WRITE_ABORT    = uint32(4)
+	PFS_WRITE_ONE_SHOT = uint32(5)
 
 	PFS_WRITE_OUT_BEGUN     = uint32(1 << 0)
 	PFS_WRITE_OUT_STAGED    = uint32(1 << 1)

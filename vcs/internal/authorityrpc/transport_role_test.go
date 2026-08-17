@@ -20,7 +20,8 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_Link{}}, {Body: &authoritypb.Request_Symlink{}},
 		{Body: &authoritypb.Request_Readlink{}}, {Body: &authoritypb.Request_Open{}},
 		{Body: &authoritypb.Request_Close{}}, {Body: &authoritypb.Request_Read{}},
-		{Body: &authoritypb.Request_WriteTransaction{}}, {Body: &authoritypb.Request_Fallocate{}},
+		{Body: &authoritypb.Request_WriteTransaction{}}, {Body: &authoritypb.Request_OneShotWrite{}},
+		{Body: &authoritypb.Request_Fallocate{}},
 		{Body: &authoritypb.Request_CopyFileRange{}}, {Body: &authoritypb.Request_Tmpfile{}}, {Body: &authoritypb.Request_Fsync{}},
 		{Body: &authoritypb.Request_ReadDir{}}, {Body: &authoritypb.Request_Reclaim{}},
 		{Body: &authoritypb.Request_Flush{}}, {Body: &authoritypb.Request_GetXattr{}},
@@ -56,6 +57,7 @@ func TestTransportRoleAllowlistIsStrict(t *testing.T) {
 		control bool
 	}{
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_OneShotWrite{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{}}, control: true},

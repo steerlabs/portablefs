@@ -248,23 +248,30 @@ func (c writeTransactionCleanup) finish() {
 }
 
 func writeTransactionMetadataFromRequest(request *authoritypb.WriteTransactionRequest) (writeTransactionMetadata, error) {
+	if request == nil || request.GetTransactionId() == 0 {
+		return writeTransactionMetadata{}, syscall.EINVAL
+	}
+	return writeMetadataFromGeometry(request.GetHandle(), request.GetRequestedSize(), request.GetPosition(),
+		request.GetRlimitFsize(), request.GetFileMaxSize(), request.GetLockOwner(), request.GetWriteFlags(), request.GetFlags())
+}
+
+func writeMetadataFromGeometry(handle []byte, requestedSize, position, rlimitSize, fileMaxSize, lockOwner uint64, writeFlags, flags uint32) (writeTransactionMetadata, error) {
 	var metadata writeTransactionMetadata
-	if request == nil || request.GetTransactionId() == 0 || len(request.GetHandle()) != len(metadata.handle) ||
-		request.GetRequestedSize() == 0 || request.GetRequestedSize() > math.MaxInt64 ||
-		request.GetFileMaxSize() == 0 || request.GetFileMaxSize() > math.MaxInt64 {
+	if len(handle) != len(metadata.handle) || requestedSize == 0 || requestedSize > math.MaxInt64 ||
+		fileMaxSize == 0 || fileMaxSize > math.MaxInt64 {
 		return metadata, syscall.EINVAL
 	}
-	copy(metadata.handle[:], request.GetHandle())
+	copy(metadata.handle[:], handle)
 	if metadata.handle == (xfsstore.Capability{}) {
 		return metadata, syscall.EINVAL
 	}
-	metadata.requestedSize = request.GetRequestedSize()
-	metadata.position = request.GetPosition()
-	metadata.rlimitSize = request.GetRlimitFsize()
-	metadata.fileMaxSize = request.GetFileMaxSize()
-	metadata.lockOwner = request.GetLockOwner()
-	metadata.writeFlags = request.GetWriteFlags()
-	metadata.flags = request.GetFlags()
+	metadata.requestedSize = requestedSize
+	metadata.position = position
+	metadata.rlimitSize = rlimitSize
+	metadata.fileMaxSize = fileMaxSize
+	metadata.lockOwner = lockOwner
+	metadata.writeFlags = writeFlags
+	metadata.flags = flags
 
 	allowedWriteFlags := uint32(writeTransactionLockOwner | writeTransactionKillSUIDGID)
 	if metadata.writeFlags&^allowedWriteFlags != 0 || metadata.writeFlags&writeTransactionLockOwner == 0 && metadata.lockOwner != 0 {

@@ -537,6 +537,9 @@ func visibilityChanged(resp *authoritypb.Response) bool {
 		// not change. Only COMMITTED opens a DATA/ATTR COMPLETE phase.
 		return transaction.GetFlags()&writeTransactionReplyCommitted != 0
 	}
+	if write := resp.GetOneShotWrite(); write != nil {
+		return write.GetFlags()&writeTransactionReplyCommitted != 0
+	}
 	if fallocate := resp.GetFallocate(); fallocate != nil {
 		return fallocate.GetFlags()&rangeReplyApplied != 0
 	}

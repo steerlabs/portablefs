@@ -1,4 +1,4 @@
-From 4ae5946954df88d0061be18a27f55d63d4ec113f Mon Sep 17 00:00:00 2001
+From 6471e19ad993ca867d83004d4f707b2a5fdea1ca Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Thu, 13 Aug 2026 08:30:45 -0700
 Subject: [PATCH] fuse: add PortableFS strict-coherence profile
@@ -14,12 +14,12 @@ Subject: [PATCH] fuse: add PortableFS strict-coherence profile
  fs/cachefiles/namei.c                        |    7 +
  fs/coda/file.c                               |    7 +
  fs/erofs/super.c                             |    7 +
- fs/fuse/dev.c                                |  468 +++++++-
+ fs/fuse/dev.c                                |  470 ++++++-
  fs/fuse/dir.c                                |  360 +++++-
- fs/fuse/file.c                               | 1118 +++++++++++++++++-
+ fs/fuse/file.c                               | 1220 +++++++++++++++++-
  fs/fuse/fuse_i.h                             |   79 +-
  fs/fuse/fuse_trace.h                         |    4 +
- fs/fuse/inode.c                              |  328 ++++-
+ fs/fuse/inode.c                              |  332 ++++-
  fs/fuse/ioctl.c                              |   13 +-
  fs/fuse/readdir.c                            |    8 +-
  fs/fuse/xattr.c                              |   49 +-
@@ -31,13 +31,13 @@ Subject: [PATCH] fuse: add PortableFS strict-coherence profile
  fs/splice.c                                  |   12 +-
  include/linux/fs.h                           |    6 +
  include/linux/fs_reply_publish.h             |    2 +
- include/uapi/linux/fuse.h                    |  141 +++
+ include/uapi/linux/fuse.h                    |  144 +++
  io_uring/rw.c                                |   22 +-
  mm/swapfile.c                                |    4 +
- 30 files changed, 2580 insertions(+), 131 deletions(-)
+ 30 files changed, 2691 insertions(+), 131 deletions(-)
 
 diff --git a/drivers/block/loop.c b/drivers/block/loop.c
-index dd411719..97866507 100644
+index dd4117192..978665072 100644
 --- a/drivers/block/loop.c
 +++ b/drivers/block/loop.c
 @@ -508,6 +508,8 @@ static int loop_check_backing_file(struct file *file)
@@ -50,7 +50,7 @@ index dd411719..97866507 100644
  	if ((file->f_mode & FMODE_WRITE) && !file->f_op->write_iter)
  		return -EINVAL;
 diff --git a/drivers/md/md.c b/drivers/md/md.c
-index 1aff3e54..3f670529 100644
+index 1aff3e541..3f6705297 100644
 --- a/drivers/md/md.c
 +++ b/drivers/md/md.c
 @@ -7237,6 +7237,8 @@ static int set_bitmap_file(struct mddev *mddev, int fd)
@@ -63,7 +63,7 @@ index 1aff3e54..3f670529 100644
  		if (err) {
  			fput(f);
 diff --git a/drivers/mtd/nand/raw/nandsim.c b/drivers/mtd/nand/raw/nandsim.c
-index df48b7d0..d0520111 100644
+index df48b7d01..d05201110 100644
 --- a/drivers/mtd/nand/raw/nandsim.c
 +++ b/drivers/mtd/nand/raw/nandsim.c
 @@ -542,6 +542,10 @@ static int __init ns_alloc_device(struct nandsim *ns)
@@ -78,7 +78,7 @@ index df48b7d0..d0520111 100644
  			NS_ERR("alloc_device: cache file not readable\n");
  			err = -EINVAL;
 diff --git a/drivers/nvme/target/io-cmd-file.c b/drivers/nvme/target/io-cmd-file.c
-index 2d068439..25099b66 100644
+index 2d068439b..25099b66b 100644
 --- a/drivers/nvme/target/io-cmd-file.c
 +++ b/drivers/nvme/target/io-cmd-file.c
 @@ -46,6 +46,10 @@ int nvmet_file_ns_enable(struct nvmet_ns *ns)
@@ -93,7 +93,7 @@ index 2d068439..25099b66 100644
  	nvmet_file_ns_revalidate(ns);
  
 diff --git a/drivers/target/target_core_file.c b/drivers/target/target_core_file.c
-index 2d78ef74..bd2b51cb 100644
+index 2d78ef746..bd2b51cb4 100644
 --- a/drivers/target/target_core_file.c
 +++ b/drivers/target/target_core_file.c
 @@ -144,6 +144,10 @@ static int fd_configure_device(struct se_device *dev)
@@ -119,7 +119,7 @@ index 2d78ef74..bd2b51cb 100644
  
  	return 0;
 diff --git a/drivers/usb/gadget/function/storage_common.c b/drivers/usb/gadget/function/storage_common.c
-index 75831f2c..a5e60c82 100644
+index 75831f2c7..a5e60c82d 100644
 --- a/drivers/usb/gadget/function/storage_common.c
 +++ b/drivers/usb/gadget/function/storage_common.c
 @@ -201,6 +201,10 @@ int fsg_lun_open(struct fsg_lun *curlun, const char *filename)
@@ -134,7 +134,7 @@ index 75831f2c..a5e60c82 100644
  	if (!(filp->f_mode & FMODE_WRITE))
  		ro = 1;
 diff --git a/fs/aio.c b/fs/aio.c
-index 0f876757..f5be9431 100644
+index 0f8767575..f5be94319 100644
 --- a/fs/aio.c
 +++ b/fs/aio.c
 @@ -1635,8 +1635,8 @@ static int aio_write(struct kiocb *req, const struct iocb *iocb,
@@ -149,7 +149,7 @@ index 0f876757..f5be9431 100644
  		/* Strict PortableFS transactions are synchronous by contract. */
  		if (io_result == -EIOCBQUEUED &&
 diff --git a/fs/cachefiles/namei.c b/fs/cachefiles/namei.c
-index 2b3f9935..5631207a 100644
+index 2b3f9935d..5631207ae 100644
 --- a/fs/cachefiles/namei.c
 +++ b/fs/cachefiles/namei.c
 @@ -466,6 +466,11 @@ struct file *cachefiles_create_tmpfile(struct cachefiles_object *object)
@@ -174,7 +174,7 @@ index 2b3f9935..5631207a 100644
  	if (unlikely(!file->f_op->read_iter) ||
  	    unlikely(!file->f_op->write_iter)) {
 diff --git a/fs/coda/file.c b/fs/coda/file.c
-index 148856a5..8640fd30 100644
+index 148856a58..8640fd305 100644
 --- a/fs/coda/file.c
 +++ b/fs/coda/file.c
 @@ -244,6 +244,13 @@ int coda_open(struct inode *coda_inode, struct file *coda_file)
@@ -192,7 +192,7 @@ index 148856a5..8640fd30 100644
  	host_file->f_flags |= coda_file->f_flags & (O_APPEND | O_SYNC);
  
 diff --git a/fs/erofs/super.c b/fs/erofs/super.c
-index 1640ebc2..34676b1f 100644
+index 1640ebc26..34676b1f0 100644
 --- a/fs/erofs/super.c
 +++ b/fs/erofs/super.c
 @@ -200,6 +200,9 @@ static int erofs_init_device(struct erofs_buf *buf, struct super_block *sb,
@@ -217,7 +217,7 @@ index 1640ebc2..34676b1f 100644
  
  		if (S_ISREG(file_inode(sbi->dif0.file)->i_mode) &&
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index c3e72675..c629fe0c 100644
+index c3e726751..8f8ab7fc3 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
 @@ -49,6 +49,7 @@ static void fuse_request_init(struct fuse_mount *fm, struct fuse_req *req)
@@ -572,7 +572,7 @@ index c3e72675..c629fe0c 100644
  		return -EINVAL;
  
   restart:
-@@ -1481,6 +1665,90 @@ err:
+@@ -1481,6 +1665,90 @@ static int fuse_notify_poll(struct fuse_conn *fc, unsigned int size,
  	return err;
  }
  
@@ -871,7 +871,7 @@ index c3e72675..c629fe0c 100644
  
  	err = -EINVAL;
  	if (oh.error <= -512 || oh.error > 0)
-@@ -2021,6 +2409,23 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2021,6 +2409,25 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  		goto copy_finish;
  	}
  
@@ -884,8 +884,10 @@ index c3e72675..c629fe0c 100644
 +	     req->in.h.opcode == FUSE_PFS_PUBLISH ||
 +	     (req->in.h.opcode == FUSE_PFS_WRITE &&
 +	      req->args->in_args[0].value &&
-+	      ((const struct fuse_pfs_write_in *)
-+	       req->args->in_args[0].value)->phase != FUSE_PFS_WRITE_COMMIT))) {
++		     ((const struct fuse_pfs_write_in *)
++		       req->args->in_args[0].value)->phase != FUSE_PFS_WRITE_COMMIT &&
++		     ((const struct fuse_pfs_write_in *)
++		       req->args->in_args[0].value)->phase != FUSE_PFS_WRITE_ONE_SHOT))) {
 +		spin_unlock(&fpq->lock);
 +		fuse_abort_conn(fc);
 +		err = -EPROTO;
@@ -895,7 +897,7 @@ index c3e72675..c629fe0c 100644
  	/* Is it an interrupt reply ID? */
  	if (oh.unique & FUSE_INT_REQ_BIT) {
  		__fuse_get_request(req);
-@@ -2029,8 +2434,14 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2029,8 +2436,14 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  		err = 0;
  		if (nbytes != sizeof(struct fuse_out_header))
  			err = -EINVAL;
@@ -912,7 +914,7 @@ index c3e72675..c629fe0c 100644
  		else if (oh.error == -EAGAIN)
  			err = queue_interrupt(req);
  
-@@ -2042,6 +2453,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
+@@ -2042,6 +2455,7 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  	clear_bit(FR_SENT, &req->flags);
  	list_move(&req->list, &fpq->io);
  	req->out.h = oh;
@@ -920,7 +922,7 @@ index c3e72675..c629fe0c 100644
  	set_bit(FR_LOCKED, &req->flags);
  	spin_unlock(&fpq->lock);
  	cs->req = req;
-@@ -2073,6 +2485,18 @@ copy_finish:
+@@ -2073,6 +2487,18 @@ static ssize_t fuse_dev_do_write(struct fuse_dev *fud,
  	goto out;
  }
  
@@ -940,7 +942,7 @@ index c3e72675..c629fe0c 100644
  {
  	struct fuse_copy_state cs;
 diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
-index ce7324d0..f11b829c 100644
+index ce7324d0d..f11b829cc 100644
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
 @@ -228,36 +228,82 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
@@ -1566,7 +1568,7 @@ index ce7324d0..f11b829c 100644
  
  error:
  	if (is_truncate)
-@@ -2083,6 +2352,20 @@ error:
+@@ -2083,6 +2352,20 @@ int fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  	return err;
  }
  
@@ -1629,7 +1631,7 @@ index ce7324d0..f11b829c 100644
  
  	spin_lock_init(&fi->rdc.lock);
 diff --git a/fs/fuse/file.c b/fs/fuse/file.c
-index 1f71ef3e..dfc28b62 100644
+index 1f71ef3ea..229b26b65 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
 @@ -22,7 +22,7 @@
@@ -1952,7 +1954,7 @@ index 1f71ef3e..dfc28b62 100644
  	struct fuse_write_in *inarg = &ia->write.in;
  	ssize_t err;
  
-@@ -1742,6 +1889,468 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
+@@ -1742,6 +1889,570 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
  	return res;
  }
  
@@ -2189,9 +2191,10 @@ index 1f71ef3e..dfc28b62 100644
 +		fuse_abort_conn(ff->fm->fc);
 +}
 +
-+static void fuse_pfs_write_data_args(struct fuse_io_args *ia,
-+				     const struct fuse_pfs_write_in *frozen,
-+				     u64 fragment_offset, size_t size)
++static void fuse_pfs_write_payload_args(struct fuse_io_args *ia,
++					const struct fuse_pfs_write_in *frozen,
++					u64 fragment_offset, size_t size,
++					u32 phase)
 +{
 +	struct fuse_args *args = &ia->ap.args;
 +	struct fuse_pfs_write_out *out = &ia->pfs_write.out;
@@ -2199,7 +2202,7 @@ index 1f71ef3e..dfc28b62 100644
 +	ia->pfs_write.in = *frozen;
 +	ia->pfs_write.in.fragment_offset = fragment_offset;
 +	ia->pfs_write.in.size = size;
-+	ia->pfs_write.in.phase = FUSE_PFS_WRITE_DATA;
++	ia->pfs_write.in.phase = phase;
 +	memset(out, 0, sizeof(*out));
 +	args->opcode = FUSE_PFS_WRITE;
 +	args->nodeid = ia->ff->nodeid;
@@ -2210,20 +2213,175 @@ index 1f71ef3e..dfc28b62 100644
 +	args->out_numargs = 1;
 +	args->out_args[0].size = sizeof(*out);
 +	args->out_args[0].value = out;
++	if (phase == FUSE_PFS_WRITE_ONE_SHOT) {
++		args->force = true;
++		args->pfs_publish_policy = FUSE_PFS_PUBLISH_OPTIONAL;
++	}
 +}
 +
-+static int fuse_pfs_write_data_send(struct fuse_io_args *ia,
-+				    const struct fuse_pfs_write_in *frozen)
++static int fuse_pfs_write_payload_send(
++		struct fuse_io_args *ia, const struct fuse_pfs_write_in *frozen,
++		enum fuse_pfs_write_outcome *outcome,
++		struct fs_reply_publish_token **publish_token)
 +{
-+	enum fuse_pfs_write_outcome outcome;
++	struct fuse_args *args = &ia->ap.args;
++	u32 phase = ia->pfs_write.in.phase;
++	u32 expected = phase == FUSE_PFS_WRITE_ONE_SHOT ?
++		FUSE_PFS_WRITE_OUT_COMMITTED : FUSE_PFS_WRITE_OUT_STAGED;
 +	int err;
 +
-+	err = fuse_simple_request(ia->ff->fm, &ia->ap.args);
++	*outcome = FUSE_PFS_WRITE_OUTCOME_INVALID;
++	if (publish_token)
++		*publish_token = NULL;
++	err = fuse_simple_request(ia->ff->fm, args);
 +	if (err)
 +		return err;
-+	return fuse_pfs_validate_write_out(&ia->pfs_write.out, frozen->txid,
-+					   FUSE_PFS_WRITE_OUT_STAGED, false,
-+					   &outcome);
++	err = fuse_pfs_validate_write_out(&ia->pfs_write.out, frozen->txid,
++					  expected,
++					  phase == FUSE_PFS_WRITE_ONE_SHOT,
++					  outcome);
++	if (phase == FUSE_PFS_WRITE_ONE_SHOT) {
++		bool committed =
++			*outcome == FUSE_PFS_WRITE_OUTCOME_COMMITTED ||
++			*outcome == FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR;
++
++		if (fuse_pfs_require_publication(ia->ff->fm, args, committed)) {
++			*outcome = FUSE_PFS_WRITE_OUTCOME_INVALID;
++			return -ENOTCONN;
++		}
++		if (committed) {
++			if (WARN_ON_ONCE(!args->pfs_reply_token)) {
++				*outcome = FUSE_PFS_WRITE_OUTCOME_INVALID;
++				return -EPROTO;
++			}
++			if (publish_token)
++				*publish_token = args->pfs_reply_token;
++		}
++	}
++	return err;
++}
++
++static ssize_t fuse_pfs_finish_write(
++		struct kiocb *iocb, struct iov_iter *from, u64 advanced,
++		u64 position, u64 rlimit_fsize, u64 max_end, bool append, int err,
++		const struct fuse_pfs_write_out *out,
++		enum fuse_pfs_write_outcome outcome,
++		struct fs_reply_publish_token *publish_token)
++{
++	struct file *file = iocb->ki_filp;
++	struct inode *inode = file_inode(file);
++	struct fuse_file *ff = file->private_data;
++	struct fuse_conn *fc = ff->fm->fc;
++
++	if (err) {
++		iov_iter_revert(from, advanced);
++		if (outcome == FUSE_PFS_WRITE_OUTCOME_REJECTED_RLIMIT) {
++			if (!append || rlimit_fsize == RLIM_INFINITY) {
++				fuse_abort_conn(fc);
++				return -ENOTCONN;
++			}
++			send_sig(SIGXFSZ, current, 0);
++			return err;
++		}
++		if (outcome == FUSE_PFS_WRITE_OUTCOME_REJECTED)
++			return err;
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	if (outcome != FUSE_PFS_WRITE_OUTCOME_COMMITTED &&
++	    outcome != FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR) {
++		fuse_abort_conn(fc);
++		iov_iter_revert(from, advanced);
++		return -ENOTCONN;
++	}
++	if (!(out->flags & FUSE_PFS_WRITE_OUT_COMMITTED) ||
++	    out->committed_size > advanced || !out->sequence ||
++	    out->sequence > S64_MAX || out->post_size > inode->i_sb->s_maxbytes ||
++	    (!out->committed_size &&
++	     (outcome != FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR ||
++	      out->assigned_offset)) ||
++	    (out->committed_size &&
++	     ((!append && out->assigned_offset != position) ||
++	      out->assigned_offset > max_end ||
++	      out->committed_size > max_end - out->assigned_offset ||
++	      (append && out->post_size !=
++			 out->assigned_offset + out->committed_size) ||
++	      out->post_size < out->assigned_offset + out->committed_size))) {
++		fuse_abort_conn(fc);
++		iov_iter_revert(from, advanced);
++		return -ENOTCONN;
++	}
++	if (out->committed_size < advanced)
++		iov_iter_revert(from, advanced - out->committed_size);
++
++	/*
++	 * The mutation retained the source gate, so no peer update can overlap
++	 * this. Do not take i_rwsem here: another local mutation may hold it while
++	 * waiting to acquire the retained source gate.
++	 */
++	err = fuse_pfs_update_source_size(inode, out->post_size, out->sequence);
++	if (!err && out->committed_size)
++		iocb->ki_pos = out->assigned_offset + out->committed_size;
++	if (err) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	if (WARN_ON_ONCE(!publish_token)) {
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
++	publish_token->publish_on_operation_error = true;
++	if (out->committed_size) {
++		fs_reply_publish_scope_set_applied_bytes(out->committed_size);
++		iocb->ki_flags |= IOCB_PFS_TERMINAL_SHORT;
++		task_io_account_write(out->committed_size);
++	}
++	return out->error ?: out->committed_size;
++}
++
++static ssize_t fuse_pfs_write_one_shot(
++		struct kiocb *iocb, struct iov_iter *from,
++		const struct fuse_pfs_write_in *frozen, u64 position,
++		u64 rlimit_fsize, u64 max_end, bool append)
++{
++	struct fuse_file *ff = iocb->ki_filp->private_data;
++	struct fuse_conn *fc = ff->fm->fc;
++	struct fuse_io_priv io = FUSE_IO_PRIV_SYNC(iocb);
++	struct fuse_io_args *ia;
++	struct fs_reply_publish_token *publish_token = NULL;
++	enum fuse_pfs_write_outcome outcome;
++	unsigned int max_pages;
++	size_t nbytes = iov_iter_count(from);
++	ssize_t result;
++	int extract_err, err;
++
++	max_pages = iov_iter_npages(from, fc->max_pages);
++	ia = fuse_io_alloc(&io, max_pages);
++	if (!ia)
++		return -ENOMEM;
++	ia->ff = ff;
++	fuse_pfs_write_payload_args(ia, frozen, 0, nbytes,
++				    FUSE_PFS_WRITE_ONE_SHOT);
++	extract_err = fuse_get_user_pages(&ia->ap, from, &nbytes, 1,
++					  max_pages,
++					  fc->use_pages_for_kvec_io);
++	if (!nbytes) {
++		fuse_io_free(ia);
++		return extract_err ?: -EFAULT;
++	}
++	/* A faulted tail becomes the same single-request partial write Linux had. */
++	ia->pfs_write.in.requested_size = nbytes;
++	ia->pfs_write.in.size = nbytes;
++	ia->ap.args.in_args[1].size = nbytes;
++	err = fuse_pfs_write_payload_send(ia, frozen, &outcome,
++					  &publish_token);
++	fuse_release_user_pages(&ia->ap, err ? 0 : nbytes, false);
++	result = fuse_pfs_finish_write(iocb, from, nbytes, position,
++				       rlimit_fsize, max_end, append, err,
++				       &ia->pfs_write.out, outcome,
++				       publish_token);
++	fuse_io_free(ia);
++	return result;
 +}
 +
 +static ssize_t fuse_pfs_write_transaction(struct kiocb *iocb,
@@ -2273,6 +2431,12 @@ index 1f71ef3e..dfc28b62 100644
 +	if (!requested)
 +		return 0;
 +	max_end = min(rlimit_fsize, file_max_size);
++	if (requested <= fc->max_write) {
++		fuse_pfs_write_in_freeze(&frozen, iocb, 0, requested,
++					 position, rlimit_fsize, file_max_size);
++		return fuse_pfs_write_one_shot(iocb, from, &frozen, position,
++					       rlimit_fsize, max_end, append);
++	}
 +	txid = atomic64_inc_return(&fc->pfs_write_txid);
 +	if (unlikely(txid <= 0)) {
 +		fuse_abort_conn(fc);
@@ -2304,7 +2468,8 @@ index 1f71ef3e..dfc28b62 100644
 +		}
 +		ia->ff = ff;
 +		nbytes = min_t(size_t, iov_iter_count(from), fc->max_write);
-+		fuse_pfs_write_data_args(ia, &frozen, staged, nbytes);
++		fuse_pfs_write_payload_args(ia, &frozen, staged, nbytes,
++					    FUSE_PFS_WRITE_DATA);
 +		err = fuse_get_user_pages(&ia->ap, from, &nbytes, 1,
 +					  max_pages, fc->use_pages_for_kvec_io);
 +		advanced += nbytes;
@@ -2315,7 +2480,7 @@ index 1f71ef3e..dfc28b62 100644
 +		}
 +		ia->pfs_write.in.size = nbytes;
 +		ia->ap.args.in_args[1].size = nbytes;
-+		err = fuse_pfs_write_data_send(ia, &frozen);
++		err = fuse_pfs_write_payload_send(ia, &frozen, &outcome, NULL);
 +		fuse_release_user_pages(&ia->ap, err ? 0 : nbytes, false);
 +		fuse_io_free(ia);
 +		if (err)
@@ -2352,76 +2517,15 @@ index 1f71ef3e..dfc28b62 100644
 +	err = fuse_pfs_write_control(iocb, &frozen, FUSE_PFS_WRITE_COMMIT,
 +				     staged, true, &out, &outcome,
 +				     &publish_token);
-+	if (err) {
-+		iov_iter_revert(from, advanced);
-+		if (outcome == FUSE_PFS_WRITE_OUTCOME_REJECTED_RLIMIT) {
-+			if (!append || rlimit_fsize == RLIM_INFINITY) {
-+				fuse_abort_conn(fc);
-+				return -ENOTCONN;
-+			}
-+			send_sig(SIGXFSZ, current, 0);
-+			return err;
-+		}
-+		if (outcome == FUSE_PFS_WRITE_OUTCOME_REJECTED)
-+			return err;
-+		fuse_abort_conn(fc);
-+		return -ENOTCONN;
-+	}
-+	if (outcome != FUSE_PFS_WRITE_OUTCOME_COMMITTED &&
-+	    outcome != FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR) {
-+		fuse_abort_conn(fc);
-+		iov_iter_revert(from, advanced);
-+		return -ENOTCONN;
-+	}
-+	if (!(out.flags & FUSE_PFS_WRITE_OUT_COMMITTED) ||
-+	    out.committed_size > staged || !out.sequence ||
-+	    out.sequence > S64_MAX || out.post_size > inode->i_sb->s_maxbytes ||
-+	    (!out.committed_size &&
-+	     (outcome != FUSE_PFS_WRITE_OUTCOME_POSTAPPLY_ERROR ||
-+	      out.assigned_offset)) ||
-+	    (out.committed_size &&
-+	     ((!append && out.assigned_offset != position) ||
-+	      out.assigned_offset > max_end ||
-+	      out.committed_size > max_end - out.assigned_offset ||
-+	      (append && out.post_size !=
-+			 out.assigned_offset + out.committed_size) ||
-+	      out.post_size < out.assigned_offset + out.committed_size))) {
-+		fuse_abort_conn(fc);
-+		iov_iter_revert(from, advanced);
-+		return -ENOTCONN;
-+	}
-+	if (out.committed_size < advanced)
-+		iov_iter_revert(from, advanced - out.committed_size);
-+
-+	/*
-+	 * COMMIT retained the source gate, so no peer update can overlap this.
-+	 * Do not take i_rwsem here: another local mutation may hold it while
-+	 * waiting to acquire the retained source gate.
-+	 */
-+	err = fuse_pfs_update_source_size(inode, out.post_size, out.sequence);
-+	if (!err && out.committed_size)
-+		iocb->ki_pos = out.assigned_offset + out.committed_size;
-+	if (err) {
-+		fuse_abort_conn(fc);
-+		return -ENOTCONN;
-+	}
-+	if (WARN_ON_ONCE(!publish_token)) {
-+		fuse_abort_conn(fc);
-+		return -ENOTCONN;
-+	}
-+	publish_token->publish_on_operation_error = true;
-+	if (out.committed_size) {
-+		fs_reply_publish_scope_set_applied_bytes(out.committed_size);
-+		iocb->ki_flags |= IOCB_PFS_TERMINAL_SHORT;
-+		task_io_account_write(out.committed_size);
-+	}
-+	return out.error ?: out.committed_size;
++	return fuse_pfs_finish_write(iocb, from, advanced, position,
++				     rlimit_fsize, max_end, append, err, &out,
++				     outcome, publish_token);
 +}
 +
  static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
  {
  	struct file *file = iocb->ki_filp;
-@@ -1751,6 +2360,16 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+@@ -1751,6 +2462,16 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
  	if (fuse_is_bad(inode))
  		return -EIO;
  
@@ -2438,7 +2542,7 @@ index 1f71ef3e..dfc28b62 100644
  	if (FUSE_IS_DAX(inode))
  		return fuse_dax_read_iter(iocb, to);
  
-@@ -1768,9 +2387,28 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+@@ -1768,9 +2489,28 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
  	struct file *file = iocb->ki_filp;
  	struct fuse_file *ff = file->private_data;
  	struct inode *inode = file_inode(file);
@@ -2467,7 +2571,7 @@ index 1f71ef3e..dfc28b62 100644
  
  	if (FUSE_IS_DAX(inode))
  		return fuse_dax_write_iter(iocb, from);
-@@ -1790,6 +2428,16 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
+@@ -1790,6 +2530,16 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
  {
  	struct fuse_file *ff = in->private_data;
  
@@ -2484,7 +2588,7 @@ index 1f71ef3e..dfc28b62 100644
  	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
  	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
  		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
-@@ -2423,6 +3071,19 @@ static int fuse_writepages(struct address_space *mapping,
+@@ -2423,6 +3173,19 @@ static int fuse_writepages(struct address_space *mapping,
  	if (fuse_is_bad(inode))
  		goto out;
  
@@ -2504,7 +2608,7 @@ index 1f71ef3e..dfc28b62 100644
  	if (wbc->sync_mode == WB_SYNC_NONE &&
  	    fc->num_background >= fc->congestion_threshold)
  		return 0;
-@@ -2465,6 +3126,11 @@ static int fuse_write_begin(struct file *file, struct address_space *mapping,
+@@ -2465,6 +3228,11 @@ static int fuse_write_begin(struct file *file, struct address_space *mapping,
  	int err = -ENOMEM;
  
  	WARN_ON(!fc->writeback_cache);
@@ -2516,7 +2620,7 @@ index 1f71ef3e..dfc28b62 100644
  
  	folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
  			mapping_gfp_mask(mapping));
-@@ -2617,6 +3283,35 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
+@@ -2617,6 +3385,35 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
  	else if (fuse_inode_backing(get_fuse_inode(inode)))
  		return -ENODEV;
  
@@ -2552,7 +2656,7 @@ index 1f71ef3e..dfc28b62 100644
  	/*
  	 * FOPEN_DIRECT_IO handling is special compared to O_DIRECT,
  	 * as does not allow MAP_SHARED mmap without FUSE_DIRECT_IO_ALLOW_MMAP.
-@@ -2845,6 +3540,10 @@ static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
+@@ -2845,6 +3642,10 @@ static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
  	struct fuse_lseek_out outarg;
  	int err;
  
@@ -2563,7 +2667,7 @@ index 1f71ef3e..dfc28b62 100644
  	if (fm->fc->no_lseek)
  		goto fallback;
  
-@@ -2966,6 +3665,10 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait)
+@@ -2966,6 +3767,10 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait)
  	FUSE_ARGS(args);
  	int err;
  
@@ -2574,7 +2678,7 @@ index 1f71ef3e..dfc28b62 100644
  	if (fm->fc->no_poll)
  		return DEFAULT_POLLMASK;
  
-@@ -3150,6 +3853,220 @@ static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
+@@ -3150,6 +3955,220 @@ static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
  	return err;
  }
  
@@ -2795,7 +2899,7 @@ index 1f71ef3e..dfc28b62 100644
  static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  				loff_t length)
  {
-@@ -3169,10 +4086,12 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+@@ -3169,10 +4188,12 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  		(!(mode & FALLOC_FL_KEEP_SIZE) ||
  		 (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)));
  
@@ -2810,7 +2914,7 @@ index 1f71ef3e..dfc28b62 100644
  	if (fm->fc->no_fallocate)
  		return -EOPNOTSUPP;
  
-@@ -3211,6 +4130,11 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+@@ -3211,6 +4232,11 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  	args.in_numargs = 1;
  	args.in_args[0].size = sizeof(inarg);
  	args.in_args[0].value = &inarg;
@@ -2822,7 +2926,7 @@ index 1f71ef3e..dfc28b62 100644
  	err = fuse_simple_request(fm, &args);
  	if (err == -ENOSYS) {
  		fm->fc->no_fallocate = 1;
-@@ -3244,6 +4168,118 @@ out:
+@@ -3244,6 +4270,118 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  	return err;
  }
  
@@ -2941,7 +3045,7 @@ index 1f71ef3e..dfc28b62 100644
  static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  				      struct file *file_out, loff_t pos_out,
  				      size_t len, unsigned int flags)
-@@ -3323,6 +4359,12 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
+@@ -3323,6 +4461,12 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  	args.out_numargs = 1;
  	args.out_args[0].size = sizeof(outarg);
  	args.out_args[0].value = &outarg;
@@ -2954,7 +3058,7 @@ index 1f71ef3e..dfc28b62 100644
  	err = fuse_simple_request(fm, &args);
  	if (err == -ENOSYS) {
  		fc->no_copy_file_range = 1;
-@@ -3358,15 +4400,38 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3358,15 +4502,38 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  				    struct file *dst_file, loff_t dst_off,
  				    size_t len, unsigned int flags)
  {
@@ -2999,7 +3103,7 @@ index 1f71ef3e..dfc28b62 100644
  }
  
  static const struct file_operations fuse_file_operations = {
-@@ -3388,6 +4453,17 @@ static const struct file_operations fuse_file_operations = {
+@@ -3388,6 +4555,17 @@ static const struct file_operations fuse_file_operations = {
  	.poll		= fuse_file_poll,
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
@@ -3018,7 +3122,7 @@ index 1f71ef3e..dfc28b62 100644
  
  static const struct address_space_operations fuse_file_aops  = {
 diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
-index 28cf319c..0ba881cd 100644
+index 28cf319c1..0ba881cdf 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
 @@ -29,6 +29,7 @@
@@ -3199,7 +3303,7 @@ index 28cf319c..0ba881cd 100644
  		       unsigned int open_flags, fl_owner_t id, bool isdir);
  
 diff --git a/fs/fuse/fuse_trace.h b/fs/fuse/fuse_trace.h
-index bbe9ddd8..d3dbd5ec 100644
+index bbe9ddd8c..d3dbd5ec9 100644
 --- a/fs/fuse/fuse_trace.h
 +++ b/fs/fuse/fuse_trace.h
 @@ -58,6 +58,10 @@
@@ -3214,7 +3318,7 @@ index bbe9ddd8..d3dbd5ec 100644
  
  /*
 diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
-index 153f3102..1a8d9dd3 100644
+index 153f3102f..c2ac021bf 100644
 --- a/fs/fuse/inode.c
 +++ b/fs/fuse/inode.c
 @@ -100,6 +100,7 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
@@ -3449,7 +3553,7 @@ index 153f3102..1a8d9dd3 100644
  		inode = new_inode(sb);
  		if (!inode)
  			return NULL;
-@@ -484,7 +655,26 @@ retry:
+@@ -484,7 +655,26 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
  	fi->nlookup++;
  	spin_unlock(&fi->lock);
  done:
@@ -3536,18 +3640,19 @@ index 153f3102..1a8d9dd3 100644
  
  		process_init_limits(fc, arg);
  
-@@ -1259,7 +1458,69 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+@@ -1259,7 +1458,72 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
  			}
  			if (flags & FUSE_ATOMIC_O_TRUNC)
  				fc->atomic_o_trunc = 1;
 -			if (arg->minor >= 9) {
 +			if (flags & (FUSE_PFS_STRICT_COHERENCE |
-+				     FUSE_PFS_CACHED_DATA)) {
++				     FUSE_PFS_CACHED_DATA |
++				     FUSE_PFS_WRITE_ONESHOT)) {
 +				struct fuse_inode *root_fi =
 +					get_fuse_inode(fm->sb->s_root->d_inode);
 +
 +				/*
-+				 * The two private bits are one indivisible
++				 * The three private bits are one indivisible
 +				 * profile version, not two features.  A daemon
 +				 * that selects only one of them was built
 +				 * against a different kernel contract: it would
@@ -3559,9 +3664,11 @@ index 153f3102..1a8d9dd3 100644
 +				 * an aborted connection under load.
 +				 */
 +				if ((flags & (FUSE_PFS_STRICT_COHERENCE |
-+					      FUSE_PFS_CACHED_DATA)) !=
++					      FUSE_PFS_CACHED_DATA |
++					      FUSE_PFS_WRITE_ONESHOT)) !=
 +					    (FUSE_PFS_STRICT_COHERENCE |
-+					     FUSE_PFS_CACHED_DATA) ||
++					     FUSE_PFS_CACHED_DATA |
++					     FUSE_PFS_WRITE_ONESHOT) ||
 +				    arg->minor != FUSE_KERNEL_MINOR_VERSION ||
 +				    !fc->default_permissions ||
 +				    !(flags & FUSE_ATOMIC_O_TRUNC) ||
@@ -3607,7 +3714,7 @@ index 153f3102..1a8d9dd3 100644
  				/* LOOKUP has dependency on proto version */
  				if (flags & FUSE_EXPORT_SUPPORT)
  					fc->export_support = 1;
-@@ -1341,10 +1602,11 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+@@ -1341,10 +1605,11 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
  			    !(flags & FUSE_WRITEBACK_CACHE))  {
  				fc->passthrough = 1;
  				fc->max_stack_depth = arg->max_stack_depth;
@@ -3622,7 +3729,7 @@ index 153f3102..1a8d9dd3 100644
  			if (flags & FUSE_ALLOW_IDMAP) {
  				if (fc->default_permissions)
  					fm->sb->s_iflags &= ~SB_I_NOIDMAP;
-@@ -1357,8 +1619,27 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+@@ -1357,8 +1622,27 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
  			fc->no_flock = 1;
  		}
  
@@ -3651,17 +3758,18 @@ index 153f3102..1a8d9dd3 100644
  		fc->minor = arg->minor;
  		fc->max_write = arg->minor < 5 ? 4096 : arg->max_write;
  		fc->max_write = max_t(unsigned, 4096, fc->max_write);
-@@ -1398,7 +1679,8 @@ void fuse_send_init(struct fuse_mount *fm)
+@@ -1398,7 +1682,9 @@ void fuse_send_init(struct fuse_mount *fm)
  		FUSE_HANDLE_KILLPRIV_V2 | FUSE_SETXATTR_EXT | FUSE_INIT_EXT |
  		FUSE_SECURITY_CTX | FUSE_CREATE_SUPP_GROUP |
  		FUSE_HAS_EXPIRE_ONLY | FUSE_DIRECT_IO_ALLOW_MMAP |
 -		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP;
 +		FUSE_NO_EXPORT_SUPPORT | FUSE_HAS_RESEND | FUSE_ALLOW_IDMAP |
-+		FUSE_PFS_STRICT_COHERENCE | FUSE_PFS_CACHED_DATA;
++		FUSE_PFS_STRICT_COHERENCE | FUSE_PFS_CACHED_DATA |
++		FUSE_PFS_WRITE_ONESHOT;
  #ifdef CONFIG_FUSE_DAX
  	if (fm->fc->dax)
  		flags |= FUSE_MAP_ALIGNMENT;
-@@ -1564,6 +1846,10 @@ static void fuse_fill_attr_from_inode(struct fuse_attr *attr,
+@@ -1564,6 +1850,10 @@ static void fuse_fill_attr_from_inode(struct fuse_attr *attr,
  		.rdev		= fi->inode.i_rdev,
  		.blksize	= 1u << fi->inode.i_blkbits,
  	};
@@ -3672,7 +3780,7 @@ index 153f3102..1a8d9dd3 100644
  }
  
  static void fuse_sb_defaults(struct super_block *sb)
-@@ -1701,6 +1987,14 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
+@@ -1701,6 +1991,14 @@ int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
  
  	rcu_assign_pointer(fc->curr_bucket, fuse_sync_bucket_alloc());
  	fuse_sb_defaults(sb);
@@ -3688,7 +3796,7 @@ index 153f3102..1a8d9dd3 100644
  	if (ctx->is_bdev) {
  #ifdef CONFIG_BLOCK
 diff --git a/fs/fuse/ioctl.c b/fs/fuse/ioctl.c
-index 572ce8a8..ef13638c 100644
+index 572ce8a82..ef13638ca 100644
 --- a/fs/fuse/ioctl.c
 +++ b/fs/fuse/ioctl.c
 @@ -413,6 +413,7 @@ long fuse_ioctl_common(struct file *file, unsigned int cmd,
@@ -3733,10 +3841,10 @@ index 572ce8a8..ef13638c 100644
  	if (IS_ERR(ff))
  		return PTR_ERR(ff);
 diff --git a/fs/fuse/readdir.c b/fs/fuse/readdir.c
-index 78e6ad3f..de3dd14d 100644
+index 78e6ad3f8..de3dd14d1 100644
 --- a/fs/fuse/readdir.c
 +++ b/fs/fuse/readdir.c
-@@ -227,9 +227,11 @@ retry:
+@@ -227,9 +227,11 @@ static int fuse_direntplus_link(struct file *file,
  		spin_unlock(&fi->lock);
  
  		forget_all_cached_acls(inode);
@@ -3752,7 +3860,7 @@ index 78e6ad3f..de3dd14d 100644
  		 * The other branch comes via fuse_iget()
  		 * which bumps nlookup inside
 diff --git a/fs/fuse/xattr.c b/fs/fuse/xattr.c
-index 9f568d34..8e47c0a8 100644
+index 9f568d345..8e47c0a8a 100644
 --- a/fs/fuse/xattr.c
 +++ b/fs/fuse/xattr.c
 @@ -19,6 +19,10 @@ int fuse_setxattr(struct inode *inode, const char *name, const void *value,
@@ -3865,7 +3973,7 @@ index 9f568d34..8e47c0a8 100644
  		err = -EOPNOTSUPP;
  	}
 diff --git a/fs/overlayfs/params.c b/fs/overlayfs/params.c
-index d8b1a433..7dd7c00b 100644
+index d8b1a4337..7dd7c00b6 100644
 --- a/fs/overlayfs/params.c
 +++ b/fs/overlayfs/params.c
 @@ -298,6 +298,17 @@ static int ovl_mount_dir_check(struct fs_context *fc, const struct path *path,
@@ -3887,7 +3995,7 @@ index d8b1a433..7dd7c00b 100644
  	 * Root dentries of case-insensitive capable filesystems might
  	 * not have the dentry operations set, but still be incompatible
 diff --git a/fs/read_write.c b/fs/read_write.c
-index d14cad67..5afd32ac 100644
+index d14cad671..5afd32ac4 100644
 --- a/fs/read_write.c
 +++ b/fs/read_write.c
 @@ -751,8 +751,8 @@ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
@@ -3924,7 +4032,7 @@ index d14cad67..5afd32ac 100644
  	ret = vfs_copy_file_range(fd_file(f_in), pos_in, fd_file(f_out), pos_out,
  				  len, flags);
 diff --git a/fs/reply_publish.c b/fs/reply_publish.c
-index 767d8f0c..30225234 100644
+index 767d8f0c2..302252343 100644
 --- a/fs/reply_publish.c
 +++ b/fs/reply_publish.c
 @@ -31,6 +31,18 @@ bool fs_reply_publish_scope_enter_write(
@@ -3947,7 +4055,7 @@ index 767d8f0c..30225234 100644
  		struct fs_reply_publish_scope *scope, struct super_block *sb)
  {
 diff --git a/fs/smb/server/smb2pdu.c b/fs/smb/server/smb2pdu.c
-index b7e48e08..099559b5 100644
+index b7e48e086..099559b56 100644
 --- a/fs/smb/server/smb2pdu.c
 +++ b/fs/smb/server/smb2pdu.c
 @@ -3164,6 +3164,10 @@ int smb2_open(struct ksmbd_work *work)
@@ -3978,7 +4086,7 @@ index b7e48e08..099559b5 100644
  		if (!(open_flags & O_TRUNC))
  			file_info = FILE_OPENED;
 diff --git a/fs/smb/server/vfs.c b/fs/smb/server/vfs.c
-index d77c3e95..d336b45d 100644
+index d77c3e956..d336b45d2 100644
 --- a/fs/smb/server/vfs.c
 +++ b/fs/smb/server/vfs.c
 @@ -1209,6 +1209,8 @@ static int ksmbd_vfs_lookup_in_dir(const struct path *dir, char *name,
@@ -4003,7 +4111,7 @@ index d77c3e95..d336b45d 100644
  	err = mnt_want_write(path->mnt);
  	if (err) {
 diff --git a/fs/splice.c b/fs/splice.c
-index c406cff8..5e3dc554 100644
+index c406cff8d..5e3dc554f 100644
 --- a/fs/splice.c
 +++ b/fs/splice.c
 @@ -744,17 +744,13 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
@@ -4029,7 +4137,7 @@ index c406cff8..5e3dc554 100644
  		if (!applied_bytes) {
  			ret = fs_reply_publish_scope_finish(&publish_scope, ret);
 diff --git a/include/linux/fs.h b/include/linux/fs.h
-index cce19f88..2babc32d 100644
+index cce19f88b..2babc32d0 100644
 --- a/include/linux/fs.h
 +++ b/include/linux/fs.h
 @@ -1073,6 +1073,12 @@ struct file {
@@ -4046,7 +4154,7 @@ index cce19f88..2babc32d 100644
  	__u32 handle_bytes;
  	int handle_type;
 diff --git a/include/linux/fs_reply_publish.h b/include/linux/fs_reply_publish.h
-index f4a8dc7a..2cfa76a8 100644
+index f4a8dc7ad..2cfa76a83 100644
 --- a/include/linux/fs_reply_publish.h
 +++ b/include/linux/fs_reply_publish.h
 @@ -41,6 +41,8 @@ bool fs_reply_publish_scope_enter_if_needed(
@@ -4059,7 +4167,7 @@ index f4a8dc7a..2cfa76a8 100644
  void fs_reply_publish_scope_abort(struct fs_reply_publish_scope *scope);
  ssize_t fs_reply_publish_scope_finish(struct fs_reply_publish_scope *scope,
 diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
-index f1e99458..661ca691 100644
+index f1e99458e..9914a2ffd 100644
 --- a/include/uapi/linux/fuse.h
 +++ b/include/uapi/linux/fuse.h
 @@ -372,6 +372,16 @@ struct fuse_file_lock {
@@ -4079,24 +4187,26 @@ index f1e99458..661ca691 100644
  
  /**
   * INIT request/reply flags
-@@ -471,6 +481,16 @@ struct fuse_file_lock {
+@@ -471,6 +481,18 @@ struct fuse_file_lock {
  /* Obsolete alias for FUSE_DIRECT_IO_ALLOW_MMAP */
  #define FUSE_DIRECT_IO_RELAX	FUSE_DIRECT_IO_ALLOW_MMAP
  #define FUSE_ALLOW_IDMAP	(1ULL << 40)
 +/* Private, indivisible PortableFS strict-coherence profile. */
 +#define FUSE_PFS_STRICT_COHERENCE (1ULL << 63)
 +/*
-+ * Second half of the same indivisible profile: SHARED regular files retain
-+ * this kernel's page cache instead of forcing direct I/O.  It is a separate
-+ * bit only so that a kernel and a daemon built against different revisions of
-+ * the private contract fail INIT instead of disagreeing about the one exact
-+ * open flag pair.  Selecting either bit without the other is refused.
++ * Second revision bit of the same indivisible profile: SHARED regular files
++ * retain this kernel's page cache instead of forcing direct I/O.  It is a
++ * separate bit only so that a kernel and a daemon built against different
++ * revisions of the private contract fail INIT instead of disagreeing about
++ * the one exact open flag pair.  Selecting an incomplete profile is refused.
 + */
 +#define FUSE_PFS_CACHED_DATA	(1ULL << 62)
++/* Third revision bit: single-fragment writes commit in one request. */
++#define FUSE_PFS_WRITE_ONESHOT	(1ULL << 61)
  
  /**
   * CUSE INIT request/reply flags
-@@ -557,6 +577,8 @@ struct fuse_file_lock {
+@@ -557,6 +579,8 @@ struct fuse_file_lock {
   */
  #define FUSE_ATTR_SUBMOUNT      (1 << 0)
  #define FUSE_ATTR_DAX		(1 << 1)
@@ -4105,7 +4215,7 @@ index f1e99458..661ca691 100644
  
  /**
   * Open flags
-@@ -639,6 +661,12 @@ enum fuse_opcode {
+@@ -639,6 +663,12 @@ enum fuse_opcode {
  	FUSE_TMPFILE		= 51,
  	FUSE_STATX		= 52,
  
@@ -4118,7 +4228,7 @@ index f1e99458..661ca691 100644
  	/* CUSE specific operations */
  	CUSE_INIT		= 4096,
  
-@@ -656,6 +684,7 @@ enum fuse_notify_code {
+@@ -656,6 +686,7 @@ enum fuse_notify_code {
  	FUSE_NOTIFY_DELETE = 6,
  	FUSE_NOTIFY_RESEND = 7,
  	FUSE_NOTIFY_CODE_MAX,
@@ -4126,7 +4236,7 @@ index f1e99458..661ca691 100644
  };
  
  /* The read buffer is required to be at least 8k, but may be much larger */
-@@ -825,6 +854,111 @@ struct fuse_write_out {
+@@ -825,6 +856,112 @@ struct fuse_write_out {
  	uint32_t	padding;
  };
  
@@ -4135,6 +4245,7 @@ index f1e99458..661ca691 100644
 +#define FUSE_PFS_WRITE_DATA	2
 +#define FUSE_PFS_WRITE_COMMIT	3
 +#define FUSE_PFS_WRITE_ABORT	4
++#define FUSE_PFS_WRITE_ONE_SHOT	5
 +
 +#define FUSE_PFS_WRITE_OUT_BEGUN	(1 << 0)
 +#define FUSE_PFS_WRITE_OUT_STAGED	(1 << 1)
@@ -4238,7 +4349,7 @@ index f1e99458..661ca691 100644
  #define FUSE_COMPAT_STATFS_SIZE 48
  
  struct fuse_statfs_out {
-@@ -987,6 +1121,7 @@ struct fuse_fallocate_in {
+@@ -987,6 +1124,7 @@ struct fuse_fallocate_in {
   * Indicates whether this is a resend request. The receiver should handle this
   * request accordingly.
   */
@@ -4246,7 +4357,7 @@ index f1e99458..661ca691 100644
  #define FUSE_UNIQUE_RESEND (1ULL << 63)
  
  /**
-@@ -1055,6 +1190,12 @@ struct fuse_notify_inval_inode_out {
+@@ -1055,6 +1193,12 @@ struct fuse_notify_inval_inode_out {
  	int64_t		len;
  };
  
@@ -4260,7 +4371,7 @@ index f1e99458..661ca691 100644
  	uint64_t	parent;
  	uint32_t	namelen;
 diff --git a/io_uring/rw.c b/io_uring/rw.c
-index 6566ac98..dd821aea 100644
+index 6566ac986..dd821aead 100644
 --- a/io_uring/rw.c
 +++ b/io_uring/rw.c
 @@ -593,12 +593,13 @@ static int kiocb_done(struct io_kiocb *req, ssize_t ret,
@@ -4315,7 +4426,7 @@ index 6566ac98..dd821aea 100644
  	if (likely(req->file->f_op->write_iter))
  		ret2 = req->file->f_op->write_iter(kiocb, &io->iter);
 diff --git a/mm/swapfile.c b/mm/swapfile.c
-index 552df432..a8e5df7a 100644
+index 552df432c..a8e5df7a3 100644
 --- a/mm/swapfile.c
 +++ b/mm/swapfile.c
 @@ -3411,6 +3411,10 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)

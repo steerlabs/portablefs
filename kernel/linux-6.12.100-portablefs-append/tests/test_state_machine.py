@@ -120,6 +120,12 @@ def next_publication_id(current: int) -> int:
     return value
 
 
+def write_shape(total: int, max_write: int) -> str:
+    if total <= 0 or max_write <= 0:
+        raise ProtocolError("invalid write size boundary")
+    return "one-shot" if total <= max_write else "transaction"
+
+
 def validate_write_reply(reply: WriteReply, txid: int, expected: int) -> str:
     if reply.txid != txid:
         raise ProtocolError("transaction identity mismatch")
@@ -257,10 +263,13 @@ REQUIRED_INIT = {
     "POSIX_LOCKS",
     "FLOCK_LOCKS",
     "PFS_STRICT",
-    # The two private bits are one profile version. A daemon offering only one
-    # of them was built against a different contract and must fail INIT rather
-    # than disagree about the open flag pair at first open.
+    # The private bits are one profile revision. A daemon offering an
+    # incomplete set was built against a different contract and must fail INIT
+    # rather than disagree about the open flags or write shape after mount.
     "PFS_CACHED_DATA",
+    # Single-fragment writes have one request shape only. This third revision
+    # bit prevents an old daemon from interpreting ONE_SHOT as an unknown phase.
+    "PFS_WRITE_ONESHOT",
     # Retained pages are withdrawn by the ordered DATA publication alone, so
     # invalidation is explicit; mtime heuristics would both drop a coherent
     # cache for nothing and put a GETATTR in front of every read.
@@ -400,13 +409,59 @@ class Tx:
 
 
 class Authority:
-    """In-memory authority with inert staging and one locked commit cut."""
+    """In-memory authority with direct one-shots and one locked commit cut."""
 
     def __init__(self, initial: bytes = b"") -> None:
         self.contents = bytearray(initial)
         self.sequence = 0
         self.transactions: dict[int, Tx] = {}
+        self.one_shot_results: dict[
+            tuple[int, int], tuple[tuple[FrozenWrite, bytes], WriteReply]
+        ] = {}
         self.lock = threading.Lock()
+
+    def _apply(self, txid: int, frozen: FrozenWrite,
+               payload: bytes) -> WriteReply:
+        f = frozen
+        with self.lock:
+            assigned = len(self.contents) if f.append else f.position
+            ceiling = min(f.rlimit, f.file_max)
+            if assigned >= ceiling:
+                flag = (
+                    WRITE_REJECTED_RLIMIT
+                    if f.rlimit != U64_MAX and assigned >= f.rlimit
+                    else WRITE_REJECTED
+                )
+                return WriteReply(txid=txid, flags=flag, error=-errno.EFBIG)
+            committed = min(len(payload), ceiling - assigned)
+            end = assigned + committed
+            if end > len(self.contents):
+                self.contents.extend(b"\0" * (end - len(self.contents)))
+            self.contents[assigned:end] = payload[:committed]
+            self.sequence += 1
+            return WriteReply(
+                txid=txid,
+                committed_size=committed,
+                assigned_offset=assigned,
+                post_size=len(self.contents),
+                sequence=self.sequence,
+                flags=WRITE_COMMITTED,
+            )
+
+    def one_shot(self, slot: int, sequence: int, frozen: FrozenWrite,
+                 payload: bytes) -> WriteReply:
+        if frozen.total <= 0 or len(payload) != frozen.total:
+            raise ProtocolError("one-shot payload does not match geometry")
+        identity = (slot, sequence)
+        fingerprint = (frozen, payload)
+        retained = self.one_shot_results.get(identity)
+        if retained is not None:
+            if retained[0] != fingerprint:
+                raise ProtocolError("one-shot replay changed request")
+            return retained[1]
+        reply = self._apply(0, frozen, payload)
+        self.one_shot_results[identity] = (fingerprint, reply)
+        return reply
 
     def begin(self, txid: int, frozen: FrozenWrite) -> WriteReply:
         if txid <= 0 or frozen.total <= 0 or frozen.file_max <= 0:
@@ -450,37 +505,8 @@ class Authority:
             return tx.result
         if tx.aborted or staged_size != len(tx.staged) or not tx.staged:
             raise ProtocolError("COMMIT prefix mismatch")
-        f = tx.frozen
-        with self.lock:
-            assigned = len(self.contents) if f.append else f.position
-            ceiling = min(f.rlimit, f.file_max)
-            if assigned >= ceiling:
-                flag = (
-                    WRITE_REJECTED_RLIMIT
-                    if f.rlimit != U64_MAX and assigned >= f.rlimit
-                    else WRITE_REJECTED
-                )
-                tx.result = WriteReply(
-                    txid=txid,
-                    flags=flag,
-                    error=-errno.EFBIG,
-                )
-                return tx.result
-            committed = min(staged_size, ceiling - assigned)
-            end = assigned + committed
-            if end > len(self.contents):
-                self.contents.extend(b"\0" * (end - len(self.contents)))
-            self.contents[assigned:end] = tx.staged[:committed]
-            self.sequence += 1
-            tx.result = WriteReply(
-                txid=txid,
-                committed_size=committed,
-                assigned_offset=assigned,
-                post_size=len(self.contents),
-                sequence=self.sequence,
-                flags=WRITE_COMMITTED,
-            )
-            return tx.result
+        tx.result = self._apply(txid, tx.frozen, bytes(tx.staged[:staged_size]))
+        return tx.result
 
 
 @dataclasses.dataclass
@@ -877,6 +903,27 @@ class AbiAndAdmissionTests(unittest.TestCase):
 
 
 class TransactionTests(unittest.TestCase):
+    def test_size_class_has_exactly_one_shape_at_max_write_boundary(self) -> None:
+        max_write = 1 << 20
+        self.assertEqual(write_shape(1, max_write), "one-shot")
+        self.assertEqual(write_shape(max_write, max_write), "one-shot")
+        self.assertEqual(write_shape(max_write + 1, max_write), "transaction")
+
+    def test_one_shot_append_replay_is_exact_and_uses_no_transaction_id(self) -> None:
+        authority = Authority(b"prefix")
+        frozen = FrozenWrite(4, True, 0, U64_MAX, S64_MAX)
+        reply = authority.one_shot(2, 9, frozen, b"data")
+        self.assertEqual(validate_write_reply(reply, 0, WRITE_COMMITTED),
+                         "committed")
+        self.assertEqual((reply.assigned_offset, reply.post_size), (6, 10))
+        self.assertEqual(authority.contents, b"prefixdata")
+        self.assertEqual(authority.transactions, {})
+        self.assertEqual(authority.one_shot(2, 9, frozen, b"data"), reply)
+        self.assertEqual(authority.sequence, 1)
+        self.assertEqual(authority.contents, b"prefixdata")
+        with self.assertRaises(ProtocolError):
+            authority.one_shot(2, 9, frozen, b"date")
+
     def test_fragmented_append_is_one_visibility_cut(self) -> None:
         authority = Authority(b"prefix")
         frozen = FrozenWrite(9, True, 0, U64_MAX, S64_MAX)
