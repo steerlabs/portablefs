@@ -78,10 +78,15 @@ The run:
    writes a second file it never fsyncs. The mark request goes out on the
    driver's stdout and the harness answers on its stdin, so the mark always
    lands after the fsync returned and before the next write starts.
-5. SIGKILL the authority and the mount, take a `power-cut` mark, and release the
-   device. Everything the tidy-up unmount writes lands after that mark and is
-   truncated away by `Log.Through`, so no cut is contaminated by a write that
-   only exists because the harness had to clean up after itself.
+5. Establish the device-release precondition in order: SIGKILL and reap the
+   authority; SIGKILL and reap the mount server; force-detach its FUSE mount
+   and prove that exact kernel mount absent; then unmount the write-staging bind
+   whose source is inside the cell. Only after every service-side holder is
+   gone does the harness take the `power-cut` mark, unmount XFS, and release the
+   device-mapper target. Everything the tidy-up XFS unmount writes lands after
+   that mark and is truncated away by `Log.Through`, so no cut is contaminated
+   by a write that only exists because the harness had to clean up after
+   itself.
 6. For each replay point - every checkpoint mark, plus a bounded sweep of the
    filesystem's own flush/FUA barriers spread across the whole log, plus the
    cut itself - replay to a fresh image, mount it (which runs XFS log recovery),
@@ -102,6 +107,15 @@ writing, that a fresh mount attaches, that the volume serves again, and that
 nothing an `fsync` had already promised was lost. The kill lands at a different
 point in each round, at fixed delays rather than random ones - a harness whose
 coverage changes between runs cannot say what a green result covered.
+
+The strict-membership restart gate remains part of this instrument. Killing an
+authority cannot authenticate `Detach`, so the harness reaps the killed round's
+mount process, force-detaches its exact kernel mount, proves that mount absent,
+and only then starts the replacement with the audited
+`--prior-strict-mounts-fenced` operator assertion. Authority loss by itself is
+never treated as fencing evidence. The fresh liveness-probe mount then shuts
+down normally while the replacement authority is alive, which sends the
+authenticated `Detach` and leaves no active membership for the next round.
 
 In practice an un-fsynced write usually still survives this instrument, because
 the page cache does. The harness records that as an observation and never as a

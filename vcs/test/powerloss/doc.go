@@ -22,9 +22,11 @@
 // allowed. This is a real power-cut simulation: dirty page cache is not
 // replayed, because a power cut does not write it back.
 //
-// The process instrument only SIGKILLs the authority. That removes the process
-// but not the kernel's dirty page cache, so it is strictly weaker than a power
-// cut and is labelled as such everywhere it reports. It covers the restart and
+// The process instrument injects only an authority SIGKILL. That removes the
+// process but not the kernel's dirty page cache, so it is strictly weaker than
+// a power cut and is labelled as such everywhere it reports. Before restart it
+// reaps and force-detaches the stranded strict mount, then presents the same
+// prior-mount fencing assertion an operator must. It covers the restart and
 // re-attach path, which the device instrument does not exercise.
 //
 // What this package deliberately does NOT claim:

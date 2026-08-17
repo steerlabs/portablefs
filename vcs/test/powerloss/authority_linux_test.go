@@ -48,12 +48,13 @@ func TestFsyncedWritesSurvivePowerLoss(t *testing.T) {
 		t.Fatalf("the workload driver failed: %v", err)
 	}
 
-	// Power loss takes everything at once. The authority goes first because it
-	// is the only process that can still be writing to the device; the mount
-	// then has nothing to talk to, which is exactly the state a cut leaves.
-	authority.kill(t)
-	mount.kill(t)
-	releaseMount(gate.runner, mountpoint)
+	// Power loss takes everything at once. releaseForPowerCut proves the data
+	// plane cannot still pin or dirty the cell: authority reaped, mount server
+	// reaped, exact FUSE mount absent, and write-staging bind absent. Only then
+	// may the filesystem and dm target be released to finalize the write log.
+	if _, err := cell.releaseForPowerCut(authority, mount, mountpoint); err != nil {
+		t.Fatalf("releasing the data plane for the power cut: %v", err)
+	}
 
 	fullLog, closeLog := playground.cut(t, "power-cut")
 	defer func() { _ = closeLog() }()
@@ -116,9 +117,14 @@ func TestAuthorityKillDuringWritesKeepsFsyncedData(t *testing.T) {
 	delays := []time.Duration{150 * time.Millisecond, 700 * time.Millisecond, 2 * time.Second, 4500 * time.Millisecond}
 	for round := range gate.killRounds {
 		delay := delays[round%len(delays)]
-		t.Run(fmt.Sprintf("killed-after-%s", delay), func(t *testing.T) {
+		if passed := t.Run(fmt.Sprintf("killed-after-%s", delay), func(t *testing.T) {
 			runKillRound(t, gate, cell, round, delay)
-		})
+		}); !passed {
+			// A failed round may have died before it could discharge its strict
+			// membership. Starting another epoch would then add a secondary
+			// 30-second gate refusal that says nothing new about durability.
+			return
+		}
 	}
 }
 
@@ -154,8 +160,10 @@ func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay
 	// completed checkpoint either way.
 	_ = driver.wait(t, 2*time.Minute)
 	driver.kill(t)
-	mount.kill(t)
-	releaseMount(gate.runner, mountpoint)
+	fence, err := forceFenceStrictMount(gate.runner, mount, mountpoint)
+	if err != nil {
+		t.Fatalf("fencing the killed authority's strict mount: %v", err)
+	}
 
 	ledger, err := LoadLedger(ledgerPath)
 	if err != nil {
@@ -174,13 +182,8 @@ func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay
 
 	// Restart over the volume the authority was killed in the middle of
 	// writing, and attach a new mount to it.
-	restarted := cell.startAuthority(t, fmt.Sprintf("restart-%d", round))
-	t.Cleanup(func() { restarted.kill(t) })
+	restarted := cell.startAuthorityAfterFence(t, fmt.Sprintf("restart-%d", round), fence)
 	freshMount, freshMountpoint := cell.startMount(t, fmt.Sprintf("restart-%d", round), fmt.Sprintf("access-%d.token", 2+2*round))
-	t.Cleanup(func() {
-		freshMount.kill(t)
-		releaseMount(gate.runner, freshMountpoint)
-	})
 
 	expectations, err := ExpectationsAfterRestart(ledger)
 	if err != nil {
@@ -200,7 +203,7 @@ func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay
 	// The volume must also still serve. A restart that preserved every byte and
 	// then refused to work would satisfy the durability check and be useless,
 	// so the same driver runs one more checkpoint through the fresh mount.
-	liveness := filepath.Join(gate.workDir, fmt.Sprintf("process-liveness-%d.json", round))
+	liveness := filepath.Join(cell.ledgerDir, fmt.Sprintf("process-liveness-%d.json", round))
 	probe := cell.runDriver(t, freshMountpoint, liveness, InstrumentProcess, nil,
 		"--prefix", fmt.Sprintf("probe-%d", round),
 		"--checkpoints", "1",
@@ -212,4 +215,14 @@ func runKillRound(t *testing.T, gate authorityGate, cell *cell, round int, delay
 		restarted.dump(t)
 		t.Fatalf("after the %s kill the restarted volume does not serve: %v", delay, err)
 	}
+
+	// The probe mount is not a crash victim. Let its normal shutdown send the
+	// authenticated Detach while the replacement authority is still alive, so
+	// this round leaves no durable membership for the next initial epoch. The
+	// killed mount above is the one deliberately discharged by operator
+	// fencing, through the same audited assertion production uses.
+	if err := cleanlyDischargeMount(gate.runner, freshMount, freshMountpoint); err != nil {
+		t.Fatalf("cleanly discharging the restart probe mount: %v", err)
+	}
+	restarted.kill(t)
 }

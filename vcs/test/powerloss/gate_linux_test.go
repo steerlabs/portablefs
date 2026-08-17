@@ -5,6 +5,7 @@ package powerloss
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"testing"
@@ -161,6 +162,9 @@ func requireAuthorityGate(t *testing.T) authorityGate {
 		if _, err := os.Stat(filepath.Join(gate.binDir, binary)); err != nil {
 			skipOrFail(t, "%s does not contain %s: %v", envBinDir, binary, err)
 		}
+	}
+	if _, err := exec.LookPath("fusermount3"); err != nil {
+		skipOrFail(t, "fusermount3 is not installed; strict mount fencing cannot be proved")
 	}
 	gate.imageSize = optionalNumber(t, envImageSize, 2<<30)
 	gate.checkpoints = int(optionalNumber(t, envCheckpoints, 12))

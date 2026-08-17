@@ -4,6 +4,8 @@ package powerloss
 
 import (
 	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,12 +34,25 @@ import (
 
 type cell struct {
 	gate       authorityGate
+	runner     commandRunner
 	root       string // the XFS cell mount point
 	volumeRoot string // the provisioned volume directory inside it
 	home       string // the service identity's scratch directory
 	staging    string // the write-staging bind mount the authority is given
-	logDir     string
-	ledgerDir  string // where the unprivileged driver writes its ledgers
+	// stagingBound is ownership, not a cached observation: the fixture sets it
+	// only after mount --bind succeeds and clears it only after exact absence is
+	// proved. The device instrument must discharge this ownership before it can
+	// claim the dm target is free for a cut.
+	stagingBound bool
+	logDir       string
+	ledgerDir    string // where the unprivileged driver writes its ledgers
+}
+
+// commandRunner is deliberately smaller than Runner so the teardown contract
+// can be unit tested without creating mounts. The privileged tests still pass
+// the real narrated Runner.
+type commandRunner interface {
+	Run(string, ...string) (string, error)
 }
 
 // provisionCell runs the production provisioner over an already-mounted XFS
@@ -51,6 +66,7 @@ func provisionCell(t *testing.T, gate authorityGate, mountpoint string) *cell {
 	t.Helper()
 	c := &cell{
 		gate:       gate,
+		runner:     gate.runner,
 		root:       mountpoint,
 		volumeRoot: filepath.Join(mountpoint, gate.volume),
 		home:       filepath.Join(gate.workDir, "service"),
@@ -79,8 +95,9 @@ func provisionCell(t *testing.T, gate authorityGate, mountpoint string) *cell {
 	if _, err := gate.runner.Run("mount", "--bind", source, c.staging); err != nil {
 		t.Fatalf("binding the write-staging directory: %v", err)
 	}
+	c.stagingBound = true
 	t.Cleanup(func() {
-		if _, err := gate.runner.Run("umount", c.staging); err != nil {
+		if err := c.releaseWriteStaging(); err != nil {
 			t.Errorf("releasing the write-staging bind mount: %v", err)
 		}
 	})
@@ -176,31 +193,62 @@ func (c *cell) start(t *testing.T, name, label string, arguments ...string) *pro
 // than durability.
 func (p *process) kill(t *testing.T) {
 	t.Helper()
-	if p == nil || p.command.Process == nil {
-		return
+	if err := p.forceKill(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// forceKill is the evidence-producing half of kill. Waiting for Wait to reap
+// the process is essential: sending SIGKILL is an intention, not proof that a
+// process holding the cell has stopped doing so.
+func (p *process) forceKill(bound time.Duration) error {
+	if p == nil || p.command == nil || p.command.Process == nil {
+		return errors.New("process absence cannot be proved for a process that was never started")
+	}
+	if p.exited() {
+		return nil
 	}
 	_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGKILL)
 	_ = syscall.Kill(p.command.Process.Pid, syscall.SIGKILL)
 	select {
 	case <-p.exit:
-	case <-time.After(30 * time.Second):
-		t.Fatalf("%s survived SIGKILL for 30 seconds; the run cannot claim the process was gone at the cut", p.name)
+		return nil
+	case <-time.After(bound):
+		return fmt.Errorf("%s survived SIGKILL for %s; process absence was not proved", p.name, bound)
 	}
+}
+
+// stop asks a process to perform its ordinary shutdown and requires both a
+// clean exit and the caller's time bound. It is used only after a restart
+// probe, where an authenticated Detach is part of the setup for the next
+// authority epoch; the crash points themselves always use forceKill.
+func (p *process) stop(bound time.Duration) error {
+	if p == nil || p.command == nil || p.command.Process == nil {
+		return nil
+	}
+	if !p.exited() {
+		_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGTERM)
+		_ = syscall.Kill(p.command.Process.Pid, syscall.SIGTERM)
+		select {
+		case <-p.exit:
+		case <-time.After(bound):
+			return fmt.Errorf("%s did not complete clean shutdown within %s", p.name, bound)
+		}
+	}
+	if p.err != nil {
+		return fmt.Errorf("%s clean shutdown: %w", p.name, p.err)
+	}
+	return nil
 }
 
 // terminate is kill without a testing.T. Teardown runs after the assertions
 // are done, and a teardown that fails the test for a process that was already
 // on its way out would report the wrong thing.
 func (p *process) terminate() {
-	if p == nil || p.command.Process == nil || p.exited() {
+	if p == nil || p.command == nil || p.command.Process == nil || p.exited() {
 		return
 	}
-	_ = syscall.Kill(-p.command.Process.Pid, syscall.SIGKILL)
-	_ = syscall.Kill(p.command.Process.Pid, syscall.SIGKILL)
-	select {
-	case <-p.exit:
-	case <-time.After(30 * time.Second):
-	}
+	_ = p.forceKill(30 * time.Second)
 }
 
 func (p *process) dump(t *testing.T) {
@@ -213,14 +261,61 @@ func (p *process) dump(t *testing.T) {
 	t.Logf("==== %s log ====\n%s", p.name, strings.TrimSpace(string(content)))
 }
 
-// startAuthority brings up the authority and waits for it to listen. The flag
-// set is the same one the coherence matrix uses, because a harness that
-// started the authority in a shape nobody deploys would prove something about
-// that shape instead.
+// priorStrictMountsFenced is the harness's local operator evidence. The
+// authority deliberately cannot verify --prior-strict-mounts-fenced itself;
+// the fixture may make that assertion only after it has reaped the mount
+// process and proved the exact kernel mount absent.
+type priorStrictMountsFenced struct {
+	mountpoint         string
+	mountProcessExited bool
+	kernelMountAbsent  bool
+}
+
+func (fence priorStrictMountsFenced) validate() error {
+	if fence.mountpoint == "" || !fence.mountProcessExited || !fence.kernelMountAbsent {
+		return errors.New("prior strict mount fencing requires a reaped mount process and an absent exact kernel mount")
+	}
+	return nil
+}
+
+func priorStrictMountFenceArguments(fence *priorStrictMountsFenced) ([]string, error) {
+	if fence == nil {
+		return nil, nil
+	}
+	if err := fence.validate(); err != nil {
+		return nil, err
+	}
+	return []string{"--prior-strict-mounts-fenced"}, nil
+}
+
+// startAuthority brings up an initial authority epoch. A replacement after an
+// unclean mount loss must use startAuthorityAfterFence instead.
 func (c *cell) startAuthority(t *testing.T, label string) *process {
+	return c.startAuthorityEpoch(t, label, nil)
+}
+
+// startAuthorityAfterFence consumes the proof required by the production
+// restart contract and makes the same audited operator assertion the control
+// plane would make after fencing a host.
+func (c *cell) startAuthorityAfterFence(t *testing.T, label string, fence priorStrictMountsFenced) *process {
+	t.Helper()
+	if err := fence.validate(); err != nil {
+		t.Fatalf("starting a replacement authority: %v", err)
+	}
+	return c.startAuthorityEpoch(t, label, &fence)
+}
+
+// startAuthorityEpoch uses the same command shape as the coherence matrix.
+// The optional assertion is added only through a validated fencing receipt,
+// never because an authority happened to stop listening.
+func (c *cell) startAuthorityEpoch(t *testing.T, label string, fence *priorStrictMountsFenced) *process {
 	t.Helper()
 	gate := c.gate
-	authority := c.start(t, "portablefs-authority", label,
+	fenceArguments, err := priorStrictMountFenceArguments(fence)
+	if err != nil {
+		t.Fatalf("starting authority epoch: %v", err)
+	}
+	arguments := []string{
 		"--listen", fmt.Sprintf("127.0.0.1:%d", gate.port),
 		"--volume-id", gate.volume,
 		"--root", c.volumeRoot,
@@ -239,7 +334,9 @@ func (c *cell) startAuthority(t *testing.T, label string) *process {
 		// attach, which reads exactly like a durability harness that cannot
 		// mount. See envCapabilityLifetime.
 		"--capability-max-lifetime", gate.capabilityBound().String(),
-	)
+	}
+	arguments = append(arguments, fenceArguments...)
+	authority := c.start(t, "portablefs-authority", label, arguments...)
 	listening := waitFor(30*time.Second, func() bool {
 		connection, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", gate.port), time.Second)
 		if err != nil {
@@ -282,10 +379,14 @@ func (c *cell) startMount(t *testing.T, name, token string) (*process, string) {
 		"--tls-server-name", "authority.portablefs.test",
 		"--coherence", "strict",
 	)
-	// A dead mount holds its mountpoint, and the cell underneath cannot be
-	// unmounted while it does. Every mount this fixture starts is therefore
-	// released during teardown whether the test killed it or not.
-	t.Cleanup(func() { releaseMount(c.gate.runner, mountpoint) })
+	// A dead mount holds its mountpoint, and a live server can keep descriptors
+	// into the cell after lazy detach. Every fallback teardown therefore reaps
+	// the server before releasing its kernel mount. Contract-bearing paths do
+	// the same work explicitly and this cleanup then becomes idempotent.
+	t.Cleanup(func() {
+		mount.terminate()
+		releaseMount(c.gate.runner, mountpoint)
+	})
 	// A mount that has already exited will never appear, so waiting the full
 	// bound for it would only delay the report of why it refused.
 	waitFor(45*time.Second, func() bool { return mount.exited() || isFUSE(c.gate.runner, mountpoint) })
@@ -328,13 +429,162 @@ func isFUSE(runner Runner, mountpoint string) bool {
 	return strings.HasPrefix(strings.TrimSpace(output), "fuse")
 }
 
-// releaseMount takes a dead mount's FUSE connection out of the kernel. A
-// killed mount process leaves the mountpoint attached and every access on it
-// blocked, which would hang the unmount of the cell underneath it.
-func releaseMount(runner Runner, mountpoint string) {
-	if _, err := runner.Run("umount", "-l", mountpoint); err != nil {
-		_, _ = runner.Run("fusermount3", "-uz", mountpoint)
+// processKiller is the part of a data-plane process needed to prove that it no
+// longer holds a descriptor into the cell.
+type processKiller interface {
+	forceKill(time.Duration) error
+}
+
+// exactMountPresent distinguishes a mount at mountpoint from its containing
+// filesystem. It parses a complete successful findmnt inventory: command
+// failure and malformed output are errors, never mistaken for mount absence.
+func exactMountPresent(runner commandRunner, mountpoint string) (bool, error) {
+	output, err := runner.Run("findmnt", "--json", "--output", "TARGET")
+	if err != nil {
+		return false, fmt.Errorf("inspect the mount namespace for %s: %w", mountpoint, err)
 	}
+	var inventory struct {
+		Filesystems []findmntFilesystem `json:"filesystems"`
+	}
+	if err := json.Unmarshal([]byte(output), &inventory); err != nil {
+		return false, fmt.Errorf("parse mount namespace for %s: %w", mountpoint, err)
+	}
+	clean := filepath.Clean(mountpoint)
+	for _, filesystem := range inventory.Filesystems {
+		if filesystem.contains(clean) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+type findmntFilesystem struct {
+	Target   string              `json:"target"`
+	Children []findmntFilesystem `json:"children"`
+}
+
+func (filesystem findmntFilesystem) contains(mountpoint string) bool {
+	if filepath.Clean(filesystem.Target) == mountpoint {
+		return true
+	}
+	for _, child := range filesystem.Children {
+		if child.contains(mountpoint) {
+			return true
+		}
+	}
+	return false
+}
+
+// forceFenceStrictMount implements the local equivalent of production host
+// fencing: make the userspace server impossible to revive, detach its exact
+// kernel mount, and verify both facts before issuing an operator assertion.
+// fusermount's lazy forced detach is the normal path. umount -l is a bounded
+// escalation, not the proof; exact namespace absence below is the proof.
+func forceFenceStrictMount(runner commandRunner, mount processKiller, mountpoint string) (priorStrictMountsFenced, error) {
+	if mount == nil {
+		return priorStrictMountsFenced{}, errors.New("strict mount fencing requires its mount process")
+	}
+	if err := mount.forceKill(30 * time.Second); err != nil {
+		return priorStrictMountsFenced{}, err
+	}
+
+	_, detachErr := runner.Run("fusermount3", "-uz", mountpoint)
+	present, inspectErr := exactMountPresent(runner, mountpoint)
+	if inspectErr != nil {
+		return priorStrictMountsFenced{}, inspectErr
+	}
+	if present {
+		if _, err := runner.Run("umount", "-l", mountpoint); err != nil {
+			failures := []error{fmt.Errorf("lazy-detach strict mount %s: %w", mountpoint, err)}
+			if detachErr != nil {
+				failures = append([]error{fmt.Errorf("force-detach strict mount %s: %w", mountpoint, detachErr)}, failures...)
+			}
+			return priorStrictMountsFenced{}, errors.Join(failures...)
+		}
+		present, inspectErr = exactMountPresent(runner, mountpoint)
+		if inspectErr != nil {
+			return priorStrictMountsFenced{}, inspectErr
+		}
+	}
+	if present {
+		return priorStrictMountsFenced{}, fmt.Errorf("strict kernel mount %s remains installed after forced detach", mountpoint)
+	}
+	return priorStrictMountsFenced{
+		mountpoint:         mountpoint,
+		mountProcessExited: true,
+		kernelMountAbsent:  true,
+	}, nil
+}
+
+// releaseMount is cleanup only. Contract-bearing paths use
+// forceFenceStrictMount or cleanlyDischargeMount and check their errors.
+func releaseMount(runner commandRunner, mountpoint string) {
+	_, _ = runner.Run("fusermount3", "-uz", mountpoint)
+	present, err := exactMountPresent(runner, mountpoint)
+	if err == nil && present {
+		_, _ = runner.Run("umount", "-l", mountpoint)
+	}
+}
+
+// releaseWriteStaging removes the bind mount whose source lies on the cell.
+// It must run before the cell filesystem is unmounted for a device cut; doing
+// it only in t.Cleanup leaves a live reference to the dm target.
+func (c *cell) releaseWriteStaging() error {
+	if c == nil || !c.stagingBound {
+		return nil
+	}
+	unmountErr := error(nil)
+	if _, err := c.runner.Run("umount", c.staging); err != nil {
+		unmountErr = fmt.Errorf("unmount %s: %w", c.staging, err)
+	}
+	present, err := exactMountPresent(c.runner, c.staging)
+	if err != nil {
+		return errors.Join(unmountErr, err)
+	}
+	if present {
+		return errors.Join(unmountErr, fmt.Errorf("write-staging bind mount %s remains installed", c.staging))
+	}
+	c.stagingBound = false
+	return nil
+}
+
+// releaseForPowerCut establishes the complete device-release precondition in
+// one ordered operation. The authority is killed first so it cannot dirty the
+// XFS after the cut begins; the FUSE server is then killed and detached; only
+// then is the last service bind into the cell removed.
+func (c *cell) releaseForPowerCut(authority, mount processKiller, mountpoint string) (priorStrictMountsFenced, error) {
+	if authority == nil {
+		return priorStrictMountsFenced{}, errors.New("a power cut requires its authority process")
+	}
+	if err := authority.forceKill(30 * time.Second); err != nil {
+		return priorStrictMountsFenced{}, err
+	}
+	fence, err := forceFenceStrictMount(c.runner, mount, mountpoint)
+	if err != nil {
+		return priorStrictMountsFenced{}, err
+	}
+	if err := c.releaseWriteStaging(); err != nil {
+		return priorStrictMountsFenced{}, err
+	}
+	return fence, nil
+}
+
+// cleanlyDischargeMount preserves the other half of the membership contract:
+// when the authority is live, the mount must use its ordinary shutdown path so
+// authenticated Detach deactivates its durable membership record. Exact mount
+// absence verifies that shutdown completed before the next epoch begins.
+func cleanlyDischargeMount(runner commandRunner, mount *process, mountpoint string) error {
+	if err := mount.stop(30 * time.Second); err != nil {
+		return err
+	}
+	present, err := exactMountPresent(runner, mountpoint)
+	if err != nil {
+		return err
+	}
+	if present {
+		return fmt.Errorf("cleanly stopped mount %s remains installed", mountpoint)
+	}
+	return nil
 }
 
 // runDriver runs the workload driver as the service identity and services its
