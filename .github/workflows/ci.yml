@@ -20,10 +20,10 @@ jobs:
   workflow-pins:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -54,7 +54,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Xcode-native complete Swift suite
@@ -63,10 +63,10 @@ jobs:
   go:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -93,10 +93,10 @@ jobs:
   go-darwin:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -113,7 +113,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Verify exact Linux 6.12.100 patch series, UAPI, hooks, and state models
@@ -123,10 +123,10 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -197,7 +197,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Verify the runner can provide loop devices and /dev/fuse
@@ -225,7 +225,7 @@ jobs:
     runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Verify the runner can provide loop devices and /dev/fuse
