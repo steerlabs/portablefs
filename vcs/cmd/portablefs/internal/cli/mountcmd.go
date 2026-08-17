@@ -69,10 +69,12 @@ type mountOpts struct {
 	noLocalDirs           bool
 }
 
-// errFastRetired is the typed refusal for the retired --fast flag: write
-// mode is no longer a mount property — the authority delegates adaptively on
-// every mount, and fsync is always durable at the authority.
-var errFastRetired = fmt.Errorf("--fast is retired: every mount is adaptive (the authority delegates write-back per scope automatically); remove the flag")
+// errFastRetired is the typed refusal for the retired --fast flag. Write mode
+// is no longer a mount property because v3 has no client write-back at all:
+// every write is a strict write-through transaction that is durable at the
+// authority before it is acknowledged. There is nothing left for a "fast" mode
+// to select.
+var errFastRetired = fmt.Errorf("--fast is retired: v3 mounts are strict write-through (every acknowledged write is already durable at the authority); remove the flag")
 
 // errBranchRetired is the typed refusal for the retired --branch flag: a v3
 // volume is branchless — one durable workspace, no branch graph — so there is
@@ -124,7 +126,7 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.Int64Var(&o.enrollmentExpiresAtMs, "mount-enrollment-expires-at-ms", 0, "mount enrollment expiry as unix milliseconds")
 	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
 	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-5 coherence mode)")
-	fs.BoolFunc("fast", "retired: every mount is adaptive; passing this flag is an error", func(string) error {
+	fs.BoolFunc("fast", "retired: v3 mounts are strict write-through; passing this flag is an error", func(string) error {
 		return errFastRetired
 	})
 	fs.Var(&o.localDirs, "local-dir", "refused: machine-local routes are declared volume-wide in "+localdirs.VolumeConfigPath)
@@ -208,10 +210,11 @@ func (o *mountOpts) automaticEnrollment(clientIdentity *clientTLSIdentity, volum
 	return client, time.UnixMilli(o.authExpiresAtMs), nil
 }
 
-// perfOptions carries the FUSE mount cache options plus the write-back
-// engine's durable state location. There is no write-mode knob: the
-// authority delegates adaptively per scope. Plain writes may return before
-// the local group-sync; fsync forces local sync and authority durability.
+// perfOptions carries the FUSE mount cache options plus the retired write-back
+// engine's durable state location. There is no write-mode knob because v3 has
+// no write-back: every write is a strict write-through transaction, durable at
+// the authority before it is acknowledged, so there is no local tail a knob
+// could trade against.
 type perfOptions struct {
 	// negativeCache forces the negative dentry cache on; negativeCacheOff
 	// forces it off. Neither (the default) keeps the v8 baseline: on.
@@ -1660,12 +1663,29 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// The v3 engine. The mount capability is single-use — its nonce is
 		// spent by the attach below — so from here every failure path must
 		// tear down exactly, never retry the attach.
+		// The Linux half of the revocation observation contract. The engine
+		// self-revokes on its own terminal edges — a coherence violation, a
+		// fenced session, a repair budget it could not keep — and this is what
+		// turns that into a durable, machine-readable record. Without it a
+		// revoked mount whose MNT_DETACH failed stayed installed in the
+		// namespace with `portablefs mounts` still calling it live.
+		recordRevocation := func(revocation mountRevocation) {
+			if !setMountRevoked(stateDir, mountPath, revocation.reason, revocation.detail, time.Now().UnixMilli()) {
+				log.Printf("portablefs mount: could not record the revoked status for %s (%s)", mountPath, revocation.reason)
+			}
+			log.Printf("portablefs mount: %s self-revoked (%s): %s", mountPath, revocation.reason, revocation.detail)
+			if !revocation.kernelStateWithdrawn {
+				log.Printf("portablefs mount: %s is revoked but its kernel mount could not be withdrawn; "+
+					"the authority's strict membership for this session must be discharged explicitly", mountPath)
+			}
+		}
 		m, authorityAttached, err := mountFUSEv3(fuseV3Config{
 			addr: authorityURL, token: mountToken, transport: transport,
 			identity: clientIdentity, coherence: o.coherence,
 			volumeID: volumeID, mountPath: mountPath, mountInstanceID: mountInstanceID,
 			backingRoot: localDirsBackingRoot(stateDir, volumeID),
 			noLocalDirs: o.noLocalDirs, requireMountEnrollment: enrollmentClient != nil,
+			onRevoked: recordRevocation,
 		})
 		automaticOwnerEstablished = enrollmentClient != nil && authorityAttached
 		if err != nil {
@@ -2127,11 +2147,19 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				present = false
 			}
 			if present {
-				if revoke, reason := watchdog.observe(time.Now()); revoke {
+				if revoke, verdict := watchdog.observe(time.Now()); revoke {
 					if failClosedReason == "" {
-						failClosedReason = reason
+						failClosedReason = verdict.sentence
+						// Persist the verdict BEFORE attempting the forced
+						// unmount. The mount is already revoked at this point —
+						// it refuses to serve regardless of whether the kernel
+						// lets go — and a forced unmount that wedges must not be
+						// what decides whether anyone ever finds out.
+						if !setMountRevoked(stateDir, mountPath, verdict.reason, verdict.sentence, time.Now().UnixMilli()) {
+							fmt.Fprintf(e.stderr, "portablefs mount: could not record the revoked status for %s\n", mountPath)
+						}
 					}
-					fmt.Fprintf(e.stderr, "portablefs mount: revoking the kernel mount at %s: %s\n", mountPath, reason)
+					fmt.Fprintf(e.stderr, "portablefs mount: revoking the kernel mount at %s: %s\n", mountPath, verdict.sentence)
 					if err := forceRevokeFSKitKernelMount(&state); err != nil {
 						// The watchdog fires again at its next interval; a
 						// revocation that cannot complete is retried, never
@@ -3590,6 +3618,63 @@ func stopMountDaemon(st *mountState) error {
 	)
 }
 
+// mountInventoryRow is one `portablefs mounts` row. It is a package-level
+// type, not a local one, because it IS the command's JSON contract: the
+// fields below are what an agent or the app reads, and a contract that
+// cannot be named cannot be tested.
+type mountInventoryRow struct {
+	MountPath              string   `json:"mountPath"`
+	VolumeID               string   `json:"volumeId"`
+	Branch                 string   `json:"branch"`
+	PID                    int      `json:"pid"`
+	Strategy               string   `json:"strategy"`
+	AuthorityURL           string   `json:"authorityUrl,omitempty"`
+	AttachRef              string   `json:"attachRef,omitempty"`
+	AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
+	StartedAtMs            int64    `json:"startedAtMs"`
+	LocalDirs              []string `json:"localDirs,omitempty"`
+	// LocalRoutes and LocalRouteRevision are the machine-local route set
+	// a FUSE mount activated and the revision it answers for.
+	LocalRoutes        []string `json:"localRoutes,omitempty"`
+	LocalRouteRevision string   `json:"localRouteRevision,omitempty"`
+	Alive              bool     `json:"alive"`
+	Status             string   `json:"status,omitempty"`
+	StatusChangedAtMs  int64    `json:"statusChangedAtMs,omitempty"`
+	// StatusReason and StatusDetail carry a revocation's machine-readable
+	// class and the engine's own sentence. They are the reason a revoked
+	// mount is actionable rather than merely alarming, and they are
+	// recorded identically by the Linux and macOS supervisors.
+	StatusReason string `json:"statusReason,omitempty"`
+	StatusDetail string `json:"statusDetail,omitempty"`
+	// Health folds pid-liveness and the persisted status:
+	// live | stale | credential-expired | revoked | cleanup-required.
+	Health string `json:"health"`
+	// AttachState is the daemon-reported attach state (degraded carries
+	// the daemon's last error in the printed line).
+	AttachState string `json:"attachState,omitempty"`
+	// SessionTerminal is the daemon's verdict that this attach's authority
+	// session ended permanently. The macOS revocation watchdog has always
+	// branched on it, but it never reached --json, so an agent could see a
+	// mount the supervisor was about to revoke and read it as healthy.
+	SessionTerminal bool `json:"sessionTerminal,omitempty"`
+	// AttachError is the daemon's own lastError for the attach. The
+	// printed line already shows it; the JSON view dropped it, so an agent
+	// reading --json could see attachState=degraded with no reason at all.
+	AttachError string `json:"attachError,omitempty"`
+	// CleanupRequired marks a durable operation intent with no matching
+	// mount-state record. It is deliberately a first-class inventory row:
+	// crash recovery must never disappear from the CLI or app view.
+	CleanupRequired           bool   `json:"cleanupRequired,omitempty"`
+	OperationPhase            string `json:"operationPhase,omitempty"`
+	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
+	EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
+	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
+	LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
+	NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
+	ReauthorizationFailures   uint64 `json:"reauthorizationFailures,omitempty"`
+	ReauthorizationError      string `json:"reauthorizationError,omitempty"`
+}
+
 func cmdMounts(e *cmdEnv, args []string) int {
 	fs := newFlagSet("mounts")
 	var o commonOpts
@@ -3609,47 +3694,6 @@ func cmdMounts(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mounts", err)
 	}
-	type mountRow struct {
-		MountPath              string   `json:"mountPath"`
-		VolumeID               string   `json:"volumeId"`
-		Branch                 string   `json:"branch"`
-		PID                    int      `json:"pid"`
-		Strategy               string   `json:"strategy"`
-		AuthorityURL           string   `json:"authorityUrl,omitempty"`
-		AttachRef              string   `json:"attachRef,omitempty"`
-		AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
-		StartedAtMs            int64    `json:"startedAtMs"`
-		LocalDirs              []string `json:"localDirs,omitempty"`
-		// LocalRoutes and LocalRouteRevision are the machine-local route set
-		// a FUSE mount activated and the revision it answers for.
-		LocalRoutes        []string `json:"localRoutes,omitempty"`
-		LocalRouteRevision string   `json:"localRouteRevision,omitempty"`
-		Alive              bool     `json:"alive"`
-		Status             string   `json:"status,omitempty"`
-		StatusChangedAtMs  int64    `json:"statusChangedAtMs,omitempty"`
-		// Health folds pid-liveness and the persisted credential status:
-		// live | stale | credential-expired.
-		Health string `json:"health"`
-		// AttachState is the daemon-reported attach state (degraded carries
-		// the daemon's last error in the printed line).
-		AttachState string `json:"attachState,omitempty"`
-		// AttachError is the daemon's own lastError for the attach. The
-		// printed line already shows it; the JSON view dropped it, so an agent
-		// reading --json could see attachState=degraded with no reason at all.
-		AttachError string `json:"attachError,omitempty"`
-		// CleanupRequired marks a durable operation intent with no matching
-		// mount-state record. It is deliberately a first-class inventory row:
-		// crash recovery must never disappear from the CLI or app view.
-		CleanupRequired           bool   `json:"cleanupRequired,omitempty"`
-		OperationPhase            string `json:"operationPhase,omitempty"`
-		MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
-		EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
-		AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
-		LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
-		NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
-		ReauthorizationFailures   uint64 `json:"reauthorizationFailures,omitempty"`
-		ReauthorizationError      string `json:"reauthorizationError,omitempty"`
-	}
 	var daemonView map[string]cliAttachStatus
 	for i := range states {
 		if states[i].Strategy == "fskit" && states[i].AttachRef != "" {
@@ -3660,7 +3704,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			break
 		}
 	}
-	rows := make([]mountRow, 0, len(states))
+	rows := make([]mountInventoryRow, 0, len(states))
 	statePaths := make(map[string]struct{}, len(states))
 	for i := range states {
 		st := &states[i]
@@ -3668,7 +3712,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// mountState contains the live access credential because the daemon
 		// needs it for renewal. Never embed that persistence object in a
 		// presentation type: JSON output is routinely captured in agent logs.
-		row := mountRow{
+		row := mountInventoryRow{
 			MountPath:              st.MountPath,
 			VolumeID:               st.VolumeID,
 			Branch:                 st.Branch,
@@ -3685,6 +3729,8 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			Status:                 st.Status,
 			Health:                 e.classifyMount(st),
 			StatusChangedAtMs:      st.StatusChangedAtMs,
+			StatusReason:           st.StatusReason,
+			StatusDetail:           st.StatusDetail,
 			MountEnrollmentID:      st.MountEnrollmentID, EnrollmentExpiresAtMs: st.EnrollmentExpiresAtMs,
 			AuthorizationDeadlineAtMs: st.AuthorizationDeadlineAtMs, LastReauthorizationAtMs: st.LastReauthorizationAtMs,
 			NextReauthorizationAtMs: st.NextReauthorizationAtMs, ReauthorizationFailures: st.ReauthorizationFailures,
@@ -3693,6 +3739,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		if a, ok := daemonView[states[i].AttachRef]; ok {
 			row.AttachState = a.State
 			row.AttachError = a.LastError
+			row.SessionTerminal = a.SessionTerminal
 			if a.MountEnrollmentID != "" {
 				row.MountEnrollmentID = a.MountEnrollmentID
 				row.EnrollmentExpiresAtMs = a.EnrollmentExpiresAtMs
@@ -3710,7 +3757,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		if _, tracked := statePaths[intent.MountPath]; tracked {
 			continue
 		}
-		rows = append(rows, mountRow{
+		rows = append(rows, mountInventoryRow{
 			MountPath:       intent.MountPath,
 			VolumeID:        intent.VolumeID,
 			Branch:          intent.Branch,
@@ -3735,6 +3782,8 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			mountPath:         row.MountPath,
 			operationPhase:    row.OperationPhase,
 			statusChangedAtMs: row.StatusChangedAtMs,
+			statusReason:      row.StatusReason,
+			statusDetail:      row.StatusDetail,
 			attachState:       row.AttachState,
 			attachLastError:   row.AttachError,
 		})
@@ -3761,7 +3810,12 @@ type mountStatusInput struct {
 	mountPath         string
 	operationPhase    string
 	statusChangedAtMs int64
-	attachState       string
+	// statusReason and statusDetail are a revocation's recorded class and the
+	// engine's sentence. A revoked mount's whole value to an operator is why,
+	// so the word carries both rather than a bare "revoked".
+	statusReason string
+	statusDetail string
+	attachState  string
 	// attachLastError is the daemon's own sentence for this degradation. A
 	// router refusal has three different conditions behind it with three
 	// different remedies, and a fixed status word cannot name which — so for
@@ -3799,6 +3853,25 @@ func mountStatusWord(row mountStatusInput) string {
 		return "credential-expired" + since +
 			" (this mount's authorization ended and can no longer be renewed; mount again " +
 			"with a fresh volume mount capability)"
+	case mountStatusRevoked:
+		// A revoked mount refuses to serve and can never serve again. It is
+		// reported ahead of liveness precisely because it may still look alive:
+		// its owner is running and, when the withdrawal escalation could not
+		// finish, its kernel mount is still installed.
+		since := ""
+		if row.statusChangedAtMs != 0 {
+			since = " since " + formatMs(row.statusChangedAtMs)
+		}
+		word := "revoked" + since
+		if row.statusReason != "" {
+			word += " (" + row.statusReason
+			if row.statusDetail != "" {
+				word += ": " + row.statusDetail
+			}
+			word += "; run `portablefs umount " + row.mountPath + "` and mount again)"
+			return word
+		}
+		return word + " (run `portablefs umount " + row.mountPath + "` and mount again)"
 	}
 	if row.attachState != "degraded" {
 		return "live"

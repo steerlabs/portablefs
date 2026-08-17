@@ -510,7 +510,7 @@ func readLocalRoutesRecordByStorage(mountsDir, storageID string) (*localRoutesRe
 }
 
 // localRouteStatusRow is one volume's machine-local routing, as
-// `portablefs status` prints it.
+// `portablefs route` prints it.
 type localRouteStatusRow struct {
 	// Revision is the volume declaration's revision, the value every mount of
 	// the volume must agree on.
@@ -622,7 +622,7 @@ func (e *cmdEnv) localRoutesOf(volumeID, branch string) *localRouteStatusRow {
 }
 
 // printLocalRoutes renders the machine-local routing lines of
-// `portablefs status`.
+// `portablefs route`.
 func (e *cmdEnv) printLocalRoutes(row *localRouteStatusRow) {
 	if row == nil {
 		return

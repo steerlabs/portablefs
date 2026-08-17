@@ -427,6 +427,12 @@ func (c *coherence) run(ctx context.Context) {
 	}
 }
 
+// errRepairBudgetExceeded classifies the one revocation cause a supervisor can
+// act on differently: this mount was healthy but too slow to repair. It is a
+// sentinel rather than a formatted string so classifyRevocationReason never has
+// to read prose.
+var errRepairBudgetExceeded = errors.New("fusev3: visibility phase exceeded the repair budget this mount declared")
+
 // applyWithinBudget performs exactly one phase under the deadline this mount
 // declared at attach. A kernel notification cannot be cancelled once it is
 // inside write(2), so the budget is enforced by revoking the mount, which
@@ -434,7 +440,7 @@ func (c *coherence) run(ctx context.Context) {
 // frontend keeps, not a hope that the kernel is quick.
 func (c *coherence) applyWithinBudget(ctx context.Context, event *authoritypb.VisibilityEvent) error {
 	overdue := time.AfterFunc(c.budget, func() {
-		c.mount.revoke(fmt.Errorf("fusev3: visibility phase exceeded the %s repair budget this mount declared", c.budget))
+		c.mount.revoke(fmt.Errorf("%w (%s)", errRepairBudgetExceeded, c.budget))
 	})
 	defer overdue.Stop()
 	return c.apply(ctx, event)
@@ -886,21 +892,206 @@ func (m *Mount) revoke(cause error) {
 	m.failAsync(cause)
 }
 
+// The revocation reason vocabulary. It is the machine-readable half of a
+// revocation report: one bounded token a supervisor can branch on and persist,
+// beside the frontend's own sentence which it can only print. The identical
+// tokens are the ones the macOS supervisor's watchdog produces (see the CLI's
+// fskit_revocation.go), so one operator-facing vocabulary covers both
+// platforms even though the mechanisms behind them cannot be shared.
+const (
+	// RevocationSessionTerminal: the authority session ended permanently, so
+	// nothing can repair this kernel's caches again.
+	RevocationSessionTerminal = "session-terminal"
+	// RevocationRepairBudgetExceeded: this mount was still connected but did
+	// not complete a visibility phase inside the budget it declared at attach.
+	RevocationRepairBudgetExceeded = "repair-budget-exceeded"
+	// RevocationRoutesChanged: the volume's machine-local route declaration
+	// moved under a mount whose topology is fixed for its lifetime.
+	RevocationRoutesChanged = "routes-changed"
+	// RevocationCoherenceViolation: the residual class. This frontend found a
+	// state it cannot serve coherently and stopped being a filesystem.
+	RevocationCoherenceViolation = "coherence-violation"
+)
+
+// classifyRevocationReason reduces the recorded cause to one vocabulary token.
+// Only causes with a sentinel behind them are classified; everything else is a
+// coherence violation, which is the honest default because that is what every
+// unclassified revoke callsite in this package actually is.
+func classifyRevocationReason(cause error) string {
+	switch {
+	case cause == nil:
+		return RevocationCoherenceViolation
+	case errors.Is(cause, errRepairBudgetExceeded):
+		return RevocationRepairBudgetExceeded
+	case errors.Is(cause, errRoutesChanged):
+		return RevocationRoutesChanged
+	case errors.Is(cause, authorityrpc.ErrSessionEnded):
+		return RevocationSessionTerminal
+	default:
+		return RevocationCoherenceViolation
+	}
+}
+
+// RevocationReport is one self-revocation made observable: why this mount
+// stopped serving, and what its escalating withdrawal actually proved about the
+// kernel state it left behind.
+//
+// KernelStateWithdrawn is the load-bearing field. A revoked mount whose kernel
+// mount is still installed is not a tidy failure: the dead FUSE mount remains
+// in the namespace, no mount-absence proof can be produced, and the authority's
+// durable strict membership therefore stays active until an operator discharges
+// it by hand. Reporting false is what lets a supervisor say so instead of
+// showing the mount as live.
+type RevocationReport struct {
+	Reason               string
+	Cause                string
+	KernelStateWithdrawn bool
+	// Withdrawal names every escalation step that failed, in order, as
+	// "<round>/<step>: <error>". It is empty on a first-attempt withdrawal.
+	Withdrawal []string
+}
+
+// withdrawalRounds bounds the escalation ladder. Three rounds is the smallest
+// number that expresses the whole escalation — detach, abort, re-detach — and
+// still leaves one round of margin; the ladder is additionally bounded by the
+// repair budget this mount declared, because a withdrawal that outlived the
+// budget has already lost the race it exists to win.
+const withdrawalRounds = 3
+
+// withdrawalRetryDelay is the first inter-round pause, doubled each round. It
+// is short: the kernel references a busy detach could not take back are
+// released by the abort in the same round, not by waiting.
+const withdrawalRetryDelay = 25 * time.Millisecond
+
+// withdrawalOutcome accumulates what the ladder did. installed records whether
+// there was a recorded kernel identity to withdraw at all, which is different
+// from having withdrawn one: a startup that failed before mountinfo yielded an
+// ID has nothing here whose absence could be proven.
+type withdrawalOutcome struct {
+	installed bool
+	withdrawn bool
+	failures  []string
+}
+
+func (o *withdrawalOutcome) record(round int, step string, err error) {
+	if err == nil {
+		return
+	}
+	o.failures = append(o.failures, fmt.Sprintf("%d/%s: %v", round, step, err))
+}
+
+// kernelWithdrawal is the set of kernel primitives the escalation ladder
+// drives. Production binds them to the real syscalls; a test substitutes them
+// to exercise the escalation without a kernel, which is the only way to cover
+// the failure ladder at all — a unit test cannot make MNT_DETACH return EPERM.
+type kernelWithdrawal struct {
+	detach func(point string) error
+	abort  func(kernelMount) error
+	absent func(kernelMount) (MountAbsenceProof, error)
+	sleep  func(time.Duration)
+}
+
+func productionKernelWithdrawal() kernelWithdrawal {
+	return kernelWithdrawal{
+		detach: func(point string) error { return unix.Unmount(point, unix.MNT_DETACH) },
+		abort:  func(k kernelMount) error { return k.abortKernelConnection() },
+		absent: func(k kernelMount) (MountAbsenceProof, error) { return k.absent() },
+		sleep:  time.Sleep,
+	}
+}
+
+func (m *Mount) withdrawalOps() kernelWithdrawal {
+	if m.withdrawal.detach != nil {
+		return m.withdrawal
+	}
+	return productionKernelWithdrawal()
+}
+
 // withdrawKernelState is the strict half of teardown. It runs on the teardown
-// goroutine because two of its three steps can block, and none of them may
-// block whoever discovered the failure.
-func (m *Mount) withdrawKernelState() {
+// goroutine because most of its steps can block, and none of them may block
+// whoever discovered the failure.
+//
+// Every step's error is now checked. It used to discard all three, which read
+// as harmless because the happy path is one successful MNT_DETACH — but under
+// load MNT_DETACH can fail, and a discarded failure left a dead FUSE mount
+// installed in the namespace with the CLI still reporting it live and the
+// authority still holding this participant's strict membership. So the steps
+// are an escalation ladder instead: detach, then abort the FUSE connection —
+// which is what makes the kernel drop the references the detach could not take
+// back — then prove absence, then re-detach and repeat, bounded by
+// withdrawalRounds and by the declared repair budget. Whatever it proves is
+// returned, so the caller can persist a truthful verdict either way.
+func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	m.revoked.Store(true)
+	ops := m.withdrawalOps()
 	installed := m.kernelMount
-	if installed.point != "" {
-		_ = unix.Unmount(installed.point, unix.MNT_DETACH)
+	out := withdrawalOutcome{installed: installed.point != ""}
+
+	// Round one's namespace detach runs before the cached-name withdrawal, so
+	// the tree is already unreachable from the namespace root while the
+	// bindings are being taken back one at a time.
+	if out.installed {
+		out.record(1, "detach", ops.detach(installed.point))
 	}
 	if m.raw != nil {
 		m.raw.revokeCachedNames(time.Now().Add(m.repairBudget))
 	}
-	if installed.device != "" {
-		_ = installed.abortKernelConnection()
+	deadline := time.Now().Add(m.repairBudget)
+	delay := withdrawalRetryDelay
+	for round := 1; ; round++ {
+		// Aborting is unconditional and is never skipped just because the
+		// detach reported success: it is the only primitive that unblocks a
+		// reverse notification already parked on a VFS lock, so it is what
+		// bounds self-revocation, and it is also what forces the kernel to
+		// release a mount a busy detach could not remove.
+		if installed.device != "" {
+			out.record(round, "abort", ops.abort(installed))
+		}
+		if !out.installed {
+			// No recorded kernel identity: startup failed before mountinfo
+			// yielded one. There is nothing here whose absence this ladder
+			// could prove, and the caller falls back to the ordinary unmount.
+			return out
+		}
+		if _, err := ops.absent(installed); err == nil {
+			out.withdrawn = true
+			return out
+		} else {
+			out.record(round, "absence", err)
+		}
+		if round >= withdrawalRounds || !time.Now().Before(deadline) {
+			return out
+		}
+		ops.sleep(delay)
+		delay *= 2
+		out.record(round+1, "detach", ops.detach(installed.point))
 	}
+}
+
+// reportRevocation hands the supervisor the terminal verdict exactly once, from
+// the teardown goroutine, as soon as the ladder has finished. It deliberately
+// does not wait for Close: when withdrawal fails there may be no later moment
+// at which the supervisor learns anything at all, and an unobserved revocation
+// is the defect this whole path exists to remove.
+//
+// A recorded fatal cause is required. Not every path through the teardown
+// goroutine is a revocation: the benign /dev/fuse reply race that follows an
+// already-observed external unmount schedules the same teardown without
+// recording any cause, and reporting that as a revocation would stamp a
+// terminal verdict onto an ordinary clean unmount.
+func (m *Mount) reportRevocation(out withdrawalOutcome) {
+	observe := m.onRevoked
+	cause := m.fatalError()
+	if observe == nil || cause == nil {
+		return
+	}
+	report := RevocationReport{
+		Reason:               classifyRevocationReason(cause),
+		Cause:                cause.Error(),
+		KernelStateWithdrawn: out.withdrawn,
+		Withdrawal:           out.failures,
+	}
+	m.revokeOnce.Do(func() { observe(report) })
 }
 
 func (m *Mount) isRevoked() bool { return m.revoked.Load() }

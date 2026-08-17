@@ -2314,10 +2314,28 @@ func (m *Mount) scheduleAbort() {
 			// published names and attributes that nothing can correct any more,
 			// so it withdraws them and makes itself unreachable before it even
 			// tries an ordinary unmount.
-			m.withdrawKernelState()
-			if m.server != nil {
-				_ = m.Unmount()
+			outcome := m.withdrawKernelState()
+			// Report first. Everything below can block — the ordinary unmount,
+			// the serving-connection wait inside Close, the authority round trip
+			// — and a revocation the supervisor never hears about is exactly the
+			// hole this path closes.
+			m.reportRevocation(outcome)
+			// The ordinary unmount is attempted only when the escalation ladder
+			// could NOT prove this mount gone. After a proven withdrawal it is
+			// pure noise: the mountpoint is already detached, so it would fail
+			// on every single revocation and poison the recorded verdict with a
+			// duplicate. When the ladder failed it is the last thing left to
+			// try, and its failure is diagnostic truth worth recording.
+			if m.server != nil && !(outcome.installed && outcome.withdrawn) {
+				if err := m.Unmount(); err != nil {
+					m.recordFatalCause(fmt.Errorf(
+						"fusev3: revoked mount could not be withdrawn from the kernel and the ordinary unmount also failed: %w", err))
+				}
 			}
+			// Close runs the clean-detach absence proof (see Mount.detach). A
+			// proven withdrawal is what makes that proof obtainable, so a
+			// successful escalation discharges the authority's durable strict
+			// membership automatically instead of leaving it for an operator.
 			_ = m.Close()
 		}()
 	})

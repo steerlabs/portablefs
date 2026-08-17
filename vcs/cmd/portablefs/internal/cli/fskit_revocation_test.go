@@ -15,22 +15,22 @@ func watchdogWithResults(results ...fskitRevocationProbeResult) *fskitRevocation
 	return w
 }
 
-func advanceObserve(t *testing.T, w *fskitRevocationWatchdog, steps int) (bool, string) {
+func advanceObserve(t *testing.T, w *fskitRevocationWatchdog, steps int) (bool, fskitRevocationVerdict) {
 	t.Helper()
 	now := w.last
 	if now.IsZero() {
 		now = time.Unix(1000, 0)
 	}
 	var revoke bool
-	var reason string
+	var verdict fskitRevocationVerdict
 	for s := 0; s < steps; s++ {
 		now = now.Add(w.interval)
-		revoke, reason = w.observe(now)
+		revoke, verdict = w.observe(now)
 		if revoke {
-			return revoke, reason
+			return revoke, verdict
 		}
 	}
-	return revoke, reason
+	return revoke, verdict
 }
 
 func TestRevocationWatchdogRunsAtOneThirdOfTheRepairBudget(t *testing.T) {
@@ -55,12 +55,17 @@ func TestRevocationWatchdogRevokesATerminalSessionOnOneProbe(t *testing.T) {
 	w := watchdogWithResults(fskitRevocationProbeResult{
 		daemonHealthy: true, attachPresent: true, sessionTerminal: true,
 	})
-	revoke, reason := advanceObserve(t, w, 1)
+	revoke, verdict := advanceObserve(t, w, 1)
 	if !revoke {
 		t.Fatal("a terminal session was not revoked on its first probe; every extra interval is served stale cache")
 	}
-	if reason == "" {
+	if verdict.sentence == "" {
 		t.Fatal("a revocation carried no reason")
+	}
+	// The class is what a supervisor persists and a program branches on; a
+	// sentence alone is not machine-readable.
+	if verdict.reason != mountRevokedSessionTerminal {
+		t.Fatalf("terminal session classified as %q, want %q", verdict.reason, mountRevokedSessionTerminal)
 	}
 }
 
@@ -76,12 +81,15 @@ func TestRevocationWatchdogConfirmsDaemonDeathBeforeRevoking(t *testing.T) {
 
 func TestRevocationWatchdogRevokesWhenTheDaemonForgotTheAttach(t *testing.T) {
 	w := watchdogWithResults(fskitRevocationProbeResult{daemonHealthy: true})
-	revoke, reason := advanceObserve(t, w, fskitRevocationConfirmations)
+	revoke, verdict := advanceObserve(t, w, fskitRevocationConfirmations)
 	if !revoke {
 		t.Fatal("a daemon that no longer owns the attach cannot repair the kernel; the mount must be revoked")
 	}
-	if reason == "" {
+	if verdict.sentence == "" {
 		t.Fatal("a revocation carried no reason")
+	}
+	if verdict.reason != mountRevokedAttachNotOwned {
+		t.Fatalf("forgotten attach classified as %q, want %q", verdict.reason, mountRevokedAttachNotOwned)
 	}
 }
 

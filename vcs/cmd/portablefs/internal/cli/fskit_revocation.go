@@ -70,12 +70,22 @@ func newFSKitRevocationWatchdog(probe func() fskitRevocationProbeResult) *fskitR
 	}
 }
 
+// fskitRevocationVerdict is one decision to revoke: the machine-readable class
+// a supervisor persists into the mount state record, and the sentence it
+// prints. The class tokens are the shared cross-platform vocabulary defined in
+// mountstate.go, so a Linux and a macOS revocation are readable by one
+// consumer.
+type fskitRevocationVerdict struct {
+	reason   string
+	sentence string
+}
+
 // observe runs at the supervisor's tick rate and rate-limits real probes to
 // the watchdog interval. It reports whether the kernel mount must be revoked
 // NOW, and why.
-func (w *fskitRevocationWatchdog) observe(now time.Time) (revoke bool, reason string) {
+func (w *fskitRevocationWatchdog) observe(now time.Time) (revoke bool, verdict fskitRevocationVerdict) {
 	if !w.last.IsZero() && now.Sub(w.last) < w.interval {
-		return false, ""
+		return false, fskitRevocationVerdict{}
 	}
 	w.last = now
 	result := w.probe()
@@ -83,27 +93,36 @@ func (w *fskitRevocationWatchdog) observe(now time.Time) (revoke bool, reason st
 	return w.decide(result)
 }
 
-func (w *fskitRevocationWatchdog) decide(result fskitRevocationProbeResult) (bool, string) {
+func (w *fskitRevocationWatchdog) decide(result fskitRevocationProbeResult) (bool, fskitRevocationVerdict) {
 	switch {
 	case result.daemonHealthy && result.attachPresent && result.sessionTerminal:
 		// Definitive on one probe: the daemon itself reports the session can
 		// never repair the kernel's caches again.
 		w.unhealthy = 0
-		return true, "the v3 authority session is terminal and can never repair this kernel's caches again"
+		return true, fskitRevocationVerdict{
+			reason:   mountRevokedSessionTerminal,
+			sentence: "the v3 authority session is terminal and can never repair this kernel's caches again",
+		}
 	case result.daemonHealthy && result.attachPresent:
 		// A detaching attach is owned by a running unmount transaction whose
 		// own barrier ends in an exact kernel detach; healthy either way.
 		w.unhealthy = 0
-		return false, ""
+		return false, fskitRevocationVerdict{}
 	}
 	w.unhealthy++
 	if w.unhealthy < fskitRevocationConfirmations {
-		return false, ""
+		return false, fskitRevocationVerdict{}
 	}
 	if !w.lastResult.daemonHealthy {
-		return true, "portablefsd stopped answering; nothing can repair this kernel's caches"
+		return true, fskitRevocationVerdict{
+			reason:   mountRevokedDaemonUnreachable,
+			sentence: "portablefsd stopped answering; nothing can repair this kernel's caches",
+		}
 	}
-	return true, "portablefsd no longer owns this attach; nothing can repair this kernel's caches"
+	return true, fskitRevocationVerdict{
+		reason:   mountRevokedAttachNotOwned,
+		sentence: "portablefsd no longer owns this attach; nothing can repair this kernel's caches",
+	}
 }
 
 // daemonCanFinalize reports whether the daemon-owned detach barrier is worth

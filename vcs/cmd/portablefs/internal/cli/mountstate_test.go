@@ -31,9 +31,8 @@ func TestPerfOptionsFromEnv(t *testing.T) {
 		t.Fatalf("PORTABLEFS_NEGATIVE_CACHE=0 must force off: %+v", p)
 	}
 
-	// The retired write-back knobs are inert: the authority decides
-	// delegation adaptively, batching is fixed, fsync is always the
-	// authority barrier.
+	// The retired write-back knobs are inert: v3 is strict write-through, so
+	// there is no local tail to batch, flush, or park.
 	p = perfOptionsFromEnv(env(map[string]string{
 		"PORTABLEFS_WRITEBACK":         "1",
 		"PORTABLEFS_FLUSH_MS":          "100",

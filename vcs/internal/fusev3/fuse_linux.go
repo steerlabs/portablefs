@@ -158,6 +158,16 @@ type Config struct {
 	// Debug enables the underlying FUSE request/reply trace. It is diagnostic
 	// only and leaves the negotiated protocol and serving semantics unchanged.
 	Debug bool
+
+	// OnRevoked is called exactly once, from the teardown goroutine, when this
+	// mount self-revokes and its kernel-state withdrawal has finished. It is a
+	// Config field rather than a setter because a revocation can happen before
+	// MountVolume even returns, and a supervisor that learned about it late
+	// would have nothing to persist.
+	//
+	// It must not block: the same goroutine goes on to unmount and release the
+	// authority session. Persisting one small state record is what it is for.
+	OnRevoked func(RevocationReport)
 }
 
 // cleanStartupFailure is an error whose failed mount attempt has no remaining
@@ -229,6 +239,11 @@ type Mount struct {
 	revokeOnce        sync.Once
 	notifyMu          sync.Mutex
 	notify            kernelNotifier
+	// onRevoked is the supervisor's revocation observer (Config.OnRevoked) and
+	// withdrawal the kernel primitives the escalation ladder drives; a zero
+	// withdrawal selects the production syscalls.
+	onRevoked  func(RevocationReport)
+	withdrawal kernelWithdrawal
 
 	// grafts serves the machine-local routes, nil when the volume declares
 	// none. routesRevision is the declaration this mount attached with, and is
@@ -412,6 +427,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		nameCapacity:         cfg.CachedNameCapacity,
 		repairBudget:         cfg.RepairBudget,
 		routesRevision:       cfg.Routes.Revision(),
+		onRevoked:            cfg.OnRevoked,
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -47,6 +48,32 @@ type fuseV3Config struct {
 	// of serving them (adopt=false in the attach protocol).
 	noLocalDirs            bool
 	requireMountEnrollment bool
+	// onRevoked observes this mount's self-revocation. It is handed to the
+	// engine at construction because a strict mount can revoke before
+	// MountVolume returns, and the supervisor's whole job here is to persist a
+	// verdict it might otherwise never hear.
+	onRevoked func(mountRevocation)
+}
+
+// fuseRevocation translates the engine's report into the platform-neutral
+// verdict the supervisor persists. The withdrawal failures are folded into the
+// detail sentence because they are the operator-facing consequence: a
+// revocation whose kernel state could not be withdrawn leaves a dead FUSE mount
+// installed in this namespace, which no amount of status reporting removes.
+func fuseRevocation(report fusev3.RevocationReport) mountRevocation {
+	detail := report.Cause
+	if !report.KernelStateWithdrawn {
+		detail += " [kernel state not withdrawn: the revoked FUSE mount is still installed"
+		if len(report.Withdrawal) > 0 {
+			detail += "; " + strings.Join(report.Withdrawal, "; ")
+		}
+		detail += "]"
+	}
+	return mountRevocation{
+		reason:               report.Reason,
+		detail:               detail,
+		kernelStateWithdrawn: report.KernelStateWithdrawn,
+	}
 }
 
 // fuseV3Mount is one live fusev3 kernel mount plus the routing it was
@@ -149,6 +176,11 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
 		Coherence: profile, CachedNameCapacity: mountv3.CachedNameCapacity, RepairBudget: mountv3.RepairBudget,
 		Routes: rules, LocalBacking: backing,
+		OnRevoked: func(report fusev3.RevocationReport) {
+			if cfg.onRevoked != nil {
+				cfg.onRevoked(fuseRevocation(report))
+			}
+		},
 	})
 	if err != nil {
 		// MountVolume owns the ACTIVE session as soon as it is called. Its

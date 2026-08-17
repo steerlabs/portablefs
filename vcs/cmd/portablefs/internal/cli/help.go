@@ -284,13 +284,22 @@ and no umount path — including --force — ever reads standard input.
   portablefs mounts [--json]
 
 List this machine's recorded mounts with their health: live (daemon serving),
-stale (daemon gone; umount cleans up), or credential-expired (the daemon is
-running but this mount's credential ended). A v3 mount capability is single-use.
+stale (daemon gone; umount cleans up), credential-expired (the daemon is
+running but this mount's credential ended), or revoked (the mount fenced
+itself and will never serve again). A v3 mount capability is single-use.
 A hosted enrolled mount refreshes automatically before its safety cutoff.
 Standalone hosted integrations can call portablefs reauthorize explicitly;
 once the credential is already expired, a new capability and remount is
 required. The mount log under
 ~/.local/state/portablefs/mounts/ carries the daemon's own reason.
+
+A revoked mount is reported ahead of every liveness check, because it may
+still look alive: its owner process runs and, when the kernel refused to
+release it, its mount is still installed. --json carries the machine-readable
+class in statusReason — session-terminal, repair-budget-exceeded,
+routes-changed, coherence-violation, daemon-unreachable, attach-not-owned —
+with the engine's own sentence in statusDetail. Revocation is terminal: run
+portablefs umount on the path and mount again.
 `,
 		"mount-check": `USAGE
   portablefs mount-check [--strategy auto|fskit|fuse] [--json]
@@ -314,9 +323,12 @@ Read-only environment health check, in the spirit of brew doctor. Verifies,
 in order: the config file parses (listing every profile's server and the
 active one), the active server answers a cheap GET (an unauthenticated
 401/404 still proves it is there), the saved token is still accepted, this
-binary meets the server's advertised minimum CLI version, and — on macOS —
-the selected mount transport, FSKit PlugInKit inventory (which does not claim
-enablement), portablefsd daemon health, and this machine's recorded mounts.
+binary meets the server's advertised minimum CLI version, the selected mount
+transport, this machine's recorded mounts, and each mount's authority session.
+The session check reads portablefsd's attach table on macOS and the per-mount
+state the FUSE supervisor persists on Linux; on either platform it reports
+mounts that have revoked themselves. FSKit PlugInKit inventory (which does not
+claim enablement) and portablefsd daemon health are macOS-only.
 
 Each check prints PASS, FAIL, UNKNOWN, or SKIP with a one-line fix for every
 definite FAIL. UNKNOWN is an honest unverified state and does not change the
