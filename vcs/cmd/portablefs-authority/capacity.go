@@ -9,7 +9,22 @@ const (
 	defaultMaxSessions                 = 1024
 	transportConnectionsPerLiveSession = 4
 	defaultMaxConnections              = defaultMaxSessions * transportConnectionsPerLiveSession
+	defaultMaxInFlight                 = 256
+	defaultMaxWriteTransactions        = 4096
+	// The authority has no item-capacity negotiation. This must remain at least
+	// mountv3.CachedNameCapacity so a stock mount can retain its declared cache.
+	defaultMaxItemsPerSession = 1 << 16
 )
+
+func defaultWriteTransactionsPerSession(maxInFlight int, maxWriteTransactions uint) uint {
+	if maxInFlight <= 0 || maxWriteTransactions == 0 {
+		return 0
+	}
+	if uint64(maxInFlight) < uint64(maxWriteTransactions) {
+		return uint(maxInFlight)
+	}
+	return maxWriteTransactions
+}
 
 // validateConnectionCapacity keeps physical transport admission ahead of the
 // logical session limit. Protocol 5 holds one DATA and one CONTROL connection

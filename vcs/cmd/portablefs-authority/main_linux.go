@@ -89,7 +89,7 @@ func run() error {
 	flag.UintVar(&o.replaySlots, "max-replay-slots", 256, "maximum concurrent retry slots per session")
 	flag.UintVar(&o.maxSessions, "max-sessions", defaultMaxSessions, "maximum live mount sessions for this volume worker")
 	flag.UintVar(&o.maxLockRecords, "max-lock-records", 65536, "maximum held and waiting POSIX lock records")
-	flag.UintVar(&o.maxItemsPerSession, "max-items-per-session", 8192, "maximum descriptor-backed item capabilities per session")
+	flag.UintVar(&o.maxItemsPerSession, "max-items-per-session", defaultMaxItemsPerSession, "maximum descriptor-backed item capabilities per session")
 	flag.UintVar(&o.maxOpensPerSession, "max-opens-per-session", 4096, "maximum open file descriptions per session")
 	flag.UintVar(&o.maxItems, "max-items", 65536, "maximum descriptor-backed item capabilities for the worker")
 	flag.UintVar(&o.maxOpens, "max-opens", 32768, "maximum open file descriptions for the worker")
@@ -98,15 +98,15 @@ func run() error {
 	flag.StringVar(&o.writeStaging, "write-staging-dir", "", "absolute private 0700 directory for unnamed transactional-write staging")
 	flag.Uint64Var(&o.maxWriteStagingBytesPerSession, "max-write-staging-bytes-per-session", 16<<30, "staging bytes reserved by one session")
 	flag.Uint64Var(&o.maxWriteStagingBytes, "max-write-staging-bytes", 64<<30, "staging bytes reserved by this worker")
-	flag.UintVar(&o.maxWriteTransactionsPerSession, "max-write-transactions-per-session", 8, "inert or committing write transactions owned by one session")
-	flag.UintVar(&o.maxWriteTransactions, "max-write-transactions", 4096, "inert or committing write transactions owned by this worker")
+	flag.UintVar(&o.maxWriteTransactionsPerSession, "max-write-transactions-per-session", defaultWriteTransactionsPerSession(defaultMaxInFlight, defaultMaxWriteTransactions), "inert or committing write transactions owned by one session")
+	flag.UintVar(&o.maxWriteTransactions, "max-write-transactions", defaultMaxWriteTransactions, "inert or committing write transactions owned by this worker")
 	flag.DurationVar(&o.writeTransactionProgressTimeout, "write-transaction-progress-timeout", 2*time.Minute, "maximum idle interval between write transaction phases")
-	flag.DurationVar(&o.writeTransactionAbsoluteTimeout, "write-transaction-absolute-timeout", 30*time.Minute, "absolute lifetime of inert write staging")
+	flag.DurationVar(&o.writeTransactionAbsoluteTimeout, "write-transaction-absolute-timeout", 30*time.Minute, "absolute lifetime of a write transaction")
 	flag.DurationVar(&o.terminalDeliveryTimeout, "terminal-delivery-timeout", 45*time.Second, "maximum drain from a terminal exact result through peer repair and source kernel publication receipt")
 	flag.DurationVar(&o.capabilityLifetime, "capability-max-lifetime", 15*time.Minute, "longest capability validity window this authority will honour")
 	flag.UintVar(&o.capabilityNonces, "capability-nonce-records", 65536, "single-use capability records retained until expiry")
 	flag.DurationVar(&o.sessionLease, "session-lease", 2*time.Minute, "renewable session lease")
-	flag.IntVar(&o.maxInFlight, "max-in-flight", 256, "requests concurrently executing per TLS connection")
+	flag.IntVar(&o.maxInFlight, "max-in-flight", defaultMaxInFlight, "requests concurrently executing per TLS connection")
 	flag.IntVar(&o.maxConnections, "max-connections", defaultMaxConnections, "maximum accepted TLS connections for the worker; must be at least 4 times max-sessions")
 	flag.DurationVar(&o.handshakeTimeout, "tls-handshake-timeout", 10*time.Second, "maximum TLS handshake duration")
 	flag.DurationVar(&o.idleTimeout, "connection-idle-timeout", 5*time.Minute, "maximum interval without a complete request frame")
@@ -120,6 +120,15 @@ func run() error {
 	flag.DurationVar(&o.maxRepairBudget, "max-repair-budget", 30*time.Second, "longest per-phase cache-repair deadline a strict mount may commit to before it is fenced; must be at least the mount's -repair-budget")
 	flag.DurationVar(&o.visibilityClockSkew, "visibility-clock-skew", 5*time.Second, "clock disagreement tolerated when a mount timestamps its own kernel-mount absence")
 	flag.Parse()
+	writeTransactionLimitOverridden := false
+	flag.Visit(func(value *flag.Flag) {
+		if value.Name == "max-write-transactions-per-session" {
+			writeTransactionLimitOverridden = true
+		}
+	})
+	if !writeTransactionLimitOverridden {
+		o.maxWriteTransactionsPerSession = defaultWriteTransactionsPerSession(o.maxInFlight, o.maxWriteTransactions)
+	}
 	if *showVersion {
 		_, _ = fmt.Fprintln(os.Stdout, version)
 		return nil

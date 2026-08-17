@@ -151,23 +151,28 @@ type writeTransaction struct {
 	// then cleanup waits without holding it. mu serializes all work for one
 	// transaction, including INITIALIZING and DATA filesystem I/O. No holder of
 	// sessionResources.writeMu may wait for mu.
-	mu               sync.Mutex
-	refs             sync.WaitGroup
-	id               uint64
-	metadata         writeTransactionMetadata
-	beginFingerprint volumeserver.RequestFingerprint
-	stage            writeTransactionStage
-	target           xfsstore.WriteTarget
-	coordinate       xfsstore.ObjectCoordinate
-	state            writeTransactionState
-	staged           uint64
-	lastDataOffset   uint64
-	lastDataSize     uint32
-	lastData         volumeserver.RequestFingerprint
-	progressDeadline time.Time
-	absoluteDeadline time.Time
-	initErr          error
+	mu                sync.Mutex
+	refs              sync.WaitGroup
+	id                uint64
+	metadata          writeTransactionMetadata
+	beginFingerprint  volumeserver.RequestFingerprint
+	stage             writeTransactionStage
+	target            xfsstore.WriteTarget
+	coordinate        xfsstore.ObjectCoordinate
+	state             writeTransactionState
+	staged            uint64
+	lastDataOffset    uint64
+	lastDataSize      uint32
+	lastData          volumeserver.RequestFingerprint
+	progressDeadline  time.Time
+	absoluteDeadline  time.Time
+	initErr           error
+	capacityReserved  bool
+	commitFingerprint volumeserver.RequestFingerprint
+	commitOwner       *writeTransactionCommitOwner
 }
+
+type writeTransactionCommitOwner struct{ marker byte }
 
 type writeTransactionTerminalKind uint8
 
@@ -182,11 +187,21 @@ const (
 // older than the newest dispatched BEGIN. Retaining one exact tombstone keeps
 // cleanup bounded while altered or late reuse still fails closed.
 type writeTransactionTerminal struct {
-	id               uint64
-	beginFingerprint volumeserver.RequestFingerprint
-	metadata         writeTransactionMetadata
-	kind             writeTransactionTerminalKind
-	err              error
+	id                uint64
+	beginFingerprint  volumeserver.RequestFingerprint
+	commitFingerprint volumeserver.RequestFingerprint
+	metadata          writeTransactionMetadata
+	staged            uint64
+	kind              writeTransactionTerminalKind
+	err               error
+}
+
+type writeTransactionCapacityWaiter struct {
+	resources *sessionResources
+	ready     chan struct{}
+	previous  *writeTransactionCapacityWaiter
+	next      *writeTransactionCapacityWaiter
+	queued    bool
 }
 
 type writeTransactionCleanup struct {
@@ -214,7 +229,7 @@ func (c writeTransactionCleanup) finish() {
 	if target != nil {
 		_ = target.Close()
 	}
-	if c.handler != nil && c.resources != nil {
+	if c.handler != nil && c.resources != nil && c.transaction.capacityReserved {
 		c.handler.releaseWriteTransactionCapacity(c.resources, c.transaction.metadata.requestedSize)
 	}
 }
@@ -354,21 +369,100 @@ func (h *VolumeHandler) writeTransactionResources(id volumeserver.SessionID) (*s
 	return resources, nil
 }
 
-func (h *VolumeHandler) reserveWriteTransactionCapacity(resources *sessionResources, bytes uint64) error {
-	h.writeCapacityMu.Lock()
-	defer h.writeCapacityMu.Unlock()
-	if bytes > h.MaxWriteStagingBytesPerSession || bytes > h.MaxWriteStagingBytes ||
-		resources.writeReservedBytes > h.MaxWriteStagingBytesPerSession-bytes ||
-		h.totalWriteStagingBytes > h.MaxWriteStagingBytes-bytes ||
-		resources.writeTransactionCount >= h.MaxWriteTransactionsPerSession ||
-		h.totalWriteTransactions >= h.MaxWriteTransactions {
-		return volumeserver.ErrAdmission
+func (h *VolumeHandler) writeTransactionCapacityAvailableLocked(resources *sessionResources, bytes uint64) bool {
+	return bytes <= h.MaxWriteStagingBytesPerSession && bytes <= h.MaxWriteStagingBytes &&
+		resources.writeReservedBytes <= h.MaxWriteStagingBytesPerSession-bytes &&
+		h.totalWriteStagingBytes <= h.MaxWriteStagingBytes-bytes &&
+		resources.writeTransactionCount < h.MaxWriteTransactionsPerSession &&
+		h.totalWriteTransactions < h.MaxWriteTransactions
+}
+
+func (h *VolumeHandler) enqueueWriteTransactionCapacityLocked(waiter *writeTransactionCapacityWaiter) {
+	if waiter.queued {
+		return
 	}
-	resources.writeReservedBytes += bytes
-	resources.writeTransactionCount++
-	h.totalWriteStagingBytes += bytes
-	h.totalWriteTransactions++
-	return nil
+	waiter.previous = h.writeCapacityTail
+	waiter.next = nil
+	if h.writeCapacityTail == nil {
+		h.writeCapacityHead = waiter
+	} else {
+		h.writeCapacityTail.next = waiter
+	}
+	h.writeCapacityTail = waiter
+	waiter.queued = true
+}
+
+func (h *VolumeHandler) removeWriteTransactionCapacityLocked(waiter *writeTransactionCapacityWaiter) {
+	if !waiter.queued {
+		return
+	}
+	if waiter.previous == nil {
+		h.writeCapacityHead = waiter.next
+	} else {
+		waiter.previous.next = waiter.next
+	}
+	if waiter.next == nil {
+		h.writeCapacityTail = waiter.previous
+	} else {
+		waiter.next.previous = waiter.previous
+	}
+	waiter.previous, waiter.next, waiter.queued = nil, nil, false
+}
+
+func wakeWriteTransactionCapacityWaiterLocked(waiter *writeTransactionCapacityWaiter) {
+	if waiter == nil {
+		return
+	}
+	ready := waiter.ready
+	waiter.ready = make(chan struct{})
+	close(ready)
+}
+
+func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, terminal <-chan struct{}, resources *sessionResources, bytes uint64) error {
+	waiter := &writeTransactionCapacityWaiter{resources: resources, ready: make(chan struct{})}
+	for {
+		h.writeCapacityMu.Lock()
+		if resources.writeCapacityEnded {
+			h.removeWriteTransactionCapacityLocked(waiter)
+			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
+			h.writeCapacityMu.Unlock()
+			return volumeserver.ErrSessionExpired
+		}
+		h.enqueueWriteTransactionCapacityLocked(waiter)
+		if h.writeCapacityHead == waiter && h.writeTransactionCapacityAvailableLocked(resources, bytes) {
+			h.removeWriteTransactionCapacityLocked(waiter)
+			resources.writeReservedBytes += bytes
+			resources.writeTransactionCount++
+			h.totalWriteStagingBytes += bytes
+			h.totalWriteTransactions++
+			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
+			h.writeCapacityMu.Unlock()
+			return nil
+		}
+		ready := waiter.ready
+		h.writeCapacityMu.Unlock()
+
+		select {
+		case <-ready:
+			continue
+		case <-terminal:
+			h.writeCapacityMu.Lock()
+			h.removeWriteTransactionCapacityLocked(waiter)
+			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
+			h.writeCapacityMu.Unlock()
+			return volumeserver.ErrSessionExpired
+		case <-ctx.Done():
+			h.writeCapacityMu.Lock()
+			h.removeWriteTransactionCapacityLocked(waiter)
+			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
+			ended := resources.writeCapacityEnded
+			h.writeCapacityMu.Unlock()
+			if ended {
+				return volumeserver.ErrSessionExpired
+			}
+			return ctx.Err()
+		}
+	}
 }
 
 func (h *VolumeHandler) releaseWriteTransactionCapacity(resources *sessionResources, bytes uint64) {
@@ -382,6 +476,18 @@ func (h *VolumeHandler) releaseWriteTransactionCapacity(resources *sessionResour
 	resources.writeTransactionCount--
 	h.totalWriteStagingBytes -= bytes
 	h.totalWriteTransactions--
+	wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
+}
+
+func (h *VolumeHandler) endWriteTransactionCapacityWaits(resources *sessionResources) {
+	h.writeCapacityMu.Lock()
+	resources.writeCapacityEnded = true
+	for waiter := h.writeCapacityHead; waiter != nil; waiter = waiter.next {
+		if waiter.resources == resources {
+			wakeWriteTransactionCapacityWaiterLocked(waiter)
+		}
+	}
+	h.writeCapacityMu.Unlock()
 }
 
 // acquireWriteTransaction pins the exact registered object without ever
@@ -407,15 +513,15 @@ func writeTransactionRegistered(resources *sessionResources, transaction *writeT
 
 // removeWriteTransactionLocked transfers cleanup ownership but performs no
 // waiting, Close, or capacity release under writeMu. Callers must already have
-// made the transaction terminal while holding transaction.mu, unless this is
-// session teardown (which makes the entire ledger unreachable first).
+// made the transaction terminal while holding transaction.mu.
 func (h *VolumeHandler) removeWriteTransactionLocked(resources *sessionResources, transaction *writeTransaction, terminal writeTransactionTerminalKind, terminalErr error) writeTransactionCleanup {
 	if resources.writeTransactions[transaction.id] != transaction {
 		return writeTransactionCleanup{}
 	}
 	delete(resources.writeTransactions, transaction.id)
 	resources.writeTerminal = &writeTransactionTerminal{
-		id: transaction.id, beginFingerprint: transaction.beginFingerprint, metadata: transaction.metadata, kind: terminal, err: terminalErr,
+		id: transaction.id, beginFingerprint: transaction.beginFingerprint, commitFingerprint: transaction.commitFingerprint,
+		metadata: transaction.metadata, staged: transaction.staged, kind: terminal, err: terminalErr,
 	}
 	return writeTransactionCleanup{handler: h, resources: resources, transaction: transaction}
 }
@@ -428,6 +534,10 @@ func (h *VolumeHandler) fenceWriteTransactionMismatch(id volumeserver.SessionID)
 }
 
 func (h *VolumeHandler) beginWriteTransaction(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
+	return h.beginWriteTransactionContext(context.Background(), request, credential, body)
+}
+
+func (h *VolumeHandler) beginWriteTransactionContext(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
 	metadata, err := writeTransactionMetadataFromRequest(body)
 	if err != nil || !validWriteTransactionPhaseShape(request, body) || body.GetRequestedSize() > h.MaxWriteTransactionBytes {
 		return h.errorResponse(request.GetRequestId(), syscall.EINVAL, false)
@@ -518,17 +628,19 @@ func (h *VolumeHandler) beginWriteTransaction(request *authoritypb.Request, cred
 		return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
 	}
 	// A syntactically valid exact next BEGIN consumes its monotonic identity
-	// before any resource decision. A refused/lost BEGIN can therefore be
-	// retried or aborted without letting a later transaction reuse its number.
+	// before waiting for resources. Its published INITIALIZING placeholder makes
+	// exact retries join this attempt without allowing a later transaction to
+	// reuse its number.
 	resources.writeHighWater = body.GetTransactionId()
-	if err := h.reserveWriteTransactionCapacity(resources, metadata.requestedSize); err != nil {
-		resources.writeTerminal = &writeTransactionTerminal{id: body.GetTransactionId(), beginFingerprint: fingerprint, metadata: metadata, kind: writeTransactionTerminalRejected, err: err}
-		resources.writeMu.Unlock()
-		return h.errorResponse(request.GetRequestId(), err, false)
+	now := time.Now()
+	absoluteDeadline := now.Add(h.WriteTransactionAbsoluteTimeout)
+	progressDeadline := now.Add(h.WriteTransactionProgressTimeout)
+	if progressDeadline.After(absoluteDeadline) {
+		progressDeadline = absoluteDeadline
 	}
 	transaction := &writeTransaction{
 		id: body.GetTransactionId(), metadata: metadata, beginFingerprint: fingerprint,
-		state: writeTransactionInitializing,
+		state: writeTransactionInitializing, progressDeadline: progressDeadline, absoluteDeadline: absoluteDeadline,
 	}
 	// Lock before publishing the placeholder so no retry can observe a partial
 	// stage/target pair. The initial attempt itself is the first lifetime ref.
@@ -538,7 +650,23 @@ func (h *VolumeHandler) beginWriteTransaction(request *authoritypb.Request, cred
 	resources.writeTerminal = nil
 	resources.writeMu.Unlock()
 
-	stage, initErr := h.WriteStaging.newFile(metadata.requestedSize)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	terminal, initErr := h.Runtime.SessionTerminal(credential.ID)
+	admissionCtx, cancelAdmission := context.WithDeadline(ctx, transaction.progressDeadline)
+	if initErr == nil {
+		initErr = h.reserveWriteTransactionCapacity(admissionCtx, terminal, resources, metadata.requestedSize)
+		transaction.capacityReserved = initErr == nil
+	}
+	cancelAdmission()
+	if initErr == nil && !writeTransactionRegistered(resources, transaction) {
+		initErr = volumeserver.ErrSessionExpired
+	}
+	var stage writeTransactionStage
+	if initErr == nil {
+		stage, initErr = h.WriteStaging.newFile(metadata.requestedSize)
+	}
 	transaction.stage = stage
 	if initErr == nil {
 		store, ok := h.Store.(writeTransactionStore)
@@ -566,7 +694,9 @@ func (h *VolumeHandler) beginWriteTransaction(request *authoritypb.Request, cred
 		now := time.Now()
 		transaction.state = writeTransactionStaging
 		transaction.progressDeadline = now.Add(h.WriteTransactionProgressTimeout)
-		transaction.absoluteDeadline = now.Add(h.WriteTransactionAbsoluteTimeout)
+		if transaction.progressDeadline.After(transaction.absoluteDeadline) {
+			transaction.progressDeadline = transaction.absoluteDeadline
+		}
 	}
 	transaction.mu.Unlock()
 	transaction.refs.Done()
@@ -719,10 +849,10 @@ func (h *VolumeHandler) abortWriteTransaction(request *authoritypb.Request, cred
 	return writeTransactionResponseWithEnvelope(h, request.GetRequestId(), writeTransactionReply(body.GetTransactionId(), writeTransactionReplyAborted))
 }
 
-func (h *VolumeHandler) handleWriteTransaction(ctxRequest *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
+func (h *VolumeHandler) handleWriteTransaction(ctx context.Context, ctxRequest *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
 	switch body.GetPhase() {
 	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
-		return h.beginWriteTransaction(ctxRequest, credential, body)
+		return h.beginWriteTransactionContext(ctx, ctxRequest, credential, body)
 	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
 		return h.stageWriteTransaction(ctxRequest, credential, body)
 	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
@@ -912,37 +1042,87 @@ func (h *VolumeHandler) writeTransactionGate(id volumeserver.SessionID, body *au
 	return gate, coordinate, nil
 }
 
-func (h *VolumeHandler) markWriteTransactionCommitting(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) error {
+func (h *VolumeHandler) rejectedWriteTransactionTerminal(request *authoritypb.Request, id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) (*authoritypb.Response, bool, error) {
 	resources, err := h.writeTransactionResources(id)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	metadata, err := writeTransactionMetadataFromRequest(body)
+	metadata, fingerprint, err := h.writeTransactionForPhase(request, body)
 	if err != nil {
-		return err
+		return nil, false, err
+	}
+	resources.writeMu.Lock()
+	terminal := resources.writeTerminal
+	if terminal == nil || terminal.id != body.GetTransactionId() {
+		resources.writeMu.Unlock()
+		return nil, false, nil
+	}
+	matched := terminal.kind == writeTransactionTerminalRejected && terminal.err != nil &&
+		terminal.commitFingerprint != (volumeserver.RequestFingerprint{}) && terminal.commitFingerprint == fingerprint &&
+		sameWriteTransactionMetadata(terminal.metadata, metadata) && terminal.staged == body.GetFragmentOffset()
+	terminalErr := terminal.err
+	resources.writeMu.Unlock()
+	if !matched {
+		return nil, false, h.fenceWriteTransactionMismatch(id)
+	}
+	return writeTransactionRejection(wireErrno(terminalErr), body.GetTransactionId(), false), true, nil
+}
+
+func (h *VolumeHandler) markWriteTransactionCommitting(id volumeserver.SessionID, request *authoritypb.Request, body *authoritypb.WriteTransactionRequest) (*writeTransactionCommitOwner, error) {
+	resources, err := h.writeTransactionResources(id)
+	if err != nil {
+		return nil, err
+	}
+	metadata, fingerprint, err := h.writeTransactionForPhase(request, body)
+	if err != nil {
+		return nil, err
 	}
 	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
 	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
 		if transaction != nil {
 			transaction.refs.Done()
 		}
-		return h.fenceWriteTransactionMismatch(id)
+		return nil, h.fenceWriteTransactionMismatch(id)
 	}
 	transaction.mu.Lock()
 	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionStaging || transaction.staged != body.GetFragmentOffset() {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
-		return h.fenceWriteTransactionMismatch(id)
+		return nil, h.fenceWriteTransactionMismatch(id)
 	}
-	// From this point the transaction cannot be swept or aborted. A terminal
-	// outcome consumes it through the replay slot. The one nonterminal outcome
-	// is a Linux item-only visibility handoff: resetWriteTransactionForRetry
-	// returns these inert staged bytes to STAGING before that classified reply
-	// is retained, so the frontend can retry COMMIT with a fresh mutation ID.
+	// While this owner is live the transaction cannot be swept or aborted. A
+	// terminal outcome consumes it through the replay slot. The one nonterminal
+	// outcome is a Linux item-only visibility handoff:
+	// resetWriteTransactionForRetry returns these inert staged bytes to STAGING
+	// before that classified reply is retained, so the frontend can retry COMMIT
+	// with a fresh mutation ID.
+	owner := &writeTransactionCommitOwner{}
 	transaction.state = writeTransactionCommitting
+	transaction.commitFingerprint = fingerprint
+	transaction.commitOwner = owner
 	transaction.mu.Unlock()
 	transaction.refs.Done()
-	return nil
+	return owner, nil
+}
+
+func (h *VolumeHandler) finishWriteTransactionCommit(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest, owner *writeTransactionCommitOwner) {
+	if owner == nil {
+		return
+	}
+	resources, err := h.writeTransactionResources(id)
+	if err != nil {
+		return
+	}
+	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
+	if transaction == nil {
+		return
+	}
+	transaction.mu.Lock()
+	if writeTransactionRegistered(resources, transaction) && transaction.state == writeTransactionCommitting && transaction.commitOwner == owner {
+		transaction.commitOwner = nil
+	}
+	transaction.mu.Unlock()
+	transaction.refs.Done()
 }
 
 // resetWriteTransactionForRetry preserves inert staged bytes across the
@@ -979,6 +1159,8 @@ func (h *VolumeHandler) resetWriteTransactionForRetry(id volumeserver.SessionID,
 		progress = transaction.absoluteDeadline
 	}
 	transaction.state = writeTransactionStaging
+	transaction.commitFingerprint = volumeserver.RequestFingerprint{}
+	transaction.commitOwner = nil
 	transaction.progressDeadline = progress
 	transaction.mu.Unlock()
 	transaction.refs.Done()
@@ -1021,6 +1203,57 @@ func (h *VolumeHandler) rejectPendingWriteTransaction(id volumeserver.SessionID,
 	return writeTransactionRejection(wireErrno(cause), body.GetTransactionId(), false)
 }
 
+// rejectUnadmittedWriteTransaction consumes a COMMIT whose replay-cache
+// reservation was refused before the mutation callback ran. The cache is a
+// memory bound, so ENOMEM is the definite syscall result; a generic outer
+// admission error would make Linux treat a known no-apply result as ambiguous.
+func (h *VolumeHandler) rejectUnadmittedWriteTransaction(request *authoritypb.Request, id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
+	if terminal, found, err := h.rejectedWriteTransactionTerminal(request, id, body); err != nil {
+		return h.errorResponse(0, err, false)
+	} else if found {
+		return terminal
+	}
+	resources, err := h.writeTransactionResources(id)
+	if err != nil {
+		return h.errorResponse(0, err, false)
+	}
+	metadata, fingerprint, err := h.writeTransactionForPhase(request, body)
+	if err != nil {
+		return h.errorResponse(0, err, false)
+	}
+	declaredGate, err := decodeSourcePublicationGate(request)
+	if err != nil || declaredGate == nil {
+		return h.errorResponse(0, syscall.EINVAL, false)
+	}
+	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
+	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+		if transaction != nil {
+			transaction.refs.Done()
+		}
+		return h.errorResponse(0, h.fenceWriteTransactionMismatch(id), false)
+	}
+	transaction.mu.Lock()
+	builder := sourceGateBuilder{}
+	builder.addItem(transaction.coordinate.Stable, true, true)
+	expectedGate := builder.finish()
+	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionStaging ||
+		transaction.staged != body.GetFragmentOffset() || !sourcePublicationGatesEqual(declaredGate, &expectedGate) {
+		transaction.mu.Unlock()
+		transaction.refs.Done()
+		return h.errorResponse(0, h.fenceWriteTransactionMismatch(id), false)
+	}
+	transaction.state = writeTransactionRejected
+	transaction.initErr = syscall.ENOMEM
+	transaction.commitFingerprint = fingerprint
+	resources.writeMu.Lock()
+	cleanup := h.removeWriteTransactionLocked(resources, transaction, writeTransactionTerminalRejected, syscall.ENOMEM)
+	resources.writeMu.Unlock()
+	transaction.mu.Unlock()
+	transaction.refs.Done()
+	cleanup.finish()
+	return writeTransactionRejection(int32(syscall.ENOMEM), body.GetTransactionId(), false)
+}
+
 // markWriteTransactionPostApplyFailure preserves the exact committed prefix
 // when visibility completion fails after XFS apply. The source kernel must
 // install and publish that result before receiving the failure; returning a
@@ -1044,9 +1277,9 @@ func markWriteTransactionPostApplyFailure(response *authoritypb.Response, cause 
 	return true
 }
 
-// SweepWriteTransactions releases inert staging whose progress or absolute
-// deadline elapsed. COMMITTING is never swept: once mutation assignment begins,
-// exact replay/fencing owns the outcome and cleanup cannot guess no-apply.
+// SweepWriteTransactions releases inert staging and abandoned COMMIT attempts.
+// CommitWrite removes the transaction before releasing its handler ownership,
+// so a registered COMMITTING transaction with no owner is definitely pre-apply.
 func (h *VolumeHandler) SweepWriteTransactions(now time.Time) {
 	if h == nil || now.IsZero() {
 		return
@@ -1072,11 +1305,21 @@ func (h *VolumeHandler) SweepWriteTransactions(now time.Time) {
 			// available throughout the wait.
 			transaction.mu.Lock()
 			var cleanup writeTransactionCleanup
-			if writeTransactionRegistered(resource, transaction) && transaction.state == writeTransactionStaging &&
-				(!now.Before(transaction.progressDeadline) || !now.Before(transaction.absoluteDeadline)) {
-				resource.writeMu.Lock()
-				cleanup = h.removeWriteTransactionLocked(resource, transaction, writeTransactionTerminalAborted, nil)
-				resource.writeMu.Unlock()
+			if writeTransactionRegistered(resource, transaction) {
+				switch {
+				case transaction.state == writeTransactionStaging &&
+					(!now.Before(transaction.progressDeadline) || !now.Before(transaction.absoluteDeadline)):
+					resource.writeMu.Lock()
+					cleanup = h.removeWriteTransactionLocked(resource, transaction, writeTransactionTerminalAborted, nil)
+					resource.writeMu.Unlock()
+				case transaction.state == writeTransactionCommitting && transaction.commitOwner == nil &&
+					!now.Before(transaction.absoluteDeadline):
+					transaction.state = writeTransactionRejected
+					transaction.initErr = context.DeadlineExceeded
+					resource.writeMu.Lock()
+					cleanup = h.removeWriteTransactionLocked(resource, transaction, writeTransactionTerminalRejected, context.DeadlineExceeded)
+					resource.writeMu.Unlock()
+				}
 			}
 			transaction.mu.Unlock()
 			transaction.refs.Done()
@@ -1092,8 +1335,12 @@ func closeWriteTransactions(h *VolumeHandler, resources *sessionResources) []wri
 	resources.writeMu.Lock()
 	defer resources.writeMu.Unlock()
 	cleanup := make([]writeTransactionCleanup, 0, len(resources.writeTransactions))
-	for _, transaction := range resources.writeTransactions {
-		cleanup = append(cleanup, h.removeWriteTransactionLocked(resources, transaction, writeTransactionTerminalAborted, nil))
+	for id, transaction := range resources.writeTransactions {
+		// Session teardown makes the whole ledger unreachable and discards its
+		// tombstone. Do not read phase-owned fields without transaction.mu merely
+		// to construct a terminal value that is cleared below.
+		delete(resources.writeTransactions, id)
+		cleanup = append(cleanup, writeTransactionCleanup{handler: h, resources: resources, transaction: transaction})
 	}
 	resources.writeTransactions = nil
 	resources.writeTerminal = nil

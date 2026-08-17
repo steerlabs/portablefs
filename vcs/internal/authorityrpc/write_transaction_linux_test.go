@@ -180,6 +180,24 @@ func requireWriteTransactionTestBlocked(t *testing.T, result <-chan *authoritypb
 	}
 }
 
+func waitWriteTransactionCapacityQueue(t *testing.T, h *VolumeHandler, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		h.writeCapacityMu.Lock()
+		got := 0
+		for waiter := h.writeCapacityHead; waiter != nil; waiter = waiter.next {
+			got++
+		}
+		h.writeCapacityMu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("write transaction capacity queue did not reach %d waiters", want)
+}
+
 func (s *writeTransactionTestStore) PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarget, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -608,6 +626,122 @@ func TestWriteTransactionSweeperNeverClosesActiveData(t *testing.T) {
 	waitWriteTransactionTestSignal(t, stage.closed, "stage cleanup after ABORT")
 }
 
+func TestWriteTransactionAdmissionWaitsForReleasedSlot(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(t.Context(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+	requireWriteTransactionTestBlocked(t, secondResult, "capacity waiter")
+
+	abort := writeTransactionTestRequest(3, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil)
+	if response := h.abortWriteTransaction(abort, credential, abort.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first ABORT = %+v", response)
+	}
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != 0 || response.GetWriteTransaction().GetFlags() != writeTransactionReplyBegun {
+			t.Fatalf("second BEGIN after release = %+v", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("capacity waiter did not proceed after slot release")
+	}
+}
+
+func TestWriteTransactionAdmissionWakesWithTerminalErrorOnSessionEnd(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(context.Background(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+
+	closed := make(chan struct{})
+	go func() {
+		h.closeSessionResources(credential.ID)
+		close(closed)
+	}()
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != int32(syscall.ESTALE) || response.GetUncertain() {
+			t.Fatalf("terminal capacity waiter = %+v, want definite ESTALE", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session end did not wake capacity waiter")
+	}
+	waitWriteTransactionTestSignal(t, closed, "session cleanup after capacity wait")
+}
+
+func TestWriteTransactionAdmissionWakesOnRuntimeTerminalEdge(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	secondResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		secondResult <- h.beginWriteTransactionContext(context.Background(), second, credential, second.GetWriteTransaction())
+	}()
+	waitWriteTransactionCapacityQueue(t, h, 1)
+	h.Runtime.FenceSession(credential.ID)
+	select {
+	case response := <-secondResult:
+		if response.GetErrno() != int32(syscall.ESTALE) || response.GetUncertain() {
+			t.Fatalf("runtime-terminal capacity waiter = %+v, want definite ESTALE", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runtime terminal edge did not wake capacity waiter")
+	}
+}
+
+func TestWriteTransactionAdmissionDeadlineBoundsWaitAndRetainsBeginOutcome(t *testing.T) {
+	h, credential, _ := newWriteTransactionHarness(t, nil)
+	h.MaxWriteTransactionsPerSession = 1
+	h.WriteTransactionProgressTimeout = 40 * time.Millisecond
+	h.WriteTransactionAbsoluteTimeout = time.Second
+	first := writeTransactionTestRequest(1, 1, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if response := h.beginWriteTransaction(first, credential, first.GetWriteTransaction()); response.GetErrno() != 0 {
+		t.Fatalf("first BEGIN = %+v", response)
+	}
+
+	second := writeTransactionTestRequest(2, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	started := time.Now()
+	response := h.beginWriteTransactionContext(context.Background(), second, credential, second.GetWriteTransaction())
+	if response.GetErrno() != int32(syscall.ETIMEDOUT) || response.GetUncertain() {
+		t.Fatalf("deadline-bounded BEGIN = %+v, want definite ETIMEDOUT", response)
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("deadline-bounded BEGIN elapsed %v, want bounded near %v", elapsed, h.WriteTransactionProgressTimeout)
+	}
+	replay := writeTransactionTestRequest(3, 2, authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil)
+	if replayed := h.beginWriteTransaction(replay, credential, replay.GetWriteTransaction()); replayed.GetErrno() != int32(syscall.ETIMEDOUT) {
+		t.Fatalf("deadline BEGIN replay = %+v, want retained ETIMEDOUT", replayed)
+	}
+	resources, err := h.sessionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.writeTransactionCount != 1 || h.totalWriteTransactions != 1 {
+		t.Fatalf("timed-out waiter accounting = session %d, global %d; want one original transaction", resources.writeTransactionCount, h.totalWriteTransactions)
+	}
+}
+
 func TestWriteTransactionDataFailureRetainsExactBeginOutcomeUntilAbort(t *testing.T) {
 	h, credential, _ := newWriteTransactionHarness(t, nil)
 	writeStarted := make(chan struct{})
@@ -831,6 +965,106 @@ func TestWriteTransactionCommitAppliesStagedPrefixOnceAndReplaysRetainedResult(t
 	}
 	if calls, _ := target.commitSnapshot(); calls != 1 {
 		t.Fatalf("exact replay applied storage %d times, want 1", calls)
+	}
+}
+
+func TestWriteTransactionSweepRejectsOnlyAbandonedCommitAndReplaysOutcome(t *testing.T) {
+	h, credential, store := newWriteTransactionHarness(t, nil)
+	beginAndStageWriteTransaction(t, h, credential, []byte("abc"))
+	target := store.targets[0]
+	commit := writeTransactionTestCommitRequest(3, 1, 3, target.Coordinate().Stable)
+	owner, err := h.markWriteTransactionCommitting(credential.ID, commit, commit.GetWriteTransaction())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources, err := h.sessionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := acquireWriteTransaction(resources, 1)
+	if transaction == nil {
+		t.Fatal("COMMIT transaction was not registered")
+	}
+	transaction.mu.Lock()
+	transaction.absoluteDeadline = time.Now().Add(-time.Second)
+	transaction.mu.Unlock()
+	transaction.refs.Done()
+
+	h.SweepWriteTransactions(time.Now())
+	if active := acquireWriteTransaction(resources, 1); active == nil {
+		t.Fatal("sweeper reclaimed a COMMIT whose handler still owned the outcome")
+	} else {
+		active.refs.Done()
+	}
+	if resources.writeTransactionCount != 1 || h.totalWriteTransactions != 1 {
+		t.Fatalf("active COMMIT accounting = session %d, global %d", resources.writeTransactionCount, h.totalWriteTransactions)
+	}
+
+	h.finishWriteTransactionCommit(credential.ID, commit.GetWriteTransaction(), owner)
+	h.SweepWriteTransactions(time.Now())
+	if abandoned := acquireWriteTransaction(resources, 1); abandoned != nil {
+		abandoned.refs.Done()
+		t.Fatal("sweeper retained an expired abandoned COMMIT")
+	}
+	if resources.writeReservedBytes != 0 || resources.writeTransactionCount != 0 || h.totalWriteStagingBytes != 0 || h.totalWriteTransactions != 0 {
+		t.Fatalf("swept COMMIT accounting = session bytes %d/count %d, global bytes %d/count %d",
+			resources.writeReservedBytes, resources.writeTransactionCount, h.totalWriteStagingBytes, h.totalWriteTransactions)
+	}
+	if target.closeCount() != 1 {
+		t.Fatalf("swept COMMIT target closes = %d, want 1", target.closeCount())
+	}
+
+	replay := writeTransactionTestCommitRequest(4, 1, 3, target.Coordinate().Stable)
+	response := h.commitWriteTransaction(t.Context(), replay, credential, replay.GetWriteTransaction())
+	reply := response.GetWriteTransaction()
+	if response.GetErrno() != 0 || response.GetUncertain() || reply.GetFlags() != writeTransactionReplyRejected ||
+		reply.GetError() != -int32(syscall.ETIMEDOUT) {
+		t.Fatalf("swept COMMIT replay = %+v, want structured ETIMEDOUT rejection", response)
+	}
+	if mutation := response.GetMutation(); mutation.GetSlot() != 0 || mutation.GetAcceptedSequence() != 1 {
+		t.Fatalf("swept COMMIT replay mutation state = %+v", mutation)
+	}
+	secondReplay := writeTransactionTestCommitRequest(5, 1, 3, target.Coordinate().Stable)
+	second := h.commitWriteTransaction(t.Context(), secondReplay, credential, secondReplay.GetWriteTransaction())
+	if second.GetErrno() != 0 || second.GetWriteTransaction().GetFlags() != writeTransactionReplyRejected ||
+		second.GetWriteTransaction().GetError() != -int32(syscall.ETIMEDOUT) {
+		t.Fatalf("retained swept COMMIT replay = %+v", second)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 0 {
+		t.Fatalf("swept COMMIT replay applied storage %d times", calls)
+	}
+}
+
+func TestWriteTransactionReplayCapacityRefusalIsStructuredENOMEM(t *testing.T) {
+	h, credential, store := newWriteTransactionHarness(t, nil)
+	beginAndStageWriteTransaction(t, h, credential, []byte("abc"))
+	target := store.targets[0]
+	h.MaxRetainedReplyBytes = 0
+	commit := writeTransactionTestCommitRequest(3, 1, 3, target.Coordinate().Stable)
+	response := h.commitWriteTransaction(t.Context(), commit, credential, commit.GetWriteTransaction())
+	reply := response.GetWriteTransaction()
+	if response.GetErrno() != 0 || response.GetUncertain() || response.GetMutation() != nil ||
+		reply.GetFlags() != writeTransactionReplyRejected || reply.GetError() != -int32(syscall.ENOMEM) {
+		t.Fatalf("replay-capacity COMMIT = %+v, want unrecorded structured ENOMEM rejection", response)
+	}
+	if response.GetErrno() == int32(syscall.EAGAIN) {
+		t.Fatal("blocking COMMIT exposed EAGAIN")
+	}
+	resources, err := h.sessionResources(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resources.writeTransactionCount != 0 || h.totalWriteTransactions != 0 {
+		t.Fatalf("replay-capacity rejection retained transaction: session %d, global %d", resources.writeTransactionCount, h.totalWriteTransactions)
+	}
+	replay := writeTransactionTestCommitRequest(4, 1, 3, target.Coordinate().Stable)
+	replayed := h.commitWriteTransaction(t.Context(), replay, credential, replay.GetWriteTransaction())
+	if replayed.GetErrno() != 0 || replayed.GetWriteTransaction().GetFlags() != writeTransactionReplyRejected ||
+		replayed.GetWriteTransaction().GetError() != -int32(syscall.ENOMEM) {
+		t.Fatalf("replay-capacity COMMIT replay = %+v", replayed)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 0 {
+		t.Fatalf("replay-capacity refusal applied storage %d times", calls)
 	}
 }
 

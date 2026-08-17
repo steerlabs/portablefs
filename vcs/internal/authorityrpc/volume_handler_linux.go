@@ -24,7 +24,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-var errInternal = errors.New("authorityrpc: internal handler failure")
+var (
+	errInternal            = errors.New("authorityrpc: internal handler failure")
+	errCapabilityTableFull = errnos.Sentinel("authorityrpc: descriptor-backed capability table full", syscall.ENFILE)
+)
 
 // readDirReplyOverhead bounds the fixed part of a directory reply: the 16-byte
 // verifier, the EOF flag, and the protobuf tags wrapping the reply inside a
@@ -174,6 +177,8 @@ type VolumeHandler struct {
 	retainedReplyBytes     uint64
 	reservedReplyBytes     uint64
 	writeCapacityMu        sync.Mutex
+	writeCapacityHead      *writeTransactionCapacityWaiter
+	writeCapacityTail      *writeTransactionCapacityWaiter
 	totalWriteStagingBytes uint64
 	totalWriteTransactions uint32
 }
@@ -233,6 +238,7 @@ type sessionResources struct {
 	writeTerminal         *writeTransactionTerminal
 	writeReservedBytes    uint64
 	writeTransactionCount uint32
+	writeCapacityEnded    bool
 }
 
 type trackedCapability struct {
@@ -1235,7 +1241,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		if body.WriteTransaction.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
 			return h.commitWriteTransaction(ctx, req, cred, body.WriteTransaction)
 		}
-		return h.handleWriteTransaction(req, cred, body.WriteTransaction)
+		return h.handleWriteTransaction(ctx, req, cred, body.WriteTransaction)
 	case *authoritypb.Request_Fallocate:
 		return h.handleFallocate(ctx, req, cred, body.Fallocate)
 	case *authoritypb.Request_CopyFileRange:
@@ -2037,7 +2043,23 @@ func (h *VolumeHandler) mutateVisibleSequence(
 	prepare func() ([]volumeserver.VisibilityTarget, error),
 	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
 ) *authoritypb.Response {
+	var writeCommitOwner *writeTransactionCommitOwner
+	defer func() {
+		if body := req.GetWriteTransaction(); body != nil {
+			h.finishWriteTransactionCommit(cred.ID, body, writeCommitOwner)
+		}
+	}()
 	return h.mutateOperation(ctx, req, cred, func(id volumeserver.MutationID) *authoritypb.Response {
+		writeCommit := req.GetWriteTransaction()
+		if writeCommit != nil {
+			terminal, found, err := h.rejectedWriteTransactionTerminal(req, cred.ID, writeCommit)
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			if found {
+				return terminal
+			}
+		}
 		declaredGate, err := decodeSourcePublicationGate(req)
 		if err != nil || declaredGate == nil {
 			return h.errorResponse(0, syscall.EINVAL, false)
@@ -2049,10 +2071,10 @@ func (h *VolumeHandler) mutateVisibleSequence(
 		if !sourcePublicationGatesEqual(declaredGate, &expectedGate) {
 			return h.errorResponse(0, syscall.EINVAL, false)
 		}
-		writeCommit := req.GetWriteTransaction()
 		if h.Visibility == nil {
 			if writeCommit != nil {
-				if err := h.markWriteTransactionCommitting(cred.ID, writeCommit); err != nil {
+				writeCommitOwner, err = h.markWriteTransactionCommitting(cred.ID, req, writeCommit)
+				if err != nil {
 					return h.errorResponse(0, err, false)
 				}
 			}
@@ -2095,7 +2117,8 @@ func (h *VolumeHandler) mutateVisibleSequence(
 			return refreshed, nil
 		}
 		if writeCommit != nil {
-			if err := h.markWriteTransactionCommitting(cred.ID, writeCommit); err != nil {
+			writeCommitOwner, err = h.markWriteTransactionCommitting(cred.ID, req, writeCommit)
+			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
 		}
@@ -2215,6 +2238,11 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		}
 	})
 	if err != nil {
+		if body := req.GetWriteTransaction(); body != nil &&
+			body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT &&
+			errors.Is(err, volumeserver.ErrAdmission) {
+			return writeTransactionResponseWithEnvelope(h, req.GetRequestId(), h.rejectUnadmittedWriteTransaction(req, cred.ID, body))
+		}
 		// Nothing was recorded for this identity, so the response deliberately
 		// carries no MutationState and the peer's slot stays where it is.
 		return h.errorResponse(req.GetRequestId(), err, false)
@@ -3367,7 +3395,11 @@ func (h *VolumeHandler) reserveCapabilities(id volumeserver.SessionID, items, op
 		uint64(h.totalItems)+uint64(items) > uint64(h.MaxItems) ||
 		uint64(len(resources.opens))+uint64(resources.reservedOpens)+uint64(opens) > uint64(h.MaxOpensPerSession) ||
 		uint64(h.totalOpens)+uint64(opens) > uint64(h.MaxOpens):
-		return nil, volumeserver.ErrAdmission
+		// These are descriptor tables, not a transient execution queue. Waiting
+		// would let lookup/readdir storms pin workers, while EAGAIN is not a legal
+		// blocking pathname result. ENFILE reports the exhausted authority-managed
+		// file table without pretending the caller's own descriptor limit was hit.
+		return nil, errCapabilityTableFull
 	}
 	resources.reservedItems += items
 	resources.reservedOpens += opens
@@ -3451,7 +3483,7 @@ func (h *VolumeHandler) trackItem(id volumeserver.SessionID, item xfsstore.Capab
 	case alreadyTracked:
 		resources.items[item] = resources.items[item] || protected
 	case uint64(len(resources.items))+uint64(resources.reservedItems) >= uint64(h.MaxItemsPerSession) || h.totalItems >= h.MaxItems:
-		err = volumeserver.ErrAdmission
+		err = errCapabilityTableFull
 	default:
 		trackCapability(resources.items, item, protected, &h.totalItems)
 	}
@@ -3484,7 +3516,7 @@ func (h *VolumeHandler) trackOpen(id volumeserver.SessionID, handle xfsstore.Cap
 	case alreadyTracked:
 		resources.opens[handle] = resources.opens[handle] || protected
 	case uint64(len(resources.opens))+uint64(resources.reservedOpens) >= uint64(h.MaxOpensPerSession) || h.totalOpens >= h.MaxOpens:
-		err = volumeserver.ErrAdmission
+		err = errCapabilityTableFull
 	default:
 		trackCapability(resources.opens, handle, protected, &h.totalOpens)
 	}
@@ -3519,6 +3551,7 @@ func (h *VolumeHandler) takeSessionResourcesLocked(id volumeserver.SessionID, ex
 		return sessionResourceCleanup{}, false
 	}
 	resources.ended = true
+	h.endWriteTransactionCapacityWaits(resources)
 	handles := make([]xfsstore.Capability, 0, len(resources.opens))
 	for handle := range resources.opens {
 		handles = append(handles, handle)

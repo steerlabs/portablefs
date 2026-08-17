@@ -835,8 +835,8 @@ func TestSessionResourceAdmissionAndTerminalState(t *testing.T) {
 	if err := h.trackItem(first, xfsstore.Capability{1}, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.trackItem(second, xfsstore.Capability{2}, false); !errors.Is(err, volumeserver.ErrAdmission) {
-		t.Fatalf("global item admission = %v, want ErrAdmission", err)
+	if err := h.trackItem(second, xfsstore.Capability{2}, false); !errors.Is(err, syscall.ENFILE) {
+		t.Fatalf("global item admission = %v, want ENFILE", err)
 	}
 	h.closeSessionResources(first)
 	if err := h.trackItem(first, xfsstore.Capability{3}, false); !errors.Is(err, volumeserver.ErrSessionExpired) {
@@ -868,11 +868,11 @@ func TestCapabilityReservationIsPreApplyAndSymmetric(t *testing.T) {
 	if h.totalItems != 1 || h.totalOpens != 1 {
 		t.Fatalf("reservation charged %d items / %d opens, want 1 / 1", h.totalItems, h.totalOpens)
 	}
-	if _, err := h.reserveCapabilities(second, 1, 0); !errors.Is(err, volumeserver.ErrAdmission) {
-		t.Fatalf("item admitted past outstanding reservation: %v", err)
+	if _, err := h.reserveCapabilities(second, 1, 0); !errors.Is(err, syscall.ENFILE) {
+		t.Fatalf("item admission past outstanding reservation = %v, want ENFILE", err)
 	}
-	if _, err := h.reserveCapabilities(second, 0, 1); !errors.Is(err, volumeserver.ErrAdmission) {
-		t.Fatalf("open admitted past outstanding reservation: %v", err)
+	if _, err := h.reserveCapabilities(second, 0, 1); !errors.Is(err, syscall.ENFILE) {
+		t.Fatalf("open admission past outstanding reservation = %v, want ENFILE", err)
 	}
 
 	item := xfsstore.Capability{0x41}
@@ -1855,8 +1855,8 @@ func TestResourceCapacityRefusalPrecedesEveryStoreAllocation(t *testing.T) {
 			store := &resourceAdmissionFaultStore{failure: syscall.EACCES}
 			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 0, 0)
 			response := h.Handle(ctx, resourceAcquisitionRequest(t, operation, cred, root))
-			if response.GetErrno() != errnos.EAGAIN || response.GetUncertain() {
-				t.Fatalf("capacity response=%+v, want definite EAGAIN", response)
+			if response.GetErrno() != errnos.ENFILE || response.GetUncertain() {
+				t.Fatalf("capacity response=%+v, want definite ENFILE", response)
 			}
 			if calls := store.calls(operation); calls != 0 {
 				t.Fatalf("store %s calls=%d before capacity refusal", operation, calls)
