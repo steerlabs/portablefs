@@ -607,18 +607,35 @@ class PatchedSourceTests(unittest.TestCase):
     def test_one_fragment_write_has_one_deterministic_mutating_shape(self) -> None:
         text = self.source("fs/fuse/file.c")
         one_shot = text[text.index("static ssize_t fuse_pfs_write_one_shot"):
-                        text.index("static ssize_t fuse_pfs_write_transaction")]
+                        text.index("static bool fuse_pfs_write_fits_one_shot")]
         self.assertIn("FUSE_PFS_WRITE_ONE_SHOT", one_shot)
         self.assertEqual(one_shot.count("fuse_pfs_write_payload_send"), 1)
         self.assertNotIn("atomic64_inc_return", one_shot)
         self.assertNotIn("FUSE_PFS_WRITE_BEGIN", one_shot)
         self.assertNotIn("FUSE_PFS_WRITE_COMMIT", one_shot)
+        self.assertIn(
+            "!extract_err && nbytes != frozen->requested_size", one_shot
+        )
+
+        capacity = text[
+            text.index("static bool fuse_pfs_write_fits_one_shot"):
+            text.index("static ssize_t fuse_pfs_write_transaction")
+        ]
+        self.assertIn("requested > fc->max_write", capacity)
+        self.assertIn("iov_iter_is_kvec(from)", capacity)
+        self.assertIn("iov_iter_single_seg_count(from) == requested", capacity)
+        self.assertIn(
+            "iov_iter_npages(from, fc->max_pages + 1) <= fc->max_pages",
+            capacity,
+        )
 
         transaction = text[
             text.index("static ssize_t fuse_pfs_write_transaction"):
             text.index("static ssize_t fuse_file_read_iter")
         ]
-        boundary = transaction.index("if (requested <= fc->max_write)")
+        boundary = transaction.index(
+            "if (fuse_pfs_write_fits_one_shot(fc, from, requested))"
+        )
         txid = transaction.index("atomic64_inc_return(&fc->pfs_write_txid)")
         self.assertLess(boundary, txid)
         self.assertIn(
@@ -628,6 +645,8 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("FUSE_PFS_WRITE_BEGIN", transaction[txid:])
         self.assertIn("FUSE_PFS_WRITE_DATA", transaction[txid:])
         self.assertIn("FUSE_PFS_WRITE_COMMIT", transaction[txid:])
+        self.assertIn("while (iov_iter_count(from))", transaction[txid:])
+        self.assertIn("advanced += nbytes", transaction[txid:])
 
         payload_args = text[
             text.index("static void fuse_pfs_write_payload_args"):

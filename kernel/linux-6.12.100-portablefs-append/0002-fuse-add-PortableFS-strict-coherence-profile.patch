@@ -1,4 +1,4 @@
-From be96ce1bc2a746d202e412004e21bd67a540c46e Mon Sep 17 00:00:00 2001
+From 09a2530e755cf855146af0470d2a8d88ec477e97 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Thu, 13 Aug 2026 08:30:45 -0700
 Subject: [PATCH] fuse: add PortableFS strict-coherence profile
@@ -15,8 +15,8 @@ Subject: [PATCH] fuse: add PortableFS strict-coherence profile
  fs/coda/file.c                               |    7 +
  fs/erofs/super.c                             |    7 +
  fs/fuse/dev.c                                |  471 ++++++-
- fs/fuse/dir.c                                |  360 +++++-
- fs/fuse/file.c                               | 1220 +++++++++++++++++-
+ fs/fuse/dir.c                                |  360 ++++-
+ fs/fuse/file.c                               | 1246 +++++++++++++++++-
  fs/fuse/fuse_i.h                             |   79 +-
  fs/fuse/fuse_trace.h                         |    4 +
  fs/fuse/inode.c                              |  332 ++++-
@@ -31,10 +31,10 @@ Subject: [PATCH] fuse: add PortableFS strict-coherence profile
  fs/splice.c                                  |   12 +-
  include/linux/fs.h                           |    6 +
  include/linux/fs_reply_publish.h             |    2 +
- include/uapi/linux/fuse.h                    |  144 +++
+ include/uapi/linux/fuse.h                    |  144 ++
  io_uring/rw.c                                |   22 +-
  mm/swapfile.c                                |    4 +
- 30 files changed, 2692 insertions(+), 131 deletions(-)
+ 30 files changed, 2718 insertions(+), 131 deletions(-)
 
 diff --git a/drivers/block/loop.c b/drivers/block/loop.c
 index dd4117192..978665072 100644
@@ -1632,7 +1632,7 @@ index ce7324d0d..f11b829cc 100644
  
  	spin_lock_init(&fi->rdc.lock);
 diff --git a/fs/fuse/file.c b/fs/fuse/file.c
-index 1f71ef3ea..229b26b65 100644
+index 1f71ef3ea..acfedc292 100644
 --- a/fs/fuse/file.c
 +++ b/fs/fuse/file.c
 @@ -22,7 +22,7 @@
@@ -1955,7 +1955,7 @@ index 1f71ef3ea..229b26b65 100644
  	struct fuse_write_in *inarg = &ia->write.in;
  	ssize_t err;
  
-@@ -1742,6 +1889,570 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
+@@ -1742,6 +1889,596 @@ static ssize_t fuse_direct_write_iter(struct kiocb *iocb, struct iov_iter *from)
  	return res;
  }
  
@@ -2370,6 +2370,13 @@ index 1f71ef3ea..229b26b65 100644
 +		fuse_io_free(ia);
 +		return extract_err ?: -EFAULT;
 +	}
++	if (unlikely(!extract_err && nbytes != frozen->requested_size)) {
++		fuse_release_user_pages(&ia->ap, 0, false);
++		iov_iter_revert(from, nbytes);
++		fuse_io_free(ia);
++		fuse_abort_conn(fc);
++		return -ENOTCONN;
++	}
 +	/* A faulted tail becomes the same single-request partial write Linux had. */
 +	ia->pfs_write.in.requested_size = nbytes;
 +	ia->pfs_write.in.size = nbytes;
@@ -2383,6 +2390,25 @@ index 1f71ef3ea..229b26b65 100644
 +				       publish_token);
 +	fuse_io_free(ia);
 +	return result;
++}
++
++static bool fuse_pfs_write_fits_one_shot(struct fuse_conn *fc,
++					 struct iov_iter *from, u64 requested)
++{
++	if (requested > fc->max_write)
++		return false;
++
++	/*
++	 * A direct kvec argument can carry only its current segment.  Every other
++	 * iterator is extracted into the negotiated request page vector.  Probe
++	 * one page past that limit so an unaligned max_write-sized buffer does not
++	 * get mistaken for a complete one-shot and returned as a routine short
++	 * write after fuse_get_user_pages() advances only its first max_pages.
++	 */
++	if (iov_iter_is_kvec(from) && !fc->use_pages_for_kvec_io)
++		return iov_iter_single_seg_count(from) == requested;
++
++	return iov_iter_npages(from, fc->max_pages + 1) <= fc->max_pages;
 +}
 +
 +static ssize_t fuse_pfs_write_transaction(struct kiocb *iocb,
@@ -2432,7 +2458,7 @@ index 1f71ef3ea..229b26b65 100644
 +	if (!requested)
 +		return 0;
 +	max_end = min(rlimit_fsize, file_max_size);
-+	if (requested <= fc->max_write) {
++	if (fuse_pfs_write_fits_one_shot(fc, from, requested)) {
 +		fuse_pfs_write_in_freeze(&frozen, iocb, 0, requested,
 +					 position, rlimit_fsize, file_max_size);
 +		return fuse_pfs_write_one_shot(iocb, from, &frozen, position,
@@ -2526,7 +2552,7 @@ index 1f71ef3ea..229b26b65 100644
  static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
  {
  	struct file *file = iocb->ki_filp;
-@@ -1751,6 +2462,16 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+@@ -1751,6 +2488,16 @@ static ssize_t fuse_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
  	if (fuse_is_bad(inode))
  		return -EIO;
  
@@ -2543,7 +2569,7 @@ index 1f71ef3ea..229b26b65 100644
  	if (FUSE_IS_DAX(inode))
  		return fuse_dax_read_iter(iocb, to);
  
-@@ -1768,9 +2489,28 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+@@ -1768,9 +2515,28 @@ static ssize_t fuse_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
  	struct file *file = iocb->ki_filp;
  	struct fuse_file *ff = file->private_data;
  	struct inode *inode = file_inode(file);
@@ -2572,7 +2598,7 @@ index 1f71ef3ea..229b26b65 100644
  
  	if (FUSE_IS_DAX(inode))
  		return fuse_dax_write_iter(iocb, from);
-@@ -1790,6 +2530,16 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
+@@ -1790,6 +2556,16 @@ static ssize_t fuse_splice_read(struct file *in, loff_t *ppos,
  {
  	struct fuse_file *ff = in->private_data;
  
@@ -2589,7 +2615,7 @@ index 1f71ef3ea..229b26b65 100644
  	/* FOPEN_DIRECT_IO overrides FOPEN_PASSTHROUGH */
  	if (fuse_file_passthrough(ff) && !(ff->open_flags & FOPEN_DIRECT_IO))
  		return fuse_passthrough_splice_read(in, ppos, pipe, len, flags);
-@@ -2423,6 +3173,19 @@ static int fuse_writepages(struct address_space *mapping,
+@@ -2423,6 +3199,19 @@ static int fuse_writepages(struct address_space *mapping,
  	if (fuse_is_bad(inode))
  		goto out;
  
@@ -2609,7 +2635,7 @@ index 1f71ef3ea..229b26b65 100644
  	if (wbc->sync_mode == WB_SYNC_NONE &&
  	    fc->num_background >= fc->congestion_threshold)
  		return 0;
-@@ -2465,6 +3228,11 @@ static int fuse_write_begin(struct file *file, struct address_space *mapping,
+@@ -2465,6 +3254,11 @@ static int fuse_write_begin(struct file *file, struct address_space *mapping,
  	int err = -ENOMEM;
  
  	WARN_ON(!fc->writeback_cache);
@@ -2621,7 +2647,7 @@ index 1f71ef3ea..229b26b65 100644
  
  	folio = __filemap_get_folio(mapping, index, FGP_WRITEBEGIN,
  			mapping_gfp_mask(mapping));
-@@ -2617,6 +3385,35 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
+@@ -2617,6 +3411,35 @@ static int fuse_file_mmap(struct file *file, struct vm_area_struct *vma)
  	else if (fuse_inode_backing(get_fuse_inode(inode)))
  		return -ENODEV;
  
@@ -2657,7 +2683,7 @@ index 1f71ef3ea..229b26b65 100644
  	/*
  	 * FOPEN_DIRECT_IO handling is special compared to O_DIRECT,
  	 * as does not allow MAP_SHARED mmap without FUSE_DIRECT_IO_ALLOW_MMAP.
-@@ -2845,6 +3642,10 @@ static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
+@@ -2845,6 +3668,10 @@ static loff_t fuse_lseek(struct file *file, loff_t offset, int whence)
  	struct fuse_lseek_out outarg;
  	int err;
  
@@ -2668,7 +2694,7 @@ index 1f71ef3ea..229b26b65 100644
  	if (fm->fc->no_lseek)
  		goto fallback;
  
-@@ -2966,6 +3767,10 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait)
+@@ -2966,6 +3793,10 @@ __poll_t fuse_file_poll(struct file *file, poll_table *wait)
  	FUSE_ARGS(args);
  	int err;
  
@@ -2679,7 +2705,7 @@ index 1f71ef3ea..229b26b65 100644
  	if (fm->fc->no_poll)
  		return DEFAULT_POLLMASK;
  
-@@ -3150,6 +3955,220 @@ static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
+@@ -3150,6 +3981,220 @@ static int fuse_writeback_range(struct inode *inode, loff_t start, loff_t end)
  	return err;
  }
  
@@ -2900,7 +2926,7 @@ index 1f71ef3ea..229b26b65 100644
  static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  				loff_t length)
  {
-@@ -3169,10 +4188,12 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+@@ -3169,10 +4214,12 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  		(!(mode & FALLOC_FL_KEEP_SIZE) ||
  		 (mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_ZERO_RANGE)));
  
@@ -2915,7 +2941,7 @@ index 1f71ef3ea..229b26b65 100644
  	if (fm->fc->no_fallocate)
  		return -EOPNOTSUPP;
  
-@@ -3211,6 +4232,11 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+@@ -3211,6 +4258,11 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  	args.in_numargs = 1;
  	args.in_args[0].size = sizeof(inarg);
  	args.in_args[0].value = &inarg;
@@ -2927,7 +2953,7 @@ index 1f71ef3ea..229b26b65 100644
  	err = fuse_simple_request(fm, &args);
  	if (err == -ENOSYS) {
  		fm->fc->no_fallocate = 1;
-@@ -3244,6 +4270,118 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+@@ -3244,6 +4296,118 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
  	return err;
  }
  
@@ -3046,7 +3072,7 @@ index 1f71ef3ea..229b26b65 100644
  static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  				      struct file *file_out, loff_t pos_out,
  				      size_t len, unsigned int flags)
-@@ -3323,6 +4461,12 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
+@@ -3323,6 +4487,12 @@ static ssize_t __fuse_copy_file_range(struct file *file_in, loff_t pos_in,
  	args.out_numargs = 1;
  	args.out_args[0].size = sizeof(outarg);
  	args.out_args[0].value = &outarg;
@@ -3059,7 +3085,7 @@ index 1f71ef3ea..229b26b65 100644
  	err = fuse_simple_request(fm, &args);
  	if (err == -ENOSYS) {
  		fc->no_copy_file_range = 1;
-@@ -3358,15 +4502,38 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
+@@ -3358,15 +4528,38 @@ static ssize_t fuse_copy_file_range(struct file *src_file, loff_t src_off,
  				    struct file *dst_file, loff_t dst_off,
  				    size_t len, unsigned int flags)
  {
@@ -3104,7 +3130,7 @@ index 1f71ef3ea..229b26b65 100644
  }
  
  static const struct file_operations fuse_file_operations = {
-@@ -3388,6 +4555,17 @@ static const struct file_operations fuse_file_operations = {
+@@ -3388,6 +4581,17 @@ static const struct file_operations fuse_file_operations = {
  	.poll		= fuse_file_poll,
  	.fallocate	= fuse_file_fallocate,
  	.copy_file_range = fuse_copy_file_range,
@@ -4442,5 +4468,5 @@ index 552df432c..a8e5df7a3 100644
  	si->swap_file = swap_file;
  	mapping = swap_file->f_mapping;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

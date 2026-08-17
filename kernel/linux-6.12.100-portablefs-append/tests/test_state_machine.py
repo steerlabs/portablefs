@@ -120,10 +120,35 @@ def next_publication_id(current: int) -> int:
     return value
 
 
-def write_shape(total: int, max_write: int) -> str:
-    if total <= 0 or max_write <= 0:
+def write_shape(total: int, max_write: int, request_capacity: int) -> str:
+    if total <= 0 or max_write <= 0 or request_capacity <= 0:
         raise ProtocolError("invalid write size boundary")
-    return "one-shot" if total <= max_write else "transaction"
+    return ("one-shot" if total <= max_write and total <= request_capacity
+            else "transaction")
+
+
+def buffered_write_plan(total: int, max_write: int, max_pages: int,
+                        page_size: int, first_page_offset: int
+                        ) -> tuple[str, list[int], int]:
+    if (total <= 0 or max_write <= 0 or max_pages <= 0 or page_size <= 0 or
+            first_page_offset < 0 or first_page_offset >= page_size):
+        raise ProtocolError("invalid buffered write geometry")
+    request_capacity = min(max_write,
+                           max_pages * page_size - first_page_offset)
+    shape = write_shape(total, max_write, request_capacity)
+    if shape == "one-shot":
+        return shape, [total], total
+
+    remaining = total
+    offset = first_page_offset
+    fragments: list[int] = []
+    while remaining:
+        capacity = min(max_write, max_pages * page_size - offset)
+        fragment = min(remaining, capacity)
+        fragments.append(fragment)
+        remaining -= fragment
+        offset = (offset + fragment) % page_size
+    return shape, fragments, sum(fragments)
 
 
 def validate_write_reply(reply: WriteReply, txid: int, expected: int) -> str:
@@ -907,9 +932,25 @@ class AbiAndAdmissionTests(unittest.TestCase):
 class TransactionTests(unittest.TestCase):
     def test_size_class_has_exactly_one_shape_at_max_write_boundary(self) -> None:
         max_write = 1 << 20
-        self.assertEqual(write_shape(1, max_write), "one-shot")
-        self.assertEqual(write_shape(max_write, max_write), "one-shot")
-        self.assertEqual(write_shape(max_write + 1, max_write), "transaction")
+        self.assertEqual(write_shape(1, max_write, max_write), "one-shot")
+        self.assertEqual(write_shape(max_write, max_write, max_write),
+                         "one-shot")
+        self.assertEqual(write_shape(max_write + 1, max_write, max_write),
+                         "transaction")
+
+    def test_buffered_write_larger_than_page_vector_completes_all_fragments(
+            self) -> None:
+        max_write = 1 << 20
+        for first_page_offset in (208, 3184):
+            with self.subTest(first_page_offset=first_page_offset):
+                shape, fragments, completed = buffered_write_plan(
+                    max_write, max_write, 256, 4096, first_page_offset)
+                self.assertEqual(shape, "transaction")
+                self.assertEqual(
+                    fragments,
+                    [max_write - first_page_offset, first_page_offset],
+                )
+                self.assertEqual(completed, max_write)
 
     def test_one_shot_append_replay_is_exact_and_uses_no_transaction_id(self) -> None:
         authority = Authority(b"prefix")

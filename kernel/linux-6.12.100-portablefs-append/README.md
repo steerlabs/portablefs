@@ -12,8 +12,9 @@ whole strict kernel publication boundary:
   page cache is withdrawn by ordered DATA publication under
   `mapping->invalidate_lock`, plus the whole-inode withdrawal a revoking mount
   uses to stop serving retained pages;
-- one-request positioned and effective-append writes at or below `max_write`,
-  with the staged transaction ladder retained only above that boundary;
+- one-request positioned and effective-append writes whose complete iterator
+  fits both `max_write` and one negotiated request page vector, with the staged
+  transaction ladder used for every multi-fragment shape;
 - a generic post-VFS publication ACK for marked replies;
 - ordered exact-size/full-data invalidation notifications;
 - private full-mode XFS fallocate and SHARED copy-file-range requests;

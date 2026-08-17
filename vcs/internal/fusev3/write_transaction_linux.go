@@ -191,9 +191,9 @@ func fillOneShotWriteOut(out *fuse.PFSWriteOut, reply *authoritypb.OneShotWriteR
 	}
 }
 
-// PFSWrite selects exactly one negotiated shape by size. A one-fragment write
-// commits directly; a larger write uses inert BEGIN/DATA staging followed by
-// the sole mutating COMMIT.
+// PFSWrite executes the one shape selected by the kernel before dispatch. A
+// one-request iterator commits directly; a byte or page-vector shape requiring
+// fragments uses inert BEGIN/DATA staging followed by the sole mutating COMMIT.
 func (r *rawFileSystem) PFSWrite(_ <-chan struct{}, input *fuse.PFSWriteIn, data []byte, out *fuse.PFSWriteOut) fuse.Status {
 	if out == nil {
 		return writeTransactionProtocolError

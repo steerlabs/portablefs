@@ -261,12 +261,15 @@ BEGIN and repeated exactly across a fragmented transaction.
 | ABORT | 4 | none | 0 | idempotent precommit cleanup |
 | ONE_SHOT | 5 | `size` bytes | 0 | one authority mutation, no staging |
 
-The initial `iov_iter_count` selects exactly one shape. A count at or below
-negotiated `max_write` sends ONE_SHOT with the complete extracted payload,
-write geometry, and `txid == 0`. It neither allocates nor consumes a transaction
-ID. A count above `max_write` consumes the next monotonic transaction ID and
-uses BEGIN, one or more DATA fragments, and COMMIT. These are deterministic
-size classes, not a fallback chain.
+The initial `iov_iter` selects exactly one shape. A count at or below negotiated
+`max_write` whose complete iterator also fits the negotiated request page
+vector sends ONE_SHOT with the complete extracted payload, write geometry, and
+`txid == 0`. A direct kernel-vector argument must likewise fit one segment. The
+ONE_SHOT shape neither allocates nor consumes a transaction ID. A larger byte
+count or page-vector shape consumes the next monotonic transaction ID and uses
+BEGIN, one or more DATA fragments, and COMMIT. Selection is deterministic
+before dispatch; the transaction is not a runtime fallback from a partial
+ONE_SHOT.
 
 BEGIN and DATA do not acquire the source visibility gate and cannot expose
 partial data.  COMMIT acquires the source gate only after prior peer phases have

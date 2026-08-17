@@ -99,10 +99,11 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   authority that stopped meeting one of them would be refused rather than
   silently tolerated.
 
-  `one-shot-write-v1` is the additive protocol-5 write operation for a payload
-  no larger than negotiated `max_write`. It is one source-gated replay-slot
-  mutation and has no transaction ID or staging phase. Larger writes use the
-  existing BEGIN/DATA/COMMIT transaction shape. The size boundary selects one
+  `one-shot-write-v1` is the additive protocol-5 write operation for a complete
+  payload no larger than negotiated `max_write` that fits one negotiated kernel
+  request page vector. It is one source-gated replay-slot mutation and has no
+  transaction ID or staging phase. Larger byte or page-vector shapes use the
+  existing BEGIN/DATA/COMMIT transaction. The initial iterator selects one
   shape deterministically; neither shape is a runtime fallback for the other.
 
   The sequenced visibility retry is an internal Linux liveness transaction,

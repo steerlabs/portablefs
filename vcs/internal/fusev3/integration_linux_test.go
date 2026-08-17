@@ -842,8 +842,8 @@ func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
 
 // TestWriteSizeClassesUseExactAuthorityShapes is gated on the pinned kernel.
 // It proves the small-write optimization at the real /dev/fuse boundary and
-// also pins that the large-write transaction ladder remains the only shape
-// above max_write.
+// also pins that the transaction ladder owns both byte counts above max_write
+// and iterators which fit that byte bound but exceed one request page vector.
 func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	path := f.join(0, "write-size-classes")
@@ -890,16 +890,29 @@ func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
 	}
 
 	const maxWrite = 1 << 20
-	large, err := unix.Mmap(-1, 0, maxWrite+1, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+	mapping, err := unix.Mmap(-1, 0, maxWrite+os.Getpagesize(), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer unix.Munmap(large)
-	for index := range large {
-		large[index] = 0x33
+	defer unix.Munmap(mapping)
+	for index := range mapping {
+		mapping[index] = 0x33
 	}
+	unaligned := mapping[208 : 208+maxWrite]
 	oneShot, transactions = countWrite(func() error {
-		n, err := unix.Pwrite(int(file.Fd()), large, 2*maxWrite)
+		n, err := unix.Pwrite(int(file.Fd()), unaligned, 2*maxWrite)
+		if err == nil && n != len(unaligned) {
+			return io.ErrShortWrite
+		}
+		return err
+	})
+	if oneShot != 0 || transactions != 4 {
+		t.Fatalf("unaligned max_write positioned write authority shapes = one-shot %d, transaction phases %d, want 0/4", oneShot, transactions)
+	}
+
+	large := mapping[:maxWrite+1]
+	oneShot, transactions = countWrite(func() error {
+		n, err := unix.Pwrite(int(file.Fd()), large, 3*maxWrite)
 		if err == nil && n != len(large) {
 			return io.ErrShortWrite
 		}
@@ -908,10 +921,11 @@ func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
 	if oneShot != 0 || transactions != 4 {
 		t.Fatalf("max_write+1 positioned write authority shapes = one-shot %d, transaction phases %d, want 0/4", oneShot, transactions)
 	}
-	expected := make([]byte, 3*maxWrite+1)
+	expected := make([]byte, 4*maxWrite+1)
 	copy(expected, positioned)
 	copy(expected[len(positioned):], appendPayload)
-	copy(expected[2*maxWrite:], large)
+	copy(expected[2*maxWrite:], unaligned)
+	copy(expected[3*maxWrite:], large)
 	requireContent(t, path, expected, "data after both write-size shapes")
 }
 
