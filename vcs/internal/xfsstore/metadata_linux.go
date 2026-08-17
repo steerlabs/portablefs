@@ -64,20 +64,13 @@ func (v *Volume) Chmod(id Capability, mode fs.FileMode) error {
 // Fchmodat with AT_EMPTY_PATH is the natural spelling, but Go routes any
 // nonzero flags to fchmodat2(2), which only exists on Linux 6.6+ — on an older
 // authority host every chmod would fail mid-mutation with ENOSYS and fence the
-// epoch. Reopening through /proc/self/fd (which re-verifies device, inode and
-// project) and using plain fchmod(2) has identical no-path-race semantics on
-// every kernel this authority may run on.
-func (v *Volume) chmodCapability(fd int, kind Kind, unixMode uint32) error {
-	flags := unix.O_RDONLY
-	if kind == KindDirectory {
-		flags |= unix.O_DIRECTORY
-	}
-	opened, err := v.reopen(fd, flags, kind)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(opened)
-	return unix.Fchmod(opened, unixMode)
+// epoch. Reopening and fchmod(2) is no substitute: a mode-0 object cannot be
+// reopened by the unprivileged service identity, and restoring such a mode is
+// exactly what Chmod must be able to do. chmod(2) through the /proc magic link
+// is glibc's own pre-fchmodat2 fallback: it needs no open permission, and the
+// held O_PATH descriptor pins the inode the link resolves to.
+func (v *Volume) chmodCapability(fd int, _ Kind, unixMode uint32) error {
+	return unix.Chmod(procFDPath(fd), unixMode)
 }
 
 // Chown uses -1 to leave one side unchanged, matching fchownat. The owner
