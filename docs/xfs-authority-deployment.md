@@ -219,12 +219,14 @@ the worker class and workload measurements.
 | `--max-sessions` | `1024` |
 | `--max-lock-records` | `65536` |
 | `--max-items` | `65536` |
-| `--max-items-per-session` | `8192` |
+| `--max-items-per-session` | `65536` |
 | `--max-opens` | `32768` |
 | `--max-opens-per-session` | `4096` |
 | `--max-retained-reply-bytes` | `512 MiB` |
 | `--max-frame-bytes-in-flight` | `512 MiB` |
 | `--max-in-flight` | `256` |
+| `--max-write-transactions` | `4096` |
+| `--max-write-transactions-per-session` | effective `--max-in-flight`, capped by `--max-write-transactions` (`256` with stock defaults) |
 | `--max-connections` | `4096` |
 | `--capability-nonce-records` | `65536` |
 | `--tls-handshake-timeout` | `10s` |
@@ -397,8 +399,9 @@ per-mount owner uses an enrollment to obtain exact, short-lived in-session
 reauthorizations without keeping the original product assertion alive. The
 manager does not authenticate end users itself; it verifies the product's
 signed authorization at enrollment creation. See
-[hosted-control-plane.md](./hosted-control-plane.md). A standalone mount still
-ends at its initial capability's deadline.
+[hosted-control-plane.md](./hosted-control-plane.md). A standalone mount has no
+manager to ask, so it renews from the credential file its own issuer rotates:
+see [Renewing a standalone mount](#renewing-a-standalone-mount).
 
 ## Mounting from Linux
 
@@ -467,6 +470,52 @@ All eight of those are required. Notable optional flags are `--coherence`
 (`10s`), `--request-timeout` (`45s`), `--local-backing`, and `--no-local-dirs`.
 `--local-dir` exists only to be refused with an explanation. The mountpoint must
 be a clean absolute path naming a real, empty directory that is not a symlink.
+
+### Renewing a standalone mount
+
+A capability is short lived and the authority bounds it further with
+`--capability-max-lifetime`. Session keepalive never extends a signed
+authorization deadline; only a new session-bound signed authorization does. A
+mount that never gets one is fenced when its deadline passes, and every open
+file under it fails.
+
+`portablefs-mount-v3` therefore renews from `--access-token-file`, the same file
+it attached with. There is no second flag and no second credential path: the
+issuer that minted the attach capability rotates the file in place, and the
+mount picks it up. Renewal is always running, so there is no configuration in
+which it is off.
+
+A reauthorization capability is bound to one session and one exact sequence, so
+the mount publishes both. At mount time it logs
+
+```
+authorization session <id> expires <RFC3339>; write the capability for sequence 1
+of this session to /run/portablefs/access.token to extend it
+```
+
+and after each renewal it logs the next sequence and the new deadline. Mint the
+replacement with `volumecap.Sign`, setting `session_id` and `sequence` to the
+logged values, the same `volume_id` and `peer_spki_sha256` as the attach
+capability, and access no broader than the mount already holds — the authority
+fences a session that is offered more access than it holds, and the mount
+refuses to present such a capability rather than provoke that. Replace the file
+atomically (write a sibling, then `rename`); mode `0600` is enforced on every
+read, as it is at startup.
+
+Rotation is the operator's only obligation and failing to meet it is safe. The
+mount retries with backoff, and if no usable capability appears before a safety
+margin ahead of the deadline it unmounts itself while its current authorization
+is still valid. That is the same fail-closed end state as having no renewal at
+all, reached slightly earlier and as an orderly unmount rather than as
+`ESTALE` in the middle of application I/O. The margin is a tenth of the
+authorization window, at least five seconds and at most a minute.
+
+Access may narrow across renewals and never broadens: a mount can be demoted to
+read-only by rotating in a narrower capability, and the narrowed access becomes
+the ceiling for every later renewal.
+
+The mutual-TLS client identity is not renewed this way. The capability is bound
+to that key, so `--tls-cert` must outlive the mount.
 
 ### What the Linux mount does and does not promise
 
