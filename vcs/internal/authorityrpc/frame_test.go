@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -398,6 +399,191 @@ func TestFrameBudgetIsRetainedThroughBulkUse(t *testing.T) {
 		t.Fatalf("budget after handler release = %v", err)
 	}
 	budget.release(total)
+}
+
+func TestFramePayloadClassesCoverEveryLegalFrame(t *testing.T) {
+	for _, tc := range []struct {
+		size  int
+		class int
+	}{
+		{size: 1, class: -1},
+		{size: (64 << 10) - 1, class: -1},
+		{size: 64 << 10, class: 0},
+		{size: (64 << 10) + 1, class: 1},
+		{size: 128 << 10, class: 1},
+		{size: (1 << 20) + int(FramePayloadReserve), class: 16},
+		{size: 4 << 20, class: framePoolClasses - 1},
+		{size: (4 << 20) + 1, class: -1},
+	} {
+		if got := framePoolClass(tc.size); got != tc.class {
+			t.Fatalf("framePoolClass(%d) = %d, want %d", tc.size, got, tc.class)
+		}
+		payload, class := acquireFramePayload(tc.size)
+		if len(payload) != tc.size || class != tc.class {
+			t.Fatalf("acquireFramePayload(%d) = (len %d, class %d), want (len %d, class %d)",
+				tc.size, len(payload), class, tc.size, tc.class)
+		}
+		if class >= 0 {
+			if cap(payload) != framePoolBytes(class) {
+				t.Fatalf("acquireFramePayload(%d) capacity = %d, want the exact class size %d",
+					tc.size, cap(payload), framePoolBytes(class))
+			}
+			// A class must never round a frame up by more than its own width, or
+			// a pool miss costs more than the allocation it replaces.
+			if over := cap(payload) - tc.size; over >= framePoolGranularity {
+				t.Fatalf("acquireFramePayload(%d) over-allocated by %d bytes", tc.size, over)
+			}
+		}
+		releaseFramePayload(payload, class)
+	}
+}
+
+func TestFramePayloadIsRecycledAtItsClass(t *testing.T) {
+	// A smaller frame in the same class draws the released buffer back; the
+	// class exists so that a megabyte of write staging is allocated once rather
+	// than once per frame. Every garbage collection empties the pool, so a
+	// single put/get pair may legitimately miss — recycling has to be the
+	// ordinary outcome, not a guaranteed one.
+	for attempt := range 32 {
+		payload, class := acquireFramePayload(1 << 20)
+		base := &payload[0]
+		releaseFramePayload(payload, class)
+		again, againClass := acquireFramePayload((1 << 20) - 4096)
+		reused := againClass == class && &again[0] == base
+		releaseFramePayload(again, againClass)
+		if againClass != class {
+			t.Fatalf("attempt %d: 1 MiB and 1 MiB - 4 KiB took classes %d and %d", attempt, class, againClass)
+		}
+		if reused {
+			return
+		}
+	}
+	t.Fatal("a released frame payload was never recycled into its own class")
+}
+
+// A retained frame hands its decoded message a slice of the payload buffer.
+// That slice is exactly as alive as the release hook, so release both drops it
+// from the message and returns the buffer: a carrier that survived release would
+// be reading another connection's frame.
+func TestReleasedFramePayloadIsNotAliasedByALiveCarrier(t *testing.T) {
+	encode := func(t *testing.T, fill byte) []byte {
+		t.Helper()
+		request := &authoritypb.Request{
+			RequestId: 21,
+			Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+				TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+				Data: bytes.Repeat([]byte{fill}, 64<<10),
+			}},
+		}
+		var frame bytes.Buffer
+		if err := writeFrame(&frame, 128<<10, request); err != nil {
+			t.Fatal(err)
+		}
+		return frame.Bytes()
+	}
+
+	first := new(authoritypb.Request)
+	release, err := readFrameRetained(bytes.NewReader(encode(t, 0xA5)), 128<<10, nil, 0, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bulk := first.GetWriteTransaction().GetData()
+	if len(bulk) != 64<<10 || bulk[0] != 0xA5 {
+		t.Fatalf("retained bulk = %d bytes, want the exact out-of-line body", len(bulk))
+	}
+	release()
+	if got := first.GetWriteTransaction().GetData(); got != nil {
+		t.Fatalf("released payload is still reachable through its carrier: %d bytes", len(got))
+	}
+
+	// The recycled buffer is not cleared, so the next frame is only correct if
+	// every byte of it was read over the previous frame's contents.
+	second := new(authoritypb.Request)
+	secondRelease, err := readFrameRetained(bytes.NewReader(encode(t, 0x3C)), 128<<10, nil, 0, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondRelease()
+	next := second.GetWriteTransaction().GetData()
+	if len(next) != 64<<10 {
+		t.Fatalf("recycled frame decoded %d bulk bytes, want %d", len(next), 64<<10)
+	}
+	if want := bytes.Repeat([]byte{0x3C}, 64<<10); !bytes.Equal(next, want) {
+		t.Fatal("a recycled payload buffer left stale bytes in the decoded frame")
+	}
+}
+
+func TestConcurrentRetainedFramesNeverShareAPayload(t *testing.T) {
+	const readers = 16
+	const rounds = 24
+	frames := make([][]byte, readers)
+	for reader := range frames {
+		request := &authoritypb.Request{
+			RequestId: uint64(reader) + 1,
+			Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+				TransactionId: uint64(reader) + 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+				Data: bytes.Repeat([]byte{byte(reader)}, (reader+1)<<10),
+			}},
+		}
+		var frame bytes.Buffer
+		if err := writeFrame(&frame, 128<<10, request); err != nil {
+			t.Fatal(err)
+		}
+		frames[reader] = frame.Bytes()
+	}
+	budget := newFrameBudget(uint64(readers) * (128 << 10))
+	var failures sync.WaitGroup
+	errs := make(chan error, readers*rounds)
+	for reader := range readers {
+		failures.Add(1)
+		go func(reader int) {
+			defer failures.Done()
+			want := bytes.Repeat([]byte{byte(reader)}, (reader+1)<<10)
+			for range rounds {
+				decoded := new(authoritypb.Request)
+				release, err := readFrameRetained(bytes.NewReader(frames[reader]), 128<<10, budget, time.Second, decoded)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !bytes.Equal(decoded.GetWriteTransaction().GetData(), want) {
+					errs <- fmt.Errorf("reader %d decoded another reader's payload", reader)
+					release()
+					return
+				}
+				release()
+			}
+		}(reader)
+	}
+	failures.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+}
+
+func BenchmarkReadRetainedBulkFrame1MiB(b *testing.B) {
+	request := &authoritypb.Request{
+		RequestId: 14,
+		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: make([]byte, 1<<20),
+		}},
+	}
+	var encoded bytes.Buffer
+	if err := writeFrame(&encoded, 2<<20, request); err != nil {
+		b.Fatal(err)
+	}
+	wire := encoded.Bytes()
+	b.ReportAllocs()
+	b.SetBytes(1 << 20)
+	for b.Loop() {
+		var got authoritypb.Request
+		release, err := readFrameRetained(bytes.NewReader(wire), 2<<20, nil, 0, &got)
+		if err != nil {
+			b.Fatal(err)
+		}
+		release()
+	}
 }
 
 // BenchmarkWriteBulkFrameAllocations1MiB isolates framing allocations. The

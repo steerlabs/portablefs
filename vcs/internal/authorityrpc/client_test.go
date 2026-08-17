@@ -169,6 +169,7 @@ type clientTestHandler struct {
 	omitExactRepair       bool
 	attachCount           *atomic.Int32
 	writeTransactionBound *uint64
+	readBound             *uint32
 	keepAliveErrno        int32
 	maxInFlight           int
 	mountEnrollment       bool
@@ -292,9 +293,13 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 		if h.writeTransactionBound != nil {
 			writeTransactionBound = *h.writeTransactionBound
 		}
+		readBound := uint32(1 << 20)
+		if h.readBound != nil {
+			readBound = *h.readBound
+		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 			ProtocolMajor: ProtocolMajor, Features: features,
-			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
+			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: readBound, MaxWriteBytes: 1 << 20,
 			MaxInFlight: uint32(bounds.MaxInFlight), MaxWriteTransactionBytes: writeTransactionBound,
 		}}
 	case *authoritypb.Request_Attach:
@@ -466,6 +471,125 @@ func TestClientRefusesWrongWriteTransactionBoundBeforeAttachSideEffects(t *testi
 				t.Fatalf("write-transaction bound refusal reached Attach %d times", got)
 			}
 		})
+	}
+}
+
+// The authority configures its read and write bounds separately, but a Linux
+// mount sizes max_write from the write bound and the kernel then sizes max_read
+// from max_write. A read bound below the write bound therefore does not shrink
+// reads, it splits each one across round trips, and nothing on either side
+// reports that it happened. Negotiation is the only place both numbers are
+// visible, so it is where the pairing is refused.
+func TestClientRefusesAReadBoundBelowTheWriteBound(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		bound   uint32
+		refused bool
+	}{
+		{name: "below", bound: (1 << 20) - 4096, refused: true},
+		{name: "halved", bound: 1 << 19, refused: true},
+		{name: "equal", bound: 1 << 20},
+		{name: "above", bound: 2 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attaches atomic.Int32
+			bound := tc.bound
+			address, clientTLS, stop := startTestServer(t, clientTestHandler{
+				epoch: bytes.Repeat([]byte{0x2c}, 16), maxInFlight: 4,
+				readBound: &bound, attachCount: &attaches,
+			}, 4, time.Minute)
+			defer stop()
+			client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+			if !tc.refused {
+				if err != nil {
+					t.Fatal(err)
+				}
+				gotRead, gotWrite := client.IOLimits()
+				_ = client.Close()
+				if gotRead != tc.bound || gotWrite != 1<<20 {
+					t.Fatalf("IOLimits() = (%d, %d), want (%d, %d)", gotRead, gotWrite, tc.bound, 1<<20)
+				}
+				return
+			}
+			if err == nil {
+				_ = client.Close()
+				t.Fatalf("client accepted read bound %d under a %d write bound", tc.bound, 1<<20)
+			}
+			if !strings.Contains(err.Error(), "read bound") {
+				t.Fatalf("DialClient error = %v, want a read-bound refusal", err)
+			}
+			if got := attaches.Load(); got != 0 {
+				t.Fatalf("read-bound refusal reached Attach %d times", got)
+			}
+		})
+	}
+}
+
+// Both transports reconnect independently and lazily, so a mount that runs for
+// a day pays for however many handshakes its network produced. The resumption
+// cache belongs to the Client, not to the caller-supplied config, and has to
+// survive the per-dial Clone or it resumes nothing.
+func TestClientResumesItsTLSSessionAcrossTransportReconnects(t *testing.T) {
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{
+		epoch: bytes.Repeat([]byte{0x2d}, 16), maxInFlight: 5,
+	}, 5, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 5, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if clientTLS.ClientSessionCache != nil {
+		t.Fatal("DialClient installed its resumption cache on the caller's config")
+	}
+	cache := client.tlsConfig().ClientSessionCache
+	if cache == nil {
+		t.Fatal("client dialed the authority without a TLS session cache")
+	}
+	if again := client.tlsConfig().ClientSessionCache; again != cache {
+		t.Fatal("each dial takes a private cache, so no ticket can outlive one connection")
+	}
+
+	client.data.pendingMu.Lock()
+	old := client.data.conn
+	client.data.pendingMu.Unlock()
+	client.failConnection(client.data, old, ErrTransportUncertain)
+	response, err := client.CallRead(context.Background(), &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{}}})
+	if err != nil || response.GetErrno() != 95 {
+		t.Fatalf("DATA call after transport loss = (%v, %v)", response, err)
+	}
+	client.data.pendingMu.Lock()
+	resumed, _ := client.data.conn.(*tls.Conn)
+	client.data.pendingMu.Unlock()
+	if resumed == nil {
+		t.Fatal("DATA did not reconnect")
+	}
+	if !resumed.ConnectionState().DidResume {
+		t.Fatal("the reconnected DATA transport paid a full TLS handshake")
+	}
+}
+
+func TestReauthorizedCertificateDropsResumableTLSSessions(t *testing.T) {
+	handler := &clientReauthorizationHandler{clientTestHandler: clientTestHandler{
+		epoch: bytes.Repeat([]byte{0x2e}, 16), maxInFlight: 4,
+	}}
+	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	retired := client.tlsConfig().ClientSessionCache
+	renewed := renewedCertificateForExistingKey(t, clientTLS.Certificates[0], 9002)
+	if _, err := client.ReauthorizeWithCertificate(context.Background(), []byte("renewed"), 1, renewed, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// A resumed session authenticates as the identity that completed the full
+	// handshake behind its ticket. Keeping those tickets would let a later
+	// transport present the certificate this rotation just retired.
+	if rotated := client.tlsConfig().ClientSessionCache; rotated == nil || rotated == retired {
+		t.Fatal("a rotated client identity left the retired certificate's tickets resumable")
 	}
 }
 
@@ -1256,7 +1380,10 @@ type splitNegotiationHandler struct {
 func (h *splitNegotiationHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	response := h.clientTestHandler.Handle(ctx, request)
 	if hello := request.GetHello(); hello != nil && hello.GetRole() == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
-		response.GetHello().MaxReadBytes--
+		// Raise rather than lower the bound: a read bound below the write bound
+		// is refused on its own Hello, which would leave the pair comparison
+		// untested.
+		response.GetHello().MaxReadBytes++
 	}
 	if request.GetAttach() != nil {
 		h.attachCount.Add(1)
@@ -1643,7 +1770,7 @@ func TestBlockedMaximumDataFrameCannotBlockControlProgress(t *testing.T) {
 	}
 }
 
-func TestOwnedIdempotentWritePhaseSkipsDefensiveRequestClone(t *testing.T) {
+func TestIdempotentWritePhaseSkipsDefensiveRequestClone(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{
 		epoch: bytes.Repeat([]byte{0x7d}, 16), maxInFlight: 4,
 	}, 4, time.Minute)
@@ -1662,19 +1789,21 @@ func TestOwnedIdempotentWritePhaseSkipsDefensiveRequestClone(t *testing.T) {
 		}}}
 	}
 
-	// The general API preserves its defensive-copy contract: its caller-owned
-	// envelope remains untouched after the complete round trip.
-	cloned := newDataRequest(1)
-	if _, err := client.CallIdempotent(context.Background(), cloned); err != nil {
+	// Every entry point now transfers ownership, so the general idempotent API
+	// stamps the caller's message in place. That in-place envelope is the
+	// executable proof that a 1 MiB DATA field is not copied before
+	// serialization.
+	general := newDataRequest(1)
+	if _, err := client.CallIdempotent(context.Background(), general); err != nil {
 		t.Fatal(err)
 	}
-	if cloned.GetRequestId() != 0 || len(cloned.GetEpoch()) != 0 || cloned.GetSession() != nil {
-		t.Fatalf("clone-safe request envelope mutated: %+v", cloned)
+	if general.GetRequestId() == 0 || !bytes.Equal(general.GetEpoch(), client.Epoch()) || general.GetSession() == nil {
+		t.Fatalf("request envelope was not stamped in place: %+v", general)
+	}
+	if got := general.GetWriteTransaction().GetData(); len(got) != 1<<20 || got[0] != 1 || got[len(got)-1] != 1 {
+		t.Fatal("DATA payload changed during dispatch")
 	}
 
-	// The staged-write API intentionally stamps the caller-owned message. This
-	// is the executable ownership proof that its 1 MiB DATA field did not pass
-	// through protoCloneRequest before serialization.
 	owned := newDataRequest(2)
 	response, consumption, err := client.CallIdempotentOwnedRetained(context.Background(), owned, func(error) {})
 	if err != nil || response == nil || consumption == nil {
