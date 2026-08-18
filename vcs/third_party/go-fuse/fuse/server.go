@@ -800,28 +800,27 @@ func (ms *protocolServer) InodeNotify(node uint64, off int64, length int64) Stat
 	return ms.notifyWrite(req)
 }
 
-// PFSSizeNotify publishes an inode's exact authoritative size in visibility
-// sequence order. It is available only under CAP_PFS_STRICT_COHERENCE; callers
-// must treat failure as loss of the negotiated coherence contract.
-func (ms *protocolServer) PFSSizeNotify(node uint64, size uint64, sequence uint64) Status {
-	if node == 0 || sequence == 0 || !ms.kernelSettings.SupportsNotify(NOTIFY_PFS_SIZE) {
+// PFSSizeNotify repairs data and installs the authority's complete exact object
+// record in one kernel transaction.
+func (ms *protocolServer) PFSSizeNotify(sequence uint64, object *PFSObjectState) Status {
+	if object == nil || object.Nodeid == 0 || sequence == 0 || !ms.kernelSettings.SupportsNotify(NOTIFY_PFS_SIZE) {
 		return EINVAL
 	}
 	req := newNotifyRequest(_OP_NOTIFY_PFS_SIZE)
 	out := (*NotifyPFSSizeOut)(req.outData())
-	out.Nodeid = node
-	out.Size = size
-	out.Sequence = sequence
+	out.VisibilitySequence = sequence
+	out.Object = *object
 	return ms.notifyWrite(req)
 }
 
-func (ms *protocolServer) PFSAttrNotify(node, sequence uint64) Status {
-	if node == 0 || sequence == 0 || !ms.kernelSettings.SupportsNotify(NOTIFY_PFS_ATTR) {
+func (ms *protocolServer) PFSAttrNotify(sequence uint64, object *PFSObjectState) Status {
+	if object == nil || object.Nodeid == 0 || sequence == 0 || !ms.kernelSettings.SupportsNotify(NOTIFY_PFS_ATTR) {
 		return EINVAL
 	}
 	req := newNotifyRequest(_OP_NOTIFY_PFS_ATTR)
 	out := (*NotifyPFSAttrOut)(req.outData())
-	out.Nodeid, out.VisibilitySequence = node, sequence
+	out.VisibilitySequence = sequence
+	out.Object = *object
 	return ms.notifyWrite(req)
 }
 

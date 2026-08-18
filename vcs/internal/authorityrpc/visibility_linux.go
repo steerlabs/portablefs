@@ -254,6 +254,12 @@ func visibilityCursorProto(cursor volumeserver.VisibilityCursor) *authoritypb.Vi
 // rather than absent. Emitting a field the scope does not define is therefore
 // an encoder defect, not decoder pedantry.
 func visibilityTargetProto(target volumeserver.VisibilityTarget) *authoritypb.VisibilityTarget {
+	withExact := func(wire *authoritypb.VisibilityTarget) *authoritypb.VisibilityTarget {
+		if target.ExactPostState != nil {
+			wire.ExactPostState = visibilityObjectPostStateProto(target.ExactPostState)
+		}
+		return wire
+	}
 	switch target.Scope {
 	case volumeserver.VisibilityNamespace:
 		wire := visibilitywire.Namespace(target.ParentIdentity[:], target.Name, target.ParentKernelIno, target.Device)
@@ -262,15 +268,90 @@ func visibilityTargetProto(target volumeserver.VisibilityTarget) *authoritypb.Vi
 		}
 		return wire
 	case volumeserver.VisibilityData:
-		return visibilitywire.Data(target.Identity[:], target.KernelIno, target.Device, target.Size)
+		return withExact(visibilitywire.Data(target.Identity[:], target.KernelIno, target.Device, target.Size))
 	case volumeserver.VisibilityAttributes:
-		return visibilitywire.Attributes(target.Identity[:], target.KernelIno, target.Device)
+		return withExact(visibilitywire.Attributes(target.Identity[:], target.KernelIno, target.Device))
 	default:
 		// An unknown scope cannot be encoded as anything a decoder would act
 		// on. Emit only the unspecified scope so every receiver fails closed
 		// on this exact target instead of repairing a guessed coordinate.
 		return &authoritypb.VisibilityTarget{}
 	}
+}
+
+func visibilityObjectPostStateProto(state *volumeserver.VisibilityObjectPostState) *authoritypb.ObjectPostState {
+	if state == nil {
+		return nil
+	}
+	attr := state.Attr
+	return &authoritypb.ObjectPostState{
+		StableIdentity: append([]byte(nil), state.StableIdentity[:]...),
+		ObjectVersion:  state.ObjectVersion,
+		Roles:          state.Roles,
+		Attr: &authoritypb.Attr{
+			Kind: authoritypb.Attr_Kind(attr.Kind), Inode: attr.Inode, Size: attr.Size,
+			Blocks: attr.Blocks, Mode: attr.Mode, Uid: attr.UID, Gid: attr.GID,
+			Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS,
+			CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS, Rdev: attr.Rdev,
+			Blksize: attr.Blksize, Flags: attr.Flags,
+		},
+	}
+}
+
+func visibilityObjectPostState(object *authoritypb.ObjectPostState) *volumeserver.VisibilityObjectPostState {
+	if object == nil || len(object.GetStableIdentity()) != 16 || object.GetAttr() == nil {
+		return nil
+	}
+	attr := object.GetAttr()
+	state := &volumeserver.VisibilityObjectPostState{
+		ObjectVersion: object.GetObjectVersion(), Roles: object.GetRoles(),
+		Attr: volumeserver.VisibilityAttr{
+			Kind: uint32(attr.GetKind()), Inode: attr.GetInode(), Size: attr.GetSize(),
+			Blocks: attr.GetBlocks(), Mode: attr.GetMode(), UID: attr.GetUid(), GID: attr.GetGid(),
+			Nlink: attr.GetNlink(), ATimeNS: attr.GetAtimeNs(), MTimeNS: attr.GetMtimeNs(),
+			CTimeNS: attr.GetCtimeNs(), BirthTimeNS: attr.GetBirthTimeNs(), Rdev: attr.GetRdev(),
+			Blksize: attr.GetBlksize(), Flags: attr.GetFlags(),
+		},
+	}
+	copy(state.StableIdentity[:], object.GetStableIdentity())
+	return state
+}
+
+// attachExactRepairPostState binds each repaired inode coordinate to the exact
+// object record already retained for the source reply. The visibility event is
+// constructed before that reply is released, so this never takes a second
+// snapshot and never guesses which object a coordinate names.
+func attachExactRepairPostState(targets []volumeserver.VisibilityTarget, state *authoritypb.PostState, sequence uint64) error {
+	if !validPostStateShape(state, true) || state.GetVisibilitySequence() != sequence {
+		return errors.New("authorityrpc: visible mutation has no exact repair post-state")
+	}
+	objects := make(map[[16]byte]*authoritypb.ObjectPostState, len(state.GetObjects()))
+	for _, object := range state.GetObjects() {
+		var identity [16]byte
+		copy(identity[:], object.GetStableIdentity())
+		objects[identity] = object
+	}
+	exactCount := 0
+	for index := range targets {
+		target := &targets[index]
+		if target.Scope == volumeserver.VisibilityNamespace {
+			if target.ExactPostState != nil {
+				return errors.New("authorityrpc: namespace repair carried attribute post-state")
+			}
+			continue
+		}
+		exactCount++
+		object := objects[target.Identity]
+		if object == nil || object.GetObjectVersion() == 0 || object.GetObjectVersion() > sequence || object.GetAttr().GetInode() != target.KernelIno ||
+			target.Scope == volumeserver.VisibilityData && object.GetAttr().GetSize() != target.Size {
+			return fmt.Errorf("authorityrpc: repair coordinate %x has no matching exact mutation record", target.Identity)
+		}
+		target.ExactPostState = visibilityObjectPostState(object)
+	}
+	if exactCount > 4 {
+		return errors.New("authorityrpc: exact repair exceeds four object records")
+	}
+	return nil
 }
 
 // normalizeVisibilityTargets gives every cache coordinate exactly one repair
@@ -409,6 +490,9 @@ func validateAuthorityVisibilityTarget(target volumeserver.VisibilityTarget) err
 		if target.KernelIno != 0 {
 			return errors.New("namespace target carries an object kernel inode")
 		}
+		if target.ExactPostState != nil {
+			return errors.New("namespace target carries exact object post-state")
+		}
 		if target.ParentKernelIno == 0 {
 			return errors.New("namespace target carries no parent kernel inode")
 		}
@@ -443,6 +527,13 @@ func validateAuthorityVisibilityTarget(target volumeserver.VisibilityTarget) err
 		}
 		if target.ParentKernelIno != 0 {
 			return errors.New("inode target carries a parent kernel inode")
+		}
+		if exact := target.ExactPostState; exact != nil {
+			if exact.StableIdentity != target.Identity || exact.ObjectVersion == 0 ||
+				exact.Attr.Inode != target.KernelIno || exact.Roles == 0 ||
+				(target.Scope == volumeserver.VisibilityData && exact.Attr.Size != target.Size) {
+				return errors.New("inode target carries mismatched exact object post-state")
+			}
 		}
 		if target.Scope == volumeserver.VisibilityData && target.Size < 0 {
 			return errors.New("data target carries a negative size")

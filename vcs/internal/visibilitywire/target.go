@@ -99,6 +99,9 @@ func ValidateTarget(target *authoritypb.VisibilityTarget) error {
 		if len(target.GetPostIdentity()) != 0 && len(target.GetPostIdentity()) != IdentityLen {
 			return errors.New("visibilitywire: namespace post identity is not an export handle")
 		}
+		if target.GetExactPostState() != nil {
+			return errors.New("visibilitywire: namespace target carries exact attribute state")
+		}
 	case authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA:
 		if err := validateInodeTarget(target); err != nil {
 			return err
@@ -118,6 +121,50 @@ func ValidateTarget(target *authoritypb.VisibilityTarget) error {
 	}
 	if target.GetDevice() == 0 {
 		return errors.New("visibilitywire: visibility target carries no backing device")
+	}
+	if exact := target.GetExactPostState(); exact != nil {
+		if len(exact.GetStableIdentity()) != IdentityLen || !bytes.Equal(exact.GetStableIdentity(), target.GetIdentity()) ||
+			exact.GetObjectVersion() == 0 || exact.GetRoles() == 0 || exact.GetRoles()&^uint32(0x03ff) != 0 ||
+			exact.GetAttr() == nil || exact.GetAttr().GetInode() != target.GetKernelIno() || exact.GetAttr().GetKind() < authoritypb.Attr_REGULAR ||
+			exact.GetAttr().GetKind() > authoritypb.Attr_SYMLINK || exact.GetAttr().GetSize() < 0 ||
+			target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA && exact.GetAttr().GetSize() != target.GetSize() {
+			return errors.New("visibilitywire: inode target carries mismatched exact attribute state")
+		}
+	}
+	return nil
+}
+
+// ValidateEventTargets enforces the phase-dependent half of the repair wire.
+// PREPARE cannot know post-state; COMPLETE must carry it for every inode repair.
+func ValidateEventTargets(phase authoritypb.VisibilityPhase, sequence uint64, targets []*authoritypb.VisibilityTarget) error {
+	if sequence == 0 {
+		return errors.New("visibilitywire: visibility event carries no sequence")
+	}
+	exactCount := 0
+	for _, target := range targets {
+		if err := ValidateTarget(target); err != nil {
+			return err
+		}
+		exact := target.GetExactPostState()
+		switch phase {
+		case authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE:
+			if exact != nil {
+				return errors.New("visibilitywire: PREPARE target carries post-apply attribute state")
+			}
+		case authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE:
+			if target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE {
+				continue
+			}
+			exactCount++
+			if exact == nil || exact.GetObjectVersion() == 0 || exact.GetObjectVersion() > sequence {
+				return errors.New("visibilitywire: COMPLETE inode target omitted exact attributes at or before its visibility sequence")
+			}
+		default:
+			return errors.New("visibilitywire: visibility event carries no phase")
+		}
+	}
+	if exactCount > 4 {
+		return errors.New("visibilitywire: COMPLETE exceeds four exact object records")
 	}
 	return nil
 }

@@ -584,17 +584,17 @@ type NotifyPruneOut struct {
 	_spare   uint64
 }
 
-// NotifyPFSSizeOut is the ordered exact-size publication carried by private
-// FUSE_NOTIFY_PFS_SIZE. Sequence is the authority visibility cursor sequence.
+// NotifyPFSSizeOut is the ordered exact data/attribute repair carried by
+// private FUSE_NOTIFY_PFS_SIZE. The object is the authority's retained
+// post-mutation record, not attributes sampled again by the frontend.
 type NotifyPFSSizeOut struct {
-	Nodeid   uint64
-	Size     uint64
-	Sequence uint64
+	VisibilitySequence uint64
+	Object             PFSObjectState
 }
 
 type NotifyPFSAttrOut struct {
-	Nodeid             uint64
 	VisibilitySequence uint64
+	Object             PFSObjectState
 }
 
 type NotifyPFSEntryOut struct {

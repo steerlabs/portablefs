@@ -602,6 +602,10 @@ message VisibilityTarget {
   // attest it. Empty for absent/unknown postconditions and for non-namespace
   // scopes; unlike dependency metadata, this association is safe to actuate.
   bytes post_identity = 9;
+  // Absent on PREPARE and NAMESPACE. Mandatory on every DATA or ATTRIBUTES
+  // target in COMPLETE; this is the exact retained mutation record peers
+  // install instead of making prior attributes inexact.
+  ObjectPostState exact_post_state = 10;
 }
 
 // RoutesChange makes a two-phase event say "this is a routing-topology change"

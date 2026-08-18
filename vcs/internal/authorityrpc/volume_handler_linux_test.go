@@ -26,6 +26,32 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func exactAuthorityTestTargets(sequence uint64, targets []volumeserver.VisibilityTarget) []volumeserver.VisibilityTarget {
+	sizes := make(map[[16]byte]int64)
+	for _, target := range targets {
+		if target.Scope == volumeserver.VisibilityData {
+			sizes[target.Identity] = target.Size
+		}
+	}
+	exact := append([]volumeserver.VisibilityTarget(nil), targets...)
+	for index := range exact {
+		target := &exact[index]
+		if target.Scope == volumeserver.VisibilityNamespace {
+			continue
+		}
+		target.ExactPostState = &volumeserver.VisibilityObjectPostState{
+			StableIdentity: target.Identity,
+			ObjectVersion:  sequence,
+			Roles:          postStateRoleTarget,
+			Attr: volumeserver.VisibilityAttr{
+				Kind: uint32(xfsstore.KindRegular), Inode: target.KernelIno,
+				Size: sizes[target.Identity], Mode: 0o600,
+			},
+		}
+	}
+	return exact
+}
+
 func testVolumeHandler() *VolumeHandler {
 	return &VolumeHandler{
 		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
@@ -226,7 +252,7 @@ func TestNextVisibilityAtomicallyAcknowledgesAndWaitsForSuccessor(t *testing.T) 
 			ctx, volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
 			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(1, targets), true },
 		)
 	}()
 	initial := h.Handle(ctx, request(1, &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{
@@ -391,7 +417,7 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 			context.Background(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
 			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(1, targets), true },
 		)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1514,12 +1540,12 @@ func TestMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) 
 	targets := []volumeserver.VisibilityTarget{{
 		Scope: volumeserver.VisibilityData, Identity: identity, KernelIno: 52, Device: 1, Size: 1,
 	}}
-	response := h.mutateVisible(
+	response := h.mutateVisibleSequence(
 		context.Background(), request, credential,
 		func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			resp := h.success(0)
-			resp.PostState = h.mutationPostState(1, postStateSnapshot{
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
 				identity: identity,
 				attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 52, Size: 1, Mode: 0o600, Nlink: 1, DeviceMinor: 1},
 				roles:    postStateRoleTarget,
@@ -1614,12 +1640,12 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 	stampMutation(t, request, 0, 1)
 	mutationResult := make(chan *authoritypb.Response, 1)
 	go func() {
-		mutationResult <- h.mutateVisible(
+		mutationResult <- h.mutateVisibleSequence(
 			context.Background(), request, credential,
 			func() ([]volumeserver.VisibilityTarget, error) { return mutationTargets, nil },
-			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 				resp := h.success(0)
-				resp.PostState = h.mutationPostState(1,
+				resp.PostState = h.mutationPostState(sequence,
 					postStateSnapshot{
 						identity: [16]byte{newBinding[0]},
 						attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(newBinding[0]), Mode: 0o600, Nlink: 0, DeviceMinor: 1},
@@ -1676,7 +1702,7 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 			context.Background(), volumeserver.SessionID{0xFD}, volumeserver.MutationID{Sequence: 2},
 			volumeserver.MutationDependenciesForTargets(peerTargets),
 			func() ([]volumeserver.VisibilityTarget, error) { return peerTargets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return peerTargets, true },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(2, peerTargets), true },
 		)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -3337,7 +3363,7 @@ func TestProtocol5ActivationPublishesFreshRootInsideRegistrationBoundary(t *test
 				return []volumeserver.VisibilityTarget{target}, nil
 			},
 			func() ([]volumeserver.VisibilityTarget, bool) {
-				return []volumeserver.VisibilityTarget{target}, true
+				return exactAuthorityTestTargets(1, []volumeserver.VisibilityTarget{target}), true
 			},
 		)
 	}()

@@ -4138,9 +4138,13 @@ type VisibilityTarget struct {
 	// Exact post-mutation owner of a namespace coordinate when authority can
 	// attest it. Empty for absent/unknown postconditions and for non-namespace
 	// scopes; unlike dependency metadata, this association is safe to actuate.
-	PostIdentity  []byte `protobuf:"bytes,9,opt,name=post_identity,json=postIdentity,proto3" json:"post_identity,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PostIdentity []byte `protobuf:"bytes,9,opt,name=post_identity,json=postIdentity,proto3" json:"post_identity,omitempty"`
+	// Absent on PREPARE and NAMESPACE. Mandatory on every DATA or ATTRIBUTES
+	// target in COMPLETE; this is the exact retained mutation record peers
+	// install instead of making prior attributes inexact.
+	ExactPostState *ObjectPostState `protobuf:"bytes,10,opt,name=exact_post_state,json=exactPostState,proto3" json:"exact_post_state,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *VisibilityTarget) Reset() {
@@ -4232,6 +4236,13 @@ func (x *VisibilityTarget) GetDevice() uint64 {
 func (x *VisibilityTarget) GetPostIdentity() []byte {
 	if x != nil {
 		return x.PostIdentity
+	}
+	return nil
+}
+
+func (x *VisibilityTarget) GetExactPostState() *ObjectPostState {
+	if x != nil {
+		return x.ExactPostState
 	}
 	return nil
 }
@@ -8375,7 +8386,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x11target_request_id\x18\x01 \x01(\x04R\x0ftargetRequestId\"n\n" +
 	"\x10VisibilityCursor\x12\x1a\n" +
 	"\bsequence\x18\x01 \x01(\x04R\bsequence\x12>\n" +
-	"\x05phase\x18\x02 \x01(\x0e2(.portablefs.authority.v1.VisibilityPhaseR\x05phase\"\xc7\x02\n" +
+	"\x05phase\x18\x02 \x01(\x0e2(.portablefs.authority.v1.VisibilityPhaseR\x05phase\"\x9b\x03\n" +
 	"\x10VisibilityTarget\x12>\n" +
 	"\x05scope\x18\x01 \x01(\x0e2(.portablefs.authority.v1.VisibilityScopeR\x05scope\x12\x1a\n" +
 	"\bidentity\x18\x02 \x01(\fR\bidentity\x12'\n" +
@@ -8386,7 +8397,9 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"kernel_ino\x18\x06 \x01(\x04R\tkernelIno\x12*\n" +
 	"\x11parent_kernel_ino\x18\a \x01(\x04R\x0fparentKernelIno\x12\x16\n" +
 	"\x06device\x18\b \x01(\x06R\x06device\x12#\n" +
-	"\rpost_identity\x18\t \x01(\fR\fpostIdentity\"@\n" +
+	"\rpost_identity\x18\t \x01(\fR\fpostIdentity\x12R\n" +
+	"\x10exact_post_state\x18\n" +
+	" \x01(\v2(.portablefs.authority.v1.ObjectPostStateR\x0eexactPostState\"@\n" +
 	"\fRoutesChange\x12\x1a\n" +
 	"\brevision\x18\x01 \x01(\fR\brevision\x12\x14\n" +
 	"\x05rules\x18\x02 \x01(\fR\x05rules\"\xdc\x02\n" +
@@ -8948,33 +8961,34 @@ var file_proto_authority_v1_authority_proto_depIdxs = []int32{
 	39,  // 95: portablefs.authority.v1.DetachRequest.mount_absence:type_name -> portablefs.authority.v1.MountAbsenceProof
 	5,   // 96: portablefs.authority.v1.VisibilityCursor.phase:type_name -> portablefs.authority.v1.VisibilityPhase
 	6,   // 97: portablefs.authority.v1.VisibilityTarget.scope:type_name -> portablefs.authority.v1.VisibilityScope
-	42,  // 98: portablefs.authority.v1.VisibilityEvent.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	43,  // 99: portablefs.authority.v1.VisibilityEvent.targets:type_name -> portablefs.authority.v1.VisibilityTarget
-	44,  // 100: portablefs.authority.v1.VisibilityEvent.routes:type_name -> portablefs.authority.v1.RoutesChange
-	42,  // 101: portablefs.authority.v1.NextVisibilityRequest.after:type_name -> portablefs.authority.v1.VisibilityCursor
-	42,  // 102: portablefs.authority.v1.AckVisibilityRequest.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	22,  // 103: portablefs.authority.v1.LookupReply.item:type_name -> portablefs.authority.v1.Item
-	23,  // 104: portablefs.authority.v1.GetAttrReply.attr:type_name -> portablefs.authority.v1.Attr
-	55,  // 105: portablefs.authority.v1.CreateRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	22,  // 106: portablefs.authority.v1.CreateReply.item:type_name -> portablefs.authority.v1.Item
-	22,  // 107: portablefs.authority.v1.LinkReply.item:type_name -> portablefs.authority.v1.Item
-	55,  // 108: portablefs.authority.v1.OpenRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	7,   // 109: portablefs.authority.v1.WriteTransactionRequest.phase:type_name -> portablefs.authority.v1.WriteTransactionPhase
-	55,  // 110: portablefs.authority.v1.TmpfileRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	22,  // 111: portablefs.authority.v1.TmpfileReply.item:type_name -> portablefs.authority.v1.Item
-	23,  // 112: portablefs.authority.v1.Dirent.attr:type_name -> portablefs.authority.v1.Attr
-	22,  // 113: portablefs.authority.v1.Dirent.item:type_name -> portablefs.authority.v1.Item
-	85,  // 114: portablefs.authority.v1.ReadDirReply.entries:type_name -> portablefs.authority.v1.Dirent
-	9,   // 115: portablefs.authority.v1.SetXattrRequest.mode:type_name -> portablefs.authority.v1.SetXattrRequest.Mode
-	98,  // 116: portablefs.authority.v1.LockSpec.range:type_name -> portablefs.authority.v1.LockRange
-	99,  // 117: portablefs.authority.v1.GetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
-	99,  // 118: portablefs.authority.v1.GetLockReply.held:type_name -> portablefs.authority.v1.LockSpec
-	99,  // 119: portablefs.authority.v1.SetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
-	120, // [120:120] is the sub-list for method output_type
-	120, // [120:120] is the sub-list for method input_type
-	120, // [120:120] is the sub-list for extension type_name
-	120, // [120:120] is the sub-list for extension extendee
-	0,   // [0:120] is the sub-list for field type_name
+	25,  // 98: portablefs.authority.v1.VisibilityTarget.exact_post_state:type_name -> portablefs.authority.v1.ObjectPostState
+	42,  // 99: portablefs.authority.v1.VisibilityEvent.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	43,  // 100: portablefs.authority.v1.VisibilityEvent.targets:type_name -> portablefs.authority.v1.VisibilityTarget
+	44,  // 101: portablefs.authority.v1.VisibilityEvent.routes:type_name -> portablefs.authority.v1.RoutesChange
+	42,  // 102: portablefs.authority.v1.NextVisibilityRequest.after:type_name -> portablefs.authority.v1.VisibilityCursor
+	42,  // 103: portablefs.authority.v1.AckVisibilityRequest.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	22,  // 104: portablefs.authority.v1.LookupReply.item:type_name -> portablefs.authority.v1.Item
+	23,  // 105: portablefs.authority.v1.GetAttrReply.attr:type_name -> portablefs.authority.v1.Attr
+	55,  // 106: portablefs.authority.v1.CreateRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	22,  // 107: portablefs.authority.v1.CreateReply.item:type_name -> portablefs.authority.v1.Item
+	22,  // 108: portablefs.authority.v1.LinkReply.item:type_name -> portablefs.authority.v1.Item
+	55,  // 109: portablefs.authority.v1.OpenRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	7,   // 110: portablefs.authority.v1.WriteTransactionRequest.phase:type_name -> portablefs.authority.v1.WriteTransactionPhase
+	55,  // 111: portablefs.authority.v1.TmpfileRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	22,  // 112: portablefs.authority.v1.TmpfileReply.item:type_name -> portablefs.authority.v1.Item
+	23,  // 113: portablefs.authority.v1.Dirent.attr:type_name -> portablefs.authority.v1.Attr
+	22,  // 114: portablefs.authority.v1.Dirent.item:type_name -> portablefs.authority.v1.Item
+	85,  // 115: portablefs.authority.v1.ReadDirReply.entries:type_name -> portablefs.authority.v1.Dirent
+	9,   // 116: portablefs.authority.v1.SetXattrRequest.mode:type_name -> portablefs.authority.v1.SetXattrRequest.Mode
+	98,  // 117: portablefs.authority.v1.LockSpec.range:type_name -> portablefs.authority.v1.LockRange
+	99,  // 118: portablefs.authority.v1.GetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
+	99,  // 119: portablefs.authority.v1.GetLockReply.held:type_name -> portablefs.authority.v1.LockSpec
+	99,  // 120: portablefs.authority.v1.SetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
+	121, // [121:121] is the sub-list for method output_type
+	121, // [121:121] is the sub-list for method input_type
+	121, // [121:121] is the sub-list for extension type_name
+	121, // [121:121] is the sub-list for extension extendee
+	0,   // [0:121] is the sub-list for field type_name
 }
 
 func init() { file_proto_authority_v1_authority_proto_init() }

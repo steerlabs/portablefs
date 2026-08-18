@@ -209,6 +209,41 @@ type VisibilityTarget struct {
 	// projection uses it only to keep a synthetic parent-attribute repair anchor
 	// from omitting the same callback's raced inode publication.
 	RelatedIdentities [][16]byte
+	// ExactPostState is absent while PREPARE closes admission and present on
+	// every DATA or ATTRIBUTES target after apply. It is the retained mutation
+	// snapshot peers install; it must never be reconstructed from a target's
+	// scalar coordination fields.
+	ExactPostState *VisibilityObjectPostState
+}
+
+// VisibilityObjectPostState is the protocol-neutral authority snapshot carried
+// through the visibility coordinator. Keeping it here lets the coordinator
+// retain and project the exact record without depending on protobuf types.
+type VisibilityObjectPostState struct {
+	StableIdentity [16]byte
+	ObjectVersion  uint64
+	Attr           VisibilityAttr
+	Roles          uint32
+}
+
+// VisibilityAttr mirrors the exact authority Attr fields. All values come from
+// the mutation's retained statx snapshot; none are inferred during fan-out.
+type VisibilityAttr struct {
+	Kind        uint32
+	Inode       uint64
+	Size        int64
+	Blocks      uint64
+	Mode        uint32
+	UID         uint32
+	GID         uint32
+	Nlink       uint32
+	ATimeNS     int64
+	MTimeNS     int64
+	CTimeNS     int64
+	BirthTimeNS int64
+	Rdev        uint32
+	Blksize     uint32
+	Flags       uint32
 }
 
 const maxSourcePublicationTargets = 16
@@ -1524,7 +1559,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 
 	completeTargets, changed := apply(ticket.Cursor.Sequence)
 	if changed {
-		if err := c.validateCompletion(completeTargets, prepareTargets); err != nil {
+		if err := c.validateCompletion(ticket.Cursor.Sequence, completeTargets, prepareTargets); err != nil {
 			return &VisibilityBarrierError{Applied: true, Err: err}
 		}
 	}
@@ -1951,9 +1986,22 @@ func (c *VisibilityCoordinator) recordSourceResolutions(source SessionID, resolu
 // target set, and poisons the epoch when either fails. Both are authority
 // defects that no participant can cause: the mutation already reached XFS and
 // the authority cannot describe what it did.
-func (c *VisibilityCoordinator) validateCompletion(complete, prepared []VisibilityTarget) error {
+func (c *VisibilityCoordinator) validateCompletion(sequence uint64, complete, prepared []VisibilityTarget) error {
 	if err := validateVisibilityTargets(complete); err != nil {
 		return c.poison(ErrVisibilityTargets)
+	}
+	exactCount := 0
+	for _, target := range complete {
+		if target.Scope == VisibilityNamespace {
+			continue
+		}
+		exactCount++
+		if target.ExactPostState == nil || target.ExactPostState.ObjectVersion == 0 || target.ExactPostState.ObjectVersion > sequence {
+			return c.poison(fmt.Errorf("%w: completion inode target omitted exact attributes at or before its visibility sequence", ErrVisibilityTargets))
+		}
+	}
+	if exactCount > 4 {
+		return c.poison(fmt.Errorf("%w: completion exceeded the four-object exact repair bound", ErrVisibilityTargets))
 	}
 	// Fan-out chooses its audience from the PREPARE targets. A COMPLETE target
 	// outside that set would be a repair instruction addressed to mounts that
@@ -2769,6 +2817,10 @@ func cloneVisibilityTargets(targets []VisibilityTarget) []VisibilityTarget {
 	for i := range clone {
 		clone[i].Name = append([]byte(nil), targets[i].Name...)
 		clone[i].RelatedIdentities = append([][16]byte(nil), targets[i].RelatedIdentities...)
+		if targets[i].ExactPostState != nil {
+			exact := *targets[i].ExactPostState
+			clone[i].ExactPostState = &exact
+		}
 	}
 	return clone
 }
@@ -2819,7 +2871,8 @@ func validateVisibilityTargets(targets []VisibilityTarget) error {
 	for _, target := range targets {
 		switch target.Scope {
 		case VisibilityNamespace:
-			if target.ParentIdentity == zero || target.Identity != zero || target.Size != 0 || !legalVisibilityName(target.Name) {
+			if target.ParentIdentity == zero || target.Identity != zero || target.Size != 0 ||
+				target.ExactPostState != nil || !legalVisibilityName(target.Name) {
 				return ErrVisibilityTargets
 			}
 			postIsDependency := target.PostIdentity == zero
@@ -2842,6 +2895,13 @@ func validateVisibilityTargets(targets []VisibilityTarget) error {
 			}
 		default:
 			return ErrVisibilityTargets
+		}
+		if exact := target.ExactPostState; exact != nil {
+			if exact.StableIdentity != target.Identity || exact.ObjectVersion == 0 ||
+				exact.Attr.Inode != target.KernelIno || exact.Roles == 0 ||
+				(target.Scope == VisibilityData && exact.Attr.Size != target.Size) {
+				return ErrVisibilityTargets
+			}
 		}
 	}
 	return nil

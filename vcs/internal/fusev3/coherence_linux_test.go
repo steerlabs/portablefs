@@ -17,6 +17,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"google.golang.org/protobuf/proto"
 )
 
 // recordedNotify is one reverse notification the frontend sent to its kernel.
@@ -30,6 +31,9 @@ type recordedNotify struct {
 	length   int64
 	size     uint64
 	sequence uint64
+	version  uint64
+	flags    uint32
+	birthNS  int64
 }
 
 // fakeNotifier stands in for the kernel's reverse channel. block, when
@@ -85,21 +89,21 @@ func (n *fakeNotifier) InodeNotify(node uint64, off, length int64) fuse.Status {
 	return n.inodeST
 }
 
-func (n *fakeNotifier) PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status {
+func (n *fakeNotifier) PFSSizeNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status {
 	n.mu.Lock()
 	hook := n.onSize
 	n.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
-	n.record(recordedNotify{kind: "size", inode: node, size: size, sequence: sequence})
+	n.record(recordedNotify{kind: "size", inode: object.Nodeid, size: binary.LittleEndian.Uint64(object.Attr[8:16]), sequence: sequence, version: object.ObjectVersion, flags: object.InodeFlags, birthNS: object.BirthTimeNS})
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.sizeST
 }
 
-func (n *fakeNotifier) PFSAttrNotify(node uint64, sequence uint64) fuse.Status {
-	n.record(recordedNotify{kind: "attr", inode: node, sequence: sequence})
+func (n *fakeNotifier) PFSAttrNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status {
+	n.record(recordedNotify{kind: "attr", inode: object.Nodeid, size: binary.LittleEndian.Uint64(object.Attr[8:16]), sequence: sequence, version: object.ObjectVersion, flags: object.InodeFlags, birthNS: object.BirthTimeNS})
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.inodeST
@@ -183,7 +187,31 @@ func inodeVisibilityTarget(scope authoritypb.VisibilityScope, inode uint64, size
 	}
 }
 
+func exactVisibilityTargets(sequence uint64, targets ...*authoritypb.VisibilityTarget) []*authoritypb.VisibilityTarget {
+	sizes := make(map[string]int64)
+	for _, target := range targets {
+		if target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA {
+			sizes[string(target.GetIdentity())] = target.GetSize()
+		}
+	}
+	exact := make([]*authoritypb.VisibilityTarget, len(targets))
+	for index, target := range targets {
+		exact[index] = proto.Clone(target).(*authoritypb.VisibilityTarget)
+		if target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE {
+			continue
+		}
+		exact[index].ExactPostState = &authoritypb.ObjectPostState{
+			StableIdentity: append([]byte(nil), target.GetIdentity()...), ObjectVersion: sequence, Roles: postStateRoleTarget,
+			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: target.GetKernelIno(), Size: sizes[string(target.GetIdentity())], Mode: 0o600},
+		}
+	}
+	return exact
+}
+
 func visibilityEvent(sequence uint64, phase authoritypb.VisibilityPhase, initiator []byte, targets ...*authoritypb.VisibilityTarget) *authoritypb.VisibilityEvent {
+	if phase == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
+		targets = exactVisibilityTargets(sequence, targets...)
+	}
 	return &authoritypb.VisibilityEvent{
 		Cursor:             &authoritypb.VisibilityCursor{Sequence: sequence, Phase: phase},
 		InitiatorSessionId: initiator,
@@ -327,7 +355,7 @@ func TestLookupBetweenPrepareAndCompleteDoesNotRecacheTheOldValue(t *testing.T) 
 	}
 	f.raw.ReplyWritten(unique, fuse.OK)
 	acknowledgeTestPublication(t, f.raw, unique)
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	f.setReadSequence(2)
@@ -347,12 +375,12 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatalf("PREPARE: %v", err)
 	}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	calls := f.notify.snapshot()
-	if len(calls) != 3 {
-		t.Fatalf("notifications = %+v, want namespace, size, and attr repairs", calls)
+	if len(calls) != 2 {
+		t.Fatalf("notifications = %+v, want namespace and exact size/attr repairs", calls)
 	}
 	if calls[0].kind != "delete" || calls[0].parent != fuse.FUSE_ROOT_ID || calls[0].name != "victim" || calls[0].child != entry.NodeId {
 		t.Fatalf("namespace repair = %+v; a removal must reach inotify, which only NotifyDelete does", calls[0])
@@ -360,21 +388,18 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 	if calls[1].kind != "size" || calls[1].inode != entry.NodeId || calls[1].size != 4096 || calls[1].sequence != 1 {
 		t.Fatalf("inode repair = %+v; want exact size 4096 at the visibility sequence", calls[1])
 	}
-	if calls[2].kind != "attr" || calls[2].inode != entry.NodeId || calls[2].sequence != 1 {
-		t.Fatalf("attr repair = %+v; want stamped attributes at the visibility sequence", calls[2])
-	}
 	// A repaired binding is no longer cached, but every namespace COMPLETE must
 	// still advance the parent/name stamp. With no exact child left, the daemon
 	// sends the safe expire/stamp form instead of conditionally omitting PFS_ENTRY.
 	before := f.notify.count()
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("second COMPLETE: %v", err)
 	}
 	second := f.notify.snapshot()[before:]
-	if len(second) != 3 || second[0].kind != "entry" || second[0].parent != fuse.FUSE_ROOT_ID ||
+	if len(second) != 2 || second[0].kind != "entry" || second[0].parent != fuse.FUSE_ROOT_ID ||
 		second[0].child != 0 || second[0].name != "victim" || second[0].sequence != 1 ||
-		second[1].kind != "size" || second[2].kind != "attr" {
-		t.Fatalf("second COMPLETE repairs = %+v, want parent stamp plus size and attr", second)
+		second[1].kind != "size" {
+		t.Fatalf("second COMPLETE repairs = %+v, want parent stamp plus exact size/attr", second)
 	}
 }
 
@@ -404,7 +429,7 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
 				}
 			},
-			wantKinds: []string{"size", "attr"},
+			wantKinds: []string{"size"},
 			wantSize:  4096,
 		},
 	}
@@ -412,7 +437,7 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			f := newStrictFixture(t)
 			entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
-			if err := f.raw.completeVisibility(test.targets(entry.Attr.Ino), false); err != nil {
+			if err := f.raw.completeVisibility(exactVisibilityTargets(1, test.targets(entry.Attr.Ino)...), false); err != nil {
 				t.Fatalf("COMPLETE: %v", err)
 			}
 			calls := f.notify.snapshot()
@@ -426,6 +451,40 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestExactAttrRepairCarriesEnforcementAndBirthTimeTransitions(t *testing.T) {
+	f := newStrictFixture(t)
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
+	const immutable = uint32(0x10)
+	for _, transition := range []struct {
+		sequence uint64
+		flags    uint32
+		birthNS  int64
+	}{
+		{sequence: 1, flags: immutable, birthNS: 111},
+		{sequence: 2, flags: 0, birthNS: 222},
+	} {
+		target := inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, entry.Attr.Ino, 0)
+		target = exactVisibilityTargets(transition.sequence, target)[0]
+		target.ExactPostState.Attr.Flags = transition.flags
+		target.ExactPostState.Attr.BirthTimeNs = transition.birthNS
+		completion, blocked, err := f.raw.beginVisibilityCompleteAt(
+			[]*authoritypb.VisibilityTarget{target}, false, transition.sequence,
+		)
+		if err != nil || blocked {
+			t.Fatalf("begin exact ATTR COMPLETE %d = (blocked=%t, err=%v)", transition.sequence, blocked, err)
+		}
+		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+			t.Fatalf("finish exact ATTR COMPLETE %d: %v", transition.sequence, err)
+		}
+		call := f.notify.snapshot()[f.notify.count()-1]
+		if call.kind != "attr" || call.inode != entry.NodeId ||
+			call.sequence != transition.sequence || call.version != transition.sequence ||
+			call.flags != transition.flags || call.birthNS != transition.birthNS {
+			t.Fatalf("exact ATTR transition %d = %+v", transition.sequence, call)
+		}
 	}
 }
 
@@ -449,7 +508,7 @@ func TestNamespaceRepairNeverFallsBackFromExactChildExpiration(t *testing.T) {
 	f.notify.deleteST = fuse.Status(syscall.ENOSYS)
 	f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "victim")}
-	if err := f.raw.completeVisibility(targets, false); err == nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err == nil {
 		t.Fatal("COMPLETE accepted an exact-child repair the kernel refused")
 	}
 	calls := f.notify.snapshot()
@@ -466,7 +525,7 @@ func TestMissingKernelInodeAlreadySatisfiesInvalidation(t *testing.T) {
 		namespaceVisibilityTarget(1, "victim"),
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, 7, 0),
 	}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE over an inode removed by its namespace repair: %v", err)
 	}
 	calls := f.notify.snapshot()
@@ -487,7 +546,7 @@ func TestMissingKernelInodeAlreadySatisfiesExactSizeRepair(t *testing.T) {
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatal(err)
 	}
-	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 27)
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(27, targets...), false, 27)
 	if err != nil || blocked {
 		t.Fatalf("begin exact-size COMPLETE = (blocked=%t, err=%v)", blocked, err)
 	}
@@ -495,8 +554,7 @@ func TestMissingKernelInodeAlreadySatisfiesExactSizeRepair(t *testing.T) {
 		t.Fatalf("exact-size COMPLETE for an evicted inode = %v", err)
 	}
 	calls := f.notify.snapshot()
-	if len(calls) != 2 || calls[0].kind != "size" || calls[0].inode != entry.NodeId || calls[0].size != 19 || calls[0].sequence != 27 ||
-		calls[1].kind != "attr" || calls[1].inode != entry.NodeId || calls[1].sequence != 27 {
+	if len(calls) != 1 || calls[0].kind != "size" || calls[0].inode != entry.NodeId || calls[0].size != 19 || calls[0].sequence != 27 {
 		t.Fatalf("exact-size repair = %+v, want absent inode acknowledged at size 19 sequence 27", calls)
 	}
 	f.raw.mu.Lock()
@@ -553,7 +611,7 @@ func TestEvictedDentryAlreadySatisfiesNameInvalidation(t *testing.T) {
 	f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	f.notify.deleteST = fuse.ENOENT
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "victim")}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE over an evicted dentry: %v", err)
 	}
 	calls := f.notify.snapshot()
@@ -1017,7 +1075,7 @@ func TestFinalizedReplyWaitExpiresInsideRepairBudgetAndFencesParticipant(t *test
 	f.raw.mu.Unlock()
 
 	targets := []*authoritypb.VisibilityTarget{inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0)}
-	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 8)
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(8, targets...), false, 8)
 	if err != nil || blocked || len(completion.waits) != 1 {
 		t.Fatalf("begin COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
 	}
@@ -1473,7 +1531,7 @@ func TestCompleteExpiresACachedAbsenceForACreatedName(t *testing.T) {
 	}
 	f.raw.ReplyWritten(unique, fuse.OK)
 	acknowledgeTestPublication(t, f.raw, unique)
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	calls := f.notify.snapshot()
@@ -1730,7 +1788,7 @@ func TestOpenBetweenPrepareAndCompleteWaitsForTheDataCut(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	select {
@@ -1769,11 +1827,11 @@ func TestPrepareDoesNotWaitForAnUnwrittenOpenWithoutInstalledPages(t *testing.T)
 	}
 
 	completeTestReply(t, f.raw, unique, fuse.OK)
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
-	if calls := f.notify.snapshot(); len(calls) != 2 || calls[0].kind != "size" || calls[1].kind != "attr" {
-		t.Fatalf("DATA repair after OPEN publication = %+v, want stamped size then attr", calls)
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "size" {
+		t.Fatalf("DATA repair after OPEN publication = %+v, want one exact size/attr transaction", calls)
 	}
 }
 
@@ -1793,7 +1851,7 @@ func TestForgetReleasesTheDataWithdrawalObligation(t *testing.T) {
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatalf("PREPARE: %v", err)
 	}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	if !f.raw.cachedDataHolds(72) {

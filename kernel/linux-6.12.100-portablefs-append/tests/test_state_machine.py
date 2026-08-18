@@ -502,6 +502,14 @@ def strict_notify(
     padding: int = 0,
     sequence: int = 1,
     resident_child: KernelInode | None = None,
+    record_nodeid: int | None = None,
+    record_version: int | None = None,
+    record_class: str = "shared",
+    inode_flags: int | None = None,
+    birth_time_ns: int | None = None,
+    mode: int | None = None,
+    uid: int | None = None,
+    exact_size: int | None = None,
 ) -> str:
     if code not in STRICT_NOTIFY_CODES:
         raise ProtocolError("reverse notification outside strict dialect")
@@ -519,6 +527,14 @@ def strict_notify(
         raise ProtocolError("invalid exact entry-repair shape")
     if not 0 < sequence <= S64_MAX:
         raise ProtocolError("repair sequence is outside signed authority range")
+    if code in ("PFS_ATTR", "PFS_SIZE"):
+        if record_nodeid is None:
+            record_nodeid = nodeid
+        if record_version is None:
+            record_version = sequence
+        if (record_nodeid != nodeid or not 0 < record_version <= sequence or
+                record_class != "shared"):
+            raise ProtocolError("invalid exact repair record")
     if inode is None:
         return "absent"
     if inode.pfs_class != "shared":
@@ -534,7 +550,16 @@ def strict_notify(
     if code == "PFS_SIZE":
         if inode.is_dir:
             raise ProtocolError("PFS_SIZE target is not a regular file")
-        inode.exact_data(inode.size, sequence)
+        inode.exact_data(inode.size if exact_size is None else exact_size,
+                         sequence)
+    if code in ("PFS_ATTR", "PFS_SIZE"):
+        inode.repair_attr(
+            record_version,
+            inode.inode_flags if inode_flags is None else inode_flags,
+            inode.birth_time_ns if birth_time_ns is None else birth_time_ns,
+            inode.mode if mode is None else mode,
+            inode.uid if uid is None else uid,
+        )
     return "dispatched"
 
 
@@ -676,102 +701,10 @@ class KernelInode:
     nodeid: int = 1
     nlink: int = 1
     object_version: int = 0
-    attr_repair_sequence: int = 0
-    attr_exact: bool = False
     inode_flags: int = 0
     birth_time_ns: int = 0
     mode: int = 0o644
     uid: int = 0
-
-    def begin_attr_exact(self, refresh: callable) -> None:
-        if not self.attr_exact:
-            refresh()
-        if not self.attr_exact:
-            raise BlockingIOError(errno.EAGAIN, "attributes remain inexact")
-
-    def may_setattr(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(
-            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
-        )
-
-    def notify_change_kill_suid(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        mode = self.mode
-        return bool(mode & 0o4000)
-
-    def setfl(
-        self,
-        refresh: callable,
-        *,
-        append_change: bool = False,
-        add_noatime: bool = False,
-        caller_uid: int = 0,
-    ) -> bool:
-        self.begin_attr_exact(refresh)
-        if append_change and self.inode_flags & STATX_ATTR_APPEND:
-            return False
-        if add_noatime and caller_uid != self.uid:
-            return False
-        return True
-
-    def do_ftruncate(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(self.inode_flags & STATX_ATTR_APPEND)
-
-    def vfs_fallocate(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(
-            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
-        )
-
-    def may_link_target(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(
-            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
-        )
-
-    def shared_mmap(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(self.inode_flags & STATX_ATTR_APPEND)
-
-    def copy_file_target(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(self.inode_flags & STATX_ATTR_IMMUTABLE)
-
-    def may_open(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(self.inode_flags & STATX_ATTR_APPEND)
-
-    def xattr_write(self, refresh: callable) -> bool:
-        self.begin_attr_exact(refresh)
-        return not bool(
-            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
-        )
-
-    def fileattr_set(self, refresh: callable, caller_uid: int) -> bool:
-        self.begin_attr_exact(refresh)
-        return caller_uid == self.uid
-
-    def may_delete(
-        self, victim: "KernelInode", refresh_parent: callable,
-        refresh_victim: callable, before_joint_cut: callable | None = None,
-        caller_uid: int = 0,
-    ) -> bool:
-        self.begin_attr_exact(refresh_parent)
-        victim.begin_attr_exact(refresh_victim)
-        if before_joint_cut is not None:
-            before_joint_cut()
-        if not self.attr_exact or not victim.attr_exact:
-            raise BlockingIOError(errno.EAGAIN, "joint attributes are inexact")
-        if not self.permission(0o300):
-            return False
-        if (self.mode & 0o1000 and caller_uid not in (self.uid, victim.uid)):
-            return False
-        return not bool(
-            self.inode_flags & STATX_ATTR_APPEND or
-            victim.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
-        )
 
     def exact_data(self, size: int, sequence: int) -> str:
         if size < 0 or sequence <= 0 or sequence > S64_MAX:
@@ -784,30 +717,30 @@ class KernelInode:
             return "duplicate"
         self.size = size
         self.sequence = sequence
-        self.cache_generation += 1  # full data invalidation, even same EOF
+        self.cache_generation += 1
         return "applied"
 
     def withdraw_data(self) -> None:
-        """fuse_pfs_withdraw_data: the revocation primitive.
-
-        A mount that can no longer participate in the barrier drops every
-        retained page so that no read can be answered inside its kernel.  It
-        carries no authority sequence and must not consume one: a dying mount
-        that advanced the ordered size sequence would make a later real
-        publication look like a replay and be discarded.
-        """
         if self.pfs_class != "shared":
             raise ProtocolError("withdrawal is a SHARED-only primitive")
         self.cache_generation += 1
 
-    def repair_attr(self, sequence: int) -> None:
+    def repair_attr(
+        self, sequence: int, inode_flags: int, birth_time_ns: int,
+        mode: int | None = None, uid: int | None = None,
+    ) -> str:
         if sequence <= 0 or sequence > S64_MAX:
-            raise ProtocolError("invalid attr repair sequence")
-        self.object_version = max(self.object_version, sequence)
-        self.attr_repair_sequence = max(self.attr_repair_sequence, sequence)
-        self.attr_exact = False
-        self.inode_flags = 0
-        self.birth_time_ns = 0
+            raise ProtocolError("invalid exact attr repair sequence")
+        if sequence <= self.object_version:
+            return "old"
+        self.object_version = sequence
+        self.inode_flags = inode_flags
+        self.birth_time_ns = birth_time_ns
+        if mode is not None:
+            self.mode = mode
+        if uid is not None:
+            self.uid = uid
+        return "applied"
 
     def install_stamped_attr(
         self, object_version: int, snapshot_sequence: int,
@@ -817,34 +750,28 @@ class KernelInode:
         if (object_version <= 0 or object_version > snapshot_sequence or
                 snapshot_sequence > S64_MAX):
             raise ProtocolError("invalid stamped attr")
-        if (object_version < self.object_version or
-                (object_version == self.object_version and
-                 (self.attr_exact or
-                  object_version < self.attr_repair_sequence))):
+        if object_version <= self.object_version:
             return "old"
-        self.object_version = object_version
-        self.attr_exact = True
-        self.inode_flags = inode_flags
-        self.birth_time_ns = birth_time_ns
-        if mode is not None:
-            self.mode = mode
-        if uid is not None:
-            self.uid = uid
-        return "applied"
+        return self.repair_attr(
+            object_version, inode_flags, birth_time_ns, mode, uid
+        )
 
     def permission(self, mask: int) -> bool:
-        if not self.attr_exact:
-            raise BlockingIOError(errno.EAGAIN, "attributes are inexact")
         return bool(self.mode & mask)
 
     def remote_execute_permission(self) -> bool:
-        if not self.attr_exact:
-            raise BlockingIOError(errno.EAGAIN, "execute mode is inexact")
         return bool(self.mode & 0o111)
 
+    def coredump_safe(self, caller_uid: int) -> bool:
+        return caller_uid == self.uid and not bool(self.mode & 0o022)
+
+    def lsm_owner_rule(self, expected_uid: int) -> bool:
+        return self.uid == expected_uid
+
+    def audit_snapshot(self) -> tuple[int, int, int]:
+        return self.uid, self.mode, self.inode_flags
+
     def fill_exact_statx(self) -> dict[str, int]:
-        if not self.attr_exact:
-            raise BlockingIOError(errno.EAGAIN, "attributes are inexact")
         return {
             "birth_time_ns": self.birth_time_ns,
             "attributes": self.inode_flags,
@@ -1521,137 +1448,90 @@ class PublicationAndNotifyTests(unittest.TestCase):
             set(nodeids),
         )
 
-    def test_attr_repair_fences_permission_until_repaired_version_installs(
+    def test_attr_repair_installs_exact_state_without_an_inexact_interval(
         self,
     ) -> None:
         immutable = STATX_ATTR_IMMUTABLE
         inode = KernelInode()
         self.assertEqual(
-            inode.install_stamped_attr(1, 1, immutable, 111, 0o644), "applied"
-        )
-        self.assertTrue(inode.attr_exact)
-        self.assertTrue(inode.permission(0o400))
-        self.assertEqual((inode.inode_flags, inode.birth_time_ns), (immutable, 111))
-
-        # Clearing IMMUTABLE on a peer advances the repair stamp and makes the
-        # pre-repair permission and enforced state unservable. The authority's
-        # exact record at the repaired version is the recovery record.
-        inode.repair_attr(2)
-        self.assertFalse(inode.attr_exact)
-        self.assertEqual((inode.inode_flags, inode.birth_time_ns), (0, 0))
-        with self.assertRaises(BlockingIOError) as caught:
-            inode.permission(0o400)
-        self.assertEqual(caught.exception.errno, errno.EAGAIN)
-        with self.assertRaises(BlockingIOError) as caught:
-            inode.remote_execute_permission()
-        self.assertEqual(caught.exception.errno, errno.EAGAIN)
-        self.assertEqual(inode.install_stamped_attr(1, 2, immutable, 111), "old")
-        self.assertEqual(inode.install_stamped_attr(2, 2, 0, 222, 0o700), "applied")
-        self.assertTrue(inode.attr_exact)
-        self.assertFalse(inode.permission(0o040))
-        self.assertTrue(inode.remote_execute_permission())
-        self.assertEqual((inode.inode_flags, inode.birth_time_ns), (0, 222))
-
-        # The inverse transition is symmetric: the repair never retains the
-        # clear value as exact, and the next newer record enforces IMMUTABLE.
-        inode.repair_attr(3)
-        self.assertFalse(inode.attr_exact)
-        self.assertEqual(inode.install_stamped_attr(3, 3, immutable, 333), "applied")
-        self.assertEqual((inode.attr_exact, inode.inode_flags), (True, immutable))
-
-    def test_vfs_attr_prechecks_refresh_inexact_operands_once(self) -> None:
-        inode = KernelInode()
-        self.assertEqual(
-            inode.install_stamped_attr(1, 1, STATX_ATTR_IMMUTABLE, 1),
+            inode.install_stamped_attr(1, 1, immutable, 111, 0o644, 1000),
             "applied",
         )
-        inode.repair_attr(2)
-        setattr_refreshes = 0
+        self.assertTrue(inode.permission(0o400))
+        self.assertEqual((inode.inode_flags, inode.birth_time_ns),
+                         (immutable, 111))
 
-        def refresh_setattr() -> None:
-            nonlocal setattr_refreshes
-            setattr_refreshes += 1
-            self.assertEqual(
-                inode.install_stamped_attr(2, 2, 0, 2), "applied"
-            )
-
-        self.assertTrue(inode.may_setattr(refresh_setattr))
-        self.assertEqual(setattr_refreshes, 1)
-
-        parent = KernelInode(is_dir=True, mode=0o700)
-        victim = KernelInode()
-        self.assertEqual(parent.install_stamped_attr(3, 3, 0, 3), "applied")
-        self.assertEqual(victim.install_stamped_attr(3, 3, 0, 3), "applied")
-        victim.repair_attr(4)
-        parent_refreshes = 0
-        victim_refreshes = 0
-
-        def refresh_parent() -> None:
-            nonlocal parent_refreshes
-            parent_refreshes += 1
-
-        def refresh_victim() -> None:
-            nonlocal victim_refreshes
-            victim_refreshes += 1
-            self.assertEqual(
-                victim.install_stamped_attr(4, 4, 0, 4), "applied"
-            )
-
-        self.assertTrue(
-            parent.may_delete(victim, refresh_parent, refresh_victim)
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", inode, sequence=2, inode_flags=0,
+                birth_time_ns=222, mode=0o700, uid=2000,
+            ),
+            "dispatched",
         )
-        self.assertEqual((parent_refreshes, victim_refreshes), (0, 1))
+        self.assertEqual(inode.object_version, 2)
+        self.assertFalse(inode.permission(0o040))
+        self.assertTrue(inode.remote_execute_permission())
+        self.assertEqual(inode.audit_snapshot(), (2000, 0o700, 0))
+        self.assertTrue(inode.lsm_owner_rule(2000))
+        self.assertTrue(inode.coredump_safe(2000))
+        self.assertEqual(
+            inode.install_stamped_attr(1, 2, immutable, 111), "old"
+        )
 
-        parent.uid = 2000
-        victim.uid = 3000
-        parent.mode = 0o1700
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", inode, sequence=3, inode_flags=immutable,
+                birth_time_ns=333, mode=0o644, uid=3000,
+            ),
+            "dispatched",
+        )
+        self.assertEqual(
+            (inode.object_version, inode.inode_flags, inode.uid),
+            (3, immutable, 3000),
+        )
+        self.assertFalse(inode.lsm_owner_rule(2000))
+        self.assertFalse(inode.coredump_safe(2000))
 
-        def clear_sticky_before_joint_cut() -> None:
-            parent.mode = 0o700
+        # A namespace-only COMPLETE may carry an unchanged exact object whose
+        # version predates the outer visibility stamp.
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", inode, sequence=5, record_version=4,
+                inode_flags=0, birth_time_ns=444, mode=0o600, uid=4000,
+            ),
+            "dispatched",
+        )
+        self.assertEqual((inode.object_version, inode.uid), (4, 4000))
 
-        self.assertTrue(parent.may_delete(
-            victim, refresh_parent, refresh_victim,
-            clear_sticky_before_joint_cut, caller_uid=1000,
-        ))
-
-        def set_sticky_before_joint_cut() -> None:
-            parent.mode = 0o1700
-
-        parent.mode = 0o700
-        self.assertFalse(parent.may_delete(
-            victim, refresh_parent, refresh_victim,
-            set_sticky_before_joint_cut, caller_uid=1000,
-        ))
-
-        parent.repair_attr(5)
-        with self.assertRaises(BlockingIOError):
-            parent.may_delete(
-                victim,
-                lambda: parent.install_stamped_attr(5, 5, 0, 5, 0o700),
-                refresh_victim,
-                lambda: parent.repair_attr(6),
-                caller_uid=1000,
-            )
-
-        def refresh_parent_at_six() -> None:
-            self.assertEqual(
-                parent.install_stamped_attr(6, 6, 0, 6, 0o700), "applied"
-            )
-
-        self.assertTrue(parent.may_delete(
-            victim,
-            refresh_parent_at_six,
-            refresh_victim,
-            caller_uid=1000,
-        ))
+    def test_size_repair_invalidates_data_and_installs_the_same_exact_record(
+        self,
+    ) -> None:
+        inode = KernelInode(size=10)
+        self.assertEqual(
+            strict_notify(
+                "PFS_SIZE", inode, sequence=4, exact_size=20,
+                inode_flags=STATX_ATTR_NODUMP, birth_time_ns=444,
+                mode=0o600, uid=4000,
+            ),
+            "dispatched",
+        )
+        self.assertEqual((inode.size, inode.sequence, inode.cache_generation),
+                         (20, 4, 1))
+        self.assertEqual(
+            (inode.object_version, inode.inode_flags, inode.birth_time_ns,
+             inode.mode, inode.uid),
+            (4, STATX_ATTR_NODUMP, 444, 0o600, 4000),
+        )
 
     def test_synchronous_statx_fill_uses_installed_exact_record(self) -> None:
         inode = KernelInode()
-        inode.repair_attr(7)
         flags = STATX_ATTR_NODUMP | STATX_ATTR_IMMUTABLE
         self.assertEqual(
-            inode.install_stamped_attr(7, 7, flags, 1_725_000_000_123),
-            "applied",
+            strict_notify(
+                "PFS_ATTR", inode, sequence=7, inode_flags=flags,
+                birth_time_ns=1_725_000_000_123,
+            ),
+            "dispatched",
         )
         self.assertEqual(
             inode.fill_exact_statx(),
@@ -1661,95 +1541,6 @@ class PublicationAndNotifyTests(unittest.TestCase):
                 "attributes_mask": PFS_STATX_ATTRIBUTES,
             },
         )
-
-    def test_generic_vfs_consumers_refresh_before_their_first_snapshot(
-        self,
-    ) -> None:
-        consumers = (
-            (
-                "notify_change",
-                lambda inode, refresh: not inode.notify_change_kill_suid(refresh),
-            ),
-            (
-                "setfl-append",
-                lambda inode, refresh: inode.setfl(
-                    refresh, append_change=True
-                ),
-            ),
-            ("ftruncate", lambda inode, refresh: inode.do_ftruncate(refresh)),
-            ("fallocate", lambda inode, refresh: inode.vfs_fallocate(refresh)),
-            (
-                "hardlink-target",
-                lambda inode, refresh: inode.may_link_target(refresh),
-            ),
-            ("shared-mmap", lambda inode, refresh: inode.shared_mmap(refresh)),
-            ("copy-target", lambda inode, refresh: inode.copy_file_target(refresh)),
-            ("open", lambda inode, refresh: inode.may_open(refresh)),
-            ("xattr", lambda inode, refresh: inode.xattr_write(refresh)),
-        )
-        for name, decide in consumers:
-            with self.subTest(name=name):
-                inode = KernelInode()
-                self.assertEqual(
-                    inode.install_stamped_attr(
-                        1, 1,
-                        STATX_ATTR_APPEND | STATX_ATTR_IMMUTABLE,
-                        1, 0o4644,
-                    ),
-                    "applied",
-                )
-                inode.repair_attr(2)
-                refreshes = 0
-
-                def refresh() -> None:
-                    nonlocal refreshes
-                    refreshes += 1
-                    self.assertEqual(
-                        inode.install_stamped_attr(2, 2, 0, 2, 0o644),
-                        "applied",
-                    )
-
-                self.assertTrue(decide(inode, refresh))
-                self.assertEqual(refreshes, 1)
-
-        for name, decide in consumers:
-            with self.subTest(name=f"new-enforcement-{name}"):
-                inode = KernelInode()
-                self.assertEqual(
-                    inode.install_stamped_attr(1, 1, 0, 1, 0o644),
-                    "applied",
-                )
-                inode.repair_attr(2)
-
-                def refresh_enforced() -> None:
-                    self.assertEqual(
-                        inode.install_stamped_attr(
-                            2, 2,
-                            STATX_ATTR_APPEND | STATX_ATTR_IMMUTABLE,
-                            2, 0o4644,
-                        ),
-                        "applied",
-                    )
-
-                self.assertFalse(decide(inode, refresh_enforced))
-
-        inode = KernelInode(uid=1000)
-        self.assertEqual(
-            inode.install_stamped_attr(1, 1, 0, 1, uid=1000), "applied"
-        )
-        inode.repair_attr(2)
-
-        def refresh_owner() -> None:
-            self.assertEqual(
-                inode.install_stamped_attr(2, 2, 0, 2, uid=2000), "applied"
-            )
-
-        self.assertFalse(
-            inode.setfl(
-                refresh_owner, add_noatime=True, caller_uid=1000,
-            )
-        )
-        self.assertFalse(inode.fileattr_set(lambda: None, caller_uid=1000))
 
     def test_strict_reverse_notify_whitelist_blocks_cache_injection(self) -> None:
         inode = KernelInode(size=11)

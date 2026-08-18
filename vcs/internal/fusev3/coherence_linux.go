@@ -17,6 +17,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
+	"google.golang.org/protobuf/proto"
 )
 
 // CoherenceProfile is the kernel-cache contract a mount declares to the
@@ -461,6 +462,14 @@ func (c *coherence) applyWithinBudget(ctx context.Context, event *authoritypb.Vi
 }
 
 func (c *coherence) apply(ctx context.Context, event *authoritypb.VisibilityEvent) error {
+	if event == nil || event.GetCursor() == nil {
+		return errors.New("fusev3: malformed visibility event")
+	}
+	if event.GetRoutes() == nil {
+		if err := visibilitywire.ValidateEventTargets(event.GetCursor().GetPhase(), event.GetCursor().GetSequence(), event.GetTargets()); err != nil {
+			return fmt.Errorf("fusev3: %w", err)
+		}
+	}
 	// A change to the volume's route declaration is not a cache repair, and
 	// there is no repair that would answer it: the set of paths this mount
 	// serves locally was fixed at attach and is what the authority admitted it
@@ -527,6 +536,7 @@ type visibilityInodeKey struct {
 	identity publicationIdentity
 	data     bool
 	size     uint64
+	exact    *authoritypb.ObjectPostState
 }
 
 // translate converts VisibilityTargets into cache keys. This frontend keys its
@@ -586,6 +596,9 @@ func (r *rawFileSystem) translate(targets []*authoritypb.VisibilityTarget) (visi
 				if key.identity != identity {
 					return visibilityKeys{}, fmt.Errorf("fusev3: kernel inode %d carried two stable identities in one visibility event", inode)
 				}
+				if !proto.Equal(key.exact, target.GetExactPostState()) {
+					return visibilityKeys{}, fmt.Errorf("fusev3: kernel inode %d carried two exact attribute records in one visibility event", inode)
+				}
 				if data {
 					size := uint64(target.GetSize())
 					if key.data && key.size != size {
@@ -596,7 +609,7 @@ func (r *rawFileSystem) translate(targets []*authoritypb.VisibilityTarget) (visi
 				continue
 			}
 			inodeIndexes[inode] = len(keys.inodes)
-			key := visibilityInodeKey{inode: inode, identity: identity, data: data}
+			key := visibilityInodeKey{inode: inode, identity: identity, data: data, exact: target.GetExactPostState()}
 			if data {
 				key.size = uint64(target.GetSize())
 			}
@@ -632,6 +645,11 @@ func (r *rawFileSystem) pinIdentityDevice(device uint64) error {
 func (r *rawFileSystem) prepareVisibility(ctx context.Context, targets []*authoritypb.VisibilityTarget, self bool) error {
 	if self {
 		return errors.New("fusev3: source filesystem PREPARE is forbidden by the source-owned publication protocol")
+	}
+	for _, target := range targets {
+		if target.GetExactPostState() != nil {
+			return errors.New("fusev3: visibility PREPARE carried post-apply attribute state")
+		}
 	}
 	keys, err := r.translate(targets)
 	if err != nil {
@@ -688,7 +706,7 @@ type repair struct {
 	negative bool
 	inode    uint64
 	data     bool
-	size     uint64
+	object   fuse.PFSObjectState
 	sequence uint64
 }
 
@@ -710,6 +728,9 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 	}
 	if sequence == 0 {
 		return visibilityCompletion{}, false, errors.New("fusev3: visibility COMPLETE carried no sequence")
+	}
+	if err := visibilitywire.ValidateEventTargets(authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE, sequence, targets); err != nil {
+		return visibilityCompletion{}, false, fmt.Errorf("fusev3: %w", err)
 	}
 	keys, err := r.translate(targets)
 	if err != nil {
@@ -781,11 +802,33 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 		record := r.byInodeLocked(inode.inode)
 		delete(r.cachedAttrs, inode.identity)
 		if record != nil {
-			completion.work = append(completion.work, repair{inode: record.id, data: inode.data, size: inode.size, sequence: sequence})
+			object, objectErr := r.exactRepairObjectLocked(record, inode.exact)
+			if objectErr != nil {
+				r.mu.Unlock()
+				return visibilityCompletion{}, false, objectErr
+			}
+			completion.work = append(completion.work, repair{inode: record.id, data: inode.data, object: object, sequence: sequence})
 		}
 	}
 	r.mu.Unlock()
 	return completion, false, nil
+}
+
+func (r *rawFileSystem) exactRepairObjectLocked(record *inodeRecord, exact *authoritypb.ObjectPostState) (fuse.PFSObjectState, error) {
+	if record == nil || exact == nil || !bytes.Equal(exact.GetStableIdentity(), record.identity[:]) || exact.GetAttr() == nil {
+		return fuse.PFSObjectState{}, errors.New("fusev3: exact peer repair does not match its live inode record")
+	}
+	var attr fuse.Attr
+	fillAttr(exact.GetAttr(), &attr, r.mount.uid, r.mount.gid)
+	var wireAttr [fuse.PFSWireAttrSize]byte
+	encodeFuseAttr(wireAttr[:], &attr)
+	object := fuse.PFSObjectState{
+		Nodeid: record.id, ObjectVersion: exact.GetObjectVersion(), Attr: wireAttr,
+		Roles: exact.GetRoles(), InodeFlags: exact.GetAttr().GetFlags(),
+		BirthTimeNS: exact.GetAttr().GetBirthTimeNs(), PFSClass: 1,
+	}
+	copy(object.StableIdentity[:], exact.GetStableIdentity())
+	return object, nil
 }
 
 // newestFinalizedNameCandidateLocked resolves the reply which can be visible
@@ -893,16 +936,13 @@ func (r *rawFileSystem) applyRepair(item repair) error {
 			// The private notify installs the exact post-mutation EOF at this
 			// visibility sequence and invalidates every cached page, including
 			// same-size overwrites where an EOF delta alone would do nothing.
-			if status := server.PFSSizeNotify(item.inode, item.size, item.sequence); !status.Ok() && status != fuse.ENOENT {
-				return fmt.Errorf("fusev3: publish exact size %d at sequence %d for inode %d: %v", item.size, item.sequence, item.inode, status)
-			}
-			if status := server.PFSAttrNotify(item.inode, item.sequence); !status.Ok() && status != fuse.ENOENT {
-				return fmt.Errorf("fusev3: repair attributes at sequence %d for inode %d: %v", item.sequence, item.inode, status)
+			if status := server.PFSSizeNotify(item.sequence, &item.object); !status.Ok() && status != fuse.ENOENT {
+				return fmt.Errorf("fusev3: repair exact data and attributes at sequence %d for inode %d: %v", item.sequence, item.inode, status)
 			}
 			return nil
 		}
-		if status := server.PFSAttrNotify(item.inode, item.sequence); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: invalidate inode %d: %v", item.inode, status)
+		if status := server.PFSAttrNotify(item.sequence, &item.object); !status.Ok() && status != fuse.ENOENT {
+			return fmt.Errorf("fusev3: install exact repaired attributes for inode %d: %v", item.inode, status)
 		}
 		// ENOENT is the strongest successful outcome for invalidation: the
 		// kernel has no node state left that could answer from the old cache.
@@ -1353,8 +1393,8 @@ type kernelNotifier interface {
 	// mapping->invalidate_lock an ordered DATA publication takes, and which
 	// deliberately consumes no authority sequence.
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
-	PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status
-	PFSAttrNotify(node uint64, sequence uint64) fuse.Status
+	PFSSizeNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status
+	PFSAttrNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status
 	PFSEntryNotify(parent uint64, child uint64, sequence uint64, name string, deleted bool) fuse.Status
 	DeleteNotify(parent uint64, child uint64, name string) fuse.Status
 	// EntryNotify takes back a cached absence. It is the name-only primitive,
