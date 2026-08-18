@@ -935,7 +935,15 @@ class PatchedSourceTests(unittest.TestCase):
             self.assertIn(shape, local_shape)
         self.assertIn("expected.attr.flags = FUSE_ATTR_PFS_LOCAL", local_shape)
         self.assertIn("!memcmp(outarg, &expected, sizeof(expected))", local_shape)
-        self.assertIn("rule->stamped != stamped", local_shape)
+        self.assertNotIn("fuse_pfs_lookup_has_stamp", local_shape)
+        self.assertIn("args->out_numargs != 2", local_shape)
+        self.assertIn("stamp_size = args->out_args[1].size", local_shape)
+        self.assertIn("rule->stamp_size != stamp_size", local_shape)
+        for exact_size in (
+            ".stamp_size = 0",
+            ".stamp_size = sizeof(struct fuse_pfs_cache_stamp)",
+        ):
+            self.assertIn(exact_size, local_shape)
         self.assertIn("rule->marked != args->pfs_reply_marked", local_shape)
 
         stamped = self.source("fs/fuse/post_state.c")

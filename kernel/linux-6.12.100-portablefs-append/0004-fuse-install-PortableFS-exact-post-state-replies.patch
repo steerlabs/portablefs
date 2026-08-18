@@ -1,4 +1,4 @@
-From 4cb51a8202f110a79f7a6263449613b0a0b57267 Mon Sep 17 00:00:00 2001
+From 0b2affd80d4b63f8a14c9f9c780cfdbcd1fa9d9d Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -11,7 +11,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/fcntl.c                |  18 +-
  fs/fuse/Makefile          |   1 +
  fs/fuse/dev.c             | 165 ++++++++-
- fs/fuse/dir.c             | 759 +++++++++++++++++++++++++++++++++-----
+ fs/fuse/dir.c             | 757 +++++++++++++++++++++++++++++++++-----
  fs/fuse/file.c            | 122 ++++--
  fs/fuse/fuse_i.h          |  46 ++-
  fs/fuse/inode.c           |  35 +-
@@ -29,7 +29,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  include/linux/fs.h        |  24 +-
  include/uapi/linux/fuse.h |  66 +++-
  mm/mmap.c                 |  12 +-
- 23 files changed, 2287 insertions(+), 423 deletions(-)
+ 23 files changed, 2285 insertions(+), 423 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/attr.c b/fs/attr.c
@@ -686,19 +686,13 @@ index b1078aeb7..209d73eed 100644
  		fuse_copy_finish(cs);
  		return -EINVAL;
 diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
-index 7ee120772..50b34bdf7 100644
+index 7ee120772..1d849f119 100644
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
-@@ -184,6 +184,128 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
+@@ -184,6 +184,126 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
  	args->out_args[0].value = outarg;
  }
  
-+static bool fuse_pfs_lookup_has_stamp(const struct fuse_args *args)
-+{
-+	return args->out_numargs == 2 &&
-+		args->out_args[1].size == sizeof(struct fuse_pfs_cache_stamp);
-+}
-+
 +enum fuse_pfs_lookup_shape {
 +	FUSE_PFS_LOOKUP_INVALID,
 +	FUSE_PFS_LOOKUP_LOCAL_NEGATIVE,
@@ -711,7 +705,7 @@ index 7ee120772..50b34bdf7 100644
 +	enum fuse_pfs_lookup_shape shape;
 +	bool positive;
 +	u32 class_bits;
-+	bool stamped;
++	u32 stamp_size;
 +	bool marked;
 +};
 +
@@ -720,28 +714,28 @@ index 7ee120772..50b34bdf7 100644
 +		.shape = FUSE_PFS_LOOKUP_LOCAL_NEGATIVE,
 +		.positive = false,
 +		.class_bits = FUSE_ATTR_PFS_LOCAL,
-+		.stamped = false,
++		.stamp_size = 0,
 +		.marked = false,
 +	},
 +	{
 +		.shape = FUSE_PFS_LOOKUP_SHARED_NEGATIVE,
 +		.positive = false,
 +		.class_bits = 0,
-+		.stamped = true,
++		.stamp_size = sizeof(struct fuse_pfs_cache_stamp),
 +		.marked = true,
 +	},
 +	{
 +		.shape = FUSE_PFS_LOOKUP_LOCAL_POSITIVE,
 +		.positive = true,
 +		.class_bits = FUSE_ATTR_PFS_LOCAL,
-+		.stamped = false,
++		.stamp_size = 0,
 +		.marked = false,
 +	},
 +	{
 +		.shape = FUSE_PFS_LOOKUP_SHARED_POSITIVE,
 +		.positive = true,
 +		.class_bits = FUSE_ATTR_PFS_SHARED,
-+		.stamped = true,
++		.stamp_size = sizeof(struct fuse_pfs_cache_stamp),
 +		.marked = true,
 +	},
 +};
@@ -772,8 +766,12 @@ index 7ee120772..50b34bdf7 100644
 +	u32 class_bits = outarg->attr.flags &
 +		(FUSE_ATTR_PFS_SHARED | FUSE_ATTR_PFS_LOCAL);
 +	bool positive = outarg->nodeid != 0;
-+	bool stamped = fuse_pfs_lookup_has_stamp(args);
++	u32 stamp_size;
 +	unsigned int i;
++
++	if (args->out_numargs != 2)
++		return FUSE_PFS_LOOKUP_INVALID;
++	stamp_size = args->out_args[1].size;
 +
 +	for (i = 0; i < ARRAY_SIZE(fuse_pfs_lookup_shape_rules); i++) {
 +		const struct fuse_pfs_lookup_shape_rule *rule =
@@ -781,7 +779,7 @@ index 7ee120772..50b34bdf7 100644
 +
 +		if (rule->positive != positive ||
 +		    rule->class_bits != class_bits ||
-+		    rule->stamped != stamped ||
++		    rule->stamp_size != stamp_size ||
 +		    rule->marked != args->pfs_reply_marked)
 +			continue;
 +		if (rule->shape == FUSE_PFS_LOOKUP_LOCAL_NEGATIVE &&
@@ -818,7 +816,7 @@ index 7ee120772..50b34bdf7 100644
  /*
   * Check whether the dentry is still valid
   *
-@@ -207,8 +329,11 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
+@@ -207,8 +327,11 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
  	else if (time_before64(fuse_dentry_time(entry), get_jiffies_64()) ||
  		 (flags & (LOOKUP_EXCL | LOOKUP_REVAL | LOOKUP_RENAME_TARGET))) {
  		struct fuse_entry_out outarg;
@@ -830,7 +828,7 @@ index 7ee120772..50b34bdf7 100644
  		u64 attr_version;
  
  		/* For negative dentries, always do a fresh lookup */
-@@ -229,39 +354,56 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
+@@ -229,39 +352,56 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
  		attr_version = fuse_get_attr_version(fm->fc);
  
  		parent = dget_parent(entry);
@@ -909,7 +907,7 @@ index 7ee120772..50b34bdf7 100644
  			if (outarg.nodeid != get_node_id(inode) ||
  			    (bool) IS_AUTOMOUNT(inode) != (bool) (outarg.attr.flags & FUSE_ATTR_SUBMOUNT)) {
  				fuse_queue_forget(fm->fc, forget,
-@@ -283,16 +425,25 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
+@@ -283,16 +423,25 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
  				ret = -ENOTCONN;
  				goto out_revalidate;
  			}
@@ -939,7 +937,7 @@ index 7ee120772..50b34bdf7 100644
  		kfree(forget);
  		if (ret == -ENOMEM || ret == -EINTR || ret == -ENOTCONN)
  			goto out;
-@@ -301,8 +452,9 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
+@@ -301,8 +450,9 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
  			goto invalid;
  
  		forget_all_cached_acls(inode);
@@ -951,7 +949,7 @@ index 7ee120772..50b34bdf7 100644
  		if (ret)
  			goto out;
  		fuse_change_entry_timeout(entry, &outarg);
-@@ -408,12 +560,14 @@ bool fuse_invalid_attr(struct fuse_attr *attr)
+@@ -408,12 +558,14 @@ bool fuse_invalid_attr(struct fuse_attr *attr)
  }
  
  int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
@@ -968,7 +966,7 @@ index 7ee120772..50b34bdf7 100644
  	u64 attr_version;
  	int err;
  
-@@ -431,16 +585,54 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
+@@ -431,16 +583,54 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
  	attr_version = fuse_get_attr_version(fm->fc);
  
  	fuse_lookup_init(fm->fc, &args, nodeid, name, outarg);
@@ -1029,7 +1027,7 @@ index 7ee120772..50b34bdf7 100644
  		goto out_put_forget;
  	}
  
-@@ -454,6 +646,7 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
+@@ -454,6 +644,7 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
  
  	*inode = fuse_iget(sb, outarg->nodeid, outarg->generation,
  			   &outarg->attr, ATTR_TIMEOUT(outarg),
@@ -1037,7 +1035,7 @@ index 7ee120772..50b34bdf7 100644
  			   attr_version);
  	err = -ENOMEM;
  	if (!*inode) {
-@@ -461,14 +654,32 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
+@@ -461,14 +652,32 @@ int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name
  		goto out;
  	}
  	if (fm->fc->pfs_strict_coherence &&
@@ -1072,7 +1070,7 @@ index 7ee120772..50b34bdf7 100644
  	err = 0;
  
   out_put_forget:
-@@ -492,9 +703,7 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
+@@ -492,9 +701,7 @@ static struct dentry *fuse_lookup(struct inode *dir, struct dentry *entry,
  
  	locked = fuse_lock_inode(dir);
  	err = fuse_lookup_name(dir->i_sb, get_node_id(dir), &entry->d_name,
@@ -1083,7 +1081,7 @@ index 7ee120772..50b34bdf7 100644
  	fuse_unlock_inode(dir, locked);
  	if (err == -ENOENT) {
  		outarg_valid = false;
-@@ -693,6 +902,7 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+@@ -693,6 +900,7 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
  	struct fuse_create_in inarg;
  	struct fuse_open_out *outopenp;
  	struct fuse_entry_out outentry;
@@ -1091,7 +1089,7 @@ index 7ee120772..50b34bdf7 100644
  	struct fuse_inode *fi;
  	struct fuse_file *ff;
  	bool trunc = flags & O_TRUNC;
-@@ -739,8 +949,10 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+@@ -739,8 +947,10 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
  	outopenp = &ff->args->open_outarg;
  	args.out_args[1].size = sizeof(*outopenp);
  	args.out_args[1].value = outopenp;
@@ -1103,7 +1101,7 @@ index 7ee120772..50b34bdf7 100644
  
  	err = get_create_ext(idmap, &args, dir, entry, mode);
  	if (err)
-@@ -760,7 +972,8 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+@@ -760,7 +970,8 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
  	ff->nodeid = outentry.nodeid;
  	ff->open_flags = outopenp->open_flags;
  	inode = fuse_iget(dir->i_sb, outentry.nodeid, outentry.generation,
@@ -1113,7 +1111,7 @@ index 7ee120772..50b34bdf7 100644
  	if (!inode) {
  		flags &= ~(O_CREAT | O_EXCL | O_TRUNC);
  		fuse_sync_release(NULL, ff, flags);
-@@ -783,10 +996,32 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+@@ -783,10 +994,32 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
  		iput(inode);
  		return -ENOTCONN;
  	}
@@ -1147,7 +1145,7 @@ index 7ee120772..50b34bdf7 100644
  	err = generic_file_open(inode, file);
  	if (!err) {
  		file->private_data = ff;
-@@ -796,7 +1031,8 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
+@@ -796,7 +1029,8 @@ static int fuse_create_open(struct mnt_idmap *idmap, struct inode *dir,
  		fi = get_fuse_inode(inode);
  		fuse_sync_release(fi, ff, flags);
  	} else {
@@ -1157,7 +1155,7 @@ index 7ee120772..50b34bdf7 100644
  			truncate_pagecache(inode, 0);
  		else if (!(ff->open_flags & FOPEN_KEEP_CACHE))
  			invalidate_inode_pages2(inode->i_mapping);
-@@ -913,6 +1149,7 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+@@ -913,6 +1147,7 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
  			    struct dentry *entry, umode_t mode)
  {
  	struct fuse_entry_out outarg;
@@ -1165,7 +1163,7 @@ index 7ee120772..50b34bdf7 100644
  	struct inode *inode;
  	struct dentry *d;
  	int err;
-@@ -930,8 +1167,10 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+@@ -930,8 +1165,10 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
  	args->out_numargs = 1;
  	args->out_args[0].size = sizeof(outarg);
  	args->out_args[0].value = &outarg;
@@ -1177,7 +1175,7 @@ index 7ee120772..50b34bdf7 100644
  
  	if (args->opcode != FUSE_LINK) {
  		err = get_create_ext(idmap, args, dir, entry, mode);
-@@ -956,7 +1195,8 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+@@ -956,7 +1193,8 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
  		goto out_put_forget_req;
  
  	inode = fuse_iget(dir->i_sb, outarg.nodeid, outarg.generation,
@@ -1187,7 +1185,7 @@ index 7ee120772..50b34bdf7 100644
  	if (!inode) {
  		fuse_queue_forget(fm->fc, forget, outarg.nodeid, 1);
  		return -ENOMEM;
-@@ -968,6 +1208,19 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+@@ -968,6 +1206,19 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
  		iput(inode);
  		return -ENOTCONN;
  	}
@@ -1207,7 +1205,7 @@ index 7ee120772..50b34bdf7 100644
  	kfree(forget);
  
  	d_drop(entry);
-@@ -981,7 +1234,9 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
+@@ -981,7 +1232,9 @@ static int create_new_entry(struct mnt_idmap *idmap, struct fuse_mount *fm,
  	} else {
  		fuse_change_entry_timeout(entry, &outarg);
  	}
@@ -1218,7 +1216,7 @@ index 7ee120772..50b34bdf7 100644
  	return 0;
  
   out_put_forget_req:
-@@ -1113,6 +1368,11 @@ static void fuse_entry_unlinked(struct dentry *entry)
+@@ -1113,6 +1366,11 @@ static void fuse_entry_unlinked(struct dentry *entry)
  	struct fuse_conn *fc = get_fuse_conn(inode);
  	struct fuse_inode *fi = get_fuse_inode(inode);
  
@@ -1230,7 +1228,7 @@ index 7ee120772..50b34bdf7 100644
  	spin_lock(&fi->lock);
  	fi->attr_version = atomic64_inc_return(&fc->attr_version);
  	/*
-@@ -1135,6 +1395,7 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
+@@ -1135,6 +1393,7 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
  	int err;
  	struct fuse_mount *fm = get_fuse_mount(dir);
  	FUSE_ARGS(args);
@@ -1238,7 +1236,7 @@ index 7ee120772..50b34bdf7 100644
  
  	if (fuse_is_bad(dir))
  		return -EIO;
-@@ -1144,19 +1405,33 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
+@@ -1144,19 +1403,33 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
  	args.in_numargs = 1;
  	args.in_args[0].size = entry->d_name.len + 1;
  	args.in_args[0].value = entry->d_name.name;
@@ -1274,7 +1272,7 @@ index 7ee120772..50b34bdf7 100644
  		fuse_entry_unlinked(entry);
  	} else if (err == -EINTR || err == -ENOENT)
  		fuse_invalidate_entry(entry);
-@@ -1168,6 +1443,7 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
+@@ -1168,6 +1441,7 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
  	int err;
  	struct fuse_mount *fm = get_fuse_mount(dir);
  	FUSE_ARGS(args);
@@ -1282,7 +1280,7 @@ index 7ee120772..50b34bdf7 100644
  
  	if (fuse_is_bad(dir))
  		return -EIO;
-@@ -1177,25 +1453,54 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
+@@ -1177,25 +1451,54 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
  	args.in_numargs = 1;
  	args.in_args[0].size = entry->d_name.len + 1;
  	args.in_args[0].value = entry->d_name.name;
@@ -1339,7 +1337,7 @@ index 7ee120772..50b34bdf7 100644
  static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, struct dentry *oldent,
  			      struct inode *newdir, struct dentry *newent,
  			      unsigned int flags, int opcode, size_t argsize)
-@@ -1204,6 +1509,7 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
+@@ -1204,6 +1507,7 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
  	struct fuse_rename2_in inarg;
  	struct fuse_mount *fm = get_fuse_mount(olddir);
  	FUSE_ARGS(args);
@@ -1347,7 +1345,7 @@ index 7ee120772..50b34bdf7 100644
  
  	if (fm->fc->pfs_strict_coherence &&
  	    ((d_really_is_positive(newent) &&
-@@ -1225,27 +1531,49 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
+@@ -1225,27 +1529,49 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
  	args.in_args[1].value = oldent->d_name.name;
  	args.in_args[2].size = newent->d_name.len + 1;
  	args.in_args[2].value = newent->d_name.name;
@@ -1405,7 +1403,7 @@ index 7ee120772..50b34bdf7 100644
  
  		/* newent will end up negative */
  		if (!(flags & RENAME_EXCHANGE) && d_really_is_positive(newent))
-@@ -1330,7 +1658,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
+@@ -1330,7 +1656,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
  	args.in_args[1].size = newent->d_name.len + 1;
  	args.in_args[1].value = newent->d_name.name;
  	err = create_new_entry(&invalid_mnt_idmap, fm, &args, newdir, newent, inode->i_mode);
@@ -1414,7 +1412,7 @@ index 7ee120772..50b34bdf7 100644
  		fuse_update_ctime_in_cache(inode);
  	else if (err == -EINTR)
  		fuse_invalidate_attr(inode);
-@@ -1470,6 +1798,7 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1470,6 +1796,7 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
  	int err;
  	struct fuse_getattr_in inarg;
  	struct fuse_attr_out outarg;
@@ -1422,7 +1420,7 @@ index 7ee120772..50b34bdf7 100644
  	struct fuse_mount *fm = get_fuse_mount(inode);
  	FUSE_ARGS(args);
  	u64 attr_version;
-@@ -1493,12 +1822,18 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1493,12 +1820,18 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
  	args.out_numargs = 1;
  	args.out_args[0].size = sizeof(outarg);
  	args.out_args[0].value = &outarg;
@@ -1442,7 +1440,7 @@ index 7ee120772..50b34bdf7 100644
  	fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
  	err = fuse_simple_request(fm, &args);
  	if (!err) {
-@@ -1507,9 +1842,17 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1507,9 +1840,17 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
  			fuse_make_bad(inode);
  			err = -EIO;
  		} else {
@@ -1463,7 +1461,7 @@ index 7ee120772..50b34bdf7 100644
  				err = -ENOTCONN;
  			else if (stat)
  				fuse_fillattr(idmap, inode, &outarg.attr, stat);
-@@ -1569,6 +1912,9 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1569,6 +1910,9 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
  			stat->result_mask |= STATX_BTIME;
  		}
  	}
@@ -1473,7 +1471,7 @@ index 7ee120772..50b34bdf7 100644
  
  	return err;
  }
-@@ -1588,15 +1934,16 @@ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
+@@ -1588,15 +1932,16 @@ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
   * event, but does not clear nlink or detach mounts for a mutation performed on
   * another machine.
   */
@@ -1495,7 +1493,7 @@ index 7ee120772..50b34bdf7 100644
  
  	parent = fuse_ilookup(fc, parent_nodeid, NULL);
  	if (!parent)
-@@ -1606,15 +1953,20 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
+@@ -1606,15 +1951,20 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
  		err = -EPROTO;
  		goto out_parent;
  	}
@@ -1518,7 +1516,7 @@ index 7ee120772..50b34bdf7 100644
  
  	spin_lock(&entry->d_lock);
  	child = d_inode(entry);
-@@ -1627,21 +1979,37 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
+@@ -1627,21 +1977,37 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
  		goto out_entry;
  	}
  
@@ -1559,7 +1557,7 @@ index 7ee120772..50b34bdf7 100644
  out_parent:
  	iput(parent);
  	return err;
-@@ -1656,8 +2024,7 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+@@ -1656,8 +2022,7 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
  	struct dentry *entry;
  
  	if (fc->pfs_strict_coherence)
@@ -1569,7 +1567,7 @@ index 7ee120772..50b34bdf7 100644
  
  	parent = fuse_ilookup(fc, parent_nodeid, NULL);
  	if (!parent)
-@@ -1803,6 +2170,158 @@ static int fuse_perm_getattr(struct inode *inode, int mask)
+@@ -1803,6 +2168,158 @@ static int fuse_perm_getattr(struct inode *inode, int mask)
  	return fuse_do_getattr(&nop_mnt_idmap, inode, NULL, NULL);
  }
  
@@ -1728,7 +1726,7 @@ index 7ee120772..50b34bdf7 100644
  /*
   * Check permission.  The two basic access models of FUSE are:
   *
-@@ -1820,6 +2339,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1820,6 +2337,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
  			   struct inode *inode, int mask)
  {
  	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1737,7 +1735,7 @@ index 7ee120772..50b34bdf7 100644
  	bool refreshed = false;
  	int err = 0;
  
-@@ -1828,17 +2349,24 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1828,17 +2347,24 @@ static int fuse_permission(struct mnt_idmap *idmap,
  
  	if (!fuse_allow_current_process(fc))
  		return -EACCES;
@@ -1767,7 +1765,7 @@ index 7ee120772..50b34bdf7 100644
  			refreshed = true;
  
  			err = fuse_perm_getattr(inode, mask);
-@@ -1848,7 +2376,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1848,7 +2374,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
  	}
  
  	if (fc->default_permissions) {
@@ -1777,7 +1775,7 @@ index 7ee120772..50b34bdf7 100644
  
  		/* If permission is denied, try to refresh file
  		   attributes.  This is also needed, because the root
-@@ -1856,8 +2385,9 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1856,8 +2383,9 @@ static int fuse_permission(struct mnt_idmap *idmap,
  		if (err == -EACCES && !refreshed) {
  			err = fuse_perm_getattr(inode, mask);
  			if (!err)
@@ -1789,7 +1787,7 @@ index 7ee120772..50b34bdf7 100644
  		}
  
  		/* Note: the opposite of the above test does not
-@@ -1867,12 +2397,19 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1867,12 +2395,19 @@ static int fuse_permission(struct mnt_idmap *idmap,
  	} else if (mask & (MAY_ACCESS | MAY_CHDIR)) {
  		err = fuse_access(inode, mask);
  	} else if ((mask & MAY_EXEC) && S_ISREG(inode->i_mode)) {
@@ -1811,7 +1809,7 @@ index 7ee120772..50b34bdf7 100644
  				return -EACCES;
  		}
  	}
-@@ -2218,6 +2755,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2218,6 +2753,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  	FUSE_ARGS(args);
  	struct fuse_setattr_in inarg;
  	struct fuse_attr_out outarg;
@@ -1819,7 +1817,7 @@ index 7ee120772..50b34bdf7 100644
  	bool is_truncate = false;
  	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
  	loff_t oldsize;
-@@ -2315,11 +2853,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2315,11 +2851,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  
  	attr_version = fuse_get_attr_version(fm->fc);
  	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
@@ -1835,7 +1833,7 @@ index 7ee120772..50b34bdf7 100644
  	err = fuse_simple_request(fm, &args);
  	if (err) {
  		if (err == -EINTR)
-@@ -2338,6 +2879,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2338,6 +2877,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  		err = -ENOTCONN;
  		goto error;
  	}
@@ -1864,7 +1862,7 @@ index 7ee120772..50b34bdf7 100644
  	if (fc->pfs_strict_coherence && is_truncate &&
  	    fi->pfs_class == FUSE_PFS_CLASS_SHARED) {
  		/* The marked SETATTR reply now retains the source gate. */
-@@ -2533,6 +3096,11 @@ static const struct inode_operations fuse_dir_inode_operations = {
+@@ -2533,6 +3094,11 @@ static const struct inode_operations fuse_dir_inode_operations = {
  	.tmpfile	= fuse_tmpfile,
  	.mknod		= fuse_mknod,
  	.permission	= fuse_permission,
@@ -1876,7 +1874,7 @@ index 7ee120772..50b34bdf7 100644
  	.getattr	= fuse_getattr,
  	.listxattr	= fuse_listxattr,
  	.get_inode_acl	= fuse_get_inode_acl,
-@@ -2557,6 +3125,11 @@ static const struct inode_operations fuse_pfs_dir_inode_operations = {
+@@ -2557,6 +3123,11 @@ static const struct inode_operations fuse_pfs_dir_inode_operations = {
  	.tmpfile	= fuse_tmpfile,
  	.mknod		= fuse_mknod,
  	.permission	= fuse_permission,
@@ -1888,7 +1886,7 @@ index 7ee120772..50b34bdf7 100644
  	.getattr	= fuse_getattr,
  	.listxattr	= fuse_listxattr,
  	.get_inode_acl	= fuse_get_inode_acl,
-@@ -2580,6 +3153,11 @@ static const struct file_operations fuse_dir_operations = {
+@@ -2580,6 +3151,11 @@ static const struct file_operations fuse_dir_operations = {
  static const struct inode_operations fuse_common_inode_operations = {
  	.setattr	= fuse_setattr,
  	.permission	= fuse_permission,
@@ -1900,7 +1898,7 @@ index 7ee120772..50b34bdf7 100644
  	.getattr	= fuse_getattr,
  	.listxattr	= fuse_listxattr,
  	.get_inode_acl	= fuse_get_inode_acl,
-@@ -2591,6 +3169,11 @@ static const struct inode_operations fuse_common_inode_operations = {
+@@ -2591,6 +3167,11 @@ static const struct inode_operations fuse_common_inode_operations = {
  
  static const struct inode_operations fuse_symlink_inode_operations = {
  	.setattr	= fuse_setattr,
