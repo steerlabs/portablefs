@@ -610,8 +610,16 @@ class PatchedSourceTests(unittest.TestCase):
             permission.index("static int fuse_pfs_execute_permission"):
             permission.index("static int fuse_permission")
         ]
-        self.assertIn("if (!IS_ATTR_EXACT(inode))", execute)
+        self.assertIn("fuse_pfs_begin_attr_exact(inode)", execute)
         self.assertIn("inode->i_mode & 0111", execute)
+
+        attr = self.source("fs/attr.c")
+        may_setattr = attr[
+            attr.index("int may_setattr"):
+            attr.index("EXPORT_SYMBOL(may_setattr)")
+        ]
+        self.assertIn("inode_begin_attr_exact(inode)", may_setattr)
+        self.assertIn("inode_end_attr_exact(inode)", may_setattr)
 
         namei = self.source("fs/namei.c")
         inode_permission = namei[
@@ -622,6 +630,16 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertLess(
             inode_permission.index("if (unlikely(!IS_ATTR_EXACT(inode)))"),
             inode_permission.index("if (IS_IMMUTABLE(inode))"),
+        )
+        may_delete = namei[
+            namei.index("static int may_delete"):
+            namei.index("static inline int may_create")
+        ]
+        self.assertIn("inode_begin_attr_exact(dir)", may_delete)
+        self.assertIn("inode_begin_attr_exact(inode)", may_delete)
+        self.assertLess(
+            may_delete.index("inode_end_attr_exact(dir)"),
+            may_delete.index("inode_begin_attr_exact(inode)"),
         )
 
     def test_existing_create_and_negative_lookup_have_distinct_exact_shapes(
