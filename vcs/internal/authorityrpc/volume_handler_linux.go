@@ -991,7 +991,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			itemReply := itemProto(item, attr, itemIdentity)
 			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
 			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemReply, Handle: handle[:]}}
-			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
+			return resp, []volumeserver.VisibilityTarget{
+				namespaceTargetPost(parentCoordinate, body.Create.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+			}
 		})
 		if releaseMutation != nil {
 			releaseMutation()
@@ -1052,7 +1055,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
 				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
 			)
-			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
+			return resp, []volumeserver.VisibilityTarget{
+				namespaceTargetPost(parentCoordinate, body.Mkdir.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+			}
 		})
 		if releaseMutation != nil {
 			releaseMutation()
@@ -1328,7 +1334,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
 				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
 			)
-			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
+			return resp, []volumeserver.VisibilityTarget{
+				namespaceTargetPost(parentCoordinate, body.Symlink.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+			}
 		})
 		if releaseMutation != nil {
 			releaseMutation()

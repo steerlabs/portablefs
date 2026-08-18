@@ -1606,6 +1606,7 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 	mutationTargets := []volumeserver.VisibilityTarget{
 		{Scope: volumeserver.VisibilityNamespace, ParentIdentity: parentIdentity, ParentKernelIno: 0x11, Device: 1, Name: []byte("child")},
 		{Scope: volumeserver.VisibilityAttributes, Identity: parentIdentity, KernelIno: 0x11, Device: 1},
+		{Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{newBinding[0]}, KernelIno: uint64(newBinding[0]), Device: 1},
 	}
 
 	ownerEntered := make(chan struct{})
@@ -1659,7 +1660,7 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 						changed:  true,
 					},
 				)
-				return resp, nil
+				return resp, mutationTargets
 			},
 		)
 	}()

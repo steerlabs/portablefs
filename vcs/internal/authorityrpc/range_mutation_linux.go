@@ -274,6 +274,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			h.deferStorageFailure(resp, applyErr)
 		}
 		return resp, []volumeserver.VisibilityTarget{
+			inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0),
 			inodeTarget(volumeserver.VisibilityData, destinationCoordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, destinationCoordinate, 0),
 		}

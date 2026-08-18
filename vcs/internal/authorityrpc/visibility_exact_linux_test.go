@@ -72,3 +72,32 @@ func TestAttachExactRepairPostStateFailsClosedOnAMissingRecord(t *testing.T) {
 		t.Fatal("missing exact repair record was accepted")
 	}
 }
+
+func TestAttachExactRepairPostStateRequiresEveryChangedRecordTarget(t *testing.T) {
+	const sequence = uint64(17)
+	source, destination := [16]byte{1}, [16]byte{2}
+	state := &authoritypb.PostState{
+		VisibilitySequence: sequence,
+		SnapshotSequence:   sequence,
+		Objects: []*authoritypb.ObjectPostState{
+			{StableIdentity: source[:], ObjectVersion: sequence, Roles: postStateRoleSource,
+				Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 91, Size: 4}},
+			{StableIdentity: destination[:], ObjectVersion: sequence, Roles: postStateRoleDestination,
+				Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 92, Size: 8}},
+		},
+	}
+	targets := []volumeserver.VisibilityTarget{{
+		Scope: volumeserver.VisibilityData, Identity: destination, KernelIno: 92, Size: 8,
+	}}
+	if err := attachExactRepairPostState(targets, state, sequence); err == nil {
+		t.Fatal("COMPLETE without a target for the changed source record was accepted")
+	}
+
+	state.Objects[0].ObjectVersion = sequence - 1
+	if err := attachExactRepairPostState(targets, state, sequence); err != nil {
+		t.Fatalf("unchanged source record incorrectly required a COMPLETE target: %v", err)
+	}
+	if targets[0].ExactPostState == nil || targets[0].ExactPostState.StableIdentity != destination {
+		t.Fatalf("destination exact repair = %#v", targets[0].ExactPostState)
+	}
+}
