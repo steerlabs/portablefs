@@ -1,5 +1,8 @@
 # PortableFS Linux 6.12.100 strict-coherence ABI
 
+Superseded for vNext by [PortableFS vNext protocol and private kernel ABI](./vnext-protocol.md).
+This document remains the protocol-5/FUSE-7.41 implementation record only.
+
 Status: implementation candidate, not a production-qualified kernel.
 
 This document freezes the private FUSE dialect implemented by the patch series
