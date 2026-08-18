@@ -1,10 +1,17 @@
-From 0e1a51f3516fbf3a36847c0f627936863ef81cbf Mon Sep 17 00:00:00 2001
+From a744d6049bbae14bcf22150274feb3d4b02bed8a Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
-Date: Mon, 17 Aug 2026 22:44:48 -0700
+Date: Tue, 18 Aug 2026 02:15:14 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
 
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Regenerate the 6.12.100 FUSE 7.42 series with exact trailers and
+stamped lookup, getattr, and readdirplus replies. Add ordered
+ATTR/ENTRY/SIZE repairs, transaction-wide pre-store snapshots, parent
+cache generations, bounded source-write invalidation, and masked statx
+attribute installation.
+
 Signed-off-by: Tim Jang <timjang3@gmail.com>
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
  fs/fuse/dev.c             | 161 ++++++++++++-
@@ -12,11 +19,11 @@ Signed-off-by: Tim Jang <timjang3@gmail.com>
  fs/fuse/file.c            | 122 +++++++---
  fs/fuse/fuse_i.h          |  39 ++-
  fs/fuse/inode.c           |  23 +-
- fs/fuse/post_state.c      | 492 ++++++++++++++++++++++++++++++++++++++
+ fs/fuse/post_state.c      | 487 ++++++++++++++++++++++++++++++++++++++
  fs/fuse/readdir.c         |  70 +++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  63 ++++-
- 10 files changed, 1208 insertions(+), 118 deletions(-)
+ 10 files changed, 1203 insertions(+), 118 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -1334,10 +1341,10 @@ index c2ac021bf..9a91eafcd 100644
  		if (fi->nlookup)
 diff --git a/fs/fuse/post_state.c b/fs/fuse/post_state.c
 new file mode 100644
-index 000000000..46ae90a83
+index 000000000..20f9b5ef0
 --- /dev/null
 +++ b/fs/fuse/post_state.c
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,487 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* PortableFS exact post-state reply installation. */
 +
@@ -1553,21 +1560,16 @@ index 000000000..46ae90a83
 +	return 0;
 +}
 +
-+static void pfs_install_inode_flags(struct inode *inode, u32 flags)
++static void pfs_install_statx_attributes(struct inode *inode, u32 flags)
 +{
++	/* VFS i_flags represents and enforces only these statx attributes. */
 +	unsigned int preserved = inode->i_flags &
-+		~(S_IMMUTABLE | S_APPEND | S_SYNC | S_NOATIME | S_DIRSYNC);
++		~(S_IMMUTABLE | S_APPEND);
 +
-+	if (flags & FS_IMMUTABLE_FL)
++	if (flags & STATX_ATTR_IMMUTABLE)
 +		preserved |= S_IMMUTABLE;
-+	if (flags & FS_APPEND_FL)
++	if (flags & STATX_ATTR_APPEND)
 +		preserved |= S_APPEND;
-+	if (flags & FS_SYNC_FL)
-+		preserved |= S_SYNC;
-+	if (flags & FS_NOATIME_FL)
-+		preserved |= S_NOATIME;
-+	if (flags & FS_DIRSYNC_FL)
-+		preserved |= S_DIRSYNC;
 +	inode->i_flags = preserved;
 +}
 +
@@ -1811,7 +1813,7 @@ index 000000000..46ae90a83
 +		fi->i_btime.tv_nsec = nanoseconds;
 +		set_bit(FUSE_I_BTIME, &fi->state);
 +		fi->pfs_inode_flags = object->inode_flags;
-+		pfs_install_inode_flags(inode, object->inode_flags);
++		pfs_install_statx_attributes(inode, object->inode_flags);
 +		memcpy(fi->pfs_stable_identity, object->stable_identity,
 +		       sizeof(fi->pfs_stable_identity));
 +		fi->pfs_identity_known = true;
