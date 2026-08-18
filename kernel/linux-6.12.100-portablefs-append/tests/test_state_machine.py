@@ -680,6 +680,11 @@ class KernelInode:
             raise BlockingIOError(errno.EAGAIN, "attributes are inexact")
         return bool(self.mode & mask)
 
+    def remote_execute_permission(self) -> bool:
+        if not self.attr_exact:
+            raise BlockingIOError(errno.EAGAIN, "execute mode is inexact")
+        return bool(self.mode & 0o111)
+
     def fill_exact_statx(self) -> dict[str, int]:
         if not self.attr_exact:
             raise BlockingIOError(errno.EAGAIN, "attributes are inexact")
@@ -1317,10 +1322,14 @@ class PublicationAndNotifyTests(unittest.TestCase):
         with self.assertRaises(BlockingIOError) as caught:
             inode.permission(0o400)
         self.assertEqual(caught.exception.errno, errno.EAGAIN)
+        with self.assertRaises(BlockingIOError) as caught:
+            inode.remote_execute_permission()
+        self.assertEqual(caught.exception.errno, errno.EAGAIN)
         self.assertEqual(inode.install_stamped_attr(1, 2, immutable, 111), "old")
-        self.assertEqual(inode.install_stamped_attr(2, 2, 0, 222, 0), "applied")
+        self.assertEqual(inode.install_stamped_attr(2, 2, 0, 222, 0o700), "applied")
         self.assertTrue(inode.attr_exact)
-        self.assertFalse(inode.permission(0o400))
+        self.assertFalse(inode.permission(0o040))
+        self.assertTrue(inode.remote_execute_permission())
         self.assertEqual((inode.inode_flags, inode.birth_time_ns), (0, 222))
 
         # The inverse transition is symmetric: the repair never retains the

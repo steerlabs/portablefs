@@ -1,4 +1,4 @@
-From ca00864717a8def906b1bf5249af4645392f8297 Mon Sep 17 00:00:00 2001
+From d7776195e16e4385794bd9c123b93cbaca063d65 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -8,7 +8,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
  fs/fuse/dev.c             | 165 +++++++++++-
- fs/fuse/dir.c             | 446 +++++++++++++++++++++++++++----
+ fs/fuse/dir.c             | 483 +++++++++++++++++++++++++++++----
  fs/fuse/file.c            | 122 ++++++---
  fs/fuse/fuse_i.h          |  43 ++-
  fs/fuse/inode.c           |  31 +--
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/namei.c                |  23 +-
  include/linux/fs.h        |   8 +-
  include/uapi/linux/fuse.h |  66 ++++-
- 12 files changed, 1440 insertions(+), 132 deletions(-)
+ 12 files changed, 1472 insertions(+), 137 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -248,7 +248,7 @@ index b1078aeb7..209d73eed 100644
  		fuse_copy_finish(cs);
  		return -EINVAL;
 diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
-index 7ee120772..4089a7258 100644
+index 7ee120772..63c390c09 100644
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
 @@ -184,6 +184,28 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
@@ -983,7 +983,7 @@ index 7ee120772..4089a7258 100644
  
  	parent = fuse_ilookup(fc, parent_nodeid, NULL);
  	if (!parent)
-@@ -1803,6 +2098,22 @@ static int fuse_perm_getattr(struct inode *inode, int mask)
+@@ -1803,6 +2098,38 @@ static int fuse_perm_getattr(struct inode *inode, int mask)
  	return fuse_do_getattr(&nop_mnt_idmap, inode, NULL, NULL);
  }
  
@@ -1003,10 +1003,26 @@ index 7ee120772..4089a7258 100644
 +	return err;
 +}
 +
++static int fuse_pfs_execute_permission(struct inode *inode)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	int err;
++
++	mutex_lock(&fi->pfs_publish_mutex);
++	spin_lock(&fi->lock);
++	if (!IS_ATTR_EXACT(inode))
++		err = -EAGAIN;
++	else
++		err = inode->i_mode & 0111 ? 0 : -EACCES;
++	spin_unlock(&fi->lock);
++	mutex_unlock(&fi->pfs_publish_mutex);
++	return err;
++}
++
  /*
   * Check permission.  The two basic access models of FUSE are:
   *
-@@ -1820,6 +2131,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1820,6 +2147,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
  			   struct inode *inode, int mask)
  {
  	struct fuse_conn *fc = get_fuse_conn(inode);
@@ -1015,26 +1031,35 @@ index 7ee120772..4089a7258 100644
  	bool refreshed = false;
  	int err = 0;
  
-@@ -1828,6 +2141,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1828,16 +2157,23 @@ static int fuse_permission(struct mnt_idmap *idmap,
  
  	if (!fuse_allow_current_process(fc))
  		return -EACCES;
 +	if (pfs_shared && (mask & MAY_NOT_BLOCK))
 +		return -ECHILD;
  
- 	/*
- 	 * If attributes are needed, refresh them before proceeding
-@@ -1837,7 +2152,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+-	/*
+-	 * If attributes are needed, refresh them before proceeding
+-	 */
++	if (pfs_shared && !fuse_pfs_attr_is_exact(inode)) {
++		refreshed = true;
++		err = fuse_perm_getattr(inode, mask);
++		if (err)
++			return err;
++	}
++
++	/* If attributes are needed, refresh them before proceeding. */
+ 	if (fc->default_permissions ||
+ 	    ((mask & MAY_EXEC) && S_ISREG(inode->i_mode))) {
  		struct fuse_inode *fi = get_fuse_inode(inode);
  		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
  
 -		if (perm_mask & READ_ONCE(fi->inval_mask) ||
-+		if ((pfs_shared && !fuse_pfs_attr_is_exact(inode)) ||
-+		    (perm_mask & READ_ONCE(fi->inval_mask)) ||
++		if (!refreshed && ((perm_mask & READ_ONCE(fi->inval_mask)) ||
  		    time_before64(fi->i_time, get_jiffies_64())) {
  			refreshed = true;
  
-@@ -1848,7 +2164,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1848,7 +2184,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
  	}
  
  	if (fc->default_permissions) {
@@ -1044,7 +1069,7 @@ index 7ee120772..4089a7258 100644
  
  		/* If permission is denied, try to refresh file
  		   attributes.  This is also needed, because the root
-@@ -1856,8 +2173,9 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1856,8 +2193,9 @@ static int fuse_permission(struct mnt_idmap *idmap,
  		if (err == -EACCES && !refreshed) {
  			err = fuse_perm_getattr(inode, mask);
  			if (!err)
@@ -1056,7 +1081,29 @@ index 7ee120772..4089a7258 100644
  		}
  
  		/* Note: the opposite of the above test does not
-@@ -2218,6 +2536,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -1867,12 +2205,19 @@ static int fuse_permission(struct mnt_idmap *idmap,
+ 	} else if (mask & (MAY_ACCESS | MAY_CHDIR)) {
+ 		err = fuse_access(inode, mask);
+ 	} else if ((mask & MAY_EXEC) && S_ISREG(inode->i_mode)) {
+-		if (!(inode->i_mode & S_IXUGO)) {
++		if (pfs_shared) {
++			err = fuse_pfs_execute_permission(inode);
++			if (err == -EACCES && !refreshed) {
++				err = fuse_perm_getattr(inode, mask);
++				if (!err)
++					err = fuse_pfs_execute_permission(inode);
++			}
++		} else if (!(inode->i_mode & 0111)) {
+ 			if (refreshed)
+ 				return -EACCES;
+ 
+ 			err = fuse_perm_getattr(inode, mask);
+-			if (!err && !(inode->i_mode & S_IXUGO))
++			if (!err && !(inode->i_mode & 0111))
+ 				return -EACCES;
+ 		}
+ 	}
+@@ -2218,6 +2563,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  	FUSE_ARGS(args);
  	struct fuse_setattr_in inarg;
  	struct fuse_attr_out outarg;
@@ -1064,7 +1111,7 @@ index 7ee120772..4089a7258 100644
  	bool is_truncate = false;
  	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
  	loff_t oldsize;
-@@ -2315,11 +2634,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2315,11 +2661,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  
  	attr_version = fuse_get_attr_version(fm->fc);
  	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
@@ -1080,7 +1127,7 @@ index 7ee120772..4089a7258 100644
  	err = fuse_simple_request(fm, &args);
  	if (err) {
  		if (err == -EINTR)
-@@ -2338,6 +2660,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2338,6 +2687,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  		err = -ENOTCONN;
  		goto error;
  	}
