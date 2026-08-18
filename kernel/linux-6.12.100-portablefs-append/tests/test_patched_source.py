@@ -846,6 +846,25 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("fuse_direntplus_link", strict)
         self.assertIn("fuse_pfs_forget_dirplus_tail", strict)
 
+    def test_strict_readdirplus_publishes_after_every_entry_is_linked(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/readdir.c")
+        start = text.index("static int fuse_readdir_uncached")
+        end = text.index("int fuse_readdir(struct file", start)
+        frontend = text[start:end]
+        policy = frontend.index("FUSE_PFS_PUBLISH_OPTIONAL")
+        enter = frontend.index("fs_reply_publish_scope_enter")
+        request = frontend.index("fuse_simple_request")
+        parse = frontend.index("parse_pfs_dirplusfile")
+        finish = frontend.index("fs_reply_publish_scope_finish")
+        release = frontend.index("__free_page")
+        self.assertLess(policy, enter)
+        self.assertLess(enter, request)
+        self.assertLess(request, parse)
+        self.assertLess(parse, finish)
+        self.assertLess(finish, release)
+
     def test_shared_opendir_forbids_persistent_directory_cache(self) -> None:
         text = self.source("fs/fuse/file.c")
         start = text.index("int fuse_pfs_validate_open")

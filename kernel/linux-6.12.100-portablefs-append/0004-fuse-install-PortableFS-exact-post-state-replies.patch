@@ -1,4 +1,4 @@
-From 5c6480825c784d2de7b9925b6c3f9c06288c54c1 Mon Sep 17 00:00:00 2001
+From 80fb41370d0a21e4c4385cd99d17a2b995f9c70c Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -13,10 +13,10 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/fuse/fuse_i.h          |  51 +++-
  fs/fuse/inode.c           |  75 ++---
  fs/fuse/post_state.c      | 607 ++++++++++++++++++++++++++++++++++++++
- fs/fuse/readdir.c         | 104 ++++++-
+ fs/fuse/readdir.c         | 112 ++++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  71 ++++-
- 10 files changed, 1545 insertions(+), 193 deletions(-)
+ 10 files changed, 1553 insertions(+), 193 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -2336,7 +2336,7 @@ index 000000000..cc8739615
 +	return err;
 +}
 diff --git a/fs/fuse/readdir.c b/fs/fuse/readdir.c
-index de3dd14d1..c5e47502c 100644
+index de3dd14d1..f9527aeb2 100644
 --- a/fs/fuse/readdir.c
 +++ b/fs/fuse/readdir.c
 @@ -152,13 +152,13 @@ static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
@@ -2480,7 +2480,16 @@ index de3dd14d1..c5e47502c 100644
  static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
  {
  	int plus;
-@@ -359,6 +436,8 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
+@@ -344,6 +421,8 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
+ 	struct fuse_args_pages *ap = &ia.ap;
+ 	struct fuse_page_desc desc = { .length = PAGE_SIZE };
+ 	u64 attr_version = 0;
++	struct fs_reply_publish_scope publish_scope;
++	bool publish_started = false;
+ 	bool locked;
+ 
+ 	page = alloc_page(GFP_KERNEL);
+@@ -359,10 +438,16 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
  		attr_version = fuse_get_attr_version(fm->fc);
  		fuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
  				    FUSE_READDIRPLUS);
@@ -2489,7 +2498,15 @@ index de3dd14d1..c5e47502c 100644
  	} else {
  		fuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
  				    FUSE_READDIR);
-@@ -373,8 +452,17 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
+ 	}
++	if (plus && fm->fc->pfs_strict_coherence) {
++		fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
++		publish_started = true;
++	}
+ 	locked = fuse_lock_inode(inode);
+ 	res = fuse_simple_request(fm, &ap->args);
+ 	fuse_unlock_inode(inode, locked);
+@@ -373,13 +458,24 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
  			if (ff->open_flags & FOPEN_CACHE_DIR)
  				fuse_readdir_cache_end(file, ctx->pos);
  		} else if (plus) {
@@ -2509,6 +2526,13 @@ index de3dd14d1..c5e47502c 100644
  		} else {
  			res = parse_dirfile(page_address(page), res, file,
  					    ctx);
+ 		}
+ 	}
++	if (publish_started)
++		res = fs_reply_publish_scope_finish(&publish_scope, res);
+ 
+ 	__free_page(page);
+ 	fuse_invalidate_atime(inode);
 diff --git a/fs/fuse/xattr.c b/fs/fuse/xattr.c
 index 8e47c0a8a..8cd1ade35 100644
 --- a/fs/fuse/xattr.c
