@@ -223,6 +223,11 @@ and does not stop the data plane; alert on the missing scrape and repair the
 monitoring path without turning an observability fault into a filesystem
 outage.
 
+The packaged systemd worker keeps `PrivateNetwork=yes` and permits only
+`AF_UNIX` plus `AF_INET`. The inherited data-plane socket does not require the
+worker to create an Internet socket; `AF_INET` exists solely so the worker can
+bind its IPv4 loopback admin listener inside that private network namespace.
+
 ### Deployment-sized bounds
 
 These protect one volume worker from denial of service. They are not PortableFS

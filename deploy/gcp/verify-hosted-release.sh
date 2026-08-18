@@ -92,4 +92,11 @@ for unit in "$stage"/systemd/*.service; do
   }
 done
 
+authority_unit=$stage/systemd/portablefs-authority@.service
+[[ $(grep -c '^RestrictAddressFamilies=' "$authority_unit") == 1 ]] &&
+  grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET' "$authority_unit" || {
+  echo "hosted authority unit does not permit its private IPv4 admin listener" >&2
+  exit 65
+}
+
 echo "$release_id"

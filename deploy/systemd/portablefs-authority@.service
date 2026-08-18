@@ -26,7 +26,9 @@ ProtectSystem=strict
 ProcSubset=pid
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_UNIX
+# The data-plane TCP socket is inherited from systemd. AF_INET is still needed
+# for the private-network loopback admin listener.
+RestrictAddressFamilies=AF_UNIX AF_INET
 RestrictNamespaces=yes
 RestrictRealtime=yes
 # RestrictSUIDSGID rejects openat2, which is the authority's descriptor-relative
