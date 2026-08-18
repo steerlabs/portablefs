@@ -5,14 +5,29 @@ package fusev3
 import (
 	"bytes"
 	"math"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
+
+type blockingResponseConsumption struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingResponseConsumption) Consume() {
+	if c.calls.Add(1) == 1 {
+		close(c.entered)
+	}
+	<-c.release
+}
 
 type sharedRangeFile struct {
 	item   *authoritypb.Item
@@ -446,6 +461,71 @@ func TestPFSFallocateMalformedSuccessfulPostStateFences(t *testing.T) {
 				t.Fatalf("malformed local result consumed response %d times after revocation, want once", consumption.calls.Load())
 			}
 		})
+	}
+}
+
+func TestPFSFallocateMalformedCleanupTransfersResponseBeforeTerminalTeardown(t *testing.T) {
+	fixture := newStrictFixture(t)
+	file := openSharedRangeFile(t, fixture, "file", 47, 147, 247)
+	// Drive teardown explicitly after callback cleanup has entered Consume. The
+	// production revoke schedules the same terminalizer, but pre-claiming its
+	// goroutine makes the disputed ownership interleaving deterministic.
+	fixture.mount.abort.Do(func() {})
+	consumption := &blockingResponseConsumption{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	fixture.rpc.retainedConsumption = consumption
+	fixture.rpc.replyOverride = func(*authoritypb.Request) (*authoritypb.Response, error) {
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
+				PostSize: 16, VisibilitySequence: 38, Flags: fuse.PFS_RANGE_OUT_APPLIED,
+			}},
+			PostState: testMutationPostState(&authoritypb.Attr{
+				Inode: 47, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 16,
+			}),
+		}, nil
+	}
+	status := make(chan fuse.Status, 1)
+	go func() {
+		status <- fixture.raw.PFSFallocate(nil, &fuse.PFSFallocateIn{
+			InHeader: fuse.InHeader{Unique: fixture.unique.Add(2), NodeId: file.nodeID},
+			Fh:       file.handle, Offset: 8, Length: 8, RlimitFsize: 64, FileMaxSize: 64,
+			Mode: uint32(unix.FALLOC_FL_INSERT_RANGE),
+		}, &fuse.PFSRangeOut{})
+	}()
+
+	select {
+	case <-consumption.entered:
+	case <-time.After(time.Second):
+		t.Fatal("malformed callback did not claim response consumption")
+	}
+	terminalDone := make(chan bool, 1)
+	go func() {
+		terminalDone <- fixture.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
+	}()
+	select {
+	case joined := <-terminalDone:
+		if !joined {
+			t.Fatal("terminal teardown did not settle the malformed publication")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal teardown attempted to consume the callback-owned response")
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("response consumption owners = %d, want callback only", got)
+	}
+	close(consumption.release)
+	select {
+	case got := <-status:
+		if got != fuse.Status(syscall.ENOTCONN) {
+			t.Fatalf("malformed successful PFS_FALLOCATE = %v, want ENOTCONN", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("malformed callback did not return after releasing response consumption")
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("settled response consumed %d times, want once", got)
 	}
 }
 

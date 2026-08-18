@@ -192,10 +192,16 @@ func retainAuthorityResponse(ctx context.Context, consumption authorityrpc.Respo
 		return nil
 	}
 	publication := replyPublicationFromContext(ctx)
-	if publication == nil {
+	if publication == nil || publication.owner == nil {
 		return errors.New("fusev3: authority response escaped its physical kernel reply lifecycle")
 	}
+	publication.owner.mu.Lock()
+	if publication.responseConsumptionOwner != responseConsumptionPublication {
+		publication.owner.mu.Unlock()
+		return errors.New("fusev3: authority response arrived after reply ownership transferred to settlement")
+	}
 	publication.responseConsumptions = append(publication.responseConsumptions, consumption)
+	publication.owner.mu.Unlock()
 	return nil
 }
 

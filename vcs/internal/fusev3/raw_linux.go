@@ -139,6 +139,19 @@ type cacheInstallReservation struct {
 	capacityReserved bool
 }
 
+type responseConsumptionOwnership uint8
+
+const (
+	responseConsumptionUnregistered responseConsumptionOwnership = iota
+	responseConsumptionPublication
+	responseConsumptionTransferred
+)
+
+type responseConsumptionClaim struct {
+	consumptions []authorityrpc.ResponseConsumption
+	done         chan struct{}
+}
+
 // replyDataPublication is one OPEN reply's declaration that this kernel may
 // retain the inode's file data. It carries the record as well as the inode
 // number because the withdrawal it obliges is addressed by kernel NodeID.
@@ -165,16 +178,19 @@ type replyPublication struct {
 	// kernel result is either physically published through PFS_PUBLISH or
 	// fail-closed locally. One FUSE callback may require several bounded read or
 	// staged-write RPCs, so this is deliberately a collection rather than one
-	// token.
-	responseConsumptions []authorityrpc.ResponseConsumption
-	postState            *authoritypb.PostState
-	expectedPostState    map[publicationIdentity]uint32
-	cacheStamp           *fuse.PFSCacheStamp
-	droppedAttrs         map[publicationIdentity]bool
-	dirPlus              []replyDirPlusPublication
-	dirPlusLookups       *dirPlusLookupTransaction
-	snapshotSequence     uint64
-	payloadError         error
+	// token. The slice and its ownership state are protected by rawFileSystem.mu
+	// after registration.
+	responseConsumptions     []authorityrpc.ResponseConsumption
+	responseConsumptionOwner responseConsumptionOwnership
+	responseConsumptionDone  chan struct{}
+	postState                *authoritypb.PostState
+	expectedPostState        map[publicationIdentity]uint32
+	cacheStamp               *fuse.PFSCacheStamp
+	droppedAttrs             map[publicationIdentity]bool
+	dirPlus                  []replyDirPlusPublication
+	dirPlusLookups           *dirPlusLookupTransaction
+	snapshotSequence         uint64
+	payloadError             error
 
 	// Generic post-VFS publication receipt state, protected by
 	// rawFileSystem.mu. The original response write signals originalDone and
@@ -201,10 +217,53 @@ func (p *replyPublication) empty() bool {
 }
 
 func (p *replyPublication) consumeAuthorityResponse() {
-	if p == nil {
+	if p == nil || p.owner == nil {
 		return
 	}
-	for _, consumption := range p.responseConsumptions {
+	p.owner.claimAndConsumeAuthorityResponses(p)
+}
+
+// takeAuthorityResponsesLocked is the sole handoff from reply ownership to a
+// settlement path. Clearing the retained slice is not an idempotence trick: it
+// records that callback cleanup, normal settlement, or teardown won exclusive
+// ownership of every response currently attached to this publication. A later
+// response cannot join a transferred publication.
+func (r *rawFileSystem) takeAuthorityResponsesLocked(publication *replyPublication) (responseConsumptionClaim, bool) {
+	if publication == nil || publication.owner != r || publication.responseConsumptionOwner != responseConsumptionPublication {
+		return responseConsumptionClaim{}, false
+	}
+	publication.responseConsumptionOwner = responseConsumptionTransferred
+	claim := responseConsumptionClaim{
+		consumptions: publication.responseConsumptions,
+		done:         publication.responseConsumptionDone,
+	}
+	publication.responseConsumptions = nil
+	return claim, true
+}
+
+func (r *rawFileSystem) claimAndConsumeAuthorityResponses(publication *replyPublication) {
+	r.mu.Lock()
+	claim, claimed := r.takeAuthorityResponsesLocked(publication)
+	done := publication.responseConsumptionDone
+	r.mu.Unlock()
+	if claimed {
+		consumeClaimedAuthorityResponses(claim)
+		return
+	}
+	// A competing settlement path already owns the responses. Callback cleanup
+	// still cannot return until that one owner has finished the terminal
+	// consumption promised by the authority-response lifecycle.
+	if done != nil {
+		<-done
+	}
+}
+
+func consumeClaimedAuthorityResponses(claim responseConsumptionClaim) {
+	if claim.done == nil {
+		return
+	}
+	defer close(claim.done)
+	for _, consumption := range claim.consumptions {
 		if consumption != nil {
 			consumption.Consume()
 		}
@@ -853,9 +912,10 @@ func (r *rawFileSystem) releaseReplyCapacityLocked(publication *replyPublication
 }
 
 type terminalReplyCompletion struct {
-	publication *replyPublication
-	dirPlus     dirPlusLookupCompletion
-	physical    bool
+	publication         *replyPublication
+	dirPlus             dirPlusLookupCompletion
+	responseConsumption responseConsumptionClaim
+	physical            bool
 }
 
 // terminalizeReplyCacheOwnership joins physical writer callbacks only until
@@ -957,11 +1017,12 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 			close(publication.originalDone)
 		}
 		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
-		r.settleReplyPublicationLocked(publication, physical)
+		responseConsumption := r.settleReplyPublicationLocked(publication, physical)
 		completions = append(completions, terminalReplyCompletion{
-			publication: publication,
-			dirPlus:     dirPlus,
-			physical:    physical,
+			publication:         publication,
+			dirPlus:             dirPlus,
+			responseConsumption: responseConsumption,
+			physical:            physical,
 		})
 	}
 	r.replyTerminal = true
@@ -980,7 +1041,7 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 		if completion.publication.source != nil {
 			completion.publication.source.revoke()
 		}
-		completion.publication.consumeAuthorityResponse()
+		consumeClaimedAuthorityResponses(completion.responseConsumption)
 	}
 	return true
 }
@@ -1355,7 +1416,7 @@ func (r *rawFileSystem) settleDataPublicationLocked(publication replyDataPublica
 	r.settleSourcePublicationLocked(publication.coordinate)
 }
 
-func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) {
+func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) responseConsumptionClaim {
 	// Failure before the physical edge and receipt settlement both pass here.
 	// The former still owns capacity; the latter finds it already consumed.
 	r.releaseReplyCapacityLocked(publication)
@@ -1376,6 +1437,8 @@ func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublicati
 		close(r.published)
 		r.published = make(chan struct{})
 	}
+	claim, _ := r.takeAuthorityResponsesLocked(publication)
+	return claim
 }
 
 func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *replyPublication) error {
@@ -1390,8 +1453,13 @@ func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *rep
 	if r.replyPublications[unique] != nil || r.publishAcks[unique] != nil {
 		return fmt.Errorf("fusev3: FUSE request identity %d registered publication twice", unique)
 	}
+	if publication == nil || publication.owner != nil || publication.responseConsumptionOwner != responseConsumptionUnregistered {
+		return errors.New("fusev3: reply publication reused response ownership")
+	}
 	publication.requestUnique = unique
 	publication.owner = r
+	publication.responseConsumptionOwner = responseConsumptionPublication
+	publication.responseConsumptionDone = make(chan struct{})
 	publication.originalDone = make(chan struct{})
 	r.replyPublications[unique] = publication
 	return nil
@@ -1718,7 +1786,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 			return
 		}
 		delete(r.replyPublications, publication.requestUnique)
-		r.settleReplyPublicationLocked(publication, status.Ok())
+		responseConsumption := r.settleReplyPublicationLocked(publication, status.Ok())
 		r.mu.Unlock()
 		if !status.Ok() {
 			r.finishOneShotWritePublication(publication)
@@ -1728,14 +1796,14 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 			if !r.mount.replyWriteLostAfterObservedUnmount(status) {
 				r.mount.revoke(fmt.Errorf("fusev3: write PFS_PUBLISH acknowledgment %d: %v", unique, status))
 			}
-			publication.consumeAuthorityResponse()
+			consumeClaimedAuthorityResponses(responseConsumption)
 			return
 		}
 		r.finishWriteTransactionPublication(publication, unique)
 		if publication.source != nil {
 			publication.source.release()
 		}
-		publication.consumeAuthorityResponse()
+		consumeClaimedAuthorityResponses(responseConsumption)
 		return
 	}
 	publication := r.replyPublications[unique]
@@ -1762,7 +1830,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		if publication.publishUnique != 0 && r.publishAcks[publication.publishUnique] == publication {
 			delete(r.publishAcks, publication.publishUnique)
 		}
-		r.settleReplyPublicationLocked(publication, false)
+		responseConsumption := r.settleReplyPublicationLocked(publication, false)
 		r.mu.Unlock()
 		r.finishDirPlusLookupCompletion(dirPlusCompletion)
 		r.finishOneShotWritePublication(publication)
@@ -1772,19 +1840,19 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		if !r.mount.replyWriteLostAfterObservedUnmount(status) {
 			r.mount.revoke(fmt.Errorf("fusev3: publish FUSE reply %d to the kernel: %v", unique, status))
 		}
-		publication.consumeAuthorityResponse()
+		consumeClaimedAuthorityResponses(responseConsumption)
 		return
 	}
 	if !publication.needsPostVFS {
 		delete(r.replyPublications, unique)
-		r.settleReplyPublicationLocked(publication, true)
+		responseConsumption := r.settleReplyPublicationLocked(publication, true)
 		r.mu.Unlock()
 		r.finishDirPlusLookupCompletion(dirPlusCompletion)
 		r.finishWriteTransactionPublication(publication, unique)
 		if publication.source != nil {
 			publication.source.release()
 		}
-		publication.consumeAuthorityResponse()
+		consumeClaimedAuthorityResponses(responseConsumption)
 		return
 	}
 	r.mu.Unlock()
