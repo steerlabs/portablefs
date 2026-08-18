@@ -510,20 +510,25 @@ The kernel processes an admitted trailer as one installation transaction:
    numeric order, including the parent inode for every entry candidate. Take a
    regular file's `mapping->invalidate_lock` exclusively only when the operation
    changes cached data or EOF.
-3. Under each target `fi->lock`, compare an attr record's `object_version` with
-   the target `fi->pfs_object_version`. Under the parent `fi->lock`, compare an
-   entry candidate's `snapshot_sequence` with the parent's
-   `fi->pfs_object_version`. Every namespace mutation changes the parent at the
-   same visibility sequence, so the parent stamp is the kernel's conservative
-   namespace-coordinate gate; a newer repair of another name may drop this
-   entry but can never admit stale state. A marked record, or a record not
-   strictly newer than its gate, makes no cache change. It is silently dropped
-   even when it came from the current mutation. These comparisons cover a peer
-   repair completed after daemon finalization but before the kernel lock was
-   acquired.
+3. Under each target `fi->lock`, compare an attr record's `object_version` only
+   with the target `fi->pfs_object_version`, which means the version of the
+   installed exact attribute record. Under the parent `fi->lock`, compare an
+   entry candidate's `snapshot_sequence` with
+   `max(fi->pfs_object_version, fi->pfs_entry_repair_sequence)`. The second
+   scalar is the independent namespace-repair gate: PFS_ENTRY advances it but
+   never advances `pfs_object_version`. A newer repair of another name may
+   therefore drop an entry but can never suppress installation of the exact
+   parent attr record carried by the same COMPLETE. A marked record, or a
+   record not strictly newer than its gate, makes no cache change. It is
+   silently dropped even when it came from the current mutation. These
+   comparisons cover a peer repair completed after daemon finalization but
+   before the kernel lock was acquired.
 4. Install every eligible `fuse_attr` field, `i_size`, inode class, cached ACL
-   decision, admitted lifetime, birth time, and masked statx attribute word.
-   Only IMMUTABLE and APPEND project into VFS `i_flags`; `statx(2)` returns the
+   decision, birth time, and masked statx attribute word, then publish the
+   admitted attr-valid lifetime last with release ordering. A cached validity
+   check reads that deadline with acquire ordering, so observing the new
+   deadline cannot validate fields from before the install. Only IMMUTABLE and
+   APPEND project into VFS `i_flags`; `statx(2)` returns the
    complete raw masked word retained by the stamped record. Still under
    `fi->lock`, set
    `fi->attr_version = atomic64_inc_return(&fc->attr_version)` and then set
@@ -625,7 +630,9 @@ COMPLETE visibility sequence. A changed object has that COMPLETE sequence;
 an unchanged object in a namespace-only outcome retains its already-exact older
 version. A DATA target's `Attr.size` is its authoritative post-mutation EOF.
 After DATA dominance normalization, one COMPLETE carries at most four such
-records. Missing, extra, mismatched, or duplicate records are an authority
+records. Every retained changed `ObjectPostState` record has a matching
+normalized DATA or ATTRIBUTES target; DATA is required only where data may have
+changed. Missing, extra, mismatched, or duplicate records are an authority
 protocol error and fence the participant; a frontend never repairs attributes
 from retained bytes or a second snapshot.
 
@@ -633,22 +640,29 @@ PFS_ATTR takes the inode's `pfs_publish_mutex`, validates the complete object
 record and, under `fi->lock`, installs every `fuse_attr` field, `i_size`, exact
 birth time, raw masked statx attribute word, projected IMMUTABLE/APPEND state,
 `fi->attr_version`, and `fi->pfs_object_version` exactly as a stamped GETATTR
-reply does. A genuinely older record is a silent age drop; an equal record is
-an idempotent success. The transition is from the prior exact record directly
-to the new exact record: there is no inexact interval and no retained stale
-mode, owner, group, or enforcement field for a VFS, LSM, audit, or coredump
-consumer to observe. ACLs are forgotten before publication of the new record.
+reply does. It publishes the attr-cache validity deadline last with release
+ordering; a cached validity check loads that deadline with acquire ordering.
+A genuinely older record is a silent age drop; an equal record is an idempotent
+success. Each field store is individually atomic, and after installation there
+is no retained-stale interval. As with a local filesystem's concurrent setattr,
+a multi-field reader overlapping the bounded install window may observe a mix
+of the prior and new fields; this protocol does not add a record-wide reader
+lock that local filesystems do not provide. In particular, a reader that sees
+the newly published validity deadline cannot validate fields from before the
+install. ACLs are forgotten before publication of the new record.
 
 PFS_ENTRY remains stamp-only. It takes the parent's `pfs_publish_mutex`,
 performs the expire or delete repair, calls
 `inode_maybe_inc_iversion(parent, false)`, and under the parent `fi->lock`
-increments `fi->attr_version` and applies the same object-version stamp. That
-parent stamp is checked against every later positive or negative entry's
-`snapshot_sequence` as specified in section 2.3. The stamp is installed even
-when the named dentry is absent. Every namespace COMPLETE whose parent is live
-therefore sends PFS_ENTRY unconditionally. When no exact cached child is known,
-it sends EXPIRE with `child == 0` solely to expire the name and advance the
-parent stamp; registry absence never suppresses this gate. A notification
+increments `fi->attr_version` and advances only
+`fi->pfs_entry_repair_sequence`; it never changes `fi->pfs_object_version`.
+Every later positive or negative entry compares its `snapshot_sequence` with
+the maximum of those two independent gates as specified in section 2.3. The
+entry-repair stamp is installed even when the named dentry is absent. Every
+namespace COMPLETE whose parent is live therefore sends PFS_ENTRY
+unconditionally. When no exact cached child is known, it sends EXPIRE with
+`child == 0` solely to expire the name and advance the entry-repair stamp;
+registry absence never suppresses this gate. A notification
 returns success only after the cache action and stamp are complete; only then
 may portablefsd advance its map and send peer COMPLETE.
 
