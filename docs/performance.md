@@ -288,9 +288,11 @@ completion boundary. Benchmarks must identify which syscall boundary they time.
 **Names and attributes are coherently cached, and mutation pays for it.** The
 single protocol lets repeated path walks be served from the kernel without an
 authority lookup. The bill arrives on the other side: a cache-affecting mutation
-takes a volume-wide visibility ticket, holds the source's exact local
+holds its stable-identity dependency set and the source's exact local
 publication footprint, quiesces affected non-source cache holders, applies to
 XFS, drives each peer's repair, and collects acknowledgements before it returns.
+Mutations that share an inode, directory, or binding remain ordered; disjoint
+sets can execute concurrently and do not inherit one another's repair latency.
 With one mount attached there is no network visibility phase. With several, a
 mutation that overlaps an actively caching peer costs a PREPARE and COMPLETE
 round trip to the slowest such participant; exact semantics cannot remove those

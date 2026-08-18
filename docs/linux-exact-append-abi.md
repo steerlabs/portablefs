@@ -274,8 +274,8 @@ ONE_SHOT.
 BEGIN and DATA do not acquire the source visibility gate and cannot expose
 partial data.  COMMIT acquires the source gate only after prior peer phases have
 drained, performs one PREPARE/apply/COMPLETE authority mutation, and retains the
-gate through generic PUBLISH.  This avoids holding the peer FIFO during large
-payload upload.
+gate through generic PUBLISH. This avoids holding the inode dependency and a
+participant's ordered visibility lane during large payload upload.
 
 The kernel fragments one Linux `write_iter` without splitting its authority
 mutation.  DATA replay at an already staged offset must match byte-for-byte.
@@ -490,10 +490,11 @@ the source gate waiting for `inode_lock`.
 ### Why source SETATTR/O_TRUNC needs no new sequence in its stock reply
 
 All lower overlapping peer COMPLETE notifications are physically applied and
-ACKed before the source receives the visibility FIFO.  Every later overlapping
-peer PREPARE waits behind the retained source gate until generic PUBLISH and has
-a higher sequence.  Therefore no legal lower notification can arrive after the
-source kernel update.  The next legal DATA notification is higher and applies.
+ACKed before the source acquires its inode dependency. Every later overlapping
+peer PREPARE waits behind the retained source gate and inode key until generic
+PUBLISH, and has a higher sequence. Therefore no legal lower notification can
+arrive after the source kernel update. The next legal DATA notification is
+higher and applies.
 Transactional PFS_WRITE still carries its exact sequence because its private
 COMMIT directly updates the sequence-tracked local state.
 
@@ -660,12 +661,13 @@ re-enabling a stock bypass.
 
 ## Lock/order proof
 
-The daemon's coordinate admission/FIFO is the distributed serialization lock.
-BEGIN/DATA are inert and hold no FIFO. COMMIT and ONE_SHOT obtain the FIFO after
-older peer COMPLETEs, apply once, and retain it. Kernel postprocessing uses the
-per-inode publication mutex and mapping invalidate lock, not `inode_lock`.
-PUBLISH ACK then releases the FIFO.  A newer peer PREPARE cannot enter before
-that ACK.
+The authority's stable-inode dependency key and the daemon's matching
+per-inode publication mutex are the distributed serialization lock. BEGIN/DATA
+are inert and own no mutation key. COMMIT and ONE_SHOT acquire the inode key
+after older overlapping peer COMPLETEs, apply once, and retain it. Kernel
+postprocessing uses the publication mutex and mapping invalidate lock, not
+`inode_lock`. PUBLISH ACK then releases the source gate. A newer PREPARE for the
+same inode cannot enter before that ACK; a disjoint inode is independent.
 
 No synchronous PUBLISH is sent from a FUSE async completion callback; that
 would deadlock the daemon writer's reply mutex.  Strict transactional write is
