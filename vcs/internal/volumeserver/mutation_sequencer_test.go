@@ -27,6 +27,23 @@ func waitForMutationSequencerQueue(t *testing.T, sequencer *mutationSequencer, w
 	}
 }
 
+func waitForVisibilityLaneWaiters(t *testing.T, coordinator *VisibilityCoordinator, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		coordinator.mu.Lock()
+		got := len(coordinator.laneWaiters)
+		coordinator.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("visibility lane waiters = %d, want %d", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestMutationSequencerGrantsDisjointSetAlongsideOwner(t *testing.T) {
 	sequencer := newMutationSequencer()
 	owner, err := sequencer.acquire(t.Context(), testInodeDependencies(1))
