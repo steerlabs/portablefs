@@ -64,7 +64,7 @@ func startCredentialRenewal(session authorizedSession, capabilityFile string, at
 	}
 	renewer := &mountenrollment.Renewer{
 		Source:  source,
-		Observe: func(status mountenrollment.RenewalStatus) { logRenewalStatus(sessionID, status) },
+		Observe: func(event mountenrollment.RenewalEvent) { logRenewalEvent(sessionID, event) },
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	renewal := &credentialRenewal{failed: make(chan error, 1), stop: cancel, done: make(chan struct{})}
@@ -94,20 +94,29 @@ func (renewal *credentialRenewal) Close() {
 	<-renewal.done
 }
 
-// logRenewalStatus is this mount's whole renewal interface to its operator: the
+// logRenewalEvent is this mount's whole renewal interface to its operator: the
 // session and sequence the next capability must be minted for, and the instant
 // after which no capability can save this mount.
-func logRenewalStatus(sessionID string, status mountenrollment.RenewalStatus) {
+func logRenewalEvent(sessionID string, event mountenrollment.RenewalEvent) {
+	status := event.Status
 	deadline := status.AuthorizationDeadline.UTC().Format(time.RFC3339)
-	switch {
-	case !status.LastSuccess.IsZero():
+	switch event.Kind {
+	case mountenrollment.RenewalSucceeded:
 		log.Printf("session %s reauthorized through sequence %d; authorization deadline %s", sessionID, status.Sequence, deadline)
-	case status.ConsecutiveFailures != 0:
+	case mountenrollment.RenewalRetrying:
 		log.Printf("session %s sequence %d not installed after %d attempt(s) (%s); retrying at %s, authorization deadline %s",
 			sessionID, status.Sequence, status.ConsecutiveFailures, status.LastError,
 			status.NextAttempt.UTC().Format(time.RFC3339), deadline)
-	default:
+	case mountenrollment.RenewalScheduled:
 		log.Printf("session %s awaits capability sequence %d at %s; authorization deadline %s",
 			sessionID, status.Sequence, status.NextAttempt.UTC().Format(time.RFC3339), deadline)
+	case mountenrollment.RenewalDenied, mountenrollment.RenewalCutoff:
+		log.Printf("session %s renewal ended at sequence %d (%s); authorization deadline %s",
+			sessionID, status.Sequence, status.LastError, deadline)
+	case mountenrollment.RenewalStopped:
+		log.Printf("session %s renewal stopped at sequence %d; authorization deadline %s", sessionID, status.Sequence, deadline)
+	default:
+		log.Printf("session %s emitted unknown renewal event %q at sequence %d; authorization deadline %s",
+			sessionID, event.Kind, status.Sequence, deadline)
 	}
 }
