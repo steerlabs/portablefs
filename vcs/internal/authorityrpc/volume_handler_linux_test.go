@@ -991,6 +991,11 @@ func (s *fsyncMetricStore) FsyncCoalesced(xfsstore.Capability, bool) (int, error
 	return s.batch, nil
 }
 
+// CloseOpen must exist on the mock itself: the harness fences the session at
+// cleanup, which closes every tracked open, and the embedded volumeStore
+// interface is deliberately nil.
+func (s *fsyncMetricStore) CloseOpen(xfsstore.Capability) error { return nil }
+
 // renameReplyStore is an in-memory namespace only for exercising the
 // authority's response contract. The source frontend is deliberately absent:
 // the post identities must come from the authoritative pre-XFS lookup, never
