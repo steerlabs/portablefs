@@ -24,6 +24,43 @@ type testVariableReplyLifecycle struct {
 	prepared chan struct{}
 }
 
+type lookupLifecycleFileSystem struct {
+	RawFileSystem
+	status Status
+}
+
+func (f *lookupLifecycleFileSystem) Lookup(_ <-chan struct{}, _ *InHeader, _ string, out *EntryOut) Status {
+	*out = EntryOut{}
+	return f.status
+}
+
+type lookupReplyLifecycle struct {
+	ordered     bool
+	marked      bool
+	payloadSize int
+	markerCalls atomic.Int32
+	written     chan Status
+}
+
+func (l *lookupReplyLifecycle) PrepareReplyPayload(_ uint64, _ uint64, _ uint32, _ []byte, payload []byte, _ int) (int, Status) {
+	if l.payloadSize < 0 || l.payloadSize > len(payload) {
+		return 0, EIO
+	}
+	clear(payload[:l.payloadSize])
+	return l.payloadSize, OK
+}
+
+func (l *lookupReplyLifecycle) ReplyWriteOrdered(uint64) bool { return l.ordered }
+
+func (l *lookupReplyLifecycle) ReplyPublishMarked(uint64, uint64, uint32) bool {
+	l.markerCalls.Add(1)
+	return l.marked
+}
+
+func (l *lookupReplyLifecycle) ReplyWritten(_ uint64, status Status) {
+	l.written <- status
+}
+
 func (l *testVariableReplyLifecycle) PrepareReplyPayload(_ uint64, _ uint64, _ uint32, _ []byte, payload []byte, priorSize int) (int, Status) {
 	if priorSize != 0 || len(payload) < 5 {
 		return 0, EIO
@@ -77,6 +114,83 @@ func TestPhysicalReplySerializesPublicationMarkerAfterLifecycleDecision(t *testi
 	}
 	if got, want := req.outHeader().Unique, header.Unique|PFS_UNIQUE_PUBLISH; got != want {
 		t.Fatalf("physical reply unique = %#x, want marked %#x", got, want)
+	}
+}
+
+func TestLookupCallbackStatusControlsPhysicalPublicationLifecycle(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		callback       Status
+		local          bool
+		ordered        bool
+		marked         bool
+		payloadSize    int
+		wantMarker     int32
+		wantDataSize   int
+		wantWireStatus int32
+	}{
+		{name: "local structured negative", callback: OK, local: true, wantMarker: 1, wantDataSize: int(unsafe.Sizeof(EntryOut{}))},
+		{name: "shared structured negative", callback: OK, ordered: true, marked: true, payloadSize: PFSCacheStampSize, wantMarker: 1, wantDataSize: int(unsafe.Sizeof(EntryOut{}))},
+		{name: "errno negative", callback: ENOENT, wantDataSize: 0, wantWireStatus: -int32(ENOENT)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := make([]byte, unsafe.Sizeof(InHeader{}))
+			header := (*InHeader)(unsafe.Pointer(&input[0]))
+			header.Unique, header.NodeId, header.Opcode = 52, FUSE_ROOT_ID, _OP_LOOKUP
+			req := &request{
+				inputBuf: input, inPayload: []byte("missing\x00"),
+				outHeaderBuf:  make([]byte, sizeOfOutHeader),
+				outDataBuf:    make([]byte, unsafe.Sizeof(EntryOut{})),
+				outPayload:    make([]byte, 0, PFSCacheStampSize),
+				variableReply: true, status: OK,
+			}
+			protocol := &protocolServer{fileSystem: &lookupLifecycleFileSystem{
+				RawFileSystem: NewDefaultRawFileSystem(), status: test.callback,
+			}}
+			doLookup(protocol, req)
+			if req.status != test.callback {
+				t.Fatalf("callback status = %v, want %v", req.status, test.callback)
+			}
+
+			lifecycle := &lookupReplyLifecycle{
+				ordered: test.ordered, marked: test.marked, payloadSize: test.payloadSize,
+				written: make(chan Status, 1),
+			}
+			server := &Server{replyWriteLifecycle: lifecycle}
+			status := runReplyWriteLifecycle(lifecycle, header.Unique, &server.writeMu, func() Status {
+				return server.prepareReplyForWrite(req)
+			})
+			if !status.Ok() {
+				t.Fatalf("physical lifecycle = %v", status)
+			}
+			if calls := lifecycle.markerCalls.Load(); calls != test.wantMarker {
+				t.Fatalf("marker calls = %d, want %d", calls, test.wantMarker)
+			}
+			if got := len(req.outDataBuf); got != test.wantDataSize {
+				t.Fatalf("structured data bytes = %d, want %d", got, test.wantDataSize)
+			}
+			if got := req.outHeader().Status; got != test.wantWireStatus {
+				t.Fatalf("wire status = %d, want %d", got, test.wantWireStatus)
+			}
+			wantUnique := header.Unique
+			if test.marked {
+				wantUnique |= PFS_UNIQUE_PUBLISH
+			}
+			if got := req.outHeader().Unique; got != wantUnique {
+				t.Fatalf("wire unique = %#x, want %#x", got, wantUnique)
+			}
+			if test.ordered {
+				if got := <-lifecycle.written; !got.Ok() {
+					t.Fatalf("ReplyWritten = %v", got)
+				}
+			} else {
+				select {
+				case got := <-lifecycle.written:
+					t.Fatalf("unordered reply produced ReplyWritten(%v)", got)
+				default:
+				}
+			}
+		})
 	}
 }
 
