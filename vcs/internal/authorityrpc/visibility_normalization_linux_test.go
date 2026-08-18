@@ -22,6 +22,10 @@ func normalizationCoordinate(fill byte, inode uint64) visibilityCoordinate {
 	return visibilityCoordinate{identity: [16]byte{fill}, ino: inode, device: normalizationDevice}
 }
 
+func normalizationSourceCoordinate(root xfsstore.Capability) visibilityCoordinate {
+	return visibilityCoordinate{identity: [16]byte{root[0]}, ino: uint64(root[0]), device: 1}
+}
+
 func normalizationSetXattrRequest(root xfsstore.Capability) *authoritypb.Request {
 	identity := [16]byte{root[0]}
 	return &authoritypb.Request{
@@ -339,7 +343,11 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	coordinate := normalizationCoordinate(9, 909)
+	root := xfsstore.Capability{1}
+	// The sequencer requires PREPARE to be covered by the request's independently
+	// declared source gate. Model the SETXATTR target with the same coordinate the
+	// store returns instead of an unrelated synthetic inode identity.
+	coordinate := normalizationSourceCoordinate(root)
 	visibility.RecordResolvedInode(observer.ID, coordinate.identity)
 	prepareData := inodeTarget(volumeserver.VisibilityData, coordinate, 100)
 	completeData := inodeTarget(volumeserver.VisibilityData, coordinate, 200)
@@ -349,7 +357,6 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 	h.Store = &resourceAdmissionFaultStore{}
 	h.Runtime = runtime
 	h.Visibility = visibility
-	root := xfsstore.Capability{1}
 	if err := h.startSessionResources(source.ID, root, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
 		t.Fatal(err)
 	}
@@ -400,10 +407,12 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 }
 
 func TestMutateVisibleFailsClosedAroundNormalizationDefects(t *testing.T) {
-	coordinate := normalizationCoordinate(10, 1010)
+	// These targets must use the SETXATTR fixture's source identity. Otherwise
+	// dependency coverage rejects them before apply and the table cannot test the
+	// pre- versus post-apply normalization boundary it is about.
+	coordinate := normalizationSourceCoordinate(xfsstore.Capability{1})
 	data := inodeTarget(volumeserver.VisibilityData, coordinate, 100)
 	attributes := inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)
-
 	tests := []struct {
 		name          string
 		prepare       []volumeserver.VisibilityTarget
@@ -463,7 +472,7 @@ func TestMutateVisibleFailsClosedAroundNormalizationDefects(t *testing.T) {
 }
 
 func TestMutateVisiblePreservesNilCompletionAsNoVisibleChange(t *testing.T) {
-	coordinate := normalizationCoordinate(16, 1616)
+	coordinate := normalizationSourceCoordinate(xfsstore.Capability{1})
 	data := inodeTarget(volumeserver.VisibilityData, coordinate, 100)
 	h, credential, request := newCoherentNormalizationMutation(t, "authority-target-normalization-nil")
 	response := h.mutateVisible(context.Background(), request, credential,

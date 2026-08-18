@@ -1560,8 +1560,16 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 	if response := <-mutationResult; response.GetErrno() != 0 {
 		t.Fatalf("namespace mutation = %+v", response)
 	}
-	if calls := store.lookupCalls.Load(); calls != 2 {
-		t.Fatalf("namespace binding lookups = %d, want initial declaration plus one version-triggered refresh", calls)
+	// The first post-wait lookup discovers that the binding moved from oldBinding
+	// to newBinding, but the turn still owns the old inode dependency. Requeueing
+	// is all-or-nothing and must release that set before acquiring newBinding; an
+	// older mutation of the newly discovered inode can pass in that interval. The
+	// final lookup runs with the corrected name and inode set held, preserving the
+	// resolution context's coordinate and size rather than trusting pre-acquisition
+	// metadata. The global FIFO needed only two lookups because its turn already
+	// excluded every inode mutation; dependency sequencing deliberately needs three.
+	if calls := store.lookupCalls.Load(); calls != 3 {
+		t.Fatalf("namespace binding lookups = %d, want declaration, version refresh, and post-requeue proof", calls)
 	}
 
 	newIdentity := [16]byte{newBinding[0]}
