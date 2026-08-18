@@ -1268,8 +1268,9 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		if len(publication.attrs) != 0 && attrDropped[publication.attrs[0].identity] {
 			zeroAttrLifetime(opcode, outData)
 		}
-		binary.LittleEndian.PutUint64(payload[0:8], publication.cacheStamp.SnapshotSequence)
-		binary.LittleEndian.PutUint64(payload[8:16], publication.cacheStamp.ObjectVersion)
+		if !fuse.EncodePFSCacheStamp(payload, publication.cacheStamp) {
+			return 0, fuse.EIO
+		}
 		return fuse.PFSCacheStampSize, fuse.OK
 	}
 	if publication.postState == nil {
@@ -1301,19 +1302,22 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 			r.mu.Unlock()
 			return 0, fuse.EIO
 		}
-		encoded := payload[offset : offset+fuse.PFSObjectStateSize]
-		binary.LittleEndian.PutUint64(encoded[0:8], record.id)
-		binary.LittleEndian.PutUint64(encoded[8:16], object.GetObjectVersion())
-		copy(encoded[16:32], object.GetStableIdentity())
 		var attr fuse.Attr
 		fillAttr(object.GetAttr(), &attr, r.mount.uid, r.mount.gid)
-		encodeFuseAttr(encoded[32:120], &attr)
-		binary.LittleEndian.PutUint32(encoded[120:124], object.GetRoles())
-		binary.LittleEndian.PutUint32(encoded[124:128], object.GetAttr().GetFlags())
-		binary.LittleEndian.PutUint64(encoded[128:136], uint64(object.GetAttr().GetBirthTimeNs()))
-		binary.LittleEndian.PutUint32(encoded[136:140], 1)
+		var wireAttr [fuse.PFSWireAttrSize]byte
+		encodeFuseAttr(wireAttr[:], &attr)
+		wireObject := &fuse.PFSObjectState{
+			Nodeid: record.id, ObjectVersion: object.GetObjectVersion(), Attr: wireAttr,
+			Roles: object.GetRoles(), InodeFlags: object.GetAttr().GetFlags(),
+			BirthTimeNS: object.GetAttr().GetBirthTimeNs(), PFSClass: 1,
+		}
+		copy(wireObject.StableIdentity[:], object.GetStableIdentity())
 		if attrDropped[identity] {
-			binary.LittleEndian.PutUint32(encoded[140:144], 1)
+			wireObject.RecordFlags = 1
+		}
+		if !fuse.EncodePFSObjectState(payload[offset:offset+fuse.PFSObjectStateSize], wireObject) {
+			r.mu.Unlock()
+			return 0, fuse.EIO
 		}
 		offset += fuse.PFSObjectStateSize
 	}
@@ -2972,6 +2976,8 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		fillAttr(item.GetAttr(), &entryOut.Attr, r.mount.uid, r.mount.gid)
 		stamp.SnapshotSequence = dirent.GetSnapshotSequence()
 		stamp.ObjectVersion = dirent.GetObjectVersion()
+		stamp.BirthTimeNS = item.GetAttr().GetBirthTimeNs()
+		stamp.InodeFlags = item.GetAttr().GetFlags()
 		candidates = append(candidates, dirPlusCandidate{entry: entryOut, dirent: dirent, record: record})
 		handle.consumePlus()
 		if handle.authorityPageExhausted() {

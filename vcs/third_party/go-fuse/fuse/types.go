@@ -956,9 +956,10 @@ type PFSRangeOut struct {
 const (
 	PFSPostStateMaxObjects = 4
 	PFSPostStateHeaderSize = 32
+	PFSWireAttrSize        = 88
 	PFSObjectStateSize     = 144
 	PFSPostStateMaxSize    = PFSPostStateHeaderSize + PFSPostStateMaxObjects*PFSObjectStateSize
-	PFSCacheStampSize      = 16
+	PFSCacheStampSize      = 32
 )
 
 // PFSPostStateHeader and PFSObjectState are the variable trailer appended to
@@ -976,7 +977,7 @@ type PFSObjectState struct {
 	Nodeid         uint64
 	ObjectVersion  uint64
 	StableIdentity [16]byte
-	Attr           Attr
+	Attr           [PFSWireAttrSize]byte
 	Roles          uint32
 	InodeFlags     uint32
 	BirthTimeNS    int64
@@ -987,6 +988,9 @@ type PFSObjectState struct {
 type PFSCacheStamp struct {
 	SnapshotSequence uint64
 	ObjectVersion    uint64
+	BirthTimeNS      int64
+	InodeFlags       uint32
+	Reserved         uint32
 }
 
 // PFSPublishIn is the kernel's local-only post-VFS publication receipt. The
