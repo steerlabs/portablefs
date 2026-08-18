@@ -140,6 +140,12 @@ extension PfsLocalMockDaemonTests {
         try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
     }
 
+    contract = v3Contract()
+    contract.authorityProtocolMajor = 6
+    #expect(throws: PfsMacOSCoherenceError.exactVNextFSKitUnavailable(6)) {
+        try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
+    }
+
     contract = v3Contract(epoch: Data(repeating: 1, count: 15))
     #expect(throws: PfsMacOSCoherenceError.invalidEpochLength(15)) {
         try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
