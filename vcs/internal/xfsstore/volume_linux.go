@@ -1537,36 +1537,10 @@ func (v *Volume) Fallocate(id Capability, spec FallocateSpec) (Attr, error) {
 	return post, nil
 }
 
-func lockCopyMutation(v *Volume, source, destination [16]byte) func() {
-	sourceStripe := inodeMutationStripe(source)
-	destinationStripe := inodeMutationStripe(destination)
-	if sourceStripe == destinationStripe {
-		lock := &v.inodeMutation[sourceStripe]
-		lock.Lock()
-		return lock.Unlock
-	}
-	sourceLock := &v.inodeMutation[sourceStripe]
-	destinationLock := &v.inodeMutation[destinationStripe]
-	if sourceStripe < destinationStripe {
-		sourceLock.Lock()
-		destinationLock.Lock()
-		return func() {
-			destinationLock.Unlock()
-			sourceLock.Unlock()
-		}
-	}
-	destinationLock.Lock()
-	sourceLock.Lock()
-	return func() {
-		sourceLock.Unlock()
-		destinationLock.Unlock()
-	}
-}
-
 // CopyFileRange performs one server-side copy without a userspace splice or
-// payload round trip. The canonical lock order prevents reverse-direction
-// copies from deadlocking. Writer locks for both source and destination ensure
-// their complete post-state belongs to one authority ordering interval.
+// payload round trip. Its authority caller owns the canonical LockMutation set
+// for both resolved identities through this syscall and both post-state
+// samples, so the complete record belongs to one authority ordering interval.
 func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec) (uint64, Attr, error) {
 	if spec.Length == 0 || spec.InputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.InputOffset ||
 		spec.OutputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.OutputOffset ||

@@ -202,10 +202,6 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if err != nil {
 			return nil, err
 		}
-		releaseMutation, err = lockMutationStore(h.Store, sourceCoordinate.identity, destinationCoordinate.identity)
-		if err != nil {
-			return nil, err
-		}
 		source, err := h.Store.CoordinateOpen(input)
 		if err == nil {
 			var destination xfsstore.ObjectCoordinate
@@ -215,6 +211,10 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 				destinationCoordinate = rangeCoordinate(destination)
 			}
 		}
+		if err != nil {
+			return nil, err
+		}
+		releaseMutation, err = lockMutationStore(h.Store, sourceCoordinate.identity, destinationCoordinate.identity)
 		if err != nil {
 			return nil, err
 		}
