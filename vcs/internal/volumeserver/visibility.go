@@ -11,10 +11,12 @@ import (
 	"time"
 )
 
-// VisibilityRetryError identifies the exact peer phase a Linux mutation must
-// wait behind. Sequence is mandatory: DATA and CONTROL are
-// independent transport lanes, so the frontend cannot infer which repair made
-// this definite-preapply handoff necessary from arrival order.
+// VisibilityRetryError identifies the exact peer phase a Linux callback must
+// wait behind. It covers both definite-preapply mutation handoff and a read
+// which must withdraw before its participant can acknowledge PREPARE. Sequence
+// is mandatory: DATA and CONTROL are independent transport lanes, so the
+// frontend cannot infer which repair made the handoff necessary from arrival
+// order.
 type VisibilityRetryError struct {
 	Sequence uint64
 }
@@ -2247,8 +2249,9 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			// is therefore draining a different PREPARE, and waiting for an
 			// out-of-audience state would close a cross-mount Ack cycle. Do not add
 			// any resolution to the monotone index: the caller must discard the read.
+			sequence := p.pending.event.Cursor.Sequence
 			c.mu.Unlock()
-			return true, nil
+			return true, &VisibilityRetryError{Sequence: sequence}
 		}
 		done := blocked.done
 		c.mu.Unlock()

@@ -242,6 +242,21 @@ type recordingResponseConsumption struct{ calls atomic.Int32 }
 
 func (r *recordingResponseConsumption) Consume() { r.calls.Add(1) }
 
+type notifyingResponseConsumption struct {
+	calls    atomic.Int32
+	once     sync.Once
+	consumed chan struct{}
+}
+
+func newNotifyingResponseConsumption() *notifyingResponseConsumption {
+	return &notifyingResponseConsumption{consumed: make(chan struct{})}
+}
+
+func (r *notifyingResponseConsumption) Consume() {
+	r.calls.Add(1)
+	r.once.Do(func() { close(r.consumed) })
+}
+
 func (f *fakeRPC) dispatch(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	f.mu.Lock()
 	f.calls++
@@ -1511,44 +1526,133 @@ func TestSyncFSPropagatesDefiniteErrorAndRejectsMalformedSuccess(t *testing.T) {
 	})
 }
 
-func TestLinuxFrontendRejectsItemRetryOutsideItemMutation(t *testing.T) {
-	t.Run("ungated mutation", func(t *testing.T) {
-		frontend, mount, rpc := testRawFileSystem(t, 8)
-		rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-			if request.GetSyncFs() == nil {
-				return nil, errors.New("unexpected request in ungated item-retry test")
-			}
-			return &authoritypb.Response{
-				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
-				VisibilityRetrySequence: 1,
-			}, nil
+func TestLinuxFrontendRejectsVisibilityRetryForUngatedMutation(t *testing.T) {
+	frontend, mount, rpc := testRawFileSystem(t, 8)
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetSyncFs() == nil {
+			return nil, errors.New("unexpected request in ungated mutation-retry test")
 		}
-		if status := frontend.SyncFS(nil, &fuse.SyncFSIn{InHeader: fuse.InHeader{
-			Unique: nextTestRequestUnique(), NodeId: fuse.FUSE_ROOT_ID,
-		}}); status != fuse.EIO || !mount.isRevoked() {
-			t.Fatalf("ungated item retry = %v, revoked=%t fatal=%v", status, mount.isRevoked(), mount.fatalError())
-		}
-	})
+		return &authoritypb.Response{
+			Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
+			VisibilityRetrySequence: 1,
+		}, nil
+	}
+	if status := frontend.SyncFS(nil, &fuse.SyncFSIn{InHeader: fuse.InHeader{
+		Unique: nextTestRequestUnique(), NodeId: fuse.FUSE_ROOT_ID,
+	}}); status != fuse.EIO || !mount.isRevoked() {
+		t.Fatalf("ungated mutation retry = %v, revoked=%t fatal=%v", status, mount.isRevoked(), mount.fatalError())
+	}
+}
 
-	t.Run("read-only request", func(t *testing.T) {
-		f := newStrictFixture(t)
-		entry := f.lookup(t, fuse.FUSE_ROOT_ID, "read-retry")
-		f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-			if request.GetGetAttr() == nil {
-				return nil, errors.New("unexpected request in read item-retry test")
+func TestReadVisibilityRetryRequestAudit(t *testing.T) {
+	tests := []struct {
+		name    string
+		request *authoritypb.Request
+		want    bool
+	}{
+		{name: "getattr", request: &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{}}}, want: true},
+		{name: "read", request: &authoritypb.Request{Body: &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{}}}, want: true},
+		{name: "readlink", request: &authoritypb.Request{Body: &authoritypb.Request_Readlink{Readlink: &authoritypb.ReadlinkRequest{}}}, want: true},
+		{name: "getxattr", request: &authoritypb.Request{Body: &authoritypb.Request_GetXattr{GetXattr: &authoritypb.GetXattrRequest{}}}, want: true},
+		{name: "listxattr", request: &authoritypb.Request{Body: &authoritypb.Request_ListXattr{ListXattr: &authoritypb.ListXattrRequest{}}}, want: true},
+		{name: "lookup uses authority-local reread", request: &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}},
+		{name: "readdir uses authority-local reread", request: &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{}}}},
+		{name: "fsync does not stabilize", request: &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{}}}},
+		{name: "empty request", request: &authoritypb.Request{}},
+		{name: "nil request"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := readRequestSupportsVisibilityRetry(test.request); got != test.want {
+				t.Fatalf("readRequestSupportsVisibilityRetry() = %t, want %t", got, test.want)
 			}
+		})
+	}
+}
+
+func TestLinuxFrontendRetriesGetattrVisibilityRaceWithoutLeakingErrno(t *testing.T) {
+	f := newStrictFixture(t)
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "read-retry")
+	retryConsumption := newNotifyingResponseConsumption()
+	resultConsumption := &recordingResponseConsumption{}
+	f.rpc.retainedConsumptions = []authorityrpc.ResponseConsumption{retryConsumption, resultConsumption}
+	var calls atomic.Int32
+	repaired := make(chan struct{})
+	go func() {
+		<-retryConsumption.consumed
+		f.raw.mu.Lock()
+		f.raw.completedVisibilitySequence = 17
+		close(repaired)
+		f.raw.signalSourceChangedLocked()
+		f.raw.mu.Unlock()
+	}()
+	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetGetAttr() == nil {
+			return nil, errors.New("unexpected request in read visibility-retry test")
+		}
+		if calls.Add(1) == 1 {
 			return &authoritypb.Response{
 				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
-				VisibilityRetrySequence: 1,
+				VisibilityRetrySequence: 17,
 			}, nil
 		}
-		status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{
-			Unique: nextTestRequestUnique(), NodeId: entry.NodeId,
-		}}, &fuse.AttrOut{})
-		if status != fuse.Status(syscall.ENOTCONN) || !f.mount.isRevoked() {
-			t.Fatalf("read-only item retry = %v, revoked=%t fatal=%v", status, f.mount.isRevoked(), f.mount.fatalError())
+		select {
+		case <-repaired:
+		default:
+			return nil, errors.New("getattr was reissued before the pending repair completed")
 		}
-	})
+		attr := proto.Clone(f.rpc.item.GetAttr()).(*authoritypb.Attr)
+		attr.Size = 4096
+		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: attr}}}, nil
+	}
+
+	unique := nextTestRequestUnique()
+	out := &fuse.AttrOut{}
+	status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{
+		Unique: unique, NodeId: entry.NodeId,
+	}}, out)
+	if !status.Ok() || status == fuse.Status(syscall.EAGAIN) || f.mount.isRevoked() {
+		t.Fatalf("GETATTR after visibility race = %v, revoked=%t fatal=%v", status, f.mount.isRevoked(), f.mount.fatalError())
+	}
+	if out.Attr.Size != 4096 || calls.Load() != 2 {
+		t.Fatalf("GETATTR after visibility race = size %d, calls %d; want size 4096 after two calls", out.Attr.Size, calls.Load())
+	}
+	if got := retryConsumption.calls.Load(); got != 1 {
+		t.Fatalf("aborted read response consumed %d times, want 1", got)
+	}
+	if got := resultConsumption.calls.Load(); got != 0 {
+		t.Fatalf("successful read response consumed %d times before kernel publication", got)
+	}
+	completeTestReply(t, f.raw, unique, fuse.OK)
+	if got := resultConsumption.calls.Load(); got != 1 {
+		t.Fatalf("successful read response consumed %d times after kernel publication, want 1", got)
+	}
+}
+
+func TestLinuxFrontendReadVisibilityRetryBudgetExhaustionRevokes(t *testing.T) {
+	f := newStrictFixture(t)
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "read-retry-timeout")
+	f.mount.repairBudget = 20 * time.Millisecond
+	consumption := &recordingResponseConsumption{}
+	f.rpc.retainedConsumption = consumption
+	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetGetAttr() == nil {
+			return nil, errors.New("unexpected request in read visibility-retry timeout test")
+		}
+		return &authoritypb.Response{
+			Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
+			VisibilityRetrySequence: 99,
+		}, nil
+	}
+	status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{
+		Unique: nextTestRequestUnique(), NodeId: entry.NodeId,
+	}}, &fuse.AttrOut{})
+	if status != fuse.Status(syscall.ENOTCONN) || status == fuse.Status(syscall.EAGAIN) || !f.mount.isRevoked() {
+		t.Fatalf("GETATTR retry-budget exhaustion = %v, revoked=%t fatal=%v", status, f.mount.isRevoked(), f.mount.fatalError())
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("timed-out read retry consumed its response %d times, want 1", got)
+	}
 }
 
 func TestReadOnlyOpenDropsOAppend(t *testing.T) {

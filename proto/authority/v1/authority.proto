@@ -261,11 +261,12 @@ enum FailureClass {
   // ECANCELED because macOS 26 may transparently re-enter a mutating callback
   // after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
   FAILURE_CLASS_VISIBILITY_INTERRUPTED = 5;
-  // VISIBILITY_RETRY is a Linux scheduling handoff, never an
-  // application errno. The authority has definitely not applied the mutation
-  // and, for a staged write, has retained the inert bytes. The Linux frontend
-  // releases its local publication gate, lets the older peer repair finish, and
-  // resubmits with a fresh mutation identity inside the same FUSE callback.
+  // VISIBILITY_RETRY is a Linux scheduling handoff, never an application
+  // errno. For a mutation, the authority has definitely not applied it and,
+  // for a staged write, has retained the inert bytes. For a read, no result was
+  // published. The Linux frontend withdraws the aborted response or source
+  // gate, lets the named peer repair finish, and resubmits inside the same FUSE
+  // callback.
   // A Linux namespace callback may retain this handoff because the strict
   // kernel's notification path expires the cached binding without acquiring
   // the parent lock held by that callback. Callback-serialized frontends never
