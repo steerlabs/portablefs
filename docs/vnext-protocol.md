@@ -589,9 +589,9 @@ notifications with these exact forms:
 #define FUSE_NOTIFY_PFS_ATTR  12
 #define FUSE_NOTIFY_PFS_ENTRY 13
 
-struct fuse_notify_pfs_attr_out {         /* size 16 */
-	uint64_t nodeid;                      /* offset 0; nonzero */
-	uint64_t visibility_sequence;         /* offset 8; positive */
+struct fuse_notify_pfs_attr_out {         /* size 152 */
+	uint64_t visibility_sequence;         /* offset 0; positive */
+	struct fuse_pfs_object_state object;  /* offset 8; exact stamped attr */
 };
 
 #define FUSE_PFS_ENTRY_EXPIRE 0
@@ -610,17 +610,36 @@ NUL or slash. EXPIRE requires `child == 0`; DELETE requires a nonzero canonical
 child nodeid. Unknown flags, malformed names, zero sequences, or wrong live
 identities are protocol errors.
 
-PFS_ATTR takes the inode's `pfs_publish_mutex`, expires attrs and ACLs, clears
-the exact birth-time/statx-word validity and the projected IMMUTABLE/APPEND
-state, then under `fi->lock` increments `fi->attr_version` and sets
-`fi->pfs_object_version = max(fi->pfs_object_version,
-visibility_sequence)`. Until an exact stamped attr at the repaired object
-version or a newer one installs all of those fields together, that inode's
-attributes and enforced flag state are unservable rather than inherited from
-the pre-repair snapshot. Equality is accepted only while recovering this
-inexact state; an already-exact equal record and every genuinely older record
-remain silent age drops. PFS_ENTRY takes
-the parent's `pfs_publish_mutex`,
+The authority visibility wire adds this field to `VisibilityTarget`:
+
+```proto
+ObjectPostState exact_post_state = 10;
+```
+
+`exact_post_state` is absent from every PREPARE target and every NAMESPACE
+target. It is mandatory on every DATA or ATTRIBUTES target in COMPLETE and is
+the byte-equivalent object record retained for the initiating mutation's
+`PostState`: its stable identity matches the target identity, its attr inode
+matches `kernel_ino`, and its positive `object_version` is no greater than the
+COMPLETE visibility sequence. A changed object has that COMPLETE sequence;
+an unchanged object in a namespace-only outcome retains its already-exact older
+version. A DATA target's `Attr.size` is its authoritative post-mutation EOF.
+After DATA dominance normalization, one COMPLETE carries at most four such
+records. Missing, extra, mismatched, or duplicate records are an authority
+protocol error and fence the participant; a frontend never repairs attributes
+from retained bytes or a second snapshot.
+
+PFS_ATTR takes the inode's `pfs_publish_mutex`, validates the complete object
+record and, under `fi->lock`, installs every `fuse_attr` field, `i_size`, exact
+birth time, raw masked statx attribute word, projected IMMUTABLE/APPEND state,
+`fi->attr_version`, and `fi->pfs_object_version` exactly as a stamped GETATTR
+reply does. A genuinely older record is a silent age drop; an equal record is
+an idempotent success. The transition is from the prior exact record directly
+to the new exact record: there is no inexact interval and no retained stale
+mode, owner, group, or enforcement field for a VFS, LSM, audit, or coredump
+consumer to observe. ACLs are forgotten before publication of the new record.
+
+PFS_ENTRY remains stamp-only. It takes the parent's `pfs_publish_mutex`,
 performs the expire or delete repair, calls
 `inode_maybe_inc_iversion(parent, false)`, and under the parent `fi->lock`
 increments `fi->attr_version` and applies the same object-version stamp. That
@@ -633,11 +652,23 @@ parent stamp; registry absence never suppresses this gate. A notification
 returns success only after the cache action and stamp are complete; only then
 may portablefsd advance its map and send peer COMPLETE.
 
-The existing `FUSE_NOTIFY_PFS_SIZE` remains code 10. After its page/size repair
-succeeds it also sets the target `fi->pfs_object_version` to at least the
-notification sequence under `fi->lock`; its existing `pfs_size_sequence`
-ordering remains. A peer event that affects data and attrs sends the required
-SIZE and ATTR repairs and waits for both. The stock
+The existing `FUSE_NOTIFY_PFS_SIZE` remains code 10, with an exact record rather
+than a separate scalar EOF:
+
+```c
+struct fuse_notify_pfs_size_out {         /* size 152 */
+	uint64_t visibility_sequence;         /* offset 0; positive */
+	struct fuse_pfs_object_state object;  /* offset 8; exact stamped attr */
+};
+```
+
+PFS_SIZE requires a regular-file record. Under the same
+`pfs_publish_mutex` and `mapping->invalidate_lock` transaction it performs the
+whole peer-data repair, installs `object.attr.size`, and installs the complete
+exact attribute record by the PFS_ATTR rule above. Its existing
+`pfs_size_sequence` ordering remains. A normalized DATA target therefore emits
+one PFS_SIZE repair, not a SIZE followed by a separately observable ATTR
+repair. The stock
 `FUSE_NOTIFY_INVAL_INODE`, `FUSE_NOTIFY_INVAL_ENTRY`, and
 `FUSE_NOTIFY_DELETE` are not legal peer-repair shapes in the vNext profile
 because they carry no visibility sequence.
