@@ -40,6 +40,7 @@ type fakeRPC struct {
 	reclaims          [][]byte
 	keepAlives        int
 	reads             int
+	readSequence      uint64
 	calls             int
 	assignments       int
 	mutationCalls     int
@@ -121,6 +122,7 @@ func newFakeRPC() *fakeRPC {
 		maxRead:             64 * 1024,
 		maxWrite:            64 * 1024,
 		maxWriteTransaction: kernelMaxRWCount(),
+		readSequence:        1,
 		lease:               time.Minute,
 		done:                make(chan struct{}),
 		session:             []byte("test-mount-00001"),
@@ -331,24 +333,71 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}
 		return &authoritypb.Response{Body: &authoritypb.Response_ListXattr{ListXattr: &authoritypb.ListXattrReply{Names: names}}}, nil
 	case request.GetGetAttr() != nil:
-		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: cloneItem(f.item).GetAttr()}}}, nil
+		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: cloneItem(f.item).GetAttr(), ObjectVersion: f.readSequence, SnapshotSequence: f.readSequence}}}, nil
 	case request.GetLookup() != nil:
 		if f.missingNames[string(request.GetLookup().GetName())] {
-			return &authoritypb.Response{Errno: int32(syscall.ENOENT)}, nil
+			return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: f.readSequence}}}, nil
 		}
-		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetLookup().GetName())}}}, nil
+		item := f.namedItem(request.GetLookup().GetName())
+		item.ObjectVersion, item.SnapshotSequence = f.readSequence, f.readSequence
+		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}}, nil
 	case request.GetMkdir() != nil:
 		if f.mkdirFailure != 0 {
 			return &authoritypb.Response{Errno: int32(f.mkdirFailure)}, nil
 		}
-		delete(f.missingNames, string(request.GetMkdir().GetName()))
-		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetMkdir().GetName())}}}, nil
+		name := request.GetMkdir().GetName()
+		delete(f.missingNames, string(name))
+		created := f.namedItem(name)
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: created}},
+			PostState: exactTestPostState(2,
+				struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{created, postStateRoleCreated},
+				struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{f.root, postStateRoleParent}),
+		}, nil
 	case request.GetSymlink() != nil:
-		return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: f.namedItem(request.GetSymlink().GetName())}}}, nil
+		created := f.namedItem(request.GetSymlink().GetName())
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: created}},
+			PostState: exactTestPostState(2,
+				struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{created, postStateRoleCreated},
+				struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{f.root, postStateRoleParent}),
+		}, nil
 	case request.GetOpen() != nil:
-		return &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: cloneBytes(f.handle)}}}, nil
+		response := &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: cloneBytes(f.handle)}}}
+		if request.GetOpen().GetFlags().GetTruncate() {
+			target := f.itemForTokenLocked(request.GetOpen().GetItem())
+			response.PostState = exactTestPostState(2, struct {
+				item  *authoritypb.Item
+				roles uint32
+			}{target, postStateRoleTarget})
+		}
+		return response, nil
 	case request.GetCreate() != nil:
-		return &authoritypb.Response{Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: cloneItem(f.item), Handle: cloneBytes(f.handle)}}}, nil
+		created := cloneItem(f.item)
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: created, Handle: cloneBytes(f.handle)}},
+			PostState: exactTestPostState(2,
+				struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{created, postStateRoleCreated},
+				struct {
+					item  *authoritypb.Item
+					roles uint32
+				}{f.root, postStateRoleParent}),
+		}, nil
 	case request.GetRead() != nil:
 		offset := int(request.GetRead().GetOffset())
 		length := int(request.GetRead().GetLength())
@@ -393,7 +442,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}
 		response := &authoritypb.Response{Body: &authoritypb.Response_WriteTransaction{WriteTransaction: reply}}
 		if writeRequest.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
-			response.PostAttr = &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(reply.GetPostSize())}
+			response.PostState = testMutationPostState(&authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(reply.GetPostSize())})
 		}
 		return response, nil
 	case request.GetOneShotWrite() != nil:
@@ -406,7 +455,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}
 		postSize := assigned + uint64(writeRequest.GetSize())
 		return &authoritypb.Response{
-			PostAttr: &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)},
+			PostState: testMutationPostState(&authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)}),
 			Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
 				CommittedSize: uint64(writeRequest.GetSize()), AssignedOffset: assigned,
 				PostSize: postSize, VisibilitySequence: 17, Flags: fuse.PFS_WRITE_OUT_COMMITTED,
@@ -414,26 +463,52 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}, nil
 	case request.GetSetAttr() != nil:
 		f.setattrs = append(f.setattrs, request.GetSetAttr())
-		return &authoritypb.Response{PostAttr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Mode: 0o600}}, nil
+		target := f.itemForTokenLocked(request.GetSetAttr().GetItem())
+		return &authoritypb.Response{PostState: exactTestPostState(2, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{target, postStateRoleTarget})}, nil
 	case request.GetRename() != nil:
 		rename := request.GetRename()
+		moved := f.itemForTokenLocked(nil)
+		if f.byName != nil && f.byName[string(rename.GetOldName())] != nil {
+			moved = f.byName[string(rename.GetOldName())]
+		}
 		newPost := cloneBytes(f.renameNewPost)
 		if len(newPost) == 0 {
-			moved := f.item
-			if f.byName != nil && f.byName[string(rename.GetOldName())] != nil {
-				moved = f.byName[string(rename.GetOldName())]
-			}
 			newPost = cloneBytes(moved.GetStableIdentity())
 		}
 		oldPost := cloneBytes(f.renameOldPost)
+		var replaced *authoritypb.Item
+		if f.byName != nil {
+			replaced = f.byName[string(rename.GetNewName())]
+		}
 		if len(oldPost) == 0 && rename.GetExchange() {
-			replaced := f.item
-			if f.byName != nil && f.byName[string(rename.GetNewName())] != nil {
-				replaced = f.byName[string(rename.GetNewName())]
+			if replaced == nil {
+				replaced = f.item
 			}
 			oldPost = cloneBytes(replaced.GetStableIdentity())
 		}
-		return &authoritypb.Response{Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
+		movedRoles := postStateRoleSource | postStateRoleDestination
+		objects := []struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{{moved, movedRoles},
+			{f.itemForTokenLocked(rename.GetOldParent()), postStateRoleOldParent},
+			{f.itemForTokenLocked(rename.GetNewParent()), postStateRoleNewParent}}
+		if rename.GetExchange() {
+			objects[0].roles |= postStateRoleExchanged
+			objects = append(objects, struct {
+				item  *authoritypb.Item
+				roles uint32
+			}{replaced, movedRoles | postStateRoleExchanged})
+		} else if replaced != nil && !bytes.Equal(replaced.GetStableIdentity(), moved.GetStableIdentity()) {
+			objects = append(objects, struct {
+				item  *authoritypb.Item
+				roles uint32
+			}{replaced, postStateRoleOverwritten})
+		}
+		return &authoritypb.Response{PostState: exactTestPostState(2, objects...), Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
 			NewPostIdentity: newPost,
 			OldPostIdentity: oldPost,
 		}}}, nil
@@ -454,6 +529,24 @@ func (f *fakeRPC) namedItem(name []byte) *authoritypb.Item {
 	item := testItem(inode, authoritypb.Attr_DIRECTORY, inode)
 	f.byName[string(name)] = item
 	return cloneItem(item)
+}
+
+func (f *fakeRPC) itemForTokenLocked(token []byte) *authoritypb.Item {
+	if len(token) == 0 {
+		return f.item
+	}
+	if bytes.Equal(token, testToken(0)) || f.root != nil && bytes.Equal(token, f.root.GetToken()) {
+		return f.root
+	}
+	if f.item != nil && bytes.Equal(token, f.item.GetToken()) {
+		return f.item
+	}
+	for _, item := range f.byName {
+		if item != nil && bytes.Equal(token, item.GetToken()) {
+			return item
+		}
+	}
+	return f.item
 }
 
 func (f *fakeRPC) snapshot(read func(*fakeRPC)) {
@@ -621,7 +714,7 @@ func waitFor(t *testing.T, what string, condition func() bool) {
 func testItem(inode uint64, kind authoritypb.Attr_Kind, tokenID uint64) *authoritypb.Item {
 	return &authoritypb.Item{
 		Token: testToken(tokenID), StableIdentity: testIdentity(inode),
-		Attr: &authoritypb.Attr{Inode: inode, Kind: kind, Mode: 0o600},
+		Attr: &authoritypb.Attr{Inode: inode, Kind: kind, Mode: 0o600}, ObjectVersion: 1, SnapshotSequence: 1,
 	}
 }
 
@@ -712,7 +805,7 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	// The read-ahead window is paired with the authority read bound: reads are
 	// now served from the page cache, so the window is what decides how many
 	// authority round trips a sequential reader pays.
-	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
+	if !options.EnableLocks || options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
 		t.Fatalf("mount options = %#v", options)
 	}
 	foundDefaultPermissions := false
@@ -794,7 +887,7 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 	// every case here advertises a protocol new enough for them; the notify
 	// requirement has its own test.
 	notifying := func(in *fuse.InitIn) *fuse.InitIn {
-		in.Major, in.Minor = 7, 41
+		in.Major, in.Minor = 7, 42
 		return in
 	}
 	required := uint64(fuse.CAP_POSIX_LOCKS | fuse.CAP_FLOCK_LOCKS | fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 |
@@ -802,7 +895,7 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 	if err := verifyKernelGuarantees(notifying(settings(required)), 64*1024); err != nil {
 		t.Fatalf("a lock-forwarding kernel was refused: %v", err)
 	}
-	for _, version := range []struct{ major, minor uint32 }{{7, 28}, {7, 36}, {7, 40}, {7, 42}, {8, 41}} {
+	for _, version := range []struct{ major, minor uint32 }{{7, 28}, {7, 36}, {7, 40}, {7, 41}, {8, 42}} {
 		in := settings(required)
 		in.Major, in.Minor = version.major, version.minor
 		if err := verifyKernelGuarantees(in, 64*1024); err == nil {
@@ -1353,20 +1446,20 @@ func TestDirHandleBuffersOneAuthorityPageAcrossEntries(t *testing.T) {
 	defer finish(false)
 	names := []string(nil)
 	for range 4 {
-		entry, errno := handle.peek(ctx)
+		entry, _, errno := handle.peek(ctx, false)
 		if errno != 0 || entry == nil {
 			t.Fatalf("peek = (%v, %v)", entry, errno)
 		}
 		// Peeking twice must not advance: the entry is only consumed when the
 		// kernel buffer has accepted it.
-		again, _ := handle.peek(ctx)
+		again, _, _ := handle.peek(ctx, false)
 		if again.Name != entry.Name {
 			t.Fatalf("peek is not idempotent: %q then %q", entry.Name, again.Name)
 		}
 		names = append(names, entry.Name)
 		handle.consume()
 	}
-	entry, errno := handle.peek(ctx)
+	entry, _, errno := handle.peek(ctx, false)
 	if errno != 0 || entry != nil {
 		t.Fatalf("end of directory = (%v, %v)", entry, errno)
 	}
@@ -1603,7 +1696,9 @@ func TestLinuxFrontendRetriesGetattrVisibilityRaceWithoutLeakingErrno(t *testing
 		}
 		attr := proto.Clone(f.rpc.item.GetAttr()).(*authoritypb.Attr)
 		attr.Size = 4096
-		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: attr}}}, nil
+		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
+			Attr: attr, ObjectVersion: 18, SnapshotSequence: 18,
+		}}}, nil
 	}
 
 	unique := nextTestRequestUnique()
@@ -1681,11 +1776,15 @@ func TestRenameValidatesFlagCombinations(t *testing.T) {
 		}
 	}
 	for _, flags := range []uint32{0, renameNoReplace, renameExchange} {
-		_, errno := testVisibleMutation(t, mount, func(ctx context.Context) (bool, syscall.Errno) {
-			return n.Rename(ctx, "a", parent, "b", flags)
-		})
-		if errno != 0 {
-			t.Fatalf("Rename flags %#x = %v, want success", flags, errno)
+		f := newStrictFixture(t)
+		f.rpc.byName = map[string]*authoritypb.Item{"a": testItem(77, authoritypb.Attr_REGULAR, 77)}
+		f.lookup(t, fuse.FUSE_ROOT_ID, "a")
+		if flags == renameExchange {
+			f.rpc.byName["b"] = testItem(78, authoritypb.Attr_REGULAR, 78)
+			f.lookup(t, fuse.FUSE_ROOT_ID, "b")
+		}
+		if status := f.rename(fuse.FUSE_ROOT_ID, fuse.FUSE_ROOT_ID, "a", "b", flags); !status.Ok() {
+			t.Fatalf("Rename flags %#x = %v, want success", flags, status)
 		}
 	}
 	if _, errno := n.Rename(context.Background(), "a", nil, "b", 0); errno != syscall.EINVAL {

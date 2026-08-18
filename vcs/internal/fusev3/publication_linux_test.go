@@ -39,7 +39,9 @@ func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 				if request.GetLookup() == nil {
 					return nil, errors.New("unexpected non-LOOKUP request")
 				}
-				return &authoritypb.Response{Errno: int32(syscall.ENOENT)}, nil
+				return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
+					NegativeSnapshotSequence: 1,
+				}}}, nil
 			}
 			const requestUnique = 6900
 			out := &fuse.EntryOut{}

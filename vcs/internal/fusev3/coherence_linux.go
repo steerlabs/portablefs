@@ -640,16 +640,10 @@ func (r *rawFileSystem) prepareVisibility(ctx context.Context, targets []*author
 	if err := r.acquirePeerPublication(ctx, targets, keys); err != nil {
 		return err
 	}
-	// Admission is closed; now wait out the publications that were already
-	// decided cacheable before it closed. They are pure local work with no
-	// authority round trip inside them, and no mutation waits on them, so this
-	// drain cannot participate in the barrier's own dependency cycle.
-	//
-	// Publication remains counted through the real /dev/fuse response write.
-	// Publication-bearing replies and reverse notifications share go-fuse's
-	// writer ordering boundary, so an acknowledged PREPARE cannot be followed
-	// by installation of a stale reply that was merely returned by RawFS first.
-	return r.drainPublications(ctx, keys)
+	// PENDING candidates are revocable and therefore never delay PREPARE. A
+	// candidate already FINALIZED is joined at COMPLETE, immediately before the
+	// repair, under that event's bounded repair budget.
+	return nil
 }
 
 func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKeys) error {
@@ -700,8 +694,10 @@ type repair struct {
 
 // visibilityCompletion owns one COMPLETE's exact lockless repair work.
 type visibilityCompletion struct {
-	work     []repair
-	sequence uint64
+	work        []repair
+	sequence    uint64
+	coordinates []publicationCoordinate
+	waits       []<-chan struct{}
 }
 
 // beginVisibilityComplete resolves the event against the exact cache registry,
@@ -720,7 +716,31 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 		return visibilityCompletion{}, false, err
 	}
 	completion := visibilityCompletion{sequence: sequence}
+	coordinates, err := coordinatesForVisibilityTargets(targets)
+	if err != nil {
+		return visibilityCompletion{}, false, err
+	}
 	r.mu.Lock()
+	seenWait := make(map[<-chan struct{}]struct{})
+	for coordinate := range coordinates {
+		completion.coordinates = append(completion.coordinates, coordinate)
+		r.repairingCoordinates[coordinate] = true
+		for reservation := range r.cacheReservations[coordinate] {
+			switch reservation.state {
+			case cacheReservationPending:
+				reservation.revoked = true
+			case cacheReservationFinalized:
+				// The bytes are immutable once FINALIZED, but the candidate must
+				// not enter the daemon registry after the repair has removed it.
+				reservation.revoked = true
+				done := reservation.publication.originalDone
+				if _, exists := seenWait[done]; !exists {
+					seenWait[done] = struct{}{}
+					completion.waits = append(completion.waits, done)
+				}
+			}
+		}
+	}
 	for _, inode := range keys.inodes {
 		if record := r.byInodeLocked(inode.inode); record != nil && record.identity != inode.identity {
 			r.mu.Unlock()
@@ -736,6 +756,20 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 		record := r.cachedNames[key]
 		if record == nil {
 			if _, absent := r.cachedNegatives[key]; !absent {
+				parent := r.directoryLocked(key.parent)
+				if parent == nil {
+					continue
+				}
+				coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: key.name}
+				candidate, found := r.newestFinalizedNameCandidateLocked(coordinate)
+				if !found {
+					continue
+				}
+				work := repair{parent: parent.id, name: key.name, negative: candidate.negative, sequence: sequence}
+				if candidate.record != nil {
+					work.child = candidate.record.id
+				}
+				completion.work = append(completion.work, work)
 				continue
 			}
 			parent := r.directoryLocked(key.parent)
@@ -743,7 +777,7 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 			if parent == nil {
 				continue
 			}
-			completion.work = append(completion.work, repair{parent: parent.id, name: key.name, negative: true})
+			completion.work = append(completion.work, repair{parent: parent.id, name: key.name, negative: true, sequence: sequence})
 			continue
 		}
 		parent := r.directoryLocked(key.parent)
@@ -751,16 +785,40 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 		if parent == nil {
 			continue
 		}
-		completion.work = append(completion.work, repair{parent: parent.id, child: record.id, name: key.name})
+		completion.work = append(completion.work, repair{parent: parent.id, child: record.id, name: key.name, sequence: sequence})
 	}
 	for _, inode := range keys.inodes {
 		record := r.byInodeLocked(inode.inode)
+		delete(r.cachedAttrs, inode.identity)
 		if record != nil {
 			completion.work = append(completion.work, repair{inode: record.id, data: inode.data, size: inode.size, sequence: sequence})
 		}
 	}
 	r.mu.Unlock()
 	return completion, false, nil
+}
+
+// newestFinalizedNameCandidateLocked resolves the reply which can be visible
+// after all FINALIZED writes on one coordinate complete. Such a reply has not
+// received its post-VFS acknowledgment yet, so it is intentionally absent from
+// cachedNames/cachedNegatives even though COMPLETE must repair its dentry.
+func (r *rawFileSystem) newestFinalizedNameCandidateLocked(coordinate publicationCoordinate) (replyNamePublication, bool) {
+	var newest replyNamePublication
+	var newestSnapshot uint64
+	found := false
+	for reservation := range r.cacheReservations[coordinate] {
+		if reservation.state != cacheReservationFinalized || reservation.snapshot < newestSnapshot || reservation.publication == nil {
+			continue
+		}
+		for _, candidate := range reservation.publication.names {
+			if candidate.reservation != reservation {
+				continue
+			}
+			newest, newestSnapshot, found = candidate, reservation.snapshot, true
+			break
+		}
+	}
+	return newest, found
 }
 
 // beginVisibilityComplete is the direct test seam. Production always supplies
@@ -773,7 +831,17 @@ func (r *rawFileSystem) beginVisibilityComplete(targets []*authoritypb.Visibilit
 // atomically reopens namespace and publication admission. On failure both
 // remain closed and the caller revokes the mount.
 func (r *rawFileSystem) finishVisibilityComplete(ctx context.Context, completion visibilityCompletion) error {
-	_ = ctx
+	waitCtx, cancel := context.WithTimeout(ctx, r.mount.repairBudget)
+	defer cancel()
+	for _, done := range completion.waits {
+		select {
+		case <-done:
+		case <-waitCtx.Done():
+			cause := fmt.Errorf("fusev3: finalized cache reply exceeded visibility repair budget: %w", waitCtx.Err())
+			r.mount.revoke(cause)
+			return cause
+		}
+	}
 	for _, item := range completion.work {
 		if err := r.applyRepair(item); err != nil {
 			// Admission stays closed on failure. The caller revokes this mount and,
@@ -807,6 +875,12 @@ func (r *rawFileSystem) releaseComplete(completion visibilityCompletion) {
 		delete(r.heldInodes, inode.inode)
 	}
 	r.heldPhase = visibilityKeys{}
+	for _, coordinate := range completion.coordinates {
+		if completion.sequence > r.lastPeerRepairSequence[coordinate] {
+			r.lastPeerRepairSequence[coordinate] = completion.sequence
+		}
+		delete(r.repairingCoordinates, coordinate)
+	}
 	if completion.sequence > r.completedVisibilitySequence {
 		r.completedVisibilitySequence = completion.sequence
 	}
@@ -832,9 +906,12 @@ func (r *rawFileSystem) applyRepair(item repair) error {
 			if status := server.PFSSizeNotify(item.inode, item.size, item.sequence); !status.Ok() && status != fuse.ENOENT {
 				return fmt.Errorf("fusev3: publish exact size %d at sequence %d for inode %d: %v", item.size, item.sequence, item.inode, status)
 			}
+			if status := server.PFSAttrNotify(item.inode, item.sequence); !status.Ok() && status != fuse.ENOENT {
+				return fmt.Errorf("fusev3: repair attributes at sequence %d for inode %d: %v", item.sequence, item.inode, status)
+			}
 			return nil
 		}
-		if status := server.InodeNotify(item.inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
+		if status := server.PFSAttrNotify(item.inode, item.sequence); !status.Ok() && status != fuse.ENOENT {
 			return fmt.Errorf("fusev3: invalidate inode %d: %v", item.inode, status)
 		}
 		// ENOENT is the strongest successful outcome for invalidation: the
@@ -859,12 +936,12 @@ func (r *rawFileSystem) applyRepair(item repair) error {
 		// one that replaced it -- does not exist for an absence: the newer
 		// answer is precisely the one the mutation created, and losing it costs
 		// a LOOKUP rather than correctness.
-		if status := server.EntryNotify(item.parent, item.name); !status.Ok() && status != fuse.ENOENT {
+		if status := server.PFSEntryNotify(item.parent, 0, item.sequence, item.name, false); !status.Ok() && status != fuse.ENOENT {
 			return fmt.Errorf("fusev3: expire absent name %q under node %d: %v", item.name, item.parent, status)
 		}
 		return nil
 	}
-	deleteStatus := server.DeleteNotify(item.parent, item.child, item.name)
+	deleteStatus := server.PFSEntryNotify(item.parent, item.child, item.sequence, item.name, true)
 	if deleteStatus.Ok() || deleteStatus == fuse.ENOENT {
 		return nil
 	}
@@ -931,6 +1008,33 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 		}
 		_ = server.DeleteNotify(item.parent, item.child, item.name)
 	}
+}
+
+func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
+	r.mu.Lock()
+	work := make([]uint64, 0, len(r.cachedAttrs))
+	for _, record := range r.cachedAttrs {
+		if record != nil && !record.reclaimed {
+			work = append(work, record.id)
+		}
+	}
+	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
+	r.mu.Unlock()
+	server := r.mount.notifier()
+	if server == nil {
+		return nil
+	}
+	var failures []string
+	for index, inode := range work {
+		if time.Now().After(deadline) {
+			failures = append(failures, fmt.Sprintf("attribute withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-index))
+			break
+		}
+		if status := server.InodeNotify(inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
+			failures = append(failures, fmt.Sprintf("withdraw cached attributes for inode %d: %v", inode, status))
+		}
+	}
+	return failures
 }
 
 // revokeCachedData drops every page this mount told its kernel it could keep.
@@ -1178,6 +1282,9 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	}
 	deadline := time.Now().Add(m.repairBudget)
 	if m.raw != nil {
+		for _, failure := range m.raw.revokeCachedAttrs(deadline) {
+			out.record(1, "attribute-withdrawal", errors.New(failure))
+		}
 		for _, failure := range m.raw.revokeCachedData(deadline) {
 			out.record(1, "data-withdrawal", errors.New(failure))
 		}
@@ -1254,6 +1361,8 @@ type kernelNotifier interface {
 	// deliberately consumes no authority sequence.
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
 	PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status
+	PFSAttrNotify(node uint64, sequence uint64) fuse.Status
+	PFSEntryNotify(parent uint64, child uint64, sequence uint64, name string, deleted bool) fuse.Status
 	DeleteNotify(parent uint64, child uint64, name string) fuse.Status
 	// EntryNotify takes back a cached absence. It is the name-only primitive,
 	// which is the correct one here and only here: an absence has no child

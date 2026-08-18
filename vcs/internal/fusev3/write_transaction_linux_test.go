@@ -376,8 +376,8 @@ func TestPFSWriteConsumesItemRetryInternallyAndReusesOneStagedTransaction(t *tes
 			CommittedSize: 3, AssignedOffset: 100, PostSize: 103, VisibilitySequence: 17,
 		}
 		return &authoritypb.Response{
-			Body:     &authoritypb.Response_WriteTransaction{WriteTransaction: reply},
-			PostAttr: &authoritypb.Attr{Inode: fixture.rpc.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 103},
+			Body:      &authoritypb.Response_WriteTransaction{WriteTransaction: reply},
+			PostState: testMutationPostState(&authoritypb.Attr{Inode: fixture.rpc.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 103}),
 		}, nil
 	}
 	fixture.rpc.mu.Unlock()
@@ -845,7 +845,7 @@ func TestPFSWritePostapplyErrorPublishesExactCommittedState(t *testing.T) {
 		writeRequest := request.GetWriteTransaction()
 		fixture.rpc.writeTransactions = append(fixture.rpc.writeTransactions, writeRequest)
 		return &authoritypb.Response{
-			PostAttr: &authoritypb.Attr{Inode: 7, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 103},
+			PostState: testMutationPostState(&authoritypb.Attr{Inode: 7, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 103}),
 			Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
 				TransactionId:      writeRequest.GetTransactionId(),
 				CommittedSize:      3,
@@ -891,7 +891,7 @@ func TestPFSWriteZeroBytePostapplyPublishesExactAttributeStateWithoutPosition(t 
 	fixture.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
 		writeRequest := request.GetWriteTransaction()
 		return &authoritypb.Response{
-			PostAttr: &authoritypb.Attr{Inode: 7, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 100},
+			PostState: testMutationPostState(&authoritypb.Attr{Inode: 7, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 100}),
 			Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
 				TransactionId: writeRequest.GetTransactionId(), PostSize: 100, VisibilitySequence: 19,
 				Flags: fuse.PFS_WRITE_OUT_COMMITTED | fuse.PFS_WRITE_OUT_POSTAPPLY_ERROR,

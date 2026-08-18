@@ -98,6 +98,27 @@ func (n *fakeNotifier) PFSSizeNotify(node uint64, size uint64, sequence uint64) 
 	return n.sizeST
 }
 
+func (n *fakeNotifier) PFSAttrNotify(node uint64, sequence uint64) fuse.Status {
+	n.record(recordedNotify{kind: "attr", inode: node, sequence: sequence})
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.inodeST
+}
+
+func (n *fakeNotifier) PFSEntryNotify(parent uint64, child uint64, sequence uint64, name string, deleted bool) fuse.Status {
+	kind := "entry"
+	if deleted {
+		kind = "delete"
+	}
+	n.record(recordedNotify{kind: kind, parent: parent, child: child, name: name, sequence: sequence})
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if deleted {
+		return n.deleteST
+	}
+	return n.entryST
+}
+
 func (n *fakeNotifier) EntryNotify(parent uint64, name string) fuse.Status {
 	n.record(recordedNotify{kind: "entry", parent: parent, name: name})
 	n.mu.Lock()
@@ -250,6 +271,12 @@ func (f *strictFixture) rename(oldParent, newParent uint64, oldName, newName str
 	})
 }
 
+func (f *strictFixture) setReadSequence(sequence uint64) {
+	f.rpc.mu.Lock()
+	f.rpc.readSequence = sequence
+	f.rpc.mu.Unlock()
+}
+
 // --- the strict profile publishes lifetimes, and records what it published ---
 
 func TestStrictLookupPublishesACacheableEntryAndRecordsIt(t *testing.T) {
@@ -303,6 +330,7 @@ func TestLookupBetweenPrepareAndCompleteDoesNotRecacheTheOldValue(t *testing.T) 
 	if err := f.raw.completeVisibility(targets, false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
+	f.setReadSequence(2)
 	// Admission reopens on COMPLETE, not on a timer.
 	if after := f.lookup(t, fuse.FUSE_ROOT_ID, "victim"); after.EntryValid == 0 {
 		t.Fatal("cache admission was not reopened by COMPLETE")
@@ -323,14 +351,17 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	calls := f.notify.snapshot()
-	if len(calls) != 2 {
-		t.Fatalf("notifications = %+v, want one namespace repair and one inode repair", calls)
+	if len(calls) != 3 {
+		t.Fatalf("notifications = %+v, want namespace, size, and attr repairs", calls)
 	}
 	if calls[0].kind != "delete" || calls[0].parent != fuse.FUSE_ROOT_ID || calls[0].name != "victim" || calls[0].child != entry.NodeId {
 		t.Fatalf("namespace repair = %+v; a removal must reach inotify, which only NotifyDelete does", calls[0])
 	}
 	if calls[1].kind != "size" || calls[1].inode != entry.NodeId || calls[1].size != 4096 || calls[1].sequence != 1 {
 		t.Fatalf("inode repair = %+v; want exact size 4096 at the visibility sequence", calls[1])
+	}
+	if calls[2].kind != "attr" || calls[2].inode != entry.NodeId || calls[2].sequence != 1 {
+		t.Fatalf("attr repair = %+v; want stamped attributes at the visibility sequence", calls[2])
 	}
 	// A repaired binding is no longer cached, so a second event for the same
 	// name costs nothing and, critically, takes no kernel lock.
@@ -339,7 +370,7 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 		t.Fatalf("second COMPLETE: %v", err)
 	}
 	for _, call := range f.notify.snapshot()[before:] {
-		if call.kind != "size" {
+		if call.kind != "size" && call.kind != "attr" {
 			t.Fatalf("a binding this mount no longer caches was repaired again: %+v", call)
 		}
 	}
@@ -347,11 +378,10 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 
 func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 	tests := []struct {
-		name     string
-		targets  func(uint64) []*authoritypb.VisibilityTarget
-		wantKind string
-		wantOff  int64
-		wantSize uint64
+		name      string
+		targets   func(uint64) []*authoritypb.VisibilityTarget
+		wantKinds []string
+		wantSize  uint64
 	}{
 		{
 			name: "duplicate attributes stay attribute-only",
@@ -361,8 +391,7 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
 				}
 			},
-			wantKind: "inode",
-			wantOff:  -1,
+			wantKinds: []string{"attr"},
 		},
 		{
 			name: "data dominates attributes",
@@ -373,8 +402,8 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
 				}
 			},
-			wantKind: "size",
-			wantSize: 4096,
+			wantKinds: []string{"size", "attr"},
+			wantSize:  4096,
 		},
 	}
 	for _, test := range tests {
@@ -385,11 +414,14 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 				t.Fatalf("COMPLETE: %v", err)
 			}
 			calls := f.notify.snapshot()
-			if len(calls) != 1 {
-				t.Fatalf("notifications = %+v, want one normalized inode repair", calls)
+			if len(calls) != len(test.wantKinds) {
+				t.Fatalf("notifications = %+v, want %v", calls, test.wantKinds)
 			}
-			if call := calls[0]; call.kind != test.wantKind || call.inode != entry.NodeId || call.off != test.wantOff || call.length != 0 || call.size != test.wantSize {
-				t.Fatalf("normalized inode repair = %+v, want kind %q for inode %d", call, test.wantKind, entry.NodeId)
+			for index, kind := range test.wantKinds {
+				call := calls[index]
+				if call.kind != kind || call.inode != entry.NodeId || kind == "size" && call.size != test.wantSize {
+					t.Fatalf("normalized inode repairs = %+v, want %v for inode %d", calls, test.wantKinds, entry.NodeId)
+				}
 			}
 		})
 	}
@@ -437,7 +469,7 @@ func TestMissingKernelInodeAlreadySatisfiesInvalidation(t *testing.T) {
 	}
 	calls := f.notify.snapshot()
 	if len(calls) != 2 || calls[0].kind != "delete" || calls[0].child != entry.NodeId ||
-		calls[1].kind != "inode" || calls[1].inode != entry.NodeId {
+		calls[1].kind != "attr" || calls[1].inode != entry.NodeId {
 		t.Fatalf("notifications = %+v, want namespace removal followed by the now-absent inode", calls)
 	}
 }
@@ -446,6 +478,7 @@ func TestMissingKernelInodeAlreadySatisfiesExactSizeRepair(t *testing.T) {
 	f := newStrictFixture(t)
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	f.notify.sizeST = fuse.ENOENT
+	f.notify.inodeST = fuse.ENOENT
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 7, 19),
 	}
@@ -460,7 +493,8 @@ func TestMissingKernelInodeAlreadySatisfiesExactSizeRepair(t *testing.T) {
 		t.Fatalf("exact-size COMPLETE for an evicted inode = %v", err)
 	}
 	calls := f.notify.snapshot()
-	if len(calls) != 1 || calls[0].kind != "size" || calls[0].inode != entry.NodeId || calls[0].size != 19 || calls[0].sequence != 27 {
+	if len(calls) != 2 || calls[0].kind != "size" || calls[0].inode != entry.NodeId || calls[0].size != 19 || calls[0].sequence != 27 ||
+		calls[1].kind != "attr" || calls[1].inode != entry.NodeId || calls[1].sequence != 27 {
 		t.Fatalf("exact-size repair = %+v, want absent inode acknowledged at size 19 sequence 27", calls)
 	}
 	f.raw.mu.Lock()
@@ -654,6 +688,168 @@ func TestCachedNamesNeverExceedTheDeclaredCapacity(t *testing.T) {
 	}
 	if uncacheable == 0 {
 		t.Fatal("the capacity bound was never reached, so this test proved nothing")
+	}
+}
+
+func TestReadDirPlusPageReservesOrDegradesAsOneUnit(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		capacity   int
+		wantCached bool
+	}{
+		{name: "whole page reserved", capacity: 2, wantCached: true},
+		{name: "one short degrades whole page", capacity: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			f.raw.mu.Lock()
+			f.raw.nameCapacity = test.capacity
+			f.raw.attrCapacity = test.capacity
+			f.raw.mu.Unlock()
+			parent := f.raw.acquire(fuse.FUSE_ROOT_ID)
+			if parent == nil {
+				t.Fatal("acquire root")
+			}
+			defer f.raw.release(parent)
+			candidates := make([]dirPlusCandidate, 0, 2)
+			for index, name := range []string{"alpha", "beta"} {
+				item := testItem(uint64(100+index), authoritypb.Attr_REGULAR, uint64(100+index))
+				item.ObjectVersion, item.SnapshotSequence = 9, 9
+				record, errno := f.raw.intern(context.Background(), item)
+				if errno != 0 {
+					t.Fatalf("intern %s: %v", name, errno)
+				}
+				candidates = append(candidates, dirPlusCandidate{
+					entry: &fuse.EntryOut{}, record: record,
+					dirent: &authoritypb.Dirent{
+						Name: []byte(name), Attr: item.Attr, Item: item,
+						ObjectVersion: 9, SnapshotSequence: 9,
+					},
+				})
+			}
+			unique := f.unique.Add(2)
+			ctx, finish, status := f.raw.mutationContext(unique)
+			if !status.Ok() {
+				t.Fatalf("reserve READDIRPLUS publication: %v", status)
+			}
+			if err := f.raw.publishDirPlusPage(ctx, parent, candidates); err != nil {
+				t.Fatalf("publish READDIRPLUS page: %v", err)
+			}
+			for _, candidate := range candidates {
+				cached := candidate.entry.EntryValid != 0 && candidate.entry.AttrValid != 0
+				if cached != test.wantCached {
+					t.Fatalf("%q cached=%t with lifetimes entry=%d attr=%d, want cached=%t",
+						candidate.dirent.GetName(), cached, candidate.entry.EntryValid,
+						candidate.entry.AttrValid, test.wantCached)
+				}
+			}
+			f.raw.mu.Lock()
+			pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
+			f.raw.mu.Unlock()
+			if test.wantCached {
+				if pendingNames != 2 || pendingAttrs != 2 {
+					t.Fatalf("reserved page pending names/attrs = %d/%d, want 2/2", pendingNames, pendingAttrs)
+				}
+			} else if pendingNames != 0 || pendingAttrs != 0 {
+				t.Fatalf("degraded page partially reserved names/attrs = %d/%d, want 0/0", pendingNames, pendingAttrs)
+			}
+			finish()
+			completeTestReply(t, f.raw, unique, fuse.OK)
+		})
+	}
+}
+
+func TestFinalizedReplyWaitExpiresInsideRepairBudgetAndFencesParticipant(t *testing.T) {
+	f := newStrictFixture(t)
+	f.mount.repairBudget = 20 * time.Millisecond
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "stuck")
+	record := f.raw.acquire(entry.NodeId)
+	if record == nil {
+		t.Fatal("lookup record was not retained")
+	}
+	identity := record.identity
+	inode := record.key.inode
+	f.raw.release(record)
+	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
+	publication := &replyPublication{originalDone: make(chan struct{})}
+	reservation := &cacheInstallReservation{
+		publication: publication, coordinate: coordinate, snapshot: 7,
+		state: cacheReservationFinalized,
+	}
+	f.raw.mu.Lock()
+	f.raw.cacheReservations[coordinate] = map[*cacheInstallReservation]struct{}{reservation: {}}
+	f.raw.mu.Unlock()
+
+	targets := []*authoritypb.VisibilityTarget{inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0)}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 8)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	started := time.Now()
+	err = f.raw.finishVisibilityComplete(context.Background(), completion)
+	if err == nil || !strings.Contains(err.Error(), "exceeded visibility repair budget") {
+		t.Fatalf("stuck FINALIZED wait = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stuck FINALIZED wait blocked for %v", elapsed)
+	}
+	if !f.mount.isRevoked() {
+		t.Fatal("repair-budget expiry did not fence this participant")
+	}
+}
+
+func TestPendingLookupCandidateRevokedBeforePhysicalReplyHasZeroLifetime(t *testing.T) {
+	f := newStrictFixture(t)
+	const unique = 600
+	out := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "raced", out); !status.Ok() {
+		t.Fatalf("LOOKUP = %v", status)
+	}
+	if out.EntryValid == 0 {
+		t.Fatal("LOOKUP was not initially admitted")
+	}
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "raced")}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE = %v", err)
+	}
+	outData := make([]byte, 128)
+	outData[16], outData[24] = 1, 1
+	payload := make([]byte, fuse.PFSCacheStampSize)
+	n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1, outData, payload, 0)
+	if !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize LOOKUP = (%d, %v)", n, status)
+	}
+	if outData[16] != 0 {
+		t.Fatal("peer repair between admission and reply write left a nonzero entry lifetime")
+	}
+	f.raw.ReplyWritten(unique, fuse.EIO)
+}
+
+func TestNotNewerLookupIsSilentlyDropped(t *testing.T) {
+	f := newStrictFixture(t)
+	nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: publicationIdentity(testIdentity(1)), name: "old"}
+	attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(testIdentity(42))}
+	f.raw.mu.Lock()
+	f.raw.lastPeerRepairSequence[nameCoordinate] = 1
+	f.raw.lastPeerRepairSequence[attrCoordinate] = 1
+	f.raw.mu.Unlock()
+	const unique = 602
+	out := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "old", out); !status.Ok() {
+		t.Fatalf("not-newer LOOKUP returned protocol error %v", status)
+	}
+	if out.EntryValid != 0 || out.AttrValid != 0 {
+		t.Fatalf("not-newer LOOKUP lifetimes = entry %d attr %d, want zero", out.EntryValid, out.AttrValid)
+	}
+	completeTestReply(t, f.raw, unique, fuse.OK)
+	if f.mount.isRevoked() {
+		t.Fatalf("not-newer LOOKUP revoked mount: %v", f.mount.fatalError())
+	}
+	f.raw.mu.Lock()
+	_, cached := f.raw.cachedNames[nameKey{parent: 1, name: "old"}]
+	f.raw.mu.Unlock()
+	if cached {
+		t.Fatal("not-newer LOOKUP entered the cache registry")
 	}
 }
 
@@ -1058,6 +1254,7 @@ func TestCompleteExpiresACachedAbsenceForACreatedName(t *testing.T) {
 		t.Fatal("the repaired absence is still recorded, so a second event would spend another notification on nothing")
 	}
 	// Admission reopens on COMPLETE, not on a timer.
+	f.setReadSequence(2)
 	f.unmarkMissing("appeared")
 	if out := f.lookup(t, fuse.FUSE_ROOT_ID, "appeared"); out.EntryValid == 0 {
 		t.Fatal("cache admission was not reopened by COMPLETE")
@@ -1313,14 +1510,15 @@ func TestOpenBetweenPrepareAndCompleteWaitsForTheDataCut(t *testing.T) {
 	}
 }
 
-func TestPrepareDrainsAnAlreadyAdmittedDataPublication(t *testing.T) {
+func TestPrepareDoesNotWaitForAnUnwrittenOpenWithoutInstalledPages(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
 
-	// Admitted before the cut closes, still unwritten. PREPARE must not be
-	// acknowledged while a reply that grants cacheability is in flight, or the
-	// grant could land in the kernel after COMPLETE had already repaired.
+	// An OPEN reply installs no cache entry or page. A peer cut therefore need
+	// not wait for its physical write; reads which may populate pages remain
+	// ordered separately, and a successful write records the later withdrawal
+	// obligation before COMPLETE resolves the target.
 	unique := f.unique.Add(2)
 	out := &fuse.OpenOut{}
 	if status := f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Flags: syscall.O_RDONLY}, out); !status.Ok() {
@@ -1330,25 +1528,16 @@ func TestPrepareDrainsAnAlreadyAdmittedDataPublication(t *testing.T) {
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 72, 16),
 	}
-	prepared := make(chan error, 1)
-	go func() { prepared <- f.raw.prepareVisibility(context.Background(), targets, false) }()
-	select {
-	case err := <-prepared:
-		t.Fatalf("PREPARE drained before the in-flight retained-data reply was written (err=%v)", err)
-	case <-time.After(50 * time.Millisecond):
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("PREPARE: %v", err)
 	}
 
 	completeTestReply(t, f.raw, unique, fuse.OK)
-	select {
-	case err := <-prepared:
-		if err != nil {
-			t.Fatalf("PREPARE: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("PREPARE never drained the settled retained-data publication")
-	}
 	if err := f.raw.completeVisibility(targets, false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
+	}
+	if calls := f.notify.snapshot(); len(calls) != 2 || calls[0].kind != "size" || calls[1].kind != "attr" {
+		t.Fatalf("DATA repair after OPEN publication = %+v, want stamped size then attr", calls)
 	}
 }
 

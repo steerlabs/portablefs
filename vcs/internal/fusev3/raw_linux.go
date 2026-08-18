@@ -3,7 +3,9 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -16,6 +18,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 )
 
 type inodeKey struct {
@@ -73,6 +76,7 @@ type replyNamePublication struct {
 	negativeState *negativeNamePublication
 	coordinate    publicationCoordinate
 	reserved      bool
+	reservation   *cacheInstallReservation
 }
 
 // negativeNamePublication is the mutable part of an admitted absence. A
@@ -87,8 +91,34 @@ type negativeNamePublication struct {
 }
 
 type replyAttrPublication struct {
-	inode      uint64
-	coordinate publicationCoordinate
+	inode       uint64
+	identity    publicationIdentity
+	record      *inodeRecord
+	coordinate  publicationCoordinate
+	reservation *cacheInstallReservation
+	reserved    bool
+}
+
+type replyDirPlusPublication struct {
+	entry           *fuse.EntryOut
+	nameReservation *cacheInstallReservation
+	attrReservation *cacheInstallReservation
+}
+
+type cacheReservationState uint8
+
+const (
+	cacheReservationPending cacheReservationState = iota + 1
+	cacheReservationFinalized
+)
+
+type cacheInstallReservation struct {
+	publication      *replyPublication
+	coordinate       publicationCoordinate
+	snapshot         uint64
+	state            cacheReservationState
+	revoked          bool
+	capacityReserved bool
 }
 
 // replyDataPublication is one OPEN reply's declaration that this kernel may
@@ -119,6 +149,13 @@ type replyPublication struct {
 	// staged-write RPCs, so this is deliberately a collection rather than one
 	// token.
 	responseConsumptions []authorityrpc.ResponseConsumption
+	postState            *authoritypb.PostState
+	expectedPostState    map[publicationIdentity]uint32
+	cacheStamp           *fuse.PFSCacheStamp
+	droppedAttrs         map[publicationIdentity]bool
+	dirPlus              []replyDirPlusPublication
+	snapshotSequence     uint64
+	payloadError         error
 
 	// Generic post-VFS publication receipt state, protected by
 	// rawFileSystem.mu. The original response write only signals
@@ -139,7 +176,8 @@ type replyPublication struct {
 
 func (p *replyPublication) empty() bool {
 	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
-		p.writeKernelTx == 0 && p.writeHandle == nil && len(p.responseConsumptions) == 0 && !p.needsPostVFS
+		p.writeKernelTx == 0 && p.writeHandle == nil && len(p.responseConsumptions) == 0 && !p.needsPostVFS &&
+		p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil
 }
 
 func (p *replyPublication) consumeAuthorityResponse() {
@@ -243,6 +281,7 @@ type rawFileSystem struct {
 	entryTimeout time.Duration
 	attrTimeout  time.Duration
 	nameCapacity int
+	attrCapacity int
 	// negativeCapacity is the part of nameCapacity that may be spent on cached
 	// absences. See negativeNameShare for why absences need their own bound
 	// inside the declared total rather than competing freely with bindings.
@@ -287,6 +326,10 @@ type rawFileSystem struct {
 	// reclaimed by FORGET, and must therefore leave only through a repair or
 	// through self-revocation.
 	cachedNegatives map[nameKey]struct{}
+	// cachedAttrs is the exact set of inode attributes this daemon has allowed
+	// its kernel to retain. It gives attribute candidates the same bounded,
+	// repairable accounting as positive and negative names.
+	cachedAttrs map[publicationIdentity]*inodeRecord
 	// cachedData is the exact set of authority inodes whose file data this
 	// frontend has told its kernel it may keep. It is keyed by the
 	// coordination inode number a VisibilityTarget carries, and it is the
@@ -318,6 +361,7 @@ type rawFileSystem struct {
 	// separate so a burst of probes cannot silently consume the reservations
 	// that bindings were counted against, and vice versa.
 	pendingNegatives    int
+	pendingAttrs        int
 	published           chan struct{}
 	replyPublications   map[uint64]*replyPublication
 	publishAcks         map[uint64]*replyPublication
@@ -335,6 +379,9 @@ type rawFileSystem struct {
 	peerHeldPhase               []publicationCoordinate
 	sourceChanged               chan struct{}
 	completedVisibilitySequence uint64
+	lastPeerRepairSequence      map[publicationCoordinate]uint64
+	repairingCoordinates        map[publicationCoordinate]bool
+	cacheReservations           map[publicationCoordinate]map[*cacheInstallReservation]struct{}
 
 	// identityDevice pins the one filesystem a volume is, as the authority's
 	// explicit major<<32|minor device fact. The kernel inode number alone keys
@@ -346,6 +393,7 @@ type rawFileSystem struct {
 
 var _ fuse.RawFileSystem = (*rawFileSystem)(nil)
 var _ fuse.ReplyWriteLifecycle = (*rawFileSystem)(nil)
+var _ fuse.ReplyPayloadPreparer = (*rawFileSystem)(nil)
 
 func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 	key := itemKey(root.item)
@@ -360,6 +408,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		entryTimeout:   strictEntryTimeout,
 		attrTimeout:    strictAttrTimeout,
 		nameCapacity:   mount.nameCapacity,
+		attrCapacity:   mount.nameCapacity,
 		// A declared capacity too small to divide still admits one absence:
 		// refusing every negative entry would be a silent behaviour change for
 		// a mount that declared a tiny cache, not a bound anything relies on.
@@ -378,6 +427,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		cachedStableNames:          make(map[publicationNamespace]*inodeRecord),
 		cachedNameStable:           make(map[nameKey]publicationNamespace),
 		cachedNegatives:            make(map[nameKey]struct{}),
+		cachedAttrs:                make(map[publicationIdentity]*inodeRecord),
 		cachedData:                 make(map[uint64]*inodeRecord),
 		heldNames:                  make(map[nameKey]struct{}),
 		heldInodes:                 make(map[uint64]struct{}),
@@ -395,6 +445,9 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		sourceUnresolvedAttributes: make(map[*sourcePublicationLease]int),
 		sourceUnresolvedData:       make(map[*sourcePublicationLease]int),
 		sourceChanged:              make(chan struct{}),
+		lastPeerRepairSequence:     make(map[publicationCoordinate]uint64),
+		repairingCoordinates:       make(map[publicationCoordinate]bool),
+		cacheReservations:          make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
 	}
 	mount.raw = r
 	return r
@@ -496,6 +549,38 @@ func (r *rawFileSystem) bindCachedNameLocked(key nameKey, stable publicationName
 // admitNameLocked decides the lifetime one directory binding is published with
 // and records the binding when it is cacheable. Uncacheable is always a legal
 // answer: it costs a later LOOKUP and can never be wrong.
+func cacheCandidateSnapshot(publication *replyPublication) uint64 {
+	if publication == nil {
+		return 0
+	}
+	if publication.postState != nil {
+		return publication.postState.GetSnapshotSequence()
+	}
+	if publication.cacheStamp != nil {
+		return publication.cacheStamp.SnapshotSequence
+	}
+	if publication.snapshotSequence != 0 {
+		return publication.snapshotSequence
+	}
+	return 0
+}
+
+func (r *rawFileSystem) reserveCacheCandidateLocked(publication *replyPublication, coordinate publicationCoordinate) (*cacheInstallReservation, bool) {
+	snapshot := cacheCandidateSnapshot(publication)
+	if snapshot == 0 || r.repairingCoordinates[coordinate] || snapshot <= r.lastPeerRepairSequence[coordinate] {
+		return nil, false
+	}
+	reservation := &cacheInstallReservation{
+		publication: publication, coordinate: coordinate, snapshot: snapshot,
+		state: cacheReservationPending,
+	}
+	if r.cacheReservations[coordinate] == nil {
+		r.cacheReservations[coordinate] = make(map[*cacheInstallReservation]struct{})
+	}
+	r.cacheReservations[coordinate][reservation] = struct{}{}
+	return reservation, true
+}
+
 func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord, name string, record *inodeRecord) (time.Duration, replyNamePublication, bool) {
 	key := nameKey{parent: parent.key.inode, name: name}
 	stable := publicationNamespace{parent: parent.identity, name: name}
@@ -521,13 +606,19 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
 		return 0, publication, false
 	}
+	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
+	if !admitted {
+		return 0, publication, false
+	}
 	_, already := r.cachedNames[key]
 	if !already && r.cachedNameTotalLocked() >= r.nameCapacity {
 		// The declared capacity is a promise about how much state this mount
 		// can withdraw, so it is a hard bound. Beyond it the frontend keeps
 		// answering with a zero lifetime.
+		r.removeCacheReservationLocked(reservation)
 		return 0, publication, false
 	}
+	publication.reservation = reservation
 	publication.reserved = !already
 	if publication.reserved {
 		r.pendingNames++
@@ -563,15 +654,21 @@ func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *ino
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
 		return 0, publication, false
 	}
+	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
+	if !admitted {
+		return 0, publication, false
+	}
 	_, already := r.cachedNegatives[key]
 	if !already {
 		if len(r.cachedNegatives)+r.pendingNegatives >= r.negativeCapacity ||
 			r.cachedNameTotalLocked() >= r.nameCapacity {
+			r.removeCacheReservationLocked(reservation)
 			return 0, publication, false
 		}
 		publication.reserved = true
 		r.pendingNegatives++
 	}
+	publication.reservation = reservation
 	r.publishingNames[key]++
 	r.admitSourcePublicationLocked(coordinate)
 	state := &negativeNamePublication{owner: r, reply: replyPublicationFromContext(ctx), coordinate: coordinate}
@@ -650,17 +747,53 @@ func (r *rawFileSystem) awaitDataAdmission(ctx context.Context, inode uint64, id
 	}
 }
 
-func (r *rawFileSystem) admitAttrLocked(ctx context.Context, inode uint64, identity publicationIdentity) (time.Duration, publicationCoordinate, bool) {
+func (r *rawFileSystem) admitAttrLocked(ctx context.Context, inode uint64, identity publicationIdentity) (time.Duration, publicationCoordinate, *cacheInstallReservation, bool) {
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
 	if _, held := r.heldInodes[inode]; held {
-		return 0, coordinate, false
+		return 0, coordinate, nil, false
 	}
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
-		return 0, coordinate, false
+		return 0, coordinate, nil, false
+	}
+	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
+	if !admitted {
+		return 0, coordinate, nil, false
+	}
+	if _, already := r.cachedAttrs[identity]; !already {
+		if len(r.cachedAttrs)+r.pendingAttrs >= r.attrCapacity {
+			r.removeCacheReservationLocked(reservation)
+			return 0, coordinate, nil, false
+		}
+		reservation.capacityReserved = true
+		r.pendingAttrs++
 	}
 	r.publishingInodes[inode]++
 	r.admitSourcePublicationLocked(coordinate)
-	return r.attrTimeout, coordinate, true
+	return r.attrTimeout, coordinate, reservation, true
+}
+
+func (r *rawFileSystem) removeCacheReservationLocked(reservation *cacheInstallReservation) {
+	if reservation == nil {
+		return
+	}
+	set := r.cacheReservations[reservation.coordinate]
+	delete(set, reservation)
+	if len(set) == 0 {
+		delete(r.cacheReservations, reservation.coordinate)
+	}
+}
+
+func (r *rawFileSystem) releaseReplyReservationsLocked(publication *replyPublication) {
+	for coordinate, set := range r.cacheReservations {
+		for reservation := range set {
+			if reservation.publication == publication {
+				delete(set, reservation)
+			}
+		}
+		if len(set) == 0 {
+			delete(r.cacheReservations, coordinate)
+		}
+	}
 }
 
 // settle ends one admitted publication. PREPARE's drain is waiting on exactly
@@ -687,21 +820,132 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	attrLifetime := time.Duration(0)
 	var attrCoordinate publicationCoordinate
 	cachedAttr := false
-	if cachedName {
-		attrLifetime, attrCoordinate, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
+	if cachedName && publication.postState == nil {
+		var attrReservation *cacheInstallReservation
+		attrLifetime, attrCoordinate, attrReservation, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
+		if cachedAttr {
+			publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, identity: record.identity, record: record, coordinate: attrCoordinate, reservation: attrReservation})
+		}
 	}
 	r.mu.Unlock()
 	if cachedName {
 		publication.names = append(publication.names, namePublication)
-	}
-	if cachedAttr {
-		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, coordinate: attrCoordinate})
 	}
 	out.NodeId = record.id
 	out.Generation = 1
 	out.SetEntryTimeout(entry)
 	out.SetAttrTimeout(attrLifetime)
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	return nil
+}
+
+type dirPlusCandidate struct {
+	entry  *fuse.EntryOut
+	dirent *authoritypb.Dirent
+	record *inodeRecord
+}
+
+// publishDirPlusPage reserves an authority page as one admission unit. The
+// page is already serialized with zero lifetimes; only a successful preflight
+// for every name and attr turns any of them on. This keeps the bounded registry
+// invariant independent of READDIRPLUS concurrency and avoids a partially
+// cached page when one registry reaches capacity.
+func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRecord, candidates []dirPlusCandidate) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || parent == nil {
+		return errors.New("fusev3: READDIRPLUS escaped its reply-publication lifecycle")
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	snapshot := candidates[0].dirent.GetSnapshotSequence()
+	if snapshot == 0 || publication.snapshotSequence != 0 || publication.cacheStamp != nil || publication.postState != nil {
+		return errors.New("fusev3: malformed READDIRPLUS page stamp")
+	}
+	for _, candidate := range candidates {
+		item := candidate.dirent.GetItem()
+		if candidate.entry == nil || candidate.record == nil || item == nil || item.GetAttr() == nil ||
+			candidate.dirent.GetSnapshotSequence() != snapshot || candidate.dirent.GetObjectVersion() == 0 ||
+			candidate.dirent.GetObjectVersion() > snapshot || item.GetSnapshotSequence() != snapshot ||
+			item.GetObjectVersion() != candidate.dirent.GetObjectVersion() || !bytes.Equal(item.GetStableIdentity(), candidate.record.identity[:]) {
+			return errors.New("fusev3: inconsistent READDIRPLUS page record")
+		}
+	}
+	publication.needsPostVFS = true
+	publication.snapshotSequence = snapshot
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	newNames := make(map[nameKey]struct{}, len(candidates))
+	newAttrs := make(map[publicationIdentity]struct{}, len(candidates))
+	admissible := true
+	for _, candidate := range candidates {
+		name := string(candidate.dirent.GetName())
+		key := nameKey{parent: parent.key.inode, name: name}
+		stable := publicationNamespace{parent: parent.identity, name: name}
+		nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: name}
+		attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: candidate.record.identity}
+		r.supersedeNegativeNameLocked(key, nameCoordinate)
+		_, nameHeld := r.heldNames[key]
+		_, inodeHeld := r.heldInodes[candidate.record.key.inode]
+		if nameHeld || inodeHeld {
+			admissible = false
+		}
+		if !r.sourcePublicationAllowedLocked(nameCoordinate, nil) || !r.sourcePublicationAllowedLocked(attrCoordinate, nil) ||
+			r.repairingCoordinates[nameCoordinate] || snapshot <= r.lastPeerRepairSequence[nameCoordinate] ||
+			r.repairingCoordinates[attrCoordinate] || snapshot <= r.lastPeerRepairSequence[attrCoordinate] {
+			admissible = false
+		}
+		if _, exists := r.cachedNames[key]; !exists {
+			newNames[key] = struct{}{}
+		}
+		if _, exists := r.cachedAttrs[candidate.record.identity]; !exists {
+			newAttrs[candidate.record.identity] = struct{}{}
+		}
+	}
+	if r.cachedNameTotalLocked()+len(newNames) > r.nameCapacity || len(r.cachedAttrs)+r.pendingAttrs+len(newAttrs) > r.attrCapacity {
+		admissible = false
+	}
+	if !admissible {
+		return nil
+	}
+
+	reservedNames := make(map[nameKey]bool, len(newNames))
+	reservedAttrs := make(map[publicationIdentity]bool, len(newAttrs))
+	for _, candidate := range candidates {
+		name := string(candidate.dirent.GetName())
+		key := nameKey{parent: parent.key.inode, name: name}
+		stable := publicationNamespace{parent: parent.identity, name: name}
+		nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: name}
+		attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: candidate.record.identity}
+		nameReservation, _ := r.reserveCacheCandidateLocked(publication, nameCoordinate)
+		attrReservation, _ := r.reserveCacheCandidateLocked(publication, attrCoordinate)
+		namePublication := replyNamePublication{key: key, stable: stable, record: candidate.record, coordinate: nameCoordinate, reservation: nameReservation}
+		if _, needed := newNames[key]; needed && !reservedNames[key] {
+			namePublication.reserved = true
+			reservedNames[key] = true
+			r.pendingNames++
+		}
+		if _, needed := newAttrs[candidate.record.identity]; needed && !reservedAttrs[candidate.record.identity] {
+			attrReservation.capacityReserved = true
+			reservedAttrs[candidate.record.identity] = true
+			r.pendingAttrs++
+		}
+		r.publishingNames[key]++
+		r.publishingInodes[candidate.record.key.inode]++
+		r.admitSourcePublicationLocked(nameCoordinate)
+		r.admitSourcePublicationLocked(attrCoordinate)
+		publication.names = append(publication.names, namePublication)
+		publication.attrs = append(publication.attrs, replyAttrPublication{
+			inode: candidate.record.key.inode, identity: candidate.record.identity, record: candidate.record,
+			coordinate: attrCoordinate, reservation: attrReservation,
+		})
+		publication.dirPlus = append(publication.dirPlus, replyDirPlusPublication{
+			entry: candidate.entry, nameReservation: nameReservation, attrReservation: attrReservation,
+		})
+		candidate.entry.SetEntryTimeout(r.entryTimeout)
+		candidate.entry.SetAttrTimeout(r.attrTimeout)
+	}
 	return nil
 }
 
@@ -760,10 +1004,10 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 	}
 	publication.needsPostVFS = true
 	r.mu.Lock()
-	lifetime, coordinate, cached := r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
+	lifetime, coordinate, reservation, cached := r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
 	r.mu.Unlock()
 	if cached {
-		publication.attrs = append(publication.attrs, replyAttrPublication{inode: attr.GetInode(), coordinate: coordinate})
+		publication.attrs = append(publication.attrs, replyAttrPublication{inode: attr.GetInode(), identity: record.identity, record: record, coordinate: coordinate, reservation: reservation})
 	}
 	out.NodeId, out.Generation = record.id, 1
 	out.SetEntryTimeout(0)
@@ -784,7 +1028,7 @@ func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublica
 			r.pendingNames--
 		}
 	}
-	if successful {
+	if successful && (publication.reservation == nil || !publication.reservation.revoked) {
 		if publication.negative {
 			// A materializing callback may have superseded this mount's absence
 			// before the kernel returned the lookup's merged receipt. Settling still
@@ -809,7 +1053,13 @@ func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublica
 	r.settleSourcePublicationLocked(publication.coordinate)
 }
 
-func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublication) {
+func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublication, successful bool) {
+	if publication.reservation != nil && publication.reservation.capacityReserved && r.pendingAttrs > 0 {
+		r.pendingAttrs--
+	}
+	if successful && (publication.reservation == nil || !publication.reservation.revoked) && publication.record != nil && !publication.record.reclaimed {
+		r.cachedAttrs[publication.identity] = publication.record
+	}
 	if r.publishingInodes[publication.inode]--; r.publishingInodes[publication.inode] <= 0 {
 		delete(r.publishingInodes, publication.inode)
 	}
@@ -836,7 +1086,7 @@ func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublicati
 		r.settleNamePublicationLocked(name, successful)
 	}
 	for _, attr := range publication.attrs {
-		r.settleAttrPublicationLocked(attr)
+		r.settleAttrPublicationLocked(attr, successful)
 	}
 	for _, data := range publication.data {
 		r.settleDataPublicationLocked(data, successful)
@@ -870,10 +1120,69 @@ func (r *rawFileSystem) finishReplyPublicationRegistration(unique uint64, public
 		r.mount.revoke(fmt.Errorf("fusev3: FUSE request identity %d lost its reserved reply-publication ownership", unique))
 		return
 	}
+	if publication.postState != nil {
+		if err := validateMutationPostState(publication.postState); err != nil {
+			publication.payloadError = err
+		} else if err := validateExpectedPostState(publication); err != nil {
+			publication.payloadError = err
+		} else {
+			publication.droppedAttrs = make(map[publicationIdentity]bool)
+			for _, object := range publication.postState.GetObjects() {
+				identity, ok := publicationIdentityFromBytes(object.GetStableIdentity())
+				if !ok {
+					publication.payloadError = errors.New("fusev3: post-state object carried an invalid stable identity")
+					break
+				}
+				record := r.byIdentityLocked(identity)
+				if record == nil || record.id == 0 || object.GetAttr().GetInode() != record.key.inode || object.GetAttr().GetKind() != record.key.kind {
+					publication.payloadError = fmt.Errorf("fusev3: post-state object %x has no matching canonical live node", identity)
+					break
+				}
+				coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
+				if held := r.sourceHolds[coordinate]; r.peerHolds[coordinate] != 0 || r.repairingCoordinates[coordinate] || held != nil && held != publication.source {
+					publication.droppedAttrs[identity] = true
+					continue
+				}
+				reservation, admitted := r.reserveCacheCandidateLocked(publication, coordinate)
+				if !admitted {
+					publication.droppedAttrs[identity] = true
+					continue
+				}
+				if _, already := r.cachedAttrs[identity]; !already {
+					if len(r.cachedAttrs)+r.pendingAttrs >= r.attrCapacity {
+						r.removeCacheReservationLocked(reservation)
+						publication.droppedAttrs[identity] = true
+						continue
+					}
+					reservation.capacityReserved = true
+					r.pendingAttrs++
+				}
+				r.publishingInodes[record.key.inode]++
+				r.admitSourcePublicationLocked(coordinate)
+				publication.attrs = append(publication.attrs, replyAttrPublication{
+					inode: record.key.inode, identity: identity, record: record, coordinate: coordinate, reservation: reservation,
+				})
+			}
+		}
+	}
 	if publication.empty() {
 		delete(r.replyPublications, unique)
 	}
 	r.mu.Unlock()
+}
+
+func (r *rawFileSystem) byIdentityLocked(identity publicationIdentity) *inodeRecord {
+	var found *inodeRecord
+	for _, record := range r.nodesByID {
+		if record == nil || record.graft || record.reclaimed || record.identity != identity {
+			continue
+		}
+		if found != nil && found != record {
+			return nil
+		}
+		found = record
+	}
+	return found
 }
 
 // ReplyWriteOrdered joins cache/source-bearing replies to go-fuse's ordered
@@ -883,6 +1192,171 @@ func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.replyPublications[unique] != nil || r.publishAcks[unique] != nil
+}
+
+// PrepareReplyPayload is the PENDING-to-FINALIZED transition. It runs under
+// go-fuse's physical writer mutex, so no notification can overtake the bytes
+// whose lifetimes and DROP decisions are frozen here.
+func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, fuse.Status) {
+	r.mu.Lock()
+	publication := r.replyPublications[unique]
+	if publication == nil {
+		r.mu.Unlock()
+		if opcode == 44 { // READDIRPLUS
+			return payloadSize, fuse.OK
+		}
+		return 0, fuse.OK
+	}
+	if publication.payloadError != nil {
+		err := publication.payloadError
+		r.mu.Unlock()
+		r.mount.revoke(err)
+		return 0, fuse.EIO
+	}
+	for _, set := range r.cacheReservations {
+		for reservation := range set {
+			if reservation.publication != publication {
+				continue
+			}
+			if reservation.state != cacheReservationPending {
+				r.mu.Unlock()
+				r.mount.revoke(errors.New("fusev3: cache reservation finalized more than once"))
+				return 0, fuse.EIO
+			}
+			reservation.state = cacheReservationFinalized
+		}
+	}
+	nameDropped, attrDropped := false, make(map[publicationIdentity]bool)
+	for _, candidate := range publication.names {
+		if candidate.reservation != nil && candidate.reservation.revoked {
+			nameDropped = true
+		}
+	}
+	for identity, dropped := range publication.droppedAttrs {
+		attrDropped[identity] = dropped
+	}
+	for _, candidate := range publication.attrs {
+		if candidate.reservation != nil && candidate.reservation.revoked {
+			attrDropped[candidate.identity] = true
+		}
+	}
+	for _, candidate := range publication.dirPlus {
+		if candidate.entry == nil {
+			continue
+		}
+		if candidate.nameReservation != nil && candidate.nameReservation.revoked {
+			candidate.entry.SetEntryTimeout(0)
+		}
+		if candidate.attrReservation != nil && candidate.attrReservation.revoked {
+			candidate.entry.SetAttrTimeout(0)
+		}
+	}
+	r.mu.Unlock()
+
+	if nameDropped {
+		zeroEntryLifetime(opcode, outData)
+	}
+	if publication.cacheStamp != nil {
+		if len(payload) < fuse.PFSCacheStampSize {
+			return 0, fuse.EIO
+		}
+		if len(publication.attrs) != 0 && attrDropped[publication.attrs[0].identity] {
+			zeroAttrLifetime(opcode, outData)
+		}
+		binary.LittleEndian.PutUint64(payload[0:8], publication.cacheStamp.SnapshotSequence)
+		binary.LittleEndian.PutUint64(payload[8:16], publication.cacheStamp.ObjectVersion)
+		return fuse.PFSCacheStampSize, fuse.OK
+	}
+	if publication.postState == nil {
+		if opcode == 44 { // READDIRPLUS
+			return payloadSize, fuse.OK
+		}
+		return 0, fuse.OK
+	}
+	state := publication.postState
+	if err := validateMutationPostStateForOpcode(opcode, state); err != nil {
+		r.mount.revoke(err)
+		return 0, fuse.EIO
+	}
+	needed := fuse.PFSPostStateHeaderSize + len(state.GetObjects())*fuse.PFSObjectStateSize
+	if len(payload) < needed {
+		return 0, fuse.EIO
+	}
+	binary.LittleEndian.PutUint64(payload[0:8], state.GetVisibilitySequence())
+	binary.LittleEndian.PutUint64(payload[8:16], state.GetSnapshotSequence())
+	binary.LittleEndian.PutUint64(payload[16:24], uint64(r.attrTimeout))
+	binary.LittleEndian.PutUint32(payload[24:28], uint32(len(state.GetObjects())))
+	binary.LittleEndian.PutUint32(payload[28:32], 0)
+	offset := fuse.PFSPostStateHeaderSize
+	r.mu.Lock()
+	for _, object := range state.GetObjects() {
+		identity, _ := publicationIdentityFromBytes(object.GetStableIdentity())
+		record := r.byIdentityLocked(identity)
+		if record == nil {
+			r.mu.Unlock()
+			return 0, fuse.EIO
+		}
+		encoded := payload[offset : offset+fuse.PFSObjectStateSize]
+		binary.LittleEndian.PutUint64(encoded[0:8], record.id)
+		binary.LittleEndian.PutUint64(encoded[8:16], object.GetObjectVersion())
+		copy(encoded[16:32], object.GetStableIdentity())
+		var attr fuse.Attr
+		fillAttr(object.GetAttr(), &attr, r.mount.uid, r.mount.gid)
+		encodeFuseAttr(encoded[32:120], &attr)
+		binary.LittleEndian.PutUint32(encoded[120:124], object.GetRoles())
+		binary.LittleEndian.PutUint32(encoded[124:128], object.GetAttr().GetFlags())
+		binary.LittleEndian.PutUint64(encoded[128:136], uint64(object.GetAttr().GetBirthTimeNs()))
+		binary.LittleEndian.PutUint32(encoded[136:140], 1)
+		if attrDropped[identity] {
+			binary.LittleEndian.PutUint32(encoded[140:144], 1)
+		}
+		offset += fuse.PFSObjectStateSize
+	}
+	r.mu.Unlock()
+	return needed, fuse.OK
+}
+
+func zeroEntryLifetime(opcode uint32, out []byte) {
+	switch opcode {
+	case 1, 6, 8, 9, 13, 35, 51: // LOOKUP, SYMLINK, MKNOD, MKDIR, LINK, CREATE, TMPFILE
+		if len(out) >= 40 {
+			clear(out[16:24])
+			clear(out[32:36])
+		}
+	}
+}
+
+func zeroAttrLifetime(opcode uint32, out []byte) {
+	switch opcode {
+	case 1, 6, 8, 9, 13, 35, 51:
+		if len(out) >= 40 {
+			clear(out[24:32])
+			clear(out[36:40])
+		}
+	case 3, 4: // GETATTR, SETATTR
+		if len(out) >= 12 {
+			clear(out[0:12])
+		}
+	}
+}
+
+func encodeFuseAttr(out []byte, attr *fuse.Attr) {
+	binary.LittleEndian.PutUint64(out[0:8], attr.Ino)
+	binary.LittleEndian.PutUint64(out[8:16], attr.Size)
+	binary.LittleEndian.PutUint64(out[16:24], attr.Blocks)
+	binary.LittleEndian.PutUint64(out[24:32], attr.Atime)
+	binary.LittleEndian.PutUint64(out[32:40], attr.Mtime)
+	binary.LittleEndian.PutUint64(out[40:48], attr.Ctime)
+	binary.LittleEndian.PutUint32(out[48:52], attr.Atimensec)
+	binary.LittleEndian.PutUint32(out[52:56], attr.Mtimensec)
+	binary.LittleEndian.PutUint32(out[56:60], attr.Ctimensec)
+	binary.LittleEndian.PutUint32(out[60:64], attr.Mode)
+	binary.LittleEndian.PutUint32(out[64:68], attr.Nlink)
+	binary.LittleEndian.PutUint32(out[68:72], attr.Uid)
+	binary.LittleEndian.PutUint32(out[72:76], attr.Gid)
+	binary.LittleEndian.PutUint32(out[76:80], attr.Rdev)
+	binary.LittleEndian.PutUint32(out[80:84], attr.Blksize)
+	binary.LittleEndian.PutUint32(out[84:88], attr.Flags)
 }
 
 // ReplyPublishMarked freezes a state-bearing original kernel request identity
@@ -952,6 +1426,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	publication.originalWrote = true
 	publication.originalStatus = status
 	close(publication.originalDone)
+	r.releaseReplyReservationsLocked(publication)
 	// A same-mount source gate may be waiting for exactly this physical edge:
 	// once a negative reply is in the kernel's hands, its enclosing mutation may
 	// supersede it even though the merged post-VFS receipt is still outstanding.
@@ -1230,6 +1705,9 @@ func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
 	// repair drops the pages a live open description can immediately refault.
 	if r.cachedData[record.key.inode] == record {
 		delete(r.cachedData, record.key.inode)
+	}
+	if r.cachedAttrs[record.identity] == record {
+		delete(r.cachedAttrs, record.identity)
 	}
 	if record.graft {
 		// A machine-local object holds no authority capability, so there is
@@ -1900,6 +2378,10 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 		return fuse.Status(syscall.ENOTCONN)
 	}
 	out.Fh, out.OpenFlags = id, flags
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -2415,7 +2897,7 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 		return fuse.Status(errno)
 	}
 	for {
-		entry, errno := handle.peek(ctx)
+		entry, _, errno := handle.peek(ctx, false)
 		if errno != 0 {
 			return fuse.Status(errno)
 		}
@@ -2428,8 +2910,75 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 	}
 }
 
-func (r *rawFileSystem) ReadDirPlus(<-chan struct{}, *fuse.ReadIn, *fuse.DirEntryList) fuse.Status {
-	return fuse.ENOSYS
+func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+	// Mixed authority/local directories do not negotiate READDIRPLUS, so seeing
+	// a local handle here means the kernel violated the negotiated capability.
+	if r.grafts != nil {
+		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
+			r.releaseHandleOperation(held)
+			return fuse.EIO
+		}
+	}
+	handleRecord, handle := r.acquireDirHandle(input.Fh)
+	if handle == nil {
+		return fuse.EBADF
+	}
+	defer r.releaseHandleOperation(handleRecord)
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	if errno := handle.Seekdir(ctx, input.Offset); errno != 0 {
+		return fuse.Status(errno)
+	}
+	candidates := make([]dirPlusCandidate, 0, 32)
+	for {
+		entry, dirent, errno := handle.peek(ctx, true)
+		if errno != 0 {
+			return fuse.Status(errno)
+		}
+		if entry == nil || dirent == nil {
+			break
+		}
+		item := dirent.GetItem()
+		if item == nil || item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) {
+			r.mount.revoke(errors.New("fusev3: authority READDIRPLUS record omitted or disagreed with its item"))
+			return fuse.Status(syscall.ENOTCONN)
+		}
+		if !out.PFSDirLookupEntryFits(entry.Name) {
+			if len(candidates) == 0 {
+				return fuse.Status(syscall.EOVERFLOW)
+			}
+			break
+		}
+		record, internErrno := r.intern(ctx, item)
+		if internErrno != 0 {
+			return fuse.Status(internErrno)
+		}
+		r.bindPath(record, handleRecord.inode, entry.Name)
+		entry.Ino = record.key.inode
+		entryOut, stamp := out.AddPFSDirLookupEntry(*entry)
+		if entryOut == nil || stamp == nil {
+			return fuse.EIO
+		}
+		entryOut.NodeId, entryOut.Generation = record.id, 1
+		entryOut.SetEntryTimeout(0)
+		entryOut.SetAttrTimeout(0)
+		fillAttr(item.GetAttr(), &entryOut.Attr, r.mount.uid, r.mount.gid)
+		stamp.SnapshotSequence = dirent.GetSnapshotSequence()
+		stamp.ObjectVersion = dirent.GetObjectVersion()
+		candidates = append(candidates, dirPlusCandidate{entry: entryOut, dirent: dirent, record: record})
+		handle.consumePlus()
+		if handle.authorityPageExhausted() {
+			break
+		}
+	}
+	if err := r.publishDirPlusPage(ctx, handleRecord.inode, candidates); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	return fuse.OK
 }
 
 func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
@@ -2637,12 +3186,13 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 	publication.needsPostVFS = true
 	inode := attr.GetInode()
 	r.mu.Lock()
-	lifetime, coordinate, cached := r.admitAttrLocked(ctx, inode, identity)
+	record := r.byIdentityLocked(identity)
+	lifetime, coordinate, reservation, cached := r.admitAttrLocked(ctx, inode, identity)
 	r.mu.Unlock()
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 	out.SetTimeout(lifetime)
 	if cached {
-		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, coordinate: coordinate})
+		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, identity: identity, record: record, coordinate: coordinate, reservation: reservation})
 	}
 }
 
