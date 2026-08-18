@@ -290,10 +290,31 @@ def validate_open(
             raise ProtocolError("shared OPENDIR may not cache directory data")
 
 
-def lookup_requires_marker(parent: str, result: str | None) -> bool:
+def lookup_requires_marker(
+    parent: str, result: str | None, *, route_claimed: bool = False
+) -> bool:
+    if route_claimed:
+        return False
     if result is None:
         return parent == "shared"
     return result == "shared"
+
+
+def strict_negative_lookup_shape(
+    *, attr_flags: int, stamp_size: int, marked: bool,
+    generation: int = 0, entry_lifetime: int = 0,
+    attr_lifetime: int = 0, other_attr_nonzero: bool = False,
+) -> str:
+    if attr_flags == ATTR_PFS_LOCAL:
+        if (stamp_size or marked or generation or entry_lifetime or
+                attr_lifetime or other_attr_nonzero):
+            raise ProtocolError("malformed LOCAL negative")
+        return "local"
+    if attr_flags == 0:
+        if stamp_size != 32 or not marked:
+            raise ProtocolError("malformed SHARED negative")
+        return "shared"
+    raise ProtocolError("negative carried an invalid class")
 
 
 REQUIRED_INIT = {
@@ -985,6 +1006,43 @@ class AbiAndAdmissionTests(unittest.TestCase):
         }
         for key, required in matrix.items():
             self.assertEqual(lookup_requires_marker(*key), required)
+        self.assertFalse(
+            lookup_requires_marker("shared", None, route_claimed=True)
+        )
+
+    def test_local_and_shared_negatives_have_disjoint_exact_shapes(self) -> None:
+        self.assertEqual(
+            strict_negative_lookup_shape(
+                attr_flags=ATTR_PFS_LOCAL, stamp_size=0, marked=False
+            ),
+            "local",
+        )
+        self.assertEqual(
+            strict_negative_lookup_shape(
+                attr_flags=0, stamp_size=32, marked=True
+            ),
+            "shared",
+        )
+        for malformed in (
+            {"attr_flags": ATTR_PFS_LOCAL, "stamp_size": 32, "marked": False},
+            {"attr_flags": ATTR_PFS_LOCAL, "stamp_size": 0, "marked": True},
+            {
+                "attr_flags": ATTR_PFS_LOCAL,
+                "stamp_size": 0,
+                "marked": False,
+                "entry_lifetime": 1,
+            },
+            {"attr_flags": 0, "stamp_size": 0, "marked": False},
+            {"attr_flags": 0, "stamp_size": 32, "marked": False},
+            {
+                "attr_flags": ATTR_PFS_SHARED,
+                "stamp_size": 32,
+                "marked": True,
+            },
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ProtocolError):
+                    strict_negative_lookup_shape(**malformed)
 
 
 class TransactionTests(unittest.TestCase):
