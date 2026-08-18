@@ -29,7 +29,7 @@ func (r *rawFileSystem) PFSPublish(_ <-chan struct{}, input *fuse.PFSPublishIn, 
 	}
 
 	r.mu.Lock()
-	if r.replyTerminal {
+	if r.replyTerminal || r.replyTerminalizing {
 		r.mu.Unlock()
 		return fuse.Status(syscall.ENOTCONN)
 	}
@@ -58,7 +58,7 @@ func (r *rawFileSystem) PFSPublish(_ <-chan struct{}, input *fuse.PFSPublishIn, 
 	case <-originalDone:
 	case <-r.mount.ctx.Done():
 		r.mu.Lock()
-		if r.replyTerminal {
+		if r.replyTerminal || r.replyTerminalizing {
 			r.mu.Unlock()
 			return fuse.Status(syscall.ENOTCONN)
 		}
@@ -72,7 +72,7 @@ func (r *rawFileSystem) PFSPublish(_ <-chan struct{}, input *fuse.PFSPublishIn, 
 	}
 
 	r.mu.Lock()
-	if r.replyTerminal {
+	if r.replyTerminal || r.replyTerminalizing {
 		r.mu.Unlock()
 		return fuse.Status(syscall.ENOTCONN)
 	}
