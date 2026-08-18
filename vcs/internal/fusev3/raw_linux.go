@@ -105,6 +105,24 @@ type replyDirPlusPublication struct {
 	attrReservation *cacheInstallReservation
 }
 
+type stagedDirPlusLookup struct {
+	record *inodeRecord
+	parent *inodeRecord
+	name   string
+}
+
+// dirPlusLookupTransaction owns every provisional resource used to construct
+// one READDIRPLUS page. The authority capabilities and daemon lookup counts
+// exist before the kernel can own them, so the physical reply write is the
+// single commit edge for the whole collection.
+type dirPlusLookupTransaction struct {
+	cursor       *dirPlusCursorTransaction
+	handleRecord *handleRecord
+	lookups      []stagedDirPlusLookup
+	ready        bool
+	settled      bool
+}
+
 type cacheReservationState uint8
 
 const (
@@ -154,6 +172,7 @@ type replyPublication struct {
 	cacheStamp           *fuse.PFSCacheStamp
 	droppedAttrs         map[publicationIdentity]bool
 	dirPlus              []replyDirPlusPublication
+	dirPlusLookups       *dirPlusLookupTransaction
 	snapshotSequence     uint64
 	payloadError         error
 
@@ -177,7 +196,7 @@ type replyPublication struct {
 func (p *replyPublication) empty() bool {
 	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
 		p.writeKernelTx == 0 && p.writeHandle == nil && len(p.responseConsumptions) == 0 && !p.needsPostVFS &&
-		p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil
+		p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
 
 func (p *replyPublication) consumeAuthorityResponse() {
@@ -842,7 +861,105 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 type dirPlusCandidate struct {
 	entry  *fuse.EntryOut
 	dirent *authoritypb.Dirent
+	item   *authoritypb.Item
 	record *inodeRecord
+}
+
+type dirPlusLookupCompletion struct {
+	tx       *dirPlusLookupTransaction
+	commit   bool
+	reclaims [][]byte
+	corrupt  bool
+}
+
+func (r *rawFileSystem) attachDirPlusLookupTransaction(ctx context.Context, cursor *dirPlusCursorTransaction, handle *handleRecord) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || cursor == nil || handle == nil {
+		return errors.New("fusev3: READDIRPLUS lookup transaction escaped its reply lifecycle")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.replyPublications[publication.requestUnique] != publication || publication.dirPlusLookups != nil {
+		return errors.New("fusev3: READDIRPLUS lookup transaction lost its reply ownership")
+	}
+	publication.dirPlusLookups = &dirPlusLookupTransaction{cursor: cursor, handleRecord: handle}
+	return nil
+}
+
+func (r *rawFileSystem) stageDirPlusLookup(ctx context.Context, record, parent *inodeRecord, name string) error {
+	publication := replyPublicationFromContext(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if publication == nil || r.replyPublications[publication.requestUnique] != publication ||
+		publication.dirPlusLookups == nil || publication.dirPlusLookups.settled || publication.dirPlusLookups.ready ||
+		record == nil || record.reclaimed || r.nodesByID[record.id] != record || record.lookups == 0 || parent == nil {
+		return errors.New("fusev3: READDIRPLUS lookup could not join its page transaction")
+	}
+	publication.dirPlusLookups.lookups = append(publication.dirPlusLookups.lookups, stagedDirPlusLookup{
+		record: record, parent: parent, name: name,
+	})
+	return nil
+}
+
+func (r *rawFileSystem) commitDirPlusLookupTransaction(ctx context.Context) error {
+	publication := replyPublicationFromContext(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if publication == nil || r.replyPublications[publication.requestUnique] != publication ||
+		publication.dirPlusLookups == nil || publication.dirPlusLookups.settled || publication.dirPlusLookups.ready {
+		return errors.New("fusev3: READDIRPLUS page could not reach its physical-write commit edge")
+	}
+	publication.dirPlusLookups.ready = true
+	return nil
+}
+
+// settleDirPlusLookupTransactionLocked transfers the staged lookup references
+// to the kernel only when a complete successful page reached /dev/fuse. Cache
+// publication still waits for PFS_PUBLISH; lookup and path ownership do not,
+// because the kernel owns those references as soon as it accepts the page.
+func (r *rawFileSystem) settleDirPlusLookupTransactionLocked(publication *replyPublication, physicalWrite bool) dirPlusLookupCompletion {
+	if publication == nil || publication.dirPlusLookups == nil || publication.dirPlusLookups.settled {
+		return dirPlusLookupCompletion{}
+	}
+	tx := publication.dirPlusLookups
+	tx.settled = true
+	commit := physicalWrite && tx.ready
+	completion := dirPlusLookupCompletion{tx: tx, commit: commit}
+	if commit {
+		for _, lookup := range tx.lookups {
+			r.bindPathLocked(lookup.record, lookup.parent, lookup.name)
+		}
+		return completion
+	}
+	for _, lookup := range tx.lookups {
+		record := lookup.record
+		if record == nil || record.root || record.reclaimed || r.nodesByID[record.id] != record || record.lookups == 0 {
+			completion.corrupt = true
+			continue
+		}
+		record.lookups--
+		if index := r.identityIndexLocked(record); record.lookups == 0 && record.pins == 0 && index[record.key] == record {
+			delete(index, record.key)
+		}
+		if reclaim := r.collectLocked(record); len(reclaim) != 0 {
+			completion.reclaims = append(completion.reclaims, reclaim)
+		}
+	}
+	return completion
+}
+
+func (r *rawFileSystem) finishDirPlusLookupCompletion(completion dirPlusLookupCompletion) {
+	if completion.tx == nil {
+		return
+	}
+	cursorSettled := completion.tx.cursor.finish(completion.commit)
+	for _, reclaim := range completion.reclaims {
+		r.mount.deferReclaim(reclaim)
+	}
+	r.releaseHandleOperation(completion.tx.handleRecord)
+	if completion.corrupt || !cursorSettled {
+		r.mount.revoke(errors.New("fusev3: READDIRPLUS settlement lost staged lookup or cursor ownership"))
+	}
 }
 
 // publishDirPlusPage reserves an authority page as one admission unit. The
@@ -863,7 +980,7 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 		return errors.New("fusev3: malformed READDIRPLUS page stamp")
 	}
 	for _, candidate := range candidates {
-		item := candidate.dirent.GetItem()
+		item := candidate.item
 		if candidate.entry == nil || candidate.record == nil || item == nil || item.GetAttr() == nil ||
 			candidate.dirent.GetSnapshotSequence() != snapshot || candidate.dirent.GetObjectVersion() == 0 ||
 			candidate.dirent.GetObjectVersion() > snapshot || item.GetSnapshotSequence() != snapshot ||
@@ -1439,6 +1556,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	// once a negative reply is in the kernel's hands, its enclosing mutation may
 	// supersede it even though the merged post-VFS receipt is still outstanding.
 	r.signalSourceChangedLocked()
+	dirPlusCompletion := r.settleDirPlusLookupTransactionLocked(publication, status.Ok())
 	if !status.Ok() {
 		delete(r.replyPublications, unique)
 		if publication.publishUnique != 0 && r.publishAcks[publication.publishUnique] == publication {
@@ -1446,6 +1564,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		}
 		r.settleReplyPublicationLocked(publication, false)
 		r.mu.Unlock()
+		r.finishDirPlusLookupCompletion(dirPlusCompletion)
 		r.finishOneShotWritePublication(publication)
 		if publication.source != nil {
 			publication.source.revoke()
@@ -1460,6 +1579,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		delete(r.replyPublications, unique)
 		r.settleReplyPublicationLocked(publication, true)
 		r.mu.Unlock()
+		r.finishDirPlusLookupCompletion(dirPlusCompletion)
 		r.finishWriteTransactionPublication(publication, unique)
 		if publication.source != nil {
 			publication.source.release()
@@ -1468,6 +1588,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		return
 	}
 	r.mu.Unlock()
+	r.finishDirPlusLookupCompletion(dirPlusCompletion)
 }
 
 func (r *rawFileSystem) finishWriteTransactionPublication(publication *replyPublication, unique uint64) {
@@ -2931,15 +3052,29 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 	if handle == nil {
 		return fuse.EBADF
 	}
-	defer r.releaseHandleOperation(handleRecord)
+	releaseHandle := true
+	defer func() {
+		if releaseHandle {
+			r.releaseHandleOperation(handleRecord)
+		}
+	}()
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return lifecycle
 	}
 	defer finish()
-	if errno := handle.Seekdir(ctx, input.Offset); errno != 0 {
+	cursor, errno := handle.beginDirPlus(ctx, input.Offset)
+	if errno != 0 {
 		return fuse.Status(errno)
 	}
+	if err := r.attachDirPlusLookupTransaction(ctx, cursor, handleRecord); err != nil {
+		_ = cursor.finish(false)
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	// The reply transaction now retains this handle operation until the
+	// physical write commits or rolls back the staged page.
+	releaseHandle = false
 	candidates := make([]dirPlusCandidate, 0, 32)
 	for {
 		entry, dirent, errno := handle.peek(ctx, true)
@@ -2964,7 +3099,16 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		if internErrno != 0 {
 			return fuse.Status(internErrno)
 		}
-		r.bindPath(record, handleRecord.inode, entry.Name)
+		if err := r.stageDirPlusLookup(ctx, record, handleRecord.inode, entry.Name); err != nil {
+			r.Forget(record.id, 1)
+			r.mount.revoke(err)
+			return fuse.Status(syscall.ENOTCONN)
+		}
+		transferred := handle.consumePlus()
+		if transferred != item {
+			r.mount.revoke(errors.New("fusev3: READDIRPLUS capability transfer lost its pending item"))
+			return fuse.Status(syscall.ENOTCONN)
+		}
 		entry.Ino = record.key.inode
 		entryOut, stamp := out.AddPFSDirLookupEntry(*entry)
 		if entryOut == nil || stamp == nil {
@@ -2978,13 +3122,16 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		stamp.ObjectVersion = dirent.GetObjectVersion()
 		stamp.BirthTimeNS = item.GetAttr().GetBirthTimeNs()
 		stamp.InodeFlags = item.GetAttr().GetFlags()
-		candidates = append(candidates, dirPlusCandidate{entry: entryOut, dirent: dirent, record: record})
-		handle.consumePlus()
+		candidates = append(candidates, dirPlusCandidate{entry: entryOut, dirent: dirent, item: item, record: record})
 		if handle.authorityPageExhausted() {
 			break
 		}
 	}
 	if err := r.publishDirPlusPage(ctx, handleRecord.inode, candidates); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := r.commitDirPlusLookupTransaction(ctx); err != nil {
 		r.mount.revoke(err)
 		return fuse.Status(syscall.ENOTCONN)
 	}

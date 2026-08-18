@@ -1020,6 +1020,11 @@ type dirHandle struct {
 	pageWantItems bool
 	eof           bool
 	once          sync.Once
+	// plusReply serializes the directory cursor across the physical reply edge.
+	// READDIRPLUS transfers authority capabilities while building a page, but
+	// the kernel owns their lookup references only after /dev/fuse accepts the
+	// reply. No later directory request may observe that provisional cursor.
+	plusReply *dirPlusCursorTransaction
 
 	// local is the set of machine-local route roots this directory contains and
 	// shadow is the set of names they own. Both are decided once, when the
@@ -1031,6 +1036,13 @@ type dirHandle struct {
 	local      []fuse.DirEntry
 	shadow     func(name string) bool
 	localIndex int
+}
+
+type dirPlusCursorTransaction struct {
+	handle *dirHandle
+	start  uint64
+	done   chan struct{}
+	once   sync.Once
 }
 
 func (n *node) opContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -1610,13 +1622,19 @@ func (h *dirHandle) consume() {
 	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
 }
 
-func (h *dirHandle) consumePlus() {
+func (h *dirHandle) consumePlus() *authoritypb.Item {
 	h.mu.Lock()
-	if h.pendingDirent != nil {
-		h.pendingDirent.Item = nil
+	defer h.mu.Unlock()
+	if h.pending == nil || h.pendingDirent == nil {
+		return nil
 	}
-	h.mu.Unlock()
-	h.consume()
+	item := h.pendingDirent.GetItem()
+	h.pendingDirent.Item = nil
+	h.index++
+	h.cookie = h.pendingCookie
+	h.next = h.pending.Off
+	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
+	return item
 }
 
 func (h *dirHandle) discardPageItemsLocked() {
@@ -1634,9 +1652,7 @@ func (h *dirHandle) authorityPageExhausted() bool {
 	return h.index >= len(h.page)
 }
 
-func (h *dirHandle) Seekdir(_ context.Context, off uint64) syscall.Errno {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 	if off == h.next {
 		// The kernel is continuing from where this handle stopped. Keeping the
 		// buffered page is the whole point of fetching 256 entries at a time.
@@ -1663,6 +1679,73 @@ func (h *dirHandle) Seekdir(_ context.Context, off uint64) syscall.Errno {
 	}
 	h.page, h.index, h.eof = nil, 0, false
 	return 0
+}
+
+func (h *dirHandle) Seekdir(ctx context.Context, off uint64) syscall.Errno {
+	for {
+		h.mu.Lock()
+		pending := h.plusReply
+		if pending == nil {
+			errno := h.seekdirLocked(off)
+			h.mu.Unlock()
+			return errno
+		}
+		done := pending.done
+		h.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return contextErrno(ctx.Err())
+		}
+	}
+}
+
+func (h *dirHandle) beginDirPlus(ctx context.Context, off uint64) (*dirPlusCursorTransaction, syscall.Errno) {
+	for {
+		h.mu.Lock()
+		pending := h.plusReply
+		if pending == nil {
+			if errno := h.seekdirLocked(off); errno != 0 {
+				h.mu.Unlock()
+				return nil, errno
+			}
+			tx := &dirPlusCursorTransaction{handle: h, start: off, done: make(chan struct{})}
+			h.plusReply = tx
+			h.mu.Unlock()
+			return tx, 0
+		}
+		done := pending.done
+		h.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, contextErrno(ctx.Err())
+		}
+	}
+}
+
+func (tx *dirPlusCursorTransaction) finish(commit bool) bool {
+	if tx == nil || tx.handle == nil {
+		return false
+	}
+	settled := false
+	tx.once.Do(func() {
+		h := tx.handle
+		h.mu.Lock()
+		if h.plusReply == tx {
+			if !commit {
+				// Force the ordinary seek reset even though the provisional
+				// cursor may already equal its starting offset.
+				h.next = ^tx.start
+				_ = h.seekdirLocked(tx.start)
+			}
+			h.plusReply = nil
+			close(tx.done)
+			settled = true
+		}
+		h.mu.Unlock()
+	})
+	return settled
 }
 
 func (h *dirHandle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
