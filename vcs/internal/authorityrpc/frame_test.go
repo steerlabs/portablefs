@@ -42,7 +42,13 @@ type failAfterWriter struct {
 
 type countedWriteConn struct {
 	net.Conn
+	reads  atomic.Int64
 	writes atomic.Int64
+}
+
+func (c *countedWriteConn) Read(payload []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(payload)
 }
 
 func (c *countedWriteConn) Write(payload []byte) (int, error) {
@@ -155,7 +161,9 @@ func TestTLSFrameRoundTripBatchesSocketWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	clientCounted.writes.Store(0)
+	clientCounted.reads.Store(0)
 	serverCounted.writes.Store(0)
+	serverCounted.reads.Store(0)
 
 	payload := bytes.Repeat([]byte{0x5C}, 1<<20)
 	want := &authoritypb.Request{
@@ -198,6 +206,12 @@ func TestTLSFrameRoundTripBatchesSocketWrites(t *testing.T) {
 	}
 	if writes := serverCounted.writes.Load(); writes > 6 {
 		t.Fatalf("1 MiB TLS response used %d socket writes, want at most 6", writes)
+	}
+	if reads := serverCounted.reads.Load(); reads > 6 {
+		t.Fatalf("1 MiB TLS request used %d socket reads, want at most 6", reads)
+	}
+	if reads := clientCounted.reads.Load(); reads > 6 {
+		t.Fatalf("1 MiB TLS response used %d socket reads, want at most 6", reads)
 	}
 }
 
@@ -861,8 +875,9 @@ func BenchmarkTLSFrameLoopback1MiB(b *testing.B) {
 	clientTLS.DynamicRecordSizingDisabled = true
 	clientRaw, serverRaw := net.Pipe()
 	counted := &countedWriteConn{Conn: clientRaw}
+	serverCounted := &countedWriteConn{Conn: serverRaw}
 	client := newAuthorityTLSClient(counted, clientTLS)
-	server := newAuthorityTLSServer(serverRaw, serverTLS)
+	server := newAuthorityTLSServer(serverCounted, serverTLS)
 	b.Cleanup(func() {
 		_ = clientRaw.Close()
 		_ = serverRaw.Close()
@@ -903,6 +918,7 @@ func BenchmarkTLSFrameLoopback1MiB(b *testing.B) {
 		}
 	}()
 	counted.writes.Store(0)
+	serverCounted.reads.Store(0)
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))
 	b.ResetTimer()
@@ -923,6 +939,7 @@ func BenchmarkTLSFrameLoopback1MiB(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.ReportMetric(float64(counted.writes.Load())/float64(iterations), "socket-writes/op")
+	b.ReportMetric(float64(serverCounted.reads.Load())/float64(iterations), "socket-reads/op")
 }
 
 // Defect 10: post-authentication payload allocation had no worker-wide byte
