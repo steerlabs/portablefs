@@ -26,8 +26,9 @@ one serialized deployment:
 3. Build a commit-tagged E2B candidate from a digest-pinned OpenSteer Runner
    image, then start a disposable candidate sandbox and verify the client
    release plus Linux FUSE prerequisites.
-4. Activate the release on the Manager and cell control processes. This does
-   not restart a live Authority.
+4. Copy the release through the private IAP tunnels with SSH compression, then
+   activate it on the Manager and cell control processes. This does not restart
+   a live Authority.
 5. Drain OpenSteer E2B sandboxes, request the Manager's restart transaction,
    drain once more, and prove the old Authority service, listener, and cgroup
    are absent.
@@ -93,9 +94,21 @@ gcloud projects add-iam-policy-binding smooth-comfort-488701-t3 \
 Grant the same service account `roles/artifactregistry.reader` on only the
 `opensteer-admin/us-west1/staging` Artifact Registry repository. Its Workload
 Identity User binding names the exact GitHub OIDC subject
-`repo:steerlabs/portablefs:environment:opensteer-production`. OpenSteer's
-separate image-publishing identity keeps Artifact Registry write access; this
-deployment identity does not.
+`repo:steerlabs@252926615/portablefs@1313214092:environment:opensteer-production`.
+PortableFS was created after GitHub introduced immutable OIDC subjects, so the
+organization and repository IDs are part of the subject. Use the repository
+OIDC API's `sub_claim_prefix` rather than assuming the legacy name-only format.
+OpenSteer's separate image-publishing identity keeps Artifact Registry write
+access; this deployment identity does not.
+
+Enable OS Login in both the VM project and the project that owns the deployer
+service account. Google creates the service account's POSIX profile through the
+latter project even though the VMs live in the former:
+
+```bash
+gcloud services enable oslogin.googleapis.com --project=opensteer-admin
+gcloud services enable oslogin.googleapis.com --project=smooth-comfort-488701-t3
+```
 
 The VMs have no public SSH address. Deployment uses OS Login through IAP. The
 service account needs administrative login because the existing host activator
