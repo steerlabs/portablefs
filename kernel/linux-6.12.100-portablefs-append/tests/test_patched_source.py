@@ -600,8 +600,18 @@ class PatchedSourceTests(unittest.TestCase):
             directory.index("static int fuse_readlink")
         ]
         self.assertIn("fuse_pfs_generic_permission", permission)
+        self.assertIn("fuse_pfs_execute_permission", permission)
         self.assertIn("fuse_pfs_attr_is_exact(inode)", permission)
+        self.assertIn(
+            "if (pfs_shared && !fuse_pfs_attr_is_exact(inode))", permission
+        )
         self.assertIn("mutex_lock(&fi->pfs_publish_mutex)", permission)
+        execute = permission[
+            permission.index("static int fuse_pfs_execute_permission"):
+            permission.index("static int fuse_permission")
+        ]
+        self.assertIn("if (!IS_ATTR_EXACT(inode))", execute)
+        self.assertIn("inode->i_mode & 0111", execute)
 
         namei = self.source("fs/namei.c")
         inode_permission = namei[
