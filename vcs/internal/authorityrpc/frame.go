@@ -233,7 +233,12 @@ func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Durat
 	return release, nil
 }
 
-func writeFrame(w io.Writer, max uint32, message proto.Message) error {
+type frameBoundaryWriter interface {
+	beginFrameWrite() error
+	endFrameWrite() error
+}
+
+func writeFrame(w io.Writer, max uint32, message proto.Message) (err error) {
 	carrier, err := frameBulkCarrier(message)
 	if err != nil {
 		return err
@@ -267,6 +272,16 @@ func writeFrame(w io.Writer, max uint32, message proto.Message) error {
 	}
 	binary.BigEndian.PutUint32(prefix[:4], uint32(len(metadata)))
 	binary.BigEndian.PutUint32(prefix[4:8], uint32(len(bulk)))
+	if buffered, ok := w.(frameBoundaryWriter); ok {
+		if err := buffered.beginFrameWrite(); err != nil {
+			return err
+		}
+		defer func() {
+			if flushErr := buffered.endFrameWrite(); err == nil {
+				err = flushErr
+			}
+		}()
+	}
 	if err := writeAll(w, prefix); err != nil {
 		return err
 	}

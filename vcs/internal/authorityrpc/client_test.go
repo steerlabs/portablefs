@@ -559,7 +559,7 @@ func TestClientResumesItsTLSSessionAcrossTransportReconnects(t *testing.T) {
 		t.Fatalf("DATA call after transport loss = (%v, %v)", response, err)
 	}
 	client.data.pendingMu.Lock()
-	resumed, _ := client.data.conn.(*tls.Conn)
+	resumed, _ := client.data.conn.(*authorityTLSConn)
 	client.data.pendingMu.Unlock()
 	if resumed == nil {
 		t.Fatal("DATA did not reconnect")
@@ -3573,7 +3573,7 @@ func TestNextVisibilityAfterAckReconnectsAfterAcceptedAckLostBeforeNext(t *testi
 	}
 }
 
-func testTLSConfigs(t *testing.T) (*tls.Config, *tls.Config) {
+func testTLSConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 	t.Helper()
 	now := time.Now()
 	caPub, caKey, _ := ed25519.GenerateKey(rand.Reader)

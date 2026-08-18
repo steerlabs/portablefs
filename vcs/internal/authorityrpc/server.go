@@ -205,7 +205,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	}
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.NextProtos = []string{protocolALPN}
-	tlsListener := tls.NewListener(listener, tlsConfig)
+	tlsConfig.DynamicRecordSizingDisabled = true
 	serveCtx, cancel := context.WithCancel(ctx)
 	connections := make(chan struct{}, s.MaxConnections)
 	var connectionWorkers sync.WaitGroup
@@ -215,21 +215,22 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	}
 	defer func() {
 		cancel()
-		_ = tlsListener.Close()
+		_ = listener.Close()
 		connectionWorkers.Wait()
 	}()
 	go func() {
 		<-serveCtx.Done()
-		_ = tlsListener.Close()
+		_ = listener.Close()
 	}()
 	for {
-		conn, err := tlsListener.Accept()
+		raw, err := listener.Accept()
 		if err != nil {
 			if serveCtx.Err() != nil {
 				return nil
 			}
 			return err
 		}
+		conn := newAuthorityTLSServer(raw, tlsConfig)
 		select {
 		case connections <- struct{}{}:
 			connectionWorkers.Add(1)
@@ -249,7 +250,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 // authorization decision downstream reads it from the request context.
 func (s *Server) serveConn(parent context.Context, conn net.Conn, bounds TransportBounds) error {
 	defer conn.Close()
-	tlsConn, ok := conn.(*tls.Conn)
+	tlsConn, ok := conn.(*authorityTLSConn)
 	if !ok {
 		return errors.New("authorityrpc: authority connections must be mutually authenticated TLS")
 	}

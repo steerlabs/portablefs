@@ -150,9 +150,9 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn := tls.Client(raw, c.tlsConfig())
+	conn := newAuthorityTLSClient(raw, c.tlsConfig())
 	if err := conn.HandshakeContext(ctx); err != nil {
-		_ = raw.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if conn.ConnectionState().NegotiatedProtocol != protocolALPN {
