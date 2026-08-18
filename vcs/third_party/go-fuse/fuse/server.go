@@ -594,7 +594,7 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 		defer ms.requestProcessingMu.Unlock()
 	}
 
-	h, inSize, outSize, outPayloadSize, code := parseRequest(req.inputBuf, &ms.kernelSettings)
+	h, inSize, outSize, outPayloadSize, variableReply, code := parseRequest(req.inputBuf, &ms.kernelSettings)
 	if !code.Ok() {
 		ms.opts.Logger.Printf("parseRequest: %v", code)
 		return code
@@ -610,6 +610,10 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	if outPayloadSize > 0 {
 		req.outPayload = ms.buffers.AllocBuffer(uint32(outPayloadSize))
 		req.bufferPoolOutputBuf = req.outPayload
+		if variableReply {
+			req.outPayload = req.outPayload[:0]
+			req.variableReply = true
+		}
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {
@@ -646,11 +650,11 @@ func (ms *Server) ReplyWriteLifecycleArmed() bool {
 }
 
 func (ms *Server) writeReply(req *request) Status {
-	if status := ms.prepareReplyForWrite(req); !status.Ok() {
-		return status
-	}
 	unique := req.inHeader().Unique
 	return runReplyWriteLifecycle(ms.replyWriteLifecycle, unique, &ms.writeMu, func() Status {
+		if status := ms.prepareReplyForWrite(req); !status.Ok() {
+			return status
+		}
 		return ms.write(req)
 	})
 }
@@ -665,6 +669,20 @@ func (ms *Server) writeReply(req *request) Status {
 // kernel is required to abort the connection.
 func (ms *Server) prepareReplyForWrite(req *request) Status {
 	unique := req.inHeader().Unique
+	if req.variableReply {
+		preparer, ok := ms.replyWriteLifecycle.(ReplyPayloadPreparer)
+		if !ok {
+			return EIO
+		}
+		n, status := preparer.PrepareReplyPayload(unique, req.inHeader().NodeId, req.inHeader().Opcode, req.outDataBuf, req.outPayload[:cap(req.outPayload)], len(req.outPayload))
+		if !status.Ok() || n < 0 || n > cap(req.outPayload) {
+			if status.Ok() {
+				status = EIO
+			}
+			return status
+		}
+		req.outPayload = req.outPayload[:n]
+	}
 	// Most FUSE header errors have no VFS result for the kernel to publish.
 	// LOOKUP -ENOENT is the deliberate exception: d_lookup_done installs the
 	// negative result after the reply wakes the requester, even when its cache
@@ -677,7 +695,6 @@ func (ms *Server) prepareReplyForWrite(req *request) Status {
 			// A marked response without physical writer ownership could race a
 			// notification before the kernel creates its publication receipt.
 			// Fail the device write path; the lifecycle owner must fence.
-			ms.replyWriteLifecycle.ReplyWritten(unique, EIO)
 			return EIO
 		}
 	}
@@ -769,6 +786,8 @@ func newNotifyRequest(opcode uint32) *request {
 			_OP_NOTIFY_DELETE:         NOTIFY_DELETE,
 			_OP_NOTIFY_PRUNE:          NOTIFY_PRUNE,
 			_OP_NOTIFY_PFS_SIZE:       NOTIFY_PFS_SIZE,
+			_OP_NOTIFY_PFS_ATTR:       NOTIFY_PFS_ATTR,
+			_OP_NOTIFY_PFS_ENTRY:      NOTIFY_PFS_ENTRY,
 		}[opcode],
 	}
 	r.inHeader().Opcode = opcode
@@ -800,6 +819,32 @@ func (ms *protocolServer) PFSSizeNotify(node uint64, size uint64, sequence uint6
 	out.Nodeid = node
 	out.Size = size
 	out.Sequence = sequence
+	return ms.notifyWrite(req)
+}
+
+func (ms *protocolServer) PFSAttrNotify(node, sequence uint64) Status {
+	if node == 0 || sequence == 0 || !ms.kernelSettings.SupportsNotify(NOTIFY_PFS_ATTR) {
+		return EINVAL
+	}
+	req := newNotifyRequest(_OP_NOTIFY_PFS_ATTR)
+	out := (*NotifyPFSAttrOut)(req.outData())
+	out.Nodeid, out.VisibilitySequence = node, sequence
+	return ms.notifyWrite(req)
+}
+
+func (ms *protocolServer) PFSEntryNotify(parent, child, sequence uint64, name string, deleted bool) Status {
+	if parent == 0 || sequence == 0 || len(name) == 0 || len(name) > 255 || child == 0 && deleted || child != 0 && !deleted ||
+		!ms.kernelSettings.SupportsNotify(NOTIFY_PFS_ENTRY) {
+		return EINVAL
+	}
+	req := newNotifyRequest(_OP_NOTIFY_PFS_ENTRY)
+	out := (*NotifyPFSEntryOut)(req.outData())
+	out.Parent, out.Child, out.VisibilitySequence = parent, child, sequence
+	out.NameLen = uint32(len(name))
+	if deleted {
+		out.Flags = 1
+	}
+	req.outPayload = []byte(name)
 	return ms.notifyWrite(req)
 }
 
@@ -1034,7 +1079,7 @@ func (in *InitIn) SupportsNotify(notifyType int) bool {
 		return in.SupportsVersion(7, 18)
 	case NOTIFY_PRUNE:
 		return in.SupportsVersion(7, 45)
-	case NOTIFY_PFS_SIZE:
+	case NOTIFY_PFS_SIZE, NOTIFY_PFS_ATTR, NOTIFY_PFS_ENTRY:
 		return in.Flags64()&CAP_PFS_STRICT_COHERENCE != 0
 	}
 	return false

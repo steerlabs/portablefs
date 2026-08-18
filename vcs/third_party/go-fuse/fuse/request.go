@@ -45,8 +45,9 @@ type request struct {
 	status Status
 
 	// Unstructured output. Only one of these is non-nil.
-	outPayload []byte
-	readResult ReadResult
+	outPayload    []byte
+	readResult    ReadResult
+	variableReply bool
 
 	// Start timestamp for timing info.
 	startTime time.Time
@@ -94,6 +95,7 @@ func (r *request) clear() {
 	r.outPayload = nil
 	r.startTime = time.Time{}
 	r.readResult = nil
+	r.variableReply = false
 }
 
 func asType(ptr unsafe.Pointer, typ interface{}) interface{} {
@@ -210,7 +212,7 @@ func (r *request) inData() unsafe.Pointer {
 }
 
 // note: outSize is without OutHeader
-func parseRequest(in []byte, kernelSettings *InitIn) (h *operationHandler, inSize, outSize, outPayloadSize int, errno Status) {
+func parseRequest(in []byte, kernelSettings *InitIn) (h *operationHandler, inSize, outSize, outPayloadSize int, variableReply bool, errno Status) {
 	inSize = int(unsafe.Sizeof(InHeader{}))
 	if len(in) < inSize {
 		errno = EIO
@@ -243,7 +245,16 @@ func parseRequest(in []byte, kernelSettings *InitIn) (h *operationHandler, inSiz
 	outSize = int(h.OutputSize)
 
 	switch hdr.Opcode {
-	case _OP_READDIR, _OP_READDIRPLUS, _OP_READ:
+	case _OP_LOOKUP, _OP_GETATTR:
+		outPayloadSize, variableReply = PFSCacheStampSize, true
+	case _OP_SETATTR, _OP_SYMLINK, _OP_MKNOD, _OP_MKDIR, _OP_UNLINK,
+		_OP_RMDIR, _OP_RENAME, _OP_LINK, _OP_SETXATTR, _OP_REMOVEXATTR,
+		_OP_OPEN, _OP_CREATE, _OP_FALLOCATE, _OP_RENAME2, _OP_TMPFILE,
+		PFS_WRITE_OPCODE, PFS_FALLOCATE_OPCODE, PFS_COPY_FILE_RANGE_OPCODE:
+		outPayloadSize, variableReply = PFSPostStateMaxSize, true
+	case _OP_READDIRPLUS:
+		outPayloadSize, variableReply = int(((*ReadIn)(inData)).Size), true
+	case _OP_READDIR, _OP_READ:
 		outPayloadSize = int(((*ReadIn)(inData)).Size)
 	case _OP_GETXATTR, _OP_LISTXATTR:
 		// [GET|LIST]XATTR is two opcodes in one: get/list xattr size (return

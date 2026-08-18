@@ -54,6 +54,49 @@ func TestPFSWriteABILayout(t *testing.T) {
 	if got, want := unsafe.Sizeof(NotifyPFSSizeOut{}), uintptr(24); got != want {
 		t.Fatalf("fuse_notify_pfs_size_out size = %d, want %d", got, want)
 	}
+	if got, want := unsafe.Sizeof(NotifyPFSAttrOut{}), uintptr(16); got != want {
+		t.Fatalf("fuse_notify_pfs_attr_out size = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Sizeof(NotifyPFSEntryOut{}), uintptr(32); got != want {
+		t.Fatalf("fuse_notify_pfs_entry_out size = %d, want %d", got, want)
+	}
+	var postState PFSPostStateHeader
+	if got, want := unsafe.Sizeof(postState), uintptr(PFSPostStateHeaderSize); got != want {
+		t.Fatalf("fuse_pfs_post_state_header size = %d, want %d", got, want)
+	}
+	for name, test := range map[string]struct{ got, want uintptr }{
+		"visibility_sequence": {unsafe.Offsetof(postState.VisibilitySequence), 0},
+		"snapshot_sequence":   {unsafe.Offsetof(postState.SnapshotSequence), 8},
+		"attr_valid_ns":       {unsafe.Offsetof(postState.AttrValidNS), 16},
+		"object_count":        {unsafe.Offsetof(postState.ObjectCount), 24},
+		"flags":               {unsafe.Offsetof(postState.Flags), 28},
+	} {
+		if test.got != test.want {
+			t.Errorf("fuse_pfs_post_state_header.%s offset = %d, want %d", name, test.got, test.want)
+		}
+	}
+	var object PFSObjectState
+	if got, want := unsafe.Sizeof(object), uintptr(PFSObjectStateSize); got != want {
+		t.Fatalf("fuse_pfs_object_state size = %d, want %d", got, want)
+	}
+	for name, test := range map[string]struct{ got, want uintptr }{
+		"nodeid":          {unsafe.Offsetof(object.Nodeid), 0},
+		"object_version":  {unsafe.Offsetof(object.ObjectVersion), 8},
+		"stable_identity": {unsafe.Offsetof(object.StableIdentity), 16},
+		"attr":            {unsafe.Offsetof(object.Attr), 32},
+		"roles":           {unsafe.Offsetof(object.Roles), 120},
+		"inode_flags":     {unsafe.Offsetof(object.InodeFlags), 124},
+		"birth_time_ns":   {unsafe.Offsetof(object.BirthTimeNS), 128},
+		"pfs_class":       {unsafe.Offsetof(object.PFSClass), 136},
+		"record_flags":    {unsafe.Offsetof(object.RecordFlags), 140},
+	} {
+		if test.got != test.want {
+			t.Errorf("fuse_pfs_object_state.%s offset = %d, want %d", name, test.got, test.want)
+		}
+	}
+	if got, want := unsafe.Sizeof(PFSCacheStamp{}), uintptr(PFSCacheStampSize); got != want {
+		t.Fatalf("fuse_pfs_cache_stamp size = %d, want %d", got, want)
+	}
 	var publishIn PFSPublishIn
 	if got, want := unsafe.Sizeof(publishIn)-unsafe.Sizeof(publishIn.InHeader), uintptr(32); got != want {
 		t.Fatalf("fuse_pfs_publish_in size = %d, want %d", got, want)
@@ -100,7 +143,8 @@ func TestPFSWriteABILayout(t *testing.T) {
 func TestPFSWriteABIConstants(t *testing.T) {
 	if PFS_WRITE_OPCODE != 4097 || PFS_PUBLISH_OPCODE != 4098 || PFS_FALLOCATE_OPCODE != 4099 || PFS_COPY_FILE_RANGE_OPCODE != 4100 || PFS_UNIQUE_PUBLISH != uint64(1)<<62 ||
 		FOPEN_PFS_SHARED != 1<<8 || FOPEN_PFS_LOCAL != 1<<9 || FUSE_ATTR_PFS_SHARED != 1<<2 ||
-		FUSE_ATTR_PFS_LOCAL != 1<<3 || CAP_PFS_STRICT_COHERENCE != uint64(1)<<63 || NOTIFY_PFS_SIZE != -10 || PFS_PUBLISH_ACK != 1 ||
+		FUSE_ATTR_PFS_LOCAL != 1<<3 || CAP_PFS_STRICT_COHERENCE != uint64(1)<<63 || NOTIFY_PFS_SIZE != -10 ||
+		NOTIFY_PFS_ATTR != -12 || NOTIFY_PFS_ENTRY != -13 || PFS_PUBLISH_ACK != 1 ||
 		CAP_PFS_CACHED_DATA != uint64(1)<<62 || CAP_PFS_WRITE_ONESHOT != uint64(1)<<61 {
 		t.Fatalf("private ABI constants changed")
 	}
@@ -128,6 +172,51 @@ func TestPFSWriteABIConstants(t *testing.T) {
 		if flag != 1<<index {
 			t.Fatalf("range reply flag %d = %#x", index, flag)
 		}
+	}
+}
+
+func TestPostStateOpcodesReserveVariableReplyPayload(t *testing.T) {
+	for _, opcode := range []uint32{
+		_OP_SETATTR, _OP_SYMLINK, _OP_MKNOD, _OP_MKDIR, _OP_UNLINK,
+		_OP_RMDIR, _OP_RENAME, _OP_LINK, _OP_OPEN, _OP_SETXATTR,
+		_OP_REMOVEXATTR, _OP_CREATE, _OP_FALLOCATE, _OP_RENAME2,
+		_OP_TMPFILE, PFS_WRITE_OPCODE, PFS_FALLOCATE_OPCODE,
+		PFS_COPY_FILE_RANGE_OPCODE,
+	} {
+		handler := getHandler(opcode)
+		if handler == nil {
+			t.Fatalf("opcode %d has no handler", opcode)
+		}
+		inputSize := int(handler.InputSize)
+		if inputSize < int(unsafe.Sizeof(InHeader{})) {
+			inputSize = int(unsafe.Sizeof(InHeader{}))
+		}
+		input := make([]byte, inputSize)
+		header := (*InHeader)(unsafe.Pointer(&input[0]))
+		header.Length, header.Opcode, header.Unique = uint32(inputSize), opcode, 2
+		_, _, _, payload, variable, status := parseRequest(input, &InitIn{})
+		if !status.Ok() || !variable || payload != PFSPostStateMaxSize {
+			t.Errorf("opcode %d parse = payload %d variable %t status %v", opcode, payload, variable, status)
+		}
+	}
+}
+
+func TestStampedReadDirPlusKeepsKernelBufferCapacity(t *testing.T) {
+	inputSize := int(getHandler(_OP_READDIRPLUS).InputSize)
+	input := make([]byte, inputSize)
+	in := (*ReadIn)(unsafe.Pointer(&input[0]))
+	in.InHeader = InHeader{Length: uint32(inputSize), Opcode: _OP_READDIRPLUS, Unique: 2}
+	in.Size = 4096
+	_, _, _, payload, variable, status := parseRequest(input, &InitIn{})
+	if !status.Ok() || !variable || payload != 4096 {
+		t.Fatalf("READDIRPLUS parse = payload %d variable %t status %v", payload, variable, status)
+	}
+	buffer := make([]byte, 0, payload)
+	list := NewDirEntryList(buffer, 0)
+	entry, stamp := list.AddPFSDirLookupEntry(DirEntry{Name: "child", Ino: 7, Off: 1, Mode: syscall.S_IFREG})
+	want := int(unsafe.Sizeof(EntryOut{})) + int(unsafe.Sizeof(_Dirent{})) + PFSCacheStampSize + 8
+	if entry == nil || stamp == nil || len(list.bytes()) != want {
+		t.Fatalf("stamped dirent = entry %v stamp %v bytes %d, want %d", entry != nil, stamp != nil, len(list.bytes()), want)
 	}
 }
 

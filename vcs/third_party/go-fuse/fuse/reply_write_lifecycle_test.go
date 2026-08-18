@@ -19,6 +19,20 @@ type testReplyWriteLifecycle struct {
 	early         atomic.Bool
 }
 
+type testVariableReplyLifecycle struct {
+	*testReplyWriteLifecycle
+	prepared chan struct{}
+}
+
+func (l *testVariableReplyLifecycle) PrepareReplyPayload(_ uint64, _ uint64, _ uint32, _ []byte, payload []byte, priorSize int) (int, Status) {
+	if priorSize != 0 || len(payload) < 5 {
+		return 0, EIO
+	}
+	copy(payload, "trail")
+	close(l.prepared)
+	return 5, OK
+}
+
 func (l *testReplyWriteLifecycle) ReplyWriteOrdered(uint64) bool { return l.ordered }
 
 func (l *testReplyWriteLifecycle) ReplyPublishMarked(uint64, uint64, uint32) bool {
@@ -136,6 +150,55 @@ func TestOrderedReplyLifecycleReportsWriterFailureAfterReturn(t *testing.T) {
 	}
 	if lifecycle.early.Load() {
 		t.Fatal("ReplyWritten observed a pre-return writer state")
+	}
+}
+
+func TestOrderedReplyLifecycleFinalizesVariablePayloadAtWriterBoundary(t *testing.T) {
+	var writeReturned atomic.Bool
+	base := &testReplyWriteLifecycle{
+		ordered:       true,
+		writeReturned: &writeReturned,
+		written:       make(chan Status, 1),
+	}
+	lifecycle := &testVariableReplyLifecycle{
+		testReplyWriteLifecycle: base,
+		prepared:                make(chan struct{}),
+	}
+	input := make([]byte, unsafe.Sizeof(InHeader{}))
+	header := (*InHeader)(unsafe.Pointer(&input[0]))
+	header.Unique, header.NodeId, header.Opcode = 91, 7, _OP_CREATE
+	req := &request{
+		inputBuf:      input,
+		outHeaderBuf:  make([]byte, sizeOfOutHeader),
+		outPayload:    make([]byte, 0, 16),
+		variableReply: true,
+		status:        OK,
+	}
+	server := &Server{replyWriteLifecycle: lifecycle}
+	var writeMu sync.Mutex
+	status := runReplyWriteLifecycle(lifecycle, header.Unique, &writeMu, func() Status {
+		if status := server.prepareReplyForWrite(req); !status.Ok() {
+			return status
+		}
+		select {
+		case <-lifecycle.prepared:
+		default:
+			return EIO
+		}
+		if got := string(req.outPayload); got != "trail" {
+			return EIO
+		}
+		writeReturned.Store(true)
+		return OK
+	})
+	if status != OK {
+		t.Fatalf("write status = %v, want OK", status)
+	}
+	if observed := <-lifecycle.written; observed != OK {
+		t.Fatalf("observed status = %v, want OK", observed)
+	}
+	if lifecycle.early.Load() {
+		t.Fatal("ReplyWritten ran before the finalized payload write returned")
 	}
 }
 
