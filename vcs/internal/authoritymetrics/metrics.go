@@ -144,6 +144,8 @@ type Metrics struct {
 	writeStagedBytes     *Gauge
 	writeAdmissionBlocks *Counter
 	writeAdmissionWait   *Histogram
+	fsyncBarrierHandles  *Counter
+	fsyncStorageSyncs    *Counter
 	visibilityDuration   *Histogram
 	visibilityAudience   *Histogram
 	fences               [fenceReasonCount]*Counter
@@ -217,6 +219,14 @@ func New(volume string) (*Metrics, error) {
 		return nil, err
 	}
 	metrics.writeAdmissionWait, err = registry.RegisterHistogram("portablefs_authority_write_admission_wait_seconds", "Time spent waiting in FIFO write-transaction capacity admission.", admissionDurationBuckets, base)
+	if err != nil {
+		return nil, err
+	}
+	metrics.fsyncBarrierHandles, err = registry.RegisterCounter("portablefs_authority_fsync_barrier_handles_total", "Fsync barrier requests assigned to completed storage-sync batches.", base)
+	if err != nil {
+		return nil, err
+	}
+	metrics.fsyncStorageSyncs, err = registry.RegisterCounter("portablefs_authority_fsync_storage_syncs_total", "Completed storage sync syscalls serving fsync barrier batches.", base)
 	if err != nil {
 		return nil, err
 	}
@@ -313,6 +323,16 @@ func (m *Metrics) WriteAdmissionFinished(elapsed time.Duration) {
 	}
 	m.writeWaiting.Dec()
 	m.writeAdmissionWait.Observe(elapsed.Seconds())
+}
+
+// ObserveFsyncBatch records the two counters whose ratio is the group-commit
+// effectiveness: barrier handles per real storage sync.
+func (m *Metrics) ObserveFsyncBatch(handles int) {
+	if m == nil || handles <= 0 {
+		return
+	}
+	m.fsyncBarrierHandles.Add(uint64(handles))
+	m.fsyncStorageSyncs.Inc()
 }
 
 func (m *Metrics) ObserveVisibilityBarrier(elapsed time.Duration, audience int) {
