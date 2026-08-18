@@ -215,7 +215,7 @@ message Attr {
   int64 birth_time_ns = 12;
   uint32 rdev = 13;
   uint32 blksize = 14;
-  uint32 flags = 15;       // persisted inode/BSD flags; zero when none
+  uint32 flags = 15;       // statx attributes masked by stx_attributes_mask
 }
 ```
 
@@ -227,16 +227,30 @@ the complete touched-identity set in increasing stripe index, holds them across
 the XFS operation and snapshot, and releases them after the terminal replay
 record is complete. A stripe collision is one lock, not a recursive lock.
 
+The touched-identity set is defined over identities that exist when those
+writer locks are acquired. A mutation that allocates a new identity (create,
+mkdir, symlink, mknod, or O_TMPFILE) covers the newborn object under its
+parent's stripe writer lock, held across the allocating syscall and the
+post-apply snapshot. The newborn is unreachable by every other authority
+operation until this operation's visibility turn publishes it, so the parent
+stripe is the exact exclusion boundary rather than a relaxation. The new
+identity participates in touched-identity lock sets beginning with its first
+subsequent operation. In particular, linkat of an O_TMPFILE is such a
+subsequent operation: the tmpfile identity already exists and MUST be included
+in that link operation's touched-identity set.
+
 The snapshot uses `statx` with every supported basic, birth-time, device, block
 size, and attribute bit requested. It consumes `stx_rdev_major`,
 `stx_rdev_minor`, and `stx_blksize`; `rdev` is Linux `new_encode_dev()` of that
-device. Because XFS inode flags are not completely represented by `statx`, the
-authority also issues `FS_IOC_GETFLAGS` on each retained descriptor while the
-same stripe writer locks are held and places that result in `Attr.flags`.
-Missing a required field or failing the ioctl is a post-apply storage error,
-not permission to send zero. The authority does not derive timestamps, link
-counts, block counts, flags, or parent attributes from the request. A
-post-apply error has the same snapshot obligation as a clean success.
+device. `Attr.flags` is exactly `stx_attributes & stx_attributes_mask` from
+that same `statx` call, including the maskable IMMUTABLE, APPEND, NODUMP,
+VERITY, DAX, and ENCRYPTED bits the client kernel enforces. A bit absent from
+`stx_attributes_mask` is not part of exact post-state. There is no second
+syscall, descriptor reopen, or per-object-type special case. A failed `statx`
+is a post-apply storage error, and sending zero in place of a maskable set bit
+is forbidden. The authority does not derive timestamps, link counts, block
+counts, flags, or parent attributes from the request. A post-apply error has
+the same snapshot obligation as a clean success.
 
 `PostState` is present exactly for `APPLIED` and `POSTAPPLY_ERROR` outcomes and
 for every structured RESOLVE_OPEN outcome. In the latter case section 4 defines
@@ -454,9 +468,9 @@ The kernel processes an admitted trailer as one installation transaction:
 
 1. Parse and validate the entire base reply and trailer without changing an
    inode or dentry. Check the operation's exact object/role set, identities,
-   versions, kinds, inode numbers, class flags, filesystem flags, birth times,
+   versions, kinds, inode numbers, class flags, statx attribute flags, birth times,
    sizes, DROP decisions, and duplicates. `fuse_attr.flags` carries private
-   FUSE attr bits; `inode_flags` carries the filesystem flag word.
+   FUSE attr bits; `inode_flags` carries the masked statx attribute word.
 2. Sort distinct `nodeid` values and take their `pfs_publish_mutex` locks in
    numeric order, including the parent inode for every entry candidate. Take a
    regular file's `mapping->invalidate_lock` exclusively only when the operation
@@ -1912,7 +1926,7 @@ change that edits their source schema.
 |---|---|
 | Authority schema/framing | `proto/authority/v1/authority.proto`, generated `vcs/internal/authoritypb`, `vcs/internal/authorityrpc/protocol.go`, `frame.go`, `wire_validate.go`, client/server transport dispatch; set `responseEnvelopeReserve = 2048`, retain the four-object PostState cap in validation, and extend `TestRetainedReplyEnvelopeFitsReserve` with the maximum two-byte-tag envelope |
 | Authority writes and replay | `vcs/internal/authorityrpc/write_transaction_linux.go` replaced by write-stream state, one-shot handlers removed, source-publication gate derivation, replay fingerprinting, dedicated write and terminal-receipt lanes, guaranteed staging quota, staging sweeper, `vcs/internal/volumeserver` replay/visibility order |
-| XFS state extraction | `vcs/internal/xfsstore` mutation interfaces and implementations, canonical striped writer-lock sets for every mutation including SetAttr, post-operation `statx`, `FS_IOC_GETFLAGS`, rdev/blksize extraction, parent snapshots, sync error classification |
+| XFS state extraction | `vcs/internal/xfsstore` mutation interfaces and implementations, canonical striped writer-lock sets for every mutation including SetAttr and the allocating-mutation parent-stripe rule, post-operation `statx`, masked `stx_attributes`, rdev/blksize extraction, parent snapshots, sync error classification |
 | Linux daemon adapter | `vcs/internal/fusev3/fuse_linux.go`, `raw_linux.go`, `write_transaction_linux.go` replacement, mutation handlers, source publication, identity/node registry, range mutation replies, and mount teardown; add PENDING/FINALIZED cache-install reservations under the source/peer mutex, peer revocation before COMPLETE, positive/negative/attr capacity drops, page-atomic READDIRPLUS registration, and retained stream replay metadata |
 | Maintained go-fuse fork | FUSE 7.42 constants and UAPI structs, deferred private-opcode reply handles, nonblocking reader-to-stream-worker dispatch, combined ingress/reorder window accounting, replay notification, and variable private-opcode replies; no reader goroutine may wait on an authority write or offset gap. The current fork has no `/dev/fuse` mmap API, does not export `mountFd`, and computes `outPayloadSize` only for six stock opcodes, so all three surfaces must be added explicitly along with completion-ring setup exposure |
 | Kernel patch 0001: generic VFS | `kernel/linux-6.12.100-portablefs-append/0001-fs-add-post-VFS-reply-publication-scopes.patch` and `fs/namei.c`; make token permits part of `fs_reply_publish_token`, preserve them through scope merge, post and wait for every token uninterruptibly, and release exactly once. Reserve two possible tokens in `open_last_lookups()` before the final-parent lock; reserve one in `filename_create()` before the parent lock, `do_unlinkat()`/rmdir before the parent lock, and `do_renameat2()` before either parent lock and before `lock_rename()` (the one rename token covers both parent roles). Reserve one before inode/file locks in `vfs_write()`, `vfs_iter_write()`, splice, copy-file-range, and io_uring write entry points, and before the applicable locks in setattr, fallocate, xattr, link, symlink, mkdir/mknod, and tmpfile sites. Add the `FMODE_PFS_APPLIED` clearing of `O_TRUNC` and `acc_mode` in `do_open()` before `may_open()`/`handle_truncate()` |
