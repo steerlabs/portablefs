@@ -332,10 +332,17 @@ func writeTransactionReply(transactionID uint64, flags uint32) *authoritypb.Resp
 }
 
 func writeTransactionFingerprint(h *VolumeHandler, request *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
+	return writeTransactionFingerprintContext(context.Background(), h, request)
+}
+
+func writeTransactionFingerprintContext(ctx context.Context, h *VolumeHandler, request *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
 	if h == nil || h.Runtime == nil {
 		return volumeserver.RequestFingerprint{}, syscall.EIO
 	}
 	if body := request.GetWriteTransaction(); body != nil && body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA {
+		if digest, ok := framePayloadDigest(ctx, request); ok {
+			return canonicalFingerprintWithWriteDataDigest(h.Runtime, request, digest)
+		}
 		// DATA replay identity is epoch-local and never persisted. Hash the bulk
 		// body once, then feed its fixed digest into the keyed canonical request
 		// fingerprint so later canonical traversal never walks the payload again.
@@ -775,11 +782,15 @@ func (h *VolumeHandler) beginWriteTransactionContext(ctx context.Context, reques
 }
 
 func (h *VolumeHandler) writeTransactionForPhase(request *authoritypb.Request, body *authoritypb.WriteTransactionRequest) (writeTransactionMetadata, volumeserver.RequestFingerprint, error) {
+	return h.writeTransactionForPhaseContext(context.Background(), request, body)
+}
+
+func (h *VolumeHandler) writeTransactionForPhaseContext(ctx context.Context, request *authoritypb.Request, body *authoritypb.WriteTransactionRequest) (writeTransactionMetadata, volumeserver.RequestFingerprint, error) {
 	metadata, err := writeTransactionMetadataFromRequest(body)
 	if err != nil || !validWriteTransactionPhaseShape(request, body) || body.GetRequestedSize() > h.MaxWriteTransactionBytes {
 		return writeTransactionMetadata{}, volumeserver.RequestFingerprint{}, syscall.EINVAL
 	}
-	fingerprint, err := writeTransactionFingerprint(h, request)
+	fingerprint, err := writeTransactionFingerprintContext(ctx, h, request)
 	if err != nil {
 		return writeTransactionMetadata{}, volumeserver.RequestFingerprint{}, syscall.EINVAL
 	}
@@ -787,6 +798,10 @@ func (h *VolumeHandler) writeTransactionForPhase(request *authoritypb.Request, b
 }
 
 func (h *VolumeHandler) stageWriteTransaction(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
+	return h.stageWriteTransactionContext(context.Background(), request, credential, body)
+}
+
+func (h *VolumeHandler) stageWriteTransactionContext(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
 	if body.GetSize() > h.MaxWrite {
 		return h.errorResponse(request.GetRequestId(), syscall.EINVAL, false)
 	}
@@ -794,7 +809,7 @@ func (h *VolumeHandler) stageWriteTransaction(request *authoritypb.Request, cred
 	if err != nil {
 		return h.errorResponse(request.GetRequestId(), err, false)
 	}
-	metadata, fingerprint, err := h.writeTransactionForPhase(request, body)
+	metadata, fingerprint, err := h.writeTransactionForPhaseContext(ctx, request, body)
 	if err != nil {
 		return h.errorResponse(request.GetRequestId(), err, false)
 	}
@@ -921,7 +936,7 @@ func (h *VolumeHandler) handleWriteTransaction(ctx context.Context, ctxRequest *
 	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
 		return h.beginWriteTransactionContext(ctx, ctxRequest, credential, body)
 	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
-		return h.stageWriteTransaction(ctxRequest, credential, body)
+		return h.stageWriteTransactionContext(ctx, ctxRequest, credential, body)
 	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
 		return h.abortWriteTransaction(ctxRequest, credential, body)
 	default:

@@ -2211,7 +2211,7 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 	if mutation == nil {
 		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 	}
-	fingerprint, err := canonicalFingerprint(h.Runtime, req)
+	fingerprint, err := canonicalFingerprintFromFrame(ctx, h.Runtime, req)
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 	}

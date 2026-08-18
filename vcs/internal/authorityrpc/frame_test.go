@@ -3,6 +3,7 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -304,6 +305,47 @@ func TestFrameCarriesOneShotWriteDataOutsideProtobufAndRetainsIt(t *testing.T) {
 	release()
 	if got.GetOneShotWrite().GetData() != nil {
 		t.Fatal("released one-shot payload remains reachable from its carrier")
+	}
+}
+
+func TestStreamedFrameDigestMatchesOneShotReplayFingerprint(t *testing.T) {
+	data := bytes.Repeat([]byte{0x96}, 1<<20)
+	request := &authoritypb.Request{
+		RequestId: 27,
+		Body: &authoritypb.Request_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteRequest{
+			Handle: bytes.Repeat([]byte{0x35}, 16), Position: 4096, Size: uint32(len(data)), Data: data,
+		}},
+	}
+	var encoded bytes.Buffer
+	if err := writeFrame(&encoded, 2<<20, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded := new(authoritypb.Request)
+	release, streamed, err := readRequestFrameRetained(bytes.NewReader(encoded.Bytes()), 2<<20, nil, 0, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	wantDigest := sha256.Sum256(data)
+	if streamed == nil || *streamed != wantDigest {
+		t.Fatalf("streamed payload digest = %x, want %x", streamed, wantDigest)
+	}
+	runtime, err := volumeserver.New("streamed-frame-digest", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamedFingerprint, err := canonicalFingerprintWithWriteDataDigest(runtime, decoded, *streamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oneShotFingerprint, err := canonicalFingerprint(runtime, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamedFingerprint != oneShotFingerprint {
+		t.Fatalf("streamed fingerprint = %x, one-shot fingerprint = %x", streamedFingerprint, oneShotFingerprint)
 	}
 }
 

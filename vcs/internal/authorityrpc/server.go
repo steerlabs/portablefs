@@ -339,7 +339,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			return err
 		}
 		request := new(authoritypb.Request)
-		releaseFrame, err := readFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
+		releaseFrame, payloadDigest, err := readRequestFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
@@ -350,6 +350,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			releaseFrame()
 			return errors.New("authorityrpc: request ID zero is reserved")
 		}
+		frameRequestCtx := withFramePayloadDigest(requestCtx, payloadDigest)
 		if err := requestAllowedOnRole(request, entry.role); err != nil {
 			releaseFrame()
 			return err
@@ -374,7 +375,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			// Cancellation must remain processable when every normal execution
 			// slot is occupied. Its handler only validates the epoch and returns
 			// the acknowledgment, so execute it inline outside the normal slots.
-			response := s.dispatchRequest(requestCtx, request)
+			response := s.dispatchRequest(frameRequestCtx, request)
 			finishResponse := finishHandlerResponse(s.Handler, request, response)
 			writeErr := writeResponse(request, response)
 			finishResponse()
@@ -414,7 +415,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			releaseFrame()
 			return errors.New("authorityrpc: connection in-flight bound exceeded")
 		}
-		opCtx, opCancel := context.WithCancel(requestCtx)
+		opCtx, opCancel := context.WithCancel(frameRequestCtx)
 		inflightMu.Lock()
 		if _, duplicate := inflight[request.GetRequestId()]; duplicate {
 			inflightMu.Unlock()
