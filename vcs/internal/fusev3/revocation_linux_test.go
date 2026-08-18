@@ -144,6 +144,29 @@ func TestWithdrawalAbortsEvenWhenTheFirstDetachSucceeds(t *testing.T) {
 	}
 }
 
+func TestConnectionFailureWithInstalledMountEntersWithdrawalBeforeServeEnds(t *testing.T) {
+	fake := &fakeWithdrawal{installed: true}
+	mount := revokingMount(t, fake)
+	mount.kernelConnectionStarted = true
+
+	// OnUnmount runs inside Serve, immediately before kernelConnectionDone is
+	// closed.  It must record the failure and schedule withdrawal synchronously
+	// instead of racing a clean Close against that terminal edge.
+	mount.raw.OnUnmount()
+	err := mount.fatalError()
+	if err == nil || !strings.Contains(err.Error(), "serving connection terminated") ||
+		!strings.Contains(err.Error(), "still installed") {
+		t.Fatalf("installed-mount connection failure was not retained: %v", err)
+	}
+	close(mount.kernelConnectionDone)
+
+	waitFor(t, "connection-failure mount withdrawal", func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return !fake.installed && fake.detaches > 0 && fake.aborts > 0
+	})
+}
+
 func TestWithdrawalEscalatesFromAFailedDetachThroughAbortToSuccess(t *testing.T) {
 	// A first lazy-detach failure must not strand the mount. Aborting the FUSE
 	// connection does not remove it, so the ladder must retry the mount-owner

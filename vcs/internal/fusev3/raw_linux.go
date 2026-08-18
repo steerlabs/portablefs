@@ -3564,7 +3564,25 @@ func (r *rawFileSystem) setLock(_ <-chan struct{}, input *fuse.LkIn, wait bool) 
 }
 
 func (r *rawFileSystem) OnUnmount() {
-	go func() { _ = r.mount.Close() }()
+	r.mount.kernelConnectionTerminated()
+}
+
+// kernelConnectionTerminated distinguishes an external unmount from a FUSE
+// connection which failed while its namespace mount remained installed.  The
+// latter must enter the revocation ladder before OnUnmount returns: Serve
+// closes kernelConnectionDone immediately afterwards, and a clean Close racing
+// from here could otherwise consume terminal ownership and strand the mount.
+func (m *Mount) kernelConnectionTerminated() {
+	if m.kernelMount.point != "" {
+		if _, err := m.withdrawalOps().absent(m.kernelMount); err != nil {
+			m.failAsync(fmt.Errorf(
+				"fusev3: FUSE serving connection terminated while its kernel mount remained installed: %w", err))
+			return
+		}
+	}
+	// Close waits for kernelConnectionDone, which cannot close until this
+	// callback returns.  The proven-absent path therefore remains asynchronous.
+	go func() { _ = m.Close() }()
 }
 
 // publishAttr answers a stat with the lifetime this mount's cache contract
