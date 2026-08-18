@@ -748,6 +748,27 @@ func TestSelfRenameMovesTheBindingInsteadOfLosingIt(t *testing.T) {
 	}
 }
 
+func TestSelfRenameUsesExactPostStateAfterItsNameLifetimeExpires(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"before": testItem(73, authoritypb.Attr_REGULAR, 73)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "before")
+
+	f.raw.mu.Lock()
+	f.raw.dropCachedNameLocked(nameKey{parent: 1, name: "before"})
+	if f.raw.nodesByID[entry.NodeId] == nil {
+		f.raw.mu.Unlock()
+		t.Fatal("expired test binding lost its canonical inode record")
+	}
+	f.raw.mu.Unlock()
+
+	if status := f.rename(fuse.FUSE_ROOT_ID, fuse.FUSE_ROOT_ID, "before", "after", 0); !status.Ok() {
+		t.Fatalf("RENAME after the name lifetime expired = %v (fatal cause: %v)", status, f.mount.fatalError())
+	}
+	if f.mount.isRevoked() {
+		t.Fatalf("authority post-state did not close the uncached rename source lease: %v", f.mount.fatalError())
+	}
+}
+
 // --- the declared capacity is a hard bound ---------------------------------
 
 func TestCachedNamesNeverExceedTheDeclaredCapacity(t *testing.T) {

@@ -2028,24 +2028,42 @@ func (n *node) Rename(ctx context.Context, name string, parent *node, newName st
 		return false, syscall.EIO
 	}
 	lease := sourceLeaseFromContext(ctx)
-	oldParentIdentity, _ := publicationIdentityFromItem(n.item)
-	newParentIdentity, _ := publicationIdentityFromItem(parent.item)
+	oldParentIdentity, oldParentValid := publicationIdentityFromItem(n.item)
+	newParentIdentity, newParentValid := publicationIdentityFromItem(parent.item)
+	if !oldParentValid || !newParentValid {
+		return false, syscall.EIO
+	}
 	oldNamespace := publicationNamespace{parent: oldParentIdentity, name: name}
 	newNamespace := publicationNamespace{parent: newParentIdentity, name: newName}
-	moved, movedOK := lease.preBinding(oldNamespace)
-	replaced, replacedOK := lease.preBinding(newNamespace)
+	overwritten, err := renamePostStateOverwrittenIdentity(response.GetPostState(), oldParentIdentity, newParentIdentity, newPost, oldPost, flags&renameExchange != 0)
+	if err != nil {
+		return false, syscall.EIO
+	}
+	if moved, known := lease.preBinding(oldNamespace); known && moved != newPost {
+		return false, syscall.EIO
+	}
+	if replaced, known := lease.preBinding(newNamespace); known {
+		switch {
+		case flags&renameExchange != 0 && (oldPost == nil || replaced != *oldPost):
+			return false, syscall.EIO
+		case flags&renameExchange == 0 && overwritten != nil && replaced != *overwritten:
+			return false, syscall.EIO
+		case flags&renameExchange == 0 && overwritten == nil && replaced != newPost:
+			return false, syscall.EIO
+		}
+	}
 	expected := []expectedPostStateObject{
-		{identity: moved, roles: postStateRoleSource | postStateRoleDestination},
+		{identity: newPost, roles: postStateRoleSource | postStateRoleDestination},
 		{identity: oldParentIdentity, roles: postStateRoleOldParent},
 		{identity: newParentIdentity, roles: postStateRoleNewParent},
 	}
 	if flags&renameExchange != 0 {
 		expected[0].roles |= postStateRoleExchanged
-		expected = append(expected, expectedPostStateObject{identity: replaced, roles: postStateRoleSource | postStateRoleDestination | postStateRoleExchanged})
-	} else if replacedOK && replaced != moved {
-		expected = append(expected, expectedPostStateObject{identity: replaced, roles: postStateRoleOverwritten})
+		expected = append(expected, expectedPostStateObject{identity: *oldPost, roles: postStateRoleSource | postStateRoleDestination | postStateRoleExchanged})
+	} else if overwritten != nil {
+		expected = append(expected, expectedPostStateObject{identity: *overwritten, roles: postStateRoleOverwritten})
 	}
-	if !movedOK || flags&renameExchange != 0 && !replacedOK || expectPostState(ctx, expected...) != nil {
+	if expectPostState(ctx, expected...) != nil {
 		return false, syscall.EIO
 	}
 	if err := lease.attachRename(ctx,

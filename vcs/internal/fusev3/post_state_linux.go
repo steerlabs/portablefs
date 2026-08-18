@@ -127,6 +127,76 @@ func removedPostStateIdentity(state *authoritypb.PostState, parent publicationId
 	return removed, nil
 }
 
+// renamePostStateOverwrittenIdentity binds the role-shaped rename post-state
+// to the exact parents and post-bindings returned by the ordered authority
+// reply. Cached pre-bindings remain useful disagreement witnesses, but they are
+// not required: either source name can be deliberately uncacheable.
+func renamePostStateOverwrittenIdentity(state *authoritypb.PostState, oldParent, newParent, newPost publicationIdentity, oldPost *publicationIdentity, exchange bool) (*publicationIdentity, error) {
+	if err := validateMutationPostStateForOpcode(12, state); err != nil {
+		return nil, err
+	}
+	const moved = postStateRoleSource | postStateRoleDestination
+	const exchanged = moved | postStateRoleExchanged
+	var overwritten *publicationIdentity
+	oldParentFound := false
+	newParentFound := false
+	newPostFound := false
+	oldPostFound := false
+	for _, object := range state.GetObjects() {
+		identity, ok := publicationIdentityFromBytes(object.GetStableIdentity())
+		if !ok {
+			return nil, errors.New("fusev3: rename post-state carried an invalid stable identity")
+		}
+		switch object.GetRoles() {
+		case moved:
+			if exchange || identity != newPost {
+				return nil, errors.New("fusev3: rename post-state disagreed with its moved object")
+			}
+			newPostFound = true
+		case exchanged:
+			if !exchange || oldPost == nil {
+				return nil, errors.New("fusev3: rename post-state carried an unexpected exchanged object")
+			}
+			switch identity {
+			case newPost:
+				newPostFound = true
+			case *oldPost:
+				oldPostFound = true
+			default:
+				return nil, errors.New("fusev3: rename post-state disagreed with its exchanged objects")
+			}
+		case postStateRoleOverwritten:
+			if exchange || overwritten != nil {
+				return nil, errors.New("fusev3: rename post-state carried an unexpected overwritten object")
+			}
+			value := identity
+			overwritten = &value
+		case postStateRoleOldParent | postStateRoleNewParent:
+			if oldParent != newParent || identity != oldParent {
+				return nil, errors.New("fusev3: rename post-state disagreed with its shared parent")
+			}
+			oldParentFound = true
+			newParentFound = true
+		case postStateRoleOldParent:
+			if identity != oldParent {
+				return nil, errors.New("fusev3: rename post-state disagreed with its old parent")
+			}
+			oldParentFound = true
+		case postStateRoleNewParent:
+			if identity != newParent {
+				return nil, errors.New("fusev3: rename post-state disagreed with its new parent")
+			}
+			newParentFound = true
+		default:
+			return nil, errors.New("fusev3: rename post-state carried an unexpected role set")
+		}
+	}
+	if !oldParentFound || !newParentFound || !newPostFound || exchange && !oldPostFound {
+		return nil, errors.New("fusev3: rename post-state omitted an exact operation operand")
+	}
+	return overwritten, nil
+}
+
 func validateRenamePostStateRoles(got []uint32) bool {
 	const moved = postStateRoleSource | postStateRoleDestination
 	const exchanged = moved | postStateRoleExchanged
