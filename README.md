@@ -132,6 +132,9 @@ The repository also contains a product-neutral hosted foundation:
 - `portablefs-cell-agent` is unprivileged and outbound-only.
 - `portablefs-cell-helper` is the narrow root/XFS boundary and independently
   verifies signed plans.
+- `portablefs-files` is an optional bounded, read-only HTTP adapter for product
+  backends. It holds short-lived authority sessions, never mounts a volume, and
+  keeps no filesystem namespace or content cache.
 - systemd owns each listener and supervises one sandboxed, unprivileged
   authority per active volume.
 

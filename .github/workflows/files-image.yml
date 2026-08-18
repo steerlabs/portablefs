@@ -1,0 +1,52 @@
+name: files-image
+
+on:
+  push:
+    branches:
+      - main
+      - codex/portablefs-files-gateway
+    paths:
+      - ".github/workflows/files-image.yml"
+      - "deploy/files/**"
+      - "vcs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: files-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: projects/920572344872/locations/global/workloadIdentityPools/github/providers/github-oidc
+          service_account: gha-deployer@opensteer-admin.iam.gserviceaccount.com
+          token_format: access_token
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: us-west1-docker.pkg.dev
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
+        with:
+          source: .
+          files: deploy/files/docker-bake.hcl
+          push: true
+        env:
+          TAG: sha-${{ github.sha }}

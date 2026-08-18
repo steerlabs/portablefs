@@ -69,6 +69,24 @@ refuses root. Staging is outside the served namespace but inherits the exact
 volume XFS project and hard quota; its bind source cannot be replaced by the
 authority UID.
 
+`portablefs-files` is the optional read-only product adapter. It accepts only
+short-lived, body-bound requests signed by its colocated product backend, then
+uses a read-only capability and its own proof-of-possession identity to speak
+directly to the volume authority. It has bounded sessions, cursors, operations,
+downloads, request bodies, previews, and directory pages. It never mounts a
+volume and keeps no namespace or content cache. Protocol 5 has one strict
+session model, so the adapter still joins the visibility barrier with an exact
+no-kernel-mount observation and acknowledges each visibility phase immediately
+after observing it. It never adds a second filesystem truth or a weaker
+coherence profile.
+
+The intended deployment is one adapter beside one product backend in a shared
+pod network namespace, listening only on loopback. The product backend's exact
+public request-signing key is the adapter's sole HTTP trust root; the adapter
+does not receive that backend's private key or product-control credentials. Its
+private authority identity may persist for the pod lifetime, but active
+sessions and cursors are intentionally process-local and reconstructible.
+
 ## Authorization is deliberately two-party
 
 PortableFS Cloud must not silently become the product's user database. A mount
