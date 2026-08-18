@@ -51,7 +51,7 @@ func (tx v3WriteTransaction) request(phase authoritypb.WriteTransactionPhase, fr
 }
 
 func validV3WritePhaseReply(response *authoritypb.Response, transactionID uint64, want uint32) bool {
-	if response == nil || response.GetMutation() != nil || response.GetPostAttr() != nil {
+	if response == nil || response.GetMutation() != nil || response.GetPostState() != nil {
 		return false
 	}
 	reply := response.GetWriteTransaction()
@@ -63,7 +63,7 @@ func exactV3WriteRejection(request *authoritypb.Request, response *authoritypb.R
 	body := request.GetWriteTransaction()
 	reply := response.GetWriteTransaction()
 	if body == nil || body.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT || reply == nil ||
-		reply.GetTransactionId() != body.GetTransactionId() || response.GetPostAttr() != nil ||
+		reply.GetTransactionId() != body.GetTransactionId() || response.GetPostState() != nil ||
 		reply.GetCommittedSize() != 0 || reply.GetAssignedOffset() != 0 || reply.GetPostSize() != 0 || reply.GetVisibilitySequence() != 0 ||
 		reply.GetError() > -1 || reply.GetError() < -4095 {
 		return 0, false
@@ -90,14 +90,14 @@ func validV3WriteCommit(tx v3WriteTransaction, response *authoritypb.Response) e
 	if reply == nil || reply.GetTransactionId() != tx.id || reply.GetCommittedSize() == 0 ||
 		reply.GetCommittedSize() > tx.requestedSize || reply.GetCommittedSize() > math.MaxUint32 ||
 		reply.GetAssignedOffset() != tx.position ||
-		reply.GetVisibilitySequence() == 0 || response.GetPostAttr() == nil {
+		reply.GetVisibilitySequence() == 0 || v3PostAttr(response) == nil {
 		return errors.New("write transaction omitted its exact committed result")
 	}
 	if reply.GetAssignedOffset() > tx.fileMaxSize || reply.GetCommittedSize() > tx.fileMaxSize-reply.GetAssignedOffset() {
 		return errors.New("write transaction exceeded its frozen file-size ceiling")
 	}
 	end := reply.GetAssignedOffset() + reply.GetCommittedSize()
-	postAttr := response.GetPostAttr()
+	postAttr := v3PostAttr(response)
 	if reply.GetPostSize() < end || postAttr.GetKind() != authoritypb.Attr_REGULAR || postAttr.GetSize() < 0 || uint64(postAttr.GetSize()) != reply.GetPostSize() {
 		return errors.New("write transaction returned contradictory post-write size")
 	}

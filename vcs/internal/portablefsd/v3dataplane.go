@@ -521,14 +521,14 @@ func (d *v3DataPlane) setattr(ctx context.Context, operationID uint64, request *
 	if errno != 0 {
 		return nil, errno
 	}
-	if response.GetPostAttr() == nil {
+	if v3PostAttr(response) == nil {
 		return d.malformed("setattr omitted committed post-attr")
 	}
-	attr, err := d.localAttr(item, response.GetPostAttr(), item.parent)
+	attr, err := d.localAttr(item, v3PostAttr(response), item.parent)
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	d.updateAttr(item, response.GetPostAttr())
+	d.updateAttr(item, v3PostAttr(response))
 	return &pfslocal.SetAttrReply{Attr: attr}, 0
 }
 
@@ -682,14 +682,14 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	if err := validV3WriteCommit(tx, response); err != nil {
 		return d.malformed(err.Error())
 	}
-	if response.GetPostAttr().GetInode() != item.attr.GetInode() {
+	if v3PostAttr(response).GetInode() != item.attr.GetInode() {
 		return d.malformed("write transaction changed its inode identity")
 	}
-	attr, err := d.localAttr(item, response.GetPostAttr(), item.parent)
+	attr, err := d.localAttr(item, v3PostAttr(response), item.parent)
 	if err != nil {
 		return d.malformed(err.Error())
 	}
-	d.updateAttr(item, response.GetPostAttr())
+	d.updateAttr(item, v3PostAttr(response))
 	if reply.GetFlags() == v3WriteReplyCommitted|v3WriteReplyPostApply {
 		_ = d.fail(fmt.Errorf("portablefsd: authority committed %d write bytes but macOS 26 FSKit cannot publish post-apply errno %d", reply.GetCommittedSize(), reply.GetError()))
 		return nil, darwinEIO
