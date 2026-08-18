@@ -63,13 +63,16 @@ not guess at or automatically manufacture data conversions.
 
 ## One-time setup
 
-Create a GitHub environment named `opensteer-production`. Restrict it to the
-branch of the same name and add one secret, `E2B_API_KEY`. Do not store a Google
-service-account JSON key. The workflow exchanges GitHub's OIDC token through
-the existing Google Workload Identity provider and impersonates:
+Create a GitHub environment named `opensteer-production`. Allow deployments
+from `main` and add one secret, `E2B_API_KEY`. A `workflow_run` deployment uses
+the workflow file from GitHub's default branch, so GitHub evaluates the
+environment against `main`; the job itself separately requires an exact
+successful `opensteer-production` push from this repository. Do not store a
+Google service-account JSON key. The workflow exchanges GitHub's OIDC token
+through the existing Google Workload Identity provider and impersonates:
 
 ```text
-gha-deployer@opensteer-admin.iam.gserviceaccount.com
+portablefs-deployer@opensteer-admin.iam.gserviceaccount.com
 ```
 
 Grant that service account only these project roles on the PortableFS GCP
@@ -77,15 +80,22 @@ project:
 
 ```bash
 gcloud projects add-iam-policy-binding smooth-comfort-488701-t3 \
-  --member=serviceAccount:gha-deployer@opensteer-admin.iam.gserviceaccount.com \
+  --member=serviceAccount:portablefs-deployer@opensteer-admin.iam.gserviceaccount.com \
   --role=roles/compute.viewer
 gcloud projects add-iam-policy-binding smooth-comfort-488701-t3 \
-  --member=serviceAccount:gha-deployer@opensteer-admin.iam.gserviceaccount.com \
+  --member=serviceAccount:portablefs-deployer@opensteer-admin.iam.gserviceaccount.com \
   --role=roles/compute.osAdminLogin
 gcloud projects add-iam-policy-binding smooth-comfort-488701-t3 \
-  --member=serviceAccount:gha-deployer@opensteer-admin.iam.gserviceaccount.com \
+  --member=serviceAccount:portablefs-deployer@opensteer-admin.iam.gserviceaccount.com \
   --role=roles/iap.tunnelResourceAccessor
 ```
+
+Grant the same service account `roles/artifactregistry.reader` on only the
+`opensteer-admin/us-west1/staging` Artifact Registry repository. Its Workload
+Identity User binding names the exact GitHub OIDC subject
+`repo:steerlabs/portablefs:environment:opensteer-production`. OpenSteer's
+separate image-publishing identity keeps Artifact Registry write access; this
+deployment identity does not.
 
 The VMs have no public SSH address. Deployment uses OS Login through IAP. The
 service account needs administrative login because the existing host activator
@@ -115,8 +125,11 @@ deployment.
 
 ## Fixed inputs
 
-The workflow pins the OpenSteer source commit and Runner image digest together.
-When OpenSteer publishes a new production Runner, update both pins in one
-reviewed PortableFS pull request. A mutable `latest` tag is never a deployment
-input. PortableFS's promotion commit, hosted release identity, E2B client
-digest, and Authority generation remain visible as one audit chain.
+The workflow pins the OpenSteer Runner by image digest. That image contains all
+OpenSteer-owned activation and Runner code; this repository adds only the exact
+PortableFS client built by the promoted commit. When OpenSteer publishes a new
+production Runner, update the one digest in a reviewed PortableFS pull request.
+A mutable `latest` tag and a cross-repository GitHub credential are never
+deployment inputs. PortableFS's promotion commit, hosted release identity, E2B
+client digest, Runner image digest, and Authority generation remain visible as
+one audit chain.
