@@ -966,6 +966,9 @@ func (m *Mount) closeLocked() error {
 	}
 	m.closed = true
 	m.cancel()
+	if m.raw != nil {
+		m.raw.terminalizeReplyCacheOwnership()
+	}
 	m.wg.Wait()
 	// Any capability still queued for reclaim is released by Detach: ending the
 	// session drops every item and open this session holds.

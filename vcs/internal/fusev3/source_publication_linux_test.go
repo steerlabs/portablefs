@@ -1275,9 +1275,11 @@ func TestWrittenUnreceiptedLookupRemainsRevocableThroughPeerComplete(t *testing.
 	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: f.raw.nodesByID[fuse.FUSE_ROOT_ID].identity, name: "gap"}
 	reservationsAfterWrite := len(f.raw.cacheReservations[coordinate])
 	_, prematurelyCached := f.raw.cachedNames[nameKey{parent: 1, name: "gap"}]
+	pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
 	f.raw.mu.Unlock()
-	if reservationsAfterWrite != 1 || prematurelyCached {
-		t.Fatalf("physical-write gap reservations=%d cached=%t, want 1/false", reservationsAfterWrite, prematurelyCached)
+	if reservationsAfterWrite != 1 || prematurelyCached || pendingNames != 0 || pendingAttrs != 0 {
+		t.Fatalf("physical-write gap reservations=%d cached=%t pending=%d/%d, want 1/false/0/0",
+			reservationsAfterWrite, prematurelyCached, pendingNames, pendingAttrs)
 	}
 
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "gap")}
@@ -1303,6 +1305,96 @@ func TestWrittenUnreceiptedLookupRemainsRevocableThroughPeerComplete(t *testing.
 	}
 	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "gap" || calls[0].sequence != 9 {
 		t.Fatalf("gap repair = %+v, want exact sequence-9 delete", calls)
+	}
+}
+
+func TestPhysicalWriteReleasesCapacityBeforePublicationReceipt(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		lookup   string
+		negative bool
+		wantLive int
+	}{
+		{name: "positive name and attr", lookup: "positive", wantLive: 2},
+		{name: "negative name", lookup: "negative", negative: true, wantLive: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			f.rpc.byName = map[string]*authoritypb.Item{"positive": testItem(90, authoritypb.Attr_REGULAR, 90)}
+			if test.negative {
+				f.rpc.missingNames[test.lookup] = true
+			}
+			unique := nextTestRequestUnique()
+			if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, test.lookup, &fuse.EntryOut{}); !status.Ok() {
+				t.Fatalf("LOOKUP = %v", status)
+			}
+			if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1,
+				make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+				t.Fatalf("prepare LOOKUP = (%d, %v)", n, status)
+			}
+			markTestReply(t, f.raw, unique)
+			f.raw.ReplyWritten(unique, fuse.OK)
+
+			f.raw.mu.Lock()
+			live := 0
+			for _, reservations := range f.raw.cacheReservations {
+				live += len(reservations)
+			}
+			pendingNames, pendingNegatives, pendingAttrs := f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+			retained := f.raw.replyPublications[unique] != nil
+			f.raw.mu.Unlock()
+			if pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 || live != test.wantLive || !retained {
+				t.Fatalf("after physical write pending=%d/%d/%d reservations=%d retained=%t, want 0/0/0/%d/true",
+					pendingNames, pendingNegatives, pendingAttrs, live, retained, test.wantLive)
+			}
+
+			acknowledgeTestPublication(t, f.raw, unique)
+			f.raw.mu.Lock()
+			remaining := len(f.raw.cacheReservations)
+			pendingNames, pendingNegatives, pendingAttrs = f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+			f.raw.mu.Unlock()
+			if remaining != 0 || pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 {
+				t.Fatalf("after receipt pending=%d/%d/%d reservation sets=%d, want all zero",
+					pendingNames, pendingNegatives, pendingAttrs, remaining)
+			}
+		})
+	}
+}
+
+func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"teardown": testItem(91, authoritypb.Attr_REGULAR, 91)}
+	unique := nextTestRequestUnique()
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "teardown", &fuse.EntryOut{}); !status.Ok() {
+		t.Fatalf("LOOKUP = %v", status)
+	}
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1,
+		make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("prepare LOOKUP = (%d, %v)", n, status)
+	}
+	markTestReply(t, f.raw, unique)
+
+	f.raw.terminalizeReplyCacheOwnership()
+	f.raw.terminalizeReplyCacheOwnership()
+	f.raw.mu.Lock()
+	pendingNames, pendingNegatives, pendingAttrs := f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+	reservations := len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("teardown pending=%d/%d/%d reservation sets=%d, want all zero",
+			pendingNames, pendingNegatives, pendingAttrs, reservations)
+	}
+
+	// A writer failure after teardown still settles the publication but cannot
+	// release either ownership class a second time.
+	f.raw.ReplyWritten(unique, fuse.EIO)
+	f.raw.mu.Lock()
+	pendingNames, pendingNegatives, pendingAttrs = f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+	reservations = len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("post-failure pending=%d/%d/%d reservation sets=%d, want all zero",
+			pendingNames, pendingNegatives, pendingAttrs, reservations)
 	}
 }
 

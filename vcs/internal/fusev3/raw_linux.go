@@ -177,9 +177,9 @@ type replyPublication struct {
 	payloadError         error
 
 	// Generic post-VFS publication receipt state, protected by
-	// rawFileSystem.mu. The original response write only signals
-	// originalDone. Cache/source ownership remains retained through the
-	// physical FUSE_PFS_PUBLISH acknowledgment.
+	// rawFileSystem.mu. The original response write signals originalDone and
+	// releases bounded capacity; sequence-addressable cache reservations and
+	// source ownership remain through the physical PFS_PUBLISH acknowledgment.
 	owner          *rawFileSystem
 	requestUnique  uint64
 	nodeid         uint64
@@ -815,6 +815,60 @@ func (r *rawFileSystem) releaseReplyReservationsLocked(publication *replyPublica
 	}
 }
 
+// releaseReplyCapacityLocked releases only the bounded admission charge. The
+// reservation itself is a separate ordering object and remains in
+// cacheReservations until receipt, failure, or teardown removes revocability.
+func (r *rawFileSystem) releaseReplyCapacityLocked(publication *replyPublication) {
+	if publication == nil {
+		return
+	}
+	for index := range publication.names {
+		candidate := &publication.names[index]
+		if !candidate.reserved {
+			continue
+		}
+		if candidate.negative {
+			if r.pendingNegatives > 0 {
+				r.pendingNegatives--
+			}
+		} else if r.pendingNames > 0 {
+			r.pendingNames--
+		}
+		candidate.reserved = false
+	}
+	for _, candidate := range publication.attrs {
+		reservation := candidate.reservation
+		if reservation == nil || !reservation.capacityReserved {
+			continue
+		}
+		if r.pendingAttrs > 0 {
+			r.pendingAttrs--
+		}
+		reservation.capacityReserved = false
+	}
+}
+
+// terminalizeReplyCacheOwnership is the teardown edge for the two independent
+// candidate resources. It is idempotent with a concurrent physical write or
+// receipt: mutable capacity flags and map membership are each consumed under
+// r.mu exactly once.
+func (r *rawFileSystem) terminalizeReplyCacheOwnership() {
+	r.mu.Lock()
+	seen := make(map[*replyPublication]struct{}, len(r.replyPublications)+len(r.publishAcks))
+	for _, publication := range r.replyPublications {
+		seen[publication] = struct{}{}
+	}
+	for _, publication := range r.publishAcks {
+		seen[publication] = struct{}{}
+	}
+	for publication := range seen {
+		r.releaseReplyCapacityLocked(publication)
+		r.releaseReplyReservationsLocked(publication)
+	}
+	r.signalSourceChangedLocked()
+	r.mu.Unlock()
+}
+
 // settle ends one admitted publication. PREPARE's drain is waiting on exactly
 // this transition, so the wakeup happens under the same lock that decides it.
 // publishEntry hands one directory entry to the kernel with the lifetime this
@@ -1135,17 +1189,6 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 }
 
 func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublication, successful bool) {
-	switch {
-	case !publication.reserved:
-	case publication.negative:
-		if r.pendingNegatives > 0 {
-			r.pendingNegatives--
-		}
-	default:
-		if r.pendingNames > 0 {
-			r.pendingNames--
-		}
-	}
 	if successful && (publication.reservation == nil || !publication.reservation.revoked) {
 		if publication.negative {
 			// A materializing callback may have superseded this mount's absence
@@ -1172,9 +1215,6 @@ func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublica
 }
 
 func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublication, successful bool) {
-	if publication.reservation != nil && publication.reservation.capacityReserved && r.pendingAttrs > 0 {
-		r.pendingAttrs--
-	}
 	if successful && (publication.reservation == nil || !publication.reservation.revoked) && publication.record != nil && !publication.record.reclaimed {
 		r.cachedAttrs[publication.identity] = publication.record
 	}
@@ -1200,6 +1240,9 @@ func (r *rawFileSystem) settleDataPublicationLocked(publication replyDataPublica
 }
 
 func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) {
+	// Failure before the physical edge and receipt settlement both pass here.
+	// The former still owns capacity; the latter finds it already consumed.
+	r.releaseReplyCapacityLocked(publication)
 	for _, name := range publication.names {
 		r.settleNamePublicationLocked(name, successful)
 	}
@@ -1552,6 +1595,11 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	publication.originalWrote = true
 	publication.originalStatus = status
 	close(publication.originalDone)
+	if status.Ok() {
+		// Capacity bounds how many reply writers may be admitted, not how long a
+		// physically written candidate remains addressable for peer revocation.
+		r.releaseReplyCapacityLocked(publication)
+	}
 	// A same-mount source gate may be waiting for exactly this physical edge:
 	// once a negative reply is in the kernel's hands, its enclosing mutation may
 	// supersede it even though the merged post-VFS receipt is still outstanding.
