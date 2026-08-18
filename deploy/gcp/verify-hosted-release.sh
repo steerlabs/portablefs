@@ -9,6 +9,7 @@ stage=$1
 
 expected=(
   architecture
+  bin/portablefs
   bin/portablefs-authority
   bin/portablefs-cell-agent
   bin/portablefs-manager
@@ -78,6 +79,11 @@ for relative in \
     exit 65
   }
 done
+
+[[ $("$stage/bin/portablefs" version) == "portablefs $release_id" ]] || {
+  echo "hosted binary release identity mismatch: bin/portablefs" >&2
+  exit 65
+}
 
 for unit in "$stage"/systemd/*.service; do
   grep -Fq '/opt/portablefs/current/' "$unit" || {
