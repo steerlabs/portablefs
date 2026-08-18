@@ -720,7 +720,7 @@ func TestReadDirPlusPageReservesOrDegradesAsOneUnit(t *testing.T) {
 					t.Fatalf("intern %s: %v", name, errno)
 				}
 				candidates = append(candidates, dirPlusCandidate{
-					entry: &fuse.EntryOut{}, record: record,
+					entry: &fuse.EntryOut{}, item: item, record: record,
 					dirent: &authoritypb.Dirent{
 						Name: []byte(name), Attr: item.Attr, Item: item,
 						ObjectVersion: 9, SnapshotSequence: 9,
@@ -756,6 +756,129 @@ func TestReadDirPlusPageReservesOrDegradesAsOneUnit(t *testing.T) {
 			finish()
 			completeTestReply(t, f.raw, unique, fuse.OK)
 		})
+	}
+}
+
+func TestReadDirPlusAdmissionTimeoutRollsBackWholePage(t *testing.T) {
+	f := newStrictFixture(t)
+	f.raw.requestTimeout = 15 * time.Millisecond
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	first, errno := f.raw.intern(context.Background(), testItem(100, authoritypb.Attr_DIRECTORY, 100))
+	if errno != 0 {
+		t.Fatalf("intern first canonical record: %v", errno)
+	}
+	second, errno := f.raw.intern(context.Background(), testItem(101, authoritypb.Attr_REGULAR, 101))
+	if errno != 0 {
+		t.Fatalf("intern second canonical record: %v", errno)
+	}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	pageItems := []*authoritypb.Item{
+		testItem(100, authoritypb.Attr_DIRECTORY, 200),
+		testItem(101, authoritypb.Attr_REGULAR, 201),
+	}
+	page := &authoritypb.ReadDirReply{Verifier: testToken(600), Eof: true}
+	for index, item := range pageItems {
+		item.ObjectVersion, item.SnapshotSequence = 9, 9
+		page.Entries = append(page.Entries, &authoritypb.Dirent{
+			Name: []byte{byte('a' + index)}, Attr: item.Attr, Item: item,
+			NextCookie: encodeCookie(uint64(index + 1)), ObjectVersion: 9, SnapshotSequence: 9,
+		})
+	}
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{page}
+	f.mount.reclaim.mu.Lock()
+	f.mount.reclaim.watermark = 1
+	f.mount.reclaim.mu.Unlock()
+
+	unique := f.unique.Add(2)
+	list := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: handleID}, list)
+	if status != fuse.Status(syscall.ETIMEDOUT) {
+		t.Fatalf("READDIRPLUS with a full cleanup lane = %v, want ETIMEDOUT", status)
+	}
+	// The error response itself may be written successfully. That is not a page
+	// commit: the kernel received no lookup-bearing records.
+	completeTestReply(t, f.raw, unique, fuse.OK)
+
+	f.raw.mu.Lock()
+	firstLookups, secondLookups := first.lookups, second.lookups
+	bound := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "a"}]
+	handleRecord := f.raw.handles[handleID]
+	inFlight := handleRecord.inFlight
+	f.raw.mu.Unlock()
+	if firstLookups != 1 || secondLookups != 1 {
+		t.Fatalf("canonical lookup counts after rollback = %d/%d, want 1/1", firstLookups, secondLookups)
+	}
+	if bound != nil {
+		t.Fatal("the provisional directory path was committed before a successful page write")
+	}
+	if inFlight != 0 {
+		t.Fatalf("directory handle operations after rollback = %d, want 0", inFlight)
+	}
+	handle.mu.Lock()
+	gotNext, gotPage, gotPending, gotTransaction := handle.next, len(handle.page), handle.pending, handle.plusReply
+	handle.mu.Unlock()
+	if gotNext != 0 || gotPage != 0 || gotPending != nil || gotTransaction != nil {
+		t.Fatalf("rolled-back cursor = next %d page %d pending %v transaction %p", gotNext, gotPage, gotPending, gotTransaction)
+	}
+	seen := map[string]int{}
+	for range 2 {
+		seen[fmt.Sprintf("%x", popReclaim(t, f.mount))]++
+	}
+	for _, token := range [][]byte{testToken(200), testToken(201)} {
+		if seen[fmt.Sprintf("%x", token)] != 1 {
+			t.Fatalf("page capability %x reclaimed %d times, want exactly once", token, seen[fmt.Sprintf("%x", token)])
+		}
+	}
+	if pending := f.mount.reclaim.pending(); pending != 0 {
+		t.Fatalf("unexpected extra capability reclaims after rollback: %d", pending)
+	}
+}
+
+func TestReadDirPlusPhysicalWriteFailureRollsBackWholePage(t *testing.T) {
+	f := newStrictFixture(t)
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	child, errno := f.raw.intern(context.Background(), testItem(100, authoritypb.Attr_DIRECTORY, 100))
+	if errno != 0 {
+		t.Fatalf("intern child: %v", errno)
+	}
+	item := testItem(100, authoritypb.Attr_DIRECTORY, 200)
+	item.ObjectVersion, item.SnapshotSequence = 9, 9
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{{
+		Verifier: testToken(600), Eof: true,
+		Entries: []*authoritypb.Dirent{{
+			Name: []byte("child"), Attr: item.Attr, Item: item, NextCookie: encodeCookie(1),
+			ObjectVersion: 9, SnapshotSequence: 9,
+		}},
+	}}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	unique := f.unique.Add(2)
+	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: handleID}, fuse.NewDirEntryList(make([]byte, 4096), 0)); !status.Ok() {
+		t.Fatalf("READDIRPLUS construction = %v", status)
+	}
+	completeTestReply(t, f.raw, unique, fuse.EIO)
+	f.raw.mu.Lock()
+	lookups := child.lookups
+	bound := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "child"}]
+	f.raw.mu.Unlock()
+	if lookups != 1 || bound != nil {
+		t.Fatalf("failed physical write left lookup/path ownership: lookups=%d bound=%v", lookups, bound != nil)
+	}
+	if got := fmt.Sprintf("%x", popReclaim(t, f.mount)); got != fmt.Sprintf("%x", testToken(200)) {
+		t.Fatalf("failed-write reclaim = %s, want page capability %x", got, testToken(200))
 	}
 }
 
