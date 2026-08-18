@@ -46,7 +46,7 @@ ssh_run() {
 copy_to() {
   local instance=$1
   shift
-  gcloud compute scp "${gcloud_common[@]}" --recurse "$@" "$instance:~/$remote_stage/"
+  gcloud compute scp "${gcloud_common[@]}" --compress --recurse "$@" "$instance:~/$remote_stage/"
 }
 
 cleanup_remote() {
