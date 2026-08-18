@@ -143,9 +143,13 @@ _Static_assert(offsetof(struct fuse_pfs_object_state, roles) == 120,
 	       "post-state roles offset changed");
 _Static_assert(offsetof(struct fuse_pfs_object_state, birth_time_ns) == 128,
 	       "post-state birth-time offset changed");
-_Static_assert(sizeof(struct fuse_pfs_cache_stamp) == 16,
+_Static_assert(sizeof(struct fuse_pfs_cache_stamp) == 32,
 	       "cache-stamp ABI size changed");
-_Static_assert(FUSE_NAME_OFFSET_PFS_DIRENTPLUS == 168,
+_Static_assert(offsetof(struct fuse_pfs_cache_stamp, birth_time_ns) == 16,
+	       "cache-stamp birth-time offset changed");
+_Static_assert(offsetof(struct fuse_pfs_cache_stamp, inode_flags) == 24,
+	       "cache-stamp inode-flags offset changed");
+_Static_assert(FUSE_NAME_OFFSET_PFS_DIRENTPLUS == 184,
 	       "stamped readdirplus name offset changed");
 
 int main(void)

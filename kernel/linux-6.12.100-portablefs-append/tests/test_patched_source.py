@@ -551,6 +551,68 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertNotIn("S_NOATIME", install)
         self.assertNotIn("S_DIRSYNC", install)
 
+        stamped = text[
+            text.index("static int pfs_install_stamped_attr"):
+            text.index("int fuse_pfs_install_lookup")
+        ]
+        self.assertIn("stamp->birth_time_ns", stamped)
+        self.assertIn("stamp->inode_flags", stamped)
+        self.assertLess(
+            stamped.index("pfs_install_exact_attr_locked"),
+            stamped.index("fi->pfs_object_version = stamp->object_version"),
+        )
+
+        dev = self.source("fs/fuse/dev.c")
+        attr = dev[
+            dev.index("static int fuse_notify_pfs_attr"):
+            dev.index("static int fuse_notify_pfs_entry")
+        ]
+        for source in (
+            "clear_bit(FUSE_I_BTIME",
+            "fi->pfs_inode_flags = 0",
+            "inode->i_flags &= ~(S_IMMUTABLE | S_APPEND)",
+            "fi->pfs_attr_exact = false",
+        ):
+            self.assertIn(source, attr)
+
+        directory = self.source("fs/fuse/dir.c")
+        getattr = directory[
+            directory.index("static int fuse_update_get_attr"):
+            directory.index("int fuse_update_attributes")
+        ]
+        self.assertIn("fuse_pfs_fill_exact_statx(inode, stat)", getattr)
+
+    def test_existing_create_and_negative_lookup_have_distinct_exact_shapes(
+        self,
+    ) -> None:
+        post_state = self.source("fs/fuse/post_state.c")
+        roles = post_state[
+            post_state.index("static bool pfs_valid_roles"):
+            post_state.index("void fuse_pfs_post_state_args")
+        ]
+        self.assertIn(
+            "static const u32 existing[] = { PFS_ROLE_TARGET, PFS_ROLE_PARENT }",
+            roles,
+        )
+        self.assertIn("fuse_pfs_existing_create", roles)
+
+        directory = self.source("fs/fuse/dir.c")
+        create = directory[
+            directory.index("static int fuse_create_open"):
+            directory.index("static int fuse_mknod")
+        ]
+        self.assertIn("fuse_pfs_existing_create(&post_state)", create)
+        self.assertIn("ARRAY_SIZE(inodes)", create)
+        self.assertNotIn("post_state.header.object_count == 1", create)
+
+        lookup = directory[
+            directory.index("int fuse_lookup_name"):
+            directory.index("static struct dentry *fuse_lookup")
+        ]
+        self.assertIn("if (err == -ENOENT)", lookup)
+        self.assertIn("fuse_abort_conn(fm->fc)", lookup)
+        self.assertIn("fuse_pfs_install_lookup(parent, NULL", lookup)
+
     def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")

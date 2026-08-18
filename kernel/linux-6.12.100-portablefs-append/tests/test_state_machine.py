@@ -540,6 +540,10 @@ class KernelInode:
     is_dir: bool = False
     nodeid: int = 1
     nlink: int = 1
+    object_version: int = 0
+    attr_exact: bool = False
+    inode_flags: int = 0
+    birth_time_ns: int = 0
 
     def exact_data(self, size: int, sequence: int) -> str:
         if size < 0 or sequence <= 0 or sequence > S64_MAX:
@@ -567,6 +571,29 @@ class KernelInode:
         if self.pfs_class != "shared":
             raise ProtocolError("withdrawal is a SHARED-only primitive")
         self.cache_generation += 1
+
+    def repair_attr(self, sequence: int) -> None:
+        if sequence <= 0 or sequence > S64_MAX:
+            raise ProtocolError("invalid attr repair sequence")
+        self.object_version = max(self.object_version, sequence)
+        self.attr_exact = False
+        self.inode_flags = 0
+        self.birth_time_ns = 0
+
+    def install_stamped_attr(
+        self, object_version: int, snapshot_sequence: int,
+        inode_flags: int, birth_time_ns: int,
+    ) -> str:
+        if (object_version <= 0 or object_version > snapshot_sequence or
+                snapshot_sequence > S64_MAX):
+            raise ProtocolError("invalid stamped attr")
+        if object_version <= self.object_version:
+            return "old"
+        self.object_version = object_version
+        self.attr_exact = True
+        self.inode_flags = inode_flags
+        self.birth_time_ns = birth_time_ns
+        return "applied"
 
 
 class PublicationGate:
@@ -1101,6 +1128,34 @@ class TransactionTests(unittest.TestCase):
 
 
 class PublicationAndNotifyTests(unittest.TestCase):
+    def test_attr_repair_clears_flags_until_strictly_newer_stamp(self) -> None:
+        immutable = 0x10
+        inode = KernelInode()
+        self.assertEqual(
+            inode.install_stamped_attr(1, 1, immutable, 111), "applied"
+        )
+        self.assertTrue(inode.attr_exact)
+        self.assertEqual((inode.inode_flags, inode.birth_time_ns), (immutable, 111))
+
+        # Clearing IMMUTABLE on a peer advances the repair stamp and makes the
+        # pre-repair enforced state unservable; an equal/older record cannot
+        # silently resurrect it.
+        inode.repair_attr(2)
+        self.assertFalse(inode.attr_exact)
+        self.assertEqual((inode.inode_flags, inode.birth_time_ns), (0, 0))
+        self.assertEqual(inode.install_stamped_attr(2, 2, immutable, 111), "old")
+        self.assertFalse(inode.attr_exact)
+        self.assertEqual(inode.install_stamped_attr(3, 3, 0, 222), "applied")
+        self.assertTrue(inode.attr_exact)
+        self.assertEqual((inode.inode_flags, inode.birth_time_ns), (0, 222))
+
+        # The inverse transition is symmetric: the repair never retains the
+        # clear value as exact, and the next newer record enforces IMMUTABLE.
+        inode.repair_attr(4)
+        self.assertFalse(inode.attr_exact)
+        self.assertEqual(inode.install_stamped_attr(5, 5, immutable, 333), "applied")
+        self.assertEqual((inode.attr_exact, inode.inode_flags), (True, immutable))
+
     def test_strict_reverse_notify_whitelist_blocks_cache_injection(self) -> None:
         inode = KernelInode(size=11)
         parent = KernelInode(is_dir=True)
