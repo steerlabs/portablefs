@@ -56,29 +56,39 @@ func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.Vis
 // is published. The daemon consumes that internal response, waits for the exact
 // pending repair, and reissues the request inside the same FUSE callback.
 func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) error {
-	coordinator := h.strictCache(id)
-	if coordinator == nil {
-		return nil
-	}
-	identity, err := h.Store.Identity(item)
-	if err != nil {
-		return err
-	}
-	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	_, err := h.stabilizeItemSequence(ctx, id, item)
 	return err
 }
 
-func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) error {
+func (h *VolumeHandler) stabilizeItemSequence(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) (uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return nil
+		return 1, nil
+	}
+	identity, err := h.Store.Identity(item)
+	if err != nil {
+		return 0, err
+	}
+	_, sequence, err := coordinator.StabilizeSequence(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	return sequence, err
+}
+
+func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) error {
+	_, err := h.stabilizeOpenSequence(ctx, id, handle)
+	return err
+}
+
+func (h *VolumeHandler) stabilizeOpenSequence(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) (uint64, error) {
+	coordinator := h.strictCache(id)
+	if coordinator == nil {
+		return 1, nil
 	}
 	identity, err := h.Store.IdentityOpen(handle)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
-	return err
+	_, sequence, err := coordinator.StabilizeSequence(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	return sequence, err
 }
 
 // lookupForSession answers one name resolution. For a strict mount the answer
@@ -86,14 +96,15 @@ func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.Sessi
 // caches too - so the binding is recorded either way, and the inode the name
 // resolved to is recorded as well because it is only knowable after the read.
 // A read that raced a mutation on either coordinate is discarded and retried.
-func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.SessionID, parent xfsstore.Capability, name []byte) (xfsstore.Capability, xfsstore.Attr, error) {
+func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.SessionID, parent xfsstore.Capability, name []byte) (xfsstore.Capability, xfsstore.Attr, uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return h.Store.Lookup(parent, string(name))
+		item, attr, err := h.Store.Lookup(parent, string(name))
+		return item, attr, 1, err
 	}
 	parentIdentity, err := h.Store.Identity(parent)
 	if err != nil {
-		return xfsstore.Capability{}, xfsstore.Attr{}, err
+		return xfsstore.Capability{}, xfsstore.Attr{}, 0, err
 	}
 	for range maxStabilizeAttempts {
 		item, attr, lookupErr := h.Store.Lookup(parent, string(name))
@@ -102,11 +113,11 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 			identity, identityErr := h.Store.Identity(item)
 			if identityErr != nil {
 				_ = h.Store.Forget(item)
-				return xfsstore.Capability{}, xfsstore.Attr{}, identityErr
+				return xfsstore.Capability{}, xfsstore.Attr{}, 0, identityErr
 			}
 			resolution.Identity = identity
 		}
-		waited, err := coordinator.Stabilize(ctx, id, resolution)
+		waited, sequence, err := coordinator.StabilizeSequence(ctx, id, resolution)
 		if errors.Is(err, volumeserver.ErrVisibilityRetry) {
 			// Lookup already owns a bounded discard-and-reread loop. Unlike item
 			// reads, no answer has left this authority request, so let the concurrent
@@ -114,16 +125,16 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 			waited, err = true, nil
 		}
 		if err == nil && !waited {
-			return item, attr, lookupErr
+			return item, attr, sequence, lookupErr
 		}
 		if lookupErr == nil {
 			_ = h.Store.Forget(item)
 		}
 		if err != nil {
-			return xfsstore.Capability{}, xfsstore.Attr{}, err
+			return xfsstore.Capability{}, xfsstore.Attr{}, 0, err
 		}
 	}
-	return xfsstore.Capability{}, xfsstore.Attr{}, syscall.EAGAIN
+	return xfsstore.Capability{}, xfsstore.Attr{}, 0, syscall.EAGAIN
 }
 
 // stabilizeDirectoryPage covers one page of an enumeration. A strict frontend
@@ -131,17 +142,17 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 // every one of those coordinates is resolved and recorded before the page is
 // built. Resolving each child costs an extra open/stat/close, which is why it
 // only happens for a strict mount.
-func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, parent xfsstore.Capability, entries []xfsstore.Dirent) (bool, error) {
+func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, parent xfsstore.Capability, entries []xfsstore.Dirent) (bool, uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return false, nil
+		return false, 1, nil
 	}
 	directory, err := h.Store.IdentityOpen(dir)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if parent == (xfsstore.Capability{}) {
-		return false, syscall.ESTALE
+		return false, 0, syscall.ESTALE
 	}
 	resolutions := make([]volumeserver.VisibilityResolution, 0, len(entries)+1)
 	resolutions = append(resolutions, volumeserver.VisibilityResolution{Identity: directory})
@@ -158,13 +169,13 @@ func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeser
 		}
 		resolutions = append(resolutions, resolution)
 	}
-	waited, err := coordinator.Stabilize(ctx, id, resolutions...)
+	waited, sequence, err := coordinator.StabilizeSequence(ctx, id, resolutions...)
 	if errors.Is(err, volumeserver.ErrVisibilityRetry) {
 		// Readdir's caller discards the page and repeats this bounded loop while
 		// the independent CONTROL lane acknowledges the pending PREPARE.
-		return true, nil
+		return true, 0, nil
 	}
-	return waited, err
+	return waited, sequence, err
 }
 
 func coherenceProfile(profile authoritypb.CoherenceProfile) (volumeserver.CoherenceProfile, error) {

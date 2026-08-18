@@ -973,6 +973,8 @@ type resourceAdmissionFaultStore struct {
 	lookupItem   xfsstore.Capability
 }
 
+func (*resourceAdmissionFaultStore) LockMutation([][16]byte) func() { return func() {} }
+
 type sourceGateRefreshStore struct {
 	resourceAdmissionFaultStore
 	mu             sync.Mutex
@@ -1441,7 +1443,16 @@ func TestMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) 
 	response := h.mutateVisible(
 		context.Background(), request, credential,
 		func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), targets },
+		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(1, postStateSnapshot{
+				identity: identity,
+				attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 52, Size: 1, Mode: 0o600, Nlink: 1, DeviceMinor: 1},
+				roles:    postStateRoleTarget,
+				changed:  true,
+			})
+			return resp, targets
+		},
 	)
 	if response.GetErrno() != 0 {
 		t.Fatalf("fallocate mutation = %+v", response)
@@ -1532,7 +1543,24 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 		mutationResult <- h.mutateVisible(
 			context.Background(), request, credential,
 			func() ([]volumeserver.VisibilityTarget, error) { return mutationTargets, nil },
-			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), nil },
+			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				resp := h.success(0)
+				resp.PostState = h.mutationPostState(1,
+					postStateSnapshot{
+						identity: [16]byte{newBinding[0]},
+						attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(newBinding[0]), Mode: 0o600, Nlink: 0, DeviceMinor: 1},
+						roles:    postStateRoleRemoved,
+						changed:  true,
+					},
+					postStateSnapshot{
+						identity: parentIdentity,
+						attr:     xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(root[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1},
+						roles:    postStateRoleParent,
+						changed:  true,
+					},
+				)
+				return resp, nil
+			},
 		)
 	}()
 	select {
@@ -1560,8 +1588,8 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 	if response := <-mutationResult; response.GetErrno() != 0 {
 		t.Fatalf("namespace mutation = %+v", response)
 	}
-	if calls := store.lookupCalls.Load(); calls != 2 {
-		t.Fatalf("namespace binding lookups = %d, want initial declaration plus one version-triggered refresh", calls)
+	if calls := store.lookupCalls.Load(); calls != 3 {
+		t.Fatalf("namespace binding lookups = %d, want initial declaration plus refreshes before and after dependency requeue", calls)
 	}
 
 	newIdentity := [16]byte{newBinding[0]}
@@ -1816,8 +1844,8 @@ func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("Rename calls = %d, want one", calls)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("Rename namespace lookups = %d, want one pre-admission resolution per name", calls)
+	if calls := store.lookup.Load(); calls != 3 {
+		t.Fatalf("Rename namespace lookups = %d, want two dependency resolutions plus one locked post-state capability lookup", calls)
 	}
 
 	// Request ID is delivery correlation, not replay identity. A lost DATA
@@ -1832,7 +1860,7 @@ func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("exact Rename replay re-executed XFS: calls = %d", calls)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
+	if calls := store.lookup.Load(); calls != 3 {
 		t.Fatalf("exact Rename replay re-resolved namespace: lookups = %d", calls)
 	}
 }
@@ -1851,8 +1879,8 @@ func TestRenameExchangeReplyCarriesBothAuthoritativePostBindings(t *testing.T) {
 	if rename == nil || !bytes.Equal(rename.GetNewPostIdentity(), wantNew[:]) || !bytes.Equal(rename.GetOldPostIdentity(), wantOld[:]) {
 		t.Fatalf("Rename exchange reply = %+v, want new=%x old=%x", rename, wantNew, wantOld)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("Rename exchange namespace lookups = %d, want one pre-admission resolution per name", calls)
+	if calls := store.lookup.Load(); calls != 4 {
+		t.Fatalf("Rename exchange namespace lookups = %d, want two dependency resolutions plus two locked post-state capability lookups", calls)
 	}
 }
 
@@ -1888,8 +1916,8 @@ func TestRenameSameInodeNoOpReportsBothNamesAndReplaysExactly(t *testing.T) {
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("same-inode exact replay re-executed XFS: calls = %d", calls)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("same-inode Rename namespace lookups = %d, want one pre-admission resolution per name", calls)
+	if calls := store.lookup.Load(); calls != 3 {
+		t.Fatalf("same-inode Rename namespace lookups = %d, want two dependency resolutions plus one locked moved-object snapshot lookup", calls)
 	}
 }
 

@@ -317,6 +317,12 @@ func (resolver *operationResolutionContext) deriveSourcePublicationGate(req *aut
 		if err := addNamespace(body.Link.GetNewParent(), body.Link.GetNewName(), true, false); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
+	case *authoritypb.Request_Tmpfile:
+		parent, err := resolver.item(body.Tmpfile.GetParent())
+		if err != nil {
+			return volumeserver.SourcePublicationGate{}, err
+		}
+		builder.addItem(parent.identity, true, false)
 	case *authoritypb.Request_SetXattr:
 		identity, err := resolver.xattrIdentity(body.SetXattr.GetItem(), body.SetXattr.GetHandle())
 		if err != nil {

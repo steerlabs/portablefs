@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"sync"
@@ -1211,7 +1212,7 @@ func TestServerRefusesToRunWithBoundsItDoesNotEnforce(t *testing.T) {
 // large once writeFrame restored the request ID, epoch and slot state, and the
 // oversized body was already in the replay slot, so remounting reproduced the
 // substituted EOVERFLOW forever.
-func TestRetainedReplyEnvelopeFitsItsReserve(t *testing.T) {
+func TestRetainedReplyBodyFitsEnvelopeReserve(t *testing.T) {
 	const maxFrame uint32 = 64 << 10
 	body := make([]byte, maxFrame-responseEnvelopeReserve)
 	build := func() ([]byte, error) {
@@ -1244,6 +1245,49 @@ func TestRetainedReplyEnvelopeFitsItsReserve(t *testing.T) {
 	var frame bytes.Buffer
 	if err := writeFrame(&frame, maxFrame, stamped); err != nil {
 		t.Fatalf("a reply at the retained-size limit did not fit the wire frame: %v", err)
+	}
+}
+
+func TestRetainedReplyEnvelopeFitsReserve(t *testing.T) {
+	fullAttr := func(inode uint64) *authoritypb.Attr {
+		return &authoritypb.Attr{
+			Kind: authoritypb.Attr_REGULAR, Inode: inode, Size: math.MaxInt64,
+			Blocks: math.MaxUint64, Mode: math.MaxUint32, Uid: math.MaxUint32,
+			Gid: math.MaxUint32, Nlink: math.MaxUint32, AtimeNs: math.MinInt64,
+			MtimeNs: math.MaxInt64, CtimeNs: math.MinInt64, BirthTimeNs: math.MaxInt64,
+			Rdev: math.MaxUint32, Blksize: math.MaxUint32, Flags: math.MaxUint32,
+		}
+	}
+	objects := make([]*authoritypb.ObjectPostState, 4)
+	for i := range objects {
+		identity := bytes.Repeat([]byte{byte(i + 1)}, 16)
+		objects[i] = &authoritypb.ObjectPostState{
+			StableIdentity: identity, ObjectVersion: math.MaxUint64,
+			Attr: fullAttr(uint64(i + 1)), Roles: math.MaxUint32,
+		}
+	}
+	response := &authoritypb.Response{
+		RequestId: math.MaxUint64,
+		Epoch:     bytes.Repeat([]byte{0xff}, 16), Errno: math.MaxInt32,
+		Mutation:              &authoritypb.MutationState{Slot: math.MaxUint32, AcceptedSequence: math.MaxUint64},
+		TerminalDeliveryToken: bytes.Repeat([]byte{0xff}, 16),
+		PostState: &authoritypb.PostState{
+			VisibilitySequence: math.MaxUint64, SnapshotSequence: math.MaxUint64,
+			Objects: objects,
+		},
+	}
+	encoded, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > int(responseEnvelopeReserve) {
+		t.Fatalf("maximum post-state envelope is %d bytes, reserve is %d", len(encoded), responseEnvelopeReserve)
+	}
+	// Field 45 requires a two-byte protobuf tag. Check the generated wire shape
+	// so an accidental field move cannot silently invalidate the reserve proof.
+	postStateTag := protowire.AppendTag(nil, 45, protowire.BytesType)
+	if len(postStateTag) != 2 || !bytes.Contains(encoded, postStateTag) {
+		t.Fatalf("post_state field 45 tag %x is absent from encoded envelope", postStateTag)
 	}
 }
 

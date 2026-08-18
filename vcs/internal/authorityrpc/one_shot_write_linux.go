@@ -46,7 +46,6 @@ func oneShotWriteCommitReply(committed, assigned, post, sequence uint64, postAtt
 		}
 	}
 	return &authoritypb.Response{
-		PostAttr: attrProto(postAttr),
 		Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
 			CommittedSize: committed, AssignedOffset: assigned, PostSize: post,
 			VisibilitySequence: sequence, Flags: flags, Error: wireError,
@@ -81,6 +80,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 	var resources *sessionResources
 	var target xfsstore.WriteTarget
 	var coordinate visibilityCoordinate
+	var releaseMutation func()
 	reserved := false
 	defer func() {
 		if target != nil {
@@ -124,13 +124,17 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 			identity: object.Stable, ino: object.Ino,
 			device: uint64(object.DeviceMajor)<<32 | uint64(object.DeviceMinor),
 		}
+		releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+		if err != nil {
+			return nil, err
+		}
 		return []volumeserver.VisibilityTarget{
 			inodeTarget(volumeserver.VisibilityData, coordinate, 0),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}, nil
 	}
 
-	return h.mutateVisibleSequence(ctx, request, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateVisibleSequence(ctx, request, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		if target == nil {
 			return h.errorResponse(0, syscall.EIO, false), nil
 		}
@@ -159,6 +163,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 				return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 			}
 			response := oneShotWriteCommitReply(0, 0, uint64(post.Size), sequence, post, applyErr)
+			response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 			h.deferStorageFailure(response, applyErr)
 			return response, []volumeserver.VisibilityTarget{
 				inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
@@ -183,6 +188,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 			applyErr = nil
 		}
 		response := oneShotWriteCommitReply(committed, assigned, uint64(post.Size), sequence, post, applyErr)
+		response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 		if applyErr != nil {
 			h.deferStorageFailure(response, applyErr)
 		}
@@ -191,4 +197,8 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
 	})
+	if releaseMutation != nil {
+		releaseMutation()
+	}
+	return response
 }

@@ -25,7 +25,10 @@ func (s *terminalDeliveryStore) Fence(error) { s.fences.Add(1) }
 
 func terminalFallocateResponse(size, sequence uint64) *authoritypb.Response {
 	return &authoritypb.Response{
-		PostAttr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Size: int64(size)},
+		PostState: &authoritypb.PostState{VisibilitySequence: 2, SnapshotSequence: 2, Objects: []*authoritypb.ObjectPostState{{
+			StableIdentity: []byte("0123456789abcdef"), ObjectVersion: 2,
+			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Size: int64(size)}, Roles: postStateRoleTarget,
+		}}},
 		Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
 			PostSize: size, VisibilitySequence: sequence, Flags: rangeReplyApplied | rangeReplyPostApply, Error: -int32(syscall.EPERM),
 		}},

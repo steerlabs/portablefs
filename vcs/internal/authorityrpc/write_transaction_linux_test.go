@@ -1461,7 +1461,7 @@ func TestWriteTransactionCommitRetainsStructuredRLimitRefusalWithoutReapply(t *t
 	if response.GetErrno() != 0 || reply.GetFlags() != writeTransactionReplyRLimit || reply.GetError() != -int32(syscall.EFBIG) {
 		t.Fatalf("RLIMIT COMMIT = %+v", response)
 	}
-	if response.GetPostAttr() != nil || reply.GetCommittedSize() != 0 || reply.GetVisibilitySequence() != 0 {
+	if response.GetPostState() != nil || reply.GetCommittedSize() != 0 || reply.GetVisibilitySequence() != 0 {
 		t.Fatalf("RLIMIT refusal carried applied result = %+v", response)
 	}
 	replay := writeTransactionTestCommitRequest(4, 1, 3, target.Coordinate().Stable)
@@ -1510,7 +1510,7 @@ func TestWriteTransactionCommitPublishesZeroByteMetadataOnlyPostApply(t *testing
 	first := writeTransactionTestCommitRequest(3, 1, 3, target.Coordinate().Stable)
 	response := h.commitWriteTransaction(t.Context(), first, credential, first.GetWriteTransaction())
 	reply := response.GetWriteTransaction()
-	if response.GetErrno() != 0 || response.GetUncertain() || response.GetPostAttr().GetSize() != 11 ||
+	if response.GetErrno() != 0 || response.GetUncertain() || postStateTargetAttr(response.GetPostState()).GetSize() != 11 ||
 		reply.GetFlags() != writeTransactionReplyCommitted|writeTransactionReplyPostApply ||
 		reply.GetCommittedSize() != 0 || reply.GetAssignedOffset() != 0 || reply.GetPostSize() != 11 ||
 		reply.GetVisibilitySequence() != 1 || reply.GetError() != -int32(syscall.ENOSPC) {
