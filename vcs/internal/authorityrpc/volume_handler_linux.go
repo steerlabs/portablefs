@@ -1530,7 +1530,6 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			// fit in a frame. Stopping early is an ordinary short readdir: the
 			// caller resumes from the last entry's cookie.
 			budget := h.readDirEntryBudget(body.ReadDir.GetMaxEntries())
-			used := uint64(0)
 			type issuedItem struct {
 				item xfsstore.Capability
 				name []byte
@@ -1547,113 +1546,78 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			// empty non-final page advances no client cursor, so a batch whose
 			// every entry raced away is skipped over rather than published.
 			for batch := 0; ; batch++ {
-				// An enumeration is the one read that learns its own coordinates by
-				// reading. A page that raced a mutation on any of them is discarded
-				// and re-enumerated rather than published.
-				for attempt := 0; ; attempt++ {
+				var candidates []directoryPageCandidate
+				stabilized := false
+				for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
 					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, verifier, int(body.ReadDir.GetMaxEntries()))
 					if err != nil {
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
-					waited, snapshot, err := h.stabilizeDirectoryPage(ctx, cred.ID, handle, directory, entries)
+					var conflict bool
+					candidates, budgetExhausted, conflict, err = h.constructDirectoryPage(
+						directory, entries, cookie, body.ReadDir.GetWantItems(), budget,
+					)
 					if err != nil {
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
-					if !waited {
-						pageSnapshot = snapshot
-						break
+					if conflict {
+						continue
 					}
-					if attempt+1 >= maxStabilizeAttempts {
+					waited, snapshot, stabilizeErr := h.stabilizeDirectoryPage(ctx, cred.ID, handle, directory, candidates)
+					if stabilizeErr != nil {
+						h.forgetDirectoryCandidates(candidates)
 						forgetIssued()
-						return h.errorResponse(0, syscall.EAGAIN, false)
+						return h.errorResponse(0, stabilizeErr, false)
 					}
+					if waited {
+						h.forgetDirectoryCandidates(candidates)
+						continue
+					}
+					futureVersion := false
+					for _, candidate := range candidates {
+						if candidate.item != (xfsstore.Capability{}) && candidate.dirent.GetObjectVersion() > snapshot {
+							futureVersion = true
+							break
+						}
+					}
+					if futureVersion {
+						h.forgetDirectoryCandidates(candidates)
+						continue
+					}
+					valid, verifyErr := h.revalidateDirectoryPage(
+						handle, directory, cookie, verifier, current,
+						int(body.ReadDir.GetMaxEntries()), entries, eof, candidates,
+					)
+					if verifyErr != nil {
+						h.forgetDirectoryCandidates(candidates)
+						forgetIssued()
+						return h.errorResponse(0, verifyErr, false)
+					}
+					if !valid {
+						h.forgetDirectoryCandidates(candidates)
+						continue
+					}
+					pageSnapshot = snapshot
+					stabilized = true
+					break
 				}
-				result.Verifier, result.Eof = current[:], eof
-				for i, entry := range entries {
-					nextCookie := encodeCookie(cookie + uint64(i) + 1)
-					attr, statErr := h.Store.StatOpenDirChild(handle, entry.Name)
-					if statErr != nil {
-						switch {
-						case errors.Is(statErr, syscall.ENOENT), errors.Is(statErr, xfsstore.ErrStaleObject):
-							// The name was unlinked or renamed away between
-							// enumeration and stat. Omitting it is the legal
-							// after-state observation of that overlapping
-							// mutation; failing the page would turn a peer's
-							// ordinary churn into a readdir error, which no
-							// local directory listing produces.
-							continue
-						case errors.Is(statErr, xfsstore.ErrForbiddenType), errors.Is(statErr, xfsstore.ErrProjectIsolation):
-							// An inode this authority never exposes — a device
-							// node, FIFO, socket, or foreign-owned inode some
-							// other writer placed in the tree — is listed
-							// opaquely with no capability, exactly as a local
-							// readdir lists a name whose later stat fails. One
-							// non-portable inode must not make the whole
-							// directory unreadable.
-							attr = xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
-						default:
-							forgetIssued()
-							return h.errorResponse(0, statErr, false)
-						}
+				if !stabilized {
+					forgetIssued()
+					return h.errorResponse(0, syscall.EAGAIN, false)
+				}
+				result.Verifier, result.Eof = current[:], eof && !budgetExhausted
+				for _, candidate := range candidates {
+					candidate.dirent.SnapshotSequence = pageSnapshot
+					if candidate.dirent.GetItem() != nil {
+						candidate.dirent.Item.ObjectVersion = candidate.dirent.GetObjectVersion()
+						candidate.dirent.Item.SnapshotSequence = pageSnapshot
+						issued = append(issued, issuedItem{item: candidate.item, name: candidate.dirent.GetName()})
+					} else if candidate.item != (xfsstore.Capability{}) {
+						h.forgetItem(candidate.item)
 					}
-					dirent := &authoritypb.Dirent{Name: []byte(entry.Name), Attr: attrProto(attr), NextCookie: nextCookie}
-					var candidate xfsstore.Capability
-					if attr.Kind != xfsstore.KindOpaque {
-						var itemAttr xfsstore.Attr
-						candidate, itemAttr, err = h.Store.Lookup(directory, entry.Name)
-						switch {
-						case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
-							forgetIssued()
-							return h.errorResponse(0, syscall.EAGAIN, false)
-						case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
-							dirent.Attr = attrProto(xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino})
-						case err != nil:
-							forgetIssued()
-							return h.errorResponse(0, err, false)
-						case itemAttr.Ino != entry.Ino || itemAttr.Kind != entry.Kind:
-							// Replaced between enumeration and lookup: neither
-							// the enumerated binding nor its replacement is
-							// this page's to publish. The replacement is the
-							// next enumeration's ordinary entry.
-							h.forgetItem(candidate)
-							candidate = xfsstore.Capability{}
-							continue
-						default:
-							dirent.Attr = attrProto(itemAttr)
-							identity, identityErr := h.Store.Identity(candidate)
-							if identityErr != nil {
-								h.forgetItem(candidate)
-								forgetIssued()
-								return h.errorResponse(0, identityErr, false)
-							}
-							dirent.ObjectVersion = h.sampledObjectVersion(identity, pageSnapshot)
-							dirent.SnapshotSequence = pageSnapshot
-							if body.ReadDir.GetWantItems() {
-								dirent.Item = itemProto(candidate, itemAttr, identity)
-								dirent.Item.ObjectVersion = dirent.ObjectVersion
-								dirent.Item.SnapshotSequence = dirent.SnapshotSequence
-							} else {
-								h.forgetItem(candidate)
-								candidate = xfsstore.Capability{}
-							}
-						}
-					}
-					cost := direntCost(dirent)
-					if used+cost > uint64(budget) {
-						if candidate != (xfsstore.Capability{}) && dirent.Item != nil {
-							h.forgetItem(candidate)
-						}
-						result.Eof = false
-						budgetExhausted = true
-						break
-					}
-					used += cost
-					result.Entries = append(result.Entries, dirent)
-					if candidate != (xfsstore.Capability{}) && dirent.Item != nil {
-						issued = append(issued, issuedItem{item: candidate, name: dirent.Name})
-					}
+					result.Entries = append(result.Entries, candidate.dirent)
 				}
 				if len(result.Entries) != 0 || result.Eof || budgetExhausted {
 					break
@@ -1673,11 +1637,6 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				// returning an empty page forever.
 				forgetIssued()
 				return h.errorResponse(0, syscall.EOVERFLOW, false)
-			}
-			parentAttr, err := h.Store.GetattrOpen(handle)
-			if err != nil || !verifierMatches(current, parentAttr) {
-				forgetIssued()
-				return h.errorResponse(0, syscall.ESTALE, false)
 			}
 			tracked := 0
 			for i, held := range issued {
@@ -1875,6 +1834,148 @@ func encodeCookie(value uint64) []byte {
 
 func verifierMatches(verifier [16]byte, attr xfsstore.Attr) bool {
 	return binary.BigEndian.Uint64(verifier[0:8]) == attr.Ino && binary.BigEndian.Uint64(verifier[8:16]) == uint64(attr.CTimeNS)
+}
+
+type directoryPageCandidate struct {
+	enumerated xfsstore.Dirent
+	dirent     *authoritypb.Dirent
+	item       xfsstore.Capability
+	identity   [16]byte
+	attr       xfsstore.Attr
+}
+
+func (h *VolumeHandler) forgetDirectoryCandidates(candidates []directoryPageCandidate) {
+	for _, candidate := range candidates {
+		if candidate.item != (xfsstore.Capability{}) {
+			h.forgetItem(candidate.item)
+		}
+	}
+}
+
+func (h *VolumeHandler) constructDirectoryPage(
+	directory xfsstore.Capability,
+	entries []xfsstore.Dirent,
+	cookie uint64,
+	wantItems bool,
+	budget uint32,
+) ([]directoryPageCandidate, bool, bool, error) {
+	candidates := make([]directoryPageCandidate, 0, len(entries))
+	used := uint64(0)
+	for i, entry := range entries {
+		candidate := directoryPageCandidate{enumerated: entry}
+		attr := xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
+		if entry.Kind != xfsstore.KindOpaque {
+			item, itemAttr, err := h.Store.Lookup(directory, entry.Name)
+			switch {
+			case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
+				h.forgetDirectoryCandidates(candidates)
+				return nil, false, true, nil
+			case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
+				// The namespace fact remains exact, but this authority never
+				// exposes the object's metadata or a retained capability.
+			case err != nil:
+				h.forgetDirectoryCandidates(candidates)
+				return nil, false, false, err
+			case itemAttr.Ino != entry.Ino || itemAttr.Kind != entry.Kind:
+				h.forgetItem(item)
+				h.forgetDirectoryCandidates(candidates)
+				return nil, false, true, nil
+			default:
+				identity, identityErr := h.Store.Identity(item)
+				if identityErr != nil {
+					h.forgetItem(item)
+					h.forgetDirectoryCandidates(candidates)
+					return nil, false, false, identityErr
+				}
+				candidate.item, candidate.identity, candidate.attr = item, identity, itemAttr
+				attr = itemAttr
+			}
+		}
+		dirent := &authoritypb.Dirent{
+			Name: []byte(entry.Name), Attr: attrProto(attr),
+			NextCookie: encodeCookie(cookie + uint64(i) + 1),
+		}
+		if candidate.item != (xfsstore.Capability{}) {
+			dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, ^uint64(0))
+			if wantItems {
+				dirent.Item = itemProto(candidate.item, candidate.attr, candidate.identity)
+			}
+		}
+		candidate.dirent = dirent
+		cost := direntCost(dirent)
+		if used+cost > uint64(budget) {
+			if candidate.item != (xfsstore.Capability{}) {
+				h.forgetItem(candidate.item)
+			}
+			return candidates, true, false, nil
+		}
+		used += cost
+		candidates = append(candidates, candidate)
+	}
+	return candidates, false, false, nil
+}
+
+func sameDirectoryEnumeration(left, right []xfsstore.Dirent) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *VolumeHandler) revalidateDirectoryPage(
+	handle, directory xfsstore.Capability,
+	cookie uint64,
+	verifier, current [16]byte,
+	maxEntries int,
+	entries []xfsstore.Dirent,
+	eof bool,
+	candidates []directoryPageCandidate,
+) (bool, error) {
+	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
+	if err != nil {
+		return false, err
+	}
+	if checkDirectory != directory || checkVerifier != current || checkEOF != eof || !sameDirectoryEnumeration(checkEntries, entries) {
+		return false, nil
+	}
+	parentAttr, err := h.Store.GetattrOpen(handle)
+	if err != nil {
+		return false, err
+	}
+	if !verifierMatches(current, parentAttr) {
+		return false, nil
+	}
+	for _, candidate := range candidates {
+		if candidate.item == (xfsstore.Capability{}) {
+			continue
+		}
+		item, attr, lookupErr := h.Store.Lookup(directory, candidate.enumerated.Name)
+		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
+			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
+			return false, nil
+		}
+		if lookupErr != nil {
+			return false, lookupErr
+		}
+		identity, identityErr := h.Store.Identity(item)
+		forgetErr := h.Store.Forget(item)
+		if identityErr != nil {
+			return false, identityErr
+		}
+		if forgetErr != nil {
+			return false, forgetErr
+		}
+		if identity != candidate.identity || attr != candidate.attr ||
+			h.sampledObjectVersion(identity, ^uint64(0)) != candidate.dirent.GetObjectVersion() {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest) *authoritypb.Response {

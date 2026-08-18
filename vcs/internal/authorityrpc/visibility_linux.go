@@ -137,12 +137,10 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 	return xfsstore.Capability{}, xfsstore.Attr{}, 0, syscall.EAGAIN
 }
 
-// stabilizeDirectoryPage covers one page of an enumeration. A strict frontend
-// caches the names it enumerated and the state of the inodes behind them, so
-// every one of those coordinates is resolved and recorded before the page is
-// built. Resolving each child costs an extra open/stat/close, which is why it
-// only happens for a strict mount.
-func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, parent xfsstore.Capability, entries []xfsstore.Dirent) (bool, uint64, error) {
+// stabilizeDirectoryPage takes one cut over the complete candidate page. The
+// caller has already sampled every name, identity, attr, and object version;
+// after this cut it revalidates those same facts before publishing any of them.
+func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, parent xfsstore.Capability, candidates []directoryPageCandidate) (bool, uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
 		return false, 1, nil
@@ -154,18 +152,12 @@ func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeser
 	if parent == (xfsstore.Capability{}) {
 		return false, 0, syscall.ESTALE
 	}
-	resolutions := make([]volumeserver.VisibilityResolution, 0, len(entries)+1)
+	resolutions := make([]volumeserver.VisibilityResolution, 0, len(candidates)+1)
 	resolutions = append(resolutions, volumeserver.VisibilityResolution{Identity: directory})
-	for _, entry := range entries {
-		resolution := volumeserver.VisibilityResolution{Parent: directory, Name: []byte(entry.Name)}
-		// An entry whose inode cannot be resolved - it was unlinked under the
-		// enumeration, or it is a type this authority never exposes as an object
-		// - contributes its name and nothing else. There is no inode state the
-		// frontend could be caching for it, so omitting the inode coordinate
-		// cannot hide one. The reply loop and the trailing verifier check still
-		// report the entry itself as stale if it really went away.
-		if coordinate, found, err := h.lookupCoordinate(parent, []byte(entry.Name)); err == nil && found {
-			resolution.Identity = coordinate.identity
+	for _, candidate := range candidates {
+		resolution := volumeserver.VisibilityResolution{
+			Parent: directory, Name: []byte(candidate.enumerated.Name),
+			Identity: candidate.identity,
 		}
 		resolutions = append(resolutions, resolution)
 	}

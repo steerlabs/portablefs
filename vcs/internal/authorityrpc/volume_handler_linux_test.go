@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -2328,6 +2329,104 @@ func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
 	}
 	if len(store.identities) != 2 || store.identities[0] != [16]byte{store.parent[0]} || store.identities[1] != [16]byte{store.replacement[0]} {
 		t.Fatalf("binding-change final lock set = %x, want parent+replacement", store.identities)
+	}
+}
+
+type readdirPostStabilizationChangeStore struct {
+	resourceAdmissionFaultStore
+	root, handle, child xfsstore.Capability
+	readDirCalls        atomic.Uint32
+	lookupCalls         atomic.Uint32
+}
+
+func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
+	open xfsstore.Capability,
+	_ uint64,
+	_ [16]byte,
+	_ int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if open != s.handle {
+		return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EBADF
+	}
+	s.readDirCalls.Add(1)
+	var verifier [16]byte
+	binary.BigEndian.PutUint64(verifier[0:8], uint64(s.root[0]))
+	binary.BigEndian.PutUint64(verifier[8:16], 10)
+	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0])}}, 1, verifier, true, s.root, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	call := s.lookupCalls.Add(1)
+	mode := os.FileMode(0o600)
+	// Call two is the trailing read after the first stabilization cut. It
+	// models a chmod completing in that window; every later read sees the new
+	// state, so the second whole-page transaction can commit.
+	if call >= 2 {
+		mode = 0o640
+	}
+	return s.child, xfsstore.Attr{
+		Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: mode,
+		Nlink: 1, DeviceMinor: 1,
+	}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	return [16]byte{item[0]}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) IdentityOpen(open xfsstore.Capability) ([16]byte, error) {
+	if open != s.handle {
+		return [16]byte{}, syscall.EBADF
+	}
+	return [16]byte{s.root[0]}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) GetattrOpen(open xfsstore.Capability) (xfsstore.Attr, error) {
+	if open != s.handle {
+		return xfsstore.Attr{}, syscall.EBADF
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(s.root[0]), CTimeNS: 10, DeviceMinor: 1}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Forget(xfsstore.Capability) error {
+	s.forget.Add(1)
+	return nil
+}
+
+func (*readdirPostStabilizationChangeStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing.T) {
+	store := &readdirPostStabilizationChangeStore{
+		root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
+	}
+	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := &authoritypb.Request{
+		RequestId: 81, Epoch: credential.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]},
+		Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+			Handle: store.handle[:], MaxEntries: 16, WantItems: true,
+		}},
+	}
+	stampMutation(t, request, 0, 1)
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 {
+		t.Fatalf("READDIRPLUS response = %+v", response)
+	}
+	entry := response.GetReadDir().GetEntries()[0]
+	if entry.GetAttr().GetMode() != 0o640 || entry.GetItem().GetAttr().GetMode() != 0o640 {
+		t.Fatalf("returned pre-chmod candidate: dirent=%+v item=%+v", entry.GetAttr(), entry.GetItem().GetAttr())
+	}
+	if entry.GetObjectVersion() > entry.GetSnapshotSequence() {
+		t.Fatalf("future page stamp %d > %d", entry.GetObjectVersion(), entry.GetSnapshotSequence())
+	}
+	if got := store.readDirCalls.Load(); got != 4 {
+		t.Fatalf("directory enumerations = %d, want candidate+verification for each of two whole-page attempts", got)
+	}
+	if got := store.lookupCalls.Load(); got != 4 {
+		t.Fatalf("child snapshots = %d, want candidate+verification for each of two whole-page attempts", got)
 	}
 }
 
