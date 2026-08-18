@@ -363,16 +363,18 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 	if calls[2].kind != "attr" || calls[2].inode != entry.NodeId || calls[2].sequence != 1 {
 		t.Fatalf("attr repair = %+v; want stamped attributes at the visibility sequence", calls[2])
 	}
-	// A repaired binding is no longer cached, so a second event for the same
-	// name costs nothing and, critically, takes no kernel lock.
+	// A repaired binding is no longer cached, but every namespace COMPLETE must
+	// still advance the parent/name stamp. With no exact child left, the daemon
+	// sends the safe expire/stamp form instead of conditionally omitting PFS_ENTRY.
 	before := f.notify.count()
 	if err := f.raw.completeVisibility(targets, false); err != nil {
 		t.Fatalf("second COMPLETE: %v", err)
 	}
-	for _, call := range f.notify.snapshot()[before:] {
-		if call.kind != "size" && call.kind != "attr" {
-			t.Fatalf("a binding this mount no longer caches was repaired again: %+v", call)
-		}
+	second := f.notify.snapshot()[before:]
+	if len(second) != 3 || second[0].kind != "entry" || second[0].parent != fuse.FUSE_ROOT_ID ||
+		second[0].child != 0 || second[0].name != "victim" || second[0].sequence != 1 ||
+		second[1].kind != "size" || second[2].kind != "attr" {
+		t.Fatalf("second COMPLETE repairs = %+v, want parent stamp plus size and attr", second)
 	}
 }
 
@@ -1351,7 +1353,7 @@ func TestCompleteExpiresACachedAbsenceForACreatedName(t *testing.T) {
 	unique := f.unique.Add(2)
 	inWindow := &fuse.EntryOut{}
 	status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "appeared", inWindow)
-	if status != fuse.Status(syscall.ENOENT) || inWindow.EntryValid != 0 || inWindow.EntryValidNsec != 0 {
+	if !status.Ok() || inWindow.NodeId != 0 || inWindow.EntryValid != 0 || inWindow.EntryValidNsec != 0 {
 		t.Fatalf("in-window probe = %v with lifetime %d.%09d; re-caching an absence inside the barrier window is exactly what the barrier exists to prevent",
 			status, inWindow.EntryValid, inWindow.EntryValidNsec)
 	}
@@ -1435,8 +1437,8 @@ func TestCachedAbsencesAreBoundedByTheirDeclaredShare(t *testing.T) {
 			cached++
 			continue
 		}
-		if status != fuse.Status(syscall.ENOENT) || out.EntryValid != 0 {
-			t.Fatalf("refused absence %q = %v with lifetime %d; beyond the bound the only legal answer is an uncacheable ENOENT", name, status, out.EntryValid)
+		if !status.Ok() || out.NodeId != 0 || out.EntryValid != 0 {
+			t.Fatalf("refused absence %q = %v with NodeId %d and lifetime %d; capacity changes only lifetime, never the structured negative shape", name, status, out.NodeId, out.EntryValid)
 		}
 	}
 	if cached != share {

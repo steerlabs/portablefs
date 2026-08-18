@@ -912,7 +912,14 @@ func requestKind(request *authoritypb.Request) string {
 	case request.GetCreate() != nil:
 		return "create"
 	case request.GetUnlink() != nil:
+		if request.GetUnlink().GetDirectory() {
+			return "rmdir"
+		}
 		return "unlink"
+	case request.GetSymlink() != nil:
+		return "symlink"
+	case request.GetLink() != nil:
+		return "link"
 	case request.GetRename() != nil:
 		return "rename"
 	case request.GetOpen() != nil:
