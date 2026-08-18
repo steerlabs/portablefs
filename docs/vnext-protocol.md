@@ -390,12 +390,28 @@ struct fuse_pfs_cache_stamp {             /* size 32 */
 ```
 
 `record_flags` is zero or `FUSE_PFS_OBJECT_DROP_ATTR`; all other bits are
-errors. The fixed cache stamp follows the standard base result for positive and
-negative LOOKUP and positive GETATTR. Positive LOOKUP and GETATTR carry the
-sampled object version, exact birth time, and masked statx attribute word;
-negative LOOKUP carries zero in all three object fields. The birth time and
-masked statx word are installed under the same publication lock and
-object-version gate as the standard attributes. In READDIRPLUS, each record is:
+errors. The fixed cache stamp follows the standard base result for every SHARED
+positive or negative LOOKUP and every SHARED positive GETATTR. Positive SHARED
+LOOKUP and GETATTR carry the sampled object version, exact birth time, and
+masked statx attribute word; negative SHARED LOOKUP carries zero in all three
+object fields. The birth time and masked statx word are installed under the
+same publication lock and object-version gate as the standard attributes.
+
+A route configuration claims its root name independently of whether the local
+backing object currently exists. A LOOKUP resolved by that configuration is a
+LOCAL-class result even when its parent is SHARED. A present result is the
+standard classified LOCAL `fuse_entry_out`. An absent result is one canonical
+base-only local negative: successful status, zero `nodeid`, zero generation and
+lifetimes, and an otherwise-zero `fuse_entry_out` whose sole nonzero attr field
+is `attr.flags == FUSE_ATTR_PFS_LOCAL`. Neither result carries cache-stamp bytes
+or a marked request identity. It creates no SHARED publication obligation,
+requires no PFS_PUBLISH receipt, and never enters the daemon's SHARED positive,
+negative, or attr registries. The kernel validates the complete local-negative
+shape before returning ENOENT to the VFS. A genuine SHARED negative remains a
+successful zero-nodeid result with the complete stamp and marked-reply receipt;
+an errno ENOENT reply is invalid for both classes.
+
+In READDIRPLUS, each record is:
 
 ```c
 struct fuse_pfs_direntplus {              /* name follows at offset 184 */
