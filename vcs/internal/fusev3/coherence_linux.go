@@ -1257,6 +1257,9 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	ops := m.withdrawalOps()
 	installed := m.kernelMount
 	out := withdrawalOutcome{installed: installed.point != ""}
+	if m.raw != nil {
+		m.raw.terminalizeReplyCacheOwnership()
+	}
 
 	// Round one's namespace detach runs before the cached-name withdrawal, so
 	// the tree is already unreachable from the namespace root while the
