@@ -669,25 +669,35 @@ class PatchedSourceTests(unittest.TestCase):
             directory.index("int fuse_lookup_name"):
             directory.index("static struct dentry *fuse_lookup")
         ]
-        self.assertIn("if (err == -ENOENT)", lookup)
+        self.assertIn("err == -ENOENT", lookup)
         self.assertIn("fuse_abort_conn(fm->fc)", lookup)
         self.assertIn("fuse_pfs_install_lookup(parent, NULL", lookup)
-        self.assertIn("fuse_pfs_local_negative(&args, outarg)", lookup)
+        self.assertIn("fuse_pfs_classify_lookup_result(fm, &args, outarg)", lookup)
         self.assertIn("args.out_argvar = true", lookup)
         self.assertIn("args.pfs_cache_stamp = true", lookup)
 
         local_shape = directory[
-            directory.index("static bool fuse_pfs_local_negative"):
+            directory.index("enum fuse_pfs_lookup_shape"):
             directory.index("static int fuse_dentry_revalidate")
         ]
+        for shape in (
+            "FUSE_PFS_LOOKUP_LOCAL_NEGATIVE",
+            "FUSE_PFS_LOOKUP_SHARED_NEGATIVE",
+            "FUSE_PFS_LOOKUP_LOCAL_POSITIVE",
+            "FUSE_PFS_LOOKUP_SHARED_POSITIVE",
+        ):
+            self.assertIn(shape, local_shape)
         self.assertIn("expected.attr.flags = FUSE_ATTR_PFS_LOCAL", local_shape)
         self.assertIn("!memcmp(outarg, &expected, sizeof(expected))", local_shape)
-        local_unstamped = directory[
-            directory.index("static bool fuse_pfs_local_lookup_has_no_stamp"):
-            directory.index("static bool fuse_pfs_local_negative")
+        self.assertIn("rule->stamped != stamped", local_shape)
+        self.assertIn("rule->marked != args->pfs_reply_marked", local_shape)
+
+        stamped = self.source("fs/fuse/post_state.c")
+        negative = stamped[
+            stamped.index("int fuse_pfs_install_lookup"):
+            stamped.index("int fuse_pfs_install_getattr")
         ]
-        self.assertIn("!args->out_args[1].size", local_unstamped)
-        self.assertIn("!args->pfs_reply_marked", local_unstamped)
+        self.assertIn("memcmp(&entry->attr, &empty_attr", negative)
 
         dev = self.source("fs/fuse/dev.c")
         request = dev[
