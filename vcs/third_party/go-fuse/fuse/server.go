@@ -669,11 +669,7 @@ func (ms *Server) writeReply(req *request) Status {
 // kernel is required to abort the connection.
 func (ms *Server) prepareReplyForWrite(req *request) Status {
 	unique := req.inHeader().Unique
-	if req.variableReply {
-		preparer, ok := ms.replyWriteLifecycle.(ReplyPayloadPreparer)
-		if !ok {
-			return EIO
-		}
+	if preparer, ok := ms.replyWriteLifecycle.(ReplyPayloadPreparer); ok && req.variableReply {
 		n, status := preparer.PrepareReplyPayload(unique, req.inHeader().NodeId, req.inHeader().Opcode, req.outDataBuf, req.outPayload[:cap(req.outPayload)], len(req.outPayload))
 		if !status.Ok() || n < 0 || n > cap(req.outPayload) {
 			if status.Ok() {
