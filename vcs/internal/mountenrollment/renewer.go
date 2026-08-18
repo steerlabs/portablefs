@@ -27,10 +27,30 @@ type RenewalStatus struct {
 	LastError             string
 }
 
+type RenewalEventKind string
+
+const (
+	RenewalScheduled RenewalEventKind = "scheduled"
+	RenewalSucceeded RenewalEventKind = "succeeded"
+	RenewalRetrying  RenewalEventKind = "retrying"
+	RenewalDenied    RenewalEventKind = "denied"
+	RenewalCutoff    RenewalEventKind = "cutoff"
+	RenewalStopped   RenewalEventKind = "stopped"
+)
+
+// RenewalEvent is one fact emitted by the single renewal owner. Status is a
+// complete snapshot after that fact, never a sparse collection of fields that
+// each platform has to interpret differently.
+type RenewalEvent struct {
+	Kind       RenewalEventKind
+	ObservedAt time.Time
+	Status     RenewalStatus
+}
+
 type Renewer struct {
 	Source  GrantSource
 	Now     func() time.Time
-	Observe func(RenewalStatus)
+	Observe func(RenewalEvent)
 	Timeout time.Duration
 	// MinimumSafetyMargin reserves enough time for a platform owner to make
 	// cached kernel state unservable after renewal fails. FSKit sets this to its
@@ -54,21 +74,45 @@ func (renewer *Renewer) Run(ctx context.Context, sessionID string, initialDeadli
 	deadline := initialDeadline
 	authorizedAt := renewer.now()
 	var sequence uint64 = 1
+	status := RenewalStatus{AuthorizationDeadline: deadline, Sequence: sequence}
+	stop := func() error {
+		status.NextAttempt = time.Time{}
+		status.ConsecutiveFailures = 0
+		status.LastError = ""
+		renewer.observe(RenewalStopped, status)
+		return nil
+	}
 	for {
+		if ctx.Err() != nil {
+			return stop()
+		}
+		status.AuthorizationDeadline = deadline
+		status.Sequence = sequence
 		if sequence > 1 {
 			next := refreshTime(renewer.now(), deadline, sessionID, sequence)
-			renewer.observe(RenewalStatus{AuthorizationDeadline: deadline, NextAttempt: next, Sequence: sequence})
+			status.NextAttempt = next
+			status.ConsecutiveFailures = 0
+			status.LastError = ""
+			renewer.observe(RenewalScheduled, status)
 			if err := waitUntil(ctx, renewer.now, next); err != nil {
-				return nil
+				return stop()
 			}
 		}
 		backoff := 500 * time.Millisecond
 		var failures uint64
 		cutoff := safeCutoff(authorizedAt, deadline, renewer.MinimumSafetyMargin)
 		for {
+			if ctx.Err() != nil {
+				return stop()
+			}
 			now := renewer.now()
 			if !now.Before(cutoff) {
-				return errors.New("automatic mount reauthorization reached its safe cutoff")
+				err := errors.New("automatic mount reauthorization reached its safe cutoff")
+				status.NextAttempt = time.Time{}
+				status.ConsecutiveFailures = failures
+				status.LastError = boundedError(err)
+				renewer.observe(RenewalCutoff, status)
+				return err
 			}
 			attemptDeadline := now.Add(timeout)
 			if cutoff.Before(attemptDeadline) {
@@ -89,24 +133,44 @@ func (renewer *Renewer) Run(ctx context.Context, sessionID string, initialDeadli
 				}
 			}
 			cancel()
+			if ctx.Err() != nil {
+				return stop()
+			}
 			if err == nil {
-				renewer.observe(RenewalStatus{AuthorizationDeadline: deadline, LastSuccess: renewer.now(), Sequence: sequence})
+				status.AuthorizationDeadline = deadline
+				status.LastSuccess = authorizedAt
+				status.NextAttempt = time.Time{}
+				status.ConsecutiveFailures = 0
+				status.LastError = ""
+				renewer.observe(RenewalSucceeded, status)
 				sequence++
 				break
 			}
 			if errors.Is(err, ErrDefinitiveDenial) {
-				return fmt.Errorf("automatic mount enrollment was denied: %w", err)
+				resultErr := fmt.Errorf("automatic mount enrollment was denied: %w", err)
+				status.NextAttempt = time.Time{}
+				status.ConsecutiveFailures = failures + 1
+				status.LastError = boundedError(resultErr)
+				renewer.observe(RenewalDenied, status)
+				return resultErr
 			}
 			failures++
 			now = renewer.now()
 			if !now.Add(backoff).Before(cutoff) {
-				renewer.observe(RenewalStatus{AuthorizationDeadline: deadline, NextAttempt: cutoff, Sequence: sequence, ConsecutiveFailures: failures, LastError: boundedError(err)})
-				return fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)
+				resultErr := fmt.Errorf("automatic mount reauthorization could not complete before the safe cutoff: %w", err)
+				status.NextAttempt = time.Time{}
+				status.ConsecutiveFailures = failures
+				status.LastError = boundedError(resultErr)
+				renewer.observe(RenewalCutoff, status)
+				return resultErr
 			}
 			next := now.Add(backoff)
-			renewer.observe(RenewalStatus{AuthorizationDeadline: deadline, NextAttempt: next, Sequence: sequence, ConsecutiveFailures: failures, LastError: boundedError(err)})
+			status.NextAttempt = next
+			status.ConsecutiveFailures = failures
+			status.LastError = boundedError(err)
+			renewer.observe(RenewalRetrying, status)
 			if err := waitUntil(ctx, renewer.now, next); err != nil {
-				return nil
+				return stop()
 			}
 			if backoff < 30*time.Second {
 				backoff *= 2
@@ -143,9 +207,9 @@ func (renewer *Renewer) now() time.Time {
 	return time.Now()
 }
 
-func (renewer *Renewer) observe(status RenewalStatus) {
+func (renewer *Renewer) observe(kind RenewalEventKind, status RenewalStatus) {
 	if renewer.Observe != nil {
-		renewer.Observe(status)
+		renewer.Observe(RenewalEvent{Kind: kind, ObservedAt: renewer.now(), Status: status})
 	}
 }
 

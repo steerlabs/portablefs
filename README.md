@@ -132,9 +132,9 @@ The repository also contains a product-neutral hosted foundation:
 - `portablefs-cell-agent` is unprivileged and outbound-only.
 - `portablefs-cell-helper` is the narrow root/XFS boundary and independently
   verifies signed plans.
-- `portablefs-files` is an optional bounded, read-only HTTP adapter for product
-  backends. It holds short-lived authority sessions, never mounts a volume, and
-  keeps no filesystem namespace or content cache.
+- `portablefs-files` is an optional unprivileged, bounded read gateway for a
+  product's human file browser. It holds short-lived authority sessions and
+  never mounts, indexes, copies, watches, or caches a volume.
 - systemd owns each listener and supervises one sandboxed, unprivileged
   authority per active volume.
 
@@ -144,6 +144,13 @@ existing session with an exact monotonic `Reauthorize` operation; access may
 narrow but never broaden. See
 [docs/hosted-control-plane.md](./docs/hosted-control-plane.md) and
 [docs/hosted-cell-deployment.md](./docs/hosted-cell-deployment.md).
+
+The Files gateway is not a second storage plane. A product backend authenticates
+its user, signs a request token bound to one volume, opaque path, operation,
+cursor, and byte range, and supplies a short Manager-issued read grant for the
+gateway's persisted CSR identity. The gateway keeps only bounded live sessions
+and expiring directory cursors. See `deploy/files/Containerfile` for the
+unprivileged reference image.
 
 ## What PortableFS guarantees
 

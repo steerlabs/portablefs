@@ -18,6 +18,10 @@ import (
 
 const domain = "portablefs-product-authorization-v1\x00"
 
+// MaxRenewalEpoch is the largest integer represented exactly by both Go and
+// JavaScript peers.
+const MaxRenewalEpoch uint64 = 9007199254740991
+
 var ErrInvalid = errors.New("productauth: invalid authorization")
 
 type Claims struct {
@@ -32,6 +36,8 @@ type Claims struct {
 	Nonce               string   `json:"nonce"`
 	NotBefore           int64    `json:"not_before"`
 	Expires             int64    `json:"expires"`
+	RenewalScope        string   `json:"renewal_scope,omitempty"`
+	RenewalEpoch        uint64   `json:"renewal_epoch,omitempty"`
 }
 
 type Expectations struct {
@@ -44,6 +50,8 @@ type Expectations struct {
 	Now                 time.Time
 	ClockSkew           time.Duration
 	MaxLifetime         time.Duration
+	RenewalScope        string
+	RenewalEpoch        uint64
 }
 
 type Verified struct {
@@ -67,7 +75,10 @@ func Verify(publicKey ed25519.PublicKey, token []byte, expected Expectations) (V
 	if len(publicKey) != ed25519.PublicKeySize || len(token) == 0 || len(token) > 8192 ||
 		expected.Issuer == "" || expected.Audience == "" || expected.AuthorizationDomain == "" ||
 		expected.Owner == "" || expected.VolumeID == "" || expected.Now.IsZero() ||
-		expected.ClockSkew < 0 || expected.MaxLifetime <= 0 {
+		expected.ClockSkew < 0 || expected.MaxLifetime <= 0 ||
+		(expected.RenewalScope == "") != (expected.RenewalEpoch == 0) ||
+		expected.RenewalEpoch > MaxRenewalEpoch ||
+		expected.RenewalScope != "" && !ValidRenewalScope(expected.RenewalScope) {
 		return Verified{}, ErrInvalid
 	}
 	parts := strings.Split(string(token), ".")
@@ -95,7 +106,12 @@ func Verify(publicKey ed25519.PublicKey, token []byte, expected Expectations) (V
 	if claims.Issuer != expected.Issuer || claims.Audience != expected.Audience ||
 		claims.AuthorizationDomain != expected.AuthorizationDomain || claims.Owner != expected.Owner ||
 		claims.VolumeID != expected.VolumeID || claims.Subject == "" || claims.Nonce == "" ||
-		claims.Expires <= claims.NotBefore || !validAccess(claims.Access) {
+		claims.Expires <= claims.NotBefore || !validAccess(claims.Access) ||
+		(claims.RenewalScope == "") != (claims.RenewalEpoch == 0) ||
+		claims.RenewalEpoch > MaxRenewalEpoch ||
+		claims.RenewalScope != "" && !ValidRenewalScope(claims.RenewalScope) ||
+		expected.RenewalScope != "" &&
+			(claims.RenewalScope != expected.RenewalScope || claims.RenewalEpoch != expected.RenewalEpoch) {
 		return Verified{}, ErrInvalid
 	}
 	peerBytes, err := base64.RawURLEncoding.DecodeString(claims.PeerSPKI)
@@ -125,6 +141,27 @@ func Allows(granted, requested []string) bool {
 
 func validAccess(access []string) bool {
 	return accessBits(access) != 0
+}
+
+// ValidRenewalScope excludes JSON-escaped characters so encoded size remains
+// proportional to raw size on both Go and TypeScript peers.
+func ValidRenewalScope(value string) bool {
+	if value == "" || len(value) > 200 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' {
+			continue
+		}
+		switch character {
+		case '.', '_', '-', ':', '/':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func accessBits(access []string) uint8 {

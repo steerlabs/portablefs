@@ -45,8 +45,10 @@ func TestRenewerRetriesOneExactSequenceAndStopsWithItsOwner(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	renewer := &Renewer{Source: source, Observe: func(status RenewalStatus) {
-		if !status.LastSuccess.IsZero() {
+	var events []RenewalEvent
+	renewer := &Renewer{Source: source, Observe: func(event RenewalEvent) {
+		events = append(events, event)
+		if event.Kind == RenewalSucceeded {
 			cancel()
 		}
 	}}
@@ -65,12 +67,22 @@ func TestRenewerRetriesOneExactSequenceAndStopsWithItsOwner(t *testing.T) {
 	if len(source.calls) != 2 || source.calls[0] != 1 || source.calls[1] != 1 {
 		t.Fatalf("refresh sequences = %v, want [1 1]", source.calls)
 	}
+	if len(events) != 3 || events[0].Kind != RenewalRetrying || events[1].Kind != RenewalSucceeded || events[2].Kind != RenewalStopped {
+		t.Fatalf("renewal events = %+v, want retrying, succeeded, stopped", events)
+	}
+	if events[0].Status.Sequence != 1 || events[0].Status.ConsecutiveFailures != 1 || events[0].Status.LastError == "" || events[0].Status.NextAttempt.IsZero() {
+		t.Fatalf("retry event status = %+v", events[0].Status)
+	}
+	if events[1].Status.AuthorizationDeadline != grantDeadline || events[1].Status.LastSuccess.IsZero() || events[1].Status.ConsecutiveFailures != 0 || events[1].Status.LastError != "" || !events[1].Status.NextAttempt.IsZero() {
+		t.Fatalf("success event status = %+v", events[1].Status)
+	}
 }
 
 func TestRenewerFailsClosedImmediatelyOnDefinitiveDenial(t *testing.T) {
 	source := &scriptedSource{err: ErrDefinitiveDenial}
 	start := time.Now()
-	err := (&Renewer{Source: source}).Run(context.Background(), "session", start.Add(time.Minute),
+	var events []RenewalEvent
+	err := (&Renewer{Source: source, Observe: func(event RenewalEvent) { events = append(events, event) }}).Run(context.Background(), "session", start.Add(time.Minute),
 		func(context.Context, string, uint64, []byte) (time.Time, error) {
 			t.Fatal("definitively denied grant reached installer")
 			return time.Time{}, nil
@@ -81,17 +93,24 @@ func TestRenewerFailsClosedImmediatelyOnDefinitiveDenial(t *testing.T) {
 	if time.Since(start) > time.Second {
 		t.Fatalf("definitive denial was retried for %v", time.Since(start))
 	}
+	if len(events) != 1 || events[0].Kind != RenewalDenied || events[0].Status.LastError == "" || events[0].Status.ConsecutiveFailures != 1 {
+		t.Fatalf("definitive denial events = %+v", events)
+	}
 }
 
 func TestRenewerRefusesToStartInsideSafetyMargin(t *testing.T) {
 	source := &scriptedSource{}
-	err := (&Renewer{Source: source}).Run(context.Background(), "session", time.Now().Add(4*time.Second),
+	var events []RenewalEvent
+	err := (&Renewer{Source: source, Observe: func(event RenewalEvent) { events = append(events, event) }}).Run(context.Background(), "session", time.Now().Add(4*time.Second),
 		func(context.Context, string, uint64, []byte) (time.Time, error) { return time.Time{}, nil })
 	if err == nil {
 		t.Fatal("renewer started after its safe cutoff")
 	}
 	if len(source.calls) != 0 {
 		t.Fatalf("unsafe refresh calls = %v", source.calls)
+	}
+	if len(events) != 1 || events[0].Kind != RenewalCutoff || events[0].Status.LastError == "" {
+		t.Fatalf("safe-cutoff events = %+v", events)
 	}
 }
 
