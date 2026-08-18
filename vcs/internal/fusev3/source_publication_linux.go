@@ -325,6 +325,11 @@ func (r *rawFileSystem) acquirePeerPublication(ctx context.Context, targets []*a
 	for coordinate := range coordinates {
 		r.peerHolds[coordinate]++
 		r.peerHeldPhase = append(r.peerHeldPhase, coordinate)
+		for reservation := range r.cacheReservations[coordinate] {
+			if reservation.state == cacheReservationPending {
+				reservation.revoked = true
+			}
+		}
 	}
 	for _, key := range keys.names {
 		r.heldNames[key] = struct{}{}
@@ -867,6 +872,16 @@ func (l *sourcePublicationLease) hasUnresolvedBinding() bool {
 	l.r.mu.Lock()
 	defer l.r.mu.Unlock()
 	return l.unresolvedAttributes != 0 || l.unresolvedData != 0
+}
+
+func (l *sourcePublicationLease) preBinding(namespace publicationNamespace) (publicationIdentity, bool) {
+	if l == nil {
+		return publicationIdentity{}, false
+	}
+	l.r.mu.Lock()
+	defer l.r.mu.Unlock()
+	identity, ok := l.preBindings[namespace]
+	return identity, ok
 }
 
 func (l *sourcePublicationLease) attachRename(ctx context.Context, oldName, newName publicationNamespace, newPost publicationIdentity, oldPost *publicationIdentity) error {

@@ -1544,6 +1544,126 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 	}
 }
 
+// TestMutationPostStateEliminatesFollowupMetadataRPCs pins the request totals
+// exact post-state is meant to buy. Names are warmed before each mutation so
+// the mutation itself is the only authority operation; the immediate stat is
+// then a direct assertion that the reply installed the target and parent attrs.
+func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	type counts struct {
+		lookup, getattr, create, unlink, rename, write int
+	}
+	measure := func(operation string, fn func()) counts {
+		before := counts{
+			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
+			create: f.counter.count("create"), unlink: f.counter.count("unlink"),
+			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
+		}
+		fn()
+		after := counts{
+			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
+			create: f.counter.count("create"), unlink: f.counter.count("unlink"),
+			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
+		}
+		delta := counts{
+			lookup: after.lookup - before.lookup, getattr: after.getattr - before.getattr,
+			create: after.create - before.create, unlink: after.unlink - before.unlink,
+			rename: after.rename - before.rename, write: after.write - before.write,
+		}
+		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d unlink=%d rename=%d one-shot-write=%d",
+			operation, delta.lookup, delta.getattr, delta.create, delta.unlink, delta.rename, delta.write)
+		return delta
+	}
+	requireCounts := func(operation string, got, want counts) {
+		t.Helper()
+		if got != want {
+			t.Fatalf("%s RPCs = %+v, want %+v", operation, got, want)
+		}
+	}
+
+	root := f.mountPath(0)
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("warm root attrs: %v", err)
+	}
+	createdPath := filepath.Join(root, "post-state-created")
+	if _, err := os.Lstat(createdPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm create destination absence: %v", err)
+	}
+	var created *os.File
+	createRPCs := measure("create plus child/parent stat", func() {
+		var err error
+		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := os.Lstat(createdPath); err != nil {
+			t.Fatalf("stat created child: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after create: %v", err)
+		}
+	})
+	requireCounts("create plus child/parent stat", createRPCs, counts{create: 1})
+
+	payload := []byte("exact post-state")
+	writeRPCs := measure("write plus warm fstat", func() {
+		if n, err := created.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("write = (%d, %v), want (%d, nil)", n, err, len(payload))
+		}
+		info, err := created.Stat()
+		if err != nil || info.Size() != int64(len(payload)) {
+			t.Fatalf("warm fstat after write: size=%v err=%v", sizeOf(info), err)
+		}
+	})
+	requireCounts("write plus warm fstat", writeRPCs, counts{write: 1})
+	if err := created.Close(); err != nil {
+		t.Fatalf("close created file: %v", err)
+	}
+
+	unlinkedPath := filepath.Join(root, "post-state-unlinked")
+	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
+	if _, err := os.Lstat(unlinkedPath); err != nil {
+		t.Fatalf("warm unlink source: %v", err)
+	}
+	unlinkRPCs := measure("unlink plus child/parent stat", func() {
+		if err := os.Remove(unlinkedPath); err != nil {
+			t.Fatalf("unlink: %v", err)
+		}
+		if _, err := os.Lstat(unlinkedPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat unlinked child: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after unlink: %v", err)
+		}
+	})
+	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{unlink: 1})
+
+	oldParent, newParent := filepath.Join(root, "old-parent"), filepath.Join(root, "new-parent")
+	mustMkdir(t, oldParent)
+	mustMkdir(t, newParent)
+	source, destination := filepath.Join(oldParent, "source"), filepath.Join(newParent, "destination")
+	mustWrite(t, source, []byte("rename"), 0o600)
+	for _, path := range []string{oldParent, newParent, source} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("warm rename path %s: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm rename destination absence: %v", err)
+	}
+	renameRPCs := measure("rename plus child/parent stats", func() {
+		if err := os.Rename(source, destination); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		for _, path := range []string{destination, oldParent, newParent} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after rename %s: %v", path, err)
+			}
+		}
+	})
+	requireCounts("rename plus child/parent stats", renameRPCs, counts{rename: 1})
+}
+
 // TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's
 // actual promise. The observing mount has the name cached with a one-minute
 // lifetime, so nothing but a synchronous repair can make it stop resolving --

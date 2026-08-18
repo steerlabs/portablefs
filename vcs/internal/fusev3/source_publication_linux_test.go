@@ -1074,30 +1074,35 @@ func TestSourceFirstReturnedBindingAndReplyWritePrecedePeerPrepare(t *testing.T)
 		t.Fatal(err)
 	}
 	finishPeerVisibility(t, f.raw, targets)
-	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "inode" {
-		t.Fatalf("peer repair after source publication = %+v, want one inode notification", calls)
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "attr" {
+		t.Fatalf("peer repair after source publication = %+v, want one stamped attr notification", calls)
 	}
 }
 
-func TestRenameUsesAuthoritativePostBindingWithoutCachedOldName(t *testing.T) {
+func TestRenameUsesAuthoritativePostBindingForCanonicalCachedSource(t *testing.T) {
 	f := newStrictFixture(t)
-	f.rpc.renameNewPost = testIdentity(77)
+	f.rpc.byName = map[string]*authoritypb.Item{"old": testItem(77, authoritypb.Attr_REGULAR, 77)}
+	f.lookup(t, fuse.FUSE_ROOT_ID, "old")
 	const unique = 404
 	status := f.raw.Rename(nil, &fuse.RenameIn{
 		InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
 		Newdir:   fuse.FUSE_ROOT_ID,
-	}, "never-cached-old", "new")
+	}, "old", "new")
 	if !status.Ok() {
-		t.Fatalf("rename without a locally cached old binding = %v", status)
+		t.Fatalf("rename with a canonical cached source = %v", status)
 	}
 	if !f.raw.ReplyWriteOrdered(unique) {
 		t.Fatal("rename reply did not retain its authoritative post identity through physical publication")
 	}
 	f.raw.mu.Lock()
-	oldCached := f.raw.cachedStableNames[publicationNamespace{parent: testPublicationIdentity(t, f.rpc.root), name: "never-cached-old"}]
+	oldCached := f.raw.cachedStableNames[publicationNamespace{parent: testPublicationIdentity(t, f.rpc.root), name: "old"}]
+	newCached := f.raw.cachedStableNames[publicationNamespace{parent: testPublicationIdentity(t, f.rpc.root), name: "new"}]
 	f.raw.mu.Unlock()
 	if oldCached != nil {
-		t.Fatal("test precondition failed: old rename name unexpectedly entered the local cache")
+		t.Fatal("successful rename left the old cached binding behind")
+	}
+	if newCached == nil {
+		t.Fatal("successful rename did not move the cached binding to the authoritative post name")
 	}
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, 77, 0),
@@ -1199,7 +1204,7 @@ func TestStockWriteOnSharedHandleTerminalizesBeforeAuthorityDispatch(t *testing.
 	}
 }
 
-func TestCachedLookupPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
+func TestFinalizedLookupIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"cached": testItem(55, authoritypb.Attr_REGULAR, 55)}
 	const unique = 500
@@ -1217,41 +1222,42 @@ func TestCachedLookupPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
 	if committedBeforeWrite || pendingBeforeWrite != 1 {
 		t.Fatalf("pre-write registry committed=%t pending=%d, want false/1", committedBeforeWrite, pendingBeforeWrite)
 	}
+	outData := make([]byte, 128)
+	outData[16], outData[24] = 1, 1
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1, outData, make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize LOOKUP = (%d, %v)", n, status)
+	}
 
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "cached")}
-	prepareDone := make(chan error, 1)
-	go func() { prepareDone <- f.raw.prepareVisibility(context.Background(), targets, false) }()
-	waitSourceState(t, f.raw, "the peer namespace cut behind a cached LOOKUP reply", func(raw *rawFileSystem) bool {
-		return len(raw.peerHeldPhase) != 0
-	})
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE before cached LOOKUP reply write")
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 2)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	completeDone := make(chan error, 1)
+	go func() { completeDone <- f.raw.finishVisibilityComplete(context.Background(), completion) }()
+	assertNoPrepareResult(t, completeDone, "peer COMPLETE before finalized LOOKUP reply write")
 
 	markTestReply(t, f.raw, unique)
 	f.raw.ReplyWritten(unique, fuse.OK)
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE after LOOKUP reply write but before post-VFS ACK")
-	f.raw.mu.Lock()
-	_, committedAfterWrite := f.raw.cachedNames[nameKey{parent: 1, name: "cached"}]
-	f.raw.mu.Unlock()
-	if committedAfterWrite {
-		t.Fatal("physical LOOKUP reply committed its repair obligation before kernel postprocessing")
-	}
-	acknowledgeTestPublication(t, f.raw, unique)
-	if err := awaitPrepareResult(t, prepareDone, "peer PREPARE after cached LOOKUP publication ACK"); err != nil {
+	if err := awaitPrepareResult(t, completeDone, "peer COMPLETE after finalized LOOKUP reply write"); err != nil {
 		t.Fatal(err)
 	}
+	acknowledgeTestPublication(t, f.raw, unique)
 	f.raw.mu.Lock()
 	_, committedAfterAck := f.raw.cachedNames[nameKey{parent: 1, name: "cached"}]
 	f.raw.mu.Unlock()
-	if !committedAfterAck {
-		t.Fatal("post-VFS LOOKUP ACK did not commit its exact repair obligation")
+	if committedAfterAck {
+		t.Fatal("repaired FINALIZED LOOKUP entered the cache registry after post-VFS ACK")
 	}
-	finishPeerVisibility(t, f.raw, targets)
 	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "cached" {
 		t.Fatalf("LOOKUP repair = %+v, want exact delete notification", calls)
 	}
 }
 
-func TestCachedGetattrPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
+func TestFinalizedGetattrIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *testing.T) {
 	f := newStrictFixture(t)
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "cached")
 	const unique = 502
@@ -1263,26 +1269,45 @@ func TestCachedGetattrPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
 	if !f.raw.ReplyWriteOrdered(unique) {
 		t.Fatal("cacheable GETATTR reply was not joined to the physical writer boundary")
 	}
+	outData := make([]byte, 104)
+	outData[0] = 1
+	if n, status := f.raw.PrepareReplyPayload(unique, entry.NodeId, 3, outData, make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize GETATTR = (%d, %v)", n, status)
+	}
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, entry.Attr.Ino, 0),
 	}
-	prepareDone := make(chan error, 1)
-	go func() { prepareDone <- f.raw.prepareVisibility(context.Background(), targets, false) }()
-	waitSourceState(t, f.raw, "the peer item cut behind a cached GETATTR reply", func(raw *rawFileSystem) bool {
-		return len(raw.peerHeldPhase) != 0
-	})
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE before cached GETATTR reply write")
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 2)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	completeDone := make(chan error, 1)
+	go func() { completeDone <- f.raw.finishVisibilityComplete(context.Background(), completion) }()
+	assertNoPrepareResult(t, completeDone, "peer COMPLETE before finalized GETATTR reply write")
 
 	markTestReply(t, f.raw, unique)
 	f.raw.ReplyWritten(unique, fuse.OK)
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE after GETATTR reply write but before post-VFS ACK")
-	acknowledgeTestPublication(t, f.raw, unique)
-	if err := awaitPrepareResult(t, prepareDone, "peer PREPARE after cached GETATTR publication ACK"); err != nil {
+	if err := awaitPrepareResult(t, completeDone, "peer COMPLETE after finalized GETATTR reply write"); err != nil {
 		t.Fatal(err)
 	}
-	finishPeerVisibility(t, f.raw, targets)
-	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "inode" {
-		t.Fatalf("GETATTR repair = %+v, want one inode notification", calls)
+	acknowledgeTestPublication(t, f.raw, unique)
+	record := f.raw.acquire(entry.NodeId)
+	if record == nil {
+		t.Fatal("acquire GETATTR record")
+	}
+	identity := record.identity
+	f.raw.release(record)
+	f.raw.mu.Lock()
+	_, cached := f.raw.cachedAttrs[identity]
+	f.raw.mu.Unlock()
+	if cached {
+		t.Fatal("repaired FINALIZED GETATTR entered the cache registry after post-VFS ACK")
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "attr" {
+		t.Fatalf("GETATTR repair = %+v, want one stamped attr notification", calls)
 	}
 }
 

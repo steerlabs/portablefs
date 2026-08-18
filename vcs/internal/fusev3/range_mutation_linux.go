@@ -243,8 +243,8 @@ func validAppliedRange(resultSize, postSize, sequence uint64, flags uint32, errn
 	}
 }
 
-func validateRangePostAttr(response *authoritypb.Response, inode, postSize uint64) bool {
-	attr := response.GetPostAttr()
+func validateRangePostAttr(response *authoritypb.Response, inode, postSize uint64, role uint32) bool {
+	attr := responsePostAttr(response, role)
 	return attr != nil && attr.GetKind() == authoritypb.Attr_REGULAR && attr.GetInode() == inode &&
 		attr.GetSize() >= 0 && uint64(attr.GetSize()) == postSize
 }
@@ -318,15 +318,18 @@ func (r *rawFileSystem) PFSFallocate(_ <-chan struct{}, input *fuse.PFSFallocate
 	}
 	resultSize, postSize, sequence, flags, replyErrno := reply.GetResultSize(), reply.GetPostSize(), reply.GetVisibilitySequence(), reply.GetFlags(), reply.GetError()
 	if validFallocateNoChange(input, resultSize, postSize, sequence, flags, replyErrno) {
-		if response.GetPostAttr() != nil {
+		if response.GetPostState() != nil {
 			return r.rangeMutationFailure("fusev3: rejected PFS_FALLOCATE carried post-mutation attributes")
 		}
 		return r.completeRangeNoChange(ctx, out, resultSize, postSize, sequence, flags, replyErrno)
 	}
 	if !validAppliedRange(resultSize, postSize, sequence, flags, replyErrno, true, 0) ||
 		!validFallocateAppliedPost(input, postSize, flags) ||
-		!validateRangePostAttr(response, handleRecord.inode.key.inode, postSize) {
+		!validateRangePostAttr(response, handleRecord.inode.key.inode, postSize, postStateRoleTarget) {
 		return r.rangeMutationFailure("fusev3: PFS_FALLOCATE returned a malformed applied result")
+	}
+	if err := expectPostStateRecord(ctx, handleRecord.inode, postStateRoleTarget); err != nil {
+		return r.rangeMutationFailure(err.Error())
 	}
 	return r.completeAppliedRange(ctx, out, resultSize, postSize, sequence, flags, replyErrno)
 }
@@ -391,7 +394,7 @@ func (r *rawFileSystem) PFSCopyFileRange(_ <-chan struct{}, input *fuse.PFSCopyF
 	}
 	resultSize, postSize, sequence, flags, replyErrno := reply.GetResultSize(), reply.GetPostSize(), reply.GetVisibilitySequence(), reply.GetFlags(), reply.GetError()
 	if validStructuredRangeNoChange(resultSize, postSize, sequence, flags, replyErrno, true) {
-		if response.GetPostAttr() != nil {
+		if response.GetPostState() != nil {
 			return r.rangeMutationFailure("fusev3: no-change PFS_COPY_FILE_RANGE carried post-mutation attributes")
 		}
 		// Linux checks the destination position against both absolute ceilings
@@ -414,8 +417,13 @@ func (r *rawFileSystem) PFSCopyFileRange(_ <-chan struct{}, input *fuse.PFSCopyF
 		invalidRange = end > ceiling || postSize < end
 	}
 	if !validAppliedRange(resultSize, postSize, sequence, flags, replyErrno, false, input.Len) ||
-		invalidRange || postSize > input.FileMaxSize || !validateRangePostAttr(response, destinationRecord.inode.key.inode, postSize) {
+		invalidRange || postSize > input.FileMaxSize || !validateRangePostAttr(response, destinationRecord.inode.key.inode, postSize, postStateRoleDestination) {
 		return r.rangeMutationFailure("fusev3: PFS_COPY_FILE_RANGE returned a malformed applied result")
+	}
+	sourceObject, sourceErr := expectedPostStateRecord(sourceRecord.inode, postStateRoleSource)
+	destinationObject, destinationErr := expectedPostStateRecord(destinationRecord.inode, postStateRoleDestination)
+	if sourceErr != nil || destinationErr != nil || expectPostState(ctx, sourceObject, destinationObject) != nil {
+		return r.rangeMutationFailure("fusev3: PFS_COPY_FILE_RANGE post-state identities do not match its handles")
 	}
 	return r.completeAppliedRange(ctx, out, resultSize, postSize, sequence, flags, replyErrno)
 }
