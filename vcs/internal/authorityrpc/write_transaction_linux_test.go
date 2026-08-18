@@ -1376,6 +1376,7 @@ func TestWriteTransactionVisibilityRetryReusesStagedBytesAndPreservesFIFO(t *tes
 	}
 	go func() {
 		peerResult <- visibility.Execute(t.Context(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
 			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true })
 	}()

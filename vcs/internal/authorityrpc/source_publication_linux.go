@@ -16,9 +16,10 @@ import (
 
 // operationResolutionContext owns every immutable capability fact and every
 // namespace answer used by one mutation. Capability coordinates live for the
-// whole operation. Namespace answers have two epochs: the pre-turn derivation
-// needs only the independently verified request shape, then the post-turn
-// refresh resolves bindings once and prepare consumes those same answers.
+// whole operation. Namespace answers are first resolved after a binding-version
+// declaration and before dependency admission. If the version changes while
+// admission waits, one refresh supplies the corrected dependency set and the
+// same answers are then consumed by prepare.
 type operationResolutionContext struct {
 	h          *VolumeHandler
 	id         volumeserver.SessionID
@@ -381,10 +382,11 @@ func sourcePublicationGateHasNamespace(gate volumeserver.SourcePublicationGate) 
 }
 
 // sourcePublicationResolutions extracts only identities the successful
-// ordinary response can newly publish. It runs while mutation order is still
-// held, so a following peer mutation cannot choose its audience before this
-// monotone index update. Exact replays do not re-run it: the first execution
-// installed the identity even if its DATA response was lost.
+// ordinary response can newly publish. It runs while the mutation's complete
+// dependency set is still held, so a following conflicting peer mutation
+// cannot choose its audience before this monotone index update. Exact replays
+// do not re-run it: the first execution installed the identity even if its DATA
+// response was lost.
 func sourcePublicationResolutions(req *authoritypb.Request, resp *authoritypb.Response) ([]volumeserver.VisibilityResolution, error) {
 	if resp == nil {
 		return nil, syscall.EIO

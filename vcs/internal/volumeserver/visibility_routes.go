@@ -76,18 +76,12 @@ func (c *VisibilityCoordinator) ExecuteRoutesChecked(ctx context.Context, next R
 			return 0, err
 		}
 	}
-	// The write lock already excludes every Execute, so this normally grants
-	// immediately. It is taken anyway because a routing change claiming a
-	// sequence out of mutation order would make the per-participant cursor
-	// non-monotonic.
-	turn, err := c.order.acquire(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer turn.release()
 	ticket := VisibilityEvent{Routes: next.clone()}
 	barrierStarted := c.cfg.Now()
 	audience, deliveries, err := c.openRoutesBarrier(&ticket)
+	if ticket.Cursor.Sequence != 0 {
+		defer c.finishBarrier(ticket.Cursor.Sequence, audience)
+	}
 	if err != nil {
 		return 0, &VisibilityBarrierError{Err: err}
 	}
@@ -127,11 +121,17 @@ func (c *VisibilityCoordinator) openRoutesBarrier(ticket *VisibilityEvent) (visi
 	ticket.Cursor = VisibilityCursor{Sequence: c.next, Phase: VisibilityPrepare}
 	var audience visibilityAudience
 	for _, p := range c.participants {
+		if p.barrier != 0 {
+			return visibilityAudience{}, nil, c.poisonLocked(errors.New("volumeserver: routing change overlapped a participant visibility barrier"))
+		}
 		audience.members = append(audience.members, p)
+	}
+	for _, p := range audience.members {
+		p.barrier = ticket.Cursor.Sequence
 	}
 	deliveries, err := c.dispatchLocked(*ticket, audience, nil)
 	if err != nil {
-		return visibilityAudience{}, nil, err
+		return audience, nil, err
 	}
 	return audience, deliveries, nil
 }
