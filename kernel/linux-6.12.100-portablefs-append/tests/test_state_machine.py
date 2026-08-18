@@ -619,6 +619,31 @@ class KernelInode:
     birth_time_ns: int = 0
     mode: int = 0o644
 
+    def begin_attr_exact(self, refresh: callable) -> None:
+        if not self.attr_exact:
+            refresh()
+        if not self.attr_exact:
+            raise BlockingIOError(errno.EAGAIN, "attributes remain inexact")
+
+    def may_setattr(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(
+            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
+        )
+
+    def may_delete(
+        self, victim: "KernelInode", refresh_parent: callable,
+        refresh_victim: callable,
+    ) -> bool:
+        self.begin_attr_exact(refresh_parent)
+        if not self.permission(0o300):
+            return False
+        victim.begin_attr_exact(refresh_victim)
+        return not bool(
+            self.inode_flags & STATX_ATTR_APPEND or
+            victim.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
+        )
+
     def exact_data(self, size: int, sequence: int) -> str:
         if size < 0 or sequence <= 0 or sequence > S64_MAX:
             raise ProtocolError
@@ -1338,6 +1363,49 @@ class PublicationAndNotifyTests(unittest.TestCase):
         self.assertFalse(inode.attr_exact)
         self.assertEqual(inode.install_stamped_attr(3, 3, immutable, 333), "applied")
         self.assertEqual((inode.attr_exact, inode.inode_flags), (True, immutable))
+
+    def test_vfs_attr_prechecks_refresh_inexact_operands_once(self) -> None:
+        inode = KernelInode()
+        self.assertEqual(
+            inode.install_stamped_attr(1, 1, STATX_ATTR_IMMUTABLE, 1),
+            "applied",
+        )
+        inode.repair_attr(2)
+        setattr_refreshes = 0
+
+        def refresh_setattr() -> None:
+            nonlocal setattr_refreshes
+            setattr_refreshes += 1
+            self.assertEqual(
+                inode.install_stamped_attr(2, 2, 0, 2), "applied"
+            )
+
+        self.assertTrue(inode.may_setattr(refresh_setattr))
+        self.assertEqual(setattr_refreshes, 1)
+
+        parent = KernelInode(is_dir=True, mode=0o700)
+        victim = KernelInode()
+        self.assertEqual(parent.install_stamped_attr(3, 3, 0, 3), "applied")
+        self.assertEqual(victim.install_stamped_attr(3, 3, 0, 3), "applied")
+        victim.repair_attr(4)
+        parent_refreshes = 0
+        victim_refreshes = 0
+
+        def refresh_parent() -> None:
+            nonlocal parent_refreshes
+            parent_refreshes += 1
+
+        def refresh_victim() -> None:
+            nonlocal victim_refreshes
+            victim_refreshes += 1
+            self.assertEqual(
+                victim.install_stamped_attr(4, 4, 0, 4), "applied"
+            )
+
+        self.assertTrue(
+            parent.may_delete(victim, refresh_parent, refresh_victim)
+        )
+        self.assertEqual((parent_refreshes, victim_refreshes), (0, 1))
 
     def test_synchronous_statx_fill_uses_installed_exact_record(self) -> None:
         inode = KernelInode()
