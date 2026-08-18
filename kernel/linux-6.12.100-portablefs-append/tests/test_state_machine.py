@@ -33,6 +33,20 @@ FOPEN_PFS_LOCAL = 1 << 9
 
 ATTR_PFS_SHARED = 1 << 2
 ATTR_PFS_LOCAL = 1 << 3
+STATX_ATTR_IMMUTABLE = 0x00000010
+STATX_ATTR_APPEND = 0x00000020
+STATX_ATTR_NODUMP = 0x00000040
+STATX_ATTR_ENCRYPTED = 0x00000800
+STATX_ATTR_VERITY = 0x00100000
+STATX_ATTR_DAX = 0x00200000
+PFS_STATX_ATTRIBUTES = (
+    STATX_ATTR_IMMUTABLE
+    | STATX_ATTR_APPEND
+    | STATX_ATTR_NODUMP
+    | STATX_ATTR_ENCRYPTED
+    | STATX_ATTR_VERITY
+    | STATX_ATTR_DAX
+)
 
 WRITE_BEGUN = 1 << 0
 WRITE_STAGED = 1 << 1
@@ -541,9 +555,11 @@ class KernelInode:
     nodeid: int = 1
     nlink: int = 1
     object_version: int = 0
+    attr_repair_sequence: int = 0
     attr_exact: bool = False
     inode_flags: int = 0
     birth_time_ns: int = 0
+    mode: int = 0o644
 
     def exact_data(self, size: int, sequence: int) -> str:
         if size < 0 or sequence <= 0 or sequence > S64_MAX:
@@ -576,24 +592,44 @@ class KernelInode:
         if sequence <= 0 or sequence > S64_MAX:
             raise ProtocolError("invalid attr repair sequence")
         self.object_version = max(self.object_version, sequence)
+        self.attr_repair_sequence = max(self.attr_repair_sequence, sequence)
         self.attr_exact = False
         self.inode_flags = 0
         self.birth_time_ns = 0
 
     def install_stamped_attr(
         self, object_version: int, snapshot_sequence: int,
-        inode_flags: int, birth_time_ns: int,
+        inode_flags: int, birth_time_ns: int, mode: int | None = None,
     ) -> str:
         if (object_version <= 0 or object_version > snapshot_sequence or
                 snapshot_sequence > S64_MAX):
             raise ProtocolError("invalid stamped attr")
-        if object_version <= self.object_version:
+        if (object_version < self.object_version or
+                (object_version == self.object_version and
+                 (self.attr_exact or
+                  object_version < self.attr_repair_sequence))):
             return "old"
         self.object_version = object_version
         self.attr_exact = True
         self.inode_flags = inode_flags
         self.birth_time_ns = birth_time_ns
+        if mode is not None:
+            self.mode = mode
         return "applied"
+
+    def permission(self, mask: int) -> bool:
+        if not self.attr_exact:
+            raise BlockingIOError(errno.EAGAIN, "attributes are inexact")
+        return bool(self.mode & mask)
+
+    def fill_exact_statx(self) -> dict[str, int]:
+        if not self.attr_exact:
+            raise BlockingIOError(errno.EAGAIN, "attributes are inexact")
+        return {
+            "birth_time_ns": self.birth_time_ns,
+            "attributes": self.inode_flags,
+            "attributes_mask": PFS_STATX_ATTRIBUTES,
+        }
 
 
 class PublicationGate:
@@ -1128,33 +1164,56 @@ class TransactionTests(unittest.TestCase):
 
 
 class PublicationAndNotifyTests(unittest.TestCase):
-    def test_attr_repair_clears_flags_until_strictly_newer_stamp(self) -> None:
-        immutable = 0x10
+    def test_attr_repair_fences_permission_until_repaired_version_installs(
+        self,
+    ) -> None:
+        immutable = STATX_ATTR_IMMUTABLE
         inode = KernelInode()
         self.assertEqual(
-            inode.install_stamped_attr(1, 1, immutable, 111), "applied"
+            inode.install_stamped_attr(1, 1, immutable, 111, 0o644), "applied"
         )
         self.assertTrue(inode.attr_exact)
+        self.assertTrue(inode.permission(0o400))
         self.assertEqual((inode.inode_flags, inode.birth_time_ns), (immutable, 111))
 
         # Clearing IMMUTABLE on a peer advances the repair stamp and makes the
-        # pre-repair enforced state unservable; an equal/older record cannot
-        # silently resurrect it.
+        # pre-repair permission and enforced state unservable. The authority's
+        # exact record at the repaired version is the recovery record.
         inode.repair_attr(2)
         self.assertFalse(inode.attr_exact)
         self.assertEqual((inode.inode_flags, inode.birth_time_ns), (0, 0))
-        self.assertEqual(inode.install_stamped_attr(2, 2, immutable, 111), "old")
-        self.assertFalse(inode.attr_exact)
-        self.assertEqual(inode.install_stamped_attr(3, 3, 0, 222), "applied")
+        with self.assertRaises(BlockingIOError) as caught:
+            inode.permission(0o400)
+        self.assertEqual(caught.exception.errno, errno.EAGAIN)
+        self.assertEqual(inode.install_stamped_attr(1, 2, immutable, 111), "old")
+        self.assertEqual(inode.install_stamped_attr(2, 2, 0, 222, 0), "applied")
         self.assertTrue(inode.attr_exact)
+        self.assertFalse(inode.permission(0o400))
         self.assertEqual((inode.inode_flags, inode.birth_time_ns), (0, 222))
 
         # The inverse transition is symmetric: the repair never retains the
         # clear value as exact, and the next newer record enforces IMMUTABLE.
-        inode.repair_attr(4)
+        inode.repair_attr(3)
         self.assertFalse(inode.attr_exact)
-        self.assertEqual(inode.install_stamped_attr(5, 5, immutable, 333), "applied")
+        self.assertEqual(inode.install_stamped_attr(3, 3, immutable, 333), "applied")
         self.assertEqual((inode.attr_exact, inode.inode_flags), (True, immutable))
+
+    def test_synchronous_statx_fill_uses_installed_exact_record(self) -> None:
+        inode = KernelInode()
+        inode.repair_attr(7)
+        flags = STATX_ATTR_NODUMP | STATX_ATTR_IMMUTABLE
+        self.assertEqual(
+            inode.install_stamped_attr(7, 7, flags, 1_725_000_000_123),
+            "applied",
+        )
+        self.assertEqual(
+            inode.fill_exact_statx(),
+            {
+                "birth_time_ns": 1_725_000_000_123,
+                "attributes": flags,
+                "attributes_mask": PFS_STATX_ATTRIBUTES,
+            },
+        )
 
     def test_strict_reverse_notify_whitelist_blocks_cache_injection(self) -> None:
         inode = KernelInode(size=11)
