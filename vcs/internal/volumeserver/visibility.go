@@ -702,6 +702,16 @@ type visibilityMutationState struct {
 	done          chan struct{}
 }
 
+// visibilityLaneWaiter is one all-or-none reservation for participant CONTROL
+// lanes. Tickets are assigned only after a mutation first blocks. An older
+// waiter reserves every participant it needs while a later waiter may still
+// pass when its audience is disjoint.
+type visibilityLaneWaiter struct {
+	ticket  uint64
+	source  SessionID
+	targets []VisibilityTarget
+}
+
 // VisibilityConfig is the complete construction input. It is a struct because
 // every field is a safety property and none of them has a defensible default
 // that a deployment should be allowed to inherit silently.
@@ -729,7 +739,8 @@ type VisibilityConfig struct {
 	// so this is the only place both sides of the disagreement are visible.
 	OnRefusedCommitment func(SessionID, error)
 	// OnBarrier observes a successfully opened PREPARE through its terminal
-	// COMPLETE acknowledgment (or bounded failure). It must be nonblocking.
+	// COMPLETE acknowledgment (or bounded failure). It must be nonblocking and
+	// safe for concurrent use.
 	OnBarrier func(time.Duration, int)
 }
 
@@ -771,6 +782,12 @@ type VisibilityCoordinator struct {
 	// access is under mu; the participant indexes and global sequence remain
 	// protected by that same lock when several barriers run concurrently.
 	mutations map[uint64]*visibilityMutationState
+	// laneWaiters order all-or-none acquisition of participant CONTROL lanes.
+	// laneChanged is the shared wake edge for ownership, reservation, and
+	// participant-set changes.
+	nextLaneTicket uint64
+	laneWaiters    map[uint64]*visibilityLaneWaiter
+	laneChanged    chan struct{}
 }
 
 // TopologyReadGuard pins the routing revision a filesystem request or attach
@@ -818,6 +835,8 @@ func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, err
 		participants: make(map[SessionID]*visibilityParticipant),
 		fairness:     make(map[SessionID]mutationFairnessDebt),
 		mutations:    make(map[uint64]*visibilityMutationState),
+		laneWaiters:  make(map[uint64]*visibilityLaneWaiter),
+		laneChanged:  make(chan struct{}),
 		startupReady: cfg.Prior == PriorEpochStrictMountsFenced,
 		seed:         binary.LittleEndian.Uint64(seed[:]),
 	}, nil
@@ -1086,6 +1105,7 @@ func (c *VisibilityCoordinator) CleanDetach(id SessionID, proof MountAbsenceProo
 	pending := p.pending
 	p.pending = nil
 	p.signalLocked()
+	c.signalLaneChangedLocked()
 	close(p.left)
 	c.mu.Unlock()
 	// The authenticated supervisor has already made the mount terminal, so
@@ -1155,6 +1175,7 @@ func (c *VisibilityCoordinator) fence(id SessionID, expected *visibilityDelivery
 	// at most two budgets: one phase deadline plus one fencing grace.
 	pending := p.pending
 	p.signalLocked()
+	c.signalLaneChangedLocked()
 	close(p.left)
 	c.mu.Unlock()
 	// FenceSession is the active fencing action. It remains ahead of callbacks so
@@ -1192,6 +1213,7 @@ func (c *VisibilityCoordinator) poisonLocked(cause error) error {
 		}
 		participant.signalLocked()
 	}
+	c.signalLaneChangedLocked()
 	return c.poisoned
 }
 
@@ -1434,7 +1456,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		FrontendOperationID: mutation.FrontendOperationID,
 	}
 	barrierStarted := c.cfg.Now()
-	audience, deliveries, err := c.openBarrier(source, prepareTargets, &ticket)
+	audience, deliveries, err := c.openBarrier(ctx, source, prepareTargets, &ticket)
 	if ticket.Cursor.Sequence != 0 {
 		// The coordinate state and participant-lane reservations are released on
 		// every exit, including an invariant failure during initial dispatch.
@@ -1545,11 +1567,17 @@ func (c *VisibilityCoordinator) acquireMutationDependencies(ctx context.Context,
 		fairnessEligible := eligibleForFairness(participant, mutation, gate)
 		if !retryProofValidated && mutation.VisibilityRetryAfterSequence != 0 {
 			if !c.validVisibilityRetryProofLocked(source, participant, mutation, gate) {
+				if turn != nil {
+					turn.abandon()
+				}
 				c.mu.Unlock()
 				return nil, ErrSourcePublicationGate
 			}
 			retryProofValidated = true
 		} else if !retryProofValidated && c.visibilityRetryProofRequiredLocked(source, participant, mutation, gate) {
+			if turn != nil {
+				turn.abandon()
+			}
 			c.mu.Unlock()
 			return nil, ErrSourcePublicationGate
 		}
@@ -1901,6 +1929,49 @@ func (c *VisibilityCoordinator) validateCompletion(complete, prepared []Visibili
 	return nil
 }
 
+func (c *VisibilityCoordinator) signalLaneChangedLocked() {
+	close(c.laneChanged)
+	c.laneChanged = make(chan struct{})
+}
+
+func (c *VisibilityCoordinator) newLaneWaiterLocked(source SessionID, targets []VisibilityTarget) *visibilityLaneWaiter {
+	c.nextLaneTicket++
+	if c.nextLaneTicket == 0 {
+		panic("volumeserver: visibility lane ticket exhausted")
+	}
+	waiter := &visibilityLaneWaiter{
+		ticket:  c.nextLaneTicket,
+		source:  source,
+		targets: cloneVisibilityTargets(targets),
+	}
+	c.laneWaiters[waiter.ticket] = waiter
+	return waiter
+}
+
+func (c *VisibilityCoordinator) laneReservedByOlderLocked(participant *visibilityParticipant, waiter *visibilityLaneWaiter) bool {
+	for _, candidate := range c.laneWaiters {
+		if candidate == waiter || waiter != nil && candidate.ticket >= waiter.ticket {
+			continue
+		}
+		// A participant's resolved index is monotone and may grow while an older
+		// mutation waits. Project the older footprint against its current index
+		// instead of freezing the first audience, or a newly interested lane could
+		// be claimed by a younger barrier before the older waiter wakes.
+		if participant.id != candidate.source && len(participant.matchingTargetKeys(candidate.targets)) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *VisibilityCoordinator) removeLaneWaiterLocked(waiter *visibilityLaneWaiter) {
+	if waiter == nil || c.laneWaiters[waiter.ticket] != waiter {
+		return
+	}
+	delete(c.laneWaiters, waiter.ticket)
+	c.signalLaneChangedLocked()
+}
+
 // openBarrier claims the sequence, publishes the coordinates this mutation is
 // preparing to change, and chooses its audience - all in one critical section.
 //
@@ -1909,18 +1980,34 @@ func (c *VisibilityCoordinator) validateCompletion(complete, prepared []Visibili
 // contains it and PREPARE drains its old-value publication, or it did not, in
 // which case it waits for apply and reads the value that replaced it. There is
 // no third case.
-func (c *VisibilityCoordinator) openBarrier(source SessionID, targets []VisibilityTarget, ticket *VisibilityEvent) (visibilityAudience, []*visibilityDelivery, error) {
+//
+// Concurrent-barrier progress also relies on one production admission
+// invariant outside this function: the authority handler forces
+// CompatibilityWriter for both callback-serialized repair profiles. Execute
+// then refuses every foreign mutation while such a participant is active. A
+// callback-serialized mount can therefore never be asked to Ack one mutation
+// while one of its own disjoint callbacks waits here for another participant's
+// lane. The all-or-none lane tickets below do not replace that invariant; any
+// future change which decouples those repair profiles from CompatibilityWriter
+// must first supply a different cycle breaker.
+func (c *VisibilityCoordinator) openBarrier(ctx context.Context, source SessionID, targets []VisibilityTarget, ticket *VisibilityEvent) (visibilityAudience, []*visibilityDelivery, error) {
 	keys := visibilityTargetKeys(targets)
+	var laneWaiter *visibilityLaneWaiter
 	for {
 		c.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			c.removeLaneWaiterLocked(laneWaiter)
+			c.mu.Unlock()
+			return visibilityAudience{}, nil, err
+		}
 		if c.poisoned != nil {
 			err := c.poisoned
+			c.removeLaneWaiterLocked(laneWaiter)
 			c.mu.Unlock()
 			return visibilityAudience{}, nil, err
 		}
 
 		audience := visibilityAudience{targetKeys: make(map[SessionID]map[string]struct{})}
-		var laneChanged <-chan struct{}
 		for id, p := range c.participants {
 			if id == source {
 				// The initiating frontend closed and drained this footprint before
@@ -1933,19 +2020,35 @@ func (c *VisibilityCoordinator) openBarrier(source SessionID, targets []Visibili
 			}
 			audience.members = append(audience.members, p)
 			audience.targetKeys[id] = matched
-			if p.barrier != 0 && laneChanged == nil {
-				laneChanged = p.changed
+		}
+		blocked := false
+		for _, participant := range audience.members {
+			if participant.barrier != 0 || c.laneReservedByOlderLocked(participant, laneWaiter) {
+				blocked = true
+				break
 			}
 		}
-		if laneChanged != nil {
-			// One CONTROL cursor is outstanding per participant. Retaining this
-			// operation's dependency keys while waiting cannot deadlock: an older
-			// barrier never acquires additional keys, and its bounded repair/fence
-			// path does not need this operation's disjoint XFS state.
+		if blocked {
+			if laneWaiter == nil {
+				laneWaiter = c.newLaneWaiterLocked(source, targets)
+			}
+			// A waiter owns no lane until it can claim its complete audience. Its
+			// ticket nevertheless reserves every requested lane against later
+			// overlapping waiters, so a multi-participant mutation cannot be
+			// overtaken forever by alternating single-participant barriers.
+			laneChanged := c.laneChanged
 			c.mu.Unlock()
-			<-laneChanged
+			select {
+			case <-laneChanged:
+			case <-ctx.Done():
+				c.mu.Lock()
+				c.removeLaneWaiterLocked(laneWaiter)
+				c.mu.Unlock()
+				return visibilityAudience{}, nil, ctx.Err()
+			}
 			continue
 		}
+		c.removeLaneWaiterLocked(laneWaiter)
 
 		c.next++
 		if c.next == 0 {
@@ -2042,6 +2145,7 @@ func (c *VisibilityCoordinator) closeBarrier(sequence uint64) {
 func (c *VisibilityCoordinator) finishBarrier(sequence uint64, audience visibilityAudience) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	released := false
 	for _, p := range audience.members {
 		if c.participants[p.id] != p {
 			continue
@@ -2052,6 +2156,10 @@ func (c *VisibilityCoordinator) finishBarrier(sequence uint64, audience visibili
 		}
 		p.barrier = 0
 		p.signalLocked()
+		released = true
+	}
+	if released {
+		c.signalLaneChangedLocked()
 	}
 }
 
@@ -2069,8 +2177,13 @@ func (c *VisibilityCoordinator) finishBarrier(sequence uint64, audience visibili
 // The wait here is bounded by the running mutation reaching XFS, never by the
 // other mounts finishing their repairs. An already-covered PREPARE reader does
 // not wait here at all: it finishes naturally and lets its frontend Ack. A
-// non-audience reader waits because no PREPARE depends on it, and the state is
-// released immediately after apply rather than after COMPLETE repair.
+// non-audience reader normally waits because no PREPARE depends on it, and the
+// state is released immediately after apply rather than after COMPLETE repair.
+// The exception is a participant already draining a different PREPARE. Parking
+// that read on a concurrent barrier could make each mutation wait for the
+// other's participant Ack. Stabilize instead reports a race without publishing
+// the resolutions, so the callback unwinds, its frontend Acks, and the read is
+// retried.
 //
 // An operation that can only learn a coordinate by reading - a lookup learns
 // which inode a name resolves to - passes it here afterwards. A reported wait
@@ -2128,6 +2241,14 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			}
 			c.mu.Unlock()
 			return waited, nil
+		}
+		if blocked.audience[id] != p && p.pending != nil && p.pending.event.Cursor.Phase == VisibilityPrepare {
+			// Concurrent barriers cannot share a participant lane. This participant
+			// is therefore draining a different PREPARE, and waiting for an
+			// out-of-audience state would close a cross-mount Ack cycle. Do not add
+			// any resolution to the monotone index: the caller must discard the read.
+			c.mu.Unlock()
+			return true, nil
 		}
 		done := blocked.done
 		c.mu.Unlock()
