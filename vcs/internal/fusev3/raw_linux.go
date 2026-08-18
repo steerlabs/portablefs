@@ -1985,25 +1985,6 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	defer r.release(parent)
 	if r.grafts != nil {
 		if handled, status := r.graftLookup(parent, name, out); handled {
-			// A missing route name directly below an authority directory is a
-			// negative result in that SHARED parent. The returned child class
-			// selects positive LOOKUP publication, but ENOENT has no child attr,
-			// so its class is necessarily the parent's. A miss below an already
-			// LOCAL graft directory remains entirely local and unmarked.
-			if status == fuse.Status(syscall.ENOENT) && !parent.graft {
-				ctx, finish, lifecycle := r.mutationContext(header.Unique)
-				if !lifecycle.Ok() {
-					return lifecycle
-				}
-				publication := replyPublicationFromContext(ctx)
-				if publication == nil {
-					finish()
-					r.mount.revoke(errors.New("fusev3: negative graft-root lookup escaped its post-VFS reply-publication lifecycle"))
-					return fuse.Status(syscall.ENOTCONN)
-				}
-				publication.needsPostVFS = true
-				finish()
-			}
 			return status
 		}
 	}

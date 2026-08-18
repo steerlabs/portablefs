@@ -383,9 +383,11 @@ func TestStrictLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) 
 func TestARouteRootWithNoBackingIsAbsentRatherThanSynthesized(t *testing.T) {
 	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), false)
 	var status fuse.Status
-	calls := f.authorityCalls(func() { _, status = f.lookup(t, fuse.FUSE_ROOT_ID, "node_modules") })
-	if status != fuse.Status(syscall.ENOENT) {
-		t.Fatalf("LOOKUP of an uncreated route root = %v, want ENOENT", status)
+	var out *fuse.EntryOut
+	calls := f.authorityCalls(func() { out, status = f.lookup(t, fuse.FUSE_ROOT_ID, "node_modules") })
+	if !status.Ok() || out == nil || out.NodeId != 0 || out.Generation != 0 || out.EntryValid != 0 || out.AttrValid != 0 ||
+		out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		t.Fatalf("LOOKUP of an uncreated route root = (%+v, %v), want base-only LOCAL negative", out, status)
 	}
 	if calls != 0 {
 		t.Fatalf("resolving an owned name cost %d authority requests, want 0; the rule shadows the volume unconditionally", calls)
@@ -395,25 +397,29 @@ func TestARouteRootWithNoBackingIsAbsentRatherThanSynthesized(t *testing.T) {
 	}
 }
 
-func TestNegativeLookupClassificationFollowsItsParent(t *testing.T) {
+func TestRouteClaimedNegativeLookupIsLocalAcrossA_SHAREDParent(t *testing.T) {
 	f := newGraftFixture(t, floatingRoutes(t, "node_modules"), false)
 
-	sharedUnique := nextTestRequestUnique()
-	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: sharedUnique, NodeId: fuse.FUSE_ROOT_ID}, "node_modules", &fuse.EntryOut{}); status != fuse.ENOENT {
-		t.Fatalf("missing route root LOOKUP = %v, want ENOENT", status)
+	routeUnique := nextTestRequestUnique()
+	routeOut := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: routeUnique, NodeId: fuse.FUSE_ROOT_ID}, "node_modules", routeOut); !status.Ok() {
+		t.Fatalf("missing route root LOOKUP = %v, want structured success", status)
 	}
-	if !f.raw.ReplyWriteOrdered(sharedUnique) || !f.raw.ReplyPublishMarked(sharedUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
-		t.Fatal("negative LOOKUP below SHARED parent was not marked for post-VFS publication")
+	if routeOut.NodeId != 0 || routeOut.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		t.Fatalf("missing route root = %+v, want LOCAL zero-nodeid shape", routeOut)
 	}
-	f.raw.ReplyWritten(sharedUnique, fuse.OK)
-	acknowledgeTestPublication(t, f.raw, sharedUnique)
+	if f.raw.ReplyWriteOrdered(routeUnique) || f.raw.ReplyPublishMarked(routeUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
+		t.Fatal("route-owned negative below SHARED parent entered SHARED publication lifecycle")
+	}
 
 	root := f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules")
 	localUnique := nextTestRequestUnique()
-	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: localUnique, NodeId: root.NodeId}, "missing", &fuse.EntryOut{}); status != fuse.ENOENT {
-		t.Fatalf("missing local child LOOKUP = %v, want ENOENT", status)
+	localOut := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: localUnique, NodeId: root.NodeId}, "missing", localOut); !status.Ok() {
+		t.Fatalf("missing local child LOOKUP = %v, want structured success", status)
 	}
-	if f.raw.ReplyWriteOrdered(localUnique) || f.raw.ReplyPublishMarked(localUnique, root.NodeId, testPublicationOpcode) {
+	if localOut.NodeId != 0 || localOut.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL ||
+		f.raw.ReplyWriteOrdered(localUnique) || f.raw.ReplyPublishMarked(localUnique, root.NodeId, testPublicationOpcode) {
 		t.Fatal("negative LOOKUP below LOCAL parent entered shared publication lifecycle")
 	}
 }
