@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"encoding/binary"
 	"errors"
 	"syscall"
 	"testing"
@@ -13,19 +14,16 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
-// TestAuthorityNegativeLookupRequiresPostVFSPublication covers both shapes a
-// negative answer can take. A cacheable absence is a success carrying a zero
-// NodeId; an uncacheable one is ENOENT. The kernel installs the negative result
-// after the reply wakes the requester in either case, so both retain the
-// generic post-VFS receipt -- the lifetime decides caching, not ownership.
+// TestAuthorityNegativeLookupRequiresPostVFSPublication proves that admission
+// pressure changes only lifetime and registry ownership. Every protocol
+// negative remains a successful zero-nodeid entry with its sequence stamp.
 func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 	cases := []struct {
-		name       string
-		cacheable  bool
-		wantStatus fuse.Status
+		name      string
+		cacheable bool
 	}{
-		{"cacheable absence", true, fuse.OK},
-		{"uncacheable absence", false, fuse.ENOENT},
+		{"cacheable absence", true},
+		{"capacity-dropped absence", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -39,12 +37,14 @@ func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 				if request.GetLookup() == nil {
 					return nil, errors.New("unexpected non-LOOKUP request")
 				}
-				return &authoritypb.Response{Errno: int32(syscall.ENOENT)}, nil
+				return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{
+					NegativeSnapshotSequence: 1,
+				}}}, nil
 			}
 			const requestUnique = 6900
 			out := &fuse.EntryOut{}
-			if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: requestUnique, NodeId: fuse.FUSE_ROOT_ID}, "missing", out); status != tc.wantStatus {
-				t.Fatalf("negative LOOKUP = %v, want %v", status, tc.wantStatus)
+			if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: requestUnique, NodeId: fuse.FUSE_ROOT_ID}, "missing", out); status != fuse.OK {
+				t.Fatalf("negative LOOKUP = %v, want structured success", status)
 			}
 			if out.NodeId != 0 {
 				t.Fatalf("negative LOOKUP published NodeId %d, want 0", out.NodeId)
@@ -55,6 +55,13 @@ func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 			if !f.raw.ReplyWriteOrdered(requestUnique) {
 				t.Fatal("negative LOOKUP did not retain its physical reply ownership")
 			}
+			payload := make([]byte, fuse.PFSCacheStampSize)
+			if n, status := f.raw.PrepareReplyPayload(requestUnique, fuse.FUSE_ROOT_ID, 1, make([]byte, 128), payload, 0); !status.Ok() || n != len(payload) {
+				t.Fatalf("negative LOOKUP stamp = (%d, %v), want %d-byte success", n, status, len(payload))
+			}
+			if got := binary.LittleEndian.Uint64(payload[:8]); got != 1 {
+				t.Fatalf("negative LOOKUP snapshot = %d, want 1", got)
+			}
 			if !f.raw.ReplyPublishMarked(requestUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
 				t.Fatal("negative LOOKUP did not request a post-VFS publication receipt")
 			}
@@ -62,6 +69,73 @@ func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 			acknowledgeTestPublication(t, f.raw, requestUnique)
 			if f.mount.isRevoked() {
 				t.Fatalf("valid negative LOOKUP publication revoked mount: %v", f.mount.fatalError())
+			}
+		})
+	}
+}
+
+func TestStampedAttributeReadsCarryBirthTimeAndMaskedFlags(t *testing.T) {
+	const (
+		birthTime = int64(1_725_000_000_123_456_789)
+		flags     = uint32(0x00300870)
+	)
+	for _, test := range []struct {
+		name   string
+		opcode uint32
+		unique uint64
+		call   func(*strictFixture, uint64, *authoritypb.Attr) fuse.Status
+	}{
+		{
+			name: "lookup", opcode: 1, unique: 6920,
+			call: func(f *strictFixture, unique uint64, attr *authoritypb.Attr) fuse.Status {
+				item := testItem(47, authoritypb.Attr_REGULAR, 47)
+				item.Attr = attr
+				item.ObjectVersion, item.SnapshotSequence = 4, 5
+				f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+					return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}}, nil
+				}
+				return f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "stamped", &fuse.EntryOut{})
+			},
+		},
+		{
+			name: "getattr", opcode: 3, unique: 6922,
+			call: func(f *strictFixture, unique uint64, attr *authoritypb.Attr) fuse.Status {
+				f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+					return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
+						Attr: attr, ObjectVersion: 4, SnapshotSequence: 5,
+					}}}, nil
+				}
+				return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}}, &fuse.AttrOut{})
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			attr := &authoritypb.Attr{Inode: 1, Kind: authoritypb.Attr_DIRECTORY, Mode: 0o755, BirthTimeNs: birthTime, Flags: flags}
+			if test.name == "lookup" {
+				attr.Inode, attr.Kind, attr.Mode = 47, authoritypb.Attr_REGULAR, 0o600
+			}
+			if status := test.call(f, test.unique, attr); !status.Ok() {
+				t.Fatalf("%s = %v: %v", test.name, status, f.mount.fatalError())
+			}
+			payload := make([]byte, fuse.PFSCacheStampSize)
+			if n, status := f.raw.PrepareReplyPayload(test.unique, fuse.FUSE_ROOT_ID, test.opcode, make([]byte, 128), payload, 0); !status.Ok() || n != 32 {
+				t.Fatalf("%s stamp = (%d, %v), want 32 bytes", test.name, n, status)
+			}
+			if got := binary.LittleEndian.Uint64(payload[0:8]); got != 5 {
+				t.Errorf("snapshot = %d, want 5", got)
+			}
+			if got := binary.LittleEndian.Uint64(payload[8:16]); got != 4 {
+				t.Errorf("object version = %d, want 4", got)
+			}
+			if got := int64(binary.LittleEndian.Uint64(payload[16:24])); got != birthTime {
+				t.Errorf("birth time = %d, want %d", got, birthTime)
+			}
+			if got := binary.LittleEndian.Uint32(payload[24:28]); got != flags {
+				t.Errorf("masked flags = %#x, want %#x", got, flags)
+			}
+			if got := binary.LittleEndian.Uint32(payload[28:32]); got != 0 {
+				t.Errorf("reserved = %#x, want zero", got)
 			}
 		})
 	}

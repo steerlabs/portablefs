@@ -72,6 +72,12 @@ var (
 	// the callback's parent i_rwsem, so no application-visible EINTR is needed.
 	// Staged write bytes remain inert and reusable across this handoff.
 	ErrVisibilityRetry = errors.New("volumeserver: mutation must retry after this participant's pending cache repair")
+	// ErrVisibilityDependencyRefresh is returned only by a source-gated
+	// authority PREPARE callback which revalidated a namespace binding under
+	// its storage writer locks and found that the resolved identity changed.
+	// The coordinator releases/requeues the old identity-key set, refreshes the
+	// source gate, and invokes PREPARE again before any barrier or XFS apply.
+	ErrVisibilityDependencyRefresh = errors.New("volumeserver: mutation dependencies changed during locked revalidation")
 	// ErrSourcePublicationGate means a strict initiating frontend did not prove
 	// the exact local publication cut required before mutation dispatch. It is a
 	// participant protocol violation, not an authority-epoch defect.
@@ -203,6 +209,41 @@ type VisibilityTarget struct {
 	// projection uses it only to keep a synthetic parent-attribute repair anchor
 	// from omitting the same callback's raced inode publication.
 	RelatedIdentities [][16]byte
+	// ExactPostState is absent while PREPARE closes admission and present on
+	// every DATA or ATTRIBUTES target after apply. It is the retained mutation
+	// snapshot peers install; it must never be reconstructed from a target's
+	// scalar coordination fields.
+	ExactPostState *VisibilityObjectPostState
+}
+
+// VisibilityObjectPostState is the protocol-neutral authority snapshot carried
+// through the visibility coordinator. Keeping it here lets the coordinator
+// retain and project the exact record without depending on protobuf types.
+type VisibilityObjectPostState struct {
+	StableIdentity [16]byte
+	ObjectVersion  uint64
+	Attr           VisibilityAttr
+	Roles          uint32
+}
+
+// VisibilityAttr mirrors the exact authority Attr fields. All values come from
+// the mutation's retained statx snapshot; none are inferred during fan-out.
+type VisibilityAttr struct {
+	Kind        uint32
+	Inode       uint64
+	Size        int64
+	Blocks      uint64
+	Mode        uint32
+	UID         uint32
+	GID         uint32
+	Nlink       uint32
+	ATimeNS     int64
+	MTimeNS     int64
+	CTimeNS     int64
+	BirthTimeNS int64
+	Rdev        uint32
+	Blksize     uint32
+	Flags       uint32
 }
 
 const maxSourcePublicationTargets = 16
@@ -1434,7 +1475,49 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		}
 	}
 
-	prepareTargets, err := prepare()
+	var prepareTargets []VisibilityTarget
+	for {
+		prepareTargets, err = prepare()
+		if !errors.Is(err, ErrVisibilityDependencyRefresh) {
+			break
+		}
+		if gate == nil {
+			return &VisibilityBarrierError{Err: ErrVisibilityTargets}
+		}
+		refreshed, refreshErr := refresh()
+		if refreshErr != nil {
+			return refreshErr
+		}
+		if validateSourcePublicationGate(refreshed) != nil || !sameSourcePublicationShape(*gate, refreshed) {
+			return ErrSourcePublicationGate
+		}
+		refreshedDependencies := mutationDependenciesForSourceGate(refreshed)
+		gate = &refreshed
+		if !dependencies.equal(refreshedDependencies) {
+			turn.requeue(refreshedDependencies)
+			turn, err = c.acquireMutationDependencies(ctx, source, mutation, held, &refreshed, refreshedDependencies, turn)
+			if err != nil {
+				return err
+			}
+			dependencies = refreshedDependencies
+		}
+		// A requeue may have yielded the participant to a peer repair just as
+		// the original acquisition did. Re-run the exact source-yield gate
+		// before PREPARE touches storage again.
+		c.mu.Lock()
+		participant := c.participants[source]
+		yieldErr := error(nil)
+		if participant != nil {
+			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+		}
+		if yieldErr != nil {
+			c.recordDormantFairnessLocked(source, participant, mutation, turn, gate)
+		}
+		c.mu.Unlock()
+		if yieldErr != nil {
+			return yieldErr
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -1476,7 +1559,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 
 	completeTargets, changed := apply(ticket.Cursor.Sequence)
 	if changed {
-		if err := c.validateCompletion(completeTargets, prepareTargets); err != nil {
+		if err := c.validateCompletion(ticket.Cursor.Sequence, completeTargets, prepareTargets); err != nil {
 			return &VisibilityBarrierError{Applied: true, Err: err}
 		}
 	}
@@ -1903,9 +1986,22 @@ func (c *VisibilityCoordinator) recordSourceResolutions(source SessionID, resolu
 // target set, and poisons the epoch when either fails. Both are authority
 // defects that no participant can cause: the mutation already reached XFS and
 // the authority cannot describe what it did.
-func (c *VisibilityCoordinator) validateCompletion(complete, prepared []VisibilityTarget) error {
+func (c *VisibilityCoordinator) validateCompletion(sequence uint64, complete, prepared []VisibilityTarget) error {
 	if err := validateVisibilityTargets(complete); err != nil {
 		return c.poison(ErrVisibilityTargets)
+	}
+	exactCount := 0
+	for _, target := range complete {
+		if target.Scope == VisibilityNamespace {
+			continue
+		}
+		exactCount++
+		if target.ExactPostState == nil || target.ExactPostState.ObjectVersion == 0 || target.ExactPostState.ObjectVersion > sequence {
+			return c.poison(fmt.Errorf("%w: completion inode target omitted exact attributes at or before its visibility sequence", ErrVisibilityTargets))
+		}
+	}
+	if exactCount > 4 {
+		return c.poison(fmt.Errorf("%w: completion exceeded the four-object exact repair bound", ErrVisibilityTargets))
 	}
 	// Fan-out chooses its audience from the PREPARE targets. A COMPLETE target
 	// outside that set would be a repair instruction addressed to mounts that
@@ -2192,6 +2288,14 @@ func (c *VisibilityCoordinator) finishBarrier(sequence uint64, audience visibili
 // then means that read raced the mutation: the caller must discard it and try
 // again.
 func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, resolutions ...VisibilityResolution) (bool, error) {
+	waited, _, err := c.StabilizeSequence(ctx, id, resolutions...)
+	return waited, err
+}
+
+// StabilizeSequence returns the authority cursor from the same critical
+// section that registers every supplied cache coordinate. A cacheable read
+// samples after this return and stamps the result with that cursor.
+func (c *VisibilityCoordinator) StabilizeSequence(ctx context.Context, id SessionID, resolutions ...VisibilityResolution) (bool, uint64, error) {
 	waited := false
 	for {
 		c.mu.Lock()
@@ -2200,7 +2304,7 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			// Not a strict participant: this mount holds no cache the barrier
 			// has to reason about.
 			c.mu.Unlock()
-			return waited, nil
+			return waited, 0, nil
 		}
 		var blocked *visibilityMutationState
 		for _, state := range c.mutations {
@@ -2241,8 +2345,9 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 					p.index.add(key)
 				}
 			}
+			sequence := c.next
 			c.mu.Unlock()
-			return waited, nil
+			return waited, sequence, nil
 		}
 		if blocked.audience[id] != p && p.pending != nil && p.pending.event.Cursor.Phase == VisibilityPrepare {
 			// Concurrent barriers cannot share a participant lane. This participant
@@ -2251,7 +2356,7 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			// any resolution to the monotone index: the caller must discard the read.
 			sequence := p.pending.event.Cursor.Sequence
 			c.mu.Unlock()
-			return true, &VisibilityRetryError{Sequence: sequence}
+			return true, 0, &VisibilityRetryError{Sequence: sequence}
 		}
 		done := blocked.done
 		c.mu.Unlock()
@@ -2259,7 +2364,7 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return waited, ctx.Err()
+			return waited, 0, ctx.Err()
 		}
 	}
 }
@@ -2712,6 +2817,10 @@ func cloneVisibilityTargets(targets []VisibilityTarget) []VisibilityTarget {
 	for i := range clone {
 		clone[i].Name = append([]byte(nil), targets[i].Name...)
 		clone[i].RelatedIdentities = append([][16]byte(nil), targets[i].RelatedIdentities...)
+		if targets[i].ExactPostState != nil {
+			exact := *targets[i].ExactPostState
+			clone[i].ExactPostState = &exact
+		}
 	}
 	return clone
 }
@@ -2762,7 +2871,8 @@ func validateVisibilityTargets(targets []VisibilityTarget) error {
 	for _, target := range targets {
 		switch target.Scope {
 		case VisibilityNamespace:
-			if target.ParentIdentity == zero || target.Identity != zero || target.Size != 0 || !legalVisibilityName(target.Name) {
+			if target.ParentIdentity == zero || target.Identity != zero || target.Size != 0 ||
+				target.ExactPostState != nil || !legalVisibilityName(target.Name) {
 				return ErrVisibilityTargets
 			}
 			postIsDependency := target.PostIdentity == zero
@@ -2785,6 +2895,13 @@ func validateVisibilityTargets(targets []VisibilityTarget) error {
 			}
 		default:
 			return ErrVisibilityTargets
+		}
+		if exact := target.ExactPostState; exact != nil {
+			if exact.StableIdentity != target.Identity || exact.ObjectVersion == 0 ||
+				exact.Attr.Inode != target.KernelIno || exact.Roles == 0 ||
+				(target.Scope == VisibilityData && exact.Attr.Size != target.Size) {
+				return ErrVisibilityTargets
+			}
 		}
 	}
 	return nil

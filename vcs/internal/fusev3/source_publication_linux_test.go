@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -71,7 +72,7 @@ func awaitPrepareResult(t *testing.T, done <-chan error, what string) error {
 
 func finishPeerVisibility(t *testing.T, raw *rawFileSystem, targets []*authoritypb.VisibilityTarget) {
 	t.Helper()
-	completion, blocked, err := raw.beginVisibilityComplete(targets, false)
+	completion, blocked, err := raw.beginVisibilityComplete(exactVisibilityTargets(1, targets...), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -788,7 +789,7 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 				t.Fatal(err)
 			}
-			completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 41)
+			completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(41, targets...), false, 41)
 			if err != nil || blocked {
 				t.Fatalf("begin prior COMPLETE = (blocked=%t, err=%v)", blocked, err)
 			}
@@ -1074,30 +1075,35 @@ func TestSourceFirstReturnedBindingAndReplyWritePrecedePeerPrepare(t *testing.T)
 		t.Fatal(err)
 	}
 	finishPeerVisibility(t, f.raw, targets)
-	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "inode" {
-		t.Fatalf("peer repair after source publication = %+v, want one inode notification", calls)
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "attr" {
+		t.Fatalf("peer repair after source publication = %+v, want one stamped attr notification", calls)
 	}
 }
 
-func TestRenameUsesAuthoritativePostBindingWithoutCachedOldName(t *testing.T) {
+func TestRenameUsesAuthoritativePostBindingForCanonicalCachedSource(t *testing.T) {
 	f := newStrictFixture(t)
-	f.rpc.renameNewPost = testIdentity(77)
+	f.rpc.byName = map[string]*authoritypb.Item{"old": testItem(77, authoritypb.Attr_REGULAR, 77)}
+	f.lookup(t, fuse.FUSE_ROOT_ID, "old")
 	const unique = 404
 	status := f.raw.Rename(nil, &fuse.RenameIn{
 		InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
 		Newdir:   fuse.FUSE_ROOT_ID,
-	}, "never-cached-old", "new")
+	}, "old", "new")
 	if !status.Ok() {
-		t.Fatalf("rename without a locally cached old binding = %v", status)
+		t.Fatalf("rename with a canonical cached source = %v", status)
 	}
 	if !f.raw.ReplyWriteOrdered(unique) {
 		t.Fatal("rename reply did not retain its authoritative post identity through physical publication")
 	}
 	f.raw.mu.Lock()
-	oldCached := f.raw.cachedStableNames[publicationNamespace{parent: testPublicationIdentity(t, f.rpc.root), name: "never-cached-old"}]
+	oldCached := f.raw.cachedStableNames[publicationNamespace{parent: testPublicationIdentity(t, f.rpc.root), name: "old"}]
+	newCached := f.raw.cachedStableNames[publicationNamespace{parent: testPublicationIdentity(t, f.rpc.root), name: "new"}]
 	f.raw.mu.Unlock()
 	if oldCached != nil {
-		t.Fatal("test precondition failed: old rename name unexpectedly entered the local cache")
+		t.Fatal("successful rename left the old cached binding behind")
+	}
+	if newCached == nil {
+		t.Fatal("successful rename did not move the cached binding to the authoritative post name")
 	}
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, 77, 0),
@@ -1199,7 +1205,7 @@ func TestStockWriteOnSharedHandleTerminalizesBeforeAuthorityDispatch(t *testing.
 	}
 }
 
-func TestCachedLookupPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
+func TestFinalizedLookupIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"cached": testItem(55, authoritypb.Attr_REGULAR, 55)}
 	const unique = 500
@@ -1217,41 +1223,322 @@ func TestCachedLookupPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
 	if committedBeforeWrite || pendingBeforeWrite != 1 {
 		t.Fatalf("pre-write registry committed=%t pending=%d, want false/1", committedBeforeWrite, pendingBeforeWrite)
 	}
+	outData := make([]byte, 128)
+	outData[16], outData[24] = 1, 1
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1, outData, make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize LOOKUP = (%d, %v)", n, status)
+	}
 
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "cached")}
-	prepareDone := make(chan error, 1)
-	go func() { prepareDone <- f.raw.prepareVisibility(context.Background(), targets, false) }()
-	waitSourceState(t, f.raw, "the peer namespace cut behind a cached LOOKUP reply", func(raw *rawFileSystem) bool {
-		return len(raw.peerHeldPhase) != 0
-	})
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE before cached LOOKUP reply write")
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(2, targets...), false, 2)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	completeDone := make(chan error, 1)
+	go func() { completeDone <- f.raw.finishVisibilityComplete(context.Background(), completion) }()
+	assertNoPrepareResult(t, completeDone, "peer COMPLETE before finalized LOOKUP reply write")
 
 	markTestReply(t, f.raw, unique)
 	f.raw.ReplyWritten(unique, fuse.OK)
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE after LOOKUP reply write but before post-VFS ACK")
-	f.raw.mu.Lock()
-	_, committedAfterWrite := f.raw.cachedNames[nameKey{parent: 1, name: "cached"}]
-	f.raw.mu.Unlock()
-	if committedAfterWrite {
-		t.Fatal("physical LOOKUP reply committed its repair obligation before kernel postprocessing")
-	}
-	acknowledgeTestPublication(t, f.raw, unique)
-	if err := awaitPrepareResult(t, prepareDone, "peer PREPARE after cached LOOKUP publication ACK"); err != nil {
+	if err := awaitPrepareResult(t, completeDone, "peer COMPLETE after finalized LOOKUP reply write"); err != nil {
 		t.Fatal(err)
 	}
+	acknowledgeTestPublication(t, f.raw, unique)
 	f.raw.mu.Lock()
 	_, committedAfterAck := f.raw.cachedNames[nameKey{parent: 1, name: "cached"}]
 	f.raw.mu.Unlock()
-	if !committedAfterAck {
-		t.Fatal("post-VFS LOOKUP ACK did not commit its exact repair obligation")
+	if committedAfterAck {
+		t.Fatal("repaired FINALIZED LOOKUP entered the cache registry after post-VFS ACK")
 	}
-	finishPeerVisibility(t, f.raw, targets)
 	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "cached" {
 		t.Fatalf("LOOKUP repair = %+v, want exact delete notification", calls)
 	}
 }
 
-func TestCachedGetattrPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
+func TestWrittenUnreceiptedLookupRemainsRevocableThroughPeerComplete(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"gap": testItem(56, authoritypb.Attr_REGULAR, 56)}
+	const unique = 504
+	out := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "gap", out); !status.Ok() {
+		t.Fatalf("lookup = %v", status)
+	}
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1, make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize LOOKUP = (%d, %v)", n, status)
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+
+	f.raw.mu.Lock()
+	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: f.raw.nodesByID[fuse.FUSE_ROOT_ID].identity, name: "gap"}
+	reservationsAfterWrite := len(f.raw.cacheReservations[coordinate])
+	_, prematurelyCached := f.raw.cachedNames[nameKey{parent: 1, name: "gap"}]
+	pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
+	f.raw.mu.Unlock()
+	if reservationsAfterWrite != 1 || prematurelyCached || pendingNames != 0 || pendingAttrs != 0 {
+		t.Fatalf("physical-write gap reservations=%d cached=%t pending=%d/%d, want 1/false/0/0",
+			reservationsAfterWrite, prematurelyCached, pendingNames, pendingAttrs)
+	}
+
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "gap")}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 9)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+		t.Fatalf("peer COMPLETE in write-to-receipt gap: %v", err)
+	}
+	acknowledgeTestPublication(t, f.raw, unique)
+
+	f.raw.mu.Lock()
+	_, cached := f.raw.cachedNames[nameKey{parent: 1, name: "gap"}]
+	remaining := len(f.raw.cacheReservations[coordinate])
+	parentSequence := f.raw.lastPeerRepairSequence[coordinate]
+	f.raw.mu.Unlock()
+	if cached || remaining != 0 || parentSequence != 9 {
+		t.Fatalf("post-receipt cached=%t reservations=%d sequence=%d, want false/0/9", cached, remaining, parentSequence)
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "gap" || calls[0].sequence != 9 {
+		t.Fatalf("gap repair = %+v, want exact sequence-9 delete", calls)
+	}
+}
+
+func TestPhysicalWriteReleasesCapacityBeforePublicationReceipt(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		lookup   string
+		negative bool
+		wantLive int
+	}{
+		{name: "positive name and attr", lookup: "positive", wantLive: 2},
+		{name: "negative name", lookup: "negative", negative: true, wantLive: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			f.rpc.byName = map[string]*authoritypb.Item{"positive": testItem(90, authoritypb.Attr_REGULAR, 90)}
+			if test.negative {
+				f.rpc.missingNames = make(map[string]bool)
+				f.rpc.missingNames[test.lookup] = true
+			}
+			unique := nextTestRequestUnique()
+			if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, test.lookup, &fuse.EntryOut{}); !status.Ok() {
+				t.Fatalf("LOOKUP = %v", status)
+			}
+			if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1,
+				make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+				t.Fatalf("prepare LOOKUP = (%d, %v)", n, status)
+			}
+			markTestReply(t, f.raw, unique)
+			f.raw.ReplyWritten(unique, fuse.OK)
+
+			f.raw.mu.Lock()
+			live := 0
+			for _, reservations := range f.raw.cacheReservations {
+				live += len(reservations)
+			}
+			pendingNames, pendingNegatives, pendingAttrs := f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+			retained := f.raw.replyPublications[unique] != nil
+			f.raw.mu.Unlock()
+			if pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 || live != test.wantLive || !retained {
+				t.Fatalf("after physical write pending=%d/%d/%d reservations=%d retained=%t, want 0/0/0/%d/true",
+					pendingNames, pendingNegatives, pendingAttrs, live, retained, test.wantLive)
+			}
+
+			acknowledgeTestPublication(t, f.raw, unique)
+			f.raw.mu.Lock()
+			remaining := len(f.raw.cacheReservations)
+			pendingNames, pendingNegatives, pendingAttrs = f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+			f.raw.mu.Unlock()
+			if remaining != 0 || pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 {
+				t.Fatalf("after receipt pending=%d/%d/%d reservation sets=%d, want all zero",
+					pendingNames, pendingNegatives, pendingAttrs, remaining)
+			}
+		})
+	}
+}
+
+func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"teardown": testItem(91, authoritypb.Attr_REGULAR, 91)}
+	unique := nextTestRequestUnique()
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "teardown", &fuse.EntryOut{}); !status.Ok() {
+		t.Fatalf("LOOKUP = %v", status)
+	}
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1,
+		make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("prepare LOOKUP = (%d, %v)", n, status)
+	}
+	markTestReply(t, f.raw, unique)
+
+	terminalDone := make(chan struct{})
+	go func() {
+		f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
+		close(terminalDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		f.raw.mu.Lock()
+		terminalizing := f.raw.replyTerminalizing
+		f.raw.mu.Unlock()
+		if terminalizing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("teardown did not enter terminalizing state")
+		}
+		runtime.Gosched()
+	}
+	select {
+	case <-terminalDone:
+		t.Fatal("teardown completed before the finalized writer reported its physical result")
+	default:
+	}
+
+	// A writer failure after teardown begins still crosses the joined callback
+	// edge, and both ownership classes settle exactly once.
+	f.raw.ReplyWritten(unique, fuse.EIO)
+	select {
+	case <-terminalDone:
+	case <-time.After(time.Second):
+		t.Fatal("teardown did not finish after the original writer callback")
+	}
+	f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
+	f.raw.mu.Lock()
+	pendingNames, pendingNegatives, pendingAttrs := f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+	reservations := len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("teardown pending=%d/%d/%d reservation sets=%d, want all zero",
+			pendingNames, pendingNegatives, pendingAttrs, reservations)
+	}
+
+	// A duplicate callback cannot release either ownership class a second time.
+	f.raw.ReplyWritten(unique, fuse.EIO)
+	f.raw.mu.Lock()
+	pendingNames, pendingNegatives, pendingAttrs = f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
+	reservations = len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if pendingNames != 0 || pendingNegatives != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("post-failure pending=%d/%d/%d reservation sets=%d, want all zero",
+			pendingNames, pendingNegatives, pendingAttrs, reservations)
+	}
+}
+
+func TestTeardownJoinsMidWriteReplyBeforeWithdrawalAndRejectsLateAck(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"withdraw": testItem(92, authoritypb.Attr_REGULAR, 92)}
+	unique := nextTestRequestUnique()
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "withdraw", &fuse.EntryOut{}); !status.Ok() {
+		t.Fatalf("LOOKUP = %v", status)
+	}
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, testPublicationOpcode,
+		make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("prepare LOOKUP = (%d, %v)", n, status)
+	}
+	markTestReply(t, f.raw, unique)
+
+	terminalDone := make(chan struct{})
+	go func() {
+		f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
+		close(terminalDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		f.raw.mu.Lock()
+		terminalizing := f.raw.replyTerminalizing
+		f.raw.mu.Unlock()
+		if terminalizing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("teardown did not enter terminalizing state")
+		}
+		runtime.Gosched()
+	}
+	select {
+	case <-terminalDone:
+		t.Fatal("teardown completed while the finalized /dev/fuse write was in progress")
+	default:
+	}
+
+	// The device accepted the response after teardown began. ReplyWritten is
+	// the only physical result edge and must unblock classification before the
+	// withdrawal snapshot can observe admitted state.
+	f.raw.ReplyWritten(unique, fuse.OK)
+	select {
+	case <-terminalDone:
+	case <-time.After(time.Second):
+		t.Fatal("teardown did not join the successful original writer")
+	}
+
+	serial := nextTestRequestUnique()
+	publishUnique := uint64(1)<<61 | serial
+	in := &fuse.PFSPublishIn{
+		InHeader:      fuse.InHeader{Unique: publishUnique},
+		RequestUnique: unique,
+		PublicationID: serial - 1,
+		Nodeid:        testPublicationNodeID,
+		Opcode:        testPublicationOpcode,
+	}
+	if status := f.raw.PFSPublish(nil, in, &fuse.PFSPublishOut{}); status != fuse.Status(syscall.ENOTCONN) {
+		t.Fatalf("terminal PFS_PUBLISH = %v, want ENOTCONN", status)
+	}
+	f.raw.mu.Lock()
+	_, nameObligation := f.raw.cachedNames[nameKey{parent: 1, name: "withdraw"}]
+	attrObligations := len(f.raw.cachedAttrs)
+	replies, acks := len(f.raw.replyPublications), len(f.raw.publishAcks)
+	publishingNames, publishingInodes := len(f.raw.publishingNames), len(f.raw.publishingInodes)
+	sourcePublishing := len(f.raw.sourcePublishing)
+	f.raw.mu.Unlock()
+	if !nameObligation || attrObligations != 1 {
+		t.Fatalf("terminal withdrawal obligations name=%t attrs=%d, want true/1", nameObligation, attrObligations)
+	}
+	if replies != 0 || acks != 0 || publishingNames != 0 || publishingInodes != 0 || sourcePublishing != 0 {
+		t.Fatalf("terminal ownership replies=%d acks=%d names=%d inodes=%d source=%d, want all zero",
+			replies, acks, publishingNames, publishingInodes, sourcePublishing)
+	}
+
+	deadline = time.Now().Add(time.Second)
+	f.raw.revokeCachedNames(deadline)
+	f.raw.revokeCachedAttrs(deadline)
+	f.raw.ReplyWritten(publishUnique, fuse.OK)
+	f.raw.mu.Lock()
+	remainingNames, remainingAttrs := len(f.raw.cachedNames), len(f.raw.cachedAttrs)
+	replies, acks = len(f.raw.replyPublications), len(f.raw.publishAcks)
+	f.raw.mu.Unlock()
+	if remainingNames != 0 || remainingAttrs != 0 || replies != 0 || acks != 0 {
+		t.Fatalf("late ACK resurrected names=%d attrs=%d replies=%d acks=%d", remainingNames, remainingAttrs, replies, acks)
+	}
+	if f.mount.revoked.Load() {
+		t.Fatal("late successful ACK attempted settlement after terminal ownership transition")
+	}
+}
+
+func TestNamespaceCompleteAlwaysStampsLiveParentWithoutRegistryEntry(t *testing.T) {
+	f := newStrictFixture(t)
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "never-cached")}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 11)
+	if err != nil || blocked {
+		t.Fatalf("begin peer COMPLETE = (blocked=%t err=%v)", blocked, err)
+	}
+	if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+		t.Fatalf("peer COMPLETE: %v", err)
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "entry" || calls[0].child != 0 || calls[0].name != "never-cached" || calls[0].sequence != 11 {
+		t.Fatalf("mandatory parent stamp = %+v", calls)
+	}
+}
+
+func TestFinalizedGetattrIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *testing.T) {
 	f := newStrictFixture(t)
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "cached")
 	const unique = 502
@@ -1263,26 +1550,45 @@ func TestCachedGetattrPublicationSettlesOnlyAfterPostVFSAck(t *testing.T) {
 	if !f.raw.ReplyWriteOrdered(unique) {
 		t.Fatal("cacheable GETATTR reply was not joined to the physical writer boundary")
 	}
+	outData := make([]byte, 104)
+	outData[0] = 1
+	if n, status := f.raw.PrepareReplyPayload(unique, entry.NodeId, 3, outData, make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize GETATTR = (%d, %v)", n, status)
+	}
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, entry.Attr.Ino, 0),
 	}
-	prepareDone := make(chan error, 1)
-	go func() { prepareDone <- f.raw.prepareVisibility(context.Background(), targets, false) }()
-	waitSourceState(t, f.raw, "the peer item cut behind a cached GETATTR reply", func(raw *rawFileSystem) bool {
-		return len(raw.peerHeldPhase) != 0
-	})
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE before cached GETATTR reply write")
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(2, targets...), false, 2)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	completeDone := make(chan error, 1)
+	go func() { completeDone <- f.raw.finishVisibilityComplete(context.Background(), completion) }()
+	assertNoPrepareResult(t, completeDone, "peer COMPLETE before finalized GETATTR reply write")
 
 	markTestReply(t, f.raw, unique)
 	f.raw.ReplyWritten(unique, fuse.OK)
-	assertNoPrepareResult(t, prepareDone, "peer PREPARE after GETATTR reply write but before post-VFS ACK")
-	acknowledgeTestPublication(t, f.raw, unique)
-	if err := awaitPrepareResult(t, prepareDone, "peer PREPARE after cached GETATTR publication ACK"); err != nil {
+	if err := awaitPrepareResult(t, completeDone, "peer COMPLETE after finalized GETATTR reply write"); err != nil {
 		t.Fatal(err)
 	}
-	finishPeerVisibility(t, f.raw, targets)
-	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "inode" {
-		t.Fatalf("GETATTR repair = %+v, want one inode notification", calls)
+	acknowledgeTestPublication(t, f.raw, unique)
+	record := f.raw.acquire(entry.NodeId)
+	if record == nil {
+		t.Fatal("acquire GETATTR record")
+	}
+	identity := record.identity
+	f.raw.release(record)
+	f.raw.mu.Lock()
+	_, cached := f.raw.cachedAttrs[identity]
+	f.raw.mu.Unlock()
+	if cached {
+		t.Fatal("repaired FINALIZED GETATTR entered the cache registry after post-VFS ACK")
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "attr" {
+		t.Fatalf("GETATTR repair = %+v, want one stamped attr notification", calls)
 	}
 }
 

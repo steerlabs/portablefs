@@ -7,6 +7,7 @@ import (
 	"errors"
 	"reflect"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -81,6 +82,17 @@ func newCoherentNormalizationMutation(t *testing.T, name string) (*VolumeHandler
 	request := normalizationSetXattrRequest(root)
 	stampMutation(t, request, 0, 1)
 	return h, credential, request
+}
+
+func normalizationAppliedResponse(h *VolumeHandler, sequence uint64) *authoritypb.Response {
+	response := h.success(0)
+	response.PostState = h.mutationPostState(sequence, postStateSnapshot{
+		identity: [16]byte{1},
+		attr:     xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: 1, Size: 200, Mode: 0o755, Nlink: 2, DeviceMinor: 1},
+		roles:    postStateRoleTarget,
+		changed:  true,
+	})
+	return response
 }
 
 func TestNormalizeVisibilityTargetsCanonicalizesEveryCoordinateOrdering(t *testing.T) {
@@ -364,15 +376,14 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 	stampMutation(t, request, 0, 1)
 	response := make(chan *authoritypb.Response, 1)
 	go func() {
-		response <- h.mutateVisible(context.Background(), request, source,
+		response <- h.mutateVisibleSequence(context.Background(), request, source,
 			func() ([]volumeserver.VisibilityTarget, error) {
 				return []volumeserver.VisibilityTarget{attributes, prepareData, attributes}, nil
 			},
-			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-				return h.success(0), []volumeserver.VisibilityTarget{attributes, completeData, completeData}
+			func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				return normalizationAppliedResponse(h, sequence), []volumeserver.VisibilityTarget{attributes, completeData, completeData}
 			})
 	}()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	initial := testInitialVisibilityCursor(t, visibility, observer.ID)
@@ -390,8 +401,17 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if complete.Cursor.Phase != volumeserver.VisibilityComplete || !reflect.DeepEqual(complete.Targets, []volumeserver.VisibilityTarget{completeData}) {
-		t.Fatalf("COMPLETE targets = %#v, want one DATA target %#v", complete.Targets, completeData)
+	wantComplete := []volumeserver.VisibilityTarget{completeData}
+	wantComplete[0].ExactPostState = &volumeserver.VisibilityObjectPostState{
+		StableIdentity: coordinate.identity, ObjectVersion: complete.Cursor.Sequence,
+		Roles: postStateRoleTarget,
+		Attr: volumeserver.VisibilityAttr{
+			Kind: uint32(xfsstore.KindDirectory), Inode: 1, Size: 200,
+			Mode: 0o755, Nlink: 2,
+		},
+	}
+	if complete.Cursor.Phase != volumeserver.VisibilityComplete || !reflect.DeepEqual(complete.Targets, wantComplete) {
+		t.Fatalf("COMPLETE targets = %#v, want one exact DATA target %#v", complete.Targets, wantComplete)
 	}
 	if err := visibility.Ack(observer.ID, complete.Cursor); err != nil {
 		t.Fatal(err)
@@ -452,11 +472,11 @@ func TestMutateVisibleFailsClosedAroundNormalizationDefects(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			h, credential, request := newCoherentNormalizationMutation(t, "authority-target-normalization-failure")
 			var applyCalls atomic.Uint32
-			response := h.mutateVisible(context.Background(), request, credential,
+			response := h.mutateVisibleSequence(context.Background(), request, credential,
 				func() ([]volumeserver.VisibilityTarget, error) { return test.prepare, nil },
-				func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 					applyCalls.Add(1)
-					return h.success(0), test.complete
+					return normalizationAppliedResponse(h, sequence), test.complete
 				})
 			if response.GetErrno() != errnos.EIO || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 				t.Fatalf("normalization defect response = %+v, want coherence EIO", response)
@@ -471,14 +491,16 @@ func TestMutateVisibleFailsClosedAroundNormalizationDefects(t *testing.T) {
 	}
 }
 
-func TestMutateVisiblePreservesNilCompletionAsNoVisibleChange(t *testing.T) {
+func TestMutateVisiblePreservesNilCompletionForDefiniteNoChange(t *testing.T) {
 	coordinate := normalizationSourceCoordinate(xfsstore.Capability{1})
 	data := inodeTarget(volumeserver.VisibilityData, coordinate, 100)
 	h, credential, request := newCoherentNormalizationMutation(t, "authority-target-normalization-nil")
 	response := h.mutateVisible(context.Background(), request, credential,
 		func() ([]volumeserver.VisibilityTarget, error) { return []volumeserver.VisibilityTarget{data}, nil },
-		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), nil })
-	if response.GetErrno() != 0 || response.GetUncertain() {
-		t.Fatalf("nil completion = %+v, want successful no-visible-change result", response)
+		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			return h.errorResponse(0, syscall.EEXIST, false), nil
+		})
+	if response.GetErrno() != int32(syscall.EEXIST) || response.GetUncertain() {
+		t.Fatalf("nil completion = %+v, want definite no-change EEXIST", response)
 	}
 }

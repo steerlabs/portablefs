@@ -5,7 +5,9 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,6 +25,32 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
 )
+
+func exactAuthorityTestTargets(sequence uint64, targets []volumeserver.VisibilityTarget) []volumeserver.VisibilityTarget {
+	sizes := make(map[[16]byte]int64)
+	for _, target := range targets {
+		if target.Scope == volumeserver.VisibilityData {
+			sizes[target.Identity] = target.Size
+		}
+	}
+	exact := append([]volumeserver.VisibilityTarget(nil), targets...)
+	for index := range exact {
+		target := &exact[index]
+		if target.Scope == volumeserver.VisibilityNamespace {
+			continue
+		}
+		target.ExactPostState = &volumeserver.VisibilityObjectPostState{
+			StableIdentity: target.Identity,
+			ObjectVersion:  sequence,
+			Roles:          postStateRoleTarget,
+			Attr: volumeserver.VisibilityAttr{
+				Kind: uint32(xfsstore.KindRegular), Inode: target.KernelIno,
+				Size: sizes[target.Identity], Mode: 0o600,
+			},
+		}
+	}
+	return exact
+}
 
 func testVolumeHandler() *VolumeHandler {
 	return &VolumeHandler{
@@ -224,7 +252,7 @@ func TestNextVisibilityAtomicallyAcknowledgesAndWaitsForSuccessor(t *testing.T) 
 			ctx, volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
 			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(1, targets), true },
 		)
 	}()
 	initial := h.Handle(ctx, request(1, &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{
@@ -389,7 +417,7 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 			context.Background(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
 			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(1, targets), true },
 		)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -973,6 +1001,80 @@ type resourceAdmissionFaultStore struct {
 	lookupItem   xfsstore.Capability
 }
 
+func (*resourceAdmissionFaultStore) LockMutation([][16]byte) func() { return func() {} }
+
+type allocatingMutationLockStore struct {
+	resourceAdmissionFaultStore
+	t      *testing.T
+	parent xfsstore.Capability
+	child  xfsstore.Capability
+	handle xfsstore.Capability
+
+	mu         sync.Mutex
+	locked     bool
+	released   bool
+	identities [][16]byte
+	phases     map[string]bool
+}
+
+func (s *allocatingMutationLockStore) LockMutation(identities [][16]byte) func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		s.t.Fatal("allocating mutation recursively acquired its writer lock")
+	}
+	s.identities = append([][16]byte(nil), identities...)
+	s.locked = true
+	return func() {
+		s.mu.Lock()
+		s.locked = false
+		s.released = true
+		s.mu.Unlock()
+	}
+}
+
+func (s *allocatingMutationLockStore) observeLocked(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.locked {
+		s.t.Errorf("%s ran outside the allocating parent's writer lock", phase)
+	}
+	s.phases[phase] = true
+}
+
+func (s *allocatingMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.observeLocked("allocating syscall")
+	if parent != s.parent {
+		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
+	}
+	return s.child, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *allocatingMutationLockStore) OpenFile(item xfsstore.Capability, _ xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.observeLocked("creation handle acquisition")
+	if item != s.child {
+		s.t.Errorf("open item = %x, want %x", item, s.child)
+	}
+	return s.handle, nil
+}
+
+func (s *allocatingMutationLockStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	if item == s.child {
+		s.observeLocked("newborn identity capture")
+	}
+	return [16]byte{item[0]}, nil
+}
+
+func (s *allocatingMutationLockStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	if item == s.parent {
+		s.observeLocked("parent post-apply snapshot")
+		return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(item[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1}, nil
+	}
+	return s.resourceAdmissionFaultStore.Getattr(item)
+}
+
+func (*allocatingMutationLockStore) CloseOpen(xfsstore.Capability) error { return nil }
+
 type sourceGateRefreshStore struct {
 	resourceAdmissionFaultStore
 	mu             sync.Mutex
@@ -1438,10 +1540,19 @@ func TestMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) 
 	targets := []volumeserver.VisibilityTarget{{
 		Scope: volumeserver.VisibilityData, Identity: identity, KernelIno: 52, Device: 1, Size: 1,
 	}}
-	response := h.mutateVisible(
+	response := h.mutateVisibleSequence(
 		context.Background(), request, credential,
 		func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), targets },
+		func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
+				identity: identity,
+				attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 52, Size: 1, Mode: 0o600, Nlink: 1, DeviceMinor: 1},
+				roles:    postStateRoleTarget,
+				changed:  true,
+			})
+			return resp, targets
+		},
 	)
 	if response.GetErrno() != 0 {
 		t.Fatalf("fallocate mutation = %+v", response)
@@ -1495,6 +1606,7 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 	mutationTargets := []volumeserver.VisibilityTarget{
 		{Scope: volumeserver.VisibilityNamespace, ParentIdentity: parentIdentity, ParentKernelIno: 0x11, Device: 1, Name: []byte("child")},
 		{Scope: volumeserver.VisibilityAttributes, Identity: parentIdentity, KernelIno: 0x11, Device: 1},
+		{Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{newBinding[0]}, KernelIno: uint64(newBinding[0]), Device: 1},
 	}
 
 	ownerEntered := make(chan struct{})
@@ -1529,10 +1641,27 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 	stampMutation(t, request, 0, 1)
 	mutationResult := make(chan *authoritypb.Response, 1)
 	go func() {
-		mutationResult <- h.mutateVisible(
+		mutationResult <- h.mutateVisibleSequence(
 			context.Background(), request, credential,
 			func() ([]volumeserver.VisibilityTarget, error) { return mutationTargets, nil },
-			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), nil },
+			func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				resp := h.success(0)
+				resp.PostState = h.mutationPostState(sequence,
+					postStateSnapshot{
+						identity: [16]byte{newBinding[0]},
+						attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(newBinding[0]), Mode: 0o600, Nlink: 0, DeviceMinor: 1},
+						roles:    postStateRoleRemoved,
+						changed:  true,
+					},
+					postStateSnapshot{
+						identity: parentIdentity,
+						attr:     xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(root[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1},
+						roles:    postStateRoleParent,
+						changed:  true,
+					},
+				)
+				return resp, mutationTargets
+			},
 		)
 	}()
 	select {
@@ -1582,7 +1711,7 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 			context.Background(), volumeserver.SessionID{0xFD}, volumeserver.MutationID{Sequence: 2},
 			volumeserver.MutationDependenciesForTargets(peerTargets),
 			func() ([]volumeserver.VisibilityTarget, error) { return peerTargets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return peerTargets, true },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(2, peerTargets), true },
 		)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1824,8 +1953,8 @@ func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("Rename calls = %d, want one", calls)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("Rename namespace lookups = %d, want one pre-admission resolution per name", calls)
+	if calls := store.lookup.Load(); calls != 3 {
+		t.Fatalf("Rename namespace lookups = %d, want two dependency resolutions plus one locked post-state capability lookup", calls)
 	}
 
 	// Request ID is delivery correlation, not replay identity. A lost DATA
@@ -1840,7 +1969,7 @@ func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("exact Rename replay re-executed XFS: calls = %d", calls)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
+	if calls := store.lookup.Load(); calls != 3 {
 		t.Fatalf("exact Rename replay re-resolved namespace: lookups = %d", calls)
 	}
 }
@@ -1859,8 +1988,8 @@ func TestRenameExchangeReplyCarriesBothAuthoritativePostBindings(t *testing.T) {
 	if rename == nil || !bytes.Equal(rename.GetNewPostIdentity(), wantNew[:]) || !bytes.Equal(rename.GetOldPostIdentity(), wantOld[:]) {
 		t.Fatalf("Rename exchange reply = %+v, want new=%x old=%x", rename, wantNew, wantOld)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("Rename exchange namespace lookups = %d, want one pre-admission resolution per name", calls)
+	if calls := store.lookup.Load(); calls != 4 {
+		t.Fatalf("Rename exchange namespace lookups = %d, want two dependency resolutions plus two locked post-state capability lookups", calls)
 	}
 }
 
@@ -1896,8 +2025,8 @@ func TestRenameSameInodeNoOpReportsBothNamesAndReplaysExactly(t *testing.T) {
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("same-inode exact replay re-executed XFS: calls = %d", calls)
 	}
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("same-inode Rename namespace lookups = %d, want one pre-admission resolution per name", calls)
+	if calls := store.lookup.Load(); calls != 3 {
+		t.Fatalf("same-inode Rename namespace lookups = %d, want two dependency resolutions plus one locked moved-object snapshot lookup", calls)
 	}
 }
 
@@ -2031,6 +2160,308 @@ func TestResourceStoreFailureReleasesExactReservation(t *testing.T) {
 			}
 			reservation.release()
 		})
+	}
+}
+
+func TestCreateCoversNewbornUnderExistingParentWriterLock(t *testing.T) {
+	store := &allocatingMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, child: xfsstore.Capability{0x73},
+		handle: xfsstore.Capability{0x74}, phases: make(map[string]bool),
+	}
+	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+	if root != store.parent {
+		t.Fatalf("harness root = %x, want parent %x", root, store.parent)
+	}
+	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	if response.GetErrno() != 0 || response.GetCreate() == nil || len(response.GetPostState().GetObjects()) != 2 {
+		t.Fatalf("create response = %+v", response)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.locked || !store.released {
+		t.Fatalf("allocating parent lock lifecycle = locked:%v released:%v", store.locked, store.released)
+	}
+	wantIdentity := [16]byte{store.parent[0]}
+	if len(store.identities) != 1 || store.identities[0] != wantIdentity {
+		t.Fatalf("pre-allocation lock set = %x, want existing parent identity %x only", store.identities, wantIdentity)
+	}
+	for _, phase := range []string{"allocating syscall", "creation handle acquisition", "newborn identity capture", "parent post-apply snapshot"} {
+		if !store.phases[phase] {
+			t.Errorf("create did not exercise %s under the parent stripe", phase)
+		}
+	}
+}
+
+type existingCreateMutationLockStore struct {
+	resourceAdmissionFaultStore
+	t              *testing.T
+	parent         xfsstore.Capability
+	target         xfsstore.Capability
+	replacement    xfsstore.Capability
+	handle         xfsstore.Capability
+	truncate       bool
+	bindingChanges bool
+
+	mu         sync.Mutex
+	locked     bool
+	released   bool
+	identities [][16]byte
+	lookups    uint32
+	creates    uint32
+}
+
+func (s *existingCreateMutationLockStore) LockMutation(identities [][16]byte) func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		s.t.Fatal("existing CREATE recursively acquired its writer lock")
+	}
+	s.identities = append([][16]byte(nil), identities...)
+	s.locked = true
+	return func() {
+		s.mu.Lock()
+		s.locked = false
+		s.released = true
+		s.mu.Unlock()
+	}
+}
+
+func (s *existingCreateMutationLockStore) requireLocked(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.locked {
+		s.t.Errorf("%s ran outside the existing CREATE writer locks", phase)
+	}
+}
+
+func (s *existingCreateMutationLockStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.mu.Lock()
+	s.lookups++
+	lookup := s.lookups
+	s.mu.Unlock()
+	item := s.target
+	if s.bindingChanges && lookup >= 2 {
+		item = s.replacement
+	}
+	return item, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(item[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) CoordinateItem(item xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	return xfsstore.ObjectCoordinate{Stable: [16]byte{item[0]}, Ino: uint64(item[0]), DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE apply")
+	s.mu.Lock()
+	s.creates++
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	s.mu.Unlock()
+	if parent != s.parent {
+		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
+	}
+	return target, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) OpenFile(item xfsstore.Capability, flags xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.requireLocked("existing CREATE open")
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	if item != target || flags.Truncate != s.truncate {
+		s.t.Errorf("open target/flags = %x/%+v, want %x truncate=%v", item, flags, target, s.truncate)
+	}
+	return s.handle, nil
+}
+
+func (s *existingCreateMutationLockStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE target snapshot")
+	if handle != s.handle {
+		s.t.Errorf("snapshot handle = %x, want %x", handle, s.handle)
+	}
+	size := int64(17)
+	if s.truncate {
+		size = 0
+	}
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: size, Mode: 0o600, Nlink: 1, DeviceMinor: 1, Flags: 0x10}, nil
+}
+
+func (s *existingCreateMutationLockStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE parent snapshot")
+	if item != s.parent {
+		s.t.Errorf("parent snapshot item = %x, want %x", item, s.parent)
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(s.parent[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1}, nil
+}
+
+func (*existingCreateMutationLockStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
+	for _, truncate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("truncate=%v", truncate), func(t *testing.T) {
+			store := &existingCreateMutationLockStore{
+				t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+				handle: xfsstore.Capability{0x74}, truncate: truncate,
+			}
+			h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+			request := resourceAcquisitionRequest(t, "create", credential, root)
+			request.GetCreate().Flags.Truncate = truncate
+			for _, target := range request.GetSourcePublicationGate().GetTargets() {
+				if namespace := target.GetNamespace(); namespace != nil {
+					namespace.BoundData = truncate
+				}
+			}
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || response.GetCreate() == nil {
+				t.Fatalf("existing CREATE response = %+v", response)
+			}
+			if !validMutationPostStateRoles(request, response.GetPostState()) {
+				t.Fatalf("existing CREATE exact state = %+v", response.GetPostState())
+			}
+			roles := make(map[uint32]*authoritypb.ObjectPostState)
+			for _, object := range response.GetPostState().GetObjects() {
+				roles[object.GetRoles()] = object
+			}
+			if roles[postStateRoleParent] == nil || roles[postStateRoleTarget] == nil || roles[postStateRoleTarget].GetAttr().GetFlags() != 0x10 {
+				t.Fatalf("existing CREATE objects = %+v, want exact PARENT+TARGET", response.GetPostState().GetObjects())
+			}
+			if response.GetCreate().GetItem().GetObjectVersion() != roles[postStateRoleTarget].GetObjectVersion() ||
+				response.GetCreate().GetItem().GetSnapshotSequence() != response.GetPostState().GetSnapshotSequence() {
+				t.Fatalf("item stamp does not match target post-state: item=%+v state=%+v", response.GetCreate().GetItem(), roles[postStateRoleTarget])
+			}
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			want := map[[16]byte]bool{{store.parent[0]}: true, {store.target[0]}: true}
+			if store.locked || !store.released || len(store.identities) != 2 || !want[store.identities[0]] || !want[store.identities[1]] {
+				t.Fatalf("existing CREATE lock lifecycle/identities = locked:%v released:%v %x", store.locked, store.released, store.identities)
+			}
+		})
+	}
+}
+
+func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
+	store := &existingCreateMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+		replacement: xfsstore.Capability{0x74}, handle: xfsstore.Capability{0x75}, bindingChanges: true,
+	}
+	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	if response.GetErrno() != 0 || response.GetUncertain() || response.GetCreate() == nil {
+		t.Fatalf("binding-change response = %+v, want successful re-resolved CREATE", response)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.creates != 1 || store.locked || !store.released {
+		t.Fatalf("binding-change retry apply/lifecycle: creates=%d locked=%v released=%v", store.creates, store.locked, store.released)
+	}
+	if len(store.identities) != 2 || store.identities[0] != [16]byte{store.parent[0]} || store.identities[1] != [16]byte{store.replacement[0]} {
+		t.Fatalf("binding-change final lock set = %x, want parent+replacement", store.identities)
+	}
+}
+
+type readdirPostStabilizationChangeStore struct {
+	resourceAdmissionFaultStore
+	root, handle, child xfsstore.Capability
+	readDirCalls        atomic.Uint32
+	lookupCalls         atomic.Uint32
+}
+
+func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
+	open xfsstore.Capability,
+	_ uint64,
+	_ [16]byte,
+	_ int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if open != s.handle {
+		return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EBADF
+	}
+	s.readDirCalls.Add(1)
+	var verifier [16]byte
+	binary.BigEndian.PutUint64(verifier[0:8], uint64(s.root[0]))
+	binary.BigEndian.PutUint64(verifier[8:16], 10)
+	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0])}}, 1, verifier, true, s.root, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	call := s.lookupCalls.Add(1)
+	mode := os.FileMode(0o600)
+	// Call two is the trailing read after the first stabilization cut. It
+	// models a chmod completing in that window; every later read sees the new
+	// state, so the second whole-page transaction can commit.
+	if call >= 2 {
+		mode = 0o640
+	}
+	return s.child, xfsstore.Attr{
+		Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: mode,
+		Nlink: 1, DeviceMinor: 1,
+	}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	return [16]byte{item[0]}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) IdentityOpen(open xfsstore.Capability) ([16]byte, error) {
+	if open != s.handle {
+		return [16]byte{}, syscall.EBADF
+	}
+	return [16]byte{s.root[0]}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) GetattrOpen(open xfsstore.Capability) (xfsstore.Attr, error) {
+	if open != s.handle {
+		return xfsstore.Attr{}, syscall.EBADF
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(s.root[0]), CTimeNS: 10, DeviceMinor: 1}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Forget(xfsstore.Capability) error {
+	s.forget.Add(1)
+	return nil
+}
+
+func (*readdirPostStabilizationChangeStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing.T) {
+	store := &readdirPostStabilizationChangeStore{
+		root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
+	}
+	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := &authoritypb.Request{
+		RequestId: 81, Epoch: credential.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]},
+		Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+			Handle: store.handle[:], MaxEntries: 16, WantItems: true,
+		}},
+	}
+	stampMutation(t, request, 0, 1)
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 {
+		t.Fatalf("READDIRPLUS response = %+v", response)
+	}
+	entry := response.GetReadDir().GetEntries()[0]
+	if entry.GetAttr().GetMode() != 0o640 || entry.GetItem().GetAttr().GetMode() != 0o640 {
+		t.Fatalf("returned pre-chmod candidate: dirent=%+v item=%+v", entry.GetAttr(), entry.GetItem().GetAttr())
+	}
+	if entry.GetObjectVersion() > entry.GetSnapshotSequence() {
+		t.Fatalf("future page stamp %d > %d", entry.GetObjectVersion(), entry.GetSnapshotSequence())
+	}
+	if got := store.readDirCalls.Load(); got != 4 {
+		t.Fatalf("directory enumerations = %d, want candidate+verification for each of two whole-page attempts", got)
+	}
+	if got := store.lookupCalls.Load(); got != 4 {
+		t.Fatalf("child snapshots = %d, want candidate+verification for each of two whole-page attempts", got)
 	}
 }
 
@@ -2941,7 +3372,7 @@ func TestProtocol5ActivationPublishesFreshRootInsideRegistrationBoundary(t *test
 				return []volumeserver.VisibilityTarget{target}, nil
 			},
 			func() ([]volumeserver.VisibilityTarget, bool) {
-				return []volumeserver.VisibilityTarget{target}, true
+				return exactAuthorityTestTargets(1, []volumeserver.VisibilityTarget{target}), true
 			},
 		)
 	}()

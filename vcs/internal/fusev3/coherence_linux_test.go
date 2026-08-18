@@ -17,6 +17,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"google.golang.org/protobuf/proto"
 )
 
 // recordedNotify is one reverse notification the frontend sent to its kernel.
@@ -30,6 +31,9 @@ type recordedNotify struct {
 	length   int64
 	size     uint64
 	sequence uint64
+	version  uint64
+	flags    uint32
+	birthNS  int64
 }
 
 // fakeNotifier stands in for the kernel's reverse channel. block, when
@@ -85,17 +89,38 @@ func (n *fakeNotifier) InodeNotify(node uint64, off, length int64) fuse.Status {
 	return n.inodeST
 }
 
-func (n *fakeNotifier) PFSSizeNotify(node uint64, size uint64, sequence uint64) fuse.Status {
+func (n *fakeNotifier) PFSSizeNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status {
 	n.mu.Lock()
 	hook := n.onSize
 	n.mu.Unlock()
 	if hook != nil {
 		hook()
 	}
-	n.record(recordedNotify{kind: "size", inode: node, size: size, sequence: sequence})
+	n.record(recordedNotify{kind: "size", inode: object.Nodeid, size: binary.LittleEndian.Uint64(object.Attr[8:16]), sequence: sequence, version: object.ObjectVersion, flags: object.InodeFlags, birthNS: object.BirthTimeNS})
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.sizeST
+}
+
+func (n *fakeNotifier) PFSAttrNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status {
+	n.record(recordedNotify{kind: "attr", inode: object.Nodeid, size: binary.LittleEndian.Uint64(object.Attr[8:16]), sequence: sequence, version: object.ObjectVersion, flags: object.InodeFlags, birthNS: object.BirthTimeNS})
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.inodeST
+}
+
+func (n *fakeNotifier) PFSEntryNotify(parent uint64, child uint64, sequence uint64, name string, deleted bool) fuse.Status {
+	kind := "entry"
+	if deleted {
+		kind = "delete"
+	}
+	n.record(recordedNotify{kind: kind, parent: parent, child: child, name: name, sequence: sequence})
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if deleted {
+		return n.deleteST
+	}
+	return n.entryST
 }
 
 func (n *fakeNotifier) EntryNotify(parent uint64, name string) fuse.Status {
@@ -162,7 +187,31 @@ func inodeVisibilityTarget(scope authoritypb.VisibilityScope, inode uint64, size
 	}
 }
 
+func exactVisibilityTargets(sequence uint64, targets ...*authoritypb.VisibilityTarget) []*authoritypb.VisibilityTarget {
+	sizes := make(map[string]int64)
+	for _, target := range targets {
+		if target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA {
+			sizes[string(target.GetIdentity())] = target.GetSize()
+		}
+	}
+	exact := make([]*authoritypb.VisibilityTarget, len(targets))
+	for index, target := range targets {
+		exact[index] = proto.Clone(target).(*authoritypb.VisibilityTarget)
+		if target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE {
+			continue
+		}
+		exact[index].ExactPostState = &authoritypb.ObjectPostState{
+			StableIdentity: append([]byte(nil), target.GetIdentity()...), ObjectVersion: sequence, Roles: postStateRoleTarget,
+			Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: target.GetKernelIno(), Size: sizes[string(target.GetIdentity())], Mode: 0o600},
+		}
+	}
+	return exact
+}
+
 func visibilityEvent(sequence uint64, phase authoritypb.VisibilityPhase, initiator []byte, targets ...*authoritypb.VisibilityTarget) *authoritypb.VisibilityEvent {
+	if phase == authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
+		targets = exactVisibilityTargets(sequence, targets...)
+	}
 	return &authoritypb.VisibilityEvent{
 		Cursor:             &authoritypb.VisibilityCursor{Sequence: sequence, Phase: phase},
 		InitiatorSessionId: initiator,
@@ -250,6 +299,12 @@ func (f *strictFixture) rename(oldParent, newParent uint64, oldName, newName str
 	})
 }
 
+func (f *strictFixture) setReadSequence(sequence uint64) {
+	f.rpc.mu.Lock()
+	f.rpc.readSequence = sequence
+	f.rpc.mu.Unlock()
+}
+
 // --- the strict profile publishes lifetimes, and records what it published ---
 
 func TestStrictLookupPublishesACacheableEntryAndRecordsIt(t *testing.T) {
@@ -300,9 +355,10 @@ func TestLookupBetweenPrepareAndCompleteDoesNotRecacheTheOldValue(t *testing.T) 
 	}
 	f.raw.ReplyWritten(unique, fuse.OK)
 	acknowledgeTestPublication(t, f.raw, unique)
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
+	f.setReadSequence(2)
 	// Admission reopens on COMPLETE, not on a timer.
 	if after := f.lookup(t, fuse.FUSE_ROOT_ID, "victim"); after.EntryValid == 0 {
 		t.Fatal("cache admission was not reopened by COMPLETE")
@@ -319,12 +375,12 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatalf("PREPARE: %v", err)
 	}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	calls := f.notify.snapshot()
 	if len(calls) != 2 {
-		t.Fatalf("notifications = %+v, want one namespace repair and one inode repair", calls)
+		t.Fatalf("notifications = %+v, want namespace and exact size/attr repairs", calls)
 	}
 	if calls[0].kind != "delete" || calls[0].parent != fuse.FUSE_ROOT_ID || calls[0].name != "victim" || calls[0].child != entry.NodeId {
 		t.Fatalf("namespace repair = %+v; a removal must reach inotify, which only NotifyDelete does", calls[0])
@@ -332,26 +388,27 @@ func TestCompleteInvalidatesExactlyWhatWasPublished(t *testing.T) {
 	if calls[1].kind != "size" || calls[1].inode != entry.NodeId || calls[1].size != 4096 || calls[1].sequence != 1 {
 		t.Fatalf("inode repair = %+v; want exact size 4096 at the visibility sequence", calls[1])
 	}
-	// A repaired binding is no longer cached, so a second event for the same
-	// name costs nothing and, critically, takes no kernel lock.
+	// A repaired binding is no longer cached, but every namespace COMPLETE must
+	// still advance the parent/name stamp. With no exact child left, the daemon
+	// sends the safe expire/stamp form instead of conditionally omitting PFS_ENTRY.
 	before := f.notify.count()
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("second COMPLETE: %v", err)
 	}
-	for _, call := range f.notify.snapshot()[before:] {
-		if call.kind != "size" {
-			t.Fatalf("a binding this mount no longer caches was repaired again: %+v", call)
-		}
+	second := f.notify.snapshot()[before:]
+	if len(second) != 2 || second[0].kind != "entry" || second[0].parent != fuse.FUSE_ROOT_ID ||
+		second[0].child != 0 || second[0].name != "victim" || second[0].sequence != 1 ||
+		second[1].kind != "size" {
+		t.Fatalf("second COMPLETE repairs = %+v, want parent stamp plus exact size/attr", second)
 	}
 }
 
 func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 	tests := []struct {
-		name     string
-		targets  func(uint64) []*authoritypb.VisibilityTarget
-		wantKind string
-		wantOff  int64
-		wantSize uint64
+		name      string
+		targets   func(uint64) []*authoritypb.VisibilityTarget
+		wantKinds []string
+		wantSize  uint64
 	}{
 		{
 			name: "duplicate attributes stay attribute-only",
@@ -361,8 +418,7 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
 				}
 			},
-			wantKind: "inode",
-			wantOff:  -1,
+			wantKinds: []string{"attr"},
 		},
 		{
 			name: "data dominates attributes",
@@ -373,25 +429,62 @@ func TestCompleteNormalizesInodeRepairs(t *testing.T) {
 					inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0),
 				}
 			},
-			wantKind: "size",
-			wantSize: 4096,
+			wantKinds: []string{"size"},
+			wantSize:  4096,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			f := newStrictFixture(t)
 			entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
-			if err := f.raw.completeVisibility(test.targets(entry.Attr.Ino), false); err != nil {
+			if err := f.raw.completeVisibility(exactVisibilityTargets(1, test.targets(entry.Attr.Ino)...), false); err != nil {
 				t.Fatalf("COMPLETE: %v", err)
 			}
 			calls := f.notify.snapshot()
-			if len(calls) != 1 {
-				t.Fatalf("notifications = %+v, want one normalized inode repair", calls)
+			if len(calls) != len(test.wantKinds) {
+				t.Fatalf("notifications = %+v, want %v", calls, test.wantKinds)
 			}
-			if call := calls[0]; call.kind != test.wantKind || call.inode != entry.NodeId || call.off != test.wantOff || call.length != 0 || call.size != test.wantSize {
-				t.Fatalf("normalized inode repair = %+v, want kind %q for inode %d", call, test.wantKind, entry.NodeId)
+			for index, kind := range test.wantKinds {
+				call := calls[index]
+				if call.kind != kind || call.inode != entry.NodeId || kind == "size" && call.size != test.wantSize {
+					t.Fatalf("normalized inode repairs = %+v, want %v for inode %d", calls, test.wantKinds, entry.NodeId)
+				}
 			}
 		})
+	}
+}
+
+func TestExactAttrRepairCarriesEnforcementAndBirthTimeTransitions(t *testing.T) {
+	f := newStrictFixture(t)
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
+	const immutable = uint32(0x10)
+	for _, transition := range []struct {
+		sequence uint64
+		flags    uint32
+		birthNS  int64
+	}{
+		{sequence: 1, flags: immutable, birthNS: 111},
+		{sequence: 2, flags: 0, birthNS: 222},
+	} {
+		target := inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, entry.Attr.Ino, 0)
+		target = exactVisibilityTargets(transition.sequence, target)[0]
+		target.ExactPostState.Attr.Flags = transition.flags
+		target.ExactPostState.Attr.BirthTimeNs = transition.birthNS
+		completion, blocked, err := f.raw.beginVisibilityCompleteAt(
+			[]*authoritypb.VisibilityTarget{target}, false, transition.sequence,
+		)
+		if err != nil || blocked {
+			t.Fatalf("begin exact ATTR COMPLETE %d = (blocked=%t, err=%v)", transition.sequence, blocked, err)
+		}
+		if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+			t.Fatalf("finish exact ATTR COMPLETE %d: %v", transition.sequence, err)
+		}
+		call := f.notify.snapshot()[f.notify.count()-1]
+		if call.kind != "attr" || call.inode != entry.NodeId ||
+			call.sequence != transition.sequence || call.version != transition.sequence ||
+			call.flags != transition.flags || call.birthNS != transition.birthNS {
+			t.Fatalf("exact ATTR transition %d = %+v", transition.sequence, call)
+		}
 	}
 }
 
@@ -415,7 +508,7 @@ func TestNamespaceRepairNeverFallsBackFromExactChildExpiration(t *testing.T) {
 	f.notify.deleteST = fuse.Status(syscall.ENOSYS)
 	f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "victim")}
-	if err := f.raw.completeVisibility(targets, false); err == nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err == nil {
 		t.Fatal("COMPLETE accepted an exact-child repair the kernel refused")
 	}
 	calls := f.notify.snapshot()
@@ -432,12 +525,12 @@ func TestMissingKernelInodeAlreadySatisfiesInvalidation(t *testing.T) {
 		namespaceVisibilityTarget(1, "victim"),
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, 7, 0),
 	}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE over an inode removed by its namespace repair: %v", err)
 	}
 	calls := f.notify.snapshot()
 	if len(calls) != 2 || calls[0].kind != "delete" || calls[0].child != entry.NodeId ||
-		calls[1].kind != "inode" || calls[1].inode != entry.NodeId {
+		calls[1].kind != "attr" || calls[1].inode != entry.NodeId {
 		t.Fatalf("notifications = %+v, want namespace removal followed by the now-absent inode", calls)
 	}
 }
@@ -446,13 +539,14 @@ func TestMissingKernelInodeAlreadySatisfiesExactSizeRepair(t *testing.T) {
 	f := newStrictFixture(t)
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	f.notify.sizeST = fuse.ENOENT
+	f.notify.inodeST = fuse.ENOENT
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 7, 19),
 	}
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatal(err)
 	}
-	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 27)
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(27, targets...), false, 27)
 	if err != nil || blocked {
 		t.Fatalf("begin exact-size COMPLETE = (blocked=%t, err=%v)", blocked, err)
 	}
@@ -517,7 +611,7 @@ func TestEvictedDentryAlreadySatisfiesNameInvalidation(t *testing.T) {
 	f.lookup(t, fuse.FUSE_ROOT_ID, "victim")
 	f.notify.deleteST = fuse.ENOENT
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "victim")}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE over an evicted dentry: %v", err)
 	}
 	calls := f.notify.snapshot()
@@ -654,6 +748,495 @@ func TestCachedNamesNeverExceedTheDeclaredCapacity(t *testing.T) {
 	}
 	if uncacheable == 0 {
 		t.Fatal("the capacity bound was never reached, so this test proved nothing")
+	}
+}
+
+func TestReadDirPlusPageReservesOrDegradesAsOneUnit(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		capacity   int
+		wantCached bool
+	}{
+		{name: "whole page reserved", capacity: 2, wantCached: true},
+		{name: "one short degrades whole page", capacity: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			f.raw.mu.Lock()
+			f.raw.nameCapacity = test.capacity
+			f.raw.attrCapacity = test.capacity
+			f.raw.mu.Unlock()
+			parent := f.raw.acquire(fuse.FUSE_ROOT_ID)
+			if parent == nil {
+				t.Fatal("acquire root")
+			}
+			defer f.raw.release(parent)
+			candidates := make([]dirPlusCandidate, 0, 2)
+			for index, name := range []string{"alpha", "beta"} {
+				item := testItem(uint64(100+index), authoritypb.Attr_REGULAR, uint64(100+index))
+				item.ObjectVersion, item.SnapshotSequence = 9, 9
+				record, errno := f.raw.intern(context.Background(), item)
+				if errno != 0 {
+					t.Fatalf("intern %s: %v", name, errno)
+				}
+				candidates = append(candidates, dirPlusCandidate{
+					entry: &fuse.EntryOut{}, item: item, record: record,
+					dirent: &authoritypb.Dirent{
+						Name: []byte(name), Attr: item.Attr, Item: item,
+						ObjectVersion: 9, SnapshotSequence: 9,
+					},
+				})
+			}
+			unique := f.unique.Add(2)
+			ctx, finish, status := f.raw.mutationContext(unique)
+			if !status.Ok() {
+				t.Fatalf("reserve READDIRPLUS publication: %v", status)
+			}
+			if err := f.raw.publishDirPlusPage(ctx, parent, candidates); err != nil {
+				t.Fatalf("publish READDIRPLUS page: %v", err)
+			}
+			for _, candidate := range candidates {
+				cached := candidate.entry.EntryValid != 0 && candidate.entry.AttrValid != 0
+				if cached != test.wantCached {
+					t.Fatalf("%q cached=%t with lifetimes entry=%d attr=%d, want cached=%t",
+						candidate.dirent.GetName(), cached, candidate.entry.EntryValid,
+						candidate.entry.AttrValid, test.wantCached)
+				}
+			}
+			f.raw.mu.Lock()
+			pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
+			f.raw.mu.Unlock()
+			if test.wantCached {
+				if pendingNames != 2 || pendingAttrs != 2 {
+					t.Fatalf("reserved page pending names/attrs = %d/%d, want 2/2", pendingNames, pendingAttrs)
+				}
+			} else if pendingNames != 0 || pendingAttrs != 0 {
+				t.Fatalf("degraded page partially reserved names/attrs = %d/%d, want 0/0", pendingNames, pendingAttrs)
+			}
+			finish()
+			completeTestReply(t, f.raw, unique, fuse.OK)
+		})
+	}
+}
+
+func TestReadDirPlusAdmissionTimeoutRollsBackWholePage(t *testing.T) {
+	f := newStrictFixture(t)
+	f.raw.requestTimeout = 15 * time.Millisecond
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	first, errno := f.raw.intern(context.Background(), testItem(100, authoritypb.Attr_DIRECTORY, 100))
+	if errno != 0 {
+		t.Fatalf("intern first canonical record: %v", errno)
+	}
+	second, errno := f.raw.intern(context.Background(), testItem(101, authoritypb.Attr_REGULAR, 101))
+	if errno != 0 {
+		t.Fatalf("intern second canonical record: %v", errno)
+	}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	pageItems := []*authoritypb.Item{
+		testItem(100, authoritypb.Attr_DIRECTORY, 200),
+		testItem(101, authoritypb.Attr_REGULAR, 201),
+	}
+	page := &authoritypb.ReadDirReply{Verifier: testToken(600), Eof: true}
+	for index, item := range pageItems {
+		item.ObjectVersion, item.SnapshotSequence = 9, 9
+		page.Entries = append(page.Entries, &authoritypb.Dirent{
+			Name: []byte{byte('a' + index)}, Attr: item.Attr, Item: item,
+			NextCookie: encodeCookie(uint64(index + 1)), ObjectVersion: 9, SnapshotSequence: 9,
+		})
+	}
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{page}
+	f.mount.reclaim.mu.Lock()
+	f.mount.reclaim.watermark = 1
+	f.mount.reclaim.mu.Unlock()
+
+	unique := f.unique.Add(2)
+	list := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: handleID}, list)
+	if status != fuse.Status(syscall.ETIMEDOUT) {
+		t.Fatalf("READDIRPLUS with a full cleanup lane = %v, want ETIMEDOUT", status)
+	}
+	// The error response itself may be written successfully. That is not a page
+	// commit: the kernel received no lookup-bearing records.
+	completeTestReply(t, f.raw, unique, fuse.OK)
+
+	f.raw.mu.Lock()
+	firstLookups, secondLookups := first.lookups, second.lookups
+	bound := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "a"}]
+	handleRecord := f.raw.handles[handleID]
+	inFlight := handleRecord.inFlight
+	f.raw.mu.Unlock()
+	if firstLookups != 1 || secondLookups != 1 {
+		t.Fatalf("canonical lookup counts after rollback = %d/%d, want 1/1", firstLookups, secondLookups)
+	}
+	if bound != nil {
+		t.Fatal("the provisional directory path was committed before a successful page write")
+	}
+	if inFlight != 0 {
+		t.Fatalf("directory handle operations after rollback = %d, want 0", inFlight)
+	}
+	handle.mu.Lock()
+	gotNext, gotPage, gotPending, gotTransaction := handle.next, len(handle.page), handle.pending, handle.plusReply
+	handle.mu.Unlock()
+	if gotNext != 0 || gotPage != 0 || gotPending != nil || gotTransaction != nil {
+		t.Fatalf("rolled-back cursor = next %d page %d pending %v transaction %p", gotNext, gotPage, gotPending, gotTransaction)
+	}
+	seen := map[string]int{}
+	for range 2 {
+		seen[fmt.Sprintf("%x", popReclaim(t, f.mount))]++
+	}
+	for _, token := range [][]byte{testToken(200), testToken(201)} {
+		if seen[fmt.Sprintf("%x", token)] != 1 {
+			t.Fatalf("page capability %x reclaimed %d times, want exactly once", token, seen[fmt.Sprintf("%x", token)])
+		}
+	}
+	if pending := f.mount.reclaim.pending(); pending != 0 {
+		t.Fatalf("unexpected extra capability reclaims after rollback: %d", pending)
+	}
+}
+
+func TestReadDirPlusPhysicalWriteFailureRollsBackWholePage(t *testing.T) {
+	f := newStrictFixture(t)
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	child, errno := f.raw.intern(context.Background(), testItem(100, authoritypb.Attr_DIRECTORY, 100))
+	if errno != 0 {
+		t.Fatalf("intern child: %v", errno)
+	}
+	item := testItem(100, authoritypb.Attr_DIRECTORY, 200)
+	item.ObjectVersion, item.SnapshotSequence = 9, 9
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{{
+		Verifier: testToken(600), Eof: true,
+		Entries: []*authoritypb.Dirent{{
+			Name: []byte("child"), Attr: item.Attr, Item: item, NextCookie: encodeCookie(1),
+			ObjectVersion: 9, SnapshotSequence: 9,
+		}},
+	}}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	unique := f.unique.Add(2)
+	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: handleID}, fuse.NewDirEntryList(make([]byte, 4096), 0)); !status.Ok() {
+		t.Fatalf("READDIRPLUS construction = %v", status)
+	}
+	completeTestReply(t, f.raw, unique, fuse.EIO)
+	f.raw.mu.Lock()
+	lookups := child.lookups
+	bound := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "child"}]
+	f.raw.mu.Unlock()
+	if lookups != 1 || bound != nil {
+		t.Fatalf("failed physical write left lookup/path ownership: lookups=%d bound=%v", lookups, bound != nil)
+	}
+	if got := fmt.Sprintf("%x", popReclaim(t, f.mount)); got != fmt.Sprintf("%x", testToken(200)) {
+		t.Fatalf("failed-write reclaim = %s, want page capability %x", got, testToken(200))
+	}
+}
+
+func TestWithdrawalBudgetTerminalizesNeverReportingReadDirPlusWriter(t *testing.T) {
+	f := newStrictFixture(t)
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	child, errno := f.raw.intern(context.Background(), testItem(100, authoritypb.Attr_DIRECTORY, 100))
+	if errno != 0 {
+		t.Fatalf("intern child: %v", errno)
+	}
+	item := testItem(100, authoritypb.Attr_DIRECTORY, 200)
+	item.ObjectVersion, item.SnapshotSequence = 9, 9
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{{
+		Verifier: testToken(600), Eof: true,
+		Entries: []*authoritypb.Dirent{{
+			Name: []byte("child"), Attr: item.Attr, Item: item,
+			NextCookie: encodeCookie(1), ObjectVersion: 9, SnapshotSequence: 9,
+		}},
+	}}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	unique := f.unique.Add(2)
+	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{Unique: unique}, Fh: handleID,
+	}, fuse.NewDirEntryList(make([]byte, 4096), 0)); !status.Ok() {
+		t.Fatalf("READDIRPLUS construction = %v", status)
+	}
+	if _, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 44, nil, nil, 0); !status.Ok() {
+		t.Fatalf("finalize READDIRPLUS reply = %v", status)
+	}
+	markTestReply(t, f.raw, unique)
+
+	fake := &fakeWithdrawal{installed: true}
+	ops := fake.ops()
+	done := make(chan struct{})
+	var closeDone sync.Once
+	realAbort := ops.abort
+	ops.abort = func(k kernelMount) error {
+		err := realAbort(k)
+		closeDone.Do(func() { close(done) })
+		return err
+	}
+	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
+	f.mount.kernelConnectionStarted = true
+	f.mount.kernelConnectionDone = done
+	f.mount.withdrawal = ops
+	f.mount.repairBudget = 15 * time.Millisecond
+
+	started := time.Now()
+	out := f.mount.withdrawKernelState()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("never-reporting writer blocked withdrawal for %v", elapsed)
+	}
+	if !out.withdrawn {
+		t.Fatalf("forced withdrawal did not prove kernel absence: %+v", out)
+	}
+	f.raw.mu.Lock()
+	terminal := f.raw.replyTerminal
+	pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
+	reservations := len(f.raw.cacheReservations)
+	lookups := child.lookups
+	bound := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "child"}]
+	f.raw.mu.Unlock()
+	if !terminal || pendingNames != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("terminal ownership state terminal=%t pending=%d/%d reservations=%d",
+			terminal, pendingNames, pendingAttrs, reservations)
+	}
+	if lookups != 1 || bound != nil {
+		t.Fatalf("connection-absent READDIRPLUS settlement lookups=%d bound=%t, want 1/false",
+			lookups, bound != nil)
+	}
+	if got := fmt.Sprintf("%x", popReclaim(t, f.mount)); got != fmt.Sprintf("%x", testToken(200)) {
+		t.Fatalf("connection-absent reclaim = %s, want %x", got, testToken(200))
+	}
+	if pending := f.mount.reclaim.pending(); pending != 0 {
+		t.Fatalf("connection-absent settlement queued %d duplicate reclaims", pending)
+	}
+
+	// A callback issued before the forced abort may arrive late, but exact
+	// connection absence has already made successful settlement impossible.
+	f.raw.ReplyWritten(unique, fuse.OK)
+	f.raw.mu.Lock()
+	lookups = child.lookups
+	reservations = len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if lookups != 1 || reservations != 0 {
+		t.Fatalf("late callback resurrected lookup/reservation ownership: %d/%d", lookups, reservations)
+	}
+}
+
+func TestReadDirPlusParserFailureForceForgetsEveryUnlinkedRecord(t *testing.T) {
+	f := newStrictFixture(t)
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	page := &authoritypb.ReadDirReply{Verifier: testToken(600), Eof: true}
+	for index, name := range []string{"linked", "failed", "tail"} {
+		item := testItem(uint64(100+index), authoritypb.Attr_DIRECTORY, uint64(200+index))
+		item.ObjectVersion, item.SnapshotSequence = 9, 9
+		page.Entries = append(page.Entries, &authoritypb.Dirent{
+			Name: []byte(name), Attr: item.Attr, Item: item,
+			NextCookie: encodeCookie(uint64(index + 1)), ObjectVersion: 9, SnapshotSequence: 9,
+		})
+	}
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{page}
+
+	unique := f.unique.Add(2)
+	list := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{Unique: unique}, Fh: handleID,
+	}, list); !status.Ok() {
+		t.Fatalf("READDIRPLUS construction = %v", status)
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+
+	records := make([]*inodeRecord, 0, 3)
+	f.raw.mu.Lock()
+	for index := range 3 {
+		record := f.raw.nodesByKey[inodeKey{inode: uint64(100 + index), kind: authoritypb.Attr_DIRECTORY}]
+		if record == nil || record.lookups != 1 {
+			f.raw.mu.Unlock()
+			t.Fatalf("physically accepted page record %d = %p lookups=%d, want one kernel lookup", index, record, func() uint64 {
+				if record == nil {
+					return 0
+				}
+				return record.lookups
+			}())
+		}
+		records = append(records, record)
+	}
+	f.raw.mu.Unlock()
+
+	// The parser linked record zero, failed record one, and force-forgot both
+	// that record and the valid tail before making the connection terminal.
+	f.raw.Forget(records[1].id, 1)
+	f.raw.Forget(records[2].id, 1)
+	f.raw.Forget(records[1].id, 1) // A repeated terminal signal is harmless.
+
+	f.raw.mu.Lock()
+	linkedLookups := records[0].lookups
+	_, failedLive := f.raw.nodesByID[records[1].id]
+	_, tailLive := f.raw.nodesByID[records[2].id]
+	_, linkedPath := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "linked"}]
+	_, failedPath := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "failed"}]
+	_, tailPath := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "tail"}]
+	f.raw.mu.Unlock()
+	if linkedLookups != 1 || !linkedPath {
+		t.Fatalf("linked prefix ownership = lookups %d path %t, want 1/true", linkedLookups, linkedPath)
+	}
+	if failedLive || tailLive || failedPath || tailPath {
+		t.Fatalf("force-forgotten ownership remains: live=%t/%t path=%t/%t", failedLive, tailLive, failedPath, tailPath)
+	}
+
+	wantReclaims := map[string]int{
+		fmt.Sprintf("%x", testToken(201)): 1,
+		fmt.Sprintf("%x", testToken(202)): 1,
+	}
+	for range 2 {
+		got := fmt.Sprintf("%x", popReclaim(t, f.mount))
+		wantReclaims[got]--
+	}
+	for token, count := range wantReclaims {
+		if count != 0 {
+			t.Fatalf("force-FORGET reclaim %s count delta = %d, want 0", token, count)
+		}
+	}
+	if pending := f.mount.reclaim.pending(); pending != 0 {
+		t.Fatalf("duplicate force-FORGET queued %d extra reclaims", pending)
+	}
+
+	// A parser failure has no partial-page publication receipt. Terminal
+	// detach releases the linked prefix and any force-FORGET lost to teardown.
+	f.mount.kernelMount = kernelMount{id: "999999996", device: "0:996", point: "/nonexistent-portablefs-dirplus-parser"}
+	done := make(chan struct{})
+	close(done)
+	f.mount.kernelConnectionDone = done
+	if err := f.mount.Close(); err != nil {
+		t.Fatalf("terminal parser detach: %v", err)
+	}
+	f.rpc.mu.Lock()
+	detaches := len(f.rpc.detachProofs)
+	f.rpc.mu.Unlock()
+	if detaches != 1 {
+		t.Fatalf("terminal parser detach proofs = %d, want 1", detaches)
+	}
+	f.raw.mu.Lock()
+	pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
+	reservations := len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if pendingNames != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("terminal page candidate ownership = names %d attrs %d reservations %d, want zero", pendingNames, pendingAttrs, reservations)
+	}
+}
+
+func TestFinalizedReplyWaitExpiresInsideRepairBudgetAndFencesParticipant(t *testing.T) {
+	f := newStrictFixture(t)
+	f.mount.repairBudget = 20 * time.Millisecond
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "stuck")
+	record := f.raw.acquire(entry.NodeId)
+	if record == nil {
+		t.Fatal("lookup record was not retained")
+	}
+	identity := record.identity
+	inode := record.key.inode
+	f.raw.release(record)
+	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
+	publication := &replyPublication{originalDone: make(chan struct{})}
+	reservation := &cacheInstallReservation{
+		publication: publication, coordinate: coordinate, snapshot: 7,
+		state: cacheReservationFinalized,
+	}
+	f.raw.mu.Lock()
+	f.raw.cacheReservations[coordinate] = map[*cacheInstallReservation]struct{}{reservation: {}}
+	f.raw.mu.Unlock()
+
+	targets := []*authoritypb.VisibilityTarget{inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, inode, 0)}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(8, targets...), false, 8)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	started := time.Now()
+	err = f.raw.finishVisibilityComplete(context.Background(), completion)
+	if err == nil || !strings.Contains(err.Error(), "exceeded visibility repair budget") {
+		t.Fatalf("stuck FINALIZED wait = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("stuck FINALIZED wait blocked for %v", elapsed)
+	}
+	if !f.mount.isRevoked() {
+		t.Fatal("repair-budget expiry did not fence this participant")
+	}
+}
+
+func TestPendingLookupCandidateRevokedBeforePhysicalReplyHasZeroLifetime(t *testing.T) {
+	f := newStrictFixture(t)
+	const unique = 600
+	out := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "raced", out); !status.Ok() {
+		t.Fatalf("LOOKUP = %v", status)
+	}
+	if out.EntryValid == 0 {
+		t.Fatal("LOOKUP was not initially admitted")
+	}
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "raced")}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE = %v", err)
+	}
+	outData := make([]byte, 128)
+	outData[16], outData[24] = 1, 1
+	payload := make([]byte, fuse.PFSCacheStampSize)
+	n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1, outData, payload, 0)
+	if !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize LOOKUP = (%d, %v)", n, status)
+	}
+	if outData[16] != 0 {
+		t.Fatal("peer repair between admission and reply write left a nonzero entry lifetime")
+	}
+	f.raw.ReplyWritten(unique, fuse.EIO)
+}
+
+func TestNotNewerLookupIsSilentlyDropped(t *testing.T) {
+	f := newStrictFixture(t)
+	nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: publicationIdentity(testIdentity(1)), name: "old"}
+	attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(testIdentity(42))}
+	f.raw.mu.Lock()
+	f.raw.lastPeerRepairSequence[nameCoordinate] = 1
+	f.raw.lastPeerRepairSequence[attrCoordinate] = 1
+	f.raw.mu.Unlock()
+	const unique = 602
+	out := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "old", out); !status.Ok() {
+		t.Fatalf("not-newer LOOKUP returned protocol error %v", status)
+	}
+	if out.EntryValid != 0 || out.AttrValid != 0 {
+		t.Fatalf("not-newer LOOKUP lifetimes = entry %d attr %d, want zero", out.EntryValid, out.AttrValid)
+	}
+	completeTestReply(t, f.raw, unique, fuse.OK)
+	if f.mount.isRevoked() {
+		t.Fatalf("not-newer LOOKUP revoked mount: %v", f.mount.fatalError())
+	}
+	f.raw.mu.Lock()
+	_, cached := f.raw.cachedNames[nameKey{parent: 1, name: "old"}]
+	f.raw.mu.Unlock()
+	if cached {
+		t.Fatal("not-newer LOOKUP entered the cache registry")
 	}
 }
 
@@ -1032,7 +1615,7 @@ func TestCompleteExpiresACachedAbsenceForACreatedName(t *testing.T) {
 	unique := f.unique.Add(2)
 	inWindow := &fuse.EntryOut{}
 	status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "appeared", inWindow)
-	if status != fuse.Status(syscall.ENOENT) || inWindow.EntryValid != 0 || inWindow.EntryValidNsec != 0 {
+	if !status.Ok() || inWindow.NodeId != 0 || inWindow.EntryValid != 0 || inWindow.EntryValidNsec != 0 {
 		t.Fatalf("in-window probe = %v with lifetime %d.%09d; re-caching an absence inside the barrier window is exactly what the barrier exists to prevent",
 			status, inWindow.EntryValid, inWindow.EntryValidNsec)
 	}
@@ -1041,7 +1624,7 @@ func TestCompleteExpiresACachedAbsenceForACreatedName(t *testing.T) {
 	}
 	f.raw.ReplyWritten(unique, fuse.OK)
 	acknowledgeTestPublication(t, f.raw, unique)
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	calls := f.notify.snapshot()
@@ -1058,6 +1641,7 @@ func TestCompleteExpiresACachedAbsenceForACreatedName(t *testing.T) {
 		t.Fatal("the repaired absence is still recorded, so a second event would spend another notification on nothing")
 	}
 	// Admission reopens on COMPLETE, not on a timer.
+	f.setReadSequence(2)
 	f.unmarkMissing("appeared")
 	if out := f.lookup(t, fuse.FUSE_ROOT_ID, "appeared"); out.EntryValid == 0 {
 		t.Fatal("cache admission was not reopened by COMPLETE")
@@ -1115,8 +1699,8 @@ func TestCachedAbsencesAreBoundedByTheirDeclaredShare(t *testing.T) {
 			cached++
 			continue
 		}
-		if status != fuse.Status(syscall.ENOENT) || out.EntryValid != 0 {
-			t.Fatalf("refused absence %q = %v with lifetime %d; beyond the bound the only legal answer is an uncacheable ENOENT", name, status, out.EntryValid)
+		if !status.Ok() || out.NodeId != 0 || out.EntryValid != 0 {
+			t.Fatalf("refused absence %q = %v with NodeId %d and lifetime %d; capacity changes only lifetime, never the structured negative shape", name, status, out.NodeId, out.EntryValid)
 		}
 	}
 	if cached != share {
@@ -1297,7 +1881,7 @@ func TestOpenBetweenPrepareAndCompleteWaitsForTheDataCut(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	select {
@@ -1313,14 +1897,15 @@ func TestOpenBetweenPrepareAndCompleteWaitsForTheDataCut(t *testing.T) {
 	}
 }
 
-func TestPrepareDrainsAnAlreadyAdmittedDataPublication(t *testing.T) {
+func TestPrepareDoesNotWaitForAnUnwrittenOpenWithoutInstalledPages(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
 
-	// Admitted before the cut closes, still unwritten. PREPARE must not be
-	// acknowledged while a reply that grants cacheability is in flight, or the
-	// grant could land in the kernel after COMPLETE had already repaired.
+	// An OPEN reply installs no cache entry or page. A peer cut therefore need
+	// not wait for its physical write; reads which may populate pages remain
+	// ordered separately, and a successful write records the later withdrawal
+	// obligation before COMPLETE resolves the target.
 	unique := f.unique.Add(2)
 	out := &fuse.OpenOut{}
 	if status := f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Flags: syscall.O_RDONLY}, out); !status.Ok() {
@@ -1330,25 +1915,16 @@ func TestPrepareDrainsAnAlreadyAdmittedDataPublication(t *testing.T) {
 	targets := []*authoritypb.VisibilityTarget{
 		inodeVisibilityTarget(authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, 72, 16),
 	}
-	prepared := make(chan error, 1)
-	go func() { prepared <- f.raw.prepareVisibility(context.Background(), targets, false) }()
-	select {
-	case err := <-prepared:
-		t.Fatalf("PREPARE drained before the in-flight retained-data reply was written (err=%v)", err)
-	case <-time.After(50 * time.Millisecond):
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("PREPARE: %v", err)
 	}
 
 	completeTestReply(t, f.raw, unique, fuse.OK)
-	select {
-	case err := <-prepared:
-		if err != nil {
-			t.Fatalf("PREPARE: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("PREPARE never drained the settled retained-data publication")
-	}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "size" {
+		t.Fatalf("DATA repair after OPEN publication = %+v, want one exact size/attr transaction", calls)
 	}
 }
 
@@ -1368,7 +1944,7 @@ func TestForgetReleasesTheDataWithdrawalObligation(t *testing.T) {
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatalf("PREPARE: %v", err)
 	}
-	if err := f.raw.completeVisibility(targets, false); err != nil {
+	if err := f.raw.completeVisibility(exactVisibilityTargets(1, targets...), false); err != nil {
 		t.Fatalf("COMPLETE: %v", err)
 	}
 	if !f.raw.cachedDataHolds(72) {

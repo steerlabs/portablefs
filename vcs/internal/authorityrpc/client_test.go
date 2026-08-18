@@ -3546,11 +3546,16 @@ func TestNextVisibilityAfterAckReconnectsAfterAcceptedAckLostBeforeNext(t *testi
 
 	execute := func(source volumeserver.SessionID, sequence uint64) <-chan error {
 		result := make(chan error, 1)
+		complete := target
+		complete.ExactPostState = &volumeserver.VisibilityObjectPostState{
+			StableIdentity: target.Identity, ObjectVersion: sequence + 1, Roles: 1,
+			Attr: volumeserver.VisibilityAttr{Kind: 1, Inode: target.KernelIno},
+		}
 		go func() {
 			result <- visibility.Execute(context.Background(), source, volumeserver.MutationID{Sequence: sequence},
 				volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{target}),
 				func() ([]volumeserver.VisibilityTarget, error) { return []volumeserver.VisibilityTarget{target}, nil },
-				func() ([]volumeserver.VisibilityTarget, bool) { return []volumeserver.VisibilityTarget{target}, true })
+				func() ([]volumeserver.VisibilityTarget, bool) { return []volumeserver.VisibilityTarget{complete}, true })
 		}()
 		return result
 	}

@@ -56,29 +56,39 @@ func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.Vis
 // is published. The daemon consumes that internal response, waits for the exact
 // pending repair, and reissues the request inside the same FUSE callback.
 func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) error {
-	coordinator := h.strictCache(id)
-	if coordinator == nil {
-		return nil
-	}
-	identity, err := h.Store.Identity(item)
-	if err != nil {
-		return err
-	}
-	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	_, err := h.stabilizeItemSequence(ctx, id, item)
 	return err
 }
 
-func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) error {
+func (h *VolumeHandler) stabilizeItemSequence(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) (uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return nil
+		return 1, nil
+	}
+	identity, err := h.Store.Identity(item)
+	if err != nil {
+		return 0, err
+	}
+	_, sequence, err := coordinator.StabilizeSequence(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	return sequence, err
+}
+
+func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) error {
+	_, err := h.stabilizeOpenSequence(ctx, id, handle)
+	return err
+}
+
+func (h *VolumeHandler) stabilizeOpenSequence(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) (uint64, error) {
+	coordinator := h.strictCache(id)
+	if coordinator == nil {
+		return 1, nil
 	}
 	identity, err := h.Store.IdentityOpen(handle)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
-	return err
+	_, sequence, err := coordinator.StabilizeSequence(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	return sequence, err
 }
 
 // lookupForSession answers one name resolution. For a strict mount the answer
@@ -86,14 +96,15 @@ func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.Sessi
 // caches too - so the binding is recorded either way, and the inode the name
 // resolved to is recorded as well because it is only knowable after the read.
 // A read that raced a mutation on either coordinate is discarded and retried.
-func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.SessionID, parent xfsstore.Capability, name []byte) (xfsstore.Capability, xfsstore.Attr, error) {
+func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.SessionID, parent xfsstore.Capability, name []byte) (xfsstore.Capability, xfsstore.Attr, uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return h.Store.Lookup(parent, string(name))
+		item, attr, err := h.Store.Lookup(parent, string(name))
+		return item, attr, 1, err
 	}
 	parentIdentity, err := h.Store.Identity(parent)
 	if err != nil {
-		return xfsstore.Capability{}, xfsstore.Attr{}, err
+		return xfsstore.Capability{}, xfsstore.Attr{}, 0, err
 	}
 	for range maxStabilizeAttempts {
 		item, attr, lookupErr := h.Store.Lookup(parent, string(name))
@@ -102,11 +113,11 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 			identity, identityErr := h.Store.Identity(item)
 			if identityErr != nil {
 				_ = h.Store.Forget(item)
-				return xfsstore.Capability{}, xfsstore.Attr{}, identityErr
+				return xfsstore.Capability{}, xfsstore.Attr{}, 0, identityErr
 			}
 			resolution.Identity = identity
 		}
-		waited, err := coordinator.Stabilize(ctx, id, resolution)
+		waited, sequence, err := coordinator.StabilizeSequence(ctx, id, resolution)
 		if errors.Is(err, volumeserver.ErrVisibilityRetry) {
 			// Lookup already owns a bounded discard-and-reread loop. Unlike item
 			// reads, no answer has left this authority request, so let the concurrent
@@ -114,57 +125,49 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 			waited, err = true, nil
 		}
 		if err == nil && !waited {
-			return item, attr, lookupErr
+			return item, attr, sequence, lookupErr
 		}
 		if lookupErr == nil {
 			_ = h.Store.Forget(item)
 		}
 		if err != nil {
-			return xfsstore.Capability{}, xfsstore.Attr{}, err
+			return xfsstore.Capability{}, xfsstore.Attr{}, 0, err
 		}
 	}
-	return xfsstore.Capability{}, xfsstore.Attr{}, syscall.EAGAIN
+	return xfsstore.Capability{}, xfsstore.Attr{}, 0, syscall.EAGAIN
 }
 
-// stabilizeDirectoryPage covers one page of an enumeration. A strict frontend
-// caches the names it enumerated and the state of the inodes behind them, so
-// every one of those coordinates is resolved and recorded before the page is
-// built. Resolving each child costs an extra open/stat/close, which is why it
-// only happens for a strict mount.
-func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, parent xfsstore.Capability, entries []xfsstore.Dirent) (bool, error) {
+// stabilizeDirectoryPage takes one cut over the complete candidate page. The
+// caller has already sampled every name, identity, attr, and object version;
+// after this cut it revalidates those same facts before publishing any of them.
+func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, parent xfsstore.Capability, candidates []directoryPageCandidate) (bool, uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return false, nil
+		return false, 1, nil
 	}
 	directory, err := h.Store.IdentityOpen(dir)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	if parent == (xfsstore.Capability{}) {
-		return false, syscall.ESTALE
+		return false, 0, syscall.ESTALE
 	}
-	resolutions := make([]volumeserver.VisibilityResolution, 0, len(entries)+1)
+	resolutions := make([]volumeserver.VisibilityResolution, 0, len(candidates)+1)
 	resolutions = append(resolutions, volumeserver.VisibilityResolution{Identity: directory})
-	for _, entry := range entries {
-		resolution := volumeserver.VisibilityResolution{Parent: directory, Name: []byte(entry.Name)}
-		// An entry whose inode cannot be resolved - it was unlinked under the
-		// enumeration, or it is a type this authority never exposes as an object
-		// - contributes its name and nothing else. There is no inode state the
-		// frontend could be caching for it, so omitting the inode coordinate
-		// cannot hide one. The reply loop and the trailing verifier check still
-		// report the entry itself as stale if it really went away.
-		if coordinate, found, err := h.lookupCoordinate(parent, []byte(entry.Name)); err == nil && found {
-			resolution.Identity = coordinate.identity
+	for _, candidate := range candidates {
+		resolution := volumeserver.VisibilityResolution{
+			Parent: directory, Name: []byte(candidate.enumerated.Name),
+			Identity: candidate.identity,
 		}
 		resolutions = append(resolutions, resolution)
 	}
-	waited, err := coordinator.Stabilize(ctx, id, resolutions...)
+	waited, sequence, err := coordinator.StabilizeSequence(ctx, id, resolutions...)
 	if errors.Is(err, volumeserver.ErrVisibilityRetry) {
 		// Readdir's caller discards the page and repeats this bounded loop while
 		// the independent CONTROL lane acknowledges the pending PREPARE.
-		return true, nil
+		return true, 0, nil
 	}
-	return waited, err
+	return waited, sequence, err
 }
 
 func coherenceProfile(profile authoritypb.CoherenceProfile) (volumeserver.CoherenceProfile, error) {
@@ -251,6 +254,12 @@ func visibilityCursorProto(cursor volumeserver.VisibilityCursor) *authoritypb.Vi
 // rather than absent. Emitting a field the scope does not define is therefore
 // an encoder defect, not decoder pedantry.
 func visibilityTargetProto(target volumeserver.VisibilityTarget) *authoritypb.VisibilityTarget {
+	withExact := func(wire *authoritypb.VisibilityTarget) *authoritypb.VisibilityTarget {
+		if target.ExactPostState != nil {
+			wire.ExactPostState = visibilityObjectPostStateProto(target.ExactPostState)
+		}
+		return wire
+	}
 	switch target.Scope {
 	case volumeserver.VisibilityNamespace:
 		wire := visibilitywire.Namespace(target.ParentIdentity[:], target.Name, target.ParentKernelIno, target.Device)
@@ -259,15 +268,114 @@ func visibilityTargetProto(target volumeserver.VisibilityTarget) *authoritypb.Vi
 		}
 		return wire
 	case volumeserver.VisibilityData:
-		return visibilitywire.Data(target.Identity[:], target.KernelIno, target.Device, target.Size)
+		return withExact(visibilitywire.Data(target.Identity[:], target.KernelIno, target.Device, target.Size))
 	case volumeserver.VisibilityAttributes:
-		return visibilitywire.Attributes(target.Identity[:], target.KernelIno, target.Device)
+		return withExact(visibilitywire.Attributes(target.Identity[:], target.KernelIno, target.Device))
 	default:
 		// An unknown scope cannot be encoded as anything a decoder would act
 		// on. Emit only the unspecified scope so every receiver fails closed
 		// on this exact target instead of repairing a guessed coordinate.
 		return &authoritypb.VisibilityTarget{}
 	}
+}
+
+func visibilityObjectPostStateProto(state *volumeserver.VisibilityObjectPostState) *authoritypb.ObjectPostState {
+	if state == nil {
+		return nil
+	}
+	attr := state.Attr
+	return &authoritypb.ObjectPostState{
+		StableIdentity: append([]byte(nil), state.StableIdentity[:]...),
+		ObjectVersion:  state.ObjectVersion,
+		Roles:          state.Roles,
+		Attr: &authoritypb.Attr{
+			Kind: authoritypb.Attr_Kind(attr.Kind), Inode: attr.Inode, Size: attr.Size,
+			Blocks: attr.Blocks, Mode: attr.Mode, Uid: attr.UID, Gid: attr.GID,
+			Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS,
+			CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS, Rdev: attr.Rdev,
+			Blksize: attr.Blksize, Flags: attr.Flags,
+		},
+	}
+}
+
+func visibilityObjectPostState(object *authoritypb.ObjectPostState) *volumeserver.VisibilityObjectPostState {
+	if object == nil || len(object.GetStableIdentity()) != 16 || object.GetAttr() == nil {
+		return nil
+	}
+	attr := object.GetAttr()
+	state := &volumeserver.VisibilityObjectPostState{
+		ObjectVersion: object.GetObjectVersion(), Roles: object.GetRoles(),
+		Attr: volumeserver.VisibilityAttr{
+			Kind: uint32(attr.GetKind()), Inode: attr.GetInode(), Size: attr.GetSize(),
+			Blocks: attr.GetBlocks(), Mode: attr.GetMode(), UID: attr.GetUid(), GID: attr.GetGid(),
+			Nlink: attr.GetNlink(), ATimeNS: attr.GetAtimeNs(), MTimeNS: attr.GetMtimeNs(),
+			CTimeNS: attr.GetCtimeNs(), BirthTimeNS: attr.GetBirthTimeNs(), Rdev: attr.GetRdev(),
+			Blksize: attr.GetBlksize(), Flags: attr.GetFlags(),
+		},
+	}
+	copy(state.StableIdentity[:], object.GetStableIdentity())
+	return state
+}
+
+// attachExactRepairPostState binds each repaired inode coordinate to the exact
+// object record already retained for the source reply. The visibility event is
+// constructed before that reply is released, so this never takes a second
+// snapshot and never guesses which object a coordinate names.
+func attachExactRepairPostState(
+	targets []volumeserver.VisibilityTarget,
+	state *authoritypb.PostState,
+	sequence uint64,
+	changedIdentities map[[16]byte]struct{},
+) error {
+	if !validPostStateShape(state, true) || state.GetVisibilitySequence() != sequence {
+		return errors.New("authorityrpc: visible mutation has no exact repair post-state")
+	}
+	if changedIdentities == nil {
+		return fmt.Errorf("%w: exact mutation record omitted its changed-identity set", volumeserver.ErrVisibilityTargets)
+	}
+	coverage := make(map[[16]byte]volumeserver.VisibilityTarget, len(targets))
+	for _, target := range targets {
+		if target.Scope == volumeserver.VisibilityNamespace {
+			continue
+		}
+		coverage[target.Identity] = target
+	}
+	objects := make(map[[16]byte]*authoritypb.ObjectPostState, len(state.GetObjects()))
+	for _, object := range state.GetObjects() {
+		var identity [16]byte
+		copy(identity[:], object.GetStableIdentity())
+		objects[identity] = object
+	}
+	for identity := range changedIdentities {
+		object := objects[identity]
+		target, ok := coverage[identity]
+		if object == nil || !ok ||
+			target.KernelIno != object.GetAttr().GetInode() ||
+			target.Scope == volumeserver.VisibilityData && target.Size != object.GetAttr().GetSize() {
+			return fmt.Errorf("%w: changed post-state object %x has no matching COMPLETE repair target", volumeserver.ErrVisibilityTargets, identity)
+		}
+	}
+	exactCount := 0
+	for index := range targets {
+		target := &targets[index]
+		if target.Scope == volumeserver.VisibilityNamespace {
+			if target.ExactPostState != nil {
+				return errors.New("authorityrpc: namespace repair carried attribute post-state")
+			}
+			continue
+		}
+		exactCount++
+		object := objects[target.Identity]
+		if object == nil || object.GetObjectVersion() == 0 || object.GetObjectVersion() > sequence || object.GetAttr().GetInode() != target.KernelIno ||
+			target.Scope == volumeserver.VisibilityData && object.GetAttr().GetSize() != target.Size {
+			return fmt.Errorf("%w: repair coordinate %x has no matching exact mutation record", volumeserver.ErrVisibilityTargets, target.Identity)
+		}
+		target.ExactPostState = visibilityObjectPostState(object)
+	}
+	if exactCount > 4 {
+		return errors.New("authorityrpc: exact repair exceeds four object records")
+	}
+	return nil
 }
 
 // normalizeVisibilityTargets gives every cache coordinate exactly one repair
@@ -406,6 +514,9 @@ func validateAuthorityVisibilityTarget(target volumeserver.VisibilityTarget) err
 		if target.KernelIno != 0 {
 			return errors.New("namespace target carries an object kernel inode")
 		}
+		if target.ExactPostState != nil {
+			return errors.New("namespace target carries exact object post-state")
+		}
 		if target.ParentKernelIno == 0 {
 			return errors.New("namespace target carries no parent kernel inode")
 		}
@@ -440,6 +551,13 @@ func validateAuthorityVisibilityTarget(target volumeserver.VisibilityTarget) err
 		}
 		if target.ParentKernelIno != 0 {
 			return errors.New("inode target carries a parent kernel inode")
+		}
+		if exact := target.ExactPostState; exact != nil {
+			if exact.StableIdentity != target.Identity || exact.ObjectVersion == 0 ||
+				exact.Attr.Inode != target.KernelIno || exact.Roles == 0 ||
+				(target.Scope == volumeserver.VisibilityData && exact.Attr.Size != target.Size) {
+				return errors.New("inode target carries mismatched exact object post-state")
+			}
 		}
 		if target.Scope == volumeserver.VisibilityData && target.Size < 0 {
 			return errors.New("data target carries a negative size")

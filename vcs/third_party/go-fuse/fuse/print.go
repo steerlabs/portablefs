@@ -5,6 +5,7 @@
 package fuse
 
 import (
+	"encoding/binary"
 	"fmt"
 	"os"
 	"strings"
@@ -334,7 +335,8 @@ func (o *NotifyPruneOut) string() string {
 }
 
 func (o *NotifyPFSSizeOut) string() string {
-	return fmt.Sprintf("{nodeid=%d size=%d sequence=%d}", o.Nodeid, o.Size, o.Sequence)
+	return fmt.Sprintf("{nodeid=%d size=%d sequence=%d}", o.Object.Nodeid,
+		binary.LittleEndian.Uint64(o.Object.Attr[8:16]), o.VisibilitySequence)
 }
 
 func (f *FallocateIn) string() string {

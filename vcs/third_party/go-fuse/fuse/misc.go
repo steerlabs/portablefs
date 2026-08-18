@@ -37,6 +37,10 @@ func (code Status) String() string {
 			return "NOTIFY_PRUNE"
 		case NOTIFY_PFS_SIZE:
 			return "NOTIFY_PFS_SIZE"
+		case NOTIFY_PFS_ATTR:
+			return "NOTIFY_PFS_ATTR"
+		case NOTIFY_PFS_ENTRY:
+			return "NOTIFY_PFS_ENTRY"
 		}
 		return fmt.Sprintf("NOTIFY_%d", -int(code))
 	}

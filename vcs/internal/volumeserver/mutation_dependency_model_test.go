@@ -507,7 +507,7 @@ func TestVisibilityCoordinatorAppliesDisjointInodesConcurrently(t *testing.T) {
 				func(chosen uint64) ([]VisibilityTarget, bool) {
 					entered <- identity
 					<-release
-					return []VisibilityTarget{{Scope: VisibilityData, Identity: modelInode(identity)}}, true
+					return testExactVisibilityTargets(chosen, []VisibilityTarget{{Scope: VisibilityData, Identity: modelInode(identity)}}), true
 				},
 				func() ([]VisibilityResolution, error) { return nil, nil },
 			)
@@ -553,7 +553,7 @@ func TestVisibilityDisjointPeerBarriersAndStabilizeProceedIndependently(t *testi
 	start := func(source SessionID, identity [16]byte, applied chan<- struct{}, release <-chan struct{}) {
 		targets := []VisibilityTarget{{Scope: VisibilityData, Identity: identity, KernelIno: uint64(identity[0]), Device: 1}}
 		go func() {
-			results <- h.coordinator.Execute(
+			results <- executeTestExact(h.coordinator,
 				context.Background(), source, MutationID{Sequence: uint64(identity[0])},
 				mutationDependenciesForTargets(targets),
 				func() ([]VisibilityTarget, error) { return targets, nil },
@@ -657,7 +657,7 @@ func TestVisibilityStabilizeUnwindsCrossMountPrepareCycle(t *testing.T) {
 	start := func(source SessionID, identity [16]byte) {
 		targets := []VisibilityTarget{{Scope: VisibilityData, Identity: identity, KernelIno: uint64(identity[0]), Device: 1}}
 		go func() {
-			results <- h.coordinator.Execute(
+			results <- executeTestExact(h.coordinator,
 				context.Background(), source, MutationID{Sequence: uint64(identity[0])},
 				mutationDependenciesForTargets(targets),
 				func() ([]VisibilityTarget, error) { return targets, nil },
@@ -785,7 +785,7 @@ func TestVisibilityLaneTicketsPreventMultiAudienceStarvation(t *testing.T) {
 	start := func(ctx context.Context, source SessionID, sequence uint64, targets []VisibilityTarget) mutationRun {
 		result := make(chan error, 1)
 		go func() {
-			result <- h.coordinator.Execute(
+			result <- executeTestExact(h.coordinator,
 				ctx, source, MutationID{Sequence: sequence}, mutationDependenciesForTargets(targets),
 				func() ([]VisibilityTarget, error) { return targets, nil },
 				func() ([]VisibilityTarget, bool) { return targets, true },
@@ -939,7 +939,7 @@ func TestVisibilityLaneWaitCancellationReleasesReservation(t *testing.T) {
 	start := func(ctx context.Context, source SessionID, sequence uint64, targets []VisibilityTarget) <-chan error {
 		result := make(chan error, 1)
 		go func() {
-			result <- h.coordinator.Execute(ctx, source, MutationID{Sequence: sequence}, mutationDependenciesForTargets(targets),
+			result <- executeTestExact(h.coordinator, ctx, source, MutationID{Sequence: sequence}, mutationDependenciesForTargets(targets),
 				func() ([]VisibilityTarget, error) { return targets, nil },
 				func() ([]VisibilityTarget, bool) { return targets, true })
 		}()

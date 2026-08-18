@@ -5,14 +5,29 @@ package fusev3
 import (
 	"bytes"
 	"math"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
+
+type blockingResponseConsumption struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingResponseConsumption) Consume() {
+	if c.calls.Add(1) == 1 {
+		close(c.entered)
+	}
+	<-c.release
+}
 
 type sharedRangeFile struct {
 	item   *authoritypb.Item
@@ -46,6 +61,27 @@ func openSharedRangeFile(t *testing.T, fixture *strictFixture, name string, inod
 		t.Fatalf("OPEN %q flags = %#x, want %#x", name, out.OpenFlags, coherentOpenFlags)
 	}
 	return sharedRangeFile{item: item, nodeID: entry.NodeId, handle: out.Fh, token: testToken(handleToken)}
+}
+
+func testCopyPostState(sequence uint64, source, destination sharedRangeFile, postSize int64) *authoritypb.PostState {
+	sourceItem := cloneItem(source.item)
+	destinationItem := cloneItem(destination.item)
+	destinationItem.Attr.Size = postSize
+	if bytes.Equal(sourceItem.GetStableIdentity(), destinationItem.GetStableIdentity()) {
+		return exactTestPostState(sequence, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{destinationItem, postStateRoleSource | postStateRoleDestination})
+	}
+	return exactTestPostState(sequence,
+		struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{sourceItem, postStateRoleSource},
+		struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{destinationItem, postStateRoleDestination})
 }
 
 func assertExactDataAttrGate(t *testing.T, gate *authoritypb.SourcePublicationGate, items ...*authoritypb.Item) {
@@ -130,7 +166,7 @@ func TestPFSFallocateMapsExactGateAndPublishesAppliedResult(t *testing.T) {
 			Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
 				PostSize: 12, VisibilitySequence: 33, Flags: fuse.PFS_RANGE_OUT_APPLIED,
 			}},
-			PostAttr: &authoritypb.Attr{Inode: 41, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 12},
+			PostState: testMutationPostState(&authoritypb.Attr{Inode: 41, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 12}),
 		}, nil
 	}
 	unique := fixture.unique.Add(2)
@@ -210,7 +246,7 @@ func TestPFSFallocateEveryFrozenModeMapsUnchangedAndPublishesExactSize(t *testin
 					Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
 						PostSize: test.postSize, VisibilitySequence: 35, Flags: fuse.PFS_RANGE_OUT_APPLIED,
 					}},
-					PostAttr: &authoritypb.Attr{Inode: 44, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(test.postSize)},
+					PostState: testMutationPostState(&authoritypb.Attr{Inode: 44, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(test.postSize)}),
 				}, nil
 			}
 			unique := fixture.unique.Add(2)
@@ -354,7 +390,7 @@ func TestPFSFallocatePostDispatchErrorPublishesExactAppliedState(t *testing.T) {
 				Flags: fuse.PFS_RANGE_OUT_APPLIED | fuse.PFS_RANGE_OUT_POSTAPPLY_ERROR,
 				Error: -int32(syscall.ENOSPC),
 			}},
-			PostAttr: &authoritypb.Attr{Inode: 43, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 8},
+			PostState: testMutationPostState(&authoritypb.Attr{Inode: 43, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 8}),
 		}, nil
 	}
 	unique := fixture.unique.Add(2)
@@ -408,7 +444,7 @@ func TestPFSFallocateMalformedSuccessfulPostStateFences(t *testing.T) {
 					Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
 						PostSize: test.postSize, VisibilitySequence: 36, Flags: fuse.PFS_RANGE_OUT_APPLIED,
 					}},
-					PostAttr: &authoritypb.Attr{Inode: 45, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(test.postSize)},
+					PostState: testMutationPostState(&authoritypb.Attr{Inode: 45, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(test.postSize)}),
 				}, nil
 			}
 			in := &fuse.PFSFallocateIn{
@@ -428,6 +464,71 @@ func TestPFSFallocateMalformedSuccessfulPostStateFences(t *testing.T) {
 	}
 }
 
+func TestPFSFallocateMalformedCleanupTransfersResponseBeforeTerminalTeardown(t *testing.T) {
+	fixture := newStrictFixture(t)
+	file := openSharedRangeFile(t, fixture, "file", 47, 147, 247)
+	// Drive teardown explicitly after callback cleanup has entered Consume. The
+	// production revoke schedules the same terminalizer, but pre-claiming its
+	// goroutine makes the disputed ownership interleaving deterministic.
+	fixture.mount.abort.Do(func() {})
+	consumption := &blockingResponseConsumption{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	fixture.rpc.retainedConsumption = consumption
+	fixture.rpc.replyOverride = func(*authoritypb.Request) (*authoritypb.Response, error) {
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
+				PostSize: 16, VisibilitySequence: 38, Flags: fuse.PFS_RANGE_OUT_APPLIED,
+			}},
+			PostState: testMutationPostState(&authoritypb.Attr{
+				Inode: 47, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 16,
+			}),
+		}, nil
+	}
+	status := make(chan fuse.Status, 1)
+	go func() {
+		status <- fixture.raw.PFSFallocate(nil, &fuse.PFSFallocateIn{
+			InHeader: fuse.InHeader{Unique: fixture.unique.Add(2), NodeId: file.nodeID},
+			Fh:       file.handle, Offset: 8, Length: 8, RlimitFsize: 64, FileMaxSize: 64,
+			Mode: uint32(unix.FALLOC_FL_INSERT_RANGE),
+		}, &fuse.PFSRangeOut{})
+	}()
+
+	select {
+	case <-consumption.entered:
+	case <-time.After(time.Second):
+		t.Fatal("malformed callback did not claim response consumption")
+	}
+	terminalDone := make(chan bool, 1)
+	go func() {
+		terminalDone <- fixture.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
+	}()
+	select {
+	case joined := <-terminalDone:
+		if !joined {
+			t.Fatal("terminal teardown did not settle the malformed publication")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("terminal teardown attempted to consume the callback-owned response")
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("response consumption owners = %d, want callback only", got)
+	}
+	close(consumption.release)
+	select {
+	case got := <-status:
+		if got != fuse.Status(syscall.ENOTCONN) {
+			t.Fatalf("malformed successful PFS_FALLOCATE = %v, want ENOTCONN", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("malformed callback did not return after releasing response consumption")
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("settled response consumed %d times, want once", got)
+	}
+}
+
 func TestPFSFallocateCollapseAcceptsExactFileMaximumBoundary(t *testing.T) {
 	fixture := newStrictFixture(t)
 	file := openSharedRangeFile(t, fixture, "collapse-boundary", 46, 146, 246)
@@ -437,7 +538,7 @@ func TestPFSFallocateCollapseAcceptsExactFileMaximumBoundary(t *testing.T) {
 			Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
 				PostSize: fileMax - length, VisibilitySequence: 37, Flags: fuse.PFS_RANGE_OUT_APPLIED,
 			}},
-			PostAttr: &authoritypb.Attr{Inode: 46, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(fileMax - length)},
+			PostState: testMutationPostState(&authoritypb.Attr{Inode: 46, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(fileMax - length)}),
 		}, nil
 	}
 	unique := fixture.unique.Add(2)
@@ -469,7 +570,7 @@ func TestPFSCopyFileRangeMapsTwoDataDependenciesAndPublishesDestination(t *testi
 			Body: &authoritypb.Response_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeReply{
 				ResultSize: 5, PostSize: 15, VisibilitySequence: 39, Flags: fuse.PFS_RANGE_OUT_APPLIED,
 			}},
-			PostAttr: &authoritypb.Attr{Inode: 52, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 15},
+			PostState: testCopyPostState(39, source, destination, 15),
 		}, nil
 	}
 	unique := fixture.unique.Add(2)
@@ -513,7 +614,7 @@ func TestPFSCopyFileRangeZeroBytePostapplyPublishesExactAttributeState(t *testin
 				Flags: fuse.PFS_RANGE_OUT_APPLIED | fuse.PFS_RANGE_OUT_POSTAPPLY_ERROR,
 				Error: -int32(syscall.EIO),
 			}},
-			PostAttr: &authoritypb.Attr{Inode: 54, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 4},
+			PostState: testCopyPostState(41, source, destination, 4),
 		}, nil
 	}
 	unique := fixture.unique.Add(2)
@@ -630,7 +731,7 @@ func TestPFSCopyFileRangeDefersSameFileOverlapUntilAuthorityEOFClipping(t *testi
 				Body: &authoritypb.Response_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeReply{
 					ResultSize: 10, PostSize: 115, VisibilitySequence: 40, Flags: fuse.PFS_RANGE_OUT_APPLIED,
 				}},
-				PostAttr: &authoritypb.Attr{Inode: 63, Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: 115},
+				PostState: testCopyPostState(40, file, file, 115),
 			}, nil
 		case 2:
 			// The effective ranges really overlap. Only the authority can prove

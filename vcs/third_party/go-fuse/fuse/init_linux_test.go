@@ -7,9 +7,9 @@ import (
 	"unsafe"
 )
 
-func TestLinuxProtocol741WireLayout(t *testing.T) {
-	if _FUSE_KERNEL_VERSION != 7 || _OUR_MINOR_VERSION != 41 {
-		t.Fatalf("advertised FUSE protocol = %d.%d, want 7.41", _FUSE_KERNEL_VERSION, _OUR_MINOR_VERSION)
+func TestLinuxProtocol742WireLayout(t *testing.T) {
+	if _FUSE_KERNEL_VERSION != 7 || _OUR_MINOR_VERSION != 42 {
+		t.Fatalf("advertised FUSE protocol = %d.%d, want 7.42", _FUSE_KERNEL_VERSION, _OUR_MINOR_VERSION)
 	}
 	if got, want := unsafe.Sizeof(InitIn{})-unsafe.Sizeof(InHeader{}), uintptr(64); got != want {
 		t.Fatalf("fuse_init_in payload size = %d, want %d", got, want)
@@ -20,21 +20,22 @@ func TestLinuxProtocol741WireLayout(t *testing.T) {
 	var out InitOut
 	if unsafe.Offsetof(out.MapAlignment) != 30 || unsafe.Offsetof(out.Flags2) != 32 ||
 		unsafe.Offsetof(out.MaxStackDepth) != 36 || unsafe.Offsetof(out.Unused) != 40 {
-		t.Fatalf("fuse_init_out 7.41 offsets changed: map_alignment=%d flags2=%d max_stack=%d unused=%d",
+		t.Fatalf("fuse_init_out 7.42 offsets changed: map_alignment=%d flags2=%d max_stack=%d unused=%d",
 			unsafe.Offsetof(out.MapAlignment), unsafe.Offsetof(out.Flags2), unsafe.Offsetof(out.MaxStackDepth), unsafe.Offsetof(out.Unused))
 	}
 	var header InHeader
 	if unsafe.Sizeof(header) != 40 || unsafe.Offsetof(header.TotalExtlen) != 36 || unsafe.Offsetof(header.Padding) != 38 {
-		t.Fatalf("fuse_in_header 7.41 layout changed: size=%d total_extlen=%d padding=%d",
+		t.Fatalf("fuse_in_header 7.42 layout changed: size=%d total_extlen=%d padding=%d",
 			unsafe.Sizeof(header), unsafe.Offsetof(header.TotalExtlen), unsafe.Offsetof(header.Padding))
 	}
 
-	// These are the protocol additions from 7.29 through 7.41 that this fork
-	// can be sent or can negotiate. Keeping the audit executable prevents a
-	// future minor bump from becoming a constant-only assertion.
+	// These are the stock protocol additions through 7.41. Protocol 7.42 is
+	// the private exact-post-state cut and adds no stock opcode assignment.
+	// Keeping the audit executable prevents a future minor bump from becoming
+	// a constant-only assertion.
 	if _OP_SETUPMAPPING != 48 || _OP_REMOVEMAPPING != 49 || _OP_SYNCFS != 50 ||
 		_OP_TMPFILE != 51 || _OP_STATX != 52 || _OP_COPY_FILE_RANGE_64 != 53 {
-		t.Fatal("FUSE 7.29-7.41 opcode assignments changed")
+		t.Fatal("FUSE stock opcode assignments through 7.41 changed")
 	}
 	if CAP_NO_OPENDIR_SUPPORT != 1<<24 || CAP_EXPLICIT_INVAL_DATA != 1<<25 ||
 		CAP_MAP_ALIGNMENT != 1<<26 || CAP_SUBMOUNTS != 1<<27 ||
@@ -43,7 +44,7 @@ func TestLinuxProtocol741WireLayout(t *testing.T) {
 		CAP_CREATE_SUPP_GROUP != 1<<34 || CAP_HAS_EXPIRE_ONLY != 1<<35 ||
 		CAP_DIRECT_IO_ALLOW_MMAP != 1<<36 || CAP_PASSTHROUGH != 1<<37 ||
 		CAP_NO_EXPORT_SUPPORT != 1<<38 || CAP_HAS_RESEND != 1<<39 || CAP_ALLOW_IDMAP != 1<<40 {
-		t.Fatal("FUSE 7.29-7.41 capability assignments changed")
+		t.Fatal("FUSE stock capability assignments through 7.41 changed")
 	}
 	for name, layout := range map[string]struct{ got, want uintptr }{
 		"fuse_attr size":           {unsafe.Sizeof(Attr{}), 88},
@@ -62,7 +63,7 @@ func TestLinuxProtocol741WireLayout(t *testing.T) {
 	}
 }
 
-func TestInitNegotiatesExactLinuxProtocol741(t *testing.T) {
+func TestInitNegotiatesExactLinuxProtocol742(t *testing.T) {
 	fs := &recordingWriteFS{RawFileSystem: NewDefaultRawFileSystem()}
 	ps := NewProtocolServer(fs, &MountOptions{
 		EnableLocks:       true,
@@ -77,7 +78,7 @@ func TestInitNegotiatesExactLinuxProtocol741(t *testing.T) {
 		CAP_HAS_RESEND | CAP_PFS_STRICT_COHERENCE | CAP_PFS_CACHED_DATA | CAP_PFS_WRITE_ONESHOT)
 	in := InitIn{InHeader: InHeader{
 		Length: uint32(unsafe.Sizeof(InitIn{})), Opcode: _OP_INIT, Unique: 32,
-	}, Major: 7, Minor: 41, Flags: uint32(requested), Flags2: uint32(requested >> 32)}
+	}, Major: 7, Minor: 42, Flags: uint32(requested), Flags2: uint32(requested >> 32)}
 	headerSize := unsafe.Sizeof(InHeader{})
 	header, body := privateFixedRequestBytes(&in, headerSize)
 	out := [][]byte{make([]byte, sizeOfOutHeader), make([]byte, unsafe.Sizeof(InitOut{}))}
@@ -86,7 +87,7 @@ func TestInitNegotiatesExactLinuxProtocol741(t *testing.T) {
 		t.Fatalf("INIT dispatch=(%d,%v)", n, status)
 	}
 	reply := (*InitOut)(unsafe.Pointer(&out[1][0]))
-	if reply.Major != 7 || reply.Minor != 41 || reply.MapAlignment != 0 || reply.MaxStackDepth != 1 {
+	if reply.Major != 7 || reply.Minor != 42 || reply.MapAlignment != 0 || reply.MaxStackDepth != 1 {
 		t.Fatalf("INIT reply=%+v", reply)
 	}
 	granted := reply.Flags64()

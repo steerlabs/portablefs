@@ -121,10 +121,26 @@ type Attr struct {
 	Nlink       uint32
 	DeviceMajor uint32
 	DeviceMinor uint32
+	Rdev        uint32
+	BlockSize   uint32
+	Flags       uint32
 	ATimeNS     int64
 	MTimeNS     int64
 	CTimeNS     int64
 	BirthTimeNS int64
+}
+
+// SetAttrSpec is one indivisible metadata mutation. Pointer fields preserve
+// the distinction between "leave unchanged" and a requested zero value.
+type SetAttrSpec struct {
+	Mode     *fs.FileMode
+	UID      *uint32
+	GID      *uint32
+	Size     *int64
+	ATimeNS  *int64
+	MTimeNS  *int64
+	ATimeNow bool
+	MTimeNow bool
 }
 
 // ObjectCoordinate is the immutable identity needed to address one inode in
@@ -188,7 +204,7 @@ type FallocateSpec struct {
 
 // CopyFileRangeSpec freezes both ranges and the destination growth limits for
 // one whole SHARED-to-SHARED server-side copy. The store holds a canonical
-// source-read/destination-write stable-identity lock set through the syscall
+// source/destination writer stable-identity lock set through the syscall
 // and exact post-state capture.
 type CopyFileRangeSpec struct {
 	InputOffset    uint64

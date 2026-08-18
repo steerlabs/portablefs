@@ -3,7 +3,9 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -16,6 +18,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 )
 
 type inodeKey struct {
@@ -73,6 +76,7 @@ type replyNamePublication struct {
 	negativeState *negativeNamePublication
 	coordinate    publicationCoordinate
 	reserved      bool
+	reservation   *cacheInstallReservation
 }
 
 // negativeNamePublication is the mutable part of an admitted absence. A
@@ -87,8 +91,65 @@ type negativeNamePublication struct {
 }
 
 type replyAttrPublication struct {
-	inode      uint64
-	coordinate publicationCoordinate
+	inode       uint64
+	identity    publicationIdentity
+	record      *inodeRecord
+	coordinate  publicationCoordinate
+	reservation *cacheInstallReservation
+	reserved    bool
+}
+
+type replyDirPlusPublication struct {
+	entry           *fuse.EntryOut
+	nameReservation *cacheInstallReservation
+	attrReservation *cacheInstallReservation
+}
+
+type stagedDirPlusLookup struct {
+	record *inodeRecord
+	parent *inodeRecord
+	name   string
+}
+
+// dirPlusLookupTransaction owns every provisional resource used to construct
+// one READDIRPLUS page. The authority capabilities and daemon lookup counts
+// exist before the kernel can own them, so the physical reply write is the
+// single commit edge for the whole collection.
+type dirPlusLookupTransaction struct {
+	cursor       *dirPlusCursorTransaction
+	handleRecord *handleRecord
+	lookups      []stagedDirPlusLookup
+	ready        bool
+	settled      bool
+}
+
+type cacheReservationState uint8
+
+const (
+	cacheReservationPending cacheReservationState = iota + 1
+	cacheReservationFinalized
+)
+
+type cacheInstallReservation struct {
+	publication      *replyPublication
+	coordinate       publicationCoordinate
+	snapshot         uint64
+	state            cacheReservationState
+	revoked          bool
+	capacityReserved bool
+}
+
+type responseConsumptionOwnership uint8
+
+const (
+	responseConsumptionUnregistered responseConsumptionOwnership = iota
+	responseConsumptionPublication
+	responseConsumptionTransferred
+)
+
+type responseConsumptionClaim struct {
+	consumptions []authorityrpc.ResponseConsumption
+	done         chan struct{}
 }
 
 // replyDataPublication is one OPEN reply's declaration that this kernel may
@@ -117,36 +178,92 @@ type replyPublication struct {
 	// kernel result is either physically published through PFS_PUBLISH or
 	// fail-closed locally. One FUSE callback may require several bounded read or
 	// staged-write RPCs, so this is deliberately a collection rather than one
-	// token.
-	responseConsumptions []authorityrpc.ResponseConsumption
+	// token. The slice and its ownership state are protected by rawFileSystem.mu
+	// after registration.
+	responseConsumptions     []authorityrpc.ResponseConsumption
+	responseConsumptionOwner responseConsumptionOwnership
+	responseConsumptionDone  chan struct{}
+	postState                *authoritypb.PostState
+	expectedPostState        map[publicationIdentity]uint32
+	cacheStamp               *fuse.PFSCacheStamp
+	droppedAttrs             map[publicationIdentity]bool
+	dirPlus                  []replyDirPlusPublication
+	dirPlusLookups           *dirPlusLookupTransaction
+	snapshotSequence         uint64
+	payloadError             error
 
 	// Generic post-VFS publication receipt state, protected by
-	// rawFileSystem.mu. The original response write only signals
-	// originalDone. Cache/source ownership remains retained through the
-	// physical FUSE_PFS_PUBLISH acknowledgment.
-	owner          *rawFileSystem
-	requestUnique  uint64
-	nodeid         uint64
-	opcode         uint32
-	marked         bool
-	needsPostVFS   bool
-	originalDone   chan struct{}
-	originalWrote  bool
-	originalStatus fuse.Status
-	publicationID  uint64
-	publishUnique  uint64
+	// rawFileSystem.mu. The original response write signals originalDone and
+	// releases bounded capacity; sequence-addressable cache reservations and
+	// source ownership remain through the physical PFS_PUBLISH acknowledgment.
+	owner             *rawFileSystem
+	requestUnique     uint64
+	nodeid            uint64
+	opcode            uint32
+	marked            bool
+	needsPostVFS      bool
+	originalDone      chan struct{}
+	originalFinalized bool
+	originalWrote     bool
+	originalStatus    fuse.Status
+	publicationID     uint64
+	publishUnique     uint64
 }
 
 func (p *replyPublication) empty() bool {
 	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
-		p.writeKernelTx == 0 && p.writeHandle == nil && len(p.responseConsumptions) == 0 && !p.needsPostVFS
+		p.writeKernelTx == 0 && p.writeHandle == nil && len(p.responseConsumptions) == 0 && !p.needsPostVFS &&
+		p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
 
 func (p *replyPublication) consumeAuthorityResponse() {
-	if p == nil {
+	if p == nil || p.owner == nil {
 		return
 	}
-	for _, consumption := range p.responseConsumptions {
+	p.owner.claimAndConsumeAuthorityResponses(p)
+}
+
+// takeAuthorityResponsesLocked is the sole handoff from reply ownership to a
+// settlement path. Clearing the retained slice is not an idempotence trick: it
+// records that callback cleanup, normal settlement, or teardown won exclusive
+// ownership of every response currently attached to this publication. A later
+// response cannot join a transferred publication.
+func (r *rawFileSystem) takeAuthorityResponsesLocked(publication *replyPublication) (responseConsumptionClaim, bool) {
+	if publication == nil || publication.owner != r || publication.responseConsumptionOwner != responseConsumptionPublication {
+		return responseConsumptionClaim{}, false
+	}
+	publication.responseConsumptionOwner = responseConsumptionTransferred
+	claim := responseConsumptionClaim{
+		consumptions: publication.responseConsumptions,
+		done:         publication.responseConsumptionDone,
+	}
+	publication.responseConsumptions = nil
+	return claim, true
+}
+
+func (r *rawFileSystem) claimAndConsumeAuthorityResponses(publication *replyPublication) {
+	r.mu.Lock()
+	claim, claimed := r.takeAuthorityResponsesLocked(publication)
+	done := publication.responseConsumptionDone
+	r.mu.Unlock()
+	if claimed {
+		consumeClaimedAuthorityResponses(claim)
+		return
+	}
+	// A competing settlement path already owns the responses. Callback cleanup
+	// still cannot return until that one owner has finished the terminal
+	// consumption promised by the authority-response lifecycle.
+	if done != nil {
+		<-done
+	}
+}
+
+func consumeClaimedAuthorityResponses(claim responseConsumptionClaim) {
+	if claim.done == nil {
+		return
+	}
+	defer close(claim.done)
+	for _, consumption := range claim.consumptions {
 		if consumption != nil {
 			consumption.Consume()
 		}
@@ -243,6 +360,7 @@ type rawFileSystem struct {
 	entryTimeout time.Duration
 	attrTimeout  time.Duration
 	nameCapacity int
+	attrCapacity int
 	// negativeCapacity is the part of nameCapacity that may be spent on cached
 	// absences. See negativeNameShare for why absences need their own bound
 	// inside the declared total rather than competing freely with bindings.
@@ -287,6 +405,10 @@ type rawFileSystem struct {
 	// reclaimed by FORGET, and must therefore leave only through a repair or
 	// through self-revocation.
 	cachedNegatives map[nameKey]struct{}
+	// cachedAttrs is the exact set of inode attributes this daemon has allowed
+	// its kernel to retain. It gives attribute candidates the same bounded,
+	// repairable accounting as positive and negative names.
+	cachedAttrs map[publicationIdentity]*inodeRecord
 	// cachedData is the exact set of authority inodes whose file data this
 	// frontend has told its kernel it may keep. It is keyed by the
 	// coordination inode number a VisibilityTarget carries, and it is the
@@ -318,9 +440,13 @@ type rawFileSystem struct {
 	// separate so a burst of probes cannot silently consume the reservations
 	// that bindings were counted against, and vice versa.
 	pendingNegatives    int
+	pendingAttrs        int
 	published           chan struct{}
 	replyPublications   map[uint64]*replyPublication
 	publishAcks         map[uint64]*replyPublication
+	replyTerminalizing  bool
+	replyTerminal       bool
+	replyTerminalDone   chan struct{}
 	replyLifecycleArmed bool
 
 	// Source-owned gates close publication before the mutation gets a replay
@@ -335,6 +461,9 @@ type rawFileSystem struct {
 	peerHeldPhase               []publicationCoordinate
 	sourceChanged               chan struct{}
 	completedVisibilitySequence uint64
+	lastPeerRepairSequence      map[publicationCoordinate]uint64
+	repairingCoordinates        map[publicationCoordinate]bool
+	cacheReservations           map[publicationCoordinate]map[*cacheInstallReservation]struct{}
 
 	// identityDevice pins the one filesystem a volume is, as the authority's
 	// explicit major<<32|minor device fact. The kernel inode number alone keys
@@ -346,6 +475,7 @@ type rawFileSystem struct {
 
 var _ fuse.RawFileSystem = (*rawFileSystem)(nil)
 var _ fuse.ReplyWriteLifecycle = (*rawFileSystem)(nil)
+var _ fuse.ReplyPayloadPreparer = (*rawFileSystem)(nil)
 
 func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 	key := itemKey(root.item)
@@ -360,6 +490,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		entryTimeout:   strictEntryTimeout,
 		attrTimeout:    strictAttrTimeout,
 		nameCapacity:   mount.nameCapacity,
+		attrCapacity:   mount.nameCapacity,
 		// A declared capacity too small to divide still admits one absence:
 		// refusing every negative entry would be a silent behaviour change for
 		// a mount that declared a tiny cache, not a bound anything relies on.
@@ -378,6 +509,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		cachedStableNames:          make(map[publicationNamespace]*inodeRecord),
 		cachedNameStable:           make(map[nameKey]publicationNamespace),
 		cachedNegatives:            make(map[nameKey]struct{}),
+		cachedAttrs:                make(map[publicationIdentity]*inodeRecord),
 		cachedData:                 make(map[uint64]*inodeRecord),
 		heldNames:                  make(map[nameKey]struct{}),
 		heldInodes:                 make(map[uint64]struct{}),
@@ -395,6 +527,9 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		sourceUnresolvedAttributes: make(map[*sourcePublicationLease]int),
 		sourceUnresolvedData:       make(map[*sourcePublicationLease]int),
 		sourceChanged:              make(chan struct{}),
+		lastPeerRepairSequence:     make(map[publicationCoordinate]uint64),
+		repairingCoordinates:       make(map[publicationCoordinate]bool),
+		cacheReservations:          make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
 	}
 	mount.raw = r
 	return r
@@ -496,6 +631,38 @@ func (r *rawFileSystem) bindCachedNameLocked(key nameKey, stable publicationName
 // admitNameLocked decides the lifetime one directory binding is published with
 // and records the binding when it is cacheable. Uncacheable is always a legal
 // answer: it costs a later LOOKUP and can never be wrong.
+func cacheCandidateSnapshot(publication *replyPublication) uint64 {
+	if publication == nil {
+		return 0
+	}
+	if publication.postState != nil {
+		return publication.postState.GetSnapshotSequence()
+	}
+	if publication.cacheStamp != nil {
+		return publication.cacheStamp.SnapshotSequence
+	}
+	if publication.snapshotSequence != 0 {
+		return publication.snapshotSequence
+	}
+	return 0
+}
+
+func (r *rawFileSystem) reserveCacheCandidateLocked(publication *replyPublication, coordinate publicationCoordinate) (*cacheInstallReservation, bool) {
+	snapshot := cacheCandidateSnapshot(publication)
+	if snapshot == 0 || r.repairingCoordinates[coordinate] || snapshot <= r.lastPeerRepairSequence[coordinate] {
+		return nil, false
+	}
+	reservation := &cacheInstallReservation{
+		publication: publication, coordinate: coordinate, snapshot: snapshot,
+		state: cacheReservationPending,
+	}
+	if r.cacheReservations[coordinate] == nil {
+		r.cacheReservations[coordinate] = make(map[*cacheInstallReservation]struct{})
+	}
+	r.cacheReservations[coordinate][reservation] = struct{}{}
+	return reservation, true
+}
+
 func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord, name string, record *inodeRecord) (time.Duration, replyNamePublication, bool) {
 	key := nameKey{parent: parent.key.inode, name: name}
 	stable := publicationNamespace{parent: parent.identity, name: name}
@@ -521,13 +688,19 @@ func (r *rawFileSystem) admitNameLocked(ctx context.Context, parent *inodeRecord
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
 		return 0, publication, false
 	}
+	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
+	if !admitted {
+		return 0, publication, false
+	}
 	_, already := r.cachedNames[key]
 	if !already && r.cachedNameTotalLocked() >= r.nameCapacity {
 		// The declared capacity is a promise about how much state this mount
 		// can withdraw, so it is a hard bound. Beyond it the frontend keeps
 		// answering with a zero lifetime.
+		r.removeCacheReservationLocked(reservation)
 		return 0, publication, false
 	}
+	publication.reservation = reservation
 	publication.reserved = !already
 	if publication.reserved {
 		r.pendingNames++
@@ -563,15 +736,21 @@ func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *ino
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
 		return 0, publication, false
 	}
+	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
+	if !admitted {
+		return 0, publication, false
+	}
 	_, already := r.cachedNegatives[key]
 	if !already {
 		if len(r.cachedNegatives)+r.pendingNegatives >= r.negativeCapacity ||
 			r.cachedNameTotalLocked() >= r.nameCapacity {
+			r.removeCacheReservationLocked(reservation)
 			return 0, publication, false
 		}
 		publication.reserved = true
 		r.pendingNegatives++
 	}
+	publication.reservation = reservation
 	r.publishingNames[key]++
 	r.admitSourcePublicationLocked(coordinate)
 	state := &negativeNamePublication{owner: r, reply: replyPublicationFromContext(ctx), coordinate: coordinate}
@@ -650,17 +829,221 @@ func (r *rawFileSystem) awaitDataAdmission(ctx context.Context, inode uint64, id
 	}
 }
 
-func (r *rawFileSystem) admitAttrLocked(ctx context.Context, inode uint64, identity publicationIdentity) (time.Duration, publicationCoordinate, bool) {
+func (r *rawFileSystem) admitAttrLocked(ctx context.Context, inode uint64, identity publicationIdentity) (time.Duration, publicationCoordinate, *cacheInstallReservation, bool) {
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
 	if _, held := r.heldInodes[inode]; held {
-		return 0, coordinate, false
+		return 0, coordinate, nil, false
 	}
 	if !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
-		return 0, coordinate, false
+		return 0, coordinate, nil, false
+	}
+	reservation, admitted := r.reserveCacheCandidateLocked(replyPublicationFromContext(ctx), coordinate)
+	if !admitted {
+		return 0, coordinate, nil, false
+	}
+	if _, already := r.cachedAttrs[identity]; !already {
+		if len(r.cachedAttrs)+r.pendingAttrs >= r.attrCapacity {
+			r.removeCacheReservationLocked(reservation)
+			return 0, coordinate, nil, false
+		}
+		reservation.capacityReserved = true
+		r.pendingAttrs++
 	}
 	r.publishingInodes[inode]++
 	r.admitSourcePublicationLocked(coordinate)
-	return r.attrTimeout, coordinate, true
+	return r.attrTimeout, coordinate, reservation, true
+}
+
+func (r *rawFileSystem) removeCacheReservationLocked(reservation *cacheInstallReservation) {
+	if reservation == nil {
+		return
+	}
+	set := r.cacheReservations[reservation.coordinate]
+	delete(set, reservation)
+	if len(set) == 0 {
+		delete(r.cacheReservations, reservation.coordinate)
+	}
+}
+
+func (r *rawFileSystem) releaseReplyReservationsLocked(publication *replyPublication) {
+	for coordinate, set := range r.cacheReservations {
+		for reservation := range set {
+			if reservation.publication == publication {
+				delete(set, reservation)
+			}
+		}
+		if len(set) == 0 {
+			delete(r.cacheReservations, coordinate)
+		}
+	}
+}
+
+// releaseReplyCapacityLocked releases only the bounded admission charge. The
+// reservation itself is a separate ordering object and remains in
+// cacheReservations until receipt, failure, or teardown removes revocability.
+func (r *rawFileSystem) releaseReplyCapacityLocked(publication *replyPublication) {
+	if publication == nil {
+		return
+	}
+	for index := range publication.names {
+		candidate := &publication.names[index]
+		if !candidate.reserved {
+			continue
+		}
+		if candidate.negative {
+			if r.pendingNegatives > 0 {
+				r.pendingNegatives--
+			}
+		} else if r.pendingNames > 0 {
+			r.pendingNames--
+		}
+		candidate.reserved = false
+	}
+	for _, candidate := range publication.attrs {
+		reservation := candidate.reservation
+		if reservation == nil || !reservation.capacityReserved {
+			continue
+		}
+		if r.pendingAttrs > 0 {
+			r.pendingAttrs--
+		}
+		reservation.capacityReserved = false
+	}
+}
+
+type terminalReplyCompletion struct {
+	publication         *replyPublication
+	dirPlus             dirPlusLookupCompletion
+	responseConsumption responseConsumptionClaim
+	physical            bool
+}
+
+// terminalizeReplyCacheOwnership joins physical writer callbacks only until
+// deadline. A false result leaves the table terminalizing: new registration
+// and PFS_PUBLISH settlement stay closed, while an already-finalized original
+// writer may still report its physical result. The caller must then terminate
+// the device connection, prove it absent, and call
+// terminalizeReplyCacheOwnershipAfterConnectionGone.
+func (r *rawFileSystem) terminalizeReplyCacheOwnership(deadline time.Time) bool {
+	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return true
+	}
+	if !r.replyTerminalizing {
+		r.replyTerminalizing = true
+		r.replyTerminalDone = make(chan struct{})
+	}
+	seen := make(map[*replyPublication]struct{}, len(r.replyPublications)+len(r.publishAcks))
+	for _, publication := range r.replyPublications {
+		seen[publication] = struct{}{}
+	}
+	for _, publication := range r.publishAcks {
+		seen[publication] = struct{}{}
+	}
+	originalWrites := make([]<-chan struct{}, 0, len(seen))
+	for publication := range seen {
+		if publication.originalFinalized && !publication.originalWrote {
+			originalWrites = append(originalWrites, publication.originalDone)
+		}
+	}
+	r.mu.Unlock()
+
+	// The writer callback runs only after go-fuse releases writeMu. Waiting
+	// without rawFileSystem.mu lets every reply which froze its final bytes
+	// report whether those bytes physically reached the kernel. No withdrawal
+	// snapshot may precede this join.
+	for _, originalDone := range originalWrites {
+		if !waitReplyTerminal(originalDone, deadline) {
+			return false
+		}
+	}
+	return r.finishReplyCacheTerminalization(false)
+}
+
+func waitReplyTerminal(done <-chan struct{}, deadline time.Time) bool {
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// terminalizeReplyCacheOwnershipAfterConnectionGone is the only settlement
+// edge for a finalized writer which never reports. Connection absence, not a
+// guessed write result, proves that no kernel cache or lookup ownership can
+// survive, so every retained candidate is rolled back exactly once.
+func (r *rawFileSystem) terminalizeReplyCacheOwnershipAfterConnectionGone() {
+	r.finishReplyCacheTerminalization(true)
+}
+
+func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) bool {
+	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return true
+	}
+	if !r.replyTerminalizing {
+		r.mu.Unlock()
+		return false
+	}
+	seen := make(map[*replyPublication]struct{}, len(r.replyPublications)+len(r.publishAcks))
+	for _, publication := range r.replyPublications {
+		seen[publication] = struct{}{}
+	}
+	for _, publication := range r.publishAcks {
+		seen[publication] = struct{}{}
+	}
+	completions := make([]terminalReplyCompletion, 0, len(seen))
+	for publication := range seen {
+		delete(r.replyPublications, publication.requestUnique)
+		if publication.publishUnique != 0 {
+			delete(r.publishAcks, publication.publishUnique)
+		}
+		physical := !connectionGone && publication.originalWrote && publication.originalStatus.Ok()
+		if connectionGone && !publication.originalWrote {
+			close(publication.originalDone)
+		}
+		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
+		responseConsumption := r.settleReplyPublicationLocked(publication, physical)
+		completions = append(completions, terminalReplyCompletion{
+			publication:         publication,
+			dirPlus:             dirPlus,
+			responseConsumption: responseConsumption,
+			physical:            physical,
+		})
+	}
+	r.replyTerminal = true
+	r.replyTerminalizing = false
+	close(r.replyTerminalDone)
+	r.signalSourceChangedLocked()
+	r.mu.Unlock()
+
+	for _, completion := range completions {
+		r.finishDirPlusLookupCompletion(completion.dirPlus)
+		if completion.physical {
+			r.finishWriteTransactionPublication(completion.publication, completion.publication.requestUnique)
+		} else {
+			r.finishOneShotWritePublication(completion.publication)
+		}
+		if completion.publication.source != nil {
+			completion.publication.source.revoke()
+		}
+		consumeClaimedAuthorityResponses(completion.responseConsumption)
+	}
+	return true
 }
 
 // settle ends one admitted publication. PREPARE's drain is waiting on exactly
@@ -687,21 +1070,230 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	attrLifetime := time.Duration(0)
 	var attrCoordinate publicationCoordinate
 	cachedAttr := false
-	if cachedName {
-		attrLifetime, attrCoordinate, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
+	if cachedName && publication.postState == nil {
+		var attrReservation *cacheInstallReservation
+		attrLifetime, attrCoordinate, attrReservation, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
+		if cachedAttr {
+			publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, identity: record.identity, record: record, coordinate: attrCoordinate, reservation: attrReservation})
+		}
 	}
 	r.mu.Unlock()
 	if cachedName {
 		publication.names = append(publication.names, namePublication)
-	}
-	if cachedAttr {
-		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, coordinate: attrCoordinate})
 	}
 	out.NodeId = record.id
 	out.Generation = 1
 	out.SetEntryTimeout(entry)
 	out.SetAttrTimeout(attrLifetime)
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	return nil
+}
+
+type dirPlusCandidate struct {
+	entry  *fuse.EntryOut
+	dirent *authoritypb.Dirent
+	item   *authoritypb.Item
+	record *inodeRecord
+}
+
+type dirPlusLookupCompletion struct {
+	tx       *dirPlusLookupTransaction
+	commit   bool
+	reclaims [][]byte
+	corrupt  bool
+}
+
+func (r *rawFileSystem) attachDirPlusLookupTransaction(ctx context.Context, cursor *dirPlusCursorTransaction, handle *handleRecord) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || cursor == nil || handle == nil {
+		return errors.New("fusev3: READDIRPLUS lookup transaction escaped its reply lifecycle")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.replyPublications[publication.requestUnique] != publication || publication.dirPlusLookups != nil {
+		return errors.New("fusev3: READDIRPLUS lookup transaction lost its reply ownership")
+	}
+	publication.dirPlusLookups = &dirPlusLookupTransaction{cursor: cursor, handleRecord: handle}
+	return nil
+}
+
+func (r *rawFileSystem) stageDirPlusLookup(ctx context.Context, record, parent *inodeRecord, name string) error {
+	publication := replyPublicationFromContext(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if publication == nil || r.replyPublications[publication.requestUnique] != publication ||
+		publication.dirPlusLookups == nil || publication.dirPlusLookups.settled || publication.dirPlusLookups.ready ||
+		record == nil || record.reclaimed || r.nodesByID[record.id] != record || record.lookups == 0 || parent == nil {
+		return errors.New("fusev3: READDIRPLUS lookup could not join its page transaction")
+	}
+	publication.dirPlusLookups.lookups = append(publication.dirPlusLookups.lookups, stagedDirPlusLookup{
+		record: record, parent: parent, name: name,
+	})
+	return nil
+}
+
+func (r *rawFileSystem) commitDirPlusLookupTransaction(ctx context.Context) error {
+	publication := replyPublicationFromContext(ctx)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if publication == nil || r.replyPublications[publication.requestUnique] != publication ||
+		publication.dirPlusLookups == nil || publication.dirPlusLookups.settled || publication.dirPlusLookups.ready {
+		return errors.New("fusev3: READDIRPLUS page could not reach its physical-write commit edge")
+	}
+	publication.dirPlusLookups.ready = true
+	return nil
+}
+
+// settleDirPlusLookupTransactionLocked transfers the staged lookup references
+// to the kernel only when a complete successful page reached /dev/fuse. Cache
+// publication still waits for PFS_PUBLISH; lookup and path ownership do not,
+// because the kernel owns those references as soon as it accepts the page.
+func (r *rawFileSystem) settleDirPlusLookupTransactionLocked(publication *replyPublication, physicalWrite bool) dirPlusLookupCompletion {
+	if publication == nil || publication.dirPlusLookups == nil || publication.dirPlusLookups.settled {
+		return dirPlusLookupCompletion{}
+	}
+	tx := publication.dirPlusLookups
+	tx.settled = true
+	commit := physicalWrite && tx.ready
+	completion := dirPlusLookupCompletion{tx: tx, commit: commit}
+	if commit {
+		for _, lookup := range tx.lookups {
+			r.bindPathLocked(lookup.record, lookup.parent, lookup.name)
+		}
+		return completion
+	}
+	for _, lookup := range tx.lookups {
+		record := lookup.record
+		if record == nil || record.root || record.reclaimed || r.nodesByID[record.id] != record || record.lookups == 0 {
+			completion.corrupt = true
+			continue
+		}
+		record.lookups--
+		if index := r.identityIndexLocked(record); record.lookups == 0 && record.pins == 0 && index[record.key] == record {
+			delete(index, record.key)
+		}
+		if reclaim := r.collectLocked(record); len(reclaim) != 0 {
+			completion.reclaims = append(completion.reclaims, reclaim)
+		}
+	}
+	return completion
+}
+
+func (r *rawFileSystem) finishDirPlusLookupCompletion(completion dirPlusLookupCompletion) {
+	if completion.tx == nil {
+		return
+	}
+	cursorSettled := completion.tx.cursor.finish(completion.commit)
+	for _, reclaim := range completion.reclaims {
+		r.mount.deferReclaim(reclaim)
+	}
+	r.releaseHandleOperation(completion.tx.handleRecord)
+	if completion.corrupt || !cursorSettled {
+		r.mount.revoke(errors.New("fusev3: READDIRPLUS settlement lost staged lookup or cursor ownership"))
+	}
+}
+
+// publishDirPlusPage reserves an authority page as one admission unit. The
+// page is already serialized with zero lifetimes; only a successful preflight
+// for every name and attr turns any of them on. This keeps the bounded registry
+// invariant independent of READDIRPLUS concurrency and avoids a partially
+// cached page when one registry reaches capacity.
+func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRecord, candidates []dirPlusCandidate) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || parent == nil {
+		return errors.New("fusev3: READDIRPLUS escaped its reply-publication lifecycle")
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	snapshot := candidates[0].dirent.GetSnapshotSequence()
+	if snapshot == 0 || publication.snapshotSequence != 0 || publication.cacheStamp != nil || publication.postState != nil {
+		return errors.New("fusev3: malformed READDIRPLUS page stamp")
+	}
+	for _, candidate := range candidates {
+		item := candidate.item
+		if candidate.entry == nil || candidate.record == nil || item == nil || item.GetAttr() == nil ||
+			candidate.dirent.GetSnapshotSequence() != snapshot || candidate.dirent.GetObjectVersion() == 0 ||
+			candidate.dirent.GetObjectVersion() > snapshot || item.GetSnapshotSequence() != snapshot ||
+			item.GetObjectVersion() != candidate.dirent.GetObjectVersion() || !bytes.Equal(item.GetStableIdentity(), candidate.record.identity[:]) {
+			return errors.New("fusev3: inconsistent READDIRPLUS page record")
+		}
+	}
+	publication.needsPostVFS = true
+	publication.snapshotSequence = snapshot
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	newNames := make(map[nameKey]struct{}, len(candidates))
+	newAttrs := make(map[publicationIdentity]struct{}, len(candidates))
+	admissible := true
+	for _, candidate := range candidates {
+		name := string(candidate.dirent.GetName())
+		key := nameKey{parent: parent.key.inode, name: name}
+		stable := publicationNamespace{parent: parent.identity, name: name}
+		nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: name}
+		attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: candidate.record.identity}
+		r.supersedeNegativeNameLocked(key, nameCoordinate)
+		_, nameHeld := r.heldNames[key]
+		_, inodeHeld := r.heldInodes[candidate.record.key.inode]
+		if nameHeld || inodeHeld {
+			admissible = false
+		}
+		if !r.sourcePublicationAllowedLocked(nameCoordinate, nil) || !r.sourcePublicationAllowedLocked(attrCoordinate, nil) ||
+			r.repairingCoordinates[nameCoordinate] || snapshot <= r.lastPeerRepairSequence[nameCoordinate] ||
+			r.repairingCoordinates[attrCoordinate] || snapshot <= r.lastPeerRepairSequence[attrCoordinate] {
+			admissible = false
+		}
+		if _, exists := r.cachedNames[key]; !exists {
+			newNames[key] = struct{}{}
+		}
+		if _, exists := r.cachedAttrs[candidate.record.identity]; !exists {
+			newAttrs[candidate.record.identity] = struct{}{}
+		}
+	}
+	if r.cachedNameTotalLocked()+len(newNames) > r.nameCapacity || len(r.cachedAttrs)+r.pendingAttrs+len(newAttrs) > r.attrCapacity {
+		admissible = false
+	}
+	if !admissible {
+		return nil
+	}
+
+	reservedNames := make(map[nameKey]bool, len(newNames))
+	reservedAttrs := make(map[publicationIdentity]bool, len(newAttrs))
+	for _, candidate := range candidates {
+		name := string(candidate.dirent.GetName())
+		key := nameKey{parent: parent.key.inode, name: name}
+		stable := publicationNamespace{parent: parent.identity, name: name}
+		nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: name}
+		attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: candidate.record.identity}
+		nameReservation, _ := r.reserveCacheCandidateLocked(publication, nameCoordinate)
+		attrReservation, _ := r.reserveCacheCandidateLocked(publication, attrCoordinate)
+		namePublication := replyNamePublication{key: key, stable: stable, record: candidate.record, coordinate: nameCoordinate, reservation: nameReservation}
+		if _, needed := newNames[key]; needed && !reservedNames[key] {
+			namePublication.reserved = true
+			reservedNames[key] = true
+			r.pendingNames++
+		}
+		if _, needed := newAttrs[candidate.record.identity]; needed && !reservedAttrs[candidate.record.identity] {
+			attrReservation.capacityReserved = true
+			reservedAttrs[candidate.record.identity] = true
+			r.pendingAttrs++
+		}
+		r.publishingNames[key]++
+		r.publishingInodes[candidate.record.key.inode]++
+		r.admitSourcePublicationLocked(nameCoordinate)
+		r.admitSourcePublicationLocked(attrCoordinate)
+		publication.names = append(publication.names, namePublication)
+		publication.attrs = append(publication.attrs, replyAttrPublication{
+			inode: candidate.record.key.inode, identity: candidate.record.identity, record: candidate.record,
+			coordinate: attrCoordinate, reservation: attrReservation,
+		})
+		publication.dirPlus = append(publication.dirPlus, replyDirPlusPublication{
+			entry: candidate.entry, nameReservation: nameReservation, attrReservation: attrReservation,
+		})
+		candidate.entry.SetEntryTimeout(r.entryTimeout)
+		candidate.entry.SetAttrTimeout(r.attrTimeout)
+	}
 	return nil
 }
 
@@ -738,8 +1330,9 @@ func (r *rawFileSystem) publishNegativeEntry(ctx context.Context, out *fuse.Entr
 	lifetime, namePublication, cached := r.admitNegativeNameLocked(ctx, parent, name)
 	r.mu.Unlock()
 	if !cached {
+		*out = fuse.EntryOut{}
 		out.SetEntryTimeout(0)
-		return fuse.Status(syscall.ENOENT), nil
+		return fuse.OK, nil
 	}
 	publication.names = append(publication.names, namePublication)
 	// A zero-NodeId reply carries no object, so every other field is written
@@ -760,10 +1353,10 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 	}
 	publication.needsPostVFS = true
 	r.mu.Lock()
-	lifetime, coordinate, cached := r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
+	lifetime, coordinate, reservation, cached := r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
 	r.mu.Unlock()
 	if cached {
-		publication.attrs = append(publication.attrs, replyAttrPublication{inode: attr.GetInode(), coordinate: coordinate})
+		publication.attrs = append(publication.attrs, replyAttrPublication{inode: attr.GetInode(), identity: record.identity, record: record, coordinate: coordinate, reservation: reservation})
 	}
 	out.NodeId, out.Generation = record.id, 1
 	out.SetEntryTimeout(0)
@@ -773,18 +1366,7 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 }
 
 func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublication, successful bool) {
-	switch {
-	case !publication.reserved:
-	case publication.negative:
-		if r.pendingNegatives > 0 {
-			r.pendingNegatives--
-		}
-	default:
-		if r.pendingNames > 0 {
-			r.pendingNames--
-		}
-	}
-	if successful {
+	if successful && (publication.reservation == nil || !publication.reservation.revoked) {
 		if publication.negative {
 			// A materializing callback may have superseded this mount's absence
 			// before the kernel returned the lookup's merged receipt. Settling still
@@ -809,7 +1391,10 @@ func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublica
 	r.settleSourcePublicationLocked(publication.coordinate)
 }
 
-func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublication) {
+func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublication, successful bool) {
+	if successful && (publication.reservation == nil || !publication.reservation.revoked) && publication.record != nil && !publication.record.reclaimed {
+		r.cachedAttrs[publication.identity] = publication.record
+	}
 	if r.publishingInodes[publication.inode]--; r.publishingInodes[publication.inode] <= 0 {
 		delete(r.publishingInodes, publication.inode)
 	}
@@ -831,20 +1416,29 @@ func (r *rawFileSystem) settleDataPublicationLocked(publication replyDataPublica
 	r.settleSourcePublicationLocked(publication.coordinate)
 }
 
-func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) {
+func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) responseConsumptionClaim {
+	// Failure before the physical edge and receipt settlement both pass here.
+	// The former still owns capacity; the latter finds it already consumed.
+	r.releaseReplyCapacityLocked(publication)
 	for _, name := range publication.names {
 		r.settleNamePublicationLocked(name, successful)
 	}
 	for _, attr := range publication.attrs {
-		r.settleAttrPublicationLocked(attr)
+		r.settleAttrPublicationLocked(attr, successful)
 	}
 	for _, data := range publication.data {
 		r.settleDataPublicationLocked(data, successful)
 	}
+	// A successful original write can still be superseded before its merged
+	// PFS_PUBLISH receipt. Keep every candidate addressable until this terminal
+	// settlement; physical failure reaches the same point with successful=false.
+	r.releaseReplyReservationsLocked(publication)
 	if len(publication.names) != 0 || len(publication.attrs) != 0 || len(publication.data) != 0 {
 		close(r.published)
 		r.published = make(chan struct{})
 	}
+	claim, _ := r.takeAuthorityResponsesLocked(publication)
+	return claim
 }
 
 func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *replyPublication) error {
@@ -853,11 +1447,19 @@ func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *rep
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.replyTerminal || r.replyTerminalizing {
+		return errors.New("fusev3: reply publication registered after terminal settlement")
+	}
 	if r.replyPublications[unique] != nil || r.publishAcks[unique] != nil {
 		return fmt.Errorf("fusev3: FUSE request identity %d registered publication twice", unique)
 	}
+	if publication == nil || publication.owner != nil || publication.responseConsumptionOwner != responseConsumptionUnregistered {
+		return errors.New("fusev3: reply publication reused response ownership")
+	}
 	publication.requestUnique = unique
 	publication.owner = r
+	publication.responseConsumptionOwner = responseConsumptionPublication
+	publication.responseConsumptionDone = make(chan struct{})
 	publication.originalDone = make(chan struct{})
 	r.replyPublications[unique] = publication
 	return nil
@@ -865,15 +1467,78 @@ func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *rep
 
 func (r *rawFileSystem) finishReplyPublicationRegistration(unique uint64, publication *replyPublication) {
 	r.mu.Lock()
+	if r.replyTerminal || r.replyTerminalizing {
+		r.mu.Unlock()
+		return
+	}
 	if r.replyPublications[unique] != publication {
 		r.mu.Unlock()
 		r.mount.revoke(fmt.Errorf("fusev3: FUSE request identity %d lost its reserved reply-publication ownership", unique))
 		return
 	}
+	if err := validateExpectedPostState(publication); err != nil {
+		publication.payloadError = err
+	} else if publication.postState != nil {
+		if err := validateMutationPostState(publication.postState); err != nil {
+			publication.payloadError = err
+		} else {
+			publication.droppedAttrs = make(map[publicationIdentity]bool)
+			for _, object := range publication.postState.GetObjects() {
+				identity, ok := publicationIdentityFromBytes(object.GetStableIdentity())
+				if !ok {
+					publication.payloadError = errors.New("fusev3: post-state object carried an invalid stable identity")
+					break
+				}
+				record := r.byIdentityLocked(identity)
+				if record == nil || record.id == 0 || object.GetAttr().GetInode() != record.key.inode || object.GetAttr().GetKind() != record.key.kind {
+					publication.payloadError = fmt.Errorf("fusev3: post-state object %x has no matching canonical live node", identity)
+					break
+				}
+				coordinate := publicationCoordinate{kind: publicationItemAttributes, item: identity}
+				if held := r.sourceHolds[coordinate]; r.peerHolds[coordinate] != 0 || r.repairingCoordinates[coordinate] || held != nil && held != publication.source {
+					publication.droppedAttrs[identity] = true
+					continue
+				}
+				reservation, admitted := r.reserveCacheCandidateLocked(publication, coordinate)
+				if !admitted {
+					publication.droppedAttrs[identity] = true
+					continue
+				}
+				if _, already := r.cachedAttrs[identity]; !already {
+					if len(r.cachedAttrs)+r.pendingAttrs >= r.attrCapacity {
+						r.removeCacheReservationLocked(reservation)
+						publication.droppedAttrs[identity] = true
+						continue
+					}
+					reservation.capacityReserved = true
+					r.pendingAttrs++
+				}
+				r.publishingInodes[record.key.inode]++
+				r.admitSourcePublicationLocked(coordinate)
+				publication.attrs = append(publication.attrs, replyAttrPublication{
+					inode: record.key.inode, identity: identity, record: record, coordinate: coordinate, reservation: reservation,
+				})
+			}
+		}
+	}
 	if publication.empty() {
 		delete(r.replyPublications, unique)
 	}
 	r.mu.Unlock()
+}
+
+func (r *rawFileSystem) byIdentityLocked(identity publicationIdentity) *inodeRecord {
+	var found *inodeRecord
+	for _, record := range r.nodesByID {
+		if record == nil || record.graft || record.reclaimed || record.identity != identity {
+			continue
+		}
+		if found != nil && found != record {
+			return nil
+		}
+		found = record
+	}
+	return found
 }
 
 // ReplyWriteOrdered joins cache/source-bearing replies to go-fuse's ordered
@@ -882,7 +1547,184 @@ func (r *rawFileSystem) finishReplyPublicationRegistration(unique uint64, public
 func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.replyTerminal || r.replyTerminalizing {
+		return false
+	}
 	return r.replyPublications[unique] != nil || r.publishAcks[unique] != nil
+}
+
+// PrepareReplyPayload is the PENDING-to-FINALIZED transition. It runs under
+// go-fuse's physical writer mutex, so no notification can overtake the bytes
+// whose lifetimes and DROP decisions are frozen here.
+func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, fuse.Status) {
+	r.mu.Lock()
+	if r.replyTerminal || r.replyTerminalizing {
+		r.mu.Unlock()
+		return 0, fuse.Status(syscall.ENOTCONN)
+	}
+	publication := r.replyPublications[unique]
+	if publication == nil {
+		r.mu.Unlock()
+		if opcode == 44 { // READDIRPLUS
+			return payloadSize, fuse.OK
+		}
+		return 0, fuse.OK
+	}
+	if publication.payloadError != nil {
+		err := publication.payloadError
+		r.mu.Unlock()
+		r.mount.revoke(err)
+		return 0, fuse.EIO
+	}
+	for _, set := range r.cacheReservations {
+		for reservation := range set {
+			if reservation.publication != publication {
+				continue
+			}
+			if reservation.state != cacheReservationPending {
+				r.mu.Unlock()
+				r.mount.revoke(errors.New("fusev3: cache reservation finalized more than once"))
+				return 0, fuse.EIO
+			}
+			reservation.state = cacheReservationFinalized
+		}
+	}
+	publication.originalFinalized = true
+	nameDropped, attrDropped := false, make(map[publicationIdentity]bool)
+	for _, candidate := range publication.names {
+		if candidate.reservation != nil && candidate.reservation.revoked {
+			nameDropped = true
+		}
+	}
+	for identity, dropped := range publication.droppedAttrs {
+		attrDropped[identity] = dropped
+	}
+	for _, candidate := range publication.attrs {
+		if candidate.reservation != nil && candidate.reservation.revoked {
+			attrDropped[candidate.identity] = true
+		}
+	}
+	for _, candidate := range publication.dirPlus {
+		if candidate.entry == nil {
+			continue
+		}
+		if candidate.nameReservation != nil && candidate.nameReservation.revoked {
+			candidate.entry.SetEntryTimeout(0)
+		}
+		if candidate.attrReservation != nil && candidate.attrReservation.revoked {
+			candidate.entry.SetAttrTimeout(0)
+		}
+	}
+	r.mu.Unlock()
+
+	if nameDropped {
+		zeroEntryLifetime(opcode, outData)
+	}
+	if publication.cacheStamp != nil {
+		if len(payload) < fuse.PFSCacheStampSize {
+			return 0, fuse.EIO
+		}
+		if len(publication.attrs) != 0 && attrDropped[publication.attrs[0].identity] {
+			zeroAttrLifetime(opcode, outData)
+		}
+		if !fuse.EncodePFSCacheStamp(payload, publication.cacheStamp) {
+			return 0, fuse.EIO
+		}
+		return fuse.PFSCacheStampSize, fuse.OK
+	}
+	if publication.postState == nil {
+		if opcode == 44 { // READDIRPLUS
+			return payloadSize, fuse.OK
+		}
+		return 0, fuse.OK
+	}
+	state := publication.postState
+	if err := validateMutationPostStateForOpcode(opcode, state); err != nil {
+		r.mount.revoke(err)
+		return 0, fuse.EIO
+	}
+	needed := fuse.PFSPostStateHeaderSize + len(state.GetObjects())*fuse.PFSObjectStateSize
+	if len(payload) < needed {
+		return 0, fuse.EIO
+	}
+	binary.LittleEndian.PutUint64(payload[0:8], state.GetVisibilitySequence())
+	binary.LittleEndian.PutUint64(payload[8:16], state.GetSnapshotSequence())
+	binary.LittleEndian.PutUint64(payload[16:24], uint64(r.attrTimeout))
+	binary.LittleEndian.PutUint32(payload[24:28], uint32(len(state.GetObjects())))
+	binary.LittleEndian.PutUint32(payload[28:32], 0)
+	offset := fuse.PFSPostStateHeaderSize
+	r.mu.Lock()
+	for _, object := range state.GetObjects() {
+		identity, _ := publicationIdentityFromBytes(object.GetStableIdentity())
+		record := r.byIdentityLocked(identity)
+		if record == nil {
+			r.mu.Unlock()
+			return 0, fuse.EIO
+		}
+		var attr fuse.Attr
+		fillAttr(object.GetAttr(), &attr, r.mount.uid, r.mount.gid)
+		var wireAttr [fuse.PFSWireAttrSize]byte
+		encodeFuseAttr(wireAttr[:], &attr)
+		wireObject := &fuse.PFSObjectState{
+			Nodeid: record.id, ObjectVersion: object.GetObjectVersion(), Attr: wireAttr,
+			Roles: object.GetRoles(), InodeFlags: object.GetAttr().GetFlags(),
+			BirthTimeNS: object.GetAttr().GetBirthTimeNs(), PFSClass: 1,
+		}
+		copy(wireObject.StableIdentity[:], object.GetStableIdentity())
+		if attrDropped[identity] {
+			wireObject.RecordFlags = 1
+		}
+		if !fuse.EncodePFSObjectState(payload[offset:offset+fuse.PFSObjectStateSize], wireObject) {
+			r.mu.Unlock()
+			return 0, fuse.EIO
+		}
+		offset += fuse.PFSObjectStateSize
+	}
+	r.mu.Unlock()
+	return needed, fuse.OK
+}
+
+func zeroEntryLifetime(opcode uint32, out []byte) {
+	switch opcode {
+	case 1, 6, 8, 9, 13, 35, 51: // LOOKUP, SYMLINK, MKNOD, MKDIR, LINK, CREATE, TMPFILE
+		if len(out) >= 40 {
+			clear(out[16:24])
+			clear(out[32:36])
+		}
+	}
+}
+
+func zeroAttrLifetime(opcode uint32, out []byte) {
+	switch opcode {
+	case 1, 6, 8, 9, 13, 35, 51:
+		if len(out) >= 40 {
+			clear(out[24:32])
+			clear(out[36:40])
+		}
+	case 3, 4: // GETATTR, SETATTR
+		if len(out) >= 12 {
+			clear(out[0:12])
+		}
+	}
+}
+
+func encodeFuseAttr(out []byte, attr *fuse.Attr) {
+	binary.LittleEndian.PutUint64(out[0:8], attr.Ino)
+	binary.LittleEndian.PutUint64(out[8:16], attr.Size)
+	binary.LittleEndian.PutUint64(out[16:24], attr.Blocks)
+	binary.LittleEndian.PutUint64(out[24:32], attr.Atime)
+	binary.LittleEndian.PutUint64(out[32:40], attr.Mtime)
+	binary.LittleEndian.PutUint64(out[40:48], attr.Ctime)
+	binary.LittleEndian.PutUint32(out[48:52], attr.Atimensec)
+	binary.LittleEndian.PutUint32(out[52:56], attr.Mtimensec)
+	binary.LittleEndian.PutUint32(out[56:60], attr.Ctimensec)
+	binary.LittleEndian.PutUint32(out[60:64], attr.Mode)
+	binary.LittleEndian.PutUint32(out[64:68], attr.Nlink)
+	binary.LittleEndian.PutUint32(out[68:72], attr.Uid)
+	binary.LittleEndian.PutUint32(out[72:76], attr.Gid)
+	binary.LittleEndian.PutUint32(out[76:80], attr.Rdev)
+	binary.LittleEndian.PutUint32(out[80:84], attr.Blksize)
+	binary.LittleEndian.PutUint32(out[84:88], attr.Flags)
 }
 
 // ReplyPublishMarked freezes a state-bearing original kernel request identity
@@ -892,6 +1734,9 @@ func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
 func (r *rawFileSystem) ReplyPublishMarked(unique uint64, nodeid uint64, opcode uint32) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.replyTerminal || r.replyTerminalizing {
+		return false
+	}
 	if r.publishAcks[unique] != nil {
 		return false
 	}
@@ -910,6 +1755,24 @@ func (r *rawFileSystem) ReplyPublishMarked(unique uint64, nodeid uint64, opcode 
 // /dev/fuse write attempt and after its ordering mutex has been released.
 func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return
+	}
+	if r.replyTerminalizing {
+		publication := r.replyPublications[unique]
+		if publication != nil && publication.originalFinalized && !publication.originalWrote {
+			publication.originalWrote = true
+			publication.originalStatus = status
+			close(publication.originalDone)
+			if status.Ok() {
+				r.releaseReplyCapacityLocked(publication)
+			}
+			r.signalSourceChangedLocked()
+		}
+		r.mu.Unlock()
+		return
+	}
 	if publication := r.publishAcks[unique]; publication != nil {
 		delete(r.publishAcks, unique)
 		if publication.publishUnique != unique || r.replyPublications[publication.requestUnique] != publication {
@@ -923,7 +1786,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 			return
 		}
 		delete(r.replyPublications, publication.requestUnique)
-		r.settleReplyPublicationLocked(publication, status.Ok())
+		responseConsumption := r.settleReplyPublicationLocked(publication, status.Ok())
 		r.mu.Unlock()
 		if !status.Ok() {
 			r.finishOneShotWritePublication(publication)
@@ -933,14 +1796,14 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 			if !r.mount.replyWriteLostAfterObservedUnmount(status) {
 				r.mount.revoke(fmt.Errorf("fusev3: write PFS_PUBLISH acknowledgment %d: %v", unique, status))
 			}
-			publication.consumeAuthorityResponse()
+			consumeClaimedAuthorityResponses(responseConsumption)
 			return
 		}
 		r.finishWriteTransactionPublication(publication, unique)
 		if publication.source != nil {
 			publication.source.release()
 		}
-		publication.consumeAuthorityResponse()
+		consumeClaimedAuthorityResponses(responseConsumption)
 		return
 	}
 	publication := r.replyPublications[unique]
@@ -952,17 +1815,24 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	publication.originalWrote = true
 	publication.originalStatus = status
 	close(publication.originalDone)
+	if status.Ok() {
+		// Capacity bounds how many reply writers may be admitted, not how long a
+		// physically written candidate remains addressable for peer revocation.
+		r.releaseReplyCapacityLocked(publication)
+	}
 	// A same-mount source gate may be waiting for exactly this physical edge:
 	// once a negative reply is in the kernel's hands, its enclosing mutation may
 	// supersede it even though the merged post-VFS receipt is still outstanding.
 	r.signalSourceChangedLocked()
+	dirPlusCompletion := r.settleDirPlusLookupTransactionLocked(publication, status.Ok())
 	if !status.Ok() {
 		delete(r.replyPublications, unique)
 		if publication.publishUnique != 0 && r.publishAcks[publication.publishUnique] == publication {
 			delete(r.publishAcks, publication.publishUnique)
 		}
-		r.settleReplyPublicationLocked(publication, false)
+		responseConsumption := r.settleReplyPublicationLocked(publication, false)
 		r.mu.Unlock()
+		r.finishDirPlusLookupCompletion(dirPlusCompletion)
 		r.finishOneShotWritePublication(publication)
 		if publication.source != nil {
 			publication.source.revoke()
@@ -970,21 +1840,23 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		if !r.mount.replyWriteLostAfterObservedUnmount(status) {
 			r.mount.revoke(fmt.Errorf("fusev3: publish FUSE reply %d to the kernel: %v", unique, status))
 		}
-		publication.consumeAuthorityResponse()
+		consumeClaimedAuthorityResponses(responseConsumption)
 		return
 	}
 	if !publication.needsPostVFS {
 		delete(r.replyPublications, unique)
-		r.settleReplyPublicationLocked(publication, true)
+		responseConsumption := r.settleReplyPublicationLocked(publication, true)
 		r.mu.Unlock()
+		r.finishDirPlusLookupCompletion(dirPlusCompletion)
 		r.finishWriteTransactionPublication(publication, unique)
 		if publication.source != nil {
 			publication.source.release()
 		}
-		publication.consumeAuthorityResponse()
+		consumeClaimedAuthorityResponses(responseConsumption)
 		return
 	}
 	r.mu.Unlock()
+	r.finishDirPlusLookupCompletion(dirPlusCompletion)
 }
 
 func (r *rawFileSystem) finishWriteTransactionPublication(publication *replyPublication, unique uint64) {
@@ -1231,6 +2103,9 @@ func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
 	if r.cachedData[record.key.inode] == record {
 		delete(r.cachedData, record.key.inode)
 	}
+	if r.cachedAttrs[record.identity] == record {
+		delete(r.cachedAttrs, record.identity)
+	}
 	if record.graft {
 		// A machine-local object holds no authority capability, so there is
 		// nothing for the cleanup lane to hand back.
@@ -1378,25 +2253,6 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	defer r.release(parent)
 	if r.grafts != nil {
 		if handled, status := r.graftLookup(parent, name, out); handled {
-			// A missing route name directly below an authority directory is a
-			// negative result in that SHARED parent. The returned child class
-			// selects positive LOOKUP publication, but ENOENT has no child attr,
-			// so its class is necessarily the parent's. A miss below an already
-			// LOCAL graft directory remains entirely local and unmarked.
-			if status == fuse.Status(syscall.ENOENT) && !parent.graft {
-				ctx, finish, lifecycle := r.mutationContext(header.Unique)
-				if !lifecycle.Ok() {
-					return lifecycle
-				}
-				publication := replyPublicationFromContext(ctx)
-				if publication == nil {
-					finish()
-					r.mount.revoke(errors.New("fusev3: negative graft-root lookup escaped its post-VFS reply-publication lifecycle"))
-					return fuse.Status(syscall.ENOTCONN)
-				}
-				publication.needsPostVFS = true
-				finish()
-			}
 			return status
 		}
 	}
@@ -1900,6 +2756,10 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 		return fuse.Status(syscall.ENOTCONN)
 	}
 	out.Fh, out.OpenFlags = id, flags
+	if err := completeSourcePublication(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	return fuse.OK
 }
 
@@ -2415,7 +3275,7 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 		return fuse.Status(errno)
 	}
 	for {
-		entry, errno := handle.peek(ctx)
+		entry, _, errno := handle.peek(ctx, false)
 		if errno != 0 {
 			return fuse.Status(errno)
 		}
@@ -2428,8 +3288,103 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 	}
 }
 
-func (r *rawFileSystem) ReadDirPlus(<-chan struct{}, *fuse.ReadIn, *fuse.DirEntryList) fuse.Status {
-	return fuse.ENOSYS
+func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+	// Mixed authority/local directories do not negotiate READDIRPLUS, so seeing
+	// a local handle here means the kernel violated the negotiated capability.
+	if r.grafts != nil {
+		if held, handle := r.acquireGraftDirHandle(input.Fh); handle != nil {
+			r.releaseHandleOperation(held)
+			return fuse.EIO
+		}
+	}
+	handleRecord, handle := r.acquireDirHandle(input.Fh)
+	if handle == nil {
+		return fuse.EBADF
+	}
+	releaseHandle := true
+	defer func() {
+		if releaseHandle {
+			r.releaseHandleOperation(handleRecord)
+		}
+	}()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	cursor, errno := handle.beginDirPlus(ctx, input.Offset)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	if err := r.attachDirPlusLookupTransaction(ctx, cursor, handleRecord); err != nil {
+		_ = cursor.finish(false)
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	// The reply transaction now retains this handle operation until the
+	// physical write commits or rolls back the staged page.
+	releaseHandle = false
+	candidates := make([]dirPlusCandidate, 0, 32)
+	for {
+		entry, dirent, errno := handle.peek(ctx, true)
+		if errno != 0 {
+			return fuse.Status(errno)
+		}
+		if entry == nil || dirent == nil {
+			break
+		}
+		item := dirent.GetItem()
+		if item == nil || item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) {
+			r.mount.revoke(errors.New("fusev3: authority READDIRPLUS record omitted or disagreed with its item"))
+			return fuse.Status(syscall.ENOTCONN)
+		}
+		if !out.PFSDirLookupEntryFits(entry.Name) {
+			if len(candidates) == 0 {
+				return fuse.Status(syscall.EOVERFLOW)
+			}
+			break
+		}
+		record, internErrno := r.intern(ctx, item)
+		if internErrno != 0 {
+			return fuse.Status(internErrno)
+		}
+		if err := r.stageDirPlusLookup(ctx, record, handleRecord.inode, entry.Name); err != nil {
+			r.Forget(record.id, 1)
+			r.mount.revoke(err)
+			return fuse.Status(syscall.ENOTCONN)
+		}
+		transferred := handle.consumePlus()
+		if transferred != item {
+			r.mount.revoke(errors.New("fusev3: READDIRPLUS capability transfer lost its pending item"))
+			return fuse.Status(syscall.ENOTCONN)
+		}
+		entry.Ino = record.key.inode
+		entryOut, stamp := out.AddPFSDirLookupEntry(*entry)
+		if entryOut == nil || stamp == nil {
+			return fuse.EIO
+		}
+		entryOut.NodeId, entryOut.Generation = record.id, 1
+		entryOut.SetEntryTimeout(0)
+		entryOut.SetAttrTimeout(0)
+		fillAttr(item.GetAttr(), &entryOut.Attr, r.mount.uid, r.mount.gid)
+		stamp.SnapshotSequence = dirent.GetSnapshotSequence()
+		stamp.ObjectVersion = dirent.GetObjectVersion()
+		stamp.BirthTimeNS = item.GetAttr().GetBirthTimeNs()
+		stamp.InodeFlags = item.GetAttr().GetFlags()
+		candidates = append(candidates, dirPlusCandidate{entry: entryOut, dirent: dirent, item: item, record: record})
+		if handle.authorityPageExhausted() {
+			break
+		}
+	}
+	if err := r.publishDirPlusPage(ctx, handleRecord.inode, candidates); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := r.commitDirPlusLookupTransaction(ctx); err != nil {
+		r.mount.revoke(err)
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	return fuse.OK
 }
 
 func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
@@ -2637,12 +3592,13 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 	publication.needsPostVFS = true
 	inode := attr.GetInode()
 	r.mu.Lock()
-	lifetime, coordinate, cached := r.admitAttrLocked(ctx, inode, identity)
+	record := r.byIdentityLocked(identity)
+	lifetime, coordinate, reservation, cached := r.admitAttrLocked(ctx, inode, identity)
 	r.mu.Unlock()
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 	out.SetTimeout(lifetime)
 	if cached {
-		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, coordinate: coordinate})
+		publication.attrs = append(publication.attrs, replyAttrPublication{inode: inode, identity: identity, record: record, coordinate: coordinate, reservation: reservation})
 	}
 }
 

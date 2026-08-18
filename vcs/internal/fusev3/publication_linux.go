@@ -29,6 +29,10 @@ func (r *rawFileSystem) PFSPublish(_ <-chan struct{}, input *fuse.PFSPublishIn, 
 	}
 
 	r.mu.Lock()
+	if r.replyTerminal || r.replyTerminalizing {
+		r.mu.Unlock()
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	publication := r.replyPublications[input.RequestUnique]
 	if publication == nil || !publication.marked || publication.requestUnique != input.RequestUnique ||
 		publication.nodeid != input.Nodeid || publication.opcode != input.Opcode ||
@@ -54,6 +58,10 @@ func (r *rawFileSystem) PFSPublish(_ <-chan struct{}, input *fuse.PFSPublishIn, 
 	case <-originalDone:
 	case <-r.mount.ctx.Done():
 		r.mu.Lock()
+		if r.replyTerminal || r.replyTerminalizing {
+			r.mu.Unlock()
+			return fuse.Status(syscall.ENOTCONN)
+		}
 		if r.publishAcks[input.Unique] == publication {
 			delete(r.publishAcks, input.Unique)
 		}
@@ -64,6 +72,10 @@ func (r *rawFileSystem) PFSPublish(_ <-chan struct{}, input *fuse.PFSPublishIn, 
 	}
 
 	r.mu.Lock()
+	if r.replyTerminal || r.replyTerminalizing {
+		r.mu.Unlock()
+		return fuse.Status(syscall.ENOTCONN)
+	}
 	if r.replyPublications[input.RequestUnique] != publication || !publication.originalWrote ||
 		!publication.originalStatus.Ok() || r.publishAcks[input.Unique] != publication {
 		if r.publishAcks[input.Unique] == publication {

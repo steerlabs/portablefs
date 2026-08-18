@@ -7,7 +7,7 @@ stock-FUSE compatibility shim.
 The historical directory name says `append`; the implementation now covers the
 whole strict kernel publication boundary:
 
-- exact 7.41 profile negotiation and immutable SHARED/LOCAL classification;
+- exact 7.42 profile negotiation and immutable SHARED/LOCAL classification;
 - cacheable SHARED regular opens (`FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED`) whose
   page cache is withdrawn by ordered DATA publication under
   `mapping->invalidate_lock`, plus the whole-inode withdrawal a revoking mount
@@ -16,7 +16,9 @@ whole strict kernel publication boundary:
   fits both `max_write` and one negotiated request page vector, with the staged
   transaction ladder used for every multi-fragment shape;
 - a generic post-VFS publication ACK for marked replies;
-- ordered exact-size/full-data invalidation notifications;
+- exact post-state trailers and stamped LOOKUP, GETATTR, and READDIRPLUS
+  installation;
+- ordered exact SIZE, ATTR, and ENTRY repair notifications;
 - private full-mode XFS fallocate and SHARED copy-file-range requests;
 - stock classified TMPFILE with post-VFS publication;
 - exact write/splice/AIO/io_uring position and post-apply handling; and

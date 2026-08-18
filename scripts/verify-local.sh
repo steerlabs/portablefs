@@ -13,6 +13,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Login shells initialized by fnm already expose Node.  Non-interactive gate
+# runners do not necessarily source that shell setup, so resolve fnm's explicit
+# default installation before the release-policy checks need it.
+if ! command -v node >/dev/null 2>&1; then
+  PFS_FNM_ROOT="${FNM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fnm}"
+  PFS_NODE_BIN="$PFS_FNM_ROOT/aliases/default/bin/node"
+  if [[ -x "$PFS_NODE_BIN" ]]; then
+    PATH="$(dirname "$PFS_NODE_BIN"):$PATH"
+    export PATH
+  fi
+fi
+
 step() { printf '\n== %s ==\n' "$1"; }
 
 # 1. Cross-platform compile. Linux releases are static CGO-disabled binaries.
@@ -66,8 +78,8 @@ go -C vcs test -race ./...
 step "maintained go-fuse reply-publication seam"
 go -C vcs/third_party/go-fuse build ./fuse
 go -C vcs/third_party/go-fuse vet ./fuse
-go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
-go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply|LookupCallbackStatus|VariableReplyWithoutPortableFSLifecycle)'
+go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply|LookupCallbackStatus|VariableReplyWithoutPortableFSLifecycle)'
 
 # 5. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to
