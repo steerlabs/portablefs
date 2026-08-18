@@ -83,7 +83,7 @@ func validateMutationPostStateForOpcode(opcode uint32, state *authoritypb.PostSt
 	case 6, 8, 9, 51: // symlink, regular mknod, mkdir, tmpfile
 		valid = samePostStateRoles(got, postStateRoleCreated, postStateRoleParent)
 	case 35: // create-new or open-existing with O_TRUNC
-		valid = samePostStateRoles(got, postStateRoleTarget) ||
+		valid = samePostStateRoles(got, postStateRoleTarget, postStateRoleParent) ||
 			samePostStateRoles(got, postStateRoleCreated, postStateRoleParent)
 	case 13: // link
 		valid = samePostStateRoles(got, postStateRoleTarget, postStateRoleParent)

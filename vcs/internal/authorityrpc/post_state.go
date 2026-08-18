@@ -97,7 +97,7 @@ func validMutationPostStateRoles(request *authoritypb.Request, state *authorityp
 		return rolesEqual(got, postStateRoleParent, postStateRoleCreated)
 	case *authoritypb.Request_Create:
 		_ = body
-		return rolesEqual(got, postStateRoleTarget) || rolesEqual(got, postStateRoleParent, postStateRoleCreated)
+		return rolesEqual(got, postStateRoleParent, postStateRoleTarget) || rolesEqual(got, postStateRoleParent, postStateRoleCreated)
 	case *authoritypb.Request_Link:
 		return rolesEqual(got, postStateRoleTarget, postStateRoleParent)
 	case *authoritypb.Request_Unlink:
