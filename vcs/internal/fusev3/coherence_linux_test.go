@@ -897,7 +897,7 @@ func TestReadDirPlusParserFailureForceForgetsEveryUnlinkedRecord(t *testing.T) {
 	}
 	page := &authoritypb.ReadDirReply{Verifier: testToken(600), Eof: true}
 	for index, name := range []string{"linked", "failed", "tail"} {
-		item := testItem(uint64(100+index), authoritypb.Attr_REGULAR, uint64(200+index))
+		item := testItem(uint64(100+index), authoritypb.Attr_DIRECTORY, uint64(200+index))
 		item.ObjectVersion, item.SnapshotSequence = 9, 9
 		page.Entries = append(page.Entries, &authoritypb.Dirent{
 			Name: []byte(name), Attr: item.Attr, Item: item,
@@ -919,7 +919,7 @@ func TestReadDirPlusParserFailureForceForgetsEveryUnlinkedRecord(t *testing.T) {
 	records := make([]*inodeRecord, 0, 3)
 	f.raw.mu.Lock()
 	for index := range 3 {
-		record := f.raw.nodesByKey[inodeKey{inode: uint64(100 + index), kind: authoritypb.Attr_REGULAR}]
+		record := f.raw.nodesByKey[inodeKey{inode: uint64(100 + index), kind: authoritypb.Attr_DIRECTORY}]
 		if record == nil || record.lookups != 1 {
 			f.raw.mu.Unlock()
 			t.Fatalf("physically accepted page record %d = %p lookups=%d, want one kernel lookup", index, record, func() uint64 {
