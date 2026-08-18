@@ -184,6 +184,22 @@ type clientReauthorizationHandler struct {
 	requests atomic.Int32
 }
 
+type pooledReadClientHandler struct {
+	clientTestHandler
+	replies atomic.Uint32
+}
+
+func (h *pooledReadClientHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	if request.GetRead() == nil {
+		return h.clientTestHandler.Handle(ctx, request)
+	}
+	fill := byte(h.replies.Add(1))
+	return &authoritypb.Response{
+		RequestId: request.GetRequestId(), Epoch: h.Epoch(),
+		Body: &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: bytes.Repeat([]byte{fill}, 64<<10)}},
+	}
+}
+
 func (h *clientReauthorizationHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	response := h.clientTestHandler.Handle(ctx, request)
 	if hello := response.GetHello(); hello != nil {
@@ -1816,6 +1832,47 @@ func TestIdempotentWritePhaseSkipsDefensiveRequestClone(t *testing.T) {
 	}
 	if got := owned.GetWriteTransaction().GetData(); len(got) != 1<<20 || got[0] != 2 || got[len(got)-1] != 2 {
 		t.Fatal("owned DATA payload changed during dispatch")
+	}
+}
+
+func TestClientRetainsPooledReadPayloadUntilConsumption(t *testing.T) {
+	handler := &pooledReadClientHandler{clientTestHandler: clientTestHandler{
+		epoch: bytes.Repeat([]byte{0x4A}, 16), maxInFlight: 4,
+	}}
+	address, clientTLS, stop := startTestServer(t, handler, 4, time.Minute)
+	defer stop()
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	request := func() *authoritypb.Request {
+		return &authoritypb.Request{Body: &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{
+			Handle: make([]byte, 16), Length: 64 << 10,
+		}}}
+	}
+	response, consumption, err := client.CallReadRetained(context.Background(), request(), func(error) {})
+	if err != nil || consumption == nil || len(response.GetRead().GetData()) != 64<<10 {
+		t.Fatalf("retained read = (%v, %T, %v)", response, consumption, err)
+	}
+	retained := response.GetRead().GetData()
+	for attempt := range 32 {
+		next, err := client.CallRead(context.Background(), request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := byte(attempt + 2)
+		if got := next.GetRead().GetData(); len(got) != 64<<10 || got[0] != want || got[len(got)-1] != want {
+			t.Fatalf("read %d did not survive its frame release", attempt+2)
+		}
+		if retained[0] != 1 || retained[len(retained)-1] != 1 {
+			t.Fatalf("retained read was overwritten by pooled response %d before consumption", attempt+2)
+		}
+	}
+	consumption.Consume()
+	if response.GetRead().GetData() != nil {
+		t.Fatal("consumed read still exposes its recycled frame payload")
 	}
 }
 
