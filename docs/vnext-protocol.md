@@ -654,8 +654,8 @@ install. ACLs are forgotten before publication of the new record.
 PFS_ENTRY remains stamp-only. It takes the parent's `pfs_publish_mutex`,
 performs the expire or delete repair, calls
 `inode_maybe_inc_iversion(parent, false)`, and under the parent `fi->lock`
-increments `fi->attr_version` and advances only
-`fi->pfs_entry_repair_sequence`; it never changes `fi->pfs_object_version`.
+advances only `fi->pfs_entry_repair_sequence`; it changes neither
+`fi->attr_version` nor `fi->pfs_object_version`.
 Every later positive or negative entry compares its `snapshot_sequence` with
 the maximum of those two independent gates as specified in section 2.3. The
 entry-repair stamp is installed even when the named dentry is absent. Every
