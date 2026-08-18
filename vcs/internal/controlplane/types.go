@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
+	"github.com/steerlabs/portablefs/vcs/internal/productauth"
 )
 
 const (
@@ -26,17 +27,24 @@ const (
 	MaxActiveMountEnrollmentsPerAuthorizationDomain = 512
 	MaxActiveMountEnrollmentsPerVolume              = 256
 	MaxRetainedMountEnrollments                     = 4096
+	MaxRenewalFenceBatchEntries                     = 4096
+	// MaxRenewalFences keeps the index comfortably below the 64 MiB serialized
+	// state cap. Deletion waits for a future scope-retirement coordinator because
+	// removing a high-water mark would re-admit lower generations.
+	MaxRenewalFences = 65536
 )
 
 var (
-	ErrInvalid            = errors.New("controlplane: invalid request")
-	ErrNotFound           = errors.New("controlplane: not found")
-	ErrConflict           = errors.New("controlplane: conflict")
-	ErrCapacity           = errors.New("controlplane: no cell has sufficient capacity")
-	ErrEnrollmentCapacity = errors.New("controlplane: mount enrollment capacity reached")
-	ErrIdempotencyReuse   = errors.New("controlplane: idempotency key reused for a different request")
-	ErrQuarantined        = errors.New("controlplane: resource is quarantined")
-	ErrEnrollmentEnded    = errors.New("controlplane: mount enrollment has ended")
+	ErrInvalid              = errors.New("controlplane: invalid request")
+	ErrNotFound             = errors.New("controlplane: not found")
+	ErrConflict             = errors.New("controlplane: conflict")
+	ErrCapacity             = errors.New("controlplane: no cell has sufficient capacity")
+	ErrEnrollmentCapacity   = errors.New("controlplane: mount enrollment capacity reached")
+	ErrRenewalFenceCapacity = errors.New("controlplane: renewal fence capacity reached")
+	ErrIdempotencyReuse     = errors.New("controlplane: idempotency key reused for a different request")
+	ErrQuarantined          = errors.New("controlplane: resource is quarantined")
+	ErrEnrollmentEnded      = errors.New("controlplane: mount enrollment has ended")
+	ErrRenewalScopeFenced   = errors.New("renewal_scope_fenced")
 )
 
 type VolumeState string
@@ -66,6 +74,7 @@ type State struct {
 	AuthorizationNonces        map[string]AuthorizationNonce        `json:"authorization_nonces"`
 	MountEnrollments           map[string]MountEnrollment           `json:"mount_enrollments,omitempty"`
 	MountAuthorizationContexts map[string]MountAuthorizationContext `json:"mount_authorization_contexts,omitempty"`
+	RenewalFences              map[string]uint64                    `json:"renewal_fences,omitempty"`
 }
 
 type Cell struct {
@@ -166,6 +175,22 @@ type MountEnrollment struct {
 	LastAuthorizationContext string                    `json:"last_authorization_context_sha256,omitempty"`
 	UpdatedUnix              int64                     `json:"updated_unix"`
 	TerminationReason        string                    `json:"termination_reason,omitempty"`
+	RenewalScope             string                    `json:"renewal_scope,omitempty"`
+	RenewalEpoch             uint64                    `json:"renewal_epoch,omitempty"`
+}
+
+type MountEnrollmentRevocationOutcome string
+
+const (
+	MountEnrollmentRevocationRevoked MountEnrollmentRevocationOutcome = "REVOKED"
+	MountEnrollmentRevocationClosed  MountEnrollmentRevocationOutcome = "CLOSED"
+	MountEnrollmentRevocationAbsent  MountEnrollmentRevocationOutcome = "ABSENT"
+)
+
+type MountEnrollmentRevocation struct {
+	VolumeID     string                           `json:"volume_id"`
+	EnrollmentID string                           `json:"enrollment_id"`
+	Outcome      MountEnrollmentRevocationOutcome `json:"outcome"`
 }
 
 // MountAuthorizationReplay is the non-derivable portion of the exact current
@@ -250,6 +275,20 @@ type TerminateMountEnrollmentRequest struct {
 	Reason string `json:"reason"`
 }
 
+type RenewalFence struct {
+	Scope string `json:"scope"`
+	Epoch uint64 `json:"epoch"`
+}
+
+type AdvanceRenewalFencesRequest struct {
+	Reason string         `json:"reason"`
+	Fences []RenewalFence `json:"fences"`
+}
+
+type AdvanceRenewalFencesResponse struct {
+	Fences []RenewalFence `json:"fences"`
+}
+
 type MountAuthorization struct {
 	VolumeID                 string   `json:"volume_id"`
 	AuthorityEndpoint        string   `json:"authority_endpoint"`
@@ -311,7 +350,7 @@ func NewState() State {
 	return State{
 		SchemaVersion: StateSchemaVersion, Cells: map[string]Cell{}, Volumes: map[string]Volume{}, Receipts: map[string]Receipt{},
 		AuthorizationNonces: map[string]AuthorizationNonce{}, MountEnrollments: map[string]MountEnrollment{},
-		MountAuthorizationContexts: map[string]MountAuthorizationContext{},
+		MountAuthorizationContexts: map[string]MountAuthorizationContext{}, RenewalFences: map[string]uint64{},
 	}
 }
 
@@ -321,6 +360,9 @@ func (state State) Validate() error {
 	}
 	if len(state.MountEnrollments) > MaxRetainedMountEnrollments {
 		return fmt.Errorf("%w: mount enrollment capacity", ErrInvalid)
+	}
+	if len(state.RenewalFences) > MaxRenewalFences {
+		return fmt.Errorf("%w: renewal fence capacity", ErrInvalid)
 	}
 	if len(state.MountAuthorizationContexts) > len(state.MountEnrollments) {
 		return fmt.Errorf("%w: mount authorization context capacity", ErrInvalid)
@@ -363,9 +405,16 @@ func (state State) Validate() error {
 			return fmt.Errorf("%w: authorization nonce", ErrInvalid)
 		}
 	}
+	for key, epoch := range state.RenewalFences {
+		issuer, scope, found := strings.Cut(key, "\x00")
+		if !found || !validIdentity(issuer) || !validRenewalScope(scope) || epoch == 0 || epoch > productauth.MaxRenewalEpoch || renewalFenceKey(issuer, scope) != key {
+			return fmt.Errorf("%w: renewal fence", ErrInvalid)
+		}
+	}
 	activeEnrollments := 0
 	activeByAuthorizationDomain := make(map[string]int)
 	activeByVolume := make(map[string]int)
+	activeRenewalScopes := make(map[string]struct{})
 	referencedAuthorizationContexts := make(map[string]struct{})
 	for id, enrollment := range state.MountEnrollments {
 		if id != enrollment.ID || !cellplan.ValidID(id) || !cellplan.ValidID(enrollment.VolumeID) ||
@@ -374,7 +423,10 @@ func (state State) Validate() error {
 			!cellplan.ValidID(enrollment.CellID) || !validDNSName(enrollment.AuthorityID) ||
 			enrollment.AuthorityGeneration == 0 || enrollment.CreatedUnix <= 0 ||
 			enrollment.ExpiresUnix <= enrollment.CreatedUnix || enrollment.UpdatedUnix < enrollment.CreatedUnix ||
-			!validOptionalIdentity(enrollment.TerminationReason) {
+			!validOptionalIdentity(enrollment.TerminationReason) ||
+			(enrollment.RenewalScope == "") != (enrollment.RenewalEpoch == 0) ||
+			enrollment.RenewalEpoch > productauth.MaxRenewalEpoch ||
+			enrollment.RenewalScope != "" && !validRenewalScope(enrollment.RenewalScope) {
 			return fmt.Errorf("%w: mount enrollment %q", ErrInvalid, id)
 		}
 		peer, err := hex.DecodeString(enrollment.PeerSPKI)
@@ -386,10 +438,23 @@ func (state State) Validate() error {
 			volume.CellID != enrollment.CellID || volume.AuthorityID != enrollment.AuthorityID {
 			return fmt.Errorf("%w: mount enrollment volume binding", ErrInvalid)
 		}
+		if enrollment.RenewalScope != "" {
+			highWater, ok := state.RenewalFences[renewalFenceKey(enrollment.ProductIssuer, enrollment.RenewalScope)]
+			if !ok || enrollment.RenewalEpoch > highWater || enrollment.State == MountEnrollmentActive && enrollment.RenewalEpoch < highWater {
+				return fmt.Errorf("%w: mount enrollment renewal fence", ErrInvalid)
+			}
+		}
 		switch enrollment.State {
 		case MountEnrollmentActive:
 			if enrollment.TerminationReason != "" {
 				return fmt.Errorf("%w: active mount enrollment termination", ErrInvalid)
+			}
+			if enrollment.RenewalScope != "" {
+				key := renewalFenceKey(enrollment.ProductIssuer, enrollment.RenewalScope)
+				if _, exists := activeRenewalScopes[key]; exists {
+					return fmt.Errorf("%w: active mount enrollment renewal scope", ErrInvalid)
+				}
+				activeRenewalScopes[key] = struct{}{}
 			}
 			if volume.AuthorityGeneration != enrollment.AuthorityGeneration {
 				return fmt.Errorf("%w: active mount enrollment authority generation", ErrInvalid)
@@ -548,6 +613,10 @@ func validIdentity(value string) bool {
 }
 
 func validOptionalIdentity(value string) bool { return value == "" || validIdentity(value) }
+
+func validRenewalScope(value string) bool { return productauth.ValidRenewalScope(value) }
+
+func renewalFenceKey(productIssuer, scope string) string { return productIssuer + "\x00" + scope }
 
 func validSHA256Hex(value string) bool {
 	decoded, err := hex.DecodeString(value)

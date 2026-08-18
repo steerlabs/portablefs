@@ -22,9 +22,11 @@ OS kernel page caches remain part of each mount contract. For why, read
 | `cmd/portablefs` | The user-facing CLI: mount, umount, mounts, route, prune-local, daemon, doctor, mount-check, version, and the installer and lifecycle coordination subcommands. Linux and macOS. |
 | `cmd/portablefs-authority` | The volume authority. Linux only. One process serves exactly one volume, refuses to run as root, and terminates its epoch on any storage failure. |
 | `cmd/portablefs-manager` | The product-neutral hosted manager. It owns desired state, placement, PKI, grants, and fencing generations, but never filesystem contents. |
+| `cmd/portablefs-files` | A private, non-mounting read gateway for product file browsers. It accepts request-bound Ed25519 tokens, holds bounded read-only authority sessions, pages directories, bounds previews, and streams downloads. |
 | `cmd/portablefs-cell-agent` | The unprivileged outbound reconciliation loop on each Linux storage cell. |
 | `cmd/portablefs-cell-helper` | The narrow root helper that applies only a verified, manager-signed cell plan. Linux only. |
 | `cmd/portablefs-authority-launcher` | The fixed-argument systemd launcher for an isolated per-volume authority. Linux only. |
+| `cmd/portablefs-files` | The bounded read-only HTTP adapter for a colocated product backend. It holds strict, cacheless authority sessions and never mounts a volume. |
 | `cmd/portablefsd` | The per-user daemon. On macOS it is the v3 data plane behind the FSKit extension: it owns the authority session and never exposes authority credentials to the extension. |
 | `cmd/portablefs-mount-v3` | A standalone Linux mount client. This is what the coherence harnesses drive; ordinary users go through `portablefs mount`. |
 
@@ -32,6 +34,8 @@ OS kernel page caches remain part of each mount contract. For why, read
 
 ```text
 hostedauth/       Public product assertion signer and CSR SPKI helper.
+readonlyfs/       Public non-mounting read client with byte-safe path keys,
+                  exact authority handle cleanup, and live directory cursors.
 internal/
   xfsstore/        XFS-only, descriptor-relative volume backend: openat2 under
                    RESOLVE_BENEATH, *at syscalls, device verification, stable
@@ -70,6 +74,8 @@ internal/
                    on.
   localroutes/     Machine-local backing directories, keyed by (volume, route
                    root) so they survive unmount.
+  readonlyfs/      Strict, cacheless, non-mounting authority client used by the
+                   bounded files adapter.
   confinedfs/      The machine-local backing capability boundary: openat2 with
                    RESOLVE_IN_ROOT, failing closed where it is unavailable.
   fskitidentity/   The signed macOS identity tuple: app group, filesystem type,

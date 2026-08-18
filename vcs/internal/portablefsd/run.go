@@ -69,7 +69,10 @@ func (s *Server) Run(ctx context.Context) error {
 			return err
 		}
 	}
-	s.registry = newRuntimeRegistry(s.cfg.StateDir)
+	if err := privatepath.EnsureDir(s.cfg.MountLogDir); err != nil {
+		return fmt.Errorf("validate per-mount log directory: %w", err)
+	}
+	s.registry = newRegistryWithMountLogDir(s.cfg.StateDir, s.cfg.MountLogDir)
 	if s.registry.loadErr != nil {
 		return fmt.Errorf("strict persisted attach inventory: %w", s.registry.loadErr)
 	}

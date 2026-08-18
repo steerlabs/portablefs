@@ -170,8 +170,7 @@ func TestDecidePostUnmount(t *testing.T) {
 	tests := []struct {
 		name                    string
 		mounted                 bool
-		fuseForceCompleted      bool
-		fskitUnmountCompleted   bool
+		outcome                 detachOutcome
 		wantPlatformUnmount     bool
 		wantStaleReconciliation bool
 		wantError               string
@@ -187,33 +186,48 @@ func TestDecidePostUnmount(t *testing.T) {
 			wantStaleReconciliation: true,
 		},
 		{
-			name:                  "acknowledged FSKit absence is normal completion",
-			fskitUnmountCompleted: true,
+			name:    "acknowledged FSKit absence is normal completion",
+			outcome: detachFSKitDaemon,
 		},
 		{
-			name:               "acknowledged forced FUSE absence is normal completion",
-			fuseForceCompleted: true,
+			name:    "cooperative FUSE absence is normal completion",
+			outcome: detachFUSECooperative,
 		},
 		{
-			name:                  "acknowledged FSKit mount remaining is FSKit failure",
-			mounted:               true,
-			fskitUnmountCompleted: true,
-			wantError:             "FSKit unmount acknowledged completion",
-			rejectError:           "FUSE",
+			name:    "acknowledged forced FUSE absence is normal completion",
+			outcome: detachFUSEForced,
 		},
 		{
-			name:               "acknowledged forced FUSE mount remaining is FUSE failure",
-			mounted:            true,
-			fuseForceCompleted: true,
-			wantError:          "forced FUSE owner acknowledged parking",
+			name:        "acknowledged FSKit mount remaining is FSKit failure",
+			mounted:     true,
+			outcome:     detachFSKitDaemon,
+			wantError:   "FSKit unmount acknowledged completion",
+			rejectError: "FUSE",
+		},
+		{
+			name:      "acknowledged forced FUSE mount remaining is FUSE failure",
+			mounted:   true,
+			outcome:   detachFUSEForced,
+			wantError: "forced FUSE owner acknowledged parking",
+		},
+		{
+			name:        "cooperative FUSE mount remaining is a completion failure",
+			mounted:     true,
+			outcome:     detachFUSECooperative,
+			wantError:   "cooperative FUSE unmount completed",
+			rejectError: "FSKit",
+		},
+		{
+			name:      "unknown completion outcome fails closed",
+			outcome:   detachOutcome(255),
+			wantError: "unknown detach outcome",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			platformUnmount, reconcileStale, err := decidePostUnmount(
 				tc.mounted,
-				tc.fuseForceCompleted,
-				tc.fskitUnmountCompleted,
+				tc.outcome,
 			)
 			if platformUnmount != tc.wantPlatformUnmount ||
 				reconcileStale != tc.wantStaleReconciliation {

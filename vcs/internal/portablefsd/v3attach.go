@@ -19,6 +19,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -459,6 +460,20 @@ func (a *attach) startV3(ctx context.Context) error {
 		}
 		return nil
 	}
+	var renewalEvents *mountlog.Writer
+	if cfg.enrollmentClient != nil {
+		var err error
+		renewalEvents, err = mountlog.OpenAppend(a.mountLogDir, a.mountPath, "macos-fskit", a.ref)
+		if err != nil {
+			return fmt.Errorf("initialize per-mount renewal event log: %w", err)
+		}
+	}
+	renewalEventsOwned := renewalEvents != nil
+	defer func() {
+		if renewalEventsOwned {
+			_ = renewalEvents.Close()
+		}
+	}()
 	tlsCfg, err := (dataPlaneTransport{
 		mode:       a.dataPlaneTransport,
 		serverName: a.dataPlaneServerName,
@@ -535,13 +550,17 @@ func (a *attach) startV3(ctx context.Context) error {
 	a.v3Data = d
 	a.v3Session = client
 	a.v3Coherence = d.bridge
+	var renewalDone chan struct{}
 	if cfg.enrollmentClient != nil {
 		a.authorizationDeadlineAtMs = cfg.initialAuthorizationDeadline.UnixMilli()
+		renewalDone = make(chan struct{})
+		a.renewalDone = renewalDone
 	}
 	a.mu.Unlock()
 	go a.watchV3Terminal(d)
 	if cfg.enrollmentClient != nil {
-		go a.runAutomaticMountRenewal(cfg, d)
+		renewalEventsOwned = false
+		go a.runAutomaticMountRenewal(cfg, d, renewalEvents, renewalDone)
 	}
 	return nil
 }
@@ -552,15 +571,27 @@ func releaseV3ClientBeforeKernelMount(client *authorityrpc.Client, cause error) 
 	return errors.Join(cause, client.ReleaseBeforeMount(ctx))
 }
 
-func (a *attach) runAutomaticMountRenewal(cfg *v3AttachConfig, d *v3DataPlane) {
+func (a *attach) runAutomaticMountRenewal(cfg *v3AttachConfig, d *v3DataPlane, events *mountlog.Writer, done chan struct{}) {
+	defer close(done)
+	defer func() {
+		if err := events.Close(); err != nil {
+			log.Printf("portablefsd: attach %s close renewal event log: %v", a.ref, err)
+		}
+	}()
 	renewer := &mountenrollment.Renewer{
 		Source: cfg.enrollmentClient, MinimumSafetyMargin: cfg.repairBudget,
-		Observe: func(status mountenrollment.RenewalStatus) {
+		Observe: func(event mountenrollment.RenewalEvent) {
+			if err := events.WriteRenewal(event); err != nil {
+				log.Printf("portablefsd: attach %s write renewal event: %v", a.ref, err)
+			}
+			status := event.Status
 			a.mu.Lock()
 			a.authorizationDeadlineAtMs = status.AuthorizationDeadline.UnixMilli()
+			a.lastReauthorizationAtMs = 0
 			if !status.LastSuccess.IsZero() {
 				a.lastReauthorizationAtMs = status.LastSuccess.UnixMilli()
 			}
+			a.nextReauthorizationAtMs = 0
 			if !status.NextAttempt.IsZero() {
 				a.nextReauthorizationAtMs = status.NextAttempt.UnixMilli()
 			}
