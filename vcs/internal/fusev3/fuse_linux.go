@@ -1355,6 +1355,20 @@ func requestRequiresSourcePublication(request *authoritypb.Request) bool {
 	}
 }
 
+func (m *Mount) retainMutationPostState(ctx context.Context, response *authoritypb.Response) error {
+	if response == nil || response.GetPostState() == nil {
+		return nil
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || publication.postState != nil {
+		err := errors.New("fusev3: mutation post-state escaped or duplicated its reply publication")
+		m.revoke(err)
+		return err
+	}
+	publication.postState = proto.Clone(response.GetPostState()).(*authoritypb.PostState)
+	return nil
+}
+
 func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*authoritypb.Response, syscall.Errno) {
 	ctx, cancel := n.opContext(parent)
 	defer cancel()
@@ -1363,13 +1377,8 @@ func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*au
 	}
 	defer n.mount.releaseBulk()
 	response, err := n.mount.callMutation(ctx, request)
-	if response != nil && response.GetPostState() != nil {
-		publication := replyPublicationFromContext(parent)
-		if publication == nil || publication.postState != nil {
-			n.mount.revoke(errors.New("fusev3: mutation post-state escaped or duplicated its reply publication"))
-			return response, syscall.ENOTCONN
-		}
-		publication.postState = proto.Clone(response.GetPostState()).(*authoritypb.PostState)
+	if retainErr := n.mount.retainMutationPostState(parent, response); retainErr != nil {
+		return response, syscall.ENOTCONN
 	}
 	return response, rpcErrno(response, err)
 }

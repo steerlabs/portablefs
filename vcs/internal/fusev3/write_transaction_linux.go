@@ -121,7 +121,11 @@ func (r *rawFileSystem) writeTransactionCall(ctx context.Context, request *autho
 	}
 	defer r.mount.releaseBulk()
 	if commit {
-		return r.mount.callMutation(ctx, request)
+		response, err := r.mount.callMutation(ctx, request)
+		if retainErr := r.mount.retainMutationPostState(ctx, response); retainErr != nil {
+			return response, retainErr
+		}
+		return response, err
 	}
 	response, consumption, err := r.mount.rpc.CallIdempotentRetained(
 		ctx, request, r.mount.forceTerminalResponseRevocation,

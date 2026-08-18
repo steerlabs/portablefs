@@ -74,6 +74,20 @@ func oneShotWriteInput(nodeID, handle uint64, size uint32) *fuse.PFSWriteIn {
 	}
 }
 
+func assertWriteReplyRetainsPostState(t *testing.T, fixture *strictFixture, unique uint64) {
+	t.Helper()
+	fixture.raw.mu.Lock()
+	publication := fixture.raw.replyPublications[unique]
+	var state *authoritypb.PostState
+	if publication != nil {
+		state = publication.postState
+	}
+	fixture.raw.mu.Unlock()
+	if state == nil || len(state.GetObjects()) != 1 || state.GetObjects()[0].GetRoles() != postStateRoleTarget {
+		t.Fatalf("write reply %d retained post-state = %+v, want one target object", unique, state)
+	}
+}
+
 func TestPFSWriteOneShotUsesOneRetainedMutationWithoutTransactionID(t *testing.T) {
 	fixture := newStrictFixture(t)
 	nodeID, handle := openWriteTransactionTestHandle(t, fixture)
@@ -110,6 +124,7 @@ func TestPFSWriteOneShotUsesOneRetainedMutationWithoutTransactionID(t *testing.T
 		out.AssignedOffset != 100 || out.PostSize != 104 || out.Sequence != 17 || out.Error != 0 {
 		t.Fatalf("one-shot result = %+v", out)
 	}
+	assertWriteReplyRetainsPostState(t, fixture, input.Unique)
 	fixture.rpc.snapshot(func(rpc *fakeRPC) {
 		if rpc.mutationCalls != beforeMutations+1 || rpc.assignments != beforeAssignments+1 || len(rpc.oneShotWrites) != 1 || len(rpc.writeTransactions) != 0 {
 			t.Fatalf("one-shot authority calls = mutations %d (before %d), assignments %d (before %d), one-shot %d, transactions %d",
@@ -273,6 +288,7 @@ func TestPFSWriteStagesAppendFragmentsThenPublishesOneServerPositionedCommit(t *
 		out.AssignedOffset != 100 || out.PostSize != 106 || out.Sequence != 17 || out.Error != 0 {
 		t.Fatalf("COMMIT result = %+v", out)
 	}
+	assertWriteReplyRetainsPostState(t, fixture, commitUnique)
 	if !fixture.raw.ReplyPublishMarked(commitUnique, nodeID, fuse.PFS_WRITE_OPCODE) {
 		t.Fatal("COMMIT response was not marked for post-VFS publication")
 	}
