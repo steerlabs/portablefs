@@ -495,6 +495,53 @@ func executeTestSourceGatedHeld(
 	)
 }
 
+func TestVisibilityRetryProofSecondPassAbandonsExistingWaiter(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	source := SessionID{1}
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	gate := testSourcePublicationGate("proof-wedge")
+	dependencies := mutationDependenciesForSourceGate(gate)
+	owner, err := h.coordinator.sequencer.acquire(t.Context(), dependencies)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, acquireErr := h.coordinator.acquireMutationDependencies(
+			context.Background(), source, MutationID{Sequence: 1, FrontendOperationID: 77},
+			nil, &gate, dependencies, nil,
+		)
+		result <- acquireErr
+	}()
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
+
+	// Install the exact same-operation debt after the first pass enqueued. The
+	// participant signal forces a second loop iteration, where omission of the
+	// proof is rejected while turn is already non-nil.
+	h.coordinator.mu.Lock()
+	h.coordinator.fairness[source] = mutationFairnessDebt{
+		sequence: 9, ordinal: h.coordinator.sequencer.reserveOrdinal(),
+		operationID: 77, claimSameOperation: true,
+		gate: cloneSourcePublicationGate(gate), observed: true,
+	}
+	h.coordinator.participants[source].signalLocked()
+	h.coordinator.mu.Unlock()
+	if err := <-result; !errors.Is(err, ErrSourcePublicationGate) {
+		t.Fatalf("second-pass retry-proof rejection = %v, want ErrSourcePublicationGate", err)
+	}
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 0)
+	owner.release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	probe, err := h.coordinator.sequencer.acquire(ctx, dependencies)
+	if err != nil {
+		t.Fatalf("retry-proof rejection wedged dependency keys: %v", err)
+	}
+	probe.release()
+}
+
 func testMountAbsence(observed time.Time) MountAbsenceProof {
 	return MountAbsenceProof{
 		ObservedUnixNanos: observed.UnixNano(),
