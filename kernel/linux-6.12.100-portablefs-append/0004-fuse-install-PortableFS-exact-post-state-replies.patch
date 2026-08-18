@@ -1,4 +1,4 @@
-From 80fb41370d0a21e4c4385cd99d17a2b995f9c70c Mon Sep 17 00:00:00 2001
+From 254241e07931d9bcadc1a9dee7831820c864aad0 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -7,7 +7,7 @@ Signed-off-by: Tim Jang <timjang3@gmail.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
- fs/fuse/dev.c             | 144 ++++++++-
+ fs/fuse/dev.c             | 152 +++++++++-
  fs/fuse/dir.c             | 544 +++++++++++++++++++++++++++++-----
  fs/fuse/file.c            | 122 +++++---
  fs/fuse/fuse_i.h          |  51 +++-
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/fuse/readdir.c         | 112 ++++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  71 ++++-
- 10 files changed, 1553 insertions(+), 193 deletions(-)
+ 10 files changed, 1558 insertions(+), 196 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -32,7 +32,7 @@ index ce0ff7a90..93b1b136f 100644
  fuse-$(CONFIG_FUSE_DAX) += dax.o
  fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index b1078aeb7..f9039eb1b 100644
+index b1078aeb7..cea98ad4c 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
 @@ -15,6 +15,7 @@
@@ -59,7 +59,32 @@ index b1078aeb7..f9039eb1b 100644
  	}
  	if (fc->pfs_strict_coherence &&
  	    ((args->pfs_reply_marked &&
-@@ -1803,21 +1811,71 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
+@@ -709,6 +717,7 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
+ 	} else if (reply_success && args->pfs_reply_marked) {
+ 		struct fs_reply_publish_token *token =
+ 			&req->pfs_publish_token;
++		int publish_err;
+ 		struct fs_reply_publish_scope *scope = req->pfs_publish_scope;
+ 
+ 		token->sb = fm->sb;
+@@ -724,12 +733,13 @@ ssize_t __fuse_simple_request(struct mnt_idmap *idmap,
+ 		token->publish_on_operation_error = args->opcode == FUSE_LOOKUP;
+ 		__fuse_get_request(req);
+ 		if (scope != current->fs_reply_publish_scope)
+-			ret = -EPROTO;
++			publish_err = -EPROTO;
+ 		else
+-			ret = fs_reply_publish_add_to(scope, token);
+-		if (ret) {
++			publish_err = fs_reply_publish_add_to(scope, token);
++		if (publish_err) {
+ 			fuse_abort_conn(fc);
+ 			fuse_put_request(req);
++			ret = publish_err;
+ 		} else {
+ 			args->pfs_reply_token = token;
+ 		}
+@@ -1803,21 +1813,71 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
  	if (err)
  		goto abort_copy;
  	err = -EPROTO;
@@ -138,7 +163,7 @@ index b1078aeb7..f9039eb1b 100644
  		iput(inode);
  	}
  	up_read(&fc->killsb);
-@@ -1831,6 +1889,63 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
+@@ -1831,6 +1891,63 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
  	return err;
  }
  
@@ -202,7 +227,7 @@ index b1078aeb7..f9039eb1b 100644
  static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
  				   struct fuse_copy_state *cs)
  {
-@@ -2268,10 +2383,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
+@@ -2268,10 +2385,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
  		       unsigned int size, struct fuse_copy_state *cs)
  {
  	if (fc->pfs_strict_coherence &&
@@ -216,7 +241,7 @@ index b1078aeb7..f9039eb1b 100644
  		/* The strict dialect has a closed reverse-notification surface. */
  		fuse_copy_finish(cs);
  		fuse_abort_conn(fc);
-@@ -2310,6 +2424,12 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
+@@ -2310,6 +2426,12 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
  	case FUSE_NOTIFY_PFS_SIZE:
  		return fuse_notify_pfs_size(fc, size, cs);
  

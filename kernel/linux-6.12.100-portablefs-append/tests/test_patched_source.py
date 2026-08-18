@@ -68,6 +68,23 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertLess(policy, retain)
         self.assertIn("positive or a negative", request[marker:retain])
 
+    def test_marked_variable_reply_keeps_its_payload_length(self) -> None:
+        text = self.source("fs/fuse/dev.c")
+        start = text.index("ssize_t __fuse_simple_request")
+        end = text.index("static bool fuse_request_queue_background", start)
+        request = text[start:end]
+        variable = request.index(
+            "ret = args->out_args[args->out_numargs - 1].size"
+        )
+        marked = request.index(
+            "else if (reply_success && args->pfs_reply_marked)", variable
+        )
+        branch = request[marked:]
+        self.assertIn("int publish_err", branch)
+        self.assertIn("publish_err = fs_reply_publish_add_to", branch)
+        self.assertIn("ret = publish_err", branch)
+        self.assertNotIn("ret = fs_reply_publish_add_to", branch)
+
     def test_strict_enosys_and_resend_are_terminal(self) -> None:
         text = self.source("fs/fuse/dev.c")
         self.assertIn(
