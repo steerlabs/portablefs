@@ -1398,6 +1398,65 @@ func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
 	}
 }
 
+func TestTeardownSettlesPhysicalReplyBeforeWithdrawalAndRejectsLateAck(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"withdraw": testItem(92, authoritypb.Attr_REGULAR, 92)}
+	unique := nextTestRequestUnique()
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "withdraw", &fuse.EntryOut{}); !status.Ok() {
+		t.Fatalf("LOOKUP = %v", status)
+	}
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, testPublicationOpcode,
+		make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("prepare LOOKUP = (%d, %v)", n, status)
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+
+	serial := nextTestRequestUnique()
+	publishUnique := uint64(1)<<61 | serial
+	in := &fuse.PFSPublishIn{
+		InHeader:      fuse.InHeader{Unique: publishUnique},
+		RequestUnique: unique,
+		PublicationID: serial - 1,
+		Nodeid:        testPublicationNodeID,
+		Opcode:        testPublicationOpcode,
+	}
+	if status := f.raw.PFSPublish(nil, in, &fuse.PFSPublishOut{}); !status.Ok() {
+		t.Fatalf("PFS_PUBLISH = %v", status)
+	}
+
+	f.raw.terminalizeReplyCacheOwnership()
+	f.raw.mu.Lock()
+	_, nameObligation := f.raw.cachedNames[nameKey{parent: 1, name: "withdraw"}]
+	attrObligations := len(f.raw.cachedAttrs)
+	replies, acks := len(f.raw.replyPublications), len(f.raw.publishAcks)
+	publishingNames, publishingInodes := len(f.raw.publishingNames), len(f.raw.publishingInodes)
+	sourcePublishing := len(f.raw.sourcePublishing)
+	f.raw.mu.Unlock()
+	if !nameObligation || attrObligations != 1 {
+		t.Fatalf("terminal withdrawal obligations name=%t attrs=%d, want true/1", nameObligation, attrObligations)
+	}
+	if replies != 0 || acks != 0 || publishingNames != 0 || publishingInodes != 0 || sourcePublishing != 0 {
+		t.Fatalf("terminal ownership replies=%d acks=%d names=%d inodes=%d source=%d, want all zero",
+			replies, acks, publishingNames, publishingInodes, sourcePublishing)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	f.raw.revokeCachedNames(deadline)
+	f.raw.revokeCachedAttrs(deadline)
+	f.raw.ReplyWritten(publishUnique, fuse.OK)
+	f.raw.mu.Lock()
+	remainingNames, remainingAttrs := len(f.raw.cachedNames), len(f.raw.cachedAttrs)
+	replies, acks = len(f.raw.replyPublications), len(f.raw.publishAcks)
+	f.raw.mu.Unlock()
+	if remainingNames != 0 || remainingAttrs != 0 || replies != 0 || acks != 0 {
+		t.Fatalf("late ACK resurrected names=%d attrs=%d replies=%d acks=%d", remainingNames, remainingAttrs, replies, acks)
+	}
+	if f.mount.revoked.Load() {
+		t.Fatal("late successful ACK attempted settlement after terminal ownership transition")
+	}
+}
+
 func TestNamespaceCompleteAlwaysStampsLiveParentWithoutRegistryEntry(t *testing.T) {
 	f := newStrictFixture(t)
 	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "never-cached")}

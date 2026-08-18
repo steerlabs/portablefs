@@ -384,6 +384,7 @@ type rawFileSystem struct {
 	published           chan struct{}
 	replyPublications   map[uint64]*replyPublication
 	publishAcks         map[uint64]*replyPublication
+	replyTerminal       bool
 	replyLifecycleArmed bool
 
 	// Source-owned gates close publication before the mutation gets a replay
@@ -848,12 +849,24 @@ func (r *rawFileSystem) releaseReplyCapacityLocked(publication *replyPublication
 	}
 }
 
-// terminalizeReplyCacheOwnership is the teardown edge for the two independent
-// candidate resources. It is idempotent with a concurrent physical write or
-// receipt: mutable capacity flags and map membership are each consumed under
-// r.mu exactly once.
+type terminalReplyCompletion struct {
+	publication *replyPublication
+	dirPlus     dirPlusLookupCompletion
+	physical    bool
+}
+
+// terminalizeReplyCacheOwnership is the single teardown settlement edge. A
+// reply which physically reached the kernel becomes a withdrawal obligation;
+// every other reply fails admission. Both unique maps are consumed before the
+// cached-state withdrawal can take its snapshot, so a later writer callback
+// cannot resurrect a candidate behind that snapshot.
 func (r *rawFileSystem) terminalizeReplyCacheOwnership() {
 	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return
+	}
+	r.replyTerminal = true
 	seen := make(map[*replyPublication]struct{}, len(r.replyPublications)+len(r.publishAcks))
 	for _, publication := range r.replyPublications {
 		seen[publication] = struct{}{}
@@ -861,12 +874,39 @@ func (r *rawFileSystem) terminalizeReplyCacheOwnership() {
 	for _, publication := range r.publishAcks {
 		seen[publication] = struct{}{}
 	}
+	completions := make([]terminalReplyCompletion, 0, len(seen))
 	for publication := range seen {
-		r.releaseReplyCapacityLocked(publication)
-		r.releaseReplyReservationsLocked(publication)
+		delete(r.replyPublications, publication.requestUnique)
+		if publication.publishUnique != 0 {
+			delete(r.publishAcks, publication.publishUnique)
+		}
+		physical := publication.originalWrote && publication.originalStatus.Ok()
+		if !publication.originalWrote {
+			close(publication.originalDone)
+		}
+		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
+		r.settleReplyPublicationLocked(publication, physical)
+		completions = append(completions, terminalReplyCompletion{
+			publication: publication,
+			dirPlus:     dirPlus,
+			physical:    physical,
+		})
 	}
 	r.signalSourceChangedLocked()
 	r.mu.Unlock()
+
+	for _, completion := range completions {
+		r.finishDirPlusLookupCompletion(completion.dirPlus)
+		if completion.physical {
+			r.finishWriteTransactionPublication(completion.publication, completion.publication.requestUnique)
+		} else {
+			r.finishOneShotWritePublication(completion.publication)
+		}
+		if completion.publication.source != nil {
+			completion.publication.source.revoke()
+		}
+		completion.publication.consumeAuthorityResponse()
+	}
 }
 
 // settle ends one admitted publication. PREPARE's drain is waiting on exactly
@@ -1268,6 +1308,9 @@ func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *rep
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.replyTerminal {
+		return errors.New("fusev3: reply publication registered after terminal settlement")
+	}
 	if r.replyPublications[unique] != nil || r.publishAcks[unique] != nil {
 		return fmt.Errorf("fusev3: FUSE request identity %d registered publication twice", unique)
 	}
@@ -1280,6 +1323,10 @@ func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *rep
 
 func (r *rawFileSystem) finishReplyPublicationRegistration(unique uint64, publication *replyPublication) {
 	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return
+	}
 	if r.replyPublications[unique] != publication {
 		r.mu.Unlock()
 		r.mount.revoke(fmt.Errorf("fusev3: FUSE request identity %d lost its reserved reply-publication ownership", unique))
@@ -1356,6 +1403,9 @@ func (r *rawFileSystem) byIdentityLocked(identity publicationIdentity) *inodeRec
 func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.replyTerminal {
+		return false
+	}
 	return r.replyPublications[unique] != nil || r.publishAcks[unique] != nil
 }
 
@@ -1364,6 +1414,10 @@ func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
 // whose lifetimes and DROP decisions are frozen here.
 func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, fuse.Status) {
 	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return 0, fuse.Status(syscall.ENOTCONN)
+	}
 	publication := r.replyPublications[unique]
 	if publication == nil {
 		r.mu.Unlock()
@@ -1535,6 +1589,9 @@ func encodeFuseAttr(out []byte, attr *fuse.Attr) {
 func (r *rawFileSystem) ReplyPublishMarked(unique uint64, nodeid uint64, opcode uint32) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.replyTerminal {
+		return false
+	}
 	if r.publishAcks[unique] != nil {
 		return false
 	}
@@ -1553,6 +1610,10 @@ func (r *rawFileSystem) ReplyPublishMarked(unique uint64, nodeid uint64, opcode 
 // /dev/fuse write attempt and after its ordering mutex has been released.
 func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return
+	}
 	if publication := r.publishAcks[unique]; publication != nil {
 		delete(r.publishAcks, unique)
 		if publication.publishUnique != unique || r.replyPublications[publication.requestUnique] != publication {
