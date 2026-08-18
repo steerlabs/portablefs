@@ -316,7 +316,9 @@ objects a frontend happened to cache.
 |---|---|
 | write, setattr, fallocate | target inode |
 | copy-file-range | source inode and destination inode; one record if identical |
-| create, mkdir, symlink | created inode and parent directory |
+| create, new name | created inode and parent directory |
+| create, existing name, truncating or non-truncating | target inode and parent directory |
+| mkdir, symlink | created inode and parent directory |
 | hard link | linked inode after link-count change and new parent |
 | unlink | removed inode after link removal and parent |
 | rmdir | removed directory after removal and parent |
@@ -327,6 +329,14 @@ objects a frontend happened to cache.
 | resolve-open, any structured outcome | the supplied parent; also the target for OPENED/CREATED, including truncation |
 | tmpfile | new inode and supplied parent |
 | xattr removal or any future xattr mutation | target inode |
+
+FUSE_CREATE has exactly two success shapes. A newly allocated name carries
+CREATED and PARENT. An existing-name result carries TARGET and PARENT, whether
+or not the open truncates the target. Both shapes carry the complete exact
+attributes for every listed object and use the request name plus the parent
+record's `snapshot_sequence` as the namespace snapshot. The non-truncating
+existing-name result is not a no-state outcome. A missing PostState, TARGET
+without PARENT, or CREATED without PARENT is a protocol error.
 
 "Parent" means every namespace parent operand of the mutation. A handle-only
 write, setattr, or fallocate has no parent operand: an open inode may be
@@ -370,22 +380,28 @@ struct fuse_pfs_object_state {            /* size 144 */
 
 #define FUSE_PFS_OBJECT_DROP_ATTR (1U << 0)
 
-struct fuse_pfs_cache_stamp {             /* size 16 */
+struct fuse_pfs_cache_stamp {             /* size 32 */
 	uint64_t snapshot_sequence;         /* offset 0; positive */
 	uint64_t object_version;            /* offset 8; zero only for negative */
+	int64_t  birth_time_ns;             /* offset 16; zero for negative */
+	uint32_t inode_flags;               /* offset 24; Attr.flags; zero for negative */
+	uint32_t reserved;                  /* offset 28; zero */
 };
 ```
 
 `record_flags` is zero or `FUSE_PFS_OBJECT_DROP_ATTR`; all other bits are
 errors. The fixed cache stamp follows the standard base result for positive and
-negative LOOKUP and GETATTR. Positive LOOKUP and GETATTR carry the sampled
-object version; negative LOOKUP carries zero. In READDIRPLUS, each record is:
+negative LOOKUP and positive GETATTR. Positive LOOKUP and GETATTR carry the
+sampled object version, exact birth time, and masked statx attribute word;
+negative LOOKUP carries zero in all three object fields. The birth time and
+masked statx word are installed under the same publication lock and
+object-version gate as the standard attributes. In READDIRPLUS, each record is:
 
 ```c
-struct fuse_pfs_direntplus {              /* name follows at offset 168 */
+struct fuse_pfs_direntplus {              /* name follows at offset 184 */
 	struct fuse_entry_out entry_out;     /* offset 0, size 128 */
 	struct fuse_dirent dirent;           /* offset 128, size 24 */
-	struct fuse_pfs_cache_stamp stamp;   /* offset 152, size 16 */
+	struct fuse_pfs_cache_stamp stamp;   /* offset 152, size 32 */
 };
 ```
 
@@ -430,7 +446,9 @@ transaction under that mutex:
 3. Insert every surviving candidate into the per-coordinate in-flight registry
    with state PENDING and a mutable `revoked` bit. A READDIRPLUS page inserts
    all of its names and item attrs under the page's one cursor. The reservation
-   remains until the FUSE reply writer reports physical completion or failure.
+   remains sequence-addressable until the merged PFS_PUBLISH receipt. A
+   successful physical write releases only its capacity ownership; physical
+   failure removes the candidate because no cache state reached the kernel.
 
 On peer-repair arrival, the daemon takes the same mutex, marks every affected
 coordinate REPAIRING, and sets `revoked` on every overlapping PENDING
@@ -442,11 +460,12 @@ reply's physical `/dev/fuse` write to finish, then performs the kernel repair;
 a failed write starts withdrawal. Candidate admission while the wait or repair
 is active drops that coordinate. After the kernel repair completes, the daemon
 takes the mutex, advances `last_peer_repair_sequence[coordinate]`, clears
-REPAIRING, and only then sends peer COMPLETE. Physical reply completion or
-failure removes the FINALIZED reservation. A reply writer MUST NOT emit
-cacheable bytes for a PENDING reservation or change FINALIZED bytes. The kernel
-sequence gate below remains mandatory and covers any installer/notification
-overlap at the kernel boundary.
+REPAIRING, and only then sends peer COMPLETE. Physical completion releases
+reserved capacity, but a successfully written candidate is removed from the
+revocation registry only by its merged PFS_PUBLISH receipt. A reply writer MUST
+NOT emit cacheable bytes for a PENDING reservation or change FINALIZED bytes.
+The kernel sequence gate below remains mandatory and covers any
+installer/notification overlap at the kernel boundary.
 
 A candidate that is not newer, was revoked, or exceeded a registry capacity is
 dropped, not treated as a protocol error:
@@ -487,7 +506,10 @@ The kernel processes an admitted trailer as one installation transaction:
    repair completed after daemon finalization but before the kernel lock was
    acquired.
 4. Install every eligible `fuse_attr` field, `i_size`, inode class, cached ACL
-   decision, and admitted lifetime. Still under `fi->lock`, set
+   decision, admitted lifetime, birth time, and masked statx attribute word.
+   Only IMMUTABLE and APPEND project into VFS `i_flags`; `statx(2)` returns the
+   complete raw masked word retained by the stamped record. Still under
+   `fi->lock`, set
    `fi->attr_version = atomic64_inc_return(&fc->attr_version)` and then set
    `fi->pfs_object_version`. For every record with PARENT, OLD_PARENT, or
    NEW_PARENT, call `inode_maybe_inc_iversion(dir, false)` as part of this
@@ -572,18 +594,25 @@ NUL or slash. EXPIRE requires `child == 0`; DELETE requires a nonzero canonical
 child nodeid. Unknown flags, malformed names, zero sequences, or wrong live
 identities are protocol errors.
 
-PFS_ATTR takes the inode's `pfs_publish_mutex`, expires attrs and ACLs, then
-under `fi->lock` increments `fi->attr_version` and sets
+PFS_ATTR takes the inode's `pfs_publish_mutex`, expires attrs and ACLs, clears
+the exact birth-time/statx-word validity and the projected IMMUTABLE/APPEND
+state, then under `fi->lock` increments `fi->attr_version` and sets
 `fi->pfs_object_version = max(fi->pfs_object_version,
-visibility_sequence)`. PFS_ENTRY takes the parent's `pfs_publish_mutex`,
+visibility_sequence)`. Until a strictly newer stamped attr installs all of
+those fields together, that inode's attributes and enforced flag state are
+unservable rather than inherited from the pre-repair snapshot. PFS_ENTRY takes
+the parent's `pfs_publish_mutex`,
 performs the expire or delete repair, calls
 `inode_maybe_inc_iversion(parent, false)`, and under the parent `fi->lock`
 increments `fi->attr_version` and applies the same object-version stamp. That
 parent stamp is checked against every later positive or negative entry's
 `snapshot_sequence` as specified in section 2.3. The stamp is installed even
-when the named dentry is absent. A notification returns success only after the
-cache action and stamp are complete; only then may portablefsd advance its map
-and send peer COMPLETE.
+when the named dentry is absent. Every namespace COMPLETE whose parent is live
+therefore sends PFS_ENTRY unconditionally. When no exact cached child is known,
+it sends EXPIRE with `child == 0` solely to expire the name and advance the
+parent stamp; registry absence never suppresses this gate. A notification
+returns success only after the cache action and stamp are complete; only then
+may portablefsd advance its map and send peer COMPLETE.
 
 The existing `FUSE_NOTIFY_PFS_SIZE` remains code 10. After its page/size repair
 succeeds it also sets the target `fi->pfs_object_version` to at least the
@@ -1895,6 +1924,8 @@ protocol 6:
 
 1. **Exact post-state replies (section 2).** This defines the common mutation
    result and version rule consumed by resolve-open and write. This step includes
+   both new-name and existing-name FUSE_CREATE post-state shapes, exact birth
+   time and masked statx words on every stamped attribute-bearing read,
    daemon candidate reservation/revocation, positive and negative registry
    capacity, whole-page READDIRPLUS registration, stamped ATTR/ENTRY/SIZE peer
    repairs, both kernel version gates, parent `i_version`, and locked
