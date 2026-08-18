@@ -26,9 +26,9 @@ one serialized deployment:
 3. Build a commit-tagged E2B candidate from a digest-pinned OpenSteer Runner
    image, then start a disposable candidate sandbox and verify the client
    release plus Linux FUSE prerequisites.
-4. Copy the release through the private IAP tunnels with SSH compression, then
-   activate it on the Manager and cell control processes. This does not restart
-   a live Authority.
+4. Stream one gzip-compressed release archive through each private IAP tunnel,
+   then activate it on the Manager and cell control processes. This does not
+   restart a live Authority.
 5. Drain OpenSteer E2B sandboxes, request the Manager's restart transaction,
    drain once more, and prove the old Authority service, listener, and cgroup
    are absent.
@@ -112,7 +112,8 @@ gcloud services enable oslogin.googleapis.com --project=smooth-comfort-488701-t3
 
 The VMs have no public SSH address. Deployment uses OS Login through IAP. The
 service account needs administrative login because the existing host activator
-must replace root-owned releases and systemd units.
+must replace root-owned releases and systemd units. A single compressed tar
+stream avoids recursive SFTP's per-file behavior on the private tunnel.
 
 Bootstrap the Manager's narrow product and operator mTLS identities once:
 

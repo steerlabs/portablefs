@@ -34,9 +34,15 @@ release_id=$(<"$release_dir/release-id")
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 release_base=${release_dir##*/}
 remote_stage=.portablefs-deploy/$release_id
+archive_dir=$(mktemp -d)
+transfer_archive=$archive_dir/$release_id.tar.gz
 gcloud_common=(--project "$OPENSTEER_GCP_PROJECT" --zone "$OPENSTEER_GCP_ZONE" --tunnel-through-iap --quiet)
 mkdir -p -- "$evidence_dir"
 "$root/deploy/gcp/verify-hosted-release.sh" "$release_dir" >/dev/null
+tar -czf "$transfer_archive" \
+  -C "${release_dir%/*}" "$release_base" \
+  -C "$root/deploy/gcp" activate-hosted-release.sh verify-hosted-release.sh \
+  -C "$root/deploy/opensteer" manager-api.sh cell-authority-state.sh
 
 ssh_run() {
   local instance=$1 command=$2
@@ -45,8 +51,9 @@ ssh_run() {
 
 copy_to() {
   local instance=$1
-  shift
-  gcloud compute scp "${gcloud_common[@]}" --compress --recurse "$@" "$instance:~/$remote_stage/"
+  local command
+  command="set -euo pipefail; tar -xzf - -C \"\$HOME/$remote_stage\""
+  gcloud compute ssh "$instance" "${gcloud_common[@]}" --command="$command" <"$transfer_archive"
 }
 
 cleanup_remote() {
@@ -55,27 +62,19 @@ cleanup_remote() {
   ssh_run "$OPENSTEER_MANAGER_INSTANCE" "$command" >/dev/null 2>&1 || true
   ssh_run "$OPENSTEER_CELL_INSTANCE" "$command" >/dev/null 2>&1 || true
 }
-trap cleanup_remote EXIT
+
+cleanup() {
+  rm -rf -- "$archive_dir"
+  cleanup_remote
+}
+trap cleanup EXIT
 
 prepare_host() {
   local instance=$1 role=$2 command
   command="set -euo pipefail; install -d -m 0700 \"\$HOME/.portablefs-deploy\" \"\$HOME/$remote_stage\""
   ssh_run "$instance" "$command" >/dev/null
   case "$role" in
-    manager)
-      copy_to "$instance" \
-        "$release_dir" \
-        "$root/deploy/gcp/activate-hosted-release.sh" \
-        "$root/deploy/gcp/verify-hosted-release.sh" \
-        "$root/deploy/opensteer/manager-api.sh"
-      ;;
-    cell)
-      copy_to "$instance" \
-        "$release_dir" \
-        "$root/deploy/gcp/activate-hosted-release.sh" \
-        "$root/deploy/gcp/verify-hosted-release.sh" \
-        "$root/deploy/opensteer/cell-authority-state.sh"
-      ;;
+    manager | cell) copy_to "$instance" ;;
     *) exit 64 ;;
   esac
 }
