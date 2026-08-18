@@ -1562,6 +1562,11 @@ func TestPinnedAppendAcrossAliasesSerializesWholeTransactions(t *testing.T) {
 	results := make(chan result, 2)
 	for target, data := range map[WriteTarget]string{left: "aaa", right: "bbb"} {
 		go func(target WriteTarget, data string) {
+			// CommitWrite is the store half of an authority transaction.  The
+			// authority's mutation lease deliberately spans this call, exact
+			// post-state sampling, and replay persistence.
+			unlock := v.LockMutation([][16]byte{target.Coordinate().Stable})
+			defer unlock()
 			_, assigned, _, err := target.CommitWrite(bytes.NewReader([]byte(data)), WriteCommit{RequestedSize: uint64(len(data)), RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}, make([]byte, 2))
 			results <- result{assigned: assigned, err: err}
 		}(target, data)
