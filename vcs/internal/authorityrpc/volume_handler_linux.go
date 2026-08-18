@@ -57,6 +57,7 @@ type volumeStore interface {
 	Forget(xfsstore.Capability) error
 	Getattr(xfsstore.Capability) (xfsstore.Attr, error)
 	Identity(xfsstore.Capability) ([16]byte, error)
+	CoordinateItem(xfsstore.Capability) (xfsstore.ObjectCoordinate, error)
 	IdentityOpen(xfsstore.Capability) ([16]byte, error)
 	CoordinateOpen(xfsstore.Capability) (xfsstore.ObjectCoordinate, error)
 	OpenFile(xfsstore.Capability, xfsstore.OpenFlags) (xfsstore.Capability, error)
@@ -93,6 +94,10 @@ type volumeStore interface {
 // lifetime. Production's *xfsstore.Volume is the sole implementation.
 type writeTransactionStore interface {
 	PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarget, error)
+}
+
+type coalescingFsyncStore interface {
+	FsyncCoalesced(xfsstore.Capability, bool) (int, error)
 }
 
 type tmpfileStore interface {
@@ -799,23 +804,20 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		var parentCoordinate, existingCoordinate visibilityCoordinate
 		var existingSize int64
 		var existed bool
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Create.GetName()); err != nil {
 				return nil, err
 			}
-			var err error
-			parent, err = h.item(cred.ID, body.Create.GetParent())
+			resolvedParent, err := resolutions.item(body.Create.GetParent())
 			if err != nil {
 				return nil, err
 			}
-			parentCoordinate, err = h.coordinateItem(parent)
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
+			resolvedName, err := resolutions.namespace(parent, body.Create.GetName())
 			if err != nil {
 				return nil, err
 			}
-			existingCoordinate, existingSize, existed, err = h.lookupCoordinateSizeOptional(parent, body.Create.GetName())
-			if err != nil {
-				return nil, err
-			}
+			existingCoordinate, existingSize, existed = resolvedName.coordinate, resolvedName.size, resolvedName.found
 			if !existed {
 				return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
 			}
@@ -842,7 +844,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			mode, valid := modeFromProtocol(body.Create.GetMode())
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
@@ -906,18 +908,15 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	case *authoritypb.Request_Mkdir:
 		var parent xfsstore.Capability
 		var parentCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Mkdir.GetName()); err != nil {
 				return nil, err
 			}
-			var err error
-			parent, err = h.item(cred.ID, body.Mkdir.GetParent())
-			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
-			}
+			resolvedParent, err := resolutions.item(body.Mkdir.GetParent())
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
 			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			mode, valid := modeFromProtocol(body.Mkdir.GetMode())
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
@@ -950,21 +949,23 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	case *authoritypb.Request_Unlink:
 		var parent xfsstore.Capability
 		var parentCoordinate, removedCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Unlink.GetName()); err != nil {
 				return nil, err
 			}
-			var err error
-			parent, err = h.item(cred.ID, body.Unlink.GetParent())
-			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
+			resolvedParent, err := resolutions.item(body.Unlink.GetParent())
+			if err != nil {
+				return nil, err
 			}
-			if err == nil {
-				removedCoordinate, _, err = h.lookupCoordinate(parent, body.Unlink.GetName())
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
+			resolvedName, err := resolutions.namespace(parent, body.Unlink.GetName())
+			if err == nil && !resolvedName.found {
+				err = syscall.ENOENT
 			}
+			removedCoordinate = resolvedName.coordinate
 			return []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			if err := h.Store.Unlink(parent, string(body.Unlink.GetName()), body.Unlink.GetDirectory()); err != nil {
 				resp := h.errorResponse(0, err, false)
 				targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
@@ -977,34 +978,37 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		var oldParent, newParent xfsstore.Capability
 		var oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate visibilityCoordinate
 		var replaced bool
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Rename.GetOldName()); err != nil {
 				return nil, err
 			}
 			if err := namespaceName(body.Rename.GetNewName()); err != nil {
 				return nil, err
 			}
-			var err error
-			oldParent, err = h.item(cred.ID, body.Rename.GetOldParent())
-			if err == nil {
-				newParent, err = h.item(cred.ID, body.Rename.GetNewParent())
+			resolvedOldParent, err := resolutions.item(body.Rename.GetOldParent())
+			if err != nil {
+				return nil, err
 			}
-			if err == nil {
-				oldParentCoordinate, err = h.coordinateItem(oldParent)
+			resolvedNewParent, err := resolutions.item(body.Rename.GetNewParent())
+			if err != nil {
+				return nil, err
 			}
-			if err == nil {
-				newParentCoordinate, err = h.coordinateItem(newParent)
+			oldParent, oldParentCoordinate = resolvedOldParent.cap, resolvedOldParent.coordinate
+			newParent, newParentCoordinate = resolvedNewParent.cap, resolvedNewParent.coordinate
+			moved, err := resolutions.namespace(oldParent, body.Rename.GetOldName())
+			if err == nil && !moved.found {
+				err = syscall.ENOENT
 			}
+			movedCoordinate = moved.coordinate
 			if err == nil {
-				movedCoordinate, _, err = h.lookupCoordinate(oldParent, body.Rename.GetOldName())
-			}
-			if err == nil {
-				replacedCoordinate, replaced, err = h.lookupCoordinateOptional(newParent, body.Rename.GetNewName())
+				var replacement namespaceResolution
+				replacement, err = resolutions.namespace(newParent, body.Rename.GetNewName())
+				replacedCoordinate, replaced = replacement.coordinate, replacement.found
 			}
 			targets := renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, visibilityCoordinate{}, false, false)
 			return targets, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var flags xfsstore.RenameFlags
 			if body.Rename.GetNoReplace() {
 				flags |= xfsstore.RenameNoReplace
@@ -1045,24 +1049,20 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	case *authoritypb.Request_Link:
 		var source, parent xfsstore.Capability
 		var sourceCoordinate, parentCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Link.GetNewName()); err != nil {
 				return nil, err
 			}
-			var err error
-			source, err = h.item(cred.ID, body.Link.GetExistingItem())
-			if err == nil {
-				parent, err = h.item(cred.ID, body.Link.GetNewParent())
+			resolvedSource, err := resolutions.item(body.Link.GetExistingItem())
+			if err != nil {
+				return nil, err
 			}
-			if err == nil {
-				sourceCoordinate, err = h.coordinateItem(source)
-			}
-			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
-			}
+			resolvedParent, err := resolutions.item(body.Link.GetNewParent())
+			source, sourceCoordinate = resolvedSource.cap, resolvedSource.coordinate
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
 			return linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, false), err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			attr, err := h.Store.Link(source, parent, string(body.Link.GetNewName()))
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
@@ -1077,18 +1077,15 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	case *authoritypb.Request_Symlink:
 		var parent xfsstore.Capability
 		var parentCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Symlink.GetName()); err != nil {
 				return nil, err
 			}
-			var err error
-			parent, err = h.item(cred.ID, body.Symlink.GetParent())
-			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
-			}
+			resolvedParent, err := resolutions.item(body.Symlink.GetParent())
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
 			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			reservation, err := h.reserveCapabilities(cred.ID, 1, 0)
 			if err != nil {
 				return h.errorResponse(0, err, false), nil
@@ -1255,7 +1252,16 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		if err := h.Store.Fsync(handle, body.Fsync.GetDataOnly()); err != nil {
+		group := 0
+		if store, ok := h.Store.(coalescingFsyncStore); ok {
+			group, err = store.FsyncCoalesced(handle, body.Fsync.GetDataOnly())
+		} else {
+			err = h.Store.Fsync(handle, body.Fsync.GetDataOnly())
+		}
+		if group != 0 && h.Metrics != nil {
+			h.Metrics.ObserveFsyncBatch(group)
+		}
+		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, true)
 		}
 		return h.success(req.GetRequestId())
@@ -2040,11 +2046,35 @@ func (h *VolumeHandler) mutateVisible(
 	})
 }
 
+func (h *VolumeHandler) mutateVisibleResolved(
+	ctx context.Context,
+	req *authoritypb.Request,
+	cred volumeserver.SessionCredential,
+	prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error),
+	apply func() (*authoritypb.Response, []volumeserver.VisibilityTarget),
+) *authoritypb.Response {
+	return h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return apply()
+	})
+}
+
 func (h *VolumeHandler) mutateVisibleSequence(
 	ctx context.Context,
 	req *authoritypb.Request,
 	cred volumeserver.SessionCredential,
 	prepare func() ([]volumeserver.VisibilityTarget, error),
+	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
+) *authoritypb.Response {
+	return h.mutateVisibleSequenceResolved(ctx, req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+		return prepare()
+	}, apply)
+}
+
+func (h *VolumeHandler) mutateVisibleSequenceResolved(
+	ctx context.Context,
+	req *authoritypb.Request,
+	cred volumeserver.SessionCredential,
+	prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error),
 	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
 ) *authoritypb.Response {
 	var writeCommitOwner *writeTransactionCommitOwner
@@ -2074,7 +2104,8 @@ func (h *VolumeHandler) mutateVisibleSequence(
 		if err != nil || declaredGate == nil {
 			return definiteRejection(syscall.EINVAL)
 		}
-		expectedGate, err := h.deriveSourcePublicationGate(req, cred.ID)
+		resolutions := newOperationResolutionContext(h, cred.ID)
+		expectedGate, err := resolutions.deriveSourcePublicationGate(req, false)
 		if err != nil {
 			return definiteRejection(err)
 		}
@@ -2088,7 +2119,7 @@ func (h *VolumeHandler) mutateVisibleSequence(
 					return h.errorResponse(0, err, false)
 				}
 			}
-			if _, err := prepare(); err != nil {
+			if _, err := prepare(resolutions); err != nil {
 				if writeCommit != nil {
 					if rejected := h.rejectPendingWriteTransaction(cred.ID, writeCommit, err); rejected != nil {
 						return rejected
@@ -2101,7 +2132,7 @@ func (h *VolumeHandler) mutateVisibleSequence(
 		}
 		var resp *authoritypb.Response
 		normalizedPrepare := func() ([]volumeserver.VisibilityTarget, error) {
-			targets, prepareErr := prepare()
+			targets, prepareErr := prepare(resolutions)
 			if prepareErr != nil {
 				return nil, prepareErr
 			}
@@ -2117,7 +2148,12 @@ func (h *VolumeHandler) mutateVisibleSequence(
 			if !sourcePublicationGateHasNamespace(expectedGate) {
 				return expectedGate, nil
 			}
-			refreshed, refreshErr := h.deriveSourcePublicationGate(req, cred.ID)
+			// Namespace bindings are the only operation facts that can change
+			// while this request waits for its FIFO turn. Discard the pre-turn
+			// cache exactly here; the refreshed answers remain authoritative
+			// through prepare and apply under the acquired turn.
+			resolutions.invalidateNamespaceBindings()
+			refreshed, refreshErr := resolutions.deriveSourcePublicationGate(req, true)
 			if refreshErr != nil {
 				return volumeserver.SourcePublicationGate{}, refreshErr
 			}
@@ -3306,33 +3342,6 @@ func (h *VolumeHandler) lookupCoordinate(parent xfsstore.Capability, name []byte
 		return visibilityCoordinate{}, false, forgetErr
 	}
 	return attrCoordinate(identity, attr), true, nil
-}
-
-func (h *VolumeHandler) lookupCoordinateOptional(parent xfsstore.Capability, name []byte) (visibilityCoordinate, bool, error) {
-	coordinate, found, err := h.lookupCoordinate(parent, name)
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
-		return visibilityCoordinate{}, false, nil
-	}
-	return coordinate, found, err
-}
-
-func (h *VolumeHandler) lookupCoordinateSizeOptional(parent xfsstore.Capability, name []byte) (visibilityCoordinate, int64, bool, error) {
-	item, attr, err := h.Store.Lookup(parent, string(name))
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
-		return visibilityCoordinate{}, 0, false, nil
-	}
-	if err != nil {
-		return visibilityCoordinate{}, 0, false, err
-	}
-	identity, identityErr := h.Store.Identity(item)
-	forgetErr := h.Store.Forget(item)
-	if identityErr != nil {
-		return visibilityCoordinate{}, 0, false, identityErr
-	}
-	if forgetErr != nil {
-		return visibilityCoordinate{}, 0, false, forgetErr
-	}
-	return attrCoordinate(identity, attr), attr.Size, true, nil
 }
 
 func linkVisibilityTargets(

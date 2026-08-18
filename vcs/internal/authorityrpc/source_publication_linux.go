@@ -14,31 +14,46 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
-// sourceIdentityResolver resolves each capability at most once while deriving
-// the source cut. Derivation intentionally happens before mutation order: the
-// coordinator needs current namespace bindings to detect a peer-first cycle,
-// and no client-supplied stable identity is trusted for that decision.
-type sourceIdentityResolver struct {
-	h     *VolumeHandler
-	id    volumeserver.SessionID
-	items map[string]sourceResolvedIdentity
-	opens map[string]sourceResolvedIdentity
+// operationResolutionContext owns every immutable capability fact and every
+// namespace answer used by one mutation. Capability coordinates live for the
+// whole operation. Namespace answers have two epochs: the pre-turn derivation
+// needs only the independently verified request shape, then the post-turn
+// refresh resolves bindings once and prepare consumes those same answers.
+type operationResolutionContext struct {
+	h          *VolumeHandler
+	id         volumeserver.SessionID
+	items      map[string]sourceResolvedIdentity
+	opens      map[string]sourceResolvedIdentity
+	namespaces map[namespaceResolutionKey]namespaceResolution
 }
 
 type sourceResolvedIdentity struct {
-	cap      xfsstore.Capability
-	identity [16]byte
+	cap        xfsstore.Capability
+	identity   [16]byte
+	coordinate visibilityCoordinate
 }
 
-func newSourceIdentityResolver(h *VolumeHandler, id volumeserver.SessionID) *sourceIdentityResolver {
-	return &sourceIdentityResolver{
+type namespaceResolutionKey struct {
+	parent xfsstore.Capability
+	name   string
+}
+
+type namespaceResolution struct {
+	coordinate visibilityCoordinate
+	size       int64
+	found      bool
+}
+
+func newOperationResolutionContext(h *VolumeHandler, id volumeserver.SessionID) *operationResolutionContext {
+	return &operationResolutionContext{
 		h: h, id: id,
-		items: make(map[string]sourceResolvedIdentity),
-		opens: make(map[string]sourceResolvedIdentity),
+		items:      make(map[string]sourceResolvedIdentity),
+		opens:      make(map[string]sourceResolvedIdentity),
+		namespaces: make(map[namespaceResolutionKey]namespaceResolution),
 	}
 }
 
-func (r *sourceIdentityResolver) item(raw []byte) (sourceResolvedIdentity, error) {
+func (r *operationResolutionContext) item(raw []byte) (sourceResolvedIdentity, error) {
 	if resolved, ok := r.items[string(raw)]; ok {
 		return resolved, nil
 	}
@@ -46,19 +61,20 @@ func (r *sourceIdentityResolver) item(raw []byte) (sourceResolvedIdentity, error
 	if err != nil {
 		return sourceResolvedIdentity{}, err
 	}
-	identity, err := r.h.Store.Identity(capability)
+	stored, err := r.h.Store.CoordinateItem(capability)
 	if err != nil {
 		return sourceResolvedIdentity{}, err
 	}
-	if identity == ([16]byte{}) {
+	coordinate := objectCoordinate(stored)
+	if coordinate.identity == ([16]byte{}) || coordinate.ino == 0 {
 		return sourceResolvedIdentity{}, syscall.EIO
 	}
-	resolved := sourceResolvedIdentity{cap: capability, identity: identity}
+	resolved := sourceResolvedIdentity{cap: capability, identity: coordinate.identity, coordinate: coordinate}
 	r.items[string(raw)] = resolved
 	return resolved, nil
 }
 
-func (r *sourceIdentityResolver) open(raw []byte) (sourceResolvedIdentity, error) {
+func (r *operationResolutionContext) open(raw []byte) (sourceResolvedIdentity, error) {
 	if resolved, ok := r.opens[string(raw)]; ok {
 		return resolved, nil
 	}
@@ -66,41 +82,58 @@ func (r *sourceIdentityResolver) open(raw []byte) (sourceResolvedIdentity, error
 	if err != nil {
 		return sourceResolvedIdentity{}, err
 	}
-	identity, err := r.h.Store.IdentityOpen(capability)
+	stored, err := r.h.Store.CoordinateOpen(capability)
 	if err != nil {
 		return sourceResolvedIdentity{}, err
 	}
-	if identity == ([16]byte{}) {
+	coordinate := objectCoordinate(stored)
+	if coordinate.identity == ([16]byte{}) || coordinate.ino == 0 {
 		return sourceResolvedIdentity{}, syscall.EIO
 	}
-	resolved := sourceResolvedIdentity{cap: capability, identity: identity}
+	resolved := sourceResolvedIdentity{cap: capability, identity: coordinate.identity, coordinate: coordinate}
 	r.opens[string(raw)] = resolved
 	return resolved, nil
 }
 
-func (r *sourceIdentityResolver) bound(parent xfsstore.Capability, name []byte) ([16]byte, bool, error) {
+func (r *operationResolutionContext) invalidateNamespaceBindings() {
+	clear(r.namespaces)
+}
+
+func (r *operationResolutionContext) namespace(parent xfsstore.Capability, name []byte) (namespaceResolution, error) {
 	if err := namespaceName(name); err != nil {
-		return [16]byte{}, false, err
+		return namespaceResolution{}, err
 	}
-	item, _, err := r.h.Store.Lookup(parent, string(name))
+	key := namespaceResolutionKey{parent: parent, name: string(name)}
+	if resolved, ok := r.namespaces[key]; ok {
+		return resolved, nil
+	}
+	item, attr, err := r.h.Store.Lookup(parent, string(name))
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
-		return [16]byte{}, false, nil
+		resolved := namespaceResolution{}
+		r.namespaces[key] = resolved
+		return resolved, nil
 	}
 	if err != nil {
-		return [16]byte{}, false, err
+		return namespaceResolution{}, err
 	}
-	identity, identityErr := r.h.Store.Identity(item)
+	stored, coordinateErr := r.h.Store.CoordinateItem(item)
 	forgetErr := r.h.Store.Forget(item)
-	if identityErr != nil {
-		return [16]byte{}, false, identityErr
+	if coordinateErr != nil {
+		return namespaceResolution{}, coordinateErr
 	}
 	if forgetErr != nil {
-		return [16]byte{}, false, forgetErr
+		return namespaceResolution{}, forgetErr
 	}
-	if identity == ([16]byte{}) {
-		return [16]byte{}, false, syscall.EIO
+	coordinate := objectCoordinate(stored)
+	if coordinate.identity == ([16]byte{}) || coordinate.ino == 0 {
+		return namespaceResolution{}, syscall.EIO
 	}
-	return identity, true, nil
+	if fromLookup := attrCoordinate(coordinate.identity, attr); coordinate != fromLookup {
+		return namespaceResolution{}, syscall.EIO
+	}
+	resolved := namespaceResolution{coordinate: coordinate, size: attr.Size, found: true}
+	r.namespaces[key] = resolved
+	return resolved, nil
 }
 
 type sourceGateBuilder struct {
@@ -163,21 +196,24 @@ func (b *sourceGateBuilder) finish() volumeserver.SourcePublicationGate {
 	return volumeserver.SourcePublicationGate{Targets: b.targets}
 }
 
-func (h *VolumeHandler) deriveSourcePublicationGate(req *authoritypb.Request, id volumeserver.SessionID) (volumeserver.SourcePublicationGate, error) {
-	resolver := newSourceIdentityResolver(h, id)
+func (resolver *operationResolutionContext) deriveSourcePublicationGate(req *authoritypb.Request, resolveBindings bool) (volumeserver.SourcePublicationGate, error) {
 	var builder sourceGateBuilder
 	addNamespace := func(parentRaw, name []byte, boundAttributes, boundData bool) error {
 		parent, err := resolver.item(parentRaw)
 		if err != nil {
 			return err
 		}
-		bound, found, err := resolver.bound(parent.cap, name)
+		builder.addItem(parent.identity, true, false)
+		if !resolveBindings {
+			builder.addNamespace(parent.identity, name, boundAttributes, boundData)
+			return nil
+		}
+		bound, err := resolver.namespace(parent.cap, name)
 		if err != nil {
 			return err
 		}
-		builder.addItem(parent.identity, true, false)
-		if found {
-			builder.addNamespace(parent.identity, name, boundAttributes, boundData, bound)
+		if bound.found {
+			builder.addNamespace(parent.identity, name, boundAttributes, boundData, bound.coordinate.identity)
 		} else {
 			builder.addNamespace(parent.identity, name, boundAttributes, boundData)
 		}
@@ -213,7 +249,7 @@ func (h *VolumeHandler) deriveSourcePublicationGate(req *authoritypb.Request, id
 		if body.WriteTransaction.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
 			return volumeserver.SourcePublicationGate{}, syscall.EINVAL
 		}
-		gate, _, err := h.writeTransactionGate(id, body.WriteTransaction)
+		gate, _, err := resolver.h.writeTransactionGate(resolver.id, body.WriteTransaction)
 		return gate, err
 	case *authoritypb.Request_OneShotWrite:
 		resolved, err := resolver.open(body.OneShotWrite.GetHandle())
@@ -298,7 +334,7 @@ func (h *VolumeHandler) deriveSourcePublicationGate(req *authoritypb.Request, id
 	return builder.finish(), nil
 }
 
-func (r *sourceIdentityResolver) xattrIdentity(itemRaw, handleRaw []byte) ([16]byte, error) {
+func (r *operationResolutionContext) xattrIdentity(itemRaw, handleRaw []byte) ([16]byte, error) {
 	if len(itemRaw) == 0 {
 		// The storage mutation APIs are item-relative. A handle may corroborate
 		// the item but cannot silently select a different object.

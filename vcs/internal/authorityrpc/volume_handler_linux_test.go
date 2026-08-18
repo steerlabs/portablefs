@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -981,6 +982,15 @@ type sourceGateRefreshStore struct {
 	secondLookup   chan struct{}
 }
 
+type fsyncMetricStore struct {
+	resourceAdmissionFaultStore
+	batch int
+}
+
+func (s *fsyncMetricStore) FsyncCoalesced(xfsstore.Capability, bool) (int, error) {
+	return s.batch, nil
+}
+
 // renameReplyStore is an in-memory namespace only for exercising the
 // authority's response contract. The source frontend is deliberately absent:
 // the post identities must come from the authoritative pre-XFS lookup, never
@@ -1059,7 +1069,7 @@ func (s *sourceGateRefreshStore) Lookup(_ xfsstore.Capability, _ string) (xfssto
 	} else if call == 2 {
 		close(s.secondLookup)
 	}
-	return bound, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(bound[0]), Mode: 0o600, Nlink: 1}, nil
+	return bound, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(bound[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
 }
 
 func (s *sourceGateRefreshStore) Forget(xfsstore.Capability) error {
@@ -1082,9 +1092,20 @@ func (s *resourceAdmissionFaultStore) Root() (xfsstore.Capability, error) {
 func (s *resourceAdmissionFaultStore) Identity(item xfsstore.Capability) ([16]byte, error) {
 	return [16]byte{item[0]}, nil
 }
+func (s *resourceAdmissionFaultStore) CoordinateItem(item xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	ino := uint64(item[0])
+	if item == s.lookupItem {
+		ino = 2
+	}
+	return xfsstore.ObjectCoordinate{Stable: [16]byte{item[0]}, Ino: ino, DeviceMinor: 1}, nil
+}
 func (s *resourceAdmissionFaultStore) IdentityOpen(open xfsstore.Capability) ([16]byte, error) {
 	s.identityOpen.Add(1)
 	return [16]byte{open[0]}, nil
+}
+func (s *resourceAdmissionFaultStore) CoordinateOpen(open xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	s.identityOpen.Add(1)
+	return xfsstore.ObjectCoordinate{Stable: [16]byte{open[0]}, Ino: uint64(open[0]), DeviceMinor: 1}, nil
 }
 func (s *resourceAdmissionFaultStore) Getattr(xfsstore.Capability) (xfsstore.Attr, error) {
 	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: 1, DeviceMinor: 1}, nil
@@ -1263,7 +1284,7 @@ func TestDeriveSourcePublicationGateCoversVisibleOperationMatrix(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := h.deriveSourcePublicationGate(test.request, session)
+			got, err := newOperationResolutionContext(h, session).deriveSourcePublicationGate(test.request, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1290,8 +1311,70 @@ func TestDeriveSourcePublicationGateRejectsSetAttrItemHandleMismatch(t *testing.
 	request := &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{
 		Item: item[:], Handle: handle[:], Mode: proto.Uint32(0o600),
 	}}}
-	if _, err := h.deriveSourcePublicationGate(request, session); !errors.Is(err, syscall.EINVAL) {
+	if _, err := newOperationResolutionContext(h, session).deriveSourcePublicationGate(request, true); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("mismatched SetAttr item/handle = %v, want EINVAL", err)
+	}
+}
+
+func TestOperationResolutionContextReusesAuthoritativeNamespaceBindings(t *testing.T) {
+	root := xfsstore.Capability{0x11}
+	for _, test := range []struct {
+		name        string
+		request     *authoritypb.Request
+		prepareName [][]byte
+		wantLookups uint32
+	}{
+		{
+			name: "create",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+				Parent: root[:], Name: []byte("created"),
+			}}},
+			prepareName: [][]byte{[]byte("created")}, wantLookups: 1,
+		},
+		{
+			name: "same-directory-rename",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+				OldParent: root[:], OldName: []byte("old"), NewParent: root[:], NewName: []byte("new"),
+			}}},
+			prepareName: [][]byte{[]byte("old"), []byte("new")}, wantLookups: 2,
+		},
+		{
+			name: "unlink",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{
+				Parent: root[:], Name: []byte("removed"),
+			}}},
+			prepareName: [][]byte{[]byte("removed")}, wantLookups: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x42}}
+			h := testVolumeHandler()
+			h.Store = store
+			session := volumeserver.SessionID{0x93}
+			if err := h.startSessionResources(session, root, 1, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+				t.Fatal(err)
+			}
+			resolutions := newOperationResolutionContext(h, session)
+			if _, err := resolutions.deriveSourcePublicationGate(test.request, false); err != nil {
+				t.Fatal(err)
+			}
+			if got := store.lookup.Load(); got != 0 {
+				t.Fatalf("pre-turn namespace lookups = %d, want 0", got)
+			}
+
+			resolutions.invalidateNamespaceBindings()
+			if _, err := resolutions.deriveSourcePublicationGate(test.request, true); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range test.prepareName {
+				if _, err := resolutions.namespace(root, name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := store.lookup.Load(); got != test.wantLookups {
+				t.Fatalf("operation namespace lookups = %d, want %d", got, test.wantLookups)
+			}
+		})
 	}
 }
 
@@ -1447,13 +1530,10 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterMutationOrderGrant(t *te
 			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), nil },
 		)
 	}()
-	<-store.firstLookup
 	store.setBound(newBinding)
-	close(store.releaseFirst)
-	<-store.firstForgotten
 	select {
-	case <-store.secondLookup:
-		t.Fatal("namespace binding refreshed before the earlier mutation released FIFO order")
+	case <-store.firstLookup:
+		t.Fatal("namespace binding resolved before the earlier mutation released FIFO order")
 	default:
 	}
 	close(releaseOwner)
@@ -1461,15 +1541,22 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterMutationOrderGrant(t *te
 		t.Fatal(err)
 	}
 	select {
-	case <-store.secondLookup:
+	case <-store.firstLookup:
 	case <-time.After(2 * time.Second):
-		t.Fatal("namespace binding was not refreshed after mutation-order grant")
+		t.Fatal("namespace binding was not resolved after mutation-order grant")
 	}
+	close(store.releaseFirst)
+	<-store.firstForgotten
 	if response := <-mutationResult; response.GetErrno() != 0 {
 		t.Fatalf("namespace mutation = %+v", response)
 	}
-	if calls := store.lookupCalls.Load(); calls != 2 {
-		t.Fatalf("namespace binding lookups = %d, want pre-enqueue and post-grant", calls)
+	if calls := store.lookupCalls.Load(); calls != 1 {
+		t.Fatalf("namespace binding lookups = %d, want one post-grant resolution", calls)
+	}
+	select {
+	case <-store.secondLookup:
+		t.Fatal("prepare repeated the post-grant namespace resolution")
+	default:
 	}
 
 	newIdentity := [16]byte{newBinding[0]}
@@ -1723,8 +1810,8 @@ func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("Rename calls = %d, want one", calls)
 	}
-	if calls := store.lookup.Load(); calls != 6 {
-		t.Fatalf("Rename namespace lookups = %d, want pre-enqueue declaration, post-FIFO refresh, pre-XFS bindings, and no post-XFS lookup", calls)
+	if calls := store.lookup.Load(); calls != 2 {
+		t.Fatalf("Rename namespace lookups = %d, want one post-FIFO resolution per name", calls)
 	}
 
 	// Request ID is delivery correlation, not replay identity. A lost DATA
@@ -1739,7 +1826,7 @@ func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("exact Rename replay re-executed XFS: calls = %d", calls)
 	}
-	if calls := store.lookup.Load(); calls != 6 {
+	if calls := store.lookup.Load(); calls != 2 {
 		t.Fatalf("exact Rename replay re-resolved namespace: lookups = %d", calls)
 	}
 }
@@ -1758,8 +1845,8 @@ func TestRenameExchangeReplyCarriesBothAuthoritativePostBindings(t *testing.T) {
 	if rename == nil || !bytes.Equal(rename.GetNewPostIdentity(), wantNew[:]) || !bytes.Equal(rename.GetOldPostIdentity(), wantOld[:]) {
 		t.Fatalf("Rename exchange reply = %+v, want new=%x old=%x", rename, wantNew, wantOld)
 	}
-	if calls := store.lookup.Load(); calls != 6 {
-		t.Fatalf("Rename exchange namespace lookups = %d, want pre-enqueue declaration, post-FIFO refresh, pre-XFS bindings, and no post-XFS lookup", calls)
+	if calls := store.lookup.Load(); calls != 2 {
+		t.Fatalf("Rename exchange namespace lookups = %d, want one post-FIFO resolution per name", calls)
 	}
 }
 
@@ -1795,8 +1882,42 @@ func TestRenameSameInodeNoOpReportsBothNamesAndReplaysExactly(t *testing.T) {
 	if calls := store.renameCalls.Load(); calls != 1 {
 		t.Fatalf("same-inode exact replay re-executed XFS: calls = %d", calls)
 	}
-	if calls := store.lookup.Load(); calls != 6 {
-		t.Fatalf("same-inode Rename namespace lookups = %d, want pre-enqueue declaration, post-FIFO refresh, pre-XFS bindings, and no post-XFS lookup", calls)
+	if calls := store.lookup.Load(); calls != 2 {
+		t.Fatalf("same-inode Rename namespace lookups = %d, want one post-FIFO resolution per name", calls)
+	}
+}
+
+func TestHandlerExportsFsyncBatchEffectiveness(t *testing.T) {
+	store := &fsyncMetricStore{batch: 3}
+	h, ctx, cred, _ := resourceAdmissionRequestHarness(t, store, 1, 1)
+	metrics, err := authoritymetrics.New("fsync-metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Metrics = metrics
+	handle := xfsstore.Capability{0xA5}
+	if err := h.trackOpen(cred.ID, handle, false); err != nil {
+		t.Fatal(err)
+	}
+	response := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 1, Epoch: cred.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]},
+		Body:    &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: handle[:]}},
+	})
+	if response.GetErrno() != 0 {
+		t.Fatalf("Fsync = %+v", response)
+	}
+	var rendered bytes.Buffer
+	if err := metrics.Registry().WritePrometheus(&rendered); err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []string{
+		`portablefs_authority_fsync_barrier_handles_total{volume="fsync-metrics"} 3`,
+		`portablefs_authority_fsync_storage_syncs_total{volume="fsync-metrics"} 1`,
+	} {
+		if !bytes.Contains(rendered.Bytes(), []byte(sample+"\n")) {
+			t.Errorf("metrics omit %q", sample)
+		}
 	}
 }
 
