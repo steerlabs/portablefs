@@ -195,9 +195,11 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 		return fail(err)
 	}
 	var response authoritypb.Response
-	if err := readFrame(conn, c.cfg.MaxFrame, nil, 0, &response); err != nil {
+	releaseFrame, err := readFrameRetained(conn, c.cfg.MaxFrame, nil, 0, &response)
+	if err != nil {
 		return fail(err)
 	}
+	defer releaseFrame()
 	hello := response.GetHello()
 	if response.GetRequestId() != request.GetRequestId() || response.GetErrno() != 0 || hello == nil ||
 		hello.GetProtocolMajor() != ProtocolMajor {
@@ -350,9 +352,11 @@ func rawRoundTrip(conn net.Conn, frameMax uint32, request *authoritypb.Request) 
 		return nil, err
 	}
 	response := new(authoritypb.Response)
-	if err := readFrame(conn, frameMax, nil, 0, response); err != nil {
+	releaseFrame, err := readFrameRetained(conn, frameMax, nil, 0, response)
+	if err != nil {
 		return nil, err
 	}
+	defer releaseFrame()
 	if response.GetRequestId() != request.GetRequestId() {
 		return nil, errors.New("authorityrpc: handshake response carried a foreign request ID")
 	}

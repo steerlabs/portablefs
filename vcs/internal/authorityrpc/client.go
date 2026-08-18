@@ -129,6 +129,7 @@ type responseConsumption struct {
 	forceOnce     sync.Once
 	force         func(error)
 	terminalToken []byte
+	releaseFrame  func()
 }
 
 // Consume acknowledges that the frontend has either physically published the
@@ -148,8 +149,9 @@ func (r *responseConsumption) revoke(cause error) {
 }
 
 type callResult struct {
-	response *authoritypb.Response
-	err      error
+	response     *authoritypb.Response
+	releaseFrame func()
+	err          error
 }
 
 // lane is one admission class. Ordinary operations and blocking POSIX lock
@@ -1185,6 +1187,10 @@ func (c *Client) bindResponseConsumption(receipt *responseConsumption, response 
 // cross-lane teardown race the token closes.
 func (c *Client) consumeResponse(receipt *responseConsumption) {
 	defer c.finishResponseConsumption(receipt)
+	if receipt.releaseFrame != nil {
+		receipt.releaseFrame()
+		receipt.releaseFrame = nil
+	}
 	if len(receipt.terminalToken) == 0 {
 		return
 	}
@@ -1322,12 +1328,17 @@ func (c *Client) laneFor(request *authoritypb.Request) *lane {
 // and drops it. Copying that request first isolated nothing and made a maximal
 // write pay for a second megabyte.
 func (c *Client) Call(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	response, releaseFrame, err := c.callFrame(ctx, request)
+	return detachResponseFrame(response, releaseFrame), err
+}
+
+func (c *Client) callFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
 	admitted, err := c.admitCall(ctx, request)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { <-admitted.permits }()
-	return c.dispatchOwned(ctx, request)
+	return c.dispatchOwnedFrame(ctx, request)
 }
 
 // admitCall is the single shape and concurrency boundary for non-mutation
@@ -1359,9 +1370,14 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 // same-epoch reconnect; copying for each attempt only duplicated large write
 // payloads without adding isolation.
 func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	response, releaseFrame, err := c.dispatchOwnedFrame(ctx, request)
+	return detachResponseFrame(response, releaseFrame), err
+}
+
+func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
 	role, err := roleForRequest(request)
 	if err != nil {
-		return nil, syscall.EINVAL
+		return nil, nil, syscall.EINVAL
 	}
 	transport := c.transportForRole(role)
 	// An idle DATA failure has no coherence meaning. Rebind it lazily before a
@@ -1369,7 +1385,7 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 	// replay, because no bytes for this request have been assigned or sent yet.
 	if role == authoritypb.TransportRole_TRANSPORT_ROLE_DATA && !c.transportIsLive(transport) && !c.poisoned.Load() {
 		if err := c.reconnectTransport(ctx, role); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	// Request IDs are physical-connection envelopes, not replay identities. A
@@ -1382,21 +1398,21 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 	transport.pendingMu.Lock()
 	if c.closed.Load() {
 		transport.pendingMu.Unlock()
-		return nil, net.ErrClosed
+		return nil, nil, net.ErrClosed
 	}
 	if transport.conn == nil {
 		terminal := c.poisoned.Load()
 		transport.pendingMu.Unlock()
 		if terminal {
 			if err := c.SessionEndCause(); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			return nil, ErrSessionEnded
+			return nil, nil, ErrSessionEnded
 		}
 		// Nothing was written. Classifying this as a transport break lets the
 		// read and mutation wrappers safely establish the same epoch and submit
 		// the operation once, while their replay identity remains unchanged.
-		return nil, ErrTransportUncertain
+		return nil, nil, ErrTransportUncertain
 	}
 	transport.pending[request.RequestId] = result
 	conn := transport.conn
@@ -1416,18 +1432,36 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 			return c.completeCall(request, completed)
 		case <-timer.C:
 			c.failConnection(transport, conn, ErrTransportUncertain)
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 	case completed := <-result:
 		return c.completeCall(request, completed)
 	}
 }
 
-func (c *Client) completeCall(request *authoritypb.Request, completed callResult) (*authoritypb.Response, error) {
+func (c *Client) completeCall(request *authoritypb.Request, completed callResult) (*authoritypb.Response, func(), error) {
 	if completed.err == nil && completed.response != nil && completed.response.GetErrno() == int32(syscall.ESTALE) && request.GetKeepAlive() != nil {
 		c.signalSessionEnd(ErrSessionEnded)
 	}
-	return completed.response, completed.err
+	return completed.response, completed.releaseFrame, completed.err
+}
+
+// detachResponseFrame preserves the existing unrestricted response lifetime
+// for callers without an explicit consumption boundary. Only read replies can
+// alias the pooled frame; copy that bulk body before releasing the frame.
+func detachResponseFrame(response *authoritypb.Response, releaseFrame func()) *authoritypb.Response {
+	if releaseFrame == nil {
+		return response
+	}
+	var readData []byte
+	if response != nil && response.GetRead() != nil && len(response.GetRead().GetData()) != 0 {
+		readData = append([]byte(nil), response.GetRead().GetData()...)
+	}
+	releaseFrame()
+	if readData != nil {
+		response.GetRead().Data = readData
+	}
+	return response
 }
 
 func (c *Client) sendCancel(transport *clientTransport, target uint64, conn net.Conn) {
@@ -1471,8 +1505,8 @@ func (c *Client) CallReadRetained(
 	request *authoritypb.Request,
 	force func(error),
 ) (*authoritypb.Response, ResponseConsumption, error) {
-	return c.callRetained(force, func() (*authoritypb.Response, error) {
-		return c.CallRead(ctx, request)
+	return c.callRetained(force, func() (*authoritypb.Response, func(), error) {
+		return c.callIdempotentFrame(ctx, request)
 	})
 }
 
@@ -1482,24 +1516,32 @@ func (c *Client) CallReadRetained(
 // staging and are idempotent by transaction identity. COMMIT must never use it;
 // COMMIT is replay-retained through CallMutationWithIdentity.
 func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	response, releaseFrame, err := c.callIdempotentFrame(ctx, request)
+	return detachResponseFrame(response, releaseFrame), err
+}
+
+func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
 	if c.poisoned.Load() {
-		return nil, ErrTransportUncertain
+		return nil, nil, ErrTransportUncertain
 	}
-	response, err := c.Call(ctx, request)
+	response, releaseFrame, err := c.callFrame(ctx, request)
 	if !errors.Is(err, ErrTransportUncertain) {
-		return response, err
+		return response, releaseFrame, err
+	}
+	if releaseFrame != nil {
+		releaseFrame()
 	}
 	role, roleErr := roleForRequest(request)
 	if roleErr != nil {
-		return nil, syscall.EINVAL
+		return nil, nil, syscall.EINVAL
 	}
 	if err := c.reconnectTransport(ctx, role); err != nil {
 		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
 			c.signalSessionEnd(err)
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	return c.Call(ctx, request)
+	return c.callFrame(ctx, request)
 }
 
 // CallIdempotentRetained is the staged-write counterpart to
@@ -1513,14 +1555,14 @@ func (c *Client) CallIdempotentRetained(
 	request *authoritypb.Request,
 	force func(error),
 ) (*authoritypb.Response, ResponseConsumption, error) {
-	return c.callRetained(force, func() (*authoritypb.Response, error) {
-		return c.CallIdempotent(ctx, request)
+	return c.callRetained(force, func() (*authoritypb.Response, func(), error) {
+		return c.callIdempotentFrame(ctx, request)
 	})
 }
 
 func (c *Client) callRetained(
 	force func(error),
-	call func() (*authoritypb.Response, error),
+	call func() (*authoritypb.Response, func(), error),
 ) (*authoritypb.Response, ResponseConsumption, error) {
 	consumption, err := c.beginResponseConsumption(force)
 	if err != nil {
@@ -1532,7 +1574,8 @@ func (c *Client) callRetained(
 			consumption.Consume()
 		}
 	}()
-	response, err := call()
+	response, releaseFrame, err := call()
+	consumption.releaseFrame = releaseFrame
 	if err != nil || response == nil {
 		return response, nil, err
 	}
@@ -1626,18 +1669,23 @@ func (c *Client) CallMutationWithIdentityRetained(
 			return nil, nil, err
 		}
 	}
-	response, err := c.dispatchOwned(ctx, request)
+	response, releaseFrame, err := c.dispatchOwnedFrame(ctx, request)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		consumption.releaseFrame = releaseFrame
 		c.signalSessionEnd(ErrTransportUncertain)
 		return nil, nil, ErrTransportUncertain
 	}
 	if errors.Is(err, ErrTransportUncertain) {
+		if releaseFrame != nil {
+			releaseFrame()
+		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
 		}
-		response, err = c.dispatchOwned(ctx, request)
+		response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
 	}
+	consumption.releaseFrame = releaseFrame
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1678,8 +1726,9 @@ func synchronizeSlot(slot *clientSlot, index uint32, sequence uint64, state *aut
 
 func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 	for {
-		var response authoritypb.Response
-		if err := readFrame(conn, transport.frameMax.Load(), nil, 0, &response); err != nil {
+		response := new(authoritypb.Response)
+		releaseFrame, err := readFrameRetained(conn, transport.frameMax.Load(), nil, 0, response)
+		if err != nil {
 			c.failConnection(transport, conn, ErrTransportUncertain)
 			return
 		}
@@ -1689,11 +1738,13 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 		transport.pendingMu.Lock()
 		if transport.conn != conn {
 			transport.pendingMu.Unlock()
+			releaseFrame()
 			return
 		}
 		if !equalBytes(response.GetEpoch(), c.sessionEpoch()) {
 			c.signalSessionEnd(ErrAuthorityChanged)
 			transport.pendingMu.Unlock()
+			releaseFrame()
 			c.failConnection(transport, conn, ErrAuthorityChanged)
 			return
 		}
@@ -1719,11 +1770,20 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 		if response.GetRoutesMismatch().GetSessionRefused() {
 			c.signalSessionEnd(ErrRoutesMismatch)
 		}
+		// Protobuf unmarshaling owns metadata fields. Only ReadReply.Data aliases
+		// the out-of-line frame, so every other response can recycle immediately
+		// without waiting for the caller's publication boundary.
+		if len(response.GetRead().GetData()) == 0 {
+			releaseFrame()
+			releaseFrame = nil
+		}
 		waiter := transport.pending[response.GetRequestId()]
 		delete(transport.pending, response.GetRequestId())
 		transport.pendingMu.Unlock()
 		if waiter != nil {
-			waiter <- callResult{response: &response}
+			waiter <- callResult{response: response, releaseFrame: releaseFrame}
+		} else if releaseFrame != nil {
+			releaseFrame()
 		}
 	}
 }
