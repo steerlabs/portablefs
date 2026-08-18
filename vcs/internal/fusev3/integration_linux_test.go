@@ -1558,6 +1558,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	}
 	type counts struct {
 		lookup, getattr, create, mkdir, unlink, rmdir, rename, write, setattr, symlink, link int
+		open, tmpfile, fallocate, copyFileRange, removeXattr                                 int
 	}
 	measure := func(operation string, fn func()) counts {
 		before := counts{
@@ -1566,6 +1567,9 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
 			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
 			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
+			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
+			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
+			removeXattr: f.counter.count("remove-xattr"),
 		}
 		fn()
 		after := counts{
@@ -1574,6 +1578,9 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
 			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
 			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
+			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
+			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
+			removeXattr: f.counter.count("remove-xattr"),
 		}
 		delta := counts{
 			lookup: after.lookup - before.lookup, getattr: after.getattr - before.getattr,
@@ -1581,10 +1588,14 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			unlink: after.unlink - before.unlink, rmdir: after.rmdir - before.rmdir,
 			rename: after.rename - before.rename, write: after.write - before.write,
 			setattr: after.setattr - before.setattr, symlink: after.symlink - before.symlink, link: after.link - before.link,
+			open: after.open - before.open, tmpfile: after.tmpfile - before.tmpfile,
+			fallocate: after.fallocate - before.fallocate, copyFileRange: after.copyFileRange - before.copyFileRange,
+			removeXattr: after.removeXattr - before.removeXattr,
 		}
-		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d mkdir=%d unlink=%d rmdir=%d rename=%d one-shot-write=%d setattr=%d symlink=%d link=%d",
+		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d mkdir=%d unlink=%d rmdir=%d rename=%d one-shot-write=%d setattr=%d symlink=%d link=%d open=%d tmpfile=%d fallocate=%d copy-file-range=%d remove-xattr=%d",
 			operation, delta.lookup, delta.getattr, delta.create, delta.mkdir, delta.unlink, delta.rmdir,
-			delta.rename, delta.write, delta.setattr, delta.symlink, delta.link)
+			delta.rename, delta.write, delta.setattr, delta.symlink, delta.link, delta.open, delta.tmpfile,
+			delta.fallocate, delta.copyFileRange, delta.removeXattr)
 		return delta
 	}
 	requireCounts := func(operation string, got, want counts) {
@@ -1644,6 +1655,54 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	})
 	requireCounts("setattr plus warm stat", setattrRPCs, counts{setattr: 1})
 
+	truncateRPCs := measure("truncating open plus warm fstat", func() {
+		file, err := os.OpenFile(createdPath, os.O_TRUNC|os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("truncating open: %v", err)
+		}
+		info, statErr := file.Stat()
+		if statErr != nil || info.Size() != 0 {
+			_ = file.Close()
+			t.Fatalf("fstat after truncating open: size=%v err=%v", sizeOf(info), statErr)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close truncated file: %v", err)
+		}
+	})
+	requireCounts("truncating open plus warm fstat", truncateRPCs, counts{open: 1})
+
+	fallocateFile, err := os.OpenFile(createdPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open fallocate target: %v", err)
+	}
+	fallocateRPCs := measure("fallocate plus warm fstat", func() {
+		if err := unix.Fallocate(int(fallocateFile.Fd()), 0, 0, 4096); err != nil {
+			t.Fatalf("fallocate: %v", err)
+		}
+		info, statErr := fallocateFile.Stat()
+		if statErr != nil || info.Size() != 4096 {
+			t.Fatalf("fstat after fallocate: size=%v err=%v", sizeOf(info), statErr)
+		}
+	})
+	requireCounts("fallocate plus warm fstat", fallocateRPCs, counts{fallocate: 1})
+	if err := fallocateFile.Close(); err != nil {
+		t.Fatalf("close fallocate target: %v", err)
+	}
+
+	const removableXattr = "user.portablefs-post-state-remove"
+	if err := unix.Setxattr(filepath.Join(f.volumeRoot, "post-state-created"), removableXattr, []byte("value"), 0); err != nil {
+		t.Fatalf("seed removable xattr directly in the isolated backing tree: %v", err)
+	}
+	removeXattrRPCs := measure("remove xattr plus warm stat", func() {
+		if err := unix.Removexattr(createdPath, removableXattr); err != nil {
+			t.Fatalf("removexattr: %v", err)
+		}
+		if _, err := os.Lstat(createdPath); err != nil {
+			t.Fatalf("stat after removexattr: %v", err)
+		}
+	})
+	requireCounts("remove xattr plus warm stat", removeXattrRPCs, counts{removeXattr: 1})
+
 	mkdirPath := filepath.Join(root, "post-state-directory")
 	if _, err := os.Lstat(mkdirPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("warm mkdir destination absence: %v", err)
@@ -1660,6 +1719,45 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		}
 	})
 	requireCounts("mkdir plus child/parent stat", mkdirRPCs, counts{mkdir: 1})
+
+	mknodPath := filepath.Join(root, "post-state-mknod")
+	if _, err := os.Lstat(mknodPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm mknod destination absence: %v", err)
+	}
+	mknodRPCs := measure("mknod plus child/parent stat", func() {
+		if err := unix.Mknod(mknodPath, unix.S_IFREG|0o600, 0); err != nil {
+			t.Fatalf("mknod regular file: %v", err)
+		}
+		for _, path := range []string{mknodPath, root} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after mknod %s: %v", path, err)
+			}
+		}
+	})
+	requireCounts("mknod plus child/parent stat", mknodRPCs, counts{create: 1})
+
+	tmpfileRPCs := measure("tmpfile plus inode/parent stat", func() {
+		fd, err := unix.Open(root, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+		if err != nil {
+			t.Fatalf("open O_TMPFILE: %v", err)
+		}
+		file := os.NewFile(uintptr(fd), "post-state-tmpfile")
+		if file == nil {
+			_ = unix.Close(fd)
+			t.Fatal("wrap O_TMPFILE descriptor")
+		}
+		if _, err := file.Stat(); err != nil {
+			_ = file.Close()
+			t.Fatalf("fstat O_TMPFILE: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close O_TMPFILE: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after O_TMPFILE: %v", err)
+		}
+	})
+	requireCounts("tmpfile plus inode/parent stat", tmpfileRPCs, counts{tmpfile: 1})
 
 	symlinkPath := filepath.Join(root, "post-state-symlink")
 	if _, err := os.Lstat(symlinkPath); !errors.Is(err, os.ErrNotExist) {
@@ -1696,6 +1794,37 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		}
 	})
 	requireCounts("link plus target/source/parent stat", linkRPCs, counts{link: 1})
+
+	copySourcePath, copyDestinationPath := filepath.Join(root, "post-state-copy-source"), filepath.Join(root, "post-state-copy-destination")
+	mustWrite(t, copySourcePath, []byte("copy"), 0o600)
+	mustWrite(t, copyDestinationPath, nil, 0o600)
+	copySource, err := os.Open(copySourcePath)
+	if err != nil {
+		t.Fatalf("open copy source: %v", err)
+	}
+	copyDestination, err := os.OpenFile(copyDestinationPath, os.O_RDWR, 0)
+	if err != nil {
+		_ = copySource.Close()
+		t.Fatalf("open copy destination: %v", err)
+	}
+	copyRPCs := measure("copy-file-range plus source/destination stat", func() {
+		copied, err := unix.CopyFileRange(int(copySource.Fd()), nil, int(copyDestination.Fd()), nil, 4, 0)
+		if err != nil || copied != 4 {
+			t.Fatalf("copy_file_range = (%d, %v), want (4, nil)", copied, err)
+		}
+		for _, file := range []*os.File{copySource, copyDestination} {
+			if _, err := file.Stat(); err != nil {
+				t.Fatalf("fstat after copy_file_range: %v", err)
+			}
+		}
+	})
+	requireCounts("copy-file-range plus source/destination stat", copyRPCs, counts{copyFileRange: 1})
+	if err := copySource.Close(); err != nil {
+		t.Fatalf("close copy source: %v", err)
+	}
+	if err := copyDestination.Close(); err != nil {
+		t.Fatalf("close copy destination: %v", err)
+	}
 
 	rmdirPath := filepath.Join(root, "post-state-rmdir")
 	mustMkdir(t, rmdirPath)

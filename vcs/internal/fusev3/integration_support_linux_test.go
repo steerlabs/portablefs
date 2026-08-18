@@ -911,6 +911,8 @@ func requestKind(request *authoritypb.Request) string {
 		return "mkdir"
 	case request.GetCreate() != nil:
 		return "create"
+	case request.GetTmpfile() != nil:
+		return "tmpfile"
 	case request.GetUnlink() != nil:
 		if request.GetUnlink().GetDirectory() {
 			return "rmdir"
@@ -932,10 +934,16 @@ func requestKind(request *authoritypb.Request) string {
 		return "write-transaction"
 	case request.GetOneShotWrite() != nil:
 		return "one-shot-write"
+	case request.GetFallocate() != nil:
+		return "fallocate"
+	case request.GetCopyFileRange() != nil:
+		return "copy-file-range"
 	case request.GetRead() != nil:
 		return "read"
 	case request.GetSetAttr() != nil:
 		return "setattr"
+	case request.GetRemoveXattr() != nil:
+		return "remove-xattr"
 	case request.GetStatFs() != nil:
 		return "statfs"
 	default:
