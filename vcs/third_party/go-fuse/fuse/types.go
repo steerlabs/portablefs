@@ -592,6 +592,19 @@ type NotifyPFSSizeOut struct {
 	Sequence uint64
 }
 
+type NotifyPFSAttrOut struct {
+	Nodeid             uint64
+	VisibilitySequence uint64
+}
+
+type NotifyPFSEntryOut struct {
+	Parent             uint64
+	Child              uint64
+	VisibilitySequence uint64
+	NameLen            uint32
+	Flags              uint32
+}
+
 const (
 	//	NOTIFY_POLL         = -1 // notify kernel that a poll waiting for IO on a file handle should wake up
 	NOTIFY_INVAL_INODE    = -2 // notify kernel that an inode should be invalidated
@@ -602,6 +615,8 @@ const (
 	NOTIFY_RESEND         = -7
 	NOTIFY_PRUNE          = -9
 	NOTIFY_PFS_SIZE       = -10
+	NOTIFY_PFS_ATTR       = -12
+	NOTIFY_PFS_ENTRY      = -13
 )
 
 type FlushIn struct {
@@ -715,7 +730,7 @@ type InHeader struct {
 	// Protocol 7.38 split the former padding word into total_extlen and
 	// padding. PortableFS does not negotiate request extensions, so
 	// TotalExtlen must remain zero, but preserving the named field makes the
-	// 7.41 wire contract explicit and auditable.
+	// 7.42 wire contract explicit and auditable.
 	TotalExtlen uint16
 	Padding     uint16
 }
@@ -936,6 +951,42 @@ type PFSRangeOut struct {
 	Sequence   uint64
 	Flags      uint32
 	Error      int32
+}
+
+const (
+	PFSPostStateMaxObjects = 4
+	PFSPostStateHeaderSize = 32
+	PFSObjectStateSize     = 144
+	PFSPostStateMaxSize    = PFSPostStateHeaderSize + PFSPostStateMaxObjects*PFSObjectStateSize
+	PFSCacheStampSize      = 16
+)
+
+// PFSPostStateHeader and PFSObjectState are the variable trailer appended to
+// every applied mutation result. Keep these layouts pointer-free: the reply
+// writer encodes them directly into its bounded payload buffer.
+type PFSPostStateHeader struct {
+	VisibilitySequence uint64
+	SnapshotSequence   uint64
+	AttrValidNS        uint64
+	ObjectCount        uint32
+	Flags              uint32
+}
+
+type PFSObjectState struct {
+	Nodeid         uint64
+	ObjectVersion  uint64
+	StableIdentity [16]byte
+	Attr           Attr
+	Roles          uint32
+	InodeFlags     uint32
+	BirthTimeNS    int64
+	PFSClass       uint32
+	RecordFlags    uint32
+}
+
+type PFSCacheStamp struct {
+	SnapshotSequence uint64
+	ObjectVersion    uint64
 }
 
 // PFSPublishIn is the kernel's local-only post-VFS publication receipt. The

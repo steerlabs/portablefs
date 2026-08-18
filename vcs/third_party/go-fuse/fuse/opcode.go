@@ -88,8 +88,10 @@ const (
 	_OP_NOTIFY_DELETE         = uint32(104) // protocol version 18
 	_OP_NOTIFY_PRUNE          = uint32(105) // protocol version 45
 	_OP_NOTIFY_PFS_SIZE       = uint32(106) // PortableFS private notify code 10
+	_OP_NOTIFY_PFS_ATTR       = uint32(107) // PortableFS private notify code 12
+	_OP_NOTIFY_PFS_ENTRY      = uint32(108) // PortableFS private notify code 13
 
-	_OPCODE_COUNT = uint32(107)
+	_OPCODE_COUNT = uint32(109)
 
 	// Constants from Linux kernel fs/fuse/fuse_i.h
 	// Default MaxPages value in all kernel versions
@@ -698,6 +700,8 @@ func init() {
 		_OP_NOTIFY_RETRIEVE_CACHE: "NOTIFY_RETRIEVE",
 		_OP_NOTIFY_DELETE:         "NOTIFY_DELETE",
 		_OP_NOTIFY_PFS_SIZE:       "NOTIFY_PFS_SIZE",
+		_OP_NOTIFY_PFS_ATTR:       "NOTIFY_PFS_ATTR",
+		_OP_NOTIFY_PFS_ENTRY:      "NOTIFY_PFS_ENTRY",
 		_OP_FALLOCATE:             "FALLOCATE",
 		_OP_READDIRPLUS:           "READDIRPLUS",
 		_OP_RENAME2:               "RENAME2",
@@ -820,6 +824,8 @@ func init() {
 		_OP_NOTIFY_STORE_CACHE:    NotifyStoreOut{},
 		_OP_NOTIFY_PRUNE:          NotifyPruneOut{},
 		_OP_NOTIFY_PFS_SIZE:       NotifyPFSSizeOut{},
+		_OP_NOTIFY_PFS_ATTR:       NotifyPFSAttrOut{},
+		_OP_NOTIFY_PFS_ENTRY:      NotifyPFSEntryOut{},
 		_OP_OPEN:                  OpenOut{},
 		_OP_OPENDIR:               OpenOut{},
 		_OP_POLL:                  _PollOut{},
