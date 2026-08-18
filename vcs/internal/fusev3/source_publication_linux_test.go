@@ -1322,6 +1322,7 @@ func TestPhysicalWriteReleasesCapacityBeforePublicationReceipt(t *testing.T) {
 			f := newStrictFixture(t)
 			f.rpc.byName = map[string]*authoritypb.Item{"positive": testItem(90, authoritypb.Attr_REGULAR, 90)}
 			if test.negative {
+				f.rpc.missingNames = make(map[string]bool)
 				f.rpc.missingNames[test.lookup] = true
 			}
 			unique := nextTestRequestUnique()

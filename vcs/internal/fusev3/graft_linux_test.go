@@ -483,8 +483,9 @@ func TestARouteRootIsRemovedAndRecreatedLikeAnyDirectory(t *testing.T) {
 	if status := f.raw.Rmdir(nil, &fuse.InHeader{NodeId: fuse.FUSE_ROOT_ID}, "node_modules"); !status.Ok() {
 		t.Fatalf("RMDIR of the emptied route root = %v", status)
 	}
-	if _, status := f.lookup(t, fuse.FUSE_ROOT_ID, "node_modules"); status != fuse.Status(syscall.ENOENT) {
-		t.Fatalf("LOOKUP after removing the route root = %v, want ENOENT", status)
+	if out, status := f.lookup(t, fuse.FUSE_ROOT_ID, "node_modules"); !status.Ok() ||
+		out.NodeId != 0 || out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		t.Fatalf("LOOKUP after removing the route root = (%+v, %v), want LOCAL negative", out, status)
 	}
 	if calls := f.authorityCalls(func() { f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules") }); calls != 0 {
 		t.Fatalf("recreating the route root cost %d authority requests, want 0", calls)
@@ -614,8 +615,9 @@ func TestRenamingAnAncestorOfAnUncreatedRouteRootIsAnOrdinaryRename(t *testing.T
 	packages := f.mustLookup(t, fuse.FUSE_ROOT_ID, "packages")
 	// Resolve the owned name so the topology knows about it, without creating
 	// any machine-local content behind it.
-	if _, status := f.lookup(t, packages.NodeId, "node_modules"); status != fuse.Status(syscall.ENOENT) {
-		t.Fatalf("LOOKUP of an uncreated route root = %v, want ENOENT", status)
+	if out, status := f.lookup(t, packages.NodeId, "node_modules"); !status.Ok() ||
+		out.NodeId != 0 || out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		t.Fatalf("LOOKUP of an uncreated route root = (%+v, %v), want LOCAL negative", out, status)
 	}
 	status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {
 		rename := &fuse.RenameIn{InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Newdir: fuse.FUSE_ROOT_ID}
