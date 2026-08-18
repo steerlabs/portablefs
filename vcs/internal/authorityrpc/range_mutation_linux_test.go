@@ -3,9 +3,11 @@
 package authorityrpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -26,10 +28,87 @@ type rangeMutationTestStore struct {
 	copyCount      uint64
 	copyPost       xfsstore.Attr
 	copyErr        error
+
+	lockTableMu sync.Mutex
+	lockTable   map[[16]byte]*sync.Mutex
+	lockStateMu sync.Mutex
+	held        map[[16]byte]int
+	lockCalls   [][][16]byte
+
+	coordinateWhileLocked bool
+	copyUnderLock         bool
+	postSampleUnderLock   bool
+	copyEntered           chan struct{}
+	copyRelease           chan struct{}
+	copyEnteredOnce       sync.Once
 }
 
 func (s *rangeMutationTestStore) CoordinateOpen(handle xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	s.lockStateMu.Lock()
+	if len(s.held) != 0 {
+		s.coordinateWhileLocked = true
+	}
+	s.lockStateMu.Unlock()
 	return xfsstore.ObjectCoordinate{Stable: [16]byte{handle[0]}, Ino: uint64(handle[0]), DeviceMinor: 1}, nil
+}
+
+func (s *rangeMutationTestStore) LockMutation(identities [][16]byte) func() {
+	s.lockStateMu.Lock()
+	s.lockCalls = append(s.lockCalls, append([][16]byte(nil), identities...))
+	s.lockStateMu.Unlock()
+
+	seen := make(map[[16]byte]struct{}, len(identities))
+	ordered := make([][16]byte, 0, len(identities))
+	locks := make([]*sync.Mutex, 0, len(identities))
+	s.lockTableMu.Lock()
+	for _, identity := range identities {
+		if _, ok := seen[identity]; ok {
+			continue
+		}
+		seen[identity] = struct{}{}
+		lock := s.lockTable[identity]
+		if lock == nil {
+			lock = &sync.Mutex{}
+			s.lockTable[identity] = lock
+		}
+		ordered = append(ordered, identity)
+		locks = append(locks, lock)
+	}
+	s.lockTableMu.Unlock()
+	for _, lock := range locks {
+		lock.Lock()
+	}
+	s.lockStateMu.Lock()
+	for _, identity := range ordered {
+		s.held[identity]++
+	}
+	s.lockStateMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.lockStateMu.Lock()
+			for _, identity := range ordered {
+				if s.held[identity]--; s.held[identity] == 0 {
+					delete(s.held, identity)
+				}
+			}
+			s.lockStateMu.Unlock()
+			for index := len(locks) - 1; index >= 0; index-- {
+				locks[index].Unlock()
+			}
+		})
+	}
+}
+
+func (s *rangeMutationTestStore) identitiesHeld(identities ...[16]byte) bool {
+	s.lockStateMu.Lock()
+	defer s.lockStateMu.Unlock()
+	for _, identity := range identities {
+		if s.held[identity] == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *rangeMutationTestStore) Fallocate(xfsstore.Capability, xfsstore.FallocateSpec) (xfsstore.Attr, error) {
@@ -37,12 +116,26 @@ func (s *rangeMutationTestStore) Fallocate(xfsstore.Capability, xfsstore.Falloca
 	return s.fallocatePost, s.fallocateErr
 }
 
-func (s *rangeMutationTestStore) CopyFileRange(xfsstore.Capability, xfsstore.Capability, xfsstore.CopyFileRangeSpec) (uint64, xfsstore.Attr, error) {
+func (s *rangeMutationTestStore) CopyFileRange(input, output xfsstore.Capability, _ xfsstore.CopyFileRangeSpec) (uint64, xfsstore.Attr, error) {
 	s.copyCalls.Add(1)
+	s.lockStateMu.Lock()
+	s.copyUnderLock = s.held[[16]byte{input[0]}] != 0 && s.held[[16]byte{output[0]}] != 0
+	s.lockStateMu.Unlock()
+	if s.copyEntered != nil {
+		s.copyEnteredOnce.Do(func() { close(s.copyEntered) })
+	}
+	if s.copyRelease != nil {
+		<-s.copyRelease
+	}
 	return s.copyCount, s.copyPost, s.copyErr
 }
 
 func (s *rangeMutationTestStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	if s.copyCalls.Load() != 0 {
+		s.lockStateMu.Lock()
+		s.postSampleUnderLock = s.held[[16]byte{handle[0]}] != 0
+		s.lockStateMu.Unlock()
+	}
 	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(handle[0]), Size: 64, Mode: 0o600, Nlink: 1}, nil
 }
 
@@ -69,7 +162,10 @@ func newRangeMutationHarness(t *testing.T) (*VolumeHandler, volumeserver.Session
 	if err != nil {
 		t.Fatal(err)
 	}
-	store := &rangeMutationTestStore{}
+	store := &rangeMutationTestStore{
+		lockTable: make(map[[16]byte]*sync.Mutex),
+		held:      make(map[[16]byte]int),
+	}
 	h := testVolumeHandler()
 	h.Store, h.Runtime = store, runtime
 	root := xfsstore.Capability{0x11}
@@ -253,6 +349,156 @@ func TestCopyFileRangePublishesZeroByteMetadataOnlyPostApply(t *testing.T) {
 	if replayed.GetCopyFileRange().GetFlags() != rangeReplyApplied|rangeReplyPostApply ||
 		replayed.GetCopyFileRange().GetResultSize() != 0 || store.copyCalls.Load() != 1 {
 		t.Fatalf("zero-byte metadata-only CFR replay = %+v calls=%d", replayed, store.copyCalls.Load())
+	}
+}
+
+func TestCopyFileRangeLocksResolvedIdentitiesThroughBothSnapshots(t *testing.T) {
+	h, credential, store, input, output := newRangeMutationHarness(t)
+	store.copyCount = 5
+	store.copyPost = xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x31, Size: 20, Mode: 0o600, Nlink: 1}
+	store.copyEntered = make(chan struct{})
+	store.copyRelease = make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-store.copyRelease:
+		default:
+			close(store.copyRelease)
+		}
+	})
+
+	response := make(chan *authoritypb.Response, 1)
+	request := copyMutationRequest(1, input, output)
+	go func() {
+		response <- h.handleCopyFileRange(t.Context(), request, credential, request.GetCopyFileRange())
+	}()
+	select {
+	case <-store.copyEntered:
+	case <-time.After(time.Second):
+		t.Fatal("COPY_FILE_RANGE did not reach the locked storage call")
+	}
+
+	sourceIdentity, destinationIdentity := [16]byte{input[0]}, [16]byte{output[0]}
+	store.lockStateMu.Lock()
+	if len(store.lockCalls) != 1 || len(store.lockCalls[0]) != 2 ||
+		store.lockCalls[0][0] != sourceIdentity || store.lockCalls[0][1] != destinationIdentity {
+		calls := append([][][16]byte(nil), store.lockCalls...)
+		store.lockStateMu.Unlock()
+		t.Fatalf("mutation lock calls = %#v, want resolved source then destination", calls)
+	}
+	coordinateWhileLocked, copyUnderLock := store.coordinateWhileLocked, store.copyUnderLock
+	store.lockStateMu.Unlock()
+	if coordinateWhileLocked || !copyUnderLock {
+		t.Fatalf("coordinateWhileLocked=%v copyUnderLock=%v", coordinateWhileLocked, copyUnderLock)
+	}
+
+	competitorAcquired := make(chan struct{})
+	go func() {
+		unlock := store.LockMutation([][16]byte{sourceIdentity})
+		close(competitorAcquired)
+		unlock()
+	}()
+	select {
+	case <-competitorAcquired:
+		t.Fatal("a concurrent source mutation entered before COPY_FILE_RANGE sampled post-state")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(store.copyRelease)
+	select {
+	case got := <-response:
+		if got.GetErrno() != 0 || got.GetUncertain() {
+			t.Fatalf("COPY_FILE_RANGE = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("COPY_FILE_RANGE did not finish")
+	}
+	select {
+	case <-competitorAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("source mutation lock was not released")
+	}
+	store.lockStateMu.Lock()
+	postSampleUnderLock := store.postSampleUnderLock
+	held := len(store.held)
+	store.lockStateMu.Unlock()
+	if !postSampleUnderLock || held != 0 {
+		t.Fatalf("postSampleUnderLock=%v retainedLocks=%d", postSampleUnderLock, held)
+	}
+}
+
+func TestCopyFileRangeRepairsParticipantRegisteredOnlyOnSource(t *testing.T) {
+	h, source, store, input, output := newRangeMutationHarness(t)
+	store.copyCount = 5
+	store.copyPost = xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x31, Size: 20, Mode: 0o600, Nlink: 1}
+	observer, err := h.Runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{0x72}, volumeserver.Authorization{
+		Access: volumeserver.AccessRead, Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: h.Runtime,
+		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, participant := range []volumeserver.SessionCredential{source, observer} {
+		terminal, terminalErr := h.Runtime.SessionTerminal(participant.ID)
+		if terminalErr != nil {
+			t.Fatal(terminalErr)
+		}
+		if err := visibility.Register(participant.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+			CachedNameCapacity: 32, RepairBudget: time.Second,
+			NamespaceRepair: volumeserver.NamespaceRepairLocklessExpiration,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	visibility.RecordResolvedInode(observer.ID, [16]byte{input[0]})
+	h.Visibility = visibility
+
+	request := copyMutationRequest(1, input, output)
+	response := make(chan *authoritypb.Response, 1)
+	go func() {
+		response <- h.handleCopyFileRange(t.Context(), request, source, request.GetCopyFileRange())
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	initial := testInitialVisibilityCursor(t, visibility, observer.ID)
+	prepare, err := visibility.Next(ctx, observer.ID, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepare.Cursor.Phase != volumeserver.VisibilityPrepare || len(prepare.Targets) != 1 ||
+		prepare.Targets[0].Identity != [16]byte{input[0]} || prepare.Targets[0].Scope != volumeserver.VisibilityData {
+		t.Fatalf("source-only PREPARE = %#v", prepare.Targets)
+	}
+	if err := visibility.Ack(observer.ID, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := visibility.Next(ctx, observer.ID, prepare.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if complete.Cursor.Phase != volumeserver.VisibilityComplete || len(complete.Targets) != 1 {
+		t.Fatalf("source-only COMPLETE = %#v", complete.Targets)
+	}
+	target := complete.Targets[0]
+	if target.Identity != [16]byte{input[0]} || target.Scope != volumeserver.VisibilityAttributes ||
+		target.ExactPostState == nil || target.ExactPostState.StableIdentity != [16]byte{input[0]} ||
+		target.ExactPostState.Roles != postStateRoleSource || target.ExactPostState.Attr.Inode != uint64(input[0]) {
+		t.Fatalf("source-only exact repair = %#v", target)
+	}
+	if err := visibility.Ack(observer.ID, complete.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-response:
+		if got.GetErrno() != 0 || got.GetUncertain() {
+			t.Fatalf("COPY_FILE_RANGE = %+v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("COPY_FILE_RANGE did not finish after source-only repair")
 	}
 }
 
