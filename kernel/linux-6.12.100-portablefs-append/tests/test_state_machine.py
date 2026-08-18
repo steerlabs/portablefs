@@ -304,14 +304,14 @@ def lookup_requires_marker(
 
 
 DEFAULT_LOOKUP_SHAPE_RULES = (
-    ("local-negative", False, ATTR_PFS_LOCAL, False, False),
-    ("shared-negative", False, 0, True, True),
-    ("local-positive", True, ATTR_PFS_LOCAL, False, False),
-    ("shared-positive", True, ATTR_PFS_SHARED, True, True),
+    ("local-negative", False, ATTR_PFS_LOCAL, 0, False),
+    ("shared-negative", False, 0, 32, True),
+    ("local-positive", True, ATTR_PFS_LOCAL, 0, False),
+    ("shared-positive", True, ATTR_PFS_SHARED, 32, True),
 )
 
 
-def lookup_shape_rules() -> tuple[tuple[str, bool, int, bool, bool], ...]:
+def lookup_shape_rules() -> tuple[tuple[str, bool, int, int, bool], ...]:
     tree = os.environ.get("PFS_PATCHED_KERNEL_TREE")
     if not tree:
         return DEFAULT_LOOKUP_SHAPE_RULES
@@ -323,7 +323,7 @@ def lookup_shape_rules() -> tuple[tuple[str, bool, int, bool, bool], ...]:
         r"\.shape = FUSE_PFS_LOOKUP_([A-Z_]+),\s*"
         r"\.positive = (true|false),\s*"
         r"\.class_bits = (FUSE_ATTR_PFS_LOCAL|FUSE_ATTR_PFS_SHARED|0),\s*"
-        r"\.stamped = (true|false),\s*"
+        r"\.stamp_size = (sizeof\(struct fuse_pfs_cache_stamp\)|0),\s*"
         r"\.marked = (true|false),"
     )
     classes = {
@@ -336,10 +336,10 @@ def lookup_shape_rules() -> tuple[tuple[str, bool, int, bool, bool], ...]:
             shape.lower().replace("_", "-"),
             positive == "true",
             classes[class_bits],
-            stamped == "true",
+            32 if stamp_size.startswith("sizeof") else 0,
             marked == "true",
         )
-        for shape, positive, class_bits, stamped, marked
+        for shape, positive, class_bits, stamp_size, marked
         in pattern.findall(block)
     )
     if not rules:
@@ -354,10 +354,11 @@ def strict_lookup_shape(
 ) -> str:
     positive = nodeid != 0
     class_bits = attr_flags & (ATTR_PFS_SHARED | ATTR_PFS_LOCAL)
-    stamped = stamp_size == 32
-    for shape, rule_positive, rule_class, rule_stamped, rule_marked in lookup_shape_rules():
-        if ((positive, class_bits, stamped, marked) !=
-                (rule_positive, rule_class, rule_stamped, rule_marked)):
+    for (
+        shape, rule_positive, rule_class, rule_size, rule_marked
+    ) in lookup_shape_rules():
+        if ((positive, class_bits, stamp_size, marked) !=
+                (rule_positive, rule_class, rule_size, rule_marked)):
             continue
         if not positive:
             if generation or attr_lifetime or other_attr_nonzero:
@@ -1243,6 +1244,23 @@ class AbiAndAdmissionTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError):
                     strict_negative_lookup_shape(**malformed)
 
+        for stamp_size in (1, 31):
+            for attr_flags, marked in (
+                (ATTR_PFS_LOCAL, False),
+                (0, True),
+            ):
+                with self.subTest(
+                    polarity="negative",
+                    stamp_size=stamp_size,
+                    attr_flags=attr_flags,
+                ):
+                    with self.assertRaises(ProtocolError):
+                        strict_negative_lookup_shape(
+                            attr_flags=attr_flags,
+                            stamp_size=stamp_size,
+                            marked=marked,
+                        )
+
         self.assertEqual(
             strict_lookup_shape(
                 nodeid=2, attr_flags=ATTR_PFS_LOCAL,
@@ -1257,6 +1275,23 @@ class AbiAndAdmissionTests(unittest.TestCase):
             ),
             "shared",
         )
+        for stamp_size in (1, 31):
+            for attr_flags, marked in (
+                (ATTR_PFS_LOCAL, False),
+                (ATTR_PFS_SHARED, True),
+            ):
+                with self.subTest(
+                    polarity="positive",
+                    stamp_size=stamp_size,
+                    attr_flags=attr_flags,
+                ):
+                    with self.assertRaises(ProtocolError):
+                        strict_lookup_shape(
+                            nodeid=4,
+                            attr_flags=attr_flags,
+                            stamp_size=stamp_size,
+                            marked=marked,
+                        )
         for existing, result in (("local", "shared"), ("shared", "local")):
             with self.subTest(existing=existing, result=result):
                 with self.assertRaises(ProtocolError):
