@@ -470,31 +470,31 @@ func attrDevice(attr xfsstore.Attr) uint64 {
 	return uint64(attr.DeviceMajor)<<32 | uint64(attr.DeviceMinor)
 }
 
-// coordinateItem fetches an object's stable identity together with the
-// attributes that carry its kernel-cache facts. Call sites that already hold
-// the Attr build the coordinate with attrCoordinate instead of statting twice.
+func objectCoordinate(coordinate xfsstore.ObjectCoordinate) visibilityCoordinate {
+	return visibilityCoordinate{
+		identity: coordinate.Stable,
+		ino:      coordinate.Ino,
+		device:   uint64(coordinate.DeviceMajor)<<32 | uint64(coordinate.DeviceMinor),
+	}
+}
+
+// coordinateItem reads the immutable coordinate retained by the store. Call
+// sites that already hold an Attr may still use attrCoordinate when that is
+// the value whose equivalence they need to attest.
 func (h *VolumeHandler) coordinateItem(item xfsstore.Capability) (visibilityCoordinate, error) {
-	identity, err := h.Store.Identity(item)
+	coordinate, err := h.Store.CoordinateItem(item)
 	if err != nil {
 		return visibilityCoordinate{}, err
 	}
-	attr, err := h.Store.Getattr(item)
-	if err != nil {
-		return visibilityCoordinate{}, err
-	}
-	return attrCoordinate(identity, attr), nil
+	return objectCoordinate(coordinate), nil
 }
 
 func (h *VolumeHandler) coordinateOpen(handle xfsstore.Capability) (visibilityCoordinate, error) {
-	identity, err := h.Store.IdentityOpen(handle)
+	coordinate, err := h.Store.CoordinateOpen(handle)
 	if err != nil {
 		return visibilityCoordinate{}, err
 	}
-	attr, err := h.Store.GetattrOpen(handle)
-	if err != nil {
-		return visibilityCoordinate{}, err
-	}
-	return attrCoordinate(identity, attr), nil
+	return objectCoordinate(coordinate), nil
 }
 
 func namespaceTarget(parent visibilityCoordinate, name []byte) volumeserver.VisibilityTarget {
