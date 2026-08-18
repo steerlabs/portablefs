@@ -1125,10 +1125,10 @@ func (r *rawFileSystem) finishReplyPublicationRegistration(unique uint64, public
 		r.mount.revoke(fmt.Errorf("fusev3: FUSE request identity %d lost its reserved reply-publication ownership", unique))
 		return
 	}
-	if publication.postState != nil {
+	if err := validateExpectedPostState(publication); err != nil {
+		publication.payloadError = err
+	} else if publication.postState != nil {
 		if err := validateMutationPostState(publication.postState); err != nil {
-			publication.payloadError = err
-		} else if err := validateExpectedPostState(publication); err != nil {
 			publication.payloadError = err
 		} else {
 			publication.droppedAttrs = make(map[publicationIdentity]bool)

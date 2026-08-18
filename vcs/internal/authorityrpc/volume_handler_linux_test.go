@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2153,6 +2154,180 @@ func TestCreateCoversNewbornUnderExistingParentWriterLock(t *testing.T) {
 		if !store.phases[phase] {
 			t.Errorf("create did not exercise %s under the parent stripe", phase)
 		}
+	}
+}
+
+type existingCreateMutationLockStore struct {
+	resourceAdmissionFaultStore
+	t              *testing.T
+	parent         xfsstore.Capability
+	target         xfsstore.Capability
+	replacement    xfsstore.Capability
+	handle         xfsstore.Capability
+	truncate       bool
+	bindingChanges bool
+
+	mu         sync.Mutex
+	locked     bool
+	released   bool
+	identities [][16]byte
+	lookups    uint32
+	creates    uint32
+}
+
+func (s *existingCreateMutationLockStore) LockMutation(identities [][16]byte) func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		s.t.Fatal("existing CREATE recursively acquired its writer lock")
+	}
+	s.identities = append([][16]byte(nil), identities...)
+	s.locked = true
+	return func() {
+		s.mu.Lock()
+		s.locked = false
+		s.released = true
+		s.mu.Unlock()
+	}
+}
+
+func (s *existingCreateMutationLockStore) requireLocked(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.locked {
+		s.t.Errorf("%s ran outside the existing CREATE writer locks", phase)
+	}
+}
+
+func (s *existingCreateMutationLockStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.mu.Lock()
+	s.lookups++
+	lookup := s.lookups
+	s.mu.Unlock()
+	item := s.target
+	if s.bindingChanges && lookup >= 2 {
+		item = s.replacement
+	}
+	return item, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(item[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) CoordinateItem(item xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	return xfsstore.ObjectCoordinate{Stable: [16]byte{item[0]}, Ino: uint64(item[0]), DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE apply")
+	s.mu.Lock()
+	s.creates++
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	s.mu.Unlock()
+	if parent != s.parent {
+		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
+	}
+	return target, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) OpenFile(item xfsstore.Capability, flags xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.requireLocked("existing CREATE open")
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	if item != target || flags.Truncate != s.truncate {
+		s.t.Errorf("open target/flags = %x/%+v, want %x truncate=%v", item, flags, target, s.truncate)
+	}
+	return s.handle, nil
+}
+
+func (s *existingCreateMutationLockStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE target snapshot")
+	if handle != s.handle {
+		s.t.Errorf("snapshot handle = %x, want %x", handle, s.handle)
+	}
+	size := int64(17)
+	if s.truncate {
+		size = 0
+	}
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: size, Mode: 0o600, Nlink: 1, DeviceMinor: 1, Flags: 0x10}, nil
+}
+
+func (s *existingCreateMutationLockStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE parent snapshot")
+	if item != s.parent {
+		s.t.Errorf("parent snapshot item = %x, want %x", item, s.parent)
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(s.parent[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1}, nil
+}
+
+func (*existingCreateMutationLockStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
+	for _, truncate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("truncate=%v", truncate), func(t *testing.T) {
+			store := &existingCreateMutationLockStore{
+				t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+				handle: xfsstore.Capability{0x74}, truncate: truncate,
+			}
+			h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+			request := resourceAcquisitionRequest(t, "create", credential, root)
+			request.GetCreate().Flags.Truncate = truncate
+			for _, target := range request.GetSourcePublicationGate().GetTargets() {
+				if namespace := target.GetNamespace(); namespace != nil {
+					namespace.BoundData = truncate
+				}
+			}
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || response.GetCreate() == nil {
+				t.Fatalf("existing CREATE response = %+v", response)
+			}
+			if !validMutationPostStateRoles(request, response.GetPostState()) {
+				t.Fatalf("existing CREATE exact state = %+v", response.GetPostState())
+			}
+			roles := make(map[uint32]*authoritypb.ObjectPostState)
+			for _, object := range response.GetPostState().GetObjects() {
+				roles[object.GetRoles()] = object
+			}
+			if roles[postStateRoleParent] == nil || roles[postStateRoleTarget] == nil || roles[postStateRoleTarget].GetAttr().GetFlags() != 0x10 {
+				t.Fatalf("existing CREATE objects = %+v, want exact PARENT+TARGET", response.GetPostState().GetObjects())
+			}
+			if response.GetCreate().GetItem().GetObjectVersion() != roles[postStateRoleTarget].GetObjectVersion() ||
+				response.GetCreate().GetItem().GetSnapshotSequence() != response.GetPostState().GetSnapshotSequence() {
+				t.Fatalf("item stamp does not match target post-state: item=%+v state=%+v", response.GetCreate().GetItem(), roles[postStateRoleTarget])
+			}
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			want := map[[16]byte]bool{{store.parent[0]}: true, {store.target[0]}: true}
+			if store.locked || !store.released || len(store.identities) != 2 || !want[store.identities[0]] || !want[store.identities[1]] {
+				t.Fatalf("existing CREATE lock lifecycle/identities = locked:%v released:%v %x", store.locked, store.released, store.identities)
+			}
+		})
+	}
+}
+
+func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
+	store := &existingCreateMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+		replacement: xfsstore.Capability{0x74}, handle: xfsstore.Capability{0x75}, bindingChanges: true,
+	}
+	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	if response.GetErrno() != 0 || response.GetUncertain() || response.GetCreate() == nil {
+		t.Fatalf("binding-change response = %+v, want successful re-resolved CREATE", response)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.creates != 1 || store.locked || !store.released {
+		t.Fatalf("binding-change retry apply/lifecycle: creates=%d locked=%v released=%v", store.creates, store.locked, store.released)
+	}
+	if len(store.identities) != 2 || store.identities[0] != [16]byte{store.parent[0]} || store.identities[1] != [16]byte{store.replacement[0]} {
+		t.Fatalf("binding-change final lock set = %x, want parent+replacement", store.identities)
 	}
 }
 

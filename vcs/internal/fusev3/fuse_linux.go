@@ -1696,8 +1696,10 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	}
 	item := cloneItem(created.GetItem())
 	roles := postStateRoles(response.GetPostState())
-	if samePostStateRoles(roles, postStateRoleTarget) {
-		if err := expectPostStateItem(ctx, item, postStateRoleTarget); err != nil {
+	if samePostStateRoles(roles, postStateRoleTarget, postStateRoleParent) {
+		targetObject, targetErr := expectedPostStateItem(item, postStateRoleTarget)
+		parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+		if targetErr != nil || parentErr != nil || expectPostState(ctx, targetObject, parentObject) != nil {
 			return nil, nil, 0, syscall.EIO
 		}
 	} else {

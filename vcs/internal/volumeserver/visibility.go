@@ -72,6 +72,12 @@ var (
 	// the callback's parent i_rwsem, so no application-visible EINTR is needed.
 	// Staged write bytes remain inert and reusable across this handoff.
 	ErrVisibilityRetry = errors.New("volumeserver: mutation must retry after this participant's pending cache repair")
+	// ErrVisibilityDependencyRefresh is returned only by a source-gated
+	// authority PREPARE callback which revalidated a namespace binding under
+	// its storage writer locks and found that the resolved identity changed.
+	// The coordinator releases/requeues the old identity-key set, refreshes the
+	// source gate, and invokes PREPARE again before any barrier or XFS apply.
+	ErrVisibilityDependencyRefresh = errors.New("volumeserver: mutation dependencies changed during locked revalidation")
 	// ErrSourcePublicationGate means a strict initiating frontend did not prove
 	// the exact local publication cut required before mutation dispatch. It is a
 	// participant protocol violation, not an authority-epoch defect.
@@ -1434,7 +1440,49 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		}
 	}
 
-	prepareTargets, err := prepare()
+	var prepareTargets []VisibilityTarget
+	for {
+		prepareTargets, err = prepare()
+		if !errors.Is(err, ErrVisibilityDependencyRefresh) {
+			break
+		}
+		if gate == nil {
+			return &VisibilityBarrierError{Err: ErrVisibilityTargets}
+		}
+		refreshed, refreshErr := refresh()
+		if refreshErr != nil {
+			return refreshErr
+		}
+		if validateSourcePublicationGate(refreshed) != nil || !sameSourcePublicationShape(*gate, refreshed) {
+			return ErrSourcePublicationGate
+		}
+		refreshedDependencies := mutationDependenciesForSourceGate(refreshed)
+		gate = &refreshed
+		if !dependencies.equal(refreshedDependencies) {
+			turn.requeue(refreshedDependencies)
+			turn, err = c.acquireMutationDependencies(ctx, source, mutation, held, &refreshed, refreshedDependencies, turn)
+			if err != nil {
+				return err
+			}
+			dependencies = refreshedDependencies
+		}
+		// A requeue may have yielded the participant to a peer repair just as
+		// the original acquisition did. Re-run the exact source-yield gate
+		// before PREPARE touches storage again.
+		c.mu.Lock()
+		participant := c.participants[source]
+		yieldErr := error(nil)
+		if participant != nil {
+			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+		}
+		if yieldErr != nil {
+			c.recordDormantFairnessLocked(source, participant, mutation, turn, gate)
+		}
+		c.mu.Unlock()
+		if yieldErr != nil {
+			return yieldErr
+		}
+	}
 	if err != nil {
 		return err
 	}

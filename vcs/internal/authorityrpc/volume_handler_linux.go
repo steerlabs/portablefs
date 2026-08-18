@@ -3,6 +3,7 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -826,6 +827,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		var existingSize int64
 		var existed bool
 		var releaseMutation func()
+		bindingRefreshes := 0
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Create.GetName()); err != nil {
 				return nil, err
@@ -840,18 +842,47 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return nil, err
 			}
 			existingCoordinate, existingSize, existed = resolvedName.coordinate, resolvedName.size, resolvedName.found
-			releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
+			lockIdentities := [][16]byte{parentCoordinate.identity}
+			if existed {
+				lockIdentities = append(lockIdentities, existingCoordinate.identity)
+			}
+			releaseMutation, err = lockMutationStore(h.Store, lockIdentities...)
 			if err != nil {
 				return nil, err
+			}
+			// The source gate prevents an authority namespace writer from passing
+			// while this dependency turn is held. Re-read under the complete XFS
+			// writer-stripe set as a negative control against a stale resolution;
+			// if the binding changed, this turn's target-identity dependency is no
+			// longer complete and the whole request must resolve again.
+			resolutions.invalidateNamespaceBindings()
+			lockedName, lookupErr := resolutions.namespace(parent, body.Create.GetName())
+			if lookupErr != nil || lockedName.found != existed || existed && lockedName.coordinate != existingCoordinate {
+				releaseMutation()
+				releaseMutation = nil
+				if lookupErr != nil {
+					return nil, lookupErr
+				}
+				bindingRefreshes++
+				if bindingRefreshes >= maxStabilizeAttempts {
+					return nil, syscall.EAGAIN
+				}
+				return nil, volumeserver.ErrVisibilityDependencyRefresh
+			}
+			if existed {
+				existingSize = lockedName.size
 			}
 			if !existed {
 				return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
 			}
-			// Opening an existing name does not mutate its parent or binding. Keep
-			// the unavoidable replay-ordered no-op barrier scoped to the existing
-			// inode; O_TRUNC adds data, while a plain existing create completes with
-			// no targets and therefore performs no peer repair.
-			targets := []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
+			// Existing-name CREATE publishes an exact name snapshot and both object
+			// records even when opening the target is a no-op. The source gate already
+			// covers this complete set; O_TRUNC additionally covers target data.
+			targets := []volumeserver.VisibilityTarget{
+				namespaceTarget(parentCoordinate, body.Create.GetName()),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+				inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0),
+			}
 			if body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
 				targets = append([]volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, existingSize)}, targets...)
 			}
@@ -906,12 +937,12 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				h.untrackItem(cred.ID, item)
 				h.forgetItem(item)
 			}
-			if body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
-				post, err := h.Store.GetattrOpen(handle)
-				if err != nil {
+			if existed || body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
+				post, snapshotErr := h.Store.GetattrOpen(handle)
+				if snapshotErr != nil {
 					targets := createdTargets(item)
 					cleanupUndeliverable()
-					return h.errorResponse(0, err, true), targets
+					return h.errorResponse(0, snapshotErr, true), targets
 				}
 				attr = post
 			}
@@ -921,15 +952,30 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				cleanupUndeliverable()
 				return h.errorResponse(0, identityErr, true), targets
 			}
-			resp := h.success(0)
-			itemReply := itemProto(item, attr, itemIdentity)
-			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
-			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemReply, Handle: handle[:]}}
 			if existed {
-				if body.Create.GetFlags() == nil || !body.Create.GetFlags().GetTruncate() {
+				parentAttr, parentErr := h.Store.Getattr(parent)
+				if parentErr != nil {
+					cleanupUndeliverable()
+					return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+				}
+				truncated := body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate()
+				resp := h.success(0)
+				resp.PostState = h.mutationPostState(sequence,
+					postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleTarget, changed: truncated},
+					postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: false},
+				)
+				itemReply := itemProto(item, attr, itemIdentity)
+				for _, object := range resp.PostState.GetObjects() {
+					if bytes.Equal(object.GetStableIdentity(), itemIdentity[:]) {
+						itemReply.ObjectVersion = object.GetObjectVersion()
+						break
+					}
+				}
+				itemReply.SnapshotSequence = sequence
+				resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemReply, Handle: handle[:]}}
+				if !truncated {
 					return resp, nil
 				}
-				resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleTarget, changed: true})
 				return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
 			}
 			parentAttr, parentErr := h.Store.Getattr(parent)
@@ -937,10 +983,14 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				cleanupUndeliverable()
 				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
 			}
+			resp := h.success(0)
 			resp.PostState = h.mutationPostState(sequence,
 				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
 				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
 			)
+			itemReply := itemProto(item, attr, itemIdentity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemReply, Handle: handle[:]}}
 			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 		})
 		if releaseMutation != nil {
