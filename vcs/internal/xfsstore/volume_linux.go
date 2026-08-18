@@ -136,8 +136,10 @@ func (g *createGrant) discard() error {
 }
 
 type openFile struct {
+	volume     *Volume
 	res        *resource
 	coordinate ObjectCoordinate
+	fsyncState *inodeFsyncState
 	// read and write are the access this handle was opened for. They are
 	// enforced here rather than left to the underlying description, because a
 	// handle may be served by a creation grant whose description is wider than
@@ -160,6 +162,7 @@ type writeTarget struct {
 	volume     *Volume
 	res        *resource
 	coordinate ObjectCoordinate
+	fsyncState *inodeFsyncState
 	// mu makes Close and CommitWrite mutually exclusive. The target owns one
 	// descriptor reference from PinWriteTarget until Close, and a commit must
 	// not race that final release: otherwise the kernel may recycle the fd
@@ -180,11 +183,16 @@ func (t *writeTarget) Close() error {
 		return nil
 	}
 	t.closed = true
-	return t.res.release()
+	result := t.res.release()
+	t.volume.releaseFsyncState(t.fsyncState)
+	return result
 }
 
-func (f *openFile) fd() int  { return f.res.fd }
-func (f *openFile) release() { _ = f.res.release() }
+func (f *openFile) fd() int { return f.res.fd }
+func (f *openFile) release() {
+	_ = f.res.release()
+	f.volume.releaseFsyncState(f.fsyncState)
+}
 
 // Volume owns all descriptors for one authority epoch. Closing it atomically
 // makes every issued capability stale.
@@ -206,6 +214,8 @@ type Volume struct {
 	fenced        error
 	objects       map[Capability]object
 	opens         map[Capability]*openFile
+	fsyncMu       sync.Mutex
+	fsyncStates   map[[16]byte]*inodeFsyncState
 
 	// The fields below are written once, before the Volume is reachable by
 	// any other goroutine, and never again. That is what makes them safe to
@@ -229,18 +239,20 @@ type Volume struct {
 	// The write/copy seams are likewise fixed to their unix implementations in
 	// production. Tests use them to model XFS running file_modified before a
 	// later zero-byte data-path failure.
-	pwrite        func(int, []byte, int64) (int, error)
-	pwritev2      func(int, [][]byte, int64, int) (int, error)
-	sendfile      func(int, int, *int64, int) (int, error)
-	copyFileRange func(int, *int64, int, *int64, int, int) (int, error)
-	postStat      func(int) (Attr, error)
-	fsync         func(int) error
-	fdatasync     func(int) error
+	pwrite                    func(int, []byte, int64) (int, error)
+	pwritev2                  func(int, [][]byte, int64, int) (int, error)
+	sendfile                  func(int, int, *int64, int) (int, error)
+	copyFileRange             func(int, *int64, int, *int64, int, int) (int, error)
+	postStat                  func(int) (Attr, error)
+	fsync                     func(int) error
+	fdatasync                 func(int) error
+	inspectSecurityCapability func(int) (bool, error)
 	// removeWritePrivileges is fixed to the package implementation in
 	// production. The seam lets tests prove that a delegated killpriv failure
 	// does not suppress the one logical sync attempt owed by a clean backend
 	// mutation.
-	removeWritePrivileges func(int, uint32, bool) error
+	removeWritePrivileges       func(int, uint32, bool) error
+	removePinnedWritePrivileges func(int, uint32, bool, *bool) error
 }
 
 func inodeMutationStripe(identity [16]byte) uint64 {
@@ -281,7 +293,45 @@ func (v *Volume) holdOpen(id Capability) (*openFile, error) {
 		return nil, err
 	}
 	f.res.acquire()
+	v.retainFsyncState(f.fsyncState)
 	return f, nil
+}
+
+func (v *Volume) fsyncState(identity [16]byte) *inodeFsyncState {
+	v.fsyncMu.Lock()
+	defer v.fsyncMu.Unlock()
+	state := v.fsyncStates[identity]
+	if state == nil {
+		state = &inodeFsyncState{identity: identity}
+		v.fsyncStates[identity] = state
+	}
+	state.refs++
+	return state
+}
+
+func (v *Volume) retainFsyncState(state *inodeFsyncState) {
+	if state == nil {
+		return
+	}
+	v.fsyncMu.Lock()
+	state.refs++
+	v.fsyncMu.Unlock()
+}
+
+func (v *Volume) releaseFsyncState(state *inodeFsyncState) {
+	if state == nil {
+		return
+	}
+	v.fsyncMu.Lock()
+	state.refs--
+	if state.refs < 0 {
+		v.fsyncMu.Unlock()
+		panic("xfsstore: fsync state released more times than acquired")
+	}
+	if state.refs == 0 && v.fsyncStates[state.identity] == state {
+		delete(v.fsyncStates, state.identity)
+	}
+	v.fsyncMu.Unlock()
 }
 
 func (v *Volume) openChild(parent Capability, name string) (int, [16]byte, error) {
@@ -385,24 +435,27 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 	}
 
 	v := &Volume{
-		rootFD:                  fd,
-		device:                  uint64(st.Dev),
-		ownerUID:                ownerUID,
-		ownerGID:                ownerGID,
-		projectID:               expectedProjectID,
-		objects:                 make(map[Capability]object),
-		opens:                   make(map[Capability]*openFile),
-		productionIdentity:      requireXFS,
-		fallocate:               unix.Fallocate,
-		fallocateAllocationUnit: xfsFallocateAllocationUnit,
-		pwrite:                  unix.Pwrite,
-		pwritev2:                unix.Pwritev2,
-		sendfile:                unix.Sendfile,
-		copyFileRange:           unix.CopyFileRange,
-		postStat:                statFD,
-		fsync:                   unix.Fsync,
-		fdatasync:               unix.Fdatasync,
-		removeWritePrivileges:   removeWritePrivileges,
+		rootFD:                      fd,
+		device:                      uint64(st.Dev),
+		ownerUID:                    ownerUID,
+		ownerGID:                    ownerGID,
+		projectID:                   expectedProjectID,
+		objects:                     make(map[Capability]object),
+		opens:                       make(map[Capability]*openFile),
+		fsyncStates:                 make(map[[16]byte]*inodeFsyncState),
+		productionIdentity:          requireXFS,
+		fallocate:                   unix.Fallocate,
+		fallocateAllocationUnit:     xfsFallocateAllocationUnit,
+		pwrite:                      unix.Pwrite,
+		pwritev2:                    unix.Pwritev2,
+		sendfile:                    unix.Sendfile,
+		copyFileRange:               unix.CopyFileRange,
+		postStat:                    statFD,
+		fsync:                       unix.Fsync,
+		fdatasync:                   unix.Fdatasync,
+		inspectSecurityCapability:   inspectSecurityCapability,
+		removeWritePrivileges:       removeWritePrivileges,
+		removePinnedWritePrivileges: removeWritePrivilegesWithCapability,
 	}
 	rootIdentity, err := stableIdentityFD(fd, requireXFS)
 	if err != nil {
@@ -492,6 +545,7 @@ func (v *Volume) Close() error {
 	result := unix.Flock(v.rootFD, unix.LOCK_UN)
 	for id, opened := range v.opens {
 		result = errors.Join(result, opened.res.release())
+		v.releaseFsyncState(opened.fsyncState)
 		delete(v.opens, id)
 	}
 	for id, obj := range v.objects {
@@ -631,12 +685,21 @@ func (v *Volume) Getattr(id Capability) (Attr, error) {
 // inode number in the same authority epoch does not. It is coordination
 // identity only, never authorization.
 func (v *Volume) Identity(id Capability) ([16]byte, error) {
+	coordinate, err := v.CoordinateItem(id)
+	return coordinate.Stable, err
+}
+
+// CoordinateItem returns the immutable coordination facts retained when this
+// object capability was installed. It deliberately performs no statx: size,
+// timestamps and mode are mutable, but stable identity, inode and device are
+// properties of the held incarnation itself.
+func (v *Volume) CoordinateItem(id Capability) (ObjectCoordinate, error) {
 	obj, err := v.holdObject(id)
 	if err != nil {
-		return [16]byte{}, err
+		return ObjectCoordinate{}, err
 	}
 	defer obj.release()
-	return obj.coordinate.Stable, nil
+	return obj.coordinate, nil
 }
 
 func (v *Volume) IdentityOpen(id Capability) ([16]byte, error) {
@@ -950,9 +1013,10 @@ func (v *Volume) installHandle(res *resource, id Capability, kind Kind, flags Op
 		return fail(ErrStaleObject)
 	}
 	v.opens[openID] = &openFile{
-		res: res, read: flags.Read, write: flags.Write,
+		volume: v, res: res, read: flags.Read, write: flags.Write,
 		sync: flags.Sync, dataSync: flags.DataSync && !flags.Sync,
 		object: id, kind: kind, coordinate: obj.coordinate,
+		fsyncState: v.fsyncState(obj.coordinate.Stable),
 	}
 	return openID, nil
 }
@@ -968,7 +1032,9 @@ func (v *Volume) CloseOpen(id Capability) error {
 		return ErrStaleOpen
 	}
 	delete(v.opens, id)
-	return f.res.release()
+	result := f.res.release()
+	v.releaseFsyncState(f.fsyncState)
+	return result
 }
 
 // ReadAt reports (0, nil) for an empty destination. io.EOF is reserved for a
@@ -1029,6 +1095,9 @@ func (v *Volume) WriteAt(id Capability, src []byte, off int64) (int, error) {
 	if end <= current.Size {
 		n, err := unix.Pwrite(f.fd(), src, off)
 		mutation.RUnlock()
+		if n > 0 {
+			f.fsyncState.applied()
+		}
 		return n, err
 	}
 	mutation.RUnlock()
@@ -1039,7 +1108,11 @@ func (v *Volume) WriteAt(id Capability, src []byte, off int64) (int, error) {
 	// indivisible with those operations.
 	mutation.Lock()
 	defer mutation.Unlock()
-	return unix.Pwrite(f.fd(), src, off)
+	n, err := unix.Pwrite(f.fd(), src, off)
+	if n > 0 {
+		f.fsyncState.applied()
+	}
+	return n, err
 }
 
 // PinWriteTarget transfers one in-flight reference out of the handle table.
@@ -1053,7 +1126,14 @@ func (v *Volume) PinWriteTarget(id Capability) (WriteTarget, error) {
 		f.release()
 		return nil, syscall.EBADF
 	}
-	return &writeTarget{volume: v, res: f.res, coordinate: f.coordinate}, nil
+	if err := f.fsyncState.inspectWritePrivileges(f.fd(), v.inspectSecurityCapability); err != nil {
+		f.release()
+		return nil, err
+	}
+	return &writeTarget{
+		volume: v, res: f.res, coordinate: f.coordinate,
+		fsyncState: f.fsyncState,
+	}, nil
 }
 
 func (v *Volume) syncDescriptor(fd int, full, dataOnly bool) error {
@@ -1246,7 +1326,8 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		expectedPost = end
 	}
 	if dispatched {
-		if err := t.volume.removeWritePrivileges(t.res.fd, uint32(before.Mode), spec.KillPrivileges); err != nil {
+		t.fsyncState.applied()
+		if err := t.fsyncState.removeWritePrivileges(t.res.fd, uint32(before.Mode), spec.KillPrivileges, t.volume.removePinnedWritePrivileges); err != nil {
 			postApplyErr = err
 		}
 	}
@@ -1612,20 +1693,37 @@ func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec)
 // privilege-dependent mode-bit removal. SGID without group execute is the
 // mandatory-locking form and is deliberately retained, matching
 // setattr_should_drop_suidgid.
-func removeWritePrivileges(fd int, beforeMode uint32, killSUIDGID bool) error {
+func inspectSecurityCapability(fd int) (bool, error) {
 	// An unprivileged authority is intentionally able to own and mutate the
 	// volume without CAP_SETFCAP. Linux checks permission before existence for
 	// fremovexattr("security.capability"), so blindly removing an absent xattr
-	// returns EPERM and would terminal-fence every ordinary write. Probe for the
-	// capability under the same stable-inode writer lock first. A present file
-	// capability must still be removed successfully; failure remains a terminal
-	// security postcondition, never a best-effort omission.
+	// returns EPERM and would terminal-fence every ordinary write.
 	if _, err := unix.Fgetxattr(fd, "security.capability", nil); err != nil {
 		if !errors.Is(err, unix.ENODATA) {
-			return fmt.Errorf("%w: inspect security.capability: %w", ErrWritePrivilege, err)
+			return false, fmt.Errorf("%w: inspect security.capability: %w", ErrWritePrivilege, err)
 		}
-	} else if err := unix.Fremovexattr(fd, "security.capability"); err != nil && !errors.Is(err, unix.ENODATA) {
-		return fmt.Errorf("%w: remove security.capability: %w", ErrWritePrivilege, err)
+		return false, nil
+	}
+	return true, nil
+}
+
+func removeWritePrivileges(fd int, beforeMode uint32, killSUIDGID bool) error {
+	present, err := inspectSecurityCapability(fd)
+	if err != nil {
+		return err
+	}
+	return removeWritePrivilegesWithCapability(fd, beforeMode, killSUIDGID, &present)
+}
+
+func removeWritePrivilegesWithCapability(fd int, beforeMode uint32, killSUIDGID bool, securityCapability *bool) error {
+	if securityCapability == nil {
+		return fs.ErrInvalid
+	}
+	if *securityCapability {
+		if err := unix.Fremovexattr(fd, "security.capability"); err != nil && !errors.Is(err, unix.ENODATA) {
+			return fmt.Errorf("%w: remove security.capability: %w", ErrWritePrivilege, err)
+		}
+		*securityCapability = false
 	}
 	if !killSUIDGID {
 		return nil
@@ -1690,15 +1788,20 @@ func (v *Volume) Truncate(id Capability, size int64) error {
 }
 
 func (v *Volume) Fsync(id Capability, dataOnly bool) error {
+	_, err := v.FsyncCoalesced(id, dataOnly)
+	return err
+}
+
+// FsyncCoalesced returns the number of barrier requests served by the real
+// storage sync when this caller led a batch. Followers return zero. Every call
+// still waits for a completed sync whose generation and class cover it.
+func (v *Volume) FsyncCoalesced(id Capability, dataOnly bool) (int, error) {
 	f, err := v.holdOpen(id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.release()
-	if dataOnly {
-		return v.fdatasync(f.fd())
-	}
-	return v.fsync(f.fd())
+	return f.fsyncState.barrier(f.fd(), dataOnly, v.fsync, v.fdatasync)
 }
 
 func (v *Volume) GetattrOpen(id Capability) (Attr, error) {

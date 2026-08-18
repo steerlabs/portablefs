@@ -20,6 +20,7 @@ func TestAuthorityMetricInventoryUpdates(t *testing.T) {
 	metrics.WriteStagedBytes(4096)
 	metrics.WriteAdmissionBlocked()
 	metrics.WriteAdmissionFinished(5 * time.Millisecond)
+	metrics.ObserveFsyncBatch(3)
 	metrics.ObserveVisibilityBarrier(10*time.Millisecond, 2)
 	metrics.Fence(FenceRepairDeadline)
 	metrics.WriteStagedBytes(-4096)
@@ -40,6 +41,8 @@ func TestAuthorityMetricInventoryUpdates(t *testing.T) {
 		`portablefs_authority_write_staged_bytes{volume="volume-a"} 0`,
 		`portablefs_authority_write_admission_blocks_total{volume="volume-a"} 1`,
 		`portablefs_authority_write_admission_wait_seconds_count{volume="volume-a"} 1`,
+		`portablefs_authority_fsync_barrier_handles_total{volume="volume-a"} 3`,
+		`portablefs_authority_fsync_storage_syncs_total{volume="volume-a"} 1`,
 		`portablefs_authority_visibility_barrier_duration_seconds_count{volume="volume-a"} 1`,
 		`portablefs_authority_visibility_barrier_audience_count{volume="volume-a"} 1`,
 		`portablefs_authority_fence_events_total{volume="volume-a",reason="repair_deadline"} 1`,
