@@ -509,6 +509,7 @@ def strict_notify(
     birth_time_ns: int | None = None,
     mode: int | None = None,
     uid: int | None = None,
+    nlink: int | None = None,
     exact_size: int | None = None,
 ) -> str:
     if code not in STRICT_NOTIFY_CODES:
@@ -547,6 +548,8 @@ def strict_notify(
         if flags == 1 and child != resident_child.nodeid:
             raise ProtocolError("DELETE child identity mismatch")
         inode.cache_generation += 1
+    if code == "PFS_ENTRY":
+        inode.repair_entry(sequence)
     if code == "PFS_SIZE":
         if inode.is_dir:
             raise ProtocolError("PFS_SIZE target is not a regular file")
@@ -559,6 +562,7 @@ def strict_notify(
             inode.birth_time_ns if birth_time_ns is None else birth_time_ns,
             inode.mode if mode is None else mode,
             inode.uid if uid is None else uid,
+            inode.nlink if nlink is None else nlink,
         )
     return "dispatched"
 
@@ -701,6 +705,7 @@ class KernelInode:
     nodeid: int = 1
     nlink: int = 1
     object_version: int = 0
+    entry_repair_sequence: int = 0
     inode_flags: int = 0
     birth_time_ns: int = 0
     mode: int = 0o644
@@ -728,6 +733,7 @@ class KernelInode:
     def repair_attr(
         self, sequence: int, inode_flags: int, birth_time_ns: int,
         mode: int | None = None, uid: int | None = None,
+        nlink: int | None = None,
     ) -> str:
         if sequence <= 0 or sequence > S64_MAX:
             raise ProtocolError("invalid exact attr repair sequence")
@@ -740,7 +746,19 @@ class KernelInode:
             self.mode = mode
         if uid is not None:
             self.uid = uid
+        if nlink is not None:
+            self.nlink = nlink
         return "applied"
+
+    def repair_entry(self, sequence: int) -> None:
+        self.entry_repair_sequence = max(
+            self.entry_repair_sequence, sequence
+        )
+
+    def admit_entry(self, snapshot_sequence: int) -> bool:
+        return snapshot_sequence > max(
+            self.object_version, self.entry_repair_sequence
+        )
 
     def install_stamped_attr(
         self, object_version: int, snapshot_sequence: int,
@@ -753,7 +771,8 @@ class KernelInode:
         if object_version <= self.object_version:
             return "old"
         return self.repair_attr(
-            object_version, inode_flags, birth_time_ns, mode, uid
+            object_version, inode_flags, birth_time_ns, mode, uid,
+            self.nlink,
         )
 
     def permission(self, mask: int) -> bool:
@@ -1502,6 +1521,39 @@ class PublicationAndNotifyTests(unittest.TestCase):
             "dispatched",
         )
         self.assertEqual((inode.object_version, inode.uid), (4, 4000))
+
+    def test_entry_then_attr_repair_installs_parent_fields_at_same_sequence(
+        self,
+    ) -> None:
+        parent = KernelInode(
+            is_dir=True, object_version=4, mode=0o755, uid=1000, nlink=2
+        )
+
+        self.assertEqual(
+            strict_notify(
+                "PFS_ENTRY", parent, child=0, flags=0, sequence=5
+            ),
+            "dispatched",
+        )
+        self.assertEqual(parent.entry_repair_sequence, 5)
+        self.assertEqual(parent.object_version, 4)
+        self.assertFalse(parent.admit_entry(5))
+        self.assertTrue(parent.admit_entry(6))
+
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", parent, sequence=5, record_version=5,
+                inode_flags=STATX_ATTR_NODUMP, birth_time_ns=555,
+                mode=0o700, uid=2000, nlink=3,
+            ),
+            "dispatched",
+        )
+        self.assertEqual(
+            (parent.object_version, parent.entry_repair_sequence,
+             parent.mode, parent.uid, parent.nlink,
+             parent.inode_flags, parent.birth_time_ns),
+            (5, 5, 0o700, 2000, 3, STATX_ATTR_NODUMP, 555),
+        )
 
     def test_size_repair_invalidates_data_and_installs_the_same_exact_record(
         self,
