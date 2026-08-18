@@ -629,6 +629,11 @@ func translateV3VisibilityEvent(epoch []byte, event *authoritypb.VisibilityEvent
 		// only its paired COMPLETE may be targetless.
 		return nil, errors.New("portablefsd: targetless visibility PREPARE")
 	}
+	if event.GetRoutes() == nil {
+		if err := visibilitywire.ValidateEventTargets(event.GetCursor().GetPhase(), event.GetCursor().GetSequence(), event.GetTargets()); err != nil {
+			return nil, fmt.Errorf("portablefsd: %w", err)
+		}
+	}
 
 	local := &pfslocal.V3VisibilityEvent{
 		AuthorityEpoch:     append([]byte(nil), epoch...),

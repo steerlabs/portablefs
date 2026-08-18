@@ -52,10 +52,10 @@ func TestPFSWriteABILayout(t *testing.T) {
 	if unsafe.Offsetof(out.Error) != 44 {
 		t.Fatalf("fuse_pfs_write_out.error offset = %d, want 44", unsafe.Offsetof(out.Error))
 	}
-	if got, want := unsafe.Sizeof(NotifyPFSSizeOut{}), uintptr(24); got != want {
+	if got, want := unsafe.Sizeof(NotifyPFSSizeOut{}), uintptr(8+PFSObjectStateSize); got != want {
 		t.Fatalf("fuse_notify_pfs_size_out size = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Sizeof(NotifyPFSAttrOut{}), uintptr(16); got != want {
+	if got, want := unsafe.Sizeof(NotifyPFSAttrOut{}), uintptr(8+PFSObjectStateSize); got != want {
 		t.Fatalf("fuse_notify_pfs_attr_out size = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Sizeof(NotifyPFSEntryOut{}), uintptr(32); got != want {
@@ -556,7 +556,9 @@ func TestPFSSizeNotifyWireAndCapability(t *testing.T) {
 			return len(wire), 0
 		},
 	}
-	if status := server.PFSSizeNotify(7, 99, 123); status != OK {
+	object := &PFSObjectState{Nodeid: 7, ObjectVersion: 123, Roles: 1, PFSClass: 1}
+	binary.LittleEndian.PutUint64(object.Attr[8:16], 99)
+	if status := server.PFSSizeNotify(123, object); status != OK {
 		t.Fatalf("PFSSizeNotify: %v", status)
 	}
 	if len(wire) != int(sizeOfOutHeader+unsafe.Sizeof(NotifyPFSSizeOut{})) {
@@ -565,18 +567,21 @@ func TestPFSSizeNotifyWireAndCapability(t *testing.T) {
 	if got := int32(binary.LittleEndian.Uint32(wire[4:8])); got != -int32(NOTIFY_PFS_SIZE) {
 		t.Fatalf("notify code = %d, want %d", got, -NOTIFY_PFS_SIZE)
 	}
-	if got := binary.LittleEndian.Uint64(wire[16:24]); got != 7 {
-		t.Fatalf("notify nodeid = %d", got)
+	if got := binary.LittleEndian.Uint64(wire[16:24]); got != 123 {
+		t.Fatalf("notify sequence = %d", got)
 	}
-	if got := binary.LittleEndian.Uint64(wire[24:32]); got != 99 {
-		t.Fatalf("notify size = %d", got)
+	if got := binary.LittleEndian.Uint64(wire[24:32]); got != 7 {
+		t.Fatalf("notify object nodeid = %d", got)
 	}
 	if got := binary.LittleEndian.Uint64(wire[32:40]); got != 123 {
-		t.Fatalf("notify sequence = %d", got)
+		t.Fatalf("notify object version = %d", got)
+	}
+	if got := binary.LittleEndian.Uint64(wire[64:72]); got != 99 {
+		t.Fatalf("notify exact size = %d", got)
 	}
 
 	server.kernelSettings = InitIn{}
-	if status := server.PFSSizeNotify(7, 99, 123); status != EINVAL {
+	if status := server.PFSSizeNotify(123, object); status != EINVAL {
 		t.Fatalf("unnegotiated PFSSizeNotify = %v, want EINVAL", status)
 	}
 }

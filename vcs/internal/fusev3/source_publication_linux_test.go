@@ -72,7 +72,7 @@ func awaitPrepareResult(t *testing.T, done <-chan error, what string) error {
 
 func finishPeerVisibility(t *testing.T, raw *rawFileSystem, targets []*authoritypb.VisibilityTarget) {
 	t.Helper()
-	completion, blocked, err := raw.beginVisibilityComplete(targets, false)
+	completion, blocked, err := raw.beginVisibilityComplete(exactVisibilityTargets(1, targets...), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -789,7 +789,7 @@ func TestTruncatePublicationOrdersPriorAndLaterExactSizePhases(t *testing.T) {
 			if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 				t.Fatal(err)
 			}
-			completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 41)
+			completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(41, targets...), false, 41)
 			if err != nil || blocked {
 				t.Fatalf("begin prior COMPLETE = (blocked=%t, err=%v)", blocked, err)
 			}
@@ -1233,7 +1233,7 @@ func TestFinalizedLookupIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *tes
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatalf("peer PREPARE: %v", err)
 	}
-	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 2)
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(2, targets...), false, 2)
 	if err != nil || blocked || len(completion.waits) != 1 {
 		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
 	}
@@ -1561,7 +1561,7 @@ func TestFinalizedGetattrIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *te
 	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
 		t.Fatalf("peer PREPARE: %v", err)
 	}
-	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 2)
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(exactVisibilityTargets(2, targets...), false, 2)
 	if err != nil || blocked || len(completion.waits) != 1 {
 		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
 	}

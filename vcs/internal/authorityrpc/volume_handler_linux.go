@@ -1691,6 +1691,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
 		var mode xfsstore.XattrMode
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			var valid bool
 			mode, valid = xattrMode(body.SetXattr.GetMode())
@@ -1702,15 +1703,28 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if err == nil {
 				coordinate, err = h.coordinateItem(item)
 			}
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			if err := h.Store.SetXattr(item, string(body.SetXattr.GetName()), body.SetXattr.GetValue(), mode); err != nil {
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)})
 			}
-			return h.success(0), []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
+			attr, err := h.Store.Getattr(item)
+			if err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_RemoveXattr:
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
@@ -2550,7 +2564,8 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 		_, err = h.Visibility.ExecuteWithSourceGateSequence(ctx, cred.ID, id, declaration, expectedGate, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
 			var complete []volumeserver.VisibilityTarget
 			resp, complete = apply(sequence)
-			if visibilityChanged(resp) && !validMutationPostStateRoles(req, resp.GetPostState()) {
+			changed := visibilityChanged(resp)
+			if changed && !validMutationPostStateRoles(req, resp.GetPostState()) {
 				completeNormalizationErr = errors.New("authorityrpc: applied mutation produced an invalid exact post-state object/role set")
 				return []volumeserver.VisibilityTarget{}, true
 			}
@@ -2562,7 +2577,13 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 				completeNormalizationErr = normalizeErr
 				return []volumeserver.VisibilityTarget{}, true
 			}
-			return normalized, normalized != nil && visibilityChanged(resp)
+			if changed {
+				if attachErr := attachExactRepairPostState(normalized, resp.GetPostState(), sequence); attachErr != nil {
+					completeNormalizationErr = attachErr
+					return []volumeserver.VisibilityTarget{}, true
+				}
+			}
+			return normalized, normalized != nil && changed
 		}, func() ([]volumeserver.VisibilityResolution, error) {
 			return sourcePublicationResolutions(req, resp)
 		})

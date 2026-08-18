@@ -124,10 +124,14 @@ _Static_assert(FALLOC_FL_ZERO_RANGE == 0x10, "ZERO_RANGE changed");
 _Static_assert(FALLOC_FL_INSERT_RANGE == 0x20, "INSERT_RANGE changed");
 _Static_assert(FALLOC_FL_UNSHARE_RANGE == 0x40, "UNSHARE_RANGE changed");
 
-_Static_assert(sizeof(struct fuse_notify_pfs_size_out) == 24,
+_Static_assert(sizeof(struct fuse_notify_pfs_size_out) == 152,
 	       "size notification ABI size changed");
-_Static_assert(sizeof(struct fuse_notify_pfs_attr_out) == 16,
+_Static_assert(sizeof(struct fuse_notify_pfs_attr_out) == 152,
 	       "attr notification ABI size changed");
+_Static_assert(offsetof(struct fuse_notify_pfs_size_out, object) == 8,
+	       "size notification object offset changed");
+_Static_assert(offsetof(struct fuse_notify_pfs_attr_out, object) == 8,
+	       "attr notification object offset changed");
 _Static_assert(sizeof(struct fuse_notify_pfs_entry_out) == 32,
 	       "entry notification ABI size changed");
 

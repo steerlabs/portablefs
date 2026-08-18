@@ -448,6 +448,67 @@ func testVisibilityPrepare(name string) func() ([]VisibilityTarget, error) {
 	return func() ([]VisibilityTarget, error) { return testVisibilityTargets(name), nil }
 }
 
+func testExactVisibilityTargets(sequence uint64, targets []VisibilityTarget) []VisibilityTarget {
+	exact := cloneVisibilityTargets(targets)
+	for index := range exact {
+		target := &exact[index]
+		if target.Scope == VisibilityNamespace {
+			continue
+		}
+		target.ExactPostState = &VisibilityObjectPostState{
+			StableIdentity: target.Identity,
+			ObjectVersion:  sequence,
+			Roles:          1,
+			Attr: VisibilityAttr{
+				Kind: 1, Inode: target.KernelIno, Size: target.Size,
+			},
+		}
+	}
+	return exact
+}
+
+func executeTestExact(
+	coordinator *VisibilityCoordinator,
+	ctx context.Context,
+	source SessionID,
+	mutation MutationID,
+	dependencies MutationDependencies,
+	prepare func() ([]VisibilityTarget, error),
+	apply func() ([]VisibilityTarget, bool),
+) error {
+	return coordinator.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, nil, prepare,
+		func(sequence uint64) ([]VisibilityTarget, bool) {
+			targets, changed := apply()
+			if changed {
+				targets = testExactVisibilityTargets(sequence, targets)
+			}
+			return targets, changed
+		}, nil)
+}
+
+func executeTestExactWithSourceGate(
+	coordinator *VisibilityCoordinator,
+	ctx context.Context,
+	source SessionID,
+	mutation MutationID,
+	declaration DependencyDeclaration,
+	gate SourcePublicationGate,
+	refresh func() (SourcePublicationGate, error),
+	prepare func() ([]VisibilityTarget, error),
+	apply func() ([]VisibilityTarget, bool),
+	published func() ([]VisibilityResolution, error),
+) error {
+	_, err := coordinator.ExecuteWithSourceGateSequence(ctx, source, mutation, declaration, gate, refresh, prepare,
+		func(sequence uint64) ([]VisibilityTarget, bool) {
+			targets, changed := apply()
+			if changed {
+				targets = testExactVisibilityTargets(sequence, targets)
+			}
+			return targets, changed
+		}, published)
+	return err
+}
+
 func testMutationDependencies(name string) MutationDependencies {
 	return mutationDependenciesForTargets(testVisibilityTargets(name))
 }
@@ -469,11 +530,18 @@ func executeTestSourceGated(
 ) error {
 	gate := testSourcePublicationGate(name)
 	declaration := coordinator.DeclareSourceGate(gate)
-	return coordinator.ExecuteWithSourceGate(ctx, source, mutation, declaration, gate,
+	_, err := coordinator.ExecuteWithSourceGateSequence(ctx, source, mutation, declaration, gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
-		prepare, apply,
+		prepare, func(sequence uint64) ([]VisibilityTarget, bool) {
+			targets, changed := apply()
+			if changed {
+				targets = testExactVisibilityTargets(sequence, targets)
+			}
+			return targets, changed
+		},
 		func() ([]VisibilityResolution, error) { return nil, nil },
 	)
+	return err
 }
 
 func executeTestSourceGatedHeld(
@@ -488,11 +556,18 @@ func executeTestSourceGatedHeld(
 ) error {
 	gate := testSourcePublicationGate(name)
 	declaration := coordinator.DeclareSourceGate(gate)
-	return coordinator.ExecuteWithSourceGateAndHeldParents(ctx, source, mutation, declaration, gate, held,
+	_, err := coordinator.ExecuteWithSourceGateAndHeldParentsSequence(ctx, source, mutation, declaration, gate, held,
 		func() (SourcePublicationGate, error) { return gate, nil },
-		prepare, apply,
+		prepare, func(sequence uint64) ([]VisibilityTarget, bool) {
+			targets, changed := apply()
+			if changed {
+				targets = testExactVisibilityTargets(sequence, targets)
+			}
+			return targets, changed
+		},
 		func() ([]VisibilityResolution, error) { return nil, nil },
 	)
+	return err
 }
 
 func TestVisibilityRetryProofSecondPassAbandonsExistingWaiter(t *testing.T) {
@@ -885,7 +960,7 @@ func TestVisibilityFanOutProjectsTargetsPerParticipant(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 1},
 			mutationDependenciesForTargets(prepareTargets),
 			func() ([]VisibilityTarget, error) { return prepareTargets, nil },
@@ -963,7 +1038,7 @@ func TestVisibilityProjectedPrepareDoesNotCoverRacedOmittedTarget(t *testing.T) 
 	releaseApply := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 1},
 			mutationDependenciesForTargets(targets),
 			func() ([]VisibilityTarget, error) { return targets, nil },
@@ -1057,7 +1132,7 @@ func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.
 		{Identity: file, Attributes: true, Data: true},
 		{ParentIdentity: parent, Name: []byte("child"), BoundAttributes: true, BoundIdentities: [][16]byte{file}},
 	}}
-	err := h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
+	err := executeTestExactWithSourceGate(h.coordinator, context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
 		func() ([]VisibilityTarget, error) { return targets, nil },
 		func() ([]VisibilityTarget, bool) { return targets, true },
@@ -1120,7 +1195,7 @@ func TestVisibilityPublishedIdentityIsIndexedBeforeNextMutationTurn(t *testing.T
 	}}
 	second := make(chan error, 1)
 	go func() {
-		second <- h.coordinator.Execute(
+		second <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 2},
 			mutationDependenciesForTargets(secondTargets),
 			func() ([]VisibilityTarget, error) { return secondTargets, nil },
@@ -1167,7 +1242,7 @@ func TestVisibilityLaterPeerWaitsForDelayedSourceReplyPublication(t *testing.T) 
 	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{
 		Identity: identity, Attributes: true, Data: true,
 	}}}
-	if err := h.coordinator.ExecuteWithSourceGate(
+	if err := executeTestExactWithSourceGate(h.coordinator,
 		context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
 		func() ([]VisibilityTarget, error) { return targets, nil },
@@ -1183,7 +1258,7 @@ func TestVisibilityLaterPeerWaitsForDelayedSourceReplyPublication(t *testing.T) 
 	secondApplied := make(chan struct{})
 	second := make(chan error, 1)
 	go func() {
-		second <- h.coordinator.ExecuteWithSourceGate(
+		second <- executeTestExactWithSourceGate(h.coordinator,
 			context.Background(), peer, MutationID{Sequence: 2}, h.coordinator.DeclareSourceGate(gate), gate,
 			func() (SourcePublicationGate, error) { return gate, nil },
 			func() ([]VisibilityTarget, error) { return targets, nil },
@@ -2394,7 +2469,7 @@ func TestVisibilityQueuedLinuxItemGateYieldsInternalRetryAndPreservesFIFO(t *tes
 	releaseOwnerPrepare := make(chan struct{})
 	owner := make(chan error, 1)
 	go func() {
-		owner <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+		owner <- executeTestExact(h.coordinator, context.Background(), SessionID{9}, MutationID{Sequence: 1},
 			mutationDependenciesForTargets(targets),
 			func() ([]VisibilityTarget, error) {
 				close(ownerPreparing)
@@ -2550,7 +2625,7 @@ func TestVisibilityUnresolvedNamespaceGateRunsBesideDisjointItemMutation(t *test
 	releaseOwnerPrepare := make(chan struct{})
 	owner := make(chan error, 1)
 	go func() {
-		owner <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+		owner <- executeTestExact(h.coordinator, context.Background(), SessionID{9}, MutationID{Sequence: 1},
 			mutationDependenciesForTargets(itemTargets),
 			func() ([]VisibilityTarget, error) {
 				close(ownerPreparing)
@@ -3893,7 +3968,7 @@ func TestVisibilityPeerCompleteAckActivatesInterruptedGhostDebt(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), peer, MutationID{Sequence: 1, FrontendOperationID: 91},
 			testMutationDependencies("ghost-debt"),
 			testVisibilityPrepare("ghost-debt"),
@@ -4348,7 +4423,7 @@ func TestVisibilityImportedAnchorCarriesItsRacedInodeDependency(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 1},
 			mutationDependenciesForTargets(targets),
 			func() ([]VisibilityTarget, error) { return targets, nil },
@@ -4398,7 +4473,7 @@ func TestVisibilityCompletionCannotDropPreparedParentNamespaceDependency(t *test
 		{Scope: VisibilityNamespace, ParentIdentity: parent, Name: []byte("b")},
 		{Scope: VisibilityAttributes, Identity: parent},
 	}
-	if err := h.coordinator.validateCompletion(complete, prepared); err == nil {
+	if err := h.coordinator.validateCompletion(1, complete, prepared); err == nil {
 		t.Fatal("completion dropped a prepared parent namespace dependency")
 	}
 }
