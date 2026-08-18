@@ -1,4 +1,4 @@
-From b089522d45242fafd2a6d7229d04c8dea77554de Mon Sep 17 00:00:00 2001
+From ca00864717a8def906b1bf5249af4645392f8297 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -13,12 +13,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/fuse/fuse_i.h          |  43 ++-
  fs/fuse/inode.c           |  31 +--
  fs/fuse/post_state.c      | 544 ++++++++++++++++++++++++++++++++++++++
- fs/fuse/readdir.c         |  70 ++++-
+ fs/fuse/readdir.c         | 104 +++++++-
  fs/fuse/xattr.c           |  19 +-
  fs/namei.c                |  23 +-
  include/linux/fs.h        |   8 +-
  include/uapi/linux/fuse.h |  66 ++++-
- 12 files changed, 1406 insertions(+), 132 deletions(-)
+ 12 files changed, 1440 insertions(+), 132 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -2091,7 +2091,7 @@ index 000000000..e965d9c7a
 +	return err;
 +}
 diff --git a/fs/fuse/readdir.c b/fs/fuse/readdir.c
-index de3dd14d1..f88772e74 100644
+index de3dd14d1..c5e47502c 100644
 --- a/fs/fuse/readdir.c
 +++ b/fs/fuse/readdir.c
 @@ -152,13 +152,13 @@ static int parse_dirfile(char *buf, size_t nbytes, struct file *file,
@@ -2143,7 +2143,32 @@ index de3dd14d1..f88772e74 100644
  	if (fc->readdirplus_auto)
  		set_bit(FUSE_I_INIT_RDPLUS, &get_fuse_inode(inode)->state);
  	fuse_change_entry_timeout(dentry, o);
-@@ -325,7 +333,9 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
+@@ -289,6 +297,24 @@ static void fuse_force_forget(struct file *file, u64 nodeid)
+ 	/* ignore errors */
+ }
+ 
++static void fuse_pfs_forget_dirplus_tail(char *buf, size_t nbytes,
++					 struct file *file)
++{
++	while (nbytes >= FUSE_NAME_OFFSET_PFS_DIRENTPLUS) {
++		struct fuse_pfs_direntplus *record = (void *)buf;
++		size_t reclen = FUSE_PFS_DIRENTPLUS_SIZE(record);
++
++		if (!record->namelen || record->namelen > FUSE_NAME_MAX ||
++		    reclen > nbytes || memchr(record->name, '/',
++					     record->namelen))
++			return;
++		if (record->entry_out.nodeid)
++			fuse_force_forget(file, record->entry_out.nodeid);
++		buf += reclen;
++		nbytes -= reclen;
++	}
++}
++
+ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
+ 			     struct dir_context *ctx, u64 attr_version)
+ {
+@@ -325,7 +351,9 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
  		buf += reclen;
  		nbytes -= reclen;
  
@@ -2154,7 +2179,7 @@ index de3dd14d1..f88772e74 100644
  		if (ret)
  			fuse_force_forget(file, direntplus->entry_out.nodeid);
  	}
-@@ -333,6 +343,39 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
+@@ -333,6 +361,55 @@ static int parse_dirplusfile(char *buf, size_t nbytes, struct file *file,
  	return 0;
  }
  
@@ -2170,8 +2195,10 @@ index de3dd14d1..f88772e74 100644
 +
 +		if (!record->namelen || record->namelen > FUSE_NAME_MAX ||
 +		    reclen > nbytes || memchr(record->name, '/',
-+					     record->namelen))
-+			return -EIO;
++					     record->namelen)) {
++			fuse_abort_conn(get_fuse_conn(file_inode(file)));
++			return -ENOTCONN;
++		}
 +		if (!over) {
 +			over = !dir_emit(ctx, record->name, record->namelen,
 +					 record->ino, record->type);
@@ -2182,19 +2209,33 @@ index de3dd14d1..f88772e74 100644
 +					   record->name, record->namelen,
 +					   &record->stamp, attr_version);
 +		if (ret) {
-+			fuse_force_forget(file, record->entry_out.nodeid);
-+			return ret;
++			if (record->entry_out.nodeid)
++				fuse_force_forget(file, record->entry_out.nodeid);
++			buf += reclen;
++			nbytes -= reclen;
++			fuse_pfs_forget_dirplus_tail(buf, nbytes, file);
++			/*
++			 * A parser error cannot carry a partial-page outcome in the
++			 * publication receipt.  Teardown releases any FORGET which lost
++			 * the race with connection abort and the already-linked prefix.
++			 */
++			fuse_abort_conn(get_fuse_conn(file_inode(file)));
++			return -ENOTCONN;
 +		}
 +		buf += reclen;
 +		nbytes -= reclen;
 +	}
-+	return nbytes ? -EIO : 0;
++	if (nbytes) {
++		fuse_abort_conn(get_fuse_conn(file_inode(file)));
++		return -ENOTCONN;
++	}
++	return 0;
 +}
 +
  static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
  {
  	int plus;
-@@ -359,6 +402,8 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
+@@ -359,6 +436,8 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
  		attr_version = fuse_get_attr_version(fm->fc);
  		fuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
  				    FUSE_READDIRPLUS);
@@ -2203,7 +2244,7 @@ index de3dd14d1..f88772e74 100644
  	} else {
  		fuse_read_args_fill(&ia, file, ctx->pos, PAGE_SIZE,
  				    FUSE_READDIR);
-@@ -373,8 +418,17 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
+@@ -373,8 +452,17 @@ static int fuse_readdir_uncached(struct file *file, struct dir_context *ctx)
  			if (ff->open_flags & FOPEN_CACHE_DIR)
  				fuse_readdir_cache_end(file, ctx->pos);
  		} else if (plus) {

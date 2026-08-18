@@ -670,6 +670,36 @@ class PatchedSourceTests(unittest.TestCase):
             "if (!args->pfs_post_state && !args->pfs_cache_stamp)", request
         )
 
+    def test_marked_readdirplus_failure_drains_unlinked_lookup_ownership(
+        self,
+    ) -> None:
+        readdir = self.source("fs/fuse/readdir.c")
+        helper = readdir[
+            readdir.index("static void fuse_pfs_forget_dirplus_tail"):
+            readdir.index("static int parse_dirplusfile")
+        ]
+        self.assertIn("while (nbytes >= FUSE_NAME_OFFSET_PFS_DIRENTPLUS)", helper)
+        self.assertIn("fuse_force_forget(file, record->entry_out.nodeid)", helper)
+
+        stock = readdir[
+            readdir.index("static int parse_dirplusfile"):
+            readdir.index("static int parse_pfs_dirplusfile")
+        ]
+        self.assertNotIn("fuse_pfs_forget_dirplus_tail", stock)
+
+        strict = readdir[
+            readdir.index("static int parse_pfs_dirplusfile"):
+            readdir.index("static int fuse_readdir_uncached")
+        ]
+        link_failure = strict.index("if (ret) {")
+        forget_failed = strict.index("fuse_force_forget", link_failure)
+        drain_tail = strict.index("fuse_pfs_forget_dirplus_tail", forget_failed)
+        abort = strict.index("fuse_abort_conn", drain_tail)
+        return_failure = strict.index("return -ENOTCONN", abort)
+        self.assertLess(forget_failed, drain_tail)
+        self.assertLess(drain_tail, abort)
+        self.assertLess(abort, return_failure)
+
     def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")

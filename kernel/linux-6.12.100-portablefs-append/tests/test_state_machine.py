@@ -317,6 +317,43 @@ def strict_negative_lookup_shape(
     raise ProtocolError("negative carried an invalid class")
 
 
+@dataclasses.dataclass(frozen=True)
+class DirPlusParseResult:
+    linked: tuple[int, ...]
+    force_forgotten: tuple[int, ...]
+    session_released: tuple[int, ...]
+
+
+def parse_marked_dirplus_page(
+    nodeids: tuple[int, ...], *, link_failure: int | None = None,
+    malformed_tail: int | None = None, teardown_during_drain: bool = False,
+) -> DirPlusParseResult:
+    """Model lookup ownership after an accepted marked page is parsed."""
+    if any(nodeid <= 1 for nodeid in nodeids):
+        raise ProtocolError("READDIRPLUS page carried an invalid nodeid")
+    if link_failure is None:
+        if malformed_tail is not None or teardown_during_drain:
+            raise ProtocolError("failure controls require a link failure")
+        return DirPlusParseResult(nodeids, (), ())
+    if link_failure < 0 or link_failure >= len(nodeids):
+        raise ProtocolError("link failure is outside the page")
+    if malformed_tail is not None and malformed_tail <= link_failure:
+        raise ProtocolError("malformed tail does not follow the failed record")
+
+    linked = nodeids[:link_failure]
+    drain_end = malformed_tail if malformed_tail is not None else len(nodeids)
+    if teardown_during_drain:
+        drain_end = link_failure + 1
+    force_forgotten = nodeids[link_failure:drain_end]
+    # A partial parser result has no receipt shape, so the connection becomes
+    # terminal. Detach releases every capability not already force-forgotten,
+    # including the linked prefix and any drain requests lost to teardown.
+    released = tuple(
+        nodeid for nodeid in nodeids if nodeid not in force_forgotten
+    )
+    return DirPlusParseResult(linked, force_forgotten, released)
+
+
 REQUIRED_INIT = {
     "ATOMIC_O_TRUNC",
     "HANDLE_KILLPRIV_V2",
@@ -1222,6 +1259,43 @@ class TransactionTests(unittest.TestCase):
 
 
 class PublicationAndNotifyTests(unittest.TestCase):
+    def test_readdirplus_link_failure_drains_or_terminalizes_the_page(
+        self,
+    ) -> None:
+        nodeids = (101, 102, 103, 104)
+
+        success = parse_marked_dirplus_page(nodeids)
+        self.assertEqual(success.linked, nodeids)
+        self.assertEqual(success.force_forgotten, ())
+        self.assertEqual(success.session_released, ())
+
+        failed = parse_marked_dirplus_page(nodeids, link_failure=1)
+        self.assertEqual(failed.linked, (101,))
+        self.assertEqual(failed.force_forgotten, (102, 103, 104))
+        self.assertEqual(failed.session_released, (101,))
+        self.assertEqual(
+            set(failed.force_forgotten) | set(failed.session_released),
+            set(nodeids),
+        )
+
+        malformed = parse_marked_dirplus_page(
+            nodeids, link_failure=1, malformed_tail=3
+        )
+        self.assertEqual(malformed.force_forgotten, (102, 103))
+        self.assertEqual(
+            set(malformed.force_forgotten) | set(malformed.session_released),
+            set(nodeids),
+        )
+
+        teardown = parse_marked_dirplus_page(
+            nodeids, link_failure=1, teardown_during_drain=True
+        )
+        self.assertEqual(teardown.force_forgotten, (102,))
+        self.assertEqual(
+            set(teardown.force_forgotten) | set(teardown.session_released),
+            set(nodeids),
+        )
+
     def test_attr_repair_fences_permission_until_repaired_version_installs(
         self,
     ) -> None:
