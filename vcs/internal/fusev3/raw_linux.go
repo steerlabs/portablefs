@@ -858,25 +858,22 @@ type terminalReplyCompletion struct {
 	physical    bool
 }
 
-// terminalizeReplyCacheOwnership is the single teardown settlement edge. A
-// reply which physically reached the kernel becomes a withdrawal obligation;
-// every other reply fails admission. Both unique maps are consumed before the
-// cached-state withdrawal can take its snapshot, so a later writer callback
-// cannot resurrect a candidate behind that snapshot.
-func (r *rawFileSystem) terminalizeReplyCacheOwnership() {
+// terminalizeReplyCacheOwnership joins physical writer callbacks only until
+// deadline. A false result leaves the table terminalizing: new registration
+// and PFS_PUBLISH settlement stay closed, while an already-finalized original
+// writer may still report its physical result. The caller must then terminate
+// the device connection, prove it absent, and call
+// terminalizeReplyCacheOwnershipAfterConnectionGone.
+func (r *rawFileSystem) terminalizeReplyCacheOwnership(deadline time.Time) bool {
 	r.mu.Lock()
 	if r.replyTerminal {
 		r.mu.Unlock()
-		return
+		return true
 	}
-	if r.replyTerminalizing {
-		done := r.replyTerminalDone
-		r.mu.Unlock()
-		<-done
-		return
+	if !r.replyTerminalizing {
+		r.replyTerminalizing = true
+		r.replyTerminalDone = make(chan struct{})
 	}
-	r.replyTerminalizing = true
-	r.replyTerminalDone = make(chan struct{})
 	seen := make(map[*replyPublication]struct{}, len(r.replyPublications)+len(r.publishAcks))
 	for _, publication := range r.replyPublications {
 		seen[publication] = struct{}{}
@@ -897,18 +894,66 @@ func (r *rawFileSystem) terminalizeReplyCacheOwnership() {
 	// report whether those bytes physically reached the kernel. No withdrawal
 	// snapshot may precede this join.
 	for _, originalDone := range originalWrites {
-		<-originalDone
+		if !waitReplyTerminal(originalDone, deadline) {
+			return false
+		}
 	}
+	return r.finishReplyCacheTerminalization(false)
+}
 
+func waitReplyTerminal(done <-chan struct{}, deadline time.Time) bool {
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// terminalizeReplyCacheOwnershipAfterConnectionGone is the only settlement
+// edge for a finalized writer which never reports. Connection absence, not a
+// guessed write result, proves that no kernel cache or lookup ownership can
+// survive, so every retained candidate is rolled back exactly once.
+func (r *rawFileSystem) terminalizeReplyCacheOwnershipAfterConnectionGone() {
+	r.finishReplyCacheTerminalization(true)
+}
+
+func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) bool {
 	r.mu.Lock()
+	if r.replyTerminal {
+		r.mu.Unlock()
+		return true
+	}
+	if !r.replyTerminalizing {
+		r.mu.Unlock()
+		return false
+	}
+	seen := make(map[*replyPublication]struct{}, len(r.replyPublications)+len(r.publishAcks))
+	for _, publication := range r.replyPublications {
+		seen[publication] = struct{}{}
+	}
+	for _, publication := range r.publishAcks {
+		seen[publication] = struct{}{}
+	}
 	completions := make([]terminalReplyCompletion, 0, len(seen))
 	for publication := range seen {
 		delete(r.replyPublications, publication.requestUnique)
 		if publication.publishUnique != 0 {
 			delete(r.publishAcks, publication.publishUnique)
 		}
-		physical := publication.originalWrote && publication.originalStatus.Ok()
-		if !publication.originalWrote {
+		physical := !connectionGone && publication.originalWrote && publication.originalStatus.Ok()
+		if connectionGone && !publication.originalWrote {
 			close(publication.originalDone)
 		}
 		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
@@ -937,6 +982,7 @@ func (r *rawFileSystem) terminalizeReplyCacheOwnership() {
 		}
 		completion.publication.consumeAuthorityResponse()
 	}
+	return true
 }
 
 // settle ends one admitted publication. PREPARE's drain is waiting on exactly

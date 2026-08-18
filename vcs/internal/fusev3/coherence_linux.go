@@ -1120,6 +1120,21 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 	return failures
 }
 
+// discardCachedOwnershipAfterConnectionGone clears only daemon bookkeeping.
+// It is legal solely after exact mount and connection absence prove that no
+// kernel dentry, inode, page, lookup reference, or cursor can survive to need a
+// reverse notification.
+func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
+	r.mu.Lock()
+	r.cachedNames = make(map[nameKey]*inodeRecord)
+	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
+	r.cachedNameStable = make(map[nameKey]publicationNamespace)
+	r.cachedNegatives = make(map[nameKey]struct{})
+	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
+	r.cachedData = make(map[uint64]*inodeRecord)
+	r.mu.Unlock()
+}
+
 // revoke makes this mount unusable immediately and permanently. It is the local
 // obligation that lets the authority stop freezing a whole volume because one
 // participant died: a strict mount that can no longer repair must stop serving
@@ -1297,8 +1312,14 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	ops := m.withdrawalOps()
 	installed := m.kernelMount
 	out := withdrawalOutcome{installed: installed.point != ""}
+	writersJoined := true
 	if m.raw != nil {
-		m.raw.terminalizeReplyCacheOwnership()
+		writersJoined = m.raw.terminalizeReplyCacheOwnership(
+			time.Now().Add(m.repairBudget),
+		)
+		if !writersJoined {
+			out.record(0, "reply-writer-join", errRepairBudgetExceeded)
+		}
 	}
 
 	// Round one's namespace detach runs before the cached-name withdrawal, so
@@ -1310,11 +1331,11 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	if out.installed {
 		out.record(1, "detach", ops.detach(installed.point))
 	}
-	if m.raw != nil {
+	if m.raw != nil && writersJoined {
 		m.raw.revokeCachedNames(time.Now().Add(m.repairBudget))
 	}
 	deadline := time.Now().Add(m.repairBudget)
-	if m.raw != nil {
+	if m.raw != nil && writersJoined {
 		for _, failure := range m.raw.revokeCachedAttrs(deadline) {
 			out.record(1, "attribute-withdrawal", errors.New(failure))
 		}
@@ -1335,9 +1356,22 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 			// No recorded kernel identity: startup failed before mountinfo
 			// yielded one. There is nothing here whose absence this ladder
 			// could prove, and the caller falls back to the ordinary unmount.
+			if !writersJoined && m.kernelConnectionAbsentBy(deadline) {
+				m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+				m.raw.discardCachedOwnershipAfterConnectionGone()
+			}
 			return out
 		}
 		if _, err := ops.absent(installed); err == nil {
+			if !writersJoined {
+				if !m.kernelConnectionAbsentBy(deadline) {
+					out.record(round, "connection-absence",
+						errors.New("FUSE serving connection did not terminate inside the withdrawal budget"))
+					return out
+				}
+				m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+				m.raw.discardCachedOwnershipAfterConnectionGone()
+			}
 			out.withdrawn = true
 			return out
 		} else {
@@ -1350,6 +1384,16 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 		delay *= 2
 		out.record(round+1, "detach", ops.detach(installed.point))
 	}
+}
+
+func (m *Mount) kernelConnectionAbsentBy(deadline time.Time) bool {
+	if !m.kernelConnectionStarted {
+		return true
+	}
+	if m.kernelConnectionDone == nil {
+		return false
+	}
+	return waitReplyTerminal(m.kernelConnectionDone, deadline)
 }
 
 // reportRevocation hands the supervisor the terminal verdict exactly once, from
