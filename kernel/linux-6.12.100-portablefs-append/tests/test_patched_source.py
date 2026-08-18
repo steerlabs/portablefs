@@ -538,6 +538,19 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("if (!args->pfs_post_state)", variable)
         self.assertIn("ret = args->out_args[args->out_numargs - 1].size", variable)
 
+    def test_post_state_inode_flags_are_masked_statx_attributes(self) -> None:
+        text = self.source("fs/fuse/post_state.c")
+        start = text.index("static void pfs_install_statx_attributes")
+        end = text.index("static int pfs_install_stamped_attr", start)
+        install = text[start:end]
+        self.assertIn("STATX_ATTR_IMMUTABLE", install)
+        self.assertIn("STATX_ATTR_APPEND", install)
+        self.assertNotIn("FS_IMMUTABLE_FL", install)
+        self.assertNotIn("FS_APPEND_FL", install)
+        self.assertNotIn("S_SYNC", install)
+        self.assertNotIn("S_NOATIME", install)
+        self.assertNotIn("S_DIRSYNC", install)
+
     def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")

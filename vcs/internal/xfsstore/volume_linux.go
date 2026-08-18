@@ -842,6 +842,7 @@ func attrFromStatx(st unix.Statx_t) (Attr, error) {
 		Mode: modeFromUnix(uint32(st.Mode)), UID: st.Uid, GID: st.Gid, Nlink: st.Nlink,
 		DeviceMajor: st.Dev_major, DeviceMinor: st.Dev_minor,
 		Rdev: newEncodeDevice(st.Rdev_major, st.Rdev_minor), BlockSize: st.Blksize,
+		Flags:   uint32(st.Attributes & st.Attributes_mask),
 		ATimeNS: timestampNS(st.Atime), MTimeNS: timestampNS(st.Mtime),
 		CTimeNS: timestampNS(st.Ctime), BirthTimeNS: timestampNS(st.Btime),
 	}, nil

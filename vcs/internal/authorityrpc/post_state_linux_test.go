@@ -67,3 +67,19 @@ func TestMutationPostStateExactObjectRoleSets(t *testing.T) {
 		})
 	}
 }
+
+func TestMutationPostStateCarriesMaskedStatxFlags(t *testing.T) {
+	identity := postStateTestIdentity(0x71)
+	const flags = uint32(0x00300870)
+	state := (&VolumeHandler{}).mutationPostState(23, postStateSnapshot{
+		identity: identity,
+		attr: xfsstore.Attr{
+			Kind: xfsstore.KindRegular, Ino: 71, Mode: 0o600, Nlink: 1, Flags: flags,
+		},
+		roles:   postStateRoleTarget,
+		changed: true,
+	})
+	if len(state.GetObjects()) != 1 || state.GetObjects()[0].GetAttr().GetFlags() != flags {
+		t.Fatalf("post-state flags = %#x, want %#x", state.GetObjects()[0].GetAttr().GetFlags(), flags)
+	}
+}

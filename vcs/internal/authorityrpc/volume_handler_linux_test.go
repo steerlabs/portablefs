@@ -975,6 +975,78 @@ type resourceAdmissionFaultStore struct {
 
 func (*resourceAdmissionFaultStore) LockMutation([][16]byte) func() { return func() {} }
 
+type allocatingMutationLockStore struct {
+	resourceAdmissionFaultStore
+	t      *testing.T
+	parent xfsstore.Capability
+	child  xfsstore.Capability
+	handle xfsstore.Capability
+
+	mu         sync.Mutex
+	locked     bool
+	released   bool
+	identities [][16]byte
+	phases     map[string]bool
+}
+
+func (s *allocatingMutationLockStore) LockMutation(identities [][16]byte) func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		s.t.Fatal("allocating mutation recursively acquired its writer lock")
+	}
+	s.identities = append([][16]byte(nil), identities...)
+	s.locked = true
+	return func() {
+		s.mu.Lock()
+		s.locked = false
+		s.released = true
+		s.mu.Unlock()
+	}
+}
+
+func (s *allocatingMutationLockStore) observeLocked(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.locked {
+		s.t.Errorf("%s ran outside the allocating parent's writer lock", phase)
+	}
+	s.phases[phase] = true
+}
+
+func (s *allocatingMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.observeLocked("allocating syscall")
+	if parent != s.parent {
+		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
+	}
+	return s.child, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *allocatingMutationLockStore) OpenFile(item xfsstore.Capability, _ xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.observeLocked("creation handle acquisition")
+	if item != s.child {
+		s.t.Errorf("open item = %x, want %x", item, s.child)
+	}
+	return s.handle, nil
+}
+
+func (s *allocatingMutationLockStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	if item == s.child {
+		s.observeLocked("newborn identity capture")
+	}
+	return [16]byte{item[0]}, nil
+}
+
+func (s *allocatingMutationLockStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	if item == s.parent {
+		s.observeLocked("parent post-apply snapshot")
+		return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(item[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1}, nil
+	}
+	return s.resourceAdmissionFaultStore.Getattr(item)
+}
+
+func (*allocatingMutationLockStore) CloseOpen(xfsstore.Capability) error { return nil }
+
 type sourceGateRefreshStore struct {
 	resourceAdmissionFaultStore
 	mu             sync.Mutex
@@ -2051,6 +2123,36 @@ func TestResourceStoreFailureReleasesExactReservation(t *testing.T) {
 			}
 			reservation.release()
 		})
+	}
+}
+
+func TestCreateCoversNewbornUnderExistingParentWriterLock(t *testing.T) {
+	store := &allocatingMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, child: xfsstore.Capability{0x73},
+		handle: xfsstore.Capability{0x74}, phases: make(map[string]bool),
+	}
+	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+	if root != store.parent {
+		t.Fatalf("harness root = %x, want parent %x", root, store.parent)
+	}
+	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	if response.GetErrno() != 0 || response.GetCreate() == nil || len(response.GetPostState().GetObjects()) != 2 {
+		t.Fatalf("create response = %+v", response)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.locked || !store.released {
+		t.Fatalf("allocating parent lock lifecycle = locked:%v released:%v", store.locked, store.released)
+	}
+	wantIdentity := [16]byte{store.parent[0]}
+	if len(store.identities) != 1 || store.identities[0] != wantIdentity {
+		t.Fatalf("pre-allocation lock set = %x, want existing parent identity %x only", store.identities, wantIdentity)
+	}
+	for _, phase := range []string{"allocating syscall", "creation handle acquisition", "newborn identity capture", "parent post-apply snapshot"} {
+		if !store.phases[phase] {
+			t.Errorf("create did not exercise %s under the parent stripe", phase)
+		}
 	}
 }
 
