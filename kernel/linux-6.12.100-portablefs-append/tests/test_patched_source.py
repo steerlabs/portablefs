@@ -571,9 +571,20 @@ class PatchedSourceTests(unittest.TestCase):
             "clear_bit(FUSE_I_BTIME",
             "fi->pfs_inode_flags = 0",
             "inode->i_flags &= ~(S_IMMUTABLE | S_APPEND)",
-            "fi->pfs_attr_exact = false",
+            "inode->i_flags |= S_ATTR_INEXACT",
         ):
             self.assertIn(source, attr)
+
+        fill_start = text.index("int fuse_pfs_fill_exact_statx")
+        fill_end = text.index("static int pfs_install_stamped_attr", fill_start)
+        fill = text[fill_start:fill_end]
+        for source in (
+            "stat->btime = fi->i_btime",
+            "stat->result_mask |= STATX_BTIME",
+            "stat->attributes = fi->pfs_inode_flags",
+            "stat->attributes_mask |= FUSE_PFS_STATX_ATTRIBUTES",
+        ):
+            self.assertIn(source, fill)
 
         directory = self.source("fs/fuse/dir.c")
         getattr = directory[
@@ -581,6 +592,25 @@ class PatchedSourceTests(unittest.TestCase):
             directory.index("int fuse_update_attributes")
         ]
         self.assertIn("fuse_pfs_fill_exact_statx(inode, stat)", getattr)
+
+        permission = directory[
+            directory.index("static int fuse_perm_getattr"):
+            directory.index("static int fuse_readlink")
+        ]
+        self.assertIn("fuse_pfs_generic_permission", permission)
+        self.assertIn("fuse_pfs_attr_is_exact(inode)", permission)
+        self.assertIn("mutex_lock(&fi->pfs_publish_mutex)", permission)
+
+        namei = self.source("fs/namei.c")
+        inode_permission = namei[
+            namei.index("int inode_permission"):
+            namei.index("EXPORT_SYMBOL(inode_permission)")
+        ]
+        self.assertIn("if (unlikely(!IS_ATTR_EXACT(inode)))", inode_permission)
+        self.assertLess(
+            inode_permission.index("if (unlikely(!IS_ATTR_EXACT(inode)))"),
+            inode_permission.index("if (IS_IMMUTABLE(inode))"),
+        )
 
     def test_existing_create_and_negative_lookup_have_distinct_exact_shapes(
         self,

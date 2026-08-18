@@ -1,4 +1,4 @@
-From 06daf91f799548a1e5efca73ac29746a7d6b3604 Mon Sep 17 00:00:00 2001
+From 43cb7e49666288def59f97ae8086e1274932777c Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -8,15 +8,17 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
  fs/fuse/dev.c             | 165 +++++++++++-
- fs/fuse/dir.c             | 362 ++++++++++++++++++++++----
+ fs/fuse/dir.c             | 393 +++++++++++++++++++++++----
  fs/fuse/file.c            | 122 ++++++---
  fs/fuse/fuse_i.h          |  42 ++-
- fs/fuse/inode.c           |  23 +-
- fs/fuse/post_state.c      | 523 ++++++++++++++++++++++++++++++++++++++
+ fs/fuse/inode.c           |  31 +--
+ fs/fuse/post_state.c      | 544 ++++++++++++++++++++++++++++++++++++++
  fs/fuse/readdir.c         |  70 ++++-
  fs/fuse/xattr.c           |  19 +-
+ fs/namei.c                |  23 +-
+ include/linux/fs.h        |   8 +-
  include/uapi/linux/fuse.h |  66 ++++-
- 10 files changed, 1271 insertions(+), 122 deletions(-)
+ 12 files changed, 1351 insertions(+), 133 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -32,7 +34,7 @@ index ce0ff7a90..93b1b136f 100644
  fuse-$(CONFIG_FUSE_DAX) += dax.o
  fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index b1078aeb7..9e07acd3b 100644
+index b1078aeb7..dcc2a4e39 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
 @@ -15,6 +15,7 @@
@@ -139,7 +141,7 @@ index b1078aeb7..9e07acd3b 100644
 +		clear_bit(FUSE_I_BTIME, &fi->state);
 +		fi->pfs_inode_flags = 0;
 +		inode->i_flags &= ~(S_IMMUTABLE | S_APPEND);
-+		fi->pfs_attr_exact = false;
++		inode->i_flags |= S_ATTR_INEXACT;
 +		fi->attr_version = atomic64_inc_return(&fc->attr_version);
 +		fi->pfs_object_version = max(fi->pfs_object_version,
 +					     outarg.visibility_sequence);
@@ -246,7 +248,7 @@ index b1078aeb7..9e07acd3b 100644
  		fuse_copy_finish(cs);
  		return -EINVAL;
 diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
-index 7ee120772..cc2f60c95 100644
+index 7ee120772..524de461d 100644
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
 @@ -207,8 +207,10 @@ static int fuse_dentry_revalidate(struct dentry *entry, unsigned int flags)
@@ -913,7 +915,80 @@ index 7ee120772..cc2f60c95 100644
  
  	parent = fuse_ilookup(fc, parent_nodeid, NULL);
  	if (!parent)
-@@ -2218,6 +2458,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -1803,6 +2043,22 @@ static int fuse_perm_getattr(struct inode *inode, int mask)
+ 	return fuse_do_getattr(&nop_mnt_idmap, inode, NULL, NULL);
+ }
+ 
++static int fuse_pfs_generic_permission(struct mnt_idmap *idmap,
++				       struct inode *inode, int mask)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	int err;
++
++	mutex_lock(&fi->pfs_publish_mutex);
++	spin_lock(&fi->lock);
++	err = IS_ATTR_EXACT(inode) ? 0 : -EAGAIN;
++	spin_unlock(&fi->lock);
++	if (!err)
++		err = generic_permission(idmap, inode, mask);
++	mutex_unlock(&fi->pfs_publish_mutex);
++	return err;
++}
++
+ /*
+  * Check permission.  The two basic access models of FUSE are:
+  *
+@@ -1820,6 +2076,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+ 			   struct inode *inode, int mask)
+ {
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
++	bool pfs_shared = fc->pfs_strict_coherence &&
++		get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_SHARED;
+ 	bool refreshed = false;
+ 	int err = 0;
+ 
+@@ -1828,6 +2086,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+ 
+ 	if (!fuse_allow_current_process(fc))
+ 		return -EACCES;
++	if (pfs_shared && (mask & MAY_NOT_BLOCK))
++		return -ECHILD;
+ 
+ 	/*
+ 	 * If attributes are needed, refresh them before proceeding
+@@ -1837,7 +2097,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+ 		struct fuse_inode *fi = get_fuse_inode(inode);
+ 		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
+ 
+-		if (perm_mask & READ_ONCE(fi->inval_mask) ||
++		if ((pfs_shared && !fuse_pfs_attr_is_exact(inode)) ||
++		    (perm_mask & READ_ONCE(fi->inval_mask)) ||
+ 		    time_before64(fi->i_time, get_jiffies_64())) {
+ 			refreshed = true;
+ 
+@@ -1848,7 +2109,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
+ 	}
+ 
+ 	if (fc->default_permissions) {
+-		err = generic_permission(idmap, inode, mask);
++		err = pfs_shared ? fuse_pfs_generic_permission(idmap, inode, mask) :
++			generic_permission(idmap, inode, mask);
+ 
+ 		/* If permission is denied, try to refresh file
+ 		   attributes.  This is also needed, because the root
+@@ -1856,8 +2118,9 @@ static int fuse_permission(struct mnt_idmap *idmap,
+ 		if (err == -EACCES && !refreshed) {
+ 			err = fuse_perm_getattr(inode, mask);
+ 			if (!err)
+-				err = generic_permission(idmap,
+-							 inode, mask);
++				err = pfs_shared ?
++					fuse_pfs_generic_permission(idmap, inode, mask) :
++					generic_permission(idmap, inode, mask);
+ 		}
+ 
+ 		/* Note: the opposite of the above test does not
+@@ -2218,6 +2481,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  	FUSE_ARGS(args);
  	struct fuse_setattr_in inarg;
  	struct fuse_attr_out outarg;
@@ -921,7 +996,7 @@ index 7ee120772..cc2f60c95 100644
  	bool is_truncate = false;
  	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
  	loff_t oldsize;
-@@ -2315,11 +2556,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2315,11 +2579,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  
  	attr_version = fuse_get_attr_version(fm->fc);
  	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
@@ -937,7 +1012,7 @@ index 7ee120772..cc2f60c95 100644
  	err = fuse_simple_request(fm, &args);
  	if (err) {
  		if (err == -EINTR)
-@@ -2338,6 +2582,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2338,6 +2605,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  		err = -ENOTCONN;
  		goto error;
  	}
@@ -1227,10 +1302,10 @@ index acfedc292..17f05830f 100644
  		fs_reply_publish_scope_set_applied_bytes(out.result_size);
  	publish_token->publish_on_operation_error = true;
 diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
-index 0ba881cdf..07562a7db 100644
+index 0ba881cdf..5b68919c5 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
-@@ -121,8 +121,16 @@ struct fuse_inode {
+@@ -121,8 +121,15 @@ struct fuse_inode {
  	/** Version of last attribute change */
  	u64 attr_version;
  
@@ -1239,7 +1314,6 @@ index 0ba881cdf..07562a7db 100644
  	u8 pfs_class;
 +	bool pfs_identity_known;
 +	bool pfs_repairing;
-+	bool pfs_attr_exact;
 +	u8 pfs_stable_identity[16];
 +	u64 pfs_object_version;
 +	u64 pfs_attr_repair_sequence;
@@ -1248,7 +1322,7 @@ index 0ba881cdf..07562a7db 100644
  	u64 pfs_size_sequence;
  	u64 pfs_sequence_size;
  	/*
-@@ -315,6 +323,13 @@ enum fuse_pfs_publish_policy {
+@@ -315,6 +322,13 @@ enum fuse_pfs_publish_policy {
  	FUSE_PFS_PUBLISH_OPTIONAL,
  };
  
@@ -1262,7 +1336,7 @@ index 0ba881cdf..07562a7db 100644
  struct fuse_args {
  	uint64_t nodeid;
  	uint32_t opcode;
-@@ -335,11 +350,12 @@ struct fuse_args {
+@@ -335,11 +349,12 @@ struct fuse_args {
  	bool is_pinned:1;
  	bool invalidate_vmap:1;
  	bool pfs_reply_marked:1;
@@ -1276,7 +1350,7 @@ index 0ba881cdf..07562a7db 100644
  	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
  	/* Used for kvec iter backed by vmalloc address */
  	void *vmap_base;
-@@ -1114,6 +1130,7 @@ struct fuse_io_args {
+@@ -1114,6 +1129,7 @@ struct fuse_io_args {
  	struct {
  		struct fuse_pfs_write_in in;
  		struct fuse_pfs_write_out out;
@@ -1284,7 +1358,7 @@ index 0ba881cdf..07562a7db 100644
  	} pfs_write;
  	};
  	struct fuse_args_pages ap;
-@@ -1230,12 +1247,31 @@ void fuse_wait_aborted(struct fuse_conn *fc);
+@@ -1230,12 +1246,32 @@ void fuse_wait_aborted(struct fuse_conn *fc);
  
  int fuse_pfs_require_publication(struct fuse_mount *fm,
  				 struct fuse_args *args, bool required);
@@ -1305,6 +1379,7 @@ index 0ba881cdf..07562a7db 100644
 +			     const struct fuse_pfs_cache_stamp *stamp);
 +bool fuse_pfs_existing_create(const struct fuse_pfs_post_state *state);
 +int fuse_pfs_fill_exact_statx(struct inode *inode, struct kstat *stat);
++bool fuse_pfs_attr_is_exact(struct inode *inode);
  int fuse_pfs_classify_attr(struct fuse_conn *fc, struct inode *inode,
  			   const struct fuse_attr *attr);
  int fuse_pfs_update_size_locked(struct inode *inode, u64 size, u64 sequence);
@@ -1318,7 +1393,7 @@ index 0ba881cdf..07562a7db 100644
  /**
   * Invalidate inode attributes
 diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
-index c2ac021bf..9a91eafcd 100644
+index c2ac021bf..2a28b85bf 100644
 --- a/fs/fuse/inode.c
 +++ b/fs/fuse/inode.c
 @@ -502,21 +502,6 @@ int fuse_pfs_withdraw_data(struct inode *inode)
@@ -1343,7 +1418,23 @@ index c2ac021bf..9a91eafcd 100644
  static void fuse_init_submount_lookup(struct fuse_submount_lookup *sl,
  				      u64 nodeid)
  {
-@@ -601,6 +586,8 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+@@ -570,10 +555,13 @@ int fuse_pfs_classify_attr(struct fuse_conn *fc, struct inode *inode,
+ 	else
+ 		return -EPROTO;
+ 	spin_lock(&fi->lock);
+-	if (fi->pfs_class == FUSE_PFS_CLASS_UNKNOWN)
++	if (fi->pfs_class == FUSE_PFS_CLASS_UNKNOWN) {
+ 		fi->pfs_class = class;
+-	else if (fi->pfs_class != class)
++		if (class == FUSE_PFS_CLASS_SHARED)
++			inode->i_flags |= S_ATTR_INEXACT;
++	} else if (fi->pfs_class != class) {
+ 		class = FUSE_PFS_CLASS_UNKNOWN;
++	}
+ 	spin_unlock(&fi->lock);
+ 	return class == FUSE_PFS_CLASS_UNKNOWN ? -EPROTO : 0;
+ }
+@@ -601,6 +589,8 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
  	struct inode *inode;
  	struct fuse_inode *fi;
  	struct fuse_conn *fc = get_fuse_conn_super(sb);
@@ -1352,7 +1443,7 @@ index c2ac021bf..9a91eafcd 100644
  
  	/*
  	 * Auto mount points get their node id from the submount root, which is
-@@ -635,6 +622,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+@@ -635,6 +625,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
  		return NULL;
  
  	if ((inode->i_state & I_NEW)) {
@@ -1360,7 +1451,7 @@ index c2ac021bf..9a91eafcd 100644
  		inode->i_flags |= S_NOATIME;
  		if (!fc->writeback_cache || !S_ISREG(attr->mode))
  			inode->i_flags |= S_NOCMTIME;
-@@ -665,8 +653,9 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+@@ -665,8 +656,9 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
  		iput(inode);
  		return NULL;
  	}
@@ -1372,12 +1463,20 @@ index c2ac021bf..9a91eafcd 100644
  		spin_lock(&fi->lock);
  		WARN_ON_ONCE(!fi->nlookup);
  		if (fi->nlookup)
+@@ -1520,6 +1512,7 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 					stack_depth = FILESYSTEM_MAX_STACK_DEPTH;
+ 					export_ops = NULL;
+ 					root_fi->pfs_class = FUSE_PFS_CLASS_SHARED;
++					root_fi->inode.i_flags |= S_ATTR_INEXACT;
+ 					fuse_init_dir(&root_fi->inode);
+ 				}
+ 			}
 diff --git a/fs/fuse/post_state.c b/fs/fuse/post_state.c
 new file mode 100644
-index 000000000..cf2fb9b70
+index 000000000..e965d9c7a
 --- /dev/null
 +++ b/fs/fuse/post_state.c
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,544 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* PortableFS exact post-state reply installation. */
 +
@@ -1606,7 +1705,7 @@ index 000000000..cf2fb9b70
 +{
 +	/* VFS i_flags represents and enforces only these statx attributes. */
 +	unsigned int preserved = inode->i_flags &
-+		~(S_IMMUTABLE | S_APPEND);
++		~(S_IMMUTABLE | S_APPEND | S_ATTR_INEXACT);
 +
 +	if (flags & STATX_ATTR_IMMUTABLE)
 +		preserved |= S_IMMUTABLE;
@@ -1632,7 +1731,21 @@ index 000000000..cf2fb9b70
 +	set_bit(FUSE_I_BTIME, &fi->state);
 +	fi->pfs_inode_flags = flags;
 +	pfs_install_statx_attributes(inode, flags);
-+	fi->pfs_attr_exact = true;
++}
++
++#define FUSE_PFS_STATX_ATTRIBUTES \
++	(STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND | STATX_ATTR_NODUMP | \
++	 STATX_ATTR_ENCRYPTED | STATX_ATTR_VERITY | STATX_ATTR_DAX)
++
++bool fuse_pfs_attr_is_exact(struct inode *inode)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	bool exact;
++
++	spin_lock(&fi->lock);
++	exact = IS_ATTR_EXACT(inode);
++	spin_unlock(&fi->lock);
++	return exact;
 +}
 +
 +int fuse_pfs_fill_exact_statx(struct inode *inode, struct kstat *stat)
@@ -1641,10 +1754,14 @@ index 000000000..cf2fb9b70
 +	int err = 0;
 +
 +	spin_lock(&fi->lock);
-+	if (!fi->pfs_attr_exact)
++	if (!IS_ATTR_EXACT(inode)) {
 +		err = -EAGAIN;
-+	else
++	} else {
++		stat->btime = fi->i_btime;
++		stat->result_mask |= STATX_BTIME;
 +		stat->attributes = fi->pfs_inode_flags;
++		stat->attributes_mask |= FUSE_PFS_STATX_ATTRIBUTES;
++	}
 +	spin_unlock(&fi->lock);
 +	return err;
 +}
@@ -1661,7 +1778,10 @@ index 000000000..cf2fb9b70
 +	    fuse_pfs_classify_attr(get_fuse_conn(inode), inode, attr))
 +		return -EPROTO;
 +	spin_lock(&fi->lock);
-+	if (stamp->object_version <= fi->pfs_object_version) {
++	if (stamp->object_version < fi->pfs_object_version ||
++	    (stamp->object_version == fi->pfs_object_version &&
++	     (IS_ATTR_EXACT(inode) ||
++	      stamp->object_version < fi->pfs_attr_repair_sequence))) {
 +		spin_unlock(&fi->lock);
 +		return 1;
 +	}
@@ -2084,6 +2204,79 @@ index 8e47c0a8a..8cd1ade35 100644
  
  	return err;
  }
+diff --git a/fs/namei.c b/fs/namei.c
+index ab50f1c96..a548d21da 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -516,12 +516,27 @@ static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
+ int inode_permission(struct mnt_idmap *idmap,
+ 		     struct inode *inode, int mask)
+ {
++	bool attr_checked = false;
+ 	int retval;
+ 
+ 	retval = sb_permission(inode->i_sb, inode, mask);
+ 	if (retval)
+ 		return retval;
+ 
++	/*
++	 * An inexact inode must reach its filesystem refresh gate before common
++	 * i_flags enforcement. IS_IMMUTABLE/IS_APPEND remain fail-closed for every
++	 * consumer which has no refresh path of its own.
++	 */
++	if (unlikely(!IS_ATTR_EXACT(inode))) {
++		retval = do_inode_permission(idmap, inode, mask);
++		if (retval)
++			return retval;
++		if (unlikely(!IS_ATTR_EXACT(inode)))
++			return -EAGAIN;
++		attr_checked = true;
++	}
++
+ 	if (unlikely(mask & MAY_WRITE)) {
+ 		/*
+ 		 * Nobody gets write access to an immutable file.
+@@ -538,9 +553,11 @@ int inode_permission(struct mnt_idmap *idmap,
+ 			return -EACCES;
+ 	}
+ 
+-	retval = do_inode_permission(idmap, inode, mask);
+-	if (retval)
+-		return retval;
++	if (!attr_checked) {
++		retval = do_inode_permission(idmap, inode, mask);
++		if (retval)
++			return retval;
++	}
+ 
+ 	retval = devcgroup_inode_permission(inode, mask);
+ 	if (retval)
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 2babc32d0..5dfdcd86f 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2292,6 +2292,7 @@ struct super_operations {
+ #define S_CASEFOLD	(1 << 15) /* Casefolded file */
+ #define S_VERITY	(1 << 16) /* Verity file (using fs/verity/) */
+ #define S_KERNEL_FILE	(1 << 17) /* File is in use by the kernel (eg. fs/cachefiles) */
++#define S_ATTR_INEXACT	(1 << 18) /* Attribute/enforcement state is unservable */
+ 
+ /*
+  * Note that nosuid etc flags are inode-specific: setting some file-system
+@@ -2319,8 +2320,11 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags
+ #define IS_I_VERSION(inode)	__IS_FLG(inode, SB_I_VERSION)
+ 
+ #define IS_NOQUOTA(inode)	((inode)->i_flags & S_NOQUOTA)
+-#define IS_APPEND(inode)	((inode)->i_flags & S_APPEND)
+-#define IS_IMMUTABLE(inode)	((inode)->i_flags & S_IMMUTABLE)
++#define IS_ATTR_EXACT(inode)	(!(READ_ONCE((inode)->i_flags) & S_ATTR_INEXACT))
++#define IS_APPEND(inode)	(READ_ONCE((inode)->i_flags) & \
++				 (S_APPEND | S_ATTR_INEXACT))
++#define IS_IMMUTABLE(inode)	(READ_ONCE((inode)->i_flags) & \
++				 (S_IMMUTABLE | S_ATTR_INEXACT))
+ 
+ #ifdef CONFIG_FS_POSIX_ACL
+ #define IS_POSIXACL(inode)	__IS_FLG(inode, SB_POSIXACL)
 diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
 index 9914a2ffd..ef2b716a8 100644
 --- a/include/uapi/linux/fuse.h

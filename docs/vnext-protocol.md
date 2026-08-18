@@ -614,9 +614,12 @@ PFS_ATTR takes the inode's `pfs_publish_mutex`, expires attrs and ACLs, clears
 the exact birth-time/statx-word validity and the projected IMMUTABLE/APPEND
 state, then under `fi->lock` increments `fi->attr_version` and sets
 `fi->pfs_object_version = max(fi->pfs_object_version,
-visibility_sequence)`. Until a strictly newer stamped attr installs all of
-those fields together, that inode's attributes and enforced flag state are
-unservable rather than inherited from the pre-repair snapshot. PFS_ENTRY takes
+visibility_sequence)`. Until an exact stamped attr at the repaired object
+version or a newer one installs all of those fields together, that inode's
+attributes and enforced flag state are unservable rather than inherited from
+the pre-repair snapshot. Equality is accepted only while recovering this
+inexact state; an already-exact equal record and every genuinely older record
+remain silent age drops. PFS_ENTRY takes
 the parent's `pfs_publish_mutex`,
 performs the expire or delete repair, calls
 `inode_maybe_inc_iversion(parent, false)`, and under the parent `fi->lock`
