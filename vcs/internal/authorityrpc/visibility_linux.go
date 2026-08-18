@@ -52,7 +52,9 @@ func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.Vis
 
 // stabilizeItem guards one read-path answer about an inode this session already
 // holds a capability for. The coordinate is known before anything is read, so
-// the reported wait carries no information the caller needs.
+// any reported race can unwind the callback before state is published. That
+// lets a pending PREPARE Ack, and the kernel retries the read against the state
+// which follows it.
 func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) error {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
@@ -62,7 +64,10 @@ func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.Sessi
 	if err != nil {
 		return err
 	}
-	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	waited, err := coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	if err == nil && waited {
+		return syscall.EAGAIN
+	}
 	return err
 }
 
@@ -75,7 +80,10 @@ func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.Sessi
 	if err != nil {
 		return err
 	}
-	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	waited, err := coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	if err == nil && waited {
+		return syscall.EAGAIN
+	}
 	return err
 }
 
