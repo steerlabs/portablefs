@@ -753,39 +753,29 @@ func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.Visibil
 		// an absence, because the kernel holds one dentry per name. Both are
 		// answers this kernel would keep serving after the mutation, so both
 		// are resolved here against the same target.
-		record := r.cachedNames[key]
-		if record == nil {
-			if _, absent := r.cachedNegatives[key]; !absent {
-				parent := r.directoryLocked(key.parent)
-				if parent == nil {
-					continue
-				}
-				coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: key.name}
-				candidate, found := r.newestFinalizedNameCandidateLocked(coordinate)
-				if !found {
-					continue
-				}
-				work := repair{parent: parent.id, name: key.name, negative: candidate.negative, sequence: sequence}
-				if candidate.record != nil {
-					work.child = candidate.record.id
-				}
-				completion.work = append(completion.work, work)
-				continue
-			}
-			parent := r.directoryLocked(key.parent)
-			r.dropCachedNegativeLocked(key)
-			if parent == nil {
-				continue
-			}
-			completion.work = append(completion.work, repair{parent: parent.id, name: key.name, negative: true, sequence: sequence})
-			continue
-		}
 		parent := r.directoryLocked(key.parent)
-		r.dropCachedNameLocked(key)
 		if parent == nil {
 			continue
 		}
-		completion.work = append(completion.work, repair{parent: parent.id, child: record.id, name: key.name, sequence: sequence})
+		work := repair{parent: parent.id, name: key.name, negative: true, sequence: sequence}
+		if record := r.cachedNames[key]; record != nil {
+			r.dropCachedNameLocked(key)
+			work.child, work.negative = record.id, false
+		} else if _, absent := r.cachedNegatives[key]; absent {
+			r.dropCachedNegativeLocked(key)
+		} else {
+			coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: key.name}
+			if candidate, found := r.newestFinalizedNameCandidateLocked(coordinate); found {
+				work.negative = candidate.negative
+				if candidate.record != nil {
+					work.child = candidate.record.id
+				}
+			}
+		}
+		// Parent sequence advancement is mandatory even when the daemon has no
+		// settled or in-flight answer for this name. The safe EXPIRE shape has
+		// child zero and exists precisely to stamp an absent dentry coordinate.
+		completion.work = append(completion.work, work)
 	}
 	for _, inode := range keys.inodes {
 		record := r.byInodeLocked(inode.inode)

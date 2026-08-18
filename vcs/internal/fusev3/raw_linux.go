@@ -1091,6 +1091,10 @@ func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublicati
 	for _, data := range publication.data {
 		r.settleDataPublicationLocked(data, successful)
 	}
+	// A successful original write can still be superseded before its merged
+	// PFS_PUBLISH receipt. Keep every candidate addressable until this terminal
+	// settlement; physical failure reaches the same point with successful=false.
+	r.releaseReplyReservationsLocked(publication)
 	if len(publication.names) != 0 || len(publication.attrs) != 0 || len(publication.data) != 0 {
 		close(r.published)
 		r.published = make(chan struct{})
@@ -1426,7 +1430,6 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	publication.originalWrote = true
 	publication.originalStatus = status
 	close(publication.originalDone)
-	r.releaseReplyReservationsLocked(publication)
 	// A same-mount source gate may be waiting for exactly this physical edge:
 	// once a negative reply is in the kernel's hands, its enclosing mutation may
 	// supersede it even though the merged post-VFS receipt is still outstanding.
