@@ -98,6 +98,35 @@ func validateMutationPostStateForOpcode(opcode uint32, state *authoritypb.PostSt
 	return nil
 }
 
+// removedPostStateIdentity returns the exact object an unlink/rmdir removed,
+// while also binding the response to the parent on which the operation ran.
+// A source mount is not required to have cached the name before mutating it;
+// in that case the authority's ordered post-state is the only exact identity
+// available after the successful operation.
+func removedPostStateIdentity(state *authoritypb.PostState, parent publicationIdentity) (publicationIdentity, error) {
+	if err := validateMutationPostStateForOpcode(10, state); err != nil {
+		return publicationIdentity{}, err
+	}
+	var removed publicationIdentity
+	parentFound := false
+	for _, object := range state.GetObjects() {
+		identity, ok := publicationIdentityFromBytes(object.GetStableIdentity())
+		if !ok {
+			return publicationIdentity{}, errors.New("fusev3: removal post-state carried an invalid stable identity")
+		}
+		switch object.GetRoles() {
+		case postStateRoleRemoved:
+			removed = identity
+		case postStateRoleParent:
+			parentFound = identity == parent
+		}
+	}
+	if removed == (publicationIdentity{}) || !parentFound {
+		return publicationIdentity{}, errors.New("fusev3: removal post-state did not match its source parent and removed object")
+	}
+	return removed, nil
+}
+
 func validateRenamePostStateRoles(got []uint32) bool {
 	const moved = postStateRoleSource | postStateRoleDestination
 	const exchanged = moved | postStateRoleExchanged

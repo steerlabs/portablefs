@@ -124,6 +124,7 @@ func newFakeRPC() *fakeRPC {
 		maxWriteTransaction: kernelMaxRWCount(),
 		readSequence:        1,
 		lease:               time.Minute,
+		missingNames:        make(map[string]bool),
 		done:                make(chan struct{}),
 		session:             []byte("test-mount-00001"),
 	}
@@ -468,6 +469,22 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 			item  *authoritypb.Item
 			roles uint32
 		}{target, postStateRoleTarget})}, nil
+	case request.GetUnlink() != nil:
+		unlink := request.GetUnlink()
+		removed := f.namedItem(unlink.GetName())
+		parent := f.itemForTokenLocked(unlink.GetParent())
+		delete(f.byName, string(unlink.GetName()))
+		f.missingNames[string(unlink.GetName())] = true
+		return &authoritypb.Response{PostState: exactTestPostState(2,
+			struct {
+				item  *authoritypb.Item
+				roles uint32
+			}{removed, postStateRoleRemoved},
+			struct {
+				item  *authoritypb.Item
+				roles uint32
+			}{parent, postStateRoleParent},
+		)}, nil
 	case request.GetRename() != nil:
 		rename := request.GetRename()
 		moved := f.itemForTokenLocked(nil)

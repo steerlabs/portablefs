@@ -705,6 +705,31 @@ func TestSelfUnlinkDropsTheBindingSoNoRepairIsAttempted(t *testing.T) {
 	}
 }
 
+func TestSelfUnlinkUsesExactPostStateAfterItsNameLifetimeExpires(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"doomed": testItem(73, authoritypb.Attr_REGULAR, 73)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "doomed")
+
+	// Model the real-kernel case in which path walk interned the inode but the
+	// binding was deliberately uncacheable (or its lifetime elapsed) before
+	// UNLINK acquired the source gate. The record must remain addressable for
+	// exact post-state installation even though there is no cached pre-binding.
+	f.raw.mu.Lock()
+	f.raw.dropCachedNameLocked(nameKey{parent: 1, name: "doomed"})
+	if f.raw.nodesByID[entry.NodeId] == nil {
+		f.raw.mu.Unlock()
+		t.Fatal("expired test binding lost its canonical inode record")
+	}
+	f.raw.mu.Unlock()
+
+	if status := f.unlink(fuse.FUSE_ROOT_ID, "doomed"); !status.Ok() {
+		t.Fatalf("UNLINK after the name lifetime expired = %v (fatal cause: %v)", status, f.mount.fatalError())
+	}
+	if f.mount.isRevoked() {
+		t.Fatalf("authority post-state did not close the uncached removal source lease: %v", f.mount.fatalError())
+	}
+}
+
 func TestSelfRenameMovesTheBindingInsteadOfLosingIt(t *testing.T) {
 	f := newStrictFixture(t)
 	f.lookup(t, fuse.FUSE_ROOT_ID, "before")

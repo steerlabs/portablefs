@@ -1946,19 +1946,11 @@ func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 	request.SourcePublicationGate = gate
-	_, errno := n.mutate(ctx, request)
+	response, errno := n.mutate(ctx, request)
 	if errno == 0 {
-		identity, _ := publicationIdentityFromItem(n.item)
-		namespace := publicationNamespace{parent: identity, name: name}
-		lease := sourceLeaseFromContext(ctx)
-		removed, ok := lease.preBinding(namespace)
-		if !ok || expectPostState(ctx,
-			expectedPostStateObject{identity: removed, roles: postStateRoleRemoved},
-			expectedPostStateObject{identity: identity, roles: postStateRoleParent},
-		) != nil {
+		if err := n.completeRemoval(ctx, name, response); err != nil {
 			return syscall.EIO
 		}
-		lease.resolveNoBinding(namespace)
 	}
 	return errno
 }
@@ -1970,21 +1962,40 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 	request.SourcePublicationGate = gate
-	_, errno := n.mutate(ctx, request)
+	response, errno := n.mutate(ctx, request)
 	if errno == 0 {
-		identity, _ := publicationIdentityFromItem(n.item)
-		namespace := publicationNamespace{parent: identity, name: name}
-		lease := sourceLeaseFromContext(ctx)
-		removed, ok := lease.preBinding(namespace)
-		if !ok || expectPostState(ctx,
-			expectedPostStateObject{identity: removed, roles: postStateRoleRemoved},
-			expectedPostStateObject{identity: identity, roles: postStateRoleParent},
-		) != nil {
+		if err := n.completeRemoval(ctx, name, response); err != nil {
 			return syscall.EIO
 		}
-		lease.resolveNoBinding(namespace)
 	}
 	return errno
+}
+
+func (n *node) completeRemoval(ctx context.Context, name string, response *authoritypb.Response) error {
+	parent, ok := publicationIdentityFromItem(n.item)
+	if !ok {
+		return errors.New("fusev3: removal source parent has an invalid stable identity")
+	}
+	removed, err := removedPostStateIdentity(response.GetPostState(), parent)
+	if err != nil {
+		return err
+	}
+	namespace := publicationNamespace{parent: parent, name: name}
+	lease := sourceLeaseFromContext(ctx)
+	if prior, known := lease.preBinding(namespace); known && prior != removed {
+		return errors.New("fusev3: removal post-state disagreed with the source mount's cached pre-binding")
+	}
+	if err := expectPostState(ctx,
+		expectedPostStateObject{identity: removed, roles: postStateRoleRemoved},
+		expectedPostStateObject{identity: parent, roles: postStateRoleParent},
+	); err != nil {
+		return err
+	}
+	// Convert the unresolved namespace wildcard into the exact removed object
+	// before the reply can install its final inode attributes. This retains the
+	// object coordinate through the post-VFS publication receipt even when the
+	// source never cached the name itself.
+	return lease.attachBinding(ctx, namespace, removed)
 }
 
 func (n *node) Rename(ctx context.Context, name string, parent *node, newName string, flags uint32) (bool, syscall.Errno) {
