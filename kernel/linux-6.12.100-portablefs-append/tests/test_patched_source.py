@@ -535,7 +535,9 @@ class PatchedSourceTests(unittest.TestCase):
             request.index("if (!ret && args->out_argvar)"):
             request.index("if (fc->pfs_strict_coherence", request.index("if (!ret && args->out_argvar)"))
         ]
-        self.assertIn("if (!args->pfs_post_state)", variable)
+        self.assertIn(
+            "if (!args->pfs_post_state && !args->pfs_cache_stamp)", variable
+        )
         self.assertIn("ret = args->out_args[args->out_numargs - 1].size", variable)
 
     def test_post_state_inode_flags_are_masked_statx_attributes(self) -> None:
@@ -642,6 +644,31 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("if (err == -ENOENT)", lookup)
         self.assertIn("fuse_abort_conn(fm->fc)", lookup)
         self.assertIn("fuse_pfs_install_lookup(parent, NULL", lookup)
+        self.assertIn("fuse_pfs_local_negative(&args, outarg)", lookup)
+        self.assertIn("args.out_argvar = true", lookup)
+        self.assertIn("args.pfs_cache_stamp = true", lookup)
+
+        local_shape = directory[
+            directory.index("static bool fuse_pfs_local_negative"):
+            directory.index("static int fuse_dentry_revalidate")
+        ]
+        self.assertIn("expected.attr.flags = FUSE_ATTR_PFS_LOCAL", local_shape)
+        self.assertIn("!memcmp(outarg, &expected, sizeof(expected))", local_shape)
+        local_unstamped = directory[
+            directory.index("static bool fuse_pfs_local_lookup_has_no_stamp"):
+            directory.index("static bool fuse_pfs_local_negative")
+        ]
+        self.assertIn("!args->out_args[1].size", local_unstamped)
+        self.assertIn("!args->pfs_reply_marked", local_unstamped)
+
+        dev = self.source("fs/fuse/dev.c")
+        request = dev[
+            dev.index("ssize_t __fuse_simple_request"):
+            dev.index("static bool fuse_request_queue_background")
+        ]
+        self.assertIn(
+            "if (!args->pfs_post_state && !args->pfs_cache_stamp)", request
+        )
 
     def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
         text = self.source("fs/fuse/inode.c")
