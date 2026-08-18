@@ -1,4 +1,4 @@
-From 37f76375d5f9d14bfe1071dd64d7baeb158b4ea0 Mon Sep 17 00:00:00 2001
+From 5c6480825c784d2de7b9925b6c3f9c06288c54c1 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -11,12 +11,12 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/fuse/dir.c             | 544 +++++++++++++++++++++++++++++-----
  fs/fuse/file.c            | 122 +++++---
  fs/fuse/fuse_i.h          |  51 +++-
- fs/fuse/inode.c           |  69 ++---
+ fs/fuse/inode.c           |  75 ++---
  fs/fuse/post_state.c      | 607 ++++++++++++++++++++++++++++++++++++++
  fs/fuse/readdir.c         | 104 ++++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  71 ++++-
- 10 files changed, 1540 insertions(+), 192 deletions(-)
+ 10 files changed, 1545 insertions(+), 193 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -1548,7 +1548,7 @@ index 0ba881cdf..dfd83f7ff 100644
  /**
   * Invalidate inode attributes
 diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
-index c2ac021bf..5914e95bd 100644
+index c2ac021bf..1878ae76e 100644
 --- a/fs/fuse/inode.c
 +++ b/fs/fuse/inode.c
 @@ -212,7 +212,6 @@ void fuse_change_attributes_common(struct inode *inode, struct fuse_attr *attr,
@@ -1706,6 +1706,22 @@ index c2ac021bf..5914e95bd 100644
  	if (err) {
  		if (err == -ENOENT)
  			return ERR_PTR(-ESTALE);
+@@ -1490,10 +1471,14 @@ static void process_init_reply(struct fuse_mount *fm, struct fuse_args *args,
+ 				    !(flags & FUSE_FLOCK_LOCKS) ||
+ 				    fc->no_lock || fc->no_flock ||
+ 				    fc->iq.ops != &fuse_dev_fiq_ops ||
++				    /*
++				     * Explicit READDIRPLUS carries private stamped
++				     * records.  Automatic selection remains outside
++				     * the strict publication contract.
++				     */
+ 				    (flags & (FUSE_EXPORT_SUPPORT | FUSE_SUBMOUNTS |
+ 					      FUSE_NO_OPEN_SUPPORT |
+ 					      FUSE_NO_OPENDIR_SUPPORT |
+-					      FUSE_DO_READDIRPLUS |
+ 					      FUSE_READDIRPLUS_AUTO |
+ 					      FUSE_POSIX_ACL |
+ 					      FUSE_PASSTHROUGH |
 diff --git a/fs/fuse/post_state.c b/fs/fuse/post_state.c
 new file mode 100644
 index 000000000..cc8739615

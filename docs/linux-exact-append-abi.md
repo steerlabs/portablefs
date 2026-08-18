@@ -46,14 +46,15 @@ SHARED open flags or the write shape after the mount is live. The kernel accepts
 the profile only when all of the following are true:
 
 - all three private capability bits are returned;
-- the returned protocol version is exactly 7.41;
+- the returned protocol version is exactly 7.42;
 - the mount uses `default_permissions`;
 - `FUSE_ATOMIC_O_TRUNC`, `FUSE_HANDLE_KILLPRIV_V2`, `FUSE_POSIX_LOCKS`, and
   `FUSE_FLOCK_LOCKS` are returned;
 - transport is `/dev/fuse`, not virtio-fs;
 - `FUSE_WRITEBACK_CACHE`, `FUSE_DIRECT_IO_ALLOW_MMAP`, inode DAX, export
-  support, submounts, zero-message OPEN/OPENDIR, READDIRPLUS, passthrough, and
-  RESEND are absent; and
+  support, submounts, zero-message OPEN/OPENDIR, automatic READDIRPLUS,
+  passthrough, and RESEND are absent. Explicit READDIRPLUS is admitted because
+  its strict records carry exact cache stamps and join generic PUBLISH; and
 - `FUSE_POSIX_ACL` is absent.  ACL caching happens outside the inner GETXATTR
   reply boundary and therefore requires a future dedicated post-cache
   publication hook before it can be admitted safely; and
@@ -635,7 +636,9 @@ Current deliberate kernel-boundary decisions are:
 - LSEEK: pre-dispatch EOPNOTSUPP;
 - POLL/epoll on regular files: local `DEFAULT_POLLMASK`, no request;
 - ACCESS: handled by required `default_permissions`;
-- STATX and READDIRPLUS: invariant-unreachable in strict mode;
+- STATX: invariant-unreachable in strict mode;
+- READDIRPLUS: explicit stamped records only; automatic selection remains
+  disabled;
 - SETXATTR and SHARED ioctl/fileattr mutation: pre-dispatch EOPNOTSUPP;
 - SYNCFS: mandatory real opcode 50; ordinary durability errno propagates,
   ENOSYS/protocol/transport failure fences.

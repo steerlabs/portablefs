@@ -829,6 +829,23 @@ class PatchedSourceTests(unittest.TestCase):
                           text.index("void fuse_send_init")]
         self.assertIn("fm->sb->s_bdi->ra_pages = ra_pages;", init_reply)
 
+    def test_strict_init_admits_only_stamped_explicit_readdirplus(self) -> None:
+        text = self.source("fs/fuse/inode.c")
+        start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")
+        end = text.index("if (arg->minor >= 9", start)
+        admission = text[start:end]
+        self.assertNotIn("FUSE_DO_READDIRPLUS", admission)
+        self.assertIn("FUSE_READDIRPLUS_AUTO", admission)
+
+        readdir = self.source("fs/fuse/readdir.c")
+        strict = readdir[
+            readdir.index("static int parse_pfs_dirplusfile"):
+            readdir.index("static int fuse_readdir_uncached")
+        ]
+        self.assertIn("struct fuse_pfs_direntplus", strict)
+        self.assertIn("fuse_direntplus_link", strict)
+        self.assertIn("fuse_pfs_forget_dirplus_tail", strict)
+
     def test_shared_opendir_forbids_persistent_directory_cache(self) -> None:
         text = self.source("fs/fuse/file.c")
         start = text.index("int fuse_pfs_validate_open")
