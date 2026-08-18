@@ -285,7 +285,7 @@ func (r *rawFileSystem) writeOneShot(input *fuse.PFSWriteIn, data []byte, out *f
 		fillOneShotWriteOut(out, reply)
 		return fuse.OK
 	}
-	postAttr := response.GetPostAttr()
+	postAttr := responsePostAttr(response, postStateRoleTarget)
 	if postAttr == nil || postAttr.GetKind() != authoritypb.Attr_REGULAR ||
 		postAttr.GetInode() != handleRecord.inode.key.inode || postAttr.GetSize() < 0 ||
 		uint64(postAttr.GetSize()) != reply.GetPostSize() || reply.GetPostSize() > input.FileMaxSize {
@@ -319,6 +319,10 @@ func (r *rawFileSystem) writeOneShot(input *fuse.PFSWriteIn, data []byte, out *f
 	}
 	if invalidResult {
 		r.mount.revoke(errors.New("fusev3: one-shot write violated its position or post-size geometry"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := expectPostStateRecord(ctx, handleRecord.inode, postStateRoleTarget); err != nil {
+		r.mount.revoke(err)
 		return fuse.Status(syscall.ENOTCONN)
 	}
 	if err := completeSourcePublication(ctx); err != nil {
@@ -562,7 +566,7 @@ func (r *rawFileSystem) writeTransactionCommit(input *fuse.PFSWriteIn, out *fuse
 		fillWriteTransactionOut(out, input.Txid, reply)
 		return fuse.OK
 	}
-	postAttr := response.GetPostAttr()
+	postAttr := responsePostAttr(response, postStateRoleTarget)
 	if postAttr == nil || postAttr.GetKind() != authoritypb.Attr_REGULAR ||
 		postAttr.GetInode() != tx.handleRecord.inode.key.inode || postAttr.GetSize() < 0 ||
 		uint64(postAttr.GetSize()) != reply.GetPostSize() || reply.GetPostSize() > tx.fileMaxSize {
@@ -596,6 +600,10 @@ func (r *rawFileSystem) writeTransactionCommit(input *fuse.PFSWriteIn, out *fuse
 	}
 	if invalidResult {
 		r.mount.revoke(errors.New("fusev3: write COMMIT result violated its staged position or maximum range"))
+		return fuse.Status(syscall.ENOTCONN)
+	}
+	if err := expectPostStateRecord(ctx, tx.handleRecord.inode, postStateRoleTarget); err != nil {
+		r.mount.revoke(err)
 		return fuse.Status(syscall.ENOTCONN)
 	}
 	r.writeMu.Lock()

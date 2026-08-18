@@ -22,7 +22,7 @@ class PatchedSourceTests(unittest.TestCase):
     def source(self, name: str) -> str:
         return (self.tree / name).read_text()
 
-    def test_strict_init_is_exact_741_and_indivisible(self) -> None:
+    def test_strict_init_is_exact_742_and_indivisible(self) -> None:
         text = self.source("fs/fuse/inode.c")
         needle = "arg->minor != FUSE_KERNEL_MINOR_VERSION"
         self.assertIn(needle, text)
@@ -86,10 +86,9 @@ class PatchedSourceTests(unittest.TestCase):
         dispatch = notify.index("switch (code)")
         self.assertLess(gate, dispatch)
         for allowed in (
-            "FUSE_NOTIFY_INVAL_INODE",
-            "FUSE_NOTIFY_INVAL_ENTRY",
-            "FUSE_NOTIFY_DELETE",
             "FUSE_NOTIFY_PFS_SIZE",
+            "FUSE_NOTIFY_PFS_ATTR",
+            "FUSE_NOTIFY_PFS_ENTRY",
         ):
             self.assertIn(f"code != {allowed}", notify[:dispatch])
         self.assertIn("fuse_copy_finish(cs)", notify[gate:dispatch])
@@ -102,116 +101,82 @@ class PatchedSourceTests(unittest.TestCase):
         ):
             self.assertGreater(notify.index(forbidden_handler), dispatch)
 
-    def test_strict_stock_reverse_repairs_validate_shape_and_class_first(
+    def test_strict_stamped_reverse_repairs_validate_before_mutation(
         self,
     ) -> None:
         text = self.source("fs/fuse/dev.c")
         target = text[
             text.index("static struct inode *fuse_pfs_notify_target"):
-            text.index("static int fuse_notify_inval_inode")
+            text.index("static int fuse_notify_pfs_size")
         ]
         self.assertIn("FUSE_PFS_CLASS_SHARED", target)
         self.assertIn("require_dir && !S_ISDIR", target)
 
         name_validator = text[
             text.index("static bool fuse_pfs_notify_name_valid"):
-            text.index("static int fuse_notify_inval_inode")
+            text.index("static int fuse_notify_pfs_size")
         ]
         self.assertIn("memchr(name, '\\0', len)", name_validator)
         self.assertIn("memchr(name, '/', len)", name_validator)
         self.assertIn("name[0] == '.'", name_validator)
 
-        inode_repair = text[
-            text.index("static int fuse_pfs_reverse_inval_inode"):
-            text.index("static int fuse_pfs_reverse_inval_entry")
-        ]
-        self.assertLess(
-            inode_repair.index("fuse_pfs_notify_target"),
-            inode_repair.index("fuse_reverse_inval_inode"),
-        )
-        entry_repair = text[
-            text.index("static int fuse_pfs_reverse_inval_entry"):
-            text.index("static int fuse_notify_inval_inode")
-        ]
-        self.assertLess(
-            entry_repair.index("fuse_pfs_notify_target"),
-            entry_repair.index("fuse_reverse_inval_entry"),
-        )
-
-        inode = text[
-            text.index("static int fuse_notify_inval_inode"):
-            text.index("static int fuse_notify_pfs_size")
-        ]
-        shape = inode.index("!outarg.ino || outarg.len != 0 ||")
-        self.assertIn(
-            "(outarg.off != -1 && outarg.off != 0)",
-            inode[shape:],
-        )
-        repair = inode.index("fuse_pfs_reverse_inval_inode")
-        self.assertLess(shape, repair)
-        self.assertIn("fuse_abort_conn(fc)", inode)
-
-        withdrawal = inode_repair.index("if (off == 0 && len == 0)")
-        self.assertLess(withdrawal, inode_repair.index("fuse_reverse_inval_inode"))
-        self.assertIn("fuse_pfs_withdraw_data(target)", inode_repair[withdrawal:])
-
-        entry = text[
-            text.index("static int fuse_notify_inval_entry"):
-            text.index("static int fuse_notify_delete")
-        ]
-        self.assertLess(
-            entry.index("outarg.flags"),
-            entry.index("fuse_pfs_reverse_inval_entry"),
-        )
-        self.assertLess(
-            entry.index("!outarg.parent"),
-            entry.index("fuse_pfs_reverse_inval_entry"),
-        )
-        self.assertLess(
-            entry.index("fuse_pfs_notify_name_valid"),
-            entry.index("fuse_pfs_reverse_inval_entry"),
-        )
-        self.assertIn("fuse_abort_conn(fc)", entry)
-
-        delete = text[
-            text.index("static int fuse_notify_delete"):
-            text.index("static int fuse_notify_store")
-        ]
-        self.assertIn("outarg.padding", delete)
-        self.assertIn("!outarg.parent || !outarg.child", delete)
-        self.assertIn("fuse_pfs_notify_name_valid", delete)
-        self.assertIn("fuse_pfs_reverse_inval_entry", delete)
-        self.assertIn("fuse_abort_conn(fc)", delete)
-
         pfs_size = text[
             text.index("static int fuse_notify_pfs_size"):
-            text.index("static int fuse_notify_inval_entry")
+            text.index("static int fuse_notify_pfs_attr")
         ]
         for proof in (
-            "!outarg.nodeid",
-            "!outarg.sequence",
-            "outarg.sequence > S64_MAX",
-            "outarg.size > S64_MAX",
+            "!outarg.object.nodeid",
+            "!outarg.visibility_sequence",
+            "outarg.visibility_sequence > S64_MAX",
         ):
             self.assertIn(proof, pfs_size)
         self.assertLess(
-            pfs_size.index("!outarg.nodeid"),
+            pfs_size.index("!outarg.object.nodeid"),
             pfs_size.index("fuse_ilookup"),
+        )
+        self.assertIn("fuse_pfs_update_size_locked(inode, &outarg.object",
+                      pfs_size)
+
+        pfs_attr = text[
+            text.index("static int fuse_notify_pfs_attr"):
+            text.index("static int fuse_notify_pfs_entry")
+        ]
+        self.assertLess(
+            pfs_attr.index("!outarg.object.nodeid"),
+            pfs_attr.index("fuse_pfs_notify_target"),
+        )
+        self.assertIn("fuse_pfs_install_repair_attr_locked(inode", pfs_attr)
+        self.assertNotIn("fuse_invalidate_attr", pfs_attr)
+
+        pfs_entry = text[
+            text.index("static int fuse_notify_pfs_entry"):
+            text.index("static int fuse_notify_inval_entry")
+        ]
+        self.assertLess(
+            pfs_entry.index("!outarg.parent"),
+            pfs_entry.index("fuse_pfs_reverse_entry"),
+        )
+        self.assertLess(
+            pfs_entry.index("fuse_pfs_notify_name_valid"),
+            pfs_entry.index("fuse_pfs_reverse_entry"),
         )
 
         directory = self.source("fs/fuse/dir.c")
-        start = directory.index("static int fuse_pfs_reverse_expire_entry")
+        start = directory.index("int fuse_pfs_reverse_entry")
         end = directory.index("int fuse_reverse_inval_entry", start)
         repair = directory[start:end]
         lookup = repair.index("entry = d_lookup")
         child_class = repair.index("FUSE_PFS_CLASS_SHARED", lookup)
         child_identity = repair.index("get_node_id(child)", lookup)
-        first_mutation = repair.index("fuse_dir_changed(parent)", lookup)
+        first_mutation = repair.index("fuse_invalidate_entry_cache(entry)", lookup)
         self.assertLess(child_class, first_mutation)
         self.assertLess(child_identity, first_mutation)
         self.assertIn("err = -EPROTO", repair[lookup:first_mutation])
         self.assertIn("fuse_invalidate_entry_cache(entry)", repair)
         self.assertIn("fsnotify_name", repair)
+        self.assertIn("parent_fi->pfs_entry_repair_sequence", repair)
+        self.assertNotIn("parent_fi->pfs_object_version", repair)
+        self.assertNotIn("parent_fi->attr_version", repair)
         for forbidden in (
             "inode_lock",
             "d_invalidate",
@@ -220,17 +185,13 @@ class PatchedSourceTests(unittest.TestCase):
             "dont_mount",
         ):
             self.assertNotIn(forbidden, repair)
-
-        stock_start = directory.index("int fuse_reverse_inval_entry", end)
-        stock_end = directory.index(
-            "static inline bool fuse_permissible_uidgid", stock_start
+        all_fuse = "\n".join(
+            self.source(path) for path in (
+                "fs/fuse/dev.c", "fs/fuse/dir.c", "fs/fuse/fuse_i.h",
+                "fs/fuse/post_state.c",
+            )
         )
-        stock = directory[stock_start:stock_end]
-        self.assertLess(
-            stock.index("if (fc->pfs_strict_coherence)"),
-            stock.index("inode_lock_nested(parent"),
-        )
-        self.assertIn("fuse_pfs_reverse_expire_entry", stock)
+        self.assertNotIn("pfs_repairing", all_fuse)
 
     def test_strict_init_forbids_posix_acl_cache_without_publication(self) -> None:
         text = self.source("fs/fuse/inode.c")
@@ -489,7 +450,7 @@ class PatchedSourceTests(unittest.TestCase):
     ) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("int fuse_pfs_update_size_locked")
-        end = text.index("int fuse_pfs_update_size(", start)
+        end = text.index("int fuse_pfs_withdraw_data", start)
         publish = text[start:end]
         # Ordering is by sequence only. A same-length overwrite carries a
         # strictly greater sequence and therefore reaches the invalidation;
@@ -513,7 +474,7 @@ class PatchedSourceTests(unittest.TestCase):
     ) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("int fuse_pfs_withdraw_data")
-        end = text.index("int fuse_pfs_update_source_size", start)
+        end = text.index("static void fuse_init_submount_lookup", start)
         withdraw = text[start:end]
         self.assertIn("fi->pfs_class != FUSE_PFS_CLASS_SHARED", withdraw)
         self.assertLess(
@@ -536,6 +497,289 @@ class PatchedSourceTests(unittest.TestCase):
             notify.index("fuse_pfs_withdraw_data(target)"),
         )
         self.assertIn("fuse_reverse_inval_inode(fc, nodeid, off, len)", notify)
+
+    def test_post_state_installer_snapshots_before_stores_and_invalidates_range(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/post_state.c")
+        start = text.index("int fuse_pfs_install_post_state")
+        installer = text[start:]
+        snapshot = installer.index("NEW-A: this loop is the complete step-3 snapshot")
+        compare = installer.index("records[i].install_attr", snapshot)
+        first_store = installer.index("fuse_change_attributes_common", compare)
+        self.assertLess(snapshot, compare)
+        self.assertLess(compare, first_store)
+        self.assertNotIn("fuse_change_attributes_common", installer[snapshot:compare])
+        self.assertLess(
+            installer.index("state->header.snapshot_sequence <= parent_prior", compare),
+            first_store,
+        )
+        self.assertIn("invalidate_inode_pages2_range", installer)
+        self.assertIn("unmap_mapping_pages", installer)
+        self.assertNotIn("truncate_pagecache", installer)
+        self.assertNotIn("invalidate_inode_pages2(data_inode->i_mapping)", installer)
+        self.assertLess(
+            installer.index("fi->attr_version =", first_store),
+            installer.index("fi->pfs_object_version =", first_store),
+        )
+
+    def test_entry_and_attr_repairs_use_distinct_publication_gates(self) -> None:
+        post_state = self.source("fs/fuse/post_state.c")
+        lookup = post_state[
+            post_state.index("int fuse_pfs_install_lookup"):
+            post_state.index("int fuse_pfs_install_getattr")
+        ]
+        self.assertIn("parent_prior = max(parent_fi->pfs_object_version,",
+                      lookup)
+        self.assertIn("parent_fi->pfs_entry_repair_sequence", lookup)
+
+        installer = post_state[post_state.index("int fuse_pfs_install_post_state"):]
+        snapshot = installer[
+            installer.index("NEW-A: this loop is the complete step-3 snapshot"):
+            installer.index("if (entry_parent) {", installer.index(
+                "NEW-A: this loop is the complete step-3 snapshot"))
+        ]
+        self.assertIn("parent_prior = max(records[i].prior_version,", snapshot)
+        self.assertIn("fi->pfs_entry_repair_sequence", snapshot)
+
+        directory = self.source("fs/fuse/dir.c")
+        entry = directory[
+            directory.index("int fuse_pfs_reverse_entry"):
+            directory.index("int fuse_reverse_inval_entry")
+        ]
+        self.assertIn("parent_fi->pfs_entry_repair_sequence", entry)
+        self.assertNotIn("parent_fi->pfs_object_version", entry)
+        self.assertNotIn("parent_fi->attr_version", entry)
+
+    def test_exact_attr_validity_is_release_published_last(self) -> None:
+        inode = self.source("fs/fuse/inode.c")
+        common = inode[
+            inode.index("void fuse_change_attributes_common"):
+            inode.index("u32 fuse_get_cache_mask")
+        ]
+        self.assertGreater(
+            common.index("smp_store_release(&fi->i_time, attr_valid)"),
+            common.index("inode->i_flags &= ~S_NOSEC"),
+        )
+
+        post_state = self.source("fs/fuse/post_state.c")
+        for start, end in (
+            ("static int pfs_install_stamped_attr",
+             "int fuse_pfs_install_repair_attr_locked"),
+            ("int fuse_pfs_install_repair_attr_locked",
+             "int fuse_pfs_install_lookup"),
+            ("int fuse_pfs_install_post_state", None),
+        ):
+            install = post_state[
+                post_state.index(start):
+                post_state.index(end, post_state.index(start)) if end else None
+            ]
+            self.assertIn("fuse_change_attributes_common", install)
+            self.assertGreater(
+                install.index("smp_store_release(&fi->i_time"),
+                install.index("fi->pfs_object_version ="),
+            )
+
+        directory = self.source("fs/fuse/dir.c")
+        self.assertEqual(directory.count("smp_load_acquire(&fi->i_time)"), 2)
+        self.assertNotIn("time_before64(fi->i_time", directory)
+
+    def test_post_state_variable_length_is_not_a_vfs_result(self) -> None:
+        post_state = self.source("fs/fuse/post_state.c")
+        args = post_state[
+            post_state.index("void fuse_pfs_post_state_args"):
+            post_state.index("static struct inode *pfs_find_inode")
+        ]
+        self.assertIn("args->out_argvar = true", args)
+        self.assertIn("args->pfs_post_state = true", args)
+
+        dev = self.source("fs/fuse/dev.c")
+        request = dev[
+            dev.index("ssize_t __fuse_simple_request"):
+            dev.index("static bool fuse_request_queue_background")
+        ]
+        variable = request[
+            request.index("if (!ret && args->out_argvar)"):
+            request.index("if (fc->pfs_strict_coherence", request.index("if (!ret && args->out_argvar)"))
+        ]
+        self.assertIn(
+            "if (!args->pfs_post_state && !args->pfs_cache_stamp)", variable
+        )
+        self.assertIn("ret = args->out_args[args->out_numargs - 1].size", variable)
+
+    def test_post_state_inode_flags_are_masked_statx_attributes(self) -> None:
+        text = self.source("fs/fuse/post_state.c")
+        start = text.index("static void pfs_install_statx_attributes")
+        end = text.index("static int pfs_install_stamped_attr", start)
+        install = text[start:end]
+        self.assertIn("STATX_ATTR_IMMUTABLE", install)
+        self.assertIn("STATX_ATTR_APPEND", install)
+        self.assertNotIn("FS_IMMUTABLE_FL", install)
+        self.assertNotIn("FS_APPEND_FL", install)
+        self.assertNotIn("S_ATTR_INEXACT", install)
+
+        stamped = text[
+            text.index("static int pfs_install_stamped_attr"):
+            text.index("int fuse_pfs_install_repair_attr_locked")
+        ]
+        self.assertIn("stamp->birth_time_ns", stamped)
+        self.assertIn("stamp->inode_flags", stamped)
+        self.assertIn("stamp->object_version <= fi->pfs_object_version", stamped)
+
+        repair = text[
+            text.index("int fuse_pfs_install_repair_attr_locked"):
+            text.index("int fuse_pfs_install_lookup")
+        ]
+        for source in (
+            "object->object_version > visibility_sequence",
+            "object->attr.flags != FUSE_ATTR_PFS_SHARED",
+            "pfs_install_exact_attr_locked",
+            "fuse_change_attributes_common",
+            "fi->attr_version = atomic64_inc_return",
+            "fi->pfs_object_version = object->object_version",
+        ):
+            self.assertIn(source, repair)
+        self.assertNotIn("fuse_invalidate_attr", repair)
+
+        fill_start = text.index("int fuse_pfs_fill_exact_statx")
+        fill_end = text.index("static int pfs_install_stamped_attr", fill_start)
+        fill = text[fill_start:fill_end]
+        for source in (
+            "stat->btime = fi->i_btime",
+            "stat->result_mask |= STATX_BTIME",
+            "stat->attributes = fi->pfs_inode_flags",
+            "stat->attributes_mask |= FUSE_PFS_STATX_ATTRIBUTES",
+        ):
+            self.assertIn(source, fill)
+        self.assertNotIn("EAGAIN", fill)
+
+        directory = self.source("fs/fuse/dir.c")
+        getattr = directory[
+            directory.index("static int fuse_update_get_attr"):
+            directory.index("int fuse_update_attributes")
+        ]
+        self.assertIn("fuse_pfs_fill_exact_statx(inode, stat)", getattr)
+
+        all_sources = "\n".join(
+            self.source(path) for path in (
+                "fs/attr.c", "fs/exec.c", "fs/fcntl.c", "fs/inode.c",
+                "fs/ioctl.c", "fs/locks.c", "fs/namei.c", "fs/open.c",
+                "fs/read_write.c", "fs/remap_range.c", "fs/xattr.c",
+                "include/linux/fs.h", "mm/mmap.c", "fs/fuse/dir.c",
+                "fs/fuse/inode.c", "fs/fuse/post_state.c",
+            )
+        )
+        for forbidden in (
+            "S_ATTR_INEXACT", "attr_repair_sequence",
+            "begin_attr_exact", "end_attr_exact",
+            "refresh_attr_exact", "permission_attr_exact",
+            "fuse_pfs_attr_is_exact",
+        ):
+            self.assertNotIn(forbidden, all_sources)
+
+    def test_existing_create_and_negative_lookup_have_distinct_exact_shapes(
+        self,
+    ) -> None:
+        post_state = self.source("fs/fuse/post_state.c")
+        roles = post_state[
+            post_state.index("static bool pfs_valid_roles"):
+            post_state.index("void fuse_pfs_post_state_args")
+        ]
+        self.assertIn(
+            "static const u32 existing[] = { PFS_ROLE_TARGET, PFS_ROLE_PARENT }",
+            roles,
+        )
+        self.assertIn("fuse_pfs_existing_create", roles)
+
+        directory = self.source("fs/fuse/dir.c")
+        create = directory[
+            directory.index("static int fuse_create_open"):
+            directory.index("static int fuse_mknod")
+        ]
+        self.assertIn("fuse_pfs_existing_create(&post_state)", create)
+        self.assertIn("ARRAY_SIZE(inodes)", create)
+        self.assertNotIn("post_state.header.object_count == 1", create)
+
+        lookup = directory[
+            directory.index("int fuse_lookup_name"):
+            directory.index("static struct dentry *fuse_lookup")
+        ]
+        self.assertIn("err == -ENOENT", lookup)
+        self.assertIn("fuse_abort_conn(fm->fc)", lookup)
+        self.assertIn("fuse_pfs_install_lookup(parent, NULL", lookup)
+        self.assertIn("fuse_pfs_classify_lookup_result(fm, &args, outarg)", lookup)
+        self.assertIn("args.out_argvar = true", lookup)
+        self.assertIn("args.pfs_cache_stamp = true", lookup)
+
+        local_shape = directory[
+            directory.index("enum fuse_pfs_lookup_shape"):
+            directory.index("static int fuse_dentry_revalidate")
+        ]
+        for shape in (
+            "FUSE_PFS_LOOKUP_LOCAL_NEGATIVE",
+            "FUSE_PFS_LOOKUP_SHARED_NEGATIVE",
+            "FUSE_PFS_LOOKUP_LOCAL_POSITIVE",
+            "FUSE_PFS_LOOKUP_SHARED_POSITIVE",
+        ):
+            self.assertIn(shape, local_shape)
+        self.assertIn("expected.attr.flags = FUSE_ATTR_PFS_LOCAL", local_shape)
+        self.assertIn("!memcmp(outarg, &expected, sizeof(expected))", local_shape)
+        self.assertNotIn("fuse_pfs_lookup_has_stamp", local_shape)
+        self.assertIn("args->out_numargs != 2", local_shape)
+        self.assertIn("stamp_size = args->out_args[1].size", local_shape)
+        self.assertIn("rule->stamp_size != stamp_size", local_shape)
+        for exact_size in (
+            ".stamp_size = 0",
+            ".stamp_size = sizeof(struct fuse_pfs_cache_stamp)",
+        ):
+            self.assertIn(exact_size, local_shape)
+        self.assertIn("rule->marked != args->pfs_reply_marked", local_shape)
+
+        stamped = self.source("fs/fuse/post_state.c")
+        negative = stamped[
+            stamped.index("int fuse_pfs_install_lookup"):
+            stamped.index("int fuse_pfs_install_getattr")
+        ]
+        self.assertIn("memcmp(&entry->attr, &empty_attr", negative)
+
+        dev = self.source("fs/fuse/dev.c")
+        request = dev[
+            dev.index("ssize_t __fuse_simple_request"):
+            dev.index("static bool fuse_request_queue_background")
+        ]
+        self.assertIn(
+            "if (!args->pfs_post_state && !args->pfs_cache_stamp)", request
+        )
+
+    def test_marked_readdirplus_failure_drains_unlinked_lookup_ownership(
+        self,
+    ) -> None:
+        readdir = self.source("fs/fuse/readdir.c")
+        helper = readdir[
+            readdir.index("static void fuse_pfs_forget_dirplus_tail"):
+            readdir.index("static int parse_dirplusfile")
+        ]
+        self.assertIn("while (nbytes >= FUSE_NAME_OFFSET_PFS_DIRENTPLUS)", helper)
+        self.assertIn("fuse_force_forget(file, record->entry_out.nodeid)", helper)
+
+        stock = readdir[
+            readdir.index("static int parse_dirplusfile"):
+            readdir.index("static int parse_pfs_dirplusfile")
+        ]
+        self.assertNotIn("fuse_pfs_forget_dirplus_tail", stock)
+
+        strict = readdir[
+            readdir.index("static int parse_pfs_dirplusfile"):
+            readdir.index("static int fuse_readdir_uncached")
+        ]
+        link_failure = strict.index("if (ret) {")
+        forget_failed = strict.index("fuse_force_forget", link_failure)
+        drain_tail = strict.index("fuse_pfs_forget_dirplus_tail", forget_failed)
+        abort = strict.index("fuse_abort_conn", drain_tail)
+        return_failure = strict.index("return -ENOTCONN", abort)
+        self.assertLess(forget_failed, drain_tail)
+        self.assertLess(drain_tail, abort)
+        self.assertLess(abort, return_failure)
 
     def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
         text = self.source("fs/fuse/inode.c")
@@ -594,8 +838,11 @@ class PatchedSourceTests(unittest.TestCase):
                      text.index("static ssize_t fuse_pfs_write_one_shot")]
         self.assertIn("!out->committed_size &&", write)
         self.assertIn("out->assigned_offset", write)
-        self.assertIn("if (!err && out->committed_size)", write)
         self.assertIn("if (out->committed_size) {", write)
+        request = text[text.index("static int fuse_pfs_write_control"):
+                       text.index("static void fuse_pfs_write_abort")]
+        self.assertIn("if (committed) {", request)
+        self.assertIn("fuse_pfs_install_post_state", request)
         copy_range = text[text.index("static ssize_t fuse_pfs_copy_file_range"):
                           text.index("static ssize_t fuse_copy_file_range")]
         self.assertIn("!out.result_size &&", copy_range)
@@ -737,12 +984,14 @@ class PatchedSourceTests(unittest.TestCase):
     def test_exact_data_update_locks_mapping_and_invalidates_all_pages(self) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("int fuse_pfs_update_size_locked")
-        end = text.index("int fuse_pfs_update_size(", start)
+        end = text.index("int fuse_pfs_withdraw_data", start)
         helper = text[start:end]
         self.assertLess(helper.index("filemap_invalidate_lock(mapping)"),
-                        helper.index("i_size_write(inode, size)"))
+                        helper.index("invalidate_inode_pages2(mapping)"))
         self.assertIn("invalidate_inode_pages2(mapping)", helper)
         self.assertLess(helper.index("invalidate_inode_pages2(mapping)"),
+                        helper.index("fuse_pfs_install_repair_attr_locked"))
+        self.assertLess(helper.index("fuse_pfs_install_repair_attr_locked"),
                         helper.index("fi->pfs_size_sequence = sequence"))
 
     def test_rcu_revalidation_never_sleeps_to_invalidate(self) -> None:

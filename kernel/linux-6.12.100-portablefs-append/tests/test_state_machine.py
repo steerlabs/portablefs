@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import os
+import pathlib
 import random
+import re
 import threading
 import unittest
 
@@ -33,6 +36,20 @@ FOPEN_PFS_LOCAL = 1 << 9
 
 ATTR_PFS_SHARED = 1 << 2
 ATTR_PFS_LOCAL = 1 << 3
+STATX_ATTR_IMMUTABLE = 0x00000010
+STATX_ATTR_APPEND = 0x00000020
+STATX_ATTR_NODUMP = 0x00000040
+STATX_ATTR_ENCRYPTED = 0x00000800
+STATX_ATTR_VERITY = 0x00100000
+STATX_ATTR_DAX = 0x00200000
+PFS_STATX_ATTRIBUTES = (
+    STATX_ATTR_IMMUTABLE
+    | STATX_ATTR_APPEND
+    | STATX_ATTR_NODUMP
+    | STATX_ATTR_ENCRYPTED
+    | STATX_ATTR_VERITY
+    | STATX_ATTR_DAX
+)
 
 WRITE_BEGUN = 1 << 0
 WRITE_STAGED = 1 << 1
@@ -276,10 +293,128 @@ def validate_open(
             raise ProtocolError("shared OPENDIR may not cache directory data")
 
 
-def lookup_requires_marker(parent: str, result: str | None) -> bool:
+def lookup_requires_marker(
+    parent: str, result: str | None, *, route_claimed: bool = False
+) -> bool:
+    if route_claimed:
+        return False
     if result is None:
         return parent == "shared"
     return result == "shared"
+
+
+DEFAULT_LOOKUP_SHAPE_RULES = (
+    ("local-negative", False, ATTR_PFS_LOCAL, 0, False),
+    ("shared-negative", False, 0, 32, True),
+    ("local-positive", True, ATTR_PFS_LOCAL, 0, False),
+    ("shared-positive", True, ATTR_PFS_SHARED, 32, True),
+)
+
+
+def lookup_shape_rules() -> tuple[tuple[str, bool, int, int, bool], ...]:
+    tree = os.environ.get("PFS_PATCHED_KERNEL_TREE")
+    if not tree:
+        return DEFAULT_LOOKUP_SHAPE_RULES
+    source = (pathlib.Path(tree) / "fs/fuse/dir.c").read_text()
+    start = source.index("fuse_pfs_lookup_shape_rules[]")
+    end = source.index("static bool fuse_pfs_local_negative_base", start)
+    block = source[start:end]
+    pattern = re.compile(
+        r"\.shape = FUSE_PFS_LOOKUP_([A-Z_]+),\s*"
+        r"\.positive = (true|false),\s*"
+        r"\.class_bits = (FUSE_ATTR_PFS_LOCAL|FUSE_ATTR_PFS_SHARED|0),\s*"
+        r"\.stamp_size = (sizeof\(struct fuse_pfs_cache_stamp\)|0),\s*"
+        r"\.marked = (true|false),"
+    )
+    classes = {
+        "0": 0,
+        "FUSE_ATTR_PFS_LOCAL": ATTR_PFS_LOCAL,
+        "FUSE_ATTR_PFS_SHARED": ATTR_PFS_SHARED,
+    }
+    rules = tuple(
+        (
+            shape.lower().replace("_", "-"),
+            positive == "true",
+            classes[class_bits],
+            32 if stamp_size.startswith("sizeof") else 0,
+            marked == "true",
+        )
+        for shape, positive, class_bits, stamp_size, marked
+        in pattern.findall(block)
+    )
+    if not rules:
+        raise ProtocolError("kernel LOOKUP classifier has no shape rules")
+    return rules
+
+
+def strict_lookup_shape(
+    *, nodeid: int, attr_flags: int, stamp_size: int, marked: bool,
+    generation: int = 0, entry_lifetime: int = 0,
+    attr_lifetime: int = 0, other_attr_nonzero: bool = False,
+) -> str:
+    positive = nodeid != 0
+    class_bits = attr_flags & (ATTR_PFS_SHARED | ATTR_PFS_LOCAL)
+    for (
+        shape, rule_positive, rule_class, rule_size, rule_marked
+    ) in lookup_shape_rules():
+        if ((positive, class_bits, stamp_size, marked) !=
+                (rule_positive, rule_class, rule_size, rule_marked)):
+            continue
+        if not positive:
+            if generation or attr_lifetime or other_attr_nonzero:
+                raise ProtocolError("malformed negative base record")
+            if shape == "local-negative" and entry_lifetime:
+                raise ProtocolError("malformed LOCAL negative lifetime")
+        return "shared" if shape.startswith("shared-") else "local"
+    raise ProtocolError("LOOKUP did not match one complete kernel shape")
+
+
+def strict_negative_lookup_shape(**kwargs: object) -> str:
+    return strict_lookup_shape(nodeid=0, **kwargs)
+
+
+def strict_revalidate_lookup(existing_class: str, **kwargs: object) -> str:
+    result_class = strict_lookup_shape(**kwargs)
+    if result_class != existing_class:
+        raise ProtocolError("revalidation changed inode class")
+    return result_class
+
+
+@dataclasses.dataclass(frozen=True)
+class DirPlusParseResult:
+    linked: tuple[int, ...]
+    force_forgotten: tuple[int, ...]
+    session_released: tuple[int, ...]
+
+
+def parse_marked_dirplus_page(
+    nodeids: tuple[int, ...], *, link_failure: int | None = None,
+    malformed_tail: int | None = None, teardown_during_drain: bool = False,
+) -> DirPlusParseResult:
+    """Model lookup ownership after an accepted marked page is parsed."""
+    if any(nodeid <= 1 for nodeid in nodeids):
+        raise ProtocolError("READDIRPLUS page carried an invalid nodeid")
+    if link_failure is None:
+        if malformed_tail is not None or teardown_during_drain:
+            raise ProtocolError("failure controls require a link failure")
+        return DirPlusParseResult(nodeids, (), ())
+    if link_failure < 0 or link_failure >= len(nodeids):
+        raise ProtocolError("link failure is outside the page")
+    if malformed_tail is not None and malformed_tail <= link_failure:
+        raise ProtocolError("malformed tail does not follow the failed record")
+
+    linked = nodeids[:link_failure]
+    drain_end = malformed_tail if malformed_tail is not None else len(nodeids)
+    if teardown_during_drain:
+        drain_end = link_failure + 1
+    force_forgotten = nodeids[link_failure:drain_end]
+    # A partial parser result has no receipt shape, so the connection becomes
+    # terminal. Detach releases every capability not already force-forgotten,
+    # including the linked prefix and any drain requests lost to teardown.
+    released = tuple(
+        nodeid for nodeid in nodeids if nodeid not in force_forgotten
+    )
+    return DirPlusParseResult(linked, force_forgotten, released)
 
 
 REQUIRED_INIT = {
@@ -317,10 +452,9 @@ FORBIDDEN_INIT = {
 }
 
 STRICT_NOTIFY_CODES = {
-    "INVAL_INODE",
-    "INVAL_ENTRY",
-    "DELETE",
     "PFS_SIZE",
+    "PFS_ATTR",
+    "PFS_ENTRY",
 }
 
 
@@ -368,49 +502,74 @@ def strict_notify(
     padding: int = 0,
     sequence: int = 1,
     resident_child: KernelInode | None = None,
+    record_nodeid: int | None = None,
+    record_version: int | None = None,
+    record_class: str = "shared",
+    inode_flags: int | None = None,
+    birth_time_ns: int | None = None,
+    mode: int | None = None,
+    uid: int | None = None,
+    nlink: int | None = None,
+    exact_size: int | None = None,
 ) -> str:
     if code not in STRICT_NOTIFY_CODES:
         raise ProtocolError("reverse notification outside strict dialect")
     if nodeid == 0:
         raise ProtocolError("zero reverse-notification identity")
-    if code == "DELETE" and child == 0:
+    if code == "PFS_ENTRY" and flags == 1 and child == 0:
         raise ProtocolError("zero DELETE child identity")
-    if code in ("INVAL_ENTRY", "DELETE") and (
+    if code == "PFS_ENTRY" and (
         not name or b"\0" in name or b"/" in name or name in (b".", b"..")
     ):
         raise ProtocolError("invalid cached-child component")
-    if code == "INVAL_INODE" and (off not in (-1, 0) or length != 0):
-        raise ProtocolError("partial inode invalidation is unsequenced")
-    if code == "INVAL_ENTRY" and flags != 0:
-        raise ProtocolError("entry expiry is outside the strict repair shape")
-    if code == "DELETE" and padding != 0:
-        raise ProtocolError("DELETE padding must be zero")
-    if code == "PFS_SIZE" and not 0 < sequence <= S64_MAX:
-        raise ProtocolError("PFS_SIZE sequence is outside signed authority range")
+    if code == "PFS_ENTRY" and (
+        flags not in (0, 1) or (flags == 0 and child != 0)
+    ):
+        raise ProtocolError("invalid exact entry-repair shape")
+    if not 0 < sequence <= S64_MAX:
+        raise ProtocolError("repair sequence is outside signed authority range")
+    if code in ("PFS_ATTR", "PFS_SIZE"):
+        if record_nodeid is None:
+            record_nodeid = nodeid
+        if record_version is None:
+            record_version = sequence
+        if (record_nodeid != nodeid or not 0 < record_version <= sequence or
+                record_class != "shared"):
+            raise ProtocolError("invalid exact repair record")
     if inode is None:
         return "absent"
     if inode.pfs_class != "shared":
         raise ProtocolError("reverse repair targeted a LOCAL inode")
-    if code in ("INVAL_ENTRY", "DELETE") and not inode.is_dir:
+    if code == "PFS_ENTRY" and not inode.is_dir:
         raise ProtocolError("namespace repair parent is not a directory")
-    if code == "INVAL_INODE" and off == 0:
-        inode.withdraw_data()
-    if code in ("INVAL_ENTRY", "DELETE") and resident_child is not None:
+    if code == "PFS_ENTRY" and resident_child is not None:
         if resident_child.pfs_class != "shared":
             raise ProtocolError("namespace repair targeted a LOCAL child")
-        if code == "DELETE" and child != resident_child.nodeid:
+        if flags == 1 and child != resident_child.nodeid:
             raise ProtocolError("DELETE child identity mismatch")
         inode.cache_generation += 1
+    if code == "PFS_ENTRY":
+        inode.repair_entry(sequence)
     if code == "PFS_SIZE":
         if inode.is_dir:
             raise ProtocolError("PFS_SIZE target is not a regular file")
-        inode.exact_data(inode.size, sequence)
+        inode.exact_data(inode.size if exact_size is None else exact_size,
+                         sequence)
+    if code in ("PFS_ATTR", "PFS_SIZE"):
+        inode.repair_attr(
+            record_version,
+            inode.inode_flags if inode_flags is None else inode_flags,
+            inode.birth_time_ns if birth_time_ns is None else birth_time_ns,
+            inode.mode if mode is None else mode,
+            inode.uid if uid is None else uid,
+            inode.nlink if nlink is None else nlink,
+        )
     return "dispatched"
 
 
 def strict_init(minor: int, flags: set[str], default_permissions: bool) -> None:
-    if minor != 41 or not default_permissions:
-        raise ProtocolError("strict profile requires exact ABI 7.41")
+    if minor != 42 or not default_permissions:
+        raise ProtocolError("strict profile requires exact ABI 7.42")
     if not REQUIRED_INIT <= flags or FORBIDDEN_INIT & flags:
         raise ProtocolError("strict INIT capability mismatch")
 
@@ -545,6 +704,12 @@ class KernelInode:
     is_dir: bool = False
     nodeid: int = 1
     nlink: int = 1
+    object_version: int = 0
+    entry_repair_sequence: int = 0
+    inode_flags: int = 0
+    birth_time_ns: int = 0
+    mode: int = 0o644
+    uid: int = 0
 
     def exact_data(self, size: int, sequence: int) -> str:
         if size < 0 or sequence <= 0 or sequence > S64_MAX:
@@ -557,21 +722,80 @@ class KernelInode:
             return "duplicate"
         self.size = size
         self.sequence = sequence
-        self.cache_generation += 1  # full data invalidation, even same EOF
+        self.cache_generation += 1
         return "applied"
 
     def withdraw_data(self) -> None:
-        """fuse_pfs_withdraw_data: the revocation primitive.
-
-        A mount that can no longer participate in the barrier drops every
-        retained page so that no read can be answered inside its kernel.  It
-        carries no authority sequence and must not consume one: a dying mount
-        that advanced the ordered size sequence would make a later real
-        publication look like a replay and be discarded.
-        """
         if self.pfs_class != "shared":
             raise ProtocolError("withdrawal is a SHARED-only primitive")
         self.cache_generation += 1
+
+    def repair_attr(
+        self, sequence: int, inode_flags: int, birth_time_ns: int,
+        mode: int | None = None, uid: int | None = None,
+        nlink: int | None = None,
+    ) -> str:
+        if sequence <= 0 or sequence > S64_MAX:
+            raise ProtocolError("invalid exact attr repair sequence")
+        if sequence <= self.object_version:
+            return "old"
+        self.object_version = sequence
+        self.inode_flags = inode_flags
+        self.birth_time_ns = birth_time_ns
+        if mode is not None:
+            self.mode = mode
+        if uid is not None:
+            self.uid = uid
+        if nlink is not None:
+            self.nlink = nlink
+        return "applied"
+
+    def repair_entry(self, sequence: int) -> None:
+        self.entry_repair_sequence = max(
+            self.entry_repair_sequence, sequence
+        )
+
+    def admit_entry(self, snapshot_sequence: int) -> bool:
+        return snapshot_sequence > max(
+            self.object_version, self.entry_repair_sequence
+        )
+
+    def install_stamped_attr(
+        self, object_version: int, snapshot_sequence: int,
+        inode_flags: int, birth_time_ns: int, mode: int | None = None,
+        uid: int | None = None,
+    ) -> str:
+        if (object_version <= 0 or object_version > snapshot_sequence or
+                snapshot_sequence > S64_MAX):
+            raise ProtocolError("invalid stamped attr")
+        if object_version <= self.object_version:
+            return "old"
+        return self.repair_attr(
+            object_version, inode_flags, birth_time_ns, mode, uid,
+            self.nlink,
+        )
+
+    def permission(self, mask: int) -> bool:
+        return bool(self.mode & mask)
+
+    def remote_execute_permission(self) -> bool:
+        return bool(self.mode & 0o111)
+
+    def coredump_safe(self, caller_uid: int) -> bool:
+        return caller_uid == self.uid and not bool(self.mode & 0o022)
+
+    def lsm_owner_rule(self, expected_uid: int) -> bool:
+        return self.uid == expected_uid
+
+    def audit_snapshot(self) -> tuple[int, int, int]:
+        return self.uid, self.mode, self.inode_flags
+
+    def fill_exact_statx(self) -> dict[str, int]:
+        return {
+            "birth_time_ns": self.birth_time_ns,
+            "attributes": self.inode_flags,
+            "attributes_mask": PFS_STATX_ATTRIBUTES,
+        }
 
 
 class PublicationGate:
@@ -735,18 +959,18 @@ class AbiAndAdmissionTests(unittest.TestCase):
                          max_write)
 
     def test_exact_minor_and_capability_suite(self) -> None:
-        strict_init(41, set(REQUIRED_INIT), True)
-        for minor in (28, 36, 40, 42):
+        strict_init(42, set(REQUIRED_INIT), True)
+        for minor in (28, 36, 40, 41, 43):
             with self.assertRaises(ProtocolError):
                 strict_init(minor, set(REQUIRED_INIT), True)
         for missing in REQUIRED_INIT:
             with self.assertRaises(ProtocolError):
-                strict_init(41, set(REQUIRED_INIT) - {missing}, True)
+                strict_init(42, set(REQUIRED_INIT) - {missing}, True)
         for forbidden in FORBIDDEN_INIT:
             with self.assertRaises(ProtocolError):
-                strict_init(41, set(REQUIRED_INIT) | {forbidden}, True)
+                strict_init(42, set(REQUIRED_INIT) | {forbidden}, True)
         with self.assertRaises(ProtocolError):
-            strict_init(41, set(REQUIRED_INIT), False)
+            strict_init(42, set(REQUIRED_INIT), False)
 
     def test_strict_superblock_refuses_lower_and_upper_stacking(self) -> None:
         preinit_depth = FILESYSTEM_MAX_STACK_DEPTH
@@ -927,6 +1151,106 @@ class AbiAndAdmissionTests(unittest.TestCase):
         }
         for key, required in matrix.items():
             self.assertEqual(lookup_requires_marker(*key), required)
+        self.assertFalse(
+            lookup_requires_marker("shared", None, route_claimed=True)
+        )
+
+    def test_local_and_shared_negatives_have_disjoint_exact_shapes(self) -> None:
+        self.assertEqual(lookup_shape_rules(), DEFAULT_LOOKUP_SHAPE_RULES)
+        self.assertEqual(
+            strict_negative_lookup_shape(
+                attr_flags=ATTR_PFS_LOCAL, stamp_size=0, marked=False
+            ),
+            "local",
+        )
+        self.assertEqual(
+            strict_negative_lookup_shape(
+                attr_flags=0, stamp_size=32, marked=True
+            ),
+            "shared",
+        )
+        for malformed in (
+            {"attr_flags": ATTR_PFS_LOCAL, "stamp_size": 32, "marked": False},
+            {"attr_flags": ATTR_PFS_LOCAL, "stamp_size": 0, "marked": True},
+            {
+                "attr_flags": ATTR_PFS_LOCAL,
+                "stamp_size": 0,
+                "marked": False,
+                "entry_lifetime": 1,
+            },
+            {"attr_flags": 0, "stamp_size": 0, "marked": False},
+            {"attr_flags": 0, "stamp_size": 32, "marked": False},
+            {
+                "attr_flags": ATTR_PFS_SHARED,
+                "stamp_size": 32,
+                "marked": True,
+            },
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(ProtocolError):
+                    strict_negative_lookup_shape(**malformed)
+
+        for stamp_size in (1, 31):
+            for attr_flags, marked in (
+                (ATTR_PFS_LOCAL, False),
+                (0, True),
+            ):
+                with self.subTest(
+                    polarity="negative",
+                    stamp_size=stamp_size,
+                    attr_flags=attr_flags,
+                ):
+                    with self.assertRaises(ProtocolError):
+                        strict_negative_lookup_shape(
+                            attr_flags=attr_flags,
+                            stamp_size=stamp_size,
+                            marked=marked,
+                        )
+
+        self.assertEqual(
+            strict_lookup_shape(
+                nodeid=2, attr_flags=ATTR_PFS_LOCAL,
+                stamp_size=0, marked=False,
+            ),
+            "local",
+        )
+        self.assertEqual(
+            strict_lookup_shape(
+                nodeid=3, attr_flags=ATTR_PFS_SHARED,
+                stamp_size=32, marked=True,
+            ),
+            "shared",
+        )
+        for stamp_size in (1, 31):
+            for attr_flags, marked in (
+                (ATTR_PFS_LOCAL, False),
+                (ATTR_PFS_SHARED, True),
+            ):
+                with self.subTest(
+                    polarity="positive",
+                    stamp_size=stamp_size,
+                    attr_flags=attr_flags,
+                ):
+                    with self.assertRaises(ProtocolError):
+                        strict_lookup_shape(
+                            nodeid=4,
+                            attr_flags=attr_flags,
+                            stamp_size=stamp_size,
+                            marked=marked,
+                        )
+        for existing, result in (("local", "shared"), ("shared", "local")):
+            with self.subTest(existing=existing, result=result):
+                with self.assertRaises(ProtocolError):
+                    strict_revalidate_lookup(
+                        existing,
+                        nodeid=4,
+                        attr_flags=(
+                            ATTR_PFS_SHARED if result == "shared"
+                            else ATTR_PFS_LOCAL
+                        ),
+                        stamp_size=32 if result == "shared" else 0,
+                        marked=result == "shared",
+                    )
 
 
 class TransactionTests(unittest.TestCase):
@@ -1106,13 +1430,186 @@ class TransactionTests(unittest.TestCase):
 
 
 class PublicationAndNotifyTests(unittest.TestCase):
+    def test_readdirplus_link_failure_drains_or_terminalizes_the_page(
+        self,
+    ) -> None:
+        nodeids = (101, 102, 103, 104)
+
+        success = parse_marked_dirplus_page(nodeids)
+        self.assertEqual(success.linked, nodeids)
+        self.assertEqual(success.force_forgotten, ())
+        self.assertEqual(success.session_released, ())
+
+        failed = parse_marked_dirplus_page(nodeids, link_failure=1)
+        self.assertEqual(failed.linked, (101,))
+        self.assertEqual(failed.force_forgotten, (102, 103, 104))
+        self.assertEqual(failed.session_released, (101,))
+        self.assertEqual(
+            set(failed.force_forgotten) | set(failed.session_released),
+            set(nodeids),
+        )
+
+        malformed = parse_marked_dirplus_page(
+            nodeids, link_failure=1, malformed_tail=3
+        )
+        self.assertEqual(malformed.force_forgotten, (102, 103))
+        self.assertEqual(
+            set(malformed.force_forgotten) | set(malformed.session_released),
+            set(nodeids),
+        )
+
+        teardown = parse_marked_dirplus_page(
+            nodeids, link_failure=1, teardown_during_drain=True
+        )
+        self.assertEqual(teardown.force_forgotten, (102,))
+        self.assertEqual(
+            set(teardown.force_forgotten) | set(teardown.session_released),
+            set(nodeids),
+        )
+
+    def test_attr_repair_installs_exact_state_without_an_inexact_interval(
+        self,
+    ) -> None:
+        immutable = STATX_ATTR_IMMUTABLE
+        inode = KernelInode()
+        self.assertEqual(
+            inode.install_stamped_attr(1, 1, immutable, 111, 0o644, 1000),
+            "applied",
+        )
+        self.assertTrue(inode.permission(0o400))
+        self.assertEqual((inode.inode_flags, inode.birth_time_ns),
+                         (immutable, 111))
+
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", inode, sequence=2, inode_flags=0,
+                birth_time_ns=222, mode=0o700, uid=2000,
+            ),
+            "dispatched",
+        )
+        self.assertEqual(inode.object_version, 2)
+        self.assertFalse(inode.permission(0o040))
+        self.assertTrue(inode.remote_execute_permission())
+        self.assertEqual(inode.audit_snapshot(), (2000, 0o700, 0))
+        self.assertTrue(inode.lsm_owner_rule(2000))
+        self.assertTrue(inode.coredump_safe(2000))
+        self.assertEqual(
+            inode.install_stamped_attr(1, 2, immutable, 111), "old"
+        )
+
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", inode, sequence=3, inode_flags=immutable,
+                birth_time_ns=333, mode=0o644, uid=3000,
+            ),
+            "dispatched",
+        )
+        self.assertEqual(
+            (inode.object_version, inode.inode_flags, inode.uid),
+            (3, immutable, 3000),
+        )
+        self.assertFalse(inode.lsm_owner_rule(2000))
+        self.assertFalse(inode.coredump_safe(2000))
+
+        # A namespace-only COMPLETE may carry an unchanged exact object whose
+        # version predates the outer visibility stamp.
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", inode, sequence=5, record_version=4,
+                inode_flags=0, birth_time_ns=444, mode=0o600, uid=4000,
+            ),
+            "dispatched",
+        )
+        self.assertEqual((inode.object_version, inode.uid), (4, 4000))
+
+    def test_entry_then_attr_repair_installs_parent_fields_at_same_sequence(
+        self,
+    ) -> None:
+        parent = KernelInode(
+            is_dir=True, object_version=4, mode=0o755, uid=1000, nlink=2
+        )
+
+        self.assertEqual(
+            strict_notify(
+                "PFS_ENTRY", parent, child=0, flags=0, sequence=5
+            ),
+            "dispatched",
+        )
+        self.assertEqual(parent.entry_repair_sequence, 5)
+        self.assertEqual(parent.object_version, 4)
+        self.assertFalse(parent.admit_entry(5))
+        self.assertTrue(parent.admit_entry(6))
+
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", parent, sequence=5, record_version=5,
+                inode_flags=STATX_ATTR_NODUMP, birth_time_ns=555,
+                mode=0o700, uid=2000, nlink=3,
+            ),
+            "dispatched",
+        )
+        self.assertEqual(
+            (parent.object_version, parent.entry_repair_sequence,
+             parent.mode, parent.uid, parent.nlink,
+             parent.inode_flags, parent.birth_time_ns),
+            (5, 5, 0o700, 2000, 3, STATX_ATTR_NODUMP, 555),
+        )
+
+    def test_size_repair_invalidates_data_and_installs_the_same_exact_record(
+        self,
+    ) -> None:
+        inode = KernelInode(size=10)
+        self.assertEqual(
+            strict_notify(
+                "PFS_SIZE", inode, sequence=4, exact_size=20,
+                inode_flags=STATX_ATTR_NODUMP, birth_time_ns=444,
+                mode=0o600, uid=4000,
+            ),
+            "dispatched",
+        )
+        self.assertEqual((inode.size, inode.sequence, inode.cache_generation),
+                         (20, 4, 1))
+        self.assertEqual(
+            (inode.object_version, inode.inode_flags, inode.birth_time_ns,
+             inode.mode, inode.uid),
+            (4, STATX_ATTR_NODUMP, 444, 0o600, 4000),
+        )
+
+    def test_synchronous_statx_fill_uses_installed_exact_record(self) -> None:
+        inode = KernelInode()
+        flags = STATX_ATTR_NODUMP | STATX_ATTR_IMMUTABLE
+        self.assertEqual(
+            strict_notify(
+                "PFS_ATTR", inode, sequence=7, inode_flags=flags,
+                birth_time_ns=1_725_000_000_123,
+            ),
+            "dispatched",
+        )
+        self.assertEqual(
+            inode.fill_exact_statx(),
+            {
+                "birth_time_ns": 1_725_000_000_123,
+                "attributes": flags,
+                "attributes_mask": PFS_STATX_ATTRIBUTES,
+            },
+        )
+
     def test_strict_reverse_notify_whitelist_blocks_cache_injection(self) -> None:
         inode = KernelInode(size=11)
         parent = KernelInode(is_dir=True)
         queued_replies: list[str] = []
         before = (inode.size, inode.sequence, inode.cache_generation)
 
-        for forbidden in ("STORE", "RETRIEVE", "POLL", "RESEND", "FUTURE"):
+        for forbidden in (
+            "INVAL_INODE",
+            "INVAL_ENTRY",
+            "DELETE",
+            "STORE",
+            "RETRIEVE",
+            "POLL",
+            "RESEND",
+            "FUTURE",
+        ):
             with self.assertRaises(ProtocolError):
                 strict_notify(forbidden, inode)
         self.assertEqual(
@@ -1120,13 +1617,15 @@ class PublicationAndNotifyTests(unittest.TestCase):
         )
         self.assertEqual(queued_replies, [])
 
-        self.assertEqual(strict_notify("INVAL_INODE", inode), "dispatched")
-        for allowed in ("INVAL_ENTRY", "DELETE"):
-            self.assertEqual(strict_notify(allowed, parent), "dispatched")
         self.assertEqual(strict_notify("PFS_SIZE", inode), "dispatched")
+        self.assertEqual(strict_notify("PFS_ATTR", inode), "dispatched")
+        self.assertEqual(
+            strict_notify("PFS_ENTRY", parent, child=0, flags=0),
+            "dispatched",
+        )
         self.assertEqual((inode.size, inode.sequence), (11, 1))
 
-    def test_stock_reverse_repairs_require_exact_shape_and_shared_target(
+    def test_stamped_reverse_repairs_require_exact_shape_and_shared_target(
         self,
     ) -> None:
         shared_file = KernelInode(size=4096)
@@ -1134,54 +1633,38 @@ class PublicationAndNotifyTests(unittest.TestCase):
         local_file = KernelInode(size=4096, pfs_class="local")
         local_dir = KernelInode(pfs_class="local", is_dir=True)
 
-        before_withdrawal = shared_file.cache_generation
-        self.assertEqual(
-            strict_notify("INVAL_INODE", shared_file, off=0, length=0),
-            "dispatched",
-        )
-        self.assertEqual(
-            shared_file.cache_generation,
-            before_withdrawal + 1,
-            "the exact (0, 0) revocation shape must withdraw retained data",
-        )
-        for off, length in ((0, 4096), (-1, 1), (4096, 0)):
-            with self.assertRaises(ProtocolError):
-                strict_notify(
-                    "INVAL_INODE", shared_file, off=off, length=length
-                )
-        with self.assertRaises(ProtocolError):
-            strict_notify("INVAL_ENTRY", shared_dir, flags=1)  # EXPIRE_ONLY
-        with self.assertRaises(ProtocolError):
-            strict_notify("DELETE", shared_dir, padding=1)
-
         for code, target in (
-            ("INVAL_INODE", local_file),
-            ("INVAL_ENTRY", local_dir),
-            ("DELETE", local_dir),
             ("PFS_SIZE", local_file),
+            ("PFS_ATTR", local_file),
+            ("PFS_ENTRY", local_dir),
         ):
             with self.assertRaises(ProtocolError):
                 strict_notify(code, target)
         for code in STRICT_NOTIFY_CODES:
-            self.assertEqual(strict_notify(code, None), "absent")
+            kwargs = {"child": 0} if code == "PFS_ENTRY" else {}
+            self.assertEqual(strict_notify(code, None, **kwargs), "absent")
 
         for code in STRICT_NOTIFY_CODES:
             with self.assertRaises(ProtocolError):
                 strict_notify(code, None, nodeid=0)
+        for code in STRICT_NOTIFY_CODES:
+            with self.assertRaises(ProtocolError):
+                strict_notify(code, None, sequence=0)
         with self.assertRaises(ProtocolError):
-            strict_notify("DELETE", None, child=0)
+            strict_notify("PFS_ENTRY", None, child=1, flags=0)
         with self.assertRaises(ProtocolError):
-            strict_notify("PFS_SIZE", None, sequence=0)
-        self.assertEqual(
-            strict_notify("INVAL_INODE", None, nodeid=987654), "absent"
-        )
+            strict_notify("PFS_ENTRY", None, child=0, flags=1)
+        self.assertEqual(strict_notify("PFS_ATTR", None, nodeid=987654), "absent")
 
         for malformed in (b"", b".", b"..", b"a/b", b"a\0b"):
-            for code in ("INVAL_ENTRY", "DELETE"):
-                with self.assertRaises(ProtocolError):
-                    strict_notify(code, shared_dir, name=malformed)
+            with self.assertRaises(ProtocolError):
+                strict_notify(
+                    "PFS_ENTRY", shared_dir, name=malformed, child=0, flags=0
+                )
         self.assertEqual(
-            strict_notify("INVAL_ENTRY", shared_dir, name=b"\xff"),
+            strict_notify(
+                "PFS_ENTRY", shared_dir, name=b"\xff", child=0, flags=0
+            ),
             "dispatched",
         )
 
@@ -1191,12 +1674,13 @@ class PublicationAndNotifyTests(unittest.TestCase):
             local_graft.nlink,
             local_graft.pfs_class,
         )
-        for code in ("INVAL_ENTRY", "DELETE"):
+        for child, flags in ((0, 0), (local_graft.nodeid, 1)):
             with self.assertRaises(ProtocolError):
                 strict_notify(
-                    code,
+                    "PFS_ENTRY",
                     shared_dir,
-                    child=local_graft.nodeid,
+                    child=child,
+                    flags=flags,
                     resident_child=local_graft,
                 )
             self.assertEqual(
@@ -1212,9 +1696,10 @@ class PublicationAndNotifyTests(unittest.TestCase):
         before = (shared_dir.cache_generation, shared_child.nlink)
         with self.assertRaises(ProtocolError):
             strict_notify(
-                "DELETE",
+                "PFS_ENTRY",
                 shared_dir,
                 child=89,
+                flags=1,
                 resident_child=shared_child,
             )
         self.assertEqual(
@@ -1222,9 +1707,10 @@ class PublicationAndNotifyTests(unittest.TestCase):
         )
 
         strict_notify(
-            "DELETE",
+            "PFS_ENTRY",
             shared_dir,
             child=shared_child.nodeid,
+            flags=1,
             resident_child=shared_child,
         )
         self.assertEqual(shared_dir.cache_generation, before[0] + 1)
@@ -1233,6 +1719,27 @@ class PublicationAndNotifyTests(unittest.TestCase):
             before[1],
             "peer repair expires the binding but does not synthesize a local unlink",
         )
+
+    def test_create_snapshots_every_gate_before_installing_parent(self) -> None:
+        versions = {"parent": 0, "child": 0}
+        snapshot_sequence = 7
+        records = {"parent": 7, "child": 7}
+
+        # Step 3 is a transaction-wide snapshot. Installing the parent before
+        # comparing the dentry gate would make this create reject its own name
+        # because the dentry cursor equals the parent record's version.
+        prior = dict(versions)
+        attr_install = {
+            identity: version > prior[identity]
+            for identity, version in records.items()
+        }
+        entry_install = snapshot_sequence > prior["parent"]
+        for identity, install in attr_install.items():
+            if install:
+                versions[identity] = records[identity]
+
+        self.assertEqual(versions, records)
+        self.assertTrue(entry_install)
 
     def test_revocation_withdrawal_drops_pages_without_taking_a_sequence(
         self,

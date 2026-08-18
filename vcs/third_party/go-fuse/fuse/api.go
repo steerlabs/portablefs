@@ -517,6 +517,14 @@ type ReplyWriteLifecycle interface {
 	ReplyWritten(unique uint64, status Status)
 }
 
+// ReplyPayloadPreparer finalizes a bounded variable reply at the physical
+// writer boundary. payload has zero length and sufficient capacity for the
+// opcode's maximum trailer. The implementation returns the number of bytes it
+// initialized; a non-OK status prevents the device write.
+type ReplyPayloadPreparer interface {
+	PrepareReplyPayload(unique, nodeid uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, Status)
+}
+
 // ReplyPublishMarker is the optional private extension which marks an ordered
 // reply as requiring a post-VFS FUSE_PFS_PUBLISH receipt. Returning true is
 // valid only when ReplyWriteOrdered returns true for the same unique.

@@ -1239,7 +1239,7 @@ func (c *Client) dispatchTerminalDeliveryReceipt(ctx context.Context, token []by
 func validTerminalDeliveryReceiptResponse(response *authoritypb.Response) bool {
 	return response != nil && response.GetErrno() == 0 && !response.GetUncertain() &&
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED &&
-		response.GetPostAttr() == nil && response.GetMutation() == nil && response.GetRoutesMismatch() == nil &&
+		response.GetPostState() == nil && response.GetMutation() == nil && response.GetRoutesMismatch() == nil &&
 		len(response.GetTerminalDeliveryToken()) == 0 && response.GetTerminalDeliveryReceipt() != nil
 }
 

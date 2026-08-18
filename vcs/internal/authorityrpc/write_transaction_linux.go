@@ -380,7 +380,6 @@ func writeTransactionCommitReply(transactionID, committed, assigned, post, seque
 		}
 	}
 	return &authoritypb.Response{
-		PostAttr: attrProto(postAttr),
 		Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
 			TransactionId: transactionID, CommittedSize: committed, AssignedOffset: assigned,
 			PostSize: post, VisibilitySequence: sequence, Flags: flags, Error: wireError,
@@ -952,6 +951,7 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 	var transaction *writeTransaction
 	var resources *sessionResources
 	var coordinate visibilityCoordinate
+	var releaseMutation func()
 	prepare := func() ([]volumeserver.VisibilityTarget, error) {
 		var err error
 		resources, err = h.writeTransactionResources(credential.ID)
@@ -982,12 +982,16 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 		}
 		transaction.mu.Unlock()
 		transaction.refs.Done()
+		releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+		if err != nil {
+			return nil, err
+		}
 		return []volumeserver.VisibilityTarget{
 			inodeTarget(volumeserver.VisibilityData, coordinate, 0),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}, nil
 	}
-	return h.mutateVisibleSequence(ctx, request, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateVisibleSequence(ctx, request, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		active := acquireWriteTransaction(resources, transaction.id)
 		if active != transaction {
 			if active != nil {
@@ -1059,6 +1063,7 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 			// in this attr-only post-apply shape even for append, and the kernel
 			// must leave every iterator/OFD position unchanged.
 			response := writeTransactionCommitReply(transaction.id, 0, 0, uint64(post.Size), sequence, post, applyErr)
+			response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 			h.deferStorageFailure(response, applyErr)
 			return response, []volumeserver.VisibilityTarget{
 				inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
@@ -1088,6 +1093,7 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 			applyErr = nil
 		}
 		response := writeTransactionCommitReply(transaction.id, committed, assigned, uint64(post.Size), sequence, post, applyErr)
+		response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 		if applyErr != nil {
 			h.deferStorageFailure(response, applyErr)
 		}
@@ -1096,6 +1102,10 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
 	})
+	if releaseMutation != nil {
+		releaseMutation()
+	}
+	return response
 }
 
 func (h *VolumeHandler) writeTransactionGate(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) (volumeserver.SourcePublicationGate, xfsstore.ObjectCoordinate, error) {

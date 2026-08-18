@@ -133,6 +133,8 @@ readonly -a AFFECTED_FILES=(
   "fs/coda/file.c"
   "fs/erofs/super.c"
   "fs/attr.c"
+  "fs/exec.c"
+  "fs/fcntl.c"
   "fs/fuse/dev.c"
   "fs/fuse/dir.c"
   "fs/fuse/file.c"
@@ -140,12 +142,17 @@ readonly -a AFFECTED_FILES=(
   "fs/fuse/fuse_trace.h"
   "fs/fuse/inode.c"
   "fs/fuse/ioctl.c"
+  "fs/fuse/post_state.c"
   "fs/fuse/readdir.c"
   "fs/fuse/xattr.c"
+  "fs/inode.c"
+  "fs/ioctl.c"
+  "fs/locks.c"
   "fs/namei.c"
   "fs/open.c"
   "fs/overlayfs/params.c"
   "fs/read_write.c"
+  "fs/remap_range.c"
   "fs/reply_publish.c"
   "fs/smb/server/smb2pdu.c"
   "fs/smb/server/vfs.c"
@@ -157,6 +164,7 @@ readonly -a AFFECTED_FILES=(
   "include/uapi/linux/fuse.h"
   "io_uring/rw.c"
   "kernel/fork.c"
+  "mm/mmap.c"
   "mm/swapfile.c"
 )
 for relative_path in "${AFFECTED_FILES[@]}"; do
@@ -180,6 +188,8 @@ verify_patched_tree() {
   grep -Eq '^[[:space:]]*FUSE_PFS_FALLOCATE[[:space:]]*=[[:space:]]*4099,$' "$abi_header"
   grep -Eq '^[[:space:]]*FUSE_PFS_COPY_FILE_RANGE[[:space:]]*=[[:space:]]*4100,$' "$abi_header"
   grep -Eq '^[[:space:]]*FUSE_NOTIFY_PFS_SIZE[[:space:]]*=[[:space:]]*10,$' "$abi_header"
+  grep -Eq '^[[:space:]]*FUSE_NOTIFY_PFS_ATTR[[:space:]]*=[[:space:]]*12,$' "$abi_header"
+  grep -Eq '^[[:space:]]*FUSE_NOTIFY_PFS_ENTRY[[:space:]]*=[[:space:]]*13,$' "$abi_header"
 
   cc -std=c11 -Wall -Wextra -Werror \
     -I "$tree/include/uapi" \
@@ -190,11 +200,12 @@ verify_patched_tree() {
 }
 
 "$UPSTREAM_TREE/scripts/checkpatch.pl" --no-tree \
-  --ignore ENOSYS,COMMIT_MESSAGE,MISSING_SIGN_OFF,FILE_PATH_CHANGES \
+  --ignore ENOSYS,COMMIT_MESSAGE,MISSING_SIGN_OFF,BAD_SIGN_OFF,FILE_PATH_CHANGES \
   "${PFS_PATCHES[@]}"
 verify_patched_tree "$UPSTREAM_TREE" upstream
 verify_patched_tree "$DEBIAN_TREE" debian
-python3 "$SCRIPT_DIR/tests/test_state_machine.py"
+PFS_PATCHED_KERNEL_TREE="$UPSTREAM_TREE" \
+  python3 "$SCRIPT_DIR/tests/test_state_machine.py"
 python3 "$SCRIPT_DIR/tests/test_xfs_fallocate.py"
 python3 "$SCRIPT_DIR/tests/test_strict_stacking.py"
 
@@ -239,8 +250,10 @@ docker exec "$CONTAINER_ID" sh -eu -c '
       fs/overlayfs/params.o \
       fs/smb/server/smb2pdu.o fs/smb/server/vfs.o \
       fs/fuse/dev.o fs/fuse/dir.o fs/fuse/file.o fs/fuse/inode.o \
-      fs/fuse/ioctl.o fs/fuse/readdir.o fs/fuse/xattr.o \
-      fs/reply_publish.o fs/namei.o fs/open.o fs/read_write.o \
+      fs/fuse/ioctl.o fs/fuse/post_state.o fs/fuse/readdir.o fs/fuse/xattr.o \
+      fs/reply_publish.o fs/attr.o fs/exec.o fs/fcntl.o fs/inode.o \
+      fs/ioctl.o fs/locks.o fs/namei.o fs/open.o fs/read_write.o \
+      fs/remap_range.o mm/mmap.o \
       fs/splice.o fs/xattr.o fs/aio.o io_uring/rw.o kernel/fork.o
   }
 

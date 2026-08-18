@@ -152,6 +152,156 @@ func (v *Volume) TruncateObject(id Capability, size int64) error {
 	return unix.Ftruncate(fd, size)
 }
 
+// SetAttr executes every requested syscall and takes the final stat while its
+// authority handler retains the stable-identity writer stripe. Keeping the
+// compound operation here prevents an intermediate snapshot and closes the
+// historical gap where only truncate participated in mutation sequencing.
+func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, error) {
+	if itemID == (Capability{}) && handleID == (Capability{}) {
+		return Attr{}, fs.ErrInvalid
+	}
+	var obj object
+	var opened *openFile
+	var err error
+	if itemID != (Capability{}) {
+		obj, err = v.holdObject(itemID)
+		if err != nil {
+			return Attr{}, err
+		}
+		defer obj.release()
+	}
+	if handleID != (Capability{}) {
+		opened, err = v.holdOpen(handleID)
+		if err != nil {
+			return Attr{}, err
+		}
+		defer opened.release()
+	}
+	coordinate := obj.coordinate
+	if itemID == (Capability{}) {
+		coordinate = opened.coordinate
+	} else if handleID != (Capability{}) && coordinate.Stable != opened.coordinate.Stable {
+		return Attr{}, fs.ErrInvalid
+	}
+	changed := false
+	apply := func(operation func() error) error {
+		if err := operation(); err != nil {
+			if changed {
+				return outcomeUncertain(err)
+			}
+			return err
+		}
+		changed = true
+		return nil
+	}
+	if spec.Mode != nil {
+		unixMode, modeErr := modeToUnix(*spec.Mode)
+		if modeErr != nil {
+			return Attr{}, modeErr
+		}
+		if itemID == (Capability{}) || obj.kind == KindSymlink {
+			return Attr{}, syscall.EOPNOTSUPP
+		}
+		if err := apply(func() error { return v.chmodCapability(obj.fd(), obj.kind, unixMode) }); err != nil {
+			return v.setAttrPost(obj, opened, itemID, err)
+		}
+	}
+	if spec.UID != nil || spec.GID != nil {
+		uid, gid := -1, -1
+		if spec.UID != nil {
+			if *spec.UID != v.ownerUID {
+				return Attr{}, syscall.EPERM
+			}
+			uid = int(*spec.UID)
+		}
+		if spec.GID != nil {
+			if *spec.GID != v.ownerGID {
+				return Attr{}, syscall.EPERM
+			}
+			gid = int(*spec.GID)
+		}
+		if itemID == (Capability{}) {
+			return Attr{}, fs.ErrInvalid
+		}
+		if err := apply(func() error {
+			return unix.Fchownat(obj.fd(), "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+		}); err != nil {
+			return v.setAttrPost(obj, opened, itemID, err)
+		}
+	}
+	if spec.Size != nil {
+		if *spec.Size < 0 {
+			return Attr{}, fs.ErrInvalid
+		}
+		if handleID != (Capability{}) {
+			if !opened.write {
+				return Attr{}, fs.ErrInvalid
+			}
+			if err := apply(func() error { return unix.Ftruncate(opened.fd(), *spec.Size) }); err != nil {
+				return v.setAttrPost(obj, opened, itemID, err)
+			}
+		} else {
+			if obj.kind == KindSymlink {
+				return Attr{}, syscall.EOPNOTSUPP
+			}
+			flags := unix.O_RDONLY
+			if obj.kind == KindRegular {
+				flags = unix.O_RDWR
+			}
+			if obj.kind == KindDirectory {
+				flags |= unix.O_DIRECTORY
+			}
+			fd, reopenErr := v.reopen(obj.fd(), flags, obj.kind)
+			if reopenErr != nil {
+				return v.setAttrPost(obj, opened, itemID, firstError(reopenErr, syscall.EIO))
+			}
+			truncateErr := unix.Ftruncate(fd, *spec.Size)
+			closeErr := unix.Close(fd)
+			if err := apply(func() error { return errors.Join(truncateErr, closeErr) }); err != nil {
+				return v.setAttrPost(obj, opened, itemID, err)
+			}
+		}
+	}
+	if spec.ATimeNS != nil || spec.MTimeNS != nil || spec.ATimeNow || spec.MTimeNow {
+		if itemID == (Capability{}) || spec.ATimeNS != nil && spec.ATimeNow || spec.MTimeNS != nil && spec.MTimeNow {
+			return Attr{}, fs.ErrInvalid
+		}
+		times := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, {Nsec: unix.UTIME_OMIT}}
+		if spec.ATimeNow {
+			times[0].Nsec = unix.UTIME_NOW
+		} else if spec.ATimeNS != nil {
+			times[0] = unix.NsecToTimespec(*spec.ATimeNS)
+		}
+		if spec.MTimeNow {
+			times[1].Nsec = unix.UTIME_NOW
+		} else if spec.MTimeNS != nil {
+			times[1] = unix.NsecToTimespec(*spec.MTimeNS)
+		}
+		if err := apply(func() error {
+			return unix.UtimesNanoAt(obj.fd(), "", times, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+		}); err != nil {
+			return v.setAttrPost(obj, opened, itemID, err)
+		}
+	}
+	return v.setAttrPost(obj, opened, itemID, nil)
+}
+
+func (v *Volume) setAttrPost(obj object, opened *openFile, hasItem Capability, applyErr error) (Attr, error) {
+	fd := -1
+	if opened != nil {
+		fd = opened.fd()
+	} else if hasItem != (Capability{}) {
+		fd = obj.fd()
+	} else {
+		return Attr{}, fs.ErrInvalid
+	}
+	post, statErr := statFD(fd)
+	if statErr != nil {
+		return Attr{}, outcomeUncertain(errors.Join(applyErr, statErr))
+	}
+	return post, applyErr
+}
+
 func (v *Volume) GetXattr(id Capability, name string) ([]byte, error) {
 	if err := ValidateXattr(name); err != nil {
 		return nil, err

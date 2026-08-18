@@ -530,15 +530,10 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 		// control instead is what makes the ordered DATA publication the single
 		// thing that withdraws a page.
 		ExplicitDataCacheControl: true,
-		// READDIRPLUS stays refused. Now that a strict mount does publish
-		// nonzero entry lifetimes the old reason no longer holds, but the
-		// remaining one is decisive: the authority mints one capability per
-		// entry it returns, so serving READDIRPLUS means interning -- and
-		// eventually reclaiming -- every name in a directory whether or not
-		// anything ever looks at it. `ls` on a large tree would pay for a full
-		// LOOKUP-equivalent per entry to populate a cache the caller does not
-		// use. Ordinary READDIR plus cached LOOKUPs is strictly less work.
-		DisableReadDirPlus: true,
+		// Stamped READDIRPLUS is available for pure authority directories. The
+		// current private ABI has no stamped record for machine-local route roots,
+		// so a mixed topology declines the capability instead of inventing one.
+		DisableReadDirPlus: !cfg.Routes.Empty(),
 		// Shared mmap is a decision of this mount, not an accident of which
 		// capabilities go-fuse happens to forward. A writable shared mapping
 		// would dirty pages that never travel the strict write transaction, and
@@ -607,8 +602,8 @@ func verifyKernelGuarantees(settings *fuse.InitIn, maxWrite uint32) error {
 	if settings == nil {
 		return errors.New("fusev3: kernel INIT settings are unavailable; the mount guarantees cannot be verified")
 	}
-	if settings.Major != 7 || settings.Minor != 41 {
-		return fmt.Errorf("fusev3: strict coherence requires the pinned FUSE protocol 7.41 exactly; kernel offered %d.%d", settings.Major, settings.Minor)
+	if settings.Major != 7 || settings.Minor != 42 {
+		return fmt.Errorf("fusev3: strict coherence requires the pinned FUSE protocol 7.42 exactly; kernel offered %d.%d", settings.Major, settings.Minor)
 	}
 	offered := settings.Flags64()
 	if offered&fuse.CAP_ATOMIC_O_TRUNC == 0 {
@@ -971,6 +966,22 @@ func (m *Mount) closeLocked() error {
 	}
 	m.closed = true
 	m.cancel()
+	var replyOwnershipErr error
+	if m.raw != nil {
+		if !m.raw.terminalizeReplyCacheOwnership(time.Now().Add(m.repairBudget)) {
+			deadline := time.Now().Add(m.repairBudget)
+			_, absenceErr := m.kernelMount.absent()
+			if absenceErr != nil || !m.kernelConnectionAbsentBy(deadline) {
+				replyOwnershipErr = errors.Join(
+					fmt.Errorf("fusev3: terminal reply writer did not report inside the repair budget"),
+					absenceErr,
+				)
+			} else {
+				m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+				m.raw.discardCachedOwnershipAfterConnectionGone()
+			}
+		}
+	}
 	m.wg.Wait()
 	// Any capability still queued for reclaim is released by Detach: ending the
 	// session drops every item and open this session holds.
@@ -980,7 +991,7 @@ func (m *Mount) closeLocked() error {
 	// boundary. A terminal revocation already finished this idempotently from
 	// scheduleAbort before it reached Close.
 	m.rpc.FinishLocalSessionEnforcement()
-	m.closeErr = errors.Join(m.fatalError(), detachErr, m.grafts.Close(), m.rpc.Close())
+	m.closeErr = errors.Join(m.fatalError(), replyOwnershipErr, detachErr, m.grafts.Close(), m.rpc.Close())
 	return m.closeErr
 }
 
@@ -1020,9 +1031,16 @@ type dirHandle struct {
 	// buffer. Holding it here is what makes the page cache lossless: an entry
 	// that does not fit in this READDIR reply is not consumed.
 	pending       *fuse.DirEntry
+	pendingDirent *authoritypb.Dirent
 	pendingCookie []byte
+	pageWantItems bool
 	eof           bool
 	once          sync.Once
+	// plusReply serializes the directory cursor across the physical reply edge.
+	// READDIRPLUS transfers authority capabilities while building a page, but
+	// the kernel owns their lookup references only after /dev/fuse accepts the
+	// reply. No later directory request may observe that provisional cursor.
+	plusReply *dirPlusCursorTransaction
 
 	// local is the set of machine-local route roots this directory contains and
 	// shadow is the set of names they own. Both are decided once, when the
@@ -1034,6 +1052,13 @@ type dirHandle struct {
 	local      []fuse.DirEntry
 	shadow     func(name string) bool
 	localIndex int
+}
+
+type dirPlusCursorTransaction struct {
+	handle *dirHandle
+	start  uint64
+	done   chan struct{}
+	once   sync.Once
 }
 
 func (n *node) opContext(parent context.Context) (context.Context, context.CancelFunc) {
@@ -1085,7 +1110,7 @@ func (n *node) read(parent context.Context, request *authoritypb.Request) (*auth
 			response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY &&
 			responseErrno(response) == syscall.EINTR && !response.GetUncertain() &&
 			retrySequence != 0 && response.GetBody() == nil &&
-			response.GetPostAttr() == nil && response.GetRoutesMismatch() == nil &&
+			response.GetPostState() == nil && response.GetRoutesMismatch() == nil &&
 			response.GetMutation() == nil && len(response.GetTerminalDeliveryToken()) == 0 &&
 			readRetryPublicationIsUnadmitted(publication)
 		if consumption != nil {
@@ -1222,7 +1247,7 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request) 
 		if response != nil && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY {
 			validRetry := callErr == nil && assigned && !assignmentFailed && !response.GetUncertain() &&
 				responseErrno(response) == syscall.EINTR && response.GetBody() == nil &&
-				response.GetPostAttr() == nil && response.GetRoutesMismatch() == nil && len(response.GetTerminalDeliveryToken()) == 0 &&
+				response.GetPostState() == nil && response.GetRoutesMismatch() == nil && len(response.GetTerminalDeliveryToken()) == 0 &&
 				response.GetVisibilityRetrySequence() != 0
 			if !validRetry {
 				if consumption != nil {
@@ -1309,6 +1334,7 @@ func requestRequiresSourcePublication(request *authoritypb.Request) bool {
 	case *authoritypb.Request_Open:
 		return body.Open.GetFlags().GetTruncate()
 	case *authoritypb.Request_Create,
+		*authoritypb.Request_Tmpfile,
 		*authoritypb.Request_Mkdir,
 		*authoritypb.Request_Unlink,
 		*authoritypb.Request_Rename,
@@ -1337,6 +1363,14 @@ func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*au
 	}
 	defer n.mount.releaseBulk()
 	response, err := n.mount.callMutation(ctx, request)
+	if response != nil && response.GetPostState() != nil {
+		publication := replyPublicationFromContext(parent)
+		if publication == nil || publication.postState != nil {
+			n.mount.revoke(errors.New("fusev3: mutation post-state escaped or duplicated its reply publication"))
+			return response, syscall.ENOTCONN
+		}
+		publication.postState = proto.Clone(response.GetPostState()).(*authoritypb.PostState)
+	}
 	return response, rpcErrno(response, err)
 }
 
@@ -1350,8 +1384,25 @@ func (n *node) Lookup(ctx context.Context, name string) (*authoritypb.Item, sysc
 		return nil, errno
 	}
 	item := response.GetLookup().GetItem()
-	if item == nil || item.GetAttr() == nil {
+	if item == nil {
+		snapshot := response.GetLookup().GetNegativeSnapshotSequence()
+		publication := replyPublicationFromContext(ctx)
+		if snapshot == 0 || publication == nil || publication.cacheStamp != nil {
+			return nil, syscall.EIO
+		}
+		publication.cacheStamp = &fuse.PFSCacheStamp{SnapshotSequence: snapshot}
+		return nil, syscall.ENOENT
+	}
+	if item.GetAttr() == nil || item.GetObjectVersion() == 0 || item.GetSnapshotSequence() == 0 || item.GetObjectVersion() > item.GetSnapshotSequence() {
 		return nil, syscall.EIO
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || publication.cacheStamp != nil {
+		return nil, syscall.EIO
+	}
+	publication.cacheStamp = &fuse.PFSCacheStamp{
+		SnapshotSequence: item.GetSnapshotSequence(), ObjectVersion: item.GetObjectVersion(),
+		BirthTimeNS: item.GetAttr().GetBirthTimeNs(), InodeFlags: item.GetAttr().GetFlags(),
 	}
 	return cloneItem(item), 0
 }
@@ -1366,8 +1417,17 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 		return errno
 	}
 	attr := response.GetGetAttr().GetAttr()
-	if attr == nil {
+	objectVersion, snapshot := response.GetGetAttr().GetObjectVersion(), response.GetGetAttr().GetSnapshotSequence()
+	if attr == nil || objectVersion == 0 || snapshot == 0 || objectVersion > snapshot {
 		return syscall.EIO
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || publication.cacheStamp != nil {
+		return syscall.EIO
+	}
+	publication.cacheStamp = &fuse.PFSCacheStamp{
+		SnapshotSequence: snapshot, ObjectVersion: objectVersion,
+		BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags(),
 	}
 	n.mount.publishAttr(ctx, out, n.item, attr)
 	return 0
@@ -1389,6 +1449,11 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	response, errno := n.mutate(ctx, request)
 	if errno != 0 {
 		return nil, 0, errno
+	}
+	if openFlags.GetTruncate() {
+		if err := expectPostStateItem(ctx, n.item, postStateRoleTarget); err != nil {
+			return nil, 0, syscall.EIO
+		}
 	}
 	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
 		return nil, 0, syscall.EIO
@@ -1470,35 +1535,43 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 
 // peek returns the next directory entry without consuming it, fetching another
 // authority page only when the buffered one is exhausted.
-func (h *dirHandle) peek(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
+func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *authoritypb.Dirent, syscall.Errno) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.pending != nil && h.pageWantItems != wantItems {
+		// Resume from the last consumed authority cookie. A kernel is allowed to
+		// alternate READDIR and READDIRPLUS on one handle; capabilities must only
+		// be minted for the PLUS page that will actually carry them.
+		h.discardPageItemsLocked()
+		h.page, h.index, h.pending, h.pendingDirent = nil, 0, nil, nil
+	}
 	if h.pending != nil {
-		return h.pending, 0
+		return h.pending, h.pendingDirent, 0
 	}
 	for {
 		for h.index >= len(h.page) {
 			if h.eof {
-				return h.peekLocalLocked(), 0
+				return h.peekLocalLocked(), nil, 0
 			}
-			response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: cloneBytes(h.token), Cookie: cloneBytes(h.cookie), Verifier: cloneBytes(h.verifier), MaxEntries: 256}}})
+			response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: cloneBytes(h.token), Cookie: cloneBytes(h.cookie), Verifier: cloneBytes(h.verifier), MaxEntries: 256, WantItems: wantItems}}})
 			if errno != 0 {
-				return nil, errno
+				return nil, nil, errno
 			}
 			page := response.GetReadDir()
 			if page == nil || len(page.GetVerifier()) == 0 {
-				return nil, syscall.EIO
+				return nil, nil, syscall.EIO
 			}
 			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
+			h.pageWantItems = wantItems
 			h.verifier = cloneBytes(page.GetVerifier())
 			if len(h.page) == 0 && !h.eof {
-				return nil, syscall.EIO
+				return nil, nil, syscall.EIO
 			}
 		}
 		entry := h.page[h.index]
 		attr := entry.GetAttr()
 		if attr == nil {
-			return nil, syscall.EIO
+			return nil, nil, syscall.EIO
 		}
 		offset, ok := decodeCookie(entry.GetNextCookie())
 		if !ok {
@@ -1506,27 +1579,32 @@ func (h *dirHandle) peek(ctx context.Context) (*fuse.DirEntry, syscall.Errno) {
 			// short or zero authority cookie would be silently replaced by an
 			// offset the authority cannot resume from, turning `ls` on a directory
 			// larger than one reply into an infinite loop.
-			return nil, syscall.EIO
+			return nil, nil, syscall.EIO
 		}
 		if offset&graftDirOffsetBase != 0 {
 			// The top bit of the offset space belongs to merged route roots.
 			// An authority cookie that carried it would alias onto one of them,
 			// so it is refused rather than served as the wrong entry.
-			return nil, syscall.EIO
+			return nil, nil, syscall.EIO
 		}
 		name := string(entry.GetName())
 		if h.shadow != nil && h.shadow(name) {
 			// A route rule owns this name unconditionally: the volume's
 			// same-named entry is not merged, it is replaced. Advancing here
 			// rather than emitting is what makes the name appear exactly once.
+			if item := entry.GetItem(); item != nil {
+				h.node.mount.deferReclaim(item.GetToken())
+				entry.Item = nil
+			}
 			h.index++
 			h.cookie = cloneBytes(entry.GetNextCookie())
 			h.next = offset
 			continue
 		}
 		h.pending = &fuse.DirEntry{Name: name, Mode: direntMode(attr.GetKind()), Ino: attr.GetInode(), Off: offset}
+		h.pendingDirent = entry
 		h.pendingCookie = cloneBytes(entry.GetNextCookie())
-		return h.pending, 0
+		return h.pending, h.pendingDirent, 0
 	}
 }
 
@@ -1557,18 +1635,47 @@ func (h *dirHandle) consume() {
 	h.index++
 	h.cookie = h.pendingCookie
 	h.next = h.pending.Off
-	h.pending, h.pendingCookie = nil, nil
+	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
 }
 
-func (h *dirHandle) Seekdir(_ context.Context, off uint64) syscall.Errno {
+func (h *dirHandle) consumePlus() *authoritypb.Item {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.pending == nil || h.pendingDirent == nil {
+		return nil
+	}
+	item := h.pendingDirent.GetItem()
+	h.pendingDirent.Item = nil
+	h.index++
+	h.cookie = h.pendingCookie
+	h.next = h.pending.Off
+	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
+	return item
+}
+
+func (h *dirHandle) discardPageItemsLocked() {
+	for index := h.index; index < len(h.page); index++ {
+		if item := h.page[index].GetItem(); item != nil {
+			h.node.mount.deferReclaim(item.GetToken())
+			h.page[index].Item = nil
+		}
+	}
+}
+
+func (h *dirHandle) authorityPageExhausted() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.index >= len(h.page)
+}
+
+func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 	if off == h.next {
 		// The kernel is continuing from where this handle stopped. Keeping the
 		// buffered page is the whole point of fetching 256 entries at a time.
 		return 0
 	}
-	h.pending, h.pendingCookie = nil, nil
+	h.discardPageItemsLocked()
+	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
 	h.next = off
 	if off&graftDirOffsetBase != 0 {
 		// The kernel is resuming inside the merged route roots, so the volume's
@@ -1590,6 +1697,73 @@ func (h *dirHandle) Seekdir(_ context.Context, off uint64) syscall.Errno {
 	return 0
 }
 
+func (h *dirHandle) Seekdir(ctx context.Context, off uint64) syscall.Errno {
+	for {
+		h.mu.Lock()
+		pending := h.plusReply
+		if pending == nil {
+			errno := h.seekdirLocked(off)
+			h.mu.Unlock()
+			return errno
+		}
+		done := pending.done
+		h.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return contextErrno(ctx.Err())
+		}
+	}
+}
+
+func (h *dirHandle) beginDirPlus(ctx context.Context, off uint64) (*dirPlusCursorTransaction, syscall.Errno) {
+	for {
+		h.mu.Lock()
+		pending := h.plusReply
+		if pending == nil {
+			if errno := h.seekdirLocked(off); errno != 0 {
+				h.mu.Unlock()
+				return nil, errno
+			}
+			tx := &dirPlusCursorTransaction{handle: h, start: off, done: make(chan struct{})}
+			h.plusReply = tx
+			h.mu.Unlock()
+			return tx, 0
+		}
+		done := pending.done
+		h.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, contextErrno(ctx.Err())
+		}
+	}
+}
+
+func (tx *dirPlusCursorTransaction) finish(commit bool) bool {
+	if tx == nil || tx.handle == nil {
+		return false
+	}
+	settled := false
+	tx.once.Do(func() {
+		h := tx.handle
+		h.mu.Lock()
+		if h.plusReply == tx {
+			if !commit {
+				// Force the ordinary seek reset even though the provisional
+				// cursor may already equal its starting offset.
+				h.next = ^tx.start
+				_ = h.seekdirLocked(tx.start)
+			}
+			h.plusReply = nil
+			close(tx.done)
+			settled = true
+		}
+		h.mu.Unlock()
+	})
+	return settled
+}
+
 func (h *dirHandle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
 	_, errno := h.node.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: cloneBytes(h.token), DataOnly: flags&fsyncDataOnly != 0}}})
 	return errno
@@ -1598,6 +1772,9 @@ func (h *dirHandle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
 func (h *dirHandle) close(ctx context.Context) syscall.Errno {
 	var errno syscall.Errno
 	h.once.Do(func() {
+		h.mu.Lock()
+		h.discardPageItemsLocked()
+		h.mu.Unlock()
 		_, errno = h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
 	})
 	return errno
@@ -1623,6 +1800,20 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 		return nil, nil, 0, syscall.EIO
 	}
 	item := cloneItem(created.GetItem())
+	roles := postStateRoles(response.GetPostState())
+	if samePostStateRoles(roles, postStateRoleTarget, postStateRoleParent) {
+		targetObject, targetErr := expectedPostStateItem(item, postStateRoleTarget)
+		parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+		if targetErr != nil || parentErr != nil || expectPostState(ctx, targetObject, parentObject) != nil {
+			return nil, nil, 0, syscall.EIO
+		}
+	} else {
+		createdObject, createdErr := expectedPostStateItem(item, postStateRoleCreated)
+		parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+		if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
+			return nil, nil, 0, syscall.EIO
+		}
+	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
 	return item, &fileHandle{node: child, token: cloneBytes(created.GetHandle())}, coherentOpenFlags, 0
 }
@@ -1635,7 +1826,11 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 		}
 		return nil, nil, 0, errno
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Tmpfile{Tmpfile: &authoritypb.TmpfileRequest{
+	gate, err := itemSourceGate(n.item, false)
+	if err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	response, errno := n.mutate(ctx, &authoritypb.Request{SourcePublicationGate: gate, Body: &authoritypb.Request_Tmpfile{Tmpfile: &authoritypb.TmpfileRequest{
 		Parent: cloneBytes(n.item.GetToken()), Mode: mode & 0o7777, Flags: openFlags,
 		Exclusive: flags&uint32(syscall.O_EXCL) != 0,
 	}}})
@@ -1648,6 +1843,11 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 	}
 	item := cloneItem(created.GetItem())
 	if item.GetAttr().GetKind() != authoritypb.Attr_REGULAR {
+		return nil, nil, 0, syscall.EIO
+	}
+	createdObject, createdErr := expectedPostStateItem(item, postStateRoleCreated)
+	parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+	if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
 		return nil, nil, 0, syscall.EIO
 	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
@@ -1691,6 +1891,11 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 		return nil, syscall.EIO
 	}
 	item := cloneItem(created.GetItem())
+	createdObject, createdErr := expectedPostStateItem(item, postStateRoleCreated)
+	parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+	if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
+		return nil, syscall.EIO
+	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
 	// mknod(2) does not hand an open file description to the caller, so the one
 	// the authority just created is this frontend's to release immediately.
@@ -1717,6 +1922,11 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32) (*authorityp
 	if item == nil || item.GetAttr() == nil {
 		return nil, syscall.EIO
 	}
+	createdObject, createdErr := expectedPostStateItem(item, postStateRoleCreated)
+	parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+	if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
+		return nil, syscall.EIO
+	}
 	return cloneItem(item), 0
 }
 
@@ -1730,7 +1940,16 @@ func (n *node) Unlink(ctx context.Context, name string) syscall.Errno {
 	_, errno := n.mutate(ctx, request)
 	if errno == 0 {
 		identity, _ := publicationIdentityFromItem(n.item)
-		sourceLeaseFromContext(ctx).resolveNoBinding(publicationNamespace{parent: identity, name: name})
+		namespace := publicationNamespace{parent: identity, name: name}
+		lease := sourceLeaseFromContext(ctx)
+		removed, ok := lease.preBinding(namespace)
+		if !ok || expectPostState(ctx,
+			expectedPostStateObject{identity: removed, roles: postStateRoleRemoved},
+			expectedPostStateObject{identity: identity, roles: postStateRoleParent},
+		) != nil {
+			return syscall.EIO
+		}
+		lease.resolveNoBinding(namespace)
 	}
 	return errno
 }
@@ -1745,7 +1964,16 @@ func (n *node) Rmdir(ctx context.Context, name string) syscall.Errno {
 	_, errno := n.mutate(ctx, request)
 	if errno == 0 {
 		identity, _ := publicationIdentityFromItem(n.item)
-		sourceLeaseFromContext(ctx).resolveNoBinding(publicationNamespace{parent: identity, name: name})
+		namespace := publicationNamespace{parent: identity, name: name}
+		lease := sourceLeaseFromContext(ctx)
+		removed, ok := lease.preBinding(namespace)
+		if !ok || expectPostState(ctx,
+			expectedPostStateObject{identity: removed, roles: postStateRoleRemoved},
+			expectedPostStateObject{identity: identity, roles: postStateRoleParent},
+		) != nil {
+			return syscall.EIO
+		}
+		lease.resolveNoBinding(namespace)
 	}
 	return errno
 }
@@ -1782,9 +2010,27 @@ func (n *node) Rename(ctx context.Context, name string, parent *node, newName st
 	lease := sourceLeaseFromContext(ctx)
 	oldParentIdentity, _ := publicationIdentityFromItem(n.item)
 	newParentIdentity, _ := publicationIdentityFromItem(parent.item)
+	oldNamespace := publicationNamespace{parent: oldParentIdentity, name: name}
+	newNamespace := publicationNamespace{parent: newParentIdentity, name: newName}
+	moved, movedOK := lease.preBinding(oldNamespace)
+	replaced, replacedOK := lease.preBinding(newNamespace)
+	expected := []expectedPostStateObject{
+		{identity: moved, roles: postStateRoleSource | postStateRoleDestination},
+		{identity: oldParentIdentity, roles: postStateRoleOldParent},
+		{identity: newParentIdentity, roles: postStateRoleNewParent},
+	}
+	if flags&renameExchange != 0 {
+		expected[0].roles |= postStateRoleExchanged
+		expected = append(expected, expectedPostStateObject{identity: replaced, roles: postStateRoleSource | postStateRoleDestination | postStateRoleExchanged})
+	} else if replacedOK && replaced != moved {
+		expected = append(expected, expectedPostStateObject{identity: replaced, roles: postStateRoleOverwritten})
+	}
+	if !movedOK || flags&renameExchange != 0 && !replacedOK || expectPostState(ctx, expected...) != nil {
+		return false, syscall.EIO
+	}
 	if err := lease.attachRename(ctx,
-		publicationNamespace{parent: oldParentIdentity, name: name},
-		publicationNamespace{parent: newParentIdentity, name: newName},
+		oldNamespace,
+		newNamespace,
 		newPost, oldPost,
 	); err != nil {
 		n.mount.revoke(err)
@@ -1811,6 +2057,11 @@ func (n *node) Link(ctx context.Context, source *node, name string) (*authorityp
 	if item == nil || item.GetAttr() == nil || !bytes.Equal(item.GetToken(), source.item.GetToken()) {
 		return nil, syscall.EIO
 	}
+	linkedObject, linkedErr := expectedPostStateItem(source.item, postStateRoleTarget)
+	parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+	if linkedErr != nil || parentErr != nil || expectPostState(ctx, linkedObject, parentObject) != nil {
+		return nil, syscall.EIO
+	}
 	return cloneItem(item), 0
 }
 
@@ -1827,6 +2078,11 @@ func (n *node) Symlink(ctx context.Context, target, name string) (*authoritypb.I
 	}
 	item := response.GetLookup().GetItem()
 	if item == nil || item.GetAttr() == nil {
+		return nil, syscall.EIO
+	}
+	createdObject, createdErr := expectedPostStateItem(item, postStateRoleCreated)
+	parentObject, parentErr := expectedPostStateItem(n.item, postStateRoleParent)
+	if createdErr != nil || parentErr != nil || expectPostState(ctx, createdObject, parentObject) != nil {
 		return nil, syscall.EIO
 	}
 	return cloneItem(item), 0
@@ -1889,10 +2145,20 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 	if errno != 0 {
 		return errno
 	}
-	if response.GetPostAttr() == nil {
+	if err := expectPostStateItem(ctx, n.item, postStateRoleTarget); err != nil {
 		return syscall.EIO
 	}
-	n.mount.publishAttr(ctx, out, n.item, response.GetPostAttr())
+	state := response.GetPostState()
+	identity := n.item.GetStableIdentity()
+	if err := validateMutationPostState(state); err != nil {
+		return syscall.EIO
+	}
+	object := postStateObject(state, identity, postStateRoleTarget)
+	if object == nil {
+		return syscall.EIO
+	}
+	fillAttr(object.GetAttr(), &out.Attr, n.mount.uid, n.mount.gid)
+	out.SetTimeout(0)
 	return 0
 }
 
@@ -1959,6 +2225,11 @@ func (n *node) Removexattr(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 	_, errno := n.mutate(ctx, &authoritypb.Request{SourcePublicationGate: gate, Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{Item: cloneBytes(n.item.GetToken()), Name: []byte(name)}}})
+	if errno == 0 {
+		if err := expectPostStateItem(ctx, n.item, postStateRoleTarget); err != nil {
+			return syscall.EIO
+		}
+	}
 	return errno
 }
 
@@ -2061,6 +2332,8 @@ func fillAttr(attr *authoritypb.Attr, out *fuse.Attr, uid, gid uint32) {
 	out.Flags = fuse.FUSE_ATTR_PFS_SHARED
 	out.Nlink = attr.GetNlink()
 	out.Uid, out.Gid = uid, gid
+	out.Rdev = attr.GetRdev()
+	out.Blksize = attr.GetBlksize()
 	setTime(attr.GetAtimeNs(), &out.Atime, &out.Atimensec)
 	setTime(attr.GetMtimeNs(), &out.Mtime, &out.Mtimensec)
 	setTime(attr.GetCtimeNs(), &out.Ctime, &out.Ctimensec)

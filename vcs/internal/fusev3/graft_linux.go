@@ -385,12 +385,15 @@ func (r *rawFileSystem) graftLookup(parent *inodeRecord, name string, out *fuse.
 	if errno != 0 {
 		// A rule owns the NAME whether or not anything has created it, so the
 		// volume's same-named subtree stays shadowed and this is an honest
-		// ENOENT rather than a fall-through to the authority. The negative
-		// answer is not cached, for the same reason a negative authority answer
-		// is not: the entry that fills it in is created without this frontend
-		// being asked about the name.
-		out.SetEntryTimeout(0)
-		return true, fuse.Status(errno)
+		// local negative rather than a fall-through to the authority. Its class
+		// bit makes the successful zero-nodeid base reply distinguishable from a
+		// SHARED stamped negative without inventing a publication obligation.
+		if errno != syscall.ENOENT {
+			return true, fuse.Status(errno)
+		}
+		*out = fuse.EntryOut{}
+		out.Attr.Flags = fuse.FUSE_ATTR_PFS_LOCAL
+		return true, fuse.OK
 	}
 	record, errno := r.internGraft(parent, name, &st)
 	if errno != 0 {

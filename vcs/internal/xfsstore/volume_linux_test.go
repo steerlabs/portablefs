@@ -1423,7 +1423,7 @@ func TestCanonicalCopyLocksCannotDeadlockReverseDirections(t *testing.T) {
 		go func(source, destination [16]byte) {
 			<-start
 			for range 1000 {
-				unlock := lockCopyMutation(v, source, destination)
+				unlock := v.LockMutation([][16]byte{source, destination})
 				unlock()
 			}
 			done <- struct{}{}

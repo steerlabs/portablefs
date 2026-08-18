@@ -47,8 +47,14 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 		request.GetFlags().GetAppend() || request.GetFlags().GetTruncate() || !request.GetExclusive() {
 		t.Fatalf("authority TMPFILE mapping = %+v", request)
 	}
-	if captured.GetSourcePublicationGate() != nil {
-		t.Fatalf("unlinked TMPFILE unexpectedly declared a peer-visible source gate: %+v", captured.GetSourcePublicationGate())
+	gate := captured.GetSourcePublicationGate()
+	var gateItem *authoritypb.SourcePublicationItem
+	if gate != nil && len(gate.GetTargets()) == 1 {
+		gateItem = gate.GetTargets()[0].GetItem()
+	}
+	if gateItem == nil || !gateItem.GetAttributes() || gateItem.GetData() ||
+		!bytes.Equal(gateItem.GetIdentity(), fixture.raw.nodesByID[fuse.FUSE_ROOT_ID].identity[:]) {
+		t.Fatalf("TMPFILE parent-attribute source gate = %+v, want exactly the supplied parent attrs", gate)
 	}
 	if out.NodeId == 0 || out.Fh == 0 || out.Attr.Ino != 81 || out.Attr.Flags != fuse.FUSE_ATTR_PFS_SHARED ||
 		out.OpenFlags != coherentOpenFlags || out.EntryTimeout() != 0 {

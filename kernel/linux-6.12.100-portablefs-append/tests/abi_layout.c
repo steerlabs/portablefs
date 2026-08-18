@@ -5,7 +5,7 @@
 #include <linux/fuse.h>
 
 _Static_assert(FUSE_KERNEL_VERSION == 7, "FUSE major changed");
-_Static_assert(FUSE_KERNEL_MINOR_VERSION == 41, "strict ABI minor changed");
+_Static_assert(FUSE_KERNEL_MINOR_VERSION == 42, "strict ABI minor changed");
 _Static_assert(FUSE_PFS_STRICT_COHERENCE == (UINT64_C(1) << 63),
 	       "strict capability bit changed");
 _Static_assert(FUSE_PFS_CACHED_DATA == (UINT64_C(1) << 62),
@@ -42,6 +42,8 @@ _Static_assert(FUSE_PFS_PUBLISH == 4098, "publish opcode changed");
 _Static_assert(FUSE_PFS_FALLOCATE == 4099, "fallocate opcode changed");
 _Static_assert(FUSE_PFS_COPY_FILE_RANGE == 4100, "copy opcode changed");
 _Static_assert(FUSE_NOTIFY_PFS_SIZE == 10, "exact-size notify changed");
+_Static_assert(FUSE_NOTIFY_PFS_ATTR == 12, "exact-attr notify changed");
+_Static_assert(FUSE_NOTIFY_PFS_ENTRY == 13, "exact-entry notify changed");
 _Static_assert(FUSE_TMPFILE == 51, "tmpfile opcode changed");
 
 _Static_assert(FUSE_PFS_WRITE_BEGIN == 1, "BEGIN changed");
@@ -122,8 +124,37 @@ _Static_assert(FALLOC_FL_ZERO_RANGE == 0x10, "ZERO_RANGE changed");
 _Static_assert(FALLOC_FL_INSERT_RANGE == 0x20, "INSERT_RANGE changed");
 _Static_assert(FALLOC_FL_UNSHARE_RANGE == 0x40, "UNSHARE_RANGE changed");
 
-_Static_assert(sizeof(struct fuse_notify_pfs_size_out) == 24,
+_Static_assert(sizeof(struct fuse_notify_pfs_size_out) == 152,
 	       "size notification ABI size changed");
+_Static_assert(sizeof(struct fuse_notify_pfs_attr_out) == 152,
+	       "attr notification ABI size changed");
+_Static_assert(offsetof(struct fuse_notify_pfs_size_out, object) == 8,
+	       "size notification object offset changed");
+_Static_assert(offsetof(struct fuse_notify_pfs_attr_out, object) == 8,
+	       "attr notification object offset changed");
+_Static_assert(sizeof(struct fuse_notify_pfs_entry_out) == 32,
+	       "entry notification ABI size changed");
+
+_Static_assert(sizeof(struct fuse_pfs_post_state_header) == 32,
+	       "post-state header ABI size changed");
+_Static_assert(offsetof(struct fuse_pfs_post_state_header, object_count) == 24,
+	       "post-state object-count offset changed");
+_Static_assert(sizeof(struct fuse_pfs_object_state) == 144,
+	       "post-state object ABI size changed");
+_Static_assert(offsetof(struct fuse_pfs_object_state, attr) == 32,
+	       "post-state attr offset changed");
+_Static_assert(offsetof(struct fuse_pfs_object_state, roles) == 120,
+	       "post-state roles offset changed");
+_Static_assert(offsetof(struct fuse_pfs_object_state, birth_time_ns) == 128,
+	       "post-state birth-time offset changed");
+_Static_assert(sizeof(struct fuse_pfs_cache_stamp) == 32,
+	       "cache-stamp ABI size changed");
+_Static_assert(offsetof(struct fuse_pfs_cache_stamp, birth_time_ns) == 16,
+	       "cache-stamp birth-time offset changed");
+_Static_assert(offsetof(struct fuse_pfs_cache_stamp, inode_flags) == 24,
+	       "cache-stamp inode-flags offset changed");
+_Static_assert(FUSE_NAME_OFFSET_PFS_DIRENTPLUS == 184,
+	       "stamped readdirplus name offset changed");
 
 int main(void)
 {

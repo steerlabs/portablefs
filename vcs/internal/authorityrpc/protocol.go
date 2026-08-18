@@ -34,21 +34,11 @@ const protocolALPN = ProtocolALPN
 // configuration against it, and both read the same constant.
 const FramePayloadReserve uint32 = 1024
 
-// responseEnvelopeReserve bounds the bytes writeFrame adds back to a retained
-// replay body. A retained outcome is marshaled with request_id, epoch and
-// mutation stripped and errno already present; the reply that finally reaches
-// the wire restores them:
-//
-//	request_id  field 1 varint : 1 tag +           10 =  11
-//	epoch       field 2 bytes  : 1 tag + 1 len  + 16 =  18
-//	errno       field 3 varint : 1 tag +           10 =  11
-//	mutation    field 6 msg    : 1 tag + 1 len  + (1+5 slot) + (1+10 sequence) = 19
-//	terminal_delivery_token
-//	            field 9 bytes  : 1 tag + 1 len  + 16 = 18
-//
-// 77 bytes worst case. TestRetainedReplyEnvelopeFitsReserve measures the real
-// delta against this bound so the arithmetic cannot drift from the schema.
-const responseEnvelopeReserve uint32 = 80
+// responseEnvelopeReserve is the protocol-6 retained-response allowance. It
+// covers the maximum four-object post-state envelope, including field 45's
+// two-byte tag, as well as the request, epoch, errno, mutation state, and
+// terminal-delivery token restored around a retained outcome.
+const responseEnvelopeReserve uint32 = 2048
 
 // fixedMutationReplyBytes bounds every mutation reply whose body has a fixed
 // shape (an Item, an Attr, a handle, a byte count). It is also the floor for a
@@ -203,6 +193,7 @@ func requestIsVisibleMutation(req *authoritypb.Request) bool {
 		*authoritypb.Request_Rename,
 		*authoritypb.Request_Symlink,
 		*authoritypb.Request_Link,
+		*authoritypb.Request_Tmpfile,
 		*authoritypb.Request_SetXattr,
 		*authoritypb.Request_RemoveXattr:
 		return true

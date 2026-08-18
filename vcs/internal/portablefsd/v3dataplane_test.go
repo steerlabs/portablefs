@@ -180,7 +180,7 @@ func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request
 			AssignedOffset: write.GetPosition(), PostSize: postSize, VisibilitySequence: identity.Sequence,
 			Flags: v3WriteReplyCommitted,
 		}}
-		response.PostAttr = &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1}
+		response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1})
 	case *authoritypb.Request_SyncFs:
 		response.Body = &authoritypb.Response_SyncFs{SyncFs: &authoritypb.SyncFSReply{}}
 	}
@@ -386,7 +386,7 @@ func exactTestWriteCommit(identity authorityrpc.MutationIdentity, request *autho
 		AssignedOffset: write.GetPosition(), PostSize: postSize, VisibilitySequence: identity.Sequence,
 		Flags: v3WriteReplyCommitted,
 	}}
-	response.PostAttr = &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1}
+	response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1})
 	return response
 }
 
@@ -1556,10 +1556,10 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 				response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}}
 				switch request.GetBody().(type) {
 				case *authoritypb.Request_SetAttr:
-					response.PostAttr = &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7}
+					response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7})
 				case *authoritypb.Request_WriteTransaction:
 					response = exactTestWriteCommit(identity, request)
-					response.PostAttr.Mode = 0o600
+					v3PostAttr(response).Mode = 0o600
 				case *authoritypb.Request_Rename:
 					response.Body = &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
 						NewPostIdentity: bytes.Repeat([]byte{0xaf}, 16),

@@ -5,6 +5,7 @@
 package fuse
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"syscall"
@@ -51,8 +52,84 @@ func TestPFSWriteABILayout(t *testing.T) {
 	if unsafe.Offsetof(out.Error) != 44 {
 		t.Fatalf("fuse_pfs_write_out.error offset = %d, want 44", unsafe.Offsetof(out.Error))
 	}
-	if got, want := unsafe.Sizeof(NotifyPFSSizeOut{}), uintptr(24); got != want {
+	if got, want := unsafe.Sizeof(NotifyPFSSizeOut{}), uintptr(8+PFSObjectStateSize); got != want {
 		t.Fatalf("fuse_notify_pfs_size_out size = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Sizeof(NotifyPFSAttrOut{}), uintptr(8+PFSObjectStateSize); got != want {
+		t.Fatalf("fuse_notify_pfs_attr_out size = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Sizeof(NotifyPFSEntryOut{}), uintptr(32); got != want {
+		t.Fatalf("fuse_notify_pfs_entry_out size = %d, want %d", got, want)
+	}
+	var postState PFSPostStateHeader
+	if got, want := unsafe.Sizeof(postState), uintptr(PFSPostStateHeaderSize); got != want {
+		t.Fatalf("fuse_pfs_post_state_header size = %d, want %d", got, want)
+	}
+	for name, test := range map[string]struct{ got, want uintptr }{
+		"visibility_sequence": {unsafe.Offsetof(postState.VisibilitySequence), 0},
+		"snapshot_sequence":   {unsafe.Offsetof(postState.SnapshotSequence), 8},
+		"attr_valid_ns":       {unsafe.Offsetof(postState.AttrValidNS), 16},
+		"object_count":        {unsafe.Offsetof(postState.ObjectCount), 24},
+		"flags":               {unsafe.Offsetof(postState.Flags), 28},
+	} {
+		if test.got != test.want {
+			t.Errorf("fuse_pfs_post_state_header.%s offset = %d, want %d", name, test.got, test.want)
+		}
+	}
+	object := PFSObjectState{
+		Nodeid: 0x0102030405060708, ObjectVersion: 0x1112131415161718,
+		Roles: 0x21222324, InodeFlags: 0x31323334, BirthTimeNS: -123456789,
+		PFSClass: 0x41424344, RecordFlags: 0x51525354,
+	}
+	for index := range object.StableIdentity {
+		object.StableIdentity[index] = byte(0x60 + index)
+	}
+	for index := range object.Attr {
+		object.Attr[index] = byte(index)
+	}
+	encoded := make([]byte, PFSObjectStateSize)
+	if !EncodePFSObjectState(encoded, &object) {
+		t.Fatal("manual fuse_pfs_object_state encoder refused its fixed-size buffer")
+	}
+	if got := binary.LittleEndian.Uint64(encoded[0:8]); got != object.Nodeid {
+		t.Errorf("encoded nodeid = %#x, want %#x", got, object.Nodeid)
+	}
+	if got := binary.LittleEndian.Uint64(encoded[8:16]); got != object.ObjectVersion {
+		t.Errorf("encoded object_version = %#x, want %#x", got, object.ObjectVersion)
+	}
+	if !bytes.Equal(encoded[16:32], object.StableIdentity[:]) || !bytes.Equal(encoded[32:120], object.Attr[:]) {
+		t.Error("encoded identity or 88-byte Linux fuse_attr landed at the wrong offset")
+	}
+	if got := binary.LittleEndian.Uint32(encoded[120:124]); got != object.Roles {
+		t.Errorf("encoded roles = %#x, want %#x", got, object.Roles)
+	}
+	if got := binary.LittleEndian.Uint32(encoded[124:128]); got != object.InodeFlags {
+		t.Errorf("encoded inode_flags = %#x, want %#x", got, object.InodeFlags)
+	}
+	if got := int64(binary.LittleEndian.Uint64(encoded[128:136])); got != object.BirthTimeNS {
+		t.Errorf("encoded birth_time_ns = %d, want %d", got, object.BirthTimeNS)
+	}
+	if got := binary.LittleEndian.Uint32(encoded[136:140]); got != object.PFSClass {
+		t.Errorf("encoded pfs_class = %#x, want %#x", got, object.PFSClass)
+	}
+	if got := binary.LittleEndian.Uint32(encoded[140:144]); got != object.RecordFlags {
+		t.Errorf("encoded record_flags = %#x, want %#x", got, object.RecordFlags)
+	}
+	if got, want := unsafe.Sizeof(PFSCacheStamp{}), uintptr(PFSCacheStampSize); got != want {
+		t.Fatalf("fuse_pfs_cache_stamp size = %d, want %d", got, want)
+	}
+	stamp := PFSCacheStamp{
+		SnapshotSequence: 0x6162636465666768, ObjectVersion: 0x7172737475767778,
+		BirthTimeNS: -987654321, InodeFlags: 0x81828384,
+	}
+	stampWire := make([]byte, PFSCacheStampSize)
+	if !EncodePFSCacheStamp(stampWire, &stamp) ||
+		binary.LittleEndian.Uint64(stampWire[0:8]) != stamp.SnapshotSequence ||
+		binary.LittleEndian.Uint64(stampWire[8:16]) != stamp.ObjectVersion ||
+		int64(binary.LittleEndian.Uint64(stampWire[16:24])) != stamp.BirthTimeNS ||
+		binary.LittleEndian.Uint32(stampWire[24:28]) != stamp.InodeFlags ||
+		binary.LittleEndian.Uint32(stampWire[28:32]) != 0 {
+		t.Fatalf("manual fuse_pfs_cache_stamp layout = %x", stampWire)
 	}
 	var publishIn PFSPublishIn
 	if got, want := unsafe.Sizeof(publishIn)-unsafe.Sizeof(publishIn.InHeader), uintptr(32); got != want {
@@ -100,7 +177,8 @@ func TestPFSWriteABILayout(t *testing.T) {
 func TestPFSWriteABIConstants(t *testing.T) {
 	if PFS_WRITE_OPCODE != 4097 || PFS_PUBLISH_OPCODE != 4098 || PFS_FALLOCATE_OPCODE != 4099 || PFS_COPY_FILE_RANGE_OPCODE != 4100 || PFS_UNIQUE_PUBLISH != uint64(1)<<62 ||
 		FOPEN_PFS_SHARED != 1<<8 || FOPEN_PFS_LOCAL != 1<<9 || FUSE_ATTR_PFS_SHARED != 1<<2 ||
-		FUSE_ATTR_PFS_LOCAL != 1<<3 || CAP_PFS_STRICT_COHERENCE != uint64(1)<<63 || NOTIFY_PFS_SIZE != -10 || PFS_PUBLISH_ACK != 1 ||
+		FUSE_ATTR_PFS_LOCAL != 1<<3 || CAP_PFS_STRICT_COHERENCE != uint64(1)<<63 || NOTIFY_PFS_SIZE != -10 ||
+		NOTIFY_PFS_ATTR != -12 || NOTIFY_PFS_ENTRY != -13 || PFS_PUBLISH_ACK != 1 ||
 		CAP_PFS_CACHED_DATA != uint64(1)<<62 || CAP_PFS_WRITE_ONESHOT != uint64(1)<<61 {
 		t.Fatalf("private ABI constants changed")
 	}
@@ -131,7 +209,52 @@ func TestPFSWriteABIConstants(t *testing.T) {
 	}
 }
 
-func TestReplyPublicationMarkerPermitsOnlyStateBearingHeaderErrors(t *testing.T) {
+func TestPostStateOpcodesReserveVariableReplyPayload(t *testing.T) {
+	for _, opcode := range []uint32{
+		_OP_SETATTR, _OP_SYMLINK, _OP_MKNOD, _OP_MKDIR, _OP_UNLINK,
+		_OP_RMDIR, _OP_RENAME, _OP_LINK, _OP_OPEN, _OP_SETXATTR,
+		_OP_REMOVEXATTR, _OP_CREATE, _OP_FALLOCATE, _OP_RENAME2,
+		_OP_TMPFILE, PFS_WRITE_OPCODE, PFS_FALLOCATE_OPCODE,
+		PFS_COPY_FILE_RANGE_OPCODE,
+	} {
+		handler := getHandler(opcode)
+		if handler == nil {
+			t.Fatalf("opcode %d has no handler", opcode)
+		}
+		inputSize := int(handler.InputSize)
+		if inputSize < int(unsafe.Sizeof(InHeader{})) {
+			inputSize = int(unsafe.Sizeof(InHeader{}))
+		}
+		input := make([]byte, inputSize)
+		header := (*InHeader)(unsafe.Pointer(&input[0]))
+		header.Length, header.Opcode, header.Unique = uint32(inputSize), opcode, 2
+		_, _, _, payload, variable, status := parseRequest(input, &InitIn{})
+		if !status.Ok() || !variable || payload != PFSPostStateMaxSize {
+			t.Errorf("opcode %d parse = payload %d variable %t status %v", opcode, payload, variable, status)
+		}
+	}
+}
+
+func TestStampedReadDirPlusKeepsKernelBufferCapacity(t *testing.T) {
+	inputSize := int(getHandler(_OP_READDIRPLUS).InputSize)
+	input := make([]byte, inputSize)
+	in := (*ReadIn)(unsafe.Pointer(&input[0]))
+	in.InHeader = InHeader{Length: uint32(inputSize), Opcode: _OP_READDIRPLUS, Unique: 2}
+	in.Size = 4096
+	_, _, _, payload, variable, status := parseRequest(input, &InitIn{})
+	if !status.Ok() || !variable || payload != 4096 {
+		t.Fatalf("READDIRPLUS parse = payload %d variable %t status %v", payload, variable, status)
+	}
+	buffer := make([]byte, 0, payload)
+	list := NewDirEntryList(buffer, 0)
+	entry, stamp := list.AddPFSDirLookupEntry(DirEntry{Name: "child", Ino: 7, Off: 1, Mode: syscall.S_IFREG})
+	want := int(unsafe.Sizeof(EntryOut{})) + int(unsafe.Sizeof(_Dirent{})) + PFSCacheStampSize + 8
+	if entry == nil || stamp == nil || len(list.bytes()) != want {
+		t.Fatalf("stamped dirent = entry %v stamp %v bytes %d, want %d", entry != nil, stamp != nil, len(list.bytes()), want)
+	}
+}
+
+func TestReplyPublicationMarkerRequiresStructuredSuccess(t *testing.T) {
 	requestFor := func(opcode uint32, status Status) *request {
 		input := make([]byte, unsafe.Sizeof(InHeader{}))
 		req := &request{inputBuf: input, status: status}
@@ -145,7 +268,7 @@ func TestReplyPublicationMarkerPermitsOnlyStateBearingHeaderErrors(t *testing.T)
 		want   bool
 	}{
 		{name: "successful lookup", opcode: _OP_LOOKUP, status: OK, want: true},
-		{name: "negative lookup", opcode: _OP_LOOKUP, status: ENOENT, want: true},
+		{name: "legacy negative lookup", opcode: _OP_LOOKUP, status: ENOENT},
 		{name: "lookup transport error", opcode: _OP_LOOKUP, status: EIO},
 		{name: "non-lookup ENOENT", opcode: _OP_GETATTR, status: ENOENT},
 	} {
@@ -154,6 +277,29 @@ func TestReplyPublicationMarkerPermitsOnlyStateBearingHeaderErrors(t *testing.T)
 				t.Fatalf("replyMayRequestPFSPublish(%d, %v) = %t, want %t", test.opcode, test.status, got, test.want)
 			}
 		})
+	}
+}
+
+func TestStructuredNegativeSerializationRetainsEntryAndStamp(t *testing.T) {
+	input := make([]byte, unsafe.Sizeof(InHeader{}))
+	req := request{
+		inputBuf:      input,
+		outHeaderBuf:  make([]byte, sizeOfOutHeader),
+		outDataBuf:    make([]byte, unsafe.Sizeof(EntryOut{})),
+		outPayload:    make([]byte, PFSCacheStampSize),
+		status:        OK,
+		publishMarked: true,
+	}
+	req.inHeader().Opcode = _OP_LOOKUP
+	req.inHeader().Unique = 42
+	req.serializeHeader(len(req.outPayload))
+	if req.outHeader().Status != 0 || req.outHeader().Unique != 42|PFS_UNIQUE_PUBLISH {
+		t.Fatalf("structured negative header = %+v", req.outHeader())
+	}
+	want := uint32(sizeOfOutHeader + unsafe.Sizeof(EntryOut{}) + uintptr(PFSCacheStampSize))
+	if req.outHeader().Length != want || len(req.outDataBuf) != int(unsafe.Sizeof(EntryOut{})) || len(req.outPayload) != PFSCacheStampSize {
+		t.Fatalf("structured negative wire = length:%d data:%d stamp:%d, want %d/%d/%d",
+			req.outHeader().Length, len(req.outDataBuf), len(req.outPayload), want, unsafe.Sizeof(EntryOut{}), PFSCacheStampSize)
 	}
 }
 
@@ -410,7 +556,9 @@ func TestPFSSizeNotifyWireAndCapability(t *testing.T) {
 			return len(wire), 0
 		},
 	}
-	if status := server.PFSSizeNotify(7, 99, 123); status != OK {
+	object := &PFSObjectState{Nodeid: 7, ObjectVersion: 123, Roles: 1, PFSClass: 1}
+	binary.LittleEndian.PutUint64(object.Attr[8:16], 99)
+	if status := server.PFSSizeNotify(123, object); status != OK {
 		t.Fatalf("PFSSizeNotify: %v", status)
 	}
 	if len(wire) != int(sizeOfOutHeader+unsafe.Sizeof(NotifyPFSSizeOut{})) {
@@ -419,18 +567,21 @@ func TestPFSSizeNotifyWireAndCapability(t *testing.T) {
 	if got := int32(binary.LittleEndian.Uint32(wire[4:8])); got != -int32(NOTIFY_PFS_SIZE) {
 		t.Fatalf("notify code = %d, want %d", got, -NOTIFY_PFS_SIZE)
 	}
-	if got := binary.LittleEndian.Uint64(wire[16:24]); got != 7 {
-		t.Fatalf("notify nodeid = %d", got)
+	if got := binary.LittleEndian.Uint64(wire[16:24]); got != 123 {
+		t.Fatalf("notify sequence = %d", got)
 	}
-	if got := binary.LittleEndian.Uint64(wire[24:32]); got != 99 {
-		t.Fatalf("notify size = %d", got)
+	if got := binary.LittleEndian.Uint64(wire[24:32]); got != 7 {
+		t.Fatalf("notify object nodeid = %d", got)
 	}
 	if got := binary.LittleEndian.Uint64(wire[32:40]); got != 123 {
-		t.Fatalf("notify sequence = %d", got)
+		t.Fatalf("notify object version = %d", got)
+	}
+	if got := binary.LittleEndian.Uint64(wire[64:72]); got != 99 {
+		t.Fatalf("notify exact size = %d", got)
 	}
 
 	server.kernelSettings = InitIn{}
-	if status := server.PFSSizeNotify(7, 99, 123); status != EINVAL {
+	if status := server.PFSSizeNotify(123, object); status != EINVAL {
 		t.Fatalf("unnegotiated PFSSizeNotify = %v, want EINVAL", status)
 	}
 }
