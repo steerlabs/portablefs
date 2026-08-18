@@ -4,6 +4,8 @@
 package fuse
 
 import (
+	"io"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,10 +29,12 @@ type testVariableReplyLifecycle struct {
 type lookupLifecycleFileSystem struct {
 	RawFileSystem
 	status Status
+	nodeID uint64
 }
 
 func (f *lookupLifecycleFileSystem) Lookup(_ <-chan struct{}, _ *InHeader, _ string, out *EntryOut) Status {
 	*out = EntryOut{}
+	out.NodeId = f.nodeID
 	return f.status
 }
 
@@ -189,6 +193,65 @@ func TestLookupCallbackStatusControlsPhysicalPublicationLifecycle(t *testing.T) 
 					t.Fatalf("unordered reply produced ReplyWritten(%v)", got)
 				default:
 				}
+			}
+		})
+	}
+}
+
+func TestVariableReplyWithoutPortableFSLifecycleUsesUpstreamWriterPath(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		status         Status
+		nodeID         uint64
+		wantDataSize   int
+		wantWireStatus int32
+	}{
+		{name: "success", status: OK, nodeID: 17, wantDataSize: int(unsafe.Sizeof(EntryOut{}))},
+		{name: "errno", status: ENOENT, wantWireStatus: -int32(ENOENT)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			input := make([]byte, unsafe.Sizeof(InHeader{}))
+			header := (*InHeader)(unsafe.Pointer(&input[0]))
+			header.Unique, header.NodeId, header.Opcode = 61, FUSE_ROOT_ID, _OP_LOOKUP
+			req := &request{
+				inputBuf: input, inPayload: []byte("plain\x00"),
+				outHeaderBuf:  make([]byte, sizeOfOutHeader),
+				outDataBuf:    make([]byte, unsafe.Sizeof(EntryOut{})),
+				outPayload:    make([]byte, 0, PFSCacheStampSize),
+				variableReply: true, status: OK,
+			}
+			protocol := &protocolServer{fileSystem: &lookupLifecycleFileSystem{
+				RawFileSystem: NewDefaultRawFileSystem(), status: test.status, nodeID: test.nodeID,
+			}}
+			doLookup(protocol, req)
+
+			reader, writer, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := &Server{mountFd: int(writer.Fd())}
+			if status := server.writeReply(req); status != OK {
+				t.Fatalf("write reply = %v, want OK", status)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			wire, err := io.ReadAll(reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := reader.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := len(wire), int(sizeOfOutHeader)+test.wantDataSize; got != want {
+				t.Fatalf("wire bytes = %d, want %d", got, want)
+			}
+			out := (*OutHeader)(unsafe.Pointer(&wire[0]))
+			if got := out.Status; got != test.wantWireStatus {
+				t.Fatalf("wire status = %d, want %d", got, test.wantWireStatus)
+			}
+			if got := out.Unique; got != header.Unique {
+				t.Fatalf("wire unique = %#x, want %#x", got, header.Unique)
 			}
 		})
 	}
