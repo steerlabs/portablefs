@@ -220,7 +220,7 @@ func TestStampedReadDirPlusKeepsKernelBufferCapacity(t *testing.T) {
 	}
 }
 
-func TestReplyPublicationMarkerPermitsOnlyStateBearingHeaderErrors(t *testing.T) {
+func TestReplyPublicationMarkerRequiresStructuredSuccess(t *testing.T) {
 	requestFor := func(opcode uint32, status Status) *request {
 		input := make([]byte, unsafe.Sizeof(InHeader{}))
 		req := &request{inputBuf: input, status: status}
@@ -234,7 +234,7 @@ func TestReplyPublicationMarkerPermitsOnlyStateBearingHeaderErrors(t *testing.T)
 		want   bool
 	}{
 		{name: "successful lookup", opcode: _OP_LOOKUP, status: OK, want: true},
-		{name: "negative lookup", opcode: _OP_LOOKUP, status: ENOENT, want: true},
+		{name: "legacy negative lookup", opcode: _OP_LOOKUP, status: ENOENT},
 		{name: "lookup transport error", opcode: _OP_LOOKUP, status: EIO},
 		{name: "non-lookup ENOENT", opcode: _OP_GETATTR, status: ENOENT},
 	} {
@@ -243,6 +243,29 @@ func TestReplyPublicationMarkerPermitsOnlyStateBearingHeaderErrors(t *testing.T)
 				t.Fatalf("replyMayRequestPFSPublish(%d, %v) = %t, want %t", test.opcode, test.status, got, test.want)
 			}
 		})
+	}
+}
+
+func TestStructuredNegativeSerializationRetainsEntryAndStamp(t *testing.T) {
+	input := make([]byte, unsafe.Sizeof(InHeader{}))
+	req := request{
+		inputBuf:      input,
+		outHeaderBuf:  make([]byte, sizeOfOutHeader),
+		outDataBuf:    make([]byte, unsafe.Sizeof(EntryOut{})),
+		outPayload:    make([]byte, PFSCacheStampSize),
+		status:        OK,
+		publishMarked: true,
+	}
+	req.inHeader().Opcode = _OP_LOOKUP
+	req.inHeader().Unique = 42
+	req.serializeHeader(len(req.outPayload))
+	if req.outHeader().Status != 0 || req.outHeader().Unique != 42|PFS_UNIQUE_PUBLISH {
+		t.Fatalf("structured negative header = %+v", req.outHeader())
+	}
+	want := uint32(sizeOfOutHeader + unsafe.Sizeof(EntryOut{}) + uintptr(PFSCacheStampSize))
+	if req.outHeader().Length != want || len(req.outDataBuf) != int(unsafe.Sizeof(EntryOut{})) || len(req.outPayload) != PFSCacheStampSize {
+		t.Fatalf("structured negative wire = length:%d data:%d stamp:%d, want %d/%d/%d",
+			req.outHeader().Length, len(req.outDataBuf), len(req.outPayload), want, unsafe.Sizeof(EntryOut{}), PFSCacheStampSize)
 	}
 }
 
