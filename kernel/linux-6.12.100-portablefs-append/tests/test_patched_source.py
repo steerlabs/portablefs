@@ -134,7 +134,6 @@ class PatchedSourceTests(unittest.TestCase):
             pfs_size.index("!outarg.object.nodeid"),
             pfs_size.index("fuse_ilookup"),
         )
-        self.assertIn("fi->pfs_repairing = true", pfs_size)
         self.assertIn("fuse_pfs_update_size_locked(inode, &outarg.object",
                       pfs_size)
 
@@ -175,9 +174,9 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("err = -EPROTO", repair[lookup:first_mutation])
         self.assertIn("fuse_invalidate_entry_cache(entry)", repair)
         self.assertIn("fsnotify_name", repair)
-        self.assertIn("parent_fi->pfs_repairing = true", repair)
         self.assertIn("parent_fi->pfs_entry_repair_sequence", repair)
-        self.assertIn("parent_fi->attr_version", repair)
+        self.assertNotIn("parent_fi->pfs_object_version", repair)
+        self.assertNotIn("parent_fi->attr_version", repair)
         for forbidden in (
             "inode_lock",
             "d_invalidate",
@@ -186,6 +185,13 @@ class PatchedSourceTests(unittest.TestCase):
             "dont_mount",
         ):
             self.assertNotIn(forbidden, repair)
+        all_fuse = "\n".join(
+            self.source(path) for path in (
+                "fs/fuse/dev.c", "fs/fuse/dir.c", "fs/fuse/fuse_i.h",
+                "fs/fuse/post_state.c",
+            )
+        )
+        self.assertNotIn("pfs_repairing", all_fuse)
 
     def test_strict_init_forbids_posix_acl_cache_without_publication(self) -> None:
         text = self.source("fs/fuse/inode.c")
@@ -516,6 +522,67 @@ class PatchedSourceTests(unittest.TestCase):
             installer.index("fi->attr_version =", first_store),
             installer.index("fi->pfs_object_version =", first_store),
         )
+
+    def test_entry_and_attr_repairs_use_distinct_publication_gates(self) -> None:
+        post_state = self.source("fs/fuse/post_state.c")
+        lookup = post_state[
+            post_state.index("int fuse_pfs_install_lookup"):
+            post_state.index("int fuse_pfs_install_getattr")
+        ]
+        self.assertIn("parent_prior = max(parent_fi->pfs_object_version,",
+                      lookup)
+        self.assertIn("parent_fi->pfs_entry_repair_sequence", lookup)
+
+        installer = post_state[post_state.index("int fuse_pfs_install_post_state"):]
+        snapshot = installer[
+            installer.index("NEW-A: this loop is the complete step-3 snapshot"):
+            installer.index("if (entry_parent) {", installer.index(
+                "NEW-A: this loop is the complete step-3 snapshot"))
+        ]
+        self.assertIn("parent_prior = max(records[i].prior_version,", snapshot)
+        self.assertIn("fi->pfs_entry_repair_sequence", snapshot)
+
+        directory = self.source("fs/fuse/dir.c")
+        entry = directory[
+            directory.index("int fuse_pfs_reverse_entry"):
+            directory.index("int fuse_reverse_inval_entry")
+        ]
+        self.assertIn("parent_fi->pfs_entry_repair_sequence", entry)
+        self.assertNotIn("parent_fi->pfs_object_version", entry)
+        self.assertNotIn("parent_fi->attr_version", entry)
+
+    def test_exact_attr_validity_is_release_published_last(self) -> None:
+        inode = self.source("fs/fuse/inode.c")
+        common = inode[
+            inode.index("void fuse_change_attributes_common"):
+            inode.index("u32 fuse_get_cache_mask")
+        ]
+        self.assertGreater(
+            common.index("smp_store_release(&fi->i_time, attr_valid)"),
+            common.index("inode->i_flags &= ~S_NOSEC"),
+        )
+
+        post_state = self.source("fs/fuse/post_state.c")
+        for start, end in (
+            ("static int pfs_install_stamped_attr",
+             "int fuse_pfs_install_repair_attr_locked"),
+            ("int fuse_pfs_install_repair_attr_locked",
+             "int fuse_pfs_install_lookup"),
+            ("int fuse_pfs_install_post_state", None),
+        ):
+            install = post_state[
+                post_state.index(start):
+                post_state.index(end, post_state.index(start)) if end else None
+            ]
+            self.assertIn("fuse_change_attributes_common", install)
+            self.assertGreater(
+                install.index("smp_store_release(&fi->i_time"),
+                install.index("fi->pfs_object_version ="),
+            )
+
+        directory = self.source("fs/fuse/dir.c")
+        self.assertEqual(directory.count("smp_load_acquire(&fi->i_time)"), 2)
+        self.assertNotIn("time_before64(fi->i_time", directory)
 
     def test_post_state_variable_length_is_not_a_vfs_result(self) -> None:
         post_state = self.source("fs/fuse/post_state.c")
