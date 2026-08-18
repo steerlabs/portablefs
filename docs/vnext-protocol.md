@@ -412,7 +412,10 @@ transaction under that mutex:
    candidate and each surviving attr candidate. If either the positive-name,
    negative-name, or attr registry is full, do not register that candidate and
    give only that entry or attr zero lifetime. Capacity exhaustion is not a
-   request error and never starts withdrawal.
+   request error and never starts withdrawal. A READDIRPLUS page reserves its
+   complete surviving set of names and attrs as one unit; if any required
+   registry lacks capacity, register none of those candidates and give every
+   entry and attr in the page zero lifetime.
 3. Insert every surviving candidate into the per-coordinate in-flight registry
    with state PENDING and a mutable `revoked` bit. A READDIRPLUS page inserts
    all of its names and item attrs under the page's one cursor. The reservation
@@ -426,13 +429,15 @@ encoded with zero lifetime and the applicable DROP flag. A peer repair that
 finds an overlapping FINALIZED reservation waits outside the mutex for that
 reply's physical `/dev/fuse` write to finish, then performs the kernel repair;
 a failed write starts withdrawal. Candidate admission while the wait or repair
-is active drops that coordinate. After the kernel repair completes, the daemon
-takes the mutex, advances `last_peer_repair_sequence[coordinate]`, clears
-REPAIRING, and only then sends peer COMPLETE. Physical reply completion or
-failure removes the FINALIZED reservation. A reply writer MUST NOT emit
-cacheable bytes for a PENDING reservation or change FINALIZED bytes. The kernel
-sequence gate below remains mandatory and covers any installer/notification
-overlap at the kernel boundary.
+is active drops that coordinate. The FINALIZED wait MUST run within this
+participant's existing visibility-repair budget; on expiry the daemon fences
+this participant rather than continuing to withhold peer COMPLETE. After the
+kernel repair completes, the daemon takes the mutex, advances
+`last_peer_repair_sequence[coordinate]`, clears REPAIRING, and only then sends
+peer COMPLETE. Physical reply completion or failure removes the FINALIZED
+reservation. A reply writer MUST NOT emit cacheable bytes for a PENDING
+reservation or change FINALIZED bytes. The kernel sequence gate below remains
+mandatory and covers any installer/notification overlap at the kernel boundary.
 
 A candidate that is not newer, was revoked, or exceeded a registry capacity is
 dropped, not treated as a protocol error:
@@ -469,9 +474,11 @@ The kernel processes an admitted trailer as one installation transaction:
    namespace-coordinate gate; a newer repair of another name may drop this
    entry but can never admit stale state. A marked record, or a record not
    strictly newer than its gate, makes no cache change. It is silently dropped
-   even when it came from the current mutation. These comparisons cover a peer
-   repair completed after daemon finalization but before the kernel lock was
-   acquired.
+   even when it came from the current mutation. Every comparison in this step
+   is evaluated against the versions installed before this transaction; no
+   step-4 store is visible to any step-3 comparison. These comparisons cover a
+   peer repair completed after daemon finalization but before the kernel lock
+   was acquired.
 4. Install every eligible `fuse_attr` field, `i_size`, inode class, cached ACL
    decision, and admitted lifetime. Still under `fi->lock`, set
    `fi->attr_version = atomic64_inc_return(&fc->attr_version)` and then set
@@ -1368,6 +1375,14 @@ issue FUSE LOOKUP, CREATE, OPEN, or SETATTR for the same final component. A
 failure to support the opcode under the vNext profile aborts the connection;
 `ENOSYS` is not a fallback signal.
 
+Before dispatching a request whose flags contain `O_TRUNC`,
+`fuse_atomic_open()` MUST take mount write access for `file->f_path.mnt`.
+Failure returns `-EROFS` without dispatch; success is held through the reply
+and balanced on every exit. This applies independently of the eventual CREATED
+or OPENED result and mirrors `open_last_lookups()`/`lookup_open()` removing
+mutation intent when `got_write` is false. The authority cannot observe a
+client-side read-only bind mount.
+
 On CREATED, `fuse_atomic_open()` sets `FMODE_CREATED` before returning to
 `do_open`, including when CREATED came from exact replay. This is the required
 VFS signal to skip a contradictory post-create access check; its absence is a
@@ -1376,21 +1391,29 @@ kernel ABI defect, not an authority permission failure.
 For a truncating OPENED result, `fuse_atomic_open()` sets private
 `FMODE_PFS_APPLIED` before returning to `do_open`. Patch 0001 changes
 `fs/namei.c:do_open()` before `may_open()` and `handle_truncate()` to apply the
-same consumed-operation rule as create:
+consumed-operation rule without discarding client-only write checks:
 
 ```c
-if (file->f_mode & (FMODE_CREATED | FMODE_PFS_APPLIED)) {
+if (file->f_mode & FMODE_CREATED) {
+	WARN_ON(!(open_flag & O_CREAT));
 	open_flag &= ~O_TRUNC;
 	acc_mode = 0;
+} else if (file->f_mode & FMODE_PFS_APPLIED) {
+	open_flag &= ~O_TRUNC;
+	acc_mode &= MAY_WRITE;
 }
 ```
 
-This is not just errno suppression: clearing `O_TRUNC` prevents the VFS from
-issuing a second SETATTR truncate, and clearing `acc_mode` prevents a second
-access decision after the authority has applied the operation. The bit is set
-only for a structured truncating OPENED result whose truncate reached the
-authority's normative decision; nontruncating OPENED and pre-apply failures do
-not set it.
+For `FMODE_PFS_APPLIED`, `do_open()` sends the retained `MAY_WRITE` bit through
+only the client-local subset of `may_open()`: `sb_permission()` and its
+`sb_rdonly` rejection, `IS_IMMUTABLE`, and the `IS_APPEND` requirement. It MUST
+run those checks when the retained mask contains `MAY_WRITE` and MUST NOT repeat
+the target mode or ACL permission decision. The create-only
+`WARN_ON(!(open_flag & O_CREAT))` remains inside the `FMODE_CREATED` branch.
+Clearing `O_TRUNC` prevents a second SETATTR truncate; only CREATED clears
+`acc_mode` completely. `FMODE_PFS_APPLIED` is set only for a structured
+truncating OPENED result whose truncate reached the authority's normative
+decision; nontruncating OPENED and pre-apply failures do not set it.
 
 ### 4.3 Authority operation and permission split
 
@@ -1562,12 +1585,12 @@ unrelated receipts.
 
 The connection owns a semaphore of exactly `max_publication_tokens` permits.
 One permit represents one possible publication token and therefore one receipt,
-not one task or scope. Before entering a VFS operation that can add tokens, the
-kernel reserves the path's exact maximum token count, before any affected inode
-or parent `i_rwsem` is taken. Token-add consumes one of that scope's reserved
-permits without sleeping; scope merge moves tokens and their permits and never
-coalesces them. Atomic open may therefore leave lookup and open/create tokens in
-one scope while still consuming two permits.
+not one task or scope. The defining reservation rule is that every site that can
+enter a publication scope reserves the path's exact maximum token count before
+any lock that scope's operation will take. Token-add consumes one of that
+scope's reserved permits without sleeping; scope merge moves tokens and their
+permits and never coalesces them. Atomic open may therefore leave lookup and
+open/create tokens in one scope while still consuming two permits.
 
 Each created token retains its permit until its matching DONE is consumed or
 the connection reaches CACHE_WITHDRAWN or UNSERVABLE. A reservation that never
@@ -1915,8 +1938,8 @@ change that edits their source schema.
 | XFS state extraction | `vcs/internal/xfsstore` mutation interfaces and implementations, canonical striped writer-lock sets for every mutation including SetAttr, post-operation `statx`, `FS_IOC_GETFLAGS`, rdev/blksize extraction, parent snapshots, sync error classification |
 | Linux daemon adapter | `vcs/internal/fusev3/fuse_linux.go`, `raw_linux.go`, `write_transaction_linux.go` replacement, mutation handlers, source publication, identity/node registry, range mutation replies, and mount teardown; add PENDING/FINALIZED cache-install reservations under the source/peer mutex, peer revocation before COMPLETE, positive/negative/attr capacity drops, page-atomic READDIRPLUS registration, and retained stream replay metadata |
 | Maintained go-fuse fork | FUSE 7.42 constants and UAPI structs, deferred private-opcode reply handles, nonblocking reader-to-stream-worker dispatch, combined ingress/reorder window accounting, replay notification, and variable private-opcode replies; no reader goroutine may wait on an authority write or offset gap. The current fork has no `/dev/fuse` mmap API, does not export `mountFd`, and computes `outPayloadSize` only for six stock opcodes, so all three surfaces must be added explicitly along with completion-ring setup exposure |
-| Kernel patch 0001: generic VFS | `kernel/linux-6.12.100-portablefs-append/0001-fs-add-post-VFS-reply-publication-scopes.patch` and `fs/namei.c`; make token permits part of `fs_reply_publish_token`, preserve them through scope merge, post and wait for every token uninterruptibly, and release exactly once. Reserve two possible tokens in `open_last_lookups()` before the final-parent lock; reserve one in `filename_create()` before the parent lock, `do_unlinkat()`/rmdir before the parent lock, and `do_renameat2()` before either parent lock and before `lock_rename()` (the one rename token covers both parent roles). Reserve one before inode/file locks in `vfs_write()`, `vfs_iter_write()`, splice, copy-file-range, and io_uring write entry points, and before the applicable locks in setattr, fallocate, xattr, link, symlink, mkdir/mknod, and tmpfile sites. Add the `FMODE_PFS_APPLIED` clearing of `O_TRUNC` and `acc_mode` in `do_open()` before `may_open()`/`handle_truncate()` |
-| Kernel patches 0002/0003: FUSE profile | `0002-fuse-add-PortableFS-strict-coherence-profile.patch`, `0003-fuse-expire-strict-namespace-entries-without-parent-.patch`, and `README.md`; add the protocol-6 installer, ATTR/ENTRY/SIZE sequence stamps, parent and target gates, publication-token semaphore and ring, write-stream contexts/replay scheduling, withdrawal states, ABI layout/state-machine tests, and live qualification |
+| Kernel patch 0001: generic VFS | `kernel/linux-6.12.100-portablefs-append/0001-fs-add-post-VFS-reply-publication-scopes.patch` and `fs/namei.c`; make token permits part of `fs_reply_publish_token`, preserve them through scope merge, post and wait for every token uninterruptibly, and release exactly once. Every site that can enter a publication scope reserves before any lock that scope's operation will take; the following sites are a checklist, not the definition. Reserve one possible token in `lookup_slow()`/`walk_component()` before `inode_lock_shared()` for each slow path component, and one at the stat/GETATTR entry before `vfs_getattr()` can call `fuse_do_getattr()`. Reserve two possible tokens in `open_last_lookups()` before the final-parent lock; reserve one in `filename_create()` before the parent lock, `do_unlinkat()`/rmdir before the parent lock, and `do_renameat2()` before either parent lock and before `lock_rename()` (the one rename token covers both parent roles). Reserve one before inode/file locks in `vfs_write()`, `vfs_iter_write()`, splice, copy-file-range, and io_uring write entry points, and before the applicable locks in setattr, fallocate, xattr, link, symlink, mkdir/mknod, and tmpfile sites. Add the `FMODE_PFS_APPLIED` split in `do_open()` before `may_open()`/`handle_truncate()`: clear `O_TRUNC`, retain `MAY_WRITE` for the client-only `sb_rdonly`/immutable/append checks, and condition the create warning on `FMODE_CREATED` |
+| Kernel patches 0002/0003: FUSE profile | `0002-fuse-add-PortableFS-strict-coherence-profile.patch`, `0003-fuse-expire-strict-namespace-entries-without-parent-.patch`, and `README.md`; add the protocol-6 installer, ATTR/ENTRY/SIZE sequence stamps, parent and target gates, publication-token semaphore and ring, pre-dispatch mount write access for truncating RESOLVE_OPEN, write-stream contexts/replay scheduling, withdrawal states, ABI layout/state-machine tests, and live qualification |
 | pfslocal | `pfslocal/pfslocal.proto`, generated Go/Swift, framing golden files, protocol-major gates, mutation replies, write request, resolve-open messages, PublicationAck tests |
 | macOS shared adapter | `swift/PortableFSKit/Sources/PortableFSKit/FSKitMapping.swift`, `OperationsAdapter.swift`, `VolumeCore.swift`, `MacOSV3Coherence.swift`, `MacOSV3FSKitComposition.swift`, transport and publication tests |
 | macOS 27 adapter | `swift/PortableFSKitMacOS27/Sources/PortableFSKitMacOS27/NativeDataCache.swift`; checked-in SDK artifacts and compiling Handler probes must precede any Handler result adapter or qualification claim |
