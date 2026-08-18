@@ -74,6 +74,73 @@ func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 	}
 }
 
+func TestStampedAttributeReadsCarryBirthTimeAndMaskedFlags(t *testing.T) {
+	const (
+		birthTime = int64(1_725_000_000_123_456_789)
+		flags     = uint32(0x00300870)
+	)
+	for _, test := range []struct {
+		name   string
+		opcode uint32
+		unique uint64
+		call   func(*strictFixture, uint64, *authoritypb.Attr) fuse.Status
+	}{
+		{
+			name: "lookup", opcode: 1, unique: 6920,
+			call: func(f *strictFixture, unique uint64, attr *authoritypb.Attr) fuse.Status {
+				item := testItem(47, authoritypb.Attr_REGULAR, 47)
+				item.Attr = attr
+				item.ObjectVersion, item.SnapshotSequence = 4, 5
+				f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+					return &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}}, nil
+				}
+				return f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "stamped", &fuse.EntryOut{})
+			},
+		},
+		{
+			name: "getattr", opcode: 3, unique: 6922,
+			call: func(f *strictFixture, unique uint64, attr *authoritypb.Attr) fuse.Status {
+				f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+					return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
+						Attr: attr, ObjectVersion: 4, SnapshotSequence: 5,
+					}}}, nil
+				}
+				return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}}, &fuse.AttrOut{})
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			attr := &authoritypb.Attr{Inode: 1, Kind: authoritypb.Attr_DIRECTORY, Mode: 0o755, BirthTimeNs: birthTime, Flags: flags}
+			if test.name == "lookup" {
+				attr.Inode, attr.Kind, attr.Mode = 47, authoritypb.Attr_REGULAR, 0o600
+			}
+			if status := test.call(f, test.unique, attr); !status.Ok() {
+				t.Fatalf("%s = %v: %v", test.name, status, f.mount.fatalError())
+			}
+			payload := make([]byte, fuse.PFSCacheStampSize)
+			if n, status := f.raw.PrepareReplyPayload(test.unique, fuse.FUSE_ROOT_ID, test.opcode, make([]byte, 128), payload, 0); !status.Ok() || n != 32 {
+				t.Fatalf("%s stamp = (%d, %v), want 32 bytes", test.name, n, status)
+			}
+			if got := binary.LittleEndian.Uint64(payload[0:8]); got != 5 {
+				t.Errorf("snapshot = %d, want 5", got)
+			}
+			if got := binary.LittleEndian.Uint64(payload[8:16]); got != 4 {
+				t.Errorf("object version = %d, want 4", got)
+			}
+			if got := int64(binary.LittleEndian.Uint64(payload[16:24])); got != birthTime {
+				t.Errorf("birth time = %d, want %d", got, birthTime)
+			}
+			if got := binary.LittleEndian.Uint32(payload[24:28]); got != flags {
+				t.Errorf("masked flags = %#x, want %#x", got, flags)
+			}
+			if got := binary.LittleEndian.Uint32(payload[28:32]); got != 0 {
+				t.Errorf("reserved = %#x, want zero", got)
+			}
+		})
+	}
+}
+
 func TestNonENOENTLookupFailureRemainsUnpublished(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {

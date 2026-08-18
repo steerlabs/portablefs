@@ -5,6 +5,7 @@
 package fuse
 
 import (
+	"bytes"
 	"encoding/binary"
 	"math"
 	"syscall"
@@ -75,27 +76,60 @@ func TestPFSWriteABILayout(t *testing.T) {
 			t.Errorf("fuse_pfs_post_state_header.%s offset = %d, want %d", name, test.got, test.want)
 		}
 	}
-	var object PFSObjectState
-	if got, want := unsafe.Sizeof(object), uintptr(PFSObjectStateSize); got != want {
-		t.Fatalf("fuse_pfs_object_state size = %d, want %d", got, want)
+	object := PFSObjectState{
+		Nodeid: 0x0102030405060708, ObjectVersion: 0x1112131415161718,
+		Roles: 0x21222324, InodeFlags: 0x31323334, BirthTimeNS: -123456789,
+		PFSClass: 0x41424344, RecordFlags: 0x51525354,
 	}
-	for name, test := range map[string]struct{ got, want uintptr }{
-		"nodeid":          {unsafe.Offsetof(object.Nodeid), 0},
-		"object_version":  {unsafe.Offsetof(object.ObjectVersion), 8},
-		"stable_identity": {unsafe.Offsetof(object.StableIdentity), 16},
-		"attr":            {unsafe.Offsetof(object.Attr), 32},
-		"roles":           {unsafe.Offsetof(object.Roles), 120},
-		"inode_flags":     {unsafe.Offsetof(object.InodeFlags), 124},
-		"birth_time_ns":   {unsafe.Offsetof(object.BirthTimeNS), 128},
-		"pfs_class":       {unsafe.Offsetof(object.PFSClass), 136},
-		"record_flags":    {unsafe.Offsetof(object.RecordFlags), 140},
-	} {
-		if test.got != test.want {
-			t.Errorf("fuse_pfs_object_state.%s offset = %d, want %d", name, test.got, test.want)
-		}
+	for index := range object.StableIdentity {
+		object.StableIdentity[index] = byte(0x60 + index)
+	}
+	for index := range object.Attr {
+		object.Attr[index] = byte(index)
+	}
+	encoded := make([]byte, PFSObjectStateSize)
+	if !EncodePFSObjectState(encoded, &object) {
+		t.Fatal("manual fuse_pfs_object_state encoder refused its fixed-size buffer")
+	}
+	if got := binary.LittleEndian.Uint64(encoded[0:8]); got != object.Nodeid {
+		t.Errorf("encoded nodeid = %#x, want %#x", got, object.Nodeid)
+	}
+	if got := binary.LittleEndian.Uint64(encoded[8:16]); got != object.ObjectVersion {
+		t.Errorf("encoded object_version = %#x, want %#x", got, object.ObjectVersion)
+	}
+	if !bytes.Equal(encoded[16:32], object.StableIdentity[:]) || !bytes.Equal(encoded[32:120], object.Attr[:]) {
+		t.Error("encoded identity or 88-byte Linux fuse_attr landed at the wrong offset")
+	}
+	if got := binary.LittleEndian.Uint32(encoded[120:124]); got != object.Roles {
+		t.Errorf("encoded roles = %#x, want %#x", got, object.Roles)
+	}
+	if got := binary.LittleEndian.Uint32(encoded[124:128]); got != object.InodeFlags {
+		t.Errorf("encoded inode_flags = %#x, want %#x", got, object.InodeFlags)
+	}
+	if got := int64(binary.LittleEndian.Uint64(encoded[128:136])); got != object.BirthTimeNS {
+		t.Errorf("encoded birth_time_ns = %d, want %d", got, object.BirthTimeNS)
+	}
+	if got := binary.LittleEndian.Uint32(encoded[136:140]); got != object.PFSClass {
+		t.Errorf("encoded pfs_class = %#x, want %#x", got, object.PFSClass)
+	}
+	if got := binary.LittleEndian.Uint32(encoded[140:144]); got != object.RecordFlags {
+		t.Errorf("encoded record_flags = %#x, want %#x", got, object.RecordFlags)
 	}
 	if got, want := unsafe.Sizeof(PFSCacheStamp{}), uintptr(PFSCacheStampSize); got != want {
 		t.Fatalf("fuse_pfs_cache_stamp size = %d, want %d", got, want)
+	}
+	stamp := PFSCacheStamp{
+		SnapshotSequence: 0x6162636465666768, ObjectVersion: 0x7172737475767778,
+		BirthTimeNS: -987654321, InodeFlags: 0x81828384,
+	}
+	stampWire := make([]byte, PFSCacheStampSize)
+	if !EncodePFSCacheStamp(stampWire, &stamp) ||
+		binary.LittleEndian.Uint64(stampWire[0:8]) != stamp.SnapshotSequence ||
+		binary.LittleEndian.Uint64(stampWire[8:16]) != stamp.ObjectVersion ||
+		int64(binary.LittleEndian.Uint64(stampWire[16:24])) != stamp.BirthTimeNS ||
+		binary.LittleEndian.Uint32(stampWire[24:28]) != stamp.InodeFlags ||
+		binary.LittleEndian.Uint32(stampWire[28:32]) != 0 {
+		t.Fatalf("manual fuse_pfs_cache_stamp layout = %x", stampWire)
 	}
 	var publishIn PFSPublishIn
 	if got, want := unsafe.Sizeof(publishIn)-unsafe.Sizeof(publishIn.InHeader), uintptr(32); got != want {

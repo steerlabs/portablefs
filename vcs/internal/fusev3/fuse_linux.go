@@ -1372,7 +1372,10 @@ func (n *node) Lookup(ctx context.Context, name string) (*authoritypb.Item, sysc
 	if publication == nil || publication.cacheStamp != nil {
 		return nil, syscall.EIO
 	}
-	publication.cacheStamp = &fuse.PFSCacheStamp{SnapshotSequence: item.GetSnapshotSequence(), ObjectVersion: item.GetObjectVersion()}
+	publication.cacheStamp = &fuse.PFSCacheStamp{
+		SnapshotSequence: item.GetSnapshotSequence(), ObjectVersion: item.GetObjectVersion(),
+		BirthTimeNS: item.GetAttr().GetBirthTimeNs(), InodeFlags: item.GetAttr().GetFlags(),
+	}
 	return cloneItem(item), 0
 }
 
@@ -1394,7 +1397,10 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 	if publication == nil || publication.cacheStamp != nil {
 		return syscall.EIO
 	}
-	publication.cacheStamp = &fuse.PFSCacheStamp{SnapshotSequence: snapshot, ObjectVersion: objectVersion}
+	publication.cacheStamp = &fuse.PFSCacheStamp{
+		SnapshotSequence: snapshot, ObjectVersion: objectVersion,
+		BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags(),
+	}
 	n.mount.publishAttr(ctx, out, n.item, attr)
 	return 0
 }
