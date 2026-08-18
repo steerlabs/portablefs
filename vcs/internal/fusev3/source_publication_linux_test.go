@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -1375,7 +1376,38 @@ func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
 	}
 	markTestReply(t, f.raw, unique)
 
-	f.raw.terminalizeReplyCacheOwnership()
+	terminalDone := make(chan struct{})
+	go func() {
+		f.raw.terminalizeReplyCacheOwnership()
+		close(terminalDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		f.raw.mu.Lock()
+		terminalizing := f.raw.replyTerminalizing
+		f.raw.mu.Unlock()
+		if terminalizing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("teardown did not enter terminalizing state")
+		}
+		runtime.Gosched()
+	}
+	select {
+	case <-terminalDone:
+		t.Fatal("teardown completed before the finalized writer reported its physical result")
+	default:
+	}
+
+	// A writer failure after teardown begins still crosses the joined callback
+	// edge, and both ownership classes settle exactly once.
+	f.raw.ReplyWritten(unique, fuse.EIO)
+	select {
+	case <-terminalDone:
+	case <-time.After(time.Second):
+		t.Fatal("teardown did not finish after the original writer callback")
+	}
 	f.raw.terminalizeReplyCacheOwnership()
 	f.raw.mu.Lock()
 	pendingNames, pendingNegatives, pendingAttrs := f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
@@ -1386,8 +1418,7 @@ func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
 			pendingNames, pendingNegatives, pendingAttrs, reservations)
 	}
 
-	// A writer failure after teardown still settles the publication but cannot
-	// release either ownership class a second time.
+	// A duplicate callback cannot release either ownership class a second time.
 	f.raw.ReplyWritten(unique, fuse.EIO)
 	f.raw.mu.Lock()
 	pendingNames, pendingNegatives, pendingAttrs = f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
@@ -1399,7 +1430,7 @@ func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
 	}
 }
 
-func TestTeardownSettlesPhysicalReplyBeforeWithdrawalAndRejectsLateAck(t *testing.T) {
+func TestTeardownJoinsMidWriteReplyBeforeWithdrawalAndRejectsLateAck(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"withdraw": testItem(92, authoritypb.Attr_REGULAR, 92)}
 	unique := nextTestRequestUnique()
@@ -1411,7 +1442,40 @@ func TestTeardownSettlesPhysicalReplyBeforeWithdrawalAndRejectsLateAck(t *testin
 		t.Fatalf("prepare LOOKUP = (%d, %v)", n, status)
 	}
 	markTestReply(t, f.raw, unique)
+
+	terminalDone := make(chan struct{})
+	go func() {
+		f.raw.terminalizeReplyCacheOwnership()
+		close(terminalDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		f.raw.mu.Lock()
+		terminalizing := f.raw.replyTerminalizing
+		f.raw.mu.Unlock()
+		if terminalizing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("teardown did not enter terminalizing state")
+		}
+		runtime.Gosched()
+	}
+	select {
+	case <-terminalDone:
+		t.Fatal("teardown completed while the finalized /dev/fuse write was in progress")
+	default:
+	}
+
+	// The device accepted the response after teardown began. ReplyWritten is
+	// the only physical result edge and must unblock classification before the
+	// withdrawal snapshot can observe admitted state.
 	f.raw.ReplyWritten(unique, fuse.OK)
+	select {
+	case <-terminalDone:
+	case <-time.After(time.Second):
+		t.Fatal("teardown did not join the successful original writer")
+	}
 
 	serial := nextTestRequestUnique()
 	publishUnique := uint64(1)<<61 | serial
@@ -1422,11 +1486,9 @@ func TestTeardownSettlesPhysicalReplyBeforeWithdrawalAndRejectsLateAck(t *testin
 		Nodeid:        testPublicationNodeID,
 		Opcode:        testPublicationOpcode,
 	}
-	if status := f.raw.PFSPublish(nil, in, &fuse.PFSPublishOut{}); !status.Ok() {
-		t.Fatalf("PFS_PUBLISH = %v", status)
+	if status := f.raw.PFSPublish(nil, in, &fuse.PFSPublishOut{}); status != fuse.Status(syscall.ENOTCONN) {
+		t.Fatalf("terminal PFS_PUBLISH = %v, want ENOTCONN", status)
 	}
-
-	f.raw.terminalizeReplyCacheOwnership()
 	f.raw.mu.Lock()
 	_, nameObligation := f.raw.cachedNames[nameKey{parent: 1, name: "withdraw"}]
 	attrObligations := len(f.raw.cachedAttrs)
@@ -1442,7 +1504,7 @@ func TestTeardownSettlesPhysicalReplyBeforeWithdrawalAndRejectsLateAck(t *testin
 			replies, acks, publishingNames, publishingInodes, sourcePublishing)
 	}
 
-	deadline := time.Now().Add(time.Second)
+	deadline = time.Now().Add(time.Second)
 	f.raw.revokeCachedNames(deadline)
 	f.raw.revokeCachedAttrs(deadline)
 	f.raw.ReplyWritten(publishUnique, fuse.OK)
