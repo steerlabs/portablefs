@@ -1,4 +1,4 @@
-From 23ef97e11a5774d33727e1978c4ddb756e8f185e Mon Sep 17 00:00:00 2001
+From 37f76375d5f9d14bfe1071dd64d7baeb158b4ea0 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -7,16 +7,16 @@ Signed-off-by: Tim Jang <timjang3@gmail.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
- fs/fuse/dev.c             | 144 +++++++++-
- fs/fuse/dir.c             | 544 +++++++++++++++++++++++++++++------
+ fs/fuse/dev.c             | 144 ++++++++-
+ fs/fuse/dir.c             | 544 +++++++++++++++++++++++++++++-----
  fs/fuse/file.c            | 122 +++++---
  fs/fuse/fuse_i.h          |  51 +++-
  fs/fuse/inode.c           |  69 ++---
- fs/fuse/post_state.c      | 587 ++++++++++++++++++++++++++++++++++++++
+ fs/fuse/post_state.c      | 607 ++++++++++++++++++++++++++++++++++++++
  fs/fuse/readdir.c         | 104 ++++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  71 ++++-
- 10 files changed, 1520 insertions(+), 192 deletions(-)
+ 10 files changed, 1540 insertions(+), 192 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -1708,10 +1708,10 @@ index c2ac021bf..5914e95bd 100644
  			return ERR_PTR(-ESTALE);
 diff --git a/fs/fuse/post_state.c b/fs/fuse/post_state.c
 new file mode 100644
-index 000000000..233880fcf
+index 000000000..cc8739615
 --- /dev/null
 +++ b/fs/fuse/post_state.c
-@@ -0,0 +1,587 @@
+@@ -0,0 +1,607 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* PortableFS exact post-state reply installation. */
 +
@@ -1906,6 +1906,26 @@ index 000000000..233880fcf
 +	return NULL;
 +}
 +
++static bool pfs_valid_attr_ino(struct inode *inode, u64 ino)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++	bool valid;
++
++	/*
++	 * The VFS creates the FUSE root before userspace can supply attributes,
++	 * with i_ino fixed to FUSE_ROOT_ID.  Permit the first exact record to
++	 * replace only that synthetic value; every later record remains bound to
++	 * the already-installed authoritative inode number.
++	 */
++	spin_lock(&fi->lock);
++	valid = ino == inode->i_ino ||
++		(get_node_id(inode) == FUSE_ROOT_ID &&
++		inode->i_ino == FUSE_ROOT_ID && !fi->pfs_identity_known &&
++		!fi->pfs_object_version);
++	spin_unlock(&fi->lock);
++	return valid;
++}
++
 +static int pfs_validate_record(struct fuse_pfs_post_state *state,
 +			       unsigned int index, struct inode *inode)
 +{
@@ -1917,7 +1937,7 @@ index 000000000..233880fcf
 +	    !object->roles || object->roles & ~PFS_ROLE_ALL ||
 +	    object->record_flags & ~FUSE_PFS_OBJECT_DROP_ATTR ||
 +	    fuse_invalid_attr(&object->attr) ||
-+	    object->attr.ino != inode->i_ino ||
++	    !pfs_valid_attr_ino(inode, object->attr.ino) ||
 +	    object->attr.size > inode->i_sb->s_maxbytes ||
 +	    object->attr.flags != FUSE_ATTR_PFS_SHARED ||
 +	    object->pfs_class != FUSE_PFS_CLASS_SHARED ||
@@ -2028,7 +2048,7 @@ index 000000000..233880fcf
 +	    object->object_version > visibility_sequence ||
 +	    !object->roles || object->roles & ~PFS_ROLE_ALL ||
 +	    object->record_flags || fuse_invalid_attr(&object->attr) ||
-+	    object->attr.ino != inode->i_ino ||
++	    !pfs_valid_attr_ino(inode, object->attr.ino) ||
 +	    object->attr.size > inode->i_sb->s_maxbytes ||
 +	    object->attr.flags != FUSE_ATTR_PFS_SHARED ||
 +	    object->pfs_class != FUSE_PFS_CLASS_SHARED ||

@@ -523,6 +523,27 @@ class PatchedSourceTests(unittest.TestCase):
             installer.index("fi->pfs_object_version =", first_store),
         )
 
+    def test_first_exact_root_record_replaces_only_the_synthetic_inode_number(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/post_state.c")
+        helper = text[
+            text.index("static bool pfs_valid_attr_ino"):
+            text.index("static int pfs_validate_record")
+        ]
+        self.assertIn("ino == inode->i_ino", helper)
+        self.assertIn("get_node_id(inode) == FUSE_ROOT_ID", helper)
+        self.assertIn("inode->i_ino == FUSE_ROOT_ID", helper)
+        self.assertIn("!fi->pfs_identity_known", helper)
+        self.assertIn("!fi->pfs_object_version", helper)
+        self.assertLess(helper.index("spin_lock(&fi->lock)"),
+                        helper.index("ino == inode->i_ino"))
+        self.assertGreater(helper.index("spin_unlock(&fi->lock)"),
+                           helper.index("!fi->pfs_object_version"))
+        self.assertEqual(
+            text.count("!pfs_valid_attr_ino(inode, object->attr.ino)"), 2
+        )
+
     def test_entry_and_attr_repairs_use_distinct_publication_gates(self) -> None:
         post_state = self.source("fs/fuse/post_state.c")
         lookup = post_state[
