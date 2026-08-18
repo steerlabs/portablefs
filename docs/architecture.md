@@ -93,6 +93,7 @@ product stored elsewhere.
 | Running a volume | [xfs-authority-deployment.md](./xfs-authority-deployment.md) |
 | Hosted placement, credentials, reauthorization, and fencing | [hosted-control-plane.md](./hosted-control-plane.md) |
 | Deploying a hosted XFS cell | [hosted-cell-deployment.md](./hosted-cell-deployment.md) |
+| Promoting one matched release to OpenSteer | [opensteer-production-deployment.md](./opensteer-production-deployment.md) |
 | The macOS 26 best-effort boundary and future exact requirements | [macos-26-coherence-contract.md](./macos-26-coherence-contract.md) |
 | The shipping macOS FSKit mount path | [fskit-mount.md](./fskit-mount.md) |
 | Why Windows currently fails closed and what a native frontend must prove | [windows-mount.md](./windows-mount.md) |

@@ -247,6 +247,8 @@ scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-
   manager, authorization, lifecycle, fencing, and deliberate v1 limits.
 - [docs/hosted-cell-deployment.md](./docs/hosted-cell-deployment.md) — deploying
   the outbound agent, root helper, and systemd authority units on a cell.
+- [docs/opensteer-production-deployment.md](./docs/opensteer-production-deployment.md) —
+  the single matched server/client promotion path used by OpenSteer.
 - [docs/consistency-model.md](./docs/consistency-model.md) — the exact
   visibility, durability, and retry rules.
 - [docs/failure-modes.md](./docs/failure-modes.md) — what breaks, and what a

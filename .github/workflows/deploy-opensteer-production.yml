@@ -1,0 +1,140 @@
+name: deploy-opensteer-production
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [opensteer-production]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: opensteer-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'opensteer-production' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: opensteer-production
+    env:
+      OPENSTEER_CELL_INSTANCE: pfs-v3-authority-01
+      OPENSTEER_GCP_PROJECT: smooth-comfort-488701-t3
+      OPENSTEER_GCP_ZONE: us-east4-a
+      OPENSTEER_MANAGER_INSTANCE: pfs-v3-manager-01
+      OPENSTEER_SOURCE_SHA: 0f83a56ed66f58d6aef4c1845bf8ce3509ee5b72
+      OPENSTEER_VOLUME_ID: 57483c00-a90d-42f1-bc80-945c0b477227
+      OPENSTEER_RUNNER_IMAGE: us-west1-docker.pkg.dev/opensteer-admin/staging/runner@sha256:67092c4be99c4a95f3582ca342f4c11e64f483f573e6a79bb545438ea651e942
+      WIF_PROVIDER: projects/920572344872/locations/global/workloadIdentityPools/github/providers/github-oidc
+      WIF_SERVICE_ACCOUNT: gha-deployer@opensteer-admin.iam.gserviceaccount.com
+    steps:
+      - name: Check out the exact promoted PortableFS commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Prove the successful commit is still the promotion branch head
+        env:
+          PROMOTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$PROMOTED_SHA"
+          branch_sha=$(git ls-remote origin refs/heads/opensteer-production | awk '{print $1}')
+          test "$branch_sha" = "$PROMOTED_SHA"
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          promoted_tree=$(git rev-parse 'HEAD^{tree}')
+          git log --format=%T origin/main >"$RUNNER_TEMP/main-trees"
+          grep -Fx "$promoted_tree" "$RUNNER_TEMP/main-trees" >/dev/null
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+
+      - name: Build and verify one matched hosted release
+        id: release
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          commit_epoch=$(git show -s --format=%ct HEAD)
+          release_date=$(date --utc --date="@$commit_epoch" +%Y%m%d)
+          release_id="pfs-hosted-$release_date-${commit:0:12}"
+          output="$RUNNER_TEMP/portablefs-release"
+          release_dir=$(scripts/build-hosted-linux-release.sh "$output" "$release_id" amd64)
+          deploy/gcp/verify-hosted-release.sh "$release_dir"
+          {
+            echo "release_id=$release_id"
+            echo "release_dir=$release_dir"
+            echo "candidate=opensteer-cloud-runner:pfs-${commit:0:12}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud without a stored key
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Check out the pinned OpenSteer template builder
+        uses: actions/checkout@v4
+        with:
+          repository: steerlabs/opensteer-next
+          ref: ${{ env.OPENSTEER_SOURCE_SHA }}
+          path: opensteer
+          persist-credentials: false
+
+      - name: Set up the OpenSteer Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
+      - name: Install the pinned E2B SDK
+        run: |
+          set -euo pipefail
+          sdk_root="$RUNNER_TEMP/opensteer-e2b-sdk"
+          mkdir -p "$sdk_root"
+          npm install --prefix "$sdk_root" --no-package-lock --no-save --ignore-scripts e2b@2.39.0
+          ln -s "$sdk_root/node_modules" opensteer/node_modules
+
+      - name: Build and smoke-test the candidate E2B template
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          OPENSTEER_E2B_TEMPLATE_NAME: ${{ steps.release.outputs.candidate }}
+          OPENSTEER_PACKAGE_ROOT: ${{ github.workspace }}/opensteer
+          OPENSTEER_PORTABLEFS_ARTIFACT_PATH: ${{ steps.release.outputs.release_dir }}/bin/portablefs
+        run: |
+          set -euo pipefail
+          node opensteer/deploy/e2b/build-template.mjs
+          node deploy/opensteer/e2b-release.mjs smoke \
+            '${{ steps.release.outputs.candidate }}' \
+            '${{ steps.release.outputs.release_id }}'
+
+      - name: Deploy the matched release forward
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          OPENSTEER_E2B_CANDIDATE: ${{ steps.release.outputs.candidate }}
+          OPENSTEER_EVIDENCE_DIR: ${{ runner.temp }}/opensteer-deployment-evidence
+          OPENSTEER_PACKAGE_ROOT: ${{ github.workspace }}/opensteer
+          OPENSTEER_RELEASE_DIR: ${{ steps.release.outputs.release_dir }}
+        run: deploy/opensteer/deploy-production.sh
+
+      - name: Retain the fencing and release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: ignore
+          name: opensteer-portablefs-${{ steps.release.outputs.release_id }}
+          path: ${{ runner.temp }}/opensteer-deployment-evidence
+          retention-days: 90
