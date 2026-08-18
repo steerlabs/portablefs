@@ -206,11 +206,36 @@ Different replay slots may execute concurrently. XFS supplies the same
 operation atomicity and locking it supplies to local processes; PortableFS does
 not serialize an entire volume behind a userspace global mutex.
 
-When at least one strict cached frontend is attached, cache-visible mutations
-are the deliberate exception: one volume-wide visibility ticket orders
-PREPARE, the XFS syscall, and COMPLETE. This serialization exists only to close
-and repair kernel publication gates. With no strict participants, it is absent
-and ordinary XFS concurrency remains unchanged.
+With strict cached frontends attached, each cache-visible mutation declares a
+canonical dependency set before visibility admission. Data and attribute
+changes name their stable inode identities. Namespace changes name the parent
+identity, the exact parent/name binding, and every currently bound identity;
+rename takes the union for both bindings, including the moved and replacement
+inodes. `copy_file_range` names both endpoints. The authority acquires the set
+all-or-nothing, retains it through PREPARE, XFS apply, and COMPLETE, and assigns
+the global visibility sequence while the set is held. Operations sharing a key
+therefore remain totally ordered, while disjoint mutations run concurrently.
+
+The registry grants no partial set, so dependency acquisition cannot deadlock.
+An earlier blocked waiter reserves its shared keys while later disjoint waiters
+may pass, providing FIFO fairness per key without restoring volume-wide
+head-of-line blocking. Namespace bindings are resolved before admission. A
+per-binding version captured before resolution detects an intervening mutation;
+the request then refreshes the binding and atomically requeues the corrected set
+at its retained position before prepare or apply.
+
+This schema covers the cache observations repaired by visibility: a binding,
+including a negative entry, maps to its parent/name key; inode data and
+attributes map to the inode key; and directory attributes map to the parent
+inode key. Unlink therefore conflicts with a write of its bound inode, two
+renames in one directory conflict on the parent, rmdir conflicts with a child
+create on the removed directory identity, and rename conflicts with a create at
+its target name. Disjoint operations may receive global sequences in either
+order because their executions overlap.
+
+Each participant still has one ordered CONTROL cursor. Two otherwise disjoint
+mutations that address the same participant serialize only on that
+participant's PREPARE/COMPLETE lane; disjoint audiences continue independently.
 
 There is no honest way to atomically commit an arbitrary XFS syscall and a
 separate durable reply record. PortableFS makes the boundary explicit:
