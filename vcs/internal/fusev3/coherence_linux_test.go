@@ -884,6 +884,117 @@ func TestReadDirPlusPhysicalWriteFailureRollsBackWholePage(t *testing.T) {
 	}
 }
 
+func TestReadDirPlusParserFailureForceForgetsEveryUnlinkedRecord(t *testing.T) {
+	f := newStrictFixture(t)
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	page := &authoritypb.ReadDirReply{Verifier: testToken(600), Eof: true}
+	for index, name := range []string{"linked", "failed", "tail"} {
+		item := testItem(uint64(100+index), authoritypb.Attr_REGULAR, uint64(200+index))
+		item.ObjectVersion, item.SnapshotSequence = 9, 9
+		page.Entries = append(page.Entries, &authoritypb.Dirent{
+			Name: []byte(name), Attr: item.Attr, Item: item,
+			NextCookie: encodeCookie(uint64(index + 1)), ObjectVersion: 9, SnapshotSequence: 9,
+		})
+	}
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{page}
+
+	unique := f.unique.Add(2)
+	list := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{Unique: unique}, Fh: handleID,
+	}, list); !status.Ok() {
+		t.Fatalf("READDIRPLUS construction = %v", status)
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+
+	records := make([]*inodeRecord, 0, 3)
+	f.raw.mu.Lock()
+	for index := range 3 {
+		record := f.raw.nodesByKey[inodeKey{inode: uint64(100 + index), kind: authoritypb.Attr_REGULAR}]
+		if record == nil || record.lookups != 1 {
+			f.raw.mu.Unlock()
+			t.Fatalf("physically accepted page record %d = %p lookups=%d, want one kernel lookup", index, record, func() uint64 {
+				if record == nil {
+					return 0
+				}
+				return record.lookups
+			}())
+		}
+		records = append(records, record)
+	}
+	f.raw.mu.Unlock()
+
+	// The parser linked record zero, failed record one, and force-forgot both
+	// that record and the valid tail before making the connection terminal.
+	f.raw.Forget(records[1].id, 1)
+	f.raw.Forget(records[2].id, 1)
+	f.raw.Forget(records[1].id, 1) // A repeated terminal signal is harmless.
+
+	f.raw.mu.Lock()
+	linkedLookups := records[0].lookups
+	_, failedLive := f.raw.nodesByID[records[1].id]
+	_, tailLive := f.raw.nodesByID[records[2].id]
+	_, linkedPath := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "linked"}]
+	_, failedPath := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "failed"}]
+	_, tailPath := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "tail"}]
+	f.raw.mu.Unlock()
+	if linkedLookups != 1 || !linkedPath {
+		t.Fatalf("linked prefix ownership = lookups %d path %t, want 1/true", linkedLookups, linkedPath)
+	}
+	if failedLive || tailLive || failedPath || tailPath {
+		t.Fatalf("force-forgotten ownership remains: live=%t/%t path=%t/%t", failedLive, tailLive, failedPath, tailPath)
+	}
+
+	wantReclaims := map[string]int{
+		fmt.Sprintf("%x", testToken(201)): 1,
+		fmt.Sprintf("%x", testToken(202)): 1,
+	}
+	for range 2 {
+		got := fmt.Sprintf("%x", popReclaim(t, f.mount))
+		wantReclaims[got]--
+	}
+	for token, count := range wantReclaims {
+		if count != 0 {
+			t.Fatalf("force-FORGET reclaim %s count delta = %d, want 0", token, count)
+		}
+	}
+	if pending := f.mount.reclaim.pending(); pending != 0 {
+		t.Fatalf("duplicate force-FORGET queued %d extra reclaims", pending)
+	}
+
+	// A parser failure has no partial-page publication receipt. Terminal
+	// detach releases the linked prefix and any force-FORGET lost to teardown.
+	f.mount.kernelMount = kernelMount{id: "999999996", device: "0:996", point: "/nonexistent-portablefs-dirplus-parser"}
+	done := make(chan struct{})
+	close(done)
+	f.mount.kernelConnectionDone = done
+	if err := f.mount.Close(); err != nil {
+		t.Fatalf("terminal parser detach: %v", err)
+	}
+	f.rpc.mu.Lock()
+	detaches := len(f.rpc.detachProofs)
+	f.rpc.mu.Unlock()
+	if detaches != 1 {
+		t.Fatalf("terminal parser detach proofs = %d, want 1", detaches)
+	}
+	f.raw.mu.Lock()
+	pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
+	reservations := len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if pendingNames != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("terminal page candidate ownership = names %d attrs %d reservations %d, want zero", pendingNames, pendingAttrs, reservations)
+	}
+}
+
 func TestFinalizedReplyWaitExpiresInsideRepairBudgetAndFencesParticipant(t *testing.T) {
 	f := newStrictFixture(t)
 	f.mount.repairBudget = 20 * time.Millisecond
