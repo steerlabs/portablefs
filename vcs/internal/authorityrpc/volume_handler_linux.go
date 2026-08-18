@@ -136,6 +136,7 @@ type VolumeHandler struct {
 	MaxOpens           uint32
 	postStateMu        sync.Mutex
 	objectVersions     map[[16]byte]uint64
+	postStateChanges   map[uint64]map[[16]byte]struct{}
 	// MaxRetainedReplyBytes bounds the real quantity the replay cache consumes:
 	// the total encoded bytes retained across every live session's replay
 	// slots. Slot counts are not a proxy for it; one directory listing is five
@@ -2587,7 +2588,10 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 				return []volumeserver.VisibilityTarget{}, true
 			}
 			if changed {
-				if attachErr := attachExactRepairPostState(normalized, resp.GetPostState(), sequence); attachErr != nil {
+				if attachErr := attachExactRepairPostState(
+					normalized, resp.GetPostState(), sequence,
+					h.takePostStateChanges(sequence),
+				); attachErr != nil {
 					completeNormalizationErr = attachErr
 					return []volumeserver.VisibilityTarget{}, true
 				}

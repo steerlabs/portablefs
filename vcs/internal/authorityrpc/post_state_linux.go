@@ -51,6 +51,10 @@ func (h *VolumeHandler) mutationPostState(sequence uint64, snapshots ...postStat
 	if h.objectVersions == nil {
 		h.objectVersions = make(map[[16]byte]uint64)
 	}
+	if h.postStateChanges == nil {
+		h.postStateChanges = make(map[uint64]map[[16]byte]struct{})
+	}
+	changedIdentities := make(map[[16]byte]struct{})
 	objects := make([]*authoritypb.ObjectPostState, 0, len(ordered))
 	for _, snapshot := range ordered {
 		version := h.objectVersions[snapshot.identity]
@@ -61,6 +65,13 @@ func (h *VolumeHandler) mutationPostState(sequence uint64, snapshots ...postStat
 		if snapshot.changed {
 			version = sequence
 			h.objectVersions[snapshot.identity] = sequence
+			// A CREATED identity had no pre-mutation coordinate another
+			// participant could have registered. Its name is published by the
+			// namespace target; only pre-existing changed identities require an
+			// exact ATTR/DATA repair target.
+			if snapshot.roles&postStateRoleCreated == 0 {
+				changedIdentities[snapshot.identity] = struct{}{}
+			}
 		}
 		objects = append(objects, &authoritypb.ObjectPostState{
 			StableIdentity: append([]byte(nil), snapshot.identity[:]...),
@@ -69,8 +80,17 @@ func (h *VolumeHandler) mutationPostState(sequence uint64, snapshots ...postStat
 			Roles:          snapshot.roles,
 		})
 	}
+	h.postStateChanges[sequence] = changedIdentities
 	h.postStateMu.Unlock()
 	return &authoritypb.PostState{VisibilitySequence: sequence, SnapshotSequence: sequence, Objects: objects}
+}
+
+func (h *VolumeHandler) takePostStateChanges(sequence uint64) map[[16]byte]struct{} {
+	h.postStateMu.Lock()
+	defer h.postStateMu.Unlock()
+	changed := h.postStateChanges[sequence]
+	delete(h.postStateChanges, sequence)
+	return changed
 }
 
 func (h *VolumeHandler) sampledObjectVersion(identity [16]byte, snapshot uint64) uint64 {

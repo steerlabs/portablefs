@@ -84,3 +84,37 @@ func TestMutationPostStateCarriesMaskedStatxFlags(t *testing.T) {
 		t.Fatalf("post-state flags = %#x, want %#x", state.GetObjects()[0].GetAttr().GetFlags(), flags)
 	}
 }
+
+func TestMutationPostStateRetainsExactChangedIdentitySet(t *testing.T) {
+	changed := postStateTestIdentity(1)
+	unchanged := postStateTestIdentity(2)
+	newborn := postStateTestIdentity(3)
+	handler := &VolumeHandler{}
+	handler.mutationPostState(1,
+		postStateSnapshot{
+			identity: changed,
+			attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 1},
+			roles:    postStateRoleTarget,
+			changed:  true,
+		},
+		postStateSnapshot{
+			identity: unchanged,
+			attr:     xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: 2},
+			roles:    postStateRoleParent,
+			changed:  false,
+		},
+		postStateSnapshot{
+			identity: newborn,
+			attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 3},
+			roles:    postStateRoleCreated,
+			changed:  true,
+		},
+	)
+	got := handler.takePostStateChanges(1)
+	if !reflect.DeepEqual(got, map[[16]byte]struct{}{changed: {}}) {
+		t.Fatalf("changed identity set = %#v, want only %x", got, changed)
+	}
+	if second := handler.takePostStateChanges(1); second != nil {
+		t.Fatalf("changed identity set was not consumed exactly once: %#v", second)
+	}
+}

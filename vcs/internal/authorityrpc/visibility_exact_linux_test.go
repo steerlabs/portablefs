@@ -40,7 +40,7 @@ func TestAttachExactRepairPostStateCarriesTheMutationRecord(t *testing.T) {
 				target.Size = 4096
 			}
 			targets := []volumeserver.VisibilityTarget{target}
-			if err := attachExactRepairPostState(targets, state, sequence); err != nil {
+			if err := attachExactRepairPostState(targets, state, sequence, map[[16]byte]struct{}{identity: {}}); err != nil {
 				t.Fatal(err)
 			}
 			exact := targets[0].ExactPostState
@@ -68,7 +68,8 @@ func TestAttachExactRepairPostStateFailsClosedOnAMissingRecord(t *testing.T) {
 			Attr:           &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 91},
 		}},
 	}
-	if err := attachExactRepairPostState(targets, state, 17); err == nil {
+	changed := map[[16]byte]struct{}{{2}: {}}
+	if err := attachExactRepairPostState(targets, state, 17, changed); err == nil {
 		t.Fatal("missing exact repair record was accepted")
 	}
 }
@@ -89,15 +90,36 @@ func TestAttachExactRepairPostStateRequiresEveryChangedRecordTarget(t *testing.T
 	targets := []volumeserver.VisibilityTarget{{
 		Scope: volumeserver.VisibilityData, Identity: destination, KernelIno: 92, Size: 8,
 	}}
-	if err := attachExactRepairPostState(targets, state, sequence); err == nil {
+	changed := map[[16]byte]struct{}{source: {}, destination: {}}
+	if err := attachExactRepairPostState(targets, state, sequence, changed); err == nil {
 		t.Fatal("COMPLETE without a target for the changed source record was accepted")
 	}
 
 	state.Objects[0].ObjectVersion = sequence - 1
-	if err := attachExactRepairPostState(targets, state, sequence); err != nil {
+	changed = map[[16]byte]struct{}{destination: {}}
+	if err := attachExactRepairPostState(targets, state, sequence, changed); err != nil {
 		t.Fatalf("unchanged source record incorrectly required a COMPLETE target: %v", err)
 	}
 	if targets[0].ExactPostState == nil || targets[0].ExactPostState.StableIdentity != destination {
 		t.Fatalf("destination exact repair = %#v", targets[0].ExactPostState)
+	}
+}
+
+func TestAttachExactRepairPostStateDoesNotInferChangeFromBaselineVersion(t *testing.T) {
+	const sequence = uint64(1)
+	identity := [16]byte{1}
+	state := &authoritypb.PostState{
+		VisibilitySequence: sequence,
+		SnapshotSequence:   sequence,
+		Objects: []*authoritypb.ObjectPostState{{
+			StableIdentity: identity[:], ObjectVersion: sequence,
+			Roles: postStateRoleTarget,
+			Attr:  &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 91},
+		}},
+	}
+	if err := attachExactRepairPostState(
+		nil, state, sequence, map[[16]byte]struct{}{},
+	); err != nil {
+		t.Fatalf("unchanged baseline-version record required a COMPLETE target: %v", err)
 	}
 }
