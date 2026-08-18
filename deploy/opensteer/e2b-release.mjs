@@ -6,13 +6,11 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const packageRoot = resolve(required("OPENSTEER_PACKAGE_ROOT"));
+const sdkRoot = resolve(required("OPENSTEER_E2B_SDK_ROOT"));
 const apiKey = required("E2B_API_KEY");
-const requireFromOpenSteer = createRequire(
-  pathToFileURL(join(packageRoot, "apps/control-plane/package.json")),
-);
+const requireFromSdk = createRequire(join(sdkRoot, "package.json"));
 const e2b = await import(
-  pathToFileURL(requireFromOpenSteer.resolve("e2b")).href
+  pathToFileURL(requireFromSdk.resolve("e2b")).href
 );
 const { Sandbox, SandboxNotFoundError, Template } = e2b;
 

@@ -29,11 +29,10 @@ jobs:
       OPENSTEER_GCP_PROJECT: smooth-comfort-488701-t3
       OPENSTEER_GCP_ZONE: us-east4-a
       OPENSTEER_MANAGER_INSTANCE: pfs-v3-manager-01
-      OPENSTEER_SOURCE_SHA: 0f83a56ed66f58d6aef4c1845bf8ce3509ee5b72
       OPENSTEER_VOLUME_ID: 57483c00-a90d-42f1-bc80-945c0b477227
-      OPENSTEER_RUNNER_IMAGE: us-west1-docker.pkg.dev/opensteer-admin/staging/runner@sha256:67092c4be99c4a95f3582ca342f4c11e64f483f573e6a79bb545438ea651e942
+      OPENSTEER_RUNNER_IMAGE: us-west1-docker.pkg.dev/opensteer-admin/staging/runner@sha256:1e310bb87984279ed3971a6b543f8e55acca09738a3a8b8905a882386dd454dc
       WIF_PROVIDER: projects/920572344872/locations/global/workloadIdentityPools/github/providers/github-oidc
-      WIF_SERVICE_ACCOUNT: gha-deployer@opensteer-admin.iam.gserviceaccount.com
+      WIF_SERVICE_ACCOUNT: portablefs-deployer@opensteer-admin.iam.gserviceaccount.com
     steps:
       - name: Check out the exact promoted PortableFS commit
         uses: actions/checkout@v4
@@ -87,14 +86,6 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
 
-      - name: Check out the pinned OpenSteer template builder
-        uses: actions/checkout@v4
-        with:
-          repository: steerlabs/opensteer-next
-          ref: ${{ env.OPENSTEER_SOURCE_SHA }}
-          path: opensteer
-          persist-credentials: false
-
       - name: Set up the OpenSteer Node runtime
         uses: actions/setup-node@v4
         with:
@@ -105,18 +96,19 @@ jobs:
           set -euo pipefail
           sdk_root="$RUNNER_TEMP/opensteer-e2b-sdk"
           mkdir -p "$sdk_root"
-          npm install --prefix "$sdk_root" --no-package-lock --no-save --ignore-scripts e2b@2.39.0
-          ln -s "$sdk_root/node_modules" opensteer/node_modules
+          npm install --prefix "$sdk_root" --no-package-lock --no-save \
+            --ignore-scripts --omit=dev --no-audit --no-fund e2b@2.39.0
 
       - name: Build and smoke-test the candidate E2B template
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          OPENSTEER_E2B_SDK_ROOT: ${{ runner.temp }}/opensteer-e2b-sdk
           OPENSTEER_E2B_TEMPLATE_NAME: ${{ steps.release.outputs.candidate }}
-          OPENSTEER_PACKAGE_ROOT: ${{ github.workspace }}/opensteer
           OPENSTEER_PORTABLEFS_ARTIFACT_PATH: ${{ steps.release.outputs.release_dir }}/bin/portablefs
+          OPENSTEER_PORTABLEFS_RELEASE_ID: ${{ steps.release.outputs.release_id }}
         run: |
           set -euo pipefail
-          node opensteer/deploy/e2b/build-template.mjs
+          node deploy/opensteer/build-e2b-template.mjs
           node deploy/opensteer/e2b-release.mjs smoke \
             '${{ steps.release.outputs.candidate }}' \
             '${{ steps.release.outputs.release_id }}'
@@ -125,8 +117,8 @@ jobs:
         env:
           E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
           OPENSTEER_E2B_CANDIDATE: ${{ steps.release.outputs.candidate }}
+          OPENSTEER_E2B_SDK_ROOT: ${{ runner.temp }}/opensteer-e2b-sdk
           OPENSTEER_EVIDENCE_DIR: ${{ runner.temp }}/opensteer-deployment-evidence
-          OPENSTEER_PACKAGE_ROOT: ${{ github.workspace }}/opensteer
           OPENSTEER_RELEASE_DIR: ${{ steps.release.outputs.release_dir }}
         run: deploy/opensteer/deploy-production.sh
 
