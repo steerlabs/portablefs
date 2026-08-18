@@ -11,11 +11,15 @@ usage() {
   exit 77
 }
 
-config_root=/etc/portablefs/opensteer-deployer
-[[ -d $config_root && ! -L $config_root ]] || {
+config_base=/etc/portablefs/opensteer-deployer
+config_root=$config_base/current
+[[ -d $config_base && ! -L $config_base && -L $config_root && -d $config_root ]] || {
   echo "OpenSteer manager deployment identity is not installed" >&2
   exit 78
 }
+resolved_config=$(readlink -f "$config_root")
+[[ $resolved_config == "$config_base"/credentials/* && -d $resolved_config && ! -L $resolved_config ]] || exit 78
+config_root=$resolved_config
 # shellcheck source=/dev/null
 source "$config_root/manager.env"
 : "${PORTABLEFS_MANAGER_SERVER_NAME:?missing manager server name}"
@@ -73,7 +77,7 @@ case "$command" in
     body=$(jq -cn --arg volume "$volume_id" --arg reason "OpenSteer matched release $release_id" \
       '{volume_id:$volume,reason:$reason}')
     request product POST "/v1/volumes/$volume_id/restart" "$body" \
-      "opensteer-$release_id-restart"
+      "opensteer-$release_id-$volume_id-restart"
     ;;
   strict-fence)
     [[ $# == 4 && $3 =~ $release_pattern && $4 =~ ^[0-9a-f]{64}$ ]] || usage
@@ -82,7 +86,7 @@ case "$command" in
     body=$(jq -cn --arg volume "$volume_id" --arg evidence "$evidence_sha" \
       '{volume_id:$volume,evidence_sha256:$evidence}')
     request operator POST "/v1/volumes/$volume_id/strict-fence" "$body" \
-      "opensteer-$release_id-strict-${evidence_sha:0:16}"
+      "opensteer-$release_id-$volume_id-strict-${evidence_sha:0:16}"
     ;;
   wait-ready)
     [[ $# == 4 && $3 =~ ^[1-9][0-9]*$ && $4 =~ ^[1-9][0-9]*$ ]] || usage
