@@ -2,6 +2,7 @@ package authorityrpc
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -376,6 +377,34 @@ func canonicalFingerprint(runtime *volumeserver.Authority, req *authoritypb.Requ
 		return canonicalFingerprintWithWriteDataDigest(runtime, req, digest)
 	}
 	return canonicalFingerprintWithOptions(runtime, req, canonicalWriteOptions{})
+}
+
+type framePayloadDigestKey struct{}
+
+func withFramePayloadDigest(ctx context.Context, digest *[sha256.Size]byte) context.Context {
+	if digest == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, framePayloadDigestKey{}, *digest)
+}
+
+func framePayloadDigest(ctx context.Context, req *authoritypb.Request) ([sha256.Size]byte, bool) {
+	if ctx == nil || req == nil || (req.GetOneShotWrite() == nil &&
+		(req.GetWriteTransaction() == nil || req.GetWriteTransaction().GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA)) {
+		return [sha256.Size]byte{}, false
+	}
+	digest, ok := ctx.Value(framePayloadDigestKey{}).([sha256.Size]byte)
+	return digest, ok
+}
+
+// canonicalFingerprintFromFrame uses the digest produced while the transport
+// copied an out-of-line write body into its retained frame. Direct handler
+// callers have no transport digest and deliberately keep the one-shot path.
+func canonicalFingerprintFromFrame(ctx context.Context, runtime *volumeserver.Authority, req *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
+	if digest, ok := framePayloadDigest(ctx, req); ok {
+		return canonicalFingerprintWithWriteDataDigest(runtime, req, digest)
+	}
+	return canonicalFingerprint(runtime, req)
 }
 
 type canonicalWriteOptions struct {
