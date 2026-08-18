@@ -683,12 +683,9 @@ func (ms *Server) prepareReplyForWrite(req *request) Status {
 		}
 		req.outPayload = req.outPayload[:n]
 	}
-	// Most FUSE header errors have no VFS result for the kernel to publish.
-	// LOOKUP -ENOENT is the deliberate exception: d_lookup_done installs the
-	// negative result after the reply wakes the requester, even when its cache
-	// lifetime is zero. The filesystem decides whether this particular LOOKUP
-	// belongs to the strict shared namespace; the transport only permits the
-	// one error shape whose kernel postprocessing is publication-bearing.
+	// Protocol negatives are successful zero-nodeid entry replies. Header
+	// errors carry no structured result or trailer and can never request a
+	// publication receipt.
 	if marker, ok := ms.replyWriteLifecycle.(ReplyPublishMarker); ok && replyMayRequestPFSPublish(req) {
 		req.publishMarked = marker.ReplyPublishMarked(unique, req.inHeader().NodeId, req.inHeader().Opcode)
 		if req.publishMarked && !ms.replyWriteLifecycle.ReplyWriteOrdered(unique) {
@@ -711,7 +708,7 @@ func (ms *Server) prepareReplyForWrite(req *request) Status {
 }
 
 func replyMayRequestPFSPublish(req *request) bool {
-	return req != nil && (req.status.Ok() || req.inHeader().Opcode == _OP_LOOKUP && req.status == ENOENT)
+	return req != nil && req.status.Ok()
 }
 
 func runReplyWriteLifecycle(lifecycle ReplyWriteLifecycle, unique uint64, writeMu *sync.Mutex, write func() Status) Status {

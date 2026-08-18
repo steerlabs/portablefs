@@ -982,8 +982,9 @@ func (r *rawFileSystem) publishNegativeEntry(ctx context.Context, out *fuse.Entr
 	lifetime, namePublication, cached := r.admitNegativeNameLocked(ctx, parent, name)
 	r.mu.Unlock()
 	if !cached {
+		*out = fuse.EntryOut{}
 		out.SetEntryTimeout(0)
-		return fuse.Status(syscall.ENOENT), nil
+		return fuse.OK, nil
 	}
 	publication.names = append(publication.names, namePublication)
 	// A zero-NodeId reply carries no object, so every other field is written

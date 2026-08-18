@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"encoding/binary"
 	"errors"
 	"syscall"
 	"testing"
@@ -13,19 +14,16 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
-// TestAuthorityNegativeLookupRequiresPostVFSPublication covers both shapes a
-// negative answer can take. A cacheable absence is a success carrying a zero
-// NodeId; an uncacheable one is ENOENT. The kernel installs the negative result
-// after the reply wakes the requester in either case, so both retain the
-// generic post-VFS receipt -- the lifetime decides caching, not ownership.
+// TestAuthorityNegativeLookupRequiresPostVFSPublication proves that admission
+// pressure changes only lifetime and registry ownership. Every protocol
+// negative remains a successful zero-nodeid entry with its sequence stamp.
 func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 	cases := []struct {
-		name       string
-		cacheable  bool
-		wantStatus fuse.Status
+		name      string
+		cacheable bool
 	}{
-		{"cacheable absence", true, fuse.OK},
-		{"uncacheable absence", false, fuse.ENOENT},
+		{"cacheable absence", true},
+		{"capacity-dropped absence", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -45,8 +43,8 @@ func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 			}
 			const requestUnique = 6900
 			out := &fuse.EntryOut{}
-			if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: requestUnique, NodeId: fuse.FUSE_ROOT_ID}, "missing", out); status != tc.wantStatus {
-				t.Fatalf("negative LOOKUP = %v, want %v", status, tc.wantStatus)
+			if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: requestUnique, NodeId: fuse.FUSE_ROOT_ID}, "missing", out); status != fuse.OK {
+				t.Fatalf("negative LOOKUP = %v, want structured success", status)
 			}
 			if out.NodeId != 0 {
 				t.Fatalf("negative LOOKUP published NodeId %d, want 0", out.NodeId)
@@ -56,6 +54,13 @@ func TestAuthorityNegativeLookupRequiresPostVFSPublication(t *testing.T) {
 			}
 			if !f.raw.ReplyWriteOrdered(requestUnique) {
 				t.Fatal("negative LOOKUP did not retain its physical reply ownership")
+			}
+			payload := make([]byte, fuse.PFSCacheStampSize)
+			if n, status := f.raw.PrepareReplyPayload(requestUnique, fuse.FUSE_ROOT_ID, 1, make([]byte, 128), payload, 0); !status.Ok() || n != len(payload) {
+				t.Fatalf("negative LOOKUP stamp = (%d, %v), want %d-byte success", n, status, len(payload))
+			}
+			if got := binary.LittleEndian.Uint64(payload[:8]); got != 1 {
+				t.Fatalf("negative LOOKUP snapshot = %d, want 1", got)
 			}
 			if !f.raw.ReplyPublishMarked(requestUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
 				t.Fatal("negative LOOKUP did not request a post-VFS publication receipt")
