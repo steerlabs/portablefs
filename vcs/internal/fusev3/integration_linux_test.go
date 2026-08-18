@@ -1550,28 +1550,41 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 // then a direct assertion that the reply installed the target and parent attrs.
 func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	modeOf := func(info os.FileInfo) os.FileMode {
+		if info == nil {
+			return 0
+		}
+		return info.Mode()
+	}
 	type counts struct {
-		lookup, getattr, create, unlink, rename, write int
+		lookup, getattr, create, mkdir, unlink, rmdir, rename, write, setattr, symlink, link int
 	}
 	measure := func(operation string, fn func()) counts {
 		before := counts{
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
-			create: f.counter.count("create"), unlink: f.counter.count("unlink"),
+			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
+			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
 			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
+			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
 		}
 		fn()
 		after := counts{
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
-			create: f.counter.count("create"), unlink: f.counter.count("unlink"),
+			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
+			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
 			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
+			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
 		}
 		delta := counts{
 			lookup: after.lookup - before.lookup, getattr: after.getattr - before.getattr,
-			create: after.create - before.create, unlink: after.unlink - before.unlink,
+			create: after.create - before.create, mkdir: after.mkdir - before.mkdir,
+			unlink: after.unlink - before.unlink, rmdir: after.rmdir - before.rmdir,
 			rename: after.rename - before.rename, write: after.write - before.write,
+			setattr: after.setattr - before.setattr, symlink: after.symlink - before.symlink, link: after.link - before.link,
 		}
-		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d unlink=%d rename=%d one-shot-write=%d",
-			operation, delta.lookup, delta.getattr, delta.create, delta.unlink, delta.rename, delta.write)
+		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d mkdir=%d unlink=%d rmdir=%d rename=%d one-shot-write=%d setattr=%d symlink=%d link=%d",
+			operation, delta.lookup, delta.getattr, delta.create, delta.mkdir, delta.unlink, delta.rmdir,
+			delta.rename, delta.write, delta.setattr, delta.symlink, delta.link)
 		return delta
 	}
 	requireCounts := func(operation string, got, want counts) {
@@ -1619,6 +1632,126 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	if err := created.Close(); err != nil {
 		t.Fatalf("close created file: %v", err)
 	}
+
+	setattrRPCs := measure("setattr plus warm stat", func() {
+		if err := os.Chmod(createdPath, 0o640); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		info, err := os.Lstat(createdPath)
+		if err != nil || info.Mode().Perm() != 0o640 {
+			t.Fatalf("stat after chmod: mode=%v err=%v", modeOf(info), err)
+		}
+	})
+	requireCounts("setattr plus warm stat", setattrRPCs, counts{setattr: 1})
+
+	mkdirPath := filepath.Join(root, "post-state-directory")
+	if _, err := os.Lstat(mkdirPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm mkdir destination absence: %v", err)
+	}
+	mkdirRPCs := measure("mkdir plus child/parent stat", func() {
+		if err := os.Mkdir(mkdirPath, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if _, err := os.Lstat(mkdirPath); err != nil {
+			t.Fatalf("stat created directory: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after mkdir: %v", err)
+		}
+	})
+	requireCounts("mkdir plus child/parent stat", mkdirRPCs, counts{mkdir: 1})
+
+	symlinkPath := filepath.Join(root, "post-state-symlink")
+	if _, err := os.Lstat(symlinkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm symlink destination absence: %v", err)
+	}
+	symlinkRPCs := measure("symlink plus child/parent stat", func() {
+		if err := os.Symlink("post-state-created", symlinkPath); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if info, err := os.Lstat(symlinkPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("lstat created symlink: mode=%v err=%v", modeOf(info), err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after symlink: %v", err)
+		}
+	})
+	requireCounts("symlink plus child/parent stat", symlinkRPCs, counts{symlink: 1})
+
+	linkPath := filepath.Join(root, "post-state-hardlink")
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("warm link source: %v", err)
+	}
+	if _, err := os.Lstat(linkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm link destination absence: %v", err)
+	}
+	linkRPCs := measure("link plus target/source/parent stat", func() {
+		if err := os.Link(createdPath, linkPath); err != nil {
+			t.Fatalf("link: %v", err)
+		}
+		for _, path := range []string{linkPath, createdPath, root} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after link %s: %v", path, err)
+			}
+		}
+	})
+	requireCounts("link plus target/source/parent stat", linkRPCs, counts{link: 1})
+
+	rmdirPath := filepath.Join(root, "post-state-rmdir")
+	mustMkdir(t, rmdirPath)
+	for _, path := range []string{rmdirPath, root} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("warm rmdir path %s: %v", path, err)
+		}
+	}
+	rmdirRPCs := measure("rmdir plus child/parent stat", func() {
+		if err := os.Remove(rmdirPath); err != nil {
+			t.Fatalf("rmdir: %v", err)
+		}
+		if _, err := os.Lstat(rmdirPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat removed directory: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after rmdir: %v", err)
+		}
+	})
+	requireCounts("rmdir plus child/parent stat", rmdirRPCs, counts{rmdir: 1})
+
+	existingName := "post-state-existing-create"
+	existingPath := filepath.Join(root, existingName)
+	if _, err := os.Lstat(existingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm existing-create negative: %v", err)
+	}
+	rootCapability, err := f.store.Root()
+	if err != nil {
+		t.Fatalf("acquire store root: %v", err)
+	}
+	existingCapability, _, err := f.store.Create(rootCapability, existingName, 0o600, true)
+	if err != nil {
+		t.Fatalf("materialize existing-create race directly at the store: %v", err)
+	}
+	defer func() {
+		if err := f.store.Forget(existingCapability); err != nil {
+			t.Errorf("forget direct existing-create capability: %v", err)
+		}
+	}()
+	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
+		file, err := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatalf("open existing name through FUSE_CREATE: %v", err)
+		}
+		if _, err := file.Stat(); err != nil {
+			_ = file.Close()
+			t.Fatalf("fstat existing-create result: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close existing-create result: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after existing create: %v", err)
+		}
+	})
+	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{create: 1})
 
 	unlinkedPath := filepath.Join(root, "post-state-unlinked")
 	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
