@@ -698,8 +698,14 @@ func TestVisibilityStabilizeUnwindsCrossMountPrepareCycle(t *testing.T) {
 	for count := 0; count < 2; count++ {
 		select {
 		case got := <-stabilized:
-			if !got.waited || got.err != nil {
-				t.Fatalf("mount %x cross-PREPARE stabilization = waited %t, err %v", got.mount, got.waited, got.err)
+			sequence, sequenced := VisibilityRetrySequence(got.err)
+			wantSequence := leftPrepare.Cursor.Sequence
+			if got.mount == rightMount {
+				wantSequence = rightPrepare.Cursor.Sequence
+			}
+			if !got.waited || !errors.Is(got.err, ErrVisibilityRetry) || !sequenced || sequence != wantSequence {
+				t.Fatalf("mount %x cross-PREPARE stabilization = waited %t, err %v, sequence %d/%t; want retry sequence %d",
+					got.mount, got.waited, got.err, sequence, sequenced, wantSequence)
 			}
 		case <-time.After(100 * time.Millisecond):
 			t.Fatal("cross-mount Stabilize/PREPARE cycle did not unwind before the repair deadline")

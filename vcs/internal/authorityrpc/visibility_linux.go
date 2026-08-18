@@ -52,9 +52,9 @@ func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.Vis
 
 // stabilizeItem guards one read-path answer about an inode this session already
 // holds a capability for. The coordinate is known before anything is read, so
-// any reported race can unwind the callback before state is published. That
-// lets a pending PREPARE Ack, and the kernel retries the read against the state
-// which follows it.
+// a classified visibility retry can unwind the authority request before state
+// is published. The daemon consumes that internal response, waits for the exact
+// pending repair, and reissues the request inside the same FUSE callback.
 func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) error {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
@@ -64,10 +64,7 @@ func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.Sessi
 	if err != nil {
 		return err
 	}
-	waited, err := coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
-	if err == nil && waited {
-		return syscall.EAGAIN
-	}
+	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
 	return err
 }
 
@@ -80,10 +77,7 @@ func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.Sessi
 	if err != nil {
 		return err
 	}
-	waited, err := coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
-	if err == nil && waited {
-		return syscall.EAGAIN
-	}
+	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
 	return err
 }
 
@@ -113,6 +107,12 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 			resolution.Identity = identity
 		}
 		waited, err := coordinator.Stabilize(ctx, id, resolution)
+		if errors.Is(err, volumeserver.ErrVisibilityRetry) {
+			// Lookup already owns a bounded discard-and-reread loop. Unlike item
+			// reads, no answer has left this authority request, so let the concurrent
+			// CONTROL Ack clear the pending phase before the next attempt.
+			waited, err = true, nil
+		}
 		if err == nil && !waited {
 			return item, attr, lookupErr
 		}
@@ -158,7 +158,13 @@ func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeser
 		}
 		resolutions = append(resolutions, resolution)
 	}
-	return coordinator.Stabilize(ctx, id, resolutions...)
+	waited, err := coordinator.Stabilize(ctx, id, resolutions...)
+	if errors.Is(err, volumeserver.ErrVisibilityRetry) {
+		// Readdir's caller discards the page and repeats this bounded loop while
+		// the independent CONTROL lane acknowledges the pending PREPARE.
+		return true, nil
+	}
+	return waited, err
 }
 
 func coherenceProfile(profile authoritypb.CoherenceProfile) (volumeserver.CoherenceProfile, error) {

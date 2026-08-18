@@ -1047,23 +1047,100 @@ func (n *node) read(parent context.Context, request *authoritypb.Request) (*auth
 		return nil, errno
 	}
 	defer n.mount.releaseBulk()
-	response, consumption, err := n.mount.rpc.CallReadRetained(ctx, request, n.mount.forceTerminalResponseRevocation)
-	if response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
-		response.GetVisibilityRetrySequence() != 0) {
+	var retryCtx context.Context
+	var cancelRetry context.CancelFunc
+	for {
+		callCtx := ctx
+		if retryCtx != nil {
+			callCtx = retryCtx
+		}
+		response, consumption, err := n.mount.rpc.CallReadRetained(callCtx, request, n.mount.forceTerminalResponseRevocation)
+		retrySignal := response != nil && (response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
+			response.GetVisibilityRetrySequence() != 0)
+		if !retrySignal {
+			if retryCtx != nil && err != nil && retryCtx.Err() != nil {
+				if consumption != nil {
+					consumption.Consume()
+				}
+				cause := fmt.Errorf("fusev3: read visibility retry exceeded the mount repair budget: %w", retryCtx.Err())
+				n.mount.revoke(cause)
+				return response, syscall.ENOTCONN
+			}
+			if consumption != nil {
+				if retainErr := retainAuthorityResponse(parent, consumption); retainErr != nil {
+					n.mount.revoke(retainErr)
+					consumption.Consume()
+					return response, syscall.ENOTCONN
+				}
+			}
+			return response, rpcErrno(response, err)
+		}
+
+		// A store EAGAIN remains an ordinary errno. Only this classified, sequenced,
+		// bodyless envelope can enter the daemon retry path, so a genuine filesystem
+		// result can never be mistaken for coherence scheduling.
+		retrySequence := response.GetVisibilityRetrySequence()
+		publication := replyPublicationFromContext(parent)
+		validRetry := err == nil && readRequestSupportsVisibilityRetry(request) &&
+			response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY &&
+			responseErrno(response) == syscall.EINTR && !response.GetUncertain() &&
+			retrySequence != 0 && response.GetBody() == nil &&
+			response.GetPostAttr() == nil && response.GetRoutesMismatch() == nil &&
+			response.GetMutation() == nil && len(response.GetTerminalDeliveryToken()) == 0 &&
+			readRetryPublicationIsUnadmitted(publication)
 		if consumption != nil {
 			consumption.Consume()
 		}
-		n.mount.revoke(errors.New("fusev3: authority returned a visibility retry for a read-only request"))
-		return response, syscall.ENOTCONN
-	}
-	if consumption != nil {
-		if retainErr := retainAuthorityResponse(parent, consumption); retainErr != nil {
-			n.mount.revoke(retainErr)
-			consumption.Consume()
-			return response, syscall.ENOTCONN
+		if !validRetry || n.mount.raw == nil {
+			protocolErr := errors.New("fusev3: authority returned a malformed visibility retry for a read-only request")
+			n.mount.revoke(protocolErr)
+			return nil, syscall.ENOTCONN
+		}
+		if retryCtx == nil {
+			retryCtx, cancelRetry = context.WithTimeout(parent, n.mount.repairBudget)
+			defer cancelRetry()
+		}
+		// Operation-specific publication admission happens only after read returns.
+		// Consuming the bodyless response above therefore withdraws the aborted
+		// authority result while the callback still owns no new kernel-cache fact.
+		// Waiting for the exact local COMPLETE lets CONTROL acknowledge and repair
+		// the pending PREPARE before this same FUSE callback reissues the RPC.
+		if waitErr := n.mount.raw.waitForVisibilityCompletion(retryCtx, retrySequence); waitErr != nil {
+			cause := fmt.Errorf("fusev3: read visibility retry exceeded the mount repair budget: %w", waitErr)
+			n.mount.revoke(cause)
+			return nil, syscall.ENOTCONN
 		}
 	}
-	return response, rpcErrno(response, err)
+}
+
+// readRetryPublicationIsUnadmitted proves that the aborted authority response
+// has not acquired any PFS publication intent. Earlier successful READ chunks
+// may have response-consumption receipts in the same callback, but the raw
+// operation does not admit cache facts until node.read returns successfully.
+func readRetryPublicationIsUnadmitted(publication *replyPublication) bool {
+	return publication != nil && len(publication.names) == 0 && len(publication.attrs) == 0 &&
+		len(publication.data) == 0 && publication.source == nil && publication.writeKernelTx == 0 &&
+		publication.writeHandle == nil && !publication.needsPostVFS
+}
+
+// readRequestSupportsVisibilityRetry is the audited set of authority handlers
+// which call stabilizeItem or stabilizeOpen: item/handle GETATTR, file READ,
+// READLINK, GETXATTR, and LISTXATTR. Other read-only RPCs receiving the class
+// are protocol violations and revoke the mount.
+func readRequestSupportsVisibilityRetry(request *authoritypb.Request) bool {
+	if request == nil {
+		return false
+	}
+	switch request.GetBody().(type) {
+	case *authoritypb.Request_GetAttr,
+		*authoritypb.Request_Read,
+		*authoritypb.Request_Readlink,
+		*authoritypb.Request_GetXattr,
+		*authoritypb.Request_ListXattr:
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Mount) forceTerminalResponseRevocation(cause error) {
