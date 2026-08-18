@@ -257,9 +257,14 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
     public static func parseContract(
         _ wire: PfsV3CoherenceContract
     ) throws -> PfsMacOSV3LocalContract {
-        // This is the authority protocol nested inside pfslocal 1.15, not the
-        // local UDS major. portablefs-authority-v5 is the only contract this
-        // repair model understands.
+        // This is the authority protocol nested inside pfslocal, not the local
+        // UDS major. Protocol 6 is understood but deliberately refused: the
+        // checked-in SDK surfaces do not provide its complete synchronous
+        // source-install and peer-repair primitive set. No timer or pathname
+        // repair is an admissible substitute.
+        if wire.authorityProtocolMajor == 6 {
+            throw PfsMacOSCoherenceError.exactVNextFSKitUnavailable(6)
+        }
         guard wire.authorityProtocolMajor == 5 else {
             throw PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(
                 wire.authorityProtocolMajor
