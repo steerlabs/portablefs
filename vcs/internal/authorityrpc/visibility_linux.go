@@ -325,11 +325,35 @@ func attachExactRepairPostState(targets []volumeserver.VisibilityTarget, state *
 	if !validPostStateShape(state, true) || state.GetVisibilitySequence() != sequence {
 		return errors.New("authorityrpc: visible mutation has no exact repair post-state")
 	}
+	coverage := make(map[[16]byte]volumeserver.VisibilityTarget, len(targets))
+	for _, target := range targets {
+		if target.Scope == volumeserver.VisibilityNamespace {
+			if target.PostIdentity != ([16]byte{}) {
+				coverage[target.PostIdentity] = target
+			}
+			continue
+		}
+		coverage[target.Identity] = target
+	}
 	objects := make(map[[16]byte]*authoritypb.ObjectPostState, len(state.GetObjects()))
 	for _, object := range state.GetObjects() {
 		var identity [16]byte
 		copy(identity[:], object.GetStableIdentity())
 		objects[identity] = object
+		if object.GetObjectVersion() != sequence {
+			continue
+		}
+		target, ok := coverage[identity]
+		if !ok && object.GetRoles()&postStateRoleCreated != 0 {
+			// A newborn identity cannot have been registered by another participant
+			// before PREPARE. Named newborns are covered by their namespace target;
+			// O_TMPFILE has no peer-visible coordinate until a later linkat.
+			continue
+		}
+		if !ok || target.Scope != volumeserver.VisibilityNamespace && target.KernelIno != object.GetAttr().GetInode() ||
+			target.Scope == volumeserver.VisibilityData && target.Size != object.GetAttr().GetSize() {
+			return fmt.Errorf("%w: changed post-state object %x has no matching COMPLETE repair target", volumeserver.ErrVisibilityTargets, identity)
+		}
 	}
 	exactCount := 0
 	for index := range targets {
@@ -344,7 +368,7 @@ func attachExactRepairPostState(targets []volumeserver.VisibilityTarget, state *
 		object := objects[target.Identity]
 		if object == nil || object.GetObjectVersion() == 0 || object.GetObjectVersion() > sequence || object.GetAttr().GetInode() != target.KernelIno ||
 			target.Scope == volumeserver.VisibilityData && object.GetAttr().GetSize() != target.Size {
-			return fmt.Errorf("authorityrpc: repair coordinate %x has no matching exact mutation record", target.Identity)
+			return fmt.Errorf("%w: repair coordinate %x has no matching exact mutation record", volumeserver.ErrVisibilityTargets, target.Identity)
 		}
 		target.ExactPostState = visibilityObjectPostState(object)
 	}
