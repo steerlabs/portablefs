@@ -1,4 +1,4 @@
-From d7776195e16e4385794bd9c123b93cbaca063d65 Mon Sep 17 00:00:00 2001
+From d44f2837bc768b039df64cceb9e91a75c5c7aebc Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -8,7 +8,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
  fs/fuse/dev.c             | 165 +++++++++++-
- fs/fuse/dir.c             | 483 +++++++++++++++++++++++++++++----
+ fs/fuse/dir.c             | 485 +++++++++++++++++++++++++++++----
  fs/fuse/file.c            | 122 ++++++---
  fs/fuse/fuse_i.h          |  43 ++-
  fs/fuse/inode.c           |  31 +--
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/namei.c                |  23 +-
  include/linux/fs.h        |   8 +-
  include/uapi/linux/fuse.h |  66 ++++-
- 12 files changed, 1472 insertions(+), 137 deletions(-)
+ 12 files changed, 1473 insertions(+), 138 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -248,7 +248,7 @@ index b1078aeb7..209d73eed 100644
  		fuse_copy_finish(cs);
  		return -EINVAL;
 diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
-index 7ee120772..63c390c09 100644
+index 7ee120772..cd64aed0d 100644
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
 @@ -184,6 +184,28 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
@@ -1031,7 +1031,7 @@ index 7ee120772..63c390c09 100644
  	bool refreshed = false;
  	int err = 0;
  
-@@ -1828,16 +2157,23 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1828,17 +2157,24 @@ static int fuse_permission(struct mnt_idmap *idmap,
  
  	if (!fuse_allow_current_process(fc))
  		return -EACCES;
@@ -1055,10 +1055,12 @@ index 7ee120772..63c390c09 100644
  		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
  
 -		if (perm_mask & READ_ONCE(fi->inval_mask) ||
+-		    time_before64(fi->i_time, get_jiffies_64())) {
 +		if (!refreshed && ((perm_mask & READ_ONCE(fi->inval_mask)) ||
- 		    time_before64(fi->i_time, get_jiffies_64())) {
++		    time_before64(fi->i_time, get_jiffies_64()))) {
  			refreshed = true;
  
+ 			err = fuse_perm_getattr(inode, mask);
 @@ -1848,7 +2184,8 @@ static int fuse_permission(struct mnt_idmap *idmap,
  	}
  
@@ -2533,5 +2535,5 @@ index 9914a2ffd..ef2b716a8 100644
  	uint64_t	parent;
  	uint32_t	namelen;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 
