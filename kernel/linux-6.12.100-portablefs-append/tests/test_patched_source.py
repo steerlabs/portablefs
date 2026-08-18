@@ -606,9 +606,10 @@ class PatchedSourceTests(unittest.TestCase):
             "if (pfs_shared && !fuse_pfs_attr_is_exact(inode))", permission
         )
         self.assertIn("mutex_lock(&fi->pfs_publish_mutex)", permission)
+        execute_start = permission.index("static int fuse_pfs_execute_permission")
         execute = permission[
-            permission.index("static int fuse_pfs_execute_permission"):
-            permission.index("static int fuse_permission")
+            execute_start:
+            permission.index("static int fuse_permission", execute_start)
         ]
         self.assertIn("fuse_pfs_begin_attr_exact(inode)", execute)
         self.assertIn("inode->i_mode & 0111", execute)
@@ -623,7 +624,7 @@ class PatchedSourceTests(unittest.TestCase):
 
         namei = self.source("fs/namei.c")
         inode_permission = namei[
-            namei.index("int inode_permission"):
+            namei.index("int inode_permission(struct"):
             namei.index("EXPORT_SYMBOL(inode_permission)")
         ]
         self.assertIn("if (unlikely(!IS_ATTR_EXACT(inode)))", inode_permission)
@@ -637,10 +638,34 @@ class PatchedSourceTests(unittest.TestCase):
         ]
         self.assertIn("inode_begin_attr_exact(dir)", may_delete)
         self.assertIn("inode_begin_attr_exact(inode)", may_delete)
+        self.assertIn("inode_begin_attr_exact_pair(dir, inode)", may_delete)
+        self.assertIn("inode_permission_attr_exact(idmap, dir", may_delete)
         self.assertLess(
             may_delete.index("inode_end_attr_exact(dir)"),
             may_delete.index("inode_begin_attr_exact(inode)"),
         )
+        self.assertLess(
+            may_delete.index("inode_end_attr_exact(inode)"),
+            may_delete.index("inode_begin_attr_exact_pair(dir, inode)"),
+        )
+        pair_cut = may_delete[may_delete.index("inode_begin_attr_exact_pair") :]
+        self.assertNotIn("inode_end_attr_exact(dir)", pair_cut)
+        self.assertIn("inode_end_attr_exact_pair(dir, inode)", pair_cut)
+        self.assertLess(
+            pair_cut.index("inode_permission_attr_exact(idmap, dir"),
+            pair_cut.index("dir_mode = dir->i_mode"),
+        )
+
+        fuse_dir = self.source("fs/fuse/dir.c")
+        pair = fuse_dir[
+            fuse_dir.index("static int fuse_pfs_begin_attr_exact_pair"):
+            fuse_dir.index("static int fuse_permission(")
+        ]
+        self.assertIn("get_node_id(second) < get_node_id(first)", pair)
+        self.assertIn("mutex_lock(&first_fi->pfs_publish_mutex)", pair)
+        self.assertIn("mutex_lock_nested(&second_fi->pfs_publish_mutex", pair)
+        self.assertIn("IS_ATTR_EXACT(first)", pair)
+        self.assertIn("IS_ATTR_EXACT(second)", pair)
 
     def test_existing_create_and_negative_lookup_have_distinct_exact_shapes(
         self,

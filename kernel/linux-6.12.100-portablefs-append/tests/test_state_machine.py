@@ -680,6 +680,7 @@ class KernelInode:
     inode_flags: int = 0
     birth_time_ns: int = 0
     mode: int = 0o644
+    uid: int = 0
 
     def begin_attr_exact(self, refresh: callable) -> None:
         if not self.attr_exact:
@@ -695,12 +696,19 @@ class KernelInode:
 
     def may_delete(
         self, victim: "KernelInode", refresh_parent: callable,
-        refresh_victim: callable,
+        refresh_victim: callable, before_joint_cut: callable | None = None,
+        caller_uid: int = 0,
     ) -> bool:
         self.begin_attr_exact(refresh_parent)
+        victim.begin_attr_exact(refresh_victim)
+        if before_joint_cut is not None:
+            before_joint_cut()
+        if not self.attr_exact or not victim.attr_exact:
+            raise BlockingIOError(errno.EAGAIN, "joint attributes are inexact")
         if not self.permission(0o300):
             return False
-        victim.begin_attr_exact(refresh_victim)
+        if (self.mode & 0o1000 and caller_uid not in (self.uid, victim.uid)):
+            return False
         return not bool(
             self.inode_flags & STATX_ATTR_APPEND or
             victim.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
@@ -1497,6 +1505,27 @@ class PublicationAndNotifyTests(unittest.TestCase):
             parent.may_delete(victim, refresh_parent, refresh_victim)
         )
         self.assertEqual((parent_refreshes, victim_refreshes), (0, 1))
+
+        parent.uid = 2000
+        victim.uid = 3000
+        parent.mode = 0o1700
+
+        def clear_sticky_before_joint_cut() -> None:
+            parent.mode = 0o700
+
+        self.assertTrue(parent.may_delete(
+            victim, refresh_parent, refresh_victim,
+            clear_sticky_before_joint_cut, caller_uid=1000,
+        ))
+
+        def set_sticky_before_joint_cut() -> None:
+            parent.mode = 0o1700
+
+        parent.mode = 0o700
+        self.assertFalse(parent.may_delete(
+            victim, refresh_parent, refresh_victim,
+            set_sticky_before_joint_cut, caller_uid=1000,
+        ))
 
     def test_synchronous_statx_fill_uses_installed_exact_record(self) -> None:
         inode = KernelInode()
