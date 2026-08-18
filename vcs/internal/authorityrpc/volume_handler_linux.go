@@ -1020,7 +1020,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, visibilityCoordinate{}, false, false))
 			}
-			// Mutation order held both authoritative pre-bindings fixed through
+			// The dependency set held both authoritative pre-bindings fixed through
 			// the syscall. POSIX therefore determines the exact post-state without
 			// another filesystem round trip: exchange swaps the two bindings; a
 			// normal rename whose names already bind the same inode is a no-op; any
@@ -2130,6 +2130,21 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 			resp, _ := apply(1)
 			return resp
 		}
+		declaration := h.Visibility.DeclareSourceGate(expectedGate)
+		defer declaration.Release()
+		if sourcePublicationGateHasNamespace(expectedGate) {
+			// Dependency sequencing needs the current bound inode identities before
+			// admission. The declaration above snapshots the binding-key versions
+			// before this lookup, allowing the coordinator to prove an uncontended
+			// result current or refresh it after a preceding binding mutation.
+			expectedGate, err = resolutions.deriveSourcePublicationGate(req, true)
+			if err != nil {
+				return definiteRejection(err)
+			}
+			if !sourcePublicationGatesEqual(declaredGate, &expectedGate) {
+				return definiteRejection(syscall.EINVAL)
+			}
+		}
 		var resp *authoritypb.Response
 		normalizedPrepare := func() ([]volumeserver.VisibilityTarget, error) {
 			targets, prepareErr := prepare(resolutions)
@@ -2142,16 +2157,16 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 		refreshGate := func() (volumeserver.SourcePublicationGate, error) {
 			// Stable item and open-handle identities are immutable for the epoch.
 			// Only namespace bindings can change while this request waits for its
-			// FIFO turn, so item-only hot paths (especially Write) reuse the gate
+			// dependency set, so item-only hot paths (especially Write) reuse the gate
 			// already independently derived before enqueue instead of issuing a
 			// second identity syscall.
 			if !sourcePublicationGateHasNamespace(expectedGate) {
 				return expectedGate, nil
 			}
 			// Namespace bindings are the only operation facts that can change
-			// while this request waits for its FIFO turn. Discard the pre-turn
+			// while this request waits for its dependency set. Discard the stale
 			// cache exactly here; the refreshed answers remain authoritative
-			// through prepare and apply under the acquired turn.
+			// through prepare and apply under the acquired set.
 			resolutions.invalidateNamespaceBindings()
 			refreshed, refreshErr := resolutions.deriveSourcePublicationGate(req, true)
 			if refreshErr != nil {
@@ -2168,7 +2183,7 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 				return h.errorResponse(0, err, false)
 			}
 		}
-		_, err = h.Visibility.ExecuteWithSourceGateSequence(ctx, cred.ID, id, expectedGate, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
+		_, err = h.Visibility.ExecuteWithSourceGateSequence(ctx, cred.ID, id, declaration, expectedGate, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
 			var complete []volumeserver.VisibilityTarget
 			resp, complete = apply(sequence)
 			// nil is the explicit no-visible-change result. A non-nil empty

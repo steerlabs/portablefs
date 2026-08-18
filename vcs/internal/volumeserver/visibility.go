@@ -64,7 +64,7 @@ var (
 	// concurrent; unmounting the Mac participant releases this writer lease.
 	ErrCompatibilityWriterLease = errors.New("volumeserver: macOS 26 compatibility mount is the active volume writer")
 	// ErrVisibilityRetry is an internal, definite-preapply dependency for the
-	// lockless Linux frontend. The authority releases the request's FIFO turn;
+	// lockless Linux frontend. The authority releases the request's key set;
 	// the frontend releases its source gate, completes the named peer repair,
 	// and retries inside the same FUSE callback. Namespace repair does not need
 	// the callback's parent i_rwsem, so no application-visible EINTR is needed.
@@ -226,7 +226,7 @@ func (g SourcePublicationGate) hasNamespace() bool {
 // namespace coordinate (ParentIdentity+Name). BoundIdentities are resolved by
 // the authority from the namespace's current binding; they are never supplied
 // by the peer and exist only to make the pending-peer/source-request overlap
-// test exact before the request can acquire mutation order.
+// test exact before the request can acquire its dependency set.
 type SourcePublicationTarget struct {
 	Identity        [16]byte
 	ParentIdentity  [16]byte
@@ -531,6 +531,11 @@ func (d *visibilityDelivery) finish(err error) { d.once.Do(func() { d.done <- er
 type visibilityParticipant struct {
 	id      SessionID
 	pending *visibilityDelivery
+	// barrier reserves this participant's single ordered CONTROL event lane
+	// across both phases. A second disjoint mutation may run concurrently when
+	// its audience differs, but cannot insert PREPARE between this barrier's
+	// PREPARE and COMPLETE on the same participant.
+	barrier uint64
 	// interrupt is installed only after a parent-exclusive frontend confirms
 	// from its exact cache registry that its pending COMPLETE needs a parent
 	// currently held by one of its own unanswered mutations. It stays active
@@ -559,11 +564,12 @@ type visibilityInterruption struct {
 	kernelInodes map[uint64]struct{}
 }
 
-// mutationFairnessDebt is an off-list, one-shot effective FIFO position. A
-// dormant debt is tied to the peer visibility sequence that forced an eligible
-// later callback to leave. It becomes claimable only after that sequence's exact
-// COMPLETE Ack. A wholly local frontend refusal activates the PREPARE-time cut
-// at the same edge. Neither form owns mutation order while unclaimed.
+// mutationFairnessDebt is an off-list, one-shot effective per-key FIFO
+// position. A dormant debt is tied to the peer visibility sequence that forced
+// an eligible later callback to leave. It becomes claimable only after that
+// sequence's exact COMPLETE Ack. A wholly local frontend refusal activates the
+// PREPARE-time cut at the same edge. Neither form owns dependency keys while
+// unclaimed.
 type mutationFairnessDebt struct {
 	sequence           uint64
 	ordinal            uint64
@@ -669,8 +675,9 @@ func (a visibilityAudience) project(event VisibilityEvent, id SessionID) Visibil
 	return event
 }
 
-// visibilityMutationState is the read-side ordering boundary for the one
-// cache-visible mutation that owns serial order.
+// visibilityMutationState is one read-side ordering boundary. Several states
+// may coexist only when their dependency sets, and therefore their cached
+// observation keys, are disjoint.
 //
 // During PREPARE, a participant in audience may still have callbacks that were
 // admitted before its publication gate closed. Those callbacks must be allowed
@@ -746,10 +753,10 @@ type VisibilityCoordinator struct {
 	// mutation. With no strict participants mutations retain XFS concurrency by
 	// sharing this read lock.
 	registration sync.RWMutex
-	// order gives cache-visible mutations one cancellable FIFO order while
-	// strict mounts exist. Each waiter still watches its frontend's exact repair
-	// state and can remove itself from any queue position before apply.
-	order *mutationOrder
+	// sequencer grants complete stable-identity dependency sets. Conflicting
+	// mutations retain FIFO order while disjoint mutations may keep independent
+	// PREPARE/apply/COMPLETE barriers in flight.
+	sequencer *mutationSequencer
 
 	cfg          VisibilityConfig
 	startupReady bool
@@ -760,9 +767,10 @@ type VisibilityCoordinator struct {
 	next         uint64
 	poisoned     error
 	seed         uint64
-	// mutation holds both sides of the PREPARE -> apply read boundary. See
-	// visibilityMutationState and Stabilize.
-	mutation *visibilityMutationState
+	// mutations hold the independent PREPARE -> apply read boundaries. Every
+	// access is under mu; the participant indexes and global sequence remain
+	// protected by that same lock when several barriers run concurrently.
+	mutations map[uint64]*visibilityMutationState
 }
 
 // TopologyReadGuard pins the routing revision a filesystem request or attach
@@ -806,9 +814,10 @@ func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, err
 		return nil, fmt.Errorf("seed visibility resolved index: %w", err)
 	}
 	return &VisibilityCoordinator{
-		cfg: cfg, order: newMutationOrder(),
+		cfg: cfg, sequencer: newMutationSequencer(),
 		participants: make(map[SessionID]*visibilityParticipant),
 		fairness:     make(map[SessionID]mutationFairnessDebt),
+		mutations:    make(map[uint64]*visibilityMutationState),
 		startupReady: cfg.Prior == PriorEpochStrictMountsFenced,
 		seed:         binary.LittleEndian.Uint64(seed[:]),
 	}, nil
@@ -1186,17 +1195,41 @@ func (c *VisibilityCoordinator) poisonLocked(cause error) error {
 	return c.poisoned
 }
 
-// Execute orders one cache-visible filesystem mutation. prepare identifies the
-// callback publication gates that close before apply. apply runs exactly once
-// and returns post-mutation repair targets plus whether visible state changed.
+// DependencyDeclaration is a pre-resolution snapshot of the namespace
+// bindings from which an authority handler will derive a mutation's full key
+// set. It is opaque so callers cannot manufacture a claim that stale binding
+// identities are current.
+type DependencyDeclaration struct {
+	snapshot *dependencySnapshot
+}
+
+// DeclareSourceGate must run before resolving the gate's current bindings.
+// The later Execute call uses the snapshot to avoid a redundant uncontended
+// lookup while still detecting every sequenced binding change in between.
+func (c *VisibilityCoordinator) DeclareSourceGate(gate SourcePublicationGate) DependencyDeclaration {
+	return DependencyDeclaration{snapshot: c.sequencer.snapshot(bindingDependenciesForSourceGate(gate))}
+}
+
+// Release discards a declaration that will not be passed to Execute. Execute
+// also calls it, so a handler may defer Release immediately after declaration
+// without coordinating the success path.
+func (d DependencyDeclaration) Release() {
+	d.snapshot.release()
+}
+
+// Execute is the authority-derived/test entry point for a cache-visible
+// mutation without a protocol-5 source gate. dependencies must be the complete
+// stable-identity footprint declared before entry. Protocol-5 filesystem
+// mutations use ExecuteWithSourceGate so namespace identities can be
+// revalidated.
 //
-// ctx bounds only queueing for mutation order. Once a peer phase has been
+// ctx bounds only dependency-key queueing. Once a peer phase has been
 // delivered, a mount is holding publication admission closed and only its own
 // acknowledgment or fencing can reopen it, so caller cancellation cannot end
 // that wait. What bounds it instead is the per-participant repair budget.
-func (c *VisibilityCoordinator) Execute(ctx context.Context, source SessionID, mutation MutationID,
+func (c *VisibilityCoordinator) Execute(ctx context.Context, source SessionID, mutation MutationID, dependencies MutationDependencies,
 	prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool)) error {
-	return c.execute(ctx, source, mutation, nil, nil, nil, prepare,
+	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, nil, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil)
 }
 
@@ -1204,22 +1237,22 @@ func (c *VisibilityCoordinator) Execute(ctx context.Context, source SessionID, m
 // the listed parent directories until this authority answers. The declaration
 // is scoped only to this exact request, so one concurrent request in D1 can
 // never spuriously interrupt another request from the same mount in D2.
-func (c *VisibilityCoordinator) ExecuteWithHeldParents(ctx context.Context, source SessionID, mutation MutationID,
+func (c *VisibilityCoordinator) ExecuteWithHeldParents(ctx context.Context, source SessionID, mutation MutationID, dependencies MutationDependencies,
 	held [][16]byte, prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool)) error {
-	return c.execute(ctx, source, mutation, nil, held, nil, prepare,
+	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, held, nil, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil)
 }
 
 // ExecuteWithSourceGate is the production protocol-5 entry point. gate is the
 // initiating frontend's pre-dispatch local publication cut. published runs
-// immediately after apply, while mutation order is still held, and returns any
+// immediately after apply, while the dependency set is still held, and returns any
 // exact identities the ordinary response can publish but PREPARE could not know
 // (most importantly a newly created item).
 func (c *VisibilityCoordinator) ExecuteWithSourceGate(ctx context.Context, source SessionID, mutation MutationID,
-	gate SourcePublicationGate, refresh func() (SourcePublicationGate, error),
+	declaration DependencyDeclaration, gate SourcePublicationGate, refresh func() (SourcePublicationGate, error),
 	prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool),
 	published func() ([]VisibilityResolution, error)) error {
-	return c.execute(ctx, source, mutation, &gate, nil, refresh, prepare,
+	return c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, nil, refresh, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, published)
 }
 
@@ -1228,9 +1261,9 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGate(ctx context.Context, sourc
 // parent-exclusive cycle break while source-gate overlap handles the earlier
 // PREPARE/source-request dependency.
 func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParents(ctx context.Context, source SessionID, mutation MutationID,
-	gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
+	declaration DependencyDeclaration, gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
 	apply func() ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) error {
-	return c.execute(ctx, source, mutation, &gate, held, refresh, prepare,
+	return c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, held, refresh, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, published)
 }
 
@@ -1240,10 +1273,10 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParents(ctx context.
 // authority-issued sequence. Lockless Linux namespace repair needs no separate
 // parent-lock declaration: the exact source gate is the complete footprint.
 func (c *VisibilityCoordinator) ExecuteWithSourceGateSequence(ctx context.Context, source SessionID, mutation MutationID,
-	gate SourcePublicationGate, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
+	declaration DependencyDeclaration, gate SourcePublicationGate, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
 	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) (uint64, error) {
 	var sequence uint64
-	err := c.execute(ctx, source, mutation, &gate, nil, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
+	err := c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, nil, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
 		sequence = chosen
 		return apply(chosen)
 	}, published)
@@ -1254,10 +1287,10 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateSequence(ctx context.Contex
 // retired parent-exclusive model tests. No protocol-5 Attach can select that
 // profile, and production Linux uses ExecuteWithSourceGateSequence above.
 func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParentsSequence(ctx context.Context, source SessionID, mutation MutationID,
-	gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
+	declaration DependencyDeclaration, gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
 	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) (uint64, error) {
 	var sequence uint64
-	err := c.execute(ctx, source, mutation, &gate, held, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
+	err := c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, held, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
 		sequence = chosen
 		return apply(chosen)
 	}, published)
@@ -1265,14 +1298,19 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParentsSequence(ctx 
 }
 
 func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, mutation MutationID,
+	dependencies MutationDependencies, declaration DependencyDeclaration,
 	gate *SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
 	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) error {
 	if ctx == nil || prepare == nil || apply == nil {
 		return errors.New("volumeserver: visibility context, prepare, and mutation callbacks are required")
 	}
 	if gate != nil {
+		defer declaration.Release()
 		if err := validateSourcePublicationGate(*gate); err != nil {
 			return err
+		}
+		if !declaration.validFor(*gate, c.sequencer) {
+			return ErrSourcePublicationGate
 		}
 		if refresh == nil || published == nil {
 			return errors.New("volumeserver: source-gated mutation requires refresh and publication callbacks")
@@ -1302,7 +1340,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		return &VisibilityBarrierError{Err: ErrSourcePublicationGate}
 	}
 	if compatibilityWriterBlocked {
-		// This check precedes FIFO admission and every prepare/apply callback.
+		// This check precedes dependency admission and every prepare/apply callback.
 		// EBUSY is therefore a retryable product-policy result, not an uncertain
 		// mutation and not a coherence failure. The Mac may continue serving.
 		return ErrCompatibilityWriterLease
@@ -1315,24 +1353,48 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		// would recreate the retired uncached publication race.
 		return &VisibilityBarrierError{Err: ErrVisibilityProfile}
 	}
+	if !dependencies.valid() {
+		return &VisibilityBarrierError{Err: ErrVisibilityTargets}
+	}
 
-	turn, err := c.acquireMutationOrder(ctx, source, mutation, held, gate)
+	turn, err := c.acquireMutationDependencies(ctx, source, mutation, held, gate, dependencies, nil)
 	if err != nil {
 		return err
 	}
-	defer turn.release()
+	defer turn.settle()
 	if gate != nil {
-		refreshed, refreshErr := refresh()
-		if refreshErr != nil {
-			return refreshErr
+		// The handler captured binding versions before resolving the identities in
+		// gate. An unchanged snapshot proves the uncontended resolution is still
+		// current. Otherwise refresh while the structural parent/name keys are held,
+		// then atomically requeue at the same ordinal if the bound inode set changed.
+		// A previously reserved fairness credit can have an older ordinal and pass
+		// during that requeue, so every reacquisition refreshes again. There are only
+		// finitely many older ordinals, and later binding traffic cannot pass the
+		// retained reservation, which makes this loop starvation-free.
+		if !c.sequencer.unchanged(declaration.snapshot) {
+			for {
+				refreshed, refreshErr := refresh()
+				if refreshErr != nil {
+					return refreshErr
+				}
+				if validateSourcePublicationGate(refreshed) != nil || !sameSourcePublicationShape(*gate, refreshed) {
+					return ErrSourcePublicationGate
+				}
+				refreshedDependencies := mutationDependenciesForSourceGate(refreshed)
+				gate = &refreshed
+				if dependencies.equal(refreshedDependencies) {
+					break
+				}
+				turn.requeue(refreshedDependencies)
+				turn, err = c.acquireMutationDependencies(ctx, source, mutation, held, &refreshed, refreshedDependencies, turn)
+				if err != nil {
+					return err
+				}
+				dependencies = refreshedDependencies
+			}
 		}
-		if validateSourcePublicationGate(refreshed) != nil || !sameSourcePublicationShape(*gate, refreshed) {
-			return ErrSourcePublicationGate
-		}
-		gate = &refreshed
-		// Namespace pre-bindings can change while this request waits in FIFO.
 		// Re-read the exact pending phase under the same lock used by delivery
-		// after refreshing those identities and before any prepare/apply work.
+		// after final key acquisition and before any prepare/apply work.
 		c.mu.Lock()
 		participant := c.participants[source]
 		yieldErr := error(nil)
@@ -1355,6 +1417,9 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if err := validateVisibilityTargets(prepareTargets); err != nil {
 		return &VisibilityBarrierError{Err: ErrVisibilityTargets}
 	}
+	if !dependencies.covers(prepareTargets) {
+		return &VisibilityBarrierError{Err: ErrVisibilityTargets}
+	}
 	// prepare is the authority's independent derivation/validation boundary.
 	// A refused or forged declaration must not pollute the source's monotone
 	// history, so publish the validated gate only after prepare succeeds.
@@ -1370,10 +1435,12 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	}
 	barrierStarted := c.cfg.Now()
 	audience, deliveries, err := c.openBarrier(source, prepareTargets, &ticket)
-	// The PREPARE/apply state is released on every exit from here on, including
-	// the one where opening the barrier itself failed: a reader waiting on a
-	// coordinate must never outlive the mutation that claimed it.
-	defer c.closeBarrier()
+	if ticket.Cursor.Sequence != 0 {
+		// The coordinate state and participant-lane reservations are released on
+		// every exit, including an invariant failure during initial dispatch.
+		defer c.finishBarrier(ticket.Cursor.Sequence, audience)
+		defer c.closeBarrier(ticket.Cursor.Sequence)
+	}
 	if err != nil {
 		return &VisibilityBarrierError{Err: err}
 	}
@@ -1381,7 +1448,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if err := c.awaitAll(deliveries); err != nil {
 		return &VisibilityBarrierError{Err: err}
 	}
-	c.beginApply()
+	c.beginApply(ticket.Cursor.Sequence)
 
 	completeTargets, changed := apply(ticket.Cursor.Sequence)
 	if changed {
@@ -1401,8 +1468,8 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	}
 	if changed {
 		// Completion targets are also coordinates the initiating callback may
-		// publish through its ordinary result. Record them before the FIFO turn
-		// can pass even when the response contains no Item message.
+		// publish through its ordinary result. Record them before the dependency
+		// set can pass even when the response contains no Item message.
 		c.recordSourceTargets(source, completeTargets)
 	}
 	// The coordinates stop being in flight the instant XFS has them, not when
@@ -1419,11 +1486,12 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	// gates, and apply is this authority talking to XFS.
 	//
 	// It costs nothing in exactness. A reader released here reads post-apply
-	// state, which is the new value, not the old one; the next mutation cannot
-	// have started, because this one still holds mutation order; and COMPLETE is
-	// addressed to the mounts that cached the PRE-mutation value, which this
-	// reader by definition did not.
-	c.closeBarrier()
+	// state, which is the new value, not the old one; a conflicting mutation
+	// cannot have started because this operation still holds all dependency
+	// keys; and COMPLETE is addressed to the mounts that cached the pre-mutation
+	// value, which this reader by definition did not. A disjoint mutation may be
+	// active, but by construction it cannot affect this observation.
+	c.closeBarrier(ticket.Cursor.Sequence)
 	ticket.Cursor.Phase = VisibilityComplete
 	if changed {
 		ticket.Targets = cloneVisibilityTargets(completeTargets)
@@ -1453,20 +1521,22 @@ func (c *VisibilityCoordinator) observeBarrier(started time.Time, audience int) 
 	c.cfg.OnBarrier(elapsed, audience)
 }
 
-// acquireMutationOrder takes the global visible-mutation turn while honoring
-// the frontend-declared progress constraints. Each caller joins the FIFO once
-// and keeps that position across harmless participant-state changes. A pending
+// acquireMutationDependencies waits for one atomic dependency set while
+// honoring the frontend-declared progress constraints. Each caller keeps its
+// per-key FIFO position across harmless participant-state changes. A pending
 // repair can still remove a hazardous waiter from any queue position before
 // prepare or apply, which is required for both FSKit callback capacity and
 // Linux parent-lock cycle breaking.
 //
-// The post-grant check closes the edge where a phase and the FIFO handoff become
-// visible together. Abandoning a waiter is safe even if the grant won that race:
-// it releases the exact ownership before returning the definite-preapply result.
-func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source SessionID, mutation MutationID,
-	held [][16]byte, gate *SourcePublicationGate) (*mutationOrderWaiter, error) {
-	var turn *mutationOrderWaiter
-	retryProofValidated := false
+// The post-grant check closes the edge where a phase and the dependency grant
+// become visible together. Abandoning a waiter is safe even if the grant won
+// that race: it releases the exact ownership before returning the
+// definite-preapply result.
+func (c *VisibilityCoordinator) acquireMutationDependencies(ctx context.Context, source SessionID, mutation MutationID,
+	held [][16]byte, gate *SourcePublicationGate, dependencies MutationDependencies,
+	waiter *mutationSequencerWaiter) (*mutationSequencerWaiter, error) {
+	turn := waiter
+	retryProofValidated := turn != nil
 	for {
 		c.mu.Lock()
 		participant := c.participants[source]
@@ -1502,7 +1572,7 @@ func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source
 			}
 		} else if turn == nil {
 			reserved := c.claimFairnessLocked(source, mutation, fairnessEligible)
-			turn = c.order.enqueueFor(reserved)
+			turn = c.sequencer.enqueueFor(dependencies, reserved)
 		}
 		c.mu.Unlock()
 		if yieldErr != nil {
@@ -1530,7 +1600,7 @@ func (c *VisibilityCoordinator) acquireMutationOrder(ctx context.Context, source
 			}
 			return turn, nil
 		case <-changed:
-			// Keep the same FIFO node. The next loop either proves it is still
+			// Keep the same per-key FIFO node. The next loop either proves it is still
 			// eligible or removes it without delaying the queue head.
 		case <-ctx.Done():
 			turn.abandon()
@@ -1550,7 +1620,7 @@ func eligibleForFairness(participant *visibilityParticipant, mutation MutationID
 }
 
 func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, participant *visibilityParticipant, mutation MutationID,
-	turn *mutationOrderWaiter, gate *SourcePublicationGate) {
+	turn *mutationSequencerWaiter, gate *SourcePublicationGate) {
 	if !eligibleForFairness(participant, mutation, gate) || participant.pending == nil {
 		return
 	}
@@ -1597,7 +1667,7 @@ func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, pa
 		c.fairness[source] = debt
 		return
 	}
-	ordinal := c.order.reserveOrdinal()
+	ordinal := c.sequencer.reserveOrdinal()
 	if turn != nil {
 		ordinal = turn.ordinal
 	}
@@ -1692,7 +1762,7 @@ func (c *VisibilityCoordinator) visibilityRetryProofRequiredLocked(source Sessio
 // phase: the initiating frontend pre-closes its own footprint and receives no
 // PREPARE/COMPLETE. If that footprint overlaps a pending peer phase, the peer
 // may already be waiting for the source callback to publish; letting the same
-// request wait for mutation order would close a cycle, so it is refused
+// request wait for its dependency set would close a cycle, so it is refused
 // definite-preapply. Callback serialization and Linux parent-lock conflicts
 // retain their stronger platform-specific interruption rules.
 func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutation MutationID,
@@ -1703,7 +1773,7 @@ func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutat
 	pending := participant.pending.event
 	if pending.Routes == nil && gate != nil && gate.overlaps(pending.Targets) {
 		if participant.repair == NamespaceRepairLocklessExpiration {
-			// acquireMutationOrder authenticated this proof against the exact
+			// acquireMutationDependencies authenticated this proof against the exact
 			// retained debt before it could claim/enqueue. Matching the still-pending
 			// sequence is therefore safe to wait behind: local repair is complete,
 			// and only its CONTROL-lane ACK remains. A different phase must produce a
@@ -1736,7 +1806,7 @@ func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutat
 
 // recordSourceGate publishes the frontend's pre-dispatch cut into the source
 // participant's monotone audience index after authority PREPARE validation and
-// before mutation order can pass to another writer.
+// before a conflicting dependency owner can pass.
 func (c *VisibilityCoordinator) recordSourceGate(source SessionID, gate SourcePublicationGate) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1750,7 +1820,7 @@ func (c *VisibilityCoordinator) recordSourceGate(source SessionID, gate SourcePu
 }
 
 // recordSourceTargets indexes actual post-apply coordinates while the mutation
-// still owns the FIFO turn. It supplements the potential declaration with
+// still owns its dependency set. It supplements the potential declaration with
 // identities that only XFS could determine.
 func (c *VisibilityCoordinator) recordSourceTargets(source SessionID, targets []VisibilityTarget) {
 	c.mu.Lock()
@@ -1841,93 +1911,113 @@ func (c *VisibilityCoordinator) validateCompletion(complete, prepared []Visibili
 // no third case.
 func (c *VisibilityCoordinator) openBarrier(source SessionID, targets []VisibilityTarget, ticket *VisibilityEvent) (visibilityAudience, []*visibilityDelivery, error) {
 	keys := visibilityTargetKeys(targets)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.poisoned != nil {
-		return visibilityAudience{}, nil, c.poisoned
-	}
-	c.next++
-	ticket.Cursor = VisibilityCursor{Sequence: c.next, Phase: VisibilityPrepare}
-	ticket.Targets = cloneVisibilityTargets(targets)
+	for {
+		c.mu.Lock()
+		if c.poisoned != nil {
+			err := c.poisoned
+			c.mu.Unlock()
+			return visibilityAudience{}, nil, err
+		}
 
-	audience := visibilityAudience{targetKeys: make(map[SessionID]map[string]struct{})}
-	for id, p := range c.participants {
-		if id == source {
-			// The initiating frontend closed and drained this footprint before
-			// dispatch. It therefore receives neither filesystem phase.
-			continue
-		}
-		matched := p.matchingTargetKeys(targets)
-		if len(matched) != 0 {
-			audience.members = append(audience.members, p)
-			audience.targetKeys[id] = matched
-		}
-	}
-	// A callback refused locally during peer PREPARE has no authority waiter
-	// whose ordinal can be recovered. Take one shared off-list cut now, before
-	// later mutation traffic can enqueue; exact peer COMPLETE feedback may
-	// activate it. The cut is never a queue node and therefore never blocks.
-	var fairnessCut uint64
-	for _, p := range audience.members {
-		if p.repair != NamespaceRepairCallbackSerializedPipelined {
-			continue
-		}
-		if debt, exists := c.fairness[p.id]; exists {
-			if debt.active && c.cfg.Now().After(debt.deadline) {
-				delete(c.fairness, p.id)
-			} else if debt.active {
-				// Claims are impossible while this peer phase is pending. Carry
-				// the one coalesced credit forward, preserving its earliest cut,
-				// and restart the bounded claim window only on this sequence's
-				// exact COMPLETE. This is not a second credit.
-				debt.sequence = ticket.Cursor.Sequence
-				debt.observed = true
-				debt.active = false
-				debt.deadline = time.Time{}
-				c.fairness[p.id] = debt
-				continue
-			} else {
+		audience := visibilityAudience{targetKeys: make(map[SessionID]map[string]struct{})}
+		var laneChanged <-chan struct{}
+		for id, p := range c.participants {
+			if id == source {
+				// The initiating frontend closed and drained this footprint before
+				// dispatch. It therefore receives neither filesystem phase.
 				continue
 			}
+			matched := p.matchingTargetKeys(targets)
+			if len(matched) == 0 {
+				continue
+			}
+			audience.members = append(audience.members, p)
+			audience.targetKeys[id] = matched
+			if p.barrier != 0 && laneChanged == nil {
+				laneChanged = p.changed
+			}
 		}
-		if fairnessCut == 0 {
-			fairnessCut = c.order.reserveOrdinal()
+		if laneChanged != nil {
+			// One CONTROL cursor is outstanding per participant. Retaining this
+			// operation's dependency keys while waiting cannot deadlock: an older
+			// barrier never acquires additional keys, and its bounded repair/fence
+			// path does not need this operation's disjoint XFS state.
+			c.mu.Unlock()
+			<-laneChanged
+			continue
 		}
-		c.fairness[p.id] = mutationFairnessDebt{
-			sequence: ticket.Cursor.Sequence,
-			ordinal:  fairnessCut,
-		}
-	}
 
-	state := &visibilityMutationState{
-		keys:          make(map[string]struct{}, len(keys)),
-		audience:      make(map[SessionID]*visibilityParticipant, len(audience.members)),
-		projectedKeys: audience.targetKeys,
-		cursor:        ticket.Cursor,
-		done:          make(chan struct{}),
+		c.next++
+		if c.next == 0 {
+			c.mu.Unlock()
+			panic("volumeserver: visibility sequence exhausted")
+		}
+		ticket.Cursor = VisibilityCursor{Sequence: c.next, Phase: VisibilityPrepare}
+		ticket.Targets = cloneVisibilityTargets(targets)
+		for _, p := range audience.members {
+			p.barrier = ticket.Cursor.Sequence
+		}
+
+		// A callback refused locally during peer PREPARE has no authority waiter
+		// whose ordinal can be recovered. Take one shared off-list cut now, before
+		// later mutation traffic can enqueue; exact peer COMPLETE feedback may
+		// activate it. The cut is never a queue node and therefore never blocks.
+		var fairnessCut uint64
+		for _, p := range audience.members {
+			if p.repair != NamespaceRepairCallbackSerializedPipelined {
+				continue
+			}
+			if debt, exists := c.fairness[p.id]; exists {
+				if debt.active && c.cfg.Now().After(debt.deadline) {
+					delete(c.fairness, p.id)
+				} else if debt.active {
+					debt.sequence = ticket.Cursor.Sequence
+					debt.observed = true
+					debt.active = false
+					debt.deadline = time.Time{}
+					c.fairness[p.id] = debt
+					continue
+				} else {
+					continue
+				}
+			}
+			if fairnessCut == 0 {
+				fairnessCut = c.sequencer.reserveOrdinal()
+			}
+			c.fairness[p.id] = mutationFairnessDebt{
+				sequence: ticket.Cursor.Sequence,
+				ordinal:  fairnessCut,
+			}
+		}
+
+		state := &visibilityMutationState{
+			keys:          make(map[string]struct{}, len(keys)),
+			audience:      make(map[SessionID]*visibilityParticipant, len(audience.members)),
+			projectedKeys: audience.targetKeys,
+			cursor:        ticket.Cursor,
+			done:          make(chan struct{}),
+		}
+		for _, key := range keys {
+			state.keys[string(key)] = struct{}{}
+		}
+		for _, p := range audience.members {
+			state.audience[p.id] = p
+		}
+		c.mutations[ticket.Cursor.Sequence] = state
+		deliveries, err := c.dispatchLocked(*ticket, audience, nil)
+		c.mu.Unlock()
+		return audience, deliveries, err
 	}
-	for _, key := range keys {
-		state.keys[string(key)] = struct{}{}
-	}
-	for _, p := range audience.members {
-		state.audience[p.id] = p
-	}
-	c.mutation = state
-	deliveries, err := c.dispatchLocked(*ticket, audience, nil)
-	if err != nil {
-		return visibilityAudience{}, nil, err
-	}
-	return audience, deliveries, nil
 }
 
 // beginApply closes the old-value drain boundary after every PREPARE Ack. A
 // compliant frontend still has publication admission closed, and from this
 // point even an audience member must wait for XFS apply before reading one of
 // the mutation's coordinates.
-func (c *VisibilityCoordinator) beginApply() {
+func (c *VisibilityCoordinator) beginApply(sequence uint64) {
 	c.mu.Lock()
-	if c.mutation != nil {
-		c.mutation.applying = true
+	if state := c.mutations[sequence]; state != nil {
+		state.applying = true
 	}
 	c.mu.Unlock()
 }
@@ -1935,19 +2025,39 @@ func (c *VisibilityCoordinator) beginApply() {
 // closeBarrier releases the PREPARE/apply coordinate set. It is idempotent:
 // Execute calls it as soon as apply returns and also defers it, so neither a
 // pre-apply failure nor a post-apply repair wait can strand a reader.
-func (c *VisibilityCoordinator) closeBarrier() {
+func (c *VisibilityCoordinator) closeBarrier(sequence uint64) {
 	c.mu.Lock()
-	state := c.mutation
-	c.mutation = nil
+	state := c.mutations[sequence]
+	delete(c.mutations, sequence)
 	c.mu.Unlock()
 	if state != nil {
 		close(state.done)
 	}
 }
 
+// finishBarrier releases participant CONTROL lanes only after COMPLETE has
+// either been acknowledged or discharged by fencing. The dependency set stays
+// owned until the caller returns, so a conflicting mutation still cannot open
+// a later sequence first.
+func (c *VisibilityCoordinator) finishBarrier(sequence uint64, audience visibilityAudience) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, p := range audience.members {
+		if c.participants[p.id] != p {
+			continue
+		}
+		if p.barrier != sequence {
+			c.poisonLocked(errors.New("volumeserver: participant visibility barrier ownership changed"))
+			continue
+		}
+		p.barrier = 0
+		p.signalLocked()
+	}
+}
+
 // Stabilize is the read-path half of scoped fan-out. It records what this
 // operation is about to publish into a strict frontend's kernel cache, and
-// orders it against the running mutation's PREPARE/apply boundary.
+// orders it against every running mutation's PREPARE/apply boundary.
 //
 // On return the coordinates are in this mount's index and either no mutation
 // owned them, apply has completed, or this participant's still-pending PREPARE
@@ -1977,10 +2087,10 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			c.mu.Unlock()
 			return waited, nil
 		}
-		state := c.mutation
-		blocked := false
-		prepareCoversEveryConflict := true
-		if state != nil {
+		var blocked *visibilityMutationState
+		for _, state := range c.mutations {
+			conflicts := false
+			prepareCoversEveryConflict := true
 			projected := state.projectedKeys[id]
 			for _, resolution := range resolutions {
 				for _, key := range resolution.keys() {
@@ -1988,24 +2098,29 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 					if _, conflict := state.keys[encoded]; !conflict {
 						continue
 					}
-					blocked = true
+					conflicts = true
 					if _, covered := projected[encoded]; !covered {
 						prepareCoversEveryConflict = false
 					}
 				}
 			}
+			if !conflicts {
+				continue
+			}
+			if prepareCoversEveryConflict && !state.applying && state.audience[id] == p &&
+				p.pending != nil && p.pending.event.Cursor == state.cursor &&
+				p.pending.event.Cursor.Phase == VisibilityPrepare {
+				// This callback's every conflicting coordinate is covered by the
+				// PREPARE actually delivered to this participant. Let it publish old
+				// state; that exact scoped PREPARE cannot Ack until the frontend drains
+				// the publication. A union-audience match on another target is not
+				// sufficient and stays blocked through apply.
+				continue
+			}
+			blocked = state
+			break
 		}
-		if blocked && prepareCoversEveryConflict && !state.applying && state.audience[id] == p &&
-			p.pending != nil && p.pending.event.Cursor == state.cursor &&
-			p.pending.event.Cursor.Phase == VisibilityPrepare {
-			// This callback's every conflicting coordinate is covered by the
-			// PREPARE actually delivered to this participant. Let it publish old
-			// state; that exact scoped PREPARE cannot Ack until the frontend drains
-			// the publication. A union-audience match on another target is not
-			// sufficient and stays blocked through apply.
-			blocked = false
-		}
-		if !blocked {
+		if blocked == nil {
 			for _, resolution := range resolutions {
 				for _, key := range resolution.keys() {
 					p.index.add(key)
@@ -2014,7 +2129,7 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			c.mu.Unlock()
 			return waited, nil
 		}
-		done := state.done
+		done := blocked.done
 		c.mu.Unlock()
 		waited = true
 		select {
@@ -2098,7 +2213,7 @@ func (c *VisibilityCoordinator) dispatchLocked(event VisibilityEvent, audience v
 // fs/fuse/dir.c:1014-1062 - so the write lock is held for the whole time this
 // authority is deciding the operation.
 //
-// Mount A holds mutation order and its COMPLETE asks B to make a name in D
+// Mount A holds D's dependency keys and its COMPLETE asks B to make a name in D
 // unservable. The only kernel interface that does so is
 // fuse_reverse_inval_entry, which takes inode_lock_nested(parent,
 // I_MUTEX_PARENT) - down_write, include/linux/fs.h:837 - at fs/fuse/dir.c:1351
@@ -2112,7 +2227,7 @@ func (c *VisibilityCoordinator) dispatchLocked(event VisibilityEvent, audience v
 //
 // A's mutation still cannot return while B can serve the stale binding. The
 // operation holding B's lock has not reached XFS, however, so the authority can
-// answer that one operation definitively without releasing A's mutation order.
+// answer that one operation definitively without releasing A's dependency keys.
 //
 //  1. Holding D's lock does not stop B serving the name. RCU-walk resolves it
 //     with no inode lock at all: lookup_fast's RCU branch (fs/namei.c:1617) and
@@ -2132,7 +2247,7 @@ func (c *VisibilityCoordinator) dispatchLocked(event VisibilityEvent, audience v
 //     authority can answer it. The blocked report wakes the exact queued
 //     handler, which returns ErrVisibilityInterrupted before prepare/apply.
 //     The resulting EINTR releases D without changing XFS; COMPLETE then runs
-//     while A still owns mutation order.
+//     while A still owns D's dependency keys.
 //  4. A repair gate in B linearizes callback admission against its exact cache
 //     plan. A callback admitted first is visible here as parked and gets the
 //     pre-apply interruption; one arriving after the gate is refused locally.

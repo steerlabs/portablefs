@@ -222,6 +222,7 @@ func TestNextVisibilityAtomicallyAcknowledgesAndWaitsForSuccessor(t *testing.T) 
 	go func() {
 		applied <- visibility.Execute(
 			ctx, volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
 			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
 		)
@@ -386,6 +387,7 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 	go func() {
 		first <- visibility.Execute(
 			context.Background(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
 			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
 		)
@@ -1364,7 +1366,7 @@ func TestOperationResolutionContextReusesAuthoritativeNamespaceBindings(t *testi
 				t.Fatal(err)
 			}
 			if got := store.lookup.Load(); got != 0 {
-				t.Fatalf("pre-turn namespace lookups = %d, want 0", got)
+				t.Fatalf("shape-only namespace lookups = %d, want 0", got)
 			}
 
 			resolutions.invalidateNamespaceBindings()
@@ -1449,7 +1451,7 @@ func TestMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) 
 	}
 }
 
-func TestMutateVisibleNamespaceGateRefreshesBindingAfterMutationOrderGrant(t *testing.T) {
+func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testing.T) {
 	runtime, err := volumeserver.New("namespace-source-gate-refresh", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
@@ -1489,27 +1491,29 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterMutationOrderGrant(t *te
 	if err := h.startSessionResources(credential.ID, root, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
 		t.Fatal(err)
 	}
+	parentIdentity := [16]byte{root[0]}
+	mutationTargets := []volumeserver.VisibilityTarget{
+		{Scope: volumeserver.VisibilityNamespace, ParentIdentity: parentIdentity, ParentKernelIno: 0x11, Device: 1, Name: []byte("child")},
+		{Scope: volumeserver.VisibilityAttributes, Identity: parentIdentity, KernelIno: 0x11, Device: 1},
+	}
 
 	ownerEntered := make(chan struct{})
 	releaseOwner := make(chan struct{})
 	ownerResult := make(chan error, 1)
-	unrelated := []volumeserver.VisibilityTarget{{
-		Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{0xEE}, KernelIno: 0xEE, Device: 1,
-	}}
 	go func() {
 		ownerResult <- visibility.Execute(
 			context.Background(), volumeserver.SessionID{0xFE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets(mutationTargets),
 			func() ([]volumeserver.VisibilityTarget, error) {
 				close(ownerEntered)
 				<-releaseOwner
-				return unrelated, nil
+				return mutationTargets, nil
 			},
 			func() ([]volumeserver.VisibilityTarget, bool) { return nil, false },
 		)
 	}()
 	<-ownerEntered
 
-	parentIdentity := [16]byte{root[0]}
 	request := &authoritypb.Request{
 		RequestId: 1,
 		SourcePublicationGate: &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{
@@ -1523,10 +1527,6 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterMutationOrderGrant(t *te
 		Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: root[:], Name: []byte("child")}},
 	}
 	stampMutation(t, request, 0, 1)
-	mutationTargets := []volumeserver.VisibilityTarget{
-		{Scope: volumeserver.VisibilityNamespace, ParentIdentity: parentIdentity, ParentKernelIno: 0x11, Device: 1, Name: []byte("child")},
-		{Scope: volumeserver.VisibilityAttributes, Identity: parentIdentity, KernelIno: 0x11, Device: 1},
-	}
 	mutationResult := make(chan *authoritypb.Response, 1)
 	go func() {
 		mutationResult <- h.mutateVisible(
@@ -1535,33 +1535,33 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterMutationOrderGrant(t *te
 			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), nil },
 		)
 	}()
-	store.setBound(newBinding)
 	select {
 	case <-store.firstLookup:
-		t.Fatal("namespace binding resolved before the earlier mutation released FIFO order")
+	case <-time.After(2 * time.Second):
+		t.Fatal("namespace binding was not resolved before dependency admission")
+	}
+	close(store.releaseFirst)
+	<-store.firstForgotten
+	select {
+	case <-store.secondLookup:
+		t.Fatal("namespace binding refreshed before the conflicting owner released its key")
 	default:
 	}
+	store.setBound(newBinding)
 	close(releaseOwner)
 	if err := <-ownerResult; err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-store.firstLookup:
+	case <-store.secondLookup:
 	case <-time.After(2 * time.Second):
-		t.Fatal("namespace binding was not resolved after mutation-order grant")
+		t.Fatal("namespace binding was not refreshed after its dependency version changed")
 	}
-	close(store.releaseFirst)
-	<-store.firstForgotten
 	if response := <-mutationResult; response.GetErrno() != 0 {
 		t.Fatalf("namespace mutation = %+v", response)
 	}
-	if calls := store.lookupCalls.Load(); calls != 1 {
-		t.Fatalf("namespace binding lookups = %d, want one post-grant resolution", calls)
-	}
-	select {
-	case <-store.secondLookup:
-		t.Fatal("prepare repeated the post-grant namespace resolution")
-	default:
+	if calls := store.lookupCalls.Load(); calls != 2 {
+		t.Fatalf("namespace binding lookups = %d, want initial declaration plus one version-triggered refresh", calls)
 	}
 
 	newIdentity := [16]byte{newBinding[0]}
@@ -1572,6 +1572,7 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterMutationOrderGrant(t *te
 	go func() {
 		peerResult <- visibility.Execute(
 			context.Background(), volumeserver.SessionID{0xFD}, volumeserver.MutationID{Sequence: 2},
+			volumeserver.MutationDependenciesForTargets(peerTargets),
 			func() ([]volumeserver.VisibilityTarget, error) { return peerTargets, nil },
 			func() ([]volumeserver.VisibilityTarget, bool) { return peerTargets, true },
 		)
@@ -1816,7 +1817,7 @@ func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.
 		t.Fatalf("Rename calls = %d, want one", calls)
 	}
 	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("Rename namespace lookups = %d, want one post-FIFO resolution per name", calls)
+		t.Fatalf("Rename namespace lookups = %d, want one pre-admission resolution per name", calls)
 	}
 
 	// Request ID is delivery correlation, not replay identity. A lost DATA
@@ -1851,7 +1852,7 @@ func TestRenameExchangeReplyCarriesBothAuthoritativePostBindings(t *testing.T) {
 		t.Fatalf("Rename exchange reply = %+v, want new=%x old=%x", rename, wantNew, wantOld)
 	}
 	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("Rename exchange namespace lookups = %d, want one post-FIFO resolution per name", calls)
+		t.Fatalf("Rename exchange namespace lookups = %d, want one pre-admission resolution per name", calls)
 	}
 }
 
@@ -1888,7 +1889,7 @@ func TestRenameSameInodeNoOpReportsBothNamesAndReplaysExactly(t *testing.T) {
 		t.Fatalf("same-inode exact replay re-executed XFS: calls = %d", calls)
 	}
 	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("same-inode Rename namespace lookups = %d, want one post-FIFO resolution per name", calls)
+		t.Fatalf("same-inode Rename namespace lookups = %d, want one pre-admission resolution per name", calls)
 	}
 }
 
@@ -2926,6 +2927,7 @@ func TestProtocol5ActivationPublishesFreshRootInsideRegistrationBoundary(t *test
 		close(mutationStarted)
 		mutationDone <- h.Visibility.Execute(
 			context.Background(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{target}),
 			func() ([]volumeserver.VisibilityTarget, error) {
 				close(prepareEntered)
 				return []volumeserver.VisibilityTarget{target}, nil

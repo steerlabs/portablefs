@@ -237,6 +237,7 @@ func TestRoutesChangeFencesOnlyTheParticipantThatMissedItsOwnBudget(t *testing.T
 		t.Fatalf("waited %s for a mount that committed to %s", waited, silentBudget)
 	}
 	if err := h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+		testMutationDependencies("after"),
 		testVisibilityPrepare("after"), func() ([]VisibilityTarget, bool) {
 			return testVisibilityTargets("after"), true
 		}); err != nil {
