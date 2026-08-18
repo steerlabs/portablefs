@@ -317,10 +317,9 @@ FORBIDDEN_INIT = {
 }
 
 STRICT_NOTIFY_CODES = {
-    "INVAL_INODE",
-    "INVAL_ENTRY",
-    "DELETE",
     "PFS_SIZE",
+    "PFS_ATTR",
+    "PFS_ENTRY",
 }
 
 
@@ -373,32 +372,28 @@ def strict_notify(
         raise ProtocolError("reverse notification outside strict dialect")
     if nodeid == 0:
         raise ProtocolError("zero reverse-notification identity")
-    if code == "DELETE" and child == 0:
+    if code == "PFS_ENTRY" and flags == 1 and child == 0:
         raise ProtocolError("zero DELETE child identity")
-    if code in ("INVAL_ENTRY", "DELETE") and (
+    if code == "PFS_ENTRY" and (
         not name or b"\0" in name or b"/" in name or name in (b".", b"..")
     ):
         raise ProtocolError("invalid cached-child component")
-    if code == "INVAL_INODE" and (off not in (-1, 0) or length != 0):
-        raise ProtocolError("partial inode invalidation is unsequenced")
-    if code == "INVAL_ENTRY" and flags != 0:
-        raise ProtocolError("entry expiry is outside the strict repair shape")
-    if code == "DELETE" and padding != 0:
-        raise ProtocolError("DELETE padding must be zero")
-    if code == "PFS_SIZE" and not 0 < sequence <= S64_MAX:
-        raise ProtocolError("PFS_SIZE sequence is outside signed authority range")
+    if code == "PFS_ENTRY" and (
+        flags not in (0, 1) or (flags == 0 and child != 0)
+    ):
+        raise ProtocolError("invalid exact entry-repair shape")
+    if not 0 < sequence <= S64_MAX:
+        raise ProtocolError("repair sequence is outside signed authority range")
     if inode is None:
         return "absent"
     if inode.pfs_class != "shared":
         raise ProtocolError("reverse repair targeted a LOCAL inode")
-    if code in ("INVAL_ENTRY", "DELETE") and not inode.is_dir:
+    if code == "PFS_ENTRY" and not inode.is_dir:
         raise ProtocolError("namespace repair parent is not a directory")
-    if code == "INVAL_INODE" and off == 0:
-        inode.withdraw_data()
-    if code in ("INVAL_ENTRY", "DELETE") and resident_child is not None:
+    if code == "PFS_ENTRY" and resident_child is not None:
         if resident_child.pfs_class != "shared":
             raise ProtocolError("namespace repair targeted a LOCAL child")
-        if code == "DELETE" and child != resident_child.nodeid:
+        if flags == 1 and child != resident_child.nodeid:
             raise ProtocolError("DELETE child identity mismatch")
         inode.cache_generation += 1
     if code == "PFS_SIZE":
@@ -409,8 +404,8 @@ def strict_notify(
 
 
 def strict_init(minor: int, flags: set[str], default_permissions: bool) -> None:
-    if minor != 41 or not default_permissions:
-        raise ProtocolError("strict profile requires exact ABI 7.41")
+    if minor != 42 or not default_permissions:
+        raise ProtocolError("strict profile requires exact ABI 7.42")
     if not REQUIRED_INIT <= flags or FORBIDDEN_INIT & flags:
         raise ProtocolError("strict INIT capability mismatch")
 
@@ -735,18 +730,18 @@ class AbiAndAdmissionTests(unittest.TestCase):
                          max_write)
 
     def test_exact_minor_and_capability_suite(self) -> None:
-        strict_init(41, set(REQUIRED_INIT), True)
-        for minor in (28, 36, 40, 42):
+        strict_init(42, set(REQUIRED_INIT), True)
+        for minor in (28, 36, 40, 41, 43):
             with self.assertRaises(ProtocolError):
                 strict_init(minor, set(REQUIRED_INIT), True)
         for missing in REQUIRED_INIT:
             with self.assertRaises(ProtocolError):
-                strict_init(41, set(REQUIRED_INIT) - {missing}, True)
+                strict_init(42, set(REQUIRED_INIT) - {missing}, True)
         for forbidden in FORBIDDEN_INIT:
             with self.assertRaises(ProtocolError):
-                strict_init(41, set(REQUIRED_INIT) | {forbidden}, True)
+                strict_init(42, set(REQUIRED_INIT) | {forbidden}, True)
         with self.assertRaises(ProtocolError):
-            strict_init(41, set(REQUIRED_INIT), False)
+            strict_init(42, set(REQUIRED_INIT), False)
 
     def test_strict_superblock_refuses_lower_and_upper_stacking(self) -> None:
         preinit_depth = FILESYSTEM_MAX_STACK_DEPTH
@@ -1112,7 +1107,16 @@ class PublicationAndNotifyTests(unittest.TestCase):
         queued_replies: list[str] = []
         before = (inode.size, inode.sequence, inode.cache_generation)
 
-        for forbidden in ("STORE", "RETRIEVE", "POLL", "RESEND", "FUTURE"):
+        for forbidden in (
+            "INVAL_INODE",
+            "INVAL_ENTRY",
+            "DELETE",
+            "STORE",
+            "RETRIEVE",
+            "POLL",
+            "RESEND",
+            "FUTURE",
+        ):
             with self.assertRaises(ProtocolError):
                 strict_notify(forbidden, inode)
         self.assertEqual(
@@ -1120,13 +1124,15 @@ class PublicationAndNotifyTests(unittest.TestCase):
         )
         self.assertEqual(queued_replies, [])
 
-        self.assertEqual(strict_notify("INVAL_INODE", inode), "dispatched")
-        for allowed in ("INVAL_ENTRY", "DELETE"):
-            self.assertEqual(strict_notify(allowed, parent), "dispatched")
         self.assertEqual(strict_notify("PFS_SIZE", inode), "dispatched")
+        self.assertEqual(strict_notify("PFS_ATTR", inode), "dispatched")
+        self.assertEqual(
+            strict_notify("PFS_ENTRY", parent, child=0, flags=0),
+            "dispatched",
+        )
         self.assertEqual((inode.size, inode.sequence), (11, 1))
 
-    def test_stock_reverse_repairs_require_exact_shape_and_shared_target(
+    def test_stamped_reverse_repairs_require_exact_shape_and_shared_target(
         self,
     ) -> None:
         shared_file = KernelInode(size=4096)
@@ -1134,54 +1140,38 @@ class PublicationAndNotifyTests(unittest.TestCase):
         local_file = KernelInode(size=4096, pfs_class="local")
         local_dir = KernelInode(pfs_class="local", is_dir=True)
 
-        before_withdrawal = shared_file.cache_generation
-        self.assertEqual(
-            strict_notify("INVAL_INODE", shared_file, off=0, length=0),
-            "dispatched",
-        )
-        self.assertEqual(
-            shared_file.cache_generation,
-            before_withdrawal + 1,
-            "the exact (0, 0) revocation shape must withdraw retained data",
-        )
-        for off, length in ((0, 4096), (-1, 1), (4096, 0)):
-            with self.assertRaises(ProtocolError):
-                strict_notify(
-                    "INVAL_INODE", shared_file, off=off, length=length
-                )
-        with self.assertRaises(ProtocolError):
-            strict_notify("INVAL_ENTRY", shared_dir, flags=1)  # EXPIRE_ONLY
-        with self.assertRaises(ProtocolError):
-            strict_notify("DELETE", shared_dir, padding=1)
-
         for code, target in (
-            ("INVAL_INODE", local_file),
-            ("INVAL_ENTRY", local_dir),
-            ("DELETE", local_dir),
             ("PFS_SIZE", local_file),
+            ("PFS_ATTR", local_file),
+            ("PFS_ENTRY", local_dir),
         ):
             with self.assertRaises(ProtocolError):
                 strict_notify(code, target)
         for code in STRICT_NOTIFY_CODES:
-            self.assertEqual(strict_notify(code, None), "absent")
+            kwargs = {"child": 0} if code == "PFS_ENTRY" else {}
+            self.assertEqual(strict_notify(code, None, **kwargs), "absent")
 
         for code in STRICT_NOTIFY_CODES:
             with self.assertRaises(ProtocolError):
                 strict_notify(code, None, nodeid=0)
+        for code in STRICT_NOTIFY_CODES:
+            with self.assertRaises(ProtocolError):
+                strict_notify(code, None, sequence=0)
         with self.assertRaises(ProtocolError):
-            strict_notify("DELETE", None, child=0)
+            strict_notify("PFS_ENTRY", None, child=1, flags=0)
         with self.assertRaises(ProtocolError):
-            strict_notify("PFS_SIZE", None, sequence=0)
-        self.assertEqual(
-            strict_notify("INVAL_INODE", None, nodeid=987654), "absent"
-        )
+            strict_notify("PFS_ENTRY", None, child=0, flags=1)
+        self.assertEqual(strict_notify("PFS_ATTR", None, nodeid=987654), "absent")
 
         for malformed in (b"", b".", b"..", b"a/b", b"a\0b"):
-            for code in ("INVAL_ENTRY", "DELETE"):
-                with self.assertRaises(ProtocolError):
-                    strict_notify(code, shared_dir, name=malformed)
+            with self.assertRaises(ProtocolError):
+                strict_notify(
+                    "PFS_ENTRY", shared_dir, name=malformed, child=0, flags=0
+                )
         self.assertEqual(
-            strict_notify("INVAL_ENTRY", shared_dir, name=b"\xff"),
+            strict_notify(
+                "PFS_ENTRY", shared_dir, name=b"\xff", child=0, flags=0
+            ),
             "dispatched",
         )
 
@@ -1191,12 +1181,13 @@ class PublicationAndNotifyTests(unittest.TestCase):
             local_graft.nlink,
             local_graft.pfs_class,
         )
-        for code in ("INVAL_ENTRY", "DELETE"):
+        for child, flags in ((0, 0), (local_graft.nodeid, 1)):
             with self.assertRaises(ProtocolError):
                 strict_notify(
-                    code,
+                    "PFS_ENTRY",
                     shared_dir,
-                    child=local_graft.nodeid,
+                    child=child,
+                    flags=flags,
                     resident_child=local_graft,
                 )
             self.assertEqual(
@@ -1212,9 +1203,10 @@ class PublicationAndNotifyTests(unittest.TestCase):
         before = (shared_dir.cache_generation, shared_child.nlink)
         with self.assertRaises(ProtocolError):
             strict_notify(
-                "DELETE",
+                "PFS_ENTRY",
                 shared_dir,
                 child=89,
+                flags=1,
                 resident_child=shared_child,
             )
         self.assertEqual(
@@ -1222,9 +1214,10 @@ class PublicationAndNotifyTests(unittest.TestCase):
         )
 
         strict_notify(
-            "DELETE",
+            "PFS_ENTRY",
             shared_dir,
             child=shared_child.nodeid,
+            flags=1,
             resident_child=shared_child,
         )
         self.assertEqual(shared_dir.cache_generation, before[0] + 1)
@@ -1233,6 +1226,27 @@ class PublicationAndNotifyTests(unittest.TestCase):
             before[1],
             "peer repair expires the binding but does not synthesize a local unlink",
         )
+
+    def test_create_snapshots_every_gate_before_installing_parent(self) -> None:
+        versions = {"parent": 0, "child": 0}
+        snapshot_sequence = 7
+        records = {"parent": 7, "child": 7}
+
+        # Step 3 is a transaction-wide snapshot. Installing the parent before
+        # comparing the dentry gate would make this create reject its own name
+        # because the dentry cursor equals the parent record's version.
+        prior = dict(versions)
+        attr_install = {
+            identity: version > prior[identity]
+            for identity, version in records.items()
+        }
+        entry_install = snapshot_sequence > prior["parent"]
+        for identity, install in attr_install.items():
+            if install:
+                versions[identity] = records[identity]
+
+        self.assertEqual(versions, records)
+        self.assertTrue(entry_install)
 
     def test_revocation_withdrawal_drops_pages_without_taking_a_sequence(
         self,

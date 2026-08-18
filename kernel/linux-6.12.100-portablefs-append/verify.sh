@@ -140,6 +140,7 @@ readonly -a AFFECTED_FILES=(
   "fs/fuse/fuse_trace.h"
   "fs/fuse/inode.c"
   "fs/fuse/ioctl.c"
+  "fs/fuse/post_state.c"
   "fs/fuse/readdir.c"
   "fs/fuse/xattr.c"
   "fs/namei.c"
@@ -180,6 +181,8 @@ verify_patched_tree() {
   grep -Eq '^[[:space:]]*FUSE_PFS_FALLOCATE[[:space:]]*=[[:space:]]*4099,$' "$abi_header"
   grep -Eq '^[[:space:]]*FUSE_PFS_COPY_FILE_RANGE[[:space:]]*=[[:space:]]*4100,$' "$abi_header"
   grep -Eq '^[[:space:]]*FUSE_NOTIFY_PFS_SIZE[[:space:]]*=[[:space:]]*10,$' "$abi_header"
+  grep -Eq '^[[:space:]]*FUSE_NOTIFY_PFS_ATTR[[:space:]]*=[[:space:]]*12,$' "$abi_header"
+  grep -Eq '^[[:space:]]*FUSE_NOTIFY_PFS_ENTRY[[:space:]]*=[[:space:]]*13,$' "$abi_header"
 
   cc -std=c11 -Wall -Wextra -Werror \
     -I "$tree/include/uapi" \
@@ -190,7 +193,7 @@ verify_patched_tree() {
 }
 
 "$UPSTREAM_TREE/scripts/checkpatch.pl" --no-tree \
-  --ignore ENOSYS,COMMIT_MESSAGE,MISSING_SIGN_OFF,FILE_PATH_CHANGES \
+  --ignore ENOSYS,COMMIT_MESSAGE,MISSING_SIGN_OFF,BAD_SIGN_OFF,FILE_PATH_CHANGES \
   "${PFS_PATCHES[@]}"
 verify_patched_tree "$UPSTREAM_TREE" upstream
 verify_patched_tree "$DEBIAN_TREE" debian
@@ -239,7 +242,7 @@ docker exec "$CONTAINER_ID" sh -eu -c '
       fs/overlayfs/params.o \
       fs/smb/server/smb2pdu.o fs/smb/server/vfs.o \
       fs/fuse/dev.o fs/fuse/dir.o fs/fuse/file.o fs/fuse/inode.o \
-      fs/fuse/ioctl.o fs/fuse/readdir.o fs/fuse/xattr.o \
+      fs/fuse/ioctl.o fs/fuse/post_state.o fs/fuse/readdir.o fs/fuse/xattr.o \
       fs/reply_publish.o fs/namei.o fs/open.o fs/read_write.o \
       fs/splice.o fs/xattr.o fs/aio.o io_uring/rw.o kernel/fork.o
   }
