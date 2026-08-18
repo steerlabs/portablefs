@@ -942,6 +942,99 @@ func TestReadDirPlusPhysicalWriteFailureRollsBackWholePage(t *testing.T) {
 	}
 }
 
+func TestWithdrawalBudgetTerminalizesNeverReportingReadDirPlusWriter(t *testing.T) {
+	f := newStrictFixture(t)
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	child, errno := f.raw.intern(context.Background(), testItem(100, authoritypb.Attr_DIRECTORY, 100))
+	if errno != 0 {
+		t.Fatalf("intern child: %v", errno)
+	}
+	item := testItem(100, authoritypb.Attr_DIRECTORY, 200)
+	item.ObjectVersion, item.SnapshotSequence = 9, 9
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{{
+		Verifier: testToken(600), Eof: true,
+		Entries: []*authoritypb.Dirent{{
+			Name: []byte("child"), Attr: item.Attr, Item: item,
+			NextCookie: encodeCookie(1), ObjectVersion: 9, SnapshotSequence: 9,
+		}},
+	}}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	unique := f.unique.Add(2)
+	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{Unique: unique}, Fh: handleID,
+	}, fuse.NewDirEntryList(make([]byte, 4096), 0)); !status.Ok() {
+		t.Fatalf("READDIRPLUS construction = %v", status)
+	}
+	if _, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 44, nil, nil, 0); !status.Ok() {
+		t.Fatalf("finalize READDIRPLUS reply = %v", status)
+	}
+	markTestReply(t, f.raw, unique)
+
+	fake := &fakeWithdrawal{installed: true}
+	ops := fake.ops()
+	done := make(chan struct{})
+	var closeDone sync.Once
+	realAbort := ops.abort
+	ops.abort = func(k kernelMount) error {
+		err := realAbort(k)
+		closeDone.Do(func() { close(done) })
+		return err
+	}
+	f.mount.kernelMount = kernelMount{id: "271", device: "0:57", point: t.TempDir()}
+	f.mount.kernelConnectionStarted = true
+	f.mount.kernelConnectionDone = done
+	f.mount.withdrawal = ops
+	f.mount.repairBudget = 15 * time.Millisecond
+
+	started := time.Now()
+	out := f.mount.withdrawKernelState()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("never-reporting writer blocked withdrawal for %v", elapsed)
+	}
+	if !out.withdrawn {
+		t.Fatalf("forced withdrawal did not prove kernel absence: %+v", out)
+	}
+	f.raw.mu.Lock()
+	terminal := f.raw.replyTerminal
+	pendingNames, pendingAttrs := f.raw.pendingNames, f.raw.pendingAttrs
+	reservations := len(f.raw.cacheReservations)
+	lookups := child.lookups
+	bound := f.raw.namedRecords[nameKey{parent: parent.key.inode, name: "child"}]
+	f.raw.mu.Unlock()
+	if !terminal || pendingNames != 0 || pendingAttrs != 0 || reservations != 0 {
+		t.Fatalf("terminal ownership state terminal=%t pending=%d/%d reservations=%d",
+			terminal, pendingNames, pendingAttrs, reservations)
+	}
+	if lookups != 1 || bound != nil {
+		t.Fatalf("connection-absent READDIRPLUS settlement lookups=%d bound=%t, want 1/false",
+			lookups, bound != nil)
+	}
+	if got := fmt.Sprintf("%x", popReclaim(t, f.mount)); got != fmt.Sprintf("%x", testToken(200)) {
+		t.Fatalf("connection-absent reclaim = %s, want %x", got, testToken(200))
+	}
+	if pending := f.mount.reclaim.pending(); pending != 0 {
+		t.Fatalf("connection-absent settlement queued %d duplicate reclaims", pending)
+	}
+
+	// A callback issued before the forced abort may arrive late, but exact
+	// connection absence has already made successful settlement impossible.
+	f.raw.ReplyWritten(unique, fuse.OK)
+	f.raw.mu.Lock()
+	lookups = child.lookups
+	reservations = len(f.raw.cacheReservations)
+	f.raw.mu.Unlock()
+	if lookups != 1 || reservations != 0 {
+		t.Fatalf("late callback resurrected lookup/reservation ownership: %d/%d", lookups, reservations)
+	}
+}
+
 func TestReadDirPlusParserFailureForceForgetsEveryUnlinkedRecord(t *testing.T) {
 	f := newStrictFixture(t)
 	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))

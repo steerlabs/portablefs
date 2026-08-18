@@ -966,8 +966,21 @@ func (m *Mount) closeLocked() error {
 	}
 	m.closed = true
 	m.cancel()
+	var replyOwnershipErr error
 	if m.raw != nil {
-		m.raw.terminalizeReplyCacheOwnership()
+		if !m.raw.terminalizeReplyCacheOwnership(time.Now().Add(m.repairBudget)) {
+			deadline := time.Now().Add(m.repairBudget)
+			_, absenceErr := m.kernelMount.absent()
+			if absenceErr != nil || !m.kernelConnectionAbsentBy(deadline) {
+				replyOwnershipErr = errors.Join(
+					fmt.Errorf("fusev3: terminal reply writer did not report inside the repair budget"),
+					absenceErr,
+				)
+			} else {
+				m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+				m.raw.discardCachedOwnershipAfterConnectionGone()
+			}
+		}
 	}
 	m.wg.Wait()
 	// Any capability still queued for reclaim is released by Detach: ending the
@@ -978,7 +991,7 @@ func (m *Mount) closeLocked() error {
 	// boundary. A terminal revocation already finished this idempotently from
 	// scheduleAbort before it reached Close.
 	m.rpc.FinishLocalSessionEnforcement()
-	m.closeErr = errors.Join(m.fatalError(), detachErr, m.grafts.Close(), m.rpc.Close())
+	m.closeErr = errors.Join(m.fatalError(), replyOwnershipErr, detachErr, m.grafts.Close(), m.rpc.Close())
 	return m.closeErr
 }
 

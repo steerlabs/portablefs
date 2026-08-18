@@ -1378,7 +1378,7 @@ func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
 
 	terminalDone := make(chan struct{})
 	go func() {
-		f.raw.terminalizeReplyCacheOwnership()
+		f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
 		close(terminalDone)
 	}()
 	deadline := time.Now().Add(time.Second)
@@ -1408,7 +1408,7 @@ func TestTeardownTerminalizesCapacityAndRevocabilityOnce(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("teardown did not finish after the original writer callback")
 	}
-	f.raw.terminalizeReplyCacheOwnership()
+	f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
 	f.raw.mu.Lock()
 	pendingNames, pendingNegatives, pendingAttrs := f.raw.pendingNames, f.raw.pendingNegatives, f.raw.pendingAttrs
 	reservations := len(f.raw.cacheReservations)
@@ -1445,7 +1445,7 @@ func TestTeardownJoinsMidWriteReplyBeforeWithdrawalAndRejectsLateAck(t *testing.
 
 	terminalDone := make(chan struct{})
 	go func() {
-		f.raw.terminalizeReplyCacheOwnership()
+		f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second))
 		close(terminalDone)
 	}()
 	deadline := time.Now().Add(time.Second)
