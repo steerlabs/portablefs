@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import os
+import pathlib
 import random
+import re
 import threading
 import unittest
 
@@ -300,21 +303,80 @@ def lookup_requires_marker(
     return result == "shared"
 
 
-def strict_negative_lookup_shape(
-    *, attr_flags: int, stamp_size: int, marked: bool,
+DEFAULT_LOOKUP_SHAPE_RULES = (
+    ("local-negative", False, ATTR_PFS_LOCAL, False, False),
+    ("shared-negative", False, 0, True, True),
+    ("local-positive", True, ATTR_PFS_LOCAL, False, False),
+    ("shared-positive", True, ATTR_PFS_SHARED, True, True),
+)
+
+
+def lookup_shape_rules() -> tuple[tuple[str, bool, int, bool, bool], ...]:
+    tree = os.environ.get("PFS_PATCHED_KERNEL_TREE")
+    if not tree:
+        return DEFAULT_LOOKUP_SHAPE_RULES
+    source = (pathlib.Path(tree) / "fs/fuse/dir.c").read_text()
+    start = source.index("fuse_pfs_lookup_shape_rules[]")
+    end = source.index("static bool fuse_pfs_local_negative_base", start)
+    block = source[start:end]
+    pattern = re.compile(
+        r"\.shape = FUSE_PFS_LOOKUP_([A-Z_]+),\s*"
+        r"\.positive = (true|false),\s*"
+        r"\.class_bits = (FUSE_ATTR_PFS_LOCAL|FUSE_ATTR_PFS_SHARED|0),\s*"
+        r"\.stamped = (true|false),\s*"
+        r"\.marked = (true|false),"
+    )
+    classes = {
+        "0": 0,
+        "FUSE_ATTR_PFS_LOCAL": ATTR_PFS_LOCAL,
+        "FUSE_ATTR_PFS_SHARED": ATTR_PFS_SHARED,
+    }
+    rules = tuple(
+        (
+            shape.lower().replace("_", "-"),
+            positive == "true",
+            classes[class_bits],
+            stamped == "true",
+            marked == "true",
+        )
+        for shape, positive, class_bits, stamped, marked
+        in pattern.findall(block)
+    )
+    if not rules:
+        raise ProtocolError("kernel LOOKUP classifier has no shape rules")
+    return rules
+
+
+def strict_lookup_shape(
+    *, nodeid: int, attr_flags: int, stamp_size: int, marked: bool,
     generation: int = 0, entry_lifetime: int = 0,
     attr_lifetime: int = 0, other_attr_nonzero: bool = False,
 ) -> str:
-    if attr_flags == ATTR_PFS_LOCAL:
-        if (stamp_size or marked or generation or entry_lifetime or
-                attr_lifetime or other_attr_nonzero):
-            raise ProtocolError("malformed LOCAL negative")
-        return "local"
-    if attr_flags == 0:
-        if stamp_size != 32 or not marked:
-            raise ProtocolError("malformed SHARED negative")
-        return "shared"
-    raise ProtocolError("negative carried an invalid class")
+    positive = nodeid != 0
+    class_bits = attr_flags & (ATTR_PFS_SHARED | ATTR_PFS_LOCAL)
+    stamped = stamp_size == 32
+    for shape, rule_positive, rule_class, rule_stamped, rule_marked in lookup_shape_rules():
+        if ((positive, class_bits, stamped, marked) !=
+                (rule_positive, rule_class, rule_stamped, rule_marked)):
+            continue
+        if not positive:
+            if generation or attr_lifetime or other_attr_nonzero:
+                raise ProtocolError("malformed negative base record")
+            if shape == "local-negative" and entry_lifetime:
+                raise ProtocolError("malformed LOCAL negative lifetime")
+        return "shared" if shape.startswith("shared-") else "local"
+    raise ProtocolError("LOOKUP did not match one complete kernel shape")
+
+
+def strict_negative_lookup_shape(**kwargs: object) -> str:
+    return strict_lookup_shape(nodeid=0, **kwargs)
+
+
+def strict_revalidate_lookup(existing_class: str, **kwargs: object) -> str:
+    result_class = strict_lookup_shape(**kwargs)
+    if result_class != existing_class:
+        raise ProtocolError("revalidation changed inode class")
+    return result_class
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1078,6 +1140,7 @@ class AbiAndAdmissionTests(unittest.TestCase):
         )
 
     def test_local_and_shared_negatives_have_disjoint_exact_shapes(self) -> None:
+        self.assertEqual(lookup_shape_rules(), DEFAULT_LOOKUP_SHAPE_RULES)
         self.assertEqual(
             strict_negative_lookup_shape(
                 attr_flags=ATTR_PFS_LOCAL, stamp_size=0, marked=False
@@ -1110,6 +1173,34 @@ class AbiAndAdmissionTests(unittest.TestCase):
             with self.subTest(malformed=malformed):
                 with self.assertRaises(ProtocolError):
                     strict_negative_lookup_shape(**malformed)
+
+        self.assertEqual(
+            strict_lookup_shape(
+                nodeid=2, attr_flags=ATTR_PFS_LOCAL,
+                stamp_size=0, marked=False,
+            ),
+            "local",
+        )
+        self.assertEqual(
+            strict_lookup_shape(
+                nodeid=3, attr_flags=ATTR_PFS_SHARED,
+                stamp_size=32, marked=True,
+            ),
+            "shared",
+        )
+        for existing, result in (("local", "shared"), ("shared", "local")):
+            with self.subTest(existing=existing, result=result):
+                with self.assertRaises(ProtocolError):
+                    strict_revalidate_lookup(
+                        existing,
+                        nodeid=4,
+                        attr_flags=(
+                            ATTR_PFS_SHARED if result == "shared"
+                            else ATTR_PFS_LOCAL
+                        ),
+                        stamp_size=32 if result == "shared" else 0,
+                        marked=result == "shared",
+                    )
 
 
 class TransactionTests(unittest.TestCase):

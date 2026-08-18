@@ -197,7 +197,8 @@ verify_patched_tree() {
   "${PFS_PATCHES[@]}"
 verify_patched_tree "$UPSTREAM_TREE" upstream
 verify_patched_tree "$DEBIAN_TREE" debian
-python3 "$SCRIPT_DIR/tests/test_state_machine.py"
+PFS_PATCHED_KERNEL_TREE="$UPSTREAM_TREE" \
+  python3 "$SCRIPT_DIR/tests/test_state_machine.py"
 python3 "$SCRIPT_DIR/tests/test_xfs_fallocate.py"
 python3 "$SCRIPT_DIR/tests/test_strict_stacking.py"
 
