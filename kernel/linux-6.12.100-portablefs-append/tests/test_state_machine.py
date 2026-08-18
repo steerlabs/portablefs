@@ -694,6 +694,64 @@ class KernelInode:
             self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
         )
 
+    def notify_change_kill_suid(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        mode = self.mode
+        return bool(mode & 0o4000)
+
+    def setfl(
+        self,
+        refresh: callable,
+        *,
+        append_change: bool = False,
+        add_noatime: bool = False,
+        caller_uid: int = 0,
+    ) -> bool:
+        self.begin_attr_exact(refresh)
+        if append_change and self.inode_flags & STATX_ATTR_APPEND:
+            return False
+        if add_noatime and caller_uid != self.uid:
+            return False
+        return True
+
+    def do_ftruncate(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(self.inode_flags & STATX_ATTR_APPEND)
+
+    def vfs_fallocate(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(
+            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
+        )
+
+    def may_link_target(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(
+            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
+        )
+
+    def shared_mmap(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(self.inode_flags & STATX_ATTR_APPEND)
+
+    def copy_file_target(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(self.inode_flags & STATX_ATTR_IMMUTABLE)
+
+    def may_open(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(self.inode_flags & STATX_ATTR_APPEND)
+
+    def xattr_write(self, refresh: callable) -> bool:
+        self.begin_attr_exact(refresh)
+        return not bool(
+            self.inode_flags & (STATX_ATTR_IMMUTABLE | STATX_ATTR_APPEND)
+        )
+
+    def fileattr_set(self, refresh: callable, caller_uid: int) -> bool:
+        self.begin_attr_exact(refresh)
+        return caller_uid == self.uid
+
     def may_delete(
         self, victim: "KernelInode", refresh_parent: callable,
         refresh_victim: callable, before_joint_cut: callable | None = None,
@@ -753,6 +811,7 @@ class KernelInode:
     def install_stamped_attr(
         self, object_version: int, snapshot_sequence: int,
         inode_flags: int, birth_time_ns: int, mode: int | None = None,
+        uid: int | None = None,
     ) -> str:
         if (object_version <= 0 or object_version > snapshot_sequence or
                 snapshot_sequence > S64_MAX):
@@ -768,6 +827,8 @@ class KernelInode:
         self.birth_time_ns = birth_time_ns
         if mode is not None:
             self.mode = mode
+        if uid is not None:
+            self.uid = uid
         return "applied"
 
     def permission(self, mask: int) -> bool:
@@ -1527,6 +1588,28 @@ class PublicationAndNotifyTests(unittest.TestCase):
             set_sticky_before_joint_cut, caller_uid=1000,
         ))
 
+        parent.repair_attr(5)
+        with self.assertRaises(BlockingIOError):
+            parent.may_delete(
+                victim,
+                lambda: parent.install_stamped_attr(5, 5, 0, 5, 0o700),
+                refresh_victim,
+                lambda: parent.repair_attr(6),
+                caller_uid=1000,
+            )
+
+        def refresh_parent_at_six() -> None:
+            self.assertEqual(
+                parent.install_stamped_attr(6, 6, 0, 6, 0o700), "applied"
+            )
+
+        self.assertTrue(parent.may_delete(
+            victim,
+            refresh_parent_at_six,
+            refresh_victim,
+            caller_uid=1000,
+        ))
+
     def test_synchronous_statx_fill_uses_installed_exact_record(self) -> None:
         inode = KernelInode()
         inode.repair_attr(7)
@@ -1543,6 +1626,95 @@ class PublicationAndNotifyTests(unittest.TestCase):
                 "attributes_mask": PFS_STATX_ATTRIBUTES,
             },
         )
+
+    def test_generic_vfs_consumers_refresh_before_their_first_snapshot(
+        self,
+    ) -> None:
+        consumers = (
+            (
+                "notify_change",
+                lambda inode, refresh: not inode.notify_change_kill_suid(refresh),
+            ),
+            (
+                "setfl-append",
+                lambda inode, refresh: inode.setfl(
+                    refresh, append_change=True
+                ),
+            ),
+            ("ftruncate", lambda inode, refresh: inode.do_ftruncate(refresh)),
+            ("fallocate", lambda inode, refresh: inode.vfs_fallocate(refresh)),
+            (
+                "hardlink-target",
+                lambda inode, refresh: inode.may_link_target(refresh),
+            ),
+            ("shared-mmap", lambda inode, refresh: inode.shared_mmap(refresh)),
+            ("copy-target", lambda inode, refresh: inode.copy_file_target(refresh)),
+            ("open", lambda inode, refresh: inode.may_open(refresh)),
+            ("xattr", lambda inode, refresh: inode.xattr_write(refresh)),
+        )
+        for name, decide in consumers:
+            with self.subTest(name=name):
+                inode = KernelInode()
+                self.assertEqual(
+                    inode.install_stamped_attr(
+                        1, 1,
+                        STATX_ATTR_APPEND | STATX_ATTR_IMMUTABLE,
+                        1, 0o4644,
+                    ),
+                    "applied",
+                )
+                inode.repair_attr(2)
+                refreshes = 0
+
+                def refresh() -> None:
+                    nonlocal refreshes
+                    refreshes += 1
+                    self.assertEqual(
+                        inode.install_stamped_attr(2, 2, 0, 2, 0o644),
+                        "applied",
+                    )
+
+                self.assertTrue(decide(inode, refresh))
+                self.assertEqual(refreshes, 1)
+
+        for name, decide in consumers:
+            with self.subTest(name=f"new-enforcement-{name}"):
+                inode = KernelInode()
+                self.assertEqual(
+                    inode.install_stamped_attr(1, 1, 0, 1, 0o644),
+                    "applied",
+                )
+                inode.repair_attr(2)
+
+                def refresh_enforced() -> None:
+                    self.assertEqual(
+                        inode.install_stamped_attr(
+                            2, 2,
+                            STATX_ATTR_APPEND | STATX_ATTR_IMMUTABLE,
+                            2, 0o4644,
+                        ),
+                        "applied",
+                    )
+
+                self.assertFalse(decide(inode, refresh_enforced))
+
+        inode = KernelInode(uid=1000)
+        self.assertEqual(
+            inode.install_stamped_attr(1, 1, 0, 1, uid=1000), "applied"
+        )
+        inode.repair_attr(2)
+
+        def refresh_owner() -> None:
+            self.assertEqual(
+                inode.install_stamped_attr(2, 2, 0, 2, uid=2000), "applied"
+            )
+
+        self.assertFalse(
+            inode.setfl(
+                refresh_owner, add_noatime=True, caller_uid=1000,
+            )
+        )
+        self.assertFalse(inode.fileattr_set(lambda: None, caller_uid=1000))
 
     def test_strict_reverse_notify_whitelist_blocks_cache_injection(self) -> None:
         inode = KernelInode(size=11)
