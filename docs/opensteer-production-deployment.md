@@ -29,13 +29,15 @@ one serialized deployment:
 4. Stream one gzip-compressed release archive through each private IAP tunnel,
    then activate it on the Manager and cell control processes. This does not
    restart a live Authority.
-5. Drain OpenSteer E2B sandboxes, request the Manager's restart transaction,
-   drain once more, and prove the old Authority service, listener, and cgroup
-   are absent.
-6. Submit the SHA-256 of that drain evidence to the Manager's strict-fence API.
-   The Manager advances the Authority generation; the cell starts the new
+5. Preflight every configured volume, drain OpenSteer E2B sandboxes once, and
+   request each required Manager restart transaction. A co-located Manager and
+   cell are activated as two explicit roles; sharing a VM does not skip either
+   unit set.
+6. Drain once more, prove each old Authority service, listener, and cgroup is
+   absent, and submit that evidence SHA-256 to every fencing volume. The
+   Manager advances each Authority generation; the cell starts every new
    Authority from the same immutable release.
-7. Verify the new generation and executable release, atomically move E2B's
+7. Verify every new generation and executable release, atomically move E2B's
    `default` tag to the tested candidate, and drain once more. That final pass
    removes a sandbox that might have been created with the old default tag
    during the maintenance window.
@@ -115,21 +117,29 @@ service account needs administrative login because the existing host activator
 must replace root-owned releases and systemd units. A single compressed tar
 stream avoids recursive SFTP's per-file behavior on the private tunnel.
 
-Bootstrap the Manager's narrow product and operator mTLS identities once:
+Prepare an absolute root-private credential directory containing
+`client-ca.pem`, `client-ca.key`, `manager-ca.pem`, `product.cert`, and
+`product.key`. The client CA must already be in the Manager's configured trust
+bundle and the product certificate must name the configured product issuer.
+Then install the Manager's narrow product identity and a freshly issued
+operator identity:
 
 ```bash
 deploy/opensteer/bootstrap-manager-deployer.sh \
   smooth-comfort-488701-t3 us-east4-a \
-  pfs-v3-manager-01 pfs-v3-authority-01 \
-  manager.pfs-v3.internal \
-  57483c00-a90d-42f1-bc80-945c0b477227
+  pfs-v3-manager-01 manager.pfs-v3.internal \
+  opensteer-production \
+  57483c00-a90d-42f1-bc80-945c0b477227 \
+  /absolute/path/to/deployment-credentials
 ```
 
-The bootstrap generates a one-purpose CA locally, installs only its CA
-certificate plus the product/operator client identities on the root-owned
-Manager host, verifies both roles against the live API, and discards the CA
-private key with its temporary directory. Re-run it before the one-year client
-certificates expire. No Manager credential or private key is stored in GitHub.
+The bootstrap validates the CA, certificate, private-key, issuer, and server
+trust relationships before upload. It issues a 30-day operator certificate,
+atomically activates a versioned root-owned credential bundle, and verifies
+both roles against the live API without changing Manager trust or restarting
+the Manager. Re-run it before deployment to renew the operator identity. Keep
+the client CA key in the environment's protected secret store; no Manager
+credential or private key is stored in GitHub.
 
 Protect `opensteer-production` against deletion and force pushes, allow only
 merge commits through pull requests, and require every `ci` job before merge.

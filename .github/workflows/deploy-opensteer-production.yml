@@ -29,7 +29,7 @@ jobs:
       OPENSTEER_GCP_PROJECT: smooth-comfort-488701-t3
       OPENSTEER_GCP_ZONE: us-east4-a
       OPENSTEER_MANAGER_INSTANCE: pfs-v3-manager-01
-      OPENSTEER_VOLUME_ID: 57483c00-a90d-42f1-bc80-945c0b477227
+      OPENSTEER_VOLUME_IDS: 57483c00-a90d-42f1-bc80-945c0b477227
       OPENSTEER_RUNNER_IMAGE: us-west1-docker.pkg.dev/opensteer-admin/staging/runner@sha256:1e310bb87984279ed3971a6b543f8e55acca09738a3a8b8905a882386dd454dc
       WIF_PROVIDER: projects/920572344872/locations/global/workloadIdentityPools/github/providers/github-oidc
       WIF_SERVICE_ACCOUNT: portablefs-deployer@opensteer-admin.iam.gserviceaccount.com
