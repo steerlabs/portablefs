@@ -42,6 +42,19 @@ func (s *rangeMutationTestStore) CopyFileRange(xfsstore.Capability, xfsstore.Cap
 	return s.copyCount, s.copyPost, s.copyErr
 }
 
+func (s *rangeMutationTestStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(handle[0]), Size: 64, Mode: 0o600, Nlink: 1}, nil
+}
+
+func rangePostStateAttr(state *authoritypb.PostState, role uint32) *authoritypb.Attr {
+	for _, object := range state.GetObjects() {
+		if object.GetRoles() == role {
+			return object.GetAttr()
+		}
+	}
+	return nil
+}
+
 func newRangeMutationHarness(t *testing.T) (*VolumeHandler, volumeserver.SessionCredential, *rangeMutationTestStore, xfsstore.Capability, xfsstore.Capability) {
 	t.Helper()
 	runtime, err := volumeserver.New("range-mutation", volumeserver.Config{
@@ -136,7 +149,7 @@ func TestFallocateAppliedResultAndReplayCarryExactPostState(t *testing.T) {
 	request := fallocateMutationRequest(1, handle)
 	response := h.handleFallocate(t.Context(), request, credential, request.GetFallocate())
 	reply := response.GetFallocate()
-	if response.GetErrno() != 0 || response.GetUncertain() || response.GetPostAttr().GetSize() != 12 ||
+	if response.GetErrno() != 0 || response.GetUncertain() || postStateTargetAttr(response.GetPostState()).GetSize() != 12 ||
 		reply.GetFlags() != rangeReplyApplied || reply.GetResultSize() != 0 || reply.GetPostSize() != 12 || reply.GetVisibilitySequence() != 1 {
 		t.Fatalf("fallocate applied = %+v", response)
 	}
@@ -154,7 +167,7 @@ func TestFallocateRLimitRejectionIsDefiniteAndHasNoPostState(t *testing.T) {
 	request := fallocateMutationRequest(1, handle)
 	response := h.handleFallocate(t.Context(), request, credential, request.GetFallocate())
 	reply := response.GetFallocate()
-	if response.GetErrno() != 0 || response.GetUncertain() || response.GetPostAttr() != nil ||
+	if response.GetErrno() != 0 || response.GetUncertain() || response.GetPostState() != nil ||
 		reply.GetFlags() != rangeReplyRejectedRLimit || reply.GetError() != -int32(syscall.EFBIG) ||
 		reply.GetResultSize() != 0 || reply.GetPostSize() != 6 || reply.GetVisibilitySequence() != 0 {
 		t.Fatalf("fallocate RLIMIT rejection = %+v", response)
@@ -168,7 +181,7 @@ func TestFallocatePostDispatchErrorPublishesAndReplaysExactState(t *testing.T) {
 	request := fallocateMutationRequest(1, handle)
 	response := h.handleFallocate(t.Context(), request, credential, request.GetFallocate())
 	reply := response.GetFallocate()
-	if response.GetErrno() != 0 || response.GetUncertain() || response.GetPostAttr().GetSize() != 12 ||
+	if response.GetErrno() != 0 || response.GetUncertain() || postStateTargetAttr(response.GetPostState()).GetSize() != 12 ||
 		reply.GetFlags() != rangeReplyApplied|rangeReplyPostApply || reply.GetResultSize() != 0 ||
 		reply.GetPostSize() != 12 || reply.GetVisibilitySequence() != 1 || reply.GetError() != -int32(syscall.ENOSPC) {
 		t.Fatalf("post-dispatch fallocate error = %+v", response)
@@ -201,7 +214,9 @@ func TestCopyFileRangeAppliedReplayAndEOFNoopShapes(t *testing.T) {
 	request := copyMutationRequest(1, input, output)
 	response := h.handleCopyFileRange(t.Context(), request, credential, request.GetCopyFileRange())
 	reply := response.GetCopyFileRange()
-	if response.GetErrno() != 0 || response.GetPostAttr().GetSize() != 20 || reply.GetFlags() != rangeReplyApplied ||
+	if response.GetErrno() != 0 || len(response.GetPostState().GetObjects()) != 2 ||
+		rangePostStateAttr(response.GetPostState(), postStateRoleSource).GetInode() != 0x21 ||
+		rangePostStateAttr(response.GetPostState(), postStateRoleDestination).GetSize() != 20 || reply.GetFlags() != rangeReplyApplied ||
 		reply.GetResultSize() != 5 || reply.GetPostSize() != 20 || reply.GetVisibilitySequence() != 1 {
 		t.Fatalf("copy applied = %+v", response)
 	}
@@ -214,7 +229,7 @@ func TestCopyFileRangeAppliedReplayAndEOFNoopShapes(t *testing.T) {
 	noop := copyMutationRequest(1, input2, output2)
 	response = h2.handleCopyFileRange(t.Context(), noop, credential2, noop.GetCopyFileRange())
 	reply = response.GetCopyFileRange()
-	if response.GetErrno() != 0 || response.GetPostAttr() != nil || reply.GetFlags() != rangeReplyNoop ||
+	if response.GetErrno() != 0 || response.GetPostState() != nil || reply.GetFlags() != rangeReplyNoop ||
 		reply.GetResultSize() != 0 || reply.GetPostSize() != 0 || reply.GetVisibilitySequence() != 0 || reply.GetError() != 0 || store2.copyCalls.Load() != 1 {
 		t.Fatalf("copy EOF no-op = %+v calls=%d", response, store2.copyCalls.Load())
 	}
@@ -227,7 +242,8 @@ func TestCopyFileRangePublishesZeroByteMetadataOnlyPostApply(t *testing.T) {
 	request := copyMutationRequest(1, input, output)
 	response := h.handleCopyFileRange(t.Context(), request, credential, request.GetCopyFileRange())
 	reply := response.GetCopyFileRange()
-	if response.GetErrno() != 0 || response.GetUncertain() || response.GetPostAttr().GetSize() != 19 ||
+	if response.GetErrno() != 0 || response.GetUncertain() || len(response.GetPostState().GetObjects()) != 2 ||
+		rangePostStateAttr(response.GetPostState(), postStateRoleDestination).GetSize() != 19 ||
 		reply.GetFlags() != rangeReplyApplied|rangeReplyPostApply || reply.GetResultSize() != 0 ||
 		reply.GetPostSize() != 19 || reply.GetVisibilitySequence() != 1 || reply.GetError() != -int32(syscall.ENOSPC) {
 		t.Fatalf("zero-byte metadata-only CFR = %+v", response)

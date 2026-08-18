@@ -2192,6 +2192,14 @@ func (c *VisibilityCoordinator) finishBarrier(sequence uint64, audience visibili
 // then means that read raced the mutation: the caller must discard it and try
 // again.
 func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, resolutions ...VisibilityResolution) (bool, error) {
+	waited, _, err := c.StabilizeSequence(ctx, id, resolutions...)
+	return waited, err
+}
+
+// StabilizeSequence returns the authority cursor from the same critical
+// section that registers every supplied cache coordinate. A cacheable read
+// samples after this return and stamps the result with that cursor.
+func (c *VisibilityCoordinator) StabilizeSequence(ctx context.Context, id SessionID, resolutions ...VisibilityResolution) (bool, uint64, error) {
 	waited := false
 	for {
 		c.mu.Lock()
@@ -2200,7 +2208,7 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			// Not a strict participant: this mount holds no cache the barrier
 			// has to reason about.
 			c.mu.Unlock()
-			return waited, nil
+			return waited, 0, nil
 		}
 		var blocked *visibilityMutationState
 		for _, state := range c.mutations {
@@ -2241,8 +2249,9 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 					p.index.add(key)
 				}
 			}
+			sequence := c.next
 			c.mu.Unlock()
-			return waited, nil
+			return waited, sequence, nil
 		}
 		if blocked.audience[id] != p && p.pending != nil && p.pending.event.Cursor.Phase == VisibilityPrepare {
 			// Concurrent barriers cannot share a participant lane. This participant
@@ -2251,7 +2260,7 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 			// any resolution to the monotone index: the caller must discard the read.
 			sequence := p.pending.event.Cursor.Sequence
 			c.mu.Unlock()
-			return true, &VisibilityRetryError{Sequence: sequence}
+			return true, 0, &VisibilityRetryError{Sequence: sequence}
 		}
 		done := blocked.done
 		c.mu.Unlock()
@@ -2259,7 +2268,7 @@ func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, res
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return waited, ctx.Err()
+			return waited, 0, ctx.Err()
 		}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"reflect"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,6 +78,17 @@ func newCoherentNormalizationMutation(t *testing.T, name string) (*VolumeHandler
 	request := normalizationSetXattrRequest(root)
 	stampMutation(t, request, 0, 1)
 	return h, credential, request
+}
+
+func normalizationAppliedResponse(h *VolumeHandler) *authoritypb.Response {
+	response := h.success(0)
+	response.PostState = h.mutationPostState(1, postStateSnapshot{
+		identity: [16]byte{1},
+		attr:     xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: 1, Mode: 0o755, Nlink: 2, DeviceMinor: 1},
+		roles:    postStateRoleTarget,
+		changed:  true,
+	})
+	return response
 }
 
 func TestNormalizeVisibilityTargetsCanonicalizesEveryCoordinateOrdering(t *testing.T) {
@@ -339,7 +351,7 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	coordinate := normalizationCoordinate(9, 909)
+	coordinate := normalizationCoordinate(1, 1)
 	visibility.RecordResolvedInode(observer.ID, coordinate.identity)
 	prepareData := inodeTarget(volumeserver.VisibilityData, coordinate, 100)
 	completeData := inodeTarget(volumeserver.VisibilityData, coordinate, 200)
@@ -362,10 +374,9 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 				return []volumeserver.VisibilityTarget{attributes, prepareData, attributes}, nil
 			},
 			func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-				return h.success(0), []volumeserver.VisibilityTarget{attributes, completeData, completeData}
+				return normalizationAppliedResponse(h), []volumeserver.VisibilityTarget{attributes, completeData, completeData}
 			})
 	}()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	initial := testInitialVisibilityCursor(t, visibility, observer.ID)
@@ -400,7 +411,7 @@ func TestMutateVisibleNormalizesPrepareAndCompletionCentrally(t *testing.T) {
 }
 
 func TestMutateVisibleFailsClosedAroundNormalizationDefects(t *testing.T) {
-	coordinate := normalizationCoordinate(10, 1010)
+	coordinate := normalizationCoordinate(1, 1)
 	data := inodeTarget(volumeserver.VisibilityData, coordinate, 100)
 	attributes := inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)
 
@@ -447,7 +458,7 @@ func TestMutateVisibleFailsClosedAroundNormalizationDefects(t *testing.T) {
 				func() ([]volumeserver.VisibilityTarget, error) { return test.prepare, nil },
 				func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 					applyCalls.Add(1)
-					return h.success(0), test.complete
+					return normalizationAppliedResponse(h), test.complete
 				})
 			if response.GetErrno() != errnos.EIO || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 				t.Fatalf("normalization defect response = %+v, want coherence EIO", response)
@@ -462,14 +473,16 @@ func TestMutateVisibleFailsClosedAroundNormalizationDefects(t *testing.T) {
 	}
 }
 
-func TestMutateVisiblePreservesNilCompletionAsNoVisibleChange(t *testing.T) {
-	coordinate := normalizationCoordinate(16, 1616)
+func TestMutateVisiblePreservesNilCompletionForDefiniteNoChange(t *testing.T) {
+	coordinate := normalizationCoordinate(1, 1)
 	data := inodeTarget(volumeserver.VisibilityData, coordinate, 100)
 	h, credential, request := newCoherentNormalizationMutation(t, "authority-target-normalization-nil")
 	response := h.mutateVisible(context.Background(), request, credential,
 		func() ([]volumeserver.VisibilityTarget, error) { return []volumeserver.VisibilityTarget{data}, nil },
-		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) { return h.success(0), nil })
-	if response.GetErrno() != 0 || response.GetUncertain() {
-		t.Fatalf("nil completion = %+v, want successful no-visible-change result", response)
+		func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			return h.errorResponse(0, syscall.EEXIST, false), nil
+		})
+	if response.GetErrno() != int32(syscall.EEXIST) || response.GetUncertain() {
+		t.Fatalf("nil completion = %+v, want definite no-change EEXIST", response)
 	}
 }

@@ -150,7 +150,8 @@ message Response {
   bytes epoch = 2;
   int32 errno = 3; // Linux errno; zero is success
   bool uncertain = 4; // operation may have reached XFS; never auto-retry
-  Attr post_attr = 5;
+  reserved 5;
+  reserved "post_attr";
   // mutation is present exactly when the authority recorded this request in a
   // replay slot. It is the authoritative slot state; a client must copy it
   // rather than infer its own sequence, so the two counters cannot diverge.
@@ -171,6 +172,7 @@ message Response {
   // peer phase whose local repair must finish before the Linux frontend may
   // resubmit. This cross-lane identity prevents transport-speed retry loops.
   uint64 visibility_retry_sequence = 43;
+  PostState post_state = 45;
   reserved 26;
   reserved "write";
 
@@ -310,6 +312,8 @@ message Item {
   // coordination metadata, never authorization; every operation still uses
   // token. All capabilities for hard-link aliases carry the same 16 bytes.
   bytes stable_identity = 3;
+  uint64 object_version = 4;
+  uint64 snapshot_sequence = 5;
 }
 
 message Attr {
@@ -331,6 +335,22 @@ message Attr {
   int64 mtime_ns = 10;
   int64 ctime_ns = 11;
   int64 birth_time_ns = 12;
+  uint32 rdev = 13;
+  uint32 blksize = 14;
+  uint32 flags = 15;
+}
+
+message PostState {
+  uint64 visibility_sequence = 1;
+  repeated ObjectPostState objects = 2;
+  uint64 snapshot_sequence = 3;
+}
+
+message ObjectPostState {
+  bytes stable_identity = 1;
+  uint64 object_version = 2;
+  Attr attr = 3;
+  uint32 roles = 4;
 }
 
 // Every protocol-5 client owns exactly two authenticated transports for one
@@ -657,9 +677,16 @@ message AckVisibilityRequest {
 }
 
 message LookupRequest { bytes parent = 1; bytes name = 2; }
-message LookupReply { Item item = 1; }
+message LookupReply {
+  Item item = 1;
+  uint64 negative_snapshot_sequence = 2;
+}
 message GetAttrRequest { bytes item = 1; bytes handle = 2; }
-message GetAttrReply { Attr attr = 1; }
+message GetAttrReply {
+  Attr attr = 1;
+  uint64 object_version = 2;
+  uint64 snapshot_sequence = 3;
+}
 
 message SetAttrRequest {
   bytes item = 1;
@@ -898,6 +925,8 @@ message Dirent {
   Attr attr = 2;
   bytes next_cookie = 3;
   Item item = 4; // present for every entry exactly when want_items is true
+  uint64 object_version = 5;
+  uint64 snapshot_sequence = 6;
 }
 message ReadDirReply { repeated Dirent entries = 1; bytes verifier = 2; bool eof = 3; }
 message ReclaimRequest { bytes item = 1; }

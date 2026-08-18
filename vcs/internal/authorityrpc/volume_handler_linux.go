@@ -74,6 +74,7 @@ type volumeStore interface {
 	Chown(xfsstore.Capability, int, int) error
 	SetTimes(xfsstore.Capability, *int64, *int64, bool, bool) error
 	TruncateObject(xfsstore.Capability, int64) error
+	SetAttr(xfsstore.Capability, xfsstore.Capability, xfsstore.SetAttrSpec) (xfsstore.Attr, error)
 	GetXattr(xfsstore.Capability, string) ([]byte, error)
 	SetXattr(xfsstore.Capability, string, []byte, xfsstore.XattrMode) error
 	RemoveXattr(xfsstore.Capability, string) error
@@ -104,6 +105,18 @@ type tmpfileStore interface {
 	Tmpfile(xfsstore.Capability, fs.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error)
 }
 
+type mutationLockStore interface {
+	LockMutation([][16]byte) func()
+}
+
+func lockMutationStore(store volumeStore, identities ...[16]byte) (func(), error) {
+	locker, ok := store.(mutationLockStore)
+	if !ok {
+		return nil, errInternal
+	}
+	return locker.LockMutation(identities), nil
+}
+
 type VolumeHandler struct {
 	Store       volumeStore
 	Runtime     *volumeserver.Authority
@@ -120,6 +133,8 @@ type VolumeHandler struct {
 	MaxOpensPerSession uint32
 	MaxItems           uint32
 	MaxOpens           uint32
+	postStateMu        sync.Mutex
+	objectVersions     map[[16]byte]uint64
 	// MaxRetainedReplyBytes bounds the real quantity the replay cache consumes:
 	// the total encoded bytes retained across every live session's replay
 	// slots. Slot counts are not a proxy for it; one directory listing is five
@@ -579,7 +594,12 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			// capability inside it can enter this session, so it is the only place
 			// the mark has to be applied for the set to be closed at every depth.
 			protected := h.protectedChild(cred.ID, parent, body.Lookup.GetName())
-			item, attr, err := h.lookupForSession(ctx, cred.ID, parent, body.Lookup.GetName())
+			item, attr, snapshot, err := h.lookupForSession(ctx, cred.ID, parent, body.Lookup.GetName())
+			if errors.Is(err, syscall.ENOENT) {
+				resp := h.success(0)
+				resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: snapshot}}
+				return resp
+			}
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
@@ -593,22 +613,26 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return h.errorResponse(0, err, false)
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, identity)}}
+			itemReply := itemProto(item, attr, identity)
+			itemReply.SnapshotSequence = snapshot
+			itemReply.ObjectVersion = h.sampledObjectVersion(identity, snapshot)
+			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
 			return resp
 		})
 	case *authoritypb.Request_GetAttr:
-		attr, err := h.getattr(ctx, cred.ID, body.GetAttr)
+		attr, identity, snapshot, err := h.getattr(ctx, cred.ID, body.GetAttr)
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		resp := h.success(req.GetRequestId())
-		resp.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: attrProto(attr)}}
+		resp.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: attrProto(attr), ObjectVersion: h.sampledObjectVersion(identity, snapshot), SnapshotSequence: snapshot}}
 		return resp
 	case *authoritypb.Request_SetAttr:
 		set := body.SetAttr
 		var item, handle xfsstore.Capability
 		var coordinate visibilityCoordinate
 		var mode fs.FileMode
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			if set.Mode == nil && set.Uid == nil && set.Gid == nil && set.Size == nil && set.AtimeNs == nil && set.MtimeNs == nil && !set.GetAtimeNow() && !set.GetMtimeNow() {
 				return nil, syscall.EINVAL
@@ -670,109 +694,91 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if err != nil {
 				return nil, err
 			}
+			releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+			if err != nil {
+				return nil, err
+			}
 			targets := []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 			if set.Size != nil {
 				targets = append(targets, inodeTarget(volumeserver.VisibilityData, coordinate, set.GetSize()))
 			}
 			return targets, nil
 		}
-		completeTargets := func() []volumeserver.VisibilityTarget {
-			var attr xfsstore.Attr
-			var err error
-			if handle != (xfsstore.Capability{}) {
-				attr, err = h.Store.GetattrOpen(handle)
-			} else {
-				attr, err = h.Store.Getattr(item)
-			}
-			if err != nil {
-				return []volumeserver.VisibilityTarget{}
-			}
+		completeTargets := func(attr xfsstore.Attr) []volumeserver.VisibilityTarget {
 			targets := []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 			if set.Size != nil {
 				targets = append(targets, inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size))
 			}
 			return targets
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-			changed := false
-			var err error
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			var modePtr *fs.FileMode
 			if set.Mode != nil {
-				err = h.Store.Chmod(item, mode)
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
+				modePtr = &mode
 			}
-			if set.Uid != nil || set.Gid != nil {
-				uid, gid := -1, -1
-				if set.Uid != nil {
-					uid = int(set.GetUid())
-				}
-				if set.Gid != nil {
-					gid = int(set.GetGid())
-				}
-				err = h.Store.Chown(item, uid, gid)
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
-			}
-			if set.Size != nil {
-				if handle != (xfsstore.Capability{}) {
-					err = h.Store.Truncate(handle, set.GetSize())
-				} else {
-					err = h.Store.TruncateObject(item, set.GetSize())
-				}
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
-			}
-			if set.AtimeNs != nil || set.MtimeNs != nil || set.GetAtimeNow() || set.GetMtimeNow() {
-				err = h.Store.SetTimes(item, set.AtimeNs, set.MtimeNs, set.GetAtimeNow(), set.GetMtimeNow())
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
-			}
-			var attr xfsstore.Attr
-			if handle != (xfsstore.Capability{}) {
-				attr, err = h.Store.GetattrOpen(handle)
-			} else {
-				attr, err = h.Store.Getattr(item)
-			}
+			attr, err := h.Store.SetAttr(item, handle, xfsstore.SetAttrSpec{
+				Mode: modePtr, UID: set.Uid, GID: set.Gid, Size: set.Size,
+				ATimeNS: set.AtimeNs, MTimeNS: set.MtimeNs,
+				ATimeNow: set.GetAtimeNow(), MTimeNow: set.GetMtimeNow(),
+			})
 			if err != nil {
-				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+				uncertain := uncertainFailure(err)
+				resp := h.errorResponse(0, err, uncertain)
+				if uncertain {
+					resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+					return resp, completeTargets(attr)
+				}
+				return resp, nil
 			}
 			resp := h.success(0)
-			resp.PostAttr = attrProto(attr)
-			return resp, completeTargets()
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+			return resp, completeTargets(attr)
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Tmpfile:
-		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
+		var parent xfsstore.Capability
+		var parentCoordinate visibilityCoordinate
+		var releaseMutation func()
+		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+			var err error
+			parent, err = h.item(cred.ID, body.Tmpfile.GetParent())
+			if err != nil {
+				return nil, err
+			}
+			parentCoordinate, err = h.coordinateItem(parent)
+			if err != nil {
+				return nil, err
+			}
+			releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
+			if err != nil {
+				return nil, err
+			}
+			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
+		}
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			store, ok := h.Store.(tmpfileStore)
 			flags := body.Tmpfile.GetFlags()
 			mode, valid := modeFromProtocol(body.Tmpfile.GetMode())
 			if !ok || !valid || flags == nil || !flags.GetWrite() || flags.GetTruncate() {
-				return h.errorResponse(0, syscall.EINVAL, false)
-			}
-			parent, err := h.item(cred.ID, body.Tmpfile.GetParent())
-			if err != nil {
-				return h.errorResponse(0, err, false)
+				return h.errorResponse(0, syscall.EINVAL, false), nil
 			}
 			reservation, err := h.reserveCapabilities(cred.ID, 1, 1)
 			if err != nil {
-				return h.errorResponse(0, err, false)
+				return h.errorResponse(0, err, false), nil
 			}
 			defer reservation.release()
 			item, attr, err := store.Tmpfile(parent, mode, body.Tmpfile.GetExclusive())
 			if err != nil {
-				return h.errorResponse(0, err, uncertainFailure(err))
+				resp := h.errorResponse(0, err, uncertainFailure(err))
+				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)})
 			}
 			handle, err := h.Store.OpenFile(item, openFlags(flags))
 			if err != nil {
 				h.forgetItem(item)
-				return h.errorResponse(0, err, true)
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
 			if err := reservation.commit(
 				[]trackedCapability{{value: item}},
@@ -780,7 +786,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			); err != nil {
 				h.closeOpen(handle)
 				h.forgetItem(item)
-				return h.errorResponse(0, err, true)
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
 			cleanupUndeliverable := func() {
 				h.untrackOpen(cred.ID, handle)
@@ -791,19 +797,35 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			identity, err := h.Store.Identity(item)
 			if err != nil {
 				cleanupUndeliverable()
-				return h.errorResponse(0, err, true)
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
 			resp := h.success(0)
+			itemReply := itemProto(item, attr, identity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
 			resp.Body = &authoritypb.Response_Tmpfile{Tmpfile: &authoritypb.TmpfileReply{
-				Item: itemProto(item, attr, identity), Handle: append([]byte(nil), handle[:]...),
+				Item: itemReply, Handle: append([]byte(nil), handle[:]...),
 			}}
-			return resp
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				cleanupUndeliverable()
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: identity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
+			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Create:
 		var parent xfsstore.Capability
 		var parentCoordinate, existingCoordinate visibilityCoordinate
 		var existingSize int64
 		var existed bool
+		var releaseMutation func()
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Create.GetName()); err != nil {
 				return nil, err
@@ -818,6 +840,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return nil, err
 			}
 			existingCoordinate, existingSize, existed = resolvedName.coordinate, resolvedName.size, resolvedName.found
+			releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
+			if err != nil {
+				return nil, err
+			}
 			if !existed {
 				return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
 			}
@@ -844,7 +870,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
 		}
-		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			mode, valid := modeFromProtocol(body.Create.GetMode())
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
@@ -896,27 +922,47 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return h.errorResponse(0, identityErr, true), targets
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemProto(item, attr, itemIdentity), Handle: handle[:]}}
+			itemReply := itemProto(item, attr, itemIdentity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemReply, Handle: handle[:]}}
 			if existed {
 				if body.Create.GetFlags() == nil || !body.Create.GetFlags().GetTruncate() {
 					return resp, nil
 				}
+				resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleTarget, changed: true})
 				return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
 			}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				cleanupUndeliverable()
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
 			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Mkdir:
 		var parent xfsstore.Capability
 		var parentCoordinate visibilityCoordinate
+		var releaseMutation func()
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Mkdir.GetName()); err != nil {
 				return nil, err
 			}
 			resolvedParent, err := resolutions.item(body.Mkdir.GetParent())
 			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, err
 		}
-		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			mode, valid := modeFromProtocol(body.Mkdir.GetMode())
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
@@ -943,12 +989,29 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return h.errorResponse(0, identityErr, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, itemIdentity)}}
+			itemReply := itemProto(item, attr, itemIdentity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
 			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Unlink:
 		var parent xfsstore.Capability
 		var parentCoordinate, removedCoordinate visibilityCoordinate
+		var releaseMutation func()
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Unlink.GetName()); err != nil {
 				return nil, err
@@ -963,21 +1026,44 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				err = syscall.ENOENT
 			}
 			removedCoordinate = resolvedName.coordinate
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity, removedCoordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}, err
 		}
-		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			removed, _, lookupErr := h.Store.Lookup(parent, string(body.Unlink.GetName()))
+			if lookupErr != nil {
+				return h.errorResponse(0, lookupErr, false), nil
+			}
+			defer h.forgetItem(removed)
 			if err := h.Store.Unlink(parent, string(body.Unlink.GetName()), body.Unlink.GetDirectory()); err != nil {
 				resp := h.errorResponse(0, err, false)
 				targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
 			targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
-			return h.success(0), targets
+			removedAttr, removedErr := h.Store.Getattr(removed)
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if err := errors.Join(removedErr, parentErr); err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: removedCoordinate.identity, attr: removedAttr, roles: postStateRoleRemoved, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
+			return resp, targets
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Rename:
 		var oldParent, newParent xfsstore.Capability
 		var oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate visibilityCoordinate
 		var replaced bool
+		var releaseMutation func()
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Rename.GetOldName()); err != nil {
 				return nil, err
@@ -1005,16 +1091,36 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				replacement, err = resolutions.namespace(newParent, body.Rename.GetNewName())
 				replacedCoordinate, replaced = replacement.coordinate, replacement.found
 			}
+			if err == nil {
+				identities := [][16]byte{oldParentCoordinate.identity, newParentCoordinate.identity, movedCoordinate.identity}
+				if replaced {
+					identities = append(identities, replacedCoordinate.identity)
+				}
+				releaseMutation, err = lockMutationStore(h.Store, identities...)
+			}
 			targets := renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, visibilityCoordinate{}, false, false)
 			return targets, err
 		}
-		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var flags xfsstore.RenameFlags
 			if body.Rename.GetNoReplace() {
 				flags |= xfsstore.RenameNoReplace
 			}
 			if body.Rename.GetExchange() {
 				flags |= xfsstore.RenameExchange
+			}
+			moved, _, lookupErr := h.Store.Lookup(oldParent, string(body.Rename.GetOldName()))
+			if lookupErr != nil {
+				return h.errorResponse(0, lookupErr, false), nil
+			}
+			defer h.forgetItem(moved)
+			var overwritten xfsstore.Capability
+			if replaced && (body.Rename.GetExchange() || replacedCoordinate.identity != movedCoordinate.identity) {
+				overwritten, _, lookupErr = h.Store.Lookup(newParent, string(body.Rename.GetNewName()))
+				if lookupErr != nil {
+					return h.errorResponse(0, lookupErr, false), nil
+				}
+				defer h.forgetItem(overwritten)
 			}
 			if err := h.Store.Rename(oldParent, string(body.Rename.GetOldName()), newParent, string(body.Rename.GetNewName()), flags); err != nil {
 				resp := h.errorResponse(0, err, false)
@@ -1044,11 +1150,41 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 			resp := h.success(0)
 			resp.Body = &authoritypb.Response_Rename{Rename: rename}
+			movedAttr, movedErr := h.Store.Getattr(moved)
+			oldParentAttr, oldParentErr := h.Store.Getattr(oldParent)
+			newParentAttr, newParentErr := h.Store.Getattr(newParent)
+			if err := errors.Join(movedErr, oldParentErr, newParentErr); err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			noChange := !body.Rename.GetExchange() && replaced && replacedCoordinate.identity == movedCoordinate.identity
+			snapshots := []postStateSnapshot{
+				{identity: movedCoordinate.identity, attr: movedAttr, roles: postStateRoleSource | postStateRoleDestination, changed: !noChange},
+				{identity: oldParentCoordinate.identity, attr: oldParentAttr, roles: postStateRoleOldParent, changed: !noChange},
+				{identity: newParentCoordinate.identity, attr: newParentAttr, roles: postStateRoleNewParent, changed: !noChange},
+			}
+			if replaced && (body.Rename.GetExchange() || replacedCoordinate.identity != movedCoordinate.identity) {
+				replacedAttr, replacedErr := h.Store.Getattr(overwritten)
+				if replacedErr != nil {
+					return h.errorResponse(0, replacedErr, true), []volumeserver.VisibilityTarget{}
+				}
+				roles := postStateRoleOverwritten
+				if body.Rename.GetExchange() {
+					roles = postStateRoleSource | postStateRoleDestination | postStateRoleExchanged
+					snapshots[0].roles |= postStateRoleExchanged
+				}
+				snapshots = append(snapshots, postStateSnapshot{identity: replacedCoordinate.identity, attr: replacedAttr, roles: roles, changed: !noChange})
+			}
+			resp.PostState = h.mutationPostState(sequence, snapshots...)
 			return resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, oldPostCoordinate, oldPostBound, true)
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Link:
 		var source, parent xfsstore.Capability
 		var sourceCoordinate, parentCoordinate visibilityCoordinate
+		var releaseMutation func()
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Link.GetNewName()); err != nil {
 				return nil, err
@@ -1060,9 +1196,12 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			resolvedParent, err := resolutions.item(body.Link.GetNewParent())
 			source, sourceCoordinate = resolvedSource.cap, resolvedSource.coordinate
 			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, sourceCoordinate.identity, parentCoordinate.identity)
+			}
 			return linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, false), err
 		}
-		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			attr, err := h.Store.Link(source, parent, string(body.Link.GetNewName()))
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
@@ -1070,22 +1209,40 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: itemProto(source, attr, sourceCoordinate.identity)}}
+			itemReply := itemProto(source, attr, sourceCoordinate.identity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: itemReply}}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: sourceCoordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
 			targets := linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, true)
 			return resp, targets
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Symlink:
 		var parent xfsstore.Capability
 		var parentCoordinate visibilityCoordinate
+		var releaseMutation func()
 		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Symlink.GetName()); err != nil {
 				return nil, err
 			}
 			resolvedParent, err := resolutions.item(body.Symlink.GetParent())
 			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, err
 		}
-		return h.mutateVisibleResolved(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			reservation, err := h.reserveCapabilities(cred.ID, 1, 0)
 			if err != nil {
 				return h.errorResponse(0, err, false), nil
@@ -1108,9 +1265,25 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return h.errorResponse(0, identityErr, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, itemIdentity)}}
+			itemReply := itemProto(item, attr, itemIdentity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
 			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Readlink:
 		item, err := h.item(cred.ID, body.Readlink.GetItem())
 		if err != nil {
@@ -1171,15 +1344,19 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		}
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			var err error
 			item, err = h.item(cred.ID, body.Open.GetItem())
 			if err == nil {
 				coordinate, err = h.coordinateItem(item)
 			}
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			resp := openApply(item)
 			if !visibilityChanged(resp) {
 				return resp, nil
@@ -1189,8 +1366,15 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				cleanupOpenedHandle()
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
+				identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true,
+			})
 			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Close:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
 			handle, err := h.open(cred.ID, body.Close.GetHandle())
@@ -1289,6 +1473,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			var current [16]byte
 			var eof bool
 			var directory xfsstore.Capability
+			var pageSnapshot uint64
 			result := &authoritypb.ReadDirReply{}
 			// The reply is built to the same byte budget that was reserved for
 			// it, so a directory listing can never be the reply that does not
@@ -1321,12 +1506,13 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
-					waited, err := h.stabilizeDirectoryPage(ctx, cred.ID, handle, directory, entries)
+					waited, snapshot, err := h.stabilizeDirectoryPage(ctx, cred.ID, handle, directory, entries)
 					if err != nil {
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
 					if !waited {
+						pageSnapshot = snapshot
 						break
 					}
 					if attempt+1 >= maxStabilizeAttempts {
@@ -1364,12 +1550,13 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					}
 					dirent := &authoritypb.Dirent{Name: []byte(entry.Name), Attr: attrProto(attr), NextCookie: nextCookie}
 					var candidate xfsstore.Capability
-					if body.ReadDir.GetWantItems() && attr.Kind != xfsstore.KindOpaque {
+					if attr.Kind != xfsstore.KindOpaque {
 						var itemAttr xfsstore.Attr
-						candidate, itemAttr, err = h.lookupForSession(ctx, cred.ID, directory, []byte(entry.Name))
+						candidate, itemAttr, err = h.Store.Lookup(directory, entry.Name)
 						switch {
 						case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
-							continue
+							forgetIssued()
+							return h.errorResponse(0, syscall.EAGAIN, false)
 						case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
 							dirent.Attr = attrProto(xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino})
 						case err != nil:
@@ -1391,7 +1578,16 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 								forgetIssued()
 								return h.errorResponse(0, identityErr, false)
 							}
-							dirent.Item = itemProto(candidate, itemAttr, identity)
+							dirent.ObjectVersion = h.sampledObjectVersion(identity, pageSnapshot)
+							dirent.SnapshotSequence = pageSnapshot
+							if body.ReadDir.GetWantItems() {
+								dirent.Item = itemProto(candidate, itemAttr, identity)
+								dirent.Item.ObjectVersion = dirent.ObjectVersion
+								dirent.Item.SnapshotSequence = dirent.SnapshotSequence
+							} else {
+								h.forgetItem(candidate)
+								candidate = xfsstore.Capability{}
+							}
 						}
 					}
 					cost := direntCost(dirent)
@@ -1509,21 +1705,35 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	case *authoritypb.Request_RemoveXattr:
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			var err error
 			item, err = h.item(cred.ID, body.RemoveXattr.GetItem())
 			if err == nil {
 				coordinate, err = h.coordinateItem(item)
 			}
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			if err := h.Store.RemoveXattr(item, string(body.RemoveXattr.GetName())); err != nil {
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)})
 			}
-			return h.success(0), []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
+			attr, err := h.Store.Getattr(item)
+			if err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_ListXattr:
 		item, err := h.item(cred.ID, body.ListXattr.GetItem())
 		if err != nil {
@@ -2128,6 +2338,9 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 				return definiteRejection(err)
 			}
 			resp, _ := apply(1)
+			if visibilityChanged(resp) && !validMutationPostStateRoles(req, resp.GetPostState()) {
+				return h.errorResponse(0, errInternal, true)
+			}
 			return resp
 		}
 		declaration := h.Visibility.DeclareSourceGate(expectedGate)
@@ -2186,6 +2399,10 @@ func (h *VolumeHandler) mutateVisibleSequenceResolved(
 		_, err = h.Visibility.ExecuteWithSourceGateSequence(ctx, cred.ID, id, declaration, expectedGate, refreshGate, normalizedPrepare, func(sequence uint64) ([]volumeserver.VisibilityTarget, bool) {
 			var complete []volumeserver.VisibilityTarget
 			resp, complete = apply(sequence)
+			if visibilityChanged(resp) && !validMutationPostStateRoles(req, resp.GetPostState()) {
+				completeNormalizationErr = errors.New("authorityrpc: applied mutation produced an invalid exact post-state object/role set")
+				return []volumeserver.VisibilityTarget{}, true
+			}
 			// nil is the explicit no-visible-change result. A non-nil empty
 			// slice means apply changed XFS but target construction failed;
 			// the coordinator detects and poisons that post-apply defect.
@@ -2467,7 +2684,7 @@ func itemProto(item xfsstore.Capability, attr xfsstore.Attr, identity [16]byte) 
 	return &authoritypb.Item{Token: item[:], Attr: attrProto(attr), StableIdentity: identity[:]}
 }
 func attrProto(attr xfsstore.Attr) *authoritypb.Attr {
-	return &authoritypb.Attr{Kind: attrKindProto(attr.Kind), Inode: attr.Ino, Size: attr.Size, Blocks: attr.Blocks, Mode: modeToProtocol(attr.Mode), Uid: attr.UID, Gid: attr.GID, Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS, CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS}
+	return &authoritypb.Attr{Kind: attrKindProto(attr.Kind), Inode: attr.Ino, Size: attr.Size, Blocks: attr.Blocks, Mode: modeToProtocol(attr.Mode), Uid: attr.UID, Gid: attr.GID, Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS, CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS, Rdev: attr.Rdev, Blksize: attr.BlockSize, Flags: attr.Flags}
 }
 
 // attrKindProto and xattrMode translate between two independently numbered
@@ -2530,25 +2747,37 @@ func modeToProtocol(mode fs.FileMode) uint32 {
 	return result
 }
 
-func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, req *authoritypb.GetAttrRequest) (xfsstore.Attr, error) {
+func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, req *authoritypb.GetAttrRequest) (xfsstore.Attr, [16]byte, uint64, error) {
 	if len(req.GetHandle()) != 0 {
 		handle, err := h.open(id, req.GetHandle())
 		if err != nil {
-			return xfsstore.Attr{}, err
+			return xfsstore.Attr{}, [16]byte{}, 0, err
 		}
-		if err := h.stabilizeOpen(ctx, id, handle); err != nil {
-			return xfsstore.Attr{}, err
+		snapshot, err := h.stabilizeOpenSequence(ctx, id, handle)
+		if err != nil {
+			return xfsstore.Attr{}, [16]byte{}, 0, err
 		}
-		return h.Store.GetattrOpen(handle)
+		identity, err := h.Store.IdentityOpen(handle)
+		if err != nil {
+			return xfsstore.Attr{}, [16]byte{}, 0, err
+		}
+		attr, err := h.Store.GetattrOpen(handle)
+		return attr, identity, snapshot, err
 	}
 	item, err := h.item(id, req.GetItem())
 	if err != nil {
-		return xfsstore.Attr{}, err
+		return xfsstore.Attr{}, [16]byte{}, 0, err
 	}
-	if err := h.stabilizeItem(ctx, id, item); err != nil {
-		return xfsstore.Attr{}, err
+	snapshot, err := h.stabilizeItemSequence(ctx, id, item)
+	if err != nil {
+		return xfsstore.Attr{}, [16]byte{}, 0, err
 	}
-	return h.Store.Getattr(item)
+	identity, err := h.Store.Identity(item)
+	if err != nil {
+		return xfsstore.Attr{}, [16]byte{}, 0, err
+	}
+	attr, err := h.Store.Getattr(item)
+	return attr, identity, snapshot, err
 }
 
 func (h *VolumeHandler) getLock(requestID uint64, cred volumeserver.SessionCredential, request *authoritypb.GetLockRequest) *authoritypb.Response {
@@ -2990,12 +3219,15 @@ func (h *VolumeHandler) takeTerminalReceiptFrame(response *authoritypb.Response)
 
 func terminalReceiptCarriesExactAppliedState(response *authoritypb.Response) bool {
 	if response == nil || response.GetErrno() != 0 || response.GetUncertain() ||
-		response.GetPostAttr() == nil || response.GetPostAttr().GetKind() != authoritypb.Attr_REGULAR ||
-		response.GetPostAttr().GetSize() < 0 {
+		!validPostStateShape(response.GetPostState(), true) {
+		return false
+	}
+	target := postStateTargetAttr(response.GetPostState())
+	if target == nil || target.GetKind() != authoritypb.Attr_REGULAR || target.GetSize() < 0 {
 		return false
 	}
 	validError := func(value int32) bool { return value < 0 && value >= -4095 }
-	postSize := uint64(response.GetPostAttr().GetSize())
+	postSize := uint64(target.GetSize())
 	if reply := response.GetWriteTransaction(); reply != nil {
 		return reply.GetFlags() == writeTransactionReplyCommitted|writeTransactionReplyPostApply &&
 			validError(reply.GetError()) && reply.GetVisibilitySequence() > 0 && reply.GetPostSize() == postSize

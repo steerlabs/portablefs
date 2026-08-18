@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"math"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -269,6 +270,35 @@ func inodeMutationStripe(identity [16]byte) uint64 {
 
 func (v *Volume) inodeMutationLock(identity [16]byte) *sync.RWMutex {
 	return &v.inodeMutation[inodeMutationStripe(identity)]
+}
+
+// LockMutation takes the writer stripes for a complete touched-identity set in
+// increasing stripe order. The returned release function is idempotent so an
+// authority handler can retain it through replay-record persistence and still
+// use one deferred cleanup path on every rejection.
+func (v *Volume) LockMutation(identities [][16]byte) func() {
+	stripes := make([]uint64, 0, len(identities))
+	seen := make(map[uint64]struct{}, len(identities))
+	for _, identity := range identities {
+		stripe := inodeMutationStripe(identity)
+		if _, exists := seen[stripe]; exists {
+			continue
+		}
+		seen[stripe] = struct{}{}
+		stripes = append(stripes, stripe)
+	}
+	slices.Sort(stripes)
+	for _, stripe := range stripes {
+		v.inodeMutation[stripe].Lock()
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for i := len(stripes) - 1; i >= 0; i-- {
+				v.inodeMutation[stripes[i]].Unlock()
+			}
+		})
+	}
 }
 
 // holdObject resolves a capability and takes a reference to its descriptor.
@@ -787,7 +817,7 @@ func exactXFSHandleIdentity(handleType int32, raw []byte) ([16]byte, bool) {
 func statFD(fd int) (Attr, error) {
 	var st unix.Statx_t
 	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW,
-		unix.STATX_BASIC_STATS|unix.STATX_BTIME, &st); err != nil {
+		unix.STATX_ALL, &st); err != nil {
 		return Attr{}, err
 	}
 	return attrFromStatx(st)
@@ -796,7 +826,7 @@ func statFD(fd int) (Attr, error) {
 func statChild(dirFD int, name string) (Attr, error) {
 	var st unix.Statx_t
 	if err := unix.Statx(dirFD, name, unix.AT_SYMLINK_NOFOLLOW,
-		unix.STATX_BASIC_STATS|unix.STATX_BTIME, &st); err != nil {
+		unix.STATX_ALL, &st); err != nil {
 		return Attr{}, err
 	}
 	return attrFromStatx(st)
@@ -811,9 +841,16 @@ func attrFromStatx(st unix.Statx_t) (Attr, error) {
 		Kind: kind, Ino: st.Ino, Size: int64(st.Size), Blocks: st.Blocks,
 		Mode: modeFromUnix(uint32(st.Mode)), UID: st.Uid, GID: st.Gid, Nlink: st.Nlink,
 		DeviceMajor: st.Dev_major, DeviceMinor: st.Dev_minor,
+		Rdev: newEncodeDevice(st.Rdev_major, st.Rdev_minor), BlockSize: st.Blksize,
 		ATimeNS: timestampNS(st.Atime), MTimeNS: timestampNS(st.Mtime),
 		CTimeNS: timestampNS(st.Ctime), BirthTimeNS: timestampNS(st.Btime),
 	}, nil
+}
+
+// newEncodeDevice is Linux's new_encode_dev() UAPI representation. It is not
+// the authority volume's st_dev; it encodes statx's rdev pair for the inode.
+func newEncodeDevice(major, minor uint32) uint32 {
+	return (minor & 0xff) | (major << 8) | ((minor &^ 0xff) << 12)
 }
 
 func timestampNS(ts unix.StatxTimestamp) int64 { return ts.Sec*1e9 + int64(ts.Nsec) }
@@ -929,14 +966,8 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	if obj.kind != KindRegular && obj.kind != KindDirectory {
 		return Capability{}, ErrForbiddenType
 	}
-	// O_TRUNC changes EOF as part of open(2). It must share the exact inode
-	// mutation boundary with append's EOF check even when this capability is a
-	// hard-link alias or this session bypasses visibility coordination.
-	if flags.Truncate {
-		mutation := v.inodeMutationLock(obj.coordinate.Stable)
-		mutation.Lock()
-		defer mutation.Unlock()
-	}
+	// O_TRUNC is serialized by the authority's full-operation mutation lease,
+	// which remains held through post-state sampling and replay persistence.
 	// A description this authority created the inode with already carries the
 	// access the creating caller was granted, so it answers this open without
 	// re-deriving anything from the mode. Sync intent is retained logically on
@@ -1277,9 +1308,6 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 	if err := t.volume.Health(); err != nil {
 		return 0, 0, Attr{}, err
 	}
-	mutation := t.volume.inodeMutationLock(t.coordinate.Stable)
-	mutation.Lock()
-	defer mutation.Unlock()
 	before, err := statFD(t.res.fd)
 	if err != nil {
 		return 0, 0, Attr{}, err
@@ -1456,9 +1484,6 @@ func (v *Volume) Fallocate(id Capability, spec FallocateSpec) (Attr, error) {
 	if err := v.Health(); err != nil {
 		return Attr{}, err
 	}
-	mutation := v.inodeMutationLock(f.coordinate.Stable)
-	mutation.Lock()
-	defer mutation.Unlock()
 	before, err := statFD(f.fd())
 	if err != nil {
 		return Attr{}, err
@@ -1522,26 +1547,25 @@ func lockCopyMutation(v *Volume, source, destination [16]byte) func() {
 	sourceLock := &v.inodeMutation[sourceStripe]
 	destinationLock := &v.inodeMutation[destinationStripe]
 	if sourceStripe < destinationStripe {
-		sourceLock.RLock()
+		sourceLock.Lock()
 		destinationLock.Lock()
 		return func() {
 			destinationLock.Unlock()
-			sourceLock.RUnlock()
+			sourceLock.Unlock()
 		}
 	}
 	destinationLock.Lock()
-	sourceLock.RLock()
+	sourceLock.Lock()
 	return func() {
-		sourceLock.RUnlock()
+		sourceLock.Unlock()
 		destinationLock.Unlock()
 	}
 }
 
 // CopyFileRange performs one server-side copy without a userspace splice or
 // payload round trip. The canonical lock order prevents reverse-direction
-// copies from deadlocking, while retaining a source read lock and destination
-// write lock ensures the bytes and exact post-size belong to one authority
-// ordering interval.
+// copies from deadlocking. Writer locks for both source and destination ensure
+// their complete post-state belongs to one authority ordering interval.
 func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec) (uint64, Attr, error) {
 	if spec.Length == 0 || spec.InputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.InputOffset ||
 		spec.OutputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.OutputOffset ||
@@ -1564,8 +1588,6 @@ func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec)
 	if err := v.Health(); err != nil {
 		return 0, Attr{}, err
 	}
-	unlock := lockCopyMutation(v, source.coordinate.Stable, destination.coordinate.Stable)
-	defer unlock()
 	beforeSource, err := statFD(source.fd())
 	if err != nil {
 		return 0, Attr{}, err
