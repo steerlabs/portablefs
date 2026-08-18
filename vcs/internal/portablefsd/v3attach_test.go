@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,6 +29,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
+	"github.com/steerlabs/portablefs/vcs/internal/mountrecord"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
 )
 
@@ -429,7 +431,8 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 		EnrollmentExpiresAtMs: enrollmentExpires.UnixMilli(), AuthorityGeneration: 7,
 		InitialAuthorizationExpiresAtMs: initialDeadline.UnixMilli(),
 	}
-	r := newRegistry(privateTestDir(t))
+	stateDir := privateTestDir(t)
+	r := newRegistry(stateDir)
 	t.Cleanup(r.stopPersister)
 	a := ensureV3TestAttach(t, r, req)
 	t.Cleanup(a.lifeCancel)
@@ -440,20 +443,53 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 		t.Fatal("portablefsd automatic owner never refreshed its enrollment")
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for handler.reauthorizationCalls() == 0 {
+	var installedDeadline int64
+	for {
+		a.mu.RLock()
+		installedDeadline = a.authorizationDeadlineAtMs
+		a.mu.RUnlock()
+		if installedDeadline == renewedDeadline.UnixMilli() {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatal("portablefsd automatic owner never installed the renewed authority grant")
+			t.Fatalf("portablefsd automatic owner did not publish the installed deadline: got %d, want %d", installedDeadline, renewedDeadline.UnixMilli())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	a.mu.RLock()
-	installedDeadline := a.authorizationDeadlineAtMs
-	a.mu.RUnlock()
-	if installedDeadline != renewedDeadline.UnixMilli() {
-		t.Fatalf("automatic authorization deadline = %d, want %d", installedDeadline, renewedDeadline.UnixMilli())
+	if handler.reauthorizationCalls() == 0 {
+		t.Fatal("automatic status advanced without installing the authority grant")
+	}
+	logPath := mountrecord.LogPath(stateDir, req.MountPath)
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		body, readErr := os.ReadFile(logPath)
+		if readErr == nil && bytes.Contains(body, []byte(`"kind":"renewal.succeeded"`)) &&
+			bytes.Contains(body, []byte(`"component":"macos-fskit"`)) &&
+			bytes.Contains(body, []byte(`"mountIdentity":"`+a.ref+`"`)) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("per-mount renewal log = %q, err = %v", body, readErr)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if _, handled, err := a.rotateLiveCredential(context.Background(), "manual", renewedDeadline.UnixMilli(), 2, pki.clientCertPEM, false); !handled || err == nil || !strings.Contains(err.Error(), "automatic reauthorization owner") {
 		t.Fatalf("manual fallback against automatic owner: handled=%t err=%v", handled, err)
+	}
+	if found, _, err := r.delete(context.Background(), a.ref, true); err != nil || !found {
+		t.Fatalf("detach automatic renewal owner: found=%t err=%v", found, err)
+	}
+	select {
+	case <-a.renewalDone:
+	default:
+		t.Fatal("detach returned before the automatic renewal owner stopped")
+	}
+	body, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`"kind":"renewal.stopped"`)) {
+		t.Fatalf("per-mount log has no terminal owner event: %q", body)
 	}
 }
 

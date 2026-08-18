@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"math/big"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -318,7 +320,7 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	if err != nil || renewedAccess.Access != volumeserver.AccessRead {
 		t.Fatalf("hosted reauthorization = %+v, %v", renewedAccess, err)
 	}
-	if _, err := h.manager.RevokeMountEnrollment("revoke-enrollment", authorization.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "product access revoked"}); err != nil {
+	if _, err := h.manager.RevokeVolumeMountEnrollment("opensteer", volume.ID, authorization.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "product access revoked"}); err != nil {
 		t.Fatalf("revoke mount enrollment: %v", err)
 	}
 	sequenceAfterRevocation := h.store.sequence
@@ -467,6 +469,670 @@ func TestPruneMountEnrollmentsRemovesExpiredOwnersAndOrphanedReplayContexts(t *t
 	}
 	if len(state.MountAuthorizationContexts) != 0 {
 		t.Fatal("orphaned replay context was retained")
+	}
+}
+
+func TestScopedRenewalIssuanceRotatesSameEpochEnrollment(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	issue := func(requestID, scope string, epoch uint64) MountAuthorization {
+		t.Helper()
+		clientPublic, clientCSR := testCSR(t)
+		peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peer := sha256.Sum256(peerSPKI)
+		authorization, err := h.manager.IssueMount(requestID, IssueMountRequest{
+			VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+				t, h, volume.Volume, peer, requestID, []string{"write"}, scope, epoch,
+			),
+			ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+		})
+		if err != nil {
+			t.Fatalf("issue %s: %v", requestID, err)
+		}
+		return authorization
+	}
+
+	first := issue("scope-epoch-2", "cloud-private-state:computer-1", 2)
+	second := issue("scope-epoch-2-fresh-csr", "cloud-private-state:computer-1", 2)
+
+	if err := h.store.View(func(state State) error {
+		if got := state.RenewalFences[renewalFenceKey("opensteer", "cloud-private-state:computer-1")]; got != 2 {
+			t.Fatalf("renewal fence = %d, want 2", got)
+		}
+		if enrollment := state.MountEnrollments[first.EnrollmentID]; enrollment.State != MountEnrollmentRevoked ||
+			enrollment.TerminationReason != "renewal-scope-superseded" || enrollment.RenewalScope != "cloud-private-state:computer-1" || enrollment.RenewalEpoch != 2 {
+			t.Fatalf("superseded enrollment = %+v", enrollment)
+		}
+		active := 0
+		for _, enrollment := range state.MountEnrollments {
+			if enrollment.ProductIssuer == "opensteer" && enrollment.RenewalScope == "cloud-private-state:computer-1" && enrollment.State == MountEnrollmentActive {
+				active++
+				if enrollment.ID != second.EnrollmentID {
+					t.Fatalf("active scoped enrollment = %+v, want %s", enrollment, second.EnrollmentID)
+				}
+			}
+		}
+		if active != 1 {
+			t.Fatalf("active scoped enrollments = %d, want 1", active)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExactScopedIssuanceReplayDoesNotRotateCreatedEnrollment(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	request := IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "scoped-replay", []string{"write"}, "cloud-private-state:computer-1", 2,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	}
+	first, err := h.manager.IssueMount("scoped-replay", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence := h.store.sequence
+	replayed, err := h.manager.IssueMount("scoped-replay", request)
+	if err != nil || replayed.EnrollmentID != first.EnrollmentID || h.store.sequence != sequence {
+		t.Fatalf("scoped replay = %+v, sequence=%d want=%d, err=%v", replayed, h.store.sequence, sequence, err)
+	}
+	if err := h.store.View(func(state State) error {
+		enrollment := state.MountEnrollments[first.EnrollmentID]
+		if enrollment.State != MountEnrollmentActive || enrollment.TerminationReason != "" {
+			t.Fatalf("replayed enrollment = %+v", enrollment)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestScopedStandaloneIssuanceRevokesOnlyLowerEpochEnrollments(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	issue := func(requestID string, epoch uint64, createEnrollment bool) MountAuthorization {
+		t.Helper()
+		clientPublic, clientCSR := testCSR(t)
+		peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peer := sha256.Sum256(peerSPKI)
+		authorization, err := h.manager.IssueMount(requestID, IssueMountRequest{
+			VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+				t, h, volume.Volume, peer, requestID, []string{"write"}, "cloud-private-state:standalone", epoch,
+			),
+			ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: createEnrollment,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return authorization
+	}
+	lower := issue("standalone-lower", 1, true)
+	if standalone := issue("standalone-advance", 2, false); standalone.EnrollmentID != "" {
+		t.Fatalf("standalone issuance created enrollment %+v", standalone)
+	}
+	equal := issue("standalone-equal", 2, true)
+	issue("standalone-equal-retry", 2, false)
+	if err := h.store.View(func(state State) error {
+		if enrollment := state.MountEnrollments[lower.EnrollmentID]; enrollment.State != MountEnrollmentRevoked || enrollment.TerminationReason != "renewal-scope-superseded" {
+			t.Fatalf("lower standalone enrollment = %+v", enrollment)
+		}
+		if enrollment := state.MountEnrollments[equal.EnrollmentID]; enrollment.State != MountEnrollmentActive {
+			t.Fatalf("equal standalone enrollment = %+v", enrollment)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRenewalFenceBatchConvergesAtomically(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	issue := func(requestID, scope string, epoch uint64) MountAuthorization {
+		t.Helper()
+		clientPublic, clientCSR := testCSR(t)
+		peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peer := sha256.Sum256(peerSPKI)
+		authorization, err := h.manager.IssueMount(requestID, IssueMountRequest{
+			VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+				t, h, volume.Volume, peer, requestID, []string{"write"}, scope, epoch,
+			),
+			ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return authorization
+	}
+	scopeA := "cloud-private-state:computer-a"
+	scopeB := "cloud-private-state:computer-b"
+	scopeC := "cloud-private-state:computer-c"
+	activeA := issue("batch-scope-a-epoch-2", scopeA, 2)
+	activeB := issue("batch-scope-b-epoch-5", scopeB, 5)
+
+	sequence := h.store.sequence
+	if _, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+		Reason: "invalid-batch", Fences: []RenewalFence{{Scope: scopeC, Epoch: 4}, {Scope: "", Epoch: 1}},
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid batch = %v, want ErrInvalid", err)
+	}
+	if h.store.sequence != sequence {
+		t.Fatalf("invalid batch sequence = %d, want %d", h.store.sequence, sequence)
+	}
+	if err := h.store.View(func(state State) error {
+		if _, exists := state.RenewalFences[renewalFenceKey("opensteer", scopeC)]; exists {
+			t.Fatal("invalid batch created its valid entry")
+		}
+		if enrollment := state.MountEnrollments[activeA.EnrollmentID]; enrollment.State != MountEnrollmentActive {
+			t.Fatalf("invalid batch changed enrollment = %+v", enrollment)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := AdvanceRenewalFencesRequest{
+		Reason: "cloud-computer-stopped",
+		Fences: []RenewalFence{
+			{Scope: scopeA, Epoch: 3},
+			{Scope: scopeB, Epoch: 2},
+			{Scope: scopeC, Epoch: 4},
+			{Scope: scopeC, Epoch: 2},
+			{Scope: scopeA, Epoch: 1},
+		},
+	}
+	result, err := h.manager.AdvanceRenewalFences("opensteer", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []RenewalFence{
+		{Scope: scopeA, Epoch: 3},
+		{Scope: scopeB, Epoch: 5},
+		{Scope: scopeC, Epoch: 4},
+		{Scope: scopeC, Epoch: 4},
+		{Scope: scopeA, Epoch: 3},
+	}
+	if !slices.Equal(result.Fences, want) {
+		t.Fatalf("batch response = %+v, want %+v", result.Fences, want)
+	}
+	if h.store.sequence != sequence+1 {
+		t.Fatalf("batch sequence = %d, want one transaction after %d", h.store.sequence, sequence)
+	}
+	if err := h.store.View(func(state State) error {
+		if enrollment := state.MountEnrollments[activeA.EnrollmentID]; enrollment.State != MountEnrollmentRevoked || enrollment.TerminationReason != request.Reason {
+			t.Fatalf("lower-epoch enrollment = %+v", enrollment)
+		}
+		if enrollment := state.MountEnrollments[activeB.EnrollmentID]; enrollment.State != MountEnrollmentActive {
+			t.Fatalf("exact-epoch enrollment = %+v", enrollment)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	sequence = h.store.sequence
+	lower, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+		Reason: "delayed-retry", Fences: []RenewalFence{{Scope: scopeA, Epoch: 1}, {Scope: scopeB, Epoch: 4}, {Scope: scopeC, Epoch: 3}},
+	})
+	if err != nil || lower.Fences[0].Epoch != 3 || lower.Fences[1].Epoch != 5 || lower.Fences[2].Epoch != 4 || h.store.sequence != sequence {
+		t.Fatalf("lower batch = %+v, sequence=%d want=%d, err=%v", lower, h.store.sequence, sequence, err)
+	}
+}
+
+func TestRenewalFenceBatchEpochBounds(t *testing.T) {
+	h := newManagerHarness(t)
+	for _, test := range []struct {
+		name  string
+		scope string
+		epoch uint64
+		valid bool
+	}{
+		{name: "zero", scope: "scope-zero", epoch: 0},
+		{name: "one", scope: "scope-one", epoch: 1, valid: true},
+		{name: "max", scope: "scope-max", epoch: productauth.MaxRenewalEpoch, valid: true},
+		{name: "max-plus-one", scope: "scope-max-plus-one", epoch: productauth.MaxRenewalEpoch + 1},
+		{name: "uint64-max", scope: "scope-uint64-max", epoch: ^uint64(0)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+				Reason: "epoch-boundary", Fences: []RenewalFence{{Scope: test.scope, Epoch: test.epoch}},
+			})
+			if test.valid {
+				if err != nil || len(response.Fences) != 1 || response.Fences[0].Epoch != test.epoch {
+					t.Fatalf("AdvanceRenewalFences epoch %d = %+v, %v", test.epoch, response, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("AdvanceRenewalFences epoch %d = %v, want ErrInvalid", test.epoch, err)
+			}
+		})
+	}
+}
+
+func TestRenewalFenceBatchScopeSyntax(t *testing.T) {
+	h := newManagerHarness(t)
+	for _, test := range []struct {
+		name  string
+		scope string
+		valid bool
+	}{
+		{name: "less-than", scope: "cloud-private-state:clc_<uuid"},
+		{name: "greater-than", scope: "cloud-private-state:clc_>uuid"},
+		{name: "ampersand", scope: "cloud-private-state:clc_&uuid"},
+		{name: "control", scope: "cloud-private-state:clc_\n"},
+		{name: "unicode", scope: "cloud-private-state:clc_é"},
+		{name: "identifier", scope: "cloud-private-state:clc_123e4567-e89b-12d3-a456-426614174000", valid: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+				Reason: "scope-syntax", Fences: []RenewalFence{{Scope: test.scope, Epoch: 1}},
+			})
+			if test.valid {
+				if err != nil || len(response.Fences) != 1 || response.Fences[0].Scope != test.scope {
+					t.Fatalf("AdvanceRenewalFences scope %q = %+v, %v", test.scope, response, err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("AdvanceRenewalFences scope %q = %v, want ErrInvalid", test.scope, err)
+			}
+		})
+	}
+}
+
+func TestRenewalFenceRejectsStaleIssuance(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	if _, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+		Reason: "cloud-computer-stopped", Fences: []RenewalFence{{Scope: "cloud-private-state:computer-1", Epoch: 3}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	staleToken := signedProductAuthorizationWithRenewal(
+		t, h, volume.Volume, peer, "stale-scope-epoch", []string{"write"}, "cloud-private-state:computer-1", 1,
+	)
+	if _, err := h.manager.IssueMount("stale-scope-epoch", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: staleToken, ClientCSRPEM: clientCSR,
+		Access: []string{"write"}, AutomaticReauthorization: true,
+	}); !errors.Is(err, ErrRenewalScopeFenced) {
+		t.Fatalf("stale issuance = %v, want ErrRenewalScopeFenced", err)
+	}
+
+	*h.now = h.now.Add(time.Minute)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.manager.IssueMount("fenced-after-advance", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "fenced-after-advance", []string{"write"}, "cloud-private-state:computer-1", 2,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	}); !errors.Is(err, ErrRenewalScopeFenced) {
+		t.Fatalf("issuance below advanced fence = %v, want ErrRenewalScopeFenced", err)
+	}
+}
+
+func TestRenewalScopeTerminalizationIsIssuerScopedAndPreservesTerminals(t *testing.T) {
+	state := NewState()
+	state.MountEnrollments = map[string]MountEnrollment{
+		"same-lower":  {ProductIssuer: "product-a", RenewalScope: "scope", RenewalEpoch: 1, State: MountEnrollmentActive},
+		"same-equal":  {ProductIssuer: "product-a", RenewalScope: "scope", RenewalEpoch: 2, State: MountEnrollmentActive},
+		"other-scope": {ProductIssuer: "product-a", RenewalScope: "other", RenewalEpoch: 1, State: MountEnrollmentActive},
+		"other-issuer": {ProductIssuer: "product-b", RenewalScope: "scope", RenewalEpoch: 1,
+			State: MountEnrollmentActive},
+		"terminal": {ProductIssuer: "product-a", RenewalScope: "scope", RenewalEpoch: 1,
+			State: MountEnrollmentClosed, TerminationReason: "first"},
+	}
+	if !revokeRenewalScopeEnrollmentsBeforeEpoch(&state, "product-a", "scope", 2, "superseded", 100) {
+		t.Fatal("terminalization reported no change")
+	}
+	if enrollment := state.MountEnrollments["same-lower"]; enrollment.State != MountEnrollmentRevoked || enrollment.TerminationReason != "superseded" {
+		t.Fatalf("same-issuer lower epoch = %+v", enrollment)
+	}
+	for _, id := range []string{"same-equal", "other-scope", "other-issuer"} {
+		if enrollment := state.MountEnrollments[id]; enrollment.State != MountEnrollmentActive {
+			t.Fatalf("untouched enrollment %s = %+v", id, enrollment)
+		}
+	}
+	if enrollment := state.MountEnrollments["terminal"]; enrollment.State != MountEnrollmentClosed || enrollment.TerminationReason != "first" {
+		t.Fatalf("terminal enrollment = %+v", enrollment)
+	}
+}
+
+func TestStateRejectsTwoActiveEnrollmentsInOneRenewalScope(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	authorization, err := h.manager.IssueMount("duplicate-scope-state", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "duplicate-scope-state", []string{"write"}, "cloud-private-state:duplicate", 1,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var invalid State
+	if err := h.store.View(func(state State) error {
+		var err error
+		invalid, err = cloneState(state)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := invalid.MountEnrollments[authorization.EnrollmentID]
+	duplicate.ID = newUUID()
+	invalid.MountEnrollments[duplicate.ID] = duplicate
+	if err := invalid.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("duplicate active renewal scope validation = %v, want ErrInvalid", err)
+	}
+}
+
+func TestStateRenewalEpochBounds(t *testing.T) {
+	tests := []struct {
+		name  string
+		epoch uint64
+		valid bool
+	}{
+		{name: "zero", epoch: 0},
+		{name: "one", epoch: 1, valid: true},
+		{name: "max", epoch: productauth.MaxRenewalEpoch, valid: true},
+		{name: "max-plus-one", epoch: productauth.MaxRenewalEpoch + 1},
+		{name: "uint64-max", epoch: ^uint64(0)},
+	}
+
+	for _, test := range tests {
+		t.Run("fence/"+test.name, func(t *testing.T) {
+			state := NewState()
+			state.RenewalFences[renewalFenceKey("opensteer", "cloud-private-state:clc_fence")] = test.epoch
+			err := state.Validate()
+			if test.valid && err != nil {
+				t.Fatalf("Validate fence epoch %d: %v", test.epoch, err)
+			}
+			if !test.valid && !errors.Is(err, ErrInvalid) {
+				t.Fatalf("Validate fence epoch %d = %v, want ErrInvalid", test.epoch, err)
+			}
+		})
+	}
+
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	scope := "cloud-private-state:clc_enrollment"
+	authorization, err := h.manager.IssueMount("state-epoch-bounds", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "state-epoch-bounds", []string{"write"}, scope, 1,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var base State
+	if err := h.store.View(func(state State) error {
+		var cloneErr error
+		base, cloneErr = cloneState(state)
+		return cloneErr
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range tests {
+		t.Run("enrollment/"+test.name, func(t *testing.T) {
+			state, err := cloneState(base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enrollment := state.MountEnrollments[authorization.EnrollmentID]
+			enrollment.RenewalEpoch = test.epoch
+			state.MountEnrollments[enrollment.ID] = enrollment
+			fenceEpoch := test.epoch
+			if fenceEpoch == 0 || fenceEpoch > productauth.MaxRenewalEpoch {
+				fenceEpoch = productauth.MaxRenewalEpoch
+			}
+			state.RenewalFences[renewalFenceKey("opensteer", scope)] = fenceEpoch
+			err = state.Validate()
+			if test.valid && err != nil {
+				t.Fatalf("Validate enrollment epoch %d: %v", test.epoch, err)
+			}
+			if !test.valid && !errors.Is(err, ErrInvalid) {
+				t.Fatalf("Validate enrollment epoch %d = %v, want ErrInvalid", test.epoch, err)
+			}
+		})
+	}
+}
+
+func TestRenewalFenceMapCapacity(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	if _, err := h.store.TransactNatural("seed-renewal-fence-capacity", h.now.Unix(), func(state *State) (any, bool, error) {
+		if state.RenewalFences == nil {
+			state.RenewalFences = make(map[string]uint64)
+		}
+		for index := 0; index < MaxRenewalFences; index++ {
+			state.RenewalFences[renewalFenceKey("opensteer", fmt.Sprintf("scope-%d", index))] = 1
+		}
+		return RenewalFence{Scope: "scope-0", Epoch: 1}, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	existingKey := renewalFenceKey("opensteer", "scope-0")
+	existing, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+		Reason: "existing-scope", Fences: []RenewalFence{{Scope: "scope-0", Epoch: 2}},
+	})
+	if err != nil || len(existing.Fences) != 1 || existing.Fences[0].Epoch != 2 {
+		t.Fatalf("existing fence at capacity = %+v, %v", existing, err)
+	}
+	sequence := h.store.sequence
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	if _, err := h.manager.IssueMount("new-scope-at-capacity", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "new-scope-at-capacity", []string{"write"}, "new-scope", 1,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	}); !errors.Is(err, ErrRenewalFenceCapacity) {
+		t.Fatalf("issuance fence at capacity = %v, want ErrRenewalFenceCapacity", err)
+	}
+	if _, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+		Reason: "new-scope", Fences: []RenewalFence{{Scope: "new-scope", Epoch: 1}},
+	}); !errors.Is(err, ErrRenewalFenceCapacity) {
+		t.Fatalf("batch fence at capacity = %v, want ErrRenewalFenceCapacity", err)
+	}
+	if h.store.sequence != sequence {
+		t.Fatalf("capacity failures changed sequence = %d, want %d", h.store.sequence, sequence)
+	}
+	var invalid State
+	if err := h.store.View(func(state State) error {
+		invalid = state
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	invalid.RenewalFences[renewalFenceKey("opensteer", "new-scope")] = 1
+	if err := invalid.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("over-capacity state validation = %v, want ErrInvalid", err)
+	}
+	if got := invalid.RenewalFences[existingKey]; got != 2 {
+		t.Fatalf("existing fence high-water = %d, want 2", got)
+	}
+}
+
+func TestRenewalFenceAtExactEpochLeavesActiveEnrollment(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	authorization, err := h.manager.IssueMount("exact-fence-epoch", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "exact-fence-epoch", []string{"write"}, "cloud-private-state:exact", 7,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sequence := h.store.sequence
+	result, err := h.manager.AdvanceRenewalFences("opensteer", AdvanceRenewalFencesRequest{
+		Reason: "delayed-stop-fence", Fences: []RenewalFence{{Scope: "cloud-private-state:exact", Epoch: 7}},
+	})
+	if err != nil || len(result.Fences) != 1 || result.Fences[0].Epoch != 7 || h.store.sequence != sequence {
+		t.Fatalf("exact fence = %+v, sequence=%d want=%d, err=%v", result, h.store.sequence, sequence, err)
+	}
+	if err := h.store.View(func(state State) error {
+		enrollment := state.MountEnrollments[authorization.EnrollmentID]
+		if enrollment.State != MountEnrollmentActive {
+			t.Fatalf("exact-epoch enrollment = %+v", enrollment)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConvergentRevocationConcurrentCallsPreserveFirstDecision(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	authorization, err := h.manager.IssueMount("concurrent-enrollment", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "concurrent-enrollment", []string{"write"}),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const callers = 16
+	start := make(chan struct{})
+	results := make(chan error, callers)
+	var wait sync.WaitGroup
+	for index := 0; index < callers; index++ {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			result, err := h.manager.RevokeVolumeMountEnrollment(
+				"opensteer", volume.ID, authorization.EnrollmentID,
+				TerminateMountEnrollmentRequest{Reason: fmt.Sprintf("concurrent-reason-%d", index)},
+			)
+			if err == nil && result.Outcome != MountEnrollmentRevocationRevoked {
+				err = fmt.Errorf("outcome = %s", result.Outcome)
+			}
+			results <- err
+		}(index)
+	}
+	close(start)
+	wait.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.store.View(func(state State) error {
+		enrollment := state.MountEnrollments[authorization.EnrollmentID]
+		if enrollment.State != MountEnrollmentRevoked || enrollment.TerminationReason == "" {
+			t.Fatalf("concurrently revoked enrollment = %+v", enrollment)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClosedEnrollmentPrunesBeforeNextScopedGeneration(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	first, err := h.manager.IssueMount("incident-epoch-1", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "incident-epoch-1", []string{"write"}, "cloud-private-state:incident", 1,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.manager.CloseMountEnrollment("incident-close", first.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "startup-rollback"}); err != nil {
+		t.Fatal(err)
+	}
+	*h.now = h.now.Add(mountEnrollmentRetention + time.Second)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := h.manager.IssueMount("incident-epoch-2", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
+			t, h, volume.Volume, peer, "incident-epoch-2", []string{"write"}, "cloud-private-state:incident", 2,
+		),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil || second.EnrollmentID == "" {
+		t.Fatalf("next generation issuance = %+v, %v", second, err)
+	}
+	revocation, err := h.manager.RevokeVolumeMountEnrollment(
+		"opensteer", volume.ID, first.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "stale-cleanup"},
+	)
+	if err != nil || revocation.Outcome != MountEnrollmentRevocationAbsent {
+		t.Fatalf("pruned enrollment revocation = %+v, %v", revocation, err)
 	}
 }
 
@@ -736,13 +1402,68 @@ func verifiedPlan(t *testing.T, manager *Manager, cellID string, now time.Time) 
 	return plan
 }
 
+func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
+	t.Helper()
+	cell, err := h.manager.RegisterCell("ready-cell", RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume, err := h.manager.CreateVolume("ready-volume", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, authorityCSR := testCSR(t)
+	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
+	cell, err = h.manager.ObserveCell("ready-csr", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{
+			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityGeneration, ProjectID: volume.ProjectID,
+			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			Provisioned: true, AuthorityCSRPEM: authorityCSR,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
+	cell, err = h.manager.ObserveCell("ready-running", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{
+			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityGeneration, ProjectID: volume.ProjectID,
+			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			Provisioned: true, AuthorityRunning: true,
+		}},
+	})
+	if err != nil || cell.Health != CellHealthy {
+		t.Fatalf("ready cell = %+v, %v", cell, err)
+	}
+	volume, err = h.manager.GetVolume(volume.ID)
+	if err != nil || volume.State != VolumeReady {
+		t.Fatalf("ready volume = %+v, %v", volume, err)
+	}
+	return cell, volume
+}
+
 func signedProductAuthorization(t *testing.T, h managerHarness, volume Volume, peer [32]byte, nonce string, access []string) string {
+	t.Helper()
+	return signedProductAuthorizationWithRenewal(t, h, volume, peer, nonce, access, "", 0)
+}
+
+func signedProductAuthorizationWithRenewal(t *testing.T, h managerHarness, volume Volume, peer [32]byte, nonce string, access []string, scope string, epoch uint64) string {
 	t.Helper()
 	token, err := productauth.Sign(h.productKey, productauth.Claims{
 		Issuer: volume.ProductIssuer, Audience: "portablefs-manager", AuthorizationDomain: volume.AuthorizationDomain,
 		Owner: volume.Owner, Subject: "agent-session", VolumeID: volume.ID, Access: access,
 		PeerSPKI: base64.RawURLEncoding.EncodeToString(peer[:]), Nonce: nonce,
 		NotBefore: h.now.Add(-time.Second).Unix(), Expires: h.now.Add(12 * time.Minute).Unix(),
+		RenewalScope: scope, RenewalEpoch: epoch,
 	})
 	if err != nil {
 		t.Fatal(err)

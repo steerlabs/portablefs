@@ -31,6 +31,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/mounthost"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 	"github.com/steerlabs/portablefs/vcs/internal/portablefsd"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
@@ -1758,23 +1759,14 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			renewalCtx, cancel := context.WithCancel(context.Background())
 			renewalCancel = cancel
 			renewalDone = make(chan error, 1)
+			renewalEvents, eventLogErr := mountlog.New(e.stderr, "linux-fuse", mountInstanceID)
+			if eventLogErr != nil {
+				return cleanupMountedFUSE(fmt.Errorf("initialize per-mount renewal event log: %w", eventLogErr))
+			}
 			renewer := &mountenrollment.Renewer{
 				Source: enrollmentClient,
-				Observe: func(status mountenrollment.RenewalStatus) {
-					_, _ = updateMountState(stateDir, mountPath, func(current *mountState) {
-						if current.MountEnrollmentID != o.enrollmentID {
-							return
-						}
-						current.AuthorizationDeadlineAtMs = status.AuthorizationDeadline.UnixMilli()
-						if !status.LastSuccess.IsZero() {
-							current.LastReauthorizationAtMs = status.LastSuccess.UnixMilli()
-						}
-						if !status.NextAttempt.IsZero() {
-							current.NextReauthorizationAtMs = status.NextAttempt.UnixMilli()
-						}
-						current.ReauthorizationFailures = status.ConsecutiveFailures
-						current.ReauthorizationError = status.LastError
-					})
+				Observe: func(event mountenrollment.RenewalEvent) {
+					recordFUSERenewalEvent(renewalEvents, stateDir, mountPath, o.enrollmentID, event)
 				},
 			}
 			go func() {
@@ -2142,6 +2134,34 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	}
 }
 
+func recordFUSERenewalEvent(events *mountlog.Writer, stateDir, mountPath, enrollmentID string, event mountenrollment.RenewalEvent) {
+	if err := events.WriteRenewal(event); err != nil {
+		log.Printf("portablefs mount: write renewal event: %v", err)
+	}
+	status := event.Status
+	updated, stateErr := updateMountState(stateDir, mountPath, func(current *mountState) {
+		if current.MountEnrollmentID != enrollmentID {
+			return
+		}
+		current.AuthorizationDeadlineAtMs = status.AuthorizationDeadline.UnixMilli()
+		current.LastReauthorizationAtMs = 0
+		if !status.LastSuccess.IsZero() {
+			current.LastReauthorizationAtMs = status.LastSuccess.UnixMilli()
+		}
+		current.NextReauthorizationAtMs = 0
+		if !status.NextAttempt.IsZero() {
+			current.NextReauthorizationAtMs = status.NextAttempt.UnixMilli()
+		}
+		current.ReauthorizationFailures = status.ConsecutiveFailures
+		current.ReauthorizationError = status.LastError
+	})
+	if stateErr != nil {
+		log.Printf("portablefs mount: persist renewal status: %v", stateErr)
+	} else if !updated {
+		log.Printf("portablefs mount: renewal status had no matching mount record")
+	}
+}
+
 // waitForFSKitRoot waits for a kernel-visible mount whose root can answer a
 // real filesystem operation. mount(8) may return before the FSKit resource
 // has completed loading; reporting readiness in that gap makes the first
@@ -2461,16 +2481,19 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	}
 
 	var forcedJobs []string
-	fuseForceCompleted := false
-	fskitUnmountCompleted := false
+	outcome := detachNone
 	switch {
 	case force:
 		switch st.Strategy {
 		case "fskit":
 			if st.Engine == mountEngineDaemonV3 {
-				fskitUnmountCompleted, err = e.v3FSKitDaemonDetach(st, true)
+				var kernelDetached bool
+				kernelDetached, err = e.v3FSKitDaemonDetach(st, true)
 				if err != nil {
 					return e.fail("umount", err)
+				}
+				if kernelDetached {
+					outcome = detachFSKitDaemon
 				}
 				break
 			}
@@ -2480,7 +2503,7 @@ func cmdUmount(e *cmdEnv, args []string) int {
 			if err != nil {
 				return e.fail("umount", err)
 			}
-			fskitUnmountCompleted = true
+			outcome = detachFSKitDaemon
 		case "fuse":
 			if st.Engine == mountEngineFuseV3 {
 				// A v3 mount has no journal to park: forced detach is the same
@@ -2497,7 +2520,9 @@ func cmdUmount(e *cmdEnv, args []string) int {
 			// A live owner performs its own exact detach before acknowledging.
 			// The abandoned-store path only publishes the durability proof;
 			// this operation still owns the subsequent exact kernel detach.
-			fuseForceCompleted = ownerWasLive
+			if ownerWasLive {
+				outcome = detachFUSEForced
+			}
 		default:
 			return e.fail("umount", fmt.Errorf("unsupported recorded mount strategy %q", st.Strategy))
 		}
@@ -2509,9 +2534,13 @@ func cmdUmount(e *cmdEnv, args []string) int {
 		// with the mount fully alive — never a silently parked tail behind a
 		// healthy-looking unmount.
 		if mounted && st.Strategy == "fskit" && st.Engine == mountEngineDaemonV3 {
-			fskitUnmountCompleted, err = e.v3FSKitDaemonDetach(st, false)
+			var kernelDetached bool
+			kernelDetached, err = e.v3FSKitDaemonDetach(st, false)
 			if err != nil {
 				return e.fail("umount", err)
+			}
+			if kernelDetached {
+				outcome = detachFSKitDaemon
 			}
 		} else if mounted && st.Strategy == "fskit" {
 			cfg, err := fskitConfigFromEnv(e.getenv)
@@ -2536,11 +2565,12 @@ func cmdUmount(e *cmdEnv, args []string) int {
 					mountPath,
 				))
 			}
-			fskitUnmountCompleted = true
+			outcome = detachFSKitDaemon
 		} else if mounted {
 			if err := e.drainBeforeUnmount(st); err != nil {
 				return e.fail("umount", fmt.Errorf("%v\nnothing was unmounted: the write-back tail could not reach the authority. Retry when it is reachable, or run `portablefs umount --force %s` to detach now — the tail then parks as a durable recovery job for verified exact replay on the next attach", err, mountPath))
 			}
+			outcome = detachFUSECooperative
 		}
 	}
 
@@ -2550,8 +2580,7 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	}
 	needsPlatformUnmount, reconcileStale, completionErr := decidePostUnmount(
 		mounted,
-		fuseForceCompleted,
-		fskitUnmountCompleted,
+		outcome,
 	)
 	if completionErr != nil {
 		return e.fail("umount", completionErr)
@@ -2616,20 +2645,35 @@ func cmdUmount(e *cmdEnv, args []string) int {
 	return 0
 }
 
-// decidePostUnmount classifies the exact kernel state after a drain/detach
-// acknowledgement. A successful daemon-owned FSKit transaction already
-// performed the kernel detach, so absence is normal and presence is an
-// FSKit-specific invariant violation. Only an unacknowledged absence is
-// stale-state reconciliation.
-func decidePostUnmount(mounted, fuseForceCompleted, fskitUnmountCompleted bool) (needsPlatformUnmount, reconcileStale bool, err error) {
+// detachOutcome is the positive completion evidence returned by the strategy
+// that owned an unmount. It is deliberately not inferred from process liveness
+// or from the final kernel snapshot: absence without one of these outcomes is
+// stale-state reconciliation, while absence after one is normal completion.
+type detachOutcome uint8
+
+const (
+	detachNone detachOutcome = iota
+	detachFUSECooperative
+	detachFUSEForced
+	detachFSKitDaemon
+)
+
+// decidePostUnmount verifies a strategy's completion claim against the exact
+// kernel state. The claim is correctness evidence carried in-process from the
+// operation that produced it; logs and PID timing are never inputs.
+func decidePostUnmount(mounted bool, outcome detachOutcome) (needsPlatformUnmount, reconcileStale bool, err error) {
 	switch {
-	case mounted && fskitUnmountCompleted:
+	case outcome > detachFSKitDaemon:
+		return false, false, fmt.Errorf("unmount produced an unknown detach outcome %d; state and intent were preserved", outcome)
+	case mounted && outcome == detachFSKitDaemon:
 		return false, false, fmt.Errorf("daemon-owned FSKit unmount acknowledged completion but the exact kernel mount remains; state and intent were preserved")
-	case mounted && fuseForceCompleted:
+	case mounted && outcome == detachFUSEForced:
 		return false, false, fmt.Errorf("forced FUSE owner acknowledged parking but the exact kernel mount remains; state and intent were preserved")
+	case mounted && outcome == detachFUSECooperative:
+		return false, false, fmt.Errorf("cooperative FUSE unmount completed but the exact kernel mount remains; state and intent were preserved")
 	case mounted:
 		return true, false, nil
-	case fskitUnmountCompleted || fuseForceCompleted:
+	case outcome != detachNone:
 		return false, false, nil
 	default:
 		return false, true, nil

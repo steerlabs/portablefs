@@ -28,6 +28,7 @@ type Config struct {
 	FrontendSocket   string
 	ControlSocket    string
 	StateDir         string
+	MountLogDir      string
 	Version          string
 	ExecutableSHA256 string
 }
@@ -44,6 +45,9 @@ type Server struct {
 }
 
 func NewServer(cfg Config) *Server {
+	if cfg.MountLogDir == "" && cfg.StateDir != "" {
+		cfg.MountLogDir = defaultMountLogDir(cfg.StateDir)
+	}
 	if cfg.Version == "" {
 		cfg.Version = "dev"
 	}
@@ -138,6 +142,7 @@ type registry struct {
 	testUnmountDrain func(context.Context, func() error) (string, error)
 	persistMu        sync.Mutex
 	stateDir         string
+	mountLogDir      string
 	byRef            map[string]*attach
 	byKey            map[string]*attach
 	quiescing        bool
@@ -165,8 +170,13 @@ type registry struct {
 }
 
 func newRegistry(stateDir string) *registry {
+	return newRegistryWithMountLogDir(stateDir, stateDir)
+}
+
+func newRegistryWithMountLogDir(stateDir, mountLogDir string) *registry {
 	r := &registry{
 		stateDir:    stateDir,
+		mountLogDir: mountLogDir,
 		byRef:       map[string]*attach{},
 		byKey:       map[string]*attach{},
 		persistReq:  make(chan struct{}, 1),
@@ -228,6 +238,7 @@ func newRegistry(stateDir string) *registry {
 			r.loadErr = fmt.Errorf("revive persisted attach %s: %w", e.Ref, err)
 			return r
 		}
+		a.mountLogDir = r.mountLogDir
 		if e.V3 == nil {
 			// A RECORD FROM THE RETIRED CLIENT-JOURNAL ARCHITECTURE.
 			//
@@ -411,6 +422,7 @@ func (r *registry) ensure(ctx context.Context, req ensureAttachRequest) (*attach
 		return nil, false, fmt.Errorf("attachRef %s already belongs to a different mount identity", ref)
 	}
 	a := newAttach(ref, key, req, r.stateDir)
+	a.mountLogDir = r.mountLogDir
 	a.v3Config = v3Config
 	a.persist = r.persist
 	a.schedulePersist = r.schedulePersist
@@ -1132,6 +1144,7 @@ type attach struct {
 	storageID           string
 	options             AttachOptions
 	stateDir            string
+	mountLogDir         string
 	identityEpoch       uint64
 	persist             func() error
 	// schedulePersist requests a debounced background persist.
@@ -1186,9 +1199,13 @@ type attach struct {
 	// contract; assigned before registration, never mutated (see v3attach.go).
 	// v3Data/v3Session are that attach's live data plane and authority session,
 	// installed by startV3 and guarded by mu.
-	v3Config                  *v3AttachConfig
-	v3Data                    *v3DataPlane
-	v3Session                 v3AuthoritySession
+	v3Config  *v3AttachConfig
+	v3Data    *v3DataPlane
+	v3Session v3AuthoritySession
+	// renewalDone closes only after the automatic owner has emitted its final
+	// event and closed the per-mount log. Exact detach waits for it before the
+	// attach identity can be reused.
+	renewalDone               chan struct{}
 	authorizationDeadlineAtMs int64
 	lastReauthorizationAtMs   int64
 	nextReauthorizationAtMs   int64
@@ -1279,6 +1296,7 @@ func newAttach(ref, key string, req ensureAttachRequest, stateDir string) *attac
 		storageID:           storageID,
 		options:             req.Options,
 		stateDir:            stateDir,
+		mountLogDir:         stateDir,
 		identityEpoch:       1,
 		token:               req.AuthToken,
 		tokenExpiresAtMs:    req.AuthTokenExpiresAtMs,
@@ -1742,6 +1760,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	lifeCancel := a.lifeCancel
 	v3Data := a.v3Data
 	v3Config := a.v3Config
+	renewalDone := a.renewalDone
 	a.mu.Unlock()
 	a.nsMu.Unlock()
 	a.frontendSerial.Unlock()
@@ -1750,6 +1769,22 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	// client forever.
 	if lifeCancel != nil {
 		lifeCancel()
+	}
+	renewalStopped := true
+	if renewalDone != nil {
+		timer := time.NewTimer(5 * time.Second)
+		select {
+		case <-renewalDone:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			renewalStopped = false
+			priorErr = errors.Join(priorErr, errors.New("automatic mount renewal did not stop within its cancellation bound"))
+		}
 	}
 	enrollmentCloseReason := "mount detached"
 	if v3Data != nil {
@@ -1782,7 +1817,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 	// Remote enrollment closure is hygiene after every local kernel, session,
 	// descriptor, and connection owner is already terminal. Manager reachability
 	// therefore cannot block the local terminal transition or leave it dirty.
-	if v3Config != nil && v3Config.enrollmentClient != nil {
+	if v3Config != nil && v3Config.enrollmentClient != nil && renewalStopped {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		closeErr := v3Config.enrollmentClient.Close(closeCtx, enrollmentCloseReason)
 		cancel()

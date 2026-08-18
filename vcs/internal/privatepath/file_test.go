@@ -71,3 +71,34 @@ func TestRemoveFileDurable(t *testing.T) {
 		t.Fatalf("missing removal: %v", err)
 	}
 }
+
+func TestTruncatedLogRemainsAppendOnlyAcrossIndependentWriters(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "private")
+	if err := EnsureDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "mount.log")
+	first, err := OpenFileTruncate(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenFileAppend(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if _, err := second.WriteString("daemon\n"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.WriteString("supervisor\n"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "daemon\nsupervisor\n" {
+		t.Fatalf("append-only log = %q", body)
+	}
+}

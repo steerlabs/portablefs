@@ -211,8 +211,13 @@ before upgrading.
   concurrent replacement is restored rather than unlinked.
 - **Log.** A CLI-spawned daemon appends to
   `~/.local/state/portablefs/portablefsd.log`. Per-mount logs are separate,
-  under `~/.local/state/portablefs/mounts/`. The menu-bar app invokes the same
-  embedded CLI and does not own another daemon or state root.
+  under `~/.local/state/portablefs/mounts/`. The per-mount wrapper and the
+  attach's renewal owner append there without sharing file offsets. Automatic
+  renewal emits structured scheduled, succeeded, retrying, denied, cutoff, and
+  stopped events containing sequence, deadline, retry, and bounded error
+  metadata only; capabilities, certificates, and tokens are never logged. The
+  menu-bar app invokes the same embedded CLI and does not own another daemon or
+  state root.
 - **Sockets are the authentication boundary.** The daemon creates the socket
   directory 0700 and the sockets 0600; same-user filesystem access is the
   control plane's entire auth model — there is no bearer token on the control

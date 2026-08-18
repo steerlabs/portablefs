@@ -99,7 +99,10 @@ func ReadFile(path string) ([]byte, error) {
 }
 
 func OpenFileTruncate(path string) (*os.File, error) {
-	return openPrivateLog(path, unix.O_TRUNC)
+	// Mount logs may also be opened by portablefsd after the per-mount
+	// supervisor inherits this descriptor. O_APPEND keeps those independent
+	// writers from reusing and overwriting each other's file offsets.
+	return openPrivateLog(path, unix.O_TRUNC|unix.O_APPEND)
 }
 
 func OpenFileAppend(path string) (*os.File, error) {

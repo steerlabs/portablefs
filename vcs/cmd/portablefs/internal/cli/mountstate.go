@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"os"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
+	"github.com/steerlabs/portablefs/vcs/internal/mountrecord"
 	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 	"golang.org/x/sys/unix"
 )
@@ -211,9 +211,7 @@ func (e *cmdEnv) mountStateDir() (string, error) {
 // mountStateKey names a mount's state file from its absolute path: stable,
 // filesystem-safe, and collision-free enough for a per-user mount table.
 func mountStateKey(mountPath string) string {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(mountPath))
-	return fmt.Sprintf("%016x", h.Sum64())
+	return mountrecord.Key(mountPath)
 }
 
 func mountStatePath(dir, mountPath string) string {
@@ -221,7 +219,7 @@ func mountStatePath(dir, mountPath string) string {
 }
 
 func mountLogPath(dir, mountPath string) string {
-	return filepath.Join(dir, mountStateKey(mountPath)+".log")
+	return mountrecord.LogPath(dir, mountPath)
 }
 
 func writeMountState(dir string, st mountState) error {

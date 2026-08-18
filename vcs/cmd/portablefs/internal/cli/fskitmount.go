@@ -795,6 +795,7 @@ func ensurePortablefsd(cfg fskitConfig, stateRoot, cliVersion string) (*fsdContr
 		"-frontend-socket", cfg.frontendSock,
 		"-control-socket", cfg.controlSock,
 		"-state-dir", daemonStateDir,
+		"-mount-log-dir", filepath.Join(stateRoot, "mounts"),
 	)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

@@ -1,12 +1,18 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 )
 
 func TestPerfOptionsFromEnv(t *testing.T) {
@@ -142,6 +148,54 @@ func TestMountStateKeyIsStableAndSafe(t *testing.T) {
 	}
 	if strings.ContainsAny(a, "/\\ ") {
 		t.Fatalf("key must be filesystem-safe: %q", a)
+	}
+}
+
+func TestFUSERenewalEventUpdatesSnapshotAndPerMountLog(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st := validFuseMountState(t, "/tmp/renewal-observation")
+	st.AuthorizationSessionID = base64.RawURLEncoding.EncodeToString(make([]byte, 16))
+	st.MountEnrollmentID = "enrollment-1"
+	st.EnrollmentExpiresAtMs = time.Now().Add(time.Hour).UnixMilli()
+	st.AuthorizationDeadlineAtMs = time.Now().Add(time.Minute).UnixMilli()
+	if err := writeMountState(dir, st); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	events, err := mountlog.New(&output, "linux-fuse", st.MountInstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	event := mountenrollment.RenewalEvent{
+		Kind:       mountenrollment.RenewalRetrying,
+		ObservedAt: now,
+		Status: mountenrollment.RenewalStatus{
+			AuthorizationDeadline: now.Add(10 * time.Minute),
+			LastSuccess:           now.Add(-time.Minute),
+			NextAttempt:           now.Add(time.Second),
+			Sequence:              2,
+			ConsecutiveFailures:   1,
+			LastError:             "temporary Manager failure",
+		},
+	}
+	recordFUSERenewalEvent(events, dir, st.MountPath, st.MountEnrollmentID, event)
+	got, err := readMountState(dir, st.MountPath)
+	if err != nil || got == nil {
+		t.Fatalf("read renewed mount state: %+v, %v", got, err)
+	}
+	if got.AuthorizationDeadlineAtMs != event.Status.AuthorizationDeadline.UnixMilli() ||
+		got.LastReauthorizationAtMs != event.Status.LastSuccess.UnixMilli() ||
+		got.NextReauthorizationAtMs != event.Status.NextAttempt.UnixMilli() ||
+		got.ReauthorizationFailures != 1 || got.ReauthorizationError != event.Status.LastError {
+		t.Fatalf("renewal snapshot = %+v", got)
+	}
+	if !bytes.Contains(output.Bytes(), []byte(`"kind":"renewal.retrying"`)) ||
+		!bytes.Contains(output.Bytes(), []byte(`"component":"linux-fuse"`)) {
+		t.Fatalf("per-mount renewal log = %q", output.String())
 	}
 }
 
