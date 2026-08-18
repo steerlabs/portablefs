@@ -1257,6 +1257,73 @@ func TestFinalizedLookupIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *tes
 	}
 }
 
+func TestWrittenUnreceiptedLookupRemainsRevocableThroughPeerComplete(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"gap": testItem(56, authoritypb.Attr_REGULAR, 56)}
+	const unique = 504
+	out := &fuse.EntryOut{}
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "gap", out); !status.Ok() {
+		t.Fatalf("lookup = %v", status)
+	}
+	if n, status := f.raw.PrepareReplyPayload(unique, fuse.FUSE_ROOT_ID, 1, make([]byte, 128), make([]byte, fuse.PFSCacheStampSize), 0); !status.Ok() || n != fuse.PFSCacheStampSize {
+		t.Fatalf("finalize LOOKUP = (%d, %v)", n, status)
+	}
+	markTestReply(t, f.raw, unique)
+	f.raw.ReplyWritten(unique, fuse.OK)
+
+	f.raw.mu.Lock()
+	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: f.raw.nodesByID[fuse.FUSE_ROOT_ID].identity, name: "gap"}
+	reservationsAfterWrite := len(f.raw.cacheReservations[coordinate])
+	_, prematurelyCached := f.raw.cachedNames[nameKey{parent: 1, name: "gap"}]
+	f.raw.mu.Unlock()
+	if reservationsAfterWrite != 1 || prematurelyCached {
+		t.Fatalf("physical-write gap reservations=%d cached=%t, want 1/false", reservationsAfterWrite, prematurelyCached)
+	}
+
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "gap")}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 9)
+	if err != nil || blocked || len(completion.waits) != 1 {
+		t.Fatalf("begin peer COMPLETE = (waits=%d blocked=%t err=%v)", len(completion.waits), blocked, err)
+	}
+	if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+		t.Fatalf("peer COMPLETE in write-to-receipt gap: %v", err)
+	}
+	acknowledgeTestPublication(t, f.raw, unique)
+
+	f.raw.mu.Lock()
+	_, cached := f.raw.cachedNames[nameKey{parent: 1, name: "gap"}]
+	remaining := len(f.raw.cacheReservations[coordinate])
+	parentSequence := f.raw.lastPeerRepairSequence[coordinate]
+	f.raw.mu.Unlock()
+	if cached || remaining != 0 || parentSequence != 9 {
+		t.Fatalf("post-receipt cached=%t reservations=%d sequence=%d, want false/0/9", cached, remaining, parentSequence)
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "delete" || calls[0].name != "gap" || calls[0].sequence != 9 {
+		t.Fatalf("gap repair = %+v, want exact sequence-9 delete", calls)
+	}
+}
+
+func TestNamespaceCompleteAlwaysStampsLiveParentWithoutRegistryEntry(t *testing.T) {
+	f := newStrictFixture(t)
+	targets := []*authoritypb.VisibilityTarget{namespaceVisibilityTarget(1, "never-cached")}
+	if err := f.raw.prepareVisibility(context.Background(), targets, false); err != nil {
+		t.Fatalf("peer PREPARE: %v", err)
+	}
+	completion, blocked, err := f.raw.beginVisibilityCompleteAt(targets, false, 11)
+	if err != nil || blocked {
+		t.Fatalf("begin peer COMPLETE = (blocked=%t err=%v)", blocked, err)
+	}
+	if err := f.raw.finishVisibilityComplete(context.Background(), completion); err != nil {
+		t.Fatalf("peer COMPLETE: %v", err)
+	}
+	if calls := f.notify.snapshot(); len(calls) != 1 || calls[0].kind != "entry" || calls[0].child != 0 || calls[0].name != "never-cached" || calls[0].sequence != 11 {
+		t.Fatalf("mandatory parent stamp = %+v", calls)
+	}
+}
+
 func TestFinalizedGetattrIsRepairedAfterPhysicalWriteAndNeverSettlesCached(t *testing.T) {
 	f := newStrictFixture(t)
 	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "cached")
