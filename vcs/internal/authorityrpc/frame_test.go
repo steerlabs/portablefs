@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +37,43 @@ var errInjectedFrameWrite = errors.New("injected frame write failure")
 type failAfterWriter struct {
 	bytes.Buffer
 	remaining int
+}
+
+type countedWriteConn struct {
+	net.Conn
+	writes atomic.Int64
+}
+
+func (c *countedWriteConn) Write(payload []byte) (int, error) {
+	c.writes.Add(1)
+	return c.Conn.Write(payload)
+}
+
+type deadlineWriteConn struct {
+	bytes.Buffer
+	deadline time.Time
+	writes   int
+}
+
+func (c *deadlineWriteConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *deadlineWriteConn) Close() error             { return nil }
+func (c *deadlineWriteConn) LocalAddr() net.Addr      { return nil }
+func (c *deadlineWriteConn) RemoteAddr() net.Addr     { return nil }
+func (c *deadlineWriteConn) SetDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	return nil
+}
+func (c *deadlineWriteConn) SetReadDeadline(time.Time) error { return nil }
+func (c *deadlineWriteConn) SetWriteDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	return nil
+}
+func (c *deadlineWriteConn) Write(payload []byte) (int, error) {
+	c.writes++
+	if !c.deadline.IsZero() && !c.deadline.After(time.Now()) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return c.Buffer.Write(payload)
 }
 
 func (w *failAfterWriter) Write(value []byte) (int, error) {
@@ -85,6 +124,102 @@ func TestFrameRoundTripAndBound(t *testing.T) {
 	_ = binary.Write(&oversized, binary.BigEndian, uint32(0))
 	if err := readFrame(&oversized, 1024, nil, 0, &decoded); !errors.Is(err, ErrFrameBounds) {
 		t.Fatalf("readFrame=%v", err)
+	}
+}
+
+func TestTLSFrameRoundTripBatchesSocketWrites(t *testing.T) {
+	serverTLS, clientTLS := testTLSConfigs(t)
+	serverTLS = serverTLS.Clone()
+	clientTLS = clientTLS.Clone()
+	serverTLS.NextProtos = []string{protocolALPN}
+	clientTLS.NextProtos = []string{protocolALPN}
+	serverTLS.DynamicRecordSizingDisabled = true
+	clientTLS.DynamicRecordSizingDisabled = true
+
+	clientRaw, serverRaw := net.Pipe()
+	clientCounted := &countedWriteConn{Conn: clientRaw}
+	serverCounted := &countedWriteConn{Conn: serverRaw}
+	client := newAuthorityTLSClient(clientCounted, clientTLS)
+	server := newAuthorityTLSServer(serverCounted, serverTLS)
+	t.Cleanup(func() {
+		_ = clientRaw.Close()
+		_ = serverRaw.Close()
+	})
+	serverHandshake := make(chan error, 1)
+	go func() { serverHandshake <- server.HandshakeContext(t.Context()) }()
+	if err := client.HandshakeContext(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverHandshake; err != nil {
+		t.Fatal(err)
+	}
+	clientCounted.writes.Store(0)
+	serverCounted.writes.Store(0)
+
+	payload := bytes.Repeat([]byte{0x5C}, 1<<20)
+	want := &authoritypb.Request{
+		RequestId: 41,
+		Body: &authoritypb.Request_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteRequest{
+			Handle: bytes.Repeat([]byte{0x71}, 16), Size: uint32(len(payload)), Data: payload,
+		}},
+	}
+	serverDone := make(chan error, 1)
+	go func() {
+		got := new(authoritypb.Request)
+		if err := readFrame(server, 2<<20, nil, 0, got); err != nil {
+			serverDone <- err
+			return
+		}
+		if !proto.Equal(got, want) {
+			serverDone <- errors.New("buffered TLS request did not round trip exactly")
+			return
+		}
+		serverDone <- writeFrame(server, 2<<20, &authoritypb.Response{
+			RequestId: want.GetRequestId(),
+			Body:      &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: payload}},
+		})
+	}()
+	if err := writeFrame(client, 2<<20, want); err != nil {
+		t.Fatal(err)
+	}
+	var response authoritypb.Response
+	if err := readFrame(client, 2<<20, nil, 0, &response); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(response.GetRead().GetData(), payload) {
+		t.Fatal("buffered TLS response did not round trip exactly")
+	}
+	if writes := clientCounted.writes.Load(); writes > 6 {
+		t.Fatalf("1 MiB TLS request used %d socket writes, want at most 6", writes)
+	}
+	if writes := serverCounted.writes.Load(); writes > 6 {
+		t.Fatalf("1 MiB TLS response used %d socket writes, want at most 6", writes)
+	}
+}
+
+func TestWriteRequestDeadlineCoversBufferedFlush(t *testing.T) {
+	raw := new(deadlineWriteConn)
+	conn := newFrameSocket(raw)
+	client := &Client{cfg: ClientConfig{CancelDrainTimeout: time.Second}}
+	transport := newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
+	transport.frameMax.Store(4096)
+	request := &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}
+	if err := client.writeRequest(t.Context(), transport, conn, request); err != nil {
+		t.Fatal(err)
+	}
+	if raw.deadline.IsZero() || raw.writes != 1 || raw.Len() == 0 {
+		t.Fatalf("buffered frame returned before its deadline-covered flush: deadline=%v writes=%d bytes=%d", raw.deadline, raw.writes, raw.Len())
+	}
+
+	expiredRaw := new(deadlineWriteConn)
+	expiredConn := newFrameSocket(expiredRaw)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := client.writeRequest(ctx, transport, expiredConn, request); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired buffered flush = %v, want deadline exceeded", err)
 	}
 }
 
@@ -672,6 +807,80 @@ func BenchmarkReadBulkFrame1MiB(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkTLSFrameLoopback1MiB(b *testing.B) {
+	serverTLS, clientTLS := testTLSConfigs(b)
+	serverTLS = serverTLS.Clone()
+	clientTLS = clientTLS.Clone()
+	serverTLS.NextProtos = []string{protocolALPN}
+	clientTLS.NextProtos = []string{protocolALPN}
+	serverTLS.DynamicRecordSizingDisabled = true
+	clientTLS.DynamicRecordSizingDisabled = true
+	clientRaw, serverRaw := net.Pipe()
+	counted := &countedWriteConn{Conn: clientRaw}
+	client := newAuthorityTLSClient(counted, clientTLS)
+	server := newAuthorityTLSServer(serverRaw, serverTLS)
+	b.Cleanup(func() {
+		_ = clientRaw.Close()
+		_ = serverRaw.Close()
+	})
+	serverHandshake := make(chan error, 1)
+	go func() { serverHandshake <- server.HandshakeContext(context.Background()) }()
+	if err := client.HandshakeContext(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	if err := <-serverHandshake; err != nil {
+		b.Fatal(err)
+	}
+
+	payload := make([]byte, 1<<20)
+	request := &authoritypb.Request{
+		RequestId: 1,
+		Body: &authoritypb.Request_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteRequest{
+			Handle: make([]byte, 16), Size: uint32(len(payload)), Data: payload,
+		}},
+	}
+	response := &authoritypb.Response{RequestId: 1}
+	serverDone := make(chan error, 1)
+	go func() {
+		for {
+			var got authoritypb.Request
+			if err := readFrame(server, 2<<20, nil, 0, &got); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+					serverDone <- nil
+				} else {
+					serverDone <- err
+				}
+				return
+			}
+			if err := writeFrame(server, 2<<20, response); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+	}()
+	counted.writes.Store(0)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	iterations := int64(0)
+	for b.Loop() {
+		if err := writeFrame(client, 2<<20, request); err != nil {
+			b.Fatal(err)
+		}
+		var got authoritypb.Response
+		if err := readFrame(client, 2<<20, nil, 0, &got); err != nil {
+			b.Fatal(err)
+		}
+		iterations++
+	}
+	b.StopTimer()
+	_ = clientRaw.Close()
+	if err := <-serverDone; err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(counted.writes.Load())/float64(iterations), "socket-writes/op")
 }
 
 // Defect 10: post-authentication payload allocation had no worker-wide byte

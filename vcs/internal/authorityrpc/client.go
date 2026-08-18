@@ -257,6 +257,7 @@ func DialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	cfg.TLS = cfg.TLS.Clone()
 	cfg.TLS.MinVersion = tls.VersionTLS13
 	cfg.TLS.NextProtos = []string{protocolALPN}
+	cfg.TLS.DynamicRecordSizingDisabled = true
 	cfg.TLS.ClientSessionCache = tls.NewLRUClientSessionCache(clientSessionCacheEntries)
 	ordinaryLimit, blockingLimit := blockingWaitLane(cfg.MaxInFlight)
 	if cfg.CachedNameCapacity == 0 || cfg.RepairBudget <= 0 {
