@@ -133,6 +133,8 @@ readonly -a AFFECTED_FILES=(
   "fs/coda/file.c"
   "fs/erofs/super.c"
   "fs/attr.c"
+  "fs/exec.c"
+  "fs/fcntl.c"
   "fs/fuse/dev.c"
   "fs/fuse/dir.c"
   "fs/fuse/file.c"
@@ -143,10 +145,14 @@ readonly -a AFFECTED_FILES=(
   "fs/fuse/post_state.c"
   "fs/fuse/readdir.c"
   "fs/fuse/xattr.c"
+  "fs/inode.c"
+  "fs/ioctl.c"
+  "fs/locks.c"
   "fs/namei.c"
   "fs/open.c"
   "fs/overlayfs/params.c"
   "fs/read_write.c"
+  "fs/remap_range.c"
   "fs/reply_publish.c"
   "fs/smb/server/smb2pdu.c"
   "fs/smb/server/vfs.c"
@@ -158,6 +164,7 @@ readonly -a AFFECTED_FILES=(
   "include/uapi/linux/fuse.h"
   "io_uring/rw.c"
   "kernel/fork.c"
+  "mm/mmap.c"
   "mm/swapfile.c"
 )
 for relative_path in "${AFFECTED_FILES[@]}"; do
@@ -244,7 +251,9 @@ docker exec "$CONTAINER_ID" sh -eu -c '
       fs/smb/server/smb2pdu.o fs/smb/server/vfs.o \
       fs/fuse/dev.o fs/fuse/dir.o fs/fuse/file.o fs/fuse/inode.o \
       fs/fuse/ioctl.o fs/fuse/post_state.o fs/fuse/readdir.o fs/fuse/xattr.o \
-      fs/reply_publish.o fs/namei.o fs/open.o fs/read_write.o \
+      fs/reply_publish.o fs/attr.o fs/exec.o fs/fcntl.o fs/inode.o \
+      fs/ioctl.o fs/locks.o fs/namei.o fs/open.o fs/read_write.o \
+      fs/remap_range.o mm/mmap.o \
       fs/splice.o fs/xattr.o fs/aio.o io_uring/rw.o kernel/fork.o
   }
 

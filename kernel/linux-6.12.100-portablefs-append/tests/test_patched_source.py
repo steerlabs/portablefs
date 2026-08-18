@@ -627,29 +627,27 @@ class PatchedSourceTests(unittest.TestCase):
             namei.index("int inode_permission(struct"):
             namei.index("EXPORT_SYMBOL(inode_permission)")
         ]
-        self.assertIn("if (unlikely(!IS_ATTR_EXACT(inode)))", inode_permission)
+        self.assertIn("inode_begin_attr_exact(inode)", inode_permission)
+        self.assertIn("inode_permission_attr_exact(idmap, inode, mask)",
+                      inode_permission)
+        self.assertIn("inode_end_attr_exact(inode)", inode_permission)
         self.assertLess(
-            inode_permission.index("if (unlikely(!IS_ATTR_EXACT(inode)))"),
-            inode_permission.index("if (IS_IMMUTABLE(inode))"),
+            inode_permission.index("mask & MAY_NOT_BLOCK"),
+            inode_permission.index("inode_begin_attr_exact(inode)"),
         )
         may_delete = namei[
             namei.index("static int may_delete"):
             namei.index("static inline int may_create")
         ]
-        self.assertIn("inode_begin_attr_exact(dir)", may_delete)
-        self.assertIn("inode_begin_attr_exact(inode)", may_delete)
+        self.assertIn("inode_refresh_attr_exact(dir)", may_delete)
+        self.assertIn("inode_refresh_attr_exact(inode)", may_delete)
         self.assertIn("inode_begin_attr_exact_pair(dir, inode)", may_delete)
         self.assertIn("inode_permission_attr_exact(idmap, dir", may_delete)
         self.assertLess(
-            may_delete.index("inode_end_attr_exact(dir)"),
-            may_delete.index("inode_begin_attr_exact(inode)"),
-        )
-        self.assertLess(
-            may_delete.index("inode_end_attr_exact(inode)"),
+            may_delete.index("inode_refresh_attr_exact(inode)"),
             may_delete.index("inode_begin_attr_exact_pair(dir, inode)"),
         )
         pair_cut = may_delete[may_delete.index("inode_begin_attr_exact_pair") :]
-        self.assertNotIn("inode_end_attr_exact(dir)", pair_cut)
         self.assertIn("inode_end_attr_exact_pair(dir, inode)", pair_cut)
         self.assertLess(
             pair_cut.index("inode_permission_attr_exact(idmap, dir"),
@@ -666,6 +664,229 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertIn("mutex_lock_nested(&second_fi->pfs_publish_mutex", pair)
         self.assertIn("IS_ATTR_EXACT(first)", pair)
         self.assertIn("IS_ATTR_EXACT(second)", pair)
+
+    def test_all_mutable_vfs_consumers_join_an_exact_attribute_cut(
+        self,
+    ) -> None:
+        def function(path: str, start: str, end: str) -> str:
+            text = self.source(path)
+            begin = text.index(start)
+            return text[begin:text.index(end, begin)]
+
+        def assert_cut(
+            body: str,
+            *snapshots: str,
+            begin: str = "inode_begin_attr_exact(inode)",
+            end: str = "inode_end_attr_exact(inode)",
+        ) -> None:
+            begin_at = body.index(begin)
+            end_at = body.index(end, begin_at)
+            for snapshot in snapshots:
+                with self.subTest(snapshot=snapshot):
+                    snapshot_at = body.index(snapshot, begin_at)
+                    self.assertLess(begin_at, snapshot_at)
+                    self.assertLess(snapshot_at, end_at)
+
+        attr = self.source("fs/attr.c")
+        notify = function("fs/attr.c", "int notify_change(",
+                          "EXPORT_SYMBOL(notify_change)")
+        assert_cut(
+            notify,
+            "mode = inode->i_mode",
+            "mode & S_ISUID",
+            "i_uid_into_vfsuid(idmap, inode)",
+            "i_gid_into_vfsgid(idmap, inode)",
+        )
+        self.assertNotIn("may_setattr(idmap", notify)
+        prepare = function("fs/attr.c", "int setattr_prepare(",
+                           "EXPORT_SYMBOL(setattr_prepare)")
+        assert_cut(
+            prepare,
+            "chown_ok(idmap, inode",
+            "chgrp_ok(idmap, inode",
+            "inode_owner_or_capable(idmap, inode)",
+        )
+        self.assertIn("static int may_setattr_attr_exact", attr)
+        self.assertIn("inode_permission_attr_exact(idmap, inode", attr)
+
+        namei = self.source("fs/namei.c")
+        permission = function(
+            "fs/namei.c", "int inode_permission(struct",
+            "EXPORT_SYMBOL(inode_permission)",
+        )
+        self.assertLess(
+            permission.index("mask & MAY_NOT_BLOCK"),
+            permission.index("inode_begin_attr_exact(inode)"),
+        )
+        assert_cut(permission, "inode_permission_attr_exact(idmap, inode")
+
+        may_open = function("fs/namei.c", "static int may_open(",
+                            "static int handle_truncate")
+        assert_cut(
+            may_open,
+            "switch (inode->i_mode & S_IFMT)",
+            "inode_permission_attr_exact(idmap, inode",
+            "IS_APPEND(inode)",
+            "inode_owner_or_capable(idmap, inode)",
+        )
+        linkat = function("fs/namei.c", "int may_linkat(",
+                          "/**\n * may_create_in_sticky")
+        assert_cut(
+            linkat,
+            "i_uid_into_vfsuid(idmap, inode)",
+            "safe_hardlink_source_attr_exact(idmap, inode)",
+            "inode_owner_or_capable(idmap, inode)",
+        )
+        link = function("fs/namei.c", "int vfs_link(",
+                        "EXPORT_SYMBOL(vfs_link)")
+        assert_cut(
+            link,
+            "IS_APPEND(inode)",
+            "IS_IMMUTABLE(inode)",
+            "HAS_UNMAPPED_ID(idmap, inode)",
+        )
+        prepare_mode = function("fs/namei.c", "static int vfs_prepare_mode(",
+                                "/**\n * vfs_create")
+        assert_cut(
+            prepare_mode,
+            "mode_strip_sgid(idmap, dir",
+            "mode_strip_umask(dir",
+            begin="inode_begin_attr_exact(dir)",
+            end="inode_end_attr_exact(dir)",
+        )
+        for start, end, child_snapshot in (
+            (
+                "static inline int may_follow_link(",
+                "/**\n * safe_hardlink_source",
+                "i_uid_into_vfsuid(idmap, inode)",
+            ),
+            (
+                "static int may_create_in_sticky(",
+                "/*\n * follow_up",
+                "inode->i_mode",
+            ),
+        ):
+            pair = function("fs/namei.c", start, end)
+            self.assertIn("inode_refresh_attr_exact(dir)", pair)
+            self.assertIn("inode_refresh_attr_exact(inode)", pair)
+            pair_begin = pair.index("inode_begin_attr_exact_pair(dir, inode)")
+            pair_end = pair.index("inode_end_attr_exact_pair(dir, inode)")
+            self.assertLess(pair_begin, pair.index("dir->i_mode", pair_begin))
+            self.assertLess(pair.index(child_snapshot, pair_begin), pair_end)
+        sticky = function("fs/namei.c", "static int may_create_in_sticky(",
+                          "/*\n * follow_up")
+        self.assertIn("nd->path.dentry->d_parent", sticky)
+
+        setfl = function("fs/fcntl.c", "static int setfl(",
+                         "int file_f_owner_allocate")
+        assert_cut(
+            setfl,
+            "IS_APPEND(inode)",
+            "inode_owner_or_capable(file_mnt_idmap(filp), inode)",
+            "S_ISFIFO(inode->i_mode)",
+        )
+
+        truncate = function("fs/open.c", "long vfs_truncate(",
+                            "EXPORT_SYMBOL_GPL(vfs_truncate)")
+        assert_cut(
+            truncate,
+            "S_ISDIR(inode->i_mode)",
+            "inode_permission_attr_exact(idmap, inode",
+            "IS_APPEND(inode)",
+        )
+        ftruncate = function("fs/open.c", "long do_ftruncate(",
+                             "long do_sys_ftruncate")
+        assert_cut(
+            ftruncate,
+            "S_ISREG(inode->i_mode)",
+            "IS_APPEND(file_inode(file))",
+        )
+        fallocate = function("fs/open.c", "int vfs_fallocate(",
+                             "EXPORT_SYMBOL_GPL(vfs_fallocate)")
+        assert_cut(
+            fallocate,
+            "IS_APPEND(inode)",
+            "IS_IMMUTABLE(inode)",
+            "S_ISFIFO(inode->i_mode)",
+        )
+        chown = function("fs/open.c", "int chown_common(",
+                         "int vfs_fchown(")
+        assert_cut(
+            chown,
+            "S_ISDIR(inode->i_mode)",
+            "setattr_should_drop_sgid(idmap, inode)",
+        )
+
+        remove_privs = function(
+            "fs/inode.c", "int dentry_needs_remove_privs(",
+            "static int __remove_privs",
+        )
+        assert_cut(
+            remove_privs,
+            "IS_NOSEC(inode)",
+            "setattr_should_drop_suidgid(idmap, inode)",
+        )
+        xattr = function("fs/xattr.c", "static int\nxattr_permission(",
+                         "int\nxattr_supports_user_prefix")
+        assert_cut(
+            xattr,
+            "may_write_xattr_attr_exact(idmap, inode)",
+            "S_ISDIR(inode->i_mode)",
+            "inode_owner_or_capable(idmap, inode)",
+            "inode_permission_attr_exact(idmap, inode, mask)",
+        )
+        copy = function("fs/read_write.c", "static int generic_copy_file_checks",
+                        "ssize_t vfs_copy_file_range")
+        assert_cut(
+            copy,
+            "IS_IMMUTABLE(inode_out)",
+            begin="inode_begin_attr_exact(inode_out)",
+            end="inode_end_attr_exact(inode_out)",
+        )
+        lease = function("fs/locks.c", "vfs_setlease(struct file",
+                         "EXPORT_SYMBOL_GPL(vfs_setlease)")
+        assert_cut(
+            lease,
+            "i_uid_into_vfsuid(file_mnt_idmap(filp), inode)",
+            "S_ISREG(inode->i_mode)",
+        )
+        mmap = function("mm/mmap.c", "unsigned long do_mmap(",
+                        "unsigned long ksys_mmap_pgoff")
+        assert_cut(mmap, "IS_APPEND(inode)")
+        exec_uid = function("fs/exec.c", "static void bprm_fill_uid(",
+                            "static int exec_binprm")
+        assert_cut(
+            exec_uid,
+            "mode = inode->i_mode",
+            "i_uid_into_vfsuid(idmap, inode)",
+            "inode_permission_attr_exact(idmap, inode, MAY_EXEC)",
+        )
+        dedupe = function("fs/remap_range.c", "static int may_dedupe_file(",
+                           "loff_t vfs_dedupe_file_range_one")
+        assert_cut(
+            dedupe,
+            "i_uid_into_vfsuid(idmap, inode)",
+            "inode_permission_attr_exact(idmap, inode, MAY_WRITE)",
+        )
+        fileattr = function("fs/ioctl.c", "int vfs_fileattr_set(",
+                           "EXPORT_SYMBOL(vfs_fileattr_set)")
+        assert_cut(fileattr, "inode_owner_or_capable(idmap, inode)")
+
+        # These apparent consumers cannot run on a strict PortableFS mount.
+        init = self.source("fs/fuse/inode.c")
+        admission = init[
+            init.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |"):
+            init.index("if (arg->minor >= 9", init.index(
+                "if (flags & (FUSE_PFS_STRICT_COHERENCE |"
+            ))
+        ]
+        self.assertIn("FUSE_POSIX_ACL", admission)
+        self.assertIn("FUSE_WRITEBACK_CACHE", admission)
+        fuse_file = self.source("fs/fuse/file.c")
+        operations = fuse_file[fuse_file.index(
+            "static const struct file_operations"
+        ):]
+        self.assertNotIn(".remap_file_range", operations)
 
     def test_existing_create_and_negative_lookup_have_distinct_exact_shapes(
         self,
