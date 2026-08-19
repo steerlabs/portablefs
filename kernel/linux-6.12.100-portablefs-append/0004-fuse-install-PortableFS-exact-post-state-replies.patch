@@ -1,4 +1,4 @@
-From 79a95072b1afeab54864f037546ffeb39243dd95 Mon Sep 17 00:00:00 2001
+From 2d8fd82c1b98368643eab763efc1cd31b3c465b6 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -7,16 +7,16 @@ Signed-off-by: Tim Jang <timjang3@gmail.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
- fs/fuse/dev.c             | 168 +++++++++--
- fs/fuse/dir.c             | 544 +++++++++++++++++++++++++++++-----
- fs/fuse/file.c            | 122 +++++---
- fs/fuse/fuse_i.h          |  51 +++-
+ fs/fuse/dev.c             | 168 ++++++++--
+ fs/fuse/dir.c             | 544 ++++++++++++++++++++++++++-----
+ fs/fuse/file.c            | 122 +++++--
+ fs/fuse/fuse_i.h          |  52 ++-
  fs/fuse/inode.c           |  75 ++---
- fs/fuse/post_state.c      | 607 ++++++++++++++++++++++++++++++++++++++
- fs/fuse/readdir.c         | 122 +++++++-
+ fs/fuse/post_state.c      | 655 ++++++++++++++++++++++++++++++++++++++
+ fs/fuse/readdir.c         | 122 ++++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  71 ++++-
- 10 files changed, 1575 insertions(+), 205 deletions(-)
+ 10 files changed, 1624 insertions(+), 205 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -1501,10 +1501,10 @@ index acfedc292..17f05830f 100644
  		fs_reply_publish_scope_set_applied_bytes(out.result_size);
  	publish_token->publish_on_operation_error = true;
 diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
-index 0ba881cdf..dfd83f7ff 100644
+index 0ba881cdf..4c9de56be 100644
 --- a/fs/fuse/fuse_i.h
 +++ b/fs/fuse/fuse_i.h
-@@ -121,8 +121,13 @@ struct fuse_inode {
+@@ -121,8 +121,14 @@ struct fuse_inode {
  	/** Version of last attribute change */
  	u64 attr_version;
  
@@ -1513,13 +1513,14 @@ index 0ba881cdf..dfd83f7ff 100644
  	u8 pfs_class;
 +	bool pfs_identity_known;
 +	u8 pfs_stable_identity[16];
++	struct fuse_attr pfs_attr;
 +	u64 pfs_object_version;
 +	u64 pfs_entry_repair_sequence;
 +	u32 pfs_inode_flags;
  	u64 pfs_size_sequence;
  	u64 pfs_sequence_size;
  	/*
-@@ -315,6 +320,13 @@ enum fuse_pfs_publish_policy {
+@@ -315,6 +321,13 @@ enum fuse_pfs_publish_policy {
  	FUSE_PFS_PUBLISH_OPTIONAL,
  };
  
@@ -1533,7 +1534,7 @@ index 0ba881cdf..dfd83f7ff 100644
  struct fuse_args {
  	uint64_t nodeid;
  	uint32_t opcode;
-@@ -335,11 +347,13 @@ struct fuse_args {
+@@ -335,11 +348,13 @@ struct fuse_args {
  	bool is_pinned:1;
  	bool invalidate_vmap:1;
  	bool pfs_reply_marked:1;
@@ -1548,7 +1549,7 @@ index 0ba881cdf..dfd83f7ff 100644
  	void (*end)(struct fuse_mount *fm, struct fuse_args *args, int error);
  	/* Used for kvec iter backed by vmalloc address */
  	void *vmap_base;
-@@ -1086,8 +1100,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+@@ -1086,8 +1101,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
  			u64 attr_valid, u64 attr_version);
  
  int fuse_lookup_name(struct super_block *sb, u64 nodeid, const struct qstr *name,
@@ -1558,7 +1559,7 @@ index 0ba881cdf..dfd83f7ff 100644
  
  /**
   * Send FORGET command
-@@ -1114,6 +1127,7 @@ struct fuse_io_args {
+@@ -1114,6 +1128,7 @@ struct fuse_io_args {
  	struct {
  		struct fuse_pfs_write_in in;
  		struct fuse_pfs_write_out out;
@@ -1566,7 +1567,7 @@ index 0ba881cdf..dfd83f7ff 100644
  	} pfs_write;
  	};
  	struct fuse_args_pages ap;
-@@ -1230,12 +1244,35 @@ void fuse_wait_aborted(struct fuse_conn *fc);
+@@ -1230,12 +1245,35 @@ void fuse_wait_aborted(struct fuse_conn *fc);
  
  int fuse_pfs_require_publication(struct fuse_mount *fm,
  				 struct fuse_args *args, bool required);
@@ -1782,10 +1783,10 @@ index c2ac021bf..1878ae76e 100644
  					      FUSE_PASSTHROUGH |
 diff --git a/fs/fuse/post_state.c b/fs/fuse/post_state.c
 new file mode 100644
-index 000000000..cc8739615
+index 000000000..d46dc556d
 --- /dev/null
 +++ b/fs/fuse/post_state.c
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,655 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/* PortableFS exact post-state reply installation. */
 +
@@ -2044,6 +2045,7 @@ index 000000000..cc8739615
 +}
 +
 +static void pfs_install_exact_attr_locked(struct inode *inode,
++					  const struct fuse_attr *attr,
 +					  s64 birth_time_ns, u32 flags)
 +{
 +	struct fuse_inode *fi = get_fuse_inode(inode);
@@ -2058,8 +2060,21 @@ index 000000000..cc8739615
 +	fi->i_btime.tv_sec = seconds;
 +	fi->i_btime.tv_nsec = nanoseconds;
 +	set_bit(FUSE_I_BTIME, &fi->state);
++	fi->pfs_attr = *attr;
 +	fi->pfs_inode_flags = flags;
 +	pfs_install_statx_attributes(inode, flags);
++}
++
++static bool pfs_exact_attr_matches_locked(struct inode *inode,
++					  const struct fuse_attr *attr,
++					  s64 birth_time_ns, u32 flags)
++{
++	struct fuse_inode *fi = get_fuse_inode(inode);
++
++	lockdep_assert_held(&fi->lock);
++	return !memcmp(&fi->pfs_attr, attr, sizeof(*attr)) &&
++	       timespec64_to_ns(&fi->i_btime) == birth_time_ns &&
++	       fi->pfs_inode_flags == flags;
 +}
 +
 +#define FUSE_PFS_STATX_ATTRIBUTES \
@@ -2091,13 +2106,25 @@ index 000000000..cc8739615
 +	    fuse_pfs_classify_attr(get_fuse_conn(inode), inode, attr))
 +		return -EPROTO;
 +	spin_lock(&fi->lock);
-+	if (stamp->object_version <= fi->pfs_object_version) {
++	if (stamp->object_version < fi->pfs_object_version) {
 +		spin_unlock(&fi->lock);
 +		return 1;
 +	}
++	if (stamp->object_version == fi->pfs_object_version) {
++		if (!pfs_exact_attr_matches_locked(inode, attr,
++						   stamp->birth_time_ns,
++						   stamp->inode_flags)) {
++			spin_unlock(&fi->lock);
++			return -EPROTO;
++		}
++		/* An identical exact replay safely renews only its lifetime. */
++		smp_store_release(&fi->i_time, attr_valid);
++		spin_unlock(&fi->lock);
++		return 0;
++	}
 +	fuse_change_attributes_common(inode, attr, NULL, 0, 0);
 +	i_size_write(inode, attr->size);
-+	pfs_install_exact_attr_locked(inode, stamp->birth_time_ns,
++	pfs_install_exact_attr_locked(inode, attr, stamp->birth_time_ns,
 +				      stamp->inode_flags);
 +	fi->attr_version = atomic64_inc_return(&get_fuse_conn(inode)->attr_version);
 +	fi->pfs_object_version = stamp->object_version;
@@ -2134,7 +2161,17 @@ index 000000000..cc8739615
 +		return -EPROTO;
 +
 +	spin_lock(&fi->lock);
-+	if (object->object_version <= fi->pfs_object_version) {
++	if (object->object_version < fi->pfs_object_version) {
++		spin_unlock(&fi->lock);
++		return 0;
++	}
++	if (object->object_version == fi->pfs_object_version) {
++		if (!pfs_exact_attr_matches_locked(inode, &object->attr,
++						   object->birth_time_ns,
++						   object->inode_flags)) {
++			spin_unlock(&fi->lock);
++			return -EPROTO;
++		}
 +		spin_unlock(&fi->lock);
 +		return 0;
 +	}
@@ -2146,7 +2183,8 @@ index 000000000..cc8739615
 +		nsecs_to_jiffies64(PFS_ATTR_VALID_NS);
 +	fuse_change_attributes_common(inode, &object->attr, NULL, 0, 0);
 +	i_size_write(inode, object->attr.size);
-+	pfs_install_exact_attr_locked(inode, object->birth_time_ns,
++	pfs_install_exact_attr_locked(inode, &object->attr,
++				      object->birth_time_ns,
 +				      object->inode_flags);
 +	memcpy(fi->pfs_stable_identity, object->stable_identity,
 +	       sizeof(fi->pfs_stable_identity));
@@ -2200,11 +2238,11 @@ index 000000000..cc8739615
 +		object_prior = fi->pfs_object_version;
 +		spin_unlock(&fi->lock);
 +	}
-+	if (stamp->snapshot_sequence <= parent_prior) {
++	if (stamp->snapshot_sequence < parent_prior) {
 +		entry->entry_valid = 0;
 +		entry->entry_valid_nsec = 0;
 +	}
-+	if (inode && stamp->object_version <= object_prior) {
++	if (inode && stamp->object_version < object_prior) {
 +		entry->attr_valid = 0;
 +		entry->attr_valid_nsec = 0;
 +	} else if (inode) {
@@ -2320,7 +2358,17 @@ index 000000000..cc8739615
 +					   fi->pfs_entry_repair_sequence);
 +			parent_found = true;
 +		}
++		if (!(records[i].state->record_flags &
++		      FUSE_PFS_OBJECT_DROP_ATTR) &&
++		    records[i].state->object_version == records[i].prior_version &&
++		    !pfs_exact_attr_matches_locked(records[i].inode,
++					   &records[i].state->attr,
++					   records[i].state->birth_time_ns,
++					   records[i].state->inode_flags))
++			err = -EPROTO;
 +		spin_unlock(&fi->lock);
++		if (err)
++			goto out_data;
 +		records[i].install_attr =
 +			!(records[i].state->record_flags &
 +			  FUSE_PFS_OBJECT_DROP_ATTR) &&
@@ -2332,7 +2380,7 @@ index 000000000..cc8739615
 +			err = -EPROTO;
 +			goto out_data;
 +		}
-+		if (state->header.snapshot_sequence <= parent_prior)
++		if (state->header.snapshot_sequence < parent_prior)
 +			entry_install = false;
 +		if (!entry_install && entry) {
 +			entry->entry_valid = 0;
@@ -2370,7 +2418,8 @@ index 000000000..cc8739615
 +		spin_lock(&fi->lock);
 +		fuse_change_attributes_common(inode, &object->attr, NULL, 0, 0);
 +		i_size_write(inode, object->attr.size);
-+		pfs_install_exact_attr_locked(inode, object->birth_time_ns,
++		pfs_install_exact_attr_locked(inode, &object->attr,
++					      object->birth_time_ns,
 +					      object->inode_flags);
 +		memcpy(fi->pfs_stable_identity, object->stable_identity,
 +		       sizeof(fi->pfs_stable_identity));

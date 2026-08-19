@@ -542,7 +542,7 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertLess(compare, first_store)
         self.assertNotIn("fuse_change_attributes_common", installer[snapshot:compare])
         self.assertLess(
-            installer.index("state->header.snapshot_sequence <= parent_prior", compare),
+            installer.index("state->header.snapshot_sequence < parent_prior", compare),
             first_store,
         )
         self.assertIn("invalidate_inode_pages2_range", installer)
@@ -628,7 +628,7 @@ class PatchedSourceTests(unittest.TestCase):
             ]
             self.assertIn("fuse_change_attributes_common", install)
             self.assertGreater(
-                install.index("smp_store_release(&fi->i_time"),
+                install.rindex("smp_store_release(&fi->i_time"),
                 install.index("fi->pfs_object_version ="),
             )
 
@@ -676,7 +676,7 @@ class PatchedSourceTests(unittest.TestCase):
         ]
         self.assertIn("stamp->birth_time_ns", stamped)
         self.assertIn("stamp->inode_flags", stamped)
-        self.assertIn("stamp->object_version <= fi->pfs_object_version", stamped)
+        self.assertIn("stamp->object_version < fi->pfs_object_version", stamped)
 
         repair = text[
             text.index("int fuse_pfs_install_repair_attr_locked"):
@@ -728,6 +728,42 @@ class PatchedSourceTests(unittest.TestCase):
             "fuse_pfs_attr_is_exact",
         ):
             self.assertNotIn(forbidden, all_sources)
+
+    def test_identical_exact_replays_refresh_without_accepting_disagreement(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/post_state.c")
+        exact = text[
+            text.index("static void pfs_install_exact_attr_locked"):
+            text.index("int fuse_pfs_fill_exact_statx")
+        ]
+        self.assertIn("fi->pfs_attr = *attr", exact)
+        self.assertIn("memcmp(&fi->pfs_attr, attr", exact)
+        self.assertIn("timespec64_to_ns(&fi->i_btime)", exact)
+
+        stamped = text[
+            text.index("static int pfs_install_stamped_attr"):
+            text.index("int fuse_pfs_install_repair_attr_locked")
+        ]
+        stale = stamped.index("stamp->object_version < fi->pfs_object_version")
+        equal = stamped.index("stamp->object_version == fi->pfs_object_version")
+        validate = stamped.index("pfs_exact_attr_matches_locked", equal)
+        refresh = stamped.index("smp_store_release(&fi->i_time", validate)
+        self.assertLess(stale, equal)
+        self.assertLess(equal, validate)
+        self.assertLess(validate, refresh)
+
+        lookup = text[
+            text.index("int fuse_pfs_install_lookup"):
+            text.index("int fuse_pfs_install_getattr")
+        ]
+        self.assertIn("stamp->snapshot_sequence < parent_prior", lookup)
+        self.assertIn("stamp->object_version < object_prior", lookup)
+        self.assertNotIn("stamp->snapshot_sequence <= parent_prior", lookup)
+        self.assertNotIn("stamp->object_version <= object_prior", lookup)
+
+        inode = self.source("fs/fuse/fuse_i.h")
+        self.assertIn("struct fuse_attr pfs_attr", inode)
 
     def test_existing_create_and_negative_lookup_have_distinct_exact_shapes(
         self,
