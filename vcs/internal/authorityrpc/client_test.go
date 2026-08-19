@@ -409,7 +409,7 @@ func TestFrontendProfileControlMethodsCannotCrossProfiles(t *testing.T) {
 	if err := linux.AckVisibility(ctx, &authoritypb.VisibilityCursor{}); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("Linux AckVisibility error = %v, want EOPNOTSUPP", err)
 	}
-	if err := linux.ReportVisibilityBlocked(ctx, &authoritypb.VisibilityCursor{}, nil); !errors.Is(err, syscall.EOPNOTSUPP) {
+	if err := linux.ReportVisibilityBlocked(ctx, &authoritypb.VisibilityCursor{}); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("Linux ReportVisibilityBlocked error = %v, want EOPNOTSUPP", err)
 	}
 

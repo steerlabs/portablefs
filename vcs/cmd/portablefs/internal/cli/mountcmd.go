@@ -125,7 +125,7 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.StringVar(&o.enrollmentCertPath, "mount-enrollment-cert", "", "Manager-issued mount enrollment certificate PEM file")
 	fs.Int64Var(&o.enrollmentExpiresAtMs, "mount-enrollment-expires-at-ms", 0, "mount enrollment expiry as unix milliseconds")
 	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
-	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-5 coherence mode)")
+	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-6 profile)")
 	fs.BoolFunc("fast", "retired: v3 mounts are strict write-through; passing this flag is an error", func(string) error {
 		return errFastRetired
 	})

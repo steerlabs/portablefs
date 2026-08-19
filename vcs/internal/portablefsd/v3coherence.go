@@ -50,7 +50,7 @@ type v3VisibilityClient interface {
 	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
 	AckVisibilityWithContention(context.Context, *authoritypb.VisibilityCursor, bool) error
-	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor, []uint64) error
+	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor) error
 	SessionDone() <-chan struct{}
 	SessionError() error
 	Close() error
@@ -497,7 +497,7 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 		return b.protocolViolation("visibility acknowledgement does not match the outstanding cursor")
 	}
 	if request.Blocked {
-		reportErr := b.client.ReportVisibilityBlocked(ctx, cursor, nil)
+		reportErr := b.client.ReportVisibilityBlocked(ctx, cursor)
 		if reportErr == nil {
 			reportErr = errors.New("portablefsd: authority accepted a blocked visibility report without fencing the session")
 		}

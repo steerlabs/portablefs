@@ -222,6 +222,7 @@ lease grace before admitting clients.
 - power-loss and authority-restart drills; and
 - fresh protocol-6 performance measurements before any SLO claim.
 
-The checked-in Linux 6.12.100 private patch series, protocol-5 qualification
-receipt, and private vNext design remain historical evidence. They are not
-build, test, deployment, or runtime dependencies of this architecture.
+The protocol-5 qualification receipt and the private vNext design remain in-tree
+as historical evidence. The Linux 6.12.100 private patch series is no longer
+checked in; it lives only in git history. None of the three is a build, test,
+deployment, or runtime dependency of this architecture.

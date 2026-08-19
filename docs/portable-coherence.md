@@ -9,6 +9,12 @@ ABI. Authority protocol major for this architecture: **6 (portable)**. There is
 exactly one architecture: no patched-kernel mode, no fallback profile, no
 PortableFS-private kernel capability bits.
 
+DRAFT here means protocol 6 is a **verification-candidate contract
+(pre-launch)**, not a frozen one, and `COMPATIBILITY.md` states it with the same
+words. The §12 L1–L6 program is what promotes it: until L6 closes, every surface
+in `COMPATIBILITY.md` is reviewed as if frozen but is not yet a stability
+promise.
+
 Evidence was audited directly against pristine Linux 6.12.100 and established
 lease-filesystem designs. The earlier review used **[SC §n]** and **[LS §n]**
 labels for working notes; those research files are not present in this tree and
@@ -705,10 +711,14 @@ source of the E2B incident class; its removal is a feature.
    Activate, replay, and resume; compose PREPARE/COMPLETE with Linux lease
    recall around one XFS apply; enforce profile-specific request allowlists;
    exercise macOS 26 synchronous repair and macOS 27 native data revocation.
-7. **L6 — Retirement + full verification.** Remove the private ABI from active
-   build/runtime paths while retaining its dated sources as historical evidence;
-   power-loss harness; multi-client stress/coherence fuzzing under
-   kills; measure §10 on stock kernels; benchmark v3 vs Archil on stock.
+7. **L6 — Retirement + full verification.** Remove the private ABI from the tree
+   entirely. Its patch series is not retained in-tree: the directory
+   `kernel/linux-6.12.100-portablefs-append/` was removed on branch
+   `codex/legacy-cleanup` in the commit titled "kernel: delete the retired
+   private-ABI patch series", and the sources are recoverable from git history at
+   the last commit that contained that directory. Then: power-loss harness;
+   multi-client stress/coherence fuzzing under kills; measure §10 on stock
+   kernels; benchmark v3 vs Archil on stock.
 
 ## 13. Open questions and upstream program (honest list)
 

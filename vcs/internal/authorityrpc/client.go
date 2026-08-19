@@ -963,7 +963,7 @@ func (c *Client) AckVisibilityWithContention(ctx context.Context, cursor *author
 	return nil
 }
 
-func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authoritypb.VisibilityCursor, parentKernelInos []uint64) error {
+func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authoritypb.VisibilityCursor) error {
 	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return syscall.EOPNOTSUPP
 	}
@@ -972,7 +972,7 @@ func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authorityp
 	}
 	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_AckFskitRepair{
 		AckFskitRepair: &authoritypb.AckVisibilityRequest{
-			Cursor: cursor, Blocked: true, BlockedParentKernelInos: append([]uint64(nil), parentKernelInos...),
+			Cursor: cursor, Blocked: true,
 		},
 	}})
 	if err != nil {

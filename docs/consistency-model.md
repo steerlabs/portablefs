@@ -1,12 +1,25 @@
 # Consistency model
 
-PortableFS v3 has one production consistency profile: authority protocol 6 on
-stock Linux FUSE protocol 7.31 or newer. There is no uncached profile, private
-kernel dialect, macOS compatibility-writer mode, or negotiated downgrade.
+PortableFS v3 has one exact consistency profile: authority protocol 6 on stock
+Linux FUSE protocol 7.31 or newer, under the N/A/D/E lease algorithm. There is
+no uncached profile, private kernel dialect, or negotiated downgrade.
+
+macOS is the second declared profile, `FSKIT_SYNC_REPAIR`, and it is not the
+Linux profile with weaker timings — it is **explicit writer ownership**. A
+mounted Mac holds the volume's compatibility writer lease: it is the volume's
+only writer, Linux peers stay mounted and read its changes, a Linux visible
+mutation is refused `EBUSY` before prepare and before any XFS apply, and a
+second Mac is refused `EBUSY` at attach before durable membership or runtime
+activation. Clean Mac unmount releases the lease and Linux may write again. This
+is an admitted, named mode — not a hidden fallback — and it is explicitly **not**
+symmetric multi-writer coherence. Its boundaries are specified in
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md) and enforced
+in the authority's visibility coordinator.
 
 The normative lease and invalidation algorithm is
 [portable-coherence.md](./portable-coherence.md). This document states the
-filesystem behavior applications may rely on.
+filesystem behavior applications may rely on. Unless a statement below names
+macOS, it describes the Linux lease profile.
 
 ## Truth and operation ordering
 
@@ -14,9 +27,12 @@ One provisioned XFS project directory is the only durable truth. The authority
 executes object-relative Linux syscalls beneath a pre-opened root. PortableFS
 does not keep a second namespace, mutation journal, or client write-back log.
 
-Filesystem operations are linearizable. A mutation linearizes after its
-authoritative XFS apply and before its response, at a point consistent with
-overlapping observations. The response is the external completion/visibility
+Supported filesystem operations on Linux lease mounts are linearizable, except
+where this document names a residual: reverse dentry rendering (below), and the
+two stock-FUSE read-cache residuals under *File data and mappings*. Those are
+enumerated exceptions to this sentence, not qualifications of it. A mutation
+linearizes after its authoritative XFS apply and before its response, at a point
+consistent with overlapping observations. The response is the external completion/visibility
 boundary, not necessarily the exact linearization instant. Before the daemon
 permits it, every conflicting peer cache lease has been discharged. An
 operation whose relevant cache acquisition begins after that response observes
@@ -185,7 +201,11 @@ Current FSKit cannot discharge protocol 6 N, A, and E leases, control
 per-reply metadata installation, or expose exact append intent or distributed
 lock callbacks. macOS therefore uses the explicit `FSKIT_SYNC_REPAIR` profile:
 mutations retain ordered PREPARE/COMPLETE repair, while those host-cache,
-append, and lock edges remain best-effort rather than Linux-equivalent.
+append, and lock edges remain best-effort rather than Linux-equivalent. The
+compatibility writer lease is what makes that honest — a mounted Mac writes and
+everyone else reads, so the missing FSKit invalidation primitive is never asked
+to serve a concurrent remote mutation. Cross-machine `fcntl`/`flock` exclusion
+and cross-client atomic append need Linux mounts with no Mac writer attached.
 
 Windows has no admitted transport. A future frontend must prove exact lease
 discharge, lock forwarding, and cache behavior before it can participate.
@@ -195,6 +215,9 @@ discharge, lock forwarding, and cache behavior before it can participate.
 - Transparent exactly-once mutation across authority death.
 - Shared writable file-backed `mmap`.
 - Remote-volume `syncfs(2)` on a kernel that does not advertise FUSE SYNCFS.
+- Symmetric multi-writer coherence with a macOS mount attached: while a Mac
+  holds the compatibility writer lease, another Mac and every Linux peer are
+  readers and their visible mutations are refused `EBUSY`.
 - Multiple POSIX principals inside one volume.
 - Writable extended attributes.
 - Production FSKit or Windows mounts.

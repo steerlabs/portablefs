@@ -169,7 +169,7 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-			CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+			CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -276,7 +276,7 @@ func TestFskitSourceMutationRecallsLinuxLeaseWithoutSourceDischarge(t *testing.T
 		t.Fatal(err)
 	}
 	if err := visibility.Register(source.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairLocklessExpiration,
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1582,7 +1582,7 @@ func retiredMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.
 	terminal := make(chan struct{})
 	t.Cleanup(func() { close(terminal) })
 	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1657,7 +1657,7 @@ func retiredMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *tes
 	terminal := make(chan struct{})
 	t.Cleanup(func() { close(terminal) })
 	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2888,7 +2888,7 @@ func (a *countingAuthorizer) count() int {
 
 func newProtocol5Handler(t *testing.T, membership volumeserver.DurableVisibilityMembership) (*VolumeHandler, context.Context, *countingAuthorizer, *RoutesController) {
 	t.Helper()
-	runtime, err := volumeserver.New("handler-protocol-5", volumeserver.Config{
+	runtime, err := volumeserver.New("handler-fskit", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 8, MaxLockRecords: 32,
 	})
 	if err != nil {
@@ -2908,9 +2908,9 @@ func newProtocol5Handler(t *testing.T, membership volumeserver.DurableVisibility
 	return h, ctx, authorizer, h.Routes
 }
 
-func protocol5AttachRequest(id uint64) *authoritypb.Request {
+func fskitAttachRequest(id uint64) *authoritypb.Request {
 	attach := &authoritypb.AttachRequest{
-		VolumeId: "handler-protocol-5", AccessToken: []byte("one-use"), ReplaySlots: 2,
+		VolumeId: "handler-fskit", AccessToken: []byte("one-use"), ReplaySlots: 2,
 		Purpose:                 authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
 		RoutesRevision:          emptyRoutesRevision(),
@@ -3029,7 +3029,7 @@ func TestProtocol5AttachRequiresNonzeroExactAttemptID(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
-			request := protocol5AttachRequest(31)
+			request := fskitAttachRequest(31)
 			request.GetAttach().AttachAttemptId = attempt
 			response := h.Handle(ctx, request)
 			if response.GetErrno() != errnos.EINVAL || authorizer.count() != 0 {
@@ -3041,7 +3041,7 @@ func TestProtocol5AttachRequiresNonzeroExactAttemptID(t *testing.T) {
 
 func TestProtocol6MountAttachRejectsOmittedFrontendProfileBeforeAuthorization(t *testing.T) {
 	h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
-	request := protocol5AttachRequest(32)
+	request := fskitAttachRequest(32)
 	request.GetAttach().FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED
 	response := h.Handle(ctx, request)
 	if response.GetErrno() != errnos.EINVAL || authorizer.count() != 0 {
@@ -3053,7 +3053,7 @@ func TestProtocol5AttachIsExactProvisionalAndConcurrent(t *testing.T) {
 	h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
 	authorizer.entered = make(chan struct{}, 1)
 	authorizer.release = make(chan struct{})
-	request := protocol5AttachRequest(41)
+	request := fskitAttachRequest(41)
 	responses := make(chan *authoritypb.Response, 2)
 	for range 2 {
 		go func() { responses <- h.Handle(ctx, proto.Clone(request).(*authoritypb.Request)) }()
@@ -3142,7 +3142,7 @@ func TestProtocol5AttachIsExactProvisionalAndConcurrent(t *testing.T) {
 
 func TestProtocol5ActivateRetainsExactReplyAndRejectsAbortAfterCommit(t *testing.T) {
 	h, ctx, authorizer, routes := newProtocol5Handler(t, nil)
-	request := protocol5AttachRequest(51)
+	request := fskitAttachRequest(51)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3192,7 +3192,7 @@ func TestProtocol5ActivateRetainsExactReplyAndRejectsAbortAfterCommit(t *testing
 
 func TestProtocol5AbortIsIdempotent(t *testing.T) {
 	h, ctx, _, _ := newProtocol5Handler(t, nil)
-	request := protocol5AttachRequest(61)
+	request := fskitAttachRequest(61)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3215,7 +3215,7 @@ func TestProtocol5AbortIsIdempotent(t *testing.T) {
 func TestProtocol5ActivationFailureLeavesSessionProvisional(t *testing.T) {
 	membership := &failingActivationMembership{err: errors.New("durable membership unavailable")}
 	h, ctx, _, _ := newProtocol5Handler(t, membership)
-	request := protocol5AttachRequest(71)
+	request := fskitAttachRequest(71)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3253,7 +3253,7 @@ func TestProtocol5RootPreparationFailureRollsBackAndCanRetry(t *testing.T) {
 	store := &failingActivationRootStore{resourceAdmissionFaultStore: &resourceAdmissionFaultStore{}}
 	store.fail.Store(true)
 	h.Store = store
-	request := protocol5AttachRequest(76)
+	request := fskitAttachRequest(76)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3287,7 +3287,7 @@ func TestProtocol5RootPreparationFailureRollsBackAndCanRetry(t *testing.T) {
 
 func TestProtocol5ActivationRevalidatesRouteRevision(t *testing.T) {
 	h, ctx, _, routes := newProtocol5Handler(t, nil)
-	request := protocol5AttachRequest(81)
+	request := fskitAttachRequest(81)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3320,7 +3320,7 @@ func TestProtocol5ActivationRevalidatesRouteRevision(t *testing.T) {
 func TestProtocol5ReplyPrecommitFailureRollsBackMembershipAndRuntime(t *testing.T) {
 	membership := &blockingActivationMembership{activated: make(chan struct{}), release: make(chan struct{})}
 	h, ctx, _, _ := newProtocol5Handler(t, membership)
-	request := protocol5AttachRequest(91)
+	request := fskitAttachRequest(91)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3368,7 +3368,7 @@ func TestProtocol5ReplyPrecommitFailureRollsBackMembershipAndRuntime(t *testing.
 func TestProtocol5AbortRacingActivationCannotEraseActive(t *testing.T) {
 	membership := &blockingActivationMembership{activated: make(chan struct{}), release: make(chan struct{})}
 	h, ctx, _, _ := newProtocol5Handler(t, membership)
-	request := protocol5AttachRequest(96)
+	request := fskitAttachRequest(96)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3426,7 +3426,7 @@ func retiredProtocol5ActivationPublishesFreshRootInsideRegistrationBoundary(t *t
 	}
 	h.Store = store
 
-	request := protocol5AttachRequest(101)
+	request := fskitAttachRequest(101)
 	attached := h.Handle(ctx, request)
 	if attached.GetErrno() != 0 {
 		t.Fatalf("Attach = %+v", attached)
@@ -3732,9 +3732,9 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 		t.Fatalf("create = %v", created)
 	}
 	t.Cleanup(func() {
-		// Removed behind the store, like resetXFSRouteDeclaration: the routing
-		// revision this test installs makes the holder's session stale by
-		// design, so an in-protocol unlink could not run in every exit path.
+		// Removed behind the store, like resetXFSRouteDeclaration: the shared
+		// fixture outlives the parked lock wait, so an in-protocol unlink could
+		// not run in every exit path.
 		if err := os.Remove(filepath.Join(root, "lock-wait-target")); err != nil && !os.IsNotExist(err) {
 			t.Errorf("remove shared XFS lock fixture: %v", err)
 		}
@@ -3778,7 +3778,10 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	// The topology writer must not queue behind the parked wait. Before the
 	// fix, this Apply blocked until the lock wait ended — and because a queued
 	// RWMutex writer stops new readers, every guarded request on the volume
-	// blocked with it.
+	// blocked with it. Protocol 6 commits a route change only at clean mount
+	// absence, so the answer here is a prompt EBUSY-class refusal naming that
+	// absence. Reaching that decision at all is the property under test: it is
+	// made under topology exclusion, which the parked wait must not be holding.
 	active, err := h.Routes.Revision()
 	if err != nil {
 		t.Fatal(err)
@@ -3790,25 +3793,52 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	}()
 	select {
 	case err := <-applyDone:
-		if err != nil {
-			t.Fatalf("ApplyRoutes beside a blocked lock wait: %v", err)
+		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
+			t.Fatalf("ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("ApplyRoutes deadlocked behind a blocked lock wait")
 	}
 
-	// A changed route is terminal for current production frontends. The
-	// visibility fencer therefore ends both sessions and releases the holder's
-	// lock while Apply owns the topology writer. The parked waiter must unwind
-	// with the exact terminal-session errno; it must neither acquire a lock for a
-	// stale route nor hold the topology writer indefinitely.
+	// A refused change disturbs nothing: the declaration is unmoved, the holder
+	// keeps its lock, and the waiter is still parked rather than having been
+	// admitted for a topology the volume does not have.
+	if unchanged, err := h.Routes.Revision(); err != nil {
+		t.Fatal(err)
+	} else if unchanged != active {
+		t.Fatal("a refused routing change moved the active revision")
+	}
 	select {
 	case response := <-waitDone:
-		if response.GetErrno() != errnos.ESTALE {
-			t.Fatalf("the route-fenced parked wait completed with errno %d, want ESTALE", response.GetErrno())
+		t.Fatalf("the parked wait completed across a refused routing change: %v", response)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// And the topology guard is genuinely free rather than merely fast once: a
+	// second decision still completes while the wait is parked.
+	go func() {
+		_, err := h.Routes.Apply(ctx, []byte("node_modules\n/target/\n"), active)
+		applyDone <- err
+	}()
+	select {
+	case err := <-applyDone:
+		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
+			t.Fatalf("second ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("the parked lock wait never completed after the route-change fence released the holder")
+		t.Fatal("a second ApplyRoutes deadlocked behind a blocked lock wait")
+	}
+
+	// The wait unwinds on its own cancellation, which is the only thing left
+	// that can end it: no routing change fenced the holder out from under it.
+	cancelWait()
+	select {
+	case response := <-waitDone:
+		if response.GetErrno() == 0 {
+			t.Fatalf("the cancelled parked wait acquired the conflicting lock: %v", response)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the parked lock wait never completed after cancellation")
 	}
 }
 

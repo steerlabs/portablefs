@@ -370,11 +370,6 @@ func (CoherenceProfile) EnumDescriptor() ([]byte, []int) {
 // authority cannot see a remote kernel and the two answers have different
 // provable properties.
 //
-// PARENT_EXCLUSIVE is the retired stock-FUSE model. It is parseable so an old
-// client receives an explicit commitment refusal, but protocol 6 does not
-// admit it: breaking its parent-i_rwsem cycle required surfacing a synthetic
-// EINTR to ordinary applications.
-//
 // INDEPENDENT means repair never waits on a lock the mount's own unanswered
 // operation can hold. A frontend may only declare it if that is true of its
 // kernel; there is no default, because guessing wrong turns a proven cycle into
@@ -396,36 +391,25 @@ func (CoherenceProfile) EnumDescriptor() ([]byte, []int) {
 type NamespaceRepair int32
 
 const (
-	NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED NamespaceRepair = 0
-	// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
-	NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE              NamespaceRepair = 1
+	NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED                   NamespaceRepair = 0
 	NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT                   NamespaceRepair = 2
 	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED           NamespaceRepair = 3
 	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED NamespaceRepair = 4
-	// LOCKLESS_EXPIRATION is the patched Linux FUSE contract. Strict reverse
-	// namespace notifications expire a binding under dcache locks only; they do
-	// not acquire the parent inode's i_rwsem and therefore cannot deadlock with
-	// an unanswered local create/unlink/rename callback which holds that lock.
-	NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION NamespaceRepair = 5
 )
 
 // Enum value maps for NamespaceRepair.
 var (
 	NamespaceRepair_name = map[int32]string{
 		0: "NAMESPACE_REPAIR_UNSPECIFIED",
-		1: "NAMESPACE_REPAIR_PARENT_EXCLUSIVE",
 		2: "NAMESPACE_REPAIR_INDEPENDENT",
 		3: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED",
 		4: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED",
-		5: "NAMESPACE_REPAIR_LOCKLESS_EXPIRATION",
 	}
 	NamespaceRepair_value = map[string]int32{
 		"NAMESPACE_REPAIR_UNSPECIFIED":                   0,
-		"NAMESPACE_REPAIR_PARENT_EXCLUSIVE":              1,
 		"NAMESPACE_REPAIR_INDEPENDENT":                   2,
 		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED":           3,
 		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED": 4,
-		"NAMESPACE_REPAIR_LOCKLESS_EXPIRATION":           5,
 	}
 )
 
@@ -5063,14 +5047,10 @@ func (x *NextVisibilityRequest) GetOrderedAdmissionContended() bool {
 type AckVisibilityRequest struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Cursor *VisibilityCursor      `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
-	// Retired protocol-5 development fields. They remain parseable so an old
-	// client receives a deterministic refusal, but no admitted profile sends
-	// them. Lockless Linux namespace expiration removed the parent-lock cycle.
-	//
-	// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
+	// blocked declares that this participant cannot adopt the phase it was
+	// delivered. Protocol 6 has exactly one such phase, a routing revision, and
+	// the report is terminal for the reporting mount alone.
 	Blocked bool `protobuf:"varint,2,opt,name=blocked,proto3" json:"blocked,omitempty"`
-	// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
-	BlockedParentKernelInos []uint64 `protobuf:"varint,3,rep,packed,name=blocked_parent_kernel_inos,json=blockedParentKernelInos,proto3" json:"blocked_parent_kernel_inos,omitempty"`
 	// Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
 	// pipelined frontend sets it when peer repair refused at least one eligible
 	// later ordered callback before that exact Ack. It never acknowledges a
@@ -5117,20 +5097,11 @@ func (x *AckVisibilityRequest) GetCursor() *VisibilityCursor {
 	return nil
 }
 
-// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
 func (x *AckVisibilityRequest) GetBlocked() bool {
 	if x != nil {
 		return x.Blocked
 	}
 	return false
-}
-
-// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
-func (x *AckVisibilityRequest) GetBlockedParentKernelInos() []uint64 {
-	if x != nil {
-		return x.BlockedParentKernelInos
-	}
-	return nil
 }
 
 func (x *AckVisibilityRequest) GetOrderedAdmissionContended() bool {
@@ -9665,12 +9636,11 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x15NextVisibilityRequest\x12?\n" +
 	"\x05after\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x05after\x12+\n" +
 	"\x11acknowledge_after\x18\x02 \x01(\bR\x10acknowledgeAfter\x12>\n" +
-	"\x1bordered_admission_contended\x18\x03 \x01(\bR\x19orderedAdmissionContended\"\xf8\x01\n" +
+	"\x1bordered_admission_contended\x18\x03 \x01(\bR\x19orderedAdmissionContended\"\xd5\x01\n" +
 	"\x14AckVisibilityRequest\x12A\n" +
-	"\x06cursor\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x06cursor\x12\x1c\n" +
-	"\ablocked\x18\x02 \x01(\bB\x02\x18\x01R\ablocked\x12?\n" +
-	"\x1ablocked_parent_kernel_inos\x18\x03 \x03(\x04B\x02\x18\x01R\x17blockedParentKernelInos\x12>\n" +
-	"\x1bordered_admission_contended\x18\x04 \x01(\bR\x19orderedAdmissionContended\"\xa8\x01\n" +
+	"\x06cursor\x18\x01 \x01(\v2).portablefs.authority.v1.VisibilityCursorR\x06cursor\x12\x18\n" +
+	"\ablocked\x18\x02 \x01(\bR\ablocked\x12>\n" +
+	"\x1bordered_admission_contended\x18\x04 \x01(\bR\x19orderedAdmissionContendedJ\x04\b\x03\x10\x04R\x1ablocked_parent_kernel_inos\"\xa8\x01\n" +
 	"\x0fLeaseCoordinate\x12<\n" +
 	"\x06family\x18\x01 \x01(\x0e2$.portablefs.authority.v1.LeaseFamilyR\x06family\x12\x1a\n" +
 	"\bidentity\x18\x02 \x01(\fR\bidentity\x12'\n" +
@@ -10029,12 +9999,10 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x1dCOHERENCE_PROFILE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18COHERENCE_PROFILE_STRICT\x10\x01*\x1aCOHERENCE_PROFILE_UNCACHED*\x88\x02\n" +
 	"\x0fNamespaceRepair\x12 \n" +
-	"\x1cNAMESPACE_REPAIR_UNSPECIFIED\x10\x00\x12)\n" +
-	"!NAMESPACE_REPAIR_PARENT_EXCLUSIVE\x10\x01\x1a\x02\b\x01\x12 \n" +
+	"\x1cNAMESPACE_REPAIR_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cNAMESPACE_REPAIR_INDEPENDENT\x10\x02\x12(\n" +
 	"$NAMESPACE_REPAIR_CALLBACK_SERIALIZED\x10\x03\x122\n" +
-	".NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED\x10\x04\x12(\n" +
-	"$NAMESPACE_REPAIR_LOCKLESS_EXPIRATION\x10\x05*p\n" +
+	".NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED\x10\x04\"\x04\b\x01\x10\x01\"\x04\b\x05\x10\x05*!NAMESPACE_REPAIR_PARENT_EXCLUSIVE*$NAMESPACE_REPAIR_LOCKLESS_EXPIRATION*p\n" +
 	"\x0fVisibilityPhase\x12 \n" +
 	"\x1cVISIBILITY_PHASE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18VISIBILITY_PHASE_PREPARE\x10\x01\x12\x1d\n" +

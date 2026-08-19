@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 // The machine-local route contract, against a real kernel.
@@ -372,7 +374,12 @@ func TestSharedPathsKeepTheirCoherenceWithRoutesConfigured(t *testing.T) {
 	requireContent(t, f.join(1, "node_modules", "local.js"), []byte("machine only"), "graft on mount 1")
 }
 
-func TestARoutingChangeRevokesEveryMountWithARemountMessage(t *testing.T) {
+// A route change is committed only at clean mount absence. LOCAL graft cache
+// has no authority TTL, so no acknowledgment and no fencing can prove that a
+// kernel on the old revision stopped serving it; the only proof is that no
+// mount exists. Route declarations are therefore installed before mounts, and
+// a change attempted underneath live mounts is refused without disturbing them.
+func TestARoutingChangeIsRefusedWhileAnyMountIsLive(t *testing.T) {
 	f := newRoutedFixture(t, integrationConfig{Mounts: 2})
 	mustMkdir(t, f.join(0, "node_modules"))
 	mustWrite(t, f.join(0, "node_modules", "installed"), []byte("yes"), 0o644)
@@ -387,28 +394,48 @@ func TestARoutingChangeRevokesEveryMountWithARemountMessage(t *testing.T) {
 	if _, err := f.clients[0].ApplyRoutes(t.Context(), changed.Canonical(), current); err == nil {
 		t.Fatal("a mount session was allowed to change the volume's routing topology")
 	}
-	if _, err := f.routes.Apply(t.Context(), changed.Canonical(), current); err != nil {
-		t.Fatalf("apply a routing change: %v", err)
+	// The operator path is refused too, and for a different reason: the mounts
+	// are live. The refusal names clean mount absence, and it is an ordinary
+	// retryable answer rather than a half-applied topology.
+	if _, err := f.routes.Apply(t.Context(), changed.Canonical(), current); !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
+		t.Fatalf("ApplyRoutes with live mounts = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
+	}
+	if active, err := f.routes.Revision(); err != nil {
+		t.Fatal(err)
+	} else if active != current {
+		t.Fatal("a refused routing change moved the volume's active revision")
 	}
 
-	// Route topology is fixed for the life of a mount: the only correct answer
-	// to it moving is to stop being a filesystem, with a message that says what
-	// to do about it.
+	// A refused change is not a disturbance: both mounts keep serving, on the
+	// revision they agreed to at attach.
+	requireContent(t, f.join(0, "node_modules", "installed"), []byte("yes"), "graft after a refused routing change")
+	mustWrite(t, f.join(0, "shared.txt"), []byte("still serving"), 0o644)
+	requireContent(t, f.join(1, "shared.txt"), []byte("still serving"), "cross-mount write after a refused routing change")
 	for i := range 2 {
-		mount := f.mounts[i]
-		waitUntil(t, 30*time.Second, fmt.Sprintf("mount %d to revoke itself", i), func() bool {
-			return mount.fatalError() != nil
-		})
-		cause := mount.fatalError().Error()
-		if !strings.Contains(cause, LocalDirsPath) || !strings.Contains(cause, "unmount and mount again") {
-			t.Fatalf("mount %d revoked with %q; a routing change has to say what it was and what to do about it", i, cause)
+		if cause := f.mounts[i].fatalError(); cause != nil {
+			t.Fatalf("mount %d died on a refused routing change: %v", i, cause)
 		}
 	}
-	waitUntil(t, 30*time.Second, "the revoked mounts to stop serving", func() bool {
-		_, err := os.Stat(f.join(0, "node_modules"))
-		return err != nil
+
+	// At clean absence the same change commits, and the next mount serves the
+	// new topology: vendor/ becomes machine-local, so it costs the authority
+	// nothing and cannot be seen from the other machine.
+	f.unmountAll()
+	if _, err := f.routes.Apply(t.Context(), changed.Canonical(), current); err != nil {
+		t.Fatalf("apply a routing change at clean mount absence: %v", err)
+	}
+	f.cfg.rules = changed
+	f.mountAll()
+
+	mustMkdir(t, f.join(0, "vendor"))
+	warmVolumePath(t, f.mountPath(0), f.join(0, "vendor"))
+	count, kinds := f.authorityRequests(func() {
+		mustWrite(t, f.join(0, "vendor", "local.js"), []byte("machine only"), 0o644)
 	})
-	f.mounts = nil
+	if count != 0 {
+		t.Fatalf("writing under the newly routed root cost %d authority requests %s, want 0", count, kinds)
+	}
+	requireAbsent(t, f.join(1, "vendor", "local.js"), "the newly routed root on the other machine")
 }
 
 func TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt(t *testing.T) {

@@ -102,7 +102,7 @@ func newFskitWriteHarnessWithAccess(t *testing.T, access volumeserver.Access) (*
 		t.Fatal(err)
 	}
 	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairLocklessExpiration,
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}

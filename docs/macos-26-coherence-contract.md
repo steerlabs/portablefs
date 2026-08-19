@@ -65,8 +65,8 @@ FSKit 26 has no documented module-initiated namespace or inode-attribute cache
 invalidation API. It also lacks source-result attributes for several mutation
 callbacks. PortableFS 26 therefore performs authenticated synchronous repair
 through its own FSKit callback lane. That mechanism can refresh ordinary
-cached state, but it cannot create the exact peer cache transaction available
-in the patched Linux VFS.
+cached state, but it cannot create the exact peer cache transaction the Linux
+N/A/D/E lease profile gets from stock FUSE.
 
 Qualification before the writer lease was added showed why this boundary is
 needed. A Linux truncate of a file already cached by the Mac reached FSKit's

@@ -73,7 +73,7 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateAtAnUncreatedRouteRootIsEISDIR"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARouteRootShadowsTheVolumeSubtreeOfTheSameName"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSharedPathsKeepTheirCoherenceWithRoutesConfigured"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeRevokesEveryMountWithARemountMessage"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeIsRefusedWhileAnyMountIsLive"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
 )

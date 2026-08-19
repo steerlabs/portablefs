@@ -498,6 +498,14 @@ func (f *integrationFixture) start() {
 		}).Serve(ctx, listener, f.serverTLS)
 	}()
 
+	f.mountAll()
+}
+
+// mountAll installs every mountpoint against the running authority, each
+// declaring the routing revision the fixture currently carries.
+func (f *integrationFixture) mountAll() {
+	t := f.t
+	t.Helper()
 	for i := range f.paths {
 		client, transport := f.dialClient()
 		mountInstanceID, err := mountid.NewMountInstance()
@@ -628,10 +636,10 @@ func (f *integrationFixture) shutdown() {
 	f.closeWriteStaging()
 }
 
-// remount recreates the entire authority on the same XFS directory: mounts are
-// unmounted cleanly, the RPC server stops, the volume handle closes, and a fresh
-// epoch is established. Nothing but durable XFS state survives it.
-func (f *integrationFixture) remount() {
+// unmountAll releases every mount cleanly, in protocol: each detach carries
+// the mount-absence observation the authority requires before it will drop the
+// session's topology obligation.
+func (f *integrationFixture) unmountAll() {
 	t := f.t
 	t.Helper()
 	for i := len(f.mounts) - 1; i >= 0; i-- {
@@ -640,6 +648,15 @@ func (f *integrationFixture) remount() {
 		}
 	}
 	f.mounts, f.clients, f.transports = nil, nil, nil
+}
+
+// remount recreates the entire authority on the same XFS directory: mounts are
+// unmounted cleanly, the RPC server stops, the volume handle closes, and a fresh
+// epoch is established. Nothing but durable XFS state survives it.
+func (f *integrationFixture) remount() {
+	t := f.t
+	t.Helper()
+	f.unmountAll()
 	f.stopAuthority()
 	f.closeStore()
 	f.start()

@@ -525,8 +525,7 @@ func TestTransportBlockedReportSuccessKeepsActivePairServing(t *testing.T) {
 		RequestId: 8,
 		Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
 		Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{
-			Blocked:                 true,
-			BlockedParentKernelInos: []uint64{101},
+			Blocked: true,
 		}},
 	}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
 		wrote = response

@@ -138,6 +138,7 @@ generated on the mount host and are never delivered by the manager.
 | Machine-local routing | [graft-security.md](./graft-security.md) |
 | Black-box qualification | [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md) |
 
-Protocol-5 qualification receipts, the Linux 6.12.100 private ABI, and the
-private-kernel vNext specification are retained as historical implementation
-records. They do not define the protocol-6 product.
+Protocol-5 qualification receipts, the Linux 6.12.100 private ABI description,
+and the private-kernel vNext specification are retained as historical
+implementation records; the ABI's kernel patch series itself is only in git
+history. None of them defines the protocol-6 product.

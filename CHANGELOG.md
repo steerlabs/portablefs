@@ -58,7 +58,7 @@ this file is the human-curated summary.
   of an `O_TMPFILE` uses the capability-free `/proc/self/fd` idiom because
   `linkat(AT_EMPTY_PATH)` needs `CAP_DAC_READ_SEARCH` the data plane does not
   have. `docs/portable-coherence.md` §4.4 records all three.
-- Ship the named macOS 26 FSKit best-effort cache tier over protocol 5. One
+- Ship the named macOS 26 FSKit best-effort cache tier over protocol 6. One
   active Mac owns an authority-enforced compatibility writer lease; Linux peers
   remain readable but their visible mutations return `EBUSY` before storage,
   a second Mac writer is refused at activation, and clean unmount transfers
