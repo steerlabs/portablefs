@@ -1869,7 +1869,9 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	var injectOnce sync.Once
 	f.counter.setAfterHandle(func(request *authoritypb.Request, response *authoritypb.Response) {
 		lookup := request.GetLookup()
-		if lookup == nil || string(lookup.GetName()) != existingName || response.GetErrno() != int32(syscall.ENOENT) {
+		lookupReply := response.GetLookup()
+		if lookup == nil || string(lookup.GetName()) != existingName || response.GetErrno() != 0 ||
+			lookupReply.GetItem() != nil || lookupReply.GetNegativeSnapshotSequence() == 0 {
 			return
 		}
 		injectOnce.Do(func() {
