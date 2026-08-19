@@ -68,22 +68,68 @@ manifest_members=$(awk '{print $2}' "$stage/SHA256SUMS")
 }
 (cd "$stage" && sha256sum --check --strict SHA256SUMS >/dev/null)
 
+# Every released binary must agree about its own release identity AND carry
+# Go's VCS stamp naming the recorded source commit of an unmodified tree.
+#
+# The stamp is not decoration. `scripts/build-hosted-linux-release.sh` builds
+# with `-buildvcs=true`, but when it is invoked from a linked git worktree (a
+# `.git` FILE holding `gitdir: .../worktrees/NAME`, not a `.git` directory)
+# Go's VCS support degrades silently and stamps NOTHING, producing a
+# provenance-stripped artifact that every other check here still accepts. An
+# absent stamp is therefore the failure this gate exists to catch and is never
+# tolerated as "not applicable".
+#
+# `go version -m` is the authoritative reader and is used whenever a toolchain
+# is on PATH, which is how CI verifies (it runs actions/setup-go before
+# building). It reads the binary rather than executing it, so a cross-built
+# linux/amd64 release verifies from any host. Release hosts run this same
+# script out of the deploy tarball as root and have no Go installed, so the
+# fallback reads the identical settings straight out of the embedded
+# runtime/debug build-info blob. Neither path is allowed to return nothing.
+tab=$'\t'
+go_toolchain=$(command -v go || true)
+vcs_build_setting() {
+  local binary=$1 key=$2 raw=
+  if [[ -n $go_toolchain ]]; then
+    raw=$("$go_toolchain" version -m "$binary" 2>/dev/null | sed -n "s/^${tab}build${tab}${key}=//p") || true
+  else
+    raw=$(LC_ALL=C grep -a -o "build${tab}${key}=[!-~]*" "$binary" | sed "s/^build${tab}${key}=//") || true
+  fi
+  printf '%s\n' "${raw%%$'\n'*}"
+}
+
 for relative in \
-  bin/portablefs-manager \
-  bin/portablefs-cell-agent \
+  bin/portablefs \
   bin/portablefs-authority \
-  libexec/portablefs-cell-helper \
-  libexec/portablefs-authority-launcher; do
-  [[ $("$stage/$relative" -version) == "$release_id" ]] || {
+  bin/portablefs-cell-agent \
+  bin/portablefs-manager \
+  libexec/portablefs-authority-launcher \
+  libexec/portablefs-cell-helper; do
+  case "$relative" in
+    bin/portablefs) reported_identity=$("$stage/$relative" version); expected_identity="portablefs $release_id" ;;
+    *) reported_identity=$("$stage/$relative" -version); expected_identity=$release_id ;;
+  esac
+  [[ $reported_identity == "$expected_identity" ]] || {
     echo "hosted binary release identity mismatch: $relative" >&2
     exit 65
   }
-done
 
-[[ $("$stage/bin/portablefs" version) == "portablefs $release_id" ]] || {
-  echo "hosted binary release identity mismatch: bin/portablefs" >&2
-  exit 65
-}
+  revision=$(vcs_build_setting "$stage/$relative" vcs.revision)
+  [[ -n $revision ]] || {
+    echo "hosted binary carries no build vcs.revision stamp: $relative (found none, expected vcs.revision=$source_commit; -buildvcs stamping is silently dropped when the release is built from a linked git worktree or with -buildvcs=false)" >&2
+    exit 65
+  }
+  [[ $revision == "$source_commit" ]] || {
+    echo "hosted binary vcs.revision does not name the release source commit: $relative (found vcs.revision=$revision, expected vcs.revision=$source_commit)" >&2
+    exit 65
+  }
+
+  modified=$(vcs_build_setting "$stage/$relative" vcs.modified)
+  [[ $modified == false ]] || {
+    echo "hosted binary is not stamped as built from a clean tree: $relative (found vcs.modified=${modified:-none}, expected vcs.modified=false)" >&2
+    exit 65
+  }
+done
 
 for unit in "$stage"/systemd/*.service; do
   grep -Fq '/opt/portablefs/current/' "$unit" || {
