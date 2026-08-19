@@ -10,6 +10,18 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+### Added
+
+- Writable `O_APPEND` on the stock-FUSE Linux profile, and it is exact across
+  mounts. The frontend forwards the writing description's append intent and the
+  authority places the payload at the object's true EOF inside the per-inode
+  writer stripe, reporting the offset it assigned. Concurrent cross-mount append
+  atomicity is now a demonstrated matrix case rather than a declared failure.
+  Stock Linux forwards neither `RWF_APPEND` nor `RWF_NOAPPEND`, and those two
+  per-call cases are disclosed deviations in `docs/portable-coherence.md` §4.3.
+- The Linux write path now carries the description's `O_SYNC`/`O_DSYNC` intent to
+  the authority, which the FSKit path has always honored.
+
 ### Changed
 
 - Ship the named macOS 26 FSKit best-effort cache tier over protocol 5. One
