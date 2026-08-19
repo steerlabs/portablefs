@@ -352,15 +352,21 @@ serializes every size-changing operation:
   COPY_FILE_RANGE raise it to the end of the range the kernel itself computed,
   and SETATTR and atomic `O_TRUNC` assign it unconditionally.
 - Because the kernel sets its offset to `i_size` for every appending write, a
-  FUSE_WRITE whose offset equals S is the only observable trace of an append. The
-  decision table is one pure function (`resolveAppendPlacement`):
+  FUSE_WRITE whose offset equals S is the only observable trace of an append.
+  Every ordinary sequential write also lands at `i_size`, so the trace needs one
+  more discriminator: for `IOCB_APPEND`, `fuse_file_write_iter` refreshes
+  STATX_SIZE *through the writing file* first, so a hidden per-call append is
+  preceded by a GETATTR carrying that same file handle with nothing else touching
+  the inode in between. The decision table is one pure function
+  (`resolveAppendPlacement`):
 
-  | `O_APPEND` on the description | offset == S | placement |
-  | --- | --- | --- |
-  | yes | yes | append at the authority's EOF |
-  | yes | no  | positioned; only `RWF_NOAPPEND` (Linux ≥ 6.9) produces this |
-  | no  | no  | positioned; no append can be hiding here |
-  | no  | yes | positioned, flagged `offset_matches_client_size` |
+  | `O_APPEND` | offset == S | S refreshed for this handle | placement |
+  | --- | --- | --- | --- |
+  | yes | yes | any | append at the authority's EOF |
+  | yes | no  | any | positioned; only `RWF_NOAPPEND` (Linux ≥ 6.9) produces this |
+  | no  | no  | any | positioned; no append can be hiding here |
+  | no  | yes | no  | positioned; no append this daemon answered fits |
+  | no  | yes | yes | positioned, flagged `offset_matches_client_size` |
 
 `i_size` remains advisory throughout. The kernel raises it from its own offset,
 so after an append that the authority placed further along, the kernel's value
@@ -370,13 +376,15 @@ always is, and never what the next append's placement depends on.
 **Two loud refusal conditions**, both EIO, both narrow:
 
 1. **Stale-size ambiguity.** Stock FUSE does not forward `RWF_APPEND`, so a
-   per-call append on a description without `O_APPEND` is indistinguishable from
-   an ordinary write at that offset. When `offset == S`, the frontend flags the
-   write and the authority refuses it unless the offset really is EOF: only then
-   do the two readings agree. In practice the kernel refreshes attributes from
-   this daemon immediately before an appending write (`fuse_file_write_iter`
-   calls `fuse_update_attributes` for `IOCB_APPEND`), so this fires only if a
-   peer moves EOF inside that window.
+   per-call append on a description without `O_APPEND` is distinguishable from an
+   ordinary write only by the handle-scoped size refresh above. When that trace is
+   present the frontend flags the write, and the authority refuses it unless the
+   offset really is EOF: only then do the two readings agree. The window is the
+   gap between that refresh and the write, so this fires only if a peer moves EOF
+   inside it. The one residual: if the refresh was answered from a nonzero
+   attribute timeout instead of reaching this daemon, the write is placed
+   positioned — correct while the A-R lease backing that timeout is live, since a
+   peer's size change must recall it first.
 2. **Unknown shadow.** If the frontend cannot state its kernel's `i_size` for the
    object, it cannot evaluate the table and refuses the write. This is
    unreachable by construction — the kernel has no inode this daemon never

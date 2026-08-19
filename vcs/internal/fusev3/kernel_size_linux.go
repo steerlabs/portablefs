@@ -44,6 +44,13 @@ type kernelSizeEntry struct {
 	known bool
 	// raised is the tick of the most recent size-raising reply for this inode.
 	raised uint64
+	// statHandle is the file handle of the GETATTR that established size, when
+	// the kernel asked with one and nothing has happened to the inode since. It
+	// is the trace an appending write leaves before it arrives: for IOCB_APPEND,
+	// fuse_file_write_iter refreshes STATX_SIZE through the writing file, so the
+	// refresh carries FUSE_GETATTR_FH with the handle the write then uses.
+	statHandle      uint64
+	statHandleValid bool
 }
 
 func newKernelSizeShadow() *kernelSizeShadow {
@@ -61,7 +68,7 @@ func (s *kernelSizeShadow) begin() uint64 {
 // observeAttr records an attribute-bearing reply. since is the tick the reply's
 // request began with; a zero tick means the provenance is unknown and is treated
 // as a race.
-func (s *kernelSizeShadow) observeAttr(inode uint64, size int64, since uint64) {
+func (s *kernelSizeShadow) observeAttr(inode uint64, size int64, since uint64, statHandle uint64, hasStatHandle bool) {
 	if inode == 0 {
 		return
 	}
@@ -72,11 +79,13 @@ func (s *kernelSizeShadow) observeAttr(inode uint64, size int64, since uint64) {
 		entry = &kernelSizeEntry{}
 		s.entries[inode] = entry
 	}
+	entry.statHandle, entry.statHandleValid = 0, false
 	if size < 0 || since == 0 || entry.raised >= since {
 		entry.known = false
 		return
 	}
 	entry.size, entry.known = uint64(size), true
+	entry.statHandle, entry.statHandleValid = statHandle, hasStatHandle
 }
 
 // observeSet records a reply the kernel applies unconditionally: a SETATTR,
@@ -96,6 +105,7 @@ func (s *kernelSizeShadow) observeSet(inode, size uint64) {
 	s.tick++
 	entry.raised = s.tick
 	entry.size, entry.known = size, true
+	entry.statHandle, entry.statHandleValid = 0, false
 }
 
 // observeRaise records a reply after which the kernel raised i_size to end. It
@@ -115,19 +125,29 @@ func (s *kernelSizeShadow) observeRaise(inode, end uint64) {
 	}
 	s.tick++
 	entry.raised = s.tick
+	entry.statHandle, entry.statHandleValid = 0, false
 	if entry.known && end > entry.size {
 		entry.size = end
 	}
 }
 
 func (s *kernelSizeShadow) lookup(inode uint64) (uint64, bool) {
+	size, known, _ := s.placement(inode, 0)
+	return size, known
+}
+
+// placement reports the shadow together with whether its value came from a
+// size refresh the kernel made through this exact file handle and nothing has
+// touched the inode since. That is what separates a per-call append the kernel
+// did not forward from an ordinary write that merely lands at i_size.
+func (s *kernelSizeShadow) placement(inode, handle uint64) (size uint64, known, refreshedForHandle bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry := s.entries[inode]
 	if entry == nil || !entry.known {
-		return 0, false
+		return 0, false, false
 	}
-	return entry.size, true
+	return entry.size, true, entry.statHandleValid && entry.statHandle == handle
 }
 
 // forget drops an inode the kernel has evicted. A later instantiation starts
@@ -150,7 +170,20 @@ func (r *rawFileSystem) noteKernelAttr(ctx context.Context, attr *authoritypb.At
 	if r == nil || r.sizes == nil || attr == nil || attr.GetKind() != authoritypb.Attr_REGULAR {
 		return
 	}
-	r.sizes.observeAttr(attr.GetInode(), attr.GetSize(), replyPublicationTick(ctx))
+	tick, statHandle, hasStatHandle := uint64(0), uint64(0), false
+	if publication := replyPublicationFromContext(ctx); publication != nil {
+		tick, statHandle, hasStatHandle = publication.sizeTick, publication.sizeStatHandle, publication.sizeStatHandleSet
+	}
+	r.sizes.observeAttr(attr.GetInode(), attr.GetSize(), tick, statHandle, hasStatHandle)
+}
+
+// markKernelSizeRefresh records that this callback is the kernel refreshing an
+// inode's size through one file handle, which stock Linux does immediately
+// before an appending write.
+func markKernelSizeRefresh(ctx context.Context, handle uint64) {
+	if publication := replyPublicationFromContext(ctx); publication != nil {
+		publication.sizeStatHandle, publication.sizeStatHandleSet = handle, true
+	}
 }
 
 // noteKernelSize records a size the kernel adopts unconditionally.
@@ -168,14 +201,4 @@ func (r *rawFileSystem) noteKernelRaise(inode, end uint64) {
 		return
 	}
 	r.sizes.observeRaise(inode, end)
-}
-
-// replyPublicationTick is the shadow tick the callback's reply publication was
-// registered with. A callback that has no publication states no provenance.
-func replyPublicationTick(ctx context.Context) uint64 {
-	publication := replyPublicationFromContext(ctx)
-	if publication == nil {
-		return 0
-	}
-	return publication.sizeTick
 }

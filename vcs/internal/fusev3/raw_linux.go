@@ -221,6 +221,10 @@ type replyPublication struct {
 	// attribute reply can tell whether a write reply for the same inode
 	// overtook it and may have made the kernel discard the attributes.
 	sizeTick uint64
+	// sizeStatHandle is set when this callback is a GETATTR the kernel issued
+	// through a file handle. See markKernelSizeRefresh.
+	sizeStatHandle    uint64
+	sizeStatHandleSet bool
 
 	// Physical reply state is protected by rawFileSystem.mu.
 	owner             *rawFileSystem
@@ -2189,6 +2193,9 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 		return lifecycle
 	}
 	defer finish()
+	if handle != nil {
+		markKernelSizeRefresh(ctx, input.Fh())
+	}
 	return fuse.Status(record.node.Getattr(ctx, handle, out))
 }
 

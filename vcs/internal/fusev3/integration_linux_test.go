@@ -872,16 +872,14 @@ func TestStockWriteRequestSplitting(t *testing.T) {
 		t.Fatalf("4 KiB positioned write authority calls = %d, want 1", writes)
 	}
 
-	appendFile := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
-	record := []byte("appended-record\n")
-	before, err := appendFile.Stat()
-	if err != nil {
+	// A writable O_APPEND open is ordinary. Placement itself is per write and is
+	// covered by the append suite; this test only counts request splitting, so it
+	// deliberately does not disturb the object here.
+	if appendFile, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0); err != nil {
+		t.Fatalf("O_APPEND open = %v, want acceptance", err)
+	} else if err := appendFile.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := appendFile.Write(record); err != nil || n != len(record) {
-		t.Fatalf("O_APPEND write = (%d, %v), want %d bytes", n, err, len(record))
-	}
-	requireSize(t, path, before.Size()+int64(len(record)), "size after an O_APPEND write")
 
 	const maxWrite = 1 << 20
 	mapping, err := unix.Mmap(-1, 0, maxWrite+os.Getpagesize(), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)

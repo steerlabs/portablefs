@@ -134,11 +134,13 @@ throughout: it is a shadow of what a daemon last published, and a peer may have
 moved EOF since.
 
 Stock FUSE does not forward `RWF_APPEND`, so a per-call append on a description
-without `O_APPEND` is visible only as an offset equal to the `i_size` this daemon
-published. That shape is forwarded flagged, and the authority refuses it with EIO
-unless the offset really is EOF — the one condition under which the two readings
-of the request agree. The system never reinterprets an offset it cannot
-disambiguate.
+without `O_APPEND` is visible only as an offset equal to an `i_size` the kernel
+refreshed from this daemon through that same file handle immediately before the
+write — which is what Linux does for `IOCB_APPEND`, and what an ordinary
+sequential write at `i_size` does not do. That shape is forwarded flagged, and the
+authority refuses it with EIO unless the offset really is EOF, the one condition
+under which the two readings of the request agree. The system never reinterprets
+an offset it cannot disambiguate.
 
 ## Replay and uncertain outcomes
 

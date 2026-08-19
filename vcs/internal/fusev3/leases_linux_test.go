@@ -210,11 +210,13 @@ func TestLeaseCompleteValidatesExactPostStateBeforeDischarge(t *testing.T) {
 	}
 }
 
-func TestStockWriteRefusesObservableAppendFlag(t *testing.T) {
+func TestStockWriteTreatsTheAppendFlagAsPlacementNotRefusal(t *testing.T) {
 	fixture := newStrictFixture(t)
+	// The flag states where the bytes belong, so the request proceeds to ordinary
+	// handle validation instead of being short-circuited.
 	written, status := fixture.raw.writeStock(&fuse.WriteIn{Flags: uint32(syscall.O_APPEND)}, nil)
-	if written != 0 || status != fuse.Status(syscall.EOPNOTSUPP) {
-		t.Fatalf("append FUSE_WRITE = (%d, %v), want EOPNOTSUPP", written, status)
+	if written != 0 || status != fuse.EBADF {
+		t.Fatalf("append FUSE_WRITE on no handle = (%d, %v), want EBADF", written, status)
 	}
 }
 

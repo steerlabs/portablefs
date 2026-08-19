@@ -27,8 +27,8 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		return 0, fuse.EBADF
 	}
 	inode := handleRecord.inode.key.inode
-	shadow, shadowKnown := r.sizes.lookup(inode)
-	placement := resolveAppendPlacement(input.Flags&uint32(syscall.O_APPEND) != 0, input.Offset, shadow, shadowKnown)
+	shadow, shadowKnown, refreshedForHandle := r.sizes.placement(inode, input.Fh)
+	placement := resolveAppendPlacement(input.Flags&uint32(syscall.O_APPEND) != 0, input.Offset, shadow, shadowKnown, refreshedForHandle)
 	if placement.refuse {
 		// Unreachable by construction: the kernel cannot have an i_size for an
 		// inode this mount never described to it. Refusing loudly is the only
