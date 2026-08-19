@@ -1298,6 +1298,15 @@ func (s *resourceAdmissionFaultStore) Lookup(xfsstore.Capability, string) (xfsst
 	}
 	return xfsstore.Capability{}, xfsstore.Attr{}, syscall.ENOENT
 }
+
+// LookupOpen resolves the same names as Lookup. The real volume distinguishes
+// them by which reference names the directory -- an object capability or an
+// open handle -- and this fake holds no directory state to distinguish, so the
+// two answers are deliberately the same. A store embedding this one that models
+// readdir's resolution must override both.
+func (s *resourceAdmissionFaultStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	return s.Lookup(handle, name)
+}
 func (s *resourceAdmissionFaultStore) Forget(xfsstore.Capability) error {
 	s.forget.Add(1)
 	return nil
@@ -2500,6 +2509,12 @@ func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string
 		Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: mode,
 		Nlink: 1, DeviceMinor: 1,
 	}, nil
+}
+
+// Readdir resolves every entry from the open directory handle, so this is the
+// call under test; it answers exactly as this store's Lookup does.
+func (s *readdirPostStabilizationChangeStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	return s.Lookup(handle, name)
 }
 
 func (s *readdirPostStabilizationChangeStore) Identity(item xfsstore.Capability) ([16]byte, error) {

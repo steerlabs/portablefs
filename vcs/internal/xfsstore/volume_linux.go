@@ -684,6 +684,52 @@ func (v *Volume) Lookup(parent Capability, name string) (Capability, Attr, error
 	return v.installObject(fd, nil, identity)
 }
 
+// LookupOpen is Lookup with the directory named by an open handle instead of by
+// the directory's own object capability.
+//
+// Enumerating an open directory must not depend on a reference the open does
+// not itself imply. A frontend that keeps no namespace of its own -- the files
+// gateway is the one in this tree -- reclaims the directory's object capability
+// as soon as it holds the handle, exactly as it does for a file it is about to
+// read. Reading that file keeps working because reads are answered from the
+// handle; readdir was not, so it resolved each entry against a capability the
+// caller had legitimately dropped and failed every page with ErrStaleObject.
+func (v *Volume) LookupOpen(handle Capability, name string) (Capability, Attr, error) {
+	fd, identity, err := v.openChildOfOpen(handle, name)
+	if err != nil {
+		return Capability{}, Attr{}, err
+	}
+	return v.installObject(fd, nil, identity)
+}
+
+// openChildOfOpen is openChild resolved from an open directory handle. The
+// authorization that produced the handle is the same one that produced the
+// object capability it was opened from, so this reaches no name the caller
+// could not already reach.
+func (v *Volume) openChildOfOpen(handle Capability, name string) (int, [16]byte, error) {
+	if err := ValidateComponent(name); err != nil {
+		return -1, [16]byte{}, err
+	}
+	opened, err := v.holdOpen(handle)
+	if err != nil {
+		return -1, [16]byte{}, err
+	}
+	defer opened.release()
+	if opened.kind != KindDirectory {
+		return -1, [16]byte{}, syscall.ENOTDIR
+	}
+	fd, err := openChildAt(opened.fd(), name)
+	if err != nil {
+		return -1, [16]byte{}, err
+	}
+	identity, err := stableIdentityFD(fd, v.productionIdentity)
+	if err != nil {
+		_ = unix.Close(fd)
+		return -1, [16]byte{}, err
+	}
+	return fd, identity, nil
+}
+
 func (v *Volume) Forget(id Capability) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()

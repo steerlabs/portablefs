@@ -74,6 +74,7 @@ type volumeStore interface {
 	SyncFS() error
 	ReadDirOpen(xfsstore.Capability, uint64, [16]byte, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
 	StatOpenDirChild(xfsstore.Capability, string) (xfsstore.Attr, error)
+	LookupOpen(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error)
 	Chmod(xfsstore.Capability, fs.FileMode) error
 	Chown(xfsstore.Capability, int, int) error
 	SetTimes(xfsstore.Capability, *int64, *int64, bool, bool) error
@@ -2017,7 +2018,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					}
 					var conflict bool
 					candidates, budgetExhausted, conflict, err = h.constructDirectoryPage(
-						directory, entries, cookie, body.ReadDir.GetWantItems(), budget,
+						handle, entries, cookie, body.ReadDir.GetWantItems(), budget,
 					)
 					if err != nil {
 						forgetIssued()
@@ -2042,7 +2043,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					if admission != nil {
 						pageSnapshot = admission.SnapshotSequence()
 					} else {
-						waited, snapshot, stabilizeErr := h.stabilizeDirectoryPage(ctx, cred.ID, handle, directory, candidates)
+						waited, snapshot, stabilizeErr := h.stabilizeDirectoryPage(ctx, cred.ID, handle, candidates)
 						if stabilizeErr != nil {
 							h.forgetDirectoryCandidates(candidates)
 							forgetIssued()
@@ -2350,7 +2351,7 @@ func (h *VolumeHandler) forgetDirectoryCandidates(candidates []directoryPageCand
 }
 
 func (h *VolumeHandler) constructDirectoryPage(
-	directory xfsstore.Capability,
+	handle xfsstore.Capability,
 	entries []xfsstore.Dirent,
 	cookie uint64,
 	wantItems bool,
@@ -2362,7 +2363,7 @@ func (h *VolumeHandler) constructDirectoryPage(
 		candidate := directoryPageCandidate{enumerated: entry}
 		attr := xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
 		if entry.Kind != xfsstore.KindOpaque {
-			item, itemAttr, err := h.Store.Lookup(directory, entry.Name)
+			item, itemAttr, err := h.Store.LookupOpen(handle, entry.Name)
 			switch {
 			case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
 				h.forgetDirectoryCandidates(candidates)
@@ -2451,7 +2452,7 @@ func (h *VolumeHandler) revalidateDirectoryPage(
 		if candidate.item == (xfsstore.Capability{}) {
 			continue
 		}
-		item, attr, lookupErr := h.Store.Lookup(directory, candidate.enumerated.Name)
+		item, attr, lookupErr := h.Store.LookupOpen(handle, candidate.enumerated.Name)
 		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
 			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
 			return false, nil
