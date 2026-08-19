@@ -701,12 +701,85 @@ func TestExpiredEnumerationPageIsNotServedAfterResume(t *testing.T) {
 	}
 }
 
-func TestEnumerationPageWithoutRequiredGrantFailsClosed(t *testing.T) {
+// TestEnumerationPageWithoutGrantIsServedUncachedAndRetired pins what an
+// enumeration reply that carries no installable E(dir) grant means. It does not
+// mean the authority broke the protocol -- §2.2 makes the grant a MAY, and this
+// frontend independently declines grants a newer recall's floor, an unfinished
+// local recall, or the family's cache budget has taken out from under it. It
+// means exactly one thing: the reply is uncached.
+//
+// So the page is served, and it is bounded to the kernel callback that fetched
+// it: the next callback retires the buffer and refetches from the authority
+// cookie rather than resuming a page nothing is obliged to withdraw. The second
+// page below is what proves the refetch happened; that the refetch skips and
+// duplicates no name against a real authority is
+// TestPagedReaddirRefusesToPageAcrossARemoteMutation's and the tree-install
+// test's job.
+func TestEnumerationPageWithoutGrantIsServedUncachedAndRetired(t *testing.T) {
 	frontend, _, rpc := testRawFileSystem(t, 8)
 	record, errno := frontend.intern(context.Background(), testItem(96, authoritypb.Attr_DIRECTORY, 96))
 	if errno != 0 {
 		t.Fatal(errno)
 	}
+	rpc.root = cloneItem(record.node.item)
+	first := testDirPage(2, true, func(index int) []byte { return encodeCookie(uint64(index + 1)) })
+	second := testDirPage(1, true, func(index int) []byte { return encodeCookie(uint64(index + 2)) })
+	second.Entries[0].Name = []byte("refetched")
+	fetches := 0
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetReadDir() == nil {
+			return &authoritypb.Response{}, nil
+		}
+		page := first
+		if fetches > 0 {
+			page = second
+		}
+		fetches++
+		return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: proto.Clone(page).(*authoritypb.ReadDirReply)}}, nil
+	}
+	handle := &dirHandle{node: record.node, token: testToken(112)}
+	ctx, finish := testMutationContext(t, frontend.mount)
+	entry, _, errno := handle.peek(ctx, false)
+	finish(errno == 0)
+	if errno != 0 || entry == nil || entry.Name != "a" {
+		t.Fatalf("ungranted READDIR = (%v, %v), want the page served", entry, errno)
+	}
+	if frontend.mount.isRevoked() {
+		t.Fatalf("an ungranted enumeration page revoked the mount: %v", frontend.mount.fatalError())
+	}
+	handle.consume()
+	if !handle.pageUncovered {
+		t.Fatal("a page served without an enumeration grant was not marked uncovered")
+	}
+
+	// The kernel comes back for the rest of the stream. The buffered second
+	// entry of the first page is not what it gets: that page is retired and the
+	// authority is asked again from the cookie this handle actually reached.
+	ctx, finish = testMutationContext(t, frontend.mount)
+	if errno := handle.Seekdir(ctx, entry.Off); errno != 0 {
+		finish(false)
+		t.Fatalf("resume an uncovered enumeration = %v, want acceptance", errno)
+	}
+	next, _, errno := handle.peek(ctx, false)
+	finish(errno == 0)
+	if errno != 0 || next == nil || next.Name != "refetched" {
+		t.Fatalf("second callback on an uncovered stream = (%v, %v), want the refetched page", next, errno)
+	}
+	if fetches != 2 {
+		t.Fatalf("authority READDIRs = %d, want 2: the uncovered page was resumed instead of retired", fetches)
+	}
+}
+
+// TestEnumerationPageForAnItemWithoutAStableIdentityFailsClosed is the
+// enumeration violation that stays terminal, and it must still hand back every
+// capability the refused page carried.
+func TestEnumerationPageForAnItemWithoutAStableIdentityFailsClosed(t *testing.T) {
+	frontend, _, rpc := testRawFileSystem(t, 8)
+	record, errno := frontend.intern(context.Background(), testItem(96, authoritypb.Attr_DIRECTORY, 96))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	record.node.item.StableIdentity = nil
 	page := testDirPage(2, true, func(index int) []byte { return encodeCookie(uint64(index + 1)) })
 	wantReclaims := make([][]byte, len(page.Entries))
 	for index, entry := range page.Entries {
@@ -724,7 +797,7 @@ func TestEnumerationPageWithoutRequiredGrantFailsClosed(t *testing.T) {
 	entry, _, errno := handle.peek(ctx, true)
 	finish(false)
 	if errno != syscall.ENOTCONN || entry != nil || !frontend.mount.isRevoked() {
-		t.Fatalf("READDIR without E grant = (%v, %v, revoked=%t), want terminal ENOTCONN", entry, errno, frontend.mount.isRevoked())
+		t.Fatalf("READDIR for an item with no stable identity = (%v, %v, revoked=%t), want terminal ENOTCONN", entry, errno, frontend.mount.isRevoked())
 	}
 	for _, want := range wantReclaims {
 		if got := popReclaim(t, frontend.mount); !bytes.Equal(got, want) {

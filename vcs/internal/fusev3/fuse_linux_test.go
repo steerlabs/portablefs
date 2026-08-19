@@ -1279,7 +1279,14 @@ func TestOpendirRejectsMalformedOpenReply(t *testing.T) {
 	}
 }
 
-func TestOpendirRequiresEnumerationLease(t *testing.T) {
+// TestOpendirWithoutAnEnumerationLeaseOpensUncached pins the frontend half of
+// the enumeration contract. A grant on a read-side reply is a MAY, not a MUST
+// (docs/portable-coherence.md §2.2), and a directory under sustained mutation
+// is exactly where one is withheld or overtaken by a newer recall's grant
+// floor. An ungranted OPENDIR therefore yields a usable, uncached handle.
+// Requiring the grant here revoked live mounts under an ordinary package
+// install; see TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing.
+func TestOpendirWithoutAnEnumerationLeaseOpensUncached(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
 		if request.GetOpen() != nil {
@@ -1289,10 +1296,39 @@ func TestOpendirRequiresEnumerationLease(t *testing.T) {
 	}
 	directory := &node{mount: mount, item: testItem(8, authoritypb.Attr_DIRECTORY, 8), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
 	ctx, finish := testMutationContext(t, mount)
+	handle, _, errno := directory.OpendirHandle(ctx, syscall.O_RDONLY)
+	finish(errno == 0)
+	if errno != 0 || handle == nil {
+		t.Fatalf("OPENDIR without an E lease = (%v, handle %v), want a usable handle", errno, handle)
+	}
+	if mount.isRevoked() {
+		t.Fatalf("OPENDIR without an E lease revoked the mount: %v", mount.fatalError())
+	}
+	if handle.pageLease != (leaseStamp{}) {
+		t.Fatalf("uncovered directory handle carries lease stamp %+v, want none", handle.pageLease)
+	}
+}
+
+// TestOpendirWithoutAStableIdentityFailsClosed is the violation that remains
+// terminal. An item with no stable identity has no lease coordinate, so no
+// recall could ever reach the stream opened over it; there is no uncached
+// reading of that reply, only a broken one.
+func TestOpendirWithoutAStableIdentityFailsClosed(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetOpen() != nil {
+			return &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: testToken(901)}}}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	item := testItem(8, authoritypb.Attr_DIRECTORY, 8)
+	item.StableIdentity = nil
+	directory := &node{mount: mount, item: item, requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
+	ctx, finish := testMutationContext(t, mount)
 	_, _, errno := directory.OpendirHandle(ctx, syscall.O_RDONLY)
 	finish(false)
 	if errno != syscall.ENOTCONN || !mount.isRevoked() {
-		t.Fatalf("successful OPENDIR without E lease = (%v, revoked=%t), want terminal ENOTCONN", errno, mount.isRevoked())
+		t.Fatalf("OPENDIR of an item with no stable identity = (%v, revoked=%t), want terminal ENOTCONN", errno, mount.isRevoked())
 	}
 }
 
