@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify-local.sh — the repository's single local merge gate.
+# verify-local.sh — the repository's local merge gate.
 #
 # PortableFS is a two-language tree: the Go data plane under vcs/ and the Swift
 # FSKit/app package under swift/PortableFSKit. There is no build system above
@@ -7,11 +7,46 @@
 # plain bash so that it runs identically on a developer Mac and on a Linux CI
 # runner.
 #
-# Run it from anywhere; it operates on the repository root.
+# It has two modes, and the difference is not cosmetic.
+#
+#   default   Everything that runs without Docker and without a privileged
+#             container: cross-platform build and vet, govulncheck, the native
+#             Go suites, the go-fuse reply-ordering seam, the Swift suite on
+#             macOS, workflow/release-trust policy, and the architecture scans.
+#             It does NOT run either real-mount suite. The closing banner names
+#             what it skipped; this mode alone is not merge evidence for a
+#             change to the authority, a frontend, or the coherence protocol.
+#
+#   full      Everything above, plus the two privileged real-mount suites that
+#             CI runs on its ubuntu-24.04 lanes:
+#               scripts/xfs-fuse-integration.sh    (real XFS + real kernel FUSE)
+#               scripts/coherence-matrix-linux.sh  (two real mounts, one volume)
+#             Both need a working Docker daemon and free loop devices. On macOS
+#             they run inside the Docker VM, which is why this is opt-in rather
+#             than the default: the default mode stays fast for macOS-only work.
+#
+#   bash scripts/verify-local.sh            # default (fast, no Docker)
+#   bash scripts/verify-local.sh --full     # + both real-mount suites
+#   VERIFY_LOCAL_FULL=1 bash scripts/verify-local.sh   # same as --full
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+VERIFY_LOCAL_FULL="${VERIFY_LOCAL_FULL:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --full) VERIFY_LOCAL_FULL=1 ;;
+    --help|-h)
+      sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "verify-local: unknown argument: $arg (expected --full)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Login shells initialized by fnm already expose Node.  Non-interactive gate
 # runners do not necessarily source that shell setup, so resolve fnm's explicit
@@ -203,5 +238,47 @@ then
   exit 1
 fi
 
+# 8. The two privileged real-mount suites. These are the only gates in this
+# repository that observe a real kernel FUSE mount against real XFS, so no
+# amount of green from the steps above substitutes for them. They are opt-in
+# locally and mandatory in CI.
+if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "verify-local --full requires docker; none found on PATH" >&2
+    exit 1
+  fi
+
+  step "privileged XFS (prjquota) and kernel FUSE integration suite"
+  bash scripts/xfs-fuse-integration.sh
+
+  step "two-mount cross-mount coherence matrix"
+  bash scripts/coherence-matrix-linux.sh
+
+  echo
+  echo "verify-local: ok (full)"
+  echo "  ran: build/vet, govulncheck, native go suites, go-fuse reply seam,"
+  echo "       Swift suite (macOS host only), workflow/release-trust policy,"
+  echo "       architecture scans, xfs-fuse-integration.sh, coherence-matrix-linux.sh"
+  echo "  still not run locally: the macOS live-mount matrix"
+  echo "       (scripts/coherence-matrix-macos.sh, needs an installed and"
+  echo "       user-enabled FSKit extension), and staging qualification"
+  echo "       (deploy/opensteer/staging-qualification.sh against a live cell)."
+  exit 0
+fi
+
 echo
-echo "verify-local: ok"
+echo "verify-local: ok (default mode) — this is NOT full verification"
+echo
+echo "NOT RUN by this invocation:"
+echo "  - scripts/xfs-fuse-integration.sh   real XFS + real kernel FUSE mounts"
+echo "  - scripts/coherence-matrix-linux.sh two real mounts against one volume"
+if [[ "$(uname -s)" != Darwin ]]; then
+  echo "  - scripts/test-swift-xcode.sh      Xcode-native Swift suite (macOS only)"
+fi
+echo "  - scripts/coherence-matrix-macos.sh live macOS FSKit mount matrix"
+echo "  - deploy/opensteer/staging-qualification.sh real-workload staging corpus"
+echo
+echo "CI runs both privileged Linux suites on its ubuntu-24.04 lanes"
+echo "(linux-xfs-fuse and linux-coherence-matrix in .github/workflows/ci.yml),"
+echo "so a merge is still gated on them. To run them here:"
+echo "  bash scripts/verify-local.sh --full"
