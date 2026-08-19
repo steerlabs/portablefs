@@ -1,4 +1,4 @@
-From 2d8fd82c1b98368643eab763efc1cd31b3c465b6 Mon Sep 17 00:00:00 2001
+From edfa9abf86c2eef0ed805f8731d7afce780371c0 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -8,7 +8,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
  fs/fuse/dev.c             | 168 ++++++++--
- fs/fuse/dir.c             | 544 ++++++++++++++++++++++++++-----
+ fs/fuse/dir.c             | 554 +++++++++++++++++++++++++++-----
  fs/fuse/file.c            | 122 +++++--
  fs/fuse/fuse_i.h          |  52 ++-
  fs/fuse/inode.c           |  75 ++---
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/fuse/readdir.c         | 122 ++++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  71 ++++-
- 10 files changed, 1624 insertions(+), 205 deletions(-)
+ 10 files changed, 1632 insertions(+), 207 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -288,7 +288,7 @@ index b1078aeb7..324832d54 100644
  		fuse_copy_finish(cs);
  		return -EINVAL;
 diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
-index 7ee120772..d35737f43 100644
+index 7ee120772..2cd55ecd5 100644
 --- a/fs/fuse/dir.c
 +++ b/fs/fuse/dir.c
 @@ -184,6 +184,126 @@ static void fuse_lookup_init(struct fuse_conn *fc, struct fuse_args *args,
@@ -742,7 +742,7 @@ index 7ee120772..d35737f43 100644
  	fuse_change_entry_timeout(entry, &outentry);
 -	fuse_dir_changed(dir);
 +	if (!fm->fc->pfs_strict_coherence ||
-+	    get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_LOCAL)
++	    get_fuse_inode(dir)->pfs_class == FUSE_PFS_CLASS_LOCAL)
 +		fuse_dir_changed(dir);
  	err = generic_file_open(inode, file);
  	if (!err) {
@@ -813,7 +813,7 @@ index 7ee120772..d35737f43 100644
  	}
 -	fuse_dir_changed(dir);
 +	if (!fm->fc->pfs_strict_coherence ||
-+	    get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_LOCAL)
++	    get_fuse_inode(dir)->pfs_class == FUSE_PFS_CLASS_LOCAL)
 +		fuse_dir_changed(dir);
  	return 0;
  
@@ -838,7 +838,7 @@ index 7ee120772..d35737f43 100644
  
  	if (fuse_is_bad(dir))
  		return -EIO;
-@@ -1144,19 +1403,33 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
+@@ -1144,19 +1403,34 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
  	args.in_numargs = 1;
  	args.in_args[0].size = entry->d_name.len + 1;
  	args.in_args[0].value = entry->d_name.name;
@@ -868,13 +868,14 @@ index 7ee120772..d35737f43 100644
 +				fuse_abort_conn(fm->fc);
 +				return -ENOTCONN;
 +			}
-+		} else {
++		} else if (!fm->fc->pfs_strict_coherence ||
++			   get_fuse_inode(dir)->pfs_class == FUSE_PFS_CLASS_LOCAL) {
 +			fuse_dir_changed(dir);
 +		}
  		fuse_entry_unlinked(entry);
  	} else if (err == -EINTR || err == -ENOENT)
  		fuse_invalidate_entry(entry);
-@@ -1168,6 +1441,7 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
+@@ -1168,6 +1442,7 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
  	int err;
  	struct fuse_mount *fm = get_fuse_mount(dir);
  	FUSE_ARGS(args);
@@ -882,7 +883,7 @@ index 7ee120772..d35737f43 100644
  
  	if (fuse_is_bad(dir))
  		return -EIO;
-@@ -1177,25 +1451,54 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
+@@ -1177,25 +1452,55 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
  	args.in_numargs = 1;
  	args.in_args[0].size = entry->d_name.len + 1;
  	args.in_args[0].value = entry->d_name.name;
@@ -912,7 +913,8 @@ index 7ee120772..d35737f43 100644
 +				fuse_abort_conn(fm->fc);
 +				return -ENOTCONN;
 +			}
-+		} else {
++		} else if (!fm->fc->pfs_strict_coherence ||
++			   get_fuse_inode(dir)->pfs_class == FUSE_PFS_CLASS_LOCAL) {
 +			fuse_dir_changed(dir);
 +		}
  		fuse_entry_unlinked(entry);
@@ -939,7 +941,7 @@ index 7ee120772..d35737f43 100644
  static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, struct dentry *oldent,
  			      struct inode *newdir, struct dentry *newent,
  			      unsigned int flags, int opcode, size_t argsize)
-@@ -1204,6 +1507,7 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
+@@ -1204,6 +1509,7 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
  	struct fuse_rename2_in inarg;
  	struct fuse_mount *fm = get_fuse_mount(olddir);
  	FUSE_ARGS(args);
@@ -947,7 +949,7 @@ index 7ee120772..d35737f43 100644
  
  	if (fm->fc->pfs_strict_coherence &&
  	    ((d_really_is_positive(newent) &&
-@@ -1225,27 +1529,49 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
+@@ -1225,27 +1531,53 @@ static int fuse_rename_common(struct mnt_idmap *idmap, struct inode *olddir, str
  	args.in_args[1].value = oldent->d_name.name;
  	args.in_args[2].size = newent->d_name.len + 1;
  	args.in_args[2].value = newent->d_name.name;
@@ -969,6 +971,13 @@ index 7ee120772..d35737f43 100644
  	if (!err) {
 -		/* ctime changes */
 -		fuse_update_ctime(d_inode(oldent));
+-
+-		if (flags & RENAME_EXCHANGE)
+-			fuse_update_ctime(d_inode(newent));
+-
+-		fuse_dir_changed(olddir);
+-		if (olddir != newdir)
+-			fuse_dir_changed(newdir);
 +		if (args.pfs_publish_policy == FUSE_PFS_PUBLISH_REQUIRE_SUCCESS) {
 +			struct inode *inodes[FUSE_PFS_MAX_OBJECTS];
 +			unsigned int inode_count = 0;
@@ -989,23 +998,22 @@ index 7ee120772..d35737f43 100644
 +		} else {
 +			/* ctime changes */
 +			fuse_update_ctime(d_inode(oldent));
- 
--		if (flags & RENAME_EXCHANGE)
--			fuse_update_ctime(d_inode(newent));
++
 +			if (flags & RENAME_EXCHANGE)
 +				fuse_update_ctime(d_inode(newent));
- 
--		fuse_dir_changed(olddir);
--		if (olddir != newdir)
--			fuse_dir_changed(newdir);
-+			fuse_dir_changed(olddir);
-+			if (olddir != newdir)
++
++			if (!fm->fc->pfs_strict_coherence ||
++			    get_fuse_inode(olddir)->pfs_class == FUSE_PFS_CLASS_LOCAL)
++				fuse_dir_changed(olddir);
++			if (olddir != newdir &&
++			    (!fm->fc->pfs_strict_coherence ||
++			     get_fuse_inode(newdir)->pfs_class == FUSE_PFS_CLASS_LOCAL))
 +				fuse_dir_changed(newdir);
 +		}
  
  		/* newent will end up negative */
  		if (!(flags & RENAME_EXCHANGE) && d_really_is_positive(newent))
-@@ -1330,7 +1656,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
+@@ -1330,7 +1662,7 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
  	args.in_args[1].size = newent->d_name.len + 1;
  	args.in_args[1].value = newent->d_name.name;
  	err = create_new_entry(&invalid_mnt_idmap, fm, &args, newdir, newent, inode->i_mode);
@@ -1014,7 +1022,7 @@ index 7ee120772..d35737f43 100644
  		fuse_update_ctime_in_cache(inode);
  	else if (err == -EINTR)
  		fuse_invalidate_attr(inode);
-@@ -1470,6 +1796,7 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1470,6 +1802,7 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
  	int err;
  	struct fuse_getattr_in inarg;
  	struct fuse_attr_out outarg;
@@ -1022,7 +1030,7 @@ index 7ee120772..d35737f43 100644
  	struct fuse_mount *fm = get_fuse_mount(inode);
  	FUSE_ARGS(args);
  	u64 attr_version;
-@@ -1493,12 +1820,18 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1493,12 +1826,18 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
  	args.out_numargs = 1;
  	args.out_args[0].size = sizeof(outarg);
  	args.out_args[0].value = &outarg;
@@ -1042,7 +1050,7 @@ index 7ee120772..d35737f43 100644
  	fs_reply_publish_scope_enter(&publish_scope, inode->i_sb);
  	err = fuse_simple_request(fm, &args);
  	if (!err) {
-@@ -1507,9 +1840,17 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1507,9 +1846,17 @@ static int fuse_do_getattr(struct mnt_idmap *idmap, struct inode *inode,
  			fuse_make_bad(inode);
  			err = -EIO;
  		} else {
@@ -1063,7 +1071,7 @@ index 7ee120772..d35737f43 100644
  				err = -ENOTCONN;
  			else if (stat)
  				fuse_fillattr(idmap, inode, &outarg.attr, stat);
-@@ -1545,7 +1886,9 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1545,7 +1892,9 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
  	else if (request_mask & inval_mask & ~cache_mask)
  		sync = true;
  	else
@@ -1074,7 +1082,7 @@ index 7ee120772..d35737f43 100644
  
  	if (sync) {
  		forget_all_cached_acls(inode);
-@@ -1569,6 +1912,9 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
+@@ -1569,6 +1918,9 @@ static int fuse_update_get_attr(struct mnt_idmap *idmap, struct inode *inode,
  			stat->result_mask |= STATX_BTIME;
  		}
  	}
@@ -1084,7 +1092,7 @@ index 7ee120772..d35737f43 100644
  
  	return err;
  }
-@@ -1588,15 +1934,16 @@ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
+@@ -1588,15 +1940,16 @@ int fuse_update_attributes(struct inode *inode, struct file *file, u32 mask)
   * event, but does not clear nlink or detach mounts for a mutation performed on
   * another machine.
   */
@@ -1106,7 +1114,7 @@ index 7ee120772..d35737f43 100644
  
  	parent = fuse_ilookup(fc, parent_nodeid, NULL);
  	if (!parent)
-@@ -1606,15 +1953,17 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
+@@ -1606,15 +1959,17 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
  		err = -EPROTO;
  		goto out_parent;
  	}
@@ -1126,7 +1134,7 @@ index 7ee120772..d35737f43 100644
  
  	spin_lock(&entry->d_lock);
  	child = d_inode(entry);
-@@ -1627,21 +1976,28 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
+@@ -1627,21 +1982,28 @@ static int fuse_pfs_reverse_expire_entry(struct fuse_conn *fc,
  		goto out_entry;
  	}
  
@@ -1158,7 +1166,7 @@ index 7ee120772..d35737f43 100644
  out_parent:
  	iput(parent);
  	return err;
-@@ -1656,8 +2012,7 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
+@@ -1656,8 +2018,7 @@ int fuse_reverse_inval_entry(struct fuse_conn *fc, u64 parent_nodeid,
  	struct dentry *entry;
  
  	if (fc->pfs_strict_coherence)
@@ -1168,7 +1176,7 @@ index 7ee120772..d35737f43 100644
  
  	parent = fuse_ilookup(fc, parent_nodeid, NULL);
  	if (!parent)
-@@ -1828,7 +2183,6 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1828,7 +2189,6 @@ static int fuse_permission(struct mnt_idmap *idmap,
  
  	if (!fuse_allow_current_process(fc))
  		return -EACCES;
@@ -1176,7 +1184,7 @@ index 7ee120772..d35737f43 100644
  	/*
  	 * If attributes are needed, refresh them before proceeding
  	 */
-@@ -1838,7 +2192,9 @@ static int fuse_permission(struct mnt_idmap *idmap,
+@@ -1838,7 +2198,9 @@ static int fuse_permission(struct mnt_idmap *idmap,
  		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
  
  		if (perm_mask & READ_ONCE(fi->inval_mask) ||
@@ -1187,7 +1195,7 @@ index 7ee120772..d35737f43 100644
  			refreshed = true;
  
  			err = fuse_perm_getattr(inode, mask);
-@@ -2218,6 +2574,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2218,6 +2580,7 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  	FUSE_ARGS(args);
  	struct fuse_setattr_in inarg;
  	struct fuse_attr_out outarg;
@@ -1195,7 +1203,7 @@ index 7ee120772..d35737f43 100644
  	bool is_truncate = false;
  	bool is_wb = fc->writeback_cache && S_ISREG(inode->i_mode);
  	loff_t oldsize;
-@@ -2315,11 +2672,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2315,11 +2678,14 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  
  	attr_version = fuse_get_attr_version(fm->fc);
  	fuse_setattr_fill(fc, &args, inode, &inarg, &outarg);
@@ -1211,7 +1219,7 @@ index 7ee120772..d35737f43 100644
  	err = fuse_simple_request(fm, &args);
  	if (err) {
  		if (err == -EINTR)
-@@ -2338,6 +2698,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+@@ -2338,6 +2704,28 @@ static int __fuse_do_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
  		err = -ENOTCONN;
  		goto error;
  	}

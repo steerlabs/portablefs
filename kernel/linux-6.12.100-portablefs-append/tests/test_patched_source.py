@@ -529,6 +529,66 @@ class PatchedSourceTests(unittest.TestCase):
         )
         self.assertNotIn("fuse_reverse_inval_inode", notify)
 
+    def test_local_mutations_invalidate_only_local_parent_directories(
+        self,
+    ) -> None:
+        text = self.source("fs/fuse/dir.c")
+
+        create_open = text[
+            text.index("static int fuse_create_open"):
+            text.index("static int fuse_atomic_open")
+        ]
+        create_tail = create_open[create_open.index("d_instantiate(entry, inode)"):]
+        self.assertIn(
+            "get_fuse_inode(dir)->pfs_class == FUSE_PFS_CLASS_LOCAL",
+            create_tail,
+        )
+        self.assertNotIn(
+            "get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_LOCAL",
+            create_tail,
+        )
+
+        new_entry = text[
+            text.index("static int create_new_entry"):
+            text.index("static int fuse_mknod", text.index("static int create_new_entry"))
+        ]
+        self.assertIn(
+            "get_fuse_inode(dir)->pfs_class == FUSE_PFS_CLASS_LOCAL",
+            new_entry,
+        )
+        self.assertNotIn(
+            "get_fuse_inode(inode)->pfs_class == FUSE_PFS_CLASS_LOCAL",
+            new_entry,
+        )
+
+        unlink = text[
+            text.index("static int fuse_unlink"):
+            text.index("static int fuse_rmdir")
+        ]
+        rmdir = text[
+            text.index("static int fuse_rmdir"):
+            text.index("static void fuse_pfs_add_post_inode")
+        ]
+        for removal in (unlink, rmdir):
+            self.assertIn("else if (!fm->fc->pfs_strict_coherence ||", removal)
+            self.assertIn(
+                "get_fuse_inode(dir)->pfs_class == FUSE_PFS_CLASS_LOCAL",
+                removal,
+            )
+
+        rename = text[
+            text.index("static int fuse_rename_common"):
+            text.index("static int fuse_rename2")
+        ]
+        self.assertIn(
+            "get_fuse_inode(olddir)->pfs_class == FUSE_PFS_CLASS_LOCAL",
+            rename,
+        )
+        self.assertIn(
+            "get_fuse_inode(newdir)->pfs_class == FUSE_PFS_CLASS_LOCAL",
+            rename,
+        )
+
     def test_post_state_installer_snapshots_before_stores_and_invalidates_range(
         self,
     ) -> None:
