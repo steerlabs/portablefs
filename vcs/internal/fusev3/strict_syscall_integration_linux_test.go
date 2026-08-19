@@ -5,7 +5,10 @@ package fusev3
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -209,28 +212,57 @@ func TestStrictKernelSharedFallocateMutations(t *testing.T) {
 		requireExactFile(t, f.join(1, "zero"), want, "zeroed file through peer mount")
 	})
 
-	t.Run("collapse range", func(t *testing.T) {
-		file, initial := newFile(t, "collapse", 6)
-		requireFallocate(t, file, unix.FALLOC_FL_COLLAPSE_RANGE, int64(2*block), int64(block), "collapse aligned interior range")
-		want := append(append([]byte(nil), initial[:2*block]...), initial[3*block:]...)
-		requireExactFile(t, f.join(1, "collapse"), want, "collapsed file through peer mount")
-	})
+	// Stock Linux forwards exactly KEEP_SIZE, PUNCH_HOLE, and ZERO_RANGE to a
+	// FUSE server: fuse_file_fallocate refuses every other mode with EOPNOTSUPP
+	// before the request is built, so no userspace filesystem on this profile can
+	// deliver COLLAPSE_RANGE, INSERT_RANGE, or UNSHARE_RANGE however much its
+	// backing store supports them. The authority and its XFS do implement all
+	// three -- the control below proves it on the same filesystem -- and the mode
+	// still never reaches them, which is why this is the kernel interface's
+	// boundary rather than a gap in the write path. Each refusal is pinned to
+	// zero authority requests so a future PortableFS-side refusal, which would be
+	// a real regression, cannot hide behind the same errno.
+	for _, test := range []struct {
+		name   string
+		mode   uint32
+		blocks int
+	}{
+		{name: "collapse range", mode: unix.FALLOC_FL_COLLAPSE_RANGE, blocks: 6},
+		{name: "insert range", mode: unix.FALLOC_FL_INSERT_RANGE, blocks: 5},
+		{name: "unshare range", mode: unix.FALLOC_FL_UNSHARE_RANGE | unix.FALLOC_FL_KEEP_SIZE, blocks: 4},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			name := strings.ReplaceAll(test.name, " ", "-")
+			file, initial := newFile(t, name, test.blocks)
+			var err error
+			requests := f.countRequests("fallocate", func() {
+				err = unix.Fallocate(int(file.Fd()), test.mode, int64(2*block), int64(block))
+			})
+			if !errors.Is(err, syscall.EOPNOTSUPP) {
+				t.Fatalf("fallocate mode %#o through the strict mount = %v, want EOPNOTSUPP from the kernel", test.mode, err)
+			}
+			if requests != 0 {
+				t.Fatalf("the refused mode %#o still reached the authority %d times", test.mode, requests)
+			}
+			requireExactFile(t, f.join(1, name), initial, "file the refused mode must have left alone")
 
-	t.Run("insert range", func(t *testing.T) {
-		file, initial := newFile(t, "insert", 5)
-		requireFallocate(t, file, unix.FALLOC_FL_INSERT_RANGE, int64(2*block), int64(block), "insert aligned interior range")
-		want := make([]byte, 0, len(initial)+block)
-		want = append(want, initial[:2*block]...)
-		want = append(want, make([]byte, block)...)
-		want = append(want, initial[2*block:]...)
-		requireExactFile(t, f.join(1, "insert"), want, "inserted file through peer mount")
-	})
-
-	t.Run("unshare range", func(t *testing.T) {
-		file, initial := newFile(t, "unshare", 4)
-		requireFallocate(t, file, unix.FALLOC_FL_UNSHARE_RANGE|unix.FALLOC_FL_KEEP_SIZE, 0, int64(len(initial)), "unshare complete allocated range")
-		requireExactFile(t, f.join(1, "unshare"), initial, "unshared file through peer mount")
-	})
+			// The control runs the same mode against the same XFS through a file
+			// the volume never publishes, so nothing here is a mutation behind the
+			// authority's back.
+			controlPath := filepath.Join(f.writeStagingRoot, name+"-control")
+			control := mustOpenFile(t, controlPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+			defer func() {
+				_ = control.Close()
+				_ = os.Remove(controlPath)
+			}()
+			if _, err := control.Write(deterministicIntegrationData(test.blocks*block, 7)); err != nil {
+				t.Fatalf("seed the backing-XFS control file: %v", err)
+			}
+			if err := unix.Fallocate(int(control.Fd()), test.mode, int64(2*block), int64(block)); err != nil {
+				t.Fatalf("fallocate mode %#o directly on the backing XFS: %v (this mode is meant to be supported there)", test.mode, err)
+			}
+		})
+	}
 }
 
 func TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
@@ -274,6 +306,14 @@ func TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
 	mustMkdir(t, f.join(0, "local"))
 	mustWrite(t, f.join(0, "local", "machine"), []byte("local"), 0o600)
 	local := mustOpenFile(t, f.join(0, "local", "machine"), os.O_RDWR, 0)
+	// A copy that spans the two classes is never one authority operation: the
+	// classes have no shared backing store to copy inside. The daemon answers
+	// EXDEV, and stock Linux does not hand that to userspace --
+	// vfs_copy_file_range retries EXDEV and EOPNOTSUPP through its own generic
+	// read/write path -- so the syscall completes as ordinary I/O across the
+	// boundary, exactly what cp(1) would have done. The contract worth pinning is
+	// therefore the one that is observable and that matters: the authority is
+	// never asked to copy into or out of a machine-local object.
 	for _, test := range []struct {
 		name string
 		in   *os.File
@@ -282,10 +322,17 @@ func TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary(t *testing.T) {
 		{name: "SHARED to LOCAL", in: source, out: local},
 		{name: "LOCAL to SHARED", in: local, out: destination},
 	} {
-		offIn, offOut := int64(0), int64(0)
-		copied, err := unix.CopyFileRange(int(test.in.Fd()), &offIn, int(test.out.Fd()), &offOut, 1, 0)
-		if copied != -1 || !errors.Is(err, syscall.EXDEV) {
-			t.Fatalf("%s copy_file_range = (%d, %v), want (-1, EXDEV)", test.name, copied, err)
+		var copied int
+		var copyErr error
+		requests := f.countRequests("copy-file-range", func() {
+			offIn, offOut := int64(0), int64(0)
+			copied, copyErr = unix.CopyFileRange(int(test.in.Fd()), &offIn, int(test.out.Fd()), &offOut, 1, 0)
+		})
+		if copyErr != nil || copied != 1 {
+			t.Fatalf("%s copy_file_range = (%d, %v), want (1, nil) through the kernel's generic fallback", test.name, copied, copyErr)
+		}
+		if requests != 0 {
+			t.Fatalf("%s copy_file_range reached the authority %d times; the graft boundary must refuse the accelerated path", test.name, requests)
 		}
 	}
 }
@@ -305,8 +352,18 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	requireSyscallWrite(t, "write linkable O_TMPFILE", func() (int, error) {
 		return unix.Write(linkable, payload)
 	}, len(payload))
+	// linkat(2) with AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH, which the
+	// production data-plane identity does not have and must not be given. The
+	// kernel refuses it in do_linkat before any filesystem is consulted, so the
+	// refusal says nothing about this mount, and the capability-free idiom
+	// open(2) documents for O_TMPFILE -- /proc/self/fd/<n> with AT_SYMLINK_FOLLOW
+	// -- is the one that has to work.
+	if err := unix.Linkat(linkable, "", unix.AT_FDCWD, f.join(0, "empty-path-tmpfile"), unix.AT_EMPTY_PATH); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("unprivileged AT_EMPTY_PATH link = %v, want ENOENT from the kernel", err)
+	}
+	requireAbsent(t, f.join(1, "empty-path-tmpfile"), "AT_EMPTY_PATH link the kernel refused")
 	linked := f.join(0, "linked-tmpfile")
-	if err := unix.Linkat(linkable, "", unix.AT_FDCWD, linked, unix.AT_EMPTY_PATH); err != nil {
+	if err := unix.Linkat(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", linkable), unix.AT_FDCWD, linked, unix.AT_SYMLINK_FOLLOW); err != nil {
 		t.Fatalf("first link of O_TMPFILE: %v", err)
 	}
 	requireExactFile(t, f.join(1, "linked-tmpfile"), payload, "linked O_TMPFILE through peer mount")
@@ -320,7 +377,9 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 			t.Errorf("close exclusive O_TMPFILE: %v", err)
 		}
 	})
-	err = unix.Linkat(exclusive, "", unix.AT_FDCWD, f.join(0, "must-not-link"), unix.AT_EMPTY_PATH)
+	// Same idiom, so the refusal here is the O_EXCL tmpfile's own unlinkability
+	// rather than a missing capability: the kernel never marks it I_LINKABLE.
+	err = unix.Linkat(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", exclusive), unix.AT_FDCWD, f.join(0, "must-not-link"), unix.AT_SYMLINK_FOLLOW)
 	if !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("link O_EXCL O_TMPFILE = %v, want ENOENT", err)
 	}

@@ -416,6 +416,35 @@ validates exact post-state for reply construction and recall ordering, but v1
 does not retain it as cache state after recall-to-none; kernel invalidations
 follow §3.3.
 
+**Three stock-kernel boundaries** on these operations. None is a PortableFS
+policy: in each case the kernel decides before or after the daemon is consulted,
+and the authority's XFS implements the operation the daemon never gets to
+perform. Each is pinned by name in `TestStrictKernelSharedFallocateMutations`,
+`TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary`, and
+`TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable`.
+
+1. **`fallocate` modes.** `fuse_file_fallocate` forwards only `KEEP_SIZE`,
+   `PUNCH_HOLE`, and `ZERO_RANGE`, refusing every other mode with `EOPNOTSUPP`
+   before a request exists. `COLLAPSE_RANGE`, `INSERT_RANGE`, and
+   `UNSHARE_RANGE` therefore cannot be delivered on this profile, although the
+   authority and its XFS support all three. The tests pin the refusal to zero
+   authority requests so a PortableFS-side refusal could not hide behind the
+   same errno.
+2. **Cross-class `copy_file_range`.** A copy spanning a LOCAL route and the
+   shared volume has no common backing store, so the daemon answers `EXDEV`.
+   Stock `vfs_copy_file_range` retries `EXDEV`/`EOPNOTSUPP` through its own
+   generic read/write path, so userspace observes an ordinary successful copy —
+   the same bytes `cp(1)` would move. The contract is that the authority is
+   never asked to copy into or out of a machine-local object, not that the
+   syscall fails.
+3. **`linkat(AT_EMPTY_PATH)` on `O_TMPFILE`.** `do_linkat` requires
+   `CAP_DAC_READ_SEARCH` for a null name and returns `ENOENT` without consulting
+   any filesystem. The data plane runs unprivileged by design, so the supported
+   first link is the capability-free idiom `open(2)` documents:
+   `/proc/self/fd/<n>` with `AT_SYMLINK_FOLLOW`. That path works, and an
+   `O_TMPFILE` opened `O_EXCL` still refuses it, because the kernel never marks
+   that inode `I_LINKABLE`.
+
 ---
 
 ## 5. Metadata and namespace path

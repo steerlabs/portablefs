@@ -35,6 +35,15 @@ this file is the human-curated summary.
 
 ### Changed
 
+- Name the three stock-kernel boundaries on the Linux range and link surfaces
+  instead of leaving them as unexplained failures, each pinned by test:
+  `fallocate` `COLLAPSE_RANGE`/`INSERT_RANGE`/`UNSHARE_RANGE` are refused by
+  `fuse_file_fallocate` before any request exists, a `copy_file_range` spanning a
+  machine-local route and the shared volume is refused as `EXDEV` and then
+  completed by the kernel's own generic read/write fallback, and the first link
+  of an `O_TMPFILE` uses the capability-free `/proc/self/fd` idiom because
+  `linkat(AT_EMPTY_PATH)` needs `CAP_DAC_READ_SEARCH` the data plane does not
+  have. `docs/portable-coherence.md` §4.4 records all three.
 - Ship the named macOS 26 FSKit best-effort cache tier over protocol 5. One
   active Mac owns an authority-enforced compatibility writer lease; Linux peers
   remain readable but their visible mutations return `EBUSY` before storage,
