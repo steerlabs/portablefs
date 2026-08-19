@@ -54,6 +54,46 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# macOS ships no GNU `timeout`, so each xcodebuild invocation is bounded here by
+# a plain background-and-timed-wait. Output streams through untouched and the
+# child's own exit status is preserved. The child is started in its own process
+# group so that on expiry the whole xcodebuild tree dies with it; the script
+# then continues, which is the point: a hang leaves the retained work_root with
+# the result bundle and diagnostics instead of the job being SIGKILLed by
+# GitHub's job timeout with nothing to read.
+#
+# Both budgets sit well below the swift-xcode-native job's timeout-minutes.
+enumerate_timeout_seconds=360
+execute_timeout_seconds=720
+
+run_bounded() {
+  local limit="$1" label="$2"
+  shift 2
+  local pid deadline status
+
+  set -m
+  "$@" &
+  pid=$!
+  set +m
+
+  deadline=$((SECONDS + limit))
+  while kill -0 "$pid" 2>/dev/null; do
+    if ((SECONDS >= deadline)); then
+      echo "test-swift-xcode: $label exceeded ${limit}s; terminating" >&2
+      kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      sleep 10
+      kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    sleep 1
+  done
+
+  status=0
+  wait "$pid" || status=$?
+  return "$status"
+}
+
 derived_data="$work_root/DerivedData"
 enumeration="$work_root/enumerated-tests.json"
 result_bundle="$work_root/PortableFSKit.xcresult"
@@ -70,8 +110,7 @@ common=(
 
 PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/scripts/test_verify_xcode_tests.py"
 
-echo "test-swift-xcode: Xcode-native enumeration ($destination)"
-(
+enumerate_tests() {
   cd "$package_path"
   xcodebuild "${common[@]}" \
     -enumerate-tests \
@@ -79,15 +118,20 @@ echo "test-swift-xcode: Xcode-native enumeration ($destination)"
     -test-enumeration-format json \
     -test-enumeration-output-path "$enumeration" \
     test
-)
+}
+
+execute_tests() {
+  cd "$package_path"
+  xcodebuild "${common[@]}" -resultBundlePath "$result_bundle" test-without-building
+}
+
+echo "test-swift-xcode: Xcode-native enumeration ($destination)"
+run_bounded "$enumerate_timeout_seconds" "enumeration" enumerate_tests
 python3 "$repo_root/scripts/verify_xcode_tests.py" --enumeration "$enumeration"
 
 echo "test-swift-xcode: Xcode-native single-process execution"
 set +e
-(
-  cd "$package_path"
-  xcodebuild "${common[@]}" -resultBundlePath "$result_bundle" test-without-building
-)
+run_bounded "$execute_timeout_seconds" "test execution" execute_tests
 xcode_status=$?
 set -e
 

@@ -17,6 +17,7 @@ concurrency:
 jobs:
   validate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -71,6 +72,7 @@ jobs:
   goreleaser:
     needs: validate
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     # Gates publishing behind the `release` GitHub environment. Required
     # reviewers / deployment branch+tag policies must be configured on that
     # environment in the repository settings.
@@ -94,6 +96,8 @@ jobs:
         run: |
           set -euo pipefail
           status="$(curl -sS \
+            --connect-timeout 10 \
+            --max-time 60 \
             -o "$RUNNER_TEMP/existing-release.json" \
             -w '%{http_code}' \
             -H "Accept: application/vnd.github+json" \
@@ -206,6 +210,10 @@ jobs:
   macos-app:
     needs: [validate, goreleaser]
     runs-on: macos-26
+    # Must exceed the 2h `notarytool --wait --timeout 2h` in
+    # scripts/package-macos-app.sh so the notary wait reports its own timeout
+    # instead of the job being hard-killed mid-submission.
+    timeout-minutes: 150
     environment: release
     permissions:
       contents: write # upload the notarized app to the draft release
@@ -428,6 +436,7 @@ jobs:
   publish:
     needs: [validate, goreleaser, macos-app]
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     environment: release
     permissions:
       contents: write
