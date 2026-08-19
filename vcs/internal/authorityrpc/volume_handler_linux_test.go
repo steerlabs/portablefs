@@ -169,7 +169,7 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-			CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+			CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -1582,7 +1582,7 @@ func retiredMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.
 	terminal := make(chan struct{})
 	t.Cleanup(func() { close(terminal) })
 	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1657,7 +1657,7 @@ func retiredMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *tes
 	terminal := make(chan struct{})
 	t.Cleanup(func() { close(terminal) })
 	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}

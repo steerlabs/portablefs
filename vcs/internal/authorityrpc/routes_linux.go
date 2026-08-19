@@ -614,12 +614,6 @@ func namespaceRepair(repair authoritypb.NamespaceRepair) (volumeserver.Namespace
 	switch repair {
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED:
 		return volumeserver.NamespaceRepairUnspecified, nil
-	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE:
-		// Protocol 6 keeps the numeric value parseable so an unsupported peer receives
-		// an explicit refusal. It is never admitted: stock FUSE parent-i_rwsem
-		// repair required an application-visible synthetic EINTR to break its
-		// lock cycle, which is not part of the strict contract.
-		return volumeserver.NamespaceRepairUnspecified, syscall.EOPNOTSUPP
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT:
 		return volumeserver.NamespaceRepairIndependent, nil
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED:

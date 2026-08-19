@@ -71,7 +71,7 @@ func (f *fakeV3VisibilityClient) AckVisibilityWithContention(_ context.Context, 
 	f.contention = append(f.contention, contended)
 	return nil
 }
-func (f *fakeV3VisibilityClient) ReportVisibilityBlocked(_ context.Context, cursor *authoritypb.VisibilityCursor, _ []uint64) error {
+func (f *fakeV3VisibilityClient) ReportVisibilityBlocked(_ context.Context, cursor *authoritypb.VisibilityCursor) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.blocked = append(f.blocked, cloneAuthorityCursor(cursor))

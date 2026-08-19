@@ -55,8 +55,8 @@ var (
 	// mutation that would prevent this participant from discharging a pending
 	// repair. That is volume-wide for the frozen callback-serialized profile;
 	// the pipelined profile exempts only a distinct, exactly identified source
-	// callback. Parent-exclusive repair is scoped to an overlapping held parent.
-	// The caller may retry after the phase; no filesystem mutation was executed.
+	// callback. The caller may retry after the phase; no filesystem mutation
+	// was executed.
 	ErrVisibilityInterrupted = errors.New("volumeserver: visible mutation interrupted by this participant's pending cache repair")
 	// ErrCompatibilityWriterLease is a definite pre-apply refusal while an
 	// active macOS 26 callback-serialized participant owns the volume's
@@ -113,11 +113,6 @@ const (
 	// NamespaceRepairUnspecified is refused. A strict mount that does not say
 	// how it repairs has not agreed to the contract the barrier is built on.
 	NamespaceRepairUnspecified NamespaceRepair = iota
-	// NamespaceRepairParentExclusive is the retired stock-FUSE model. Protocol
-	// 5 no longer admits it because its cycle break exposed synthetic EINTR to
-	// ordinary applications. The value remains parseable only so an old client
-	// receives an explicit commitment refusal instead of being misclassified.
-	NamespaceRepairParentExclusive
 	// NamespaceRepairIndependent means repair never waits on a lock this
 	// mount's own unanswered operation can hold.
 	NamespaceRepairIndependent
@@ -572,16 +567,7 @@ type visibilityParticipant struct {
 	// across both phases. A second disjoint mutation may run concurrently when
 	// its audience differs, but cannot insert PREPARE between this barrier's
 	// PREPARE and COMPLETE on the same participant.
-	barrier uint64
-	// interrupt is installed only after a parent-exclusive frontend confirms
-	// from its exact cache registry that its pending COMPLETE needs a parent
-	// currently held by one of its own unanswered mutations. It stays active
-	// through Ack so a new request cannot recreate the cycle while repair runs.
-	interrupt *visibilityInterruption
-	// reported retains the last accepted report after Ack. It is not an active
-	// scope; it only makes a response-lost retry of that exact report
-	// idempotent instead of turning a completed repair into a cursor violation.
-	reported *visibilityInterruption
+	barrier  uint64
 	acked    VisibilityCursor
 	changed  chan struct{}
 	terminal <-chan struct{}
@@ -593,12 +579,6 @@ type visibilityParticipant struct {
 	index               *resolvedIndex
 	repair              NamespaceRepair
 	compatibilityWriter bool
-}
-
-type visibilityInterruption struct {
-	cursor       VisibilityCursor
-	parents      map[[16]byte]struct{}
-	kernelInodes map[uint64]struct{}
 }
 
 // mutationFairnessDebt is an off-list, one-shot effective per-key FIFO
@@ -1109,13 +1089,12 @@ func (c *VisibilityCoordinator) ValidateCommitment(commitment VisibilityCommitme
 	case commitment.RepairBudget > c.cfg.MaxRepairBudget:
 		refusal = fmt.Errorf("%w: mount declared repair budget %s, authority admits at most %s",
 			ErrVisibilityProfile, commitment.RepairBudget, c.cfg.MaxRepairBudget)
-	case commitment.NamespaceRepair != NamespaceRepairParentExclusive &&
-		commitment.NamespaceRepair != NamespaceRepairIndependent &&
+	case commitment.NamespaceRepair != NamespaceRepairIndependent &&
 		commitment.NamespaceRepair != NamespaceRepairCallbackSerialized &&
 		commitment.NamespaceRepair != NamespaceRepairCallbackSerializedPipelined:
 		// There is no default here on purpose. Assuming "independent" would let
 		// the authority wait out a proven cycle as though it were a slow lock;
-		// assuming "parent-exclusive" would fence a mount that could have
+		// assuming a serialized model would interrupt a mount that could have
 		// repaired. Both are worse than refusing a mount that did not say.
 		refusal = fmt.Errorf("%w: mount declared an unsupported namespace-repair model; a strict mount must state callback-serialized, callback-serialized-pipelined, or independent",
 			ErrVisibilityProfile)
@@ -1332,7 +1311,7 @@ func (d DependencyDeclaration) Release() {
 // that wait. What bounds it instead is the per-participant repair budget.
 func (c *VisibilityCoordinator) Execute(ctx context.Context, source SessionID, mutation MutationID, dependencies MutationDependencies,
 	prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool)) error {
-	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, nil, prepare,
+	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil)
 }
 
@@ -1345,18 +1324,8 @@ func (c *VisibilityCoordinator) ExecuteFromExternalSource(ctx context.Context, s
 	if source == (SessionID{}) || terminal == nil {
 		return &VisibilityBarrierError{Err: ErrVisibilityLost}
 	}
-	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, nil, prepare,
+	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil, terminal)
-}
-
-// ExecuteWithHeldParents is Execute for a namespace callback whose kernel holds
-// the listed parent directories until this authority answers. The declaration
-// is scoped only to this exact request, so one concurrent request in D1 can
-// never spuriously interrupt another request from the same mount in D2.
-func (c *VisibilityCoordinator) ExecuteWithHeldParents(ctx context.Context, source SessionID, mutation MutationID, dependencies MutationDependencies,
-	held [][16]byte, prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool)) error {
-	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, held, nil, prepare,
-		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil)
 }
 
 // ExecuteWithSourceGate is the production FSKit repair entry point. gate is the
@@ -1368,18 +1337,7 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGate(ctx context.Context, sourc
 	declaration DependencyDeclaration, gate SourcePublicationGate, refresh func() (SourcePublicationGate, error),
 	prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool),
 	published func() ([]VisibilityResolution, error)) error {
-	return c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, nil, refresh, prepare,
-		func(uint64) ([]VisibilityTarget, bool) { return apply() }, published)
-}
-
-// ExecuteWithSourceGateAndHeldParents additionally carries the exact Linux
-// parent locks held across this authority call. It retains the existing
-// parent-exclusive cycle break while source-gate overlap handles the earlier
-// PREPARE/source-request dependency.
-func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParents(ctx context.Context, source SessionID, mutation MutationID,
-	declaration DependencyDeclaration, gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
-	apply func() ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) error {
-	return c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, held, refresh, prepare,
+	return c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, refresh, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, published)
 }
 
@@ -1392,21 +1350,7 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateSequence(ctx context.Contex
 	declaration DependencyDeclaration, gate SourcePublicationGate, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
 	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) (uint64, error) {
 	var sequence uint64
-	err := c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, nil, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
-		sequence = chosen
-		return apply(chosen)
-	}, published)
-	return sequence, err
-}
-
-// ExecuteWithSourceGateAndHeldParentsSequence is retained for the coordinator's
-// retired parent-exclusive model tests. No protocol-6 Attach can select that
-// profile, and production Linux uses ExecuteWithSourceGateSequence above.
-func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParentsSequence(ctx context.Context, source SessionID, mutation MutationID,
-	declaration DependencyDeclaration, gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
-	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) (uint64, error) {
-	var sequence uint64
-	err := c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, held, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
+	err := c.execute(ctx, source, mutation, mutationDependenciesForSourceGate(gate), declaration, &gate, refresh, prepare, func(chosen uint64) ([]VisibilityTarget, bool) {
 		sequence = chosen
 		return apply(chosen)
 	}, published)
@@ -1415,7 +1359,7 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParentsSequence(ctx 
 
 func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, mutation MutationID,
 	dependencies MutationDependencies, declaration DependencyDeclaration,
-	gate *SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
+	gate *SourcePublicationGate, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
 	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error), externalSource ...<-chan struct{}) error {
 	if ctx == nil || prepare == nil || apply == nil {
 		return errors.New("volumeserver: visibility context, prepare, and mutation callbacks are required")
@@ -1495,7 +1439,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		return &VisibilityBarrierError{Err: ErrVisibilityTargets}
 	}
 
-	turn, err := c.acquireMutationDependencies(ctx, source, mutation, held, gate, dependencies, nil)
+	turn, err := c.acquireMutationDependencies(ctx, source, mutation, gate, dependencies, nil)
 	if err != nil {
 		return err
 	}
@@ -1524,7 +1468,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 					break
 				}
 				turn.requeue(refreshedDependencies)
-				turn, err = c.acquireMutationDependencies(ctx, source, mutation, held, &refreshed, refreshedDependencies, turn)
+				turn, err = c.acquireMutationDependencies(ctx, source, mutation, &refreshed, refreshedDependencies, turn)
 				if err != nil {
 					return err
 				}
@@ -1537,7 +1481,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		participant := c.participants[source]
 		yieldErr := error(nil)
 		if participant != nil {
-			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, gate)
 		}
 		if yieldErr != nil {
 			c.recordDormantFairnessLocked(source, participant, mutation, turn)
@@ -1568,7 +1512,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		gate = &refreshed
 		if !dependencies.equal(refreshedDependencies) {
 			turn.requeue(refreshedDependencies)
-			turn, err = c.acquireMutationDependencies(ctx, source, mutation, held, &refreshed, refreshedDependencies, turn)
+			turn, err = c.acquireMutationDependencies(ctx, source, mutation, &refreshed, refreshedDependencies, turn)
 			if err != nil {
 				return err
 			}
@@ -1581,7 +1525,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 		participant := c.participants[source]
 		yieldErr := error(nil)
 		if participant != nil {
-			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, gate)
 		}
 		if yieldErr != nil {
 			c.recordDormantFairnessLocked(source, participant, mutation, turn)
@@ -1719,7 +1663,7 @@ func (c *VisibilityCoordinator) observeBarrier(started time.Time, audience int) 
 // that race: it releases the exact ownership before returning the
 // definite-preapply result.
 func (c *VisibilityCoordinator) acquireMutationDependencies(ctx context.Context, source SessionID, mutation MutationID,
-	held [][16]byte, gate *SourcePublicationGate, dependencies MutationDependencies,
+	gate *SourcePublicationGate, dependencies MutationDependencies,
 	waiter *mutationSequencerWaiter) (*mutationSequencerWaiter, error) {
 	turn := waiter
 	for {
@@ -1729,10 +1673,9 @@ func (c *VisibilityCoordinator) acquireMutationDependencies(ctx context.Context,
 		var yieldErr error
 		fairnessEligible := eligibleForFairness(participant, mutation)
 		if participant != nil {
-			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+			yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, gate)
 			if gate != nil || participant.repair == NamespaceRepairCallbackSerialized ||
-				participant.repair == NamespaceRepairCallbackSerializedPipelined ||
-				(participant.repair == NamespaceRepairParentExclusive && len(held) != 0) {
+				participant.repair == NamespaceRepairCallbackSerializedPipelined {
 				changed = participant.changed
 			}
 		}
@@ -1762,7 +1705,7 @@ func (c *VisibilityCoordinator) acquireMutationDependencies(ctx context.Context,
 			participant = c.participants[source]
 			yieldErr = nil
 			if participant != nil {
-				yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, held, gate)
+				yieldErr = c.mutationYieldErrorLocked(source, mutation, participant, gate)
 			}
 			if yieldErr != nil {
 				c.recordDormantFairnessLocked(source, participant, mutation, turn)
@@ -1869,7 +1812,7 @@ func (c *VisibilityCoordinator) claimFairnessLocked(source SessionID, mutation M
 // definite-preapply. Callback serialization and Linux parent-lock conflicts
 // retain their stronger platform-specific interruption rules.
 func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutation MutationID,
-	participant *visibilityParticipant, held [][16]byte, gate *SourcePublicationGate) error {
+	participant *visibilityParticipant, gate *SourcePublicationGate) error {
 	if participant == nil || participant.pending == nil {
 		return nil
 	}
@@ -1882,16 +1825,6 @@ func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutat
 		return ErrVisibilityInterrupted
 	case NamespaceRepairCallbackSerializedPipelined:
 		return ErrVisibilityInterrupted
-	case NamespaceRepairParentExclusive:
-		interrupt := participant.interrupt
-		if interrupt == nil || participant.pending.event.Cursor != interrupt.cursor {
-			return nil
-		}
-		for _, parent := range held {
-			if _, conflict := interrupt.parents[parent]; conflict {
-				return ErrVisibilityInterrupted
-			}
-		}
 	}
 	return nil
 }
@@ -2420,124 +2353,24 @@ func (c *VisibilityCoordinator) dispatchLocked(event VisibilityEvent, audience v
 	return deliveries, nil
 }
 
-// ReportBlocked is a parent-exclusive frontend proving that an exact cached-
-// name repair would wait on a parent lock its own unanswered request holds.
-// The report does not acknowledge COMPLETE and does not fence the mount. It
-// installs a cursor-scoped interruption for the overlapping parent(s); queued
-// operations then return definite pre-apply EINTR, release their kernel locks,
-// and let this same participant repair and acknowledge normally.
+// ReportBlocked is a strict frontend declaring that it cannot adopt the phase
+// it was delivered. Protocol 6 has exactly one such phase: a routing revision,
+// which cannot be repaired in place the way a cached name can. The report is
+// therefore terminal for the reporting participant and for it alone. Any other
+// pending phase makes this a cursor violation.
 //
-// # The cycle it reports
-//
-// Mount B has a directory-mutating syscall in directory D. The Linux VFS holds
-// D's i_rwsem for WRITE across the entire FUSE server round trip:
-// do_unlinkat takes inode_lock_nested(dir, I_MUTEX_PARENT) at fs/namei.c:4389
-// and releases it at :4407, spanning vfs_unlink at :4402; filename_create
-// (mkdir/mknod/symlink/link/create) takes it at fs/namei.c:3895 and returns
-// still holding it; do_renameat2 takes both parents through lock_rename at
-// fs/namei.c:4975 (fs/namei.c:3066, :3030) and releases at :5046, spanning
-// vfs_rename at :5040. The FUSE side of every one of those blocks in
-// fuse_simple_request - fuse_unlink at fs/fuse/dir.c:982, fuse_rename_common at
-// fs/fuse/dir.c:1014-1062 - so the write lock is held for the whole time this
-// authority is deciding the operation.
-//
-// Mount A holds D's dependency keys and its COMPLETE asks B to make a name in D
-// unservable. The only kernel interface that does so is
-// fuse_reverse_inval_entry, which takes inode_lock_nested(parent,
-// I_MUTEX_PARENT) - down_write, include/linux/fs.h:837 - at fs/fuse/dir.c:1351
-// and holds it to :1402. It is unconditional and blocking: the FUSE_EXPIRE_ONLY
-// test is at fs/fuse/dir.c:1367, sixteen lines INSIDE the locked region, and
-// grepping fs/fuse for inode_trylock in v6.8 returns nothing. So B's repair
-// blocks on B's own syscall, B's syscall blocks on this authority, and this
-// authority is blocked on B's repair. Closed.
-//
-// # The exact cycle break
-//
-// A's mutation still cannot return while B can serve the stale binding. The
-// operation holding B's lock has not reached XFS, however, so the authority can
-// answer that one operation definitively without releasing A's dependency keys.
-//
-//  1. Holding D's lock does not stop B serving the name. RCU-walk resolves it
-//     with no inode lock at all: lookup_fast's RCU branch (fs/namei.c:1617) and
-//     __d_lookup_rcu (fs/dcache.c:2168) take none, and fuse_dentry_revalidate
-//     returns 1 with no lock and no round trip while the entry timeout is
-//     unexpired (fs/fuse/dir.c:262-273). A strict mount publishes a 60s entry
-//     timeout, so this is the common path, not a corner.
-//  2. Making it unservable therefore means reaching fuse_dentry_settime(entry,
-//     0). That store itself needs only dentry->d_lock (fs/fuse/dir.c:65-84),
-//     but the only interface that reaches it is fuse_reverse_inval_entry, which
-//     has already taken the parent write lock by then (1). FUSE_EXPIRE_ONLY is
-//     not an escape: it only skips d_invalidate at fs/fuse/dir.c:1368.
-//     fuse_reverse_inval_inode (fs/fuse/inode.c:507-537) takes no parent lock
-//     but only invalidates attributes and pages - it cannot unbind a name.
-//     Verified unchanged on current master (fs/fuse/dir.c:1595).
-//  3. B cannot repair before its own syscall is answered, and only this
-//     authority can answer it. The blocked report wakes the exact queued
-//     handler, which returns ErrVisibilityInterrupted before prepare/apply.
-//     The resulting EINTR releases D without changing XFS; COMPLETE then runs
-//     while A still owns D's dependency keys.
-//  4. A repair gate in B linearizes callback admission against its exact cache
-//     plan. A callback admitted first is visible here as parked and gets the
-//     pre-apply interruption; one arriving after the gate is refused locally.
-//     There is therefore no parked-after-check gap.
-//  5. Shrinking the audience on the argument that B's own parked mutation will
-//     rebind the same name is not exact. It would let a read on B that starts
-//     strictly after A's mutation returned still see the pre-A value, which is
-//     the linearizability violation the barrier exists to prevent.
-//
-// The interruption scope remains active through Ack, so a transparent retry
-// cannot recreate the cycle. The existing repair deadline is still the hard
-// fallback: if the request cannot be answered or the kernel lock does not drain,
-// the participant is fenced exactly as before.
-//
-// # Why the frontend declares it and this authority does not decide it
-//
-// The cycle needs two facts to be true at once: this mount has an unanswered
-// namespace mutation in D, AND it actually holds a cached binding that this
-// COMPLETE names in D. The frontend knows both from its callback and exact
-// cache registries. This authority can enforce the first exactly once the
-// request arrives, even when the visibility-lane report wins the network race
-// and arrives first. It does NOT know the second. Its audience comes from
-// the resolved-name index, which is a monotone filter chosen to have no false
-// negatives and therefore plenty of false positives: a mount that once resolved
-// anything in D is addressed by every later mutation in D, whether or not it
-// still caches the name. Deciding the cycle from the first fact alone fences
-// every mount that is merely busy in the same directory as another - which is
-// an ordinary shared build tree, continuously.
-//
-// The frontend's cached-name registry and repair gate are exact, so the report
-// carries the coordination inode(s) it actually has to notify. The authority
-// maps those only through the pending event; a fabricated or stale parent is a
-// cursor violation. Installing the scope does not require the ordinary RPC to
-// have arrived first, which closes the visibility-lane/ordinary-lane race. A
-// repeated report for the same cursor is idempotent.
-func (c *VisibilityCoordinator) ReportBlocked(_ context.Context, id SessionID, cursor VisibilityCursor, parentKernelInos []uint64) error {
+// A repeated report for the same cursor is idempotent: the report may have
+// succeeded while its response was lost.
+func (c *VisibilityCoordinator) ReportBlocked(_ context.Context, id SessionID, cursor VisibilityCursor) error {
 	c.mu.Lock()
 	p := c.participants[id]
 	if p == nil {
 		c.mu.Unlock()
 		return ErrSessionExpired
 	}
-	kernelInodes := make(map[uint64]struct{}, len(parentKernelInos))
-	for _, inode := range parentKernelInos {
-		kernelInodes[inode] = struct{}{}
-	}
-	// The report may have succeeded while its response was lost. If repair and
-	// Ack completed before that response is retried, the exact same report must
-	// stay idempotent rather than fence a healthy participant.
-	if p.acked == cursor && cursor != (VisibilityCursor{}) {
-		if p.reported != nil && p.reported.cursor == cursor && sameKernelParents(p.reported.kernelInodes, kernelInodes) {
-			c.mu.Unlock()
-			return nil
-		}
-		c.mu.Unlock()
-		c.Fence(id, ErrVisibilitySequence)
-		return ErrVisibilitySequence
-	}
-	// A handler for an accepted COMPLETE can survive cancellation or reconnect
-	// and arrive after later phases have advanced the participant. Such a stale
-	// control replay must never mutate current state or fence the mount. Reports
-	// are valid only for COMPLETE, so sequence order is sufficient here.
+	// A handler for an accepted phase can survive cancellation or reconnect and
+	// arrive after later phases have advanced the participant. Such a stale
+	// control replay must never mutate current state or fence the mount.
 	if cursor.Phase == VisibilityComplete && cursor.Sequence < p.acked.Sequence {
 		c.mu.Unlock()
 		return nil
@@ -2547,76 +2380,14 @@ func (c *VisibilityCoordinator) ReportBlocked(_ context.Context, id SessionID, c
 		c.Fence(id, ErrVisibilitySequence)
 		return ErrVisibilitySequence
 	}
-	// A route declaration cannot be repaired in place. Its blocked report
-	// retains the terminal meaning; ordinary namespace COMPLETE is the only
-	// phase whose lock cycle a pre-apply interruption can resolve.
-	event := p.pending.event
-	if event.Routes != nil {
-		c.mu.Unlock()
-		c.Fence(id, ErrVisibilityBlocked)
-		return ErrVisibilityBlocked
-	}
-	if event.Cursor.Phase != VisibilityComplete || p.repair != NamespaceRepairParentExclusive ||
-		event.Initiator == id || len(parentKernelInos) == 0 {
+	if p.pending.event.Routes == nil {
 		c.mu.Unlock()
 		c.Fence(id, ErrVisibilitySequence)
 		return ErrVisibilitySequence
 	}
-	parents := make(map[[16]byte]struct{}, len(parentKernelInos))
-	for _, kernelIno := range parentKernelInos {
-		matched := false
-		for _, target := range event.Targets {
-			if target.Scope == VisibilityNamespace && target.ParentKernelIno == kernelIno {
-				parents[target.ParentIdentity] = struct{}{}
-				matched = true
-			}
-		}
-		if !matched {
-			c.mu.Unlock()
-			c.Fence(id, ErrVisibilitySequence)
-			return ErrVisibilitySequence
-		}
-	}
-	if p.interrupt != nil {
-		if p.interrupt.cursor == cursor && sameVisibilityParents(p.interrupt.parents, parents) &&
-			sameKernelParents(p.interrupt.kernelInodes, kernelInodes) {
-			c.mu.Unlock()
-			return nil
-		}
-		c.mu.Unlock()
-		c.Fence(id, ErrVisibilitySequence)
-		return ErrVisibilitySequence
-	}
-	interruption := &visibilityInterruption{cursor: cursor, parents: parents, kernelInodes: kernelInodes}
-	p.interrupt = interruption
-	p.reported = interruption
-	p.signalLocked()
 	c.mu.Unlock()
-	return nil
-}
-
-func sameVisibilityParents(left, right map[[16]byte]struct{}) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for parent := range left {
-		if _, ok := right[parent]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-func sameKernelParents(left, right map[uint64]struct{}) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for parent := range left {
-		if _, ok := right[parent]; !ok {
-			return false
-		}
-	}
-	return true
+	c.Fence(id, ErrVisibilityBlocked)
+	return ErrVisibilityBlocked
 }
 
 func (c *VisibilityCoordinator) newDeliveryLocked(p *visibilityParticipant, event VisibilityEvent) *visibilityDelivery {
@@ -2769,7 +2540,6 @@ func (c *VisibilityCoordinator) AckWithContention(id SessionID, cursor Visibilit
 	delivery := p.pending
 	c.activateFairnessLocked(id, p, delivery.event, orderedAdmissionContended)
 	p.pending = nil
-	p.interrupt = nil
 	p.acked = cursor
 	p.signalLocked()
 	c.mu.Unlock()

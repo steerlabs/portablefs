@@ -536,11 +536,6 @@ enum CoherenceProfile {
 // authority cannot see a remote kernel and the two answers have different
 // provable properties.
 //
-// PARENT_EXCLUSIVE is the retired stock-FUSE model. It is parseable so an old
-// client receives an explicit commitment refusal, but protocol 6 does not
-// admit it: breaking its parent-i_rwsem cycle required surfacing a synthetic
-// EINTR to ordinary applications.
-//
 // INDEPENDENT means repair never waits on a lock the mount's own unanswered
 // operation can hold. A frontend may only declare it if that is true of its
 // kernel; there is no default, because guessing wrong turns a proven cycle into
@@ -561,15 +556,15 @@ enum CoherenceProfile {
 // gate before dispatch and never receives its own PREPARE or COMPLETE.
 enum NamespaceRepair {
   NAMESPACE_REPAIR_UNSPECIFIED = 0;
-  NAMESPACE_REPAIR_PARENT_EXCLUSIVE = 1 [deprecated = true];
   NAMESPACE_REPAIR_INDEPENDENT = 2;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED = 3;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED = 4;
-  // 5 was NAMESPACE_REPAIR_LOCKLESS_EXPIRATION, the retired patched-kernel
-  // repair model. Linux repair is stock-FUSE lease driven; the private ABI it
-  // required no longer exists.
-  reserved 5;
-  reserved "NAMESPACE_REPAIR_LOCKLESS_EXPIRATION";
+  // 1 was NAMESPACE_REPAIR_PARENT_EXCLUSIVE, the retired stock-FUSE model:
+  // breaking its parent-i_rwsem cycle required surfacing a synthetic EINTR to
+  // ordinary applications. 5 was NAMESPACE_REPAIR_LOCKLESS_EXPIRATION, the
+  // retired patched-kernel model, whose private ABI no longer exists.
+  reserved 1, 5;
+  reserved "NAMESPACE_REPAIR_PARENT_EXCLUSIVE", "NAMESPACE_REPAIR_LOCKLESS_EXPIRATION";
 }
 
 enum VisibilityPhase {
@@ -675,12 +670,15 @@ message NextVisibilityRequest {
 }
 message AckVisibilityRequest {
   VisibilityCursor cursor = 1;
-  // Retired protocol-5 development fields. They remain parseable so an old
-  // client receives a deterministic refusal, but no admitted profile sends
-  // them: the parent-lock cycle they reported belonged to the retired
-  // parent-exclusive repair model.
-  bool blocked = 2 [deprecated = true];
-  repeated uint64 blocked_parent_kernel_inos = 3 [deprecated = true];
+  // blocked declares that this participant cannot adopt the phase it was
+  // delivered. Protocol 6 has exactly one such phase, a routing revision, and
+  // the report is terminal for the reporting mount alone.
+  bool blocked = 2;
+  // 3 was blocked_parent_kernel_inos: the coordination inodes a parent-exclusive
+  // repair would have had to notify. That model is retired and no admitted
+  // profile can declare it.
+  reserved 3;
+  reserved "blocked_parent_kernel_inos";
   // Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
   // pipelined frontend sets it when peer repair refused at least one eligible
   // later ordered callback before that exact Ack. It never acknowledges a

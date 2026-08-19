@@ -1111,12 +1111,21 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 	}
 }
 
-func TestRetiredParentExclusiveNamespaceRepairIsRefused(t *testing.T) {
-	repair, err := namespaceRepair(authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE)
-	if !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("namespaceRepair(PARENT_EXCLUSIVE) error = %v, want EOPNOTSUPP", err)
-	}
-	if repair != volumeserver.NamespaceRepairUnspecified {
-		t.Fatalf("namespaceRepair(PARENT_EXCLUSIVE) = %v, want unspecified", repair)
+// The retired repair models keep their enum numbers reserved, so a peer can
+// still put those bytes on the wire. Reserving a number is not refusing it:
+// this asserts the decode refuses both, by number, without mapping either onto
+// an admitted model.
+func TestReservedNamespaceRepairNumbersAreRefused(t *testing.T) {
+	for name, number := range map[string]authoritypb.NamespaceRepair{
+		"parent-exclusive":    1,
+		"lockless-expiration": 5,
+	} {
+		repair, err := namespaceRepair(number)
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("namespaceRepair(%s) error = %v, want EINVAL", name, err)
+		}
+		if repair != volumeserver.NamespaceRepairUnspecified {
+			t.Fatalf("namespaceRepair(%s) = %v, want unspecified", name, repair)
+		}
 	}
 }

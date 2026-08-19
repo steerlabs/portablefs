@@ -173,7 +173,7 @@ func TestVisibilityDepartedParticipantLeavesNoWatchdog(t *testing.T) {
 	for i := 1; i <= 32; i++ {
 		id := SessionID{byte(i)}
 		terminal := h.fencer.attach(id)
-		commitment := VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairParentExclusive}
+		commitment := VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairIndependent}
 		if err := h.coordinator.Register(id, CoherenceStrict, terminal, commitment); err != nil {
 			t.Fatalf("register: %v", err)
 		}

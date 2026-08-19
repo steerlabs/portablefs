@@ -152,9 +152,9 @@ then
 fi
 
 # Protocol 6 has one coherent lease contract. The old non-participant profile
-# and the retired patched-kernel repair model keep their names reserved in the
+# and both retired namespace-repair models keep their names reserved in the
 # source schema (and therefore in generated descriptor bytes), while docs and
-# the changelog may describe their retirement. Neither may re-enter executable
+# the changelog may describe their retirement. None may re-enter executable
 # code, tests, scripts, or configuration.
 if rg --hidden -n \
   -e 'CoherenceUncached' \
@@ -163,6 +163,10 @@ if rg --hidden -n \
   -e '--coherence uncached' \
   -e 'LOCKLESS_EXPIRATION' \
   -e 'NamespaceRepairLocklessExpiration' \
+  -e 'PARENT_EXCLUSIVE' \
+  -e 'NamespaceRepairParentExclusive' \
+  -e 'blocked_parent_kernel_inos' \
+  -e 'BlockedParentKernelInos' \
   . \
   -g '!.git' \
   -g '!docs' \

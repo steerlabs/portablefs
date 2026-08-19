@@ -312,7 +312,7 @@ func TestRoutesCommitFailurePreservesProductionPrepareFencing(t *testing.T) {
 			reported <- err
 			return
 		}
-		reported <- h.coordinator.ReportBlocked(ctx, mount, prepare.Cursor, nil)
+		reported <- h.coordinator.ReportBlocked(ctx, mount, prepare.Cursor)
 	}()
 
 	refusal := errors.New("definite route commit refusal")
@@ -370,7 +370,7 @@ func TestRoutesChangeAcceptsABlockedReportFromAParkedMount(t *testing.T) {
 			return
 		}
 		reported <- time.Now()
-		_ = h.coordinator.ReportBlocked(context.Background(), parked, complete.Cursor, nil)
+		_ = h.coordinator.ReportBlocked(context.Background(), parked, complete.Cursor)
 	}()
 
 	change := testRoutesChange(3)
