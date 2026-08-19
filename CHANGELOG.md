@@ -12,6 +12,46 @@ this file is the human-curated summary.
 
 ### Fixed
 
+- An uncached enumeration no longer restarts from the first entry, which made a
+  single readdir pass return names the kernel had already been given. The
+  uncached path introduced in the previous entry retired its buffered page at
+  the next kernel callback and kept the resume cookie, but cleared the mark
+  saying the stream was deliberately uncovered. `peek`'s lease guard then read a
+  live cookie behind a zero lease stamp as leftovers from a dead lease and reset
+  the stream to offset zero, so the next fetch re-read the directory from the
+  beginning and appended a second copy of everything already delivered. Live
+  staging saw stable, immutable package directories enumerate as `18 entries,
+  not the 9 that were renamed into place`, 6 runs in 8 — the mount stayed up and
+  served wrong data, which is strictly worse than the revocation it replaced.
+  The uncovered mark is now a property of the stream rather than of one page and
+  survives retirement; it is cleared only where a position is genuinely regained
+  (a grant installs) or abandoned (an invalidation, or a seek to zero). Where
+  that guard does have to drop a position the kernel has already read from, it
+  now marks the stream invalidated so the next resume is answered with `ESTALE`
+  rather than silently re-reading. `docs/portable-coherence.md` §5.4 states the
+  invariant this is held to: one pass returns every stable entry exactly once,
+  and the only permitted outcomes are served-exactly, `ESTALE`, or revocation.
+- `deploy/opensteer/staging-qualification.sh` phase 9 can now actually run. An
+  initial mount grant is single-use, so the remount could never reuse
+  `PORTABLEFS_MOUNT_TOKEN` and always failed with errno 1 — meaning durability
+  across unmount/remount had never once been scored. The phase now takes its own
+  capability, from `--mount-token-command CMD` (preferred: a grant is short-lived
+  and one minted before phase 1 can expire before phase 9) or a pre-minted
+  `PORTABLEFS_REMOUNT_TOKEN`. With neither, the phase skips loudly and says the
+  run did not qualify durability, instead of failing at the end of a good run.
+
+### Changed
+
+- `.github/workflows/deploy-opensteer-staging.yml` takes the runner image as a
+  required `workflow_dispatch` input instead of hardcoding a digest, and refuses
+  anything not of the form `REGISTRY/PATH@sha256:<64 hex>`. The infra pin
+  (`releases/staging/opensteer.json` in `opensteer-infra`) is the source of
+  truth and this repository cannot read it at dispatch time, so the operator
+  pastes it and the workflow validates it. The copy this workflow shipped with
+  had already drifted from the pin.
+
+### Fixed
+
 - A Linux mount is no longer revoked when an enumeration reply carries no
   E(dir) grant. A grant on a read-side reply is a MAY, not a MUST
   (docs/portable-coherence.md §2.2), and the frontend independently declines to

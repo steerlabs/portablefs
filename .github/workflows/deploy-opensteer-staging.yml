@@ -16,6 +16,14 @@ on:
         required: false
         default: ""
         type: string
+      runner_image:
+        description: >-
+          Runner image to deploy, digest-pinned. Paste the exact value of
+          .runner_image from releases/staging/opensteer.json in opensteer-infra
+          -- that pin is the source of truth and this workflow deliberately
+          keeps no copy of it. Must be NAME@sha256:<64 hex>; a tag is refused.
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -39,7 +47,15 @@ jobs:
       OPENSTEER_GCP_ZONE: us-west1-b
       OPENSTEER_MANAGER_INSTANCE: portablefs-bench-1
       OPENSTEER_VOLUME_IDS: ${{ inputs.volume_ids != '' && inputs.volume_ids || vars.OPENSTEER_VOLUME_IDS }}
-      OPENSTEER_RUNNER_IMAGE: us-west1-docker.pkg.dev/opensteer-admin/staging/runner@sha256:1e310bb87984279ed3971a6b543f8e55acca09738a3a8b8905a882386dd454dc
+      # Deliberately NOT pinned here. The infra pin
+      # (releases/staging/opensteer.json in opensteer-infra) is the source of
+      # truth, and it lives in a repository this workflow cannot read at
+      # dispatch time. A second copy in this file is not a safety net, it is a
+      # thing that drifts: the value hardcoded here when this workflow was
+      # written was already a different digest from the one the pin carried.
+      # So the operator pastes the pin's value and the step below refuses
+      # anything that is not digest-pinned.
+      OPENSTEER_RUNNER_IMAGE: ${{ inputs.runner_image }}
       # Production pins its provider and deployer service account inline
       # because they exist. Staging reads both from the opensteer-staging
       # environment so the federation can be provisioned without editing this
@@ -68,6 +84,16 @@ jobs:
             missing+=("environment variable WIF_SERVICE_ACCOUNT is not set on the GitHub environment 'opensteer-staging'. Set it to the deployer service account this workflow impersonates, e.g. portablefs-deployer@opensteer-staging.iam.gserviceaccount.com")
           elif [[ ! $WIF_SERVICE_ACCOUNT =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$ ]]; then
             missing+=("environment variable WIF_SERVICE_ACCOUNT on 'opensteer-staging' is not a service account email (got '$WIF_SERVICE_ACCOUNT')")
+          fi
+
+          # A tag resolves to whatever was last pushed under it, so a tagged
+          # deploy is a deploy of an unknown artifact. Only a digest names one
+          # image for good, which is why the infra pin records a digest and why
+          # anything else is refused here rather than deployed.
+          if [[ -z ${OPENSTEER_RUNNER_IMAGE:-} ]]; then
+            missing+=("the runner_image input is empty. Paste .runner_image from releases/staging/opensteer.json in opensteer-infra")
+          elif [[ ! $OPENSTEER_RUNNER_IMAGE =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+            missing+=("the runner_image input is not digest-pinned (got '$OPENSTEER_RUNNER_IMAGE'; expected REGISTRY/PATH@sha256:<64 hex>, copied verbatim from .runner_image in releases/staging/opensteer.json in opensteer-infra). A tag is refused: it names whatever was pushed last, not the image this deploy was qualified against")
           fi
 
           if [[ $HAS_E2B_API_KEY != true ]]; then
