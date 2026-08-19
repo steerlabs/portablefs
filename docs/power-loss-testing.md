@@ -24,14 +24,18 @@ code:
   (`vcs/internal/authorityrpc/volume_handler_linux.go`), which is
   `xfsstore.Volume.Fsync` (`vcs/internal/xfsstore/volume_linux.go`), which is
   `unix.Fdatasync` or `unix.Fsync` on the target descriptor.
-- A write transaction is different. Payload bytes are staged in a sealed
-  `memfd` and applied to the XFS inode with `sendfile`
-  (`vcs/internal/authorityrpc/write_transaction_linux.go`,
-  `xfsstore.writeTarget.CommitWrite`). The commit is acknowledged once that
-  apply has happened. Nothing has been fsynced at that point. The staging code
-  says so itself: "Staging was never fsynced, so anonymous memory does not
-  change write-through acknowledgement or the target descriptor's later fsync
-  durability barrier."
+- A write is different. A stock Linux `FUSE_WRITE` arrives in one frame and its
+  retained payload is applied to the XFS inode with a single `pwrite`, or a
+  single `pwritev2(RWF_APPEND)` when the authority is placing an append
+  (`vcs/internal/authorityrpc/write_linux.go`,
+  `xfsstore.writeTarget.CommitWriteData`). A multi-frame FSKit write instead
+  stages its payload in an unnamed `O_TMPFILE` inside the volume's write-staging
+  directory and applies it with `sendfile`, or by reading it back for an append
+  (`vcs/internal/authorityrpc/fskit_write_linux.go`,
+  `xfsstore.writeTarget.CommitWrite`). Either way the commit is acknowledged once
+  that apply has happened, and nothing has been fsynced at that point: staging is
+  never fsynced, so it changes neither write-through acknowledgement nor the
+  target descriptor's later fsync durability barrier.
 
 So an acknowledged write lives in the page cache, and a power cut discards the
 page cache. **The harness therefore asserts presence only for writes whose

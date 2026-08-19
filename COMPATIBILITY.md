@@ -65,11 +65,13 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   Writes use ordinary `FUSE_WRITE` between Linux and the daemon. Operation
   identity, replay, and streaming are daemon-to-authority concerns; no kernel
   transaction, one-shot capability, private opcode, or completion ring is part
-  of the contract. `O_APPEND` is refused at OPEN (and if observed at WRITE).
-  Stock FUSE does not forward `RWF_APPEND`, so the daemon cannot detect and
-  refuse that path. This is an unresolved correctness blocker: the writable
-  protocol-6 Linux profile is not production-ready until the kernel ABI or a
-  different proven architecture closes it.
+  of the contract. Append placement is the one
+  decision the frontend forwards rather than makes: `WriteRequest.append` asks
+  the authority to place the payload at the true EOF and `assigned_offset`
+  reports where it landed. Stock FUSE does not forward `RWF_APPEND`, so a
+  per-call append is recognized only from the kernel's offset matching the
+  `i_size` this daemon published; that shape is forwarded flagged and refused
+  with EIO unless the offset really is EOF.
 
 - **Both peers name what they require, and refuse on absence.** Every mount
   requires the common paired-transport, canonical-framing, replay,

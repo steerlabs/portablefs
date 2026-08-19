@@ -5,7 +5,23 @@ This document remains the protocol-5/FUSE-7.41 implementation record only; the
 intermediate private-kernel vNext design is retained in
 [vnext-protocol.md](./vnext-protocol.md).
 
-Status: implementation candidate, not a production-qualified kernel.
+Status: **historical**. No part of this dialect is implemented, built, or
+required. It is retained as the dated record of what a private kernel was going
+to be asked for, and nothing here is an open request.
+
+What actually shipped instead: append is exact on a stock kernel, with placement
+resolved by the authority at the object's true EOF under its per-inode writer
+stripe, and the two offsets stock FUSE cannot disambiguate refused loudly
+(`docs/portable-coherence.md` §4.3). The whole private write/publish/notify
+profile below was not needed for it.
+
+The remaining upstream ask is correspondingly narrow and is no longer a blocker:
+**forward `IOCB_APPEND` and `IOCB_NOAPPEND` in `fuse_write_in.flags`.** With
+those two bits the frontend would read the placement intent directly instead of
+reconstructing it from "the offset equals the `i_size` I published", which would
+delete the kernel-size shadow, delete the stale-size EIO refusal, and let the
+kernel apply `RLIMIT_FSIZE` against the offset the write actually used. No new
+opcode, reply field, or capability bit is involved.
 
 This document freezes the private FUSE dialect implemented by the patch series
 under `kernel/linux-6.12.100-portablefs-append/`.  Despite the historical file

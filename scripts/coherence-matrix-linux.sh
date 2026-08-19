@@ -517,7 +517,6 @@ run_matrix() {
     --fence-command "$FENCE_COMMAND" \
     --local-route "$PORTABLEFS_LOCAL_ROUTE" \
     --routes-contract-command "$ROUTES_CONTRACT_COMMAND" \
-    --expect "concurrent_same_file_append_atomicity=FAIL:protocol 6 refuses writable O_APPEND because stock FUSE does not preserve exact append intent or an authority-assigned result offset; RWF_APPEND is not forwarded and remains a production blocker" \
     --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal (docs/xfs-authority-architecture.md), so a chown to another principal is refused by the volume itself and there is no ownership change to observe" \
     --label "linux ${KERNEL_RELEASE}: two stock-kernel FUSE mounts of one authoritative XFS volume" \
     --json /home/portablefs/logs/matrix.json

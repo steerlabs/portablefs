@@ -5,8 +5,8 @@ several machines at once. Every mount reads and writes the same current
 filesystem. There are no commits, no branches, and no user-visible history: the
 mounted tree is the product.
 
-Protocol 6 is under implementation and qualification. The writable Linux
-profile is not production-ready while stock FUSE hides `RWF_APPEND`. macOS 26
+Protocol 6 is under implementation and qualification. The writable Linux profile
+supports exact append, placed by the authority at the true EOF. macOS 26
 and 27 remain available through an explicit FSKit synchronous-repair profile;
 that profile is useful but does not claim Linux-equivalent cache withdrawal.
 The contracts below state the target and its blockers, not a claim that this
@@ -201,7 +201,7 @@ narrow but never broaden. See
 
 | Platform | Transport | Status |
 | --- | --- | --- |
-| Linux | stock kernel FUSE protocol 7.31+ (`vcs/internal/fusev3`) | The protocol-6 implementation target. The writable profile is not production-ready because stock FUSE does not forward `RWF_APPEND`; `O_APPEND` is refused, but `RWF_APPEND` cannot yet be detected. No private kernel capability or opcode is accepted. CI currently exercises one hosted Ubuntu stock kernel; the broader LTS matrix remains an open qualification gate. |
+| Linux | stock kernel FUSE protocol 7.31+ (`vcs/internal/fusev3`) | The protocol-6 implementation target. Writable `O_APPEND` is supported and exact: the authority places every append at the true EOF under its per-inode writer stripe. Stock FUSE does not forward `RWF_APPEND`, so a per-call append is recognized from the offset the kernel derived from this daemon's own `i_size` and refused with EIO in the one window where a peer could have made that offset stale. No private kernel capability or opcode is accepted. CI currently exercises one hosted Ubuntu stock kernel; the broader LTS matrix remains an open qualification gate. |
 | macOS 26 | FSKit synchronous VFS repair | Supported by the explicit protocol-6 FSKit profile. Mutations are ordered through PREPARE/COMPLETE, but host cache repair remains best-effort and append/lock/cache edges are not claimed equivalent to Linux. |
 | macOS 27 | FSKit synchronous VFS repair; separately signed native `DataCacheHandler` build | The ordinary app uses the same admitted v2 repair contract as macOS 26. A build-stamped native artifact strengthens retained-data revocation. Neither claims exact namespace/attribute withdrawal, append intent, or distributed locks. |
 

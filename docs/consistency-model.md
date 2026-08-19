@@ -126,13 +126,19 @@ mutation, and a cached read-only page. Metadata and writes are not affected.
 
 ## Append
 
-Stock FUSE lets PortableFS refuse `O_APPEND` at OPEN and reject it if the open
-intent remains observable at WRITE. It does not forward `RWF_APPEND` at all, so
-the daemon cannot distinguish that request from an ordinary positioned write
-and cannot reliably refuse or place it. The system does not reinterpret offsets
-or serialize an inexact path behind D-X. Unobservable `RWF_APPEND` is a hard
-correctness blocker: the writable protocol-6 profile is not production-ready
-until upstream ABI support or a different proven architecture closes it.
+Append is exact, and the authority — not either kernel — places it. A frontend
+forwards the intent and the authority assigns the offset at the object's true EOF
+inside the same per-inode writer stripe that serializes every other size-changing
+operation, then reports that offset back. A kernel `i_size` is advisory
+throughout: it is a shadow of what a daemon last published, and a peer may have
+moved EOF since.
+
+Stock FUSE does not forward `RWF_APPEND`, so a per-call append on a description
+without `O_APPEND` is visible only as an offset equal to the `i_size` this daemon
+published. That shape is forwarded flagged, and the authority refuses it with EIO
+unless the offset really is EOF — the one condition under which the two readings
+of the request agree. The system never reinterprets an offset it cannot
+disambiguate.
 
 ## Replay and uncertain outcomes
 
@@ -144,7 +150,10 @@ sequence gap fences the session.
 There is no honest atomic transaction spanning an arbitrary XFS syscall and a
 separate durable replay database. A mutation whose reply is lost across
 authority death is reported `UNCERTAIN`; it is never silently retried in a new
-epoch. The application inspects current state and decides.
+epoch. The application inspects current state and decides. For an `UNCERTAIN`
+append that means 0..n bytes may have been placed at an offset the caller was
+never told, known only to be at or after the pre-operation EOF; recovering means
+reading the object's current state, exactly as for any other uncertain write.
 
 ## Locks and open handles
 

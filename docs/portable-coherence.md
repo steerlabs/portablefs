@@ -1,8 +1,9 @@
 # PortableFS Portable Coherence Architecture
 
 Status: DRAFT v3 after stock-FUSE and FSKit API audit. The writable Linux
-profile is **not production-ready** because stock FUSE does not forward
-`RWF_APPEND`. Supersedes the private-kernel exact
+profile supports exact append: placement is resolved by the authority at the true
+EOF (§4.3), and the offsets stock FUSE cannot disambiguate are refused loudly
+rather than misplaced. Supersedes the private-kernel exact
 profile defined in `docs/vnext-protocol.md` §2–§5 and the Linux exact-append
 ABI. Authority protocol major for this architecture: **6 (portable)**. There is
 exactly one architecture: no patched-kernel mode, no fallback profile, no
@@ -19,7 +20,7 @@ source extract or upstream file:line reference.
 v3 incorporates the adversarial reviews: commit-point reformalization (§1),
 source-side discharge and the non-installing metadata lane (§2.2, §3.3),
 whole-file data recall-to-none (§2.2), the directory-enumeration lease class
-(§2.1, §5.4), `O_APPEND` refusal and the `RWF_APPEND` blocker (§4.3), the honest
+(§2.1, §5.4), authority-resolved exact append (§4.3), the honest
 open-existing RPC shape (§5.2), the 7.31 semantic floor (§6), and the hidden
 data-invalidation result as a second explicitly disclosed residual (§7.3b).
 The FSKit audit defines a separate synchronous-repair profile and its weaker
@@ -40,10 +41,10 @@ when `entry_valid` is zero, and FUSE exposes no receipt proving that a remote
 rename has been incorporated into every retained dentry. This is a semantic
 scope boundary, not a cache mode silently presented as coherent.
 
-This is the target contract for supported operations, not a declaration that
-the current writable profile is production-ready. The unobservable
-`RWF_APPEND` path in §4.3 must be closed before arbitrary writable workloads can
-be admitted under this bar.
+This is the target contract for supported operations. Append is inside it:
+placement is resolved by the authority at the true EOF (§4.3), and the two
+conditions under which a write cannot be placed are loud EIO refusals rather
+than silent misplacement.
 
 1. A mutation linearizes at one point after its authoritative XFS apply and
    before its response, chosen consistently with observations by operations
@@ -108,7 +109,7 @@ locally*: all mutations remain write-through regardless of rights held.
   namespace mutation, so recall wiring exists). Per-name N-R cannot substitute
   for E-R: no holder can enumerate leases for names it has never seen.
 - Exclusive rights remain write-through. `D-X` is defined for sole-writer cache
-  policy but does not make exact append implementable (§4.3). `N-X`/`A-X` are
+  policy; append placement is resolved by the authority instead (§4.3). `N-X`/`A-X` are
   defined on the wire but never granted by v1 policy.
 - Data leases are whole-file in v1; range leases are future-additive [LS §3.2].
 - Xattr/ACL values have no cache class in v1.
@@ -333,23 +334,66 @@ durability barrier; the visibility/durability split is retained unchanged.
 
 ### 4.3 Append
 
-Stock FUSE computes append offsets in the kernel from cached `i_size` and has
-no field for an authority-assigned result offset [SC §4.3; review]. More
-importantly, the write request does not preserve exact `O_APPEND` or
-`RWF_APPEND` intent at the point where the daemon would have to distinguish an
-append from a positioned write. Treating the kernel offset as advisory would
-therefore corrupt non-append semantics, and D-X cannot manufacture the missing
-intent or repair the file position.
+Append is **supported and exact**, with placement resolved by the authority.
 
-Protocol 6 refuses `O_APPEND` at OPEN and again if that intent is observable at
-WRITE. It does not infer intent from an offset, place every write at EOF, or
-serialize an inexact regime. However, stock FUSE does **not forward
-`RWF_APPEND`**, so the daemon cannot distinguish it from an ordinary positioned
-write and cannot reliably refuse it. This is a hard correctness blocker for
-declaring the writable profile production-ready. Exact support requires an
-upstream request/result surface carrying append intent and the
-authority-assigned offset, or a different architecture with an equally strong
-proof.
+Stock FUSE cannot place an append itself on a shared volume: the kernel derives
+its offset from `i_size`, which for a non-writeback FUSE inode is nothing more
+than an advisory shadow of what this daemon last told it, and another machine may
+have moved EOF since. Protocol 6 therefore forwards the *intent* and lets the
+authority choose the offset inside the per-inode writer stripe that already
+serializes every size-changing operation:
+
+- `WriteRequest.append` asks the authority to place the payload at the object's
+  true EOF, read under that stripe. `WriteReply.assigned_offset` reports where it
+  landed, and the authority additionally proves exactness by requiring the object
+  to end exactly at `assigned_offset + committed_size`.
+- The frontend keeps a shadow S of its kernel's `i_size`, derived from the only
+  replies that move it: attribute-bearing replies assign it, WRITE/FALLOCATE/
+  COPY_FILE_RANGE raise it to the end of the range the kernel itself computed,
+  and SETATTR and atomic `O_TRUNC` assign it unconditionally.
+- Because the kernel sets its offset to `i_size` for every appending write, a
+  FUSE_WRITE whose offset equals S is the only observable trace of an append. The
+  decision table is one pure function (`resolveAppendPlacement`):
+
+  | `O_APPEND` on the description | offset == S | placement |
+  | --- | --- | --- |
+  | yes | yes | append at the authority's EOF |
+  | yes | no  | positioned; only `RWF_NOAPPEND` (Linux ≥ 6.9) produces this |
+  | no  | no  | positioned; no append can be hiding here |
+  | no  | yes | positioned, flagged `offset_matches_client_size` |
+
+`i_size` remains advisory throughout. The kernel raises it from its own offset,
+so after an append that the authority placed further along, the kernel's value
+understates the object — which is exactly what a shared filesystem's cached size
+always is, and never what the next append's placement depends on.
+
+**Two loud refusal conditions**, both EIO, both narrow:
+
+1. **Stale-size ambiguity.** Stock FUSE does not forward `RWF_APPEND`, so a
+   per-call append on a description without `O_APPEND` is indistinguishable from
+   an ordinary write at that offset. When `offset == S`, the frontend flags the
+   write and the authority refuses it unless the offset really is EOF: only then
+   do the two readings agree. In practice the kernel refreshes attributes from
+   this daemon immediately before an appending write (`fuse_file_write_iter`
+   calls `fuse_update_attributes` for `IOCB_APPEND`), so this fires only if a
+   peer moves EOF inside that window.
+2. **Unknown shadow.** If the frontend cannot state its kernel's `i_size` for the
+   object, it cannot evaluate the table and refuses the write. This is
+   unreachable by construction — the kernel has no inode this daemon never
+   described — and is logged when it happens. The one state that produces it is
+   an attribute reply a write on the same inode may have overtaken, which the
+   kernel's `attr_version` guard may discard unobservably; failing closed there
+   is a refusal to guess a placement.
+
+Appends cannot duplicate under retry: the replay-slot retention returns the
+retained outcome, including its `assigned_offset`, rather than re-resolving EOF.
+
+**`RLIMIT_FSIZE` exception.** The kernel checks the file-size rlimit against its
+own `ki_pos`, which is `i_size`. When the shadow equals EOF — the ordinary case —
+that check is exact. When a peer has moved EOF further along, an append the
+authority places past the kernel's position may cross a limit the kernel checked
+at a smaller size. This is a named, disclosed exception: the authority does not
+replay private rlimit policy, and there is no stock mechanism that would let it.
 
 ### 4.4 Truncate / fallocate / copy_range / setattr
 
@@ -599,9 +643,9 @@ source of the E2B incident class; its removal is a feature.
 3. **L2 — Lease service.** Grant/recall/TTL/epoch with self-exemption and
    whole-file recall-to-none; metadata + E-R leases end-to-end; validity
    arithmetic; two-mount coherence matrix green on stock.
-4. **L3 — Write path.** DIRECT_IO writes → single RPC; exact `O_APPEND`
-   refusal; an explicit failing qualification gate for unobservable
-   `RWF_APPEND`; fsync group commit; then the pipelined unified write stream.
+4. **L3 — Write path.** DIRECT_IO writes → single RPC; authority-resolved exact
+   append, including the unforwarded per-call `RWF_APPEND` reduced to a loud
+   refusal; fsync group commit; then the pipelined unified write stream.
 5. **L4 — Metadata completion.** FUSE_CREATE→RESOLVE_OPEN, open-by-identity,
    negative entries, readdir under E-R, LOCAL routes, D-R read caching
    (daemon + read-only KEEP_CACHE with the §7.3b belt).
@@ -619,10 +663,12 @@ source of the E2B incident class; its removal is a feature.
 1. **Upstream patch: propagate data-invalidation failure** from
    `fuse_reverse_inval_inode` (removes §7.3b entirely; small, generally
    useful — the correct successor to private patching).
-2. **Upstream conversation: append intent plus authority-assigned result
-   offset** — both are required before PortableFS can support exact
-   `O_APPEND`/`RWF_APPEND`. `O_APPEND` is refused today; `RWF_APPEND` is not
-   forwarded and therefore blocks writable-profile production readiness.
+2. **Upstream conversation: forward `IOCB_APPEND`/`IOCB_NOAPPEND` in
+   `fuse_write_in.flags`.** Append is exact today without it, but only because
+   the frontend reconstructs the intent from "offset equals the i_size I
+   published". Forwarding the two bits would delete that reconstruction, the
+   kernel-size shadow it needs, and the stale-size EIO refusal in §4.3 — and
+   would let the kernel apply `RLIMIT_FSIZE` against the offset actually used.
 3. Authority-restart lease persistence vs v1 grace (§7.5).
 4. Range data leases (after all frontends prove exact range purge).
 5. WinFsp contract verification to §3 rigor before Windows work.

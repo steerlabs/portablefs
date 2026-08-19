@@ -109,7 +109,7 @@ Exit status is zero only when every case reached its **declared** status.
 | `remote_truncate_shrink_readable_eof` | a remote shrink is observed as a shorter readable EOF, not a stale tail |
 | `dir_listing_reflects_remote_creates_and_deletes` | an enumeration on one mount reflects creates and deletes performed on the other |
 | `concurrent_writers_distinct_files` | both mounts writing distinct files concurrently lose nothing and both see the full result |
-| `concurrent_same_file_append_atomicity` | negative `O_APPEND` gate; a separate syscall-level gate must track the unobservable `RWF_APPEND` blocker |
+| `concurrent_same_file_append_atomicity` | exact cross-mount append: every record from both mounts lands whole, placed by the authority at the true EOF |
 | `concurrent_same_file_overwrite_integrity` | concurrent whole-record overwrites of one file leave one writer's record, never a mixture |
 | `hardlink_visible_same_inode` | a hard link made on one mount is observed on the other as the same inode with the right link count |
 | `symlink_visible_and_resolves` | a symlink created and atomically replaced on one mount is observed on the other with its exact current target and bytes |
