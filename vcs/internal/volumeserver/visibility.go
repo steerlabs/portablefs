@@ -1603,7 +1603,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	}
 	// Every non-source mount in this mutation's audience repairs before the
 	// reply is released.
-	complete, err := c.dispatch(ticket, audience, nil)
+	complete, err := c.dispatch(ticket, audience)
 	if err != nil {
 		return &VisibilityBarrierError{Applied: true, Err: err}
 	}
@@ -2087,7 +2087,7 @@ func (c *VisibilityCoordinator) openBarrier(ctx context.Context, source SessionI
 			state.audience[p.id] = p
 		}
 		c.mutations[ticket.Cursor.Sequence] = state
-		deliveries, err := c.dispatchLocked(*ticket, audience, nil)
+		deliveries, err := c.dispatchLocked(*ticket, audience)
 		c.mu.Unlock()
 		return audience, deliveries, err
 	}
@@ -2295,21 +2295,18 @@ func (c *VisibilityCoordinator) RecordResolvedInode(id SessionID, identity [16]b
 	}
 }
 
-func (c *VisibilityCoordinator) dispatch(event VisibilityEvent, audience visibilityAudience, exclude *visibilityParticipant) ([]*visibilityDelivery, error) {
+func (c *VisibilityCoordinator) dispatch(event VisibilityEvent, audience visibilityAudience) ([]*visibilityDelivery, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.dispatchLocked(event, audience, exclude)
+	return c.dispatchLocked(event, audience)
 }
 
-func (c *VisibilityCoordinator) dispatchLocked(event VisibilityEvent, audience visibilityAudience, exclude *visibilityParticipant) ([]*visibilityDelivery, error) {
+func (c *VisibilityCoordinator) dispatchLocked(event VisibilityEvent, audience visibilityAudience) ([]*visibilityDelivery, error) {
 	if c.poisoned != nil {
 		return nil, c.poisoned
 	}
 	deliveries := make([]*visibilityDelivery, 0, len(audience.members))
 	for _, p := range audience.members {
-		if p == exclude {
-			continue
-		}
 		if c.participants[p.id] != p {
 			// Fenced or cleanly detached since the audience was chosen. Its
 			// obligation is already discharged.
