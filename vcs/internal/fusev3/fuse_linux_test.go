@@ -1673,7 +1673,7 @@ func TestSyncFSPropagatesDefiniteErrorAndRejectsMalformedSuccess(t *testing.T) {
 	})
 }
 
-func TestAuthorityAppendOpenFailsClosed(t *testing.T) {
+func TestAppendOpenStatesWriteIntent(t *testing.T) {
 	flags, errno := protocolOpenFlags(syscall.O_RDONLY | syscall.O_APPEND)
 	if errno != 0 {
 		t.Fatal(errno)
@@ -1681,11 +1681,14 @@ func TestAuthorityAppendOpenFailsClosed(t *testing.T) {
 	if flags.GetAppend() {
 		t.Fatal("O_APPEND on a read-only open is legal and ignored on every other Linux filesystem; forwarding it makes the authority reject the open with EINVAL")
 	}
-	if flags, errno := protocolOpenFlags(syscall.O_WRONLY | syscall.O_APPEND); errno != syscall.EOPNOTSUPP || flags != nil {
-		t.Fatalf("writable O_APPEND = (%+v, %v), want EOPNOTSUPP", flags, errno)
-	}
-	if flags, errno := protocolOpenFlags(syscall.O_RDWR | syscall.O_APPEND); errno != syscall.EOPNOTSUPP || flags != nil {
-		t.Fatalf("read-write O_APPEND = (%+v, %v), want EOPNOTSUPP", flags, errno)
+	for _, access := range []int{syscall.O_WRONLY, syscall.O_RDWR} {
+		flags, errno := protocolOpenFlags(uint32(access | syscall.O_APPEND))
+		if errno != 0 {
+			t.Fatalf("writable O_APPEND open (access %#x) = %v, want acceptance", access, errno)
+		}
+		if !flags.GetAppend() || !flags.GetWrite() {
+			t.Fatalf("writable O_APPEND open (access %#x) = %+v, want append write intent", access, flags)
+		}
 	}
 }
 

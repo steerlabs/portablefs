@@ -296,3 +296,116 @@ func TestWriteFingerprintHashesPayloadAndMetadata(t *testing.T) {
 		t.Fatal("write fingerprint omitted write geometry")
 	}
 }
+
+func TestWriteResolvesAppendPlacementAtTheAuthority(t *testing.T) {
+	t.Run("append", func(t *testing.T) {
+		h, credential, store := newWriteHarness(t)
+		target := &writeTestTarget{}
+		target.setCommitResult(4, 6, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 10, Mode: 0o600, Nlink: 1}, nil)
+		handle := prepareOneShotTarget(t, h, credential, store, target)
+		request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+		request.GetWrite().Append = true
+
+		response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
+		reply := response.GetWrite()
+		if response.GetErrno() != 0 || reply.GetCommittedSize() != 4 || reply.GetAssignedOffset() != 6 || reply.GetError() != 0 {
+			t.Fatalf("append reply = %+v", response)
+		}
+		if direct, specs := target.directSnapshot(); direct != 1 ||
+			specs[0].Mode != xfsstore.WriteAppend || specs[0].Position != 0 || specs[0].RequirePositionAtEOF {
+			t.Fatalf("append direct apply = %d calls, specs %+v", direct, specs)
+		}
+		// A retried append must return the retained outcome, never place the
+		// payload a second time at a new EOF.
+		replay := proto.Clone(request).(*authoritypb.Request)
+		replay.RequestId = 2
+		replayed := h.handleWrite(t.Context(), replay, credential, replay.GetWrite())
+		if replayed.GetWrite().GetCommittedSize() != 4 || replayed.GetWrite().GetAssignedOffset() != 6 {
+			t.Fatalf("append replay = %+v", replayed)
+		}
+		if direct, _ := target.directSnapshot(); direct != 1 {
+			t.Fatalf("append replay applied storage %d times, want 1", direct)
+		}
+	})
+
+	t.Run("append that did not land at the object end is uncertain", func(t *testing.T) {
+		h, credential, store := newWriteHarness(t)
+		target := &writeTestTarget{}
+		target.setCommitResult(4, 6, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 11, Mode: 0o600, Nlink: 1}, nil)
+		handle := prepareOneShotTarget(t, h, credential, store, target)
+		request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+		request.GetWrite().Append = true
+		response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
+		if response.GetErrno() == 0 || response.GetWrite() != nil {
+			t.Fatalf("append past the object end = %+v, want a fenced envelope", response)
+		}
+	})
+
+	t.Run("offset matching the client size requires EOF", func(t *testing.T) {
+		h, credential, store := newWriteHarness(t)
+		target := &writeTestTarget{}
+		target.setCommitResult(4, 6, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 10, Mode: 0o600, Nlink: 1}, nil)
+		handle := prepareOneShotTarget(t, h, credential, store, target)
+		request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 6, 0)
+		request.GetWrite().OffsetMatchesClientSize = true
+		response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
+		if response.GetErrno() != 0 || response.GetWrite().GetCommittedSize() != 4 {
+			t.Fatalf("flagged write reply = %+v", response)
+		}
+		if direct, specs := target.directSnapshot(); direct != 1 ||
+			specs[0].Mode != xfsstore.WritePositioned || !specs[0].RequirePositionAtEOF {
+			t.Fatalf("flagged write direct apply = %d calls, specs %+v", direct, specs)
+		}
+	})
+
+	t.Run("the store refusal is returned as a structured errno", func(t *testing.T) {
+		h, credential, store := newWriteHarness(t)
+		target := &writeTestTarget{}
+		target.setCommitResult(0, 6, xfsstore.Attr{}, xfsstore.ErrPositionNotAtEOF)
+		handle := prepareOneShotTarget(t, h, credential, store, target)
+		request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 6, 0)
+		request.GetWrite().OffsetMatchesClientSize = true
+		response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
+		if response.GetErrno() != 0 || response.GetWrite().GetError() != -int32(syscall.EIO) {
+			t.Fatalf("stale-size refusal = %+v, want a structured EIO", response)
+		}
+	})
+
+	t.Run("durability intent reaches the store", func(t *testing.T) {
+		for _, tc := range []struct{ sync, dataSync bool }{{sync: true}, {dataSync: true}} {
+			h, credential, store := newWriteHarness(t)
+			target := &writeTestTarget{}
+			target.setCommitResult(4, 0, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0o600, Nlink: 1}, nil)
+			handle := prepareOneShotTarget(t, h, credential, store, target)
+			request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+			request.GetWrite().Sync, request.GetWrite().DataSync = tc.sync, tc.dataSync
+			if response := h.handleWrite(t.Context(), request, credential, request.GetWrite()); response.GetErrno() != 0 {
+				t.Fatalf("durable write = %+v", response)
+			}
+			if _, specs := target.directSnapshot(); specs[0].Sync != tc.sync || specs[0].DataSync != tc.dataSync {
+				t.Fatalf("durability intent %+v reached the store as %+v", tc, specs[0])
+			}
+		}
+	})
+
+	t.Run("contradictory placement statements are refused", func(t *testing.T) {
+		for _, mutate := range []func(*authoritypb.WriteRequest){
+			func(body *authoritypb.WriteRequest) { body.Append, body.Position = true, 6 },
+			func(body *authoritypb.WriteRequest) { body.Append, body.OffsetMatchesClientSize = true, true },
+			func(body *authoritypb.WriteRequest) { body.Sync, body.DataSync = true, true },
+		} {
+			h, credential, store := newWriteHarness(t)
+			target := &writeTestTarget{}
+			handle := prepareOneShotTarget(t, h, credential, store, target)
+			request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+			mutate(request.GetWrite())
+			response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
+			if response.GetWrite().GetError() != -int32(syscall.EINVAL) {
+				t.Fatalf("contradictory write request = %+v, want EINVAL", response)
+			}
+			if direct, _ := target.directSnapshot(); direct != 0 {
+				t.Fatalf("contradictory write request reached storage %d times", direct)
+			}
+		}
+	})
+}

@@ -217,6 +217,10 @@ type replyPublication struct {
 	dirPlusLookups           *dirPlusLookupTransaction
 	snapshotSequence         uint64
 	payloadError             error
+	// sizeTick stamps this callback against the kernel-i_size shadow, so an
+	// attribute reply can tell whether a write reply for the same inode
+	// overtook it and may have made the kernel discard the attributes.
+	sizeTick uint64
 
 	// Physical reply state is protected by rawFileSystem.mu.
 	owner             *rawFileSystem
@@ -430,6 +434,11 @@ type rawFileSystem struct {
 	// cacheability and removed only by FORGET, because a live open description
 	// can refault at any moment after a repair.
 	cachedData map[uint64]*inodeRecord
+	// sizes shadows the kernel's i_size for this mount's regular files. It is
+	// advisory for everything except append placement, where it is the only
+	// evidence that a write the kernel described as positioned may really be an
+	// unforwarded per-call RWF_APPEND.
+	sizes *kernelSizeShadow
 	// publishingNames and publishingInodes count publications that were already
 	// admitted to the cache and have not finished being written. PREPARE waits
 	// them out so that no entry decided before admission closed can be
@@ -503,6 +512,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		cachedAttrs:                make(map[publicationIdentity]*inodeRecord),
 		cachedAttrPayloads:         make(map[publicationIdentity]cachedAttrPayload),
 		cachedData:                 make(map[uint64]*inodeRecord),
+		sizes:                      newKernelSizeShadow(),
 		publishingNames:            make(map[nameKey]int),
 		publishingInodes:           make(map[uint64]int),
 		published:                  make(chan struct{}),
@@ -1030,6 +1040,7 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	out.SetEntryTimeout(0)
 	out.SetAttrTimeout(attrLifetime)
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	r.noteKernelAttr(ctx, attr)
 	return nil
 }
 
@@ -1286,6 +1297,7 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 	out.SetEntryTimeout(0)
 	out.SetAttrTimeout(lifetime)
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	r.noteKernelAttr(ctx, attr)
 	return nil
 }
 
@@ -1389,6 +1401,7 @@ func (r *rawFileSystem) registerReplyPublication(unique uint64, publication *rep
 	}
 	publication.requestUnique = unique
 	publication.owner = r
+	publication.sizeTick = r.sizes.begin()
 	publication.responseConsumptionOwner = responseConsumptionPublication
 	publication.responseConsumptionDone = make(chan struct{})
 	publication.originalDone = make(chan struct{})
@@ -1850,6 +1863,7 @@ func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
 	}
 	record.reclaimed = true
 	delete(r.nodesByID, record.id)
+	r.sizes.forget(record.key.inode)
 	if index := r.identityIndexLocked(record); index[record.key] == record {
 		delete(index, record.key)
 	}
@@ -2093,6 +2107,7 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 		out.SetEntryTimeout(0)
 		out.SetAttrTimeout(0)
 		fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+		r.noteKernelAttr(ctx, attr)
 		return fuse.OK
 	}
 	item, errno := parent.node.Lookup(ctx, name)
@@ -2383,9 +2398,6 @@ func (r *rawFileSystem) Write(_ <-chan struct{}, input *fuse.WriteIn, data []byt
 	if input.WriteFlags&fuse.WRITE_CACHE != 0 || input.WriteFlags&^(uint32(fuse.WRITE_LOCKOWNER)|uint32(fuse.WRITE_KILL_SUIDGID)) != 0 {
 		r.mount.revoke(errors.New("fusev3: stock FUSE_WRITE violated the negotiated direct write-through profile"))
 		return 0, fuse.Status(syscall.ENOTCONN)
-	}
-	if input.Flags&uint32(syscall.O_APPEND) != 0 {
-		return 0, fuse.Status(syscall.EOPNOTSUPP)
 	}
 	return r.writeStock(input, data)
 }
@@ -3348,6 +3360,7 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 		r.mount.revoke(errors.New("fusev3: attribute result escaped its post-VFS reply-publication lifecycle"))
 		fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 		out.SetTimeout(0)
+		r.noteKernelAttr(ctx, attr)
 		return
 	}
 	inode := attr.GetInode()
@@ -3357,6 +3370,7 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 	r.mu.Unlock()
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 	out.SetTimeout(lifetime)
+	r.noteKernelAttr(ctx, attr)
 	if cached {
 		attrGrant, _ := publication.leaseGrant(authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ,
 			identity, publicationIdentity{}, "", time.Now())

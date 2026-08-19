@@ -76,26 +76,63 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 		path := f.join(0, "append")
 		prefix := deterministicIntegrationData(7777, 29)
 		mustWrite(t, path, prefix, 0o600)
-		file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
-		if file != nil {
-			_ = file.Close()
-		}
-		if !errors.Is(err, syscall.EOPNOTSUPP) {
-			t.Fatalf("writable O_APPEND open = %v, want EOPNOTSUPP", err)
-		}
+		file := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
+		payload := deterministicIntegrationData(payloadSize, 31)
+		requireSyscallWrite(t, "one O_APPEND write larger than a transaction fragment", func() (int, error) {
+			return unix.Write(int(file.Fd()), payload)
+		}, len(payload))
+		want := append(append([]byte(nil), prefix...), payload...)
+		requireExactFile(t, f.join(1, "append"), want, "append through the peer mount")
+		requireSize(t, f.join(1, "append"), int64(len(want)), "append size")
+	})
+
+	t.Run("pwrite on an append descriptor still appends", func(t *testing.T) {
+		// POSIX gives O_APPEND precedence over an explicit offset, and the kernel
+		// resolves that before the request reaches this daemon.
+		path := f.join(0, "append-pwrite")
+		prefix := deterministicIntegrationData(4096, 37)
+		mustWrite(t, path, prefix, 0o600)
+		file := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
+		payload := deterministicIntegrationData(1024, 41)
+		requireSyscallWrite(t, "pwrite at offset zero on an O_APPEND descriptor", func() (int, error) {
+			return unix.Pwrite(int(file.Fd()), payload, 0)
+		}, len(payload))
+		want := append(append([]byte(nil), prefix...), payload...)
+		requireExactFile(t, f.join(1, "append-pwrite"), want, "pwrite on an append descriptor")
 	})
 
 	t.Run("per-call append", func(t *testing.T) {
+		// Stock Linux does not forward RWF_APPEND, so the kernel's own offset --
+		// which it refreshes from this daemon before an appending write -- is the
+		// only trace of it. The authority confirms that offset is the true EOF.
 		path := f.join(0, "per-call-append")
 		prefix := deterministicIntegrationData(6001, 47)
 		mustWrite(t, path, prefix, 0o600)
 		file := mustOpenFile(t, path, os.O_WRONLY, 0)
 		payload := deterministicIntegrationData(payloadSize, 53)
-		written, err := unix.Pwritev2(int(file.Fd()), [][]byte{payload}, 0, unix.RWF_APPEND)
-		if written != 0 || !errors.Is(err, syscall.EOPNOTSUPP) {
-			t.Fatalf("RWF_APPEND = (%d, %v), want exact EOPNOTSUPP refusal; stock FUSE not forwarding RWF_APPEND blocks qualification", written, err)
+		requireSyscallWrite(t, "RWF_APPEND write", func() (int, error) {
+			return unix.Pwritev2(int(file.Fd()), [][]byte{payload}, 0, unix.RWF_APPEND)
+		}, len(payload))
+		want := append(append([]byte(nil), prefix...), payload...)
+		requireExactFile(t, f.join(1, "per-call-append"), want, "RWF_APPEND placement")
+	})
+
+	t.Run("per-call noappend", func(t *testing.T) {
+		path := f.join(0, "per-call-noappend")
+		prefix := deterministicIntegrationData(8192, 59)
+		mustWrite(t, path, prefix, 0o600)
+		file := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
+		payload := deterministicIntegrationData(1024, 61)
+		written, err := unix.Pwritev2(int(file.Fd()), [][]byte{payload}, 2048, unix.RWF_NOAPPEND)
+		if errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.EINVAL) {
+			t.Skip("RWF_NOAPPEND requires Linux 6.9 or newer")
 		}
-		requireExactFile(t, f.join(1, "per-call-append"), prefix, "RWF_APPEND refusal")
+		if err != nil || written != len(payload) {
+			t.Fatalf("RWF_NOAPPEND write = (%d, %v), want %d bytes", written, err, len(payload))
+		}
+		want := append([]byte(nil), prefix...)
+		copy(want[2048:], payload)
+		requireExactFile(t, f.join(1, "per-call-noappend"), want, "RWF_NOAPPEND placement")
 	})
 
 	t.Run("fcntl append toggle", func(t *testing.T) {
@@ -111,11 +148,11 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 			t.Fatalf("toggle O_APPEND with F_SETFL: %v", err)
 		}
 		payload := deterministicIntegrationData(payloadSize, 73)
-		written, err := unix.Write(int(file.Fd()), payload)
-		if written != 0 || !errors.Is(err, syscall.EOPNOTSUPP) {
-			t.Fatalf("write after F_SETFL O_APPEND = (%d, %v), want EOPNOTSUPP", written, err)
-		}
-		requireExactFile(t, f.join(1, "fcntl-append"), prefix, "F_SETFL O_APPEND refusal")
+		requireSyscallWrite(t, "write after F_SETFL O_APPEND", func() (int, error) {
+			return unix.Write(int(file.Fd()), payload)
+		}, len(payload))
+		want := append(append([]byte(nil), prefix...), payload...)
+		requireExactFile(t, f.join(1, "fcntl-append"), want, "F_SETFL O_APPEND placement")
 	})
 }
 

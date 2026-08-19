@@ -5,19 +5,18 @@ package fusev3
 import (
 	"errors"
 	"fmt"
+	"log"
+	"math"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"golang.org/x/sys/unix"
 )
 
 func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
-	// O_APPEND carried on the open file description is observable in standard
-	// FUSE_WRITE.Flags and is refused. Per-call RWF_APPEND is not forwarded by
-	// stock Linux, so it remains a qualification blocker rather than something
-	// this daemon can infer or emulate.
-	if input == nil || input.Flags&uint32(syscall.O_APPEND) != 0 {
-		return 0, fuse.Status(syscall.EOPNOTSUPP)
+	if input == nil {
+		return 0, fuse.EINVAL
 	}
 	handleRecord, handle := r.acquireFileHandle(input.Fh)
 	if handle == nil {
@@ -26,6 +25,16 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 	defer r.releaseHandleOperation(handleRecord)
 	if handleRecord.inode == nil || input.NodeId != handleRecord.inode.id || handleRecord.inode.key.kind != authoritypb.Attr_REGULAR || handle.node != handleRecord.inode.node {
 		return 0, fuse.EBADF
+	}
+	inode := handleRecord.inode.key.inode
+	shadow, shadowKnown := r.sizes.lookup(inode)
+	placement := resolveAppendPlacement(input.Flags&uint32(syscall.O_APPEND) != 0, input.Offset, shadow, shadowKnown)
+	if placement.refuse {
+		// Unreachable by construction: the kernel cannot have an i_size for an
+		// inode this mount never described to it. Refusing loudly is the only
+		// honest answer, because placing the bytes would be a guess.
+		log.Printf("fusev3: refusing a write to inode %d whose kernel i_size shadow is unknown", inode)
+		return 0, fuse.EIO
 	}
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
@@ -38,8 +47,11 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 	}
 	response, errno := handle.node.mutateWithSource(ctx, &authoritypb.Request{
 		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
-			Handle: cloneBytes(handle.token), Position: input.Offset, LockOwner: input.LockOwner,
+			Handle: cloneBytes(handle.token), Position: placement.position, LockOwner: input.LockOwner,
 			Size: input.Size, WriteFlags: input.WriteFlags, Data: data,
+			Append: placement.append, OffsetMatchesClientSize: placement.offsetMatchesClientSize,
+			Sync:     input.Flags&uint32(syscall.O_SYNC) == uint32(syscall.O_SYNC),
+			DataSync: input.Flags&uint32(syscall.O_SYNC) != uint32(syscall.O_SYNC) && input.Flags&uint32(unix.O_DSYNC) != 0,
 		}},
 	}, gate)
 	if errno != 0 {
@@ -66,9 +78,26 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
 	postAttr := reply.GetPostAttr()
-	end := input.Offset + reply.GetCommittedSize()
-	if postAttr == nil || postAttr.GetKind() != authoritypb.Attr_REGULAR || postAttr.GetInode() != handleRecord.inode.key.inode || postAttr.GetSize() < 0 || uint64(postAttr.GetSize()) < end {
+	assigned := reply.GetAssignedOffset()
+	if placement.append {
+		// The authority owns an append's placement, so the only thing this mount
+		// can check is that the reply is self-consistent: the bytes end exactly
+		// at the object's new end.
+		if assigned > math.MaxInt64 || reply.GetCommittedSize() > math.MaxInt64-assigned {
+			r.mount.revoke(errors.New("fusev3: stock append returned an out-of-range assigned offset"))
+			return 0, fuse.Status(syscall.ENOTCONN)
+		}
+	} else if assigned != placement.position {
+		r.mount.revoke(errors.New("fusev3: stock write relocated a positioned request"))
+		return 0, fuse.Status(syscall.ENOTCONN)
+	}
+	end := assigned + reply.GetCommittedSize()
+	if postAttr == nil || postAttr.GetKind() != authoritypb.Attr_REGULAR || postAttr.GetInode() != inode || postAttr.GetSize() < 0 || uint64(postAttr.GetSize()) < end {
 		r.mount.revoke(errors.New("fusev3: stock write omitted exact post attributes"))
+		return 0, fuse.Status(syscall.ENOTCONN)
+	}
+	if placement.append && uint64(postAttr.GetSize()) != end {
+		r.mount.revoke(errors.New("fusev3: stock append did not land at the object's end"))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
 	if err := expectPostStateRecord(ctx, handleRecord.inode, postStateRoleTarget); err != nil {
@@ -79,5 +108,9 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		r.mount.revoke(fmt.Errorf("fusev3: complete stock write publication: %w", err))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
+	// The kernel raises i_size from the offset *it* used, which for an append is
+	// its own i_size rather than the offset the authority assigned. Mirroring the
+	// authority's offset here would desynchronize the shadow from the kernel.
+	r.sizes.observeRaise(inode, input.Offset+reply.GetCommittedSize())
 	return uint32(reply.GetCommittedSize()), fuse.OK
 }

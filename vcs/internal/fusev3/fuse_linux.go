@@ -1359,6 +1359,9 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 		if err := expectPostStateItem(ctx, n.item, postStateRoleTarget); err != nil {
 			return nil, 0, syscall.EIO
 		}
+		// The negotiated atomic O_TRUNC makes the kernel zero i_size itself: the
+		// OPEN reply carries no attributes for it to adopt.
+		n.mount.raw.noteKernelSize(itemKey(n.item).inode, 0)
 	}
 	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
 		return nil, 0, syscall.EIO
@@ -2203,6 +2206,12 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 	}
 	fillAttr(object.GetAttr(), &out.Attr, n.mount.uid, n.mount.gid)
 	out.SetTimeout(0)
+	// A SETATTR reply is the one attribute reply the kernel adopts
+	// unconditionally: it holds the inode lock across the call and assigns
+	// i_size from the reply without any attr_version check.
+	if object.GetAttr().GetKind() == authoritypb.Attr_REGULAR && object.GetAttr().GetSize() >= 0 {
+		n.mount.raw.noteKernelSize(object.GetAttr().GetInode(), uint64(object.GetAttr().GetSize()))
+	}
 	return 0
 }
 
@@ -2357,15 +2366,10 @@ func protocolOpenFlags(flags uint32) (*authoritypb.OpenFlags, syscall.Errno) {
 	// O_APPEND is meaningful only for a writable description. Every other Linux
 	// filesystem accepts and ignores it on a read-only open; forwarding it
 	// would make the authority reject a legal open(2) with EINVAL.
+	// Append states write intent for admission and lease purposes only. It is
+	// deliberately not installed on the authority descriptor: Linux decides
+	// placement per call, so every write carries its own placement statement.
 	result.Append = result.Write && flags&uint32(syscall.O_APPEND) != 0
-	if result.Append {
-		// Stock FUSE chooses the append offset and applies RLIMIT before the
-		// request reaches userspace, but its WRITE reply can return only a byte
-		// count. Relocating at the authority would therefore leave f_pos and
-		// i_size describing the stale kernel offset. Refuse the operation until
-		// the stock ABI has an exact result-offset mechanism.
-		return nil, syscall.EOPNOTSUPP
-	}
 	result.Truncate = flags&uint32(syscall.O_TRUNC) != 0
 	result.Sync = flags&uint32(syscall.O_SYNC) != 0
 	result.DataSync = flags&uint32(unix.O_DSYNC) != 0 && !result.Sync

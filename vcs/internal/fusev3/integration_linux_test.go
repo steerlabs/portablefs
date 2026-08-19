@@ -872,12 +872,16 @@ func TestStockWriteRequestSplitting(t *testing.T) {
 		t.Fatalf("4 KiB positioned write authority calls = %d, want 1", writes)
 	}
 
-	if appendFile, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
-		if err == nil {
-			_ = appendFile.Close()
-		}
-		t.Fatalf("O_APPEND open = %v, want EOPNOTSUPP on stock FUSE", err)
+	appendFile := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
+	record := []byte("appended-record\n")
+	before, err := appendFile.Stat()
+	if err != nil {
+		t.Fatal(err)
 	}
+	if n, err := appendFile.Write(record); err != nil || n != len(record) {
+		t.Fatalf("O_APPEND write = (%d, %v), want %d bytes", n, err, len(record))
+	}
+	requireSize(t, path, before.Size()+int64(len(record)), "size after an O_APPEND write")
 
 	const maxWrite = 1 << 20
 	mapping, err := unix.Mmap(-1, 0, maxWrite+os.Getpagesize(), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
