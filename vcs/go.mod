@@ -5,8 +5,8 @@ go 1.26.6
 require (
 	github.com/hanwen/go-fuse/v2 v2.10.1
 	github.com/minio/highwayhash v1.0.4
-	golang.org/x/sys v0.46.0
-	google.golang.org/protobuf v1.36.11
+	golang.org/x/sys v0.47.0
+	google.golang.org/protobuf v1.36.12
 )
 
 // PortableFS requires the post-/dev/fuse-reply publication hook documented in
