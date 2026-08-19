@@ -196,7 +196,7 @@ public enum PortableFSDServiceCoordinator {
         }
     }
 
-    private enum DaemonFenceWitness {
+    enum DaemonFenceWitness {
         case process(DaemonProcessWitness)
         case unpublished
 
@@ -779,28 +779,36 @@ public enum PortableFSDServiceCoordinator {
         registeredIdentity: PortableFSDReleaseIdentity?,
         releaseIdentity: PortableFSDReleaseIdentity
     ) throws {
-        guard let registeredIdentity else {
-            throw RegistrationError.liveIdentityFailed(
-                "an enabled daemon has no persisted registered identity"
-            )
-        }
         let updateGuard = try acquireEmptyInventoryGuard(
             bundle: bundle,
             registeredIdentity: registeredIdentity
         )
         defer { updateGuard.release() }
 
-        // The process witness is captured from the authenticated live control
-        // peer after admission is quiesced and before registration mutation.
-        // An enabled service with no verifiable peer is never updated in place.
-        let processWitness = try probeLiveDaemon(
-            registeredIdentity,
-            bundle: bundle
-        )
+        // An enabled service is updated in place only after the outgoing daemon
+        // is proven gone, by exactly one of two proofs. The preferred proof is a
+        // process witness captured from the authenticated live control peer
+        // after admission is quiesced and before registration mutation. When no
+        // such peer can be authenticated — the daemon was never bootstrapped,
+        // exited, or no longer matches the persisted identity — the fallback is
+        // proof of absence, not an assumption of absence: `.unpublished` makes
+        // `unregisterAndWait` require a nonblocking exclusive flock on the
+        // canonical state singleton, which any live daemon holds. A daemon that
+        // is running but unreachable therefore still fails the update closed,
+        // while a genuinely absent one no longer wedges the enabled service into
+        // a state only `register()` could clear.
+        let processWitness = daemonDepartureProof {
+            guard let registeredIdentity else {
+                throw RegistrationError.liveIdentityFailed(
+                    "an enabled service has no persisted registered identity"
+                )
+            }
+            return try probeLiveDaemon(registeredIdentity, bundle: bundle)
+        }
         try unregisterAndWait(
             service: service,
             socketDirectory: socketDirectory,
-            processWitness: .process(processWitness)
+            processWitness: processWitness
         )
 
         try completeRegisteredRelease(
@@ -947,6 +955,22 @@ public enum PortableFSDServiceCoordinator {
         processDeparted: Bool
     ) -> Bool {
         statusNotRegistered && runtimePathsAbsent && processDeparted
+    }
+
+    /// Chooses which departure proof an in-place update must satisfy. An
+    /// authenticated live control peer yields the strongest proof — a process
+    /// witness bound to that exact execution. Every other case (no persisted
+    /// identity, no daemon bootstrapped, a daemon whose identity no longer
+    /// matches) yields `.unpublished`, which is a weaker proof but still a
+    /// proof: it resolves through the canonical state singleton's exclusive
+    /// flock, which a live daemon holds for its whole lifetime. Selecting
+    /// `.unpublished` therefore never asserts absence, it only decides which
+    /// question `unregisterAndWait` must get a "yes" to before mutating.
+    static func daemonDepartureProof(
+        probe: () throws -> DaemonProcessWitness
+    ) -> DaemonFenceWitness {
+        guard let witness = try? probe() else { return .unpublished }
+        return .process(witness)
     }
 
     private static func runtimePaths(bundle: Bundle) throws -> [URL] {

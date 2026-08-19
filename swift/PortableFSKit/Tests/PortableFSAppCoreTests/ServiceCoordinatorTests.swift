@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PortableFSKit
 import Testing
 @testable import PortableFSAppCore
 
@@ -129,6 +130,77 @@ private func serviceCoordinatorTestFlock(_ descriptor: Int32, _ operation: Int32
             }
         }
     }
+}
+
+@Test func anUnreachableDaemonProvesAbsenceInsteadOfWedgingAnEnabledService() throws {
+    // The wedge this covers: BTM reports the agent enabled, but no daemon was
+    // ever bootstrapped into launchd (or the running one no longer matches the
+    // persisted identity). Probing it raises a transport error. If that error
+    // escaped, the enabled service could only ever be repaired by register(),
+    // which reregister is the sole caller of — a deadlock with no user exit.
+    let probed = PortableFSDServiceCoordinator.daemonDepartureProof {
+        throw PfsLocalClientError.system(errno: ENOENT, operation: "connect")
+    }
+    guard case .unpublished = probed else {
+        Issue.record("an unreachable daemon must fall back to proof of absence")
+        return
+    }
+
+    // Falling back is not the same as assuming absence. `.unpublished` resolves
+    // through the state singleton, so a daemon that is alive but unreachable
+    // still refuses the update.
+    let fileManager = FileManager.default
+    let root = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("pfs-absent-probe-\(UUID().uuidString)", isDirectory: true)
+    try fileManager.createDirectory(
+        at: root,
+        withIntermediateDirectories: false,
+        attributes: [.posixPermissions: 0o700]
+    )
+    defer { try? fileManager.removeItem(at: root) }
+    #expect(try PortableFSDServiceCoordinator.stateSingletonIsUnlocked(at: root))
+
+    let lock = root.appendingPathComponent(".portablefsd-state.lock")
+    #expect(fileManager.createFile(
+        atPath: lock.path,
+        contents: Data("owner\n".utf8),
+        attributes: [.posixPermissions: 0o600]
+    ))
+    let descriptor = Darwin.open(lock.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    #expect(descriptor >= 0)
+    guard descriptor >= 0 else { return }
+    defer { Darwin.close(descriptor) }
+    #expect(serviceCoordinatorTestFlock(descriptor, LOCK_EX | LOCK_NB) == 0)
+    defer { _ = serviceCoordinatorTestFlock(descriptor, LOCK_UN) }
+    #expect(try !PortableFSDServiceCoordinator.stateSingletonIsUnlocked(at: root))
+}
+
+@Test func anAuthenticatedPeerStillYieldsTheStrongerProcessProof() throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    process.arguments = ["30"]
+    try process.run()
+    defer {
+        if process.isRunning { process.terminate() }
+        process.waitUntilExit()
+    }
+
+    let witness = try PortableFSDServiceCoordinator.DaemonProcessWitness(
+        pid: process.processIdentifier,
+        pidVersion: 1
+    )
+    let probed = PortableFSDServiceCoordinator.daemonDepartureProof { witness }
+    guard case .process = probed else {
+        Issue.record("a live authenticated peer must yield a process witness")
+        return
+    }
+}
+
+@Test func pfsLocalTransportErrorsSurfaceTheirOwnDescription() {
+    let failure = PfsLocalClientError.system(errno: ENOENT, operation: "connect")
+    #expect(failure.localizedDescription == failure.description)
+    #expect(failure.localizedDescription.contains("connect"))
+    #expect(!failure.localizedDescription.contains("error 6"))
 }
 
 @Test func daemonProcessWitnessRemainsBoundToTheObservedExecution() throws {
