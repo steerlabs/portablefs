@@ -1065,15 +1065,22 @@ type dirHandle struct {
 	// the beginning rather than resume an authority cookie/verifier from a
 	// recalled E(dir) lease.
 	enumerationInvalidated bool
-	// pageUncovered marks a buffered page this mount holds no E(dir) authority
-	// over, because the authority declined the grant or this frontend could not
-	// install the one it sent (see peek). Such a page is exact for the callback
-	// that fetched it and no longer: nothing will recall it if the directory
-	// changes underneath. seekdirLocked therefore retires it at the next kernel
-	// callback, leaving the authority cookie and verifier in place so the next
-	// fetch resumes exactly where this one stopped and the verifier -- not a
-	// lease -- is what catches a mutation across the gap.
-	pageUncovered bool
+	// uncovered marks a STREAM this mount holds no E(dir) authority over,
+	// because the authority declined the grant or this frontend could not install
+	// the one it sent (see peek). It describes the stream and not merely the
+	// buffered page, and that distinction is the whole correctness of the
+	// uncached path: seekdirLocked retires the page at the next kernel callback
+	// but the stream stays uncovered, because its resume position is still
+	// (cookie, verifier) and still proven by the authority rather than by a
+	// lease. Clearing it at retirement -- while keeping the cookie -- is what
+	// made peek's guard below read a deliberately uncovered stream as leftovers
+	// from a dead lease and restart it from the beginning, handing the kernel a
+	// second copy of every entry it had already been given.
+	//
+	// It is cleared only where the stream genuinely regains or abandons a
+	// position: an installed grant covers it again, an invalidation throws the
+	// position away, or a seek to offset zero starts over.
+	uncovered bool
 
 	// local is the set of machine-local route roots this directory contains and
 	// shadow is the set of names they own. Both are decided once, when the
@@ -1512,16 +1519,28 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 	// allowed to continue a stream that was dropped underneath it is decided in
 	// seekdirLocked, which is the only place that knows the resume offset.
 	//
-	// A page fetched without enumeration authority is exempt: it is covered by
-	// nothing by construction, seekdirLocked already retires it at the next
-	// kernel callback, and resetting it here mid-callback would re-read from the
-	// beginning and hand the kernel names it has already been given.
-	if !h.pageUncovered &&
+	// A stream carrying no enumeration authority is exempt: it is covered by
+	// nothing by construction, so there is no lease here to find missing. Its
+	// position is (cookie, verifier), which the authority itself validates on
+	// the next fetch -- ReadDirOpen answers a resume whose verifier no longer
+	// describes the directory with ESTALE rather than repositioning silently.
+	// Running this reset over such a stream would re-read from the beginning and
+	// hand the kernel names it has already been given.
+	if !h.uncovered &&
 		(h.pageLease.epoch != 0 || h.pending != nil || h.index < len(h.page) || len(h.verifier) != 0 || len(h.cookie) != 0) {
 		identity, ok := publicationIdentityFromItem(h.node.item)
 		if !ok || !h.node.mount.leases.matches(leaseKey{
 			family: authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, identity: identity,
 		}, authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ, h.pageLease, time.Now()) {
+			// Dropping a position this stream already delivered from is not a
+			// silent operation. Re-reading from the beginning would repeat every
+			// name the kernel has taken, so a stream that had one is marked
+			// invalidated and the next callback's seekdirLocked answers the
+			// resume with ESTALE. Only a stream still at its start -- nothing
+			// delivered, nothing to repeat -- restarts quietly.
+			if len(h.cookie) != 0 || h.next != 0 || h.localIndex != 0 {
+				h.enumerationInvalidated = true
+			}
 			h.discardPageItemsLocked()
 			h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 			h.pageLease = leaseStamp{}
@@ -1609,7 +1628,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 			// enumeration of this directory being a refetch (§5.4) rather than a
 			// local hit; what requiring it cost was the mount.
 			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
-			h.pageUncovered = !granted
+			h.uncovered = !granted
 			if granted {
 				h.pageLease = leaseStamp{epoch: grant.epoch, issuedSequence: grant.issuedSequence}
 			} else {
@@ -1734,20 +1753,29 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 		h.pageLease = leaseStamp{}
 		h.cookie, h.verifier = nil, nil
+		h.uncovered = false
 		h.next, h.localIndex, h.eof = 0, 0, false
 		h.enumerationInvalidated = false
 		h.cursorGeneration++
 	}
-	if h.pageUncovered {
+	if h.uncovered {
 		// This handle is between kernel callbacks holding a page no lease covers,
 		// so no recall will arrive to invalidate it if the directory changed in
 		// the gap. Its entries were exact when the authority produced them and
 		// are not claimed to be exact now, so the page is retired here rather
-		// than served again. The authority cookie and verifier are kept: the
-		// next fetch resumes at the last entry this handle actually delivered,
-		// which is what makes the refetch skip and duplicate nothing, and the
-		// verifier is what turns a mutation across the gap into the ESTALE this
-		// stream already owes its caller.
+		// than served again.
+		//
+		// What is deliberately NOT dropped is the position. h.cookie is the
+		// authority cookie following the last entry this handle actually handed
+		// to the kernel, and h.verifier is the snapshot that cookie counts in.
+		// Keeping both is the whole of the exactness claim: the refetch resumes
+		// at exactly the next undelivered entry, so it repeats nothing and skips
+		// nothing, and if the directory moved in the gap the authority refuses
+		// the resume with ESTALE (xfsstore.Volume.ReadDirOpen) instead of
+		// silently repositioning. h.uncovered stays set for the same reason --
+		// clearing it here left a live cookie behind a zero lease stamp, which
+		// peek's guard then read as a dead lease and restarted from the
+		// beginning, re-delivering every entry the kernel already had.
 		//
 		// An end-of-stream this handle holds no authority over is retired with
 		// the rest of the page. Re-establishing it costs one authority round
@@ -1757,7 +1785,6 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		h.discardPageItemsLocked()
 		h.page, h.index, h.eof = nil, 0, false
 		h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
-		h.pageUncovered = false
 		h.pageLease = leaseStamp{}
 	}
 	if off == h.next {
@@ -1785,7 +1812,12 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 	h.localIndex = 0
 	h.cookie = encodeCookie(off)
 	if off == 0 {
+		// Starting the directory over abandons every position this handle held,
+		// so there is nothing left for the uncovered mark to protect. A seek to
+		// any other offset keeps it: that offset is itself an authority cookie
+		// and is still resumed under the verifier.
 		h.verifier = nil
+		h.uncovered = false
 	}
 	h.page, h.index, h.eof = nil, 0, false
 	return 0
@@ -1799,7 +1831,7 @@ func (h *dirHandle) invalidateEnumeration() {
 	h.pageLease = leaseStamp{}
 	h.cookie, h.verifier = nil, nil
 	h.next, h.localIndex, h.eof = 0, 0, false
-	h.pageUncovered = false
+	h.uncovered = false
 	h.enumerationInvalidated = true
 	h.cursorGeneration++
 }
