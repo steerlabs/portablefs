@@ -19,6 +19,7 @@ var (
 	ErrLeaseDischarge  = errors.New("volumeserver: invalid lease discharge")
 	ErrLeaseHolder     = errors.New("volumeserver: lease holder is not active")
 	ErrLeaseBlocked    = errors.New("volumeserver: lease coordinate is under recall")
+	ErrLeaseApplyStall = errors.New("volumeserver: lease coordinate stayed mid-apply past every recall budget")
 	ErrLeaseCapacity   = errors.New("volumeserver: lease grant capacity exhausted")
 	ErrLeaseStartup    = errors.New("volumeserver: prior cache leases may still be live")
 	ErrLeaseRoutesLive = errors.New("volumeserver: route change requires clean mount absence")
@@ -146,6 +147,11 @@ type LeaseRenewal struct {
 type LeaseGrantRequest struct {
 	Coordinate LeaseCoordinate
 	Right      LeaseRight
+	// Created marks a coordinate on an identity this transaction brought into
+	// existence. Only GrantSourcePostState consults it: an identity no peer
+	// could have named cannot have been recalled, so it is the one post-state
+	// coordinate legitimately absent from the transaction's recall set.
+	Created bool
 }
 
 type LeaseEventPhase uint8
@@ -267,26 +273,54 @@ type LeaseConfig struct {
 	OnRecall          func(time.Duration, int)
 }
 
+// coordinateBlock is one coordinate closed by one recall transaction. It has
+// two distinguishable phases because the two things a block stands for end at
+// different moments.
+//
+// applying is true only from the recall reservation until the transaction's
+// storage apply has finished. While it holds, the coordinate's storage state is
+// mid-transition and nobody may observe it. It is deliberately the shorter
+// phase: the frontend's whole-file page purge runs strictly after apply and
+// waits for the data replies this mount already admitted, so a data read that
+// parked here can never be the folio that purge is blocked on. Extending the
+// read wait to the end of the transaction would close that cycle and wedge the
+// mount.
+//
+// The block itself outlives apply and lasts until the source's discharge
+// receipt lands. That tail closes *grant* admission only: a read is answered
+// with the applied bytes and no cache authority, which is what keeps a
+// recalled coordinate missing to the authority.
+//
+// source names the holder whose outstanding receipt is the only thing still
+// holding the key closed, so that receipt does not close the coordinate against
+// the holder that owes it.
+type coordinateBlock struct {
+	sequence uint64
+	applying bool
+	source   SessionID
+	// applyDeadline bounds a data read's wait for apply. Every phase before it
+	// is already fenced by RecallBudget and the authority lease horizon, so a
+	// coordinate still mid-apply past this point belongs to a transaction that
+	// outlived every budget that should have torn it down.
+	applyDeadline time.Time
+}
+
 // LeaseCoordinator owns the exact in-epoch cache-authority table. Storage
 // mutation ordering remains in mutationSequencer; this coordinator only closes
 // cache-grant admission and runs the recall barrier for those coordinates.
 type LeaseCoordinator struct {
 	cfg LeaseConfig
 
-	mu      sync.Mutex
-	holders map[SessionID]*leaseHolder
-	blocked map[string]uint64
-	// blockedSource names the holder whose outstanding discharge receipt is the
-	// only thing still holding each key closed, so that receipt does not close
-	// the coordinate against the holder that owes it.
-	blockedSource map[string]SessionID
-	readers       map[string]uint64
-	source        map[sourceLeaseKey]*sourceLeaseObligation
-	next          uint64
-	committed     uint64
-	totalLeases   uint64
-	startupUntil  time.Time
-	changed       chan struct{}
+	mu           sync.Mutex
+	holders      map[SessionID]*leaseHolder
+	blocked      map[string]*coordinateBlock
+	readers      map[string]uint64
+	source       map[sourceLeaseKey]*sourceLeaseObligation
+	next         uint64
+	committed    uint64
+	totalLeases  uint64
+	startupUntil time.Time
+	changed      chan struct{}
 }
 
 func NewLeaseCoordinator(cfg LeaseConfig) (*LeaseCoordinator, error) {
@@ -303,9 +337,8 @@ func NewLeaseCoordinator(cfg LeaseConfig) (*LeaseCoordinator, error) {
 		startupUntil = startupUntil.Add(cfg.StartupGrace)
 	}
 	return &LeaseCoordinator{
-		cfg: cfg, holders: make(map[SessionID]*leaseHolder), blocked: make(map[string]uint64),
-		blockedSource: make(map[string]SessionID),
-		readers:       make(map[string]uint64), source: make(map[sourceLeaseKey]*sourceLeaseObligation),
+		cfg: cfg, holders: make(map[SessionID]*leaseHolder), blocked: make(map[string]*coordinateBlock),
+		readers: make(map[string]uint64), source: make(map[sourceLeaseKey]*sourceLeaseObligation),
 		next: 1, committed: 1, startupUntil: startupUntil, changed: make(chan struct{}),
 	}, nil
 }
@@ -409,6 +442,11 @@ type LeaseReadAdmission struct {
 	coordinator *LeaseCoordinator
 	holder      SessionID
 	keys        map[string]struct{}
+	// uncacheable names the coordinates that were still closed to grant
+	// admission when this read was admitted. Their bytes are the applied state
+	// and may be returned, but no cache authority over them may be minted until
+	// the recall transaction's receipt lands.
+	uncacheable map[string]struct{}
 	mu          sync.Mutex
 	closed      bool
 	granted     map[string]struct{}
@@ -416,19 +454,41 @@ type LeaseReadAdmission struct {
 	generation  uint64
 }
 
+// readAdmissionMode names how long a read is willing to wait on a coordinate
+// one recall transaction has closed.
+type readAdmissionMode uint8
+
+const (
+	// admitAfterBarrier waits for the whole barrier: reservation, recall,
+	// apply, and every discharge receipt. Nothing in a recall waits on a
+	// metadata reply, so a metadata request may hold its place for the entire
+	// transaction and then be answered under fresh authority.
+	admitAfterBarrier readAdmissionMode = iota + 1
+	// admitAfterApply waits only until the mutation has applied. A FUSE_READ
+	// callback is holding the kernel folio that the transaction's own whole-file
+	// purge will need, and that purge runs strictly after apply -- so waiting
+	// past apply would deadlock the mount against the recall it is waiting for.
+	// The read is then answered with the applied bytes and no grant.
+	admitAfterApply
+)
+
+// BeginRead admits a metadata read. It waits for the whole recall barrier: see
+// admitAfterBarrier.
 func (c *LeaseCoordinator) BeginRead(ctx context.Context, id SessionID, coordinates ...LeaseCoordinate) (*LeaseReadAdmission, error) {
-	return c.beginRead(ctx, id, true, coordinates...)
+	return c.beginRead(ctx, id, admitAfterBarrier, coordinates...)
 }
 
-// TryBeginRead is the callback-safe form. A FUSE request may hold a kernel
-// folio or parent lock needed by recall invalidation, so it must never park
-// behind a blocked coordinate; the frontend receives an immediate retry result
-// with zero cache validity instead.
-func (c *LeaseCoordinator) TryBeginRead(id SessionID, coordinates ...LeaseCoordinate) (*LeaseReadAdmission, error) {
-	return c.beginRead(context.Background(), id, false, coordinates...)
+// BeginDataRead admits a FUSE_READ. It waits only until the mutation that
+// closed the coordinate has applied, then returns an admission over which no
+// grant may be minted while the coordinate stays closed: see admitAfterApply.
+// A read is never refused for coherence -- read(2) has no retryable errno on a
+// blocking description -- so the answer to a recall in progress is to wait for
+// the new bytes, not to hand the caller EAGAIN.
+func (c *LeaseCoordinator) BeginDataRead(ctx context.Context, id SessionID, coordinates ...LeaseCoordinate) (*LeaseReadAdmission, error) {
+	return c.beginRead(ctx, id, admitAfterApply, coordinates...)
 }
 
-func (c *LeaseCoordinator) beginRead(ctx context.Context, id SessionID, wait bool, coordinates ...LeaseCoordinate) (*LeaseReadAdmission, error) {
+func (c *LeaseCoordinator) beginRead(ctx context.Context, id SessionID, mode readAdmissionMode, coordinates ...LeaseCoordinate) (*LeaseReadAdmission, error) {
 	if len(coordinates) == 0 {
 		return nil, ErrLeaseCoordinate
 	}
@@ -441,48 +501,102 @@ func (c *LeaseCoordinator) beginRead(ctx context.Context, id SessionID, wait boo
 	}
 	for {
 		c.mu.Lock()
-		c.expireLocked(c.cfg.Now())
+		now := c.cfg.Now()
+		c.expireLocked(now)
 		if c.holders[id] == nil || c.holders[id].fenced {
 			c.mu.Unlock()
 			return nil, ErrLeaseHolder
 		}
-		blocked := false
+		var wait *coordinateBlock
 		for key := range keys {
+			block := c.blocked[key]
+			if block == nil {
+				continue
+			}
 			// A coordinate held closed only by this holder's own outstanding
 			// discharge receipt does not close it against that holder. The purge the
 			// receipt attests to already happened, before the reply that let this
 			// request be issued at all; the receipt itself only has to keep every
-			// other holder out until it lands. Refusing the source here would make an
-			// ordinary write-then-read on one mount return EAGAIN. Every earlier
-			// phase of the transaction still blocks the source too: until peers have
-			// discharged, the barrier is not complete for anyone.
-			if c.blocked[key] != 0 && c.blockedSource[key] != id {
-				blocked = true
-				break
+			// other holder out until it lands.
+			if block.source == id {
+				continue
 			}
+			if mode == admitAfterApply && !block.applying {
+				continue
+			}
+			wait = block
+			break
 		}
-		if !blocked {
+		if wait == nil {
+			holder := c.holders[id]
+			uncacheable := make(map[string]struct{})
 			for key := range keys {
 				c.readers[key]++
+				// Whether a post-apply read may be given fresh authority turns on
+				// how this holder's outstanding recall obligation is tracked, not
+				// on whether one exists.
+				//
+				// A peer discharges through the COMPLETE event, and Discharge
+				// matches the exact revoking record: transaction and revoke epoch
+				// both. Minting here would replace that record, the peer's
+				// discharge would then fail its epoch check, and the session would
+				// be fenced for a receipt it correctly sent. So a peer holding a
+				// revoking record is refused, which costs it nothing it needs --
+				// its own whole-file purge, which this read is already ordered
+				// ahead of, has not run yet.
+				//
+				// The source is granted even though its receipt is equally
+				// outstanding, because its obligation is not tracked by the
+				// record at all: it is the sourceLeaseObligation keyed on holder
+				// and sequence, and finishSourceDischargeLocked deliberately
+				// tolerates finding the record replaced -- it skips the delete and
+				// still releases the block. That is the same path a post-state
+				// successor already takes. Refusing the source instead would make
+				// an ordinary write-then-read on one mount uncacheable for a whole
+				// round trip.
+				//
+				// Everyone else -- including a peer that has finished discharging
+				// while the source's receipt is still outstanding -- is served
+				// under fresh authority. Those pages otherwise sit in a kernel
+				// with no lease obliging anyone to withdraw them.
+				if block := c.blocked[key]; block != nil && block.source != id && holder != nil {
+					if record := holder.leases[key]; record != nil && record.state == leaseRevoking {
+						uncacheable[key] = struct{}{}
+					}
+				}
 			}
 			snapshot := c.committed
 			generation := c.next
 			c.mu.Unlock()
 			return &LeaseReadAdmission{
-				coordinator: c, holder: id, keys: keys, granted: make(map[string]struct{}),
-				snapshot: snapshot, generation: generation,
+				coordinator: c, holder: id, keys: keys, uncacheable: uncacheable,
+				granted: make(map[string]struct{}), snapshot: snapshot, generation: generation,
 			}, nil
 		}
-		if !wait {
-			c.mu.Unlock()
-			return nil, ErrLeaseBlocked
-		}
+		deadline := wait.applyDeadline
 		changed := c.changed
 		c.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		if err := func() error {
+			var expired <-chan time.Time
+			if mode == admitAfterApply && !deadline.IsZero() {
+				delay := deadline.Sub(now)
+				if delay <= 0 {
+					return ErrLeaseApplyStall
+				}
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				expired = timer.C
+			}
+			select {
+			case <-changed:
+				return nil
+			case <-expired:
+				return ErrLeaseApplyStall
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}(); err != nil {
+			return nil, err
 		}
 	}
 }
@@ -556,6 +670,13 @@ func (a *LeaseReadAdmission) GrantBatch(requests []LeaseGrantRequest) ([]LeaseGr
 		key := request.Coordinate.key()
 		if _, admitted := a.keys[key]; !admitted {
 			return nil, ErrLeaseCoordinate
+		}
+		// This read was admitted while the coordinate was still closed by a
+		// recall that had already applied. Its bytes are the applied state and
+		// the reply may carry them, but the recall is not discharged, so nothing
+		// may be cached under them: the coordinate still misses to the authority.
+		if _, closed := a.uncacheable[key]; closed {
+			return nil, ErrLeaseBlocked
 		}
 		if _, duplicate := keys[key]; duplicate {
 			return nil, ErrLeaseEpoch
@@ -722,7 +843,7 @@ func (c *LeaseCoordinator) Renew(id SessionID, renewals []LeaseRenewal) ([]Lease
 	expires := now.Add(c.cfg.TTL)
 	grants := make([]LeaseGrant, len(records))
 	for index, record := range records {
-		if c.blocked[record.grant.Coordinate.key()] == 0 {
+		if c.blocked[record.grant.Coordinate.key()] == nil {
 			record.grant.ExpiresAt = expires
 			record.grant.IssuedAt = c.next
 		}
@@ -748,7 +869,7 @@ func (c *LeaseCoordinator) RenewHeld(id SessionID) []LeaseGrant {
 		if record.state != leaseGranted {
 			continue
 		}
-		if c.blocked[record.grant.Coordinate.key()] == 0 {
+		if c.blocked[record.grant.Coordinate.key()] == nil {
 			record.grant.ExpiresAt = expires
 			record.grant.IssuedAt = c.next
 		}
@@ -898,7 +1019,7 @@ func (c *LeaseCoordinator) prepareRecall(ctx context.Context, source SessionID, 
 		}
 		busy := false
 		for _, key := range keys {
-			if c.blocked[key] != 0 {
+			if c.blocked[key] != nil {
 				busy = true
 				break
 			}
@@ -930,8 +1051,12 @@ func (c *LeaseCoordinator) prepareRecall(ctx context.Context, source SessionID, 
 			panic("volumeserver: lease recall sequence exhausted")
 		}
 		sequence = c.next
+		// applying holds only until this transaction's storage apply is done.
+		// The tail of the block, which closes grant admission until the source
+		// receipt lands, is the coordinateBlock outliving that phase.
+		applyDeadline := now.Add(c.cfg.TTL + 2*c.cfg.RecallBudget)
 		for _, key := range keys {
-			c.blocked[key] = sequence
+			c.blocked[key] = &coordinateBlock{sequence: sequence, applying: true, applyDeadline: applyDeadline}
 		}
 		c.mu.Unlock()
 		break
@@ -1056,9 +1181,24 @@ func (c *LeaseCoordinator) prepareRecall(ctx context.Context, source SessionID, 
 func (c *LeaseCoordinator) releaseBlockedLocked(sequence uint64, keys []string) {
 	changed := false
 	for _, key := range keys {
-		if c.blocked[key] == sequence {
+		if block := c.blocked[key]; block != nil && block.sequence == sequence {
 			delete(c.blocked, key)
-			delete(c.blockedSource, key)
+			changed = true
+		}
+	}
+	if changed {
+		c.signalLocked()
+	}
+}
+
+// endApplyPhaseLocked reopens read admission on every coordinate this
+// transaction still holds. The block itself stays: grant admission remains
+// closed until the source discharge receipt lands.
+func (c *LeaseCoordinator) endApplyPhaseLocked(sequence uint64, keys []string) {
+	changed := false
+	for _, key := range keys {
+		if block := c.blocked[key]; block != nil && block.sequence == sequence && block.applying {
+			block.applying = false
 			changed = true
 		}
 	}
@@ -1108,6 +1248,13 @@ func (t *LeaseRecallTransaction) complete(ctx context.Context, postState []Visib
 	deliveries := make(map[SessionID]*leaseDelivery, len(t.deliveries))
 	now := c.cfg.Now()
 	c.expireLocked(now)
+	// Storage has stopped moving under these coordinates: either the operation
+	// applied, or this is an abort that never touched them. Data reads parked on
+	// the apply phase are released here and answered with the applied bytes and
+	// no grant. Releasing them at this exact point is what keeps the recall from
+	// waiting on a folio that is itself waiting on the recall: the whole-file
+	// purge every holder is about to run happens strictly after this line.
+	c.endApplyPhaseLocked(t.sequence, t.keys)
 	for id := range t.deliveries {
 		holder := c.holders[id]
 		if holder == nil {
@@ -1167,8 +1314,8 @@ func (t *LeaseRecallTransaction) complete(ctx context.Context, postState []Visib
 				}
 				c.source[sourceLeaseKey{holder: t.initiator, sequence: t.sequence}] = obligation
 				for _, key := range t.keys {
-					if c.blocked[key] == t.sequence {
-						c.blockedSource[key] = t.initiator
+					if block := c.blocked[key]; block != nil && block.sequence == t.sequence {
+						block.source = t.initiator
 					}
 				}
 				if !source.fenced {
@@ -1203,6 +1350,24 @@ func (t *LeaseRecallTransaction) GrantSourcePostState(requests []LeaseGrantReque
 		return nil
 	}
 	c := t.coordinator
+	prepared := make(map[string]struct{}, len(t.keys))
+	for _, key := range t.keys {
+		prepared[key] = struct{}{}
+	}
+	for _, request := range requests {
+		// The accuracy claim above rests entirely on this: a successor may only
+		// cover a coordinate this transaction actually recalled to none, or one
+		// on an identity it just created, which no peer could have held. Anything
+		// else would hand the source cache authority over state some other mount
+		// may still be caching. A handler that composes such a post-state has a
+		// bug in the recall set it declared, not a runtime condition to tolerate.
+		if request.Created {
+			continue
+		}
+		if _, recalled := prepared[request.Coordinate.key()]; !recalled {
+			panic("volumeserver: post-state successor grant over an unprepared coordinate " + request.Coordinate.String())
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := c.cfg.Now()

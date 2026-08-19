@@ -4,11 +4,13 @@ package authorityrpc
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
 type wireLeaseTestFencer struct{}
@@ -107,5 +109,139 @@ func TestLeaseAbortCompleteOmitsPostState(t *testing.T) {
 	})
 	if event.GetPostState() != nil {
 		t.Fatalf("abort COMPLETE post-state = %+v, want absent", event.GetPostState())
+	}
+}
+
+// leaseBarrierFixture drives one lease recall transaction to the point the
+// coherence barrier returns, leaving the source owing a discharge receipt.
+type leaseBarrierFixture struct {
+	coordinator *volumeserver.LeaseCoordinator
+	source      volumeserver.SessionID
+	peer        volumeserver.SessionID
+	identity    [16]byte
+	transaction *volumeserver.LeaseRecallTransaction
+	discharge   *volumeserver.LeaseSourceDischarge
+}
+
+func newLeaseBarrierFixture(t *testing.T) *leaseBarrierFixture {
+	t.Helper()
+	coordinator, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
+		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384,
+		PriorGrantsFenced: true, Fencer: wireLeaseTestFencer{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &leaseBarrierFixture{coordinator: coordinator}
+	f.source[0], f.peer[0], f.identity[0] = 1, 2, 7
+	for _, id := range []volumeserver.SessionID{f.source, f.peer} {
+		if err := coordinator.ActivateHolder(id, make(chan struct{})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: f.identity}
+	for _, id := range []volumeserver.SessionID{f.source, f.peer} {
+		if _, err := coordinator.Grant(context.Background(), id, coordinate, volumeserver.LeaseRightAttributesRead); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepared := make(chan *volumeserver.LeaseRecallTransaction, 1)
+	go func() {
+		transaction, prepareErr := coordinator.PrepareRecall(context.Background(), f.source,
+			[]volumeserver.LeaseRecallTarget{{Coordinate: coordinate}})
+		if prepareErr != nil {
+			panic(prepareErr)
+		}
+		prepared <- transaction
+	}()
+	revoke, err := coordinator.Next(context.Background(), f.peer, volumeserver.LeaseEventCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.AcknowledgeRevoke(f.peer, revoke.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	f.transaction = <-prepared
+
+	completed := make(chan *volumeserver.LeaseSourceDischarge, 1)
+	completeErr := make(chan error, 1)
+	go func() {
+		discharge, err := f.transaction.CompletePeers(context.Background(), nil, 1, true)
+		completed <- discharge
+		completeErr <- err
+	}()
+	complete, err := coordinator.Next(context.Background(), f.peer, revoke.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Discharge(f.peer, complete.Cursor, []volumeserver.LeaseDischarge{{
+		Coordinate: coordinate, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: volumeserver.LeaseDischargeToNone,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	f.discharge = <-completed
+	if err := <-completeErr; err != nil {
+		t.Fatal(err)
+	}
+	if f.discharge == nil {
+		t.Fatal("the barrier minted no source discharge obligation")
+	}
+	return f
+}
+
+func (f *leaseBarrierFixture) postState(t *testing.T) *authoritypb.PostState {
+	t.Helper()
+	return (&VolumeHandler{}).mutationPostState(f.transaction.Sequence(), postStateSnapshot{
+		identity: f.identity,
+		attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Mode: 0o600, Nlink: 1},
+		roles:    postStateRoleTarget,
+		changed:  true,
+	})
+}
+
+func TestFailedCoherenceBarrierMintsNothingAndStillConveysTheSourceDischarge(t *testing.T) {
+	f := newLeaseBarrierFixture(t)
+	h := &VolumeHandler{Leases: f.coordinator}
+	resp := h.success(0)
+	resp.PostState = f.postState(t)
+	failure := h.finishLeaseMutationReply(
+		&authoritypb.Request{Body: &authoritypb.Request_SetAttr{}}, resp, f.transaction,
+		f.discharge, errors.New("coherence barrier did not complete"), true,
+	)
+	if failure.GetErrno() == 0 {
+		t.Fatal("a failed barrier produced a success reply")
+	}
+	if len(failure.GetLeaseGrants()) != 0 {
+		t.Fatalf("failed barrier delivered %d successor grants", len(failure.GetLeaseGrants()))
+	}
+	if failure.GetSourceLeaseDischarge().GetSequence() != f.discharge.Sequence {
+		t.Fatalf("failed barrier dropped the source discharge: %+v", failure.GetSourceLeaseDischarge())
+	}
+	// A phantom leaseGranted record would be a live successor in the authority
+	// table with nothing on the wire that could ever discharge it.
+	if held := f.coordinator.Held(f.source); len(held) != 0 {
+		t.Fatalf("failed barrier retained authority records: %+v", held)
+	}
+}
+
+func TestCompletedCoherenceBarrierMintsTheSuccessorGrant(t *testing.T) {
+	f := newLeaseBarrierFixture(t)
+	h := &VolumeHandler{Leases: f.coordinator}
+	resp := h.success(0)
+	resp.PostState = f.postState(t)
+	reply := h.finishLeaseMutationReply(
+		&authoritypb.Request{Body: &authoritypb.Request_SetAttr{}}, resp, f.transaction, f.discharge, nil, true,
+	)
+	if reply.GetErrno() != 0 {
+		t.Fatalf("completed barrier returned errno %d", reply.GetErrno())
+	}
+	if len(reply.GetLeaseGrants()) != 1 {
+		t.Fatalf("completed barrier delivered %d successor grants, want 1", len(reply.GetLeaseGrants()))
+	}
+	if reply.GetSourceLeaseDischarge().GetSequence() != f.discharge.Sequence {
+		t.Fatalf("completed barrier dropped the source discharge: %+v", reply.GetSourceLeaseDischarge())
+	}
+	if held := f.coordinator.Held(f.source); len(held) != 1 {
+		t.Fatalf("successor records = %+v, want exactly the minted grant", held)
 	}
 }

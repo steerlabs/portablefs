@@ -62,6 +62,20 @@ func newLeaseTestCoordinator(t *testing.T, ttl, budget time.Duration) (*LeaseCoo
 	return coordinator, fencer
 }
 
+// tryLeaseRead probes whether a coordinate is closed to a metadata read
+// without parking the test on it. BeginRead waits for the whole recall barrier
+// by design, so a short deadline is the observation, and its expiry is reported
+// as the block it stands for.
+func tryLeaseRead(coordinator *LeaseCoordinator, id SessionID, coordinates ...LeaseCoordinate) (*LeaseReadAdmission, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	admission, err := coordinator.BeginRead(ctx, id, coordinates...)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, ErrLeaseBlocked
+	}
+	return admission, err
+}
+
 func activateLeaseTestHolder(t *testing.T, coordinator *LeaseCoordinator, id SessionID) chan struct{} {
 	t.Helper()
 	terminal := make(chan struct{})
@@ -826,18 +840,18 @@ func TestLeaseDisjointSourceMutationsDischargeOutOfOrder(t *testing.T) {
 	if err := coordinator.DischargeSource(source, secondDischarge.Sequence); err != nil {
 		t.Fatalf("higher source discharge: %v", err)
 	}
-	if admission, err := coordinator.TryBeginRead(reader, secondCoordinate); err != nil {
+	if admission, err := tryLeaseRead(coordinator, reader, secondCoordinate); err != nil {
 		t.Fatalf("second coordinate remained blocked: %v", err)
 	} else {
 		admission.Release()
 	}
-	if _, err := coordinator.TryBeginRead(reader, firstCoordinate); !errors.Is(err, ErrLeaseBlocked) {
+	if _, err := tryLeaseRead(coordinator, reader, firstCoordinate); !errors.Is(err, ErrLeaseBlocked) {
 		t.Fatalf("first coordinate error = %v, want still blocked", err)
 	}
 	if err := coordinator.DischargeSource(source, firstDischarge.Sequence); err != nil {
 		t.Fatalf("lower out-of-order source discharge: %v", err)
 	}
-	if admission, err := coordinator.TryBeginRead(reader, firstCoordinate); err != nil {
+	if admission, err := tryLeaseRead(coordinator, reader, firstCoordinate); err != nil {
 		t.Fatalf("first coordinate remained blocked: %v", err)
 	} else {
 		admission.Release()
@@ -1250,8 +1264,8 @@ func TestLeaseNewReadWaitsUntilOldCacheIsDischarged(t *testing.T) {
 		t.Fatal(err)
 	}
 	transaction := <-prepared // Filesystem apply occurs after this point.
-	if _, err := coordinator.TryBeginRead(newReader, coordinate); !errors.Is(err, ErrLeaseBlocked) {
-		t.Fatalf("TryBeginRead during recall error = %v, want %v", err, ErrLeaseBlocked)
+	if _, err := tryLeaseRead(coordinator, newReader, coordinate); !errors.Is(err, ErrLeaseBlocked) {
+		t.Fatalf("read during recall error = %v, want %v", err, ErrLeaseBlocked)
 	}
 
 	readReady := make(chan *LeaseReadAdmission, 1)
@@ -1386,13 +1400,13 @@ func TestLeaseFencedSourceKeepsBarrierUntilOriginalGrantExpiry(t *testing.T) {
 	if err := <-completeErr; err != nil {
 		t.Fatal(err)
 	}
-	if _, err := coordinator.TryBeginRead(reader, coordinate); !errors.Is(err, ErrLeaseBlocked) {
+	if _, err := tryLeaseRead(coordinator, reader, coordinate); !errors.Is(err, ErrLeaseBlocked) {
 		t.Fatalf("read before fenced source expiry error = %v, want %v", err, ErrLeaseBlocked)
 	}
 
 	deadline := time.Now().Add(time.Second)
 	for {
-		admission, err := coordinator.TryBeginRead(reader, coordinate)
+		admission, err := tryLeaseRead(coordinator, reader, coordinate)
 		if err == nil {
 			admission.Release()
 			break
@@ -1493,7 +1507,7 @@ func TestLeaseEventCursorIsExactTokenNotMonotonicSequence(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		coordinator.mu.Lock()
-		blocked := coordinator.blocked[coordinateA.key()] != 0
+		blocked := coordinator.blocked[coordinateA.key()] != nil
 		coordinator.mu.Unlock()
 		if blocked {
 			break
@@ -1561,4 +1575,312 @@ func TestLeaseEventCursorIsExactTokenNotMonotonicSequence(t *testing.T) {
 	if err := <-completedA; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestLeaseConstructorRejectsTTLBeyondProtocolHorizon(t *testing.T) {
+	// StartupGrace >= TTL is what makes an unclean authority restart safe, and
+	// that argument only bounds anything because no configuration may name a TTL
+	// longer than the frozen protocol horizon.
+	base := LeaseConfig{
+		TTL: Protocol6MaxLeaseTTL, RecallBudget: time.Second, MaxPerHolder: 16, MaxTotal: 64,
+		StartupGrace: Protocol6MaxLeaseTTL, Fencer: &leaseTestFencer{},
+	}
+	if _, err := NewLeaseCoordinator(base); err != nil {
+		t.Fatalf("TTL at the protocol horizon was rejected: %v", err)
+	}
+	beyond := base
+	beyond.TTL = Protocol6MaxLeaseTTL + time.Nanosecond
+	beyond.StartupGrace = beyond.TTL
+	if _, err := NewLeaseCoordinator(beyond); err == nil {
+		t.Fatal("a TTL past the protocol horizon was accepted; restart recovery can no longer bound prior grants")
+	}
+	short := base
+	short.StartupGrace = base.TTL - time.Nanosecond
+	if _, err := NewLeaseCoordinator(short); err == nil {
+		t.Fatal("a startup grace shorter than the TTL was accepted")
+	}
+}
+
+// leaseRecallToApply drives one transaction to the point where the peer has
+// acknowledged REVOKE and the caller owns the pre-apply window.
+func leaseRecallToApply(t *testing.T, coordinator *LeaseCoordinator, source, peer SessionID,
+	coordinate LeaseCoordinate) (*LeaseRecallTransaction, LeaseEventCursor) {
+	t.Helper()
+	prepared := make(chan *LeaseRecallTransaction, 1)
+	go func() {
+		transaction, err := coordinator.PrepareRecall(context.Background(), source, []LeaseRecallTarget{{Coordinate: coordinate}})
+		if err != nil {
+			panic(err)
+		}
+		prepared <- transaction
+	}()
+	revoke, err := coordinator.Next(context.Background(), peer, LeaseEventCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.AcknowledgeRevoke(peer, revoke.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	return <-prepared, revoke.Cursor
+}
+
+func TestLeaseDataReadWaitsForApplyAndThenMissesUntilDischarge(t *testing.T) {
+	// The blocking read(2) case. A data read may not be refused, and it may not
+	// wait past apply either: the callback holds the folio the recall's own purge
+	// needs. So it parks until apply, then is answered with no cache authority.
+	coordinator, _ := newLeaseTestCoordinator(t, time.Second, 200*time.Millisecond)
+	source, peer, reader := leaseTestID(1), leaseTestID(2), leaseTestID(3)
+	for _, id := range []SessionID{source, peer, reader} {
+		activateLeaseTestHolder(t, coordinator, id)
+	}
+	coordinate := leaseTestCoordinate(LeaseFamilyData, 1)
+	// The source holds the coordinate too, so the transaction mints a source
+	// discharge obligation and the coordinate stays closed past COMPLETE.
+	for _, id := range []SessionID{peer, source} {
+		if _, err := coordinator.Grant(context.Background(), id, coordinate, LeaseRightDataRead); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transaction, revokeCursor := leaseRecallToApply(t, coordinator, source, peer, coordinate)
+
+	type admitted struct {
+		admission *LeaseReadAdmission
+		err       error
+	}
+	readReady := make(chan admitted, 1)
+	go func() {
+		// The peer is the holder under recall: its own purge is still pending,
+		// so this is the one reader that may not be given fresh authority.
+		admission, err := coordinator.BeginDataRead(context.Background(), peer, coordinate)
+		readReady <- admitted{admission: admission, err: err}
+	}()
+	select {
+	case result := <-readReady:
+		if result.admission != nil {
+			result.admission.Release()
+		}
+		t.Fatalf("data read entered mid-apply (err = %v); it must observe the applied bytes", result.err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	completeErr := make(chan error, 1)
+	go func() { completeErr <- completeLeaseTest(transaction, context.Background(), nil, 1, true) }()
+
+	// Apply is over the moment COMPLETE is composed, and the peer has not
+	// discharged yet: the read must enter here, because the peer's purge is what
+	// this read would otherwise be waiting behind.
+	var result admitted
+	select {
+	case result = <-readReady:
+	case <-time.After(2 * time.Second):
+		t.Fatal("data read did not enter after apply; the recall and its readers can now deadlock")
+	}
+	if result.err != nil {
+		t.Fatalf("post-apply data read = %v, want admission", result.err)
+	}
+	if _, err := result.admission.Grant(coordinate, LeaseRightDataRead); !errors.Is(err, ErrLeaseBlocked) {
+		t.Fatalf("grant to the holder still discharging = %v, want %v", err, ErrLeaseBlocked)
+	}
+	result.admission.Release()
+
+	// A mount that is not part of this recall is served under fresh authority.
+	// Answering it without a grant would leave pages in a kernel that no later
+	// recall could reach, because that mount would hold no lease to recall.
+	thirdParty, err := coordinator.BeginDataRead(context.Background(), reader, coordinate)
+	if err != nil {
+		t.Fatalf("post-apply read by an uninvolved mount = %v, want admission", err)
+	}
+	if _, err := thirdParty.Grant(coordinate, LeaseRightDataRead); err != nil {
+		t.Fatalf("post-apply grant to an uninvolved mount: %v", err)
+	}
+	thirdParty.Release()
+
+	complete, err := coordinator.Next(context.Background(), peer, revokeCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Discharge(peer, complete.Cursor, []LeaseDischarge{{
+		Coordinate: coordinate, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: LeaseDischargeToNone,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-completeErr; err != nil {
+		t.Fatal(err)
+	}
+	// The peer has discharged, so it holds no record this recall still owns.
+	// The source's receipt is still outstanding, but that closes nothing against
+	// a mount whose cache is already proven clean.
+	admission, err := coordinator.BeginDataRead(context.Background(), peer, coordinate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admission.Grant(coordinate, LeaseRightDataRead); err != nil {
+		t.Fatalf("grant to a discharged peer before the source receipt: %v", err)
+	}
+	admission.Release()
+	if err := coordinator.DischargeSource(source, transaction.Sequence()); err != nil {
+		t.Fatal(err)
+	}
+	admission, err = coordinator.BeginDataRead(context.Background(), reader, coordinate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admission.Grant(coordinate, LeaseRightDataRead); err != nil {
+		t.Fatalf("grant after full discharge: %v", err)
+	}
+	admission.Release()
+}
+
+func TestLeaseSourceDataReadWaitsForItsOwnApplyThenSeesAppliedState(t *testing.T) {
+	// The single-mount shape of the same rule: a second thread reading the file
+	// this mount is writing waits for the apply, and is admitted for the whole
+	// pre-receipt window afterwards, under the source's own receipt exception.
+	coordinator, _ := newLeaseTestCoordinator(t, time.Second, 200*time.Millisecond)
+	source, peer := leaseTestID(1), leaseTestID(2)
+	activateLeaseTestHolder(t, coordinator, source)
+	activateLeaseTestHolder(t, coordinator, peer)
+	coordinate := leaseTestCoordinate(LeaseFamilyData, 1)
+	for _, id := range []SessionID{source, peer} {
+		if _, err := coordinator.Grant(context.Background(), id, coordinate, LeaseRightDataRead); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transaction, revokeCursor := leaseRecallToApply(t, coordinator, source, peer, coordinate)
+	if _, err := tryLeaseRead(coordinator, source, coordinate); !errors.Is(err, ErrLeaseBlocked) {
+		t.Fatalf("source read mid-apply = %v, want the barrier to hold it", err)
+	}
+	sourceRead := make(chan error, 1)
+	go func() {
+		admission, err := coordinator.BeginDataRead(context.Background(), source, coordinate)
+		if admission != nil {
+			admission.Release()
+		}
+		sourceRead <- err
+	}()
+	select {
+	case err := <-sourceRead:
+		t.Fatalf("source data read entered mid-apply: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	completeErr := make(chan error, 1)
+	go func() { completeErr <- completeLeaseTest(transaction, context.Background(), nil, 1, true) }()
+	select {
+	case err := <-sourceRead:
+		if err != nil {
+			t.Fatalf("source data read after apply = %v, want admission", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("source data read did not enter after its own apply")
+	}
+	complete, err := coordinator.Next(context.Background(), peer, revokeCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Discharge(peer, complete.Cursor, []LeaseDischarge{{
+		Coordinate: coordinate, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: LeaseDischargeToNone,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-completeErr; err != nil {
+		t.Fatal(err)
+	}
+	// Post-COMPLETE, pre-receipt: the source owes the receipt, so the coordinate
+	// is not closed against the source and its read is cacheable again.
+	admission, err := coordinator.BeginDataRead(context.Background(), source, coordinate)
+	if err != nil {
+		t.Fatalf("source read before its own receipt = %v, want admission", err)
+	}
+	if _, err := admission.Grant(coordinate, LeaseRightDataRead); err != nil {
+		t.Fatalf("source grant before its own receipt: %v", err)
+	}
+	admission.Release()
+	if err := coordinator.DischargeSource(source, transaction.Sequence()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLeaseDataReadWakesWhenTheRecallAborts(t *testing.T) {
+	coordinator, _ := newLeaseTestCoordinator(t, time.Second, 200*time.Millisecond)
+	source, peer, reader := leaseTestID(1), leaseTestID(2), leaseTestID(3)
+	for _, id := range []SessionID{source, peer, reader} {
+		activateLeaseTestHolder(t, coordinator, id)
+	}
+	coordinate := leaseTestCoordinate(LeaseFamilyData, 1)
+	if _, err := coordinator.Grant(context.Background(), peer, coordinate, LeaseRightDataRead); err != nil {
+		t.Fatal(err)
+	}
+	transaction, revokeCursor := leaseRecallToApply(t, coordinator, source, peer, coordinate)
+	readReady := make(chan error, 1)
+	go func() {
+		admission, err := coordinator.BeginDataRead(context.Background(), reader, coordinate)
+		if admission != nil {
+			admission.Release()
+		}
+		readReady <- err
+	}()
+	aborted := make(chan struct{})
+	go func() { transaction.Abort(); close(aborted) }()
+	complete, err := coordinator.Next(context.Background(), peer, revokeCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Discharge(peer, complete.Cursor, []LeaseDischarge{{
+		Coordinate: coordinate, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: LeaseDischargeToNone,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	<-aborted
+	select {
+	case err := <-readReady:
+		if err != nil {
+			t.Fatalf("data read after an aborted recall = %v, want admission", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an aborted recall left its data readers parked")
+	}
+}
+
+func TestLeaseSourcePostStateGrantRejectsAnUnpreparedCoordinate(t *testing.T) {
+	coordinator, _ := newLeaseTestCoordinator(t, time.Second, 100*time.Millisecond)
+	source, peer := leaseTestID(1), leaseTestID(2)
+	activateLeaseTestHolder(t, coordinator, source)
+	activateLeaseTestHolder(t, coordinator, peer)
+	prepared := leaseTestCoordinate(LeaseFamilyAttributes, 1)
+	unprepared := leaseTestCoordinate(LeaseFamilyAttributes, 2)
+	if _, err := coordinator.Grant(context.Background(), peer, prepared, LeaseRightAttributesRead); err != nil {
+		t.Fatal(err)
+	}
+	transaction, revokeCursor := leaseRecallToApply(t, coordinator, source, peer, prepared)
+	t.Cleanup(func() {
+		go func() {
+			complete, err := coordinator.Next(context.Background(), peer, revokeCursor)
+			if err != nil {
+				return
+			}
+			_ = coordinator.Discharge(peer, complete.Cursor, []LeaseDischarge{{
+				Coordinate: prepared, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: LeaseDischargeToNone,
+			}})
+		}()
+		transaction.Abort()
+	})
+
+	if grants := transaction.GrantSourcePostState([]LeaseGrantRequest{
+		{Coordinate: prepared, Right: LeaseRightAttributesRead},
+	}); len(grants) != 1 {
+		t.Fatalf("successor over a recalled coordinate = %+v, want one grant", grants)
+	}
+	// A created identity is the one legal absence: no peer could have held a
+	// lease on an identity that did not exist before this transaction.
+	if grants := transaction.GrantSourcePostState([]LeaseGrantRequest{
+		{Coordinate: unprepared, Right: LeaseRightAttributesRead, Created: true},
+	}); len(grants) != 1 {
+		t.Fatalf("successor over a created identity = %+v, want one grant", grants)
+	}
+	defer func() {
+		if recovered := recover(); recovered == nil {
+			t.Fatal("a successor over a coordinate this transaction never recalled was minted silently")
+		}
+	}()
+	transaction.GrantSourcePostState([]LeaseGrantRequest{{Coordinate: unprepared, Right: LeaseRightAttributesRead}})
 }

@@ -142,6 +142,9 @@ func postStateAttributeGrants(state *authoritypb.PostState) []volumeserver.Lease
 		copy(coordinate.Identity[:], object.GetStableIdentity())
 		requests = append(requests, volumeserver.LeaseGrantRequest{
 			Coordinate: coordinate, Right: volumeserver.LeaseRightAttributesRead,
+			// A created identity has no recall entry because no peer could have
+			// named it before this transaction made it exist.
+			Created: object.GetRoles()&postStateRoleCreated != 0,
 		})
 	}
 	return requests

@@ -1748,7 +1748,21 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					right = volumeserver.LeaseRightEnumerationRead
 					mandatory = true
 				}
-				admission, err := h.Leases.BeginRead(ctx, cred.ID, coordinate)
+				// Opening a file for reading is admitted on the data lane, not the
+				// metadata lane. It is a data coordinate, and its reply is one a
+				// recall's whole-file purge waits for: the frontend registers this
+				// open's page-cache publication, so an open parked for the whole
+				// barrier would be a reply that purge waits on while the purge's own
+				// transaction waits on the open. The data lane releases at apply,
+				// strictly before any purge runs. Opening a directory keeps the full
+				// barrier: an enumeration reply publishes no pages, and nothing in a
+				// recall waits on it.
+				var admission *volumeserver.LeaseReadAdmission
+				if coordinate.Family == volumeserver.LeaseFamilyData {
+					admission, err = h.Leases.BeginDataRead(ctx, cred.ID, coordinate)
+				} else {
+					admission, err = h.Leases.BeginRead(ctx, cred.ID, coordinate)
+				}
 				if err != nil {
 					return h.errorResponse(0, err, false)
 				}
@@ -1758,16 +1772,16 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					return response
 				}
 				openGrant, err = admission.Grant(coordinate, right)
-				if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) {
+				// A coordinate still under recall opens without cache authority --
+				// the same answer a read past that transaction's apply receives. The
+				// handle is usable; the frontend just does not keep its pages.
+				if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) && !errors.Is(err, volumeserver.ErrLeaseBlocked) {
 					cleanupOpenedHandle()
 					return h.errorResponse(0, err, false)
 				}
 				if errors.Is(err, volumeserver.ErrLeaseCapacity) && mandatory {
 					cleanupOpenedHandle()
 					return h.errorResponse(0, syscall.ENOSPC, false)
-				}
-				if errors.Is(err, volumeserver.ErrLeaseCapacity) {
-					return response
 				}
 				return response
 			})
@@ -1868,7 +1882,11 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyData, Identity: identity}
-		admission, err := h.Leases.TryBeginRead(cred.ID, coordinate)
+		// A blocking read(2) has no retryable errno, so a recall in progress is
+		// answered by waiting for the applied bytes rather than by refusing. The
+		// wait ends at apply, not at the end of the transaction: this callback
+		// holds the kernel folio the transaction's own whole-file purge needs.
+		admission, err := h.Leases.BeginDataRead(ctx, cred.ID, coordinate)
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -1878,8 +1896,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		if err != nil && !errors.Is(err, io.EOF) {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
+		// A coordinate still under recall serves its bytes and mints nothing:
+		// the reply is explicitly uncacheable, so the next read misses here again.
 		grant, err := admission.Grant(coordinate, volumeserver.LeaseRightDataRead)
-		if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) {
+		if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) && !errors.Is(err, volumeserver.ErrLeaseBlocked) {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		resp := h.success(req.GetRequestId())
@@ -3257,20 +3277,7 @@ func (h *VolumeHandler) mutateLeaseVisibleSequenceResolved(
 			if completeErr != nil {
 				visibilityErr = errors.Join(visibilityErr, completeErr)
 			}
-			resp.SourceLeaseDischarge = sourceLeaseDischargeProto(sourceDischarge)
-			if changed {
-				resp.LeaseGrants = append(resp.LeaseGrants, leaseGrantsProto(h.Leases,
-					transaction.GrantSourcePostState(postStateAttributeGrants(resp.GetPostState())))...)
-			}
-			if visibilityErr != nil {
-				barrier := &volumeserver.VisibilityBarrierError{Applied: changed, Err: visibilityErr}
-				if req.GetWrite() != nil && changed && markWritePostApplyFailure(resp, barrier) {
-					h.deferCoherenceFailure(resp, barrier)
-					return resp
-				}
-				return h.errorResponse(0, barrier, changed)
-			}
-			return resp
+			return h.finishLeaseMutationReply(req, resp, transaction, sourceDischarge, visibilityErr, changed)
 		}
 		return definiteRejection(syscall.EAGAIN)
 	}, &executed)
@@ -3280,6 +3287,47 @@ func (h *VolumeHandler) mutateLeaseVisibleSequenceResolved(
 		return h.rejectUnadmittedFskitWrite(req, cred.ID, writeCommit)
 	}
 	return response
+}
+
+// finishLeaseMutationReply composes the reply once the coherence barrier has
+// returned. The order of the two decisions here is the whole point.
+//
+// A successor grant is a claim that this reply just established the state it
+// covers. A barrier that did not complete established nothing, so a failed
+// outcome mints no cache authority at all: no grant reaches the frontend, and
+// no leaseGranted record is left behind in the authority table for a recall to
+// have to sweep later. The coordinates stay recalled to none and the source's
+// next request is an ordinary miss.
+//
+// The source discharge obligation is the opposite: it travels with every
+// outcome. CompletePeers minted it before this function was reached, so the
+// source already owes that receipt; dropping it from an error reply does not
+// cancel the obligation, it only guarantees the session is fenced once
+// RecallBudget elapses.
+func (h *VolumeHandler) finishLeaseMutationReply(
+	req *authoritypb.Request,
+	resp *authoritypb.Response,
+	transaction *volumeserver.LeaseRecallTransaction,
+	sourceDischarge *volumeserver.LeaseSourceDischarge,
+	visibilityErr error,
+	changed bool,
+) *authoritypb.Response {
+	resp.SourceLeaseDischarge = sourceLeaseDischargeProto(sourceDischarge)
+	if visibilityErr != nil {
+		barrier := &volumeserver.VisibilityBarrierError{Applied: changed, Err: visibilityErr}
+		if req.GetWrite() != nil && changed && markWritePostApplyFailure(resp, barrier) {
+			h.deferCoherenceFailure(resp, barrier)
+			return resp
+		}
+		failure := h.errorResponse(0, barrier, changed)
+		failure.SourceLeaseDischarge = resp.GetSourceLeaseDischarge()
+		return failure
+	}
+	if changed {
+		resp.LeaseGrants = append(resp.LeaseGrants, leaseGrantsProto(h.Leases,
+			transaction.GrantSourcePostState(postStateAttributeGrants(resp.GetPostState())))...)
+	}
+	return resp
 }
 
 func stampVisibilityTargets(targets []volumeserver.VisibilityTarget, state *authoritypb.PostState) {
