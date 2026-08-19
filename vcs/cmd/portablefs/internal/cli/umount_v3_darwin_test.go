@@ -262,7 +262,7 @@ func TestCanonicalMountPathResolvesSymlinkedAncestorOfADeadMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	typed := filepath.Join(link, "mnt")          // the path the user types
+	typed := filepath.Join(link, "mnt")             // the path the user types
 	canonical := filepath.Join(resolvedReal, "mnt") // the path the kernel records
 
 	stubMountIdentification(t,
