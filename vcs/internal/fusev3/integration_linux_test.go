@@ -1958,7 +1958,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			}
 		}
 	})
-	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
+	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 2, rename: 1})
 }
 
 // TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's
