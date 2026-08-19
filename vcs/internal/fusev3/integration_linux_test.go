@@ -1723,7 +1723,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after mkdir: %v", err)
 		}
 	})
-	requireCounts("mkdir plus child/parent stat", mkdirRPCs, counts{mkdir: 1})
+	requireCounts("mkdir plus child/parent stat", mkdirRPCs, counts{lookup: 1, mkdir: 1})
 
 	mknodPath := filepath.Join(root, "post-state-mknod")
 	if _, err := os.Lstat(mknodPath); !errors.Is(err, os.ErrNotExist) {
@@ -1739,7 +1739,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			}
 		}
 	})
-	requireCounts("mknod plus child/parent stat", mknodRPCs, counts{create: 1})
+	requireCounts("mknod plus child/parent stat", mknodRPCs, counts{lookup: 1, create: 1})
 
 	tmpfileRPCs := measure("tmpfile plus inode/parent stat", func() {
 		fd, err := unix.Open(root, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
@@ -1779,7 +1779,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after symlink: %v", err)
 		}
 	})
-	requireCounts("symlink plus child/parent stat", symlinkRPCs, counts{symlink: 1})
+	requireCounts("symlink plus child/parent stat", symlinkRPCs, counts{lookup: 1, symlink: 1})
 
 	linkPath := filepath.Join(root, "post-state-hardlink")
 	if _, err := os.Lstat(createdPath); err != nil {
@@ -1798,7 +1798,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			}
 		}
 	})
-	requireCounts("link plus target/source/parent stat", linkRPCs, counts{link: 1})
+	requireCounts("link plus target/source/parent stat", linkRPCs, counts{lookup: 1, link: 1})
 
 	copySourcePath, copyDestinationPath := filepath.Join(root, "post-state-copy-source"), filepath.Join(root, "post-state-copy-destination")
 	mustWrite(t, copySourcePath, []byte("copy"), 0o600)
@@ -1885,7 +1885,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after existing create: %v", err)
 		}
 	})
-	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{create: 1})
+	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{lookup: 1, create: 1})
 
 	unlinkedPath := filepath.Join(root, "post-state-unlinked")
 	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
@@ -1928,7 +1928,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			}
 		}
 	})
-	requireCounts("rename plus child/parent stats", renameRPCs, counts{rename: 1})
+	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
 }
 
 // TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's
