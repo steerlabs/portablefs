@@ -431,11 +431,13 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 		}
 		requireExactFile(t, f.join(1, "empty-path-tmpfile"), emptyPathPayload,
 			"AT_EMPTY_PATH-linked O_TMPFILE through peer mount")
+		t.Logf("this kernel permits AT_EMPTY_PATH linking of an O_TMPFILE; the mount linked it and the peer mount read it back exactly")
 	} else {
 		if !errors.Is(err, syscall.ENOENT) {
 			t.Fatalf("AT_EMPTY_PATH link of O_TMPFILE = %v, want the ENOENT this kernel gives the same call on the backing XFS", err)
 		}
 		requireAbsent(t, f.join(1, "empty-path-tmpfile"), "AT_EMPTY_PATH link the kernel refused")
+		t.Logf("this kernel refuses AT_EMPTY_PATH before any filesystem is consulted; the mount created no entry for it")
 	}
 
 	exclusive, err := unix.Open(f.mountPath(0), unix.O_TMPFILE|unix.O_RDWR|unix.O_EXCL|unix.O_CLOEXEC, 0o600)
