@@ -242,6 +242,12 @@ fi
 # repository that observe a real kernel FUSE mount against real XFS, so no
 # amount of green from the steps above substitutes for them. They are opt-in
 # locally and mandatory in CI.
+#
+# CI's linux-coherence-matrix lane runs a third Docker suite,
+# scripts/package-manager-matrix.sh, after the matrix. It is deliberately not
+# here: it is a workload soak rather than a coherence gate, and it roughly
+# doubles the wall time of a full local run. The closing banner names it so a
+# --full pass is not read as "everything CI runs".
 if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
   if ! command -v docker >/dev/null 2>&1; then
     echo "verify-local --full requires docker; none found on PATH" >&2
@@ -259,10 +265,12 @@ if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
   echo "  ran: build/vet, govulncheck, native go suites, go-fuse reply seam,"
   echo "       Swift suite (macOS host only), workflow/release-trust policy,"
   echo "       architecture scans, xfs-fuse-integration.sh, coherence-matrix-linux.sh"
-  echo "  still not run locally: the macOS live-mount matrix"
-  echo "       (scripts/coherence-matrix-macos.sh, needs an installed and"
-  echo "       user-enabled FSKit extension), and staging qualification"
-  echo "       (deploy/opensteer/staging-qualification.sh against a live cell)."
+  echo "  still NOT run by --full:"
+  echo "    - scripts/package-manager-matrix.sh   third Docker suite; CI runs it"
+  echo "                                         in the linux-coherence-matrix lane"
+  echo "    - scripts/coherence-matrix-macos.sh   live macOS FSKit mount matrix;"
+  echo "                                         needs a user-enabled extension"
+  echo "    - deploy/opensteer/staging-qualification.sh against a live cell"
   exit 0
 fi
 
@@ -272,6 +280,7 @@ echo
 echo "NOT RUN by this invocation:"
 echo "  - scripts/xfs-fuse-integration.sh   real XFS + real kernel FUSE mounts"
 echo "  - scripts/coherence-matrix-linux.sh two real mounts against one volume"
+echo "  - scripts/package-manager-matrix.sh concurrent package-manager readers"
 if [[ "$(uname -s)" != Darwin ]]; then
   echo "  - scripts/test-swift-xcode.sh      Xcode-native Swift suite (macOS only)"
 fi
