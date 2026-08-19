@@ -726,10 +726,20 @@ func TestEnumerationPageWithoutGrantIsServedUncachedAndRetired(t *testing.T) {
 	second := testDirPage(1, true, func(index int) []byte { return encodeCookie(uint64(index + 2)) })
 	second.Entries[0].Name = []byte("refetched")
 	fetches := 0
+	// Every READDIR this handle issues is recorded with the position it asked
+	// for. An earlier version of this test ignored the cookie and answered the
+	// second fetch with the second page no matter what was requested, which made
+	// it pass while the stream was in fact restarting from the beginning and
+	// re-delivering the entries the kernel already had. The request is the
+	// evidence, so it is what gets asserted.
+	var requestedCookies [][]byte
+	var requestedVerifiers [][]byte
 	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
 		if request.GetReadDir() == nil {
 			return &authoritypb.Response{}, nil
 		}
+		requestedCookies = append(requestedCookies, cloneBytes(request.GetReadDir().GetCookie()))
+		requestedVerifiers = append(requestedVerifiers, cloneBytes(request.GetReadDir().GetVerifier()))
 		page := first
 		if fetches > 0 {
 			page = second
@@ -748,7 +758,7 @@ func TestEnumerationPageWithoutGrantIsServedUncachedAndRetired(t *testing.T) {
 		t.Fatalf("an ungranted enumeration page revoked the mount: %v", frontend.mount.fatalError())
 	}
 	handle.consume()
-	if !handle.pageUncovered {
+	if !handle.uncovered {
 		t.Fatal("a page served without an enumeration grant was not marked uncovered")
 	}
 
@@ -767,6 +777,33 @@ func TestEnumerationPageWithoutGrantIsServedUncachedAndRetired(t *testing.T) {
 	}
 	if fetches != 2 {
 		t.Fatalf("authority READDIRs = %d, want 2: the uncovered page was resumed instead of retired", fetches)
+	}
+	if !handle.uncovered {
+		t.Fatal("retiring an uncovered page cleared the stream's uncovered mark, which is what let peek's guard restart it from the beginning")
+	}
+	// The refetch must ask to continue, not to start over. A zero cookie here is
+	// the whole defect: it re-reads the directory from the first entry and hands
+	// the kernel a second copy of everything it already accepted.
+	if len(requestedCookies) != 2 {
+		t.Fatalf("recorded %d READDIR requests, want 2", len(requestedCookies))
+	}
+	if len(requestedCookies[0]) != 0 {
+		t.Fatalf("first READDIR asked for cookie %x, want the start of the stream", requestedCookies[0])
+	}
+	wantResume := entry.Off
+	if got, ok := decodeCookie(requestedCookies[1]); !ok || got != wantResume {
+		t.Fatalf("resumed READDIR asked for cookie %x (decoded %d, ok=%t), want the cookie following the entry already delivered (%d): an uncovered stream restarted from the beginning instead of continuing",
+			requestedCookies[1], got, ok, wantResume)
+	}
+	// And it must name the snapshot it is continuing in. Without the verifier
+	// the authority has no way to refuse a resume into a directory that moved,
+	// which is the only thing making the uncached path exact rather than hopeful.
+	if len(requestedVerifiers[1]) == 0 {
+		t.Fatal("resumed READDIR carried no verifier, so the authority could not refuse a resume into a changed directory")
+	}
+	if !bytes.Equal(requestedVerifiers[1], first.GetVerifier()) {
+		t.Fatalf("resumed READDIR carried verifier %x, want the one the page it is continuing was produced under (%x)",
+			requestedVerifiers[1], first.GetVerifier())
 	}
 }
 

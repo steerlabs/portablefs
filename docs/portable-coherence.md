@@ -579,14 +579,46 @@ violation that does stay fail-closed is a directory reply that carries no
 stable identity, because no coordinate can name it and therefore no recall can
 ever reach it.
 
-An uncovered page is **bounded to the kernel callback that fetched it**. It is
-retired when the next callback begins — entries, buffered EOF and all — while
-the authority cookie and verifier are kept, so the refetch resumes at the last
-entry actually delivered. That is what makes the uncached path skip no name and
-repeat none, and it leaves the mutation check where it belongs: on the
-authority's readdir verifier, which answers a stream that moved underneath it
-with ESTALE (§5.4, `TestPagedReaddirRefusesToPageAcrossARemoteMutation`), not
-on the presence of a cache lease.
+**One enumeration pass returns every stable entry exactly once.** This is
+unconditional and it outranks the caching rules above. POSIX's latitude covers
+*membership* only — an entry created or removed while a pass is running may
+appear or not — and it never licenses returning one name twice or dropping a
+name that was present throughout. A pass therefore has exactly three permitted
+outcomes: it is **served exactly**, it fails **loudly with `ESTALE`** so the
+application re-`opendir`s, or the mount is **revoked**. Silently returning a
+repositioned stream is not one of them, and is worse than the revocation it
+would replace: a revoked mount stops, while a repositioned one keeps serving
+wrong answers that look like right ones.
+
+An uncovered page is **bounded to the kernel callback that fetched it** and is
+retired when the next callback begins — entries, buffered EOF and all. What is
+*not* retired is the position: the authority cookie following the last entry
+actually delivered, and the verifier naming the snapshot that cookie counts in.
+Both are resent on the refetch, so the resume is not asserted by this frontend,
+it is **proven by the authority**: `ReadDirOpen` answers a resume whose verifier
+no longer describes the directory with `ESTALE`, and refuses a non-zero cookie
+carrying no verifier outright, rather than repositioning silently. That is what
+makes the uncached path skip no name and repeat none, and it puts the mutation
+check on the readdir verifier (§5.4,
+`TestPagedReaddirRefusesToPageAcrossARemoteMutation`) rather than on the
+presence of a cache lease.
+
+The corollary is a state distinction the frontend has to keep, and getting it
+wrong is how this shipped broken once: a stream that is *deliberately uncovered
+with a proven position* is not the same as one holding *leftovers from a lease
+that lapsed*. Both have no live grant. Only the second may be reset. Collapsing
+them — clearing the uncovered mark at retirement while keeping the cookie — made
+the lapsed-lease reset fire on a healthy uncovered stream and restart it from
+the first entry, so a stable directory came back with its first callback's worth
+of names delivered twice. Where such a reset does have to drop a position the
+kernel has already read from, it marks the stream invalidated so the next
+resume is answered with `ESTALE`, because re-reading from the beginning would
+repeat every name already taken.
+
+Note that `ESTALE` here is driven by the *directory's own* mutation, not by
+cache pressure: a stable directory enumerated beside a churning sibling never
+sees one, which is what keeps enumeration completing under a package install
+rather than livelocking on retry.
 
 ### 5.5 LOCAL routes
 
