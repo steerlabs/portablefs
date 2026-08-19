@@ -217,6 +217,16 @@ type replyPublication struct {
 	dirPlusLookups           *dirPlusLookupTransaction
 	snapshotSequence         uint64
 	payloadError             error
+	// admittedData is append-only, unlike data, which reply preparation trims
+	// as it settles each candidate. A whole-file purge has to wait for the
+	// physical reply of every read it admitted, and settling happens before that
+	// write: draining on data alone would let a settled-but-unwritten reply fill
+	// a folio after the purge that was supposed to remove it.
+	admittedData []publicationCoordinate
+	// unlicensed carries the READ candidates this reply delivers without cache
+	// authority. The bytes still reach the kernel page cache, so the mount still
+	// owes their withdrawal: see settleReplyPublicationLocked.
+	unlicensed []replyDataPublication
 
 	// Physical reply state is protected by rawFileSystem.mu.
 	owner             *rawFileSystem
@@ -1361,6 +1371,18 @@ func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublicati
 	for _, data := range publication.data {
 		r.settleDataPublicationLocked(data, successful)
 	}
+	// A READ delivered without cache authority still fills folios: the kernel
+	// caches read data for a KEEP_CACHE description whether or not this mount
+	// holds a lease over it. Recording the payload is what keeps the mount's
+	// belief about the kernel true, so the next recall of this coordinate
+	// actually issues the withdrawal instead of concluding there is nothing to
+	// withdraw. It is recorded here, at the physical edge, because before it
+	// there are no pages.
+	for _, data := range publication.unlicensed {
+		if successful && data.record != nil && !data.record.reclaimed {
+			r.cachedData[data.inode] = data.record
+		}
+	}
 	// Keep every candidate addressable until physical settlement; physical
 	// failure reaches the same point with successful=false.
 	r.releaseReplyReservationsLocked(publication)
@@ -1506,7 +1528,6 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		}
 	}
 	dropKeepCache := false
-	retryRead := false
 	if len(publication.data) != 0 {
 		retained := publication.data[:0]
 		for _, candidate := range publication.data {
@@ -1522,9 +1543,18 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 				r.mount.leases.remaining(leaseKey{
 					family: authoritypb.LeaseFamily_LEASE_FAMILY_DATA, identity: candidate.record.identity,
 				}, authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ, time.Now()) <= 0 {
+				// A READ whose coordinate was recalled while it was in flight
+				// still delivers its bytes. It cannot be turned into a retry:
+				// the only retryable errno is EAGAIN and read(2) may not return
+				// it on a blocking description. The bytes are ordered instead --
+				// the recall's whole-file purge waits for this physical reply
+				// before it invalidates, so these folios cannot outlive the
+				// mutation, and this reply precedes the mutation's own reply.
+				// A reply that lands outside that purge's reach still owes the
+				// kernel a purge of its own, which beginBufferedRead records.
 				r.settleDataPublicationLocked(candidate, false)
 				if opcode == 15 { // READ
-					retryRead = true
+					publication.unlicensed = append(publication.unlicensed, candidate)
 				} else {
 					dropKeepCache = true
 				}
@@ -1548,9 +1578,6 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	// Exact post-state is consumed by the daemon cache. Stock FUSE replies do
 	// not carry PortableFS trailers; returning the original payload length is
 	// what preserves the upstream wire shape.
-	if retryRead {
-		return 0, fuse.EAGAIN, fuse.OK
-	}
 	return payloadSize, fuse.OK, fuse.OK
 }
 
@@ -2349,10 +2376,18 @@ func (r *rawFileSystem) SetAttr(_ <-chan struct{}, input *fuse.SetAttrIn, out *f
 	return fuse.OK
 }
 
-// beginBufferedRead registers the possible page-cache install before issuing
-// the authority RPC. It never waits: a request arriving after a recall cut
-// must return retryable instead of parking while it may hold a kernel folio
-// lock needed by the invalidation that will reopen the cut.
+// beginBufferedRead registers the possible page-cache install. The caller must
+// already hold this mount's bulk slot: registration is what a whole-file purge
+// waits for, so a publication that still has to queue for transport capacity
+// would make that purge wait on the lane it is competing for.
+//
+// It never refuses and never waits. A read that arrives while this mount is
+// repairing the coordinate is admitted and ordered by the authority instead: it
+// is answered with the applied bytes, and the purge that follows the recall
+// waits for this reply before invalidating. Refusing here is not available --
+// the kernel holds the folio lock, so the only non-blocking answer is EAGAIN,
+// which read(2) may not return on a blocking description -- and waiting here is
+// not available either, for the same folio.
 func (r *rawFileSystem) beginBufferedRead(ctx context.Context, record *inodeRecord) bool {
 	publication := replyPublicationFromContext(ctx)
 	if publication == nil || record == nil || record.id == 0 {
@@ -2361,21 +2396,10 @@ func (r *rawFileSystem) beginBufferedRead(ctx context.Context, record *inodeReco
 	coordinate := publicationCoordinate{kind: publicationItemData, item: record.identity}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// A buffered READ is not refused because this mount is mutating something.
-	// It cannot be: the kernel holds the folio lock while it waits for the reply,
-	// so a refusal is the only non-blocking answer and the only errno available
-	// for it is EAGAIN, which read(2) may not return on a blocking description --
-	// stock Linux hands it straight to the caller, where it is either a spurious
-	// failure or, for a runtime that polls, a permanent stall. Ordering is
-	// established at the purge instead: a whole-file invalidation waits for every
-	// read admitted before it (drainDataPublications), and a read admitted after
-	// it was issued after the mutation applied, so its bytes are the new state.
-	if r.repairingCoordinates[coordinate] {
-		return false
-	}
 	r.publishingInodes[record.key.inode]++
 	r.admitSourcePublicationLocked(coordinate)
 	publication.data = append(publication.data, replyDataPublication{inode: record.key.inode, record: record, coordinate: coordinate})
+	publication.admittedData = append(publication.admittedData, coordinate)
 	return true
 }
 
@@ -2421,20 +2445,31 @@ func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 		return lifecycle
 	}
 	defer finish()
+	ctx, releaseBulk, errno := r.mount.holdBulk(ctx)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	defer releaseBulk()
 	readOnly := input.Flags&uint32(syscall.O_ACCMODE) == uint32(syscall.O_RDONLY) && input.Flags&uint32(syscall.O_TRUNC) == 0
+	handle, flags, errno := record.node.Open(ctx, input.Flags)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	// The publication is registered on return, not before the call. A READ has
+	// to register first, because its reply carries bytes a concurrent purge must
+	// be ordered against; an OPEN carries none, and its publication exists only
+	// to bind this reply's KEEP_CACHE decision to the grant the reply carries.
+	// Registering it across the authority call would put an open that is waiting
+	// on a recall into the very drain that recall performs.
 	dataAdmitted := false
 	if readOnly {
 		dataAdmitted = r.beginBufferedRead(ctx, record)
 		if !dataAdmitted {
-			return fuse.EAGAIN
+			// The publication is this callback's own reply bookkeeping; missing
+			// it is an internal accounting failure, never a coherence answer.
+			r.closeOrphanedFile(ctx, handle)
+			return fuse.EIO
 		}
-	}
-	handle, flags, errno := record.node.Open(ctx, input.Flags)
-	if errno != 0 {
-		if dataAdmitted {
-			r.cancelBufferedRead(ctx, record)
-		}
-		return fuse.Status(errno)
 	}
 	id, ok := r.addHandle(record, &handleRecord{file: handle})
 	if !ok {
@@ -2493,11 +2528,26 @@ func (r *rawFileSystem) Read(_ <-chan struct{}, input *fuse.ReadIn, buf []byte) 
 		return nil, lifecycle
 	}
 	defer finish()
+	// The bulk slot is taken before the data publication is registered, not
+	// inside the authority call underneath it. A whole-file purge waits for
+	// registered publications, and the source mutation that drives that purge is
+	// itself holding a bulk slot; registering first would let a saturated lane
+	// close a wait cycle between the purge and the reads it is waiting for.
+	ctx, releaseBulk, errno := r.mount.holdBulk(ctx)
+	if errno != 0 {
+		return nil, fuse.Status(errno)
+	}
+	defer releaseBulk()
 	if handle.buffered && !r.beginBufferedRead(ctx, handleRecord.inode) {
-		return nil, fuse.EAGAIN
+		return nil, fuse.EIO
 	}
 	result, errno := handle.node.Read(ctx, handle, buf, int64(input.Offset))
-	if handle.buffered && (errno != 0 || result == nil || result.Size() == 0) {
+	// A short or empty result is still a page-cache install. Stock zero-fills
+	// the remainder of the requested range and marks those folios uptodate, so
+	// an end-of-file read past a truncation leaves real pages behind; treating
+	// it as "nothing was published" hid them from every later withdrawal. Only
+	// a failed read publishes nothing, because the kernel populates nothing.
+	if handle.buffered && (errno != 0 || result == nil) {
 		r.cancelBufferedRead(ctx, handleRecord.inode)
 	}
 	return result, fuse.Status(errno)

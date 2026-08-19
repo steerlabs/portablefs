@@ -353,7 +353,7 @@ func (r *leaseRegistry) completeRecalls(recalls []*authoritypb.LeaseRecall) ([]*
 	return discharges, nil
 }
 
-func (r *leaseRegistry) finishRecalls(recalls []*authoritypb.LeaseRecall) {
+func (r *leaseRegistry) finishRecalls(recalls []*authoritypb.LeaseRecall) error {
 	r.mu.Lock()
 	keys := make([]leaseKey, 0, len(recalls))
 	for _, recall := range recalls {
@@ -372,6 +372,7 @@ func (r *leaseRegistry) finishRecalls(recalls []*authoritypb.LeaseRecall) {
 			r.mount.raw.openLeaseCoordinate(coordinate)
 		}
 	}
+	return nil
 }
 
 func (m *Mount) dischargeSourceLeases(discharge *authoritypb.SourceLeaseDischarge) error {
@@ -700,7 +701,7 @@ func (m *Mount) runLeaseEvents(ctx context.Context) {
 			err = m.rpc.AcknowledgeLeaseEvent(ackCtx, event.GetCursor(), discharges)
 			cancel()
 			if err == nil {
-				m.leases.finishRecalls(event.GetRecalls())
+				err = m.leases.finishRecalls(event.GetRecalls())
 			}
 		default:
 			err = errors.New("fusev3: unknown lease event phase")
@@ -1054,8 +1055,8 @@ func (r *rawFileSystem) drainDataPublications(coordinate publicationCoordinate) 
 	r.mu.Lock()
 	pending := make(map[*replyPublication]struct{})
 	for _, publication := range r.replyPublications {
-		for _, data := range publication.data {
-			if data.coordinate == coordinate {
+		for _, admitted := range publication.admittedData {
+			if admitted == coordinate {
 				pending[publication] = struct{}{}
 				break
 			}
@@ -1103,9 +1104,14 @@ func (r *rawFileSystem) invalidateLease(key leaseKey) error {
 			return errors.New("fusev3: attribute lease invalidation has no kernel notification channel")
 		}
 		r.mu.Lock()
-		record := r.cachedAttrs[key.identity]
 		delete(r.cachedAttrs, key.identity)
 		delete(r.cachedAttrPayloads, key.identity)
+		// Notify on the inode this mount knows, not on the daemon payload it
+		// happens to be retaining. The kernel caches an attribute from any reply
+		// that carried a lifetime, whether or not this daemon kept a copy of it,
+		// so keying the withdrawal on the daemon's own cache let a recall decide
+		// there was nothing to expire while the kernel was still serving a size.
+		record := r.byIdentityLocked(key.identity)
 		r.mu.Unlock()
 		if record != nil {
 			if status := notifier.InodeNotify(record.id, -1, 0); !status.Ok() && status != fuse.ENOENT {
@@ -1121,11 +1127,14 @@ func (r *rawFileSystem) invalidateLease(key leaseKey) error {
 			return err
 		}
 		r.mu.Lock()
+		// Same rule as attributes: the purge follows the inode, not this
+		// daemon's belief about which pages it is tracking. Stock caches read
+		// data for a KEEP_CACHE description regardless of what the daemon
+		// retained, so a withdrawal conditioned on the daemon's own map can skip
+		// folios the kernel is still serving.
 		record := r.byIdentityLocked(key.identity)
 		if record != nil && r.cachedData[record.key.inode] == record {
 			delete(r.cachedData, record.key.inode)
-		} else {
-			record = nil
 		}
 		r.mu.Unlock()
 		if record != nil {
@@ -1133,6 +1142,9 @@ func (r *rawFileSystem) invalidateLease(key leaseKey) error {
 				return fmt.Errorf("fusev3: invalidate leased data for inode %d: %v", record.id, status)
 			}
 		}
+		// Reads admitted from here until this recall finishes cannot be covered
+		// by the purge that just ran. beginBufferedRead records that debt and
+		// settleUnlicensedData discharges it.
 	case authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION:
 		r.mu.Lock()
 		handles := make([]*dirHandle, 0)

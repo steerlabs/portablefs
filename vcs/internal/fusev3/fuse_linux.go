@@ -791,6 +791,35 @@ func (m *Mount) acquireBulk(ctx context.Context) syscall.Errno {
 
 func (m *Mount) releaseBulk() { <-m.bulk }
 
+// bulkSlotKey marks a context whose callback already holds this mount's bulk
+// slot.
+type bulkSlotKey struct{}
+
+// holdBulk takes the bulk slot for a whole FUSE callback rather than for each
+// authority call inside it, and marks the context so those calls reuse it.
+//
+// A callback needs this when it registers reply bookkeeping that a coherence
+// wait later depends on -- a buffered read's data publication is the case that
+// matters. Registering before the slot is held makes the purge that waits for
+// those publications wait, transitively, on bulk-lane capacity that the
+// mutation driving the purge is itself consuming.
+//
+// Acquisition is bounded by the mount's request timeout so a saturated lane
+// fails the callback instead of parking it; the slot is then held for the rest
+// of the callback, including any deadline the operation sets for itself.
+func (m *Mount) holdBulk(parent context.Context) (context.Context, func(), syscall.Errno) {
+	if held, _ := parent.Value(bulkSlotKey{}).(bool); held {
+		return parent, func() {}, 0
+	}
+	acquire, cancel := context.WithTimeout(parent, m.requestTimeout)
+	errno := m.acquireBulk(acquire)
+	cancel()
+	if errno != 0 {
+		return parent, func() {}, errno
+	}
+	return context.WithValue(parent, bulkSlotKey{}, true), m.releaseBulk, 0
+}
+
 // reclaimQueue is the frontend's forgotten-capability backlog.
 //
 // It is a FIFO with an admission watermark rather than a fixed channel because
@@ -1063,10 +1092,11 @@ func (n *node) opContext(parent context.Context) (context.Context, context.Cance
 func (n *node) read(parent context.Context, request *authoritypb.Request) (*authoritypb.Response, syscall.Errno) {
 	ctx, cancel := n.opContext(parent)
 	defer cancel()
-	if errno := n.mount.acquireBulk(ctx); errno != 0 {
+	ctx, releaseBulk, errno := n.mount.holdBulk(ctx)
+	if errno != 0 {
 		return nil, errno
 	}
-	defer n.mount.releaseBulk()
+	defer releaseBulk()
 	requestStart := time.Now()
 	response, consumption, err := n.mount.rpc.CallReadRetained(ctx, request, n.mount.forceTerminalResponseRevocation)
 	if grantErr := captureLeaseGrants(n.mount, replyPublicationFromContext(parent), response, requestStart); grantErr != nil {
@@ -1254,10 +1284,11 @@ func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*au
 func (n *node) mutateWithSource(parent context.Context, request *authoritypb.Request, gate *sourcePublicationGate) (*authoritypb.Response, syscall.Errno) {
 	ctx, cancel := n.opContext(parent)
 	defer cancel()
-	if errno := n.mount.acquireBulk(ctx); errno != 0 {
+	ctx, releaseBulk, errno := n.mount.holdBulk(ctx)
+	if errno != 0 {
 		return nil, errno
 	}
-	defer n.mount.releaseBulk()
+	defer releaseBulk()
 	requestStart := time.Now()
 	response, err := n.mount.callMutation(ctx, request, gate)
 	if grantErr := captureLeaseGrants(n.mount, replyPublicationFromContext(parent), response, requestStart); grantErr != nil {
@@ -2334,10 +2365,11 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	// A blocking lock request has no operation deadline: it is defined to wait
 	// for the holder. It still occupies a bulk slot, because it occupies a
 	// transport slot for exactly as long.
-	if errno := n.mount.acquireBulk(ctx); errno != 0 {
+	ctx, releaseBulk, errno := n.mount.holdBulk(ctx)
+	if errno != 0 {
 		return errno
 	}
-	defer n.mount.releaseBulk()
+	defer releaseBulk()
 	response, err := n.mount.callMutation(ctx, request, nil)
 	return rpcErrno(response, err)
 }
