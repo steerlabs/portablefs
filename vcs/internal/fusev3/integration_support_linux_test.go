@@ -217,6 +217,7 @@ type integrationTransport struct {
 	session        []byte
 	hookMu         sync.Mutex
 	beforeMutation func(*authoritypb.Request)
+	afterMutation  func(*authoritypb.Request, *authoritypb.Response, error)
 }
 
 func (t *integrationTransport) SessionID() []byte { return append([]byte(nil), t.session...) }
@@ -241,12 +242,25 @@ func (t *integrationTransport) CallMutationWithIdentityRetained(
 	if before != nil {
 		before(request)
 	}
-	return t.Client.CallMutationWithIdentityRetained(ctx, request, assigned, force)
+	response, consumption, err := t.Client.CallMutationWithIdentityRetained(ctx, request, assigned, force)
+	t.hookMu.Lock()
+	after := t.afterMutation
+	t.hookMu.Unlock()
+	if after != nil {
+		after(request, response, err)
+	}
+	return response, consumption, err
 }
 
 func (t *integrationTransport) setBeforeMutation(before func(*authoritypb.Request)) {
 	t.hookMu.Lock()
 	t.beforeMutation = before
+	t.hookMu.Unlock()
+}
+
+func (t *integrationTransport) setAfterMutation(after func(*authoritypb.Request, *authoritypb.Response, error)) {
+	t.hookMu.Lock()
+	t.afterMutation = after
 	t.hookMu.Unlock()
 }
 

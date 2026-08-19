@@ -1866,6 +1866,13 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		err    error
 	}
 	injected := make(chan existingCreateInjection, 1)
+	type existingCreateResult struct {
+		errno   int32
+		failure authoritypb.FailureClass
+		retry   uint64
+		err     error
+	}
+	results := make(chan existingCreateResult, 8)
 	var injectOnce sync.Once
 	f.transports[0].setBeforeMutation(func(request *authoritypb.Request) {
 		create := request.GetCreate()
@@ -1882,10 +1889,22 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		})
 	})
 	defer f.transports[0].setBeforeMutation(nil)
+	f.transports[0].setAfterMutation(func(request *authoritypb.Request, response *authoritypb.Response, err error) {
+		create := request.GetCreate()
+		if create != nil && string(create.GetName()) == existingName {
+			results <- existingCreateResult{
+				errno: response.GetErrno(), failure: response.GetFailure(),
+				retry: response.GetVisibilityRetrySequence(), err: err,
+			}
+		}
+	})
+	defer f.transports[0].setAfterMutation(nil)
+	var existingOpenErr error
 	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
-		file, err := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
-		if err != nil {
-			t.Fatalf("open existing name through FUSE_CREATE: %v (frontend fatal cause: %v)", err, f.mounts[0].fatalError())
+		file, openErr := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if openErr != nil {
+			existingOpenErr = openErr
+			return
 		}
 		if _, err := file.Stat(); err != nil {
 			_ = file.Close()
@@ -1899,6 +1918,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		}
 	})
 	f.transports[0].setBeforeMutation(nil)
+	f.transports[0].setAfterMutation(nil)
 	var injection existingCreateInjection
 	select {
 	case injection = <-injected:
@@ -1907,6 +1927,14 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	}
 	if injection.err != nil {
 		t.Fatalf("materialize existing-create race after the negative lookup: %v", injection.err)
+	}
+	var rpcResults []existingCreateResult
+	for len(results) != 0 {
+		rpcResults = append(rpcResults, <-results)
+	}
+	if existingOpenErr != nil {
+		t.Fatalf("open existing name through FUSE_CREATE: %v (RPC results=%+v; frontend fatal cause: %v)",
+			existingOpenErr, rpcResults, f.mounts[0].fatalError())
 	}
 	defer func() {
 		if err := injection.forget(); err != nil {
