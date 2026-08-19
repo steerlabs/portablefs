@@ -677,7 +677,8 @@ message AckVisibilityRequest {
   VisibilityCursor cursor = 1;
   // Retired protocol-5 development fields. They remain parseable so an old
   // client receives a deterministic refusal, but no admitted profile sends
-  // them. Lockless Linux namespace expiration removed the parent-lock cycle.
+  // them: the parent-lock cycle they reported belonged to the retired
+  // parent-exclusive repair model.
   bool blocked = 2 [deprecated = true];
   repeated uint64 blocked_parent_kernel_inos = 3 [deprecated = true];
   // Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26

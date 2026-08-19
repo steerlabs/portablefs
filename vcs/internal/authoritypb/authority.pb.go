@@ -5058,7 +5058,8 @@ type AckVisibilityRequest struct {
 	Cursor *VisibilityCursor      `protobuf:"bytes,1,opt,name=cursor,proto3" json:"cursor,omitempty"`
 	// Retired protocol-5 development fields. They remain parseable so an old
 	// client receives a deterministic refusal, but no admitted profile sends
-	// them. Lockless Linux namespace expiration removed the parent-lock cycle.
+	// them: the parent-lock cycle they reported belonged to the retired
+	// parent-exclusive repair model.
 	//
 	// Deprecated: Marked as deprecated in proto/authority/v1/authority.proto.
 	Blocked bool `protobuf:"varint,2,opt,name=blocked,proto3" json:"blocked,omitempty"`

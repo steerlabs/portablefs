@@ -1267,7 +1267,7 @@ func (h *VolumeHandler) resetFskitWriteForRetry(id volumeserver.SessionID, body 
 
 // rejectPendingFskitWrite consumes a COMMIT that entered the exact
 // replay/source-gate state but was refused before storage apply. It returns a
-// structured REJECTED result so the patched kernel can prove no bytes landed,
+// structured REJECTED result so the frontend can prove no bytes landed,
 // discard its staged syscall, and avoid treating an ordinary admission error
 // as an ambiguous transport failure.
 func (h *VolumeHandler) rejectPendingFskitWrite(id volumeserver.SessionID, body *authoritypb.FskitWriteRequest, cause error) *authoritypb.Response {
