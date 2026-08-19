@@ -152,14 +152,17 @@ then
 fi
 
 # Protocol 6 has one coherent lease contract. The old non-participant profile
-# name remains reserved in the source schema (and therefore in generated
-# descriptor bytes), while docs and the changelog may describe its retirement.
-# It must not re-enter executable code, tests, scripts, or configuration.
+# and the retired patched-kernel repair model keep their names reserved in the
+# source schema (and therefore in generated descriptor bytes), while docs and
+# the changelog may describe their retirement. Neither may re-enter executable
+# code, tests, scripts, or configuration.
 if rg --hidden -n \
   -e 'CoherenceUncached' \
   -e 'COHERENCE_PROFILE_UNCACHED' \
   -e 'PORTABLEFS_COHERENCE' \
   -e '--coherence uncached' \
+  -e 'LOCKLESS_EXPIRATION' \
+  -e 'NamespaceRepairLocklessExpiration' \
   . \
   -g '!.git' \
   -g '!docs' \
@@ -173,9 +176,10 @@ then
 fi
 
 # Active product material must describe the protocol-6 stock-FUSE architecture.
-# Historical qualification receipts and the retained kernel patch directory are
-# intentionally outside this list: they remain evidence, not a build or runtime
-# dependency. Keeping the input list explicit makes a newly active contract an
+# Historical qualification receipts are intentionally outside this list: they
+# remain evidence, not a build or runtime dependency. The patch series for the
+# retired private ABI is no longer in the tree at all; git history holds it.
+# Keeping the input list explicit makes a newly active contract an
 # intentional review event rather than silently granting all docs authority.
 step "active stock-FUSE contract scan"
 if rg -n \
