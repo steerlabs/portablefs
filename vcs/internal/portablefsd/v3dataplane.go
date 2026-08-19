@@ -2135,8 +2135,20 @@ func v3KeepAliveInterval(lease, repairBudget time.Duration) time.Duration {
 }
 func authorityIdentity(item *authoritypb.Item) ([16]byte, error) {
 	var out [16]byte
-	if item == nil || len(item.GetToken()) != 16 || len(item.GetStableIdentity()) != len(out) {
-		return out, errors.New("authority item omitted its 16-byte capability or stable identity")
+	// Naming the exact field is the difference between a one-line diagnosis and
+	// an afternoon: a nil item means the caller never had one to validate,
+	// which is a different defect from an authority that sent a short field.
+	if item == nil {
+		return out, errors.New("authority item is absent")
+	}
+	if len(item.GetToken()) != 16 {
+		return out, fmt.Errorf("authority item capability is %d bytes, want 16", len(item.GetToken()))
+	}
+	if len(item.GetStableIdentity()) != len(out) {
+		return out, fmt.Errorf(
+			"authority item stable identity is %d bytes, want %d",
+			len(item.GetStableIdentity()), len(out),
+		)
 	}
 	copy(out[:], item.GetStableIdentity())
 	if out == ([16]byte{}) {
