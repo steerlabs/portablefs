@@ -2316,3 +2316,57 @@ func TestV3DataPlanePreservesV1VisibilityInterruptionBoundary(t *testing.T) {
 		t.Fatalf("v1 visibility interruption errno=%d, want frozen EINTR", errno)
 	}
 }
+
+// A malformed authority item used to report one sentence for four distinct
+// defects. An absent item means the caller never had one to hand over, which
+// is a different bug in a different component than an authority that sent a
+// short capability — and the frontend surfaces this text to an operator as the
+// terminal cause of the coherence stream, so it has to name the actual field.
+func TestAuthorityIdentityNamesTheExactMalformedField(t *testing.T) {
+	full := bytes.Repeat([]byte{0x11}, 16)
+	for _, testCase := range []struct {
+		name string
+		item *authoritypb.Item
+		want string
+	}{
+		{name: "absent", item: nil, want: "authority item is absent"},
+		{
+			name: "short capability",
+			item: &authoritypb.Item{Token: full[:8], StableIdentity: full},
+			want: "authority item capability is 8 bytes, want 16",
+		},
+		{
+			name: "missing capability",
+			item: &authoritypb.Item{StableIdentity: full},
+			want: "authority item capability is 0 bytes, want 16",
+		},
+		{
+			name: "short stable identity",
+			item: &authoritypb.Item{Token: full, StableIdentity: full[:4]},
+			want: "authority item stable identity is 4 bytes, want 16",
+		},
+		{
+			name: "zero stable identity",
+			item: &authoritypb.Item{Token: full, StableIdentity: make([]byte, 16)},
+			want: "authority item used the zero stable identity",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := authorityIdentity(testCase.item)
+			if err == nil {
+				t.Fatalf("authorityIdentity accepted a malformed item")
+			}
+			if err.Error() != testCase.want {
+				t.Fatalf("authorityIdentity said %q, want %q", err.Error(), testCase.want)
+			}
+		})
+	}
+
+	identity, err := authorityIdentity(authorityTestItem(2, authoritypb.Attr_REGULAR, 0x31, 0x41))
+	if err != nil {
+		t.Fatalf("authorityIdentity rejected a well-formed item: %v", err)
+	}
+	if identity != [16]byte(bytes.Repeat([]byte{0x41}, 16)) {
+		t.Fatalf("authorityIdentity returned %x", identity)
+	}
+}
