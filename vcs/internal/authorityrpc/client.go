@@ -333,6 +333,33 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	return c, nil
 }
 
+// attachBody builds the attach request for exactly one session purpose. The
+// authority requires every mount-only field to be absent on a route-admin
+// attach - a route-admin session takes no topology read side, so declaring a
+// revision it would then have to agree with is meaningless - and the two
+// purposes therefore share only the fields set unconditionally here. Setting a
+// field for the wrong purpose is a refusal no configuration can repair, so the
+// purposes never touch the same assignment.
+func (c *Client) attachBody() *authoritypb.AttachRequest {
+	attach := &authoritypb.AttachRequest{
+		VolumeId: c.cfg.VolumeID, AccessToken: append([]byte(nil), c.cfg.AccessToken...),
+		ReplaySlots:     c.cfg.ReplaySlots,
+		AttachAttemptId: append([]byte(nil), c.attachAttemptID[:]...),
+		Purpose:         c.cfg.Purpose,
+	}
+	if c.cfg.Purpose != authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
+		return attach
+	}
+	attach.RoutesRevision = append([]byte(nil), c.cfg.RoutesRevision[:]...)
+	attach.FrontendProfile = c.cfg.FrontendProfile
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		attach.FskitCachedNameCapacity = uint32(c.cfg.FskitCachedNameCapacity)
+		attach.FskitRepairBudgetMillis = uint64(c.cfg.FskitRepairBudget / time.Millisecond)
+		attach.FskitNamespaceRepair = c.cfg.FskitNamespaceRepair
+	}
+	return attach
+}
+
 func (c *Client) attachAndActivate(ctx context.Context) error {
 	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
 	defer handshakeCancel()
@@ -355,20 +382,7 @@ func (c *Client) attachAndActivate(ctx context.Context) error {
 	c.lifecycle.Unlock()
 	c.sessionReauthorization.Store(hasFeatures(data.features, []string{sessionReauthorizationFeature}))
 
-	attach := &authoritypb.AttachRequest{
-		VolumeId: c.cfg.VolumeID, AccessToken: append([]byte(nil), c.cfg.AccessToken...),
-		ReplaySlots:     c.cfg.ReplaySlots,
-		RoutesRevision:  append([]byte(nil), c.cfg.RoutesRevision[:]...),
-		AttachAttemptId: append([]byte(nil), c.attachAttemptID[:]...),
-		Purpose:         c.cfg.Purpose,
-		FrontendProfile: c.cfg.FrontendProfile,
-	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		attach.FskitCachedNameCapacity = uint32(c.cfg.FskitCachedNameCapacity)
-		attach.FskitRepairBudgetMillis = uint64(c.cfg.FskitRepairBudget / time.Millisecond)
-		attach.FskitNamespaceRepair = c.cfg.FskitNamespaceRepair
-	}
-	attachRequest := &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Attach{Attach: attach}}
+	attachRequest := &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Attach{Attach: c.attachBody()}}
 	response, err := rawRoundTrip(data.conn, data.maxFrame, attachRequest)
 	for err != nil {
 		// The provisional result is keyed by attach_attempt_id. Reconnect both

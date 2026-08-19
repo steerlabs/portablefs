@@ -122,6 +122,11 @@ func clientConfig(o options, token []byte, revision [32]byte, purpose authorityp
 		RoutesRevision:     revision,
 	}
 	if purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
+		// A mount-purpose attach is what learns the volume's active routing
+		// revision from the refusal that carries it, so this tool declares the
+		// same frontend profile the real Linux mount declares. Anything else
+		// would be refused for the wrong reason and prove nothing about routing.
+		cfg.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
 		cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return administrativeAbsenceProof(), nil
 		}
