@@ -110,6 +110,13 @@ const (
 	integrationRequestTimeout = 10 * time.Second
 	integrationMaxFrame       = 4 << 20
 	integrationReplaySlots    = 64
+	// The authority's replay-slot ceiling, which is a different number from the
+	// slots these mounts declare. It has to admit the largest declaration any
+	// production frontend makes, and the files gateway declares
+	// mountv3.ReplaySlots -- a constant this package cannot name, because
+	// mountv3 imports it. 128 is that value; an authority capped below it would
+	// refuse the real gateway for a reason no deployment has.
+	integrationMaxReplaySlots = 128
 	integrationMaxInFlight    = 64
 	// The transport refuses to run unless the handler advertises exactly the
 	// bounds the server enforces, so these are shared by both.
@@ -294,20 +301,25 @@ type integrationFixture struct {
 
 	serverTLS *tls.Config
 	clientTLS *tls.Config
+	// credentials is the same identity material as clientTLS, in the PEM form a
+	// non-mounting participant configured from a control-plane grant receives.
+	credentials integrationCredentials
 
 	// clockSkew drives the authority's clock. Advancing it ages session leases
 	// without making the test sleep for real.
 	clockSkew atomic.Int64
 
-	store      *xfsstore.Volume
-	routes     *authorityrpc.RoutesController
-	authority  *volumeserver.Authority
-	membership *recordingMembership
-	counter    *countingHandler
-	listener   net.Listener
-	stopServe  context.CancelFunc
-	served     chan error
-	stopped    bool
+	store        *xfsstore.Volume
+	routes       *authorityrpc.RoutesController
+	authority    *volumeserver.Authority
+	fskitStaging *authorityrpc.FskitWriteStaging
+	membership   *recordingMembership
+	fencer       *recordingFencer
+	counter      *countingHandler
+	listener     net.Listener
+	stopServe    context.CancelFunc
+	served       chan error
+	stopped      bool
 
 	clients    []*authorityrpc.Client
 	transports []*integrationTransport
@@ -329,7 +341,7 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 	cfg.rules = rules
 	env := requireIntegrationEnvironment(t)
 	f := &integrationFixture{t: t, cfg: cfg, env: env}
-	f.serverTLS, f.clientTLS = integrationTLS(t)
+	f.serverTLS, f.clientTLS, f.credentials = integrationTLS(t)
 
 	f.volumeRoot = filepath.Join(env.xfsRoot, integrationVolumeDirectory(t))
 	if err := os.Mkdir(f.volumeRoot, 0o700); err != nil {
@@ -432,7 +444,7 @@ func (f *integrationFixture) start() {
 	}
 	f.store = store
 	authority, err := volumeserver.New(integrationVolumeID, volumeserver.Config{
-		SessionLease: f.cfg.SessionLease, MaxReplaySlots: integrationReplaySlots,
+		SessionLease: f.cfg.SessionLease, MaxReplaySlots: integrationMaxReplaySlots,
 		MaxSessions: 8, MaxLockRecords: 4096, Now: f.now,
 	})
 	if err != nil {
@@ -445,13 +457,25 @@ func (f *integrationFixture) start() {
 	}
 	f.listener = listener
 	f.membership = newRecordingMembership()
+	f.fencer = &recordingFencer{inner: authority}
+	// The FSKit-write bounds are what makes this authority able to accept a
+	// synchronous-repair frontend at all: HELLO refuses that profile outright
+	// unless they are complete. Nothing in this fixture issues an FSKit write --
+	// the only sync-repair participant here is the read-only files gateway --
+	// but an authority that could not have accepted one would be answering a
+	// handshake production never runs.
+	fskitStaging, err := authorityrpc.OpenFskitWriteStaging(f.writeStagingRoot)
+	if err != nil {
+		t.Fatalf("open FSKit write staging: %v", err)
+	}
+	f.fskitStaging = fskitStaging
 	// The authority is the source of truth for the volume's machine-local
 	// routing revision, and it refuses every mount whose declared revision is
 	// not the active one. The fixture therefore installs the declaration these
 	// mounts are about to agree with, through the same assembly and the same
 	// barrier a live operator's change would use.
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
-		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: f.membership,
+		Store: store, Fencer: f.fencer, Locks: authority.Locks(), Membership: f.membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
 		MaxCachedNameCapacity: integrationCachedNames, MaxRepairBudget: time.Minute,
 		CacheLeaseTTL: integrationCacheLeaseTTL, MaxCacheLeasesPerSession: integrationCacheLeasesPerSession,
@@ -483,6 +507,15 @@ func (f *integrationFixture) start() {
 		WriteAdmissionProgressTimeout: integrationWriteProgressTimeout,
 		WriteAbsoluteTimeout:          integrationWriteAbsoluteTimeout,
 		TerminalDeliveryTimeout:       integrationTerminalDeliveryTimeout,
+
+		FskitWriteStaging:                   f.fskitStaging,
+		MaxFskitWriteBytes:                  authorityrpc.RequiredFskitWriteBytes,
+		MaxFskitWriteStagingBytesPerSession: integrationWriteBytesPerSession,
+		MaxFskitWriteStagingBytes:           integrationWriteBytes,
+		MaxFskitWritesPerSession:            integrationWritesPerSession,
+		MaxFskitWrites:                      integrationWrites,
+		FskitWriteProgressTimeout:           integrationWriteProgressTimeout,
+		FskitWriteAbsoluteTimeout:           integrationWriteAbsoluteTimeout,
 	}
 	coordination.Bind(handler)
 	f.counter = &countingHandler{inner: handler}
@@ -593,6 +626,12 @@ func (f *integrationFixture) stopAuthority() {
 }
 
 func (f *integrationFixture) closeStore() {
+	if f.fskitStaging != nil {
+		if err := f.fskitStaging.Close(); err != nil {
+			f.t.Errorf("close FSKit write staging: %v", err)
+		}
+		f.fskitStaging = nil
+	}
 	if f.store == nil {
 		return
 	}
@@ -600,6 +639,32 @@ func (f *integrationFixture) closeStore() {
 		f.t.Errorf("close XFS volume: %v", err)
 	}
 	f.store = nil
+}
+
+// recordingFencer is the authority's own SessionFencer with a log. Recall-budget
+// exhaustion has no error return and no metric: the coordinator answers a
+// recall the frontend never discharged by fencing the holder and moving on. The
+// only in-process evidence that it happened is this call, so a test that claims
+// no participant was fenced has to hold the fencer itself.
+type recordingFencer struct {
+	inner volumeserver.SessionFencer
+
+	mu      sync.Mutex
+	ordered []volumeserver.SessionID
+}
+
+func (f *recordingFencer) FenceSession(id volumeserver.SessionID) {
+	f.mu.Lock()
+	f.ordered = append(f.ordered, id)
+	f.mu.Unlock()
+	f.inner.FenceSession(id)
+}
+
+// fenced returns every session the authority has fenced, in order.
+func (f *recordingFencer) fenced() []volumeserver.SessionID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.ordered)
 }
 
 func (f *integrationFixture) closeWriteStaging() {
@@ -855,7 +920,20 @@ func (f *integrationFixture) sessionDiagnostics() string {
 	return strings.Join(parts, "; ")
 }
 
-func integrationTLS(t *testing.T) (*tls.Config, *tls.Config) {
+// integrationCredentials is the PEM form of the same identity integrationTLS
+// installs in its *tls.Config pair. A mount receives assembled TLS state from
+// its own binary; a participant configured from a control-plane grant -- the
+// files gateway is the one in this tree -- receives PEM and assembles its own,
+// so a fixture that only produces *tls.Config cannot dial one.
+type integrationCredentials struct {
+	AuthorityCAPEM       []byte
+	ClientCertificatePEM []byte
+	ClientPrivateKeyPEM  []byte
+	// ServerName is the name the authority's leaf certificate carries.
+	ServerName string
+}
+
+func integrationTLS(t *testing.T) (*tls.Config, *tls.Config, integrationCredentials) {
 	t.Helper()
 	now := time.Now()
 	caPub, caKey, err := ed25519.GenerateKey(rand.Reader)
@@ -871,7 +949,7 @@ func integrationTLS(t *testing.T) (*tls.Config, *tls.Config) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	issue := func(serial int64, name string, usages []x509.ExtKeyUsage, dns []string) tls.Certificate {
+	issue := func(serial int64, name string, usages []x509.ExtKeyUsage, dns []string) (tls.Certificate, []byte, []byte) {
 		pub, key, err := ed25519.GenerateKey(rand.Reader)
 		if err != nil {
 			t.Fatal(err)
@@ -891,14 +969,21 @@ func integrationTLS(t *testing.T) (*tls.Config, *tls.Config) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		return certificate
+		return certificate, certPEM, keyPEM
 	}
-	serverCertificate := issue(2, "server", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []string{"localhost"})
-	clientCertificate := issue(3, "client", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
+	serverCertificate, _, _ := issue(2, "server", []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, []string{"localhost"})
+	clientCertificate, clientCertPEM, clientKeyPEM := issue(3, "client", []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, nil)
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
+	credentials := integrationCredentials{
+		AuthorityCAPEM:       pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+		ClientCertificatePEM: clientCertPEM,
+		ClientPrivateKeyPEM:  clientKeyPEM,
+		ServerName:           "localhost",
+	}
 	return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{serverCertificate}},
-		&tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{clientCertificate}, ServerName: "localhost"}
+		&tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{clientCertificate}, ServerName: "localhost"},
+		credentials
 }
 
 // countingHandler is the fixture's RPC meter. It sits where the transport
