@@ -592,6 +592,17 @@ func Main(version string) int {
 		log.Printf("portablefsd: %v", err)
 		return 1
 	}
+	// After this point every diagnostic has somewhere to go. Config failures
+	// above still report to the inherited stderr, because the log's location is
+	// derived from the very config that has not been validated yet.
+	daemonLog, err := openDaemonLog(&cfg)
+	if err != nil {
+		log.Printf("%v", err)
+		return 1
+	}
+	if daemonLog != nil {
+		defer daemonLog.Close()
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	s := NewServer(cfg)

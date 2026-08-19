@@ -4,12 +4,48 @@ package portablefsd
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"path/filepath"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountpath"
 	"github.com/steerlabs/portablefs/vcs/internal/appgroupcontainer"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
+	"github.com/steerlabs/portablefs/vcs/internal/privatepath"
 )
+
+// DaemonLogPath is the account-private log the launchd-managed daemon owns. It
+// sits beside the daemon's state directory, not inside it, so rotating or
+// removing the log can never disturb the sockets and singleton locks the state
+// directory holds.
+func DaemonLogPath(stateDir string) string {
+	return filepath.Join(filepath.Dir(filepath.Clean(stateDir)), "portablefsd.log")
+}
+
+// openDaemonLog gives the daemon its own log file.
+//
+// Under launchd there is nowhere else for a diagnostic to go. When the CLI
+// still spawned portablefsd it handed the child an already-open descriptor for
+// this exact path, so the daemon inherited a log without ever opening one. The
+// move to an SMAppService-managed agent removed that spawner, and its plist
+// sets no StandardErrorPath, so every log.Printf — including the terminal cause
+// of a failed coherence stream, which is recorded at the one point that always
+// holds it — was written to a discarded stderr. A mount could fail with no
+// evidence anywhere on the machine.
+//
+// Failing closed is the right posture: the daemon cannot report a later
+// failure if it has no log, and a daemon that cannot be diagnosed is the exact
+// condition this restores. The check is also not a new fragility — the same
+// directory already has to admit the control socket and the state singleton,
+// so a machine that refuses this file could not have served a mount anyway.
+func openDaemonLog(cfg *Config) (io.Closer, error) {
+	file, err := privatepath.OpenFileAppend(DaemonLogPath(cfg.StateDir))
+	if err != nil {
+		return nil, fmt.Errorf("portablefsd: open daemon log: %w", err)
+	}
+	log.SetOutput(file)
+	return file, nil
+}
 
 func prepareRuntimeConfig(cfg *Config) error {
 	home, err := accountpath.Home()
