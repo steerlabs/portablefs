@@ -276,7 +276,7 @@ func TestFskitSourceMutationRecallsLinuxLeaseWithoutSourceDischarge(t *testing.T
 		t.Fatal(err)
 	}
 	if err := visibility.Register(source.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairLocklessExpiration,
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}

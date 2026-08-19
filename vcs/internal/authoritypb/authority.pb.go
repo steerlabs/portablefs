@@ -402,11 +402,6 @@ const (
 	NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT                   NamespaceRepair = 2
 	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED           NamespaceRepair = 3
 	NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED NamespaceRepair = 4
-	// LOCKLESS_EXPIRATION is the patched Linux FUSE contract. Strict reverse
-	// namespace notifications expire a binding under dcache locks only; they do
-	// not acquire the parent inode's i_rwsem and therefore cannot deadlock with
-	// an unanswered local create/unlink/rename callback which holds that lock.
-	NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION NamespaceRepair = 5
 )
 
 // Enum value maps for NamespaceRepair.
@@ -417,7 +412,6 @@ var (
 		2: "NAMESPACE_REPAIR_INDEPENDENT",
 		3: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED",
 		4: "NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED",
-		5: "NAMESPACE_REPAIR_LOCKLESS_EXPIRATION",
 	}
 	NamespaceRepair_value = map[string]int32{
 		"NAMESPACE_REPAIR_UNSPECIFIED":                   0,
@@ -425,7 +419,6 @@ var (
 		"NAMESPACE_REPAIR_INDEPENDENT":                   2,
 		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED":           3,
 		"NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED": 4,
-		"NAMESPACE_REPAIR_LOCKLESS_EXPIRATION":           5,
 	}
 )
 
@@ -10027,14 +10020,13 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x1bSESSION_PURPOSE_ROUTE_ADMIN\x10\x02*o\n" +
 	"\x10CoherenceProfile\x12!\n" +
 	"\x1dCOHERENCE_PROFILE_UNSPECIFIED\x10\x00\x12\x1c\n" +
-	"\x18COHERENCE_PROFILE_STRICT\x10\x01*\x1aCOHERENCE_PROFILE_UNCACHED*\x88\x02\n" +
+	"\x18COHERENCE_PROFILE_STRICT\x10\x01*\x1aCOHERENCE_PROFILE_UNCACHED*\x8a\x02\n" +
 	"\x0fNamespaceRepair\x12 \n" +
 	"\x1cNAMESPACE_REPAIR_UNSPECIFIED\x10\x00\x12)\n" +
 	"!NAMESPACE_REPAIR_PARENT_EXCLUSIVE\x10\x01\x1a\x02\b\x01\x12 \n" +
 	"\x1cNAMESPACE_REPAIR_INDEPENDENT\x10\x02\x12(\n" +
 	"$NAMESPACE_REPAIR_CALLBACK_SERIALIZED\x10\x03\x122\n" +
-	".NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED\x10\x04\x12(\n" +
-	"$NAMESPACE_REPAIR_LOCKLESS_EXPIRATION\x10\x05*p\n" +
+	".NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED\x10\x04\"\x04\b\x05\x10\x05*$NAMESPACE_REPAIR_LOCKLESS_EXPIRATION*p\n" +
 	"\x0fVisibilityPhase\x12 \n" +
 	"\x1cVISIBILITY_PHASE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18VISIBILITY_PHASE_PREPARE\x10\x01\x12\x1d\n" +

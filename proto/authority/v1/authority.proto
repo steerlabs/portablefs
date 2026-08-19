@@ -565,11 +565,11 @@ enum NamespaceRepair {
   NAMESPACE_REPAIR_INDEPENDENT = 2;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED = 3;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED = 4;
-  // LOCKLESS_EXPIRATION is the patched Linux FUSE contract. Strict reverse
-  // namespace notifications expire a binding under dcache locks only; they do
-  // not acquire the parent inode's i_rwsem and therefore cannot deadlock with
-  // an unanswered local create/unlink/rename callback which holds that lock.
-  NAMESPACE_REPAIR_LOCKLESS_EXPIRATION = 5;
+  // 5 was NAMESPACE_REPAIR_LOCKLESS_EXPIRATION, the retired patched-kernel
+  // repair model. Linux repair is stock-FUSE lease driven; the private ABI it
+  // required no longer exists.
+  reserved 5;
+  reserved "NAMESPACE_REPAIR_LOCKLESS_EXPIRATION";
 }
 
 enum VisibilityPhase {

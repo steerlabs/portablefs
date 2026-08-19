@@ -570,53 +570,6 @@ func executeTestSourceGatedHeld(
 	return err
 }
 
-func TestVisibilityRetryProofSecondPassAbandonsExistingWaiter(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	gate := testSourcePublicationGate("proof-wedge")
-	dependencies := mutationDependenciesForSourceGate(gate)
-	owner, err := h.coordinator.sequencer.acquire(t.Context(), dependencies)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	result := make(chan error, 1)
-	go func() {
-		_, acquireErr := h.coordinator.acquireMutationDependencies(
-			context.Background(), source, MutationID{Sequence: 1, FrontendOperationID: 77},
-			nil, &gate, dependencies, nil,
-		)
-		result <- acquireErr
-	}()
-	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
-
-	// Install the exact same-operation debt after the first pass enqueued. The
-	// participant signal forces a second loop iteration, where omission of the
-	// proof is rejected while turn is already non-nil.
-	h.coordinator.mu.Lock()
-	h.coordinator.fairness[source] = mutationFairnessDebt{
-		sequence: 9, ordinal: h.coordinator.sequencer.reserveOrdinal(),
-		operationID: 77, claimSameOperation: true,
-		gate: cloneSourcePublicationGate(gate), observed: true,
-	}
-	h.coordinator.participants[source].signalLocked()
-	h.coordinator.mu.Unlock()
-	if err := <-result; !errors.Is(err, ErrSourcePublicationGate) {
-		t.Fatalf("second-pass retry-proof rejection = %v, want ErrSourcePublicationGate", err)
-	}
-	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 0)
-	owner.release()
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	probe, err := h.coordinator.sequencer.acquire(ctx, dependencies)
-	if err != nil {
-		t.Fatalf("retry-proof rejection wedged dependency keys: %v", err)
-	}
-	probe.release()
-}
-
 func testMountAbsence(observed time.Time) MountAbsenceProof {
 	return MountAbsenceProof{
 		ObservedUnixNanos: observed.UnixNano(),
@@ -1118,7 +1071,7 @@ func TestVisibilityProjectedPrepareDoesNotCoverRacedOmittedTarget(t *testing.T) 
 func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	parent := testVisibilityParent()
 	var file [16]byte
 	file[0] = 2
@@ -1161,8 +1114,8 @@ func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.
 func TestVisibilitySourceGateFenceDuringPeerPrepareRefusesApply(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source, peer := SessionID{1}, SessionID{2}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	h.registerRepair(t, peer, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
+	h.registerRepair(t, peer, testRepairBudget, NamespaceRepairIndependent)
 	h.resolve(t, peer, "source-fence")
 	gate := testSourcePublicationGate("source-fence")
 	applied := 0
@@ -1210,7 +1163,7 @@ func TestVisibilitySourceGateFenceDuringPeerPrepareRefusesApply(t *testing.T) {
 func TestVisibilityPublishedIdentityIsIndexedBeforeNextMutationTurn(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	gate := testSourcePublicationGate("existing")
 	var returnedIdentity [16]byte
 	returnedIdentity[0] = 0xA1
@@ -1630,7 +1583,7 @@ func TestVisibilityRegisterRefusesUnstatedCommitments(t *testing.T) {
 		{"no namespace-repair model", SessionID{5}, VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget}},
 		{"writer lease on a non-macOS repair profile", SessionID{6}, VisibilityCommitment{
 			CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget,
-			NamespaceRepair: NamespaceRepairLocklessExpiration, CompatibilityWriter: true,
+			NamespaceRepair: NamespaceRepairIndependent, CompatibilityWriter: true,
 		}},
 	}
 	for _, test := range cases {
@@ -2048,7 +2001,7 @@ func TestMacOS26CompatibilityMountOwnsTheWriterLease(t *testing.T) {
 		t.Fatalf("register macOS compatibility writer: %v", err)
 	}
 	t.Cleanup(func() { h.fencer.FenceSession(mac) })
-	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairIndependent)
 	h.resolve(t, linux, "shared")
 
 	prepared, applied := false, false
@@ -2100,7 +2053,7 @@ func TestMacOS26CompatibilityMountOwnsTheWriterLease(t *testing.T) {
 func TestMacOS26WriterActivationWaitsForAdmittedMutation(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	linux, mac := SessionID{1}, SessionID{2}
-	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairIndependent)
 
 	applyStarted := make(chan struct{})
 	releaseApply := make(chan struct{})
@@ -2437,7 +2390,7 @@ func TestVisibilityDependencySequencerInterruptsConflictingNonHeadWaiter(t *test
 func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	ownerPreparing := make(chan struct{})
 	releaseOwner := make(chan struct{})
 	owner := make(chan error, 1)
@@ -2493,171 +2446,13 @@ func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T)
 	}
 }
 
-// An item mutation with no held directory can queue while the current owner is
-// still deriving PREPARE. If that owner then installs an overlapping peer
-// phase, the source waiter must wake and abandon its dependency queue node
-// immediately; otherwise the peer frontend waits for the source lease while
-// the source waits for the peer-owned keys.
-func TestVisibilityQueuedLinuxItemGateYieldsInternalRetryAndPreservesFIFO(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	var identity [16]byte
-	identity[0] = 31
-	h.coordinator.RecordResolvedInode(source, identity)
-	targets := []VisibilityTarget{{
-		Scope: VisibilityAttributes, Identity: identity, KernelIno: 301, Device: 1,
-	}}
-
-	ownerPreparing := make(chan struct{})
-	releaseOwnerPrepare := make(chan struct{})
-	owner := make(chan error, 1)
-	go func() {
-		owner <- executeTestExact(h.coordinator, context.Background(), SessionID{9}, MutationID{Sequence: 1},
-			mutationDependenciesForTargets(targets),
-			func() ([]VisibilityTarget, error) {
-				close(ownerPreparing)
-				<-releaseOwnerPrepare
-				return targets, nil
-			},
-			func() ([]VisibilityTarget, bool) { return targets, true })
-	}()
-	<-ownerPreparing
-
-	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: identity, Attributes: true}}}
-	var prepared atomic.Bool
-	sourceResult := make(chan error, 1)
-	go func() {
-		sourceResult <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2, FrontendOperationID: 77}, h.coordinator.DeclareSourceGate(gate), gate,
-			func() (SourcePublicationGate, error) { return gate, nil },
-			func() ([]VisibilityTarget, error) {
-				prepared.Store(true)
-				return targets, nil
-			},
-			func() ([]VisibilityTarget, bool) { return targets, true },
-			func() ([]VisibilityResolution, error) { return nil, nil })
-	}()
-	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
-	close(releaseOwnerPrepare)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-sourceResult:
-		if !errors.Is(err, ErrVisibilityRetry) {
-			t.Fatalf("queued item source = %v, want ErrVisibilityRetry", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("queued item source did not wake for overlapping PREPARE")
-	}
-	if prepared.Load() {
-		t.Fatal("interrupted item source reached prepare")
-	}
-	h.coordinator.mu.Lock()
-	dormant, exists := h.coordinator.fairness[source]
-	h.coordinator.mu.Unlock()
-	if !exists || dormant.active || !dormant.observed || dormant.operationID != 77 || !dormant.claimSameOperation || dormant.ordinal == 0 {
-		t.Fatalf("dormant Linux item retry credit = %+v, present=%t", dormant, exists)
-	}
-	if err := h.coordinator.Ack(source, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	complete, err := h.coordinator.Next(ctx, source, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Model the independent transport lanes exactly: the frontend has finished
-	// the COMPLETE repair and sends its retry proof on DATA while the combined
-	// COMPLETE ACK is still in flight on CONTROL. The proof may claim the
-	// dormant ordinal, but it must remain behind the barrier owner until ACK.
-	type acquired struct {
-		turn *mutationSequencerWaiter
-		err  error
-	}
-	retried := make(chan acquired, 1)
-	go func() {
-		turn, err := h.coordinator.acquireMutationDependencies(ctx, source, MutationID{
-			Sequence: 3, FrontendOperationID: 77,
-			VisibilityRetryAfterSequence: complete.Cursor.Sequence,
-		}, nil, &gate, mutationDependenciesForSourceGate(gate), nil)
-		retried <- acquired{turn: turn, err: err}
-	}()
-	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
-	select {
-	case got := <-retried:
-		if got.turn != nil {
-			got.turn.release()
-		}
-		t.Fatalf("proved retry escaped before COMPLETE ACK: %+v", got)
-	case <-time.After(25 * time.Millisecond):
-	}
-	if err := h.coordinator.Ack(source, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-owner; err != nil {
-		t.Fatal(err)
-	}
-	got := <-retried
-	if got.err != nil {
-		t.Fatal(got.err)
-	}
-	if got.turn.ordinal != dormant.ordinal {
-		t.Fatalf("retried item ordinal = %d, want preserved %d", got.turn.ordinal, dormant.ordinal)
-	}
-	got.turn.release()
-}
-
-func TestVisibilityLinuxItemRetryProofIsExactAndMandatory(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	var identity [16]byte
-	identity[0] = 32
-	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: identity, Attributes: true}}}
-	h.coordinator.mu.Lock()
-	h.coordinator.fairness[source] = mutationFairnessDebt{
-		sequence: 41, ordinal: h.coordinator.sequencer.reserveOrdinal(), operationID: 77,
-		claimSameOperation: true, gate: cloneSourcePublicationGate(gate), observed: true,
-	}
-	h.coordinator.mu.Unlock()
-
-	for name, mutation := range map[string]MutationID{
-		"omitted":         {Sequence: 2, FrontendOperationID: 77},
-		"wrong sequence":  {Sequence: 2, FrontendOperationID: 77, VisibilityRetryAfterSequence: 40},
-		"wrong operation": {Sequence: 2, FrontendOperationID: 78, VisibilityRetryAfterSequence: 41},
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := h.coordinator.acquireMutationDependencies(t.Context(), source, mutation, nil, &gate, mutationDependenciesForSourceGate(gate), nil)
-			if !errors.Is(err, ErrSourcePublicationGate) {
-				t.Fatalf("retry proof error = %v, want ErrSourcePublicationGate", err)
-			}
-		})
-	}
-
-	t.Run("wrong gate", func(t *testing.T) {
-		otherIdentity := identity
-		otherIdentity[1] = 1
-		otherGate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: otherIdentity, Attributes: true}}}
-		_, err := h.coordinator.acquireMutationDependencies(t.Context(), source, MutationID{
-			Sequence: 2, FrontendOperationID: 77, VisibilityRetryAfterSequence: 41,
-		}, nil, &otherGate, mutationDependenciesForSourceGate(otherGate), nil)
-		if !errors.Is(err, ErrSourcePublicationGate) {
-			t.Fatalf("changed-gate retry proof error = %v, want ErrSourcePublicationGate", err)
-		}
-	})
-}
-
 // A currently negative namespace binding and an unrelated inode mutation have
 // no shared cached observation. The namespace operation must not queue merely
 // because the old volume-global turn would have put the inode operation first.
 func TestVisibilityUnresolvedNamespaceGateRunsBesideDisjointItemMutation(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	var newlyBound [16]byte
 	newlyBound[0] = 41
 	h.coordinator.RecordResolvedInode(source, newlyBound)
@@ -2714,88 +2509,6 @@ func TestVisibilityUnresolvedNamespaceGateRunsBesideDisjointItemMutation(t *test
 	runBarrierFrom(t, h.coordinator, source, prepare)
 	if err := <-owner; err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestVisibilityLocklessNamespaceRetryKeepsItsFIFOPositionThroughCompleteAck(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	h.resolve(t, source, "same-name")
-	targets := testVisibilityTargets("same-name")
-	gate := testSourcePublicationGate("same-name")
-
-	peer := make(chan error, 1)
-	go func() {
-		peer <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
-			mutationDependenciesForTargets(targets),
-			func() ([]VisibilityTarget, error) { return targets, nil },
-			func() ([]VisibilityTarget, bool) { return targets, true })
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, source)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = h.coordinator.ExecuteWithSourceGateSequence(ctx, source, MutationID{
-		Sequence: 2, FrontendOperationID: 88,
-	}, h.coordinator.DeclareSourceGate(gate), gate, func() (SourcePublicationGate, error) { return gate, nil },
-		func() ([]VisibilityTarget, error) {
-			t.Fatal("namespace retry reached prepare before its peer repair")
-			return nil, nil
-		}, func(uint64) ([]VisibilityTarget, bool) {
-			t.Fatal("namespace retry reached apply before its peer repair")
-			return nil, false
-		}, func() ([]VisibilityResolution, error) { return nil, nil })
-	retrySequence, ok := VisibilityRetrySequence(err)
-	if !ok || retrySequence != prepare.Cursor.Sequence {
-		t.Fatalf("namespace first attempt = %v sequence=%d, want retry for %d", err, retrySequence, prepare.Cursor.Sequence)
-	}
-
-	if err := h.coordinator.Ack(source, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	complete, err := h.coordinator.Next(ctx, source, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var prepared, applied atomic.Bool
-	retried := make(chan error, 1)
-	go func() {
-		_, executeErr := h.coordinator.ExecuteWithSourceGateSequence(ctx, source, MutationID{
-			Sequence: 3, FrontendOperationID: 88, VisibilityRetryAfterSequence: complete.Cursor.Sequence,
-		}, h.coordinator.DeclareSourceGate(gate), gate, func() (SourcePublicationGate, error) { return gate, nil },
-			func() ([]VisibilityTarget, error) {
-				prepared.Store(true)
-				return targets, nil
-			}, func(uint64) ([]VisibilityTarget, bool) {
-				applied.Store(true)
-				return targets, true
-			}, func() ([]VisibilityResolution, error) { return nil, nil })
-		retried <- executeErr
-	}()
-	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
-	select {
-	case err := <-retried:
-		t.Fatalf("proved namespace retry escaped before COMPLETE Ack: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
-	if prepared.Load() || applied.Load() {
-		t.Fatal("proved namespace retry reached filesystem work before COMPLETE Ack")
-	}
-	if err := h.coordinator.Ack(source, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-peer; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-retried; err != nil {
-		t.Fatal(err)
-	}
-	if !prepared.Load() || !applied.Load() {
-		t.Fatalf("namespace retry prepare=%t apply=%t, want both after Ack", prepared.Load(), applied.Load())
 	}
 }
 
