@@ -245,7 +245,7 @@ Deeper gates:
 ```bash
 bash scripts/xfs-fuse-integration.sh    # privileged: stock kernel FUSE + real XFS
 bash scripts/coherence-matrix-linux.sh  # stock kernel, two-mount black-box matrix
-bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume, recorded not gated
+bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume; on demand, not a CI lane
 ```
 
 The macOS matrix runs against two already-mounted paths, optionally with a

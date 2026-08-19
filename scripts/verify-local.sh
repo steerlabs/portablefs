@@ -243,11 +243,13 @@ fi
 # amount of green from the steps above substitutes for them. They are opt-in
 # locally and mandatory in CI.
 #
-# CI's linux-coherence-matrix lane runs a third Docker suite,
-# scripts/package-manager-matrix.sh, after the matrix. It is deliberately not
-# here: it is a workload soak rather than a coherence gate, and it roughly
-# doubles the wall time of a full local run. The closing banner names it so a
-# --full pass is not read as "everything CI runs".
+# scripts/package-manager-matrix.sh is a third Docker suite in the same
+# container, and it is deliberately not here and no longer in CI either: it is a
+# workload soak rather than a coherence gate, and it roughly doubles the wall
+# time of a full local run. Run it on demand; the concurrent-reader shape it
+# drives is qualified after deploy by phase 8 of
+# deploy/opensteer/staging-qualification.sh. The closing banner names it so a
+# --full pass is not read as "every instrument in the tree".
 if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
   if ! command -v docker >/dev/null 2>&1; then
     echo "verify-local --full requires docker; none found on PATH" >&2
@@ -266,8 +268,8 @@ if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
   echo "       Swift suite (macOS host only), workflow/release-trust policy,"
   echo "       architecture scans, xfs-fuse-integration.sh, coherence-matrix-linux.sh"
   echo "  still NOT run by --full:"
-  echo "    - scripts/package-manager-matrix.sh   third Docker suite; CI runs it"
-  echo "                                         in the linux-coherence-matrix lane"
+  echo "    - scripts/package-manager-matrix.sh   third Docker suite; a workload"
+  echo "                                         soak, run on demand, not in CI"
   echo "    - scripts/coherence-matrix-macos.sh   live macOS FSKit mount matrix;"
   echo "                                         needs a user-enabled extension"
   echo "    - deploy/opensteer/staging-qualification.sh against a live cell"
@@ -281,6 +283,7 @@ echo "NOT RUN by this invocation:"
 echo "  - scripts/xfs-fuse-integration.sh   real XFS + real kernel FUSE mounts"
 echo "  - scripts/coherence-matrix-linux.sh two real mounts against one volume"
 echo "  - scripts/package-manager-matrix.sh concurrent package-manager readers"
+echo "                                     (on demand; not a CI lane)"
 if [[ "$(uname -s)" != Darwin ]]; then
   echo "  - scripts/test-swift-xcode.sh      Xcode-native Swift suite (macOS only)"
 fi

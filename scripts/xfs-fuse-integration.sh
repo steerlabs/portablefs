@@ -203,6 +203,11 @@ run_suite() {
   # failure so a broken provisioner cannot present as a green run. -p 1 keeps
   # the three privileged packages from opening the one provisioned XFS cell
   # concurrently, which its exclusive volume lock forbids.
+  #
+  # -timeout is set below the CI job timeout on purpose (the whole lane
+  # completes in about two minutes). A hung mount must be killed by the test
+  # binary, which prints every goroutine's stack, rather than by the job
+  # timeout, which kills the runner and leaves nothing to read.
   set +e
   runuser -u portablefs -- env -i \
     HOME=/home/portablefs \
@@ -222,7 +227,7 @@ run_suite() {
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
 	PORTABLEFS_FUSE_DEBUG="${PORTABLEFS_FUSE_DEBUG:-}" \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 25m "${extra_go_test_flags[@]}" \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 10m "${extra_go_test_flags[@]}" \
     ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... \
     >"$log" 2>&1
   status=$?

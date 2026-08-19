@@ -350,15 +350,21 @@ starting point. The provisional run above used `fsops`, fio, Linux `perf`, and
 the coherence matrix together.
 
 Outside `vcs/bench`, `scripts/package-manager-matrix.sh` is the closest thing to a
-realistic workload in the gates. It runs `npm`, `pnpm`, `yarn`, and `bun` installs
-on a shared volume path with no machine-local route, while a second mount
-enumerates and reads the same tree. It asserts exactly three things — the
-installer exited zero, the other mount sees the same entry count and the same
-bytes, and both mounts still serve — and it thresholds nothing. Wall time and
-authority work counters are recorded into a table for a human to read. That is
-deliberate: it is a correctness gate that happens to produce timings, and treating
-its timings as a performance gate would make an unrelated CI slowdown look like a
-regression.
+realistic workload the repository can run on demand. It runs `npm`, `pnpm`,
+`yarn`, and `bun` installs on a shared volume path with no machine-local route,
+while a second mount enumerates and reads the same tree. It asserts exactly three
+things — the installer exited zero, the other mount sees the same entry count and
+the same bytes, and both mounts still serve — and it thresholds nothing. Wall time
+and authority work counters are recorded into a table for a human to read. That is
+deliberate: it is a correctness instrument that happens to produce timings, and
+treating its timings as a performance gate would make an unrelated slowdown look
+like a regression.
+
+It is not a merge gate and CI does not run it: a soak that takes an order of
+magnitude longer than every other lane belongs after the deploy, not in front of
+a merge. Run it by hand when the workload shape matters; phase 8 of
+`deploy/opensteer/staging-qualification.sh` drives the same concurrent-reader
+shape against a live staging cell.
 
 ## What is missing before a number belongs here
 

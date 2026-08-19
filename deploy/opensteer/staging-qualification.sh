@@ -44,6 +44,13 @@
 # WHAT EACH PHASE ASSERTS is documented at the phase. Read phase 7 before
 # interpreting a hot-file failure: it is the one phase with a documented,
 # deliberately tolerated residual.
+#
+# Phase 8 is the concurrent-reader workload the merge gate deliberately does not
+# run: a dependency tree installed package-by-package while several readers
+# enumerate and read it. `scripts/package-manager-matrix.sh` drives the same
+# shape harder — real npm/pnpm/yarn/bun installs against two kernel FUSE mounts
+# of one volume in a container — and is run on demand, not in CI, because it is
+# a workload soak rather than a merge gate.
 set -euo pipefail
 
 fail() { echo "staging-qualification: $*" >&2; exit 1; }
@@ -75,7 +82,7 @@ while (( $# )); do
     --authority-generation|--auth-expires-at-ms)
       mount_args+=("$1" "$2"); shift 2 ;;
     --no-local-dirs) mount_args+=("$1"); shift ;;
-    -h|--help) sed -n '2,47p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) usage "unknown argument: $1" ;;
   esac
 done
@@ -384,14 +391,164 @@ run_hot_phase "7b in-place rewrite" "$run_root/hot-inplace.txt" tolerant inplace
 ok "7b: every observed byte came from a generation the writer wrote"
 
 # ---------------------------------------------------------------------------
-# Phase 8 — read-back after unmount and remount. Everything written above must
+# Phase 8 — dependency-tree install racing concurrent readers.
+#
+# Phase 7 is several readers against ONE file. This is the other concurrent-read
+# shape, and the one every dependency installer produces: a metadata-heavy tree
+# arriving package by package while other processes enumerate and read it. npm,
+# pnpm, yarn and bun all unpack a package beside its destination and rename(2)
+# it into place, so a directory that appears in the tree is a directory that is
+# already complete. That is the contract asserted here.
+#
+# The writer installs $tree_packages packages of $tree_files files each, each
+# one built in a staging directory ON THE MOUNT (so the move is a real rename,
+# not a copy) and renamed into node_modules/. The readers enumerate that tree
+# throughout and fully read every package they can see.
+#
+#   PASS: every package a reader observed held exactly its own complete,
+#         byte-exact contents, and the finished tree is exactly what was
+#         installed.
+#   FAIL: a reader saw a package directory that was incomplete, held bytes no
+#         writer produced, or held an entry count nobody wrote. Any of those is
+#         a half-visible rename, which no POSIX filesystem may show.
+#
+# A reader observing FEWER packages than are installed is not a failure: that is
+# the same bounded §7.3b staleness phase 7a documents. What must never happen is
+# a package that is visible but not whole.
+#
+# This is the shape scripts/package-manager-matrix.sh drives with real
+# installers on two mounts in a container. This phase is its qualification
+# stand-in on a live cell: same concurrency, no npm registry, one mount.
+# ---------------------------------------------------------------------------
+tree_packages=24
+tree_files=8
+phase "8. dependency-tree install ($tree_packages packages) racing $hot_readers readers"
+tree_root="$run_root/node_modules"
+tree_staging="$run_root/.tree-staging"
+mkdir -p -- "$tree_root"
+
+# tree_body prints the exact complete contents of package $1, in the exact order
+# a reader concatenates them. Writer and reader both derive their bytes from it,
+# so a package can only match if every one of its files is present and exact.
+tree_body() {
+  local p=$1 k
+  printf '{"name":"pkg-%03d"}\n' "$p"
+  for (( k = 1; k <= tree_files; k++ )); do
+    printf 'package %03d file %02d\n' "$p" "$k"
+  done
+}
+
+tree_installer() {
+  local p k
+  for (( p = 1; p <= tree_packages; p++ )); do
+    rm -rf -- "$tree_staging"
+    mkdir -p -- "$tree_staging"
+    printf '{"name":"pkg-%03d"}\n' "$p" >"$tree_staging/package.json"
+    for (( k = 1; k <= tree_files; k++ )); do
+      printf 'package %03d file %02d\n' "$p" "$k" >"$tree_staging/file-$k.txt"
+    done
+    mv -T -- "$tree_staging" "$(printf '%s/pkg-%03d' "$tree_root" "$p")"
+  done
+}
+
+# tree_read_package returns 0 when $1 is a complete, byte-exact package and 1
+# when it is not. It never treats an absent package as a fault; only a present
+# one that is wrong.
+tree_read_package() {
+  local dir=$1 name number entries observed expected k
+  name=${dir%/}
+  name=${name##*/}
+  [[ $name =~ ^pkg-[0-9]{3}$ ]] || {
+    echo "reader observed an entry no installer wrote: $name" >&2
+    return 1
+  }
+  number=$(( 10#${name#pkg-} ))
+  entries=$(find "$dir" -mindepth 1 2>/dev/null | wc -l)
+  if (( entries != tree_files + 1 )); then
+    echo "reader observed $name with $entries entries, not the $(( tree_files + 1 )) that were renamed into place" >&2
+    return 1
+  fi
+  observed=$( { cat "$dir/package.json"; for (( k = 1; k <= tree_files; k++ )); do cat "$dir/file-$k.txt"; done; } 2>/dev/null )
+  expected=$(tree_body "$number")
+  if [[ $observed != "$expected" ]]; then
+    echo "reader observed $name holding bytes the installer never wrote" >&2
+    return 1
+  fi
+  return 0
+}
+
+tree_reader() {
+  local id=$1 rounds=0 verified=0 dir
+  while [[ ! -e "$work/tree-installed" ]]; do
+    rounds=$(( rounds + 1 ))
+    for dir in "$tree_root"/*/; do
+      [[ -d $dir ]] || continue
+      tree_read_package "$dir" || return 1
+      verified=$(( verified + 1 ))
+    done
+  done
+  printf '%d %d\n' "$rounds" "$verified" >"$work/tree-reader-$id"
+  return 0
+}
+
+rm -f -- "$work/tree-installed"
+tree_reader_pids=()
+for (( r = 1; r <= hot_readers; r++ )); do
+  tree_reader "$r" &
+  tree_reader_pids+=("$!")
+done
+# The readers stop when the marker appears, so it is written even when the
+# installer fails: a reader left spinning on the mount would outlive this script
+# and hang the unmount its cleanup performs.
+install_status=0
+tree_installer || install_status=1
+: >"$work/tree-installed"
+tree_status=0
+for pid in "${tree_reader_pids[@]}"; do
+  wait "$pid" || tree_status=1
+done
+(( install_status == 0 )) || fail "the dependency-tree installer failed"
+(( tree_status == 0 )) || fail "phase 8: a reader observed a package that was visible but not whole"
+
+tree_rounds=0
+tree_verified=0
+for (( r = 1; r <= hot_readers; r++ )); do
+  [[ -r "$work/tree-reader-$r" ]] || fail "phase 8: reader $r produced no observation record"
+  read -r round_count verified_count <"$work/tree-reader-$r"
+  tree_rounds=$(( tree_rounds + round_count ))
+  tree_verified=$(( tree_verified + verified_count ))
+done
+(( tree_verified > 0 )) ||
+  fail "phase 8: the readers finished without verifying a single package; the phase proved nothing"
+echo "   readers: $tree_verified complete package reads over $tree_rounds enumeration rounds"
+
+# The installed tree itself, from the mount that wrote it: exactly the packages
+# installed, each exactly its own contents, nothing extra.
+installed=$(find "$tree_root" -mindepth 1 -maxdepth 1 | wc -l)
+(( installed == tree_packages )) ||
+  fail "phase 8: the finished tree holds $installed packages, expected $tree_packages"
+[[ ! -e $tree_staging ]] || fail "phase 8: the installer's staging directory survived its own rename"
+for (( p = 1; p <= tree_packages; p++ )); do
+  tree_read_package "$(printf '%s/pkg-%03d' "$tree_root" "$p")" ||
+    fail "phase 8: the finished tree is not what the installer wrote"
+done
+printf 'serves\n' >"$run_root/after-install"
+[[ $(cat "$run_root/after-install") == serves ]] || fail "phase 8: the mount stopped serving after the install"
+ok "every observed package was complete and the finished tree is exactly what was installed"
+
+# ---------------------------------------------------------------------------
+# Phase 9 — read-back after unmount and remount. Everything written above must
 # be durable in the volume, not merely visible through the mount that wrote it.
 # ---------------------------------------------------------------------------
-phase "8. unmount, remount, and verify durability"
+phase "9. unmount, remount, and verify durability"
 serial_digest=$(sha256sum <"$append_file" | cut -d' ' -f1)
 tee_digest=$(sha256sum <"$tee_file" | cut -d' ' -f1)
 shared_digest=$(sha256sum <"$shared" | cut -d' ' -f1)
 head_commit=$(git -C "$repo" rev-parse HEAD)
+tree_manifest() {
+  find "$tree_root" -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+}
+tree_digest=$(tree_manifest)
 
 "$portablefs" umount "$mount_path" || fail "unmount failed"
 mounted=0
@@ -404,6 +561,7 @@ mounted=1
 [[ $(sha256sum <"$append_file" | cut -d' ' -f1) == "$serial_digest" ]] || fail "serial append content changed across remount"
 [[ $(sha256sum <"$tee_file" | cut -d' ' -f1) == "$tee_digest" ]] || fail "tee append content changed across remount"
 [[ $(sha256sum <"$shared" | cut -d' ' -f1) == "$shared_digest" ]] || fail "concurrent append content changed across remount"
+[[ $(tree_manifest) == "$tree_digest" ]] || fail "the installed dependency tree changed across remount"
 [[ $(git -C "$repo" rev-parse HEAD) == "$head_commit" ]] || fail "git HEAD changed across remount"
 git -C "$repo" fsck --strict >/dev/null || fail "git object store is damaged after remount"
 ok "every artifact survived unmount and remount byte-identically"

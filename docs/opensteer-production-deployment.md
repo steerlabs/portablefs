@@ -83,8 +83,13 @@ Full qualification is the real-workload corpus in
 `deploy/opensteer/staging-qualification.sh`, run against a live staging cell:
 serial and `tee -a` appends, a git repository created and `fsck`-verified on the
 mount, two concurrent `O_APPEND` writers on one file, a hot file read by several
-processes while another rewrites it, and a durability check across unmount and
-remount. That script also names the two things to watch on the authority while
+processes while another rewrites it, a dependency tree installed package by
+package while several readers enumerate and read it, and a durability check
+across unmount and remount. That dependency-tree phase is the concurrent-reader
+workload the merge gate deliberately does not run;
+`scripts/package-manager-matrix.sh` drives the same shape harder — real
+`npm`/`pnpm`/`yarn`/`bun` installs against two kernel FUSE mounts of one volume
+in a container — and is run on demand rather than in CI. That script also names the two things to watch on the authority while
 it runs — RecallBudget-exhaustion fences and uncertain-outcome revocations — a
 pass with either of those firing is a result the authority paid for, not a clean
 one.

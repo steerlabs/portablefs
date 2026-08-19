@@ -261,6 +261,14 @@ Wall time and the authority's work counters are **recorded into a table**, not
 gated. A timing threshold in CI turns a shared runner's bad afternoon into a red
 build, and a number nobody can act on gets raised until it never fires again.
 
+**It is not part of the merge gate.** It is a workload soak: it ran in the
+`linux-coherence-matrix` lane once and made that lane an order of magnitude
+slower than every other job in the workflow, for coverage a merge does not need
+to wait on. Run it on demand — it provisions the same container as the matrix
+above — and read the table. The concurrent-reader shape it drives is qualified
+after deploy by phase 8 of `deploy/opensteer/staging-qualification.sh`, against
+a live cell rather than a container.
+
 The fixture is hermetic: six tiny packages the script generates and `npm pack`s
 itself, installed from local tarballs, with no registry contacted and nothing
 compiled. A registry outage can never be mistaken for a filesystem defect.

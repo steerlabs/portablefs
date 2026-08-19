@@ -43,6 +43,45 @@ func requireFallocate(t *testing.T, file *os.File, mode uint32, offset, length i
 	}
 }
 
+// kernelPermitsEmptyPathLink measures, in this very process and on the backing
+// XFS, whether this kernel lets this caller link an O_TMPFILE into the namespace
+// with AT_EMPTY_PATH. The gate is entirely outside portablefs: do_linkat applies
+// it before any filesystem is consulted, and which way it goes depends on the
+// running kernel and the caller's credentials -- older kernels refuse the flag
+// to anyone without CAP_DAC_READ_SEARCH, current ones let a caller link back an
+// O_TMPFILE it opened itself, and a privileged process is allowed either way. So
+// the only honest reference for what the mount must answer is what the local
+// filesystem underneath it answers to the identical call.
+//
+// The control runs against the write-staging root, which is ordinary backing
+// storage the volume never publishes, so it is not a mutation behind the
+// authority's back.
+func kernelPermitsEmptyPathLink(t *testing.T, backingDirectory string) bool {
+	t.Helper()
+	control, err := unix.Open(backingDirectory, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		t.Fatalf("create the control O_TMPFILE on the backing XFS: %v", err)
+	}
+	defer func() {
+		if err := unix.Close(control); err != nil {
+			t.Errorf("close the control O_TMPFILE: %v", err)
+		}
+	}()
+	link := filepath.Join(backingDirectory, "empty-path-link-control")
+	switch err := unix.Linkat(control, "", unix.AT_FDCWD, link, unix.AT_EMPTY_PATH); {
+	case err == nil:
+		if err := os.Remove(link); err != nil {
+			t.Fatalf("remove the control link on the backing XFS: %v", err)
+		}
+		return true
+	case errors.Is(err, syscall.ENOENT):
+		return false
+	default:
+		t.Fatalf("AT_EMPTY_PATH link on the backing XFS = %v, want either success or the kernel's ENOENT refusal", err)
+		return false
+	}
+}
+
 func requireExactFile(t *testing.T, path string, want []byte, operation string) {
 	t.Helper()
 	got, err := os.ReadFile(path)
@@ -352,21 +391,52 @@ func TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable(t *testing.T) {
 	requireSyscallWrite(t, "write linkable O_TMPFILE", func() (int, error) {
 		return unix.Write(linkable, payload)
 	}, len(payload))
-	// linkat(2) with AT_EMPTY_PATH needs CAP_DAC_READ_SEARCH, which the
-	// production data-plane identity does not have and must not be given. The
-	// kernel refuses it in do_linkat before any filesystem is consulted, so the
-	// refusal says nothing about this mount, and the capability-free idiom
-	// open(2) documents for O_TMPFILE -- /proc/self/fd/<n> with AT_SYMLINK_FOLLOW
-	// -- is the one that has to work.
-	if err := unix.Linkat(linkable, "", unix.AT_FDCWD, f.join(0, "empty-path-tmpfile"), unix.AT_EMPTY_PATH); !errors.Is(err, syscall.ENOENT) {
-		t.Fatalf("unprivileged AT_EMPTY_PATH link = %v, want ENOENT from the kernel", err)
-	}
-	requireAbsent(t, f.join(1, "empty-path-tmpfile"), "AT_EMPTY_PATH link the kernel refused")
+	// The capability-free idiom open(2) documents for O_TMPFILE --
+	// /proc/self/fd/<n> with AT_SYMLINK_FOLLOW -- is the one every caller has,
+	// so it is the unconditional contract: the first link materializes the
+	// tmpfile in the namespace with its exact bytes, and the peer mount sees it.
 	linked := f.join(0, "linked-tmpfile")
 	if err := unix.Linkat(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", linkable), unix.AT_FDCWD, linked, unix.AT_SYMLINK_FOLLOW); err != nil {
 		t.Fatalf("first link of O_TMPFILE: %v", err)
 	}
 	requireExactFile(t, f.join(1, "linked-tmpfile"), payload, "linked O_TMPFILE through peer mount")
+
+	// linkat(2) with AT_EMPTY_PATH is the other entry point into the same
+	// first-link contract, exercised on its own tmpfile so neither half of this
+	// test can borrow the other's result. Whether the call reaches a filesystem
+	// at all is a kernel policy that varies by kernel version and by the caller's
+	// credentials, so it is measured on the backing XFS rather than assumed: this
+	// mount must answer what the filesystem underneath it answers. Both outcomes
+	// are asserted and neither is skipped -- when the kernel permits the link the
+	// namespace entry must be correct and coherent on the peer mount, and when it
+	// refuses it, no entry may appear on either mount.
+	emptyPath, err := unix.Open(f.mountPath(0), unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		t.Fatalf("create AT_EMPTY_PATH O_TMPFILE: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := unix.Close(emptyPath); err != nil {
+			t.Errorf("close AT_EMPTY_PATH O_TMPFILE: %v", err)
+		}
+	})
+	emptyPathPayload := deterministicIntegrationData(4097, 149)
+	requireSyscallWrite(t, "write AT_EMPTY_PATH O_TMPFILE", func() (int, error) {
+		return unix.Write(emptyPath, emptyPathPayload)
+	}, len(emptyPathPayload))
+	permitted := kernelPermitsEmptyPathLink(t, f.writeStagingRoot)
+	err = unix.Linkat(emptyPath, "", unix.AT_FDCWD, f.join(0, "empty-path-tmpfile"), unix.AT_EMPTY_PATH)
+	if permitted {
+		if err != nil {
+			t.Fatalf("AT_EMPTY_PATH link of O_TMPFILE = %v, but this kernel permits the same call on the backing XFS", err)
+		}
+		requireExactFile(t, f.join(1, "empty-path-tmpfile"), emptyPathPayload,
+			"AT_EMPTY_PATH-linked O_TMPFILE through peer mount")
+	} else {
+		if !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("AT_EMPTY_PATH link of O_TMPFILE = %v, want the ENOENT this kernel gives the same call on the backing XFS", err)
+		}
+		requireAbsent(t, f.join(1, "empty-path-tmpfile"), "AT_EMPTY_PATH link the kernel refused")
+	}
 
 	exclusive, err := unix.Open(f.mountPath(0), unix.O_TMPFILE|unix.O_RDWR|unix.O_EXCL|unix.O_CLOEXEC, 0o600)
 	if err != nil {
