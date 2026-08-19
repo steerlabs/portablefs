@@ -1932,7 +1932,21 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		t.Fatalf("open existing name through FUSE_CREATE: %v (RPC results=%+v; frontend fatal cause: %v)",
 			existingOpenErr, rpcResults, f.mounts[0].fatalError())
 	}
-	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{lookup: 2, create: 3})
+	// Both mounts create the same name inside this window: one FUSE_CREATE
+	// materializes it and the other resolves the existing object, each with one
+	// authority mutation, and the loser's kernel supplies its own negative
+	// dentry rather than a second LOOKUP. The follow-up stats are the one place
+	// in this test where a post-state successor grant is legitimately withheld:
+	// the peer's mutation recalls the same A coordinates while the source's
+	// reply is still being built, and a mount under recall must miss to the
+	// authority rather than cache across it. Bound that instead of pinning it,
+	// because which side reaches the recall first is genuinely concurrent.
+	if existingCreateRPCs.getattr > 3 || existingCreateRPCs.lookup > 2 {
+		t.Fatalf("existing-create raced window cost %d GETATTRs and %d LOOKUPs; at most one per observation is a recall miss",
+			existingCreateRPCs.getattr, existingCreateRPCs.lookup)
+	}
+	existingCreateRPCs.getattr, existingCreateRPCs.lookup = 0, 0
+	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{create: 2})
 
 	unlinkedPath := filepath.Join(root, "post-state-unlinked")
 	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
@@ -1975,7 +1989,10 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			}
 		}
 	})
-	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 2, rename: 1})
+	// The warmed source name resolves inside the daemon under its N lease, so
+	// only the destination's absence -- which carries no cacheable fact -- costs
+	// the kernel's pre-rename LOOKUP a round trip.
+	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
 }
 
 // TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's

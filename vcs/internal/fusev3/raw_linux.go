@@ -2020,8 +2020,15 @@ func (r *rawFileSystem) opContext() context.Context {
 
 // cachedLookup resolves an N-R-covered name entirely inside the daemon. A
 // positive hit additionally needs A-R because the FUSE reply itself carries
-// attributes even though both kernel validity fields remain zero.
-func (r *rawFileSystem) cachedLookup(parent *inodeRecord, name string) (*inodeRecord, *authoritypb.Attr, bool) {
+// attributes even though kernel entry validity remains zero.
+//
+// A hit seeds the reply publication with the exact leases and cache version it
+// is answering from, so publishEntry admits it through the same admission,
+// reservation, and drain discipline as an authority answer. Without that the
+// reply would have to declare its attributes uncacheable, which forces the
+// kernel to re-enter this daemon for a GETATTR on every path component of every
+// walk -- the exact per-component round trip the A lease exists to remove.
+func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, name string) (*inodeRecord, *authoritypb.Attr, bool) {
 	if parent == nil {
 		return nil, nil, false
 	}
@@ -2040,15 +2047,24 @@ func (r *rawFileSystem) cachedLookup(parent *inodeRecord, name string) (*inodeRe
 		attrPayload = r.cachedAttrPayloads[record.identity]
 	}
 	r.mu.Unlock()
-	if !r.mount.leases.matches(nameLease, authoritypb.LeaseRight_LEASE_RIGHT_NAME_READ, nameStamp, now) {
+	nameGrant, held := r.mount.leases.heldGrant(nameLease, authoritypb.LeaseRight_LEASE_RIGHT_NAME_READ, nameStamp, now)
+	if !held {
 		return nil, nil, false
 	}
 	if negative {
 		return nil, nil, true
 	}
-	if record == nil || !r.mount.leases.matches(leaseKey{
+	if record == nil {
+		return nil, nil, false
+	}
+	attrGrant, held := r.mount.leases.heldGrant(leaseKey{
 		family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, identity: record.identity,
-	}, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, attrPayload.lease, now) {
+	}, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, attrPayload.lease, now)
+	if !held {
+		return nil, nil, false
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || publication.cacheStamp != nil {
 		return nil, nil, false
 	}
 	r.mu.Lock()
@@ -2064,7 +2080,106 @@ func (r *rawFileSystem) cachedLookup(parent *inodeRecord, name string) (*inodeRe
 	r.identityIndexLocked(record)[record.key] = record
 	attr := proto.Clone(currentAttr.attr).(*authoritypb.Attr)
 	r.mu.Unlock()
+	publication.cacheStamp = &cacheSnapshot{
+		SnapshotSequence: currentAttr.snapshot, ObjectVersion: currentAttr.objectVersion,
+		BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags(),
+	}
+	publication.leaseGrants = append(publication.leaseGrants, nameGrant, attrGrant)
 	return record, attr, false
+}
+
+// publishPostStateAttrs records the exact applied attributes of every object a
+// mutation's own post-state describes, under the successor A-R grant the
+// authority issued with that reply. It runs after the callback has interned
+// every record it creates and after the source discharge purged the recalled
+// epoch, so the payload it installs is the applied state and nothing else.
+//
+// Without it the mutating syscall's own follow-up stat -- of the parent
+// directory above all, whose attributes the source discharge just invalidated in
+// the kernel -- costs a second authority round trip for state this reply already
+// carried exactly.
+func (r *rawFileSystem) publishPostStateAttrs(ctx context.Context) {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || publication.postState == nil {
+		return
+	}
+	now := time.Now()
+	published := make(map[publicationIdentity]struct{}, len(publication.attrs))
+	for _, attr := range publication.attrs {
+		published[attr.identity] = struct{}{}
+	}
+	for _, object := range publication.postState.GetObjects() {
+		identity, ok := publicationIdentityFromBytes(object.GetStableIdentity())
+		if !ok || object.GetRoles()&postStateRoleRemoved != 0 || object.GetAttr() == nil {
+			continue
+		}
+		if _, already := published[identity]; already {
+			continue
+		}
+		grant, granted := publication.leaseGrant(authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES,
+			authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, identity, publicationIdentity{}, "", now)
+		if !granted {
+			continue
+		}
+		inode := object.GetAttr().GetInode()
+		r.mu.Lock()
+		record := r.byIdentityLocked(identity)
+		if record == nil || record.reclaimed {
+			r.mu.Unlock()
+			continue
+		}
+		if _, _, reservation, cached := r.admitAttrLocked(ctx, inode, identity); cached {
+			publication.attrs = append(publication.attrs, replyAttrPublication{
+				inode: inode, identity: identity, record: record,
+				coordinate:  publicationCoordinate{kind: publicationItemAttributes, item: identity},
+				reservation: reservation, lease: leaseStamp{epoch: grant.epoch, issuedSequence: grant.issuedSequence},
+				attr:          proto.Clone(object.GetAttr()).(*authoritypb.Attr),
+				objectVersion: object.GetObjectVersion(), snapshot: publication.postState.GetSnapshotSequence(),
+			})
+		}
+		r.mu.Unlock()
+	}
+}
+
+// cachedAttrRecord answers one GETATTR from the daemon attribute cache under a
+// live A-R lease. The kernel's own attribute timer covers the common repeat
+// stat; this covers the requests it cannot -- a descriptor stat, a component
+// whose attributes a peer's mutation just invalidated, and any inode whose
+// kernel timer lapsed while this mount still holds cache authority.
+func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecord) (*authoritypb.Attr, bool) {
+	if record == nil || record.graft || record.identity == (publicationIdentity{}) {
+		return nil, false
+	}
+	now := time.Now()
+	r.mu.Lock()
+	payload := r.cachedAttrPayloads[record.identity]
+	r.mu.Unlock()
+	attrGrant, held := r.mount.leases.heldGrant(leaseKey{
+		family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, identity: record.identity,
+	}, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, payload.lease, now)
+	if !held {
+		return nil, false
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || publication.cacheStamp != nil {
+		return nil, false
+	}
+	r.mu.Lock()
+	current := r.cachedAttrPayloads[record.identity]
+	if current.lease != payload.lease || current.objectVersion != payload.objectVersion ||
+		current.snapshot != payload.snapshot || current.attr == nil ||
+		r.cachedAttrs[record.identity] != record || record.reclaimed {
+		r.mu.Unlock()
+		return nil, false
+	}
+	attr := proto.Clone(current.attr).(*authoritypb.Attr)
+	r.mu.Unlock()
+	publication.cacheStamp = &cacheSnapshot{
+		SnapshotSequence: current.snapshot, ObjectVersion: current.objectVersion,
+		BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags(),
+	}
+	publication.leaseGrants = append(publication.leaseGrants, attrGrant)
+	return attr, true
 }
 
 func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
@@ -2083,16 +2198,16 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 		return lifecycle
 	}
 	defer finish()
-	if record, attr, negative := r.cachedLookup(parent, name); negative {
+	if record, attr, negative := r.cachedLookup(ctx, parent, name); negative {
 		*out = fuse.EntryOut{}
 		out.SetEntryTimeout(0)
 		return fuse.OK
 	} else if record != nil {
 		r.bindPath(record, parent, name)
-		out.NodeId, out.Generation = record.id, 1
-		out.SetEntryTimeout(0)
-		out.SetAttrTimeout(0)
-		fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+		if err := r.publishEntry(ctx, out, parent, name, record, attr); err != nil {
+			r.mount.revoke(err)
+			return fuse.Status(syscall.ENOTCONN)
+		}
 		return fuse.OK
 	}
 	item, errno := parent.node.Lookup(ctx, name)
@@ -2174,6 +2289,10 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 		return lifecycle
 	}
 	defer finish()
+	if attr, cached := r.cachedAttrRecord(ctx, record); cached {
+		r.publishAttr(ctx, out, record.identity, attr)
+		return fuse.OK
+	}
 	return fuse.Status(record.node.Getattr(ctx, handle, out))
 }
 

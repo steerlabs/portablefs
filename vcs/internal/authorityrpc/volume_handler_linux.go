@@ -3258,6 +3258,10 @@ func (h *VolumeHandler) mutateLeaseVisibleSequenceResolved(
 				visibilityErr = errors.Join(visibilityErr, completeErr)
 			}
 			resp.SourceLeaseDischarge = sourceLeaseDischargeProto(sourceDischarge)
+			if changed {
+				resp.LeaseGrants = append(resp.LeaseGrants, leaseGrantsProto(h.Leases,
+					transaction.GrantSourcePostState(postStateAttributeGrants(resp.GetPostState())))...)
+			}
 			if visibilityErr != nil {
 				barrier := &volumeserver.VisibilityBarrierError{Applied: changed, Err: visibilityErr}
 				if req.GetWrite() != nil && changed && markWritePostApplyFailure(resp, barrier) {

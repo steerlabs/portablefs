@@ -21,6 +21,17 @@ this file is the human-curated summary.
   per-call cases are disclosed deviations in `docs/portable-coherence.md` §4.3.
 - The Linux write path now carries the description's `O_SYNC`/`O_DSYNC` intent to
   the authority, which the FSKit path has always honored.
+- Attribute caching under the A lease, which is what the lease architecture was
+  for. A path component resolved inside the daemon now publishes the attribute
+  validity its held A-R lease covers instead of declaring the answer
+  uncacheable, a `GETATTR` the kernel still sends is answered from the daemon's
+  leased attribute record, and a changed mutation reply installs its own exact
+  post-state attributes under an A-R successor grant so the mutating syscall's
+  follow-up stat of the target and its parent costs no second round trip. A
+  repeated 64-name path walk fell from 128 authority `GETATTR`s to zero, and one
+  steady-state `git status` over 200 tracked files from 404 authority requests to
+  22. Nothing is served past its lease: a coordinate under recall still misses to
+  the authority.
 
 ### Changed
 

@@ -122,9 +122,28 @@ acknowledgment for an old epoch is rejected [LS §2.3, §3.3].
 
 **Grant.** The authority MAY attach grants to successful read-side replies
 (LOOKUP/RESOLVE → N-R + A-R; enumeration page → E-R; open-for-read → D-R).
-Policy is conservative and server-side. V1 mutation replies do not issue
-successor grants: every recalled source right is discharged to none, and a
-later read reacquires state and cache authority together.
+Policy is conservative and server-side. A **changed mutation reply also carries
+an A-R successor grant to its source** for every object its exact post-state
+describes, except an object the mutation removed. That grant is issued after
+every conflicting peer lease has discharged to none and after XFS apply, at a
+fresh epoch, so it covers exactly the state the same reply carries and nothing
+whose freshness this transaction did not just establish. It does not cancel the
+source obligation below: the recalled epoch's payload is still purged before the
+reply, and the fresh epoch is what the post-state is installed under. A peer
+recall still holds the coordinate closed for the source, so a mutation racing a
+peer's recall of the same coordinate installs no successor and its own follow-up
+read is an ordinary miss.
+
+The source's outstanding discharge receipt does not close a coordinate against
+the source itself: the purge that receipt attests to happened before the reply
+that let the next request be issued, so refusing the source there would make an
+ordinary write-then-read on one mount return `EAGAIN`. Every earlier phase of
+the transaction still blocks the source, because until peers discharge the
+barrier is incomplete for everyone.
+
+No other family gets a successor. N-R, D-R, and E-R recalled from the source are
+discharged to none, and a later read reacquires state and cache authority
+together.
 
 **Revoke.** When a mutation's touched-coordinate set (the existing
 `MutationDependencies`/`VisibilityTarget` rules; the cross-class recall table
@@ -296,8 +315,10 @@ The daemon validates COMPLETE's exact post-state at the same recall cut, then
 purges every recalled payload before acknowledging recall-to-none. It does not
 retain that payload after giving up its covering lease. A later read reacquires
 authority and state together; COMPLETE adds no follow-up RPC to the mutation
-critical path itself. A future successor-lease protocol may install exact
-post-state, but v1 does not disguise one as recall-to-none.
+critical path itself. A **peer's** recall is never paired with a successor: the
+peer discharges to none and reacquires later. Only the mutating source, whose own
+reply carries the applied post-state, receives the A-R successor of §2.2, so no
+recall-to-none is ever disguised as continuity.
 
 ### 3.4 Daemon-side caches
 

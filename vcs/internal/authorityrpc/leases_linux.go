@@ -127,6 +127,26 @@ func leaseGrantsProto(coordinator *volumeserver.LeaseCoordinator, grants []volum
 	return wire
 }
 
+// postStateAttributeGrants selects the coordinates a mutation's own applied
+// post-state authorizes its source to cache. A removed object has no attributes
+// left to cache; every other object the reply describes is the exact state the
+// authority just wrote, so a successor attribute grant over it covers nothing
+// this transaction did not establish.
+func postStateAttributeGrants(state *authoritypb.PostState) []volumeserver.LeaseGrantRequest {
+	requests := make([]volumeserver.LeaseGrantRequest, 0, len(state.GetObjects()))
+	for _, object := range state.GetObjects() {
+		if object.GetRoles()&postStateRoleRemoved != 0 || !nonzeroLeaseIdentity(object.GetStableIdentity()) {
+			continue
+		}
+		coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes}
+		copy(coordinate.Identity[:], object.GetStableIdentity())
+		requests = append(requests, volumeserver.LeaseGrantRequest{
+			Coordinate: coordinate, Right: volumeserver.LeaseRightAttributesRead,
+		})
+	}
+	return requests
+}
+
 func nonzeroLeaseIdentity(identity []byte) bool {
 	return len(identity) == 16 && !bytes.Equal(identity, make([]byte, 16))
 }

@@ -895,9 +895,13 @@ func (p *replyPublication) leaseGrant(family authoritypb.LeaseFamily, right auth
 	return selected, !selected.cacheDeadline.IsZero()
 }
 
-func (r *leaseRegistry) matches(key leaseKey, right authoritypb.LeaseRight, stamp leaseStamp, now time.Time) bool {
+// heldGrant returns the live obligation one daemon cache payload is covered by.
+// A reply answered from that payload is admitted through the same publication
+// discipline as an authority answer, so it needs the exact grant it is
+// answering under rather than a yes/no.
+func (r *leaseRegistry) heldGrant(key leaseKey, right authoritypb.LeaseRight, stamp leaseStamp, now time.Time) (validatedLeaseGrant, bool) {
 	if r == nil || stamp.epoch == 0 || stamp.issuedSequence == 0 {
-		return false
+		return validatedLeaseGrant{}, false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -906,9 +910,14 @@ func (r *leaseRegistry) matches(key leaseKey, right authoritypb.LeaseRight, stam
 	// generation. The epoch is the payload continuity token; issued_sequence is
 	// only the cross-lane late-response admission filter.
 	if held == nil || held.revoking || held.grant.right != right || held.grant.epoch != stamp.epoch || !held.purgeAt.After(now) {
-		return false
+		return validatedLeaseGrant{}, false
 	}
-	return true
+	return held.grant, true
+}
+
+func (r *leaseRegistry) matches(key leaseKey, right authoritypb.LeaseRight, stamp leaseStamp, now time.Time) bool {
+	_, held := r.heldGrant(key, right, stamp, now)
+	return held
 }
 
 func leaseBound(policy, remaining time.Duration) time.Duration {

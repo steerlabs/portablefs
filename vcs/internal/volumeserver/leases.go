@@ -273,16 +273,20 @@ type LeaseConfig struct {
 type LeaseCoordinator struct {
 	cfg LeaseConfig
 
-	mu           sync.Mutex
-	holders      map[SessionID]*leaseHolder
-	blocked      map[string]uint64
-	readers      map[string]uint64
-	source       map[sourceLeaseKey]*sourceLeaseObligation
-	next         uint64
-	committed    uint64
-	totalLeases  uint64
-	startupUntil time.Time
-	changed      chan struct{}
+	mu      sync.Mutex
+	holders map[SessionID]*leaseHolder
+	blocked map[string]uint64
+	// blockedSource names the holder whose outstanding discharge receipt is the
+	// only thing still holding each key closed, so that receipt does not close
+	// the coordinate against the holder that owes it.
+	blockedSource map[string]SessionID
+	readers       map[string]uint64
+	source        map[sourceLeaseKey]*sourceLeaseObligation
+	next          uint64
+	committed     uint64
+	totalLeases   uint64
+	startupUntil  time.Time
+	changed       chan struct{}
 }
 
 func NewLeaseCoordinator(cfg LeaseConfig) (*LeaseCoordinator, error) {
@@ -300,7 +304,8 @@ func NewLeaseCoordinator(cfg LeaseConfig) (*LeaseCoordinator, error) {
 	}
 	return &LeaseCoordinator{
 		cfg: cfg, holders: make(map[SessionID]*leaseHolder), blocked: make(map[string]uint64),
-		readers: make(map[string]uint64), source: make(map[sourceLeaseKey]*sourceLeaseObligation),
+		blockedSource: make(map[string]SessionID),
+		readers:       make(map[string]uint64), source: make(map[sourceLeaseKey]*sourceLeaseObligation),
 		next: 1, committed: 1, startupUntil: startupUntil, changed: make(chan struct{}),
 	}, nil
 }
@@ -443,7 +448,15 @@ func (c *LeaseCoordinator) beginRead(ctx context.Context, id SessionID, wait boo
 		}
 		blocked := false
 		for key := range keys {
-			if c.blocked[key] != 0 {
+			// A coordinate held closed only by this holder's own outstanding
+			// discharge receipt does not close it against that holder. The purge the
+			// receipt attests to already happened, before the reply that let this
+			// request be issued at all; the receipt itself only has to keep every
+			// other holder out until it lands. Refusing the source here would make an
+			// ordinary write-then-read on one mount return EAGAIN. Every earlier
+			// phase of the transaction still blocks the source too: until peers have
+			// discharged, the barrier is not complete for anyone.
+			if c.blocked[key] != 0 && c.blockedSource[key] != id {
 				blocked = true
 				break
 			}
@@ -586,7 +599,7 @@ func (a *LeaseReadAdmission) GrantBatch(requests []LeaseGrantRequest) ([]LeaseGr
 	}
 	grants := make([]LeaseGrant, 0, len(requests))
 	for _, request := range requests {
-		grant, err := c.grantLocked(a.holder, request.Coordinate, request.Right, now, a.generation)
+		grant, err := c.grantLocked(a.holder, request.Coordinate, request.Right, now, a.generation, false)
 		if err != nil {
 			panic("volumeserver: prevalidated lease grant batch failed: " + err.Error())
 		}
@@ -614,7 +627,11 @@ func (c *LeaseCoordinator) Grant(ctx context.Context, id SessionID, coordinate L
 	return admission.Grant(coordinate, right)
 }
 
-func (c *LeaseCoordinator) grantLocked(id SessionID, coordinate LeaseCoordinate, right LeaseRight, now time.Time, issuedAt uint64) (LeaseGrant, error) {
+// successor is set only for a post-state grant. It suppresses the in-place
+// epoch refresh below: a successor covers state the same transaction just
+// applied, so it must not inherit the epoch of the payload that transaction's
+// source discharge is simultaneously obliged to retire.
+func (c *LeaseCoordinator) grantLocked(id SessionID, coordinate LeaseCoordinate, right LeaseRight, now time.Time, issuedAt uint64, successor bool) (LeaseGrant, error) {
 	if right.family() != coordinate.Family || !c.grantAllowed(right) {
 		return LeaseGrant{}, ErrLeaseRight
 	}
@@ -632,7 +649,7 @@ func (c *LeaseCoordinator) grantLocked(id SessionID, coordinate LeaseCoordinate,
 			return LeaseGrant{}, ErrLeaseConflict
 		}
 	}
-	if record := h.leases[key]; record != nil && record.state == leaseGranted &&
+	if record := h.leases[key]; !successor && record != nil && record.state == leaseGranted &&
 		record.grant.Right == right && record.grant.ExpiresAt.After(now) {
 		// A second read of the same coordinate refreshes the existing authority
 		// token. Rotating its epoch would make an earlier, still-valid DATA reply
@@ -1041,6 +1058,7 @@ func (c *LeaseCoordinator) releaseBlockedLocked(sequence uint64, keys []string) 
 	for _, key := range keys {
 		if c.blocked[key] == sequence {
 			delete(c.blocked, key)
+			delete(c.blockedSource, key)
 			changed = true
 		}
 	}
@@ -1148,6 +1166,11 @@ func (t *LeaseRecallTransaction) complete(ctx context.Context, postState []Visib
 					deadline: now.Add(c.cfg.RecallBudget), expires: latest,
 				}
 				c.source[sourceLeaseKey{holder: t.initiator, sequence: t.sequence}] = obligation
+				for _, key := range t.keys {
+					if c.blocked[key] == t.sequence {
+						c.blockedSource[key] = t.initiator
+					}
+				}
 				if !source.fenced {
 					sourceDischarge = cloneSourceDischarge(&discharge)
 				}
@@ -1165,6 +1188,34 @@ func (t *LeaseRecallTransaction) complete(ctx context.Context, postState []Visib
 		c.cfg.OnRecall(c.cfg.Now().Sub(t.started), len(deliveries))
 	}
 	return sourceDischarge, err
+}
+
+// GrantSourcePostState issues the mutating holder fresh cache authority over the
+// coordinates its own applied post-state describes. It is legal only at this
+// point in the transaction: every conflicting peer lease has been recalled to
+// none, XFS has applied, and the grant covers exactly the state the reply is
+// about to carry, so a successor here can never cover state whose freshness was
+// not just established. The epoch is new, so the source's recalled epochs still
+// owe their purge before the discharge receipt, and the coordinate stays closed
+// to every other holder until that receipt arrives.
+func (t *LeaseRecallTransaction) GrantSourcePostState(requests []LeaseGrantRequest) []LeaseGrant {
+	if t == nil || t.coordinator == nil || len(requests) == 0 {
+		return nil
+	}
+	c := t.coordinator
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.cfg.Now()
+	c.expireLocked(now)
+	grants := make([]LeaseGrant, 0, len(requests))
+	for _, request := range requests {
+		grant, err := c.grantLocked(t.initiator, request.Coordinate, request.Right, now, t.sequence, true)
+		if err != nil {
+			continue
+		}
+		grants = append(grants, grant)
+	}
+	return grants
 }
 
 // Abort is safe only before filesystem apply. It still completes the recall to
@@ -1222,6 +1273,10 @@ func (c *LeaseCoordinator) finishSourceDischargeLocked(key sourceLeaseKey, holde
 		for _, recall := range obligation.discharge.Recalls {
 			coordinateKey := recall.Coordinate.key()
 			record := holder.leases[coordinateKey]
+			// A post-state successor may already have replaced the revoking
+			// record for this coordinate. Its epoch is newer than the recalled
+			// one, so the receipt discharges the old epoch and leaves the
+			// successor -- and its lease-count entry -- alone.
 			if record != nil && record.state == leaseRevoking && record.transaction == key.sequence && record.revokeEpoch == recall.RevokeEpoch {
 				delete(holder.leases, coordinateKey)
 				c.totalLeases--

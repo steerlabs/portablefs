@@ -1167,14 +1167,14 @@ func TestDaemonNamePayloadCannotBorrowReplacementGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.mount.leases.install(grants, now)
-	if cached, _, _ := fixture.raw.cachedLookup(parent, "stale"); cached != nil {
+	if cached, _, _ := fixture.raw.cachedLookup(context.Background(), parent, "stale"); cached != nil {
 		t.Fatal("old positive payload borrowed a replacement N grant")
 	}
 	fixture.raw.mu.Lock()
 	fixture.raw.dropCachedNameLocked(key)
 	fixture.raw.bindCachedNegativeLocked(key, leaseStamp{epoch: 1, issuedSequence: 1})
 	fixture.raw.mu.Unlock()
-	if _, _, negative := fixture.raw.cachedLookup(parent, "stale"); negative {
+	if _, _, negative := fixture.raw.cachedLookup(context.Background(), parent, "stale"); negative {
 		t.Fatal("old negative payload borrowed a replacement N grant")
 	}
 }

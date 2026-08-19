@@ -212,7 +212,9 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 		r.mount.revoke(err)
 		return ctx, func() {}, fuse.Status(syscall.ENOTCONN)
 	}
-	return context.WithValue(ctx, mutationCallbackKey{}, callback), func() {
+	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
+	return ctx, func() {
+		r.publishPostStateAttrs(ctx)
 		callback.finish()
 		r.finishReplyPublicationRegistration(unique, &callback.publication)
 	}, fuse.OK
