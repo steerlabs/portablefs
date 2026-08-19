@@ -10,6 +10,44 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+### Fixed
+
+- A Linux mount is no longer revoked when an enumeration reply carries no
+  E(dir) grant. A grant on a read-side reply is a MAY, not a MUST
+  (docs/portable-coherence.md §2.2), and the frontend independently declines to
+  install a grant that a newer recall's grant floor, an unfinished local recall,
+  or the family's cache budget has overtaken. All of those mean one thing --
+  this reply is uncached -- but OPENDIR and READDIR treated them as an authority
+  protocol violation and failed the mount closed. A dependency-tree install
+  (per-package `rename(2)` publication into one directory) racing readers that
+  enumerate that directory hits the window continuously: live staging
+  qualification lost its mount in about seven seconds, three runs out of three,
+  with the authority journal showing no fence and nothing to notice. The
+  frontend now serves the ungranted page uncached and bounded to the kernel
+  callback that fetched it, retiring the buffer at the next callback and
+  resuming from the authority cookie so the verifier -- not a cache lease -- is
+  what catches a mutation across the gap. A directory reply carrying no stable
+  identity remains terminal: no coordinate can name it, so no recall could ever
+  reach it. Covered by
+  `TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing`,
+  which is bounded, required, and fails on the unfixed frontend in under a
+  second.
+
+### Added
+
+- `deploy/gcp/verify-hosted-release.sh` now asserts each released binary's Go
+  VCS stamp: `vcs.revision` must equal the release's recorded `source-commit`
+  and `vcs.modified` must be `false`, with an absent stamp treated as the
+  failure rather than as not-applicable. That absence is exactly what a release
+  built from a linked git worktree produces -- Go's `-buildvcs` support drops
+  silently there -- and it shipped a provenance-stripped artifact that every
+  other check in the script accepted.
+- `.github/workflows/deploy-opensteer-staging.yml`: a `workflow_dispatch`
+  staging deploy mirroring the production workflow against project
+  `opensteer-staging`, zone `us-west1-b`, instance `portablefs-bench-1` as both
+  Manager and cell. Its first step refuses, by name, an `opensteer-staging`
+  GitHub environment whose WIF variables or E2B secret are not provisioned.
+
 ## [0.3.0] - 2026-08-19
 
 This release replaces the private-kernel architecture with one that runs on a
