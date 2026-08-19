@@ -354,6 +354,22 @@ func TestRepeatedOpenForReadRacingAPeerWriteKeepsBothMountsServing(t *testing.T)
 	}
 
 	payloads := [2][]byte{after, before}
+	// The cycle this test exists for does not only end in a revoked mount. With
+	// the open admitted on the metadata lane but the frontend no longer refusing
+	// a read outright, the open still parks for the whole barrier and the purge
+	// still waits on it -- and the pair is broken by a request timeout rather
+	// than by a fence, so every assertion below passes and the suite only gets
+	// slower. Measured: 0.12s for these 96 rounds when the lanes are right,
+	// 240.65s when they are not, about a quarter of the rounds eating a full
+	// request timeout. A wall-clock bound is what makes that state fail.
+	//
+	// The bound is on the whole loop rather than per round, because one round
+	// stalling on a loaded machine is ordinary and the defect is systemic. At
+	// 20s it sits two orders of magnitude above the healthy total and an order
+	// of magnitude below the degraded one, so neither CI load nor a slow
+	// filesystem reaches it.
+	const raceBound = 20 * time.Second
+	raceStart := time.Now()
 	for round := range 96 {
 		// One opener, two opens, joined before the next round. That is enough
 		// for an open to land inside a recall, which is this test's subject,
@@ -375,6 +391,10 @@ func TestRepeatedOpenForReadRacingAPeerWriteKeepsBothMountsServing(t *testing.T)
 		if recorded := failure.Load(); recorded != nil {
 			t.Fatalf("round %d: %v", round, *recorded)
 		}
+	}
+	if raced := time.Since(raceStart); raced > raceBound {
+		t.Fatalf("96 rewrites raced by repeated opens took %s, past the %s bound: opens are parking for a whole barrier and being released by a timeout rather than by the data lane (%s)",
+			raced, raceBound, f.sessionDiagnostics())
 	}
 	if completed := opens.Load(); completed < 150 {
 		t.Fatalf("only %d opens raced 96 peer rewrites; the window this test exists for was not entered", completed)

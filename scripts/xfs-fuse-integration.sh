@@ -77,6 +77,16 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeIsRefusedWhileAnyMountIsLive"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
+  # The files gateway is the only synchronous-repair frontend shipped on Linux
+  # and the only participant that is not a mount. Keep its real handshake with
+  # the real volume handler required: every other readonlyfs test drives a fake,
+  # which cannot observe attach negotiation, a real barrier, or whether a
+  # cacheless reader can stall a writing mount.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer"
+  # The gateway is a sidecar, so it leaves whenever its pod restarts, and
+  # leaving used to cost a writing mount its mutation. Keep the test that
+  # measures what a clean departure costs required.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayCloseDoesNotStallAMutatingMount"
 )
 
 # This boundary is root-owned provisioning work and therefore cannot run under

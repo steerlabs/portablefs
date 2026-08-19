@@ -140,17 +140,25 @@ func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.Se
 // stabilizeDirectoryPage takes one cut over the complete candidate page. The
 // caller has already sampled every name, identity, attr, and object version;
 // after this cut it revalidates those same facts before publishing any of them.
-func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, parent xfsstore.Capability, candidates []directoryPageCandidate) (bool, uint64, error) {
+//
+// Two things happen here and they are separate. The visibility coordinator
+// decides *when* the cut may be taken: it blocks while a conflicting barrier is
+// in flight and records the page's resolutions in this participant's monotone
+// index. The cut's *value* is the volume's storage cut, which is a different
+// counter and deliberately not the coordinator's own barrier sequence -- the
+// caller compares it against each entry's ObjectVersion, and those are stamped
+// from the storage cut. Returning the barrier sequence here made a sync-repair
+// readdir compare two unrelated counters, so on any volume a Linux mount had
+// written to, every entry looked like it was from the future and the page could
+// never stabilize.
+func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, candidates []directoryPageCandidate) (bool, uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return false, 1, nil
+		return false, h.storageCut(), nil
 	}
 	directory, err := h.Store.IdentityOpen(dir)
 	if err != nil {
 		return false, 0, err
-	}
-	if parent == (xfsstore.Capability{}) {
-		return false, 0, syscall.ESTALE
 	}
 	resolutions := make([]volumeserver.VisibilityResolution, 0, len(candidates)+1)
 	resolutions = append(resolutions, volumeserver.VisibilityResolution{Identity: directory})
@@ -161,13 +169,41 @@ func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeser
 		}
 		resolutions = append(resolutions, resolution)
 	}
-	waited, sequence, err := coordinator.StabilizeSequence(ctx, id, resolutions...)
+	waited, _, err := coordinator.StabilizeSequence(ctx, id, resolutions...)
 	if errors.Is(err, volumeserver.ErrVisibilityRetry) {
 		// Readdir's caller discards the page and repeats this bounded loop while
 		// the independent CONTROL lane acknowledges the pending PREPARE.
 		return true, 0, nil
 	}
-	return waited, sequence, err
+	if err != nil || waited {
+		return waited, 0, err
+	}
+	// Sampled here rather than before the wait: StabilizeSequence returns only
+	// once no barrier conflicting with this page is in flight, so the cut read
+	// at this point is one no covered entry can already be ahead of. Sampling
+	// before the wait would let a mutation commit during it and make a
+	// legitimate entry look like an ordering defect.
+	return false, h.storageCut(), nil
+}
+
+// storageCut is the volume's object-version domain: the latest completed
+// storage cut. Object versions are stamped from it -- finalizeMutationPostState
+// records the lease commit sequence, and LeaseReadAdmission.SnapshotSequence
+// publishes the same counter -- so a page stabilized against it is directly
+// comparable to the versions its entries carry, for either frontend profile.
+//
+// It floors at 1 for the same reason sampledObjectVersion floors an unstamped
+// object at 1: before anything has committed, the domain's first value is 1.
+// Returning 0 would make every unstamped entry look like it came from the
+// future on a volume nothing had written to yet.
+func (h *VolumeHandler) storageCut() uint64 {
+	if h.Leases == nil {
+		return 1
+	}
+	if cut := h.Leases.CommittedSequence(); cut != 0 {
+		return cut
+	}
+	return 1
 }
 
 func coherenceProfile(profile authoritypb.CoherenceProfile) (volumeserver.CoherenceProfile, error) {
