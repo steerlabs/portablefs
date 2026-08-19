@@ -73,6 +73,12 @@ type authorityClient interface {
 	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	Close() error
+	// ReleaseBeforeMount is the authenticated detach for an ACTIVE session that
+	// never installed a kernel mount. That is the abort path for a mount
+	// supervisor and the permanent condition of this client, so it is the exact
+	// contract to leave on: it observes this process's own mount-absence
+	// evidence, sends Detach, and closes.
+	ReleaseBeforeMount(context.Context) error
 	IOLimits() (uint32, uint32)
 	InitialVisibilityCursor() *authoritypb.VisibilityCursor
 	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
@@ -436,12 +442,35 @@ func (c *Client) sessionError() error {
 // as ENOENT do not poison the session and are not returned here.
 func (c *Client) Err() error { return c.sessionError() }
 
+// detachBudget bounds the authenticated detach on Close. Leaving without
+// detaching is not free: the authority keeps this session in the barrier
+// audience, so the next peer mutation waits this session's whole repair budget
+// for a phase nobody will acknowledge before the authority expels it. A
+// departure that costs a round trip is strictly better than one that costs a
+// writer a budget, so Close spends a bounded amount of time on it and gives up
+// rather than hanging.
+const detachBudget = 10 * time.Second
+
+// Close ends the session, detaching first.
+//
+// The workers stop before the detach rather than after it. Both of them treat a
+// failed call as a terminal session cause, and the detach deliberately ends the
+// session underneath them -- a visibility poll outstanding across it would
+// report the departure it was asked for as a fatal error.
+//
+// A session that already has a terminal cause does not detach: there is nothing
+// live to detach, and Err has already told the caller so.
 func (c *Client) Close() error {
 	var closeErr error
 	c.closeOnce.Do(func() {
 		c.stop()
-		closeErr = c.rpc.Close()
 		<-c.done
+		if c.sessionError() == nil {
+			detachContext, cancel := context.WithTimeout(context.Background(), detachBudget)
+			closeErr = c.rpc.ReleaseBeforeMount(detachContext)
+			cancel()
+		}
+		closeErr = errors.Join(closeErr, c.rpc.Close())
 	})
 	return closeErr
 }
