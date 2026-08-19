@@ -897,8 +897,9 @@ func integrationTLS(t *testing.T) (*tls.Config, *tls.Config) {
 type countingHandler struct {
 	inner authorityrpc.Handler
 
-	mu     sync.Mutex
-	byKind map[string]int
+	mu           sync.Mutex
+	byKind       map[string]int
+	beforeHandle func(*authoritypb.Request)
 }
 
 func (h *countingHandler) Epoch() []byte                        { return h.inner.Epoch() }
@@ -916,8 +917,18 @@ func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Reque
 		h.byKind = make(map[string]int)
 	}
 	h.byKind[requestKind(request)]++
+	before := h.beforeHandle
 	h.mu.Unlock()
+	if before != nil {
+		before(request)
+	}
 	return h.inner.Handle(ctx, request)
+}
+
+func (h *countingHandler) setBeforeHandle(before func(*authoritypb.Request)) {
+	h.mu.Lock()
+	h.beforeHandle = before
+	h.mu.Unlock()
 }
 
 func (h *countingHandler) count(kind string) int {

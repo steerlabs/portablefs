@@ -1550,7 +1550,7 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 // the mutation itself is the only authority operation; the immediate stat is
 // then a direct assertion that the reply installed the target and parent attrs.
 func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	modeOf := func(info os.FileInfo) os.FileMode {
 		if info == nil {
 			return 0
@@ -1857,15 +1857,17 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	if _, err := os.Lstat(existingPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("warm existing-create negative: %v", err)
 	}
-	rootCapability, err := f.store.Root()
-	if err != nil {
-		t.Fatalf("acquire store root: %v", err)
-	}
-	type existingCreateInjection struct {
-		forget func() error
-		err    error
-	}
-	injected := make(chan existingCreateInjection, 1)
+	injected := make(chan error, 1)
+	peerCreateEntered := make(chan struct{})
+	var peerCreateOnce sync.Once
+	f.counter.setBeforeHandle(func(request *authoritypb.Request) {
+		create := request.GetCreate()
+		if create == nil || string(create.GetName()) != existingName {
+			return
+		}
+		peerCreateOnce.Do(func() { close(peerCreateEntered) })
+	})
+	defer f.counter.setBeforeHandle(nil)
 	type existingCreateResult struct {
 		errno   int32
 		failure authoritypb.FailureClass
@@ -1880,12 +1882,17 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			return
 		}
 		injectOnce.Do(func() {
-			capability, _, createErr := f.store.Create(rootCapability, existingName, 0o600, true)
-			result := existingCreateInjection{err: createErr}
-			if createErr == nil {
-				result.forget = func() error { return f.store.Forget(capability) }
+			go func() {
+				file, createErr := os.OpenFile(f.join(1, existingName), os.O_CREATE|os.O_RDWR, 0o600)
+				if createErr == nil {
+					createErr = file.Close()
+				}
+				injected <- createErr
+			}()
+			select {
+			case <-peerCreateEntered:
+			case <-time.After(integrationRequestTimeout):
 			}
-			injected <- result
 		})
 	})
 	defer f.transports[0].setBeforeMutation(nil)
@@ -1919,14 +1926,14 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	})
 	f.transports[0].setBeforeMutation(nil)
 	f.transports[0].setAfterMutation(nil)
-	var injection existingCreateInjection
+	var injectionErr error
 	select {
-	case injection = <-injected:
+	case injectionErr = <-injected:
 	case <-time.After(integrationRequestTimeout):
-		t.Fatal("the existing-create race observed no CREATE dispatch")
+		t.Fatal("the peer existing-create mutation did not complete")
 	}
-	if injection.err != nil {
-		t.Fatalf("materialize existing-create race after the negative lookup: %v", injection.err)
+	if injectionErr != nil {
+		t.Fatalf("materialize existing-create race through the peer mount: %v", injectionErr)
 	}
 	var rpcResults []existingCreateResult
 	for len(results) != 0 {
@@ -1936,12 +1943,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		t.Fatalf("open existing name through FUSE_CREATE: %v (RPC results=%+v; frontend fatal cause: %v)",
 			existingOpenErr, rpcResults, f.mounts[0].fatalError())
 	}
-	defer func() {
-		if err := injection.forget(); err != nil {
-			t.Errorf("forget direct existing-create capability: %v", err)
-		}
-	}()
-	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{lookup: 1, create: 1})
+	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{lookup: 2, create: 3})
 
 	unlinkedPath := filepath.Join(root, "post-state-unlinked")
 	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
