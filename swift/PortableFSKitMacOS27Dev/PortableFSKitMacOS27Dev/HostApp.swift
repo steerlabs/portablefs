@@ -15,7 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(state, forKey: "PFSLaunchAgentState")
         UserDefaults.standard.set(detail, forKey: "PFSLaunchAgentDetail")
         statusLabel?.stringValue = detail
-        NSLog("%{public}@", detail)
+        NSLog("%@", detail)
     }
 
     private func publishEnabledPresentation() {

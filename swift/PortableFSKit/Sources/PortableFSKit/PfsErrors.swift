@@ -131,6 +131,16 @@ public enum PfsLocalClientError: Error, Equatable, Sendable, CustomStringConvert
     }
 }
 
+/// Without this, every surfaced `localizedDescription` is the bridged NSError
+/// fallback — "The operation couldn't be completed. (PortableFSKit
+/// .PfsLocalClientError error N.)", where N is the case's declaration index and
+/// the payload naming the actual failure is dropped. Anything that reports a
+/// transport failure to a person (the host app's status line, the registration
+/// fence's composed messages) has to be able to say what went wrong.
+extension PfsLocalClientError: LocalizedError {
+    public var errorDescription: String? { description }
+}
+
 @inline(__always)
 func pfsErrno() -> Int32 {
     Darwin.errno

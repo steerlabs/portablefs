@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func publishEnabledPresentation() {
         statusLabel?.stringValue = Self.enabledDetail
-        NSLog("%{public}@", Self.enabledDetail)
+        NSLog("%@", Self.enabledDetail)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -46,7 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } catch {
             status = "PortableFS could not register its launchd service: \(error.localizedDescription)"
-            NSLog("%{public}@", status)
+            NSLog("%@", status)
         }
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: 220),
