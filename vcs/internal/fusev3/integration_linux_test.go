@@ -1885,7 +1885,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
 		file, err := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
-			t.Fatalf("open existing name through FUSE_CREATE: %v", err)
+			t.Fatalf("open existing name through FUSE_CREATE: %v (frontend fatal cause: %v)", err, f.mounts[0].fatalError())
 		}
 		if _, err := file.Stat(); err != nil {
 			_ = file.Close()
