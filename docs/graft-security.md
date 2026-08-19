@@ -106,8 +106,9 @@ enumerates and then proves the exact executed test set from the native
 confinement — the macOS graft refusal is a Go-side property and is covered by
 the `portablefsd` suite above.
 
-`bash scripts/verify-local.sh` is the repository's single local merge gate and
-runs the Go and Swift suites together.
+`bash scripts/verify-local.sh` is the repository's local gate and runs the Go
+and Swift suites together; `--full` also runs the two privileged real-mount
+suites.
 
 ## Source audit
 

@@ -7,11 +7,13 @@ and no package manager to install.
 ## The merge gate
 
 ```bash
-bash scripts/verify-local.sh
+bash scripts/verify-local.sh          # default: no Docker, no real mount
+bash scripts/verify-local.sh --full   # + both privileged real-mount suites
 ```
 
-That script is the single local gate, and it is plain bash so a developer Mac
-and a Linux CI runner execute the same steps:
+That script is the local gate, and it is plain bash so a developer Mac and a
+Linux CI runner execute the same steps. The default mode below stops short of
+the two real-mount suites and names them as not run; `--full` appends them.
 
 1. cross-platform compile and vet: `GOOS=darwin` and `GOOS=linux`, both built
    before anything runs, because the daemon, mount clients, and frontend

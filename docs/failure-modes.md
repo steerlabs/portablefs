@@ -171,7 +171,7 @@ Windows has no production frontend and is refused by its primitive gate.
 - `scripts/run-powerloss.sh` distinguishes process death from device-level
   durability cuts.
 - `scripts/verify-local.sh` runs portable compile, unit, race, workflow-policy,
-  and active-contract scans.
+  and active-contract scans; `--full` also runs the two suites above.
 
 The exact lease algorithm and open upstream work are in
 [portable-coherence.md](./portable-coherence.md).

@@ -222,8 +222,14 @@ weaker profile. The remaining platform gaps are in
 ## Development and verification
 
 ```bash
-bash scripts/verify-local.sh        # the single local merge gate
+bash scripts/verify-local.sh          # fast: everything that needs no Docker
+bash scripts/verify-local.sh --full   # + both privileged real-mount suites
 ```
+
+The default mode runs no real mount and says so: it closes by naming every gate
+it skipped and pointing at the CI lanes that run them. `--full` adds
+`scripts/xfs-fuse-integration.sh` and `scripts/coherence-matrix-linux.sh`, which
+need Docker and free loop devices.
 
 `verify-local.sh` runs cross-OS Go builds and vet, the pinned reachable-call
 vulnerability scan, the Go suite, the Go race suite, the native Xcode Swift

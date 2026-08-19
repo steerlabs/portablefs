@@ -56,7 +56,11 @@ Testing suite; pure tests remain parallel.
 bash scripts/verify-local.sh
 ```
 
-This is the repository's single pre-push gate. It runs from anywhere, operates
+This is the repository's pre-push gate, in its fast default mode: it runs no
+real mount, and it closes by naming every gate it did not run. Add `--full` (or
+set `VERIFY_LOCAL_FULL=1`) to also run the two privileged Docker real-mount
+suites, which is required evidence for a change to the authority, a frontend, or
+the coherence protocol. It runs from anywhere, operates
 on the repository root, and is plain bash so that a developer Mac and a Linux CI
 runner execute the same steps:
 
@@ -147,8 +151,8 @@ cannot be merged; fix up with `git commit --amend -s` or
   story. Silent changes to frozen surfaces are rejected.
 - **Run `bash scripts/verify-local.sh` locally.** CI runs the same suites; a
   green local run saves a round trip. If your change reaches the authority's XFS
-  path or a frontend's cache behavior, run the privileged gate too and say what
-  you ran.
+  path or a frontend's cache behavior, run `bash scripts/verify-local.sh --full`,
+  which drives both privileged real-mount suites, and say which mode you ran.
 - **Match the codebase style.** Go is `gofmt`-clean, with table-driven tests and
   errors wrapped with the context the caller needs to act on them. Swift follows
   the existing package's conventions, with no force-unwraps on I/O paths.
