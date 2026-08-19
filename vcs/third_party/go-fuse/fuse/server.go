@@ -659,52 +659,37 @@ func (ms *Server) writeReply(req *request) Status {
 	})
 }
 
-// prepareReplyForWrite freezes the two pieces of state that belong in the
-// physical response header: the filesystem result and the optional strict
-// publication marker. protocolServer.handleRequest serializes once for the
-// in-process/virtio transport, before the real /dev/fuse server can ask the
-// ReplyPublishMarker whether this response owns a publication obligation. The
-// real writer must therefore serialize again after that decision. Otherwise a
-// correctly retained reply is written with an unmarked unique and the strict
-// kernel is required to abort the connection.
+// prepareReplyForWrite lets a filesystem close its cache-admission lane at the
+// physical writer boundary, then freezes the standard response header.
 func (ms *Server) prepareReplyForWrite(req *request) Status {
 	unique := req.inHeader().Unique
-	if preparer, ok := ms.replyWriteLifecycle.(ReplyPayloadPreparer); ok && req.variableReply {
-		n, status := preparer.PrepareReplyPayload(unique, req.inHeader().NodeId, req.inHeader().Opcode, req.outDataBuf, req.outPayload[:cap(req.outPayload)], len(req.outPayload))
-		if !status.Ok() || n < 0 || n > cap(req.outPayload) {
-			if status.Ok() {
-				status = EIO
+	if preparer, ok := ms.replyWriteLifecycle.(ReplyPayloadPreparer); ok {
+		n, replyStatus, prepareStatus := preparer.PrepareReplyPayload(unique, req.inHeader().NodeId, req.inHeader().Opcode, req.outDataBuf, req.outPayload[:cap(req.outPayload)], len(req.outPayload))
+		if !prepareStatus.Ok() || n < 0 || n > cap(req.outPayload) {
+			if prepareStatus.Ok() {
+				prepareStatus = EIO
 			}
-			return status
+			return prepareStatus
 		}
 		req.outPayload = req.outPayload[:n]
-	}
-	// Protocol negatives are successful zero-nodeid entry replies. Header
-	// errors carry no structured result or trailer and can never request a
-	// publication receipt.
-	if marker, ok := ms.replyWriteLifecycle.(ReplyPublishMarker); ok && replyMayRequestPFSPublish(req) {
-		req.publishMarked = marker.ReplyPublishMarked(unique, req.inHeader().NodeId, req.inHeader().Opcode)
-		if req.publishMarked && !ms.replyWriteLifecycle.ReplyWriteOrdered(unique) {
-			// A marked response without physical writer ownership could race a
-			// notification before the kernel creates its publication receipt.
-			// Fail the device write path; the lifecycle owner must fence.
-			return EIO
+		if !replyStatus.Ok() {
+			req.status = replyStatus
+			if req.readResult != nil {
+				req.readResult.Done()
+				req.readResult = nil
+			}
+			req.outPayload = req.outPayload[:0]
 		}
 	}
-	// This is the final header serialization before Server.write. read-result
-	// conversion may serialize once more if its realized length differs, and it
-	// preserves publishMarked.
+	// This is the final header serialization before Server.write. Read-result
+	// conversion may serialize once more if its realized length differs.
 	req.serializeHeader(req.outPayloadSize())
 	if ms.opts != nil && ms.opts.Debug {
-		ms.opts.Logger.Printf("physical tx %d: unique=%#x marked=%t ordered=%t",
-			unique, req.outHeader().Unique, req.publishMarked,
+		ms.opts.Logger.Printf("physical tx %d: unique=%#x ordered=%t",
+			unique, req.outHeader().Unique,
 			ms.replyWriteLifecycle != nil && ms.replyWriteLifecycle.ReplyWriteOrdered(unique))
 	}
 	return OK
-}
-
-func replyMayRequestPFSPublish(req *request) bool {
-	return req != nil && req.status.Ok()
 }
 
 func runReplyWriteLifecycle(lifecycle ReplyWriteLifecycle, unique uint64, writeMu *sync.Mutex, write func() Status) Status {
@@ -778,9 +763,6 @@ func newNotifyRequest(opcode uint32) *request {
 			_OP_NOTIFY_RETRIEVE_CACHE: NOTIFY_RETRIEVE_CACHE,
 			_OP_NOTIFY_DELETE:         NOTIFY_DELETE,
 			_OP_NOTIFY_PRUNE:          NOTIFY_PRUNE,
-			_OP_NOTIFY_PFS_SIZE:       NOTIFY_PFS_SIZE,
-			_OP_NOTIFY_PFS_ATTR:       NOTIFY_PFS_ATTR,
-			_OP_NOTIFY_PFS_ENTRY:      NOTIFY_PFS_ENTRY,
 		}[opcode],
 	}
 	r.inHeader().Opcode = opcode
@@ -797,46 +779,6 @@ func (ms *protocolServer) InodeNotify(node uint64, off int64, length int64) Stat
 	entry.Off = off
 	entry.Length = length
 
-	return ms.notifyWrite(req)
-}
-
-// PFSSizeNotify repairs data and installs the authority's complete exact object
-// record in one kernel transaction.
-func (ms *protocolServer) PFSSizeNotify(sequence uint64, object *PFSObjectState) Status {
-	if object == nil || object.Nodeid == 0 || sequence == 0 || !ms.kernelSettings.SupportsNotify(NOTIFY_PFS_SIZE) {
-		return EINVAL
-	}
-	req := newNotifyRequest(_OP_NOTIFY_PFS_SIZE)
-	out := (*NotifyPFSSizeOut)(req.outData())
-	out.VisibilitySequence = sequence
-	out.Object = *object
-	return ms.notifyWrite(req)
-}
-
-func (ms *protocolServer) PFSAttrNotify(sequence uint64, object *PFSObjectState) Status {
-	if object == nil || object.Nodeid == 0 || sequence == 0 || !ms.kernelSettings.SupportsNotify(NOTIFY_PFS_ATTR) {
-		return EINVAL
-	}
-	req := newNotifyRequest(_OP_NOTIFY_PFS_ATTR)
-	out := (*NotifyPFSAttrOut)(req.outData())
-	out.VisibilitySequence = sequence
-	out.Object = *object
-	return ms.notifyWrite(req)
-}
-
-func (ms *protocolServer) PFSEntryNotify(parent, child, sequence uint64, name string, deleted bool) Status {
-	if parent == 0 || sequence == 0 || len(name) == 0 || len(name) > 255 || child == 0 && deleted || child != 0 && !deleted ||
-		!ms.kernelSettings.SupportsNotify(NOTIFY_PFS_ENTRY) {
-		return EINVAL
-	}
-	req := newNotifyRequest(_OP_NOTIFY_PFS_ENTRY)
-	out := (*NotifyPFSEntryOut)(req.outData())
-	out.Parent, out.Child, out.VisibilitySequence = parent, child, sequence
-	out.NameLen = uint32(len(name))
-	if deleted {
-		out.Flags = 1
-	}
-	req.outPayload = []byte(name)
 	return ms.notifyWrite(req)
 }
 
@@ -1071,8 +1013,6 @@ func (in *InitIn) SupportsNotify(notifyType int) bool {
 		return in.SupportsVersion(7, 18)
 	case NOTIFY_PRUNE:
 		return in.SupportsVersion(7, 45)
-	case NOTIFY_PFS_SIZE, NOTIFY_PFS_ATTR, NOTIFY_PFS_ENTRY:
-		return in.Flags64()&CAP_PFS_STRICT_COHERENCE != 0
 	}
 	return false
 }

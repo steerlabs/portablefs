@@ -51,12 +51,14 @@ func (s *Server) acceptTransportHello(
 	hello := request.GetHello()
 	if request.GetRequestId() == 0 || hello == nil || request.GetBody() == nil ||
 		len(request.GetEpoch()) != 0 || request.GetSession() != nil || request.GetMutation() != nil ||
-		request.GetFrontendOperationId() != 0 || request.GetSourcePublicationGate() != nil ||
-		request.GetVisibilityRetryAfterSequence() != 0 {
+		len(request.ProtoReflect().GetUnknown()) != 0 {
 		return nil, nil, fmt.Errorf("%w: first frame must be a bare nonzero Hello", ErrTransportBinding)
 	}
 	if !validTransportRole(hello.GetRole()) {
 		return nil, nil, fmt.Errorf("%w: Hello omitted a valid role", ErrTransportBinding)
+	}
+	if !validFrontendProfile(hello.GetFrontendProfile()) {
+		return nil, nil, fmt.Errorf("%w: Hello carried an unknown frontend profile", ErrTransportBinding)
 	}
 	setID, err := parseConnectionSetID(hello.GetConnectionSetId())
 	if err != nil {
@@ -81,7 +83,8 @@ func (s *Server) acceptTransportHello(
 	}
 	response.GetHello().Role = hello.GetRole()
 	response.GetHello().ConnectionSetId = append([]byte(nil), hello.GetConnectionSetId()...)
-	entry, err := s.registry.register(peer, setID, hello.GetRole(), cancel, conn.Close)
+	response.GetHello().FrontendProfile = hello.GetFrontendProfile()
+	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -184,21 +187,6 @@ func (s *Server) executeTransportRequest(
 			return sessionErr
 		}
 		return s.executeTransportDetach(ctx, entry, session, request, writeResponse)
-	case *authoritypb.Request_AckVisibility:
-		if sessionErr != nil {
-			return sessionErr
-		}
-		if request.GetAckVisibility().GetBlocked() {
-			return s.executeTransportBlockedReport(ctx, entry, session, request, writeResponse)
-		}
-		if _, pin, err := s.registry.pinActive(entry, session); err != nil {
-			return err
-		} else {
-			defer pin.Release()
-		}
-		response := s.dispatchRequest(ctx, request)
-		defer finishHandlerResponse(s.Handler, request, response)()
-		return writeResponse(request, response)
 	default:
 		if sessionErr != nil {
 			return sessionErr
@@ -214,46 +202,16 @@ func (s *Server) executeTransportRequest(
 	}
 }
 
-// executeTransportBlockedReport preserves the one exact response attempt for a
-// report which may synchronously fence its own runtime session. A namespace
-// cycle report normally succeeds and leaves the session active; a route-change
-// report (or malformed report) deliberately fences it. Without the response
-// hold, SessionTerminal closes CONTROL from inside Handler before the caller can
-// receive the reason it must unmount, collapsing a definite coherence verdict
-// into an unrelated transport-uncertain error.
-func (s *Server) executeTransportBlockedReport(
-	ctx context.Context,
-	entry *transportConnection,
-	session volumeserver.SessionID,
-	request *authoritypb.Request,
-	writeResponse transportResponseWriter,
-) error {
-	pair := entry.pair
-	pair.operation.Lock()
-	defer pair.operation.Unlock()
-	if _, err := s.registry.activeWitness(entry, session); err != nil {
-		return err
-	}
-	if err := s.registry.beginTerminalResponse(entry, session); err != nil {
-		return err
-	}
-	response := s.dispatchRequest(ctx, request)
-	defer finishHandlerResponse(s.Handler, request, response)()
-	writeErr := writeResponse(request, response)
-	if s.registry.finishTerminalResponse(entry) {
-		terminateTransportConnections(entry)
-	} else {
-		s.registry.cancelTerminalResponse(entry)
-	}
-	return writeErr
-}
-
 func (s *Server) executeTransportAttach(ctx context.Context, entry *transportConnection, request *authoritypb.Request, writeResponse transportResponseWriter) error {
 	pair := entry.pair
 	pair.operation.Lock()
 	if _, err := s.registry.attachWitness(entry); err != nil {
 		pair.operation.Unlock()
 		return err
+	}
+	if request.GetAttach().GetFrontendProfile() != entry.profile {
+		pair.operation.Unlock()
+		return fmt.Errorf("%w: Attach frontend profile differs from Hello", ErrTransportBinding)
 	}
 	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()

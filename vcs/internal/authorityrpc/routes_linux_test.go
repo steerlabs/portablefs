@@ -51,14 +51,29 @@ func testRoutesControllerWithFencer(t *testing.T, store *xfsstore.Volume, fencer
 	if err != nil {
 		t.Fatal(err)
 	}
+	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
+		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	locks := volumeserver.NewLockTable(1024, 1024, time.Now)
 	if authority, ok := fencer.(*volumeserver.Authority); ok {
 		locks = authority.Locks()
 	}
-	routes, err := NewRoutesController(store, visibility, locks)
+	routes, err := NewRoutesController(store, lifecycle, locks)
 	if err != nil {
 		t.Fatal(err)
 	}
+	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
+		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384, PriorGrantsFenced: true, Fencer: fencer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	routes.Leases = leases
+	routes.Mounts = lifecycle
+	routes.Visibility = visibility
 	if err := routes.Load(); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +153,13 @@ func loadedRoutes(rules string) *RoutesController {
 	if err != nil {
 		panic(err)
 	}
-	return &RoutesController{Visibility: visibility, loaded: true, revision: parsed.Revision(), canonical: parsed.Canonical()}
+	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
+		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return &RoutesController{Topology: lifecycle, Mounts: lifecycle, Visibility: visibility, loaded: true, revision: parsed.Revision(), canonical: parsed.Canonical()}
 }
 
 func routesRevisionOf(rules string) [32]byte {
@@ -181,10 +202,9 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 			response := h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{
 				Attach: &authoritypb.AttachRequest{
 					VolumeId: "routes-volume", AccessToken: []byte("test-only"), ReplaySlots: 2,
-					RoutesRevision: test.revision, AttachAttemptId: testAttachAttempt(1),
-					CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-					CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-					NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+					Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+					FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+					RoutesRevision:  test.revision, AttachAttemptId: testAttachAttempt(1),
 				}}})
 			if response.GetAttach() != nil {
 				t.Fatal("a mount running another topology was admitted")
@@ -300,14 +320,14 @@ func TestStaleRoutingRevisionRefusesEveryLaterRequestActionably(t *testing.T) {
 	}
 }
 
-// The visibility stream is barrier control, not filesystem work. The barrier
+// The FSKit repair stream is barrier control, not filesystem work. The barrier
 // that installs a new routing revision still needs its participants'
 // acknowledgments and blocked reports after the commit point — refusing them
 // through the session-routes gate would convert every routing change into one
 // full repair-budget stall per strict participant. So after the revision
 // moves, an ordinary request is refused as stale (the control assertion), but
 // a visibility request must reach its own handler.
-func TestVisibilityControlIsNotRoutesGated(t *testing.T) {
+func TestFskitRepairControlIsNotRoutesGated(t *testing.T) {
 	first := routesRevisionOf("node_modules\n")
 	second := routesRevisionOf("node_modules\ntarget\n")
 	h := testVolumeHandler()
@@ -326,9 +346,13 @@ func TestVisibilityControlIsNotRoutesGated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.startSessionResources(cred.ID, xfsstore.Capability{0xAA}, 2, first); err != nil {
+	if err := h.startSessionResourcesForProfile(
+		cred.ID, xfsstore.Capability{0xAA}, 2, first,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+	); err != nil {
 		t.Fatal(err)
 	}
+	h.Visibility = nil
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{1})
 	request := func(id uint64, body any) *authoritypb.Response {
 		req := &authoritypb.Request{
@@ -339,9 +363,9 @@ func TestVisibilityControlIsNotRoutesGated(t *testing.T) {
 		case *authoritypb.KeepAliveRequest:
 			req.Body = &authoritypb.Request_KeepAlive{KeepAlive: body}
 		case *authoritypb.AckVisibilityRequest:
-			req.Body = &authoritypb.Request_AckVisibility{AckVisibility: body}
+			req.Body = &authoritypb.Request_AckFskitRepair{AckFskitRepair: body}
 		case *authoritypb.NextVisibilityRequest:
-			req.Body = &authoritypb.Request_NextVisibility{NextVisibility: body}
+			req.Body = &authoritypb.Request_NextFskitRepair{NextFskitRepair: body}
 		default:
 			t.Fatalf("unhandled body %T", body)
 		}
@@ -444,7 +468,7 @@ func TestProtectedNamespaceRefusesEveryMountMutation(t *testing.T) {
 		"remove an xattr from it": {Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{
 			Item: declaration[:], Name: []byte("user.x")}}},
 		"fallocate through a handle on it": {Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{
-			Handle: handle[:], Offset: 0, Length: 1, FileMaxSize: 1 << 20}}},
+			Handle: handle[:], Offset: 0, Length: 1}}},
 		"open it for writing": {Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{
 			Item: declaration[:], Flags: &authoritypb.OpenFlags{Write: true}}}},
 		"open it for truncation": {Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{
@@ -920,10 +944,9 @@ func TestAttachRefusedForRoutingLeavesTheCapabilityUnspent(t *testing.T) {
 		return h.Handle(ctx, &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{
 			Attach: &authoritypb.AttachRequest{
 				VolumeId: "routes-volume", AccessToken: capability, ReplaySlots: 2,
-				RoutesRevision: revision, AttachAttemptId: testAttachAttempt(id),
-				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-				CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+				Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+				FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+				RoutesRevision:  revision, AttachAttemptId: testAttachAttempt(id),
 			}}})
 	}
 
@@ -969,25 +992,10 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 		{
 			name: "invalid replay slots",
 			invalid: &authoritypb.AttachRequest{
-				VolumeId: "routes-volume", ReplaySlots: 0,
+				VolumeId: "routes-volume", ReplaySlots: 0, Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			},
 			valid: &authoritypb.AttachRequest{
-				VolumeId: "routes-volume", ReplaySlots: 2,
-			},
-		},
-		{
-			name: "over-bound strict commitment",
-			invalid: &authoritypb.AttachRequest{
-				VolumeId: "routes-volume", ReplaySlots: 2,
-				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-				CachedNameCapacity: 1<<16 + 1, RepairBudgetMillis: 1000,
-				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
-			},
-			valid: &authoritypb.AttachRequest{
-				VolumeId: "routes-volume", ReplaySlots: 2,
-				CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-				CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-				NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+				VolumeId: "routes-volume", ReplaySlots: 2, Purpose: authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			},
 		},
 	} {
@@ -1011,16 +1019,7 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 			for _, attach := range []*authoritypb.AttachRequest{test.invalid, test.valid} {
 				attach.AccessToken = token
 				attach.RoutesRevision = append([]byte(nil), revision[:]...)
-				attach.CoherenceProfile = authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT
-				if attach.CachedNameCapacity == 0 {
-					attach.CachedNameCapacity = 1024
-				}
-				if attach.RepairBudgetMillis == 0 {
-					attach.RepairBudgetMillis = 1000
-				}
-				if attach.NamespaceRepair == authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
-					attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
-				}
+				attach.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
 			}
 			test.invalid.AttachAttemptId = testAttachAttempt(1)
 			test.valid.AttachAttemptId = testAttachAttempt(2)
@@ -1055,10 +1054,9 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 	revision := routesRevisionOf("")
 	attach := &authoritypb.AttachRequest{
 		VolumeId: "routes-volume", AccessToken: []byte("token"), ReplaySlots: 2,
-		RoutesRevision:     append([]byte(nil), revision[:]...),
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 1024, RepairBudgetMillis: 1000,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		RoutesRevision:  append([]byte(nil), revision[:]...),
 		AttachAttemptId: testAttachAttempt(1),
 	}
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{1})
@@ -1076,10 +1074,10 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 	checked := make(chan struct{})
 	writerDone := make(chan error, 1)
 	go func() {
-		_, err := routes.Visibility.ExecuteRoutesChecked(context.Background(), volumeserver.RoutesChange{}, func() (bool, error) {
+		_, err := routes.Topology.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
 			close(checked)
-			return false, nil
-		}, func() (volumeserver.RoutesChange, error) { panic("no-op CAS committed") })
+			return 0, nil
+		})
 		writerDone <- err
 	}()
 	select {
@@ -1112,44 +1110,17 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 	if err := h.startSessionResources(id, xfsstore.Capability{1}, 2, revision, volumeserver.CoherenceStrict); err != nil {
 		t.Fatal(err)
 	}
-	if err := routes.Visibility.Register(id, volumeserver.CoherenceStrict, make(chan struct{}), volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 1024, RepairBudget: time.Second,
-		NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	initial, err := routes.Visibility.InitialCursor(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		after := initial
-		for range 2 {
-			event, err := routes.Visibility.Next(ctx, id, after)
-			if err != nil {
-				return
-			}
-			if err := routes.Visibility.Ack(id, event.Cursor); err != nil {
-				return
-			}
-			after = event.Cursor
-		}
-	}()
-
 	guard, err := h.beginTopologyRequest(id)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checked := make(chan struct{})
 	writerDone := make(chan error, 1)
-	next := volumeserver.RoutesChange{Revision: [32]byte{1}, Canonical: []byte("node_modules\n")}
 	go func() {
-		_, err := routes.Visibility.ExecuteRoutesChecked(context.Background(), next, func() (bool, error) {
+		_, err := routes.Topology.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
 			close(checked)
-			return true, nil
-		}, func() (volumeserver.RoutesChange, error) { return next, nil })
+			return 0, nil
+		})
 		writerDone <- err
 	}()
 	select {

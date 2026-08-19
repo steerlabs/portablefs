@@ -32,7 +32,7 @@ func TestMutationPostStateExactObjectRoleSets(t *testing.T) {
 		input    []postStateSnapshot
 		expected map[[16]byte]uint32
 	}{
-		{"write", &authoritypb.Request{Body: &authoritypb.Request_OneShotWrite{}}, []postStateSnapshot{snapshot(target, postStateRoleTarget)}, map[[16]byte]uint32{target: postStateRoleTarget}},
+		{"write", &authoritypb.Request{Body: &authoritypb.Request_Write{}}, []postStateSnapshot{snapshot(target, postStateRoleTarget)}, map[[16]byte]uint32{target: postStateRoleTarget}},
 		{"setattr", &authoritypb.Request{Body: &authoritypb.Request_SetAttr{}}, []postStateSnapshot{snapshot(target, postStateRoleTarget)}, map[[16]byte]uint32{target: postStateRoleTarget}},
 		{"fallocate", &authoritypb.Request{Body: &authoritypb.Request_Fallocate{}}, []postStateSnapshot{snapshot(target, postStateRoleTarget)}, map[[16]byte]uint32{target: postStateRoleTarget}},
 		{"copy distinct", &authoritypb.Request{Body: &authoritypb.Request_CopyFileRange{}}, []postStateSnapshot{snapshot(target, postStateRoleSource), snapshot(parent, postStateRoleDestination)}, map[[16]byte]uint32{target: postStateRoleSource, parent: postStateRoleDestination}},

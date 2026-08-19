@@ -121,18 +121,16 @@ const (
 	integrationCachedNames  = 4096
 	integrationRepairBudget = 20 * time.Second
 
-	// Match the production authority's strict write-transaction admission
-	// profile. RequiredWriteTransactionBytes is the frozen MAX_RW_COUNT wire
-	// commitment; the remaining bounds admit the same per-session transaction
-	// concurrency as production without making the integration fixture a weaker
-	// peer than the mount it is qualifying.
-	integrationWriteStagingBytesPerSession = 16 << 30
-	integrationWriteStagingBytes           = 64 << 30
-	integrationWriteTransactionsPerSession = 8
-	integrationWriteTransactions           = 4096
-	integrationWriteProgressTimeout        = 2 * time.Minute
-	integrationWriteAbsoluteTimeout        = 30 * time.Minute
-	integrationTerminalDeliveryTimeout     = 45 * time.Second
+	// Match the production authority's bounded standard-WRITE admission
+	// profile without making the integration fixture a weaker peer than the
+	// mount it is qualifying.
+	integrationWriteBytesPerSession    = 16 << 30
+	integrationWriteBytes              = 64 << 30
+	integrationWritesPerSession        = 8
+	integrationWrites                  = 4096
+	integrationWriteProgressTimeout    = 2 * time.Minute
+	integrationWriteAbsoluteTimeout    = 30 * time.Minute
+	integrationTerminalDeliveryTimeout = 45 * time.Second
 )
 
 type integrationAuthorizer struct{ now func() time.Time }
@@ -284,7 +282,7 @@ type integrationFixture struct {
 	// XFS project but is outside the authoritative namespace, so inert payloads
 	// can only exist in private unnamed O_TMPFILE stages.
 	writeStagingRoot string
-	writeStaging     *authorityrpc.WriteTransactionStaging
+	writeAdmission   *authorityrpc.WriteAdmission
 	paths            []string
 	// backing is one per-machine tree per mount: these mounts stand in for
 	// different machines, and machine-local storage is not shared between them.
@@ -347,7 +345,7 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 			t.Errorf("remove per-test write staging root: %v", err)
 		}
 	})
-	f.writeStaging, err = authorityrpc.OpenWriteTransactionStaging(f.writeStagingRoot)
+	f.writeAdmission, err = authorityrpc.OpenWriteAdmission(f.writeStagingRoot)
 	if err != nil {
 		t.Fatalf("open per-test write staging root: %v", err)
 	}
@@ -476,16 +474,15 @@ func (f *integrationFixture) start() {
 		MaxFrame: integrationMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight:        integrationServerInFlight,
 		MaxItemsPerSession: 4096, MaxOpensPerSession: 4096, MaxItems: 16384, MaxOpens: 16384,
-		MaxRetainedReplyBytes:           integrationAllocationBudget,
-		WriteStaging:                    f.writeStaging,
-		MaxWriteTransactionBytes:        authorityrpc.RequiredWriteTransactionBytes,
-		MaxWriteStagingBytesPerSession:  integrationWriteStagingBytesPerSession,
-		MaxWriteStagingBytes:            integrationWriteStagingBytes,
-		MaxWriteTransactionsPerSession:  integrationWriteTransactionsPerSession,
-		MaxWriteTransactions:            integrationWriteTransactions,
-		WriteTransactionProgressTimeout: integrationWriteProgressTimeout,
-		WriteTransactionAbsoluteTimeout: integrationWriteAbsoluteTimeout,
-		TerminalDeliveryTimeout:         integrationTerminalDeliveryTimeout,
+		MaxRetainedReplyBytes:         integrationAllocationBudget,
+		WriteAdmission:                f.writeAdmission,
+		MaxWriteBytesPerSession:       integrationWriteBytesPerSession,
+		MaxWriteBytesInFlight:         integrationWriteBytes,
+		MaxWritesPerSession:           integrationWritesPerSession,
+		MaxWrites:                     integrationWrites,
+		WriteAdmissionProgressTimeout: integrationWriteProgressTimeout,
+		WriteAbsoluteTimeout:          integrationWriteAbsoluteTimeout,
+		TerminalDeliveryTimeout:       integrationTerminalDeliveryTimeout,
 	}
 	f.counter = &countingHandler{inner: handler}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -530,7 +527,9 @@ func (f *integrationFixture) start() {
 func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTransport) {
 	f.t.Helper()
 	cfg := authorityrpc.ClientConfig{
-		Address: f.listener.Addr().String(), TLS: f.clientTLS.Clone(), VolumeID: integrationVolumeID,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         f.listener.Addr().String(), TLS: f.clientTLS.Clone(), VolumeID: integrationVolumeID,
 		AccessToken: []byte("test-capability"), ReplaySlots: integrationReplaySlots,
 		MaxFrame: integrationMaxFrame, DialTimeout: 5 * time.Second,
 		CancelDrainTimeout: 5 * time.Second, MaxInFlight: integrationMaxInFlight,
@@ -538,13 +537,6 @@ func (f *integrationFixture) dialClient() (*authorityrpc.Client, *integrationTra
 	// Every mount declares the routing it is about to serve. The authority
 	// refuses a mount whose revision is not the volume's active one.
 	cfg.RoutesRevision = f.cfg.rules.Revision()
-	cfg.CoherenceProfile = authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT
-	cfg.CachedNameCapacity = integrationCachedNames
-	cfg.RepairBudget = integrationRepairBudget
-	// Strict Linux makes a cached binding unservable with exact lockless dentry
-	// expiration. Declaring that private primitive prevents accidental admission
-	// of the retired stock parent-lock profile.
-	cfg.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
 	cfg.RequireLocalSessionEnforcement = true
 	cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 		return &authoritypb.MountAbsenceProof{
@@ -602,13 +594,13 @@ func (f *integrationFixture) closeStore() {
 }
 
 func (f *integrationFixture) closeWriteStaging() {
-	if f.writeStaging == nil {
+	if f.writeAdmission == nil {
 		return
 	}
-	if err := f.writeStaging.Close(); err != nil {
-		f.t.Errorf("close write-transaction staging: %v", err)
+	if err := f.writeAdmission.Close(); err != nil {
+		f.t.Errorf("close write admission: %v", err)
 	}
-	f.writeStaging = nil
+	f.writeAdmission = nil
 }
 
 // shutdown is the cleanup path. It tolerates mounts that already aborted
@@ -947,10 +939,10 @@ func requestKind(request *authoritypb.Request) string {
 		return "lookup"
 	case request.GetGetAttr() != nil:
 		return "getattr"
-	case request.GetNextVisibility() != nil:
-		return "next-visibility"
-	case request.GetAckVisibility() != nil:
-		return "ack-visibility"
+	case request.GetNextLeaseEvent() != nil:
+		return "next-lease-event"
+	case request.GetAcknowledgeLeaseEvent() != nil:
+		return "ack-lease-event"
 	case request.GetReclaim() != nil:
 		return "reclaim"
 	case request.GetKeepAlive() != nil:
@@ -978,10 +970,8 @@ func requestKind(request *authoritypb.Request) string {
 		return "close"
 	case request.GetReadDir() != nil:
 		return "readdir"
-	case request.GetWriteTransaction() != nil:
-		return "write-transaction"
-	case request.GetOneShotWrite() != nil:
-		return "one-shot-write"
+	case request.GetWrite() != nil:
+		return "write"
 	case request.GetFallocate() != nil:
 		return "fallocate"
 	case request.GetCopyFileRange() != nil:

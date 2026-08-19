@@ -257,22 +257,6 @@ const (
 	FOPEN_NOFLUSH                = (1 << 5)
 	FOPEN_PARALLEL_DIRECT_WRITES = (1 << 6)
 	FOPEN_PASSTHROUGH            = (1 << 7)
-	// FOPEN_PFS_SHARED marks a handle whose inode is owned by the PortableFS
-	// authority. It is a private bit negotiated together with
-	// CAP_PFS_STRICT_COHERENCE and is intentionally absent from upstream FUSE.
-	FOPEN_PFS_SHARED = (1 << 8)
-	// FOPEN_PFS_LOCAL marks a handle in PortableFS's machine-local graft
-	// namespace. Under CAP_PFS_STRICT_COHERENCE every OPEN/OPENDIR/CREATE is
-	// classified exactly once as SHARED or LOCAL; an unmarked handle is invalid.
-	FOPEN_PFS_LOCAL = (1 << 9)
-)
-
-const (
-	// FUSE_ATTR_PFS_SHARED and FUSE_ATTR_PFS_LOCAL classify every inode for the
-	// lifetime of one nodeid/generation. Exactly one is mandatory under the
-	// private PortableFS strict-coherence capability.
-	FUSE_ATTR_PFS_SHARED = uint32(1 << 2)
-	FUSE_ATTR_PFS_LOCAL  = uint32(1 << 3)
 )
 
 type OpenOut struct {
@@ -328,23 +312,6 @@ const (
 	CAP_ALLOW_IDMAP          = (1 << 40)
 	CAP_OVER_IO_URING        = (1 << 41)
 	CAP_REQUEST_TIMEOUT      = (1 << 42)
-	// CAP_PFS_STRICT_COHERENCE is PortableFS's private, indivisible contract for
-	// explicit inode/handle classification, transactional shared writes,
-	// post-VFS publication receipts, and ordered exact-size notification.
-	CAP_PFS_STRICT_COHERENCE = uint64(1) << 63
-	// CAP_PFS_CACHED_DATA is the second half of that same indivisible contract:
-	// a SHARED regular file's open reply is exactly
-	// FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED, so reads are served from this kernel's
-	// page cache and withdrawn by ordered DATA publication instead of being
-	// forced through direct I/O. It is a separate bit only so that a kernel and
-	// a daemon built against different revisions of the private contract fail
-	// INIT rather than disagree about the one exact open flag pair; selecting
-	// either bit without the other is refused by the strict kernel.
-	CAP_PFS_CACHED_DATA = uint64(1) << 62
-	// CAP_PFS_WRITE_ONESHOT is the third revision bit of the indivisible
-	// PortableFS profile. It adds the single-fragment commit shape; peers which
-	// do not advertise the complete three-bit revision fail INIT.
-	CAP_PFS_WRITE_ONESHOT = uint64(1) << 61
 )
 
 type InitIn struct {
@@ -528,12 +495,6 @@ type OutHeader struct {
 	Unique uint64
 }
 
-// PFS_UNIQUE_PUBLISH is the private response-header marker asking the patched
-// kernel to send FUSE_PFS_PUBLISH after its actual VFS postprocessing. The
-// kernel masks this bit only for outstanding-request lookup; request unique
-// allocation remains below it.
-const PFS_UNIQUE_PUBLISH = uint64(1) << 62
-
 type NotifyInvalInodeOut struct {
 	Ino    uint64
 	Off    int64
@@ -584,27 +545,6 @@ type NotifyPruneOut struct {
 	_spare   uint64
 }
 
-// NotifyPFSSizeOut is the ordered exact data/attribute repair carried by
-// private FUSE_NOTIFY_PFS_SIZE. The object is the authority's retained
-// post-mutation record, not attributes sampled again by the frontend.
-type NotifyPFSSizeOut struct {
-	VisibilitySequence uint64
-	Object             PFSObjectState
-}
-
-type NotifyPFSAttrOut struct {
-	VisibilitySequence uint64
-	Object             PFSObjectState
-}
-
-type NotifyPFSEntryOut struct {
-	Parent             uint64
-	Child              uint64
-	VisibilitySequence uint64
-	NameLen            uint32
-	Flags              uint32
-}
-
 const (
 	//	NOTIFY_POLL         = -1 // notify kernel that a poll waiting for IO on a file handle should wake up
 	NOTIFY_INVAL_INODE    = -2 // notify kernel that an inode should be invalidated
@@ -614,9 +554,6 @@ const (
 	NOTIFY_DELETE         = -6 // notify kernel that a directory entry has been deleted
 	NOTIFY_RESEND         = -7
 	NOTIFY_PRUNE          = -9
-	NOTIFY_PFS_SIZE       = -10
-	NOTIFY_PFS_ATTR       = -12
-	NOTIFY_PFS_ENTRY      = -13
 )
 
 type FlushIn struct {
@@ -875,177 +812,6 @@ type WriteIn struct {
 	Flags      uint32
 	Padding    uint32
 }
-
-// PFSWriteIn is the request for PortableFS's private FUSE_PFS_WRITE opcode.
-// The embedded InHeader is the common FUSE request header; the fields after it
-// exactly match struct fuse_pfs_write_in in the pinned kernel ABI.
-type PFSWriteIn struct {
-	InHeader
-	Fh             uint64
-	Txid           uint64
-	RequestedSize  uint64
-	FragmentOffset uint64
-	Position       uint64
-	// RlimitFsize is the raw unsigned Linux rlim_cur value. MaxUint64 is
-	// RLIM_INFINITY; zero is a real zero-byte limit and is never a sentinel.
-	RlimitFsize uint64
-	FileMaxSize uint64
-	LockOwner   uint64
-	Size        uint32
-	WriteFlags  uint32
-	Flags       uint32
-	Phase       uint32
-}
-
-// PFSWriteOut exactly matches struct fuse_pfs_write_out in the pinned
-// PortableFS kernel ABI.
-type PFSWriteOut struct {
-	Txid           uint64
-	CommittedSize  uint64
-	AssignedOffset uint64
-	PostSize       uint64
-	Sequence       uint64
-	Flags          uint32
-	Error          int32
-}
-
-// PFSFallocateIn exactly matches struct fuse_pfs_fallocate_in. Strict SHARED
-// files use this private operation instead of stock FUSE_FALLOCATE so the
-// authority can serialize one mutation and return exact size/visibility state.
-type PFSFallocateIn struct {
-	InHeader
-	Fh          uint64
-	Offset      uint64
-	Length      uint64
-	RlimitFsize uint64
-	FileMaxSize uint64
-	Mode        uint32
-	WriteFlags  uint32
-}
-
-// PFSCopyFileRangeIn exactly matches struct fuse_pfs_copy_file_range_in.
-// NodeIdOut identifies the SHARED destination; the embedded InHeader NodeId is
-// the SHARED source.
-type PFSCopyFileRangeIn struct {
-	InHeader
-	FhIn        uint64
-	OffIn       uint64
-	NodeIdOut   uint64
-	FhOut       uint64
-	OffOut      uint64
-	Len         uint64
-	RlimitFsize uint64
-	FileMaxSize uint64
-	WriteFlags  uint32
-	Flags       uint32
-}
-
-// PFSRangeOut is the common result for strict range mutations. ResultSize is
-// zero for fallocate and the exact copied prefix for copy_file_range. A sole
-// fallocate REJECTED_RLIMIT carries the authoritative pre-mutation size in
-// PostSize so the kernel can prove a mode-specific RLIMIT_FSIZE refusal; other
-// definite no-change results leave all three uint64 result fields zero.
-type PFSRangeOut struct {
-	ResultSize uint64
-	PostSize   uint64
-	Sequence   uint64
-	Flags      uint32
-	Error      int32
-}
-
-const (
-	PFSPostStateMaxObjects = 4
-	PFSPostStateHeaderSize = 32
-	PFSWireAttrSize        = 88
-	PFSObjectStateSize     = 144
-	PFSPostStateMaxSize    = PFSPostStateHeaderSize + PFSPostStateMaxObjects*PFSObjectStateSize
-	PFSCacheStampSize      = 32
-)
-
-// PFSPostStateHeader and PFSObjectState are the variable trailer appended to
-// every applied mutation result. Keep these layouts pointer-free: the reply
-// writer encodes them directly into its bounded payload buffer.
-type PFSPostStateHeader struct {
-	VisibilitySequence uint64
-	SnapshotSequence   uint64
-	AttrValidNS        uint64
-	ObjectCount        uint32
-	Flags              uint32
-}
-
-type PFSObjectState struct {
-	Nodeid         uint64
-	ObjectVersion  uint64
-	StableIdentity [16]byte
-	Attr           [PFSWireAttrSize]byte
-	Roles          uint32
-	InodeFlags     uint32
-	BirthTimeNS    int64
-	PFSClass       uint32
-	RecordFlags    uint32
-}
-
-type PFSCacheStamp struct {
-	SnapshotSequence uint64
-	ObjectVersion    uint64
-	BirthTimeNS      int64
-	InodeFlags       uint32
-	Reserved         uint32
-}
-
-// PFSPublishIn is the kernel's local-only post-VFS publication receipt. The
-// 32 bytes following InHeader are the complete private wire structure.
-type PFSPublishIn struct {
-	InHeader
-	RequestUnique uint64
-	PublicationID uint64
-	Nodeid        uint64
-	Opcode        uint32
-	Flags         uint32
-}
-
-// PFSPublishOut must echo the input identity exactly and carry the sole ACK
-// flag. It intentionally has the same fixed 32-byte layout as PFSPublishIn's
-// private payload.
-type PFSPublishOut struct {
-	RequestUnique uint64
-	PublicationID uint64
-	Nodeid        uint64
-	Opcode        uint32
-	Flags         uint32
-}
-
-const (
-	PFS_WRITE_BEGIN    = uint32(1)
-	PFS_WRITE_DATA     = uint32(2)
-	PFS_WRITE_COMMIT   = uint32(3)
-	PFS_WRITE_ABORT    = uint32(4)
-	PFS_WRITE_ONE_SHOT = uint32(5)
-
-	PFS_WRITE_OUT_BEGUN     = uint32(1 << 0)
-	PFS_WRITE_OUT_STAGED    = uint32(1 << 1)
-	PFS_WRITE_OUT_COMMITTED = uint32(1 << 2)
-	PFS_WRITE_OUT_ABORTED   = uint32(1 << 3)
-	PFS_WRITE_OUT_REJECTED  = uint32(1 << 4)
-	// PFS_WRITE_OUT_POSTAPPLY_ERROR accompanies COMMITTED when a durability or
-	// killpriv step failed after a positive prefix changed storage. Exact result
-	// fields and a negative errno remain mandatory so the kernel publishes the
-	// committed state before returning that errno without retrying.
-	PFS_WRITE_OUT_POSTAPPLY_ERROR = uint32(1 << 5)
-	// PFS_WRITE_OUT_REJECTED_RLIMIT is the sole reply flag for an RLIMIT_FSIZE
-	// pre-apply refusal. It carries exactly -EFBIG and zero result fields so the
-	// kernel can raise SIGXFSZ exactly for this limit, never for an ordinary
-	// filesystem/non-LFS EFBIG refusal.
-	PFS_WRITE_OUT_REJECTED_RLIMIT = uint32(1 << 6)
-
-	PFS_RANGE_OUT_APPLIED         = uint32(1 << 0)
-	PFS_RANGE_OUT_REJECTED        = uint32(1 << 1)
-	PFS_RANGE_OUT_POSTAPPLY_ERROR = uint32(1 << 2)
-	PFS_RANGE_OUT_REJECTED_RLIMIT = uint32(1 << 3)
-	PFS_RANGE_OUT_NOOP            = uint32(1 << 4)
-
-	PFS_PUBLISH_ACK = uint32(1 << 0)
-)
 
 // Data for registering a file as backing an inode.
 type BackingMap struct {

@@ -6,8 +6,7 @@ This directory is a source-pinned copy of
 `6945a37ef334da27a747ddd6aacda04423d462d662e5035e367adec7ca8f4642`).
 The upstream BSD license is preserved in `LICENSE`.
 
-PortableFS changes one architectural boundary and carries the private strict
-coherence wire ABI used at that boundary:
+PortableFS carries one generic userspace ordering hook:
 
 - `fuse.ReplyWriteLifecycle` lets a raw filesystem select replies whose real
   `/dev/fuse` writes must be serialized with reverse-notification writes and
@@ -15,16 +14,13 @@ coherence wire ABI used at that boundary:
 - `fuse.Server` applies that lifecycle only to selected replies. Unselected
   replies retain upstream's parallel write path. `ProtocolServer` deliberately
   does not emulate physical kernel publication.
-- `FUSE_PFS_WRITE` stages every SHARED write (positioned or effective append)
-  and applies it once at COMMIT; `FUSE_PFS_PUBLISH` is the kernel's mandatory
-  post-VFS receipt. Explicit SHARED/LOCAL inode and open markers prevent an
-  omitted marker from silently selecting stock FUSE behavior.
-- `FUSE_NOTIFY_PFS_SIZE` carries exact size plus the visibility sequence, so a
-  peer installs grow and shrink results from the same ordered change identity.
-
 The hook exists because returning from a `RawFileSystem` method precedes the
-kernel response write, and even a successful response write wakes the requester
-before its VFS postprocessing is complete. Releasing a distributed gate at
-either earlier point permits a peer repair to race stale requester state. The
-generic publication receipt is the one release boundary; no timing delay or
-cache fallback can close that race.
+kernel response write. It lets the protocol-6 lease client order an admitted
+cache-bearing reply against a recall and observe failed device writes. It is
+not a kernel publication receipt: a successful write wakes the requester before
+VFS postprocessing necessarily finishes, so no correctness proof treats the
+callback as one.
+
+The retired private opcodes, capability bits, trailers, inode markers, and
+notification payloads are absent. Kernel communication is the stock FUSE 7.31+
+ABI; the fork does not implement a patched-kernel or compatibility profile.

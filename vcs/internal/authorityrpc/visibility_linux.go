@@ -40,7 +40,7 @@ func namespaceName(name []byte) error {
 	return xfsstore.ValidateComponent(string(name))
 }
 
-// strictCache returns the one protocol-5 coherence coordinator. A missing or
+// strictCache returns the FSKit synchronous-repair coordinator. A missing or
 // non-coherent session returns nil only on an already-invalid runtime path; no
 // attach can activate such a session.
 func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.VisibilityCoordinator {
@@ -176,7 +176,7 @@ func coherenceProfile(profile authoritypb.CoherenceProfile) (volumeserver.Cohere
 		return volumeserver.CoherenceStrict, nil
 	default:
 		// Zero is both protobuf's omitted value and the value emitted by the
-		// retired UNCACHED profile. Protocol 5 never normalizes it into the one
+		// retired UNCACHED profile. Protocol 6 never normalizes it into the strict
 		// coherent contract: an old frontend has not installed source gates or
 		// peer visibility and must be refused before activation.
 		return 0, syscall.EINVAL
@@ -663,14 +663,8 @@ func visibilityChanged(resp *authoritypb.Response) bool {
 	if resp == nil {
 		return false
 	}
-	if transaction := resp.GetWriteTransaction(); transaction != nil {
-		// A structured REJECTED result has outer errno zero so it can carry the
-		// private kernel rejection reason, but it is explicit proof that XFS did
-		// not change. Only COMMITTED opens a DATA/ATTR COMPLETE phase.
-		return transaction.GetFlags()&writeTransactionReplyCommitted != 0
-	}
-	if write := resp.GetOneShotWrite(); write != nil {
-		return write.GetFlags()&writeTransactionReplyCommitted != 0
+	if write := resp.GetWrite(); write != nil {
+		return write.GetPostAttr() != nil
 	}
 	if fallocate := resp.GetFallocate(); fallocate != nil {
 		return fallocate.GetFlags()&rangeReplyApplied != 0

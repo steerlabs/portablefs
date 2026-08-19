@@ -364,8 +364,8 @@ func TestSuccessfulWithdrawalReportsCleanKernelState(t *testing.T) {
 // bounded by refusing requests; a retained page is not, because a read of a
 // resident folio never becomes a request at all. So the ladder has to drop the
 // pages explicitly while the reverse-notification descriptor is still alive.
-// revoked admission plus the patched kernel's invalidate-lock serialization
-// makes the pass final before the connection is aborted.
+// Stock FUSE does not expose the final page-purge result, so this test proves
+// notification ordering only; the retained-reference residual stays explicit.
 func TestWithdrawalDropsRetainedPagesBeforeTheAbort(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}

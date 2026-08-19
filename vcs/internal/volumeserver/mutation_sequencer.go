@@ -67,7 +67,7 @@ func mutationDependenciesForTargets(targets []VisibilityTarget) MutationDependen
 
 // MutationDependenciesForTargets is the explicit dependency declaration for a
 // caller that already has an authority-derived visibility footprint. Normal
-// protocol-5 filesystem requests use DeclareSourceGate so binding identities
+// FSKit synchronous-repair requests use DeclareSourceGate so binding identities
 // can be version-checked across their XFS resolution.
 func MutationDependenciesForTargets(targets []VisibilityTarget) MutationDependencies {
 	return mutationDependenciesForTargets(targets)

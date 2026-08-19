@@ -97,9 +97,8 @@ var (
 	ErrVisibilityPoisoned = errors.New("volumeserver: visibility epoch is poisoned by an authority defect")
 )
 
-// CoherenceProfile is declared by a mount at attach time. Protocol 5 has one
-// coherent mount contract; zero is invalid so an omitted or retired profile
-// cannot accidentally enter the visibility runtime.
+// CoherenceProfile is the FSKit repair coordinator's exact cache contract.
+// Zero is invalid so an omitted profile cannot enter the repair runtime.
 type CoherenceProfile uint8
 
 const CoherenceStrict CoherenceProfile = 1
@@ -761,7 +760,12 @@ type visibilityLaneWaiter struct {
 type VisibilityConfig struct {
 	Prior      PriorEpochDisposition
 	Membership DurableVisibilityMembership
-	Fencer     SessionFencer
+	// ExternalMembership makes MountLifecycle the sole durable membership
+	// owner. Protocol-6 FSKit repair still uses this coordinator's ordered
+	// participant set, but activation/detach persistence is composed by the
+	// authority handler instead of being written twice here.
+	ExternalMembership bool
+	Fencer             SessionFencer
 	// MaxCachedNameCapacity is the largest resolved-index size this deployment
 	// will allocate per strict mount. An attach declaring more is refused rather
 	// than clamped, so what a mount was admitted on and what it is running
@@ -841,26 +845,26 @@ type VisibilityCoordinator struct {
 // The guard is intentionally opaque and pointer-only. Release is idempotent so
 // a deferred release remains safe on every handler exit.
 type TopologyReadGuard struct {
-	coordinator *VisibilityCoordinator
-	once        sync.Once
+	release func()
+	once    sync.Once
 }
 
 // AcquireTopologyRead begins one route-revision admission critical section.
 func (c *VisibilityCoordinator) AcquireTopologyRead() *TopologyReadGuard {
 	c.topology.RLock()
-	return &TopologyReadGuard{coordinator: c}
+	return &TopologyReadGuard{release: c.topology.RUnlock}
 }
 
 // Release ends one route-revision admission critical section.
 func (g *TopologyReadGuard) Release() {
-	if g == nil || g.coordinator == nil {
+	if g == nil || g.release == nil {
 		return
 	}
-	g.once.Do(func() { g.coordinator.topology.RUnlock() })
+	g.once.Do(g.release)
 }
 
 func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, error) {
-	if cfg.Membership == nil || cfg.Fencer == nil {
+	if cfg.Fencer == nil || cfg.Membership == nil && !cfg.ExternalMembership || cfg.Membership != nil && cfg.ExternalMembership {
 		return nil, errors.New("volumeserver: visibility needs durable membership and a session fencer")
 	}
 	if cfg.MaxCachedNameCapacity == 0 || cfg.MaxRepairBudget <= 0 || cfg.MaxClockSkew < 0 {
@@ -885,21 +889,50 @@ func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, err
 	}, nil
 }
 
-// Register is the direct-test/protocol-4 active helper. Protocol 5 must pass
-// its runtime CommitActivation callback to ActivateParticipant so visibility
-// membership and runtime executability share one transaction boundary.
+// Register is the direct-test active helper. Production protocol-6 activation
+// uses ActivateParticipantInMemory inside MountLifecycle's durable transaction,
+// so the durable mount record has exactly one owner.
 func (c *VisibilityCoordinator) Register(id SessionID, profile CoherenceProfile, terminal <-chan struct{}, commitment VisibilityCommitment) error {
 	_, err := c.ActivateParticipant(id, profile, terminal, commitment, nil, func() {})
 	return err
 }
 
-// ActivateParticipant makes one prepared runtime session executable at the
-// same boundary where a strict mount becomes a cache-coherence participant.
-// The resolved index is allocated before global exclusion. While registration
-// is write-locked, durable membership is persisted, the participant and exact
-// initial cursor are installed, and commit publishes the runtime ACTIVE state.
-// Therefore a mutation sees either neither fact or both facts, never an active
-// filesystem client omitted from its visibility audience.
+// ActivateParticipant preserves the coordinator-owned membership mode used by
+// direct coordinator callers. Protocol-6 server activation must instead call
+// ActivateParticipantInMemory from inside MountLifecycle.Activate.
+func (c *VisibilityCoordinator) ActivateParticipant(
+	id SessionID,
+	profile CoherenceProfile,
+	terminal <-chan struct{},
+	commitment VisibilityCommitment,
+	precommit func(VisibilityCursor) ([][16]byte, error),
+	commit func(),
+) (VisibilityCursor, error) {
+	return c.activateParticipant(id, profile, terminal, commitment, precommit, commit, c.cfg.ExternalMembership)
+}
+
+// ActivateParticipantInMemory makes one prepared FSKit participant executable
+// without writing durable membership. MountLifecycle already owns that write
+// and invokes this method within its activation publication callback; allowing
+// both coordinators to persist the same member would make rollback non-atomic.
+func (c *VisibilityCoordinator) ActivateParticipantInMemory(
+	id SessionID,
+	profile CoherenceProfile,
+	terminal <-chan struct{},
+	commitment VisibilityCommitment,
+	precommit func(VisibilityCursor) ([][16]byte, error),
+	commit func(),
+) (VisibilityCursor, error) {
+	return c.activateParticipant(id, profile, terminal, commitment, precommit, commit, true)
+}
+
+// activateParticipant makes one prepared runtime session executable at the
+// same boundary where an FSKit mount becomes a repair participant. The resolved
+// index is allocated before global exclusion. While registration is write-locked,
+// the participant and exact initial cursor are installed and commit publishes
+// runtime ACTIVE state. Direct coordinator callers may also ask this method to
+// persist membership; protocol 6 instead encloses it in MountLifecycle's sole
+// durable transaction.
 //
 // precommit and commit run without c.mu but under registration exclusion.
 // precommit receives the exact initial cursor and returns inode identities that
@@ -908,18 +941,19 @@ func (c *VisibilityCoordinator) Register(id SessionID, profile CoherenceProfile,
 // first operation an ACTIVE mount can issue is already covered by visibility.
 // A precommit failure must not have made externally visible state changes; that
 // path rolls back the participant and durable record before the caller releases
-// its runtime activation token. commit has no error result: protocol 5 passes
-// Authority.CommitActivation, whose prepared token makes the transition
+// its runtime activation token. commit has no error result: the authority
+// passes CommitActivation, whose prepared token makes the transition
 // infallible. This type split prevents an active runtime from ever being rolled
 // back out of membership. If durable rollback itself fails, the coordinator is
 // poisoned and the conservative membership record remains for restart proof.
-func (c *VisibilityCoordinator) ActivateParticipant(
+func (c *VisibilityCoordinator) activateParticipant(
 	id SessionID,
 	profile CoherenceProfile,
 	terminal <-chan struct{},
 	commitment VisibilityCommitment,
 	precommit func(VisibilityCursor) ([][16]byte, error),
 	commit func(),
+	externalMembership bool,
 ) (VisibilityCursor, error) {
 	if commit == nil {
 		return VisibilityCursor{}, errors.New("volumeserver: visibility activation needs a runtime commit")
@@ -971,12 +1005,14 @@ func (c *VisibilityCoordinator) ActivateParticipant(
 		return VisibilityCursor{}, ErrVisibilityLost
 	default:
 	}
-	if err := c.cfg.Membership.Activate(id); err != nil {
-		return VisibilityCursor{}, fmt.Errorf("record strict visibility participant: %w", err)
+	if !externalMembership {
+		if err := c.cfg.Membership.Activate(id); err != nil {
+			return VisibilityCursor{}, fmt.Errorf("record strict visibility participant: %w", err)
+		}
 	}
 
 	c.mu.Lock()
-	// COMPLETE(1) is the epoch's explicit empty-history baseline. Protocol 5
+	// COMPLETE(1) is the epoch's explicit empty-history baseline. Protocol 6
 	// never activates a participant with a nil cursor: doing so used to be
 	// indistinguishable from the retired non-participant profile. The first
 	// mutation therefore claims sequence 2, and every later attach starts from
@@ -1003,10 +1039,12 @@ func (c *VisibilityCoordinator) ActivateParticipant(
 			close(p.left)
 		}
 		c.mu.Unlock()
-		if err := c.cfg.Membership.Deactivate(id); err != nil {
-			rollbackErr := fmt.Errorf("roll back strict visibility participant: %w", err)
-			poisoned := c.poison(errors.Join(cause, rollbackErr))
-			return VisibilityCursor{}, errors.Join(cause, rollbackErr, poisoned)
+		if !externalMembership {
+			if err := c.cfg.Membership.Deactivate(id); err != nil {
+				rollbackErr := fmt.Errorf("roll back strict visibility participant: %w", err)
+				poisoned := c.poison(errors.Join(cause, rollbackErr))
+				return VisibilityCursor{}, errors.Join(cause, rollbackErr, poisoned)
+			}
 		}
 		return VisibilityCursor{}, cause
 	}
@@ -1132,6 +1170,17 @@ func (c *VisibilityCoordinator) InitialCursor(id SessionID) (VisibilityCursor, e
 // the obligation it discharges, and is not dated in the future. A frontend with
 // nothing to observe sends nothing and lets its session die fenced.
 func (c *VisibilityCoordinator) CleanDetach(id SessionID, proof MountAbsenceProof) error {
+	return c.cleanDetach(id, proof, c.cfg.ExternalMembership)
+}
+
+// CleanDetachInMemory removes an FSKit repair participant after the enclosing
+// MountLifecycle transaction has durably removed the mount. It deliberately
+// performs no second membership write.
+func (c *VisibilityCoordinator) CleanDetachInMemory(id SessionID, proof MountAbsenceProof) error {
+	return c.cleanDetach(id, proof, true)
+}
+
+func (c *VisibilityCoordinator) cleanDetach(id SessionID, proof MountAbsenceProof, externalMembership bool) error {
 	now := c.cfg.Now()
 	c.mu.Lock()
 	p := c.participants[id]
@@ -1156,14 +1205,16 @@ func (c *VisibilityCoordinator) CleanDetach(id SessionID, proof MountAbsenceProo
 	if pending != nil {
 		pending.finish(nil)
 	}
-	if err := c.cfg.Membership.Deactivate(id); err != nil {
-		// The record still names this mount, so a restarted epoch refuses to
-		// serve until an operator proves the fencing. The participant has already
-		// left this coordinator's barrier set, so the live authority session must
-		// become terminal synchronously: otherwise it could keep issuing ordinary
-		// filesystem requests while no longer participating in cache repair.
-		c.cfg.Fencer.FenceSession(id)
-		return fmt.Errorf("record strict visibility detach: %w", err)
+	if !externalMembership {
+		if err := c.cfg.Membership.Deactivate(id); err != nil {
+			// The record still names this mount, so a restarted epoch refuses to
+			// serve until an operator proves the fencing. The participant has already
+			// left this coordinator's barrier set, so the live authority session must
+			// become terminal synchronously: otherwise it could keep issuing ordinary
+			// filesystem requests while no longer participating in cache repair.
+			c.cfg.Fencer.FenceSession(id)
+			return fmt.Errorf("record strict visibility detach: %w", err)
+		}
 	}
 	return nil
 }
@@ -1283,10 +1334,9 @@ func (d DependencyDeclaration) Release() {
 }
 
 // Execute is the authority-derived/test entry point for a cache-visible
-// mutation without a protocol-5 source gate. dependencies must be the complete
-// stable-identity footprint declared before entry. Protocol-5 filesystem
-// mutations use ExecuteWithSourceGate so namespace identities can be
-// revalidated.
+// mutation without an FSKit source gate. dependencies must be the complete
+// stable-identity footprint declared before entry. FSKit mutations use
+// ExecuteWithSourceGate so namespace identities can be revalidated.
 //
 // ctx bounds only dependency-key queueing. Once a peer phase has been
 // delivered, a mount is holding publication admission closed and only its own
@@ -1296,6 +1346,19 @@ func (c *VisibilityCoordinator) Execute(ctx context.Context, source SessionID, m
 	prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool)) error {
 	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, nil, prepare,
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil)
+}
+
+// ExecuteFromExternalSource coordinates FSKit repair participants for a
+// mutation initiated by an authenticated frontend that does not participate in
+// this repair protocol. The terminal channel is the source's runtime-liveness
+// proof and is checked atomically at the pre-apply cut.
+func (c *VisibilityCoordinator) ExecuteFromExternalSource(ctx context.Context, source SessionID, terminal <-chan struct{}, mutation MutationID,
+	dependencies MutationDependencies, prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool)) error {
+	if source == (SessionID{}) || terminal == nil {
+		return &VisibilityBarrierError{Err: ErrVisibilityLost}
+	}
+	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, nil, prepare,
+		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil, terminal)
 }
 
 // ExecuteWithHeldParents is Execute for a namespace callback whose kernel holds
@@ -1308,7 +1371,7 @@ func (c *VisibilityCoordinator) ExecuteWithHeldParents(ctx context.Context, sour
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil)
 }
 
-// ExecuteWithSourceGate is the production protocol-5 entry point. gate is the
+// ExecuteWithSourceGate is the production FSKit repair entry point. gate is the
 // initiating frontend's pre-dispatch local publication cut. published runs
 // immediately after apply, while the dependency set is still held, and returns any
 // exact identities the ordinary response can publish but PREPARE could not know
@@ -1349,7 +1412,7 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateSequence(ctx context.Contex
 }
 
 // ExecuteWithSourceGateAndHeldParentsSequence is retained for the coordinator's
-// retired parent-exclusive model tests. No protocol-5 Attach can select that
+// retired parent-exclusive model tests. No protocol-6 Attach can select that
 // profile, and production Linux uses ExecuteWithSourceGateSequence above.
 func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParentsSequence(ctx context.Context, source SessionID, mutation MutationID,
 	declaration DependencyDeclaration, gate SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
@@ -1365,9 +1428,24 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateAndHeldParentsSequence(ctx 
 func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, mutation MutationID,
 	dependencies MutationDependencies, declaration DependencyDeclaration,
 	gate *SourcePublicationGate, held [][16]byte, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
-	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) error {
+	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error), externalSource ...<-chan struct{}) error {
 	if ctx == nil || prepare == nil || apply == nil {
 		return errors.New("volumeserver: visibility context, prepare, and mutation callbacks are required")
+	}
+	if len(externalSource) > 1 {
+		return errors.New("volumeserver: visibility mutation has multiple external source proofs")
+	}
+	var externalTerminal <-chan struct{}
+	if len(externalSource) == 1 {
+		externalTerminal = externalSource[0]
+		if source == (SessionID{}) || externalTerminal == nil {
+			return &VisibilityBarrierError{Err: ErrVisibilityLost}
+		}
+		select {
+		case <-externalTerminal:
+			return &VisibilityBarrierError{Err: ErrVisibilityLost}
+		default:
+		}
 	}
 	if gate != nil {
 		defer declaration.Release()
@@ -1385,7 +1463,8 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	defer c.registration.RUnlock()
 	c.mu.Lock()
 	strict := len(c.participants) != 0
-	sourceStrict := c.participants[source] != nil
+	sourceParticipant := c.participants[source]
+	sourceStrict := sourceParticipant != nil
 	compatibilityWriterBlocked := false
 	for id, participant := range c.participants {
 		if id != source && participant.compatibilityWriter {
@@ -1404,14 +1483,20 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if sourceStrict && gate == nil {
 		return &VisibilityBarrierError{Err: ErrSourcePublicationGate}
 	}
+	if gate != nil && !sourceStrict {
+		return &VisibilityBarrierError{Err: ErrVisibilityLost}
+	}
+	if externalTerminal != nil && sourceStrict {
+		return &VisibilityBarrierError{Err: ErrVisibilityProfile}
+	}
 	if compatibilityWriterBlocked {
 		// This check precedes dependency admission and every prepare/apply callback.
 		// EBUSY is therefore a retryable product-policy result, not an uncertain
 		// mutation and not a coherence failure. The Mac may continue serving.
 		return ErrCompatibilityWriterLease
 	}
-	if !strict {
-		// An ACTIVE protocol-5 filesystem session is installed in this map in
+	if !strict && !c.cfg.ExternalMembership && externalTerminal == nil {
+		// An ACTIVE FSKit repair session is installed in this map in
 		// the same activation transaction that makes its runtime executable.
 		// Reaching a visible mutation with no participant therefore means the
 		// one coherent mount contract was bypassed; applying without a barrier
@@ -1555,7 +1640,13 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if err := c.awaitAll(deliveries); err != nil {
 		return &VisibilityBarrierError{Err: err}
 	}
-	c.beginApply(ticket.Cursor.Sequence)
+	var requiredSource *visibilityParticipant
+	if gate != nil {
+		requiredSource = sourceParticipant
+	}
+	if !c.beginApply(ticket.Cursor.Sequence, requiredSource, externalTerminal) {
+		return &VisibilityBarrierError{Err: ErrVisibilityLost}
+	}
 
 	completeTargets, changed := apply(ticket.Cursor.Sequence)
 	if changed {
@@ -1986,7 +2077,7 @@ func (c *VisibilityCoordinator) recordSourceResolutions(source SessionID, resolu
 // target set, and poisons the epoch when either fails. Both are authority
 // defects that no participant can cause: the mutation already reached XFS and
 // the authority cannot describe what it did.
-func (c *VisibilityCoordinator) validateCompletion(sequence uint64, complete, prepared []VisibilityTarget) error {
+func (c *VisibilityCoordinator) validateCompletion(_ uint64, complete, prepared []VisibilityTarget) error {
 	if err := validateVisibilityTargets(complete); err != nil {
 		return c.poison(ErrVisibilityTargets)
 	}
@@ -1996,8 +2087,8 @@ func (c *VisibilityCoordinator) validateCompletion(sequence uint64, complete, pr
 			continue
 		}
 		exactCount++
-		if target.ExactPostState == nil || target.ExactPostState.ObjectVersion == 0 || target.ExactPostState.ObjectVersion > sequence {
-			return c.poison(fmt.Errorf("%w: completion inode target omitted exact attributes at or before its visibility sequence", ErrVisibilityTargets))
+		if target.ExactPostState == nil || target.ExactPostState.ObjectVersion == 0 {
+			return c.poison(fmt.Errorf("%w: completion inode target omitted exact committed attributes", ErrVisibilityTargets))
 		}
 	}
 	if exactCount > 4 {
@@ -2215,12 +2306,32 @@ func (c *VisibilityCoordinator) openBarrier(ctx context.Context, source SessionI
 // compliant frontend still has publication admission closed, and from this
 // point even an audience member must wait for XFS apply before reading one of
 // the mutation's coordinates.
-func (c *VisibilityCoordinator) beginApply(sequence uint64) {
+func (c *VisibilityCoordinator) beginApply(sequence uint64, source *visibilityParticipant, externalTerminal <-chan struct{}) bool {
 	c.mu.Lock()
-	if state := c.mutations[sequence]; state != nil {
-		state.applying = true
+	defer c.mu.Unlock()
+	if source != nil {
+		if c.participants[source.id] != source {
+			return false
+		}
+		select {
+		case <-source.terminal:
+			return false
+		default:
+		}
 	}
-	c.mu.Unlock()
+	if externalTerminal != nil {
+		select {
+		case <-externalTerminal:
+			return false
+		default:
+		}
+	}
+	state := c.mutations[sequence]
+	if state == nil {
+		return false
+	}
+	state.applying = true
+	return true
 }
 
 // closeBarrier releases the PREPARE/apply coordinate set. It is idempotent:

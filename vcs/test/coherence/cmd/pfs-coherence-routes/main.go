@@ -90,7 +90,7 @@ func run(arguments []string) error {
 	}
 }
 
-func clientConfig(o options, token []byte, revision [32]byte) (authorityrpc.ClientConfig, error) {
+func clientConfig(o options, token []byte, revision [32]byte, purpose authoritypb.SessionPurpose) (authorityrpc.ClientConfig, error) {
 	certificate, err := tls.LoadX509KeyPair(o.clientCert, o.clientKey)
 	if err != nil {
 		return authorityrpc.ClientConfig{}, fmt.Errorf("load client identity: %w", err)
@@ -103,7 +103,7 @@ func clientConfig(o options, token []byte, revision [32]byte) (authorityrpc.Clie
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return authorityrpc.ClientConfig{}, errors.New("authority CA PEM contains no certificate")
 	}
-	return authorityrpc.ClientConfig{
+	cfg := authorityrpc.ClientConfig{
 		Address:  o.address,
 		VolumeID: o.volumeID,
 		TLS: &tls.Config{
@@ -113,24 +113,20 @@ func clientConfig(o options, token []byte, revision [32]byte) (authorityrpc.Clie
 			MinVersion:   tls.VersionTLS13,
 		},
 		AccessToken:        token,
+		Purpose:            purpose,
 		ReplaySlots:        8,
 		MaxFrame:           uint32(o.maxFrame),
 		DialTimeout:        o.dialTimeout,
 		CancelDrainTimeout: 10 * time.Second,
 		MaxInFlight:        4,
-		// Protocol 5 has one coherent session model. This short-lived
-		// administrative client caches no filesystem facts, but still joins and
-		// acknowledges the visibility stream while active. Its absence observer
-		// is exact because this process never creates a kernel mount at all.
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 1,
-		RepairBudget:       10 * time.Second,
-		NamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT,
-		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+		RoutesRevision:     revision,
+	}
+	if purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
+		cfg.ObservePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return administrativeAbsenceProof(), nil
-		},
-		RoutesRevision: revision,
-	}, nil
+		}
+	}
+	return cfg, nil
 }
 
 func administrativeAbsenceProof() *authoritypb.MountAbsenceProof {
@@ -141,28 +137,18 @@ func administrativeAbsenceProof() *authoritypb.MountAbsenceProof {
 	}
 }
 
-// acknowledgeVisibility keeps this deliberately cacheless administrative
-// session inside the same coherent participation model as a real mount. With
-// no kernel facts to repair, each phase is complete as soon as it arrives.
-func acknowledgeVisibility(ctx context.Context, client *authorityrpc.Client, done chan<- error) {
-	cursor := client.InitialVisibilityCursor()
-	event, err := client.NextVisibility(ctx, cursor)
-	for err == nil {
-		event, err = client.NextVisibilityAfterAck(ctx, event.GetCursor(), false)
-	}
-	if ctx.Err() != nil {
-		err = nil
-	}
-	done <- err
-}
-
-func releaseAdministrativeClient(client *authorityrpc.Client, cancelVisibility context.CancelFunc, visibilityDone <-chan error) error {
-	cancelVisibility()
-	visibilityErr := <-visibilityDone
+func releaseMountClient(client *authorityrpc.Client) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	releaseErr := client.ReleaseBeforeMount(ctx)
 	cancel()
-	return errors.Join(releaseErr, visibilityErr, client.Close())
+	return errors.Join(releaseErr, client.Close())
+}
+
+func releaseAdminClient(client *authorityrpc.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	detachErr := client.DetachRouteAdmin(ctx)
+	cancel()
+	return errors.Join(detachErr, client.Close())
 }
 
 // dialOnce makes one attach attempt. The TLS configuration is cloned per
@@ -173,6 +159,13 @@ func dialOnce(ctx context.Context, cfg authorityrpc.ClientConfig) (*authorityrpc
 		cfg.TLS = cfg.TLS.Clone()
 	}
 	return authorityrpc.DialClient(ctx, cfg)
+}
+
+func dialAdminOnce(ctx context.Context, cfg authorityrpc.ClientConfig) (*authorityrpc.Client, error) {
+	if cfg.TLS != nil {
+		cfg.TLS = cfg.TLS.Clone()
+	}
+	return authorityrpc.DialRouteAdminClient(ctx, cfg)
 }
 
 // applyRoutes installs a declaration through the admin ApplyRoutes call.
@@ -198,37 +191,21 @@ func applyRoutes(o options, path string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	empty := localroutes.RuleSet{}
-	cfg, err := clientConfig(o, token, empty.Revision())
+	cfg, err := clientConfig(o, token, [32]byte{}, authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN)
 	if err != nil {
 		return err
 	}
-	expected := empty.Revision()
-	client, err := dialOnce(ctx, cfg)
+	client, err := dialAdminOnce(ctx, cfg)
 	if err != nil {
-		var mismatch *authorityrpc.RoutesMismatchError
-		if !errors.As(err, &mismatch) {
-			return fmt.Errorf("attach to apply routes: %w", err)
-		}
-		// The volume already runs a declaration. Adopt it as the CAS expectation
-		// and attach again on the same capability; a routing refusal does not
-		// spend it.
-		expected = mismatch.Active
-		cfg.RoutesRevision = mismatch.Active
-		client, err = dialOnce(ctx, cfg)
-		if err != nil {
-			return fmt.Errorf("attach with the volume's active routing to apply routes: %w", err)
-		}
+		return fmt.Errorf("attach route administrator: %w", err)
 	}
-	visibilityCtx, stopVisibility := context.WithCancel(ctx)
-	visibilityDone := make(chan error, 1)
-	go acknowledgeVisibility(visibilityCtx, client, visibilityDone)
+	expected := client.RoutesRevision()
 
 	reply, err := client.ApplyRoutes(ctx, rules.Canonical(), expected)
 	if err != nil {
-		return errors.Join(fmt.Errorf("apply routes: %w", err), releaseAdministrativeClient(client, stopVisibility, visibilityDone))
+		return errors.Join(fmt.Errorf("apply routes: %w", err), releaseAdminClient(client))
 	}
-	if err := releaseAdministrativeClient(client, stopVisibility, visibilityDone); err != nil {
+	if err := releaseAdminClient(client); err != nil {
 		return fmt.Errorf("release route-administration session: %w", err)
 	}
 	fmt.Printf("applied_revision=%x\n", reply.GetRevision())
@@ -268,7 +245,7 @@ func checkRevisionContract(o options) error {
 		return fmt.Errorf("compile the stale rule set: %w", err)
 	}
 	staleRevision := stale.Revision()
-	cfg, err := clientConfig(o, token, staleRevision)
+	cfg, err := clientConfig(o, token, staleRevision, authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT)
 	if err != nil {
 		return err
 	}
@@ -276,10 +253,7 @@ func checkRevisionContract(o options) error {
 	attempts := 1
 	client, err := dialOnce(ctx, cfg)
 	if err == nil {
-		visibilityCtx, stopVisibility := context.WithCancel(ctx)
-		visibilityDone := make(chan error, 1)
-		go acknowledgeVisibility(visibilityCtx, client, visibilityDone)
-		_ = releaseAdministrativeClient(client, stopVisibility, visibilityDone)
+		_ = releaseMountClient(client)
 		fmt.Printf("stale_attach_refused=false\n")
 		fmt.Printf("attempts=%d\n", attempts)
 		return nil
@@ -324,10 +298,7 @@ func checkRevisionContract(o options) error {
 		fmt.Printf("adopt_error=%s\n", err)
 		return nil
 	}
-	visibilityCtx, stopVisibility := context.WithCancel(ctx)
-	visibilityDone := make(chan error, 1)
-	go acknowledgeVisibility(visibilityCtx, client, visibilityDone)
-	releaseErr := releaseAdministrativeClient(client, stopVisibility, visibilityDone)
+	releaseErr := releaseMountClient(client)
 	fmt.Printf("attempts=%d\n", attempts)
 	fmt.Printf("adopt_succeeded=%t\n", releaseErr == nil)
 	if releaseErr != nil {

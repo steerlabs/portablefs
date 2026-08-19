@@ -1473,7 +1473,8 @@ public actor PfsLocalClient {
         // ordered-admission contention bit used for bounded FIFO compensation.
         // Protocol minor 14: namespace targets can carry the exact authority
         // post-binding used to inode-attest a new rename/hard-link coordinate.
-        // Protocol minor 15: the nested authority session is protocol 5 and was
+        // Protocol minor 15: the nested authority session carries the exact
+        // authority major selected by the resolved contract and was
         // activated only after its mandatory DATA and CONTROL bindings existed;
         // source publication is daemon-gated and every PublicationAck carries
         // an explicit callback semantic-commit verdict.

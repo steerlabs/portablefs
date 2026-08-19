@@ -1158,6 +1158,50 @@ func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.
 	}
 }
 
+func TestVisibilitySourceGateFenceDuringPeerPrepareRefusesApply(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	source, peer := SessionID{1}, SessionID{2}
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, peer, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.resolve(t, peer, "source-fence")
+	gate := testSourcePublicationGate("source-fence")
+	applied := 0
+	result := make(chan error, 1)
+	go func() {
+		result <- executeTestExactWithSourceGate(
+			h.coordinator, context.Background(), source, MutationID{Sequence: 1},
+			h.coordinator.DeclareSourceGate(gate), gate,
+			func() (SourcePublicationGate, error) { return gate, nil },
+			testVisibilityPrepare("source-fence"),
+			func() ([]VisibilityTarget, bool) {
+				applied++
+				return testVisibilityTargets("source-fence"), true
+			},
+			func() ([]VisibilityResolution, error) { return nil, nil },
+		)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepare.Cursor.Phase != VisibilityPrepare {
+		t.Fatalf("peer event = %+v, want PREPARE", prepare)
+	}
+	h.fencer.die(source)
+	if err := h.coordinator.Ack(peer, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, ErrVisibilityLost) {
+		t.Fatalf("source-gated mutation after source fence = %v, want %v", err, ErrVisibilityLost)
+	}
+	if applied != 0 {
+		t.Fatalf("apply calls after source fence = %d, want 0", applied)
+	}
+}
+
 // A successful create can return an existing item without changing XFS. That
 // response still publishes a stable identity into the initiating frontend. The
 // authority must index it while the create owns the resolved inode dependency:
@@ -1225,7 +1269,7 @@ func TestVisibilityPublishedIdentityIsIndexedBeforeNextMutationTurn(t *testing.T
 }
 
 // A zero-TTL reply is still a publication while it is in flight to a kernel.
-// Every protocol-5 mount is therefore a real participant: a later peer
+// Every FSKit synchronous-repair mount is therefore a real participant: a later peer
 // mutation reaches the source's local gate and cannot apply until the earlier
 // reply is physically published. This is the deterministic core witness for
 // the race the retired UNCACHED profile allowed.

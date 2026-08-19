@@ -7,8 +7,8 @@ stack. Most of that ledger is gone with the code it described. What remains
 below are the items whose subject matter survives the reset — an unexplained
 observation, four macOS platform gaps, and one design question that must be
 re-asked rather than carried forward as an answer. The platform gaps now form
-part of the reason macOS 26 is a named best-effort tier rather than the exact
-Linux tier. New live experiments must identify which tier they exercise.
+part of the reason protocol 6 refuses production macOS mounting. New live
+experiments are qualification only and must identify the adapter they exercise.
 
 ## Open
 
@@ -43,9 +43,9 @@ kernels, not for substituting an undocumented contract.
   exists blinds that machine to the name until a *local* mutation purges the
   directory's cache. Cross-machine "stat-poll until it appears" cannot work.
   Enumeration happened to consult the filesystem in those experiments, but
-  using it as a discovery workaround would not satisfy protocol-5 namespace
-  visibility. The SDK-26 product uses authenticated synchronous repair, but the
-  absence prevents an exact cache claim;
+  using it as a discovery workaround would not discharge a protocol-6 N or E
+  lease. The retained SDK-26 adapter can characterize the behavior, but the
+  absence prevents a production cache claim;
   see
   [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 - **No advisory-lock operations.** FSKit exposes no lock callbacks, so
@@ -60,8 +60,10 @@ kernels, not for substituting an undocumented contract.
 - **No append intent.** `FSVolume.OpenModes` carries only read and write access
   bits and writes arrive with kernel-resolved offsets, so cross-machine
   `O_APPEND` interleaving cannot be expressed on FSKit; FUSE mounts do get true
-  authority-assigned append offsets. This is a stated best-effort-tier gap, not
-  a concurrent-append usage recommendation. The boundary is stated in
+  authority-assigned append placement. This is a production-admission blocker,
+  not a concurrent-append usage recommendation. Stock FUSE also lacks the exact
+  intent/result surface. Protocol 6 can refuse `O_APPEND`, but `RWF_APPEND` is
+  not forwarded and therefore blocks a production-ready writable profile. The boundary is stated in
   [fskit-mount.md](./fskit-mount.md).
 - **Replacing the hosting app tears down live mounts.** Replacing or
   re-registering an app that hosts an FSKit extension makes `pkd` `SIGTERM` the
@@ -70,8 +72,8 @@ kernels, not for substituting an undocumented contract.
   is not yet designed: the release installer replaces PortableFS.app, so the
   shipping install path and live mount lifecycle must remain coordinated.
 
-These facts define the limits of the named macOS 26 best-effort tier and the
-requirements for a future exact tier.
+These facts define the refusal boundary and the requirements for any future
+production FSKit profile.
 
 ### Path-scoped repair versus inode-shared objects — re-ask, do not assume
 

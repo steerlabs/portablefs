@@ -1,19 +1,23 @@
-# macOS FSKit coherence support boundary
+# macOS 26 FSKit synchronous-repair contract
 
-Status: **macOS 26 is a supported best-effort FSKit tier; Linux remains the
-exact shared-filesystem tier**
+Status: **admitted protocol-6 `FSKIT_SYNC_REPAIR` profile with best-effort host
+cache repair**
+
+This document defines the deliberately weaker macOS 26 platform contract and
+preserves its dated protocol-5 measurements as evidence. Current admission
+rules are in [fskit-mount.md](./fskit-mount.md); historical measurements below
+remain labeled and are not represented as protocol-6 qualification.
 
 PortableFS now names these guarantees instead of pretending both operating
 systems expose the same cache controls:
 
-- Linux 6.12.100 with the strict PortableFS FUSE profile provides the exact
-  protocol-5 publication and invalidation contract.
+- Linux uses the exact protocol-6 N/A/D/E lease profile on stock FUSE 7.31+.
 - macOS 26 uses `macos26-synchronous-vfs-repair-v2`. It provides ordinary
-  mounted filesystem behavior, authenticated protocol-5 access, synchronous
+  mounted filesystem behavior, authenticated protocol-6 access, synchronous
   repair attempts, and fail-closed error handling. It does not claim an exact
   multi-writer cache cut that FSKit 26 cannot express.
-- The macOS 27 handler remains a separate test target until its complete
-  callback and invalidation behavior is qualified on the deployed SDK and OS.
+- The macOS 27 handler uses the same FSKit profile with stronger native data
+  revocation, but retains the same namespace/attribute caveats.
 
 This is not a hidden compatibility mode. The CLI, daemon, and extension select
 one named policy, report it through diagnostics, and refuse any unknown policy.
@@ -22,9 +26,9 @@ There is no TTL downgrade, local-filesystem substitution, or protocol fallback.
 ## What works on macOS 26
 
 The shipping FSKit composition is `PortableFSFileSystem.macOS26BestEffort()`.
-It uses the same protocol-5 authority, replay identities, source-publication
-operations, transaction staging, TLS identity checks, and terminal fencing as
-the Linux client.
+It uses the protocol-6 FSKit profile, replay identities, source-publication
+operations, fragmented-write staging, TLS identity checks, and terminal
+fencing. It does not enter the Linux lease profile.
 
 The following behavior has been exercised against the hosted protocol-5 stack,
 including runs with a simultaneously attached Linux reader:

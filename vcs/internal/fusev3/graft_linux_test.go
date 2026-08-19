@@ -112,7 +112,7 @@ func TestEveryGraftAttrIsExplicitlyLocal(t *testing.T) {
 	for _, mode := range []uint32{syscall.S_IFREG | 0o600, syscall.S_IFDIR | 0o700, syscall.S_IFLNK | 0o777} {
 		var out fuse.Attr
 		fillGraftAttr(&syscall.Stat_t{Mode: mode, Ino: 7}, &out, 1, 2)
-		if out.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		if out.Flags != 0 {
 			t.Fatalf("mode %#o attr flags = %#x, want exactly PFS_LOCAL", mode, out.Flags)
 		}
 	}
@@ -164,7 +164,7 @@ func (f *graftFixture) createFile(t *testing.T, parent uint64, name string, data
 	if status := f.raw.Create(nil, input, name, out); !status.Ok() {
 		t.Fatalf("CREATE %q = %v", name, status)
 	}
-	if out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL || out.OpenFlags != fuse.FOPEN_KEEP_CACHE|fuse.FOPEN_PFS_LOCAL {
+	if out.Attr.Flags != 0 || out.OpenFlags != fuse.FOPEN_KEEP_CACHE {
 		t.Fatalf("local CREATE classification attr=%#x open=%#x", out.Attr.Flags, out.OpenFlags)
 	}
 	if len(data) != 0 {
@@ -324,8 +324,7 @@ func TestStrictLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) 
 	} else if !status.Ok() {
 		t.Fatalf("first name for local TMPFILE = %v", status)
 	}
-	if linked.NodeId != linkable.NodeId || linked.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL ||
-		f.raw.ReplyWriteOrdered(linkUnique) || f.raw.ReplyPublishMarked(linkUnique, root.NodeId, 13) {
+	if linked.NodeId != linkable.NodeId || linked.Attr.Flags != 0 || f.raw.ReplyWriteOrdered(linkUnique) {
 		t.Fatalf("linked local TMPFILE output/lifecycle = %+v", linked)
 	}
 	if got, status := f.readNode(t, linked.NodeId, 8); !status.Ok() || string(got) != "linkable" {
@@ -342,11 +341,11 @@ func TestStrictLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) 
 	}, "/", tmp); !status.Ok() {
 		t.Fatalf("local TMPFILE = %v", status)
 	}
-	if tmp.NodeId == 0 || tmp.Fh == 0 || tmp.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL || tmp.Attr.Nlink != 0 ||
-		tmp.OpenFlags != fuse.FOPEN_KEEP_CACHE|fuse.FOPEN_PFS_LOCAL {
+	if tmp.NodeId == 0 || tmp.Fh == 0 || tmp.Attr.Flags != 0 || tmp.Attr.Nlink != 0 ||
+		tmp.OpenFlags != fuse.FOPEN_KEEP_CACHE {
 		t.Fatalf("local TMPFILE output = %+v", tmp)
 	}
-	if f.raw.ReplyWriteOrdered(unique) || f.raw.ReplyPublishMarked(unique, root.NodeId, 51) {
+	if f.raw.ReplyWriteOrdered(unique) {
 		t.Fatal("LOCAL TMPFILE entered the SHARED post-VFS publication path")
 	}
 	if status := f.raw.Link(nil, &fuse.LinkIn{
@@ -386,7 +385,7 @@ func TestARouteRootWithNoBackingIsAbsentRatherThanSynthesized(t *testing.T) {
 	var out *fuse.EntryOut
 	calls := f.authorityCalls(func() { out, status = f.lookup(t, fuse.FUSE_ROOT_ID, "node_modules") })
 	if !status.Ok() || out == nil || out.NodeId != 0 || out.Generation != 0 || out.EntryValid != 0 || out.AttrValid != 0 ||
-		out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		out.Attr.Flags != 0 {
 		t.Fatalf("LOOKUP of an uncreated route root = (%+v, %v), want base-only LOCAL negative", out, status)
 	}
 	if calls != 0 {
@@ -405,10 +404,10 @@ func TestRouteClaimedNegativeLookupIsLocalAcrossA_SHAREDParent(t *testing.T) {
 	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: routeUnique, NodeId: fuse.FUSE_ROOT_ID}, "node_modules", routeOut); !status.Ok() {
 		t.Fatalf("missing route root LOOKUP = %v, want structured success", status)
 	}
-	if routeOut.NodeId != 0 || routeOut.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+	if routeOut.NodeId != 0 || routeOut.Attr.Flags != 0 {
 		t.Fatalf("missing route root = %+v, want LOCAL zero-nodeid shape", routeOut)
 	}
-	if f.raw.ReplyWriteOrdered(routeUnique) || f.raw.ReplyPublishMarked(routeUnique, fuse.FUSE_ROOT_ID, testPublicationOpcode) {
+	if f.raw.ReplyWriteOrdered(routeUnique) {
 		t.Fatal("route-owned negative below SHARED parent entered SHARED publication lifecycle")
 	}
 
@@ -418,8 +417,7 @@ func TestRouteClaimedNegativeLookupIsLocalAcrossA_SHAREDParent(t *testing.T) {
 	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: localUnique, NodeId: root.NodeId}, "missing", localOut); !status.Ok() {
 		t.Fatalf("missing local child LOOKUP = %v, want structured success", status)
 	}
-	if localOut.NodeId != 0 || localOut.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL ||
-		f.raw.ReplyWriteOrdered(localUnique) || f.raw.ReplyPublishMarked(localUnique, root.NodeId, testPublicationOpcode) {
+	if localOut.NodeId != 0 || localOut.Attr.Flags != 0 || f.raw.ReplyWriteOrdered(localUnique) {
 		t.Fatal("negative LOOKUP below LOCAL parent entered shared publication lifecycle")
 	}
 }
@@ -432,7 +430,7 @@ func TestDirectoryOpenClassificationMatchesInodeOwnership(t *testing.T) {
 	}); !status.Ok() {
 		t.Fatalf("authority OPENDIR = %v", status)
 	}
-	if shared.OpenFlags != fuse.FOPEN_PFS_SHARED {
+	if shared.OpenFlags != 0 {
 		t.Fatalf("authority OPENDIR flags = %#x, want PFS_SHARED", shared.OpenFlags)
 	}
 	f.raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: nextTestRequestUnique(), NodeId: fuse.FUSE_ROOT_ID}, Fh: shared.Fh})
@@ -444,7 +442,7 @@ func TestDirectoryOpenClassificationMatchesInodeOwnership(t *testing.T) {
 	}); !status.Ok() {
 		t.Fatalf("graft OPENDIR = %v", status)
 	}
-	if local.OpenFlags != fuse.FOPEN_PFS_LOCAL {
+	if local.OpenFlags != 0 {
 		t.Fatalf("graft OPENDIR flags = %#x, want PFS_LOCAL", local.OpenFlags)
 	}
 	f.raw.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{NodeId: root.NodeId}, Fh: local.Fh})
@@ -484,7 +482,7 @@ func TestARouteRootIsRemovedAndRecreatedLikeAnyDirectory(t *testing.T) {
 		t.Fatalf("RMDIR of the emptied route root = %v", status)
 	}
 	if out, status := f.lookup(t, fuse.FUSE_ROOT_ID, "node_modules"); !status.Ok() ||
-		out.NodeId != 0 || out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		out.NodeId != 0 || out.Attr.Flags != 0 {
 		t.Fatalf("LOOKUP after removing the route root = (%+v, %v), want LOCAL negative", out, status)
 	}
 	if calls := f.authorityCalls(func() { f.mkdir(t, fuse.FUSE_ROOT_ID, "node_modules") }); calls != 0 {
@@ -616,7 +614,7 @@ func TestRenamingAnAncestorOfAnUncreatedRouteRootIsAnOrdinaryRename(t *testing.T
 	// Resolve the owned name so the topology knows about it, without creating
 	// any machine-local content behind it.
 	if out, status := f.lookup(t, packages.NodeId, "node_modules"); !status.Ok() ||
-		out.NodeId != 0 || out.Attr.Flags != fuse.FUSE_ATTR_PFS_LOCAL {
+		out.NodeId != 0 || out.Attr.Flags != 0 {
 		t.Fatalf("LOOKUP of an uncreated route root = (%+v, %v), want LOCAL negative", out, status)
 	}
 	status := testRawCall(t, f.raw, func(unique uint64) fuse.Status {

@@ -175,7 +175,7 @@ func (s *Server) validate() (TransportBounds, error) {
 		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
 	}
 	if s.MaxConnections < 2 {
-		return TransportBounds{}, errors.New("authorityrpc: protocol 5 requires capacity for one DATA/CONTROL connection pair")
+		return TransportBounds{}, errors.New("authorityrpc: protocol 6 requires capacity for one DATA/CONTROL connection pair")
 	}
 	bounds := s.Handler.Bounds()
 	if bounds.MaxFrame != s.MaxFrame || bounds.MaxInFlight != s.MaxInFlight {

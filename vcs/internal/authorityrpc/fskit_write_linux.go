@@ -24,48 +24,48 @@ import (
 )
 
 const (
-	writeTransactionReplyBegun     uint32 = 1 << 0
-	writeTransactionReplyStaged    uint32 = 1 << 1
-	writeTransactionReplyCommitted uint32 = 1 << 2
-	writeTransactionReplyAborted   uint32 = 1 << 3
-	writeTransactionReplyRejected  uint32 = 1 << 4
-	writeTransactionReplyPostApply uint32 = 1 << 5
-	writeTransactionReplyRLimit    uint32 = 1 << 6
+	fskitWriteReplyBegun     uint32 = 1 << 0
+	fskitWriteReplyStaged    uint32 = 1 << 1
+	fskitWriteReplyCommitted uint32 = 1 << 2
+	fskitWriteReplyAborted   uint32 = 1 << 3
+	fskitWriteReplyRejected  uint32 = 1 << 4
+	fskitWriteReplyPostApply uint32 = 1 << 5
+	fskitWriteReplyRLimit    uint32 = 1 << 6
 
 	// These are the closed Linux FUSE write flag set. WRITE_CACHE is
 	// intentionally absent: shared files never enter the stock writeback path.
-	writeTransactionLockOwner   uint32 = 1 << 1
-	writeTransactionKillSUIDGID uint32 = 1 << 2
+	fskitWriteLockOwner   uint32 = 1 << 1
+	fskitWriteKillSUIDGID uint32 = 1 << 2
 )
 
-// WriteTransactionStaging creates sealed-size anonymous-memory files. Payload
+// FskitWriteStaging creates sealed-size anonymous-memory files. Payload
 // bytes therefore never enter the authority namespace, heap, or served XFS,
 // and a process crash lets the kernel reclaim every incomplete transaction
 // without a recovery scan.
-type WriteTransactionStaging struct {
+type FskitWriteStaging struct {
 	mu             sync.RWMutex
 	closed         bool
-	newFileForTest func(uint64) (writeTransactionStage, error)
+	newFileForTest func(uint64) (fskitWriteStage, error)
 }
 
-type writeTransactionStage interface {
+type fskitWriteStage interface {
 	io.ReaderAt
 	io.WriterAt
 	io.Closer
 }
 
-func OpenWriteTransactionStaging(path string) (*WriteTransactionStaging, error) {
+func OpenFskitWriteStaging(path string) (*FskitWriteStaging, error) {
 	// Keep validating the existing authority configuration surface, but do not
 	// retain or create anything in this directory. Transaction contents live
 	// exclusively in memfd-backed anonymous memory.
 	dir, err := privatepath.OpenExistingDir(path)
 	if err != nil {
-		return nil, fmt.Errorf("open write-transaction staging directory: %w", err)
+		return nil, fmt.Errorf("open FSKit-write staging directory: %w", err)
 	}
 	if err := dir.Close(); err != nil {
-		return nil, fmt.Errorf("close write-transaction staging directory: %w", err)
+		return nil, fmt.Errorf("close FSKit-write staging directory: %w", err)
 	}
-	staging := &WriteTransactionStaging{}
+	staging := &FskitWriteStaging{}
 	probe, err := staging.newFile(1)
 	if err != nil {
 		_ = staging.Close()
@@ -78,7 +78,7 @@ func OpenWriteTransactionStaging(path string) (*WriteTransactionStaging, error) 
 	return staging, nil
 }
 
-func (s *WriteTransactionStaging) newFile(size uint64) (writeTransactionStage, error) {
+func (s *FskitWriteStaging) newFile(size uint64) (fskitWriteStage, error) {
 	if s == nil || size == 0 || size > math.MaxInt64 {
 		return nil, syscall.EINVAL
 	}
@@ -92,11 +92,11 @@ func (s *WriteTransactionStaging) newFile(size uint64) (writeTransactionStage, e
 		return hook(size)
 	}
 	defer s.mu.RUnlock()
-	fd, err := unix.MemfdCreate("portablefs-write-transaction", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
+	fd, err := unix.MemfdCreate("portablefs-fskit-write", unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING)
 	if err != nil {
 		return nil, err
 	}
-	file := os.NewFile(uintptr(fd), "portablefs-write-transaction")
+	file := os.NewFile(uintptr(fd), "portablefs-fskit-write")
 	if file == nil {
 		_ = unix.Close(fd)
 		return nil, syscall.EIO
@@ -117,7 +117,7 @@ func (s *WriteTransactionStaging) newFile(size uint64) (writeTransactionStage, e
 	return file, nil
 }
 
-func (s *WriteTransactionStaging) Close() error {
+func (s *FskitWriteStaging) Close() error {
 	if s == nil {
 		return nil
 	}
@@ -130,16 +130,16 @@ func (s *WriteTransactionStaging) Close() error {
 	return nil
 }
 
-type writeTransactionState uint8
+type fskitWriteState uint8
 
 const (
-	writeTransactionInitializing writeTransactionState = iota + 1
-	writeTransactionStaging
-	writeTransactionCommitting
-	writeTransactionRejected
+	fskitWriteInitializing fskitWriteState = iota + 1
+	fskitWriteStaging
+	fskitWriteCommitting
+	fskitWriteRejected
 )
 
-type writeTransactionMetadata struct {
+type fskitWriteMetadata struct {
 	handle        xfsstore.Capability
 	requestedSize uint64
 	position      uint64
@@ -153,7 +153,7 @@ type writeTransactionMetadata struct {
 	sync          bool
 }
 
-type writeTransaction struct {
+type fskitWrite struct {
 	// refs protects stage and target lifetime after the transaction is found in
 	// the session ledger. The ledger mutex may add a reference only while the
 	// exact pointer is still registered; removal happens under that same mutex,
@@ -163,12 +163,12 @@ type writeTransaction struct {
 	mu                sync.Mutex
 	refs              sync.WaitGroup
 	id                uint64
-	metadata          writeTransactionMetadata
+	metadata          fskitWriteMetadata
 	beginFingerprint  volumeserver.RequestFingerprint
-	stage             writeTransactionStage
+	stage             fskitWriteStage
 	target            xfsstore.WriteTarget
 	coordinate        xfsstore.ObjectCoordinate
-	state             writeTransactionState
+	state             fskitWriteState
 	staged            uint64
 	lastDataOffset    uint64
 	lastDataSize      uint32
@@ -178,48 +178,48 @@ type writeTransaction struct {
 	initErr           error
 	capacityReserved  bool
 	commitFingerprint volumeserver.RequestFingerprint
-	commitOwner       *writeTransactionCommitOwner
+	commitOwner       *fskitWriteCommitOwner
 }
 
-type writeTransactionCommitOwner struct{ marker byte }
+type fskitWriteCommitOwner struct{ marker byte }
 
-type writeTransactionTerminalKind uint8
+type fskitWriteTerminalKind uint8
 
 const (
-	writeTransactionTerminalAborted writeTransactionTerminalKind = iota + 1
-	writeTransactionTerminalCommitted
-	writeTransactionTerminalRejected
+	fskitWriteTerminalAborted fskitWriteTerminalKind = iota + 1
+	fskitWriteTerminalCommitted
+	fskitWriteTerminalRejected
 )
 
 // Only the newest terminal transaction is retained. BEGIN is serialized by
 // the frontend and IDs are monotonic, so a legitimate lost response cannot be
 // older than the newest dispatched BEGIN. Retaining one exact tombstone keeps
 // cleanup bounded while altered or late reuse still fails closed.
-type writeTransactionTerminal struct {
+type fskitWriteTerminal struct {
 	id                uint64
 	beginFingerprint  volumeserver.RequestFingerprint
 	commitFingerprint volumeserver.RequestFingerprint
-	metadata          writeTransactionMetadata
+	metadata          fskitWriteMetadata
 	staged            uint64
-	kind              writeTransactionTerminalKind
+	kind              fskitWriteTerminalKind
 	err               error
 }
 
-type writeTransactionCapacityWaiter struct {
+type fskitWriteCapacityWaiter struct {
 	resources *sessionResources
 	ready     chan struct{}
-	previous  *writeTransactionCapacityWaiter
-	next      *writeTransactionCapacityWaiter
+	previous  *fskitWriteCapacityWaiter
+	next      *fskitWriteCapacityWaiter
 	queued    bool
 }
 
-type writeTransactionCleanup struct {
+type fskitWriteCleanup struct {
 	handler     *VolumeHandler
 	resources   *sessionResources
-	transaction *writeTransaction
+	transaction *fskitWrite
 }
 
-func (c writeTransactionCleanup) finish() {
+func (c fskitWriteCleanup) finish() {
 	if c.transaction == nil {
 		return
 	}
@@ -243,20 +243,20 @@ func (c writeTransactionCleanup) finish() {
 		_ = target.Close()
 	}
 	if c.handler != nil && c.resources != nil && c.transaction.capacityReserved {
-		c.handler.releaseWriteTransactionCapacity(c.resources, c.transaction.metadata.requestedSize)
+		c.handler.releaseFskitWriteCapacity(c.resources, c.transaction.metadata.requestedSize)
 	}
 }
 
-func writeTransactionMetadataFromRequest(request *authoritypb.WriteTransactionRequest) (writeTransactionMetadata, error) {
+func fskitWriteMetadataFromRequest(request *authoritypb.FskitWriteRequest) (fskitWriteMetadata, error) {
 	if request == nil || request.GetTransactionId() == 0 {
-		return writeTransactionMetadata{}, syscall.EINVAL
+		return fskitWriteMetadata{}, syscall.EINVAL
 	}
 	return writeMetadataFromGeometry(request.GetHandle(), request.GetRequestedSize(), request.GetPosition(),
 		request.GetRlimitFsize(), request.GetFileMaxSize(), request.GetLockOwner(), request.GetWriteFlags(), request.GetFlags())
 }
 
-func writeMetadataFromGeometry(handle []byte, requestedSize, position, rlimitSize, fileMaxSize, lockOwner uint64, writeFlags, flags uint32) (writeTransactionMetadata, error) {
-	var metadata writeTransactionMetadata
+func writeMetadataFromGeometry(handle []byte, requestedSize, position, rlimitSize, fileMaxSize, lockOwner uint64, writeFlags, flags uint32) (fskitWriteMetadata, error) {
+	var metadata fskitWriteMetadata
 	if len(handle) != len(metadata.handle) || requestedSize == 0 || requestedSize > math.MaxInt64 ||
 		fileMaxSize == 0 || fileMaxSize > math.MaxInt64 {
 		return metadata, syscall.EINVAL
@@ -273,73 +273,73 @@ func writeMetadataFromGeometry(handle []byte, requestedSize, position, rlimitSiz
 	metadata.writeFlags = writeFlags
 	metadata.flags = flags
 
-	allowedWriteFlags := uint32(writeTransactionLockOwner | writeTransactionKillSUIDGID)
-	if metadata.writeFlags&^allowedWriteFlags != 0 || metadata.writeFlags&writeTransactionLockOwner == 0 && metadata.lockOwner != 0 {
-		return writeTransactionMetadata{}, syscall.EINVAL
+	allowedWriteFlags := uint32(fskitWriteLockOwner | fskitWriteKillSUIDGID)
+	if metadata.writeFlags&^allowedWriteFlags != 0 || metadata.writeFlags&fskitWriteLockOwner == 0 && metadata.lockOwner != 0 {
+		return fskitWriteMetadata{}, syscall.EINVAL
 	}
 	allowedFileFlags := uint32(syscall.O_APPEND | syscall.O_DSYNC | syscall.O_SYNC)
 	if metadata.flags&^allowedFileFlags != 0 {
-		return writeTransactionMetadata{}, syscall.EINVAL
+		return fskitWriteMetadata{}, syscall.EINVAL
 	}
 	fullSyncBit := uint32(syscall.O_SYNC &^ syscall.O_DSYNC)
 	if metadata.flags&fullSyncBit != 0 && metadata.flags&uint32(syscall.O_DSYNC) == 0 {
-		return writeTransactionMetadata{}, syscall.EINVAL
+		return fskitWriteMetadata{}, syscall.EINVAL
 	}
 	metadata.sync = metadata.flags&fullSyncBit != 0
 	metadata.dataSync = !metadata.sync && metadata.flags&uint32(syscall.O_DSYNC) != 0
 	if metadata.flags&uint32(syscall.O_APPEND) != 0 {
 		if metadata.position != 0 {
-			return writeTransactionMetadata{}, syscall.EINVAL
+			return fskitWriteMetadata{}, syscall.EINVAL
 		}
 		metadata.mode = xfsstore.WriteAppend
 	} else {
 		if metadata.position > math.MaxInt64 {
-			return writeTransactionMetadata{}, syscall.EINVAL
+			return fskitWriteMetadata{}, syscall.EINVAL
 		}
 		metadata.mode = xfsstore.WritePositioned
 	}
 	return metadata, nil
 }
 
-func validWriteTransactionPhaseShape(request *authoritypb.Request, body *authoritypb.WriteTransactionRequest) bool {
+func validFskitWritePhaseShape(request *authoritypb.Request, body *authoritypb.FskitWriteRequest) bool {
 	if request == nil || body == nil {
 		return false
 	}
 	switch body.GetPhase() {
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
-		return request.GetMutation() == nil && request.GetSourcePublicationGate() == nil &&
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
+		return request.GetMutation() == nil && request.GetFskitSourcePublication() == nil &&
 			body.GetFragmentOffset() == 0 && body.GetSize() == 0 && len(body.GetData()) == 0
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
-		return request.GetMutation() == nil && request.GetSourcePublicationGate() == nil && body.GetSize() != 0 &&
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
+		return request.GetMutation() == nil && request.GetFskitSourcePublication() == nil && body.GetSize() != 0 &&
 			uint32(len(body.GetData())) == body.GetSize() && body.GetFragmentOffset() < body.GetRequestedSize() &&
 			uint64(body.GetSize()) <= body.GetRequestedSize()-body.GetFragmentOffset()
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT:
-		return request.GetMutation() != nil && request.GetSourcePublicationGate() != nil &&
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT:
+		return request.GetMutation() != nil && request.GetFskitSourcePublication() != nil &&
 			body.GetFragmentOffset() != 0 && body.GetFragmentOffset() <= body.GetRequestedSize() &&
 			body.GetSize() == 0 && len(body.GetData()) == 0
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
-		return request.GetMutation() == nil && request.GetSourcePublicationGate() == nil &&
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
+		return request.GetMutation() == nil && request.GetFskitSourcePublication() == nil &&
 			body.GetFragmentOffset() == 0 && body.GetSize() == 0 && len(body.GetData()) == 0
 	default:
 		return false
 	}
 }
 
-func writeTransactionReply(transactionID uint64, flags uint32) *authoritypb.Response {
-	return &authoritypb.Response{Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+func fskitWriteReply(transactionID uint64, flags uint32) *authoritypb.Response {
+	return &authoritypb.Response{Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 		TransactionId: transactionID, Flags: flags,
 	}}}
 }
 
-func writeTransactionFingerprint(h *VolumeHandler, request *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
-	return writeTransactionFingerprintContext(context.Background(), h, request)
+func fskitWriteFingerprint(h *VolumeHandler, request *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
+	return fskitWriteFingerprintContext(context.Background(), h, request)
 }
 
-func writeTransactionFingerprintContext(ctx context.Context, h *VolumeHandler, request *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
+func fskitWriteFingerprintContext(ctx context.Context, h *VolumeHandler, request *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
 	if h == nil || h.Runtime == nil {
 		return volumeserver.RequestFingerprint{}, syscall.EIO
 	}
-	if body := request.GetWriteTransaction(); body != nil && body.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA {
+	if body := request.GetFskitWrite(); body != nil && body.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA {
 		if digest, ok := framePayloadDigest(ctx, request); ok {
 			return canonicalFingerprintWithWriteDataDigest(h.Runtime, request, digest)
 		}
@@ -354,40 +354,40 @@ func writeTransactionFingerprintContext(ctx context.Context, h *VolumeHandler, r
 	return canonicalFingerprint(h.Runtime, request)
 }
 
-func sameWriteTransactionMetadata(left, right writeTransactionMetadata) bool { return left == right }
+func sameFskitWriteMetadata(left, right fskitWriteMetadata) bool { return left == right }
 
-func writeTransactionRejection(errno int32, transactionID uint64, rlimit bool) *authoritypb.Response {
+func fskitWriteRejection(errno int32, transactionID uint64, rlimit bool) *authoritypb.Response {
 	if errno <= 0 || errno > 4095 {
 		errno = int32(syscall.EIO)
 	}
-	flags := writeTransactionReplyRejected
+	flags := fskitWriteReplyRejected
 	if rlimit {
-		flags = writeTransactionReplyRLimit
+		flags = fskitWriteReplyRLimit
 	}
-	return &authoritypb.Response{Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+	return &authoritypb.Response{Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 		TransactionId: transactionID, Flags: flags, Error: -errno,
 	}}}
 }
 
-func writeTransactionCommitReply(transactionID, committed, assigned, post, sequence uint64, postAttr xfsstore.Attr, err error) *authoritypb.Response {
-	flags := writeTransactionReplyCommitted
+func fskitWriteCommitReply(transactionID, committed, assigned, post, sequence uint64, postAttr xfsstore.Attr, err error) *authoritypb.Response {
+	flags := fskitWriteReplyCommitted
 	wireError := int32(0)
 	if err != nil && errors.Is(err, xfsstore.ErrWritePostApply) {
-		flags |= writeTransactionReplyPostApply
+		flags |= fskitWriteReplyPostApply
 		wireError = -wireErrno(err)
 		if wireError >= 0 {
 			wireError = -int32(syscall.EIO)
 		}
 	}
 	return &authoritypb.Response{
-		Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+		Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 			TransactionId: transactionID, CommittedSize: committed, AssignedOffset: assigned,
 			PostSize: post, VisibilitySequence: sequence, Flags: flags, Error: wireError,
 		}},
 	}
 }
 
-func writeTransactionResponseWithEnvelope(h *VolumeHandler, requestID uint64, response *authoritypb.Response) *authoritypb.Response {
+func fskitWriteResponseWithEnvelope(h *VolumeHandler, requestID uint64, response *authoritypb.Response) *authoritypb.Response {
 	if response == nil {
 		return h.errorResponse(requestID, syscall.EIO, true)
 	}
@@ -396,7 +396,7 @@ func writeTransactionResponseWithEnvelope(h *VolumeHandler, requestID uint64, re
 	return response
 }
 
-func (h *VolumeHandler) writeTransactionResources(id volumeserver.SessionID) (*sessionResources, error) {
+func (h *VolumeHandler) fskitWriteResources(id volumeserver.SessionID) (*sessionResources, error) {
 	resources, err := h.sessionResources(id)
 	if err != nil {
 		return nil, err
@@ -404,47 +404,47 @@ func (h *VolumeHandler) writeTransactionResources(id volumeserver.SessionID) (*s
 	return resources, nil
 }
 
-func (h *VolumeHandler) writeTransactionCapacityAvailableLocked(resources *sessionResources, bytes uint64) bool {
-	return bytes <= h.MaxWriteStagingBytesPerSession && bytes <= h.MaxWriteStagingBytes &&
-		resources.writeReservedBytes <= h.MaxWriteStagingBytesPerSession-bytes &&
-		h.totalWriteStagingBytes <= h.MaxWriteStagingBytes-bytes &&
-		resources.writeTransactionCount < h.MaxWriteTransactionsPerSession &&
-		h.totalWriteTransactions < h.MaxWriteTransactions
+func (h *VolumeHandler) fskitWriteCapacityAvailableLocked(resources *sessionResources, bytes uint64) bool {
+	return bytes <= h.MaxFskitWriteStagingBytesPerSession && bytes <= h.MaxFskitWriteStagingBytes &&
+		resources.fskitWriteReservedBytes <= h.MaxFskitWriteStagingBytesPerSession-bytes &&
+		h.totalFskitWriteStagingBytes <= h.MaxFskitWriteStagingBytes-bytes &&
+		resources.fskitWriteCount < h.MaxFskitWritesPerSession &&
+		h.totalFskitWrites < h.MaxFskitWrites
 }
 
-func (h *VolumeHandler) enqueueWriteTransactionCapacityLocked(waiter *writeTransactionCapacityWaiter) {
+func (h *VolumeHandler) enqueueFskitWriteCapacityLocked(waiter *fskitWriteCapacityWaiter) {
 	if waiter.queued {
 		return
 	}
-	waiter.previous = h.writeCapacityTail
+	waiter.previous = h.fskitWriteCapacityTail
 	waiter.next = nil
-	if h.writeCapacityTail == nil {
-		h.writeCapacityHead = waiter
+	if h.fskitWriteCapacityTail == nil {
+		h.fskitWriteCapacityHead = waiter
 	} else {
-		h.writeCapacityTail.next = waiter
+		h.fskitWriteCapacityTail.next = waiter
 	}
-	h.writeCapacityTail = waiter
+	h.fskitWriteCapacityTail = waiter
 	waiter.queued = true
 }
 
-func (h *VolumeHandler) removeWriteTransactionCapacityLocked(waiter *writeTransactionCapacityWaiter) {
+func (h *VolumeHandler) removeFskitWriteCapacityLocked(waiter *fskitWriteCapacityWaiter) {
 	if !waiter.queued {
 		return
 	}
 	if waiter.previous == nil {
-		h.writeCapacityHead = waiter.next
+		h.fskitWriteCapacityHead = waiter.next
 	} else {
 		waiter.previous.next = waiter.next
 	}
 	if waiter.next == nil {
-		h.writeCapacityTail = waiter.previous
+		h.fskitWriteCapacityTail = waiter.previous
 	} else {
 		waiter.next.previous = waiter.previous
 	}
 	waiter.previous, waiter.next, waiter.queued = nil, nil, false
 }
 
-func wakeWriteTransactionCapacityWaiterLocked(waiter *writeTransactionCapacityWaiter) {
+func wakeFskitWriteCapacityWaiterLocked(waiter *fskitWriteCapacityWaiter) {
 	if waiter == nil {
 		return
 	}
@@ -453,30 +453,30 @@ func wakeWriteTransactionCapacityWaiterLocked(waiter *writeTransactionCapacityWa
 	close(ready)
 }
 
-func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, terminal <-chan struct{}, resources *sessionResources, bytes uint64) error {
-	waiter := &writeTransactionCapacityWaiter{resources: resources, ready: make(chan struct{})}
+func (h *VolumeHandler) reserveFskitWriteCapacity(ctx context.Context, terminal <-chan struct{}, resources *sessionResources, bytes uint64) error {
+	waiter := &fskitWriteCapacityWaiter{resources: resources, ready: make(chan struct{})}
 	waiting := false
 	var waitStarted time.Time
 	for {
-		h.writeCapacityMu.Lock()
-		if resources.writeCapacityEnded {
-			h.removeWriteTransactionCapacityLocked(waiter)
-			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
-			h.writeCapacityMu.Unlock()
+		h.fskitWriteCapacityMu.Lock()
+		if resources.fskitWriteCapacityEnded {
+			h.removeFskitWriteCapacityLocked(waiter)
+			wakeFskitWriteCapacityWaiterLocked(h.fskitWriteCapacityHead)
+			h.fskitWriteCapacityMu.Unlock()
 			if waiting && h.Metrics != nil {
 				h.Metrics.WriteAdmissionFinished(time.Since(waitStarted))
 			}
 			return volumeserver.ErrSessionExpired
 		}
-		h.enqueueWriteTransactionCapacityLocked(waiter)
-		if h.writeCapacityHead == waiter && h.writeTransactionCapacityAvailableLocked(resources, bytes) {
-			h.removeWriteTransactionCapacityLocked(waiter)
-			resources.writeReservedBytes += bytes
-			resources.writeTransactionCount++
-			h.totalWriteStagingBytes += bytes
-			h.totalWriteTransactions++
-			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
-			h.writeCapacityMu.Unlock()
+		h.enqueueFskitWriteCapacityLocked(waiter)
+		if h.fskitWriteCapacityHead == waiter && h.fskitWriteCapacityAvailableLocked(resources, bytes) {
+			h.removeFskitWriteCapacityLocked(waiter)
+			resources.fskitWriteReservedBytes += bytes
+			resources.fskitWriteCount++
+			h.totalFskitWriteStagingBytes += bytes
+			h.totalFskitWrites++
+			wakeFskitWriteCapacityWaiterLocked(h.fskitWriteCapacityHead)
+			h.fskitWriteCapacityMu.Unlock()
 			if h.Metrics != nil {
 				h.Metrics.WriteTransactionAdmitted()
 				if waiting {
@@ -493,26 +493,26 @@ func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, ter
 			}
 		}
 		ready := waiter.ready
-		h.writeCapacityMu.Unlock()
+		h.fskitWriteCapacityMu.Unlock()
 
 		select {
 		case <-ready:
 			continue
 		case <-terminal:
-			h.writeCapacityMu.Lock()
-			h.removeWriteTransactionCapacityLocked(waiter)
-			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
-			h.writeCapacityMu.Unlock()
+			h.fskitWriteCapacityMu.Lock()
+			h.removeFskitWriteCapacityLocked(waiter)
+			wakeFskitWriteCapacityWaiterLocked(h.fskitWriteCapacityHead)
+			h.fskitWriteCapacityMu.Unlock()
 			if h.Metrics != nil {
 				h.Metrics.WriteAdmissionFinished(time.Since(waitStarted))
 			}
 			return volumeserver.ErrSessionExpired
 		case <-ctx.Done():
-			h.writeCapacityMu.Lock()
-			h.removeWriteTransactionCapacityLocked(waiter)
-			wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
-			ended := resources.writeCapacityEnded
-			h.writeCapacityMu.Unlock()
+			h.fskitWriteCapacityMu.Lock()
+			h.removeFskitWriteCapacityLocked(waiter)
+			wakeFskitWriteCapacityWaiterLocked(h.fskitWriteCapacityHead)
+			ended := resources.fskitWriteCapacityEnded
+			h.fskitWriteCapacityMu.Unlock()
 			if h.Metrics != nil {
 				h.Metrics.WriteAdmissionFinished(time.Since(waitStarted))
 			}
@@ -524,124 +524,124 @@ func (h *VolumeHandler) reserveWriteTransactionCapacity(ctx context.Context, ter
 	}
 }
 
-func (h *VolumeHandler) releaseWriteTransactionCapacity(resources *sessionResources, bytes uint64) {
-	h.writeCapacityMu.Lock()
-	defer h.writeCapacityMu.Unlock()
-	if bytes > resources.writeReservedBytes || bytes > h.totalWriteStagingBytes ||
-		resources.writeTransactionCount == 0 || h.totalWriteTransactions == 0 {
-		panic("authorityrpc: write transaction capacity accounting underflow")
+func (h *VolumeHandler) releaseFskitWriteCapacity(resources *sessionResources, bytes uint64) {
+	h.fskitWriteCapacityMu.Lock()
+	defer h.fskitWriteCapacityMu.Unlock()
+	if bytes > resources.fskitWriteReservedBytes || bytes > h.totalFskitWriteStagingBytes ||
+		resources.fskitWriteCount == 0 || h.totalFskitWrites == 0 {
+		panic("authorityrpc: FSKit write capacity accounting underflow")
 	}
-	resources.writeReservedBytes -= bytes
-	resources.writeTransactionCount--
-	h.totalWriteStagingBytes -= bytes
-	h.totalWriteTransactions--
+	resources.fskitWriteReservedBytes -= bytes
+	resources.fskitWriteCount--
+	h.totalFskitWriteStagingBytes -= bytes
+	h.totalFskitWrites--
 	if h.Metrics != nil {
 		h.Metrics.WriteTransactionReleased()
 	}
-	wakeWriteTransactionCapacityWaiterLocked(h.writeCapacityHead)
+	wakeFskitWriteCapacityWaiterLocked(h.fskitWriteCapacityHead)
 }
 
-func (h *VolumeHandler) endWriteTransactionCapacityWaits(resources *sessionResources) {
-	h.writeCapacityMu.Lock()
-	resources.writeCapacityEnded = true
-	for waiter := h.writeCapacityHead; waiter != nil; waiter = waiter.next {
+func (h *VolumeHandler) endFskitWriteCapacityWaits(resources *sessionResources) {
+	h.fskitWriteCapacityMu.Lock()
+	resources.fskitWriteCapacityEnded = true
+	for waiter := h.fskitWriteCapacityHead; waiter != nil; waiter = waiter.next {
 		if waiter.resources == resources {
-			wakeWriteTransactionCapacityWaiterLocked(waiter)
+			wakeFskitWriteCapacityWaiterLocked(waiter)
 		}
 	}
-	h.writeCapacityMu.Unlock()
+	h.fskitWriteCapacityMu.Unlock()
 }
 
-// acquireWriteTransaction pins the exact registered object without ever
+// acquireFskitWrite pins the exact registered object without ever
 // waiting on transaction.mu while holding the session ledger. WaitGroup.Add is
 // ordered before removal by writeMu; once removal wins, no future Add can race
 // cleanup's Wait.
-func acquireWriteTransaction(resources *sessionResources, id uint64) *writeTransaction {
-	resources.writeMu.Lock()
-	transaction := resources.writeTransactions[id]
+func acquireFskitWrite(resources *sessionResources, id uint64) *fskitWrite {
+	resources.fskitWriteMu.Lock()
+	transaction := resources.fskitWrites[id]
 	if transaction != nil {
 		transaction.refs.Add(1)
 	}
-	resources.writeMu.Unlock()
+	resources.fskitWriteMu.Unlock()
 	return transaction
 }
 
-func writeTransactionRegistered(resources *sessionResources, transaction *writeTransaction) bool {
-	resources.writeMu.Lock()
-	registered := resources.writeTransactions[transaction.id] == transaction
-	resources.writeMu.Unlock()
+func fskitWriteRegistered(resources *sessionResources, transaction *fskitWrite) bool {
+	resources.fskitWriteMu.Lock()
+	registered := resources.fskitWrites[transaction.id] == transaction
+	resources.fskitWriteMu.Unlock()
 	return registered
 }
 
-// removeWriteTransactionLocked transfers cleanup ownership but performs no
+// removeFskitWriteLocked transfers cleanup ownership but performs no
 // waiting, Close, or capacity release under writeMu. Callers must already have
 // made the transaction terminal while holding transaction.mu.
-func (h *VolumeHandler) removeWriteTransactionLocked(resources *sessionResources, transaction *writeTransaction, terminal writeTransactionTerminalKind, terminalErr error) writeTransactionCleanup {
-	if resources.writeTransactions[transaction.id] != transaction {
-		return writeTransactionCleanup{}
+func (h *VolumeHandler) removeFskitWriteLocked(resources *sessionResources, transaction *fskitWrite, terminal fskitWriteTerminalKind, terminalErr error) fskitWriteCleanup {
+	if resources.fskitWrites[transaction.id] != transaction {
+		return fskitWriteCleanup{}
 	}
-	delete(resources.writeTransactions, transaction.id)
-	resources.writeTerminal = &writeTransactionTerminal{
+	delete(resources.fskitWrites, transaction.id)
+	resources.fskitWriteTerminal = &fskitWriteTerminal{
 		id: transaction.id, beginFingerprint: transaction.beginFingerprint, commitFingerprint: transaction.commitFingerprint,
 		metadata: transaction.metadata, staged: transaction.staged, kind: terminal, err: terminalErr,
 	}
-	return writeTransactionCleanup{handler: h, resources: resources, transaction: transaction}
+	return fskitWriteCleanup{handler: h, resources: resources, transaction: transaction}
 }
 
-func (h *VolumeHandler) fenceWriteTransactionMismatch(id volumeserver.SessionID) error {
+func (h *VolumeHandler) fenceFskitWriteMismatch(id volumeserver.SessionID) error {
 	if h.Runtime != nil {
 		h.Runtime.FenceSession(id)
 	}
 	if h.Metrics != nil {
-		h.Metrics.Fence(authoritymetrics.FenceWriteTransactionMismatch)
+		h.Metrics.Fence(authoritymetrics.FenceFskitWriteMismatch)
 	}
 	volume := ""
 	if h.Runtime != nil {
 		volume = h.Runtime.VolumeID()
 	}
-	log.Printf("portablefs-authority: event=fence volume=%q session=%x reason=write_transaction_mismatch", volume, id)
+	log.Printf("portablefs-authority: event=fence volume=%q session=%x reason=fskit_write_mismatch", volume, id)
 	return volumeserver.ErrRequestMismatch
 }
 
-func (h *VolumeHandler) beginWriteTransaction(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
-	return h.beginWriteTransactionContext(context.Background(), request, credential, body)
+func (h *VolumeHandler) beginFskitWrite(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
+	return h.beginFskitWriteContext(context.Background(), request, credential, body)
 }
 
-func (h *VolumeHandler) beginWriteTransactionContext(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
-	metadata, err := writeTransactionMetadataFromRequest(body)
-	if err != nil || !validWriteTransactionPhaseShape(request, body) || body.GetRequestedSize() > h.MaxWriteTransactionBytes {
+func (h *VolumeHandler) beginFskitWriteContext(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
+	metadata, err := fskitWriteMetadataFromRequest(body)
+	if err != nil || !validFskitWritePhaseShape(request, body) || body.GetRequestedSize() > h.MaxFskitWriteBytes {
 		return h.errorResponse(request.GetRequestId(), syscall.EINVAL, false)
 	}
-	fingerprint, err := writeTransactionFingerprint(h, request)
+	fingerprint, err := fskitWriteFingerprint(h, request)
 	if err != nil {
 		return h.errorResponse(request.GetRequestId(), syscall.EINVAL, false)
 	}
-	resources, err := h.writeTransactionResources(credential.ID)
+	resources, err := h.fskitWriteResources(credential.ID)
 	if err != nil {
 		return h.errorResponse(request.GetRequestId(), err, false)
 	}
-	resources.writeMu.Lock()
-	if resources.writeTransactions == nil {
-		resources.writeTransactions = make(map[uint64]*writeTransaction)
+	resources.fskitWriteMu.Lock()
+	if resources.fskitWrites == nil {
+		resources.fskitWrites = make(map[uint64]*fskitWrite)
 	}
-	if existing := resources.writeTransactions[body.GetTransactionId()]; existing != nil {
-		if existing.beginFingerprint != fingerprint || !sameWriteTransactionMetadata(existing.metadata, metadata) {
-			resources.writeMu.Unlock()
-			return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+	if existing := resources.fskitWrites[body.GetTransactionId()]; existing != nil {
+		if existing.beginFingerprint != fingerprint || !sameFskitWriteMetadata(existing.metadata, metadata) {
+			resources.fskitWriteMu.Unlock()
+			return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 		}
 		existing.refs.Add(1)
-		resources.writeMu.Unlock()
+		resources.fskitWriteMu.Unlock()
 		// INITIALIZING owns this mutex across allocation and target pinning. An
 		// exact retry waits for that one attempt instead of duplicating either
 		// resource, while every other transaction remains independent.
 		existing.mu.Lock()
 		var response *authoritypb.Response
 		switch existing.state {
-		case writeTransactionStaging, writeTransactionCommitting:
-			if writeTransactionRegistered(resources, existing) {
-				response = writeTransactionReply(body.GetTransactionId(), writeTransactionReplyBegun)
+		case fskitWriteStaging, fskitWriteCommitting:
+			if fskitWriteRegistered(resources, existing) {
+				response = fskitWriteReply(body.GetTransactionId(), fskitWriteReplyBegun)
 			}
-		case writeTransactionRejected:
+		case fskitWriteRejected:
 			if existing.initErr != nil {
 				response = h.errorResponse(request.GetRequestId(), existing.initErr, false)
 			}
@@ -652,73 +652,73 @@ func (h *VolumeHandler) beginWriteTransactionContext(ctx context.Context, reques
 			// Removal may have won after this retry acquired its lifetime ref but
 			// before it acquired transaction.mu. Preserve the same exact terminal
 			// result a retry arriving one instruction later would observe.
-			resources.writeMu.Lock()
-			terminal := resources.writeTerminal
+			resources.fskitWriteMu.Lock()
+			terminal := resources.fskitWriteTerminal
 			if terminal != nil && terminal.id == body.GetTransactionId() && terminal.beginFingerprint == fingerprint &&
-				sameWriteTransactionMetadata(terminal.metadata, metadata) {
+				sameFskitWriteMetadata(terminal.metadata, metadata) {
 				switch terminal.kind {
-				case writeTransactionTerminalAborted:
-					response = writeTransactionReply(body.GetTransactionId(), writeTransactionReplyAborted)
-				case writeTransactionTerminalRejected:
+				case fskitWriteTerminalAborted:
+					response = fskitWriteReply(body.GetTransactionId(), fskitWriteReplyAborted)
+				case fskitWriteTerminalRejected:
 					if terminal.err != nil {
 						response = h.errorResponse(request.GetRequestId(), terminal.err, false)
 					}
 				}
 			}
-			resources.writeMu.Unlock()
+			resources.fskitWriteMu.Unlock()
 		}
 		if response == nil {
-			return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+			return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 		}
 		if response.GetRequestId() != request.GetRequestId() {
-			response = writeTransactionResponseWithEnvelope(h, request.GetRequestId(), response)
+			response = fskitWriteResponseWithEnvelope(h, request.GetRequestId(), response)
 		}
 		return response
 	}
-	if terminal := resources.writeTerminal; terminal != nil && terminal.id == body.GetTransactionId() {
-		if terminal.beginFingerprint != fingerprint || !sameWriteTransactionMetadata(terminal.metadata, metadata) {
-			resources.writeMu.Unlock()
-			return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+	if terminal := resources.fskitWriteTerminal; terminal != nil && terminal.id == body.GetTransactionId() {
+		if terminal.beginFingerprint != fingerprint || !sameFskitWriteMetadata(terminal.metadata, metadata) {
+			resources.fskitWriteMu.Unlock()
+			return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 		}
-		resources.writeMu.Unlock()
+		resources.fskitWriteMu.Unlock()
 		switch terminal.kind {
-		case writeTransactionTerminalAborted:
-			return writeTransactionResponseWithEnvelope(h, request.GetRequestId(), writeTransactionReply(body.GetTransactionId(), writeTransactionReplyAborted))
-		case writeTransactionTerminalRejected:
+		case fskitWriteTerminalAborted:
+			return fskitWriteResponseWithEnvelope(h, request.GetRequestId(), fskitWriteReply(body.GetTransactionId(), fskitWriteReplyAborted))
+		case fskitWriteTerminalRejected:
 			if terminal.err == nil {
 				return h.errorResponse(request.GetRequestId(), syscall.EIO, false)
 			}
 			return h.errorResponse(request.GetRequestId(), terminal.err, false)
 		default:
-			return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+			return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 		}
 	}
-	if body.GetTransactionId() != resources.writeHighWater+1 {
-		resources.writeMu.Unlock()
-		return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+	if body.GetTransactionId() != resources.fskitWriteHighWater+1 {
+		resources.fskitWriteMu.Unlock()
+		return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 	}
 	// A syntactically valid exact next BEGIN consumes its monotonic identity
 	// before waiting for resources. Its published INITIALIZING placeholder makes
 	// exact retries join this attempt without allowing a later transaction to
 	// reuse its number.
-	resources.writeHighWater = body.GetTransactionId()
+	resources.fskitWriteHighWater = body.GetTransactionId()
 	now := time.Now()
-	absoluteDeadline := now.Add(h.WriteTransactionAbsoluteTimeout)
-	progressDeadline := now.Add(h.WriteTransactionProgressTimeout)
+	absoluteDeadline := now.Add(h.FskitWriteAbsoluteTimeout)
+	progressDeadline := now.Add(h.FskitWriteProgressTimeout)
 	if progressDeadline.After(absoluteDeadline) {
 		progressDeadline = absoluteDeadline
 	}
-	transaction := &writeTransaction{
+	transaction := &fskitWrite{
 		id: body.GetTransactionId(), metadata: metadata, beginFingerprint: fingerprint,
-		state: writeTransactionInitializing, progressDeadline: progressDeadline, absoluteDeadline: absoluteDeadline,
+		state: fskitWriteInitializing, progressDeadline: progressDeadline, absoluteDeadline: absoluteDeadline,
 	}
 	// Lock before publishing the placeholder so no retry can observe a partial
 	// stage/target pair. The initial attempt itself is the first lifetime ref.
 	transaction.mu.Lock()
 	transaction.refs.Add(1)
-	resources.writeTransactions[transaction.id] = transaction
-	resources.writeTerminal = nil
-	resources.writeMu.Unlock()
+	resources.fskitWrites[transaction.id] = transaction
+	resources.fskitWriteTerminal = nil
+	resources.fskitWriteMu.Unlock()
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -726,20 +726,20 @@ func (h *VolumeHandler) beginWriteTransactionContext(ctx context.Context, reques
 	terminal, initErr := h.Runtime.SessionTerminal(credential.ID)
 	admissionCtx, cancelAdmission := context.WithDeadline(ctx, transaction.progressDeadline)
 	if initErr == nil {
-		initErr = h.reserveWriteTransactionCapacity(admissionCtx, terminal, resources, metadata.requestedSize)
+		initErr = h.reserveFskitWriteCapacity(admissionCtx, terminal, resources, metadata.requestedSize)
 		transaction.capacityReserved = initErr == nil
 	}
 	cancelAdmission()
-	if initErr == nil && !writeTransactionRegistered(resources, transaction) {
+	if initErr == nil && !fskitWriteRegistered(resources, transaction) {
 		initErr = volumeserver.ErrSessionExpired
 	}
-	var stage writeTransactionStage
+	var stage fskitWriteStage
 	if initErr == nil {
-		stage, initErr = h.WriteStaging.newFile(metadata.requestedSize)
+		stage, initErr = h.FskitWriteStaging.newFile(metadata.requestedSize)
 	}
 	transaction.stage = stage
 	if initErr == nil {
-		store, ok := h.Store.(writeTransactionStore)
+		store, ok := h.Store.(writeStore)
 		if !ok {
 			initErr = syscall.EOPNOTSUPP
 		} else {
@@ -753,17 +753,17 @@ func (h *VolumeHandler) beginWriteTransactionContext(ctx context.Context, reques
 		}
 	}
 
-	var cleanup writeTransactionCleanup
+	var cleanup fskitWriteCleanup
 	if initErr != nil {
-		transaction.state = writeTransactionRejected
+		transaction.state = fskitWriteRejected
 		transaction.initErr = initErr
-		resources.writeMu.Lock()
-		cleanup = h.removeWriteTransactionLocked(resources, transaction, writeTransactionTerminalRejected, initErr)
-		resources.writeMu.Unlock()
+		resources.fskitWriteMu.Lock()
+		cleanup = h.removeFskitWriteLocked(resources, transaction, fskitWriteTerminalRejected, initErr)
+		resources.fskitWriteMu.Unlock()
 	} else {
 		now := time.Now()
-		transaction.state = writeTransactionStaging
-		transaction.progressDeadline = now.Add(h.WriteTransactionProgressTimeout)
+		transaction.state = fskitWriteStaging
+		transaction.progressDeadline = now.Add(h.FskitWriteProgressTimeout)
 		if transaction.progressDeadline.After(transaction.absoluteDeadline) {
 			transaction.progressDeadline = transaction.absoluteDeadline
 		}
@@ -774,76 +774,76 @@ func (h *VolumeHandler) beginWriteTransactionContext(ctx context.Context, reques
 	if initErr != nil {
 		return h.errorResponse(request.GetRequestId(), initErr, false)
 	}
-	if !writeTransactionRegistered(resources, transaction) {
+	if !fskitWriteRegistered(resources, transaction) {
 		return h.errorResponse(request.GetRequestId(), volumeserver.ErrSessionExpired, false)
 	}
-	return writeTransactionResponseWithEnvelope(h, request.GetRequestId(), writeTransactionReply(transaction.id, writeTransactionReplyBegun))
+	return fskitWriteResponseWithEnvelope(h, request.GetRequestId(), fskitWriteReply(transaction.id, fskitWriteReplyBegun))
 }
 
-func (h *VolumeHandler) writeTransactionForPhase(request *authoritypb.Request, body *authoritypb.WriteTransactionRequest) (writeTransactionMetadata, volumeserver.RequestFingerprint, error) {
-	return h.writeTransactionForPhaseContext(context.Background(), request, body)
+func (h *VolumeHandler) fskitWriteForPhase(request *authoritypb.Request, body *authoritypb.FskitWriteRequest) (fskitWriteMetadata, volumeserver.RequestFingerprint, error) {
+	return h.fskitWriteForPhaseContext(context.Background(), request, body)
 }
 
-func (h *VolumeHandler) writeTransactionForPhaseContext(ctx context.Context, request *authoritypb.Request, body *authoritypb.WriteTransactionRequest) (writeTransactionMetadata, volumeserver.RequestFingerprint, error) {
-	metadata, err := writeTransactionMetadataFromRequest(body)
-	if err != nil || !validWriteTransactionPhaseShape(request, body) || body.GetRequestedSize() > h.MaxWriteTransactionBytes {
-		return writeTransactionMetadata{}, volumeserver.RequestFingerprint{}, syscall.EINVAL
+func (h *VolumeHandler) fskitWriteForPhaseContext(ctx context.Context, request *authoritypb.Request, body *authoritypb.FskitWriteRequest) (fskitWriteMetadata, volumeserver.RequestFingerprint, error) {
+	metadata, err := fskitWriteMetadataFromRequest(body)
+	if err != nil || !validFskitWritePhaseShape(request, body) || body.GetRequestedSize() > h.MaxFskitWriteBytes {
+		return fskitWriteMetadata{}, volumeserver.RequestFingerprint{}, syscall.EINVAL
 	}
-	fingerprint, err := writeTransactionFingerprintContext(ctx, h, request)
+	fingerprint, err := fskitWriteFingerprintContext(ctx, h, request)
 	if err != nil {
-		return writeTransactionMetadata{}, volumeserver.RequestFingerprint{}, syscall.EINVAL
+		return fskitWriteMetadata{}, volumeserver.RequestFingerprint{}, syscall.EINVAL
 	}
 	return metadata, fingerprint, nil
 }
 
-func (h *VolumeHandler) stageWriteTransaction(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
-	return h.stageWriteTransactionContext(context.Background(), request, credential, body)
+func (h *VolumeHandler) stageFskitWrite(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
+	return h.stageFskitWriteContext(context.Background(), request, credential, body)
 }
 
-func (h *VolumeHandler) stageWriteTransactionContext(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
+func (h *VolumeHandler) stageFskitWriteContext(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
 	if body.GetSize() > h.MaxWrite {
 		return h.errorResponse(request.GetRequestId(), syscall.EINVAL, false)
 	}
-	resources, err := h.writeTransactionResources(credential.ID)
+	resources, err := h.fskitWriteResources(credential.ID)
 	if err != nil {
 		return h.errorResponse(request.GetRequestId(), err, false)
 	}
-	metadata, fingerprint, err := h.writeTransactionForPhaseContext(ctx, request, body)
+	metadata, fingerprint, err := h.fskitWriteForPhaseContext(ctx, request, body)
 	if err != nil {
 		return h.errorResponse(request.GetRequestId(), err, false)
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
-	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
+	if transaction == nil || !sameFskitWriteMetadata(transaction.metadata, metadata) {
 		if transaction != nil {
 			transaction.refs.Done()
 		}
-		return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+		return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 	}
 	transaction.mu.Lock()
-	var cleanup writeTransactionCleanup
+	var cleanup fskitWriteCleanup
 	var response *authoritypb.Response
 	var phaseErr error
-	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionStaging {
-		phaseErr = h.fenceWriteTransactionMismatch(credential.ID)
+	if !fskitWriteRegistered(resources, transaction) || transaction.state != fskitWriteStaging {
+		phaseErr = h.fenceFskitWriteMismatch(credential.ID)
 	} else if body.GetFragmentOffset() < transaction.staged {
 		if body.GetFragmentOffset() != transaction.lastDataOffset || body.GetSize() != transaction.lastDataSize || transaction.lastData != fingerprint {
-			phaseErr = h.fenceWriteTransactionMismatch(credential.ID)
+			phaseErr = h.fenceFskitWriteMismatch(credential.ID)
 		} else {
-			response = writeTransactionReply(transaction.id, writeTransactionReplyStaged)
+			response = fskitWriteReply(transaction.id, fskitWriteReplyStaged)
 		}
 	} else if body.GetFragmentOffset() != transaction.staged {
-		phaseErr = h.fenceWriteTransactionMismatch(credential.ID)
+		phaseErr = h.fenceFskitWriteMismatch(credential.ID)
 	} else {
 		n, writeErr := transaction.stage.WriteAt(body.GetData(), int64(transaction.staged))
 		if writeErr != nil || n != len(body.GetData()) {
 			if writeErr == nil {
 				writeErr = io.ErrShortWrite
 			}
-			transaction.state = writeTransactionRejected
+			transaction.state = fskitWriteRejected
 			transaction.initErr = writeErr
-			resources.writeMu.Lock()
-			cleanup = h.removeWriteTransactionLocked(resources, transaction, writeTransactionTerminalRejected, writeErr)
-			resources.writeMu.Unlock()
+			resources.fskitWriteMu.Lock()
+			cleanup = h.removeFskitWriteLocked(resources, transaction, fskitWriteTerminalRejected, writeErr)
+			resources.fskitWriteMu.Unlock()
 			phaseErr = writeErr
 		} else {
 			transaction.lastDataOffset = transaction.staged
@@ -854,12 +854,12 @@ func (h *VolumeHandler) stageWriteTransactionContext(ctx context.Context, reques
 				h.Metrics.WriteStagedBytes(int64(body.GetSize()))
 			}
 			now := time.Now()
-			progress := now.Add(h.WriteTransactionProgressTimeout)
+			progress := now.Add(h.FskitWriteProgressTimeout)
 			if progress.After(transaction.absoluteDeadline) {
 				progress = transaction.absoluteDeadline
 			}
 			transaction.progressDeadline = progress
-			response = writeTransactionReply(transaction.id, writeTransactionReplyStaged)
+			response = fskitWriteReply(transaction.id, fskitWriteReplyStaged)
 		}
 	}
 	transaction.mu.Unlock()
@@ -868,113 +868,113 @@ func (h *VolumeHandler) stageWriteTransactionContext(ctx context.Context, reques
 	if phaseErr != nil {
 		return h.errorResponse(request.GetRequestId(), phaseErr, false)
 	}
-	return writeTransactionResponseWithEnvelope(h, request.GetRequestId(), response)
+	return fskitWriteResponseWithEnvelope(h, request.GetRequestId(), response)
 }
 
-func (h *VolumeHandler) abortWriteTransaction(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
-	metadata, err := writeTransactionMetadataFromRequest(body)
-	if err != nil || !validWriteTransactionPhaseShape(request, body) {
+func (h *VolumeHandler) abortFskitWrite(request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
+	metadata, err := fskitWriteMetadataFromRequest(body)
+	if err != nil || !validFskitWritePhaseShape(request, body) {
 		return h.errorResponse(request.GetRequestId(), syscall.EINVAL, false)
 	}
-	resources, err := h.writeTransactionResources(credential.ID)
+	resources, err := h.fskitWriteResources(credential.ID)
 	if err != nil {
 		return h.errorResponse(request.GetRequestId(), err, false)
 	}
 	abortTerminal := func() *authoritypb.Response {
-		resources.writeMu.Lock()
-		terminal := resources.writeTerminal
-		if body.GetTransactionId() != resources.writeHighWater || terminal == nil || terminal.id != body.GetTransactionId() ||
-			!sameWriteTransactionMetadata(terminal.metadata, metadata) || terminal.kind == writeTransactionTerminalCommitted {
-			resources.writeMu.Unlock()
-			return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+		resources.fskitWriteMu.Lock()
+		terminal := resources.fskitWriteTerminal
+		if body.GetTransactionId() != resources.fskitWriteHighWater || terminal == nil || terminal.id != body.GetTransactionId() ||
+			!sameFskitWriteMetadata(terminal.metadata, metadata) || terminal.kind == fskitWriteTerminalCommitted {
+			resources.fskitWriteMu.Unlock()
+			return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 		}
-		if terminal.kind == writeTransactionTerminalAborted {
-			resources.writeMu.Unlock()
-			return writeTransactionResponseWithEnvelope(h, request.GetRequestId(), writeTransactionReply(body.GetTransactionId(), writeTransactionReplyAborted))
+		if terminal.kind == fskitWriteTerminalAborted {
+			resources.fskitWriteMu.Unlock()
+			return fskitWriteResponseWithEnvelope(h, request.GetRequestId(), fskitWriteReply(body.GetTransactionId(), fskitWriteReplyAborted))
 		}
 		// A structured BEGIN/COMMIT refusal owns no staged bytes. ABORT turns
 		// that exact newest tombstone into the idempotent terminal state the
 		// kernel expects after its best-effort cleanup phase.
-		resources.writeTerminal = &writeTransactionTerminal{
+		resources.fskitWriteTerminal = &fskitWriteTerminal{
 			id: body.GetTransactionId(), beginFingerprint: terminal.beginFingerprint,
-			metadata: metadata, kind: writeTransactionTerminalAborted,
+			metadata: metadata, kind: fskitWriteTerminalAborted,
 		}
-		resources.writeMu.Unlock()
-		return writeTransactionResponseWithEnvelope(h, request.GetRequestId(), writeTransactionReply(body.GetTransactionId(), writeTransactionReplyAborted))
+		resources.fskitWriteMu.Unlock()
+		return fskitWriteResponseWithEnvelope(h, request.GetRequestId(), fskitWriteReply(body.GetTransactionId(), fskitWriteReplyAborted))
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
 	if transaction == nil {
 		return abortTerminal()
 	}
-	if !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+	if !sameFskitWriteMetadata(transaction.metadata, metadata) {
 		transaction.refs.Done()
-		return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+		return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 	}
 	transaction.mu.Lock()
-	if !writeTransactionRegistered(resources, transaction) {
+	if !fskitWriteRegistered(resources, transaction) {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
 		return abortTerminal()
 	}
-	if transaction.state != writeTransactionStaging {
+	if transaction.state != fskitWriteStaging {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
-		return h.errorResponse(request.GetRequestId(), h.fenceWriteTransactionMismatch(credential.ID), false)
+		return h.errorResponse(request.GetRequestId(), h.fenceFskitWriteMismatch(credential.ID), false)
 	}
-	resources.writeMu.Lock()
-	cleanup := h.removeWriteTransactionLocked(resources, transaction, writeTransactionTerminalAborted, nil)
-	resources.writeMu.Unlock()
+	resources.fskitWriteMu.Lock()
+	cleanup := h.removeFskitWriteLocked(resources, transaction, fskitWriteTerminalAborted, nil)
+	resources.fskitWriteMu.Unlock()
 	transaction.mu.Unlock()
 	transaction.refs.Done()
 	cleanup.finish()
-	return writeTransactionResponseWithEnvelope(h, request.GetRequestId(), writeTransactionReply(body.GetTransactionId(), writeTransactionReplyAborted))
+	return fskitWriteResponseWithEnvelope(h, request.GetRequestId(), fskitWriteReply(body.GetTransactionId(), fskitWriteReplyAborted))
 }
 
-func (h *VolumeHandler) handleWriteTransaction(ctx context.Context, ctxRequest *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
+func (h *VolumeHandler) handleFskitWrite(ctx context.Context, ctxRequest *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
 	switch body.GetPhase() {
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
-		return h.beginWriteTransactionContext(ctx, ctxRequest, credential, body)
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
-		return h.stageWriteTransactionContext(ctx, ctxRequest, credential, body)
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
-		return h.abortWriteTransaction(ctxRequest, credential, body)
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
+		return h.beginFskitWriteContext(ctx, ctxRequest, credential, body)
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
+		return h.stageFskitWriteContext(ctx, ctxRequest, credential, body)
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
+		return h.abortFskitWrite(ctxRequest, credential, body)
 	default:
 		return h.errorResponse(ctxRequest.GetRequestId(), syscall.EINVAL, false)
 	}
 }
 
-// commitWriteTransaction is the only phase that enters mutation replay,
+// commitFskitWrite is the only phase that enters mutation replay,
 // topology ordering, the source publication cut, or XFS. BEGIN/DATA are inert
 // staging; this method turns exactly one staged prefix into one visible
 // write-syscall outcome.
-func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
-	var transaction *writeTransaction
+func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
+	var transaction *fskitWrite
 	var resources *sessionResources
 	var coordinate visibilityCoordinate
 	var releaseMutation func()
 	prepare := func() ([]volumeserver.VisibilityTarget, error) {
 		var err error
-		resources, err = h.writeTransactionResources(credential.ID)
+		resources, err = h.fskitWriteResources(credential.ID)
 		if err != nil {
 			return nil, err
 		}
-		metadata, err := writeTransactionMetadataFromRequest(body)
-		if err != nil || !validWriteTransactionPhaseShape(request, body) {
+		metadata, err := fskitWriteMetadataFromRequest(body)
+		if err != nil || !validFskitWritePhaseShape(request, body) {
 			return nil, syscall.EINVAL
 		}
-		transaction = acquireWriteTransaction(resources, body.GetTransactionId())
-		if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+		transaction = acquireFskitWrite(resources, body.GetTransactionId())
+		if transaction == nil || !sameFskitWriteMetadata(transaction.metadata, metadata) {
 			if transaction != nil {
 				transaction.refs.Done()
 			}
-			return nil, h.fenceWriteTransactionMismatch(credential.ID)
+			return nil, h.fenceFskitWriteMismatch(credential.ID)
 		}
 		transaction.mu.Lock()
-		if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionCommitting ||
+		if !fskitWriteRegistered(resources, transaction) || transaction.state != fskitWriteCommitting ||
 			transaction.staged != body.GetFragmentOffset() {
 			transaction.mu.Unlock()
 			transaction.refs.Done()
-			return nil, h.fenceWriteTransactionMismatch(credential.ID)
+			return nil, h.fenceFskitWriteMismatch(credential.ID)
 		}
 		coordinate = visibilityCoordinate{
 			identity: transaction.coordinate.Stable, ino: transaction.coordinate.Ino,
@@ -992,18 +992,18 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 		}, nil
 	}
 	response := h.mutateVisibleSequence(ctx, request, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-		active := acquireWriteTransaction(resources, transaction.id)
+		active := acquireFskitWrite(resources, transaction.id)
 		if active != transaction {
 			if active != nil {
 				active.refs.Done()
 			}
-			return h.errorResponse(0, h.fenceWriteTransactionMismatch(credential.ID), false), nil
+			return h.errorResponse(0, h.fenceFskitWriteMismatch(credential.ID), false), nil
 		}
 		transaction.mu.Lock()
-		if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionCommitting {
+		if !fskitWriteRegistered(resources, transaction) || transaction.state != fskitWriteCommitting {
 			transaction.mu.Unlock()
 			transaction.refs.Done()
-			return h.errorResponse(0, h.fenceWriteTransactionMismatch(credential.ID), false), nil
+			return h.errorResponse(0, h.fenceFskitWriteMismatch(credential.ID), false), nil
 		}
 		stage, target, staged := transaction.stage, transaction.target, transaction.staged
 		metadata := transaction.metadata
@@ -1023,16 +1023,16 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 			RequestedSize: staged, Position: metadata.position, RLimitSize: metadata.rlimitSize,
 			FileMaxSize: metadata.fileMaxSize, Mode: metadata.mode,
 			DataSync: metadata.dataSync, Sync: metadata.sync,
-			KillPrivileges: metadata.writeFlags&writeTransactionKillSUIDGID != 0,
+			KillPrivileges: metadata.writeFlags&fskitWriteKillSUIDGID != 0,
 		}, scratch)
-		terminalKind := writeTransactionTerminalCommitted
+		terminalKind := fskitWriteTerminalCommitted
 		if committed == 0 && applyErr != nil && !errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) &&
 			!errors.Is(applyErr, xfsstore.ErrWritePostApply) {
-			terminalKind = writeTransactionTerminalRejected
+			terminalKind = fskitWriteTerminalRejected
 		}
-		resources.writeMu.Lock()
-		cleanup := h.removeWriteTransactionLocked(resources, transaction, terminalKind, nil)
-		resources.writeMu.Unlock()
+		resources.fskitWriteMu.Lock()
+		cleanup := h.removeFskitWriteLocked(resources, transaction, terminalKind, nil)
+		resources.fskitWriteMu.Unlock()
 		transaction.mu.Unlock()
 		transaction.refs.Done()
 		cleanup.finish()
@@ -1051,7 +1051,7 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 			// proves only that this transaction did not apply; it is not evidence
 			// that the authoritative filesystem remains healthy.
 			var limit *xfsstore.WriteLimitError
-			response := writeTransactionRejection(wireErrno(applyErr), transaction.id, errors.As(applyErr, &limit) && limit.RLimit)
+			response := fskitWriteRejection(wireErrno(applyErr), transaction.id, errors.As(applyErr, &limit) && limit.RLimit)
 			h.deferStorageFailure(nil, applyErr)
 			return response, nil
 		}
@@ -1062,7 +1062,7 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 			// No byte received an assigned position. The private ABI reserves zero
 			// in this attr-only post-apply shape even for append, and the kernel
 			// must leave every iterator/OFD position unchanged.
-			response := writeTransactionCommitReply(transaction.id, 0, 0, uint64(post.Size), sequence, post, applyErr)
+			response := fskitWriteCommitReply(transaction.id, 0, 0, uint64(post.Size), sequence, post, applyErr)
 			response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 			h.deferStorageFailure(response, applyErr)
 			return response, []volumeserver.VisibilityTarget{
@@ -1092,7 +1092,7 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 			// committed result.
 			applyErr = nil
 		}
-		response := writeTransactionCommitReply(transaction.id, committed, assigned, uint64(post.Size), sequence, post, applyErr)
+		response := fskitWriteCommitReply(transaction.id, committed, assigned, uint64(post.Size), sequence, post, applyErr)
 		response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 		if applyErr != nil {
 			h.deferStorageFailure(response, applyErr)
@@ -1108,24 +1108,26 @@ func (h *VolumeHandler) commitWriteTransaction(ctx context.Context, request *aut
 	return response
 }
 
-func (h *VolumeHandler) writeTransactionGate(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) (volumeserver.SourcePublicationGate, xfsstore.ObjectCoordinate, error) {
-	resources, err := h.writeTransactionResources(id)
+func (h *VolumeHandler) fskitWriteGate(id volumeserver.SessionID, body *authoritypb.FskitWriteRequest) (volumeserver.SourcePublicationGate, xfsstore.ObjectCoordinate, error) {
+	resources, err := h.fskitWriteResources(id)
 	if err != nil {
 		return volumeserver.SourcePublicationGate{}, xfsstore.ObjectCoordinate{}, err
 	}
-	metadata, err := writeTransactionMetadataFromRequest(body)
+	metadata, err := fskitWriteMetadataFromRequest(body)
 	if err != nil {
 		return volumeserver.SourcePublicationGate{}, xfsstore.ObjectCoordinate{}, err
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
-	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
+	if transaction == nil || !sameFskitWriteMetadata(transaction.metadata, metadata) {
 		if transaction != nil {
 			transaction.refs.Done()
 		}
 		return volumeserver.SourcePublicationGate{}, xfsstore.ObjectCoordinate{}, volumeserver.ErrRequestMismatch
 	}
 	transaction.mu.Lock()
-	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionStaging || transaction.staged != body.GetFragmentOffset() {
+	if !fskitWriteRegistered(resources, transaction) ||
+		(transaction.state != fskitWriteStaging && transaction.state != fskitWriteCommitting) ||
+		transaction.staged != body.GetFragmentOffset() {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
 		return volumeserver.SourcePublicationGate{}, xfsstore.ObjectCoordinate{}, volumeserver.ErrRequestMismatch
@@ -1138,62 +1140,62 @@ func (h *VolumeHandler) writeTransactionGate(id volumeserver.SessionID, body *au
 	return gate, coordinate, nil
 }
 
-func (h *VolumeHandler) rejectedWriteTransactionTerminal(request *authoritypb.Request, id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) (*authoritypb.Response, bool, error) {
-	resources, err := h.writeTransactionResources(id)
+func (h *VolumeHandler) rejectedFskitWriteTerminal(request *authoritypb.Request, id volumeserver.SessionID, body *authoritypb.FskitWriteRequest) (*authoritypb.Response, bool, error) {
+	resources, err := h.fskitWriteResources(id)
 	if err != nil {
 		return nil, false, err
 	}
-	metadata, fingerprint, err := h.writeTransactionForPhase(request, body)
+	metadata, fingerprint, err := h.fskitWriteForPhase(request, body)
 	if err != nil {
 		return nil, false, err
 	}
-	resources.writeMu.Lock()
-	terminal := resources.writeTerminal
+	resources.fskitWriteMu.Lock()
+	terminal := resources.fskitWriteTerminal
 	if terminal == nil || terminal.id != body.GetTransactionId() {
-		resources.writeMu.Unlock()
+		resources.fskitWriteMu.Unlock()
 		return nil, false, nil
 	}
-	matched := terminal.kind == writeTransactionTerminalRejected && terminal.err != nil &&
+	matched := terminal.kind == fskitWriteTerminalRejected && terminal.err != nil &&
 		terminal.commitFingerprint != (volumeserver.RequestFingerprint{}) && terminal.commitFingerprint == fingerprint &&
-		sameWriteTransactionMetadata(terminal.metadata, metadata) && terminal.staged == body.GetFragmentOffset()
+		sameFskitWriteMetadata(terminal.metadata, metadata) && terminal.staged == body.GetFragmentOffset()
 	terminalErr := terminal.err
-	resources.writeMu.Unlock()
+	resources.fskitWriteMu.Unlock()
 	if !matched {
-		return nil, false, h.fenceWriteTransactionMismatch(id)
+		return nil, false, h.fenceFskitWriteMismatch(id)
 	}
-	return writeTransactionRejection(wireErrno(terminalErr), body.GetTransactionId(), false), true, nil
+	return fskitWriteRejection(wireErrno(terminalErr), body.GetTransactionId(), false), true, nil
 }
 
-func (h *VolumeHandler) markWriteTransactionCommitting(id volumeserver.SessionID, request *authoritypb.Request, body *authoritypb.WriteTransactionRequest) (*writeTransactionCommitOwner, error) {
-	resources, err := h.writeTransactionResources(id)
+func (h *VolumeHandler) markFskitWriteCommitting(id volumeserver.SessionID, request *authoritypb.Request, body *authoritypb.FskitWriteRequest) (*fskitWriteCommitOwner, error) {
+	resources, err := h.fskitWriteResources(id)
 	if err != nil {
 		return nil, err
 	}
-	metadata, fingerprint, err := h.writeTransactionForPhase(request, body)
+	metadata, fingerprint, err := h.fskitWriteForPhase(request, body)
 	if err != nil {
 		return nil, err
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
-	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
+	if transaction == nil || !sameFskitWriteMetadata(transaction.metadata, metadata) {
 		if transaction != nil {
 			transaction.refs.Done()
 		}
-		return nil, h.fenceWriteTransactionMismatch(id)
+		return nil, h.fenceFskitWriteMismatch(id)
 	}
 	transaction.mu.Lock()
-	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionStaging || transaction.staged != body.GetFragmentOffset() {
+	if !fskitWriteRegistered(resources, transaction) || transaction.state != fskitWriteStaging || transaction.staged != body.GetFragmentOffset() {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
-		return nil, h.fenceWriteTransactionMismatch(id)
+		return nil, h.fenceFskitWriteMismatch(id)
 	}
 	// While this owner is live the transaction cannot be swept or aborted. A
 	// terminal outcome consumes it through the replay slot. The one nonterminal
 	// outcome is a Linux item-only visibility handoff:
-	// resetWriteTransactionForRetry returns these inert staged bytes to STAGING
+	// resetFskitWriteForRetry returns these inert staged bytes to STAGING
 	// before that classified reply is retained, so the frontend can retry COMMIT
 	// with a fresh mutation ID.
-	owner := &writeTransactionCommitOwner{}
-	transaction.state = writeTransactionCommitting
+	owner := &fskitWriteCommitOwner{}
+	transaction.state = fskitWriteCommitting
 	transaction.commitFingerprint = fingerprint
 	transaction.commitOwner = owner
 	transaction.mu.Unlock()
@@ -1201,60 +1203,60 @@ func (h *VolumeHandler) markWriteTransactionCommitting(id volumeserver.SessionID
 	return owner, nil
 }
 
-func (h *VolumeHandler) finishWriteTransactionCommit(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest, owner *writeTransactionCommitOwner) {
+func (h *VolumeHandler) finishFskitWriteCommit(id volumeserver.SessionID, body *authoritypb.FskitWriteRequest, owner *fskitWriteCommitOwner) {
 	if owner == nil {
 		return
 	}
-	resources, err := h.writeTransactionResources(id)
+	resources, err := h.fskitWriteResources(id)
 	if err != nil {
 		return
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
 	if transaction == nil {
 		return
 	}
 	transaction.mu.Lock()
-	if writeTransactionRegistered(resources, transaction) && transaction.state == writeTransactionCommitting && transaction.commitOwner == owner {
+	if fskitWriteRegistered(resources, transaction) && transaction.state == fskitWriteCommitting && transaction.commitOwner == owner {
 		transaction.commitOwner = nil
 	}
 	transaction.mu.Unlock()
 	transaction.refs.Done()
 }
 
-// resetWriteTransactionForRetry preserves inert staged bytes across the
+// resetFskitWriteForRetry preserves inert staged bytes across the
 // authority's item-only visibility handoff. No XFS callback ran, so retaining
 // the memfd is both exact and avoids copying the user's write into a second
 // BEGIN/DATA sequence. The transaction's absolute lifetime remains fixed; only
 // its ordinary progress deadline advances, bounded by that limit.
-func (h *VolumeHandler) resetWriteTransactionForRetry(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) error {
-	resources, err := h.writeTransactionResources(id)
+func (h *VolumeHandler) resetFskitWriteForRetry(id volumeserver.SessionID, body *authoritypb.FskitWriteRequest) error {
+	resources, err := h.fskitWriteResources(id)
 	if err != nil {
 		return err
 	}
-	metadata, err := writeTransactionMetadataFromRequest(body)
+	metadata, err := fskitWriteMetadataFromRequest(body)
 	if err != nil {
 		return err
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
-	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
+	if transaction == nil || !sameFskitWriteMetadata(transaction.metadata, metadata) {
 		if transaction != nil {
 			transaction.refs.Done()
 		}
-		return h.fenceWriteTransactionMismatch(id)
+		return h.fenceFskitWriteMismatch(id)
 	}
 	transaction.mu.Lock()
-	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionCommitting ||
+	if !fskitWriteRegistered(resources, transaction) || transaction.state != fskitWriteCommitting ||
 		transaction.staged != body.GetFragmentOffset() {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
-		return h.fenceWriteTransactionMismatch(id)
+		return h.fenceFskitWriteMismatch(id)
 	}
 	now := time.Now()
-	progress := now.Add(h.WriteTransactionProgressTimeout)
+	progress := now.Add(h.FskitWriteProgressTimeout)
 	if progress.After(transaction.absoluteDeadline) {
 		progress = transaction.absoluteDeadline
 	}
-	transaction.state = writeTransactionStaging
+	transaction.state = fskitWriteStaging
 	transaction.commitFingerprint = volumeserver.RequestFingerprint{}
 	transaction.commitOwner = nil
 	transaction.progressDeadline = progress
@@ -1263,107 +1265,107 @@ func (h *VolumeHandler) resetWriteTransactionForRetry(id volumeserver.SessionID,
 	return nil
 }
 
-// rejectPendingWriteTransaction consumes a COMMIT that entered the exact
+// rejectPendingFskitWrite consumes a COMMIT that entered the exact
 // replay/source-gate state but was refused before storage apply. It returns a
 // structured REJECTED result so the patched kernel can prove no bytes landed,
 // discard its staged syscall, and avoid treating an ordinary admission error
 // as an ambiguous transport failure.
-func (h *VolumeHandler) rejectPendingWriteTransaction(id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest, cause error) *authoritypb.Response {
-	resources, err := h.writeTransactionResources(id)
+func (h *VolumeHandler) rejectPendingFskitWrite(id volumeserver.SessionID, body *authoritypb.FskitWriteRequest, cause error) *authoritypb.Response {
+	resources, err := h.fskitWriteResources(id)
 	if err != nil {
 		return nil
 	}
-	metadata, err := writeTransactionMetadataFromRequest(body)
+	metadata, err := fskitWriteMetadataFromRequest(body)
 	if err != nil {
 		return nil
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
-	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
+	if transaction == nil || !sameFskitWriteMetadata(transaction.metadata, metadata) {
 		if transaction != nil {
 			transaction.refs.Done()
 		}
 		return nil
 	}
 	transaction.mu.Lock()
-	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionCommitting {
+	if !fskitWriteRegistered(resources, transaction) || transaction.state != fskitWriteCommitting {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
 		return nil
 	}
-	resources.writeMu.Lock()
-	cleanup := h.removeWriteTransactionLocked(resources, transaction, writeTransactionTerminalRejected, cause)
-	resources.writeMu.Unlock()
+	resources.fskitWriteMu.Lock()
+	cleanup := h.removeFskitWriteLocked(resources, transaction, fskitWriteTerminalRejected, cause)
+	resources.fskitWriteMu.Unlock()
 	transaction.mu.Unlock()
 	transaction.refs.Done()
 	cleanup.finish()
-	return writeTransactionRejection(wireErrno(cause), body.GetTransactionId(), false)
+	return fskitWriteRejection(wireErrno(cause), body.GetTransactionId(), false)
 }
 
-// rejectUnadmittedWriteTransaction consumes a COMMIT whose replay-cache
+// rejectUnadmittedFskitWrite consumes a COMMIT whose replay-cache
 // reservation was refused before the mutation callback ran. The cache is a
 // memory bound, so ENOMEM is the definite syscall result; a generic outer
 // admission error would make Linux treat a known no-apply result as ambiguous.
-func (h *VolumeHandler) rejectUnadmittedWriteTransaction(request *authoritypb.Request, id volumeserver.SessionID, body *authoritypb.WriteTransactionRequest) *authoritypb.Response {
-	if terminal, found, err := h.rejectedWriteTransactionTerminal(request, id, body); err != nil {
+func (h *VolumeHandler) rejectUnadmittedFskitWrite(request *authoritypb.Request, id volumeserver.SessionID, body *authoritypb.FskitWriteRequest) *authoritypb.Response {
+	if terminal, found, err := h.rejectedFskitWriteTerminal(request, id, body); err != nil {
 		return h.errorResponse(0, err, false)
 	} else if found {
 		return terminal
 	}
-	resources, err := h.writeTransactionResources(id)
+	resources, err := h.fskitWriteResources(id)
 	if err != nil {
 		return h.errorResponse(0, err, false)
 	}
-	metadata, fingerprint, err := h.writeTransactionForPhase(request, body)
+	metadata, fingerprint, err := h.fskitWriteForPhase(request, body)
 	if err != nil {
 		return h.errorResponse(0, err, false)
 	}
-	declaredGate, err := decodeSourcePublicationGate(request)
+	declaredGate, err := decodeFskitSourcePublication(request)
 	if err != nil || declaredGate == nil {
 		return h.errorResponse(0, syscall.EINVAL, false)
 	}
-	transaction := acquireWriteTransaction(resources, body.GetTransactionId())
-	if transaction == nil || !sameWriteTransactionMetadata(transaction.metadata, metadata) {
+	transaction := acquireFskitWrite(resources, body.GetTransactionId())
+	if transaction == nil || !sameFskitWriteMetadata(transaction.metadata, metadata) {
 		if transaction != nil {
 			transaction.refs.Done()
 		}
-		return h.errorResponse(0, h.fenceWriteTransactionMismatch(id), false)
+		return h.errorResponse(0, h.fenceFskitWriteMismatch(id), false)
 	}
 	transaction.mu.Lock()
 	builder := sourceGateBuilder{}
 	builder.addItem(transaction.coordinate.Stable, true, true)
 	expectedGate := builder.finish()
-	if !writeTransactionRegistered(resources, transaction) || transaction.state != writeTransactionStaging ||
+	if !fskitWriteRegistered(resources, transaction) || transaction.state != fskitWriteStaging ||
 		transaction.staged != body.GetFragmentOffset() || !sourcePublicationGatesEqual(declaredGate, &expectedGate) {
 		transaction.mu.Unlock()
 		transaction.refs.Done()
-		return h.errorResponse(0, h.fenceWriteTransactionMismatch(id), false)
+		return h.errorResponse(0, h.fenceFskitWriteMismatch(id), false)
 	}
-	transaction.state = writeTransactionRejected
+	transaction.state = fskitWriteRejected
 	transaction.initErr = syscall.ENOMEM
 	transaction.commitFingerprint = fingerprint
-	resources.writeMu.Lock()
-	cleanup := h.removeWriteTransactionLocked(resources, transaction, writeTransactionTerminalRejected, syscall.ENOMEM)
-	resources.writeMu.Unlock()
+	resources.fskitWriteMu.Lock()
+	cleanup := h.removeFskitWriteLocked(resources, transaction, fskitWriteTerminalRejected, syscall.ENOMEM)
+	resources.fskitWriteMu.Unlock()
 	transaction.mu.Unlock()
 	transaction.refs.Done()
 	cleanup.finish()
-	return writeTransactionRejection(int32(syscall.ENOMEM), body.GetTransactionId(), false)
+	return fskitWriteRejection(int32(syscall.ENOMEM), body.GetTransactionId(), false)
 }
 
-// markWriteTransactionPostApplyFailure preserves the exact committed prefix
+// markFskitWritePostApplyFailure preserves the exact committed prefix
 // when visibility completion fails after XFS apply. The source kernel must
 // install and publish that result before receiving the failure; returning a
 // generic outer error would erase the only safe offset/size truth and invite a
 // duplicate append on retry.
-func markWriteTransactionPostApplyFailure(response *authoritypb.Response, cause error) bool {
+func markFskitWritePostApplyFailure(response *authoritypb.Response, cause error) bool {
 	if response == nil || cause == nil {
 		return false
 	}
-	reply := response.GetWriteTransaction()
-	if reply == nil || reply.GetFlags()&writeTransactionReplyCommitted == 0 {
+	reply := response.GetFskitWrite()
+	if reply == nil || reply.GetFlags()&fskitWriteReplyCommitted == 0 {
 		return false
 	}
-	reply.Flags |= writeTransactionReplyPostApply
+	reply.Flags |= fskitWriteReplyPostApply
 	reply.Error = -wireErrno(cause)
 	if reply.Error >= 0 {
 		reply.Error = -int32(syscall.EIO)
@@ -1373,10 +1375,10 @@ func markWriteTransactionPostApplyFailure(response *authoritypb.Response, cause 
 	return true
 }
 
-// SweepWriteTransactions releases inert staging and abandoned COMMIT attempts.
+// SweepFskitWrites releases inert staging and abandoned COMMIT attempts.
 // CommitWrite removes the transaction before releasing its handler ownership,
 // so a registered COMMITTING transaction with no owner is definitely pre-apply.
-func (h *VolumeHandler) SweepWriteTransactions(now time.Time) {
+func (h *VolumeHandler) SweepFskitWrites(now time.Time) {
 	if h == nil || now.IsZero() {
 		return
 	}
@@ -1387,34 +1389,34 @@ func (h *VolumeHandler) SweepWriteTransactions(now time.Time) {
 	}
 	h.resourcesMu.Unlock()
 	for _, resource := range resources {
-		resource.writeMu.Lock()
-		transactions := make([]*writeTransaction, 0, len(resource.writeTransactions))
-		for _, transaction := range resource.writeTransactions {
+		resource.fskitWriteMu.Lock()
+		transactions := make([]*fskitWrite, 0, len(resource.fskitWrites))
+		for _, transaction := range resource.fskitWrites {
 			transaction.refs.Add(1)
 			transactions = append(transactions, transaction)
 		}
-		resource.writeMu.Unlock()
+		resource.fskitWriteMu.Unlock()
 		for _, transaction := range transactions {
 			// Wait outside the ledger for active work to publish its new progress
 			// deadline. This prevents timeout cleanup from closing a live WriteAt,
 			// while the session registry and every unrelated transaction remain
 			// available throughout the wait.
 			transaction.mu.Lock()
-			var cleanup writeTransactionCleanup
-			if writeTransactionRegistered(resource, transaction) {
+			var cleanup fskitWriteCleanup
+			if fskitWriteRegistered(resource, transaction) {
 				switch {
-				case transaction.state == writeTransactionStaging &&
+				case transaction.state == fskitWriteStaging &&
 					(!now.Before(transaction.progressDeadline) || !now.Before(transaction.absoluteDeadline)):
-					resource.writeMu.Lock()
-					cleanup = h.removeWriteTransactionLocked(resource, transaction, writeTransactionTerminalAborted, nil)
-					resource.writeMu.Unlock()
-				case transaction.state == writeTransactionCommitting && transaction.commitOwner == nil &&
+					resource.fskitWriteMu.Lock()
+					cleanup = h.removeFskitWriteLocked(resource, transaction, fskitWriteTerminalAborted, nil)
+					resource.fskitWriteMu.Unlock()
+				case transaction.state == fskitWriteCommitting && transaction.commitOwner == nil &&
 					!now.Before(transaction.absoluteDeadline):
-					transaction.state = writeTransactionRejected
+					transaction.state = fskitWriteRejected
 					transaction.initErr = context.DeadlineExceeded
-					resource.writeMu.Lock()
-					cleanup = h.removeWriteTransactionLocked(resource, transaction, writeTransactionTerminalRejected, context.DeadlineExceeded)
-					resource.writeMu.Unlock()
+					resource.fskitWriteMu.Lock()
+					cleanup = h.removeFskitWriteLocked(resource, transaction, fskitWriteTerminalRejected, context.DeadlineExceeded)
+					resource.fskitWriteMu.Unlock()
 				}
 			}
 			transaction.mu.Unlock()
@@ -1424,21 +1426,21 @@ func (h *VolumeHandler) SweepWriteTransactions(now time.Time) {
 	}
 }
 
-func closeWriteTransactions(h *VolumeHandler, resources *sessionResources) []writeTransactionCleanup {
+func closeFskitWrites(h *VolumeHandler, resources *sessionResources) []fskitWriteCleanup {
 	if h == nil || resources == nil {
 		return nil
 	}
-	resources.writeMu.Lock()
-	defer resources.writeMu.Unlock()
-	cleanup := make([]writeTransactionCleanup, 0, len(resources.writeTransactions))
-	for id, transaction := range resources.writeTransactions {
+	resources.fskitWriteMu.Lock()
+	defer resources.fskitWriteMu.Unlock()
+	cleanup := make([]fskitWriteCleanup, 0, len(resources.fskitWrites))
+	for id, transaction := range resources.fskitWrites {
 		// Session teardown makes the whole ledger unreachable and discards its
 		// tombstone. Do not read phase-owned fields without transaction.mu merely
 		// to construct a terminal value that is cleared below.
-		delete(resources.writeTransactions, id)
-		cleanup = append(cleanup, writeTransactionCleanup{handler: h, resources: resources, transaction: transaction})
+		delete(resources.fskitWrites, id)
+		cleanup = append(cleanup, fskitWriteCleanup{handler: h, resources: resources, transaction: transaction})
 	}
-	resources.writeTransactions = nil
-	resources.writeTerminal = nil
+	resources.fskitWrites = nil
+	resources.fskitWriteTerminal = nil
 	return cleanup
 }

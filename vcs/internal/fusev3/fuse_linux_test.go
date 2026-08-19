@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,9 +19,50 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
+
+func testIdentity(inode uint64) []byte {
+	identity := make([]byte, 16)
+	binary.BigEndian.PutUint32(identity[0:4], 0x81)
+	binary.BigEndian.PutUint64(identity[4:12], inode^0xa5a5_a5a5_a5a5_a5a5)
+	binary.BigEndian.PutUint32(identity[12:16], 0x0badf00d)
+	return identity
+}
+
+func testMutationPostState(attr *authoritypb.Attr) *authoritypb.PostState {
+	return &authoritypb.PostState{VisibilitySequence: 2, SnapshotSequence: 2, Objects: []*authoritypb.ObjectPostState{{
+		StableIdentity: testIdentity(attr.GetInode()), ObjectVersion: 2, Attr: attr, Roles: postStateRoleTarget,
+	}}}
+}
+
+func exactTestPostState(sequence uint64, objects ...struct {
+	item  *authoritypb.Item
+	roles uint32
+}) *authoritypb.PostState {
+	state := &authoritypb.PostState{VisibilitySequence: sequence, SnapshotSequence: sequence}
+	merged := make(map[string]*authoritypb.ObjectPostState, len(objects))
+	for _, object := range objects {
+		key := string(object.item.GetStableIdentity())
+		if existing := merged[key]; existing != nil {
+			existing.Roles |= object.roles
+			continue
+		}
+		attr := *object.item.GetAttr()
+		entry := &authoritypb.ObjectPostState{
+			StableIdentity: append([]byte(nil), object.item.GetStableIdentity()...),
+			ObjectVersion:  sequence, Attr: &attr, Roles: object.roles,
+		}
+		merged[key] = entry
+		state.Objects = append(state.Objects, entry)
+	}
+	sort.Slice(state.Objects, func(i, j int) bool {
+		return string(state.Objects[i].GetStableIdentity()) < string(state.Objects[j].GetStableIdentity())
+	})
+	return state
+}
 
 // fakeRPC is a programmable stand-in for the authority. It answers every
 // request shape the frontend issues, so the real mount path -- including
@@ -28,24 +70,23 @@ import (
 type fakeRPC struct {
 	mu sync.Mutex
 
-	writeTransactions []*authoritypb.WriteTransactionRequest
-	oneShotWrites     []*authoritypb.OneShotWriteRequest
-	oneShotRequests   []*authoritypb.Request
-	setattrs          []*authoritypb.SetAttrRequest
-	flushes           []*authoritypb.FlushRequest
-	fsyncs            []*authoritypb.FsyncRequest
-	syncFS            int
-	fileCloses        []*authoritypb.CloseRequest
-	readdirs          []*authoritypb.ReadDirRequest
-	reclaims          [][]byte
-	keepAlives        int
-	reads             int
-	readSequence      uint64
-	calls             int
-	assignments       int
-	mutationCalls     int
-	closes            int
-	canceled          int
+	writes        []*authoritypb.WriteRequest
+	writeRequests []*authoritypb.Request
+	setattrs      []*authoritypb.SetAttrRequest
+	flushes       []*authoritypb.FlushRequest
+	fsyncs        []*authoritypb.FsyncRequest
+	syncFS        int
+	fileCloses    []*authoritypb.CloseRequest
+	readdirs      []*authoritypb.ReadDirRequest
+	reclaims      [][]byte
+	keepAlives    int
+	reads         int
+	readSequence  uint64
+	calls         int
+	assignments   int
+	mutationCalls int
+	closes        int
+	canceled      int
 
 	closeFailure   syscall.Errno
 	mkdirFailure   syscall.Errno
@@ -68,33 +109,22 @@ type fakeRPC struct {
 	// how a negative resolution is made reachable without a kernel. A name is
 	// removed from the set by whatever creates it, so the miss/create/hit
 	// sequence a probing workload performs can be replayed exactly.
-	missingNames        map[string]bool
-	handle              []byte
-	maxRead             uint32
-	maxWrite            uint32
-	maxWriteTransaction uint64
-	lease               time.Duration
-	done                chan struct{}
+	missingNames map[string]bool
+	handle       []byte
+	maxRead      uint32
+	maxWrite     uint32
+	lease        time.Duration
+	leaseEpoch   uint64
+	leaseIssued  uint64
+	sourceAcks   []uint64
+	done         chan struct{}
 
 	dirPages     []*authoritypb.ReadDirReply
 	dirPageIndex int
 
-	// The strict cache contract. events is the programmed visibility stream;
-	// acked records every cursor the frontend acknowledged, which is what the
-	// liveness assertions read.
-	session        []byte
-	initial        *authoritypb.VisibilityCursor
-	events         chan *authoritypb.VisibilityEvent
-	acked          []*authoritypb.VisibilityCursor
-	blocked        []*authoritypb.VisibilityCursor
-	blockedParents [][]uint64
-	blockedErr     error
-	// onBlocked models the authority's nonterminal cycle break: it refuses the
-	// queued overlapping mutation before returning success to the report.
-	onBlocked     func()
-	detachProofs  []MountAbsenceProof
-	detachErr     error
-	visibilityErr error
+	session      []byte
+	detachProofs []MountAbsenceProof
+	detachErr    error
 	// mutationStates are attached, in order, to successful mutation responses.
 	// afterMutation runs after the envelope has been attached but before the
 	// response is returned to the frontend, allowing ordering tests to place a
@@ -116,29 +146,64 @@ type fakeRPC struct {
 
 func newFakeRPC() *fakeRPC {
 	return &fakeRPC{
-		root:                testItem(1, authoritypb.Attr_DIRECTORY, 1),
-		item:                testItem(7, authoritypb.Attr_REGULAR, 7),
-		handle:              testToken(900),
-		maxRead:             64 * 1024,
-		maxWrite:            64 * 1024,
-		maxWriteTransaction: kernelMaxRWCount(),
-		readSequence:        1,
-		lease:               time.Minute,
-		missingNames:        make(map[string]bool),
-		done:                make(chan struct{}),
-		session:             []byte("test-mount-00001"),
+		root:         testItem(1, authoritypb.Attr_DIRECTORY, 1),
+		item:         testItem(7, authoritypb.Attr_REGULAR, 7),
+		handle:       testToken(900),
+		maxRead:      64 * 1024,
+		maxWrite:     64 * 1024,
+		readSequence: 1,
+		lease:        volumeserver.Protocol6MaxLeaseTTL,
+		leaseEpoch:   1,
+		leaseIssued:  1,
+		missingNames: make(map[string]bool),
+		done:         make(chan struct{}),
+		session:      []byte("test-mount-00001"),
 	}
 }
 
 func (f *fakeRPC) Root() *authoritypb.Item            { return cloneItem(f.root) }
 func (f *fakeRPC) IOLimits() (uint32, uint32)         { return f.maxRead, f.maxWrite }
-func (f *fakeRPC) MaxWriteTransactionBytes() uint64   { return f.maxWriteTransaction }
 func (f *fakeRPC) SessionLease() time.Duration        { return f.lease }
 func (f *fakeRPC) SessionDone() <-chan struct{}       { return f.done }
 func (f *fakeRPC) SessionError() error                { return nil }
 func (f *fakeRPC) SessionEndPending() <-chan struct{} { return f.done }
 func (f *fakeRPC) SessionEndCause() error             { return nil }
 func (f *fakeRPC) FinishLocalSessionEnforcement()     {}
+func (f *fakeRPC) InitialLeaseCursor() *authoritypb.LeaseEventCursor {
+	return &authoritypb.LeaseEventCursor{}
+}
+func (f *fakeRPC) NextLeaseEvent(ctx context.Context, _ *authoritypb.LeaseEventCursor) (*authoritypb.LeaseEvent, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (f *fakeRPC) AcknowledgeLeaseEvent(context.Context, *authoritypb.LeaseEventCursor, []*authoritypb.LeaseDischarge) error {
+	return nil
+}
+func (f *fakeRPC) AcknowledgeSourceLeaseDischarge(_ context.Context, sequence uint64) error {
+	f.mu.Lock()
+	f.sourceAcks = append(f.sourceAcks, sequence)
+	f.mu.Unlock()
+	return nil
+}
+func (f *fakeRPC) RenewLeases(_ context.Context, renewals []*authoritypb.LeaseRenewal) (authorityrpc.LeaseRenewalOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	grants := make([]*authoritypb.LeaseGrant, 0, len(renewals))
+	for _, renewal := range renewals {
+		right := authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ
+		switch renewal.GetCoordinate().GetFamily() {
+		case authoritypb.LeaseFamily_LEASE_FAMILY_NAME:
+			right = authoritypb.LeaseRight_LEASE_RIGHT_NAME_READ
+		case authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES:
+			right = authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ
+		case authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION:
+			right = authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ
+		}
+		grants = append(grants, &authoritypb.LeaseGrant{Coordinate: proto.Clone(renewal.GetCoordinate()).(*authoritypb.LeaseCoordinate), Right: right, Epoch: renewal.GetEpoch(), ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued})
+	}
+	timed, err := authorityrpc.TimedLeaseGrants(grants, time.Now())
+	return authorityrpc.LeaseRenewalOutcome{Grants: timed}, err
+}
 
 func (f *fakeRPC) Close() error {
 	f.mu.Lock()
@@ -377,8 +442,19 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}, nil
 	case request.GetOpen() != nil:
 		response := &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: cloneBytes(f.handle)}}}
+		target := f.itemForTokenLocked(request.GetOpen().GetItem())
+		if request.GetOpen().GetFlags().GetRead() && !request.GetOpen().GetFlags().GetWrite() && target != nil {
+			family, right := authoritypb.LeaseFamily_LEASE_FAMILY_DATA, authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ
+			if target.GetAttr().GetKind() == authoritypb.Attr_DIRECTORY {
+				family, right = authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ
+			}
+			response.LeaseGrants = []*authoritypb.LeaseGrant{{
+				Coordinate: &authoritypb.LeaseCoordinate{Family: family, Identity: cloneBytes(target.GetStableIdentity())},
+				Right:      right, Epoch: f.leaseEpoch,
+				ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
+			}}
+		}
 		if request.GetOpen().GetFlags().GetTruncate() {
-			target := f.itemForTokenLocked(request.GetOpen().GetItem())
 			response.PostState = exactTestPostState(2, struct {
 				item  *authoritypb.Item
 				roles uint32
@@ -406,61 +482,34 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		if offset < len(f.fileData) {
 			data = cloneBytes(f.fileData[offset:min(offset+length, len(f.fileData))])
 		}
-		return &authoritypb.Response{Body: &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: data}}}, nil
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: data}},
+			LeaseGrants: []*authoritypb.LeaseGrant{{
+				Coordinate: &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_DATA, Identity: cloneBytes(f.item.GetStableIdentity())},
+				Right:      authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ, Epoch: f.leaseEpoch, ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
+			}},
+		}, nil
 	case request.GetReadDir() != nil:
 		f.readdirs = append(f.readdirs, proto.Clone(request.GetReadDir()).(*authoritypb.ReadDirRequest))
+		enumerationGrants := []*authoritypb.LeaseGrant{{
+			Coordinate: &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, Identity: cloneBytes(f.root.GetStableIdentity())},
+			Right:      authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ, Epoch: f.leaseEpoch, ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
+		}}
 		if f.dirPageIndex >= len(f.dirPages) {
-			return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{Verifier: testToken(5), Eof: true}}}, nil
+			return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{Verifier: testToken(5), Eof: true}}, LeaseGrants: enumerationGrants}, nil
 		}
 		page := f.dirPages[f.dirPageIndex]
 		f.dirPageIndex++
-		return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: proto.Clone(page).(*authoritypb.ReadDirReply)}}, nil
-	case request.GetWriteTransaction() != nil:
-		writeRequest := proto.Clone(request.GetWriteTransaction()).(*authoritypb.WriteTransactionRequest)
-		f.writeTransactions = append(f.writeTransactions, writeRequest)
-		reply := &authoritypb.WriteTransactionReply{TransactionId: writeRequest.GetTransactionId()}
-		switch writeRequest.GetPhase() {
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
-			reply.Flags = fuse.PFS_WRITE_OUT_BEGUN
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
-			reply.Flags = fuse.PFS_WRITE_OUT_STAGED
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
-			reply.Flags = fuse.PFS_WRITE_OUT_ABORTED
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT:
-			reply.Flags = fuse.PFS_WRITE_OUT_COMMITTED
-			reply.CommittedSize = writeRequest.GetFragmentOffset()
-			reply.AssignedOffset = writeRequest.GetPosition()
-			if writeRequest.GetFlags()&uint32(syscall.O_APPEND) != 0 {
-				reply.AssignedOffset = 100
-			}
-			reply.PostSize = 100 + reply.CommittedSize
-			if writeRequest.GetFlags()&uint32(syscall.O_APPEND) == 0 && reply.AssignedOffset+reply.CommittedSize > 100 {
-				reply.PostSize = reply.AssignedOffset + reply.CommittedSize
-			}
-			reply.VisibilitySequence = 17
-		default:
-			return &authoritypb.Response{Errno: int32(syscall.EPROTO)}, nil
-		}
-		response := &authoritypb.Response{Body: &authoritypb.Response_WriteTransaction{WriteTransaction: reply}}
-		if writeRequest.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT {
-			response.PostState = testMutationPostState(&authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(reply.GetPostSize())})
-		}
-		return response, nil
-	case request.GetOneShotWrite() != nil:
-		f.oneShotRequests = append(f.oneShotRequests, proto.Clone(request).(*authoritypb.Request))
-		writeRequest := proto.Clone(request.GetOneShotWrite()).(*authoritypb.OneShotWriteRequest)
-		f.oneShotWrites = append(f.oneShotWrites, writeRequest)
-		assigned := writeRequest.GetPosition()
-		if writeRequest.GetFlags()&uint32(syscall.O_APPEND) != 0 {
-			assigned = 100
-		}
-		postSize := assigned + uint64(writeRequest.GetSize())
+		return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: proto.Clone(page).(*authoritypb.ReadDirReply)}, LeaseGrants: enumerationGrants}, nil
+	case request.GetWrite() != nil:
+		f.writeRequests = append(f.writeRequests, proto.Clone(request).(*authoritypb.Request))
+		writeRequest := proto.Clone(request.GetWrite()).(*authoritypb.WriteRequest)
+		f.writes = append(f.writes, writeRequest)
+		postSize := writeRequest.GetPosition() + uint64(writeRequest.GetSize())
+		postAttr := &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)}
 		return &authoritypb.Response{
-			PostState: testMutationPostState(&authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)}),
-			Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
-				CommittedSize: uint64(writeRequest.GetSize()), AssignedOffset: assigned,
-				PostSize: postSize, VisibilitySequence: 17, Flags: fuse.PFS_WRITE_OUT_COMMITTED,
-			}},
+			PostState: testMutationPostState(postAttr),
+			Body:      &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(writeRequest.GetSize()), PostAttr: postAttr}},
 		}, nil
 	case request.GetSetAttr() != nil:
 		f.setattrs = append(f.setattrs, request.GetSetAttr())
@@ -614,50 +663,13 @@ const (
 	testPublicationOpcode = uint32(1) // FUSE_LOOKUP; only the exact echoed identity matters here.
 )
 
-// completeTestReply models the strict patched-kernel publication handshake for
-// direct RawFileSystem tests. A successful original /dev/fuse write is not the
-// publication boundary: the kernel first performs its VFS postprocessing, then
-// sends PFS_PUBLISH, and only the physical ACK write releases frontend state.
+// completeTestReply models the physical /dev/fuse response edge exposed by the
+// neutral ordered-writer lifecycle.
 func completeTestReply(t *testing.T, raw *rawFileSystem, unique uint64, status fuse.Status) {
 	t.Helper()
-	if !raw.ReplyWriteOrdered(unique) {
-		return
+	if raw.ReplyWriteOrdered(unique) {
+		raw.ReplyWritten(unique, status)
 	}
-	marked := raw.ReplyPublishMarked(unique, testPublicationNodeID, testPublicationOpcode)
-	raw.ReplyWritten(unique, status)
-	if status.Ok() && marked {
-		acknowledgeTestPublication(t, raw, unique)
-	}
-}
-
-func markTestReply(t *testing.T, raw *rawFileSystem, unique uint64) {
-	t.Helper()
-	if !raw.ReplyPublishMarked(unique, testPublicationNodeID, testPublicationOpcode) {
-		t.Fatalf("mark reply %d for publication", unique)
-	}
-}
-
-func acknowledgeTestPublication(t *testing.T, raw *rawFileSystem, unique uint64) {
-	t.Helper()
-	serial := nextTestRequestUnique()
-	publishUnique := uint64(1)<<61 | serial
-	publicationID := serial - 1
-	in := &fuse.PFSPublishIn{
-		InHeader:      fuse.InHeader{Unique: publishUnique},
-		RequestUnique: unique,
-		PublicationID: publicationID,
-		Nodeid:        testPublicationNodeID,
-		Opcode:        testPublicationOpcode,
-	}
-	out := &fuse.PFSPublishOut{}
-	if got := raw.PFSPublish(nil, in, out); !got.Ok() {
-		t.Fatalf("PFS_PUBLISH for reply %d = %v", unique, got)
-	}
-	if out.RequestUnique != in.RequestUnique || out.PublicationID != in.PublicationID ||
-		out.Nodeid != in.Nodeid || out.Opcode != in.Opcode || out.Flags != fuse.PFS_PUBLISH_ACK {
-		t.Fatalf("PFS_PUBLISH ACK for reply %d = %+v", unique, out)
-	}
-	raw.ReplyWritten(publishUnique, fuse.OK)
 }
 
 // testMutationContext models the RawFS ownership which direct node unit tests
@@ -743,7 +755,7 @@ func testToken(id uint64) []byte {
 
 // --- Defect 8: the direct-I/O decision is explicit and asserted -------------
 
-func TestOpenAndCreateAlwaysReturnTheExactCacheablePair(t *testing.T) {
+func TestOpenCacheModeFollowsDataLeaseAndWriteCapability(t *testing.T) {
 	mount, _ := testMount(t, 8)
 	n := testNode(mount)
 	openCtx, finishOpen := testMutationContext(t, mount)
@@ -752,8 +764,14 @@ func TestOpenAndCreateAlwaysReturnTheExactCacheablePair(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("Open errno = %v", errno)
 	}
-	if flags != coherentOpenFlags {
-		t.Fatalf("Open OpenFlags = %#x, want exactly %#x", flags, coherentOpenFlags)
+	if flags != 0 {
+		t.Fatalf("first D-R-backed read-only OPEN flags = %#x, want buffered purge-on-open", flags)
+	}
+	secondCtx, finishSecond := testMutationContext(t, mount)
+	_, secondFlags, errno := n.Open(secondCtx, syscall.O_RDONLY)
+	finishSecond(errno == 0)
+	if errno != 0 || secondFlags != fuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("warm D-R-backed OPEN = (%#x, %v), want KEEP_CACHE", secondFlags, errno)
 	}
 	ctx, finish := testMutationContext(t, mount)
 	_, _, createFlags, errno := n.Create(ctx, "child", syscall.O_RDWR|syscall.O_CREAT, 0o644)
@@ -761,31 +779,17 @@ func TestOpenAndCreateAlwaysReturnTheExactCacheablePair(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("Create errno = %v", errno)
 	}
-	if createFlags != coherentOpenFlags {
-		t.Fatalf("Create OpenFlags = %#x, want exactly %#x", createFlags, coherentOpenFlags)
-	}
-	// The pair is exact in both directions. FOPEN_PFS_SHARED is what routes
-	// writes through the kernel transaction and what makes the kernel refuse
-	// every shared mmap, so it can never be dropped. FOPEN_DIRECT_IO is now
-	// refused by the kernel outright: it would route reads around the page
-	// cache the DATA barrier is written against, and there is no compatibility
-	// mode in which both pairs are accepted.
-	for _, got := range []uint32{flags, createFlags} {
-		if got&fuse.FOPEN_KEEP_CACHE == 0 || got&fuse.FOPEN_PFS_SHARED == 0 {
-			t.Fatalf("authority open flags %#x must be exactly KEEP_CACHE|PFS_SHARED", got)
-		}
-		if got&fuse.FOPEN_DIRECT_IO != 0 {
-			t.Fatalf("authority open flags %#x must never carry FOPEN_DIRECT_IO", got)
-		}
+	if createFlags != fuse.FOPEN_DIRECT_IO {
+		t.Fatalf("Create OpenFlags = %#x, want exactly %#x", createFlags, fuse.FOPEN_DIRECT_IO)
 	}
 }
 
-func TestEveryAuthorityAttrIsExplicitlyShared(t *testing.T) {
+func TestAuthorityAttrsUseOnlyStockFuseFlags(t *testing.T) {
 	for _, kind := range []authoritypb.Attr_Kind{authoritypb.Attr_REGULAR, authoritypb.Attr_DIRECTORY, authoritypb.Attr_SYMLINK} {
 		var out fuse.Attr
 		fillAttr(&authoritypb.Attr{Inode: 7, Kind: kind, Mode: 0o600}, &out, 1, 2)
-		if out.Flags != fuse.FUSE_ATTR_PFS_SHARED {
-			t.Fatalf("%s attr flags = %#x, want exactly PFS_SHARED", kind, out.Flags)
+		if out.Flags != 0 {
+			t.Fatalf("%s attr flags = %#x, want no private classification", kind, out.Flags)
 		}
 	}
 }
@@ -798,13 +802,11 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	if options.ExtraCapabilities&fuse.CAP_DIRECT_IO_ALLOW_MMAP != 0 {
 		t.Fatal("direct-I/O shared-mmap capability must never be requested")
 	}
+	if options.DisabledCapabilities&fuse.CAP_HAS_INODE_DAX == 0 || options.ExtraCapabilities&fuse.CAP_HAS_INODE_DAX != 0 {
+		t.Fatal("inode DAX must be explicitly disabled")
+	}
 	if options.ExtraCapabilities&fuse.CAP_ATOMIC_O_TRUNC == 0 {
 		t.Fatal("atomic open-truncate must be explicitly requested")
-	}
-	if options.ExtraCapabilities&fuse.CAP_PFS_STRICT_COHERENCE == 0 ||
-		options.ExtraCapabilities&fuse.CAP_PFS_CACHED_DATA == 0 ||
-		options.ExtraCapabilities&fuse.CAP_PFS_WRITE_ONESHOT == 0 {
-		t.Fatal("every bit of the indivisible strict-coherence revision must be explicitly requested")
 	}
 	if options.DisabledCapabilities&fuse.CAP_AUTO_INVAL_DATA == 0 || !options.ExplicitDataCacheControl {
 		t.Fatal("a retained page cache must be withdrawn by this mount's own repair, never by an mtime heuristic")
@@ -822,7 +824,7 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	// The read-ahead window is paired with the authority read bound: reads are
 	// now served from the page cache, so the window is what decides how many
 	// authority round trips a sequential reader pays.
-	if !options.EnableLocks || options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
+	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
 		t.Fatalf("mount options = %#v", options)
 	}
 	foundDefaultPermissions := false
@@ -841,6 +843,11 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 		t.Fatal("a mount that permits shared mmap must be refused")
 	}
 	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
+	tampered.DisabledCapabilities &^= fuse.CAP_HAS_INODE_DAX
+	if err := verifyMountDecisions(tampered); err == nil {
+		t.Fatal("a mount that permits inode DAX must be refused")
+	}
+	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.EnableLocks = false
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a mount that does not forward locks must be refused")
@@ -853,16 +860,6 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	tampered.ExtraCapabilities |= fuse.CAP_HAS_RESEND
 	if err := verifyMountDecisions(tampered); err == nil {
 		t.Fatal("a strict mount that requests HAS_RESEND must be refused")
-	}
-	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
-	tampered.ExtraCapabilities &^= fuse.CAP_PFS_CACHED_DATA
-	if err := verifyMountDecisions(tampered); err == nil {
-		t.Fatal("a mount that requests only half the private profile must be refused")
-	}
-	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
-	tampered.ExtraCapabilities &^= fuse.CAP_PFS_WRITE_ONESHOT
-	if err := verifyMountDecisions(tampered); err == nil {
-		t.Fatal("a mount that omits the one-shot write revision must be refused")
 	}
 	tampered = mountOptions(testConfig(8), 128*1024, 64*1024)
 	tampered.ExplicitDataCacheControl = false
@@ -907,16 +904,22 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 		in.Major, in.Minor = 7, 42
 		return in
 	}
-	required := uint64(fuse.CAP_POSIX_LOCKS | fuse.CAP_FLOCK_LOCKS | fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_HANDLE_KILLPRIV_V2 |
-		fuse.CAP_PFS_STRICT_COHERENCE | fuse.CAP_PFS_CACHED_DATA | fuse.CAP_PFS_WRITE_ONESHOT | fuse.CAP_EXPLICIT_INVAL_DATA)
+	required := uint64(fuse.CAP_POSIX_LOCKS | fuse.CAP_FLOCK_LOCKS | fuse.CAP_ATOMIC_O_TRUNC | fuse.CAP_EXPLICIT_INVAL_DATA)
 	if err := verifyKernelGuarantees(notifying(settings(required)), 64*1024); err != nil {
 		t.Fatalf("a lock-forwarding kernel was refused: %v", err)
 	}
-	for _, version := range []struct{ major, minor uint32 }{{7, 28}, {7, 36}, {7, 40}, {7, 41}, {8, 42}} {
+	for _, version := range []struct{ major, minor uint32 }{{7, 28}, {7, 30}, {8, 42}} {
 		in := settings(required)
 		in.Major, in.Minor = version.major, version.minor
 		if err := verifyKernelGuarantees(in, 64*1024); err == nil {
-			t.Fatalf("unpinned FUSE protocol %d.%d was accepted", version.major, version.minor)
+			t.Fatalf("unsupported FUSE protocol %d.%d was accepted", version.major, version.minor)
+		}
+	}
+	for _, minor := range []uint32{31, 36, 42} {
+		in := settings(required)
+		in.Major, in.Minor = 7, minor
+		if err := verifyKernelGuarantees(in, 64*1024); err != nil {
+			t.Fatalf("stock FUSE protocol 7.%d was refused: %v", minor, err)
 		}
 	}
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_FLOCK_LOCKS)), 64*1024); err == nil {
@@ -928,24 +931,11 @@ func TestKernelGuaranteesRequireForwardedLocksAndRequestSize(t *testing.T) {
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_ATOMIC_O_TRUNC)), 64*1024); err == nil {
 		t.Fatal("a kernel without CAP_ATOMIC_O_TRUNC must be refused")
 	}
-	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_STRICT_COHERENCE)), 64*1024); err == nil {
-		t.Fatal("a kernel without the indivisible PortableFS strict-coherence contract must be refused")
-	}
-	// The private bits are one profile revision. A kernel offering only the
-	// older cached-data subset implements the retired direct-I/O open pair and would reject
-	// this daemon's very first regular OPEN with -EPROTO, so the mismatch has
-	// to be a failed mount rather than an aborted connection under load.
-	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_CACHED_DATA)), 64*1024); err == nil {
-		t.Fatal("a kernel implementing only the pre-cached-data revision of the contract must be refused")
-	}
-	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_PFS_WRITE_ONESHOT)), 64*1024); err == nil {
-		t.Fatal("a kernel implementing only the pre-one-shot revision of the contract must be refused")
-	}
 	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_EXPLICIT_INVAL_DATA)), 64*1024); err == nil {
 		t.Fatal("a kernel that cannot grant explicit data-cache control must be refused; retained pages would be dropped by an mtime heuristic")
 	}
-	if err := verifyKernelGuarantees(notifying(settings(required&^fuse.CAP_HANDLE_KILLPRIV_V2)), 64*1024); err == nil {
-		t.Fatal("a kernel without HANDLE_KILLPRIV_V2 must be refused")
+	if err := verifyKernelGuarantees(notifying(settings(required|fuse.CAP_HANDLE_KILLPRIV_V2)), 64*1024); err != nil {
+		t.Fatalf("optional HANDLE_KILLPRIV_V2 was refused: %v", err)
 	}
 	for _, offeredOptional := range []uint64{fuse.CAP_HAS_RESEND, fuse.CAP_PASSTHROUGH, fuse.CAP_NO_OPEN_SUPPORT, fuse.CAP_NO_OPENDIR_SUPPORT, fuse.CAP_DIRECT_IO_ALLOW_MMAP} {
 		if err := verifyKernelGuarantees(notifying(settings(required|offeredOptional)), 64*1024); err != nil {
@@ -1203,8 +1193,8 @@ func TestGenericTerminalCauseCannotMaskAnExistingRouteCause(t *testing.T) {
 func TestLivenessAndCleanupLanesAreReserved(t *testing.T) {
 	cfg := testConfig(8)
 	mount, rpc := testMount(t, 8)
-	if cap(mount.bulk)+mount.reclaimWorkers+livenessReserve+visibilityReserve != cfg.MaxInFlight {
-		t.Fatalf("bulk %d + cleanup %d + liveness %d + visibility %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, livenessReserve, visibilityReserve, cfg.MaxInFlight)
+	if cap(mount.bulk)+mount.reclaimWorkers+livenessReserve+leaseControlReserve != cfg.MaxInFlight {
+		t.Fatalf("bulk %d + cleanup %d + liveness %d + lease control %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, livenessReserve, leaseControlReserve, cfg.MaxInFlight)
 	}
 	for range cap(mount.bulk) {
 		mount.bulk <- struct{}{}
@@ -1277,12 +1267,58 @@ func TestReleaseDirSurfacesARefusedClose(t *testing.T) {
 func TestOpendirRejectsMalformedOpenReply(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	rpc.handle = nil
-	if _, _, errno := testNode(mount).OpendirHandle(context.Background(), syscall.O_RDONLY); errno != syscall.EIO {
+	ctx, finish := testMutationContext(t, mount)
+	_, _, errno := testNode(mount).OpendirHandle(ctx, syscall.O_RDONLY)
+	finish(false)
+	if errno != syscall.EIO {
 		t.Fatalf("OpendirHandle on a malformed reply = %v, want EIO", errno)
 	}
 	rpc.handle = testToken(900)
 	if _, _, errno := testNode(mount).OpendirHandle(context.Background(), syscall.O_WRONLY); errno != syscall.EISDIR {
 		t.Fatalf("writable opendir = %v, want EISDIR", errno)
+	}
+}
+
+func TestOpendirRequiresEnumerationLease(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetOpen() != nil {
+			return &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: testToken(901)}}}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	directory := &node{mount: mount, item: testItem(8, authoritypb.Attr_DIRECTORY, 8), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
+	ctx, finish := testMutationContext(t, mount)
+	_, _, errno := directory.OpendirHandle(ctx, syscall.O_RDONLY)
+	finish(false)
+	if errno != syscall.ENOTCONN || !mount.isRevoked() {
+		t.Fatalf("successful OPENDIR without E lease = (%v, revoked=%t), want terminal ENOTCONN", errno, mount.isRevoked())
+	}
+}
+
+func TestOpendirCapacityRefusalDoesNotPublishAHandle(t *testing.T) {
+	frontend, mount, rpc := testRawFileSystem(t, 8)
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetOpen() != nil {
+			return &authoritypb.Response{Errno: int32(syscall.ENOSPC)}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	out := &fuse.OpenOut{}
+	status := testRawCall(t, frontend, func(unique uint64) fuse.Status {
+		return frontend.OpenDir(nil, &fuse.OpenIn{
+			InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID},
+			Flags:    uint32(syscall.O_RDONLY),
+		}, out)
+	})
+	if status != fuse.Status(syscall.ENOSPC) || out.Fh != 0 {
+		t.Fatalf("capacity-refused OPENDIR = (status %v, fh %d), want (ENOSPC, 0)", status, out.Fh)
+	}
+	frontend.mu.Lock()
+	handles := len(frontend.handles)
+	frontend.mu.Unlock()
+	if handles != 0 || mount.isRevoked() {
+		t.Fatalf("capacity-refused OPENDIR left %d handles (revoked=%t), want no handle and a live mount", handles, mount.isRevoked())
 	}
 }
 
@@ -1432,6 +1468,7 @@ func testDirHandle(t *testing.T, frontend *rawFileSystem, pages ...*authoritypb.
 	}
 	rpc := frontend.mount.rpc.(*fakeRPC)
 	rpc.dirPages = pages
+	rpc.root = cloneItem(record.node.item)
 	id, ok := frontend.addHandle(record, &handleRecord{dir: &dirHandle{node: record.node, token: testToken(100)}})
 	if !ok {
 		t.Fatal("add directory handle")
@@ -1458,7 +1495,7 @@ func readDirOnce(t *testing.T, frontend *rawFileSystem, id, offset uint64, entri
 func TestDirHandleBuffersOneAuthorityPageAcrossEntries(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	rpc.dirPages = []*authoritypb.ReadDirReply{testDirPage(4, true, func(index int) []byte { return encodeCookie(uint64(index + 1)) })}
-	handle := &dirHandle{node: testNode(mount), token: testToken(100)}
+	handle := &dirHandle{node: mount.raw.nodesByID[fuse.FUSE_ROOT_ID].node, token: testToken(100)}
 	ctx, finish := testMutationContext(t, mount)
 	defer finish(false)
 	names := []string(nil)
@@ -1580,7 +1617,7 @@ func TestSyncFSUsesOneReplayMutationAndNoPublicationGate(t *testing.T) {
 				f.syncFS, f.calls, f.mutationCalls, f.mutationSeq, f.reads)
 		}
 	})
-	if !frontend.ReplyWriteOrdered(unique) || frontend.ReplyPublishMarked(unique, fuse.FUSE_ROOT_ID, 50) {
+	if !frontend.ReplyWriteOrdered(unique) {
 		t.Fatal("SYNCFS omitted physical reply ordering or created a cache/source publication obligation")
 	}
 	if got := consumption.calls.Load(); got != 0 {
@@ -1609,7 +1646,7 @@ func TestSyncFSPropagatesDefiniteErrorAndRejectsMalformedSuccess(t *testing.T) {
 		}}); status != fuse.EIO || mount.isRevoked() {
 			t.Fatalf("definite SYNCFS error = %v, revoked=%t", status, mount.isRevoked())
 		}
-		if !frontend.ReplyWriteOrdered(unique) || frontend.ReplyPublishMarked(unique, fuse.FUSE_ROOT_ID, 50) {
+		if !frontend.ReplyWriteOrdered(unique) {
 			t.Fatal("definite SYNCFS error omitted physical reply ordering or created publication")
 		}
 		if got := consumption.calls.Load(); got != 0 {
@@ -1636,138 +1673,7 @@ func TestSyncFSPropagatesDefiniteErrorAndRejectsMalformedSuccess(t *testing.T) {
 	})
 }
 
-func TestLinuxFrontendRejectsVisibilityRetryForUngatedMutation(t *testing.T) {
-	frontend, mount, rpc := testRawFileSystem(t, 8)
-	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetSyncFs() == nil {
-			return nil, errors.New("unexpected request in ungated mutation-retry test")
-		}
-		return &authoritypb.Response{
-			Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
-			VisibilityRetrySequence: 1,
-		}, nil
-	}
-	if status := frontend.SyncFS(nil, &fuse.SyncFSIn{InHeader: fuse.InHeader{
-		Unique: nextTestRequestUnique(), NodeId: fuse.FUSE_ROOT_ID,
-	}}); status != fuse.EIO || !mount.isRevoked() {
-		t.Fatalf("ungated mutation retry = %v, revoked=%t fatal=%v", status, mount.isRevoked(), mount.fatalError())
-	}
-}
-
-func TestReadVisibilityRetryRequestAudit(t *testing.T) {
-	tests := []struct {
-		name    string
-		request *authoritypb.Request
-		want    bool
-	}{
-		{name: "getattr", request: &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{}}}, want: true},
-		{name: "read", request: &authoritypb.Request{Body: &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{}}}, want: true},
-		{name: "readlink", request: &authoritypb.Request{Body: &authoritypb.Request_Readlink{Readlink: &authoritypb.ReadlinkRequest{}}}, want: true},
-		{name: "getxattr", request: &authoritypb.Request{Body: &authoritypb.Request_GetXattr{GetXattr: &authoritypb.GetXattrRequest{}}}, want: true},
-		{name: "listxattr", request: &authoritypb.Request{Body: &authoritypb.Request_ListXattr{ListXattr: &authoritypb.ListXattrRequest{}}}, want: true},
-		{name: "lookup uses authority-local reread", request: &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}},
-		{name: "readdir uses authority-local reread", request: &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{}}}},
-		{name: "fsync does not stabilize", request: &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{}}}},
-		{name: "empty request", request: &authoritypb.Request{}},
-		{name: "nil request"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if got := readRequestSupportsVisibilityRetry(test.request); got != test.want {
-				t.Fatalf("readRequestSupportsVisibilityRetry() = %t, want %t", got, test.want)
-			}
-		})
-	}
-}
-
-func TestLinuxFrontendRetriesGetattrVisibilityRaceWithoutLeakingErrno(t *testing.T) {
-	f := newStrictFixture(t)
-	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "read-retry")
-	retryConsumption := newNotifyingResponseConsumption()
-	resultConsumption := &recordingResponseConsumption{}
-	f.rpc.retainedConsumptions = []authorityrpc.ResponseConsumption{retryConsumption, resultConsumption}
-	var calls atomic.Int32
-	repaired := make(chan struct{})
-	go func() {
-		<-retryConsumption.consumed
-		f.raw.mu.Lock()
-		f.raw.completedVisibilitySequence = 17
-		close(repaired)
-		f.raw.signalSourceChangedLocked()
-		f.raw.mu.Unlock()
-	}()
-	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetGetAttr() == nil {
-			return nil, errors.New("unexpected request in read visibility-retry test")
-		}
-		if calls.Add(1) == 1 {
-			return &authoritypb.Response{
-				Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
-				VisibilityRetrySequence: 17,
-			}, nil
-		}
-		select {
-		case <-repaired:
-		default:
-			return nil, errors.New("getattr was reissued before the pending repair completed")
-		}
-		attr := proto.Clone(f.rpc.item.GetAttr()).(*authoritypb.Attr)
-		attr.Size = 4096
-		return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
-			Attr: attr, ObjectVersion: 18, SnapshotSequence: 18,
-		}}}, nil
-	}
-
-	unique := nextTestRequestUnique()
-	out := &fuse.AttrOut{}
-	status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{
-		Unique: unique, NodeId: entry.NodeId,
-	}}, out)
-	if !status.Ok() || status == fuse.Status(syscall.EAGAIN) || f.mount.isRevoked() {
-		t.Fatalf("GETATTR after visibility race = %v, revoked=%t fatal=%v", status, f.mount.isRevoked(), f.mount.fatalError())
-	}
-	if out.Attr.Size != 4096 || calls.Load() != 2 {
-		t.Fatalf("GETATTR after visibility race = size %d, calls %d; want size 4096 after two calls", out.Attr.Size, calls.Load())
-	}
-	if got := retryConsumption.calls.Load(); got != 1 {
-		t.Fatalf("aborted read response consumed %d times, want 1", got)
-	}
-	if got := resultConsumption.calls.Load(); got != 0 {
-		t.Fatalf("successful read response consumed %d times before kernel publication", got)
-	}
-	completeTestReply(t, f.raw, unique, fuse.OK)
-	if got := resultConsumption.calls.Load(); got != 1 {
-		t.Fatalf("successful read response consumed %d times after kernel publication, want 1", got)
-	}
-}
-
-func TestLinuxFrontendReadVisibilityRetryBudgetExhaustionRevokes(t *testing.T) {
-	f := newStrictFixture(t)
-	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "read-retry-timeout")
-	f.mount.repairBudget = 20 * time.Millisecond
-	consumption := &recordingResponseConsumption{}
-	f.rpc.retainedConsumption = consumption
-	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetGetAttr() == nil {
-			return nil, errors.New("unexpected request in read visibility-retry timeout test")
-		}
-		return &authoritypb.Response{
-			Errno: int32(syscall.EINTR), Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
-			VisibilityRetrySequence: 99,
-		}, nil
-	}
-	status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{
-		Unique: nextTestRequestUnique(), NodeId: entry.NodeId,
-	}}, &fuse.AttrOut{})
-	if status != fuse.Status(syscall.ENOTCONN) || status == fuse.Status(syscall.EAGAIN) || !f.mount.isRevoked() {
-		t.Fatalf("GETATTR retry-budget exhaustion = %v, revoked=%t fatal=%v", status, f.mount.isRevoked(), f.mount.fatalError())
-	}
-	if got := consumption.calls.Load(); got != 1 {
-		t.Fatalf("timed-out read retry consumed its response %d times, want 1", got)
-	}
-}
-
-func TestReadOnlyOpenDropsOAppend(t *testing.T) {
+func TestAuthorityAppendOpenFailsClosed(t *testing.T) {
 	flags, errno := protocolOpenFlags(syscall.O_RDONLY | syscall.O_APPEND)
 	if errno != 0 {
 		t.Fatal(errno)
@@ -1775,11 +1681,11 @@ func TestReadOnlyOpenDropsOAppend(t *testing.T) {
 	if flags.GetAppend() {
 		t.Fatal("O_APPEND on a read-only open is legal and ignored on every other Linux filesystem; forwarding it makes the authority reject the open with EINVAL")
 	}
-	if flags, _ := protocolOpenFlags(syscall.O_WRONLY | syscall.O_APPEND); !flags.GetAppend() {
-		t.Fatal("O_APPEND must survive on a writable open")
+	if flags, errno := protocolOpenFlags(syscall.O_WRONLY | syscall.O_APPEND); errno != syscall.EOPNOTSUPP || flags != nil {
+		t.Fatalf("writable O_APPEND = (%+v, %v), want EOPNOTSUPP", flags, errno)
 	}
-	if flags, _ := protocolOpenFlags(syscall.O_RDWR | syscall.O_APPEND); !flags.GetAppend() {
-		t.Fatal("O_APPEND must survive on a read-write open")
+	if flags, errno := protocolOpenFlags(syscall.O_RDWR | syscall.O_APPEND); errno != syscall.EOPNOTSUPP || flags != nil {
+		t.Fatalf("read-write O_APPEND = (%+v, %v), want EOPNOTSUPP", flags, errno)
 	}
 }
 
@@ -2207,63 +2113,9 @@ func TestRefusedReclaimIsTerminal(t *testing.T) {
 	}
 }
 
-// --- the strict cache contract --------------------------------------------
+// --- the lease-backed cache contract --------------------------------------
 
 func (f *fakeRPC) SessionID() []byte { return cloneBytes(f.session) }
-
-func (f *fakeRPC) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
-	if f.initial == nil {
-		return nil
-	}
-	return proto.Clone(f.initial).(*authoritypb.VisibilityCursor)
-}
-
-func (f *fakeRPC) NextVisibility(ctx context.Context, _ *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error) {
-	f.mu.Lock()
-	failure, stream := f.visibilityErr, f.events
-	f.mu.Unlock()
-	if failure != nil {
-		return nil, failure
-	}
-	if stream == nil {
-		<-ctx.Done()
-		return nil, ctx.Err()
-	}
-	select {
-	case event := <-stream:
-		return event, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (f *fakeRPC) AckVisibility(_ context.Context, cursor *authoritypb.VisibilityCursor) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.acked = append(f.acked, proto.Clone(cursor).(*authoritypb.VisibilityCursor))
-	return nil
-}
-
-func (f *fakeRPC) NextVisibilityAfterAck(ctx context.Context, cursor *authoritypb.VisibilityCursor, _ bool) (*authoritypb.VisibilityEvent, error) {
-	if err := f.AckVisibility(ctx, cursor); err != nil {
-		return nil, err
-	}
-	return f.NextVisibility(ctx, cursor)
-}
-
-// ReportVisibilityBlocked records the exact-cycle report and lets a test model
-// the authority's pre-apply interruption before the report returns.
-func (f *fakeRPC) ReportVisibilityBlocked(_ context.Context, cursor *authoritypb.VisibilityCursor, parents []uint64) error {
-	f.mu.Lock()
-	f.blocked = append(f.blocked, proto.Clone(cursor).(*authoritypb.VisibilityCursor))
-	f.blockedParents = append(f.blockedParents, append([]uint64(nil), parents...))
-	err, hook := f.blockedErr, f.onBlocked
-	f.mu.Unlock()
-	if err == nil && hook != nil {
-		hook()
-	}
-	return err
-}
 
 func (f *fakeRPC) DetachAfterUnmount(_ context.Context, proof MountAbsenceProof) error {
 	f.mu.Lock()

@@ -74,7 +74,7 @@ Two honest limits apply to that probe today:
 
 Unit tests and cross-compilation do not exercise `openat2(2)`. The required
 privileged Linux gate does, against real XFS and a real FUSE mount on the exact
-patched Linux 6.12.100 kernel:
+stock kernel interface at FUSE protocol 7.31 or newer:
 
 ```bash
 bash scripts/xfs-fuse-integration.sh

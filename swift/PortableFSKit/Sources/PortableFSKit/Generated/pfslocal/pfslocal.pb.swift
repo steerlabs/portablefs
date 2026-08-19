@@ -77,8 +77,8 @@
 // coordinate to its exact authority post-mutation owner, allowing macOS to
 // inode-attest a new rename/hard-link repair source instead of reusing an old
 // pathname whose authority stability ended at a namespace event.
-// Protocol minor 15 is the coordinated one-version authority-v5 cut. It
-// requires the nested authority contract to be protocol 5, replaces source
+// Protocol minor 15 is the coordinated source-publication cut. The current
+// frontend requires nested authority protocol 6, replaces source
 // PREPARE/COMPLETE with the daemon-owned source-publication gate, and makes the
 // callback's semantic publication verdict explicit. The authority session owns
 // mandatory DATA and CONTROL transports and becomes usable only after its

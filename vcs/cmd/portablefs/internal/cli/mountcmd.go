@@ -327,10 +327,9 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mount", err)
 	}
-	// An ordinary macOS 27 build must reach its native-policy refusal without
-	// touching the protected app-group container. Preserve the older strict
-	// ownership-first ordering for malformed selectors: durable recovery
-	// evidence still takes precedence over an unrelated option typo.
+	// Select the exact extension contract before touching the protected app-group
+	// container. Ordinary macOS 26 and 27 builds use synchronous repair; only a
+	// separately stamped SDK-27 build selects the native actuator.
 	fskitCachePolicy := ""
 	if runtime.GOOS == "darwin" && (o.strategy == "auto" || o.strategy == "fskit") {
 		fskitCachePolicy, err = currentFSKitCachePolicy()

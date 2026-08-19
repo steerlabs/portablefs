@@ -71,15 +71,15 @@ go -C vcs test ./...
 step "go race suite (native)"
 go -C vcs test -race ./...
 
-# The maintained go-fuse fork is a nested module, so `go test ./...` above
-# deliberately does not enter it. Its PortableFS patch surface is the physical
-# reply-publication seam; gate that seam explicitly without depending on a
-# host FUSE mount utility or changing unrelated upstream integration tests.
-step "maintained go-fuse reply-publication seam"
+# The maintained go-fuse fork is a nested module, so the suite above does not
+# enter it. Protocol 6 retains one stock-FUSE-neutral seam: ReplyWriteLifecycle
+# serializes selected physical replies and notifications through writeMu. Gate
+# that ordering hook without running the retired private-ABI tests.
+step "maintained go-fuse reply ordering seam"
 go -C vcs/third_party/go-fuse build ./fuse
 go -C vcs/third_party/go-fuse vet ./fuse
-go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply|LookupCallbackStatus|VariableReplyWithoutPortableFSLifecycle)'
-go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply|LookupCallbackStatus|VariableReplyWithoutPortableFSLifecycle)'
+go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
 
 # 5. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to
@@ -151,7 +151,7 @@ then
   exit 1
 fi
 
-# Protocol 5 has one coherent mount contract. The old non-participant profile
+# Protocol 6 has one coherent lease contract. The old non-participant profile
 # name remains reserved in the source schema (and therefore in generated
 # descriptor bytes), while docs and the changelog may describe its retirement.
 # It must not re-enter executable code, tests, scripts, or configuration.
@@ -169,6 +169,29 @@ if rg --hidden -n \
   -g '!scripts/verify-local.sh'
 then
   echo "retired non-participant coherence profile references found" >&2
+  exit 1
+fi
+
+# Active product material must describe the protocol-6 stock-FUSE architecture.
+# Historical qualification receipts and the retained kernel patch directory are
+# intentionally outside this list: they remain evidence, not a build or runtime
+# dependency. Keeping the input list explicit makes a newly active contract an
+# intentional review event rather than silently granting all docs authority.
+step "active stock-FUSE contract scan"
+if rg -n \
+  -e 'portablefs-authority-v5' \
+  -e 'authority protocol major `5`' \
+  -e '\bCAP_PFS_' \
+  -e '\bFUSE_PFS_' \
+  -e 'exact patched kernel' \
+  -e 'pinned Linux 6\.12\.100' \
+  README.md COMPATIBILITY.md \
+  docs/architecture.md docs/consistency-model.md docs/failure-modes.md \
+  docs/local-dev.md docs/xfs-authority-deployment.md \
+  .github/workflows scripts/coherence-matrix-linux.sh \
+  scripts/xfs-fuse-integration.sh
+then
+  echo "retired private-kernel contract found in active product material" >&2
   exit 1
 fi
 

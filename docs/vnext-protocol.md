@@ -1,8 +1,10 @@
-# PortableFS vNext protocol and private kernel ABI
+# Historical: PortableFS private-kernel vNext specification
 
-Status: implementation specification. This document replaces the protocol-5
-write, mutation-reply, Linux atomic-open, and source-publication shapes. It is
-not a compatibility proposal.
+Status: **retired implementation specification**. It is superseded by
+[PortableFS portable coherence](./portable-coherence.md), which keeps authority
+protocol 6 but replaces this private FUSE 7.42 ABI with stock FUSE 7.31 or
+newer. The contents below remain a historical design record, not a current
+implementation or compatibility proposal.
 
 The words MUST, MUST NOT, REQUIRED, SHALL, SHALL NOT, SHOULD, SHOULD NOT, and
 MAY have their RFC 2119 meanings.

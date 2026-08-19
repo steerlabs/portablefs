@@ -77,7 +77,7 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 	// A shared mapping of a SHARED regular file is refused by the kernel with
 	// exactly ENODEV (fs/fuse/file.c). The reason survived the move to a
 	// retained page cache and got sharper: a writable shared mapping would
-	// dirty folios that never travel the strict write transaction, and a dirty
+	// dirty folios that never travel an authority WRITE RPC, and a dirty
 	// folio is the one thing invalidate_inode_pages2() cannot withdraw, so it
 	// would turn every later DATA repair on the inode into a revocation.
 	// Accepting EINVAL or ENOSYS as well would let an unrelated mmap breakage,
@@ -330,9 +330,9 @@ func TestCreateWithAReadOnlyModeReturnsAWritableHandle(t *testing.T) {
 // offset. Every mutation keeps the file length identical, so no size-derived
 // heuristic can rescue a stale page.
 //
-// Since SHARED regular opens became FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED this is
-// also the load-bearing cached-page test, and the same-length payloads are what
-// make it one. The first read populates mount B's page cache; every later read
+// Read-only opens covered by a D-R lease use FOPEN_KEEP_CACHE, so this is also
+// the load-bearing cached-page test. The same-length payloads are what make it
+// one. The first read populates mount B's page cache; every later read
 // at the same offset is served from that cache unless something withdrew it.
 // Only the ordered DATA publication does -- it invalidates the whole mapping by
 // sequence, never by an EOF delta -- so a kernel that short-circuited the
@@ -841,53 +841,42 @@ func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
 	}
 }
 
-// TestWriteSizeClassesUseExactAuthorityShapes is gated on the pinned kernel.
-// It proves the small-write optimization at the real /dev/fuse boundary and
-// also pins that the transaction ladder owns both byte counts above max_write
-// and iterators which fit that byte bound but exceed one request page vector.
-func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
+// TestStockWriteRequestSplitting is gated on the provider kernel. It proves
+// that ordinary positioned writes are sent as standard FUSE_WRITE requests and
+// that max_write/page-vector boundaries split rather than entering a private
+// transaction protocol.
+func TestStockWriteRequestSplitting(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	path := f.join(0, "write-size-classes")
 	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR, 0o600)
 	defer file.Close()
 
-	countWrite := func(write func() error) (oneShot, transactions int) {
+	countWrite := func(write func() error) int {
 		t.Helper()
-		beforeOneShot := f.counter.count("one-shot-write")
-		beforeTransactions := f.counter.count("write-transaction")
+		before := f.counter.count("write")
 		if err := write(); err != nil {
 			t.Fatal(err)
 		}
-		return f.counter.count("one-shot-write") - beforeOneShot,
-			f.counter.count("write-transaction") - beforeTransactions
+		return f.counter.count("write") - before
 	}
 
 	positioned := bytes.Repeat([]byte{0x31}, 4096)
-	oneShot, transactions := countWrite(func() error {
+	writes := countWrite(func() error {
 		n, err := file.WriteAt(positioned, 0)
 		if err == nil && n != len(positioned) {
 			return io.ErrShortWrite
 		}
 		return err
 	})
-	if oneShot != 1 || transactions != 0 {
-		t.Fatalf("4 KiB positioned write authority shapes = one-shot %d, transaction phases %d, want 1/0", oneShot, transactions)
+	if writes != 1 {
+		t.Fatalf("4 KiB positioned write authority calls = %d, want 1", writes)
 	}
 
-	appendFile := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
-	appendPayload := bytes.Repeat([]byte{0x32}, 4096)
-	oneShot, transactions = countWrite(func() error {
-		n, err := appendFile.Write(appendPayload)
-		if err == nil && n != len(appendPayload) {
-			return io.ErrShortWrite
+	if appendFile, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
+		if err == nil {
+			_ = appendFile.Close()
 		}
-		return err
-	})
-	if err := appendFile.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if oneShot != 1 || transactions != 0 {
-		t.Fatalf("4 KiB append authority shapes = one-shot %d, transaction phases %d, want 1/0", oneShot, transactions)
+		t.Fatalf("O_APPEND open = %v, want EOPNOTSUPP on stock FUSE", err)
 	}
 
 	const maxWrite = 1 << 20
@@ -900,34 +889,33 @@ func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
 		mapping[index] = 0x33
 	}
 	unaligned := mapping[208 : 208+maxWrite]
-	oneShot, transactions = countWrite(func() error {
+	writes = countWrite(func() error {
 		n, err := unix.Pwrite(int(file.Fd()), unaligned, 2*maxWrite)
 		if err == nil && n != len(unaligned) {
 			return io.ErrShortWrite
 		}
 		return err
 	})
-	if oneShot != 0 || transactions != 4 {
-		t.Fatalf("unaligned max_write positioned write authority shapes = one-shot %d, transaction phases %d, want 0/4", oneShot, transactions)
+	if writes != 2 {
+		t.Fatalf("unaligned max_write positioned write authority calls = %d, want 2 page-vector requests", writes)
 	}
 
 	large := mapping[:maxWrite+1]
-	oneShot, transactions = countWrite(func() error {
+	writes = countWrite(func() error {
 		n, err := unix.Pwrite(int(file.Fd()), large, 3*maxWrite)
 		if err == nil && n != len(large) {
 			return io.ErrShortWrite
 		}
 		return err
 	})
-	if oneShot != 0 || transactions != 4 {
-		t.Fatalf("max_write+1 positioned write authority shapes = one-shot %d, transaction phases %d, want 0/4", oneShot, transactions)
+	if writes != 2 {
+		t.Fatalf("max_write+1 positioned write authority calls = %d, want 2 standard requests", writes)
 	}
 	expected := make([]byte, 4*maxWrite+1)
 	copy(expected, positioned)
-	copy(expected[len(positioned):], appendPayload)
 	copy(expected[2*maxWrite:], unaligned)
 	copy(expected[3*maxWrite:], large)
-	requireContent(t, path, expected, "data after both write-size shapes")
+	requireContent(t, path, expected, "data after stock FUSE write splits")
 }
 
 // TestConcurrentCrossMountWritersToOneFile covers two mounts writing the same
@@ -1566,7 +1554,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
 			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
 			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
-			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
+			rename: f.counter.count("rename"), write: f.counter.count("write"),
 			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
 			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
 			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
@@ -1577,7 +1565,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
 			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
 			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
-			rename: f.counter.count("rename"), write: f.counter.count("one-shot-write"),
+			rename: f.counter.count("rename"), write: f.counter.count("write"),
 			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
 			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
 			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
@@ -1593,7 +1581,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			fallocate: after.fallocate - before.fallocate, copyFileRange: after.copyFileRange - before.copyFileRange,
 			removeXattr: after.removeXattr - before.removeXattr,
 		}
-		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d mkdir=%d unlink=%d rmdir=%d rename=%d one-shot-write=%d setattr=%d symlink=%d link=%d open=%d tmpfile=%d fallocate=%d copy-file-range=%d remove-xattr=%d",
+		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d mkdir=%d unlink=%d rmdir=%d rename=%d write=%d setattr=%d symlink=%d link=%d open=%d tmpfile=%d fallocate=%d copy-file-range=%d remove-xattr=%d",
 			operation, delta.lookup, delta.getattr, delta.create, delta.mkdir, delta.unlink, delta.rmdir,
 			delta.rename, delta.write, delta.setattr, delta.symlink, delta.link, delta.open, delta.tmpfile,
 			delta.fallocate, delta.copyFileRange, delta.removeXattr)
@@ -1871,7 +1859,6 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	type existingCreateResult struct {
 		errno   int32
 		failure authoritypb.FailureClass
-		retry   uint64
 		err     error
 	}
 	results := make(chan existingCreateResult, 8)
@@ -1901,7 +1888,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		if create != nil && string(create.GetName()) == existingName {
 			results <- existingCreateResult{
 				errno: response.GetErrno(), failure: response.GetFailure(),
-				retry: response.GetVisibilityRetrySequence(), err: err,
+				err: err,
 			}
 		}
 	})

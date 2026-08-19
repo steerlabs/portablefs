@@ -221,7 +221,7 @@ public final class PortableFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOpe
     /// This is deliberately named rather than inferred from the host version:
     /// the signed application chooses the declared best-effort cache tier at
     /// build time, while the generic adapter initializer remains unconfigured.
-    /// The authority still enforces protocol-5 ordering and the mount still
+    /// The authority enforces protocol-6 FSKit repair ordering and the mount still
     /// fails closed if synchronous VFS repair cannot complete.
     public static func macOS26BestEffort() -> PortableFSFileSystem {
         PortableFSFileSystem(

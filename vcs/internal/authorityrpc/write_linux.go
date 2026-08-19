@@ -13,55 +13,77 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
-func oneShotWriteMetadata(body *authoritypb.OneShotWriteRequest, maxWrite uint32) (writeTransactionMetadata, error) {
-	if body == nil || body.GetSize() == 0 || body.GetSize() > maxWrite || uint32(len(body.GetData())) != body.GetSize() {
-		return writeTransactionMetadata{}, syscall.EINVAL
-	}
-	return writeMetadataFromGeometry(body.GetHandle(), uint64(body.GetSize()), body.GetPosition(), body.GetRlimitFsize(),
-		body.GetFileMaxSize(), body.GetLockOwner(), body.GetWriteFlags(), body.GetFlags())
+type writeMetadata struct {
+	handle        xfsstore.Capability
+	requestedSize uint64
+	position      uint64
+	lockOwner     uint64
+	writeFlags    uint32
 }
 
-func oneShotWriteRejection(cause error, rlimit bool) *authoritypb.Response {
+func stockWriteMetadata(body *authoritypb.WriteRequest, maxWrite uint32) (writeMetadata, error) {
+	var metadata writeMetadata
+	if body == nil || body.GetSize() == 0 || body.GetSize() > maxWrite || uint32(len(body.GetData())) != body.GetSize() {
+		return metadata, syscall.EINVAL
+	}
+	if len(body.GetHandle()) != len(metadata.handle) || body.GetPosition() > math.MaxInt64 ||
+		body.GetWriteFlags()&^(writeLockOwner|writeKillSUIDGID) != 0 ||
+		body.GetWriteFlags()&writeLockOwner == 0 && body.GetLockOwner() != 0 {
+		return metadata, syscall.EINVAL
+	}
+	copy(metadata.handle[:], body.GetHandle())
+	if metadata.handle == (xfsstore.Capability{}) {
+		return writeMetadata{}, syscall.EINVAL
+	}
+	metadata.requestedSize = uint64(body.GetSize())
+	metadata.position = body.GetPosition()
+	metadata.lockOwner = body.GetLockOwner()
+	metadata.writeFlags = body.GetWriteFlags()
+	return metadata, nil
+}
+
+func stockWriteRejection(cause error, _ bool) *authoritypb.Response {
 	errno := wireErrno(cause)
 	if errno <= 0 || errno > 4095 {
 		errno = int32(syscall.EIO)
 	}
-	flags := writeTransactionReplyRejected
-	if rlimit {
-		flags = writeTransactionReplyRLimit
-	}
-	return &authoritypb.Response{Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
-		Flags: flags, Error: -errno,
+	return &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
+		Error: -errno,
 	}}}
 }
 
-func oneShotWriteCommitReply(committed, assigned, post, sequence uint64, postAttr xfsstore.Attr, err error) *authoritypb.Response {
-	flags := writeTransactionReplyCommitted
+func stockWriteResponseWithEnvelope(h *VolumeHandler, requestID uint64, response *authoritypb.Response) *authoritypb.Response {
+	if response == nil {
+		return h.errorResponse(requestID, syscall.EIO, true)
+	}
+	response.RequestId = requestID
+	response.Epoch = h.Epoch()
+	return response
+}
+
+func stockWriteCommitReply(committed, assigned, post, sequence uint64, postAttr xfsstore.Attr, err error) *authoritypb.Response {
 	wireError := int32(0)
 	if err != nil && errors.Is(err, xfsstore.ErrWritePostApply) {
-		flags |= writeTransactionReplyPostApply
 		wireError = -wireErrno(err)
 		if wireError >= 0 {
 			wireError = -int32(syscall.EIO)
 		}
 	}
 	return &authoritypb.Response{
-		Body: &authoritypb.Response_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteReply{
-			CommittedSize: committed, AssignedOffset: assigned, PostSize: post,
-			VisibilitySequence: sequence, Flags: flags, Error: wireError,
+		Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
+			CommittedSize: committed, PostAttr: attrProto(postAttr), Error: wireError,
 		}},
 	}
 }
 
-func markOneShotWritePostApplyFailure(response *authoritypb.Response, cause error) bool {
+func markWritePostApplyFailure(response *authoritypb.Response, cause error) bool {
 	if response == nil || cause == nil {
 		return false
 	}
-	reply := response.GetOneShotWrite()
-	if reply == nil || reply.GetFlags()&writeTransactionReplyCommitted == 0 {
+	reply := response.GetWrite()
+	if reply == nil || reply.GetPostAttr() == nil {
 		return false
 	}
-	reply.Flags |= writeTransactionReplyPostApply
 	reply.Error = -wireErrno(cause)
 	if reply.Error >= 0 {
 		reply.Error = -int32(syscall.EIO)
@@ -71,12 +93,17 @@ func markOneShotWritePostApplyFailure(response *authoritypb.Response, cause erro
 	return true
 }
 
-// handleOneShotWrite executes a complete one-frame write as one ordinary
+// handleWrite executes a complete one-frame write as one ordinary
 // replay-slot mutation. Capacity is charged to the same FIFO byte/count
 // budgets as staged transactions, but the retained frame payload is written
 // directly and no staging object or transaction ID exists.
-func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.OneShotWriteRequest) *authoritypb.Response {
-	metadata, metadataErr := oneShotWriteMetadata(body, h.MaxWrite)
+func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.WriteRequest) *authoritypb.Response {
+	if h.WriteAbsoluteTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, h.WriteAbsoluteTimeout)
+		defer cancel()
+	}
+	metadata, metadataErr := stockWriteMetadata(body, h.MaxWrite)
 	var resources *sessionResources
 	var target xfsstore.WriteTarget
 	var coordinate visibilityCoordinate
@@ -87,7 +114,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 			_ = target.Close()
 		}
 		if reserved {
-			h.releaseWriteTransactionCapacity(resources, metadata.requestedSize)
+			h.releaseWriteAdmission(resources, metadata.requestedSize)
 		}
 	}()
 
@@ -96,7 +123,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 			return nil, metadataErr
 		}
 		var err error
-		resources, err = h.writeTransactionResources(credential.ID)
+		resources, err = h.sessionResources(credential.ID)
 		if err != nil {
 			return nil, err
 		}
@@ -104,11 +131,11 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 		if err != nil {
 			return nil, err
 		}
-		if err := h.reserveWriteTransactionCapacity(ctx, terminal, resources, metadata.requestedSize); err != nil {
+		if err := h.reserveWriteAdmission(ctx, terminal, resources, metadata.requestedSize); err != nil {
 			return nil, err
 		}
 		reserved = true
-		store, ok := h.Store.(writeTransactionStore)
+		store, ok := h.Store.(writeStore)
 		if !ok {
 			return nil, syscall.EOPNOTSUPP
 		}
@@ -140,9 +167,8 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 		}
 		committed, assigned, post, applyErr := target.CommitWriteData(body.GetData(), xfsstore.WriteCommit{
 			RequestedSize: metadata.requestedSize, Position: metadata.position,
-			RLimitSize: metadata.rlimitSize, FileMaxSize: metadata.fileMaxSize, Mode: metadata.mode,
-			DataSync: metadata.dataSync, Sync: metadata.sync,
-			KillPrivileges: metadata.writeFlags&writeTransactionKillSUIDGID != 0,
+			RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: xfsstore.WritePositioned,
+			KillPrivileges: metadata.writeFlags&writeKillSUIDGID != 0,
 		})
 		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
 			!errors.Is(applyErr, xfsstore.ErrOutcomeUncertain)
@@ -154,7 +180,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 				return h.errorResponse(0, applyErr, true), []volumeserver.VisibilityTarget{}
 			}
 			var limit *xfsstore.WriteLimitError
-			response := oneShotWriteRejection(applyErr, errors.As(applyErr, &limit) && limit.RLimit)
+			response := stockWriteRejection(applyErr, errors.As(applyErr, &limit) && limit.RLimit)
 			h.deferStorageFailure(nil, applyErr)
 			return response, nil
 		}
@@ -162,7 +188,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 			if post.Kind != xfsstore.KindRegular || post.Size < 0 || sequence == 0 {
 				return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 			}
-			response := oneShotWriteCommitReply(0, 0, uint64(post.Size), sequence, post, applyErr)
+			response := stockWriteCommitReply(0, 0, uint64(post.Size), sequence, post, applyErr)
 			response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 			h.deferStorageFailure(response, applyErr)
 			return response, []volumeserver.VisibilityTarget{
@@ -177,8 +203,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 		if post.Kind != xfsstore.KindRegular || post.Size < 0 || uint64(post.Size) < end || sequence == 0 {
 			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 		}
-		if metadata.mode == xfsstore.WriteAppend && uint64(post.Size) != end ||
-			metadata.mode == xfsstore.WritePositioned && assigned != metadata.position {
+		if assigned != metadata.position {
 			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 		}
 		if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {
@@ -187,7 +212,7 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 		if applyErr != nil && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
 			applyErr = nil
 		}
-		response := oneShotWriteCommitReply(committed, assigned, uint64(post.Size), sequence, post, applyErr)
+		response := stockWriteCommitReply(committed, assigned, uint64(post.Size), sequence, post, applyErr)
 		response.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 		if applyErr != nil {
 			h.deferStorageFailure(response, applyErr)
@@ -197,6 +222,9 @@ func (h *VolumeHandler) handleOneShotWrite(ctx context.Context, request *authori
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
 	})
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) && response != nil && response.GetErrno() == 0 && response.GetWrite() == nil {
+		return h.errorResponse(request.GetRequestId(), syscall.ETIMEDOUT, false)
+	}
 	if releaseMutation != nil {
 		releaseMutation()
 	}

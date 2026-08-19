@@ -65,10 +65,8 @@ private final class PfsWeakMacOSV3Transport: @unchecked Sendable {
 /// mount's concrete repairs from its namespace index, and sends the resulting
 /// cursor verdict back over the priority local control lane.
 ///
-/// The live `VolumeCore` deliberately rejects v3 resolves until it can supply
-/// the remaining production pieces (index population, callback admission, and
-/// repair backend). This adapter remains usable by that future composition and
-/// by exact wire tests without making the current mount falsely claim support.
+/// `VolumeCore` composes this adapter only after the selected FSKit cache policy
+/// has supplied its exact index, callback-admission, and repair implementation.
 public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
     public let contract: PfsMacOSV3LocalContract
 
@@ -258,14 +256,9 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         _ wire: PfsV3CoherenceContract
     ) throws -> PfsMacOSV3LocalContract {
         // This is the authority protocol nested inside pfslocal, not the local
-        // UDS major. Protocol 6 is understood but deliberately refused: the
-        // checked-in SDK surfaces do not provide its complete synchronous
-        // source-install and peer-repair primitive set. No timer or pathname
-        // repair is an admissible substitute.
-        if wire.authorityProtocolMajor == 6 {
-            throw PfsMacOSCoherenceError.exactVNextFSKitUnavailable(6)
-        }
-        guard wire.authorityProtocolMajor == 5 else {
+        // UDS major. Protocol 6 names the explicit FSKit synchronous-repair
+        // profile; an older authority contract is not negotiated or translated.
+        guard wire.authorityProtocolMajor == 6 else {
             throw PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(
                 wire.authorityProtocolMajor
             )

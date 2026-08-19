@@ -119,9 +119,18 @@ func (h *lifecycleTestHandler) Handle(ctx context.Context, request *authoritypb.
 }
 
 func lifecyclePair(t *testing.T, registry *transportRegistry, session volumeserver.SessionID) (*transportConnection, *atomic.Int32, *transportConnection, *atomic.Int32, transportPairSnapshot) {
+	return lifecyclePairForProfile(t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES)
+}
+
+func lifecyclePairForProfile(
+	t *testing.T,
+	registry *transportRegistry,
+	session volumeserver.SessionID,
+	profile authoritypb.FrontendProfile,
+) (*transportConnection, *atomic.Int32, *transportConnection, *atomic.Int32, transportPairSnapshot) {
 	t.Helper()
-	data, dataClosed := testTransportRegistration(t, registry, 0x41, 0x42, authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
-	control, controlClosed := testTransportRegistration(t, registry, 0x41, 0x42, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL)
+	data, dataClosed := testTransportRegistrationForProfile(t, registry, 0x41, 0x42, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, profile)
+	control, controlClosed := testTransportRegistrationForProfile(t, registry, 0x41, 0x42, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL, profile)
 	snapshot, replaced, err := registry.bindProvisional(data, session)
 	if err != nil || len(replaced) != 0 {
 		t.Fatalf("bind provisional = %+v, replaced=%v, err=%v", snapshot, replaced, err)
@@ -171,7 +180,9 @@ func TestTransportAttachReplayAndActivateSerializeExactBoundary(t *testing.T) {
 		}
 	}
 	server := &Server{Handler: handler, registry: registry}
-	attachRequest := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{}}}
+	attachRequest := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+	}}}
 	activateRequest := &authoritypb.Request{RequestId: 2, Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
 		DataBindingGeneration: snapshot.dataGeneration, ControlBindingGeneration: snapshot.controlGeneration,
 	}}}
@@ -442,10 +453,12 @@ func TestTransportPlannedTerminalReplyAttemptsWriteBeforeResponderClose(t *testi
 	}
 }
 
-func TestTransportBlockedReportDeliversTerminalReasonBeforeControlCloses(t *testing.T) {
+func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 	registry, _ := newTransportRegistry(1)
 	session := volumeserver.SessionID{0x44}
-	data, dataClosed, control, controlClosed, _ := lifecyclePair(t, registry, session)
+	data, dataClosed, control, controlClosed, _ := lifecyclePairForProfile(
+		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+	)
 	if err := registry.markActive(control, session); err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +484,7 @@ func TestTransportBlockedReportDeliversTerminalReasonBeforeControlCloses(t *test
 	err := server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 		RequestId: 7,
 		Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-		Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
+		Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{
 			Blocked: true,
 		}},
 	}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
@@ -479,8 +492,8 @@ func TestTransportBlockedReportDeliversTerminalReasonBeforeControlCloses(t *test
 		if pairs != 0 || sessions != 0 {
 			t.Fatalf("terminal report retained registry at reply: pairs=%d sessions=%d", pairs, sessions)
 		}
-		if dataClosed.Load() != 1 || controlClosed.Load() != 0 {
-			t.Fatalf("close counts at reply = DATA %d CONTROL %d, want 1/0", dataClosed.Load(), controlClosed.Load())
+		if dataClosed.Load() != 1 || controlClosed.Load() != 1 {
+			t.Fatalf("close counts at reply = DATA %d CONTROL %d, want 1/1", dataClosed.Load(), controlClosed.Load())
 		}
 		wrote = response
 		return nil
@@ -499,7 +512,9 @@ func TestTransportBlockedReportDeliversTerminalReasonBeforeControlCloses(t *test
 func TestTransportBlockedReportSuccessKeepsActivePairServing(t *testing.T) {
 	registry, _ := newTransportRegistry(1)
 	session := volumeserver.SessionID{0x45}
-	data, dataClosed, control, controlClosed, _ := lifecyclePair(t, registry, session)
+	data, dataClosed, control, controlClosed, _ := lifecyclePairForProfile(
+		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+	)
 	if err := registry.markActive(control, session); err != nil {
 		t.Fatal(err)
 	}
@@ -509,7 +524,7 @@ func TestTransportBlockedReportSuccessKeepsActivePairServing(t *testing.T) {
 	err := server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 		RequestId: 8,
 		Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-		Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
+		Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{
 			Blocked:                 true,
 			BlockedParentKernelInos: []uint64{101},
 		}},
@@ -546,14 +561,19 @@ func TestTransportBlockedReportSuccessKeepsActivePairServing(t *testing.T) {
 	}
 }
 
-func TestTransportBlockedReportExcludesConcurrentControlResumeUntilReply(t *testing.T) {
+func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testing.T) {
 	registry, _ := newTransportRegistry(1)
 	session := volumeserver.SessionID{0x46}
-	data, dataClosed, control, controlClosed, _ := lifecyclePair(t, registry, session)
+	data, dataClosed, control, controlClosed, _ := lifecyclePairForProfile(
+		t, registry, session, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+	)
 	if err := registry.markActive(control, session); err != nil {
 		t.Fatal(err)
 	}
-	candidate, candidateClosed := testTransportRegistration(t, registry, 0x41, 0x42, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL)
+	candidate, candidateClosed := testTransportRegistrationForProfile(
+		t, registry, 0x41, 0x42, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+	)
 
 	blockedEntered := make(chan struct{})
 	releaseBlocked := make(chan struct{})
@@ -564,7 +584,7 @@ func TestTransportBlockedReportExcludesConcurrentControlResumeUntilReply(t *test
 	handler := newLifecycleTestHandler(volumeserver.SessionStateActive)
 	handler.handle = func(_ context.Context, request *authoritypb.Request) *authoritypb.Response {
 		switch {
-		case request.GetAckVisibility() != nil:
+		case request.GetAckFskitRepair() != nil:
 			close(blockedEntered)
 			<-releaseBlocked
 			return &authoritypb.Response{RequestId: request.GetRequestId()}
@@ -588,7 +608,7 @@ func TestTransportBlockedReportExcludesConcurrentControlResumeUntilReply(t *test
 		blockedDone <- server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 			RequestId: 9,
 			Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-			Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
+			Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{
 				Blocked: true,
 			}},
 		}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
@@ -600,8 +620,8 @@ func TestTransportBlockedReportExcludesConcurrentControlResumeUntilReply(t *test
 			current := data.pair.control.current
 			responder := data.pair.terminalResponder
 			registry.mu.Unlock()
-			if current != control || responder != control {
-				return errors.New("CONTROL changed during blocked response write")
+			if current != candidate || responder != nil {
+				return errors.New("CONTROL successor was not promoted before the drained response write")
 			}
 			return nil
 		})
@@ -630,30 +650,33 @@ func TestTransportBlockedReportExcludesConcurrentControlResumeUntilReply(t *test
 	<-resumeStarted
 	select {
 	case <-resumeEntered:
-		t.Fatal("CONTROL Resume crossed the blocked-report handler/reply transaction")
-	default:
+	case <-time.After(time.Second):
+		t.Fatal("CONTROL Resume did not reach its handler while the prior execution remained pinned")
 	}
-	if controlClosed.Load() != 0 || candidateClosed.Load() != 0 {
-		t.Fatalf("CONTROL generations closed while responder held: current=%d candidate=%d", controlClosed.Load(), candidateClosed.Load())
+	// resumeEntered is published by the handler immediately before it returns;
+	// promotion and predecessor close happen in the transport wrapper after that
+	// return. Wait for that boundary explicitly instead of relying on scheduler
+	// order between the wrapper and this test goroutine.
+	deadline := time.Now().Add(time.Second)
+	for controlClosed.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
 	}
-	if snapshot, err := registry.snapshot(candidate); err != nil || !snapshot.candidate || snapshot.current || snapshot.serving {
-		t.Fatalf("queued CONTROL candidate snapshot = %+v, err=%v", snapshot, err)
+	if controlClosed.Load() != 1 || candidateClosed.Load() != 0 {
+		t.Fatalf("CONTROL generation close counts after promotion = current:%d candidate:%d", controlClosed.Load(), candidateClosed.Load())
+	}
+	if snapshot, err := registry.snapshot(candidate); err != nil || snapshot.candidate || !snapshot.current || snapshot.serving {
+		t.Fatalf("promoted but unexposed CONTROL snapshot = %+v, err=%v", snapshot, err)
 	}
 
 	close(releaseBlocked)
 	if err := <-blockedDone; err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-resumeEntered:
-	case <-time.After(time.Second):
-		t.Fatal("CONTROL Resume did not enter after blocked response completed")
-	}
 	if err := <-resumeDone; err != nil {
 		t.Fatal(err)
 	}
-	if resumeCrossedResponse.Load() {
-		t.Fatal("CONTROL Resume handler ran before the blocked response write")
+	if !resumeCrossedResponse.Load() {
+		t.Fatal("CONTROL Resume handler did not overlap the pinned FSKit Ack as expected")
 	}
 	if controlClosed.Load() != 1 || candidateClosed.Load() != 0 || dataClosed.Load() != 0 {
 		t.Fatalf("post-Resume close counts DATA/current CONTROL/candidate CONTROL = %d/%d/%d", dataClosed.Load(), controlClosed.Load(), candidateClosed.Load())

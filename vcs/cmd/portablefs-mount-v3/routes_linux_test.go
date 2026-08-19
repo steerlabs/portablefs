@@ -52,17 +52,17 @@ const (
 )
 
 type attachFixture struct {
-	t          *testing.T
-	address    string
-	clientTLS  *tls.Config
-	capability []byte
-	routes     *authorityrpc.RoutesController
-	attaches   *attachCounter
-	stop       context.CancelFunc
-	served     chan error
-	listener   net.Listener
-	store      *xfsstore.Volume
-	staging    *authorityrpc.WriteTransactionStaging
+	t              *testing.T
+	address        string
+	clientTLS      *tls.Config
+	capability     []byte
+	routes         *authorityrpc.RoutesController
+	attaches       *attachCounter
+	stop           context.CancelFunc
+	served         chan error
+	listener       net.Listener
+	store          *xfsstore.Volume
+	writeAdmission *authorityrpc.WriteAdmission
 }
 
 // attachCounter records every attach the authority was asked to perform and how
@@ -134,21 +134,21 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		t.Fatalf("open XFS volume: %v", err)
 	}
 	f.store = store
-	stagingRoot := volumeRoot + ".write-staging"
-	if err := os.Mkdir(stagingRoot, 0o700); err != nil {
-		t.Fatalf("create write-transaction staging root: %v", err)
+	writeAdmissionRoot := volumeRoot + ".write-admission"
+	if err := os.Mkdir(writeAdmissionRoot, 0o700); err != nil {
+		t.Fatalf("create write admission root: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(stagingRoot) })
-	f.staging, err = authorityrpc.OpenWriteTransactionStaging(stagingRoot)
+	t.Cleanup(func() { _ = os.RemoveAll(writeAdmissionRoot) })
+	f.writeAdmission, err = authorityrpc.OpenWriteAdmission(writeAdmissionRoot)
 	if err != nil {
-		t.Fatalf("open write-transaction staging root: %v", err)
+		t.Fatalf("open write admission root: %v", err)
 	}
 	t.Cleanup(func() {
-		if f.staging != nil {
-			if err := f.staging.Close(); err != nil {
-				t.Errorf("close write-transaction staging: %v", err)
+		if f.writeAdmission != nil {
+			if err := f.writeAdmission.Close(); err != nil {
+				t.Errorf("close write admission: %v", err)
 			}
-			f.staging = nil
+			f.writeAdmission = nil
 		}
 	})
 
@@ -207,16 +207,15 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		},
 		MaxFrame: 4 << 20, MaxRead: 1 << 20, MaxWrite: 1 << 20, MaxInFlight: 64,
 		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 4096, MaxOpens: 4096,
-		MaxRetainedReplyBytes:           32 << 20,
-		WriteStaging:                    f.staging,
-		MaxWriteTransactionBytes:        authorityrpc.RequiredWriteTransactionBytes,
-		MaxWriteStagingBytesPerSession:  16 << 30,
-		MaxWriteStagingBytes:            64 << 30,
-		MaxWriteTransactionsPerSession:  8,
-		MaxWriteTransactions:            64,
-		WriteTransactionProgressTimeout: 2 * time.Minute,
-		WriteTransactionAbsoluteTimeout: 30 * time.Minute,
-		TerminalDeliveryTimeout:         45 * time.Second,
+		MaxRetainedReplyBytes:         32 << 20,
+		WriteAdmission:                f.writeAdmission,
+		MaxWriteBytesPerSession:       16 << 30,
+		MaxWriteBytesInFlight:         64 << 30,
+		MaxWritesPerSession:           8,
+		MaxWrites:                     64,
+		WriteAdmissionProgressTimeout: 2 * time.Minute,
+		WriteAbsoluteTimeout:          30 * time.Minute,
+		TerminalDeliveryTimeout:       45 * time.Second,
 	}
 	f.attaches = &attachCounter{inner: handler}
 
@@ -254,12 +253,11 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 // mount: no flags, no environment, one capability.
 func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 	return authorityrpc.ClientConfig{
-		Address: f.address, TLS: f.clientTLS.Clone(), VolumeID: attachVolumeID,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         f.address, TLS: f.clientTLS.Clone(), VolumeID: attachVolumeID,
 		AccessToken: f.capability, ReplaySlots: 64, MaxFrame: 4 << 20,
 		DialTimeout: 10 * time.Second, CancelDrainTimeout: 5 * time.Second, MaxInFlight: 64,
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 4096, RepairBudget: 15 * time.Second,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return &authoritypb.MountAbsenceProof{
 				ObservedUnixNanos: time.Now().UnixNano(),

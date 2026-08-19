@@ -131,7 +131,7 @@ func releaseFramePayload(payload []byte, class int) {
 
 // readFrame decodes one framed protobuf message. A frame has two lengths:
 // protobuf metadata followed by an optional out-of-line bulk body. Only
-// WriteTransactionRequest.Data, OneShotWriteRequest.Data, and ReadReply.Data
+// WriteRequest.Data and ReadReply.Data
 // are the only legal bulk bodies. Keeping the payload outside protobuf removes
 // the full-size marshal and unmarshal copies from
 // the data path without creating a second protocol or weakening replay: the
@@ -320,10 +320,11 @@ func writeFrame(w io.Writer, max uint32, message proto.Message) (err error) {
 func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 	switch typed := message.(type) {
 	case *authoritypb.Request:
-		if transaction := typed.GetWriteTransaction(); transaction != nil {
-			return &transaction.Data, nil
+		if write := typed.GetWrite(); write != nil {
+			return &write.Data, nil
 		}
-		if write := typed.GetOneShotWrite(); write != nil {
+		if write := typed.GetFskitWrite(); write != nil &&
+			write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA {
 			return &write.Data, nil
 		}
 	case *authoritypb.Response:

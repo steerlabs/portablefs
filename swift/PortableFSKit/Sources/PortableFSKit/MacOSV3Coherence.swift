@@ -25,11 +25,6 @@ public enum PfsMacOSCachePolicy: String, Sendable, CaseIterable {
 public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
     case missingV3CoherenceContract
     case invalidAuthorityProtocolMajor(UInt32)
-    /// Authority v6 requires synchronous typed source-state installation and
-    /// exact namespace, attribute, and data peer repair. Neither the macOS 26
-    /// Operations API nor the checked-in macOS 27 probes supply that complete
-    /// primitive set, so accepting it would be a silent compatibility mode.
-    case exactVNextFSKitUnavailable(UInt32)
     case invalidEpochLength(Int)
     case invalidSecretLength(Int)
     case invalidSessionIDLength(Int)
@@ -82,8 +77,6 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
             return "resolved v3 attach omitted its coherence contract"
         case let .invalidAuthorityProtocolMajor(major):
             return "unsupported authority protocol major \(major)"
-        case let .exactVNextFSKitUnavailable(major):
-            return "authority protocol \(major) requires unavailable exact FSKit post-state and repair primitives"
         case let .invalidEpochLength(length):
             return "authority epoch has \(length) bytes; expected 16"
         case let .invalidSecretLength(length):

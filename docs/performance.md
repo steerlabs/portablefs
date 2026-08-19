@@ -1,7 +1,12 @@
 # Performance
 
-Status: **protocol-5 Linux exact and macOS 26 best-effort paths measured; no
-release SLO yet**
+Status: **historical protocol-4/5 measurements only; the protocol-6 stock-FUSE
+profile has not been measured and has no release SLO**
+
+The measurements below are retained unchanged as evidence for retired
+configurations. They must not be quoted as protocol-6 performance. PortableFS
+will add a separate stock-kernel section only after the new profile is measured
+end to end with the same byte-verification discipline.
 
 ## August 15, 2026 protocol-5 Linux measurement
 

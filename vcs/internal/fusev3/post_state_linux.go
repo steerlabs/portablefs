@@ -8,7 +8,6 @@ import (
 	"errors"
 	"sort"
 
-	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
@@ -75,9 +74,9 @@ func validateMutationPostStateForOpcode(opcode uint32, state *authoritypb.PostSt
 	got := postStateRoles(state)
 	valid := false
 	switch opcode {
-	case 4, 14, 21, 24, 43, fuse.PFS_WRITE_OPCODE, fuse.PFS_FALLOCATE_OPCODE: // setattr, open(O_TRUNC), xattrs, fallocate, private write/fallocate
+	case 4, 14, 21, 24, 43: // setattr, open(O_TRUNC), xattrs, fallocate
 		valid = samePostStateRoles(got, postStateRoleTarget)
-	case fuse.PFS_COPY_FILE_RANGE_OPCODE:
+	case 47: // copy_file_range
 		valid = samePostStateRoles(got, postStateRoleSource|postStateRoleDestination) ||
 			samePostStateRoles(got, postStateRoleSource, postStateRoleDestination)
 	case 6, 8, 9, 51: // symlink, regular mknod, mkdir, tmpfile
@@ -292,10 +291,7 @@ func validateExpectedPostState(publication *replyPublication) error {
 	}
 	state := publication.postState
 	if state == nil {
-		if publication.needsPostVFS {
-			return errors.New("fusev3: applied mutation omitted its exact post-state")
-		}
-		return nil
+		return errors.New("fusev3: applied mutation omitted its exact post-state")
 	}
 	if len(state.GetObjects()) != len(publication.expectedPostState) {
 		return errors.New("fusev3: mutation post-state identity count does not match its operands")

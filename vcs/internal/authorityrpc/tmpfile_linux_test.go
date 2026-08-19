@@ -61,7 +61,6 @@ func (s *tmpfileHandlerStore) Getattr(parent xfsstore.Capability) (xfsstore.Attr
 
 func tmpfileMutationRequest(t *testing.T, credentialEpoch, sessionID, secret []byte, generation uint64, parent xfsstore.Capability, requestID uint64) *authoritypb.Request {
 	t.Helper()
-	parentIdentity := [16]byte{parent[0]}
 	request := &authoritypb.Request{
 		RequestId: requestID,
 		Epoch:     append([]byte(nil), credentialEpoch...),
@@ -72,11 +71,6 @@ func tmpfileMutationRequest(t *testing.T, credentialEpoch, sessionID, secret []b
 			Parent: parent[:], Mode: 0o640, Exclusive: true,
 			Flags: &authoritypb.OpenFlags{Read: true, Write: true, Sync: true},
 		}},
-		SourcePublicationGate: &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{{
-			Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
-				Identity: parentIdentity[:], Attributes: true,
-			}},
-		}}},
 	}
 	stampMutation(t, request, 0, 1)
 	return request

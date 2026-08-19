@@ -108,14 +108,13 @@ nothing an `fsync` had already promised was lost. The kill lands at a different
 point in each round, at fixed delays rather than random ones - a harness whose
 coverage changes between runs cannot say what a green result covered.
 
-The strict-membership restart gate remains part of this instrument. Killing an
-authority cannot authenticate `Detach`, so the harness reaps the killed round's
-mount process, force-detaches its exact kernel mount, proves that mount absent,
-and only then starts the replacement with the audited
-`--prior-strict-mounts-fenced` operator assertion. Authority loss by itself is
-never treated as fencing evidence. The fresh liveness-probe mount then shuts
-down normally while the replacement authority is alive, which sends the
-authenticated `Detach` and leaves no active membership for the next round.
+The protocol-6 restart grace remains part of this instrument. Killing an
+authority loses its volatile lease table, so the harness reaps the killed
+round's mount process, detaches its stock FUSE mount, and proves it absent. The
+replacement authority must still hold the configured maximum-lease-plus-skew
+grace before conflicting mutation admission; process death alone is never
+treated as lease discharge. The fresh liveness-probe mount then shuts down
+normally while the replacement authority is alive and returns its leases.
 
 In practice an un-fsynced write usually still survives this instrument, because
 the page cache does. The harness records that as an observation and never as a

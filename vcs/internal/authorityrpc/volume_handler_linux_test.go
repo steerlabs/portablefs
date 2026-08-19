@@ -53,18 +53,47 @@ func exactAuthorityTestTargets(sequence uint64, targets []volumeserver.Visibilit
 }
 
 func testVolumeHandler() *VolumeHandler {
+	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
+		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384, PriorGrantsFenced: true, Fencer: noopFencer{},
+	})
+	if err != nil {
+		panic(err)
+	}
+	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
+		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+	})
+	if err != nil {
+		panic(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		panic(err)
+	}
 	return &VolumeHandler{
 		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
 		MaxItemsPerSession: 64, MaxOpensPerSession: 64, MaxItems: 128, MaxOpens: 128,
-		MaxRetainedReplyBytes:           1 << 20,
-		WriteStaging:                    &WriteTransactionStaging{},
-		MaxWriteTransactionBytes:        RequiredWriteTransactionBytes,
-		MaxWriteStagingBytesPerSession:  16 << 30,
-		MaxWriteStagingBytes:            64 << 30,
-		MaxWriteTransactionsPerSession:  8,
-		MaxWriteTransactions:            32,
-		WriteTransactionProgressTimeout: time.Minute,
-		WriteTransactionAbsoluteTimeout: time.Hour,
+		MaxRetainedReplyBytes:               1 << 20,
+		WriteAdmission:                      &WriteAdmission{},
+		MaxWriteBytesPerSession:             16 << 30,
+		MaxWriteBytesInFlight:               64 << 30,
+		MaxWritesPerSession:                 8,
+		MaxWrites:                           32,
+		WriteAdmissionProgressTimeout:       time.Minute,
+		WriteAbsoluteTimeout:                time.Hour,
+		MaxFskitWriteBytes:                  RequiredFskitWriteBytes,
+		FskitWriteStaging:                   &FskitWriteStaging{},
+		MaxFskitWriteStagingBytesPerSession: 16 << 30,
+		MaxFskitWriteStagingBytes:           64 << 30,
+		MaxFskitWritesPerSession:            8,
+		MaxFskitWrites:                      32,
+		FskitWriteProgressTimeout:           time.Minute,
+		FskitWriteAbsoluteTimeout:           time.Hour,
+		Leases:                              leases,
+		Lifecycle:                           lifecycle,
+		Visibility:                          visibility,
 	}
 }
 
@@ -120,12 +149,18 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
+		Membership: membership, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	h := testVolumeHandler()
 	h.Store = &resourceAdmissionFaultStore{}
 	h.Runtime = runtime
 	h.Authorizer = allowAuthorizer{access: volumeserver.AccessRead}
-	h.Visibility = visibility
-	h.Routes = &RoutesController{Visibility: visibility, loaded: true}
+	h.Visibility, h.Lifecycle = visibility, lifecycle
+	h.Routes = &RoutesController{Topology: lifecycle, Mounts: lifecycle, Leases: h.Leases, Visibility: visibility, loaded: true}
 
 	peers := []volumeserver.PeerIdentity{{0x31}, {0x32}, {0x33}}
 	credentials := make([]volumeserver.SessionCredential, len(peers))
@@ -136,6 +171,9 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 		}
 		credentials[index] = credential
 		if err := h.startSessionResources(credential.ID, xfsstore.Capability{byte(index + 1)}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+			t.Fatal(err)
+		}
+		if err := lifecycle.Activate(credential.ID, func() error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		terminal, err := runtime.SessionTerminal(credential.ID)
@@ -189,8 +227,8 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 	}
 }
 
-func TestNextVisibilityAtomicallyAcknowledgesAndWaitsForSuccessor(t *testing.T) {
-	runtime, err := volumeserver.New("ack-next", volumeserver.Config{
+func TestLinuxProfileRejectsFskitRepairControlBeforeTopologyAdmission(t *testing.T) {
+	runtime, err := volumeserver.New("retired-visibility", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
 	if err != nil {
@@ -203,90 +241,136 @@ func TestNextVisibilityAtomicallyAcknowledgesAndWaitsForSuccessor(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: runtime,
-		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	h := testVolumeHandler()
+	h.Store, h.Runtime, h.Authorizer = &resourceAdmissionFaultStore{}, runtime, allowAuthorizer{access: volumeserver.AccessRead | volumeserver.AccessWrite}
+	// Deliberately omit Topology: cross-profile bodies must be refused without
+	// entering route admission or dereferencing the FSKit repair coordinator.
+	h.Routes = &RoutesController{loaded: true}
+	if err := h.startSessionResources(credential.ID, xfsstore.Capability{1}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peer))
+	for id, request := range []*authoritypb.Request{
+		{Body: &authoritypb.Request_NextFskitRepair{NextFskitRepair: &authoritypb.NextVisibilityRequest{}}},
+		{Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}}},
+	} {
+		request.RequestId, request.Epoch = uint64(id+1), credential.Epoch[:]
+		request.Session = &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]}
+		response := h.Handle(ctx, request)
+		if response.GetErrno() != int32(syscall.EOPNOTSUPP) {
+			t.Fatalf("cross-profile FSKit repair body %T = %+v", request.GetBody(), response)
+		}
+	}
+}
+
+func TestFskitSourceMutationRecallsLinuxLeaseWithoutSourceDischarge(t *testing.T) {
+	runtime, err := volumeserver.New("mixed-profile-recall", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 4, MaxLockRecords: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := runtime.SessionTerminal(credential.ID)
+	source, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{1}, volumeserver.Authorization{
+		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: runtime,
+		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Second, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := runtime.SessionTerminal(source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := visibility.Register(source.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairLocklessExpiration,
 	}); err != nil {
 		t.Fatal(err)
 	}
+
 	h := testVolumeHandler()
-	h.Store = &resourceAdmissionFaultStore{}
-	h.Runtime = runtime
-	h.Authorizer = allowAuthorizer{access: volumeserver.AccessRead | volumeserver.AccessWrite}
-	h.Visibility = visibility
-	h.Routes = &RoutesController{Visibility: visibility, loaded: true}
-	if err := h.startSessionResources(credential.ID, xfsstore.Capability{1}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+	h.Runtime, h.Store, h.Visibility = runtime, &resourceAdmissionFaultStore{}, visibility
+	root := xfsstore.Capability{0x31}
+	if err := h.startSessionResourcesForProfile(source.ID, root, 2, [32]byte{}, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR); err != nil {
 		t.Fatal(err)
 	}
-	peerContext := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peer))
-	ctx, cancel := context.WithTimeout(peerContext, 2*time.Second)
-	defer cancel()
-	request := func(id uint64, value *authoritypb.Request) *authoritypb.Request {
-		value.RequestId = id
-		value.Epoch = credential.Epoch[:]
-		value.Session = &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]}
-		return value
+	peer := volumeserver.SessionID{0x42}
+	peerTerminal := make(chan struct{})
+	if err := h.Leases.ActivateHolder(peer, peerTerminal); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { close(peerTerminal) })
+	identity := [16]byte{root[0]}
+	coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: identity}
+	if _, err := h.Leases.Grant(context.Background(), peer, coordinate, volumeserver.LeaseRightAttributesRead); err != nil {
+		t.Fatal(err)
 	}
 
+	request := &authoritypb.Request{
+		RequestId: 1,
+		Body:      &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: root[:]}},
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+				Identity: identity[:], Attributes: true,
+			}},
+		}}},
+	}
+	stampMutation(t, request, 0, 1)
 	targets := []volumeserver.VisibilityTarget{{
-		Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{7}, KernelIno: 7, Device: 1,
+		Scope: volumeserver.VisibilityAttributes, Identity: identity, KernelIno: uint64(root[0]), Device: 1,
 	}}
-	// The registered mount is a peer that has actually published this inode to
-	// its kernel. The distinct initiator below is therefore excluded nowhere in
-	// this one-peer audience, and the peer receives both phases.
-	visibility.RecordResolvedInode(credential.ID, targets[0].Identity)
-	initialCursor := testInitialVisibilityCursor(t, visibility, credential.ID)
-	applied := make(chan error, 1)
+	applyCalls := 0
+	response := make(chan *authoritypb.Response, 1)
 	go func() {
-		applied <- visibility.Execute(
-			ctx, volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
-			volumeserver.MutationDependenciesForTargets(targets),
+		response <- h.mutateVisibleSequence(context.Background(), request, source,
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(1, targets), true },
+			func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				applyCalls++
+				resp := h.success(0)
+				resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
+					identity: identity,
+					attr: xfsstore.Attr{
+						Kind: xfsstore.KindRegular, Ino: uint64(root[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1,
+					},
+					roles: postStateRoleTarget, changed: true,
+				})
+				return resp, targets
+			},
 		)
 	}()
-	initial := h.Handle(ctx, request(1, &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{
-		NextVisibility: &authoritypb.NextVisibilityRequest{
-			After: visibilityCursorProto(initialCursor),
-		},
-	}}))
-	prepare := initial.GetVisibility()
-	if initial.GetErrno() != 0 || prepare.GetCursor().GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE {
-		t.Fatalf("initial visibility = %+v, want PREPARE", initial)
-	}
 
-	advanced := h.Handle(ctx, request(2, &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{
-		NextVisibility: &authoritypb.NextVisibilityRequest{
-			After: prepare.GetCursor(), AcknowledgeAfter: true,
-		},
-	}}))
-	complete := advanced.GetVisibility()
-	if advanced.GetErrno() != 0 || complete.GetCursor().GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
-		t.Fatalf("combined visibility advance = %+v, want COMPLETE", advanced)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	revoke, err := h.Leases.Next(ctx, peer, volumeserver.LeaseEventCursor{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	acked := h.Handle(ctx, request(3, &authoritypb.Request{Body: &authoritypb.Request_AckVisibility{
-		AckVisibility: &authoritypb.AckVisibilityRequest{Cursor: complete.GetCursor()},
-	}}))
-	if acked.GetErrno() != 0 {
-		t.Fatalf("final COMPLETE acknowledgment = %+v", acked)
+	if revoke.Initiator != source.ID || revoke.Cursor.Phase != volumeserver.LeaseEventRevoke {
+		t.Fatalf("mixed-profile revoke = %+v", revoke)
 	}
-	select {
-	case err := <-applied:
-		if err != nil {
-			t.Fatalf("mutation after COMPLETE acknowledgment: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatalf("mutation did not complete after COMPLETE acknowledgment: %v", ctx.Err())
+	if err := h.Leases.AcknowledgeRevoke(peer, revoke.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := h.Leases.Next(ctx, peer, revoke.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Leases.Discharge(peer, complete.Cursor, []volumeserver.LeaseDischarge{{
+		Coordinate: coordinate, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: volumeserver.LeaseDischargeToNone,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	result := <-response
+	if result.GetErrno() != 0 || result.GetUncertain() || result.GetSourceLeaseDischarge() != nil {
+		t.Fatalf("mixed-profile mutation response = %+v", result)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("storage apply calls = %d, want 1", applyCalls)
 	}
 }
 
@@ -352,8 +436,8 @@ func TestVisibilityRetryMapsToInternalDefiniteEINTR(t *testing.T) {
 	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY {
 		t.Fatalf("visibility retry failure class = %v, want VISIBILITY_RETRY", response.GetFailure())
 	}
-	if response.GetVisibilityRetrySequence() != 9 {
-		t.Fatalf("visibility retry sequence = %d, want 9", response.GetVisibilityRetrySequence())
+	if response.GetFskitRepairRetrySequence() != 9 {
+		t.Fatalf("visibility retry sequence = %d, want 9", response.GetFskitRepairRetrySequence())
 	}
 }
 
@@ -361,7 +445,7 @@ func TestVisibilityRetryWithoutSequenceFailsClosed(t *testing.T) {
 	h := &VolumeHandler{}
 	response := h.errorResponse(7, volumeserver.ErrVisibilityRetry, false)
 	if response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() ||
-		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL || response.GetVisibilityRetrySequence() != 0 {
+		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL || response.GetFskitRepairRetrySequence() != 0 {
 		t.Fatalf("unsequenced visibility retry = %+v, want uncertain internal EIO", response)
 	}
 }
@@ -372,7 +456,7 @@ func TestVisibilityRetryWithoutSequenceFailsClosed(t *testing.T) {
 // the retained EINTR and must never enter visibility prepare or filesystem
 // apply on either delivery. The source never receives a phase for its own
 // mutation.
-func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T) {
+func retiredMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T) {
 	runtime, err := volumeserver.New("visibility-eintr-replay", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
@@ -443,10 +527,10 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 		t.Fatal(err)
 	}
 	request := &authoritypb.Request{
-		RequestId:           7,
-		FrontendOperationId: 77,
-		SourcePublicationGate: &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{{
-			Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+		RequestId:                7,
+		FskitFrontendOperationId: 77,
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
 				Identity: identity[:], Attributes: true,
 			}},
 		}}},
@@ -1487,7 +1571,7 @@ func TestOperationResolutionContextReusesAuthoritativeNamespaceBindings(t *testi
 	}
 }
 
-func TestMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) {
+func retiredMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) {
 	runtime, err := volumeserver.New("write-source-gate-identity", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
@@ -1529,12 +1613,12 @@ func TestMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) 
 	identity := [16]byte{handle[0]}
 	request := &authoritypb.Request{
 		RequestId: 1,
-		SourcePublicationGate: &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{{
-			Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
 				Identity: identity[:], Attributes: true, Data: true,
 			}},
 		}}},
-		Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: handle[:], Length: 1, FileMaxSize: 1 << 20}},
+		Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: handle[:], Length: 1}},
 	}
 	stampMutation(t, request, 0, 1)
 	targets := []volumeserver.VisibilityTarget{{
@@ -1562,7 +1646,7 @@ func TestMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) 
 	}
 }
 
-func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testing.T) {
+func retiredMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testing.T) {
 	runtime, err := volumeserver.New("namespace-source-gate-refresh", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
@@ -1628,11 +1712,11 @@ func TestMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testin
 
 	request := &authoritypb.Request{
 		RequestId: 1,
-		SourcePublicationGate: &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{
-			{Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
 				Identity: parentIdentity[:], Attributes: true,
 			}}},
-			{Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
 				ParentIdentity: parentIdentity[:], Name: []byte("child"), BoundAttributes: true,
 			}}},
 		}},
@@ -1856,6 +1940,27 @@ func resourceAdmissionRequestHarness(
 	store volumeStore,
 	maxItems, maxOpens uint32,
 ) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability) {
+	return resourceAdmissionRequestHarnessForProfile(
+		t, store, maxItems, maxOpens, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+	)
+}
+
+func resourceAdmissionFskitRequestHarness(
+	t *testing.T,
+	store volumeStore,
+	maxItems, maxOpens uint32,
+) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability) {
+	return resourceAdmissionRequestHarnessForProfile(
+		t, store, maxItems, maxOpens, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+	)
+}
+
+func resourceAdmissionRequestHarnessForProfile(
+	t *testing.T,
+	store volumeStore,
+	maxItems, maxOpens uint32,
+	profile authoritypb.FrontendProfile,
+) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability) {
 	t.Helper()
 	runtime, err := volumeserver.New("resource-admission", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
@@ -1877,25 +1982,39 @@ func resourceAdmissionRequestHarness(
 	if err != nil {
 		t.Fatal(err)
 	}
-	routes := &RoutesController{Visibility: visibility, loaded: true, revision: routesRevisionOf("")}
-	h := &VolumeHandler{
-		Store: store, Runtime: runtime, Authorizer: allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}, Routes: routes, Visibility: visibility,
-		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
-		MaxItemsPerSession: maxItems, MaxOpensPerSession: maxOpens,
-		MaxItems: maxItems, MaxOpens: maxOpens, MaxRetainedReplyBytes: 1 << 20,
+	h := testVolumeHandler()
+	routes := &RoutesController{
+		Topology: h.Lifecycle, Mounts: h.Lifecycle, Leases: h.Leases,
+		Visibility: visibility, loaded: true, revision: routesRevisionOf(""),
 	}
+	h.Store, h.Runtime, h.Authorizer, h.Routes, h.Visibility = store, runtime, allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}, routes, visibility
+	h.MaxItemsPerSession, h.MaxOpensPerSession = maxItems, maxOpens
+	h.MaxItems, h.MaxOpens = maxItems, maxOpens
 	root := xfsstore.Capability{0x72}
-	if err := h.startSessionResources(cred.ID, root, 2, routesRevisionOf("")); err != nil {
+	if err := h.startSessionResourcesForProfile(
+		cred.ID, root, 2, routesRevisionOf(""), profile,
+	); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := runtime.SessionTerminal(cred.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := visibility.Register(cred.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
-	}); err != nil {
-		t.Fatal(err)
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		commitment := volumeserver.VisibilityCommitment{
+			CachedNameCapacity: 16, RepairBudget: time.Second,
+			NamespaceRepair:     volumeserver.NamespaceRepairCallbackSerializedPipelined,
+			CompatibilityWriter: true,
+		}
+		h.resourcesMu.Lock()
+		h.resources[cred.ID].commitment = commitment
+		h.resourcesMu.Unlock()
+		if err := h.Lifecycle.Activate(cred.ID, func() error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		terminal, err := runtime.SessionTerminal(cred.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := visibility.Register(cred.ID, volumeserver.CoherenceStrict, terminal, commitment); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() { runtime.FenceSession(cred.ID) })
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peer))
@@ -1916,15 +2035,15 @@ func renameReplyRequest(
 		Session: &authoritypb.SessionProof{
 			Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:],
 		},
-		FrontendOperationId: 1,
-		SourcePublicationGate: &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{
-			{Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+		FskitFrontendOperationId: 1,
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
 				Identity: parentIdentity[:], Attributes: true,
 			}}},
-			{Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
 				ParentIdentity: parentIdentity[:], Name: []byte("new"), BoundAttributes: true,
 			}}},
-			{Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
 				ParentIdentity: parentIdentity[:], Name: []byte("old"), BoundAttributes: true,
 			}}},
 		}},
@@ -1939,7 +2058,7 @@ func renameReplyRequest(
 func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.T) {
 	moved := xfsstore.Capability{0xA1}
 	store := &renameReplyStore{bindings: map[string]xfsstore.Capability{"old": moved}}
-	h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 4, 2)
+	h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 4, 2)
 	request := renameReplyRequest(t, cred, root, false)
 
 	first := h.Handle(ctx, request)
@@ -1978,7 +2097,7 @@ func TestRenameExchangeReplyCarriesBothAuthoritativePostBindings(t *testing.T) {
 	moved := xfsstore.Capability{0xB1}
 	replaced := xfsstore.Capability{0xB2}
 	store := &renameReplyStore{bindings: map[string]xfsstore.Capability{"old": moved, "new": replaced}}
-	h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 4, 2)
+	h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 4, 2)
 	response := h.Handle(ctx, renameReplyRequest(t, cred, root, true))
 	if response.GetErrno() != 0 || response.GetUncertain() {
 		t.Fatalf("Rename exchange = %+v, want definite success", response)
@@ -1996,7 +2115,7 @@ func TestRenameExchangeReplyCarriesBothAuthoritativePostBindings(t *testing.T) {
 func TestRenameSameInodeNoOpReportsBothNamesAndReplaysExactly(t *testing.T) {
 	shared := xfsstore.Capability{0xB3}
 	store := &renameReplyStore{bindings: map[string]xfsstore.Capability{"old": shared, "new": shared}}
-	h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 4, 2)
+	h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 4, 2)
 	request := renameReplyRequest(t, cred, root, false)
 	response := h.Handle(ctx, request)
 	if response.GetErrno() != 0 || response.GetUncertain() {
@@ -2099,12 +2218,12 @@ func resourceAcquisitionRequest(
 	if operation != "open" {
 		parentIdentity := [16]byte{root[0]}
 		name := []byte("capacity-" + operation)
-		request.FrontendOperationId = 1
-		request.SourcePublicationGate = &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{
-			{Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+		request.FskitFrontendOperationId = 1
+		request.FskitSourcePublication = &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
 				Identity: parentIdentity[:], Attributes: true,
 			}}},
-			{Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
 				ParentIdentity: parentIdentity[:], Name: name, BoundAttributes: true,
 			}}},
 		}}
@@ -2117,7 +2236,7 @@ func TestResourceCapacityRefusalPrecedesEveryStoreAllocation(t *testing.T) {
 	for _, operation := range []string{"create", "mkdir", "symlink", "open"} {
 		t.Run(operation, func(t *testing.T) {
 			store := &resourceAdmissionFaultStore{failure: syscall.EACCES}
-			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 0, 0)
+			h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 0, 0)
 			response := h.Handle(ctx, resourceAcquisitionRequest(t, operation, cred, root))
 			if response.GetErrno() != errnos.ENFILE || response.GetUncertain() {
 				t.Fatalf("capacity response=%+v, want definite ENFILE", response)
@@ -2136,7 +2255,7 @@ func TestResourceStoreFailureReleasesExactReservation(t *testing.T) {
 	for _, operation := range []string{"create", "mkdir", "symlink", "open"} {
 		t.Run(operation, func(t *testing.T) {
 			store := &resourceAdmissionFaultStore{failure: syscall.EACCES}
-			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 1, 1)
+			h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 1, 1)
 			response := h.Handle(ctx, resourceAcquisitionRequest(t, operation, cred, root))
 			if response.GetErrno() != int32(syscall.EACCES) || response.GetUncertain() {
 				t.Fatalf("store failure response=%+v, want definite EACCES", response)
@@ -2168,7 +2287,7 @@ func TestCreateCoversNewbornUnderExistingParentWriterLock(t *testing.T) {
 		t: t, parent: xfsstore.Capability{0x72}, child: xfsstore.Capability{0x73},
 		handle: xfsstore.Capability{0x74}, phases: make(map[string]bool),
 	}
-	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
 	if root != store.parent {
 		t.Fatalf("harness root = %x, want parent %x", root, store.parent)
 	}
@@ -2311,10 +2430,10 @@ func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
 				t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
 				handle: xfsstore.Capability{0x74}, truncate: truncate,
 			}
-			h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+			h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
 			request := resourceAcquisitionRequest(t, "create", credential, root)
 			request.GetCreate().Flags.Truncate = truncate
-			for _, target := range request.GetSourcePublicationGate().GetTargets() {
+			for _, target := range request.GetFskitSourcePublication().GetTargets() {
 				if namespace := target.GetNamespace(); namespace != nil {
 					namespace.BoundData = truncate
 				}
@@ -2352,7 +2471,7 @@ func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
 		t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
 		replacement: xfsstore.Capability{0x74}, handle: xfsstore.Capability{0x75}, bindingChanges: true,
 	}
-	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 2, 2)
+	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
 	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
 	if response.GetErrno() != 0 || response.GetUncertain() || response.GetCreate() == nil {
 		t.Fatalf("binding-change response = %+v, want successful re-resolved CREATE", response)
@@ -2434,7 +2553,7 @@ func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing
 	store := &readdirPostStabilizationChangeStore{
 		root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
 	}
-	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
+	h, ctx, credential, _ := resourceAdmissionFskitRequestHarness(t, store, 8, 4)
 	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
 		t.Fatal(err)
 	}
@@ -2488,8 +2607,11 @@ func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
 		!bytes.Equal(replayed.GetLookup().GetItem().GetToken(), item[:]) {
 		t.Fatalf("replayed lookup=%+v", replayed)
 	}
-	if calls := store.lookup.Load(); calls != 1 {
-		t.Fatalf("lookup store calls=%d, want one exact acquisition", calls)
+	// A positive Linux lookup resolves once under N, then re-resolves under the
+	// atomic N+A admission that authorizes its returned attributes. Exact replay
+	// reuses that retained result and performs neither read again.
+	if calls := store.lookup.Load(); calls != 2 {
+		t.Fatalf("lookup store calls=%d, want two-phase N then N+A acquisition", calls)
 	}
 	resources := h.resources[cred.ID]
 	if len(resources.items) != 1 || h.totalItems != 1 {
@@ -2630,7 +2752,7 @@ func testAttachAttempt(id uint64) []byte {
 	return attempt
 }
 
-// attachAndActivateHandler drives the protocol-5 lifecycle directly at the
+// attachAndActivateHandler drives the protocol-6 lifecycle directly at the
 // handler boundary. Transport-registry tests separately prove that the two
 // nonzero binding generations came from the exact DATA/CONTROL pair.
 func attachAndActivateHandler(
@@ -2804,13 +2926,22 @@ func newProtocol5Handler(t *testing.T, membership volumeserver.DurableVisibility
 	if err != nil {
 		t.Fatal(err)
 	}
-	routes := &RoutesController{Visibility: visibility, loaded: true, revision: routesRevisionOf("")}
+	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
+		Membership: membership, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	authorizer := &countingAuthorizer{
 		access:   volumeserver.AccessRead | volumeserver.AccessWrite,
 		deadline: time.Now().Add(time.Hour).Round(0),
 	}
 	h := testVolumeHandler()
-	h.Store, h.Runtime, h.Authorizer, h.Routes, h.Visibility = &resourceAdmissionFaultStore{}, runtime, authorizer, routes, visibility
+	routes := &RoutesController{
+		Topology: lifecycle, Mounts: lifecycle, Leases: h.Leases,
+		Visibility: visibility, loaded: true, revision: routesRevisionOf(""),
+	}
+	h.Store, h.Runtime, h.Authorizer, h.Routes, h.Visibility, h.Lifecycle = &resourceAdmissionFaultStore{}, runtime, authorizer, routes, visibility, lifecycle
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{0xA5})
 	return h, ctx, authorizer, routes
 }
@@ -2818,10 +2949,13 @@ func newProtocol5Handler(t *testing.T, membership volumeserver.DurableVisibility
 func protocol5AttachRequest(id uint64) *authoritypb.Request {
 	attach := &authoritypb.AttachRequest{
 		VolumeId: "handler-protocol-5", AccessToken: []byte("one-use"), ReplaySlots: 2,
-		RoutesRevision: emptyRoutesRevision(), AttachAttemptId: testAttachAttempt(id),
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 64, RepairBudgetMillis: 1000,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+		Purpose:                 authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		RoutesRevision:          emptyRoutesRevision(),
+		AttachAttemptId:         testAttachAttempt(id),
+		FskitCachedNameCapacity: 64,
+		FskitRepairBudgetMillis: 1000,
+		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED,
 	}
 	return &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{Attach: attach}}
 }
@@ -2943,10 +3077,10 @@ func TestProtocol5AttachRequiresNonzeroExactAttemptID(t *testing.T) {
 	}
 }
 
-func TestProtocol5AttachRejectsOmittedRetiredCoherenceProfileBeforeAuthorization(t *testing.T) {
+func TestProtocol6MountAttachRejectsOmittedFrontendProfileBeforeAuthorization(t *testing.T) {
 	h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
 	request := protocol5AttachRequest(32)
-	request.GetAttach().CoherenceProfile = authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNSPECIFIED
+	request.GetAttach().FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED
 	response := h.Handle(ctx, request)
 	if response.GetErrno() != errnos.EINVAL || authorizer.count() != 0 {
 		t.Fatalf("Attach = %+v, authorization calls=%d; want EINVAL before authorization", response, authorizer.count())
@@ -3316,7 +3450,7 @@ func TestProtocol5AbortRacingActivationCannotEraseActive(t *testing.T) {
 	}
 }
 
-func TestProtocol5ActivationPublishesFreshRootInsideRegistrationBoundary(t *testing.T) {
+func retiredProtocol5ActivationPublishesFreshRootInsideRegistrationBoundary(t *testing.T) {
 	h, ctx, _, _ := newProtocol5Handler(t, nil)
 	rootIdentity := [16]byte{0xD1, 0x5C}
 	rootAttr := xfsstore.Attr{
@@ -3522,9 +3656,11 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 
 	activated, epoch, proof := attachAndActivateHandler(t, h, ctx, 1, &authoritypb.AttachRequest{
 		VolumeId: "volume-e2e", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(),
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 64, RepairBudgetMillis: 1000,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+		Purpose:                 authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		FskitCachedNameCapacity: 64,
+		FskitRepairBudgetMillis: 1000,
+		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 	})
 	var sessionID volumeserver.SessionID
 	copy(sessionID[:], proof.GetId())
@@ -3623,21 +3759,13 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 		t.Helper()
 		return attachAndActivateHandler(t, h, ctx, id, &authoritypb.AttachRequest{
 			VolumeId: "volume-lockwait", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(),
-			CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-			CachedNameCapacity: 64, RepairBudgetMillis: 1000,
-			NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
 		})
 	}
 	holder, epoch, holderProof := attachSession(1)
-	var rootCapability xfsstore.Capability
-	copy(rootCapability[:], holder.GetRoot().GetToken())
-	rootIdentity, err := store.Identity(rootCapability)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	create := &authoritypb.Request{RequestId: 3, Epoch: epoch, Session: holderProof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: holder.GetRoot().GetToken(), Name: []byte("lock-wait-target"), Mode: 0o600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
-	stampNamespacePublication(create, 3, rootIdentity, []byte("lock-wait-target"))
 	stampMutation(t, create, 0, 1)
 	created := h.Handle(ctx, create)
 	if created.GetErrno() != 0 {
@@ -3744,6 +3872,17 @@ func TestRoutingRevisionContractRejectsTheOldExactProtocolAtHello(t *testing.T) 
 	if legacy.GetErrno() != int32(syscall.EOPNOTSUPP) || legacy.GetHello() != nil {
 		t.Fatalf("legacy-feature hello = %v, want EOPNOTSUPP before attach", legacy)
 	}
+	malformed := h.Handle(context.Background(), &authoritypb.Request{
+		RequestId:                4,
+		FskitFrontendOperationId: 1,
+		FskitSourcePublication:   &authoritypb.FskitSourcePublication{},
+		Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
+			ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...),
+		}},
+	})
+	if malformed.GetErrno() != int32(syscall.EINVAL) || malformed.GetHello() != nil {
+		t.Fatalf("FSKit-stamped hello = %v, want EINVAL before negotiation", malformed)
+	}
 }
 
 func stampMutation(t *testing.T, request *authoritypb.Request, slot uint32, sequence uint64) {
@@ -3752,12 +3891,12 @@ func stampMutation(t *testing.T, request *authoritypb.Request, slot uint32, sequ
 }
 
 func stampNamespacePublication(request *authoritypb.Request, operationID uint64, parent [16]byte, name []byte) {
-	request.FrontendOperationId = operationID
-	request.SourcePublicationGate = &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{
-		{Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+	request.FskitFrontendOperationId = operationID
+	request.FskitSourcePublication = &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+		{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
 			Identity: append([]byte(nil), parent[:]...), Attributes: true,
 		}}},
-		{Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+		{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
 			ParentIdentity: append([]byte(nil), parent[:]...), Name: append([]byte(nil), name...),
 			BoundAttributes: true,
 		}}},

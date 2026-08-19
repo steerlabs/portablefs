@@ -14,16 +14,14 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// ProtocolMajor is intentionally incompatible with every earlier authority
-// data path. Version 5 makes one DATA and one CONTROL transport mandatory and
-// activates a provisional attach only after both authenticated bindings exist.
-// There is no single-connection compatibility path: peers that disagree must
-// fail at Hello, not mix transport or session lifecycles.
-const ProtocolMajor uint32 = 5
+// ProtocolMajor 6 is the stock-kernel lease architecture. It is intentionally
+// incompatible with the previous private-kernel publication profile; there is no
+// negotiated downgrade or second execution path.
+const ProtocolMajor uint32 = 6
 
 // ProtocolALPN is exported so the production authority listener and the RPC
 // server package cannot drift onto different exact protocols.
-const ProtocolALPN = "portablefs-authority-v5"
+const ProtocolALPN = "portablefs-authority-v6"
 
 const protocolALPN = ProtocolALPN
 
@@ -55,51 +53,82 @@ const maxDirentBytes uint32 = 768
 // volume would be unusable rather than merely constrained.
 const MinimumFrameBytes uint32 = fixedMutationReplyBytes + responseEnvelopeReserve
 
+// RequiredFskitWriteBytes is the largest one-callback write FSKit can deliver.
+// The authority may transport it in bounded DATA fragments but must stage the
+// complete callback before its single COMMIT mutation.
+const RequiredFskitWriteBytes uint64 = 0x7ffff000
+
 const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
 const sessionReauthorizationFeature = "session-reauthorization-v1"
 const mountEnrollmentReauthorizationFeature = "mount-enrollment-reauthorization-v1"
-const strictWriteTransactionFeature = "transactional-shared-write-v1"
-const oneShotWriteFeature = "one-shot-write-v1"
-
-// strictLinuxMutationSuiteFeature proves the authority implements every
-// operation the indivisible patched-kernel profile can issue beyond the write
-// transaction itself: exact fallocate, server-side copy_file_range, and
-// O_TMPFILE capability acquisition. A kernel must not discover an older
-// protocol-5 authority only when the first such syscall would otherwise fence
-// the mount.
-const strictLinuxMutationSuiteFeature = "strict-linux-mutation-suite-v1"
-
-// terminalAppliedDeliveryFeature proves that a fenced authority retains a
-// terminal applied-state response until the frontend confirms its local kernel
-// publication boundary. Without it, connection teardown can overtake the one
-// reply that carries the exact post-mutation state.
-const terminalAppliedDeliveryFeature = "terminal-applied-delivery-receipt-v1"
-
-// sequencedVisibilityRetryFeature proves both sides implement the exact
-// Linux handoff: the authority returns the blocking peer sequence and
-// the frontend waits for that local repair before resubmitting with an
-// authority-authenticated, replay-bound proof. The proof lets the retried DATA
-// request wait behind an in-flight CONTROL ACK without reopening the source-gate
-// cycle. Without this negotiation, an older protocol-5 frontend could leak the
-// internal EINTR to an application or spin across those independent lanes.
-const sequencedVisibilityRetryFeature = "sequenced-visibility-retry-v1"
-
-// locklessNamespaceRepairFeature makes the patched kernel primitive an
-// indivisible protocol-5 profile invariant. A frontend without it must fail at
-// Hello instead of falling back to parent-lock interruption and leaking EINTR.
-const locklessNamespaceRepairFeature = "lockless-namespace-repair-v1"
-
-// RequiredWriteTransactionBytes is Linux MAX_RW_COUNT on the smallest
-// supported page size. Larger-page kernels have a slightly smaller bound, so
-// this fixed authority contract can stage every legal write_iter without a
-// page-size negotiation or a silent clamp.
-const RequiredWriteTransactionBytes uint64 = 0x7ffff000
+const leaseCoherenceFeature = "lease-coherence-v1"
+const leaseRecallFeature = "lease-recall-v1"
+const leaseRenewalFeature = "lease-renewal-v1"
+const directoryEnumerationLeaseFeature = "directory-enumeration-lease-v1"
+const openByIdentityFeature = "open-by-identity-v1"
+const fskitSyncRepairFeature = "fskit-sync-repair-v1"
+const fskitSourcePublicationFeature = "fskit-source-publication-v1"
+const fskitFragmentedWriteFeature = "fskit-fragmented-write-v1"
 
 var (
-	requiredHelloFeatures        = []string{"xfs-current-state", "session-exact-epoch", "direct-write", "framed-bulk-data-v1", "authority-keyed-replay-fingerprint-v1", "visibility-ack-next-v1", "mandatory-dual-transport-v1", "strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1", "exact-resource-acquisition", strictWriteTransactionFeature, oneShotWriteFeature, strictLinuxMutationSuiteFeature, terminalAppliedDeliveryFeature}
-	requiredAttachFeatures       = []string{"write-through", "no-history", "no-branches", "direct-io-no-file-mmap", "user-xattr-readonly", "single-principal", "distributed-posix-locks", "stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier", "exact-resource-acquisition", strictWriteTransactionFeature, oneShotWriteFeature}
-	requiredStrictAttachFeatures = []string{"strict-two-phase-visibility", "classified-visibility-interruption", sequencedVisibilityRetryFeature, locklessNamespaceRepairFeature, "namespace-post-binding-identity", "source-publication-gate-v1"}
+	requiredCommonHelloFeatures = []string{
+		"xfs-current-state", "session-exact-epoch", "framed-bulk-data-v1",
+		"authority-keyed-replay-fingerprint-v1", "mandatory-dual-transport-v1", "exact-resource-acquisition",
+	}
+	requiredLinuxHelloFeatures = []string{
+		"direct-write",
+		leaseCoherenceFeature, directoryEnumerationLeaseFeature,
+	}
+	requiredFskitHelloFeatures = []string{
+		fskitSyncRepairFeature, fskitSourcePublicationFeature, fskitFragmentedWriteFeature,
+	}
+	requiredCommonAttachFeatures = []string{
+		"write-through", "no-history", "no-branches", "user-xattr-readonly",
+		"single-principal", "stable-item-identity", "volume-syncfs-barrier",
+		"exact-resource-acquisition",
+	}
+	requiredLinuxAttachFeatures = []string{
+		"direct-io-no-file-mmap", "distributed-posix-locks",
+		leaseRenewalFeature, leaseRecallFeature, openByIdentityFeature,
+	}
+	requiredFskitAttachFeatures = []string{
+		fskitSyncRepairFeature, fskitSourcePublicationFeature, fskitFragmentedWriteFeature,
+		peerCompleteFIFOFeedbackFeature,
+	}
+	// These aliases are the exact Linux profile and remain package-local so the
+	// stock-FUSE client and its tests share one frozen feature set.
+	requiredHelloFeatures        = append(append([]string(nil), requiredCommonHelloFeatures...), requiredLinuxHelloFeatures...)
+	requiredAttachFeatures       = append([]string(nil), requiredCommonAttachFeatures...)
+	requiredStrictAttachFeatures = append([]string(nil), requiredLinuxAttachFeatures...)
 )
+
+func helloFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
+	features := append([]string(nil), requiredCommonHelloFeatures...)
+	switch profile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED:
+		return features, true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		return append(features, requiredLinuxHelloFeatures...), true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+		return append(features, requiredFskitHelloFeatures...), true
+	default:
+		return nil, false
+	}
+}
+
+func activateFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
+	features := append([]string(nil), requiredCommonAttachFeatures...)
+	switch profile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED:
+		return features, true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		return append(features, requiredLinuxAttachFeatures...), true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+		return append(features, requiredFskitAttachFeatures...), true
+	default:
+		return nil, false
+	}
+}
 
 func hasFeatures(advertised, required []string) bool {
 	set := make(map[string]struct{}, len(advertised))
@@ -132,7 +161,7 @@ func terminalQuiesceCancelable(req *authoritypb.Request) bool {
 	if req == nil {
 		return false
 	}
-	if blockingWait(req) || req.GetNextVisibility() != nil || req.GetApplyRoutes() != nil {
+	if blockingWait(req) || req.GetNextLeaseEvent() != nil || req.GetNextFskitRepair() != nil || req.GetApplyRoutes() != nil {
 		return true
 	}
 	return false
@@ -165,26 +194,91 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 		return flags != nil && (flags.GetWrite() || flags.GetAppend() || flags.GetTruncate())
 	case *authoritypb.Request_SetLock:
 		return !body.SetLock.GetUnlock() && body.SetLock.GetLock() != nil && body.SetLock.GetLock().GetWrite()
-	case *authoritypb.Request_WriteTransaction:
-		// ABORT only releases already-reserved inert state. It remains legal
-		// after a grant is downgraded so cleanup can never be held hostage by
-		// current write authorization.
-		return body.WriteTransaction.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT
-	case *authoritypb.Request_OneShotWrite:
+	case *authoritypb.Request_Write:
 		return true
+	case *authoritypb.Request_FskitWrite:
+		switch body.FskitWrite.GetPhase() {
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN,
+			authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA,
+			authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT:
+			return true
+		default:
+			// ABORT remains available after an authorization downgrade so the
+			// frontend can retire bytes staged while it still had write access.
+			return false
+		}
 	default:
 		return false
 	}
 }
 
-// requestIsVisibleMutation is the single protocol-level classification of
-// operations whose ordinary callback can publish state another mount must
-// repair. Every one carries an exact source publication gate under the one
-// coherent protocol-5 mount contract. Non-visible operations must omit it.
+func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.FrontendProfile) bool {
+	if req == nil {
+		return false
+	}
+	common := func() bool {
+		switch req.GetBody().(type) {
+		case *authoritypb.Request_Hello, *authoritypb.Request_Attach,
+			*authoritypb.Request_Resume, *authoritypb.Request_Activate,
+			*authoritypb.Request_AbortAttach, *authoritypb.Request_TerminalDeliveryReceipt,
+			*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
+			*authoritypb.Request_Cancel, *authoritypb.Request_Reauthorize,
+			*authoritypb.Request_ApplyRoutes,
+			*authoritypb.Request_Lookup, *authoritypb.Request_GetAttr,
+			*authoritypb.Request_SetAttr, *authoritypb.Request_Create,
+			*authoritypb.Request_Mkdir, *authoritypb.Request_Unlink,
+			*authoritypb.Request_Rename, *authoritypb.Request_Link,
+			*authoritypb.Request_Symlink, *authoritypb.Request_Readlink,
+			*authoritypb.Request_Open, *authoritypb.Request_Close,
+			*authoritypb.Request_Read, *authoritypb.Request_Fsync,
+			*authoritypb.Request_ReadDir, *authoritypb.Request_Reclaim,
+			*authoritypb.Request_GetXattr, *authoritypb.Request_SetXattr,
+			*authoritypb.Request_ListXattr, *authoritypb.Request_RemoveXattr,
+			*authoritypb.Request_StatFs, *authoritypb.Request_SyncFs:
+			return true
+		default:
+			return false
+		}
+	}
+	switch profile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		if req.GetFskitSourcePublication() != nil || req.GetFskitFrontendOperationId() != 0 {
+			return false
+		}
+		switch req.GetBody().(type) {
+		case *authoritypb.Request_Flush, *authoritypb.Request_Fallocate,
+			*authoritypb.Request_CopyFileRange, *authoritypb.Request_Tmpfile,
+			*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
+			*authoritypb.Request_Write, *authoritypb.Request_NextLeaseEvent,
+			*authoritypb.Request_AcknowledgeLeaseEvent, *authoritypb.Request_RenewLeases,
+			*authoritypb.Request_AcknowledgeSourceLeaseDischarge:
+			return true
+		default:
+			return common()
+		}
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+		if (req.GetFskitSourcePublication() != nil || req.GetFskitFrontendOperationId() != 0) && !requestIsVisibleMutation(req) {
+			return false
+		}
+		switch req.GetBody().(type) {
+		case *authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
+			*authoritypb.Request_FskitWrite:
+			return true
+		default:
+			return common()
+		}
+	default:
+		return false
+	}
+}
+
+// requestIsVisibleMutation classifies callbacks that can publish new state to
+// another mount. FSKit requires an exact source-publication declaration for
+// this set; Linux derives its lease obligations entirely at the authority.
 func requestIsVisibleMutation(req *authoritypb.Request) bool {
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_SetAttr,
-		*authoritypb.Request_OneShotWrite,
+		*authoritypb.Request_Write,
 		*authoritypb.Request_Fallocate,
 		*authoritypb.Request_CopyFileRange,
 		*authoritypb.Request_Create,
@@ -199,86 +293,64 @@ func requestIsVisibleMutation(req *authoritypb.Request) bool {
 		return true
 	case *authoritypb.Request_Open:
 		return body.Open.GetFlags() != nil && body.Open.GetFlags().GetTruncate()
-	case *authoritypb.Request_WriteTransaction:
-		return body.WriteTransaction.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT
+	case *authoritypb.Request_FskitWrite:
+		return body.FskitWrite.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT
 	default:
 		return false
 	}
 }
 
-func validSourcePublicationGatePresence(req *authoritypb.Request) bool {
-	return (req.GetSourcePublicationGate() != nil) == requestIsVisibleMutation(req)
+func validFskitSourcePublicationPresence(req *authoritypb.Request) bool {
+	return (req.GetFskitSourcePublication() != nil) == requestIsVisibleMutation(req)
 }
 
-// validVisibilityRetryRequestShape is the wire-level half of the retry
-// proof. The visibility coordinator validates the stateful half against the
-// exact one-shot debt it issued. Keeping the cheap structural checks here
-// prevents a retry proof from entering lifecycle, read-only, or
-// callback-serialized paths where it has no meaning. Namespace gates are valid
-// only for the lockless Linux attachment and are authenticated statefully by
-// the visibility coordinator.
-func validVisibilityRetryRequestShape(req *authoritypb.Request, gate *volumeserver.SourcePublicationGate) bool {
-	if req == nil {
-		return false
-	}
-	if req.GetVisibilityRetryAfterSequence() == 0 {
-		return true
-	}
-	if !requestIsVisibleMutation(req) || req.GetFrontendOperationId() == 0 || gate == nil || len(gate.Targets) == 0 {
-		return false
-	}
-	return true
-}
-
-// decodeSourcePublicationGate validates the one canonical wire declaration
-// before replay identity is computed. In particular, a sender cannot make an
-// exact replay depend on protobuf repeated-field order or duplicate merging:
-// both are rejected, never normalized after fingerprinting.
-func decodeSourcePublicationGate(req *authoritypb.Request) (*volumeserver.SourcePublicationGate, error) {
-	wire := req.GetSourcePublicationGate()
+// decodeFskitSourcePublication refuses noncanonical target order and shape
+// before replay fingerprinting or mutation admission. The authority derives
+// the same gate independently from the operation before apply.
+func decodeFskitSourcePublication(req *authoritypb.Request) (*volumeserver.SourcePublicationGate, error) {
+	wire := req.GetFskitSourcePublication()
 	if wire == nil {
 		return nil, nil
 	}
 	if len(wire.ProtoReflect().GetUnknown()) != 0 || len(wire.GetTargets()) == 0 || len(wire.GetTargets()) > 16 {
-		return nil, fmt.Errorf("%w: malformed source publication gate", errNonCanonical)
+		return nil, fmt.Errorf("%w: malformed FSKit source publication", errNonCanonical)
 	}
 	gate := &volumeserver.SourcePublicationGate{Targets: make([]volumeserver.SourcePublicationTarget, 0, len(wire.GetTargets()))}
 	for _, encoded := range wire.GetTargets() {
 		if encoded == nil || len(encoded.ProtoReflect().GetUnknown()) != 0 {
-			return nil, fmt.Errorf("%w: malformed source publication target", errNonCanonical)
+			return nil, fmt.Errorf("%w: malformed FSKit source publication target", errNonCanonical)
 		}
 		var target volumeserver.SourcePublicationTarget
 		switch coordinate := encoded.GetCoordinate().(type) {
-		case *authoritypb.SourcePublicationTarget_Item:
+		case *authoritypb.FskitSourcePublicationTarget_Item:
 			item := coordinate.Item
 			if item == nil || len(item.ProtoReflect().GetUnknown()) != 0 || len(item.GetIdentity()) != len(target.Identity) ||
 				!item.GetAttributes() || item.GetData() && !item.GetAttributes() {
-				return nil, fmt.Errorf("%w: malformed source item target", errNonCanonical)
+				return nil, fmt.Errorf("%w: malformed FSKit source item target", errNonCanonical)
 			}
 			copy(target.Identity[:], item.GetIdentity())
 			if target.Identity == ([16]byte{}) {
-				return nil, fmt.Errorf("%w: source item identity is zero", errNonCanonical)
+				return nil, fmt.Errorf("%w: FSKit source item identity is zero", errNonCanonical)
 			}
 			target.Attributes, target.Data = item.GetAttributes(), item.GetData()
-		case *authoritypb.SourcePublicationTarget_Namespace:
+		case *authoritypb.FskitSourcePublicationTarget_Namespace:
 			namespace := coordinate.Namespace
 			if namespace == nil || len(namespace.ProtoReflect().GetUnknown()) != 0 ||
 				len(namespace.GetParentIdentity()) != len(target.ParentIdentity) ||
-				!validProtocolNamespaceName(namespace.GetName()) ||
-				namespace.GetBoundData() && !namespace.GetBoundAttributes() {
-				return nil, fmt.Errorf("%w: malformed source namespace target", errNonCanonical)
+				!validProtocolNamespaceName(namespace.GetName()) || namespace.GetBoundData() && !namespace.GetBoundAttributes() {
+				return nil, fmt.Errorf("%w: malformed FSKit source namespace target", errNonCanonical)
 			}
 			copy(target.ParentIdentity[:], namespace.GetParentIdentity())
 			if target.ParentIdentity == ([16]byte{}) {
-				return nil, fmt.Errorf("%w: source namespace parent identity is zero", errNonCanonical)
+				return nil, fmt.Errorf("%w: FSKit source namespace parent identity is zero", errNonCanonical)
 			}
 			target.Name = append([]byte(nil), namespace.GetName()...)
 			target.BoundAttributes, target.BoundData = namespace.GetBoundAttributes(), namespace.GetBoundData()
 		default:
-			return nil, fmt.Errorf("%w: source target has no coordinate", errNonCanonical)
+			return nil, fmt.Errorf("%w: FSKit source target has no coordinate", errNonCanonical)
 		}
 		if len(gate.Targets) != 0 && compareSourcePublicationTarget(gate.Targets[len(gate.Targets)-1], target) >= 0 {
-			return nil, fmt.Errorf("%w: source targets are duplicate or out of order", errNonCanonical)
+			return nil, fmt.Errorf("%w: FSKit source targets are duplicate or out of order", errNonCanonical)
 		}
 		gate.Targets = append(gate.Targets, target)
 	}
@@ -330,7 +402,10 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 		*authoritypb.Request_Reauthorize,
 		*authoritypb.Request_Detach, *authoritypb.Request_Cancel,
 		*authoritypb.Request_TerminalDeliveryReceipt,
-		*authoritypb.Request_NextVisibility, *authoritypb.Request_AckVisibility,
+		*authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent,
+		*authoritypb.Request_RenewLeases,
+		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
+		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
 		*authoritypb.Request_ApplyRoutes:
 		return false
 	case *authoritypb.Request_SetLock:
@@ -345,10 +420,6 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 		// Non-blocking lock calls keep the guard: they are cheap and complete
 		// immediately, so uniformity there costs nothing.
 		return body.SetLock.GetUnlock() || !body.SetLock.GetWait()
-	case *authoritypb.Request_WriteTransaction:
-		// BEGIN/DATA/ABORT are session-local staging operations. COMMIT is the
-		// one filesystem mutation and owns the ordinary topology read cut.
-		return body.WriteTransaction.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT
 	default:
 		// Unknown future filesystem operations fail closed into the guarded side.
 		return true
@@ -363,7 +434,7 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 // versions. A replay with different content is therefore rejected without
 // making every client hash a large payload before it can send it.
 func canonicalFingerprint(runtime *volumeserver.Authority, req *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
-	if body := req.GetOneShotWrite(); body != nil {
+	if body := req.GetWrite(); body != nil {
 		digest := sha256.Sum256(body.GetData())
 		return canonicalFingerprintWithWriteDataDigest(runtime, req, digest)
 	}
@@ -380,8 +451,7 @@ func withFramePayloadDigest(ctx context.Context, digest *[sha256.Size]byte) cont
 }
 
 func framePayloadDigest(ctx context.Context, req *authoritypb.Request) ([sha256.Size]byte, bool) {
-	if ctx == nil || req == nil || (req.GetOneShotWrite() == nil &&
-		(req.GetWriteTransaction() == nil || req.GetWriteTransaction().GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA)) {
+	if ctx == nil || req == nil || req.GetWrite() == nil && req.GetFskitWrite() == nil {
 		return [sha256.Size]byte{}, false
 	}
 	digest, ok := ctx.Value(framePayloadDigestKey{}).([sha256.Size]byte)
@@ -390,7 +460,7 @@ func framePayloadDigest(ctx context.Context, req *authoritypb.Request) ([sha256.
 
 // canonicalFingerprintFromFrame uses the digest produced while the transport
 // copied an out-of-line write body into its retained frame. Direct handler
-// callers have no transport digest and deliberately keep the one-shot path.
+// callers have no transport digest and hash the payload directly.
 func canonicalFingerprintFromFrame(ctx context.Context, runtime *volumeserver.Authority, req *authoritypb.Request) (volumeserver.RequestFingerprint, error) {
 	if digest, ok := framePayloadDigest(ctx, req); ok {
 		return canonicalFingerprintWithWriteDataDigest(runtime, req, digest)
@@ -427,18 +497,19 @@ func canonicalFingerprintWithOptions(runtime *volumeserver.Authority, req *autho
 	if mutation := req.GetMutation(); mutation != nil && len(mutation.ProtoReflect().GetUnknown()) != 0 {
 		return volumeserver.RequestFingerprint{}, fmt.Errorf("%w: unknown mutation fields are not part of this protocol", errNonCanonical)
 	}
-	if _, err := decodeSourcePublicationGate(req); err != nil {
+	if _, err := decodeFskitSourcePublication(req); err != nil {
 		return volumeserver.RequestFingerprint{}, err
 	}
 	// The body is already immutable for the duration of dispatch. Stream the
 	// canonical form directly into the keyed fingerprint instead of recursively
 	// materializing one payload-sized byte slice at every protobuf nesting level.
-	// The tiny envelope below deliberately shares the body; canonicalWrite only
-	// reads it.
+	// The tiny envelope below deliberately shares the body and FSKit publication
+	// declaration; canonicalWrite only reads them. Request/session/mutation
+	// transport fields remain stripped, while the frontend operation identity
+	// and source cache coordinates are part of the syscall's exact replay identity.
 	body := &authoritypb.Request{
-		SourcePublicationGate:        req.GetSourcePublicationGate(),
-		VisibilityRetryAfterSequence: req.GetVisibilityRetryAfterSequence(),
-		Body:                         req.GetBody(),
+		Body: req.GetBody(), FskitSourcePublication: req.GetFskitSourcePublication(),
+		FskitFrontendOperationId: req.GetFskitFrontendOperationId(),
 	}
 	return runtime.ReplayFingerprint(func(writer io.Writer) error {
 		return canonicalWriteWithOptions(writer, body.ProtoReflect(), options)
@@ -448,7 +519,7 @@ func canonicalFingerprintWithOptions(runtime *volumeserver.Authority, req *autho
 var errNonCanonical = errors.New("authorityrpc: request cannot be canonicalized")
 
 // canonicalWrite emits the exact byte stream canonicalBytes defines without
-// constructing that stream in memory. Large WriteTransactionRequest.Data fields dominate
+// constructing that stream in memory. Large WriteRequest.Data fields dominate
 // the data plane; recursively appending a 1 MiB field once per enclosing
 // message used to allocate and copy more than 4 MiB on both the client and the
 // authority before XFS saw one byte. Streaming preserves the frozen digest
@@ -622,8 +693,7 @@ func canonicalWriteField(writer io.Writer, field protoreflect.FieldDescriptor, v
 
 func isCanonicalWriteDataField(field protoreflect.FieldDescriptor) bool {
 	switch field.FullName() {
-	case "portablefs.authority.v1.WriteTransactionRequest.data",
-		"portablefs.authority.v1.OneShotWriteRequest.data":
+	case "portablefs.authority.v1.WriteRequest.data", "portablefs.authority.v1.FskitWriteRequest.data":
 		return true
 	default:
 		return false

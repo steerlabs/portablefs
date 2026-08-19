@@ -85,7 +85,7 @@ func validMutationPostStateRoles(request *authoritypb.Request, state *authorityp
 	}
 	got := postStateRoleMultiset(state)
 	switch body := request.GetBody().(type) {
-	case *authoritypb.Request_WriteTransaction, *authoritypb.Request_OneShotWrite,
+	case *authoritypb.Request_Write, *authoritypb.Request_FskitWrite,
 		*authoritypb.Request_SetAttr, *authoritypb.Request_Fallocate,
 		*authoritypb.Request_Open, *authoritypb.Request_SetXattr,
 		*authoritypb.Request_RemoveXattr:

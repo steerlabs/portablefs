@@ -54,7 +54,11 @@ func (h *VolumeHandler) mutationPostState(sequence uint64, snapshots ...postStat
 	if h.postStateChanges == nil {
 		h.postStateChanges = make(map[uint64]map[[16]byte]struct{})
 	}
+	if h.postStateAllChanges == nil {
+		h.postStateAllChanges = make(map[uint64]map[[16]byte]struct{})
+	}
 	changedIdentities := make(map[[16]byte]struct{})
+	allChangedIdentities := make(map[[16]byte]struct{})
 	objects := make([]*authoritypb.ObjectPostState, 0, len(ordered))
 	for _, snapshot := range ordered {
 		version := h.objectVersions[snapshot.identity]
@@ -63,8 +67,11 @@ func (h *VolumeHandler) mutationPostState(sequence uint64, snapshots ...postStat
 			version = 1
 		}
 		if snapshot.changed {
+			// This is a provisional pre-apply admission generation. The handler
+			// replaces it with a post-apply commit sequence before validating or
+			// publishing the response; do not mutate the committed version map yet.
 			version = sequence
-			h.objectVersions[snapshot.identity] = sequence
+			allChangedIdentities[snapshot.identity] = struct{}{}
 			// A CREATED identity had no pre-mutation coordinate another
 			// participant could have registered. Its name is published by the
 			// namespace target; only pre-existing changed identities require an
@@ -81,8 +88,46 @@ func (h *VolumeHandler) mutationPostState(sequence uint64, snapshots ...postStat
 		})
 	}
 	h.postStateChanges[sequence] = changedIdentities
+	h.postStateAllChanges[sequence] = allChangedIdentities
 	h.postStateMu.Unlock()
 	return &authoritypb.PostState{VisibilitySequence: sequence, SnapshotSequence: sequence, Objects: objects}
+}
+
+func (h *VolumeHandler) finalizeMutationPostState(provisional, committed uint64, state *authoritypb.PostState) map[string]uint64 {
+	if provisional == 0 || committed == 0 || state == nil {
+		return nil
+	}
+	h.postStateMu.Lock()
+	defer h.postStateMu.Unlock()
+	changed := h.postStateChanges[provisional]
+	allChanged := h.postStateAllChanges[provisional]
+	delete(h.postStateChanges, provisional)
+	delete(h.postStateAllChanges, provisional)
+	versions := make(map[string]uint64, len(state.GetObjects()))
+	for _, object := range state.GetObjects() {
+		if object == nil || len(object.GetStableIdentity()) != 16 {
+			continue
+		}
+		var identity [16]byte
+		copy(identity[:], object.GetStableIdentity())
+		version := h.objectVersions[identity]
+		if version == 0 {
+			version = 1
+		}
+		if _, wasChanged := allChanged[identity]; wasChanged {
+			version = committed
+			h.objectVersions[identity] = committed
+		}
+		object.ObjectVersion = version
+		versions[string(identity[:])] = version
+	}
+	state.VisibilitySequence = committed
+	state.SnapshotSequence = committed
+	if h.postStateChanges == nil {
+		h.postStateChanges = make(map[uint64]map[[16]byte]struct{})
+	}
+	h.postStateChanges[committed] = changed
+	return versions
 }
 
 func (h *VolumeHandler) takePostStateChanges(sequence uint64) map[[16]byte]struct{} {

@@ -460,20 +460,6 @@ type RawFileSystem interface {
 
 	Release(cancel <-chan struct{}, input *ReleaseIn)
 	Write(cancel <-chan struct{}, input *WriteIn, data []byte) (written uint32, code Status)
-	// PFSWrite executes one phase of PortableFS's negotiated transaction for
-	// every SHARED regular write, whether positioned or effective append. DATA
-	// carries bytes; BEGIN, COMMIT, and ABORT do not. Generic PFSPublish closes
-	// kernel/VFS publication after COMMIT.
-	PFSWrite(cancel <-chan struct{}, input *PFSWriteIn, data []byte, out *PFSWriteOut) (code Status)
-	// PFSPublish acknowledges that the kernel completed postprocessing for one
-	// response marked with PFS_UNIQUE_PUBLISH. It is local to the FUSE ABI and
-	// never crosses PortableFS's authority transport.
-	PFSPublish(cancel <-chan struct{}, input *PFSPublishIn, out *PFSPublishOut) (code Status)
-	// PFSFallocate and PFSCopyFileRange are the mandatory one-mutation range
-	// operations for strict SHARED regular files. LOCAL files retain stock FUSE
-	// operations and never enter these methods.
-	PFSFallocate(cancel <-chan struct{}, input *PFSFallocateIn, out *PFSRangeOut) (code Status)
-	PFSCopyFileRange(cancel <-chan struct{}, input *PFSCopyFileRangeIn, out *PFSRangeOut) (code Status)
 	CopyFileRange(cancel <-chan struct{}, input *CopyFileRangeIn) (written uint32, code Status)
 	Ioctl(cancel <-chan struct{}, input *IoctlIn, inbuf []byte, output *IoctlOut, outbuf []byte) (code Status)
 
@@ -522,12 +508,8 @@ type ReplyWriteLifecycle interface {
 // opcode's maximum trailer. The implementation returns the number of bytes it
 // initialized; a non-OK status prevents the device write.
 type ReplyPayloadPreparer interface {
-	PrepareReplyPayload(unique, nodeid uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, Status)
-}
-
-// ReplyPublishMarker is the optional private extension which marks an ordered
-// reply as requiring a post-VFS FUSE_PFS_PUBLISH receipt. Returning true is
-// valid only when ReplyWriteOrdered returns true for the same unique.
-type ReplyPublishMarker interface {
-	ReplyPublishMarked(unique uint64, nodeid uint64, opcode uint32) bool
+	// replyStatus replaces the filesystem result at the writer edge;
+	// prepareStatus reports failure of the lifecycle itself and prevents a
+	// device write.
+	PrepareReplyPayload(unique, nodeid uint64, opcode uint32, outData, payload []byte, payloadSize int) (size int, replyStatus, prepareStatus Status)
 }

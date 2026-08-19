@@ -173,13 +173,6 @@ func newRegistry(stateDir string) *registry {
 	return newRegistryWithStateDir(stateDir)
 }
 
-// newFSKitQualificationRegistry is retained as a package-test spelling for the
-// existing protocol-5 fixture inventory. Production and tests now exercise the
-// same macOS 26 cache-policy admission path.
-func newFSKitQualificationRegistry(stateDir string) *registry {
-	return newRegistryWithStateDir(stateDir)
-}
-
 func newRuntimeRegistry(stateDir string) *registry {
 	return newRegistryWithStateDir(stateDir)
 }

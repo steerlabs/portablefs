@@ -25,20 +25,16 @@ import (
 
 // The transport and declaration defaults every v3 frontend starts from.
 //
-// The first group are transport bounds: they negotiate downward against the
-// authority's advertised limits and are private to this client. The second
-// group is different in kind — CachedNameCapacity and RepairBudget are
-// DECLARED to the authority, which sizes its visibility barrier from them, so
-// two frontends that disagreed here would be admitted with different
-// obligations for the same product behavior.
+// Transport bounds negotiate downward against the authority's advertised
+// limits. CachedNameCapacity and RepairBudget are local resource and recall
+// bounds under protocol 6's one exact lease profile.
 const (
 	ReplaySlots  uint32 = 128
 	MaxInFlight         = 128
 	MaxFrame     uint32 = 4 << 20
 	ReclaimQueue        = 4096
 
-	// CachedNameCapacity is how many directory bindings a strict mount may
-	// leave resident in its kernel.
+	// CachedNameCapacity bounds daemon-held name leases and cached resolutions.
 	CachedNameCapacity = 1 << 16
 )
 
@@ -46,8 +42,7 @@ const (
 	DialTimeout        = 10 * time.Second
 	CancelDrainTimeout = 10 * time.Second
 	RequestTimeout     = 45 * time.Second
-	// RepairBudget is the per-phase deadline a strict mount commits to before
-	// revoking itself; the authority fences the mount on the same number.
+	// RepairBudget bounds local recall repair before the mount revokes itself.
 	RepairBudget = 15 * time.Second
 )
 

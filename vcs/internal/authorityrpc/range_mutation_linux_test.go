@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -182,25 +181,12 @@ func newRangeMutationHarness(t *testing.T) (*VolumeHandler, volumeserver.Session
 	return h, credential, store, input, output
 }
 
-func itemGate(identities ...[16]byte) *authoritypb.SourcePublicationGate {
-	targets := make([]*authoritypb.SourcePublicationTarget, 0, len(identities))
-	for _, identity := range identities {
-		identity := identity
-		targets = append(targets, &authoritypb.SourcePublicationTarget{Coordinate: &authoritypb.SourcePublicationTarget_Item{
-			Item: &authoritypb.SourcePublicationItem{Identity: identity[:], Attributes: true, Data: true},
-		}})
-	}
-	return &authoritypb.SourcePublicationGate{Targets: targets}
-}
-
 func fallocateMutationRequest(requestID uint64, handle xfsstore.Capability) *authoritypb.Request {
 	request := &authoritypb.Request{
-		RequestId: requestID, FrontendOperationId: 17,
+		RequestId: requestID,
 		Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{
-			Handle: handle[:], Offset: 4, Length: 8, RlimitFsize: math.MaxUint64,
-			FileMaxSize: math.MaxInt64, WriteFlags: writeTransactionKillSUIDGID,
+			Handle: handle[:], Offset: 4, Length: 8,
 		}},
-		SourcePublicationGate: itemGate([16]byte{handle[0]}),
 	}
 	request.Mutation = &authoritypb.Mutation{Slot: 0, Sequence: 1}
 	return request
@@ -219,7 +205,7 @@ func TestFallocateRequestModeSetIsExact(t *testing.T) {
 		uint32(unix.FALLOC_FL_UNSHARE_RANGE | unix.FALLOC_FL_KEEP_SIZE),
 	}
 	for _, mode := range valid {
-		body := &authoritypb.FallocateRequest{Handle: make([]byte, 16), Length: 1, RlimitFsize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: mode}
+		body := &authoritypb.FallocateRequest{Handle: make([]byte, 16), Length: 1, Mode: mode}
 		if !validFallocateRequest(body) {
 			t.Fatalf("valid mode %#x was refused", mode)
 		}
@@ -232,7 +218,7 @@ func TestFallocateRequestModeSetIsExact(t *testing.T) {
 		1 << 31,
 	}
 	for _, mode := range invalid {
-		body := &authoritypb.FallocateRequest{Handle: make([]byte, 16), Length: 1, RlimitFsize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: mode}
+		body := &authoritypb.FallocateRequest{Handle: make([]byte, 16), Length: 1, Mode: mode}
 		if validFallocateRequest(body) {
 			t.Fatalf("invalid mode %#x was admitted", mode)
 		}
@@ -246,7 +232,8 @@ func TestFallocateAppliedResultAndReplayCarryExactPostState(t *testing.T) {
 	response := h.handleFallocate(t.Context(), request, credential, request.GetFallocate())
 	reply := response.GetFallocate()
 	if response.GetErrno() != 0 || response.GetUncertain() || postStateTargetAttr(response.GetPostState()).GetSize() != 12 ||
-		reply.GetFlags() != rangeReplyApplied || reply.GetResultSize() != 0 || reply.GetPostSize() != 12 || reply.GetVisibilitySequence() != 1 {
+		reply.GetFlags() != rangeReplyApplied || reply.GetResultSize() != 0 || reply.GetPostSize() != 12 ||
+		reply.GetVisibilitySequence() != response.GetPostState().GetSnapshotSequence() {
 		t.Fatalf("fallocate applied = %+v", response)
 	}
 	replay := fallocateMutationRequest(2, handle)
@@ -279,7 +266,7 @@ func TestFallocatePostDispatchErrorPublishesAndReplaysExactState(t *testing.T) {
 	reply := response.GetFallocate()
 	if response.GetErrno() != 0 || response.GetUncertain() || postStateTargetAttr(response.GetPostState()).GetSize() != 12 ||
 		reply.GetFlags() != rangeReplyApplied|rangeReplyPostApply || reply.GetResultSize() != 0 ||
-		reply.GetPostSize() != 12 || reply.GetVisibilitySequence() != 1 || reply.GetError() != -int32(syscall.ENOSPC) {
+		reply.GetPostSize() != 12 || reply.GetVisibilitySequence() != response.GetPostState().GetSnapshotSequence() || reply.GetError() != -int32(syscall.ENOSPC) {
 		t.Fatalf("post-dispatch fallocate error = %+v", response)
 	}
 	replay := fallocateMutationRequest(2, handle)
@@ -292,12 +279,10 @@ func TestFallocatePostDispatchErrorPublishesAndReplaysExactState(t *testing.T) {
 
 func copyMutationRequest(requestID uint64, input, output xfsstore.Capability) *authoritypb.Request {
 	request := &authoritypb.Request{
-		RequestId: requestID, FrontendOperationId: 18,
+		RequestId: requestID,
 		Body: &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{
 			InputHandle: input[:], InputOffset: 2, OutputHandle: output[:], OutputOffset: 7, Length: 9,
-			RlimitFsize: math.MaxUint64, FileMaxSize: math.MaxInt64,
 		}},
-		SourcePublicationGate: itemGate([16]byte{input[0]}, [16]byte{output[0]}),
 	}
 	request.Mutation = &authoritypb.Mutation{Slot: 0, Sequence: 1}
 	return request
@@ -313,7 +298,7 @@ func TestCopyFileRangeAppliedReplayAndEOFNoopShapes(t *testing.T) {
 	if response.GetErrno() != 0 || len(response.GetPostState().GetObjects()) != 2 ||
 		rangePostStateAttr(response.GetPostState(), postStateRoleSource).GetInode() != 0x21 ||
 		rangePostStateAttr(response.GetPostState(), postStateRoleDestination).GetSize() != 20 || reply.GetFlags() != rangeReplyApplied ||
-		reply.GetResultSize() != 5 || reply.GetPostSize() != 20 || reply.GetVisibilitySequence() != 1 {
+		reply.GetResultSize() != 5 || reply.GetPostSize() != 20 || reply.GetVisibilitySequence() != response.GetPostState().GetSnapshotSequence() {
 		t.Fatalf("copy applied = %+v", response)
 	}
 	replay := copyMutationRequest(2, input, output)
@@ -341,7 +326,7 @@ func TestCopyFileRangePublishesZeroByteMetadataOnlyPostApply(t *testing.T) {
 	if response.GetErrno() != 0 || response.GetUncertain() || len(response.GetPostState().GetObjects()) != 2 ||
 		rangePostStateAttr(response.GetPostState(), postStateRoleDestination).GetSize() != 19 ||
 		reply.GetFlags() != rangeReplyApplied|rangeReplyPostApply || reply.GetResultSize() != 0 ||
-		reply.GetPostSize() != 19 || reply.GetVisibilitySequence() != 1 || reply.GetError() != -int32(syscall.ENOSPC) {
+		reply.GetPostSize() != 19 || reply.GetVisibilitySequence() != response.GetPostState().GetSnapshotSequence() || reply.GetError() != -int32(syscall.ENOSPC) {
 		t.Fatalf("zero-byte metadata-only CFR = %+v", response)
 	}
 	replay := copyMutationRequest(2, input, output)
@@ -425,7 +410,7 @@ func TestCopyFileRangeLocksResolvedIdentitiesThroughBothSnapshots(t *testing.T) 
 	}
 }
 
-func TestCopyFileRangeRepairsParticipantRegisteredOnlyOnSource(t *testing.T) {
+func TestCopyFileRangeRecallsLeasesHeldOnlyOnSource(t *testing.T) {
 	h, source, store, input, output := newRangeMutationHarness(t)
 	store.copyCount = 5
 	store.copyPost = xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x31, Size: 20, Mode: 0o600, Nlink: 1}
@@ -435,27 +420,25 @@ func TestCopyFileRangeRepairsParticipantRegisteredOnlyOnSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: h.Runtime,
-		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
+	terminal, err := h.Runtime.SessionTerminal(observer.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, participant := range []volumeserver.SessionCredential{source, observer} {
-		terminal, terminalErr := h.Runtime.SessionTerminal(participant.ID)
-		if terminalErr != nil {
-			t.Fatal(terminalErr)
-		}
-		if err := visibility.Register(participant.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-			CachedNameCapacity: 32, RepairBudget: time.Second,
-			NamespaceRepair: volumeserver.NamespaceRepairLocklessExpiration,
-		}); err != nil {
+	if err := h.Leases.ActivateHolder(observer.ID, terminal); err != nil {
+		t.Fatal(err)
+	}
+	sourceIdentity := [16]byte{input[0]}
+	for _, grant := range []struct {
+		coordinate volumeserver.LeaseCoordinate
+		right      volumeserver.LeaseRight
+	}{
+		{volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyData, Identity: sourceIdentity}, volumeserver.LeaseRightDataRead},
+		{volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: sourceIdentity}, volumeserver.LeaseRightAttributesRead},
+	} {
+		if _, err := h.Leases.Grant(t.Context(), observer.ID, grant.coordinate, grant.right); err != nil {
 			t.Fatal(err)
 		}
 	}
-	visibility.RecordResolvedInode(observer.ID, [16]byte{input[0]})
-	h.Visibility = visibility
 
 	request := copyMutationRequest(1, input, output)
 	response := make(chan *authoritypb.Response, 1)
@@ -464,32 +447,45 @@ func TestCopyFileRangeRepairsParticipantRegisteredOnlyOnSource(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	initial := testInitialVisibilityCursor(t, visibility, observer.ID)
-	prepare, err := visibility.Next(ctx, observer.ID, initial)
+	revoke, err := h.Leases.Next(ctx, observer.ID, volumeserver.LeaseEventCursor{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prepare.Cursor.Phase != volumeserver.VisibilityPrepare || len(prepare.Targets) != 1 ||
-		prepare.Targets[0].Identity != [16]byte{input[0]} || prepare.Targets[0].Scope != volumeserver.VisibilityData {
-		t.Fatalf("source-only PREPARE = %#v", prepare.Targets)
+	if revoke.Cursor.Phase != volumeserver.LeaseEventRevoke || len(revoke.Recalls) != 2 {
+		t.Fatalf("source-only REVOKE = %#v", revoke)
 	}
-	if err := visibility.Ack(observer.ID, prepare.Cursor); err != nil {
+	for _, recall := range revoke.Recalls {
+		if recall.Coordinate.Identity != sourceIdentity ||
+			(recall.Coordinate.Family != volumeserver.LeaseFamilyData && recall.Coordinate.Family != volumeserver.LeaseFamilyAttributes) {
+			t.Fatalf("source-only recall = %#v", recall)
+		}
+	}
+	if err := h.Leases.AcknowledgeRevoke(observer.ID, revoke.Cursor); err != nil {
 		t.Fatal(err)
 	}
-	complete, err := visibility.Next(ctx, observer.ID, prepare.Cursor)
+	complete, err := h.Leases.Next(ctx, observer.ID, revoke.Cursor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if complete.Cursor.Phase != volumeserver.VisibilityComplete || len(complete.Targets) != 1 {
-		t.Fatalf("source-only COMPLETE = %#v", complete.Targets)
+	if complete.Cursor.Phase != volumeserver.LeaseEventComplete || len(complete.PostState) != 2 {
+		t.Fatalf("source-only COMPLETE = %#v", complete)
 	}
-	target := complete.Targets[0]
-	if target.Identity != [16]byte{input[0]} || target.Scope != volumeserver.VisibilityAttributes ||
-		target.ExactPostState == nil || target.ExactPostState.StableIdentity != [16]byte{input[0]} ||
-		target.ExactPostState.Roles != postStateRoleSource || target.ExactPostState.Attr.Inode != uint64(input[0]) {
-		t.Fatalf("source-only exact repair = %#v", target)
+	var sourceState *volumeserver.VisibilityObjectPostState
+	for index := range complete.PostState {
+		if complete.PostState[index].StableIdentity == sourceIdentity {
+			sourceState = &complete.PostState[index]
+		}
 	}
-	if err := visibility.Ack(observer.ID, complete.Cursor); err != nil {
+	if sourceState == nil || sourceState.Roles != postStateRoleSource || sourceState.Attr.Inode != uint64(input[0]) || sourceState.ObjectVersion != 1 {
+		t.Fatalf("source-only exact post-state = %#v", sourceState)
+	}
+	discharges := make([]volumeserver.LeaseDischarge, len(complete.Recalls))
+	for index, recall := range complete.Recalls {
+		discharges[index] = volumeserver.LeaseDischarge{
+			Coordinate: recall.Coordinate, RevokeEpoch: recall.RevokeEpoch, Mode: volumeserver.LeaseDischargeToNone,
+		}
+	}
+	if err := h.Leases.Discharge(observer.ID, complete.Cursor, discharges); err != nil {
 		t.Fatal(err)
 	}
 	select {

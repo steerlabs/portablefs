@@ -3,7 +3,6 @@
 package fusev3
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,17 +13,12 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
-	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
-	"google.golang.org/protobuf/proto"
 )
 
-// CoherenceProfile is the kernel-cache contract a mount declares to the
-// authority. Protocol 5 has one coherent mount semantics: every frontend joins
-// the visibility barrier and owns its kernel publications through the physical
-// reply write. Zero is deliberately invalid so a legacy uncached attachment is
-// rejected rather than silently acquiring different semantics.
+// CoherenceProfile is the retained local spelling of protocol 6's one exact
+// lease-backed kernel-cache contract. Zero remains invalid so a caller cannot
+// accidentally mount with unspecified local semantics.
 type CoherenceProfile uint8
 
 const CoherenceStrict CoherenceProfile = 1
@@ -37,14 +31,9 @@ func (p CoherenceProfile) String() string {
 }
 
 const (
-	// strictEntryTimeout and strictAttrTimeout are the lifetimes a strict mount
-	// publishes with. They are no longer a correctness parameter, which is the
-	// whole point of joining the barrier: every authority-visible change to a
-	// name or an inode is repaired by NAMESPACE/DATA/ATTRIBUTES notification
-	// before the mutating call returns on the machine that made it, so no
-	// caller anywhere can observe the old value after the new one exists. A
-	// timeout expiry therefore never *fixes* anything; it only re-fetches state
-	// this mount already knows is current.
+	// strictEntryTimeout is retained as a policy ceiling, but protocol 6 always
+	// publishes kernel entry validity as zero. strictAttrTimeout is likewise
+	// only a ceiling; an exact reply-local A-R grant supplies the real lifetime.
 	//
 	// One minute is chosen as the largest value that still bounds the blast
 	// radius of a future repair defect to a single human-noticeable interval.
@@ -85,10 +74,10 @@ const (
 	// the budget is sized for lock hand-off, not for I/O.
 	defaultRepairBudget = 15 * time.Second
 
-	// visibilityReserve is the authority in-flight slot that only the
-	// visibility loop may occupy. Acknowledging is what releases the mutating
+	// leaseControlReserve is the authority in-flight slot that only the lease
+	// CONTROL loop may occupy. Acknowledging is what releases the mutating
 	// machine, so this loop must never queue behind bulk kernel I/O.
-	visibilityReserve = 1
+	leaseControlReserve = 1
 )
 
 // MountAbsenceProof is the official supervisor's local observation that this
@@ -105,10 +94,9 @@ func (p MountAbsenceProof) valid() bool {
 	return p.ObservedUnixNanos != 0 && len(p.Observation) != 0 && p.Component != ""
 }
 
-// nameKey is one kernel-cached directory binding. The parent is the inode
-// number the authority publishes in attributes, which is what a
-// VisibilityTarget carries as parent_kernel_ino; the kernel NodeID is resolved
-// separately at repair time.
+// nameKey is one daemon-cached directory binding. The parent is the inode
+// number the authority publishes in attributes; the stable parent identity is
+// tracked separately in the exact N-lease coordinate.
 type nameKey struct {
 	parent uint64
 	name   string
@@ -139,7 +127,7 @@ func (c *mutationCallback) finish() {
 	}
 }
 
-func (c *mutationCallback) acquireSource(ctx context.Context, raw *rawFileSystem, gate *authoritypb.SourcePublicationGate) (*sourcePublicationLease, error) {
+func (c *mutationCallback) acquireSource(ctx context.Context, raw *rawFileSystem, gate *sourcePublicationGate) (*sourcePublicationLease, error) {
 	if c.publication.source != nil {
 		return nil, errors.New("fusev3: raw callback attempted more than one visible source mutation")
 	}
@@ -149,26 +137,6 @@ func (c *mutationCallback) acquireSource(ctx context.Context, raw *rawFileSystem
 	}
 	c.publication.source = lease
 	return lease, nil
-}
-
-// releaseVisibilityRetry closes one definite-preapply attempt without exposing
-// it to the kernel. The authority retained no filesystem result (and retains
-// staged write bytes separately), so the exact response-consumption boundary
-// is this local decision. Clearing source permits the same FUSE callback to
-// acquire a fresh cut after the older peer repair. The strict kernel's
-// lockless namespace expiration makes the same transition safe for namespace
-// callbacks which still hold a parent VFS lock.
-func (c *mutationCallback) releaseVisibilityRetry(lease *sourcePublicationLease) error {
-	if c == nil || lease == nil || c.publication.source != lease {
-		return errors.New("fusev3: visibility retry lost its source publication lease")
-	}
-	lease.resolveAllNoBinding()
-	if err := lease.markDefiniteNoChange(); err != nil {
-		return err
-	}
-	lease.release()
-	c.publication.source = nil
-	return nil
 }
 
 func sourceLeaseFromContext(ctx context.Context) *sourcePublicationLease {
@@ -217,7 +185,6 @@ func completeSourcePublication(ctx context.Context) error {
 	if publication == nil {
 		return errors.New("fusev3: source publication escaped its reply ownership")
 	}
-	publication.needsPostVFS = true
 	return nil
 }
 
@@ -414,636 +381,24 @@ func (k kernelMount) abortKernelConnection() error {
 	return os.WriteFile("/sys/fs/fuse/connections/"+minor+"/abort", []byte("1"), 0)
 }
 
-// coherence is the strict frontend's half of the two-phase visibility barrier.
-// It owns nothing the kernel-facing tables own: the cached-name registry and
-// the publication gate live in rawFileSystem under one lock, because they are
-// decided on the same code path that answers the kernel.
-type coherence struct {
-	mount   *Mount
-	session []byte
-	budget  time.Duration
-}
-
-// run is the visibility loop. It is a dedicated goroutine holding a dedicated
-// transport lane: acknowledging is what releases the mutating machine on every
-// other participant, so this loop is never allowed to queue behind bulk I/O.
-func (c *coherence) run(ctx context.Context) {
-	defer c.mount.wg.Done()
-	cursor := c.mount.rpc.InitialVisibilityCursor()
-	event, err := c.mount.rpc.NextVisibility(ctx, cursor)
-	for {
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			c.mount.revoke(fmt.Errorf("fusev3: visibility stream ended: %w", err))
-			return
-		}
-		if err := c.applyWithinBudget(ctx, event); err != nil {
-			c.mount.revoke(err)
-			return
-		}
-		cursor = event.GetCursor()
-		event, err = c.mount.rpc.NextVisibilityAfterAck(ctx, cursor, false)
-	}
-}
-
 // errRepairBudgetExceeded classifies the one revocation cause a supervisor can
 // act on differently: this mount was healthy but too slow to repair. It is a
 // sentinel rather than a formatted string so classifyRevocationReason never has
 // to read prose.
-var errRepairBudgetExceeded = errors.New("fusev3: visibility phase exceeded the repair budget this mount declared")
+var errRepairBudgetExceeded = errors.New("fusev3: lease cache withdrawal exceeded its safety budget")
 
-// applyWithinBudget performs exactly one phase under the deadline this mount
-// declared at attach. A kernel notification cannot be cancelled once it is
-// inside write(2), so the budget is enforced by revoking the mount, which
-// aborts the connection and releases the stuck write; it is a commitment the
-// frontend keeps, not a hope that the kernel is quick.
-func (c *coherence) applyWithinBudget(ctx context.Context, event *authoritypb.VisibilityEvent) error {
-	overdue := time.AfterFunc(c.budget, func() {
-		c.mount.revoke(fmt.Errorf("%w (%s)", errRepairBudgetExceeded, c.budget))
-	})
-	defer overdue.Stop()
-	return c.apply(ctx, event)
-}
-
-func (c *coherence) apply(ctx context.Context, event *authoritypb.VisibilityEvent) error {
-	if event == nil || event.GetCursor() == nil {
-		return errors.New("fusev3: malformed visibility event")
-	}
-	if event.GetRoutes() == nil {
-		if err := visibilitywire.ValidateEventTargets(event.GetCursor().GetPhase(), event.GetCursor().GetSequence(), event.GetTargets()); err != nil {
-			return fmt.Errorf("fusev3: %w", err)
-		}
-	}
-	// A change to the volume's route declaration is not a cache repair, and
-	// there is no repair that would answer it: the set of paths this mount
-	// serves locally was fixed at attach and is what the authority admitted it
-	// with. Continuing under the old topology while the volume has moved to a
-	// new one is precisely the divergence the revision check exists to prevent,
-	// so the mount stops — but it says so first. Dying silently would leave the
-	// authority holding this participant's phase until the declared repair
-	// budget expired, turning one routing change into a budget-long stall per
-	// strict mount; the blocked report discharges the phase immediately and is
-	// fenced to the same terminal outcome.
-	if err := routesEventChange(c.mount.routesRevision, event); err != nil {
-		return c.reportUnservable(ctx, event, err)
-	}
-	// initiator_session_id is the exemption ticket. A mount that repaired its
-	// own mutation would race its own VFS postprocessing and is unnecessary: the
-	// source-publication gate already owns the exact cut, and the VFS updates its
-	// dcache from the operation reply before the generic PUBLISH boundary.
-	self := len(c.session) != 0 && bytes.Equal(event.GetInitiatorSessionId(), c.session)
-	if self && event.GetRoutes() == nil {
-		return errors.New("fusev3: authority delivered this source a filesystem visibility phase; protocol 5 excludes the source because its exact publication gate already owns that cut")
-	}
-	switch event.GetCursor().GetPhase() {
-	case authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE:
-		// PREPARE is never reportable. It closes cache admission by publishing
-		// uncacheable, which takes no lock any syscall of this mount can be
-		// holding, so there is no phase here that this mount cannot service.
-		return c.mount.raw.prepareVisibility(ctx, event.GetTargets(), self)
-	case authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE:
-		completion, _, err := c.mount.raw.beginVisibilityCompleteAt(event.GetTargets(), self, event.GetCursor().GetSequence())
-		if err != nil {
-			return err
-		}
-		return c.mount.raw.finishVisibilityComplete(ctx, completion)
-	default:
-		return fmt.Errorf("fusev3: visibility event %d carried no phase", event.GetCursor().GetSequence())
-	}
-}
-
-// reportUnservable delivers the blocked report for any terminal condition —
-// currently a routing revision this mount cannot adopt — and returns the cause
-// the mount revokes with. The report replaces
-// the acknowledgment (it IS the acknowledgment, carrying `blocked`), so the
-// authority discharges this participant's phase immediately instead of
-// waiting out the declared repair budget.
-func (c *coherence) reportUnservable(ctx context.Context, event *authoritypb.VisibilityEvent, cause error) error {
-	if err := c.mount.rpc.ReportVisibilityBlocked(ctx, event.GetCursor(), nil); err != nil && ctx.Err() == nil {
-		return errors.Join(cause, fmt.Errorf("fusev3: the authority did not accept this mount's report that it cannot repair: %w", err))
-	}
-	return cause
-}
-
-// visibilityKeys is one event's target set translated into this frontend's own
-// cache keys.
-type visibilityKeys struct {
-	names  []nameKey
-	inodes []visibilityInodeKey
-}
-
-// visibilityInodeKey is one normalized inode repair. A data target dominates
-// any attribute target for the same kernel inode because dropping cached pages
-// also requires dropping the cached attributes that describe them.
-type visibilityInodeKey struct {
-	inode    uint64
-	identity publicationIdentity
-	data     bool
-	size     uint64
-	exact    *authoritypb.ObjectPostState
-}
-
-// translate converts VisibilityTargets into cache keys. This frontend keys its
-// kernel caches by the attr inode number the authority publishes, so a target
-// carries that number explicitly (kernel_ino / parent_kernel_ino) alongside the
-// stable identity — the stable identity is the exact XFS export handle, whose
-// layout deliberately contains no device and no bare inode number, and is not
-// parsed here. A target missing its kernel inode or device is malformed and
-// fails closed: repairing a guessed coordinate would leave the real one stale.
-// The one backing device is pinned on first sight and any later disagreement is
-// a violation of the one-volume contract, not something to paper over.
-func (r *rawFileSystem) translate(targets []*authoritypb.VisibilityTarget) (visibilityKeys, error) {
-	// Validate the complete raw event before normalizing or pinning any state.
-	// In particular, a malformed ATTRIBUTES target must not disappear merely
-	// because an earlier DATA target for the same inode dominates its repair.
-	for _, target := range targets {
-		// The full shared wire contract is enforced, not just the fields this
-		// frontend repairs by. A frontend that silently tolerates a shape the
-		// other decoder refuses is how an encoder defect ships through every
-		// gate on one platform and revokes every mount on the other.
-		if err := visibilitywire.ValidateTarget(target); err != nil {
-			return visibilityKeys{}, fmt.Errorf("fusev3: %w", err)
-		}
-	}
-	var device uint64
-	for _, target := range targets {
-		if device == 0 {
-			device = target.GetDevice()
-		} else if device != target.GetDevice() {
-			return visibilityKeys{}, fmt.Errorf("fusev3: authority reported coordination identities from two devices (%x and %x); a volume is exactly one filesystem", device, target.GetDevice())
-		}
-	}
-	if device != 0 {
-		if err := r.pinIdentityDevice(device); err != nil {
-			return visibilityKeys{}, err
-		}
-	}
-
-	var keys visibilityKeys
-	var inodeIndexes map[uint64]int
-	for _, target := range targets {
-		switch target.GetScope() {
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:
-			keys.names = append(keys.names, nameKey{parent: target.GetParentKernelIno(), name: string(target.GetName())})
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA, authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES:
-			inode := target.GetKernelIno()
-			data := target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA
-			identity, ok := publicationIdentityFromBytes(target.GetIdentity())
-			if !ok {
-				return visibilityKeys{}, errors.New("fusev3: visibility inode target carried an invalid stable identity")
-			}
-			if inodeIndexes == nil {
-				inodeIndexes = make(map[uint64]int)
-			}
-			if index, exists := inodeIndexes[inode]; exists {
-				key := &keys.inodes[index]
-				if key.identity != identity {
-					return visibilityKeys{}, fmt.Errorf("fusev3: kernel inode %d carried two stable identities in one visibility event", inode)
-				}
-				if !proto.Equal(key.exact, target.GetExactPostState()) {
-					return visibilityKeys{}, fmt.Errorf("fusev3: kernel inode %d carried two exact attribute records in one visibility event", inode)
-				}
-				if data {
-					size := uint64(target.GetSize())
-					if key.data && key.size != size {
-						return visibilityKeys{}, fmt.Errorf("fusev3: kernel inode %d carried two authoritative DATA sizes (%d and %d)", inode, key.size, size)
-					}
-					key.data, key.size = true, size
-				}
-				continue
-			}
-			inodeIndexes[inode] = len(keys.inodes)
-			key := visibilityInodeKey{inode: inode, identity: identity, data: data, exact: target.GetExactPostState()}
-			if data {
-				key.size = uint64(target.GetSize())
-			}
-			keys.inodes = append(keys.inodes, key)
-		}
-	}
-	return keys, nil
-}
-
-func (r *rawFileSystem) pinIdentityDevice(device uint64) error {
-	if device == 0 {
-		return errors.New("fusev3: visibility target carried no backing device")
-	}
+// revokeCachedNames drops daemon-resident N payloads. The portable profile
+// gives kernel dentries zero validity, so there is no kernel namespace cache to
+// notify or drain at recall or teardown.
+func (r *rawFileSystem) revokeCachedNames(_ time.Time) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.identityDeviceKnown {
-		r.identityDevice, r.identityDeviceKnown = device, true
-		return nil
-	}
-	if r.identityDevice != device {
-		return fmt.Errorf("fusev3: authority reported coordination identities from two devices (%x and %x); a volume is exactly one filesystem", r.identityDevice, device)
-	}
-	return nil
-}
-
-// prepareVisibility closes cache admission for the affected keys.
-//
-// Closing admission means publishing them uncacheable, not withholding the
-// reply. Answering with a zero lifetime gives the caller the pre-mutation truth
-// -- which is still the truth, because the authority has not applied yet --
-// while leaving nothing behind for COMPLETE to repair. Withholding the lookup
-// would also waste the callback lane needed to service independent work.
-func (r *rawFileSystem) prepareVisibility(ctx context.Context, targets []*authoritypb.VisibilityTarget, self bool) error {
-	if self {
-		return errors.New("fusev3: source filesystem PREPARE is forbidden by the source-owned publication protocol")
-	}
-	for _, target := range targets {
-		if target.GetExactPostState() != nil {
-			return errors.New("fusev3: visibility PREPARE carried post-apply attribute state")
-		}
-	}
-	keys, err := r.translate(targets)
-	if err != nil {
-		return err
-	}
-	if err := r.acquirePeerPublication(ctx, targets, keys); err != nil {
-		return err
-	}
-	// PENDING candidates are revocable and therefore never delay PREPARE. A
-	// candidate already FINALIZED is joined at COMPLETE, immediately before the
-	// repair, under that event's bounded repair budget.
-	return nil
-}
-
-func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKeys) error {
-	for {
-		r.mu.Lock()
-		busy := false
-		for _, key := range keys.names {
-			if r.publishingNames[key] != 0 {
-				busy = true
-				break
-			}
-		}
-		if !busy {
-			for _, inode := range keys.inodes {
-				if r.publishingInodes[inode.inode] != 0 {
-					busy = true
-					break
-				}
-			}
-		}
-		if !busy {
-			r.mu.Unlock()
-			return nil
-		}
-		settled := r.published
-		r.mu.Unlock()
-		select {
-		case <-settled:
-		case <-ctx.Done():
-			return fmt.Errorf("fusev3: visibility prepare could not drain in-flight publications: %w", ctx.Err())
-		}
-	}
-}
-
-// repair is one kernel cache repair this frontend owes. A namespace repair is
-// negative when the cached answer being taken back was an absence: there is no
-// child identity, and the primitive that expires it differs accordingly.
-type repair struct {
-	parent   uint64
-	child    uint64
-	name     string
-	negative bool
-	inode    uint64
-	data     bool
-	object   fuse.PFSObjectState
-	sequence uint64
-}
-
-// visibilityCompletion owns one COMPLETE's exact lockless repair work.
-type visibilityCompletion struct {
-	work        []repair
-	sequence    uint64
-	coordinates []publicationCoordinate
-	waits       []<-chan struct{}
-}
-
-// beginVisibilityComplete resolves the event against the exact cache registry,
-// removes those entries from the registry, and closes admission in one r.mu
-// critical section. Strict namespace expiration never acquires parent i_rwsem,
-// so an already-admitted namespace callback is not a repair dependency.
-func (r *rawFileSystem) beginVisibilityCompleteAt(targets []*authoritypb.VisibilityTarget, self bool, sequence uint64) (visibilityCompletion, bool, error) {
-	if self {
-		return visibilityCompletion{}, false, errors.New("fusev3: source filesystem COMPLETE is forbidden by the source-owned publication protocol")
-	}
-	if sequence == 0 {
-		return visibilityCompletion{}, false, errors.New("fusev3: visibility COMPLETE carried no sequence")
-	}
-	if err := visibilitywire.ValidateEventTargets(authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE, sequence, targets); err != nil {
-		return visibilityCompletion{}, false, fmt.Errorf("fusev3: %w", err)
-	}
-	keys, err := r.translate(targets)
-	if err != nil {
-		return visibilityCompletion{}, false, err
-	}
-	completion := visibilityCompletion{sequence: sequence}
-	coordinates, err := coordinatesForVisibilityTargets(targets)
-	if err != nil {
-		return visibilityCompletion{}, false, err
-	}
-	r.mu.Lock()
-	seenWait := make(map[<-chan struct{}]struct{})
-	for coordinate := range coordinates {
-		completion.coordinates = append(completion.coordinates, coordinate)
-		r.repairingCoordinates[coordinate] = true
-		for reservation := range r.cacheReservations[coordinate] {
-			switch reservation.state {
-			case cacheReservationPending:
-				reservation.revoked = true
-			case cacheReservationFinalized:
-				// The bytes are immutable once FINALIZED, but the candidate must
-				// not enter the daemon registry after the repair has removed it.
-				reservation.revoked = true
-				done := reservation.publication.originalDone
-				if _, exists := seenWait[done]; !exists {
-					seenWait[done] = struct{}{}
-					completion.waits = append(completion.waits, done)
-				}
-			}
-		}
-	}
-	for _, inode := range keys.inodes {
-		if record := r.byInodeLocked(inode.inode); record != nil && record.identity != inode.identity {
-			r.mu.Unlock()
-			return visibilityCompletion{}, false, fmt.Errorf("fusev3: visibility target for inode %d does not match the cached stable identity", inode.inode)
-		}
-	}
-	completion.work = make([]repair, 0, len(keys.names)+len(keys.inodes))
-	for _, key := range keys.names {
-		// A name this mount cached is cached exactly once, as a binding or as
-		// an absence, because the kernel holds one dentry per name. Both are
-		// answers this kernel would keep serving after the mutation, so both
-		// are resolved here against the same target.
-		parent := r.directoryLocked(key.parent)
-		if parent == nil {
-			continue
-		}
-		work := repair{parent: parent.id, name: key.name, negative: true, sequence: sequence}
-		if record := r.cachedNames[key]; record != nil {
-			r.dropCachedNameLocked(key)
-			work.child, work.negative = record.id, false
-		} else if _, absent := r.cachedNegatives[key]; absent {
-			r.dropCachedNegativeLocked(key)
-		} else {
-			coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: key.name}
-			if candidate, found := r.newestFinalizedNameCandidateLocked(coordinate); found {
-				work.negative = candidate.negative
-				if candidate.record != nil {
-					work.child = candidate.record.id
-				}
-			}
-		}
-		// Parent sequence advancement is mandatory even when the daemon has no
-		// settled or in-flight answer for this name. The safe EXPIRE shape has
-		// child zero and exists precisely to stamp an absent dentry coordinate.
-		completion.work = append(completion.work, work)
-	}
-	for _, inode := range keys.inodes {
-		record := r.byInodeLocked(inode.inode)
-		delete(r.cachedAttrs, inode.identity)
-		if record != nil {
-			object, objectErr := r.exactRepairObjectLocked(record, inode.exact)
-			if objectErr != nil {
-				r.mu.Unlock()
-				return visibilityCompletion{}, false, objectErr
-			}
-			completion.work = append(completion.work, repair{inode: record.id, data: inode.data, object: object, sequence: sequence})
-		}
-	}
-	r.mu.Unlock()
-	return completion, false, nil
-}
-
-func (r *rawFileSystem) exactRepairObjectLocked(record *inodeRecord, exact *authoritypb.ObjectPostState) (fuse.PFSObjectState, error) {
-	if record == nil || exact == nil || !bytes.Equal(exact.GetStableIdentity(), record.identity[:]) || exact.GetAttr() == nil {
-		return fuse.PFSObjectState{}, errors.New("fusev3: exact peer repair does not match its live inode record")
-	}
-	var attr fuse.Attr
-	fillAttr(exact.GetAttr(), &attr, r.mount.uid, r.mount.gid)
-	var wireAttr [fuse.PFSWireAttrSize]byte
-	encodeFuseAttr(wireAttr[:], &attr)
-	object := fuse.PFSObjectState{
-		Nodeid: record.id, ObjectVersion: exact.GetObjectVersion(), Attr: wireAttr,
-		Roles: exact.GetRoles(), InodeFlags: exact.GetAttr().GetFlags(),
-		BirthTimeNS: exact.GetAttr().GetBirthTimeNs(), PFSClass: 1,
-	}
-	copy(object.StableIdentity[:], exact.GetStableIdentity())
-	return object, nil
-}
-
-// newestFinalizedNameCandidateLocked resolves the reply which can be visible
-// after all FINALIZED writes on one coordinate complete. Such a reply has not
-// received its post-VFS acknowledgment yet, so it is intentionally absent from
-// cachedNames/cachedNegatives even though COMPLETE must repair its dentry.
-func (r *rawFileSystem) newestFinalizedNameCandidateLocked(coordinate publicationCoordinate) (replyNamePublication, bool) {
-	var newest replyNamePublication
-	var newestSnapshot uint64
-	found := false
-	for reservation := range r.cacheReservations[coordinate] {
-		if reservation.state != cacheReservationFinalized || reservation.snapshot < newestSnapshot || reservation.publication == nil {
-			continue
-		}
-		for _, candidate := range reservation.publication.names {
-			if candidate.reservation != reservation {
-				continue
-			}
-			newest, newestSnapshot, found = candidate, reservation.snapshot, true
-			break
-		}
-	}
-	return newest, found
-}
-
-// beginVisibilityComplete is the direct test seam. Production always supplies
-// the authority cursor sequence through beginVisibilityCompleteAt.
-func (r *rawFileSystem) beginVisibilityComplete(targets []*authoritypb.VisibilityTarget, self bool) (visibilityCompletion, bool, error) {
-	return r.beginVisibilityCompleteAt(targets, self, 1)
-}
-
-// finishVisibilityComplete performs lockless reverse notifications, then
-// atomically reopens namespace and publication admission. On failure both
-// remain closed and the caller revokes the mount.
-func (r *rawFileSystem) finishVisibilityComplete(ctx context.Context, completion visibilityCompletion) error {
-	waitCtx, cancel := context.WithTimeout(ctx, r.mount.repairBudget)
-	defer cancel()
-	for _, done := range completion.waits {
-		select {
-		case <-done:
-		case <-waitCtx.Done():
-			cause := fmt.Errorf("fusev3: finalized cache reply exceeded visibility repair budget: %w", waitCtx.Err())
-			r.mount.revoke(cause)
-			return cause
-		}
-	}
-	for _, item := range completion.work {
-		if err := r.applyRepair(item); err != nil {
-			// Admission stays closed on failure. The caller revokes this mount and,
-			// most importantly, must not acknowledge COMPLETE: a failed reverse
-			// notification means this kernel may still serve the pre-mutation state.
-			return err
-		}
-	}
-	r.releaseComplete(completion)
-	return nil
-}
-
-// completeVisibility is retained as the direct, no-transport test seam. The
-// production path uses the same begin/finish split to bind repair work to the
-// authority cursor before it emits any reverse notification.
-func (r *rawFileSystem) completeVisibility(targets []*authoritypb.VisibilityTarget, self bool) error {
-	completion, _, err := r.beginVisibilityComplete(targets, self)
-	if err != nil {
-		return err
-	}
-	return r.finishVisibilityComplete(context.Background(), completion)
-}
-
-func (r *rawFileSystem) releaseComplete(completion visibilityCompletion) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, key := range r.heldPhase.names {
-		delete(r.heldNames, key)
-	}
-	for _, inode := range r.heldPhase.inodes {
-		delete(r.heldInodes, inode.inode)
-	}
-	r.heldPhase = visibilityKeys{}
-	for _, coordinate := range completion.coordinates {
-		if completion.sequence > r.lastPeerRepairSequence[coordinate] {
-			r.lastPeerRepairSequence[coordinate] = completion.sequence
-		}
-		delete(r.repairingCoordinates, coordinate)
-	}
-	if completion.sequence > r.completedVisibilitySequence {
-		r.completedVisibilitySequence = completion.sequence
-	}
-	r.releasePeerPublicationLocked()
-}
-
-// applyRepair issues one reverse notification.
-//
-// Strict NotifyDelete is the one exact namespace primitive: the patched kernel
-// validates the cached child identity, expires the binding without taking the
-// parent inode lock, and emits the watcher event. A weaker name-only fallback
-// would be able to expire a newer binding and is therefore forbidden.
-func (r *rawFileSystem) applyRepair(item repair) error {
-	server := r.mount.notifier()
-	if server == nil {
-		return errors.New("fusev3: kernel cache repair has no notification channel")
-	}
-	if item.inode != 0 {
-		if item.data {
-			// The private notify installs the exact post-mutation EOF at this
-			// visibility sequence and invalidates every cached page, including
-			// same-size overwrites where an EOF delta alone would do nothing.
-			if status := server.PFSSizeNotify(item.sequence, &item.object); !status.Ok() && status != fuse.ENOENT {
-				return fmt.Errorf("fusev3: repair exact data and attributes at sequence %d for inode %d: %v", item.sequence, item.inode, status)
-			}
-			return nil
-		}
-		if status := server.PFSAttrNotify(item.sequence, &item.object); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: install exact repaired attributes for inode %d: %v", item.inode, status)
-		}
-		// ENOENT is the strongest successful outcome for invalidation: the
-		// kernel has no node state left that could answer from the old cache.
-		// It occurs normally when a namespace repair immediately before this
-		// one removed the inode's final dentry, and can also race ordinary
-		// kernel eviction. Treating absence as a repair failure revokes a
-		// healthy observer after a remote unlink.
-		return nil
-	}
-	if item.negative {
-		// The cached answer being taken back is an absence, so there is no
-		// child identity for the kernel to validate and no watcher event that a
-		// creation on another machine owes this one -- nothing was deleted
-		// here. Expiring the name is the whole repair: the next path walk has
-		// to ask again. The strict kernel routes this expiration through the
-		// same lockless path as NotifyDelete, so it cannot deadlock against an
-		// unanswered namespace callback of this mount.
-		//
-		// Invalidating a name is unconditionally safe in this direction. The
-		// hazard a name-only expiry carries for a binding -- expiring a newer
-		// one that replaced it -- does not exist for an absence: the newer
-		// answer is precisely the one the mutation created, and losing it costs
-		// a LOOKUP rather than correctness.
-		if status := server.PFSEntryNotify(item.parent, 0, item.sequence, item.name, false); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: expire absent name %q under node %d: %v", item.name, item.parent, status)
-		}
-		return nil
-	}
-	deleteStatus := server.PFSEntryNotify(item.parent, item.child, item.sequence, item.name, true)
-	if deleteStatus.Ok() || deleteStatus == fuse.ENOENT {
-		return nil
-	}
-	// The strict kernel validates the exact child identity before expiring the
-	// binding. A mismatch is protocol corruption, not permission to issue a
-	// weaker name-only fallback which could invalidate a newer binding.
-	return fmt.Errorf("fusev3: expire exact name %q under node %d for child %d: %v",
-		item.name, item.parent, item.child, deleteStatus)
-}
-
-func (r *rawFileSystem) releaseHeld() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, key := range r.heldPhase.names {
-		delete(r.heldNames, key)
-	}
-	for _, inode := range r.heldPhase.inodes {
-		delete(r.heldInodes, inode.inode)
-	}
-	r.heldPhase = visibilityKeys{}
-	r.releasePeerPublicationLocked()
-}
-
-// revokeCachedNames walks the exact set of name answers this mount published
-// and takes every one of them back. Absences are withdrawn beside bindings: a
-// dying participant that leaves a cached "not there" behind is exactly as wrong
-// as one that leaves a cached binding, because the name may already exist. The
-// walk is bounded by the cached-name capacity this mount declared at attach,
-// which is precisely why that number is part of the contract: it is the amount
-// of stale state a dying participant has to be able to withdraw.
-func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
-	r.mu.Lock()
-	work := make([]repair, 0, len(r.cachedNames)+len(r.cachedNegatives))
-	for key, record := range r.cachedNames {
-		parent := r.directoryLocked(key.parent)
-		if parent == nil {
-			continue
-		}
-		work = append(work, repair{parent: parent.id, child: record.id, name: key.name})
+	for key := range r.cachedNames {
+		r.dropCachedNameLocked(key)
 	}
 	for key := range r.cachedNegatives {
-		parent := r.directoryLocked(key.parent)
-		if parent == nil {
-			continue
-		}
-		work = append(work, repair{parent: parent.id, name: key.name, negative: true})
+		r.dropCachedNegativeLocked(key)
 	}
-	r.cachedNames = make(map[nameKey]*inodeRecord)
-	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
-	r.cachedNameStable = make(map[nameKey]publicationNamespace)
-	r.cachedNegatives = make(map[nameKey]struct{})
 	r.mu.Unlock()
-	server := r.mount.notifier()
-	if server == nil {
-		return
-	}
-	for _, item := range work {
-		if time.Now().After(deadline) {
-			return
-		}
-		if item.negative {
-			_ = server.EntryNotify(item.parent, item.name)
-			continue
-		}
-		_ = server.DeleteNotify(item.parent, item.child, item.name)
-	}
 }
 
 func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
@@ -1076,11 +431,9 @@ func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
 		}
 		// Strict FUSE has no attribute-only invalidation. The exact terminal
 		// primitive is whole-inode withdrawal: it drops retained pages and
-		// invalidates attributes together, so a fenced mount cannot retain either
-		// kind of state after losing the authority. Sending stock (-1, 0) here is
-		// a protocol violation and aborts the notification channel before the
-		// retained-data pass can run.
-		if status := server.InodeNotify(inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
+		// This record has no retained-data obligation, so the stock attribute-only
+		// shape is sufficient and avoids evicting unrelated clean pages.
+		if status := server.InodeNotify(inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
 			failures = append(failures, fmt.Sprintf("withdraw cached attributes for inode %d: %v", inode, status))
 		}
 	}
@@ -1098,23 +451,17 @@ func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
 // other kind of stale service -- cannot see it, let alone refuse it. Neither
 // can the FUSE connection abort at the end of the withdrawal ladder: aborting
 // fails every future request, and a page that needs no request is unaffected.
-// Without this pass a process whose working directory was already inside the
-// mount could keep reading pre-fence bytes for as long as it held the file
-// open. That is exactly the 8.6s stale-read window failure-modes.md records as
-// a known macOS defect, and it is not one this platform is going to reproduce.
-//
-// The walk is bounded by the same declared repair budget the name withdrawal
-// uses. It runs after namespace detach but before connection abort: the mount
-// is already revoked, so the serving path refuses every FUSE_READ, while the
-// notification channel is still alive. The patched kernel serializes this
-// withdrawal with page fills, so one pass is final rather than a race the next
-// reader can undo.
+// Without this pass a preexisting fd can keep reading resident pre-fence pages.
+// The walk runs after namespace detach but before connection abort, while the
+// stock notification channel is still alive. Stock FUSE does not report the
+// kernel's final invalidate_inode_pages2 result, so a transiently busy page is
+// an explicit residual; connection abort prevents new fills but does not prove
+// that such a resident page was removed.
 func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 	r.mu.Lock()
-	work := make([]repair, 0, len(r.cachedData))
-	for inode, record := range r.cachedData {
-		_ = inode
-		work = append(work, repair{inode: record.id, data: true})
+	work := make([]uint64, 0, len(r.cachedData))
+	for _, record := range r.cachedData {
+		work = append(work, record.id)
 	}
 	r.cachedData = make(map[uint64]*inodeRecord)
 	r.mu.Unlock()
@@ -1123,7 +470,7 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 		return nil
 	}
 	var failures []string
-	for _, item := range work {
+	for _, inode := range work {
 		if time.Now().After(deadline) {
 			failures = append(failures, fmt.Sprintf("data withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-len(failures)))
 			return failures
@@ -1133,24 +480,27 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 		// pages. Every other failure is recorded, because a page this mount
 		// could not take back is stale data a fenced participant can still
 		// serve, and the operator has to be told that in the revocation report.
-		if status := server.InodeNotify(item.inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
-			failures = append(failures, fmt.Sprintf("withdraw cached data for inode %d: %v", item.inode, status))
+		if status := server.InodeNotify(inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
+			failures = append(failures, fmt.Sprintf("withdraw cached data for inode %d: %v", inode, status))
 		}
 	}
 	return failures
 }
 
 // discardCachedOwnershipAfterConnectionGone clears only daemon bookkeeping.
-// It is legal solely after exact mount and connection absence prove that no
-// kernel dentry, inode, page, lookup reference, or cursor can survive to need a
-// reverse notification.
+// It is legal after exact mount and connection absence make further reverse
+// notification impossible. It does not claim that a preexisting fd or mapping
+// has lost every resident page; that stock-kernel residual remains explicit.
 func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 	r.mu.Lock()
 	r.cachedNames = make(map[nameKey]*inodeRecord)
 	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
 	r.cachedNameStable = make(map[nameKey]publicationNamespace)
+	r.cachedNameLeases = make(map[nameKey]leaseStamp)
 	r.cachedNegatives = make(map[nameKey]struct{})
+	r.cachedNegativeLeases = make(map[nameKey]leaseStamp)
 	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
+	r.cachedAttrPayloads = make(map[publicationIdentity]cachedAttrPayload)
 	r.cachedData = make(map[uint64]*inodeRecord)
 	r.mu.Unlock()
 }
@@ -1160,25 +510,11 @@ func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 // participant died: a strict mount that can no longer repair must stop serving
 // what it already cached rather than continue.
 //
-// The bound on stale service is stated in four parts, strongest first. Every
-// new request is refused synchronously, before this call returns. From the
-// mount namespace root the tree becomes unreachable in one syscall. For a
-// process whose working directory was already inside the mount, every binding
-// this frontend published is withdrawn within the declared repair budget, after
-// which the connection is aborted and there is no request this mount could
-// answer wrongly at all. Finally -- and this is the part that requests alone
-// cannot cover, because a retained page is served without one -- every inode
-// whose data this mount declared retainable has that data dropped from the
-// kernel before aborting the notification channel. The frontend's revoked
-// admission blocks new fills, and the kernel serializes the withdrawal with
-// any fill already in progress.
-//
-// What that leaves is exact rather than approximate: an already-established
-// MAP_PRIVATE page table entry is torn down by the same
-// invalidate_inode_pages2() the withdrawal performs, so the next access
-// refaults into a dead connection and takes SIGBUS rather than reading stale
-// bytes. If the withdrawal itself fails, that failure is recorded in the
-// revocation report instead of being presented as a clean teardown.
+// New requests are refused synchronously. The asynchronous ladder detaches the
+// namespace, attempts stock cache invalidations, and aborts the FUSE connection.
+// A failed notification is recorded rather than presented as clean withdrawal.
+// Stock FUSE does not expose the kernel's final data-purge result, so resident
+// pages reachable through a preexisting fd or mapping are not claimed removed.
 func (m *Mount) revoke(cause error) {
 	if cause == nil {
 		cause = errors.New("fusev3: strict mount revoked")
@@ -1200,7 +536,7 @@ const (
 	// nothing can repair this kernel's caches again.
 	RevocationSessionTerminal = "session-terminal"
 	// RevocationRepairBudgetExceeded: this mount was still connected but did
-	// not complete a visibility phase inside the budget it declared at attach.
+	// not complete lease cache withdrawal inside the reserved safety interval.
 	RevocationRepairBudgetExceeded = "repair-budget-exceeded"
 	// RevocationRoutesChanged: the volume's machine-local route declaration
 	// moved under a mount whose topology is fixed for its lifetime.
@@ -1344,10 +680,9 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 
 	// Round one's namespace detach runs before the cached-name withdrawal, so
 	// the tree is already unreachable from the namespace root while the
-	// bindings are being taken back one at a time. The retained-data
-	// withdrawal runs later still but necessarily before the first abort: the
-	// patched kernel makes the pass final, while an aborted go-fuse loop can
-	// close the notification descriptor before userspace reaches it.
+	// bindings are being taken back one at a time. The retained-data withdrawal
+	// runs before the first abort because an aborted go-fuse loop can close the
+	// notification descriptor before userspace reaches it.
 	if out.installed {
 		out.record(1, "detach", ops.detach(installed.point))
 	}
@@ -1445,27 +780,14 @@ func (m *Mount) reportRevocation(out withdrawalOutcome) {
 func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 
 // kernelNotifier is the reverse channel this frontend uses to take back what it
-// published. It is exactly the strict go-fuse calls the repair needs, named as
-// an interface so the mapping from a visibility target to a notification can be
-// tested without a kernel; *fuse.Server is the only production implementation.
+// published. It is the stock go-fuse notification surface, named as an
+// interface so lease invalidation can be tested without a kernel; *fuse.Server
+// is the only production implementation.
 type kernelNotifier interface {
 	// InodeNotify(node, -1, 0) withdraws cached attributes only, which is what
-	// an ATTRIBUTES repair owes. InodeNotify(node, 0, 0) is the strict
-	// whole-inode data withdrawal used by self-revocation: the patched kernel
-	// routes that exact shape through fuse_pfs_withdraw_data(), which drops
-	// every retained folio under the same publication mutex and
-	// mapping->invalidate_lock an ordered DATA publication takes, and which
-	// deliberately consumes no authority sequence.
+	// an A recall owes. InodeNotify(node, 0, 0) asks stock FUSE to invalidate
+	// the entire inode data range and its attributes for a D recall.
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
-	PFSSizeNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status
-	PFSAttrNotify(sequence uint64, object *fuse.PFSObjectState) fuse.Status
-	PFSEntryNotify(parent uint64, child uint64, sequence uint64, name string, deleted bool) fuse.Status
-	DeleteNotify(parent uint64, child uint64, name string) fuse.Status
-	// EntryNotify takes back a cached absence. It is the name-only primitive,
-	// which is the correct one here and only here: an absence has no child
-	// identity to validate, and the strict kernel expires it under the same
-	// lockless path DeleteNotify uses.
-	EntryNotify(parent uint64, name string) fuse.Status
 }
 
 var _ kernelNotifier = (*fuse.Server)(nil)

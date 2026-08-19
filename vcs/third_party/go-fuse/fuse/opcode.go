@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"math"
 	"runtime"
 	"syscall"
 	"unsafe"
@@ -68,18 +67,6 @@ const (
 	_OP_STATX              = 52
 	_OP_COPY_FILE_RANGE_64 = 53
 
-	// PFS_WRITE_OPCODE is PortableFS's private transactional shared-write opcode.
-	// It is deliberately sparse: 4096 is CUSE_INIT in the Linux UAPI.
-	PFS_WRITE_OPCODE = uint32(4097)
-	_OP_PFS_WRITE    = PFS_WRITE_OPCODE
-	// PFS_PUBLISH_OPCODE is the local-only post-VFS publication receipt.
-	PFS_PUBLISH_OPCODE         = uint32(4098)
-	_OP_PFS_PUBLISH            = PFS_PUBLISH_OPCODE
-	PFS_FALLOCATE_OPCODE       = uint32(4099)
-	_OP_PFS_FALLOCATE          = PFS_FALLOCATE_OPCODE
-	PFS_COPY_FILE_RANGE_OPCODE = uint32(4100)
-	_OP_PFS_COPY_FILE_RANGE    = PFS_COPY_FILE_RANGE_OPCODE
-
 	// The following entries don't have to be compatible across Go-FUSE versions.
 	_OP_NOTIFY_INVAL_ENTRY    = uint32(100)
 	_OP_NOTIFY_INVAL_INODE    = uint32(101)
@@ -87,11 +74,7 @@ const (
 	_OP_NOTIFY_RETRIEVE_CACHE = uint32(103)
 	_OP_NOTIFY_DELETE         = uint32(104) // protocol version 18
 	_OP_NOTIFY_PRUNE          = uint32(105) // protocol version 45
-	_OP_NOTIFY_PFS_SIZE       = uint32(106) // PortableFS private notify code 10
-	_OP_NOTIFY_PFS_ATTR       = uint32(107) // PortableFS private notify code 12
-	_OP_NOTIFY_PFS_ENTRY      = uint32(108) // PortableFS private notify code 13
-
-	_OPCODE_COUNT = uint32(109)
+	_OPCODE_COUNT             = uint32(106)
 
 	// Constants from Linux kernel fs/fuse/fuse_i.h
 	// Default MaxPages value in all kernel versions
@@ -116,12 +99,6 @@ func doInit(server *protocolServer, req *request) {
 	}
 
 	kernelFlags := input.Flags64()
-	const pfsProfileRevision = CAP_PFS_STRICT_COHERENCE | CAP_PFS_CACHED_DATA | CAP_PFS_WRITE_ONESHOT
-	if server.opts.ExtraCapabilities&CAP_PFS_WRITE_ONESHOT != 0 && input.Flags64()&pfsProfileRevision != pfsProfileRevision {
-		log.Printf("kernel does not advertise the exact PortableFS profile revision\n")
-		req.status = EIO
-		return
-	}
 	server.kernelSettings = *input
 	kernelFlags &= (CAP_ASYNC_READ | CAP_BIG_WRITES | CAP_FILE_OPS |
 		CAP_READDIRPLUS | CAP_NO_OPEN_SUPPORT | CAP_PARALLEL_DIROPS | CAP_MAX_PAGES | CAP_RENAME_SWAP | CAP_PASSTHROUGH | CAP_ALLOW_IDMAP |
@@ -164,16 +141,6 @@ func doInit(server *protocolServer, req *request) {
 	}
 	out.setFlags(kernelFlags)
 	if server.opts.MaxReadAhead != 0 && uint32(server.opts.MaxReadAhead) < out.MaxReadAhead {
-		out.MaxReadAhead = uint32(server.opts.MaxReadAhead)
-	}
-	if kernelFlags&CAP_PFS_CACHED_DATA != 0 && server.opts.MaxReadAhead != 0 {
-		// The strict profile negotiates the read-ahead window exactly rather
-		// than clamping the kernel's own request downwards. A SHARED read is
-		// one authority round trip, so the window is what decides how many of
-		// them a sequential reader pays, and it is sized against the same
-		// authority read bound this daemon will honour. The strict kernel
-		// installs this value verbatim instead of taking min() with its
-		// generic VM_READAHEAD_PAGES default.
 		out.MaxReadAhead = uint32(server.opts.MaxReadAhead)
 	}
 	if out.Minor > input.Minor {
@@ -240,63 +207,6 @@ func doWrite(server *protocolServer, req *request) {
 	o := (*WriteOut)(req.outData())
 	o.Size = n
 	req.status = status
-}
-
-func doPFSWrite(server *protocolServer, req *request) {
-	in := (*PFSWriteIn)(req.inData())
-	if in.Unique == 0 || in.Unique >= PFS_UNIQUE_PUBLISH || in.Unique&1 != 0 || uint64(len(req.inPayload)) != uint64(in.Size) {
-		req.status = EIO
-		return
-	}
-	switch in.Phase {
-	case PFS_WRITE_DATA, PFS_WRITE_ONE_SHOT:
-		if in.Size == 0 {
-			req.status = EIO
-			return
-		}
-	case PFS_WRITE_BEGIN, PFS_WRITE_COMMIT, PFS_WRITE_ABORT:
-		if in.Size != 0 {
-			req.status = EIO
-			return
-		}
-	default:
-		req.status = EIO
-		return
-	}
-	req.status = server.fileSystem.PFSWrite(req.cancel, in, req.inPayload, (*PFSWriteOut)(req.outData()))
-}
-
-func doPFSPublish(server *protocolServer, req *request) {
-	in := (*PFSPublishIn)(req.inData())
-	if len(req.inPayload) != 0 || in.RequestUnique == 0 || in.PublicationID == 0 ||
-		in.PublicationID > math.MaxInt64 || in.PublicationID&1 == 0 || in.RequestUnique&1 != 0 || in.PublicationID == in.RequestUnique ||
-		in.Opcode == 0 || in.Flags != 0 || in.Unique >= PFS_UNIQUE_PUBLISH || in.Unique&1 != 0 || in.RequestUnique >= PFS_UNIQUE_PUBLISH {
-		req.status = EIO
-		return
-	}
-	req.status = server.fileSystem.PFSPublish(req.cancel, in, (*PFSPublishOut)(req.outData()))
-}
-
-func doPFSFallocate(server *protocolServer, req *request) {
-	in := (*PFSFallocateIn)(req.inData())
-	if len(req.inPayload) != 0 || in.Unique == 0 || in.Unique >= PFS_UNIQUE_PUBLISH || in.Unique&1 != 0 {
-		req.status = EIO
-		return
-	}
-	req.status = server.fileSystem.PFSFallocate(
-		req.cancel, in, (*PFSRangeOut)(req.outData()),
-	)
-}
-
-func doPFSCopyFileRange(server *protocolServer, req *request) {
-	in := (*PFSCopyFileRangeIn)(req.inData())
-	if len(req.inPayload) != 0 || in.Unique == 0 || in.Unique >= PFS_UNIQUE_PUBLISH || in.Unique&1 != 0 {
-		req.status = EIO
-		return
-	}
-	req.status = server.fileSystem.PFSCopyFileRange(
-		req.cancel, in, (*PFSRangeOut)(req.outData()),
-	)
 }
 
 func doNotifyReply(server *protocolServer, req *request) {
@@ -600,13 +510,7 @@ type operationHandler struct {
 	SuppressReply bool
 }
 
-var (
-	operationHandlers                []*operationHandler
-	pfsWriteOperationHandler         *operationHandler
-	pfsPublishOperationHandler       *operationHandler
-	pfsFallocateOperationHandler     *operationHandler
-	pfsCopyFileRangeOperationHandler *operationHandler
-)
+var operationHandlers []*operationHandler
 
 func operationName(op uint32) string {
 	h := getHandler(op)
@@ -617,16 +521,6 @@ func operationName(op uint32) string {
 }
 
 func getHandler(o uint32) *operationHandler {
-	switch o {
-	case _OP_PFS_WRITE:
-		return pfsWriteOperationHandler
-	case _OP_PFS_PUBLISH:
-		return pfsPublishOperationHandler
-	case _OP_PFS_FALLOCATE:
-		return pfsFallocateOperationHandler
-	case _OP_PFS_COPY_FILE_RANGE:
-		return pfsCopyFileRangeOperationHandler
-	}
 	if o >= _OPCODE_COUNT {
 		return nil
 	}
@@ -699,9 +593,6 @@ func init() {
 		_OP_NOTIFY_STORE_CACHE:    "NOTIFY_STORE",
 		_OP_NOTIFY_RETRIEVE_CACHE: "NOTIFY_RETRIEVE",
 		_OP_NOTIFY_DELETE:         "NOTIFY_DELETE",
-		_OP_NOTIFY_PFS_SIZE:       "NOTIFY_PFS_SIZE",
-		_OP_NOTIFY_PFS_ATTR:       "NOTIFY_PFS_ATTR",
-		_OP_NOTIFY_PFS_ENTRY:      "NOTIFY_PFS_ENTRY",
 		_OP_FALLOCATE:             "FALLOCATE",
 		_OP_READDIRPLUS:           "READDIRPLUS",
 		_OP_RENAME2:               "RENAME2",
@@ -714,40 +605,6 @@ func init() {
 		_OP_COPY_FILE_RANGE_64:    "COPY_FILE_RANGE_64",
 	} {
 		operationHandlers[op].Name = v
-	}
-
-	pfsWriteOperationHandler = &operationHandler{
-		OpCode:     int(_OP_PFS_WRITE),
-		Name:       "PFS_WRITE",
-		Func:       doPFSWrite,
-		InType:     PFSWriteIn{},
-		OutType:    PFSWriteOut{},
-		InputSize:  unsafe.Sizeof(PFSWriteIn{}),
-		OutputSize: unsafe.Sizeof(PFSWriteOut{}),
-	}
-	pfsPublishOperationHandler = &operationHandler{
-		OpCode:     int(_OP_PFS_PUBLISH),
-		Name:       "PFS_PUBLISH",
-		Func:       doPFSPublish,
-		InType:     PFSPublishIn{},
-		OutType:    PFSPublishOut{},
-		InputSize:  unsafe.Sizeof(PFSPublishIn{}),
-		OutputSize: unsafe.Sizeof(PFSPublishOut{}),
-	}
-	pfsFallocateOperationHandler = &operationHandler{
-		OpCode: int(_OP_PFS_FALLOCATE), Name: "PFS_FALLOCATE", Func: doPFSFallocate,
-		InType: PFSFallocateIn{}, OutType: PFSRangeOut{},
-		InputSize: unsafe.Sizeof(PFSFallocateIn{}), OutputSize: unsafe.Sizeof(PFSRangeOut{}),
-	}
-	pfsCopyFileRangeOperationHandler = &operationHandler{
-		OpCode: int(_OP_PFS_COPY_FILE_RANGE), Name: "PFS_COPY_FILE_RANGE", Func: doPFSCopyFileRange,
-		InType: PFSCopyFileRangeIn{}, OutType: PFSRangeOut{},
-		InputSize: unsafe.Sizeof(PFSCopyFileRangeIn{}), OutputSize: unsafe.Sizeof(PFSRangeOut{}),
-	}
-	for _, handler := range []*operationHandler{pfsWriteOperationHandler, pfsPublishOperationHandler, pfsFallocateOperationHandler, pfsCopyFileRangeOperationHandler} {
-		if maxInputSize < handler.InputSize {
-			maxInputSize = handler.InputSize
-		}
 	}
 
 	for op, v := range map[uint32]operationFunc{
@@ -823,9 +680,6 @@ func init() {
 		_OP_NOTIFY_RETRIEVE_CACHE: NotifyRetrieveOut{},
 		_OP_NOTIFY_STORE_CACHE:    NotifyStoreOut{},
 		_OP_NOTIFY_PRUNE:          NotifyPruneOut{},
-		_OP_NOTIFY_PFS_SIZE:       NotifyPFSSizeOut{},
-		_OP_NOTIFY_PFS_ATTR:       NotifyPFSAttrOut{},
-		_OP_NOTIFY_PFS_ENTRY:      NotifyPFSEntryOut{},
 		_OP_OPEN:                  OpenOut{},
 		_OP_OPENDIR:               OpenOut{},
 		_OP_POLL:                  _PollOut{},
@@ -918,11 +772,6 @@ func checkFixedBufferSize() {
 	for code, h := range operationHandlers {
 		if h.OutputSize > unsafe.Sizeof(r.outDataInline) {
 			log.Panicf("request output buffer too small: code %v, sz %d %v", code, h.OutputSize, h)
-		}
-	}
-	for _, handler := range []*operationHandler{pfsWriteOperationHandler, pfsPublishOperationHandler, pfsFallocateOperationHandler, pfsCopyFileRangeOperationHandler} {
-		if handler != nil && handler.OutputSize > unsafe.Sizeof(r.outDataInline) {
-			log.Panicf("request output buffer too small: code %v, sz %d %v", handler.OpCode, handler.OutputSize, handler)
 		}
 	}
 }

@@ -22,10 +22,6 @@ type request struct {
 	cancel chan struct{}
 
 	suppressReply bool
-	// publishMarked asks serializeHeader to set the private bit62 marker on an
-	// ordinary response selected by ReplyPublishMarker.
-	publishMarked bool
-
 	// written under Server.interruptMu
 	interrupted bool
 
@@ -91,7 +87,6 @@ func (r *request) clear() {
 	r.outDataBuf = nil
 	r.inPayload = nil
 	r.status = OK
-	r.publishMarked = false
 	r.outPayload = nil
 	r.startTime = time.Time{}
 	r.readResult = nil
@@ -245,13 +240,6 @@ func parseRequest(in []byte, kernelSettings *InitIn) (h *operationHandler, inSiz
 	outSize = int(h.OutputSize)
 
 	switch hdr.Opcode {
-	case _OP_LOOKUP, _OP_GETATTR:
-		outPayloadSize, variableReply = PFSCacheStampSize, true
-	case _OP_SETATTR, _OP_SYMLINK, _OP_MKNOD, _OP_MKDIR, _OP_UNLINK,
-		_OP_RMDIR, _OP_RENAME, _OP_LINK, _OP_SETXATTR, _OP_REMOVEXATTR,
-		_OP_OPEN, _OP_CREATE, _OP_FALLOCATE, _OP_RENAME2, _OP_TMPFILE,
-		PFS_WRITE_OPCODE, PFS_FALLOCATE_OPCODE, PFS_COPY_FILE_RANGE_OPCODE:
-		outPayloadSize, variableReply = PFSPostStateMaxSize, true
 	case _OP_READDIRPLUS:
 		outPayloadSize, variableReply = int(((*ReadIn)(inData)).Size), true
 	case _OP_READDIR, _OP_READ:
@@ -317,9 +305,6 @@ func (r *request) serializeHeader(outPayloadSize int) {
 
 	o := r.outHeader()
 	o.Unique = r.inHeader().Unique
-	if r.publishMarked {
-		o.Unique |= PFS_UNIQUE_PUBLISH
-	}
 	o.Status = int32(-r.status)
 	o.Length = uint32(
 		int(sizeOfOutHeader) + len(r.outDataBuf) + outPayloadSize)

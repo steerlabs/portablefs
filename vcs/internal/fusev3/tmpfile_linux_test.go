@@ -47,20 +47,14 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 		request.GetFlags().GetAppend() || request.GetFlags().GetTruncate() || !request.GetExclusive() {
 		t.Fatalf("authority TMPFILE mapping = %+v", request)
 	}
-	gate := captured.GetSourcePublicationGate()
-	var gateItem *authoritypb.SourcePublicationItem
-	if gate != nil && len(gate.GetTargets()) == 1 {
-		gateItem = gate.GetTargets()[0].GetItem()
+	if !fixture.raw.ReplyWriteOrdered(unique) {
+		t.Fatal("TMPFILE lost its daemon-local source publication ownership")
 	}
-	if gateItem == nil || !gateItem.GetAttributes() || gateItem.GetData() ||
-		!bytes.Equal(gateItem.GetIdentity(), fixture.raw.nodesByID[fuse.FUSE_ROOT_ID].identity[:]) {
-		t.Fatalf("TMPFILE parent-attribute source gate = %+v, want exactly the supplied parent attrs", gate)
-	}
-	if out.NodeId == 0 || out.Fh == 0 || out.Attr.Ino != 81 || out.Attr.Flags != fuse.FUSE_ATTR_PFS_SHARED ||
-		out.OpenFlags != coherentOpenFlags || out.EntryTimeout() != 0 {
+	if out.NodeId == 0 || out.Fh == 0 || out.Attr.Ino != 81 || out.Attr.Flags != 0 ||
+		out.OpenFlags != fuse.FOPEN_DIRECT_IO || out.EntryTimeout() != 0 {
 		t.Fatalf("shared TMPFILE output = %+v", out)
 	}
-	finishPrivatePublication(t, fixture, unique, fuse.FUSE_ROOT_ID, 51) // FUSE_TMPFILE
+	completeTestReply(t, fixture.raw, unique, fuse.OK)
 	if fixture.mount.isRevoked() {
 		t.Fatalf("valid shared TMPFILE revoked mount: %v", fixture.mount.fatalError())
 	}

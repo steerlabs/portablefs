@@ -678,7 +678,7 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	if errno != 0 {
 		return nil, errno
 	}
-	reply := response.GetWriteTransaction()
+	reply := response.GetFskitWrite()
 	if err := validV3WriteCommit(tx, response); err != nil {
 		return d.malformed(err.Error())
 	}
@@ -1354,7 +1354,7 @@ func retainedV3ResponseTerminalCause(response *authoritypb.Response, callErr err
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_STORAGE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE ||
 		response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY ||
-		response.GetVisibilityRetrySequence() != 0 ||
+		response.GetFskitRepairRetrySequence() != 0 ||
 		response.GetRoutesMismatch().GetSessionRefused() {
 		return errors.New("portablefsd: authority returned a terminal retained outcome")
 	}
@@ -1374,13 +1374,9 @@ func (d *v3DataPlane) revokeRetainedResponse(ctx context.Context, cause error) {
 	_ = d.fail(cause)
 }
 
-func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.SourcePublicationGate) (*authoritypb.Response, int32) {
+func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, request *authoritypb.Request, gate *authoritypb.FskitSourcePublication) (*authoritypb.Response, int32) {
 	if operationID == 0 || request == nil {
 		return nil, darwinEINVAL
-	}
-	if request.GetVisibilityRetryAfterSequence() != 0 {
-		_ = d.fail(errors.New("portablefsd: callback-serialized mutation carried a Linux-only visibility retry proof"))
-		return nil, darwinEIO
 	}
 	lease, err := d.bridge.sourcePublication.acquireSource(ctx, operationID, gate)
 	if err != nil {
@@ -1389,18 +1385,18 @@ func (d *v3DataPlane) callMutation(ctx context.Context, operationID uint64, requ
 		}
 		return nil, v3LocalErrno(err)
 	}
-	request.SourcePublicationGate = gate
+	request.FskitSourcePublication = gate
 	// Carry the exact pfslocal publication/callback identity into authority
 	// scheduling as retry-fairness metadata. Publication ownership itself is
 	// represented only by the canonical gate above; there is no source phase.
-	request.FrontendOperationId = operationID
+	request.FskitFrontendOperationId = operationID
 	var assigned authorityrpc.MutationIdentity
 	response, consumption, callErr := d.client.CallMutationWithIdentityRetained(ctx, request, func(identity authorityrpc.MutationIdentity) error {
 		assigned = identity
 		return lease.markAssigned()
 	}, func(cause error) {
 		// The authority holds a terminal response until this callback proves the
-		// qualification frontend has either published it or revoked its serving
+		// FSKit frontend has either published it or revoked its serving
 		// boundary. A forced drain therefore kills the whole strict incarnation
 		// synchronously; returning while FSKit could still issue callbacks would
 		// turn a delivery timeout into a stale-serving window.
@@ -1584,7 +1580,7 @@ func (d *v3DataPlane) classify(response *authoritypb.Response, callErr error, mu
 		_ = d.fail(errors.New("portablefsd: authority returned a terminal or malformed outcome"))
 		return nil, darwinEIO
 	}
-	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY || response.GetVisibilityRetrySequence() != 0 {
+	if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY || response.GetFskitRepairRetrySequence() != 0 {
 		_ = d.fail(errors.New("portablefsd: authority returned a Linux-only visibility retry to a callback-serialized frontend"))
 		return nil, darwinEIO
 	}

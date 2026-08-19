@@ -89,6 +89,13 @@ jobs:
       - run: go -C vcs test ./...
       - name: Race suite
         run: go -C vcs test -race ./...
+      - name: Maintained go-fuse reply ordering seam
+        run: |
+          set -euo pipefail
+          go -C vcs/third_party/go-fuse build ./fuse
+          go -C vcs/third_party/go-fuse vet ./fuse
+          go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+          go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
 
   go-darwin:
     runs-on: macos-26
@@ -107,17 +114,6 @@ jobs:
           CGO_ENABLED=1 GOOS=darwin go -C vcs vet ./...
       - name: Test the Foundation-enabled Darwin data plane
         run: CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
-
-  kernel-strict-static:
-    name: kernel-strict-static
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Verify exact Linux 6.12.100 patch series, UAPI, hooks, and state models
-        run: kernel/linux-6.12.100-portablefs-append/verify.sh --no-build
 
   macos-app-unsigned:
     runs-on: macos-26
@@ -181,11 +177,6 @@ jobs:
           test "$("$cli" version)" = "portablefs $expected_version"
           test "$("$daemon" -version)" = "$expected_version"
 
-  # The live privileged jobs are intentionally not run on stock hosted runners.
-  # The strict dialect requires the checked-in patched Linux 6.12.100 kernel;
-  # stock Ubuntu must fail INIT and cannot provide weaker evidence. A separate
-  # qualification runner boots that exact kernel and invokes these same scripts.
-  #
   # The privileged Linux data-plane suite. Everything below `go test ./...` in
   # the `go` job runs on an ordinary tmpfs with no XFS project quotas and no
   # kernel FUSE mount, so the two-mount coherence, locking, paging, session and
@@ -194,13 +185,13 @@ jobs:
   # the script additionally verifies that each required test reported PASS, so a
   # provisioning regression or a deleted test cannot present as a green run.
   linux-xfs-fuse:
-    runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Verify the runner can provide loop devices and /dev/fuse
+      - name: Verify the stock runner can provide loop devices and /dev/fuse
         run: |
           sudo modprobe loop
           sudo modprobe fuse
@@ -222,19 +213,19 @@ jobs:
   # coherence case must fail) and fails the job if a control does not turn a case
   # red. So a green result here is evidence rather than an absence of evidence.
   linux-coherence-matrix:
-    runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Verify the runner can provide loop devices and /dev/fuse
+      - name: Verify the stock runner can provide loop devices and /dev/fuse
         run: |
           sudo modprobe loop
           sudo modprobe fuse
           test -e /dev/loop-control
           test -e /dev/fuse
-      # The strict protocol runs against a volume that really declares
+      # The route cases run against a volume that really declares
       # machine-local routes: the script installs the declaration through the
       # admin ApplyRoutes call before either mount attaches, so the run also
       # exercises the mount's adopt-and-retry attach path.

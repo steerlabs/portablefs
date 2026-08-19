@@ -371,22 +371,6 @@ func (c *rawBridge) Tmpfile(cancel <-chan struct{}, input *fuse.CreateIn, name s
 	return fuse.ENOSYS
 }
 
-func (c *rawBridge) PFSWrite(cancel <-chan struct{}, input *fuse.PFSWriteIn, data []byte, out *fuse.PFSWriteOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
-func (c *rawBridge) PFSPublish(cancel <-chan struct{}, input *fuse.PFSPublishIn, out *fuse.PFSPublishOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
-func (c *rawBridge) PFSFallocate(cancel <-chan struct{}, input *fuse.PFSFallocateIn, out *fuse.PFSRangeOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
-func (c *rawBridge) PFSCopyFileRange(cancel <-chan struct{}, input *fuse.PFSCopyFileRangeIn, out *fuse.PFSRangeOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
 func (c *rawBridge) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 	if input.Fh != 0 {
 		node := c.toInode(input.NodeId)

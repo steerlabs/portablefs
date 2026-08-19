@@ -3,11 +3,9 @@
 package fusev3
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 
-	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
 
@@ -44,22 +42,6 @@ func ActivateRoutes(declaration []byte) (localroutes.RuleSet, error) {
 		return localroutes.RuleSet{}, fmt.Errorf("fusev3: %s: %w", LocalDirsPath, err)
 	}
 	return rules, nil
-}
-
-// routesEventChange reports whether a visibility event announces a route
-// declaration this mount did not attach with.
-//
-// The authority sends the change on both phases of the barrier and this answers
-// on the first one it sees. Acting at PREPARE is deliberate: PREPARE is the
-// point at which the new topology is not yet visible anywhere, so a mount that
-// stops there has served nothing under the old rules that the new rules
-// contradict.
-func routesEventChange(mounted [32]byte, event *authoritypb.VisibilityEvent) error {
-	revision := event.GetRoutes().GetRevision()
-	if len(revision) == 0 || bytes.Equal(revision, mounted[:]) {
-		return nil
-	}
-	return routesChangeCause(mounted[:], revision)
 }
 
 // routesChangeCause is the message a mount self-revokes with when the volume's

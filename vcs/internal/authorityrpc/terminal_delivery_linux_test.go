@@ -55,11 +55,11 @@ func TestStorageFatalTeardownWaitsForExactFrontendReceipt(t *testing.T) {
 	if h.beginTerminalRequest(ordinary) {
 		t.Fatal("post-fence filesystem request was admitted")
 	}
-	// Visibility CONTROL must remain live while the already-applied operation
+	// Lease CONTROL must remain live while the already-applied operation
 	// finishes its peer COMPLETE barrier.
-	control := &authoritypb.Request{Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{}}}
+	control := &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{AcknowledgeLeaseEvent: &authoritypb.AcknowledgeLeaseEventRequest{}}}
 	if !h.beginTerminalRequest(control) {
-		t.Fatal("terminal visibility control was refused")
+		t.Fatal("terminal lease control was refused")
 	}
 	h.endTerminalRequest()
 
@@ -372,9 +372,9 @@ func TestTerminalQuiesceEdgeClosesOnceAndLeavesControlAdmissible(t *testing.T) {
 	if h.beginTerminalRequest(ordinary) {
 		t.Fatal("ordinary request was admitted after quiesce")
 	}
-	control := &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{NextVisibility: &authoritypb.NextVisibilityRequest{}}}
+	control := &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{AcknowledgeLeaseEvent: &authoritypb.AcknowledgeLeaseEventRequest{}}}
 	if !h.beginTerminalRequest(control) {
-		t.Fatal("visibility control was refused during quiesce")
+		t.Fatal("lease control was refused during quiesce")
 	}
 	h.endTerminalRequest()
 	h.endTerminalRequest()
@@ -390,11 +390,11 @@ func TestTerminalQuiesceRefusesNewParkableControlWithoutWaiting(t *testing.T) {
 		t.Fatal("ordinary request was not admitted before fence")
 	}
 	h.deferStorageFailure(nil, errors.Join(xfsstore.ErrWritePrivilege, syscall.EPERM))
-	next := &authoritypb.Request{RequestId: 9, Body: &authoritypb.Request_NextVisibility{NextVisibility: &authoritypb.NextVisibilityRequest{}}}
+	next := &authoritypb.Request{RequestId: 9, Body: &authoritypb.Request_NextLeaseEvent{NextLeaseEvent: &authoritypb.NextLeaseEventRequest{}}}
 	response := h.Handle(t.Context(), next)
 	if response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() ||
 		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE {
-		t.Fatalf("post-quiesce NextVisibility = %+v, want immediate fenced response", response)
+		t.Fatalf("post-quiesce NextLeaseEvent = %+v, want immediate fenced response", response)
 	}
 	h.endTerminalRequest()
 }

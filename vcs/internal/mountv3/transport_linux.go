@@ -12,16 +12,14 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 )
 
-// Profile maps a coherence profile name to the two forms a mount needs: the
-// frontend's kernel-cache contract and the wire declaration the authority
-// sizes its barrier from. They travel together so a frontend can never mount
-// with one profile while having attached with the other.
-func Profile(name string) (fusev3.CoherenceProfile, authoritypb.CoherenceProfile, error) {
+// Profile validates the retained CLI spelling for protocol 6's one exact
+// frontend cache contract. The profile is no longer negotiated on the wire.
+func Profile(name string) (fusev3.CoherenceProfile, error) {
 	switch name {
 	case "strict":
-		return fusev3.CoherenceStrict, authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT, nil
+		return fusev3.CoherenceStrict, nil
 	default:
-		return 0, 0, fmt.Errorf("coherence must be strict, not %q", name)
+		return 0, fmt.Errorf("coherence must be strict, not %q", name)
 	}
 }
 

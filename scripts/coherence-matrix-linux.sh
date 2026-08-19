@@ -37,16 +37,11 @@ set -euo pipefail
 : "${PORTABLEFS_VOLUME_NAME:=coherence-volume}"
 : "${PORTABLEFS_AUTHORITY_PORT:=17443}"
 : "${PORTABLEFS_ATOMIC_REPLACE_ROUNDS:=20}"
-# Protocol 5 has one kernel-cache contract: every mount participates in strict
-# source-publication and peer-visibility ordering. The harness names that
-# contract explicitly instead of exposing a selector for a weaker path.
-# A mount declares a kernel-cache bound and a repair deadline, and the
-# authority refuses any commitment larger than its own maxima. The shipped
-# defaults agree (mount -repair-budget 15s under authority --max-repair-budget
-# 30s; both cached-name capacities 1<<16), so these are stated here only to pin
-# the harness's numbers explicitly: if the two commands' defaults ever diverge
-# again, the attach fails loudly with EOPNOTSUPP and this harness must report
-# that defect rather than paper over it with its own values.
+# This black-box harness proves only the syscall behavior its cases observe. It
+# does not inspect or prove protocol-6 lease grants, recalls, or discharge. The
+# legacy-named bounds remain explicit while their command-line admission surface
+# is retired; if mount and authority disagree, Attach must fail rather than let
+# the harness paper over it. Dedicated v6 tests must cover the mechanism.
 : "${PORTABLEFS_CACHED_NAME_CAPACITY:=65536}"
 : "${PORTABLEFS_REPAIR_BUDGET:=15s}"
 # The driver's per-case wall bound. It is deliberately larger than
@@ -89,7 +84,10 @@ FALSIFIABLE_CASES=(
   remote_truncate_shrink_readable_eof
   dir_listing_reflects_remote_creates_and_deletes
   concurrent_writers_distinct_files
-  concurrent_same_file_append_atomicity
+  # Protocol 6 refuses writable O_APPEND because stock FUSE cannot preserve
+  # append intent or return an authority-assigned offset. The real matrix
+  # declares that case FAIL; a case which is intentionally unavailable cannot
+  # also serve as evidence that the stale-view control detects a bug.
   concurrent_same_file_overwrite_integrity
   hardlink_visible_same_inode
   symlink_visible_and_resolves
@@ -430,7 +428,7 @@ run_disjoint_control() {
       # through a client that touches no mountpoint, so pointing the second root
       # at an unrelated directory cannot turn it red. It is expected to PASS
       # here, which is why it is simply not declared.
-      routes_revision_mismatch) continue ;;
+      routes_revision_mismatch|concurrent_same_file_append_atomicity) continue ;;
     esac
     arguments+=(--expect "${entry}=FAIL:a mount that shares no namespace with the other must fail this case")
   done
@@ -439,7 +437,7 @@ run_disjoint_control() {
   # consumes one single-use capability. Exclude it here so the final matrix is
   # the one phase that owns and spends that credential.
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
-    cut -f1 | grep -vx routes_revision_mismatch | paste -sd, -)
+    cut -f1 | grep -Ev '^(routes_revision_mismatch|concurrent_same_file_append_atomicity)$' | paste -sd, -)
   echo
   echo "======================================================================"
   echo "PHASE 1/3  disjoint-namespace control (second root is not the volume)"
@@ -473,7 +471,7 @@ run_falsifiability_control() {
     arguments+=(--expect "${name}=FAIL:a replayed first-success pathname observation must be detected by this case")
   done
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
-    cut -f1 | grep -vx routes_revision_mismatch | paste -sd, -)
+    cut -f1 | grep -Ev '^(routes_revision_mismatch|concurrent_same_file_append_atomicity)$' | paste -sd, -)
   echo
   echo "======================================================================"
   echo "PHASE 2/3  first-success stale-view control (deliberately broken pathname observations)"
@@ -508,8 +506,9 @@ run_matrix() {
     --fence-command "$FENCE_COMMAND" \
     --local-route "$PORTABLEFS_LOCAL_ROUTE" \
     --routes-contract-command "$ROUTES_CONTRACT_COMMAND" \
+    --expect "concurrent_same_file_append_atomicity=FAIL:protocol 6 refuses writable O_APPEND because stock FUSE does not preserve exact append intent or an authority-assigned result offset; RWF_APPEND is not forwarded and remains a production blocker" \
     --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal (docs/xfs-authority-architecture.md), so a chown to another principal is refused by the volume itself and there is no ownership change to observe" \
-    --label "linux ${KERNEL_RELEASE}: two strict kernel FUSE mounts of one authoritative XFS volume" \
+    --label "linux ${KERNEL_RELEASE}: two stock-kernel FUSE mounts of one authoritative XFS volume" \
     --json /home/portablefs/logs/matrix.json
 }
 
@@ -538,7 +537,7 @@ run_container() {
   # matrix process's own command line, so a pkill pattern would match and kill
   # the driver instead of the mount.
   FENCE_COMMAND="kill -9 ${MOUNT_B_PID}"
-  echo "coherence-matrix-linux: kernel $KERNEL_RELEASE, two independent strict mounts of volume $PORTABLEFS_VOLUME_NAME"
+  echo "coherence-matrix-linux: stock kernel $KERNEL_RELEASE, two independent mounts of volume $PORTABLEFS_VOLUME_NAME (black-box behavior only)"
   local both=(/home/portablefs/mount-a /home/portablefs/mount-b)
   assert_mounts_serving "before any phase ran" "${both[@]}"
   run_disjoint_control

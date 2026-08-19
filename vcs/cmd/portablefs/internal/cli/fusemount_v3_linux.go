@@ -118,7 +118,7 @@ func (m *fuseV3Mount) Reauthorize(ctx context.Context, token string, sequence ui
 // keeps a Manager enrollment alive when cleanup is ambiguous, while a failure
 // before attach can close an enrollment that was never handed to a session.
 func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ error) {
-	profile, wireProfile, err := mountv3.Profile(cfg.coherence)
+	profile, err := mountv3.Profile(cfg.coherence)
 	if err != nil {
 		return nil, false, err
 	}
@@ -137,24 +137,15 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		return nil, false, fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
 	}
 	attach := authorityrpc.ClientConfig{
-		Address: cfg.addr, TLS: tlsCfg, VolumeID: cfg.volumeID,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         cfg.addr, TLS: tlsCfg, VolumeID: cfg.volumeID,
 		AccessToken: []byte(cfg.token), ReplaySlots: mountv3.ReplaySlots,
 		MaxFrame: mountv3.MaxFrame, DialTimeout: mountv3.DialTimeout,
 		CancelDrainTimeout: mountv3.CancelDrainTimeout, MaxInFlight: mountv3.MaxInFlight,
 		RequireMountEnrollmentReauthorization: cfg.requireMountEnrollment,
-		// The two numbers a strict mount declares are the two the authority
-		// needs to size the barrier: how much cached state this frontend can be
-		// holding, and how long it may take to withdraw it.
-		CoherenceProfile: wireProfile, CachedNameCapacity: mountv3.CachedNameCapacity, RepairBudget: mountv3.RepairBudget,
-		ObservePreKernelMountAbsence: preKernelAbsence,
+		ObservePreKernelMountAbsence:          preKernelAbsence,
 	}
-	// How this frontend's kernel makes a cached binding unservable. It is
-	// declared rather than inferred because the authority cannot observe a
-	// remote kernel. The strict Linux answer is load-bearing: its private
-	// reverse notification expires one exact binding under dcache locks without
-	// taking the parent inode's i_rwsem. A stock parent-lock implementation is
-	// refused rather than translated into synthetic application EINTR.
-	attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
 	client, rules, err := mountv3.AttachWithRoutes(context.Background(), attach, !cfg.noLocalDirs)
 	if err != nil {
 		// A routing refusal names both revisions and the volume's declaration.

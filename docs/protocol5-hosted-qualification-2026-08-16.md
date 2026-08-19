@@ -1,7 +1,7 @@
 # Protocol-5 hosted qualification — 2026-08-16
 
-Status: **qualified on the exact Linux reference stack; macOS production
-admission remains intentionally unavailable on current public FSKit**.
+Status: **historical qualification receipt for the retired protocol-5 stack;
+not evidence for protocol 6**.
 
 This receipt records the final clean-source validation of the protocol-5
 hosted migration. It distinguishes demonstrated behavior from platform or

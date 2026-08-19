@@ -127,7 +127,7 @@ func TestV3SourcePublicationGateCanonicalizesExactStableCoordinates(t *testing.T
 	if _, _, err := coordinatesForV3SourceGate(gate); err != nil {
 		t.Fatalf("canonical gate rejected locally: %v", err)
 	}
-	noncanonical := &authoritypb.SourcePublicationGate{Targets: []*authoritypb.SourcePublicationTarget{
+	noncanonical := &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
 		gate.GetTargets()[1], gate.GetTargets()[0],
 	}}
 	if _, _, err := coordinatesForV3SourceGate(noncanonical); err == nil {

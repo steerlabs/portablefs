@@ -93,7 +93,7 @@ func v3SourceNamespace(parent pfslocal.Item, name []byte, boundData bool) (v3Sou
 	}, nil
 }
 
-func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSpec) (*authoritypb.SourcePublicationGate, error) {
+func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSpec) (*authoritypb.FskitSourcePublication, error) {
 	itemSet := make(map[v3PublicationIdentity]v3SourceItemSpec, len(items))
 	for _, item := range items {
 		if item.identity == (v3PublicationIdentity{}) || !item.attributes || item.data && !item.attributes {
@@ -137,19 +137,19 @@ func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSp
 		}
 		return bytes.Compare([]byte(orderedNames[i].name), []byte(orderedNames[j].name)) < 0
 	})
-	gate := &authoritypb.SourcePublicationGate{
-		Targets: make([]*authoritypb.SourcePublicationTarget, 0, len(orderedItems)+len(orderedNames)),
+	gate := &authoritypb.FskitSourcePublication{
+		Targets: make([]*authoritypb.FskitSourcePublicationTarget, 0, len(orderedItems)+len(orderedNames)),
 	}
 	for _, item := range orderedItems {
-		gate.Targets = append(gate.Targets, &authoritypb.SourcePublicationTarget{
-			Coordinate: &authoritypb.SourcePublicationTarget_Item{Item: &authoritypb.SourcePublicationItem{
+		gate.Targets = append(gate.Targets, &authoritypb.FskitSourcePublicationTarget{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
 				Identity: append([]byte(nil), item.identity[:]...), Attributes: item.attributes, Data: item.data,
 			}},
 		})
 	}
 	for _, name := range orderedNames {
-		gate.Targets = append(gate.Targets, &authoritypb.SourcePublicationTarget{
-			Coordinate: &authoritypb.SourcePublicationTarget_Namespace{Namespace: &authoritypb.SourcePublicationNamespace{
+		gate.Targets = append(gate.Targets, &authoritypb.FskitSourcePublicationTarget{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
 				ParentIdentity: append([]byte(nil), name.parent[:]...), Name: []byte(name.name),
 				BoundAttributes: name.attributes, BoundData: name.data,
 			}},
@@ -158,7 +158,7 @@ func v3CanonicalSourceGate(items []v3SourceItemSpec, names []v3SourceNamespaceSp
 	return gate, nil
 }
 
-func v3ItemSourceGate(item pfslocal.Item, data bool) (*authoritypb.SourcePublicationGate, error) {
+func v3ItemSourceGate(item pfslocal.Item, data bool) (*authoritypb.FskitSourcePublication, error) {
 	target, err := v3SourceItem(item, data)
 	if err != nil {
 		return nil, err
@@ -166,7 +166,7 @@ func v3ItemSourceGate(item pfslocal.Item, data bool) (*authoritypb.SourcePublica
 	return v3CanonicalSourceGate([]v3SourceItemSpec{target}, nil)
 }
 
-func v3NamespaceSourceGate(parent pfslocal.Item, name []byte, boundData bool, additional ...pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+func v3NamespaceSourceGate(parent pfslocal.Item, name []byte, boundData bool, additional ...pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 	namespace, err := v3SourceNamespace(parent, name, boundData)
 	if err != nil {
 		return nil, err
@@ -186,7 +186,7 @@ func v3NamespaceSourceGate(parent pfslocal.Item, name []byte, boundData bool, ad
 	return v3CanonicalSourceGate(items, []v3SourceNamespaceSpec{namespace})
 }
 
-func v3RenameSourceGate(oldParent pfslocal.Item, oldName []byte, newParent pfslocal.Item, newName []byte) (*authoritypb.SourcePublicationGate, error) {
+func v3RenameSourceGate(oldParent pfslocal.Item, oldName []byte, newParent pfslocal.Item, newName []byte) (*authoritypb.FskitSourcePublication, error) {
 	oldNamespace, err := v3SourceNamespace(oldParent, oldName, false)
 	if err != nil {
 		return nil, err
@@ -350,7 +350,7 @@ func (c *v3SourcePublicationCoordinator) operationLeaseLocked(operationID uint64
 	return nil
 }
 
-func coordinatesForV3SourceGate(gate *authoritypb.SourcePublicationGate) (map[v3PublicationCoordinate]struct{}, map[v3PublicationNamespace]v3PublicationBounds, error) {
+func coordinatesForV3SourceGate(gate *authoritypb.FskitSourcePublication) (map[v3PublicationCoordinate]struct{}, map[v3PublicationNamespace]v3PublicationBounds, error) {
 	if gate == nil || len(gate.GetTargets()) == 0 || len(gate.GetTargets()) > maxV3SourcePublicationTargets {
 		return nil, nil, errors.New("portablefsd: source publication gate is missing or oversized")
 	}
@@ -514,7 +514,7 @@ func (c *v3SourcePublicationCoordinator) unresolvedConflictsExistingLocked(names
 	return false
 }
 
-func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, operationID uint64, gate *authoritypb.SourcePublicationGate) (*v3SourcePublicationLease, error) {
+func (c *v3SourcePublicationCoordinator) acquireSource(ctx context.Context, operationID uint64, gate *authoritypb.FskitSourcePublication) (*v3SourcePublicationLease, error) {
 	if ctx == nil || operationID == 0 {
 		return nil, errors.New("portablefsd: source publication needs a live callback identity")
 	}
@@ -724,7 +724,7 @@ func addV3BoundCoordinates(coordinates map[v3PublicationCoordinate]struct{}, ide
 	}
 }
 
-func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.SourcePublicationGate, namespace v3PublicationNamespace, identity v3PublicationIdentity) error {
+func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.FskitSourcePublication, namespace v3PublicationNamespace, identity v3PublicationIdentity) error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: definitive source binding has no publication lease")
 	}
@@ -763,7 +763,7 @@ func (l *v3SourcePublicationLease) attachBinding(gate *authoritypb.SourcePublica
 	return nil
 }
 
-func (l *v3SourcePublicationLease) resolveNoBinding(gate *authoritypb.SourcePublicationGate, namespace v3PublicationNamespace) error {
+func (l *v3SourcePublicationLease) resolveNoBinding(gate *authoritypb.FskitSourcePublication, namespace v3PublicationNamespace) error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: source namespace resolution has no lease")
 	}
@@ -790,7 +790,7 @@ func (l *v3SourcePublicationLease) resolveNoBinding(gate *authoritypb.SourcePubl
 	return nil
 }
 
-func (l *v3SourcePublicationLease) resolveNoBindings(gate *authoritypb.SourcePublicationGate) error {
+func (l *v3SourcePublicationLease) resolveNoBindings(gate *authoritypb.FskitSourcePublication) error {
 	if l == nil || l.gate == nil {
 		return errors.New("portablefsd: source namespace resolution has no lease")
 	}

@@ -166,51 +166,6 @@ func (l *DirEntryList) AddDirLookupEntry(e DirEntry) *EntryOut {
 	return entryOut
 }
 
-// PFSDirLookupEntryFits reports whether one private stamped READDIRPLUS record
-// fits without changing the list. PortableFS uses it before interning the
-// authority capability carried by that record, so an entry deferred to the
-// next kernel reply does not acquire a lookup reference early.
-func (l *DirEntryList) PFSDirLookupEntryFits(name string) bool {
-	const fixed = int(unsafe.Sizeof(EntryOut{})) + direntSize + PFSCacheStampSize
-	padding := (8 - len(name)&7) & 7
-	return len(l.buf)+fixed+len(name)+padding <= l.size
-}
-
-// AddPFSDirLookupEntry serializes the private stamped READDIRPLUS ABI:
-// EntryOut, dirent, cache stamp, raw name, then eight-byte padding.
-func (l *DirEntryList) AddPFSDirLookupEntry(e DirEntry) (*EntryOut, *PFSCacheStamp) {
-	if !l.PFSDirLookupEntryFits(e.Name) {
-		return nil, nil
-	}
-	if e.Ino == 0 {
-		e.Ino = FUSE_UNKNOWN_INO
-	}
-	if e.Off == 0 {
-		e.Off = l.Offset + 1
-	}
-	const entryOutSize = int(unsafe.Sizeof(EntryOut{}))
-	const stampOffset = entryOutSize + direntSize
-	padding := (8 - len(e.Name)&7) & 7
-	oldLen := len(l.buf)
-	newLen := oldLen + stampOffset + PFSCacheStampSize + len(e.Name) + padding
-	l.buf = l.buf[:newLen]
-
-	entryOut := (*EntryOut)(unsafe.Pointer(&l.buf[oldLen]))
-	*entryOut = EntryOut{}
-	dirent := (*_Dirent)(unsafe.Pointer(&l.buf[oldLen+entryOutSize]))
-	*dirent = _Dirent{}
-	dirent.Off = e.Off
-	dirent.Ino = e.Ino
-	dirent.NameLen = uint32(len(e.Name))
-	dirent.Typ = modeToType(e.Mode)
-	stamp := (*PFSCacheStamp)(unsafe.Pointer(&l.buf[oldLen+stampOffset]))
-	*stamp = PFSCacheStamp{}
-	copy(l.buf[oldLen+stampOffset+PFSCacheStampSize:], e.Name)
-	l.lastDirent = dirent
-	l.Offset = dirent.Off
-	return entryOut, stamp
-}
-
 // modeToType converts a file *mode* (as used in syscall.Stat_t.Mode)
 // to a file *type* (as used in _Dirent.Typ).
 // Equivalent to IFTODT() in libc (see man 5 dirent).

@@ -52,3 +52,25 @@ func TestAuthorityMetricInventoryUpdates(t *testing.T) {
 		}
 	}
 }
+
+func TestProtocolSixTelemetryNamesDescribeActiveProfiles(t *testing.T) {
+	for operation, want := range map[Operation]string{
+		OperationWrite:            "positioned_write",
+		OperationNextFskitRepair:  "next_fskit_repair",
+		OperationAckFskitRepair:   "ack_fskit_repair",
+		OperationFskitWriteBegin:  "fskit_write_begin",
+		OperationFskitWriteData:   "fskit_write_data",
+		OperationFskitWriteCommit: "fskit_write_commit",
+		OperationFskitWriteAbort:  "fskit_write_abort",
+	} {
+		if got := operation.String(); got != want {
+			t.Fatalf("operation %d = %q, want %q", operation, got, want)
+		}
+	}
+	if got := OutcomeFskitRepairRetry.String(); got != "fskit_repair_retry" {
+		t.Fatalf("FSKit repair retry outcome = %q", got)
+	}
+	if got := fenceReasonNames[FenceFskitWriteMismatch]; got != "fskit_write_mismatch" {
+		t.Fatalf("FSKit write fence = %q", got)
+	}
+}

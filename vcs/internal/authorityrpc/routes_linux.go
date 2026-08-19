@@ -63,8 +63,17 @@ const routesDirMode fs.FileMode = 0o755
 // hidden, and neither side would see an error - so the disagreement has to be
 // caught where both sides are visible, which is here.
 type RoutesController struct {
-	Store      *xfsstore.Volume
+	Store    *xfsstore.Volume
+	Topology interface {
+		AcquireTopologyRead() *volumeserver.TopologyReadGuard
+		ExecuteTopologyExclusive(context.Context, func() (int, error)) (int, error)
+	}
+	// Visibility is the FSKit synchronous-repair coordinator exposed to handler
+	// construction. Route changes themselves use only clean mount absence and
+	// never publish repair events.
 	Visibility *volumeserver.VisibilityCoordinator
+	Mounts     *volumeserver.MountLifecycle
+	Leases     *volumeserver.LeaseCoordinator
 	Locks      *volumeserver.LockTable
 
 	// lockWaitAdmission is a topology transition gate only for blocking byte-
@@ -89,17 +98,24 @@ type RoutesController struct {
 // filesystem request. The caller checks admission only after acquiring it and
 // releases it only after the request can no longer reach XFS.
 func (r *RoutesController) AcquireTopologyRead() *volumeserver.TopologyReadGuard {
-	return r.Visibility.AcquireTopologyRead()
+	return r.Topology.AcquireTopologyRead()
 }
 
-func NewRoutesController(store *xfsstore.Volume, visibility *volumeserver.VisibilityCoordinator, locks *volumeserver.LockTable) (*RoutesController, error) {
-	if store == nil || visibility == nil || locks == nil {
-		return nil, errors.New("authorityrpc: routing needs the volume store, visibility coordinator, and epoch lock table")
+func NewRoutesController(store *xfsstore.Volume, topology interface {
+	AcquireTopologyRead() *volumeserver.TopologyReadGuard
+	ExecuteTopologyExclusive(context.Context, func() (int, error)) (int, error)
+}, locks *volumeserver.LockTable) (*RoutesController, error) {
+	if store == nil || topology == nil || locks == nil {
+		return nil, errors.New("authorityrpc: routing needs the volume store, topology coordinator, and epoch lock table")
 	}
 	if routesDirName == "" || routesFileName == "" {
 		return nil, fmt.Errorf("authorityrpc: %q is not a two-component in-volume path", localroutes.ConfigPath)
 	}
-	return &RoutesController{Store: store, Visibility: visibility, Locks: locks}, nil
+	routes := &RoutesController{Store: store, Topology: topology, Locks: locks}
+	if visibility, ok := topology.(*volumeserver.VisibilityCoordinator); ok {
+		routes.Visibility = visibility
+	}
+	return routes, nil
 }
 
 // Load reads the declaration out of this authority's own volume root and makes
@@ -192,7 +208,7 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 	var active [32]byte
 	var activeCanonical []byte
 	apply := false
-	acknowledged, err := r.Visibility.ExecuteRoutesChecked(ctx, next, func() (bool, error) {
+	check := func() (bool, error) {
 		// This is the authoritative CAS. ExecuteRoutesChecked holds the topology
 		// writer before calling it, so no admitted request or attach is still
 		// running and no competing routing change can decide against the same old
@@ -214,13 +230,9 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		if next.Revision == active {
 			return false, nil
 		}
-		// Retire the complete old-revision queue before PREPARE can fence a lock
-		// holder. Otherwise releasing that holder can grant a stale waiter for a
-		// session that the same routing transition is about to destroy.
-		r.Locks.InterruptWaiters(volumeserver.ErrSessionExpired)
-		apply = true
 		return true, nil
-	}, func() (volumeserver.RoutesChange, error) {
+	}
+	commit := func() (volumeserver.RoutesChange, error) {
 		published, err := r.write(raw)
 		if err != nil && !published {
 			r.mu.RLock()
@@ -235,6 +247,29 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		r.revision, r.canonical = next.Revision, append([]byte(nil), next.Canonical...)
 		r.mu.Unlock()
 		return next, err
+	}
+	if r.Leases == nil {
+		return nil, errors.New("authorityrpc: routing needs the protocol-6 lease coordinator")
+	}
+	acknowledged, err := r.Topology.ExecuteTopologyExclusive(ctx, func() (int, error) {
+		shouldApply, checkErr := check()
+		if checkErr != nil || !shouldApply {
+			return 0, checkErr
+		}
+		if r.Mounts == nil {
+			return 0, errors.New("authorityrpc: routing needs the protocol-6 durable mount lifecycle")
+		}
+		if cleanErr := r.Mounts.RequireCleanRouteAbsence(); cleanErr != nil {
+			return 0, cleanErr
+		}
+		return r.Leases.ExecuteRoutes(ctx, next, func() (volumeserver.RoutesChange, error) {
+			// Every refusal check has passed under topology exclusion. Retire the
+			// old-revision lock queue immediately before durable publication; an
+			// ordinary CAS or live-mount refusal must not disturb it.
+			r.Locks.InterruptWaiters(volumeserver.ErrSessionExpired)
+			apply = true
+			return commit()
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -595,7 +630,7 @@ func namespaceRepair(repair authoritypb.NamespaceRepair) (volumeserver.Namespace
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED:
 		return volumeserver.NamespaceRepairUnspecified, nil
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE:
-		// Protocol 5 keeps the numeric value parseable so an old peer receives
+		// Protocol 6 keeps the numeric value parseable so an unsupported peer receives
 		// an explicit refusal. It is never admitted: stock FUSE parent-i_rwsem
 		// repair required an application-visible synthetic EINTR to break its
 		// lock cycle, which is not part of the strict contract.

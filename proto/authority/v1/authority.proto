@@ -14,31 +14,14 @@ message Request {
   bytes epoch = 2; // 16 bytes after Hello/Attach
   SessionProof session = 3;
   Mutation mutation = 4; // required on mutating bodies
-  // Opaque logical publication/callback identity assigned by the filesystem
-  // frontend. A nonzero value lets CALLBACK_SERIALIZED_PIPELINED scheduling
-  // distinguish a later callback from another mutation issued by the initiating
-  // callback.
-  // Zero means unknown and preserves the fail-safe interruption rule. This is
-  // scheduling metadata only: it grants no authority and is not a replay ID.
-  uint64 frontend_operation_id = 5;
-  reserved 6;
-  reserved "source_phase_queueable";
-  // Exact stable-identity footprint whose publication admission the initiating
-  // strict frontend closed and drained before this mutation could be sent.
-  // The authority independently derives the same footprint from the operation
-  // operands and refuses any mismatch before XFS. It is part of the retained
-  // replay fingerprint: an exact replay carries the exact same local cut.
-  SourcePublicationGate source_publication_gate = 7;
-  // Present only when a Linux mutation is resubmitted after an authority
-  // VISIBILITY_RETRY. The value is the exact COMPLETE sequence
-  // the frontend has repaired locally. The authority accepts it only while it
-  // retains the one-shot fairness debt issued to this frontend_operation_id;
-  // it therefore cannot be forged into a general barrier bypass. Keeping this
-  // proof on the retried request closes the independent DATA/CONTROL-lane race
-  // where local repair finishes just before its ACK reaches the authority.
-  uint64 visibility_retry_after_sequence = 8;
-  reserved 33;
-  reserved "write";
+  reserved 5, 6, 7, 8, 16, 17, 33, 46;
+  reserved "frontend_operation_id", "source_phase_queueable", "source_publication_gate",
+    "visibility_retry_after_sequence", "next_visibility", "ack_visibility", "write_transaction";
+  // FSKit callbacks declare the exact local cache coordinates whose publication
+  // must remain closed until the framework callback has consumed the reply.
+  // Linux lease sessions must leave both fields zero.
+  FskitSourcePublication fskit_source_publication = 60;
+  uint64 fskit_frontend_operation_id = 61;
 
   oneof body {
     HelloRequest hello = 10;
@@ -47,8 +30,6 @@ message Request {
     KeepAliveRequest keep_alive = 13;
     DetachRequest detach = 14;
     CancelRequest cancel = 15;
-    NextVisibilityRequest next_visibility = 16;
-    AckVisibilityRequest ack_visibility = 17;
     ReauthorizeRequest reauthorize = 19;
     LookupRequest lookup = 20;
     GetAttrRequest get_attr = 21;
@@ -73,19 +54,10 @@ message Request {
     RemoveXattrRequest remove_xattr = 43;
     StatFSRequest stat_fs = 44;
     SyncFSRequest sync_fs = 45;
-    // One whole shared regular-file write syscall. BEGIN/DATA/ABORT are inert
-    // session staging operations; only COMMIT carries Mutation and
-    // source_publication_gate and enters visibility ordering. The private
-    // Linux ABI uses this path for both positioned and effective-append writes;
-    // stock fragmented FUSE_WRITE is never a shared-file fallback.
-    WriteTransactionRequest write_transaction = 46;
-    // One whole shared fallocate operation. It is a visible mutation with one
-    // exact source-publication cut; stock FUSE_FALLOCATE is never accepted for
-    // a SHARED inode under the strict kernel contract.
+    // One stock fallocate operation.
     FallocateRequest fallocate = 47;
     // One whole server-side SHARED-to-SHARED copy. Cross-domain copies are
-    // rejected by the kernel before transport, and no splice fallback is part
-    // of protocol 5.
+    // rejected by the kernel before transport.
     CopyFileRangeRequest copy_file_range = 48;
     // Creates one unnamed regular inode and its open handle. Because no name is
     // published, this is replayed authority state but not a peer-visible
@@ -100,47 +72,40 @@ message Request {
     // carries no filesystem authority of its own.
     TerminalDeliveryReceipt terminal_delivery_receipt = 54;
     ApplyRoutesRequest apply_routes = 18;
-    // One shared regular-file write whose complete payload fits in one
-    // negotiated max_write frame. It is a visible mutation in its only shape:
-    // no transaction ID or inert staging phase exists. data is the frame's
-    // exact out-of-line bulk body.
-    OneShotWriteRequest one_shot_write = 55;
+    // One ordinary positioned FUSE write. The kernel has already performed
+    // generic write checks and bounded the payload to the negotiated frame.
+    // data is the frame's exact out-of-line bulk body.
+    WriteRequest write = 55;
+    NextLeaseEventRequest next_lease_event = 56;
+    AcknowledgeLeaseEventRequest acknowledge_lease_event = 57;
+    RenewLeasesRequest renew_leases = 58;
+    AcknowledgeSourceLeaseDischargeRequest acknowledge_source_lease_discharge = 59;
+    NextVisibilityRequest next_fskit_repair = 62;
+    AckVisibilityRequest ack_fskit_repair = 63;
+    FskitWriteRequest fskit_write = 64;
   }
 }
 
-// SourcePublicationGate is an abstract local publication cut. It deliberately
-// omits kernel inode/device facts: those belong to peer repair targets and are
-// neither stable frontend identities nor knowable by every frontend. Targets
-// are sorted canonically (ITEM before NAMESPACE, then raw identity/name bytes),
-// unique, and bounded by the protocol validator.
-message SourcePublicationGate {
-  repeated SourcePublicationTarget targets = 1;
+message FskitSourcePublication {
+  repeated FskitSourcePublicationTarget targets = 1;
 }
 
-message SourcePublicationTarget {
+message FskitSourcePublicationTarget {
   oneof coordinate {
-    SourcePublicationItem item = 1;
-    SourcePublicationNamespace namespace = 2;
+    FskitSourcePublicationItem item = 1;
+    FskitSourcePublicationNamespace namespace = 2;
   }
 }
 
-// Item state is split so a frontend can keep data-only work disjoint where its
-// kernel permits it. DATA always implies ATTRIBUTES because every successful
-// write/truncate also publishes size/timestamps/versions.
-message SourcePublicationItem {
+message FskitSourcePublicationItem {
   bytes identity = 1; // exactly 16 bytes
   bool attributes = 2;
   bool data = 3;
 }
 
-// A namespace coordinate always closes publication of the exact name. The
-// bound_* bits additionally close the named state of whichever item is locally
-// bound before the cut and any authoritative post-binding returned to the same
-// callback. This wildcard is what makes create/rename sound before a new item
-// identity exists; it is not a mount-wide gate.
-message SourcePublicationNamespace {
+message FskitSourcePublicationNamespace {
   bytes parent_identity = 1; // exactly 16 bytes
-  bytes name = 2;
+  bytes name = 2; // one raw component
   bool bound_attributes = 3;
   bool bound_data = 4;
 }
@@ -171,10 +136,23 @@ message Response {
   // Present exactly with VISIBILITY_RETRY. It names the already-delivered
   // peer phase whose local repair must finish before the Linux frontend may
   // resubmit. This cross-lane identity prevents transport-speed retry loops.
-  uint64 visibility_retry_sequence = 43;
+  reserved 43;
+  reserved "visibility_retry_sequence";
   PostState post_state = 45;
-  reserved 26;
-  reserved "write";
+  // Cache authority is carried in one common envelope so LOOKUP, GETATTR,
+  // OPEN, READDIR, and mutation replies cannot invent operation-specific
+  // grant encodings.
+  repeated LeaseGrant lease_grants = 46;
+  // Present on a changed mutation reply when the source held cache authority
+  // over an affected coordinate. Those coordinates remain closed until the
+  // frontend purges every named A/D/E cache before returning the callback,
+  // writes the physical kernel reply, then acknowledges the obligation on
+  // CONTROL. Namespace state covered by normal VFS reply processing is proven
+  // only at that physical reply boundary.
+  SourceLeaseDischarge source_lease_discharge = 50;
+  uint64 fskit_repair_retry_sequence = 52;
+  reserved 26, 33, 38;
+  reserved "visibility", "write_transaction";
 
   oneof body {
     HelloReply hello = 10;
@@ -194,17 +172,21 @@ message Response {
     StatFSReply stat_fs = 30;
     GetLockReply get_lock = 31;
     LinkReply link = 32;
-    VisibilityEvent visibility = 33;
     ApplyRoutesReply apply_routes = 34;
     SyncFSReply sync_fs = 35;
     ReauthorizeReply reauthorize = 36;
     RenameReply rename = 37;
-    WriteTransactionReply write_transaction = 38;
     FallocateReply fallocate = 39;
     CopyFileRangeReply copy_file_range = 40;
     TmpfileReply tmpfile = 41;
     TerminalDeliveryReceiptReply terminal_delivery_receipt = 42;
-    OneShotWriteReply one_shot_write = 44;
+    WriteReply write = 44;
+    LeaseEvent lease_event = 47;
+    AcknowledgeLeaseEventReply acknowledge_lease_event = 48;
+    RenewLeasesReply renew_leases = 49;
+    AcknowledgeSourceLeaseDischargeReply acknowledge_source_lease_discharge = 51;
+    VisibilityEvent fskit_repair = 53;
+    FskitWriteReply fskit_write = 54;
   }
 }
 
@@ -353,8 +335,8 @@ message ObjectPostState {
   uint32 roles = 4;
 }
 
-// Every protocol-5 client owns exactly two authenticated transports for one
-// session. DATA carries filesystem traffic; CONTROL carries visibility and
+// Every protocol-6 client owns exactly two authenticated transports for one
+// session. DATA carries filesystem traffic; CONTROL carries cache repair and
 // liveness traffic. The role and random connection-set identity are mandatory
 // at Hello and are echoed by the authority before either connection can take
 // part in attach.
@@ -380,6 +362,7 @@ message HelloRequest {
   repeated string features = 2;
   TransportRole role = 3;
   bytes connection_set_id = 4; // exactly 32 random bytes
+  FrontendProfile frontend_profile = 10;
 }
 message HelloReply {
   uint32 protocol_major = 1;
@@ -390,10 +373,11 @@ message HelloReply {
   uint32 max_in_flight = 6; // per TLS connection
   TransportRole role = 7;
   bytes connection_set_id = 8; // exact echo of HelloRequest.connection_set_id
-  // Largest one-syscall shared write transaction the authority can stage. It
-  // must cover Linux MAX_RW_COUNT for a production mount; max_write_bytes
-  // remains the bound for each DATA fragment.
-  uint64 max_write_transaction_bytes = 9;
+  // Retired pre-v6 fragmented-write bound.
+  reserved 9;
+  reserved "max_write_transaction_bytes";
+  FrontendProfile frontend_profile = 10;
+  uint64 max_fskit_write_bytes = 11;
 }
 
 message AttachRequest {
@@ -401,22 +385,21 @@ message AttachRequest {
   string volume_id = 1;
   bytes access_token = 2;
   uint32 replay_slots = 4;
-  CoherenceProfile coherence_profile = 5;
-  // cached_name_capacity is how many distinct resolutions this frontend's
+  reserved 5, 6, 7, 9;
+  reserved "coherence_profile", "cached_name_capacity", "repair_budget_millis", "namespace_repair";
+  // fskit_cached_name_capacity is how many distinct resolutions this frontend's
   // kernel cache is expected to hold. It sizes the authority's per-session
   // resolved-name index, which is what lets a mutation skip mounts that cannot
   // be holding the affected name. It is a precision and memory setting only:
   // the index never drops a coordinate, so understating this number costs
   // wasted acknowledgments and never a missed one. Required and nonzero for
-  // the one coherent protocol-5 mount profile.
-  uint64 cached_name_capacity = 6;
-  // repair_budget_millis is the per-phase deadline this frontend commits to:
+  // the exact FSKit synchronous-repair profile.
+  // fskit_repair_budget_millis is the per-phase deadline this frontend commits to:
   // the longest it may take to acknowledge one PREPARE or one COMPLETE. The
   // authority fences this participant individually when the budget expires, and
   // the frontend must revoke its own kernel mount if it has not acknowledged a
   // phase within the same budget. The two sides use one number so the window in
   // which a fenced mount could still serve a stale name is bounded by it.
-  uint64 repair_budget_millis = 7;
   // routes_revision is the 32-byte SHA-256 over the canonical machine-local
   // routing rules this mount will run, derived from the volume file
   // .portablefs/local-dirs. The authority is the source of truth for that file
@@ -424,21 +407,28 @@ message AttachRequest {
   // set has a revision too, so this field is required and a mount that omits it
   // is refused - "I did not say" must never be admitted as "I agree".
   bytes routes_revision = 8;
-  // namespace_repair states how this frontend's kernel makes a cached binding
+  // fskit_namespace_repair states how this frontend's kernel makes a cached binding
   // unservable. Required and non-UNSPECIFIED. It is what lets the authority
   // tell a proven repair cycle apart from an ordinary slow lock.
-  NamespaceRepair namespace_repair = 9;
   // One random identity for this attach transaction. It makes a lost
   // provisional response and AbortAttach name exactly one attempt rather than
   // whichever attach happens to be newest on the connection set.
   bytes attach_attempt_id = 10; // exactly 32 random bytes
+  // MOUNT sessions enter durable mount membership and the lease service.
+  // ROUTE_ADMIN sessions are capability-authenticated control sessions: they
+  // never receive filesystem capabilities, cache leases, or route membership.
+  SessionPurpose purpose = 11;
+  FrontendProfile frontend_profile = 12;
+  uint32 fskit_cached_name_capacity = 13;
+  uint64 fskit_repair_budget_millis = 14;
+  NamespaceRepair fskit_namespace_repair = 15;
 }
 message AttachReply {
   bytes session_id = 1;
   uint64 generation = 2;
   bytes resume_secret = 3;
-  // Protocol 4 exposed an active filesystem session directly from Attach.
-  // Protocol 5 reserves that exact wire surface: active state is returned only
+  // Earlier protocol majors exposed an active filesystem session directly from
+  // Attach. Protocol 6 reserves that wire surface: active state is returned only
   // by Activate after both authenticated role bindings exist.
   reserved 4 to 9;
   reserved "root", "features", "session_lease_milliseconds", "visibility_cursor", "routes_revision", "authorization_deadline_unix_nanos";
@@ -462,7 +452,8 @@ message ActivateReply {
   Item root = 1;
   repeated string features = 2;
   uint64 session_lease_milliseconds = 3;
-  VisibilityCursor visibility_cursor = 4; // strict participant's initial cursor
+  reserved 4;
+  reserved "visibility_cursor";
   // routes_revision is the revision this session was admitted against. It is
   // the same value the mount presented - an attach that disagreed was refused -
   // so it is an explicit confirmation rather than a value to adopt.
@@ -472,6 +463,23 @@ message ActivateReply {
   // value, never from a caller's untrusted copy of the Manager response.
   int64 authorization_deadline_unix_nanos = 6;
   SessionState state = 7;
+  // Protocol 6 lease streams begin at the zero cursor. Carrying it explicitly
+  // makes activation/replay state self-contained and leaves room for a future
+  // nonzero restored cursor without changing attach semantics.
+  LeaseEventCursor lease_cursor = 8;
+  SessionPurpose purpose = 9;
+  FrontendProfile frontend_profile = 10;
+  VisibilityCursor fskit_repair_cursor = 11;
+}
+enum FrontendProfile {
+  FRONTEND_PROFILE_UNSPECIFIED = 0;
+  FRONTEND_PROFILE_LINUX_LEASES = 1;
+  FRONTEND_PROFILE_FSKIT_SYNC_REPAIR = 2;
+}
+enum SessionPurpose {
+  SESSION_PURPOSE_UNSPECIFIED = 0;
+  SESSION_PURPOSE_MOUNT = 1;
+  SESSION_PURPOSE_ROUTE_ADMIN = 2;
 }
 
 // AbortAttach releases one exact provisional attempt. It is invalid after the
@@ -513,11 +521,10 @@ message DetachRequest {
 }
 message CancelRequest { uint64 target_request_id = 1; }
 
-// Protocol 5 has one coherent mount contract. Every frontend closes its exact
-// source-publication footprint and participates in the peer-only visibility
-// barrier. Zero is deliberately invalid: the retired UNCACHED profile encoded
-// as zero, so old clients fail before activation instead of silently joining a
-// contract they do not implement.
+// FSKit synchronous repair has one strict cache contract. Its frontend closes
+// the exact source-publication footprint and participates in the peer-only
+// repair barrier. Zero is deliberately invalid so an omitted profile cannot
+// enter that coordinator.
 enum CoherenceProfile {
   reserved "COHERENCE_PROFILE_UNCACHED";
   COHERENCE_PROFILE_UNSPECIFIED = 0;
@@ -530,7 +537,7 @@ enum CoherenceProfile {
 // provable properties.
 //
 // PARENT_EXCLUSIVE is the retired stock-FUSE model. It is parseable so an old
-// client receives an explicit commitment refusal, but protocol 5 does not
+// client receives an explicit commitment refusal, but protocol 6 does not
 // admit it: breaking its parent-i_rwsem cycle required surfacing a synthetic
 // EINTR to ordinary applications.
 //
@@ -680,6 +687,132 @@ message AckVisibilityRequest {
   bool ordered_admission_contended = 4;
 }
 
+// Protocol 6 grants cache authority over four exact coordinate families. Name
+// coordinates use parent_identity+name; every other family uses identity. Data
+// coordinates are whole-file in v1.
+enum LeaseFamily {
+  LEASE_FAMILY_UNSPECIFIED = 0;
+  LEASE_FAMILY_NAME = 1;
+  LEASE_FAMILY_ATTRIBUTES = 2;
+  LEASE_FAMILY_DATA = 3;
+  LEASE_FAMILY_ENUMERATION = 4;
+}
+
+enum LeaseRight {
+  LEASE_RIGHT_UNSPECIFIED = 0;
+  LEASE_RIGHT_NAME_READ = 1;
+  LEASE_RIGHT_NAME_EXCLUSIVE = 2;
+  LEASE_RIGHT_ATTRIBUTES_READ = 3;
+  LEASE_RIGHT_ATTRIBUTES_EXCLUSIVE = 4;
+  LEASE_RIGHT_DATA_READ = 5;
+  LEASE_RIGHT_DATA_EXCLUSIVE = 6;
+  LEASE_RIGHT_ENUMERATION_READ = 7;
+}
+
+message LeaseCoordinate {
+  LeaseFamily family = 1;
+  bytes identity = 2;        // exactly 16 bytes for A/D/E
+  bytes parent_identity = 3; // exactly 16 bytes for N
+  bytes name = 4;            // one raw component for N
+}
+
+message LeaseGrant {
+  LeaseCoordinate coordinate = 1;
+  LeaseRight right = 2;
+  uint64 epoch = 3;
+  // The client anchors this conservative duration at request start using its
+  // monotonic clock. Transport delay only shortens validity; wall-clock skew is
+  // never part of the cache-safety proof.
+  uint64 valid_for_nanos = 4;
+  // Global lease-mutation cut at which the storage read and this grant were
+  // admitted. A frontend that has already processed a later recall rejects a
+  // delayed DATA response instead of installing authority from the past.
+  uint64 issued_sequence = 5;
+}
+
+enum LeaseEventPhase {
+  LEASE_EVENT_PHASE_UNSPECIFIED = 0;
+  // REVOKE closes the frontend's installing lane before authority apply.
+  LEASE_EVENT_PHASE_REVOKE = 1;
+  // COMPLETE carries exact post-state and is discharged after cache purge.
+  LEASE_EVENT_PHASE_COMPLETE = 2;
+}
+
+message LeaseEventCursor {
+  uint64 sequence = 1;
+  LeaseEventPhase phase = 2;
+}
+
+message LeaseRecall {
+  LeaseCoordinate coordinate = 1;
+  LeaseRight right = 2;
+  uint64 grant_epoch = 3;
+  uint64 revoke_epoch = 4;
+}
+
+message LeaseEvent {
+  LeaseEventCursor cursor = 1;
+  bytes initiator_session_id = 2; // exactly 16 bytes
+  repeated LeaseRecall recalls = 3;
+  PostState post_state = 4; // COMPLETE only
+  reserved 5;
+  reserved "routes";
+}
+
+message NextLeaseEventRequest {
+  LeaseEventCursor after = 1;
+}
+
+enum LeaseDischargeMode {
+  LEASE_DISCHARGE_MODE_UNSPECIFIED = 0;
+  LEASE_DISCHARGE_MODE_TO_NONE = 1;
+  // Reserved for a future range-capable D coordinate. Whole-file protocol-6
+  // v1 data leases cannot safely describe a retained-range successor.
+  LEASE_DISCHARGE_MODE_CONTINUITY = 2;
+}
+
+message LeaseDischarge {
+  LeaseCoordinate coordinate = 1;
+  uint64 revoke_epoch = 2;
+  LeaseDischargeMode mode = 3;
+  LeaseRight successor_right = 4;
+}
+
+message AcknowledgeLeaseEventRequest {
+  LeaseEventCursor cursor = 1;
+  // Empty for REVOKE. COMPLETE names every recalled lease exactly once.
+  repeated LeaseDischarge discharges = 2;
+}
+
+message AcknowledgeLeaseEventReply {}
+
+message LeaseRenewal {
+  LeaseCoordinate coordinate = 1;
+  uint64 epoch = 2;
+}
+
+message RenewLeasesRequest {
+  repeated LeaseRenewal leases = 1;
+}
+
+message RenewLeasesReply {
+  repeated LeaseGrant grants = 1;
+  // Exact requested tokens which expired or lost to a concurrent recall.
+  // Withdrawal is ordinary cache coherence and never terminalizes the mount.
+  repeated LeaseRenewal withdrawn = 2;
+}
+
+message SourceLeaseDischarge {
+  uint64 sequence = 1;
+  repeated LeaseRecall recalls = 2;
+}
+
+message AcknowledgeSourceLeaseDischargeRequest {
+  uint64 sequence = 1;
+}
+
+message AcknowledgeSourceLeaseDischargeReply {}
+
 message LookupRequest { bytes parent = 1; bytes name = 2; }
 message LookupReply {
   Item item = 1;
@@ -754,110 +887,78 @@ message CloseRequest {
 }
 message ReadRequest { bytes handle = 1; uint64 offset = 2; uint32 length = 3; }
 message ReadReply { bytes data = 1; }
-// One private-kernel write syscall remains one authority mutation even when
-// its payload spans many max_write-sized frames. BEGIN and DATA only fill
-// bounded, session-owned staging state. COMMIT is the sole visible/replayed
-// phase. ABORT is idempotent and is legal only before COMMIT assignment.
-enum WriteTransactionPhase {
-  WRITE_TRANSACTION_PHASE_UNSPECIFIED = 0;
-  WRITE_TRANSACTION_PHASE_BEGIN = 1;
-  WRITE_TRANSACTION_PHASE_DATA = 2;
-  WRITE_TRANSACTION_PHASE_COMMIT = 3;
-  WRITE_TRANSACTION_PHASE_ABORT = 4;
+// WriteRequest is the stock FUSE_WRITE shape after kernel-side generic
+// write checks. The kernel has already bounded size and position; userspace
+// must not replay private RLIMIT/file-ceiling or append-placement policy.
+message WriteRequest {
+  bytes handle = 1;
+  uint64 position = 2;
+  reserved 3, 4, 8;
+  reserved "rlimit_fsize", "file_max_size", "flags";
+  uint64 lock_owner = 5;
+  uint32 size = 6;
+  uint32 write_flags = 7;
+  bytes data = 9; // transported out of line
 }
 
-message WriteTransactionRequest {
-  uint64 transaction_id = 1; // nonzero; scoped to session + authority epoch
+// One stock write either reports the exact committed byte count and resulting
+// attributes, or a negative Linux errno in error. There are no private output
+// flags or authority-assigned append offsets.
+message WriteReply {
+  uint64 committed_size = 1;
+  Attr post_attr = 2;
+  int32 error = 3;
+  reserved 4, 5, 6;
+  reserved "visibility_sequence", "flags", "assigned_offset";
+}
+
+// FSKit can deliver one logical write in multiple transport frames. BEGIN and
+// DATA only fill bounded session-owned staging state; COMMIT is the sole
+// replayed filesystem mutation and ABORT only retires unapplied staging.
+enum FskitWritePhase {
+  FSKIT_WRITE_PHASE_UNSPECIFIED = 0;
+  FSKIT_WRITE_PHASE_BEGIN = 1;
+  FSKIT_WRITE_PHASE_DATA = 2;
+  FSKIT_WRITE_PHASE_COMMIT = 3;
+  FSKIT_WRITE_PHASE_ABORT = 4;
+}
+
+message FskitWriteRequest {
+  uint64 transaction_id = 1;
   bytes handle = 2;
   uint64 requested_size = 3;
   uint64 fragment_offset = 4;
-  // Two distinct ceilings are required for exact Linux semantics. Crossing
-  // rlimit_fsize raises SIGXFSZ; crossing the filesystem/non-LFS ceiling does
-  // not. For append only the authority knows the current EOF, so one collapsed
-  // minimum cannot preserve that distinction.
-  // Raw Linux rlim_cur. UINT64_MAX is RLIM_INFINITY; zero is the real
-  // zero-byte limit and must produce an RLIMIT-specific rejection/SIGXFSZ.
   uint64 rlimit_fsize = 5;
   uint64 lock_owner = 6;
   uint32 size = 7;
   uint32 write_flags = 8;
-  // Exact effective per-syscall file flags from the patched kernel. In
-  // particular O_APPEND reflects IOCB_APPEND after O_APPEND/RWF_APPEND/
-  // RWF_NOAPPEND resolution; OPEN-time append state is not authoritative.
   uint32 flags = 9;
-  WriteTransactionPhase phase = 10;
-  bytes data = 11; // present only for DATA; transported out of line
-  // Frozen syscall position for a positioned write. Effective append is
-  // selected by flags.O_APPEND and requires position == 0; the authority then
-  // assigns the exact EOF under the stable-inode mutation writer lock.
+  FskitWritePhase phase = 10;
+  bytes data = 11; // DATA only; transported out of line
   uint64 position = 12;
   uint64 file_max_size = 13;
 }
 
-// Reply flags mirror the pinned private FUSE ABI exactly:
-// BEGUN=1, STAGED=2, COMMITTED=4, ABORTED=8, REJECTED=16,
-// POSTAPPLY_ERROR=32, REJECTED_RLIMIT=64. REJECTED_RLIMIT is the
-// RLIMIT_FSIZE-specific pre-apply rejection and causes one SIGXFSZ; ordinary
-// REJECTED never does.
-message WriteTransactionReply {
+message FskitWriteReply {
   uint64 transaction_id = 1;
   uint64 committed_size = 2;
   uint64 assigned_offset = 3;
   uint64 post_size = 4;
-  // Existing visibility Cursor.Sequence allocated by COMMIT's PREPARE.
-  // Source reply and peer exact-size notification carry this same value.
   uint64 visibility_sequence = 5;
   uint32 flags = 6;
-  // REJECTED alone plus a negative errno proves COMMIT was refused before
-  // apply and staging was discarded. COMMITTED|POSTAPPLY_ERROR plus a negative
-  // errno carries an exact committed prefix/post state when fsync, fdatasync,
-  // or killpriv failed after data reached XFS; the kernel must publish that
-  // state before returning the errno and must not retry. Every other reply
-  // form requires zero here. Transport/header errors at COMMIT remain
-  // ambiguous and fence instead of using this field.
   int32 error = 7;
 }
 
-// OneShotWriteRequest carries the complete payload and syscall geometry for a
-// write no larger than max_write. Its mutation slot/sequence is the sole replay
-// identity; transaction IDs remain reserved for multi-fragment staging.
-message OneShotWriteRequest {
-  bytes handle = 1;
-  uint64 position = 2;
-  // Raw Linux rlim_cur. UINT64_MAX is RLIM_INFINITY and zero is a real limit.
-  uint64 rlimit_fsize = 3;
-  uint64 file_max_size = 4;
-  uint64 lock_owner = 5;
-  uint32 size = 6;
-  uint32 write_flags = 7;
-  // Exact effective per-syscall O_APPEND/O_DSYNC/O_SYNC flags.
-  uint32 flags = 8;
-  bytes data = 9; // transported out of line
-}
-
-// Flags and result semantics are identical to a COMMIT reply. No transaction
-// identity is echoed because this operation never enters the staging ledger.
-message OneShotWriteReply {
-  uint64 committed_size = 1;
-  uint64 assigned_offset = 2;
-  uint64 post_size = 3;
-  uint64 visibility_sequence = 4;
-  uint32 flags = 5;
-  int32 error = 6;
-}
-
-// FallocateRequest mirrors the private pinned-kernel input exactly. mode is a
-// closed Linux fallocate bitset; write_flags is either zero or
-// FUSE_WRITE_KILL_SUIDGID. rlimit_fsize is raw rlim_cur (UINT64_MAX means
-// infinity), while file_max_size is a positive signed-64-bit ceiling.
+// FallocateRequest is the stock FUSE_FALLOCATE shape after VFS has run
+// inode_newsize_ok and file_modified. mode is the closed Linux fallocate
+// bitset; the authority does not replay kernel limit policy.
 message FallocateRequest {
   bytes handle = 1;
   uint64 offset = 2;
   uint64 length = 3;
-  uint64 rlimit_fsize = 4;
-  uint64 file_max_size = 5;
+  reserved 4, 5, 7;
+  reserved "rlimit_fsize", "file_max_size", "write_flags";
   uint32 mode = 6;
-  uint32 write_flags = 7;
 }
 
 // CopyFileRangeRequest is legal only for SHARED source and destination
@@ -870,9 +971,8 @@ message CopyFileRangeRequest {
   bytes output_handle = 3;
   uint64 output_offset = 4;
   uint64 length = 5;
-  uint64 rlimit_fsize = 6;
-  uint64 file_max_size = 7;
-  uint32 write_flags = 8;
+  reserved 6, 7, 8;
+  reserved "rlimit_fsize", "file_max_size", "write_flags";
   uint32 flags = 9;
 }
 

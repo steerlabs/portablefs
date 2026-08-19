@@ -5,7 +5,6 @@
 package fuse
 
 import (
-	"encoding/binary"
 	"fmt"
 	"os"
 	"strings"
@@ -57,7 +56,6 @@ var (
 		{CAP_ALLOW_IDMAP, "ALLOW_IDMAP"},
 		{CAP_OVER_IO_URING, "IO_URING"},
 		{CAP_REQUEST_TIMEOUT, "REQUEST_TIMEOUT"},
-		{int64(-1 << 63), "PFS_STRICT_COHERENCE"},
 	})
 	releaseFlagNames = newFlagNames([]flagNameEntry{
 		{RELEASE_FLUSH, "FLUSH"},
@@ -85,7 +83,6 @@ var (
 		{FOPEN_NOFLUSH, "NOFLUSH"},
 		{FOPEN_PARALLEL_DIRECT_WRITES, "PARALLEL_DIRECT_WRITES"},
 		{FOPEN_PASSTHROUGH, "PASSTHROUGH"},
-		{FOPEN_PFS_SHARED, "PFS_SHARED"},
 	})
 	ioctlFlagNames = newFlagNames([]flagNameEntry{
 		{IOCTL_COMPAT, "COMPAT"},
@@ -332,11 +329,6 @@ func (i *NotifyRetrieveIn) string() string {
 
 func (o *NotifyPruneOut) string() string {
 	return fmt.Sprintf("{%d}", o.Count)
-}
-
-func (o *NotifyPFSSizeOut) string() string {
-	return fmt.Sprintf("{nodeid=%d size=%d sequence=%d}", o.Object.Nodeid,
-		binary.LittleEndian.Uint64(o.Object.Attr[8:16]), o.VisibilitySequence)
 }
 
 func (f *FallocateIn) string() string {

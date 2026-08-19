@@ -553,7 +553,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// interrupted process into a permanently fenced mount.
 @Test func requestCancellationLeavesTheStrictConnectionAndItsPublicationsIntact() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 5
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = Data(repeating: 0xE1, count: 16)
     contract.sessionID = Data(repeating: 0x51, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
@@ -656,7 +656,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// retryable timeout while the daemon may still apply the request.
 @Test func dispatchedMutationTimeoutTerminatesStrictMountAsUncertain() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 5
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = Data(repeating: 0xE3, count: 16)
     contract.sessionID = Data(repeating: 0x53, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
@@ -716,7 +716,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// recurrence kills the connection and fails the follow-up below.
 @Test func immediateCancellationNeverLetsTheAckOvertakeItsRequest() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 5
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = Data(repeating: 0xE2, count: 16)
     contract.sessionID = Data(repeating: 0x52, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue

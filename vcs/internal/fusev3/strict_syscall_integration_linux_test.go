@@ -52,7 +52,7 @@ func requireExactFile(t *testing.T, path string, want []byte, operation string) 
 	}
 }
 
-func TestStrictKernelLargeWriteTransactionsPreservePositionedAndAppendData(t *testing.T) {
+func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	const payloadSize = 2*integrationWriteFragmentBytes + 12345
 
@@ -76,15 +76,13 @@ func TestStrictKernelLargeWriteTransactionsPreservePositionedAndAppendData(t *te
 		path := f.join(0, "append")
 		prefix := deterministicIntegrationData(7777, 29)
 		mustWrite(t, path, prefix, 0o600)
-		file := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
-		payload := deterministicIntegrationData(payloadSize, 41)
-		requireSyscallWrite(t, "one append write larger than a transaction fragment", func() (int, error) {
-			return unix.Write(int(file.Fd()), payload)
-		}, len(payload))
-
-		want := append(append([]byte(nil), prefix...), payload...)
-		requireExactFile(t, f.join(1, "append"), want, "append transaction through the peer mount")
-		requireSize(t, f.join(1, "append"), int64(len(want)), "append transaction size")
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+		if file != nil {
+			_ = file.Close()
+		}
+		if !errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Fatalf("writable O_APPEND open = %v, want EOPNOTSUPP", err)
+		}
 	})
 
 	t.Run("per-call append", func(t *testing.T) {
@@ -93,30 +91,11 @@ func TestStrictKernelLargeWriteTransactionsPreservePositionedAndAppendData(t *te
 		mustWrite(t, path, prefix, 0o600)
 		file := mustOpenFile(t, path, os.O_WRONLY, 0)
 		payload := deterministicIntegrationData(payloadSize, 53)
-		requireSyscallWrite(t, "one RWF_APPEND write larger than a transaction fragment", func() (int, error) {
-			return unix.Pwritev2(int(file.Fd()), [][]byte{payload}, 0, unix.RWF_APPEND)
-		}, len(payload))
-
-		want := append(append([]byte(nil), prefix...), payload...)
-		requireExactFile(t, f.join(1, "per-call-append"), want, "RWF_APPEND transaction through the peer mount")
-		requireSize(t, f.join(1, "per-call-append"), int64(len(want)), "RWF_APPEND transaction size")
-	})
-
-	t.Run("per-call noappend", func(t *testing.T) {
-		const offset = 2049
-		path := f.join(0, "per-call-noappend")
-		initial := deterministicIntegrationData(payloadSize+8192, 59)
-		mustWrite(t, path, initial, 0o600)
-		file := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
-		payload := deterministicIntegrationData(payloadSize, 61)
-		requireSyscallWrite(t, "one RWF_NOAPPEND write larger than a transaction fragment", func() (int, error) {
-			return unix.Pwritev2(int(file.Fd()), [][]byte{payload}, offset, unix.RWF_NOAPPEND)
-		}, len(payload))
-
-		want := append([]byte(nil), initial...)
-		copy(want[offset:], payload)
-		requireExactFile(t, f.join(1, "per-call-noappend"), want, "RWF_NOAPPEND transaction through the peer mount")
-		requireSize(t, f.join(1, "per-call-noappend"), int64(len(want)), "RWF_NOAPPEND transaction size")
+		written, err := unix.Pwritev2(int(file.Fd()), [][]byte{payload}, 0, unix.RWF_APPEND)
+		if written != 0 || !errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Fatalf("RWF_APPEND = (%d, %v), want exact EOPNOTSUPP refusal; stock FUSE not forwarding RWF_APPEND blocks qualification", written, err)
+		}
+		requireExactFile(t, f.join(1, "per-call-append"), prefix, "RWF_APPEND refusal")
 	})
 
 	t.Run("fcntl append toggle", func(t *testing.T) {
@@ -132,13 +111,11 @@ func TestStrictKernelLargeWriteTransactionsPreservePositionedAndAppendData(t *te
 			t.Fatalf("toggle O_APPEND with F_SETFL: %v", err)
 		}
 		payload := deterministicIntegrationData(payloadSize, 73)
-		requireSyscallWrite(t, "one write after F_SETFL O_APPEND larger than a transaction fragment", func() (int, error) {
-			return unix.Write(int(file.Fd()), payload)
-		}, len(payload))
-
-		want := append(append([]byte(nil), prefix...), payload...)
-		requireExactFile(t, f.join(1, "fcntl-append"), want, "F_SETFL O_APPEND transaction through the peer mount")
-		requireSize(t, f.join(1, "fcntl-append"), int64(len(want)), "F_SETFL O_APPEND transaction size")
+		written, err := unix.Write(int(file.Fd()), payload)
+		if written != 0 || !errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Fatalf("write after F_SETFL O_APPEND = (%d, %v), want EOPNOTSUPP", written, err)
+		}
+		requireExactFile(t, f.join(1, "fcntl-append"), prefix, "F_SETFL O_APPEND refusal")
 	})
 }
 
