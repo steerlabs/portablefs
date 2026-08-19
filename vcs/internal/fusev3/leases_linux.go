@@ -93,9 +93,62 @@ func (k leaseKey) publicationCoordinate() (publicationCoordinate, bool) {
 	}
 }
 
+// payloadQuery is one epoch upgrade that install could not decide by itself:
+// whether the frontend still holds payload under the epoch being replaced is a
+// question only rawFileSystem can answer, and answering it costs that lock.
+type payloadQuery struct {
+	grant      validatedLeaseGrant
+	key        leaseKey
+	priorEpoch uint64
+}
+
+// install admits grants into the registry.
+//
+// Lock order is rawFileSystem.mu then leaseRegistry.mu, never the reverse. The
+// reply path needs both -- PrepareReplyPayload decides a reply's cache fate
+// under the frontend lock and asks this registry what each coordinate still
+// covers -- and it runs on every reply, so it owns the outer position. This
+// registry therefore may not call into rawFileSystem while holding its own
+// lock. An epoch upgrade is the one decision that needs the frontend's answer,
+// so it is deferred: collected under this lock, asked with the lock released,
+// then re-validated against the exact epoch it was asked about. Doing it under
+// one lock inverted the order and wedged any mount doing concurrent I/O.
 func (r *leaseRegistry) install(grants []validatedLeaseGrant, now time.Time) []validatedLeaseGrant {
+	accepted, deferred := r.installPass(grants, now, nil)
+	if len(deferred) == 0 {
+		return accepted
+	}
+	// Released: hasLeasePayload takes rawFileSystem.mu.
+	cleared := make(map[leaseKey]uint64, len(deferred))
+	for _, query := range deferred {
+		if !r.mount.raw.hasLeasePayload(query.key, query.priorEpoch) {
+			cleared[query.key] = query.priorEpoch
+		}
+	}
+	if len(cleared) == 0 {
+		return accepted
+	}
+	retry := make([]validatedLeaseGrant, 0, len(cleared))
+	for _, query := range deferred {
+		if epoch, ok := cleared[query.key]; ok && epoch == query.priorEpoch {
+			retry = append(retry, query.grant)
+		}
+	}
+	// A coordinate whose epoch moved while the lock was released no longer
+	// matches what was asked about, so installPass defers it again and this
+	// pass drops it. Refusing an upgrade only leaves the reply uncacheable.
+	upgraded, _ := r.installPass(retry, now, cleared)
+	return append(accepted, upgraded...)
+}
+
+// installPass holds only the registry lock. cleared carries the epochs a prior
+// pass proved carry no frontend payload; an upgrade over any other epoch is
+// returned as a deferred query instead of being decided here.
+func (r *leaseRegistry) installPass(grants []validatedLeaseGrant, now time.Time,
+	cleared map[leaseKey]uint64) ([]validatedLeaseGrant, []payloadQuery) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	var deferred []payloadQuery
 	accepted := make([]validatedLeaseGrant, 0, len(grants))
 	for _, grant := range grants {
 		grant.cacheDeadline = grant.deadline.Add(-volumeserver.Protocol6LeaseWithdrawalBudget)
@@ -130,9 +183,13 @@ func (r *leaseRegistry) install(grants []validatedLeaseGrant, now time.Time) []v
 				}
 				continue
 			}
-			if grant.epoch > current.grant.epoch && r.mount != nil && r.mount.raw != nil &&
-				r.mount.raw.hasLeasePayload(key, current.grant.epoch) {
-				continue
+			if grant.epoch > current.grant.epoch && r.mount != nil && r.mount.raw != nil {
+				if epoch, ok := cleared[key]; !ok || epoch != current.grant.epoch {
+					deferred = append(deferred, payloadQuery{
+						grant: grant, key: key, priorEpoch: current.grant.epoch,
+					})
+					continue
+				}
 			}
 		} else if r.leaseCounts[key.family] >= r.maxPerFamily {
 			// The kernel cache budget also bounds userspace lease state. Refusing
@@ -149,9 +206,12 @@ func (r *leaseRegistry) install(grants []validatedLeaseGrant, now time.Time) []v
 		}
 		accepted = append(accepted, grant)
 	}
-	return accepted
+	return accepted, deferred
 }
 
+// hasLeasePayload answers whether the frontend still holds cache payload for a
+// coordinate under one exact epoch. It takes the frontend lock, so the lease
+// registry must not hold its own lock across a call: see install.
 func (r *rawFileSystem) hasLeasePayload(key leaseKey, epoch uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
