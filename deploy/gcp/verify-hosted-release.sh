@@ -138,4 +138,15 @@ for unit in "$stage"/systemd/*.service; do
   }
 done
 
+# The authority listens on a loopback admin socket in addition to its UNIX
+# socket, so its sandbox must permit exactly AF_UNIX, AF_INET, and AF_INET6.
+# The line is asserted whole and exact rather than by substring: a release that
+# narrowed, widened, or dropped the directive would otherwise ship a sandbox
+# that silently disagrees with the contract the units in-tree encode.
+authority_unit=$stage/systemd/portablefs-authority@.service
+grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' "$authority_unit" || {
+  echo "hosted authority unit does not carry the exact address-family sandbox: expected 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6', found '$(grep -F 'RestrictAddressFamilies=' "$authority_unit" || echo none)'" >&2
+  exit 65
+}
+
 echo "$release_id"
