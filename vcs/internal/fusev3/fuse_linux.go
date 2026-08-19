@@ -1359,9 +1359,6 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 		if err := expectPostStateItem(ctx, n.item, postStateRoleTarget); err != nil {
 			return nil, 0, syscall.EIO
 		}
-		// The negotiated atomic O_TRUNC makes the kernel zero i_size itself: the
-		// OPEN reply carries no attributes for it to adopt.
-		n.mount.raw.noteKernelSize(itemKey(n.item).inode, 0)
 	}
 	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
 		return nil, 0, syscall.EIO
@@ -2206,12 +2203,6 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 	}
 	fillAttr(object.GetAttr(), &out.Attr, n.mount.uid, n.mount.gid)
 	out.SetTimeout(0)
-	// A SETATTR reply is the one attribute reply the kernel adopts
-	// unconditionally: it holds the inode lock across the call and assigns
-	// i_size from the reply without any attr_version check.
-	if object.GetAttr().GetKind() == authoritypb.Attr_REGULAR && object.GetAttr().GetSize() >= 0 {
-		n.mount.raw.noteKernelSize(object.GetAttr().GetInode(), uint64(object.GetAttr().GetSize()))
-	}
 	return 0
 }
 

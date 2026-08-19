@@ -1303,8 +1303,7 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 	if t.volume == nil || t.res == nil || t.closed || apply == nil || spec.RequestedSize == 0 ||
 		spec.RequestedSize > math.MaxInt64 || spec.Position > math.MaxInt64 ||
 		spec.FileMaxSize > math.MaxInt64 || spec.FileMaxSize == 0 ||
-		(spec.Mode != WritePositioned && spec.Mode != WriteAppend) || spec.Mode == WriteAppend && spec.Position != 0 ||
-		spec.RequirePositionAtEOF && spec.Mode != WritePositioned {
+		(spec.Mode != WritePositioned && spec.Mode != WriteAppend) || spec.Mode == WriteAppend && spec.Position != 0 {
 		return 0, 0, Attr{}, fs.ErrInvalid
 	}
 	if err := t.volume.Health(); err != nil {
@@ -1320,9 +1319,6 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 	assigned := spec.Position
 	if spec.Mode == WriteAppend {
 		assigned = uint64(before.Size)
-	}
-	if spec.RequirePositionAtEOF && assigned != uint64(before.Size) {
-		return 0, assigned, Attr{}, ErrPositionNotAtEOF
 	}
 	finiteRLimit := spec.RLimitSize != math.MaxUint64
 	if finiteRLimit && assigned >= spec.RLimitSize {

@@ -5,7 +5,6 @@ package fusev3
 import (
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"syscall"
 
@@ -27,15 +26,7 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		return 0, fuse.EBADF
 	}
 	inode := handleRecord.inode.key.inode
-	shadow, shadowKnown, refreshedForHandle := r.sizes.placement(inode, input.Fh)
-	placement := resolveAppendPlacement(input.Flags&uint32(syscall.O_APPEND) != 0, input.Offset, shadow, shadowKnown, refreshedForHandle)
-	if placement.refuse {
-		// Unreachable by construction: the kernel cannot have an i_size for an
-		// inode this mount never described to it. Refusing loudly is the only
-		// honest answer, because placing the bytes would be a guess.
-		log.Printf("fusev3: refusing a write to inode %d whose kernel i_size shadow is unknown", inode)
-		return 0, fuse.EIO
-	}
+	placement := resolveAppendPlacement(input.Flags&uint32(syscall.O_APPEND) != 0, input.Offset)
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return 0, lifecycle
@@ -49,7 +40,7 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
 			Handle: cloneBytes(handle.token), Position: placement.position, LockOwner: input.LockOwner,
 			Size: input.Size, WriteFlags: input.WriteFlags, Data: data,
-			Append: placement.append, OffsetMatchesClientSize: placement.offsetMatchesClientSize,
+			Append:   placement.append,
 			Sync:     input.Flags&uint32(syscall.O_SYNC) == uint32(syscall.O_SYNC),
 			DataSync: input.Flags&uint32(syscall.O_SYNC) != uint32(syscall.O_SYNC) && input.Flags&uint32(unix.O_DSYNC) != 0,
 		}},
@@ -108,9 +99,5 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		r.mount.revoke(fmt.Errorf("fusev3: complete stock write publication: %w", err))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
-	// The kernel raises i_size from the offset *it* used, which for an append is
-	// its own i_size rather than the offset the authority assigned. Mirroring the
-	// authority's offset here would desynchronize the shadow from the kernel.
-	r.sizes.observeRaise(inode, input.Offset+reply.GetCommittedSize())
 	return uint32(reply.GetCommittedSize()), fuse.OK
 }

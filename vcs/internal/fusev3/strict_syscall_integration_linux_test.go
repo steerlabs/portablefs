@@ -102,9 +102,10 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	})
 
 	t.Run("per-call append", func(t *testing.T) {
-		// Stock Linux does not forward RWF_APPEND, so the kernel's own offset --
-		// which it refreshes from this daemon before an appending write -- is the
-		// only trace of it. The authority confirms that offset is the true EOF.
+		// Stock Linux does not forward RWF_APPEND: the kernel resolves it locally
+		// against its own i_size and sends an ordinary positioned write. That is
+		// exact while this mount's i_size is the object's EOF, which is the only
+		// state a single writer can be in, and is a disclosed deviation otherwise.
 		path := f.join(0, "per-call-append")
 		prefix := deterministicIntegrationData(6001, 47)
 		mustWrite(t, path, prefix, 0o600)
@@ -118,6 +119,11 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 	})
 
 	t.Run("per-call noappend", func(t *testing.T) {
+		// RWF_NOAPPEND is the other flag stock FUSE does not forward. On a shared
+		// volume the kernel's offset is not evidence of anything -- inferring
+		// "positioned" from it would misplace the ordinary appends whose offsets
+		// are equally stale -- so an O_APPEND description keeps appending. This is
+		// a disclosed deviation, asserted here so it cannot change silently.
 		path := f.join(0, "per-call-noappend")
 		prefix := deterministicIntegrationData(8192, 59)
 		mustWrite(t, path, prefix, 0o600)
@@ -130,8 +136,7 @@ func TestStrictKernelLargePositionedWritesAndAppendBoundary(t *testing.T) {
 		if err != nil || written != len(payload) {
 			t.Fatalf("RWF_NOAPPEND write = (%d, %v), want %d bytes", written, err, len(payload))
 		}
-		want := append([]byte(nil), prefix...)
-		copy(want[2048:], payload)
+		want := append(append([]byte(nil), prefix...), payload...)
 		requireExactFile(t, f.join(1, "per-call-noappend"), want, "RWF_NOAPPEND placement")
 	})
 

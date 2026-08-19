@@ -61,12 +61,6 @@ var ErrOutcomeUncertain = errors.New("xfsstore: operation changed XFS before a l
 // would make a retry duplicate already-applied bytes.
 var ErrWritePostApply = errors.New("xfsstore: write committed before a required post-apply step failed")
 
-// ErrPositionNotAtEOF refuses a WriteCommit that required its position to be
-// EOF. Nothing was dispatched, so it is a definite pre-apply refusal; it carries
-// EIO because the request itself was well formed and the caller cannot repair
-// the disagreement without re-observing the object.
-var ErrPositionNotAtEOF = fmt.Errorf("xfsstore: write position is not the object EOF: %w", syscall.EIO)
-
 // ErrWritePrivilege marks failure to remove a privilege-bearing mode bit or
 // security.capability after a write. Unlike an ordinary durability error this
 // is a security boundary: the authority must fence the storage epoch even when
@@ -191,13 +185,6 @@ type WriteCommit struct {
 	// inside the same stable-inode writer critical section as the data. It is a
 	// per-call kernel decision, never retained on the open description.
 	KillPrivileges bool
-	// RequirePositionAtEOF refuses a positioned write whose Position is not the
-	// object's EOF as observed inside the writer critical section. A Linux
-	// frontend sets it when the position it was given is indistinguishable from
-	// an unforwarded per-call RWF_APPEND: the two readings agree only while the
-	// position really is EOF, so a disagreement must be refused rather than
-	// silently placed. It never applies to WriteAppend, which resolves EOF here.
-	RequirePositionAtEOF bool
 }
 
 // FallocateSpec is the complete authority-side contract for one private

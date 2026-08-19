@@ -82,11 +82,6 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 			r.mount.revoke(fmt.Errorf("fusev3: complete fallocate publication: %w", err))
 			return fuse.Status(syscall.ENOTCONN)
 		}
-		// fuse_file_fallocate raises i_size to the end of the range whenever
-		// FALLOC_FL_KEEP_SIZE is absent, whatever the mode did to the object.
-		if input.Mode&unix.FALLOC_FL_KEEP_SIZE == 0 {
-			r.noteKernelRaise(held.inode.key.inode, input.Offset+input.Length)
-		}
 		if reply.GetFlags()&rangeResultPostApply != 0 && reply.GetError() < 0 {
 			return fuse.Status(-reply.GetError())
 		}
@@ -222,9 +217,6 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 		r.mount.revoke(fmt.Errorf("fusev3: complete copy_file_range publication: %w", err))
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
-	// fuse_copy_file_range raises the destination's i_size to the end of what it
-	// copied, using the offset the kernel itself supplied.
-	r.noteKernelRaise(destinationInode.inode.key.inode, input.OffOut+reply.GetResultSize())
 	if reply.GetFlags()&rangeResultPostApply != 0 && reply.GetError() < 0 {
 		return 0, fuse.Status(-reply.GetError())
 	}

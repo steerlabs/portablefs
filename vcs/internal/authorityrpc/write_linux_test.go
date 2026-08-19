@@ -312,7 +312,7 @@ func TestWriteResolvesAppendPlacementAtTheAuthority(t *testing.T) {
 			t.Fatalf("append reply = %+v", response)
 		}
 		if direct, specs := target.directSnapshot(); direct != 1 ||
-			specs[0].Mode != xfsstore.WriteAppend || specs[0].Position != 0 || specs[0].RequirePositionAtEOF {
+			specs[0].Mode != xfsstore.WriteAppend || specs[0].Position != 0 {
 			t.Fatalf("append direct apply = %d calls, specs %+v", direct, specs)
 		}
 		// A retried append must return the retained outcome, never place the
@@ -341,36 +341,6 @@ func TestWriteResolvesAppendPlacementAtTheAuthority(t *testing.T) {
 		}
 	})
 
-	t.Run("offset matching the client size requires EOF", func(t *testing.T) {
-		h, credential, store := newWriteHarness(t)
-		target := &writeTestTarget{}
-		target.setCommitResult(4, 6, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 10, Mode: 0o600, Nlink: 1}, nil)
-		handle := prepareOneShotTarget(t, h, credential, store, target)
-		request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 6, 0)
-		request.GetWrite().OffsetMatchesClientSize = true
-		response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
-		if response.GetErrno() != 0 || response.GetWrite().GetCommittedSize() != 4 {
-			t.Fatalf("flagged write reply = %+v", response)
-		}
-		if direct, specs := target.directSnapshot(); direct != 1 ||
-			specs[0].Mode != xfsstore.WritePositioned || !specs[0].RequirePositionAtEOF {
-			t.Fatalf("flagged write direct apply = %d calls, specs %+v", direct, specs)
-		}
-	})
-
-	t.Run("the store refusal is returned as a structured errno", func(t *testing.T) {
-		h, credential, store := newWriteHarness(t)
-		target := &writeTestTarget{}
-		target.setCommitResult(0, 6, xfsstore.Attr{}, xfsstore.ErrPositionNotAtEOF)
-		handle := prepareOneShotTarget(t, h, credential, store, target)
-		request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 6, 0)
-		request.GetWrite().OffsetMatchesClientSize = true
-		response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
-		if response.GetErrno() != 0 || response.GetWrite().GetError() != -int32(syscall.EIO) {
-			t.Fatalf("stale-size refusal = %+v, want a structured EIO", response)
-		}
-	})
-
 	t.Run("durability intent reaches the store", func(t *testing.T) {
 		for _, tc := range []struct{ sync, dataSync bool }{{sync: true}, {dataSync: true}} {
 			h, credential, store := newWriteHarness(t)
@@ -391,7 +361,6 @@ func TestWriteResolvesAppendPlacementAtTheAuthority(t *testing.T) {
 	t.Run("contradictory placement statements are refused", func(t *testing.T) {
 		for _, mutate := range []func(*authoritypb.WriteRequest){
 			func(body *authoritypb.WriteRequest) { body.Append, body.Position = true, 6 },
-			func(body *authoritypb.WriteRequest) { body.Append, body.OffsetMatchesClientSize = true, true },
 			func(body *authoritypb.WriteRequest) { body.Sync, body.DataSync = true, true },
 		} {
 			h, credential, store := newWriteHarness(t)

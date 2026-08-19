@@ -133,14 +133,14 @@ operation, then reports that offset back. A kernel `i_size` is advisory
 throughout: it is a shadow of what a daemon last published, and a peer may have
 moved EOF since.
 
-Stock FUSE does not forward `RWF_APPEND`, so a per-call append on a description
-without `O_APPEND` is visible only as an offset equal to an `i_size` the kernel
-refreshed from this daemon through that same file handle immediately before the
-write — which is what Linux does for `IOCB_APPEND`, and what an ordinary
-sequential write at `i_size` does not do. That shape is forwarded flagged, and the
-authority refuses it with EIO unless the offset really is EOF, the one condition
-under which the two readings of the request agree. The system never reinterprets
-an offset it cannot disambiguate.
+The intent it forwards is the writing description's `O_APPEND`, which stock FUSE
+reports. The two per-call flags it cannot see are disclosed deviations, not
+inferences: `RWF_APPEND` on a description without `O_APPEND` arrives as an
+ordinary positioned write and is placed at the offset the kernel derived from its
+advisory `i_size`, and `RWF_NOAPPEND` on a description with `O_APPEND` is placed
+at EOF like any other append. The system never reinterprets an offset it cannot
+disambiguate: guessing "this positioned write was really an append" is exactly
+what would misplace the ordinary sequential writes that carry the same offset.
 
 ## Replay and uncertain outcomes
 

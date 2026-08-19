@@ -5,15 +5,11 @@ package fusev3
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
 	"os"
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
-
-	"golang.org/x/sys/unix"
 )
 
 // appendRecord is a distinguishable, fixed-width record. Fixed width makes a
@@ -160,89 +156,4 @@ func TestShellAppendRedirectionAcrossMounts(t *testing.T) {
 		fmt.Fprintf(&want, "tee-%03d\n", i)
 	}
 	requireExactFile(t, f.join(1, "shell-append"), []byte(want.String()), "shell append redirection")
-}
-
-// TestKernelSizeShadowTracksTheKernelAcrossRandomOperations is the audit the
-// placement rule depends on: if the shadow ever disagreed with the kernel's
-// i_size, an unforwarded RWF_APPEND would be placed at the wrong offset. fstat
-// reports exactly the value being shadowed, so the two must never diverge.
-func TestKernelSizeShadowTracksTheKernelAcrossRandomOperations(t *testing.T) {
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
-	path := f.join(0, "shadow-audit")
-	mustWrite(t, path, nil, 0o600)
-	file := mustOpenFile(t, path, os.O_RDWR, 0)
-	appendFile := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
-
-	var stat unix.Stat_t
-	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
-		t.Fatal(err)
-	}
-	inode := stat.Ino
-	shadow := f.mounts[0].raw.sizes
-
-	requireAgreement := func(step int, operation string) {
-		t.Helper()
-		var stat unix.Stat_t
-		if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
-			t.Fatalf("step %d (%s): fstat: %v", step, operation, err)
-		}
-		size, known := shadow.lookup(inode)
-		if !known {
-			t.Fatalf("step %d (%s): the kernel-size shadow became unknown; every later write would be refused", step, operation)
-		}
-		if size != uint64(stat.Size) {
-			t.Fatalf("step %d (%s): shadow = %d, kernel i_size = %d", step, operation, size, stat.Size)
-		}
-	}
-
-	random := rand.New(rand.NewSource(20260819))
-	payload := deterministicIntegrationData(4096, 11)
-	for step := range 200 {
-		switch random.Intn(6) {
-		case 0:
-			size := 1 + random.Intn(len(payload))
-			offset := random.Intn(1 << 16)
-			if _, err := unix.Pwrite(int(file.Fd()), payload[:size], int64(offset)); err != nil {
-				t.Fatalf("step %d: pwrite: %v", step, err)
-			}
-			requireAgreement(step, "positioned write")
-		case 1:
-			size := 1 + random.Intn(len(payload))
-			if _, err := unix.Write(int(appendFile.Fd()), payload[:size]); err != nil {
-				t.Fatalf("step %d: append: %v", step, err)
-			}
-			requireAgreement(step, "append")
-		case 2:
-			size := int64(random.Intn(1 << 16))
-			if err := unix.Ftruncate(int(file.Fd()), size); err != nil {
-				t.Fatalf("step %d: ftruncate: %v", step, err)
-			}
-			requireAgreement(step, "truncate")
-		case 3:
-			buffer := make([]byte, 1+random.Intn(len(payload)))
-			if _, err := unix.Pread(int(file.Fd()), buffer, int64(random.Intn(1<<16))); err != nil {
-				t.Fatalf("step %d: pread: %v", step, err)
-			}
-			requireAgreement(step, "read")
-		case 4:
-			if _, err := os.Stat(path); err != nil {
-				t.Fatalf("step %d: stat: %v", step, err)
-			}
-			requireAgreement(step, "path stat")
-		case 5:
-			size := 1 + random.Intn(len(payload))
-			written, err := unix.Pwritev2(int(file.Fd()), [][]byte{payload[:size]}, 0, unix.RWF_APPEND)
-			if err != nil && !errorIsUnsupported(err) {
-				t.Fatalf("step %d: RWF_APPEND: %v", step, err)
-			}
-			if err == nil && written != size {
-				t.Fatalf("step %d: RWF_APPEND wrote %d bytes, want %d", step, written, size)
-			}
-			requireAgreement(step, "per-call append")
-		}
-	}
-}
-
-func errorIsUnsupported(err error) bool {
-	return err == syscall.EOPNOTSUPP || err == syscall.EINVAL || err == syscall.ENOTSUP
 }

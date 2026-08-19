@@ -7287,8 +7287,10 @@ func (x *ReadReply) GetData() []byte {
 //
 // Append placement is the one decision the kernel cannot make for a shared
 // volume: its i_size is only an advisory shadow of another machine's EOF. The
-// frontend therefore forwards the placement *intent* and the authority resolves
-// it against the true EOF under the per-inode writer stripe.
+// frontend therefore forwards the description's append intent and the authority
+// resolves it against the true EOF under the per-inode writer stripe. It never
+// reinterprets the kernel's offset: a write that states no append intent is
+// placed exactly where the kernel asked.
 type WriteRequest struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
 	Handle     []byte                 `protobuf:"bytes,1,opt,name=handle,proto3" json:"handle,omitempty"`
@@ -7297,23 +7299,17 @@ type WriteRequest struct {
 	Size       uint32                 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
 	WriteFlags uint32                 `protobuf:"varint,7,opt,name=write_flags,json=writeFlags,proto3" json:"write_flags,omitempty"`
 	Data       []byte                 `protobuf:"bytes,9,opt,name=data,proto3" json:"data,omitempty"` // transported out of line
-	// append requests authority-resolved placement at the object's true EOF.
-	// position must be zero; the resulting offset is returned as
-	// WriteReply.assigned_offset.
+	// append requests authority-resolved placement at the object's true EOF. It
+	// carries the O_APPEND state of the writing file description, which stock
+	// FUSE_WRITE.flags reports. position must be zero; the resulting offset is
+	// returned as WriteReply.assigned_offset.
 	Append bool `protobuf:"varint,10,opt,name=append,proto3" json:"append,omitempty"`
-	// offset_matches_client_size states that position equals the kernel i_size
-	// this frontend last published for the object. Stock Linux does not forward
-	// RWF_APPEND, so a per-call append on a descriptor without O_APPEND is
-	// indistinguishable from an ordinary write at that offset. The authority
-	// refuses such a write with EIO when position is not the true EOF, because
-	// only then could the two readings disagree about where the bytes belong.
-	OffsetMatchesClientSize bool `protobuf:"varint,11,opt,name=offset_matches_client_size,json=offsetMatchesClientSize,proto3" json:"offset_matches_client_size,omitempty"`
 	// The per-call durability intent of the writing file description. Linux keeps
 	// O_SYNC/O_DSYNC on the description and fcntl can change them, so they are a
 	// property of the call and are never inherited from the authority descriptor.
 	// sync is stronger than data_sync; both may not be set.
-	Sync          bool `protobuf:"varint,12,opt,name=sync,proto3" json:"sync,omitempty"`
-	DataSync      bool `protobuf:"varint,13,opt,name=data_sync,json=dataSync,proto3" json:"data_sync,omitempty"`
+	Sync          bool `protobuf:"varint,11,opt,name=sync,proto3" json:"sync,omitempty"`
+	DataSync      bool `protobuf:"varint,12,opt,name=data_sync,json=dataSync,proto3" json:"data_sync,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7393,13 +7389,6 @@ func (x *WriteRequest) GetData() []byte {
 func (x *WriteRequest) GetAppend() bool {
 	if x != nil {
 		return x.Append
-	}
-	return false
-}
-
-func (x *WriteRequest) GetOffsetMatchesClientSize() bool {
-	if x != nil {
-		return x.OffsetMatchesClientSize
 	}
 	return false
 }
@@ -9843,7 +9832,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x06offset\x18\x02 \x01(\x04R\x06offset\x12\x16\n" +
 	"\x06length\x18\x03 \x01(\rR\x06length\"\x1f\n" +
 	"\tReadReply\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\fR\x04data\"\xe6\x02\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"\xa9\x02\n" +
 	"\fWriteRequest\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\fR\x06handle\x12\x1a\n" +
 	"\bposition\x18\x02 \x01(\x04R\bposition\x12\x1d\n" +
@@ -9854,10 +9843,9 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"writeFlags\x12\x12\n" +
 	"\x04data\x18\t \x01(\fR\x04data\x12\x16\n" +
 	"\x06append\x18\n" +
-	" \x01(\bR\x06append\x12;\n" +
-	"\x1aoffset_matches_client_size\x18\v \x01(\bR\x17offsetMatchesClientSize\x12\x12\n" +
-	"\x04sync\x18\f \x01(\bR\x04sync\x12\x1b\n" +
-	"\tdata_sync\x18\r \x01(\bR\bdataSyncJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\b\x10\tR\frlimit_fsizeR\rfile_max_sizeR\x05flags\"\xdc\x01\n" +
+	" \x01(\bR\x06append\x12\x12\n" +
+	"\x04sync\x18\v \x01(\bR\x04sync\x12\x1b\n" +
+	"\tdata_sync\x18\f \x01(\bR\bdataSyncJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\b\x10\tR\frlimit_fsizeR\rfile_max_sizeR\x05flags\"\xdc\x01\n" +
 	"\n" +
 	"WriteReply\x12%\n" +
 	"\x0ecommitted_size\x18\x01 \x01(\x04R\rcommittedSize\x12:\n" +

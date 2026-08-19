@@ -20,13 +20,8 @@ type writeMetadata struct {
 	lockOwner     uint64
 	writeFlags    uint32
 	mode          xfsstore.WriteMode
-	// requireEOF carries WriteRequest.offset_matches_client_size. It is only
-	// meaningful for a positioned write and makes the store refuse a position
-	// that is not EOF, because such a request is indistinguishable from a
-	// per-call append the kernel never forwarded.
-	requireEOF bool
-	sync       bool
-	dataSync   bool
+	sync          bool
+	dataSync      bool
 }
 
 func stockWriteMetadata(body *authoritypb.WriteRequest, maxWrite uint32) (writeMetadata, error) {
@@ -41,8 +36,8 @@ func stockWriteMetadata(body *authoritypb.WriteRequest, maxWrite uint32) (writeM
 		return metadata, syscall.EINVAL
 	}
 	// An append carries no position: the authority assigns one under the writer
-	// stripe. The two placement statements are therefore mutually exclusive.
-	if body.GetAppend() && (body.GetPosition() != 0 || body.GetOffsetMatchesClientSize()) {
+	// stripe.
+	if body.GetAppend() && body.GetPosition() != 0 {
 		return metadata, syscall.EINVAL
 	}
 	copy(metadata.handle[:], body.GetHandle())
@@ -57,7 +52,6 @@ func stockWriteMetadata(body *authoritypb.WriteRequest, maxWrite uint32) (writeM
 	if body.GetAppend() {
 		metadata.mode = xfsstore.WriteAppend
 	}
-	metadata.requireEOF = body.GetOffsetMatchesClientSize()
 	metadata.sync, metadata.dataSync = body.GetSync(), body.GetDataSync()
 	return metadata, nil
 }
@@ -188,8 +182,7 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		committed, assigned, post, applyErr := target.CommitWriteData(body.GetData(), xfsstore.WriteCommit{
 			RequestedSize: metadata.requestedSize, Position: metadata.position,
 			RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: metadata.mode,
-			RequirePositionAtEOF: metadata.requireEOF,
-			DataSync:             metadata.dataSync, Sync: metadata.sync,
+			DataSync: metadata.dataSync, Sync: metadata.sync,
 			KillPrivileges: metadata.writeFlags&writeKillSUIDGID != 0,
 		})
 		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&

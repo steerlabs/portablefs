@@ -11,14 +11,13 @@ to be asked for, and nothing here is an open request.
 
 What actually shipped instead: append is exact on a stock kernel, with placement
 resolved by the authority at the object's true EOF under its per-inode writer
-stripe, and the two offsets stock FUSE cannot disambiguate refused loudly
-(`docs/portable-coherence.md` §4.3). The whole private write/publish/notify
+stripe (`docs/portable-coherence.md` §4.3). The whole private write/publish/notify
 profile below was not needed for it.
 
 The remaining upstream ask is correspondingly narrow and is no longer a blocker:
 **forward `IOCB_APPEND` and `IOCB_NOAPPEND` in `fuse_write_in.flags`.** With
-those two bits the frontend would read the placement intent directly instead of
-reconstructing it from "the offset equals the `i_size` I published", which would
+those two bits the frontend would read the per-call placement intent directly
+rather than seeing only the description's `O_APPEND`, which would
 delete the kernel-size shadow, delete the stale-size EIO refusal, and let the
 kernel apply `RLIMIT_FSIZE` against the offset the write actually used. No new
 opcode, reply field, or capability bit is involved.

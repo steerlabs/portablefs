@@ -68,10 +68,11 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   of the contract. Append placement is the one
   decision the frontend forwards rather than makes: `WriteRequest.append` asks
   the authority to place the payload at the true EOF and `assigned_offset`
-  reports where it landed. Stock FUSE does not forward `RWF_APPEND`, so a
-  per-call append is recognized only from the kernel's offset matching the
-  `i_size` this daemon published; that shape is forwarded flagged and refused
-  with EIO unless the offset really is EOF.
+  reports where it landed. The intent is the description's
+  `O_APPEND`, which stock `FUSE_WRITE.flags` reports. The per-call
+  `RWF_APPEND`/`RWF_NOAPPEND` flags are not forwarded by stock Linux and are
+  disclosed deviations: the former arrives as a positioned write at the offset the
+  kernel derived, the latter keeps appending.
 
 - **Both peers name what they require, and refuse on absence.** Every mount
   requires the common paired-transport, canonical-framing, replay,

@@ -2,8 +2,8 @@
 
 Status: DRAFT v3 after stock-FUSE and FSKit API audit. The writable Linux
 profile supports exact append: placement is resolved by the authority at the true
-EOF (§4.3), and the offsets stock FUSE cannot disambiguate are refused loudly
-rather than misplaced. Supersedes the private-kernel exact
+EOF (§4.3), with the per-call flags stock FUSE does not forward disclosed as
+deviations. Supersedes the private-kernel exact
 profile defined in `docs/vnext-protocol.md` §2–§5 and the Linux exact-append
 ABI. Authority protocol major for this architecture: **6 (portable)**. There is
 exactly one architecture: no patched-kernel mode, no fallback profile, no
@@ -42,9 +42,9 @@ rename has been incorporated into every retained dentry. This is a semantic
 scope boundary, not a cache mode silently presented as coherent.
 
 This is the target contract for supported operations. Append is inside it:
-placement is resolved by the authority at the true EOF (§4.3), and the two
-conditions under which a write cannot be placed are loud EIO refusals rather
-than silent misplacement.
+placement is resolved by the authority at the true EOF (§4.3). The two per-call
+flags stock Linux does not forward are disclosed deviations of that section, not
+silent reinterpretations of an offset.
 
 1. A mutation linearizes at one point after its authoritative XFS apply and
    before its response, chosen consistently with observations by operations
@@ -343,65 +343,49 @@ have moved EOF since. Protocol 6 therefore forwards the *intent* and lets the
 authority choose the offset inside the per-inode writer stripe that already
 serializes every size-changing operation:
 
-- `WriteRequest.append` asks the authority to place the payload at the object's
-  true EOF, read under that stripe. `WriteReply.assigned_offset` reports where it
-  landed, and the authority additionally proves exactness by requiring the object
-  to end exactly at `assigned_offset + committed_size`.
-- The frontend keeps a shadow S of its kernel's `i_size`, derived from the only
-  replies that move it: attribute-bearing replies assign it, WRITE/FALLOCATE/
-  COPY_FILE_RANGE raise it to the end of the range the kernel itself computed,
-  and SETATTR and atomic `O_TRUNC` assign it unconditionally.
-- Because the kernel sets its offset to `i_size` for every appending write, a
-  FUSE_WRITE whose offset equals S is the only observable trace of an append.
-  Every ordinary sequential write also lands at `i_size`, so the trace needs one
-  more discriminator: for `IOCB_APPEND`, `fuse_file_write_iter` refreshes
-  STATX_SIZE *through the writing file* first, so a hidden per-call append is
-  preceded by a GETATTR carrying that same file handle with nothing else touching
-  the inode in between. The decision table is one pure function
-  (`resolveAppendPlacement`):
-
-  | `O_APPEND` | offset == S | S refreshed for this handle | placement |
-  | --- | --- | --- | --- |
-  | yes | yes | any | append at the authority's EOF |
-  | yes | no  | any | positioned; only `RWF_NOAPPEND` (Linux ≥ 6.9) produces this |
-  | no  | no  | any | positioned; no append can be hiding here |
-  | no  | yes | no  | positioned; no append this daemon answered fits |
-  | no  | yes | yes | positioned, flagged `offset_matches_client_size` |
+- `WriteRequest.append` carries the writing description's `O_APPEND` state, which
+  stock `FUSE_WRITE.flags` reports. It asks the authority to place the payload at
+  the object's true EOF, read under that stripe.
+- `WriteReply.assigned_offset` reports where the bytes landed. The authority
+  additionally proves exactness by requiring the object to end exactly at
+  `assigned_offset + committed_size`, which nothing but a serialized append can
+  satisfy.
+- Every other write is placed exactly where the kernel asked. The kernel's offset
+  is never reinterpreted, and never consulted for an append.
 
 `i_size` remains advisory throughout. The kernel raises it from its own offset,
-so after an append that the authority placed further along, the kernel's value
-understates the object — which is exactly what a shared filesystem's cached size
-always is, and never what the next append's placement depends on.
+so after an append the authority placed further along, the kernel's value
+understates the object — which is what a shared filesystem's cached size always
+is, and never what the next append's placement depends on.
 
-**Two loud refusal conditions**, both EIO, both narrow:
+**Two disclosed deviations**, both because stock Linux carries the per-call
+read/write flags nowhere the daemon can see them (`fuse_write_in` has no
+`IOCB_APPEND`/`IOCB_NOAPPEND` bit, and the direct-I/O write path does not refresh
+`i_size` from the daemon before an appending write either):
 
-1. **Stale-size ambiguity.** Stock FUSE does not forward `RWF_APPEND`, so a
-   per-call append on a description without `O_APPEND` is distinguishable from an
-   ordinary write only by the handle-scoped size refresh above. When that trace is
-   present the frontend flags the write, and the authority refuses it unless the
-   offset really is EOF: only then do the two readings agree. The window is the
-   gap between that refresh and the write, so this fires only if a peer moves EOF
-   inside it. The one residual: if the refresh was answered from a nonzero
-   attribute timeout instead of reaching this daemon, the write is placed
-   positioned — correct while the A-R lease backing that timeout is live, since a
-   peer's size change must recall it first.
-2. **Unknown shadow.** If the frontend cannot state its kernel's `i_size` for the
-   object, it cannot evaluate the table and refuses the write. This is
-   unreachable by construction — the kernel has no inode this daemon never
-   described — and is logged when it happens. The one state that produces it is
-   an attribute reply a write on the same inode may have overtaken, which the
-   kernel's `attr_version` guard may discard unobservably; failing closed there
-   is a refusal to guess a placement.
+1. **`RWF_APPEND` on a description without `O_APPEND`** is resolved by the kernel
+   against its own `i_size` and arrives as an ordinary positioned write. It is
+   exact while that `i_size` is the object's EOF and lands at the stale offset
+   otherwise. An earlier revision of this design tried to recover the intent from
+   "the offset equals the `i_size` I published" and had the authority refuse a
+   mismatch; that was withdrawn because the same offset is what every ordinary
+   sequential write carries, so the rule refused honest concurrent writers, and
+   because the trace it depended on does not exist in this profile.
+2. **`RWF_NOAPPEND` on a description with `O_APPEND`** is placed at EOF like any
+   other append. Inferring "positioned" from the kernel's offset would misplace
+   real appends, whose offsets are equally advisory; the ordinary appends are the
+   ones that must stay exact.
 
 Appends cannot duplicate under retry: the replay-slot retention returns the
 retained outcome, including its `assigned_offset`, rather than re-resolving EOF.
 
 **`RLIMIT_FSIZE` exception.** The kernel checks the file-size rlimit against its
-own `ki_pos`, which is `i_size`. When the shadow equals EOF — the ordinary case —
-that check is exact. When a peer has moved EOF further along, an append the
+own `ki_pos`, which is `i_size`. When that shadow equals EOF — the ordinary case —
+the check is exact. When a peer has moved EOF further along, an append the
 authority places past the kernel's position may cross a limit the kernel checked
 at a smaller size. This is a named, disclosed exception: the authority does not
-replay private rlimit policy, and there is no stock mechanism that would let it.
+replay private rlimit policy, and stock FUSE offers no mechanism that would let
+it.
 
 ### 4.4 Truncate / fallocate / copy_range / setattr
 
@@ -652,8 +636,8 @@ source of the E2B incident class; its removal is a feature.
    whole-file recall-to-none; metadata + E-R leases end-to-end; validity
    arithmetic; two-mount coherence matrix green on stock.
 4. **L3 — Write path.** DIRECT_IO writes → single RPC; authority-resolved exact
-   append, including the unforwarded per-call `RWF_APPEND` reduced to a loud
-   refusal; fsync group commit; then the pipelined unified write stream.
+   `O_APPEND` with the unforwarded per-call flags disclosed; fsync group commit;
+   then the pipelined unified write stream.
 5. **L4 — Metadata completion.** FUSE_CREATE→RESOLVE_OPEN, open-by-identity,
    negative entries, readdir under E-R, LOCAL routes, D-R read caching
    (daemon + read-only KEEP_CACHE with the §7.3b belt).
@@ -672,11 +656,11 @@ source of the E2B incident class; its removal is a feature.
    `fuse_reverse_inval_inode` (removes §7.3b entirely; small, generally
    useful — the correct successor to private patching).
 2. **Upstream conversation: forward `IOCB_APPEND`/`IOCB_NOAPPEND` in
-   `fuse_write_in.flags`.** Append is exact today without it, but only because
-   the frontend reconstructs the intent from "offset equals the i_size I
-   published". Forwarding the two bits would delete that reconstruction, the
-   kernel-size shadow it needs, and the stale-size EIO refusal in §4.3 — and
-   would let the kernel apply `RLIMIT_FSIZE` against the offset actually used.
+   `fuse_write_in.flags`.** `O_APPEND` is exact today without it, because the
+   description's state is already reported. The two bits are what would close the
+   per-call `RWF_APPEND`/`RWF_NOAPPEND` deviations in §4.3 — and, with an
+   authority-assigned offset in the reply, would let the kernel apply
+   `RLIMIT_FSIZE` against the offset actually used.
 3. Authority-restart lease persistence vs v1 grace (§7.5).
 4. Range data leases (after all frontends prove exact range purge).
 5. WinFsp contract verification to §3 rigor before Windows work.
