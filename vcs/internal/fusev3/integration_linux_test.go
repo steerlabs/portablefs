@@ -1616,7 +1616,10 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	var created *os.File
 	createRPCs := measure("create plus child/parent stat", func() {
 		var err error
-		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		// O_EXCL deliberately revalidates even a warm negative dentry before
+		// CREATE. This assertion measures metadata requests after the mutation,
+		// so use the ordinary create path whose warmed absence is reusable.
+		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
