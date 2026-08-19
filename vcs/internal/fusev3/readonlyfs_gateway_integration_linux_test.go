@@ -246,23 +246,33 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 		t.Fatalf("the gateway reported a terminal cause across a clean close: %v", err)
 	}
 
-	// What happens on the volume after this close is deliberately not asserted,
-	// and that is the second defect this test found rather than a gap in its
-	// scope. readonlyfs.Close closes the transport; neither it nor
-	// cmd/portablefs-files ever sends Detach, and the authorityClient interface
-	// the gateway is written against has no detach call at all. The session
-	// therefore stays an active durable-membership participant with the socket
-	// gone, so the next peer mutation waits the whole repair budget for a
-	// PREPARE nobody will acknowledge and then fails EIO with an uncertain
-	// outcome -- observed here as the mutating mount revoking itself after 20s,
-	// three runs out of three. Asserting that would cement it; asserting a clean
-	// volume would be false. The client-side close is what this test can honestly
-	// state, and the volume-side consequence is tracked separately.
+	// A departure that left an obligation behind shows up as a barrier the next
+	// mutation cannot close. Close sends an authenticated Detach, so the session
+	// leaves the audience before its transport drops and this write costs a
+	// round trip. Without it the write waits the gateway's whole repair budget
+	// for a phase nobody will acknowledge, plus a budget of post-fence grace,
+	// and the mount's own watchdog revokes it in the meantime.
+	afterDetach := time.Now()
+	if err := os.WriteFile(peer.Join(0, name), initial, 0o600); err != nil {
+		t.Fatalf("peer mount write after the gateway detached: %v (%s)", err, peer.Diagnostics())
+	}
+	if elapsed := time.Since(afterDetach); elapsed > peer.RepairBudget()/4 {
+		t.Fatalf("the first write after the gateway detached took %s; the gateway left an undischarged obligation (%s)", elapsed, peer.Diagnostics())
+	}
+	got, err := os.ReadFile(peer.Join(0, name))
+	if err != nil {
+		t.Fatalf("read the mount after the gateway detached: %v", err)
+	}
+	if !bytes.Equal(got, initial) {
+		t.Fatalf("the mount holds %d bytes after the gateway detached, want %d", len(got), len(initial))
+	}
+	// A clean detach fences nobody. Reaching this line with a fence recorded
+	// would mean the departure was taken as a failure.
 	if fenced := peer.FencedSessions(); fenced != 0 {
-		t.Fatalf("%d session(s) were fenced up to the gateway's close", fenced)
+		t.Fatalf("%d session(s) were fenced across the gateway's detach", fenced)
 	}
 	if cause := peer.MountFatal(0); cause != nil {
-		t.Fatalf("the mount was revoked up to the gateway's close: %v", cause)
+		t.Fatalf("the mount was revoked across the gateway's detach: %v", cause)
 	}
 }
 

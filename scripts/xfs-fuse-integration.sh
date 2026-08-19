@@ -83,6 +83,10 @@ REQUIRED_TESTS=(
   # which cannot observe attach negotiation, a real barrier, or whether a
   # cacheless reader can stall a writing mount.
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer"
+  # The gateway is a sidecar, so it leaves whenever its pod restarts, and
+  # leaving used to cost a writing mount its mutation. Keep the test that
+  # measures what a clean departure costs required.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayCloseDoesNotStallAMutatingMount"
 )
 
 # This boundary is root-owned provisioning work and therefore cannot run under
