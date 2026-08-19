@@ -200,10 +200,10 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 	var activeCanonical []byte
 	apply := false
 	check := func() (bool, error) {
-		// This is the authoritative CAS. ExecuteRoutesChecked holds the topology
-		// writer before calling it, so no admitted request or attach is still
-		// running and no competing routing change can decide against the same old
-		// value.
+		// This is the authoritative CAS. ExecuteTopologyExclusive holds the
+		// topology writer before calling it, so no admitted request or attach is
+		// still running and no competing routing change can decide against the
+		// same old value.
 		r.mu.RLock()
 		loaded := r.loaded
 		active = r.revision
