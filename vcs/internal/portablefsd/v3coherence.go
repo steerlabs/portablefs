@@ -50,7 +50,6 @@ type v3VisibilityClient interface {
 	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
 	AckVisibilityWithContention(context.Context, *authoritypb.VisibilityCursor, bool) error
-	ReportVisibilityBlocked(context.Context, *authoritypb.VisibilityCursor, []uint64) error
 	SessionDone() <-chan struct{}
 	SessionError() error
 	Close() error
@@ -395,13 +394,6 @@ func (b *v3CoherenceBridge) next(ctx context.Context) (*v3PendingVisibility, err
 	if err != nil {
 		return nil, b.fail(err)
 	}
-	if local.Routes != nil {
-		// Routing is part of the mount's admitted topology, not cache state. No
-		// FSKit invalidation can turn an already-mounted namespace into a
-		// different routing graph, so a route event ends this incarnation rather
-		// than being acknowledged as though it were a repair.
-		return nil, b.fail(authorityrpc.ErrRoutesMismatch)
-	}
 	if bytes.Equal(local.InitiatorSessionID, b.contract.SessionID) {
 		return nil, b.fail(errors.New("portablefsd: authority delivered a filesystem visibility phase to its source participant"))
 	}
@@ -461,12 +453,6 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 	if request == nil || !bytes.Equal(request.AuthorityEpoch, b.contract.AuthorityEpoch) {
 		return b.protocolViolation("visibility acknowledgement has no request or names a different authority epoch")
 	}
-	if len(request.Reason) > 1024 {
-		return b.protocolViolation("visibility blocked reason exceeds 1024 bytes")
-	}
-	if !request.Blocked && request.Reason != "" {
-		return b.protocolViolation("successful visibility acknowledgement carries a failure reason")
-	}
 	cursor, err := authorityVisibilityCursor(request.Cursor)
 	if err != nil {
 		return b.protocolViolation("visibility acknowledgement has an invalid cursor")
@@ -485,7 +471,7 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 	b.mu.Unlock()
 
 	if pending == nil {
-		if request.Blocked || !authorityCursorsEqual(current, cursor) {
+		if !authorityCursorsEqual(current, cursor) {
 			return b.protocolViolation("visibility acknowledgement does not repeat the last accepted cursor")
 		}
 		if err := b.client.AckVisibility(ctx, cursor); err != nil {
@@ -495,13 +481,6 @@ func (b *v3CoherenceBridge) acknowledge(ctx context.Context, request *pfslocal.V
 	}
 	if !authorityCursorsEqual(pending.cursor, cursor) {
 		return b.protocolViolation("visibility acknowledgement does not match the outstanding cursor")
-	}
-	if request.Blocked {
-		reportErr := b.client.ReportVisibilityBlocked(ctx, cursor, nil)
-		if reportErr == nil {
-			reportErr = errors.New("portablefsd: authority accepted a blocked visibility report without fencing the session")
-		}
-		return b.fail(reportErr)
 	}
 	orderedAdmissionContended := request.OrderedAdmissionContended &&
 		b.contract.CachePolicy == v3CachePolicyMacOS26 &&
@@ -617,17 +596,17 @@ func translateV3VisibilityEvent(epoch []byte, event *authoritypb.VisibilityEvent
 	if err := validateAuthorityCursor(event.GetCursor()); err != nil {
 		return nil, err
 	}
-	if event.GetRoutes() != nil {
-		if len(event.GetTargets()) != 0 || len(event.GetRoutes().GetRevision()) != 32 {
-			return nil, errors.New("portablefsd: malformed routing visibility event")
-		}
-	} else if len(event.GetInitiatorSessionId()) != 16 || event.GetMutationSequence() == 0 {
+	if len(event.GetInitiatorSessionId()) != 16 || event.GetMutationSequence() == 0 {
 		return nil, errors.New("portablefsd: visibility event omitted its initiator ticket")
-	} else if len(event.GetTargets()) == 0 && event.GetCursor().GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
+	}
+	if len(event.GetTargets()) == 0 && event.GetCursor().GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
 		// A definite failed or no-op visible mutation can legitimately finish
 		// with no coordinates changed. PREPARE must still name what is drained;
 		// only its paired COMPLETE may be targetless.
 		return nil, errors.New("portablefsd: targetless visibility PREPARE")
+	}
+	if err := visibilitywire.ValidateEventTargets(event.GetCursor().GetPhase(), event.GetCursor().GetSequence(), event.GetTargets()); err != nil {
+		return nil, fmt.Errorf("portablefsd: %w", err)
 	}
 
 	local := &pfslocal.V3VisibilityEvent{
@@ -647,12 +626,6 @@ func translateV3VisibilityEvent(epoch []byte, event *authoritypb.VisibilityEvent
 			return nil, err
 		}
 		local.Targets = append(local.Targets, translated)
-	}
-	if routes := event.GetRoutes(); routes != nil {
-		local.Routes = &pfslocal.RoutesChange{
-			Revision: append([]byte(nil), routes.GetRevision()...),
-			Rules:    append([]byte(nil), routes.GetRules()...),
-		}
 	}
 	return local, nil
 }
@@ -752,12 +725,6 @@ func cloneLocalVisibilityEvent(event *pfslocal.V3VisibilityEvent) *pfslocal.V3Vi
 		clone.Targets[i].Identity = append([]byte(nil), event.Targets[i].Identity...)
 		clone.Targets[i].ParentIdentity = append([]byte(nil), event.Targets[i].ParentIdentity...)
 		clone.Targets[i].Name = append([]byte(nil), event.Targets[i].Name...)
-	}
-	if event.Routes != nil {
-		clone.Routes = &pfslocal.RoutesChange{
-			Revision: append([]byte(nil), event.Routes.Revision...),
-			Rules:    append([]byte(nil), event.Routes.Rules...),
-		}
 	}
 	return &clone
 }

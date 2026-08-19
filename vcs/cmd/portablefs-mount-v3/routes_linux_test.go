@@ -52,17 +52,17 @@ const (
 )
 
 type attachFixture struct {
-	t          *testing.T
-	address    string
-	clientTLS  *tls.Config
-	capability []byte
-	routes     *authorityrpc.RoutesController
-	attaches   *attachCounter
-	stop       context.CancelFunc
-	served     chan error
-	listener   net.Listener
-	store      *xfsstore.Volume
-	staging    *authorityrpc.WriteTransactionStaging
+	t              *testing.T
+	address        string
+	clientTLS      *tls.Config
+	capability     []byte
+	routes         *authorityrpc.RoutesController
+	attaches       *attachCounter
+	stop           context.CancelFunc
+	served         chan error
+	listener       net.Listener
+	store          *xfsstore.Volume
+	writeAdmission *authorityrpc.WriteAdmission
 }
 
 // attachCounter records every attach the authority was asked to perform and how
@@ -134,21 +134,21 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		t.Fatalf("open XFS volume: %v", err)
 	}
 	f.store = store
-	stagingRoot := volumeRoot + ".write-staging"
-	if err := os.Mkdir(stagingRoot, 0o700); err != nil {
-		t.Fatalf("create write-transaction staging root: %v", err)
+	writeAdmissionRoot := volumeRoot + ".write-admission"
+	if err := os.Mkdir(writeAdmissionRoot, 0o700); err != nil {
+		t.Fatalf("create write admission root: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(stagingRoot) })
-	f.staging, err = authorityrpc.OpenWriteTransactionStaging(stagingRoot)
+	t.Cleanup(func() { _ = os.RemoveAll(writeAdmissionRoot) })
+	f.writeAdmission, err = authorityrpc.OpenWriteAdmission(writeAdmissionRoot)
 	if err != nil {
-		t.Fatalf("open write-transaction staging root: %v", err)
+		t.Fatalf("open write admission root: %v", err)
 	}
 	t.Cleanup(func() {
-		if f.staging != nil {
-			if err := f.staging.Close(); err != nil {
-				t.Errorf("close write-transaction staging: %v", err)
+		if f.writeAdmission != nil {
+			if err := f.writeAdmission.Close(); err != nil {
+				t.Errorf("close write admission: %v", err)
 			}
-			f.staging = nil
+			f.writeAdmission = nil
 		}
 	})
 
@@ -158,20 +158,16 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	if err != nil {
 		t.Fatalf("create authority epoch: %v", err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noMembership{}, Fencer: authority,
-		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute, MaxClockSkew: time.Minute,
+	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
+		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: noMembership{},
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
+		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
+		CacheLeaseTTL: volumeserver.Protocol6MaxLeaseTTL, MaxCacheLeasesPerSession: 65536, MaxCacheLeases: 1 << 20,
 	})
 	if err != nil {
-		t.Fatalf("create visibility coordinator: %v", err)
+		t.Fatalf("assemble authority coordination: %v", err)
 	}
-	routes, err := authorityrpc.NewRoutesController(store, visibility, authority.Locks())
-	if err != nil {
-		t.Fatalf("create routing controller: %v", err)
-	}
-	if err := routes.Load(); err != nil {
-		t.Fatalf("load routing: %v", err)
-	}
+	routes := coordination.Routes
 	active, err := routes.Revision()
 	if err != nil {
 		t.Fatalf("read active routing revision: %v", err)
@@ -201,23 +197,23 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	f.capability = token
 
 	handler := &authorityrpc.VolumeHandler{
-		Store: store, Runtime: authority, Visibility: visibility, Routes: routes,
+		Store: store, Runtime: authority,
 		Authorizer: &volumecap.Authorizer{
 			PublicKey: public, MaxLifetime: 15 * time.Minute, MaxRetainedNonces: 64,
 		},
 		MaxFrame: 4 << 20, MaxRead: 1 << 20, MaxWrite: 1 << 20, MaxInFlight: 64,
 		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 4096, MaxOpens: 4096,
-		MaxRetainedReplyBytes:           32 << 20,
-		WriteStaging:                    f.staging,
-		MaxWriteTransactionBytes:        authorityrpc.RequiredWriteTransactionBytes,
-		MaxWriteStagingBytesPerSession:  16 << 30,
-		MaxWriteStagingBytes:            64 << 30,
-		MaxWriteTransactionsPerSession:  8,
-		MaxWriteTransactions:            64,
-		WriteTransactionProgressTimeout: 2 * time.Minute,
-		WriteTransactionAbsoluteTimeout: 30 * time.Minute,
-		TerminalDeliveryTimeout:         45 * time.Second,
+		MaxRetainedReplyBytes:         32 << 20,
+		WriteAdmission:                f.writeAdmission,
+		MaxWriteBytesPerSession:       16 << 30,
+		MaxWriteBytesInFlight:         64 << 30,
+		MaxWritesPerSession:           8,
+		MaxWrites:                     64,
+		WriteAdmissionProgressTimeout: 2 * time.Minute,
+		WriteAbsoluteTimeout:          30 * time.Minute,
+		TerminalDeliveryTimeout:       45 * time.Second,
 	}
+	coordination.Bind(handler)
 	f.attaches = &attachCounter{inner: handler}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -254,12 +250,11 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 // mount: no flags, no environment, one capability.
 func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 	return authorityrpc.ClientConfig{
-		Address: f.address, TLS: f.clientTLS.Clone(), VolumeID: attachVolumeID,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         f.address, TLS: f.clientTLS.Clone(), VolumeID: attachVolumeID,
 		AccessToken: f.capability, ReplaySlots: 64, MaxFrame: 4 << 20,
 		DialTimeout: 10 * time.Second, CancelDrainTimeout: 5 * time.Second, MaxInFlight: 64,
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 4096, RepairBudget: 15 * time.Second,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
 		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return &authoritypb.MountAbsenceProof{
 				ObservedUnixNanos: time.Now().UnixNano(),

@@ -17,7 +17,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
-// clientTransport is one physical protocol-5 lane. Everything whose identity
+// clientTransport is one physical protocol-6 lane. Everything whose identity
 // is scoped to a TCP/TLS connection lives here: publication, serialization,
 // request IDs, waiters, reconnect exclusion, and negotiated frame accounting.
 // Session identity is deliberately not duplicated here; both transports prove
@@ -37,15 +37,15 @@ type clientTransport struct {
 }
 
 type transportNegotiation struct {
-	conn                net.Conn
-	epoch               []byte
-	features            []string
-	maxFrame            uint32
-	maxRead             uint32
-	maxWrite            uint32
-	maxWriteTransaction uint64
-	maxInFlight         uint32
-	role                authoritypb.TransportRole
+	conn          net.Conn
+	epoch         []byte
+	features      []string
+	maxFrame      uint32
+	maxRead       uint32
+	maxWrite      uint32
+	maxFskitWrite uint64
+	maxInFlight   uint32
+	role          authoritypb.TransportRole
 	// Set only by proof-bearing Resume during pre-publication activation
 	// recovery. Hello itself never conveys a binding generation.
 	resumedBindingGeneration uint64
@@ -150,9 +150,9 @@ func (c *Client) dialTLS(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	conn := tls.Client(raw, c.tlsConfig())
+	conn := newAuthorityTLSClient(raw, c.tlsConfig())
 	if err := conn.HandshakeContext(ctx); err != nil {
-		_ = raw.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if conn.ConnectionState().NegotiatedProtocol != protocolALPN {
@@ -185,28 +185,36 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	if err := conn.SetDeadline(deadline); err != nil {
 		return fail(err)
 	}
+	requiredFeatures, ok := helloFeatures(c.cfg.FrontendProfile)
+	if !ok {
+		return fail(errors.New("authorityrpc: unsupported frontend profile"))
+	}
 	request := &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
 		ProtocolMajor:   ProtocolMajor,
-		Features:        append([]string(nil), requiredHelloFeatures...),
+		Features:        append([]string(nil), requiredFeatures...),
 		Role:            role,
 		ConnectionSetId: append([]byte(nil), c.connectionSetID[:]...),
+		FrontendProfile: c.cfg.FrontendProfile,
 	}}}
 	if err := writeFrame(conn, c.cfg.MaxFrame, request); err != nil {
 		return fail(err)
 	}
 	var response authoritypb.Response
-	if err := readFrame(conn, c.cfg.MaxFrame, nil, 0, &response); err != nil {
+	releaseFrame, err := readFrameRetained(conn, c.cfg.MaxFrame, nil, 0, &response)
+	if err != nil {
 		return fail(err)
 	}
+	defer releaseFrame()
 	hello := response.GetHello()
 	if response.GetRequestId() != request.GetRequestId() || response.GetErrno() != 0 || hello == nil ||
 		hello.GetProtocolMajor() != ProtocolMajor {
 		return fail(fmt.Errorf("authorityrpc: %s protocol handshake refused with errno %d", role, response.GetErrno()))
 	}
-	if hello.GetRole() != role || !equalBytes(hello.GetConnectionSetId(), c.connectionSetID[:]) {
-		return fail(fmt.Errorf("authorityrpc: %s Hello did not echo its exact transport binding", role))
+	if hello.GetRole() != role || !equalBytes(hello.GetConnectionSetId(), c.connectionSetID[:]) ||
+		hello.GetFrontendProfile() != c.cfg.FrontendProfile {
+		return fail(fmt.Errorf("%w: %s Hello did not echo its exact transport binding", ErrTransportBinding, role))
 	}
-	if !hasFeatures(hello.GetFeatures(), requiredHelloFeatures) {
+	if !hasFeatures(hello.GetFeatures(), requiredFeatures) {
 		return fail(errors.New("authorityrpc: authority omitted required current-state features"))
 	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
@@ -219,12 +227,6 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 	}
 	if hello.GetMaxFrameBytes() == 0 || hello.GetMaxReadBytes() == 0 || hello.GetMaxWriteBytes() == 0 || hello.GetMaxInFlight() == 0 {
 		return fail(errors.New("authorityrpc: authority omitted allocation bounds"))
-	}
-	if got := hello.GetMaxWriteTransactionBytes(); got != RequiredWriteTransactionBytes {
-		return fail(fmt.Errorf(
-			"authorityrpc: authority write-transaction bound is %d, require exactly %d",
-			got, RequiredWriteTransactionBytes,
-		))
 	}
 	if uint64(c.cfg.MaxInFlight) > uint64(hello.GetMaxInFlight()) {
 		return fail(errors.New("authorityrpc: client max-in-flight exceeds the authority connection bound"))
@@ -251,10 +253,17 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 			hello.GetMaxReadBytes(), hello.GetMaxWriteBytes(),
 		))
 	}
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hello.GetMaxFskitWriteBytes() != 0 {
+		return fail(errors.New("authorityrpc: Linux profile received FSKit write capacity"))
+	}
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
+		hello.GetMaxFskitWriteBytes() < RequiredFskitWriteBytes {
+		return fail(errors.New("authorityrpc: FSKit profile omitted fragmented-write capacity"))
+	}
 	return &transportNegotiation{
 		conn: conn, epoch: append([]byte(nil), response.GetEpoch()...),
 		features: append([]string(nil), hello.GetFeatures()...), maxFrame: negotiatedFrame,
-		maxRead: hello.GetMaxReadBytes(), maxWrite: hello.GetMaxWriteBytes(), maxWriteTransaction: hello.GetMaxWriteTransactionBytes(),
+		maxRead: hello.GetMaxReadBytes(), maxWrite: hello.GetMaxWriteBytes(), maxFskitWrite: hello.GetMaxFskitWriteBytes(),
 		maxInFlight: hello.GetMaxInFlight(), role: role,
 	}, nil
 }
@@ -266,7 +275,7 @@ func validateNegotiationPair(data, control *transportNegotiation) error {
 	}
 	if !equalBytes(data.epoch, control.epoch) || !slices.Equal(data.features, control.features) ||
 		data.maxFrame != control.maxFrame || data.maxRead != control.maxRead ||
-		data.maxWrite != control.maxWrite || data.maxWriteTransaction != control.maxWriteTransaction || data.maxInFlight != control.maxInFlight {
+		data.maxWrite != control.maxWrite || data.maxFskitWrite != control.maxFskitWrite || data.maxInFlight != control.maxInFlight {
 		return errors.New("authorityrpc: DATA and CONTROL negotiated different authority state")
 	}
 	return nil
@@ -327,7 +336,8 @@ func (c *Client) validateReconnectNegotiation(opened *transportNegotiation) erro
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
 	if !slices.Equal(opened.features, c.helloFeatures) || opened.maxFrame != c.negotiatedFrame ||
-		opened.maxRead != c.maxRead || opened.maxWrite != c.maxWrite || opened.maxWriteTransaction != c.maxWriteTransaction || opened.maxInFlight != c.negotiatedInFlight {
+		opened.maxRead != c.maxRead || opened.maxWrite != c.maxWrite || opened.maxFskitWrite != c.maxFskitWrite ||
+		opened.maxInFlight != c.negotiatedInFlight {
 		return errors.New("authorityrpc: resumed transport negotiated different authority state")
 	}
 	return nil
@@ -350,9 +360,11 @@ func rawRoundTrip(conn net.Conn, frameMax uint32, request *authoritypb.Request) 
 		return nil, err
 	}
 	response := new(authoritypb.Response)
-	if err := readFrame(conn, frameMax, nil, 0, response); err != nil {
+	releaseFrame, err := readFrameRetained(conn, frameMax, nil, 0, response)
+	if err != nil {
 		return nil, err
 	}
+	defer releaseFrame()
 	if response.GetRequestId() != request.GetRequestId() {
 		return nil, errors.New("authorityrpc: handshake response carried a foreign request ID")
 	}
@@ -486,6 +498,9 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 	defer cancel()
 	opened, err := c.openTransport(handshakeCtx, role)
 	if err != nil {
+		if errors.Is(err, ErrAuthorityChanged) || errors.Is(err, ErrSessionEnded) || errors.Is(err, ErrTransportBinding) {
+			c.signalSessionEnd(err)
+		}
 		return err
 	}
 	fail := func(err error) error {
@@ -495,6 +510,8 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 			c.signalSessionEnd(ErrAuthorityChanged)
 		case errors.Is(err, ErrSessionEnded):
 			c.signalSessionEnd(ErrSessionEnded)
+		case errors.Is(err, ErrTransportBinding):
+			c.signalSessionEnd(err)
 		}
 		return err
 	}

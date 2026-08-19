@@ -22,10 +22,6 @@ type request struct {
 	cancel chan struct{}
 
 	suppressReply bool
-	// publishMarked asks serializeHeader to set the private bit62 marker on an
-	// ordinary response selected by ReplyPublishMarker.
-	publishMarked bool
-
 	// written under Server.interruptMu
 	interrupted bool
 
@@ -45,8 +41,9 @@ type request struct {
 	status Status
 
 	// Unstructured output. Only one of these is non-nil.
-	outPayload []byte
-	readResult ReadResult
+	outPayload    []byte
+	readResult    ReadResult
+	variableReply bool
 
 	// Start timestamp for timing info.
 	startTime time.Time
@@ -90,10 +87,10 @@ func (r *request) clear() {
 	r.outDataBuf = nil
 	r.inPayload = nil
 	r.status = OK
-	r.publishMarked = false
 	r.outPayload = nil
 	r.startTime = time.Time{}
 	r.readResult = nil
+	r.variableReply = false
 }
 
 func asType(ptr unsafe.Pointer, typ interface{}) interface{} {
@@ -210,7 +207,7 @@ func (r *request) inData() unsafe.Pointer {
 }
 
 // note: outSize is without OutHeader
-func parseRequest(in []byte, kernelSettings *InitIn) (h *operationHandler, inSize, outSize, outPayloadSize int, errno Status) {
+func parseRequest(in []byte, kernelSettings *InitIn) (h *operationHandler, inSize, outSize, outPayloadSize int, variableReply bool, errno Status) {
 	inSize = int(unsafe.Sizeof(InHeader{}))
 	if len(in) < inSize {
 		errno = EIO
@@ -243,7 +240,9 @@ func parseRequest(in []byte, kernelSettings *InitIn) (h *operationHandler, inSiz
 	outSize = int(h.OutputSize)
 
 	switch hdr.Opcode {
-	case _OP_READDIR, _OP_READDIRPLUS, _OP_READ:
+	case _OP_READDIRPLUS:
+		outPayloadSize, variableReply = int(((*ReadIn)(inData)).Size), true
+	case _OP_READDIR, _OP_READ:
 		outPayloadSize = int(((*ReadIn)(inData)).Size)
 	case _OP_GETXATTR, _OP_LISTXATTR:
 		// [GET|LIST]XATTR is two opcodes in one: get/list xattr size (return
@@ -306,9 +305,6 @@ func (r *request) serializeHeader(outPayloadSize int) {
 
 	o := r.outHeader()
 	o.Unique = r.inHeader().Unique
-	if r.publishMarked {
-		o.Unique |= PFS_UNIQUE_PUBLISH
-	}
 	o.Status = int32(-r.status)
 	o.Length = uint32(
 		int(sizeOfOutHeader) + len(r.outDataBuf) + outPayloadSize)

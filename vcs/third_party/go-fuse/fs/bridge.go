@@ -116,28 +116,6 @@ type rawBridge struct {
 	disableBackingFiles bool
 }
 
-// PFSWrite is intentionally unsupported by the generic high-level bridge.
-// PortableFS implements the private negotiated opcode in its raw frontend,
-// where the multi-phase transaction and reply-publication lifecycle are
-// explicit rather than inferred from ordinary file methods.
-func (b *rawBridge) PFSWrite(cancel <-chan struct{}, input *fuse.PFSWriteIn, data []byte, out *fuse.PFSWriteOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
-// PFSPublish is private to raw filesystems that negotiate PortableFS's kernel
-// publication contract.
-func (b *rawBridge) PFSPublish(cancel <-chan struct{}, input *fuse.PFSPublishIn, out *fuse.PFSPublishOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
-func (b *rawBridge) PFSFallocate(cancel <-chan struct{}, input *fuse.PFSFallocateIn, out *fuse.PFSRangeOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
-func (b *rawBridge) PFSCopyFileRange(cancel <-chan struct{}, input *fuse.PFSCopyFileRangeIn, out *fuse.PFSRangeOut) fuse.Status {
-	return fuse.ENOSYS
-}
-
 func (b *rawBridge) SyncFS(cancel <-chan struct{}, input *fuse.SyncFSIn) fuse.Status {
 	return fuse.ENOSYS
 }

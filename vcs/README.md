@@ -22,12 +22,11 @@ OS kernel page caches remain part of each mount contract. For why, read
 | `cmd/portablefs` | The user-facing CLI: mount, umount, mounts, route, prune-local, daemon, doctor, mount-check, version, and the installer and lifecycle coordination subcommands. Linux and macOS. |
 | `cmd/portablefs-authority` | The volume authority. Linux only. One process serves exactly one volume, refuses to run as root, and terminates its epoch on any storage failure. |
 | `cmd/portablefs-manager` | The product-neutral hosted manager. It owns desired state, placement, PKI, grants, and fencing generations, but never filesystem contents. |
-| `cmd/portablefs-files` | A private, non-mounting read gateway for product file browsers. It accepts request-bound Ed25519 tokens, holds bounded read-only authority sessions, pages directories, bounds previews, and streams downloads. |
 | `cmd/portablefs-cell-agent` | The unprivileged outbound reconciliation loop on each Linux storage cell. |
 | `cmd/portablefs-cell-helper` | The narrow root helper that applies only a verified, manager-signed cell plan. Linux only. |
 | `cmd/portablefs-authority-launcher` | The fixed-argument systemd launcher for an isolated per-volume authority. Linux only. |
-| `cmd/portablefs-files` | The bounded read-only HTTP adapter for a colocated product backend. It holds strict, cacheless authority sessions and never mounts a volume. |
-| `cmd/portablefsd` | The per-user daemon. On macOS it is the v3 data plane behind the FSKit extension: it owns the authority session and never exposes authority credentials to the extension. |
+| `cmd/portablefs-files` | The bounded, non-mounting read gateway for product file browsers. It accepts request-bound Ed25519 tokens, holds strict cacheless read-only authority sessions, pages directories, bounds previews, and streams downloads. |
+| `cmd/portablefsd` | The per-user macOS registry, control daemon, and FSKit data plane. It declares the protocol-6 synchronous-repair profile and never claims Linux lease semantics. |
 | `cmd/portablefs-mount-v3` | A standalone Linux mount client. This is what the coherence harnesses drive; ordinary users go through `portablefs mount`. |
 
 ## Layout
@@ -41,13 +40,13 @@ internal/
                    RESOLVE_BENEATH, *at syscalls, device verification, stable
                    export-handle identity, xattr namespace restriction.
   volumeserver/    Epoch sessions, replay slots, cancellation, POSIX and flock
-                   lock tables, the two-phase visibility barrier, durable strict
-                   membership, and fail-closed fencing.
+                   lock tables, the N/A/D/E lease coordinator, durable mount
+                   lifecycle, and fail-closed fencing.
   authorityrpc/    The wire: TLS 1.3 mutual authentication, ALPN
-                   portablefs-authority-v5, mandatory DATA/CONTROL transports,
+                   portablefs-authority-v6, mandatory DATA/CONTROL transports,
                    provisional activation, schema-bound bulk framing,
                    canonical replay fingerprinting, the XFS request handler, routing
-                   topology, and visibility events.
+                   topology, and lease recall/renewal events.
   authoritypb/     Generated protobuf bindings for proto/authority/v1.
   volumecap/       Ed25519 mount capabilities: signed, single-use, short-lived,
                    volume- and peer-bound.
@@ -60,11 +59,11 @@ internal/
   cellhelper/      Durable assignment pinning and the narrow root boundary.
   cellhost/        Closed XFS quota, local authority identity, and systemd host
                    operations derived only from signed volume assignments.
-  fusev3/          The Linux frontend. Raw FUSE, a barrier-coherent page cache,
-                   strict source and peer publication ordering, kernel binding
-                   and page revocation, and machine-local route grafts.
-  portablefsd/     The daemon: attach registry, control API, the v3 attach and
-                   its coherence bridge, and the evidence-bearing detach.
+  fusev3/          The Linux frontend. Stock FUSE 7.31, reply-local lease
+                   validity, daemon and kernel cache withdrawal, positioned
+                   write-through I/O, and machine-local route grafts.
+  portablefsd/     The macOS daemon registry, control API, FSKit data plane,
+                   synchronous-repair bridge, and evidence-bearing detach.
   pfslocal/        The local protocol between the daemon and the FSKit
                    extension. Major 1, currently minor 15, additive.
   mountv3/         The shared mount engine used by both the CLI and the
@@ -74,8 +73,6 @@ internal/
                    on.
   localroutes/     Machine-local backing directories, keyed by (volume, route
                    root) so they survive unmount.
-  readonlyfs/      Strict, cacheless, non-mounting authority client used by the
-                   bounded files adapter.
   confinedfs/      The machine-local backing capability boundary: openat2 with
                    RESOLVE_IN_ROOT, failing closed where it is unavailable.
   fskitidentity/   The signed macOS identity tuple: app group, filesystem type,

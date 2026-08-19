@@ -37,6 +37,7 @@ type publicationCoordinateKind uint8
 const (
 	publicationItemAttributes publicationCoordinateKind = iota + 1
 	publicationItemData
+	publicationItemEnumeration
 	publicationNamespaceName
 )
 
@@ -90,6 +91,14 @@ type sourceNamespaceSpec struct {
 	data       bool
 }
 
+// sourcePublicationGate is daemon-local admission state. Protocol 6 derives
+// authority coordinates from the mutation itself; this footprint is never
+// serialized and exists only to close/drain this mount's local publications.
+type sourcePublicationGate struct {
+	items []sourceItemSpec
+	names []sourceNamespaceSpec
+}
+
 func sourceItem(item *authoritypb.Item, attributes, data bool) (sourceItemSpec, error) {
 	identity, ok := publicationIdentityFromItem(item)
 	if !ok || !attributes || data && !attributes {
@@ -112,10 +121,9 @@ func validSourceNamespaceName(name string) bool {
 		bytes.IndexByte(raw, 0) < 0 && bytes.IndexByte(raw, '/') < 0
 }
 
-// sourcePublicationGate canonicalizes an exact potential callback footprint.
-// Duplicate coordinates are merged before serialization; ITEM sorts before
-// NAMESPACE, then identities and raw Linux name bytes sort lexicographically.
-func sourcePublicationGate(items []sourceItemSpec, names []sourceNamespaceSpec) (*authoritypb.SourcePublicationGate, error) {
+// canonicalSourcePublicationGate canonicalizes an exact potential callback
+// footprint. Duplicate coordinates are merged before local admission.
+func canonicalSourcePublicationGate(items []sourceItemSpec, names []sourceNamespaceSpec) (*sourcePublicationGate, error) {
 	itemSet := make(map[publicationIdentity]sourceItemSpec, len(items))
 	for _, item := range items {
 		if item.identity == (publicationIdentity{}) || !item.attributes || item.data && !item.attributes {
@@ -159,28 +167,14 @@ func sourcePublicationGate(items []sourceItemSpec, names []sourceNamespaceSpec) 
 		}
 		return bytes.Compare([]byte(orderedNames[i].name), []byte(orderedNames[j].name)) < 0
 	})
-	gate := &authoritypb.SourcePublicationGate{Targets: make([]*authoritypb.SourcePublicationTarget, 0, len(orderedItems)+len(orderedNames))}
-	for _, item := range orderedItems {
-		gate.Targets = append(gate.Targets, &authoritypb.SourcePublicationTarget{Coordinate: &authoritypb.SourcePublicationTarget_Item{
-			Item: &authoritypb.SourcePublicationItem{Identity: append([]byte(nil), item.identity[:]...), Attributes: item.attributes, Data: item.data},
-		}})
-	}
-	for _, name := range orderedNames {
-		gate.Targets = append(gate.Targets, &authoritypb.SourcePublicationTarget{Coordinate: &authoritypb.SourcePublicationTarget_Namespace{
-			Namespace: &authoritypb.SourcePublicationNamespace{
-				ParentIdentity: append([]byte(nil), name.parent[:]...), Name: []byte(name.name),
-				BoundAttributes: name.attributes, BoundData: name.data,
-			},
-		}})
-	}
-	return gate, nil
+	return &sourcePublicationGate{items: orderedItems, names: orderedNames}, nil
 }
 
-func exactSourceGate(items []sourceItemSpec, names []sourceNamespaceSpec) (*authoritypb.SourcePublicationGate, error) {
-	return sourcePublicationGate(items, names)
+func exactSourceGate(items []sourceItemSpec, names []sourceNamespaceSpec) (*sourcePublicationGate, error) {
+	return canonicalSourcePublicationGate(items, names)
 }
 
-func itemSourceGate(item *authoritypb.Item, data bool) (*authoritypb.SourcePublicationGate, error) {
+func itemSourceGate(item *authoritypb.Item, data bool) (*sourcePublicationGate, error) {
 	target, err := sourceItem(item, true, data)
 	if err != nil {
 		return nil, err
@@ -188,7 +182,7 @@ func itemSourceGate(item *authoritypb.Item, data bool) (*authoritypb.SourcePubli
 	return exactSourceGate([]sourceItemSpec{target}, nil)
 }
 
-func namespaceSourceGate(parent *authoritypb.Item, name string, boundData bool, additionalItems ...*authoritypb.Item) (*authoritypb.SourcePublicationGate, error) {
+func namespaceSourceGate(parent *authoritypb.Item, name string, boundData bool, additionalItems ...*authoritypb.Item) (*sourcePublicationGate, error) {
 	namespace, err := sourceNamespace(parent, name, true, boundData)
 	if err != nil {
 		return nil, err
@@ -208,7 +202,7 @@ func namespaceSourceGate(parent *authoritypb.Item, name string, boundData bool, 
 	return exactSourceGate(items, []sourceNamespaceSpec{namespace})
 }
 
-func renameSourceGate(oldParent *authoritypb.Item, oldName string, newParent *authoritypb.Item, newName string) (*authoritypb.SourcePublicationGate, error) {
+func renameSourceGate(oldParent *authoritypb.Item, oldName string, newParent *authoritypb.Item, newName string) (*sourcePublicationGate, error) {
 	oldNamespace, err := sourceNamespace(oldParent, oldName, true, false)
 	if err != nil {
 		return nil, err
@@ -228,172 +222,35 @@ func renameSourceGate(oldParent *authoritypb.Item, oldName string, newParent *au
 	return exactSourceGate([]sourceItemSpec{oldItem, newItem}, []sourceNamespaceSpec{oldNamespace, newNamespace})
 }
 
-func coordinatesForSourceGate(gate *authoritypb.SourcePublicationGate) (map[publicationCoordinate]struct{}, map[publicationNamespace]namespaceBounds, error) {
-	if gate == nil || len(gate.GetTargets()) == 0 {
+func coordinatesForSourceGate(gate *sourcePublicationGate) (map[publicationCoordinate]struct{}, map[publicationNamespace]namespaceBounds, error) {
+	if gate == nil || len(gate.items)+len(gate.names) == 0 {
 		return nil, nil, errors.New("fusev3: source publication gate is missing")
 	}
-	coordinates := make(map[publicationCoordinate]struct{}, len(gate.GetTargets())*2)
+	coordinates := make(map[publicationCoordinate]struct{}, (len(gate.items)+len(gate.names))*2)
 	names := make(map[publicationNamespace]namespaceBounds)
-	for _, target := range gate.GetTargets() {
-		switch {
-		case target.GetItem() != nil:
-			item := target.GetItem()
-			var identity publicationIdentity
-			if len(item.GetIdentity()) != len(identity) || !item.GetAttributes() || item.GetData() && !item.GetAttributes() {
-				return nil, nil, errors.New("fusev3: malformed item source publication target")
-			}
-			copy(identity[:], item.GetIdentity())
-			if identity == (publicationIdentity{}) {
-				return nil, nil, errors.New("fusev3: zero item source publication identity")
-			}
-			coordinates[publicationCoordinate{kind: publicationItemAttributes, item: identity}] = struct{}{}
-			if item.GetData() {
-				coordinates[publicationCoordinate{kind: publicationItemData, item: identity}] = struct{}{}
-			}
-		case target.GetNamespace() != nil:
-			namespace := target.GetNamespace()
-			var parent publicationIdentity
-			if len(namespace.GetParentIdentity()) != len(parent) || !validSourceNamespaceName(string(namespace.GetName())) || namespace.GetBoundData() && !namespace.GetBoundAttributes() {
-				return nil, nil, errors.New("fusev3: malformed namespace source publication target")
-			}
-			copy(parent[:], namespace.GetParentIdentity())
-			if parent == (publicationIdentity{}) {
-				return nil, nil, errors.New("fusev3: zero namespace source publication parent identity")
-			}
-			name := publicationNamespace{parent: parent, name: string(namespace.GetName())}
-			coordinates[publicationCoordinate{kind: publicationNamespaceName, parent: parent, name: name.name}] = struct{}{}
-			names[name] = namespaceBounds{attributes: namespace.GetBoundAttributes(), data: namespace.GetBoundData()}
-		default:
-			return nil, nil, errors.New("fusev3: source publication target carried no coordinate")
+	for _, item := range gate.items {
+		if item.identity == (publicationIdentity{}) || !item.attributes || item.data && !item.attributes {
+			return nil, nil, errors.New("fusev3: malformed item source publication target")
 		}
+		coordinates[publicationCoordinate{kind: publicationItemAttributes, item: item.identity}] = struct{}{}
+		if item.data {
+			coordinates[publicationCoordinate{kind: publicationItemData, item: item.identity}] = struct{}{}
+		}
+	}
+	for _, namespace := range gate.names {
+		if namespace.parent == (publicationIdentity{}) || !validSourceNamespaceName(namespace.name) || namespace.data && !namespace.attributes {
+			return nil, nil, errors.New("fusev3: malformed namespace source publication target")
+		}
+		name := publicationNamespace{parent: namespace.parent, name: namespace.name}
+		coordinates[publicationCoordinate{kind: publicationNamespaceName, parent: namespace.parent, name: namespace.name}] = struct{}{}
+		names[name] = namespaceBounds{attributes: namespace.attributes, data: namespace.data}
 	}
 	return coordinates, names, nil
-}
-
-func coordinatesForVisibilityTargets(targets []*authoritypb.VisibilityTarget) (map[publicationCoordinate]struct{}, error) {
-	if len(targets) == 0 {
-		return nil, errors.New("fusev3: peer filesystem phase has no publication targets")
-	}
-	coordinates := make(map[publicationCoordinate]struct{}, len(targets)*2)
-	for _, target := range targets {
-		switch target.GetScope() {
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:
-			var parent publicationIdentity
-			if len(target.GetParentIdentity()) != len(parent) || len(target.GetName()) == 0 {
-				return nil, errors.New("fusev3: peer namespace target has no stable publication coordinate")
-			}
-			copy(parent[:], target.GetParentIdentity())
-			coordinates[publicationCoordinate{kind: publicationNamespaceName, parent: parent, name: string(target.GetName())}] = struct{}{}
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_ATTRIBUTES, authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA:
-			var identity publicationIdentity
-			if len(target.GetIdentity()) != len(identity) {
-				return nil, errors.New("fusev3: peer item target has no stable publication coordinate")
-			}
-			copy(identity[:], target.GetIdentity())
-			coordinates[publicationCoordinate{kind: publicationItemAttributes, item: identity}] = struct{}{}
-			if target.GetScope() == authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA {
-				coordinates[publicationCoordinate{kind: publicationItemData, item: identity}] = struct{}{}
-			}
-		default:
-			return nil, errors.New("fusev3: peer target has no publication scope")
-		}
-	}
-	return coordinates, nil
-}
-
-func (r *rawFileSystem) peerPublicationOverlapLocked(coordinates map[publicationCoordinate]struct{}) bool {
-	return r.sourceLeaseOverlapLocked(coordinates, nil) || r.unresolvedSourceOverlapLocked(coordinates, nil)
-}
-
-// acquirePeerPublication linearizes a peer PREPARE with both source gates and
-// ordinary cached-reply admission. The peer cut is installed first. Existing
-// source owners drain through it. A later source yields before assignment and
-// receives one authority-sequenced internal retry after the exact peer repair.
-// Namespace and inode coordinates use the same FIFO rule because strict Linux
-// namespace expiration takes no parent inode lock.
-func (r *rawFileSystem) acquirePeerPublication(ctx context.Context, targets []*authoritypb.VisibilityTarget, keys visibilityKeys) error {
-	coordinates, err := coordinatesForVisibilityTargets(targets)
-	if err != nil {
-		return err
-	}
-	r.mu.Lock()
-	if len(r.peerHeldPhase) != 0 {
-		r.mu.Unlock()
-		return errors.New("fusev3: peer publication phase overlapped an unreleased prior phase")
-	}
-	r.peerHeldPhase = make([]publicationCoordinate, 0, len(coordinates))
-	for coordinate := range coordinates {
-		r.peerHolds[coordinate]++
-		r.peerHeldPhase = append(r.peerHeldPhase, coordinate)
-	}
-	for _, key := range keys.names {
-		r.heldNames[key] = struct{}{}
-	}
-	for _, inode := range keys.inodes {
-		r.heldInodes[inode.inode] = struct{}{}
-	}
-	r.heldPhase = keys
-	r.signalSourceChangedLocked()
-	r.mu.Unlock()
-
-	for {
-		r.mu.Lock()
-		if !r.peerPublicationOverlapLocked(coordinates) {
-			r.mu.Unlock()
-			return nil
-		}
-		changed := r.sourceChanged
-		r.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			// Keep the cut closed. A PREPARE whose transport/context ended while
-			// an earlier source publication was unresolved cannot safely reopen;
-			// the coherence loop terminalizes this mount.
-			return fmt.Errorf("fusev3: peer PREPARE waited for source publication cut: %w", ctx.Err())
-		}
-	}
-}
-
-func (r *rawFileSystem) releasePeerPublicationLocked() {
-	for _, coordinate := range r.peerHeldPhase {
-		if r.peerHolds[coordinate]--; r.peerHolds[coordinate] <= 0 {
-			delete(r.peerHolds, coordinate)
-		}
-	}
-	r.peerHeldPhase = nil
-	r.signalSourceChangedLocked()
 }
 
 func (r *rawFileSystem) signalSourceChangedLocked() {
 	close(r.sourceChanged)
 	r.sourceChanged = make(chan struct{})
-}
-
-// waitForVisibilityCompletion joins a mutation retry to the exact
-// peer repair which caused it. The sequence is authority-assigned and globally
-// monotonic for the volume. Waiting on the local completion counter makes the
-// independent DATA and CONTROL lanes deterministic without polling or retry
-// backoff; a repair that completed before the retry response arrived satisfies
-// the wait immediately.
-func (r *rawFileSystem) waitForVisibilityCompletion(ctx context.Context, sequence uint64) error {
-	if sequence == 0 {
-		return errors.New("fusev3: visibility retry carried no sequence")
-	}
-	for {
-		r.mu.Lock()
-		if r.completedVisibilitySequence >= sequence {
-			r.mu.Unlock()
-			return nil
-		}
-		changed := r.sourceChanged
-		r.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return fmt.Errorf("fusev3: wait for visibility sequence %d: %w", sequence, ctx.Err())
-		}
-	}
 }
 
 func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
@@ -405,9 +262,25 @@ func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoor
 	return false
 }
 
-func (r *rawFileSystem) peerPublicationHeldLocked(coordinates map[publicationCoordinate]struct{}) bool {
+func (r *rawFileSystem) leaseRecallHeldLocked(coordinates map[publicationCoordinate]struct{}) bool {
 	for coordinate := range coordinates {
-		if r.peerHolds[coordinate] != 0 {
+		if r.repairingCoordinates[coordinate] {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *rawFileSystem) leaseRecallOverlapsUnresolvedLocked(attributes, data int) bool {
+	if attributes == 0 && data == 0 {
+		return false
+	}
+	for coordinate, held := range r.repairingCoordinates {
+		if !held {
+			continue
+		}
+		if attributes != 0 && coordinate.kind == publicationItemAttributes ||
+			data != 0 && coordinate.kind == publicationItemData {
 			return true
 		}
 	}
@@ -455,22 +328,6 @@ func (r *rawFileSystem) unresolvedGateOverlapsSourceHoldsLocked(attributes, data
 	return false
 }
 
-func (r *rawFileSystem) peerOverlapUnresolvedLocked(attributes, data int) bool {
-	if attributes == 0 && data == 0 {
-		return false
-	}
-	for coordinate, held := range r.peerHolds {
-		if held == 0 {
-			continue
-		}
-		if (attributes != 0 && coordinate.kind == publicationItemAttributes) ||
-			(data != 0 && coordinate.kind == publicationItemData) {
-			return true
-		}
-	}
-	return false
-}
-
 func addBoundCoordinates(coordinates map[publicationCoordinate]struct{}, identity publicationIdentity, bounds namespaceBounds) {
 	if identity == (publicationIdentity{}) {
 		return
@@ -494,7 +351,7 @@ func (r *rawFileSystem) supersedableNegativePublicationLocked(publication *negat
 	}
 	reply := publication.reply
 	if reply.owner != owner.r || !reply.originalWrote || !reply.originalStatus.Ok() || reply.source != nil ||
-		len(reply.attrs) != 0 || len(reply.data) != 0 || reply.writeKernelTx != 0 || reply.writeHandle != nil || len(reply.names) == 0 {
+		len(reply.attrs) != 0 || len(reply.data) != 0 || len(reply.names) == 0 {
 		return false
 	}
 	for _, name := range reply.names {
@@ -547,7 +404,7 @@ func (r *rawFileSystem) sourcePublicationsBusyLocked(coordinates map[publication
 // acquireSourcePublication closes every exact coordinate atomically, then
 // drains publication decisions made before the cut. It happens before replay
 // assignment, so an acquisition failure cannot have reached the authority.
-func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *authoritypb.SourcePublicationGate) (*sourcePublicationLease, error) {
+func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sourcePublicationGate) (*sourcePublicationLease, error) {
 	base, names, err := coordinatesForSourceGate(gate)
 	if err != nil {
 		return nil, err
@@ -578,7 +435,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *auth
 		// lock, so every source gate can wait behind an older peer publication.
 		// This is an internal scheduling boundary: no synthetic EINTR escapes to
 		// applications for either namespace or inode mutations.
-		if r.peerPublicationHeldLocked(coordinates) || r.peerOverlapUnresolvedLocked(lease.unresolvedAttributes, lease.unresolvedData) {
+		if r.leaseRecallHeldLocked(coordinates) || r.leaseRecallOverlapsUnresolvedLocked(lease.unresolvedAttributes, lease.unresolvedData) {
 			changed := r.sourceChanged
 			r.mu.Unlock()
 			select {
@@ -869,6 +726,16 @@ func (l *sourcePublicationLease) hasUnresolvedBinding() bool {
 	return l.unresolvedAttributes != 0 || l.unresolvedData != 0
 }
 
+func (l *sourcePublicationLease) preBinding(namespace publicationNamespace) (publicationIdentity, bool) {
+	if l == nil {
+		return publicationIdentity{}, false
+	}
+	l.r.mu.Lock()
+	defer l.r.mu.Unlock()
+	identity, ok := l.preBindings[namespace]
+	return identity, ok
+}
+
 func (l *sourcePublicationLease) attachRename(ctx context.Context, oldName, newName publicationNamespace, newPost publicationIdentity, oldPost *publicationIdentity) error {
 	if l == nil {
 		return nil
@@ -899,10 +766,9 @@ func (l *sourcePublicationLease) revoke() {
 	l.r.mu.Lock()
 	l.revoked = true
 	// Revocation is a terminal fail-closed transition, not a release. In
-	// particular, an unresolved namespace wildcard must keep excluding peer
-	// item PREPAREs until the authority fences this dead session; otherwise a
-	// late visibility phase could acknowledge through the same uncertainty
-	// which made the mutation terminal in the first place.
+	// particular, an unresolved namespace wildcard remains closed until the
+	// authority fences this dead session; reopening it would admit a local
+	// cache publication through the same uncertain mutation result.
 	l.r.signalSourceChangedLocked()
 	l.r.mu.Unlock()
 }

@@ -19,8 +19,8 @@ const (
 	OperationDetach
 	OperationCancel
 	OperationTerminalDeliveryReceipt
-	OperationNextVisibility
-	OperationAckVisibility
+	OperationNextFskitRepair
+	OperationAckFskitRepair
 	OperationApplyRoutes
 	OperationLookup
 	OperationGetAttr
@@ -35,11 +35,11 @@ const (
 	OperationOpen
 	OperationClose
 	OperationRead
-	OperationOneShotWrite
-	OperationWriteTransactionBegin
-	OperationWriteTransactionData
-	OperationWriteTransactionCommit
-	OperationWriteTransactionAbort
+	OperationWrite
+	OperationFskitWriteBegin
+	OperationFskitWriteData
+	OperationFskitWriteCommit
+	OperationFskitWriteAbort
 	OperationFallocate
 	OperationCopyFileRange
 	OperationTmpfile
@@ -60,9 +60,9 @@ const (
 
 var operationNames = [...]string{
 	"unknown", "hello", "attach", "resume", "activate", "abort_attach", "keep_alive", "reauthorize", "detach", "cancel",
-	"terminal_delivery_receipt", "next_visibility", "ack_visibility", "apply_routes", "lookup", "getattr", "setattr", "create",
-	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "one_shot_write", "write_transaction_begin",
-	"write_transaction_data", "write_transaction_commit", "write_transaction_abort", "fallocate", "copy_file_range", "tmpfile",
+	"terminal_delivery_receipt", "next_fskit_repair", "ack_fskit_repair", "apply_routes", "lookup", "getattr", "setattr", "create",
+	"mkdir", "unlink", "rename", "link", "symlink", "readlink", "open", "close", "read", "positioned_write", "fskit_write_begin",
+	"fskit_write_data", "fskit_write_commit", "fskit_write_abort", "fallocate", "copy_file_range", "tmpfile",
 	"fsync", "readdir", "reclaim", "flush", "getxattr", "setxattr", "listxattr", "removexattr", "statfs", "syncfs",
 	"getlock", "setlock",
 }
@@ -90,8 +90,8 @@ const (
 	OutcomeInternal
 	OutcomeCoherence
 	OutcomeRoutes
-	OutcomeVisibilityInterrupted
-	OutcomeVisibilityRetry
+	OutcomeFskitRepairInterrupted
+	OutcomeFskitRepairRetry
 	OutcomeIO
 	OutcomeOther
 	outcomeCount
@@ -99,7 +99,7 @@ const (
 
 var outcomeNames = [...]string{
 	"success", "not_found", "permission", "stale", "invalid", "saturation", "unsupported", "conflict", "canceled",
-	"storage", "internal", "coherence", "routes", "visibility_interrupted", "visibility_retry", "io", "other",
+	"storage", "internal", "coherence", "routes", "fskit_repair_interrupted", "fskit_repair_retry", "io", "other",
 }
 
 func (o Outcome) String() string {
@@ -112,17 +112,16 @@ func (o Outcome) String() string {
 type FenceReason uint8
 
 const (
-	FenceVisibilityLost FenceReason = iota
+	FenceFskitRepairLost FenceReason = iota
 	FenceRepairDeadline
-	FenceRoutesBlocked
 	FenceProtocolViolation
-	FenceWriteTransactionMismatch
+	FenceFskitWriteMismatch
 	FenceOther
 	fenceReasonCount
 )
 
 var fenceReasonNames = [...]string{
-	"visibility_lost", "repair_deadline", "routes_blocked", "protocol_violation", "write_transaction_mismatch", "other",
+	"fskit_repair_lost", "repair_deadline", "protocol_violation", "fskit_write_mismatch", "other",
 }
 
 type rpcSeries struct {
@@ -144,6 +143,8 @@ type Metrics struct {
 	writeStagedBytes     *Gauge
 	writeAdmissionBlocks *Counter
 	writeAdmissionWait   *Histogram
+	fsyncBarrierHandles  *Counter
+	fsyncStorageSyncs    *Counter
 	visibilityDuration   *Histogram
 	visibilityAudience   *Histogram
 	fences               [fenceReasonCount]*Counter
@@ -200,11 +201,11 @@ func New(volume string) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
-	metrics.writeTransactions, err = registry.RegisterGauge("portablefs_authority_write_transactions_active", "Currently admitted staged write transactions.", base)
+	metrics.writeTransactions, err = registry.RegisterGauge("portablefs_authority_write_transactions_active", "Currently admitted staged FSKit writes.", base)
 	if err != nil {
 		return nil, err
 	}
-	metrics.writeWaiting, err = registry.RegisterGauge("portablefs_authority_write_transactions_waiting", "Write transactions currently waiting in FIFO capacity admission.", base)
+	metrics.writeWaiting, err = registry.RegisterGauge("portablefs_authority_write_transactions_waiting", "FSKit writes currently waiting in FIFO staging admission.", base)
 	if err != nil {
 		return nil, err
 	}
@@ -212,11 +213,19 @@ func New(volume string) (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
-	metrics.writeAdmissionBlocks, err = registry.RegisterCounter("portablefs_authority_write_admission_blocks_total", "Write transactions that had to wait for staging capacity.", base)
+	metrics.writeAdmissionBlocks, err = registry.RegisterCounter("portablefs_authority_write_admission_blocks_total", "FSKit writes that had to wait for staging capacity.", base)
 	if err != nil {
 		return nil, err
 	}
-	metrics.writeAdmissionWait, err = registry.RegisterHistogram("portablefs_authority_write_admission_wait_seconds", "Time spent waiting in FIFO write-transaction capacity admission.", admissionDurationBuckets, base)
+	metrics.writeAdmissionWait, err = registry.RegisterHistogram("portablefs_authority_write_admission_wait_seconds", "Time spent waiting in FIFO FSKit-write staging admission.", admissionDurationBuckets, base)
+	if err != nil {
+		return nil, err
+	}
+	metrics.fsyncBarrierHandles, err = registry.RegisterCounter("portablefs_authority_fsync_barrier_handles_total", "Fsync barrier requests assigned to completed storage-sync batches.", base)
+	if err != nil {
+		return nil, err
+	}
+	metrics.fsyncStorageSyncs, err = registry.RegisterCounter("portablefs_authority_fsync_storage_syncs_total", "Completed storage sync syscalls serving fsync barrier batches.", base)
 	if err != nil {
 		return nil, err
 	}
@@ -313,6 +322,16 @@ func (m *Metrics) WriteAdmissionFinished(elapsed time.Duration) {
 	}
 	m.writeWaiting.Dec()
 	m.writeAdmissionWait.Observe(elapsed.Seconds())
+}
+
+// ObserveFsyncBatch records the two counters whose ratio is the group-commit
+// effectiveness: barrier handles per real storage sync.
+func (m *Metrics) ObserveFsyncBatch(handles int) {
+	if m == nil || handles <= 0 {
+		return
+	}
+	m.fsyncBarrierHandles.Add(uint64(handles))
+	m.fsyncStorageSyncs.Inc()
 }
 
 func (m *Metrics) ObserveVisibilityBarrier(elapsed time.Duration, audience int) {

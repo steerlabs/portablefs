@@ -122,11 +122,10 @@ type SessionCredential struct {
 }
 
 type MutationID struct {
-	Slot                         uint32
-	Sequence                     uint64
-	Fingerprint                  RequestFingerprint
-	FrontendOperationID          uint64
-	VisibilityRetryAfterSequence uint64
+	Slot                uint32
+	Sequence            uint64
+	Fingerprint         RequestFingerprint
+	FrontendOperationID uint64
 }
 
 // Outcome is the exact wire-ready result retained for a duplicate request.
@@ -258,6 +257,29 @@ func (a *Authority) AuthorizationDeadline(cred SessionCredential, attemptID Atta
 		return time.Time{}, ErrSessionFenced
 	}
 	return s.authorizationDeadline, nil
+}
+
+// ProvisionalAccess returns the signed access installed for one exact attach
+// attempt without making the provisional session executable. The protocol
+// handler uses it to reject a route-admin purpose unless the capability
+// explicitly carries volume-admin authority.
+func (a *Authority) ProvisionalAccess(cred SessionCredential, attemptID AttachAttemptID) (Access, error) {
+	if cred.Epoch != a.epoch {
+		return 0, ErrEpochMismatch
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	attempt := a.attempts[attemptID]
+	if attempt == nil || !attempt.complete || attempt.session == nil || attempt.credential.ID != cred.ID {
+		return 0, ErrSessionExpired
+	}
+	s := attempt.session
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !credentialMatchesSession(s, cred) {
+		return 0, ErrSessionFenced
+	}
+	return s.access, nil
 }
 
 // SessionUse pins runtime resources for one admitted operation. Ending a
@@ -416,7 +438,7 @@ func (a *Authority) purgeAttachAttemptsLocked(now time.Time) {
 	}
 }
 
-// PrepareAttach creates one non-executable session for an exact protocol-5
+// PrepareAttach creates one non-executable session for an exact protocol-6
 // attach attempt. Admission is reserved before authorize is called, so a full
 // authority neither spends a single-use capability nor starts unbounded work.
 // The attempt record is installed before the call and retained through its
@@ -881,8 +903,8 @@ func (a *Authority) notifySessionEnd(id SessionID) {
 
 // AttachActiveForTest creates an immediately active session solely for direct
 // tests of post-activation runtime behavior. Its explicit name prevents a
-// production handler from accidentally bypassing protocol 5's provisional
-// receipt proof and visibility-transactional activation boundary.
+// production handler from accidentally bypassing protocol 6's provisional
+// receipt proof and lifecycle-transactional activation boundary.
 func (a *Authority) AttachActiveForTest(slots uint32, peer PeerIdentity, authorization Authorization) (SessionCredential, error) {
 	if err := a.ValidateAttachSlots(slots); err != nil {
 		return SessionCredential{}, err

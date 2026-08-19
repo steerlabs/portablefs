@@ -24,14 +24,18 @@ code:
   (`vcs/internal/authorityrpc/volume_handler_linux.go`), which is
   `xfsstore.Volume.Fsync` (`vcs/internal/xfsstore/volume_linux.go`), which is
   `unix.Fdatasync` or `unix.Fsync` on the target descriptor.
-- A write transaction is different. Payload bytes are staged in a sealed
-  `memfd` and applied to the XFS inode with `sendfile`
-  (`vcs/internal/authorityrpc/write_transaction_linux.go`,
-  `xfsstore.writeTarget.CommitWrite`). The commit is acknowledged once that
-  apply has happened. Nothing has been fsynced at that point. The staging code
-  says so itself: "Staging was never fsynced, so anonymous memory does not
-  change write-through acknowledgement or the target descriptor's later fsync
-  durability barrier."
+- A write is different. A stock Linux `FUSE_WRITE` arrives in one frame and its
+  retained payload is applied to the XFS inode with a single `pwrite`, or a
+  single `pwritev2(RWF_APPEND)` when the authority is placing an append
+  (`vcs/internal/authorityrpc/write_linux.go`,
+  `xfsstore.writeTarget.CommitWriteData`). A multi-frame FSKit write instead
+  stages its payload in an unnamed `O_TMPFILE` inside the volume's write-staging
+  directory and applies it with `sendfile`, or by reading it back for an append
+  (`vcs/internal/authorityrpc/fskit_write_linux.go`,
+  `xfsstore.writeTarget.CommitWrite`). Either way the commit is acknowledged once
+  that apply has happened, and nothing has been fsynced at that point: staging is
+  never fsynced, so it changes neither write-through acknowledgement nor the
+  target descriptor's later fsync durability barrier.
 
 So an acknowledged write lives in the page cache, and a power cut discards the
 page cache. **The harness therefore asserts presence only for writes whose
@@ -108,14 +112,13 @@ nothing an `fsync` had already promised was lost. The kill lands at a different
 point in each round, at fixed delays rather than random ones - a harness whose
 coverage changes between runs cannot say what a green result covered.
 
-The strict-membership restart gate remains part of this instrument. Killing an
-authority cannot authenticate `Detach`, so the harness reaps the killed round's
-mount process, force-detaches its exact kernel mount, proves that mount absent,
-and only then starts the replacement with the audited
-`--prior-strict-mounts-fenced` operator assertion. Authority loss by itself is
-never treated as fencing evidence. The fresh liveness-probe mount then shuts
-down normally while the replacement authority is alive, which sends the
-authenticated `Detach` and leaves no active membership for the next round.
+The protocol-6 restart grace remains part of this instrument. Killing an
+authority loses its volatile lease table, so the harness reaps the killed
+round's mount process, detaches its stock FUSE mount, and proves it absent. The
+replacement authority must still hold the configured maximum-lease-plus-skew
+grace before conflicting mutation admission; process death alone is never
+treated as lease discharge. The fresh liveness-probe mount then shuts down
+normally while the replacement authority is alive and returns its leases.
 
 In practice an un-fsynced write usually still survives this instrument, because
 the page cache does. The harness records that as an observation and never as a
@@ -189,15 +192,10 @@ any `--- SKIP` at all, since `REQUIRED=1` should have made one impossible.
 | `TestFsyncedWritesSurvivePowerLoss` | no | **no** | yes |
 | `TestAuthorityKillDuringWritesKeepsFsyncedData` | no | **no** | yes |
 
-The two product-level instruments need a kernel that can carry a strict mount,
-and a strict mount pins exactly one FUSE protocol version. A Docker Desktop VM
-running Linux 6.8 offers FUSE 7.39 and the mount refuses it outright:
-
-```
-fusev3: strict coherence requires the pinned FUSE protocol 7.41 exactly; kernel offered 7.39
-```
-
-The harness reports that through the ordinary gate, so it is a named skip on a
+The two product-level instruments need a kernel that can carry a lease mount,
+which means stock FUSE protocol 7.31 or newer; a kernel below that floor is
+refused at FUSE INIT rather than served under a reduced profile. The harness
+reports the refusal through the ordinary gate, so it is a named skip on a
 developer machine and a hard failure in CI - never a quiet pass. Everything else
 about those two tests - the device stack, the provisioner, the authority start,
 the credential set, the mark channel, the teardown - has been exercised on a

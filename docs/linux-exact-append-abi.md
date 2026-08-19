@@ -1,9 +1,30 @@
-# PortableFS Linux 6.12.100 strict-coherence ABI
+# Historical: PortableFS Linux 6.12.100 strict-coherence ABI
 
-Status: implementation candidate, not a production-qualified kernel.
+Superseded by [PortableFS portable coherence](./portable-coherence.md).
+This document remains the protocol-5/FUSE-7.41 implementation record only; the
+intermediate private-kernel vNext design is retained in
+[vnext-protocol.md](./vnext-protocol.md).
 
-This document freezes the private FUSE dialect implemented by the patch series
-under `kernel/linux-6.12.100-portablefs-append/`.  Despite the historical file
+Status: **historical**. No part of this dialect is implemented, built, or
+required. It is retained as the dated record of what a private kernel was going
+to be asked for, and nothing here is an open request.
+
+What actually shipped instead: append is exact on a stock kernel, with placement
+resolved by the authority at the object's true EOF under its per-inode writer
+stripe (`docs/portable-coherence.md` §4.3). The whole private write/publish/notify
+profile below was not needed for it.
+
+The remaining upstream ask is correspondingly narrow and is no longer a blocker:
+**forward `IOCB_APPEND` and `IOCB_NOAPPEND` in `fuse_write_in.flags`.** With
+those two bits the frontend would read the per-call placement intent directly
+rather than seeing only the description's `O_APPEND`, which would
+delete the kernel-size shadow, delete the stale-size EIO refusal, and let the
+kernel apply `RLIMIT_FSIZE` against the offset the write actually used. No new
+opcode, reply field, or capability bit is involved.
+
+This document freezes the private FUSE dialect that was implemented by the
+`kernel/linux-6.12.100-portablefs-append/` patch series, which is no longer in
+the tree and survives only in git history.  Despite the historical file
 name, the design is no longer append-only.  It covers transactional shared-file
 writes, exact cache publication, range mutation, copy-file-range, namespace
 publication, and shared/local graft classification as one indivisible profile.
@@ -43,14 +64,15 @@ SHARED open flags or the write shape after the mount is live. The kernel accepts
 the profile only when all of the following are true:
 
 - all three private capability bits are returned;
-- the returned protocol version is exactly 7.41;
+- the returned protocol version is exactly 7.42;
 - the mount uses `default_permissions`;
 - `FUSE_ATOMIC_O_TRUNC`, `FUSE_HANDLE_KILLPRIV_V2`, `FUSE_POSIX_LOCKS`, and
   `FUSE_FLOCK_LOCKS` are returned;
 - transport is `/dev/fuse`, not virtio-fs;
 - `FUSE_WRITEBACK_CACHE`, `FUSE_DIRECT_IO_ALLOW_MMAP`, inode DAX, export
-  support, submounts, zero-message OPEN/OPENDIR, READDIRPLUS, passthrough, and
-  RESEND are absent; and
+  support, submounts, zero-message OPEN/OPENDIR, automatic READDIRPLUS,
+  passthrough, and RESEND are absent. Explicit READDIRPLUS is admitted because
+  its strict records carry exact cache stamps and join generic PUBLISH; and
 - `FUSE_POSIX_ACL` is absent.  ACL caching happens outside the inner GETXATTR
   reply boundary and therefore requires a future dedicated post-cache
   publication hook before it can be admitted safely; and
@@ -274,8 +296,8 @@ ONE_SHOT.
 BEGIN and DATA do not acquire the source visibility gate and cannot expose
 partial data.  COMMIT acquires the source gate only after prior peer phases have
 drained, performs one PREPARE/apply/COMPLETE authority mutation, and retains the
-gate through generic PUBLISH.  This avoids holding the peer FIFO during large
-payload upload.
+gate through generic PUBLISH. This avoids holding the inode dependency and a
+participant's ordered visibility lane during large payload upload.
 
 The kernel fragments one Linux `write_iter` without splitting its authority
 mutation.  DATA replay at an already staged offset must match byte-for-byte.
@@ -490,10 +512,11 @@ the source gate waiting for `inode_lock`.
 ### Why source SETATTR/O_TRUNC needs no new sequence in its stock reply
 
 All lower overlapping peer COMPLETE notifications are physically applied and
-ACKed before the source receives the visibility FIFO.  Every later overlapping
-peer PREPARE waits behind the retained source gate until generic PUBLISH and has
-a higher sequence.  Therefore no legal lower notification can arrive after the
-source kernel update.  The next legal DATA notification is higher and applies.
+ACKed before the source acquires its inode dependency. Every later overlapping
+peer PREPARE waits behind the retained source gate and inode key until generic
+PUBLISH, and has a higher sequence. Therefore no legal lower notification can
+arrive after the source kernel update. The next legal DATA notification is
+higher and applies.
 Transactional PFS_WRITE still carries its exact sequence because its private
 COMMIT directly updates the sequence-tracked local state.
 
@@ -631,7 +654,9 @@ Current deliberate kernel-boundary decisions are:
 - LSEEK: pre-dispatch EOPNOTSUPP;
 - POLL/epoll on regular files: local `DEFAULT_POLLMASK`, no request;
 - ACCESS: handled by required `default_permissions`;
-- STATX and READDIRPLUS: invariant-unreachable in strict mode;
+- STATX: invariant-unreachable in strict mode;
+- READDIRPLUS: explicit stamped records only; automatic selection remains
+  disabled;
 - SETXATTR and SHARED ioctl/fileattr mutation: pre-dispatch EOPNOTSUPP;
 - SYNCFS: mandatory real opcode 50; ordinary durability errno propagates,
   ENOSYS/protocol/transport failure fences.
@@ -660,12 +685,13 @@ re-enabling a stock bypass.
 
 ## Lock/order proof
 
-The daemon's coordinate admission/FIFO is the distributed serialization lock.
-BEGIN/DATA are inert and hold no FIFO. COMMIT and ONE_SHOT obtain the FIFO after
-older peer COMPLETEs, apply once, and retain it. Kernel postprocessing uses the
-per-inode publication mutex and mapping invalidate lock, not `inode_lock`.
-PUBLISH ACK then releases the FIFO.  A newer peer PREPARE cannot enter before
-that ACK.
+The authority's stable-inode dependency key and the daemon's matching
+per-inode publication mutex are the distributed serialization lock. BEGIN/DATA
+are inert and own no mutation key. COMMIT and ONE_SHOT acquire the inode key
+after older overlapping peer COMPLETEs, apply once, and retain it. Kernel
+postprocessing uses the publication mutex and mapping invalidate lock, not
+`inode_lock`. PUBLISH ACK then releases the source gate. A newer PREPARE for the
+same inode cannot enter before that ACK; a disjoint inode is independent.
 
 No synchronous PUBLISH is sent from a FUSE async completion callback; that
 would deadlock the daemon writer's reply mutex.  Strict transactional write is

@@ -18,12 +18,11 @@ const sdk27QualificationStamp = "sdk27-live-qualification-only"
 var nativeFSKitPolicyQualification = ""
 
 // fskitCachePolicyForProductVersion selects the exact cache contract an FSKit
-// mount declares to portablefsd and the authority. macOS 26 uses the bounded
-// synchronous-VFS-repair policy: it preserves protocol-5 ordering and fences
-// on repair failure, but FSKit does not expose complete source-result or peer
-// cache-invalidation primitives, so it is explicitly a best-effort cache tier
-// rather than the Linux strict-cache contract. The separately signed macOS 27
-// lane remains qualification-only until its native policy is product-ready.
+// mount declares to portablefsd and the authority. macOS 26 and ordinary
+// macOS 27 builds use the bounded synchronous-VFS-repair policy. The separately
+// signed SDK-27 lane selects native revocation only when its exact build stamp
+// proves that the matching adapter is present; OS version alone never selects
+// an implementation the installed extension may not contain.
 func fskitCachePolicyForProductVersion(
 	productVersion string,
 	nativeQualification string,
@@ -37,10 +36,10 @@ func fskitCachePolicyForProductVersion(
 	case 26:
 		return portablefsd.V3CachePolicyMacOS26, nil
 	case 27:
-		if nativeQualification != sdk27QualificationStamp {
-			return "", fmt.Errorf("macOS 27 FSKit cannot mount PortableFS protocol 5 in production: FSKit exposes no exact peer namespace or attribute invalidation; no authority attach was attempted")
+		if nativeQualification == sdk27QualificationStamp {
+			return portablefsd.V3CachePolicyFSKit, nil
 		}
-		return portablefsd.V3CachePolicyFSKit, nil
+		return portablefsd.V3CachePolicyMacOS26, nil
 	default:
 		return "", fmt.Errorf("macOS %s has no qualified PortableFS FSKit cache policy in this build", productVersion)
 	}

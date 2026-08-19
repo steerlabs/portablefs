@@ -16,7 +16,7 @@ const (
 	transportRequestControl
 )
 
-// classifyTransportRequest is the one protocol-5 role allowlist. New request
+// classifyTransportRequest is the one protocol-6 role allowlist. New request
 // bodies fail closed until they are assigned deliberately; neither the client
 // nor server may infer a role from traffic size or current load.
 func classifyTransportRequest(request *authoritypb.Request) (transportRequestClass, error) {
@@ -35,8 +35,8 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		*authoritypb.Request_Rename, *authoritypb.Request_Link,
 		*authoritypb.Request_Symlink, *authoritypb.Request_Readlink,
 		*authoritypb.Request_Open, *authoritypb.Request_Close,
-		*authoritypb.Request_Read, *authoritypb.Request_WriteTransaction,
-		*authoritypb.Request_OneShotWrite,
+		*authoritypb.Request_Read, *authoritypb.Request_Write,
+		*authoritypb.Request_FskitWrite,
 		*authoritypb.Request_Fallocate, *authoritypb.Request_CopyFileRange,
 		*authoritypb.Request_Tmpfile,
 		*authoritypb.Request_Fsync, *authoritypb.Request_ReadDir,
@@ -49,7 +49,10 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		return transportRequestData, nil
 	case *authoritypb.Request_Activate, *authoritypb.Request_AbortAttach,
 		*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
-		*authoritypb.Request_NextVisibility, *authoritypb.Request_AckVisibility,
+		*authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent,
+		*authoritypb.Request_RenewLeases,
+		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
+		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
 		*authoritypb.Request_Reauthorize, *authoritypb.Request_TerminalDeliveryReceipt:
 		return transportRequestControl, nil
 	default:

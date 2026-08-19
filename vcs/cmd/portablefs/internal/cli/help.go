@@ -39,7 +39,7 @@ MOUNTS (this machine)
   route <path>                 is this path machine-local or shared, and by which rule
   prune-local                  reclaim machine-local backing no route can reach
   daemon stop                  stop an idle daemon (Linux; host-owned update only on macOS)
-  mount-check                  inspect mount prerequisites (no network or mutation)
+  mount-check                  inspect mount prerequisites (--probe-mount really mounts)
 
 THIS MACHINE
   doctor                       health check (transport, extension, daemon, mounts)
@@ -194,8 +194,10 @@ There is no PortableFS-managed or offline write-back layer. Linux direct-I/O
 write(2) returns after the authority has applied the bytes to XFS. On macOS,
 ordinary kernel page-cache writeback still applies: write(2) may return before
 FSKit sends the write, while fsync/synchronize waits through the authority's
-server descriptor. Protocol 5 has one coherence contract: names and attributes
-are cached and repaired through the authority's synchronous visibility barrier.
+server descriptor. Protocol 6 fixes one frontend profile for the whole session
+at attach. A Linux mount holds exact N/A/D/E cache leases and discharges every
+recall before the mutating peer's reply; a macOS FSKit mount runs the
+synchronous-repair stream instead and never receives cache leases.
 --coherence may only be strict; legacy uncached mounts are rejected. Linux
 implements the exact strict-cache contract. macOS 26 declares the named
 macos26-synchronous-vfs-repair-v2 best-effort cache tier: authority ordering,
@@ -304,7 +306,7 @@ with the engine's own sentence in statusDetail. Revocation is terminal: run
 portablefs umount on the path and mount again.
 `,
 		"mount-check": `USAGE
-  portablefs mount-check [--strategy auto|fskit|fuse] [--json]
+  portablefs mount-check [--strategy auto|fskit|fuse] [--probe-mount] [--json]
 
 Inspect the current host's mount transport without contacting a server,
 starting a daemon, or changing the machine. Transport selection is
@@ -317,6 +319,18 @@ deterministic: FSKit on macOS and FUSE on Linux. The result is one of:
 Installed helpers, capabilities, app bundles, and PlugInKit inventory are
 evidence, never proof. JSON output carries stable issue codes for installers
 and other automation. BLOCKED exits 1; VERIFIED and UNVERIFIED exit 0.
+
+--probe-mount is the one exception to "changes nothing". On Linux it installs
+one real FUSE mount on a private temporary directory, completes the kernel
+INIT handshake with this binary's own mount options, checks the same kernel
+guarantees a live mount requires, and unmounts. That is the only check here
+that can fail for a client which can never complete FUSE INIT — every other
+signal (the device node, opening it, CAP_SYS_ADMIN, an installed helper) is
+equally satisfied by such a client. It contacts no authority and serves no
+file, so it proves nothing about the wire protocol or coherence. JSON output
+adds a kernelProbe object with the negotiated protocol version and the
+capability flags the kernel offered. It is refused for the fskit transport,
+whose mount is installed by the system extension.
 `,
 		"doctor": `USAGE
   portablefs doctor [--profile name] [--json]

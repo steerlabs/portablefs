@@ -80,7 +80,7 @@ type DirEntryList struct {
 func NewDirEntryList(data []byte, off uint64) *DirEntryList {
 	return &DirEntryList{
 		buf:    data[:0],
-		size:   len(data),
+		size:   cap(data),
 		Offset: off,
 	}
 }

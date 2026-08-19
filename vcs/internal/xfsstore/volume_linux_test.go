@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -31,6 +32,224 @@ func openTestVolume(t *testing.T) *Volume {
 		}
 	})
 	return v
+}
+
+type fsyncTestResult struct {
+	batch int
+	err   error
+}
+
+func fsyncTestHandle(t *testing.T) (*Volume, Capability, *inodeFsyncState) {
+	t.Helper()
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "fsync-group", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := v.CloseOpen(handle); err != nil && !errors.Is(err, ErrClosed) {
+			t.Errorf("CloseOpen: %v", err)
+		}
+	})
+	opened, err := v.holdOpen(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := opened.fsyncState
+	opened.release()
+	return v, handle, state
+}
+
+func waitFsyncPending(t *testing.T, state *inodeFsyncState, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		state.mu.Lock()
+		got := len(state.pending)
+		state.mu.Unlock()
+		if got == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("fsync pending batch did not reach %d waiters", want)
+}
+
+func requireFsyncBlocked(t *testing.T, result <-chan fsyncTestResult, what string) {
+	t.Helper()
+	select {
+	case got := <-result:
+		t.Fatalf("%s returned before its covering sync completed: %+v", what, got)
+	case <-time.After(25 * time.Millisecond):
+	}
+}
+
+func TestFsyncCoalescesArrivalsIntoTheNextCompletedBatch(t *testing.T) {
+	v, handle, state := fsyncTestHandle(t)
+	started := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var calls atomic.Int32
+	v.fdatasync = func(int) error {
+		call := int(calls.Add(1)) - 1
+		if call >= len(started) {
+			return syscall.EIO
+		}
+		close(started[call])
+		<-release[call]
+		return nil
+	}
+
+	first := make(chan fsyncTestResult, 1)
+	go func() {
+		batch, err := v.FsyncCoalesced(handle, true)
+		first <- fsyncTestResult{batch: batch, err: err}
+	}()
+	<-started[0]
+
+	const followers = 4
+	results := make(chan fsyncTestResult, followers)
+	for range followers {
+		go func() {
+			batch, err := v.FsyncCoalesced(handle, true)
+			results <- fsyncTestResult{batch: batch, err: err}
+		}()
+	}
+	waitFsyncPending(t, state, followers)
+	requireFsyncBlocked(t, results, "follower")
+	close(release[0])
+	<-started[1]
+	if got := <-first; got.err != nil || got.batch != 1 {
+		t.Fatalf("first fsync = %+v, want one-handle batch", got)
+	}
+	requireFsyncBlocked(t, results, "next-batch follower")
+	close(release[1])
+
+	batchLeaders := 0
+	for range followers {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if got.batch != 0 {
+			batchLeaders++
+			if got.batch != followers {
+				t.Fatalf("coalesced batch size = %d, want %d", got.batch, followers)
+			}
+		}
+	}
+	if batchLeaders != 1 || calls.Load() != 2 {
+		t.Fatalf("batch leaders=%d storage syncs=%d, want 1 and 2", batchLeaders, calls.Load())
+	}
+}
+
+func TestFsyncFullClassIsNeverCoveredByFdatasync(t *testing.T) {
+	v, handle, state := fsyncTestHandle(t)
+	dataStarted, dataRelease := make(chan struct{}), make(chan struct{})
+	fullStarted, fullRelease := make(chan struct{}), make(chan struct{})
+	var dataCalls, fullCalls atomic.Int32
+	v.fdatasync = func(int) error {
+		dataCalls.Add(1)
+		close(dataStarted)
+		<-dataRelease
+		return nil
+	}
+	v.fsync = func(int) error {
+		fullCalls.Add(1)
+		close(fullStarted)
+		<-fullRelease
+		return nil
+	}
+
+	first := make(chan fsyncTestResult, 1)
+	go func() {
+		batch, err := v.FsyncCoalesced(handle, true)
+		first <- fsyncTestResult{batch: batch, err: err}
+	}()
+	<-dataStarted
+	pending := make(chan fsyncTestResult, 2)
+	go func() {
+		batch, err := v.FsyncCoalesced(handle, false)
+		pending <- fsyncTestResult{batch: batch, err: err}
+	}()
+	go func() {
+		batch, err := v.FsyncCoalesced(handle, true)
+		pending <- fsyncTestResult{batch: batch, err: err}
+	}()
+	waitFsyncPending(t, state, 2)
+	close(dataRelease)
+	<-fullStarted
+	if got := <-first; got.err != nil {
+		t.Fatal(got.err)
+	}
+	requireFsyncBlocked(t, pending, "full-class batch")
+	if dataCalls.Load() != 1 || fullCalls.Load() != 1 {
+		t.Fatalf("sync classes = fdatasync:%d fsync:%d, want 1/1", dataCalls.Load(), fullCalls.Load())
+	}
+	close(fullRelease)
+	for range 2 {
+		if got := <-pending; got.err != nil {
+			t.Fatal(got.err)
+		}
+	}
+}
+
+func TestFsyncGenerationAppliedDuringFlightRequiresNextSync(t *testing.T) {
+	v, handle, state := fsyncTestHandle(t)
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	started := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	release := [2]chan struct{}{make(chan struct{}), make(chan struct{})}
+	var calls atomic.Int32
+	v.fdatasync = func(int) error {
+		call := int(calls.Add(1)) - 1
+		close(started[call])
+		<-release[call]
+		return nil
+	}
+
+	first := make(chan fsyncTestResult, 1)
+	go func() {
+		batch, err := v.FsyncCoalesced(handle, true)
+		first <- fsyncTestResult{batch: batch, err: err}
+	}()
+	<-started[0]
+	if committed, _, _, err := target.CommitWriteData([]byte{'x'}, WriteCommit{
+		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: WritePositioned,
+	}); err != nil || committed != 1 {
+		t.Fatalf("CommitWriteData = (%d, %v)", committed, err)
+	}
+
+	second := make(chan fsyncTestResult, 1)
+	go func() {
+		batch, err := v.FsyncCoalesced(handle, true)
+		second <- fsyncTestResult{batch: batch, err: err}
+	}()
+	waitFsyncPending(t, state, 1)
+	state.mu.Lock()
+	applied := state.appliedGeneration
+	required := state.pending[0].requiredGeneration
+	state.mu.Unlock()
+	if applied != 1 || required != applied {
+		t.Fatalf("generation applied=%d required=%d, want 1/1", applied, required)
+	}
+	close(release[0])
+	<-started[1]
+	if got := <-first; got.err != nil {
+		t.Fatal(got.err)
+	}
+	requireFsyncBlocked(t, second, "post-write barrier")
+	close(release[1])
+	if got := <-second; got.err != nil || got.batch != 1 {
+		t.Fatalf("post-write fsync = %+v", got)
+	}
 }
 
 func writeCommitStage(t testing.TB, data []byte) *os.File {
@@ -142,6 +361,40 @@ func TestPinnedAppendIsPerCallAndSurvivesHandleClose(t *testing.T) {
 	got := make([]byte, post.Size)
 	if n, err := v.ReadAt(reader, got, 0); err != nil || int64(n) != post.Size || string(got) != "payload" {
 		t.Fatalf("post append = %q n=%d err=%v", got, n, err)
+	}
+}
+
+func TestCoordinateItemMatchesInstalledIdentityAndAttributes(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, attr, err := v.Create(root, "retained-coordinate", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := v.Identity(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinate, err := v.CoordinateItem(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ObjectCoordinate{
+		Stable: identity, Ino: attr.Ino,
+		DeviceMajor: attr.DeviceMajor, DeviceMinor: attr.DeviceMinor,
+	}
+	if coordinate != want {
+		t.Fatalf("CoordinateItem = %+v, want %+v", coordinate, want)
+	}
+	if err := v.Chmod(item, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	after, err := v.CoordinateItem(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != want {
+		t.Fatalf("CoordinateItem after mutable attr change = %+v, want %+v", after, want)
 	}
 }
 
@@ -440,7 +693,7 @@ func TestCommitWritePrivilegeFailureStillAttemptsAndJoinsLogicalSync(t *testing.
 	defer v.CloseOpen(handle)
 
 	var privilegeCalls, syncCalls int
-	v.removeWritePrivileges = func(int, uint32, bool) error {
+	v.removePinnedWritePrivileges = func(int, uint32, bool, *bool) error {
 		privilegeCalls++
 		return errors.Join(ErrWritePrivilege, syscall.EPERM)
 	}
@@ -467,6 +720,72 @@ func TestAbsentFileCapabilityNeedsNoPrivilegedRemoval(t *testing.T) {
 	defer file.Close()
 	if err := removeWritePrivileges(int(file.Fd()), 0o600, false); err != nil {
 		t.Fatalf("ordinary unprivileged file was treated as a failed capability removal: %v", err)
+	}
+}
+
+func TestPinnedWriteTargetCachesSecurityCapabilityUntilLastOpenCloses(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "capability-cache", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probes int
+	v.inspectSecurityCapability = func(int) (bool, error) {
+		probes++
+		return false, nil
+	}
+	commit := WriteCommit{
+		RequestedSize: 1, RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64,
+		Mode: WritePositioned,
+	}
+	target, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for offset := uint64(0); offset < 2; offset++ {
+		commit.Position = offset
+		if committed, _, _, err := target.CommitWriteData([]byte{'x'}, commit); err != nil || committed != 1 {
+			t.Fatalf("CommitWriteData(%d) = (%d, %v)", offset, committed, err)
+		}
+	}
+	if probes != 1 {
+		t.Fatalf("security.capability probes during one pin = %d, want 1", probes)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := v.PinWriteTarget(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probes != 1 {
+		t.Fatalf("security.capability probes after repin = %d, want cached 1", probes)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.CloseOpen(handle); err != nil {
+		t.Fatal(err)
+	}
+
+	newHandle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(newHandle)
+	third, err := v.PinWriteTarget(newHandle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close()
+	if probes != 2 {
+		t.Fatalf("security.capability probes after cache lifetime ended = %d, want 2", probes)
 	}
 }
 
@@ -1104,7 +1423,7 @@ func TestCanonicalCopyLocksCannotDeadlockReverseDirections(t *testing.T) {
 		go func(source, destination [16]byte) {
 			<-start
 			for range 1000 {
-				unlock := lockCopyMutation(v, source, destination)
+				unlock := v.LockMutation([][16]byte{source, destination})
 				unlock()
 			}
 			done <- struct{}{}
@@ -1243,6 +1562,11 @@ func TestPinnedAppendAcrossAliasesSerializesWholeTransactions(t *testing.T) {
 	results := make(chan result, 2)
 	for target, data := range map[WriteTarget]string{left: "aaa", right: "bbb"} {
 		go func(target WriteTarget, data string) {
+			// CommitWrite is the store half of an authority transaction.  The
+			// authority's mutation lease deliberately spans this call, exact
+			// post-state sampling, and replay persistence.
+			unlock := v.LockMutation([][16]byte{target.Coordinate().Stable})
+			defer unlock()
 			_, assigned, _, err := target.CommitWrite(bytes.NewReader([]byte(data)), WriteCommit{RequestedSize: uint64(len(data)), RLimitSize: 1 << 20, FileMaxSize: 1 << 20, Mode: WriteAppend}, make([]byte, 2))
 			results <- result{assigned: assigned, err: err}
 		}(target, data)

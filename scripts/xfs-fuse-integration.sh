@@ -29,6 +29,7 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestVolumeHandlerEndToEndOnXFS"
   "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestBlockedLockWaitDoesNotHoldTheTopologyGuard"
   "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestRoutesControllerRefusesGitTrackedContentOnXFS"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelFUSEProbeCompletesInit"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTwoKernelMountsShareAuthoritativeXFS"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateWithAReadOnlyModeReturnsAWritableHandle"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountContentCoherence"
@@ -49,28 +50,16 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesStrictMembership"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts"
-  # The strict-profile cache-coherence battery. These are the only tests that
-  # execute the two-phase visibility barrier against a real kernel FUSE mount:
-  # everything else about strict coherence is either unit-level (no kernel) or
-  # black box through the coherence matrix (no RPC accounting). They are listed
-  # here for the same reason the rest are - a privileged test that is renamed or
-  # deleted must fail this job rather than quietly shrink the coverage that
-  # justifies caching names and attributes at all.
+  # Retained real-VFS regression coverage. These test names predate protocol 6
+  # and do not, by themselves, prove lease grant/recall/discharge. Keep them
+  # required for the behavior they exercise until dedicated v6 tests land; add
+  # those tests by exact name rather than relabeling this block as lease proof.
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost"
-  # The patched-kernel syscall surface must be exercised through real VFS
-  # syscalls. Unit calls into rawFileSystem do not prove kernel negotiation,
-  # transaction fragmentation, post-VFS publication, or stock/private opcode
-  # routing.
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelLargeWriteTransactionsPreservePositionedAndAppendData"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelSharedFallocateMutations"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelSharedCopyFileRangeAndCrossClassBoundary"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelTmpfileFirstLinkAndExclusiveNonlinkable"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelSyncfsSucceeds"
   # Machine-local routing must be proven against the real kernel and the real
   # authority transport. Keep the zero-RPC tests here in particular: the
   # cross-process matrix proves two-machine isolation, but intentionally does
@@ -85,20 +74,26 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateAtAnUncreatedRouteRootIsEISDIR"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARouteRootShadowsTheVolumeSubtreeOfTheSameName"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSharedPathsKeepTheirCoherenceWithRoutesConfigured"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeRevokesEveryMountWithARemountMessage"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeIsRefusedWhileAnyMountIsLive"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
+  # The files gateway is the only synchronous-repair frontend shipped on Linux
+  # and the only participant that is not a mount. Keep its real handshake with
+  # the real volume handler required: every other readonlyfs test drives a fake,
+  # which cannot observe attach negotiation, a real barrier, or whether a
+  # cacheless reader can stall a writing mount.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer"
+  # The gateway is a sidecar, so it leaves whenever its pod restarts, and
+  # leaving used to cost a writing mount its mutation. Keep the test that
+  # measures what a clean departure costs required.
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayCloseDoesNotStallAMutatingMount"
 )
 
-# These boundaries require CAP_SYS_ADMIN and therefore cannot run under the
-# capability-free identity used for the POSIX/DAC suite above. They still run
-# in the same throwaway container, as the same production uid against the same
-# authority/frontend code and provisioned XFS volume. The process receives
-# SYS_ADMIN for the admission calls and DAC_OVERRIDE solely to open the
-# root-owned loop control devices. Keeping an exact required list prevents a missing
-# module, renamed test, or accidental skip from masquerading as qualification.
+# This boundary is root-owned provisioning work and therefore cannot run under
+# the unprivileged authority identity used for the data-plane suite. Keeping an
+# exact required list prevents a renamed or skipped test from masquerading as
+# qualification.
 REQUIRED_ROOT_TESTS=(
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictKernelRefusesStackingExportAndLoopBacking"
   "github.com/steerlabs/portablefs/vcs/internal/cellhost:TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota"
 )
 
@@ -123,7 +118,6 @@ run_host() {
       --tmpfs /var/tmp:exec,mode=1777 \
       -v "${root}/vcs:/work/vcs:ro" \
       -v "${root}/scripts:/work/scripts:ro" \
-      -v "${root}/kernel/linux-6.12.100-portablefs-append:/work/kernel/linux-6.12.100-portablefs-append:ro" \
       "$@" \
       -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
       -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
@@ -149,6 +143,20 @@ install_container_dependencies() {
   # xfsprogs: mkfs.xfs and xfs_quota. fuse3: the setuid fusermount3 helper the
   # unprivileged test process needs. sqlite3/git: the real application workload.
   apt-get install -y -qq --no-install-recommends xfsprogs fuse3 sqlite3 git util-linux kmod >/dev/null
+}
+
+# The FUSE control filesystem is the kernel interface a strict mount's
+# revocation ladder uses to abort its own serving connection, which is what
+# releases every request parked in the kernel when the authority is gone. A
+# production host has it mounted; a container does not inherit it, and without
+# it the abort step silently cannot run - so the mount-owner detach helper waits
+# on a request nothing can answer and teardown never completes. Provisioning it
+# here is what makes the container the same kernel surface production is.
+provision_fuse_control() {
+  [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
+  mountpoint -q /sys/fs/fuse/connections ||
+    mount -t fusectl none /sys/fs/fuse/connections ||
+    fail "cannot mount the FUSE control filesystem; connection aborts would be unavailable" 69
 }
 
 provision_xfs() {
@@ -195,6 +203,11 @@ run_suite() {
   # failure so a broken provisioner cannot present as a green run. -p 1 keeps
   # the three privileged packages from opening the one provisioned XFS cell
   # concurrently, which its exclusive volume lock forbids.
+  #
+  # -timeout is set below the CI job timeout on purpose (the whole lane
+  # completes in about two minutes). A hung mount must be killed by the test
+  # binary, which prints every goroutine's stack, rather than by the job
+  # timeout, which kills the runner and leaves nothing to read.
   set +e
   runuser -u portablefs -- env -i \
     HOME=/home/portablefs \
@@ -214,7 +227,7 @@ run_suite() {
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
 	PORTABLEFS_FUSE_DEBUG="${PORTABLEFS_FUSE_DEBUG:-}" \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 25m "${extra_go_test_flags[@]}" \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 10m "${extra_go_test_flags[@]}" \
     ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... \
     >"$log" 2>&1
   status=$?
@@ -225,45 +238,9 @@ run_suite() {
 }
 
 run_root_boundary_suite() {
-  local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
-  local log=/var/tmp/portablefs-kernel-boundary.log
   local cellhost_log=/var/tmp/portablefs-cellhost-boundary.log
   local combined_log=/var/tmp/portablefs-root-boundary.log
   local status=0
-  # Load the only optional module before dropping to the production uid.  The
-  # test process then receives CAP_SYS_ADMIN plus DAC_OVERRIDE for the
-  # root-owned loop device nodes, and no broader root identity. It can exercise
-  # mount/backend admission while xfsstore continues to prove the exact service
-  # owner on every private ancestor.
-  modprobe overlay
-  modprobe loop
-  set +e
-  setpriv \
-    --reuid="$PORTABLEFS_SERVICE_UID" \
-    --regid="$PORTABLEFS_SERVICE_GID" \
-    --clear-groups \
-    --inh-caps=+sys_admin,+dac_override \
-    --ambient-caps=+sys_admin,+dac_override \
-    env -i \
-    HOME=/home/portablefs \
-    PATH=/usr/local/go/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    TMPDIR=/var/tmp \
-    GOCACHE=/var/tmp/portablefs-root-gocache \
-    GOMODCACHE=/home/portablefs/gomodcache \
-    GOTOOLCHAIN=local \
-    GOFLAGS=-mod=readonly \
-    PORTABLEFS_XFS_TEST_ROOT="$volume" \
-    PORTABLEFS_XFS_TEST_PROJECT="$PORTABLEFS_PROJECT_ID" \
-    PORTABLEFS_FUSE_TEST=1 \
-    PORTABLEFS_STRICT_STACK_TEST_SCRIPT=/work/kernel/linux-6.12.100-portablefs-append/tests/test_strict_stacking.py \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 5m \
-    -run '^TestStrictKernelRefusesStackingExportAndLoopBacking$' \
-    ./internal/fusev3/... >"$log" 2>&1
-  status=$?
-  set -e
-  cat -- "$log"
-  [[ $status -eq 0 ]] || fail "kernel backing-boundary test exited $status" "$status"
-
   # Write-staging creation is the cell helper's root-only responsibility, not a
   # capability of the authority service identity. Run that exact boundary as
   # root against the same provisioned XFS cell while retaining the production
@@ -287,7 +264,7 @@ run_root_boundary_suite() {
   set -e
   cat -- "$cellhost_log"
   [[ $status -eq 0 ]] || fail "root cell-helper boundary test exited $status" "$status"
-  cat "$log" "$cellhost_log" >"$combined_log"
+  cp "$cellhost_log" "$combined_log"
   verify_exact_tests "$combined_log" "${REQUIRED_ROOT_TESTS[@]}"
   echo "xfs-fuse-integration: all ${#REQUIRED_ROOT_TESTS[@]} required root boundary tests passed"
 }
@@ -319,6 +296,7 @@ run_container() {
   [[ $EUID -eq 0 ]] || fail "container side must start as root to provision XFS" 77
   install_container_dependencies
   create_service_identity
+  provision_fuse_control
   provision_xfs
   provision_volume
   run_suite

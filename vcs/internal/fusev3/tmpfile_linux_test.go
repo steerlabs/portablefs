@@ -47,14 +47,14 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 		request.GetFlags().GetAppend() || request.GetFlags().GetTruncate() || !request.GetExclusive() {
 		t.Fatalf("authority TMPFILE mapping = %+v", request)
 	}
-	if captured.GetSourcePublicationGate() != nil {
-		t.Fatalf("unlinked TMPFILE unexpectedly declared a peer-visible source gate: %+v", captured.GetSourcePublicationGate())
+	if !fixture.raw.ReplyWriteOrdered(unique) {
+		t.Fatal("TMPFILE lost its daemon-local source publication ownership")
 	}
-	if out.NodeId == 0 || out.Fh == 0 || out.Attr.Ino != 81 || out.Attr.Flags != fuse.FUSE_ATTR_PFS_SHARED ||
-		out.OpenFlags != coherentOpenFlags || out.EntryTimeout() != 0 {
+	if out.NodeId == 0 || out.Fh == 0 || out.Attr.Ino != 81 || out.Attr.Flags != 0 ||
+		out.OpenFlags != fuse.FOPEN_DIRECT_IO || out.EntryTimeout() != 0 {
 		t.Fatalf("shared TMPFILE output = %+v", out)
 	}
-	finishPrivatePublication(t, fixture, unique, fuse.FUSE_ROOT_ID, 51) // FUSE_TMPFILE
+	completeTestReply(t, fixture.raw, unique, fuse.OK)
 	if fixture.mount.isRevoked() {
 		t.Fatalf("valid shared TMPFILE revoked mount: %v", fixture.mount.fatalError())
 	}

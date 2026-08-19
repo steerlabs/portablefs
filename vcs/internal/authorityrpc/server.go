@@ -175,7 +175,7 @@ func (s *Server) validate() (TransportBounds, error) {
 		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
 	}
 	if s.MaxConnections < 2 {
-		return TransportBounds{}, errors.New("authorityrpc: protocol 5 requires capacity for one DATA/CONTROL connection pair")
+		return TransportBounds{}, errors.New("authorityrpc: protocol 6 requires capacity for one DATA/CONTROL connection pair")
 	}
 	bounds := s.Handler.Bounds()
 	if bounds.MaxFrame != s.MaxFrame || bounds.MaxInFlight != s.MaxInFlight {
@@ -205,7 +205,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	}
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.NextProtos = []string{protocolALPN}
-	tlsListener := tls.NewListener(listener, tlsConfig)
+	tlsConfig.DynamicRecordSizingDisabled = true
 	serveCtx, cancel := context.WithCancel(ctx)
 	connections := make(chan struct{}, s.MaxConnections)
 	var connectionWorkers sync.WaitGroup
@@ -215,21 +215,22 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 	}
 	defer func() {
 		cancel()
-		_ = tlsListener.Close()
+		_ = listener.Close()
 		connectionWorkers.Wait()
 	}()
 	go func() {
 		<-serveCtx.Done()
-		_ = tlsListener.Close()
+		_ = listener.Close()
 	}()
 	for {
-		conn, err := tlsListener.Accept()
+		raw, err := listener.Accept()
 		if err != nil {
 			if serveCtx.Err() != nil {
 				return nil
 			}
 			return err
 		}
+		conn := newAuthorityTLSServer(raw, tlsConfig)
 		select {
 		case connections <- struct{}{}:
 			connectionWorkers.Add(1)
@@ -249,7 +250,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 // authorization decision downstream reads it from the request context.
 func (s *Server) serveConn(parent context.Context, conn net.Conn, bounds TransportBounds) error {
 	defer conn.Close()
-	tlsConn, ok := conn.(*tls.Conn)
+	tlsConn, ok := conn.(*authorityTLSConn)
 	if !ok {
 		return errors.New("authorityrpc: authority connections must be mutually authenticated TLS")
 	}
@@ -338,7 +339,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			return err
 		}
 		request := new(authoritypb.Request)
-		releaseFrame, err := readFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
+		releaseFrame, payloadDigest, err := readRequestFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
@@ -349,6 +350,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			releaseFrame()
 			return errors.New("authorityrpc: request ID zero is reserved")
 		}
+		frameRequestCtx := withFramePayloadDigest(requestCtx, payloadDigest)
 		if err := requestAllowedOnRole(request, entry.role); err != nil {
 			releaseFrame()
 			return err
@@ -373,7 +375,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			// Cancellation must remain processable when every normal execution
 			// slot is occupied. Its handler only validates the epoch and returns
 			// the acknowledgment, so execute it inline outside the normal slots.
-			response := s.dispatchRequest(requestCtx, request)
+			response := s.dispatchRequest(frameRequestCtx, request)
 			finishResponse := finishHandlerResponse(s.Handler, request, response)
 			writeErr := writeResponse(request, response)
 			finishResponse()
@@ -413,7 +415,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			releaseFrame()
 			return errors.New("authorityrpc: connection in-flight bound exceeded")
 		}
-		opCtx, opCancel := context.WithCancel(requestCtx)
+		opCtx, opCancel := context.WithCancel(frameRequestCtx)
 		inflightMu.Lock()
 		if _, duplicate := inflight[request.GetRequestId()]; duplicate {
 			inflightMu.Unlock()

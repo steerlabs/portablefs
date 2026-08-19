@@ -50,9 +50,9 @@ func run() error {
 		dialTimeout        = flag.Duration("dial-timeout", mountv3.DialTimeout, "authority dial and TLS timeout")
 		cancelDrainTimeout = flag.Duration("cancel-drain-timeout", mountv3.CancelDrainTimeout, "time to obtain an exact result after interrupting an in-flight request")
 		requestTimeout     = flag.Duration("request-timeout", mountv3.RequestTimeout, "non-blocking filesystem operation timeout")
-		coherence          = flag.String("coherence", "strict", "kernel cache contract: strict (the only protocol-5 coherence mode)")
-		cachedNames        = flag.Int("cached-name-capacity", mountv3.CachedNameCapacity, "directory bindings a strict mount may leave resident in its kernel")
-		repairBudget       = flag.Duration("repair-budget", mountv3.RepairBudget, "per-phase deadline a strict mount commits to before revoking itself")
+		coherence          = flag.String("coherence", "strict", "kernel cache contract: strict (the only protocol-6 profile)")
+		cachedNames        = flag.Int("cached-name-capacity", mountv3.CachedNameCapacity, "local daemon name-lease cache bound")
+		repairBudget       = flag.Duration("repair-budget", mountv3.RepairBudget, "local lease-recall and withdrawal deadline")
 		localBacking       = flag.String("local-backing", "", "per-machine directory holding the volume's machine-local route subtrees")
 		noLocalDirs        = flag.Bool("no-local-dirs", false, "refuse to mount a volume that declares machine-local routes in "+fusev3.LocalDirsPath)
 	)
@@ -106,12 +106,12 @@ func run() error {
 	if len(token) == 0 {
 		return errors.New("access token file is empty")
 	}
-	profile, protocolProfile, err := mountv3.Profile(*coherence)
+	profile, err := mountv3.Profile(*coherence)
 	if err != nil {
 		return err
 	}
 	if *cachedNames <= 0 || *repairBudget <= 0 {
-		return errors.New("strict coherence requires a positive cached-name capacity and repair budget; both are declared to the authority")
+		return errors.New("strict coherence requires a positive local cached-name capacity and repair budget")
 	}
 	mountInstanceID, err := mountid.NewMountInstance()
 	if err != nil {
@@ -124,22 +124,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	attach := authorityrpc.ClientConfig{
-		Address: *authority, TLS: tlsConfig, VolumeID: *volumeID,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         *authority, TLS: tlsConfig, VolumeID: *volumeID,
 		AccessToken: token, ReplaySlots: uint32(*replaySlots),
 		MaxFrame: uint32(*maxFrame), DialTimeout: *dialTimeout, CancelDrainTimeout: *cancelDrainTimeout, MaxInFlight: *maxInFlight,
-		// The two numbers a strict mount declares are the two the authority
-		// needs to size the barrier: how much cached state this frontend can be
-		// holding, and how long it may take to withdraw it.
-		CoherenceProfile: protocolProfile, CachedNameCapacity: uint64(*cachedNames), RepairBudget: *repairBudget,
 		ObservePreKernelMountAbsence: preKernelAbsence,
 	}
-	// How this frontend's kernel makes a cached binding unservable. It is
-	// declared rather than inferred because the authority cannot observe a
-	// remote kernel. The strict Linux answer is load-bearing: its private
-	// reverse notification expires one exact binding under dcache locks without
-	// taking the parent inode's i_rwsem. A stock parent-lock implementation is
-	// refused rather than translated into synthetic application EINTR.
-	attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION
 	if len(localDirs) != 0 {
 		return fmt.Errorf("machine-local routes are declared volume-wide in %s; -local-dir would add a route only this machine knows about, which desynchronizes the routing topology the authority pins every mount to", fusev3.LocalDirsPath)
 	}

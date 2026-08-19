@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# verify-local.sh — the repository's single local merge gate.
+# verify-local.sh — the repository's local merge gate.
 #
 # PortableFS is a two-language tree: the Go data plane under vcs/ and the Swift
 # FSKit/app package under swift/PortableFSKit. There is no build system above
@@ -7,11 +7,58 @@
 # plain bash so that it runs identically on a developer Mac and on a Linux CI
 # runner.
 #
-# Run it from anywhere; it operates on the repository root.
+# It has two modes, and the difference is not cosmetic.
+#
+#   default   Everything that runs without Docker and without a privileged
+#             container: cross-platform build and vet, govulncheck, the native
+#             Go suites, the go-fuse reply-ordering seam, the Swift suite on
+#             macOS, workflow/release-trust policy, and the architecture scans.
+#             It does NOT run either real-mount suite. The closing banner names
+#             what it skipped; this mode alone is not merge evidence for a
+#             change to the authority, a frontend, or the coherence protocol.
+#
+#   full      Everything above, plus the two privileged real-mount suites that
+#             CI runs on its ubuntu-24.04 lanes:
+#               scripts/xfs-fuse-integration.sh    (real XFS + real kernel FUSE)
+#               scripts/coherence-matrix-linux.sh  (two real mounts, one volume)
+#             Both need a working Docker daemon and free loop devices. On macOS
+#             they run inside the Docker VM, which is why this is opt-in rather
+#             than the default: the default mode stays fast for macOS-only work.
+#
+#   bash scripts/verify-local.sh            # default (fast, no Docker)
+#   bash scripts/verify-local.sh --full     # + both real-mount suites
+#   VERIFY_LOCAL_FULL=1 bash scripts/verify-local.sh   # same as --full
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+
+VERIFY_LOCAL_FULL="${VERIFY_LOCAL_FULL:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --full) VERIFY_LOCAL_FULL=1 ;;
+    --help|-h)
+      sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "verify-local: unknown argument: $arg (expected --full)" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Login shells initialized by fnm already expose Node.  Non-interactive gate
+# runners do not necessarily source that shell setup, so resolve fnm's explicit
+# default installation before the release-policy checks need it.
+if ! command -v node >/dev/null 2>&1; then
+  PFS_FNM_ROOT="${FNM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/fnm}"
+  PFS_NODE_BIN="$PFS_FNM_ROOT/aliases/default/bin/node"
+  if [[ -x "$PFS_NODE_BIN" ]]; then
+    PATH="$(dirname "$PFS_NODE_BIN"):$PATH"
+    export PATH
+  fi
+fi
 
 step() { printf '\n== %s ==\n' "$1"; }
 
@@ -59,11 +106,11 @@ go -C vcs test ./...
 step "go race suite (native)"
 go -C vcs test -race ./...
 
-# The maintained go-fuse fork is a nested module, so `go test ./...` above
-# deliberately does not enter it. Its PortableFS patch surface is the physical
-# reply-publication seam; gate that seam explicitly without depending on a
-# host FUSE mount utility or changing unrelated upstream integration tests.
-step "maintained go-fuse reply-publication seam"
+# The maintained go-fuse fork is a nested module, so the suite above does not
+# enter it. Protocol 6 retains one stock-FUSE-neutral seam: ReplyWriteLifecycle
+# serializes selected physical replies and notifications through writeMu. Gate
+# that ordering hook without running the retired private-ABI tests.
+step "maintained go-fuse reply ordering seam"
 go -C vcs/third_party/go-fuse build ./fuse
 go -C vcs/third_party/go-fuse vet ./fuse
 go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
@@ -139,15 +186,22 @@ then
   exit 1
 fi
 
-# Protocol 5 has one coherent mount contract. The old non-participant profile
-# name remains reserved in the source schema (and therefore in generated
-# descriptor bytes), while docs and the changelog may describe its retirement.
-# It must not re-enter executable code, tests, scripts, or configuration.
+# Protocol 6 has one coherent lease contract. The old non-participant profile
+# and both retired namespace-repair models keep their names reserved in the
+# source schema (and therefore in generated descriptor bytes), while docs and
+# the changelog may describe their retirement. None may re-enter executable
+# code, tests, scripts, or configuration.
 if rg --hidden -n \
   -e 'CoherenceUncached' \
   -e 'COHERENCE_PROFILE_UNCACHED' \
   -e 'PORTABLEFS_COHERENCE' \
   -e '--coherence uncached' \
+  -e 'LOCKLESS_EXPIRATION' \
+  -e 'NamespaceRepairLocklessExpiration' \
+  -e 'PARENT_EXCLUSIVE' \
+  -e 'NamespaceRepairParentExclusive' \
+  -e 'blocked_parent_kernel_inos' \
+  -e 'BlockedParentKernelInos' \
   . \
   -g '!.git' \
   -g '!docs' \
@@ -160,5 +214,83 @@ then
   exit 1
 fi
 
+# Active product material must describe the protocol-6 stock-FUSE architecture.
+# Historical qualification receipts are intentionally outside this list: they
+# remain evidence, not a build or runtime dependency. The patch series for the
+# retired private ABI is no longer in the tree at all; git history holds it.
+# Keeping the input list explicit makes a newly active contract an
+# intentional review event rather than silently granting all docs authority.
+step "active stock-FUSE contract scan"
+if rg -n \
+  -e 'portablefs-authority-v5' \
+  -e 'authority protocol major `5`' \
+  -e '\bCAP_PFS_' \
+  -e '\bFUSE_PFS_' \
+  -e 'exact patched kernel' \
+  -e 'pinned Linux 6\.12\.100' \
+  README.md COMPATIBILITY.md \
+  docs/architecture.md docs/consistency-model.md docs/failure-modes.md \
+  docs/local-dev.md docs/xfs-authority-deployment.md \
+  .github/workflows scripts/coherence-matrix-linux.sh \
+  scripts/xfs-fuse-integration.sh
+then
+  echo "retired private-kernel contract found in active product material" >&2
+  exit 1
+fi
+
+# 8. The two privileged real-mount suites. These are the only gates in this
+# repository that observe a real kernel FUSE mount against real XFS, so no
+# amount of green from the steps above substitutes for them. They are opt-in
+# locally and mandatory in CI.
+#
+# scripts/package-manager-matrix.sh is a third Docker suite in the same
+# container, and it is deliberately not here and no longer in CI either: it is a
+# workload soak rather than a coherence gate, and it roughly doubles the wall
+# time of a full local run. Run it on demand; the concurrent-reader shape it
+# drives is qualified after deploy by phase 8 of
+# deploy/opensteer/staging-qualification.sh. The closing banner names it so a
+# --full pass is not read as "every instrument in the tree".
+if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "verify-local --full requires docker; none found on PATH" >&2
+    exit 1
+  fi
+
+  step "privileged XFS (prjquota) and kernel FUSE integration suite"
+  bash scripts/xfs-fuse-integration.sh
+
+  step "two-mount cross-mount coherence matrix"
+  bash scripts/coherence-matrix-linux.sh
+
+  echo
+  echo "verify-local: ok (full)"
+  echo "  ran: build/vet, govulncheck, native go suites, go-fuse reply seam,"
+  echo "       Swift suite (macOS host only), workflow/release-trust policy,"
+  echo "       architecture scans, xfs-fuse-integration.sh, coherence-matrix-linux.sh"
+  echo "  still NOT run by --full:"
+  echo "    - scripts/package-manager-matrix.sh   third Docker suite; a workload"
+  echo "                                         soak, run on demand, not in CI"
+  echo "    - scripts/coherence-matrix-macos.sh   live macOS FSKit mount matrix;"
+  echo "                                         needs a user-enabled extension"
+  echo "    - deploy/opensteer/staging-qualification.sh against a live cell"
+  exit 0
+fi
+
 echo
-echo "verify-local: ok"
+echo "verify-local: ok (default mode) — this is NOT full verification"
+echo
+echo "NOT RUN by this invocation:"
+echo "  - scripts/xfs-fuse-integration.sh   real XFS + real kernel FUSE mounts"
+echo "  - scripts/coherence-matrix-linux.sh two real mounts against one volume"
+echo "  - scripts/package-manager-matrix.sh concurrent package-manager readers"
+echo "                                     (on demand; not a CI lane)"
+if [[ "$(uname -s)" != Darwin ]]; then
+  echo "  - scripts/test-swift-xcode.sh      Xcode-native Swift suite (macOS only)"
+fi
+echo "  - scripts/coherence-matrix-macos.sh live macOS FSKit mount matrix"
+echo "  - deploy/opensteer/staging-qualification.sh real-workload staging corpus"
+echo
+echo "CI runs both privileged Linux suites on its ubuntu-24.04 lanes"
+echo "(linux-xfs-fuse and linux-coherence-matrix in .github/workflows/ci.yml),"
+echo "so a merge is still gated on them. To run them here:"
+echo "  bash scripts/verify-local.sh --full"

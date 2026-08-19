@@ -493,8 +493,6 @@ func marshalVisibilityAckRequest(m *VisibilityAckRequest) []byte {
 	var b []byte
 	b = appendBytesField(b, 1, m.AuthorityEpoch)
 	b = appendMsg(b, 2, marshalVisibilityCursor(&m.Cursor))
-	b = appendBool(b, 3, m.Blocked)
-	b = appendString(b, 4, m.Reason)
 	b = appendBool(b, 5, m.OrderedAdmissionContended)
 	return b
 }
@@ -508,12 +506,6 @@ func unmarshalVisibilityAckRequest(b []byte) (*VisibilityAckRequest, error) {
 			m.AuthorityEpoch, err = scalarBytes(wt, raw)
 		case 2:
 			m.Cursor, err = parseVisibilityCursorField(wt, raw)
-		case 3:
-			m.Blocked, err = scalarBool(wt, raw)
-		case 4:
-			var v []byte
-			v, err = scalarBytes(wt, raw)
-			m.Reason = string(v)
 		case 5:
 			m.OrderedAdmissionContended, err = scalarBool(wt, raw)
 		}
@@ -1953,30 +1945,6 @@ func parseVisibilityTargetField(wt int, raw []byte) (VisibilityTarget, error) {
 	})
 }
 
-func marshalRoutesChange(m *RoutesChange) []byte {
-	var b []byte
-	b = appendBytesField(b, 1, m.Revision)
-	b = appendBytesField(b, 2, m.Rules)
-	return b
-}
-
-func parseRoutesChangeField(wt int, raw []byte) (*RoutesChange, error) {
-	if wt != wireBytes {
-		return nil, ErrMalformed
-	}
-	m := &RoutesChange{}
-	return m, scan(raw, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.Revision, err = scalarBytes(wt, raw)
-		case 2:
-			m.Rules, err = scalarBytes(wt, raw)
-		}
-		return err
-	})
-}
-
 func marshalV3VisibilityEvent(m *V3VisibilityEvent) []byte {
 	var b []byte
 	b = appendBytesField(b, 1, m.AuthorityEpoch)
@@ -1987,9 +1955,6 @@ func marshalV3VisibilityEvent(m *V3VisibilityEvent) []byte {
 		b = appendMsg(b, 5, marshalVisibilityTarget(&m.Targets[i]))
 	}
 	b = appendU64(b, 6, m.MutationSequence)
-	if m.Routes != nil {
-		b = appendMsg(b, 7, marshalRoutesChange(m.Routes))
-	}
 	return b
 }
 
@@ -2019,8 +1984,6 @@ func parseV3VisibilityEventField(wt int, raw []byte) (V3VisibilityEvent, error) 
 			}
 		case 6:
 			m.MutationSequence, err = scalarU64(wt, raw)
-		case 7:
-			m.Routes, err = parseRoutesChangeField(wt, raw)
 		}
 		return err
 	})

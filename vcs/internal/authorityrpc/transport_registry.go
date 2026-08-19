@@ -29,6 +29,7 @@ type transportConnection struct {
 	registry   *transportRegistry
 	pair       *transportPair
 	role       authoritypb.TransportRole
+	profile    authoritypb.FrontendProfile
 	generation uint64
 	// serving is guarded by registry.mu. Replacement first makes a candidate
 	// current with serving=false, which generation-fences its predecessor. Only
@@ -59,6 +60,7 @@ type transportRoleBinding struct {
 type transportPair struct {
 	operation sync.Mutex
 	key       transportPairKey
+	profile   authoritypb.FrontendProfile
 	data      transportRoleBinding
 	control   transportRoleBinding
 	session   volumeserver.SessionID
@@ -134,14 +136,21 @@ func validTransportRole(role authoritypb.TransportRole) bool {
 		role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL
 }
 
+func validFrontendProfile(profile authoritypb.FrontendProfile) bool {
+	return profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED ||
+		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES ||
+		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+}
+
 func (r *transportRegistry) register(
 	peer volumeserver.PeerIdentity,
 	set connectionSetID,
 	role authoritypb.TransportRole,
+	profile authoritypb.FrontendProfile,
 	cancel context.CancelFunc,
 	closeConnection func() error,
 ) (*transportConnection, error) {
-	if peer == (volumeserver.PeerIdentity{}) || set == (connectionSetID{}) || !validTransportRole(role) || cancel == nil || closeConnection == nil {
+	if peer == (volumeserver.PeerIdentity{}) || set == (connectionSetID{}) || !validTransportRole(role) || !validFrontendProfile(profile) || cancel == nil || closeConnection == nil {
 		return nil, ErrTransportBinding
 	}
 	key := transportPairKey{peer: peer, set: set}
@@ -152,8 +161,10 @@ func (r *transportRegistry) register(
 		if len(r.pairs) >= r.maxSets {
 			return nil, fmt.Errorf("%w: connection-set admission bound reached", ErrTransportBinding)
 		}
-		pair = &transportPair{key: key, done: make(chan struct{})}
+		pair = &transportPair{key: key, profile: profile, done: make(chan struct{})}
 		r.pairs[key] = pair
+	} else if pair.profile != profile {
+		return nil, fmt.Errorf("%w: connection-set frontend profile mismatch", ErrTransportBinding)
 	}
 	slot := pair.roleBinding(role)
 	if slot == nil {
@@ -166,7 +177,7 @@ func (r *transportRegistry) register(
 	executionDrained := make(chan struct{})
 	close(executionDrained)
 	entry := &transportConnection{
-		registry: r, pair: pair, role: role, generation: r.nextGeneration,
+		registry: r, pair: pair, role: role, profile: profile, generation: r.nextGeneration,
 		cancel: cancel, close: closeConnection, executionDrained: executionDrained,
 	}
 	if pair.session == (volumeserver.SessionID{}) {

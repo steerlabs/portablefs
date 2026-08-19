@@ -1,5 +1,8 @@
 name: ci
 
+# The push trigger is scoped to the two integration branches on purpose: a
+# branch that is open as a pull request must run this workflow once, through
+# `pull_request`, not a second time through `push`.
 on:
   push:
     branches: [main, opensteer-production]
@@ -89,6 +92,13 @@ jobs:
       - run: go -C vcs test ./...
       - name: Race suite
         run: go -C vcs test -race ./...
+      - name: Maintained go-fuse reply ordering seam
+        run: |
+          set -euo pipefail
+          go -C vcs/third_party/go-fuse build ./fuse
+          go -C vcs/third_party/go-fuse vet ./fuse
+          go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+          go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
 
   go-darwin:
     runs-on: macos-26
@@ -108,18 +118,15 @@ jobs:
       - name: Test the Foundation-enabled Darwin data plane
         run: CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...
 
-  kernel-strict-static:
-    name: kernel-strict-static
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Verify exact Linux 6.12.100 patch series, UAPI, hooks, and state models
-        run: kernel/linux-6.12.100-portablefs-append/verify.sh --no-build
-
+  # Packaging, not correctness: it proves the unsigned universal app and the
+  # development host still assemble with the exact group and version identity.
+  # release.yml builds, signs, notarizes, and verifies the same app from the
+  # same script at tag time, so nothing merges on this evidence -- it is the
+  # early warning that packaging broke, and it belongs after the merge, on the
+  # integration branches, not in the pull-request gate. swift-xcode-native is
+  # the macOS correctness lane and stays in the gate.
   macos-app-unsigned:
+    if: github.event_name != 'pull_request'
     runs-on: macos-26
     timeout-minutes: 20
     steps:
@@ -181,11 +188,6 @@ jobs:
           test "$("$cli" version)" = "portablefs $expected_version"
           test "$("$daemon" -version)" = "$expected_version"
 
-  # The live privileged jobs are intentionally not run on stock hosted runners.
-  # The strict dialect requires the checked-in patched Linux 6.12.100 kernel;
-  # stock Ubuntu must fail INIT and cannot provide weaker evidence. A separate
-  # qualification runner boots that exact kernel and invokes these same scripts.
-  #
   # The privileged Linux data-plane suite. Everything below `go test ./...` in
   # the `go` job runs on an ordinary tmpfs with no XFS project quotas and no
   # kernel FUSE mount, so the two-mount coherence, locking, paging, session and
@@ -193,14 +195,18 @@ jobs:
   # PORTABLEFS_XFS_TEST_REQUIRED=1 turns a missing gate into a test failure, and
   # the script additionally verifies that each required test reported PASS, so a
   # provisioning regression or a deleted test cannot present as a green run.
+  # Runs natively on the runner in about two minutes. The timeout is a
+  # fail-fast bound on a hang, not a budget: the suite's own `go test -timeout`
+  # fires first and prints a full goroutine dump, so a job that reaches this
+  # limit has hung outside the test binary.
   linux-xfs-fuse:
-    runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Verify the runner can provide loop devices and /dev/fuse
+      - name: Verify the stock runner can provide loop devices and /dev/fuse
         run: |
           sudo modprobe loop
           sudo modprobe fuse
@@ -221,24 +227,34 @@ jobs:
   # phase where every case must fail, and a stale-view phase where every
   # coherence case must fail) and fails the job if a control does not turn a case
   # red. So a green result here is evidence rather than an absence of evidence.
+  #
+  # The matrix completes in about two minutes here, and the driver's own
+  # --case-timeout (8m, deliberately larger than the 3m storm bound one case
+  # sets for itself) reports a deadlocked case before this job timeout can kill
+  # the runner without diagnostics.
+  #
+  # scripts/package-manager-matrix.sh -- real dependency installers racing a
+  # concurrent reader on the second mount -- used to run here as a second step
+  # and made this the longest lane in the workflow by an order of magnitude. It
+  # is a workload soak, not a merge gate: it stays in the tree, runs on demand
+  # against this same container, and its shape is qualified after deploy by
+  # deploy/opensteer/staging-qualification.sh phase 8.
   linux-coherence-matrix:
-    runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Verify the runner can provide loop devices and /dev/fuse
+      - name: Verify the stock runner can provide loop devices and /dev/fuse
         run: |
           sudo modprobe loop
           sudo modprobe fuse
           test -e /dev/loop-control
           test -e /dev/fuse
-      # The strict protocol runs against a volume that really declares
+      # The route cases run against a volume that really declares
       # machine-local routes: the script installs the declaration through the
       # admin ApplyRoutes call before either mount attaches, so the run also
       # exercises the mount's adopt-and-retry attach path.
       - name: Two-mount cross-mount coherence matrix
         run: bash scripts/coherence-matrix-linux.sh
-      - name: Package-manager concurrent-reader matrix
-        run: bash scripts/package-manager-matrix.sh

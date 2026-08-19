@@ -46,7 +46,7 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 	if request == nil {
 		return authoritymetrics.OperationUnknown
 	}
-	switch body := request.GetBody().(type) {
+	switch request.GetBody().(type) {
 	case *authoritypb.Request_Hello:
 		return authoritymetrics.OperationHello
 	case *authoritypb.Request_Attach:
@@ -67,10 +67,10 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationCancel
 	case *authoritypb.Request_TerminalDeliveryReceipt:
 		return authoritymetrics.OperationTerminalDeliveryReceipt
-	case *authoritypb.Request_NextVisibility:
-		return authoritymetrics.OperationNextVisibility
-	case *authoritypb.Request_AckVisibility:
-		return authoritymetrics.OperationAckVisibility
+	case *authoritypb.Request_NextFskitRepair:
+		return authoritymetrics.OperationNextFskitRepair
+	case *authoritypb.Request_AckFskitRepair:
+		return authoritymetrics.OperationAckFskitRepair
 	case *authoritypb.Request_ApplyRoutes:
 		return authoritymetrics.OperationApplyRoutes
 	case *authoritypb.Request_Lookup:
@@ -99,18 +99,18 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationClose
 	case *authoritypb.Request_Read:
 		return authoritymetrics.OperationRead
-	case *authoritypb.Request_OneShotWrite:
-		return authoritymetrics.OperationOneShotWrite
-	case *authoritypb.Request_WriteTransaction:
-		switch body.WriteTransaction.GetPhase() {
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
-			return authoritymetrics.OperationWriteTransactionBegin
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
-			return authoritymetrics.OperationWriteTransactionData
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT:
-			return authoritymetrics.OperationWriteTransactionCommit
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
-			return authoritymetrics.OperationWriteTransactionAbort
+	case *authoritypb.Request_Write:
+		return authoritymetrics.OperationWrite
+	case *authoritypb.Request_FskitWrite:
+		switch request.GetFskitWrite().GetPhase() {
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
+			return authoritymetrics.OperationFskitWriteBegin
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
+			return authoritymetrics.OperationFskitWriteData
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT:
+			return authoritymetrics.OperationFskitWriteCommit
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
+			return authoritymetrics.OperationFskitWriteAbort
 		default:
 			return authoritymetrics.OperationUnknown
 		}
@@ -166,9 +166,9 @@ func responseOutcome(response *authoritypb.Response) authoritymetrics.Outcome {
 	case authoritypb.FailureClass_FAILURE_CLASS_ROUTES:
 		return authoritymetrics.OutcomeRoutes
 	case authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED:
-		return authoritymetrics.OutcomeVisibilityInterrupted
+		return authoritymetrics.OutcomeFskitRepairInterrupted
 	case authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY:
-		return authoritymetrics.OutcomeVisibilityRetry
+		return authoritymetrics.OutcomeFskitRepairRetry
 	}
 	errno := response.GetErrno()
 	switch {
@@ -231,8 +231,6 @@ func loggableRPC(operation authoritymetrics.Operation, outcome authoritymetrics.
 		authoritymetrics.OperationActivate, authoritymetrics.OperationAbortAttach,
 		authoritymetrics.OperationDetach, authoritymetrics.OperationReauthorize:
 		return true
-	case authoritymetrics.OperationNextVisibility, authoritymetrics.OperationAckVisibility:
-		return response.GetErrno() != 0
 	default:
 		return false
 	}

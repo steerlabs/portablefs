@@ -66,7 +66,7 @@ private func makeWiringHarness(
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let contract = cachePolicy.map { policy in
         PfsMacOSV3LocalContract(
-            authorityProtocolMajor: 5,
+            authorityProtocolMajor: 6,
             epoch: wiringEpoch,
             sessionID: wiringLocalSession,
             cachePolicy: policy,
@@ -1093,7 +1093,7 @@ extension PfsLocalMockDaemonTests {
 
 private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 5
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = wiringEpoch
     contract.sessionID = wiringLocalSession
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
@@ -1181,7 +1181,6 @@ private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3Cohere
     #expect(try await waitUntil { await daemon.stats().visibilityAcks == 2 })
     let acknowledgements = await daemon.visibilityAcknowledgements()
     #expect(acknowledgements.map(\.cursor.phase) == [.prepare, .complete])
-    #expect(acknowledgements.allSatisfy { !$0.blocked })
 
     // The mount keeps serving after the barrier.
     _ = try await volume.lookupItem(named: FSFileName(string: "wired"), inDirectory: root)

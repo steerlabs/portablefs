@@ -27,14 +27,9 @@ type rangeMutationStore interface {
 	CopyFileRange(xfsstore.Capability, xfsstore.Capability, xfsstore.CopyFileRangeSpec) (uint64, xfsstore.Attr, error)
 }
 
-func validRangeWriteFlags(flags uint32) bool {
-	return flags == 0 || flags == writeTransactionKillSUIDGID
-}
-
 func validFallocateRequest(body *authoritypb.FallocateRequest) bool {
 	if body == nil || len(body.GetHandle()) != 16 || body.GetLength() == 0 ||
-		body.GetOffset() > math.MaxInt64 || body.GetLength() > math.MaxInt64-body.GetOffset() ||
-		body.GetFileMaxSize() == 0 || body.GetFileMaxSize() > math.MaxInt64 || !validRangeWriteFlags(body.GetWriteFlags()) {
+		body.GetOffset() > math.MaxInt64 || body.GetLength() > math.MaxInt64-body.GetOffset() {
 		return false
 	}
 	switch body.GetMode() {
@@ -57,8 +52,7 @@ func validCopyFileRangeRequest(body *authoritypb.CopyFileRangeRequest) bool {
 	return body != nil && len(body.GetInputHandle()) == 16 && len(body.GetOutputHandle()) == 16 && body.GetLength() != 0 &&
 		body.GetInputOffset() <= math.MaxInt64 && body.GetLength() <= math.MaxInt64-body.GetInputOffset() &&
 		body.GetOutputOffset() <= math.MaxInt64 && body.GetLength() <= math.MaxInt64-body.GetOutputOffset() &&
-		body.GetFileMaxSize() != 0 && body.GetFileMaxSize() <= math.MaxInt64 &&
-		validRangeWriteFlags(body.GetWriteFlags()) && body.GetFlags() == 0
+		body.GetFlags() == 0
 }
 
 func rangeCoordinate(coordinate xfsstore.ObjectCoordinate) visibilityCoordinate {
@@ -112,6 +106,7 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 	}
 	var handle xfsstore.Capability
 	var coordinate visibilityCoordinate
+	var releaseMutation func()
 	prepare := func() ([]volumeserver.VisibilityTarget, error) {
 		if !validFallocateRequest(body) {
 			return nil, syscall.EINVAL
@@ -126,16 +121,19 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			return nil, err
 		}
 		coordinate = rangeCoordinate(resolved)
+		releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+		if err != nil {
+			return nil, err
+		}
 		return []volumeserver.VisibilityTarget{
 			inodeTarget(volumeserver.VisibilityData, coordinate, 0),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}, nil
 	}
-	return h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		post, applyErr := store.Fallocate(handle, xfsstore.FallocateSpec{
-			Offset: body.GetOffset(), Length: body.GetLength(), RLimitSize: body.GetRlimitFsize(),
-			FileMaxSize: body.GetFileMaxSize(), Mode: body.GetMode(),
-			KillPrivileges: body.GetWriteFlags()&writeTransactionKillSUIDGID != 0,
+			Offset: body.GetOffset(), Length: body.GetLength(), RLimitSize: math.MaxUint64,
+			FileMaxSize: math.MaxInt64, Mode: body.GetMode(), KillPrivileges: true,
 		})
 		if applyErr != nil && !errors.Is(applyErr, xfsstore.ErrWritePostApply) {
 			if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {
@@ -159,7 +157,7 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			resultErr = rangeResultError(applyErr)
 		}
 		resp := h.success(0)
-		resp.PostAttr = attrProto(post)
+		resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: post, roles: postStateRoleTarget, changed: true})
 		resp.Body = &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{
 			PostSize: uint64(post.Size), VisibilitySequence: sequence, Flags: flags, Error: resultErr,
 		}}
@@ -171,6 +169,10 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
 	})
+	if releaseMutation != nil {
+		releaseMutation()
+	}
+	return response
 }
 
 func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authoritypb.Request, credential volumeserver.SessionCredential, body *authoritypb.CopyFileRangeRequest) *authoritypb.Response {
@@ -180,6 +182,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 	}
 	var input, output xfsstore.Capability
 	var sourceCoordinate, destinationCoordinate visibilityCoordinate
+	var releaseMutation func()
 	prepare := func() ([]volumeserver.VisibilityTarget, error) {
 		if !validCopyFileRangeRequest(body) {
 			return nil, syscall.EINVAL
@@ -204,6 +207,10 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if err != nil {
 			return nil, err
 		}
+		releaseMutation, err = lockMutationStore(h.Store, sourceCoordinate.identity, destinationCoordinate.identity)
+		if err != nil {
+			return nil, err
+		}
 		return []volumeserver.VisibilityTarget{
 			inodeTarget(volumeserver.VisibilityData, sourceCoordinate, 0),
 			inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0),
@@ -211,11 +218,10 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			inodeTarget(volumeserver.VisibilityAttributes, destinationCoordinate, 0),
 		}, nil
 	}
-	return h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+	response := h.mutateVisibleSequence(ctx, req, credential, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		copied, post, applyErr := store.CopyFileRange(input, output, xfsstore.CopyFileRangeSpec{
 			InputOffset: body.GetInputOffset(), OutputOffset: body.GetOutputOffset(), Length: body.GetLength(),
-			RLimitSize: body.GetRlimitFsize(), FileMaxSize: body.GetFileMaxSize(),
-			KillPrivileges: body.GetWriteFlags()&writeTransactionKillSUIDGID != 0,
+			RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, KillPrivileges: true,
 		})
 		zeroPostApply := copied == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
 			!errors.Is(applyErr, xfsstore.ErrOutcomeUncertain)
@@ -244,8 +250,15 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			flags |= rangeReplyPostApply
 			resultErr = rangeResultError(applyErr)
 		}
+		sourcePost, sourceErr := h.Store.GetattrOpen(input)
+		if sourceErr != nil {
+			return h.errorResponse(0, sourceErr, true), []volumeserver.VisibilityTarget{}
+		}
 		resp := h.success(0)
-		resp.PostAttr = attrProto(post)
+		resp.PostState = h.mutationPostState(sequence,
+			postStateSnapshot{identity: sourceCoordinate.identity, attr: sourcePost, roles: postStateRoleSource, changed: false},
+			postStateSnapshot{identity: destinationCoordinate.identity, attr: post, roles: postStateRoleDestination, changed: true},
+		)
 		resp.Body = &authoritypb.Response_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeReply{
 			ResultSize: copied, PostSize: uint64(post.Size), VisibilitySequence: sequence, Flags: flags, Error: resultErr,
 		}}
@@ -253,10 +266,15 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			h.deferStorageFailure(resp, applyErr)
 		}
 		return resp, []volumeserver.VisibilityTarget{
+			inodeTarget(volumeserver.VisibilityAttributes, sourceCoordinate, 0),
 			inodeTarget(volumeserver.VisibilityData, destinationCoordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, destinationCoordinate, 0),
 		}
 	})
+	if releaseMutation != nil {
+		releaseMutation()
+	}
+	return response
 }
 
 // markRangePostApplyFailure preserves the exact range result after XFS changed

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"golang.org/x/sys/unix"
 )
@@ -76,7 +77,7 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 	// A shared mapping of a SHARED regular file is refused by the kernel with
 	// exactly ENODEV (fs/fuse/file.c). The reason survived the move to a
 	// retained page cache and got sharper: a writable shared mapping would
-	// dirty folios that never travel the strict write transaction, and a dirty
+	// dirty folios that never travel an authority WRITE RPC, and a dirty
 	// folio is the one thing invalidate_inode_pages2() cannot withdraw, so it
 	// would turn every later DATA repair on the inode into a revocation.
 	// Accepting EINVAL or ENOSYS as well would let an unrelated mmap breakage,
@@ -329,9 +330,9 @@ func TestCreateWithAReadOnlyModeReturnsAWritableHandle(t *testing.T) {
 // offset. Every mutation keeps the file length identical, so no size-derived
 // heuristic can rescue a stale page.
 //
-// Since SHARED regular opens became FOPEN_KEEP_CACHE|FOPEN_PFS_SHARED this is
-// also the load-bearing cached-page test, and the same-length payloads are what
-// make it one. The first read populates mount B's page cache; every later read
+// Read-only opens covered by a D-R lease use FOPEN_KEEP_CACHE, so this is also
+// the load-bearing cached-page test. The same-length payloads are what make it
+// one. The first read populates mount B's page cache; every later read
 // at the same offset is served from that cache unless something withdrew it.
 // Only the ordered DATA publication does -- it invalidates the whole mapping by
 // sequence, never by an EOF delta -- so a kernel that short-circuited the
@@ -840,53 +841,44 @@ func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
 	}
 }
 
-// TestWriteSizeClassesUseExactAuthorityShapes is gated on the pinned kernel.
-// It proves the small-write optimization at the real /dev/fuse boundary and
-// also pins that the transaction ladder owns both byte counts above max_write
-// and iterators which fit that byte bound but exceed one request page vector.
-func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
+// TestStockWriteRequestSplitting is gated on the provider kernel. It proves
+// that ordinary positioned writes are sent as standard FUSE_WRITE requests and
+// that max_write/page-vector boundaries split rather than entering a private
+// transaction protocol.
+func TestStockWriteRequestSplitting(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	path := f.join(0, "write-size-classes")
 	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR, 0o600)
 	defer file.Close()
 
-	countWrite := func(write func() error) (oneShot, transactions int) {
+	countWrite := func(write func() error) int {
 		t.Helper()
-		beforeOneShot := f.counter.count("one-shot-write")
-		beforeTransactions := f.counter.count("write-transaction")
+		before := f.counter.count("write")
 		if err := write(); err != nil {
 			t.Fatal(err)
 		}
-		return f.counter.count("one-shot-write") - beforeOneShot,
-			f.counter.count("write-transaction") - beforeTransactions
+		return f.counter.count("write") - before
 	}
 
 	positioned := bytes.Repeat([]byte{0x31}, 4096)
-	oneShot, transactions := countWrite(func() error {
+	writes := countWrite(func() error {
 		n, err := file.WriteAt(positioned, 0)
 		if err == nil && n != len(positioned) {
 			return io.ErrShortWrite
 		}
 		return err
 	})
-	if oneShot != 1 || transactions != 0 {
-		t.Fatalf("4 KiB positioned write authority shapes = one-shot %d, transaction phases %d, want 1/0", oneShot, transactions)
+	if writes != 1 {
+		t.Fatalf("4 KiB positioned write authority calls = %d, want 1", writes)
 	}
 
-	appendFile := mustOpenFile(t, path, os.O_WRONLY|os.O_APPEND, 0)
-	appendPayload := bytes.Repeat([]byte{0x32}, 4096)
-	oneShot, transactions = countWrite(func() error {
-		n, err := appendFile.Write(appendPayload)
-		if err == nil && n != len(appendPayload) {
-			return io.ErrShortWrite
-		}
-		return err
-	})
-	if err := appendFile.Close(); err != nil {
+	// A writable O_APPEND open is ordinary. Placement itself is per write and is
+	// covered by the append suite; this test only counts request splitting, so it
+	// deliberately does not disturb the object here.
+	if appendFile, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0); err != nil {
+		t.Fatalf("O_APPEND open = %v, want acceptance", err)
+	} else if err := appendFile.Close(); err != nil {
 		t.Fatal(err)
-	}
-	if oneShot != 1 || transactions != 0 {
-		t.Fatalf("4 KiB append authority shapes = one-shot %d, transaction phases %d, want 1/0", oneShot, transactions)
 	}
 
 	const maxWrite = 1 << 20
@@ -899,34 +891,33 @@ func TestWriteSizeClassesUseExactAuthorityShapes(t *testing.T) {
 		mapping[index] = 0x33
 	}
 	unaligned := mapping[208 : 208+maxWrite]
-	oneShot, transactions = countWrite(func() error {
+	writes = countWrite(func() error {
 		n, err := unix.Pwrite(int(file.Fd()), unaligned, 2*maxWrite)
 		if err == nil && n != len(unaligned) {
 			return io.ErrShortWrite
 		}
 		return err
 	})
-	if oneShot != 0 || transactions != 4 {
-		t.Fatalf("unaligned max_write positioned write authority shapes = one-shot %d, transaction phases %d, want 0/4", oneShot, transactions)
+	if writes != 2 {
+		t.Fatalf("unaligned max_write positioned write authority calls = %d, want 2 page-vector requests", writes)
 	}
 
 	large := mapping[:maxWrite+1]
-	oneShot, transactions = countWrite(func() error {
+	writes = countWrite(func() error {
 		n, err := unix.Pwrite(int(file.Fd()), large, 3*maxWrite)
 		if err == nil && n != len(large) {
 			return io.ErrShortWrite
 		}
 		return err
 	})
-	if oneShot != 0 || transactions != 4 {
-		t.Fatalf("max_write+1 positioned write authority shapes = one-shot %d, transaction phases %d, want 0/4", oneShot, transactions)
+	if writes != 2 {
+		t.Fatalf("max_write+1 positioned write authority calls = %d, want 2 standard requests", writes)
 	}
 	expected := make([]byte, 4*maxWrite+1)
 	copy(expected, positioned)
-	copy(expected[len(positioned):], appendPayload)
 	copy(expected[2*maxWrite:], unaligned)
 	copy(expected[3*maxWrite:], large)
-	requireContent(t, path, expected, "data after both write-size shapes")
+	requireContent(t, path, expected, "data after stock FUSE write splits")
 }
 
 // TestConcurrentCrossMountWritersToOneFile covers two mounts writing the same
@@ -1542,6 +1533,466 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 	if second > files/8 || third > files/8 {
 		t.Fatalf("repeated walks cost %d and %d LOOKUPs for %d names; a strict mount must resolve a cached path without the authority", second, third, files)
 	}
+}
+
+// TestMutationPostStateEliminatesFollowupMetadataRPCs pins the request totals
+// exact post-state is meant to buy. Names are warmed before each mutation so
+// the mutation itself is the only authority operation; the immediate stat is
+// then a direct assertion that the reply installed the target and parent attrs.
+func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	modeOf := func(info os.FileInfo) os.FileMode {
+		if info == nil {
+			return 0
+		}
+		return info.Mode()
+	}
+	type counts struct {
+		lookup, getattr, create, mkdir, unlink, rmdir, rename, write, setattr, symlink, link int
+		open, tmpfile, fallocate, copyFileRange, removeXattr                                 int
+	}
+	measure := func(operation string, fn func()) counts {
+		before := counts{
+			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
+			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
+			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
+			rename: f.counter.count("rename"), write: f.counter.count("write"),
+			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
+			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
+			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
+			removeXattr: f.counter.count("remove-xattr"),
+		}
+		fn()
+		after := counts{
+			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
+			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
+			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
+			rename: f.counter.count("rename"), write: f.counter.count("write"),
+			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
+			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
+			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
+			removeXattr: f.counter.count("remove-xattr"),
+		}
+		delta := counts{
+			lookup: after.lookup - before.lookup, getattr: after.getattr - before.getattr,
+			create: after.create - before.create, mkdir: after.mkdir - before.mkdir,
+			unlink: after.unlink - before.unlink, rmdir: after.rmdir - before.rmdir,
+			rename: after.rename - before.rename, write: after.write - before.write,
+			setattr: after.setattr - before.setattr, symlink: after.symlink - before.symlink, link: after.link - before.link,
+			open: after.open - before.open, tmpfile: after.tmpfile - before.tmpfile,
+			fallocate: after.fallocate - before.fallocate, copyFileRange: after.copyFileRange - before.copyFileRange,
+			removeXattr: after.removeXattr - before.removeXattr,
+		}
+		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d mkdir=%d unlink=%d rmdir=%d rename=%d write=%d setattr=%d symlink=%d link=%d open=%d tmpfile=%d fallocate=%d copy-file-range=%d remove-xattr=%d",
+			operation, delta.lookup, delta.getattr, delta.create, delta.mkdir, delta.unlink, delta.rmdir,
+			delta.rename, delta.write, delta.setattr, delta.symlink, delta.link, delta.open, delta.tmpfile,
+			delta.fallocate, delta.copyFileRange, delta.removeXattr)
+		return delta
+	}
+	requireCounts := func(operation string, got, want counts) {
+		t.Helper()
+		if got != want {
+			t.Fatalf("%s RPCs = %+v, want %+v", operation, got, want)
+		}
+	}
+
+	root := f.mountPath(0)
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("warm root attrs: %v", err)
+	}
+	createdPath := filepath.Join(root, "post-state-created")
+	if _, err := os.Lstat(createdPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm create destination absence: %v", err)
+	}
+	var created *os.File
+	createRPCs := measure("create plus child/parent stat", func() {
+		var err error
+		// Linux always performs one fresh LOOKUP for a negative dentry before
+		// CREATE, including the ordinary non-exclusive path. It precedes the
+		// mutation and therefore says nothing about post-state completeness; the
+		// child and parent stats below are the follow-up requests this assertion
+		// requires the CREATE post-state to eliminate.
+		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := os.Lstat(createdPath); err != nil {
+			t.Fatalf("stat created child: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after create: %v", err)
+		}
+	})
+	requireCounts("create plus child/parent stat", createRPCs, counts{lookup: 1, create: 1})
+
+	payload := []byte("exact post-state")
+	writeRPCs := measure("write plus warm fstat", func() {
+		if n, err := created.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("write = (%d, %v), want (%d, nil)", n, err, len(payload))
+		}
+		info, err := created.Stat()
+		if err != nil || info.Size() != int64(len(payload)) {
+			t.Fatalf("warm fstat after write: size=%v err=%v", sizeOf(info), err)
+		}
+	})
+	requireCounts("write plus warm fstat", writeRPCs, counts{write: 1})
+	if err := created.Close(); err != nil {
+		t.Fatalf("close created file: %v", err)
+	}
+
+	setattrRPCs := measure("setattr plus warm stat", func() {
+		if err := os.Chmod(createdPath, 0o640); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		info, err := os.Lstat(createdPath)
+		if err != nil || info.Mode().Perm() != 0o640 {
+			t.Fatalf("stat after chmod: mode=%v err=%v", modeOf(info), err)
+		}
+	})
+	requireCounts("setattr plus warm stat", setattrRPCs, counts{setattr: 1})
+
+	truncateRPCs := measure("truncating open plus warm fstat", func() {
+		file, err := os.OpenFile(createdPath, os.O_TRUNC|os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("truncating open: %v", err)
+		}
+		info, statErr := file.Stat()
+		if statErr != nil || info.Size() != 0 {
+			_ = file.Close()
+			t.Fatalf("fstat after truncating open: size=%v err=%v", sizeOf(info), statErr)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close truncated file: %v", err)
+		}
+	})
+	requireCounts("truncating open plus warm fstat", truncateRPCs, counts{open: 1})
+
+	fallocateFile, err := os.OpenFile(createdPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open fallocate target: %v", err)
+	}
+	fallocateRPCs := measure("fallocate plus warm fstat", func() {
+		if err := unix.Fallocate(int(fallocateFile.Fd()), 0, 0, 4096); err != nil {
+			t.Fatalf("fallocate: %v", err)
+		}
+		info, statErr := fallocateFile.Stat()
+		if statErr != nil || info.Size() != 4096 {
+			t.Fatalf("fstat after fallocate: size=%v err=%v", sizeOf(info), statErr)
+		}
+	})
+	requireCounts("fallocate plus warm fstat", fallocateRPCs, counts{fallocate: 1})
+	if err := fallocateFile.Close(); err != nil {
+		t.Fatalf("close fallocate target: %v", err)
+	}
+
+	const removableXattr = "user.portablefs-post-state-remove"
+	if err := unix.Setxattr(filepath.Join(f.volumeRoot, "post-state-created"), removableXattr, []byte("value"), 0); err != nil {
+		t.Fatalf("seed removable xattr directly in the isolated backing tree: %v", err)
+	}
+	removeXattrRPCs := measure("remove xattr plus warm stat", func() {
+		if err := unix.Removexattr(createdPath, removableXattr); err != nil {
+			t.Fatalf("removexattr: %v", err)
+		}
+		if _, err := os.Lstat(createdPath); err != nil {
+			t.Fatalf("stat after removexattr: %v", err)
+		}
+	})
+	requireCounts("remove xattr plus warm stat", removeXattrRPCs, counts{removeXattr: 1})
+
+	mkdirPath := filepath.Join(root, "post-state-directory")
+	if _, err := os.Lstat(mkdirPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm mkdir destination absence: %v", err)
+	}
+	mkdirRPCs := measure("mkdir plus child/parent stat", func() {
+		if err := os.Mkdir(mkdirPath, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if _, err := os.Lstat(mkdirPath); err != nil {
+			t.Fatalf("stat created directory: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after mkdir: %v", err)
+		}
+	})
+	requireCounts("mkdir plus child/parent stat", mkdirRPCs, counts{lookup: 1, mkdir: 1})
+
+	mknodPath := filepath.Join(root, "post-state-mknod")
+	if _, err := os.Lstat(mknodPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm mknod destination absence: %v", err)
+	}
+	mknodRPCs := measure("mknod plus child/parent stat", func() {
+		if err := unix.Mknod(mknodPath, unix.S_IFREG|0o600, 0); err != nil {
+			t.Fatalf("mknod regular file: %v", err)
+		}
+		for _, path := range []string{mknodPath, root} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after mknod %s: %v", path, err)
+			}
+		}
+	})
+	requireCounts("mknod plus child/parent stat", mknodRPCs, counts{lookup: 1, create: 1})
+
+	tmpfileRPCs := measure("tmpfile plus inode/parent stat", func() {
+		fd, err := unix.Open(root, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+		if err != nil {
+			t.Fatalf("open O_TMPFILE: %v", err)
+		}
+		file := os.NewFile(uintptr(fd), "post-state-tmpfile")
+		if file == nil {
+			_ = unix.Close(fd)
+			t.Fatal("wrap O_TMPFILE descriptor")
+		}
+		if _, err := file.Stat(); err != nil {
+			_ = file.Close()
+			t.Fatalf("fstat O_TMPFILE: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close O_TMPFILE: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after O_TMPFILE: %v", err)
+		}
+	})
+	requireCounts("tmpfile plus inode/parent stat", tmpfileRPCs, counts{tmpfile: 1})
+
+	symlinkPath := filepath.Join(root, "post-state-symlink")
+	if _, err := os.Lstat(symlinkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm symlink destination absence: %v", err)
+	}
+	symlinkRPCs := measure("symlink plus child/parent stat", func() {
+		if err := os.Symlink("post-state-created", symlinkPath); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if info, err := os.Lstat(symlinkPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("lstat created symlink: mode=%v err=%v", modeOf(info), err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after symlink: %v", err)
+		}
+	})
+	requireCounts("symlink plus child/parent stat", symlinkRPCs, counts{lookup: 1, symlink: 1})
+
+	linkPath := filepath.Join(root, "post-state-hardlink")
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("warm link source: %v", err)
+	}
+	if _, err := os.Lstat(linkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm link destination absence: %v", err)
+	}
+	linkRPCs := measure("link plus target/source/parent stat", func() {
+		if err := os.Link(createdPath, linkPath); err != nil {
+			t.Fatalf("link: %v", err)
+		}
+		for _, path := range []string{linkPath, createdPath, root} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after link %s: %v", path, err)
+			}
+		}
+	})
+	requireCounts("link plus target/source/parent stat", linkRPCs, counts{lookup: 1, link: 1})
+
+	copySourcePath, copyDestinationPath := filepath.Join(root, "post-state-copy-source"), filepath.Join(root, "post-state-copy-destination")
+	mustWrite(t, copySourcePath, []byte("copy"), 0o600)
+	mustWrite(t, copyDestinationPath, nil, 0o600)
+	copySource, err := os.Open(copySourcePath)
+	if err != nil {
+		t.Fatalf("open copy source: %v", err)
+	}
+	copyDestination, err := os.OpenFile(copyDestinationPath, os.O_RDWR, 0)
+	if err != nil {
+		_ = copySource.Close()
+		t.Fatalf("open copy destination: %v", err)
+	}
+	copyRPCs := measure("copy-file-range plus source/destination stat", func() {
+		copied, err := unix.CopyFileRange(int(copySource.Fd()), nil, int(copyDestination.Fd()), nil, 4, 0)
+		if err != nil || copied != 4 {
+			t.Fatalf("copy_file_range = (%d, %v), want (4, nil)", copied, err)
+		}
+		for _, file := range []*os.File{copySource, copyDestination} {
+			if _, err := file.Stat(); err != nil {
+				t.Fatalf("fstat after copy_file_range: %v", err)
+			}
+		}
+	})
+	requireCounts("copy-file-range plus source/destination stat", copyRPCs, counts{copyFileRange: 1})
+	if err := copySource.Close(); err != nil {
+		t.Fatalf("close copy source: %v", err)
+	}
+	if err := copyDestination.Close(); err != nil {
+		t.Fatalf("close copy destination: %v", err)
+	}
+
+	rmdirPath := filepath.Join(root, "post-state-rmdir")
+	mustMkdir(t, rmdirPath)
+	for _, path := range []string{rmdirPath, root} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("warm rmdir path %s: %v", path, err)
+		}
+	}
+	rmdirRPCs := measure("rmdir plus child/parent stat", func() {
+		if err := os.Remove(rmdirPath); err != nil {
+			t.Fatalf("rmdir: %v", err)
+		}
+		if _, err := os.Lstat(rmdirPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat removed directory: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after rmdir: %v", err)
+		}
+	})
+	requireCounts("rmdir plus child/parent stat", rmdirRPCs, counts{lookup: 1, rmdir: 1})
+
+	existingName := "post-state-existing-create"
+	existingPath := filepath.Join(root, existingName)
+	if _, err := os.Lstat(existingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm existing-create negative: %v", err)
+	}
+	injected := make(chan error, 1)
+	peerCreateEntered := make(chan struct{})
+	var peerCreateOnce sync.Once
+	f.counter.setBeforeHandle(func(request *authoritypb.Request) {
+		create := request.GetCreate()
+		if create == nil || string(create.GetName()) != existingName {
+			return
+		}
+		peerCreateOnce.Do(func() { close(peerCreateEntered) })
+	})
+	defer f.counter.setBeforeHandle(nil)
+	type existingCreateResult struct {
+		errno   int32
+		failure authoritypb.FailureClass
+		err     error
+	}
+	results := make(chan existingCreateResult, 8)
+	var injectOnce sync.Once
+	f.transports[0].setBeforeMutation(func(request *authoritypb.Request) {
+		create := request.GetCreate()
+		if create == nil || string(create.GetName()) != existingName {
+			return
+		}
+		injectOnce.Do(func() {
+			go func() {
+				file, createErr := os.OpenFile(f.join(1, existingName), os.O_CREATE|os.O_RDWR, 0o600)
+				if createErr == nil {
+					createErr = file.Close()
+				}
+				injected <- createErr
+			}()
+			select {
+			case <-peerCreateEntered:
+			case <-time.After(integrationRequestTimeout):
+			}
+		})
+	})
+	defer f.transports[0].setBeforeMutation(nil)
+	f.transports[0].setAfterMutation(func(request *authoritypb.Request, response *authoritypb.Response, err error) {
+		create := request.GetCreate()
+		if create != nil && string(create.GetName()) == existingName {
+			results <- existingCreateResult{
+				errno: response.GetErrno(), failure: response.GetFailure(),
+				err: err,
+			}
+		}
+	})
+	defer f.transports[0].setAfterMutation(nil)
+	var existingOpenErr error
+	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
+		file, openErr := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if openErr != nil {
+			existingOpenErr = openErr
+			return
+		}
+		if _, err := file.Stat(); err != nil {
+			_ = file.Close()
+			t.Fatalf("fstat existing-create result: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close existing-create result: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after existing create: %v", err)
+		}
+	})
+	f.transports[0].setBeforeMutation(nil)
+	f.transports[0].setAfterMutation(nil)
+	var injectionErr error
+	select {
+	case injectionErr = <-injected:
+	case <-time.After(integrationRequestTimeout):
+		t.Fatal("the peer existing-create mutation did not complete")
+	}
+	if injectionErr != nil {
+		t.Fatalf("materialize existing-create race through the peer mount: %v", injectionErr)
+	}
+	var rpcResults []existingCreateResult
+	for len(results) != 0 {
+		rpcResults = append(rpcResults, <-results)
+	}
+	if existingOpenErr != nil {
+		t.Fatalf("open existing name through FUSE_CREATE: %v (RPC results=%+v; frontend fatal cause: %v)",
+			existingOpenErr, rpcResults, f.mounts[0].fatalError())
+	}
+	// Both mounts create the same name inside this window: one FUSE_CREATE
+	// materializes it and the other resolves the existing object, each with one
+	// authority mutation, and the loser's kernel supplies its own negative
+	// dentry rather than a second LOOKUP. The follow-up stats are the one place
+	// in this test where a post-state successor grant is legitimately withheld:
+	// the peer's mutation recalls the same A coordinates while the source's
+	// reply is still being built, and a mount under recall must miss to the
+	// authority rather than cache across it. Bound that instead of pinning it,
+	// because which side reaches the recall first is genuinely concurrent.
+	if existingCreateRPCs.getattr > 3 || existingCreateRPCs.lookup > 2 {
+		t.Fatalf("existing-create raced window cost %d GETATTRs and %d LOOKUPs; at most one per observation is a recall miss",
+			existingCreateRPCs.getattr, existingCreateRPCs.lookup)
+	}
+	existingCreateRPCs.getattr, existingCreateRPCs.lookup = 0, 0
+	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{create: 2})
+
+	unlinkedPath := filepath.Join(root, "post-state-unlinked")
+	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
+	if _, err := os.Lstat(unlinkedPath); err != nil {
+		t.Fatalf("warm unlink source: %v", err)
+	}
+	unlinkRPCs := measure("unlink plus child/parent stat", func() {
+		if err := os.Remove(unlinkedPath); err != nil {
+			t.Fatalf("unlink: %v", err)
+		}
+		if _, err := os.Lstat(unlinkedPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat unlinked child: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after unlink: %v", err)
+		}
+	})
+	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{lookup: 1, unlink: 1})
+
+	oldParent, newParent := filepath.Join(root, "old-parent"), filepath.Join(root, "new-parent")
+	mustMkdir(t, oldParent)
+	mustMkdir(t, newParent)
+	source, destination := filepath.Join(oldParent, "source"), filepath.Join(newParent, "destination")
+	mustWrite(t, source, []byte("rename"), 0o600)
+	for _, path := range []string{oldParent, newParent, source} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("warm rename path %s: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm rename destination absence: %v", err)
+	}
+	renameRPCs := measure("rename plus child/parent stats", func() {
+		if err := os.Rename(source, destination); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		for _, path := range []string{destination, oldParent, newParent} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after rename %s: %v", path, err)
+			}
+		}
+	})
+	// The warmed source name resolves inside the daemon under its N lease, so
+	// only the destination's absence -- which carries no cacheable fact -- costs
+	// the kernel's pre-rename LOOKUP a round trip.
+	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
 }
 
 // TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's

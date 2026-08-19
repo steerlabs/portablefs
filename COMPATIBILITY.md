@@ -1,6 +1,16 @@
 # Compatibility
 
-This is the PortableFS v3 stability contract.
+This is the PortableFS v3 stability contract. Authority protocol 6 is a
+deliberate wire reset from the retired protocol-5/private-kernel candidate;
+there is no mixed-version execution path.
+
+Status: **verification candidate (pre-launch)**. PortableFS has not launched,
+and the normative coherence specification behind protocol 6
+([docs/portable-coherence.md](./docs/portable-coherence.md)) is still DRAFT
+pending the §12 L1–L6 verification program. The surfaces below are therefore
+stated as the intended contract and reviewed as if frozen — no change lands
+silently — but they become a stability promise only when that specification
+leaves draft.
 
 ## v2 is gone
 
@@ -23,20 +33,25 @@ client at the handshake rather than negotiating down.
 Everything below describes v3 and only v3. If a surface is not listed here,
 treat it as internal and unstable.
 
-## Frozen
+## Verification-candidate contract
 
-Breaking changes are prohibited. Deployments and clients may pin against these.
+These are the surfaces protocol 6 is committing to. Breaking changes are
+prohibited without going through [Changing a contract
+surface](#changing-a-contract-surface); a change that verification forces is
+still a coordinated protocol-major change, not a silent edit. Pre-launch, pin
+against these knowing the draft specification can still move a detail; after it
+leaves draft they are frozen.
 
 ### The authority wire
 
 - **Transport is mutually authenticated TLS 1.3**, with ALPN
-  `portablefs-authority-v5` and authority protocol major `5`. Plaintext is
+  `portablefs-authority-v6` and authority protocol major `6`. Plaintext is
   refused; there is no fallback mode and no environment escape.
 
   The names are worth reading carefully, because two version numbers are in play
-  and they do not mean the same thing. `portablefs-authority-v5` and protocol
-  major `5` name the *authority protocol* generation, not the product
-  generation. Authority protocol 5 requires exactly one authenticated DATA
+  and they do not mean the same thing. `portablefs-authority-v6` and protocol
+  major `6` name the *authority protocol* generation, not the product
+  generation. Authority protocol 6 requires exactly one authenticated DATA
   transport and one authenticated CONTROL transport in the same random
   connection set. Attach returns only a provisional credential. The session
   becomes active exactly once, through Activate, after both role bindings and
@@ -44,78 +59,67 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
   A provisional session cannot execute filesystem or visibility operations.
   There is no single-connection or direct-active-attach compatibility path.
 
-  Protocol 5 retains protocol 4's exact-replay treatment
-  of every capability acquisition. For mutations, the client sends only its
-  owned replay slot and sequence; the authority derives the content identity
-  with a per-epoch secret keyed fingerprint over the full canonical body. The
-  secret and fingerprint never cross the wire, and replay state is discarded
-  with that same epoch. Protocol 5 carries write-transaction DATA fragments in
-  `WriteTransactionRequest.Data`, complete single-fragment writes in
-  `OneShotWriteRequest.Data`, and read payloads in `ReadReply.Data` as the
-  frame's one exact out-of-line bulk body. The protobuf
-  metadata and bulk lengths are both in the frame header; a bulk body on any
-  other message, or an inline copy of either bulk field, is a protocol error.
-  This removes client-side mutation hashing and payload-sized protobuf copies
-  without adding another data path.
-  In particular, Lookup is not a side-effect-free read: its reply transfers an
-  item capability that must be returned exactly once or explicitly reclaimed.
-  Protocol 4 also permits a visibility `Next` request to atomically acknowledge
-  its `after` cursor and long-poll for the successor. Repeating that request
-  after a lost response is safe because the exact last accepted cursor remains
-  idempotent. Protocol 5 replaces source self-phases with one exact
-  source-publication gate: the initiating frontend closes and drains its stable
-  item/name footprint before dispatch, the authority independently derives and
-  validates that same footprint, and PREPARE/COMPLETE are delivered only to
-  other cached participants. On Linux the local gate remains closed through
-  the kernel's operation-specific VFS postprocessing and the physical ACK of a
-  forced `FUSE_PFS_PUBLISH`; a daemon `write(/dev/fuse)` returning is not that
-  boundary. Qualification frontends must supply an equally explicit framework
-  publication verdict. A post-apply local publication failure ends the mount
-  rather than reopening stale state. Protocol-4 single-transport
-  direct activation and protocol-5 paired, provisional activation are
-  wire-incompatible, so peers fail at TLS ALPN and `Hello` rather than mix
-  lifecycles.
+  Protocol 6 retains session-exact replay, canonical framed bulk data,
+  object-relative authority operations, paired transport activation, and
+  write-through mutation acknowledgement. Each mount declares one immutable
+  frontend profile. `LINUX_LEASES` uses authority-issued N/A/D/E leases for
+  name bindings, attributes, whole-file clean data, and directory enumeration.
+  `FSKIT_SYNC_REPAIR` uses the ordered PREPARE/COMPLETE repair and source-
+  publication surfaces that the macOS API can actually drive. A conflicting
+  mutation closes every affected Linux lease audience and FSKit repair audience
+  before XFS apply and does not reopen either early. The initiating syscall's
+  response is the external completion/visibility boundary; the mutation
+  linearizes after XFS apply and before that response, consistently with the
+  guarantees declared by its frontend profile. Linux source A/D/E and daemon N
+  state are purged before the reply; kernel entry validity is always zero, so
+  rename cannot transplant an old leased dentry timeout. There is no private
+  kernel publication message.
 
-- **Both peers name what they require, and refuse on absence.** A session
-  requires the `xfs-current-state`, `session-exact-epoch`, `direct-write`,
-  `framed-bulk-data-v1`, `authority-keyed-replay-fingerprint-v1`,
-  `visibility-ack-next-v1`, `mandatory-dual-transport-v1`,
-  `transactional-shared-write-v1`, `one-shot-write-v1`, `strict-linux-mutation-suite-v1`,
-  `terminal-applied-delivery-receipt-v1`,
-  `strict-two-phase-visibility`, `classified-visibility-interruption`,
-  `sequenced-visibility-retry-v1`, `lockless-namespace-repair-v1`,
-  `source-publication-gate-v1`,
-  `namespace-post-binding-identity`, and `exact-resource-acquisition` features at `Hello`, and `write-through`,
-  `no-history`, `no-branches`,
-  `direct-io-no-file-mmap`, `user-xattr-readonly`, `single-principal`,
-  `distributed-posix-locks`, `stable-item-identity`, `readdir-plus-items`,
-  `volume-syncfs-barrier`, `transactional-shared-write-v1`,
-  `one-shot-write-v1`, and `exact-resource-acquisition` at `Activate`. A
-  strict attach additionally requires
-  `strict-two-phase-visibility`, `classified-visibility-interruption`,
-  `sequenced-visibility-retry-v1`, `lockless-namespace-repair-v1`,
-  `source-publication-gate-v1`, and
-  `namespace-post-binding-identity` in its Activate reply. These strings are the contract's shape written down: an
-  authority that stopped meeting one of them would be refused rather than
-  silently tolerated.
+  Writes use ordinary `FUSE_WRITE` between Linux and the daemon. Operation
+  identity, replay, and streaming are daemon-to-authority concerns; no kernel
+  transaction, one-shot capability, private opcode, or completion ring is part
+  of the contract. Append placement is the one
+  decision the frontend forwards rather than makes: `WriteRequest.append` asks
+  the authority to place the payload at the true EOF and `assigned_offset`
+  reports where it landed. The intent is the description's
+  `O_APPEND`, which stock `FUSE_WRITE.flags` reports. The per-call
+  `RWF_APPEND`/`RWF_NOAPPEND` flags are not forwarded by stock Linux and are
+  disclosed deviations: the former arrives as a positioned write at the offset the
+  kernel derived, the latter keeps appending.
 
-  `one-shot-write-v1` is the additive protocol-5 write operation for a complete
-  payload no larger than negotiated `max_write` that fits one negotiated kernel
-  request page vector. It is one source-gated replay-slot mutation and has no
-  transaction ID or staging phase. Larger byte or page-vector shapes use the
-  existing BEGIN/DATA/COMMIT transaction. The initial iterator selects one
-  shape deterministically; neither shape is a runtime fallback for the other.
+- **Both peers name what they require, and refuse on absence.** Every mount
+  requires the common paired-transport, canonical-framing, replay,
+  write-through, stable-identity, single-principal, and read-only-user-xattr
+  assertions. A `LINUX_LEASES` session additionally requires
+  `lease-coherence-v1` and `directory-enumeration-lease-v1` at `Hello`, then
+  `lease-renewal-v1`, `lease-recall-v1`, `open-by-identity-v1`, direct I/O, and
+  distributed Linux locks at `Activate`. Its successful cacheable responses
+  carry `lease_grants`; CONTROL traffic uses `next_lease_event`,
+  `acknowledge_lease_event`, `acknowledge_source_lease_discharge`, and
+  `renew_leases` with their exact response counterparts. An
+  `FSKIT_SYNC_REPAIR` session instead requires `fskit-sync-repair-v1`,
+  `fskit-source-publication-v1`, and `fskit-fragmented-write-v1`; its CONTROL
+  traffic uses the FSKit repair stream and never receives a Linux lease grant.
+  Absence of any feature required by the selected profile refuses the session;
+  features are not negotiated into a weaker profile.
 
-  The sequenced visibility retry is an internal Linux liveness transaction,
-  not an application errno or a timed retry. The authority names the exact
-  peer COMPLETE that blocked a callback; after repairing it, the frontend
-  resubmits with that sequence. The authority accepts the proof only for the
-  same callback identity and its retained one-shot FIFO debt. This lets both
-  namespace and inode operations wait behind a CONTROL ACK already in flight
-  without allowing a stale, forged, or FSKit request to bypass visibility
-  ordering. Strict Linux namespace repair is lockless dentry expiration; the
-  retired parent-lock profile is refused rather than translated into an
-  application-visible synthetic `EINTR`.
+  Protocol 6 freezes a 20-second maximum authority lease horizon and a
+  five-second client withdrawal interval. A client anchors the wire
+  `valid_for_nanos` duration at request start, ends local cache validity five
+  seconds before that horizon, and authorizes no caching when the remaining
+  duration cannot contain the withdrawal interval. Renewal, withdrawal, and
+  terminalization are independent; a blocked renewal cannot extend cache
+  validity or postpone the hard horizon.
+
+  Attach declares one required session purpose. `MOUNT` is the only purpose
+  that receives a root capability or joins durable mount membership; a Linux
+  mount joins the lease coordinator and an FSKit mount joins the repair
+  coordinator. `ROUTE_ADMIN` requires signed admin access and is restricted to
+  route CAS and session plumbing; it receives no root, lease cursor, or repair
+  cursor and never joins mount membership. A mount session cannot invoke
+  `ApplyRoutes`, even when its credential also has admin scope. This separation
+  makes the route clean-absence check exclude only a control connection, never
+  a possible mount.
 
   Feature advertisement proves what the authority can execute; it does not
   manufacture a callback that a host filesystem API does not expose. In
@@ -136,30 +140,48 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
 ### Filesystem semantics
 
 The guarantees in [docs/consistency-model.md](./docs/consistency-model.md) are
-frozen: write-through acknowledgement, `fsync` on the authoritative descriptor,
+part of the contract: write-through acknowledgement, `fsync` on the authoritative descriptor,
 `close` is not an implicit `fsync`, session-exact replay inside an epoch, no
 silent continuation across an epoch, atomic rename, and open-after-unlink. The
 authority implements independent POSIX record and `flock` lock namespaces, and
 Linux FUSE forwards both. Current FSKit exposes neither lock callback nor the
-cache primitives required for a strict shared filesystem, so production macOS
-mounts are refused before Attach rather than advertising a smaller guarantee.
+N/A/E cache primitives, per-reply non-installing metadata control, nor exact
+append intent. macOS therefore declares the separate `FSKIT_SYNC_REPAIR`
+profile and its smaller guarantees instead of advertising Linux lease
+semantics.
 
-The explicit refusals are equally frozen, because programs depend on getting an
+Cross-mount namespace coherence covers forward pathname resolution and
+directory enumeration. Reverse rendering of an already-held Linux dentry
+(`getcwd`, `/proc/*/fd`, and other `d_path` users) is outside that guarantee:
+stock Linux performs no FUSE revalidation for those observations and exposes no
+receipt that can make a remote rename linearizable there. This is an explicit
+semantic boundary, not a weaker negotiated profile.
+
+The explicit refusals carry equal weight, because programs depend on getting an
 errno rather than incoherent data: shared file-backed `mmap`, `setxattr`, device
 nodes, FIFOs, sockets, setuid execution, and cross-volume link and rename. The
 XFS authority and Linux expose unsupported xattr writes as `EOPNOTSUPP`. The
-macOS xattr mapping remains covered by qualification tests, but it is not a
-production surface while all macOS protocol-5 mounts are refused.
+macOS xattr mapping remains covered by its explicit FSKit profile tests and is
+not evidence for Linux-equivalent cache coherence.
 
 ### Mount transports
 
-Linux mounts through kernel FUSE. macOS 26 mounts through the shipping FSKit
-extension under the named `macos26-synchronous-vfs-repair-v2` best-effort
-policy. One active Mac owns the volume's compatibility writer lease; Linux
-peers may read but their visible mutations return `EBUSY`, and a second Mac
-writer is refused before activation. There is no protocol fallback, local
-filesystem substitution, or runtime policy opt-in. macOS 27 remains a separate
-qualification-only native-cache track.
+Linux mounts through stock kernel FUSE protocol 7.31 or newer. PortableFS
+requires only upstream FUSE requests and notification semantics; it advertises
+no PortableFS-private capability bit and recognizes no private opcode. A kernel below 7.31 is
+refused during FUSE INIT rather than served through a reduced semantic profile.
+The authority session is established first because the kernel level is revealed
+only by INIT; on refusal the client proves that no usable mount was installed
+and cleanly detaches that session.
+
+macOS 26 and 27 mount through the explicit protocol-6 `FSKIT_SYNC_REPAIR`
+frontend profile. It is selected before Attach, pinned into the canonical
+session fingerprint, and cannot change on replay or resume. The authority does
+not issue N/A/D/E grants to it; it retains the FSKit PREPARE/COMPLETE,
+source-publication, and fragmented-write bodies behind a strict profile
+allowlist. Linux sessions cannot invoke those bodies, and FSKit sessions cannot
+invoke lease control. This is a declared platform contract, not probing,
+fallback to an older protocol major, or local-filesystem substitution.
 
 Windows has no declared transport, released client binary, or install path yet.
 The pure `auto` selector carries a stable primitive-gate refusal that any future
@@ -172,27 +194,27 @@ declaring a future transport are in
 
 ### Declared macOS cache policies
 
-Three cache-policy names remain in the protocol so clients are classified
-precisely: the frozen macOS 26 v1/v2 synchronous-repair policies and
-`fskit-native-revocation-v1`. Shipping macOS 26 selects v2 explicitly; v1 is a
-frozen compatibility spelling and both callback-serialized profiles acquire
-the same exclusive writer lease at authority admission. The native policy is
-qualification-only. An unknown policy still fails closed; no name is
-reinterpreted as another policy.
+The frozen macOS 26 v1/v2 synchronous-repair policy spellings and
+`fskit-native-revocation-v1` name the admitted implementations behind the
+protocol-6 FSKit frontend profile. They do not select the Linux lease profile
+or imply identical guarantees.
 
-The SDK-27 adapter remains a compile and test lane for protocol work. It
-requires the exact build-time qualification stamp
+Ordinary macOS 27 uses the admitted
+`macos26-synchronous-vfs-repair-v2` actuator under the FSKit profile. The
+SDK-27 native adapter is selected only by an app built and signed with its exact
+compile-time capability stamp
 `sdk27-live-qualification-only` in the CLI and the compile-time
-`portablefs_macos27_qualification` packaging tag. These are properties of a
-separately signed qualification artifact, not environment toggles. The stamp
-does not change macOS 26's product policy or admit macOS 28. An unsupported
-repair terminates a qualification mount before COMPLETE; passing a
-qualification test does not promote the native policy to product support.
+`portablefs_macos27_qualification` packaging tag. The historical spelling is
+frozen even though protocol 6 admits the resulting stronger actuator; it is a
+property of the signed artifact, not a runtime toggle or fallback. The stamp
+does not alter the ordinary v2 policy or automatically admit a future macOS
+release. An unsupported repair terminates the mount before COMPLETE.
 
-The best-effort boundary is architectural. macOS 26 `FSVolume.Operations`
+The weaker boundary is architectural. macOS 26 `FSVolume.Operations`
 callbacks cannot return every exact source snapshot or invalidate every peer
 namespace/attribute cache shape. The writer lease prevents a second machine
-from mutating underneath that missing primitive; repair failure still fences.
+from mutating underneath that missing primitive within the FSKit profile's
+declared constraints; it is not a proof of Linux lease semantics.
 macOS 27 `FSVolume.Handler` adds most source result attributes, but current
 FSKit still has no documented exact namespace or inode-attribute invalidation
 API for peer changes; its data-cache handler covers only retained item data. A
@@ -215,11 +237,15 @@ different revision fails closed.
 `doctor`, `mount-check`, and `version` are the user-facing commands, along with
 `--json` on every one of them and the `PORTABLEFS_MOUNT_TOKEN` environment
 variable. Documented flags keep their meaning; new flags and new JSON fields may
-appear, and consumers must ignore unknown fields. `lifecycle`,
+appear, and consumers must ignore unknown fields. `mount-check` is the one
+command with a mutating option: `--probe-mount` installs and removes one real
+throwaway FUSE mount. It is opt-in for exactly that reason, and the command
+changes nothing without it. `lifecycle`,
 `install-macos-app`, and `install-linux-release` are installer and app
 coordination surfaces, not a user contract. The shipping macOS mount command
-fails at its FSKit primitive gate before readiness or Attach. Qualification-only
-readiness code remains internal and makes no production compatibility promise.
+selects synchronous VFS repair v2 on macOS 26 and 27 before Attach. Only the
+separately stamped SDK-27 artifact selects native readiness; unsupported OS and
+policy combinations still fail before Attach.
 
 ### Release identity
 
@@ -235,9 +261,9 @@ bundle identifier, app group, FSKit type `pfs`, resource scheme
 Additive evolution with versioning; consumers tolerate additions.
 
 - New authority operations and new feature strings behind the existing
-  handshake, where an authority that lacks them still serves the frozen set.
+  handshake, where an authority that lacks them still serves the contract set.
   `session-reauthorization-v1` is one such optional feature: it adds an exact,
-  session-bound `Reauthorize` operation without making older protocol-5
+  session-bound `Reauthorize` operation without making older protocol-6
   authorities invalid for standalone mounts. `mount-enrollment-reauthorization-v1` names
   the Manager-enrollment grant basis; an automatic mount requires it and fails
   its handshake against an older authority instead of changing renewal modes.
@@ -274,9 +300,9 @@ closed on unknown fields and carry explicit schema/version fields, but they are
 not frozen public APIs yet. The authority protocol additions they use remain
 additive under the rules above.
 
-## Changing a frozen surface
+## Changing a contract surface
 
-Frozen does not mean immortal; changes are deliberate and staged.
+A contract surface is not immortal; changes are deliberate and staged.
 
 1. Propose the change in an issue explaining why additive evolution cannot work.
 2. Ship the replacement additively while the old surface keeps working, and mark
@@ -289,6 +315,7 @@ A protocol-visible change is the exception that skips straight to a new exact
 protocol major: PortableFS would rather refuse a mount at the handshake than
 serve one under a contract neither side can name.
 
-PRs that touch a frozen surface must say so explicitly and explain the
+PRs that touch a contract surface must say so explicitly and explain the
 compatibility story. Reviewers should reject silent changes to anything in the
-frozen list.
+verification-candidate list — pre-launch draft status is a reason to route the
+change through this process, not a licence to skip it.

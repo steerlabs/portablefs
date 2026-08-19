@@ -35,8 +35,6 @@ func (code Status) String() string {
 			return "NOTIFY_RESEND"
 		case NOTIFY_PRUNE:
 			return "NOTIFY_PRUNE"
-		case NOTIFY_PFS_SIZE:
-			return "NOTIFY_PFS_SIZE"
 		}
 		return fmt.Sprintf("NOTIFY_%d", -int(code))
 	}

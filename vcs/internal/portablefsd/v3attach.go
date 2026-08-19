@@ -501,6 +501,8 @@ func (a *attach) startV3(ctx context.Context) error {
 		}
 	}
 	client, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
+		Purpose:                               authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:                       authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
 		Address:                               a.authorityAddr,
 		TLS:                                   tlsCfg,
 		VolumeID:                              a.volumeID,
@@ -510,10 +512,9 @@ func (a *attach) startV3(ctx context.Context) error {
 		DialTimeout:                           v3AttachDialTimeout,
 		CancelDrainTimeout:                    v3AttachCancelDrainTimeout,
 		MaxInFlight:                           v3AttachMaxInFlight,
-		CoherenceProfile:                      authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity:                    cfg.cachedNameCapacity,
-		RepairBudget:                          cfg.repairBudget,
-		NamespaceRepair:                       v3NamespaceRepair(cfg.cachePolicy),
+		FskitCachedNameCapacity:               cfg.cachedNameCapacity,
+		FskitRepairBudget:                     cfg.repairBudget,
+		FskitNamespaceRepair:                  v3NamespaceRepair(cfg.cachePolicy),
 		RoutesRevision:                        cfg.routesRevision,
 		RequireMountEnrollmentReauthorization: cfg.enrollmentClient != nil,
 		ObservePreKernelMountAbsence:          preKernelMountAbsence,

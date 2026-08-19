@@ -213,33 +213,10 @@ func TestV3VisibilityEventRoundTrip(t *testing.T) {
 	assertWireFields(t, marshalVisibilityTarget(&visibility.Targets[2]), 1, 2)
 }
 
-func TestV3RoutesVisibilityEventRoundTrip(t *testing.T) {
-	want := &Event{Kind: &V3VisibilityEvent{
-		AuthorityEpoch:   bytes.Repeat([]byte{0x61}, 16),
-		Cursor:           VisibilityCursor{Sequence: 97, Phase: VisibilityPhaseComplete},
-		MutationSequence: 103,
-		Routes: &RoutesChange{
-			Revision: bytes.Repeat([]byte{0x66}, 32),
-			Rules:    []byte("/local/cache\n"),
-		},
-	}}
-
-	decoded := roundTripBody(t, want)
-	if !reflect.DeepEqual(decoded, want) {
-		t.Fatalf("routes visibility event round trip:\n got  %#v\n want %#v", decoded, want)
-	}
-
-	visibility := want.Kind.(*V3VisibilityEvent)
-	assertWireFields(t, marshalV3VisibilityEvent(visibility), 1, 2, 6, 7)
-	assertWireFields(t, marshalRoutesChange(visibility.Routes), 1, 2)
-}
-
 func TestVisibilityAckBodiesRoundTripAndPinEnvelopeFields(t *testing.T) {
 	want := &VisibilityAckRequest{
 		AuthorityEpoch:            bytes.Repeat([]byte{0x71}, 16),
 		Cursor:                    VisibilityCursor{Sequence: 101, Phase: VisibilityPhaseComplete},
-		Blocked:                   true,
-		Reason:                    "namespace repair waits on a callback lock",
 		OrderedAdmissionContended: true,
 	}
 	decoded := roundTripBody(t, want)
@@ -252,7 +229,7 @@ func TestVisibilityAckBodiesRoundTripAndPinEnvelopeFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertWireField(t, requestWire, 37, wireBytes)
-	assertWireFields(t, marshalVisibilityAckRequest(want), 1, 2, 3, 4, 5)
+	assertWireFields(t, marshalVisibilityAckRequest(want), 1, 2, 5)
 
 	reply := &VisibilityAckReply{}
 	if got := roundTripBody(t, reply); !reflect.DeepEqual(got, reply) {

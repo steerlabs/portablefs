@@ -3,12 +3,16 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +39,49 @@ var errInjectedFrameWrite = errors.New("injected frame write failure")
 type failAfterWriter struct {
 	bytes.Buffer
 	remaining int
+}
+
+type countedWriteConn struct {
+	net.Conn
+	reads  atomic.Int64
+	writes atomic.Int64
+}
+
+func (c *countedWriteConn) Read(payload []byte) (int, error) {
+	c.reads.Add(1)
+	return c.Conn.Read(payload)
+}
+
+func (c *countedWriteConn) Write(payload []byte) (int, error) {
+	c.writes.Add(1)
+	return c.Conn.Write(payload)
+}
+
+type deadlineWriteConn struct {
+	bytes.Buffer
+	deadline time.Time
+	writes   int
+}
+
+func (c *deadlineWriteConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (c *deadlineWriteConn) Close() error             { return nil }
+func (c *deadlineWriteConn) LocalAddr() net.Addr      { return nil }
+func (c *deadlineWriteConn) RemoteAddr() net.Addr     { return nil }
+func (c *deadlineWriteConn) SetDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	return nil
+}
+func (c *deadlineWriteConn) SetReadDeadline(time.Time) error { return nil }
+func (c *deadlineWriteConn) SetWriteDeadline(deadline time.Time) error {
+	c.deadline = deadline
+	return nil
+}
+func (c *deadlineWriteConn) Write(payload []byte) (int, error) {
+	c.writes++
+	if !c.deadline.IsZero() && !c.deadline.After(time.Now()) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return c.Buffer.Write(payload)
 }
 
 func (w *failAfterWriter) Write(value []byte) (int, error) {
@@ -88,48 +135,115 @@ func TestFrameRoundTripAndBound(t *testing.T) {
 	}
 }
 
-func TestFrameCarriesWriteTransactionDataOutsideProtobuf(t *testing.T) {
-	data := bytes.Repeat([]byte{0xA5}, 64<<10)
+func TestTLSFrameRoundTripBatchesSocketWrites(t *testing.T) {
+	serverTLS, clientTLS := testTLSConfigs(t)
+	serverTLS = serverTLS.Clone()
+	clientTLS = clientTLS.Clone()
+	serverTLS.NextProtos = []string{protocolALPN}
+	clientTLS.NextProtos = []string{protocolALPN}
+	serverTLS.DynamicRecordSizingDisabled = true
+	clientTLS.DynamicRecordSizingDisabled = true
+
+	clientRaw, serverRaw := net.Pipe()
+	clientCounted := &countedWriteConn{Conn: clientRaw}
+	serverCounted := &countedWriteConn{Conn: serverRaw}
+	client := newAuthorityTLSClient(clientCounted, clientTLS)
+	server := newAuthorityTLSServer(serverCounted, serverTLS)
+	t.Cleanup(func() {
+		_ = clientRaw.Close()
+		_ = serverRaw.Close()
+	})
+	serverHandshake := make(chan error, 1)
+	go func() { serverHandshake <- server.HandshakeContext(t.Context()) }()
+	if err := client.HandshakeContext(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serverHandshake; err != nil {
+		t.Fatal(err)
+	}
+	clientCounted.writes.Store(0)
+	clientCounted.reads.Store(0)
+	serverCounted.writes.Store(0)
+	serverCounted.reads.Store(0)
+
+	payload := bytes.Repeat([]byte{0x5C}, 1<<20)
 	want := &authoritypb.Request{
-		RequestId: 8,
-		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-			TransactionId: 17, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: data,
+		RequestId: 41,
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x71}, 16), Size: uint32(len(payload)), Data: payload,
 		}},
 	}
-	var frame bytes.Buffer
-	if err := writeFrame(&frame, 128<<10, want); err != nil {
+	serverDone := make(chan error, 1)
+	go func() {
+		got := new(authoritypb.Request)
+		if err := readFrame(server, 2<<20, nil, 0, got); err != nil {
+			serverDone <- err
+			return
+		}
+		if !proto.Equal(got, want) {
+			serverDone <- errors.New("buffered TLS request did not round trip exactly")
+			return
+		}
+		serverDone <- writeFrame(server, 2<<20, &authoritypb.Response{
+			RequestId: want.GetRequestId(),
+			Body:      &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: payload}},
+		})
+	}()
+	if err := writeFrame(client, 2<<20, want); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(want.GetWriteTransaction().GetData(), data) {
-		t.Fatal("writeFrame did not restore the caller-owned request payload")
-	}
-	metadataSize := binary.BigEndian.Uint32(frame.Bytes()[:4])
-	bulkSize := binary.BigEndian.Uint32(frame.Bytes()[4:8])
-	if bulkSize != uint32(len(data)) {
-		t.Fatalf("bulk size = %d, want %d", bulkSize, len(data))
-	}
-	var metadata authoritypb.Request
-	if err := proto.Unmarshal(frame.Bytes()[frameHeaderBytes:frameHeaderBytes+int(metadataSize)], &metadata); err != nil {
+	var response authoritypb.Response
+	if err := readFrame(client, 2<<20, nil, 0, &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(metadata.GetWriteTransaction().GetData()) != 0 {
-		t.Fatal("write data was duplicated inside protobuf metadata")
-	}
-
-	var got authoritypb.Request
-	if err := readFrame(bytes.NewReader(frame.Bytes()), 128<<10, nil, 0, &got); err != nil {
+	if err := <-serverDone; err != nil {
 		t.Fatal(err)
 	}
-	if !proto.Equal(want, &got) {
-		t.Fatalf("round trip differs: got %v", &got)
+	if !bytes.Equal(response.GetRead().GetData(), payload) {
+		t.Fatal("buffered TLS response did not round trip exactly")
+	}
+	if writes := clientCounted.writes.Load(); writes > 6 {
+		t.Fatalf("1 MiB TLS request used %d socket writes, want at most 6", writes)
+	}
+	if writes := serverCounted.writes.Load(); writes > 6 {
+		t.Fatalf("1 MiB TLS response used %d socket writes, want at most 6", writes)
+	}
+	if reads := serverCounted.reads.Load(); reads > 6 {
+		t.Fatalf("1 MiB TLS request used %d socket reads, want at most 6", reads)
+	}
+	if reads := clientCounted.reads.Load(); reads > 6 {
+		t.Fatalf("1 MiB TLS response used %d socket reads, want at most 6", reads)
 	}
 }
 
-func TestFrameCarriesOneShotWriteDataOutsideProtobufAndRetainsIt(t *testing.T) {
+func TestWriteRequestDeadlineCoversBufferedFlush(t *testing.T) {
+	raw := new(deadlineWriteConn)
+	conn := newFrameSocket(raw)
+	client := &Client{cfg: ClientConfig{CancelDrainTimeout: time.Second}}
+	transport := newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
+	transport.frameMax.Store(4096)
+	request := &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}
+	if err := client.writeRequest(t.Context(), transport, conn, request); err != nil {
+		t.Fatal(err)
+	}
+	if raw.deadline.IsZero() || raw.writes != 1 || raw.Len() == 0 {
+		t.Fatalf("buffered frame returned before its deadline-covered flush: deadline=%v writes=%d bytes=%d", raw.deadline, raw.writes, raw.Len())
+	}
+
+	expiredRaw := new(deadlineWriteConn)
+	expiredConn := newFrameSocket(expiredRaw)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	if err := client.writeRequest(ctx, transport, expiredConn, request); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expired buffered flush = %v, want deadline exceeded", err)
+	}
+}
+
+func TestFrameCarriesWriteDataOutsideProtobufAndRetainsIt(t *testing.T) {
 	data := bytes.Repeat([]byte{0x5A}, 64<<10)
 	want := &authoritypb.Request{
 		RequestId: 9,
-		Body: &authoritypb.Request_OneShotWrite{OneShotWrite: &authoritypb.OneShotWriteRequest{
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
 			Handle: bytes.Repeat([]byte{0x41}, 16), Size: uint32(len(data)), Data: data,
 		}},
 	}
@@ -137,19 +251,19 @@ func TestFrameCarriesOneShotWriteDataOutsideProtobufAndRetainsIt(t *testing.T) {
 	if err := writeFrame(&frame, 128<<10, want); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(want.GetOneShotWrite().GetData(), data) {
-		t.Fatal("writeFrame did not restore the caller-owned one-shot payload")
+	if !bytes.Equal(want.GetWrite().GetData(), data) {
+		t.Fatal("writeFrame did not restore the caller-owned write payload")
 	}
 	metadataSize := binary.BigEndian.Uint32(frame.Bytes()[:4])
 	bulkSize := binary.BigEndian.Uint32(frame.Bytes()[4:8])
 	if bulkSize != uint32(len(data)) {
-		t.Fatalf("one-shot bulk size = %d, want %d", bulkSize, len(data))
+		t.Fatalf("write bulk size = %d, want %d", bulkSize, len(data))
 	}
 	var metadata authoritypb.Request
 	if err := proto.Unmarshal(frame.Bytes()[frameHeaderBytes:frameHeaderBytes+int(metadataSize)], &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if len(metadata.GetOneShotWrite().GetData()) != 0 {
+	if len(metadata.GetWrite().GetData()) != 0 {
 		t.Fatal("one-shot data was duplicated inside protobuf metadata")
 	}
 
@@ -160,15 +274,56 @@ func TestFrameCarriesOneShotWriteDataOutsideProtobufAndRetainsIt(t *testing.T) {
 	}
 	if !proto.Equal(want, &got) {
 		release()
-		t.Fatalf("one-shot retained round trip differs: got %v", &got)
+		t.Fatalf("write retained round trip differs: got %v", &got)
 	}
-	if &got.GetOneShotWrite().GetData()[0] == &data[0] {
+	if &got.GetWrite().GetData()[0] == &data[0] {
 		release()
-		t.Fatal("decoded one-shot payload aliases the caller's original slice")
+		t.Fatal("decoded write payload aliases the caller's original slice")
 	}
 	release()
-	if got.GetOneShotWrite().GetData() != nil {
-		t.Fatal("released one-shot payload remains reachable from its carrier")
+	if got.GetWrite().GetData() != nil {
+		t.Fatal("released write payload remains reachable from its carrier")
+	}
+}
+
+func TestStreamedFrameDigestMatchesOneShotReplayFingerprint(t *testing.T) {
+	data := bytes.Repeat([]byte{0x96}, 1<<20)
+	request := &authoritypb.Request{
+		RequestId: 27,
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x35}, 16), Position: 4096, Size: uint32(len(data)), Data: data,
+		}},
+	}
+	var encoded bytes.Buffer
+	if err := writeFrame(&encoded, 2<<20, request); err != nil {
+		t.Fatal(err)
+	}
+	decoded := new(authoritypb.Request)
+	release, streamed, err := readRequestFrameRetained(bytes.NewReader(encoded.Bytes()), 2<<20, nil, 0, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	wantDigest := sha256.Sum256(data)
+	if streamed == nil || *streamed != wantDigest {
+		t.Fatalf("streamed payload digest = %x, want %x", streamed, wantDigest)
+	}
+	runtime, err := volumeserver.New("streamed-frame-digest", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamedFingerprint, err := canonicalFingerprintWithWriteDataDigest(runtime, decoded, *streamed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFingerprint, err := canonicalFingerprint(runtime, decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamedFingerprint != writeFingerprint {
+		t.Fatalf("streamed fingerprint = %x, write fingerprint = %x", streamedFingerprint, writeFingerprint)
 	}
 }
 
@@ -176,8 +331,8 @@ func TestWriteFramePartialPrefixAndBulkFailuresPreserveExactReplayBody(t *testin
 	data := bytes.Repeat([]byte{0x6D}, 4096)
 	request := &authoritypb.Request{
 		RequestId: 81,
-		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-			TransactionId: 23, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: data,
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x41}, 16), Size: uint32(len(data)), Data: data,
 		}},
 	}
 	var complete bytes.Buffer
@@ -192,7 +347,7 @@ func TestWriteFramePartialPrefixAndBulkFailuresPreserveExactReplayBody(t *testin
 			if err := writeFrame(writer, 8192, request); !errors.Is(err, errInjectedFrameWrite) {
 				t.Fatalf("writeFrame = %v, want injected failure", err)
 			}
-			if !bytes.Equal(request.GetWriteTransaction().GetData(), data) {
+			if !bytes.Equal(request.GetWrite().GetData(), data) {
 				t.Fatal("failed write changed the caller-owned replay body")
 			}
 			if !bytes.Equal(writer.Bytes(), complete.Bytes()[:limit]) {
@@ -257,9 +412,9 @@ func TestFrameRejectsBulkWithoutItsExactCarrier(t *testing.T) {
 func TestFrameRejectsInlineBulkCopy(t *testing.T) {
 	metadata, err := proto.Marshal(&authoritypb.Request{
 		RequestId: 10,
-		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
-			Data: []byte("inline is not protocol 5"),
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x41}, 16), Size: uint32(len("inline is not protocol 6")),
+			Data: []byte("inline is not protocol 6"),
 		}},
 	})
 	if err != nil {
@@ -355,53 +510,21 @@ func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
 	}
 }
 
-func TestFrameBoundsPackedRepeatedElements(t *testing.T) {
-	atLimit := &authoritypb.Request{
-		RequestId: 20,
-		Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
-			BlockedParentKernelInos: make([]uint64, maxWireRepeatedElements),
-		}},
-	}
-	var atLimitFrame bytes.Buffer
-	if err := writeFrame(&atLimitFrame, 1<<20, atLimit); err != nil {
-		t.Fatalf("writeFrame at exact repeated bound: %v", err)
-	}
-	var atLimitDecoded authoritypb.Request
-	if err := readFrame(&atLimitFrame, 1<<20, nil, 0, &atLimitDecoded); err != nil {
-		t.Fatalf("readFrame at exact repeated bound: %v", err)
-	}
-	if got := len(atLimitDecoded.GetAckVisibility().GetBlockedParentKernelInos()); got != maxWireRepeatedElements {
-		t.Fatalf("decoded repeated elements = %d, want %d", got, maxWireRepeatedElements)
-	}
-
-	request := &authoritypb.Request{
-		RequestId: 21,
-		Body: &authoritypb.Request_AckVisibility{AckVisibility: &authoritypb.AckVisibilityRequest{
-			BlockedParentKernelInos: make([]uint64, maxWireRepeatedElements+1),
-		}},
-	}
-	metadata, err := proto.Marshal(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var decoded authoritypb.Request
-	if err := readFrame(bytes.NewReader(encodedRawFrame(metadata, nil)), uint32(len(metadata)+frameHeaderBytes), nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("oversized packed field = %v, want ErrFrameEncoding", err)
-	}
-}
-
 func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
-	targets := make([]*authoritypb.VisibilityTarget, maxWireRepeatedElements+1)
-	for i := range targets {
-		targets[i] = &authoritypb.VisibilityTarget{
-			Scope:    authoritypb.VisibilityScope_VISIBILITY_SCOPE_DATA,
-			Identity: []byte{byte(i)},
+	recalls := make([]*authoritypb.LeaseRecall, maxWireRepeatedElements+1)
+	for i := range recalls {
+		recalls[i] = &authoritypb.LeaseRecall{
+			Coordinate: &authoritypb.LeaseCoordinate{
+				Family:   authoritypb.LeaseFamily_LEASE_FAMILY_DATA,
+				Identity: bytes.Repeat([]byte{byte(i + 1)}, 16),
+			},
+			Right: authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ,
 		}
 	}
 	response := &authoritypb.Response{
 		RequestId: 22,
-		Body: &authoritypb.Response_Visibility{Visibility: &authoritypb.VisibilityEvent{
-			Targets: targets,
+		Body: &authoritypb.Response_LeaseEvent{LeaseEvent: &authoritypb.LeaseEvent{
+			Recalls: recalls,
 		}},
 	}
 	metadata, err := proto.Marshal(response)
@@ -423,8 +546,8 @@ func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
 func TestFrameBudgetIsRetainedThroughBulkUse(t *testing.T) {
 	request := &authoritypb.Request{
 		RequestId: 11,
-		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: bytes.Repeat([]byte{7}, 4096),
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x41}, 16), Size: 4096, Data: bytes.Repeat([]byte{7}, 4096),
 		}},
 	}
 	var frame bytes.Buffer
@@ -517,8 +640,8 @@ func TestReleasedFramePayloadIsNotAliasedByALiveCarrier(t *testing.T) {
 		t.Helper()
 		request := &authoritypb.Request{
 			RequestId: 21,
-			Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-				TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+			Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+				Handle: bytes.Repeat([]byte{0x41}, 16), Size: 64 << 10,
 				Data: bytes.Repeat([]byte{fill}, 64<<10),
 			}},
 		}
@@ -534,12 +657,12 @@ func TestReleasedFramePayloadIsNotAliasedByALiveCarrier(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bulk := first.GetWriteTransaction().GetData()
+	bulk := first.GetWrite().GetData()
 	if len(bulk) != 64<<10 || bulk[0] != 0xA5 {
 		t.Fatalf("retained bulk = %d bytes, want the exact out-of-line body", len(bulk))
 	}
 	release()
-	if got := first.GetWriteTransaction().GetData(); got != nil {
+	if got := first.GetWrite().GetData(); got != nil {
 		t.Fatalf("released payload is still reachable through its carrier: %d bytes", len(got))
 	}
 
@@ -551,7 +674,7 @@ func TestReleasedFramePayloadIsNotAliasedByALiveCarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer secondRelease()
-	next := second.GetWriteTransaction().GetData()
+	next := second.GetWrite().GetData()
 	if len(next) != 64<<10 {
 		t.Fatalf("recycled frame decoded %d bulk bytes, want %d", len(next), 64<<10)
 	}
@@ -567,8 +690,8 @@ func TestConcurrentRetainedFramesNeverShareAPayload(t *testing.T) {
 	for reader := range frames {
 		request := &authoritypb.Request{
 			RequestId: uint64(reader) + 1,
-			Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-				TransactionId: uint64(reader) + 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
+			Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+				Handle: bytes.Repeat([]byte{byte(reader + 1)}, 16), Size: uint32((reader + 1) << 10),
 				Data: bytes.Repeat([]byte{byte(reader)}, (reader+1)<<10),
 			}},
 		}
@@ -593,7 +716,7 @@ func TestConcurrentRetainedFramesNeverShareAPayload(t *testing.T) {
 					errs <- err
 					return
 				}
-				if !bytes.Equal(decoded.GetWriteTransaction().GetData(), want) {
+				if !bytes.Equal(decoded.GetWrite().GetData(), want) {
 					errs <- fmt.Errorf("reader %d decoded another reader's payload", reader)
 					release()
 					return
@@ -612,8 +735,8 @@ func TestConcurrentRetainedFramesNeverShareAPayload(t *testing.T) {
 func BenchmarkReadRetainedBulkFrame1MiB(b *testing.B) {
 	request := &authoritypb.Request{
 		RequestId: 14,
-		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: make([]byte, 1<<20),
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x41}, 16), Size: 1 << 20, Data: make([]byte, 1<<20),
 		}},
 	}
 	var encoded bytes.Buffer
@@ -640,8 +763,8 @@ func BenchmarkReadRetainedBulkFrame1MiB(b *testing.B) {
 func BenchmarkWriteBulkFrameAllocations1MiB(b *testing.B) {
 	request := &authoritypb.Request{
 		RequestId: 12,
-		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: make([]byte, 1<<20),
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x41}, 16), Size: 1 << 20, Data: make([]byte, 1<<20),
 		}},
 	}
 	b.ReportAllocs()
@@ -655,8 +778,8 @@ func BenchmarkWriteBulkFrameAllocations1MiB(b *testing.B) {
 func BenchmarkReadBulkFrame1MiB(b *testing.B) {
 	request := &authoritypb.Request{
 		RequestId: 13,
-		Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
-			TransactionId: 1, Phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, Data: make([]byte, 1<<20),
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: bytes.Repeat([]byte{0x41}, 16), Size: 1 << 20, Data: make([]byte, 1<<20),
 		}},
 	}
 	var encoded bytes.Buffer
@@ -672,6 +795,83 @@ func BenchmarkReadBulkFrame1MiB(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func BenchmarkTLSFrameLoopback1MiB(b *testing.B) {
+	serverTLS, clientTLS := testTLSConfigs(b)
+	serverTLS = serverTLS.Clone()
+	clientTLS = clientTLS.Clone()
+	serverTLS.NextProtos = []string{protocolALPN}
+	clientTLS.NextProtos = []string{protocolALPN}
+	serverTLS.DynamicRecordSizingDisabled = true
+	clientTLS.DynamicRecordSizingDisabled = true
+	clientRaw, serverRaw := net.Pipe()
+	counted := &countedWriteConn{Conn: clientRaw}
+	serverCounted := &countedWriteConn{Conn: serverRaw}
+	client := newAuthorityTLSClient(counted, clientTLS)
+	server := newAuthorityTLSServer(serverCounted, serverTLS)
+	b.Cleanup(func() {
+		_ = clientRaw.Close()
+		_ = serverRaw.Close()
+	})
+	serverHandshake := make(chan error, 1)
+	go func() { serverHandshake <- server.HandshakeContext(context.Background()) }()
+	if err := client.HandshakeContext(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+	if err := <-serverHandshake; err != nil {
+		b.Fatal(err)
+	}
+
+	payload := make([]byte, 1<<20)
+	request := &authoritypb.Request{
+		RequestId: 1,
+		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: make([]byte, 16), Size: uint32(len(payload)), Data: payload,
+		}},
+	}
+	response := &authoritypb.Response{RequestId: 1}
+	serverDone := make(chan error, 1)
+	go func() {
+		for {
+			var got authoritypb.Request
+			if err := readFrame(server, 2<<20, nil, 0, &got); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+					serverDone <- nil
+				} else {
+					serverDone <- err
+				}
+				return
+			}
+			if err := writeFrame(server, 2<<20, response); err != nil {
+				serverDone <- err
+				return
+			}
+		}
+	}()
+	counted.writes.Store(0)
+	serverCounted.reads.Store(0)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	iterations := int64(0)
+	for b.Loop() {
+		if err := writeFrame(client, 2<<20, request); err != nil {
+			b.Fatal(err)
+		}
+		var got authoritypb.Response
+		if err := readFrame(client, 2<<20, nil, 0, &got); err != nil {
+			b.Fatal(err)
+		}
+		iterations++
+	}
+	b.StopTimer()
+	_ = clientRaw.Close()
+	if err := <-serverDone; err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(counted.writes.Load())/float64(iterations), "socket-writes/op")
+	b.ReportMetric(float64(serverCounted.reads.Load())/float64(iterations), "socket-reads/op")
 }
 
 // Defect 10: post-authentication payload allocation had no worker-wide byte
@@ -943,7 +1143,7 @@ func TestServerRefusesToRunWithBoundsItDoesNotEnforce(t *testing.T) {
 // large once writeFrame restored the request ID, epoch and slot state, and the
 // oversized body was already in the replay slot, so remounting reproduced the
 // substituted EOVERFLOW forever.
-func TestRetainedReplyEnvelopeFitsItsReserve(t *testing.T) {
+func TestRetainedReplyBodyFitsEnvelopeReserve(t *testing.T) {
 	const maxFrame uint32 = 64 << 10
 	body := make([]byte, maxFrame-responseEnvelopeReserve)
 	build := func() ([]byte, error) {
@@ -976,6 +1176,49 @@ func TestRetainedReplyEnvelopeFitsItsReserve(t *testing.T) {
 	var frame bytes.Buffer
 	if err := writeFrame(&frame, maxFrame, stamped); err != nil {
 		t.Fatalf("a reply at the retained-size limit did not fit the wire frame: %v", err)
+	}
+}
+
+func TestRetainedReplyEnvelopeFitsReserve(t *testing.T) {
+	fullAttr := func(inode uint64) *authoritypb.Attr {
+		return &authoritypb.Attr{
+			Kind: authoritypb.Attr_REGULAR, Inode: inode, Size: math.MaxInt64,
+			Blocks: math.MaxUint64, Mode: math.MaxUint32, Uid: math.MaxUint32,
+			Gid: math.MaxUint32, Nlink: math.MaxUint32, AtimeNs: math.MinInt64,
+			MtimeNs: math.MaxInt64, CtimeNs: math.MinInt64, BirthTimeNs: math.MaxInt64,
+			Rdev: math.MaxUint32, Blksize: math.MaxUint32, Flags: math.MaxUint32,
+		}
+	}
+	objects := make([]*authoritypb.ObjectPostState, 4)
+	for i := range objects {
+		identity := bytes.Repeat([]byte{byte(i + 1)}, 16)
+		objects[i] = &authoritypb.ObjectPostState{
+			StableIdentity: identity, ObjectVersion: math.MaxUint64,
+			Attr: fullAttr(uint64(i + 1)), Roles: math.MaxUint32,
+		}
+	}
+	response := &authoritypb.Response{
+		RequestId: math.MaxUint64,
+		Epoch:     bytes.Repeat([]byte{0xff}, 16), Errno: math.MaxInt32,
+		Mutation:              &authoritypb.MutationState{Slot: math.MaxUint32, AcceptedSequence: math.MaxUint64},
+		TerminalDeliveryToken: bytes.Repeat([]byte{0xff}, 16),
+		PostState: &authoritypb.PostState{
+			VisibilitySequence: math.MaxUint64, SnapshotSequence: math.MaxUint64,
+			Objects: objects,
+		},
+	}
+	encoded, err := proto.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > int(responseEnvelopeReserve) {
+		t.Fatalf("maximum post-state envelope is %d bytes, reserve is %d", len(encoded), responseEnvelopeReserve)
+	}
+	// Field 45 requires a two-byte protobuf tag. Check the generated wire shape
+	// so an accidental field move cannot silently invalidate the reserve proof.
+	postStateTag := protowire.AppendTag(nil, 45, protowire.BytesType)
+	if len(postStateTag) != 2 || !bytes.Contains(encoded, postStateTag) {
+		t.Fatalf("post_state field 45 tag %x is absent from encoded envelope", postStateTag)
 	}
 }
 

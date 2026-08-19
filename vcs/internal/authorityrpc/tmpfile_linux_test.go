@@ -55,6 +55,10 @@ func (s *tmpfileHandlerStore) Forget(xfsstore.Capability) error {
 	return nil
 }
 
+func (s *tmpfileHandlerStore) Getattr(parent xfsstore.Capability) (xfsstore.Attr, error) {
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(parent[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1}, nil
+}
+
 func tmpfileMutationRequest(t *testing.T, credentialEpoch, sessionID, secret []byte, generation uint64, parent xfsstore.Capability, requestID uint64) *authoritypb.Request {
 	t.Helper()
 	request := &authoritypb.Request{

@@ -2,9 +2,11 @@ package authorityrpc
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"sync"
 	"time"
@@ -129,7 +131,7 @@ func releaseFramePayload(payload []byte, class int) {
 
 // readFrame decodes one framed protobuf message. A frame has two lengths:
 // protobuf metadata followed by an optional out-of-line bulk body. Only
-// WriteTransactionRequest.Data, OneShotWriteRequest.Data, and ReadReply.Data
+// WriteRequest.Data and ReadReply.Data
 // are the only legal bulk bodies. Keeping the payload outside protobuf removes
 // the full-size marshal and unmarshal copies from
 // the data path without creating a second protocol or weakening replay: the
@@ -143,7 +145,7 @@ func releaseFramePayload(payload []byte, class int) {
 func readFrame(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message) error {
 	// The decoded message keeps the frame's bulk slice and this caller has no
 	// later boundary at which that slice dies, so the payload is not recycled.
-	release, err := readFrameInto(r, max, budget, wait, message, false)
+	release, _, err := readFrameInto(r, max, budget, wait, message, false, false)
 	if release != nil {
 		release()
 	}
@@ -155,23 +157,32 @@ func readFrame(r io.Reader, max uint32, budget *frameBudget, wait time.Duration,
 // drops the bulk slice from message and hands the buffer to the next reader, so
 // a caller must be finished with message before running it.
 func readFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message) (func(), error) {
-	return readFrameInto(r, max, budget, wait, message, true)
+	release, _, err := readFrameInto(r, max, budget, wait, message, true, false)
+	return release, err
 }
 
-func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message, recycle bool) (func(), error) {
+// readRequestFrameRetained is the authority's request reader. It folds the
+// replay payload digest into the socket-to-frame copy so handler execution can
+// authenticate the exact same bytes without traversing the completed payload
+// again.
+func readRequestFrameRetained(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message *authoritypb.Request) (func(), *[sha256.Size]byte, error) {
+	return readFrameInto(r, max, budget, wait, message, true, true)
+}
+
+func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Duration, message proto.Message, recycle, digestBulk bool) (func(), *[sha256.Size]byte, error) {
 	var header [frameHeaderBytes]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	metadataSize := binary.BigEndian.Uint32(header[:4])
 	bulkSize := binary.BigEndian.Uint32(header[4:])
 	total := uint64(metadataSize) + uint64(bulkSize)
 	if metadataSize == 0 || total > uint64(max) {
-		return nil, fmt.Errorf("%w: metadata %d + bulk %d (max %d)", ErrFrameBounds, metadataSize, bulkSize, max)
+		return nil, nil, fmt.Errorf("%w: metadata %d + bulk %d (max %d)", ErrFrameBounds, metadataSize, bulkSize, max)
 	}
 	if budget != nil {
 		if err := budget.acquire(context.Background(), uint32(total), wait); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	var payload []byte
@@ -201,15 +212,15 @@ func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Durat
 			budget.release(uint32(total))
 		}
 	}
-	fail := func(err error) (func(), error) {
+	fail := func(err error) (func(), *[sha256.Size]byte, error) {
 		release()
-		return nil, err
-	}
-	if _, err := io.ReadFull(r, payload); err != nil {
-		return fail(err)
+		return nil, nil, err
 	}
 	metadata := payload[:metadataSize]
 	bulk := payload[metadataSize:]
+	if _, err := io.ReadFull(r, metadata); err != nil {
+		return fail(err)
+	}
 	if err := validateWireMessage(metadata, message.ProtoReflect().Descriptor()); err != nil {
 		return fail(err)
 	}
@@ -223,17 +234,37 @@ func readFrameInto(r io.Reader, max uint32, budget *frameBudget, wait time.Durat
 	if carrier != nil && len(*carrier) != 0 {
 		return fail(fmt.Errorf("%w: bulk data was encoded inside protobuf", ErrFramePayload))
 	}
+	var digest *[sha256.Size]byte
 	if bulkSize != 0 {
 		if carrier == nil {
 			return fail(fmt.Errorf("%w: %d bytes have no legal carrier", ErrFramePayload, bulkSize))
 		}
+		bulkReader := io.Reader(r)
+		var hasher hash.Hash
+		if digestBulk {
+			hasher = sha256.New()
+			bulkReader = io.TeeReader(r, hasher)
+		}
+		if _, err := io.ReadFull(bulkReader, bulk); err != nil {
+			return fail(err)
+		}
+		if hasher != nil {
+			var sum [sha256.Size]byte
+			hasher.Sum(sum[:0])
+			digest = &sum
+		}
 		*carrier = bulk
 		retained = carrier
 	}
-	return release, nil
+	return release, digest, nil
 }
 
-func writeFrame(w io.Writer, max uint32, message proto.Message) error {
+type frameBoundaryWriter interface {
+	beginFrameWrite() error
+	endFrameWrite() error
+}
+
+func writeFrame(w io.Writer, max uint32, message proto.Message) (err error) {
 	carrier, err := frameBulkCarrier(message)
 	if err != nil {
 		return err
@@ -267,6 +298,16 @@ func writeFrame(w io.Writer, max uint32, message proto.Message) error {
 	}
 	binary.BigEndian.PutUint32(prefix[:4], uint32(len(metadata)))
 	binary.BigEndian.PutUint32(prefix[4:8], uint32(len(bulk)))
+	if buffered, ok := w.(frameBoundaryWriter); ok {
+		if err := buffered.beginFrameWrite(); err != nil {
+			return err
+		}
+		defer func() {
+			if flushErr := buffered.endFrameWrite(); err == nil {
+				err = flushErr
+			}
+		}()
+	}
 	if err := writeAll(w, prefix); err != nil {
 		return err
 	}
@@ -279,10 +320,11 @@ func writeFrame(w io.Writer, max uint32, message proto.Message) error {
 func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 	switch typed := message.(type) {
 	case *authoritypb.Request:
-		if transaction := typed.GetWriteTransaction(); transaction != nil {
-			return &transaction.Data, nil
+		if write := typed.GetWrite(); write != nil {
+			return &write.Data, nil
 		}
-		if write := typed.GetOneShotWrite(); write != nil {
+		if write := typed.GetFskitWrite(); write != nil &&
+			write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA {
 			return &write.Data, nil
 		}
 	case *authoritypb.Response:

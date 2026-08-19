@@ -1,22 +1,22 @@
 # macOS 27 native FSKit coherence
 
-Status: **SDK-27 exact-coherence candidate; shipping macOS 26 uses the separate
-best-effort policy**
+Status: **optional build-stamped protocol-6 `FSKIT_SYNC_REPAIR` actuator with
+native data revocation; ordinary macOS 27 uses synchronous VFS repair v2**
 
-No currently documented FSKit release supplies the complete primitives that an
-exact shared PortableFS mount requires. The shipping CLI admits macOS 26 only
-under `macos26-synchronous-vfs-repair-v2`, whose limits are documented as a
-best-effort tier. The macOS 27 native-data adapter remains separately signed and
-build-stamped test code until the missing namespace and attribute primitives
-exist and pass the complete live matrix. Unknown policies fail before Attach.
+No currently documented FSKit release supplies the complete primitives needed
+for Linux-equivalent lease semantics. macOS 27 nevertheless remains operational
+through the explicit FSKit synchronous-repair profile: the ordinary app selects
+the shipping v2 synchronous-VFS actuator, while a separately signed and
+build-stamped artifact selects native data revocation. Both retain the declared
+namespace, attribute, enumeration, append, and lock gaps. Unknown policies
+still fail before Attach.
 
 ## Exact missing primitives
 
-Protocol 5 has two distinct publication obligations. A source mutation must
-return every exact post-mutation attribute snapshot that its initiating FSKit
-callback publishes. A peer mutation must synchronously make the affected
-kernel namespace, attributes, and data unobservable before COMPLETE is
-acknowledged.
+The Linux profile requires exact discharge of N/A/D/E leases before a
+conflicting mutation returns. FSKit does not claim that profile. The table
+retains the source/peer audit vocabulary because it describes the host cache
+controls that keep the Mac contract weaker.
 
 | FSKit generation | source callback boundary | peer repair boundary |
 | --- | --- | --- |
@@ -182,15 +182,15 @@ retains both frozen experimental revisions; the SDK-27 qualification adapter
 contains only `fskit-native-revocation-v1`. A mismatch closes the pfslocal
 connection and returns `ENOTSUP`. Shipping composition never reaches Resolve.
 
-The CLI has a second, independent gate. Its normal build contains no native
-qualification stamp, so macOS 27 fails before attach; macOS 26 independently
-selects its shipping best-effort v2 policy. The signed development lane may
-stamp exactly `sdk27-live-qualification-only` into
+The CLI has a second, independent gate. Its normal build selects the shipping
+synchronous-VFS-repair v2 policy on both macOS 26 and macOS 27. The signed
+development lane may stamp exactly `sdk27-live-qualification-only` into
 `nativeFSKitPolicyQualification` with Go `-ldflags -X`; its packaging tag
 selects the matching SDK-27 app/extension layout. This is a build identity, not
-a runtime environment toggle. It does not alter macOS 26's policy, and macOS 28
-and later remain refused until independently qualified. OS version detection
-alone never authorizes the native policy.
+a runtime environment toggle. It selects native revocation only for that
+artifact, does not alter macOS 26's policy, and leaves macOS 28 and later
+refused until independently qualified. OS version detection alone never
+authorizes the native policy.
 
 Qualification mount readiness is also policy-specific. After `/sbin/mount`
 returns, the CLI proves the exact `pfs` kernel identity, asks `portablefsd` to

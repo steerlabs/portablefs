@@ -140,14 +140,6 @@ func (fs *defaultRawFileSystem) Write(cancel <-chan struct{}, input *WriteIn, da
 	return 0, ENOSYS
 }
 
-func (fs *defaultRawFileSystem) PFSWrite(cancel <-chan struct{}, input *PFSWriteIn, data []byte, out *PFSWriteOut) Status {
-	return ENOSYS
-}
-
-func (fs *defaultRawFileSystem) PFSPublish(cancel <-chan struct{}, input *PFSPublishIn, out *PFSPublishOut) Status {
-	return ENOSYS
-}
-
 func (fs *defaultRawFileSystem) Flush(cancel <-chan struct{}, input *FlushIn) Status {
 	return OK
 }
@@ -181,14 +173,6 @@ func (fs *defaultRawFileSystem) Fallocate(cancel <-chan struct{}, in *FallocateI
 
 func (fs *defaultRawFileSystem) CopyFileRange(cancel <-chan struct{}, input *CopyFileRangeIn) (written uint32, code Status) {
 	return 0, ENOSYS
-}
-
-func (fs *defaultRawFileSystem) PFSFallocate(cancel <-chan struct{}, input *PFSFallocateIn, out *PFSRangeOut) Status {
-	return ENOSYS
-}
-
-func (fs *defaultRawFileSystem) PFSCopyFileRange(cancel <-chan struct{}, input *PFSCopyFileRangeIn, out *PFSRangeOut) Status {
-	return ENOSYS
 }
 
 func (fs *defaultRawFileSystem) Ioctl(cancel <-chan struct{}, input *IoctlIn, inbuf []byte, output *IoctlOut, outbuf []byte) (code Status) {

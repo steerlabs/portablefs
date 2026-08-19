@@ -12,7 +12,7 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_Hello{}}, {Body: &authoritypb.Request_Attach{}},
 		{Body: &authoritypb.Request_Resume{}}, {Body: &authoritypb.Request_KeepAlive{}},
 		{Body: &authoritypb.Request_Detach{}}, {Body: &authoritypb.Request_Cancel{}},
-		{Body: &authoritypb.Request_NextVisibility{}}, {Body: &authoritypb.Request_AckVisibility{}},
+		{Body: &authoritypb.Request_NextFskitRepair{}}, {Body: &authoritypb.Request_AckFskitRepair{}},
 		{Body: &authoritypb.Request_Reauthorize{}}, {Body: &authoritypb.Request_Lookup{}},
 		{Body: &authoritypb.Request_GetAttr{}}, {Body: &authoritypb.Request_SetAttr{}},
 		{Body: &authoritypb.Request_Create{}}, {Body: &authoritypb.Request_Mkdir{}},
@@ -20,7 +20,7 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_Link{}}, {Body: &authoritypb.Request_Symlink{}},
 		{Body: &authoritypb.Request_Readlink{}}, {Body: &authoritypb.Request_Open{}},
 		{Body: &authoritypb.Request_Close{}}, {Body: &authoritypb.Request_Read{}},
-		{Body: &authoritypb.Request_WriteTransaction{}}, {Body: &authoritypb.Request_OneShotWrite{}},
+		{Body: &authoritypb.Request_FskitWrite{}}, {Body: &authoritypb.Request_Write{}},
 		{Body: &authoritypb.Request_Fallocate{}},
 		{Body: &authoritypb.Request_CopyFileRange{}}, {Body: &authoritypb.Request_Tmpfile{}}, {Body: &authoritypb.Request_Fsync{}},
 		{Body: &authoritypb.Request_ReadDir{}}, {Body: &authoritypb.Request_Reclaim{}},
@@ -31,6 +31,9 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_SetLock{}}, {Body: &authoritypb.Request_ApplyRoutes{}},
 		{Body: &authoritypb.Request_Activate{}}, {Body: &authoritypb.Request_AbortAttach{}},
 		{Body: &authoritypb.Request_TerminalDeliveryReceipt{}},
+		{Body: &authoritypb.Request_NextLeaseEvent{}}, {Body: &authoritypb.Request_AcknowledgeLeaseEvent{}},
+		{Body: &authoritypb.Request_RenewLeases{}},
+		{Body: &authoritypb.Request_AcknowledgeSourceLeaseDischarge{}},
 	}
 	descriptorBodies := (&authoritypb.Request{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
 	if len(requests) != descriptorBodies {
@@ -57,9 +60,12 @@ func TestTransportRoleAllowlistIsStrict(t *testing.T) {
 		control bool
 	}{
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{}}, data: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_OneShotWrite{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_Write{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{}}, data: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewLeases{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Activate{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_TerminalDeliveryReceipt{}}, control: true},

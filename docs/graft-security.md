@@ -74,7 +74,7 @@ Two honest limits apply to that probe today:
 
 Unit tests and cross-compilation do not exercise `openat2(2)`. The required
 privileged Linux gate does, against real XFS and a real FUSE mount on the exact
-patched Linux 6.12.100 kernel:
+stock kernel interface at FUSE protocol 7.31 or newer:
 
 ```bash
 bash scripts/xfs-fuse-integration.sh
@@ -106,8 +106,9 @@ enumerates and then proves the exact executed test set from the native
 confinement — the macOS graft refusal is a Go-side property and is covered by
 the `portablefsd` suite above.
 
-`bash scripts/verify-local.sh` is the repository's single local merge gate and
-runs the Go and Swift suites together.
+`bash scripts/verify-local.sh` is the repository's local gate and runs the Go
+and Swift suites together; `--full` also runs the two privileged real-mount
+suites.
 
 ## Source audit
 

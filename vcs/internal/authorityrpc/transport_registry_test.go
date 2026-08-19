@@ -54,12 +54,25 @@ func TestRetireTransportConnectionsDoesNotExposeSuccessorBeforeExecutionDrain(t 
 }
 
 func testTransportRegistration(t *testing.T, registry *transportRegistry, peer byte, set byte, role authoritypb.TransportRole) (*transportConnection, *atomic.Int32) {
+	return testTransportRegistrationForProfile(
+		t, registry, peer, set, role, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+	)
+}
+
+func testTransportRegistrationForProfile(
+	t *testing.T,
+	registry *transportRegistry,
+	peer byte,
+	set byte,
+	role authoritypb.TransportRole,
+	profile authoritypb.FrontendProfile,
+) (*transportConnection, *atomic.Int32) {
 	t.Helper()
 	var setID connectionSetID
 	setID[0] = set
 	closed := new(atomic.Int32)
 	entry, err := registry.register(
-		volumeserver.PeerIdentity{peer}, setID, role,
+		volumeserver.PeerIdentity{peer}, setID, role, profile,
 		func() {}, func() error { closed.Add(1); return nil },
 	)
 	if err != nil {
@@ -80,7 +93,7 @@ func TestTransportRegistryRequiresExactPairAndRefusesUnprovedDuplicateRole(t *te
 	}
 	var set connectionSetID
 	set[0] = 2
-	if _, err := registry.register(volumeserver.PeerIdentity{1}, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, func() {}, func() error { return nil }); !errors.Is(err, ErrTransportBinding) {
+	if _, err := registry.register(volumeserver.PeerIdentity{1}, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, func() {}, func() error { return nil }); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("duplicate DATA = %v, want ErrTransportBinding", err)
 	}
 	control, _ := testTransportRegistration(t, registry, 1, 2, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL)

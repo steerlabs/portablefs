@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"slices"
 	"sync"
 	"syscall"
@@ -34,7 +33,6 @@ type fakeV3VisibilityClient struct {
 	mu         sync.Mutex
 	acked      []*authoritypb.VisibilityCursor
 	contention []bool
-	blocked    []*authoritypb.VisibilityCursor
 	closed     bool
 	err        error
 }
@@ -70,12 +68,6 @@ func (f *fakeV3VisibilityClient) AckVisibilityWithContention(_ context.Context, 
 	f.acked = append(f.acked, cloneAuthorityCursor(cursor))
 	f.contention = append(f.contention, contended)
 	return nil
-}
-func (f *fakeV3VisibilityClient) ReportVisibilityBlocked(_ context.Context, cursor *authoritypb.VisibilityCursor, _ []uint64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.blocked = append(f.blocked, cloneAuthorityCursor(cursor))
-	return errors.New("test authority fenced blocked mount")
 }
 func (f *fakeV3VisibilityClient) SessionDone() <-chan struct{} { return f.done }
 func (f *fakeV3VisibilityClient) SessionError() error {
@@ -562,59 +554,7 @@ func TestV3CoherenceBridgeMissedBudgetClosesAuthoritySession(t *testing.T) {
 	}
 }
 
-func TestV3CoherenceBridgeTerminatesActualZeroTicketRoutePrepare(t *testing.T) {
-	client := newFakeV3VisibilityClient()
-	defer client.Close()
-	failures := make(chan error, 1)
-	bridge, err := newV3CoherenceBridge(client, v3CachePolicyMacOS26, func(err error) {
-		failures <- err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	event := &authoritypb.VisibilityEvent{
-		Cursor: &authoritypb.VisibilityCursor{
-			Sequence: 11, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE,
-		},
-		InitiatorSessionId: make([]byte, 16),
-		Routes: &authoritypb.RoutesChange{
-			Revision: bytes.Repeat([]byte{0x51}, 32), Rules: []byte("/cache\n"),
-		},
-		// Route events carry the zero session identity and no mutation replay ticket.
-	}
-	client.next <- v3VisibilityResult{event: event}
-	delivered := false
-	err = bridge.run(context.Background(), func(*pfslocal.Event) error {
-		delivered = true
-		return nil
-	})
-	if !errors.Is(err, authorityrpc.ErrRoutesMismatch) {
-		t.Fatalf("route PREPARE = %v, want ErrRoutesMismatch", err)
-	}
-	if delivered {
-		t.Fatal("route PREPARE was forwarded to FSKit")
-	}
-	client.mu.Lock()
-	closed := client.closed
-	acks := len(client.acked)
-	client.mu.Unlock()
-	if !closed || acks != 0 {
-		t.Fatalf("route PREPARE left client closed=%v with %d Ack(s)", closed, acks)
-	}
-	select {
-	case failure := <-failures:
-		if !errors.Is(failure, authorityrpc.ErrRoutesMismatch) {
-			t.Fatalf("terminal route failure = %v", failure)
-		}
-	default:
-		t.Fatal("route PREPARE did not publish its terminal failure")
-	}
-	if err := bridge.bind(); !errors.Is(err, errV3VisibilityTerminal) {
-		t.Fatalf("route-terminated bridge rebound: %v", err)
-	}
-}
-
-func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
+func TestV3VisibilityTranslationValidatesEveryScope(t *testing.T) {
 	epoch := bytes.Repeat([]byte{0xa1}, 16)
 	base := &authoritypb.VisibilityEvent{
 		Cursor:             &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE},
@@ -640,14 +580,6 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 	if err != nil || len(translatedPost.Targets) != 1 ||
 		!bytes.Equal(translatedPost.Targets[0].PostIdentity, postTarget.PostIdentity) {
 		t.Fatalf("valid COMPLETE post-binding = %#v, %v", translatedPost, err)
-	}
-
-	routes := proto.Clone(base).(*authoritypb.VisibilityEvent)
-	routes.InitiatorSessionId = make([]byte, 16)
-	routes.MutationSequence = 0
-	routes.Routes = &authoritypb.RoutesChange{Revision: bytes.Repeat([]byte{4}, 32), Rules: []byte("/cache\n")}
-	if got, err := translateV3VisibilityEvent(epoch, routes); err != nil || got.Routes == nil {
-		t.Fatalf("valid route event = %#v, %v", got, err)
 	}
 
 	invalid := []*authoritypb.VisibilityEvent{}
@@ -676,9 +608,6 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 	preparePostTarget.PostIdentity = bytes.Repeat([]byte{4}, 16)
 	badPreparePost.Targets = []*authoritypb.VisibilityTarget{preparePostTarget}
 	invalid = append(invalid, badPreparePost)
-	badRoutes := proto.Clone(routes).(*authoritypb.VisibilityEvent)
-	badRoutes.Targets = []*authoritypb.VisibilityTarget{visibilitywire.Attributes(bytes.Repeat([]byte{3}, 16), 7, 0x700000001)}
-	invalid = append(invalid, badRoutes)
 	for i, event := range invalid {
 		if _, err := translateV3VisibilityEvent(epoch, event); err == nil {
 			t.Fatalf("invalid visibility case %d was accepted", i)
@@ -686,7 +615,7 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 	}
 }
 
-func TestV3CoherenceBridgeRefusesWrongAndBlockedAcknowledgements(t *testing.T) {
+func TestV3CoherenceBridgeRefusesAnAcknowledgementForAnotherAuthorityEpoch(t *testing.T) {
 	client := newFakeV3VisibilityClient()
 	defer client.Close()
 	bridge, err := newV3CoherenceBridge(client, v3CachePolicyMacOS26, nil)
@@ -703,35 +632,5 @@ func TestV3CoherenceBridgeRefusesWrongAndBlockedAcknowledgements(t *testing.T) {
 	client.mu.Unlock()
 	if !closedAfterViolation {
 		t.Fatal("cursor/epoch violation did not terminate the authority session")
-	}
-
-	client = newFakeV3VisibilityClient()
-	defer client.Close()
-	bridge, err = newV3CoherenceBridge(client, v3CachePolicyMacOS26, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.next <- v3VisibilityResult{event: testV3Event(client, 11, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE)}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	delivered := make(chan *pfslocal.V3VisibilityEvent, 1)
-	go func() {
-		_ = bridge.run(ctx, func(event *pfslocal.Event) error {
-			delivered <- event.Kind.(*pfslocal.V3VisibilityEvent)
-			return nil
-		})
-	}()
-	event := <-delivered
-	err = bridge.acknowledge(context.Background(), &pfslocal.VisibilityAckRequest{
-		AuthorityEpoch: client.epoch, Cursor: event.Cursor, Blocked: true, Reason: "proven parent-lock cycle",
-	})
-	if err == nil || errors.Is(err, io.EOF) {
-		t.Fatalf("blocked report returned %v", err)
-	}
-	client.mu.Lock()
-	blocked := len(client.blocked)
-	client.mu.Unlock()
-	if blocked != 1 {
-		t.Fatalf("authority received %d blocked reports, want 1", blocked)
 	}
 }

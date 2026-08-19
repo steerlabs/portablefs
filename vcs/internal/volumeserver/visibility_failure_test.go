@@ -196,7 +196,7 @@ func testVisibilityCommitment() VisibilityCommitment {
 	return VisibilityCommitment{
 		CachedNameCapacity: testCacheCapacity,
 		RepairBudget:       testRepairBudget,
-		NamespaceRepair:    NamespaceRepairParentExclusive,
+		NamespaceRepair:    NamespaceRepairIndependent,
 	}
 }
 
@@ -255,6 +255,7 @@ func TestActivateParticipantCommitFailureRollsBackMembership(t *testing.T) {
 	}
 	applied := false
 	if err := coordinator.Execute(context.Background(), SessionID{99}, MutationID{Sequence: 1},
+		testMutationDependencies("rollback-health"),
 		testVisibilityPrepare("rollback-health"),
 		func() ([]VisibilityTarget, bool) { applied = true; return nil, false }); !errors.Is(err, ErrVisibilityProfile) || applied {
 		t.Fatalf("mutation after last participant rolled back = %v, applied=%t, want strict-profile refusal before apply", err, applied)
@@ -276,6 +277,7 @@ func TestActivateParticipantRollbackFailurePoisonsCoordinator(t *testing.T) {
 		t.Fatalf("rollback failure = %v durable=%t", err, membership.contains(id))
 	}
 	err = coordinator.Execute(context.Background(), SessionID{99}, MutationID{Sequence: 1},
+		testMutationDependencies("poisoned"),
 		func() ([]VisibilityTarget, error) { return nil, nil },
 		func() ([]VisibilityTarget, bool) { t.Fatal("poisoned coordinator applied mutation"); return nil, false })
 	if !errors.Is(err, ErrVisibilityPoisoned) {
@@ -306,6 +308,7 @@ func TestActivateParticipantExcludesMutationUntilCommitVerdict(t *testing.T) {
 	executeDone := make(chan error, 1)
 	go func() {
 		executeDone <- coordinator.Execute(context.Background(), SessionID{90}, MutationID{Sequence: 1},
+			testMutationDependencies("excluded"),
 			func() ([]VisibilityTarget, error) {
 				close(prepareCalled)
 				return testVisibilityTargets("excluded"), nil
@@ -400,7 +403,7 @@ func (h *visibilityHarness) fenceReasonFor(id SessionID) error {
 
 func (h *visibilityHarness) register(t *testing.T, id SessionID, budget time.Duration) {
 	t.Helper()
-	h.registerRepair(t, id, budget, NamespaceRepairParentExclusive)
+	h.registerRepair(t, id, budget, NamespaceRepairIndependent)
 }
 
 // registerRepair admits one strict participant with an explicit namespace-repair
@@ -445,6 +448,71 @@ func testVisibilityPrepare(name string) func() ([]VisibilityTarget, error) {
 	return func() ([]VisibilityTarget, error) { return testVisibilityTargets(name), nil }
 }
 
+func testExactVisibilityTargets(sequence uint64, targets []VisibilityTarget) []VisibilityTarget {
+	exact := cloneVisibilityTargets(targets)
+	for index := range exact {
+		target := &exact[index]
+		if target.Scope == VisibilityNamespace {
+			continue
+		}
+		target.ExactPostState = &VisibilityObjectPostState{
+			StableIdentity: target.Identity,
+			ObjectVersion:  sequence,
+			Roles:          1,
+			Attr: VisibilityAttr{
+				Kind: 1, Inode: target.KernelIno, Size: target.Size,
+			},
+		}
+	}
+	return exact
+}
+
+func executeTestExact(
+	coordinator *VisibilityCoordinator,
+	ctx context.Context,
+	source SessionID,
+	mutation MutationID,
+	dependencies MutationDependencies,
+	prepare func() ([]VisibilityTarget, error),
+	apply func() ([]VisibilityTarget, bool),
+) error {
+	return coordinator.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, prepare,
+		func(sequence uint64) ([]VisibilityTarget, bool) {
+			targets, changed := apply()
+			if changed {
+				targets = testExactVisibilityTargets(sequence, targets)
+			}
+			return targets, changed
+		}, nil)
+}
+
+func executeTestExactWithSourceGate(
+	coordinator *VisibilityCoordinator,
+	ctx context.Context,
+	source SessionID,
+	mutation MutationID,
+	declaration DependencyDeclaration,
+	gate SourcePublicationGate,
+	refresh func() (SourcePublicationGate, error),
+	prepare func() ([]VisibilityTarget, error),
+	apply func() ([]VisibilityTarget, bool),
+	published func() ([]VisibilityResolution, error),
+) error {
+	_, err := coordinator.ExecuteWithSourceGateSequence(ctx, source, mutation, declaration, gate, refresh, prepare,
+		func(sequence uint64) ([]VisibilityTarget, bool) {
+			targets, changed := apply()
+			if changed {
+				targets = testExactVisibilityTargets(sequence, targets)
+			}
+			return targets, changed
+		}, published)
+	return err
+}
+
+func testMutationDependencies(name string) MutationDependencies {
+	return mutationDependenciesForTargets(testVisibilityTargets(name))
+}
+
 func testSourcePublicationGate(name string) SourcePublicationGate {
 	return SourcePublicationGate{Targets: []SourcePublicationTarget{{
 		ParentIdentity: testVisibilityParent(), Name: []byte(name), BoundAttributes: true,
@@ -461,29 +529,19 @@ func executeTestSourceGated(
 	apply func() ([]VisibilityTarget, bool),
 ) error {
 	gate := testSourcePublicationGate(name)
-	return coordinator.ExecuteWithSourceGate(ctx, source, mutation, gate,
+	declaration := coordinator.DeclareSourceGate(gate)
+	_, err := coordinator.ExecuteWithSourceGateSequence(ctx, source, mutation, declaration, gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
-		prepare, apply,
+		prepare, func(sequence uint64) ([]VisibilityTarget, bool) {
+			targets, changed := apply()
+			if changed {
+				targets = testExactVisibilityTargets(sequence, targets)
+			}
+			return targets, changed
+		},
 		func() ([]VisibilityResolution, error) { return nil, nil },
 	)
-}
-
-func executeTestSourceGatedHeld(
-	coordinator *VisibilityCoordinator,
-	ctx context.Context,
-	source SessionID,
-	mutation MutationID,
-	name string,
-	held [][16]byte,
-	prepare func() ([]VisibilityTarget, error),
-	apply func() ([]VisibilityTarget, bool),
-) error {
-	gate := testSourcePublicationGate(name)
-	return coordinator.ExecuteWithSourceGateAndHeldParents(ctx, source, mutation, gate, held,
-		func() (SourcePublicationGate, error) { return gate, nil },
-		prepare, apply,
-		func() ([]VisibilityResolution, error) { return nil, nil },
-	)
+	return err
 }
 
 func testMountAbsence(observed time.Time) MountAbsenceProof {
@@ -537,6 +595,7 @@ func TestVisibilityParticipantLossFencesOnlyThatMount(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("prepare"),
 			testVisibilityPrepare("prepare"), func() ([]VisibilityTarget, bool) {
 				applied.Store(true)
 				return testVisibilityTargets("prepare"), true
@@ -562,6 +621,7 @@ func TestVisibilityParticipantLossFencesOnlyThatMount(t *testing.T) {
 	second := make(chan error, 1)
 	go func() {
 		second <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 2},
+			testMutationDependencies("prepare"),
 			testVisibilityPrepare("prepare"), func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("prepare"), true
 			})
@@ -589,6 +649,7 @@ func TestVisibilityDeadlineFencesOneParticipantAndCompletes(t *testing.T) {
 	started := time.Now()
 	go func() {
 		result <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("prepare"),
 			testVisibilityPrepare("prepare"), func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("prepare"), true
 			})
@@ -725,6 +786,7 @@ func TestVisibilityExpiredDeliveryCannotFenceAfterAck(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("shared"),
 			testVisibilityPrepare("shared"),
 			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("shared"), true })
 	}()
@@ -772,6 +834,7 @@ func TestVisibilityFanOutSkipsMountsThatNeverResolvedTheName(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("watched"),
 			testVisibilityPrepare("watched"), func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("watched"), true
 			})
@@ -824,8 +887,9 @@ func TestVisibilityFanOutProjectsTargetsPerParticipant(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			mutationDependenciesForTargets(prepareTargets),
 			func() ([]VisibilityTarget, error) { return prepareTargets, nil },
 			func() ([]VisibilityTarget, bool) { return completeTargets, true },
 		)
@@ -901,8 +965,9 @@ func TestVisibilityProjectedPrepareDoesNotCoverRacedOmittedTarget(t *testing.T) 
 	releaseApply := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			mutationDependenciesForTargets(targets),
 			func() ([]VisibilityTarget, error) { return targets, nil },
 			func() ([]VisibilityTarget, bool) {
 				close(applyEntered)
@@ -980,7 +1045,7 @@ func TestVisibilityProjectedPrepareDoesNotCoverRacedOmittedTarget(t *testing.T) 
 func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	parent := testVisibilityParent()
 	var file [16]byte
 	file[0] = 2
@@ -994,7 +1059,7 @@ func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.
 		{Identity: file, Attributes: true, Data: true},
 		{ParentIdentity: parent, Name: []byte("child"), BoundAttributes: true, BoundIdentities: [][16]byte{file}},
 	}}
-	err := h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, gate,
+	err := executeTestExactWithSourceGate(h.coordinator, context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
 		func() ([]VisibilityTarget, error) { return targets, nil },
 		func() ([]VisibilityTarget, bool) { return targets, true },
@@ -1020,25 +1085,70 @@ func TestVisibilitySourceGateReplacesSelfPhasesAndIndexesPublication(t *testing.
 	}
 }
 
+func TestVisibilitySourceGateFenceDuringPeerPrepareRefusesApply(t *testing.T) {
+	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
+	source, peer := SessionID{1}, SessionID{2}
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
+	h.registerRepair(t, peer, testRepairBudget, NamespaceRepairIndependent)
+	h.resolve(t, peer, "source-fence")
+	gate := testSourcePublicationGate("source-fence")
+	applied := 0
+	result := make(chan error, 1)
+	go func() {
+		result <- executeTestExactWithSourceGate(
+			h.coordinator, context.Background(), source, MutationID{Sequence: 1},
+			h.coordinator.DeclareSourceGate(gate), gate,
+			func() (SourcePublicationGate, error) { return gate, nil },
+			testVisibilityPrepare("source-fence"),
+			func() ([]VisibilityTarget, bool) {
+				applied++
+				return testVisibilityTargets("source-fence"), true
+			},
+			func() ([]VisibilityResolution, error) { return nil, nil },
+		)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepare.Cursor.Phase != VisibilityPrepare {
+		t.Fatalf("peer event = %+v, want PREPARE", prepare)
+	}
+	h.fencer.die(source)
+	if err := h.coordinator.Ack(peer, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, ErrVisibilityLost) {
+		t.Fatalf("source-gated mutation after source fence = %v, want %v", err, ErrVisibilityLost)
+	}
+	if applied != 0 {
+		t.Fatalf("apply calls after source fence = %d, want 0", applied)
+	}
+}
+
 // A successful create can return an existing item without changing XFS. That
 // response still publishes a stable identity into the initiating frontend. The
-// authority must index it while the create owns mutation order: otherwise an
-// immediately queued item-only peer mutation can choose its audience before
-// the source is known to cache that item.
+// authority must index it while the create owns the resolved inode dependency:
+// otherwise an immediately queued item-only peer mutation can choose its
+// audience before the source is known to cache that item.
 func TestVisibilityPublishedIdentityIsIndexedBeforeNextMutationTurn(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	gate := testSourcePublicationGate("existing")
 	var returnedIdentity [16]byte
 	returnedIdentity[0] = 0xA1
+	gate.Targets[0].BoundIdentities = [][16]byte{returnedIdentity}
 
 	publicationEntered := make(chan struct{})
 	releasePublication := make(chan struct{})
 	first := make(chan error, 1)
 	go func() {
 		first <- h.coordinator.ExecuteWithSourceGate(
-			context.Background(), source, MutationID{Sequence: 1}, gate,
+			context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 			func() (SourcePublicationGate, error) { return gate, nil },
 			testVisibilityPrepare("existing"),
 			func() ([]VisibilityTarget, bool) { return nil, false },
@@ -1056,13 +1166,14 @@ func TestVisibilityPublishedIdentityIsIndexedBeforeNextMutationTurn(t *testing.T
 	}}
 	second := make(chan error, 1)
 	go func() {
-		second <- h.coordinator.Execute(
+		second <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 2},
+			mutationDependenciesForTargets(secondTargets),
 			func() ([]VisibilityTarget, error) { return secondTargets, nil },
 			func() ([]VisibilityTarget, bool) { return secondTargets, true },
 		)
 	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
 	close(releasePublication)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1085,7 +1196,7 @@ func TestVisibilityPublishedIdentityIsIndexedBeforeNextMutationTurn(t *testing.T
 }
 
 // A zero-TTL reply is still a publication while it is in flight to a kernel.
-// Every protocol-5 mount is therefore a real participant: a later peer
+// Every FSKit synchronous-repair mount is therefore a real participant: a later peer
 // mutation reaches the source's local gate and cannot apply until the earlier
 // reply is physically published. This is the deterministic core witness for
 // the race the retired UNCACHED profile allowed.
@@ -1102,8 +1213,8 @@ func TestVisibilityLaterPeerWaitsForDelayedSourceReplyPublication(t *testing.T) 
 	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{
 		Identity: identity, Attributes: true, Data: true,
 	}}}
-	if err := h.coordinator.ExecuteWithSourceGate(
-		context.Background(), source, MutationID{Sequence: 1}, gate,
+	if err := executeTestExactWithSourceGate(h.coordinator,
+		context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
 		func() ([]VisibilityTarget, error) { return targets, nil },
 		func() ([]VisibilityTarget, bool) { return targets, true },
@@ -1118,8 +1229,8 @@ func TestVisibilityLaterPeerWaitsForDelayedSourceReplyPublication(t *testing.T) 
 	secondApplied := make(chan struct{})
 	second := make(chan error, 1)
 	go func() {
-		second <- h.coordinator.ExecuteWithSourceGate(
-			context.Background(), peer, MutationID{Sequence: 2}, gate,
+		second <- executeTestExactWithSourceGate(h.coordinator,
+			context.Background(), peer, MutationID{Sequence: 2}, h.coordinator.DeclareSourceGate(gate), gate,
 			func() (SourcePublicationGate, error) { return gate, nil },
 			func() ([]VisibilityTarget, error) { return targets, nil },
 			func() ([]VisibilityTarget, bool) {
@@ -1184,6 +1295,7 @@ func TestVisibilityStabilizeBlocksOnAnInFlightCoordinate(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("contended"),
 			testVisibilityPrepare("contended"), func() ([]VisibilityTarget, bool) {
 				<-release
 				return testVisibilityTargets("contended"), true
@@ -1258,6 +1370,7 @@ func TestVisibilityStabilizeLetsPrepareAudienceDrainThenBlocksAfterAck(t *testin
 	result := make(chan error, 1)
 	go func() {
 		result <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("contended"),
 			testVisibilityPrepare("contended"), func() ([]VisibilityTarget, bool) {
 				close(applied)
 				<-releaseApply
@@ -1347,6 +1460,7 @@ func TestVisibilityStabilizeReleasesAfterApplyBeforeCompleteAck(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("contended"),
 			testVisibilityPrepare("contended"), func() ([]VisibilityTarget, bool) {
 				<-releaseApply
 				close(applied)
@@ -1404,13 +1518,13 @@ func TestVisibilityStabilizeReleasesAfterApplyBeforeCompleteAck(t *testing.T) {
 // control state supplies the prior-epoch fencing proof.
 func TestVisibilityRestartStartsClosedWithoutPriorEpochProof(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochUnproven)
-	commitment := VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairParentExclusive}
+	commitment := VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairIndependent}
 	if err := h.coordinator.Register(SessionID{1}, CoherenceStrict, make(chan struct{}), commitment); !errors.Is(err, ErrVisibilityStartup) {
 		t.Fatalf("Register without prior-epoch proof = %v, want ErrVisibilityStartup", err)
 	}
 
 	var applied atomic.Bool
-	err := h.coordinator.Execute(context.Background(), SessionID{}, MutationID{Sequence: 1}, testVisibilityPrepare("prepare"), func() ([]VisibilityTarget, bool) {
+	err := h.coordinator.Execute(context.Background(), SessionID{}, MutationID{Sequence: 1}, testMutationDependencies("prepare"), testVisibilityPrepare("prepare"), func() ([]VisibilityTarget, bool) {
 		applied.Store(true)
 		return testVisibilityTargets("prepare"), true
 	})
@@ -1426,24 +1540,24 @@ func TestVisibilityRestartStartsClosedWithoutPriorEpochProof(t *testing.T) {
 // session ID and an undeclared cache capacity or repair budget are all refused.
 func TestVisibilityRegisterRefusesUnstatedCommitments(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	good := VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairParentExclusive}
+	good := VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairIndependent}
 	cases := []struct {
 		name       string
 		id         SessionID
 		commitment VisibilityCommitment
 	}{
 		{"zero session id", SessionID{}, good},
-		{"no cache capacity", SessionID{1}, VisibilityCommitment{RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairParentExclusive}},
-		{"no repair budget", SessionID{2}, VisibilityCommitment{CachedNameCapacity: testCacheCapacity, NamespaceRepair: NamespaceRepairParentExclusive}},
-		{"capacity beyond the deployment bound", SessionID{3}, VisibilityCommitment{CachedNameCapacity: 1 << 24, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairParentExclusive}},
-		{"budget beyond the deployment bound", SessionID{4}, VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: time.Hour, NamespaceRepair: NamespaceRepairParentExclusive}},
+		{"no cache capacity", SessionID{1}, VisibilityCommitment{RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairIndependent}},
+		{"no repair budget", SessionID{2}, VisibilityCommitment{CachedNameCapacity: testCacheCapacity, NamespaceRepair: NamespaceRepairIndependent}},
+		{"capacity beyond the deployment bound", SessionID{3}, VisibilityCommitment{CachedNameCapacity: 1 << 24, RepairBudget: testRepairBudget, NamespaceRepair: NamespaceRepairIndependent}},
+		{"budget beyond the deployment bound", SessionID{4}, VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: time.Hour, NamespaceRepair: NamespaceRepairIndependent}},
 		// A strict mount that does not say how its kernel makes a binding
 		// unservable has not agreed to the contract: the authority would have to
 		// guess whether a silent participant is deadlocked or merely slow.
 		{"no namespace-repair model", SessionID{5}, VisibilityCommitment{CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget}},
 		{"writer lease on a non-macOS repair profile", SessionID{6}, VisibilityCommitment{
 			CachedNameCapacity: testCacheCapacity, RepairBudget: testRepairBudget,
-			NamespaceRepair: NamespaceRepairLocklessExpiration, CompatibilityWriter: true,
+			NamespaceRepair: NamespaceRepairIndependent, CompatibilityWriter: true,
 		}},
 	}
 	for _, test := range cases {
@@ -1500,7 +1614,7 @@ func TestVisibilityDetachAcceptsAuthenticatedSupervisorObservation(t *testing.T)
 	id := SessionID{1}
 	terminal := fencer.attach(id)
 	if err := coordinator.Register(id, CoherenceStrict, terminal, VisibilityCommitment{
-		CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: NamespaceRepairParentExclusive,
+		CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: NamespaceRepairIndependent,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1573,6 +1687,7 @@ func TestVisibilityDetachProofMustPostdateTheOutstandingEvent(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		result <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("prepare"),
 			testVisibilityPrepare("prepare"), func() ([]VisibilityTarget, bool) {
 				close(applied)
 				return testVisibilityTargets("prepare"), true
@@ -1617,7 +1732,7 @@ func TestVisibilityCoherentProfileValidatesTargets(t *testing.T) {
 	h.register(t, source, testRepairBudget)
 	gate := testSourcePublicationGate("invalid")
 	var applied atomic.Bool
-	err := h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, gate,
+	err := h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
 		func() ([]VisibilityTarget, error) {
 			// A namespace target with no parent identity: a construction defect.
@@ -1636,8 +1751,9 @@ func TestVisibilityCoherentProfileValidatesTargets(t *testing.T) {
 
 	postApply := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	postApply.register(t, source, testRepairBudget)
-	err = postApply.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, gate,
-		func() (SourcePublicationGate, error) { return gate, nil },
+	postApplyGate := testSourcePublicationGate("x")
+	err = postApply.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, postApply.coordinator.DeclareSourceGate(postApplyGate), postApplyGate,
+		func() (SourcePublicationGate, error) { return postApplyGate, nil },
 		testVisibilityPrepare("x"),
 		func() ([]VisibilityTarget, bool) {
 			// Changed XFS but could not describe what it changed.
@@ -1659,7 +1775,7 @@ func TestVisibilityCompletionOutsidePrepareIsAnAuthorityDefect(t *testing.T) {
 	source := SessionID{9}
 	h.register(t, source, testRepairBudget)
 	gate := testSourcePublicationGate("prepared")
-	err := h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, gate,
+	err := h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
 		testVisibilityPrepare("prepared"),
 		func() ([]VisibilityTarget, bool) { return testVisibilityTargets("never-prepared"), true },
@@ -1859,7 +1975,7 @@ func TestMacOS26CompatibilityMountOwnsTheWriterLease(t *testing.T) {
 		t.Fatalf("register macOS compatibility writer: %v", err)
 	}
 	t.Cleanup(func() { h.fencer.FenceSession(mac) })
-	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairIndependent)
 	h.resolve(t, linux, "shared")
 
 	prepared, applied := false, false
@@ -1911,7 +2027,7 @@ func TestMacOS26CompatibilityMountOwnsTheWriterLease(t *testing.T) {
 func TestMacOS26WriterActivationWaitsForAdmittedMutation(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	linux, mac := SessionID{1}, SessionID{2}
-	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, linux, testRepairBudget, NamespaceRepairIndependent)
 
 	applyStarted := make(chan struct{})
 	releaseApply := make(chan struct{})
@@ -2029,6 +2145,7 @@ func TestVisibilityCallbackSerializedMutationIsInterruptedByPendingRepair(t *tes
 	go func() {
 		first <- h.coordinator.Execute(
 			context.Background(), SessionID{9}, MutationID{Sequence: 1, FrontendOperationID: 41},
+			testMutationDependencies("peer-change"),
 			testVisibilityPrepare("peer-change"),
 			func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("peer-change"), true
@@ -2067,8 +2184,8 @@ func TestVisibilityCallbackSerializedMutationIsInterruptedByPendingRepair(t *tes
 	}
 }
 
-// The interruption also wakes a mutation that was already waiting for global
-// order before PREPARE was installed. This is the half a check performed only
+// The interruption also wakes a mutation that was already waiting for a shared
+// dependency before PREPARE was installed. This is the half a check performed only
 // when Execute begins would miss under a sustained writer storm.
 func TestVisibilityCallbackSerializedQueuedMutationWakesForPendingRepair(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
@@ -2076,7 +2193,7 @@ func TestVisibilityCallbackSerializedQueuedMutationWakesForPendingRepair(t *test
 	h.registerRepair(t, participant, testRepairBudget, NamespaceRepairCallbackSerializedPipelined)
 	h.resolve(t, participant, "peer-change")
 
-	// Let the peer own mutation order but stop immediately before it publishes
+	// Let the peer own the shared parent key but stop immediately before it publishes
 	// PREPARE, so the local mutation is already queued when pending changes.
 	peerPreparing := make(chan struct{})
 	releasePeerPrepare := make(chan struct{})
@@ -2084,6 +2201,7 @@ func TestVisibilityCallbackSerializedQueuedMutationWakesForPendingRepair(t *test
 	go func() {
 		peer <- h.coordinator.Execute(
 			context.Background(), SessionID{9}, MutationID{Sequence: 1, FrontendOperationID: 41},
+			testMutationDependencies("peer-change"),
 			func() ([]VisibilityTarget, error) {
 				close(peerPreparing)
 				<-releasePeerPrepare
@@ -2143,10 +2261,10 @@ func TestVisibilityCallbackSerializedQueuedMutationWakesForPendingRepair(t *test
 	}
 }
 
-// A conflicting callback must leave the FIFO even when it is not the head.
+// A conflicting callback must leave its per-key FIFO even when it is not the head.
 // Otherwise one safe waiter in front of it would keep the callback alive while
 // PREPARE waits for the FSKit lane that callback occupies.
-func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T) {
+func TestVisibilityDependencySequencerInterruptsConflictingNonHeadWaiter(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	participant := SessionID{1}
 	h.registerRepair(t, participant, testRepairBudget, NamespaceRepairCallbackSerializedPipelined)
@@ -2158,6 +2276,7 @@ func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T)
 	go func() {
 		peer <- h.coordinator.Execute(
 			context.Background(), SessionID{9}, MutationID{Sequence: 1, FrontendOperationID: 41},
+			testMutationDependencies("peer-change"),
 			func() ([]VisibilityTarget, error) {
 				close(peerPreparing)
 				<-releasePeerPrepare
@@ -2175,6 +2294,7 @@ func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T)
 	go func() {
 		safe <- h.coordinator.Execute(
 			context.Background(), SessionID{8}, MutationID{Sequence: 2, FrontendOperationID: 42},
+			testMutationDependencies("safe-change"),
 			func() ([]VisibilityTarget, error) {
 				safePrepared.Store(true)
 				return testVisibilityTargets("safe-change"), nil
@@ -2184,7 +2304,7 @@ func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T)
 			},
 		)
 	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
 
 	var hazardousPrepared atomic.Bool
 	hazardous := make(chan error, 1)
@@ -2200,7 +2320,7 @@ func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T)
 			},
 		)
 	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 2)
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 2)
 
 	close(releasePeerPrepare)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -2220,9 +2340,9 @@ func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T)
 	if hazardousPrepared.Load() {
 		t.Fatal("interrupted non-head waiter reached prepare")
 	}
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
 	if safePrepared.Load() {
-		t.Fatal("safe FIFO head prepared before the owner released mutation order")
+		t.Fatal("safe per-key FIFO head prepared before the owner released the parent key")
 	}
 
 	runBarrierFrom(t, h.coordinator, participant, prepare)
@@ -2237,24 +2357,25 @@ func TestVisibilityMutationOrderInterruptsConflictingNonHeadWaiter(t *testing.T)
 	}
 }
 
-// A namespace binding may change while a source request waits in mutation
-// FIFO. The authority refreshes only its internal bound identities after grant;
+// A namespace binding may change while a source request waits on its binding
+// key. The authority refreshes only its internal bound identities after grant;
 // the frontend-declared coordinate and scopes remain immutable. The refreshed
 // identity, not the stale pre-enqueue one, enters the source's monotone index.
 func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	ownerPreparing := make(chan struct{})
 	releaseOwner := make(chan struct{})
 	owner := make(chan error, 1)
 	go func() {
 		owner <- h.coordinator.Execute(
 			context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("new"),
 			func() ([]VisibilityTarget, error) {
 				close(ownerPreparing)
 				<-releaseOwner
-				return testVisibilityTargets("unrelated"), nil
+				return testVisibilityTargets("new"), nil
 			},
 			func() ([]VisibilityTarget, bool) { return nil, false },
 		)
@@ -2269,7 +2390,7 @@ func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T)
 	result := make(chan error, 1)
 	go func() {
 		result <- h.coordinator.ExecuteWithSourceGate(
-			context.Background(), source, MutationID{Sequence: 2}, initial,
+			context.Background(), source, MutationID{Sequence: 2}, h.coordinator.DeclareSourceGate(initial), initial,
 			func() (SourcePublicationGate, error) {
 				refreshed := testSourcePublicationGate("new")
 				refreshed.Targets[0].BoundIdentities = [][16]byte{current}
@@ -2280,7 +2401,7 @@ func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T)
 			func() ([]VisibilityResolution, error) { return nil, nil },
 		)
 	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
 	current = newIdentity
 	close(releaseOwner)
 	if err := <-owner; err != nil {
@@ -2299,172 +2420,13 @@ func TestVisibilityQueuedSourceRefreshesNamespaceBindingAfterGrant(t *testing.T)
 	}
 }
 
-// An item mutation with no held directory can queue while the current owner is
-// still deriving PREPARE. If that owner then installs an overlapping peer
-// phase, the source waiter must wake and abandon FIFO immediately; otherwise
-// the peer frontend waits for the source lease while the source waits for the
-// peer-owned turn.
-func TestVisibilityQueuedLinuxItemGateYieldsInternalRetryAndPreservesFIFO(t *testing.T) {
+// A currently negative namespace binding and an unrelated inode mutation have
+// no shared cached observation. The namespace operation must not queue merely
+// because the old volume-global turn would have put the inode operation first.
+func TestVisibilityUnresolvedNamespaceGateRunsBesideDisjointItemMutation(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	var identity [16]byte
-	identity[0] = 31
-	h.coordinator.RecordResolvedInode(source, identity)
-	targets := []VisibilityTarget{{
-		Scope: VisibilityAttributes, Identity: identity, KernelIno: 301, Device: 1,
-	}}
-
-	ownerPreparing := make(chan struct{})
-	releaseOwnerPrepare := make(chan struct{})
-	owner := make(chan error, 1)
-	go func() {
-		owner <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
-			func() ([]VisibilityTarget, error) {
-				close(ownerPreparing)
-				<-releaseOwnerPrepare
-				return targets, nil
-			},
-			func() ([]VisibilityTarget, bool) { return targets, true })
-	}()
-	<-ownerPreparing
-
-	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: identity, Attributes: true}}}
-	var prepared atomic.Bool
-	sourceResult := make(chan error, 1)
-	go func() {
-		sourceResult <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2, FrontendOperationID: 77}, gate,
-			func() (SourcePublicationGate, error) { return gate, nil },
-			func() ([]VisibilityTarget, error) {
-				prepared.Store(true)
-				return targets, nil
-			},
-			func() ([]VisibilityTarget, bool) { return targets, true },
-			func() ([]VisibilityResolution, error) { return nil, nil })
-	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
-	close(releaseOwnerPrepare)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-sourceResult:
-		if !errors.Is(err, ErrVisibilityRetry) {
-			t.Fatalf("queued item source = %v, want ErrVisibilityRetry", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("queued item source did not wake for overlapping PREPARE")
-	}
-	if prepared.Load() {
-		t.Fatal("interrupted item source reached prepare")
-	}
-	h.coordinator.mu.Lock()
-	dormant, exists := h.coordinator.fairness[source]
-	h.coordinator.mu.Unlock()
-	if !exists || dormant.active || !dormant.observed || dormant.operationID != 77 || !dormant.claimSameOperation || dormant.ordinal == 0 {
-		t.Fatalf("dormant Linux item retry credit = %+v, present=%t", dormant, exists)
-	}
-	if err := h.coordinator.Ack(source, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	complete, err := h.coordinator.Next(ctx, source, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Model the independent transport lanes exactly: the frontend has finished
-	// the COMPLETE repair and sends its retry proof on DATA while the combined
-	// COMPLETE ACK is still in flight on CONTROL. The proof may claim the
-	// dormant ordinal, but it must remain behind the barrier owner until ACK.
-	type acquired struct {
-		turn *mutationOrderWaiter
-		err  error
-	}
-	retried := make(chan acquired, 1)
-	go func() {
-		turn, err := h.coordinator.acquireMutationOrder(ctx, source, MutationID{
-			Sequence: 3, FrontendOperationID: 77,
-			VisibilityRetryAfterSequence: complete.Cursor.Sequence,
-		}, nil, &gate)
-		retried <- acquired{turn: turn, err: err}
-	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
-	select {
-	case got := <-retried:
-		if got.turn != nil {
-			got.turn.release()
-		}
-		t.Fatalf("proved retry escaped before COMPLETE ACK: %+v", got)
-	case <-time.After(25 * time.Millisecond):
-	}
-	if err := h.coordinator.Ack(source, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-owner; err != nil {
-		t.Fatal(err)
-	}
-	got := <-retried
-	if got.err != nil {
-		t.Fatal(got.err)
-	}
-	if got.turn.ordinal != dormant.ordinal {
-		t.Fatalf("retried item ordinal = %d, want preserved %d", got.turn.ordinal, dormant.ordinal)
-	}
-	got.turn.release()
-}
-
-func TestVisibilityLinuxItemRetryProofIsExactAndMandatory(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	var identity [16]byte
-	identity[0] = 32
-	gate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: identity, Attributes: true}}}
-	h.coordinator.mu.Lock()
-	h.coordinator.fairness[source] = mutationFairnessDebt{
-		sequence: 41, ordinal: h.coordinator.order.reserveOrdinal(), operationID: 77,
-		claimSameOperation: true, gate: cloneSourcePublicationGate(gate), observed: true,
-	}
-	h.coordinator.mu.Unlock()
-
-	for name, mutation := range map[string]MutationID{
-		"omitted":         {Sequence: 2, FrontendOperationID: 77},
-		"wrong sequence":  {Sequence: 2, FrontendOperationID: 77, VisibilityRetryAfterSequence: 40},
-		"wrong operation": {Sequence: 2, FrontendOperationID: 78, VisibilityRetryAfterSequence: 41},
-	} {
-		t.Run(name, func(t *testing.T) {
-			_, err := h.coordinator.acquireMutationOrder(t.Context(), source, mutation, nil, &gate)
-			if !errors.Is(err, ErrSourcePublicationGate) {
-				t.Fatalf("retry proof error = %v, want ErrSourcePublicationGate", err)
-			}
-		})
-	}
-
-	t.Run("wrong gate", func(t *testing.T) {
-		otherIdentity := identity
-		otherIdentity[1] = 1
-		otherGate := SourcePublicationGate{Targets: []SourcePublicationTarget{{Identity: otherIdentity, Attributes: true}}}
-		_, err := h.coordinator.acquireMutationOrder(t.Context(), source, MutationID{
-			Sequence: 2, FrontendOperationID: 77, VisibilityRetryAfterSequence: 41,
-		}, nil, &otherGate)
-		if !errors.Is(err, ErrSourcePublicationGate) {
-			t.Fatalf("changed-gate retry proof error = %v, want ErrSourcePublicationGate", err)
-		}
-	})
-}
-
-// A create/rename lease cannot know the identity a prior queued mutation is
-// about to bind. Its requested bound scope is therefore a wildcard only while
-// that exact namespace callback is in flight. An item-only PREPARE for the new
-// object must wake and refuse the waiter before either side can wait on the
-// other.
-func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
+	h.registerRepair(t, source, testRepairBudget, NamespaceRepairIndependent)
 	var newlyBound [16]byte
 	newlyBound[0] = 41
 	h.coordinator.RecordResolvedInode(source, newlyBound)
@@ -2476,7 +2438,8 @@ func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T
 	releaseOwnerPrepare := make(chan struct{})
 	owner := make(chan error, 1)
 	go func() {
-		owner <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+		owner <- executeTestExact(h.coordinator, context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			mutationDependenciesForTargets(itemTargets),
 			func() ([]VisibilityTarget, error) {
 				close(ownerPreparing)
 				<-releaseOwnerPrepare
@@ -2490,7 +2453,7 @@ func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T
 	var prepared atomic.Bool
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2, FrontendOperationID: 77}, gate,
+		result <- h.coordinator.ExecuteWithSourceGate(context.Background(), source, MutationID{Sequence: 2, FrontendOperationID: 77}, h.coordinator.DeclareSourceGate(gate), gate,
 			func() (SourcePublicationGate, error) { return gate, nil },
 			func() ([]VisibilityTarget, error) {
 				prepared.Store(true)
@@ -2499,7 +2462,17 @@ func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T
 			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("new"), true },
 			func() ([]VisibilityResolution, error) { return nil, nil })
 	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("disjoint unresolved namespace mutation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("disjoint unresolved namespace mutation waited behind inode mutation")
+	}
+	if !prepared.Load() {
+		t.Fatal("disjoint unresolved namespace mutation never prepared")
+	}
 	close(releaseOwnerPrepare)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -2507,326 +2480,9 @@ func TestVisibilityQueuedUnresolvedNamespaceGateWakesForItemPrepare(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case err := <-result:
-		if !errors.Is(err, ErrVisibilityRetry) {
-			t.Fatalf("queued unresolved namespace source = %v, want ErrVisibilityRetry", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("unresolved namespace source did not wake for item PREPARE")
-	}
-	if prepared.Load() {
-		t.Fatal("interrupted unresolved namespace source reached prepare")
-	}
 	runBarrierFrom(t, h.coordinator, source, prepare)
 	if err := <-owner; err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestVisibilityLocklessNamespaceRetryKeepsItsFIFOPositionThroughCompleteAck(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	source := SessionID{1}
-	h.registerRepair(t, source, testRepairBudget, NamespaceRepairLocklessExpiration)
-	h.resolve(t, source, "same-name")
-	targets := testVisibilityTargets("same-name")
-	gate := testSourcePublicationGate("same-name")
-
-	peer := make(chan error, 1)
-	go func() {
-		peer <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
-			func() ([]VisibilityTarget, error) { return targets, nil },
-			func() ([]VisibilityTarget, bool) { return targets, true })
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, source)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = h.coordinator.ExecuteWithSourceGateSequence(ctx, source, MutationID{
-		Sequence: 2, FrontendOperationID: 88,
-	}, gate, func() (SourcePublicationGate, error) { return gate, nil },
-		func() ([]VisibilityTarget, error) {
-			t.Fatal("namespace retry reached prepare before its peer repair")
-			return nil, nil
-		}, func(uint64) ([]VisibilityTarget, bool) {
-			t.Fatal("namespace retry reached apply before its peer repair")
-			return nil, false
-		}, func() ([]VisibilityResolution, error) { return nil, nil })
-	retrySequence, ok := VisibilityRetrySequence(err)
-	if !ok || retrySequence != prepare.Cursor.Sequence {
-		t.Fatalf("namespace first attempt = %v sequence=%d, want retry for %d", err, retrySequence, prepare.Cursor.Sequence)
-	}
-
-	if err := h.coordinator.Ack(source, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	complete, err := h.coordinator.Next(ctx, source, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var prepared, applied atomic.Bool
-	retried := make(chan error, 1)
-	go func() {
-		_, executeErr := h.coordinator.ExecuteWithSourceGateSequence(ctx, source, MutationID{
-			Sequence: 3, FrontendOperationID: 88, VisibilityRetryAfterSequence: complete.Cursor.Sequence,
-		}, gate, func() (SourcePublicationGate, error) { return gate, nil },
-			func() ([]VisibilityTarget, error) {
-				prepared.Store(true)
-				return targets, nil
-			}, func(uint64) ([]VisibilityTarget, bool) {
-				applied.Store(true)
-				return targets, true
-			}, func() ([]VisibilityResolution, error) { return nil, nil })
-		retried <- executeErr
-	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
-	select {
-	case err := <-retried:
-		t.Fatalf("proved namespace retry escaped before COMPLETE Ack: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
-	if prepared.Load() || applied.Load() {
-		t.Fatal("proved namespace retry reached filesystem work before COMPLETE Ack")
-	}
-	if err := h.coordinator.Ack(source, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-peer; err != nil {
-		t.Fatal(err)
-	}
-	if err := <-retried; err != nil {
-		t.Fatal(err)
-	}
-	if !prepared.Load() || !applied.Load() {
-		t.Fatalf("namespace retry prepare=%t apply=%t, want both after Ack", prepared.Load(), applied.Load())
-	}
-}
-
-// Linux enters the authority while its namespace callback already holds the
-// parent i_rwsem. If a peer COMPLETE for that parent is installed while the
-// request waits for mutation order, letting it continue to wait closes a
-// cycle: COMPLETE needs the lock and only this request's reply releases it.
-// The authority has both exact ordering facts, so it refuses this one request
-// before prepare/apply instead of fencing the whole mount after its budget.
-func TestVisibilityParentExclusiveQueuedMutationYieldsForOverlappingComplete(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	participant := SessionID{1}
-	h.registerRepair(t, participant, testRepairBudget, NamespaceRepairParentExclusive)
-	h.resolve(t, participant, "peer-change")
-
-	peer := make(chan error, 1)
-	go func() {
-		peer <- h.coordinator.Execute(
-			context.Background(), SessionID{9}, MutationID{Sequence: 1},
-			testVisibilityPrepare("peer-change"),
-			func() ([]VisibilityTarget, bool) {
-				return testVisibilityTargets("peer-change"), true
-			},
-		)
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, participant)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var prepared, applied atomic.Bool
-	local := make(chan error, 1)
-	go func() {
-		local <- executeTestSourceGatedHeld(
-			h.coordinator, ctx, participant, MutationID{Sequence: 2}, "local-change", [][16]byte{testVisibilityParent()},
-			func() ([]VisibilityTarget, error) {
-				prepared.Store(true)
-				return testVisibilityTargets("local-change"), nil
-			},
-			func() ([]VisibilityTarget, bool) {
-				applied.Store(true)
-				return testVisibilityTargets("local-change"), true
-			},
-		)
-	}()
-	select {
-	case err := <-local:
-		t.Fatalf("parent-exclusive mutation was refused during lock-free PREPARE: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	if err := h.coordinator.Ack(participant, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	complete, err := h.coordinator.Next(ctx, participant, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if complete.Cursor.Phase != VisibilityComplete {
-		t.Fatalf("phase = %v, want COMPLETE", complete.Cursor.Phase)
-	}
-	select {
-	case err := <-local:
-		t.Fatalf("parent-exclusive mutation was interrupted without an exact frontend report: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	if err := h.coordinator.ReportBlocked(ctx, participant, complete.Cursor, []uint64{101}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-local:
-		if !errors.Is(err, ErrVisibilityInterrupted) {
-			t.Fatalf("overlapping parent-exclusive mutation = %v, want ErrVisibilityInterrupted", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("overlapping parent-exclusive mutation did not release its parent for COMPLETE")
-	}
-	if prepared.Load() || applied.Load() {
-		t.Fatalf("interrupted parent-exclusive mutation reached prepare=%v apply=%v", prepared.Load(), applied.Load())
-	}
-	if err := h.coordinator.Ack(participant, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-peer; err != nil {
-		t.Fatalf("peer mutation: %v", err)
-	}
-	if !h.fencer.live(participant) || h.fencer.wasFenced(participant) {
-		t.Fatal("one overlapping Linux operation fenced the participant")
-	}
-}
-
-func TestVisibilityParentExclusiveDifferentParentKeepsOrdinaryOrder(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	participant := SessionID{1}
-	h.registerRepair(t, participant, testRepairBudget, NamespaceRepairParentExclusive)
-	h.resolve(t, participant, "peer-change")
-
-	peer := make(chan error, 1)
-	go func() {
-		peer <- h.coordinator.Execute(
-			context.Background(), SessionID{9}, MutationID{Sequence: 1},
-			testVisibilityPrepare("peer-change"),
-			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("peer-change"), true },
-		)
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, participant)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	differentParent := [16]byte{2}
-	local := make(chan error, 1)
-	go func() {
-		local <- executeTestSourceGatedHeld(
-			h.coordinator, ctx, participant, MutationID{Sequence: 2}, "local-change", [][16]byte{differentParent},
-			testVisibilityPrepare("local-change"),
-			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("local-change"), true },
-		)
-	}()
-	if err := h.coordinator.Ack(participant, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	complete, err := h.coordinator.Next(ctx, participant, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.ReportBlocked(ctx, participant, complete.Cursor, []uint64{101}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-local:
-		t.Fatalf("different-parent mutation returned under a disjoint interruption: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	if err := h.coordinator.Ack(participant, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	// The accepted report may be retransmitted after the Ack response wins the
-	// other network lane. Exact replay remains a no-op after acknowledgment.
-	if err := h.coordinator.ReportBlocked(ctx, participant, complete.Cursor, []uint64{101, 101}); err != nil {
-		t.Fatalf("accepted report replayed after Ack: %v", err)
-	}
-	if err := <-peer; err != nil {
-		t.Fatalf("peer mutation: %v", err)
-	}
-
-	if err := <-local; err != nil {
-		t.Fatalf("different-parent mutation: %v", err)
-	}
-}
-
-// rename(2) holds both parent i_rwsems across its authority round trip. An
-// exact interruption for either one must therefore refuse the whole operation
-// before prepare/apply. Naming the same parent twice is the same operation, not
-// two obligations, and must remain a harmless duplicate in the held set.
-func TestVisibilityParentExclusiveRenameYieldsForEitherParent(t *testing.T) {
-	overlap := testVisibilityParent()
-	disjoint := [16]byte{2}
-	for _, test := range []struct {
-		name string
-		held [][16]byte
-	}{
-		{name: "old parent", held: [][16]byte{overlap, disjoint}},
-		{name: "new parent", held: [][16]byte{disjoint, overlap}},
-		{name: "same parent", held: [][16]byte{overlap, overlap}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-			participant := SessionID{1}
-			h.registerRepair(t, participant, testRepairBudget, NamespaceRepairParentExclusive)
-			h.resolve(t, participant, "peer-change")
-
-			peer := make(chan error, 1)
-			go func() {
-				peer <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
-					testVisibilityPrepare("peer-change"),
-					func() ([]VisibilityTarget, bool) { return testVisibilityTargets("peer-change"), true })
-			}()
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, participant)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := h.coordinator.Ack(participant, prepare.Cursor); err != nil {
-				t.Fatal(err)
-			}
-			complete, err := h.coordinator.Next(ctx, participant, prepare.Cursor)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := h.coordinator.ReportBlocked(ctx, participant, complete.Cursor, []uint64{101}); err != nil {
-				t.Fatal(err)
-			}
-
-			var prepared, applied atomic.Bool
-			err = executeTestSourceGatedHeld(h.coordinator, ctx, participant, MutationID{Sequence: 2}, "rename", test.held,
-				func() ([]VisibilityTarget, error) {
-					prepared.Store(true)
-					return testVisibilityTargets("rename"), nil
-				},
-				func() ([]VisibilityTarget, bool) {
-					applied.Store(true)
-					return testVisibilityTargets("rename"), true
-				})
-			if !errors.Is(err, ErrVisibilityInterrupted) {
-				t.Fatalf("two-parent rename = %v, want ErrVisibilityInterrupted", err)
-			}
-			if prepared.Load() || applied.Load() {
-				t.Fatalf("interrupted rename reached prepare=%v apply=%v", prepared.Load(), applied.Load())
-			}
-			if err := h.coordinator.Ack(participant, complete.Cursor); err != nil {
-				t.Fatal(err)
-			}
-			if err := <-peer; err != nil {
-				t.Fatal(err)
-			}
-			if h.fencer.wasFenced(participant) || !h.fencer.live(participant) {
-				t.Fatal("one interrupted rename fenced the participant")
-			}
-		})
 	}
 }
 
@@ -2843,6 +2499,7 @@ func TestVisibilityCallbackSerializedFrozenProfileInterruptsDuringPeerPhase(t *t
 		first <- h.coordinator.Execute(
 			context.Background(), SessionID{9},
 			MutationID{Sequence: 1, FrontendOperationID: 41},
+			testMutationDependencies("first"),
 			testVisibilityPrepare("first"),
 			func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("first"), true
@@ -2879,7 +2536,7 @@ func TestVisibilityCallbackSerializedFrozenProfileInterruptsDuringPeerPhase(t *t
 	}
 }
 
-// A strict source cannot enter cache-visible mutation order without the exact
+// A strict source cannot enter cache-visible dependency sequencing without the exact
 // pre-dispatch publication cut. Refusal is definite-preapply and cannot mutate
 // either XFS or the source's resolved index.
 func TestVisibilityStrictSourceWithoutPublicationGateIsRefused(t *testing.T) {
@@ -2889,6 +2546,7 @@ func TestVisibilityStrictSourceWithoutPublicationGateIsRefused(t *testing.T) {
 	prepared, applied := false, false
 	err := h.coordinator.Execute(
 		context.Background(), source, MutationID{Sequence: 1},
+		testMutationDependencies("missing"),
 		func() ([]VisibilityTarget, error) {
 			prepared = true
 			return testVisibilityTargets("missing"), nil
@@ -2938,6 +2596,7 @@ func TestVisibilityPeerPhaseAdmissionIsFailSafe(t *testing.T) {
 				first <- h.coordinator.Execute(
 					context.Background(), test.initiator,
 					MutationID{Sequence: 1, FrontendOperationID: test.pendingOpID},
+					testMutationDependencies("first"),
 					testVisibilityPrepare("first"),
 					func() ([]VisibilityTarget, bool) {
 						return testVisibilityTargets("first"), true
@@ -3020,16 +2679,14 @@ func TestVisibilitySourceGateOverlapHonorsRequestedScope(t *testing.T) {
 }
 
 // Only CALLBACK_SERIALIZED has the volume-global callback-lane constraint.
-// INDEPENDENT repair can run beside an unanswered mutation, and the existing
-// PARENT_EXCLUSIVE model keeps its coordinate-specific blocked-report contract;
-// neither profile is refused merely because a visibility phase is pending.
+// INDEPENDENT repair can run beside an unanswered mutation and is not refused
+// merely because a visibility phase is pending.
 func TestVisibilityOtherRepairProfilesWaitAndApply(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		repair NamespaceRepair
 	}{
 		{"independent", NamespaceRepairIndependent},
-		{"parent-exclusive", NamespaceRepairParentExclusive},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
@@ -3041,6 +2698,7 @@ func TestVisibilityOtherRepairProfilesWaitAndApply(t *testing.T) {
 			go func() {
 				peer <- h.coordinator.Execute(
 					context.Background(), SessionID{9}, MutationID{Sequence: 1},
+					testMutationDependencies("peer-change"),
 					testVisibilityPrepare("peer-change"),
 					func() ([]VisibilityTarget, bool) {
 						return testVisibilityTargets("peer-change"), true
@@ -3075,7 +2733,7 @@ func TestVisibilityOtherRepairProfilesWaitAndApply(t *testing.T) {
 			case <-time.After(20 * time.Millisecond):
 			}
 			if prepared.Load() || applied.Load() {
-				t.Fatalf("profile %s crossed mutation order early: prepare=%v apply=%v", test.name, prepared.Load(), applied.Load())
+				t.Fatalf("profile %s crossed dependency order early: prepare=%v apply=%v", test.name, prepared.Load(), applied.Load())
 			}
 
 			if err := h.coordinator.Ack(participant, peerPrepare.Cursor); err != nil {
@@ -3131,7 +2789,7 @@ func TestVisibilitySourceIndexesTheNamesItsOwnMutationBound(t *testing.T) {
 		{ParentIdentity: parent, Name: []byte("new"), BoundAttributes: true},
 		{ParentIdentity: parent, Name: []byte("old"), BoundAttributes: true},
 	}}
-	err := h.coordinator.ExecuteWithSourceGate(context.Background(), mover, MutationID{Sequence: 1}, gate,
+	err := h.coordinator.ExecuteWithSourceGate(context.Background(), mover, MutationID{Sequence: 1}, h.coordinator.DeclareSourceGate(gate), gate,
 		func() (SourcePublicationGate, error) { return gate, nil },
 		func() ([]VisibilityTarget, error) { return rename, nil },
 		func() ([]VisibilityTarget, bool) { return rename, true },
@@ -3146,6 +2804,7 @@ func TestVisibilitySourceIndexesTheNamesItsOwnMutationBound(t *testing.T) {
 	second := make(chan error, 1)
 	go func() {
 		second <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 2},
+			testMutationDependencies("new"),
 			testVisibilityPrepare("new"), func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("new"), true
 			})
@@ -3190,209 +2849,6 @@ func runBarrierFrom(t *testing.T, coordinator *VisibilityCoordinator, id Session
 	}
 }
 
-// A Linux parent-exclusive callback already holds the parent i_rwsem when its
-// request queues behind a peer mutation. The exact cached-name report installs
-// a scoped interruption, so that one pre-apply operation releases the lock and
-// the same mount repairs COMPLETE instead of being fenced.
-func TestVisibilityParkedMountReportInterruptsOperationAndPreservesMount(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	parked, mutator := SessionID{1}, SessionID{2}
-	const parkedBudget = 80 * time.Millisecond
-	h.register(t, parked, parkedBudget)
-	h.register(t, mutator, testRepairBudget)
-	// Both mounts hold names in the same directory.
-	h.resolve(t, parked, "shared")
-	h.resolve(t, mutator, "shared")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// The other mount is healthy: it answers every phase it is given.
-	go serviceVisibility(ctx, h.coordinator, mutator)
-
-	// The other mount's mutation starts and reaches PREPARE on the mount that
-	// is about to park.
-	first := make(chan error, 1)
-	go func() {
-		first <- executeTestSourceGated(h.coordinator, context.Background(), mutator, MutationID{Sequence: 1}, "shared",
-			testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
-				return testVisibilityTargets("shared"), true
-			})
-	}()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, parked)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// PREPARE only closes a frontend-local publication gate, so a mount can
-	// still answer it while its own syscall holds the directory lock. Only
-	// COMPLETE needs the kernel lock, which is why only COMPLETE is reportable.
-	if err := h.coordinator.Ack(parked, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-
-	parkedDone := make(chan error, 1)
-	go func() {
-		parkedDone <- executeTestSourceGatedHeld(h.coordinator, context.Background(), parked, MutationID{Sequence: 1}, "shared",
-			[][16]byte{testVisibilityParent()},
-			testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
-				return testVisibilityTargets("shared"), true
-			})
-	}()
-
-	// It receives the COMPLETE, finds it holds a cached binding in a directory
-	// its own unanswered syscall is holding, and says so rather than hanging.
-	complete, err := h.coordinator.Next(ctx, parked, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.ReportBlocked(context.Background(), parked, complete.Cursor, []uint64{101}); err != nil {
-		t.Fatalf("ReportBlocked = %v", err)
-	}
-
-	select {
-	case err := <-parkedDone:
-		if !errors.Is(err, ErrVisibilityInterrupted) {
-			t.Fatalf("parked mutation = %v, want ErrVisibilityInterrupted", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("the parked operation did not release its parent")
-	}
-	// The interruption remains active until COMPLETE is acknowledged. A quick
-	// application retry cannot retake the parent and recreate the same cycle.
-	stillScoped := make(chan error, 1)
-	go func() {
-		stillScoped <- executeTestSourceGatedHeld(h.coordinator, context.Background(), parked, MutationID{Sequence: 2}, "too-early-retry",
-			[][16]byte{testVisibilityParent()}, testVisibilityPrepare("too-early-retry"),
-			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("too-early-retry"), true })
-	}()
-	select {
-	case err := <-stillScoped:
-		if !errors.Is(err, ErrVisibilityInterrupted) {
-			t.Fatalf("retry before COMPLETE Ack = %v, want ErrVisibilityInterrupted", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("retry before COMPLETE Ack recreated the parent-lock cycle")
-	}
-	if err := h.coordinator.Ack(parked, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-first:
-		if err != nil {
-			t.Fatalf("peer mutation: %v", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("peer mutation did not finish after repair Ack")
-	}
-	if h.fencer.wasFenced(parked) || !h.fencer.live(parked) || !h.fencer.live(mutator) {
-		t.Fatal("cycle breaking did not preserve both mounts")
-	}
-
-	retry := make(chan error, 1)
-	go func() {
-		retry <- executeTestSourceGatedHeld(h.coordinator, context.Background(), parked, MutationID{Sequence: 3}, "retry",
-			[][16]byte{testVisibilityParent()}, testVisibilityPrepare("retry"),
-			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("retry"), true })
-	}()
-	if err := <-retry; err != nil {
-		t.Fatalf("fresh retry after cycle break: %v", err)
-	}
-}
-
-// The visibility stream and ordinary mutation stream are independent network
-// lanes. A blocked report may therefore reach the authority before the
-// operation whose callback already holds the parent. Installing the exact
-// scope first makes that ordering equivalent: the later request is still
-// refused before prepare/apply, the lock drains, and the mount survives.
-func TestVisibilityBlockedReportBeforeOrdinaryRequestIsRaceSafe(t *testing.T) {
-	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-	participant := SessionID{1}
-	h.registerRepair(t, participant, testRepairBudget, NamespaceRepairParentExclusive)
-	h.resolve(t, participant, "peer-change")
-
-	peer := make(chan error, 1)
-	go func() {
-		peer <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
-			testVisibilityPrepare("peer-change"),
-			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("peer-change"), true })
-	}()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, participant)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.Ack(participant, prepare.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	complete, err := h.coordinator.Next(ctx, participant, prepare.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.ReportBlocked(ctx, participant, complete.Cursor, []uint64{101}); err != nil {
-		t.Fatal(err)
-	}
-	// A lost success response is retried with the same cursor and exact parent
-	// set. That duplicate is idempotent, not a second state transition.
-	if err := h.coordinator.ReportBlocked(ctx, participant, complete.Cursor, []uint64{101, 101}); err != nil {
-		t.Fatalf("duplicate exact report: %v", err)
-	}
-
-	var prepared, applied atomic.Bool
-	operation := make(chan error, 1)
-	go func() {
-		operation <- executeTestSourceGatedHeld(h.coordinator, ctx, participant, MutationID{Sequence: 2}, "blocked",
-			[][16]byte{testVisibilityParent()},
-			func() ([]VisibilityTarget, error) {
-				prepared.Store(true)
-				return testVisibilityTargets("local-change"), nil
-			},
-			func() ([]VisibilityTarget, bool) {
-				applied.Store(true)
-				return testVisibilityTargets("local-change"), true
-			})
-	}()
-	select {
-	case err := <-operation:
-		if !errors.Is(err, ErrVisibilityInterrupted) {
-			t.Fatalf("request arriving after report = %v, want ErrVisibilityInterrupted", err)
-		}
-	case <-ctx.Done():
-		t.Fatal("request arriving after blocked report was not interrupted")
-	}
-	if prepared.Load() || applied.Load() {
-		t.Fatalf("request arriving after report reached prepare=%v apply=%v", prepared.Load(), applied.Load())
-	}
-	if err := h.coordinator.Ack(participant, complete.Cursor); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-peer; err != nil {
-		t.Fatal(err)
-	}
-	// Advance the cursor through a later mutation, then deliver the old accepted
-	// report once more. A canceled/reconnected server worker can be this late;
-	// stale control replay is a no-op, never a reason to fence the mount.
-	later := make(chan error, 1)
-	go func() {
-		later <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 3},
-			testVisibilityPrepare("peer-change"),
-			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("peer-change"), true })
-	}()
-	laterPrepare, err := h.coordinator.Next(ctx, participant, complete.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runBarrierFrom(t, h.coordinator, participant, laterPrepare)
-	if err := <-later; err != nil {
-		t.Fatal(err)
-	}
-	if err := h.coordinator.ReportBlocked(ctx, participant, complete.Cursor, []uint64{101}); err != nil {
-		t.Fatalf("accepted blocked report replayed after a later phase: %v", err)
-	}
-	if h.fencer.wasFenced(participant) || !h.fencer.live(participant) {
-		t.Fatal("report-before-request ordering fenced the participant")
-	}
-}
-
 // Being parked in the affected directory is only half the cycle. The other half
 // is holding a cached binding the COMPLETE names, and this authority cannot see
 // it: the resolved-name index is a monotone filter with no false negatives, so
@@ -3424,8 +2880,7 @@ func TestVisibilityParkedMountThatCanRepairIsNeverFenced(t *testing.T) {
 	parkedDone := make(chan error, 1)
 	go func() {
 		<-release
-		parkedDone <- executeTestSourceGatedHeld(h.coordinator, context.Background(), parked, MutationID{Sequence: 1}, "shared",
-			[][16]byte{testVisibilityParent()},
+		parkedDone <- executeTestSourceGated(h.coordinator, context.Background(), parked, MutationID{Sequence: 1}, "shared",
 			testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("shared"), true
 			})
@@ -3468,10 +2923,8 @@ func TestVisibilityOneMountMutatingSequentiallyIsNeverFenced(t *testing.T) {
 	defer cancel()
 	go serviceVisibility(ctx, h.coordinator, only)
 
-	// Every submission declares the exact directory its kernel callback holds.
 	for sequence := uint64(1); sequence <= 64; sequence++ {
-		err := executeTestSourceGatedHeld(h.coordinator, context.Background(), only, MutationID{Sequence: sequence}, "shared",
-			[][16]byte{testVisibilityParent()},
+		err := executeTestSourceGated(h.coordinator, context.Background(), only, MutationID{Sequence: sequence}, "shared",
 			testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
 				return testVisibilityTargets("shared"), true
 			})
@@ -3506,8 +2959,7 @@ func TestVisibilityTwoMountsInDifferentDirectoriesAreNeverFenced(t *testing.T) {
 			source SessionID
 			parent [16]byte
 		}{{first, testVisibilityParent()}, {second, elsewhere}} {
-			if err := executeTestSourceGatedHeld(h.coordinator, context.Background(), submission.source, MutationID{Sequence: sequence}, "shared",
-				[][16]byte{submission.parent},
+			if err := executeTestSourceGated(h.coordinator, context.Background(), submission.source, MutationID{Sequence: sequence}, "shared",
 				testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
 					return testVisibilityTargets("shared"), true
 				}); err != nil {
@@ -3522,66 +2974,6 @@ func TestVisibilityTwoMountsInDifferentDirectoriesAreNeverFenced(t *testing.T) {
 	}
 }
 
-// A blocked report never acknowledges the phase, but it still may not install
-// an interruption for an unsupported phase or coordinate. The authority maps
-// reported coordination inodes only through the exact pending COMPLETE and
-// fences a client whose report cannot be reconciled with that cursor.
-func TestVisibilityUnsupportedBlockedReportIsACursorViolation(t *testing.T) {
-	for _, name := range []string{"prepare", "unknown complete parent"} {
-		t.Run(name, func(t *testing.T) {
-			h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-			claimant, mutator := SessionID{1}, SessionID{2}
-			h.register(t, claimant, 80*time.Millisecond)
-			h.register(t, mutator, testRepairBudget)
-			h.resolve(t, claimant, "shared")
-			h.resolve(t, mutator, "shared")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			go serviceVisibility(ctx, h.coordinator, mutator)
-			done := make(chan error, 1)
-			go func() {
-				done <- executeTestSourceGated(h.coordinator, context.Background(), mutator, MutationID{Sequence: 1}, "shared",
-					testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
-						return testVisibilityTargets("shared"), true
-					})
-			}()
-			prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, claimant)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cursor := prepare.Cursor
-			parents := []uint64(nil)
-			if name == "unknown complete parent" {
-				if err := h.coordinator.Ack(claimant, prepare.Cursor); err != nil {
-					t.Fatal(err)
-				}
-				complete, err := h.coordinator.Next(ctx, claimant, prepare.Cursor)
-				if err != nil {
-					t.Fatal(err)
-				}
-				cursor = complete.Cursor
-				parents = []uint64{999}
-			}
-			if err := h.coordinator.ReportBlocked(context.Background(), claimant, cursor, parents); !errors.Is(err, ErrVisibilitySequence) {
-				t.Fatalf("unsupported blocked report = %v, want ErrVisibilitySequence", err)
-			}
-			if reason := h.fenceReasonFor(claimant); !errors.Is(reason, ErrVisibilitySequence) {
-				t.Fatalf("fenced for %v, want ErrVisibilitySequence", reason)
-			}
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatalf("the mutation failed after refusing a false claim: %v", err)
-				}
-			case <-time.After(3 * time.Second):
-				t.Fatal("refusing a false blocked report stalled the mutation")
-			}
-		})
-	}
-}
-
-// serviceVisibility is a healthy mount: it acknowledges every phase it is
-// handed, for as long as its session lives.
 func serviceVisibility(ctx context.Context, coordinator *VisibilityCoordinator, id SessionID) {
 	after, err := coordinator.InitialCursor(id)
 	if err != nil {
@@ -3614,7 +3006,7 @@ func TestVisibilityRefusedCommitmentNamesBothValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitment := VisibilityCommitment{CachedNameCapacity: 4096, RepairBudget: 15 * time.Second, NamespaceRepair: NamespaceRepairParentExclusive}
+	commitment := VisibilityCommitment{CachedNameCapacity: 4096, RepairBudget: 15 * time.Second, NamespaceRepair: NamespaceRepairIndependent}
 	if err := coordinator.ValidateCommitment(commitment); !errors.Is(err, ErrVisibilityProfile) {
 		t.Fatalf("ValidateCommitment = %v, want ErrVisibilityProfile", err)
 	}
@@ -3633,7 +3025,7 @@ func TestVisibilityRefusedCommitmentNamesBothValues(t *testing.T) {
 			t.Fatalf("refusal %q does not name %q", message, want)
 		}
 	}
-	over := VisibilityCommitment{CachedNameCapacity: 1 << 20, RepairBudget: time.Second, NamespaceRepair: NamespaceRepairParentExclusive}
+	over := VisibilityCommitment{CachedNameCapacity: 1 << 20, RepairBudget: time.Second, NamespaceRepair: NamespaceRepairIndependent}
 	if err := coordinator.Register(SessionID{2}, CoherenceStrict, make(chan struct{}), over); !errors.Is(err, ErrVisibilityProfile) {
 		t.Fatalf("Register = %v, want ErrVisibilityProfile", err)
 	}
@@ -3701,6 +3093,7 @@ func TestVisibilityRacingReadIsReleasedByApplyNotByRepair(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			testMutationDependencies("shared"),
 			testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
 				close(applied)
 				return testVisibilityTargets("shared"), true
@@ -3807,8 +3200,9 @@ func TestVisibilityPeerCompleteAckActivatesInterruptedGhostDebt(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), peer, MutationID{Sequence: 1, FrontendOperationID: 91},
+			testMutationDependencies("ghost-debt"),
 			testVisibilityPrepare("ghost-debt"),
 			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("ghost-debt"), true },
 		)
@@ -3819,9 +3213,9 @@ func TestVisibilityPeerCompleteAckActivatesInterruptedGhostDebt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = h.coordinator.acquireMutationOrder(ctx, participant, MutationID{
+	_, err = h.coordinator.acquireMutationDependencies(ctx, participant, MutationID{
 		Sequence: 2, FrontendOperationID: 101,
-	}, nil, nil)
+	}, nil, testMutationDependencies("ghost-debt"), nil)
 	if !errors.Is(err, ErrVisibilityInterrupted) {
 		t.Fatalf("peer-PREPARE mutation = %v, want ErrVisibilityInterrupted", err)
 	}
@@ -3852,9 +3246,9 @@ func TestVisibilityPeerCompleteAckActivatesInterruptedGhostDebt(t *testing.T) {
 		t.Fatalf("active debt = %+v, present=%v; dormant was %+v", active, ok, dormant)
 	}
 
-	turn, err := h.coordinator.acquireMutationOrder(ctx, participant, MutationID{
+	turn, err := h.coordinator.acquireMutationDependencies(ctx, participant, MutationID{
 		Sequence: 3, FrontendOperationID: 102,
-	}, nil, nil)
+	}, nil, testMutationDependencies("ghost-debt"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3883,6 +3277,7 @@ func TestVisibilityInterruptedQueuedWaiterPreservesExactOrdinal(t *testing.T) {
 	go func() {
 		peerResult <- h.coordinator.Execute(
 			context.Background(), peer, MutationID{Sequence: 1, FrontendOperationID: 91},
+			testMutationDependencies("queued-debt"),
 			func() ([]VisibilityTarget, error) {
 				close(prepareEntered)
 				<-releasePrepare
@@ -3897,15 +3292,15 @@ func TestVisibilityInterruptedQueuedWaiterPreservesExactOrdinal(t *testing.T) {
 	defer cancel()
 	interrupted := make(chan error, 1)
 	go func() {
-		_, err := h.coordinator.acquireMutationOrder(ctx, participant, MutationID{
+		_, err := h.coordinator.acquireMutationDependencies(ctx, participant, MutationID{
 			Sequence: 2, FrontendOperationID: 101,
-		}, nil, nil)
+		}, nil, testMutationDependencies("queued-debt"), nil)
 		interrupted <- err
 	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
-	h.coordinator.order.mu.Lock()
-	lostOrdinal := h.coordinator.order.waiters.Front().Value.(*mutationOrderWaiter).ordinal
-	h.coordinator.order.mu.Unlock()
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
+	h.coordinator.sequencer.mu.Lock()
+	lostOrdinal := h.coordinator.sequencer.waiters.Front().Value.(*mutationSequencerWaiter).ordinal
+	h.coordinator.sequencer.mu.Unlock()
 	close(releasePrepare)
 
 	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, participant)
@@ -3935,9 +3330,9 @@ func TestVisibilityInterruptedQueuedWaiterPreservesExactOrdinal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	turn, err := h.coordinator.acquireMutationOrder(ctx, participant, MutationID{
+	turn, err := h.coordinator.acquireMutationDependencies(ctx, participant, MutationID{
 		Sequence: 3, FrontendOperationID: 102,
-	}, nil, nil)
+	}, nil, testMutationDependencies("queued-debt"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3958,6 +3353,7 @@ func TestVisibilityCompleteContentionFeedbackActivatesOnePrepareCut(t *testing.T
 	go func() {
 		result <- h.coordinator.Execute(
 			context.Background(), peer, MutationID{Sequence: 1, FrontendOperationID: 91},
+			testMutationDependencies("feedback-debt"),
 			testVisibilityPrepare("feedback-debt"),
 			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("feedback-debt"), true },
 		)
@@ -3998,9 +3394,9 @@ func TestVisibilityCompleteContentionFeedbackActivatesOnePrepareCut(t *testing.T
 	}
 	// Expiry removes the off-list credit; it never becomes a blocking owner.
 	h.coordinator.cfg.Now = func() time.Time { return first.deadline.Add(time.Nanosecond) }
-	turn, err := h.coordinator.acquireMutationOrder(ctx, participant, MutationID{
+	turn, err := h.coordinator.acquireMutationDependencies(ctx, participant, MutationID{
 		Sequence: 2, FrontendOperationID: 101,
-	}, nil, nil)
+	}, nil, testMutationDependencies("feedback-debt"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4026,6 +3422,7 @@ func TestVisibilityFalseContentionFeedbackDiscardsUnusedPrepareCut(t *testing.T)
 	go func() {
 		result <- h.coordinator.Execute(
 			context.Background(), peer, MutationID{Sequence: 1},
+			testMutationDependencies("false-feedback"),
 			testVisibilityPrepare("false-feedback"),
 			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("false-feedback"), true },
 		)
@@ -4072,6 +3469,7 @@ func TestVisibilityUnclaimedDebtRollsAcrossConsecutivePeerPhases(t *testing.T) {
 		go func() {
 			result <- h.coordinator.Execute(
 				context.Background(), peer, MutationID{Sequence: sequence},
+				testMutationDependencies("rolling-debt"),
 				testVisibilityPrepare("rolling-debt"),
 				func() ([]VisibilityTarget, bool) { return testVisibilityTargets("rolling-debt"), true },
 			)
@@ -4108,6 +3506,7 @@ func TestVisibilityUnclaimedDebtRollsAcrossConsecutivePeerPhases(t *testing.T) {
 	go func() {
 		result <- h.coordinator.Execute(
 			context.Background(), peer, MutationID{Sequence: 2},
+			testMutationDependencies("rolling-debt"),
 			testVisibilityPrepare("rolling-debt"),
 			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("rolling-debt"), true },
 		)
@@ -4151,11 +3550,12 @@ func TestVisibilityCancellationConsumesAClaimedSchedulingCredit(t *testing.T) {
 	h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
 	participant := SessionID{1}
 	h.registerRepair(t, participant, testRepairBudget, NamespaceRepairCallbackSerializedPipelined)
-	owner, err := h.coordinator.order.acquire(context.Background())
+	dependencies := testInodeDependencies(0xFA)
+	owner, err := h.coordinator.sequencer.acquire(context.Background(), dependencies)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reserved := h.coordinator.order.reserveOrdinal()
+	reserved := h.coordinator.sequencer.reserveOrdinal()
 	h.coordinator.mu.Lock()
 	h.coordinator.fairness[participant] = mutationFairnessDebt{
 		sequence: 1, ordinal: reserved, active: true, deadline: time.Now().Add(time.Second),
@@ -4165,12 +3565,12 @@ func TestVisibilityCancellationConsumesAClaimedSchedulingCredit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := h.coordinator.acquireMutationOrder(ctx, participant, MutationID{
+		_, err := h.coordinator.acquireMutationDependencies(ctx, participant, MutationID{
 			Sequence: 1, FrontendOperationID: 101,
-		}, nil, nil)
+		}, nil, dependencies, nil)
 		result <- err
 	}()
-	waitForMutationOrderQueue(t, h.coordinator.order, 1)
+	waitForMutationSequencerQueue(t, h.coordinator.sequencer, 1)
 	cancel()
 	if err := <-result; !errors.Is(err, context.Canceled) {
 		t.Fatalf("claimed waiter cancellation = %v", err)
@@ -4183,9 +3583,9 @@ func TestVisibilityCancellationConsumesAClaimedSchedulingCredit(t *testing.T) {
 	}
 	owner.release()
 
-	turn, err := h.coordinator.acquireMutationOrder(context.Background(), participant, MutationID{
+	turn, err := h.coordinator.acquireMutationDependencies(context.Background(), participant, MutationID{
 		Sequence: 2, FrontendOperationID: 102,
-	}, nil, nil)
+	}, nil, dependencies, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4205,6 +3605,7 @@ func TestVisibilityContentionFeedbackExcludesFrozenProfile(t *testing.T) {
 	go func() {
 		result <- h.coordinator.Execute(
 			context.Background(), peer, MutationID{Sequence: 1},
+			testMutationDependencies("v1-no-debt"),
 			testVisibilityPrepare("v1-no-debt"),
 			func() ([]VisibilityTarget, bool) { return testVisibilityTargets("v1-no-debt"), true },
 		)
@@ -4254,8 +3655,9 @@ func TestVisibilityImportedAnchorCarriesItsRacedInodeDependency(t *testing.T) {
 	}
 	result := make(chan error, 1)
 	go func() {
-		result <- h.coordinator.Execute(
+		result <- executeTestExact(h.coordinator,
 			context.Background(), SessionID{9}, MutationID{Sequence: 1},
+			mutationDependenciesForTargets(targets),
 			func() ([]VisibilityTarget, error) { return targets, nil },
 			func() ([]VisibilityTarget, bool) { return targets, true },
 		)
@@ -4303,7 +3705,7 @@ func TestVisibilityCompletionCannotDropPreparedParentNamespaceDependency(t *test
 		{Scope: VisibilityNamespace, ParentIdentity: parent, Name: []byte("b")},
 		{Scope: VisibilityAttributes, Identity: parent},
 	}
-	if err := h.coordinator.validateCompletion(complete, prepared); err == nil {
+	if err := h.coordinator.validateCompletion(1, complete, prepared); err == nil {
 		t.Fatal("completion dropped a prepared parent namespace dependency")
 	}
 }

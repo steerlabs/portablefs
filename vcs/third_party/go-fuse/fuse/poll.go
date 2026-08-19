@@ -8,12 +8,8 @@ package fuse
 const pollHackName = ".go-fuse-epoll-hack"
 const pollHackInode = ^uint64(0)
 
-// pollHackEnabled reports whether this server uses go-fuse's synthetic poll
-// inode. The strict PortableFS profile classifies every inode and publishes
-// every state-bearing reply, so an unclassified inode manufactured below the
-// RawFileSystem boundary cannot exist in that profile.
 func (ms *protocolServer) pollHackEnabled() bool {
-	return ms.opts == nil || ms.opts.ExtraCapabilities&CAP_PFS_STRICT_COHERENCE == 0
+	return true
 }
 
 func doPollHackLookup(ms *protocolServer, req *request) {

@@ -1,7 +1,12 @@
 # Performance
 
-Status: **protocol-5 Linux exact and macOS 26 best-effort paths measured; no
-release SLO yet**
+Status: **historical protocol-4/5 measurements only; the protocol-6 stock-FUSE
+profile has not been measured and has no release SLO**
+
+The measurements below are retained unchanged as evidence for retired
+configurations. They must not be quoted as protocol-6 performance. PortableFS
+will add a separate stock-kernel section only after the new profile is measured
+end to end with the same byte-verification discipline.
 
 ## August 15, 2026 protocol-5 Linux measurement
 
@@ -288,9 +293,11 @@ completion boundary. Benchmarks must identify which syscall boundary they time.
 **Names and attributes are coherently cached, and mutation pays for it.** The
 single protocol lets repeated path walks be served from the kernel without an
 authority lookup. The bill arrives on the other side: a cache-affecting mutation
-takes a volume-wide visibility ticket, holds the source's exact local
+holds its stable-identity dependency set and the source's exact local
 publication footprint, quiesces affected non-source cache holders, applies to
 XFS, drives each peer's repair, and collects acknowledgements before it returns.
+Mutations that share an inode, directory, or binding remain ordered; disjoint
+sets can execute concurrently and do not inherit one another's repair latency.
 With one mount attached there is no network visibility phase. With several, a
 mutation that overlaps an actively caching peer costs a PREPARE and COMPLETE
 round trip to the slowest such participant; exact semantics cannot remove those
@@ -343,15 +350,21 @@ starting point. The provisional run above used `fsops`, fio, Linux `perf`, and
 the coherence matrix together.
 
 Outside `vcs/bench`, `scripts/package-manager-matrix.sh` is the closest thing to a
-realistic workload in the gates. It runs `npm`, `pnpm`, `yarn`, and `bun` installs
-on a shared volume path with no machine-local route, while a second mount
-enumerates and reads the same tree. It asserts exactly three things — the
-installer exited zero, the other mount sees the same entry count and the same
-bytes, and both mounts still serve — and it thresholds nothing. Wall time and
-authority work counters are recorded into a table for a human to read. That is
-deliberate: it is a correctness gate that happens to produce timings, and treating
-its timings as a performance gate would make an unrelated CI slowdown look like a
-regression.
+realistic workload the repository can run on demand. It runs `npm`, `pnpm`,
+`yarn`, and `bun` installs on a shared volume path with no machine-local route,
+while a second mount enumerates and reads the same tree. It asserts exactly three
+things — the installer exited zero, the other mount sees the same entry count and
+the same bytes, and both mounts still serve — and it thresholds nothing. Wall time
+and authority work counters are recorded into a table for a human to read. That is
+deliberate: it is a correctness instrument that happens to produce timings, and
+treating its timings as a performance gate would make an unrelated slowdown look
+like a regression.
+
+It is not a merge gate and CI does not run it: a soak that takes an order of
+magnitude longer than every other lane belongs after the deploy, not in front of
+a merge. Run it by hand when the workload shape matters; phase 8 of
+`deploy/opensteer/staging-qualification.sh` drives the same concurrent-reader
+shape against a live staging cell.
 
 ## What is missing before a number belongs here
 

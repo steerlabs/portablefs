@@ -25,13 +25,20 @@ Testing suite; pure tests remain parallel.
 
 ## Before You Finish
 
-Run `bash scripts/verify-local.sh` and make it pass. It is the local merge gate:
-on macOS it builds and vets the real Foundation/cgo Darwin boundary plus static
-Linux, while Linux compiles its native product plus Darwin's deliberate !cgo
-refusal stub. CI always supplies the required native macOS Foundation lane. The
-gate also runs the native Go and race suites, the Swift suite, the release-trust
-policy checks, and a stale-architecture scan. Do not report a change as complete
-with a failing `verify-local.sh`.
+Run `bash scripts/verify-local.sh` and make it pass. On macOS it builds and vets
+the real Foundation/cgo Darwin boundary plus static Linux, while Linux compiles
+its native product plus Darwin's deliberate !cgo refusal stub. CI always
+supplies the required native macOS Foundation lane. The gate also runs the
+native Go and race suites, the Swift suite, the release-trust policy checks, and
+a stale-architecture scan. Do not report a change as complete with a failing
+`verify-local.sh`.
+
+That default mode runs no real mount. It closes by naming every gate it did not
+run, and it is not merge evidence for a change to the authority, a frontend, or
+the coherence protocol. For those, run `bash scripts/verify-local.sh --full`,
+which adds the two privileged Docker suites CI runs on its ubuntu-24.04 lanes
+(`scripts/xfs-fuse-integration.sh` and `scripts/coherence-matrix-linux.sh`), and
+say in the PR which mode you ran.
 
 ## Frozen Surfaces
 

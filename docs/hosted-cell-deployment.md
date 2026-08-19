@@ -25,7 +25,7 @@ The reference paths are:
 | Path | Owner/mode | Purpose |
 | --- | --- | --- |
 | `/srv/portablefs` | root, not tenant-writable | XFS cell root |
-| `/srv/portablefs/.portablefs-control/<volume>/write-staging` | volume UID `0700`, root-pinned parent | unnamed protocol-5 write transactions, charged to the volume's exact XFS project quota |
+| `/srv/portablefs/.portablefs-control/<volume>/write-staging` | volume UID `0700`, root-pinned parent | unnamed transactional-write staging, charged to the volume's exact XFS project quota |
 | `/etc/portablefs/trust` | root | manager CA and plan public key |
 | `/etc/portablefs/cells` | root | cell mTLS identity and root-owned environment |
 | `/etc/portablefs/volumes` | root | generated per-volume authority config/keys/certs |

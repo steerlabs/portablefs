@@ -55,7 +55,7 @@ func authorityTestItem(inode uint64, kind authoritypb.Attr_Kind, tokenByte, iden
 func (f *fakeV3DataClient) Root() *authoritypb.Item    { return f.root }
 func (f *fakeV3DataClient) IOLimits() (uint32, uint32) { return 4096, 4096 }
 func (f *fakeV3DataClient) MaxWriteTransactionBytes() uint64 {
-	return authorityrpc.RequiredWriteTransactionBytes
+	return authorityrpc.RequiredFskitWriteBytes
 }
 func (f *fakeV3DataClient) SessionLease() time.Duration  { return f.lease }
 func (f *fakeV3DataClient) DataPlaneOperationLimit() int { return f.limit }
@@ -112,20 +112,20 @@ func (f *fakeV3DataClient) CallIdempotent(ctx context.Context, request *authorit
 	if hook != nil {
 		return hook(ctx, request)
 	}
-	write := request.GetWriteTransaction()
+	write := request.GetFskitWrite()
 	if write == nil {
 		return f.CallRead(ctx, request)
 	}
 	flags := uint32(0)
 	switch write.GetPhase() {
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
 		flags = v3WriteReplyBegun
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
 		flags = v3WriteReplyStaged
-	case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
+	case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
 		flags = v3WriteReplyAborted
 	}
-	return &authoritypb.Response{Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+	return &authoritypb.Response{Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 		TransactionId: write.GetTransactionId(), Flags: flags,
 	}}}, nil
 }
@@ -172,15 +172,15 @@ func (f *fakeV3DataClient) callMutationWithIdentity(ctx context.Context, request
 		response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: authorityTestItem(2, authoritypb.Attr_REGULAR, 0x30, 0x40)}}
 	case *authoritypb.Request_Open:
 		response.Body = &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: bytes.Repeat([]byte{0x51}, 16)}}
-	case *authoritypb.Request_WriteTransaction:
-		write := request.GetWriteTransaction()
+	case *authoritypb.Request_FskitWrite:
+		write := request.GetFskitWrite()
 		postSize := write.GetPosition() + write.GetFragmentOffset()
-		response.Body = &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+		response.Body = &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 			TransactionId: write.GetTransactionId(), CommittedSize: write.GetFragmentOffset(),
 			AssignedOffset: write.GetPosition(), PostSize: postSize, VisibilitySequence: identity.Sequence,
 			Flags: v3WriteReplyCommitted,
 		}}
-		response.PostAttr = &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1}
+		response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1})
 	case *authoritypb.Request_SyncFs:
 		response.Body = &authoritypb.Response_SyncFs{SyncFs: &authoritypb.SyncFSReply{}}
 	}
@@ -371,22 +371,22 @@ func exactTestMutationReply(identity authorityrpc.MutationIdentity) *authoritypb
 }
 
 func exactTestWritePhaseReply(request *authoritypb.Request, flags uint32) *authoritypb.Response {
-	write := request.GetWriteTransaction()
-	return &authoritypb.Response{Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+	write := request.GetFskitWrite()
+	return &authoritypb.Response{Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 		TransactionId: write.GetTransactionId(), Flags: flags,
 	}}}
 }
 
 func exactTestWriteCommit(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
-	write := request.GetWriteTransaction()
+	write := request.GetFskitWrite()
 	postSize := write.GetPosition() + write.GetFragmentOffset()
 	response := exactTestMutationReply(identity)
-	response.Body = &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+	response.Body = &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 		TransactionId: write.GetTransactionId(), CommittedSize: write.GetFragmentOffset(),
 		AssignedOffset: write.GetPosition(), PostSize: postSize, VisibilitySequence: identity.Sequence,
 		Flags: v3WriteReplyCommitted,
 	}}
-	response.PostAttr = &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1}
+	response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Size: int64(postSize), Nlink: 1})
 	return response
 }
 
@@ -785,7 +785,7 @@ func TestV3DataPlaneWriteInstallsExactSourceGateBeforeAssignment(t *testing.T) {
 	handle := openedAny.(*pfslocal.OpenReply).Handle
 	d.bridge.reserveFrontendPublication(77)
 	client.beforeAssigned = func(request *authoritypb.Request) error {
-		if request.GetSourcePublicationGate() == nil {
+		if request.GetFskitSourcePublication() == nil {
 			return errors.New("source gate was not carried into replay assignment")
 		}
 		d.bridge.sourcePublication.mu.Lock()
@@ -798,16 +798,16 @@ func TestV3DataPlaneWriteInstallsExactSourceGateBeforeAssignment(t *testing.T) {
 		return nil
 	}
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetWriteTransaction()
-		if write == nil || write.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT ||
+		write := request.GetFskitWrite()
+		if write == nil || write.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT ||
 			write.GetTransactionId() != 1 || write.GetRequestedSize() != 3 || write.GetFragmentOffset() != 3 ||
 			write.GetPosition() != 0 || write.GetRlimitFsize() != math.MaxUint64 || write.GetFileMaxSize() != math.MaxInt64 {
 			return nil, errors.New("expected exact write transaction COMMIT")
 		}
-		if request.GetFrontendOperationId() != 77 {
+		if request.GetFskitFrontendOperationId() != 77 {
 			return nil, errors.New("write lost its pfslocal frontend operation identity")
 		}
-		gate := request.GetSourcePublicationGate()
+		gate := request.GetFskitSourcePublication()
 		if gate == nil || len(gate.GetTargets()) != 1 || gate.GetTargets()[0].GetItem() == nil ||
 			!bytes.Equal(gate.GetTargets()[0].GetItem().GetIdentity(), bytes.Repeat([]byte{0x40}, 16)) ||
 			!gate.GetTargets()[0].GetItem().GetAttributes() || !gate.GetTargets()[0].GetItem().GetData() {
@@ -834,17 +834,17 @@ func TestV3DataPlaneWriteInstallsExactSourceGateBeforeAssignment(t *testing.T) {
 		t.Fatalf("write inert phase count=%d, want BEGIN+DATA", len(inert))
 	}
 	for index, exact := range []struct {
-		phase          authoritypb.WriteTransactionPhase
+		phase          authoritypb.FskitWritePhase
 		fragmentOffset uint64
 		size           uint32
 		data           []byte
 	}{
-		{phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN},
-		{phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, size: 3, data: []byte("abc")},
+		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN},
+		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, size: 3, data: []byte("abc")},
 	} {
 		request := inert[index]
-		write := request.GetWriteTransaction()
-		if request.GetMutation() != nil || request.GetSourcePublicationGate() != nil || request.GetFrontendOperationId() != 0 ||
+		write := request.GetFskitWrite()
+		if request.GetMutation() != nil || request.GetFskitSourcePublication() != nil || request.GetFskitFrontendOperationId() != 0 ||
 			write == nil || write.GetPhase() != exact.phase || write.GetTransactionId() != 1 ||
 			!bytes.Equal(write.GetHandle(), bytes.Repeat([]byte{0x51}, 16)) || write.GetRequestedSize() != 3 ||
 			write.GetFragmentOffset() != exact.fragmentOffset || write.GetPosition() != 0 ||
@@ -869,8 +869,8 @@ func TestV3DataPlaneWriteFragmentsOneTransactionAndCommitsOnce(t *testing.T) {
 	commits := 0
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
 		commits++
-		write := request.GetWriteTransaction()
-		if write == nil || write.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT ||
+		write := request.GetFskitWrite()
+		if write == nil || write.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT ||
 			write.GetTransactionId() != 1 || write.GetFragmentOffset() != 5 {
 			return nil, errors.New("expected one exact five-byte COMMIT")
 		}
@@ -893,16 +893,16 @@ func TestV3DataPlaneWriteFragmentsOneTransactionAndCommitsOnce(t *testing.T) {
 		t.Fatalf("fragmented phases: inert=%d commits=%d, want BEGIN+3 DATA+COMMIT", len(inert), commits)
 	}
 	for index, exact := range []struct {
-		phase  authoritypb.WriteTransactionPhase
+		phase  authoritypb.FskitWritePhase
 		offset uint64
 		data   string
 	}{
-		{phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN},
-		{phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, data: "ab"},
-		{phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, offset: 2, data: "cd"},
-		{phase: authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, offset: 4, data: "e"},
+		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN},
+		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, data: "ab"},
+		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, offset: 2, data: "cd"},
+		{phase: authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, offset: 4, data: "e"},
 	} {
-		write := inert[index].GetWriteTransaction()
+		write := inert[index].GetFskitWrite()
 		if write == nil || write.GetPhase() != exact.phase || write.GetTransactionId() != 1 ||
 			write.GetFragmentOffset() != exact.offset || string(write.GetData()) != exact.data ||
 			write.GetSize() != uint32(len(exact.data)) {
@@ -930,14 +930,14 @@ func TestV3DataPlaneWriteDATAFailureUsesExactAbortAndNoCommit(t *testing.T) {
 	_, handle := openTestV3File(t, d, false)
 	dataCalls := 0
 	client.idempotent = func(_ context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetWriteTransaction()
+		write := request.GetFskitWrite()
 		switch write.GetPhase() {
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
 			return exactTestWritePhaseReply(request, v3WriteReplyBegun), nil
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
 			dataCalls++
 			return &authoritypb.Response{Errno: errnos.ENOSPC}, nil
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
 			return exactTestWritePhaseReply(request, v3WriteReplyAborted), nil
 		default:
 			return nil, errors.New("unexpected idempotent phase")
@@ -959,8 +959,8 @@ func TestV3DataPlaneWriteDATAFailureUsesExactAbortAndNoCommit(t *testing.T) {
 	if dataCalls != 1 || commits != 0 || len(inert) != 3 {
 		t.Fatalf("DATA failure phases: data=%d commits=%d inert=%d", dataCalls, commits, len(inert))
 	}
-	abort := inert[2].GetWriteTransaction()
-	if abort == nil || abort.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT ||
+	abort := inert[2].GetFskitWrite()
+	if abort == nil || abort.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT ||
 		abort.GetTransactionId() != 1 || abort.GetFragmentOffset() != 0 || abort.GetSize() != 0 || len(abort.GetData()) != 0 {
 		t.Fatalf("ABORT=%#v, want exact metadata with zero offset/payload", inert[2])
 	}
@@ -975,10 +975,10 @@ func TestV3DataPlaneWriteStructuredRejectionAbortsWithoutPublicationCommit(t *te
 		return &countingV3ResponseConsumption{count: &consumed}
 	}
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetWriteTransaction()
+		write := request.GetFskitWrite()
 		return &authoritypb.Response{
 			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
-			Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+			Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 				TransactionId: write.GetTransactionId(), Flags: v3WriteReplyRejected, Error: -int32(errnos.ENOSPC),
 			}},
 		}, nil
@@ -996,7 +996,7 @@ func TestV3DataPlaneWriteStructuredRejectionAbortsWithoutPublicationCommit(t *te
 	client.mu.Lock()
 	inert := append([]*authoritypb.Request(nil), client.idempotentCalls...)
 	client.mu.Unlock()
-	if len(inert) != 3 || inert[2].GetWriteTransaction().GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT {
+	if len(inert) != 3 || inert[2].GetFskitWrite().GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT {
 		t.Fatalf("structured rejection phases=%#v, want BEGIN+DATA+ABORT", inert)
 	}
 	lease := d.bridge.sourcePublication.operationLease(operationID)
@@ -1033,8 +1033,8 @@ func TestV3DataPlaneWriteBeginDispatchOrderIsMonotonic(t *testing.T) {
 	releaseFirst := make(chan struct{})
 	var once sync.Once
 	client.idempotent = func(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
-		write := request.GetWriteTransaction()
-		if write.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN && write.GetTransactionId() == 1 {
+		write := request.GetFskitWrite()
+		if write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN && write.GetTransactionId() == 1 {
 			once.Do(func() { close(firstEntered) })
 			select {
 			case <-releaseFirst:
@@ -1044,11 +1044,11 @@ func TestV3DataPlaneWriteBeginDispatchOrderIsMonotonic(t *testing.T) {
 		}
 		var flags uint32
 		switch write.GetPhase() {
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN:
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN:
 			flags = v3WriteReplyBegun
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA:
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA:
 			flags = v3WriteReplyStaged
-		case authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT:
+		case authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT:
 			flags = v3WriteReplyAborted
 		}
 		return exactTestWritePhaseReply(request, flags), nil
@@ -1069,7 +1069,7 @@ func TestV3DataPlaneWriteBeginDispatchOrderIsMonotonic(t *testing.T) {
 	client.mu.Lock()
 	beforeRelease := append([]*authoritypb.Request(nil), client.idempotentCalls...)
 	client.mu.Unlock()
-	if len(beforeRelease) != 1 || beforeRelease[0].GetWriteTransaction().GetTransactionId() != 1 {
+	if len(beforeRelease) != 1 || beforeRelease[0].GetFskitWrite().GetTransactionId() != 1 {
 		t.Fatalf("BEGIN mutex allowed later dispatch before transaction 1 reply: %#v", beforeRelease)
 	}
 	close(releaseFirst)
@@ -1083,7 +1083,7 @@ func TestV3DataPlaneWriteBeginDispatchOrderIsMonotonic(t *testing.T) {
 	client.mu.Unlock()
 	beginIDs := make([]uint64, 0, 2)
 	for _, request := range all {
-		if write := request.GetWriteTransaction(); write.GetPhase() == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN {
+		if write := request.GetFskitWrite(); write.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN {
 			beginIDs = append(beginIDs, write.GetTransactionId())
 		}
 	}
@@ -1175,7 +1175,7 @@ func TestV3DataPlaneMixedOperationLocalFailureAfterCommittedWriteFailsClosed(t *
 
 	calls := 0
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetWriteTransaction() == nil {
+		if request.GetFskitWrite() == nil {
 			return nil, errors.New("expected write transaction")
 		}
 		calls++
@@ -1270,14 +1270,14 @@ func TestV3DataPlanePeerFirstRefusalAbortsStagingBeforeReplayAssignment(t *testi
 	if len(inert) != 3 {
 		t.Fatalf("peer-first inert phase count=%d, want BEGIN+DATA+ABORT", len(inert))
 	}
-	for index, phase := range []authoritypb.WriteTransactionPhase{
-		authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN,
-		authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA,
-		authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT,
+	for index, phase := range []authoritypb.FskitWritePhase{
+		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN,
+		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA,
+		authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT,
 	} {
-		write := inert[index].GetWriteTransaction()
+		write := inert[index].GetFskitWrite()
 		if write == nil || write.GetTransactionId() != 1 || write.GetPhase() != phase ||
-			phase == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT &&
+			phase == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT &&
 				(write.GetFragmentOffset() != 0 || write.GetSize() != 0 || len(write.GetData()) != 0) {
 			t.Fatalf("peer-first inert phase[%d] = %#v", index, inert[index])
 		}
@@ -1302,7 +1302,7 @@ func TestV3DataPlaneCreateDeclaresAndResolvesItsExactSourceGate(t *testing.T) {
 		if create == nil || !bytes.Equal(create.GetName(), []byte("new")) {
 			return nil, errors.New("expected create")
 		}
-		gate := request.GetSourcePublicationGate()
+		gate := request.GetFskitSourcePublication()
 		if gate == nil || len(gate.GetTargets()) != 2 || gate.GetTargets()[0].GetItem() == nil ||
 			!bytes.Equal(gate.GetTargets()[0].GetItem().GetIdentity(), bytes.Repeat([]byte{0x20}, 16)) ||
 			gate.GetTargets()[1].GetNamespace() == nil ||
@@ -1418,7 +1418,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 	type mutationCase struct {
 		name     string
 		request  func(root, file pfslocal.Item, handle uint64) any
-		expected func(root, file pfslocal.Item) (*authoritypb.SourcePublicationGate, error)
+		expected func(root, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error)
 	}
 	mode := uint32(0o600)
 	size := uint64(7)
@@ -1428,7 +1428,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
 				return &pfslocal.SetAttrRequest{Item: file, Handle: handle, Mode: &mode}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3ItemSourceGate(file, false)
 			},
 		},
@@ -1437,7 +1437,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
 				return &pfslocal.SetAttrRequest{Item: file, Handle: handle, Size: &size}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3ItemSourceGate(file, true)
 			},
 		},
@@ -1446,7 +1446,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, _ pfslocal.Item, handle uint64) any {
 				return &pfslocal.WriteRequest{Handle: handle, Data: []byte("payload")}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3ItemSourceGate(file, true)
 			},
 		},
@@ -1455,7 +1455,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.CreateRequest{Dir: root, Name: []byte("created"), Mode: 0o644, Exclusive: true}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3NamespaceSourceGate(root, []byte("created"), false)
 			},
 		},
@@ -1464,7 +1464,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.MkdirRequest{Dir: root, Name: []byte("directory"), Mode: 0o755}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3NamespaceSourceGate(root, []byte("directory"), false)
 			},
 		},
@@ -1473,7 +1473,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.RemoveRequest{Dir: root, Name: []byte("gone")}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3NamespaceSourceGate(root, []byte("gone"), false)
 			},
 		},
@@ -1482,7 +1482,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.RenameRequest{FromDir: root, FromName: []byte("old"), ToDir: root, ToName: []byte("new")}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3RenameSourceGate(root, []byte("old"), root, []byte("new"))
 			},
 		},
@@ -1491,7 +1491,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, _ pfslocal.Item, _ uint64) any {
 				return &pfslocal.SymlinkRequest{Dir: root, Name: []byte("symbol"), Target: []byte("target")}
 			},
-			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(root pfslocal.Item, _ pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3NamespaceSourceGate(root, []byte("symbol"), false)
 			},
 		},
@@ -1500,7 +1500,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(root pfslocal.Item, file pfslocal.Item, _ uint64) any {
 				return &pfslocal.HardLinkRequest{Item: file, Dir: root, Name: []byte("alias")}
 			},
-			expected: func(root pfslocal.Item, file pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(root pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3NamespaceSourceGate(root, []byte("alias"), false, file)
 			},
 		},
@@ -1509,7 +1509,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
 				return &pfslocal.XattrSetRequest{Item: file, Handle: handle, Name: "user.key", Value: []byte("value")}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3ItemSourceGate(file, false)
 			},
 		},
@@ -1518,7 +1518,7 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			request: func(_ pfslocal.Item, file pfslocal.Item, handle uint64) any {
 				return &pfslocal.XattrRemoveRequest{Item: file, Handle: handle, Name: "user.key"}
 			},
-			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.SourcePublicationGate, error) {
+			expected: func(_ pfslocal.Item, file pfslocal.Item) (*authoritypb.FskitSourcePublication, error) {
 				return v3ItemSourceGate(file, false)
 			},
 		},
@@ -1544,10 +1544,10 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 			}
 			operationID := uint64(500 + index)
 			client.beforeAssigned = func(request *authoritypb.Request) error {
-				if request.GetFrontendOperationId() != operationID {
+				if request.GetFskitFrontendOperationId() != operationID {
 					return errors.New("visible mutation lost its exact callback identity")
 				}
-				if !proto.Equal(request.GetSourcePublicationGate(), expected) {
+				if !proto.Equal(request.GetFskitSourcePublication(), expected) {
 					return errors.New("visible mutation carried a different source publication footprint")
 				}
 				return nil
@@ -1556,10 +1556,10 @@ func TestV3DataPlaneEveryVisibleMutationCarriesItsFrozenExactSourceGate(t *testi
 				response := &authoritypb.Response{Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence}}
 				switch request.GetBody().(type) {
 				case *authoritypb.Request_SetAttr:
-					response.PostAttr = &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7}
-				case *authoritypb.Request_WriteTransaction:
+					response.PostState = testV3PostState(&authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o600, Nlink: 1, Size: 7})
+				case *authoritypb.Request_FskitWrite:
 					response = exactTestWriteCommit(identity, request)
-					response.PostAttr.Mode = 0o600
+					v3PostAttr(response).Mode = 0o600
 				case *authoritypb.Request_Rename:
 					response.Body = &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
 						NewPostIdentity: bytes.Repeat([]byte{0xaf}, 16),
@@ -2115,8 +2115,8 @@ func TestV3DataPlaneRejectsLinuxOnlyItemVisibilityRetry(t *testing.T) {
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request) (*authoritypb.Response, error) {
 		return &authoritypb.Response{
 			Errno: errnos.EINTR, Failure: authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY,
-			VisibilityRetrySequence: 1,
-			Mutation:                &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+			FskitRepairRetrySequence: 1,
+			Mutation:                 &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
 		}, nil
 	}
 	root := d.resolveReply().Root
@@ -2205,10 +2205,10 @@ func TestV3DataPlaneAuthoritySuccessWithUnpublishableItemResultIsTerminal(t *tes
 				return &pfslocal.WriteRequest{Handle: handle, Data: []byte("committed")}
 			},
 			result: func(identity authorityrpc.MutationIdentity, request *authoritypb.Request) *authoritypb.Response {
-				write := request.GetWriteTransaction()
+				write := request.GetFskitWrite()
 				return &authoritypb.Response{
 					Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
-					Body: &authoritypb.Response_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionReply{
+					Body: &authoritypb.Response_FskitWrite{FskitWrite: &authoritypb.FskitWriteReply{
 						TransactionId: write.GetTransactionId(), CommittedSize: write.GetFragmentOffset(),
 						AssignedOffset: write.GetPosition(), PostSize: write.GetPosition() + write.GetFragmentOffset(),
 						VisibilitySequence: identity.Sequence, Flags: v3WriteReplyCommitted,

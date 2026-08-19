@@ -23,12 +23,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # The self-hosted labels are the same set ci.yml's linux-xfs-fuse and
-  # linux-coherence-matrix jobs use. dm-log-writes is a kernel module, so the
-  # strict 6.12.100 kernel label is not a preference here - it is the only
-  # machine that can carry the target this job needs.
+  # dm-log-writes is not exposed on GitHub-hosted runners, so this instrument
+  # uses a capability-labeled self-host. The label says nothing about a custom
+  # FUSE dialect; the filesystem under test uses the same stock interface as CI.
   linux-power-loss:
-    runs-on: [self-hosted, linux, x64, portablefs-strict-6-12-100]
+    runs-on: [self-hosted, linux, x64, portablefs-dm-log-writes]
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4

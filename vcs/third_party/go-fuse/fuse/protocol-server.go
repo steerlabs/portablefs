@@ -188,7 +188,7 @@ func (ps *ProtocolServer) HandleRequest(in [][]byte, out [][]byte) (int, Status)
 	if len(in) > 1 {
 		copy(inTogether[len(in[0]):], in[1])
 	}
-	h, inSize, outSize, outPayloadSize, errno := parseRequest(inTogether, &ps.kernelSettings)
+	h, inSize, outSize, outPayloadSize, variableReply, errno := parseRequest(inTogether, &ps.kernelSettings)
 	if errno != 0 {
 		return 0, errno
 	}
@@ -232,8 +232,12 @@ func (ps *ProtocolServer) HandleRequest(in [][]byte, out [][]byte) (int, Status)
 				return 0, EIO
 			}
 			req.outPayload = out[0]
+			if variableReply {
+				req.outPayload = req.outPayload[:0]
+				req.variableReply = true
+			}
 			out = out[1:]
-		} else if outPayloadSize != 0 {
+		} else if outPayloadSize != 0 && !variableReply {
 			ps.opts.Logger.Printf("op %s: got %v, payload iov should have %d bytes", h.Name, iovLens(startOut), outPayloadSize)
 			return 0, EIO
 		}

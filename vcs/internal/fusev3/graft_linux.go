@@ -119,7 +119,7 @@ func fillGraftAttr(st *syscall.Stat_t, out *fuse.Attr, uid, gid uint32) {
 	out.FromStat(st)
 	out.Ino = localdirs.LocalIno(st.Ino)
 	out.Uid, out.Gid = uid, gid
-	out.Flags = fuse.FUSE_ATTR_PFS_LOCAL
+	out.Flags = 0
 }
 
 // publishGraftEntry hands one machine-local directory entry to the kernel.
@@ -385,12 +385,15 @@ func (r *rawFileSystem) graftLookup(parent *inodeRecord, name string, out *fuse.
 	if errno != 0 {
 		// A rule owns the NAME whether or not anything has created it, so the
 		// volume's same-named subtree stays shadowed and this is an honest
-		// ENOENT rather than a fall-through to the authority. The negative
-		// answer is not cached, for the same reason a negative authority answer
-		// is not: the entry that fills it in is created without this frontend
-		// being asked about the name.
-		out.SetEntryTimeout(0)
-		return true, fuse.Status(errno)
+		// local negative rather than a fall-through to the authority. Its class
+		// bit makes the successful zero-nodeid base reply distinguishable from a
+		// SHARED stamped negative without inventing a publication obligation.
+		if errno != syscall.ENOENT {
+			return true, fuse.Status(errno)
+		}
+		*out = fuse.EntryOut{}
+		out.Attr.Flags = 0
+		return true, fuse.OK
 	}
 	record, errno := r.internGraft(parent, name, &st)
 	if errno != 0 {
@@ -480,7 +483,7 @@ func (r *rawFileSystem) graftOpen(record *inodeRecord, flags uint32) (*graftHand
 	// goes through this kernel, and this kernel updates its own page cache from
 	// those writes. Refusing the page cache here would cost every dependency
 	// tree read a round trip through FUSE for nothing.
-	return &graftHandle{fd: fd}, fuse.FOPEN_KEEP_CACHE | fuse.FOPEN_PFS_LOCAL, 0
+	return &graftHandle{fd: fd}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // graftCreate creates and opens a machine-local file.
@@ -502,7 +505,7 @@ func (r *rawFileSystem) graftCreate(parent *inodeRecord, resolved route, flags, 
 		return nil, nil, 0, errno
 	}
 	r.publishGraftEntry(out, record, &st)
-	return record, &graftHandle{fd: fd}, fuse.FOPEN_KEEP_CACHE | fuse.FOPEN_PFS_LOCAL, 0
+	return record, &graftHandle{fd: fd}, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // graftMkdir creates a machine-local directory.

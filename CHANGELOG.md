@@ -10,14 +10,214 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-19
+
+This release replaces the private-kernel architecture with one that runs on a
+stock Linux kernel. Every guarantee PortableFS makes is now made against
+upstream FUSE 7.31+ and macOS FSKit, with no patched kernel, no private ABI,
+and no capability a distribution does not already ship. Where that costs a
+guarantee, the cost is written down rather than papered over.
+
+### Added
+
+- Protocol 6: one lease contract (N/A/D/E) over stock FUSE, replacing the
+  patched-kernel publication scopes. A mount declares exactly one frontend
+  profile at Attach — `LINUX_LEASES` for the Linux FUSE frontend or
+  `FSKIT_SYNC_REPAIR` for the macOS synchronous-repair frontend — and the
+  authority refuses any request that does not belong to the declared profile.
+  There is no third, silently weaker profile.
+- `portablefs mount-check --probe-mount`. It installs one real throwaway FUSE
+  mount on a private temporary directory, completes the kernel INIT handshake
+  with the client's own mount options, verifies the capabilities the coherence
+  contract requires, and unmounts. It is the only check that a client which can
+  never complete FUSE INIT cannot pass; the device node existing, the device
+  opening, `CAP_SYS_ADMIN` being held, and an installed helper are all equally
+  true of such a client.
+- `deploy/opensteer/staging-qualification.sh`: the real-workload qualification
+  corpus, run against a live mount on a staging cell. Serial and `tee -a`
+  appends, a git repository created and `fsck`-verified on the mount, two
+  concurrent `O_APPEND` writers on one file, several readers against a file
+  another process rewrites, and a durability check across unmount and remount.
+  The hot-file phase runs the rewrite twice, because only one shape of it lets
+  a reader demand an all-or-nothing view: under atomic replacement a mixed read
+  is wrong data and fails, while under in-place rewrite — which is not atomic
+  on any POSIX filesystem — a torn read is counted rather than failed and only
+  a malformed line or an invented generation fails. A stale-but-consistent
+  observation passes in both: that is the documented §7.3b residual, and the
+  phase reports how stale readers got instead of failing on it. The script also
+  names what to watch on the authority while it runs: RecallBudget-exhaustion
+  fences and uncertain-outcome revocations.
+- A full mode for the local gate. `scripts/verify-local.sh --full` (or
+  `VERIFY_LOCAL_FULL=1`) runs both privileged real-mount Docker suites after
+  everything else.
+- Writable `O_APPEND` on the stock-FUSE Linux profile, and it is exact across
+  mounts. The frontend forwards the writing description's append intent and the
+  authority places the payload at the object's true EOF inside the per-inode
+  writer stripe, reporting the offset it assigned. Concurrent cross-mount append
+  atomicity is now a demonstrated matrix case rather than a declared failure.
+  Stock Linux forwards neither `RWF_APPEND` nor `RWF_NOAPPEND`, and those two
+  per-call cases are disclosed deviations in `docs/portable-coherence.md` §4.3.
+- The Linux write path now carries the description's `O_SYNC`/`O_DSYNC` intent to
+  the authority, which the FSKit path has always honored.
+- Attribute caching under the A lease, which is what the lease architecture was
+  for. A path component resolved inside the daemon now publishes the attribute
+  validity its held A-R lease covers instead of declaring the answer
+  uncacheable, a `GETATTR` the kernel still sends is answered from the daemon's
+  leased attribute record, and a changed mutation reply installs its own exact
+  post-state attributes under an A-R successor grant so the mutating syscall's
+  follow-up stat of the target and its parent costs no second round trip. A
+  repeated 64-name path walk fell from 128 authority `GETATTR`s to zero, and one
+  steady-state `git status` over 200 tracked files from 404 authority requests to
+  22. Nothing is served past its lease: a coordinate under recall still misses to
+  the authority.
+
+### Fixed
+
+- A blocking `read(2)` racing a write on another mount could stall forever. The
+  window opened the moment the writing mount's recall closed the file's data
+  coordinate and stayed open until the whole transaction discharged: a reader on
+  any other mount passed its own local admission, reached the authority, and was
+  refused with `EAGAIN` -- an errno `read(2)` may not return on a blocking
+  description. This is the ordinary shape of a concurrent multi-mount workspace,
+  so it was reachable in normal use, not only under contrived load. A data read
+  now waits instead of being refused, and it waits for exactly the interval that
+  is unsafe to observe: from the recall's reservation until the mutation has
+  applied. It may not wait one step further, because the callback is holding the
+  kernel folio that the same transaction's whole-file purge will need, and that
+  purge runs strictly after apply -- so the wait and the purge can never be
+  waiting on each other. Past apply the read is answered with the applied bytes,
+  and it carries cache authority unless the reader is the very mount still
+  discharging that recall. The two local refusals of the same class are gone
+  with it: a buffered read is no longer refused because this mount is repairing
+  the coordinate, and a read the recall caught in flight now delivers its bytes
+  rather than being turned into a retry.
+- Opening a file for reading could deadlock a peer mount against the write it
+  raced. The frontend registers an open-for-read's page-cache publication and a
+  recall's whole-file purge waits for that publication's physical reply, but the
+  open itself was admitted on the metadata lane, which parks for the entire
+  barrier -- so the purge waited on a reply that was waiting on the purge's own
+  transaction, and the peer mount was revoked at its repair budget. Opening a
+  file for reading is now admitted on the data lane, which releases at apply,
+  and the publication is registered when the authority call returns rather than
+  across it: a READ has to register first because its reply carries bytes the
+  purge must be ordered against, and an open carries none. Opening a directory
+  still takes the full barrier, and with this no recall waits on a metadata
+  reply.
+- A whole-file purge could run ahead of the reads it was supposed to order.
+  It waited on the reply publications a coordinate still had outstanding, but
+  reply preparation removes a read's data entry before the reply is physically
+  written -- so a read that had been prepared and not yet written looked drained,
+  and filled its folio after the purge. The wait now follows the reads the
+  coordinate admitted rather than the entries preparation has already settled.
+- A recall could decide there was nothing to withdraw while the kernel was still
+  serving the file. Both the attribute and the data withdrawal were conditioned
+  on this daemon's own cache bookkeeping, but the kernel caches an attribute from
+  any reply that carried a lifetime and caches read data for any `KEEP_CACHE`
+  description, neither of which requires the daemon to have retained a copy.
+  Withdrawal now follows the inode. Relatedly, a read that returned end-of-file
+  was treated as publishing nothing; stock zero-fills the rest of the requested
+  range and marks those folios up to date, so an end-of-file read past a peer's
+  truncation left real pages behind that no later withdrawal knew about.
+- A buffered read registered its data publication before acquiring the mount's
+  bounded bulk lane slot, while the purge that waits for those publications runs
+  from a source mutation already holding one. A saturated lane could therefore
+  make a purge wait on reads waiting for the lane its own mutation occupied, with
+  nothing but the repair budget to break it -- and that budget revokes the mount.
+  The slot is now taken for the whole callback, before the publication exists.
+- A failed coherence barrier minted successor cache authority anyway. Grants were
+  issued before the barrier's outcome was known, so a failure delivered them to
+  the frontend and left the matching records in the authority's table with
+  nothing on the wire able to discharge them. Nothing is minted on a failed
+  barrier now. The same error path also dropped the source's discharge receipt
+  obligation, which does not cancel the obligation -- it only guarantees the
+  session is fenced once the recall budget elapses -- so the receipt now travels
+  with every outcome.
+- A buffered read on a mount doing its own I/O could stall forever. The frontend
+  refused such a read with `EAGAIN` -- an errno `read(2)` may not return on a
+  blocking description, which stock Linux hands straight to the caller and which
+  permanently parks any runtime that then polls the descriptor. It was refused
+  for two reasons that were not about this read at all: an unrelated file's
+  in-flight `O_CREAT|O_TRUNC` on the same mount closed data publication globally,
+  and a read reply that carried no successor lease was dropped even while the
+  lease its handle was opened under was still live. Reads are no longer refused
+  for either reason; instead every whole-file invalidation waits for the reads
+  already admitted for that inode before it purges, which is the ordering the
+  refusal was standing in for.
+
 ### Changed
 
-- Ship the named macOS 26 FSKit best-effort cache tier over protocol 5. One
+- Two coherence residuals are now disclosed rather than implied. A mount in a
+  recall audience can, between the mutation's apply and its own purge, answer a
+  page-cache miss with post-apply bytes while other folios of the same inode
+  still hold pre-apply ones, so a single `read(2)` spanning that boundary can
+  return a mix equal to no serial state; it is bounded by one COMPLETE round trip
+  plus one invalidation. And `docs/portable-coherence.md` §7.3b now states its
+  real scope: it is a normal-operation residual, not only a post-terminalization
+  one, serving reads through a recall raises its likelihood without changing its
+  mechanism, and it has a liveness face -- stock's whole-file invalidation is an
+  unbounded synchronous walk that a workload never letting an inode fall idle can
+  starve, stalling the mutating mount for its whole recall budget.
+- Name the three stock-kernel boundaries on the Linux range and link surfaces
+  instead of leaving them as unexplained failures, each pinned by test:
+  `fallocate` `COLLAPSE_RANGE`/`INSERT_RANGE`/`UNSHARE_RANGE` are refused by
+  `fuse_file_fallocate` before any request exists, a `copy_file_range` spanning a
+  machine-local route and the shared volume is refused as `EXDEV` and then
+  completed by the kernel's own generic read/write fallback, and the first link
+  of an `O_TMPFILE` uses the capability-free `/proc/self/fd` idiom because
+  `linkat(AT_EMPTY_PATH)` needs `CAP_DAC_READ_SEARCH` the data plane does not
+  have. `docs/portable-coherence.md` §4.4 records all three.
+- Ship the named macOS 26 FSKit best-effort cache tier over protocol 6. One
   active Mac owns an authority-enforced compatibility writer lease; Linux peers
   remain readable but their visible mutations return `EBUSY` before storage,
   a second Mac writer is refused at activation, and clean unmount transfers
   write ownership. The product reports the measured transient-`ESTALE`
   high-rename boundary instead of hiding it behind retries or a fallback.
+
+### Removed
+
+- The retired FSKit routes barrier, in full. A routing revision was once
+  delivered to mounted frontends as a two-phase visibility phase, and a
+  frontend that could not adopt it answered `blocked`. Nothing drove either
+  half: route changes commit only at clean mount absence, so there is no mount
+  to deliver a phase to, and the authority never read the `blocked` bit off the
+  wire. Gone with it: `VisibilityCoordinator.ExecuteRoutes`/`ExecuteRoutesChecked`
+  and their barrier, the `Routes` member of every visibility event and the
+  fairness, yield, and dispatch branches that tested it, `ReportBlocked`,
+  `ErrVisibilityBlocked`, and the `routes_blocked` fence reason. The
+  `AckVisibilityRequest.blocked` and `VisibilityEvent.routes` wire fields are
+  reserved rather than reused, on both the authority protocol and `pfslocal`.
+  Every phase a frontend is now delivered is one it repairs in place and
+  acknowledges.
+- The patched Linux 6.12.100 series and its private ABI, in full: the
+  `kernel/linux-6.12.100-portablefs-append` patch series, its qualification
+  receipts and test suite, the one-shot write path built on it, the strict
+  write transaction it required, and the `LOCKLESS_EXPIRATION` and
+  `PARENT_EXCLUSIVE` namespace-repair models. Nothing in the product depends on
+  a kernel a distribution does not ship. The patch series is only in git
+  history; the retired identifiers stay reserved in the wire schema and are
+  refused everywhere else by `scripts/verify-local.sh`.
+- The `mutation_order` ordering shim in the volume server and the retired
+  protocol-5 FSKit qualification registry fixture. The runtime admission path
+  is now the only admission path in production and in tests.
+
+### Deploy
+
+- The bounded read-only files gateway (`cmd/portablefs-files`, `readonlyfs/`)
+  is protocol 6. It is not a mount: it holds no kernel namespace, no page
+  cache, and no lease state, so it declares the synchronous-repair profile —
+  the one protocol-6 contract that grants no cache leases — and discharges
+  every repair phase immediately. Declaring the Linux lease profile would claim
+  recall participation it cannot honor and would stall writers behind a reader
+  that never caches.
+- The candidate E2B template smoke now proves the shipped client can complete a
+  kernel FUSE INIT handshake, and says plainly what it does and does not prove.
+  It runs with no manager and no authority, so it proves nothing about the
+  authority, the protocol, coherence, or any workload; full qualification is
+  the staging corpus above. `docs/opensteer-production-deployment.md` carries
+  the same statement.
+- `scripts/build-hosted-linux-release.sh` builds every binary the systemd units
+  and deploy scripts reference, including `bin/portablefs`, and its output
+  membership matches `deploy/gcp/verify-hosted-release.sh` exactly.
 
 ## [0.2.6] - 2026-08-12
 

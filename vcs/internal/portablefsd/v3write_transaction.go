@@ -19,9 +19,9 @@ const (
 	v3WriteReplyPostApply
 	v3WriteReplyRejectedRLimit
 
-	// Qualification FSKit does not expose the kernel's per-call killpriv
-	// decision. Every non-empty content mutation therefore requests the safe
-	// HANDLE_KILLPRIV_V2 behavior explicitly. Shipping macOS Attach is refused.
+	// FSKit does not expose the kernel's per-call killpriv decision. Every
+	// non-empty content mutation therefore requests the safe HANDLE_KILLPRIV_V2
+	// behavior explicitly under the operational FSKit profile.
 	v3WriteFlagKillSUIDGID uint32 = 1 << 2
 )
 
@@ -37,12 +37,12 @@ type v3WriteTransaction struct {
 	flags         uint32
 }
 
-func (tx v3WriteTransaction) request(phase authoritypb.WriteTransactionPhase, fragmentOffset uint64, data []byte) *authoritypb.Request {
+func (tx v3WriteTransaction) request(phase authoritypb.FskitWritePhase, fragmentOffset uint64, data []byte) *authoritypb.Request {
 	size := uint32(0)
-	if phase == authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA {
+	if phase == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA {
 		size = uint32(len(data))
 	}
-	return &authoritypb.Request{Body: &authoritypb.Request_WriteTransaction{WriteTransaction: &authoritypb.WriteTransactionRequest{
+	return &authoritypb.Request{Body: &authoritypb.Request_FskitWrite{FskitWrite: &authoritypb.FskitWriteRequest{
 		TransactionId: tx.id, Handle: cloneBytesV3(tx.handle), RequestedSize: tx.requestedSize,
 		FragmentOffset: fragmentOffset, Position: tx.position, RlimitFsize: tx.rlimitFsize,
 		FileMaxSize: tx.fileMaxSize, LockOwner: tx.lockOwner, WriteFlags: tx.writeFlags,
@@ -51,19 +51,19 @@ func (tx v3WriteTransaction) request(phase authoritypb.WriteTransactionPhase, fr
 }
 
 func validV3WritePhaseReply(response *authoritypb.Response, transactionID uint64, want uint32) bool {
-	if response == nil || response.GetMutation() != nil || response.GetPostAttr() != nil {
+	if response == nil || response.GetMutation() != nil || response.GetPostState() != nil {
 		return false
 	}
-	reply := response.GetWriteTransaction()
+	reply := response.GetFskitWrite()
 	return reply != nil && reply.GetTransactionId() == transactionID && reply.GetFlags() == want && reply.GetError() == 0 &&
 		reply.GetCommittedSize() == 0 && reply.GetAssignedOffset() == 0 && reply.GetPostSize() == 0 && reply.GetVisibilitySequence() == 0
 }
 
 func exactV3WriteRejection(request *authoritypb.Request, response *authoritypb.Response) (int32, bool) {
-	body := request.GetWriteTransaction()
-	reply := response.GetWriteTransaction()
-	if body == nil || body.GetPhase() != authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT || reply == nil ||
-		reply.GetTransactionId() != body.GetTransactionId() || response.GetPostAttr() != nil ||
+	body := request.GetFskitWrite()
+	reply := response.GetFskitWrite()
+	if body == nil || body.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT || reply == nil ||
+		reply.GetTransactionId() != body.GetTransactionId() || response.GetPostState() != nil ||
 		reply.GetCommittedSize() != 0 || reply.GetAssignedOffset() != 0 || reply.GetPostSize() != 0 || reply.GetVisibilitySequence() != 0 ||
 		reply.GetError() > -1 || reply.GetError() < -4095 {
 		return 0, false
@@ -83,21 +83,21 @@ func validV3WriteCommit(tx v3WriteTransaction, response *authoritypb.Response) e
 	if response == nil {
 		return errors.New("write transaction omitted its commit reply")
 	}
-	if errno, rejected := exactV3WriteRejection(tx.request(authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT, tx.requestedSize, nil), response); rejected {
+	if errno, rejected := exactV3WriteRejection(tx.request(authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT, tx.requestedSize, nil), response); rejected {
 		return fmt.Errorf("write transaction returned an unhandled definite rejection errno %d", errno)
 	}
-	reply := response.GetWriteTransaction()
+	reply := response.GetFskitWrite()
 	if reply == nil || reply.GetTransactionId() != tx.id || reply.GetCommittedSize() == 0 ||
 		reply.GetCommittedSize() > tx.requestedSize || reply.GetCommittedSize() > math.MaxUint32 ||
 		reply.GetAssignedOffset() != tx.position ||
-		reply.GetVisibilitySequence() == 0 || response.GetPostAttr() == nil {
+		reply.GetVisibilitySequence() == 0 || v3PostAttr(response) == nil {
 		return errors.New("write transaction omitted its exact committed result")
 	}
 	if reply.GetAssignedOffset() > tx.fileMaxSize || reply.GetCommittedSize() > tx.fileMaxSize-reply.GetAssignedOffset() {
 		return errors.New("write transaction exceeded its frozen file-size ceiling")
 	}
 	end := reply.GetAssignedOffset() + reply.GetCommittedSize()
-	postAttr := response.GetPostAttr()
+	postAttr := v3PostAttr(response)
 	if reply.GetPostSize() < end || postAttr.GetKind() != authoritypb.Attr_REGULAR || postAttr.GetSize() < 0 || uint64(postAttr.GetSize()) != reply.GetPostSize() {
 		return errors.New("write transaction returned contradictory post-write size")
 	}
@@ -149,7 +149,7 @@ func (d *v3DataPlane) callWriteInert(ctx context.Context, operationID uint64, re
 	if errno != 0 {
 		return classified, errno
 	}
-	transactionID := request.GetWriteTransaction().GetTransactionId()
+	transactionID := request.GetFskitWrite().GetTransactionId()
 	if !validV3WritePhaseReply(classified, transactionID, want) {
 		_ = d.fail(fmt.Errorf("portablefsd: write transaction %d returned a malformed inert-phase reply", transactionID))
 		return nil, darwinEIO
@@ -167,13 +167,13 @@ func (d *v3DataPlane) abortWriteTransaction(operationID uint64, tx v3WriteTransa
 	// still the final owner if this best-effort idempotent ABORT cannot return.
 	abortCtx, cancel := context.WithTimeout(d.ctx, operationAdmissionBudgetValue())
 	defer cancel()
-	_, errno := d.callWriteInert(abortCtx, operationID, tx.request(authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_ABORT, 0, nil), v3WriteReplyAborted)
+	_, errno := d.callWriteInert(abortCtx, operationID, tx.request(authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_ABORT, 0, nil), v3WriteReplyAborted)
 	if errno != 0 && d.terminalError() == nil {
 		_ = d.fail(fmt.Errorf("portablefsd: write transaction %d ABORT failed with errno %d", tx.id, errno))
 	}
 }
 
-func (d *v3DataPlane) executeWriteTransaction(ctx context.Context, operationID uint64, tx *v3WriteTransaction, data []byte, gate *authoritypb.SourcePublicationGate) (*authoritypb.Response, int32) {
+func (d *v3DataPlane) executeWriteTransaction(ctx context.Context, operationID uint64, tx *v3WriteTransaction, data []byte, gate *authoritypb.FskitSourcePublication) (*authoritypb.Response, int32) {
 	if tx == nil || tx.id != 0 || tx.requestedSize == 0 || tx.requestedSize != uint64(len(data)) ||
 		tx.requestedSize > d.maxWriteTransaction || tx.position > math.MaxInt64 || tx.fileMaxSize == 0 {
 		return nil, darwinEINVAL
@@ -190,7 +190,7 @@ func (d *v3DataPlane) executeWriteTransaction(ctx context.Context, operationID u
 		return nil, darwinEOVERFLOW
 	}
 	d.nextWriteTransaction++
-	_, errno := d.callWriteInert(ctx, operationID, tx.request(authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_BEGIN, 0, nil), v3WriteReplyBegun)
+	_, errno := d.callWriteInert(ctx, operationID, tx.request(authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_BEGIN, 0, nil), v3WriteReplyBegun)
 	if errno != 0 {
 		d.abortWriteTransaction(operationID, *tx)
 		d.writeBeginMu.Unlock()
@@ -202,7 +202,7 @@ func (d *v3DataPlane) executeWriteTransaction(ctx context.Context, operationID u
 	for fragmentOffset < tx.requestedSize {
 		fragmentSize := min(uint64(d.maxWrite), tx.requestedSize-fragmentOffset)
 		fragment := data[int(fragmentOffset):int(fragmentOffset+fragmentSize)]
-		_, errno = d.callWriteInert(ctx, operationID, tx.request(authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_DATA, fragmentOffset, fragment), v3WriteReplyStaged)
+		_, errno = d.callWriteInert(ctx, operationID, tx.request(authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_DATA, fragmentOffset, fragment), v3WriteReplyStaged)
 		if errno != 0 {
 			d.abortWriteTransaction(operationID, *tx)
 			return nil, errno
@@ -210,7 +210,7 @@ func (d *v3DataPlane) executeWriteTransaction(ctx context.Context, operationID u
 		fragmentOffset += fragmentSize
 	}
 
-	commit := tx.request(authoritypb.WriteTransactionPhase_WRITE_TRANSACTION_PHASE_COMMIT, fragmentOffset, nil)
+	commit := tx.request(authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT, fragmentOffset, nil)
 	response, errno := d.callMutation(ctx, operationID, commit, gate)
 	if errno != 0 {
 		if d.terminalError() == nil {

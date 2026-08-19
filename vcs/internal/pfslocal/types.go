@@ -512,11 +512,6 @@ type VisibilityTarget struct {
 	PostIdentity   []byte
 }
 
-type RoutesChange struct {
-	Revision []byte
-	Rules    []byte
-}
-
 type V3VisibilityEvent struct {
 	AuthorityEpoch     []byte
 	Cursor             VisibilityCursor
@@ -524,14 +519,11 @@ type V3VisibilityEvent struct {
 	MutationSlot       uint32
 	Targets            []VisibilityTarget
 	MutationSequence   uint64
-	Routes             *RoutesChange
 }
 
 type VisibilityAckRequest struct {
 	AuthorityEpoch            []byte
 	Cursor                    VisibilityCursor
-	Blocked                   bool
-	Reason                    string
 	OrderedAdmissionContended bool
 }
 

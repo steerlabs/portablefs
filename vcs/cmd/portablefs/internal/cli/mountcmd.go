@@ -126,7 +126,7 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.StringVar(&o.enrollmentCertPath, "mount-enrollment-cert", "", "Manager-issued mount enrollment certificate PEM file")
 	fs.Int64Var(&o.enrollmentExpiresAtMs, "mount-enrollment-expires-at-ms", 0, "mount enrollment expiry as unix milliseconds")
 	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
-	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-5 coherence mode)")
+	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-6 profile)")
 	fs.BoolFunc("fast", "retired: v3 mounts are strict write-through; passing this flag is an error", func(string) error {
 		return errFastRetired
 	})
@@ -328,10 +328,9 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mount", err)
 	}
-	// An ordinary macOS 27 build must reach its native-policy refusal without
-	// touching the protected app-group container. Preserve the older strict
-	// ownership-first ordering for malformed selectors: durable recovery
-	// evidence still takes precedence over an unrelated option typo.
+	// Select the exact extension contract before touching the protected app-group
+	// container. Ordinary macOS 26 and 27 builds use synchronous repair; only a
+	// separately stamped SDK-27 build selects the native actuator.
 	fskitCachePolicy := ""
 	if runtime.GOOS == "darwin" && (o.strategy == "auto" || o.strategy == "fskit") {
 		fskitCachePolicy, err = currentFSKitCachePolicy()

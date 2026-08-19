@@ -4,10 +4,8 @@ package fusev3
 
 import (
 	"slices"
-	"strings"
 	"testing"
 
-	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 )
 
@@ -98,30 +96,6 @@ func TestActivateRoutesAcceptsTheCanonicalFormExactly(t *testing.T) {
 				t.Fatalf("the canonical form is not a fixed point: %x, %v", again.Revision(), err)
 			}
 		})
-	}
-}
-
-// --- a route declaration that moves is fatal to the mount that read it ---
-
-func TestARoutesChangeEventIsFatalAndNamesTheRemount(t *testing.T) {
-	mounted := [32]byte{1, 2, 3}
-	same := &authoritypb.VisibilityEvent{Routes: &authoritypb.RoutesChange{Revision: mounted[:]}}
-	if err := routesEventChange(mounted, same); err != nil {
-		t.Fatalf("an event repeating this mount's own revision = %v, want no action", err)
-	}
-	if err := routesEventChange(mounted, &authoritypb.VisibilityEvent{}); err != nil {
-		t.Fatalf("an ordinary visibility event = %v, want no action", err)
-	}
-	moved := &authoritypb.VisibilityEvent{Routes: &authoritypb.RoutesChange{Revision: []byte{9, 9, 9}}}
-	err := routesEventChange(mounted, moved)
-	if err == nil {
-		t.Fatal("a route declaration that moved did not end the mount; serving the old topology against a volume that has moved is the exact divergence the revision exists to prevent")
-	}
-	message := err.Error()
-	for _, want := range []string{LocalDirsPath, "revoked", "unmount and mount again"} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("self-revocation message %q does not mention %q; the user has to be told what to do", message, want)
-		}
 	}
 }
 

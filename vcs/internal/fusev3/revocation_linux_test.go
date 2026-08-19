@@ -144,6 +144,29 @@ func TestWithdrawalAbortsEvenWhenTheFirstDetachSucceeds(t *testing.T) {
 	}
 }
 
+func TestConnectionFailureWithInstalledMountEntersWithdrawalBeforeServeEnds(t *testing.T) {
+	fake := &fakeWithdrawal{installed: true}
+	mount := revokingMount(t, fake)
+	mount.kernelConnectionStarted = true
+
+	// OnUnmount runs inside Serve, immediately before kernelConnectionDone is
+	// closed.  It must record the failure and schedule withdrawal synchronously
+	// instead of racing a clean Close against that terminal edge.
+	mount.raw.OnUnmount()
+	err := mount.fatalError()
+	if err == nil || !strings.Contains(err.Error(), "serving connection terminated") ||
+		!strings.Contains(err.Error(), "still installed") {
+		t.Fatalf("installed-mount connection failure was not retained: %v", err)
+	}
+	close(mount.kernelConnectionDone)
+
+	waitFor(t, "connection-failure mount withdrawal", func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return !fake.installed && fake.detaches > 0 && fake.aborts > 0
+	})
+}
+
 func TestWithdrawalEscalatesFromAFailedDetachThroughAbortToSuccess(t *testing.T) {
 	// A first lazy-detach failure must not strand the mount. Aborting the FUSE
 	// connection does not remove it, so the ladder must retry the mount-owner
@@ -341,8 +364,8 @@ func TestSuccessfulWithdrawalReportsCleanKernelState(t *testing.T) {
 // bounded by refusing requests; a retained page is not, because a read of a
 // resident folio never becomes a request at all. So the ladder has to drop the
 // pages explicitly while the reverse-notification descriptor is still alive.
-// revoked admission plus the patched kernel's invalidate-lock serialization
-// makes the pass final before the connection is aborted.
+// Stock FUSE does not expose the final page-purge result, so this test proves
+// notification ordering only; the retained-reference residual stays explicit.
 func TestWithdrawalDropsRetainedPagesBeforeTheAbort(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}

@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"math"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -136,8 +137,10 @@ func (g *createGrant) discard() error {
 }
 
 type openFile struct {
+	volume     *Volume
 	res        *resource
 	coordinate ObjectCoordinate
+	fsyncState *inodeFsyncState
 	// read and write are the access this handle was opened for. They are
 	// enforced here rather than left to the underlying description, because a
 	// handle may be served by a creation grant whose description is wider than
@@ -160,6 +163,7 @@ type writeTarget struct {
 	volume     *Volume
 	res        *resource
 	coordinate ObjectCoordinate
+	fsyncState *inodeFsyncState
 	// mu makes Close and CommitWrite mutually exclusive. The target owns one
 	// descriptor reference from PinWriteTarget until Close, and a commit must
 	// not race that final release: otherwise the kernel may recycle the fd
@@ -180,11 +184,16 @@ func (t *writeTarget) Close() error {
 		return nil
 	}
 	t.closed = true
-	return t.res.release()
+	result := t.res.release()
+	t.volume.releaseFsyncState(t.fsyncState)
+	return result
 }
 
-func (f *openFile) fd() int  { return f.res.fd }
-func (f *openFile) release() { _ = f.res.release() }
+func (f *openFile) fd() int { return f.res.fd }
+func (f *openFile) release() {
+	_ = f.res.release()
+	f.volume.releaseFsyncState(f.fsyncState)
+}
 
 // Volume owns all descriptors for one authority epoch. Closing it atomically
 // makes every issued capability stale.
@@ -206,6 +215,8 @@ type Volume struct {
 	fenced        error
 	objects       map[Capability]object
 	opens         map[Capability]*openFile
+	fsyncMu       sync.Mutex
+	fsyncStates   map[[16]byte]*inodeFsyncState
 
 	// The fields below are written once, before the Volume is reachable by
 	// any other goroutine, and never again. That is what makes them safe to
@@ -229,18 +240,20 @@ type Volume struct {
 	// The write/copy seams are likewise fixed to their unix implementations in
 	// production. Tests use them to model XFS running file_modified before a
 	// later zero-byte data-path failure.
-	pwrite        func(int, []byte, int64) (int, error)
-	pwritev2      func(int, [][]byte, int64, int) (int, error)
-	sendfile      func(int, int, *int64, int) (int, error)
-	copyFileRange func(int, *int64, int, *int64, int, int) (int, error)
-	postStat      func(int) (Attr, error)
-	fsync         func(int) error
-	fdatasync     func(int) error
+	pwrite                    func(int, []byte, int64) (int, error)
+	pwritev2                  func(int, [][]byte, int64, int) (int, error)
+	sendfile                  func(int, int, *int64, int) (int, error)
+	copyFileRange             func(int, *int64, int, *int64, int, int) (int, error)
+	postStat                  func(int) (Attr, error)
+	fsync                     func(int) error
+	fdatasync                 func(int) error
+	inspectSecurityCapability func(int) (bool, error)
 	// removeWritePrivileges is fixed to the package implementation in
 	// production. The seam lets tests prove that a delegated killpriv failure
 	// does not suppress the one logical sync attempt owed by a clean backend
 	// mutation.
-	removeWritePrivileges func(int, uint32, bool) error
+	removeWritePrivileges       func(int, uint32, bool) error
+	removePinnedWritePrivileges func(int, uint32, bool, *bool) error
 }
 
 func inodeMutationStripe(identity [16]byte) uint64 {
@@ -257,6 +270,35 @@ func inodeMutationStripe(identity [16]byte) uint64 {
 
 func (v *Volume) inodeMutationLock(identity [16]byte) *sync.RWMutex {
 	return &v.inodeMutation[inodeMutationStripe(identity)]
+}
+
+// LockMutation takes the writer stripes for a complete touched-identity set in
+// increasing stripe order. The returned release function is idempotent so an
+// authority handler can retain it through replay-record persistence and still
+// use one deferred cleanup path on every rejection.
+func (v *Volume) LockMutation(identities [][16]byte) func() {
+	stripes := make([]uint64, 0, len(identities))
+	seen := make(map[uint64]struct{}, len(identities))
+	for _, identity := range identities {
+		stripe := inodeMutationStripe(identity)
+		if _, exists := seen[stripe]; exists {
+			continue
+		}
+		seen[stripe] = struct{}{}
+		stripes = append(stripes, stripe)
+	}
+	slices.Sort(stripes)
+	for _, stripe := range stripes {
+		v.inodeMutation[stripe].Lock()
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for i := len(stripes) - 1; i >= 0; i-- {
+				v.inodeMutation[stripes[i]].Unlock()
+			}
+		})
+	}
 }
 
 // holdObject resolves a capability and takes a reference to its descriptor.
@@ -281,7 +323,45 @@ func (v *Volume) holdOpen(id Capability) (*openFile, error) {
 		return nil, err
 	}
 	f.res.acquire()
+	v.retainFsyncState(f.fsyncState)
 	return f, nil
+}
+
+func (v *Volume) fsyncState(identity [16]byte) *inodeFsyncState {
+	v.fsyncMu.Lock()
+	defer v.fsyncMu.Unlock()
+	state := v.fsyncStates[identity]
+	if state == nil {
+		state = &inodeFsyncState{identity: identity}
+		v.fsyncStates[identity] = state
+	}
+	state.refs++
+	return state
+}
+
+func (v *Volume) retainFsyncState(state *inodeFsyncState) {
+	if state == nil {
+		return
+	}
+	v.fsyncMu.Lock()
+	state.refs++
+	v.fsyncMu.Unlock()
+}
+
+func (v *Volume) releaseFsyncState(state *inodeFsyncState) {
+	if state == nil {
+		return
+	}
+	v.fsyncMu.Lock()
+	state.refs--
+	if state.refs < 0 {
+		v.fsyncMu.Unlock()
+		panic("xfsstore: fsync state released more times than acquired")
+	}
+	if state.refs == 0 && v.fsyncStates[state.identity] == state {
+		delete(v.fsyncStates, state.identity)
+	}
+	v.fsyncMu.Unlock()
 }
 
 func (v *Volume) openChild(parent Capability, name string) (int, [16]byte, error) {
@@ -385,24 +465,27 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 	}
 
 	v := &Volume{
-		rootFD:                  fd,
-		device:                  uint64(st.Dev),
-		ownerUID:                ownerUID,
-		ownerGID:                ownerGID,
-		projectID:               expectedProjectID,
-		objects:                 make(map[Capability]object),
-		opens:                   make(map[Capability]*openFile),
-		productionIdentity:      requireXFS,
-		fallocate:               unix.Fallocate,
-		fallocateAllocationUnit: xfsFallocateAllocationUnit,
-		pwrite:                  unix.Pwrite,
-		pwritev2:                unix.Pwritev2,
-		sendfile:                unix.Sendfile,
-		copyFileRange:           unix.CopyFileRange,
-		postStat:                statFD,
-		fsync:                   unix.Fsync,
-		fdatasync:               unix.Fdatasync,
-		removeWritePrivileges:   removeWritePrivileges,
+		rootFD:                      fd,
+		device:                      uint64(st.Dev),
+		ownerUID:                    ownerUID,
+		ownerGID:                    ownerGID,
+		projectID:                   expectedProjectID,
+		objects:                     make(map[Capability]object),
+		opens:                       make(map[Capability]*openFile),
+		fsyncStates:                 make(map[[16]byte]*inodeFsyncState),
+		productionIdentity:          requireXFS,
+		fallocate:                   unix.Fallocate,
+		fallocateAllocationUnit:     xfsFallocateAllocationUnit,
+		pwrite:                      unix.Pwrite,
+		pwritev2:                    unix.Pwritev2,
+		sendfile:                    unix.Sendfile,
+		copyFileRange:               unix.CopyFileRange,
+		postStat:                    statFD,
+		fsync:                       unix.Fsync,
+		fdatasync:                   unix.Fdatasync,
+		inspectSecurityCapability:   inspectSecurityCapability,
+		removeWritePrivileges:       removeWritePrivileges,
+		removePinnedWritePrivileges: removeWritePrivilegesWithCapability,
 	}
 	rootIdentity, err := stableIdentityFD(fd, requireXFS)
 	if err != nil {
@@ -492,6 +575,7 @@ func (v *Volume) Close() error {
 	result := unix.Flock(v.rootFD, unix.LOCK_UN)
 	for id, opened := range v.opens {
 		result = errors.Join(result, opened.res.release())
+		v.releaseFsyncState(opened.fsyncState)
 		delete(v.opens, id)
 	}
 	for id, obj := range v.objects {
@@ -600,6 +684,52 @@ func (v *Volume) Lookup(parent Capability, name string) (Capability, Attr, error
 	return v.installObject(fd, nil, identity)
 }
 
+// LookupOpen is Lookup with the directory named by an open handle instead of by
+// the directory's own object capability.
+//
+// Enumerating an open directory must not depend on a reference the open does
+// not itself imply. A frontend that keeps no namespace of its own -- the files
+// gateway is the one in this tree -- reclaims the directory's object capability
+// as soon as it holds the handle, exactly as it does for a file it is about to
+// read. Reading that file keeps working because reads are answered from the
+// handle; readdir was not, so it resolved each entry against a capability the
+// caller had legitimately dropped and failed every page with ErrStaleObject.
+func (v *Volume) LookupOpen(handle Capability, name string) (Capability, Attr, error) {
+	fd, identity, err := v.openChildOfOpen(handle, name)
+	if err != nil {
+		return Capability{}, Attr{}, err
+	}
+	return v.installObject(fd, nil, identity)
+}
+
+// openChildOfOpen is openChild resolved from an open directory handle. The
+// authorization that produced the handle is the same one that produced the
+// object capability it was opened from, so this reaches no name the caller
+// could not already reach.
+func (v *Volume) openChildOfOpen(handle Capability, name string) (int, [16]byte, error) {
+	if err := ValidateComponent(name); err != nil {
+		return -1, [16]byte{}, err
+	}
+	opened, err := v.holdOpen(handle)
+	if err != nil {
+		return -1, [16]byte{}, err
+	}
+	defer opened.release()
+	if opened.kind != KindDirectory {
+		return -1, [16]byte{}, syscall.ENOTDIR
+	}
+	fd, err := openChildAt(opened.fd(), name)
+	if err != nil {
+		return -1, [16]byte{}, err
+	}
+	identity, err := stableIdentityFD(fd, v.productionIdentity)
+	if err != nil {
+		_ = unix.Close(fd)
+		return -1, [16]byte{}, err
+	}
+	return fd, identity, nil
+}
+
 func (v *Volume) Forget(id Capability) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -631,12 +761,21 @@ func (v *Volume) Getattr(id Capability) (Attr, error) {
 // inode number in the same authority epoch does not. It is coordination
 // identity only, never authorization.
 func (v *Volume) Identity(id Capability) ([16]byte, error) {
+	coordinate, err := v.CoordinateItem(id)
+	return coordinate.Stable, err
+}
+
+// CoordinateItem returns the immutable coordination facts retained when this
+// object capability was installed. It deliberately performs no statx: size,
+// timestamps and mode are mutable, but stable identity, inode and device are
+// properties of the held incarnation itself.
+func (v *Volume) CoordinateItem(id Capability) (ObjectCoordinate, error) {
 	obj, err := v.holdObject(id)
 	if err != nil {
-		return [16]byte{}, err
+		return ObjectCoordinate{}, err
 	}
 	defer obj.release()
-	return obj.coordinate.Stable, nil
+	return obj.coordinate, nil
 }
 
 func (v *Volume) IdentityOpen(id Capability) ([16]byte, error) {
@@ -724,7 +863,7 @@ func exactXFSHandleIdentity(handleType int32, raw []byte) ([16]byte, bool) {
 func statFD(fd int) (Attr, error) {
 	var st unix.Statx_t
 	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW,
-		unix.STATX_BASIC_STATS|unix.STATX_BTIME, &st); err != nil {
+		unix.STATX_ALL, &st); err != nil {
 		return Attr{}, err
 	}
 	return attrFromStatx(st)
@@ -733,7 +872,7 @@ func statFD(fd int) (Attr, error) {
 func statChild(dirFD int, name string) (Attr, error) {
 	var st unix.Statx_t
 	if err := unix.Statx(dirFD, name, unix.AT_SYMLINK_NOFOLLOW,
-		unix.STATX_BASIC_STATS|unix.STATX_BTIME, &st); err != nil {
+		unix.STATX_ALL, &st); err != nil {
 		return Attr{}, err
 	}
 	return attrFromStatx(st)
@@ -748,9 +887,17 @@ func attrFromStatx(st unix.Statx_t) (Attr, error) {
 		Kind: kind, Ino: st.Ino, Size: int64(st.Size), Blocks: st.Blocks,
 		Mode: modeFromUnix(uint32(st.Mode)), UID: st.Uid, GID: st.Gid, Nlink: st.Nlink,
 		DeviceMajor: st.Dev_major, DeviceMinor: st.Dev_minor,
+		Rdev: newEncodeDevice(st.Rdev_major, st.Rdev_minor), BlockSize: st.Blksize,
+		Flags:   uint32(st.Attributes & st.Attributes_mask),
 		ATimeNS: timestampNS(st.Atime), MTimeNS: timestampNS(st.Mtime),
 		CTimeNS: timestampNS(st.Ctime), BirthTimeNS: timestampNS(st.Btime),
 	}, nil
+}
+
+// newEncodeDevice is Linux's new_encode_dev() UAPI representation. It is not
+// the authority volume's st_dev; it encodes statx's rdev pair for the inode.
+func newEncodeDevice(major, minor uint32) uint32 {
+	return (minor & 0xff) | (major << 8) | ((minor &^ 0xff) << 12)
 }
 
 func timestampNS(ts unix.StatxTimestamp) int64 { return ts.Sec*1e9 + int64(ts.Nsec) }
@@ -866,14 +1013,8 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	if obj.kind != KindRegular && obj.kind != KindDirectory {
 		return Capability{}, ErrForbiddenType
 	}
-	// O_TRUNC changes EOF as part of open(2). It must share the exact inode
-	// mutation boundary with append's EOF check even when this capability is a
-	// hard-link alias or this session bypasses visibility coordination.
-	if flags.Truncate {
-		mutation := v.inodeMutationLock(obj.coordinate.Stable)
-		mutation.Lock()
-		defer mutation.Unlock()
-	}
+	// O_TRUNC is serialized by the authority's full-operation mutation lease,
+	// which remains held through post-state sampling and replay persistence.
 	// A description this authority created the inode with already carries the
 	// access the creating caller was granted, so it answers this open without
 	// re-deriving anything from the mode. Sync intent is retained logically on
@@ -950,9 +1091,10 @@ func (v *Volume) installHandle(res *resource, id Capability, kind Kind, flags Op
 		return fail(ErrStaleObject)
 	}
 	v.opens[openID] = &openFile{
-		res: res, read: flags.Read, write: flags.Write,
+		volume: v, res: res, read: flags.Read, write: flags.Write,
 		sync: flags.Sync, dataSync: flags.DataSync && !flags.Sync,
 		object: id, kind: kind, coordinate: obj.coordinate,
+		fsyncState: v.fsyncState(obj.coordinate.Stable),
 	}
 	return openID, nil
 }
@@ -968,7 +1110,9 @@ func (v *Volume) CloseOpen(id Capability) error {
 		return ErrStaleOpen
 	}
 	delete(v.opens, id)
-	return f.res.release()
+	result := f.res.release()
+	v.releaseFsyncState(f.fsyncState)
+	return result
 }
 
 // ReadAt reports (0, nil) for an empty destination. io.EOF is reserved for a
@@ -1029,6 +1173,9 @@ func (v *Volume) WriteAt(id Capability, src []byte, off int64) (int, error) {
 	if end <= current.Size {
 		n, err := unix.Pwrite(f.fd(), src, off)
 		mutation.RUnlock()
+		if n > 0 {
+			f.fsyncState.applied()
+		}
 		return n, err
 	}
 	mutation.RUnlock()
@@ -1039,7 +1186,11 @@ func (v *Volume) WriteAt(id Capability, src []byte, off int64) (int, error) {
 	// indivisible with those operations.
 	mutation.Lock()
 	defer mutation.Unlock()
-	return unix.Pwrite(f.fd(), src, off)
+	n, err := unix.Pwrite(f.fd(), src, off)
+	if n > 0 {
+		f.fsyncState.applied()
+	}
+	return n, err
 }
 
 // PinWriteTarget transfers one in-flight reference out of the handle table.
@@ -1053,7 +1204,14 @@ func (v *Volume) PinWriteTarget(id Capability) (WriteTarget, error) {
 		f.release()
 		return nil, syscall.EBADF
 	}
-	return &writeTarget{volume: v, res: f.res, coordinate: f.coordinate}, nil
+	if err := f.fsyncState.inspectWritePrivileges(f.fd(), v.inspectSecurityCapability); err != nil {
+		f.release()
+		return nil, err
+	}
+	return &writeTarget{
+		volume: v, res: f.res, coordinate: f.coordinate,
+		fsyncState: f.fsyncState,
+	}, nil
 }
 
 func (v *Volume) syncDescriptor(fd int, full, dataOnly bool) error {
@@ -1197,9 +1355,6 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 	if err := t.volume.Health(); err != nil {
 		return 0, 0, Attr{}, err
 	}
-	mutation := t.volume.inodeMutationLock(t.coordinate.Stable)
-	mutation.Lock()
-	defer mutation.Unlock()
 	before, err := statFD(t.res.fd)
 	if err != nil {
 		return 0, 0, Attr{}, err
@@ -1246,7 +1401,8 @@ func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uin
 		expectedPost = end
 	}
 	if dispatched {
-		if err := t.volume.removeWritePrivileges(t.res.fd, uint32(before.Mode), spec.KillPrivileges); err != nil {
+		t.fsyncState.applied()
+		if err := t.fsyncState.removeWritePrivileges(t.res.fd, uint32(before.Mode), spec.KillPrivileges, t.volume.removePinnedWritePrivileges); err != nil {
 			postApplyErr = err
 		}
 	}
@@ -1314,7 +1470,7 @@ func fallocateNeedsAlignment(mode uint32) bool {
 }
 
 // fallocateExpectedSize performs every authoritative-EOF-dependent check in
-// the same order as pinned Linux 6.12.100/XFS after alignment has been proven.
+// the same order as Linux XFS after alignment has been proven.
 // Universal offset+length/s_maxbytes validation happens before this helper.
 func fallocateExpectedSize(before uint64, spec FallocateSpec) (uint64, error) {
 	end := spec.Offset + spec.Length
@@ -1375,9 +1531,6 @@ func (v *Volume) Fallocate(id Capability, spec FallocateSpec) (Attr, error) {
 	if err := v.Health(); err != nil {
 		return Attr{}, err
 	}
-	mutation := v.inodeMutationLock(f.coordinate.Stable)
-	mutation.Lock()
-	defer mutation.Unlock()
 	before, err := statFD(f.fd())
 	if err != nil {
 		return Attr{}, err
@@ -1430,37 +1583,10 @@ func (v *Volume) Fallocate(id Capability, spec FallocateSpec) (Attr, error) {
 	return post, nil
 }
 
-func lockCopyMutation(v *Volume, source, destination [16]byte) func() {
-	sourceStripe := inodeMutationStripe(source)
-	destinationStripe := inodeMutationStripe(destination)
-	if sourceStripe == destinationStripe {
-		lock := &v.inodeMutation[sourceStripe]
-		lock.Lock()
-		return lock.Unlock
-	}
-	sourceLock := &v.inodeMutation[sourceStripe]
-	destinationLock := &v.inodeMutation[destinationStripe]
-	if sourceStripe < destinationStripe {
-		sourceLock.RLock()
-		destinationLock.Lock()
-		return func() {
-			destinationLock.Unlock()
-			sourceLock.RUnlock()
-		}
-	}
-	destinationLock.Lock()
-	sourceLock.RLock()
-	return func() {
-		sourceLock.RUnlock()
-		destinationLock.Unlock()
-	}
-}
-
 // CopyFileRange performs one server-side copy without a userspace splice or
-// payload round trip. The canonical lock order prevents reverse-direction
-// copies from deadlocking, while retaining a source read lock and destination
-// write lock ensures the bytes and exact post-size belong to one authority
-// ordering interval.
+// payload round trip. Its authority caller owns the canonical LockMutation set
+// for both resolved identities through this syscall and both post-state
+// samples, so the complete record belongs to one authority ordering interval.
 func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec) (uint64, Attr, error) {
 	if spec.Length == 0 || spec.InputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.InputOffset ||
 		spec.OutputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.OutputOffset ||
@@ -1483,8 +1609,6 @@ func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec)
 	if err := v.Health(); err != nil {
 		return 0, Attr{}, err
 	}
-	unlock := lockCopyMutation(v, source.coordinate.Stable, destination.coordinate.Stable)
-	defer unlock()
 	beforeSource, err := statFD(source.fd())
 	if err != nil {
 		return 0, Attr{}, err
@@ -1612,20 +1736,37 @@ func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec)
 // privilege-dependent mode-bit removal. SGID without group execute is the
 // mandatory-locking form and is deliberately retained, matching
 // setattr_should_drop_suidgid.
-func removeWritePrivileges(fd int, beforeMode uint32, killSUIDGID bool) error {
+func inspectSecurityCapability(fd int) (bool, error) {
 	// An unprivileged authority is intentionally able to own and mutate the
 	// volume without CAP_SETFCAP. Linux checks permission before existence for
 	// fremovexattr("security.capability"), so blindly removing an absent xattr
-	// returns EPERM and would terminal-fence every ordinary write. Probe for the
-	// capability under the same stable-inode writer lock first. A present file
-	// capability must still be removed successfully; failure remains a terminal
-	// security postcondition, never a best-effort omission.
+	// returns EPERM and would terminal-fence every ordinary write.
 	if _, err := unix.Fgetxattr(fd, "security.capability", nil); err != nil {
 		if !errors.Is(err, unix.ENODATA) {
-			return fmt.Errorf("%w: inspect security.capability: %w", ErrWritePrivilege, err)
+			return false, fmt.Errorf("%w: inspect security.capability: %w", ErrWritePrivilege, err)
 		}
-	} else if err := unix.Fremovexattr(fd, "security.capability"); err != nil && !errors.Is(err, unix.ENODATA) {
-		return fmt.Errorf("%w: remove security.capability: %w", ErrWritePrivilege, err)
+		return false, nil
+	}
+	return true, nil
+}
+
+func removeWritePrivileges(fd int, beforeMode uint32, killSUIDGID bool) error {
+	present, err := inspectSecurityCapability(fd)
+	if err != nil {
+		return err
+	}
+	return removeWritePrivilegesWithCapability(fd, beforeMode, killSUIDGID, &present)
+}
+
+func removeWritePrivilegesWithCapability(fd int, beforeMode uint32, killSUIDGID bool, securityCapability *bool) error {
+	if securityCapability == nil {
+		return fs.ErrInvalid
+	}
+	if *securityCapability {
+		if err := unix.Fremovexattr(fd, "security.capability"); err != nil && !errors.Is(err, unix.ENODATA) {
+			return fmt.Errorf("%w: remove security.capability: %w", ErrWritePrivilege, err)
+		}
+		*securityCapability = false
 	}
 	if !killSUIDGID {
 		return nil
@@ -1690,15 +1831,20 @@ func (v *Volume) Truncate(id Capability, size int64) error {
 }
 
 func (v *Volume) Fsync(id Capability, dataOnly bool) error {
+	_, err := v.FsyncCoalesced(id, dataOnly)
+	return err
+}
+
+// FsyncCoalesced returns the number of barrier requests served by the real
+// storage sync when this caller led a batch. Followers return zero. Every call
+// still waits for a completed sync whose generation and class cover it.
+func (v *Volume) FsyncCoalesced(id Capability, dataOnly bool) (int, error) {
 	f, err := v.holdOpen(id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.release()
-	if dataOnly {
-		return v.fdatasync(f.fd())
-	}
-	return v.fsync(f.fd())
+	return f.fsyncState.barrier(f.fd(), dataOnly, v.fsync, v.fdatasync)
 }
 
 func (v *Volume) GetattrOpen(id Capability) (Attr, error) {
