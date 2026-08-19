@@ -63,18 +63,13 @@ const routesDirMode fs.FileMode = 0o755
 // hidden, and neither side would see an error - so the disagreement has to be
 // caught where both sides are visible, which is here.
 type RoutesController struct {
-	Store    *xfsstore.Volume
-	Topology interface {
-		AcquireTopologyRead() *volumeserver.TopologyReadGuard
-		ExecuteTopologyExclusive(context.Context, func() (int, error)) (int, error)
-	}
-	// Visibility is the FSKit synchronous-repair coordinator exposed to handler
-	// construction. Route changes themselves use only clean mount absence and
-	// never publish repair events.
-	Visibility *volumeserver.VisibilityCoordinator
-	Mounts     *volumeserver.MountLifecycle
-	Leases     *volumeserver.LeaseCoordinator
-	Locks      *volumeserver.LockTable
+	Store *xfsstore.Volume
+	// Mounts owns both topology exclusion and the durable mount set. Route
+	// changes are admitted only at clean mount absence, and both halves of that
+	// decision have to come from the same record.
+	Mounts *volumeserver.MountLifecycle
+	Leases *volumeserver.LeaseCoordinator
+	Locks  *volumeserver.LockTable
 
 	// lockWaitAdmission is a topology transition gate only for blocking byte-
 	// range lock admission. A wait holds the read side just long enough to
@@ -98,24 +93,20 @@ type RoutesController struct {
 // filesystem request. The caller checks admission only after acquiring it and
 // releases it only after the request can no longer reach XFS.
 func (r *RoutesController) AcquireTopologyRead() *volumeserver.TopologyReadGuard {
-	return r.Topology.AcquireTopologyRead()
+	return r.Mounts.AcquireTopologyRead()
 }
 
-func NewRoutesController(store *xfsstore.Volume, topology interface {
-	AcquireTopologyRead() *volumeserver.TopologyReadGuard
-	ExecuteTopologyExclusive(context.Context, func() (int, error)) (int, error)
-}, locks *volumeserver.LockTable) (*RoutesController, error) {
-	if store == nil || topology == nil || locks == nil {
-		return nil, errors.New("authorityrpc: routing needs the volume store, topology coordinator, and epoch lock table")
+// newRoutesController is reached only through NewCoordination, which is what
+// makes every dependency below non-optional at every call site.
+func newRoutesController(store *xfsstore.Volume, mounts *volumeserver.MountLifecycle,
+	leases *volumeserver.LeaseCoordinator, locks *volumeserver.LockTable) (*RoutesController, error) {
+	if store == nil || mounts == nil || leases == nil || locks == nil {
+		return nil, errors.New("authorityrpc: routing needs the volume store, durable mount lifecycle, lease coordinator, and epoch lock table")
 	}
 	if routesDirName == "" || routesFileName == "" {
 		return nil, fmt.Errorf("authorityrpc: %q is not a two-component in-volume path", localroutes.ConfigPath)
 	}
-	routes := &RoutesController{Store: store, Topology: topology, Locks: locks}
-	if visibility, ok := topology.(*volumeserver.VisibilityCoordinator); ok {
-		routes.Visibility = visibility
-	}
-	return routes, nil
+	return &RoutesController{Store: store, Mounts: mounts, Leases: leases, Locks: locks}, nil
 }
 
 // Load reads the declaration out of this authority's own volume root and makes
@@ -248,16 +239,10 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		r.mu.Unlock()
 		return next, err
 	}
-	if r.Leases == nil {
-		return nil, errors.New("authorityrpc: routing needs the protocol-6 lease coordinator")
-	}
-	acknowledged, err := r.Topology.ExecuteTopologyExclusive(ctx, func() (int, error) {
+	acknowledged, err := r.Mounts.ExecuteTopologyExclusive(ctx, func() (int, error) {
 		shouldApply, checkErr := check()
 		if checkErr != nil || !shouldApply {
 			return 0, checkErr
-		}
-		if r.Mounts == nil {
-			return 0, errors.New("authorityrpc: routing needs the protocol-6 durable mount lifecycle")
 		}
 		if cleanErr := r.Mounts.RequireCleanRouteAbsence(); cleanErr != nil {
 			return 0, cleanErr

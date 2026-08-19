@@ -142,25 +142,13 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	membership := &detachMembership{}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: membership, Fencer: runtime,
-		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
-		Membership: membership, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	h := testVolumeHandler()
 	h.Store = &resourceAdmissionFaultStore{}
 	h.Runtime = runtime
 	h.Authorizer = allowAuthorizer{access: volumeserver.AccessRead}
-	h.Visibility, h.Lifecycle = visibility, lifecycle
-	h.Routes = &RoutesController{Topology: lifecycle, Mounts: lifecycle, Leases: h.Leases, Visibility: visibility, loaded: true}
+	coordination := loadedCoordinationFor("", runtime, membership, 64)
+	coordination.Bind(h)
+	visibility, lifecycle := coordination.Visibility, coordination.Lifecycle
 
 	peers := []volumeserver.PeerIdentity{{0x31}, {0x32}, {0x33}}
 	credentials := make([]volumeserver.SessionCredential, len(peers))
@@ -1975,19 +1963,9 @@ func resourceAdmissionRequestHarnessForProfile(
 	if err != nil {
 		t.Fatal(err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
-		MaxCachedNameCapacity: 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	h := testVolumeHandler()
-	routes := &RoutesController{
-		Topology: h.Lifecycle, Mounts: h.Lifecycle, Leases: h.Leases,
-		Visibility: visibility, loaded: true, revision: routesRevisionOf(""),
-	}
-	h.Store, h.Runtime, h.Authorizer, h.Routes, h.Visibility = store, runtime, allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}, routes, visibility
+	loadedCoordinationFor("", noopFencer{}, noopMembership{}, 16).Bind(h)
+	h.Store, h.Runtime, h.Authorizer = store, runtime, allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
 	h.MaxItemsPerSession, h.MaxOpensPerSession = maxItems, maxOpens
 	h.MaxItems, h.MaxOpens = maxItems, maxOpens
 	root := xfsstore.Capability{0x72}
@@ -2012,7 +1990,7 @@ func resourceAdmissionRequestHarnessForProfile(
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := visibility.Register(cred.ID, volumeserver.CoherenceStrict, terminal, commitment); err != nil {
+		if err := h.Visibility.Register(cred.ID, volumeserver.CoherenceStrict, terminal, commitment); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2919,31 +2897,15 @@ func newProtocol5Handler(t *testing.T, membership volumeserver.DurableVisibility
 	if membership == nil {
 		membership = noopMembership{}
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: membership, Fencer: runtime,
-		MaxCachedNameCapacity: 1024, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
-		Membership: membership, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	authorizer := &countingAuthorizer{
 		access:   volumeserver.AccessRead | volumeserver.AccessWrite,
 		deadline: time.Now().Add(time.Hour).Round(0),
 	}
 	h := testVolumeHandler()
-	routes := &RoutesController{
-		Topology: lifecycle, Mounts: lifecycle, Leases: h.Leases,
-		Visibility: visibility, loaded: true, revision: routesRevisionOf(""),
-	}
-	h.Store, h.Runtime, h.Authorizer, h.Routes, h.Visibility, h.Lifecycle = &resourceAdmissionFaultStore{}, runtime, authorizer, routes, visibility, lifecycle
+	loadedCoordinationFor("", runtime, membership, 1024).Bind(h)
+	h.Store, h.Runtime, h.Authorizer = &resourceAdmissionFaultStore{}, runtime, authorizer
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{0xA5})
-	return h, ctx, authorizer, routes
+	return h, ctx, authorizer, h.Routes
 }
 
 func protocol5AttachRequest(id uint64) *authoritypb.Request {
@@ -3647,8 +3609,7 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	h.Store = store
 	h.Runtime = runtime
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
-	h.Routes = testRoutesControllerWithFencer(t, store, runtime)
-	h.Visibility = h.Routes.Visibility
+	testCoordinationWithFencer(t, store, runtime).Bind(h)
 	h.MaxItemsPerSession, h.MaxOpensPerSession = 1024, 1024
 	h.MaxItems, h.MaxOpens = 8192, 8192
 	h.MaxRetainedReplyBytes = 8 << 20
@@ -3660,7 +3621,7 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
 		FskitCachedNameCapacity: 64,
 		FskitRepairBudgetMillis: 1000,
-		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_LOCKLESS_EXPIRATION,
+		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED,
 	})
 	var sessionID volumeserver.SessionID
 	copy(sessionID[:], proof.GetId())
@@ -3748,8 +3709,7 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	h.Store = store
 	h.Runtime = runtime
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
-	h.Routes = testRoutesControllerWithFencer(t, store, runtime)
-	h.Visibility = h.Routes.Visibility
+	testCoordinationWithFencer(t, store, runtime).Bind(h)
 	h.MaxItemsPerSession, h.MaxOpensPerSession = 1024, 1024
 	h.MaxItems, h.MaxOpens = 8192, 8192
 	h.MaxRetainedReplyBytes = 8 << 20

@@ -36,48 +36,37 @@ func emptyRoutesRevision() []byte {
 	return append([]byte(nil), revision[:]...)
 }
 
-// testRoutesController builds a controller over a real volume, for the
-// privileged end-to-end test.
-func testRoutesController(t *testing.T, store *xfsstore.Volume) *RoutesController {
-	return testRoutesControllerWithFencer(t, store, noopFencer{})
+// testCoordination assembles a volume's coordination over a real volume, for
+// the privileged end-to-end tests. It is the same constructor production uses,
+// so a fixture can never run against a partially wired authority.
+func testCoordination(t *testing.T, store *xfsstore.Volume) *Coordination {
+	return testCoordinationWithFencer(t, store, noopFencer{})
 }
 
-func testRoutesControllerWithFencer(t *testing.T, store *xfsstore.Volume, fencer volumeserver.SessionFencer) *RoutesController {
+func testCoordinationWithFencer(t *testing.T, store *xfsstore.Volume, fencer volumeserver.SessionFencer) *Coordination {
 	t.Helper()
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: fencer,
-		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
+	coordination, err := newTestCoordination(store, fencer)
 	if err != nil {
 		t.Fatal(err)
 	}
-	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
-		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	return coordination
+}
+
+func newTestCoordination(store *xfsstore.Volume, fencer volumeserver.SessionFencer) (*Coordination, error) {
 	locks := volumeserver.NewLockTable(1024, 1024, time.Now)
 	if authority, ok := fencer.(*volumeserver.Authority); ok {
 		locks = authority.Locks()
 	}
-	routes, err := NewRoutesController(store, lifecycle, locks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
-		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384, PriorGrantsFenced: true, Fencer: fencer,
+	return NewCoordination(CoordinationConfig{
+		Store: store, Fencer: fencer, Locks: locks, Membership: noopMembership{},
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute,
+		CacheLeaseTTL: time.Second, MaxCacheLeasesPerSession: 4096, MaxCacheLeases: 16384,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	routes.Leases = leases
-	routes.Mounts = lifecycle
-	routes.Visibility = visibility
-	if err := routes.Load(); err != nil {
-		t.Fatal(err)
-	}
-	return routes
+}
+
+func testRoutesController(t *testing.T, store *xfsstore.Volume) *RoutesController {
+	return testCoordination(t, store).Routes
 }
 
 type noopMembership struct{}
@@ -136,30 +125,46 @@ func TestRouteLockWaitAdmissionCannotSlipPastTransition(t *testing.T) {
 	}
 }
 
-// loadedRoutes is a controller whose active revision is set directly. Every
+// loadedCoordination is an assembly whose active revision is set directly. Every
 // check below runs before any storage access - a routing disagreement is
 // decided from two digests - so the tests that exercise those checks give the
 // handler a store it provably never reaches rather than a provisioned XFS
 // volume they do not need.
-func loadedRoutes(rules string) *RoutesController {
+func loadedCoordination(rules string) *Coordination {
+	return loadedCoordinationFor(rules, noopFencer{}, noopMembership{}, 1<<16)
+}
+
+func loadedCoordinationFor(rules string, fencer volumeserver.SessionFencer,
+	membership volumeserver.DurableVisibilityMembership, cachedNames uint64) *Coordination {
 	parsed, err := localroutes.Parse([]byte(rules))
 	if err != nil {
 		panic(err)
 	}
 	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
-		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ExternalMembership: true, Fencer: fencer,
+		MaxCachedNameCapacity: cachedNames, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
 	})
 	if err != nil {
 		panic(err)
 	}
 	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
-		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+		Membership: membership, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
 	})
 	if err != nil {
 		panic(err)
 	}
-	return &RoutesController{Topology: lifecycle, Mounts: lifecycle, Visibility: visibility, loaded: true, revision: parsed.Revision(), canonical: parsed.Canonical()}
+	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
+		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384,
+		PriorGrantsFenced: true, Fencer: fencer,
+	})
+	if err != nil {
+		panic(err)
+	}
+	routes := &RoutesController{
+		Mounts: lifecycle, Leases: leases, Locks: volumeserver.NewLockTable(1024, 1024, time.Now),
+		loaded: true, revision: parsed.Revision(), canonical: parsed.Canonical(),
+	}
+	return &Coordination{Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes}
 }
 
 func routesRevisionOf(rules string) [32]byte {
@@ -179,8 +184,7 @@ func TestAttachWithAMismatchedRoutingRevisionNamesBothRevisions(t *testing.T) {
 	h := testVolumeHandler()
 	h.Store = &resourceAdmissionFaultStore{}
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
-	h.Routes = loadedRoutes("node_modules\n")
-	h.Visibility = h.Routes.Visibility
+	loadedCoordination("node_modules\n").Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -260,7 +264,7 @@ func TestStaleRoutingRevisionRefusesEveryLaterRequestActionably(t *testing.T) {
 	h := testVolumeHandler()
 	h.Store = &resourceAdmissionFaultStore{}
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
-	h.Routes = loadedRoutes("node_modules\n")
+	loadedCoordination("node_modules\n").Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -333,7 +337,7 @@ func TestFskitRepairControlIsNotRoutesGated(t *testing.T) {
 	h := testVolumeHandler()
 	h.Store = &xfsstore.Volume{}
 	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
-	h.Routes = loadedRoutes("node_modules\n")
+	loadedCoordination("node_modules\n").Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -602,21 +606,7 @@ func testGitIndex(paths ...string) []byte {
 // against a real project directory and there is nothing to learn from faking it.
 func TestRoutesControllerRoundTripsThroughTheVolumeOnXFS(t *testing.T) {
 	store, _ := xfsTestVolume(t)
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
-		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	locks := volumeserver.NewLockTable(1024, 1024, time.Now)
-	routes, err := NewRoutesController(store, visibility, locks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := routes.Load(); err != nil {
-		t.Fatal(err)
-	}
+	routes := testRoutesController(t, store)
 	empty, err := routes.Revision()
 	if err != nil {
 		t.Fatal(err)
@@ -638,13 +628,7 @@ func TestRoutesControllerRoundTripsThroughTheVolumeOnXFS(t *testing.T) {
 	// A second controller over the same volume is a restarted authority epoch.
 	// It has to arrive at exactly the same revision, or a mount admitted before
 	// the restart and one admitted after would disagree.
-	restarted, err := NewRoutesController(store, visibility, locks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := restarted.Load(); err != nil {
-		t.Fatalf("reload after apply: %v", err)
-	}
+	restarted := testRoutesController(t, store)
 	reloaded, err := restarted.Revision()
 	if err != nil {
 		t.Fatal(err)
@@ -735,23 +719,17 @@ func TestRoutesControllerTreatsRenameAsPublishedWhenDirectorySyncFails(t *testin
 	if !errors.Is(err, xfsstore.ErrOutcomeUncertain) {
 		t.Fatalf("post-rename sync failure = %v, want ErrOutcomeUncertain", err)
 	}
-	var barrier *volumeserver.VisibilityBarrierError
-	if !errors.As(err, &barrier) || !barrier.Applied {
-		t.Fatalf("post-rename sync failure = %v, want applied visibility-barrier error", err)
-	}
+	// A protocol-6 route change runs only at clean mount absence, so there is no
+	// barrier audience to carry an "applied anyway" flag: the durable commit's own
+	// uncertainty is the whole error surface, and the active revision below is
+	// what an operator re-reads to learn the change took.
 	if active, err := routes.Revision(); err != nil || active != second {
 		t.Fatalf("in-memory active revision = %x, %v; want %x", active, err, second)
 	}
 
 	// Rename publication is immediately visible even though its durability is
 	// uncertain. A fresh controller must not reconstruct the old revision.
-	restarted, err := NewRoutesController(store, routes.Visibility, routes.Locks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := restarted.Load(); err != nil {
-		t.Fatalf("load after published rename: %v", err)
-	}
+	restarted := testRoutesController(t, store)
 	if active, err := restarted.Revision(); err != nil || active != second {
 		t.Fatalf("reloaded active revision = %x, %v; want %x", active, err, second)
 	}
@@ -772,11 +750,7 @@ func TestRoutesControllerRefusesAProtectedDeclarationWithAnOutsideHardLink(t *te
 		t.Fatalf("create outside hard-link alias: %v", err)
 	}
 
-	restarted, err := NewRoutesController(store, routes.Visibility, routes.Locks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := restarted.Load(); err == nil || !strings.Contains(err.Error(), "exactly one link") {
+	if _, err := newTestCoordination(store, noopFencer{}); err == nil || !strings.Contains(err.Error(), "exactly one link") {
 		t.Fatalf("load with outside hard link = %v, want link-count refusal", err)
 	}
 }
@@ -929,8 +903,7 @@ func TestAttachRefusedForRoutingLeavesTheCapabilityUnspent(t *testing.T) {
 	h := testVolumeHandler()
 	h.Store = &xfsstore.Volume{}
 	h.Authorizer = authorizer
-	h.Routes = loadedRoutes("node_modules\n")
-	h.Visibility = h.Routes.Visibility
+	loadedCoordination("node_modules\n").Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -1004,8 +977,7 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 			h := testVolumeHandler()
 			h.Store = &resourceAdmissionFaultStore{}
 			h.Authorizer = authorizer
-			h.Routes = loadedRoutes("")
-			h.Visibility = h.Routes.Visibility
+			loadedCoordination("").Bind(h)
 			runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 				SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 			})
@@ -1038,12 +1010,12 @@ func TestAttachPureValidationLeavesTheCapabilityUnspentForRetry(t *testing.T) {
 }
 
 func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T) {
-	routes := loadedRoutes("")
+	coordination := loadedCoordination("")
 	authorizer := blockingAuthorizer{entered: make(chan struct{}), release: make(chan struct{})}
 	h := testVolumeHandler()
 	h.Store = &resourceAdmissionFaultStore{}
 	h.Authorizer = authorizer
-	h.Routes, h.Visibility = routes, routes.Visibility
+	coordination.Bind(h)
 	runtime, err := volumeserver.New("routes-volume", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -1074,7 +1046,7 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 	checked := make(chan struct{})
 	writerDone := make(chan error, 1)
 	go func() {
-		_, err := routes.Topology.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
+		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
 			close(checked)
 			return 0, nil
 		})
@@ -1102,9 +1074,9 @@ func TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes(t *testing.T)
 }
 
 func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testing.T) {
-	routes := loadedRoutes("")
+	coordination := loadedCoordination("")
 	h := testVolumeHandler()
-	h.Routes, h.Visibility = routes, routes.Visibility
+	coordination.Bind(h)
 	id := volumeserver.SessionID{1}
 	revision := routesRevisionOf("")
 	if err := h.startSessionResources(id, xfsstore.Capability{1}, 2, revision, volumeserver.CoherenceStrict); err != nil {
@@ -1117,7 +1089,7 @@ func TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion(t *testin
 	checked := make(chan struct{})
 	writerDone := make(chan error, 1)
 	go func() {
-		_, err := routes.Topology.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
+		_, err := coordination.Lifecycle.ExecuteTopologyExclusive(context.Background(), func() (int, error) {
 			close(checked)
 			return 0, nil
 		})

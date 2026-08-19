@@ -158,20 +158,16 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	if err != nil {
 		t.Fatalf("create authority epoch: %v", err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noMembership{}, Fencer: authority,
-		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute, MaxClockSkew: time.Minute,
+	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
+		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: noMembership{},
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
+		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
+		CacheLeaseTTL: volumeserver.Protocol6MaxLeaseTTL, MaxCacheLeasesPerSession: 65536, MaxCacheLeases: 1 << 20,
 	})
 	if err != nil {
-		t.Fatalf("create visibility coordinator: %v", err)
+		t.Fatalf("assemble authority coordination: %v", err)
 	}
-	routes, err := authorityrpc.NewRoutesController(store, visibility, authority.Locks())
-	if err != nil {
-		t.Fatalf("create routing controller: %v", err)
-	}
-	if err := routes.Load(); err != nil {
-		t.Fatalf("load routing: %v", err)
-	}
+	routes := coordination.Routes
 	active, err := routes.Revision()
 	if err != nil {
 		t.Fatalf("read active routing revision: %v", err)
@@ -201,7 +197,7 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	f.capability = token
 
 	handler := &authorityrpc.VolumeHandler{
-		Store: store, Runtime: authority, Visibility: visibility, Routes: routes,
+		Store: store, Runtime: authority,
 		Authorizer: &volumecap.Authorizer{
 			PublicKey: public, MaxLifetime: 15 * time.Minute, MaxRetainedNonces: 64,
 		},
@@ -217,6 +213,7 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		WriteAbsoluteTimeout:          30 * time.Minute,
 		TerminalDeliveryTimeout:       45 * time.Second,
 	}
+	coordination.Bind(handler)
 	f.attaches = &attachCounter{inner: handler}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

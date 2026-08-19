@@ -265,45 +265,25 @@ func run() error {
 	for _, cleared := range membership.ClearedByOperatorAssertion() {
 		fmt.Fprintf(os.Stderr, "portablefs-authority: operator asserted prior strict mount %x fenced; cleared from durable membership for volume %s\n", cleared, o.volumeID)
 	}
-	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
-		Membership: membership, Prior: priorDisposition, ClockSkew: o.visibilityClockSkew,
-	})
-	if err != nil {
-		return err
-	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: priorDisposition, ExternalMembership: true, Fencer: runtime,
-		MaxCachedNameCapacity: o.maxCachedNameCapacity, MaxRepairBudget: o.maxRepairBudget,
-		MaxClockSkew: o.visibilityClockSkew, OnBarrier: metrics.ObserveVisibilityBarrier,
-	})
-	if err != nil {
-		return err
-	}
-	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
-		TTL: o.cacheLeaseTTL, RecallBudget: o.maxRepairBudget, StartupGrace: volumeserver.Protocol6MaxLeaseTTL,
-		PriorGrantsFenced: priorDisposition == volumeserver.PriorEpochStrictMountsFenced,
-		MaxPerHolder:      uint32(o.maxCacheLeasesPerSession), MaxTotal: uint64(o.maxCacheLeases),
-		Fencer: runtime, OnRecall: metrics.ObserveVisibilityBarrier,
-	})
-	if err != nil {
-		return err
-	}
 	// The authority is the source of truth for the machine-local routing
-	// topology, so it reads the declaration out of its own volume root before it
-	// serves anything. A volume with no loaded revision cannot tell an agreeing
-	// mount from a disagreeing one, so a declaration that will not parse stops
-	// the process here rather than admitting mounts against a topology this
-	// volume does not have.
-	routes, err := authorityrpc.NewRoutesController(store, lifecycle, runtime.Locks())
+	// topology, so assembling coordination reads the declaration out of its own
+	// volume root before it serves anything. A volume with no loaded revision
+	// cannot tell an agreeing mount from a disagreeing one, so a declaration that
+	// will not parse stops the process here rather than admitting mounts against
+	// a topology this volume does not have.
+	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
+		Store: store, Fencer: runtime, Locks: runtime.Locks(),
+		Membership: membership, Prior: priorDisposition, ClockSkew: o.visibilityClockSkew,
+		MaxCachedNameCapacity: o.maxCachedNameCapacity, MaxRepairBudget: o.maxRepairBudget,
+		CacheLeaseTTL:            o.cacheLeaseTTL,
+		MaxCacheLeasesPerSession: uint32(o.maxCacheLeasesPerSession),
+		MaxCacheLeases:           uint64(o.maxCacheLeases),
+		OnBarrier:                metrics.ObserveVisibilityBarrier,
+	})
 	if err != nil {
 		return err
 	}
-	routes.Leases = leases
-	routes.Mounts = lifecycle
-	if err := routes.Load(); err != nil {
-		return fmt.Errorf("load machine-local routing declaration: %w", err)
-	}
-	if revision, err := routes.Revision(); err == nil {
+	if revision, err := coordination.Routes.Revision(); err == nil {
 		fmt.Fprintf(os.Stderr, "portablefs-authority: volume %s routing revision %x\n", o.volumeID, revision)
 	}
 	publicKey, err := readEd25519PublicKey(o.capabilityPublicKey)
@@ -340,7 +320,6 @@ func run() error {
 	maxFrame, maxInFlight := uint32(o.maxFrame), o.maxInFlight
 	handler := &authorityrpc.VolumeHandler{
 		Store: store, Runtime: runtime, Authorizer: authorizer, Metrics: metrics,
-		Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes,
 		MaxFrame: maxFrame, MaxRead: uint32(o.maxRead), MaxWrite: uint32(o.maxWrite), MaxInFlight: uint32(maxInFlight),
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),
@@ -373,6 +352,7 @@ func run() error {
 			stop()
 		},
 	}
+	coordination.Bind(handler)
 	server := &authorityrpc.Server{
 		Handler: handler, Metrics: metrics, MaxFrame: maxFrame, MaxInFlight: maxInFlight, MaxConnections: o.maxConnections,
 		MaxFrameBytesInFlight: o.maxFrameBytesInFlight,

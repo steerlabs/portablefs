@@ -120,6 +120,10 @@ const (
 	// The strict cache commitment every mount in this fixture declares.
 	integrationCachedNames  = 4096
 	integrationRepairBudget = 20 * time.Second
+	// The protocol-6 cache-authority bounds, at the production defaults.
+	integrationCacheLeaseTTL         = volumeserver.Protocol6MaxLeaseTTL
+	integrationCacheLeasesPerSession = 65536
+	integrationCacheLeases           = 1 << 20
 
 	// Match the production authority's bounded standard-WRITE admission
 	// profile without making the integration fixture a weaker peer than the
@@ -441,26 +445,22 @@ func (f *integrationFixture) start() {
 	}
 	f.listener = listener
 	f.membership = newRecordingMembership()
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: f.membership, Fencer: authority,
-		MaxCachedNameCapacity: integrationCachedNames, MaxRepairBudget: time.Minute,
-		MaxClockSkew: time.Minute, Now: f.now,
-	})
-	if err != nil {
-		t.Fatalf("create visibility coordinator: %v", err)
-	}
 	// The authority is the source of truth for the volume's machine-local
 	// routing revision, and it refuses every mount whose declared revision is
 	// not the active one. The fixture therefore installs the declaration these
-	// mounts are about to agree with, through the same barrier a live operator's
-	// change would use.
-	routes, err := authorityrpc.NewRoutesController(store, visibility, authority.Locks())
+	// mounts are about to agree with, through the same assembly and the same
+	// barrier a live operator's change would use.
+	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
+		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: f.membership,
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
+		MaxCachedNameCapacity: integrationCachedNames, MaxRepairBudget: time.Minute,
+		CacheLeaseTTL: integrationCacheLeaseTTL, MaxCacheLeasesPerSession: integrationCacheLeasesPerSession,
+		MaxCacheLeases: integrationCacheLeases, Now: f.now,
+	})
 	if err != nil {
-		t.Fatalf("create routing controller: %v", err)
+		t.Fatalf("assemble authority coordination: %v", err)
 	}
-	if err := routes.Load(); err != nil {
-		t.Fatalf("load the volume's routing declaration: %v", err)
-	}
+	routes := coordination.Routes
 	active, err := routes.Revision()
 	if err != nil {
 		t.Fatalf("read the active routing revision: %v", err)
@@ -470,7 +470,7 @@ func (f *integrationFixture) start() {
 	}
 	f.routes = routes
 	handler := &authorityrpc.VolumeHandler{
-		Store: store, Runtime: authority, Authorizer: integrationAuthorizer{now: f.now}, Visibility: visibility, Routes: routes,
+		Store: store, Runtime: authority, Authorizer: integrationAuthorizer{now: f.now},
 		MaxFrame: integrationMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight:        integrationServerInFlight,
 		MaxItemsPerSession: 4096, MaxOpensPerSession: 4096, MaxItems: 16384, MaxOpens: 16384,
@@ -484,6 +484,7 @@ func (f *integrationFixture) start() {
 		WriteAbsoluteTimeout:          integrationWriteAbsoluteTimeout,
 		TerminalDeliveryTimeout:       integrationTerminalDeliveryTimeout,
 	}
+	coordination.Bind(handler)
 	f.counter = &countingHandler{inner: handler}
 	ctx, cancel := context.WithCancel(context.Background())
 	f.stopServe, f.served, f.stopped = cancel, make(chan error, 1), false
