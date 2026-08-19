@@ -124,9 +124,10 @@ Exit status is zero only when every case reached its **declared** status.
 ### `same_dir_concurrent_mutations` permits no fencing
 
 Two mounts mutating one directory is the directory-inode-lock contention case.
-The frontend reports a blocked repair only when its exact cached-binding and
-parked-directory registries prove the cycle, while racing reads leave Stabilize
-at apply rather than holding the directory lock until COMPLETE. The case still
+Every phase a frontend is delivered is one it repairs in place and
+acknowledges -- there is no report by which a frontend can decline one -- while
+racing reads leave Stabilize at apply rather than holding the directory lock
+until COMPLETE. The case still
 records how many participants were fenced (observed as `ENOTCONN` from the
 revoked mount), but the allowed count is zero: fencing either healthy mount is a
 regression.
