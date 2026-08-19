@@ -10,8 +10,46 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-19
+
+This release replaces the private-kernel architecture with one that runs on a
+stock Linux kernel. Every guarantee PortableFS makes is now made against
+upstream FUSE 7.31+ and macOS FSKit, with no patched kernel, no private ABI,
+and no capability a distribution does not already ship. Where that costs a
+guarantee, the cost is written down rather than papered over.
+
 ### Added
 
+- Protocol 6: one lease contract (N/A/D/E) over stock FUSE, replacing the
+  patched-kernel publication scopes. A mount declares exactly one frontend
+  profile at Attach — `LINUX_LEASES` for the Linux FUSE frontend or
+  `FSKIT_SYNC_REPAIR` for the macOS synchronous-repair frontend — and the
+  authority refuses any request that does not belong to the declared profile.
+  There is no third, silently weaker profile.
+- `portablefs mount-check --probe-mount`. It installs one real throwaway FUSE
+  mount on a private temporary directory, completes the kernel INIT handshake
+  with the client's own mount options, verifies the capabilities the coherence
+  contract requires, and unmounts. It is the only check that a client which can
+  never complete FUSE INIT cannot pass; the device node existing, the device
+  opening, `CAP_SYS_ADMIN` being held, and an installed helper are all equally
+  true of such a client.
+- `deploy/opensteer/staging-qualification.sh`: the real-workload qualification
+  corpus, run against a live mount on a staging cell. Serial and `tee -a`
+  appends, a git repository created and `fsck`-verified on the mount, two
+  concurrent `O_APPEND` writers on one file, several readers against a file
+  another process rewrites, and a durability check across unmount and remount.
+  The hot-file phase runs the rewrite twice, because only one shape of it lets
+  a reader demand an all-or-nothing view: under atomic replacement a mixed read
+  is wrong data and fails, while under in-place rewrite — which is not atomic
+  on any POSIX filesystem — a torn read is counted rather than failed and only
+  a malformed line or an invented generation fails. A stale-but-consistent
+  observation passes in both: that is the documented §7.3b residual, and the
+  phase reports how stale readers got instead of failing on it. The script also
+  names what to watch on the authority while it runs: RecallBudget-exhaustion
+  fences and uncertain-outcome revocations.
+- A full mode for the local gate. `scripts/verify-local.sh --full` (or
+  `VERIFY_LOCAL_FULL=1`) runs both privileged real-mount Docker suites after
+  everything else.
 - Writable `O_APPEND` on the stock-FUSE Linux profile, and it is exact across
   mounts. The frontend forwards the writing description's append intent and the
   authority places the payload at the object's true EOF inside the per-inode
@@ -150,6 +188,36 @@ this file is the human-curated summary.
   reserved rather than reused, on both the authority protocol and `pfslocal`.
   Every phase a frontend is now delivered is one it repairs in place and
   acknowledges.
+- The patched Linux 6.12.100 series and its private ABI, in full: the
+  `kernel/linux-6.12.100-portablefs-append` patch series, its qualification
+  receipts and test suite, the one-shot write path built on it, the strict
+  write transaction it required, and the `LOCKLESS_EXPIRATION` and
+  `PARENT_EXCLUSIVE` namespace-repair models. Nothing in the product depends on
+  a kernel a distribution does not ship. The patch series is only in git
+  history; the retired identifiers stay reserved in the wire schema and are
+  refused everywhere else by `scripts/verify-local.sh`.
+- The `mutation_order` ordering shim in the volume server and the retired
+  protocol-5 FSKit qualification registry fixture. The runtime admission path
+  is now the only admission path in production and in tests.
+
+### Deploy
+
+- The bounded read-only files gateway (`cmd/portablefs-files`, `readonlyfs/`)
+  is protocol 6. It is not a mount: it holds no kernel namespace, no page
+  cache, and no lease state, so it declares the synchronous-repair profile —
+  the one protocol-6 contract that grants no cache leases — and discharges
+  every repair phase immediately. Declaring the Linux lease profile would claim
+  recall participation it cannot honor and would stall writers behind a reader
+  that never caches.
+- The candidate E2B template smoke now proves the shipped client can complete a
+  kernel FUSE INIT handshake, and says plainly what it does and does not prove.
+  It runs with no manager and no authority, so it proves nothing about the
+  authority, the protocol, coherence, or any workload; full qualification is
+  the staging corpus above. `docs/opensteer-production-deployment.md` carries
+  the same statement.
+- `scripts/build-hosted-linux-release.sh` builds every binary the systemd units
+  and deploy scripts reference, including `bin/portablefs`, and its output
+  membership matches `deploy/gcp/verify-hosted-release.sh` exactly.
 
 ## [0.2.6] - 2026-08-12
 
