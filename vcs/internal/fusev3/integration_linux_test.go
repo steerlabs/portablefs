@@ -1616,9 +1616,11 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	var created *os.File
 	createRPCs := measure("create plus child/parent stat", func() {
 		var err error
-		// O_EXCL deliberately revalidates even a warm negative dentry before
-		// CREATE. This assertion measures metadata requests after the mutation,
-		// so use the ordinary create path whose warmed absence is reusable.
+		// Linux always performs one fresh LOOKUP for a negative dentry before
+		// CREATE, including the ordinary non-exclusive path. It precedes the
+		// mutation and therefore says nothing about post-state completeness; the
+		// child and parent stats below are the follow-up requests this assertion
+		// requires the CREATE post-state to eliminate.
 		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
 			t.Fatalf("create: %v", err)
@@ -1630,7 +1632,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after create: %v", err)
 		}
 	})
-	requireCounts("create plus child/parent stat", createRPCs, counts{create: 1})
+	requireCounts("create plus child/parent stat", createRPCs, counts{lookup: 1, create: 1})
 
 	payload := []byte("exact post-state")
 	writeRPCs := measure("write plus warm fstat", func() {
