@@ -29,6 +29,26 @@
 #   read from the environment only, never from a flag, so it never appears in
 #   process arguments.
 #
+#   PHASE 9 NEEDS A SECOND CAPABILITY. An initial grant is single-use and
+#   creates a session at authorization sequence zero (docs/hosted-control-plane.md,
+#   "Automatic long-lived mounts"), so the remount that phase 9 exists to
+#   perform CANNOT reuse PORTABLEFS_MOUNT_TOKEN: the authority refuses the
+#   second attach with errno 1. Supply one of these, or phase 9 is skipped
+#   loudly and the run is not durability-qualified:
+#
+#     --mount-token-command CMD   run CMD and read a freshly minted capability
+#                                 from its stdout, each time one is needed. CMD
+#                                 is passed to `sh -c` with no arguments and
+#                                 must print the capability and nothing else.
+#                                 Preferred: a grant is short-lived, and a token
+#                                 minted before phase 1 can expire before phase
+#                                 9 reaches it.
+#     PORTABLEFS_REMOUNT_TOKEN    a second capability, pre-minted. Environment
+#                                 only, for the same reason as the first.
+#
+#   The command appears in process arguments; its output does not. Do not put a
+#   capability in CMD itself.
+#
 #   Optional hosted enrollment group, all-or-none, passed through to
 #   `portablefs mount` unchanged:
 #     --manager-url --manager-server-name --manager-ca
@@ -65,6 +85,7 @@ rounds=200
 hot_readers=4
 hot_rounds=200
 keep_mount=0
+mount_token_command=
 mount_args=()
 
 while (( $# )); do
@@ -75,6 +96,7 @@ while (( $# )); do
     --hot-file-readers) hot_readers=$2; shift 2 ;;
     --hot-file-rounds) hot_rounds=$2; shift 2 ;;
     --keep-mount) keep_mount=1; shift ;;
+    --mount-token-command) mount_token_command=$2; shift 2 ;;
     --volume-id) volume_id=$2; shift 2 ;;
     --addr|--data-plane-transport|--data-plane-server-name|--data-plane-ca|\
     --client-cert|--client-key|--manager-url|--manager-server-name|--manager-ca|\
@@ -82,7 +104,9 @@ while (( $# )); do
     --authority-generation|--auth-expires-at-ms)
       mount_args+=("$1" "$2"); shift 2 ;;
     --no-local-dirs) mount_args+=("$1"); shift ;;
-    -h|--help) sed -n '2,53p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # The header is printed to its own end rather than to a line number, so
+    # documenting a new option cannot silently truncate --help.
+    -h|--help) awk 'NR>1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) usage "unknown argument: $1" ;;
   esac
 done
@@ -90,6 +114,32 @@ done
 [[ -n $volume_id ]] || usage "--volume-id is required"
 [[ -x $portablefs ]] || usage "client binary is not executable: $portablefs"
 [[ -n ${PORTABLEFS_MOUNT_TOKEN:-} ]] || usage "PORTABLEFS_MOUNT_TOKEN must be set"
+if [[ -n $mount_token_command && -n ${PORTABLEFS_REMOUNT_TOKEN:-} ]]; then
+  usage "--mount-token-command and PORTABLEFS_REMOUNT_TOKEN are alternatives; set exactly one"
+fi
+
+# next_mount_token prints the capability the NEXT attach must use. Every attach
+# consumes one: an initial grant is single-use and lands the session at
+# authorization sequence zero, so reusing one is refused with errno 1 rather
+# than tolerated. Phase 9 is the only phase that attaches twice.
+next_mount_token() {
+  if [[ -n $mount_token_command ]]; then
+    local minted
+    minted=$(sh -c "$mount_token_command") ||
+      fail "--mount-token-command exited nonzero; it must print one freshly minted capability"
+    # A mint command that prints nothing has failed in the one way that would
+    # otherwise present as an authorization error a phase later.
+    [[ -n $minted ]] || fail "--mount-token-command printed no capability"
+    printf '%s' "$minted"
+    return 0
+  fi
+  printf '%s' "${PORTABLEFS_REMOUNT_TOKEN:-}"
+}
+
+remount_capable=0
+if [[ -n $mount_token_command || -n ${PORTABLEFS_REMOUNT_TOKEN:-} ]]; then
+  remount_capable=1
+fi
 [[ $rounds =~ ^[0-9]+$ && $rounds -ge 10 ]] || usage "--rounds must be at least 10"
 [[ $hot_readers =~ ^[0-9]+$ && $hot_readers -ge 2 ]] || usage "--hot-file-readers must be at least 2"
 [[ $hot_rounds =~ ^[0-9]+$ && $hot_rounds -ge 10 ]] || usage "--hot-file-rounds must be at least 10"
@@ -550,13 +600,28 @@ tree_manifest() {
 }
 tree_digest=$(tree_manifest)
 
+if (( ! remount_capable )); then
+  # A loud skip, not a quiet pass. The remount needs a capability this run was
+  # not given, and reusing the first one is refused by the authority -- so
+  # asserting durability here would mean asserting it without having remounted.
+  echo "   SKIP: phase 9 needs a second mount capability and none was supplied." >&2
+  echo "         An initial grant is single-use, so the remount cannot reuse" >&2
+  echo "         PORTABLEFS_MOUNT_TOKEN. Pass --mount-token-command CMD or set" >&2
+  echo "         PORTABLEFS_REMOUNT_TOKEN. THIS RUN DID NOT QUALIFY DURABILITY." >&2
+  phase "qualification passed (phases 1-8; phase 9 skipped)"
+else
+
 "$portablefs" umount "$mount_path" || fail "unmount failed"
 mounted=0
 ! mountpoint -q -- "$mount_path" || fail "unmount returned success but $mount_path is still a mount point"
 [[ -z $(ls -A -- "$mount_path") ]] || fail "the mountpoint is not empty after unmount; volume content is leaking to local disk"
 ok "unmounted cleanly and the mountpoint is empty"
 
-"$portablefs" mount "$volume_id" "$mount_path" "${mount_args[@]}" --strategy fuse
+remount_token=$(next_mount_token)
+[[ -n $remount_token ]] || fail "no capability available for the phase 9 remount"
+PORTABLEFS_MOUNT_TOKEN="$remount_token" \
+  "$portablefs" mount "$volume_id" "$mount_path" "${mount_args[@]}" --strategy fuse ||
+  fail "remount failed; an initial grant is single-use, so this needs a capability distinct from the one phase 2 consumed"
 mounted=1
 [[ $(sha256sum <"$append_file" | cut -d' ' -f1) == "$serial_digest" ]] || fail "serial append content changed across remount"
 [[ $(sha256sum <"$tee_file" | cut -d' ' -f1) == "$tee_digest" ]] || fail "tee append content changed across remount"
@@ -567,6 +632,7 @@ git -C "$repo" fsck --strict >/dev/null || fail "git object store is damaged aft
 ok "every artifact survived unmount and remount byte-identically"
 
 phase "qualification passed"
+fi
 cat <<'NOTES'
 This corpus proves the workloads it ran, on this volume, during this run. It
 does not prove the volume under a load it did not apply, and it deliberately
