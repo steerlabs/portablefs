@@ -147,6 +147,36 @@ ordinary write-then-read on one mount return `EAGAIN`. Every earlier phase of
 the transaction still blocks the source, because until peers discharge the
 barrier is incomplete for everyone.
 
+**A closed coordinate never refuses a read.** `read(2)` on a blocking
+description has no retryable errno — `EAGAIN` reaches the caller verbatim and
+permanently parks any runtime that then polls the descriptor — so a data read
+that arrives during a recall waits and is then answered, never refused. The two
+lanes wait for different lengths, and the difference is load-bearing:
+
+- A **metadata** read waits for the whole barrier: reservation, recall, apply,
+  and every discharge receipt. Nothing in a recall waits on a metadata reply, so
+  holding one for the full transaction costs only latency, and it is then
+  answered under fresh cache authority. That invariant is why **opening a file
+  for reading is a data-lane admission, not a metadata one**: the frontend
+  registers its page-cache publication and the recall's purge waits for that
+  publication's reply, so an open on this lane would be something a recall waits
+  on. Opening a *directory* stays here — an enumeration reply publishes no pages.
+- A **data** read waits only until the mutation has **applied**, and is then
+  admitted with the applied bytes and, unless it is the mount still discharging
+  that recall, a fresh grant. What "the applied bytes" promises is exactly the
+  bytes this read fetches, not that every folio of the inode agrees with them:
+  until this mount's own COMPLETE purge runs, the page cache can still hold
+  pre-apply folios beside them, and §3.3 records that mixed-state window. A read
+  by the mount still discharging gets *no grant* — the coordinate is still under
+  recall, so it still misses to the authority next time. It may not wait longer,
+  because the FUSE_READ callback is holding the kernel folio that this same
+  transaction's whole-file purge will need, and that purge runs strictly after
+  apply. Waiting past apply would close the cycle and wedge the mount at its
+  repair budget. The apply phase is bounded by the recall budget and the
+  authority lease horizon; a coordinate still mid-apply beyond both belongs to a
+  transaction that outlived every budget that should have fenced it, and the
+  read fails hard rather than parking forever.
+
 No other family gets a successor. N-R, D-R, and E-R recalled from the source are
 discharged to none, and a later read reacquires state and cache authority
 together.
@@ -303,16 +333,45 @@ On a revoke/COMPLETE affecting local coordinates, the daemon:
    the cut was issued after the mutation applied, so its bytes are the new state
    and waiting for it would let a stream of readers starve the purge.
 
-   A buffered READ is therefore **never refused because this mount is
-   mutating**. It cannot be: the kernel holds the folio lock while it waits for
-   the reply, so refusing is the only non-blocking answer available and the only
-   errno for it is `EAGAIN`, which `read(2)` may not return on a blocking
-   description — stock Linux hands it straight to the caller, where it is a
-   spurious failure or, for a runtime that polls the descriptor, a permanent
-   stall. A READ reply likewise does not need a successor D grant of its own: it
-   is covered by the D lease its handle was opened under, which is the
-   obligation that will purge those pages. Metadata requests use the
-   zero-validity lane.
+   A buffered READ is therefore **never refused, for any coherence reason** —
+   not because this mount is mutating, not because a peer recall is in progress
+   for the coordinate, and not because the recall caught the read in flight. It
+   cannot be: the kernel holds the folio lock while it waits for the reply, so
+   refusing is the only non-blocking answer available and the only errno for it
+   is `EAGAIN`, which `read(2)` may not return on a blocking description — stock
+   Linux hands it straight to the caller, where it is a spurious failure or, for
+   a runtime that polls the descriptor, a permanent stall. The frontend
+   therefore neither refuses nor waits inside the callback; the ordering lives
+   at the authority (which releases a data read at apply) and at this purge
+   (which waits for the replies already admitted). A read the recall caught
+   mid-flight still delivers its bytes, and those bytes reach the caller
+   strictly before the mutation's own reply, because this purge is upstream of
+   the discharge that releases it. A READ reply likewise does not need a
+   successor D grant of its own: it is covered by the D lease its handle was
+   opened under, which is the obligation that will purge those pages. Metadata
+   requests use the zero-validity lane.
+
+   **Disclosed residual: the mixed-state window.** On a mount in the recall
+   audience, between the transaction's apply and that mount's own COMPLETE
+   purge, a page-cache miss is answered with post-apply bytes while the inode's
+   other folios still hold pre-apply bytes. A single `read(2)` spanning that
+   boundary can therefore return a mix that equals no serial state of the file
+   — not the state before the mutation and not the state after it. This is the
+   price of answering rather than refusing: the alternative is `EAGAIN` on a
+   blocking descriptor, which is worse and not a legal answer at all. The window
+   opens at apply and closes when this mount's whole-file invalidation completes,
+   so it is bounded by one COMPLETE round trip plus one INVAL_INODE, and it
+   closes for every reader at once rather than decaying per folio. It is
+   distinct from §7.3b: there the invalidation silently fails to remove a folio,
+   here the invalidation has simply not run yet. A reader that needs a serial
+   view across a peer mutation must use its own synchronization, exactly as it
+   must on any filesystem where a read may interleave with a concurrent write.
+
+   The data publication is registered only once the callback holds this mount's
+   bounded bulk lane slot. A purge waits for registered publications, and the
+   source mutation that drives a purge is itself holding a bulk slot; registering
+   before the slot is held would let a saturated lane close a wait cycle between
+   the purge and the very reads it is waiting for.
 3. **Purges daemon namespace state, then invalidates inodes**: every recalled N
    binding is removed from the daemon cache; kernel entry validity is already
    zero. Then INVAL_INODE expires attributes and purges the full file for every
@@ -597,7 +656,50 @@ claimed equivalence with kernel-client filesystems.
 **(b) Unproved data-cache withdrawal.** Stock FUSE discards the result of inode
 data invalidation, so a referenced clean folio can survive a completed purge
 invisibly [SC §6.3 row "-EBUSY"]. A notification can also fail to complete
-before the authority horizon. In either case the watchdog terminalizes and
+before the authority horizon.
+
+**Scope: this is a normal-operation residual, not only a post-terminalization
+one.** The paragraphs below describe the terminalization case because that is
+where the exposure is unbounded, but the underlying mechanism -- an
+invalidation that silently fails to remove a folio some reader has pinned -- is
+live in ordinary healthy operation, on every recall of a file another mount is
+reading. Two things bound it there and neither eliminates it: the purge waits
+for the reads it admitted before its cut (§3.3 item 2), and a folio it does miss
+is still covered by a lease, so the next mutation of that file recalls and
+purges it again.
+
+Admitting reads through the REVOKE→COMPLETE window makes this **more likely,
+though not newly possible**. Before the read wait existed, a read that arrived
+inside a recall was refused, and a refused read pins no folio; now it is served,
+so there are more reads in flight at the moment invalidation runs and more
+chances for one of them to hold the folio the purge wants. The mechanism is
+unchanged and pre-existing; the exposure rate is not. Refusing those reads is
+not an available alternative -- the only errno for it is `EAGAIN`, which
+`read(2)` may not return on a blocking description -- so this is a deliberate
+trade of a certain defect for a rarer one, and the §13 primitive is what closes
+it.
+
+**The exposure has a liveness face as well as a staleness one.** Stock's
+whole-file invalidation is not a bounded operation: `INVAL_INODE` is a
+synchronous write to `/dev/fuse` that returns only once the kernel has walked
+the mapping, and it must take each folio's lock to do so. A workload that keeps
+one inode's folios continuously locked -- several processes on the same mount
+reading the same file in a tight loop -- can therefore hold that notification in
+the kernel for a long time. The mount discharging the recall is blocked in that
+write, so it does not answer COMPLETE, and the mutating mount's transaction
+burns its whole `RecallBudget` waiting for a discharge that is starved rather
+than lost. Observed shape: three processes re-opening and re-reading one file
+while a peer rewrites it stalls the writer for the full budget and ends its
+operation as uncertain. Pacing those readers reduces the rate but does not
+remove it -- a 2 ms gap between reads still reached the stall within a few dozen
+rewrites -- because what matters is whether the inode is ever quiet, not how
+fast the readers go. Access that lets the inode fall idle between bursts, which
+is what ordinary workloads do, does not reproduce it. The daemon cannot bound this from
+userspace -- it cannot decline to serve the reads, and it cannot cancel a
+notification already in the kernel -- so, like the silent `-EBUSY`, it is closed
+by the §13 result-bearing invalidation primitive and not before.
+
+In either case the watchdog terminalizes and
 aborts the mount before the authority proceeds, but aborting the FUSE channel
 does not invalidate resident folios. A read or private mapping through a
 preexisting reference can therefore continue to observe old clean bytes after

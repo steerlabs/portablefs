@@ -35,6 +35,65 @@ this file is the human-curated summary.
 
 ### Fixed
 
+- A blocking `read(2)` racing a write on another mount could stall forever. The
+  window opened the moment the writing mount's recall closed the file's data
+  coordinate and stayed open until the whole transaction discharged: a reader on
+  any other mount passed its own local admission, reached the authority, and was
+  refused with `EAGAIN` -- an errno `read(2)` may not return on a blocking
+  description. This is the ordinary shape of a concurrent multi-mount workspace,
+  so it was reachable in normal use, not only under contrived load. A data read
+  now waits instead of being refused, and it waits for exactly the interval that
+  is unsafe to observe: from the recall's reservation until the mutation has
+  applied. It may not wait one step further, because the callback is holding the
+  kernel folio that the same transaction's whole-file purge will need, and that
+  purge runs strictly after apply -- so the wait and the purge can never be
+  waiting on each other. Past apply the read is answered with the applied bytes,
+  and it carries cache authority unless the reader is the very mount still
+  discharging that recall. The two local refusals of the same class are gone
+  with it: a buffered read is no longer refused because this mount is repairing
+  the coordinate, and a read the recall caught in flight now delivers its bytes
+  rather than being turned into a retry.
+- Opening a file for reading could deadlock a peer mount against the write it
+  raced. The frontend registers an open-for-read's page-cache publication and a
+  recall's whole-file purge waits for that publication's physical reply, but the
+  open itself was admitted on the metadata lane, which parks for the entire
+  barrier -- so the purge waited on a reply that was waiting on the purge's own
+  transaction, and the peer mount was revoked at its repair budget. Opening a
+  file for reading is now admitted on the data lane, which releases at apply,
+  and the publication is registered when the authority call returns rather than
+  across it: a READ has to register first because its reply carries bytes the
+  purge must be ordered against, and an open carries none. Opening a directory
+  still takes the full barrier, and with this no recall waits on a metadata
+  reply.
+- A whole-file purge could run ahead of the reads it was supposed to order.
+  It waited on the reply publications a coordinate still had outstanding, but
+  reply preparation removes a read's data entry before the reply is physically
+  written -- so a read that had been prepared and not yet written looked drained,
+  and filled its folio after the purge. The wait now follows the reads the
+  coordinate admitted rather than the entries preparation has already settled.
+- A recall could decide there was nothing to withdraw while the kernel was still
+  serving the file. Both the attribute and the data withdrawal were conditioned
+  on this daemon's own cache bookkeeping, but the kernel caches an attribute from
+  any reply that carried a lifetime and caches read data for any `KEEP_CACHE`
+  description, neither of which requires the daemon to have retained a copy.
+  Withdrawal now follows the inode. Relatedly, a read that returned end-of-file
+  was treated as publishing nothing; stock zero-fills the rest of the requested
+  range and marks those folios up to date, so an end-of-file read past a peer's
+  truncation left real pages behind that no later withdrawal knew about.
+- A buffered read registered its data publication before acquiring the mount's
+  bounded bulk lane slot, while the purge that waits for those publications runs
+  from a source mutation already holding one. A saturated lane could therefore
+  make a purge wait on reads waiting for the lane its own mutation occupied, with
+  nothing but the repair budget to break it -- and that budget revokes the mount.
+  The slot is now taken for the whole callback, before the publication exists.
+- A failed coherence barrier minted successor cache authority anyway. Grants were
+  issued before the barrier's outcome was known, so a failure delivered them to
+  the frontend and left the matching records in the authority's table with
+  nothing on the wire able to discharge them. Nothing is minted on a failed
+  barrier now. The same error path also dropped the source's discharge receipt
+  obligation, which does not cancel the obligation -- it only guarantees the
+  session is fenced once the recall budget elapses -- so the receipt now travels
+  with every outcome.
 - A buffered read on a mount doing its own I/O could stall forever. The frontend
   refused such a read with `EAGAIN` -- an errno `read(2)` may not return on a
   blocking description, which stock Linux hands straight to the caller and which
@@ -49,6 +108,17 @@ this file is the human-curated summary.
 
 ### Changed
 
+- Two coherence residuals are now disclosed rather than implied. A mount in a
+  recall audience can, between the mutation's apply and its own purge, answer a
+  page-cache miss with post-apply bytes while other folios of the same inode
+  still hold pre-apply ones, so a single `read(2)` spanning that boundary can
+  return a mix equal to no serial state; it is bounded by one COMPLETE round trip
+  plus one invalidation. And `docs/portable-coherence.md` §7.3b now states its
+  real scope: it is a normal-operation residual, not only a post-terminalization
+  one, serving reads through a recall raises its likelihood without changing its
+  mechanism, and it has a liveness face -- stock's whole-file invalidation is an
+  unbounded synchronous walk that a workload never letting an inode fall idle can
+  starve, stalling the mutating mount for its whole recall budget.
 - Name the three stock-kernel boundaries on the Linux range and link surfaces
   instead of leaving them as unexplained failures, each pinned by test:
   `fallocate` `COLLAPSE_RANGE`/`INSERT_RANGE`/`UNSHARE_RANGE` are refused by
