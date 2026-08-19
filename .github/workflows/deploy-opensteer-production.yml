@@ -35,7 +35,7 @@ jobs:
       WIF_SERVICE_ACCOUNT: portablefs-deployer@opensteer-admin.iam.gserviceaccount.com
     steps:
       - name: Check out the exact promoted PortableFS commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -55,7 +55,7 @@ jobs:
           grep -Fx "$promoted_tree" "$RUNNER_TEMP/main-trees" >/dev/null
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -87,7 +87,7 @@ jobs:
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
 
       - name: Set up the OpenSteer Node runtime
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24.13.0
 
@@ -124,7 +124,7 @@ jobs:
 
       - name: Retain the fencing and release evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           if-no-files-found: ignore
           name: opensteer-portablefs-${{ steps.release.outputs.release_id }}
