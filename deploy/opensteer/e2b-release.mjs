@@ -31,6 +31,27 @@ switch (command) {
     );
 }
 
+// smoke is a candidate-template gate, not a qualification. It runs inside one
+// sandbox with no manager and no authority, so there is nothing for a mount to
+// attach to and no honest way to fake one. What it can do — and what the
+// earlier version did not — is make the shipped client prove it can complete a
+// real kernel FUSE INIT handshake.
+//
+// What a passing smoke proves:
+//   - the template contains this exact release's client, and the client agrees
+//     about its own version;
+//   - the sandbox kernel exposes a usable /dev/fuse to this client;
+//   - the client's own mount options are accepted by this kernel, INIT
+//     completes, the capabilities the coherence contract requires (atomic
+//     O_TRUNC, explicit data-cache control, forwarded POSIX and BSD locks,
+//     entry and inode invalidation, a 1 MiB request bound) are all offered,
+//     and the mount unmounts cleanly.
+//
+// What it does NOT prove: anything about the authority, the wire protocol,
+// visibility, durability, locking across mounts, leases, recalls, or any
+// workload. A client that completes INIT can still be wrong about every one of
+// those. Full qualification is the real-workload corpus in
+// deploy/opensteer/staging-qualification.sh, run against a live staging cell.
 async function smoke(template, expectedRelease) {
   requireTemplate(template);
   requireRelease(expectedRelease);
@@ -54,12 +75,55 @@ async function smoke(template, expectedRelease) {
         `candidate client reports ${String(version.version)}, expected ${expectedRelease}`,
       );
     }
-    await sandbox.commands.run(
-      "test -c /dev/fuse && /opt/opensteer/portablefs/portablefs mount-check --strategy fuse --json",
-      { timeoutMs: 30_000, user: "root" },
+
+    // The device node existing, opening, CAP_SYS_ADMIN being held and a helper
+    // being installed are all equally true of a client that can never complete
+    // FUSE INIT. --probe-mount installs one real throwaway mount instead, so
+    // that failure class fails here rather than at a tenant's first mount.
+    const probeResult = await sandbox.commands.run(
+      "test -c /dev/fuse && /opt/opensteer/portablefs/portablefs mount-check --strategy fuse --probe-mount --json",
+      { timeoutMs: 60_000, user: "root" },
     );
+    const probe = JSON.parse(probeResult.stdout);
+    if (probe.error) {
+      throw new Error(
+        `candidate client FUSE probe failed: ${String(probe.error.message)}`,
+      );
+    }
+    if (probe.facts?.state !== "verified") {
+      throw new Error(
+        `candidate client FUSE probe reported state ${String(probe.facts?.state)}, expected verified`,
+      );
+    }
+    if (probe.facts?.transport !== "fuse") {
+      throw new Error(
+        `candidate client probed transport ${String(probe.facts?.transport)}, expected fuse`,
+      );
+    }
+    const kernelProbe = probe.kernelProbe;
+    if (!kernelProbe || typeof kernelProbe.protocolMajor !== "number") {
+      throw new Error(
+        "candidate client reported verified without a kernel INIT probe; the client is too old to prove it can complete FUSE INIT",
+      );
+    }
+    if (
+      kernelProbe.protocolMajor !== 7 ||
+      kernelProbe.protocolMinor < 31 ||
+      !Number.isInteger(kernelProbe.initFlags) ||
+      kernelProbe.initFlags === 0
+    ) {
+      throw new Error(
+        `candidate client negotiated FUSE ${String(kernelProbe.protocolMajor)}.${String(kernelProbe.protocolMinor)} with flags ${String(kernelProbe.initFlags)}`,
+      );
+    }
+
     report({
       command: "smoke",
+      kernelInitFlags: kernelProbe.initFlags,
+      kernelProtocol: `${kernelProbe.protocolMajor}.${kernelProbe.protocolMinor}`,
+      proves: "release identity and a completed kernel FUSE INIT handshake",
+      provesNot:
+        "authority, protocol, coherence, or workload behaviour; see deploy/opensteer/staging-qualification.sh",
       releaseId: expectedRelease,
       sandboxId: sandbox.sandboxId,
       template,

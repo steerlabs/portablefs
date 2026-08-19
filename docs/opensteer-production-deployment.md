@@ -24,8 +24,9 @@ one serialized deployment:
 2. Build and verify one immutable hosted bundle. It contains the Manager, cell
    services, Authority, and the exact Linux client used by E2B.
 3. Build a commit-tagged E2B candidate from a digest-pinned OpenSteer Runner
-   image, then start a disposable candidate sandbox and verify the client
-   release plus Linux FUSE prerequisites.
+   image, then start a disposable candidate sandbox and run the template smoke.
+   See [What the smoke proves](#what-the-smoke-proves) — it is a narrow gate,
+   not a qualification.
 4. Stream one gzip-compressed release archive through each private IAP tunnel,
    then activate it on the Manager and cell control processes. This does not
    restart a live Authority.
@@ -50,6 +51,43 @@ is live, a problem is fixed by promoting another commit. The host activator does
 restore the prior symlink if an individual atomic activation fails before it
 finishes; that is transaction failure handling, not an operator rollback of a
 completed deployment.
+
+## What the smoke proves
+
+The candidate smoke (`deploy/opensteer/e2b-release.mjs smoke`) runs inside one
+disposable sandbox with no manager and no authority. There is nothing there for
+a mount to attach to, and faking one would make the gate worse than useless, so
+its scope is deliberately narrow.
+
+It proves:
+
+- the template contains this exact release's client, and the client agrees
+  about its own version;
+- the sandbox kernel exposes a usable `/dev/fuse` to that client;
+- the client can complete a real kernel FUSE INIT handshake. `portablefs
+  mount-check --strategy fuse --probe-mount` installs one throwaway FUSE mount
+  on a private temporary directory using the client's own mount options, checks
+  the capabilities the coherence contract requires — atomic `O_TRUNC`, explicit
+  data-cache control, forwarded POSIX and BSD locks, entry and inode
+  invalidation, a 1 MiB request bound — and unmounts. This is the one check
+  that a client which can never complete FUSE INIT cannot pass. The device node
+  existing, the device opening, `CAP_SYS_ADMIN` being held, and a helper being
+  installed are all equally true of such a client, which is how that failure
+  class previously reached a tenant's first mount instead of the gate.
+
+It does not prove anything about the authority, the wire protocol, visibility,
+durability, locking across mounts, leases, recalls, or any workload. A client
+that completes INIT can still be wrong about every one of those.
+
+Full qualification is the real-workload corpus in
+`deploy/opensteer/staging-qualification.sh`, run against a live staging cell:
+serial and `tee -a` appends, a git repository created and `fsck`-verified on the
+mount, two concurrent `O_APPEND` writers on one file, a hot file read by several
+processes while another rewrites it, and a durability check across unmount and
+remount. That script also names the two things to watch on the authority while
+it runs — RecallBudget-exhaustion fences and uncertain-outcome revocations — a
+pass with either of those firing is a result the authority paid for, not a clean
+one.
 
 ## Data
 
