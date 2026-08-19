@@ -221,22 +221,6 @@ func visibilityEventProto(event volumeserver.VisibilityEvent) *authoritypb.Visib
 		MutationSlot:       event.MutationSlot,
 		MutationSequence:   event.MutationSequence,
 		Targets:            targets,
-		Routes:             routesChangeProto(event.Routes),
-	}
-}
-
-// routesChangeProto carries a routing-topology change on the event that
-// announces it. It is a distinct field rather than a namespace target because
-// it is not a cache coordinate: there is no parent and no name a frontend could
-// invalidate to discharge it, and encoding it as one would let a frontend
-// satisfy it by dropping a dentry instead of by swapping its routing table.
-func routesChangeProto(change *volumeserver.RoutesChange) *authoritypb.RoutesChange {
-	if change == nil {
-		return nil
-	}
-	return &authoritypb.RoutesChange{
-		Revision: append([]byte(nil), change.Revision[:]...),
-		Rules:    append([]byte(nil), change.Canonical...),
 	}
 }
 
@@ -698,7 +682,7 @@ func isVisibilityFailure(err error) bool {
 // itself, which is what ESTALE means to a frontend.
 func isVisibilityFenced(err error) bool {
 	return errors.Is(err, volumeserver.ErrVisibilityLost) || errors.Is(err, volumeserver.ErrVisibilityDeadline) ||
-		errors.Is(err, volumeserver.ErrVisibilitySequence) || errors.Is(err, volumeserver.ErrVisibilityBlocked)
+		errors.Is(err, volumeserver.ErrVisibilitySequence)
 }
 
 func mountAbsenceProof(proof *authoritypb.MountAbsenceProof) volumeserver.MountAbsenceProof {

@@ -610,26 +610,19 @@ message VisibilityTarget {
   ObjectPostState exact_post_state = 10;
 }
 
-// RoutesChange makes a two-phase event say "this is a routing-topology change"
-// without overloading a namespace target. A routing change has no parent, no
-// name and no inode: it is not a cache coordinate, and encoding it as one would
-// mean a frontend could satisfy it by invalidating a dentry, which is not the
-// obligation. What a frontend owes here is to stop serving the old topology
-// entirely before it acknowledges COMPLETE.
-message RoutesChange {
-  bytes revision = 1; // 32 bytes; the revision that becomes active at COMPLETE
-  bytes rules = 2;    // canonical rule bytes the revision is the digest of
-}
-
 message VisibilityEvent {
   VisibilityCursor cursor = 1;
   bytes initiator_session_id = 2; // 16 bytes
   uint32 mutation_slot = 3; // initiating callback exemption ticket
   repeated VisibilityTarget targets = 4;
   uint64 mutation_sequence = 5;
-  // routes is set exactly on the two phases of a routing-topology change, and
-  // targets is empty on those phases. The two are disjoint by construction.
-  RoutesChange routes = 6;
+  // 6 was routes: the retired FSKit routes barrier delivered a routing
+  // revision as a two-phase visibility phase, and a frontend that could not
+  // adopt it reported blocked. A route change now commits only at clean mount
+  // absence -- no mount exists to deliver a phase to -- so no visibility event
+  // can carry a routing revision.
+  reserved 6;
+  reserved "routes";
 }
 
 // ApplyRoutes installs a new machine-local routing topology for the whole
@@ -670,10 +663,12 @@ message NextVisibilityRequest {
 }
 message AckVisibilityRequest {
   VisibilityCursor cursor = 1;
-  // blocked declares that this participant cannot adopt the phase it was
-  // delivered. Protocol 6 has exactly one such phase, a routing revision, and
-  // the report is terminal for the reporting mount alone.
-  bool blocked = 2;
+  // 2 was blocked: a participant declaring it could not adopt the phase it was
+  // delivered. The only unadoptable phase was a routing revision, and that
+  // barrier is retired; every phase a participant can now be delivered is one
+  // it repairs in place and acknowledges.
+  reserved 2;
+  reserved "blocked";
   // 3 was blocked_parent_kernel_inos: the coordination inodes a parent-exclusive
   // repair would have had to notify. That model is retired and no admitted
   // profile can declare it.
@@ -682,7 +677,7 @@ message AckVisibilityRequest {
   // Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
   // pipelined frontend sets it when peer repair refused at least one eligible
   // later ordered callback before that exact Ack. It never acknowledges a
-  // blocked phase and cannot exempt a mutation from ordinary eligibility.
+  // terminal report and cannot exempt a mutation from ordinary eligibility.
   bool ordered_admission_contended = 4;
 }
 

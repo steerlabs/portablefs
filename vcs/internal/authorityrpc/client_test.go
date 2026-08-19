@@ -409,9 +409,6 @@ func TestFrontendProfileControlMethodsCannotCrossProfiles(t *testing.T) {
 	if err := linux.AckVisibility(ctx, &authoritypb.VisibilityCursor{}); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("Linux AckVisibility error = %v, want EOPNOTSUPP", err)
 	}
-	if err := linux.ReportVisibilityBlocked(ctx, &authoritypb.VisibilityCursor{}); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("Linux ReportVisibilityBlocked error = %v, want EOPNOTSUPP", err)
-	}
 
 	fskit := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR}}
 	if _, err := fskit.NextLeaseEvent(ctx, nil); !errors.Is(err, syscall.EOPNOTSUPP) {

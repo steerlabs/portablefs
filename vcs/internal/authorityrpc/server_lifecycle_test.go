@@ -470,7 +470,7 @@ func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 		waitForLifecycleCondition(t, func() bool {
 			pairs, sessions := lifecycleRegistryCounts(registry)
 			return pairs == 0 && sessions == 0
-		}, "blocked-report terminal transition")
+		}, "repair-acknowledgment terminal transition")
 		return &authoritypb.Response{
 			RequestId: request.GetRequestId(), Errno: 116,
 			Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
@@ -484,9 +484,7 @@ func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 	err := server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 		RequestId: 7,
 		Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-		Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{
-			Blocked: true,
-		}},
+		Body:      &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}},
 	}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
 		pairs, sessions := lifecycleRegistryCounts(registry)
 		if pairs != 0 || sessions != 0 {
@@ -502,14 +500,14 @@ func TestTransportFskitAckReturnsTerminalReasonAfterPairCloses(t *testing.T) {
 		t.Fatal(err)
 	}
 	if wrote == nil || wrote.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE || wrote.GetErrno() != 116 {
-		t.Fatalf("blocked-report response = %+v", wrote)
+		t.Fatalf("repair acknowledgment response = %+v", wrote)
 	}
 	if controlClosed.Load() != 1 {
 		t.Fatalf("CONTROL close count after reply = %d, want 1", controlClosed.Load())
 	}
 }
 
-func TestTransportBlockedReportSuccessKeepsActivePairServing(t *testing.T) {
+func TestTransportFskitAckSuccessKeepsActivePairServing(t *testing.T) {
 	registry, _ := newTransportRegistry(1)
 	session := volumeserver.SessionID{0x45}
 	data, dataClosed, control, controlClosed, _ := lifecyclePairForProfile(
@@ -524,16 +522,14 @@ func TestTransportBlockedReportSuccessKeepsActivePairServing(t *testing.T) {
 	err := server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 		RequestId: 8,
 		Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-		Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{
-			Blocked: true,
-		}},
+		Body:      &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}},
 	}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
 		wrote = response
 		if _, err := registry.activeWitness(control, session); err != nil {
-			t.Fatalf("CONTROL stopped serving before nonterminal blocked reply: %v", err)
+			t.Fatalf("CONTROL stopped serving before nonterminal acknowledgment reply: %v", err)
 		}
 		if _, err := registry.activeWitness(data, session); err != nil {
-			t.Fatalf("DATA stopped serving before nonterminal blocked reply: %v", err)
+			t.Fatalf("DATA stopped serving before nonterminal acknowledgment reply: %v", err)
 		}
 		return nil
 	})
@@ -541,13 +537,13 @@ func TestTransportBlockedReportSuccessKeepsActivePairServing(t *testing.T) {
 		t.Fatal(err)
 	}
 	if wrote == nil || wrote.GetErrno() != 0 {
-		t.Fatalf("nonterminal blocked-report response = %+v", wrote)
+		t.Fatalf("nonterminal repair acknowledgment response = %+v", wrote)
 	}
 	if dataClosed.Load() != 0 || controlClosed.Load() != 0 {
-		t.Fatalf("nonterminal blocked report closed DATA/CONTROL = %d/%d", dataClosed.Load(), controlClosed.Load())
+		t.Fatalf("nonterminal repair acknowledgment closed DATA/CONTROL = %d/%d", dataClosed.Load(), controlClosed.Load())
 	}
 	if _, pin, err := registry.pinActive(data, session); err != nil {
-		t.Fatalf("DATA was not executable after nonterminal blocked report: %v", err)
+		t.Fatalf("DATA was not executable after a nonterminal repair acknowledgment: %v", err)
 	} else {
 		pin.Release()
 	}
@@ -574,22 +570,22 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 		authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
 	)
 
-	blockedEntered := make(chan struct{})
-	releaseBlocked := make(chan struct{})
+	ackEntered := make(chan struct{})
+	releaseAck := make(chan struct{})
 	resumeStarted := make(chan struct{})
 	resumeEntered := make(chan struct{})
-	blockedWrote := make(chan struct{})
+	ackWrote := make(chan struct{})
 	var resumeCrossedResponse atomic.Bool
 	handler := newLifecycleTestHandler(volumeserver.SessionStateActive)
 	handler.handle = func(_ context.Context, request *authoritypb.Request) *authoritypb.Response {
 		switch {
 		case request.GetAckFskitRepair() != nil:
-			close(blockedEntered)
-			<-releaseBlocked
+			close(ackEntered)
+			<-releaseAck
 			return &authoritypb.Response{RequestId: request.GetRequestId()}
 		case request.GetResume() != nil:
 			select {
-			case <-blockedWrote:
+			case <-ackWrote:
 			default:
 				resumeCrossedResponse.Store(true)
 			}
@@ -602,18 +598,16 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 		}
 	}
 	server := &Server{Handler: handler, registry: registry}
-	blockedDone := make(chan error, 1)
+	ackDone := make(chan error, 1)
 	go func() {
-		blockedDone <- server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
+		ackDone <- server.executeTransportRequest(context.Background(), control, &authoritypb.Request{
 			RequestId: 9,
 			Session:   &authoritypb.SessionProof{Id: append([]byte(nil), session[:]...)},
-			Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{
-				Blocked: true,
-			}},
+			Body:      &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}},
 		}, func(_ *authoritypb.Request, response *authoritypb.Response) error {
-			close(blockedWrote)
+			close(ackWrote)
 			if response == nil || response.GetErrno() != 0 {
-				return errors.New("blocked report returned a failure response")
+				return errors.New("repair acknowledgment returned a failure response")
 			}
 			registry.mu.Lock()
 			current := data.pair.control.current
@@ -626,9 +620,9 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 		})
 	}()
 	select {
-	case <-blockedEntered:
+	case <-ackEntered:
 	case <-time.After(time.Second):
-		t.Fatal("blocked report did not enter handler")
+		t.Fatal("repair acknowledgment did not enter handler")
 	}
 
 	resumeDone := make(chan error, 1)
@@ -667,8 +661,8 @@ func TestTransportExecutionPinDelaysControlPromotionUntilFskitAckReply(t *testin
 		t.Fatalf("promoted but unexposed CONTROL snapshot = %+v, err=%v", snapshot, err)
 	}
 
-	close(releaseBlocked)
-	if err := <-blockedDone; err != nil {
+	close(releaseAck)
+	if err := <-ackDone; err != nil {
 		t.Fatal(err)
 	}
 	if err := <-resumeDone; err != nil {

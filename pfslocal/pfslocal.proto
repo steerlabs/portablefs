@@ -720,11 +720,6 @@ message VisibilityTarget {
   bytes post_identity = 6;
 }
 
-message RoutesChange {
-  bytes revision = 1;
-  bytes rules = 2;
-}
-
 message V3VisibilityEvent {
   bytes authority_epoch = 1;
   VisibilityCursor cursor = 2;
@@ -732,15 +727,22 @@ message V3VisibilityEvent {
   uint32 mutation_slot = 4;
   repeated VisibilityTarget targets = 5;
   uint64 mutation_sequence = 6;
-  RoutesChange routes = 7;
+  // 7 was routes: the retired FSKit routes barrier delivered a routing
+  // revision as a two-phase visibility phase. A route change now commits only
+  // at clean mount absence, so no visibility event can carry one.
+  reserved 7;
+  reserved "routes";
   reserved 8;
 }
 
 message VisibilityAckRequest {
   bytes authority_epoch = 1;
   VisibilityCursor cursor = 2;
-  bool blocked = 3;
-  string reason = 4;
+  // 3 and 4 were blocked/reason: a frontend declaring it could not adopt the
+  // delivered phase. The only unadoptable phase was a routing revision, and
+  // that barrier is retired.
+  reserved 3, 4;
+  reserved "blocked", "reason";
   // Liveness-only feedback carried on the exact peer COMPLETE Ack. It is false
   // for PREPARE, terminal reports, and older minor peers.
   bool ordered_admission_contended = 5;

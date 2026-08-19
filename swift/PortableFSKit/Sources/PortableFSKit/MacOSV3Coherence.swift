@@ -45,8 +45,6 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
     case invalidVisibilityScope(Int)
     case invalidVisibilityTarget
     case sourceVisibilityEventForbidden
-    case invalidRoutesChange
-    case routesChangeRequiresRemount
     case sequenceGap(expected: UInt64, received: UInt64)
     case eventIdentityMismatch(UInt64)
     case epochChanged
@@ -109,10 +107,6 @@ public enum PfsMacOSCoherenceError: Error, Equatable, CustomStringConvertible {
             return "visibility target has fields outside its declared scope"
         case .sourceVisibilityEventForbidden:
             return "source filesystem visibility events are forbidden"
-        case .invalidRoutesChange:
-            return "visibility route change has an invalid shape"
-        case .routesChangeRequiresRemount:
-            return "visibility route change requires this mount to fail closed and remount"
         case let .sequenceGap(expected, received):
             return "repair sequence gap: expected \(expected), received \(received)"
         case let .eventIdentityMismatch(sequence):

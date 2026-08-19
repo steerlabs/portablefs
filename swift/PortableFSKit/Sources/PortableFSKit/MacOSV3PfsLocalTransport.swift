@@ -378,9 +378,9 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         request.orderedAdmissionContended = orderedAdmissionContended
         try await client.acknowledgeVisibility(request)
         if lastDeliveredCursor == cursor {
-            // A later independent liveness failure has no right to rewrite an
-            // already-successful cursor as blocked. Only an outstanding event
-            // may be used for the best-effort terminal verdict.
+            // The cursor is now acknowledged, so it is no longer outstanding
+            // and must not be named as the failing cursor by a later,
+            // independent liveness failure's log line.
             lastDeliveredCursor = nil
         }
     }
@@ -392,51 +392,17 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
     ) async {
         // This is the coherence stack's death sentence for the mount; the
         // reason must reach the unified log from the layer that decided it.
+        // The log is the only place it is recorded — the acknowledgment wire
+        // has no field for a verdict, because a frontend has no way to decline
+        // a delivered phase.
         pfsClientLogger.error(
             "v3 coherence failing closed: \(reason, privacy: .public) at sequence \((self.lastDeliveredCursor ?? cursor)?.sequence ?? 0)"
         )
-        guard epoch == contract.epoch,
-              let failedCursor = lastDeliveredCursor ?? cursor,
-              failedCursor.sequence > 0 else {
-            // There is no valid cursor the daemon can bind a blocked verdict
-            // to. Closing the subscribed connection is the only truthful
-            // signal; the strict bridge treats that disconnect as terminal.
-            await client.close()
-            return
-        }
-        var request = PfsVisibilityAckRequest()
-        request.authorityEpoch = epoch
-        request.cursor = Self.encodeCursor(failedCursor)
-        request.blocked = true
-        request.reason = Self.boundedReason(reason)
-        // Reporting the blocked cursor is best effort. It cannot inherit the
-        // ordinary request deadline: this path is also used by the local
-        // repair watchdog, and waiting on an unresponsive daemon here would
-        // turn a bounded repair failure back into an unbounded mount hang.
-        let race = PfsMacOSDeadlineRace()
-        let report = Task {
-            do {
-                try await client.acknowledgeVisibility(request)
-                race.resolve(.success(()))
-            } catch {
-                race.resolve(.failure(error))
-            }
-        }
-        let reportWindow = min(contract.repairBudgetMillis, 100)
-        let deadline = Task {
-            do {
-                try await Task.sleep(for: .milliseconds(Int64(reportWindow)))
-                race.resolve(.success(()))
-            } catch {
-                // The report completed and cancelled this timer.
-            }
-        }
-        _ = try? await race.wait()
-        report.cancel()
-        deadline.cancel()
-        // Success, refusal, disconnect, and timeout all have the same local
-        // outcome: retire this participant so no filesystem operation can
-        // continue on a mount whose cache state is no longer proven current.
+        // Closing the subscribed connection is the whole signal to the daemon:
+        // the outstanding phase will never be acknowledged, and the strict
+        // bridge treats that disconnect as terminal. Retiring this participant
+        // is also what stops any filesystem operation from continuing on a
+        // mount whose cache state is no longer proven current.
         await client.close()
     }
 
@@ -462,12 +428,6 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
             throw PfsMacOSCoherenceError.invalidSequence(0)
         }
         let cursor = try decodeCursor(wire.cursor)
-        if wire.hasRoutes {
-            guard wire.targets.isEmpty, wire.routes.revision.count == 32 else {
-                throw PfsMacOSCoherenceError.invalidRoutesChange
-            }
-            throw PfsMacOSCoherenceError.routesChangeRequiresRemount
-        }
         guard wire.initiatorSessionID != expectedSessionID else {
             throw PfsMacOSCoherenceError.invalidVisibilityTarget
         }
@@ -595,21 +555,5 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
             wire.phase = .complete
         }
         return wire
-    }
-
-    /// portablefsd bounds the UTF-8 wire representation, not Swift grapheme
-    /// count. Preserve whole user-visible characters without exceeding it.
-    private static func boundedReason(_ reason: String) -> String {
-        guard reason.utf8.count > 1024 else { return reason }
-        var end = reason.startIndex
-        var byteCount = 0
-        while end < reason.endIndex {
-            let next = reason.index(after: end)
-            let characterBytes = reason[end..<next].utf8.count
-            guard byteCount + characterBytes <= 1024 else { break }
-            byteCount += characterBytes
-            end = next
-        }
-        return String(reason[..<end])
     }
 }

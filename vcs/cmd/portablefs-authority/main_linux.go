@@ -415,8 +415,6 @@ func fenceMetricReason(reason error) authoritymetrics.FenceReason {
 		return authoritymetrics.FenceFskitRepairLost
 	case errors.Is(reason, volumeserver.ErrVisibilityDeadline):
 		return authoritymetrics.FenceRepairDeadline
-	case errors.Is(reason, volumeserver.ErrVisibilityBlocked):
-		return authoritymetrics.FenceRoutesBlocked
 	case errors.Is(reason, volumeserver.ErrVisibilitySequence), errors.Is(reason, volumeserver.ErrSourcePublicationGate):
 		return authoritymetrics.FenceProtocolViolation
 	default:

@@ -944,8 +944,8 @@ public actor PfsMacOSFSKitPublicationBarrier: PfsMacOSCallbackPublicationBarrier
 /// construction. The coherence stack is composed at resolve time, before FSKit
 /// has mounted anything; the kernel mount that repairs must be actuated
 /// through exists only later. Until a root is installed every apply fails
-/// closed — the barrier reports the cursor blocked rather than acknowledging a
-/// repair that never touched the kernel.
+/// closed — the runner fails the mount and drops the pfslocal connection
+/// rather than acknowledging a repair that never touched the kernel.
 public final class PfsMacOS26DeferredMountActuator: PfsMacOS26RepairActuator, @unchecked Sendable {
     private let lock = NSLock()
     private var inner: PfsMacOS26POSIXActuator?
@@ -1213,8 +1213,8 @@ public final class PfsMacOSV3VolumeCoherence:
             do {
                 try await runner.run()
             } catch {
-                // The runner has already reported the blocked cursor and
-                // closed the pfslocal client. Failing the barrier is what
+                // The runner has already logged the failure and closed the
+                // pfslocal client. Failing the barrier is what
                 // stops admission-gated callbacks from hanging on a gate
                 // nobody will reopen.
                 await barrier.fail(error)

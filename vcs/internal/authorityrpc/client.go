@@ -963,27 +963,6 @@ func (c *Client) AckVisibilityWithContention(ctx context.Context, cursor *author
 	return nil
 }
 
-func (c *Client) ReportVisibilityBlocked(ctx context.Context, cursor *authoritypb.VisibilityCursor) error {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		return syscall.EOPNOTSUPP
-	}
-	if cursor == nil {
-		return syscall.EINVAL
-	}
-	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_AckFskitRepair{
-		AckFskitRepair: &authoritypb.AckVisibilityRequest{
-			Cursor: cursor, Blocked: true,
-		},
-	}})
-	if err != nil {
-		return err
-	}
-	if response.GetErrno() != 0 {
-		return c.endStrictMount(syscall.Errno(response.GetErrno()))
-	}
-	return nil
-}
-
 // endStrictMount makes a lease-control protocol failure terminal. Once the
 // authority can no longer prove this mount participates in recalls, serving
 // from its kernel cache is unsafe.

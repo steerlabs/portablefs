@@ -65,6 +65,22 @@ this file is the human-curated summary.
   write ownership. The product reports the measured transient-`ESTALE`
   high-rename boundary instead of hiding it behind retries or a fallback.
 
+### Removed
+
+- The retired FSKit routes barrier, in full. A routing revision was once
+  delivered to mounted frontends as a two-phase visibility phase, and a
+  frontend that could not adopt it answered `blocked`. Nothing drove either
+  half: route changes commit only at clean mount absence, so there is no mount
+  to deliver a phase to, and the authority never read the `blocked` bit off the
+  wire. Gone with it: `VisibilityCoordinator.ExecuteRoutes`/`ExecuteRoutesChecked`
+  and their barrier, the `Routes` member of every visibility event and the
+  fairness, yield, and dispatch branches that tested it, `ReportBlocked`,
+  `ErrVisibilityBlocked`, and the `routes_blocked` fence reason. The
+  `AckVisibilityRequest.blocked` and `VisibilityEvent.routes` wire fields are
+  reserved rather than reused, on both the authority protocol and `pfslocal`.
+  Every phase a frontend is now delivered is one it repairs in place and
+  acknowledges.
+
 ## [0.2.6] - 2026-08-12
 
 ### Fixed

@@ -2509,20 +2509,6 @@ public struct PfsVisibilityTarget: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsRoutesChange: @unchecked Sendable {
-  // SwiftProtobuf.Message conformance is added in an extension below. See the
-  // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
-  // methods supported on all messages.
-
-  public var revision: Data = Data()
-
-  public var rules: Data = Data()
-
-  public var unknownFields = SwiftProtobuf.UnknownStorage()
-
-  public init() {}
-}
-
 public struct PfsV3VisibilityEvent: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
@@ -2547,21 +2533,11 @@ public struct PfsV3VisibilityEvent: @unchecked Sendable {
 
   public var mutationSequence: UInt64 = 0
 
-  public var routes: PfsRoutesChange {
-    get {return _routes ?? PfsRoutesChange()}
-    set {_routes = newValue}
-  }
-  /// Returns true if `routes` has been explicitly set.
-  public var hasRoutes: Bool {return self._routes != nil}
-  /// Clears the value of `routes`. Subsequent reads from it will return its default value.
-  public mutating func clearRoutes() {self._routes = nil}
-
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
   public init() {}
 
   fileprivate var _cursor: PfsVisibilityCursor? = nil
-  fileprivate var _routes: PfsRoutesChange? = nil
 }
 
 public struct PfsVisibilityAckRequest: @unchecked Sendable {
@@ -2579,10 +2555,6 @@ public struct PfsVisibilityAckRequest: @unchecked Sendable {
   public var hasCursor: Bool {return self._cursor != nil}
   /// Clears the value of `cursor`. Subsequent reads from it will return its default value.
   public mutating func clearCursor() {self._cursor = nil}
-
-  public var blocked: Bool = false
-
-  public var reason: String = String()
 
   /// Liveness-only feedback carried on the exact peer COMPLETE Ack. It is false
   /// for PREPARE, terminal reports, and older minor peers.
@@ -6795,44 +6767,6 @@ extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   }
 }
 
-extension PfsRoutesChange: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
-  public static let protoMessageName: String = _protobuf_package + ".RoutesChange"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "revision"),
-    2: .same(proto: "rules"),
-  ]
-
-  public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
-    while let fieldNumber = try decoder.nextFieldNumber() {
-      // The use of inline closures is to circumvent an issue where the compiler
-      // allocates stack space for every case branch when no optimizations are
-      // enabled. https://github.com/apple/swift-protobuf/issues/1034
-      switch fieldNumber {
-      case 1: try { try decoder.decodeSingularBytesField(value: &self.revision) }()
-      case 2: try { try decoder.decodeSingularBytesField(value: &self.rules) }()
-      default: break
-      }
-    }
-  }
-
-  public func traverse<V: SwiftProtobuf.Visitor>(visitor: inout V) throws {
-    if !self.revision.isEmpty {
-      try visitor.visitSingularBytesField(value: self.revision, fieldNumber: 1)
-    }
-    if !self.rules.isEmpty {
-      try visitor.visitSingularBytesField(value: self.rules, fieldNumber: 2)
-    }
-    try unknownFields.traverse(visitor: &visitor)
-  }
-
-  public static func ==(lhs: PfsRoutesChange, rhs: PfsRoutesChange) -> Bool {
-    if lhs.revision != rhs.revision {return false}
-    if lhs.rules != rhs.rules {return false}
-    if lhs.unknownFields != rhs.unknownFields {return false}
-    return true
-  }
-}
-
 extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".V3VisibilityEvent"
   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
@@ -6842,7 +6776,6 @@ extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
     4: .standard(proto: "mutation_slot"),
     5: .same(proto: "targets"),
     6: .standard(proto: "mutation_sequence"),
-    7: .same(proto: "routes"),
   ]
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
@@ -6857,7 +6790,6 @@ extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
       case 4: try { try decoder.decodeSingularUInt32Field(value: &self.mutationSlot) }()
       case 5: try { try decoder.decodeRepeatedMessageField(value: &self.targets) }()
       case 6: try { try decoder.decodeSingularUInt64Field(value: &self.mutationSequence) }()
-      case 7: try { try decoder.decodeSingularMessageField(value: &self._routes) }()
       default: break
       }
     }
@@ -6886,9 +6818,6 @@ extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
     if self.mutationSequence != 0 {
       try visitor.visitSingularUInt64Field(value: self.mutationSequence, fieldNumber: 6)
     }
-    try { if let v = self._routes {
-      try visitor.visitSingularMessageField(value: v, fieldNumber: 7)
-    } }()
     try unknownFields.traverse(visitor: &visitor)
   }
 
@@ -6899,7 +6828,6 @@ extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
     if lhs.mutationSlot != rhs.mutationSlot {return false}
     if lhs.targets != rhs.targets {return false}
     if lhs.mutationSequence != rhs.mutationSequence {return false}
-    if lhs._routes != rhs._routes {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true
   }
@@ -6910,8 +6838,6 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
   public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
     1: .standard(proto: "authority_epoch"),
     2: .same(proto: "cursor"),
-    3: .same(proto: "blocked"),
-    4: .same(proto: "reason"),
     5: .standard(proto: "ordered_admission_contended"),
   ]
 
@@ -6923,8 +6849,6 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
       switch fieldNumber {
       case 1: try { try decoder.decodeSingularBytesField(value: &self.authorityEpoch) }()
       case 2: try { try decoder.decodeSingularMessageField(value: &self._cursor) }()
-      case 3: try { try decoder.decodeSingularBoolField(value: &self.blocked) }()
-      case 4: try { try decoder.decodeSingularStringField(value: &self.reason) }()
       case 5: try { try decoder.decodeSingularBoolField(value: &self.orderedAdmissionContended) }()
       default: break
       }
@@ -6942,12 +6866,6 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
     try { if let v = self._cursor {
       try visitor.visitSingularMessageField(value: v, fieldNumber: 2)
     } }()
-    if self.blocked != false {
-      try visitor.visitSingularBoolField(value: self.blocked, fieldNumber: 3)
-    }
-    if !self.reason.isEmpty {
-      try visitor.visitSingularStringField(value: self.reason, fieldNumber: 4)
-    }
     if self.orderedAdmissionContended != false {
       try visitor.visitSingularBoolField(value: self.orderedAdmissionContended, fieldNumber: 5)
     }
@@ -6957,8 +6875,6 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
   public static func ==(lhs: PfsVisibilityAckRequest, rhs: PfsVisibilityAckRequest) -> Bool {
     if lhs.authorityEpoch != rhs.authorityEpoch {return false}
     if lhs._cursor != rhs._cursor {return false}
-    if lhs.blocked != rhs.blocked {return false}
-    if lhs.reason != rhs.reason {return false}
     if lhs.orderedAdmissionContended != rhs.orderedAdmissionContended {return false}
     if lhs.unknownFields != rhs.unknownFields {return false}
     return true

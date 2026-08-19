@@ -1383,6 +1383,19 @@ func cloneLeaseEvent(event LeaseEvent) LeaseEvent {
 	return event
 }
 
+// RoutesChange is a volume-wide machine-local routing topology: the canonical
+// rule bytes and the revision digest every mount must agree with at attach. It
+// is never delivered to a mounted frontend. A routing revision is not a cache
+// coordinate -- it has no parent, no name and no inode, so there is nothing a
+// frontend could invalidate to discharge one -- and LOCAL graft cache carries
+// no authority TTL, so no acknowledgment could prove an old-revision kernel
+// stopped serving it. The only proof is that no mount exists, which is what
+// ExecuteRoutes requires.
+type RoutesChange struct {
+	Revision  [32]byte
+	Canonical []byte
+}
+
 // ExecuteRoutes commits a topology transition only at clean mount absence.
 // LOCAL graft cache has no authority TTL, so neither a CONTROL acknowledgment
 // nor fencing is evidence that an old-revision kernel stopped serving it. The

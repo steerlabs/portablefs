@@ -2652,7 +2652,8 @@ public final class PortableFSVolume: FSVolume, FSVolume.Operations, FSVolume.Ope
 
     /// Attempts to bind the deferred repair actuator to the live kernel mount,
     /// once. Failure stays loud at repair time: an uninstalled actuator fails
-    /// every repair closed and the barrier reports the cursor blocked.
+    /// every repair closed, which fails the mount and drops its pfslocal
+    /// connection without acknowledging the phase.
     private func scheduleRepairRootInstall() {
         guard let coherence, let handoffSocket = mountRootHandoffSocket else {
             return

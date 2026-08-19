@@ -506,48 +506,6 @@ extension PfsLocalMockDaemonTests {
     )
     #expect(decodedComplete.phase == .complete)
     #expect(decodedComplete.repairs.isEmpty)
-
-    var routes = v3Event(targets: [])
-    routes.initiatorSessionID = Data(repeating: 0, count: 16)
-    routes.mutationSlot = 0
-    routes.mutationSequence = 0
-    var change = PfsRoutesChange()
-    change.revision = Data(repeating: 0xCC, count: 32)
-    change.rules = Data("rules".utf8)
-    routes.routes = change
-    await #expect(throws: PfsMacOSCoherenceError.routesChangeRequiresRemount) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            routes,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
-
-    change.revision = Data(repeating: 0xCC, count: 31)
-    routes.routes = change
-    await #expect(throws: PfsMacOSCoherenceError.invalidRoutesChange) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            routes,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
-
-    routes = v3Event(targets: [
-        v3Target(scope: .attributes, identity: Data(repeating: 0x44, count: 16))
-    ])
-    change.revision = Data(repeating: 0xCC, count: 32)
-    routes.routes = change
-    await #expect(throws: PfsMacOSCoherenceError.invalidRoutesChange) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            routes,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
 }
 
 @Test func namespaceIndexPreservesAndRepairsEveryHardLinkAlias() async throws {
@@ -611,8 +569,6 @@ extension PfsLocalMockDaemonTests {
     #expect(acknowledgements[0].hasCursor)
     #expect(acknowledgements[0].cursor.sequence == 1)
     #expect(acknowledgements[0].cursor.phase == .prepare)
-    #expect(!acknowledgements[0].blocked)
-    #expect(acknowledgements[0].reason.isEmpty)
     #expect(await daemon.stats().visibilityAcks == 1)
 
     await #expect(throws: PfsMacOSCoherenceError.invalidSequence(0)) {
@@ -629,9 +585,9 @@ extension PfsLocalMockDaemonTests {
     }
     #expect(await daemon.stats().visibilityAcks == 1)
 
-    // Once success is acknowledged the transport must forget that delivered
-    // cursor. A later independent failure closes the client, but cannot send a
-    // contradictory BLOCKED verdict for the already-ACKed PREPARE.
+    // A later independent failure closes the client and sends nothing: the
+    // already-ACKed PREPARE stays acknowledged and no further acknowledgment
+    // is written on the way down.
     await transport.failClosed(epoch: v3Epoch, cursor: nil, reason: "later liveness failure")
     #expect(await daemon.stats().visibilityAcks == 1)
 }
@@ -699,46 +655,6 @@ extension PfsLocalMockDaemonTests {
         _ = try await client.request(.statfs(PfsStatfsRequest()))
     }
     #expect(await daemon.stats().visibilityAcks == 0)
-}
-
-@Test func concreteV3TransportReportsTheRouteCursorAsBlocked() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(v3Coherence: v3Contract()))
-    defer { daemon.stop() }
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    defer { Task { await client.close() } }
-
-    let resolved = try await client.resolve(attachRef: "mock")
-    let root = try v3Identity(1)
-    let transport = try await PfsLocalMacOSV3CoherenceTransport.connect(
-        client: client,
-        resolved: resolved,
-        planner: PfsMacOSRepairPlanner(index: PfsMacOSNamespaceIndex(rootIdentity: root))
-    )
-    var routeEvent = v3Event(sequence: 9, phase: .prepare, targets: [])
-    routeEvent.initiatorSessionID = Data(repeating: 0, count: 16)
-    routeEvent.mutationSlot = 0
-    routeEvent.mutationSequence = 0
-    var routes = PfsRoutesChange()
-    routes.revision = Data(repeating: 0xDD, count: 32)
-    routeEvent.routes = routes
-    daemon.emitVisibility(routeEvent)
-
-    await #expect(throws: PfsMacOSCoherenceError.routesChangeRequiresRemount) {
-        _ = try await nextV3Event(from: transport)
-    }
-    await transport.failClosed(
-        epoch: v3Epoch,
-        cursor: nil,
-        reason: String(repeating: "🙂", count: 2_000)
-    )
-
-    let acknowledgements = await daemon.visibilityAcknowledgements()
-    #expect(acknowledgements.count == 1)
-    #expect(acknowledgements[0].blocked)
-    #expect(acknowledgements[0].cursor.sequence == 9)
-    #expect(acknowledgements[0].cursor.phase == .prepare)
-    #expect(acknowledgements[0].reason.utf8.count <= 1_024)
-    #expect(!acknowledgements[0].reason.isEmpty)
 }
 
 @Test func strictV3UDSDisconnectTerminatesWithoutReconnectOrQueueHang() async throws {

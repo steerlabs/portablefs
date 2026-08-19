@@ -700,7 +700,7 @@ label.
 | `portablefs_authority_fsync_barrier_handles_total` / `portablefs_authority_fsync_storage_syncs_total` | How many fsync barrier requests did each completed storage sync serve? The ratio is group-commit effectiveness. |
 | `portablefs_authority_visibility_barrier_duration_seconds` | How long did PREPARE, XFS apply, and peer COMPLETE acknowledgment take end to end? |
 | `portablefs_authority_visibility_barrier_audience` | How many peer sessions had cache state to repair for each barrier? Routing changes count every strict participant. |
-| `portablefs_authority_fence_events_total{reason}` | Why was a participant told to revoke: `visibility_lost`, `repair_deadline`, `routes_blocked`, `protocol_violation`, `write_transaction_mismatch`, or `other`? |
+| `portablefs_authority_fence_events_total{reason}` | Why was a participant told to revoke: `visibility_lost`, `repair_deadline`, `protocol_violation`, `write_transaction_mismatch`, or `other`? |
 
 The counters and gauges are atomics. RPC counter handles and every label set are
 precomputed at startup; a request does no metric-map lookup, label formatting,

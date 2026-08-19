@@ -114,7 +114,6 @@ type FenceReason uint8
 const (
 	FenceFskitRepairLost FenceReason = iota
 	FenceRepairDeadline
-	FenceRoutesBlocked
 	FenceProtocolViolation
 	FenceFskitWriteMismatch
 	FenceOther
@@ -122,7 +121,7 @@ const (
 )
 
 var fenceReasonNames = [...]string{
-	"fskit_repair_lost", "repair_deadline", "routes_blocked", "protocol_violation", "fskit_write_mismatch", "other",
+	"fskit_repair_lost", "repair_deadline", "protocol_violation", "fskit_write_mismatch", "other",
 }
 
 type rpcSeries struct {

@@ -2974,64 +2974,6 @@ func TestVisibilityTwoMountsInDifferentDirectoriesAreNeverFenced(t *testing.T) {
 	}
 }
 
-// A filesystem phase is repairable by definition, so declaring it unadoptable
-// is a protocol violation rather than a request. Only a routing revision can be
-// reported blocked; anything else fences the reporting mount for a cursor
-// violation and must not disturb the mutation that is running.
-func TestVisibilityBlockedReportForAFilesystemPhaseIsACursorViolation(t *testing.T) {
-	for _, name := range []string{"prepare", "complete"} {
-		t.Run(name, func(t *testing.T) {
-			h := newVisibilityHarness(t, PriorEpochStrictMountsFenced)
-			claimant, mutator := SessionID{1}, SessionID{2}
-			h.register(t, claimant, 80*time.Millisecond)
-			h.register(t, mutator, testRepairBudget)
-			h.resolve(t, claimant, "shared")
-			h.resolve(t, mutator, "shared")
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			go serviceVisibility(ctx, h.coordinator, mutator)
-			done := make(chan error, 1)
-			go func() {
-				done <- executeTestSourceGated(h.coordinator, context.Background(), mutator, MutationID{Sequence: 1}, "shared",
-					testVisibilityPrepare("shared"), func() ([]VisibilityTarget, bool) {
-						return testVisibilityTargets("shared"), true
-					})
-			}()
-			prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, claimant)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cursor := prepare.Cursor
-			if name == "complete" {
-				if err := h.coordinator.Ack(claimant, prepare.Cursor); err != nil {
-					t.Fatal(err)
-				}
-				complete, err := h.coordinator.Next(ctx, claimant, prepare.Cursor)
-				if err != nil {
-					t.Fatal(err)
-				}
-				cursor = complete.Cursor
-			}
-			if err := h.coordinator.ReportBlocked(context.Background(), claimant, cursor); !errors.Is(err, ErrVisibilitySequence) {
-				t.Fatalf("blocked report for a filesystem phase = %v, want ErrVisibilitySequence", err)
-			}
-			if reason := h.fenceReasonFor(claimant); !errors.Is(reason, ErrVisibilitySequence) {
-				t.Fatalf("fenced for %v, want ErrVisibilitySequence", reason)
-			}
-			select {
-			case err := <-done:
-				if err != nil {
-					t.Fatalf("the mutation failed after refusing a false claim: %v", err)
-				}
-			case <-time.After(3 * time.Second):
-				t.Fatal("refusing a false blocked report stalled the mutation")
-			}
-		})
-	}
-}
-
-// serviceVisibility is a healthy mount: it acknowledges every phase it is
-// handed, for as long as its session lives.
 func serviceVisibility(ctx context.Context, coordinator *VisibilityCoordinator, id SessionID) {
 	after, err := coordinator.InitialCursor(id)
 	if err != nil {

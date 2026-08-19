@@ -46,11 +46,6 @@ var (
 	// ErrVisibilityDeadline fences one participant that did not finish a phase
 	// within the repair budget it committed to at attach.
 	ErrVisibilityDeadline = errors.New("volumeserver: strict visibility participant missed its repair budget")
-	// ErrVisibilityBlocked is the terminal form of a blocked report. Ordinary
-	// parent-exclusive namespace repair is cycle-broken in place; a routing
-	// revision cannot be adopted by releasing one directory lock, so that report
-	// still fences only the participant that cannot adopt it.
-	ErrVisibilityBlocked = errors.New("volumeserver: strict visibility participant cannot adopt the pending routing revision")
 	// ErrVisibilityInterrupted is a definite pre-apply refusal for a frontend
 	// mutation that would prevent this participant from discharging a pending
 	// repair. That is volume-wide for the frozen callback-serialized profile;
@@ -434,25 +429,6 @@ type VisibilityCursor struct {
 	Phase    VisibilityPhase
 }
 
-// RoutesChange is a volume-wide machine-local routing topology. It is carried
-// on an event instead of being encoded as a namespace target because it is not
-// a cache coordinate: it has no parent, no name and no inode, and a frontend
-// cannot discharge it by invalidating a dentry. What it owes is to stop serving
-// the old topology entirely before it acknowledges COMPLETE.
-type RoutesChange struct {
-	Revision  [32]byte
-	Canonical []byte
-}
-
-func (r *RoutesChange) clone() *RoutesChange {
-	if r == nil {
-		return nil
-	}
-	out := *r
-	out.Canonical = append([]byte(nil), r.Canonical...)
-	return &out
-}
-
 // VisibilityEvent is authority-epoch local. Initiator plus slot/sequence form
 // the ticket a source frontend exempts from its own PREPARE drain; the replay
 // content fingerprint remains private to that authority epoch.
@@ -463,9 +439,6 @@ type VisibilityEvent struct {
 	MutationSequence    uint64
 	FrontendOperationID uint64
 	Targets             []VisibilityTarget
-	// Routes is set on exactly the two phases of a routing-topology change, and
-	// Targets is empty on those phases. The two are disjoint by construction.
-	Routes *RoutesChange
 }
 
 // MountAbsenceProof is the authenticated supervisor's observation that its own
@@ -1740,9 +1713,6 @@ func (c *VisibilityCoordinator) recordDormantFairnessLocked(source SessionID, pa
 		return
 	}
 	event := participant.pending.event
-	if event.Routes != nil {
-		return
-	}
 	debt, exists := c.fairness[source]
 	if exists && debt.active && c.cfg.Now().After(debt.deadline) {
 		delete(c.fairness, source)
@@ -1817,7 +1787,7 @@ func (c *VisibilityCoordinator) mutationYieldErrorLocked(source SessionID, mutat
 		return nil
 	}
 	pending := participant.pending.event
-	if pending.Routes == nil && gate != nil && gate.overlaps(pending.Targets) {
+	if gate != nil && gate.overlaps(pending.Targets) {
 		return ErrVisibilityInterrupted
 	}
 	switch participant.repair {
@@ -2353,43 +2323,6 @@ func (c *VisibilityCoordinator) dispatchLocked(event VisibilityEvent, audience v
 	return deliveries, nil
 }
 
-// ReportBlocked is a strict frontend declaring that it cannot adopt the phase
-// it was delivered. Protocol 6 has exactly one such phase: a routing revision,
-// which cannot be repaired in place the way a cached name can. The report is
-// therefore terminal for the reporting participant and for it alone. Any other
-// pending phase makes this a cursor violation.
-//
-// A repeated report for the same cursor is idempotent: the report may have
-// succeeded while its response was lost.
-func (c *VisibilityCoordinator) ReportBlocked(_ context.Context, id SessionID, cursor VisibilityCursor) error {
-	c.mu.Lock()
-	p := c.participants[id]
-	if p == nil {
-		c.mu.Unlock()
-		return ErrSessionExpired
-	}
-	// A handler for an accepted phase can survive cancellation or reconnect and
-	// arrive after later phases have advanced the participant. Such a stale
-	// control replay must never mutate current state or fence the mount.
-	if cursor.Phase == VisibilityComplete && cursor.Sequence < p.acked.Sequence {
-		c.mu.Unlock()
-		return nil
-	}
-	if p.pending == nil || p.pending.event.Cursor != cursor {
-		c.mu.Unlock()
-		c.Fence(id, ErrVisibilitySequence)
-		return ErrVisibilitySequence
-	}
-	if p.pending.event.Routes == nil {
-		c.mu.Unlock()
-		c.Fence(id, ErrVisibilitySequence)
-		return ErrVisibilitySequence
-	}
-	c.mu.Unlock()
-	c.Fence(id, ErrVisibilityBlocked)
-	return ErrVisibilityBlocked
-}
-
 func (c *VisibilityCoordinator) newDeliveryLocked(p *visibilityParticipant, event VisibilityEvent) *visibilityDelivery {
 	now := c.cfg.Now()
 	delivery := &visibilityDelivery{
@@ -2548,7 +2481,7 @@ func (c *VisibilityCoordinator) AckWithContention(id SessionID, cursor Visibilit
 }
 
 func (c *VisibilityCoordinator) activateFairnessLocked(id SessionID, p *visibilityParticipant, event VisibilityEvent, orderedAdmissionContended bool) {
-	if event.Cursor.Phase != VisibilityComplete || event.Initiator == id || event.Routes != nil ||
+	if event.Cursor.Phase != VisibilityComplete || event.Initiator == id ||
 		p.repair != NamespaceRepairCallbackSerializedPipelined {
 		return
 	}
@@ -2596,7 +2529,6 @@ func cloneVisibilityTargets(targets []VisibilityTarget) []VisibilityTarget {
 
 func cloneVisibilityEvent(event VisibilityEvent) VisibilityEvent {
 	event.Targets = cloneVisibilityTargets(event.Targets)
-	event.Routes = event.Routes.clone()
 	return event
 }
 

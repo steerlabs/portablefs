@@ -1181,7 +1181,6 @@ private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3Cohere
     #expect(try await waitUntil { await daemon.stats().visibilityAcks == 2 })
     let acknowledgements = await daemon.visibilityAcknowledgements()
     #expect(acknowledgements.map(\.cursor.phase) == [.prepare, .complete])
-    #expect(acknowledgements.allSatisfy { !$0.blocked })
 
     // The mount keeps serving after the barrier.
     _ = try await volume.lookupItem(named: FSFileName(string: "wired"), inDirectory: root)

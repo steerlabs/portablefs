@@ -384,14 +384,14 @@ func TestFskitRepairControlIsNotRoutesGated(t *testing.T) {
 	if response := request(1, &authoritypb.KeepAliveRequest{}); response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_ROUTES {
 		t.Fatalf("keepalive after the revision moved = %+v, want the ROUTES refusal proving the session is stale", response)
 	}
-	ack := request(2, &authoritypb.AckVisibilityRequest{Cursor: &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE}, Blocked: true})
+	ack := request(2, &authoritypb.AckVisibilityRequest{Cursor: &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE}})
 	if ack.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_ROUTES {
-		t.Fatalf("a blocked report was refused by the routes gate: %+v", ack)
+		t.Fatalf("a repair acknowledgment was refused by the routes gate: %+v", ack)
 	}
 	if ack.GetErrno() != int32(syscall.EOPNOTSUPP) {
 		// This fixture registers no visibility coordinator, so the request
 		// must reach the visibility handler and be answered by it.
-		t.Fatalf("blocked report = %+v, want the visibility handler's own EOPNOTSUPP", ack)
+		t.Fatalf("repair acknowledgment = %+v, want the visibility handler's own EOPNOTSUPP", ack)
 	}
 	next := request(3, &authoritypb.NextVisibilityRequest{})
 	if next.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_ROUTES {
