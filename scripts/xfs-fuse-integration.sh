@@ -134,6 +134,20 @@ install_container_dependencies() {
   apt-get install -y -qq --no-install-recommends xfsprogs fuse3 sqlite3 git util-linux kmod >/dev/null
 }
 
+# The FUSE control filesystem is the kernel interface a strict mount's
+# revocation ladder uses to abort its own serving connection, which is what
+# releases every request parked in the kernel when the authority is gone. A
+# production host has it mounted; a container does not inherit it, and without
+# it the abort step silently cannot run - so the mount-owner detach helper waits
+# on a request nothing can answer and teardown never completes. Provisioning it
+# here is what makes the container the same kernel surface production is.
+provision_fuse_control() {
+  [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
+  mountpoint -q /sys/fs/fuse/connections ||
+    mount -t fusectl none /sys/fs/fuse/connections ||
+    fail "cannot mount the FUSE control filesystem; connection aborts would be unavailable" 69
+}
+
 provision_xfs() {
   local image=/var/tmp/portablefs-xfs.img
   [[ -e /dev/fuse ]] || fail "/dev/fuse is missing; the container cannot mount a kernel FUSE filesystem" 69
@@ -266,6 +280,7 @@ run_container() {
   [[ $EUID -eq 0 ]] || fail "container side must start as root to provision XFS" 77
   install_container_dependencies
   create_service_identity
+  provision_fuse_control
   provision_xfs
   provision_volume
   run_suite

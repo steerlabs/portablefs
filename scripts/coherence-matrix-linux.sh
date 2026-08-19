@@ -154,6 +154,17 @@ install_container_dependencies() {
   apt-get install -y -qq --no-install-recommends xfsprogs fuse3 util-linux procps >/dev/null
 }
 
+# The FUSE control filesystem is the kernel interface a strict mount's
+# revocation ladder uses to abort its own serving connection. A production host
+# has it mounted; a container does not inherit it, and a mount that cannot abort
+# cannot release the requests parked in its kernel.
+provision_fuse_control() {
+  [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
+  mountpoint -q /sys/fs/fuse/connections ||
+    mount -t fusectl none /sys/fs/fuse/connections ||
+    fail "cannot mount the FUSE control filesystem; connection aborts would be unavailable" 69
+}
+
 provision_xfs() {
   local image=/var/tmp/portablefs-coherence-xfs.img
   [[ -e /dev/fuse ]] || fail "/dev/fuse is missing; this container cannot mount a kernel FUSE filesystem" 69
@@ -517,6 +528,7 @@ run_container() {
   KERNEL_RELEASE=$(uname -r)
   install_container_dependencies
   create_service_identity
+  provision_fuse_control
   provision_xfs
   # The production provisioner is the single source of truth for project-quota
   # setup, so the harness exercises exactly what a deployment runs.
