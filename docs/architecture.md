@@ -135,6 +135,9 @@ generated on the mount host and are never delivered by the manager.
 | Failure and fencing | [failure-modes.md](./failure-modes.md) |
 | XFS confinement and storage implementation | [xfs-authority-architecture.md](./xfs-authority-architecture.md) |
 | Deployment | [xfs-authority-deployment.md](./xfs-authority-deployment.md) |
+| Hosted placement, credentials, reauthorization, and fencing | [hosted-control-plane.md](./hosted-control-plane.md) |
+| Deploying a hosted XFS cell | [hosted-cell-deployment.md](./hosted-cell-deployment.md) |
+| Promoting one matched release to OpenSteer | [opensteer-production-deployment.md](./opensteer-production-deployment.md) |
 | Machine-local routing | [graft-security.md](./graft-security.md) |
 | Black-box qualification | [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md) |
 

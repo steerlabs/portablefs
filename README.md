@@ -139,6 +139,9 @@ The repository also contains a product-neutral hosted foundation:
 - `portablefs-cell-agent` is unprivileged and outbound-only.
 - `portablefs-cell-helper` is the narrow root/XFS boundary and independently
   verifies signed plans.
+- `portablefs-files` is an optional unprivileged, bounded read gateway for a
+  product's human file browser. It holds short-lived authority sessions and
+  never mounts, indexes, copies, watches, or caches a volume.
 - systemd owns each listener and supervises one sandboxed, unprivileged
   authority per active volume.
 
@@ -148,6 +151,13 @@ existing session with an exact monotonic `Reauthorize` operation; access may
 narrow but never broaden. See
 [docs/hosted-control-plane.md](./docs/hosted-control-plane.md) and
 [docs/hosted-cell-deployment.md](./docs/hosted-cell-deployment.md).
+
+The Files gateway is not a second storage plane. A product backend authenticates
+its user, signs a request token bound to one volume, opaque path, operation,
+cursor, and byte range, and supplies a short Manager-issued read grant for the
+gateway's persisted CSR identity. The gateway keeps only bounded live sessions
+and expiring directory cursors. See `deploy/files/Containerfile` for the
+unprivileged reference image.
 
 ## What PortableFS guarantees
 
@@ -252,6 +262,8 @@ scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-
   manager, authorization, lifecycle, fencing, and deliberate v1 limits.
 - [docs/hosted-cell-deployment.md](./docs/hosted-cell-deployment.md) — deploying
   the outbound agent, root helper, and systemd authority units on a cell.
+- [docs/opensteer-production-deployment.md](./docs/opensteer-production-deployment.md) —
+  the single matched server/client promotion path used by OpenSteer.
 - [docs/consistency-model.md](./docs/consistency-model.md) — the exact
   visibility, durability, and retry rules.
 - [docs/failure-modes.md](./docs/failure-modes.md) — what breaks, and what a

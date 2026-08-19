@@ -233,26 +233,21 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 		}
 		result, err := handler.Manager.CloseMountEnrollment(idempotencyKey(request), enrollmentID, body)
 		handler.writeResult(writer, result, err)
-	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "mount-enrollments" && parts[3] == "revoke" && request.Method == http.MethodPost:
-		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
-			enrollmentID := parts[2]
+	case len(parts) == 6 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "mount-enrollments" && parts[5] == "revocation" && request.Method == http.MethodPut:
+		handler.requireConvergentRole(writer, request, principal, RoleProduct, func() (any, error) {
 			var body TerminateMountEnrollmentRequest
 			if err := decodeJSON(request, &body); err != nil {
 				return nil, err
 			}
-			var enrollment MountEnrollment
-			err := handler.Manager.cfg.Store.View(func(state State) error {
-				var ok bool
-				enrollment, ok = state.MountEnrollments[enrollmentID]
-				if !ok {
-					return ErrNotFound
-				}
-				return nil
-			})
-			if err != nil || handler.requireProductVolume(principal, enrollment.VolumeID) != nil {
-				return nil, ErrNotFound
+			return handler.Manager.RevokeVolumeMountEnrollment(principal.ID, parts[2], parts[4], body)
+		})
+	case request.Method == http.MethodPut && path == "v1/renewal-fences":
+		handler.requireConvergentRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body AdvanceRenewalFencesRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
 			}
-			return handler.Manager.RevokeMountEnrollment(idempotencyKey(request), enrollmentID, body)
+			return handler.Manager.AdvanceRenewalFences(principal.ID, body)
 		})
 	default:
 		writeAPIError(writer, http.StatusNotFound, "not found")
@@ -386,6 +381,19 @@ func (handler *HTTPHandler) requireRole(writer http.ResponseWriter, request *htt
 	handler.writeResult(writer, result, err)
 }
 
+func (handler *HTTPHandler) requireConvergentRole(writer http.ResponseWriter, request *http.Request, principal Principal, role Role, operation func() (any, error)) {
+	if principal.Role != role {
+		writeAPIError(writer, http.StatusForbidden, "role not permitted")
+		return
+	}
+	if len(request.Header.Values("Idempotency-Key")) != 0 {
+		writeAPIError(writer, http.StatusBadRequest, "Idempotency-Key is not accepted")
+		return
+	}
+	result, err := operation()
+	handler.writeResult(writer, result, err)
+}
+
 func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, err error) {
 	if err == nil {
 		writeJSON(writer, http.StatusOK, result)
@@ -397,7 +405,9 @@ func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, 
 		status = http.StatusBadRequest
 	case errors.Is(err, ErrNotFound):
 		status = http.StatusNotFound
-	case errors.Is(err, ErrConflict), errors.Is(err, ErrCapacity), errors.Is(err, ErrEnrollmentCapacity), errors.Is(err, ErrQuarantined):
+	case errors.Is(err, ErrConflict), errors.Is(err, ErrCapacity), errors.Is(err, ErrEnrollmentCapacity), errors.Is(err, ErrRenewalFenceCapacity), errors.Is(err, ErrQuarantined):
+		status = http.StatusConflict
+	case errors.Is(err, ErrRenewalScopeFenced):
 		status = http.StatusConflict
 	case errors.Is(err, ErrEnrollmentEnded):
 		status = http.StatusGone

@@ -78,6 +78,14 @@ The CLI and daemon private control API require exact release identity. A foreign
 or stale daemon is left untouched and the command fails with clean-stop
 guidance. There is no automatic replacement of an unknown socket owner.
 
+The launchd-managed daemon appends to
+`~/.local/state/portablefs/portablefsd.log`; per-mount logs are separate, under
+`~/.local/state/portablefs/mounts/`. The per-mount wrapper and the attach's
+renewal owner append there without sharing file offsets. Automatic mount-credential
+renewal emits structured scheduled, succeeded, retrying, denied, cutoff, and
+stopped events carrying sequence, deadline, retry, and bounded error metadata
+only; capabilities, certificates, and tokens are never logged.
+
 ## Verification
 
 - app, daemon, extension, entitlement, and bundle identity;

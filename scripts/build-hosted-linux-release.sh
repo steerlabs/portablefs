@@ -43,6 +43,7 @@ build() {
 build ./cmd/portablefs-manager bin/portablefs-manager
 build ./cmd/portablefs-cell-agent bin/portablefs-cell-agent
 build ./cmd/portablefs-authority bin/portablefs-authority
+build ./cmd/portablefs bin/portablefs
 build ./cmd/portablefs-cell-helper libexec/portablefs-cell-helper
 build ./cmd/portablefs-authority-launcher libexec/portablefs-authority-launcher
 

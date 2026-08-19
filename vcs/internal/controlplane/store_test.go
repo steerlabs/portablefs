@@ -138,3 +138,48 @@ func TestStoreReceiptRetentionIsExactAndBounded(t *testing.T) {
 		t.Fatalf("expired receipt result=%s replay=%v applied=%v err=%v", result, replay, applied, err)
 	}
 }
+
+func TestStoreCompactionAndReloadPreserveRenewalFenceHighWater(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state")
+	store, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := renewalFenceKey("opensteer", "cloud-private-state:computer-1")
+	if _, err := store.TransactNatural("seed-renewal-fence", 1, func(state *State) (any, bool, error) {
+		if state.RenewalFences == nil {
+			state.RenewalFences = make(map[string]uint64)
+		}
+		state.RenewalFences[key] = 17
+		return RenewalFence{Scope: "cloud-private-state:computer-1", Epoch: 17}, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < compactEvery-1; index++ {
+		requestID := fmt.Sprintf("compact-fence-%d", index)
+		if _, _, err := store.Transact(requestID, "compact-fence-test", index, int64(index+2), func(*State) (any, error) {
+			return index, nil
+		}); err != nil {
+			t.Fatalf("transaction %d: %v", index, err)
+		}
+	}
+	if store.sequence >= compactEvery {
+		t.Fatalf("store sequence %d was not compacted", store.sequence)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.View(func(state State) error {
+		if got := state.RenewalFences[key]; got != 17 {
+			t.Fatalf("reloaded renewal fence = %d, want 17", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

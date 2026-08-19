@@ -38,9 +38,12 @@ The reference paths are:
 ## Install one immutable hosted release
 
 Build one clean-commit release with `scripts/build-hosted-linux-release.sh`.
-The bundle contains all five hosted executables and all five unit templates;
-each executable reports the same `pfs-hosted-YYYYMMDD-<commit>` identity and the
-bundle has exact-member SHA-256 verification. Install it beneath:
+The bundle contains the five hosted services, the Linux `portablefs` client,
+and all five unit templates. Every executable reports the same
+`pfs-hosted-YYYYMMDD-<commit>` identity and the bundle has exact-member SHA-256
+verification. The matched client is also the source for managed sandbox images;
+it is not built or selected by a second release process. Install the bundle
+beneath:
 
 ```text
 /opt/portablefs/releases/<release-id>

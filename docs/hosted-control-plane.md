@@ -31,6 +31,24 @@ product backend                    Linux mount
             one non-root authority for one volume
 ```
 
+Human file inspection may use the optional `portablefs-files` read gateway in
+parallel with mounts. The product backend remains the user-authorization
+boundary and signs a token bound to the exact read request. It issues a
+standalone `access: ["read"]`, `automatic_reauthorization: false` Manager grant
+for the gateway CSR; no mount enrollment is created. The gateway opens an
+uncached authority session and performs only object-relative lookup, directory
+read, and file read operations. Directory pages, preview bytes, session count,
+cursor count, and lifetimes are bounded. The Manager remains outside the file
+data path. A scaled deployment consistently routes a volume ID to one gateway
+instance for the lifetime of its short session and one-use cursors; it does not
+create a second metadata store to share that disposable state.
+Volumes with machine-local route declarations are refused by this non-mounting
+reader because it cannot honestly project those machine-local paths.
+Path resolution is object-relative and never follows symlinks; symlink and
+opaque inode kinds may be listed but are not opened by the gateway.
+Content streams retain PortableFS's ordinary live-file semantics when another
+client mutates the same inode; the gateway does not create a snapshot or copy.
+
 ## Component boundaries
 
 `portablefs-manager` is the network control plane. It allocates stable volume
@@ -68,6 +86,24 @@ volume/config/state/staging set, has no network namespace of its own, and
 refuses root. Staging is outside the served namespace but inherits the exact
 volume XFS project and hard quota; its bind source cannot be replaced by the
 authority UID.
+
+`portablefs-files` is the optional read-only product adapter. It accepts only
+short-lived, body-bound requests signed by its colocated product backend, then
+uses a read-only capability and its own proof-of-possession identity to speak
+directly to the volume authority. It has bounded sessions, cursors, operations,
+downloads, request bodies, previews, and directory pages. It never mounts a
+volume and keeps no namespace or content cache. Protocol 5 has one strict
+session model, so the adapter still joins the visibility barrier with an exact
+no-kernel-mount observation and acknowledges each visibility phase immediately
+after observing it. It never adds a second filesystem truth or a weaker
+coherence profile.
+
+The intended deployment is one adapter beside one product backend in a shared
+pod network namespace, listening only on loopback. The product backend's exact
+public request-signing key is the adapter's sole HTTP trust root; the adapter
+does not receive that backend's private key or product-control credentials. Its
+private authority identity may persist for the pod lifetime, but active
+sessions and cursors are intentionally process-local and reconstructible.
 
 ## Authorization is deliberately two-party
 
@@ -110,7 +146,11 @@ The signature input is the UTF-8 bytes
 `portablefs-product-authorization-v1\0` followed by the exact JSON payload. The
 payload fields are `issuer`, `audience` (`portablefs-manager`),
 `authorization_domain`, `owner`, `subject`, `volume_id`, `access`,
-`peer_spki_sha256`, `nonce`, `not_before`, and `expires`. Base64url is unpadded;
+`peer_spki_sha256`, `nonce`, `not_before`, `expires`, and the optional
+`renewal_scope` and `renewal_epoch`. The renewal fields must either both be
+absent or both be present. `renewal_scope` is 1 through 200 bytes using only
+ASCII alphanumerics plus `.`, `_`, `-`, `:`, and `/`; `renewal_epoch` is an
+integer from 1 through 9007199254740991. Base64url is unpadded;
 `peer_spki_sha256` is SHA-256 of the CSR public key's DER SubjectPublicKeyInfo.
 Unknown fields, an invalid CSR signature, an expired or overlong window, nonce
 reuse, or disagreement on any tenant/client/access field is refused.
@@ -294,12 +334,32 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product | `POST /v1/mount-reauthorizations` | renew cert plus exact session grant |
 | enrolled mount | `POST /v1/mount-enrollments/{id}/reauthorizations` | obtain the exact next live-session grant |
 | enrolled mount | `POST /v1/mount-enrollments/{id}/close` | close enrollment after exact detach |
-| product | `POST /v1/mount-enrollments/{id}/revoke` | revoke future renewal for a mount |
+| product | `PUT /v1/volumes/{volume-id}/mount-enrollments/{enrollment-id}/revocation` | converge future renewal to revoked, closed, or absent within the product-owned volume |
+| product | `PUT /v1/renewal-fences` | atomically advance a batch of issuer-scoped renewal epoch fences and revoke superseded enrollments |
 
-Every mutating product/operator request and changed cell observation requires
-`Idempotency-Key`. Reusing a retained key with different bytes or another
-operation is refused. Receipts are durable and byte-identical on retry for a
-24-hour retry window; observations are state-based and reapplying them is safe.
+The renewal-fence request and response have these exact shapes:
+
+```json
+{"reason":"<identity>","fences":[{"scope":"<scope>","epoch":1}]}
+```
+
+```json
+{"fences":[{"scope":"<scope>","epoch":1}]}
+```
+
+A batch contains 1 through 4096 entries. Manager validates the complete batch
+before one durable transaction, applies the maximum requested epoch for a
+duplicate scope, and returns the resulting high-water mark for every request
+entry in request order. Advancing a fence revokes only active enrollments below
+the resulting epoch. Issuing a new scoped enrollment rotates every other active
+enrollment in that issuer and scope, including an enrollment at the same epoch.
+
+The two convergent PUT operations reject `Idempotency-Key`: convergence in the
+durable state is stronger than retaining a transport replay receipt. Other
+mutating product/operator requests and changed cell observations require the
+header. Reusing a retained key with different bytes or another operation is
+refused. Receipts are durable and byte-identical on retry for a 24-hour retry
+window; observations are state-based and reapplying them is safe.
 
 ## Deliberate v1 limits
 

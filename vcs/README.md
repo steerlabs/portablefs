@@ -25,6 +25,7 @@ OS kernel page caches remain part of each mount contract. For why, read
 | `cmd/portablefs-cell-agent` | The unprivileged outbound reconciliation loop on each Linux storage cell. |
 | `cmd/portablefs-cell-helper` | The narrow root helper that applies only a verified, manager-signed cell plan. Linux only. |
 | `cmd/portablefs-authority-launcher` | The fixed-argument systemd launcher for an isolated per-volume authority. Linux only. |
+| `cmd/portablefs-files` | The bounded, non-mounting read gateway for product file browsers. It accepts request-bound Ed25519 tokens, holds strict cacheless read-only authority sessions, pages directories, bounds previews, and streams downloads. |
 | `cmd/portablefsd` | The per-user macOS registry, control daemon, and FSKit data plane. It declares the protocol-6 synchronous-repair profile and never claims Linux lease semantics. |
 | `cmd/portablefs-mount-v3` | A standalone Linux mount client. This is what the coherence harnesses drive; ordinary users go through `portablefs mount`. |
 
@@ -32,6 +33,8 @@ OS kernel page caches remain part of each mount contract. For why, read
 
 ```text
 hostedauth/       Public product assertion signer and CSR SPKI helper.
+readonlyfs/       Public non-mounting read client with byte-safe path keys,
+                  exact authority handle cleanup, and live directory cursors.
 internal/
   xfsstore/        XFS-only, descriptor-relative volume backend: openat2 under
                    RESOLVE_BENEATH, *at syscalls, device verification, stable

@@ -678,6 +678,25 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 		if err != nil || !productauth.Allows(verified.Claims.Access, access) {
 			return nil, ErrInvalid
 		}
+		if verified.Claims.RenewalScope != "" {
+			key := renewalFenceKey(volume.ProductIssuer, verified.Claims.RenewalScope)
+			highWater := state.RenewalFences[key]
+			if verified.Claims.RenewalEpoch < highWater {
+				return nil, ErrRenewalScopeFenced
+			}
+			if verified.Claims.RenewalEpoch > highWater {
+				var err error
+				highWater, _, err = advanceRenewalFenceHighWater(state, key, verified.Claims.RenewalEpoch)
+				if err != nil {
+					return nil, err
+				}
+			}
+			if createEnrollment {
+				supersedeRenewalScopeEnrollments(state, volume.ProductIssuer, verified.Claims.RenewalScope, "renewal-scope-superseded", now)
+			} else {
+				revokeRenewalScopeEnrollmentsBeforeEpoch(state, volume.ProductIssuer, verified.Claims.RenewalScope, highWater, "renewal-scope-superseded", now)
+			}
+		}
 		nonceKey := volume.ProductIssuer + "\x00" + verified.Claims.Nonce
 		if previous := state.AuthorizationNonces[nonceKey]; previous.RequestID != "" && previous.RequestID != requestID {
 			return nil, ErrConflict
@@ -741,6 +760,7 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 				AuthorizationDomain: volume.AuthorizationDomain, ProductIssuer: volume.ProductIssuer,
 				CellID: volume.CellID, AuthorityID: volume.AuthorityID, AuthorityGeneration: volume.AuthorityGeneration,
 				CreatedUnix: now, ExpiresUnix: enrollmentExpires.Unix(), State: MountEnrollmentActive, UpdatedUnix: now,
+				RenewalScope: verified.Claims.RenewalScope, RenewalEpoch: verified.Claims.RenewalEpoch,
 			}
 			authorization.EnrollmentID = enrollmentID
 			authorization.EnrollmentCertificatePEM = enrollmentCertificate
@@ -877,16 +897,106 @@ func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, r
 }
 
 func (manager *Manager) CloseMountEnrollment(requestID, enrollmentID string, request TerminateMountEnrollmentRequest) (MountEnrollment, error) {
-	return manager.terminateMountEnrollment(requestID, enrollmentID, request, MountEnrollmentClosed)
+	return manager.terminateMountEnrollment(requestID, enrollmentID, request)
 }
 
-func (manager *Manager) RevokeMountEnrollment(requestID, enrollmentID string, request TerminateMountEnrollmentRequest) (MountEnrollment, error) {
-	return manager.terminateMountEnrollment(requestID, enrollmentID, request, MountEnrollmentRevoked)
+func (manager *Manager) RevokeVolumeMountEnrollment(productIssuer, volumeID, enrollmentID string, request TerminateMountEnrollmentRequest) (MountEnrollmentRevocation, error) {
+	if !validIdentity(productIssuer) || !cellplan.ValidID(volumeID) || !cellplan.ValidID(enrollmentID) || !validIdentity(request.Reason) {
+		return MountEnrollmentRevocation{}, ErrInvalid
+	}
+	now := nowUnix(manager.cfg.Now)
+	raw, err := manager.cfg.Store.TransactNatural("revoke-volume-mount-enrollment", now, func(state *State) (any, bool, error) {
+		pruned := pruneMountEnrollments(state, now)
+		volume, ok := state.Volumes[volumeID]
+		if !ok || volume.ProductIssuer != productIssuer {
+			return nil, false, ErrNotFound
+		}
+		result := MountEnrollmentRevocation{VolumeID: volumeID, EnrollmentID: enrollmentID}
+		enrollment, ok := state.MountEnrollments[enrollmentID]
+		if !ok {
+			result.Outcome = MountEnrollmentRevocationAbsent
+			return result, pruned, nil
+		}
+		if enrollment.VolumeID != volumeID {
+			return nil, false, ErrNotFound
+		}
+		switch enrollment.State {
+		case MountEnrollmentClosed:
+			result.Outcome = MountEnrollmentRevocationClosed
+			return result, pruned, nil
+		case MountEnrollmentRevoked:
+			result.Outcome = MountEnrollmentRevocationRevoked
+			return result, pruned, nil
+		case MountEnrollmentActive:
+			enrollment.State = MountEnrollmentRevoked
+			enrollment.TerminationReason = request.Reason
+			enrollment.UpdatedUnix = now
+			state.MountEnrollments[enrollmentID] = enrollment
+			result.Outcome = MountEnrollmentRevocationRevoked
+			return result, true, nil
+		default:
+			return nil, false, ErrInvalid
+		}
+	})
+	if err != nil {
+		return MountEnrollmentRevocation{}, err
+	}
+	return decode[MountEnrollmentRevocation](raw)
 }
 
-func (manager *Manager) terminateMountEnrollment(requestID, enrollmentID string, request TerminateMountEnrollmentRequest, target MountEnrollmentState) (MountEnrollment, error) {
-	if !validIdentity(requestID) || !cellplan.ValidID(enrollmentID) || !validIdentity(request.Reason) ||
-		target != MountEnrollmentClosed && target != MountEnrollmentRevoked {
+func (manager *Manager) AdvanceRenewalFences(productIssuer string, request AdvanceRenewalFencesRequest) (AdvanceRenewalFencesResponse, error) {
+	if !validIdentity(productIssuer) || len(manager.cfg.ProductIssuers[productIssuer]) != ed25519.PublicKeySize || !validIdentity(request.Reason) ||
+		len(request.Fences) == 0 || len(request.Fences) > MaxRenewalFenceBatchEntries {
+		return AdvanceRenewalFencesResponse{}, ErrInvalid
+	}
+	requestedHighWater := make(map[string]uint64, len(request.Fences))
+	for _, fence := range request.Fences {
+		if !validRenewalScope(fence.Scope) || fence.Epoch == 0 || fence.Epoch > productauth.MaxRenewalEpoch {
+			return AdvanceRenewalFencesResponse{}, ErrInvalid
+		}
+		if fence.Epoch > requestedHighWater[fence.Scope] {
+			requestedHighWater[fence.Scope] = fence.Epoch
+		}
+	}
+	now := nowUnix(manager.cfg.Now)
+	raw, err := manager.cfg.Store.TransactNatural("advance-renewal-fences", now, func(state *State) (any, bool, error) {
+		newFences := 0
+		for scope := range requestedHighWater {
+			if _, exists := state.RenewalFences[renewalFenceKey(productIssuer, scope)]; !exists {
+				newFences++
+			}
+		}
+		if len(state.RenewalFences)+newFences > MaxRenewalFences {
+			return nil, false, ErrRenewalFenceCapacity
+		}
+		changed := pruneMountEnrollments(state, now)
+		for scope, epoch := range requestedHighWater {
+			key := renewalFenceKey(productIssuer, scope)
+			highWater, advanced, err := advanceRenewalFenceHighWater(state, key, epoch)
+			if err != nil {
+				return nil, false, err
+			}
+			changed = changed || advanced
+			if revokeRenewalScopeEnrollmentsBeforeEpoch(state, productIssuer, scope, highWater, request.Reason, now) {
+				changed = true
+			}
+		}
+		response := AdvanceRenewalFencesResponse{Fences: make([]RenewalFence, 0, len(request.Fences))}
+		for _, fence := range request.Fences {
+			response.Fences = append(response.Fences, RenewalFence{
+				Scope: fence.Scope, Epoch: state.RenewalFences[renewalFenceKey(productIssuer, fence.Scope)],
+			})
+		}
+		return response, changed, nil
+	})
+	if err != nil {
+		return AdvanceRenewalFencesResponse{}, err
+	}
+	return decode[AdvanceRenewalFencesResponse](raw)
+}
+
+func (manager *Manager) terminateMountEnrollment(requestID, enrollmentID string, request TerminateMountEnrollmentRequest) (MountEnrollment, error) {
+	if !validIdentity(requestID) || !cellplan.ValidID(enrollmentID) || !validIdentity(request.Reason) {
 		return MountEnrollment{}, ErrInvalid
 	}
 	now := nowUnix(manager.cfg.Now)
@@ -902,7 +1012,7 @@ func (manager *Manager) terminateMountEnrollment(requestID, enrollmentID string,
 			// without another state record or a reason-dependent conflict.
 			return enrollment, pruned, nil
 		}
-		enrollment.State = target
+		enrollment.State = MountEnrollmentClosed
 		enrollment.TerminationReason = request.Reason
 		enrollment.UpdatedUnix = now
 		state.MountEnrollments[enrollmentID] = enrollment
@@ -941,6 +1051,52 @@ func terminateVolumeEnrollments(state *State, volumeID, reason string, now int64
 		enrollment.UpdatedUnix = now
 		state.MountEnrollments[id] = enrollment
 	}
+}
+
+func advanceRenewalFenceHighWater(state *State, key string, epoch uint64) (uint64, bool, error) {
+	highWater, exists := state.RenewalFences[key]
+	if epoch <= highWater {
+		return highWater, false, nil
+	}
+	if !exists && len(state.RenewalFences) >= MaxRenewalFences {
+		return 0, false, ErrRenewalFenceCapacity
+	}
+	if state.RenewalFences == nil {
+		state.RenewalFences = make(map[string]uint64)
+	}
+	state.RenewalFences[key] = epoch
+	return epoch, true, nil
+}
+
+func supersedeRenewalScopeEnrollments(state *State, productIssuer, scope, reason string, now int64) bool {
+	changed := false
+	for id, enrollment := range state.MountEnrollments {
+		if enrollment.ProductIssuer != productIssuer || enrollment.RenewalScope != scope || enrollment.State != MountEnrollmentActive {
+			continue
+		}
+		enrollment.State = MountEnrollmentRevoked
+		enrollment.TerminationReason = reason
+		enrollment.UpdatedUnix = now
+		state.MountEnrollments[id] = enrollment
+		changed = true
+	}
+	return changed
+}
+
+func revokeRenewalScopeEnrollmentsBeforeEpoch(state *State, productIssuer, scope string, epoch uint64, reason string, now int64) bool {
+	changed := false
+	for id, enrollment := range state.MountEnrollments {
+		if enrollment.ProductIssuer != productIssuer || enrollment.RenewalScope != scope ||
+			enrollment.RenewalEpoch >= epoch || enrollment.State != MountEnrollmentActive {
+			continue
+		}
+		enrollment.State = MountEnrollmentRevoked
+		enrollment.TerminationReason = reason
+		enrollment.UpdatedUnix = now
+		state.MountEnrollments[id] = enrollment
+		changed = true
+	}
+	return changed
 }
 
 func admitMountEnrollment(state *State, volume Volume) error {
