@@ -161,8 +161,9 @@ fi
 # actually looks like.
 #
 # Excluded: docs/ and CHANGELOG.md (history is supposed to name the thing it
-# replaced), this script, and scripts/package-manager-matrix.sh, which really
-# does drive pnpm as one of the package managers under test.
+# replaced), this script, and the two harnesses that really do drive pnpm as
+# one of the package managers under test -- scripts/package-manager-matrix.sh
+# locally and deploy/opensteer/staging-qualification.sh against live staging.
 step "stale architecture scan"
 if rg --hidden -n \
   -e 'JournalRecord\b' \
@@ -180,7 +181,8 @@ if rg --hidden -n \
   -g '!docs' \
   -g '!CHANGELOG.md' \
   -g '!scripts/verify-local.sh' \
-  -g '!scripts/package-manager-matrix.sh'
+  -g '!scripts/package-manager-matrix.sh' \
+  -g '!deploy/opensteer/staging-qualification.sh'
 then
   echo "stale v2 (journal-era) references found" >&2
   exit 1

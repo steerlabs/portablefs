@@ -1,0 +1,216 @@
+name: deploy-opensteer-staging
+
+# Staging is deployed on demand, never on a promotion branch. Production is
+# driven by `workflow_run` on `opensteer-production` (see
+# deploy-opensteer-production.yml) because promotion there must be an
+# already-green commit; staging is the surface an operator points at a branch
+# to qualify it, so the only trigger is a manual dispatch of whatever ref the
+# run was started on.
+on:
+  workflow_dispatch:
+    inputs:
+      volume_ids:
+        description: >-
+          Comma-separated staging volume IDs to redeploy. Leave empty to use
+          the opensteer-staging environment variable OPENSTEER_VOLUME_IDS.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: opensteer-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: opensteer-staging
+    env:
+      # The staging cell and the staging Manager are the same host, which the
+      # deploy driver handles: it stages the tarball once and activates both
+      # roles on it.
+      OPENSTEER_CELL_INSTANCE: portablefs-bench-1
+      OPENSTEER_GCP_PROJECT: opensteer-staging
+      OPENSTEER_GCP_ZONE: us-west1-b
+      OPENSTEER_MANAGER_INSTANCE: portablefs-bench-1
+      OPENSTEER_VOLUME_IDS: ${{ inputs.volume_ids != '' && inputs.volume_ids || vars.OPENSTEER_VOLUME_IDS }}
+      OPENSTEER_RUNNER_IMAGE: us-west1-docker.pkg.dev/opensteer-admin/staging/runner@sha256:1e310bb87984279ed3971a6b543f8e55acca09738a3a8b8905a882386dd454dc
+      # Production pins its provider and deployer service account inline
+      # because they exist. Staging reads both from the opensteer-staging
+      # environment so the federation can be provisioned without editing this
+      # workflow -- and so the preflight below can name exactly what is
+      # missing instead of letting gcloud fail opaquely.
+      WIF_PROVIDER: ${{ vars.WIF_PROVIDER }}
+      WIF_SERVICE_ACCOUNT: ${{ vars.WIF_SERVICE_ACCOUNT }}
+    steps:
+      # This runs before checkout on purpose: an unprovisioned environment
+      # must cost seconds and say what to provision, not fail eight steps
+      # later inside google-github-actions/auth with an OIDC exchange error.
+      - name: Require the opensteer-staging environment to be provisioned
+        env:
+          HAS_E2B_API_KEY: ${{ secrets.E2B_API_KEY != '' }}
+        run: |
+          set -euo pipefail
+          missing=()
+
+          if [[ -z ${WIF_PROVIDER:-} ]]; then
+            missing+=("environment variable WIF_PROVIDER is not set on the GitHub environment 'opensteer-staging'. Set it to the full Workload Identity provider resource name: projects/<GCP_PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>")
+          elif [[ ! $WIF_PROVIDER =~ ^projects/[0-9]+/locations/global/workloadIdentityPools/[a-z0-9-]+/providers/[a-z0-9-]+$ ]]; then
+            missing+=("environment variable WIF_PROVIDER on 'opensteer-staging' is not a Workload Identity provider resource name (got '$WIF_PROVIDER'; expected projects/<GCP_PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL>/providers/<PROVIDER>)")
+          fi
+
+          if [[ -z ${WIF_SERVICE_ACCOUNT:-} ]]; then
+            missing+=("environment variable WIF_SERVICE_ACCOUNT is not set on the GitHub environment 'opensteer-staging'. Set it to the deployer service account this workflow impersonates, e.g. portablefs-deployer@opensteer-staging.iam.gserviceaccount.com")
+          elif [[ ! $WIF_SERVICE_ACCOUNT =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$ ]]; then
+            missing+=("environment variable WIF_SERVICE_ACCOUNT on 'opensteer-staging' is not a service account email (got '$WIF_SERVICE_ACCOUNT')")
+          fi
+
+          if [[ $HAS_E2B_API_KEY != true ]]; then
+            missing+=("secret E2B_API_KEY is not set on the GitHub environment 'opensteer-staging'. It must be a staging-scoped E2B key: this workflow promotes an E2B template to default, and a production key would repoint production Cloud Computers")
+          fi
+
+          if [[ -z ${OPENSTEER_VOLUME_IDS:-} ]]; then
+            missing+=("no staging volumes to deploy. Set environment variable OPENSTEER_VOLUME_IDS on the GitHub environment 'opensteer-staging' to a comma-separated list of volume UUIDs, or pass the volume_ids workflow_dispatch input")
+          elif [[ ! $OPENSTEER_VOLUME_IDS =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(,[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})*$ ]]; then
+            missing+=("OPENSTEER_VOLUME_IDS is not a comma-separated list of volume UUIDs (got '$OPENSTEER_VOLUME_IDS')")
+          fi
+
+          if ((${#missing[@]} > 0)); then
+            echo "The opensteer-staging deployment environment is not provisioned:" >&2
+            printf -- '  - %s\n' "${missing[@]}" >&2
+            cat >&2 <<'REMEDY'
+
+          Provision these by hand (this workflow deliberately creates no IAM or
+          WIF resources):
+            1. GitHub -> Settings -> Environments -> create 'opensteer-staging'.
+            2. Add its variables WIF_PROVIDER, WIF_SERVICE_ACCOUNT,
+               OPENSTEER_VOLUME_IDS and its secret E2B_API_KEY.
+            3. In GCP, grant the WIF_SERVICE_ACCOUNT principal
+               roles/iam.workloadIdentityUser for this repository's OIDC subject
+               on the pool named by WIF_PROVIDER, and give that service account
+               compute.instances.get / roles/iap.tunnelResourceAccessor / OS
+               Login on project opensteer-staging.
+          REMEDY
+            exit 1
+          fi
+
+          echo "opensteer-staging environment is provisioned"
+
+      - name: Check out the dispatched PortableFS commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the dispatched commit
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          echo "Deploying $DISPATCH_REF at $(git rev-parse HEAD) to opensteer-staging"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+
+      - name: Build and verify one matched hosted release
+        id: release
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          commit_epoch=$(git show -s --format=%ct HEAD)
+          release_date=$(date --utc --date="@$commit_epoch" +%Y%m%d)
+          release_id="pfs-hosted-$release_date-${commit:0:12}"
+          output="$RUNNER_TEMP/portablefs-release"
+          release_dir=$(scripts/build-hosted-linux-release.sh "$output" "$release_id" amd64)
+          deploy/gcp/verify-hosted-release.sh "$release_dir"
+          {
+            echo "release_id=$release_id"
+            echo "release_dir=$release_dir"
+            echo "candidate=opensteer-cloud-runner-staging:pfs-${commit:0:12}"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud without a stored key
+        id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SERVICE_ACCOUNT }}
+
+      # The preflight can prove the names are present and well formed; only the
+      # OIDC exchange itself can prove the bindings exist. If it fails, say so
+      # in the same vocabulary as the preflight rather than leaving the raw
+      # google-github-actions error as the whole story.
+      - name: Explain a Workload Identity Federation binding failure
+        if: failure() && steps.auth.conclusion == 'failure'
+        run: |
+          set -euo pipefail
+          cat >&2 <<REMEDY
+          Workload Identity Federation refused this run.
+            provider:        $WIF_PROVIDER
+            service account: $WIF_SERVICE_ACCOUNT
+            repository:      $GITHUB_REPOSITORY
+
+          The names are well formed, so the missing piece is a binding, not a
+          value. Confirm by hand that:
+            - the provider above exists and its attribute condition admits
+              repository '$GITHUB_REPOSITORY';
+            - '$WIF_SERVICE_ACCOUNT' grants roles/iam.workloadIdentityUser to
+              principalSet://iam.googleapis.com/<POOL>/attribute.repository/$GITHUB_REPOSITORY;
+            - that service account can reach project opensteer-staging.
+          REMEDY
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+
+      - name: Set up the OpenSteer Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
+      - name: Install the pinned E2B SDK
+        run: |
+          set -euo pipefail
+          sdk_root="$RUNNER_TEMP/opensteer-e2b-sdk"
+          mkdir -p "$sdk_root"
+          npm install --prefix "$sdk_root" --no-package-lock --no-save \
+            --ignore-scripts --omit=dev --no-audit --no-fund e2b@2.39.0
+
+      - name: Build and smoke-test the candidate E2B template
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          OPENSTEER_E2B_SDK_ROOT: ${{ runner.temp }}/opensteer-e2b-sdk
+          OPENSTEER_E2B_TEMPLATE_NAME: ${{ steps.release.outputs.candidate }}
+          OPENSTEER_PORTABLEFS_ARTIFACT_PATH: ${{ steps.release.outputs.release_dir }}/bin/portablefs
+          OPENSTEER_PORTABLEFS_RELEASE_ID: ${{ steps.release.outputs.release_id }}
+          OPENSTEER_E2B_CANDIDATE: ${{ steps.release.outputs.candidate }}
+          RELEASE_ID: ${{ steps.release.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          node deploy/opensteer/build-e2b-template.mjs
+          node deploy/opensteer/e2b-release.mjs smoke "$OPENSTEER_E2B_CANDIDATE" "$RELEASE_ID"
+
+      - name: Deploy the matched release forward
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          OPENSTEER_E2B_CANDIDATE: ${{ steps.release.outputs.candidate }}
+          OPENSTEER_E2B_SDK_ROOT: ${{ runner.temp }}/opensteer-e2b-sdk
+          OPENSTEER_EVIDENCE_DIR: ${{ runner.temp }}/opensteer-deployment-evidence
+          OPENSTEER_RELEASE_DIR: ${{ steps.release.outputs.release_dir }}
+        run: deploy/opensteer/deploy-production.sh
+
+      - name: Retain the fencing and release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: ignore
+          name: opensteer-portablefs-staging-${{ steps.release.outputs.release_id }}
+          path: ${{ runner.temp }}/opensteer-deployment-evidence
+          retention-days: 90

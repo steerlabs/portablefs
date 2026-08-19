@@ -567,6 +567,27 @@ each child's attributes: `ls -l` still resolves N/A for children that were not
 already warm, instead of borrowing E as an attribute lease. Without E-R (cold
 or post-recall), enumeration refetches. No kernel directory cache (§3.1).
 
+**An ungranted enumeration reply is not a protocol violation.** §2.2 makes the
+grant on a read-side reply a MAY, and a directory under sustained mutation is
+precisely where the authority withholds it; independently, the frontend
+declines to install a grant a newer recall's floor has overtaken, one whose
+coordinate has a local recall between BEGIN and FINISH, and one past the
+family's cache budget. All four outcomes mean the same thing and only that
+thing: **this reply is uncached.** The frontend serves the page and refetches
+next time; it does not fence, and the mount is not revoked. The genuine
+violation that does stay fail-closed is a directory reply that carries no
+stable identity, because no coordinate can name it and therefore no recall can
+ever reach it.
+
+An uncovered page is **bounded to the kernel callback that fetched it**. It is
+retired when the next callback begins — entries, buffered EOF and all — while
+the authority cookie and verifier are kept, so the refetch resumes at the last
+entry actually delivered. That is what makes the uncached path skip no name and
+repeat none, and it leaves the mutation check where it belongs: on the
+authority's readdir verifier, which answers a stream that moved underneath it
+with ESTALE (§5.4, `TestPagedReaddirRefusesToPageAcrossARemoteMutation`), not
+on the presence of a cache lease.
+
 ### 5.5 LOCAL routes
 
 Route-owned names remain LOCAL-class: served entirely by the daemon, no

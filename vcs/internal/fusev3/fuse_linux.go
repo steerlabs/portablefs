@@ -1065,6 +1065,15 @@ type dirHandle struct {
 	// the beginning rather than resume an authority cookie/verifier from a
 	// recalled E(dir) lease.
 	enumerationInvalidated bool
+	// pageUncovered marks a buffered page this mount holds no E(dir) authority
+	// over, because the authority declined the grant or this frontend could not
+	// install the one it sent (see peek). Such a page is exact for the callback
+	// that fetched it and no longer: nothing will recall it if the directory
+	// changes underneath. seekdirLocked therefore retires it at the next kernel
+	// callback, leaving the authority cookie and verifier in place so the next
+	// fetch resumes exactly where this one stopped and the verifier -- not a
+	// lease -- is what catches a mutation across the gap.
+	pageUncovered bool
 
 	// local is the set of machine-local route roots this directory contains and
 	// shadow is the set of names they own. Both are decided once, when the
@@ -1472,17 +1481,22 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 	if response.GetOpen() == nil || len(response.GetOpen().GetHandle()) == 0 {
 		return nil, 0, syscall.EIO
 	}
-	identity, ok := publicationIdentityFromItem(n.item)
-	publication := replyPublicationFromContext(ctx)
-	_, granted := publication.leaseGrant(
-		authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION,
-		authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ,
-		identity, publicationIdentity{}, "", time.Now(),
-	)
-	if !ok || !granted {
-		n.mount.revoke(errors.New("fusev3: successful directory OPEN omitted its required enumeration lease"))
+	if _, ok := publicationIdentityFromItem(n.item); !ok {
+		// An item with no stable identity has no coordinate to be covered by, so
+		// no lease could name it and no recall could reach it. That is a genuine
+		// protocol violation and stays fail-closed.
+		n.mount.revoke(errors.New("fusev3: successful directory OPEN carried no stable identity"))
 		return nil, 0, syscall.ENOTCONN
 	}
+	// An E(dir) grant is deliberately not required here. Cache authority is
+	// something the authority MAY attach to a read-side reply and withholds
+	// while the coordinate is under recall (docs/portable-coherence.md §2.2),
+	// and this frontend independently declines to install a grant that a newer
+	// recall's grant floor, an unfinished local recall, or the family's cache
+	// budget has overtaken. Every one of those means exactly one thing -- this
+	// stream is uncached and refetches (§5.4) -- and none of them means the
+	// authority broke the protocol. Requiring the grant here turned an ordinary
+	// directory mutation racing an enumeration into a revoked mount.
 	return &dirHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle())}, 0, 0
 }
 
@@ -1497,7 +1511,13 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 	// state re-reads the directory from the beginning; whether the kernel is
 	// allowed to continue a stream that was dropped underneath it is decided in
 	// seekdirLocked, which is the only place that knows the resume offset.
-	if h.pageLease.epoch != 0 || h.pending != nil || h.index < len(h.page) || len(h.verifier) != 0 || len(h.cookie) != 0 {
+	//
+	// A page fetched without enumeration authority is exempt: it is covered by
+	// nothing by construction, seekdirLocked already retires it at the next
+	// kernel callback, and resetting it here mid-callback would re-read from the
+	// beginning and hand the kernel names it has already been given.
+	if !h.pageUncovered &&
+		(h.pageLease.epoch != 0 || h.pending != nil || h.index < len(h.page) || len(h.verifier) != 0 || len(h.cookie) != 0) {
 		identity, ok := publicationIdentityFromItem(h.node.item)
 		if !ok || !h.node.mount.leases.matches(leaseKey{
 			family: authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, identity: identity,
@@ -1565,21 +1585,36 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 				return nil, nil, syscall.EIO
 			}
 			identity, ok := publicationIdentityFromItem(h.node.item)
-			publication := replyPublicationFromContext(ctx)
-			grant, granted := publication.leaseGrant(
-				authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ,
-				identity, publicationIdentity{}, "", time.Now())
-			if !ok || !granted {
+			if !ok {
 				for _, entry := range page.GetEntries() {
 					if item := entry.GetItem(); item != nil {
 						h.node.mount.deferReclaim(item.GetToken())
 					}
 				}
-				h.node.mount.revoke(errors.New("fusev3: authority returned READDIR without its required enumeration lease"))
+				h.node.mount.revoke(errors.New("fusev3: READDIR answered for an item with no stable identity"))
 				return nil, nil, syscall.ENOTCONN
 			}
+			publication := replyPublicationFromContext(ctx)
+			grant, granted := publication.leaseGrant(
+				authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ,
+				identity, publicationIdentity{}, "", time.Now())
+			// An enumeration page that carries no installable E(dir) grant is
+			// legitimate, and it is the ordinary answer while a directory is being
+			// mutated: the authority may answer a read without minting cache
+			// authority, and this frontend refuses to install a grant a newer
+			// recall's floor has overtaken, one whose coordinate has a recall it
+			// has not finished, and one past the family's cache budget. The page
+			// itself is still the exact, verifier-stamped state the authority just
+			// produced, so it is served -- uncached. What that costs is the next
+			// enumeration of this directory being a refetch (§5.4) rather than a
+			// local hit; what requiring it cost was the mount.
 			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
-			h.pageLease = leaseStamp{epoch: grant.epoch, issuedSequence: grant.issuedSequence}
+			h.pageUncovered = !granted
+			if granted {
+				h.pageLease = leaseStamp{epoch: grant.epoch, issuedSequence: grant.issuedSequence}
+			} else {
+				h.pageLease = leaseStamp{}
+			}
 			h.pageWantItems = wantItems
 			h.verifier = cloneBytes(page.GetVerifier())
 			if len(h.page) == 0 && !h.eof {
@@ -1703,6 +1738,28 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		h.enumerationInvalidated = false
 		h.cursorGeneration++
 	}
+	if h.pageUncovered {
+		// This handle is between kernel callbacks holding a page no lease covers,
+		// so no recall will arrive to invalidate it if the directory changed in
+		// the gap. Its entries were exact when the authority produced them and
+		// are not claimed to be exact now, so the page is retired here rather
+		// than served again. The authority cookie and verifier are kept: the
+		// next fetch resumes at the last entry this handle actually delivered,
+		// which is what makes the refetch skip and duplicate nothing, and the
+		// verifier is what turns a mutation across the gap into the ESTALE this
+		// stream already owes its caller.
+		//
+		// An end-of-stream this handle holds no authority over is retired with
+		// the rest of the page. Re-establishing it costs one authority round
+		// trip and is the difference between reporting a directory finished
+		// because it was finished and reporting it finished because a page that
+		// nothing was obliged to withdraw still said so.
+		h.discardPageItemsLocked()
+		h.page, h.index, h.eof = nil, 0, false
+		h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
+		h.pageUncovered = false
+		h.pageLease = leaseStamp{}
+	}
 	if off == h.next {
 		// The kernel is continuing from where this handle stopped. Keeping the
 		// buffered page is the whole point of fetching 256 entries at a time.
@@ -1742,6 +1799,7 @@ func (h *dirHandle) invalidateEnumeration() {
 	h.pageLease = leaseStamp{}
 	h.cookie, h.verifier = nil, nil
 	h.next, h.localIndex, h.eof = 0, 0, false
+	h.pageUncovered = false
 	h.enumerationInvalidated = true
 	h.cursorGeneration++
 }
