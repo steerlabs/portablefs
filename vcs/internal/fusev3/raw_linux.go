@@ -1510,9 +1510,18 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	if len(publication.data) != 0 {
 		retained := publication.data[:0]
 		for _, candidate := range publication.data {
+			// A READ reply carries no successor grant of its own when the
+			// authority has nothing new to issue -- it is already covered by the
+			// D lease this handle was opened under, which is the obligation that
+			// will purge these pages. Requiring a reply-local grant instead
+			// turned every such read into EAGAIN, and EAGAIN is not an errno
+			// read(2) may return on a blocking description.
 			if candidate.revoked || publication.leaseRemaining(
 				authoritypb.LeaseFamily_LEASE_FAMILY_DATA, authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ,
-				candidate.record.identity, publicationIdentity{}, "", time.Now()) <= 0 {
+				candidate.record.identity, publicationIdentity{}, "", time.Now()) <= 0 &&
+				r.mount.leases.remaining(leaseKey{
+					family: authoritypb.LeaseFamily_LEASE_FAMILY_DATA, identity: candidate.record.identity,
+				}, authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ, time.Now()) <= 0 {
 				r.settleDataPublicationLocked(candidate, false)
 				if opcode == 15 { // READ
 					retryRead = true
@@ -2352,7 +2361,16 @@ func (r *rawFileSystem) beginBufferedRead(ctx context.Context, record *inodeReco
 	coordinate := publicationCoordinate{kind: publicationItemData, item: record.identity}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.repairingCoordinates[coordinate] || !r.sourcePublicationAllowedLocked(coordinate, sourceLeaseFromContext(ctx)) {
+	// A buffered READ is not refused because this mount is mutating something.
+	// It cannot be: the kernel holds the folio lock while it waits for the reply,
+	// so a refusal is the only non-blocking answer and the only errno available
+	// for it is EAGAIN, which read(2) may not return on a blocking description --
+	// stock Linux hands it straight to the caller, where it is either a spurious
+	// failure or, for a runtime that polls, a permanent stall. Ordering is
+	// established at the purge instead: a whole-file invalidation waits for every
+	// read admitted before it (drainDataPublications), and a read admitted after
+	// it was issued after the mutation applied, so its bytes are the new state.
+	if r.repairingCoordinates[coordinate] {
 		return false
 	}
 	r.publishingInodes[record.key.inode]++

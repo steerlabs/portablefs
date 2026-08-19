@@ -33,6 +33,20 @@ this file is the human-curated summary.
   22. Nothing is served past its lease: a coordinate under recall still misses to
   the authority.
 
+### Fixed
+
+- A buffered read on a mount doing its own I/O could stall forever. The frontend
+  refused such a read with `EAGAIN` -- an errno `read(2)` may not return on a
+  blocking description, which stock Linux hands straight to the caller and which
+  permanently parks any runtime that then polls the descriptor. It was refused
+  for two reasons that were not about this read at all: an unrelated file's
+  in-flight `O_CREAT|O_TRUNC` on the same mount closed data publication globally,
+  and a read reply that carried no successor lease was dropped even while the
+  lease its handle was opened under was still live. Reads are no longer refused
+  for either reason; instead every whole-file invalidation waits for the reads
+  already admitted for that inode before it purges, which is the ordering the
+  refusal was standing in for.
+
 ### Changed
 
 - Name the three stock-kernel boundaries on the Linux range and link surfaces

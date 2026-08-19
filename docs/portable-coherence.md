@@ -289,14 +289,24 @@ On a revoke/COMPLETE affecting local coordinates, the daemon:
    a safe delayed grant on a disjoint coordinate, but never withdraws an
    already-installed disjoint lease. CONTROL event sequence numbers are exact
    phase tokens, not a per-holder delivery order: disjoint recalls may overtake.
-2. **Drains already-admitted writers before REVOKE acknowledgment.** A READ
-   admitted before the recall may finish its physical reply; the recall waits
-   for that writer, then COMPLETE performs the full-file purge. A new buffered
-   READ that reaches an already-closed coordinate cannot safely return bytes
-   and currently receives `EAGAIN`; it never waits inside the locked FUSE
-   callback. Metadata requests use the zero-validity lane. This is a disclosed
-   transient availability cost of the stock-FUSE profile, not a claim that
-   FUSE_READ has a cache-validity field.
+2. **Orders every whole-file purge after the READs already admitted for that
+   inode.** The purge takes a snapshot of the buffered reads in flight for the
+   coordinate and waits for their physical replies before invalidating, so no
+   folio filled with pre-mutation bytes survives it. It is a snapshot rather
+   than a quiescence wait in both directions that matters: a read admitted after
+   the cut was issued after the mutation applied, so its bytes are the new state
+   and waiting for it would let a stream of readers starve the purge.
+
+   A buffered READ is therefore **never refused because this mount is
+   mutating**. It cannot be: the kernel holds the folio lock while it waits for
+   the reply, so refusing is the only non-blocking answer available and the only
+   errno for it is `EAGAIN`, which `read(2)` may not return on a blocking
+   description — stock Linux hands it straight to the caller, where it is a
+   spurious failure or, for a runtime that polls the descriptor, a permanent
+   stall. A READ reply likewise does not need a successor D grant of its own: it
+   is covered by the D lease its handle was opened under, which is the
+   obligation that will purge those pages. Metadata requests use the
+   zero-validity lane.
 3. **Purges daemon namespace state, then invalidates inodes**: every recalled N
    binding is removed from the daemon cache; kernel entry validity is already
    zero. Then INVAL_INODE expires attributes and purges the full file for every

@@ -981,6 +981,50 @@ func publicationInstallsCoordinate(publication *replyPublication, coordinate pub
 	return false
 }
 
+// drainDataPublications orders one whole-file invalidation after every buffered
+// READ this mount had already admitted for the inode. Those reads may be
+// carrying pre-mutation bytes into folios the kernel has locked, so a purge that
+// ran ahead of their replies would miss exactly the pages it exists to remove.
+//
+// It is a snapshot, not a quiescence wait. A read admitted after this cut was
+// issued after the mutation applied, so its bytes are the new state and the
+// purge has no business waiting for it -- which is also what keeps a steady
+// stream of readers from starving the purge indefinitely.
+func (r *rawFileSystem) drainDataPublications(coordinate publicationCoordinate) error {
+	r.mu.Lock()
+	pending := make(map[*replyPublication]struct{})
+	for _, publication := range r.replyPublications {
+		for _, data := range publication.data {
+			if data.coordinate == coordinate {
+				pending[publication] = struct{}{}
+				break
+			}
+		}
+	}
+	deadline := time.Now().Add(r.mount.repairBudget)
+	for {
+		for publication := range pending {
+			if r.replyPublications[publication.requestUnique] != publication {
+				delete(pending, publication)
+			}
+		}
+		if len(pending) == 0 {
+			r.mu.Unlock()
+			return nil
+		}
+		changed := r.sourceChanged
+		r.mu.Unlock()
+		timer := time.NewTimer(time.Until(deadline))
+		select {
+		case <-changed:
+			timer.Stop()
+		case <-timer.C:
+			return fmt.Errorf("%w: buffered reads did not drain before a whole-file invalidation", errRepairBudgetExceeded)
+		}
+		r.mu.Lock()
+	}
+}
+
 func (r *rawFileSystem) openLeaseCoordinate(coordinate publicationCoordinate) {
 	r.mu.Lock()
 	delete(r.repairingCoordinates, coordinate)
@@ -1012,6 +1056,9 @@ func (r *rawFileSystem) invalidateLease(key leaseKey) error {
 		notifier := r.mount.notifier()
 		if notifier == nil {
 			return errors.New("fusev3: data lease invalidation has no kernel notification channel")
+		}
+		if err := r.drainDataPublications(publicationCoordinate{kind: publicationItemData, item: key.identity}); err != nil {
+			return err
 		}
 		r.mu.Lock()
 		record := r.byIdentityLocked(key.identity)
