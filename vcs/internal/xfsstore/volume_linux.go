@@ -1424,7 +1424,7 @@ func fallocateNeedsAlignment(mode uint32) bool {
 }
 
 // fallocateExpectedSize performs every authoritative-EOF-dependent check in
-// the same order as pinned Linux 6.12.100/XFS after alignment has been proven.
+// the same order as Linux XFS after alignment has been proven.
 // Universal offset+length/s_maxbytes validation happens before this helper.
 func fallocateExpectedSize(before uint64, spec FallocateSpec) (uint64, error) {
 	end := spec.Offset + spec.Length

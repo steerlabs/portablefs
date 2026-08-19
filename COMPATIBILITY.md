@@ -4,6 +4,14 @@ This is the PortableFS v3 stability contract. Authority protocol 6 is a
 deliberate wire reset from the retired protocol-5/private-kernel candidate;
 there is no mixed-version execution path.
 
+Status: **verification candidate (pre-launch)**. PortableFS has not launched,
+and the normative coherence specification behind protocol 6
+([docs/portable-coherence.md](./docs/portable-coherence.md)) is still DRAFT
+pending the §12 L1–L6 verification program. The surfaces below are therefore
+stated as the intended contract and reviewed as if frozen — no change lands
+silently — but they become a stability promise only when that specification
+leaves draft.
+
 ## v2 is gone
 
 v3 is a breaking reset, not a migration. The v2 product — the remote
@@ -25,9 +33,14 @@ client at the handshake rather than negotiating down.
 Everything below describes v3 and only v3. If a surface is not listed here,
 treat it as internal and unstable.
 
-## Frozen
+## Verification-candidate contract
 
-Breaking changes are prohibited. Deployments and clients may pin against these.
+These are the surfaces protocol 6 is committing to. Breaking changes are
+prohibited without going through [Changing a contract
+surface](#changing-a-contract-surface); a change that verification forces is
+still a coordinated protocol-major change, not a silent edit. Pre-launch, pin
+against these knowing the draft specification can still move a detail; after it
+leaves draft they are frozen.
 
 ### The authority wire
 
@@ -127,7 +140,7 @@ Breaking changes are prohibited. Deployments and clients may pin against these.
 ### Filesystem semantics
 
 The guarantees in [docs/consistency-model.md](./docs/consistency-model.md) are
-frozen: write-through acknowledgement, `fsync` on the authoritative descriptor,
+part of the contract: write-through acknowledgement, `fsync` on the authoritative descriptor,
 `close` is not an implicit `fsync`, session-exact replay inside an epoch, no
 silent continuation across an epoch, atomic rename, and open-after-unlink. The
 authority implements independent POSIX record and `flock` lock namespaces, and
@@ -144,7 +157,7 @@ stock Linux performs no FUSE revalidation for those observations and exposes no
 receipt that can make a remote rename linearizable there. This is an explicit
 semantic boundary, not a weaker negotiated profile.
 
-The explicit refusals are equally frozen, because programs depend on getting an
+The explicit refusals carry equal weight, because programs depend on getting an
 errno rather than incoherent data: shared file-backed `mmap`, `setxattr`, device
 nodes, FIFOs, sockets, setuid execution, and cross-volume link and rename. The
 XFS authority and Linux expose unsupported xattr writes as `EOPNOTSUPP`. The
@@ -245,7 +258,7 @@ bundle identifier, app group, FSKit type `pfs`, resource scheme
 Additive evolution with versioning; consumers tolerate additions.
 
 - New authority operations and new feature strings behind the existing
-  handshake, where an authority that lacks them still serves the frozen set.
+  handshake, where an authority that lacks them still serves the contract set.
   `session-reauthorization-v1` is one such optional feature: it adds an exact,
   session-bound `Reauthorize` operation without making older protocol-6
   authorities invalid for standalone mounts. `mount-enrollment-reauthorization-v1` names
@@ -284,9 +297,9 @@ closed on unknown fields and carry explicit schema/version fields, but they are
 not frozen public APIs yet. The authority protocol additions they use remain
 additive under the rules above.
 
-## Changing a frozen surface
+## Changing a contract surface
 
-Frozen does not mean immortal; changes are deliberate and staged.
+A contract surface is not immortal; changes are deliberate and staged.
 
 1. Propose the change in an issue explaining why additive evolution cannot work.
 2. Ship the replacement additively while the old surface keeps working, and mark
@@ -299,6 +312,7 @@ A protocol-visible change is the exception that skips straight to a new exact
 protocol major: PortableFS would rather refuse a mount at the handshake than
 serve one under a contract neither side can name.
 
-PRs that touch a frozen surface must say so explicitly and explain the
+PRs that touch a contract surface must say so explicitly and explain the
 compatibility story. Reviewers should reject silent changes to anything in the
-frozen list.
+verification-candidate list — pre-launch draft status is a reason to route the
+change through this process, not a licence to skip it.

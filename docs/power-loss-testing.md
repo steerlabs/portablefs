@@ -192,15 +192,10 @@ any `--- SKIP` at all, since `REQUIRED=1` should have made one impossible.
 | `TestFsyncedWritesSurvivePowerLoss` | no | **no** | yes |
 | `TestAuthorityKillDuringWritesKeepsFsyncedData` | no | **no** | yes |
 
-The two product-level instruments need a kernel that can carry a strict mount,
-and a strict mount pins exactly one FUSE protocol version. A Docker Desktop VM
-running Linux 6.8 offers FUSE 7.39 and the mount refuses it outright:
-
-```
-fusev3: strict coherence requires the pinned FUSE protocol 7.41 exactly; kernel offered 7.39
-```
-
-The harness reports that through the ordinary gate, so it is a named skip on a
+The two product-level instruments need a kernel that can carry a lease mount,
+which means stock FUSE protocol 7.31 or newer; a kernel below that floor is
+refused at FUSE INIT rather than served under a reduced profile. The harness
+reports the refusal through the ordinary gate, so it is a named skip on a
 developer machine and a hard failure in CI - never a quiet pass. Everything else
 about those two tests - the device stack, the provisioner, the authority start,
 the credential set, the mark channel, the teardown - has been exercised on a

@@ -24,7 +24,7 @@ this file is the human-curated summary.
 
 ### Changed
 
-- Ship the named macOS 26 FSKit best-effort cache tier over protocol 5. One
+- Ship the named macOS 26 FSKit best-effort cache tier over protocol 6. One
   active Mac owns an authority-enforced compatibility writer lease; Linux peers
   remain readable but their visible mutations return `EBUSY` before storage,
   a second Mac writer is refused at activation, and clean unmount transfers

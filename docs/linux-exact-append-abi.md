@@ -22,8 +22,9 @@ delete the kernel-size shadow, delete the stale-size EIO refusal, and let the
 kernel apply `RLIMIT_FSIZE` against the offset the write actually used. No new
 opcode, reply field, or capability bit is involved.
 
-This document freezes the private FUSE dialect implemented by the patch series
-under `kernel/linux-6.12.100-portablefs-append/`.  Despite the historical file
+This document freezes the private FUSE dialect that was implemented by the
+`kernel/linux-6.12.100-portablefs-append/` patch series, which is no longer in
+the tree and survives only in git history.  Despite the historical file
 name, the design is no longer append-only.  It covers transactional shared-file
 writes, exact cache publication, range mutation, copy-file-range, namespace
 publication, and shared/local graft classification as one indivisible profile.
