@@ -1,4 +1,4 @@
-From 310512d3d39fe8b443482c445cf3811425f3648d Mon Sep 17 00:00:00 2001
+From 79a95072b1afeab54864f037546ffeb39243dd95 Mon Sep 17 00:00:00 2001
 From: Tim Jang <timjang3@gmail.com>
 Date: Tue, 18 Aug 2026 03:38:37 -0700
 Subject: [PATCH] fuse: install PortableFS exact post-state replies
@@ -7,7 +7,7 @@ Signed-off-by: Tim Jang <timjang3@gmail.com>
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  fs/fuse/Makefile          |   1 +
- fs/fuse/dev.c             | 152 +++++++++-
+ fs/fuse/dev.c             | 168 +++++++++--
  fs/fuse/dir.c             | 544 +++++++++++++++++++++++++++++-----
  fs/fuse/file.c            | 122 +++++---
  fs/fuse/fuse_i.h          |  51 +++-
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
  fs/fuse/readdir.c         | 122 +++++++-
  fs/fuse/xattr.c           |  19 +-
  include/uapi/linux/fuse.h |  71 ++++-
- 10 files changed, 1568 insertions(+), 196 deletions(-)
+ 10 files changed, 1575 insertions(+), 205 deletions(-)
  create mode 100644 fs/fuse/post_state.c
 
 diff --git a/fs/fuse/Makefile b/fs/fuse/Makefile
@@ -32,7 +32,7 @@ index ce0ff7a90..93b1b136f 100644
  fuse-$(CONFIG_FUSE_DAX) += dax.o
  fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o
 diff --git a/fs/fuse/dev.c b/fs/fuse/dev.c
-index b1078aeb7..cea98ad4c 100644
+index b1078aeb7..324832d54 100644
 --- a/fs/fuse/dev.c
 +++ b/fs/fuse/dev.c
 @@ -15,6 +15,7 @@
@@ -84,7 +84,41 @@ index b1078aeb7..cea98ad4c 100644
  		} else {
  			args->pfs_reply_token = token;
  		}
-@@ -1803,21 +1813,71 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
+@@ -1707,17 +1717,15 @@ static int fuse_pfs_reverse_inval_inode(struct fuse_conn *fc, u64 nodeid,
+ 	 * ordered DATA publication takes, because a bare page-cache scan can be
+ 	 * raced by a MAP_PRIVATE fault that reinserts a folio immediately behind
+ 	 * it.  A failure is reported to the daemon rather than swallowed; the
+-	 * caller's next escalation step is the connection abort.
+-	 *
+-	 * Every other shape keeps stock semantics: off < 0 withdraws attributes
+-	 * only, which is what an ATTRIBUTES repair sends.
++	 * caller's next escalation step is the connection abort.  Attribute repair
++	 * has its own exact stamped notification, so no other invalidation shape is
++	 * part of the strict protocol.
+ 	 */
+-	if (off == 0 && len == 0) {
+-		err = fuse_pfs_withdraw_data(target);
++	if (off || len) {
+ 		iput(target);
+-		return err;
++		return -EPROTO;
+ 	}
+-	err = fuse_reverse_inval_inode(fc, nodeid, off, len);
++	err = fuse_pfs_withdraw_data(target);
+ 	iput(target);
+ 	return err;
+ }
+@@ -1763,8 +1771,7 @@ static int fuse_notify_inval_inode(struct fuse_conn *fc, unsigned int size,
+ 		goto err;
+ 	fuse_copy_finish(cs);
+ 	if (fc->pfs_strict_coherence &&
+-	    (!outarg.ino || outarg.len != 0 ||
+-	     (outarg.off != -1 && outarg.off != 0)))
++	    (!outarg.ino || outarg.len != 0 || outarg.off != 0))
+ 		goto protocol_error;
+ 
+ 	down_read(&fc->killsb);
+@@ -1803,21 +1810,71 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
  	if (err)
  		goto abort_copy;
  	err = -EPROTO;
@@ -163,7 +197,7 @@ index b1078aeb7..cea98ad4c 100644
  		iput(inode);
  	}
  	up_read(&fc->killsb);
-@@ -1831,6 +1891,63 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
+@@ -1831,6 +1888,63 @@ static int fuse_notify_pfs_size(struct fuse_conn *fc, unsigned int size,
  	return err;
  }
  
@@ -227,11 +261,10 @@ index b1078aeb7..cea98ad4c 100644
  static int fuse_notify_inval_entry(struct fuse_conn *fc, unsigned int size,
  				   struct fuse_copy_state *cs)
  {
-@@ -2268,10 +2385,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
- 		       unsigned int size, struct fuse_copy_state *cs)
+@@ -2269,9 +2383,9 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
  {
  	if (fc->pfs_strict_coherence &&
--	    code != FUSE_NOTIFY_INVAL_INODE &&
+ 	    code != FUSE_NOTIFY_INVAL_INODE &&
 -	    code != FUSE_NOTIFY_INVAL_ENTRY &&
 -	    code != FUSE_NOTIFY_DELETE &&
 -	    code != FUSE_NOTIFY_PFS_SIZE) {
@@ -241,7 +274,7 @@ index b1078aeb7..cea98ad4c 100644
  		/* The strict dialect has a closed reverse-notification surface. */
  		fuse_copy_finish(cs);
  		fuse_abort_conn(fc);
-@@ -2310,6 +2426,12 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
+@@ -2310,6 +2424,12 @@ static int fuse_notify(struct fuse_conn *fc, enum fuse_notify_code code,
  	case FUSE_NOTIFY_PFS_SIZE:
  		return fuse_notify_pfs_size(fc, size, cs);
  

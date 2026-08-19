@@ -103,6 +103,7 @@ class PatchedSourceTests(unittest.TestCase):
         dispatch = notify.index("switch (code)")
         self.assertLess(gate, dispatch)
         for allowed in (
+            "FUSE_NOTIFY_INVAL_INODE",
             "FUSE_NOTIFY_PFS_SIZE",
             "FUSE_NOTIFY_PFS_ATTR",
             "FUSE_NOTIFY_PFS_ENTRY",
@@ -117,6 +118,19 @@ class PatchedSourceTests(unittest.TestCase):
             "fuse_notify_resend(fc",
         ):
             self.assertGreater(notify.index(forbidden_handler), dispatch)
+
+        inval_start = text.index("static int fuse_notify_inval_inode")
+        inval_end = text.index("static int fuse_notify_inval_entry", inval_start)
+        inval = text[inval_start:inval_end]
+        self.assertIn("outarg.len != 0 || outarg.off != 0", inval)
+        self.assertIn("fuse_pfs_reverse_inval_inode", inval)
+
+        reverse_start = text.index("static int fuse_pfs_reverse_inval_inode")
+        reverse_end = text.index("static int fuse_pfs_reverse_inval_entry", reverse_start)
+        reverse = text[reverse_start:reverse_end]
+        self.assertIn("if (off || len)", reverse)
+        self.assertIn("fuse_pfs_withdraw_data(target)", reverse)
+        self.assertNotIn("fuse_reverse_inval_inode", reverse)
 
     def test_strict_stamped_reverse_repairs_validate_before_mutation(
         self,
@@ -510,10 +524,10 @@ class PatchedSourceTests(unittest.TestCase):
         end = dev.index("static int fuse_pfs_reverse_inval_entry", start)
         notify = dev[start:end]
         self.assertLess(
-            notify.index("off == 0 && len == 0"),
+            notify.index("if (off || len)"),
             notify.index("fuse_pfs_withdraw_data(target)"),
         )
-        self.assertIn("fuse_reverse_inval_inode(fc, nodeid, off, len)", notify)
+        self.assertNotIn("fuse_reverse_inval_inode", notify)
 
     def test_post_state_installer_snapshots_before_stores_and_invalidates_range(
         self,
