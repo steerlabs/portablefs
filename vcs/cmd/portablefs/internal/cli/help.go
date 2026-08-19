@@ -194,8 +194,10 @@ There is no PortableFS-managed or offline write-back layer. Linux direct-I/O
 write(2) returns after the authority has applied the bytes to XFS. On macOS,
 ordinary kernel page-cache writeback still applies: write(2) may return before
 FSKit sends the write, while fsync/synchronize waits through the authority's
-server descriptor. Protocol 5 has one coherence contract: names and attributes
-are cached and repaired through the authority's synchronous visibility barrier.
+server descriptor. Protocol 6 fixes one frontend profile for the whole session
+at attach. A Linux mount holds exact N/A/D/E cache leases and discharges every
+recall before the mutating peer's reply; a macOS FSKit mount runs the
+synchronous-repair stream instead and never receives cache leases.
 --coherence may only be strict; legacy uncached mounts are rejected. Linux
 implements the exact strict-cache contract. macOS 26 declares the named
 macos26-synchronous-vfs-repair-v2 best-effort cache tier: authority ordering,
