@@ -2370,3 +2370,60 @@ func TestAuthorityIdentityNamesTheExactMalformedField(t *testing.T) {
 		t.Fatalf("authorityIdentity returned %x", identity)
 	}
 }
+
+// A negative lookup is a successful answer carrying no item. The authority
+// reports an absent name that way under FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+// and this frontend used to intern the missing item as malformed, which turned
+// every absent name into EIO and killed the coherence stream with it. On an
+// empty volume that made mount-root attestation fail outright.
+func TestV3LookupTranslatesTheNegativeAnswerToENOENT(t *testing.T) {
+	client := newFakeV3DataClient()
+	client.mutation = func(
+		_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request,
+	) (*authoritypb.Response, error) {
+		return &authoritypb.Response{
+			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+			Body: &authoritypb.Response_Lookup{
+				Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: 41},
+			},
+		}, nil
+	}
+	d := testV3DataPlane(t, client)
+
+	root := d.itemsByID[v3RootItemID].item
+	_, errno := dispatchV3Test(d, context.Background(), 0,
+		&pfslocal.LookupRequest{Dir: root, Name: []byte("absent")})
+	if errno != darwinENOENT {
+		t.Fatalf("negative lookup errno = %d, want ENOENT (%d)", errno, darwinENOENT)
+	}
+	if err := d.terminalError(); err != nil {
+		t.Fatalf("a negative lookup made the coherence stream terminal: %v", err)
+	}
+}
+
+// Fail-closed is preserved: a reply that carries neither an item nor a
+// negative snapshot sequence names nothing at all, and is still a protocol
+// violation rather than a silent ENOENT. This mirrors the Linux frontend,
+// which rejects a zero snapshot the same way.
+func TestV3LookupStillRejectsAReplyThatNamesNothing(t *testing.T) {
+	client := newFakeV3DataClient()
+	client.mutation = func(
+		_ context.Context, identity authorityrpc.MutationIdentity, _ *authoritypb.Request,
+	) (*authoritypb.Response, error) {
+		return &authoritypb.Response{
+			Mutation: &authoritypb.MutationState{Slot: identity.Slot, AcceptedSequence: identity.Sequence},
+			Body:     &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{}},
+		}, nil
+	}
+	d := testV3DataPlane(t, client)
+
+	root := d.itemsByID[v3RootItemID].item
+	_, errno := dispatchV3Test(d, context.Background(), 0,
+		&pfslocal.LookupRequest{Dir: root, Name: []byte("absent")})
+	if errno != darwinEIO {
+		t.Fatalf("reply naming nothing errno = %d, want EIO (%d)", errno, darwinEIO)
+	}
+	if d.terminalError() == nil {
+		t.Fatal("a reply naming nothing must still make the stream terminal")
+	}
+}

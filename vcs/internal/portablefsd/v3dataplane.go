@@ -422,6 +422,27 @@ func (d *v3DataPlane) lookup(ctx context.Context, operationID uint64, request *p
 	if response.GetLookup() == nil {
 		return d.malformed("lookup omitted reply")
 	}
+	// A negative lookup is a successful answer, not a missing one. Under this
+	// profile the authority reports an absent name as errno 0 with no item and
+	// a nonzero negative snapshot sequence (volume_handler_linux.go, the
+	// FRONTEND_PROFILE_FSKIT_SYNC_REPAIR branch), exactly as it does for the
+	// Linux frontend, which has always decoded that shape. This consumer did
+	// not, so every absent name was interned as a malformed item: EIO to the
+	// caller and a terminal coherence stream. An empty volume made that certain
+	// during mount-root attestation, because the first probe for any name is
+	// necessarily negative.
+	//
+	// Unlike the Linux frontend this records no negative cache stamp. The
+	// macOS 26 profile makes no exact negative-namespace invalidation claim
+	// (docs/fskit-mount.md), so caching an absence it cannot promise to
+	// invalidate would serve stale negatives. It answers ENOENT and keeps
+	// asking.
+	if response.GetLookup().GetItem() == nil {
+		if response.GetLookup().GetNegativeSnapshotSequence() == 0 {
+			return d.malformed("lookup omitted both its item and its negative snapshot sequence")
+		}
+		return nil, darwinENOENT
+	}
 	record, errno := d.intern(ctx, response.GetLookup().GetItem(), &parent.item)
 	if errno != 0 {
 		return nil, errno
