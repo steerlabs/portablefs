@@ -118,7 +118,11 @@
 // control API (EnsureAttach); it carries no secrets and is safe to appear in a
 // mount URL / logs.
 
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
 import Foundation
+#endif
 import SwiftProtobuf
 
 // If the compiler emits an error on this type, it is because this file
@@ -126,12 +130,12 @@ import SwiftProtobuf
 // incompatible with the version of SwiftProtobuf to which you are linking.
 // Please ensure that you are building against the same version of the API
 // that was used to generate this file.
-fileprivate struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
+fileprivate nonisolated struct _GeneratedWithProtocGenSwiftVersion: SwiftProtobuf.ProtobufAPIVersionCheck {
   struct _2: SwiftProtobuf.ProtobufAPIVersion_2 {}
   typealias Version = _2
 }
 
-public enum PfsPublicationSemanticCommit: SwiftProtobuf.Enum, Swift.CaseIterable {
+public nonisolated enum PfsPublicationSemanticCommit: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case unspecified // = 0
   case published // = 1
@@ -169,7 +173,7 @@ public enum PfsPublicationSemanticCommit: SwiftProtobuf.Enum, Swift.CaseIterable
 
 }
 
-public enum PfsItemKind: SwiftProtobuf.Enum, Swift.CaseIterable {
+public nonisolated enum PfsItemKind: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case unspecified // = 0
   case file // = 1
@@ -211,7 +215,7 @@ public enum PfsItemKind: SwiftProtobuf.Enum, Swift.CaseIterable {
 
 }
 
-public enum PfsOpenMode: SwiftProtobuf.Enum, Swift.CaseIterable {
+public nonisolated enum PfsOpenMode: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case unspecified // = 0
   case read // = 1
@@ -253,7 +257,7 @@ public enum PfsOpenMode: SwiftProtobuf.Enum, Swift.CaseIterable {
 
 }
 
-public enum PfsVisibilityPhase: SwiftProtobuf.Enum, Swift.CaseIterable {
+public nonisolated enum PfsVisibilityPhase: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case unspecified // = 0
   case prepare // = 1
@@ -291,7 +295,7 @@ public enum PfsVisibilityPhase: SwiftProtobuf.Enum, Swift.CaseIterable {
 
 }
 
-public enum PfsVisibilityScope: SwiftProtobuf.Enum, Swift.CaseIterable {
+public nonisolated enum PfsVisibilityScope: SwiftProtobuf.Enum, Swift.CaseIterable {
   public typealias RawValue = Int
   case unspecified // = 0
   case namespace // = 1
@@ -333,7 +337,7 @@ public enum PfsVisibilityScope: SwiftProtobuf.Enum, Swift.CaseIterable {
 
 }
 
-public struct PfsEnvelope: Sendable {
+public nonisolated struct PfsEnvelope: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -877,7 +881,7 @@ public struct PfsEnvelope: Sendable {
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum OneOf_Body: Equatable, Sendable {
+  public nonisolated enum OneOf_Body: Equatable, Sendable {
     /// client → daemon
     case hello(PfsHello)
     case resolve(PfsResolveRequest)
@@ -948,7 +952,7 @@ public struct PfsEnvelope: Sendable {
   public init() {}
 }
 
-public struct PfsHello: Sendable {
+public nonisolated struct PfsHello: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -974,7 +978,7 @@ public struct PfsHello: Sendable {
 /// final result crossed the FSKit reply boundary; it is mandatory even when the
 /// operation produced only a cacheable error/negative result. NOT_PUBLISHED is
 /// safe only when no visible authority mutation in the operation committed.
-public struct PfsPublicationAck: Sendable {
+public nonisolated struct PfsPublicationAck: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -993,7 +997,7 @@ public struct PfsPublicationAck: Sendable {
 /// request on this exact connection. Handle ownership and item publication are
 /// deliberately independent: Create returns both, and VolumeCore can own its
 /// installed handle even when the framework refuses the returned item.
-public struct PfsResourceReplyDisposition: Sendable {
+public nonisolated struct PfsResourceReplyDisposition: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1014,7 +1018,7 @@ public struct PfsResourceReplyDisposition: Sendable {
   public init() {}
 }
 
-public struct PfsHelloReply: Sendable {
+public nonisolated struct PfsHelloReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1051,7 +1055,7 @@ public struct PfsHelloReply: Sendable {
 /// Resolve binds this connection to one attach. All subsequent item ops on the
 /// connection are scoped to it. One attach per connection; the extension opens
 /// one connection per mounted volume (plus one for events if it prefers).
-public struct PfsResolveRequest: Sendable {
+public nonisolated struct PfsResolveRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1063,60 +1067,60 @@ public struct PfsResolveRequest: Sendable {
   public init() {}
 }
 
-public struct PfsResolveReply: @unchecked Sendable {
+public nonisolated struct PfsResolveReply: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var root: PfsItem {
-    get {return _storage._root ?? PfsItem()}
+    get {_storage._root ?? PfsItem()}
     set {_uniqueStorage()._root = newValue}
   }
   /// Returns true if `root` has been explicitly set.
-  public var hasRoot: Bool {return _storage._root != nil}
+  public var hasRoot: Bool {_storage._root != nil}
   /// Clears the value of `root`. Subsequent reads from it will return its default value.
   public mutating func clearRoot() {_uniqueStorage()._root = nil}
 
   public var rootAttr: PfsAttr {
-    get {return _storage._rootAttr ?? PfsAttr()}
+    get {_storage._rootAttr ?? PfsAttr()}
     set {_uniqueStorage()._rootAttr = newValue}
   }
   /// Returns true if `rootAttr` has been explicitly set.
-  public var hasRootAttr: Bool {return _storage._rootAttr != nil}
+  public var hasRootAttr: Bool {_storage._rootAttr != nil}
   /// Clears the value of `rootAttr`. Subsequent reads from it will return its default value.
   public mutating func clearRootAttr() {_uniqueStorage()._rootAttr = nil}
 
   public var volumeID: String {
-    get {return _storage._volumeID}
+    get {_storage._volumeID}
     set {_uniqueStorage()._volumeID = newValue}
   }
 
   public var branch: String {
-    get {return _storage._branch}
+    get {_storage._branch}
     set {_uniqueStorage()._branch = newValue}
   }
 
   /// display name for the mounted volume
   public var volumeName: String {
-    get {return _storage._volumeName}
+    get {_storage._volumeName}
     set {_uniqueStorage()._volumeName = newValue}
   }
 
   public var capabilities: PfsCapabilities {
-    get {return _storage._capabilities ?? PfsCapabilities()}
+    get {_storage._capabilities ?? PfsCapabilities()}
     set {_uniqueStorage()._capabilities = newValue}
   }
   /// Returns true if `capabilities` has been explicitly set.
-  public var hasCapabilities: Bool {return _storage._capabilities != nil}
+  public var hasCapabilities: Bool {_storage._capabilities != nil}
   /// Clears the value of `capabilities`. Subsequent reads from it will return its default value.
   public mutating func clearCapabilities() {_uniqueStorage()._capabilities = nil}
 
   public var v3Coherence: PfsV3CoherenceContract {
-    get {return _storage._v3Coherence ?? PfsV3CoherenceContract()}
+    get {_storage._v3Coherence ?? PfsV3CoherenceContract()}
     set {_uniqueStorage()._v3Coherence = newValue}
   }
   /// Returns true if `v3Coherence` has been explicitly set.
-  public var hasV3Coherence: Bool {return _storage._v3Coherence != nil}
+  public var hasV3Coherence: Bool {_storage._v3Coherence != nil}
   /// Clears the value of `v3Coherence`. Subsequent reads from it will return its default value.
   public mutating func clearV3Coherence() {_uniqueStorage()._v3Coherence = nil}
 
@@ -1129,7 +1133,7 @@ public struct PfsResolveReply: @unchecked Sendable {
 
 /// Present exactly when the resolved attach is backed by the v3 authority and
 /// the frontend must participate in its strict two-phase visibility protocol.
-public struct PfsV3CoherenceContract: @unchecked Sendable {
+public nonisolated struct PfsV3CoherenceContract: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1145,11 +1149,11 @@ public struct PfsV3CoherenceContract: @unchecked Sendable {
   public var repairBudgetMillis: UInt64 = 0
 
   public var initialCursor: PfsVisibilityCursor {
-    get {return _initialCursor ?? PfsVisibilityCursor()}
+    get {_initialCursor ?? PfsVisibilityCursor()}
     set {_initialCursor = newValue}
   }
   /// Returns true if `initialCursor` has been explicitly set.
-  public var hasInitialCursor: Bool {return self._initialCursor != nil}
+  public var hasInitialCursor: Bool {self._initialCursor != nil}
   /// Clears the value of `initialCursor`. Subsequent reads from it will return its default value.
   public mutating func clearInitialCursor() {self._initialCursor = nil}
 
@@ -1164,7 +1168,7 @@ public struct PfsV3CoherenceContract: @unchecked Sendable {
 /// successful reply is emitted only after portablefsd completes an on-demand
 /// authority KeepAlive on the session's reserved liveness lane. Mismatched
 /// identities are a protocol error; there is no local-only fallback.
-public struct PfsV3LivenessRequest: @unchecked Sendable {
+public nonisolated struct PfsV3LivenessRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1178,7 +1182,7 @@ public struct PfsV3LivenessRequest: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsV3LivenessReply: @unchecked Sendable {
+public nonisolated struct PfsV3LivenessReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1192,7 +1196,7 @@ public struct PfsV3LivenessReply: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsCapabilities: Sendable {
+public nonisolated struct PfsCapabilities: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1272,7 +1276,7 @@ public struct PfsCapabilities: Sendable {
   public init() {}
 }
 
-public struct PfsItem: @unchecked Sendable {
+public nonisolated struct PfsItem: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1292,74 +1296,74 @@ public struct PfsItem: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsAttr: @unchecked Sendable {
+public nonisolated struct PfsAttr: @unchecked Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _storage._item ?? PfsItem()}
+    get {_storage._item ?? PfsItem()}
     set {_uniqueStorage()._item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return _storage._item != nil}
+  public var hasItem: Bool {_storage._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {_uniqueStorage()._item = nil}
 
   public var kind: PfsItemKind {
-    get {return _storage._kind}
+    get {_storage._kind}
     set {_uniqueStorage()._kind = newValue}
   }
 
   /// permission bits only (kind is separate)
   public var mode: UInt32 {
-    get {return _storage._mode}
+    get {_storage._mode}
     set {_uniqueStorage()._mode = newValue}
   }
 
   public var nlink: UInt32 {
-    get {return _storage._nlink}
+    get {_storage._nlink}
     set {_uniqueStorage()._nlink = newValue}
   }
 
   public var uid: UInt32 {
-    get {return _storage._uid}
+    get {_storage._uid}
     set {_uniqueStorage()._uid = newValue}
   }
 
   public var gid: UInt32 {
-    get {return _storage._gid}
+    get {_storage._gid}
     set {_uniqueStorage()._gid = newValue}
   }
 
   public var size: UInt64 {
-    get {return _storage._size}
+    get {_storage._size}
     set {_uniqueStorage()._size = newValue}
   }
 
   public var mtimeMs: Int64 {
-    get {return _storage._mtimeMs}
+    get {_storage._mtimeMs}
     set {_uniqueStorage()._mtimeMs = newValue}
   }
 
   public var ctimeMs: Int64 {
-    get {return _storage._ctimeMs}
+    get {_storage._ctimeMs}
     set {_uniqueStorage()._ctimeMs = newValue}
   }
 
   public var atimeMs: Int64 {
-    get {return _storage._atimeMs}
+    get {_storage._atimeMs}
     set {_uniqueStorage()._atimeMs = newValue}
   }
 
   public var birthtimeMs: Int64 {
-    get {return _storage._birthtimeMs}
+    get {_storage._birthtimeMs}
     set {_uniqueStorage()._birthtimeMs = newValue}
   }
 
   /// coherence version; bumps on content change
   public var contentVersion: UInt64 {
-    get {return _storage._contentVersion}
+    get {_storage._contentVersion}
     set {_uniqueStorage()._contentVersion = newValue}
   }
 
@@ -1368,25 +1372,25 @@ public struct PfsAttr: @unchecked Sendable {
   /// parents; the daemon returns the parent of the concrete alias used for the
   /// operation, or a deterministic live alias for identity-only operations.
   public var parent: PfsItem {
-    get {return _storage._parent ?? PfsItem()}
+    get {_storage._parent ?? PfsItem()}
     set {_uniqueStorage()._parent = newValue}
   }
   /// Returns true if `parent` has been explicitly set.
-  public var hasParent: Bool {return _storage._parent != nil}
+  public var hasParent: Bool {_storage._parent != nil}
   /// Clears the value of `parent`. Subsequent reads from it will return its default value.
   public mutating func clearParent() {_uniqueStorage()._parent = nil}
 
   /// Darwin st_flags. Authority-backed PortableFS Items are zero because the
   /// authority exposes no BSD file-flags operation; local grafts carry st_flags.
   public var flags: UInt32 {
-    get {return _storage._flags}
+    get {_storage._flags}
     set {_uniqueStorage()._flags = newValue}
   }
 
   /// Storage allocation reported to FSKit. Authority-backed PortableFS uses
   /// logical quota allocation; local grafts carry the backing stat allocation.
   public var allocSize: UInt64 {
-    get {return _storage._allocSize}
+    get {_storage._allocSize}
     set {_uniqueStorage()._allocSize = newValue}
   }
 
@@ -1398,7 +1402,7 @@ public struct PfsAttr: @unchecked Sendable {
 }
 
 /// errno values use the darwin numbering (the daemon translates); message is for logs only.
-public struct PfsErrorReply: Sendable {
+public nonisolated struct PfsErrorReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1412,17 +1416,17 @@ public struct PfsErrorReply: Sendable {
   public init() {}
 }
 
-public struct PfsLookupRequest: @unchecked Sendable {
+public nonisolated struct PfsLookupRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var dir: PfsItem {
-    get {return _dir ?? PfsItem()}
+    get {_dir ?? PfsItem()}
     set {_dir = newValue}
   }
   /// Returns true if `dir` has been explicitly set.
-  public var hasDir: Bool {return self._dir != nil}
+  public var hasDir: Bool {self._dir != nil}
   /// Clears the value of `dir`. Subsequent reads from it will return its default value.
   public mutating func clearDir() {self._dir = nil}
 
@@ -1436,17 +1440,17 @@ public struct PfsLookupRequest: @unchecked Sendable {
   fileprivate var _dir: PfsItem? = nil
 }
 
-public struct PfsLookupReply: Sendable {
+public nonisolated struct PfsLookupReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -1457,17 +1461,17 @@ public struct PfsLookupReply: Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsEnumerateRequest: Sendable {
+public nonisolated struct PfsEnumerateRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var dir: PfsItem {
-    get {return _dir ?? PfsItem()}
+    get {_dir ?? PfsItem()}
     set {_dir = newValue}
   }
   /// Returns true if `dir` has been explicitly set.
-  public var hasDir: Bool {return self._dir != nil}
+  public var hasDir: Bool {self._dir != nil}
   /// Clears the value of `dir`. Subsequent reads from it will return its default value.
   public mutating func clearDir() {self._dir = nil}
 
@@ -1490,7 +1494,7 @@ public struct PfsEnumerateRequest: Sendable {
   fileprivate var _dir: PfsItem? = nil
 }
 
-public struct PfsDirEntry: @unchecked Sendable {
+public nonisolated struct PfsDirEntry: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1499,11 +1503,11 @@ public struct PfsDirEntry: @unchecked Sendable {
 
   /// always has item+kind; full attrs when want_attrs
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -1517,7 +1521,7 @@ public struct PfsDirEntry: @unchecked Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsEnumerateReply: Sendable {
+public nonisolated struct PfsEnumerateReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1535,17 +1539,17 @@ public struct PfsEnumerateReply: Sendable {
   public init() {}
 }
 
-public struct PfsGetAttrRequest: Sendable {
+public nonisolated struct PfsGetAttrRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -1562,17 +1566,17 @@ public struct PfsGetAttrRequest: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsGetAttrReply: Sendable {
+public nonisolated struct PfsGetAttrReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -1583,72 +1587,72 @@ public struct PfsGetAttrReply: Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsSetAttrRequest: Sendable {
+public nonisolated struct PfsSetAttrRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
   public var mode: UInt32 {
-    get {return _mode ?? 0}
+    get {_mode ?? 0}
     set {_mode = newValue}
   }
   /// Returns true if `mode` has been explicitly set.
-  public var hasMode: Bool {return self._mode != nil}
+  public var hasMode: Bool {self._mode != nil}
   /// Clears the value of `mode`. Subsequent reads from it will return its default value.
   public mutating func clearMode() {self._mode = nil}
 
   public var uid: UInt32 {
-    get {return _uid ?? 0}
+    get {_uid ?? 0}
     set {_uid = newValue}
   }
   /// Returns true if `uid` has been explicitly set.
-  public var hasUid: Bool {return self._uid != nil}
+  public var hasUid: Bool {self._uid != nil}
   /// Clears the value of `uid`. Subsequent reads from it will return its default value.
   public mutating func clearUid() {self._uid = nil}
 
   public var gid: UInt32 {
-    get {return _gid ?? 0}
+    get {_gid ?? 0}
     set {_gid = newValue}
   }
   /// Returns true if `gid` has been explicitly set.
-  public var hasGid: Bool {return self._gid != nil}
+  public var hasGid: Bool {self._gid != nil}
   /// Clears the value of `gid`. Subsequent reads from it will return its default value.
   public mutating func clearGid() {self._gid = nil}
 
   /// truncate
   public var size: UInt64 {
-    get {return _size ?? 0}
+    get {_size ?? 0}
     set {_size = newValue}
   }
   /// Returns true if `size` has been explicitly set.
-  public var hasSize: Bool {return self._size != nil}
+  public var hasSize: Bool {self._size != nil}
   /// Clears the value of `size`. Subsequent reads from it will return its default value.
   public mutating func clearSize() {self._size = nil}
 
   public var mtimeMs: Int64 {
-    get {return _mtimeMs ?? 0}
+    get {_mtimeMs ?? 0}
     set {_mtimeMs = newValue}
   }
   /// Returns true if `mtimeMs` has been explicitly set.
-  public var hasMtimeMs: Bool {return self._mtimeMs != nil}
+  public var hasMtimeMs: Bool {self._mtimeMs != nil}
   /// Clears the value of `mtimeMs`. Subsequent reads from it will return its default value.
   public mutating func clearMtimeMs() {self._mtimeMs = nil}
 
   public var atimeMs: Int64 {
-    get {return _atimeMs ?? 0}
+    get {_atimeMs ?? 0}
     set {_atimeMs = newValue}
   }
   /// Returns true if `atimeMs` has been explicitly set.
-  public var hasAtimeMs: Bool {return self._atimeMs != nil}
+  public var hasAtimeMs: Bool {self._atimeMs != nil}
   /// Clears the value of `atimeMs`. Subsequent reads from it will return its default value.
   public mutating func clearAtimeMs() {self._atimeMs = nil}
 
@@ -1688,17 +1692,17 @@ public struct PfsSetAttrRequest: Sendable {
   fileprivate var _atimeMs: Int64? = nil
 }
 
-public struct PfsSetAttrReply: Sendable {
+public nonisolated struct PfsSetAttrReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -1709,17 +1713,17 @@ public struct PfsSetAttrReply: Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsOpenRequest: Sendable {
+public nonisolated struct PfsOpenRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -1738,7 +1742,7 @@ public struct PfsOpenRequest: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsOpenReply: Sendable {
+public nonisolated struct PfsOpenReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1751,7 +1755,7 @@ public struct PfsOpenReply: Sendable {
   public init() {}
 }
 
-public struct PfsCloseRequest: Sendable {
+public nonisolated struct PfsCloseRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1763,7 +1767,7 @@ public struct PfsCloseRequest: Sendable {
   public init() {}
 }
 
-public struct PfsCloseReply: Sendable {
+public nonisolated struct PfsCloseReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1782,7 +1786,7 @@ public struct PfsCloseReply: Sendable {
   public init() {}
 }
 
-public struct PfsReadRequest: Sendable {
+public nonisolated struct PfsReadRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1799,7 +1803,7 @@ public struct PfsReadRequest: Sendable {
   public init() {}
 }
 
-public struct PfsReadReply: @unchecked Sendable {
+public nonisolated struct PfsReadReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1812,7 +1816,7 @@ public struct PfsReadReply: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsWriteRequest: @unchecked Sendable {
+public nonisolated struct PfsWriteRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1836,7 +1840,7 @@ public struct PfsWriteRequest: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsWriteReply: Sendable {
+public nonisolated struct PfsWriteReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1845,11 +1849,11 @@ public struct PfsWriteReply: Sendable {
 
   /// post-write size/mtime so the frontend can answer without a round-trip
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -1860,7 +1864,7 @@ public struct PfsWriteReply: Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsFsyncRequest: Sendable {
+public nonisolated struct PfsFsyncRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1872,7 +1876,7 @@ public struct PfsFsyncRequest: Sendable {
   public init() {}
 }
 
-public struct PfsFsyncReply: Sendable {
+public nonisolated struct PfsFsyncReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -1882,17 +1886,17 @@ public struct PfsFsyncReply: Sendable {
   public init() {}
 }
 
-public struct PfsCreateRequest: @unchecked Sendable {
+public nonisolated struct PfsCreateRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var dir: PfsItem {
-    get {return _dir ?? PfsItem()}
+    get {_dir ?? PfsItem()}
     set {_dir = newValue}
   }
   /// Returns true if `dir` has been explicitly set.
-  public var hasDir: Bool {return self._dir != nil}
+  public var hasDir: Bool {self._dir != nil}
   /// Clears the value of `dir`. Subsequent reads from it will return its default value.
   public mutating func clearDir() {self._dir = nil}
 
@@ -1913,17 +1917,17 @@ public struct PfsCreateRequest: @unchecked Sendable {
   fileprivate var _dir: PfsItem? = nil
 }
 
-public struct PfsCreateReply: Sendable {
+public nonisolated struct PfsCreateReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -1937,17 +1941,17 @@ public struct PfsCreateReply: Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsMkdirRequest: @unchecked Sendable {
+public nonisolated struct PfsMkdirRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var dir: PfsItem {
-    get {return _dir ?? PfsItem()}
+    get {_dir ?? PfsItem()}
     set {_dir = newValue}
   }
   /// Returns true if `dir` has been explicitly set.
-  public var hasDir: Bool {return self._dir != nil}
+  public var hasDir: Bool {self._dir != nil}
   /// Clears the value of `dir`. Subsequent reads from it will return its default value.
   public mutating func clearDir() {self._dir = nil}
 
@@ -1962,17 +1966,17 @@ public struct PfsMkdirRequest: @unchecked Sendable {
   fileprivate var _dir: PfsItem? = nil
 }
 
-public struct PfsMkdirReply: Sendable {
+public nonisolated struct PfsMkdirReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -1983,17 +1987,17 @@ public struct PfsMkdirReply: Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsRemoveRequest: @unchecked Sendable {
+public nonisolated struct PfsRemoveRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var dir: PfsItem {
-    get {return _dir ?? PfsItem()}
+    get {_dir ?? PfsItem()}
     set {_dir = newValue}
   }
   /// Returns true if `dir` has been explicitly set.
-  public var hasDir: Bool {return self._dir != nil}
+  public var hasDir: Bool {self._dir != nil}
   /// Clears the value of `dir`. Subsequent reads from it will return its default value.
   public mutating func clearDir() {self._dir = nil}
 
@@ -2009,7 +2013,7 @@ public struct PfsRemoveRequest: @unchecked Sendable {
   fileprivate var _dir: PfsItem? = nil
 }
 
-public struct PfsRemoveReply: Sendable {
+public nonisolated struct PfsRemoveReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2019,28 +2023,28 @@ public struct PfsRemoveReply: Sendable {
   public init() {}
 }
 
-public struct PfsRenameRequest: @unchecked Sendable {
+public nonisolated struct PfsRenameRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var fromDir: PfsItem {
-    get {return _fromDir ?? PfsItem()}
+    get {_fromDir ?? PfsItem()}
     set {_fromDir = newValue}
   }
   /// Returns true if `fromDir` has been explicitly set.
-  public var hasFromDir: Bool {return self._fromDir != nil}
+  public var hasFromDir: Bool {self._fromDir != nil}
   /// Clears the value of `fromDir`. Subsequent reads from it will return its default value.
   public mutating func clearFromDir() {self._fromDir = nil}
 
   public var fromName: Data = Data()
 
   public var toDir: PfsItem {
-    get {return _toDir ?? PfsItem()}
+    get {_toDir ?? PfsItem()}
     set {_toDir = newValue}
   }
   /// Returns true if `toDir` has been explicitly set.
-  public var hasToDir: Bool {return self._toDir != nil}
+  public var hasToDir: Bool {self._toDir != nil}
   /// Clears the value of `toDir`. Subsequent reads from it will return its default value.
   public mutating func clearToDir() {self._toDir = nil}
 
@@ -2056,7 +2060,7 @@ public struct PfsRenameRequest: @unchecked Sendable {
   fileprivate var _toDir: PfsItem? = nil
 }
 
-public struct PfsRenameReply: @unchecked Sendable {
+public nonisolated struct PfsRenameReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2074,17 +2078,17 @@ public struct PfsRenameReply: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsSymlinkRequest: @unchecked Sendable {
+public nonisolated struct PfsSymlinkRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var dir: PfsItem {
-    get {return _dir ?? PfsItem()}
+    get {_dir ?? PfsItem()}
     set {_dir = newValue}
   }
   /// Returns true if `dir` has been explicitly set.
-  public var hasDir: Bool {return self._dir != nil}
+  public var hasDir: Bool {self._dir != nil}
   /// Clears the value of `dir`. Subsequent reads from it will return its default value.
   public mutating func clearDir() {self._dir = nil}
 
@@ -2099,17 +2103,17 @@ public struct PfsSymlinkRequest: @unchecked Sendable {
   fileprivate var _dir: PfsItem? = nil
 }
 
-public struct PfsSymlinkReply: Sendable {
+public nonisolated struct PfsSymlinkReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -2120,17 +2124,17 @@ public struct PfsSymlinkReply: Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsReadlinkRequest: Sendable {
+public nonisolated struct PfsReadlinkRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -2141,7 +2145,7 @@ public struct PfsReadlinkRequest: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsReadlinkReply: @unchecked Sendable {
+public nonisolated struct PfsReadlinkReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2153,26 +2157,26 @@ public struct PfsReadlinkReply: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsHardLinkRequest: @unchecked Sendable {
+public nonisolated struct PfsHardLinkRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
   public var dir: PfsItem {
-    get {return _dir ?? PfsItem()}
+    get {_dir ?? PfsItem()}
     set {_dir = newValue}
   }
   /// Returns true if `dir` has been explicitly set.
-  public var hasDir: Bool {return self._dir != nil}
+  public var hasDir: Bool {self._dir != nil}
   /// Clears the value of `dir`. Subsequent reads from it will return its default value.
   public mutating func clearDir() {self._dir = nil}
 
@@ -2186,7 +2190,7 @@ public struct PfsHardLinkRequest: @unchecked Sendable {
   fileprivate var _dir: PfsItem? = nil
 }
 
-public struct PfsHardLinkReply: @unchecked Sendable {
+public nonisolated struct PfsHardLinkReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2196,11 +2200,11 @@ public struct PfsHardLinkReply: @unchecked Sendable {
 
   /// fresh source item attrs, including updated nlink
   public var attr: PfsAttr {
-    get {return _attr ?? PfsAttr()}
+    get {_attr ?? PfsAttr()}
     set {_attr = newValue}
   }
   /// Returns true if `attr` has been explicitly set.
-  public var hasAttr: Bool {return self._attr != nil}
+  public var hasAttr: Bool {self._attr != nil}
   /// Clears the value of `attr`. Subsequent reads from it will return its default value.
   public mutating func clearAttr() {self._attr = nil}
 
@@ -2211,17 +2215,17 @@ public struct PfsHardLinkReply: @unchecked Sendable {
   fileprivate var _attr: PfsAttr? = nil
 }
 
-public struct PfsXattrGetRequest: Sendable {
+public nonisolated struct PfsXattrGetRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -2236,7 +2240,7 @@ public struct PfsXattrGetRequest: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsXattrGetReply: @unchecked Sendable {
+public nonisolated struct PfsXattrGetReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2248,17 +2252,17 @@ public struct PfsXattrGetReply: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsXattrSetRequest: @unchecked Sendable {
+public nonisolated struct PfsXattrSetRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -2279,7 +2283,7 @@ public struct PfsXattrSetRequest: @unchecked Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsXattrSetReply: Sendable {
+public nonisolated struct PfsXattrSetReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2289,17 +2293,17 @@ public struct PfsXattrSetReply: Sendable {
   public init() {}
 }
 
-public struct PfsXattrListRequest: Sendable {
+public nonisolated struct PfsXattrListRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -2312,7 +2316,7 @@ public struct PfsXattrListRequest: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsXattrListReply: Sendable {
+public nonisolated struct PfsXattrListReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2324,17 +2328,17 @@ public struct PfsXattrListReply: Sendable {
   public init() {}
 }
 
-public struct PfsXattrRemoveRequest: Sendable {
+public nonisolated struct PfsXattrRemoveRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -2349,7 +2353,7 @@ public struct PfsXattrRemoveRequest: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsXattrRemoveReply: Sendable {
+public nonisolated struct PfsXattrRemoveReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2367,7 +2371,7 @@ public struct PfsXattrRemoveReply: Sendable {
 /// two-phase repair boundary. There is no local-only success: an unreachable,
 /// slow, or fenced authority fails the request. `degraded` is retired wire
 /// ballast and is always false.
-public struct PfsSyncVolumeRequest: Sendable {
+public nonisolated struct PfsSyncVolumeRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2377,7 +2381,7 @@ public struct PfsSyncVolumeRequest: Sendable {
   public init() {}
 }
 
-public struct PfsSyncVolumeReply: Sendable {
+public nonisolated struct PfsSyncVolumeReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2389,7 +2393,7 @@ public struct PfsSyncVolumeReply: Sendable {
   public init() {}
 }
 
-public struct PfsStatfsRequest: Sendable {
+public nonisolated struct PfsStatfsRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2399,7 +2403,7 @@ public struct PfsStatfsRequest: Sendable {
   public init() {}
 }
 
-public struct PfsStatfsReply: Sendable {
+public nonisolated struct PfsStatfsReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2421,17 +2425,17 @@ public struct PfsStatfsReply: Sendable {
 }
 
 /// Frontend no longer references the item (FSKit reclaimItem / FUSE forget).
-public struct PfsReclaimRequest: Sendable {
+public nonisolated struct PfsReclaimRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -2442,7 +2446,7 @@ public struct PfsReclaimRequest: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsReclaimReply: Sendable {
+public nonisolated struct PfsReclaimReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2452,7 +2456,7 @@ public struct PfsReclaimReply: Sendable {
   public init() {}
 }
 
-public struct PfsSubscribeEventsRequest: Sendable {
+public nonisolated struct PfsSubscribeEventsRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2462,7 +2466,7 @@ public struct PfsSubscribeEventsRequest: Sendable {
   public init() {}
 }
 
-public struct PfsSubscribeEventsReply: Sendable {
+public nonisolated struct PfsSubscribeEventsReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2472,7 +2476,7 @@ public struct PfsSubscribeEventsReply: Sendable {
   public init() {}
 }
 
-public struct PfsVisibilityCursor: Sendable {
+public nonisolated struct PfsVisibilityCursor: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2486,7 +2490,7 @@ public struct PfsVisibilityCursor: Sendable {
   public init() {}
 }
 
-public struct PfsVisibilityTarget: @unchecked Sendable {
+public nonisolated struct PfsVisibilityTarget: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2509,7 +2513,7 @@ public struct PfsVisibilityTarget: @unchecked Sendable {
   public init() {}
 }
 
-public struct PfsV3VisibilityEvent: @unchecked Sendable {
+public nonisolated struct PfsV3VisibilityEvent: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2517,11 +2521,11 @@ public struct PfsV3VisibilityEvent: @unchecked Sendable {
   public var authorityEpoch: Data = Data()
 
   public var cursor: PfsVisibilityCursor {
-    get {return _cursor ?? PfsVisibilityCursor()}
+    get {_cursor ?? PfsVisibilityCursor()}
     set {_cursor = newValue}
   }
   /// Returns true if `cursor` has been explicitly set.
-  public var hasCursor: Bool {return self._cursor != nil}
+  public var hasCursor: Bool {self._cursor != nil}
   /// Clears the value of `cursor`. Subsequent reads from it will return its default value.
   public mutating func clearCursor() {self._cursor = nil}
 
@@ -2540,7 +2544,7 @@ public struct PfsV3VisibilityEvent: @unchecked Sendable {
   fileprivate var _cursor: PfsVisibilityCursor? = nil
 }
 
-public struct PfsVisibilityAckRequest: @unchecked Sendable {
+public nonisolated struct PfsVisibilityAckRequest: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2548,11 +2552,11 @@ public struct PfsVisibilityAckRequest: @unchecked Sendable {
   public var authorityEpoch: Data = Data()
 
   public var cursor: PfsVisibilityCursor {
-    get {return _cursor ?? PfsVisibilityCursor()}
+    get {_cursor ?? PfsVisibilityCursor()}
     set {_cursor = newValue}
   }
   /// Returns true if `cursor` has been explicitly set.
-  public var hasCursor: Bool {return self._cursor != nil}
+  public var hasCursor: Bool {self._cursor != nil}
   /// Clears the value of `cursor`. Subsequent reads from it will return its default value.
   public mutating func clearCursor() {self._cursor = nil}
 
@@ -2567,7 +2571,7 @@ public struct PfsVisibilityAckRequest: @unchecked Sendable {
   fileprivate var _cursor: PfsVisibilityCursor? = nil
 }
 
-public struct PfsVisibilityAckReply: Sendable {
+public nonisolated struct PfsVisibilityAckReply: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2578,7 +2582,7 @@ public struct PfsVisibilityAckReply: Sendable {
 }
 
 /// Emitted only after SubscribeEventsRequest on this connection.
-public struct PfsEvent: Sendable {
+public nonisolated struct PfsEvent: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2611,7 +2615,7 @@ public struct PfsEvent: Sendable {
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum OneOf_Kind: Equatable, Sendable {
+  public nonisolated enum OneOf_Kind: Equatable, Sendable {
     case invalidation(PfsInvalidation)
     case attachState(PfsAttachState)
     case visibility(PfsV3VisibilityEvent)
@@ -2626,17 +2630,17 @@ public struct PfsEvent: Sendable {
 /// items before acknowledging content invalidations. Cached namespace bindings
 /// and other attributes remain advisory until the SDK exposes general cache
 /// control.
-public struct PfsInvalidation: Sendable {
+public nonisolated struct PfsInvalidation: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
 
   public var item: PfsItem {
-    get {return _item ?? PfsItem()}
+    get {_item ?? PfsItem()}
     set {_item = newValue}
   }
   /// Returns true if `item` has been explicitly set.
-  public var hasItem: Bool {return self._item != nil}
+  public var hasItem: Bool {self._item != nil}
   /// Clears the value of `item`. Subsequent reads from it will return its default value.
   public mutating func clearItem() {self._item = nil}
 
@@ -2657,7 +2661,7 @@ public struct PfsInvalidation: Sendable {
   fileprivate var _item: PfsItem? = nil
 }
 
-public struct PfsAttachState: Sendable {
+public nonisolated struct PfsAttachState: Sendable {
   // SwiftProtobuf.Message conformance is added in an extension below. See the
   // `Message` and `Message+*Additions` files in the SwiftProtobuf library for
   // methods supported on all messages.
@@ -2668,7 +2672,7 @@ public struct PfsAttachState: Sendable {
 
   public var unknownFields = SwiftProtobuf.UnknownStorage()
 
-  public enum State: SwiftProtobuf.Enum, Swift.CaseIterable {
+  public nonisolated enum State: SwiftProtobuf.Enum, Swift.CaseIterable {
     public typealias RawValue = Int
     case unspecified // = 0
 
@@ -2727,119 +2731,31 @@ public struct PfsAttachState: Sendable {
 
 // MARK: - Code below here is support for the SwiftProtobuf runtime.
 
-fileprivate let _protobuf_package = "pfslocal.v1"
+fileprivate nonisolated let _protobuf_package = "pfslocal.v1"
 
-extension PfsPublicationSemanticCommit: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    0: .same(proto: "PUBLICATION_SEMANTIC_COMMIT_UNSPECIFIED"),
-    1: .same(proto: "PUBLICATION_SEMANTIC_COMMIT_PUBLISHED"),
-    2: .same(proto: "PUBLICATION_SEMANTIC_COMMIT_NOT_PUBLISHED"),
-  ]
+nonisolated extension PfsPublicationSemanticCommit: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0PUBLICATION_SEMANTIC_COMMIT_UNSPECIFIED\0\u{1}PUBLICATION_SEMANTIC_COMMIT_PUBLISHED\0\u{1}PUBLICATION_SEMANTIC_COMMIT_NOT_PUBLISHED\0")
 }
 
-extension PfsItemKind: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    0: .same(proto: "ITEM_KIND_UNSPECIFIED"),
-    1: .same(proto: "ITEM_KIND_FILE"),
-    2: .same(proto: "ITEM_KIND_DIRECTORY"),
-    3: .same(proto: "ITEM_KIND_SYMLINK"),
-  ]
+nonisolated extension PfsItemKind: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0ITEM_KIND_UNSPECIFIED\0\u{1}ITEM_KIND_FILE\0\u{1}ITEM_KIND_DIRECTORY\0\u{1}ITEM_KIND_SYMLINK\0")
 }
 
-extension PfsOpenMode: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    0: .same(proto: "OPEN_MODE_UNSPECIFIED"),
-    1: .same(proto: "OPEN_MODE_READ"),
-    2: .same(proto: "OPEN_MODE_WRITE"),
-    3: .same(proto: "OPEN_MODE_READ_WRITE"),
-  ]
+nonisolated extension PfsOpenMode: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0OPEN_MODE_UNSPECIFIED\0\u{1}OPEN_MODE_READ\0\u{1}OPEN_MODE_WRITE\0\u{1}OPEN_MODE_READ_WRITE\0")
 }
 
-extension PfsVisibilityPhase: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    0: .same(proto: "VISIBILITY_PHASE_UNSPECIFIED"),
-    1: .same(proto: "VISIBILITY_PHASE_PREPARE"),
-    2: .same(proto: "VISIBILITY_PHASE_COMPLETE"),
-  ]
+nonisolated extension PfsVisibilityPhase: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0VISIBILITY_PHASE_UNSPECIFIED\0\u{1}VISIBILITY_PHASE_PREPARE\0\u{1}VISIBILITY_PHASE_COMPLETE\0")
 }
 
-extension PfsVisibilityScope: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    0: .same(proto: "VISIBILITY_SCOPE_UNSPECIFIED"),
-    1: .same(proto: "VISIBILITY_SCOPE_NAMESPACE"),
-    2: .same(proto: "VISIBILITY_SCOPE_DATA"),
-    3: .same(proto: "VISIBILITY_SCOPE_ATTRIBUTES"),
-  ]
+nonisolated extension PfsVisibilityScope: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0VISIBILITY_SCOPE_UNSPECIFIED\0\u{1}VISIBILITY_SCOPE_NAMESPACE\0\u{1}VISIBILITY_SCOPE_DATA\0\u{1}VISIBILITY_SCOPE_ATTRIBUTES\0")
 }
 
-extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Envelope"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "request_id"),
-    2: .standard(proto: "publication_ack_required"),
-    3: .standard(proto: "operation_id"),
-    4: .standard(proto: "publication_retracted"),
-    10: .same(proto: "hello"),
-    11: .same(proto: "resolve"),
-    12: .same(proto: "lookup"),
-    13: .same(proto: "enumerate"),
-    14: .standard(proto: "get_attr"),
-    15: .standard(proto: "set_attr"),
-    16: .same(proto: "open"),
-    17: .same(proto: "close"),
-    18: .same(proto: "read"),
-    19: .same(proto: "write"),
-    20: .same(proto: "create"),
-    21: .same(proto: "mkdir"),
-    22: .same(proto: "remove"),
-    23: .same(proto: "rename"),
-    24: .same(proto: "symlink"),
-    25: .same(proto: "readlink"),
-    26: .standard(proto: "xattr_get"),
-    27: .standard(proto: "xattr_set"),
-    28: .standard(proto: "xattr_list"),
-    29: .standard(proto: "xattr_remove"),
-    30: .same(proto: "statfs"),
-    31: .same(proto: "fsync"),
-    32: .same(proto: "reclaim"),
-    33: .standard(proto: "subscribe_events"),
-    34: .standard(proto: "hard_link"),
-    35: .standard(proto: "sync_volume"),
-    36: .standard(proto: "publication_ack"),
-    37: .standard(proto: "visibility_ack"),
-    38: .standard(proto: "v3_liveness"),
-    39: .standard(proto: "resource_reply_disposition"),
-    60: .standard(proto: "hello_reply"),
-    61: .standard(proto: "resolve_reply"),
-    62: .standard(proto: "lookup_reply"),
-    63: .standard(proto: "enumerate_reply"),
-    64: .standard(proto: "get_attr_reply"),
-    65: .standard(proto: "set_attr_reply"),
-    66: .standard(proto: "open_reply"),
-    67: .standard(proto: "close_reply"),
-    68: .standard(proto: "read_reply"),
-    69: .standard(proto: "write_reply"),
-    70: .standard(proto: "create_reply"),
-    71: .standard(proto: "mkdir_reply"),
-    72: .standard(proto: "remove_reply"),
-    73: .standard(proto: "rename_reply"),
-    74: .standard(proto: "symlink_reply"),
-    75: .standard(proto: "readlink_reply"),
-    76: .standard(proto: "xattr_get_reply"),
-    77: .standard(proto: "xattr_set_reply"),
-    78: .standard(proto: "xattr_list_reply"),
-    79: .standard(proto: "xattr_remove_reply"),
-    80: .standard(proto: "statfs_reply"),
-    81: .standard(proto: "fsync_reply"),
-    82: .standard(proto: "reclaim_reply"),
-    83: .standard(proto: "subscribe_events_reply"),
-    84: .standard(proto: "hard_link_reply"),
-    85: .standard(proto: "sync_volume_reply"),
-    86: .standard(proto: "visibility_ack_reply"),
-    87: .standard(proto: "v3_liveness_reply"),
-    90: .same(proto: "error"),
-    91: .same(proto: "event"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}request_id\0\u{3}publication_ack_required\0\u{3}operation_id\0\u{3}publication_retracted\0\u{2}\u{6}hello\0\u{1}resolve\0\u{1}lookup\0\u{1}enumerate\0\u{3}get_attr\0\u{3}set_attr\0\u{1}open\0\u{1}close\0\u{1}read\0\u{1}write\0\u{1}create\0\u{1}mkdir\0\u{1}remove\0\u{1}rename\0\u{1}symlink\0\u{1}readlink\0\u{3}xattr_get\0\u{3}xattr_set\0\u{3}xattr_list\0\u{3}xattr_remove\0\u{1}statfs\0\u{1}fsync\0\u{1}reclaim\0\u{3}subscribe_events\0\u{3}hard_link\0\u{3}sync_volume\0\u{3}publication_ack\0\u{3}visibility_ack\0\u{3}v3_liveness\0\u{3}resource_reply_disposition\0\u{4}\u{15}hello_reply\0\u{3}resolve_reply\0\u{3}lookup_reply\0\u{3}enumerate_reply\0\u{3}get_attr_reply\0\u{3}set_attr_reply\0\u{3}open_reply\0\u{3}close_reply\0\u{3}read_reply\0\u{3}write_reply\0\u{3}create_reply\0\u{3}mkdir_reply\0\u{3}remove_reply\0\u{3}rename_reply\0\u{3}symlink_reply\0\u{3}readlink_reply\0\u{3}xattr_get_reply\0\u{3}xattr_set_reply\0\u{3}xattr_list_reply\0\u{3}xattr_remove_reply\0\u{3}statfs_reply\0\u{3}fsync_reply\0\u{3}reclaim_reply\0\u{3}subscribe_events_reply\0\u{3}hard_link_reply\0\u{3}sync_volume_reply\0\u{3}visibility_ack_reply\0\u{3}v3_liveness_reply\0\u{2}\u{3}error\0\u{1}event\0\u{c}\u{5}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3910,14 +3826,9 @@ extension PfsEnvelope: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
   }
 }
 
-extension PfsHello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsHello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Hello"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "protocol_major"),
-    2: .standard(proto: "protocol_minor"),
-    3: .standard(proto: "client_name"),
-    4: .standard(proto: "client_version"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_major\0\u{3}protocol_minor\0\u{3}client_name\0\u{3}client_version\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3960,12 +3871,9 @@ extension PfsHello: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationB
   }
 }
 
-extension PfsPublicationAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsPublicationAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".PublicationAck"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    2: .standard(proto: "operation_id"),
-    3: .standard(proto: "semantic_commit"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{4}\u{2}operation_id\0\u{3}semantic_commit\0\u{c}\u{1}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -3998,13 +3906,9 @@ extension PfsPublicationAck: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsResourceReplyDisposition: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsResourceReplyDisposition: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ResourceReplyDisposition"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "target_request_id"),
-    2: .standard(proto: "accept_handles"),
-    3: .standard(proto: "accepted_item_count"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}target_request_id\0\u{3}accept_handles\0\u{3}accepted_item_count\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4042,14 +3946,9 @@ extension PfsResourceReplyDisposition: SwiftProtobuf.Message, SwiftProtobuf._Mes
   }
 }
 
-extension PfsHelloReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsHelloReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".HelloReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "protocol_major"),
-    2: .standard(proto: "protocol_minor"),
-    3: .standard(proto: "daemon_version"),
-    4: .standard(proto: "request_deadline_ms"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}protocol_major\0\u{3}protocol_minor\0\u{3}daemon_version\0\u{3}request_deadline_ms\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4092,11 +3991,9 @@ extension PfsHelloReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
   }
 }
 
-extension PfsResolveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsResolveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ResolveRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "attach_ref"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}attach_ref\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4124,17 +4021,9 @@ extension PfsResolveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsResolveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsResolveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ResolveReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "root"),
-    2: .standard(proto: "root_attr"),
-    3: .standard(proto: "volume_id"),
-    4: .same(proto: "branch"),
-    5: .standard(proto: "volume_name"),
-    6: .same(proto: "capabilities"),
-    7: .standard(proto: "v3_coherence"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}root\0\u{3}root_attr\0\u{3}volume_id\0\u{1}branch\0\u{3}volume_name\0\u{1}capabilities\0\u{3}v3_coherence\0")
 
   fileprivate class _StorageClass {
     var _root: PfsItem? = nil
@@ -4145,15 +4034,11 @@ extension PfsResolveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
     var _capabilities: PfsCapabilities? = nil
     var _v3Coherence: PfsV3CoherenceContract? = nil
 
-    #if swift(>=5.10)
       // This property is used as the initial default value for new instances of the type.
       // The type itself is protecting the reference to its storage via CoW semantics.
       // This will force a copy to be made of this reference when the first mutation occurs;
       // hence, it is safe to mark this as `nonisolated(unsafe)`.
       static nonisolated(unsafe) let defaultInstance = _StorageClass()
-    #else
-      static let defaultInstance = _StorageClass()
-    #endif
 
     private init() {}
 
@@ -4248,16 +4133,9 @@ extension PfsResolveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsV3CoherenceContract: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsV3CoherenceContract: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".V3CoherenceContract"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "authority_protocol_major"),
-    2: .standard(proto: "authority_epoch"),
-    3: .standard(proto: "session_id"),
-    4: .standard(proto: "cache_policy"),
-    5: .standard(proto: "repair_budget_millis"),
-    6: .standard(proto: "initial_cursor"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}authority_protocol_major\0\u{3}authority_epoch\0\u{3}session_id\0\u{3}cache_policy\0\u{3}repair_budget_millis\0\u{3}initial_cursor\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4314,12 +4192,9 @@ extension PfsV3CoherenceContract: SwiftProtobuf.Message, SwiftProtobuf._MessageI
   }
 }
 
-extension PfsV3LivenessRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsV3LivenessRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".V3LivenessRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "authority_epoch"),
-    2: .standard(proto: "session_id"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}authority_epoch\0\u{3}session_id\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4352,12 +4227,9 @@ extension PfsV3LivenessRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
   }
 }
 
-extension PfsV3LivenessReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsV3LivenessReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".V3LivenessReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "authority_epoch"),
-    2: .standard(proto: "session_id"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}authority_epoch\0\u{3}session_id\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4390,20 +4262,9 @@ extension PfsV3LivenessReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
   }
 }
 
-extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Capabilities"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "symlinks"),
-    2: .standard(proto: "hard_links"),
-    3: .same(proto: "xattrs"),
-    4: .standard(proto: "case_sensitive"),
-    5: .standard(proto: "max_name_bytes"),
-    6: .standard(proto: "max_file_size"),
-    7: .standard(proto: "preferred_io_bytes"),
-    8: .standard(proto: "flags_supported"),
-    9: .standard(proto: "flags_understood"),
-    10: .standard(proto: "xattr_set_supported"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}symlinks\0\u{3}hard_links\0\u{1}xattrs\0\u{3}case_sensitive\0\u{3}max_name_bytes\0\u{3}max_file_size\0\u{3}preferred_io_bytes\0\u{3}flags_supported\0\u{3}flags_understood\0\u{3}xattr_set_supported\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4476,13 +4337,9 @@ extension PfsCapabilities: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsItem: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsItem: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Item"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "item_id"),
-    2: .standard(proto: "item_generation"),
-    3: .standard(proto: "stable_identity"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}item_id\0\u{3}item_generation\0\u{3}stable_identity\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4520,25 +4377,9 @@ extension PfsItem: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
   }
 }
 
-extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Attr"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "kind"),
-    3: .same(proto: "mode"),
-    4: .same(proto: "nlink"),
-    5: .same(proto: "uid"),
-    6: .same(proto: "gid"),
-    7: .same(proto: "size"),
-    8: .standard(proto: "mtime_ms"),
-    9: .standard(proto: "ctime_ms"),
-    10: .standard(proto: "atime_ms"),
-    11: .standard(proto: "birthtime_ms"),
-    12: .standard(proto: "content_version"),
-    13: .same(proto: "parent"),
-    14: .same(proto: "flags"),
-    15: .standard(proto: "alloc_size"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}kind\0\u{1}mode\0\u{1}nlink\0\u{1}uid\0\u{1}gid\0\u{1}size\0\u{3}mtime_ms\0\u{3}ctime_ms\0\u{3}atime_ms\0\u{3}birthtime_ms\0\u{3}content_version\0\u{1}parent\0\u{1}flags\0\u{3}alloc_size\0")
 
   fileprivate class _StorageClass {
     var _item: PfsItem? = nil
@@ -4557,15 +4398,11 @@ extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
     var _flags: UInt32 = 0
     var _allocSize: UInt64 = 0
 
-    #if swift(>=5.10)
       // This property is used as the initial default value for new instances of the type.
       // The type itself is protecting the reference to its storage via CoW semantics.
       // This will force a copy to be made of this reference when the first mutation occurs;
       // hence, it is safe to mark this as `nonisolated(unsafe)`.
       static nonisolated(unsafe) let defaultInstance = _StorageClass()
-    #else
-      static let defaultInstance = _StorageClass()
-    #endif
 
     private init() {}
 
@@ -4708,12 +4545,9 @@ extension PfsAttr: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBa
   }
 }
 
-extension PfsErrorReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsErrorReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ErrorReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "errno"),
-    2: .same(proto: "message"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}errno\0\u{1}message\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4746,12 +4580,9 @@ extension PfsErrorReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
   }
 }
 
-extension PfsLookupRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsLookupRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".LookupRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "dir"),
-    2: .same(proto: "name"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}dir\0\u{1}name\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4788,11 +4619,9 @@ extension PfsLookupRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsLookupReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsLookupReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".LookupReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "attr"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}attr\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4824,15 +4653,9 @@ extension PfsLookupReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsEnumerateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsEnumerateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".EnumerateRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "dir"),
-    2: .same(proto: "cookie"),
-    3: .standard(proto: "max_entries"),
-    4: .standard(proto: "want_attrs"),
-    5: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}dir\0\u{1}cookie\0\u{3}max_entries\0\u{3}want_attrs\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4884,13 +4707,9 @@ extension PfsEnumerateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   }
 }
 
-extension PfsDirEntry: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsDirEntry: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".DirEntry"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "name"),
-    2: .same(proto: "attr"),
-    3: .same(proto: "cookie"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{1}attr\0\u{1}cookie\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4932,13 +4751,9 @@ extension PfsDirEntry: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementati
   }
 }
 
-extension PfsEnumerateReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsEnumerateReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".EnumerateReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "entries"),
-    2: .standard(proto: "next_cookie"),
-    3: .standard(proto: "dir_version"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}entries\0\u{3}next_cookie\0\u{3}dir_version\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -4976,12 +4791,9 @@ extension PfsEnumerateReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsGetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsGetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetAttrRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5018,11 +4830,9 @@ extension PfsGetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsGetAttrReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsGetAttrReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".GetAttrReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "attr"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}attr\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5054,20 +4864,9 @@ extension PfsGetAttrReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SetAttrRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "mode"),
-    3: .same(proto: "uid"),
-    4: .same(proto: "gid"),
-    5: .same(proto: "size"),
-    6: .standard(proto: "mtime_ms"),
-    7: .standard(proto: "atime_ms"),
-    8: .same(proto: "handle"),
-    9: .standard(proto: "set_flags"),
-    10: .same(proto: "flags"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}mode\0\u{1}uid\0\u{1}gid\0\u{1}size\0\u{3}mtime_ms\0\u{3}atime_ms\0\u{1}handle\0\u{3}set_flags\0\u{1}flags\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5144,11 +4943,9 @@ extension PfsSetAttrRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsSetAttrReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSetAttrReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SetAttrReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "attr"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}attr\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5180,13 +4977,9 @@ extension PfsSetAttrReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsOpenRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsOpenRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".OpenRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "mode"),
-    3: .same(proto: "append"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}mode\0\u{1}append\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5228,11 +5021,9 @@ extension PfsOpenRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsOpenReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsOpenReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".OpenReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5260,11 +5051,9 @@ extension PfsOpenReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementat
   }
 }
 
-extension PfsCloseRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsCloseRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".CloseRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5292,12 +5081,9 @@ extension PfsCloseRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsCloseReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsCloseReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".CloseReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "retired"),
-    2: .standard(proto: "close_errno"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}retired\0\u{3}close_errno\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5330,13 +5116,9 @@ extension PfsCloseReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
   }
 }
 
-extension PfsReadRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsReadRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "handle"),
-    2: .same(proto: "offset"),
-    3: .same(proto: "length"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}handle\0\u{1}offset\0\u{1}length\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5374,11 +5156,9 @@ extension PfsReadRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsReadReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsReadReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "data"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}data\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5406,14 +5186,9 @@ extension PfsReadReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementat
   }
 }
 
-extension PfsWriteRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsWriteRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WriteRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "handle"),
-    2: .same(proto: "offset"),
-    3: .same(proto: "data"),
-    4: .same(proto: "append"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}handle\0\u{1}offset\0\u{1}data\0\u{1}append\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5456,12 +5231,9 @@ extension PfsWriteRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsWriteReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsWriteReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".WriteReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "written"),
-    2: .same(proto: "attr"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}written\0\u{1}attr\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5498,11 +5270,9 @@ extension PfsWriteReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
   }
 }
 
-extension PfsFsyncRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsFsyncRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".FsyncRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5530,7 +5300,7 @@ extension PfsFsyncRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsFsyncReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsFsyncReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".FsyncReply"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -5549,15 +5319,9 @@ extension PfsFsyncReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
   }
 }
 
-extension PfsCreateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsCreateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".CreateRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "dir"),
-    2: .same(proto: "name"),
-    3: .same(proto: "mode"),
-    4: .same(proto: "exclusive"),
-    5: .same(proto: "append"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}dir\0\u{1}name\0\u{1}mode\0\u{1}exclusive\0\u{1}append\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5609,12 +5373,9 @@ extension PfsCreateRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsCreateReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsCreateReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".CreateReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "attr"),
-    2: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}attr\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5651,13 +5412,9 @@ extension PfsCreateReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsMkdirRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsMkdirRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MkdirRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "dir"),
-    2: .same(proto: "name"),
-    3: .same(proto: "mode"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}dir\0\u{1}name\0\u{1}mode\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5699,11 +5456,9 @@ extension PfsMkdirRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsMkdirReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsMkdirReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".MkdirReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "attr"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}attr\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5735,13 +5490,9 @@ extension PfsMkdirReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementa
   }
 }
 
-extension PfsRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RemoveRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "dir"),
-    2: .same(proto: "name"),
-    3: .same(proto: "directory"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}dir\0\u{1}name\0\u{1}directory\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5783,7 +5534,7 @@ extension PfsRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsRemoveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsRemoveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RemoveReply"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -5802,15 +5553,9 @@ extension PfsRemoveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsRenameRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsRenameRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RenameRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "from_dir"),
-    2: .standard(proto: "from_name"),
-    3: .standard(proto: "to_dir"),
-    4: .standard(proto: "to_name"),
-    5: .standard(proto: "no_replace"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}from_dir\0\u{3}from_name\0\u{3}to_dir\0\u{3}to_name\0\u{3}no_replace\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5862,12 +5607,9 @@ extension PfsRenameRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsRenameReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsRenameReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".RenameReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "new_post_identity"),
-    2: .standard(proto: "old_post_identity"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}new_post_identity\0\u{3}old_post_identity\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5900,13 +5642,9 @@ extension PfsRenameReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsSymlinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSymlinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SymlinkRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "dir"),
-    2: .same(proto: "name"),
-    3: .same(proto: "target"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}dir\0\u{1}name\0\u{1}target\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5948,11 +5686,9 @@ extension PfsSymlinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsSymlinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSymlinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SymlinkReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "attr"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}attr\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -5984,11 +5720,9 @@ extension PfsSymlinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsReadlinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsReadlinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadlinkRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6020,11 +5754,9 @@ extension PfsReadlinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
   }
 }
 
-extension PfsReadlinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsReadlinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReadlinkReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "target"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}target\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6052,13 +5784,9 @@ extension PfsReadlinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsHardLinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsHardLinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".HardLinkRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "dir"),
-    3: .same(proto: "name"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}dir\0\u{1}name\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6100,12 +5828,9 @@ extension PfsHardLinkRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
   }
 }
 
-extension PfsHardLinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsHardLinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".HardLinkReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "name"),
-    2: .same(proto: "attr"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}name\0\u{1}attr\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6142,13 +5867,9 @@ extension PfsHardLinkReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsXattrGetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrGetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrGetRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "name"),
-    3: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}name\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6190,11 +5911,9 @@ extension PfsXattrGetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
   }
 }
 
-extension PfsXattrGetReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrGetReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrGetReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "value"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}value\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6222,16 +5941,9 @@ extension PfsXattrGetReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsXattrSetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrSetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrSetRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "name"),
-    3: .same(proto: "value"),
-    4: .standard(proto: "create_only"),
-    5: .standard(proto: "replace_only"),
-    6: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}name\0\u{1}value\0\u{3}create_only\0\u{3}replace_only\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6288,7 +6000,7 @@ extension PfsXattrSetRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
   }
 }
 
-extension PfsXattrSetReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrSetReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrSetReply"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6307,12 +6019,9 @@ extension PfsXattrSetReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsXattrListRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrListRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrListRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6349,11 +6058,9 @@ extension PfsXattrListRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   }
 }
 
-extension PfsXattrListReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrListReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrListReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "names"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}names\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6381,13 +6088,9 @@ extension PfsXattrListReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsXattrRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrRemoveRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .same(proto: "name"),
-    3: .same(proto: "handle"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{1}name\0\u{1}handle\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6429,7 +6132,7 @@ extension PfsXattrRemoveRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
   }
 }
 
-extension PfsXattrRemoveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsXattrRemoveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".XattrRemoveReply"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6448,7 +6151,7 @@ extension PfsXattrRemoveReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   }
 }
 
-extension PfsSyncVolumeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSyncVolumeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SyncVolumeRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6467,11 +6170,9 @@ extension PfsSyncVolumeRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
   }
 }
 
-extension PfsSyncVolumeReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSyncVolumeReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SyncVolumeReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "degraded"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}degraded\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6499,7 +6200,7 @@ extension PfsSyncVolumeReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImple
   }
 }
 
-extension PfsStatfsRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsStatfsRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".StatfsRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6518,15 +6219,9 @@ extension PfsStatfsRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImpleme
   }
 }
 
-extension PfsStatfsReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsStatfsReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".StatfsReply"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "block_size"),
-    2: .standard(proto: "total_blocks"),
-    3: .standard(proto: "free_blocks"),
-    4: .standard(proto: "total_files"),
-    5: .standard(proto: "free_files"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}block_size\0\u{3}total_blocks\0\u{3}free_blocks\0\u{3}total_files\0\u{3}free_files\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6574,11 +6269,9 @@ extension PfsStatfsReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsReclaimRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsReclaimRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReclaimRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6610,7 +6303,7 @@ extension PfsReclaimRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplem
   }
 }
 
-extension PfsReclaimReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsReclaimReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".ReclaimReply"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6629,7 +6322,7 @@ extension PfsReclaimReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsSubscribeEventsRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSubscribeEventsRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SubscribeEventsRequest"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6648,7 +6341,7 @@ extension PfsSubscribeEventsRequest: SwiftProtobuf.Message, SwiftProtobuf._Messa
   }
 }
 
-extension PfsSubscribeEventsReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsSubscribeEventsReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".SubscribeEventsReply"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6667,12 +6360,9 @@ extension PfsSubscribeEventsReply: SwiftProtobuf.Message, SwiftProtobuf._Message
   }
 }
 
-extension PfsVisibilityCursor: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsVisibilityCursor: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".VisibilityCursor"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "sequence"),
-    2: .same(proto: "phase"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}sequence\0\u{1}phase\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6705,16 +6395,9 @@ extension PfsVisibilityCursor: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   }
 }
 
-extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".VisibilityTarget"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "scope"),
-    2: .same(proto: "identity"),
-    3: .standard(proto: "parent_identity"),
-    4: .same(proto: "name"),
-    5: .same(proto: "size"),
-    6: .standard(proto: "post_identity"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}scope\0\u{1}identity\0\u{3}parent_identity\0\u{1}name\0\u{1}size\0\u{3}post_identity\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6767,16 +6450,9 @@ extension PfsVisibilityTarget: SwiftProtobuf.Message, SwiftProtobuf._MessageImpl
   }
 }
 
-extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".V3VisibilityEvent"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "authority_epoch"),
-    2: .same(proto: "cursor"),
-    3: .standard(proto: "initiator_session_id"),
-    4: .standard(proto: "mutation_slot"),
-    5: .same(proto: "targets"),
-    6: .standard(proto: "mutation_sequence"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}authority_epoch\0\u{1}cursor\0\u{3}initiator_session_id\0\u{3}mutation_slot\0\u{1}targets\0\u{3}mutation_sequence\0\u{b}routes\0\u{c}\u{7}\u{1}\u{c}\u{8}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6833,13 +6509,9 @@ extension PfsV3VisibilityEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImp
   }
 }
 
-extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".VisibilityAckRequest"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .standard(proto: "authority_epoch"),
-    2: .same(proto: "cursor"),
-    5: .standard(proto: "ordered_admission_contended"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{3}authority_epoch\0\u{1}cursor\0\u{4}\u{3}ordered_admission_contended\0\u{b}blocked\0\u{b}reason\0\u{c}\u{3}\u{1}\u{c}\u{4}\u{1}")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6881,7 +6553,7 @@ extension PfsVisibilityAckRequest: SwiftProtobuf.Message, SwiftProtobuf._Message
   }
 }
 
-extension PfsVisibilityAckReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsVisibilityAckReply: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".VisibilityAckReply"
   public static let _protobuf_nameMap = SwiftProtobuf._NameMap()
 
@@ -6900,13 +6572,9 @@ extension PfsVisibilityAckReply: SwiftProtobuf.Message, SwiftProtobuf._MessageIm
   }
 }
 
-extension PfsEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Event"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "invalidation"),
-    2: .standard(proto: "attach_state"),
-    3: .same(proto: "visibility"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}invalidation\0\u{3}attach_state\0\u{1}visibility\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -6988,15 +6656,9 @@ extension PfsEvent: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationB
   }
 }
 
-extension PfsInvalidation: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsInvalidation: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".Invalidation"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "item"),
-    2: .standard(proto: "content_changed"),
-    3: .standard(proto: "attrs_changed"),
-    4: .standard(proto: "namespace_changed"),
-    5: .standard(proto: "content_version"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}item\0\u{3}content_changed\0\u{3}attrs_changed\0\u{3}namespace_changed\0\u{3}content_version\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -7048,12 +6710,9 @@ extension PfsInvalidation: SwiftProtobuf.Message, SwiftProtobuf._MessageImplemen
   }
 }
 
-extension PfsAttachState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
+nonisolated extension PfsAttachState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplementationBase, SwiftProtobuf._ProtoNameProviding {
   public static let protoMessageName: String = _protobuf_package + ".AttachState"
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    1: .same(proto: "state"),
-    2: .same(proto: "detail"),
-  ]
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{1}state\0\u{1}detail\0")
 
   public mutating func decodeMessage<D: SwiftProtobuf.Decoder>(decoder: inout D) throws {
     while let fieldNumber = try decoder.nextFieldNumber() {
@@ -7086,12 +6745,6 @@ extension PfsAttachState: SwiftProtobuf.Message, SwiftProtobuf._MessageImplement
   }
 }
 
-extension PfsAttachState.State: SwiftProtobuf._ProtoNameProviding {
-  public static let _protobuf_nameMap: SwiftProtobuf._NameMap = [
-    0: .same(proto: "STATE_UNSPECIFIED"),
-    1: .same(proto: "STATE_ATTACHED"),
-    2: .same(proto: "STATE_WARMING"),
-    3: .same(proto: "STATE_DEGRADED"),
-    4: .same(proto: "STATE_DETACHING"),
-  ]
+nonisolated extension PfsAttachState.State: SwiftProtobuf._ProtoNameProviding {
+  public static let _protobuf_nameMap = SwiftProtobuf._NameMap(bytecode: "\0\u{2}\0STATE_UNSPECIFIED\0\u{1}STATE_ATTACHED\0\u{1}STATE_WARMING\0\u{1}STATE_DEGRADED\0\u{1}STATE_DETACHING\0")
 }

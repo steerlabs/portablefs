@@ -18,10 +18,12 @@ if ! command -v protoc-gen-swift >/dev/null 2>&1; then
 fi
 
 # Package.swift pins the runtime exactly. Generated code is an executable part
-# of that same contract: newer plugins can emit runtime APIs the pinned package
-# does not have (1.38's bytecode NameMap broke this package outright). Keep the
-# check beside generation so a developer's Homebrew PATH cannot silently make
-# an unbuildable or non-reproducible binding.
+# of that same contract: a plugin newer than the pin can emit runtime APIs the
+# pinned package does not have. That is not hypothetical — generating with 1.38
+# while the runtime was still pinned to 1.29 emitted the bytecode NameMap and
+# broke this package outright, which is why the two move together or not at
+# all. Keep the check beside generation so a developer's Homebrew PATH cannot
+# silently make an unbuildable or non-reproducible binding.
 EXPECTED_SWIFT_PROTOBUF_VERSION="$(
   sed -nE 's/.*swift-protobuf\.git", exact: "([^"]+)".*/\1/p' "$PKG/Package.swift"
 )"
