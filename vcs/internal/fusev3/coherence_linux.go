@@ -1049,8 +1049,16 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
 	r.mu.Lock()
 	work := make([]uint64, 0, len(r.cachedAttrs))
+	dataRecords := make(map[*inodeRecord]struct{}, len(r.cachedData))
+	for _, record := range r.cachedData {
+		dataRecords[record] = struct{}{}
+	}
 	for _, record := range r.cachedAttrs {
-		if record != nil && !record.reclaimed {
+		// The retained-data pass uses the same whole-inode primitive and
+		// therefore withdraws this record's attributes too. Leave it to that
+		// pass so one terminal obligation produces exactly one notification.
+		_, data := dataRecords[record]
+		if record != nil && !record.reclaimed && !data {
 			work = append(work, record.id)
 		}
 	}
@@ -1066,7 +1074,13 @@ func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
 			failures = append(failures, fmt.Sprintf("attribute withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-index))
 			break
 		}
-		if status := server.InodeNotify(inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
+		// Strict FUSE has no attribute-only invalidation. The exact terminal
+		// primitive is whole-inode withdrawal: it drops retained pages and
+		// invalidates attributes together, so a fenced mount cannot retain either
+		// kind of state after losing the authority. Sending stock (-1, 0) here is
+		// a protocol violation and aborts the notification channel before the
+		// retained-data pass can run.
+		if status := server.InodeNotify(inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
 			failures = append(failures, fmt.Sprintf("withdraw cached attributes for inode %d: %v", inode, status))
 		}
 	}

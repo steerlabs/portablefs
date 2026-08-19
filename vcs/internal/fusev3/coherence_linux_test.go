@@ -2074,6 +2074,30 @@ func TestRevocationWithdrawsEveryRetainedPage(t *testing.T) {
 	}
 }
 
+func TestRevocationUsesWholeInodeWithdrawalForCachedAttributes(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
+	entry := f.lookup(t, fuse.FUSE_ROOT_ID, "file")
+
+	failures := f.raw.revokeCachedAttrs(time.Now().Add(time.Minute))
+	if len(failures) != 0 {
+		t.Fatalf("withdrawal failures = %v", failures)
+	}
+	found := false
+	for _, call := range f.notify.snapshot() {
+		if call.kind != "inode" || call.inode != entry.NodeId {
+			continue
+		}
+		found = true
+		if call.off != 0 || call.length != 0 {
+			t.Fatalf("attribute withdrawal used shape off=%d len=%d, want strict whole-inode (0,0)", call.off, call.length)
+		}
+	}
+	if !found {
+		t.Fatalf("cached attributes for node %d were not withdrawn", entry.NodeId)
+	}
+}
+
 func TestRevocationReportsPagesItCouldNotWithdraw(t *testing.T) {
 	f := newStrictFixture(t)
 	f.rpc.byName = map[string]*authoritypb.Item{"file": testItem(72, authoritypb.Attr_REGULAR, 72)}
