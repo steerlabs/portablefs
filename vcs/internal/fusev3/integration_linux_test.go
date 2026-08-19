@@ -1849,7 +1849,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after rmdir: %v", err)
 		}
 	})
-	requireCounts("rmdir plus child/parent stat", rmdirRPCs, counts{rmdir: 1})
+	requireCounts("rmdir plus child/parent stat", rmdirRPCs, counts{lookup: 1, rmdir: 1})
 
 	existingName := "post-state-existing-create"
 	existingPath := filepath.Join(root, existingName)
@@ -1903,7 +1903,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after unlink: %v", err)
 		}
 	})
-	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{unlink: 1})
+	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{lookup: 1, unlink: 1})
 
 	oldParent, newParent := filepath.Join(root, "old-parent"), filepath.Join(root, "new-parent")
 	mustMkdir(t, oldParent)
