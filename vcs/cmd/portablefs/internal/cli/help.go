@@ -39,7 +39,7 @@ MOUNTS (this machine)
   route <path>                 is this path machine-local or shared, and by which rule
   prune-local                  reclaim machine-local backing no route can reach
   daemon stop                  stop an idle daemon (Linux; host-owned update only on macOS)
-  mount-check                  inspect mount prerequisites (no network or mutation)
+  mount-check                  inspect mount prerequisites (--probe-mount really mounts)
 
 THIS MACHINE
   doctor                       health check (transport, extension, daemon, mounts)
@@ -304,7 +304,7 @@ with the engine's own sentence in statusDetail. Revocation is terminal: run
 portablefs umount on the path and mount again.
 `,
 		"mount-check": `USAGE
-  portablefs mount-check [--strategy auto|fskit|fuse] [--json]
+  portablefs mount-check [--strategy auto|fskit|fuse] [--probe-mount] [--json]
 
 Inspect the current host's mount transport without contacting a server,
 starting a daemon, or changing the machine. Transport selection is
@@ -317,6 +317,18 @@ deterministic: FSKit on macOS and FUSE on Linux. The result is one of:
 Installed helpers, capabilities, app bundles, and PlugInKit inventory are
 evidence, never proof. JSON output carries stable issue codes for installers
 and other automation. BLOCKED exits 1; VERIFIED and UNVERIFIED exit 0.
+
+--probe-mount is the one exception to "changes nothing". On Linux it installs
+one real FUSE mount on a private temporary directory, completes the kernel
+INIT handshake with this binary's own mount options, checks the same kernel
+guarantees a live mount requires, and unmounts. That is the only check here
+that can fail for a client which can never complete FUSE INIT — every other
+signal (the device node, opening it, CAP_SYS_ADMIN, an installed helper) is
+equally satisfied by such a client. It contacts no authority and serves no
+file, so it proves nothing about the wire protocol or coherence. JSON output
+adds a kernelProbe object with the negotiated protocol version and the
+capability flags the kernel offered. It is refused for the fskit transport,
+whose mount is installed by the system extension.
 `,
 		"doctor": `USAGE
   portablefs doctor [--profile name] [--json]

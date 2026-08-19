@@ -237,7 +237,10 @@ different revision fails closed.
 `doctor`, `mount-check`, and `version` are the user-facing commands, along with
 `--json` on every one of them and the `PORTABLEFS_MOUNT_TOKEN` environment
 variable. Documented flags keep their meaning; new flags and new JSON fields may
-appear, and consumers must ignore unknown fields. `lifecycle`,
+appear, and consumers must ignore unknown fields. `mount-check` is the one
+command with a mutating option: `--probe-mount` installs and removes one real
+throwaway FUSE mount. It is opt-in for exactly that reason, and the command
+changes nothing without it. `lifecycle`,
 `install-macos-app`, and `install-linux-release` are installer and app
 coordination surfaces, not a user contract. The shipping macOS mount command
 selects synchronous VFS repair v2 on macOS 26 and 27 before Attach. Only the
