@@ -1462,7 +1462,10 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 	defer h.mu.Unlock()
 	// The E lease covers the whole authority-derived stream state, not only an
 	// unread entry. An exhausted EOF, verifier, or resume cookie from an older
-	// epoch can otherwise suppress or skip names after a mutation.
+	// epoch can otherwise suppress or skip names after a mutation. Dropping that
+	// state re-reads the directory from the beginning; whether the kernel is
+	// allowed to continue a stream that was dropped underneath it is decided in
+	// seekdirLocked, which is the only place that knows the resume offset.
 	if h.pageLease.epoch != 0 || h.pending != nil || h.index < len(h.page) || len(h.verifier) != 0 || len(h.cookie) != 0 {
 		identity, ok := publicationIdentityFromItem(h.node.item)
 		if !ok || !h.node.mount.leases.matches(leaseKey{
@@ -1654,6 +1657,13 @@ func (h *dirHandle) authorityPageExhausted() bool {
 
 func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 	if h.enumerationInvalidated {
+		if off != 0 {
+			// A recalled E(dir) lease leaves this handle's stream state
+			// describing no single directory state. Resuming it would return one
+			// name twice and lose another, so a resume is refused and only a
+			// restart from the beginning is accepted.
+			return syscall.ESTALE
+		}
 		h.discardPageItemsLocked()
 		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 		h.pageLease = leaseStamp{}
@@ -1661,7 +1671,6 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		h.next, h.localIndex, h.eof = 0, 0, false
 		h.enumerationInvalidated = false
 		h.cursorGeneration++
-		off = 0
 	}
 	if off == h.next {
 		// The kernel is continuing from where this handle stopped. Keeping the

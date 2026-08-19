@@ -1454,11 +1454,14 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 	}
 	publication := r.replyPublications[unique]
 	if publication == nil {
+		// Nothing was published for this reply, so there is no cache admission
+		// to finalize and no reason to touch the bytes. The payload length must
+		// be returned unchanged: a reply this frontend answered out of state it
+		// already holds - a buffered READDIR page, a served READ - carries a real
+		// payload that no publication decision applies to, and shortening it is
+		// indistinguishable to the kernel from end-of-data.
 		r.mu.Unlock()
-		if opcode == 44 { // READDIRPLUS
-			return payloadSize, fuse.OK, fuse.OK
-		}
-		return 0, fuse.OK, fuse.OK
+		return payloadSize, fuse.OK, fuse.OK
 	}
 	if publication.payloadError != nil {
 		err := publication.payloadError

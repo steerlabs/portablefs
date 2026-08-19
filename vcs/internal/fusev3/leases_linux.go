@@ -117,6 +117,17 @@ func (r *leaseRegistry) install(grants []validatedLeaseGrant, now time.Time) []v
 			// old obligation first, after which a later request can install the new
 			// epoch. Same-epoch renewal is the only in-place update.
 			if current.revoking || grant.epoch < current.grant.epoch || grant.epoch == current.grant.epoch && !grant.deadline.After(current.grant.deadline) {
+				// Nothing is installed, but this coordinate is still covered: the
+				// authority answered a second read of state this mount already
+				// holds authority over, and the held obligation is at least as
+				// long-lived as the one it just re-issued. The caller decides
+				// whether its reply is cacheable from what it gets back here,
+				// so reporting the live obligation is what distinguishes "your
+				// grant was redundant" from "you hold no authority" - the latter
+				// makes the frontend withdraw a page it is entitled to serve.
+				if !current.revoking && current.grant.right == grant.right && current.purgeAt.After(now) {
+					accepted = append(accepted, current.grant)
+				}
 				continue
 			}
 			if grant.epoch > current.grant.epoch && r.mount != nil && r.mount.raw != nil &&

@@ -657,40 +657,34 @@ func (m *Mount) withdrawalOps() kernelWithdrawal {
 // Every step's error is checked. A discarded detach failure leaves a dead FUSE
 // mount installed in the namespace with the CLI still reporting it live and
 // the authority still holding this participant's strict membership. So the
-// steps are an escalation ladder instead: lazy-detach through the mount owner's
-// fusermount helper, withdraw retained kernel state while /dev/fuse is still a
-// valid notification channel, abort the connection, then prove absence and
-// repeat if necessary, bounded by
-// withdrawalRounds and by the declared repair budget. Whatever it proves is
-// returned, so the caller can persist a truthful verdict either way.
+// steps are an escalation ladder instead: withdraw retained kernel state while
+// /dev/fuse is still a valid notification channel, abort the connection,
+// lazy-detach through the mount owner's fusermount helper, then prove absence
+// and repeat if necessary, bounded by withdrawalRounds and by the declared
+// repair budget. Whatever it proves is returned, so the caller can persist a
+// truthful verdict either way.
 func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	m.revoked.Store(true)
 	ops := m.withdrawalOps()
 	installed := m.kernelMount
 	out := withdrawalOutcome{installed: installed.point != ""}
+	// One repair budget covers the whole ladder rather than each step: it exists
+	// to fit inside the authority's fencing grace, and a per-step budget would
+	// let the rounds multiply it.
+	deadline := time.Now().Add(m.repairBudget)
 	writersJoined := true
 	if m.raw != nil {
-		writersJoined = m.raw.terminalizeReplyCacheOwnership(
-			time.Now().Add(m.repairBudget),
-		)
+		writersJoined = m.raw.terminalizeReplyCacheOwnership(deadline)
 		if !writersJoined {
 			out.record(0, "reply-writer-join", errRepairBudgetExceeded)
 		}
 	}
 
-	// Round one's namespace detach runs before the cached-name withdrawal, so
-	// the tree is already unreachable from the namespace root while the
-	// bindings are being taken back one at a time. The retained-data withdrawal
-	// runs before the first abort because an aborted go-fuse loop can close the
-	// notification descriptor before userspace reaches it.
-	if out.installed {
-		out.record(1, "detach", ops.detach(installed.point))
-	}
+	// The retained name, attribute, and data withdrawals run before the first
+	// abort because an aborted go-fuse loop can close the notification
+	// descriptor before userspace reaches it.
 	if m.raw != nil && writersJoined {
-		m.raw.revokeCachedNames(time.Now().Add(m.repairBudget))
-	}
-	deadline := time.Now().Add(m.repairBudget)
-	if m.raw != nil && writersJoined {
+		m.raw.revokeCachedNames(deadline)
 		for _, failure := range m.raw.revokeCachedAttrs(deadline) {
 			out.record(1, "attribute-withdrawal", errors.New(failure))
 		}
@@ -700,12 +694,19 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	}
 	delay := withdrawalRetryDelay
 	for round := 1; ; round++ {
-		// Aborting is unconditional and is never skipped just because the
-		// detach reported success: it unblocks any request still parked on an
-		// authority operation and terminates the serving connection after the
-		// notification withdrawals above have completed.
+		// Aborting is unconditional and comes first in every round. It unblocks
+		// any request still parked on an authority operation and terminates the
+		// serving connection, and only then is the namespace detach below safe:
+		// that step runs the mount owner's fusermount helper as a separate
+		// process, whose exec and path resolution can enter this very mount. A
+		// detach that ran first would deadlock a mount which can no longer
+		// answer - the helper waits for a reply this ladder can only produce
+		// after the helper returns - and buys nothing the abort does not.
 		if installed.device != "" {
 			out.record(round, "abort", ops.abort(installed))
+		}
+		if out.installed {
+			out.record(round, "detach", ops.detach(installed.point))
 		}
 		if !out.installed {
 			// No recorded kernel identity: startup failed before mountinfo
@@ -737,7 +738,6 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 		}
 		ops.sleep(delay)
 		delay *= 2
-		out.record(round+1, "detach", ops.detach(installed.point))
 	}
 }
 
