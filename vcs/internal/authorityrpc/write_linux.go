@@ -19,6 +19,14 @@ type writeMetadata struct {
 	position      uint64
 	lockOwner     uint64
 	writeFlags    uint32
+	mode          xfsstore.WriteMode
+	// requireEOF carries WriteRequest.offset_matches_client_size. It is only
+	// meaningful for a positioned write and makes the store refuse a position
+	// that is not EOF, because such a request is indistinguishable from a
+	// per-call append the kernel never forwarded.
+	requireEOF bool
+	sync       bool
+	dataSync   bool
 }
 
 func stockWriteMetadata(body *authoritypb.WriteRequest, maxWrite uint32) (writeMetadata, error) {
@@ -28,7 +36,13 @@ func stockWriteMetadata(body *authoritypb.WriteRequest, maxWrite uint32) (writeM
 	}
 	if len(body.GetHandle()) != len(metadata.handle) || body.GetPosition() > math.MaxInt64 ||
 		body.GetWriteFlags()&^(writeLockOwner|writeKillSUIDGID) != 0 ||
-		body.GetWriteFlags()&writeLockOwner == 0 && body.GetLockOwner() != 0 {
+		body.GetWriteFlags()&writeLockOwner == 0 && body.GetLockOwner() != 0 ||
+		body.GetSync() && body.GetDataSync() {
+		return metadata, syscall.EINVAL
+	}
+	// An append carries no position: the authority assigns one under the writer
+	// stripe. The two placement statements are therefore mutually exclusive.
+	if body.GetAppend() && (body.GetPosition() != 0 || body.GetOffsetMatchesClientSize()) {
 		return metadata, syscall.EINVAL
 	}
 	copy(metadata.handle[:], body.GetHandle())
@@ -39,6 +53,12 @@ func stockWriteMetadata(body *authoritypb.WriteRequest, maxWrite uint32) (writeM
 	metadata.position = body.GetPosition()
 	metadata.lockOwner = body.GetLockOwner()
 	metadata.writeFlags = body.GetWriteFlags()
+	metadata.mode = xfsstore.WritePositioned
+	if body.GetAppend() {
+		metadata.mode = xfsstore.WriteAppend
+	}
+	metadata.requireEOF = body.GetOffsetMatchesClientSize()
+	metadata.sync, metadata.dataSync = body.GetSync(), body.GetDataSync()
 	return metadata, nil
 }
 
@@ -71,7 +91,7 @@ func stockWriteCommitReply(committed, assigned, post, sequence uint64, postAttr 
 	}
 	return &authoritypb.Response{
 		Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
-			CommittedSize: committed, PostAttr: attrProto(postAttr), Error: wireError,
+			CommittedSize: committed, AssignedOffset: assigned, PostAttr: attrProto(postAttr), Error: wireError,
 		}},
 	}
 }
@@ -167,7 +187,9 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		}
 		committed, assigned, post, applyErr := target.CommitWriteData(body.GetData(), xfsstore.WriteCommit{
 			RequestedSize: metadata.requestedSize, Position: metadata.position,
-			RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: xfsstore.WritePositioned,
+			RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: metadata.mode,
+			RequirePositionAtEOF: metadata.requireEOF,
+			DataSync:             metadata.dataSync, Sync: metadata.sync,
 			KillPrivileges: metadata.writeFlags&writeKillSUIDGID != 0,
 		})
 		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
@@ -203,7 +225,13 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		if post.Kind != xfsstore.KindRegular || post.Size < 0 || uint64(post.Size) < end || sequence == 0 {
 			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 		}
-		if assigned != metadata.position {
+		// An append is exact only if the object ends exactly where the committed
+		// bytes end: any other post size means another writer interleaved inside
+		// the writer stripe, which cannot happen.
+		if metadata.mode == xfsstore.WriteAppend && uint64(post.Size) != end {
+			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
+		}
+		if metadata.mode == xfsstore.WritePositioned && assigned != metadata.position {
 			return h.errorResponse(0, syscall.EIO, true), []volumeserver.VisibilityTarget{}
 		}
 		if errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) {

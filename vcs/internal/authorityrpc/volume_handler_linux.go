@@ -1672,9 +1672,6 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		if profileErr != nil {
 			return h.errorResponse(req.GetRequestId(), profileErr, false)
 		}
-		if body.Open.GetFlags() != nil && body.Open.GetFlags().GetAppend() {
-			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
-		}
 		var openedHandle xfsstore.Capability
 		var openGrant volumeserver.LeaseGrant
 		cleanupOpenedHandle := func() {

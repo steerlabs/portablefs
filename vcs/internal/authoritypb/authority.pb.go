@@ -105,8 +105,8 @@ func (FailureClass) EnumDescriptor() ([]byte, []int) {
 	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{0}
 }
 
-// Every protocol-5 client owns exactly two authenticated transports for one
-// session. DATA carries filesystem traffic; CONTROL carries visibility and
+// Every protocol-6 client owns exactly two authenticated transports for one
+// session. DATA carries filesystem traffic; CONTROL carries cache repair and
 // liveness traffic. The role and random connection-set identity are mandatory
 // at Hello and are echoed by the authority before either connection can take
 // part in attach.
@@ -315,11 +315,10 @@ func (SessionPurpose) EnumDescriptor() ([]byte, []int) {
 	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{4}
 }
 
-// Protocol 5 has one coherent mount contract. Every frontend closes its exact
-// source-publication footprint and participates in the peer-only visibility
-// barrier. Zero is deliberately invalid: the retired UNCACHED profile encoded
-// as zero, so old clients fail before activation instead of silently joining a
-// contract they do not implement.
+// FSKit synchronous repair has one strict cache contract. Its frontend closes
+// the exact source-publication footprint and participates in the peer-only
+// repair barrier. Zero is deliberately invalid so an omitted profile cannot
+// enter that coordinator.
 type CoherenceProfile int32
 
 const (
@@ -372,7 +371,7 @@ func (CoherenceProfile) EnumDescriptor() ([]byte, []int) {
 // provable properties.
 //
 // PARENT_EXCLUSIVE is the retired stock-FUSE model. It is parseable so an old
-// client receives an explicit commitment refusal, but protocol 5 does not
+// client receives an explicit commitment refusal, but protocol 6 does not
 // admit it: breaking its parent-i_rwsem cycle required surfacing a synthetic
 // EINTR to ordinary applications.
 //
@@ -3649,14 +3648,14 @@ type AttachRequest struct {
 	VolumeId    string                 `protobuf:"bytes,1,opt,name=volume_id,json=volumeId,proto3" json:"volume_id,omitempty"`
 	AccessToken []byte                 `protobuf:"bytes,2,opt,name=access_token,json=accessToken,proto3" json:"access_token,omitempty"`
 	ReplaySlots uint32                 `protobuf:"varint,4,opt,name=replay_slots,json=replaySlots,proto3" json:"replay_slots,omitempty"`
-	// cached_name_capacity is how many distinct resolutions this frontend's
+	// fskit_cached_name_capacity is how many distinct resolutions this frontend's
 	// kernel cache is expected to hold. It sizes the authority's per-session
 	// resolved-name index, which is what lets a mutation skip mounts that cannot
 	// be holding the affected name. It is a precision and memory setting only:
 	// the index never drops a coordinate, so understating this number costs
 	// wasted acknowledgments and never a missed one. Required and nonzero for
-	// the one coherent protocol-5 mount profile.
-	// repair_budget_millis is the per-phase deadline this frontend commits to:
+	// the exact FSKit synchronous-repair profile.
+	// fskit_repair_budget_millis is the per-phase deadline this frontend commits to:
 	// the longest it may take to acknowledge one PREPARE or one COMPLETE. The
 	// authority fences this participant individually when the budget expires, and
 	// the frontend must revoke its own kernel mount if it has not acknowledged a
@@ -3669,7 +3668,7 @@ type AttachRequest struct {
 	// set has a revision too, so this field is required and a mount that omits it
 	// is refused - "I did not say" must never be admitted as "I agree".
 	RoutesRevision []byte `protobuf:"bytes,8,opt,name=routes_revision,json=routesRevision,proto3" json:"routes_revision,omitempty"`
-	// namespace_repair states how this frontend's kernel makes a cached binding
+	// fskit_namespace_repair states how this frontend's kernel makes a cached binding
 	// unservable. Required and non-UNSPECIFIED. It is what lets the authority
 	// tell a proven repair cycle apart from an ordinary slow lock.
 	// One random identity for this attach transaction. It makes a lost
@@ -7284,15 +7283,37 @@ func (x *ReadReply) GetData() []byte {
 
 // WriteRequest is the stock FUSE_WRITE shape after kernel-side generic
 // write checks. The kernel has already bounded size and position; userspace
-// must not replay private RLIMIT/file-ceiling or append-placement policy.
+// must not replay private RLIMIT/file-ceiling policy.
+//
+// Append placement is the one decision the kernel cannot make for a shared
+// volume: its i_size is only an advisory shadow of another machine's EOF. The
+// frontend therefore forwards the placement *intent* and the authority resolves
+// it against the true EOF under the per-inode writer stripe.
 type WriteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Handle        []byte                 `protobuf:"bytes,1,opt,name=handle,proto3" json:"handle,omitempty"`
-	Position      uint64                 `protobuf:"varint,2,opt,name=position,proto3" json:"position,omitempty"`
-	LockOwner     uint64                 `protobuf:"varint,5,opt,name=lock_owner,json=lockOwner,proto3" json:"lock_owner,omitempty"`
-	Size          uint32                 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
-	WriteFlags    uint32                 `protobuf:"varint,7,opt,name=write_flags,json=writeFlags,proto3" json:"write_flags,omitempty"`
-	Data          []byte                 `protobuf:"bytes,9,opt,name=data,proto3" json:"data,omitempty"` // transported out of line
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Handle     []byte                 `protobuf:"bytes,1,opt,name=handle,proto3" json:"handle,omitempty"`
+	Position   uint64                 `protobuf:"varint,2,opt,name=position,proto3" json:"position,omitempty"`
+	LockOwner  uint64                 `protobuf:"varint,5,opt,name=lock_owner,json=lockOwner,proto3" json:"lock_owner,omitempty"`
+	Size       uint32                 `protobuf:"varint,6,opt,name=size,proto3" json:"size,omitempty"`
+	WriteFlags uint32                 `protobuf:"varint,7,opt,name=write_flags,json=writeFlags,proto3" json:"write_flags,omitempty"`
+	Data       []byte                 `protobuf:"bytes,9,opt,name=data,proto3" json:"data,omitempty"` // transported out of line
+	// append requests authority-resolved placement at the object's true EOF.
+	// position must be zero; the resulting offset is returned as
+	// WriteReply.assigned_offset.
+	Append bool `protobuf:"varint,10,opt,name=append,proto3" json:"append,omitempty"`
+	// offset_matches_client_size states that position equals the kernel i_size
+	// this frontend last published for the object. Stock Linux does not forward
+	// RWF_APPEND, so a per-call append on a descriptor without O_APPEND is
+	// indistinguishable from an ordinary write at that offset. The authority
+	// refuses such a write with EIO when position is not the true EOF, because
+	// only then could the two readings disagree about where the bytes belong.
+	OffsetMatchesClientSize bool `protobuf:"varint,11,opt,name=offset_matches_client_size,json=offsetMatchesClientSize,proto3" json:"offset_matches_client_size,omitempty"`
+	// The per-call durability intent of the writing file description. Linux keeps
+	// O_SYNC/O_DSYNC on the description and fcntl can change them, so they are a
+	// property of the call and are never inherited from the authority descriptor.
+	// sync is stronger than data_sync; both may not be set.
+	Sync          bool `protobuf:"varint,12,opt,name=sync,proto3" json:"sync,omitempty"`
+	DataSync      bool `protobuf:"varint,13,opt,name=data_sync,json=dataSync,proto3" json:"data_sync,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7369,16 +7390,48 @@ func (x *WriteRequest) GetData() []byte {
 	return nil
 }
 
-// One stock write either reports the exact committed byte count and resulting
-// attributes, or a negative Linux errno in error. There are no private output
-// flags or authority-assigned append offsets.
+func (x *WriteRequest) GetAppend() bool {
+	if x != nil {
+		return x.Append
+	}
+	return false
+}
+
+func (x *WriteRequest) GetOffsetMatchesClientSize() bool {
+	if x != nil {
+		return x.OffsetMatchesClientSize
+	}
+	return false
+}
+
+func (x *WriteRequest) GetSync() bool {
+	if x != nil {
+		return x.Sync
+	}
+	return false
+}
+
+func (x *WriteRequest) GetDataSync() bool {
+	if x != nil {
+		return x.DataSync
+	}
+	return false
+}
+
+// One stock write either reports the exact committed byte count, the offset the
+// authority assigned to the first committed byte, and the resulting attributes,
+// or a negative Linux errno in error.
 type WriteReply struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CommittedSize uint64                 `protobuf:"varint,1,opt,name=committed_size,json=committedSize,proto3" json:"committed_size,omitempty"`
 	PostAttr      *Attr                  `protobuf:"bytes,2,opt,name=post_attr,json=postAttr,proto3" json:"post_attr,omitempty"`
 	Error         int32                  `protobuf:"varint,3,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// assigned_offset is the offset of the first committed byte. It equals the
+	// requested position for a positioned write and the EOF the authority
+	// observed under the writer stripe for an append.
+	AssignedOffset uint64 `protobuf:"varint,7,opt,name=assigned_offset,json=assignedOffset,proto3" json:"assigned_offset,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *WriteReply) Reset() {
@@ -7428,6 +7481,13 @@ func (x *WriteReply) GetPostAttr() *Attr {
 func (x *WriteReply) GetError() int32 {
 	if x != nil {
 		return x.Error
+	}
+	return 0
+}
+
+func (x *WriteReply) GetAssignedOffset() uint64 {
+	if x != nil {
+		return x.AssignedOffset
 	}
 	return 0
 }
@@ -9783,7 +9843,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x06offset\x18\x02 \x01(\x04R\x06offset\x12\x16\n" +
 	"\x06length\x18\x03 \x01(\rR\x06length\"\x1f\n" +
 	"\tReadReply\x12\x12\n" +
-	"\x04data\x18\x01 \x01(\fR\x04data\"\xe0\x01\n" +
+	"\x04data\x18\x01 \x01(\fR\x04data\"\xe6\x02\n" +
 	"\fWriteRequest\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\fR\x06handle\x12\x1a\n" +
 	"\bposition\x18\x02 \x01(\x04R\bposition\x12\x1d\n" +
@@ -9792,12 +9852,18 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x04size\x18\x06 \x01(\rR\x04size\x12\x1f\n" +
 	"\vwrite_flags\x18\a \x01(\rR\n" +
 	"writeFlags\x12\x12\n" +
-	"\x04data\x18\t \x01(\fR\x04dataJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\b\x10\tR\frlimit_fsizeR\rfile_max_sizeR\x05flags\"\xc4\x01\n" +
+	"\x04data\x18\t \x01(\fR\x04data\x12\x16\n" +
+	"\x06append\x18\n" +
+	" \x01(\bR\x06append\x12;\n" +
+	"\x1aoffset_matches_client_size\x18\v \x01(\bR\x17offsetMatchesClientSize\x12\x12\n" +
+	"\x04sync\x18\f \x01(\bR\x04sync\x12\x1b\n" +
+	"\tdata_sync\x18\r \x01(\bR\bdataSyncJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\b\x10\tR\frlimit_fsizeR\rfile_max_sizeR\x05flags\"\xdc\x01\n" +
 	"\n" +
 	"WriteReply\x12%\n" +
 	"\x0ecommitted_size\x18\x01 \x01(\x04R\rcommittedSize\x12:\n" +
 	"\tpost_attr\x18\x02 \x01(\v2\x1d.portablefs.authority.v1.AttrR\bpostAttr\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\x05R\x05errorJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aR\x13visibility_sequenceR\x05flagsR\x0fassigned_offset\"\xc3\x03\n" +
+	"\x05error\x18\x03 \x01(\x05R\x05error\x12'\n" +
+	"\x0fassigned_offset\x18\a \x01(\x04R\x0eassignedOffsetJ\x04\b\x04\x10\x05J\x04\b\x05\x10\x06J\x04\b\x06\x10\aR\x13visibility_sequenceR\x05flags\"\xc3\x03\n" +
 	"\x11FskitWriteRequest\x12%\n" +
 	"\x0etransaction_id\x18\x01 \x01(\x04R\rtransactionId\x12\x16\n" +
 	"\x06handle\x18\x02 \x01(\fR\x06handle\x12%\n" +

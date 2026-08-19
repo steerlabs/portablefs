@@ -889,7 +889,12 @@ message ReadRequest { bytes handle = 1; uint64 offset = 2; uint32 length = 3; }
 message ReadReply { bytes data = 1; }
 // WriteRequest is the stock FUSE_WRITE shape after kernel-side generic
 // write checks. The kernel has already bounded size and position; userspace
-// must not replay private RLIMIT/file-ceiling or append-placement policy.
+// must not replay private RLIMIT/file-ceiling policy.
+//
+// Append placement is the one decision the kernel cannot make for a shared
+// volume: its i_size is only an advisory shadow of another machine's EOF. The
+// frontend therefore forwards the placement *intent* and the authority resolves
+// it against the true EOF under the per-inode writer stripe.
 message WriteRequest {
   bytes handle = 1;
   uint64 position = 2;
@@ -899,17 +904,38 @@ message WriteRequest {
   uint32 size = 6;
   uint32 write_flags = 7;
   bytes data = 9; // transported out of line
+  // append requests authority-resolved placement at the object's true EOF.
+  // position must be zero; the resulting offset is returned as
+  // WriteReply.assigned_offset.
+  bool append = 10;
+  // offset_matches_client_size states that position equals the kernel i_size
+  // this frontend last published for the object. Stock Linux does not forward
+  // RWF_APPEND, so a per-call append on a descriptor without O_APPEND is
+  // indistinguishable from an ordinary write at that offset. The authority
+  // refuses such a write with EIO when position is not the true EOF, because
+  // only then could the two readings disagree about where the bytes belong.
+  bool offset_matches_client_size = 11;
+  // The per-call durability intent of the writing file description. Linux keeps
+  // O_SYNC/O_DSYNC on the description and fcntl can change them, so they are a
+  // property of the call and are never inherited from the authority descriptor.
+  // sync is stronger than data_sync; both may not be set.
+  bool sync = 12;
+  bool data_sync = 13;
 }
 
-// One stock write either reports the exact committed byte count and resulting
-// attributes, or a negative Linux errno in error. There are no private output
-// flags or authority-assigned append offsets.
+// One stock write either reports the exact committed byte count, the offset the
+// authority assigned to the first committed byte, and the resulting attributes,
+// or a negative Linux errno in error.
 message WriteReply {
   uint64 committed_size = 1;
   Attr post_attr = 2;
   int32 error = 3;
   reserved 4, 5, 6;
-  reserved "visibility_sequence", "flags", "assigned_offset";
+  reserved "visibility_sequence", "flags";
+  // assigned_offset is the offset of the first committed byte. It equals the
+  // requested position for a positioned write and the EOF the authority
+  // observed under the writer stripe for an append.
+  uint64 assigned_offset = 7;
 }
 
 // FSKit can deliver one logical write in multiple transport frames. BEGIN and
