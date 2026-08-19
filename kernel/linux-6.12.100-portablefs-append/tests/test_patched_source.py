@@ -819,6 +819,22 @@ class PatchedSourceTests(unittest.TestCase):
         self.assertLess(drain_tail, abort)
         self.assertLess(abort, return_failure)
 
+    def test_stamped_readdirplus_accepts_only_exact_name_only_records(
+        self,
+    ) -> None:
+        readdir = self.source("fs/fuse/readdir.c")
+        strict = readdir[
+            readdir.index("static int parse_pfs_dirplusfile"):
+            readdir.index("static int fuse_readdir_uncached")
+        ]
+        validate = strict.index("name_only &&")
+        emit = strict.index("dir_emit")
+        self.assertLess(validate, emit)
+        self.assertIn("record->type != DT_UNKNOWN", strict)
+        self.assertIn("memcmp(&record->entry_out, &empty_entry", strict)
+        self.assertIn("memcmp(&record->stamp, &empty_stamp", strict)
+        self.assertIn("ret = name_only ? 0 :", strict)
+
     def test_strict_init_requires_the_whole_one_shot_profile(self) -> None:
         text = self.source("fs/fuse/inode.c")
         start = text.index("if (flags & (FUSE_PFS_STRICT_COHERENCE |")
