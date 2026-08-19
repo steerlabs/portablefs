@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"golang.org/x/sys/unix"
 )
@@ -1860,15 +1861,27 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire store root: %v", err)
 	}
-	existingCapability, _, err := f.store.Create(rootCapability, existingName, 0o600, true)
-	if err != nil {
-		t.Fatalf("materialize existing-create race directly at the store: %v", err)
+	type existingCreateInjection struct {
+		forget func() error
+		err    error
 	}
-	defer func() {
-		if err := f.store.Forget(existingCapability); err != nil {
-			t.Errorf("forget direct existing-create capability: %v", err)
+	injected := make(chan existingCreateInjection, 1)
+	var injectOnce sync.Once
+	f.counter.setAfterHandle(func(request *authoritypb.Request, response *authoritypb.Response) {
+		lookup := request.GetLookup()
+		if lookup == nil || string(lookup.GetName()) != existingName || response.GetErrno() != int32(syscall.ENOENT) {
+			return
 		}
-	}()
+		injectOnce.Do(func() {
+			capability, _, createErr := f.store.Create(rootCapability, existingName, 0o600, true)
+			result := existingCreateInjection{err: createErr}
+			if createErr == nil {
+				result.forget = func() error { return f.store.Forget(capability) }
+			}
+			injected <- result
+		})
+	})
+	defer f.counter.setAfterHandle(nil)
 	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
 		file, err := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
@@ -1885,6 +1898,21 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after existing create: %v", err)
 		}
 	})
+	f.counter.setAfterHandle(nil)
+	var injection existingCreateInjection
+	select {
+	case injection = <-injected:
+	case <-time.After(integrationRequestTimeout):
+		t.Fatal("the existing-create race observed no negative pre-CREATE lookup")
+	}
+	if injection.err != nil {
+		t.Fatalf("materialize existing-create race after the negative lookup: %v", injection.err)
+	}
+	defer func() {
+		if err := injection.forget(); err != nil {
+			t.Errorf("forget direct existing-create capability: %v", err)
+		}
+	}()
 	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{lookup: 1, create: 1})
 
 	unlinkedPath := filepath.Join(root, "post-state-unlinked")

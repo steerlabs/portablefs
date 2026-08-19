@@ -860,8 +860,9 @@ func integrationTLS(t *testing.T) (*tls.Config, *tls.Config) {
 type countingHandler struct {
 	inner authorityrpc.Handler
 
-	mu     sync.Mutex
-	byKind map[string]int
+	mu          sync.Mutex
+	byKind      map[string]int
+	afterHandle func(*authoritypb.Request, *authoritypb.Response)
 }
 
 func (h *countingHandler) Epoch() []byte                        { return h.inner.Epoch() }
@@ -879,14 +880,25 @@ func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Reque
 		h.byKind = make(map[string]int)
 	}
 	h.byKind[requestKind(request)]++
+	after := h.afterHandle
 	h.mu.Unlock()
-	return h.inner.Handle(ctx, request)
+	response := h.inner.Handle(ctx, request)
+	if after != nil {
+		after(request, response)
+	}
+	return response
 }
 
 func (h *countingHandler) count(kind string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.byKind[kind]
+}
+
+func (h *countingHandler) setAfterHandle(after func(*authoritypb.Request, *authoritypb.Response)) {
+	h.mu.Lock()
+	h.afterHandle = after
+	h.mu.Unlock()
 }
 
 // requestKind names only the request shapes the coherence assertions read.
