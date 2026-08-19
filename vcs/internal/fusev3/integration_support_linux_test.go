@@ -214,7 +214,9 @@ func (m *recordingMembership) activeCount() int {
 // requires.
 type integrationTransport struct {
 	*authorityrpc.Client
-	session []byte
+	session        []byte
+	hookMu         sync.Mutex
+	beforeMutation func(*authoritypb.Request)
 }
 
 func (t *integrationTransport) SessionID() []byte { return append([]byte(nil), t.session...) }
@@ -225,6 +227,27 @@ func (t *integrationTransport) DetachAfterUnmount(ctx context.Context, proof Mou
 		Observation:       proof.Observation,
 		Component:         proof.Component,
 	})
+}
+
+func (t *integrationTransport) CallMutationWithIdentityRetained(
+	ctx context.Context,
+	request *authoritypb.Request,
+	assigned authorityrpc.MutationAssigned,
+	force func(error),
+) (*authoritypb.Response, authorityrpc.ResponseConsumption, error) {
+	t.hookMu.Lock()
+	before := t.beforeMutation
+	t.hookMu.Unlock()
+	if before != nil {
+		before(request)
+	}
+	return t.Client.CallMutationWithIdentityRetained(ctx, request, assigned, force)
+}
+
+func (t *integrationTransport) setBeforeMutation(before func(*authoritypb.Request)) {
+	t.hookMu.Lock()
+	t.beforeMutation = before
+	t.hookMu.Unlock()
 }
 
 // integrationFixture is one complete authority: a real XFS project directory, a
@@ -860,9 +883,8 @@ func integrationTLS(t *testing.T) (*tls.Config, *tls.Config) {
 type countingHandler struct {
 	inner authorityrpc.Handler
 
-	mu          sync.Mutex
-	byKind      map[string]int
-	afterHandle func(*authoritypb.Request, *authoritypb.Response)
+	mu     sync.Mutex
+	byKind map[string]int
 }
 
 func (h *countingHandler) Epoch() []byte                        { return h.inner.Epoch() }
@@ -880,25 +902,14 @@ func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Reque
 		h.byKind = make(map[string]int)
 	}
 	h.byKind[requestKind(request)]++
-	after := h.afterHandle
 	h.mu.Unlock()
-	response := h.inner.Handle(ctx, request)
-	if after != nil {
-		after(request, response)
-	}
-	return response
+	return h.inner.Handle(ctx, request)
 }
 
 func (h *countingHandler) count(kind string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.byKind[kind]
-}
-
-func (h *countingHandler) setAfterHandle(after func(*authoritypb.Request, *authoritypb.Response)) {
-	h.mu.Lock()
-	h.afterHandle = after
-	h.mu.Unlock()
 }
 
 // requestKind names only the request shapes the coherence assertions read.

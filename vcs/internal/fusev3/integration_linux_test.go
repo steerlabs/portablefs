@@ -1867,11 +1867,9 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	}
 	injected := make(chan existingCreateInjection, 1)
 	var injectOnce sync.Once
-	f.counter.setAfterHandle(func(request *authoritypb.Request, response *authoritypb.Response) {
-		lookup := request.GetLookup()
-		lookupReply := response.GetLookup()
-		if lookup == nil || string(lookup.GetName()) != existingName || response.GetErrno() != 0 ||
-			lookupReply.GetItem() != nil || lookupReply.GetNegativeSnapshotSequence() == 0 {
+	f.transports[0].setBeforeMutation(func(request *authoritypb.Request) {
+		create := request.GetCreate()
+		if create == nil || string(create.GetName()) != existingName {
 			return
 		}
 		injectOnce.Do(func() {
@@ -1883,7 +1881,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			injected <- result
 		})
 	})
-	defer f.counter.setAfterHandle(nil)
+	defer f.transports[0].setBeforeMutation(nil)
 	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
 		file, err := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
@@ -1900,12 +1898,12 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after existing create: %v", err)
 		}
 	})
-	f.counter.setAfterHandle(nil)
+	f.transports[0].setBeforeMutation(nil)
 	var injection existingCreateInjection
 	select {
 	case injection = <-injected:
 	case <-time.After(integrationRequestTimeout):
-		t.Fatal("the existing-create race observed no negative pre-CREATE lookup")
+		t.Fatal("the existing-create race observed no CREATE dispatch")
 	}
 	if injection.err != nil {
 		t.Fatalf("materialize existing-create race after the negative lookup: %v", injection.err)
