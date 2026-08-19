@@ -3732,9 +3732,9 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 		t.Fatalf("create = %v", created)
 	}
 	t.Cleanup(func() {
-		// Removed behind the store, like resetXFSRouteDeclaration: the routing
-		// revision this test installs makes the holder's session stale by
-		// design, so an in-protocol unlink could not run in every exit path.
+		// Removed behind the store, like resetXFSRouteDeclaration: the shared
+		// fixture outlives the parked lock wait, so an in-protocol unlink could
+		// not run in every exit path.
 		if err := os.Remove(filepath.Join(root, "lock-wait-target")); err != nil && !os.IsNotExist(err) {
 			t.Errorf("remove shared XFS lock fixture: %v", err)
 		}
@@ -3778,7 +3778,10 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	// The topology writer must not queue behind the parked wait. Before the
 	// fix, this Apply blocked until the lock wait ended — and because a queued
 	// RWMutex writer stops new readers, every guarded request on the volume
-	// blocked with it.
+	// blocked with it. Protocol 6 commits a route change only at clean mount
+	// absence, so the answer here is a prompt EBUSY-class refusal naming that
+	// absence. Reaching that decision at all is the property under test: it is
+	// made under topology exclusion, which the parked wait must not be holding.
 	active, err := h.Routes.Revision()
 	if err != nil {
 		t.Fatal(err)
@@ -3790,25 +3793,52 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	}()
 	select {
 	case err := <-applyDone:
-		if err != nil {
-			t.Fatalf("ApplyRoutes beside a blocked lock wait: %v", err)
+		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
+			t.Fatalf("ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("ApplyRoutes deadlocked behind a blocked lock wait")
 	}
 
-	// A changed route is terminal for current production frontends. The
-	// visibility fencer therefore ends both sessions and releases the holder's
-	// lock while Apply owns the topology writer. The parked waiter must unwind
-	// with the exact terminal-session errno; it must neither acquire a lock for a
-	// stale route nor hold the topology writer indefinitely.
+	// A refused change disturbs nothing: the declaration is unmoved, the holder
+	// keeps its lock, and the waiter is still parked rather than having been
+	// admitted for a topology the volume does not have.
+	if unchanged, err := h.Routes.Revision(); err != nil {
+		t.Fatal(err)
+	} else if unchanged != active {
+		t.Fatal("a refused routing change moved the active revision")
+	}
 	select {
 	case response := <-waitDone:
-		if response.GetErrno() != errnos.ESTALE {
-			t.Fatalf("the route-fenced parked wait completed with errno %d, want ESTALE", response.GetErrno())
+		t.Fatalf("the parked wait completed across a refused routing change: %v", response)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// And the topology guard is genuinely free rather than merely fast once: a
+	// second decision still completes while the wait is parked.
+	go func() {
+		_, err := h.Routes.Apply(ctx, []byte("node_modules\n/target/\n"), active)
+		applyDone <- err
+	}()
+	select {
+	case err := <-applyDone:
+		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
+			t.Fatalf("second ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("the parked lock wait never completed after the route-change fence released the holder")
+		t.Fatal("a second ApplyRoutes deadlocked behind a blocked lock wait")
+	}
+
+	// The wait unwinds on its own cancellation, which is the only thing left
+	// that can end it: no routing change fenced the holder out from under it.
+	cancelWait()
+	select {
+	case response := <-waitDone:
+		if response.GetErrno() == 0 {
+			t.Fatalf("the cancelled parked wait acquired the conflicting lock: %v", response)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the parked lock wait never completed after cancellation")
 	}
 }
 
