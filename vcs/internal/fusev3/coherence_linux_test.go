@@ -865,6 +865,40 @@ func TestReadDirPlusPageReservesOrDegradesAsOneUnit(t *testing.T) {
 	}
 }
 
+func TestReadDirPlusCarriesOpaqueNamesWithoutLookupOwnership(t *testing.T) {
+	f := newStrictFixture(t)
+	parent, errno := f.raw.intern(context.Background(), testItem(42, authoritypb.Attr_DIRECTORY, 42))
+	if errno != 0 {
+		t.Fatalf("intern parent: %v", errno)
+	}
+	f.rpc.dirPages = []*authoritypb.ReadDirReply{{
+		Verifier: testToken(600), Eof: true,
+		Entries: []*authoritypb.Dirent{{
+			Name: []byte("pipe"), Attr: &authoritypb.Attr{Kind: authoritypb.Attr_KIND_UNSPECIFIED, Inode: 99},
+			NextCookie: encodeCookie(1), SnapshotSequence: 9,
+		}},
+	}}
+	handle := &dirHandle{node: parent.node, token: testToken(500)}
+	handleID, ok := f.raw.addHandle(parent, &handleRecord{dir: handle})
+	if !ok {
+		t.Fatal("add directory handle")
+	}
+	unique := f.unique.Add(2)
+	list := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	if status := f.raw.ReadDirPlus(nil, &fuse.ReadIn{
+		InHeader: fuse.InHeader{Unique: unique}, Fh: handleID,
+	}, list); !status.Ok() {
+		t.Fatalf("opaque READDIRPLUS = %v (fatal cause: %v)", status, f.mount.fatalError())
+	}
+	completeTestReply(t, f.raw, unique, fuse.OK)
+	if f.mount.isRevoked() {
+		t.Fatalf("name-only opaque record revoked the mount: %v", f.mount.fatalError())
+	}
+	if pending := f.mount.reclaim.pending(); pending != 0 {
+		t.Fatalf("opaque record acquired %d capability reclaims, want zero", pending)
+	}
+}
+
 func TestReadDirPlusAdmissionTimeoutRollsBackWholePage(t *testing.T) {
 	f := newStrictFixture(t)
 	f.raw.requestTimeout = 15 * time.Millisecond

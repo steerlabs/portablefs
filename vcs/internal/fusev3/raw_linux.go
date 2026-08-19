@@ -3325,6 +3325,7 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 	// physical write commits or rolls back the staged page.
 	releaseHandle = false
 	candidates := make([]dirPlusCandidate, 0, 32)
+	emitted := 0
 	for {
 		entry, dirent, errno := handle.peek(ctx, true)
 		if errno != 0 {
@@ -3334,12 +3335,42 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 			break
 		}
 		item := dirent.GetItem()
-		if item == nil || item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) {
+		if item == nil {
+			// An opaque inode is deliberately a name-only directory fact.  FUSE
+			// READDIRPLUS represents that by a normal record whose entry_out has
+			// nodeid zero; the kernel emits the name but acquires no lookup or
+			// attribute state for an inode the authority cannot expose.
+			if dirent.GetAttr() == nil || dirent.GetAttr().GetKind() != authoritypb.Attr_KIND_UNSPECIFIED ||
+				dirent.GetObjectVersion() != 0 {
+				r.mount.revoke(errors.New("fusev3: authority READDIRPLUS record omitted its item without an opaque name-only shape"))
+				return fuse.Status(syscall.ENOTCONN)
+			}
+			if !out.PFSDirLookupEntryFits(entry.Name) {
+				if emitted == 0 {
+					return fuse.Status(syscall.EOVERFLOW)
+				}
+				break
+			}
+			if transferred := handle.consumePlus(); transferred != nil {
+				r.mount.revoke(errors.New("fusev3: opaque READDIRPLUS record unexpectedly transferred a capability"))
+				return fuse.Status(syscall.ENOTCONN)
+			}
+			entryOut, stamp := out.AddPFSDirLookupEntry(*entry)
+			if entryOut == nil || stamp == nil {
+				return fuse.EIO
+			}
+			emitted++
+			if handle.authorityPageExhausted() {
+				break
+			}
+			continue
+		}
+		if item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) {
 			r.mount.revoke(errors.New("fusev3: authority READDIRPLUS record omitted or disagreed with its item"))
 			return fuse.Status(syscall.ENOTCONN)
 		}
 		if !out.PFSDirLookupEntryFits(entry.Name) {
-			if len(candidates) == 0 {
+			if emitted == 0 {
 				return fuse.Status(syscall.EOVERFLOW)
 			}
 			break
@@ -3363,6 +3394,7 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		if entryOut == nil || stamp == nil {
 			return fuse.EIO
 		}
+		emitted++
 		entryOut.NodeId, entryOut.Generation = record.id, 1
 		entryOut.SetEntryTimeout(0)
 		entryOut.SetAttrTimeout(0)
