@@ -157,10 +157,17 @@ jobs:
           output="$RUNNER_TEMP/portablefs-release"
           release_dir=$(scripts/build-hosted-linux-release.sh "$output" "$release_id" amd64)
           deploy/gcp/verify-hosted-release.sh "$release_dir"
+          # The template name must be exactly `opensteer-cloud-runner`: the
+          # staging control plane resolves that bare name (its `default` tag),
+          # and the infra release record requires this name:tag shape. The
+          # environment boundary is the staging-scoped E2B key the preflight
+          # insists on, never a name suffix — a suffixed name would build,
+          # smoke, and promote a template nothing ever resolves, deploying
+          # nothing while looking green.
           {
             echo "release_id=$release_id"
             echo "release_dir=$release_dir"
-            echo "candidate=opensteer-cloud-runner-staging:pfs-${commit:0:12}"
+            echo "candidate=opensteer-cloud-runner:pfs-${commit:0:12}"
           } >>"$GITHUB_OUTPUT"
 
       - name: Authenticate to Google Cloud without a stored key
