@@ -2,12 +2,12 @@
 
 Status: **v3 failure contract**
 
-PortableFS v3 has one durable truth per volume — the XFS instance the authority
-addresses — and one active authority epoch in front of it. Every failure below
-is therefore answered by one of three questions: is the durable filesystem
-still trustworthy, is this epoch still able to serve, and is this one mount
-still a participant. The implementation never mixes those scopes, and neither
-does this document.
+PortableFS v3 has one canonical representation per volume, selected by
+`(State, ArchiveCycleStep)`: XFS for READY, the sealed archive for ARCHIVED,
+and sealed base plus monotone hydration map plus XFS for RESTORING. A serving
+volume has one active authority epoch. Every failure below is scoped to the
+canonical storage, that epoch, one participant or session, one operation, or
+RESTORING content reads; the implementation never mixes those scopes.
 
 The architectural decision is in
 [xfs-authority-architecture.md](./xfs-authority-architecture.md); the
@@ -22,13 +22,15 @@ application-visible guarantees are in
 | coherence poison | the epoch | a new epoch |
 | participant fenced | one mount's session | that mount revokes itself and remounts |
 | session fenced | one mount's session | remount |
+| restore | one volume's content reads while blocked; never the epoch | auto-clears on archive-store recovery; corrupt content requires repair |
 | ordinary errno | one operation | the application's own error handling |
 
 Responses carry the scope explicitly rather than making the client infer it
 from an errno: `FAILURE_CLASS_STORAGE`, `FAILURE_CLASS_COHERENCE`,
-`FAILURE_CLASS_ROUTES` and `FAILURE_CLASS_INTERNAL`. A bare `EIO` cannot say
-whether the filesystem is gone or the authority merely failed to recognise one
-of its own errors, and those need different operator actions.
+`FAILURE_CLASS_ROUTES`, `FAILURE_CLASS_RESTORE`, and
+`FAILURE_CLASS_INTERNAL`. A bare `EIO` cannot say whether the filesystem is
+gone or the authority merely failed to recognise one of its own errors, and
+those need different operator actions.
 
 ## Storage failure fences the store and ends the epoch
 
@@ -46,9 +48,11 @@ and do not restart-loop a volume onto unhealthy storage.
 
 ## Authority death, restart, and epoch change
 
-The authority holds no durable state of its own, so there is no promotion
-protocol, no warm standby to keep consistent, and nothing to replay. A
-replacement mounts the same XFS, increments the epoch, and serves.
+Ordinary authority runtime state is disposable, so there is no promotion
+protocol or warm standby to keep consistent. A READY replacement mounts the
+same XFS, increments the epoch, and serves. A RESTORING replacement also loads
+the durable hydration map and sealed-base identity; those records are part of
+that state's canonical representation, not replayable mutation history.
 
 Everything scoped to the old epoch is gone at that instant:
 
@@ -62,9 +66,11 @@ Everything scoped to the old epoch is gone at that instant:
   recovered; holders receive `ESTALE`/`EIO`. See
   [open-after-unlink.md](./open-after-unlink.md).
 
-What survives is exactly what XFS made durable, plus the durable strict-mount
-membership record described below. `TestUnmountRemountObservesDurableState` in
-the privileged suite pins the first half of that.
+What survives for READY is exactly what XFS made durable, plus the durable
+strict-mount membership record described below. RESTORING additionally retains
+the monotone hydration map and convergence record in StateRoot and the sealed
+base in the archive tier. `TestUnmountRemountObservesDurableState` in the
+privileged suite pins the READY case.
 
 ## A lost reply is UNCERTAIN, not a retry
 
@@ -169,11 +175,12 @@ defect into silently degraded coherence.
 
 ## Durable strict-mount membership and restart refusal
 
-Durable membership is the one piece of authority state that outlives an epoch.
-It records only which cached kernel mounts a previous epoch admitted — no
-paths, inodes, bytes, mutations, or history — and it exists so a *replacement*
-authority cannot start serving underneath a kernel cache that is still live on
-some machine.
+Durable membership is the one authority control record that outlives every
+epoch. RESTORING additionally has the phase-bound hydration map and convergence
+record described above. Membership records only which cached kernel mounts a
+previous epoch admitted — no paths, inodes, bytes, mutations, or history — and
+it exists so a *replacement* authority cannot start serving underneath a kernel
+cache that is still live on some machine.
 
 - It is deliberately **not** cleared by fencing. A fenced mount is gone from
   this epoch's barrier while still recorded.
@@ -212,14 +219,34 @@ the mounts are separate OS processes that can be killed uncleanly.
 - **Quota and disk exhaustion surface as the kernel's own `EDQUOT` and
   `ENOSPC`.** They are ordinary operation failures. They do not fence the store
   and are not in the fatal-storage set.
-- **`statfs` retains the ordinary local-XFS meaning** of cell-wide physical
-  capacity. Purchased per-volume entitlement is reported by quota and billing
-  APIs, not by `statfs`.
+- **`statfs` projects XFS project quota when hard limits are set.** Every hosted
+  volume has block and inode hard limits, so its project directory reports those
+  limits and their remaining capacity; `df` inside the mount and tiered-storage
+  usage measurement depend on that result. A project with no hard limit reports
+  cell-wide physical capacity.
 - **Deployment-sized bounds** on live sessions, replay slots, lock records,
   in-flight requests, frame allocations, descriptors, tasks, and memory are
   denial-of-service admission controls, not filesystem-size limits. Reaching one
   answers `EAGAIN`. Because launch isolates one worker per volume, exhausting
   them can fail that volume but cannot consume another tenant's worker state.
+
+## Restore interruption and corruption
+
+`RESTORE_BLOCKED` means the archive store is unreachable, credentials are
+invalid, or the hydrator is absent. The state is volume-wide: every content read
+fails with the named restore error carrying `FAILURE_CLASS_RESTORE`, including
+reads of already hydrated content, while namespace and attribute operations
+continue. Mounts and sessions stay alive, drain retries with backoff, and the
+state clears when archive fetches succeed again.
+
+`RESTORE_CORRUPT` means a fetched chunk failed digest verification. It is also a
+volume-level state: content reads stop uniformly rather than varying by hydrated
+versus cold data, the affected paths remain enumerable from the manifest, and
+unverified bytes are never served. Recovery requires repair that re-establishes
+a Manager-verified sealed representation. Neither state maps to `EIO`,
+`EUCLEAN`, `ESHUTDOWN`, or `ENOTRECOVERABLE`; hydration failures never enter the
+fatal-storage set and never end the epoch. Mounts and sessions stay alive in
+both states.
 
 ## Routing revision mismatch
 

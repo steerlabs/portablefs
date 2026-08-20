@@ -43,6 +43,10 @@ const (
 	// ECANCELED because macOS 26 may transparently re-enter a mutating callback
 	// after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
 	FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED FailureClass = 5
+	// RESTORE is a definite, non-fatal refusal while sealed base content cannot
+	// be recalled, recall admission is saturated, or corruption has made the
+	// volume's content uniformly unavailable. The session and epoch stay live.
+	FailureClass_FAILURE_CLASS_RESTORE FailureClass = 6
 )
 
 // Enum value maps for FailureClass.
@@ -54,6 +58,7 @@ var (
 		3: "FAILURE_CLASS_COHERENCE",
 		4: "FAILURE_CLASS_ROUTES",
 		5: "FAILURE_CLASS_VISIBILITY_INTERRUPTED",
+		6: "FAILURE_CLASS_RESTORE",
 	}
 	FailureClass_value = map[string]int32{
 		"FAILURE_CLASS_UNSPECIFIED":            0,
@@ -62,6 +67,7 @@ var (
 		"FAILURE_CLASS_COHERENCE":              3,
 		"FAILURE_CLASS_ROUTES":                 4,
 		"FAILURE_CLASS_VISIBILITY_INTERRUPTED": 5,
+		"FAILURE_CLASS_RESTORE":                6,
 	}
 )
 
@@ -1136,6 +1142,10 @@ type Response struct {
 	// "your mount was refused" into "your local-dirs file is revision X, the
 	// volume's is Y". See RoutesMismatch.
 	RoutesMismatch *RoutesMismatch `protobuf:"bytes,8,opt,name=routes_mismatch,json=routesMismatch,proto3" json:"routes_mismatch,omitempty"`
+	// restore_detail is present with FAILURE_CLASS_RESTORE and gives the stable
+	// retry/operator reason without overloading errno (blocked, corrupt,
+	// recall_saturated, recall_deadline, or protocol).
+	RestoreDetail string `protobuf:"bytes,9,opt,name=restore_detail,json=restoreDetail,proto3" json:"restore_detail,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Response_Hello
@@ -1246,6 +1256,13 @@ func (x *Response) GetRoutesMismatch() *RoutesMismatch {
 		return x.RoutesMismatch
 	}
 	return nil
+}
+
+func (x *Response) GetRestoreDetail() string {
+	if x != nil {
+		return x.RestoreDetail
+	}
+	return ""
 }
 
 func (x *Response) GetBody() isResponse_Body {
@@ -5885,7 +5902,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\bget_lock\x182 \x01(\v2'.portablefs.authority.v1.GetLockRequestH\x00R\agetLock\x12D\n" +
 	"\bset_lock\x183 \x01(\v2'.portablefs.authority.v1.SetLockRequestH\x00R\asetLock\x12P\n" +
 	"\fapply_routes\x18\x12 \x01(\v2+.portablefs.authority.v1.ApplyRoutesRequestH\x00R\vapplyRoutesB\x06\n" +
-	"\x04body\"\x86\r\n" +
+	"\x04body\"\xad\r\n" +
 	"\bResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -5895,7 +5912,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\tpost_attr\x18\x05 \x01(\v2\x1d.portablefs.authority.v1.AttrR\bpostAttr\x12B\n" +
 	"\bmutation\x18\x06 \x01(\v2&.portablefs.authority.v1.MutationStateR\bmutation\x12?\n" +
 	"\afailure\x18\a \x01(\x0e2%.portablefs.authority.v1.FailureClassR\afailure\x12P\n" +
-	"\x0froutes_mismatch\x18\b \x01(\v2'.portablefs.authority.v1.RoutesMismatchR\x0eroutesMismatch\x12;\n" +
+	"\x0froutes_mismatch\x18\b \x01(\v2'.portablefs.authority.v1.RoutesMismatchR\x0eroutesMismatch\x12%\n" +
+	"\x0erestore_detail\x18\t \x01(\tR\rrestoreDetail\x12;\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2#.portablefs.authority.v1.HelloReplyH\x00R\x05hello\x12>\n" +
 	"\x06attach\x18\v \x01(\v2$.portablefs.authority.v1.AttachReplyH\x00R\x06attach\x12>\n" +
@@ -6234,14 +6252,15 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x0eSetLockRequest\x125\n" +
 	"\x04lock\x18\x01 \x01(\v2!.portablefs.authority.v1.LockSpecR\x04lock\x12\x12\n" +
 	"\x04wait\x18\x02 \x01(\bR\x04wait\x12\x16\n" +
-	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xc5\x01\n" +
+	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xe0\x01\n" +
 	"\fFailureClass\x12\x1d\n" +
 	"\x19FAILURE_CLASS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15FAILURE_CLASS_STORAGE\x10\x01\x12\x1a\n" +
 	"\x16FAILURE_CLASS_INTERNAL\x10\x02\x12\x1b\n" +
 	"\x17FAILURE_CLASS_COHERENCE\x10\x03\x12\x18\n" +
 	"\x14FAILURE_CLASS_ROUTES\x10\x04\x12(\n" +
-	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05*P\n" +
+	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05\x12\x19\n" +
+	"\x15FAILURE_CLASS_RESTORE\x10\x06*P\n" +
 	"\x10CoherenceProfile\x12\x1e\n" +
 	"\x1aCOHERENCE_PROFILE_UNCACHED\x10\x00\x12\x1c\n" +
 	"\x18COHERENCE_PROFILE_STRICT\x10\x01*\xda\x01\n" +

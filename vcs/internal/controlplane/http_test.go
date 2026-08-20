@@ -14,13 +14,14 @@ import (
 
 func TestHTTPProductCannotOperateOnAnotherIssuerVolume(t *testing.T) {
 	harness := newManagerHarness(t)
-	_, err := harness.manager.RegisterCell("cell", RegisterCellRequest{
+	cell, err := harness.manager.RegisterCell("cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareCellForAdmission(t, harness, cell)
 	volume, err := harness.manager.CreateVolume("volume", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
 	})
@@ -48,7 +49,7 @@ func TestHTTPProductIdentityMustMatchCreatedIssuer(t *testing.T) {
 	harness := newManagerHarness(t)
 	_, err := harness.manager.RegisterCell("cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +67,7 @@ func TestHTTPCellObservationRequiresIdempotencyKey(t *testing.T) {
 	harness := newManagerHarness(t)
 	cell, err := harness.manager.RegisterCell("cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +79,90 @@ func TestHTTPCellObservationRequiresIdempotencyKey(t *testing.T) {
 	response := serveControlRequest(t, testHTTPHandler(harness.manager), http.MethodPost, "/v1/cells/"+cell.ID+"/observations", observation, RoleCell, cell.ID, "")
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("missing idempotency status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestHTTPCapacityAndCellCapacityRaise(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, err := h.manager.RegisterCell("http-capacity-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := testHTTPHandler(h.manager)
+	response := serveControlRequest(t, handler, http.MethodPatch, "/v1/cells/"+cell.ID+"/capacity",
+		UpdateCellCapacityRequest{CapacityBytes: 3 << 30, CapacityInodes: 110_000}, RoleOperator, "operator", "raise-capacity")
+	if response.Code != http.StatusOK {
+		t.Fatalf("capacity raise status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = serveControlRequest(t, handler, http.MethodGet, "/v1/capacity", nil, RoleProduct, "opensteer", "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("capacity report status=%d body=%s", response.Code, response.Body.String())
+	}
+	var report CapacityReport
+	if err := json.Unmarshal(response.Body.Bytes(), &report); err != nil || len(report.Pools) != 3 || report.Pools[0].CapacityBytes != 3<<30 {
+		t.Fatalf("capacity report = %+v, %v", report, err)
+	}
+}
+
+func TestHTTPArchiveWakeAndDeleteLifecycleRoutes(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	handler := testHTTPHandler(h.manager)
+
+	archive := ArchiveVolumeRequest{VolumeID: volume.ID}
+	response := serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/archive",
+		archive, RoleProduct, "opensteer", "http-archive")
+	if response.Code != http.StatusOK {
+		t.Fatalf("archive status=%d body=%s", response.Code, response.Body.String())
+	}
+	wake := WakeVolumeRequest{VolumeID: volume.ID}
+	response = serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/wake",
+		wake, RoleProduct, "opensteer", "http-wake")
+	if response.Code != http.StatusOK {
+		t.Fatalf("wake status=%d body=%s", response.Code, response.Body.String())
+	}
+	destroy := DestroyVolumeRequest{VolumeID: volume.ID, Reason: "workspace deleted"}
+	response = serveControlRequest(t, handler, http.MethodDelete, "/v1/volumes/"+volume.ID,
+		destroy, RoleProduct, "opensteer", "http-delete")
+	if response.Code != http.StatusOK {
+		t.Fatalf("delete status=%d body=%s", response.Code, response.Body.String())
+	}
+	response = serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/wake",
+		wake, RoleOperator, "operator", "http-wake-operator")
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("operator wake status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestHTTPCellObservationHasTwoMiBExclusiveBodyLimit(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, err := h.manager.RegisterCell("http-large-observation", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(CellObservation{CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent", HelperReleaseID: "helper", ObservedUnix: h.now.Unix()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveRaw := func(payload []byte, key string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/v1/cells/"+cell.ID+"/observations", bytes.NewReader(payload))
+		request.Header.Set("X-Test-Role", string(RoleCell))
+		request.Header.Set("X-Test-ID", cell.ID)
+		request.Header.Set("Idempotency-Key", key)
+		recorder := httptest.NewRecorder()
+		testHTTPHandler(h.manager).ServeHTTP(recorder, request)
+		return recorder
+	}
+	under := append(append([]byte(nil), body...), bytes.Repeat([]byte{' '}, (1<<20)+32)...)
+	if response := serveRaw(under, "large-under-two"); response.Code != http.StatusOK {
+		t.Fatalf("under two MiB status=%d body=%s", response.Code, response.Body.String())
+	}
+	over := append(append([]byte(nil), body...), bytes.Repeat([]byte{' '}, (2<<20)+1)...)
+	if response := serveRaw(over, "large-over-two"); response.Code != http.StatusBadRequest {
+		t.Fatalf("over two MiB status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
+	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
@@ -169,6 +170,29 @@ func TestVisibilityInterruptedMapsToDefiniteEINTR(t *testing.T) {
 	}
 	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED {
 		t.Fatalf("visibility interruption failure class = %v, want VISIBILITY_INTERRUPTED", response.GetFailure())
+	}
+}
+
+func TestRestoreFailuresAreDefiniteNonFatalEAGAIN(t *testing.T) {
+	h := &VolumeHandler{}
+	for _, failure := range []error{
+		restoremode.ErrRecallSaturated, restoremode.ErrRecallDeadline,
+		restoremode.ErrBlocked, restoremode.ErrCorrupt,
+	} {
+		response := h.errorResponse(9, failure, false)
+		if response.GetErrno() != errnos.EAGAIN || response.GetUncertain() ||
+			response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_RESTORE {
+			t.Fatalf("restore failure %v = %+v, want definite classified EAGAIN", failure, response)
+		}
+		if fatalStorageErrno(failure) {
+			t.Fatalf("restore failure %v entered fatal storage classification", failure)
+		}
+		if response.GetRestoreDetail() == "" {
+			t.Fatalf("restore failure %v omitted its stable detail", failure)
+		}
+	}
+	if got := h.errorResponse(9, restoremode.ErrCorrupt, false).GetRestoreDetail(); got != "corrupt" {
+		t.Fatalf("corrupt restore detail = %q", got)
 	}
 }
 

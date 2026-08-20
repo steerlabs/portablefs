@@ -14,6 +14,18 @@ import (
 
 var ErrInvalid = errors.New("cellhost: invalid configuration or assignment")
 
+// ErrVolumeAbsent separates "this cell holds no project directory for the
+// volume" from "the host could not answer". A destroyed, released, or
+// not-yet-provisioned placement is an expected observation; a failed
+// measurement is not, and admission must never read one as the other.
+var ErrVolumeAbsent = errors.New("cellhost: volume project directory is absent")
+
+// ErrQuiesceProofAbsent means the authority has not written a quiesce proof
+// yet. That is the ordinary state of a volume still draining its mounts, and
+// the caller must be able to keep waiting on it without treating it as a
+// failure - or as permission to proceed.
+var ErrQuiesceProofAbsent = errors.New("cellhost: quiesce proof has not been written")
+
 type AuthorityConfig struct {
 	Version                 uint32 `json:"version"`
 	VolumeID                string `json:"volume_id"`

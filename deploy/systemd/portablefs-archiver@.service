@@ -1,0 +1,48 @@
+[Unit]
+Description=PortableFS archiver for volume %i
+# The archiver runs only while the authority is quiesced and absent; the helper
+# starts it exactly once per ARCHIVE phase and proves it absent before any
+# later phase. It never runs beside a serving authority.
+Conflicts=portablefs-authority@%i.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/portablefs-archiver
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateUsers=no
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# The archiver is one of exactly three cell components with outbound network
+# (agent, archiver, hydrator): it uploads the sealed pack + manifest to the
+# archive store. It holds write-scoped archive credentials and a READ-ONLY
+# bind of the quiesced volume tree; it can never mutate XFS.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf io_uring_setup keyctl open_by_handle_at perf_event_open pidfd_getfd process_vm_readv process_vm_writev ptrace userfaultfd
+UMask=0077
+TasksMax=1024
+LimitNOFILE=65536
+MemoryHigh=1G
+MemoryMax=2G
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

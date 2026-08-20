@@ -3,8 +3,11 @@
 Status: **v3 architecture decision and implementation contract**
 
 PortableFS v3 is a remote gateway to ordinary, authoritative directories on
-XFS. XFS and the block device beneath it are the only durable filesystem
-state. PortableFS does not maintain a second inode tree, content index,
+XFS. For a READY live volume, XFS and the block device beneath it are the only
+durable filesystem state. The explicit archive and RESTORING representations
+are defined by the
+[tiered-storage lifecycle contract](./tiered-storage/identity-lifecycle-and-capacity.md#canonical-representation-invariant-one-per-state-explicit).
+PortableFS does not otherwise maintain a second inode tree, content index,
 permanent operation history, branch graph, or write-back overlay.
 
 This was a deliberate compatibility reset. The v2 journal architecture and its
@@ -73,13 +76,13 @@ elided here.
 
 ## Source of truth
 
-For a live volume, the source of truth is exactly the mounted XFS instance:
-its server-side VFS/page-cache state, metadata journal, and persisted device
-state. Unflushed page-cache data is authoritative current state but is not
-durable across power loss; `fsync` is the boundary that asks XFS and the device
-to persist it.
+For a READY live volume, the source of truth is exactly the mounted XFS
+instance: its server-side VFS/page-cache state, metadata journal, and persisted
+device state. Unflushed page-cache data is authoritative current state but is
+not durable across power loss; `fsync` is the boundary that asks XFS and the
+device to persist it.
 
-Filesystem authority state is disposable: connections, open file descriptors,
+Ordinary filesystem authority runtime state is disposable: connections, open file descriptors,
 advisory locks, cancellation state, and bounded reply slots for the current
 epoch. Losing that RAM interrupts mounts, but cannot roll the durable
 filesystem back to a different logical tree. One small control-plane exception
@@ -90,10 +93,18 @@ epoch a lost participant is fenced individually and mutations continue (see
 [Cache coherence](#cache-coherence)). It contains no paths, inodes, file bytes,
 mutations, or history and is bound to exactly one volume.
 
-There is no PortableFS checkpoint, manifest head, custom mutation log,
-segmented store, Pebble index, or garbage collector. EBS snapshots are
-operator backups and never participate in reads, writes, cache coherence, or
-the user-visible namespace.
+RESTORING has separate phase-bound durable state: the authority-owned monotone
+hydration map and convergence record in StateRoot. The map selects sealed base
+or XFS per chunk; it is not a mutation log and ceases to participate after the
+durable convergence commit.
+
+Outside the archive tier there is no PortableFS checkpoint, manifest head,
+custom mutation log, segmented store, Pebble index, or garbage collector. The
+explicit exception is the sealed, immutable, attempt-addressed archive and,
+during RESTORING, its composite with the monotone hydration map and XFS, as
+specified by the [tiered-storage contracts](./tiered-storage/identity-lifecycle-and-capacity.md).
+EBS snapshots are operator backups and never participate in reads, writes,
+cache coherence, or the user-visible namespace.
 
 ## Ordinary filesystem semantics
 
@@ -132,9 +143,14 @@ PortableFS preserves these boundaries:
   remaining lock. The two lock namespaces remain independent, as on local
   Linux.
 
-The server is the only supported writer to a volume tree. Operators, sidecars,
-and backup agents must not mutate it behind the authority because those writes
-cannot participate in authorization or cache coherence.
+During serving, the server is the only supported writer to a volume tree.
+Operators, sidecars, and backup agents must not mutate it behind the authority
+because those writes cannot participate in authorization or cache coherence.
+There are two phase-qualified sidecar accesses while the authority is absent:
+the restorer materializes the namespace as a provisioning-time write, like the
+helper's own provisioning, and the archiver reads the quiesced tree read-only.
+During RESTORING serving, the hydrator never writes XFS; it fetches and verifies
+recall bytes, and the authority writes those bytes through its own XFS path.
 
 ## Object identity and confinement
 
@@ -438,10 +454,14 @@ boundaries, lifecycle, API, and explicit single-manager/single-AZ limits are in
 The unprivileged request process verifies the root's project ID and
 `PROJINHERIT` flag but deliberately has no quota-administration capability.
 Privileged provisioning and monitoring attest each project's block/inode hard
-limits; XFS enforces them. `statfs` retains the ordinary local-XFS meaning of
-cell-wide physical capacity, while quota/billing APIs report the purchased
-per-volume entitlement. Granting the authority `CAP_SYS_ADMIN` merely to query
-quota records would weaken the tenant boundary.
+limits; XFS enforces them. On a project directory with hard limits set, as every
+hosted volume has, `xfs_qm_statvfs` rewrites `statfs` totals and free values to
+the project's limits and usage, so the project quota is reported as the
+filesystem. That projection is load-bearing for `df` inside mounts and for the
+tiered-storage capacity measurement. A project with no hard limit instead
+reports cell-wide physical capacity. Both cases use ordinary `fstatfs`; granting
+the authority `CAP_SYS_ADMIN` merely to query quota records would weaken the
+tenant boundary.
 
 XFS attribute-fork blocks are
 [not charged to project quotas](https://www.kernel.org/pub/linux/utils/fs/xfs/docs/xfs_filesystem_structure.pdf).
@@ -460,7 +480,8 @@ set unsupported. FSKit validates item/name/mode and refuses
 set/create/replace/upsert locally before emitting a daemon or ordered-mutation
 frame. Its internal refusal is `ENOTSUP` (45), but the FSKit xattr boundary
 exposes `EOPNOTSUPP` (102). XNU reserves 45 to request its AppleDouble `._*`
-fallback; returning 102 keeps XFS as the only durable truth. This local gate
+fallback; returning 102 keeps XFS as the only writable truth for a serving
+volume. This local gate
 changes no successful daemon-forwarded read/list or pre-existing removal.
 
 The initial volume model is deliberately single-principal, like an agent's
@@ -525,9 +546,14 @@ application-consistent EBS snapshot, unfreezes promptly, locks/copies it per DR
 policy, and exercises restores. Users see no snapshot, commit, branch, or
 historical namespace.
 
+The archive tier is distinct from those operator EBS snapshots: it is a
+first-class, Manager-verified representation with the lifecycle, identity, and
+restore contract defined in
+[the tiered-storage contracts](./tiered-storage/identity-lifecycle-and-capacity.md).
+
 ## Deliberate boundaries
 
-- One volume has one active server and one machine's throughput ceiling.
+- One serving volume has one active server and one machine's throughput ceiling.
 - Cross-region syscall latency is not hidden; place authority near clients.
 - Memory scales with active sessions, handles, locks, and bounded retry
   slots—not stored files or keys.
@@ -615,6 +641,18 @@ something in the tree establishes it, and partial progress is stated as partial.
     control path; multi-cell recovery drills remain deployment work.
 14. Per-RPC observability at the authority, without which several matrix
     assertions can only check behaviour and not work performed.
+15. Archive and restore round-trip against a real project-quota XFS filesystem,
+    comparing bytes, namespace, modes, ns-mtimes, symlink targets, sparse extent
+    maps, xattrs, and hardlink relations.
+16. Recall-saturation testing that proves session leases and keepalives survive
+    the bounded recall cap and deadline behavior.
+17. Post-convergence testing that proves a restored volume is behaviorally
+    identical to a never-archived volume and cannot re-enter restore mode.
+18. Quiesce-protocol testing that proves strict-attach admission is closed under
+    the same membership lock before the authority emits its process-bound empty
+    membership proof.
+19. A real-XFS test pinning per-project `statfs` usage measurement with block and
+    inode hard limits, plus the cell-wide result when no limit is set.
 
 The segmented-log experiment remains evidence about append-only write
 amplification. Its spike module was removed with the rest of the v2 tree; it was

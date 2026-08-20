@@ -5,7 +5,7 @@ Status: **implemented v1 foundation; single-manager and single-AZ by design**
 PortableFS can still be self-hosted with credentials minted out of band. The
 hosted stack adds a product-neutral manager and a narrow storage-cell control
 loop around the same authority data plane. It does not put the manager in the
-filesystem I/O path and it does not create a second filesystem truth.
+filesystem I/O path and it does not create a second writable filesystem truth.
 
 ```text
 product backend                    Mac / Linux mount
@@ -32,19 +32,23 @@ Human file inspection may use the optional `portablefs-files` read gateway in
 parallel with mounts. The product backend remains the user-authorization
 boundary and signs a token bound to the exact read request. It issues a
 standalone `access: ["read"]`, `automatic_reauthorization: false` Manager grant
-for the gateway CSR; no mount enrollment is created. The gateway opens an
-uncached authority session and performs only object-relative lookup, directory
-read, and file read operations. Directory pages, preview bytes, session count,
-cursor count, and lifetimes are bounded. The Manager remains outside the file
-data path. A scaled deployment consistently routes a volume ID to one gateway
-instance for the lifetime of its short session and one-use cursors; it does not
-create a second metadata store to share that disposable state.
+for the gateway CSR; no mount enrollment is created. For a live volume the
+gateway opens an uncached authority session and performs only object-relative
+lookup, directory read, and file read operations. For an ARCHIVED volume it
+serves the same bounded operations directly from the sealed manifest and pack
+objects without an authority session or wake. Directory pages, preview bytes,
+session count, cursor count, and lifetimes are bounded. The Manager remains
+outside the file data path. A scaled deployment consistently routes a volume ID
+to one gateway instance for the lifetime of its short session and one-use
+cursors; it does not create a second metadata store to share that disposable
+state.
 Volumes with machine-local route declarations are refused by this non-mounting
 reader because it cannot honestly project those machine-local paths.
 Path resolution is object-relative and never follows symlinks; symlink and
 opaque inode kinds may be listed but are not opened by the gateway.
-Content streams retain PortableFS's ordinary live-file semantics when another
-client mutates the same inode; the gateway does not create a snapshot or copy.
+Live content streams retain PortableFS's ordinary live-file semantics when
+another client mutates the same inode; the gateway does not create a snapshot
+or copy.
 
 ## Component boundaries
 
@@ -243,14 +247,26 @@ no second writer or unsafe epoch restart is introduced.
 
 ## Volume lifecycle and fencing
 
-The v1 state machine is intentionally small:
+The v1 state machine remains the baseline. State schema v2 adds the archive
+cycle and terminal destruction:
 
 ```text
-PROVISIONING -> READY -> FENCING -> PROVISIONING
-      |           |          |
-      +-----------+----------+-> QUARANTINED
-                              \-> RETIRED
+PROVISIONING -> READY <-> FENCING                      (existing, unchanged)
+READY -> ARCHIVING -> ARCHIVED -> RESTORING -> READY   (READY at a later epoch)
+READY | ARCHIVED -> DESTROYED                          (terminal, durable record)
+READY -> RETIRED                                       (v1 retained)
+QUARANTINED                                            (unchanged)
 ```
+
+Archive first closes strict-attach admission and proves membership empty, then
+stops the authority, exports to attempt-addressed immutable objects, and commits
+ARCHIVED only after the Manager verifies the manifest and object inventory.
+`DESTROY` and `RELEASE` remove the old placement with an exact helper-recorded
+proof. Wake allocates a fresh placement, materializes the namespace, and serves
+RESTORING as sealed base plus monotone hydration map plus XFS until convergence
+returns the volume to READY. The complete cursor, identity, admission, and crash
+ordering contract is in
+[identity-lifecycle-and-capacity.md](./tiered-storage/identity-lifecycle-and-capacity.md).
 
 A new volume receives a never-reused project ID, service UID/GID, and TCP port
 on one cell. The helper creates and verifies a deterministic persistent Linux
@@ -268,14 +284,20 @@ from XFS before it reports provisioning success.
 Restart is a fencing transaction, not `kill` followed by hope. The helper kills
 the complete service cgroup, stops both service and listener, verifies both are
 inactive, and verifies the cgroup is empty. The manager will allocate the next
-authority generation only after that local absence proof **and** an operator's
-external proof that every prior strict kernel mount is absent or fenced. The
-helper independently remembers that the previous signed phase was `FENCE` and
-refuses a skipped or premature generation.
+authority generation only after that local absence proof and either an
+operator's external proof that every prior strict kernel mount is absent or
+fenced, for restart, or the authority's process-bound quiesce proof, for
+archive. On restart the helper independently remembers that the previous signed
+phase was `FENCE` and refuses a skipped or premature generation.
 
 Retirement stops serving but preserves the XFS directory and all allocation
-identities. IDs are not recycled. Destructive data deletion is intentionally
-not a network plan operation.
+identities. IDs are not recycled. Destruction is a typed, proof-bearing plan
+transaction: archive-cycle `DESTROY`/`RELEASE` is gated on the Manager's own
+archive verification; an explicit terminal delete from READY quiesces and uses
+the same proof-bearing phases without export. The helper still accepts no
+free-form remote command. Plans carry archive identities and digests, never
+object keys or credentials; the helper derives keys from root-pinned cell
+configuration.
 
 ## Manager API
 
@@ -292,6 +314,10 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | Caller | Endpoint | Purpose |
 | --- | --- | --- |
 | operator | `POST /v1/cells` | register cell capacity and allocator ranges |
+| operator | `PATCH /v1/cells/{id}/capacity` | raise registered cell capacity monotonically (v2) |
+| operator | `POST /v1/cells/{id}/decommission` | stop admission and drain the cell through archive (v2) |
+| operator | `POST /v1/cells/{id}/abandon` | record a permanently lost cell and release only Manager-verified archived placements (v2) |
+| operator | `GET /v1/capacity` | inspect per-pool measured use, pending charges, counts, and admission verdicts (v2) |
 | cell | `GET /v1/cells/{id}/plan` | fetch complete signed desired state |
 | cell | `POST /v1/cells/{id}/observations` | reconcile changed observed state |
 | cell | `POST /v1/cells/{id}/heartbeat` | refresh live health without a durable log write |
@@ -300,6 +326,9 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product | `POST /v1/volumes/{id}/restart` | enter the fencing state |
 | operator | `POST /v1/volumes/{id}/strict-fence` | record external strict-mount fence evidence |
 | product | `POST /v1/volumes/{id}/retire` | stop serving while preserving data |
+| product | `POST /v1/volumes/{id}/archive` | enter the typed archive cycle (v2 surface) |
+| product | `POST /v1/volumes/{id}/wake` | place and restore an ARCHIVED volume (v2 surface) |
+| product | `DELETE /v1/volumes/{id}` | destroy the volume and retain the terminal audit record (v2) |
 | product | `POST /v1/mount-authorizations` | issue client cert plus initial grant and, when explicitly requested, an automatic enrollment |
 | product | `POST /v1/mount-reauthorizations` | renew cert plus exact session grant |
 | enrolled mount | `POST /v1/mount-enrollments/{id}/reauthorizations` | obtain the exact next live-session grant |
@@ -337,13 +366,18 @@ window; observations are state-based and reapplying them is safe.
   protocol yet. Run it on durable storage with process supervision and backups.
 - Placement is single-cell and single-AZ. There is no automatic cross-cell
   migration, block-device failover, or second writer.
-- A v1 cell admits at most 256 durable volume assignments. Retired assignments
-  still count because their isolation IDs and data are deliberately retained.
-- Backup and restore remain offline operator/storage-provider workflows. The
-  privileged helper deliberately accepts no remote snapshot command. A future
-  backup controller must fence or freeze the exact volume, use provider APIs
-  with its own narrow identity, and reconcile immutable backup records; it must
-  not add file-copy semantics to the authority.
+- A cell plan admits at most 256 placement assignments. Retired assignments
+  still count because their isolation IDs and data are deliberately retained;
+  released placements do not, because `RELEASE` removes the assignment and
+  frees the plan slot.
+- Operator EBS snapshots remain an offline storage-provider workflow. The
+  archive tier's `portablefs-archiver` and `portablefs-hydrator` are the
+  narrow-identity controllers reserved by that boundary: typed archive phases
+  carry identities and digests, while root-provisioned cell configuration holds
+  object keys and credentials. The helper accepts no free-form remote snapshot
+  command. Neither controller adds file-copy semantics to the authority; during
+  recall the hydrator returns verified bytes and the authority writes XFS
+  itself.
 - The manager currently loads CA and Ed25519 signing keys from private local
   files. Production key custody can replace those signers with KMS/HSM-backed
   implementations without changing the cell or mount contracts.
@@ -352,6 +386,10 @@ window; observations are state-based and reapplying them is safe.
   and advertised as `session-reauthorization-v1`. Automatic mounts additionally
   require `mount-enrollment-reauthorization-v1` and refuse an older authority
   rather than changing renewal modes.
+- Tiered storage uses Manager state schema v2 and signed cell-plan v2. Rollout is
+  gated helper, then agent, then Manager using explicit advertised plan and
+  helper-state versions; the Manager does not sign v2 or admit archive/restore
+  on a cell until both host components report v2 capability.
 
 These are explicit scope boundaries, not silent availability claims. The data
 plane remains usable in standalone mode without the hosted components.

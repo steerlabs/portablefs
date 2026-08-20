@@ -22,6 +22,7 @@ var (
 	ErrRequestMismatch        = errors.New("volumeserver: operation identity reused with different request")
 	ErrSlotRange              = errors.New("volumeserver: replay slot is outside the negotiated range")
 	ErrAdmission              = errors.New("volumeserver: runtime admission bound reached")
+	ErrQuiescing              = errors.New("volumeserver: strict attach refused while authority is quiescing")
 	ErrAuthorizationSequence  = errors.New("volumeserver: authorization sequence is not the exact next value")
 	ErrAuthorizationBroadened = errors.New("volumeserver: reauthorization attempted to broaden access")
 	ErrAuthorizationOwner     = errors.New("volumeserver: reauthorization issuer does not own this session")

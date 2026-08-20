@@ -2,27 +2,31 @@
 
 Status: **v3 application-visible contract**
 
-PortableFS v3 has one source of truth per volume: the mounted XFS instance the
-authority addresses. Everything the authority itself holds — sessions, open
-file descriptions, advisory locks, same-epoch replay slots, cancellation state
-— is disposable epoch state. There is no second inode tree, no mutation log, no
-PortableFS-managed or offline write-back cache, and no history. Ordinary kernel
-page caches still exist. The architectural decision behind that is in
+PortableFS v3 has one canonical representation per volume, selected by
+`(State, ArchiveCycleStep)`. READY uses the mounted XFS instance; ARCHIVED uses
+the sealed archive; RESTORING uses the sealed base, monotone hydration map, and
+XFS-applied writes. Sessions, open file descriptions, advisory locks,
+same-epoch replay slots, and cancellation state remain disposable epoch state.
+There is no second writable inode tree, live mutation log, PortableFS-managed
+write-back cache, or history. Ordinary kernel page caches still exist. The
+architectural decision behind that is in
 [xfs-authority-architecture.md](./xfs-authority-architecture.md).
 
 This document states what an application may rely on.
 
 ## Where truth lives
 
-For a live volume the source of truth is exactly the mounted XFS instance: its
-VFS and page-cache state, its metadata journal, and the persisted device state
-beneath it. Unflushed page-cache data is authoritative *current* state but is
-not durable across power loss; `fsync` is the boundary that asks XFS and the
-device to persist it. XFS's own journal is an internal crash-recovery
-mechanism, not a PortableFS history.
+For a READY live volume the source of truth is exactly the mounted XFS instance:
+its VFS and page-cache state, its metadata journal, and the persisted device
+state beneath it. During RESTORING, a durably marked chunk is canonical in XFS
+and an unmarked chunk is canonical in the sealed base; the monotone hydration
+map decides between them. Unflushed page-cache data is authoritative *current*
+state but is not durable across power loss; `fsync` is the boundary that asks
+XFS and the device to persist it. XFS's own journal is an internal
+crash-recovery mechanism, not a PortableFS history.
 
-One volume has one active authority epoch. Every mount of that volume talks to
-that one authority over mutually authenticated TLS 1.3, which is why
+A serving volume has one active authority epoch. Every mount of that volume
+talks to that one authority over mutually authenticated TLS 1.3, which is why
 cross-machine read-after-write is possible at all without merging separate
 local folders. Mounts are not independent sources of truth and never reconcile
 with each other.
@@ -66,6 +70,13 @@ The application syscall boundary depends on the frontend kernel contract.
   file-and-directory `fsync` discipline.
 - **Two whole-file replacements are ordered atomic renames.** The later ordered
   rename wins. PortableFS never merges file contents.
+- **RESTORING uses the archive ordering contract.** Before the authority
+  acknowledges a partial-chunk write, shortening truncate, or read-modify-write,
+  verified base bytes are durable in XFS and the hydration mark is durable; the
+  user mutation follows. A whole-chunk replacement or `O_TRUNC` to zero makes
+  the replacement durable before making its mark durable and acknowledging.
+  These are exactly the orderings in
+  [restore-mode.md](./tiered-storage/restore-mode.md#hydration-map).
 
 Because there is no client-side durability debt, `umount --force` has nothing
 to park and nothing to replay: it only gives up on proving the drain.
@@ -78,6 +89,12 @@ same volume, `R` does not observe namespace, attributes, size, or data older
 than `M`, unless something ordered after `M` changed them again. An operation
 that overlaps `M` may observe either side, as it could between two processes on
 one machine.
+
+During RESTORING, a read of content not yet hydrated blocks until the authority
+has fetched, verified, and written that content, bounded by the recall deadline,
+or fails with the named restore error carrying `FAILURE_CLASS_RESTORE`. It never
+returns stale bytes, a partial chunk, or zero-filled sparse placeholders as file
+content.
 
 Two profiles reach that boundary by opposite means, and `--coherence` selects
 between them (`vcs/internal/fusev3`):
@@ -169,7 +186,7 @@ than hidden:
   and the application inspects current state and decides. Append offsets and
   namespace outcomes are never guessed.
 
-This gives session-exact execution without inventing a second durable truth.
+This gives session-exact execution without inventing a second writable truth.
 **Transparent exactly-once semantics across server death are not claimed.**
 
 ## Locks
@@ -259,6 +276,10 @@ volume-wide, and pinned to a revision the authority compares at attach. See
 - Writable extended attributes.
 - Read caching beyond the two declared profiles. Any future caching must be a
   synchronous lease protocol, never hidden baseline behaviour.
+- Local-XFS read latency during RESTORING. A cold content read may pay one
+  archive-store recall round trip before it returns.
+- Content-read availability during `RESTORE_BLOCKED`. Content reads are
+  suspended volume-wide; namespace and attribute operations continue.
 
 Failure behaviour — what fences a session, what fences the store, and what an
 epoch change costs — is in [failure-modes.md](./failure-modes.md).

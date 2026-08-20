@@ -23,6 +23,7 @@ copyleft, used unmodified as a library).
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause |
 | github.com/hashicorp/golang-lru/v2 | v2.0.7 | MPL-2.0 |
 | github.com/jackc/pgpassfile | v1.0.0 | MIT |
+| github.com/klauspost/compress | v1.19.1 | Apache-2.0 (zstd; includes BSD-3-Clause portions, see its LICENSE) |
 | github.com/jackc/pgservicefile | (pinned pseudo-version) | MIT |
 | github.com/jackc/puddle/v2 | v2.2.2 | MIT |
 | github.com/rasky/go-xdr | (pinned pseudo-version) | ISC |

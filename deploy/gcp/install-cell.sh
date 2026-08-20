@@ -19,9 +19,11 @@ agent_gid=$4
 
 for relative in \
   portablefs-cell-agent portablefs-cell-helper portablefs-authority portablefs-authority-launcher \
+  portablefs-archiver portablefs-hydrator \
   portablefs-cell-agent@.service portablefs-cell-helper@.service \
   portablefs-authority@.socket portablefs-authority@.service \
-  cell.cert cell.key manager-ca.pem plan-public.pem cell.env; do
+  portablefs-archiver@.service portablefs-hydrator@.service \
+  cell.cert cell.key manager-ca.pem plan-public.pem cell.env cell-archive.env; do
   [[ -f $stage/$relative && ! -L $stage/$relative ]] || {
     echo "missing or unsafe staged file: $relative" >&2
     exit 66
@@ -50,11 +52,13 @@ fi
 
 install -o root -g root -m 0755 "$stage/portablefs-cell-agent" /usr/local/bin/portablefs-cell-agent
 install -o root -g root -m 0755 "$stage/portablefs-authority" /usr/local/bin/portablefs-authority
+install -o root -g root -m 0755 "$stage/portablefs-archiver" /usr/local/bin/portablefs-archiver
+install -o root -g root -m 0755 "$stage/portablefs-hydrator" /usr/local/bin/portablefs-hydrator
 install -d -o root -g root -m 0755 /usr/local/libexec
 install -o root -g root -m 0755 "$stage/portablefs-cell-helper" /usr/local/libexec/portablefs-cell-helper
 install -o root -g root -m 0755 "$stage/portablefs-authority-launcher" /usr/local/libexec/portablefs-authority-launcher
 
-for unit in portablefs-cell-agent@.service portablefs-cell-helper@.service portablefs-authority@.socket portablefs-authority@.service; do
+for unit in portablefs-cell-agent@.service portablefs-cell-helper@.service portablefs-authority@.socket portablefs-authority@.service portablefs-archiver@.service portablefs-hydrator@.service; do
   install -o root -g root -m 0644 "$stage/$unit" "/etc/systemd/system/$unit"
 done
 
@@ -66,6 +70,10 @@ install -o root -g root -m 0444 "$stage/plan-public.pem" /etc/portablefs/trust/p
 install -o root -g root -m 0444 "$stage/cell.cert" "/etc/portablefs/cells/$cell_id.cert"
 install -o portablefs-agent -g portablefs-agent -m 0400 "$stage/cell.key" "/etc/portablefs/cells/$cell_id.key"
 install -o root -g root -m 0600 "$stage/cell.env" "/etc/portablefs/cells/$cell_id.env"
+# Archive-store credentials: root-provisioned, never plan-selected. Root-only:
+# the helper stages a per-volume group-readable copy into each volume ConfigRoot
+# when it writes the archiver/hydrator drop-ins.
+install -o root -g root -m 0600 "$stage/cell-archive.env" "/etc/portablefs/cells/$cell_id-archive.env"
 
 # The authority socket deliberately has no template-level ListenStream. The
 # helper supplies its signed, per-volume listener in a drop-in, so verifying an

@@ -67,11 +67,12 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	cell, err := h.manager.RegisterCell("register-1", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "us-west-2a",
 		AuthorityHost: "cell.example.test", AuthorityDNSZone: "cell.example.test",
-		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000,
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareCellForAdmission(t, h, cell)
 	volume, err := h.manager.CreateVolume("create-1", CreateVolumeRequest{
 		AuthorizationDomain: "org-1", Owner: "user-1", ProductIssuer: "opensteer",
 		QuotaBytes: 1 << 30, QuotaInodes: 100_000,
@@ -79,7 +80,7 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if volume.State != VolumeProvisioning || volume.ProjectID == 0 || volume.ServiceUID == 0 {
+	if volume.State != VolumeProvisioning || volume.Placement.ProjectID == 0 || volume.Placement.ServiceUID == 0 {
 		t.Fatalf("new volume = %+v", volume)
 	}
 	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
@@ -91,8 +92,8 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	cell, err = h.manager.ObserveCell("observe-csr", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		Volumes: []VolumeObservation{{
-			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.ProjectID,
-			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
 			Provisioned: true, AuthorityCSRPEM: authorityCSR,
 		}},
 	})
@@ -106,8 +107,8 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	cell, err = h.manager.ObserveCell("observe-ready", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		Volumes: []VolumeObservation{{
-			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.ProjectID,
-			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
 			Provisioned: true, AuthorityRunning: true,
 		}},
 	})
@@ -154,8 +155,8 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	productPublic := h.productKey.Public().(ed25519.PublicKey)
 	capAuthorizer := &volumecap.Authorizer{
 		PublicKey: capabilityPublic, ProductPublicKey: productPublic, ProductIssuer: "opensteer", ProductAudience: "portablefs-manager",
-		AuthorizationDomain: volume.AuthorizationDomain, Owner: volume.Owner, CellID: volume.CellID,
-		AuthorityID: volume.AuthorityID, AuthorityGeneration: volume.AuthorityGeneration,
+		AuthorizationDomain: volume.AuthorizationDomain, Owner: volume.Owner, CellID: volume.Placement.CellID,
+		AuthorityID: volume.Placement.AuthorityID, AuthorityGeneration: volume.AuthorityEpoch,
 		Now: func() time.Time { return *h.now }, MaxLifetime: 15 * time.Minute, MaxRetainedNonces: 32,
 	}
 	initialAccess, err := capAuthorizer.Verify(volume.ID, []byte(authorization.Capability), peer)
@@ -346,15 +347,15 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	volume, err = h.manager.ConfirmStrictMountsFenced("fence-proof-1", ConfirmStrictFenceRequest{
 		VolumeID: volume.ID, EvidenceSHA256: EvidenceHash([]byte("external client-host fence receipt")),
 	})
-	if err != nil || !volume.PriorStrictFenced {
+	if err != nil || !volume.Placement.PriorStrictFenced {
 		t.Fatalf("strict fence = %+v, %v", volume, err)
 	}
 	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
 	_, err = h.manager.ObserveCell("observe-absent", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		Volumes: []VolumeObservation{{
-			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.ProjectID,
-			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
 			Provisioned: true, AuthorityAbsent: true,
 		}},
 	})
@@ -362,7 +363,7 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	volume, _ = h.manager.GetVolume(volume.ID)
-	if volume.State != VolumeProvisioning || volume.AuthorityGeneration != 2 || volume.AuthorityCertificate != "" {
+	if volume.State != VolumeProvisioning || volume.AuthorityEpoch != 2 || volume.Placement.AuthorityCertificatePEM != "" {
 		t.Fatalf("replacement authority state = %+v", volume.Volume)
 	}
 	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
@@ -1141,7 +1142,7 @@ func TestManagerReleaseUpgradeAdvancesTheSignedPlanGeneration(t *testing.T) {
 	cell, err := h.manager.RegisterCell("register-release-upgrade", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "us-west-2a",
 		AuthorityHost: "cell.example.test", AuthorityDNSZone: "cell.example.test",
-		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000,
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1173,12 +1174,47 @@ func TestManagerReleaseUpgradeAdvancesTheSignedPlanGeneration(t *testing.T) {
 	}
 }
 
+func TestCellPlanVersionRequiresDurableAgentAndHelperCapability(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, err := h.manager.RegisterCell("version-gate", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan := verifiedPlan(t, h.manager, cell.ID, *h.now); plan.Version != cellplan.VersionV1 {
+		t.Fatalf("unobserved plan version = %d", plan.Version)
+	}
+	for _, test := range []struct {
+		name          string
+		agent, helper []uint32
+		want          uint32
+	}{
+		{name: "agent-only", agent: []uint32{1, 2}, helper: []uint32{1}, want: 1},
+		{name: "both", agent: []uint32{1, 2}, helper: []uint32{1, 2}, want: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
+			observed, err := h.manager.ObserveCell("version-"+test.name, CellObservation{CellID: cell.ID, PlanGeneration: plan.Generation,
+				ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent", HelperReleaseID: "helper", ObservedUnix: h.now.Unix(),
+				PlanVersions: test.agent, HelperPlanVersions: test.helper, HelperStateVersions: []uint32{1, 2}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cell = observed
+			if got := verifiedPlan(t, h.manager, cell.ID, *h.now).Version; got != test.want {
+				t.Fatalf("plan version = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func TestObservationCannotSwapIsolationIdentity(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, _ := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
-		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
+	prepareCellForAdmission(t, h, cell)
 	volume, _ := h.manager.CreateVolume("create", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
 	})
@@ -1186,8 +1222,8 @@ func TestObservationCannotSwapIsolationIdentity(t *testing.T) {
 	cell, err := h.manager.ObserveCell("bad-observation", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		Volumes: []VolumeObservation{{
-			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.ProjectID + 1,
-			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID + 1,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
 		}},
 	})
 	if err != nil || cell.Health != CellQuarantined {
@@ -1203,8 +1239,9 @@ func TestObservationCannotOmitAssignedVolume(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, _ := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
-		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
+	prepareCellForAdmission(t, h, cell)
 	volume, _ := h.manager.CreateVolume("create", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
 	})
@@ -1226,7 +1263,7 @@ func TestHeartbeatIsLiveFailClosedStateAndDoesNotPretendToSurviveRestart(t *test
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
-		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1258,11 +1295,12 @@ func TestAuthorityCertificateRenewsOnTheSameGenerationAndCSR(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
-		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareCellForAdmission(t, h, cell)
 	volume, err := h.manager.CreateVolume("create", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
 	})
@@ -1277,8 +1315,8 @@ func TestAuthorityCertificateRenewsOnTheSameGenerationAndCSR(t *testing.T) {
 			CellID: cell.ID, PlanGeneration: planGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
 			AgentReleaseID: "agent", HelperReleaseID: "helper", ObservedUnix: h.now.Unix(),
 			Volumes: []VolumeObservation{{
-				VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.ProjectID, ServiceUID: volume.ServiceUID,
-				ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort, Provisioned: true, AuthorityRunning: true,
+				VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID,
+				ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort, Provisioned: true, AuthorityRunning: true,
 				AuthorityCSRPEM: csrPEM,
 			}},
 		})
@@ -1288,16 +1326,16 @@ func TestAuthorityCertificateRenewsOnTheSameGenerationAndCSR(t *testing.T) {
 	}
 	observe("initial-csr", plan.Generation, csr)
 	first, _ := h.manager.GetVolume(volume.ID)
-	if first.AuthorityCertificate == "" || first.AuthorityCertExpires == 0 {
+	if first.Placement.AuthorityCertificatePEM == "" || first.Placement.AuthorityCertExpires == 0 {
 		t.Fatalf("initial authority identity = %+v", first.Volume)
 	}
 	*h.now = h.now.Add(17 * time.Hour)
 	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
 	observe("renew-csr", plan.Generation, csr)
 	renewed, _ := h.manager.GetVolume(volume.ID)
-	if renewed.AuthorityGeneration != first.AuthorityGeneration || renewed.AuthorityCSRPEM != csr ||
-		renewed.AuthorityCertificate == first.AuthorityCertificate || renewed.AuthorityCertExpires <= first.AuthorityCertExpires {
-		t.Fatalf("renewed authority identity = %+v, first expiry=%d", renewed.Volume, first.AuthorityCertExpires)
+	if renewed.AuthorityEpoch != first.AuthorityEpoch || renewed.Placement.AuthorityCSRPEM != csr ||
+		renewed.Placement.AuthorityCertificatePEM == first.Placement.AuthorityCertificatePEM || renewed.Placement.AuthorityCertExpires <= first.Placement.AuthorityCertExpires {
+		t.Fatalf("renewed authority identity = %+v, first expiry=%d", renewed.Volume, first.Placement.AuthorityCertExpires)
 	}
 }
 
@@ -1305,8 +1343,9 @@ func TestAuthorityCSRSwapWithinGenerationQuarantinesVolume(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, _ := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
-		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
+	prepareCellForAdmission(t, h, cell)
 	volume, _ := h.manager.CreateVolume("create", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
 	})
@@ -1316,8 +1355,8 @@ func TestAuthorityCSRSwapWithinGenerationQuarantinesVolume(t *testing.T) {
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent", HelperReleaseID: "helper", ObservedUnix: h.now.Unix(),
 		Volumes: []VolumeObservation{{
-			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.ProjectID, ServiceUID: volume.ServiceUID,
-			ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort, Provisioned: true, AuthorityCSRPEM: firstCSR,
+			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID,
+			ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort, Provisioned: true, AuthorityCSRPEM: firstCSR,
 		}},
 	}
 	if _, err := h.manager.ObserveCell("initial", base); err != nil {
@@ -1341,11 +1380,12 @@ func TestReadyAuthorityHostFailureFencesForRetryWithoutIdentityQuarantine(t *tes
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
-		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareCellForAdmission(t, h, cell)
 	volume, err := h.manager.CreateVolume("create", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
 	})
@@ -1355,8 +1395,8 @@ func TestReadyAuthorityHostFailureFencesForRetryWithoutIdentityQuarantine(t *tes
 	_, csr := testCSR(t)
 	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
 	base := VolumeObservation{
-		VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityGeneration, ProjectID: volume.ProjectID,
-		ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort, Provisioned: true,
+		VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+		ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort, Provisioned: true,
 	}
 	withCSR := base
 	withCSR.AuthorityCSRPEM = csr
@@ -1406,11 +1446,12 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 	t.Helper()
 	cell, err := h.manager.RegisterCell("ready-cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000,
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	prepareCellForAdmission(t, h, cell)
 	volume, err := h.manager.CreateVolume("ready-volume", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
 	})
@@ -1422,9 +1463,10 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 	cell, err = h.manager.ObserveCell("ready-csr", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
 		Volumes: []VolumeObservation{{
-			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityGeneration, ProjectID: volume.ProjectID,
-			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
 			Provisioned: true, AuthorityCSRPEM: authorityCSR,
 		}},
 	})
@@ -1435,9 +1477,10 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 	cell, err = h.manager.ObserveCell("ready-running", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
 		Volumes: []VolumeObservation{{
-			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityGeneration, ProjectID: volume.ProjectID,
-			ServiceUID: volume.ServiceUID, ServiceGID: volume.ServiceGID, ListenPort: volume.ListenPort,
+			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
 			Provisioned: true, AuthorityRunning: true,
 		}},
 	})
@@ -1449,6 +1492,29 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 		t.Fatalf("ready volume = %+v, %v", volume, err)
 	}
 	return cell, volume
+}
+
+func prepareCellForAdmission(t *testing.T, h managerHarness, cell Cell) Cell {
+	t.Helper()
+	observed, err := h.manager.ObserveCell("admission-"+cell.ID, CellObservation{
+		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.PlanGeneration != cell.PlanGeneration {
+		observed, err = h.manager.ObserveCell("admission-v2-"+cell.ID, CellObservation{
+			CellID: cell.ID, PlanGeneration: observed.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+			AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+			PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return observed
 }
 
 func signedProductAuthorization(t *testing.T, h managerHarness, volume Volume, peer [32]byte, nonce string, access []string) string {

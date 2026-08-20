@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/archivestore"
+	"github.com/steerlabs/portablefs/vcs/internal/archiveverify"
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 	"golang.org/x/sys/unix"
 )
@@ -43,6 +46,18 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "migrate-state" {
+		flags := flag.NewFlagSet("migrate-state", flag.ContinueOnError)
+		from := flags.String("from", "", "absolute v1 manager state path")
+		to := flags.String("to", "", "absolute new v2 manager state path")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 || *from == "" || *to == "" {
+			return errors.New("migrate-state requires -from and -to")
+		}
+		return controlplane.MigrateStateV1ToV2(*from, *to)
+	}
 	var productKeys issuerKeyFlags
 	listen := flag.String("listen", "", "mTLS control address")
 	stateFile := flag.String("state-file", "", "absolute durable manager state path")
@@ -58,6 +73,7 @@ func run() error {
 	enrollmentCACert := flag.String("mount-enrollment-ca-cert", "", "Manager-facing mount enrollment CA certificate PEM")
 	enrollmentCAKey := flag.String("mount-enrollment-ca-key", "", "Manager-facing mount enrollment CA private key PEM")
 	flag.Var(&productKeys, "product-issuer-key", "trusted product authorization key as issuer=/absolute/public-key.pem; repeatable")
+	archiveCredentials := flag.String("archive-credentials", "", "archive-store credentials file enabling seal verification and purge (optional)")
 	planLifetime := flag.Duration("plan-lifetime", 15*time.Minute, "signed cell plan lifetime")
 	grantLifetime := flag.Duration("grant-lifetime", 10*time.Minute, "mount grant lifetime")
 	enrollmentLifetime := flag.Duration("mount-enrollment-lifetime", 24*time.Hour, "maximum lifetime of one key-bound automatic mount enrollment")
@@ -125,6 +141,29 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("mount enrollment CA: %w", err)
 	}
+	// The archive store is optional deployment capability: without it the
+	// Manager serves normally and refuses archive/destroy operations with
+	// ErrArchiveStoreUnavailable rather than pretending.
+	var archiveVerifier controlplane.ArchiveVerifier
+	var archivePurger controlplane.ArchivePurger
+	if *archiveCredentials != "" {
+		if !cleanAbsolutePath(*archiveCredentials) {
+			return fmt.Errorf("archive credentials path must be clean and absolute: %q", *archiveCredentials)
+		}
+		storeConfig, err := archivestore.LoadConfigFile(*archiveCredentials)
+		if err != nil {
+			return fmt.Errorf("archive credentials: %w", err)
+		}
+		client, err := archivestore.New(storeConfig)
+		if err != nil {
+			return fmt.Errorf("archive store: %w", err)
+		}
+		verify, err := archiveverify.New(client)
+		if err != nil {
+			return err
+		}
+		archiveVerifier, archivePurger = verify, verify
+	}
 	manager, err := controlplane.NewManager(controlplane.ManagerConfig{
 		Store: store, PlanPrivateKey: planPrivate, CapabilityPrivateKey: capabilityPrivate,
 		ProductIssuers: issuers, AuthorityCA: authorityCA, ClientCA: clientCA, EnrollmentCA: enrollmentCA,
@@ -132,6 +171,7 @@ func run() error {
 		EnrollmentLifetime: *enrollmentLifetime,
 		ProductMaxLifetime: *productLifetime, ClientCertLifetime: *clientCertLifetime,
 		AuthorityCertLifetime: *authorityCertLifetime, ObservedStaleAfter: *observedStale, ClockSkew: *clockSkew,
+		ArchiveVerifier: archiveVerifier, ArchivePurger: archivePurger,
 	})
 	if err != nil {
 		return err
@@ -162,6 +202,32 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// Archive-seal verification is deliberately not performed inside the
+	// observation transaction: the store lock must never be held across
+	// archive-store network I/O. This loop drives every volume waiting at the
+	// "verifying" cursor through the unlocked two-phase commit; failures stay
+	// at the cursor and retry on the next tick (a visible, non-destructive
+	// stall — XFS remains canonical until the commit).
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				pending, err := manager.PendingVerifications()
+				if err != nil {
+					continue
+				}
+				for _, volumeID := range pending {
+					if err := manager.NoteVerify(volumeID); err != nil {
+						log.Printf("portablefs-manager: archive verification for %s: %v", volumeID, err)
+					}
+				}
+			}
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 15*time.Second)

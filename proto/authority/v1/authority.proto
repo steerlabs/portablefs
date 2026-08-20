@@ -87,6 +87,10 @@ message Response {
   // "your mount was refused" into "your local-dirs file is revision X, the
   // volume's is Y". See RoutesMismatch.
   RoutesMismatch routes_mismatch = 8;
+  // restore_detail is present with FAILURE_CLASS_RESTORE and gives the stable
+  // retry/operator reason without overloading errno (blocked, corrupt,
+  // recall_saturated, recall_deadline, or protocol).
+  string restore_detail = 9;
 
   oneof body {
     HelloReply hello = 10;
@@ -151,6 +155,10 @@ enum FailureClass {
   // ECANCELED because macOS 26 may transparently re-enter a mutating callback
   // after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
   FAILURE_CLASS_VISIBILITY_INTERRUPTED = 5;
+  // RESTORE is a definite, non-fatal refusal while sealed base content cannot
+  // be recalled, recall admission is saturated, or corruption has made the
+  // volume's content uniformly unavailable. The session and epoch stay live.
+  FAILURE_CLASS_RESTORE = 6;
 }
 
 // RoutesMismatch names both sides of a routing-topology disagreement. All

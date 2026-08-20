@@ -22,17 +22,26 @@ product stored elsewhere.
    less like a local filesystem — eventual visibility, silent divergence,
    invented merge semantics — is a regression regardless of what it buys.
 
-2. **One volume has exactly one authority.** A volume is one XFS project
-   directory served by one `portablefs-authority` process on one Linux host.
-   Two writers to one volume tree is a correctness bug, not a scaling
-   configuration.
+2. **One serving volume has exactly one authority.** A READY or RESTORING volume
+   is one XFS project directory served by one `portablefs-authority` process on
+   one Linux host. A released ARCHIVED volume has neither an XFS placement nor
+   a serving authority. Two writers to one volume tree is a correctness bug,
+   not a scaling configuration.
 
 3. **XFS is the only durable filesystem truth.** PortableFS holds no second
    inode tree, no content index, no mutation log, no checkpoint format, no
    branch graph, and no write-back overlay. Authority state is disposable epoch
    state: sessions, open file descriptions, locks, replay slots, cancellation.
-   The one durable exception is strict-mount membership, which records only
-   which cached kernel mounts a previous epoch admitted.
+   The first durable exception is strict-mount membership, which records only
+   which cached kernel mounts a previous epoch admitted. The second durable
+   exception is the tiered-storage representation keyed by `(State,
+   ArchiveCycleStep)` in the
+   [canonical-representation table](./tiered-storage/identity-lifecycle-and-capacity.md#canonical-representation-invariant-one-per-state-explicit):
+   an ARCHIVED volume's sealed archive, or during RESTORING the composite of
+   sealed base, monotone hydration map, and XFS. The archive may contain only
+   the volume's sealed tree content and metadata; it is sealed, immutable, and
+   attempt-addressed, with no live mutation log, branch graph, or second
+   writable truth.
 
 4. **Data-plane acknowledgement means applied.** Linux direct-I/O `write(2)` and
    every FSKit write callback complete after XFS application. macOS may return an
@@ -68,12 +77,16 @@ product stored elsewhere.
    manager may store placement, quota entitlement, PKI, authorization receipts,
    desired state, and observed health. It never stores file bytes or metadata
    and is not consulted by ordinary reads, writes, locks, or visibility repair.
-   Cells poll it outbound; network input never becomes a privileged path,
-   command, unit file, or executable.
+   During RESTORING, the hydrator is a data-path serving dependency of that one
+   volume; the Manager never is. Cells poll it outbound; network input never
+   becomes a privileged path, command, unit file, or executable.
 
 ## What not to build
 
-- A second durable store, index, or operation log beside XFS.
+- A second durable store, index, or operation log beside XFS, except the sealed,
+  immutable archive tier defined by the
+  [tiered-storage contracts](./tiered-storage/identity-lifecycle-and-capacity.md);
+  the exception does not permit any other durable store or writable truth.
 - Client write-back caching, or any acknowledgement path that returns before the
   authority applied the bytes.
 - Asynchronous cache invalidation presented as a coherence guarantee.

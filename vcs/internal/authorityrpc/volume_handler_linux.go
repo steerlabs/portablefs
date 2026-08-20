@@ -17,6 +17,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
+	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/encoding/protowire"
@@ -110,6 +111,10 @@ type VolumeHandler struct {
 	// from a disagreeing one, and admitting mounts in that state is exactly the
 	// silent topology skew this exists to prevent.
 	Routes *RoutesController
+	// Restore is nil outside the state-driven ready-without-converged window.
+	// The nil check is the complete steady-state overhead on ordinary volumes.
+	Restore *restoremode.Mode
+	Quiesce interface{ Check() error }
 	// OnStorageFailure is called once after an EIO fences the store. Production
 	// uses it to terminate this epoch instead of remaining deceptively ready.
 	OnStorageFailure   func(error)
@@ -437,6 +442,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		set := body.SetAttr
 		var item, handle xfsstore.Capability
 		var coordinate visibilityCoordinate
+		var oldSize int64
 		var mode fs.FileMode
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			if set.Mode == nil && set.Uid == nil && set.Gid == nil && set.Size == nil && set.AtimeNs == nil && set.MtimeNs == nil && !set.GetAtimeNow() && !set.GetMtimeNow() {
@@ -486,6 +492,18 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if err != nil {
 				return nil, err
 			}
+			if set.Size != nil {
+				var attr xfsstore.Attr
+				if handle != (xfsstore.Capability{}) {
+					attr, err = h.Store.GetattrOpen(handle)
+				} else {
+					attr, err = h.Store.Getattr(item)
+				}
+				if err != nil {
+					return nil, err
+				}
+				oldSize = attr.Size
+			}
 			targets := []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 			if set.Size != nil {
 				targets = append(targets, inodeTarget(volumeserver.VisibilityData, coordinate, set.GetSize()))
@@ -534,10 +552,16 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				changed = true
 			}
 			if set.Size != nil {
-				if handle != (xfsstore.Capability{}) {
-					err = h.Store.Truncate(handle, set.GetSize())
+				truncate := func() error {
+					if handle != (xfsstore.Capability{}) {
+						return h.Store.Truncate(handle, set.GetSize())
+					}
+					return h.Store.TruncateObject(item, set.GetSize())
+				}
+				if h.Restore != nil && h.Restore.Active() {
+					err = h.Restore.Truncate(ctx, coordinate.identity, oldSize, set.GetSize(), truncate)
 				} else {
-					err = h.Store.TruncateObject(item, set.GetSize())
+					err = truncate()
 				}
 				if err != nil {
 					return h.errorResponse(0, err, changed), completeTargets()
@@ -545,7 +569,14 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				changed = true
 			}
 			if set.AtimeNs != nil || set.MtimeNs != nil || set.GetAtimeNow() || set.GetMtimeNow() {
-				err = h.Store.SetTimes(item, set.AtimeNs, set.MtimeNs, set.GetAtimeNow(), set.GetMtimeNow())
+				setTimes := func() error {
+					return h.Store.SetTimes(item, set.AtimeNs, set.MtimeNs, set.GetAtimeNow(), set.GetMtimeNow())
+				}
+				if h.Restore != nil && h.Restore.Active() && (set.MtimeNs != nil || set.GetMtimeNow()) {
+					err = h.Restore.UserMutation(coordinate.identity, setTimes)
+				} else {
+					err = setTimes()
+				}
 				if err != nil {
 					return h.errorResponse(0, err, changed), completeTargets()
 				}
@@ -627,11 +658,24 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, createdTargets(xfsstore.Capability{}))
 			}
-			handle, err := h.Store.OpenFile(item, openFlags(body.Create.GetFlags()))
+			var handle xfsstore.Capability
+			openExisting := func() error {
+				var openErr error
+				handle, openErr = h.Store.OpenFile(item, openFlags(body.Create.GetFlags()))
+				return openErr
+			}
+			if h.Restore != nil && h.Restore.Active() && existed && body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
+				err = h.Restore.Truncate(ctx, existingCoordinate.identity, existingSize, 0, openExisting)
+			} else {
+				err = openExisting()
+			}
 			if err != nil {
 				targets := createdTargets(item)
+				if handle != (xfsstore.Capability{}) {
+					h.closeOpen(handle)
+				}
 				h.forgetItem(item)
-				return h.errorResponse(0, err, targets != nil), targets
+				return h.errorResponse(0, err, handle != (xfsstore.Capability{}) || targets != nil), targets
 			}
 			if err := reservation.commit(
 				[]trackedCapability{{value: item}},
@@ -920,16 +964,40 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		}
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
+		var oldSize int64
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			var err error
 			item, err = h.item(cred.ID, body.Open.GetItem())
 			if err == nil {
 				coordinate, err = h.coordinateItem(item)
 			}
+			if err == nil {
+				var attr xfsstore.Attr
+				attr, err = h.Store.Getattr(item)
+				oldSize = attr.Size
+			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
 		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-			resp := openApply(item)
+			var resp *authoritypb.Response
+			if h.Restore != nil && h.Restore.Active() {
+				err := h.Restore.Truncate(ctx, coordinate.identity, oldSize, 0, func() error {
+					resp = openApply(item)
+					if resp.GetErrno() != 0 {
+						return syscall.Errno(resp.GetErrno())
+					}
+					return nil
+				})
+				if err != nil {
+					if resp != nil && resp.GetErrno() != 0 {
+						return resp, nil
+					}
+					cleanupOpenedHandle()
+					return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+				}
+			} else {
+				resp = openApply(item)
+			}
 			if !visibilityChanged(resp) {
 				return resp, nil
 			}
@@ -977,6 +1045,15 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		if err := h.stabilizeOpen(ctx, cred.ID, handle); err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
+		if h.Restore != nil && h.Restore.Active() {
+			identity, identityErr := h.Store.IdentityOpen(handle)
+			if identityErr != nil {
+				return h.errorResponse(req.GetRequestId(), identityErr, false)
+			}
+			if err := h.Restore.EnsureHydrated(ctx, identity, body.Read.GetOffset(), uint64(body.Read.GetLength())); err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+		}
 		buf := make([]byte, body.Read.GetLength())
 		n, err := h.Store.ReadAt(handle, buf, int64(body.Read.GetOffset()))
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -991,6 +1068,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		}
 		var handle xfsstore.Capability
 		var coordinate visibilityCoordinate
+		var preparedSize int64
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			if body.Write.GetAppend() && body.Write.GetOffset() != 0 {
 				return nil, syscall.EINVAL
@@ -1005,19 +1083,35 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				return nil, err
 			}
 			attr, err := h.Store.GetattrOpen(handle)
+			preparedSize = attr.Size
 			coordinate = attrCoordinate(identity, attr)
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
 		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var err error
 			var n int
-			var assigned int64
-			if body.Write.GetAppend() {
-				n, assigned, err = h.Store.Append(handle, body.Write.GetData())
-			} else {
-				n, err = h.Store.WriteAt(handle, body.Write.GetData(), int64(body.Write.GetOffset()))
+			assigned := int64(-1)
+			applyWrite := func() (int, int64, error) {
+				if body.Write.GetAppend() {
+					return h.Store.Append(handle, body.Write.GetData())
+				}
+				n, err := h.Store.WriteAt(handle, body.Write.GetData(), int64(body.Write.GetOffset()))
+				return n, -1, err
 			}
-			resp := h.writeOutcome(n, assigned, err)
+			if h.Restore != nil && h.Restore.Active() {
+				writeOffset := body.Write.GetOffset()
+				if body.Write.GetAppend() && preparedSize > 0 {
+					writeOffset = uint64(preparedSize)
+				}
+				n, assigned, err = h.Restore.Write(ctx, coordinate.identity, writeOffset, uint32(len(body.Write.GetData())), applyWrite)
+			} else {
+				n, assigned, err = applyWrite()
+			}
+			reportedAssigned := assigned
+			if reportedAssigned < 0 {
+				reportedAssigned = 0
+			}
+			resp := h.writeOutcome(n, reportedAssigned, err)
 			if visibilityChanged(resp) {
 				// A positive short count is already authoritative XFS progress even
 				// when the store then dies. COMPLETE must carry the actual resulting
@@ -1471,6 +1565,11 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	}
 	var commitment volumeserver.VisibilityCommitment
 	if profile == volumeserver.CoherenceStrict {
+		if h.Quiesce != nil {
+			if err := h.Quiesce.Check(); err != nil {
+				return h.errorResponse(requestID, err, false)
+			}
+		}
 		repair, err := namespaceRepair(attach.GetNamespaceRepair())
 		if err != nil || attach.GetRepairBudgetMillis() > uint64((time.Duration(1<<63-1))/time.Millisecond) {
 			return h.errorResponse(requestID, syscall.EINVAL, false)
@@ -1958,7 +2057,16 @@ func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, 
 		if err := h.stabilizeOpen(ctx, id, handle); err != nil {
 			return xfsstore.Attr{}, err
 		}
-		return h.Store.GetattrOpen(handle)
+		if h.Restore == nil || !h.Restore.Active() {
+			return h.Store.GetattrOpen(handle)
+		}
+		identity, err := h.Store.IdentityOpen(handle)
+		if err != nil {
+			return xfsstore.Attr{}, err
+		}
+		var attr xfsstore.Attr
+		err = h.Restore.WithAttrLock(identity, func() error { var getErr error; attr, getErr = h.Store.GetattrOpen(handle); return getErr })
+		return attr, err
 	}
 	item, err := h.item(id, req.GetItem())
 	if err != nil {
@@ -1967,7 +2075,16 @@ func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, 
 	if err := h.stabilizeItem(ctx, id, item); err != nil {
 		return xfsstore.Attr{}, err
 	}
-	return h.Store.Getattr(item)
+	if h.Restore == nil || !h.Restore.Active() {
+		return h.Store.Getattr(item)
+	}
+	identity, err := h.Store.Identity(item)
+	if err != nil {
+		return xfsstore.Attr{}, err
+	}
+	var attr xfsstore.Attr
+	err = h.Restore.WithAttrLock(identity, func() error { var getErr error; attr, getErr = h.Store.Getattr(item); return getErr })
+	return attr, err
 }
 
 func (h *VolumeHandler) getLock(requestID uint64, cred volumeserver.SessionCredential, request *authoritypb.GetLockRequest) *authoritypb.Response {
@@ -2071,6 +2188,27 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		errno = errnos.EINVAL
 	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN
+	case errors.Is(err, volumeserver.ErrQuiescing):
+		errno = errnos.EAGAIN
+	case errors.Is(err, restoremode.ErrRecallSaturated), errors.Is(err, restoremode.ErrRecallDeadline),
+		errors.Is(err, restoremode.ErrBlocked), errors.Is(err, restoremode.ErrCorrupt), errors.Is(err, restoremode.ErrProtocol):
+		errno = errnos.EAGAIN
+		resp := h.success(requestID)
+		resp.Errno, resp.Uncertain = errno, uncertain
+		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_RESTORE
+		switch {
+		case errors.Is(err, restoremode.ErrCorrupt):
+			resp.RestoreDetail = "corrupt"
+		case errors.Is(err, restoremode.ErrProtocol):
+			resp.RestoreDetail = "protocol"
+		case errors.Is(err, restoremode.ErrRecallSaturated):
+			resp.RestoreDetail = "recall_saturated"
+		case errors.Is(err, restoremode.ErrRecallDeadline):
+			resp.RestoreDetail = "recall_deadline"
+		default:
+			resp.RestoreDetail = "blocked"
+		}
+		return resp
 	case errors.Is(err, volumeserver.ErrVisibilityInterrupted):
 		// This is a definite pre-apply interruption, not a coherence
 		// failure. Linux consumes EINTR to release the execution lane needed
