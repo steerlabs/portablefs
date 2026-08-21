@@ -140,7 +140,10 @@ fi
 declare -A volume_states=() minimum_generations=() restart_volumes=() cleanup_volumes=()
 restart_count=0
 for volume_id in "${volume_ids[@]}"; do
-  volume=$(manager_call get "$volume_id")
+  # Release coordination is an operator concern and must cover every volume,
+  # including staging fixtures created under an older product issuer. Product
+  # credentials intentionally cannot inspect those volumes.
+  volume=$(manager_call get-operator "$volume_id")
   state=$(jq -r '.state' <<<"$volume")
   generation=$(jq -r '.authority_generation' <<<"$volume")
   [[ $generation =~ ^[1-9][0-9]*$ ]] || {
@@ -154,6 +157,9 @@ for volume_id in "${volume_ids[@]}"; do
   fi
   case "$state" in
     READY)
+      # Restart remains a product-authorized mutation. Prove this deployer's
+      # product identity owns each READY volume before draining anything.
+      manager_call get "$volume_id" >/dev/null
       minimum_generations[$volume_id]=$((generation + 1))
       ;;
     FENCING)
@@ -198,7 +204,7 @@ if ((restart_count > 0)); then
   evidence_sha=$(sha256sum "$evidence_dir/strict-fence.json" | awk '{print $1}')
   for volume_id in "${volume_ids[@]}"; do
     [[ -n ${restart_volumes[$volume_id]:-} ]] || continue
-    volume=$(manager_call get "$volume_id")
+    volume=$(manager_call get-operator "$volume_id")
     state=$(jq -r '.state' <<<"$volume")
     if [[ -n ${cleanup_volumes[$volume_id]:-} ]]; then
       [[ $state == DESTROYING || $state == DESTROYED ]] || {
