@@ -1,6 +1,6 @@
 # Deploying a hosted storage cell
 
-Status: **Linux reference deployment for the hosted v1 foundation**
+Status: **Linux reference deployment for the hosted v2 tiered foundation**
 
 Read [hosted-control-plane.md](./hosted-control-plane.md) first. This document
 only covers the host boundary. The standalone authority runbook remains in
@@ -28,8 +28,9 @@ The reference paths are:
 | `/srv/portablefs/.portablefs-control/<volume>/write-staging` | volume UID `0700`, root-pinned parent | unnamed transactional-write staging, charged to the volume's exact XFS project quota |
 | `/etc/portablefs/trust` | root | manager CA and plan public key |
 | `/etc/portablefs/cells` | root | cell mTLS identity and root-owned environment |
+| `/etc/portablefs/cells/<cell-uuid>-archive.env` | root `0600` | root-pinned archive endpoint, bucket, prefix, key version, and scoped credentials |
 | `/etc/portablefs/volumes` | root | generated per-volume authority config/keys/certs |
-| `/var/lib/portablefs/volumes` | per-volume UID | strict membership and runtime state |
+| `/var/lib/portablefs/volumes` | per-volume UID | membership, restore hydration/convergence records, and runtime state |
 | `/var/lib/portablefs-cell-helper` | root `0700` | pinned assignments and plan generation |
 | `/var/lib/portablefs-cell-helper/sysusers.d` | root | persistent, exact per-volume service-account definitions |
 | `/run/portablefs-cell-helper` | root:agent `0750` | cell-specific local helper sockets |
@@ -38,8 +39,9 @@ The reference paths are:
 ## Install one immutable hosted release
 
 Build one clean-commit release with `scripts/build-hosted-linux-release.sh`.
-The bundle contains the five hosted services, the Linux `portablefs` client,
-and all five unit templates. Every executable reports the same
+The bundle contains the Manager, cell agent, authority, archiver, hydrator,
+root helper, authority launcher, Linux `portablefs` client, and all seven unit
+templates. Every executable reports the same
 `pfs-hosted-YYYYMMDD-<commit>` identity and the bundle has exact-member SHA-256
 verification. The matched client is also the source for managed sandbox images;
 it is not built or selected by a second release process. Install the bundle
@@ -63,13 +65,15 @@ restart request, a strict-mount fence proof, local process-absence observation,
 and a monotonic authority generation. The next generation starts from the new
 release root.
 
-The release carries these five units from `deploy/systemd/`:
+The release carries these seven units from `deploy/systemd/`:
 
 ```text
 portablefs-cell-helper@.service
 portablefs-cell-agent@.service
 portablefs-authority@.socket
 portablefs-authority@.service
+portablefs-archiver@.service
+portablefs-hydrator@.service
 ```
 
 The helper generates only typed per-volume drop-ins. The service template gives
@@ -78,6 +82,13 @@ network, a read-only system, syscall restrictions, and exactly four bind
 mounts: the served XFS project, read-only configuration, runtime state, and a
 separate write-staging directory under that same XFS project quota. The two
 control parents are root-owned and non-replaceable by the service identity.
+During RESTORING, the existing runtime-state bind exposes the hydrator socket;
+the authority gains no extra data-tree access. The hydrator receives network,
+read-scoped archive credentials, and that socket directory, but in serve mode
+no volume data-directory access. The archiver receives network, write-scoped
+credentials, and a read-only bind of one quiesced volume. Its sole capability
+is `CAP_DAC_READ_SEARCH`, required to preserve owner-denying modes such as
+`0000`; it never receives `CAP_DAC_OVERRIDE` or write access.
 The socket unit owns the public TCP listener and passes one descriptor
 to the authority. Do not add a second `ListenStream` or a second authority unit
 for the same volume.
@@ -101,6 +112,7 @@ Provision these root-owned files out of band:
 - `/etc/portablefs/cells/<cell-uuid>.key` (agent-owned `0600`, inside a
   root-controlled, non-agent-writable directory)
 - `/etc/portablefs/cells/<cell-uuid>.env` (`0600`)
+- `/etc/portablefs/cells/<cell-uuid>-archive.env` (`0600`)
 
 The cell certificate has exactly this URI SAN:
 
@@ -117,6 +129,11 @@ PORTABLEFS_AGENT_GID=200100
 PORTABLEFS_MANAGER_URL=https://manager.internal:8443
 PORTABLEFS_MANAGER_SERVER_NAME=manager.internal
 ```
+
+The archive environment is root-provisioned and never plan-selected. It pins
+the endpoint, bucket, root prefix, and key version and supplies separate write
+scope for the archiver and read scope for the hydrator. Plans contain attempt
+identities and digests, not credentials or arbitrary object keys.
 
 The plan public key is independent of control-channel TLS. Compromise of one
 does not silently turn an unsigned manager response into a root command: both
@@ -177,13 +194,17 @@ the long-running helper does not hold that capability.
   mutation.
 - A helper-state mismatch is a stop condition. Do not delete helper state to
   make it pass; reconcile the signed assignment and on-disk project first.
+- A `RELEASE` entry whose placement sequence, authority epoch, or destroy-proof
+  digest differs from the recorded proof fails closed without removing the
+  assignment.
 - If an authority or socket remains active after fencing, the helper reports an
   error and the manager quarantines the volume. It does not start a successor.
 - A cell heartbeat loss makes mount issuance fail closed after the configured
   freshness window. Existing authority sessions continue until their own
   liveness/authorization/fencing rules end them.
-- `RETIRE` preserves the XFS directory. Deletion, snapshot, restore, and device
-  replacement are offline runbooks and require separately validated targets.
+- `RETIRE` preserves the XFS directory. Archive, restore, destroy, and release
+  run only through typed v2 plan phases and their proofs; operator snapshots and
+  device replacement remain offline runbooks.
 
 Before a production rollout, exercise the failure paths on a disposable real
 XFS host: kill/stop races, a `SIGSTOP`ed worker, cgroup population, full block

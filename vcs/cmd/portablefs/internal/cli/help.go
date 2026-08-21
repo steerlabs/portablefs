@@ -294,7 +294,7 @@ Standalone hosted integrations can call portablefs reauthorize explicitly;
 once the credential is already expired, a new capability and remount is
 required. The mount log under
 ~/.local/state/portablefs/mounts/ carries the mount owner's structured renewal
-events and terminal reason. Renewal records contain only sequence, deadline,
+events and its terminal reason. Renewal records contain only sequence, deadline,
 retry, and bounded error metadata; credentials are never logged.
 
 A revoked mount is reported ahead of every liveness check, because it may

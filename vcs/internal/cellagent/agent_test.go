@@ -68,7 +68,8 @@ func TestRunOnceVerifiesReconcilesAndReportsExactReleases(t *testing.T) {
 		}
 		return jsonResponse(t, controlplane.CellObservation{
 			CellID: cellID, PlanGeneration: plan.Generation, ManagerReleaseID: plan.ReleaseID,
-			HelperReleaseID: "helper-r1", ObservedUnix: now.Unix(),
+			HelperReleaseID: "helper-r1", ObservedUnix: now.Unix(), HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+			ArchiveConfigured: true,
 		}), nil
 	})}
 	agent, err := New(Config{
@@ -90,6 +91,13 @@ func TestRunOnceVerifiesReconcilesAndReportsExactReleases(t *testing.T) {
 	}
 	if reported.AgentReleaseID != "agent-r2" || reported.HelperReleaseID != "helper-r1" || reported.ManagerReleaseID != "manager-r3" {
 		t.Fatalf("reported releases = %+v", reported)
+	}
+	if len(reported.PlanVersions) != 2 || len(reported.HelperPlanVersions) != 2 || len(reported.HelperStateVersions) != 2 {
+		t.Fatalf("reported capability lists = %+v", reported)
+	}
+	// The agent relays helper capabilities verbatim and infers none of its own.
+	if !reported.ArchiveConfigured {
+		t.Fatalf("agent dropped the helper archive capability = %+v", reported)
 	}
 }
 
@@ -151,6 +159,64 @@ func TestObservationMustContainEveryExactSignedAssignment(t *testing.T) {
 	}
 }
 
+func TestObservationMatchesReleaseOnlyWithExactReleasedIdentity(t *testing.T) {
+	planned := []cellplan.VolumePlan{{VolumeID: "22222222-2222-4222-8222-222222222222", Phase: cellplan.PhaseRelease,
+		AuthorityGeneration: 3, ProjectID: 71, ServiceUID: 10_071, ServiceGID: 10_071, ListenPort: 20_071}}
+	observed := controlplane.VolumeObservation{VolumeID: planned[0].VolumeID, Released: true, AuthorityGeneration: 3,
+		ProjectID: 71, ServiceUID: 10_071, ServiceGID: 10_071, ListenPort: 20_071}
+	if !observationMatchesPlan([]controlplane.VolumeObservation{observed}, planned) {
+		t.Fatal("exact released observation was rejected")
+	}
+	observed.Released = false
+	if observationMatchesPlan([]controlplane.VolumeObservation{observed}, planned) {
+		t.Fatal("release phase was accepted without the helper's released signal")
+	}
+}
+
+func TestRunOnceRelaysV2EnvelopeAndHelperCapabilities(t *testing.T) {
+	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+	now := time.Unix(1_900_000_000, 0)
+	cellID := "11111111-1111-4111-8111-111111111111"
+	plan := testPlan(now, cellID)
+	plan.Version = cellplan.Version
+	plan.AuthorityCAPEM, plan.ClientCAPEM, plan.CapabilityPublicKey = "authority-ca", "client-ca", "cap-key"
+	envelope, err := cellplan.Sign(privateKey, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reported controlplane.CellObservation
+	managerClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet {
+			return jsonResponse(t, envelope), nil
+		}
+		if err := json.NewDecoder(request.Body).Decode(&reported); err != nil {
+			t.Fatal(err)
+		}
+		return jsonResponse(t, map[string]string{"ok": "true"}), nil
+	})}
+	helperClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		var received cellplan.Envelope
+		if err := json.NewDecoder(request.Body).Decode(&received); err != nil || received.Token != envelope.Token {
+			t.Fatalf("v2 envelope changed across the agent: %v", err)
+		}
+		return jsonResponse(t, controlplane.CellObservation{CellID: cellID, PlanGeneration: plan.Generation,
+			ManagerReleaseID: plan.ReleaseID, HelperReleaseID: "helper-v2", ObservedUnix: now.Unix(),
+			HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2}}), nil
+	})}
+	agent, err := New(Config{CellID: cellID, ManagerURL: "https://manager.example", PlanPublicKey: publicKey,
+		PlanLifetime: 5 * time.Minute, ClockSkew: time.Second, PollInterval: time.Second, ReleaseID: "agent-v2",
+		ManagerClient: managerClient, HelperClient: helperClient, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(reported.PlanVersions) != 2 || len(reported.HelperPlanVersions) != 2 || len(reported.HelperStateVersions) != 2 {
+		t.Fatalf("v2 capabilities were not relayed: %+v", reported)
+	}
+}
+
 func TestDecodeStrictRejectsBytesBeyondTheHardLimit(t *testing.T) {
 	var target struct{}
 	if err := decodeStrict(strings.NewReader(`{} `), 2, &target); err == nil {
@@ -160,7 +226,7 @@ func TestDecodeStrictRejectsBytesBeyondTheHardLimit(t *testing.T) {
 
 func testPlan(now time.Time, cellID string) cellplan.Plan {
 	return cellplan.Plan{
-		Version: cellplan.Version, CellID: cellID, Generation: 7, IssuedAt: now.Unix(),
+		Version: cellplan.VersionV1, CellID: cellID, Generation: 7, IssuedAt: now.Unix(),
 		ExpiresAt: now.Add(time.Minute).Unix(), ReleaseID: "manager-r3",
 	}
 }

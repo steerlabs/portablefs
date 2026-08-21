@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	StateSchemaVersion                              = 1
+	StateSchemaVersion                              = 2
 	MaxVolumesPerCell                               = 256
 	MaxActiveMountEnrollments                       = 2048
 	MaxActiveMountEnrollmentsPerAuthorizationDomain = 512
@@ -31,20 +31,40 @@ const (
 	// MaxRenewalFences keeps the index comfortably below the 64 MiB serialized
 	// state cap. Deletion waits for a future scope-retirement coordinator because
 	// removing a high-water mark would re-admit lower generations.
-	MaxRenewalFences = 65536
+	MaxRenewalFences         = 65536
+	MaxOrphanedPlacements    = 4096
+	MaxArchivePacks          = 1024
+	MaxArchiveObjectKeyBytes = 512
+	MaxArchiveRecordBytes    = 512 << 10
 )
 
 var (
-	ErrInvalid              = errors.New("controlplane: invalid request")
-	ErrNotFound             = errors.New("controlplane: not found")
-	ErrConflict             = errors.New("controlplane: conflict")
-	ErrCapacity             = errors.New("controlplane: no cell has sufficient capacity")
-	ErrEnrollmentCapacity   = errors.New("controlplane: mount enrollment capacity reached")
-	ErrRenewalFenceCapacity = errors.New("controlplane: renewal fence capacity reached")
-	ErrIdempotencyReuse     = errors.New("controlplane: idempotency key reused for a different request")
-	ErrQuarantined          = errors.New("controlplane: resource is quarantined")
-	ErrEnrollmentEnded      = errors.New("controlplane: mount enrollment has ended")
-	ErrRenewalScopeFenced   = errors.New("renewal_scope_fenced")
+	ErrInvalid                 = errors.New("controlplane: invalid request")
+	ErrNotFound                = errors.New("controlplane: not found")
+	ErrConflict                = errors.New("controlplane: conflict")
+	ErrCapacity                = errors.New("controlplane: no cell has sufficient capacity")
+	ErrEnrollmentCapacity      = errors.New("controlplane: mount enrollment capacity reached")
+	ErrRenewalFenceCapacity    = errors.New("controlplane: renewal fence capacity reached")
+	ErrIdempotencyReuse        = errors.New("controlplane: idempotency key reused for a different request")
+	ErrQuarantined             = errors.New("controlplane: resource is quarantined")
+	ErrEnrollmentEnded         = errors.New("controlplane: mount enrollment has ended")
+	ErrRenewalScopeFenced      = errors.New("renewal_scope_fenced")
+	ErrArchiveStoreUnavailable = errors.New("controlplane: archive store unavailable")
+	// ErrArchiveUnsupported means this deployment cannot perform the requested
+	// archive-tier operation at all: the volume's cell advertises no archive
+	// configuration, or the Manager itself runs without the archive component
+	// (verifier, purger) the operation needs. It is a durable configuration
+	// fact, not load and not a state race, so clients must surface it to an
+	// operator rather than retry it as busy — which is why it is distinct from
+	// both ErrArchiveStoreUnavailable (the store exists but is unreachable
+	// right now) and ErrConflict (the volume is not in an eligible state).
+	ErrArchiveUnsupported = errors.New("controlplane: archiving is not supported by this deployment")
+	// ErrBusy is transient and carries no state change: the request was refused
+	// only because a per-cell archive/restore concurrency cap is currently full,
+	// so an unchanged retry on a later sweep is the correct response. It is
+	// deliberately distinct from ErrCapacity, which means the fleet cannot hold
+	// the volume at all.
+	ErrBusy = errors.New("controlplane: cell archive or restore concurrency is saturated")
 )
 
 type VolumeState string
@@ -55,6 +75,17 @@ const (
 	VolumeFencing      VolumeState = "FENCING"
 	VolumeRetired      VolumeState = "RETIRED"
 	VolumeQuarantined  VolumeState = "QUARANTINED"
+	VolumeArchiving    VolumeState = "ARCHIVING"
+	VolumeArchived     VolumeState = "ARCHIVED"
+	VolumeRestoring    VolumeState = "RESTORING"
+	VolumeDestroying   VolumeState = "DESTROYING"
+	VolumeDestroyed    VolumeState = "DESTROYED"
+)
+
+const (
+	PoolProduct = "product"
+	PoolSystem  = "system"
+	PoolTest    = "test"
 )
 
 type CellHealth string
@@ -75,58 +106,143 @@ type State struct {
 	MountEnrollments           map[string]MountEnrollment           `json:"mount_enrollments,omitempty"`
 	MountAuthorizationContexts map[string]MountAuthorizationContext `json:"mount_authorization_contexts,omitempty"`
 	RenewalFences              map[string]uint64                    `json:"renewal_fences,omitempty"`
+	OrphanedPlacements         []OrphanedPlacement                  `json:"orphaned_placements,omitempty"`
 }
 
 type Cell struct {
-	ID                 string     `json:"id"`
-	AvailabilityZone   string     `json:"availability_zone"`
-	AuthorityHost      string     `json:"authority_host"`
-	AuthorityDNSZone   string     `json:"authority_dns_zone"`
-	CapacityBytes      uint64     `json:"capacity_bytes"`
-	CapacityInodes     uint64     `json:"capacity_inodes"`
-	AllocatedBytes     uint64     `json:"allocated_bytes"`
-	AllocatedInodes    uint64     `json:"allocated_inodes"`
-	NextProjectID      uint32     `json:"next_project_id"`
-	NextServiceUID     uint32     `json:"next_service_uid"`
-	NextPort           uint16     `json:"next_port"`
-	PlanGeneration     uint64     `json:"plan_generation"`
-	PlanReleaseID      string     `json:"plan_release_id,omitempty"`
-	PlanIssuedUnix     int64      `json:"plan_issued_unix"`
-	PlanExpiresUnix    int64      `json:"plan_expires_unix"`
-	LastObservedUnix   int64      `json:"last_observed_unix,omitempty"`
-	LastManagerRelease string     `json:"last_manager_release,omitempty"`
-	LastAgentRelease   string     `json:"last_agent_release,omitempty"`
-	LastHelperRelease  string     `json:"last_helper_release,omitempty"`
-	Health             CellHealth `json:"health"`
-	QuarantineReason   string     `json:"quarantine_reason,omitempty"`
+	ID                  string     `json:"id"`
+	AvailabilityZone    string     `json:"availability_zone"`
+	AuthorityHost       string     `json:"authority_host"`
+	AuthorityDNSZone    string     `json:"authority_dns_zone"`
+	CapacityBytes       uint64     `json:"capacity_bytes"`
+	CapacityInodes      uint64     `json:"capacity_inodes"`
+	Pool                string     `json:"pool"`
+	Decommissioning     bool       `json:"decommissioning,omitempty"`
+	Abandoned           bool       `json:"abandoned,omitempty"`
+	NextProjectID       uint32     `json:"next_project_id"`
+	NextServiceUID      uint32     `json:"next_service_uid"`
+	NextPort            uint16     `json:"next_port"`
+	PlanGeneration      uint64     `json:"plan_generation"`
+	PlanReleaseID       string     `json:"plan_release_id,omitempty"`
+	PlanIssuedUnix      int64      `json:"plan_issued_unix"`
+	PlanExpiresUnix     int64      `json:"plan_expires_unix"`
+	LastObservedUnix    int64      `json:"last_observed_unix,omitempty"`
+	LastManagerRelease  string     `json:"last_manager_release,omitempty"`
+	LastAgentRelease    string     `json:"last_agent_release,omitempty"`
+	LastHelperRelease   string     `json:"last_helper_release,omitempty"`
+	Health              CellHealth `json:"health"`
+	QuarantineReason    string     `json:"quarantine_reason,omitempty"`
+	PlanVersions        []uint32   `json:"plan_versions,omitempty"`
+	HelperPlanVersions  []uint32   `json:"helper_plan_versions,omitempty"`
+	HelperStateVersions []uint32   `json:"helper_state_versions,omitempty"`
+	// ArchiveConfigured is the cell's own report that its helper holds readable
+	// archive-store credentials. A cell without them can neither export nor
+	// hydrate, so archive and restore work is never placed on one. Absent in
+	// persisted state it decodes false, which refuses that work until the cell
+	// reports otherwise.
+	ArchiveConfigured bool `json:"archive_configured,omitempty"`
 }
 
 type Volume struct {
-	ID                   string      `json:"id"`
-	AuthorizationDomain  string      `json:"authorization_domain"`
-	Owner                string      `json:"owner"`
-	ProductIssuer        string      `json:"product_issuer"`
-	ProductPublicKeyPEM  string      `json:"product_public_key_pem"`
-	CellID               string      `json:"cell_id"`
-	QuotaBytes           uint64      `json:"quota_bytes"`
-	QuotaInodes          uint64      `json:"quota_inodes"`
-	ProjectID            uint32      `json:"project_id"`
-	ServiceUID           uint32      `json:"service_uid"`
-	ServiceGID           uint32      `json:"service_gid"`
-	ListenPort           uint16      `json:"listen_port"`
-	AuthorityID          string      `json:"authority_id"`
-	AuthorityServerName  string      `json:"authority_server_name"`
-	AuthorityGeneration  uint64      `json:"authority_generation"`
-	AuthorityCSRPEM      string      `json:"authority_csr_pem,omitempty"`
-	AuthorityCertificate string      `json:"authority_certificate_pem,omitempty"`
-	AuthorityCertExpires int64       `json:"authority_certificate_expires_unix,omitempty"`
-	State                VolumeState `json:"state"`
-	PriorStrictFenced    bool        `json:"prior_strict_mounts_fenced"`
-	StrictFenceEvidence  string      `json:"strict_fence_evidence_sha256,omitempty"`
-	LastObservedUnix     int64       `json:"last_observed_unix,omitempty"`
-	QuarantineReason     string      `json:"quarantine_reason,omitempty"`
-	CreatedUnix          int64       `json:"created_unix"`
-	UpdatedUnix          int64       `json:"updated_unix"`
+	ID                      string         `json:"id"`
+	AuthorizationDomain     string         `json:"authorization_domain"`
+	Owner                   string         `json:"owner"`
+	ProductIssuer           string         `json:"product_issuer"`
+	ProductPublicKeyPEM     string         `json:"product_public_key_pem"`
+	QuotaBytes              uint64         `json:"quota_bytes"`
+	QuotaInodes             uint64         `json:"quota_inodes"`
+	AuthorityEpoch          uint64         `json:"authority_generation"`
+	PlacementSequence       uint64         `json:"placement_sequence"`
+	State                   VolumeState    `json:"state"`
+	Pool                    string         `json:"pool"`
+	Placement               *Placement     `json:"placement,omitempty"`
+	Archive                 *ArchiveRecord `json:"archive,omitempty"`
+	PendingSeal             *ArchiveRecord `json:"pending_seal,omitempty"`
+	ArchiveCycleStep        string         `json:"archive_cycle_step,omitempty"`
+	ArchiveAttempt          string         `json:"archive_attempt,omitempty"`
+	RestoreStep             string         `json:"restore_step,omitempty"`
+	RestoreProgressPermille uint32         `json:"restore_progress_permille,omitempty"`
+	RestoreState            string         `json:"restore_state,omitempty"`
+	RestoreConvergedUnix    int64          `json:"restore_converged_unix,omitempty"`
+	WakeRequested           bool           `json:"wake_requested,omitempty"`
+	DeletionRequested       bool           `json:"deletion_requested,omitempty"`
+	DestroyedUnix           int64          `json:"destroyed_unix,omitempty"`
+	QuarantineReason        string         `json:"quarantine_reason,omitempty"`
+	CreatedUnix             int64          `json:"created_unix"`
+	UpdatedUnix             int64          `json:"updated_unix"`
+}
+
+type Placement struct {
+	CellID                  string `json:"cell_id"`
+	Sequence                uint64 `json:"sequence"`
+	ProjectID               uint32 `json:"project_id"`
+	ServiceUID              uint32 `json:"service_uid"`
+	ServiceGID              uint32 `json:"service_gid"`
+	ListenPort              uint16 `json:"listen_port"`
+	AuthorityID             string `json:"authority_id"`
+	AuthorityServerName     string `json:"authority_server_name"`
+	AuthorityCSRPEM         string `json:"authority_csr_pem,omitempty"`
+	AuthorityCertificatePEM string `json:"authority_certificate_pem,omitempty"`
+	AuthorityCertExpires    int64  `json:"authority_certificate_expires_unix,omitempty"`
+	PriorStrictFenced       bool   `json:"prior_strict_mounts_fenced"`
+	StrictFenceEvidence     string `json:"strict_fence_evidence_sha256,omitempty"`
+	CreatedUnix             int64  `json:"created_unix"`
+	LastObservedUnix        int64  `json:"last_observed_unix,omitempty"`
+	UsedBytes               uint64 `json:"used_bytes,omitempty"`
+	UsedInodes              uint64 `json:"used_inodes,omitempty"`
+	UsedObservedUnix        int64  `json:"used_observed_unix,omitempty"`
+	PendingBytes            uint64 `json:"pending_bytes,omitempty"`
+	PendingInodes           uint64 `json:"pending_inodes,omitempty"`
+	DestroyProofSHA256      string `json:"destroy_proof_sha256,omitempty"`
+}
+
+type ObjectRef struct {
+	Key       string `json:"key"`
+	SizeBytes uint64 `json:"size_bytes"`
+	SHA256    string `json:"sha256"`
+	CRC64NVME string `json:"crc64nvme,omitempty"`
+}
+
+type ArchiveRecord struct {
+	FormatVersion        uint32      `json:"format_version"`
+	ChunkSizeBytes       uint32      `json:"chunk_size_bytes"`
+	Attempt              string      `json:"attempt"`
+	SealedEpoch          uint64      `json:"sealed_epoch"`
+	SealedUnix           int64       `json:"sealed_unix"`
+	Manifest             ObjectRef   `json:"manifest"`
+	Packs                []ObjectRef `json:"packs"`
+	RootDigest           string      `json:"root_digest_sha256"`
+	LogicalBytes         uint64      `json:"logical_bytes"`
+	LogicalInodes        uint64      `json:"logical_inodes"`
+	SealedAllocatedBytes uint64      `json:"sealed_allocated_bytes"`
+	SealedInodes         uint64      `json:"sealed_inodes"`
+	KeyVersion           string      `json:"key_version"`
+	// SealedMeasured* is the placement's last measured usage at the moment the
+	// verified seal committed. Zero means unmeasured and stays valid: records
+	// sealed before this field existed decode zero, and restore admission takes
+	// the maximum of it and the archive's own sizing.
+	SealedMeasuredBytes  uint64 `json:"sealed_measured_bytes,omitempty"`
+	SealedMeasuredInodes uint64 `json:"sealed_measured_inodes,omitempty"`
+}
+
+type OrphanedPlacement struct {
+	VolumeID     string                 `json:"volume_id"`
+	CellID       string                 `json:"cell_id"`
+	Placement    OrphanedPlacementTuple `json:"placement"`
+	Epoch        uint64                 `json:"authority_generation"`
+	RecordedUnix int64                  `json:"recorded_unix"`
+	Reason       string                 `json:"reason"`
+}
+
+type OrphanedPlacementTuple struct {
+	Sequence            uint64 `json:"sequence"`
+	ProjectID           uint32 `json:"project_id"`
+	ServiceUID          uint32 `json:"service_uid"`
+	ServiceGID          uint32 `json:"service_gid"`
+	ListenPort          uint16 `json:"listen_port"`
+	AuthorityID         string `json:"authority_id"`
+	AuthorityServerName string `json:"authority_server_name"`
+	DestroyProofSHA256  string `json:"destroy_proof_sha256,omitempty"`
 }
 
 type Receipt struct {
@@ -220,6 +336,7 @@ type RegisterCellRequest struct {
 	AuthorityDNSZone string `json:"authority_dns_zone"`
 	CapacityBytes    uint64 `json:"capacity_bytes"`
 	CapacityInodes   uint64 `json:"capacity_inodes"`
+	Pool             string `json:"pool"`
 	FirstProjectID   uint32 `json:"first_project_id,omitempty"`
 	FirstServiceUID  uint32 `json:"first_service_uid,omitempty"`
 	FirstPort        uint16 `json:"first_port,omitempty"`
@@ -231,6 +348,28 @@ type CreateVolumeRequest struct {
 	ProductIssuer       string `json:"product_issuer"`
 	QuotaBytes          uint64 `json:"quota_bytes"`
 	QuotaInodes         uint64 `json:"quota_inodes"`
+	Pool                string `json:"pool,omitempty"`
+}
+
+type ArchiveVolumeRequest struct {
+	VolumeID string `json:"volume_id"`
+}
+type WakeVolumeRequest struct {
+	VolumeID string `json:"volume_id"`
+}
+type DestroyVolumeRequest struct {
+	VolumeID string `json:"volume_id"`
+	Reason   string `json:"reason"`
+}
+type UpdateCellCapacityRequest struct {
+	CapacityBytes  uint64 `json:"capacity_bytes"`
+	CapacityInodes uint64 `json:"capacity_inodes"`
+}
+type DecommissionCellRequest struct {
+	Reason string `json:"reason"`
+}
+type AbandonCellRequest struct {
+	Reason string `json:"reason"`
 }
 
 type RestartVolumeRequest struct {
@@ -309,13 +448,17 @@ type MountAuthorization struct {
 }
 
 type CellObservation struct {
-	CellID           string              `json:"cell_id"`
-	PlanGeneration   uint64              `json:"plan_generation"`
-	ManagerReleaseID string              `json:"manager_release_id"`
-	AgentReleaseID   string              `json:"agent_release_id"`
-	HelperReleaseID  string              `json:"helper_release_id"`
-	Volumes          []VolumeObservation `json:"volumes"`
-	ObservedUnix     int64               `json:"observed_unix"`
+	CellID              string              `json:"cell_id"`
+	PlanGeneration      uint64              `json:"plan_generation"`
+	ManagerReleaseID    string              `json:"manager_release_id"`
+	AgentReleaseID      string              `json:"agent_release_id"`
+	HelperReleaseID     string              `json:"helper_release_id"`
+	Volumes             []VolumeObservation `json:"volumes"`
+	ObservedUnix        int64               `json:"observed_unix"`
+	PlanVersions        []uint32            `json:"plan_versions,omitempty"`
+	HelperPlanVersions  []uint32            `json:"helper_plan_versions,omitempty"`
+	HelperStateVersions []uint32            `json:"helper_state_versions,omitempty"`
+	ArchiveConfigured   bool                `json:"archive_configured,omitempty"`
 }
 
 type CellHeartbeat struct {
@@ -328,22 +471,78 @@ type CellHeartbeat struct {
 }
 
 type VolumeObservation struct {
-	VolumeID            string `json:"volume_id"`
-	AuthorityGeneration uint64 `json:"authority_generation"`
-	ProjectID           uint32 `json:"project_id"`
-	ServiceUID          uint32 `json:"service_uid"`
-	ServiceGID          uint32 `json:"service_gid"`
-	ListenPort          uint16 `json:"listen_port"`
-	Provisioned         bool   `json:"provisioned"`
-	AuthorityRunning    bool   `json:"authority_running"`
-	AuthorityAbsent     bool   `json:"authority_absent"`
-	AuthorityCSRPEM     string `json:"authority_csr_pem,omitempty"`
-	Error               string `json:"error,omitempty"`
+	VolumeID                string                    `json:"volume_id"`
+	AuthorityGeneration     uint64                    `json:"authority_generation"`
+	ProjectID               uint32                    `json:"project_id"`
+	ServiceUID              uint32                    `json:"service_uid"`
+	ServiceGID              uint32                    `json:"service_gid"`
+	ListenPort              uint16                    `json:"listen_port"`
+	Provisioned             bool                      `json:"provisioned"`
+	AuthorityRunning        bool                      `json:"authority_running"`
+	AuthorityAbsent         bool                      `json:"authority_absent"`
+	AuthorityCSRPEM         string                    `json:"authority_csr_pem,omitempty"`
+	Error                   string                    `json:"error,omitempty"`
+	UsedBytes               uint64                    `json:"used_bytes,omitempty"`
+	UsedInodes              uint64                    `json:"used_inodes,omitempty"`
+	QuiesceProven           bool                      `json:"quiesce_proven,omitempty"`
+	ArchiveSealed           *ArchiveSealedObservation `json:"archive_sealed,omitempty"`
+	DestroyProofSHA256      string                    `json:"destroy_proof_sha256,omitempty"`
+	Released                bool                      `json:"released,omitempty"`
+	RestoreNamespaceReady   bool                      `json:"restore_namespace_ready,omitempty"`
+	RestoreConverged        bool                      `json:"restore_converged,omitempty"`
+	RestoreProgressPermille uint32                    `json:"restore_progress_permille,omitempty"`
+	RestoreState            string                    `json:"restore_state,omitempty"`
+}
+
+type ArchiveSealedObservation struct {
+	Attempt              string      `json:"attempt"`
+	Manifest             ObjectRef   `json:"manifest"`
+	Packs                []ObjectRef `json:"packs"`
+	RootDigest           string      `json:"root_digest_sha256"`
+	LogicalBytes         uint64      `json:"logical_bytes"`
+	LogicalInodes        uint64      `json:"logical_inodes"`
+	SealedAllocatedBytes uint64      `json:"sealed_allocated_bytes"`
+	SealedInodes         uint64      `json:"sealed_inodes"`
+	FormatVersion        uint32      `json:"format_version"`
+	ChunkSizeBytes       uint32      `json:"chunk_size_bytes"`
+	KeyVersion           string      `json:"key_version"`
+}
+
+type PoolCapacity struct {
+	Pool               string `json:"pool"`
+	CapacityBytes      uint64 `json:"capacity_bytes"`
+	CapacityInodes     uint64 `json:"capacity_inodes"`
+	MeasuredUsedBytes  uint64 `json:"measured_used_bytes"`
+	MeasuredUsedInodes uint64 `json:"measured_used_inodes"`
+	PendingBytes       uint64 `json:"pending_bytes"`
+	PendingInodes      uint64 `json:"pending_inodes"`
+	Placements         uint64 `json:"placements"`
+	ArchivedVolumes    uint64 `json:"archived_volumes"`
+	CreateAdmissible   bool   `json:"create_admissible"`
+	RestoreAdmissible  bool   `json:"restore_admissible"`
+}
+
+type CapacityReport struct {
+	Pools []PoolCapacity `json:"pools"`
+}
+
+// ArchiveSummaryView is the product-facing projection of a sealed archive:
+// the identities a product needs (to address archived Files reads and display
+// totals) and nothing else. Object keys, pack inventories, and digests are
+// Manager-internal — the product holds no archive-store access and a large
+// volume's pack list would bloat every volume poll.
+type ArchiveSummaryView struct {
+	SealedEpoch   uint64 `json:"sealed_epoch"`
+	Attempt       string `json:"attempt"`
+	LogicalBytes  uint64 `json:"logical_bytes"`
+	LogicalInodes uint64 `json:"logical_inodes"`
+	SealedUnix    int64  `json:"sealed_unix"`
 }
 
 type VolumeView struct {
 	Volume
-	AuthorityEndpoint string `json:"authority_endpoint"`
+	AuthorityEndpoint string              `json:"authority_endpoint"`
+	ArchiveSummary    *ArchiveSummaryView `json:"archive_summary,omitempty"`
 }
 
 func NewState() State {
@@ -351,6 +550,7 @@ func NewState() State {
 		SchemaVersion: StateSchemaVersion, Cells: map[string]Cell{}, Volumes: map[string]Volume{}, Receipts: map[string]Receipt{},
 		AuthorizationNonces: map[string]AuthorizationNonce{}, MountEnrollments: map[string]MountEnrollment{},
 		MountAuthorizationContexts: map[string]MountAuthorizationContext{}, RenewalFences: map[string]uint64{},
+		OrphanedPlacements: []OrphanedPlacement{},
 	}
 }
 
@@ -370,14 +570,13 @@ func (state State) Validate() error {
 	projects := make(map[string]map[uint32]string)
 	uids := make(map[string]map[uint32]string)
 	ports := make(map[string]map[uint16]string)
-	var allocatedBytes = make(map[string]uint64)
-	var allocatedInodes = make(map[string]uint64)
 	var volumeCounts = make(map[string]int)
 	for id, cell := range state.Cells {
 		if id != cell.ID || !cellplan.ValidID(id) || !validIdentity(cell.AvailabilityZone) ||
 			net.ParseIP(cell.AuthorityHost) == nil && !validDNSName(cell.AuthorityHost) ||
 			!validDNSName(cell.AuthorityDNSZone) || cell.CapacityBytes == 0 || cell.CapacityInodes == 0 ||
 			cell.NextProjectID == 0 || cell.NextServiceUID < 1000 || cell.NextPort < 1024 || cell.PlanGeneration == 0 ||
+			!validPool(cell.Pool) ||
 			!validOptionalIdentity(cell.PlanReleaseID) ||
 			!validOptionalIdentity(cell.LastManagerRelease) || !validOptionalIdentity(cell.LastAgentRelease) ||
 			!validOptionalIdentity(cell.LastHelperRelease) || !validOptionalIdentity(cell.QuarantineReason) {
@@ -395,6 +594,14 @@ func (state State) Validate() error {
 		if (cell.LastObservedUnix > 0) != observedIdentity || observedIdentity &&
 			(cell.LastManagerRelease == "" || cell.LastAgentRelease == "" || cell.LastHelperRelease == "") {
 			return fmt.Errorf("%w: cell observation identity", ErrInvalid)
+		}
+		if !validVersions(cell.PlanVersions) || !validVersions(cell.HelperPlanVersions) || !validVersions(cell.HelperStateVersions) {
+			return fmt.Errorf("%w: cell version capability", ErrInvalid)
+		}
+		// Archive capability is a reported observation, never an assumption: it
+		// can only be set on a cell that has actually reported.
+		if cell.ArchiveConfigured && !observedIdentity {
+			return fmt.Errorf("%w: cell archive capability without observation", ErrInvalid)
 		}
 		projects[id] = map[uint32]string{}
 		uids[id] = map[uint32]string{}
@@ -420,8 +627,7 @@ func (state State) Validate() error {
 		if id != enrollment.ID || !cellplan.ValidID(id) || !cellplan.ValidID(enrollment.VolumeID) ||
 			!validIdentity(enrollment.Subject) || !validIdentity(enrollment.Owner) || !validAccess(enrollment.Access) || enrollment.PeerSPKI == "" ||
 			!validIdentity(enrollment.AuthorizationDomain) || !validIdentity(enrollment.ProductIssuer) ||
-			!cellplan.ValidID(enrollment.CellID) || !validDNSName(enrollment.AuthorityID) ||
-			enrollment.AuthorityGeneration == 0 || enrollment.CreatedUnix <= 0 ||
+			enrollment.CreatedUnix <= 0 ||
 			enrollment.ExpiresUnix <= enrollment.CreatedUnix || enrollment.UpdatedUnix < enrollment.CreatedUnix ||
 			!validOptionalIdentity(enrollment.TerminationReason) ||
 			(enrollment.RenewalScope == "") != (enrollment.RenewalEpoch == 0) ||
@@ -434,8 +640,7 @@ func (state State) Validate() error {
 			return fmt.Errorf("%w: mount enrollment peer", ErrInvalid)
 		}
 		volume, ok := state.Volumes[enrollment.VolumeID]
-		if !ok || volume.Owner != enrollment.Owner || volume.AuthorizationDomain != enrollment.AuthorizationDomain || volume.ProductIssuer != enrollment.ProductIssuer ||
-			volume.CellID != enrollment.CellID || volume.AuthorityID != enrollment.AuthorityID {
+		if !ok || volume.Owner != enrollment.Owner || volume.AuthorizationDomain != enrollment.AuthorizationDomain || volume.ProductIssuer != enrollment.ProductIssuer {
 			return fmt.Errorf("%w: mount enrollment volume binding", ErrInvalid)
 		}
 		if enrollment.RenewalScope != "" {
@@ -456,8 +661,9 @@ func (state State) Validate() error {
 				}
 				activeRenewalScopes[key] = struct{}{}
 			}
-			if volume.AuthorityGeneration != enrollment.AuthorityGeneration {
-				return fmt.Errorf("%w: active mount enrollment authority generation", ErrInvalid)
+			if volume.Placement == nil || !cellplan.ValidID(enrollment.CellID) || !validDNSName(enrollment.AuthorityID) || enrollment.AuthorityGeneration == 0 ||
+				volume.Placement.CellID != enrollment.CellID || volume.Placement.AuthorityID != enrollment.AuthorityID || volume.AuthorityEpoch != enrollment.AuthorityGeneration {
+				return fmt.Errorf("%w: active mount enrollment placement binding", ErrInvalid)
 			}
 			activeEnrollments++
 			activeByAuthorizationDomain[enrollment.AuthorizationDomain]++
@@ -519,59 +725,266 @@ func (state State) Validate() error {
 		}
 	}
 	for id, volume := range state.Volumes {
-		cell, ok := state.Cells[volume.CellID]
-		if id != volume.ID || !cellplan.ValidID(id) || !ok || !validIdentity(volume.AuthorizationDomain) || !validIdentity(volume.Owner) ||
-			!validIdentity(volume.ProductIssuer) || volume.ProductPublicKeyPEM == "" || volume.QuotaBytes == 0 || volume.QuotaBytes%1024 != 0 || volume.QuotaInodes == 0 ||
-			volume.ProjectID == 0 || volume.ServiceUID < 1000 || volume.ServiceGID < 1000 || volume.ListenPort < 1024 ||
-			volume.ServiceGID != volume.ServiceUID || !validDNSName(volume.AuthorityID) || volume.AuthorityID != volume.AuthorityServerName ||
-			!validDNSName(volume.AuthorityServerName) || volume.AuthorityGeneration == 0 || volume.CreatedUnix <= 0 ||
-			volume.UpdatedUnix < volume.CreatedUnix || !validOptionalIdentity(volume.QuarantineReason) {
-			return fmt.Errorf("%w: volume %q", ErrInvalid, id)
+		if err := validateVolume(id, volume, state.Cells); err != nil {
+			return err
 		}
-		if (volume.AuthorityCertificate == "") != (volume.AuthorityCertExpires == 0) {
-			return fmt.Errorf("%w: authority certificate lifetime", ErrInvalid)
+		if volume.Placement == nil {
+			continue
 		}
-		if volume.AuthorityCertificate != "" && volume.AuthorityCSRPEM == "" ||
-			volume.PriorStrictFenced != (volume.StrictFenceEvidence != "") ||
-			volume.StrictFenceEvidence != "" && !validSHA256Hex(volume.StrictFenceEvidence) {
-			return fmt.Errorf("%w: authority identity or fence evidence", ErrInvalid)
-		}
-		switch volume.State {
-		case VolumeProvisioning, VolumeReady, VolumeFencing, VolumeRetired, VolumeQuarantined:
-		default:
-			return fmt.Errorf("%w: volume state", ErrInvalid)
-		}
-		if previous := projects[volume.CellID][volume.ProjectID]; previous != "" {
+		placement := volume.Placement
+		cell := state.Cells[placement.CellID]
+		if previous := projects[placement.CellID][placement.ProjectID]; previous != "" {
 			return fmt.Errorf("%w: project ID shared by %s and %s", ErrInvalid, previous, id)
 		}
-		if previous := uids[volume.CellID][volume.ServiceUID]; previous != "" {
+		if previous := uids[placement.CellID][placement.ServiceUID]; previous != "" {
 			return fmt.Errorf("%w: service UID shared by %s and %s", ErrInvalid, previous, id)
 		}
-		if previous := ports[volume.CellID][volume.ListenPort]; previous != "" {
+		if previous := ports[placement.CellID][placement.ListenPort]; previous != "" {
 			return fmt.Errorf("%w: port shared by %s and %s", ErrInvalid, previous, id)
 		}
-		projects[volume.CellID][volume.ProjectID] = id
-		uids[volume.CellID][volume.ServiceUID] = id
-		ports[volume.CellID][volume.ListenPort] = id
-		allocatedBytes[volume.CellID] += volume.QuotaBytes
-		allocatedInodes[volume.CellID] += volume.QuotaInodes
-		volumeCounts[volume.CellID]++
-		if volume.ProjectID >= cell.NextProjectID || volume.ServiceUID >= cell.NextServiceUID || volume.ListenPort >= cell.NextPort {
+		projects[placement.CellID][placement.ProjectID] = id
+		uids[placement.CellID][placement.ServiceUID] = id
+		ports[placement.CellID][placement.ListenPort] = id
+		volumeCounts[placement.CellID]++
+		if placement.ProjectID >= cell.NextProjectID || placement.ServiceUID >= cell.NextServiceUID || placement.ListenPort >= cell.NextPort {
 			return fmt.Errorf("%w: allocator reuse boundary", ErrInvalid)
 		}
 	}
-	for id, cell := range state.Cells {
-		if cell.AllocatedBytes != allocatedBytes[id] || cell.AllocatedInodes != allocatedInodes[id] ||
-			cell.AllocatedBytes > cell.CapacityBytes || cell.AllocatedInodes > cell.CapacityInodes || volumeCounts[id] > MaxVolumesPerCell {
-			return fmt.Errorf("%w: cell allocation accounting", ErrInvalid)
+	for id := range state.Cells {
+		if volumeCounts[id] > MaxVolumesPerCell {
+			return fmt.Errorf("%w: cell placement count", ErrInvalid)
+		}
+	}
+	if len(state.OrphanedPlacements) > MaxOrphanedPlacements {
+		return fmt.Errorf("%w: orphaned placement capacity", ErrInvalid)
+	}
+	for _, orphan := range state.OrphanedPlacements {
+		if !cellplan.ValidID(orphan.VolumeID) || !cellplan.ValidID(orphan.CellID) || orphan.Epoch == 0 || orphan.RecordedUnix <= 0 ||
+			!validIdentity(orphan.Reason) || orphan.Placement.Sequence == 0 || orphan.Placement.ProjectID == 0 || orphan.Placement.ServiceUID < 1000 ||
+			orphan.Placement.ServiceGID != orphan.Placement.ServiceUID || orphan.Placement.ListenPort < 1024 ||
+			!validDNSName(orphan.Placement.AuthorityID) || orphan.Placement.AuthorityID != orphan.Placement.AuthorityServerName ||
+			orphan.Placement.DestroyProofSHA256 != "" && !validSHA256Hex(orphan.Placement.DestroyProofSHA256) {
+			return fmt.Errorf("%w: orphaned placement", ErrInvalid)
+		}
+		cell, ok := state.Cells[orphan.CellID]
+		want := "v-" + strings.ReplaceAll(orphan.VolumeID, "-", "") + "." + cell.AuthorityDNSZone
+		if orphan.Placement.Sequence >= 2 {
+			want = fmt.Sprintf("v-%s-p%d.%s", strings.ReplaceAll(orphan.VolumeID, "-", ""), orphan.Placement.Sequence, cell.AuthorityDNSZone)
+		}
+		if !ok || orphan.Placement.AuthorityServerName != want {
+			return fmt.Errorf("%w: orphaned placement endpoint", ErrInvalid)
 		}
 	}
 	return nil
 }
 
+func validateVolume(id string, volume Volume, cells map[string]Cell) error {
+	if id != volume.ID || !cellplan.ValidID(id) || !validIdentity(volume.AuthorizationDomain) || !validIdentity(volume.Owner) ||
+		!validIdentity(volume.ProductIssuer) || volume.ProductPublicKeyPEM == "" || volume.QuotaBytes == 0 || volume.QuotaBytes%1024 != 0 ||
+		volume.QuotaInodes == 0 || volume.AuthorityEpoch == 0 || volume.PlacementSequence == 0 || !validPool(volume.Pool) ||
+		volume.CreatedUnix <= 0 || volume.UpdatedUnix < volume.CreatedUnix || !validOptionalIdentity(volume.QuarantineReason) ||
+		volume.RestoreProgressPermille > 1000 || volume.RestoreState != "" && volume.RestoreState != "blocked" && volume.RestoreState != "corrupt" {
+		return fmt.Errorf("%w: volume %q", ErrInvalid, id)
+	}
+	if volume.Placement != nil {
+		if err := validatePlacement(id, volume.PlacementSequence, *volume.Placement, cells, true); err != nil {
+			return err
+		}
+	} else if volume.State != VolumeArchived && volume.State != VolumeDestroyed && !(volume.State == VolumeDestroying && volume.ArchiveCycleStep == "purging-archive") {
+		return fmt.Errorf("%w: placement-free volume state", ErrInvalid)
+	}
+	if volume.Archive != nil {
+		if err := volume.Archive.Validate(); err != nil {
+			return err
+		}
+	}
+	if volume.PendingSeal != nil {
+		if err := volume.PendingSeal.Validate(); err != nil {
+			return err
+		}
+	}
+	switch volume.State {
+	case VolumeProvisioning, VolumeReady, VolumeFencing, VolumeRetired, VolumeQuarantined:
+		if volume.Placement == nil || volume.ArchiveCycleStep != "" || volume.ArchiveAttempt != "" || volume.PendingSeal != nil ||
+			volume.RestoreStep != "" || volume.WakeRequested || volume.DeletionRequested || volume.DestroyedUnix != 0 {
+			return fmt.Errorf("%w: ordinary volume cursor", ErrInvalid)
+		}
+		if volume.State != VolumeQuarantined && volume.Archive != nil && volume.Archive.SealedEpoch >= volume.AuthorityEpoch {
+			return fmt.Errorf("%w: checkpoint epoch", ErrInvalid)
+		}
+	case VolumeArchiving:
+		if volume.Placement == nil || !cellplan.ValidID(volume.ArchiveAttempt) || volume.RestoreStep != "" ||
+			volume.DeletionRequested || volume.DestroyedUnix != 0 {
+			return fmt.Errorf("%w: archiving shape", ErrInvalid)
+		}
+		if volume.Archive != nil && volume.Archive.SealedEpoch >= volume.AuthorityEpoch {
+			return fmt.Errorf("%w: archiving checkpoint epoch", ErrInvalid)
+		}
+		switch volume.ArchiveCycleStep {
+		case "quiescing", "exporting":
+			if volume.PendingSeal != nil {
+				return fmt.Errorf("%w: premature pending seal", ErrInvalid)
+			}
+		case "verifying":
+			if volume.PendingSeal == nil || volume.PendingSeal.Attempt != volume.ArchiveAttempt || volume.PendingSeal.SealedEpoch != volume.AuthorityEpoch {
+				return fmt.Errorf("%w: pending seal binding", ErrInvalid)
+			}
+		default:
+			return fmt.Errorf("%w: archiving cursor", ErrInvalid)
+		}
+	case VolumeArchived:
+		if volume.Archive == nil || volume.ArchiveAttempt != "" || volume.PendingSeal != nil || volume.RestoreStep != "" ||
+			volume.DeletionRequested || volume.DestroyedUnix != 0 || volume.Archive.SealedEpoch != volume.AuthorityEpoch {
+			return fmt.Errorf("%w: archived shape", ErrInvalid)
+		}
+		switch volume.ArchiveCycleStep {
+		case "sealed":
+			if volume.Placement == nil || volume.Placement.DestroyProofSHA256 != "" {
+				return fmt.Errorf("%w: sealed placement", ErrInvalid)
+			}
+		case "destroyed":
+			if volume.Placement == nil || !validSHA256Hex(volume.Placement.DestroyProofSHA256) {
+				return fmt.Errorf("%w: destroyed placement", ErrInvalid)
+			}
+		case "released":
+			if volume.Placement != nil {
+				return fmt.Errorf("%w: released placement", ErrInvalid)
+			}
+		default:
+			return fmt.Errorf("%w: archived cursor", ErrInvalid)
+		}
+	case VolumeRestoring:
+		if volume.Placement == nil || volume.Archive == nil || volume.ArchiveCycleStep != "released" || volume.ArchiveAttempt != "" ||
+			volume.PendingSeal != nil || volume.DestroyedUnix != 0 || volume.DeletionRequested || volume.Archive.SealedEpoch >= volume.AuthorityEpoch {
+			return fmt.Errorf("%w: restoring shape", ErrInvalid)
+		}
+		switch volume.RestoreStep {
+		case "restoring-namespace", "serving-restore":
+		default:
+			return fmt.Errorf("%w: restoring cursor", ErrInvalid)
+		}
+	case VolumeDestroying:
+		if !volume.DeletionRequested || volume.WakeRequested || volume.ArchiveAttempt != "" || volume.PendingSeal != nil || volume.RestoreStep != "" || volume.DestroyedUnix != 0 {
+			return fmt.Errorf("%w: destroying shape", ErrInvalid)
+		}
+		switch volume.ArchiveCycleStep {
+		case "quiescing":
+			if volume.Placement == nil || volume.Archive != nil {
+				return fmt.Errorf("%w: destroying quiesce", ErrInvalid)
+			}
+		case "destroying":
+			if volume.Placement == nil || volume.Archive != nil || volume.Placement.DestroyProofSHA256 != "" {
+				return fmt.Errorf("%w: destroying host data", ErrInvalid)
+			}
+		case "destroyed":
+			if volume.Placement == nil || volume.Archive != nil || !validSHA256Hex(volume.Placement.DestroyProofSHA256) {
+				return fmt.Errorf("%w: destroying proof", ErrInvalid)
+			}
+		case "purging-archive":
+			if volume.Placement != nil || volume.Archive == nil || volume.Archive.SealedEpoch != volume.AuthorityEpoch {
+				return fmt.Errorf("%w: archive purge", ErrInvalid)
+			}
+		default:
+			return fmt.Errorf("%w: destroying cursor", ErrInvalid)
+		}
+	case VolumeDestroyed:
+		if volume.Placement != nil || volume.Archive != nil || volume.PendingSeal != nil || volume.ArchiveAttempt != "" || volume.RestoreStep != "" ||
+			volume.ArchiveCycleStep != "" || volume.DestroyedUnix <= 0 || !volume.DeletionRequested {
+			return fmt.Errorf("%w: destroyed shape", ErrInvalid)
+		}
+	default:
+		return fmt.Errorf("%w: volume state", ErrInvalid)
+	}
+	return nil
+}
+
+func validatePlacement(volumeID string, sequence uint64, placement Placement, cells map[string]Cell, enforceSequence bool) error {
+	cell, ok := cells[placement.CellID]
+	if !ok || !cellplan.ValidID(placement.CellID) || placement.Sequence == 0 || enforceSequence && placement.Sequence != sequence ||
+		placement.ProjectID == 0 || placement.ServiceUID < 1000 || placement.ServiceGID != placement.ServiceUID || placement.ListenPort < 1024 ||
+		placement.AuthorityID == "" || placement.AuthorityID != placement.AuthorityServerName || !validDNSName(placement.AuthorityServerName) || placement.CreatedUnix <= 0 ||
+		(placement.AuthorityCertificatePEM == "") != (placement.AuthorityCertExpires == 0) || placement.AuthorityCertificatePEM != "" && placement.AuthorityCSRPEM == "" ||
+		placement.PriorStrictFenced != (placement.StrictFenceEvidence != "") || placement.StrictFenceEvidence != "" && !validSHA256Hex(placement.StrictFenceEvidence) ||
+		placement.DestroyProofSHA256 != "" && !validSHA256Hex(placement.DestroyProofSHA256) ||
+		placement.UsedObservedUnix == 0 && (placement.UsedBytes != 0 || placement.UsedInodes != 0) {
+		return fmt.Errorf("%w: placement for volume %q", ErrInvalid, volumeID)
+	}
+	compactID := strings.ReplaceAll(volumeID, "-", "")
+	want := "v-" + compactID + "." + cell.AuthorityDNSZone
+	if placement.Sequence >= 2 {
+		want = fmt.Sprintf("v-%s-p%d.%s", compactID, placement.Sequence, cell.AuthorityDNSZone)
+	}
+	if placement.AuthorityServerName != want {
+		return fmt.Errorf("%w: placement endpoint name", ErrInvalid)
+	}
+	return nil
+}
+
+func (record ArchiveRecord) Validate() error {
+	if record.FormatVersion == 0 || record.ChunkSizeBytes == 0 || !cellplan.ValidID(record.Attempt) || record.SealedEpoch == 0 || record.SealedUnix <= 0 ||
+		len(record.Packs) == 0 || len(record.Packs) > MaxArchivePacks || !validSHA256Hex(record.RootDigest) ||
+		record.SealedAllocatedBytes == 0 || record.SealedInodes == 0 || !validIdentity(record.KeyVersion) {
+		return fmt.Errorf("%w: archive record", ErrInvalid)
+	}
+	if err := validateObjectRef(record.Manifest); err != nil {
+		return err
+	}
+	for _, pack := range record.Packs {
+		if err := validateObjectRef(pack); err != nil {
+			return err
+		}
+	}
+	raw, err := json.Marshal(record)
+	if err != nil || len(raw) > MaxArchiveRecordBytes {
+		return fmt.Errorf("%w: archive record size", ErrInvalid)
+	}
+	return nil
+}
+
+func validateObjectRef(ref ObjectRef) error {
+	if ref.Key == "" || len(ref.Key) > MaxArchiveObjectKeyBytes || !utf8.ValidString(ref.Key) || strings.ContainsRune(ref.Key, 0) || ref.SizeBytes == 0 ||
+		!validSHA256Hex(ref.SHA256) || ref.CRC64NVME != "" && !validIdentity(ref.CRC64NVME) {
+		return fmt.Errorf("%w: archive object reference", ErrInvalid)
+	}
+	return nil
+}
+
+func validPool(pool string) bool {
+	return pool == PoolProduct || pool == PoolSystem || pool == PoolTest
+}
+
+func validVersions(versions []uint32) bool {
+	previous := uint32(0)
+	for _, version := range versions {
+		if version == 0 || version > 2 || version <= previous {
+			return false
+		}
+		previous = version
+	}
+	return true
+}
+
 func (state State) volumeView(volume Volume) VolumeView {
-	cell := state.Cells[volume.CellID]
-	return VolumeView{Volume: volume, AuthorityEndpoint: net.JoinHostPort(cell.AuthorityHost, fmt.Sprint(volume.ListenPort))}
+	// The product view never carries the full archive record or a pending
+	// seal: those are Manager-internal (object keys, pack inventories). The
+	// compact summary carries exactly the identities archived Files reads
+	// need plus display totals.
+	var summary *ArchiveSummaryView
+	if volume.Archive != nil {
+		summary = &ArchiveSummaryView{
+			SealedEpoch: volume.Archive.SealedEpoch, Attempt: volume.Archive.Attempt,
+			LogicalBytes: volume.Archive.LogicalBytes, LogicalInodes: volume.Archive.LogicalInodes,
+			SealedUnix: volume.Archive.SealedUnix,
+		}
+	}
+	volume.Archive = nil
+	volume.PendingSeal = nil
+	view := VolumeView{Volume: volume, ArchiveSummary: summary}
+	if volume.Placement != nil {
+		cell := state.Cells[volume.Placement.CellID]
+		view.AuthorityEndpoint = net.JoinHostPort(cell.AuthorityHost, fmt.Sprint(volume.Placement.ListenPort))
+	}
+	return view
 }
 
 func sortedCellIDs(cells map[string]Cell) []string {

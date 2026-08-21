@@ -11,8 +11,6 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base32"
-	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -63,25 +61,35 @@ func (ExecRunner) Run(ctx context.Context, executable string, arguments ...strin
 }
 
 type Config struct {
-	CellID           string
-	CellRoot         string
-	ConfigRoot       string
-	StateRoot        string
-	SystemdUnitRoot  string
-	SysusersRoot     string
-	XFSQuotaBinary   string
-	SystemctlBinary  string
-	SystemdRunBinary string
-	SysusersBinary   string
-	Runner           CommandRunner
-	Now              func() time.Time
+	CellID                 string
+	CellRoot               string
+	ConfigRoot             string
+	StateRoot              string
+	SystemdUnitRoot        string
+	SysusersRoot           string
+	ArchiveCredentialsPath string
+	ArchiveChunkSizeBytes  uint32
+	XFSQuotaBinary         string
+	SystemctlBinary        string
+	SystemdRunBinary       string
+	SysusersBinary         string
+	Runner                 CommandRunner
+	Now                    func() time.Time
 }
 
 type Host struct{ cfg Config }
 
 func New(config Config) (*Host, error) {
+	if config.ArchiveCredentialsPath == "" && cellplan.ValidID(config.CellID) {
+		config.ArchiveCredentialsPath = filepath.Join("/etc/portablefs/cells", config.CellID+"-archive.env")
+	}
+	if config.ArchiveChunkSizeBytes == 0 {
+		config.ArchiveChunkSizeBytes = 8 << 20
+	}
 	if !cellplan.ValidID(config.CellID) || !safeRoot(config.CellRoot) || !safeRoot(config.ConfigRoot) ||
 		!safeRoot(config.StateRoot) || !safeRoot(config.SystemdUnitRoot) || !safeRoot(config.SysusersRoot) ||
+		!safeRoot(config.ArchiveCredentialsPath) || config.ArchiveChunkSizeBytes < 4<<10 || config.ArchiveChunkSizeBytes > 16<<20 ||
+		config.ArchiveChunkSizeBytes&(config.ArchiveChunkSizeBytes-1) != 0 ||
 		!filepath.IsAbs(config.XFSQuotaBinary) || !filepath.IsAbs(config.SystemctlBinary) ||
 		!filepath.IsAbs(config.SystemdRunBinary) || !filepath.IsAbs(config.SysusersBinary) {
 		return nil, errors.New("cellhost: complete pinned absolute configuration is required")
@@ -95,15 +103,27 @@ func New(config Config) (*Host, error) {
 	return &Host{cfg: config}, nil
 }
 
-func (host *Host) Apply(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) controlplane.VolumeObservation {
+func (host *Host) Apply(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	observed := controlplane.VolumeObservation{}
+	update := cellhelper.HostUpdate{}
 	var err error
 	switch plan.Phase {
 	case cellplan.PhaseProvision:
-		observed.Provisioned, observed.AuthorityCSRPEM, err = host.provision(ctx, plan, !previous.QuotaApplied)
+		observed.Provisioned, observed.AuthorityCSRPEM, err = host.provision(ctx, plan,
+			signedQuota{Bytes: plan.QuotaBytes, Inodes: plan.QuotaInodes},
+			appliedQuota{Bytes: previous.AppliedQuotaBytes, Inodes: previous.AppliedQuotaInodes})
 		observed.AuthorityAbsent = true
 	case cellplan.PhaseServe:
-		observed.Provisioned, observed.AuthorityCSRPEM, err = host.provision(ctx, plan, !previous.QuotaApplied)
+		observed.Provisioned, observed.AuthorityCSRPEM, err = host.provision(ctx, plan,
+			signedQuota{Bytes: plan.QuotaBytes, Inodes: plan.QuotaInodes},
+			appliedQuota{Bytes: previous.AppliedQuotaBytes, Inodes: previous.AppliedQuotaInodes})
+		if err == nil {
+			if previous.LastPhase == cellplan.PhaseRestore {
+				err = host.cleanupConvergedHydrator(ctx, plan)
+			} else if previous.LastPhase == cellplan.PhaseArchive {
+				err = host.cleanupAbortedArchive(ctx, plan.VolumeID)
+			}
+		}
 		if err == nil {
 			err = host.start(ctx, plan)
 			observed.AuthorityRunning = err == nil
@@ -111,20 +131,40 @@ func (host *Host) Apply(ctx context.Context, plan cellplan.VolumePlan, previous 
 	case cellplan.PhaseFence, cellplan.PhaseRetire:
 		observed.AuthorityAbsent, err = host.fence(ctx, plan.VolumeID)
 		observed.Provisioned = host.volumeExists(plan.VolumeID)
+	case cellplan.PhaseArchive:
+		observed, update = host.applyArchive(ctx, plan, previous)
+	case cellplan.PhaseRestore:
+		observed, update = host.applyRestore(ctx, plan, previous)
+	case cellplan.PhaseDestroy:
+		observed, update = host.applyDestroy(ctx, plan, previous)
 	default:
 		err = errors.New("unknown volume phase")
 	}
 	if err != nil {
 		observed.Error = err.Error()
 	}
-	return observed
+	host.measureForPhase(plan.Phase, plan.VolumeID, &observed)
+	return observed, update
+}
+
+func (host *Host) cleanupAbortedArchive(ctx context.Context, volumeID string) error {
+	if err := host.StopArchiver(ctx, volumeID); err != nil {
+		return err
+	}
+	if err := host.RemoveArchiverConfig(volumeID); err != nil {
+		return err
+	}
+	if err := host.RemoveArchiverDropIns(ctx, volumeID); err != nil {
+		return err
+	}
+	return host.ClearQuiesceRequest(volumeID)
 }
 
 // Observe checks the already-applied plan without re-running quota changes,
 // rewriting systemd drop-ins, or starting a stopped authority. A stopped
 // serving authority is reported as failure so the manager fences the epoch;
 // the helper never hides a crash by automatically restarting the same writer.
-func (host *Host) Observe(ctx context.Context, plan cellplan.VolumePlan, _ cellhelper.Assignment) controlplane.VolumeObservation {
+func (host *Host) Observe(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
 	observed := controlplane.VolumeObservation{}
 	switch plan.Phase {
 	case cellplan.PhaseProvision:
@@ -155,10 +195,17 @@ func (host *Host) Observe(ctx context.Context, plan cellplan.VolumePlan, _ cellh
 		if err != nil {
 			observed.Error = err.Error()
 		}
+	case cellplan.PhaseArchive:
+		observed, _ = host.observeArchive(ctx, plan, previous)
+	case cellplan.PhaseRestore:
+		observed = host.observeRestore(ctx, plan)
+	case cellplan.PhaseDestroy:
+		observed.Error = "cellhost: destroy was marked applied without a durable destroy proof"
 	default:
 		observed.Error = "cellhost: unknown volume phase"
 	}
-	return observed
+	host.measureForPhase(plan.Phase, plan.VolumeID, &observed)
+	return observed, cellhelper.HostUpdate{}
 }
 
 func (host *Host) observeProvisioned(plan cellplan.VolumePlan) (bool, string, error) {
@@ -187,7 +234,7 @@ func (host *Host) observeProvisioned(plan cellplan.VolumePlan) (bool, string, er
 	if err != nil {
 		return false, "", err
 	}
-	if plan.Phase == cellplan.PhaseServe {
+	if plan.Phase == cellplan.PhaseServe || plan.Phase == cellplan.PhaseRestore {
 		certificatePath := filepath.Join(host.cfg.ConfigRoot, plan.VolumeID, fmt.Sprintf("authority-%d.cert", plan.AuthorityGeneration))
 		certificate, err := os.Lstat(certificatePath)
 		if err != nil || !certificate.Mode().IsRegular() || certificate.Mode()&os.ModeSymlink != 0 {
@@ -197,7 +244,16 @@ func (host *Host) observeProvisioned(plan cellplan.VolumePlan) (bool, string, er
 	return true, string(csr), nil
 }
 
-func (host *Host) provision(ctx context.Context, plan cellplan.VolumePlan, applyQuota bool) (bool, string, error) {
+type signedQuota struct{ Bytes, Inodes uint64 }
+type appliedQuota struct{ Bytes, Inodes uint64 }
+
+var ErrQuotaLowering = errors.New("cellhost: signed quota would lower an applied quota")
+
+func (host *Host) provision(ctx context.Context, plan cellplan.VolumePlan, signed signedQuota, applied appliedQuota) (bool, string, error) {
+	firstQuota, raiseQuota, err := quotaDecision(plan, signed, applied)
+	if err != nil {
+		return false, "", err
+	}
 	volumePath := filepath.Join(host.cfg.CellRoot, plan.VolumeID)
 	if err := host.ensureServiceIdentity(ctx, plan); err != nil {
 		return false, "", err
@@ -207,7 +263,7 @@ func (host *Host) provision(ctx context.Context, plan cellplan.VolumePlan, apply
 		return false, "", err
 	}
 	defer unix.Close(volumeFD)
-	if applyQuota {
+	if firstQuota {
 		projectCommand := fmt.Sprintf("project -s -p %s %d", volumePath, plan.ProjectID)
 		projectArguments := transientArguments(
 			"portablefs-xfs-project-"+plan.VolumeID, host.cfg.XFSQuotaBinary,
@@ -217,6 +273,8 @@ func (host *Host) provision(ctx context.Context, plan cellplan.VolumePlan, apply
 		if output, err := host.cfg.Runner.Run(ctx, host.cfg.SystemdRunBinary, projectArguments...); err != nil {
 			return false, "", commandError("assign XFS project", output, err)
 		}
+	}
+	if raiseQuota {
 		limitCommand, err := xfsHardLimitCommand(plan)
 		if err != nil {
 			return false, "", err
@@ -299,6 +357,19 @@ func (host *Host) provision(ctx context.Context, plan cellplan.VolumePlan, apply
 	return true, csr, nil
 }
 
+func quotaDecision(plan cellplan.VolumePlan, signed signedQuota, applied appliedQuota) (bool, bool, error) {
+	if signed.Bytes != plan.QuotaBytes || signed.Inodes != plan.QuotaInodes {
+		return false, false, ErrInvalid
+	}
+	if signed.Bytes < applied.Bytes || signed.Inodes < applied.Inodes {
+		return false, false, ErrQuotaLowering
+	}
+	if (applied.Bytes == 0) != (applied.Inodes == 0) {
+		return false, false, ErrInvalid
+	}
+	return applied.Bytes == 0, signed.Bytes > applied.Bytes || signed.Inodes > applied.Inodes, nil
+}
+
 func xfsHardLimitCommand(plan cellplan.VolumePlan) (string, error) {
 	if plan.ProjectID == 0 || plan.QuotaBytes == 0 || plan.QuotaBytes%1024 != 0 || plan.QuotaInodes == 0 {
 		return "", ErrInvalid
@@ -358,12 +429,14 @@ func serviceIdentityConfig(plan cellplan.VolumePlan) (string, []byte, error) {
 	if !cellplan.ValidID(plan.VolumeID) || plan.ServiceUID < 1000 || plan.ServiceGID < 1000 {
 		return "", nil, ErrInvalid
 	}
-	identifier, err := hex.DecodeString(strings.ReplaceAll(plan.VolumeID, "-", ""))
-	if err != nil || len(identifier) != 16 {
-		return "", nil, ErrInvalid
+	sequence := plan.PlacementSequence
+	if sequence == 0 {
+		sequence = 1
 	}
-	encoded := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(identifier)
-	name := "pfs-" + strings.ToLower(encoded)
+	name, err := PlacementServiceAccountName(plan.VolumeID, sequence)
+	if err != nil {
+		return "", nil, err
+	}
 	payload := fmt.Sprintf(
 		"# Generated by portablefs-cell-helper; do not edit.\n"+
 			"g %s %d\n"+

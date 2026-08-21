@@ -121,6 +121,7 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 	var resources *sessionResources
 	var target xfsstore.WriteTarget
 	var coordinate visibilityCoordinate
+	var preparedSize int64
 	var releaseMutation func()
 	reserved := false
 	defer func() {
@@ -169,6 +170,17 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		if err != nil {
 			return nil, err
 		}
+		if h.Restore != nil && h.Restore.Active() {
+			attrTarget, ok := target.(writeTargetAttr)
+			if !ok {
+				return nil, errInternal
+			}
+			attr, attrErr := attrTarget.Getattr()
+			if attrErr != nil {
+				return nil, attrErr
+			}
+			preparedSize = attr.Size
+		}
 		return []volumeserver.VisibilityTarget{
 			inodeTarget(volumeserver.VisibilityData, coordinate, 0),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
@@ -179,12 +191,34 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		if target == nil {
 			return h.errorResponse(0, syscall.EIO, false), nil
 		}
-		committed, assigned, post, applyErr := target.CommitWriteData(body.GetData(), xfsstore.WriteCommit{
-			RequestedSize: metadata.requestedSize, Position: metadata.position,
-			RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: metadata.mode,
-			DataSync: metadata.dataSync, Sync: metadata.sync,
-			KillPrivileges: metadata.writeFlags&writeKillSUIDGID != 0,
-		})
+		var committed, assigned uint64
+		var post xfsstore.Attr
+		apply := func() (int, int64, error) {
+			var applyErr error
+			committed, assigned, post, applyErr = target.CommitWriteData(body.GetData(), xfsstore.WriteCommit{
+				RequestedSize: metadata.requestedSize, Position: metadata.position,
+				RLimitSize: math.MaxUint64, FileMaxSize: math.MaxInt64, Mode: metadata.mode,
+				DataSync: metadata.dataSync, Sync: metadata.sync,
+				KillPrivileges: metadata.writeFlags&writeKillSUIDGID != 0,
+			})
+			return int(committed), int64(assigned), applyErr
+		}
+		var applyErr error
+		if h.Restore != nil && h.Restore.Active() {
+			writeOffset := metadata.position
+			if metadata.mode == xfsstore.WriteAppend && preparedSize > 0 {
+				writeOffset = uint64(preparedSize)
+			}
+			var committedInt int
+			var assignedInt int64
+			committedInt, assignedInt, applyErr = h.Restore.Write(ctx, coordinate.identity, writeOffset, metadata.requestedSize, apply)
+			committed = uint64(committedInt)
+			if assignedInt >= 0 {
+				assigned = uint64(assignedInt)
+			}
+		} else {
+			_, _, applyErr = apply()
+		}
 		zeroPostApply := committed == 0 && errors.Is(applyErr, xfsstore.ErrWritePostApply) &&
 			!errors.Is(applyErr, xfsstore.ErrOutcomeUncertain)
 		if committed == 0 && !zeroPostApply {

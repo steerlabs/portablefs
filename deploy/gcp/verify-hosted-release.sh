@@ -10,8 +10,10 @@ stage=$1
 expected=(
   architecture
   bin/portablefs
+  bin/portablefs-archiver
   bin/portablefs-authority
   bin/portablefs-cell-agent
+  bin/portablefs-hydrator
   bin/portablefs-manager
   libexec/portablefs-authority-launcher
   libexec/portablefs-cell-helper
@@ -19,8 +21,10 @@ expected=(
   source-commit
   systemd/portablefs-authority@.service
   systemd/portablefs-authority@.socket
+  systemd/portablefs-archiver@.service
   systemd/portablefs-cell-agent@.service
   systemd/portablefs-cell-helper@.service
+  systemd/portablefs-hydrator@.service
   systemd/portablefs-manager.service
 )
 
@@ -100,8 +104,10 @@ vcs_build_setting() {
 
 for relative in \
   bin/portablefs \
+  bin/portablefs-archiver \
   bin/portablefs-authority \
   bin/portablefs-cell-agent \
+  bin/portablefs-hydrator \
   bin/portablefs-manager \
   libexec/portablefs-authority-launcher \
   libexec/portablefs-cell-helper; do

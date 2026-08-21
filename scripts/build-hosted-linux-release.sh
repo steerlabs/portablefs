@@ -43,6 +43,8 @@ build() {
 build ./cmd/portablefs-manager bin/portablefs-manager
 build ./cmd/portablefs-cell-agent bin/portablefs-cell-agent
 build ./cmd/portablefs-authority bin/portablefs-authority
+build ./cmd/portablefs-archiver bin/portablefs-archiver
+build ./cmd/portablefs-hydrator bin/portablefs-hydrator
 build ./cmd/portablefs bin/portablefs
 build ./cmd/portablefs-cell-helper libexec/portablefs-cell-helper
 build ./cmd/portablefs-authority-launcher libexec/portablefs-authority-launcher
@@ -52,7 +54,9 @@ for unit in \
   portablefs-cell-agent@.service \
   portablefs-cell-helper@.service \
   portablefs-authority@.socket \
-  portablefs-authority@.service; do
+  portablefs-authority@.service \
+  portablefs-archiver@.service \
+  portablefs-hydrator@.service; do
   install -m 0644 "$root/deploy/systemd/$unit" "$stage/systemd/$unit"
 done
 

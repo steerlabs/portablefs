@@ -174,6 +174,21 @@ type writeTarget struct {
 
 func (t *writeTarget) Coordinate() ObjectCoordinate { return t.coordinate }
 
+// Getattr samples the pinned write description even after the client handle
+// has closed. Restore mode uses it immediately before apply to identify the
+// exact append/truncate boundary without reopening a path.
+func (t *writeTarget) Getattr() (Attr, error) {
+	if t == nil {
+		return Attr{}, ErrStaleOpen
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.res == nil || t.closed {
+		return Attr{}, ErrStaleOpen
+	}
+	return statFD(t.res.fd)
+}
+
 func (t *writeTarget) Close() error {
 	if t == nil {
 		return nil

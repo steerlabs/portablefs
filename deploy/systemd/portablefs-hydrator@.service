@@ -1,0 +1,51 @@
+[Unit]
+Description=PortableFS hydrator for volume %i
+# The hydrator serves a RESTORING volume's recall and drain fetches over one
+# AF_UNIX socket in the volume's state directory. It is a formal serving
+# dependency of restore mode: absent means RESTORE_BLOCKED, volume-wide.
+# In restore-namespace mode (before the authority starts) the same binary
+# materializes the namespace; the helper sequences the two modes.
+
+[Service]
+Type=simple
+ExecStart=/opt/portablefs/current/bin/portablefs-hydrator
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateUsers=no
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Outbound network for archive-store range reads (read-scoped credentials)
+# plus the AF_UNIX listener the authority connects to. In serve mode the
+# hydrator has NO volume data-directory access: it fetches, verifies, and
+# decodes; the authority alone writes XFS. The namespace-restore mode's
+# data-directory bind is added by the helper's per-volume drop-in only for
+# that phase.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf io_uring_setup keyctl open_by_handle_at perf_event_open pidfd_getfd process_vm_readv process_vm_writev ptrace userfaultfd
+UMask=0077
+TasksMax=1024
+LimitNOFILE=65536
+MemoryHigh=1G
+MemoryMax=2G
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

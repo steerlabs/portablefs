@@ -20,12 +20,15 @@ const visibilityMembershipHeader = "PFS-VISIBILITY-1"
 // prove old hosts/mounts fenced before it asks OpenFileVisibilityMembership to
 // clear old records.
 type FileVisibilityMembership struct {
-	mu       sync.Mutex
-	path     string
-	volumeID string
-	lockFile *os.File
-	active   map[SessionID]struct{}
-	cleared  []SessionID
+	mu           sync.Mutex
+	path         string
+	volumeID     string
+	lockFile     *os.File
+	active       map[SessionID]struct{}
+	cleared      []SessionID
+	quiesceNonce string
+	quiesceProof func() error
+	proofWritten bool
 }
 
 // visibilityMembershipAuditSuffix names the append-only record of operator
@@ -128,6 +131,9 @@ func (m *FileVisibilityMembership) Activate(id SessionID) error {
 	if m.lockFile == nil {
 		return errors.New("volumeserver: visibility membership is closed")
 	}
+	if m.quiesceNonce != "" {
+		return ErrQuiescing
+	}
 	if _, exists := m.active[id]; exists {
 		return nil
 	}
@@ -152,6 +158,41 @@ func (m *FileVisibilityMembership) Deactivate(id SessionID) error {
 	if err := m.persistLocked(); err != nil {
 		m.active[id] = struct{}{}
 		return err
+	}
+	if len(m.active) == 0 && m.quiesceNonce != "" && !m.proofWritten {
+		if err := m.quiesceProof(); err != nil {
+			return fmt.Errorf("write quiesce proof: %w", err)
+		}
+		m.proofWritten = true
+	}
+	return nil
+}
+
+// SetQuiescing closes strict-attach admission and, under the same mutex that
+// serializes Activate and Deactivate, writes proof once the durable active set
+// is empty. A new nonce replaces a stale proof obligation. An empty nonce
+// reopens admission after a cancelled archive attempt.
+func (m *FileVisibilityMembership) SetQuiescing(nonce string, writeProof func() error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lockFile == nil {
+		return errors.New("volumeserver: visibility membership is closed")
+	}
+	if nonce == "" {
+		m.quiesceNonce, m.quiesceProof, m.proofWritten = "", nil, false
+		return nil
+	}
+	if writeProof == nil {
+		return errors.New("volumeserver: quiesce proof writer is required")
+	}
+	if nonce != m.quiesceNonce {
+		m.quiesceNonce, m.quiesceProof, m.proofWritten = nonce, writeProof, false
+	}
+	if len(m.active) == 0 && !m.proofWritten {
+		if err := m.quiesceProof(); err != nil {
+			return fmt.Errorf("write quiesce proof: %w", err)
+		}
+		m.proofWritten = true
 	}
 	return nil
 }

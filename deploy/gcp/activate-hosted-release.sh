@@ -62,7 +62,7 @@ case "$role" in
   cell)
     mapfile -t helper_units < <(systemctl list-units --all --plain --no-legend 'portablefs-cell-helper@*.service' | awk '{print $1}')
     mapfile -t agent_units < <(systemctl list-units --all --plain --no-legend 'portablefs-cell-agent@*.service' | awk '{print $1}')
-    units=(portablefs-cell-agent@.service portablefs-cell-helper@.service portablefs-authority@.socket portablefs-authority@.service)
+    units=(portablefs-cell-agent@.service portablefs-cell-helper@.service portablefs-authority@.socket portablefs-authority@.service portablefs-archiver@.service portablefs-hydrator@.service)
     ;;
 esac
 

@@ -4,6 +4,16 @@ PortableFS v3 has one exact consistency profile: authority protocol 6 on stock
 Linux FUSE protocol 7.31 or newer, under the N/A/D/E lease algorithm. There is
 no uncached profile, private kernel dialect, or negotiated downgrade.
 
+PortableFS v3 has one canonical representation per volume, selected by
+`(State, ArchiveCycleStep)`. READY uses the mounted XFS instance; ARCHIVED uses
+the sealed archive; RESTORING uses the sealed base, monotone hydration map, and
+XFS-applied writes. Sessions, open file descriptions, advisory locks,
+same-epoch replay slots, and cancellation state remain disposable epoch state.
+There is no second writable inode tree, live mutation log, PortableFS-managed
+write-back cache, or history. Ordinary kernel page caches still exist. The
+architectural decision behind that is in
+[xfs-authority-architecture.md](./xfs-authority-architecture.md).
+
 macOS is the second declared profile, `FSKIT_SYNC_REPAIR`, and it is not the
 Linux profile with weaker timings — it is **explicit writer ownership**. A
 mounted Mac holds the volume's compatibility writer lease: it is the volume's
@@ -23,9 +33,20 @@ macOS, it describes the Linux lease profile.
 
 ## Truth and operation ordering
 
-One provisioned XFS project directory is the only durable truth. The authority
-executes object-relative Linux syscalls beneath a pre-opened root. PortableFS
-does not keep a second namespace, mutation journal, or client write-back log.
+For a READY live volume the source of truth is exactly the mounted XFS instance:
+its VFS and page-cache state, its metadata journal, and the persisted device
+state beneath it. During RESTORING, a durably marked chunk is canonical in XFS
+and an unmarked chunk is canonical in the sealed base; the monotone hydration
+map decides between them. Unflushed page-cache data is authoritative *current*
+state but is not durable across power loss; `fsync` is the boundary that asks
+XFS and the device to persist it. XFS's own journal is an internal
+crash-recovery mechanism, not a PortableFS history.
+
+A serving volume has one active authority epoch. Every mount of that volume
+talks to that one authority over mutually authenticated TLS 1.3, which is why
+cross-machine read-after-write is possible at all without merging separate
+local folders. Mounts are not independent sources of truth and never reconcile
+with each other.
 
 Supported filesystem operations on Linux lease mounts are linearizable, except
 where this document names a residual: reverse dentry rendering (below), and the
@@ -59,6 +80,14 @@ or PortableFS-private opcode participates.
   predates that request, so `syncfs(2)` is not a PortableFS remote-volume
   durability promise on every supported kernel. The absence is not emulated.
 
+- **RESTORING uses the archive ordering contract.** Before the authority
+  acknowledges a partial-chunk write, shortening truncate, or read-modify-write,
+  verified base bytes are durable in XFS and the hydration mark is durable; the
+  user mutation follows. A whole-chunk replacement or `O_TRUNC` to zero makes
+  the replacement durable before making its mark durable and acknowledging.
+  These are exactly the orderings in
+  [restore-mode.md](./tiered-storage/restore-mode.md#hydration-map).
+
 ## Cache leases
 
 Caching is allowed only under an authority lease:
@@ -76,6 +105,12 @@ request-start time. Network and processing delay can only reduce the installed
 duration; the client does not compare an authority absolute timestamp against
 its own wall clock. Daemon cache hits check the same request-anchored deadline
 and coordinate cursor. A reply without a covering lease carries zero validity.
+
+During RESTORING, a read of content not yet hydrated blocks until the authority
+has fetched, verified, and written that content, bounded by the recall deadline,
+or fails with the named restore error carrying `FAILURE_CLASS_RESTORE`. It never
+returns stale bytes, a partial chunk, or zero-filled sparse placeholders as file
+content.
 
 A conflicting mutation closes grant admission, recalls the conflicting rights,
 applies to XFS, sends exact post-state, and waits for peer discharge before the
@@ -220,6 +255,10 @@ discharge, lock forwarding, and cache behavior before it can participate.
   readers and their visible mutations are refused `EBUSY`.
 - Multiple POSIX principals inside one volume.
 - Writable extended attributes.
+- Local-XFS read latency during RESTORING. A cold content read may pay one
+  archive-store recall round trip before it returns.
+- Content-read availability during `RESTORE_BLOCKED`. Content reads are
+  suspended volume-wide; namespace and attribute operations continue.
 - Production FSKit or Windows mounts.
 - Elimination of the two stock-FUSE read-cache residuals described above.
 

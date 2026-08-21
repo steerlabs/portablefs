@@ -4,6 +4,11 @@ PortableFS protocol 6 is fail-closed except for two explicitly disclosed
 stock-FUSE clean-data residuals. This document states what fails, what scope is
 fenced, and what an application can observe.
 
+The canonical storage depends on `(State, ArchiveCycleStep)`: XFS for READY,
+the sealed archive for ARCHIVED, and sealed base plus monotone hydration map
+plus XFS for RESTORING. A serving volume still has one authority epoch. Failure
+scope never turns these representations into competing writable truths.
+
 ## Failure scopes
 
 | Scope | Examples | Result |
@@ -11,11 +16,16 @@ fenced, and what an application can observe.
 | Request | validation, permission, quota, ordinary XFS errno | that request fails; session continues |
 | Session | protocol violation, replay mismatch, failed recall, lost lease control | that mount is fenced; other mounts continue |
 | Volume epoch | authority death, XFS I/O error, storage topology violation | all sessions end; restart creates a new epoch |
+| Restore | archive-store outage, absent hydrator, or digest failure | content reads fail uniformly with `FAILURE_CLASS_RESTORE`; the epoch and sessions remain alive |
 | Host frontend profile | unsupported FUSE level or a request outside the declared profile | Linux refuses during INIT and cleanly releases the pre-mount session; FSKit rejects Linux lease operations and Linux rejects FSKit repair operations |
 
 Fencing never converts an already-applied mutation into a retry. If the
 authority cannot establish the exact result, it reports uncertainty or ends the
 affected scope.
+
+Responses distinguish `FAILURE_CLASS_STORAGE`, `FAILURE_CLASS_COHERENCE`,
+`FAILURE_CLASS_ROUTES`, `FAILURE_CLASS_RESTORE`, and
+`FAILURE_CLASS_INTERNAL`; errno alone is not the failure scope.
 
 ## Authority and storage failure
 
@@ -29,6 +39,10 @@ restarted authority uses a new epoch and holds a grace period for the maximum
 conservative lease-expiry bound before admitting a conflicting mutation. This
 prevents a new epoch from racing a lease the restarted process cannot remember.
 Persisted lease recovery is not claimed.
+
+A RESTORING replacement additionally loads the durable hydration map and sealed
+base identity. Those records are that state's canonical representation, not a
+mutation replay log.
 
 ## Lost mutation reply
 
@@ -136,10 +150,29 @@ XFS project-quota exhaustion returns the authoritative storage errno. In-memory
 bounds reject new work before unbounded allocation. Neither case redirects data
 to a different filesystem.
 
+When block and inode hard limits are installed, `statfs` on the project
+directory reports the project's limits and remaining capacity. Hosted
+tiered-storage admission and `df` depend on that projection; a project without
+hard limits retains cell-wide XFS capacity.
+
 A `.portablefs/local-dirs` revision mismatch refuses Attach and returns the
 authority's current declaration for an explicit same-capability retry. A live
 route change fences existing sessions because their local/shared classification
 is no longer the volume's declared one.
+
+## Restore interruption and corruption
+
+`RESTORE_BLOCKED` covers an unreachable archive store, invalid credentials, or
+an absent hydrator. Every content read fails with definite `EIO` and
+`FAILURE_CLASS_RESTORE`, including reads of hydrated content; namespace and
+attribute operations continue. Mounts stay alive, drain retries with backoff,
+and the state clears when verified fetches succeed again.
+
+`RESTORE_CORRUPT` covers a fetched chunk that fails digest verification. Content
+reads stop uniformly, affected paths remain enumerable from the sealed
+manifest, and unverified bytes are never served. Repair must re-establish a
+Manager-verified sealed representation. Restore errors never enter the fatal
+storage set and never end the authority epoch.
 
 ## Platform refusal
 

@@ -140,8 +140,10 @@ The repository also contains a product-neutral hosted foundation:
 - `portablefs-cell-helper` is the narrow root/XFS boundary and independently
   verifies signed plans.
 - `portablefs-files` is an optional unprivileged, bounded read gateway for a
-  product's human file browser. It holds short-lived authority sessions and
-  never mounts, indexes, copies, watches, or caches a volume.
+  product's human file browser. It uses standalone short read grants and holds
+  short-lived authority sessions for live volumes; ARCHIVED volumes are read
+  directly from their sealed manifest and packs. It never mounts, indexes,
+  copies, watches, or caches a volume.
 - systemd owns each listener and supervises one sandboxed, unprivileged
   authority per active volume.
 

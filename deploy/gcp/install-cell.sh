@@ -18,7 +18,7 @@ agent_gid=$5
 [[ $cell_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || exit 64
 [[ $agent_uid =~ ^[1-9][0-9]{3,8}$ && $agent_gid =~ ^[1-9][0-9]{3,8}$ ]] || exit 64
 
-for relative in cell.cert cell.key manager-ca.pem plan-public.pem cell.env; do
+for relative in cell.cert cell.key manager-ca.pem plan-public.pem cell.env cell-archive.env; do
   [[ -f $stage/$relative && ! -L $stage/$relative ]] || {
     echo "missing or unsafe staged file: $relative" >&2
     exit 66
@@ -57,6 +57,10 @@ install -o root -g root -m 0444 "$stage/plan-public.pem" /etc/portablefs/trust/p
 install -o root -g root -m 0444 "$stage/cell.cert" "/etc/portablefs/cells/$cell_id.cert"
 install -o portablefs-agent -g portablefs-agent -m 0400 "$stage/cell.key" "/etc/portablefs/cells/$cell_id.key"
 install -o root -g root -m 0600 "$stage/cell.env" "/etc/portablefs/cells/$cell_id.env"
+# Archive-store credentials: root-provisioned, never plan-selected. Root-only:
+# the helper stages a per-volume group-readable copy into each volume ConfigRoot
+# when it writes the archiver/hydrator drop-ins.
+install -o root -g root -m 0600 "$stage/cell-archive.env" "/etc/portablefs/cells/$cell_id-archive.env"
 
 "$(dirname -- "$0")/activate-hosted-release.sh" "$release" cell >/dev/null
 

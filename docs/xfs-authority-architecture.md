@@ -3,11 +3,13 @@
 Status: **protocol-6 storage and authority target; writable Linux is not yet
 production-ready**
 
-PortableFS is a remote gateway to one ordinary XFS project directory. XFS and
-its block device are the only durable filesystem state. The authority adds
+PortableFS is a remote gateway to one ordinary XFS project directory while a
+volume is serving. READY uses that XFS instance; ARCHIVED uses one sealed
+immutable archive; RESTORING composes the sealed base, a monotone hydration map,
+and XFS. The authority adds
 confinement, authentication, replay, distributed locks, lease coherence, and
 bounded resource admission. It does not add an inode database, content index,
-mutation history, branch graph, or write-back overlay.
+live mutation history, branch graph, or write-back overlay.
 
 The lease algorithm and stock-FUSE mapping are normative in
 [portable-coherence.md](./portable-coherence.md). This document defines the
@@ -52,6 +54,21 @@ Authority runtime state—connections, leases, locks, handles, cancellation, and
 bounded replay outcomes—is disposable at epoch loss. A restart therefore ends
 all sessions and holds a maximum-lease grace period before admitting conflicts.
 No PortableFS checkpoint or log reconstructs XFS.
+
+### Tiered canonical representation
+
+Exactly one representation is canonical for each `(State, ArchiveCycleStep)`.
+An ARCHIVED volume has no XFS placement or authority: its sealed,
+attempt-addressed manifest and packs are canonical. During RESTORING, a durable
+hydration mark selects XFS for one chunk; an unmarked chunk comes from the
+sealed base. The map is monotone, is not a mutation log, and stops participating
+after the durable convergence commit.
+
+The archiver reads one quiesced tree while the authority is absent. The
+namespace restorer materializes the initial tree before serving. During serving,
+the hydrator fetches and verifies recall bytes but never writes XFS; the
+authority alone writes them through its confined store. These phase-qualified
+roles do not create a second writable truth.
 
 The cell mount is `prjquota,nodev,nosuid,noexec,noatime`. `noatime` prevents an
 ordinary read from becoming an undeclared metadata mutation. Encryption at rest
@@ -178,6 +195,12 @@ writable by volume identities. Write staging is a service-owned project-
 inheriting directory on the same XFS filesystem, so staged bytes cannot escape
 the volume quota.
 
+With project block and inode hard limits installed, XFS `statfs` on the volume
+root reports the project's limits and remaining usage. That projection is
+load-bearing for `df` and tiered capacity accounting. A project without hard
+limits reports cell-wide XFS capacity; neither case requires granting the
+authority quota-administration capability.
+
 In-memory budgets cover sessions, handles, leases, replay outcomes, frame bytes,
 locks, and queued work. Exhaustion rejects new work before unbounded allocation.
 It never spills authoritative data onto another filesystem.
@@ -208,6 +231,11 @@ Recovery drills must verify XFS repair policy, project IDs, quotas, ownership,
 mount options, TLS identity, capability keys, route revision, and the restart
 lease grace before admitting clients.
 
+The archive tier is distinct from operator XFS/EBS snapshots. It is a
+first-class Manager-verified representation governed by the identity,
+lifecycle, capacity, and restore ordering in
+[the tiered-storage contracts](./tiered-storage/identity-lifecycle-and-capacity.md).
+
 ## Production proof gates
 
 - stock Linux FUSE 7.31+ INIT and real-VFS integration on supported LTS kernels;
@@ -219,7 +247,12 @@ lease grace before admitting clients.
 - XFS project/quota, confinement, storage-failure, and open-after-unlink tests;
 - Go race, native Swift qualification/refusal, release-identity, and workflow
   policy gates;
-- power-loss and authority-restart drills; and
+- power-loss and authority-restart drills;
+- archive/restore round-trip on real project-quota XFS, including bytes,
+  namespace, exact modes, nanosecond mtimes, symlinks, sparse extents, xattrs,
+  and hard links;
+- recall saturation, restore-blocked recovery, post-convergence equivalence,
+  quiesce admission closure, and project-`statfs` capacity tests; and
 - fresh protocol-6 performance measurements before any SLO claim.
 
 The protocol-5 qualification receipt and the private vNext design remain in-tree

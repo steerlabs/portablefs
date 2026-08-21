@@ -4,11 +4,13 @@ Status: **protocol-6 target contract; writable Linux is blocked from production
 by unobservable `RWF_APPEND`, while FSKit remains supported under an explicitly
 weaker synchronous-repair profile**
 
-PortableFS exposes one authoritative XFS project directory through multiple
-Linux mounts. XFS is the only durable filesystem truth. PortableFS adds
-authentication, object capabilities, replay protection, distributed locks, and
-lease-governed caching; it does not add a second inode tree, a mutation journal,
-or client write-back storage.
+PortableFS exposes one serving XFS project directory through multiple Linux
+mounts. A volume has one canonical representation selected by `(State,
+ArchiveCycleStep)`: READY uses XFS, ARCHIVED uses one sealed immutable archive,
+and RESTORING composes that sealed base, a monotone hydration map, and XFS.
+PortableFS adds authentication, object capabilities, replay protection,
+distributed locks, and lease-governed caching; it does not add a second writable
+inode tree, mutation journal, or client write-back storage.
 
 ```text
 stock Linux FUSE 7.31+ mounts
@@ -27,8 +29,11 @@ mutually authenticated TLS 1.3
 
 ## Product invariants
 
-1. **XFS is authoritative.** Files, directories, attributes, open handles, and
-   rename/unlink semantics are executed against the provisioned XFS subtree.
+1. **The state selects one authority.** READY and RESTORING volumes have exactly
+   one authority over one provisioned XFS subtree. An ARCHIVED volume has no XFS
+   placement or authority and is represented by its sealed archive. During
+   RESTORING, a hydration mark selects XFS for that chunk; otherwise the sealed
+   base is authoritative. No state has two writable truths.
 2. **Mutations are write-through.** A successful Linux mutation response means
    the authority applied the operation to XFS and discharged every conflicting
    peer cache lease. `fsync` and `fdatasync` remain the durability barriers.
@@ -50,6 +55,13 @@ mutually authenticated TLS 1.3
    already-applied mutation into a weaker answer. Storage failure fences the
    volume epoch. Unknown outcomes across authority death are reported as
    uncertain, never guessed or replayed automatically.
+8. **Unsupported is explicit.** Shared file-backed `mmap`, user xattr writes,
+   device nodes, FIFOs, sockets, and cross-volume rename are refused with a real
+   errno rather than emulated with divergent semantics.
+9. **Lifecycle control stays outside ordinary I/O.** The manager records
+   placement, entitlement, PKI, authorization, desired state, and observations;
+   it never stores filesystem bytes. The hydrator is a serving dependency only
+   while one volume is RESTORING. The manager never enters that data path.
 
 ## Linux cache and I/O profile
 
@@ -125,6 +137,11 @@ authorities but are not on filesystem I/O. The authority data plane remains a
 direct mutually authenticated connection from mount to volume. Client keys are
 generated on the mount host and are never delivered by the manager.
 
+Archive and wake are typed lifecycle transitions. The archiver reads a quiesced
+volume and seals an immutable attempt-addressed manifest and packs; a RESTORING
+volume serves through the hydrator until all sealed chunks converge into XFS.
+Neither mechanism creates a live mutation log or a second writable truth.
+
 ## Contract map
 
 | Subject | Document |
@@ -137,6 +154,7 @@ generated on the mount host and are never delivered by the manager.
 | Deployment | [xfs-authority-deployment.md](./xfs-authority-deployment.md) |
 | Hosted placement, credentials, reauthorization, and fencing | [hosted-control-plane.md](./hosted-control-plane.md) |
 | Deploying a hosted XFS cell | [hosted-cell-deployment.md](./hosted-cell-deployment.md) |
+| Archive identity, lifecycle, capacity, and restore ordering | [tiered-storage/identity-lifecycle-and-capacity.md](./tiered-storage/identity-lifecycle-and-capacity.md) |
 | Promoting one matched release to OpenSteer | [opensteer-production-deployment.md](./opensteer-production-deployment.md) |
 | Machine-local routing | [graft-security.md](./graft-security.md) |
 | Black-box qualification | [cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md) |

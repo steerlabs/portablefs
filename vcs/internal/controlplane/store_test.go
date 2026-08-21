@@ -1,6 +1,10 @@
 package controlplane
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -9,6 +13,78 @@ import (
 	"testing"
 	"time"
 )
+
+func TestMigrateStateV1ToV2IsExplicitValidatedAndNonDestructive(t *testing.T) {
+	directory := t.TempDir()
+	from, to := filepath.Join(directory, "manager-v1.state"), filepath.Join(directory, "manager-v2.state")
+	cellID := "11111111-1111-4111-8111-111111111111"
+	volumeID := "22222222-2222-4222-8222-222222222222"
+	endpoint := "v-22222222222242228222222222222222.cell.test"
+	legacy := stateV1{SchemaVersion: 1, Cells: map[string]cellV1{}, Volumes: map[string]volumeV1{}, Receipts: map[string]Receipt{},
+		AuthorizationNonces: map[string]AuthorizationNonce{}, MountEnrollments: map[string]MountEnrollment{},
+		MountAuthorizationContexts: map[string]MountAuthorizationContext{}, RenewalFences: map[string]uint64{}}
+	legacy.Cells[cellID] = cellV1{ID: cellID, AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, AllocatedBytes: 1 << 30, AllocatedInodes: 100_000,
+		NextProjectID: 10001, NextServiceUID: 200001, NextPort: 20001, PlanGeneration: 1, PlanReleaseID: "v1-manager",
+		PlanIssuedUnix: 100, PlanExpiresUnix: 200, Health: CellUnknown}
+	legacy.Volumes[volumeID] = volumeV1{ID: volumeID, AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "product",
+		ProductPublicKeyPEM: "product-key", CellID: cellID, QuotaBytes: 1 << 30, QuotaInodes: 100_000, ProjectID: 10000,
+		ServiceUID: 200000, ServiceGID: 200000, ListenPort: 20000, AuthorityID: endpoint, AuthorityServerName: endpoint,
+		AuthorityGeneration: 7, State: VolumeRetired, CreatedUnix: 100, UpdatedUnix: 100}
+	stateJSON, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(rawStoreEnvelope{Sequence: 1, PreviousHash: strings.Repeat("0", 64), State: stateJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+	checksum := sha256.Sum256(payload)
+	var length [4]byte
+	binary.BigEndian.PutUint32(length[:], uint32(len(payload)))
+	bytes := append([]byte(storeMagic), length[:]...)
+	bytes = append(bytes, payload...)
+	bytes = append(bytes, checksum[:]...)
+	if err := os.WriteFile(from, bytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalDigest := sha256.Sum256(bytes)
+	if store, err := OpenStore(from); store != nil || err == nil || !strings.Contains(err.Error(), "migrate-state") {
+		if store != nil {
+			_ = store.Close()
+		}
+		t.Fatalf("OpenStore(v1) = %v, want migrate-state guidance", err)
+	}
+	if err := MigrateStateV1ToV2(from, to); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateStateV1ToV2(from, to); err == nil {
+		t.Fatal("migration overwrote an existing v2 target")
+	}
+	after, err := os.ReadFile(from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if digest := sha256.Sum256(after); digest != originalDigest {
+		t.Fatalf("v1 rollback artifact changed: %s != %s", hex.EncodeToString(digest[:]), hex.EncodeToString(originalDigest[:]))
+	}
+	store, err := OpenStore(to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.View(func(state State) error {
+		volume := state.Volumes[volumeID]
+		if state.SchemaVersion != 2 || state.Cells[cellID].Pool != PoolProduct || volume.State != VolumeRetired || volume.AuthorityEpoch != 7 ||
+			volume.PlacementSequence != 1 || volume.Placement == nil || volume.Placement.Sequence != 1 || volume.Placement.AuthorityServerName != endpoint ||
+			volume.Placement.UsedBytes != 0 || volume.Placement.PendingBytes != 0 {
+			t.Fatalf("migrated state = %+v", state)
+		}
+		return state.Validate()
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestStoreRefusesASecondWriterAcrossCompaction(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "manager.state")

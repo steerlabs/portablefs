@@ -28,32 +28,32 @@ func TestVerifyTokenBindsEveryRequestDimension(t *testing.T) {
 		PathKey: expected.PathKey, Cursor: expected.Cursor, Limit: expected.Limit, BodySHA256: expected.BodySHA256,
 		KnownRevision: expected.KnownRevision, RetainedCursor: expected.RetainedCursor,
 	})
-	if !verifyToken(public, "opensteer-host", token, expected) {
+	if _, ok := verifyToken(public, "opensteer-host", token, expected); !ok {
 		t.Fatal("valid request-bound token was rejected")
 	}
 	changed := expected
 	changed.PathKey = "b3RoZXI"
-	if verifyToken(public, "opensteer-host", token, changed) {
+	if _, ok := verifyToken(public, "opensteer-host", token, changed); ok {
 		t.Fatal("token authorized a different path")
 	}
 	changed = expected
 	changed.Limit++
-	if verifyToken(public, "opensteer-host", token, changed) {
+	if _, ok := verifyToken(public, "opensteer-host", token, changed); ok {
 		t.Fatal("token authorized a different page limit")
 	}
 	changed = expected
 	changed.BodySHA256 = "other-body"
-	if verifyToken(public, "opensteer-host", token, changed) {
+	if _, ok := verifyToken(public, "opensteer-host", token, changed); ok {
 		t.Fatal("token authorized a different request body")
 	}
 	changed = expected
 	changed.RetainedCursor = "other-retained-cursor"
-	if verifyToken(public, "opensteer-host", token, changed) {
+	if _, ok := verifyToken(public, "opensteer-host", token, changed); ok {
 		t.Fatal("token authorized a different retained cursor")
 	}
 	parts := splitToken(t, token)
 	parts[1] = base64.RawURLEncoding.EncodeToString([]byte(`{"aud":"portablefs-files"}`))
-	if verifyToken(public, "opensteer-host", parts[0]+"."+parts[1]+"."+parts[2], expected) {
+	if _, ok := verifyToken(public, "opensteer-host", parts[0]+"."+parts[1]+"."+parts[2], expected); ok {
 		t.Fatal("tampered token was accepted")
 	}
 }
@@ -69,7 +69,7 @@ func TestVerifyTokenRejectsExpiredOrOverlongLifetimes(t *testing.T) {
 		{Audience: "portablefs-files", Expires: now + 61, Issued: now, Issuer: "opensteer-host", Operation: "identity", VolumeID: "volume-a"},
 		{Audience: "portablefs-files", Expires: now + 30, Issued: now - 61, Issuer: "opensteer-host", Operation: "identity", VolumeID: "volume-a"},
 	} {
-		if verifyToken(public, "opensteer-host", testToken(t, private, claims), expectedClaims{Operation: "identity", VolumeID: "volume-a"}) {
+		if _, ok := verifyToken(public, "opensteer-host", testToken(t, private, claims), expectedClaims{Operation: "identity", VolumeID: "volume-a"}); ok {
 			t.Fatalf("invalid lifetime was accepted: %+v", claims)
 		}
 	}

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
 	"github.com/steerlabs/portablefs/vcs/internal/volumecap"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
@@ -313,6 +315,43 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	stateRoot := filepath.Dir(o.visibilityMembership)
+	quiesce, err := restoremode.NewQuiesceWatcher(ctx, restoremode.QuiesceConfig{
+		ConfigRoot: "/run/portablefs-volume", StateRoot: stateRoot,
+		VolumeID: o.volumeID, AuthorityEpoch: o.authorityGeneration,
+		WireEpoch: runtime.Epoch(), Membership: membership,
+	})
+	if err != nil {
+		return fmt.Errorf("start authority quiesce watcher: %w", err)
+	}
+	defer quiesce.Close()
+
+	var restore *restoremode.Mode
+	var restoreFiles *xfsstore.RestoreFiles
+	restoreActive, err := restoremode.Active(stateRoot)
+	if err != nil {
+		return fmt.Errorf("inspect restore activation markers: %w", err)
+	}
+	if restoreActive {
+		bindings, err := restoremode.LoadBindings(filepath.Join(stateRoot, restoremode.BindingsFilename), 1<<24)
+		if err != nil {
+			return err
+		}
+		walkBound := uint64(bindings.Len())*2 + 1024
+		restoreFiles, err = store.ResolveRestoreFiles(bindings.IdentityMap(), walkBound)
+		if err != nil {
+			return fmt.Errorf("bind restored namespace identities: %w", err)
+		}
+		defer restoreFiles.Close()
+		restore, err = restoremode.Open(ctx, restoremode.Config{
+			StateRoot: stateRoot, VolumeID: o.volumeID, AuthorityEpoch: o.authorityGeneration,
+			Store: restoreFiles, Bindings: bindings,
+		})
+		if err != nil {
+			return fmt.Errorf("start restore mode: %w", err)
+		}
+		defer restore.Close()
+	}
 	storageFailure := make(chan error, 1)
 	coherenceFailure := make(chan error, 1)
 	// The transport bound and the advertised bound are one value here, and
@@ -320,6 +359,7 @@ func run() error {
 	maxFrame, maxInFlight := uint32(o.maxFrame), o.maxInFlight
 	handler := &authorityrpc.VolumeHandler{
 		Store: store, Runtime: runtime, Authorizer: authorizer, Metrics: metrics,
+		Restore: restore, Quiesce: quiesce,
 		MaxFrame: maxFrame, MaxRead: uint32(o.maxRead), MaxWrite: uint32(o.maxWrite), MaxInFlight: uint32(maxInFlight),
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),

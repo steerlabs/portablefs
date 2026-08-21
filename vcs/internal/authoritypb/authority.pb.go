@@ -54,6 +54,10 @@ const (
 	// the parent lock held by that callback. Callback-serialized frontends never
 	// receive this class.
 	FailureClass_FAILURE_CLASS_VISIBILITY_RETRY FailureClass = 6
+	// RESTORE is a definite, non-fatal refusal while sealed base content cannot
+	// be recalled, recall admission is saturated, or corruption has made the
+	// volume's content uniformly unavailable. The session and epoch stay live.
+	FailureClass_FAILURE_CLASS_RESTORE FailureClass = 7
 )
 
 // Enum value maps for FailureClass.
@@ -66,6 +70,7 @@ var (
 		4: "FAILURE_CLASS_ROUTES",
 		5: "FAILURE_CLASS_VISIBILITY_INTERRUPTED",
 		6: "FAILURE_CLASS_VISIBILITY_RETRY",
+		7: "FAILURE_CLASS_RESTORE",
 	}
 	FailureClass_value = map[string]int32{
 		"FAILURE_CLASS_UNSPECIFIED":            0,
@@ -75,6 +80,7 @@ var (
 		"FAILURE_CLASS_ROUTES":                 4,
 		"FAILURE_CLASS_VISIBILITY_INTERRUPTED": 5,
 		"FAILURE_CLASS_VISIBILITY_RETRY":       6,
+		"FAILURE_CLASS_RESTORE":                7,
 	}
 )
 
@@ -2078,6 +2084,10 @@ type Response struct {
 	// only at that physical reply boundary.
 	SourceLeaseDischarge     *SourceLeaseDischarge `protobuf:"bytes,50,opt,name=source_lease_discharge,json=sourceLeaseDischarge,proto3" json:"source_lease_discharge,omitempty"`
 	FskitRepairRetrySequence uint64                `protobuf:"varint,52,opt,name=fskit_repair_retry_sequence,json=fskitRepairRetrySequence,proto3" json:"fskit_repair_retry_sequence,omitempty"`
+	// restore_detail is present with FAILURE_CLASS_RESTORE and gives the stable
+	// retry/operator reason without overloading errno (blocked, corrupt,
+	// recall_deadline, or protocol).
+	RestoreDetail string `protobuf:"bytes,55,opt,name=restore_detail,json=restoreDetail,proto3" json:"restore_detail,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Response_Hello
@@ -2229,6 +2239,13 @@ func (x *Response) GetFskitRepairRetrySequence() uint64 {
 		return x.FskitRepairRetrySequence
 	}
 	return 0
+}
+
+func (x *Response) GetRestoreDetail() string {
+	if x != nil {
+		return x.RestoreDetail
+	}
+	return ""
 }
 
 func (x *Response) GetBody() isResponse_Body {
@@ -9323,7 +9340,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\fR\x04name\x12)\n" +
 	"\x10bound_attributes\x18\x03 \x01(\bR\x0fboundAttributes\x12\x1d\n" +
 	"\n" +
-	"bound_data\x18\x04 \x01(\bR\tboundData\"\xe8\x18\n" +
+	"bound_data\x18\x04 \x01(\bR\tboundData\"\x8f\x19\n" +
 	"\bResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -9338,7 +9355,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"post_state\x18- \x01(\v2\".portablefs.authority.v1.PostStateR\tpostState\x12F\n" +
 	"\flease_grants\x18. \x03(\v2#.portablefs.authority.v1.LeaseGrantR\vleaseGrants\x12c\n" +
 	"\x16source_lease_discharge\x182 \x01(\v2-.portablefs.authority.v1.SourceLeaseDischargeR\x14sourceLeaseDischarge\x12=\n" +
-	"\x1bfskit_repair_retry_sequence\x184 \x01(\x04R\x18fskitRepairRetrySequence\x12;\n" +
+	"\x1bfskit_repair_retry_sequence\x184 \x01(\x04R\x18fskitRepairRetrySequence\x12%\n" +
+	"\x0erestore_detail\x187 \x01(\tR\rrestoreDetail\x12;\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2#.portablefs.authority.v1.HelloReplyH\x00R\x05hello\x12>\n" +
 	"\x06attach\x18\v \x01(\v2$.portablefs.authority.v1.AttachReplyH\x00R\x06attach\x12>\n" +
@@ -9884,7 +9902,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x0eSetLockRequest\x125\n" +
 	"\x04lock\x18\x01 \x01(\v2!.portablefs.authority.v1.LockSpecR\x04lock\x12\x12\n" +
 	"\x04wait\x18\x02 \x01(\bR\x04wait\x12\x16\n" +
-	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\xe9\x01\n" +
+	"\x06unlock\x18\x03 \x01(\bR\x06unlock*\x84\x02\n" +
 	"\fFailureClass\x12\x1d\n" +
 	"\x19FAILURE_CLASS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15FAILURE_CLASS_STORAGE\x10\x01\x12\x1a\n" +
@@ -9892,7 +9910,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x17FAILURE_CLASS_COHERENCE\x10\x03\x12\x18\n" +
 	"\x14FAILURE_CLASS_ROUTES\x10\x04\x12(\n" +
 	"$FAILURE_CLASS_VISIBILITY_INTERRUPTED\x10\x05\x12\"\n" +
-	"\x1eFAILURE_CLASS_VISIBILITY_RETRY\x10\x06*d\n" +
+	"\x1eFAILURE_CLASS_VISIBILITY_RETRY\x10\x06\x12\x19\n" +
+	"\x15FAILURE_CLASS_RESTORE\x10\a*d\n" +
 	"\rTransportRole\x12\x1e\n" +
 	"\x1aTRANSPORT_ROLE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13TRANSPORT_ROLE_DATA\x10\x01\x12\x1a\n" +

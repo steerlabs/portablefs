@@ -1019,12 +1019,44 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 			}
 			scratch = make([]byte, scratchSize)
 		}
-		committed, assigned, post, applyErr := target.CommitWrite(stage, xfsstore.WriteCommit{
-			RequestedSize: staged, Position: metadata.position, RLimitSize: metadata.rlimitSize,
-			FileMaxSize: metadata.fileMaxSize, Mode: metadata.mode,
-			DataSync: metadata.dataSync, Sync: metadata.sync,
-			KillPrivileges: metadata.writeFlags&fskitWriteKillSUIDGID != 0,
-		}, scratch)
+		var committed, assigned uint64
+		var post xfsstore.Attr
+		apply := func() (int, int64, error) {
+			var applyErr error
+			committed, assigned, post, applyErr = target.CommitWrite(stage, xfsstore.WriteCommit{
+				RequestedSize: staged, Position: metadata.position, RLimitSize: metadata.rlimitSize,
+				FileMaxSize: metadata.fileMaxSize, Mode: metadata.mode,
+				DataSync: metadata.dataSync, Sync: metadata.sync,
+				KillPrivileges: metadata.writeFlags&fskitWriteKillSUIDGID != 0,
+			}, scratch)
+			return int(committed), int64(assigned), applyErr
+		}
+		var applyErr error
+		if h.Restore != nil && h.Restore.Active() {
+			attrTarget, ok := target.(writeTargetAttr)
+			if !ok {
+				applyErr = errInternal
+			} else {
+				before, attrErr := attrTarget.Getattr()
+				if attrErr != nil {
+					applyErr = attrErr
+				} else {
+					writeOffset := metadata.position
+					if metadata.mode == xfsstore.WriteAppend && before.Size > 0 {
+						writeOffset = uint64(before.Size)
+					}
+					var committedInt int
+					var assignedInt int64
+					committedInt, assignedInt, applyErr = h.Restore.Write(ctx, coordinate.identity, writeOffset, staged, apply)
+					committed = uint64(committedInt)
+					if assignedInt >= 0 {
+						assigned = uint64(assignedInt)
+					}
+				}
+			}
+		} else {
+			_, _, applyErr = apply()
+		}
 		terminalKind := fskitWriteTerminalCommitted
 		if committed == 0 && applyErr != nil && !errors.Is(applyErr, xfsstore.ErrOutcomeUncertain) &&
 			!errors.Is(applyErr, xfsstore.ErrWritePostApply) {

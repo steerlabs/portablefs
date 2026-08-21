@@ -67,6 +67,37 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			}
 			return handler.Manager.RegisterCell(idempotencyKey(request), body)
 		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "capacity" && request.Method == http.MethodPatch:
+		handler.requireRole(writer, request, principal, RoleOperator, func() (any, error) {
+			var body UpdateCellCapacityRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			return handler.Manager.UpdateCellCapacity(idempotencyKey(request), parts[2], body)
+		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "decommission" && request.Method == http.MethodPost:
+		handler.requireRole(writer, request, principal, RoleOperator, func() (any, error) {
+			var body DecommissionCellRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			return handler.Manager.DecommissionCell(idempotencyKey(request), parts[2], body)
+		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "abandon" && request.Method == http.MethodPost:
+		handler.requireRole(writer, request, principal, RoleOperator, func() (any, error) {
+			var body AbandonCellRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			return handler.Manager.AbandonCell(idempotencyKey(request), parts[2], body)
+		})
+	case request.Method == http.MethodGet && path == "v1/capacity":
+		if principal.Role != RoleOperator && principal.Role != RoleProduct && principal.Role != RoleCell {
+			writeAPIError(writer, http.StatusForbidden, "role not permitted")
+			return
+		}
+		result, err := handler.Manager.Capacity()
+		handler.writeResult(writer, result, err)
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "plan" && request.Method == http.MethodGet:
 		cellID := parts[2]
 		if principal.Role != RoleCell || principal.ID != cellID {
@@ -82,7 +113,7 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			return
 		}
 		var body CellObservation
-		if err := decodeJSON(request, &body); err != nil {
+		if err := decodeJSONLimit(request, &body, 2<<20); err != nil {
 			handler.writeResult(writer, nil, err)
 			return
 		}
@@ -176,6 +207,62 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 				return nil, err
 			}
 			return handler.Manager.RetireVolume(idempotencyKey(request), body)
+		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "archive" && request.Method == http.MethodPost:
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body ArchiveVolumeRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if body.VolumeID != parts[2] {
+				return nil, ErrInvalid
+			}
+			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
+				return nil, err
+			}
+			return handler.Manager.ArchiveVolume(idempotencyKey(request), body)
+		})
+	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "wake" && request.Method == http.MethodPost:
+		if principal.Role != RoleProduct {
+			writeAPIError(writer, http.StatusForbidden, "role not permitted")
+			return
+		}
+		if idempotencyKey(request) == "" {
+			writeAPIError(writer, http.StatusBadRequest, "Idempotency-Key is required")
+			return
+		}
+		var body WakeVolumeRequest
+		if err := decodeJSON(request, &body); err != nil {
+			handler.writeResult(writer, nil, err)
+			return
+		}
+		if body.VolumeID != parts[2] {
+			handler.writeResult(writer, nil, ErrInvalid)
+			return
+		}
+		if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
+			handler.writeResult(writer, nil, err)
+			return
+		}
+		result, err := handler.Manager.WakeVolume(idempotencyKey(request), body)
+		if err == nil && result.WakeRequested {
+			writeJSON(writer, http.StatusAccepted, result)
+			return
+		}
+		handler.writeResult(writer, result, err)
+	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "volumes" && request.Method == http.MethodDelete:
+		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
+			var body DestroyVolumeRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			if body.VolumeID != parts[2] {
+				return nil, ErrInvalid
+			}
+			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
+				return nil, err
+			}
+			return handler.Manager.DestroyVolume(idempotencyKey(request), body)
 		})
 	case request.Method == http.MethodPost && path == "v1/mount-authorizations":
 		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
@@ -411,15 +498,32 @@ func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, 
 		status = http.StatusConflict
 	case errors.Is(err, ErrEnrollmentEnded):
 		status = http.StatusGone
+	// Both 503s are "the request was correct, retry it unchanged": the archive
+	// store is down, or every eligible cell is at its archive/restore
+	// concurrency cap. Neither is a client-visible conflict in the durable
+	// state, so neither is 409.
+	case errors.Is(err, ErrArchiveStoreUnavailable), errors.Is(err, ErrBusy):
+		status = http.StatusServiceUnavailable
+	// 501 is "this deployment cannot do that at all" — a cell without archive
+	// configuration or a Manager without its archive component. Retrying is
+	// useless and hiding it behind 409/503 would let a misconfigured
+	// deployment fail every sweep silently forever, so it gets a status a
+	// client can route to an operator.
+	case errors.Is(err, ErrArchiveUnsupported):
+		status = http.StatusNotImplemented
 	}
 	writeAPIError(writer, status, err.Error())
 }
 
 func decodeJSON(request *http.Request, target any) error {
+	return decodeJSONLimit(request, target, 1<<20)
+}
+
+func decodeJSONLimit(request *http.Request, target any, limit int64) error {
 	defer request.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(request.Body, (1<<20)+1))
-	if err != nil || len(payload) > 1<<20 {
-		return fmt.Errorf("%w: JSON body exceeds one MiB", ErrInvalid)
+	payload, err := io.ReadAll(io.LimitReader(request.Body, limit+1))
+	if err != nil || int64(len(payload)) > limit {
+		return fmt.Errorf("%w: JSON body exceeds %d bytes", ErrInvalid, limit)
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(payload)))
 	decoder.DisallowUnknownFields()

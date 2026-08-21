@@ -82,6 +82,33 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeIsRefusedWhileAnyMountIsLive"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
+  # The tiered-storage lifecycle. This is the only place the archiver, the
+  # hydrator, authority-side restore mode and a real kernel FUSE mount are
+  # driven as one system on real XFS, so every stage of it is named here rather
+  # than only the parent test: a stage that is renamed away, or that starts
+  # skipping, must fail this job instead of quietly removing the proof that a
+  # restored volume serves the bytes that were archived. No stage of it is
+  # allowed to skip, restricted modes included - see run_tiered_suite.
+  # Every test that materializes a restore namespace needs real XFS export
+  # handles (restorefixture.Root), so the everywhere `go` lane skips them on
+  # its ext4 runner; this suite is where they must actually run, on the
+  # provisioned volume, and never skip.
+  "github.com/steerlabs/portablefs/vcs/internal/archiver:TestArchiveRestoreServeRoundTrip"
+  "github.com/steerlabs/portablefs/vcs/internal/hydrator:TestMaterializeRestoresRestrictiveModes"
+  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode"
+  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/ConvergesAgainstTheRealHydrator"
+  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/SurfacesHydratorCorruptionAsErrCorrupt"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ArchiveAndVerify"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/InstantNamespaceOnANewPlacement"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ServeWhileCold"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestrictedModesAreCarried"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedIsUniformAndNonFatal"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedClearsWhenTheHydratorReturns"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ColdTreeMatchesTheArchive"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/Converge"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/PlainServingAfterConvergence"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ManagerIndependentVerification"
   # The files gateway is the only synchronous-repair frontend shipped on Linux
   # and the only participant that is not a mount. Keep its real handshake with
   # the real volume handler required: every other readonlyfs test drives a fake,
@@ -147,7 +174,11 @@ install_container_dependencies() {
   apt-get update -qq
   # xfsprogs: mkfs.xfs and xfs_quota. fuse3: the setuid fusermount3 helper the
   # unprivileged test process needs. sqlite3/git: the real application workload.
-  apt-get install -y -qq --no-install-recommends xfsprogs fuse3 sqlite3 git util-linux kmod >/dev/null
+  # libcap2-bin: capsh, which is how the tiered suite is handed the archiver's
+  # one capability and nothing else. See run_tiered_suite.
+  # kmod supplies the tooling used while provisioning the kernel FUSE control
+  # surface inherited from the host.
+  apt-get install -y -qq --no-install-recommends xfsprogs fuse3 sqlite3 git util-linux libcap2-bin kmod >/dev/null
 }
 
 # The FUSE control filesystem is the kernel interface a strict mount's
@@ -194,27 +225,24 @@ create_service_identity() {
     /home/portablefs /home/portablefs/gocache /home/portablefs/gomodcache /home/portablefs/tmp
 }
 
-run_suite() {
-  local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
-  local log=/home/portablefs/tmp/go-test.log
-  local status=0
+# suite_command emits the fully pinned `go test` invocation, environment and
+# all, as one argv. Both suite slices run byte-identically apart from the
+# packages they name and the capability they are given.
+#
+# PORTABLEFS_XFS_TEST_REQUIRED turns every gate skip into a failure so a broken
+# provisioner cannot present as a green run. -p 1 keeps the privileged packages
+# from opening the one provisioned XFS cell concurrently, which its exclusive
+# volume lock forbids.
+suite_command() {
   local -a extra_go_test_flags=()
   if [[ -n ${PORTABLEFS_GO_TEST_FLAGS:-} ]]; then
     read -r -a extra_go_test_flags <<<"$PORTABLEFS_GO_TEST_FLAGS"
   fi
-  # Deliberately unprivileged: the permission assertions in the suite are only
-  # meaningful when DAC actually applies, and the production data plane never
-  # runs as root. PORTABLEFS_XFS_TEST_REQUIRED turns every gate skip into a
-  # failure so a broken provisioner cannot present as a green run. -p 1 keeps
-  # the three privileged packages from opening the one provisioned XFS cell
-  # concurrently, which its exclusive volume lock forbids.
-  #
-  # -timeout is set below the CI job timeout on purpose (the whole lane
-  # completes in about two minutes). A hung mount must be killed by the test
-  # binary, which prints every goroutine's stack, rather than by the job
-  # timeout, which kills the runner and leaves nothing to read.
-  set +e
-  runuser -u portablefs -- env -i \
+  # Emit rather than execute so the plain and capability-limited slices use
+  # the same environment and command line. The 35-minute timeout remains below
+  # the CI lane timeout while covering the longer tiered lifecycle.
+  printf '%s\0' \
+    env -i \
     HOME=/home/portablefs \
     PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin \
     TMPDIR=/home/portablefs/tmp \
@@ -222,20 +250,68 @@ run_suite() {
     GOMODCACHE=/home/portablefs/gomodcache \
     GOTOOLCHAIN=local \
     GOFLAGS=-mod=readonly \
-    PORTABLEFS_XFS_TEST_ROOT="$volume" \
-    PORTABLEFS_XFS_TEST_PROJECT="$PORTABLEFS_PROJECT_ID" \
+    "PORTABLEFS_XFS_TEST_ROOT=/srv/portablefs/${PORTABLEFS_VOLUME_NAME}" \
+    "PORTABLEFS_XFS_TEST_PROJECT=${PORTABLEFS_PROJECT_ID}" \
     PORTABLEFS_CELLHOST_XFS_TEST_ROOT=/srv/portablefs \
-    PORTABLEFS_SERVICE_UID="$PORTABLEFS_SERVICE_UID" \
-    PORTABLEFS_SERVICE_GID="$PORTABLEFS_SERVICE_GID" \
+    "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
+    "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
     PORTABLEFS_XFS_TEST_CELL=/srv/portablefs \
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
-	PORTABLEFS_FUSE_DEBUG="${PORTABLEFS_FUSE_DEBUG:-}" \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 10m "${extra_go_test_flags[@]}" \
-    ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... \
-    >"$log" 2>&1
-  status=$?
+    "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 35m \
+    "${extra_go_test_flags[@]}" "$@"
+}
+
+# The bulk of the privileged suite, with no capability at all. The permission
+# assertions in it are only meaningful when DAC actually applies, and the
+# production data plane never runs as root; CAP_DAC_READ_SEARCH would be just as
+# wrong here, because xfsstore proves the restore binding walk by asserting that
+# an archived directory refuses to open for reading.
+run_plain_suite() {
+  local log=$1
+  local -a command=()
+  mapfile -d '' -t command < <(suite_command ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... ./internal/restoremode/... ./internal/archiver/... ./internal/hydrator/...)
+  runuser -u portablefs -- "${command[@]}" >>"$log" 2>&1
+}
+
+# The tiered lifecycle, as the volume identity plus exactly one capability.
+#
+# The suite archives a tree containing inodes whose modes deny their own owner,
+# which is a shape a real workspace produces and the archive format promises to
+# carry. Reading them is the archiver's job and the archiver unit is the one
+# component in the cell granted CAP_DAC_READ_SEARCH, so the test process that
+# stands in for it is granted the same thing and nothing else: capsh keeps the
+# capability across the drop to the volume identity, raises it into the ambient
+# set so the exec'd `go test` inherits it, and leaves the bounding set to supply
+# nothing more. The restore half of the suite is unaffected, which is the whole
+# point - CAP_DAC_READ_SEARCH bypasses read and search and never write, so
+# hydration into a 0444 or 0000 inode still has to come from a descriptor the
+# authority's binding walk opened before it began serving.
+#
+# Root would have made all of it vacuous, and a capability-gated skip made it
+# absent; this is what makes RestrictedModesAreCarried a required test.
+run_tiered_suite() {
+  local log=$1
+  local -a command=()
+  mapfile -d '' -t command < <(suite_command ./internal/tierede2e/...)
+  capsh --keep=1 --user=portablefs \
+    --inh=cap_dac_read_search --addamb=cap_dac_read_search \
+    -- -c 'exec "$@"' capsh-suite "${command[@]}" >>"$log" 2>&1
+}
+
+run_suite() {
+  local log=/home/portablefs/tmp/go-test.log
+  local status=0 slice=0
+  : >"$log"
+  set +e
+  run_plain_suite "$log"
+  slice=$?
+  [[ $slice -eq 0 ]] || status=$slice
+  run_tiered_suite "$log"
+  slice=$?
+  [[ $slice -eq 0 ]] || status=$slice
   set -e
   cat -- "$log"
   [[ $status -eq 0 ]] || fail "go test exited $status" "$status"

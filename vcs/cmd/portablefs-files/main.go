@@ -45,14 +45,23 @@ const (
 	previewMaximum       = 512 << 10
 	maximumDownloads     = 16
 	maximumOperations    = 64
+	maximumFences        = 4096
+	// fenceRetention outlives the read grants a fence has to cover. The fence
+	// floor exists only to refuse an install from a grant issued before quiesce
+	// began, and such a grant is dead within its own 10-minute lifetime; an
+	// hour of retention is an order of magnitude of headroom over the window the
+	// floor can possibly matter for.
+	fenceRetention = time.Hour
 )
 
 type options struct {
-	requestPublicKey string
-	requestIssuer    string
-	identityDir      string
-	listen           string
-	maxSessions      int
+	requestPublicKey     string
+	requestIssuer        string
+	identityDir          string
+	listen               string
+	archiveConfig        string
+	maxSessions          int
+	maxArchivedManifests int
 }
 
 type identity struct {
@@ -75,13 +84,45 @@ type readGrant struct {
 	VolumeID                  string   `json:"volumeId"`
 }
 
+// authoritySession is the read-only authority surface a live volume session
+// uses. It is an interface for exactly one reason: the fence tests install a
+// fake dialer so that the install path can be exercised without an authority.
+// Production always holds a *readonlyfs.Client.
+type authoritySession interface {
+	Close() error
+	Err() error
+	List(ctx context.Context, pathKey string, limit int, cursor *readonlyfs.Cursor) (readonlyfs.Page, error)
+	OpenFile(ctx context.Context, pathKey string) (*readonlyfs.File, error)
+}
+
+// dialer is the seam the production readonlyfs.Dial sits behind.
+type dialer func(context.Context, readonlyfs.Config) (authoritySession, error)
+
+func dialAuthority(ctx context.Context, config readonlyfs.Config) (authoritySession, error) {
+	client, err := readonlyfs.Dial(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
 type volumeSession struct {
-	client       *readonlyfs.Client
+	client       authoritySession
 	expiresAt    time.Time
 	generation   uint64
 	lastUsedUnix atomic.Int64
 	managerBuild string
 	mu           sync.RWMutex
+}
+
+// fenceRecord is one volume's session fence floor. It is in-memory on purpose:
+// the product retries the quiesce delete against every configured gateway, so
+// the floor converges, and the authority stop behind it — not this record — is
+// the primary guarantee that no session survives quiesce (restore-mode.md
+// "Quiesce").
+type fenceRecord struct {
+	value      uint64
+	recordedAt time.Time
 }
 
 type cursorRecord struct {
@@ -97,11 +138,14 @@ type server struct {
 	issuer      string
 	identity    identity
 	maxSessions int
+	dial        dialer
+	archive     *archiveGateway
 	downloads   chan struct{}
 	operations  chan struct{}
 	mu          sync.Mutex
 	sessions    map[string]*volumeSession
 	cursors     map[string]cursorRecord
+	fences      map[string]fenceRecord
 }
 
 func main() {
@@ -110,10 +154,15 @@ func main() {
 	flag.StringVar(&configured.requestIssuer, "request-issuer", "", "exact trusted request-token issuer")
 	flag.StringVar(&configured.identityDir, "identity-dir", "", "private Files service identity directory")
 	flag.StringVar(&configured.listen, "listen", "127.0.0.1:4315", "private HTTP listen address")
+	flag.StringVar(&configured.archiveConfig, "archive-config", "", "root-provisioned archive-store configuration file; archived volumes are refused without it")
 	flag.IntVar(&configured.maxSessions, "max-sessions", 128, "maximum live volume sessions")
+	flag.IntVar(&configured.maxArchivedManifests, "max-archived-manifests", defaultArchivedManifests, "maximum decoded sealed manifests held in memory")
 	flag.Parse()
 	if configured.requestPublicKey == "" || configured.requestIssuer == "" || configured.identityDir == "" || configured.maxSessions < 1 || configured.maxSessions > 4096 {
 		log.Fatal("portablefs-files: --request-public-key, --request-issuer, --identity-dir, and a bounded --max-sessions are required")
+	}
+	if configured.maxArchivedManifests < 1 || configured.maxArchivedManifests > 1024 {
+		log.Fatal("portablefs-files: --max-archived-manifests must be within 1..1024")
 	}
 	requestKey, err := loadRequestPublicKey(configured.requestPublicKey)
 	if err != nil {
@@ -123,10 +172,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("portablefs-files: identity: %v", err)
 	}
+	var archived *archiveGateway
+	if configured.archiveConfig != "" {
+		archived, err = newArchiveGateway(configured.archiveConfig, configured.maxArchivedManifests)
+		if err != nil {
+			log.Fatalf("portablefs-files: archive configuration: %v", err)
+		}
+	}
 	service := &server{
 		requestKey: requestKey, issuer: configured.requestIssuer, identity: serviceIdentity, maxSessions: configured.maxSessions,
+		dial: dialAuthority, archive: archived,
 		downloads: make(chan struct{}, maximumDownloads), operations: make(chan struct{}, maximumOperations),
-		sessions: make(map[string]*volumeSession), cursors: make(map[string]cursorRecord),
+		sessions: make(map[string]*volumeSession), cursors: make(map[string]cursorRecord), fences: make(map[string]fenceRecord),
 	}
 	stop := make(chan struct{})
 	go service.sweep(stop)
@@ -167,6 +224,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /v1/volumes/{volume}/identity", s.handleIdentity)
 	mux.HandleFunc("GET /v1/volumes/{volume}/session", s.handleSessionStatus)
 	mux.HandleFunc("PUT /v1/volumes/{volume}/session", s.handleSessionInstall)
+	mux.HandleFunc("DELETE /v1/volumes/{volume}/session", s.handleSessionDelete)
 	mux.HandleFunc("GET /v1/volumes/{volume}/entries", s.handleEntries)
 	mux.HandleFunc("GET /v1/volumes/{volume}/content", s.handleContent)
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -178,7 +236,7 @@ func (s *server) routes() http.Handler {
 
 func (s *server) handleIdentity(writer http.ResponseWriter, request *http.Request) {
 	volumeID := request.PathValue("volume")
-	if !s.authorize(writer, request, expectedClaims{Operation: "identity", VolumeID: volumeID}) {
+	if _, ok := s.authorize(writer, request, expectedClaims{Operation: "identity", VolumeID: volumeID}); !ok {
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"csrPem": s.identity.csrPEM, "keyId": s.identity.keyID})
@@ -186,7 +244,7 @@ func (s *server) handleIdentity(writer http.ResponseWriter, request *http.Reques
 
 func (s *server) handleSessionStatus(writer http.ResponseWriter, request *http.Request) {
 	volumeID := request.PathValue("volume")
-	if !s.authorize(writer, request, expectedClaims{Operation: "session.status", VolumeID: volumeID}) {
+	if _, ok := s.authorize(writer, request, expectedClaims{Operation: "session.status", VolumeID: volumeID}); !ok {
 		return
 	}
 	session := s.lockCurrentSession(volumeID)
@@ -210,10 +268,14 @@ func (s *server) handleSessionInstall(writer http.ResponseWriter, request *http.
 		return
 	}
 	digest := sha256.Sum256(body)
-	if !s.authorize(writer, request, expectedClaims{
+	// The install token may carry a fence; a product that does not yet send one
+	// installs at fence 0, which is below every recorded floor and therefore
+	// refused for any volume that has been quiesced.
+	claims, ok := s.authorize(writer, request, expectedClaims{
 		Operation: "session.install", VolumeID: volumeID,
-		BodySHA256: base64.RawURLEncoding.EncodeToString(digest[:]),
-	}) {
+		BodySHA256: base64.RawURLEncoding.EncodeToString(digest[:]), Fence: fenceOptional,
+	})
+	if !ok {
 		return
 	}
 	var grant readGrant
@@ -236,7 +298,7 @@ func (s *server) handleSessionInstall(writer http.ResponseWriter, request *http.
 	}
 	ctx, cancel := context.WithTimeout(request.Context(), 20*time.Second)
 	defer cancel()
-	client, err := readonlyfs.Dial(ctx, readonlyfs.Config{
+	client, err := s.dial(ctx, readonlyfs.Config{
 		Address: grant.AuthorityAddress, AuthorityCAPEM: []byte(grant.AuthorityCACertificatePEM),
 		AuthorityServerName: grant.AuthorityServerName, Capability: []byte(grant.Capability),
 		ClientCertificatePEM: []byte(grant.ClientCertificatePEM), ClientPrivateKeyPEM: s.identity.privatePEM,
@@ -251,6 +313,19 @@ func (s *server) handleSessionInstall(writer http.ResponseWriter, request *http.
 	var prior *volumeSession
 	var evicted *volumeSession
 	s.mu.Lock()
+	// The fence floor is re-checked here — after the dial, inside the same
+	// registry lock that installs — because that is the only place the race the
+	// fence exists for can be closed. A read grant issued before quiesce began
+	// is still valid; the dial that consumes it takes long enough for a DELETE
+	// to land in between, and a check made before the dial would let the
+	// resulting session be installed after the volume was fenced and go on
+	// holding an authority session the Manager is about to stop.
+	if floor := s.fences[volumeID].value; floor > claims.Fence {
+		s.mu.Unlock()
+		_ = client.Close()
+		writeError(writer, http.StatusConflict, "session_fenced", "this volume was quiesced after the read grant was issued")
+		return
+	}
 	if len(s.sessions) >= s.maxSessions && s.sessions[volumeID] == nil {
 		var evictedVolume string
 		var oldest int64 = 1<<63 - 1
@@ -286,6 +361,67 @@ func (s *server) handleSessionInstall(writer http.ResponseWriter, request *http.
 	writeJSON(writer, http.StatusCreated, map[string]any{"expiresAt": expiresAt.Format(time.RFC3339Nano), "ready": true})
 }
 
+// handleSessionDelete is quiesce step one: it raises the volume's fence floor
+// and retires any live session so that the Manager can stop the authority with
+// no gateway session outstanding. It is idempotent and convergent — the product
+// retries it, and only the maximum fence it has ever seen is retained.
+func (s *server) handleSessionDelete(writer http.ResponseWriter, request *http.Request) {
+	volumeID := request.PathValue("volume")
+	claims, ok := s.authorize(writer, request, expectedClaims{Operation: "session.delete", VolumeID: volumeID, Fence: fenceRequired})
+	if !ok {
+		return
+	}
+	// The floor is recorded before the eviction so that an install racing this
+	// delete either observes the floor and is refused, or installs before it and
+	// is evicted by the sweep below.
+	floor := s.raiseFence(volumeID, claims.Fence)
+	evicted := s.evictSession(volumeID)
+	writeJSON(writer, http.StatusOK, map[string]any{"evicted": evicted, "fence": floor})
+}
+
+// raiseFence records max(fence) for the volume and returns the recorded floor.
+func (s *server) raiseFence(volumeID string, fence uint64) uint64 {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.fences[volumeID]
+	if fence > record.value {
+		record.value = fence
+	}
+	record.recordedAt = now
+	s.fences[volumeID] = record
+	if len(s.fences) > maximumFences {
+		oldestVolume, oldest := "", now
+		for candidateVolume, candidate := range s.fences {
+			if candidateVolume != volumeID && !candidate.recordedAt.After(oldest) {
+				oldest, oldestVolume = candidate.recordedAt, candidateVolume
+			}
+		}
+		if oldestVolume != "" {
+			log.Printf("portablefs-files: fence table is full; dropping the oldest floor for volume %s", oldestVolume)
+			delete(s.fences, oldestVolume)
+		}
+	}
+	return record.value
+}
+
+// evictSession retires a volume's live session unconditionally and reports
+// whether one was live.
+func (s *server) evictSession(volumeID string) bool {
+	s.mu.Lock()
+	session := s.sessions[volumeID]
+	if session == nil {
+		s.mu.Unlock()
+		return false
+	}
+	delete(s.sessions, volumeID)
+	stale := s.removeVolumeCursorsLocked(volumeID)
+	s.mu.Unlock()
+	closeCursors(stale)
+	closeSessionWhenIdle(session)
+	return true
+}
+
 func (s *server) handleEntries(writer http.ResponseWriter, request *http.Request) {
 	volumeID := request.PathValue("volume")
 	parentKey := request.URL.Query().Get("parent")
@@ -301,14 +437,20 @@ func (s *server) handleEntries(writer http.ResponseWriter, request *http.Request
 		}
 		return
 	}
-	if !s.authorize(writer, request, expectedClaims{
+	claims, ok := s.authorize(writer, request, expectedClaims{
 		Operation: "list", VolumeID: volumeID, PathKey: parentKey, Cursor: cursorToken,
 		KnownRevision: knownRevision, RetainedCursor: retainedCursor, Limit: uint64(limit),
-	}) {
+		AllowArchived: true,
+	})
+	if !ok {
 		return
 	}
 	if _, err := readonlyfs.DecodePath(parentKey); err != nil {
 		writeError(writer, http.StatusBadRequest, "invalid_path", "directory key is invalid")
+		return
+	}
+	if claims.Archived {
+		s.serveArchivedEntries(writer, request, claims, parentKey, cursorToken, knownRevision, retainedCursor, limit)
 		return
 	}
 	session, release := s.acquireSession(writer, volumeID)
@@ -400,11 +542,18 @@ func (s *server) handleContent(writer http.ResponseWriter, request *http.Request
 		writeError(writer, http.StatusBadRequest, "invalid_request", "content range is invalid")
 		return
 	}
-	if !s.authorize(writer, request, expectedClaims{Operation: mode, VolumeID: volumeID, PathKey: fileKey, Offset: offset, Length: length}) {
+	claims, ok := s.authorize(writer, request, expectedClaims{
+		Operation: mode, VolumeID: volumeID, PathKey: fileKey, Offset: offset, Length: length, AllowArchived: true,
+	})
+	if !ok {
 		return
 	}
 	if _, err := readonlyfs.DecodePath(fileKey); err != nil {
 		writeError(writer, http.StatusBadRequest, "invalid_path", "file key is invalid")
+		return
+	}
+	if claims.Archived {
+		s.serveArchivedContent(writer, request, claims, fileKey, mode, offset, length)
 		return
 	}
 	session, release := s.acquireSession(writer, volumeID)
@@ -664,6 +813,11 @@ func (s *server) sweep(stop <-chan struct{}) {
 					delete(s.cursors, token)
 				}
 			}
+			for volumeID, record := range s.fences {
+				if now.Sub(record.recordedAt) >= fenceRetention {
+					delete(s.fences, volumeID)
+				}
+			}
 			for volumeID, session := range s.sessions {
 				lastUsed := time.Unix(0, session.lastUsedUnix.Load())
 				if !now.Before(session.expiresAt) || now.Sub(lastUsed) >= sessionIdleTime || session.client.Err() != nil {
@@ -718,6 +872,20 @@ func closeSessionWhenIdle(session *volumeSession) {
 	}()
 }
 
+// fenceRule says how a route treats the fence claim. Every route states one, so
+// a fence-bearing token is never accepted by a route that would ignore it.
+type fenceRule uint8
+
+const (
+	fenceForbidden fenceRule = iota
+	fenceOptional
+	fenceRequired
+)
+
+// maximumAttemptBytes bounds the archive attempt claim before it reaches the
+// key grammar, which is the only thing that decides whether it is a UUID.
+const maximumAttemptBytes = 64
+
 type expectedClaims struct {
 	Operation      string
 	VolumeID       string
@@ -729,6 +897,8 @@ type expectedClaims struct {
 	BodySHA256     string
 	KnownRevision  string
 	RetainedCursor string
+	Fence          fenceRule
+	AllowArchived  bool
 }
 
 type tokenClaims struct {
@@ -746,45 +916,84 @@ type tokenClaims struct {
 	BodySHA256     string `json:"bodySha256"`
 	KnownRevision  string `json:"knownRevision"`
 	RetainedCursor string `json:"retainedCursor"`
+	Fence          uint64 `json:"fence"`
+	Archived       bool   `json:"archived"`
+	SealedEpoch    uint64 `json:"sealedEpoch"`
+	Attempt        string `json:"attempt"`
 }
 
-func (s *server) authorize(writer http.ResponseWriter, request *http.Request, expected expectedClaims) bool {
+func (s *server) authorize(writer http.ResponseWriter, request *http.Request, expected expectedClaims) (tokenClaims, bool) {
 	value := request.Header.Get("Authorization")
-	if !strings.HasPrefix(value, "Bearer ") || !verifyToken(s.requestKey, s.issuer, strings.TrimPrefix(value, "Bearer "), expected) {
+	if !strings.HasPrefix(value, "Bearer ") {
 		writeError(writer, http.StatusUnauthorized, "unauthorized", "valid request authorization is required")
-		return false
+		return tokenClaims{}, false
 	}
-	return true
+	claims, ok := verifyToken(s.requestKey, s.issuer, strings.TrimPrefix(value, "Bearer "), expected)
+	if !ok {
+		writeError(writer, http.StatusUnauthorized, "unauthorized", "valid request authorization is required")
+		return tokenClaims{}, false
+	}
+	return claims, true
 }
 
-func verifyToken(key ed25519.PublicKey, issuer, token string, expected expectedClaims) bool {
+// verifyToken returns the verified claims so that the routes whose behaviour is
+// selected by a claim rather than by a request parameter — the fence floor and
+// the archive addressing triple — read exactly what was signed.
+func verifyToken(key ed25519.PublicKey, issuer, token string, expected expectedClaims) (tokenClaims, bool) {
+	var claims tokenClaims
 	if len(token) > 64<<10 {
-		return false
+		return claims, false
 	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return false
+		return claims, false
 	}
 	header, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil || string(header) != `{"alg":"EdDSA","typ":"JWT","v":1}` {
-		return false
+		return claims, false
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || !ed25519.Verify(key, []byte(parts[0]+"."+parts[1]), signature) {
-		return false
+		return claims, false
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return false
+		return claims, false
 	}
-	var claims tokenClaims
 	if json.Unmarshal(payload, &claims) != nil {
-		return false
+		return tokenClaims{}, false
 	}
 	now := time.Now().Unix()
-	return claims.Audience == "portablefs-files" && claims.Issuer == issuer && claims.Expires > now && claims.Expires <= now+60 && claims.Issued <= now+5 && claims.Issued >= now-60 &&
+	bound := claims.Audience == "portablefs-files" && claims.Issuer == issuer && claims.Expires > now && claims.Expires <= now+60 && claims.Issued <= now+5 && claims.Issued >= now-60 &&
 		claims.Operation == expected.Operation && claims.VolumeID == expected.VolumeID && claims.PathKey == expected.PathKey && claims.Cursor == expected.Cursor && claims.Limit == expected.Limit && claims.Offset == expected.Offset && claims.Length == expected.Length &&
 		claims.BodySHA256 == expected.BodySHA256 && claims.KnownRevision == expected.KnownRevision && claims.RetainedCursor == expected.RetainedCursor
+	if !bound || !fenceClaimBound(claims.Fence, expected.Fence) || !archiveClaimsBound(claims, expected.AllowArchived) {
+		return tokenClaims{}, false
+	}
+	return claims, true
+}
+
+func fenceClaimBound(fence uint64, rule fenceRule) bool {
+	switch rule {
+	case fenceRequired:
+		return fence > 0
+	case fenceOptional:
+		return true
+	default:
+		return fence == 0
+	}
+}
+
+// archiveClaimsBound holds the archive addressing triple together: archived
+// mode is served only where the route allows it, and only for a token that also
+// names the sealed epoch and attempt it is to be served from. A token that is
+// not archived may carry neither, so an addressing claim can never be smuggled
+// past a live-mode route.
+func archiveClaimsBound(claims tokenClaims, allowed bool) bool {
+	if !claims.Archived {
+		return claims.SealedEpoch == 0 && claims.Attempt == ""
+	}
+	return allowed && claims.SealedEpoch > 0 && claims.Attempt != "" && len(claims.Attempt) <= maximumAttemptBytes
 }
 
 func loadRequestPublicKey(path string) (ed25519.PublicKey, error) {

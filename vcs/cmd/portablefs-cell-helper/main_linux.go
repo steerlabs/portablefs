@@ -47,6 +47,8 @@ func run() error {
 	systemctl := flag.String("systemctl", "/usr/bin/systemctl", "pinned systemctl executable")
 	systemdRun := flag.String("systemd-run", "/usr/bin/systemd-run", "pinned systemd-run executable")
 	sysusers := flag.String("systemd-sysusers", "/usr/bin/systemd-sysusers", "pinned systemd-sysusers executable")
+	archiveCredentials := flag.String("archive-credentials", "", "root-provisioned archive-store credentials file (default /etc/portablefs/cells/<cell>-archive.env)")
+	archiveChunkSize := flag.Uint("archive-chunk-size", 8<<20, "archive chunk size in bytes (power of two)")
 	planLifetime := flag.Duration("plan-max-lifetime", 15*time.Minute, "maximum accepted cell-plan lifetime")
 	clockSkew := flag.Duration("clock-skew", 5*time.Second, "maximum authenticated clock disagreement")
 	flag.Parse()
@@ -70,10 +72,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if *archiveChunkSize > 16<<20 {
+		return fmt.Errorf("archive chunk size %d exceeds the 16 MiB bound", *archiveChunkSize)
+	}
 	host, err := cellhost.New(cellhost.Config{
 		CellID: *cellID, CellRoot: *cellRoot, ConfigRoot: *configRoot, StateRoot: *stateRoot,
 		SystemdUnitRoot: *systemdRoot, SysusersRoot: *sysusersRoot, XFSQuotaBinary: *xfsQuota,
 		SystemctlBinary: *systemctl, SystemdRunBinary: *systemdRun, SysusersBinary: *sysusers,
+		ArchiveCredentialsPath: *archiveCredentials, ArchiveChunkSizeBytes: uint32(*archiveChunkSize),
 	})
 	if err != nil {
 		return err

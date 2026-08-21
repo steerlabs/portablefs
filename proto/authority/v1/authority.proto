@@ -153,6 +153,10 @@ message Response {
   uint64 fskit_repair_retry_sequence = 52;
   reserved 26, 33, 38;
   reserved "visibility", "write_transaction";
+  // restore_detail is present with FAILURE_CLASS_RESTORE and gives the stable
+  // retry/operator reason without overloading errno (blocked, corrupt,
+  // recall_deadline, or protocol).
+  string restore_detail = 55;
 
   oneof body {
     HelloReply hello = 10;
@@ -256,6 +260,10 @@ enum FailureClass {
   // the parent lock held by that callback. Callback-serialized frontends never
   // receive this class.
   FAILURE_CLASS_VISIBILITY_RETRY = 6;
+  // RESTORE is a definite, non-fatal refusal while sealed base content cannot
+  // be recalled, recall admission is saturated, or corruption has made the
+  // volume's content uniformly unavailable. The session and epoch stay live.
+  FAILURE_CLASS_RESTORE = 7;
 }
 
 // RoutesMismatch names both sides of a routing-topology disagreement. All
