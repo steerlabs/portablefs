@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-[[ $# == 2 && $1 == /* && -d $1 && ( $2 == manager || $2 == cell ) ]] || {
-  echo "usage: $0 /absolute/hosted-release-directory manager|cell" >&2
+[[ $# == 2 && $1 == /* && -d $1 && ( $2 == manager || $2 == cell || $2 == manager-cell ) ]] || {
+  echo "usage: $0 /absolute/hosted-release-directory manager|cell|manager-cell" >&2
   exit 64
 }
 [[ $(id -u) == 0 ]] || {
@@ -13,7 +13,7 @@ set -euo pipefail
 stage=$1
 role=$2
 script_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-release_id=$($script_root/verify-hosted-release.sh "$stage")
+release_id=$("$script_root/verify-hosted-release.sh" "$stage")
 release_root=/opt/portablefs/releases
 release_path=$release_root/$release_id
 current=/opt/portablefs/current
@@ -35,7 +35,7 @@ else
   "$script_root/verify-hosted-release.sh" "$incoming" >/dev/null
   sync -f "$incoming"
   mv -T -- "$incoming" "$release_path"
-	sync -f "$release_root"
+  sync -f "$release_root"
   trap - EXIT
 fi
 
@@ -61,18 +61,81 @@ migration_swapped=0
 
 case "$role" in
   manager)
+    has_manager=1
+    has_cell=0
+    helper_units=()
+    agent_units=()
     units=(portablefs-manager.service)
     ;;
   cell)
+    has_manager=0
+    has_cell=1
     mapfile -t helper_units < <(systemctl list-units --all --plain --no-legend 'portablefs-cell-helper@*.service' | awk '{print $1}')
     mapfile -t agent_units < <(systemctl list-units --all --plain --no-legend 'portablefs-cell-agent@*.service' | awk '{print $1}')
     units=(portablefs-cell-agent@.service portablefs-cell-helper@.service portablefs-authority@.socket portablefs-authority@.service portablefs-archiver@.service portablefs-hydrator@.service)
     ;;
+  manager-cell)
+    has_manager=1
+    has_cell=1
+    mapfile -t helper_units < <(systemctl list-units --all --plain --no-legend 'portablefs-cell-helper@*.service' | awk '{print $1}')
+    mapfile -t agent_units < <(systemctl list-units --all --plain --no-legend 'portablefs-cell-agent@*.service' | awk '{print $1}')
+    units=(portablefs-manager.service portablefs-cell-agent@.service portablefs-cell-helper@.service portablefs-authority@.socket portablefs-authority@.service portablefs-archiver@.service portablefs-hydrator@.service)
+    ;;
 esac
 
+unit_link_matches_release() {
+  local unit=$1 link target resolved
+  link=/etc/systemd/system/$unit
+  [[ -L $link ]] || return 1
+  target=$(readlink "$link")
+  [[ $target == "/opt/portablefs/current/systemd/$unit" ]] || return 1
+  resolved=$(readlink -f "$link" 2>/dev/null || true)
+  [[ $resolved == "$release_path/systemd/$unit" ]]
+}
+
+running_unit_matches_release() {
+  local unit=$1 pid executable
+  systemctl --quiet is-active "$unit" || return 1
+  pid=$(systemctl show --property=MainPID --value "$unit")
+  [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+  executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  [[ $executable == "$release_path"/* ]]
+}
+
+# Idempotence is role-specific and includes the running process provenance.
+# On a shared Manager/cell host the Manager activation advances `current`, so
+# unit links alone immediately resolve through the new release even while the
+# old cell agent/helper processes are still executing.
+already_active=1
+[[ $previous == "$release_path" ]] || already_active=0
 for unit in "${units[@]}"; do
-  if [[ -e /etc/systemd/system/$unit || -L /etc/systemd/system/$unit ]]; then
-    cp -a --dereference "/etc/systemd/system/$unit" "$rollback_dir/$unit"
+  unit_link_matches_release "$unit" || already_active=0
+done
+if ((has_manager)); then
+  running_unit_matches_release portablefs-manager.service || already_active=0
+fi
+if ((has_cell)); then
+  for unit in "${helper_units[@]}" "${agent_units[@]}"; do
+    [[ -z $unit ]] || running_unit_matches_release "$unit" || already_active=0
+  done
+fi
+if ((already_active)); then
+  echo "$release_id"
+  exit 0
+fi
+
+for unit in "${units[@]}"; do
+  link=/etc/systemd/system/$unit
+  if [[ -L $link ]]; then
+    target=$(readlink "$link")
+    [[ $target == "/opt/portablefs/current/systemd/$unit" ]] || {
+      echo "managed unit has an unexpected target: $unit -> $target" >&2
+      exit 65
+    }
+    printf '%s\n' "$target" >"$rollback_dir/$unit.target"
+  elif [[ -e $link ]]; then
+    echo "managed unit is not a symlink: $unit" >&2
+    exit 65
   else
     : >"$rollback_dir/$unit.absent"
   fi
@@ -88,8 +151,14 @@ activate_link() {
 activation_swapped=0
 restore_previous() {
   trap - ERR
-  if ((migration_swapped)); then
+  if ((has_cell)); then
+    ((${#agent_units[@]} == 0)) || systemctl stop "${agent_units[@]}" || true
+    ((${#helper_units[@]} == 0)) || systemctl stop "${helper_units[@]}" || true
+  fi
+  if ((has_manager)); then
     systemctl stop portablefs-manager.service || true
+  fi
+  if ((migration_swapped)); then
     mv -- "$manager_state" "$migration_candidate"
     mv -- "$migration_backup" "$manager_state"
     sync -f "$manager_state"
@@ -106,47 +175,54 @@ restore_previous() {
     fi
   fi
   for unit in "${units[@]}"; do
-    if [[ -f $rollback_dir/$unit ]]; then
-      install -o root -g root -m 0644 "$rollback_dir/$unit" "/etc/systemd/system/$unit"
+    link=/etc/systemd/system/$unit
+    if [[ -f $rollback_dir/$unit.target ]]; then
+      target=$(<"$rollback_dir/$unit.target")
+      temporary=/etc/systemd/system/.$unit.rollback.$$
+      ln -s -- "$target" "$temporary"
+      mv -Tf -- "$temporary" "$link"
     else
-      rm -f -- "/etc/systemd/system/$unit"
+      rm -f -- "$link"
     fi
   done
   sync -f /etc/systemd/system
   systemctl daemon-reload || true
-  case "$role" in
-    manager) systemctl restart portablefs-manager.service || true ;;
-    cell)
-      ((${#helper_units[@]} == 0)) || systemctl restart "${helper_units[@]}" || true
-      ((${#agent_units[@]} == 0)) || systemctl restart "${agent_units[@]}" || true
-      ;;
-  esac
+  if ((has_manager)); then
+    systemctl restart portablefs-manager.service || true
+  fi
+  if ((has_cell)); then
+    ((${#helper_units[@]} == 0)) || systemctl restart "${helper_units[@]}" || true
+    ((${#agent_units[@]} == 0)) || systemctl restart "${agent_units[@]}" || true
+  fi
 }
 on_activation_error() {
-  status=$?
+  failure_code=$?
   restore_previous
   echo "hosted release activation failed; prior release and units restored" >&2
-  exit "$status"
+  exit "$failure_code"
 }
 trap on_activation_error ERR
 
-case "$role" in
-  manager)
-    if systemctl --quiet is-active portablefs-manager.service; then
-      systemctl stop portablefs-manager.service
-      ! systemctl --quiet is-active portablefs-manager.service
+if ((has_cell)); then
+  ((${#agent_units[@]} == 0)) || systemctl stop "${agent_units[@]}"
+  ((${#helper_units[@]} == 0)) || systemctl stop "${helper_units[@]}"
+  for unit in "${agent_units[@]}" "${helper_units[@]}"; do
+    [[ -n $unit ]] || continue
+    if systemctl --quiet is-active "$unit"; then
+      echo "$unit remained active after stop" >&2
+      false
     fi
-    ;;
-  cell)
-    ((${#agent_units[@]} == 0)) || systemctl stop "${agent_units[@]}"
-    ((${#helper_units[@]} == 0)) || systemctl stop "${helper_units[@]}"
-	for unit in "${agent_units[@]}" "${helper_units[@]}"; do
-	  [[ -z $unit ]] || ! systemctl --quiet is-active "$unit"
-	done
-    ;;
-esac
+  done
+fi
+if ((has_manager)) && systemctl --quiet is-active portablefs-manager.service; then
+  systemctl stop portablefs-manager.service
+  if systemctl --quiet is-active portablefs-manager.service; then
+    echo "portablefs-manager.service remained active after stop" >&2
+    false
+  fi
+fi
 
-if [[ $role == manager && -f $manager_state ]]; then
+if ((has_manager)) && [[ -f $manager_state ]]; then
   state_schema=$(runuser --user portablefs-manager -- "$release_path/bin/portablefs-manager" state-version -state "$manager_state")
   case "$state_schema" in
     1)
@@ -191,21 +267,19 @@ verify_unit_release() {
   executable=$(readlink -f "/proc/$pid/exe")
   [[ $executable == "$release_path"/* ]]
 }
-case "$role" in
-  manager)
-    systemctl start portablefs-manager.service || failed=1
-    systemctl --quiet is-active portablefs-manager.service || failed=1
-    verify_unit_release portablefs-manager.service || failed=1
-    ;;
-  cell)
-    ((${#helper_units[@]} == 0)) || systemctl start "${helper_units[@]}" || failed=1
-    ((${#agent_units[@]} == 0)) || systemctl start "${agent_units[@]}" || failed=1
-    for unit in "${helper_units[@]}" "${agent_units[@]}"; do
-      [[ -z $unit ]] || systemctl --quiet is-active "$unit" || failed=1
-      [[ -z $unit ]] || verify_unit_release "$unit" || failed=1
-    done
-    ;;
-esac
+if ((has_manager)); then
+  systemctl start portablefs-manager.service || failed=1
+  systemctl --quiet is-active portablefs-manager.service || failed=1
+  verify_unit_release portablefs-manager.service || failed=1
+fi
+if ((has_cell)); then
+  ((${#helper_units[@]} == 0)) || systemctl start "${helper_units[@]}" || failed=1
+  ((${#agent_units[@]} == 0)) || systemctl start "${agent_units[@]}" || failed=1
+  for unit in "${helper_units[@]}" "${agent_units[@]}"; do
+    [[ -z $unit ]] || systemctl --quiet is-active "$unit" || failed=1
+    [[ -z $unit ]] || verify_unit_release "$unit" || failed=1
+  done
+fi
 
 ((failed == 0))
 
