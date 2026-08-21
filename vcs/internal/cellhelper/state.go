@@ -21,6 +21,7 @@ const (
 	helperStateVersionV1 uint32 = 1
 	helperStateVersion   uint32 = 2
 	maxHelperStateBytes         = 8 << 20
+	legacyPhaseRetire           = cellplan.VolumePhase("RETIRE")
 )
 
 // The v1 shapes are kept separate from the live structs. The rollout gate is
@@ -250,7 +251,7 @@ func validDigest(value string) bool {
 
 func validStoredPhase(phase cellplan.VolumePhase) bool {
 	switch phase {
-	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseRetire,
+	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, legacyPhaseRetire,
 		cellplan.PhaseArchive, cellplan.PhaseRestore, cellplan.PhaseDestroy:
 		return true
 	default:
@@ -260,7 +261,7 @@ func validStoredPhase(phase cellplan.VolumePhase) bool {
 
 func validStoredPhaseV1(phase cellplan.VolumePhase) bool {
 	switch phase {
-	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseRetire:
+	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, legacyPhaseRetire:
 		return true
 	default:
 		return false

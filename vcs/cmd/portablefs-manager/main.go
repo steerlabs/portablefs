@@ -46,6 +46,22 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "state-version" {
+		flags := flag.NewFlagSet("state-version", flag.ContinueOnError)
+		state := flags.String("state", "", "absolute manager state path")
+		if err := flags.Parse(os.Args[2:]); err != nil {
+			return err
+		}
+		if flags.NArg() != 0 || *state == "" {
+			return errors.New("state-version requires -state")
+		}
+		version, err := controlplane.StateFileVersion(*state)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(os.Stdout, version)
+		return err
+	}
 	if len(os.Args) > 1 && os.Args[1] == "migrate-state" {
 		flags := flag.NewFlagSet("migrate-state", flag.ContinueOnError)
 		from := flags.String("from", "", "absolute v1 manager state path")

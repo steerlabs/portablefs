@@ -463,6 +463,63 @@ func stateVersion(raw json.RawMessage) (uint32, error) {
 	return header.SchemaVersion, nil
 }
 
+// StateFileVersion validates a complete manager-state hash chain and reports
+// its one schema version. Activation uses this while the Manager is stopped so
+// the v1-to-v2 cutover is explicit and cannot race a writer.
+func StateFileVersion(path string) (uint32, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return 0, fmt.Errorf("%w: manager state path must be clean and absolute", ErrInvalid)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open manager state: %w", err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return 0, errors.New("manager state must be a regular file")
+	}
+	var schema uint32
+	_, _, err = readStoreChain(file, nil, func(envelope rawStoreEnvelope) error {
+		version, err := stateVersion(envelope.State)
+		if err != nil {
+			return err
+		}
+		if schema != 0 && schema != version {
+			return errors.New("manager state hash chain mixes schema versions")
+		}
+		switch version {
+		case 1:
+			state, err := decodeStrict[stateV1](envelope.State)
+			if err != nil {
+				return fmt.Errorf("decode v1 manager state: %w", err)
+			}
+			if err := state.Validate(); err != nil {
+				return fmt.Errorf("validate v1 manager state: %w", err)
+			}
+		case StateSchemaVersion:
+			state, err := decodeStrict[State](envelope.State)
+			if err != nil {
+				return fmt.Errorf("decode manager state: %w", err)
+			}
+			if err := state.Validate(); err != nil {
+				return fmt.Errorf("validate manager state: %w", err)
+			}
+		default:
+			return fmt.Errorf("manager state schema version %d is unsupported", version)
+		}
+		schema = version
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if schema == 0 {
+		return 0, errors.New("manager state contains no snapshot records")
+	}
+	return schema, nil
+}
+
 func decodeStrict[T any](raw []byte) (T, error) {
 	var value T
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -580,16 +637,32 @@ func migrateV1State(old stateV1) State {
 			LastAgentRelease: oldCell.LastAgentRelease, LastHelperRelease: oldCell.LastHelperRelease, Health: oldCell.Health, QuarantineReason: oldCell.QuarantineReason}
 	}
 	for id, oldVolume := range old.Volumes {
+		volumeState := oldVolume.State
+		archiveCycleStep := ""
+		deletionRequested := false
+		if oldVolume.State == legacyVolumeRetired {
+			// v1 RETIRED merely stopped serving and retained the placement
+			// forever. v2 has one deletion path with destroy and release proofs,
+			// so an old retired placement resumes directly at host-data destroy:
+			// its authority was already removed by the v1 RETIRE phase.
+			volumeState = VolumeDestroying
+			archiveCycleStep = "destroying"
+			deletionRequested = true
+		}
 		state.Volumes[id] = Volume{ID: oldVolume.ID, AuthorizationDomain: oldVolume.AuthorizationDomain, Owner: oldVolume.Owner,
 			ProductIssuer: oldVolume.ProductIssuer, ProductPublicKeyPEM: oldVolume.ProductPublicKeyPEM, QuotaBytes: oldVolume.QuotaBytes,
-			QuotaInodes: oldVolume.QuotaInodes, AuthorityEpoch: oldVolume.AuthorityGeneration, PlacementSequence: 1, State: oldVolume.State, Pool: PoolProduct,
+			QuotaInodes: oldVolume.QuotaInodes, AuthorityEpoch: oldVolume.AuthorityGeneration, PlacementSequence: 1, State: volumeState, Pool: PoolProduct,
 			Placement: &Placement{CellID: oldVolume.CellID, Sequence: 1, ProjectID: oldVolume.ProjectID, ServiceUID: oldVolume.ServiceUID,
 				ServiceGID: oldVolume.ServiceGID, ListenPort: oldVolume.ListenPort, AuthorityID: oldVolume.AuthorityID,
 				AuthorityServerName: oldVolume.AuthorityServerName, AuthorityCSRPEM: oldVolume.AuthorityCSRPEM,
 				AuthorityCertificatePEM: oldVolume.AuthorityCertificate, AuthorityCertExpires: oldVolume.AuthorityCertExpires,
 				PriorStrictFenced: oldVolume.PriorStrictFenced, StrictFenceEvidence: oldVolume.StrictFenceEvidence,
 				CreatedUnix: oldVolume.CreatedUnix, LastObservedUnix: oldVolume.LastObservedUnix},
+			ArchiveCycleStep: archiveCycleStep, DeletionRequested: deletionRequested,
 			QuarantineReason: oldVolume.QuarantineReason, CreatedUnix: oldVolume.CreatedUnix, UpdatedUnix: oldVolume.UpdatedUnix}
+		if deletionRequested {
+			terminateVolumeEnrollments(&state, id, "legacy retired volume cleanup", oldVolume.UpdatedUnix)
+		}
 	}
 	return state
 }

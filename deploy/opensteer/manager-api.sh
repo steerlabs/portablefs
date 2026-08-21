@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 get|get-operator VOLUME_ID | restart VOLUME_ID RELEASE_ID | strict-fence VOLUME_ID RELEASE_ID EVIDENCE_SHA256 | wait-ready VOLUME_ID MIN_GENERATION TIMEOUT_SECONDS" >&2
+  echo "usage: $0 get|get-operator VOLUME_ID | restart VOLUME_ID RELEASE_ID | strict-fence VOLUME_ID RELEASE_ID EVIDENCE_SHA256 | wait-ready VOLUME_ID MIN_GENERATION TIMEOUT_SECONDS | wait-destroyed VOLUME_ID TIMEOUT_SECONDS" >&2
   exit 64
 }
 
@@ -107,6 +107,25 @@ case "$command" in
       sleep 2
     done
     echo "timed out waiting for volume $volume_id to reach READY generation $minimum_generation" >&2
+    exit 75
+    ;;
+  wait-destroyed)
+    [[ $# == 3 && $3 =~ ^[1-9][0-9]*$ ]] || usage
+    deadline=$((SECONDS + $3))
+    while ((SECONDS < deadline)); do
+      result=$(request product GET "/v1/volumes/$volume_id")
+      state=$(jq -r '.state' <<<"$result")
+      if [[ $state == DESTROYED ]]; then
+        printf '%s\n' "$result"
+        exit 0
+      fi
+      [[ $state == DESTROYING ]] || {
+        printf '%s\n' "$result" >&2
+        exit 69
+      }
+      sleep 2
+    done
+    echo "timed out waiting for volume $volume_id to reach DESTROYED" >&2
     exit 75
     ;;
   *) usage ;;

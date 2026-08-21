@@ -73,7 +73,6 @@ const (
 	VolumeProvisioning VolumeState = "PROVISIONING"
 	VolumeReady        VolumeState = "READY"
 	VolumeFencing      VolumeState = "FENCING"
-	VolumeRetired      VolumeState = "RETIRED"
 	VolumeQuarantined  VolumeState = "QUARANTINED"
 	VolumeArchiving    VolumeState = "ARCHIVING"
 	VolumeArchived     VolumeState = "ARCHIVED"
@@ -380,11 +379,6 @@ type RestartVolumeRequest struct {
 type ConfirmStrictFenceRequest struct {
 	VolumeID       string `json:"volume_id"`
 	EvidenceSHA256 string `json:"evidence_sha256"`
-}
-
-type RetireVolumeRequest struct {
-	VolumeID string `json:"volume_id"`
-	Reason   string `json:"reason"`
 }
 
 type IssueMountRequest struct {
@@ -804,7 +798,7 @@ func validateVolume(id string, volume Volume, cells map[string]Cell) error {
 		}
 	}
 	switch volume.State {
-	case VolumeProvisioning, VolumeReady, VolumeFencing, VolumeRetired, VolumeQuarantined:
+	case VolumeProvisioning, VolumeReady, VolumeFencing, VolumeQuarantined:
 		if volume.Placement == nil || volume.ArchiveCycleStep != "" || volume.ArchiveAttempt != "" || volume.PendingSeal != nil ||
 			volume.RestoreStep != "" || volume.WakeRequested || volume.DeletionRequested || volume.DestroyedUnix != 0 {
 			return fmt.Errorf("%w: ordinary volume cursor", ErrInvalid)
