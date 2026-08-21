@@ -94,18 +94,15 @@ prepare_host() {
 }
 
 activate_host() {
-  local instance=$1 role=$2 unit command
+  local instance=$1 role=$2 command
   case "$role" in
-    manager) unit=portablefs-manager.service ;;
-    cell) unit=portablefs-cell-agent@.service ;;
+    manager | cell | manager-cell) ;;
     *) exit 64 ;;
   esac
-  command="set -euo pipefail
-current=\$(readlink -f /opt/portablefs/current 2>/dev/null || true)
-unit=\$(readlink -f /etc/systemd/system/$unit 2>/dev/null || true)
-if [[ \$current != /opt/portablefs/releases/$release_id || \$unit != /opt/portablefs/releases/$release_id/systemd/$unit ]]; then
-  sudo \"\$HOME/$remote_stage/activate-hosted-release.sh\" \"\$HOME/$remote_stage/$release_base\" $role
-fi"
+  # The activation script owns the role-specific idempotence proof. A shared
+  # Manager/cell host cannot use the global `current` link as that proof: the
+  # Manager advances it before the still-running cell process is restarted.
+  command="set -euo pipefail; sudo \"\$HOME/$remote_stage/activate-hosted-release.sh\" \"\$HOME/$remote_stage/$release_base\" $role"
   ssh_run "$instance" "$command"
 }
 
@@ -168,10 +165,10 @@ for volume_id in "${volume_ids[@]}"; do
     PROVISIONING)
       minimum_generations[$volume_id]=$generation
       ;;
-    RETIRED)
+    RETIRED | DESTROYING | DESTROYED)
       # The one-time v1 migration turns RETIRED into v2 DESTROYING at the
-      # host-data cursor. Include it in the release so the new helper produces
-      # the destroy and release proofs instead of retaining its allocation.
+      # host-data cursor. DESTROYING/DESTROYED make a retry after activation
+      # resumable without retaining the old allocation or repeating work.
       cleanup_volumes[$volume_id]=1
       ;;
     *)
@@ -189,8 +186,12 @@ if ((restart_count > 0)); then
 fi
 
 echo "Activating $release_id on the Manager and cell control processes"
-activate_host "$OPENSTEER_MANAGER_INSTANCE" manager
-activate_host "$OPENSTEER_CELL_INSTANCE" cell
+if [[ $OPENSTEER_MANAGER_INSTANCE == "$OPENSTEER_CELL_INSTANCE" ]]; then
+  activate_host "$OPENSTEER_MANAGER_INSTANCE" manager-cell
+else
+  activate_host "$OPENSTEER_MANAGER_INSTANCE" manager
+  activate_host "$OPENSTEER_CELL_INSTANCE" cell
+fi
 
 if ((restart_count > 0)); then
   for volume_id in "${volume_ids[@]}"; do
