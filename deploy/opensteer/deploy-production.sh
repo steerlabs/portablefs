@@ -137,7 +137,7 @@ if [[ $OPENSTEER_CELL_INSTANCE != "$OPENSTEER_MANAGER_INSTANCE" ]]; then
   prepare_host "$OPENSTEER_CELL_INSTANCE" cell
 fi
 
-declare -A volume_states=() minimum_generations=() restart_volumes=()
+declare -A volume_states=() minimum_generations=() restart_volumes=() cleanup_volumes=()
 restart_count=0
 for volume_id in "${volume_ids[@]}"; do
   volume=$(manager_call get "$volume_id")
@@ -161,6 +161,12 @@ for volume_id in "${volume_ids[@]}"; do
       ;;
     PROVISIONING)
       minimum_generations[$volume_id]=$generation
+      ;;
+    RETIRED)
+      # The one-time v1 migration turns RETIRED into v2 DESTROYING at the
+      # host-data cursor. Include it in the release so the new helper produces
+      # the destroy and release proofs instead of retaining its allocation.
+      cleanup_volumes[$volume_id]=1
       ;;
     *)
       echo "volume $volume_id is in non-deployable state $state" >&2
@@ -194,7 +200,12 @@ if ((restart_count > 0)); then
     [[ -n ${restart_volumes[$volume_id]:-} ]] || continue
     volume=$(manager_call get "$volume_id")
     state=$(jq -r '.state' <<<"$volume")
-    if [[ $state == FENCING ]]; then
+    if [[ -n ${cleanup_volumes[$volume_id]:-} ]]; then
+      [[ $state == DESTROYING || $state == DESTROYED ]] || {
+        echo "retired volume $volume_id entered unexpected migrated state $state" >&2
+        exit 69
+      }
+    elif [[ $state == FENCING ]]; then
       cell_call wait-absent "$volume_id" 300 >/dev/null
       manager_call strict-fence "$volume_id" "$release_id" "$evidence_sha" >/dev/null
     elif [[ $state != PROVISIONING ]]; then
@@ -205,6 +216,10 @@ if ((restart_count > 0)); then
 
   for volume_id in "${volume_ids[@]}"; do
     [[ -n ${restart_volumes[$volume_id]:-} ]] || continue
+    if [[ -n ${cleanup_volumes[$volume_id]:-} ]]; then
+      manager_call wait-destroyed "$volume_id" 300 >"$evidence_dir/destroyed-volume-$volume_id.json"
+      continue
+    fi
     manager_call wait-ready "$volume_id" "${minimum_generations[$volume_id]}" 300 >"$evidence_dir/ready-volume-$volume_id.json"
     cell_call wait-release "$volume_id" "$release_id" 300 >"$evidence_dir/authority-release-$volume_id.json"
   done

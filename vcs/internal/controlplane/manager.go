@@ -346,24 +346,6 @@ func (manager *Manager) ConfirmStrictMountsFenced(requestID string, request Conf
 	})
 }
 
-func (manager *Manager) RetireVolume(requestID string, request RetireVolumeRequest) (VolumeView, error) {
-	if !cellplan.ValidID(request.VolumeID) || strings.TrimSpace(request.Reason) == "" {
-		return VolumeView{}, ErrInvalid
-	}
-	return manager.updateVolume(requestID, "retire-volume", request, func(state *State, volume *Volume, now int64) error {
-		if volume.State == VolumeRetired {
-			return ErrConflict
-		}
-		volume.State = VolumeRetired
-		volume.UpdatedUnix = now
-		terminateVolumeEnrollments(state, volume.ID, "volume retired", now)
-		cell := state.Cells[volume.Placement.CellID]
-		manager.bumpPlan(&cell, now)
-		state.Cells[cell.ID] = cell
-		return nil
-	})
-}
-
 func (manager *Manager) ArchiveVolume(requestID string, request ArchiveVolumeRequest) (VolumeView, error) {
 	if !cellplan.ValidID(request.VolumeID) {
 		return VolumeView{}, ErrInvalid
@@ -456,7 +438,7 @@ func (manager *Manager) WakeVolume(requestID string, request WakeVolumeRequest) 
 			return nil
 		case VolumeRestoring, VolumeReady:
 			return nil
-		case VolumeProvisioning, VolumeFencing, VolumeRetired, VolumeQuarantined, VolumeDestroying, VolumeDestroyed:
+		case VolumeProvisioning, VolumeFencing, VolumeQuarantined, VolumeDestroying, VolumeDestroyed:
 			return ErrConflict
 		default:
 			return ErrInvalid
@@ -532,7 +514,7 @@ func (manager *Manager) DestroyVolume(requestID string, request DestroyVolumeReq
 			}
 		case VolumeDestroyed:
 			return nil
-		case VolumeProvisioning, VolumeFencing, VolumeRetired, VolumeQuarantined, VolumeArchiving, VolumeRestoring:
+		case VolumeProvisioning, VolumeFencing, VolumeQuarantined, VolumeArchiving, VolumeRestoring:
 			return ErrConflict
 		default:
 			return ErrInvalid
@@ -606,8 +588,6 @@ func (manager *Manager) updateVolume(requestID, operation string, request any, a
 		case RestartVolumeRequest:
 			volumeID = typed.VolumeID
 		case ConfirmStrictFenceRequest:
-			volumeID = typed.VolumeID
-		case RetireVolumeRequest:
 			volumeID = typed.VolumeID
 		case ArchiveVolumeRequest:
 			volumeID = typed.VolumeID
@@ -692,7 +672,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 				cell.Health = CellQuarantined
 				cell.QuarantineReason = "cell reported an unassigned volume"
 				for id, assigned := range state.Volumes {
-					if assigned.Placement != nil && assigned.Placement.CellID == cell.ID && assigned.State != VolumeRetired {
+					if assigned.Placement != nil && assigned.Placement.CellID == cell.ID {
 						manager.quarantineVolume(state, &assigned, "cell reported an unassigned volume", now)
 						state.Volumes[id] = assigned
 					}
@@ -927,7 +907,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 				default:
 					return nil, ErrInvalid
 				}
-			case VolumeRetired, VolumeQuarantined:
+			case VolumeQuarantined:
 			case VolumeDestroyed:
 			default:
 				return nil, ErrInvalid
@@ -1047,8 +1027,6 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 				}
 			case VolumeFencing, VolumeQuarantined:
 				phase = cellplan.PhaseFence
-			case VolumeRetired:
-				phase = cellplan.PhaseRetire
 			case VolumeArchiving:
 				phase = cellplan.PhaseArchive
 			case VolumeArchived:
@@ -1103,7 +1081,7 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 					entry.RestoreFrom = restoreSource(*volume.Archive)
 				case cellplan.PhaseRelease:
 					entry.ReleaseProof = &cellplan.ReleaseProof{PlacementSequence: placement.Sequence, AuthorityEpoch: volume.AuthorityEpoch, DestroyProofSHA256: placement.DestroyProofSHA256}
-				case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseRetire, cellplan.PhaseDestroy:
+				case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseDestroy:
 				default:
 					return fmt.Errorf("%w: cell plan phase", ErrInvalid)
 				}
@@ -1870,7 +1848,7 @@ func pruneVolumeEnrollments(state *State, volumeID string) {
 
 func pruneVolumeReceipts(state *State, volumeID string) {
 	volumeViewOperations := map[string]struct{}{
-		"create-volume": {}, "restart-volume": {}, "confirm-strict-fence": {}, "retire-volume": {},
+		"create-volume": {}, "restart-volume": {}, "confirm-strict-fence": {},
 		"archive-volume": {}, "wake-volume": {}, "destroy-volume": {}, "retry-archive-verification": {},
 	}
 	mountOperations := map[string]struct{}{"issue-mount": {}, "reauthorize-mount": {}}

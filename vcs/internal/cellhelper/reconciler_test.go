@@ -59,7 +59,7 @@ func (host *scriptedHost) Observe(_ context.Context, _ cellplan.VolumePlan, _ As
 func (host *fakeHost) Observe(_ context.Context, plan cellplan.VolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
 	host.observes = append(host.observes, plan)
 	return controlplane.VolumeObservation{
-		Provisioned: plan.Phase != cellplan.PhaseRetire, AuthorityRunning: plan.Phase == cellplan.PhaseServe,
+		Provisioned: true, AuthorityRunning: plan.Phase == cellplan.PhaseServe,
 		AuthorityAbsent: plan.Phase == cellplan.PhaseFence && host.absent,
 	}, HostUpdate{}
 }
@@ -67,7 +67,7 @@ func (host *fakeHost) Observe(_ context.Context, plan cellplan.VolumePlan, _ Ass
 func (host *fakeHost) Apply(_ context.Context, plan cellplan.VolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
 	host.calls = append(host.calls, plan)
 	return controlplane.VolumeObservation{
-		Provisioned: plan.Phase != cellplan.PhaseRetire, AuthorityRunning: plan.Phase == cellplan.PhaseServe,
+		Provisioned: true, AuthorityRunning: plan.Phase == cellplan.PhaseServe,
 		AuthorityAbsent: plan.Phase == cellplan.PhaseFence && host.absent,
 	}, HostUpdate{}
 }

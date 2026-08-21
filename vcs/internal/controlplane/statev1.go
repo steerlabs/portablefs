@@ -15,6 +15,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/productauth"
 )
 
+const legacyVolumeRetired VolumeState = "RETIRED"
+
 type stateV1 struct {
 	SchemaVersion              uint32                               `json:"schema_version"`
 	Cells                      map[string]cellV1                    `json:"cells"`
@@ -133,7 +135,7 @@ func (state stateV1) Validate() error {
 			return fmt.Errorf("%w: v1 volume %q", ErrInvalid, id)
 		}
 		switch volume.State {
-		case VolumeProvisioning, VolumeReady, VolumeFencing, VolumeRetired, VolumeQuarantined:
+		case VolumeProvisioning, VolumeReady, VolumeFencing, legacyVolumeRetired, VolumeQuarantined:
 		default:
 			return fmt.Errorf("%w: v1 volume state", ErrInvalid)
 		}

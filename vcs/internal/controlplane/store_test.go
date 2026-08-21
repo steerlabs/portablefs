@@ -30,7 +30,7 @@ func TestMigrateStateV1ToV2IsExplicitValidatedAndNonDestructive(t *testing.T) {
 	legacy.Volumes[volumeID] = volumeV1{ID: volumeID, AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "product",
 		ProductPublicKeyPEM: "product-key", CellID: cellID, QuotaBytes: 1 << 30, QuotaInodes: 100_000, ProjectID: 10000,
 		ServiceUID: 200000, ServiceGID: 200000, ListenPort: 20000, AuthorityID: endpoint, AuthorityServerName: endpoint,
-		AuthorityGeneration: 7, State: VolumeRetired, CreatedUnix: 100, UpdatedUnix: 100}
+		AuthorityGeneration: 7, State: legacyVolumeRetired, CreatedUnix: 100, UpdatedUnix: 100}
 	stateJSON, err := json.Marshal(legacy)
 	if err != nil {
 		t.Fatal(err)
@@ -49,6 +49,9 @@ func TestMigrateStateV1ToV2IsExplicitValidatedAndNonDestructive(t *testing.T) {
 		t.Fatal(err)
 	}
 	originalDigest := sha256.Sum256(bytes)
+	if version, err := StateFileVersion(from); err != nil || version != 1 {
+		t.Fatalf("StateFileVersion(v1) = %d, %v", version, err)
+	}
 	if store, err := OpenStore(from); store != nil || err == nil || !strings.Contains(err.Error(), "migrate-state") {
 		if store != nil {
 			_ = store.Close()
@@ -57,6 +60,9 @@ func TestMigrateStateV1ToV2IsExplicitValidatedAndNonDestructive(t *testing.T) {
 	}
 	if err := MigrateStateV1ToV2(from, to); err != nil {
 		t.Fatal(err)
+	}
+	if version, err := StateFileVersion(to); err != nil || version != StateSchemaVersion {
+		t.Fatalf("StateFileVersion(v2) = %d, %v", version, err)
 	}
 	if err := MigrateStateV1ToV2(from, to); err == nil {
 		t.Fatal("migration overwrote an existing v2 target")
@@ -75,9 +81,9 @@ func TestMigrateStateV1ToV2IsExplicitValidatedAndNonDestructive(t *testing.T) {
 	defer store.Close()
 	if err := store.View(func(state State) error {
 		volume := state.Volumes[volumeID]
-		if state.SchemaVersion != 2 || state.Cells[cellID].Pool != PoolProduct || volume.State != VolumeRetired || volume.AuthorityEpoch != 7 ||
+		if state.SchemaVersion != 2 || state.Cells[cellID].Pool != PoolProduct || volume.State != VolumeDestroying || volume.AuthorityEpoch != 7 ||
 			volume.PlacementSequence != 1 || volume.Placement == nil || volume.Placement.Sequence != 1 || volume.Placement.AuthorityServerName != endpoint ||
-			volume.Placement.UsedBytes != 0 || volume.Placement.PendingBytes != 0 {
+			volume.Placement.UsedBytes != 0 || volume.Placement.PendingBytes != 0 || !volume.DeletionRequested || volume.ArchiveCycleStep != "destroying" {
 			t.Fatalf("migrated state = %+v", state)
 		}
 		return state.Validate()

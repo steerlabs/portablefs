@@ -194,20 +194,6 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			}
 			return handler.Manager.ConfirmStrictMountsFenced(idempotencyKey(request), body)
 		})
-	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "retire" && request.Method == http.MethodPost:
-		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
-			var body RetireVolumeRequest
-			if err := decodeJSON(request, &body); err != nil {
-				return nil, err
-			}
-			if body.VolumeID != parts[2] {
-				return nil, ErrInvalid
-			}
-			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
-				return nil, err
-			}
-			return handler.Manager.RetireVolume(idempotencyKey(request), body)
-		})
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "archive" && request.Method == http.MethodPost:
 		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
 			var body ArchiveVolumeRequest
