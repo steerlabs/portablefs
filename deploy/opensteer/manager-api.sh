@@ -93,7 +93,7 @@ case "$command" in
     minimum_generation=$3
     deadline=$((SECONDS + $4))
     while ((SECONDS < deadline)); do
-      result=$(request product GET "/v1/volumes/$volume_id")
+      result=$(request operator GET "/v1/volumes/$volume_id")
       state=$(jq -r '.state' <<<"$result")
       generation=$(jq -r '.authority_generation' <<<"$result")
       if [[ $state == READY && $generation =~ ^[0-9]+$ ]] && ((generation >= minimum_generation)); then
@@ -113,7 +113,7 @@ case "$command" in
     [[ $# == 3 && $3 =~ ^[1-9][0-9]*$ ]] || usage
     deadline=$((SECONDS + $3))
     while ((SECONDS < deadline)); do
-      result=$(request product GET "/v1/volumes/$volume_id")
+      result=$(request operator GET "/v1/volumes/$volume_id")
       state=$(jq -r '.state' <<<"$result")
       if [[ $state == DESTROYED ]]; then
         printf '%s\n' "$result"
