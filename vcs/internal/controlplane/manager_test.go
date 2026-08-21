@@ -1174,37 +1174,42 @@ func TestManagerReleaseUpgradeAdvancesTheSignedPlanGeneration(t *testing.T) {
 	}
 }
 
-func TestCellPlanVersionRequiresDurableAgentAndHelperCapability(t *testing.T) {
+func TestCellPlanIsV2WithDestroyPhaseAndNoRecordedCapabilities(t *testing.T) {
 	h := newManagerHarness(t)
-	cell, err := h.manager.RegisterCell("version-gate", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+	cell, err := h.manager.RegisterCell("v2-plan", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan := verifiedPlan(t, h.manager, cell.ID, *h.now); plan.Version != cellplan.VersionV1 {
-		t.Fatalf("unobserved plan version = %d", plan.Version)
+	prepareCellForAdmission(t, h, cell)
+	volume, err := h.manager.CreateVolume("create-destroying", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 10_000,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, test := range []struct {
-		name          string
-		agent, helper []uint32
-		want          uint32
-	}{
-		{name: "agent-only", agent: []uint32{1, 2}, helper: []uint32{1}, want: 1},
-		{name: "both", agent: []uint32{1, 2}, helper: []uint32{1, 2}, want: 2},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
-			observed, err := h.manager.ObserveCell("version-"+test.name, CellObservation{CellID: cell.ID, PlanGeneration: plan.Generation,
-				ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent", HelperReleaseID: "helper", ObservedUnix: h.now.Unix(),
-				PlanVersions: test.agent, HelperPlanVersions: test.helper, HelperStateVersions: []uint32{1, 2}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			cell = observed
-			if got := verifiedPlan(t, h.manager, cell.ID, *h.now).Version; got != test.want {
-				t.Fatalf("plan version = %d, want %d", got, test.want)
-			}
-		})
+	if _, _, err := h.store.Transact("force-destroy-phase", "test", nil, h.now.Unix(), func(state *State) (any, error) {
+		stored := state.Volumes[volume.ID]
+		stored.State = VolumeDestroying
+		stored.DeletionRequested = true
+		stored.ArchiveCycleStep = "destroying"
+		state.Volumes[stored.ID] = stored
+		return nil, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
+	if plan.Version != cellplan.Version || len(plan.Volumes) != 1 || plan.Volumes[0].Phase != cellplan.PhaseDestroy {
+		t.Fatalf("v2 destroy plan = %+v", plan)
+	}
+	if err := h.store.View(func(state State) error {
+		stored := state.Cells[cell.ID]
+		if len(stored.PlanVersions) != 0 || len(stored.HelperPlanVersions) != 0 || len(stored.HelperStateVersions) != 0 {
+			t.Fatalf("durable capabilities unexpectedly recorded: %+v", stored)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1463,7 +1468,6 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 	cell, err = h.manager.ObserveCell("ready-csr", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
-		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
 		ArchiveConfigured: true,
 		Volumes: []VolumeObservation{{
 			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
@@ -1478,7 +1482,6 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 	cell, err = h.manager.ObserveCell("ready-running", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
-		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
 		ArchiveConfigured: true,
 		Volumes: []VolumeObservation{{
 			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
@@ -1501,7 +1504,6 @@ func prepareCellForAdmission(t *testing.T, h managerHarness, cell Cell) Cell {
 	observed, err := h.manager.ObserveCell("admission-"+cell.ID, CellObservation{
 		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
-		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
 		ArchiveConfigured: true,
 	})
 	if err != nil {
@@ -1511,7 +1513,6 @@ func prepareCellForAdmission(t *testing.T, h managerHarness, cell Cell) Cell {
 		observed, err = h.manager.ObserveCell("admission-v2-"+cell.ID, CellObservation{
 			CellID: cell.ID, PlanGeneration: observed.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
 			AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
-			PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
 			ArchiveConfigured: true,
 		})
 		if err != nil {

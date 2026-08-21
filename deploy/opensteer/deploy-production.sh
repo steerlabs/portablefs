@@ -165,10 +165,9 @@ for volume_id in "${volume_ids[@]}"; do
     PROVISIONING)
       minimum_generations[$volume_id]=$generation
       ;;
-    RETIRED | DESTROYING | DESTROYED)
-      # The one-time v1 migration turns RETIRED into v2 DESTROYING at the
-      # host-data cursor. DESTROYING/DESTROYED make a retry after activation
-      # resumable without retaining the old allocation or repeating work.
+    DESTROYING | DESTROYED)
+      # V2 deletion remains resumable while the Manager records host-data
+      # destruction and placement release.
       cleanup_volumes[$volume_id]=1
       ;;
     *)
@@ -209,7 +208,7 @@ if ((restart_count > 0)); then
     state=$(jq -r '.state' <<<"$volume")
     if [[ -n ${cleanup_volumes[$volume_id]:-} ]]; then
       [[ $state == DESTROYING || $state == DESTROYED ]] || {
-        echo "retired volume $volume_id entered unexpected migrated state $state" >&2
+        echo "deleting volume $volume_id entered unexpected state $state" >&2
         exit 69
       }
     elif [[ $state == FENCING ]]; then

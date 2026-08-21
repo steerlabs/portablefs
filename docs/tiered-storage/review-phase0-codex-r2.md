@@ -47,7 +47,7 @@ rollout gates also need more work.
    Exact resolving section: §1, “Identity model,” the “Placement” and
    “Authority endpoint names” bullets. Endpoints now include the placement
    sequence, stay stable across within-placement epoch advances, and change only
-   for a fresh placement. The migrated v1 placement keeps its old endpoint.
+   for a fresh placement. Placement sequence 1 keeps its unsuffixed endpoint.
 
 5. **RESOLVED: retained service account blocked a fresh same-cell UID.** Exact
    resolving section: §1, “Identity model,” the per-placement account-name

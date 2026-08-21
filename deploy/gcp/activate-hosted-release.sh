@@ -54,10 +54,6 @@ fi
 rollback_dir=$(mktemp -d /run/portablefs-release-rollback.XXXXXXXX)
 cleanup_rollback() { rm -rf -- "$rollback_dir"; }
 trap cleanup_rollback EXIT
-manager_state=/var/lib/portablefs-manager/manager.state
-migration_backup=
-migration_candidate=
-migration_swapped=0
 
 case "$role" in
   manager)
@@ -158,14 +154,6 @@ restore_previous() {
   if ((has_manager)); then
     systemctl stop portablefs-manager.service || true
   fi
-  if ((migration_swapped)); then
-    mv -- "$manager_state" "$migration_candidate"
-    mv -- "$migration_backup" "$manager_state"
-    sync -f "$manager_state"
-    sync -f "${manager_state%/*}"
-  elif [[ -n $migration_candidate ]]; then
-    rm -f -- "$migration_candidate"
-  fi
   if ((activation_swapped)); then
     if [[ -n $previous ]]; then
       activate_link "$previous"
@@ -220,32 +208,6 @@ if ((has_manager)) && systemctl --quiet is-active portablefs-manager.service; th
     echo "portablefs-manager.service remained active after stop" >&2
     false
   fi
-fi
-
-if ((has_manager)) && [[ -f $manager_state ]]; then
-  state_schema=$(runuser --user portablefs-manager -- "$release_path/bin/portablefs-manager" state-version -state "$manager_state")
-  case "$state_schema" in
-    1)
-      migration_backup=$manager_state.v1-$release_id
-      migration_candidate=$manager_state.v2-$release_id
-      [[ ! -e $migration_backup && ! -e $migration_candidate ]] || {
-        echo "manager state migration artifact already exists for $release_id" >&2
-        false
-      }
-      runuser --user portablefs-manager -- "$release_path/bin/portablefs-manager" migrate-state \
-        -from "$manager_state" -to "$migration_candidate"
-      mv -- "$manager_state" "$migration_backup"
-      mv -- "$migration_candidate" "$manager_state"
-      sync -f "$manager_state"
-      sync -f "${manager_state%/*}"
-      migration_swapped=1
-      ;;
-    2) ;;
-    *)
-      echo "unsupported manager state schema: $state_schema" >&2
-      false
-      ;;
-  esac
 fi
 
 activate_link "$release_path"

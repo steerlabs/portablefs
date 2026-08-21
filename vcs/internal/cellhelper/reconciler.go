@@ -147,10 +147,6 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 	if plan.Generation < state.PlanGeneration || plan.Generation == state.PlanGeneration && state.PlanHash != "" && state.PlanHash != digestHex {
 		return controlplane.CellObservation{}, errors.New("cellhelper: stale or equivocated plan generation")
 	}
-	if plan.Version == cellplan.Version {
-		state.Version = helperStateVersion
-		state.PlanVersionApplied = cellplan.Version
-	}
 	if err := validatePlanTransition(plan, state, reconciler.CellID); err != nil {
 		return controlplane.CellObservation{}, err
 	}
@@ -158,9 +154,7 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 	observation := controlplane.CellObservation{
 		CellID: reconciler.CellID, PlanGeneration: plan.Generation, ManagerReleaseID: plan.ReleaseID,
 		HelperReleaseID: reconciler.ReleaseID, ObservedUnix: now.Unix(),
-		HelperPlanVersions:  []uint32{cellplan.VersionV1, cellplan.Version},
-		HelperStateVersions: []uint32{helperStateVersionV1, helperStateVersion},
-		ArchiveConfigured:   reconciler.Host.ArchiveConfigured(),
+		ArchiveConfigured: reconciler.Host.ArchiveConfigured(),
 	}
 	for _, volume := range plan.Volumes {
 		if volume.Phase == cellplan.PhaseRelease {
@@ -200,7 +194,7 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 			}
 		}
 		setObservationIdentity(&observed, volume)
-		assignment := assignmentAfterObservation(previous, volume, reconciler.CellID, plan.Version, observed, update, volumeDigestHex)
+		assignment := assignmentAfterObservation(previous, volume, reconciler.CellID, observed, update, volumeDigestHex)
 		assignment.AppliedHelperRelease = ""
 		if assignment.Applied {
 			assignment.AppliedHelperRelease = reconciler.ReleaseID
@@ -275,7 +269,7 @@ func applyRelease(volume cellplan.VolumePlan, state *State) (controlplane.Volume
 	return controlplane.VolumeObservation{AuthorityAbsent: true, Released: true}, nil
 }
 
-func assignmentAfterObservation(previous Assignment, volume cellplan.VolumePlan, cellID string, planVersion uint32, observed controlplane.VolumeObservation, update HostUpdate, digest string) Assignment {
+func assignmentAfterObservation(previous Assignment, volume cellplan.VolumePlan, cellID string, observed controlplane.VolumeObservation, update HostUpdate, digest string) Assignment {
 	assignment := previous
 	if assignment.VolumeID == "" {
 		assignment = assignmentFromPlan(volume, cellID)
@@ -294,8 +288,7 @@ func assignmentAfterObservation(previous Assignment, volume cellplan.VolumePlan,
 		copy := *update.DestroyProof
 		assignment.DestroyProof = &copy
 	}
-	quotaSucceeded := observed.Provisioned || planVersion == cellplan.VersionV1
-	if observed.Error == "" && quotaSucceeded &&
+	if observed.Error == "" && observed.Provisioned &&
 		(volume.Phase == cellplan.PhaseProvision || volume.Phase == cellplan.PhaseServe || volume.Phase == cellplan.PhaseRestore) {
 		assignment.AppliedQuotaBytes, assignment.AppliedQuotaInodes = volume.QuotaBytes, volume.QuotaInodes
 	}

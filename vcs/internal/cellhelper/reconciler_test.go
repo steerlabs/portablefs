@@ -184,43 +184,15 @@ func TestReconcilerRejectsSameGenerationEquivocationAndIDSwap(t *testing.T) {
 	}
 }
 
-func TestStateV1MigrationAndDualWriteGate(t *testing.T) {
-	directory := t.TempDir()
-	path := filepath.Join(directory, "state.json")
+func TestStateRejectsUnsupportedVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
 	cellID := "11111111-1111-4111-8111-111111111111"
-	old := stateV1{Version: 1, CellID: cellID, PlanGeneration: 1, PlanHash: strings64("1"), Assignments: map[string]assignmentV1{
-		"22222222-2222-4222-8222-222222222222": {
-			VolumeID: "22222222-2222-4222-8222-222222222222", AuthorizationDomain: "org", Owner: "owner",
-			ProductIssuer: "product", ProductPublicKeyPEM: "key", CellID: cellID, ProjectID: 10001,
-			ServiceUID: 200001, ServiceGID: 200001, ListenPort: 20001, QuotaBytes: 1 << 30, QuotaInodes: 1000,
-			AuthorityID: "authority", AuthorityServerName: "volume.test", AuthorityGeneration: 1,
-			LastPhase: cellplan.PhaseProvision, QuotaApplied: true, Applied: true, AppliedPlanHash: strings64("2"),
-		},
-	}}
-	payload, err := json.Marshal(old)
-	if err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
-		t.Fatal(err)
+	if _, err := loadState(path, cellID); err == nil {
+		t.Fatal("cellhelper accepted unsupported state version 1")
 	}
-	state, err := loadState(path, cellID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assignment := state.Assignments["22222222-2222-4222-8222-222222222222"]
-	if assignment.PlacementSequence != 1 || assignment.AppliedQuotaBytes != assignment.QuotaBytes || assignment.AppliedQuotaInodes != assignment.QuotaInodes {
-		t.Fatalf("v1 migration = %+v", assignment)
-	}
-	if err := saveState(path, state); err != nil {
-		t.Fatal(err)
-	}
-	assertStateVersion(t, path, 1, false)
-	state.Version, state.PlanVersionApplied = 2, 2
-	if err := saveState(path, state); err != nil {
-		t.Fatal(err)
-	}
-	assertStateVersion(t, path, 2, true)
 }
 
 func TestArchiveStateMachinePersistsNonceAndSeal(t *testing.T) {
@@ -239,7 +211,7 @@ func TestArchiveStateMachinePersistsNonceAndSeal(t *testing.T) {
 		{controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true, QuiesceProven: true, ArchiveSealed: seal}, HostUpdate{ArchiveSealed: seal}},
 	}}
 	reconciler := testReconciler(t, publicKey, now, host)
-	plan := helperPlanV2(now, reconciler.CellID, 1, cellplan.PhaseArchive)
+	plan := helperPlan(now, reconciler.CellID, 1, 1, cellplan.PhaseArchive)
 	plan.Volumes[0].ArchiveTo = &cellplan.ArchiveTarget{Attempt: seal.Attempt, KeyVersion: "default"}
 	for pass := 0; pass < 3; pass++ {
 		if _, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, plan)); err != nil {
@@ -259,7 +231,7 @@ func TestArchiveStateMachinePersistsNonceAndSeal(t *testing.T) {
 func TestDestroyReleaseWritesExactTombstoneAndLeavingPlanIsSafe(t *testing.T) {
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(1_900_000_000, 0)
-	base := helperPlanV2(now, "11111111-1111-4111-8111-111111111111", 1, cellplan.PhaseDestroy)
+	base := helperPlan(now, "11111111-1111-4111-8111-111111111111", 1, 1, cellplan.PhaseDestroy)
 	assignment := assignmentFromPlan(base.Volumes[0], base.CellID)
 	record := completeDestroyRecord(assignment)
 	payload, _ := json.Marshal(record)
@@ -302,7 +274,7 @@ func TestDestroyReleaseWritesExactTombstoneAndLeavingPlanIsSafe(t *testing.T) {
 func TestReleaseMismatchAborts(t *testing.T) {
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(1_900_000_000, 0)
-	plan := helperPlanV2(now, "11111111-1111-4111-8111-111111111111", 1, cellplan.PhaseRelease)
+	plan := helperPlan(now, "11111111-1111-4111-8111-111111111111", 1, 1, cellplan.PhaseRelease)
 	plan.Volumes[0].ReleaseProof = &cellplan.ReleaseProof{PlacementSequence: 1, AuthorityEpoch: 1, DestroyProofSHA256: strings64("f")}
 	reconciler := testReconciler(t, publicKey, now, &scriptedHost{})
 	if _, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, plan)); err == nil {
@@ -324,7 +296,7 @@ func TestRestoreProgressAndUsagePassThrough(t *testing.T) {
 		}{{controlplane.VolumeObservation{Provisioned: true, AuthorityRunning: true, RestoreNamespaceReady: true,
 			RestoreProgressPermille: 750, RestoreState: "blocked", UsedBytes: 30, UsedInodes: 5}, HostUpdate{}}}}
 	reconciler := testReconciler(t, publicKey, now, host)
-	plan := helperPlanV2(now, reconciler.CellID, 1, cellplan.PhaseRestore)
+	plan := helperPlan(now, reconciler.CellID, 1, 1, cellplan.PhaseRestore)
 	plan.Volumes[0].AuthorityCertificate = "certificate"
 	plan.Volumes[0].RestoreFrom = testRestoreSource()
 	for pass := 0; pass < 2; pass++ {
@@ -349,15 +321,6 @@ func testReconciler(t *testing.T, publicKey ed25519.PublicKey, now time.Time, ho
 		StatePath: filepath.Join(t.TempDir(), "state"), Host: host, ReleaseID: "helper-test"}
 }
 
-func helperPlanV2(now time.Time, cellID string, generation uint64, phase cellplan.VolumePhase) cellplan.Plan {
-	plan := helperPlan(now, cellID, generation, 1, phase)
-	plan.Version = cellplan.Version
-	plan.AuthorityCAPEM, plan.ClientCAPEM, plan.CapabilityPublicKey = "authority-ca", "client-ca", "cap-key"
-	plan.Volumes[0].AuthorityCAPEM, plan.Volumes[0].ClientCAPEM, plan.Volumes[0].CapabilityPublicKey = "", "", ""
-	plan.Volumes[0].PlacementSequence = 1
-	return plan
-}
-
 func testRestoreSource() *cellplan.RestoreSource {
 	return &cellplan.RestoreSource{SealedEpoch: 1, Attempt: "33333333-3333-4333-8333-333333333333",
 		ManifestDigestSHA256: strings64("a"), ManifestSizeBytes: 1, PackCount: 1, SealedAllocatedBytes: 1, SealedInodes: 1}
@@ -369,24 +332,6 @@ func completeDestroyRecord(assignment Assignment) DestroyRecord {
 		PlacementSequence: assignment.PlacementSequence, Postconditions: DestroyPostconditions{ConfigRootAbsent: true,
 			DropInsAbsent: true, QuotaCleared: true, StateRootAbsent: true, SysusersConfAbsent: true, TreeAbsent: true},
 		ProjectID: assignment.ProjectID, ServiceGID: assignment.ServiceGID, ServiceUID: assignment.ServiceUID, VolumeID: assignment.VolumeID}
-}
-
-func assertStateVersion(t *testing.T, path string, want uint32, planVersionField bool) {
-	t.Helper()
-	payload, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &raw); err != nil {
-		t.Fatal(err)
-	}
-	var got uint32
-	_ = json.Unmarshal(raw["version"], &got)
-	_, hasPlanVersion := raw["plan_version_applied"]
-	if got != want || hasPlanVersion != planVersionField {
-		t.Fatalf("state version=%d plan_version_field=%t, want %d/%t: %s", got, hasPlanVersion, want, planVersionField, payload)
-	}
 }
 
 func strings64(character string) string {
@@ -403,15 +348,15 @@ func helperPlan(now time.Time, cellID string, generation, authorityGeneration ui
 		certificate = "cert"
 	}
 	return cellplan.Plan{
-		Version: cellplan.VersionV1, CellID: cellID, Generation: generation,
+		Version: cellplan.Version, CellID: cellID, Generation: generation,
 		IssuedAt: now.Unix(), ExpiresAt: now.Add(time.Minute).Unix(), ReleaseID: "release",
+		AuthorityCAPEM: "authority-ca", ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
 		Volumes: []cellplan.VolumePlan{{
 			VolumeID: "22222222-2222-4222-8222-222222222222", Phase: phase,
 			AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "product", ProductPublicKeyPEM: "product-key",
 			AuthorityID: "authority", AuthorityGeneration: authorityGeneration, ProjectID: 10001,
 			ServiceUID: 200001, ServiceGID: 200001, ListenPort: 20001, QuotaBytes: 1 << 30, QuotaInodes: 1000,
-			AuthorityServerName: "volume.test", AuthorityCertificate: certificate, AuthorityCAPEM: "authority-ca",
-			ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
+			AuthorityServerName: "volume.test", AuthorityCertificate: certificate, PlacementSequence: 1,
 		}},
 	}
 }

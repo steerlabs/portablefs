@@ -8,17 +8,13 @@ import (
 
 const testVolumeID = "22222222-2222-4222-8222-222222222222"
 
-// TestPlacementServiceAccountNameKeepsTheV1NameAtSequenceOne pins the
-// compatibility half of the derivation: a migrated v1 placement must keep the
-// account it already owns, or the helper would try to create a second account
-// for a UID that is already taken and verifyServiceIdentity would refuse.
-func TestPlacementServiceAccountNameKeepsTheV1NameAtSequenceOne(t *testing.T) {
+func TestPlacementServiceAccountNamePinsSequenceOne(t *testing.T) {
 	name, err := PlacementServiceAccountName(testVolumeID, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if name != "pfs-eirceircejbcfarceirceircei" {
-		t.Fatalf("v1 placement name = %q, want the v1 base32 name", name)
+		t.Fatalf("placement sequence 1 name = %q, want the pinned base32 name", name)
 	}
 }
 

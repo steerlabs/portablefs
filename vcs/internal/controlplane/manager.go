@@ -361,7 +361,7 @@ func (manager *Manager) ArchiveVolume(requestID string, request ArchiveVolumeReq
 			return ErrConflict
 		}
 		cell := state.Cells[volume.Placement.CellID]
-		if !cellSupportsV2(cell) || !cell.ArchiveConfigured {
+		if !cell.ArchiveConfigured {
 			return ErrArchiveUnsupported
 		}
 		if archivingCellLoad(state, cell.ID) >= manager.cfg.MaxArchivingPerCell {
@@ -489,9 +489,6 @@ func (manager *Manager) DestroyVolume(requestID string, request DestroyVolumeReq
 			volume.ArchiveCycleStep = "quiescing"
 			volume.UpdatedUnix = now
 			cell := state.Cells[volume.Placement.CellID]
-			if !cellSupportsV2(cell) {
-				return ErrConflict
-			}
 			manager.bumpPlan(&cell, now)
 			state.Cells[cell.ID] = cell
 		case VolumeArchived:
@@ -614,8 +611,7 @@ func (manager *Manager) updateVolume(requestID, operation string, request any, a
 
 func (manager *Manager) ObserveCell(requestID string, observation CellObservation) (Cell, error) {
 	if !cellplan.ValidID(observation.CellID) || observation.PlanGeneration == 0 || !validIdentity(observation.ManagerReleaseID) ||
-		!validIdentity(observation.AgentReleaseID) || !validIdentity(observation.HelperReleaseID) || observation.ObservedUnix <= 0 ||
-		!validVersions(observation.PlanVersions) || !validVersions(observation.HelperPlanVersions) || !validVersions(observation.HelperStateVersions) {
+		!validIdentity(observation.AgentReleaseID) || !validIdentity(observation.HelperReleaseID) || observation.ObservedUnix <= 0 {
 		return Cell{}, ErrInvalid
 	}
 	nowTime := manager.cfg.Now().UTC()
@@ -651,17 +647,10 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			state.Cells[cell.ID] = cell
 			return cell, nil
 		}
-		wasV2Capable := cellSupportsV2(cell)
-		cell.PlanVersions = append([]uint32(nil), observation.PlanVersions...)
-		cell.HelperPlanVersions = append([]uint32(nil), observation.HelperPlanVersions...)
-		cell.HelperStateVersions = append([]uint32(nil), observation.HelperStateVersions...)
 		// Archive capability is relayed verbatim from the helper's status pass;
 		// losing it immediately stops new archive and restore placements without
 		// disturbing cycles already in flight.
 		cell.ArchiveConfigured = observation.ArchiveConfigured
-		if wasV2Capable != cellSupportsV2(cell) {
-			manager.bumpPlan(&cell, now)
-		}
 		seen := make(map[string]struct{}, len(observation.Volumes))
 		for _, observed := range observation.Volumes {
 			volume, exists := state.Volumes[observed.VolumeID]
@@ -999,18 +988,11 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 		if !ok {
 			return ErrNotFound
 		}
-		planVersion := uint32(cellplan.VersionV1)
-		if cellSupportsV2(cell) {
-			planVersion = cellplan.Version
-		}
 		plan = cellplan.Plan{
-			Version: planVersion, CellID: cell.ID, Generation: cell.PlanGeneration,
+			Version: cellplan.Version, CellID: cell.ID, Generation: cell.PlanGeneration,
 			IssuedAt: cell.PlanIssuedUnix, ExpiresAt: cell.PlanExpiresUnix, ReleaseID: manager.cfg.ReleaseID,
-		}
-		if planVersion == cellplan.Version {
-			plan.AuthorityCAPEM = manager.cfg.AuthorityCA.CertificatePEM
-			plan.ClientCAPEM = manager.cfg.ClientCA.CertificatePEM
-			plan.CapabilityPublicKey = manager.capabilityPublicKeyPEM
+			AuthorityCAPEM: manager.cfg.AuthorityCA.CertificatePEM, ClientCAPEM: manager.cfg.ClientCA.CertificatePEM,
+			CapabilityPublicKey: manager.capabilityPublicKeyPEM,
 		}
 		for _, volume := range state.Volumes {
 			if volume.Placement == nil || volume.Placement.CellID != cellID {
@@ -1056,9 +1038,6 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 			default:
 				return fmt.Errorf("%w: volume plan state", ErrInvalid)
 			}
-			if planVersion == cellplan.VersionV1 && (phase == cellplan.PhaseArchive || phase == cellplan.PhaseRestore || phase == cellplan.PhaseDestroy || phase == cellplan.PhaseRelease) {
-				return ErrConflict
-			}
 			entry := cellplan.VolumePlan{
 				VolumeID: volume.ID, Phase: phase, AuthorizationDomain: volume.AuthorizationDomain, Owner: volume.Owner,
 				ProductIssuer: volume.ProductIssuer, ProductPublicKeyPEM: volume.ProductPublicKeyPEM,
@@ -1066,25 +1045,18 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 				ProjectID: placement.ProjectID, ServiceUID: placement.ServiceUID, ServiceGID: placement.ServiceGID,
 				ListenPort: placement.ListenPort, QuotaBytes: volume.QuotaBytes, QuotaInodes: volume.QuotaInodes,
 				AuthorityServerName: placement.AuthorityServerName, AuthorityCertificate: placement.AuthorityCertificatePEM,
-				PriorStrictFenced: placement.PriorStrictFenced,
+				PriorStrictFenced: placement.PriorStrictFenced, PlacementSequence: placement.Sequence,
 			}
-			if planVersion == cellplan.VersionV1 {
-				entry.AuthorityCAPEM = manager.cfg.AuthorityCA.CertificatePEM
-				entry.ClientCAPEM = manager.cfg.ClientCA.CertificatePEM
-				entry.CapabilityPublicKey = manager.capabilityPublicKeyPEM
-			} else {
-				entry.PlacementSequence = placement.Sequence
-				switch phase {
-				case cellplan.PhaseArchive:
-					entry.ArchiveTo = &cellplan.ArchiveTarget{Attempt: volume.ArchiveAttempt, KeyVersion: manager.cfg.ArchiveKeyVersion}
-				case cellplan.PhaseRestore:
-					entry.RestoreFrom = restoreSource(*volume.Archive)
-				case cellplan.PhaseRelease:
-					entry.ReleaseProof = &cellplan.ReleaseProof{PlacementSequence: placement.Sequence, AuthorityEpoch: volume.AuthorityEpoch, DestroyProofSHA256: placement.DestroyProofSHA256}
-				case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseDestroy:
-				default:
-					return fmt.Errorf("%w: cell plan phase", ErrInvalid)
-				}
+			switch phase {
+			case cellplan.PhaseArchive:
+				entry.ArchiveTo = &cellplan.ArchiveTarget{Attempt: volume.ArchiveAttempt, KeyVersion: manager.cfg.ArchiveKeyVersion}
+			case cellplan.PhaseRestore:
+				entry.RestoreFrom = restoreSource(*volume.Archive)
+			case cellplan.PhaseRelease:
+				entry.ReleaseProof = &cellplan.ReleaseProof{PlacementSequence: placement.Sequence, AuthorityEpoch: volume.AuthorityEpoch, DestroyProofSHA256: placement.DestroyProofSHA256}
+			case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseDestroy:
+			default:
+				return fmt.Errorf("%w: cell plan phase", ErrInvalid)
 			}
 			plan.Volumes = append(plan.Volumes, entry)
 		}
@@ -1697,7 +1669,7 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 			cell.NextServiceUID == ^uint32(0) || cell.NextPort == ^uint16(0) {
 			continue
 		}
-		if isRestore && (!cellSupportsV2(cell) || !cell.ArchiveConfigured) {
+		if isRestore && !cell.ArchiveConfigured {
 			continue
 		}
 		loadBytes, loadInodes, placements := uint64(0), uint64(0), 0
@@ -1818,17 +1790,6 @@ func addUint64(left, right uint64) (uint64, bool) {
 	return result, result >= left
 }
 
-func cellSupportsV2(cell Cell) bool {
-	return containsVersion(cell.PlanVersions, 2) && containsVersion(cell.HelperPlanVersions, 2)
-}
-func containsVersion(versions []uint32, want uint32) bool {
-	for _, version := range versions {
-		if version == want {
-			return true
-		}
-	}
-	return false
-}
 func mountableVolume(volume Volume) bool {
 	return volume.State == VolumeReady || volume.State == VolumeRestoring && volume.RestoreStep == "serving-restore"
 }
