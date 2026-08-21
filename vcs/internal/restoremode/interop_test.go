@@ -40,6 +40,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/archive"
 	"github.com/steerlabs/portablefs/vcs/internal/archivestore"
 	"github.com/steerlabs/portablefs/vcs/internal/hydrator"
+	"github.com/steerlabs/portablefs/vcs/internal/restorefixture"
 	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
 )
 
@@ -332,7 +333,7 @@ func newInteropFixture(t *testing.T) *interopFixture {
 		client:     client,
 		manifest:   manifest,
 		packKeys:   packKeys,
-		volumeRoot: interopVolumeRoot(t),
+		volumeRoot: restorefixture.Root(t),
 		// The state directory holds the AF_UNIX socket, which is capped at
 		// about a hundred bytes; a test temporary directory is often longer
 		// than that on its own.

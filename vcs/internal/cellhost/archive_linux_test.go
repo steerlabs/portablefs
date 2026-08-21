@@ -179,7 +179,9 @@ func TestArchiveConfiguredTracksUsableCredentials(t *testing.T) {
 // to notice rather than the case being weak.
 func TestArchiveConfiguredRefusesMalformedCredentials(t *testing.T) {
 	for name, mutate := range map[string]func([]string) []string{
-		"not key=value": func(lines []string) []string {
+		// The name stays inside cellhost's pinned path charset: t.TempDir embeds
+		// the subtest name in the fixture root, and safeRoot refuses '='.
+		"not a key-value assignment": func(lines []string) []string {
 			return append(lines, "credentials")
 		},
 		"unknown key": func(lines []string) []string {

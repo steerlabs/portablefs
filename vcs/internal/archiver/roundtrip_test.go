@@ -16,6 +16,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/archive"
 	"github.com/steerlabs/portablefs/vcs/internal/hydrator"
+	"github.com/steerlabs/portablefs/vcs/internal/restorefixture"
 )
 
 // The round trip of the whole tier below the authority: archive a real tree,
@@ -30,7 +31,7 @@ func TestArchiveRestoreServeRoundTrip(t *testing.T) {
 	tree := buildSourceTree(t)
 	options, _, sealed := runArchiver(t, tree)
 
-	restored := t.TempDir()
+	restored := restorefixture.Root(t)
 	stateDir := t.TempDir()
 	restoreOptions := hydrator.Options{
 		LaunchConfigPath: writeHydratorConfig(t, t.TempDir(), hydratorConfig(sealed, hydrator.ModeRestoreNamespace)),

@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/steerlabs/portablefs/vcs/archive"
+	"github.com/steerlabs/portablefs/vcs/internal/restorefixture"
 	"golang.org/x/sys/unix"
 )
 
@@ -184,7 +185,7 @@ func TestMaterializeRestoresRestrictiveModes(t *testing.T) {
 		rerunUnprivileged(t, "TestMaterializeRestoresRestrictiveModes")
 		return
 	}
-	root := t.TempDir()
+	root := restorefixture.Root(t)
 	xattrs := xattrsCarried(t, root)
 	manifest := restrictiveManifest(xattrs)
 
