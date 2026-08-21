@@ -27,8 +27,9 @@ expected=(
   systemd/portablefs-hydrator@.service
   systemd/portablefs-manager.service
 )
+mapfile -t expected_sorted < <(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
 
-for relative in "${expected[@]}" SHA256SUMS; do
+for relative in "${expected_sorted[@]}" SHA256SUMS; do
   [[ -f $stage/$relative && ! -L $stage/$relative ]] || {
     echo "missing or unsafe hosted release member: $relative" >&2
     exit 66
@@ -42,12 +43,12 @@ for relative in "${expected[@]}" SHA256SUMS; do
 done
 
 mapfile -t actual < <(cd "$stage" && find architecture bin libexec release-id source-commit systemd -type f -print | LC_ALL=C sort)
-[[ ${#actual[@]} == ${#expected[@]} ]] || {
+(( ${#actual[@]} == ${#expected_sorted[@]} )) || {
   echo "hosted release membership count is not exact" >&2
   exit 65
 }
-for index in "${!expected[@]}"; do
-  [[ ${actual[$index]} == "${expected[$index]}" ]] || {
+for index in "${!expected_sorted[@]}"; do
+  [[ ${actual[$index]} == "${expected_sorted[$index]}" ]] || {
     echo "hosted release membership differs at ${actual[$index]}" >&2
     exit 65
   }
@@ -66,7 +67,7 @@ case "$(uname -m):$architecture" in
 esac
 
 manifest_members=$(awk '{print $2}' "$stage/SHA256SUMS")
-[[ $manifest_members == "$(printf '%s\n' "${expected[@]}")" ]] || {
+[[ $manifest_members == "$(printf '%s\n' "${expected_sorted[@]}")" ]] || {
   echo "hosted release checksum membership is not exact" >&2
   exit 65
 }
