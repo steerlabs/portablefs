@@ -54,6 +54,7 @@
 		200000000000000000000201 /* ExtensionMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionMain.swift; sourceTree = "<group>"; };
 		200000000000000000000202 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000203 /* PortableFSExt.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PortableFSExt.entitlements; sourceTree = "<group>"; };
+		200000000000000000000802 /* PortableFSHelpers.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PortableFSHelpers.entitlements; sourceTree = "<group>"; };
 		200000000000000000000301 /* PortableFS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PortableFS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		200000000000000000000302 /* PortableFSExt.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = PortableFSExt.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		200000000000000000000801 /* Development.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Development.xcconfig; sourceTree = "<group>"; };
@@ -126,6 +127,7 @@
 			isa = PBXGroup;
 			children = (
 				200000000000000000000801 /* Development.xcconfig */,
+				200000000000000000000802 /* PortableFSHelpers.entitlements */,
 			);
 			path = Config;
 			sourceTree = "<group>";
@@ -241,15 +243,17 @@
 			files = (
 			);
 			inputPaths = (
+				"$(SRCROOT)/Config/PortableFSHelpers.entitlements",
 			);
 			name = "Embed PortableFS tools";
 			outputPaths = (
 				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/portablefs",
-				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/portablefsd",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/$(PRODUCT_BUNDLE_IDENTIFIER).portablefsd.plist",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "\"$SRCROOT/Scripts/embed-portablefs-tools.sh\"\n";
+			shellScript = "PORTABLEFS_NATIVE_QUALIFICATION= \"$SRCROOT/Scripts/embed-portablefs-tools.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
@@ -328,6 +332,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = App/PortableFSApp.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -341,7 +346,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.2.3;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp;
 				PRODUCT_NAME = PortableFS;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -354,6 +359,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 200000000000000000000801 /* Development.xcconfig */;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = App/PortableFSApp.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -367,7 +373,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.2.3;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp;
 				PRODUCT_NAME = PortableFS;
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -393,7 +399,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.2.3;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp.PortableFSExt;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -421,7 +427,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 0.2.3;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.PortableFSApp.PortableFSExt;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;

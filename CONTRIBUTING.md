@@ -10,7 +10,7 @@ FSKit/app package under `swift/PortableFSKit`. There is no build system above
 those two languages and nothing to install:
 
 - **Go**, at the version pinned in [vcs/go.mod](./vcs/go.mod) (currently
-  1.26.5). It builds every binary under `vcs/cmd/`: `portablefs`,
+  1.26.6). It builds every binary under `vcs/cmd/`: `portablefs`,
   `portablefs-authority`, `portablefs-mount-v3`, and `portablefsd`.
 - **A Swift toolchain** for `swift/PortableFSKit`. The package declares
   `swift-tools-version: 6.2` and targets macOS 26, so the Swift suite runs on a
@@ -32,7 +32,7 @@ go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
 
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh # macOS: authoritative native Swift gate
 ```
 
 The daemon, the mount clients, and the frontend adapters carry per-`GOOS` files,
@@ -45,10 +45,10 @@ GOOS=darwin go -C vcs build ./...
 GOOS=linux go -C vcs vet ./...
 ```
 
-`--no-parallel` on the Swift suite is required, not a tuning choice: Swift
-Testing can otherwise run cases concurrently inside one SwiftPM worker.
-Several tests share process resources — sockets, mount points, the app-group
-container — or exercise hard protocol deadlines, so they must run serially.
+The native gate runs one Xcode test process and proves exact equality between
+the enumerated inventory and the all-passing xcresult. Socket-backed integration
+tests declare their process-wide resource constraint with a serialized Swift
+Testing suite; pure tests remain parallel.
 
 ## The Local Gate
 
@@ -56,23 +56,29 @@ container — or exercise hard protocol deadlines, so they must run serially.
 bash scripts/verify-local.sh
 ```
 
-This is the repository's single pre-push gate. It runs from anywhere, operates
+This is the repository's pre-push gate, in its fast default mode: it runs no
+real mount, and it closes by naming every gate it did not run. Add `--full` (or
+set `VERIFY_LOCAL_FULL=1`) to also run the two privileged Docker real-mount
+suites, which is required evidence for a change to the authority, a frontend, or
+the coherence protocol. It runs from anywhere, operates
 on the repository root, and is plain bash so that a developer Mac and a Linux CI
 runner execute the same steps:
 
 1. **Cross-OS build** — `GOOS=darwin` and `GOOS=linux` builds of `vcs/...`,
    before anything is executed, so a compile error surfaces in seconds.
 2. **Cross-OS vet** — `go vet` for both targets.
-3. **Native Go suite** — `go -C vcs test ./...`. The Go tests exercise real
+3. **Dependency vulnerability gate** — the exact pinned `govulncheck` scans
+   reachable calls using the Go version required by `vcs/go.mod`.
+4. **Native Go suite** — `go -C vcs test ./...`. The Go tests exercise real
    syscalls, sockets, and mounts, so they are only meaningful on the host
    platform.
-4. **Native Go race suite** — `go -C vcs test -race ./...`.
-5. **Swift suite** — `swift test --package-path swift/PortableFSKit
-   --no-parallel`. Skipped loudly, with a printed `SKIP`, when the host has no
-   Swift toolchain.
-6. **Release-trust policy** — a `sh -n` syntax check of `scripts/install.sh`,
-   the workflow action-pin checker, and the installer release-trust checker.
-7. **Stale-architecture scan** — an `rg` pass that fails the gate if the deleted
+5. **Native Go race suite** — `go -C vcs test -race ./...`.
+6. **Swift suite** — `bash scripts/test-swift-xcode.sh`. Skipped loudly, with a
+   printed `SKIP`, on non-macOS hosts; the required macOS CI lane runs it.
+7. **Workflow and release-trust policy** — the exact pinned `actionlint`, a
+   `sh -n` syntax check of `scripts/install.sh`, the workflow action-pin
+   checker, and the installer release-trust checker.
+8. **Stale-architecture scan** — an `rg` pass that fails the gate if the deleted
    v2 journal-era architecture's API and package identifiers reappear anywhere
    outside `docs/`, `CHANGELOG.md`, and the two scripts that legitimately name
    them.
@@ -145,8 +151,8 @@ cannot be merged; fix up with `git commit --amend -s` or
   story. Silent changes to frozen surfaces are rejected.
 - **Run `bash scripts/verify-local.sh` locally.** CI runs the same suites; a
   green local run saves a round trip. If your change reaches the authority's XFS
-  path or a frontend's cache behavior, run the privileged gate too and say what
-  you ran.
+  path or a frontend's cache behavior, run `bash scripts/verify-local.sh --full`,
+  which drives both privileged real-mount suites, and say which mode you ran.
 - **Match the codebase style.** Go is `gofmt`-clean, with table-driven tests and
   errors wrapped with the context the caller needs to act on them. Swift follows
   the existing package's conventions, with no force-unwraps on I/O paths.

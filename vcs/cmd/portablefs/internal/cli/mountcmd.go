@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/accountsession"
+	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/fskitidentity"
 	"github.com/steerlabs/portablefs/vcs/internal/localdirs"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
@@ -69,10 +70,12 @@ type mountOpts struct {
 	noLocalDirs           bool
 }
 
-// errFastRetired is the typed refusal for the retired --fast flag: write
-// mode is no longer a mount property — the authority delegates adaptively on
-// every mount, and fsync is always durable at the authority.
-var errFastRetired = fmt.Errorf("--fast is retired: every mount is adaptive (the authority delegates write-back per scope automatically); remove the flag")
+// errFastRetired is the typed refusal for the retired --fast flag. Write mode
+// is no longer a mount property because v3 has no client write-back at all:
+// every write is a strict write-through transaction that is durable at the
+// authority before it is acknowledged. There is nothing left for a "fast" mode
+// to select.
+var errFastRetired = fmt.Errorf("--fast is retired: v3 mounts are strict write-through (every acknowledged write is already durable at the authority); remove the flag")
 
 // errBranchRetired is the typed refusal for the retired --branch flag: a v3
 // volume is branchless — one durable workspace, no branch graph — so there is
@@ -123,8 +126,8 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.StringVar(&o.enrollmentCertPath, "mount-enrollment-cert", "", "Manager-issued mount enrollment certificate PEM file")
 	fs.Int64Var(&o.enrollmentExpiresAtMs, "mount-enrollment-expires-at-ms", 0, "mount enrollment expiry as unix milliseconds")
 	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
-	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (cache names and attributes, join the authority visibility barrier) or uncached (cache nothing; Linux only)")
-	fs.BoolFunc("fast", "retired: every mount is adaptive; passing this flag is an error", func(string) error {
+	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-6 profile)")
+	fs.BoolFunc("fast", "retired: v3 mounts are strict write-through; passing this flag is an error", func(string) error {
 		return errFastRetired
 	})
 	fs.Var(&o.localDirs, "local-dir", "refused: machine-local routes are declared volume-wide in "+localdirs.VolumeConfigPath)
@@ -178,8 +181,8 @@ func validateDirectV3MountOpts(o *mountOpts, getenv func(string) string) (dataPl
 	if enrollmentSet != 0 && (o.authExpiresAtMs <= time.Now().UnixMilli() || o.enrollmentExpiresAtMs <= o.authExpiresAtMs) {
 		return dataPlaneTransport{}, errors.New("automatic mount enrollment and initial authorization must both be unexpired, with the enrollment outliving the initial authorization")
 	}
-	if o.coherence != "strict" && o.coherence != "uncached" {
-		return dataPlaneTransport{}, fmt.Errorf("--coherence must be strict or uncached, not %q", o.coherence)
+	if o.coherence != "strict" {
+		return dataPlaneTransport{}, fmt.Errorf("--coherence must be strict, not %q", o.coherence)
 	}
 	return transport, nil
 }
@@ -206,29 +209,6 @@ func (o *mountOpts) automaticEnrollment(clientIdentity *clientTLSIdentity, volum
 		return nil, time.Time{}, err
 	}
 	return client, time.UnixMilli(o.authExpiresAtMs), nil
-}
-
-// perfOptions carries the FUSE mount cache options plus the write-back
-// engine's durable state location. There is no write-mode knob: the
-// authority delegates adaptively per scope. Plain writes may return before
-// the local group-sync; fsync forces local sync and authority durability.
-type perfOptions struct {
-	// negativeCache forces the negative dentry cache on; negativeCacheOff
-	// forces it off. Neither (the default) keeps the v8 baseline: on.
-	negativeCache    bool
-	negativeCacheOff bool
-	// writebackDir is the engine's durable state directory, keyed by
-	// (volume, branch) so parked streams recover across mount paths.
-	writebackDir string
-	volumeID     string
-	branch       string
-}
-
-func perfOptionsFromEnv(getenv func(string) string) perfOptions {
-	return perfOptions{
-		negativeCache:    getenv("PORTABLEFS_NEGATIVE_CACHE") == "1",
-		negativeCacheOff: getenv("PORTABLEFS_NEGATIVE_CACHE") == "0",
-	}
 }
 
 // storageDirID names the per-(volume, branch) write-back state directory:
@@ -348,6 +328,16 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mount", err)
 	}
+	// Select the exact extension contract before touching the protected app-group
+	// container. Ordinary macOS 26 and 27 builds use synchronous repair; only a
+	// separately stamped SDK-27 build selects the native actuator.
+	fskitCachePolicy := ""
+	if runtime.GOOS == "darwin" && (o.strategy == "auto" || o.strategy == "fskit") {
+		fskitCachePolicy, err = currentFSKitCachePolicy()
+		if err != nil {
+			return e.fail("mount", err)
+		}
+	}
 	if err := e.validateMountOwnership(stateDir, volumeID, o.branch, mountPath); err != nil {
 		return e.fail("mount", err)
 	}
@@ -355,8 +345,20 @@ func cmdMount(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mount", err)
 	}
+	if selectedStrategy == "fskit" && fskitCachePolicy == "" {
+		fskitCachePolicy, err = currentFSKitCachePolicy()
+		if err != nil {
+			return e.fail("mount", err)
+		}
+	}
 	if selectedStrategy == "fskit" && o.coherence != "strict" {
-		return e.usageError("mount", fmt.Errorf("the macOS FSKit engine declares the strict %s coherence policy; --coherence %s is Linux-only", portablefsd.V3CachePolicyMacOS26, o.coherence))
+		return e.usageError("mount", fmt.Errorf("the macOS FSKit engine declares the strict %s coherence policy; --coherence %s is Linux-only", fskitCachePolicy, o.coherence))
+	}
+	if selectedStrategy == "fskit" &&
+		fskitCachePolicy == portablefsd.V3CachePolicyMacOS26 &&
+		o.readyFD == 0 {
+		fmt.Fprintln(e.stderr,
+			"portablefs mount: macOS FSKit uses the macos26-synchronous-vfs-repair-v2 best-effort tier and owns the volume writer lease while mounted; other clients may read but visible mutations return EBUSY until this Mac cleanly unmounts, and a second Mac writer is refused; extreme cross-client rename churn may return transient ESTALE instead of uncertain data")
 	}
 	var operation *mountOperation
 	if o.opLockFD > 0 {
@@ -1346,9 +1348,10 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	if o.readyFD > 0 {
 		readyPipe = os.NewFile(uintptr(o.readyFD), "portablefs-ready")
 	}
-	// A v3 mount capability is single-use and this direct CLI does not acquire
-	// hosted reauthorization, so there is no access lease for this supervisor to
-	// keep, release, or reconcile.
+	// A v3 mount capability is single-use. Automatic hosted reauthorization, when
+	// requested, is owned by the distinct enrollment client below; this cleanup
+	// state tracks only the initial Manager mount request until the local attach
+	// has durably taken ownership.
 	leaseCleanupSafe := true
 	leaseCleanupAttempted := false
 	startupCleanupComplete := false
@@ -1441,6 +1444,13 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	strategy, err := resolveStrategy(o.strategy, runtime.GOOS)
 	if err != nil {
 		return failReady(err)
+	}
+	fskitCachePolicy := ""
+	if strategy == "fskit" {
+		fskitCachePolicy, err = currentFSKitCachePolicy()
+		if err != nil {
+			return failReady(err)
+		}
 	}
 	hostFacts := mounthost.Check(mounthost.Transport(strategy))
 	if hostFacts.State == mounthost.Blocked {
@@ -1629,12 +1639,29 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		// The v3 engine. The mount capability is single-use — its nonce is
 		// spent by the attach below — so from here every failure path must
 		// tear down exactly, never retry the attach.
+		// The Linux half of the revocation observation contract. The engine
+		// self-revokes on its own terminal edges — a coherence violation, a
+		// fenced session, a repair budget it could not keep — and this is what
+		// turns that into a durable, machine-readable record. Without it a
+		// revoked mount whose MNT_DETACH failed stayed installed in the
+		// namespace with `portablefs mounts` still calling it live.
+		recordRevocation := func(revocation mountRevocation) {
+			if !setMountRevoked(stateDir, mountPath, revocation.reason, revocation.detail, time.Now().UnixMilli()) {
+				log.Printf("portablefs mount: could not record the revoked status for %s (%s)", mountPath, revocation.reason)
+			}
+			log.Printf("portablefs mount: %s self-revoked (%s): %s", mountPath, revocation.reason, revocation.detail)
+			if !revocation.kernelStateWithdrawn {
+				log.Printf("portablefs mount: %s is revoked but its kernel mount could not be withdrawn; "+
+					"the authority's strict membership for this session must be discharged explicitly", mountPath)
+			}
+		}
 		m, authorityAttached, err := mountFUSEv3(fuseV3Config{
 			addr: authorityURL, token: mountToken, transport: transport,
 			identity: clientIdentity, coherence: o.coherence,
 			volumeID: volumeID, mountPath: mountPath, mountInstanceID: mountInstanceID,
 			backingRoot: localDirsBackingRoot(stateDir, volumeID),
 			noLocalDirs: o.noLocalDirs, requireMountEnrollment: enrollmentClient != nil,
+			onRevoked: recordRevocation,
 		})
 		automaticOwnerEstablished = enrollmentClient != nil && authorityAttached
 		if err != nil {
@@ -1937,7 +1964,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				ClientKeyPEM:       string(clientIdentity.keyPEM),
 				CachedNameCapacity: mountv3.CachedNameCapacity,
 				RepairBudgetMillis: uint64(mountv3.RepairBudget / time.Millisecond),
-				CachePolicy:        portablefsd.V3CachePolicyMacOS26,
+				CachePolicy:        fskitCachePolicy,
 				// The daemon does not join the route adoption protocol, so the
 				// revision declared here is the empty rule set's. A volume that
 				// declares machine-local routes is refused by the authority with
@@ -1975,7 +2002,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			}
 			return finalizeCleanedStartup(cause)
 		}
-		if err := fskitPreflight(fskitCfg.frontendSock, attachRef, e.version); err != nil {
+		if err := ctl.preflightAttach(attachRef); err != nil {
 			return failAfterAttach(err)
 		}
 		state.AttachRef = attachRef
@@ -1996,32 +2023,40 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		if err := operation.writeIntent("kernel-mounted", os.Getpid(), processIdentity); err != nil {
 			return failAfterKernelMount(err)
 		}
-		if err := waitForFSKitRoot(
+		attestReadiness, err := fskitReadinessProbeForPolicy(
+			fskitCachePolicy,
+			func() error { return ctl.bindMountRoot(attachRef) },
+			func() error { return ctl.requireNativeFrontendReady(attachRef) },
+		)
+		if err != nil {
+			return failAfterKernelMount(err)
+		}
+		if err := waitForFSKitReady(
 			mountPath,
 			fskitCfg.fsType,
 			fskitidentity.ResourcePrefix+attachRef,
+			attestReadiness,
 			15*time.Second,
 		); err != nil {
 			return failAfterKernelMount(err)
 		}
 		// THE MOUNT IS PROVEN; DROP THE PIN BEFORE ANYONE CAN ASK TO UNMOUNT.
 		//
-		// waitForFSKitRoot has confirmed the exact kernel mount for this attach
-		// is present and serving, so the validate→mount window this fd exists to
-		// protect is closed. From here on the fd is only a covered-vnode
+		// waitForFSKitReady has confirmed the exact kernel mount for this attach
+		// around the policy's exact readiness witness: a retained, attested root
+		// descriptor for macOS 26, or a live resolved `portablefskit` connection
+		// for native macOS 27. The validate→mount window this fd exists to protect
+		// is closed. From here on the fd is only a covered-vnode
 		// reference, and the one thing it can still do is answer EBUSY to this
 		// mount's own unmount. Release it BEFORE readiness is reported, so no
 		// unmount request can ever race a live pin. See the pin's definition in
 		// runMountForeground.
 		releaseMountTargetPin()
-		// The mount is proven present and serving and nothing is in flight:
-		// the one sound moment to bind the daemon's repair root descriptor.
-		// Deriving it later would mean opening a path on this mount while a
-		// coherence barrier is closed, which asks the extension to serve a
-		// callback for the very repair it is waiting on.
-		if err := ctl.bindMountRoot(attachRef); err != nil {
-			return failAfterKernelMount(fmt.Errorf("bind the daemon's repair mount root: %w", err))
-		}
+		// Readiness already established the exact repair primitive for this
+		// policy. macOS 26 bound and retained the mount root descriptor inside
+		// attestReadiness; native macOS 27 proved a resolved FSKit frontend and
+		// must never path-open the mounted network volume from the background
+		// service. Do not add a second unconditional bind here.
 		// The daemon owns any configured automatic enrollment. In standalone
 		// mode it instead exposes the explicit manual reauthorization operation.
 		if len(attachReply.AuthorizationSessionID) != 22 {
@@ -2079,11 +2114,19 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 				present = false
 			}
 			if present {
-				if revoke, reason := watchdog.observe(time.Now()); revoke {
+				if revoke, verdict := watchdog.observe(time.Now()); revoke {
 					if failClosedReason == "" {
-						failClosedReason = reason
+						failClosedReason = verdict.sentence
+						// Persist the verdict BEFORE attempting the forced
+						// unmount. The mount is already revoked at this point —
+						// it refuses to serve regardless of whether the kernel
+						// lets go — and a forced unmount that wedges must not be
+						// what decides whether anyone ever finds out.
+						if !setMountRevoked(stateDir, mountPath, verdict.reason, verdict.sentence, time.Now().UnixMilli()) {
+							fmt.Fprintf(e.stderr, "portablefs mount: could not record the revoked status for %s\n", mountPath)
+						}
 					}
-					fmt.Fprintf(e.stderr, "portablefs mount: revoking the kernel mount at %s: %s\n", mountPath, reason)
+					fmt.Fprintf(e.stderr, "portablefs mount: revoking the kernel mount at %s: %s\n", mountPath, verdict.sentence)
 					if err := forceRevokeFSKitKernelMount(&state); err != nil {
 						// The watchdog fires again at its next interval; a
 						// revocation that cannot complete is retried, never
@@ -2162,38 +2205,77 @@ func recordFUSERenewalEvent(events *mountlog.Writer, stateDir, mountPath, enroll
 	}
 }
 
-// waitForFSKitRoot waits for a kernel-visible mount whose root can answer a
-// real filesystem operation. mount(8) may return before the FSKit resource
-// has completed loading; reporting readiness in that gap makes the first
-// user operation fail even though the mount becomes usable moments later.
-func waitForFSKitRoot(mountPath, expectedFSType, expectedSource string, timeout time.Duration) error {
+// waitForFSKitReady waits for one exact kernel FSKit mount around the exact
+// readiness primitive declared by its cache policy. The initiating CLI never
+// opens the mounted path: macOS applies the requesting process's Network
+// Volumes privacy policy to that I/O. Legacy macOS 26 attests and retains the
+// root descriptor its VFS repair channel needs. Native macOS 27 instead proves
+// that the shipping FSKit frontend has a live, resolved connection for this
+// exact attach; the native DataCacheHandler policy has no root-descriptor
+// actuation channel.
+func waitForFSKitReady(
+	mountPath, expectedFSType, expectedSource string,
+	attestReadiness func() error,
+	timeout time.Duration,
+) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for {
-		if err := verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource); err != nil {
-			lastErr = err
-		} else {
-			remaining := time.Until(deadline)
-			if remaining > time.Second {
-				remaining = time.Second
-			}
-			if remaining > 0 {
-				if err := probeFSKitRootOnce(mountPath, remaining); err != nil {
-					lastErr = err
-				} else if err := verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource); err != nil {
-					lastErr = fmt.Errorf("kernel mount identity changed after root probe: %w", err)
-				} else {
-					return nil
-				}
-			}
+		retry, err := proveFSKitReadyOnce(
+			func() error {
+				return verifyFSKitMountIdentity(mountPath, expectedFSType, expectedSource)
+			},
+			attestReadiness,
+		)
+		if err == nil {
+			return nil
 		}
+		if !retry {
+			return err
+		}
+		lastErr = err
 		if !time.Now().Before(deadline) {
 			return fmt.Errorf(
-				"FSKit mounted %s but its root did not become usable within %s: %w",
+				"FSKit mounted %s but policy readiness was not attested within %s: %w",
 				mountPath, timeout, lastErr,
 			)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// proveFSKitReadyOnce preserves the security-critical
+// kernel→policy-witness→kernel order. Once a witness succeeds, any identity
+// change is a mount substitution and fails immediately instead of retrying
+// against the replacement.
+func proveFSKitReadyOnce(verifyIdentity, attestReadiness func() error) (retry bool, err error) {
+	if err := verifyIdentity(); err != nil {
+		return true, err
+	}
+	if err := attestReadiness(); err != nil {
+		return true, fmt.Errorf("attest the exact FSKit frontend: %w", err)
+	}
+	if err := verifyIdentity(); err != nil {
+		return false, fmt.Errorf("kernel mount identity changed after readiness attestation: %w", err)
+	}
+	return false, nil
+}
+
+// fskitReadinessProbeForPolicy keeps the descriptor and native connection
+// channels disjoint. A native mount can never call bind-root; a legacy mount
+// can never treat a self/frontend connection witness as its repair actuator.
+func fskitReadinessProbeForPolicy(
+	cachePolicy string,
+	bindLegacyRoot func() error,
+	requireNativeFrontend func() error,
+) (func() error, error) {
+	switch cachePolicy {
+	case portablefsd.V3CachePolicyMacOS26V1, portablefsd.V3CachePolicyMacOS26:
+		return bindLegacyRoot, nil
+	case portablefsd.V3CachePolicyFSKit:
+		return requireNativeFrontend, nil
+	default:
+		return nil, fmt.Errorf("unsupported FSKit readiness policy %q", cachePolicy)
 	}
 }
 
@@ -3555,6 +3637,63 @@ func stopMountDaemon(st *mountState) error {
 	)
 }
 
+// mountInventoryRow is one `portablefs mounts` row. It is a package-level
+// type, not a local one, because it IS the command's JSON contract: the
+// fields below are what an agent or the app reads, and a contract that
+// cannot be named cannot be tested.
+type mountInventoryRow struct {
+	MountPath              string   `json:"mountPath"`
+	VolumeID               string   `json:"volumeId"`
+	Branch                 string   `json:"branch"`
+	PID                    int      `json:"pid"`
+	Strategy               string   `json:"strategy"`
+	AuthorityURL           string   `json:"authorityUrl,omitempty"`
+	AttachRef              string   `json:"attachRef,omitempty"`
+	AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
+	StartedAtMs            int64    `json:"startedAtMs"`
+	LocalDirs              []string `json:"localDirs,omitempty"`
+	// LocalRoutes and LocalRouteRevision are the machine-local route set
+	// a FUSE mount activated and the revision it answers for.
+	LocalRoutes        []string `json:"localRoutes,omitempty"`
+	LocalRouteRevision string   `json:"localRouteRevision,omitempty"`
+	Alive              bool     `json:"alive"`
+	Status             string   `json:"status,omitempty"`
+	StatusChangedAtMs  int64    `json:"statusChangedAtMs,omitempty"`
+	// StatusReason and StatusDetail carry a revocation's machine-readable
+	// class and the engine's own sentence. They are the reason a revoked
+	// mount is actionable rather than merely alarming, and they are
+	// recorded identically by the Linux and macOS supervisors.
+	StatusReason string `json:"statusReason,omitempty"`
+	StatusDetail string `json:"statusDetail,omitempty"`
+	// Health folds pid-liveness and the persisted status:
+	// live | stale | credential-expired | revoked | cleanup-required.
+	Health string `json:"health"`
+	// AttachState is the daemon-reported attach state (degraded carries
+	// the daemon's last error in the printed line).
+	AttachState string `json:"attachState,omitempty"`
+	// SessionTerminal is the daemon's verdict that this attach's authority
+	// session ended permanently. The macOS revocation watchdog has always
+	// branched on it, but it never reached --json, so an agent could see a
+	// mount the supervisor was about to revoke and read it as healthy.
+	SessionTerminal bool `json:"sessionTerminal,omitempty"`
+	// AttachError is the daemon's own lastError for the attach. The
+	// printed line already shows it; the JSON view dropped it, so an agent
+	// reading --json could see attachState=degraded with no reason at all.
+	AttachError string `json:"attachError,omitempty"`
+	// CleanupRequired marks a durable operation intent with no matching
+	// mount-state record. It is deliberately a first-class inventory row:
+	// crash recovery must never disappear from the CLI or app view.
+	CleanupRequired           bool   `json:"cleanupRequired,omitempty"`
+	OperationPhase            string `json:"operationPhase,omitempty"`
+	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
+	EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
+	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
+	LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
+	NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
+	ReauthorizationFailures   uint64 `json:"reauthorizationFailures,omitempty"`
+	ReauthorizationError      string `json:"reauthorizationError,omitempty"`
+}
+
 func cmdMounts(e *cmdEnv, args []string) int {
 	fs := newFlagSet("mounts")
 	var o commonOpts
@@ -3574,47 +3713,6 @@ func cmdMounts(e *cmdEnv, args []string) int {
 	if err != nil {
 		return e.fail("mounts", err)
 	}
-	type mountRow struct {
-		MountPath              string   `json:"mountPath"`
-		VolumeID               string   `json:"volumeId"`
-		Branch                 string   `json:"branch"`
-		PID                    int      `json:"pid"`
-		Strategy               string   `json:"strategy"`
-		AuthorityURL           string   `json:"authorityUrl,omitempty"`
-		AttachRef              string   `json:"attachRef,omitempty"`
-		AuthorizationSessionID string   `json:"authorizationSessionId,omitempty"`
-		StartedAtMs            int64    `json:"startedAtMs"`
-		LocalDirs              []string `json:"localDirs,omitempty"`
-		// LocalRoutes and LocalRouteRevision are the machine-local route set
-		// a FUSE mount activated and the revision it answers for.
-		LocalRoutes        []string `json:"localRoutes,omitempty"`
-		LocalRouteRevision string   `json:"localRouteRevision,omitempty"`
-		Alive              bool     `json:"alive"`
-		Status             string   `json:"status,omitempty"`
-		StatusChangedAtMs  int64    `json:"statusChangedAtMs,omitempty"`
-		// Health folds pid-liveness and the persisted credential status:
-		// live | stale | credential-expired.
-		Health string `json:"health"`
-		// AttachState is the daemon-reported attach state (degraded carries
-		// the daemon's last error in the printed line).
-		AttachState string `json:"attachState,omitempty"`
-		// AttachError is the daemon's own lastError for the attach. The
-		// printed line already shows it; the JSON view dropped it, so an agent
-		// reading --json could see attachState=degraded with no reason at all.
-		AttachError string `json:"attachError,omitempty"`
-		// CleanupRequired marks a durable operation intent with no matching
-		// mount-state record. It is deliberately a first-class inventory row:
-		// crash recovery must never disappear from the CLI or app view.
-		CleanupRequired           bool   `json:"cleanupRequired,omitempty"`
-		OperationPhase            string `json:"operationPhase,omitempty"`
-		MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
-		EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
-		AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
-		LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
-		NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
-		ReauthorizationFailures   uint64 `json:"reauthorizationFailures,omitempty"`
-		ReauthorizationError      string `json:"reauthorizationError,omitempty"`
-	}
 	var daemonView map[string]cliAttachStatus
 	for i := range states {
 		if states[i].Strategy == "fskit" && states[i].AttachRef != "" {
@@ -3625,7 +3723,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			break
 		}
 	}
-	rows := make([]mountRow, 0, len(states))
+	rows := make([]mountInventoryRow, 0, len(states))
 	statePaths := make(map[string]struct{}, len(states))
 	for i := range states {
 		st := &states[i]
@@ -3633,7 +3731,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// mountState contains the live access credential because the daemon
 		// needs it for renewal. Never embed that persistence object in a
 		// presentation type: JSON output is routinely captured in agent logs.
-		row := mountRow{
+		row := mountInventoryRow{
 			MountPath:              st.MountPath,
 			VolumeID:               st.VolumeID,
 			Branch:                 st.Branch,
@@ -3650,6 +3748,8 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			Status:                 st.Status,
 			Health:                 e.classifyMount(st),
 			StatusChangedAtMs:      st.StatusChangedAtMs,
+			StatusReason:           st.StatusReason,
+			StatusDetail:           st.StatusDetail,
 			MountEnrollmentID:      st.MountEnrollmentID, EnrollmentExpiresAtMs: st.EnrollmentExpiresAtMs,
 			AuthorizationDeadlineAtMs: st.AuthorizationDeadlineAtMs, LastReauthorizationAtMs: st.LastReauthorizationAtMs,
 			NextReauthorizationAtMs: st.NextReauthorizationAtMs, ReauthorizationFailures: st.ReauthorizationFailures,
@@ -3658,6 +3758,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		if a, ok := daemonView[states[i].AttachRef]; ok {
 			row.AttachState = a.State
 			row.AttachError = a.LastError
+			row.SessionTerminal = a.SessionTerminal
 			if a.MountEnrollmentID != "" {
 				row.MountEnrollmentID = a.MountEnrollmentID
 				row.EnrollmentExpiresAtMs = a.EnrollmentExpiresAtMs
@@ -3675,7 +3776,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		if _, tracked := statePaths[intent.MountPath]; tracked {
 			continue
 		}
-		rows = append(rows, mountRow{
+		rows = append(rows, mountInventoryRow{
 			MountPath:       intent.MountPath,
 			VolumeID:        intent.VolumeID,
 			Branch:          intent.Branch,
@@ -3700,6 +3801,8 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			mountPath:         row.MountPath,
 			operationPhase:    row.OperationPhase,
 			statusChangedAtMs: row.StatusChangedAtMs,
+			statusReason:      row.StatusReason,
+			statusDetail:      row.StatusDetail,
 			attachState:       row.AttachState,
 			attachLastError:   row.AttachError,
 		})
@@ -3726,7 +3829,12 @@ type mountStatusInput struct {
 	mountPath         string
 	operationPhase    string
 	statusChangedAtMs int64
-	attachState       string
+	// statusReason and statusDetail are a revocation's recorded class and the
+	// engine's sentence. A revoked mount's whole value to an operator is why,
+	// so the word carries both rather than a bare "revoked".
+	statusReason string
+	statusDetail string
+	attachState  string
 	// attachLastError is the daemon's own sentence for this degradation. A
 	// router refusal has three different conditions behind it with three
 	// different remedies, and a fixed status word cannot name which — so for
@@ -3764,6 +3872,25 @@ func mountStatusWord(row mountStatusInput) string {
 		return "credential-expired" + since +
 			" (this mount's authorization ended and can no longer be renewed; mount again " +
 			"with a fresh volume mount capability)"
+	case mountStatusRevoked:
+		// A revoked mount refuses to serve and can never serve again. It is
+		// reported ahead of liveness precisely because it may still look alive:
+		// its owner is running and, when the withdrawal escalation could not
+		// finish, its kernel mount is still installed.
+		since := ""
+		if row.statusChangedAtMs != 0 {
+			since = " since " + formatMs(row.statusChangedAtMs)
+		}
+		word := "revoked" + since
+		if row.statusReason != "" {
+			word += " (" + row.statusReason
+			if row.statusDetail != "" {
+				word += ": " + row.statusDetail
+			}
+			word += "; run `portablefs umount " + row.mountPath + "` and mount again)"
+			return word
+		}
+		return word + " (run `portablefs umount " + row.mountPath + "` and mount again)"
 	}
 	if row.attachState != "degraded" {
 		return "live"
@@ -3775,6 +3902,14 @@ func mountStatusWord(row mountStatusInput) string {
 }
 
 func fskitAttachStatuses(getenv func(string) string, cliVersion string) (map[string]cliAttachStatus, error) {
+	return fskitAttachStatusesForIdentity(getenv, cliVersion, nil)
+}
+
+func fskitAttachStatusesForIdentity(
+	getenv func(string) string,
+	cliVersion string,
+	expected *daemonctl.Identity,
+) (map[string]cliAttachStatus, error) {
 	cfg, err := fskitConfigFromEnv(getenv)
 	if err != nil {
 		return nil, err
@@ -3784,7 +3919,15 @@ func fskitAttachStatuses(getenv func(string) string, cliVersion string) (map[str
 	if !liveness.healthy() {
 		return nil, nil
 	}
-	ctl, err := connectCompatiblePortablefsd(cfg, cliVersion)
+	var ctl *fsdControl
+	if expected == nil {
+		ctl, err = connectCompatiblePortablefsd(cfg, cliVersion)
+	} else {
+		ctl = newFsdControl(cfg.controlSock)
+		if identityErr := ctl.requireExactIdentityWithin(*expected, 3*time.Second); identityErr != nil {
+			err = identityErr
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("portablefsd identity: %w", err)
 	}

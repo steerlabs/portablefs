@@ -183,11 +183,11 @@ func (v *Volume) walkRestoreSubtree(pathFD int, identities map[[16]byte]uint32, 
 	if err != nil {
 		return err
 	}
-	if err := setPermissionBitsFD(pathFD, original|restoreWalkBits); err != nil {
+	if err := v.chmodCapability(pathFD, KindDirectory, original|restoreWalkBits); err != nil {
 		return err
 	}
 	defer func() {
-		if restoreErr := setPermissionBitsFD(pathFD, original); restoreErr != nil {
+		if restoreErr := v.chmodCapability(pathFD, KindDirectory, original); restoreErr != nil {
 			err = errors.Join(err, fmt.Errorf(
 				"xfsstore: the restore binding walk could not restore mode %#o on the directory it widened: %w",
 				original, restoreErr))
@@ -203,10 +203,11 @@ func (v *Volume) walkRestoreSubtree(pathFD int, identities map[[16]byte]uint32, 
 // openRestoreFile produces the one descriptor a bound restore file keeps for the
 // lifetime of the restore. reopen is the only way this volume ever obtains a
 // writable descriptor, so the retained fd carries the project-accounting check
-// with it; addressing the inode through the walk's O_PATH descriptor with
-// AT_EMPTY_PATH rather than re-resolving a name is what stops a rename, or a
+// with it; addressing the inode through the O_PATH descriptor's /proc magic
+// link rather than re-resolving a user-tree name is what stops a rename, or a
 // replacement under the same name, from redirecting the chmod or the open at
-// another inode.
+// another inode. This is the same pre-6.6-compatible chmod mechanism as every
+// other xfsstore metadata path.
 func (v *Volume) openRestoreFile(pathFD int) (int, error) {
 	fd, openErr := v.reopen(pathFD, unix.O_RDWR, KindRegular)
 	if openErr == nil {
@@ -219,11 +220,11 @@ func (v *Volume) openRestoreFile(pathFD int) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	if err := setPermissionBitsFD(pathFD, original|restoreWriteBits); err != nil {
+	if err := v.chmodCapability(pathFD, KindRegular, original|restoreWriteBits); err != nil {
 		return -1, err
 	}
 	fd, openErr = v.reopen(pathFD, unix.O_RDWR, KindRegular)
-	if restoreErr := setPermissionBitsFD(pathFD, original); restoreErr != nil {
+	if restoreErr := v.chmodCapability(pathFD, KindRegular, original); restoreErr != nil {
 		if openErr == nil {
 			_ = unix.Close(fd)
 		}
@@ -272,10 +273,6 @@ func permissionBitsFD(fd int) (uint32, error) {
 		return 0, err
 	}
 	return uint32(st.Mode) & 0o7777, nil
-}
-
-func setPermissionBitsFD(fd int, bits uint32) error {
-	return unix.Fchmodat(fd, "", bits, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 }
 
 // PWrite lands hydrated bytes through the retained descriptor. The file's own
@@ -371,14 +368,14 @@ func (r *RestoreFiles) DiscardUnlinked(entry uint32) (bool, error) {
 	r.volume.mu.RLock()
 	referenced := false
 	for _, object := range r.volume.objects {
-		if object.identity == file.identity {
+		if object.coordinate.Stable == file.identity {
 			referenced = true
 			break
 		}
 	}
 	if !referenced {
 		for _, open := range r.volume.opens {
-			if open.identity == file.identity {
+			if open.coordinate.Stable == file.identity {
 				referenced = true
 				break
 			}

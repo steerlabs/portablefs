@@ -623,7 +623,7 @@ func TestRecallSaturationDoesNotBlockSessionKeepAlive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	credential, err := authority.Attach(1, volumeserver.PeerIdentity{1}, volumeserver.Authorization{
+	credential, err := authority.AttachActiveForTest(1, volumeserver.PeerIdentity{1}, volumeserver.Authorization{
 		Access: volumeserver.AccessRead, Deadline: time.Now().Add(time.Hour),
 	})
 	if err != nil {

@@ -24,7 +24,12 @@ func TestAuthorityConfigIsStrictAndLauncherArgumentsUseOnlyFixedPaths(t *testing
 			t.Fatalf("launcher arguments exposed forbidden input %q: %q", forbidden, arguments)
 		}
 	}
-	for _, required := range []string{"/srv/portablefs-volume", "/run/portablefs-volume/authority-3.key", "/var/lib/portablefs-volume/visibility.membership"} {
+	for _, required := range []string{
+		"/srv/portablefs-volume",
+		"/run/portablefs-volume/authority-3.key",
+		"/var/lib/portablefs-volume/visibility.membership",
+		"/var/lib/portablefs-write-staging",
+	} {
 		if !slices.Contains(arguments, required) {
 			t.Fatalf("launcher arguments omit fixed path %q: %q", required, arguments)
 		}

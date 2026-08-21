@@ -301,6 +301,12 @@ surfaced volume-wide.
   user write and shortening truncate recalls its overlapping cold chunks
   first — there is no fetch-free overwrite path (ordering contract,
   rule 2).
+- Protocol-6 range mutations use the same rule. Hole-punch and zero-range
+  hydrate and durably mark every overlapping stored chunk before XFS apply;
+  collapse and insert do so from the mutation offset through the old EOF.
+  `copy_file_range` hydrates its source range for reading and durably hydrates
+  the destination range before copying. Allocation-only KEEP_SIZE/UNSHARE work
+  changes no logical bytes and therefore does not alter hydration ownership.
 - `fsync` on a partially hydrated file is already honest: hydrated chunks
   are durable in XFS, unhydrated chunks are durable in the sealed archive.
   fsync fsyncs XFS; nothing more is needed.

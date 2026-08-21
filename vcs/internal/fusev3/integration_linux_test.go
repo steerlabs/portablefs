@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"golang.org/x/sys/unix"
 )
@@ -73,11 +74,15 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 	}
 	defer mappedFile.Close()
 
-	// A shared mapping of a FOPEN_DIRECT_IO file is refused by the kernel with
-	// exactly ENODEV (fs/fuse/file.c). Accepting EINVAL or ENOSYS as well would
-	// let an unrelated mmap breakage, or a mount that stopped setting
-	// FOPEN_DIRECT_IO and instead failed for some other reason, pass as if the
-	// coherence contract were being enforced.
+	// A shared mapping of a SHARED regular file is refused by the kernel with
+	// exactly ENODEV (fs/fuse/file.c). The reason survived the move to a
+	// retained page cache and got sharper: a writable shared mapping would
+	// dirty folios that never travel an authority WRITE RPC, and a dirty
+	// folio is the one thing invalidate_inode_pages2() cannot withdraw, so it
+	// would turn every later DATA repair on the inode into a revocation.
+	// Accepting EINVAL or ENOSYS as well would let an unrelated mmap breakage,
+	// or a mount that stopped refusing shared mappings and instead failed for
+	// some other reason, pass as if the contract were being enforced.
 	for _, shared := range []struct {
 		what string
 		prot int
@@ -88,7 +93,7 @@ func TestTwoKernelMountsShareAuthoritativeXFS(t *testing.T) {
 		mapping, err := unix.Mmap(int(mappedFile.Fd()), 0, 4096, shared.prot, unix.MAP_SHARED)
 		if err == nil {
 			_ = unix.Munmap(mapping)
-			t.Fatalf("%s unexpectedly succeeded on a coherent direct-I/O mount", shared.what)
+			t.Fatalf("%s unexpectedly succeeded on a coherent mount", shared.what)
 		}
 		requireErrno(t, err, syscall.ENODEV, shared.what)
 	}
@@ -323,8 +328,20 @@ func TestCreateWithAReadOnlyModeReturnsAWritableHandle(t *testing.T) {
 // "coherence" assertion was not: it reads on the second mount first, mutates on
 // the first, and then reads again through the same descriptor and at the same
 // offset. Every mutation keeps the file length identical, so no size-derived
-// heuristic can rescue a stale page. A mount that dropped FOPEN_DIRECT_IO or
-// started publishing a nonzero attribute timeout fails here.
+// heuristic can rescue a stale page.
+//
+// Read-only opens covered by a D-R lease use FOPEN_KEEP_CACHE, so this is also
+// the load-bearing cached-page test. The same-length payloads are what make it
+// one. The first read populates mount B's page cache; every later read
+// at the same offset is served from that cache unless something withdrew it.
+// Only the ordered DATA publication does -- it invalidates the whole mapping by
+// sequence, never by an EOF delta -- so a kernel that short-circuited the
+// invalidation when i_size was unchanged fails here, as does a mount that
+// stopped joining the barrier's audience for the inode.
+//
+// REQUIRES THE PRIVILEGED RUNNER: this test needs a real strict-coherence
+// kernel and two live mounts. It cannot be exercised by the unit fixtures,
+// which never populate a page cache at all.
 func TestCrossMountContentCoherence(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	nameA, nameB := f.join(0, "content"), f.join(1, "content")
@@ -505,6 +522,12 @@ func TestCrossMountPositiveDentryInvalidation(t *testing.T) {
 // project calls out as a platform hazard: a name that was looked up and found
 // missing must start resolving as soon as the other mount creates it. A cached
 // negative dentry makes the second stat below fail.
+//
+// The repeated probes below are not defensive any more. A strict mount
+// publishes an absence with a real lifetime, so after the first miss the
+// following two are answered by this kernel with no upcall at all, and the only
+// thing that can make the later stat succeed is the creating mount's barrier
+// expiring this entry before its own create(2) returns.
 func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	ghostA, ghostB := f.join(0, "ghost"), f.join(1, "ghost")
@@ -818,6 +841,85 @@ func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
 	}
 }
 
+// TestStockWriteRequestSplitting is gated on the provider kernel. It proves
+// that ordinary positioned writes are sent as standard FUSE_WRITE requests and
+// that max_write/page-vector boundaries split rather than entering a private
+// transaction protocol.
+func TestStockWriteRequestSplitting(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	path := f.join(0, "write-size-classes")
+	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR, 0o600)
+	defer file.Close()
+
+	countWrite := func(write func() error) int {
+		t.Helper()
+		before := f.counter.count("write")
+		if err := write(); err != nil {
+			t.Fatal(err)
+		}
+		return f.counter.count("write") - before
+	}
+
+	positioned := bytes.Repeat([]byte{0x31}, 4096)
+	writes := countWrite(func() error {
+		n, err := file.WriteAt(positioned, 0)
+		if err == nil && n != len(positioned) {
+			return io.ErrShortWrite
+		}
+		return err
+	})
+	if writes != 1 {
+		t.Fatalf("4 KiB positioned write authority calls = %d, want 1", writes)
+	}
+
+	// A writable O_APPEND open is ordinary. Placement itself is per write and is
+	// covered by the append suite; this test only counts request splitting, so it
+	// deliberately does not disturb the object here.
+	if appendFile, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0); err != nil {
+		t.Fatalf("O_APPEND open = %v, want acceptance", err)
+	} else if err := appendFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const maxWrite = 1 << 20
+	mapping, err := unix.Mmap(-1, 0, maxWrite+os.Getpagesize(), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Munmap(mapping)
+	for index := range mapping {
+		mapping[index] = 0x33
+	}
+	unaligned := mapping[208 : 208+maxWrite]
+	writes = countWrite(func() error {
+		n, err := unix.Pwrite(int(file.Fd()), unaligned, 2*maxWrite)
+		if err == nil && n != len(unaligned) {
+			return io.ErrShortWrite
+		}
+		return err
+	})
+	if writes != 2 {
+		t.Fatalf("unaligned max_write positioned write authority calls = %d, want 2 page-vector requests", writes)
+	}
+
+	large := mapping[:maxWrite+1]
+	writes = countWrite(func() error {
+		n, err := unix.Pwrite(int(file.Fd()), large, 3*maxWrite)
+		if err == nil && n != len(large) {
+			return io.ErrShortWrite
+		}
+		return err
+	})
+	if writes != 2 {
+		t.Fatalf("max_write+1 positioned write authority calls = %d, want 2 standard requests", writes)
+	}
+	expected := make([]byte, 4*maxWrite+1)
+	copy(expected, positioned)
+	copy(expected[2*maxWrite:], unaligned)
+	copy(expected[3*maxWrite:], large)
+	requireContent(t, path, expected, "data after stock FUSE write splits")
+}
+
 // TestConcurrentCrossMountWritersToOneFile covers two mounts writing the same
 // file at once. Disjoint ranges must all land, and a whole-block rewrite must
 // never tear, because a single kernel write below the negotiated maximum is one
@@ -932,14 +1034,18 @@ func TestAuthorityLossFailsCleanlyInsteadOfHanging(t *testing.T) {
 		if err == nil {
 			t.Fatal("a read through a descriptor of a destroyed authority succeeded")
 		}
-		// A strict mount answers ENOTCONN rather than EIO here, and the
-		// difference is the point of the change: losing the authority means
-		// this frontend can no longer be told that what it cached has changed,
-		// so it revokes itself and stops being a filesystem at all. EIO
-		// remains correct for the uncached profile, which caches nothing and
-		// therefore only ever fails the individual operation.
-		if !errors.Is(err, syscall.ENOTCONN) && !errors.Is(err, syscall.EIO) {
-			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked) or EIO", err)
+		// Losing the authority means this frontend can no longer be told that
+		// what it cached has changed, so it revokes itself and stops being a
+		// filesystem rather than failing only this operation.
+		//
+		// This read is served through a descriptor whose pages the earlier read
+		// left resident, so with FOPEN_KEEP_CACHE it is also the assertion that
+		// the revocation ladder's whole-inode data withdrawal actually ran: the
+		// kernel could otherwise answer it without any request reaching this
+		// frontend, and neither the revoked check nor the connection abort
+		// would see it.
+		if !errors.Is(err, syscall.ENOTCONN) {
+			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked)", err)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("a read through a descriptor of a destroyed authority hung")
@@ -1429,6 +1535,466 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 	}
 }
 
+// TestMutationPostStateEliminatesFollowupMetadataRPCs pins the request totals
+// exact post-state is meant to buy. Names are warmed before each mutation so
+// the mutation itself is the only authority operation; the immediate stat is
+// then a direct assertion that the reply installed the target and parent attrs.
+func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	modeOf := func(info os.FileInfo) os.FileMode {
+		if info == nil {
+			return 0
+		}
+		return info.Mode()
+	}
+	type counts struct {
+		lookup, getattr, create, mkdir, unlink, rmdir, rename, write, setattr, symlink, link int
+		open, tmpfile, fallocate, copyFileRange, removeXattr                                 int
+	}
+	measure := func(operation string, fn func()) counts {
+		before := counts{
+			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
+			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
+			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
+			rename: f.counter.count("rename"), write: f.counter.count("write"),
+			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
+			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
+			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
+			removeXattr: f.counter.count("remove-xattr"),
+		}
+		fn()
+		after := counts{
+			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
+			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
+			unlink: f.counter.count("unlink"), rmdir: f.counter.count("rmdir"),
+			rename: f.counter.count("rename"), write: f.counter.count("write"),
+			setattr: f.counter.count("setattr"), symlink: f.counter.count("symlink"), link: f.counter.count("link"),
+			open: f.counter.count("open"), tmpfile: f.counter.count("tmpfile"),
+			fallocate: f.counter.count("fallocate"), copyFileRange: f.counter.count("copy-file-range"),
+			removeXattr: f.counter.count("remove-xattr"),
+		}
+		delta := counts{
+			lookup: after.lookup - before.lookup, getattr: after.getattr - before.getattr,
+			create: after.create - before.create, mkdir: after.mkdir - before.mkdir,
+			unlink: after.unlink - before.unlink, rmdir: after.rmdir - before.rmdir,
+			rename: after.rename - before.rename, write: after.write - before.write,
+			setattr: after.setattr - before.setattr, symlink: after.symlink - before.symlink, link: after.link - before.link,
+			open: after.open - before.open, tmpfile: after.tmpfile - before.tmpfile,
+			fallocate: after.fallocate - before.fallocate, copyFileRange: after.copyFileRange - before.copyFileRange,
+			removeXattr: after.removeXattr - before.removeXattr,
+		}
+		t.Logf("%s RPCs: lookup=%d getattr=%d create=%d mkdir=%d unlink=%d rmdir=%d rename=%d write=%d setattr=%d symlink=%d link=%d open=%d tmpfile=%d fallocate=%d copy-file-range=%d remove-xattr=%d",
+			operation, delta.lookup, delta.getattr, delta.create, delta.mkdir, delta.unlink, delta.rmdir,
+			delta.rename, delta.write, delta.setattr, delta.symlink, delta.link, delta.open, delta.tmpfile,
+			delta.fallocate, delta.copyFileRange, delta.removeXattr)
+		return delta
+	}
+	requireCounts := func(operation string, got, want counts) {
+		t.Helper()
+		if got != want {
+			t.Fatalf("%s RPCs = %+v, want %+v", operation, got, want)
+		}
+	}
+
+	root := f.mountPath(0)
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("warm root attrs: %v", err)
+	}
+	createdPath := filepath.Join(root, "post-state-created")
+	if _, err := os.Lstat(createdPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm create destination absence: %v", err)
+	}
+	var created *os.File
+	createRPCs := measure("create plus child/parent stat", func() {
+		var err error
+		// Linux always performs one fresh LOOKUP for a negative dentry before
+		// CREATE, including the ordinary non-exclusive path. It precedes the
+		// mutation and therefore says nothing about post-state completeness; the
+		// child and parent stats below are the follow-up requests this assertion
+		// requires the CREATE post-state to eliminate.
+		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := os.Lstat(createdPath); err != nil {
+			t.Fatalf("stat created child: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after create: %v", err)
+		}
+	})
+	requireCounts("create plus child/parent stat", createRPCs, counts{lookup: 1, create: 1})
+
+	payload := []byte("exact post-state")
+	writeRPCs := measure("write plus warm fstat", func() {
+		if n, err := created.Write(payload); err != nil || n != len(payload) {
+			t.Fatalf("write = (%d, %v), want (%d, nil)", n, err, len(payload))
+		}
+		info, err := created.Stat()
+		if err != nil || info.Size() != int64(len(payload)) {
+			t.Fatalf("warm fstat after write: size=%v err=%v", sizeOf(info), err)
+		}
+	})
+	requireCounts("write plus warm fstat", writeRPCs, counts{write: 1})
+	if err := created.Close(); err != nil {
+		t.Fatalf("close created file: %v", err)
+	}
+
+	setattrRPCs := measure("setattr plus warm stat", func() {
+		if err := os.Chmod(createdPath, 0o640); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		info, err := os.Lstat(createdPath)
+		if err != nil || info.Mode().Perm() != 0o640 {
+			t.Fatalf("stat after chmod: mode=%v err=%v", modeOf(info), err)
+		}
+	})
+	requireCounts("setattr plus warm stat", setattrRPCs, counts{setattr: 1})
+
+	truncateRPCs := measure("truncating open plus warm fstat", func() {
+		file, err := os.OpenFile(createdPath, os.O_TRUNC|os.O_RDWR, 0)
+		if err != nil {
+			t.Fatalf("truncating open: %v", err)
+		}
+		info, statErr := file.Stat()
+		if statErr != nil || info.Size() != 0 {
+			_ = file.Close()
+			t.Fatalf("fstat after truncating open: size=%v err=%v", sizeOf(info), statErr)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close truncated file: %v", err)
+		}
+	})
+	requireCounts("truncating open plus warm fstat", truncateRPCs, counts{open: 1})
+
+	fallocateFile, err := os.OpenFile(createdPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open fallocate target: %v", err)
+	}
+	fallocateRPCs := measure("fallocate plus warm fstat", func() {
+		if err := unix.Fallocate(int(fallocateFile.Fd()), 0, 0, 4096); err != nil {
+			t.Fatalf("fallocate: %v", err)
+		}
+		info, statErr := fallocateFile.Stat()
+		if statErr != nil || info.Size() != 4096 {
+			t.Fatalf("fstat after fallocate: size=%v err=%v", sizeOf(info), statErr)
+		}
+	})
+	requireCounts("fallocate plus warm fstat", fallocateRPCs, counts{fallocate: 1})
+	if err := fallocateFile.Close(); err != nil {
+		t.Fatalf("close fallocate target: %v", err)
+	}
+
+	const removableXattr = "user.portablefs-post-state-remove"
+	if err := unix.Setxattr(filepath.Join(f.volumeRoot, "post-state-created"), removableXattr, []byte("value"), 0); err != nil {
+		t.Fatalf("seed removable xattr directly in the isolated backing tree: %v", err)
+	}
+	removeXattrRPCs := measure("remove xattr plus warm stat", func() {
+		if err := unix.Removexattr(createdPath, removableXattr); err != nil {
+			t.Fatalf("removexattr: %v", err)
+		}
+		if _, err := os.Lstat(createdPath); err != nil {
+			t.Fatalf("stat after removexattr: %v", err)
+		}
+	})
+	requireCounts("remove xattr plus warm stat", removeXattrRPCs, counts{removeXattr: 1})
+
+	mkdirPath := filepath.Join(root, "post-state-directory")
+	if _, err := os.Lstat(mkdirPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm mkdir destination absence: %v", err)
+	}
+	mkdirRPCs := measure("mkdir plus child/parent stat", func() {
+		if err := os.Mkdir(mkdirPath, 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if _, err := os.Lstat(mkdirPath); err != nil {
+			t.Fatalf("stat created directory: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after mkdir: %v", err)
+		}
+	})
+	requireCounts("mkdir plus child/parent stat", mkdirRPCs, counts{lookup: 1, mkdir: 1})
+
+	mknodPath := filepath.Join(root, "post-state-mknod")
+	if _, err := os.Lstat(mknodPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm mknod destination absence: %v", err)
+	}
+	mknodRPCs := measure("mknod plus child/parent stat", func() {
+		if err := unix.Mknod(mknodPath, unix.S_IFREG|0o600, 0); err != nil {
+			t.Fatalf("mknod regular file: %v", err)
+		}
+		for _, path := range []string{mknodPath, root} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after mknod %s: %v", path, err)
+			}
+		}
+	})
+	requireCounts("mknod plus child/parent stat", mknodRPCs, counts{lookup: 1, create: 1})
+
+	tmpfileRPCs := measure("tmpfile plus inode/parent stat", func() {
+		fd, err := unix.Open(root, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+		if err != nil {
+			t.Fatalf("open O_TMPFILE: %v", err)
+		}
+		file := os.NewFile(uintptr(fd), "post-state-tmpfile")
+		if file == nil {
+			_ = unix.Close(fd)
+			t.Fatal("wrap O_TMPFILE descriptor")
+		}
+		if _, err := file.Stat(); err != nil {
+			_ = file.Close()
+			t.Fatalf("fstat O_TMPFILE: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close O_TMPFILE: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after O_TMPFILE: %v", err)
+		}
+	})
+	requireCounts("tmpfile plus inode/parent stat", tmpfileRPCs, counts{tmpfile: 1})
+
+	symlinkPath := filepath.Join(root, "post-state-symlink")
+	if _, err := os.Lstat(symlinkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm symlink destination absence: %v", err)
+	}
+	symlinkRPCs := measure("symlink plus child/parent stat", func() {
+		if err := os.Symlink("post-state-created", symlinkPath); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if info, err := os.Lstat(symlinkPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("lstat created symlink: mode=%v err=%v", modeOf(info), err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after symlink: %v", err)
+		}
+	})
+	requireCounts("symlink plus child/parent stat", symlinkRPCs, counts{lookup: 1, symlink: 1})
+
+	linkPath := filepath.Join(root, "post-state-hardlink")
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("warm link source: %v", err)
+	}
+	if _, err := os.Lstat(linkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm link destination absence: %v", err)
+	}
+	linkRPCs := measure("link plus target/source/parent stat", func() {
+		if err := os.Link(createdPath, linkPath); err != nil {
+			t.Fatalf("link: %v", err)
+		}
+		for _, path := range []string{linkPath, createdPath, root} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after link %s: %v", path, err)
+			}
+		}
+	})
+	requireCounts("link plus target/source/parent stat", linkRPCs, counts{lookup: 1, link: 1})
+
+	copySourcePath, copyDestinationPath := filepath.Join(root, "post-state-copy-source"), filepath.Join(root, "post-state-copy-destination")
+	mustWrite(t, copySourcePath, []byte("copy"), 0o600)
+	mustWrite(t, copyDestinationPath, nil, 0o600)
+	copySource, err := os.Open(copySourcePath)
+	if err != nil {
+		t.Fatalf("open copy source: %v", err)
+	}
+	copyDestination, err := os.OpenFile(copyDestinationPath, os.O_RDWR, 0)
+	if err != nil {
+		_ = copySource.Close()
+		t.Fatalf("open copy destination: %v", err)
+	}
+	copyRPCs := measure("copy-file-range plus source/destination stat", func() {
+		copied, err := unix.CopyFileRange(int(copySource.Fd()), nil, int(copyDestination.Fd()), nil, 4, 0)
+		if err != nil || copied != 4 {
+			t.Fatalf("copy_file_range = (%d, %v), want (4, nil)", copied, err)
+		}
+		for _, file := range []*os.File{copySource, copyDestination} {
+			if _, err := file.Stat(); err != nil {
+				t.Fatalf("fstat after copy_file_range: %v", err)
+			}
+		}
+	})
+	requireCounts("copy-file-range plus source/destination stat", copyRPCs, counts{copyFileRange: 1})
+	if err := copySource.Close(); err != nil {
+		t.Fatalf("close copy source: %v", err)
+	}
+	if err := copyDestination.Close(); err != nil {
+		t.Fatalf("close copy destination: %v", err)
+	}
+
+	rmdirPath := filepath.Join(root, "post-state-rmdir")
+	mustMkdir(t, rmdirPath)
+	for _, path := range []string{rmdirPath, root} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("warm rmdir path %s: %v", path, err)
+		}
+	}
+	rmdirRPCs := measure("rmdir plus child/parent stat", func() {
+		if err := os.Remove(rmdirPath); err != nil {
+			t.Fatalf("rmdir: %v", err)
+		}
+		if _, err := os.Lstat(rmdirPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat removed directory: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after rmdir: %v", err)
+		}
+	})
+	requireCounts("rmdir plus child/parent stat", rmdirRPCs, counts{lookup: 1, rmdir: 1})
+
+	existingName := "post-state-existing-create"
+	existingPath := filepath.Join(root, existingName)
+	if _, err := os.Lstat(existingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm existing-create negative: %v", err)
+	}
+	injected := make(chan error, 1)
+	peerCreateEntered := make(chan struct{})
+	var peerCreateOnce sync.Once
+	f.counter.setBeforeHandle(func(request *authoritypb.Request) {
+		create := request.GetCreate()
+		if create == nil || string(create.GetName()) != existingName {
+			return
+		}
+		peerCreateOnce.Do(func() { close(peerCreateEntered) })
+	})
+	defer f.counter.setBeforeHandle(nil)
+	type existingCreateResult struct {
+		errno   int32
+		failure authoritypb.FailureClass
+		err     error
+	}
+	results := make(chan existingCreateResult, 8)
+	var injectOnce sync.Once
+	f.transports[0].setBeforeMutation(func(request *authoritypb.Request) {
+		create := request.GetCreate()
+		if create == nil || string(create.GetName()) != existingName {
+			return
+		}
+		injectOnce.Do(func() {
+			go func() {
+				file, createErr := os.OpenFile(f.join(1, existingName), os.O_CREATE|os.O_RDWR, 0o600)
+				if createErr == nil {
+					createErr = file.Close()
+				}
+				injected <- createErr
+			}()
+			select {
+			case <-peerCreateEntered:
+			case <-time.After(integrationRequestTimeout):
+			}
+		})
+	})
+	defer f.transports[0].setBeforeMutation(nil)
+	f.transports[0].setAfterMutation(func(request *authoritypb.Request, response *authoritypb.Response, err error) {
+		create := request.GetCreate()
+		if create != nil && string(create.GetName()) == existingName {
+			results <- existingCreateResult{
+				errno: response.GetErrno(), failure: response.GetFailure(),
+				err: err,
+			}
+		}
+	})
+	defer f.transports[0].setAfterMutation(nil)
+	var existingOpenErr error
+	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
+		file, openErr := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if openErr != nil {
+			existingOpenErr = openErr
+			return
+		}
+		if _, err := file.Stat(); err != nil {
+			_ = file.Close()
+			t.Fatalf("fstat existing-create result: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close existing-create result: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after existing create: %v", err)
+		}
+	})
+	f.transports[0].setBeforeMutation(nil)
+	f.transports[0].setAfterMutation(nil)
+	var injectionErr error
+	select {
+	case injectionErr = <-injected:
+	case <-time.After(integrationRequestTimeout):
+		t.Fatal("the peer existing-create mutation did not complete")
+	}
+	if injectionErr != nil {
+		t.Fatalf("materialize existing-create race through the peer mount: %v", injectionErr)
+	}
+	var rpcResults []existingCreateResult
+	for len(results) != 0 {
+		rpcResults = append(rpcResults, <-results)
+	}
+	if existingOpenErr != nil {
+		t.Fatalf("open existing name through FUSE_CREATE: %v (RPC results=%+v; frontend fatal cause: %v)",
+			existingOpenErr, rpcResults, f.mounts[0].fatalError())
+	}
+	// Both mounts create the same name inside this window: one FUSE_CREATE
+	// materializes it and the other resolves the existing object, each with one
+	// authority mutation, and the loser's kernel supplies its own negative
+	// dentry rather than a second LOOKUP. The follow-up stats are the one place
+	// in this test where a post-state successor grant is legitimately withheld:
+	// the peer's mutation recalls the same A coordinates while the source's
+	// reply is still being built, and a mount under recall must miss to the
+	// authority rather than cache across it. Bound that instead of pinning it,
+	// because which side reaches the recall first is genuinely concurrent.
+	if existingCreateRPCs.getattr > 3 || existingCreateRPCs.lookup > 2 {
+		t.Fatalf("existing-create raced window cost %d GETATTRs and %d LOOKUPs; at most one per observation is a recall miss",
+			existingCreateRPCs.getattr, existingCreateRPCs.lookup)
+	}
+	existingCreateRPCs.getattr, existingCreateRPCs.lookup = 0, 0
+	requireCounts("existing create plus child/parent stat", existingCreateRPCs, counts{create: 2})
+
+	unlinkedPath := filepath.Join(root, "post-state-unlinked")
+	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
+	if _, err := os.Lstat(unlinkedPath); err != nil {
+		t.Fatalf("warm unlink source: %v", err)
+	}
+	unlinkRPCs := measure("unlink plus child/parent stat", func() {
+		if err := os.Remove(unlinkedPath); err != nil {
+			t.Fatalf("unlink: %v", err)
+		}
+		if _, err := os.Lstat(unlinkedPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat unlinked child: %v", err)
+		}
+		if _, err := os.Stat(root); err != nil {
+			t.Fatalf("stat parent after unlink: %v", err)
+		}
+	})
+	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{lookup: 1, unlink: 1})
+
+	oldParent, newParent := filepath.Join(root, "old-parent"), filepath.Join(root, "new-parent")
+	mustMkdir(t, oldParent)
+	mustMkdir(t, newParent)
+	source, destination := filepath.Join(oldParent, "source"), filepath.Join(newParent, "destination")
+	mustWrite(t, source, []byte("rename"), 0o600)
+	for _, path := range []string{oldParent, newParent, source} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("warm rename path %s: %v", path, err)
+		}
+	}
+	if _, err := os.Lstat(destination); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm rename destination absence: %v", err)
+	}
+	renameRPCs := measure("rename plus child/parent stats", func() {
+		if err := os.Rename(source, destination); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		for _, path := range []string{destination, oldParent, newParent} {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("stat after rename %s: %v", path, err)
+			}
+		}
+	})
+	// The warmed source name resolves inside the daemon under its N lease, so
+	// only the destination's absence -- which carries no cacheable fact -- costs
+	// the kernel's pre-rename LOOKUP a round trip.
+	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
+}
+
 // TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns is the barrier's
 // actual promise. The observing mount has the name cached with a one-minute
 // lifetime, so nothing but a synchronous repair can make it stop resolving --
@@ -1546,96 +2112,224 @@ func TestVisibilityAcknowledgmentSurvivesSaturatedIO(t *testing.T) {
 	}
 }
 
-// TestUncachedProfileRemainsFullyCorrect keeps the other supported deployment
-// profile honest against a real kernel. It caches nothing, joins no barrier,
-// and must still be exactly coherent.
-func TestUncachedProfileRemainsFullyCorrect(t *testing.T) {
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Uncached: true})
-	mustWrite(t, f.join(0, "shared"), []byte("one"), 0o600)
-	requireContent(t, f.join(1, "shared"), []byte("one"), "uncached cross-mount read")
-
-	// Nothing is cached, so every resolution reaches the authority. That is the
-	// profile's defining property, not a defect.
-	reached := f.countRequests("lookup", func() {
-		for range 3 {
-			if _, err := os.Lstat(f.join(1, "shared")); err != nil {
-				t.Fatal(err)
-			}
-		}
-	})
-	if reached == 0 {
-		t.Fatal("an uncached mount answered a path walk without the authority; it has no way to be told the answer changed")
-	}
-	mustWrite(t, f.join(0, "shared"), []byte("two"), 0o600)
-	requireContent(t, f.join(1, "shared"), []byte("two"), "uncached cross-mount read after a remote write")
-	if err := os.Remove(f.join(0, "shared")); err != nil {
-		t.Fatal(err)
-	}
-	requireAbsent(t, f.join(1, "shared"), "uncached mount after a remote unlink")
-}
-
 // TestMetadataWorkloadRPCCost measures the thing this whole change is for, on a
-// real workload, on both supported profiles. `git status` re-lstats every
-// tracked path; with nothing cacheable that is one authority round trip per
-// path component per invocation, which is the multiplier that made this
-// frontend unusable at scale.
+// real workload. `git status` re-lstats every tracked path; the coherent name
+// cache must collapse those repeated walks rather than reintroduce one
+// authority round trip per path component per invocation.
 //
 // The assertion is on name resolution alone. That is the part a name and
 // attribute cache is responsible for; the rest of what `git status` does --
 // reading its index, listing directories, and re-hashing any file git considers
-// racily clean -- reaches the authority on both profiles by design, and how
+// racily clean -- reaches the authority by design, and how
 // much of it happens depends on wall-clock timing git owns, not on coherence.
 // All of it is logged, because the interesting number is the whole shape.
 func TestMetadataWorkloadRPCCost(t *testing.T) {
 	requireWorkloadEnvironment(t)
 	const files = 200
 	kinds := []string{"lookup", "getattr", "reclaim", "other"}
-	measure := func(t *testing.T, uncached bool) (lookups, total int) {
-		t.Helper()
-		f := newIntegrationFixture(t, integrationConfig{Mounts: 2, Uncached: uncached})
-		repository := f.join(0, "repo")
-		f.runWorkload("git", "init", "-q", repository)
-		f.runWorkload("git", "-C", repository, "config", "user.email", "portablefs@example.invalid")
-		f.runWorkload("git", "-C", repository, "config", "user.name", "PortableFS Test")
-		for i := range files {
-			mustWrite(t, filepath.Join(repository, fmt.Sprintf("source-%03d.txt", i)), []byte("content\n"), 0o600)
-		}
-		f.runWorkload("git", "-C", repository, "add", ".")
-		f.runWorkload("git", "-C", repository, "commit", "-q", "-m", "exercise PortableFS")
-		// git treats a file whose mtime is not strictly older than its index as
-		// racily clean and re-reads its contents, and mtime comparison there is
-		// at one-second granularity. Letting the second turn over before the
-		// warm-up run is what makes the measured run a steady state on both
-		// profiles instead of a race against how fast the profile happens to be.
-		time.Sleep(1100 * time.Millisecond)
-		f.runWorkload("git", "-C", repository, "status", "--porcelain")
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	repository := f.join(0, "repo")
+	f.runWorkload("git", "init", "-q", repository)
+	f.runWorkload("git", "-C", repository, "config", "user.email", "portablefs@example.invalid")
+	f.runWorkload("git", "-C", repository, "config", "user.name", "PortableFS Test")
+	for i := range files {
+		mustWrite(t, filepath.Join(repository, fmt.Sprintf("source-%03d.txt", i)), []byte("content\n"), 0o600)
+	}
+	f.runWorkload("git", "-C", repository, "add", ".")
+	f.runWorkload("git", "-C", repository, "commit", "-q", "-m", "exercise PortableFS")
+	// Make the measured invocation a steady-state walk instead of a race with
+	// git's one-second racily-clean mtime rule.
+	time.Sleep(1100 * time.Millisecond)
+	f.runWorkload("git", "-C", repository, "status", "--porcelain")
 
-		before := make([]int, len(kinds))
-		for i, kind := range kinds {
-			before[i] = f.counter.count(kind)
+	before := make([]int, len(kinds))
+	for i, kind := range kinds {
+		before[i] = f.counter.count(kind)
+	}
+	f.runWorkload("git", "-C", repository, "status", "--porcelain")
+	lookups, total := 0, 0
+	breakdown := make([]string, 0, len(kinds))
+	for i, kind := range kinds {
+		delta := f.counter.count(kind) - before[i]
+		total += delta
+		if kind == "lookup" {
+			lookups = delta
 		}
-		f.runWorkload("git", "-C", repository, "status", "--porcelain")
-		breakdown := make([]string, 0, len(kinds))
-		for i, kind := range kinds {
-			delta := f.counter.count(kind) - before[i]
-			total += delta
-			if kind == "lookup" {
-				lookups = delta
+		breakdown = append(breakdown, fmt.Sprintf("%s=%d", kind, delta))
+	}
+	t.Logf("%d authority requests for one steady-state `git status` over %d tracked files (%s)", total, files, strings.Join(breakdown, " "))
+	if lookups >= files/4 {
+		t.Fatalf("coherent cache issued %d LOOKUPs for %d tracked files; repeated path walks must stay below one lookup per four files", lookups, files)
+	}
+}
+
+// TestCachedPagesSurviveRereadsAndDieAtTheBarrier is the direct proof that the
+// retained page cache is both real and coherent. TestCrossMountContentCoherence
+// proves the coherence half; this proves that pages are genuinely being reused
+// in between, which is the whole reason the direct-I/O flag was dropped.
+//
+// The two halves have to be asserted together. A mount that never cached would
+// pass every coherence assertion trivially and deliver none of the performance;
+// a mount that cached without joining the barrier would deliver the performance
+// and be wrong. So the test counts authority READs across repeated reads of the
+// same offsets (reuse) and then asserts the payload flips after a same-length
+// remote overwrite (withdrawal).
+//
+// REQUIRES THE PRIVILEGED RUNNER: it needs a real strict-coherence kernel, two
+// live mounts, and a real page cache.
+func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	nameA, nameB := f.join(0, "cached"), f.join(1, "cached")
+
+	// Several pages, so ordinary read-ahead has something to do and the reuse
+	// is not an artefact of a single-folio file.
+	const size = 64 * 1024
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte('a' + i%26)
+	}
+	mustWrite(t, nameA, payload, 0o600)
+
+	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
+	defer reader.Close()
+	if got := readExactlyAt(t, reader, 0, size, "first full read"); !bytes.Equal(got, payload) {
+		t.Fatal("first cross-mount read returned the wrong bytes")
+	}
+
+	// Only this mount reads in the window below, so the global counter is an
+	// exact per-mount count here.
+	reads := f.countRequests("read", func() {
+		for range 8 {
+			if got := readExactlyAt(t, reader, 0, size, "cached re-read"); !bytes.Equal(got, payload) {
+				t.Fatal("cached re-read returned the wrong bytes")
 			}
-			breakdown = append(breakdown, fmt.Sprintf("%s=%d", kind, delta))
 		}
-		t.Logf("%s: %d authority requests for one `git status` over %d tracked files (%s)",
-			map[bool]string{true: "uncached", false: "strict"}[uncached], total, files, strings.Join(breakdown, " "))
-		return lookups, total
+	})
+	if reads != 0 {
+		t.Fatalf("eight full re-reads issued %d authority READs; FOPEN_KEEP_CACHE is not retaining anything and every read still costs a round trip", reads)
 	}
-	var strictLookups, strictTotal, uncachedLookups, uncachedTotal int
-	t.Run("strict", func(t *testing.T) { strictLookups, strictTotal = measure(t, false) })
-	t.Run("uncached", func(t *testing.T) { uncachedLookups, uncachedTotal = measure(t, true) })
-	t.Logf("strict=%d requests (%d LOOKUP) uncached=%d requests (%d LOOKUP)", strictTotal, strictLookups, uncachedTotal, uncachedLookups)
-	if uncachedLookups < files {
-		t.Fatalf("the uncached profile issued %d LOOKUPs for %d tracked files; the measurement is not measuring the walk", uncachedLookups, files)
+
+	// Same length, so nothing size-derived can withdraw the cache: only the
+	// sequence-ordered whole-mapping invalidation the DATA repair performs can.
+	rewritten := make([]byte, size)
+	for i := range rewritten {
+		rewritten[i] = byte('A' + i%26)
 	}
-	if strictLookups*4 > uncachedLookups {
-		t.Fatalf("strict issued %d LOOKUPs against uncached %d; a strict mount must resolve a cached path without the authority", strictLookups, uncachedLookups)
+	mustWrite(t, nameA, rewritten, 0o600)
+	if got := readExactlyAt(t, reader, 0, size, "re-read after a same-length remote rewrite"); !bytes.Equal(got, rewritten) {
+		t.Fatal("a same-length remote rewrite left this mount serving pre-write pages from its kernel; the DATA repair did not withdraw them")
+	}
+
+	// And the cache is repopulated rather than disabled: reuse must survive a
+	// repair, or the first remote write to a file would permanently cost every
+	// later reader a round trip.
+	repopulated := f.countRequests("read", func() {
+		for range 4 {
+			readExactlyAt(t, reader, 0, size, "cached re-read after repair")
+		}
+	})
+	if repopulated != 0 {
+		t.Fatalf("the page cache was not repopulated after a DATA repair: %d further authority READs", repopulated)
+	}
+}
+
+// TestPrivateMappingsAreTornDownByTheDataBarrier covers the one reader that no
+// userspace hook can see. A MAP_PRIVATE page is served straight out of the page
+// tables with no request reaching this frontend at all, so the only thing that
+// can make it coherent is invalidate_inode_pages2() unmapping it inside the
+// DATA repair. If that stopped happening, every other assertion in this suite
+// would still pass and executables and mapped data files would silently go
+// stale.
+//
+// REQUIRES THE PRIVILEGED RUNNER.
+func TestPrivateMappingsAreTornDownByTheDataBarrier(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	nameA, nameB := f.join(0, "mapped-coherent"), f.join(1, "mapped-coherent")
+
+	page := os.Getpagesize()
+	before := bytes.Repeat([]byte{'o'}, page)
+	mustWrite(t, nameA, before, 0o600)
+
+	mapped := mustOpenFile(t, nameB, os.O_RDONLY, 0)
+	defer mapped.Close()
+	view, err := unix.Mmap(int(mapped.Fd()), 0, page, unix.PROT_READ, unix.MAP_PRIVATE)
+	if err != nil {
+		t.Fatalf("MAP_PRIVATE of a shared file: %v", err)
+	}
+	defer unix.Munmap(view)
+	if view[0] != 'o' {
+		t.Fatalf("initial mapped byte = %q", view[0])
+	}
+
+	// Same length again. The mapping is faulted in and its page table entries
+	// are live; only unmap_mapping_folio() inside the repair can take them
+	// back, and if it does the next touch refaults through the authority.
+	after := bytes.Repeat([]byte{'n'}, page)
+	mustWrite(t, nameA, after, 0o600)
+	if view[0] != 'n' {
+		t.Fatalf("mapped byte after a same-length remote rewrite = %q; the DATA repair did not unmap the stale page", view[0])
+	}
+}
+
+// TestRevokedMountCannotServeRetainedPages is the fencing half, and it is the
+// assertion that separates this platform from the macOS defect recorded in
+// docs/failure-modes.md.
+//
+// Every other kind of stale service a revoked mount could commit is bounded by
+// refusing requests. A retained page is not: with FOPEN_KEEP_CACHE the read is
+// answered inside the kernel and never becomes a request, so neither the
+// frontend's revoked check nor the FUSE connection abort can see it. What
+// closes it is the explicit whole-inode withdrawal the revocation ladder issues
+// before the abort closes its notification channel. If that regressed, this
+// reader would keep observing
+// pre-fence bytes for as long as it held the file open.
+//
+// REQUIRES THE PRIVILEGED RUNNER: revocation is only observable against a real
+// kernel mount, and the reader has to be a real process holding a real mapping
+// of a real page cache.
+func TestRevokedMountCannotServeRetainedPages(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	nameA, nameB := f.join(0, "fenced"), f.join(1, "fenced")
+
+	const size = 8 * 1024
+	payload := bytes.Repeat([]byte{'z'}, size)
+	mustWrite(t, nameA, payload, 0o600)
+
+	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
+	defer reader.Close()
+	if got := readExactlyAt(t, reader, 0, size, "pre-revocation read"); !bytes.Equal(got, payload) {
+		t.Fatal("pre-revocation read returned the wrong bytes")
+	}
+
+	// The pages are now resident on mount B. Losing the authority is what fences
+	// it: it can no longer be told that what it holds has changed, so it revokes
+	// itself. Then read through the descriptor that is already open -- the exact
+	// case the mount-namespace detach cannot reach.
+	f.stopAuthority()
+	for i := range 2 {
+		t.Logf("mount %d terminal cause: %v", i, f.requireSessionEnded(i, 30*time.Second))
+	}
+
+	outcome := make(chan error, 1)
+	buf := make([]byte, size)
+	go func() {
+		_, err := reader.ReadAt(buf, 0)
+		outcome <- err
+	}()
+	select {
+	case err := <-outcome:
+		if err == nil {
+			t.Fatal("a fenced mount served its retained pages; this is the stale-read window the withdrawal pass exists to close")
+		}
+		// ENOTCONN from the aborted connection, or EIO from a refaulted page
+		// that cannot be filled. Which one depends on where in the teardown the
+		// read landed; pinning that would pin a race rather than a contract.
+		// What must never happen is a successful read.
+		t.Logf("fenced-mount read failed as required: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("a read of retained pages on a fenced mount hung")
+	}
+	if bytes.Equal(buf, payload) {
+		t.Fatal("the fenced read filled the caller's buffer with pre-fence bytes even though it reported an error")
 	}
 }

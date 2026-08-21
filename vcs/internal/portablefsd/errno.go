@@ -9,14 +9,14 @@ const (
 	// the local store is intact, the authority is not applying. It is
 	// deliberately distinct from darwinENOSPC (28), which promises the operation
 	// can never fit locally.
-	darwinEIO          int32 = 5
-	darwinEINTR        int32 = 4
-	darwinENXIO        int32 = 6
-	darwinE2BIG        int32 = 7
-	darwinEBADF        int32 = 9
-	darwinENOMEM       int32 = 12
-	darwinEACCES       int32 = 13
-	darwinEAGAIN       int32 = 35
+	darwinEIO    int32 = 5
+	darwinEINTR  int32 = 4
+	darwinENXIO  int32 = 6
+	darwinE2BIG  int32 = 7
+	darwinEBADF  int32 = 9
+	darwinENOMEM int32 = 12
+	darwinEACCES int32 = 13
+	darwinEAGAIN int32 = 35
 	// ECANCELED is deliberately named separately from EINTR/EAGAIN. On macOS
 	// 26 those retry-class results can be replayed by the VFS after FSKit has
 	// already returned them to userspace, which destroys a definite-preapply

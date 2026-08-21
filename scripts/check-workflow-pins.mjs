@@ -92,6 +92,20 @@ export async function verifyWorkflowPins(workflowsDir) {
       );
     });
   }
+  const ciWorkflow = await readFile(path.join(root, "ci.yml"), "utf8");
+  for (const semanticGate of [
+    "Validate GitHub Actions workflow semantics",
+    'GOBIN="$RUNNER_TEMP/actionlint-bin"',
+    "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.10",
+    '"$RUNNER_TEMP/actionlint-bin/actionlint" .github/workflows/*.yml',
+  ]) {
+    if (!ciWorkflow.includes(semanticGate)) {
+      failures.push(`ci.yml: missing frozen workflow semantic gate ${semanticGate}`);
+    }
+  }
+  if (ciWorkflow.includes("actionlint/cmd/actionlint@latest")) {
+    failures.push("ci.yml: actionlint must use an exact reviewed version, not @latest");
+  }
   if (failures.length > 0) {
     throw new Error(`workflow pin policy failed:\n- ${failures.join("\n- ")}`);
   }

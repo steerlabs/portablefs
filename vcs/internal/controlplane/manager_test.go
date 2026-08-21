@@ -170,7 +170,7 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtimeCredential, err := runtimeAuthority.Attach(1, volumeserver.PeerIdentity(peer), initialAccess)
+	runtimeCredential, err := runtimeAuthority.AttachActiveForTest(1, volumeserver.PeerIdentity(peer), initialAccess)
 	if err != nil {
 		t.Fatalf("attach enrollment-owned authority session: %v", err)
 	}

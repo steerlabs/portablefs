@@ -5,9 +5,12 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -15,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
@@ -23,12 +27,84 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+func exactAuthorityTestTargets(sequence uint64, targets []volumeserver.VisibilityTarget) []volumeserver.VisibilityTarget {
+	sizes := make(map[[16]byte]int64)
+	for _, target := range targets {
+		if target.Scope == volumeserver.VisibilityData {
+			sizes[target.Identity] = target.Size
+		}
+	}
+	exact := append([]volumeserver.VisibilityTarget(nil), targets...)
+	for index := range exact {
+		target := &exact[index]
+		if target.Scope == volumeserver.VisibilityNamespace {
+			continue
+		}
+		target.ExactPostState = &volumeserver.VisibilityObjectPostState{
+			StableIdentity: target.Identity,
+			ObjectVersion:  sequence,
+			Roles:          postStateRoleTarget,
+			Attr: volumeserver.VisibilityAttr{
+				Kind: uint32(xfsstore.KindRegular), Inode: target.KernelIno,
+				Size: sizes[target.Identity], Mode: 0o600,
+			},
+		}
+	}
+	return exact
+}
+
 func testVolumeHandler() *VolumeHandler {
+	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
+		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384, PriorGrantsFenced: true, Fencer: noopFencer{},
+	})
+	if err != nil {
+		panic(err)
+	}
+	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
+		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
+	})
+	if err != nil {
+		panic(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		panic(err)
+	}
 	return &VolumeHandler{
 		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
 		MaxItemsPerSession: 64, MaxOpensPerSession: 64, MaxItems: 128, MaxOpens: 128,
-		MaxRetainedReplyBytes: 1 << 20,
+		MaxRetainedReplyBytes:               1 << 20,
+		WriteAdmission:                      &WriteAdmission{},
+		MaxWriteBytesPerSession:             16 << 30,
+		MaxWriteBytesInFlight:               64 << 30,
+		MaxWritesPerSession:                 8,
+		MaxWrites:                           32,
+		WriteAdmissionProgressTimeout:       time.Minute,
+		WriteAbsoluteTimeout:                time.Hour,
+		MaxFskitWriteBytes:                  RequiredFskitWriteBytes,
+		FskitWriteStaging:                   &FskitWriteStaging{},
+		MaxFskitWriteStagingBytesPerSession: 16 << 30,
+		MaxFskitWriteStagingBytes:           64 << 30,
+		MaxFskitWritesPerSession:            8,
+		MaxFskitWrites:                      32,
+		FskitWriteProgressTimeout:           time.Minute,
+		FskitWriteAbsoluteTimeout:           time.Hour,
+		Leases:                              leases,
+		Lifecycle:                           lifecycle,
+		Visibility:                          visibility,
 	}
+}
+
+func testInitialVisibilityCursor(t *testing.T, visibility *volumeserver.VisibilityCoordinator, id volumeserver.SessionID) volumeserver.VisibilityCursor {
+	t.Helper()
+	cursor, err := visibility.InitialCursor(id)
+	if err != nil {
+		t.Fatalf("initial visibility cursor for %x: %v", id, err)
+	}
+	return cursor
 }
 
 type detachMembership struct {
@@ -67,24 +143,18 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	membership := &detachMembership{}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: membership, Fencer: runtime,
-		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	h := testVolumeHandler()
 	h.Store = &resourceAdmissionFaultStore{}
 	h.Runtime = runtime
 	h.Authorizer = allowAuthorizer{access: volumeserver.AccessRead}
-	h.Visibility = visibility
-	h.Routes = &RoutesController{Visibility: visibility, loaded: true}
+	coordination := loadedCoordinationFor("", runtime, membership, 64)
+	coordination.Bind(h)
+	visibility, lifecycle := coordination.Visibility, coordination.Lifecycle
 
 	peers := []volumeserver.PeerIdentity{{0x31}, {0x32}, {0x33}}
 	credentials := make([]volumeserver.SessionCredential, len(peers))
 	for index, peer := range peers {
-		credential, err := runtime.Attach(2, peer, volumeserver.Authorization{Access: volumeserver.AccessRead, Deadline: time.Now().Add(time.Hour)})
+		credential, err := runtime.AttachActiveForTest(2, peer, volumeserver.Authorization{Access: volumeserver.AccessRead, Deadline: time.Now().Add(time.Hour)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -92,12 +162,15 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 		if err := h.startSessionResources(credential.ID, xfsstore.Capability{byte(index + 1)}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
 			t.Fatal(err)
 		}
+		if err := lifecycle.Activate(credential.ID, func() error { return nil }); err != nil {
+			t.Fatal(err)
+		}
 		terminal, err := runtime.SessionTerminal(credential.ID)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
-			CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairParentExclusive,
+			CachedNameCapacity: 32, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -143,11 +216,178 @@ func TestStrictCleanDetachIsBoundToTheAuthenticatedSession(t *testing.T) {
 	}
 }
 
+func TestLinuxProfileRejectsFskitRepairControlBeforeTopologyAdmission(t *testing.T) {
+	runtime, err := volumeserver.New("retired-visibility", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := volumeserver.PeerIdentity{0x51}
+	credential, err := runtime.AttachActiveForTest(2, peer, volumeserver.Authorization{
+		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testVolumeHandler()
+	h.Store, h.Runtime, h.Authorizer = &resourceAdmissionFaultStore{}, runtime, allowAuthorizer{access: volumeserver.AccessRead | volumeserver.AccessWrite}
+	// Deliberately omit Topology: cross-profile bodies must be refused without
+	// entering route admission or dereferencing the FSKit repair coordinator.
+	h.Routes = &RoutesController{loaded: true}
+	if err := h.startSessionResources(credential.ID, xfsstore.Capability{1}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peer))
+	for id, request := range []*authoritypb.Request{
+		{Body: &authoritypb.Request_NextFskitRepair{NextFskitRepair: &authoritypb.NextVisibilityRequest{}}},
+		{Body: &authoritypb.Request_AckFskitRepair{AckFskitRepair: &authoritypb.AckVisibilityRequest{}}},
+	} {
+		request.RequestId, request.Epoch = uint64(id+1), credential.Epoch[:]
+		request.Session = &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]}
+		response := h.Handle(ctx, request)
+		if response.GetErrno() != int32(syscall.EOPNOTSUPP) {
+			t.Fatalf("cross-profile FSKit repair body %T = %+v", request.GetBody(), response)
+		}
+	}
+}
+
+func TestFskitSourceMutationRecallsLinuxLeaseWithoutSourceDischarge(t *testing.T) {
+	runtime, err := volumeserver.New("mixed-profile-recall", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 4, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{1}, volumeserver.Authorization{
+		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: runtime,
+		MaxCachedNameCapacity: 64, MaxRepairBudget: time.Second, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := runtime.SessionTerminal(source.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := visibility.Register(source.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	h := testVolumeHandler()
+	h.Runtime, h.Store, h.Visibility = runtime, &resourceAdmissionFaultStore{}, visibility
+	root := xfsstore.Capability{0x31}
+	if err := h.startSessionResourcesForProfile(source.ID, root, 2, [32]byte{}, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR); err != nil {
+		t.Fatal(err)
+	}
+	peer := volumeserver.SessionID{0x42}
+	peerTerminal := make(chan struct{})
+	if err := h.Leases.ActivateHolder(peer, peerTerminal); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { close(peerTerminal) })
+	identity := [16]byte{root[0]}
+	coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: identity}
+	if _, err := h.Leases.Grant(context.Background(), peer, coordinate, volumeserver.LeaseRightAttributesRead); err != nil {
+		t.Fatal(err)
+	}
+
+	request := &authoritypb.Request{
+		RequestId: 1,
+		Body:      &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: root[:]}},
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+				Identity: identity[:], Attributes: true,
+			}},
+		}}},
+	}
+	stampMutation(t, request, 0, 1)
+	targets := []volumeserver.VisibilityTarget{{
+		Scope: volumeserver.VisibilityAttributes, Identity: identity, KernelIno: uint64(root[0]), Device: 1,
+	}}
+	applyCalls := 0
+	response := make(chan *authoritypb.Response, 1)
+	go func() {
+		response <- h.mutateVisibleSequence(context.Background(), request, source,
+			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
+			func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				applyCalls++
+				resp := h.success(0)
+				resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
+					identity: identity,
+					attr: xfsstore.Attr{
+						Kind: xfsstore.KindRegular, Ino: uint64(root[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1,
+					},
+					roles: postStateRoleTarget, changed: true,
+				})
+				return resp, targets
+			},
+		)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	revoke, err := h.Leases.Next(ctx, peer, volumeserver.LeaseEventCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revoke.Initiator != source.ID || revoke.Cursor.Phase != volumeserver.LeaseEventRevoke {
+		t.Fatalf("mixed-profile revoke = %+v", revoke)
+	}
+	if err := h.Leases.AcknowledgeRevoke(peer, revoke.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := h.Leases.Next(ctx, peer, revoke.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Leases.Discharge(peer, complete.Cursor, []volumeserver.LeaseDischarge{{
+		Coordinate: coordinate, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: volumeserver.LeaseDischargeToNone,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	result := <-response
+	if result.GetErrno() != 0 || result.GetUncertain() || result.GetSourceLeaseDischarge() != nil {
+		t.Fatalf("mixed-profile mutation response = %+v", result)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("storage apply calls = %d, want 1", applyCalls)
+	}
+}
+
 func TestWireErrnoPreservesLinuxSyscall(t *testing.T) {
 	for _, errno := range []syscall.Errno{syscall.EACCES, syscall.EXDEV, syscall.ELOOP, syscall.EBADF} {
 		if got := wireErrno(errno); got != int32(errno) {
 			t.Fatalf("wireErrno(%v) = %d", errno, got)
 		}
+	}
+	if got := wireErrno(volumeserver.ErrVisibilityInterrupted); got != errnos.EINTR {
+		t.Fatalf("wireErrno(visibility interruption) = %d, want EINTR", got)
+	}
+	if got := wireErrno(volumeserver.ErrVisibilityRetry); got != errnos.EINTR {
+		t.Fatalf("wireErrno(visibility retry) = %d, want EINTR", got)
+	}
+	if got := wireErrno(volumeserver.ErrCompatibilityWriterLease); got != errnos.EBUSY {
+		t.Fatalf("wireErrno(compatibility writer lease) = %d, want EBUSY", got)
+	}
+	// Delegated killpriv and logical sync can both fail after one clean
+	// mutation. The authority retains both causes, but the syscall-visible
+	// result must deterministically preserve the security failure while the EIO
+	// remains discoverable for terminal storage classification.
+	joined := errors.Join(xfsstore.ErrWritePrivilege, syscall.EPERM, syscall.EIO)
+	if got := wireErrno(joined); got != int32(syscall.EPERM) {
+		t.Fatalf("wireErrno(joined privilege+sync failure) = %d, want EPERM", got)
+	}
+	if !fatalStorageErrno(joined) || !storageFailure(joined) {
+		t.Fatal("joined privilege+sync failure lost its terminal storage classification")
 	}
 }
 
@@ -200,36 +440,39 @@ func TestRestoreFailuresAreDefiniteNonFatalEIO(t *testing.T) {
 	}
 }
 
-func TestHandlerRejectsInvalidSourcePhaseQueueabilityBeforeDispatch(t *testing.T) {
+func TestVisibilityRetryMapsToInternalDefiniteEINTR(t *testing.T) {
 	h := &VolumeHandler{}
-	tests := []struct {
-		name    string
-		request *authoritypb.Request
-	}{
-		{name: "hello", request: &authoritypb.Request{Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{}}}},
-		{name: "attach", request: &authoritypb.Request{Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{}}}},
-		{name: "visibility control", request: &authoritypb.Request{Body: &authoritypb.Request_NextVisibility{NextVisibility: &authoritypb.NextVisibilityRequest{}}}},
-		{name: "ordinary request", request: &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{}}}},
+	response := h.errorResponse(7, &volumeserver.VisibilityRetryError{Sequence: 9}, false)
+	if response.GetErrno() != errnos.EINTR {
+		t.Fatalf("visibility retry errno = %d, want EINTR", response.GetErrno())
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			test.request.RequestId = 19
-			test.request.FrontendOperationId = 7
-			test.request.SourcePhaseQueueable = true
-			response := h.Handle(context.Background(), test.request)
-			if response.GetErrno() != int32(syscall.EINVAL) || response.GetUncertain() {
-				t.Fatalf("invalid queueability response = %+v, want definite EINVAL", response)
-			}
-		})
+	if response.GetUncertain() || response.GetBody() != nil {
+		t.Fatalf("visibility retry carried an uncertain or state-bearing result: %+v", response)
+	}
+	if response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY {
+		t.Fatalf("visibility retry failure class = %v, want VISIBILITY_RETRY", response.GetFailure())
+	}
+	if response.GetFskitRepairRetrySequence() != 9 {
+		t.Fatalf("visibility retry sequence = %d, want 9", response.GetFskitRepairRetrySequence())
+	}
+}
+
+func TestVisibilityRetryWithoutSequenceFailsClosed(t *testing.T) {
+	h := &VolumeHandler{}
+	response := h.errorResponse(7, volumeserver.ErrVisibilityRetry, false)
+	if response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() ||
+		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_INTERNAL || response.GetFskitRepairRetrySequence() != 0 {
+		t.Fatalf("unsequenced visibility retry = %+v, want uncertain internal EIO", response)
 	}
 }
 
 // This exercises the retained-mutation path, not only errorResponse. A
-// callback-serialized source with deferred COMPLETE outstanding consumes one
+// callback-serialized source with a peer COMPLETE outstanding consumes one
 // mutation slot as a definite EINTR. Replaying that exact identity must return
 // the retained EINTR and must never enter visibility prepare or filesystem
-// apply on either delivery.
-func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T) {
+// apply on either delivery. The source never receives a phase for its own
+// mutation.
+func retiredMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T) {
 	runtime, err := volumeserver.New("visibility-eintr-replay", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
@@ -237,7 +480,7 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 		t.Fatal(err)
 	}
 	peer := volumeserver.PeerIdentity{1}
-	cred, err := runtime.Attach(2, peer, volumeserver.Authorization{
+	cred, err := runtime.AttachActiveForTest(2, peer, volumeserver.Authorization{
 		Access:   volumeserver.AccessRead | volumeserver.AccessWrite,
 		Deadline: time.Now().Add(time.Hour),
 	})
@@ -261,31 +504,30 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 		t.Fatal(err)
 	}
 
-	// Produce the source-deferred COMPLETE state against which the handler's
-	// mutation is refused.
-	parent := [16]byte{1}
+	// A different writer produces the peer COMPLETE state against which this
+	// callback-serialized source's next mutation is refused.
+	identity := [16]byte{1}
+	visibility.RecordResolvedInode(cred.ID, identity)
 	targets := []volumeserver.VisibilityTarget{{
-		Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent, Name: []byte("first"),
+		Scope: volumeserver.VisibilityAttributes, Identity: identity,
 	}}
 	first := make(chan error, 1)
 	go func() {
 		first <- visibility.Execute(
-			context.Background(), cred.ID, volumeserver.MutationID{Sequence: 1},
+			context.Background(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets(targets),
 			func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
-			func() ([]volumeserver.VisibilityTarget, bool) { return targets, true },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(1, targets), true },
 		)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	prepare, err := visibility.Next(ctx, cred.ID, volumeserver.VisibilityCursor{})
+	prepare, err := visibility.Next(ctx, cred.ID, testInitialVisibilityCursor(t, visibility, cred.ID))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := visibility.Ack(cred.ID, prepare.Cursor); err != nil {
 		t.Fatal(err)
-	}
-	if err := <-first; err != nil {
-		t.Fatalf("seed mutation: %v", err)
 	}
 	complete, err := visibility.Next(ctx, cred.ID, prepare.Cursor)
 	if err != nil {
@@ -293,16 +535,23 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 	}
 
 	h := testVolumeHandler()
+	h.Store = &resourceAdmissionFaultStore{}
 	h.Runtime = runtime
 	h.Visibility = visibility
-	if err := h.startSessionResources(cred.ID, xfsstore.Capability{1}, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+	root := xfsstore.Capability{1}
+	if err := h.startSessionResources(cred.ID, root, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
 		t.Fatal(err)
 	}
 	request := &authoritypb.Request{
-		RequestId:           7,
-		FrontendOperationId: 77,
+		RequestId:                7,
+		FskitFrontendOperationId: 77,
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+				Identity: identity[:], Attributes: true,
+			}},
+		}}},
 		Body: &authoritypb.Request_SetXattr{SetXattr: &authoritypb.SetXattrRequest{
-			Item: []byte{1}, Name: []byte("user.replay"), Value: []byte("value"),
+			Item: root[:], Name: []byte("user.replay"), Value: []byte("value"),
 		}},
 	}
 	stampMutation(t, request, 0, 1)
@@ -310,14 +559,14 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 	handlerPrepare := func() ([]volumeserver.VisibilityTarget, error) {
 		prepareCalls.Add(1)
 		return []volumeserver.VisibilityTarget{{
-			Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{2},
+			Scope: volumeserver.VisibilityAttributes, Identity: identity,
 		}}, nil
 	}
 	handlerApply := func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 		applyCalls.Add(1)
 		response := h.success(0)
 		return response, []volumeserver.VisibilityTarget{{
-			Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{2},
+			Scope: volumeserver.VisibilityAttributes, Identity: identity,
 		}}
 	}
 
@@ -336,10 +585,8 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 	}
 
 	request.RequestId = 8
-	// Queueability is scheduling metadata, not replay identity. Flipping it on
-	// an exact replay must return the retained definite interruption rather than
-	// execute prepare/apply again under a different scheduling decision.
-	request.SourcePhaseQueueable = true
+	// Request ID is transport correlation, not replay identity. The otherwise
+	// exact replay must return the retained definite interruption.
 	replayed := h.mutateVisible(ctx, request, cred, handlerPrepare, handlerApply)
 	if replayed.GetErrno() != errnos.EINTR || replayed.GetUncertain() {
 		t.Fatalf("replayed interrupted mutation = %+v, want retained definite EINTR", replayed)
@@ -352,6 +599,9 @@ func TestMutateVisibleRetainsPreApplyVisibilityEINTRForExactReplay(t *testing.T)
 	}
 	if err := visibility.Ack(cred.ID, complete.Cursor); err != nil {
 		t.Fatal(err)
+	}
+	if err := <-first; err != nil {
+		t.Fatalf("seed peer mutation: %v", err)
 	}
 }
 
@@ -412,47 +662,6 @@ func TestEIOCarriesItsFailureClass(t *testing.T) {
 	}
 }
 
-// Defect 2: a partially successful write reported the byte count and a nonzero
-// errno at once. The application saw a failed write(2) while the file had
-// already grown. Linux returns the short count.
-func TestPartialWriteReportsTheShortCountAlone(t *testing.T) {
-	h := testVolumeHandler()
-	partial := h.writeOutcome(4096, 0, syscall.ENOSPC)
-	if partial.GetErrno() != 0 {
-		t.Fatalf("partial write errno = %d, want 0: %d bytes are already durable in XFS", partial.GetErrno(), partial.GetWrite().GetCount())
-	}
-	if partial.GetWrite().GetCount() != 4096 {
-		t.Fatalf("partial write count = %d, want 4096", partial.GetWrite().GetCount())
-	}
-	if partial.GetUncertain() {
-		t.Fatal("a short write on a live store is an exact outcome")
-	}
-
-	quota := h.writeOutcome(10, 64, syscall.EDQUOT)
-	if quota.GetErrno() != 0 || quota.GetWrite().GetCount() != 10 || quota.GetWrite().GetAssignedOffset() != 64 {
-		t.Fatalf("short append = %+v, want an exact short count at the assigned offset", quota)
-	}
-
-	// Only a write that made no progress reports the condition.
-	none := h.writeOutcome(0, 0, syscall.ENOSPC)
-	if none.GetErrno() != int32(syscall.ENOSPC) || none.GetWrite().GetCount() != 0 {
-		t.Fatalf("failed write = %+v, want ENOSPC with no count", none)
-	}
-
-	// A short write whose error means the store itself is gone keeps the exact
-	// count and stays explicitly uncertain, because the mount cannot continue.
-	dead := h.writeOutcome(8, 0, syscall.EIO)
-	if dead.GetErrno() != 0 || dead.GetWrite().GetCount() != 8 || !dead.GetUncertain() ||
-		dead.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE {
-		t.Fatalf("short write on a dying store = %+v", dead)
-	}
-
-	empty := h.writeOutcome(0, 0, nil)
-	if empty.GetErrno() != 0 || empty.GetWrite() == nil {
-		t.Fatalf("zero-length write = %+v, want a successful no-op", empty)
-	}
-}
-
 // Defect 4b: read and write payload sizes were used as a proxy for maximum
 // response size, so a directory listing was covered by neither bound. The
 // listing is now built to a budget derived from the frame, and every reply the
@@ -476,7 +685,7 @@ func TestDirectoryReplyBudgetAlwaysFitsTheFrame(t *testing.T) {
 			}
 			reply := &authoritypb.ReadDirReply{Verifier: make([]byte, 16)}
 			used := uint64(0)
-			for i := 0; ; i++ {
+			for i := 0; i < int(entries); i++ {
 				attr := xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: ^uint64(0), Size: 1 << 40}
 				var identity [16]byte
 				for j := range identity {
@@ -563,6 +772,167 @@ func TestReplyCacheIsBoundedInBytes(t *testing.T) {
 	}
 }
 
+// A replay slot's retained size is the credit its successor replaces. Admission
+// must therefore share the runtime's exact slot mutex with sequence validation
+// and apply. Otherwise two pipelined successors can both price themselves
+// against the same old large outcome: the first shrinks it, another slot consumes
+// those returned bytes, and the second then grows past the worker-wide bound.
+func TestReplyAdmissionIsSerializedWithItsReplaySlot(t *testing.T) {
+	now := time.Now()
+	observeNextBegin := atomic.Bool{}
+	nextBegin := make(chan struct{}, 1)
+	runtime, err := volumeserver.New("reply-admission-slot", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+		Now: func() time.Time {
+			if observeNextBegin.CompareAndSwap(true, false) {
+				nextBegin <- struct{}{}
+			}
+			return now
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{0x91}, volumeserver.Authorization{
+		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := testVolumeHandler()
+	const large, small uint32 = 64, 16
+	h.MaxRetainedReplyBytes = uint64(large)
+	if err := h.startSessionResources(cred.ID, xfsstore.Capability{0x92}, 2, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		h.closeSessionResources(cred.ID)
+		runtime.FenceSession(cred.ID)
+	})
+
+	execute := func(id volumeserver.MutationID, reserve, retained uint32, afterSettle func()) (out volumeserver.Outcome, err error) {
+		var reserved uint32
+		settled := false
+		defer func() {
+			if !settled {
+				h.releaseReplyReservation(reserved)
+			}
+		}()
+		return runtime.ExecuteMutationAdmitted(context.Background(), cred, id, func() error {
+			var reserveErr error
+			reserved, reserveErr = h.reserveReplyBytes(cred.ID, id.Slot, reserve)
+			return reserveErr
+		}, func(context.Context) volumeserver.Outcome {
+			h.settleReplyBytes(cred.ID, id.Slot, retained, reserved)
+			settled = true
+			if afterSettle != nil {
+				afterSettle()
+			}
+			return volumeserver.Outcome{Reply: make([]byte, retained)}
+		})
+	}
+	id := func(slot uint32, sequence uint64) volumeserver.MutationID {
+		return volumeserver.MutationID{
+			Slot: slot, Sequence: sequence,
+			Fingerprint: volumeserver.RequestFingerprint{byte(slot + 1), byte(sequence)},
+		}
+	}
+	if _, err := execute(id(0, 1), large, large, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	shrunk := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := execute(id(0, 2), large, small, func() {
+			close(shrunk)
+			<-releaseFirst
+		})
+		firstDone <- err
+	}()
+	<-shrunk
+
+	// Pipeline the next sequence while sequence 2 still owns slot 0. Its
+	// admission callback must remain behind that ownership boundary.
+	secondApplied := atomic.Bool{}
+	secondDone := make(chan error, 1)
+	observeNextBegin.Store(true)
+	go func() {
+		var reserved uint32
+		settled := false
+		defer func() {
+			if !settled {
+				h.releaseReplyReservation(reserved)
+			}
+		}()
+		_, err := runtime.ExecuteMutationAdmitted(context.Background(), cred, id(0, 3), func() error {
+			var reserveErr error
+			reserved, reserveErr = h.reserveReplyBytes(cred.ID, 0, large)
+			return reserveErr
+		}, func(context.Context) volumeserver.Outcome {
+			secondApplied.Store(true)
+			h.settleReplyBytes(cred.ID, 0, large, reserved)
+			settled = true
+			return volumeserver.Outcome{Reply: make([]byte, large)}
+		})
+		secondDone <- err
+	}()
+	// Begin calls the injected clock before pinning and acquiring the replay
+	// slot. Sequence 2 is still inside apply, so this observation proves sequence
+	// 3 entered the runtime and can progress only as far as slot 0's mutex.
+	<-nextBegin
+
+	// While slot 0 is still locked at its now-small settled outcome, an
+	// independent slot consumes exactly the bytes it returned.
+	if _, err := execute(id(1, 1), large-small, large-small, nil); err != nil {
+		t.Fatalf("independent slot could not consume returned capacity: %v", err)
+	}
+	h.resourcesMu.Lock()
+	retained, reserved := h.retainedReplyBytes, h.reservedReplyBytes
+	h.resourcesMu.Unlock()
+	if retained != uint64(large) || reserved != 0 {
+		t.Fatalf("before successor admission = %d retained / %d reserved, want %d / 0", retained, reserved, large)
+	}
+	select {
+	case err := <-secondDone:
+		t.Fatalf("pipelined successor escaped the slot mutex early: %v", err)
+	default:
+	}
+
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("shrinking predecessor: %v", err)
+	}
+	if err := <-secondDone; !errors.Is(err, volumeserver.ErrAdmission) {
+		t.Fatalf("successor at full budget = %v, want ErrAdmission", err)
+	}
+	if secondApplied.Load() {
+		t.Fatal("reply admission refusal reached apply")
+	}
+	h.resourcesMu.Lock()
+	retained, reserved = h.retainedReplyBytes, h.reservedReplyBytes
+	h.resourcesMu.Unlock()
+	if retained != uint64(large) || reserved != 0 {
+		t.Fatalf("refusal exceeded budget: %d retained / %d reserved, want %d / 0", retained, reserved, large)
+	}
+
+	// Admission refusal did not advance sequence 3. Once slot 1 returns its
+	// capacity, the exact same identity can execute normally.
+	if _, err := execute(id(1, 2), 0, 0, nil); err != nil {
+		t.Fatalf("release independent slot: %v", err)
+	}
+	if _, err := execute(id(0, 3), large, large, nil); err != nil {
+		t.Fatalf("retry refused identity after capacity returned: %v", err)
+	}
+	h.resourcesMu.Lock()
+	retained, reserved = h.retainedReplyBytes, h.reservedReplyBytes
+	h.resourcesMu.Unlock()
+	if retained != uint64(large) || reserved != 0 {
+		t.Fatalf("successful retry = %d retained / %d reserved, want %d / 0", retained, reserved, large)
+	}
+}
+
 func TestReplyReservationIsReleasedWhenNothingIsRetained(t *testing.T) {
 	h := testVolumeHandler()
 	h.MaxRetainedReplyBytes = uint64(fixedMutationReplyBytes)
@@ -596,8 +966,8 @@ func TestSessionResourceAdmissionAndTerminalState(t *testing.T) {
 	if err := h.trackItem(first, xfsstore.Capability{1}, false); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.trackItem(second, xfsstore.Capability{2}, false); !errors.Is(err, volumeserver.ErrAdmission) {
-		t.Fatalf("global item admission = %v, want ErrAdmission", err)
+	if err := h.trackItem(second, xfsstore.Capability{2}, false); !errors.Is(err, syscall.ENFILE) {
+		t.Fatalf("global item admission = %v, want ENFILE", err)
 	}
 	h.closeSessionResources(first)
 	if err := h.trackItem(first, xfsstore.Capability{3}, false); !errors.Is(err, volumeserver.ErrSessionExpired) {
@@ -629,11 +999,11 @@ func TestCapabilityReservationIsPreApplyAndSymmetric(t *testing.T) {
 	if h.totalItems != 1 || h.totalOpens != 1 {
 		t.Fatalf("reservation charged %d items / %d opens, want 1 / 1", h.totalItems, h.totalOpens)
 	}
-	if _, err := h.reserveCapabilities(second, 1, 0); !errors.Is(err, volumeserver.ErrAdmission) {
-		t.Fatalf("item admitted past outstanding reservation: %v", err)
+	if _, err := h.reserveCapabilities(second, 1, 0); !errors.Is(err, syscall.ENFILE) {
+		t.Fatalf("item admission past outstanding reservation = %v, want ENFILE", err)
 	}
-	if _, err := h.reserveCapabilities(second, 0, 1); !errors.Is(err, volumeserver.ErrAdmission) {
-		t.Fatalf("open admitted past outstanding reservation: %v", err)
+	if _, err := h.reserveCapabilities(second, 0, 1); !errors.Is(err, syscall.ENFILE) {
+		t.Fatalf("open admission past outstanding reservation = %v, want ENFILE", err)
 	}
 
 	item := xfsstore.Capability{0x41}
@@ -720,29 +1090,250 @@ func TestCapabilityReservationReleaseAfterSessionCleanupDoesNotUnderflow(t *test
 
 type resourceAdmissionFaultStore struct {
 	volumeStore
-	failure    error
-	create     atomic.Uint32
-	mkdir      atomic.Uint32
-	symlink    atomic.Uint32
-	open       atomic.Uint32
-	lookup     atomic.Uint32
-	forget     atomic.Uint32
-	lookupItem xfsstore.Capability
+	failure      error
+	create       atomic.Uint32
+	mkdir        atomic.Uint32
+	symlink      atomic.Uint32
+	open         atomic.Uint32
+	lookup       atomic.Uint32
+	forget       atomic.Uint32
+	identityOpen atomic.Uint32
+	lookupItem   xfsstore.Capability
+}
+
+func (*resourceAdmissionFaultStore) LockMutation([][16]byte) func() { return func() {} }
+
+type allocatingMutationLockStore struct {
+	resourceAdmissionFaultStore
+	t      *testing.T
+	parent xfsstore.Capability
+	child  xfsstore.Capability
+	handle xfsstore.Capability
+
+	mu         sync.Mutex
+	locked     bool
+	released   bool
+	identities [][16]byte
+	phases     map[string]bool
+}
+
+func (s *allocatingMutationLockStore) LockMutation(identities [][16]byte) func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		s.t.Fatal("allocating mutation recursively acquired its writer lock")
+	}
+	s.identities = append([][16]byte(nil), identities...)
+	s.locked = true
+	return func() {
+		s.mu.Lock()
+		s.locked = false
+		s.released = true
+		s.mu.Unlock()
+	}
+}
+
+func (s *allocatingMutationLockStore) observeLocked(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.locked {
+		s.t.Errorf("%s ran outside the allocating parent's writer lock", phase)
+	}
+	s.phases[phase] = true
+}
+
+func (s *allocatingMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.observeLocked("allocating syscall")
+	if parent != s.parent {
+		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
+	}
+	return s.child, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *allocatingMutationLockStore) OpenFile(item xfsstore.Capability, _ xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.observeLocked("creation handle acquisition")
+	if item != s.child {
+		s.t.Errorf("open item = %x, want %x", item, s.child)
+	}
+	return s.handle, nil
+}
+
+func (s *allocatingMutationLockStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	if item == s.child {
+		s.observeLocked("newborn identity capture")
+	}
+	return [16]byte{item[0]}, nil
+}
+
+func (s *allocatingMutationLockStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	if item == s.parent {
+		s.observeLocked("parent post-apply snapshot")
+		return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(item[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1}, nil
+	}
+	return s.resourceAdmissionFaultStore.Getattr(item)
+}
+
+func (*allocatingMutationLockStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+type sourceGateRefreshStore struct {
+	resourceAdmissionFaultStore
+	mu             sync.Mutex
+	bound          xfsstore.Capability
+	lookupCalls    atomic.Uint32
+	firstLookup    chan struct{}
+	releaseFirst   chan struct{}
+	firstForgotten chan struct{}
+	secondLookup   chan struct{}
+}
+
+type fsyncMetricStore struct {
+	resourceAdmissionFaultStore
+	batch int
+}
+
+func (s *fsyncMetricStore) FsyncCoalesced(xfsstore.Capability, bool) (int, error) {
+	return s.batch, nil
+}
+
+// CloseOpen must exist on the mock itself: the harness fences the session at
+// cleanup, which closes every tracked open, and the embedded volumeStore
+// interface is deliberately nil.
+func (s *fsyncMetricStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+// renameReplyStore is an in-memory namespace only for exercising the
+// authority's response contract. The source frontend is deliberately absent:
+// the post identities must come from the authoritative pre-XFS lookup, never
+// from a source-side dentry cache.
+type renameReplyStore struct {
+	resourceAdmissionFaultStore
+	mu          sync.Mutex
+	bindings    map[string]xfsstore.Capability
+	renameCalls atomic.Uint32
+}
+
+func (s *renameReplyStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	return xfsstore.Attr{
+		Kind: xfsstore.KindDirectory, Ino: uint64(item[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1,
+	}, nil
+}
+
+func (s *renameReplyStore) Lookup(_ xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.lookup.Add(1)
+	s.mu.Lock()
+	item, ok := s.bindings[name]
+	s.mu.Unlock()
+	if !ok {
+		return xfsstore.Capability{}, xfsstore.Attr{}, syscall.ENOENT
+	}
+	return item, xfsstore.Attr{
+		Kind: xfsstore.KindRegular, Ino: uint64(item[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1,
+	}, nil
+}
+
+func (s *renameReplyStore) Rename(
+	_ xfsstore.Capability,
+	oldName string,
+	_ xfsstore.Capability,
+	newName string,
+	flags xfsstore.RenameFlags,
+) error {
+	s.renameCalls.Add(1)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	moved, ok := s.bindings[oldName]
+	if !ok {
+		return syscall.ENOENT
+	}
+	if flags&xfsstore.RenameExchange != 0 {
+		replaced, exists := s.bindings[newName]
+		if !exists {
+			return syscall.ENOENT
+		}
+		s.bindings[oldName], s.bindings[newName] = replaced, moved
+		return nil
+	}
+	if flags&xfsstore.RenameNoReplace != 0 {
+		if _, exists := s.bindings[newName]; exists {
+			return syscall.EEXIST
+		}
+	}
+	if replaced, exists := s.bindings[newName]; exists && replaced == moved {
+		// POSIX rename is a successful no-op when two names are hard links to
+		// the same inode. Both names remain bound.
+		return nil
+	}
+	delete(s.bindings, oldName)
+	s.bindings[newName] = moved
+	return nil
+}
+
+func (s *sourceGateRefreshStore) Lookup(_ xfsstore.Capability, _ string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.mu.Lock()
+	bound := s.bound
+	s.mu.Unlock()
+	call := s.lookupCalls.Add(1)
+	if call == 1 {
+		close(s.firstLookup)
+		<-s.releaseFirst
+	} else if call == 2 {
+		close(s.secondLookup)
+	}
+	return bound, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(bound[0]), Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *sourceGateRefreshStore) Forget(xfsstore.Capability) error {
+	if s.forget.Add(1) == 1 {
+		close(s.firstForgotten)
+	}
+	return nil
+}
+
+func (s *sourceGateRefreshStore) setBound(bound xfsstore.Capability) {
+	s.mu.Lock()
+	s.bound = bound
+	s.mu.Unlock()
 }
 
 func (s *resourceAdmissionFaultStore) Fence(error) {}
+func (s *resourceAdmissionFaultStore) Root() (xfsstore.Capability, error) {
+	return xfsstore.Capability{0x70}, nil
+}
 func (s *resourceAdmissionFaultStore) Identity(item xfsstore.Capability) ([16]byte, error) {
 	return [16]byte{item[0]}, nil
 }
+func (s *resourceAdmissionFaultStore) CoordinateItem(item xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	ino := uint64(item[0])
+	if item == s.lookupItem {
+		ino = 2
+	}
+	return xfsstore.ObjectCoordinate{Stable: [16]byte{item[0]}, Ino: ino, DeviceMinor: 1}, nil
+}
+func (s *resourceAdmissionFaultStore) IdentityOpen(open xfsstore.Capability) ([16]byte, error) {
+	s.identityOpen.Add(1)
+	return [16]byte{open[0]}, nil
+}
+func (s *resourceAdmissionFaultStore) CoordinateOpen(open xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	s.identityOpen.Add(1)
+	return xfsstore.ObjectCoordinate{Stable: [16]byte{open[0]}, Ino: uint64(open[0]), DeviceMinor: 1}, nil
+}
 func (s *resourceAdmissionFaultStore) Getattr(xfsstore.Capability) (xfsstore.Attr, error) {
-	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: 1}, nil
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: 1, DeviceMinor: 1}, nil
 }
 func (s *resourceAdmissionFaultStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
 	s.lookup.Add(1)
 	if s.lookupItem != (xfsstore.Capability{}) {
-		return s.lookupItem, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 2, Mode: 0o600, Nlink: 1}, nil
+		return s.lookupItem, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 2, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
 	}
 	return xfsstore.Capability{}, xfsstore.Attr{}, syscall.ENOENT
+}
+
+// LookupOpen resolves the same names as Lookup. The real volume distinguishes
+// them by which reference names the directory -- an object capability or an
+// open handle -- and this fake holds no directory state to distinguish, so the
+// two answers are deliberately the same. A store embedding this one that models
+// readdir's resolution must override both.
+func (s *resourceAdmissionFaultStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	return s.Lookup(handle, name)
 }
 func (s *resourceAdmissionFaultStore) Forget(xfsstore.Capability) error {
 	s.forget.Add(1)
@@ -780,10 +1371,620 @@ func (s *resourceAdmissionFaultStore) calls(operation string) uint32 {
 	}
 }
 
+func TestDeriveSourcePublicationGateCoversVisibleOperationMatrix(t *testing.T) {
+	store := &resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x33}}
+	h := testVolumeHandler()
+	h.Store = store
+	session := volumeserver.SessionID{0x91}
+	root := xfsstore.Capability{0x11}
+	item := xfsstore.Capability{0x22}
+	handle := xfsstore.Capability{0x22}
+	outputHandle := xfsstore.Capability{0x44}
+	if err := h.startSessionResources(session, root, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.trackItem(session, item, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.trackOpen(session, handle, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.trackOpen(session, outputHandle, false); err != nil {
+		t.Fatal(err)
+	}
+
+	rootIdentity := [16]byte{0x11}
+	itemIdentity := [16]byte{0x22}
+	boundIdentity := [16]byte{0x33}
+	itemTarget := func(identity [16]byte, data bool) volumeserver.SourcePublicationTarget {
+		return volumeserver.SourcePublicationTarget{Identity: identity, Attributes: true, Data: data}
+	}
+	namespaceTarget := func(name string, data bool) volumeserver.SourcePublicationTarget {
+		return volumeserver.SourcePublicationTarget{
+			ParentIdentity: rootIdentity, Name: []byte(name), BoundAttributes: true, BoundData: data,
+			BoundIdentities: [][16]byte{boundIdentity},
+		}
+	}
+	rootAndNamespace := func(name string, data bool) volumeserver.SourcePublicationGate {
+		return volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{
+			itemTarget(rootIdentity, false), namespaceTarget(name, data),
+		}}
+	}
+
+	tests := []struct {
+		name    string
+		request *authoritypb.Request
+		want    volumeserver.SourcePublicationGate
+	}{
+		{
+			name: "setattr attributes", request: &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{
+				Item: item[:], Mode: proto.Uint32(0o600),
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{itemTarget(itemIdentity, false)}},
+		},
+		{
+			name: "setattr size", request: &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{
+				Item: item[:], Size: proto.Int64(7),
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{itemTarget(itemIdentity, true)}},
+		},
+		{
+			name: "fallocate", request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: handle[:]}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{itemTarget(itemIdentity, true)}},
+		},
+		{
+			name: "copy file range", request: &authoritypb.Request{Body: &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{
+				InputHandle: handle[:], OutputHandle: outputHandle[:],
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{
+				itemTarget(itemIdentity, true), itemTarget([16]byte{0x44}, true),
+			}},
+		},
+		{
+			name: "open truncate", request: &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{
+				Item: item[:], Flags: &authoritypb.OpenFlags{Write: true, Truncate: true},
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{itemTarget(itemIdentity, true)}},
+		},
+		{
+			name: "create", request: &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+				Parent: root[:], Name: []byte("child"), Flags: &authoritypb.OpenFlags{Write: true},
+			}}}, want: rootAndNamespace("child", false),
+		},
+		{
+			name: "create truncate", request: &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+				Parent: root[:], Name: []byte("child"), Flags: &authoritypb.OpenFlags{Write: true, Truncate: true},
+			}}}, want: rootAndNamespace("child", true),
+		},
+		{
+			name: "mkdir", request: &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{
+				Parent: root[:], Name: []byte("child"),
+			}}}, want: rootAndNamespace("child", false),
+		},
+		{
+			name: "unlink", request: &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{
+				Parent: root[:], Name: []byte("child"),
+			}}}, want: rootAndNamespace("child", false),
+		},
+		{
+			name: "rename", request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+				OldParent: root[:], OldName: []byte("old"), NewParent: root[:], NewName: []byte("new"),
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{
+				itemTarget(rootIdentity, false), namespaceTarget("new", false), namespaceTarget("old", false),
+			}},
+		},
+		{
+			name: "link", request: &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{
+				ExistingItem: item[:], NewParent: root[:], NewName: []byte("child"),
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{
+				itemTarget(rootIdentity, false), itemTarget(itemIdentity, false), namespaceTarget("child", false),
+			}},
+		},
+		{
+			name: "symlink", request: &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{
+				Parent: root[:], Name: []byte("child"), Target: []byte("target"),
+			}}}, want: rootAndNamespace("child", false),
+		},
+		{
+			name: "setxattr", request: &authoritypb.Request{Body: &authoritypb.Request_SetXattr{SetXattr: &authoritypb.SetXattrRequest{
+				Item: item[:], Name: []byte("user.test"), Value: []byte("value"),
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{itemTarget(itemIdentity, false)}},
+		},
+		{
+			name: "removexattr", request: &authoritypb.Request{Body: &authoritypb.Request_RemoveXattr{RemoveXattr: &authoritypb.RemoveXattrRequest{
+				Item: item[:], Name: []byte("user.test"),
+			}}},
+			want: volumeserver.SourcePublicationGate{Targets: []volumeserver.SourcePublicationTarget{itemTarget(itemIdentity, false)}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := newOperationResolutionContext(h, session).deriveSourcePublicationGate(test.request, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("derived gate\n got %#v\nwant %#v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDeriveSourcePublicationGateRejectsSetAttrItemHandleMismatch(t *testing.T) {
+	store := &resourceAdmissionFaultStore{}
+	h := testVolumeHandler()
+	h.Store = store
+	session := volumeserver.SessionID{0x92}
+	item := xfsstore.Capability{0x41}
+	handle := xfsstore.Capability{0x42}
+	if err := h.startSessionResources(session, item, 1, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.trackOpen(session, handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{
+		Item: item[:], Handle: handle[:], Mode: proto.Uint32(0o600),
+	}}}
+	if _, err := newOperationResolutionContext(h, session).deriveSourcePublicationGate(request, true); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("mismatched SetAttr item/handle = %v, want EINVAL", err)
+	}
+}
+
+func TestOperationResolutionContextReusesAuthoritativeNamespaceBindings(t *testing.T) {
+	root := xfsstore.Capability{0x11}
+	for _, test := range []struct {
+		name        string
+		request     *authoritypb.Request
+		prepareName [][]byte
+		wantLookups uint32
+	}{
+		{
+			name: "create",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+				Parent: root[:], Name: []byte("created"),
+			}}},
+			prepareName: [][]byte{[]byte("created")}, wantLookups: 1,
+		},
+		{
+			name: "same-directory-rename",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+				OldParent: root[:], OldName: []byte("old"), NewParent: root[:], NewName: []byte("new"),
+			}}},
+			prepareName: [][]byte{[]byte("old"), []byte("new")}, wantLookups: 2,
+		},
+		{
+			name: "unlink",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{
+				Parent: root[:], Name: []byte("removed"),
+			}}},
+			prepareName: [][]byte{[]byte("removed")}, wantLookups: 1,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x42}}
+			h := testVolumeHandler()
+			h.Store = store
+			session := volumeserver.SessionID{0x93}
+			if err := h.startSessionResources(session, root, 1, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+				t.Fatal(err)
+			}
+			resolutions := newOperationResolutionContext(h, session)
+			if _, err := resolutions.deriveSourcePublicationGate(test.request, false); err != nil {
+				t.Fatal(err)
+			}
+			if got := store.lookup.Load(); got != 0 {
+				t.Fatalf("shape-only namespace lookups = %d, want 0", got)
+			}
+
+			resolutions.invalidateNamespaceBindings()
+			if _, err := resolutions.deriveSourcePublicationGate(test.request, true); err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range test.prepareName {
+				if _, err := resolutions.namespace(root, name); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := store.lookup.Load(); got != test.wantLookups {
+				t.Fatalf("operation namespace lookups = %d, want %d", got, test.wantLookups)
+			}
+		})
+	}
+}
+
+func retiredMutateVisibleItemGateResolvesStableFallocateIdentityOnce(t *testing.T) {
+	runtime, err := volumeserver.New("write-source-gate-identity", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{0x51}, volumeserver.Authorization{
+		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		MaxCachedNameCapacity: 32, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := make(chan struct{})
+	t.Cleanup(func() { close(terminal) })
+	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &resourceAdmissionFaultStore{}
+	h := testVolumeHandler()
+	h.Store, h.Runtime, h.Visibility = store, runtime, visibility
+	root := xfsstore.Capability{0x11}
+	handle := xfsstore.Capability{0x52}
+	if err := h.startSessionResources(credential.ID, root, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.trackOpen(credential.ID, handle, false); err != nil {
+		t.Fatal(err)
+	}
+	identity := [16]byte{handle[0]}
+	request := &authoritypb.Request{
+		RequestId: 1,
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{{
+			Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+				Identity: identity[:], Attributes: true, Data: true,
+			}},
+		}}},
+		Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: handle[:], Length: 1}},
+	}
+	stampMutation(t, request, 0, 1)
+	targets := []volumeserver.VisibilityTarget{{
+		Scope: volumeserver.VisibilityData, Identity: identity, KernelIno: 52, Device: 1, Size: 1,
+	}}
+	response := h.mutateVisibleSequence(
+		context.Background(), request, credential,
+		func() ([]volumeserver.VisibilityTarget, error) { return targets, nil },
+		func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
+				identity: identity,
+				attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 52, Size: 1, Mode: 0o600, Nlink: 1, DeviceMinor: 1},
+				roles:    postStateRoleTarget,
+				changed:  true,
+			})
+			return resp, targets
+		},
+	)
+	if response.GetErrno() != 0 {
+		t.Fatalf("fallocate mutation = %+v", response)
+	}
+	if calls := store.identityOpen.Load(); calls != 1 {
+		t.Fatalf("Fallocate stable identity resolutions = %d, want one pre-enqueue resolution", calls)
+	}
+}
+
+func retiredMutateVisibleNamespaceGateRefreshesBindingAfterDependencyWait(t *testing.T) {
+	runtime, err := volumeserver.New("namespace-source-gate-refresh", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{0x61}, volumeserver.Authorization{
+		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
+		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
+		MaxCachedNameCapacity: 32, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal := make(chan struct{})
+	t.Cleanup(func() { close(terminal) })
+	if err := visibility.Register(credential.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairIndependent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	oldBinding := xfsstore.Capability{0x71}
+	newBinding := xfsstore.Capability{0x72}
+	store := &sourceGateRefreshStore{
+		bound: oldBinding, firstLookup: make(chan struct{}), releaseFirst: make(chan struct{}),
+		firstForgotten: make(chan struct{}), secondLookup: make(chan struct{}),
+	}
+	h := testVolumeHandler()
+	h.Store, h.Runtime, h.Visibility = store, runtime, visibility
+	root := xfsstore.Capability{0x11}
+	if err := h.startSessionResources(credential.ID, root, 2, [32]byte{}, volumeserver.CoherenceStrict); err != nil {
+		t.Fatal(err)
+	}
+	parentIdentity := [16]byte{root[0]}
+	mutationTargets := []volumeserver.VisibilityTarget{
+		{Scope: volumeserver.VisibilityNamespace, ParentIdentity: parentIdentity, ParentKernelIno: 0x11, Device: 1, Name: []byte("child")},
+		{Scope: volumeserver.VisibilityAttributes, Identity: parentIdentity, KernelIno: 0x11, Device: 1},
+		{Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{newBinding[0]}, KernelIno: uint64(newBinding[0]), Device: 1},
+	}
+
+	ownerEntered := make(chan struct{})
+	releaseOwner := make(chan struct{})
+	ownerResult := make(chan error, 1)
+	go func() {
+		ownerResult <- visibility.Execute(
+			context.Background(), volumeserver.SessionID{0xFE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets(mutationTargets),
+			func() ([]volumeserver.VisibilityTarget, error) {
+				close(ownerEntered)
+				<-releaseOwner
+				return mutationTargets, nil
+			},
+			func() ([]volumeserver.VisibilityTarget, bool) { return nil, false },
+		)
+	}()
+	<-ownerEntered
+
+	request := &authoritypb.Request{
+		RequestId: 1,
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+				Identity: parentIdentity[:], Attributes: true,
+			}}},
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
+				ParentIdentity: parentIdentity[:], Name: []byte("child"), BoundAttributes: true,
+			}}},
+		}},
+		Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: root[:], Name: []byte("child")}},
+	}
+	stampMutation(t, request, 0, 1)
+	mutationResult := make(chan *authoritypb.Response, 1)
+	go func() {
+		mutationResult <- h.mutateVisibleSequence(
+			context.Background(), request, credential,
+			func() ([]volumeserver.VisibilityTarget, error) { return mutationTargets, nil },
+			func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+				resp := h.success(0)
+				resp.PostState = h.mutationPostState(sequence,
+					postStateSnapshot{
+						identity: [16]byte{newBinding[0]},
+						attr:     xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(newBinding[0]), Mode: 0o600, Nlink: 0, DeviceMinor: 1},
+						roles:    postStateRoleRemoved,
+						changed:  true,
+					},
+					postStateSnapshot{
+						identity: parentIdentity,
+						attr:     xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(root[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1},
+						roles:    postStateRoleParent,
+						changed:  true,
+					},
+				)
+				return resp, mutationTargets
+			},
+		)
+	}()
+	select {
+	case <-store.firstLookup:
+	case <-time.After(2 * time.Second):
+		t.Fatal("namespace binding was not resolved before dependency admission")
+	}
+	close(store.releaseFirst)
+	<-store.firstForgotten
+	select {
+	case <-store.secondLookup:
+		t.Fatal("namespace binding refreshed before the conflicting owner released its key")
+	default:
+	}
+	store.setBound(newBinding)
+	close(releaseOwner)
+	if err := <-ownerResult; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-store.secondLookup:
+	case <-time.After(2 * time.Second):
+		t.Fatal("namespace binding was not refreshed after its dependency version changed")
+	}
+	if response := <-mutationResult; response.GetErrno() != 0 {
+		t.Fatalf("namespace mutation = %+v", response)
+	}
+	// The first post-wait lookup discovers that the binding moved from oldBinding
+	// to newBinding, but the turn still owns the old inode dependency. Requeueing
+	// is all-or-nothing and must release that set before acquiring newBinding; an
+	// older mutation of the newly discovered inode can pass in that interval. The
+	// final lookup runs with the corrected name and inode set held, preserving the
+	// resolution context's coordinate and size rather than trusting pre-acquisition
+	// metadata. The global FIFO needed only two lookups because its turn already
+	// excluded every inode mutation; dependency sequencing deliberately needs three.
+	if calls := store.lookupCalls.Load(); calls != 3 {
+		t.Fatalf("namespace binding lookups = %d, want declaration, version refresh, and post-requeue proof", calls)
+	}
+
+	newIdentity := [16]byte{newBinding[0]}
+	peerTargets := []volumeserver.VisibilityTarget{{
+		Scope: volumeserver.VisibilityAttributes, Identity: newIdentity, KernelIno: uint64(newBinding[0]), Device: 1,
+	}}
+	peerResult := make(chan error, 1)
+	go func() {
+		peerResult <- visibility.Execute(
+			context.Background(), volumeserver.SessionID{0xFD}, volumeserver.MutationID{Sequence: 2},
+			volumeserver.MutationDependenciesForTargets(peerTargets),
+			func() ([]volumeserver.VisibilityTarget, error) { return peerTargets, nil },
+			func() ([]volumeserver.VisibilityTarget, bool) { return exactAuthorityTestTargets(2, peerTargets), true },
+		)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	prepare, err := visibility.Next(ctx, credential.ID, testInitialVisibilityCursor(t, visibility, credential.ID))
+	if err != nil {
+		t.Fatalf("refreshed binding was not indexed before the next mutation: %v", err)
+	}
+	if err := visibility.Ack(credential.ID, prepare.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := visibility.Next(ctx, credential.ID, prepare.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := visibility.Ack(credential.ID, complete.Cursor); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-peerResult; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSourcePublicationResolutionsCoverEveryIdentityReturningMutation(t *testing.T) {
+	identity := [16]byte{0xC1}
+	exchangedIdentity := [16]byte{0xC2}
+	item := &authoritypb.Item{StableIdentity: identity[:]}
+	tests := []struct {
+		name     string
+		request  *authoritypb.Request
+		response *authoritypb.Response
+		want     []volumeserver.VisibilityResolution
+	}{
+		{
+			name:     "create including existing no-change result",
+			request:  &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: item}}},
+			want:     []volumeserver.VisibilityResolution{{Identity: identity}},
+		},
+		{
+			name:     "mkdir",
+			request:  &authoritypb.Request{Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}},
+			want:     []volumeserver.VisibilityResolution{{Identity: identity}},
+		},
+		{
+			name:     "symlink",
+			request:  &authoritypb.Request{Body: &authoritypb.Request_Symlink{Symlink: &authoritypb.SymlinkRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: item}}},
+			want:     []volumeserver.VisibilityResolution{{Identity: identity}},
+		},
+		{
+			name:     "link",
+			request:  &authoritypb.Request{Body: &authoritypb.Request_Link{Link: &authoritypb.LinkRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: item}}},
+			want:     []volumeserver.VisibilityResolution{{Identity: identity}},
+		},
+		{
+			name:    "normal rename",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
+				NewPostIdentity: identity[:],
+			}}},
+			want: []volumeserver.VisibilityResolution{{Identity: identity}},
+		},
+		{
+			name:    "normal same-inode hard-link no-op",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
+				NewPostIdentity: identity[:], OldPostIdentity: identity[:],
+			}}},
+			want: []volumeserver.VisibilityResolution{{Identity: identity}},
+		},
+		{
+			name: "exchange rename",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+				Exchange: true,
+			}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
+				NewPostIdentity: identity[:], OldPostIdentity: exchangedIdentity[:],
+			}}},
+			want: []volumeserver.VisibilityResolution{{Identity: identity}, {Identity: exchangedIdentity}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resolutions, err := sourcePublicationResolutions(test.request, test.response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(resolutions, test.want) {
+				t.Fatalf("resolutions = %#v, want %#v", resolutions, test.want)
+			}
+		})
+	}
+
+	failed := &authoritypb.Response{Errno: int32(syscall.EEXIST)}
+	resolutions, err := sourcePublicationResolutions(tests[0].request, failed)
+	if err != nil || resolutions != nil {
+		t.Fatalf("failed mutation resolutions = (%#v, %v), want nil", resolutions, err)
+	}
+	if _, err := sourcePublicationResolutions(tests[0].request, &authoritypb.Response{}); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("successful identity-returning response without item = %v, want EIO", err)
+	}
+
+	malformedRenames := []struct {
+		name     string
+		request  *authoritypb.Request
+		response *authoritypb.Response
+	}{
+		{
+			name:     "normal missing new identity",
+			request:  &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{}}},
+		},
+		{
+			name:    "normal mismatched old identity",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
+				NewPostIdentity: identity[:], OldPostIdentity: exchangedIdentity[:],
+			}}},
+		},
+		{
+			name:    "exchange missing old identity",
+			request: &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{Exchange: true}}},
+			response: &authoritypb.Response{Body: &authoritypb.Response_Rename{Rename: &authoritypb.RenameReply{
+				NewPostIdentity: identity[:],
+			}}},
+		},
+	}
+	for _, test := range malformedRenames {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := sourcePublicationResolutions(test.request, test.response); !errors.Is(err, syscall.EIO) {
+				t.Fatalf("malformed rename publication = %v, want EIO", err)
+			}
+		})
+	}
+}
+
 func resourceAdmissionRequestHarness(
 	t *testing.T,
 	store volumeStore,
 	maxItems, maxOpens uint32,
+) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability) {
+	return resourceAdmissionRequestHarnessForProfile(
+		t, store, maxItems, maxOpens, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+	)
+}
+
+func resourceAdmissionFskitRequestHarness(
+	t *testing.T,
+	store volumeStore,
+	maxItems, maxOpens uint32,
+) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability) {
+	return resourceAdmissionRequestHarnessForProfile(
+		t, store, maxItems, maxOpens, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+	)
+}
+
+func resourceAdmissionRequestHarnessForProfile(
+	t *testing.T,
+	store volumeStore,
+	maxItems, maxOpens uint32,
+	profile authoritypb.FrontendProfile,
 ) (*VolumeHandler, context.Context, volumeserver.SessionCredential, xfsstore.Capability) {
 	t.Helper()
 	runtime, err := volumeserver.New("resource-admission", volumeserver.Config{
@@ -793,33 +1994,208 @@ func resourceAdmissionRequestHarness(
 		t.Fatal(err)
 	}
 	peer := volumeserver.PeerIdentity{0x71}
-	cred, err := runtime.Attach(2, peer, volumeserver.Authorization{
+	cred, err := runtime.AttachActiveForTest(2, peer, volumeserver.Authorization{
 		Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noopMembership{}, Fencer: noopFencer{},
-		MaxCachedNameCapacity: 16, MaxRepairBudget: time.Minute, MaxClockSkew: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	routes := &RoutesController{Visibility: visibility, loaded: true}
-	h := &VolumeHandler{
-		Store: store, Runtime: runtime, Authorizer: allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}, Routes: routes,
-		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
-		MaxItemsPerSession: maxItems, MaxOpensPerSession: maxOpens,
-		MaxItems: maxItems, MaxOpens: maxOpens, MaxRetainedReplyBytes: 1 << 20,
-	}
+	h := testVolumeHandler()
+	loadedCoordinationFor("", noopFencer{}, noopMembership{}, 16).Bind(h)
+	h.Store, h.Runtime, h.Authorizer = store, runtime, allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
+	h.MaxItemsPerSession, h.MaxOpensPerSession = maxItems, maxOpens
+	h.MaxItems, h.MaxOpens = maxItems, maxOpens
 	root := xfsstore.Capability{0x72}
-	if err := h.startSessionResources(cred.ID, root, 2, [32]byte{}); err != nil {
+	if err := h.startSessionResourcesForProfile(
+		cred.ID, root, 2, routesRevisionOf(""), profile,
+	); err != nil {
 		t.Fatal(err)
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		commitment := volumeserver.VisibilityCommitment{
+			CachedNameCapacity: 16, RepairBudget: time.Second,
+			NamespaceRepair:     volumeserver.NamespaceRepairCallbackSerializedPipelined,
+			CompatibilityWriter: true,
+		}
+		h.resourcesMu.Lock()
+		h.resources[cred.ID].commitment = commitment
+		h.resourcesMu.Unlock()
+		if err := h.Lifecycle.Activate(cred.ID, func() error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		terminal, err := runtime.SessionTerminal(cred.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Visibility.Register(cred.ID, volumeserver.CoherenceStrict, terminal, commitment); err != nil {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() { runtime.FenceSession(cred.ID) })
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte(peer))
 	return h, ctx, cred, root
+}
+
+func renameReplyRequest(
+	t *testing.T,
+	cred volumeserver.SessionCredential,
+	root xfsstore.Capability,
+	exchange bool,
+) *authoritypb.Request {
+	t.Helper()
+	parentIdentity := [16]byte{root[0]}
+	request := &authoritypb.Request{
+		RequestId: 1,
+		Epoch:     cred.Epoch[:],
+		Session: &authoritypb.SessionProof{
+			Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:],
+		},
+		FskitFrontendOperationId: 1,
+		FskitSourcePublication: &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+				Identity: parentIdentity[:], Attributes: true,
+			}}},
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
+				ParentIdentity: parentIdentity[:], Name: []byte("new"), BoundAttributes: true,
+			}}},
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
+				ParentIdentity: parentIdentity[:], Name: []byte("old"), BoundAttributes: true,
+			}}},
+		}},
+		Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
+			OldParent: root[:], OldName: []byte("old"), NewParent: root[:], NewName: []byte("new"), Exchange: exchange,
+		}},
+	}
+	stampMutation(t, request, 0, 1)
+	return request
+}
+
+func TestRenameReplyUsesAuthoritativePostBindingAndReplaysWithoutXFS(t *testing.T) {
+	moved := xfsstore.Capability{0xA1}
+	store := &renameReplyStore{bindings: map[string]xfsstore.Capability{"old": moved}}
+	h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 4, 2)
+	request := renameReplyRequest(t, cred, root, false)
+
+	first := h.Handle(ctx, request)
+	if first.GetErrno() != 0 || first.GetUncertain() {
+		t.Fatalf("Rename = %+v, want definite success", first)
+	}
+	want := [16]byte{moved[0]}
+	if rename := first.GetRename(); rename == nil || !bytes.Equal(rename.GetNewPostIdentity(), want[:]) || len(rename.GetOldPostIdentity()) != 0 {
+		t.Fatalf("Rename reply = %+v, want authoritative new identity %x and no old identity", rename, want)
+	}
+	if calls := store.renameCalls.Load(); calls != 1 {
+		t.Fatalf("Rename calls = %d, want one", calls)
+	}
+	if calls := store.lookup.Load(); calls != 3 {
+		t.Fatalf("Rename namespace lookups = %d, want two dependency resolutions plus one locked post-state capability lookup", calls)
+	}
+
+	// Request ID is delivery correlation, not replay identity. A lost DATA
+	// response must reproduce the authoritative binding without a second XFS
+	// rename or any source-side name-cache inference.
+	replay := proto.Clone(request).(*authoritypb.Request)
+	replay.RequestId = 2
+	second := h.Handle(ctx, replay)
+	if second.GetErrno() != 0 || !proto.Equal(first.GetRename(), second.GetRename()) {
+		t.Fatalf("Rename replay = %+v, first = %+v", second, first)
+	}
+	if calls := store.renameCalls.Load(); calls != 1 {
+		t.Fatalf("exact Rename replay re-executed XFS: calls = %d", calls)
+	}
+	if calls := store.lookup.Load(); calls != 3 {
+		t.Fatalf("exact Rename replay re-resolved namespace: lookups = %d", calls)
+	}
+}
+
+func TestRenameExchangeReplyCarriesBothAuthoritativePostBindings(t *testing.T) {
+	moved := xfsstore.Capability{0xB1}
+	replaced := xfsstore.Capability{0xB2}
+	store := &renameReplyStore{bindings: map[string]xfsstore.Capability{"old": moved, "new": replaced}}
+	h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 4, 2)
+	response := h.Handle(ctx, renameReplyRequest(t, cred, root, true))
+	if response.GetErrno() != 0 || response.GetUncertain() {
+		t.Fatalf("Rename exchange = %+v, want definite success", response)
+	}
+	wantNew, wantOld := [16]byte{moved[0]}, [16]byte{replaced[0]}
+	rename := response.GetRename()
+	if rename == nil || !bytes.Equal(rename.GetNewPostIdentity(), wantNew[:]) || !bytes.Equal(rename.GetOldPostIdentity(), wantOld[:]) {
+		t.Fatalf("Rename exchange reply = %+v, want new=%x old=%x", rename, wantNew, wantOld)
+	}
+	if calls := store.lookup.Load(); calls != 4 {
+		t.Fatalf("Rename exchange namespace lookups = %d, want two dependency resolutions plus two locked post-state capability lookups", calls)
+	}
+}
+
+func TestRenameSameInodeNoOpReportsBothNamesAndReplaysExactly(t *testing.T) {
+	shared := xfsstore.Capability{0xB3}
+	store := &renameReplyStore{bindings: map[string]xfsstore.Capability{"old": shared, "new": shared}}
+	h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 4, 2)
+	request := renameReplyRequest(t, cred, root, false)
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != 0 || response.GetUncertain() {
+		t.Fatalf("same-inode Rename = %+v, want definite no-op success", response)
+	}
+	want := [16]byte{shared[0]}
+	rename := response.GetRename()
+	if rename == nil || !bytes.Equal(rename.GetNewPostIdentity(), want[:]) || !bytes.Equal(rename.GetOldPostIdentity(), want[:]) {
+		t.Fatalf("same-inode Rename reply = %+v, want both names bound to %x", rename, want)
+	}
+	resolutions, err := sourcePublicationResolutions(request, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantResolutions := []volumeserver.VisibilityResolution{{Identity: want}}
+	if !reflect.DeepEqual(resolutions, wantResolutions) {
+		t.Fatalf("same-inode resolutions = %#v, want %#v", resolutions, wantResolutions)
+	}
+
+	replay := proto.Clone(request).(*authoritypb.Request)
+	replay.RequestId = 2
+	second := h.Handle(ctx, replay)
+	if second.GetErrno() != 0 || !proto.Equal(rename, second.GetRename()) {
+		t.Fatalf("same-inode Rename replay = %+v, first = %+v", second, response)
+	}
+	if calls := store.renameCalls.Load(); calls != 1 {
+		t.Fatalf("same-inode exact replay re-executed XFS: calls = %d", calls)
+	}
+	if calls := store.lookup.Load(); calls != 3 {
+		t.Fatalf("same-inode Rename namespace lookups = %d, want two dependency resolutions plus one locked moved-object snapshot lookup", calls)
+	}
+}
+
+func TestHandlerExportsFsyncBatchEffectiveness(t *testing.T) {
+	store := &fsyncMetricStore{batch: 3}
+	h, ctx, cred, _ := resourceAdmissionRequestHarness(t, store, 1, 1)
+	metrics, err := authoritymetrics.New("fsync-metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Metrics = metrics
+	handle := xfsstore.Capability{0xA5}
+	if err := h.trackOpen(cred.ID, handle, false); err != nil {
+		t.Fatal(err)
+	}
+	response := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 1, Epoch: cred.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]},
+		Body:    &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: handle[:]}},
+	})
+	if response.GetErrno() != 0 {
+		t.Fatalf("Fsync = %+v", response)
+	}
+	var rendered bytes.Buffer
+	if err := metrics.Registry().WritePrometheus(&rendered); err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []string{
+		`portablefs_authority_fsync_barrier_handles_total{volume="fsync-metrics"} 3`,
+		`portablefs_authority_fsync_storage_syncs_total{volume="fsync-metrics"} 1`,
+	} {
+		if !bytes.Contains(rendered.Bytes(), []byte(sample+"\n")) {
+			t.Errorf("metrics omit %q", sample)
+		}
+	}
 }
 
 func resourceAcquisitionRequest(
@@ -854,6 +2230,19 @@ func resourceAcquisitionRequest(
 	default:
 		t.Fatalf("unknown operation %q", operation)
 	}
+	if operation != "open" {
+		parentIdentity := [16]byte{root[0]}
+		name := []byte("capacity-" + operation)
+		request.FskitFrontendOperationId = 1
+		request.FskitSourcePublication = &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+				Identity: parentIdentity[:], Attributes: true,
+			}}},
+			{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
+				ParentIdentity: parentIdentity[:], Name: name, BoundAttributes: true,
+			}}},
+		}}
+	}
 	stampMutation(t, request, 0, 1)
 	return request
 }
@@ -862,10 +2251,10 @@ func TestResourceCapacityRefusalPrecedesEveryStoreAllocation(t *testing.T) {
 	for _, operation := range []string{"create", "mkdir", "symlink", "open"} {
 		t.Run(operation, func(t *testing.T) {
 			store := &resourceAdmissionFaultStore{failure: syscall.EACCES}
-			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 0, 0)
+			h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 0, 0)
 			response := h.Handle(ctx, resourceAcquisitionRequest(t, operation, cred, root))
-			if response.GetErrno() != errnos.EAGAIN || response.GetUncertain() {
-				t.Fatalf("capacity response=%+v, want definite EAGAIN", response)
+			if response.GetErrno() != errnos.ENFILE || response.GetUncertain() {
+				t.Fatalf("capacity response=%+v, want definite ENFILE", response)
 			}
 			if calls := store.calls(operation); calls != 0 {
 				t.Fatalf("store %s calls=%d before capacity refusal", operation, calls)
@@ -881,7 +2270,7 @@ func TestResourceStoreFailureReleasesExactReservation(t *testing.T) {
 	for _, operation := range []string{"create", "mkdir", "symlink", "open"} {
 		t.Run(operation, func(t *testing.T) {
 			store := &resourceAdmissionFaultStore{failure: syscall.EACCES}
-			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 1, 1)
+			h, ctx, cred, root := resourceAdmissionFskitRequestHarness(t, store, 1, 1)
 			response := h.Handle(ctx, resourceAcquisitionRequest(t, operation, cred, root))
 			if response.GetErrno() != int32(syscall.EACCES) || response.GetUncertain() {
 				t.Fatalf("store failure response=%+v, want definite EACCES", response)
@@ -908,6 +2297,314 @@ func TestResourceStoreFailureReleasesExactReservation(t *testing.T) {
 	}
 }
 
+func TestCreateCoversNewbornUnderExistingParentWriterLock(t *testing.T) {
+	store := &allocatingMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, child: xfsstore.Capability{0x73},
+		handle: xfsstore.Capability{0x74}, phases: make(map[string]bool),
+	}
+	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
+	if root != store.parent {
+		t.Fatalf("harness root = %x, want parent %x", root, store.parent)
+	}
+	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	if response.GetErrno() != 0 || response.GetCreate() == nil || len(response.GetPostState().GetObjects()) != 2 {
+		t.Fatalf("create response = %+v", response)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.locked || !store.released {
+		t.Fatalf("allocating parent lock lifecycle = locked:%v released:%v", store.locked, store.released)
+	}
+	wantIdentity := [16]byte{store.parent[0]}
+	if len(store.identities) != 1 || store.identities[0] != wantIdentity {
+		t.Fatalf("pre-allocation lock set = %x, want existing parent identity %x only", store.identities, wantIdentity)
+	}
+	for _, phase := range []string{"allocating syscall", "creation handle acquisition", "newborn identity capture", "parent post-apply snapshot"} {
+		if !store.phases[phase] {
+			t.Errorf("create did not exercise %s under the parent stripe", phase)
+		}
+	}
+}
+
+type existingCreateMutationLockStore struct {
+	resourceAdmissionFaultStore
+	t              *testing.T
+	parent         xfsstore.Capability
+	target         xfsstore.Capability
+	replacement    xfsstore.Capability
+	handle         xfsstore.Capability
+	truncate       bool
+	bindingChanges bool
+
+	mu         sync.Mutex
+	locked     bool
+	released   bool
+	identities [][16]byte
+	lookups    uint32
+	creates    uint32
+}
+
+func (s *existingCreateMutationLockStore) LockMutation(identities [][16]byte) func() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.locked {
+		s.t.Fatal("existing CREATE recursively acquired its writer lock")
+	}
+	s.identities = append([][16]byte(nil), identities...)
+	s.locked = true
+	return func() {
+		s.mu.Lock()
+		s.locked = false
+		s.released = true
+		s.mu.Unlock()
+	}
+}
+
+func (s *existingCreateMutationLockStore) requireLocked(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.locked {
+		s.t.Errorf("%s ran outside the existing CREATE writer locks", phase)
+	}
+}
+
+func (s *existingCreateMutationLockStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.mu.Lock()
+	s.lookups++
+	lookup := s.lookups
+	s.mu.Unlock()
+	item := s.target
+	if s.bindingChanges && lookup >= 2 {
+		item = s.replacement
+	}
+	return item, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(item[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) CoordinateItem(item xfsstore.Capability) (xfsstore.ObjectCoordinate, error) {
+	return xfsstore.ObjectCoordinate{Stable: [16]byte{item[0]}, Ino: uint64(item[0]), DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE apply")
+	s.mu.Lock()
+	s.creates++
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	s.mu.Unlock()
+	if parent != s.parent {
+		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
+	}
+	return target, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *existingCreateMutationLockStore) OpenFile(item xfsstore.Capability, flags xfsstore.OpenFlags) (xfsstore.Capability, error) {
+	s.requireLocked("existing CREATE open")
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	if item != target || flags.Truncate != s.truncate {
+		s.t.Errorf("open target/flags = %x/%+v, want %x truncate=%v", item, flags, target, s.truncate)
+	}
+	return s.handle, nil
+}
+
+func (s *existingCreateMutationLockStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE target snapshot")
+	if handle != s.handle {
+		s.t.Errorf("snapshot handle = %x, want %x", handle, s.handle)
+	}
+	size := int64(17)
+	if s.truncate {
+		size = 0
+	}
+	target := s.target
+	if s.bindingChanges {
+		target = s.replacement
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: size, Mode: 0o600, Nlink: 1, DeviceMinor: 1, Flags: 0x10}, nil
+}
+
+func (s *existingCreateMutationLockStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	s.requireLocked("existing CREATE parent snapshot")
+	if item != s.parent {
+		s.t.Errorf("parent snapshot item = %x, want %x", item, s.parent)
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(s.parent[0]), Mode: 0o755, Nlink: 2, DeviceMinor: 1}, nil
+}
+
+func (*existingCreateMutationLockStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
+	for _, truncate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("truncate=%v", truncate), func(t *testing.T) {
+			store := &existingCreateMutationLockStore{
+				t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+				handle: xfsstore.Capability{0x74}, truncate: truncate,
+			}
+			h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
+			request := resourceAcquisitionRequest(t, "create", credential, root)
+			request.GetCreate().Flags.Truncate = truncate
+			for _, target := range request.GetFskitSourcePublication().GetTargets() {
+				if namespace := target.GetNamespace(); namespace != nil {
+					namespace.BoundData = truncate
+				}
+			}
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || response.GetCreate() == nil {
+				t.Fatalf("existing CREATE response = %+v", response)
+			}
+			if !validMutationPostStateRoles(request, response.GetPostState()) {
+				t.Fatalf("existing CREATE exact state = %+v", response.GetPostState())
+			}
+			roles := make(map[uint32]*authoritypb.ObjectPostState)
+			for _, object := range response.GetPostState().GetObjects() {
+				roles[object.GetRoles()] = object
+			}
+			if roles[postStateRoleParent] == nil || roles[postStateRoleTarget] == nil || roles[postStateRoleTarget].GetAttr().GetFlags() != 0x10 {
+				t.Fatalf("existing CREATE objects = %+v, want exact PARENT+TARGET", response.GetPostState().GetObjects())
+			}
+			if response.GetCreate().GetItem().GetObjectVersion() != roles[postStateRoleTarget].GetObjectVersion() ||
+				response.GetCreate().GetItem().GetSnapshotSequence() != response.GetPostState().GetSnapshotSequence() {
+				t.Fatalf("item stamp does not match target post-state: item=%+v state=%+v", response.GetCreate().GetItem(), roles[postStateRoleTarget])
+			}
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			want := map[[16]byte]bool{{store.parent[0]}: true, {store.target[0]}: true}
+			if store.locked || !store.released || len(store.identities) != 2 || !want[store.identities[0]] || !want[store.identities[1]] {
+				t.Fatalf("existing CREATE lock lifecycle/identities = locked:%v released:%v %x", store.locked, store.released, store.identities)
+			}
+		})
+	}
+}
+
+func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
+	store := &existingCreateMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+		replacement: xfsstore.Capability{0x74}, handle: xfsstore.Capability{0x75}, bindingChanges: true,
+	}
+	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
+	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	if response.GetErrno() != 0 || response.GetUncertain() || response.GetCreate() == nil {
+		t.Fatalf("binding-change response = %+v, want successful re-resolved CREATE", response)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.creates != 1 || store.locked || !store.released {
+		t.Fatalf("binding-change retry apply/lifecycle: creates=%d locked=%v released=%v", store.creates, store.locked, store.released)
+	}
+	if len(store.identities) != 2 || store.identities[0] != [16]byte{store.parent[0]} || store.identities[1] != [16]byte{store.replacement[0]} {
+		t.Fatalf("binding-change final lock set = %x, want parent+replacement", store.identities)
+	}
+}
+
+type readdirPostStabilizationChangeStore struct {
+	resourceAdmissionFaultStore
+	root, handle, child xfsstore.Capability
+	readDirCalls        atomic.Uint32
+	lookupCalls         atomic.Uint32
+}
+
+func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
+	open xfsstore.Capability,
+	_ uint64,
+	_ [16]byte,
+	_ int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if open != s.handle {
+		return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EBADF
+	}
+	s.readDirCalls.Add(1)
+	var verifier [16]byte
+	binary.BigEndian.PutUint64(verifier[0:8], uint64(s.root[0]))
+	binary.BigEndian.PutUint64(verifier[8:16], 10)
+	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0])}}, 1, verifier, true, s.root, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
+	call := s.lookupCalls.Add(1)
+	mode := os.FileMode(0o600)
+	// Call two is the trailing read after the first stabilization cut. It
+	// models a chmod completing in that window; every later read sees the new
+	// state, so the second whole-page transaction can commit.
+	if call >= 2 {
+		mode = 0o640
+	}
+	return s.child, xfsstore.Attr{
+		Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: mode,
+		Nlink: 1, DeviceMinor: 1,
+	}, nil
+}
+
+// Readdir resolves every entry from the open directory handle, so this is the
+// call under test; it answers exactly as this store's Lookup does.
+func (s *readdirPostStabilizationChangeStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	return s.Lookup(handle, name)
+}
+
+func (s *readdirPostStabilizationChangeStore) Identity(item xfsstore.Capability) ([16]byte, error) {
+	return [16]byte{item[0]}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) IdentityOpen(open xfsstore.Capability) ([16]byte, error) {
+	if open != s.handle {
+		return [16]byte{}, syscall.EBADF
+	}
+	return [16]byte{s.root[0]}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) GetattrOpen(open xfsstore.Capability) (xfsstore.Attr, error) {
+	if open != s.handle {
+		return xfsstore.Attr{}, syscall.EBADF
+	}
+	return xfsstore.Attr{Kind: xfsstore.KindDirectory, Ino: uint64(s.root[0]), CTimeNS: 10, DeviceMinor: 1}, nil
+}
+
+func (s *readdirPostStabilizationChangeStore) Forget(xfsstore.Capability) error {
+	s.forget.Add(1)
+	return nil
+}
+
+func (*readdirPostStabilizationChangeStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing.T) {
+	store := &readdirPostStabilizationChangeStore{
+		root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
+	}
+	h, ctx, credential, _ := resourceAdmissionFskitRequestHarness(t, store, 8, 4)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := &authoritypb.Request{
+		RequestId: 81, Epoch: credential.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]},
+		Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+			Handle: store.handle[:], MaxEntries: 16, WantItems: true,
+		}},
+	}
+	stampMutation(t, request, 0, 1)
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 {
+		t.Fatalf("READDIRPLUS response = %+v", response)
+	}
+	entry := response.GetReadDir().GetEntries()[0]
+	if entry.GetAttr().GetMode() != 0o640 || entry.GetItem().GetAttr().GetMode() != 0o640 {
+		t.Fatalf("returned pre-chmod candidate: dirent=%+v item=%+v", entry.GetAttr(), entry.GetItem().GetAttr())
+	}
+	if entry.GetObjectVersion() > entry.GetSnapshotSequence() {
+		t.Fatalf("future page stamp %d > %d", entry.GetObjectVersion(), entry.GetSnapshotSequence())
+	}
+	if got := store.readDirCalls.Load(); got != 4 {
+		t.Fatalf("directory enumerations = %d, want candidate+verification for each of two whole-page attempts", got)
+	}
+	if got := store.lookupCalls.Load(); got != 4 {
+		t.Fatalf("child snapshots = %d, want candidate+verification for each of two whole-page attempts", got)
+	}
+}
+
 func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
 	item := xfsstore.Capability{0x7a}
 	store := &resourceAdmissionFaultStore{lookupItem: item}
@@ -931,8 +2628,11 @@ func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
 		!bytes.Equal(replayed.GetLookup().GetItem().GetToken(), item[:]) {
 		t.Fatalf("replayed lookup=%+v", replayed)
 	}
-	if calls := store.lookup.Load(); calls != 1 {
-		t.Fatalf("lookup store calls=%d, want one exact acquisition", calls)
+	// A positive Linux lookup resolves once under N, then re-resolves under the
+	// atomic N+A admission that authorizes its returned attributes. Exact replay
+	// reuses that retained result and performs neither read again.
+	if calls := store.lookup.Load(); calls != 2 {
+		t.Fatalf("lookup store calls=%d, want two-phase N then N+A acquisition", calls)
 	}
 	resources := h.resources[cred.ID]
 	if len(resources.items) != 1 || h.totalItems != 1 {
@@ -1015,35 +2715,6 @@ func TestCapabilitiesResolveOnlyInsideTheirSession(t *testing.T) {
 	}
 }
 
-func TestHeldDirectoriesRejectsUnresolvedRenameParent(t *testing.T) {
-	h := testVolumeHandler()
-	session := volumeserver.SessionID{1}
-	root := xfsstore.Capability{0xAA}
-	if err := h.startSessionResources(session, root, 2, [32]byte{}); err != nil {
-		t.Fatal(err)
-	}
-	untracked := xfsstore.Capability{0xBB}
-
-	for _, test := range []struct {
-		name string
-		old  []byte
-		want error
-	}{
-		{name: "malformed", old: []byte{1}, want: syscall.EINVAL},
-		{name: "untracked", old: untracked[:], want: xfsstore.ErrStaleObject},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			request := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
-				OldParent: test.old,
-				NewParent: root[:],
-			}}}
-			if _, err := h.heldDirectories(session, request); !errors.Is(err, test.want) {
-				t.Fatalf("heldDirectories = %v, want %v", err, test.want)
-			}
-		})
-	}
-}
-
 // Defect 11: a cancellation acknowledgment went through the lease-renewing
 // path, so a peer could keep a session alive indefinitely using only cancels.
 func TestCancelAcknowledgmentDoesNotRenewTheLease(t *testing.T) {
@@ -1057,7 +2728,7 @@ func TestCancelAcknowledgmentDoesNotRenewTheLease(t *testing.T) {
 	}
 	h := testVolumeHandler()
 	h.Runtime = runtime
-	cred, err := runtime.Attach(2, volumeserver.PeerIdentity{1}, volumeserver.Authorization{Access: volumeserver.AccessRead, Deadline: now.Add(time.Hour)})
+	cred, err := runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{1}, volumeserver.Authorization{Access: volumeserver.AccessRead, Deadline: now.Add(time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1089,6 +2760,822 @@ type allowAuthorizer struct{ access volumeserver.Access }
 
 func (a allowAuthorizer) Authorize(context.Context, string, []byte) (volumeserver.Authorization, error) {
 	return volumeserver.Authorization{Access: a.access, Deadline: time.Now().Add(time.Hour)}, nil
+}
+
+func testAttachAttempt(id uint64) []byte {
+	attempt := make([]byte, len(volumeserver.AttachAttemptID{}))
+	for index := range 8 {
+		attempt[index] = byte(id >> (8 * index))
+	}
+	if id == 0 {
+		attempt[0] = 1
+	}
+	return attempt
+}
+
+// attachAndActivateHandler drives the protocol-6 lifecycle directly at the
+// handler boundary. Transport-registry tests separately prove that the two
+// nonzero binding generations came from the exact DATA/CONTROL pair.
+func attachAndActivateHandler(
+	t *testing.T,
+	h *VolumeHandler,
+	ctx context.Context,
+	requestID uint64,
+	request *authoritypb.AttachRequest,
+) (*authoritypb.ActivateReply, []byte, *authoritypb.SessionProof) {
+	t.Helper()
+	if len(request.GetAttachAttemptId()) == 0 {
+		request.AttachAttemptId = testAttachAttempt(requestID)
+	}
+	attached := h.Handle(ctx, &authoritypb.Request{
+		RequestId: requestID,
+		Body:      &authoritypb.Request_Attach{Attach: request},
+	})
+	if attached.GetErrno() != 0 || attached.GetAttach() == nil {
+		t.Fatalf("provisional attach = %v", attached)
+	}
+	proof := &authoritypb.SessionProof{
+		Id: attached.GetAttach().GetSessionId(), Generation: attached.GetAttach().GetGeneration(),
+		ResumeSecret: attached.GetAttach().GetResumeSecret(),
+	}
+	activated := h.Handle(ctx, &authoritypb.Request{
+		RequestId: requestID + 1, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	})
+	if activated.GetErrno() != 0 || activated.GetActivate() == nil {
+		t.Fatalf("activate = %v", activated)
+	}
+	return activated.GetActivate(), attached.GetEpoch(), proof
+}
+
+type countingAuthorizer struct {
+	mu       sync.Mutex
+	calls    int
+	deadline time.Time
+	access   volumeserver.Access
+	entered  chan struct{}
+	release  chan struct{}
+}
+
+type provisionalReauthorizer struct {
+	*countingAuthorizer
+	calls atomic.Uint32
+}
+
+func (a *provisionalReauthorizer) Reauthorize(context.Context, string, volumeserver.SessionID, uint64, []byte) (volumeserver.Authorization, [32]byte, error) {
+	a.calls.Add(1)
+	return volumeserver.Authorization{}, [32]byte{1}, errors.New("provisional reauthorization reached verifier")
+}
+
+type failingActivationMembership struct {
+	err   error
+	calls atomic.Uint32
+}
+
+func (m *failingActivationMembership) Activate(volumeserver.SessionID) error {
+	m.calls.Add(1)
+	return m.err
+}
+
+func (*failingActivationMembership) Deactivate(volumeserver.SessionID) error { return nil }
+
+type blockingActivationMembership struct {
+	active    atomic.Bool
+	activated chan struct{}
+	release   chan struct{}
+}
+
+func (m *blockingActivationMembership) Activate(volumeserver.SessionID) error {
+	m.active.Store(true)
+	if m.activated != nil {
+		close(m.activated)
+	}
+	if m.release != nil {
+		<-m.release
+	}
+	return nil
+}
+
+func (m *blockingActivationMembership) Deactivate(volumeserver.SessionID) error {
+	m.active.Store(false)
+	return nil
+}
+
+// blockingActivationRootStore lets a test stop the fresh root read at the
+// activation transaction's registration boundary. Attach itself must not read
+// these attributes: they are a cache fact whose freshness is meaningful only
+// when the strict participant becomes visible to mutations.
+type blockingActivationRootStore struct {
+	*resourceAdmissionFaultStore
+	attr     xfsstore.Attr
+	identity [16]byte
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+	reads    atomic.Uint32
+}
+
+func (s *blockingActivationRootStore) Getattr(xfsstore.Capability) (xfsstore.Attr, error) {
+	s.reads.Add(1)
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.release
+	})
+	return s.attr, nil
+}
+
+func (s *blockingActivationRootStore) Identity(xfsstore.Capability) ([16]byte, error) {
+	return s.identity, nil
+}
+
+type failingActivationRootStore struct {
+	*resourceAdmissionFaultStore
+	fail atomic.Bool
+}
+
+func (s *failingActivationRootStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	if s.fail.Load() {
+		return xfsstore.Attr{}, syscall.EAGAIN
+	}
+	return s.resourceAdmissionFaultStore.Getattr(item)
+}
+
+func (a *countingAuthorizer) Authorize(ctx context.Context, _ string, _ []byte) (volumeserver.Authorization, error) {
+	a.mu.Lock()
+	a.calls++
+	entered, release := a.entered, a.release
+	a.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return volumeserver.Authorization{}, ctx.Err()
+		}
+	}
+	return volumeserver.Authorization{Access: a.access, Deadline: a.deadline}, nil
+}
+
+func (a *countingAuthorizer) count() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.calls
+}
+
+func newProtocol5Handler(t *testing.T, membership volumeserver.DurableVisibilityMembership) (*VolumeHandler, context.Context, *countingAuthorizer, *RoutesController) {
+	t.Helper()
+	runtime, err := volumeserver.New("handler-fskit", volumeserver.Config{
+		SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 8, MaxLockRecords: 32,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if membership == nil {
+		membership = noopMembership{}
+	}
+	authorizer := &countingAuthorizer{
+		access:   volumeserver.AccessRead | volumeserver.AccessWrite,
+		deadline: time.Now().Add(time.Hour).Round(0),
+	}
+	h := testVolumeHandler()
+	loadedCoordinationFor("", runtime, membership, 1024).Bind(h)
+	h.Store, h.Runtime, h.Authorizer = &resourceAdmissionFaultStore{}, runtime, authorizer
+	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{0xA5})
+	return h, ctx, authorizer, h.Routes
+}
+
+func fskitAttachRequest(id uint64) *authoritypb.Request {
+	attach := &authoritypb.AttachRequest{
+		VolumeId: "handler-fskit", AccessToken: []byte("one-use"), ReplaySlots: 2,
+		Purpose:                 authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		RoutesRevision:          emptyRoutesRevision(),
+		AttachAttemptId:         testAttachAttempt(id),
+		FskitCachedNameCapacity: 64,
+		FskitRepairBudgetMillis: 1000,
+		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED,
+	}
+	return &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{Attach: attach}}
+}
+
+func proofFromAttach(response *authoritypb.Response) *authoritypb.SessionProof {
+	attach := response.GetAttach()
+	return &authoritypb.SessionProof{Id: attach.GetSessionId(), Generation: attach.GetGeneration(), ResumeSecret: attach.GetResumeSecret()}
+}
+
+func prepareProtocol5ResourceSpec(t *testing.T, h *VolumeHandler, discriminator byte) (sessionResourceSpec, <-chan struct{}) {
+	t.Helper()
+	attempt := volumeserver.AttachAttemptID{discriminator}
+	deadline := time.Now().Add(time.Hour).Round(0)
+	peer := volumeserver.PeerIdentity{0xA5}
+	credential, err := h.Runtime.PrepareAttach(
+		context.Background(), attempt, volumeserver.AttachRequestFingerprint{discriminator}, 2, peer,
+		func(context.Context) (volumeserver.Authorization, error) {
+			return volumeserver.Authorization{Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: deadline}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := h.Runtime.SessionTerminal(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sessionResourceSpec{
+		credential: credential, id: credential.ID, attempt: attempt,
+		root: xfsstore.Capability{0x70}, slots: 2, routes: routesRevisionOf(""),
+		coherence: volumeserver.CoherenceStrict, authorizationDeadline: deadline,
+	}, terminal
+}
+
+func TestProtocol5ResourceInstallReconcilesRuntimeEndBeforeAndAfterPublication(t *testing.T) {
+	t.Run("terminal-before-install", func(t *testing.T) {
+		h, _, _, _ := newProtocol5Handler(t, nil)
+		h.cleanupOnce.Do(func() { h.Runtime.OnSessionEnd(h.closeSessionResources) })
+		spec, terminal := prepareProtocol5ResourceSpec(t, h, 0x21)
+
+		// Hold the publication lock while the runtime becomes terminal. Both
+		// possible schedules after release are intentional: either the end hook
+		// observes no record and install reconciles the terminal runtime, or
+		// install publishes first and the hook removes that exact record.
+		h.resourcesMu.Lock()
+		installed := make(chan error, 1)
+		go func() {
+			_, err := h.ensureProvisionalSessionResources(spec)
+			installed <- err
+		}()
+		fenced := make(chan struct{})
+		go func() {
+			h.Runtime.FenceSession(spec.id)
+			close(fenced)
+		}()
+		select {
+		case <-terminal:
+		case <-time.After(time.Second):
+			h.resourcesMu.Unlock()
+			t.Fatal("runtime did not publish terminal state")
+		}
+		h.resourcesMu.Unlock()
+		select {
+		case err := <-installed:
+			if err == nil {
+				t.Fatal("resource install accepted a terminal runtime session")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("resource install did not reconcile terminal runtime state")
+		}
+		select {
+		case <-fenced:
+		case <-time.After(time.Second):
+			t.Fatal("runtime end hook did not complete")
+		}
+		h.resourcesMu.Lock()
+		remaining := h.resources[spec.id]
+		h.resourcesMu.Unlock()
+		if remaining != nil {
+			t.Fatal("terminal-before-install race leaked session resources")
+		}
+	})
+
+	t.Run("terminal-after-install", func(t *testing.T) {
+		h, _, _, _ := newProtocol5Handler(t, nil)
+		h.cleanupOnce.Do(func() { h.Runtime.OnSessionEnd(h.closeSessionResources) })
+		spec, _ := prepareProtocol5ResourceSpec(t, h, 0x22)
+		resources, err := h.ensureProvisionalSessionResources(spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.Runtime.FenceSession(spec.id)
+		h.resourcesMu.Lock()
+		remaining := h.resources[spec.id]
+		ended := resources.ended
+		h.resourcesMu.Unlock()
+		if remaining != nil || !ended {
+			t.Fatalf("terminal-after-install cleanup left record=%p ended=%v", remaining, ended)
+		}
+	})
+}
+
+func TestProtocol5AttachRequiresNonzeroExactAttemptID(t *testing.T) {
+	for name, attempt := range map[string][]byte{
+		"absent": nil,
+		"short":  make([]byte, 31),
+		"long":   make([]byte, 33),
+		"zero":   make([]byte, 32),
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
+			request := fskitAttachRequest(31)
+			request.GetAttach().AttachAttemptId = attempt
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != errnos.EINVAL || authorizer.count() != 0 {
+				t.Fatalf("Attach = %+v, authorization calls=%d; want EINVAL before authorization", response, authorizer.count())
+			}
+		})
+	}
+}
+
+func TestProtocol6MountAttachRejectsOmittedFrontendProfileBeforeAuthorization(t *testing.T) {
+	h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
+	request := fskitAttachRequest(32)
+	request.GetAttach().FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != errnos.EINVAL || authorizer.count() != 0 {
+		t.Fatalf("Attach = %+v, authorization calls=%d; want EINVAL before authorization", response, authorizer.count())
+	}
+}
+
+func TestProtocol5AttachIsExactProvisionalAndConcurrent(t *testing.T) {
+	h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
+	authorizer.entered = make(chan struct{}, 1)
+	authorizer.release = make(chan struct{})
+	request := fskitAttachRequest(41)
+	responses := make(chan *authoritypb.Response, 2)
+	for range 2 {
+		go func() { responses <- h.Handle(ctx, proto.Clone(request).(*authoritypb.Request)) }()
+	}
+	select {
+	case <-authorizer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Attach did not reach authorization")
+	}
+	close(authorizer.release)
+	first, second := <-responses, <-responses
+	for _, response := range []*authoritypb.Response{first, second} {
+		if response.GetErrno() != 0 || response.GetAttach() == nil || response.GetAttach().GetProvisionalDeadlineUnixNanos() <= 0 {
+			t.Fatalf("provisional response = %+v", response)
+		}
+	}
+	if authorizer.count() != 1 {
+		t.Fatalf("concurrent exact Attach authorized %d times, want one", authorizer.count())
+	}
+	if !proto.Equal(first.GetAttach(), second.GetAttach()) {
+		t.Fatalf("exact Attach results differ: first=%+v second=%+v", first, second)
+	}
+	if resources := h.resources; len(resources) != 1 {
+		t.Fatalf("exact Attach initialized %d resource records, want one", len(resources))
+	}
+	exactRetry := proto.Clone(request).(*authoritypb.Request)
+	exactRetry.RequestId = 42
+	retried := h.Handle(ctx, exactRetry)
+	if retried.GetErrno() != 0 || !proto.Equal(first.GetAttach(), retried.GetAttach()) || authorizer.count() != 1 {
+		t.Fatalf("exact Attach with new envelope = %+v, authorization calls=%d", retried, authorizer.count())
+	}
+
+	// Same attempt plus changed canonical body cannot consume authorization or
+	// silently inherit the first attempt's session.
+	changed := proto.Clone(request).(*authoritypb.Request)
+	changed.RequestId = 43
+	changed.GetAttach().ReplaySlots = 3
+	response := h.Handle(ctx, changed)
+	if response.GetErrno() != errnos.EINVAL || authorizer.count() != 1 {
+		t.Fatalf("altered Attach = %+v, authorization calls=%d", response, authorizer.count())
+	}
+
+	proof := proofFromAttach(first)
+	ordinary := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 44, Epoch: first.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_StatFs{StatFs: &authoritypb.StatFSRequest{}},
+	})
+	if ordinary.GetErrno() != errnos.EAGAIN {
+		t.Fatalf("ordinary provisional request = %+v, want EAGAIN", ordinary)
+	}
+	keepAlive := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 45, Epoch: first.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}},
+	})
+	if keepAlive.GetErrno() != errnos.EAGAIN {
+		t.Fatalf("provisional KeepAlive = %+v, want EAGAIN", keepAlive)
+	}
+	verifier := &provisionalReauthorizer{countingAuthorizer: authorizer}
+	h.Authorizer = verifier
+	reauthorize := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 46, Epoch: first.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Reauthorize{Reauthorize: &authoritypb.ReauthorizeRequest{
+			Sequence: 1, AccessToken: []byte("must-not-be-consumed"),
+		}},
+	})
+	if reauthorize.GetErrno() != errnos.EAGAIN || verifier.calls.Load() != 0 {
+		t.Fatalf("provisional Reauthorize = %+v, verifier calls=%d; want gated EAGAIN", reauthorize, verifier.calls.Load())
+	}
+	resumed := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 47, Epoch: first.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Resume{Resume: &authoritypb.ResumeRequest{}},
+	})
+	if resumed.GetErrno() != 0 || resumed.GetResume().GetState() != authoritypb.SessionState_SESSION_STATE_PROVISIONAL {
+		t.Fatalf("provisional Resume = %+v", resumed)
+	}
+	activated := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 48, Epoch: first.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	})
+	if activated.GetErrno() != 0 || activated.GetActivate().GetAuthorizationDeadlineUnixNanos() != authorizer.deadline.UnixNano() {
+		t.Fatalf("activation after concurrent Attach = %+v, want authoritative deadline %d", activated, authorizer.deadline.UnixNano())
+	}
+}
+
+func TestProtocol5ActivateRetainsExactReplyAndRejectsAbortAfterCommit(t *testing.T) {
+	h, ctx, authorizer, routes := newProtocol5Handler(t, nil)
+	request := fskitAttachRequest(51)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	proof := proofFromAttach(attached)
+	activate := &authoritypb.Request{
+		RequestId: 52, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 7, ControlBindingGeneration: 9,
+		}},
+	}
+	first := h.Handle(ctx, activate)
+	if first.GetErrno() != 0 || first.GetActivate().GetState() != authoritypb.SessionState_SESSION_STATE_ACTIVE || first.GetActivate().GetRoot() == nil {
+		t.Fatalf("Activate = %+v", first)
+	}
+	if first.GetActivate().GetAuthorizationDeadlineUnixNanos() != authorizer.deadline.UnixNano() {
+		t.Fatalf("activation deadline = %d, want %d", first.GetActivate().GetAuthorizationDeadlineUnixNanos(), authorizer.deadline.UnixNano())
+	}
+	// An exact replay is recovery of the committed transaction, not a new
+	// admission decision. It must survive a later route revision and reproduce
+	// the exact cursor/root reply the lost response carried.
+	routes.mu.Lock()
+	routes.revision = routesRevisionOf("later\n")
+	routes.canonical = []byte("later\n")
+	routes.mu.Unlock()
+	replay := proto.Clone(activate).(*authoritypb.Request)
+	replay.RequestId = 53
+	second := h.Handle(ctx, replay)
+	if second.GetErrno() != 0 || !proto.Equal(first.GetActivate(), second.GetActivate()) {
+		t.Fatalf("lost-response Activate replay = %+v, first=%+v", second, first)
+	}
+	resumed := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 54, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Resume{Resume: &authoritypb.ResumeRequest{}},
+	})
+	if resumed.GetErrno() != 0 || resumed.GetResume().GetState() != authoritypb.SessionState_SESSION_STATE_ACTIVE {
+		t.Fatalf("active Resume = %+v", resumed)
+	}
+	abort := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 55, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_AbortAttach{AbortAttach: &authoritypb.AbortAttachRequest{AttachAttemptId: request.GetAttach().GetAttachAttemptId()}},
+	})
+	if abort.GetErrno() != errnos.EBUSY {
+		t.Fatalf("Abort after activation = %+v, want EBUSY", abort)
+	}
+}
+
+func TestProtocol5AbortIsIdempotent(t *testing.T) {
+	h, ctx, _, _ := newProtocol5Handler(t, nil)
+	request := fskitAttachRequest(61)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	proof := proofFromAttach(attached)
+	abortRequest := &authoritypb.Request{
+		RequestId: 62, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_AbortAttach{AbortAttach: &authoritypb.AbortAttachRequest{AttachAttemptId: request.GetAttach().GetAttachAttemptId()}},
+	}
+	for id := uint64(62); id <= 63; id++ {
+		attempt := proto.Clone(abortRequest).(*authoritypb.Request)
+		attempt.RequestId = id
+		response := h.Handle(ctx, attempt)
+		if response.GetErrno() != 0 || response.GetAbortAttach().GetState() != authoritypb.SessionState_SESSION_STATE_ABORTED {
+			t.Fatalf("Abort attempt %d = %+v", id, response)
+		}
+	}
+}
+
+func TestProtocol5ActivationFailureLeavesSessionProvisional(t *testing.T) {
+	membership := &failingActivationMembership{err: errors.New("durable membership unavailable")}
+	h, ctx, _, _ := newProtocol5Handler(t, membership)
+	request := fskitAttachRequest(71)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	proof := proofFromAttach(attached)
+	activateRequest := &authoritypb.Request{
+		RequestId: 72, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	}
+	first := h.Handle(ctx, activateRequest)
+	if first.GetErrno() == 0 || first.GetActivate() != nil {
+		t.Fatalf("membership failure activated session: %+v", first)
+	}
+	resumed := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 73, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Resume{Resume: &authoritypb.ResumeRequest{}},
+	})
+	if resumed.GetErrno() != 0 || resumed.GetResume().GetState() != authoritypb.SessionState_SESSION_STATE_PROVISIONAL {
+		t.Fatalf("failed activation state = %+v, want PROVISIONAL", resumed)
+	}
+	if resources := h.resources; len(resources) != 1 {
+		t.Fatalf("failed activation changed resource count to %d", len(resources))
+	}
+	second := h.Handle(ctx, proto.Clone(activateRequest).(*authoritypb.Request))
+	if second.GetErrno() == 0 || membership.calls.Load() != 2 {
+		t.Fatalf("activation retry = %+v, durable calls=%d", second, membership.calls.Load())
+	}
+}
+
+func TestProtocol5RootPreparationFailureRollsBackAndCanRetry(t *testing.T) {
+	membership := &blockingActivationMembership{}
+	h, ctx, _, _ := newProtocol5Handler(t, membership)
+	store := &failingActivationRootStore{resourceAdmissionFaultStore: &resourceAdmissionFaultStore{}}
+	store.fail.Store(true)
+	h.Store = store
+	request := fskitAttachRequest(76)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	proof := proofFromAttach(attached)
+	activateRequest := &authoritypb.Request{
+		RequestId: 77, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	}
+	failed := h.Handle(ctx, activateRequest)
+	if failed.GetErrno() != errnos.EAGAIN || membership.active.Load() {
+		t.Fatalf("root-preparation failure = %+v membership-active=%v", failed, membership.active.Load())
+	}
+	state := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 78, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Resume{Resume: &authoritypb.ResumeRequest{}},
+	})
+	if state.GetErrno() != 0 || state.GetResume().GetState() != authoritypb.SessionState_SESSION_STATE_PROVISIONAL {
+		t.Fatalf("state after root-preparation rollback = %+v", state)
+	}
+	store.fail.Store(false)
+	retry := proto.Clone(activateRequest).(*authoritypb.Request)
+	retry.RequestId = 79
+	activated := h.Handle(ctx, retry)
+	if activated.GetErrno() != 0 || activated.GetActivate().GetState() != authoritypb.SessionState_SESSION_STATE_ACTIVE || !membership.active.Load() {
+		t.Fatalf("activation retry = %+v membership-active=%v", activated, membership.active.Load())
+	}
+}
+
+func TestProtocol5ActivationRevalidatesRouteRevision(t *testing.T) {
+	h, ctx, _, routes := newProtocol5Handler(t, nil)
+	request := fskitAttachRequest(81)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	proof := proofFromAttach(attached)
+	// Simulate the commit point of a route change between provisional Attach and
+	// Activate. RoutesController's writer owns this mutation in production.
+	routes.mu.Lock()
+	routes.revision = routesRevisionOf("target\n")
+	routes.canonical = []byte("target\n")
+	routes.mu.Unlock()
+	response := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 82, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	})
+	if response.GetErrno() != errnos.EPERM || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_ROUTES {
+		t.Fatalf("activation after route switch = %+v, want route refusal", response)
+	}
+	state := h.Handle(ctx, &authoritypb.Request{
+		RequestId: 83, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Resume{Resume: &authoritypb.ResumeRequest{}},
+	})
+	if state.GetErrno() != 0 || state.GetResume().GetState() != authoritypb.SessionState_SESSION_STATE_PROVISIONAL {
+		t.Fatalf("route-refused activation state = %+v", state)
+	}
+}
+
+func TestProtocol5ReplyPrecommitFailureRollsBackMembershipAndRuntime(t *testing.T) {
+	membership := &blockingActivationMembership{activated: make(chan struct{}), release: make(chan struct{})}
+	h, ctx, _, _ := newProtocol5Handler(t, membership)
+	request := fskitAttachRequest(91)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	proof := proofFromAttach(attached)
+	var id volumeserver.SessionID
+	copy(id[:], proof.GetId())
+	activate := &authoritypb.Request{
+		RequestId: 92, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	}
+	done := make(chan *authoritypb.Response, 1)
+	go func() { done <- h.Handle(ctx, activate) }()
+	select {
+	case <-membership.activated:
+	case <-time.After(time.Second):
+		t.Fatal("activation did not write durable membership")
+	}
+	h.resourcesMu.Lock()
+	resources := h.resources[id]
+	// Simulate the only handler-side precommit refusal: resource ownership was
+	// invalidated after preparation. ActivateParticipant must roll back its just
+	// written durable record and the runtime token must be cancelled.
+	resources.ended = true
+	h.resourcesMu.Unlock()
+	close(membership.release)
+	response := <-done
+	if response.GetErrno() == 0 || membership.active.Load() {
+		t.Fatalf("precommit failure = %+v membership-active=%v", response, membership.active.Load())
+	}
+	var attempt volumeserver.AttachAttemptID
+	copy(attempt[:], request.GetAttach().GetAttachAttemptId())
+	cred, err := h.credential(ctx, &authoritypb.Request{Epoch: attached.GetEpoch(), Session: proof})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := h.Runtime.SessionState(cred, attempt)
+	if err != nil || state != volumeserver.SessionStateProvisional {
+		t.Fatalf("runtime after precommit rollback = %v, %v", state, err)
+	}
+}
+
+func TestProtocol5AbortRacingActivationCannotEraseActive(t *testing.T) {
+	membership := &blockingActivationMembership{activated: make(chan struct{}), release: make(chan struct{})}
+	h, ctx, _, _ := newProtocol5Handler(t, membership)
+	request := fskitAttachRequest(96)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	proof := proofFromAttach(attached)
+	activate := &authoritypb.Request{
+		RequestId: 97, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	}
+	activationDone := make(chan *authoritypb.Response, 1)
+	go func() { activationDone <- h.Handle(ctx, activate) }()
+	select {
+	case <-membership.activated:
+	case <-time.After(time.Second):
+		t.Fatal("activation did not reach durable membership")
+	}
+	abortDone := make(chan *authoritypb.Response, 1)
+	go func() {
+		abortDone <- h.Handle(ctx, &authoritypb.Request{
+			RequestId: 98, Epoch: attached.GetEpoch(), Session: proof,
+			Body: &authoritypb.Request_AbortAttach{AbortAttach: &authoritypb.AbortAttachRequest{
+				AttachAttemptId: request.GetAttach().GetAttachAttemptId(),
+			}},
+		})
+	}()
+	select {
+	case response := <-abortDone:
+		t.Fatalf("Abort crossed an unresolved activation: %+v", response)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(membership.release)
+	activated := <-activationDone
+	aborted := <-abortDone
+	if activated.GetErrno() != 0 || activated.GetActivate().GetState() != authoritypb.SessionState_SESSION_STATE_ACTIVE {
+		t.Fatalf("Activate = %+v", activated)
+	}
+	if aborted.GetErrno() != errnos.EBUSY || !membership.active.Load() {
+		t.Fatalf("racing Abort = %+v membership-active=%v; want EBUSY and retained ACTIVE membership", aborted, membership.active.Load())
+	}
+}
+
+func retiredProtocol5ActivationPublishesFreshRootInsideRegistrationBoundary(t *testing.T) {
+	h, ctx, _, _ := newProtocol5Handler(t, nil)
+	rootIdentity := [16]byte{0xD1, 0x5C}
+	rootAttr := xfsstore.Attr{
+		Kind: xfsstore.KindDirectory, Ino: 0xA11CE, Mode: 0o755, Nlink: 2,
+		CTimeNS: 123456789,
+	}
+	store := &blockingActivationRootStore{
+		resourceAdmissionFaultStore: &resourceAdmissionFaultStore{},
+		attr:                        rootAttr, identity: rootIdentity,
+		entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	h.Store = store
+
+	request := fskitAttachRequest(101)
+	attached := h.Handle(ctx, request)
+	if attached.GetErrno() != 0 {
+		t.Fatalf("Attach = %+v", attached)
+	}
+	if got := store.reads.Load(); got != 0 {
+		t.Fatalf("provisional Attach read root attributes %d times, want zero", got)
+	}
+	proof := proofFromAttach(attached)
+	var participant volumeserver.SessionID
+	copy(participant[:], proof.GetId())
+	activate := &authoritypb.Request{
+		RequestId: 102, Epoch: attached.GetEpoch(), Session: proof,
+		Body: &authoritypb.Request_Activate{Activate: &authoritypb.ActivateRequest{
+			AttachAttemptId: request.GetAttach().GetAttachAttemptId(), DataBindingGeneration: 1, ControlBindingGeneration: 1,
+		}},
+	}
+	activationDone := make(chan *authoritypb.Response, 1)
+	go func() { activationDone <- h.Handle(ctx, activate) }()
+	select {
+	case <-store.entered:
+	case <-time.After(time.Second):
+		t.Fatal("Activate did not enter its fresh root read")
+	}
+
+	target := volumeserver.VisibilityTarget{
+		Scope: volumeserver.VisibilityAttributes, Identity: rootIdentity,
+		KernelIno: rootAttr.Ino, Device: 1,
+	}
+	mutationStarted := make(chan struct{})
+	prepareEntered := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		close(mutationStarted)
+		mutationDone <- h.Visibility.Execute(
+			context.Background(), volumeserver.SessionID{0xEE}, volumeserver.MutationID{Sequence: 1},
+			volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{target}),
+			func() ([]volumeserver.VisibilityTarget, error) {
+				close(prepareEntered)
+				return []volumeserver.VisibilityTarget{target}, nil
+			},
+			func() ([]volumeserver.VisibilityTarget, bool) {
+				return exactAuthorityTestTargets(1, []volumeserver.VisibilityTarget{target}), true
+			},
+		)
+	}()
+	<-mutationStarted
+	select {
+	case <-prepareEntered:
+		t.Fatal("mutation crossed activation while the fresh root fact was not installed")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(store.release)
+
+	var activated *authoritypb.Response
+	select {
+	case activated = <-activationDone:
+	case <-time.After(time.Second):
+		t.Fatal("Activate did not complete after the root read was released")
+	}
+	if activated.GetErrno() != 0 || activated.GetActivate() == nil {
+		t.Fatalf("Activate = %+v", activated)
+	}
+	root := activated.GetActivate().GetRoot()
+	if root.GetAttr().GetInode() != rootAttr.Ino || !bytes.Equal(root.GetStableIdentity(), rootIdentity[:]) {
+		t.Fatalf("activated root = %+v, want fresh inode=%d identity=%x", root, rootAttr.Ino, rootIdentity)
+	}
+	select {
+	case <-prepareEntered:
+	case <-time.After(time.Second):
+		t.Fatal("mutation did not resume after activation committed")
+	}
+
+	// The mutation began before activation could publish ACTIVE. It must still
+	// address the freshly installed root coordinate, proving there is no gap in
+	// which the new mount can serve the returned root without joining its first
+	// cache barrier.
+	phaseContext, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	prepare, err := h.Visibility.Next(phaseContext, participant, testInitialVisibilityCursor(t, h.Visibility, participant))
+	if err != nil {
+		t.Fatalf("root PREPARE = %v", err)
+	}
+	if prepare.Cursor.Phase != volumeserver.VisibilityPrepare || len(prepare.Targets) != 1 || prepare.Targets[0].Identity != rootIdentity {
+		t.Fatalf("root PREPARE = %+v", prepare)
+	}
+	if err := h.Visibility.Ack(participant, prepare.Cursor); err != nil {
+		t.Fatalf("ack root PREPARE: %v", err)
+	}
+	complete, err := h.Visibility.Next(phaseContext, participant, prepare.Cursor)
+	if err != nil {
+		t.Fatalf("root COMPLETE = %v", err)
+	}
+	if complete.Cursor.Phase != volumeserver.VisibilityComplete || len(complete.Targets) != 1 || complete.Targets[0].Identity != rootIdentity {
+		t.Fatalf("root COMPLETE = %+v", complete)
+	}
+	if err := h.Visibility.Ack(participant, complete.Cursor); err != nil {
+		t.Fatalf("ack root COMPLETE: %v", err)
+	}
+	select {
+	case err := <-mutationDone:
+		if err != nil {
+			t.Fatalf("root mutation = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("root mutation did not finish after exact repair acknowledgments")
+	}
 }
 
 type reauthorizationTestAuthorizer struct {
@@ -1161,93 +3648,35 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &VolumeHandler{
-		Store: store, Runtime: runtime, Authorizer: allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite},
-		Routes:   testRoutesController(t, store),
-		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
-		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 8192, MaxOpens: 8192,
-		MaxRetainedReplyBytes: 8 << 20,
-	}
+	h := testVolumeHandler()
+	h.Store = store
+	h.Runtime = runtime
+	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
+	testCoordinationWithFencer(t, store, runtime).Bind(h)
+	h.MaxItemsPerSession, h.MaxOpensPerSession = 1024, 1024
+	h.MaxItems, h.MaxOpens = 8192, 8192
+	h.MaxRetainedReplyBytes = 8 << 20
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{7})
 
-	attach := h.Handle(ctx, &authoritypb.Request{RequestId: 1, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{VolumeId: "volume-e2e", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision()}}})
-	if attach.GetErrno() != 0 || attach.GetAttach() == nil {
-		t.Fatalf("attach = %v", attach)
-	}
-	proof := &authoritypb.SessionProof{Id: attach.GetAttach().GetSessionId(), Generation: attach.GetAttach().GetSessionGeneration(), ResumeSecret: attach.GetAttach().GetResumeSecret()}
+	activated, epoch, proof := attachAndActivateHandler(t, h, ctx, 1, &authoritypb.AttachRequest{
+		VolumeId: "volume-e2e", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(),
+		Purpose:                 authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		FskitCachedNameCapacity: 64,
+		FskitRepairBudgetMillis: 1000,
+		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED,
+	})
 	var sessionID volumeserver.SessionID
 	copy(sessionID[:], proof.GetId())
-
-	mkdir := func(requestID, sequence uint64, name string) *authoritypb.Item {
-		t.Helper()
-		request := &authoritypb.Request{RequestId: requestID, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Mkdir{Mkdir: &authoritypb.MkdirRequest{
-			Parent: attach.GetAttach().GetRoot().GetToken(), Name: []byte(name), Mode: 0o700,
-		}}}
-		stampMutation(t, request, 1, sequence)
-		response := h.Handle(ctx, request)
-		if response.GetErrno() != 0 || response.GetLookup().GetItem() == nil {
-			t.Fatalf("mkdir %q = %v", name, response)
-		}
-		t.Cleanup(func() {
-			if err := os.Remove(filepath.Join(root, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				t.Errorf("remove test directory %q: %v", name, err)
-			}
-		})
-		return response.GetLookup().GetItem()
-	}
-	oldParent := mkdir(100, 1, "handler-e2e-old-parent")
-	newParent := mkdir(101, 2, "handler-e2e-new-parent")
-	var oldCapability, newCapability xfsstore.Capability
-	copy(oldCapability[:], oldParent.GetToken())
-	copy(newCapability[:], newParent.GetToken())
-	oldIdentity, err := store.Identity(oldCapability)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newIdentity, err := store.Identity(newCapability)
+	var rootCapability xfsstore.Capability
+	copy(rootCapability[:], activated.GetRoot().GetToken())
+	rootIdentity, err := store.Identity(rootCapability)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, test := range []struct {
-		name      string
-		oldParent []byte
-		newParent []byte
-		want      [][16]byte
-	}{
-		{name: "old parent overlap", oldParent: oldParent.GetToken(), newParent: newParent.GetToken(), want: [][16]byte{oldIdentity, newIdentity}},
-		{name: "new parent overlap", oldParent: newParent.GetToken(), newParent: oldParent.GetToken(), want: [][16]byte{newIdentity, oldIdentity}},
-		{name: "same parent", oldParent: oldParent.GetToken(), newParent: oldParent.GetToken(), want: [][16]byte{oldIdentity, oldIdentity}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			request := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
-				OldParent: test.oldParent,
-				NewParent: test.newParent,
-			}}}
-			got, err := h.heldDirectories(sessionID, request)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(got) != len(test.want) {
-				t.Fatalf("held directories = %x, want %x", got, test.want)
-			}
-			for i := range test.want {
-				if got[i] != test.want[i] {
-					t.Fatalf("held directory %d = %x, want %x", i, got[i], test.want[i])
-				}
-			}
-		})
-	}
-
-	unknown := xfsstore.Capability{0xFE}
-	unresolvedRename := &authoritypb.Request{Body: &authoritypb.Request_Rename{Rename: &authoritypb.RenameRequest{
-		OldParent: oldParent.GetToken(), NewParent: unknown[:],
-	}}}
-	if _, err := h.heldDirectories(sessionID, unresolvedRename); !errors.Is(err, xfsstore.ErrStaleObject) {
-		t.Fatalf("unresolved new rename parent = %v, want stale-object refusal", err)
-	}
-
-	create := &authoritypb.Request{RequestId: 2, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: attach.GetAttach().GetRoot().GetToken(), Name: []byte("handler-e2e"), Mode: 0o600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
+	create := &authoritypb.Request{RequestId: 2, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: activated.GetRoot().GetToken(), Name: []byte("handler-e2e"), Mode: 0o600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
+	stampNamespacePublication(create, 2, rootIdentity, []byte("handler-e2e"))
 	stampMutation(t, create, 0, 1)
 	created := h.Handle(ctx, create)
 	if created.GetErrno() != 0 || created.GetCreate() == nil {
@@ -1264,24 +3693,24 @@ func TestVolumeHandlerEndToEndOnXFS(t *testing.T) {
 	if replayed.GetMutation().GetAcceptedSequence() != 1 {
 		t.Fatalf("a replay must report the same recorded slot state: %v", replayed.GetMutation())
 	}
-	write := &authoritypb.Request{RequestId: 4, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: created.GetCreate().GetHandle(), Data: []byte("hello")}}}
-	stampMutation(t, write, 0, 2)
-	written := h.Handle(ctx, write)
-	if written.GetErrno() != 0 || written.GetWrite().GetCount() != 5 {
-		t.Fatalf("write = %v", written)
+	var createdHandle xfsstore.Capability
+	copy(createdHandle[:], created.GetCreate().GetHandle())
+	if n, err := store.WriteAt(createdHandle, []byte("hello"), 0); err != nil || n != 5 {
+		t.Fatalf("seed through store = (%d, %v)", n, err)
 	}
 
-	unlink := &authoritypb.Request{RequestId: 5, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: attach.GetAttach().GetRoot().GetToken(), Name: []byte("handler-e2e")}}}
-	stampMutation(t, unlink, 0, 3)
+	unlink := &authoritypb.Request{RequestId: 5, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Unlink{Unlink: &authoritypb.UnlinkRequest{Parent: activated.GetRoot().GetToken(), Name: []byte("handler-e2e")}}}
+	stampNamespacePublication(unlink, 5, rootIdentity, []byte("handler-e2e"))
+	stampMutation(t, unlink, 0, 2)
 	if got := h.Handle(ctx, unlink); got.GetErrno() != 0 {
 		t.Fatalf("unlink = %v", got)
 	}
 
-	read := h.Handle(ctx, &authoritypb.Request{RequestId: 6, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{Handle: created.GetCreate().GetHandle(), Length: 5}}})
+	read := h.Handle(ctx, &authoritypb.Request{RequestId: 6, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{Handle: created.GetCreate().GetHandle(), Length: 5}}})
 	if read.GetErrno() != 0 || string(read.GetRead().GetData()) != "hello" {
 		t.Fatalf("read after unlink = %v", read)
 	}
-	fsync := h.Handle(ctx, &authoritypb.Request{RequestId: 7, Epoch: attach.GetEpoch(), Session: proof, Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: created.GetCreate().GetHandle()}}})
+	fsync := h.Handle(ctx, &authoritypb.Request{RequestId: 7, Epoch: epoch, Session: proof, Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: created.GetCreate().GetHandle()}}})
 	if fsync.GetErrno() != 0 {
 		t.Fatalf("fsync = %v", fsync)
 	}
@@ -1319,25 +3748,25 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &VolumeHandler{
-		Store: store, Runtime: runtime, Authorizer: allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite},
-		Routes:   testRoutesController(t, store),
-		MaxFrame: 1 << 20, MaxRead: 1 << 16, MaxWrite: 1 << 16, MaxInFlight: 8,
-		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 8192, MaxOpens: 8192,
-		MaxRetainedReplyBytes: 8 << 20,
-	}
+	h := testVolumeHandler()
+	h.Store = store
+	h.Runtime = runtime
+	h.Authorizer = allowAuthorizer{volumeserver.AccessRead | volumeserver.AccessWrite}
+	testCoordinationWithFencer(t, store, runtime).Bind(h)
+	h.MaxItemsPerSession, h.MaxOpensPerSession = 1024, 1024
+	h.MaxItems, h.MaxOpens = 8192, 8192
+	h.MaxRetainedReplyBytes = 8 << 20
 	ctx := context.WithValue(context.Background(), peerIdentityKey{}, [32]byte{9})
 
-	attachSession := func(id uint64) (*authoritypb.AttachReply, []byte, *authoritypb.SessionProof) {
+	attachSession := func(id uint64) (*authoritypb.ActivateReply, []byte, *authoritypb.SessionProof) {
 		t.Helper()
-		attach := h.Handle(ctx, &authoritypb.Request{RequestId: id, Body: &authoritypb.Request_Attach{Attach: &authoritypb.AttachRequest{VolumeId: "volume-lockwait", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision()}}})
-		if attach.GetErrno() != 0 || attach.GetAttach() == nil {
-			t.Fatalf("attach = %v", attach)
-		}
-		return attach.GetAttach(), attach.GetEpoch(), &authoritypb.SessionProof{Id: attach.GetAttach().GetSessionId(), Generation: attach.GetAttach().GetSessionGeneration(), ResumeSecret: attach.GetAttach().GetResumeSecret()}
+		return attachAndActivateHandler(t, h, ctx, id, &authoritypb.AttachRequest{
+			VolumeId: "volume-lockwait", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(),
+			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		})
 	}
 	holder, epoch, holderProof := attachSession(1)
-	waiter, _, waiterProof := attachSession(2)
 
 	create := &authoritypb.Request{RequestId: 3, Epoch: epoch, Session: holderProof, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: holder.GetRoot().GetToken(), Name: []byte("lock-wait-target"), Mode: 0o600, Exclusive: true, Flags: &authoritypb.OpenFlags{Read: true, Write: true}}}}
 	stampMutation(t, create, 0, 1)
@@ -1346,15 +3775,19 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 		t.Fatalf("create = %v", created)
 	}
 	t.Cleanup(func() {
-		// Removed behind the store, like resetXFSRouteDeclaration: the routing
-		// revision this test installs makes the holder's session stale by
-		// design, so an in-protocol unlink could not run in every exit path.
+		// Removed behind the store, like resetXFSRouteDeclaration: the shared
+		// fixture outlives the parked lock wait, so an in-protocol unlink could
+		// not run in every exit path.
 		if err := os.Remove(filepath.Join(root, "lock-wait-target")); err != nil && !os.IsNotExist(err) {
 			t.Errorf("remove shared XFS lock fixture: %v", err)
 		}
 	})
 	itemToken := created.GetCreate().GetItem().GetToken()
 
+	// Attach the waiter only after the seed create. A direct handler test has no
+	// frontend visibility loop to ACK a create repair, and the waiter is meant to
+	// observe the already-created object before it parks on the lock.
+	waiter, _, waiterProof := attachSession(2)
 	// The waiter needs its own capability for the same object.
 	waiterLookupRequest := &authoritypb.Request{RequestId: 4, Epoch: epoch, Session: waiterProof, Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: waiter.GetRoot().GetToken(), Name: []byte("lock-wait-target")}}}
 	stampMutation(t, waiterLookupRequest, 0, 1)
@@ -1388,7 +3821,10 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	// The topology writer must not queue behind the parked wait. Before the
 	// fix, this Apply blocked until the lock wait ended — and because a queued
 	// RWMutex writer stops new readers, every guarded request on the volume
-	// blocked with it.
+	// blocked with it. Protocol 6 commits a route change only at clean mount
+	// absence, so the answer here is a prompt EBUSY-class refusal naming that
+	// absence. Reaching that decision at all is the property under test: it is
+	// made under topology exclusion, which the parked wait must not be holding.
 	active, err := h.Routes.Revision()
 	if err != nil {
 		t.Fatal(err)
@@ -1400,26 +3836,52 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	}()
 	select {
 	case err := <-applyDone:
-		if err != nil {
-			t.Fatalf("ApplyRoutes beside a blocked lock wait: %v", err)
+		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
+			t.Fatalf("ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("ApplyRoutes deadlocked behind a blocked lock wait")
 	}
 
-	// Ending the holder's session releases its locks and completes the parked
-	// wait: the waiter's admission happened before the routing change, exactly
-	// once, and is not re-litigated when the lock is granted.
-	if response := h.Handle(ctx, &authoritypb.Request{RequestId: 7, Epoch: epoch, Session: holderProof, Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}}); response.GetErrno() != 0 {
-		t.Fatalf("holder detach = %v", response)
+	// A refused change disturbs nothing: the declaration is unmoved, the holder
+	// keeps its lock, and the waiter is still parked rather than having been
+	// admitted for a topology the volume does not have.
+	if unchanged, err := h.Routes.Revision(); err != nil {
+		t.Fatal(err)
+	} else if unchanged != active {
+		t.Fatal("a refused routing change moved the active revision")
 	}
 	select {
 	case response := <-waitDone:
-		if response.GetErrno() != 0 {
-			t.Fatalf("the parked wait completed with errno %d after the lock was released", response.GetErrno())
+		t.Fatalf("the parked wait completed across a refused routing change: %v", response)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// And the topology guard is genuinely free rather than merely fast once: a
+	// second decision still completes while the wait is parked.
+	go func() {
+		_, err := h.Routes.Apply(ctx, []byte("node_modules\n/target/\n"), active)
+		applyDone <- err
+	}()
+	select {
+	case err := <-applyDone:
+		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
+			t.Fatalf("second ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
-		t.Fatal("the parked lock wait never completed after the holder detached")
+		t.Fatal("a second ApplyRoutes deadlocked behind a blocked lock wait")
+	}
+
+	// The wait unwinds on its own cancellation, which is the only thing left
+	// that can end it: no routing change fenced the holder out from under it.
+	cancelWait()
+	select {
+	case response := <-waitDone:
+		if response.GetErrno() == 0 {
+			t.Fatalf("the cancelled parked wait acquired the conflicting lock: %v", response)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the parked lock wait never completed after cancellation")
 	}
 }
 
@@ -1443,14 +3905,33 @@ func TestRoutingRevisionContractRejectsTheOldExactProtocolAtHello(t *testing.T) 
 	if legacy.GetErrno() != int32(syscall.EOPNOTSUPP) || legacy.GetHello() != nil {
 		t.Fatalf("legacy-feature hello = %v, want EOPNOTSUPP before attach", legacy)
 	}
+	malformed := h.Handle(context.Background(), &authoritypb.Request{
+		RequestId:                4,
+		FskitFrontendOperationId: 1,
+		FskitSourcePublication:   &authoritypb.FskitSourcePublication{},
+		Body: &authoritypb.Request_Hello{Hello: &authoritypb.HelloRequest{
+			ProtocolMajor: ProtocolMajor, Features: append([]string(nil), requiredHelloFeatures...),
+		}},
+	})
+	if malformed.GetErrno() != int32(syscall.EINVAL) || malformed.GetHello() != nil {
+		t.Fatalf("FSKit-stamped hello = %v, want EINVAL before negotiation", malformed)
+	}
 }
 
 func stampMutation(t *testing.T, request *authoritypb.Request, slot uint32, sequence uint64) {
 	t.Helper()
-	request.Mutation = &authoritypb.Mutation{Slot: slot, Sequence: sequence, RequestHash: make([]byte, 32)}
-	hash, err := canonicalHash(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Mutation.RequestHash = hash[:]
+	request.Mutation = &authoritypb.Mutation{Slot: slot, Sequence: sequence}
+}
+
+func stampNamespacePublication(request *authoritypb.Request, operationID uint64, parent [16]byte, name []byte) {
+	request.FskitFrontendOperationId = operationID
+	request.FskitSourcePublication = &authoritypb.FskitSourcePublication{Targets: []*authoritypb.FskitSourcePublicationTarget{
+		{Coordinate: &authoritypb.FskitSourcePublicationTarget_Item{Item: &authoritypb.FskitSourcePublicationItem{
+			Identity: append([]byte(nil), parent[:]...), Attributes: true,
+		}}},
+		{Coordinate: &authoritypb.FskitSourcePublicationTarget_Namespace{Namespace: &authoritypb.FskitSourcePublicationNamespace{
+			ParentIdentity: append([]byte(nil), parent[:]...), Name: append([]byte(nil), name...),
+			BoundAttributes: true,
+		}}},
+	}}
 }

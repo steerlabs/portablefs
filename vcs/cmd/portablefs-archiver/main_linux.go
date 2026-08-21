@@ -19,6 +19,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/archiver"
 )
 
+var version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "portablefs-archiver:", err)
@@ -27,6 +29,10 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) == 2 && os.Args[1] == "-version" {
+		_, _ = fmt.Fprintln(os.Stdout, version)
+		return nil
+	}
 	options, err := parseFlags(os.Args[1:])
 	if err != nil {
 		return err

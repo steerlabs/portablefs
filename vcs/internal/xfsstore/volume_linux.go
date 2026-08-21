@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -34,6 +36,11 @@ const (
 	// pageAllocationCap bounds the slice a single readdir page preallocates so
 	// an absurd max cannot be turned into an allocation by a peer.
 	pageAllocationCap = 512
+	// inodeMutationStripeCount bounds the storage-side coordination state while
+	// retaining parallelism between unrelated inodes. A collision only
+	// serializes two mutations; it cannot merge their identities or affect
+	// correctness. Keep this a power of two for the mask in inodeMutationLock.
+	inodeMutationStripeCount = 4096
 )
 
 // resource owns exactly one descriptor. A volume map holds one reference and
@@ -72,9 +79,9 @@ func (r *resource) release() error {
 // object is a held reference to an installed inode. Values are copied freely;
 // the descriptor stays valid until release is called exactly once.
 type object struct {
-	res      *resource
-	kind     Kind
-	identity [16]byte
+	res        *resource
+	kind       Kind
+	coordinate ObjectCoordinate
 	// grant is the file description this authority created the inode with,
 	// for as long as no handle has taken it. See createGrant.
 	grant *createGrant
@@ -130,28 +137,78 @@ func (g *createGrant) discard() error {
 }
 
 type openFile struct {
-	res      *resource
-	identity [16]byte
+	volume     *Volume
+	res        *resource
+	coordinate ObjectCoordinate
+	fsyncState *inodeFsyncState
 	// read and write are the access this handle was opened for. They are
 	// enforced here rather than left to the underlying description, because a
 	// handle may be served by a creation grant whose description is wider than
 	// the access that was asked for.
-	read   bool
-	write  bool
-	append bool
-	object Capability
-	kind   Kind
+	read     bool
+	write    bool
+	sync     bool
+	dataSync bool
+	object   Capability
+	kind     Kind
 
-	// mu serializes the state that only exists in this process: the append
-	// offset report and the directory cursor. It deliberately does not cover
-	// pread/pwrite/ftruncate/fstat, none of which touch the file description
-	// offset, so one slow read on a handle cannot block another.
-	mu     sync.Mutex
-	cursor dirCursor
+	// cursorMu serializes only the directory cursor. Regular-file operations
+	// use the inode mutation stripes where size atomicity requires it; they do
+	// not share a per-handle mutex.
+	cursorMu sync.Mutex
+	cursor   dirCursor
 }
 
-func (f *openFile) fd() int  { return f.res.fd }
-func (f *openFile) release() { _ = f.res.release() }
+type writeTarget struct {
+	volume     *Volume
+	res        *resource
+	coordinate ObjectCoordinate
+	fsyncState *inodeFsyncState
+	// mu makes Close and CommitWrite mutually exclusive. The target owns one
+	// descriptor reference from PinWriteTarget until Close, and a commit must
+	// not race that final release: otherwise the kernel may recycle the fd
+	// number while an append transaction is still issuing fstat/pwritev2.
+	mu     sync.Mutex
+	closed bool
+}
+
+func (t *writeTarget) Coordinate() ObjectCoordinate { return t.coordinate }
+
+// Getattr samples the pinned write description even after the client handle
+// has closed. Restore mode uses it immediately before apply to identify the
+// exact append/truncate boundary without reopening a path.
+func (t *writeTarget) Getattr() (Attr, error) {
+	if t == nil {
+		return Attr{}, ErrStaleOpen
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.res == nil || t.closed {
+		return Attr{}, ErrStaleOpen
+	}
+	return statFD(t.res.fd)
+}
+
+func (t *writeTarget) Close() error {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.res == nil || t.closed {
+		return nil
+	}
+	t.closed = true
+	result := t.res.release()
+	t.volume.releaseFsyncState(t.fsyncState)
+	return result
+}
+
+func (f *openFile) fd() int { return f.res.fd }
+func (f *openFile) release() {
+	_ = f.res.release()
+	f.volume.releaseFsyncState(f.fsyncState)
+}
 
 // Volume owns all descriptors for one authority epoch. Closing it atomically
 // makes every issued capability stale.
@@ -162,11 +219,19 @@ func (f *openFile) release() { _ = f.res.release() }
 // otherwise queue Fence - the emergency stop - behind gigabytes of I/O and
 // every later request behind Fence.
 type Volume struct {
-	mu      sync.RWMutex
-	closed  bool
-	fenced  error
-	objects map[Capability]object
-	opens   map[Capability]*openFile
+	mu sync.RWMutex
+	// inodeMutation is keyed by the immutable XFS incarnation identity, not by
+	// a capability or open handle. Hard-link aliases and independently opened
+	// descriptions of one inode therefore share the same EOF atomicity domain.
+	// A fixed stripe array avoids an unbounded lifecycle map. Append validation
+	// and every possible size-changing operation participate in this domain.
+	inodeMutation [inodeMutationStripeCount]sync.RWMutex
+	closed        bool
+	fenced        error
+	objects       map[Capability]object
+	opens         map[Capability]*openFile
+	fsyncMu       sync.Mutex
+	fsyncStates   map[[16]byte]*inodeFsyncState
 
 	// The fields below are written once, before the Volume is reachable by
 	// any other goroutine, and never again. That is what makes them safe to
@@ -182,6 +247,73 @@ type Volume struct {
 	// non-XFS filesystem may fall back to device+inode, but production never
 	// does: inode reuse must create a different coordination identity.
 	productionIdentity bool
+	// fallocate is fixed to unix.Fallocate in production. Keeping the syscall
+	// seam on the Volume lets tests deterministically model XFS committing an
+	// internal transaction before a later allocation step reports an error.
+	fallocate               func(int, uint32, int64, int64) error
+	fallocateAllocationUnit func(int) (uint64, error)
+	// The write/copy seams are likewise fixed to their unix implementations in
+	// production. Tests use them to model XFS running file_modified before a
+	// later zero-byte data-path failure.
+	pwrite                    func(int, []byte, int64) (int, error)
+	pwritev2                  func(int, [][]byte, int64, int) (int, error)
+	sendfile                  func(int, int, *int64, int) (int, error)
+	copyFileRange             func(int, *int64, int, *int64, int, int) (int, error)
+	postStat                  func(int) (Attr, error)
+	fsync                     func(int) error
+	fdatasync                 func(int) error
+	inspectSecurityCapability func(int) (bool, error)
+	// removeWritePrivileges is fixed to the package implementation in
+	// production. The seam lets tests prove that a delegated killpriv failure
+	// does not suppress the one logical sync attempt owed by a clean backend
+	// mutation.
+	removeWritePrivileges       func(int, uint32, bool) error
+	removePinnedWritePrivileges func(int, uint32, bool, *bool) error
+}
+
+func inodeMutationStripe(identity [16]byte) uint64 {
+	// Stable identities are uniformly opaque in production, but mix both words
+	// so the non-XFS test identity (which has visible device/inode structure)
+	// distributes just as well. This function chooses a lock only; identity
+	// equality and authorization never depend on the hash.
+	hash := binary.LittleEndian.Uint64(identity[:8]) ^ binary.LittleEndian.Uint64(identity[8:])
+	hash ^= hash >> 33
+	hash *= 0xff51afd7ed558ccd
+	hash ^= hash >> 33
+	return hash & (inodeMutationStripeCount - 1)
+}
+
+func (v *Volume) inodeMutationLock(identity [16]byte) *sync.RWMutex {
+	return &v.inodeMutation[inodeMutationStripe(identity)]
+}
+
+// LockMutation takes the writer stripes for a complete touched-identity set in
+// increasing stripe order. The returned release function is idempotent so an
+// authority handler can retain it through replay-record persistence and still
+// use one deferred cleanup path on every rejection.
+func (v *Volume) LockMutation(identities [][16]byte) func() {
+	stripes := make([]uint64, 0, len(identities))
+	seen := make(map[uint64]struct{}, len(identities))
+	for _, identity := range identities {
+		stripe := inodeMutationStripe(identity)
+		if _, exists := seen[stripe]; exists {
+			continue
+		}
+		seen[stripe] = struct{}{}
+		stripes = append(stripes, stripe)
+	}
+	slices.Sort(stripes)
+	for _, stripe := range stripes {
+		v.inodeMutation[stripe].Lock()
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for i := len(stripes) - 1; i >= 0; i-- {
+				v.inodeMutation[stripes[i]].Unlock()
+			}
+		})
+	}
 }
 
 // holdObject resolves a capability and takes a reference to its descriptor.
@@ -206,7 +338,45 @@ func (v *Volume) holdOpen(id Capability) (*openFile, error) {
 		return nil, err
 	}
 	f.res.acquire()
+	v.retainFsyncState(f.fsyncState)
 	return f, nil
+}
+
+func (v *Volume) fsyncState(identity [16]byte) *inodeFsyncState {
+	v.fsyncMu.Lock()
+	defer v.fsyncMu.Unlock()
+	state := v.fsyncStates[identity]
+	if state == nil {
+		state = &inodeFsyncState{identity: identity}
+		v.fsyncStates[identity] = state
+	}
+	state.refs++
+	return state
+}
+
+func (v *Volume) retainFsyncState(state *inodeFsyncState) {
+	if state == nil {
+		return
+	}
+	v.fsyncMu.Lock()
+	state.refs++
+	v.fsyncMu.Unlock()
+}
+
+func (v *Volume) releaseFsyncState(state *inodeFsyncState) {
+	if state == nil {
+		return
+	}
+	v.fsyncMu.Lock()
+	state.refs--
+	if state.refs < 0 {
+		v.fsyncMu.Unlock()
+		panic("xfsstore: fsync state released more times than acquired")
+	}
+	if state.refs == 0 && v.fsyncStates[state.identity] == state {
+		delete(v.fsyncStates, state.identity)
+	}
+	v.fsyncMu.Unlock()
 }
 
 func (v *Volume) openChild(parent Capability, name string) (int, [16]byte, error) {
@@ -283,6 +453,9 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		if err := verifyProject(fd, expectedProjectID, true); err != nil {
 			return fail(err)
 		}
+		if err := qualifyAtomicAppend(fd); err != nil {
+			return fail(fmt.Errorf("xfsstore: qualify RWF_APPEND: %w", err))
+		}
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
@@ -307,14 +480,27 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 	}
 
 	v := &Volume{
-		rootFD:             fd,
-		device:             uint64(st.Dev),
-		ownerUID:           ownerUID,
-		ownerGID:           ownerGID,
-		projectID:          expectedProjectID,
-		objects:            make(map[Capability]object),
-		opens:              make(map[Capability]*openFile),
-		productionIdentity: requireXFS,
+		rootFD:                      fd,
+		device:                      uint64(st.Dev),
+		ownerUID:                    ownerUID,
+		ownerGID:                    ownerGID,
+		projectID:                   expectedProjectID,
+		objects:                     make(map[Capability]object),
+		opens:                       make(map[Capability]*openFile),
+		fsyncStates:                 make(map[[16]byte]*inodeFsyncState),
+		productionIdentity:          requireXFS,
+		fallocate:                   unix.Fallocate,
+		fallocateAllocationUnit:     xfsFallocateAllocationUnit,
+		pwrite:                      unix.Pwrite,
+		pwritev2:                    unix.Pwritev2,
+		sendfile:                    unix.Sendfile,
+		copyFileRange:               unix.CopyFileRange,
+		postStat:                    statFD,
+		fsync:                       unix.Fsync,
+		fdatasync:                   unix.Fdatasync,
+		inspectSecurityCapability:   inspectSecurityCapability,
+		removeWritePrivileges:       removeWritePrivileges,
+		removePinnedWritePrivileges: removeWritePrivilegesWithCapability,
 	}
 	rootIdentity, err := stableIdentityFD(fd, requireXFS)
 	if err != nil {
@@ -327,7 +513,10 @@ func open(rootPath string, requireXFS bool, expectedProjectID uint32, config *Co
 		return fail(err)
 	}
 	v.root = root
-	v.objects[root] = object{res: newResource(fd), kind: KindDirectory, identity: rootIdentity}
+	v.objects[root] = object{res: newResource(fd), kind: KindDirectory, coordinate: ObjectCoordinate{
+		Stable: rootIdentity, Ino: st.Ino,
+		DeviceMajor: uint32(unix.Major(uint64(st.Dev))), DeviceMinor: uint32(unix.Minor(uint64(st.Dev))),
+	}}
 	return v, nil
 }
 
@@ -401,6 +590,7 @@ func (v *Volume) Close() error {
 	result := unix.Flock(v.rootFD, unix.LOCK_UN)
 	for id, opened := range v.opens {
 		result = errors.Join(result, opened.res.release())
+		v.releaseFsyncState(opened.fsyncState)
 		delete(v.opens, id)
 	}
 	for id, obj := range v.objects {
@@ -482,7 +672,9 @@ func (v *Volume) installObject(fd int, grant *resource, identity [16]byte) (Capa
 	if identity == ([16]byte{}) {
 		return fail(errors.New("xfsstore: object has no stable incarnation identity"))
 	}
-	installed := object{res: newResource(fd), kind: attr.Kind, identity: identity}
+	installed := object{res: newResource(fd), kind: attr.Kind, coordinate: ObjectCoordinate{
+		Stable: identity, Ino: attr.Ino, DeviceMajor: attr.DeviceMajor, DeviceMinor: attr.DeviceMinor,
+	}}
 	if grant != nil {
 		installed.grant = &createGrant{res: grant}
 	}
@@ -505,6 +697,52 @@ func (v *Volume) Lookup(parent Capability, name string) (Capability, Attr, error
 		return Capability{}, Attr{}, err
 	}
 	return v.installObject(fd, nil, identity)
+}
+
+// LookupOpen is Lookup with the directory named by an open handle instead of by
+// the directory's own object capability.
+//
+// Enumerating an open directory must not depend on a reference the open does
+// not itself imply. A frontend that keeps no namespace of its own -- the files
+// gateway is the one in this tree -- reclaims the directory's object capability
+// as soon as it holds the handle, exactly as it does for a file it is about to
+// read. Reading that file keeps working because reads are answered from the
+// handle; readdir was not, so it resolved each entry against a capability the
+// caller had legitimately dropped and failed every page with ErrStaleObject.
+func (v *Volume) LookupOpen(handle Capability, name string) (Capability, Attr, error) {
+	fd, identity, err := v.openChildOfOpen(handle, name)
+	if err != nil {
+		return Capability{}, Attr{}, err
+	}
+	return v.installObject(fd, nil, identity)
+}
+
+// openChildOfOpen is openChild resolved from an open directory handle. The
+// authorization that produced the handle is the same one that produced the
+// object capability it was opened from, so this reaches no name the caller
+// could not already reach.
+func (v *Volume) openChildOfOpen(handle Capability, name string) (int, [16]byte, error) {
+	if err := ValidateComponent(name); err != nil {
+		return -1, [16]byte{}, err
+	}
+	opened, err := v.holdOpen(handle)
+	if err != nil {
+		return -1, [16]byte{}, err
+	}
+	defer opened.release()
+	if opened.kind != KindDirectory {
+		return -1, [16]byte{}, syscall.ENOTDIR
+	}
+	fd, err := openChildAt(opened.fd(), name)
+	if err != nil {
+		return -1, [16]byte{}, err
+	}
+	identity, err := stableIdentityFD(fd, v.productionIdentity)
+	if err != nil {
+		_ = unix.Close(fd)
+		return -1, [16]byte{}, err
+	}
+	return fd, identity, nil
 }
 
 func (v *Volume) Forget(id Capability) error {
@@ -538,21 +776,39 @@ func (v *Volume) Getattr(id Capability) (Attr, error) {
 // inode number in the same authority epoch does not. It is coordination
 // identity only, never authorization.
 func (v *Volume) Identity(id Capability) ([16]byte, error) {
+	coordinate, err := v.CoordinateItem(id)
+	return coordinate.Stable, err
+}
+
+// CoordinateItem returns the immutable coordination facts retained when this
+// object capability was installed. It deliberately performs no statx: size,
+// timestamps and mode are mutable, but stable identity, inode and device are
+// properties of the held incarnation itself.
+func (v *Volume) CoordinateItem(id Capability) (ObjectCoordinate, error) {
 	obj, err := v.holdObject(id)
 	if err != nil {
-		return [16]byte{}, err
+		return ObjectCoordinate{}, err
 	}
 	defer obj.release()
-	return obj.identity, nil
+	return obj.coordinate, nil
 }
 
 func (v *Volume) IdentityOpen(id Capability) ([16]byte, error) {
+	coordinate, err := v.CoordinateOpen(id)
+	return coordinate.Stable, err
+}
+
+// CoordinateOpen returns the immutable coordination facts retained when this
+// handle's object was installed. It deliberately performs no fstat: size,
+// timestamps and mode are mutable, but stable identity, inode and device are
+// properties of the open incarnation itself.
+func (v *Volume) CoordinateOpen(id Capability) (ObjectCoordinate, error) {
 	opened, err := v.holdOpen(id)
 	if err != nil {
-		return [16]byte{}, err
+		return ObjectCoordinate{}, err
 	}
 	defer opened.release()
-	return opened.identity, nil
+	return opened.coordinate, nil
 }
 
 func fallbackIdentityFromAttr(attr Attr) [16]byte {
@@ -622,7 +878,7 @@ func exactXFSHandleIdentity(handleType int32, raw []byte) ([16]byte, bool) {
 func statFD(fd int) (Attr, error) {
 	var st unix.Statx_t
 	if err := unix.Statx(fd, "", unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW,
-		unix.STATX_BASIC_STATS|unix.STATX_BTIME, &st); err != nil {
+		unix.STATX_ALL, &st); err != nil {
 		return Attr{}, err
 	}
 	return attrFromStatx(st)
@@ -631,7 +887,7 @@ func statFD(fd int) (Attr, error) {
 func statChild(dirFD int, name string) (Attr, error) {
 	var st unix.Statx_t
 	if err := unix.Statx(dirFD, name, unix.AT_SYMLINK_NOFOLLOW,
-		unix.STATX_BASIC_STATS|unix.STATX_BTIME, &st); err != nil {
+		unix.STATX_ALL, &st); err != nil {
 		return Attr{}, err
 	}
 	return attrFromStatx(st)
@@ -646,9 +902,17 @@ func attrFromStatx(st unix.Statx_t) (Attr, error) {
 		Kind: kind, Ino: st.Ino, Size: int64(st.Size), Blocks: st.Blocks,
 		Mode: modeFromUnix(uint32(st.Mode)), UID: st.Uid, GID: st.Gid, Nlink: st.Nlink,
 		DeviceMajor: st.Dev_major, DeviceMinor: st.Dev_minor,
+		Rdev: newEncodeDevice(st.Rdev_major, st.Rdev_minor), BlockSize: st.Blksize,
+		Flags:   uint32(st.Attributes & st.Attributes_mask),
 		ATimeNS: timestampNS(st.Atime), MTimeNS: timestampNS(st.Mtime),
 		CTimeNS: timestampNS(st.Ctime), BirthTimeNS: timestampNS(st.Btime),
 	}, nil
+}
+
+// newEncodeDevice is Linux's new_encode_dev() UAPI representation. It is not
+// the authority volume's st_dev; it encodes statx's rdev pair for the inode.
+func newEncodeDevice(major, minor uint32) uint32 {
+	return (minor & 0xff) | (major << 8) | ((minor &^ 0xff) << 12)
 }
 
 func timestampNS(ts unix.StatxTimestamp) int64 { return ts.Sec*1e9 + int64(ts.Nsec) }
@@ -764,16 +1028,17 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	if obj.kind != KindRegular && obj.kind != KindDirectory {
 		return Capability{}, ErrForbiddenType
 	}
+	// O_TRUNC is serialized by the authority's full-operation mutation lease,
+	// which remains held through post-state sampling and replay persistence.
 	// A description this authority created the inode with already carries the
 	// access the creating caller was granted, so it answers this open without
-	// re-deriving anything from the mode. O_SYNC and O_DSYNC are the one thing
-	// it cannot be given afterwards - fcntl's F_SETFL mask excludes them - so
-	// a handle that asks for them is opened fresh and the mode decides, as it
-	// does for every non-creating open.
-	if !flags.Sync && !flags.DataSync {
-		if granted := obj.grant.take(); granted != nil {
-			return v.adoptGrantedDescription(obj.grant, granted, id, obj.kind, flags)
-		}
+	// re-deriving anything from the mode. Sync intent is retained logically on
+	// the handle instead of being installed on the fd: transactional writes may
+	// span many bounded pwrite calls and must issue one aggregate sync, while
+	// XFS fallocate/CFR semantics need the immutable OPEN intent once after a
+	// clean operation. A sticky O_SYNC/O_DSYNC fd would flush every fragment.
+	if granted := obj.grant.take(); granted != nil {
+		return v.adoptGrantedDescription(obj.grant, granted, id, obj.kind, flags)
 	}
 	linuxFlags := unix.O_RDONLY
 	if flags.Read && flags.Write {
@@ -781,17 +1046,8 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 	} else if flags.Write {
 		linuxFlags = unix.O_WRONLY
 	}
-	if flags.Append {
-		linuxFlags |= unix.O_APPEND
-	}
 	if flags.Truncate {
 		linuxFlags |= unix.O_TRUNC
-	}
-	if flags.Sync {
-		linuxFlags |= unix.O_SYNC
-	}
-	if flags.DataSync {
-		linuxFlags |= unix.O_DSYNC
 	}
 	if obj.kind == KindDirectory {
 		linuxFlags |= unix.O_DIRECTORY
@@ -804,31 +1060,21 @@ func (v *Volume) OpenFile(id Capability, flags OpenFlags) (Capability, error) {
 }
 
 // adoptGrantedDescription turns the creation description into this handle.
-// O_APPEND and O_TRUNC are the two open-time behaviors that still have to be
-// applied to it; both are expressible on an existing description, which is why
-// this is a handover and not an approximation of one.
+// Append intent is deliberately not installed on the authority descriptor:
+// Linux may change O_APPEND with fcntl or override it per call with RWF_APPEND
+// and RWF_NOAPPEND. Only the private append transaction chooses append; the
+// retained description stays position-neutral.
 //
 // A failed step returns the description to the grant slot instead of closing
 // it. The grant is the only carrier of the access the creation conferred —
 // that is what makes open(O_CREAT|O_EXCL, 0444) writable — so consuming it on
 // a transient failure would permanently re-derive a later open's access from
 // the mode, the exact behavior the grant exists to prevent. The truncate runs
-// before the flag change so every restorable failure restores a description
-// whose flags are still exactly what creation produced.
+// before handle installation so every restorable failure leaves ownership
+// unambiguous and restores the original description.
 func (v *Volume) adoptGrantedDescription(grant *createGrant, granted *resource, id Capability, kind Kind, flags OpenFlags) (Capability, error) {
 	if flags.Truncate {
 		if err := unix.Ftruncate(granted.fd, 0); err != nil {
-			grant.restore(granted)
-			return Capability{}, err
-		}
-	}
-	if flags.Append {
-		current, err := unix.FcntlInt(uintptr(granted.fd), unix.F_GETFL, 0)
-		if err != nil {
-			grant.restore(granted)
-			return Capability{}, err
-		}
-		if _, err := unix.FcntlInt(uintptr(granted.fd), unix.F_SETFL, current|unix.O_APPEND); err != nil {
 			grant.restore(granted)
 			return Capability{}, err
 		}
@@ -860,8 +1106,10 @@ func (v *Volume) installHandle(res *resource, id Capability, kind Kind, flags Op
 		return fail(ErrStaleObject)
 	}
 	v.opens[openID] = &openFile{
-		res: res, read: flags.Read, write: flags.Write, append: flags.Append,
-		object: id, kind: kind, identity: obj.identity,
+		volume: v, res: res, read: flags.Read, write: flags.Write,
+		sync: flags.Sync, dataSync: flags.DataSync && !flags.Sync,
+		object: id, kind: kind, coordinate: obj.coordinate,
+		fsyncState: v.fsyncState(obj.coordinate.Stable),
 	}
 	return openID, nil
 }
@@ -877,7 +1125,9 @@ func (v *Volume) CloseOpen(id Capability) error {
 		return ErrStaleOpen
 	}
 	delete(v.opens, id)
-	return f.res.release()
+	result := f.res.release()
+	v.releaseFsyncState(f.fsyncState)
+	return result
 }
 
 // ReadAt reports (0, nil) for an empty destination. io.EOF is reserved for a
@@ -920,49 +1170,659 @@ func (v *Volume) WriteAt(id Capability, src []byte, off int64) (int, error) {
 	if !f.write {
 		return 0, syscall.EBADF
 	}
-	if f.append {
+	if int64(len(src)) > int64(^uint64(0)>>1)-off {
 		return 0, fs.ErrInvalid
 	}
-	return unix.Pwrite(f.fd(), src, off)
+	end := off + int64(len(src))
+	mutation := v.inodeMutationLock(f.coordinate.Stable)
+	// Writes wholly inside the current extent cannot change EOF, so they may
+	// remain parallel with each other. Keep the read lock through pwrite: a
+	// concurrent truncate must not turn an in-place write into an extension
+	// after this check.
+	mutation.RLock()
+	var current unix.Stat_t
+	if err := unix.Fstat(f.fd(), &current); err != nil {
+		mutation.RUnlock()
+		return 0, err
+	}
+	if end <= current.Size {
+		n, err := unix.Pwrite(f.fd(), src, off)
+		mutation.RUnlock()
+		if n > 0 {
+			f.fsyncState.applied()
+		}
+		return n, err
+	}
+	mutation.RUnlock()
+
+	// A positional extension shares the writer side with append validation,
+	// truncate and O_TRUNC. The fixed offset itself never needs revalidation;
+	// taking the writer lock is solely what makes its possible EOF change
+	// indivisible with those operations.
+	mutation.Lock()
+	defer mutation.Unlock()
+	n, err := unix.Pwrite(f.fd(), src, off)
+	if n > 0 {
+		f.fsyncState.applied()
+	}
+	return n, err
 }
 
-// Append uses a retained O_APPEND file description and returns the offset XFS
-// assigned to this write. The handle mutex keeps the following SEEK_CUR paired
-// with its write even when one remote handle is used concurrently.
-func (v *Volume) Append(id Capability, src []byte) (count int, assignedOffset int64, err error) {
+// PinWriteTarget transfers one in-flight reference out of the handle table.
+// The returned target remains valid after CloseOpen removes the capability.
+func (v *Volume) PinWriteTarget(id Capability) (WriteTarget, error) {
 	f, err := v.holdOpen(id)
 	if err != nil {
-		return 0, 0, err
+		return nil, err
+	}
+	if !f.write || f.kind != KindRegular {
+		f.release()
+		return nil, syscall.EBADF
+	}
+	if err := f.fsyncState.inspectWritePrivileges(f.fd(), v.inspectSecurityCapability); err != nil {
+		f.release()
+		return nil, err
+	}
+	return &writeTarget{
+		volume: v, res: f.res, coordinate: f.coordinate,
+		fsyncState: f.fsyncState,
+	}, nil
+}
+
+func (v *Volume) syncDescriptor(fd int, full, dataOnly bool) error {
+	if full {
+		return v.fsync(fd)
+	}
+	if dataOnly {
+		return v.fdatasync(fd)
+	}
+	return nil
+}
+
+type writeTargetApply func(limit, assigned uint64) (committed uint64, dispatched, invalidResult bool, err error)
+
+func (t *writeTarget) CommitWrite(staged io.ReaderAt, spec WriteCommit, scratch []byte) (uint64, uint64, Attr, error) {
+	if staged == nil || spec.Mode == WriteAppend && len(scratch) == 0 {
+		return 0, 0, Attr{}, fs.ErrInvalid
+	}
+	return t.commitWrite(spec, func(limit, assigned uint64) (uint64, bool, bool, error) {
+		if spec.Mode == WritePositioned {
+			stageFD, ok := staged.(interface{ Fd() uintptr })
+			if !ok || stageFD.Fd() > uintptr(math.MaxInt) {
+				return 0, false, false, fs.ErrInvalid
+			}
+			var stageStat unix.Stat_t
+			if err := unix.Fstat(int(stageFD.Fd()), &stageStat); err != nil {
+				return 0, false, false, err
+			}
+			if stageStat.Mode&unix.S_IFMT != unix.S_IFREG || stageStat.Size < int64(limit) {
+				return 0, false, false, io.ErrUnexpectedEOF
+			}
+			// sendfile has no output-offset argument. The inode mutation lock
+			// excludes every PortableFS size-changing operation while this cursor
+			// is installed and consumed.
+			if _, err := unix.Seek(t.res.fd, int64(assigned), io.SeekStart); err != nil {
+				return 0, false, false, err
+			}
+			inputOffset := int64(0)
+			n, copyErr := t.volume.sendfile(t.res.fd, int(stageFD.Fd()), &inputOffset, int(limit))
+			invalid := false
+			if n < 0 {
+				if n == -1 && copyErr != nil {
+					n = 0
+				} else {
+					invalid = true
+					n = 0
+				}
+			}
+			if uint64(n) > limit || inputOffset != int64(n) {
+				invalid = true
+			}
+			committed := uint64(n)
+			if invalid {
+				return committed, true, true, syscall.EIO
+			}
+			if copyErr == nil && committed != limit {
+				copyErr = io.ErrShortWrite
+			}
+			return committed, true, false, copyErr
+		}
+
+		var committed uint64
+		for committed < limit {
+			chunk := uint64(len(scratch))
+			if remaining := limit - committed; chunk > remaining {
+				chunk = remaining
+			}
+			buf := scratch[:int(chunk)]
+			n, readErr := staged.ReadAt(buf, int64(committed))
+			if n != len(buf) || readErr != nil && !errors.Is(readErr, io.EOF) {
+				if committed != 0 {
+					return committed, true, false, outcomeUncertain(firstError(readErr, io.ErrUnexpectedEOF))
+				}
+				return 0, false, false, firstError(readErr, io.ErrUnexpectedEOF)
+			}
+			written, writeErr := t.volume.pwritev2(t.res.fd, [][]byte{buf}, 0, unix.RWF_APPEND)
+			if written > 0 {
+				committed += uint64(written)
+			}
+			if writeErr != nil || written != len(buf) {
+				if writeErr == nil {
+					writeErr = io.ErrShortWrite
+				}
+				return committed, true, false, writeErr
+			}
+		}
+		return committed, true, false, nil
+	})
+}
+
+// CommitWriteData applies a complete one-frame write directly from the
+// retained authority frame. It never creates a staging file and dispatches
+// exactly one data syscall to XFS.
+func (t *writeTarget) CommitWriteData(data []byte, spec WriteCommit) (uint64, uint64, Attr, error) {
+	if uint64(len(data)) != spec.RequestedSize || len(data) == 0 {
+		return 0, 0, Attr{}, fs.ErrInvalid
+	}
+	return t.commitWrite(spec, func(limit, assigned uint64) (uint64, bool, bool, error) {
+		payload := data[:int(limit)]
+		var n int
+		var err error
+		if spec.Mode == WriteAppend {
+			n, err = t.volume.pwritev2(t.res.fd, [][]byte{payload}, 0, unix.RWF_APPEND)
+		} else {
+			n, err = t.volume.pwrite(t.res.fd, payload, int64(assigned))
+		}
+		invalid := false
+		if n < 0 {
+			if n == -1 && err != nil {
+				n = 0
+			} else {
+				invalid = true
+				n = 0
+			}
+		}
+		if uint64(n) > limit {
+			invalid = true
+		}
+		if invalid {
+			return uint64(n), true, true, syscall.EIO
+		}
+		if err == nil && n != len(payload) {
+			err = io.ErrShortWrite
+		}
+		return uint64(n), true, false, err
+	})
+}
+
+func (t *writeTarget) commitWrite(spec WriteCommit, apply writeTargetApply) (uint64, uint64, Attr, error) {
+	if t == nil {
+		return 0, 0, Attr{}, fs.ErrInvalid
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.volume == nil || t.res == nil || t.closed || apply == nil || spec.RequestedSize == 0 ||
+		spec.RequestedSize > math.MaxInt64 || spec.Position > math.MaxInt64 ||
+		spec.FileMaxSize > math.MaxInt64 || spec.FileMaxSize == 0 ||
+		(spec.Mode != WritePositioned && spec.Mode != WriteAppend) || spec.Mode == WriteAppend && spec.Position != 0 {
+		return 0, 0, Attr{}, fs.ErrInvalid
+	}
+	if err := t.volume.Health(); err != nil {
+		return 0, 0, Attr{}, err
+	}
+	before, err := statFD(t.res.fd)
+	if err != nil {
+		return 0, 0, Attr{}, err
+	}
+	if before.Kind != KindRegular || before.Size < 0 {
+		return 0, 0, Attr{}, syscall.EIO
+	}
+	assigned := spec.Position
+	if spec.Mode == WriteAppend {
+		assigned = uint64(before.Size)
+	}
+	finiteRLimit := spec.RLimitSize != math.MaxUint64
+	if finiteRLimit && assigned >= spec.RLimitSize {
+		return 0, assigned, Attr{}, &WriteLimitError{RLimit: true}
+	}
+	if assigned >= spec.FileMaxSize {
+		return 0, assigned, Attr{}, &WriteLimitError{}
+	}
+	limit := spec.RequestedSize
+	limitedByRLimit := false
+	if finiteRLimit {
+		available := spec.RLimitSize - assigned
+		if limit > available {
+			limit = available
+			limitedByRLimit = true
+		}
+	}
+	if available := spec.FileMaxSize - assigned; limit > available {
+		limit = available
+		limitedByRLimit = false
+	}
+	committed, dispatched, invalidCopyResult, applyErr := apply(limit, assigned)
+	var postApplyErr error
+	if !dispatched && applyErr != nil {
+		return 0, assigned, Attr{}, applyErr
+	}
+	if committed > limit {
+		invalidCopyResult = true
+		committed = limit
+		applyErr = syscall.EIO
+	}
+	expectedPost := uint64(before.Size)
+	if end := assigned + committed; end > expectedPost {
+		expectedPost = end
+	}
+	if dispatched {
+		t.fsyncState.applied()
+		if err := t.fsyncState.removeWritePrivileges(t.res.fd, uint32(before.Mode), spec.KillPrivileges, t.volume.removePinnedWritePrivileges); err != nil {
+			postApplyErr = err
+		}
+	}
+	if committed != 0 {
+		syncErr := t.volume.syncDescriptor(t.res.fd, spec.Sync, spec.DataSync)
+		postApplyErr = errors.Join(postApplyErr, syncErr)
+	}
+	post, statErr := t.volume.postStat(t.res.fd)
+	if statErr != nil {
+		if dispatched {
+			return committed, assigned, Attr{}, outcomeUncertain(statErr)
+		}
+		return 0, assigned, Attr{}, statErr
+	}
+	if post.Size < 0 || uint64(post.Size) != expectedPost {
+		return committed, assigned, post, outcomeUncertain(syscall.EIO)
+	}
+	if invalidCopyResult {
+		return committed, assigned, post, outcomeUncertain(syscall.EIO)
+	}
+	if committed == 0 && dispatched {
+		// XFS runs file_modified/kiocb_modified before data I/O. A zero-byte
+		// syscall error can therefore have changed timestamps, privilege bits,
+		// or security.capability even when EOF and every data byte are intact.
+		// Conservatively publish the exact post-state for every dispatched zero
+		// result; only validation/staging failures before dispatch are definite
+		// no-change rejections.
+		cause := errors.Join(applyErr, postApplyErr)
+		if cause == nil {
+			cause = syscall.EIO
+		}
+		return 0, assigned, post, fmt.Errorf("%w: %w", ErrWritePostApply, cause)
+	}
+	if committed != 0 && postApplyErr != nil {
+		return committed, assigned, post, fmt.Errorf("%w: %w", ErrWritePostApply, postApplyErr)
+	}
+	if committed < spec.RequestedSize {
+		if applyErr != nil {
+			return committed, assigned, post, applyErr
+		}
+		return committed, assigned, post, &WriteLimitError{RLimit: limitedByRLimit}
+	}
+	return committed, assigned, post, nil
+}
+
+func validFallocateMode(mode uint32) bool {
+	switch mode {
+	case 0,
+		uint32(unix.FALLOC_FL_KEEP_SIZE),
+		uint32(unix.FALLOC_FL_PUNCH_HOLE | unix.FALLOC_FL_KEEP_SIZE),
+		uint32(unix.FALLOC_FL_ZERO_RANGE),
+		uint32(unix.FALLOC_FL_ZERO_RANGE | unix.FALLOC_FL_KEEP_SIZE),
+		uint32(unix.FALLOC_FL_COLLAPSE_RANGE),
+		uint32(unix.FALLOC_FL_INSERT_RANGE),
+		uint32(unix.FALLOC_FL_UNSHARE_RANGE),
+		uint32(unix.FALLOC_FL_UNSHARE_RANGE | unix.FALLOC_FL_KEEP_SIZE):
+		return true
+	default:
+		return false
+	}
+}
+
+func fallocateNeedsAlignment(mode uint32) bool {
+	return mode == uint32(unix.FALLOC_FL_COLLAPSE_RANGE) || mode == uint32(unix.FALLOC_FL_INSERT_RANGE)
+}
+
+// fallocateExpectedSize performs every authoritative-EOF-dependent check in
+// the same order as Linux XFS after alignment has been proven.
+// Universal offset+length/s_maxbytes validation happens before this helper.
+func fallocateExpectedSize(before uint64, spec FallocateSpec) (uint64, error) {
+	end := spec.Offset + spec.Length
+	switch spec.Mode {
+	case uint32(unix.FALLOC_FL_COLLAPSE_RANGE):
+		if end >= before {
+			return 0, syscall.EINVAL
+		}
+		return before - spec.Length, nil
+	case uint32(unix.FALLOC_FL_INSERT_RANGE):
+		// XFS tests the resulting EOF against s_maxbytes before offset<EOF.
+		if before > spec.FileMaxSize-spec.Length {
+			return 0, &WriteLimitError{}
+		}
+		expected := before + spec.Length
+		if spec.Offset >= before {
+			return 0, syscall.EINVAL
+		}
+		if spec.RLimitSize != math.MaxUint64 && expected > spec.RLimitSize {
+			return 0, &WriteLimitError{RLimit: true}
+		}
+		return expected, nil
+	}
+
+	expected := before
+	if spec.Mode&uint32(unix.FALLOC_FL_KEEP_SIZE) == 0 && end > expected {
+		expected = end
+	}
+	if spec.RLimitSize != math.MaxUint64 && expected > before && expected > spec.RLimitSize {
+		return 0, &WriteLimitError{RLimit: true}
+	}
+	return expected, nil
+}
+
+// Fallocate applies one range mutation while excluding every alias that can
+// change the same inode's data or EOF. XFS may commit internal allocation,
+// unmap, or zeroing transactions before a later step returns an error. Once the
+// syscall is dispatched, its outcome is therefore always published from an
+// exact post-stat; only validation and limit checks before dispatch are definite
+// no-change refusals.
+func (v *Volume) Fallocate(id Capability, spec FallocateSpec) (Attr, error) {
+	if spec.Length == 0 || spec.Offset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.Offset ||
+		spec.FileMaxSize == 0 || spec.FileMaxSize > math.MaxInt64 || !validFallocateMode(spec.Mode) {
+		return Attr{}, fs.ErrInvalid
+	}
+	end := spec.Offset + spec.Length
+	if end > spec.FileMaxSize {
+		return Attr{}, &WriteLimitError{}
+	}
+	f, err := v.holdOpen(id)
+	if err != nil {
+		return Attr{}, err
 	}
 	defer f.release()
-	if !f.write {
-		return 0, 0, syscall.EBADF
+	if !f.write || f.kind != KindRegular {
+		return Attr{}, syscall.EBADF
 	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !f.append {
-		return 0, 0, fs.ErrInvalid
+	if err := v.Health(); err != nil {
+		return Attr{}, err
 	}
-	if len(src) == 0 {
-		// A zero-length write is defined to change nothing, and Linux returns
-		// from it before O_APPEND repositions the description, so SEEK_CUR
-		// would report a stale offset. The offset this write was assigned is
-		// the current end of the file.
-		var st unix.Stat_t
-		if err := unix.Fstat(f.fd(), &st); err != nil {
-			return 0, 0, err
+	before, err := statFD(f.fd())
+	if err != nil {
+		return Attr{}, err
+	}
+	if before.Kind != KindRegular || before.Size < 0 {
+		return Attr{}, syscall.EIO
+	}
+	if fallocateNeedsAlignment(spec.Mode) {
+		unit, unitErr := v.fallocateAllocationUnit(f.fd())
+		if unitErr != nil {
+			// Both geometry queries are read-only and run before the backend
+			// fallocate dispatch. Their failure proves that no filesystem state
+			// was changed, so it is a definite refusal rather than an uncertain
+			// post-apply outcome.
+			return Attr{}, unitErr
 		}
-		return 0, st.Size, nil
+		if spec.Offset%unit != 0 || spec.Length%unit != 0 {
+			return Attr{}, syscall.EINVAL
+		}
 	}
-	n, err := unix.Write(f.fd(), src)
-	if n <= 0 {
-		return 0, 0, err
+	expectedSize, err := fallocateExpectedSize(uint64(before.Size), spec)
+	if err != nil {
+		var limit *WriteLimitError
+		if errors.As(err, &limit) && limit.RLimit {
+			// The caller needs this authoritative pre-size to prove an INSERT
+			// RLIMIT rejection and deliver SIGXFSZ exactly once.
+			return before, err
+		}
+		return Attr{}, err
 	}
-	end, seekErr := unix.Seek(f.fd(), 0, io.SeekCurrent)
-	if seekErr != nil {
-		return n, 0, seekErr
+	applyErr := v.fallocate(f.fd(), spec.Mode, int64(spec.Offset), int64(spec.Length))
+	privilegeErr := v.removeWritePrivileges(f.fd(), uint32(before.Mode), spec.KillPrivileges)
+	var syncErr error
+	if applyErr == nil {
+		syncErr = v.syncDescriptor(f.fd(), f.sync, f.dataSync)
 	}
-	return n, end - int64(n), err
+	post, statErr := v.postStat(f.fd())
+	if statErr != nil {
+		return Attr{}, outcomeUncertain(statErr)
+	}
+	if post.Kind != KindRegular || post.Size < 0 {
+		return post, outcomeUncertain(syscall.EIO)
+	}
+	if applyErr != nil || privilegeErr != nil || syncErr != nil {
+		return post, fmt.Errorf("%w: %w", ErrWritePostApply, errors.Join(applyErr, privilegeErr, syncErr))
+	}
+	if uint64(post.Size) != expectedSize {
+		return post, outcomeUncertain(syscall.EIO)
+	}
+	return post, nil
+}
+
+// CopyFileRange performs one server-side copy without a userspace splice or
+// payload round trip. Its authority caller owns the canonical LockMutation set
+// for both resolved identities through this syscall and both post-state
+// samples, so the complete record belongs to one authority ordering interval.
+func (v *Volume) CopyFileRange(input, output Capability, spec CopyFileRangeSpec) (uint64, Attr, error) {
+	if spec.Length == 0 || spec.InputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.InputOffset ||
+		spec.OutputOffset > math.MaxInt64 || spec.Length > math.MaxInt64-spec.OutputOffset ||
+		spec.FileMaxSize == 0 || spec.FileMaxSize > math.MaxInt64 {
+		return 0, Attr{}, fs.ErrInvalid
+	}
+	source, err := v.holdOpen(input)
+	if err != nil {
+		return 0, Attr{}, err
+	}
+	defer source.release()
+	destination, err := v.holdOpen(output)
+	if err != nil {
+		return 0, Attr{}, err
+	}
+	defer destination.release()
+	if !source.read || !destination.write || source.kind != KindRegular || destination.kind != KindRegular {
+		return 0, Attr{}, syscall.EBADF
+	}
+	if err := v.Health(); err != nil {
+		return 0, Attr{}, err
+	}
+	beforeSource, err := statFD(source.fd())
+	if err != nil {
+		return 0, Attr{}, err
+	}
+	beforeDestination, err := statFD(destination.fd())
+	if err != nil {
+		return 0, Attr{}, err
+	}
+	if beforeSource.Kind != KindRegular || beforeDestination.Kind != KindRegular ||
+		beforeSource.Size < 0 || beforeDestination.Size < 0 {
+		return 0, Attr{}, syscall.EIO
+	}
+	limit := spec.Length
+	if sourceSize := uint64(beforeSource.Size); spec.InputOffset >= sourceSize {
+		limit = 0
+	} else if available := sourceSize - spec.InputOffset; limit > available {
+		limit = available
+	}
+	// Linux detects same-inode overlap only after clipping the source range to
+	// its authoritative EOF. The kernel cannot perform this check from a stale
+	// peer inode size; doing it here avoids rejecting a request whose only
+	// overlap lies in the beyond-EOF tail.
+	if source.coordinate.Stable == destination.coordinate.Stable {
+		inputEnd := spec.InputOffset + limit
+		outputEnd := spec.OutputOffset + limit
+		if spec.InputOffset < outputEnd && spec.OutputOffset < inputEnd {
+			return 0, Attr{}, syscall.EINVAL
+		}
+	}
+	// Linux generic_write_check_limits constrains the output position itself,
+	// including overwrites below an already-larger EOF. Never raise a finite
+	// caller RLIMIT to the destination's current size: doing so would let a
+	// remote copy write past the caller's process limit without SIGXFSZ.
+	// generic_write_check_limits checks RLIMIT_FSIZE before the filesystem
+	// maximum, even when source-EOF clipping produced a zero-length copy.
+	// Preserve that precedence so the kernel can deliver SIGXFSZ exactly once.
+	if spec.RLimitSize != math.MaxUint64 {
+		if spec.OutputOffset >= spec.RLimitSize {
+			return 0, Attr{}, &WriteLimitError{RLimit: true}
+		}
+		if available := spec.RLimitSize - spec.OutputOffset; limit > available {
+			limit = available
+		}
+	}
+	if spec.OutputOffset >= spec.FileMaxSize {
+		return 0, Attr{}, &WriteLimitError{}
+	}
+	if available := spec.FileMaxSize - spec.OutputOffset; limit > available {
+		limit = available
+	}
+	if limit == 0 {
+		return 0, Attr{}, nil
+	}
+	inputOffset, outputOffset := int64(spec.InputOffset), int64(spec.OutputOffset)
+	n, copyErr := v.copyFileRange(source.fd(), &inputOffset, destination.fd(), &outputOffset, int(limit), 0)
+	// x/sys exposes the raw Linux failure return as n == -1 alongside errno.
+	// Canonicalize that ordinary zero-progress error before converting to the
+	// unsigned protocol count. Every other negative/oversized result, or an
+	// offset update that disagrees with the positive count, is an impossible
+	// syscall outcome; capture exact post-state below, then fence it.
+	invalidResult := false
+	if n < 0 {
+		if copyErr != nil && n == -1 {
+			n = 0
+		} else {
+			invalidResult = true
+			n = 0
+		}
+	}
+	if uint64(n) > limit || inputOffset != int64(spec.InputOffset)+int64(n) || outputOffset != int64(spec.OutputOffset)+int64(n) {
+		invalidResult = true
+	}
+	committed := uint64(n)
+	if committed != 0 {
+		// Linux cannot return a positive count and an errno from one syscall.
+		// Preserve the positive prefix if a test seam or wrapper supplies both:
+		// it is the observable result and must still receive logical sync.
+		copyErr = nil
+	}
+	expectedSize := uint64(beforeDestination.Size)
+	if end := spec.OutputOffset + committed; end > expectedSize {
+		expectedSize = end
+	}
+	var postApplyErr error
+	if err := v.removeWritePrivileges(destination.fd(), uint32(beforeDestination.Mode), spec.KillPrivileges); err != nil {
+		postApplyErr = err
+	}
+	if copyErr == nil && !invalidResult {
+		postApplyErr = errors.Join(postApplyErr,
+			v.syncDescriptor(destination.fd(), source.sync || destination.sync, source.dataSync || destination.dataSync))
+	}
+	post, statErr := v.postStat(destination.fd())
+	if statErr != nil {
+		return committed, Attr{}, outcomeUncertain(statErr)
+	}
+	if post.Kind != KindRegular || post.Size < 0 || uint64(post.Size) != expectedSize {
+		return committed, post, outcomeUncertain(syscall.EIO)
+	}
+	if invalidResult {
+		return committed, post, outcomeUncertain(syscall.EIO)
+	}
+	if committed == 0 {
+		// copy_file_range reaches file_modified on the destination before the
+		// extent operation. As with WRITE, a zero data result is not proof of a
+		// no-change outcome once the backend syscall was dispatched.
+		cause := errors.Join(copyErr, postApplyErr)
+		if cause == nil {
+			cause = syscall.EIO
+		}
+		return 0, post, fmt.Errorf("%w: %w", ErrWritePostApply, cause)
+	}
+	if postApplyErr != nil {
+		return committed, post, fmt.Errorf("%w: %w", ErrWritePostApply, postApplyErr)
+	}
+	// A positive copy result is the complete Linux result even if the syscall
+	// also supplied an errno; retrying would duplicate the applied prefix.
+	_ = copyErr
+	return committed, post, nil
+}
+
+// removeWritePrivileges implements HANDLE_KILLPRIV_V2 on the authoritative
+// inode while the same stable-identity writer stripe still excludes every
+// alias, truncate, and extending write. Linux delegates capability removal on
+// every modification; WRITE_KILL_SUIDGID additionally requests the caller-
+// privilege-dependent mode-bit removal. SGID without group execute is the
+// mandatory-locking form and is deliberately retained, matching
+// setattr_should_drop_suidgid.
+func inspectSecurityCapability(fd int) (bool, error) {
+	// An unprivileged authority is intentionally able to own and mutate the
+	// volume without CAP_SETFCAP. Linux checks permission before existence for
+	// fremovexattr("security.capability"), so blindly removing an absent xattr
+	// returns EPERM and would terminal-fence every ordinary write.
+	if _, err := unix.Fgetxattr(fd, "security.capability", nil); err != nil {
+		if !errors.Is(err, unix.ENODATA) {
+			return false, fmt.Errorf("%w: inspect security.capability: %w", ErrWritePrivilege, err)
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func removeWritePrivileges(fd int, beforeMode uint32, killSUIDGID bool) error {
+	present, err := inspectSecurityCapability(fd)
+	if err != nil {
+		return err
+	}
+	return removeWritePrivilegesWithCapability(fd, beforeMode, killSUIDGID, &present)
+}
+
+func removeWritePrivilegesWithCapability(fd int, beforeMode uint32, killSUIDGID bool, securityCapability *bool) error {
+	if securityCapability == nil {
+		return fs.ErrInvalid
+	}
+	if *securityCapability {
+		if err := unix.Fremovexattr(fd, "security.capability"); err != nil && !errors.Is(err, unix.ENODATA) {
+			return fmt.Errorf("%w: remove security.capability: %w", ErrWritePrivilege, err)
+		}
+		*securityCapability = false
+	}
+	if !killSUIDGID {
+		return nil
+	}
+	want := beforeMode &^ uint32(unix.S_ISUID)
+	if beforeMode&uint32(unix.S_IXGRP) != 0 {
+		want &^= uint32(unix.S_ISGID)
+	}
+	if want == beforeMode {
+		return nil
+	}
+	if err := unix.Fchmod(fd, want&0o7777); err != nil {
+		return fmt.Errorf("%w: clear set-id mode: %w", ErrWritePrivilege, err)
+	}
+	return nil
+}
+
+func firstError(err, fallback error) error {
+	if err != nil {
+		return err
+	}
+	return fallback
+}
+
+func qualifyAtomicAppend(rootFD int) error {
+	fd, err := unix.Openat(rootFD, ".", unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if _, err := unix.Write(fd, []byte{'a'}); err != nil {
+		return err
+	}
+	if n, err := unix.Pwritev2(fd, [][]byte{{'b'}}, 0, unix.RWF_APPEND); err != nil || n != 1 {
+		return firstError(err, io.ErrShortWrite)
+	}
+	var got [2]byte
+	if n, err := unix.Pread(fd, got[:], 0); err != nil || n != len(got) || got != [2]byte{'a', 'b'} {
+		return firstError(err, syscall.EIO)
+	}
+	return nil
 }
 
 func (v *Volume) Truncate(id Capability, size int64) error {
@@ -979,19 +1839,27 @@ func (v *Volume) Truncate(id Capability, size int64) error {
 	if !f.write {
 		return fs.ErrInvalid
 	}
+	mutation := v.inodeMutationLock(f.coordinate.Stable)
+	mutation.Lock()
+	defer mutation.Unlock()
 	return unix.Ftruncate(f.fd(), size)
 }
 
 func (v *Volume) Fsync(id Capability, dataOnly bool) error {
+	_, err := v.FsyncCoalesced(id, dataOnly)
+	return err
+}
+
+// FsyncCoalesced returns the number of barrier requests served by the real
+// storage sync when this caller led a batch. Followers return zero. Every call
+// still waits for a completed sync whose generation and class cover it.
+func (v *Volume) FsyncCoalesced(id Capability, dataOnly bool) (int, error) {
 	f, err := v.holdOpen(id)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.release()
-	if dataOnly {
-		return unix.Fdatasync(f.fd())
-	}
-	return unix.Fsync(f.fd())
+	return f.fsyncState.barrier(f.fd(), dataOnly, v.fsync, v.fdatasync)
 }
 
 func (v *Volume) GetattrOpen(id Capability) (Attr, error) {
@@ -1139,8 +2007,8 @@ func (v *Volume) ReadDirOpen(id Capability, cookie uint64, verifier [16]byte, ma
 	if opened.kind != KindDirectory {
 		return nil, 0, current, false, parent, syscall.ENOTDIR
 	}
-	opened.mu.Lock()
-	defer opened.mu.Unlock()
+	opened.cursorMu.Lock()
+	defer opened.cursorMu.Unlock()
 
 	attr, err := statFD(opened.fd())
 	if err != nil {

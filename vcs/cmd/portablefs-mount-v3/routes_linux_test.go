@@ -52,16 +52,17 @@ const (
 )
 
 type attachFixture struct {
-	t          *testing.T
-	address    string
-	clientTLS  *tls.Config
-	capability []byte
-	routes     *authorityrpc.RoutesController
-	attaches   *attachCounter
-	stop       context.CancelFunc
-	served     chan error
-	listener   net.Listener
-	store      *xfsstore.Volume
+	t              *testing.T
+	address        string
+	clientTLS      *tls.Config
+	capability     []byte
+	routes         *authorityrpc.RoutesController
+	attaches       *attachCounter
+	stop           context.CancelFunc
+	served         chan error
+	listener       net.Listener
+	store          *xfsstore.Volume
+	writeAdmission *authorityrpc.WriteAdmission
 }
 
 // attachCounter records every attach the authority was asked to perform and how
@@ -77,6 +78,12 @@ type attachCounter struct {
 
 func (c *attachCounter) Epoch() []byte                        { return c.inner.Epoch() }
 func (c *attachCounter) Bounds() authorityrpc.TransportBounds { return c.inner.Bounds() }
+func (c *attachCounter) SessionStateForTransport(id volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	return c.inner.SessionStateForTransport(id)
+}
+func (c *attachCounter) SessionTerminalForTransport(id volumeserver.SessionID) (<-chan struct{}, bool) {
+	return c.inner.SessionTerminalForTransport(id)
+}
 
 func (c *attachCounter) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
 	attach := request.GetAttach() != nil
@@ -127,6 +134,23 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		t.Fatalf("open XFS volume: %v", err)
 	}
 	f.store = store
+	writeAdmissionRoot := volumeRoot + ".write-admission"
+	if err := os.Mkdir(writeAdmissionRoot, 0o700); err != nil {
+		t.Fatalf("create write admission root: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(writeAdmissionRoot) })
+	f.writeAdmission, err = authorityrpc.OpenWriteAdmission(writeAdmissionRoot)
+	if err != nil {
+		t.Fatalf("open write admission root: %v", err)
+	}
+	t.Cleanup(func() {
+		if f.writeAdmission != nil {
+			if err := f.writeAdmission.Close(); err != nil {
+				t.Errorf("close write admission: %v", err)
+			}
+			f.writeAdmission = nil
+		}
+	})
 
 	authority, err := volumeserver.New(attachVolumeID, volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 64, MaxSessions: 8, MaxLockRecords: 1024,
@@ -134,20 +158,16 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	if err != nil {
 		t.Fatalf("create authority epoch: %v", err)
 	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: noMembership{}, Fencer: authority,
-		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute, MaxClockSkew: time.Minute,
+	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
+		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: noMembership{},
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
+		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
+		CacheLeaseTTL: volumeserver.Protocol6MaxLeaseTTL, MaxCacheLeasesPerSession: 65536, MaxCacheLeases: 1 << 20,
 	})
 	if err != nil {
-		t.Fatalf("create visibility coordinator: %v", err)
+		t.Fatalf("assemble authority coordination: %v", err)
 	}
-	routes, err := authorityrpc.NewRoutesController(store, visibility)
-	if err != nil {
-		t.Fatalf("create routing controller: %v", err)
-	}
-	if err := routes.Load(); err != nil {
-		t.Fatalf("load routing: %v", err)
-	}
+	routes := coordination.Routes
 	active, err := routes.Revision()
 	if err != nil {
 		t.Fatalf("read active routing revision: %v", err)
@@ -177,14 +197,23 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 	f.capability = token
 
 	handler := &authorityrpc.VolumeHandler{
-		Store: store, Runtime: authority, Visibility: visibility, Routes: routes,
+		Store: store, Runtime: authority,
 		Authorizer: &volumecap.Authorizer{
 			PublicKey: public, MaxLifetime: 15 * time.Minute, MaxRetainedNonces: 64,
 		},
 		MaxFrame: 4 << 20, MaxRead: 1 << 20, MaxWrite: 1 << 20, MaxInFlight: 64,
 		MaxItemsPerSession: 1024, MaxOpensPerSession: 1024, MaxItems: 4096, MaxOpens: 4096,
-		MaxRetainedReplyBytes: 32 << 20,
+		MaxRetainedReplyBytes:         32 << 20,
+		WriteAdmission:                f.writeAdmission,
+		MaxWriteBytesPerSession:       16 << 30,
+		MaxWriteBytesInFlight:         64 << 30,
+		MaxWritesPerSession:           8,
+		MaxWrites:                     64,
+		WriteAdmissionProgressTimeout: 2 * time.Minute,
+		WriteAbsoluteTimeout:          30 * time.Minute,
+		TerminalDeliveryTimeout:       45 * time.Second,
 	}
+	coordination.Bind(handler)
 	f.attaches = &attachCounter{inner: handler}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -221,12 +250,18 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 // mount: no flags, no environment, one capability.
 func (f *attachFixture) attachConfig() authorityrpc.ClientConfig {
 	return authorityrpc.ClientConfig{
-		Address: f.address, TLS: f.clientTLS.Clone(), VolumeID: attachVolumeID,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         f.address, TLS: f.clientTLS.Clone(), VolumeID: attachVolumeID,
 		AccessToken: f.capability, ReplaySlots: 64, MaxFrame: 4 << 20,
 		DialTimeout: 10 * time.Second, CancelDrainTimeout: 5 * time.Second, MaxInFlight: 64,
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 4096, RepairBudget: 15 * time.Second,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+			return &authoritypb.MountAbsenceProof{
+				ObservedUnixNanos: time.Now().UnixNano(),
+				Observation:       []byte("test exact unique FUSE source present=false before mount"),
+				Component:         "portablefs-mount-v3-test/mount-inventory",
+			}, nil
+		},
 	}
 }
 
@@ -244,6 +279,15 @@ func randomSuffix(t *testing.T) string {
 	return hex.EncodeToString(value[:])
 }
 
+func releaseTestClientBeforeMount(t *testing.T, client *authorityrpc.Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := client.ReleaseBeforeMount(ctx); err != nil {
+		t.Errorf("release ACTIVE test session before mount: %v", err)
+	}
+}
+
 // --- a volume with no declaration: one attach, no retry ---
 
 func TestADefaultMountAttachesOnceOnAVolumeWithNoRoutes(t *testing.T) {
@@ -252,7 +296,7 @@ func TestADefaultMountAttachesOnceOnAVolumeWithNoRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("default mount could not attach to a volume with no routing declaration: %v", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer releaseTestClientBeforeMount(t, client)
 	if !rules.Empty() {
 		t.Fatalf("a volume with no declaration produced rules %v", rules.Patterns())
 	}
@@ -273,7 +317,7 @@ func TestADefaultMountAdoptsTheVolumesRoutesOnOneCapability(t *testing.T) {
 		t.Fatalf("default mount could not attach to a volume that declares routes: %v\n"+
 			"if this is EPERM, the capability was spent by the refused attach and the authority half of the fix has not landed", err)
 	}
-	defer func() { _ = client.Close() }()
+	defer releaseTestClientBeforeMount(t, client)
 
 	expected, err := localroutes.Parse([]byte(declaration))
 	if err != nil {
@@ -314,7 +358,7 @@ func TestARoutingRefusalDoesNotSpendTheCapability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the capability was spent by a refusal it was never accepted for: %v", err)
 	}
-	_ = client.Close()
+	releaseTestClientBeforeMount(t, client)
 }
 
 func TestARoutingRefusalCarriesTheVolumesDeclaration(t *testing.T) {
@@ -359,7 +403,7 @@ func TestNoLocalDirsRefusesAVolumeThatDeclaresRoutes(t *testing.T) {
 	f := newAttachFixture(t, "node_modules/\n")
 	client, _, err := attachWithRoutes(context.Background(), f.attachConfig(), false)
 	if err == nil {
-		_ = client.Close()
+		releaseTestClientBeforeMount(t, client)
 		t.Fatal("-no-local-dirs mounted a volume that routes node_modules; the subtree would have been served from shared storage on this machine and machine-local on every other")
 	}
 	if !strings.Contains(err.Error(), localroutes.ConfigPath) {

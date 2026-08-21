@@ -13,7 +13,7 @@ let package = Package(
         .library(name: "PortableFSAppCore", targets: ["PortableFSAppCore"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.29.0")
+        .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.38.1")
     ],
     targets: [
         .target(
@@ -32,6 +32,9 @@ let package = Package(
             name: "PortableFSAppCore",
             dependencies: [
                 "PortableFSKit"
+            ],
+            linkerSettings: [
+                .linkedLibrary("bsm", .when(platforms: [.macOS]))
             ]
         ),
         .testTarget(

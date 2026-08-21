@@ -36,26 +36,27 @@ type stateV1 struct {
 }
 
 type assignmentV1 struct {
-	VolumeID            string               `json:"volume_id"`
-	AuthorizationDomain string               `json:"authorization_domain"`
-	Owner               string               `json:"owner"`
-	ProductIssuer       string               `json:"product_issuer"`
-	ProductPublicKeyPEM string               `json:"product_public_key_pem"`
-	CellID              string               `json:"cell_id"`
-	ProjectID           uint32               `json:"project_id"`
-	ServiceUID          uint32               `json:"service_uid"`
-	ServiceGID          uint32               `json:"service_gid"`
-	ListenPort          uint16               `json:"listen_port"`
-	QuotaBytes          uint64               `json:"quota_bytes"`
-	QuotaInodes         uint64               `json:"quota_inodes"`
-	AuthorityID         string               `json:"authority_id"`
-	AuthorityServerName string               `json:"authority_server_name"`
-	AuthorityGeneration uint64               `json:"authority_generation"`
-	LastPhase           cellplan.VolumePhase `json:"last_phase"`
-	AuthorityAbsent     bool                 `json:"authority_absent"`
-	QuotaApplied        bool                 `json:"quota_applied"`
-	Applied             bool                 `json:"applied"`
-	AppliedPlanHash     string               `json:"applied_plan_sha256,omitempty"`
+	VolumeID             string               `json:"volume_id"`
+	AuthorizationDomain  string               `json:"authorization_domain"`
+	Owner                string               `json:"owner"`
+	ProductIssuer        string               `json:"product_issuer"`
+	ProductPublicKeyPEM  string               `json:"product_public_key_pem"`
+	CellID               string               `json:"cell_id"`
+	ProjectID            uint32               `json:"project_id"`
+	ServiceUID           uint32               `json:"service_uid"`
+	ServiceGID           uint32               `json:"service_gid"`
+	ListenPort           uint16               `json:"listen_port"`
+	QuotaBytes           uint64               `json:"quota_bytes"`
+	QuotaInodes          uint64               `json:"quota_inodes"`
+	AuthorityID          string               `json:"authority_id"`
+	AuthorityServerName  string               `json:"authority_server_name"`
+	AuthorityGeneration  uint64               `json:"authority_generation"`
+	LastPhase            cellplan.VolumePhase `json:"last_phase"`
+	AuthorityAbsent      bool                 `json:"authority_absent"`
+	QuotaApplied         bool                 `json:"quota_applied"`
+	Applied              bool                 `json:"applied"`
+	AppliedPlanHash      string               `json:"applied_plan_sha256,omitempty"`
+	AppliedHelperRelease string               `json:"applied_helper_release,omitempty"`
 }
 
 func loadState(path, cellID string) (State, error) {
@@ -141,6 +142,7 @@ func migrateStateV1(old stateV1) State {
 			AuthorityID: item.AuthorityID, AuthorityServerName: item.AuthorityServerName,
 			AuthorityGeneration: item.AuthorityGeneration, LastPhase: item.LastPhase,
 			AuthorityAbsent: item.AuthorityAbsent, Applied: item.Applied, AppliedPlanHash: item.AppliedPlanHash,
+			AppliedHelperRelease: item.AppliedHelperRelease,
 		}
 		if item.QuotaApplied {
 			assignment.AppliedQuotaBytes = item.QuotaBytes
@@ -180,8 +182,8 @@ func validateState(state State, cellID string) error {
 			if !validDigest(assignment.AppliedPlanHash) {
 				return errors.New("cellhelper: applied assignment has an invalid plan digest")
 			}
-		} else if assignment.AppliedPlanHash != "" {
-			return errors.New("cellhelper: failed assignment retained an applied plan digest")
+		} else if assignment.AppliedPlanHash != "" || assignment.AppliedHelperRelease != "" {
+			return errors.New("cellhelper: failed assignment retained applied identity")
 		}
 		if assignment.ArchiveSealed != nil && !validStoredArchiveSealed(*assignment.ArchiveSealed) ||
 			assignment.DestroyProof != nil && !validDestroyProof(assignment, *assignment.DestroyProof) ||
@@ -328,6 +330,7 @@ func marshalState(state State) ([]byte, error) {
 			LastPhase: item.LastPhase, AuthorityAbsent: item.AuthorityAbsent,
 			QuotaApplied: item.AppliedQuotaBytes == item.QuotaBytes && item.AppliedQuotaInodes == item.QuotaInodes,
 			Applied:      item.Applied, AppliedPlanHash: item.AppliedPlanHash,
+			AppliedHelperRelease: item.AppliedHelperRelease,
 		}
 	}
 	return json.Marshal(old)

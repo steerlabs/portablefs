@@ -14,7 +14,7 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic(err)
 	}
-	root, err := os.MkdirTemp(base, "pfs-cli-tests-")
+	root, err := os.MkdirTemp(base, "pfs-")
 	if err != nil {
 		panic(err)
 	}
@@ -24,27 +24,22 @@ func TestMain(m *testing.M) {
 	if err := os.Setenv("TMPDIR", root); err != nil {
 		panic(err)
 	}
+	resolveFSKitAccountHome = func() (string, error) { return root, nil }
 	code := m.Run()
 	_ = os.RemoveAll(root)
 	os.Exit(code)
 }
 
 // testEnv builds a cmdEnv whose every process boundary is a temporary
-// directory: the FSKit frontend socket, the mount lifecycle guard, and the
-// canonical operational state. Nothing it returns touches the real account.
+// directory: the external daemon control socket, the mount lifecycle guard,
+// and canonical operational state. Nothing it returns touches the real account.
 func testEnv(t *testing.T) (*cmdEnv, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
-	frontendSocket := filepath.Join(t.TempDir(), "portablefsd", "pfs.sock")
 	e := &cmdEnv{
-		stdout: stdout,
-		stderr: stderr,
-		getenv: func(key string) string {
-			if key == fskitSocketEnv {
-				return frontendSocket
-			}
-			return ""
-		},
+		stdout:            stdout,
+		stderr:            stderr,
+		getenv:            func(string) string { return "" },
 		version:           "test",
 		lifecycleStateDir: filepath.Join(t.TempDir(), "state", "portablefs"),
 		stateDir:          filepath.Join(t.TempDir(), "operational-state", "portablefs"),

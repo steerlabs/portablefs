@@ -4,8 +4,8 @@ Requires=portablefs-authority@%i.socket
 After=portablefs-authority@%i.socket
 
 [Service]
-Type=simple
-ExecStart=/usr/local/libexec/portablefs-authority-launcher
+Type=exec
+ExecStart=/opt/portablefs/current/libexec/portablefs-authority-launcher
 Restart=no
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -26,7 +26,9 @@ ProtectSystem=strict
 ProcSubset=pid
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_UNIX
+# The public listener is socket-activated, while the health/metrics listener
+# binds only inside this service's private loopback network namespace.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
 # RestrictSUIDSGID rejects openat2, which is the authority's descriptor-relative

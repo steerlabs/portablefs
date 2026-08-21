@@ -8,11 +8,15 @@ work.
 The model in one paragraph: a volume is a workspace that lives in the network,
 not a folder on one machine. One XFS authority owns its durable state, so every
 mount — laptop, server, sandbox — is a window onto the same ordered filesystem.
-Linux writes are direct; macOS applications use `fsync` when they need an
-explicit cross-machine completion boundary. There is
-no history graph, no branch, no snapshot and no fork: there is the current state
-of the workspace, and every machine that mounts it sees exactly that. Machines
-are disposable; the workspace is not.
+Linux production writes are direct and cached reads are covered by authority
+leases on stock FUSE 7.31 or newer. Current FSKit cannot implement the required
+lease-discharge and append contract, so production macOS mounts are refused.
+There is no
+history graph, no branch, no snapshot and no fork: there is the current state
+of the workspace. Sustained simultaneous mutation is still under protocol-6
+qualification. `O_APPEND` is refused, but stock FUSE does not forward
+`RWF_APPEND`; that unresolved path blocks a production-ready writable profile.
+Machines are disposable; the workspace is not.
 
 ## Continuity: The Workspace Outlives The Session
 
@@ -36,34 +40,32 @@ portablefs mount refactor-auth /srv/work \
 cd /srv/work    # same files, same git state, same half-finished edit
 ```
 
-The handoff is safe with no barrier discipline at all, and that is the whole
-point:
+Linux-to-Linux handoff needs no extra barrier discipline:
 
 - **There is no PortableFS durability debt.** A v3 mount holds no daemon WAL or
-  offline tail. Linux direct writes return after XFS application. macOS retains
-  ordinary kernel page-cache semantics, so an agent that needs a handoff or
-  durability boundary calls `fsync`, which waits for the authoritative server
-  descriptor. `close` alone is not that boundary.
+  offline tail. Linux direct writes return after XFS application and peer lease
+  discharge. `fsync` waits for the authoritative server descriptor; `close`
+  alone is not that durability boundary.
 - **There is no stale handover, because there is no second truth.** Both mounts
-  are windows onto the same live authority. Names and attributes may be cached
-  under the `strict` profile, but only joined to the authority's synchronous
-  visibility barrier: a mutation that returned on one mount is not observable as
-  older state on another. `--coherence uncached` (Linux) caches nothing and is
-  the same contract with the cache removed.
+  are windows onto the same live authority. Names and attributes are cached only
+  under authority leases. A conflicting mutation recalls those leases and
+  waits for peer discharge before its result is released.
 
 For scheduled or resumable agents, make the mount the first step of the job and
 the unmount the last; the workspace carries all state between runs, including
 `.git`, caches, and SQLite files. Both are exercised across two mounts by the
-privileged Linux gate (`TestWorkloadGitAcrossMounts`,
-`TestWorkloadSQLiteAcrossMounts` — see [local-dev.md](./local-dev.md)).
+required privileged Linux gate (`TestWorkloadGitAcrossMounts`,
+`TestWorkloadSQLiteAcrossMounts` — see [local-dev.md](./local-dev.md)). That gate
+counts only when it runs through a real stock-kernel FUSE mount at protocol 7.31
+or newer; no PortableFS kernel patch is part of the evidence.
 
 An initial mount capability is single-use. A hosted mount that explicitly opts
 into automatic reauthorization also receives a bounded, volume- and key-scoped
-enrollment. The Linux mount supervisor or the
-existing macOS daemon then obtains and installs short-lived grants automatically
-without remounting; there is one sequencer per mount and the filesystem session,
-locks, handles, and strict-cache membership stay intact. A definitive denial or
-missed safety cutoff fails closed and detaches. Standalone mounts omit the
+enrollment. The Linux mount supervisor then
+obtains and installs short-lived grants automatically without remounting; there
+is one sequencer per mount and the filesystem session, locks, handles, and
+lease state stay intact. A definitive denial or missed safety
+cutoff fails closed and detaches. Standalone mounts omit the
 enrollment and can use the explicit `portablefs reauthorize` command; they never
 silently switch modes.
 
@@ -79,13 +81,17 @@ for every mount:
 - **Atomic rename.** Write to a temporary file, then `rename(2)` over the
   target. Another mount observes either the old inode with the old bytes or the
   new inode with the new bytes, never a mixture.
-- **POSIX locks.** `fcntl` byte-range locks and `flock` are held by the
-  authority, not by one kernel, so they coordinate across mounts. A blocked
-  waiter is released when the holder's session ends rather than hanging forever.
+- **Linux POSIX locks.** On Linux, `fcntl` byte-range locks and `flock` are held
+  by the authority, not by one kernel, so they coordinate across mounts. A
+  blocked waiter is released when the holder's session ends rather than hanging
+  forever. In macOS qualification builds, FSKit exposes no advisory-lock
+  callbacks: an agent must use `O_EXCL` create, atomic rename, or disjoint files
+  for cross-machine coordination, and must not treat a locally successful lock
+  as distributed.
 
 Concurrent whole-record overwrites of one file leave one writer's record, never
-a mixture; concurrent `O_APPEND` writers lose no record and tear no record,
-though the interleaving is free. Those are named cases in the two-mount
+a mixture. `O_APPEND` refusal is a negative gate; `RWF_APPEND` remains an
+unobservable blocker rather than a supported operation. Those are named cases in the two-mount
 coherence matrix ([cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md)).
 
 What is *not* available is a cheap copy of the workspace. There are no forks and
@@ -97,12 +103,19 @@ not actually need to diverge.
 
 ## Compute Near The Volume
 
-Mounting needs the platform transport (FSKit on macOS, FUSE on Linux — see
-[fskit-mount.md](./fskit-mount.md)) and a machine you control. There is no
+Production mounting needs stock Linux FUSE and a machine you control. The FSKit
+adapter is qualification-only; see [fskit-mount.md](./fskit-mount.md). There is no
 server-side `exec` and no server-side `grep`: the storage plane never runs tenant
 commands, and content search is `rg` inside a mount like anywhere else. An
 environment that cannot mount needs a different isolated runner that can, not a
 weaker remote-command surface.
+
+Protocol 6 accepts one lease-coherence profile and every mount participates;
+`--coherence uncached` is rejected before Attach rather than mapped to another
+mode. Shipping macOS builds fail before constructing an authority transport,
+because public FSKit cannot discharge N/A/E leases or report exact append
+intent. Only a separately build-stamped qualification artifact exercises the
+candidate adapter; production agent mounts use Linux FUSE.
 
 A standalone sandbox mounts with direct credentials and nothing else:
 

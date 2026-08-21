@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
@@ -100,6 +101,10 @@ type ensureAttachRequest struct {
 	// When present the attach is branchless, served by the standalone v3 data
 	// plane, and never touches the legacy clientcore path.
 	V3 *v3AttachRequest `json:"v3,omitempty"`
+	// observePreKernelMountAbsence is a package-test injection for platforms
+	// that cannot run Darwin getfsstat. It is never decoded from control input;
+	// production always constructs the observer from mountPath + attachRef.
+	observePreKernelMountAbsence authorityrpc.PreKernelMountAbsenceObserver
 }
 
 type attachStatus struct {
@@ -170,6 +175,10 @@ type registry struct {
 }
 
 func newRegistry(stateDir string) *registry {
+	return newRegistryWithMountLogDir(stateDir, stateDir)
+}
+
+func newRuntimeRegistry(stateDir string) *registry {
 	return newRegistryWithMountLogDir(stateDir, stateDir)
 }
 
@@ -687,21 +696,21 @@ func (r *registry) unmountFSKitWithContext(
 		r.unmounting[ref] = tx
 		go func() {
 			found, jobID, err := r.runUnmountTransaction(ref, tx, ops)
-			// THE OUTCOME IS PUBLISHED BEFORE THE TRANSACTION BECOMES
-			// UNDISCOVERABLE. Removing the entry first opened a window in which
-			// a retry saw no running transaction and STARTED A SECOND ONE
-			// against an attach the first had already detached, and in which a
-			// joiner's expiring timer could report "unknown attach" for a
-			// detach that had just succeeded. A request that finds the entry in
-			// that window now joins a transaction that is already resolved and
-			// reads its terminal outcome immediately.
-			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
-			close(tx.done)
 			r.unmountMu.Lock()
+			// Publish the outcome to existing joiners and atomically make this
+			// transaction undiscoverable before waking them. If close(done)
+			// happened first, a retry could join a completed failed transaction
+			// in the tiny pre-delete window and receive stale evidence even after
+			// the external mount state had changed. Existing joiners already own
+			// tx, so deleting first loses nothing; close below is their happens-
+			// before edge for outcome. A new retry starts the one next
+			// transaction and observes current kernel state.
+			tx.outcome = unmountOutcome{found: found, jobID: jobID, err: err}
 			if r.unmounting[ref] == tx {
 				delete(r.unmounting, ref)
 			}
 			r.unmountMu.Unlock()
+			close(tx.done)
 		}()
 	} else if force && !tx.force {
 		// ESCALATE the running normal transaction in place.
@@ -1233,11 +1242,16 @@ type attach struct {
 	nextOrigin        uint64
 	subscribers       map[*eventSubscriber]struct{}
 	conns             map[interface{ Close() error }]struct{}
-	eventReady        chan struct{}
-	eventOnce         sync.Once
-	detached          bool
-	detachPrepared    bool
-	detachForce       bool
+	// nativeFrontendWitnesses contains only live `portablefskit` connections
+	// that completed Resolve for this exact native-policy attach. It is the
+	// macOS 27 readiness primitive; legacy macOS 26 policies instead retain a
+	// verified mount-root descriptor. Guarded by mu.
+	nativeFrontendWitnesses map[*frontendConn]struct{}
+	eventReady              chan struct{}
+	eventOnce               sync.Once
+	detached                bool
+	detachPrepared          bool
+	detachForce             bool
 	// detachFailFrozen is process-local. The durable prepared marker and this
 	// explicit flag reject every admission, while nsMu remains releasable so
 	// daemon shutdown/restart can perform the required recovery.
@@ -1752,6 +1766,7 @@ func (a *attach) finishDetachWithNSLocked(jobID string, priorErr error) (string,
 		return existingJobID, priorErr
 	}
 	a.detached = true
+	a.retireNativeFrontendWitnessesLocked()
 	if jobID != "" {
 		a.detachJobID = jobID
 	}

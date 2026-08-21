@@ -113,6 +113,36 @@ func createRegular(parentFD int, name string, unixMode uint32) (int, error) {
 	})
 }
 
+// Tmpfile creates one unnamed regular inode beneath parent. O_EXCL has its
+// Linux O_TMPFILE meaning: the inode is deliberately non-linkable. The
+// descriptor remains the creation grant so the following OpenFile receives
+// exactly the access creation conferred without rechecking the requested mode.
+func (v *Volume) Tmpfile(parent Capability, mode fs.FileMode, exclusive bool) (Capability, Attr, error) {
+	unixMode, err := modeToUnix(mode)
+	if err != nil {
+		return Capability{}, Attr{}, err
+	}
+	p, err := v.holdParent(parent)
+	if err != nil {
+		return Capability{}, Attr{}, err
+	}
+	defer p.release()
+	flags := unix.O_TMPFILE | unix.O_RDWR | unix.O_CLOEXEC
+	if exclusive {
+		flags |= unix.O_EXCL
+	}
+	fd, err := unix.Openat(p.fd(), ".", flags, unixMode)
+	if err != nil {
+		return Capability{}, Attr{}, err
+	}
+	identity, identityErr := stableIdentityFD(fd, v.productionIdentity)
+	if identityErr != nil {
+		_ = unix.Close(fd)
+		return Capability{}, Attr{}, outcomeUncertain(identityErr)
+	}
+	return v.installCreated(fd, unixMode, identity)
+}
+
 // installCreated takes ownership of the creation description. Everything from
 // here on has already modified XFS, so every failure is an uncertain outcome.
 func (v *Volume) installCreated(fd int, unixMode uint32, identity [16]byte) (Capability, Attr, error) {
@@ -198,7 +228,7 @@ func (v *Volume) Mkdir(parent Capability, name string, mode fs.FileMode) (Capabi
 	if err != nil {
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}
-	if err := unix.Fchmodat(fd, "", unixMode, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := v.chmodCapability(fd, KindDirectory, unixMode); err != nil {
 		_ = unix.Close(fd)
 		return Capability{}, Attr{}, outcomeUncertain(err)
 	}

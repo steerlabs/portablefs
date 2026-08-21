@@ -5,12 +5,20 @@ package cellhost
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
+	"golang.org/x/sys/unix"
 )
 
 type recordedCommand struct {
@@ -19,6 +27,21 @@ type recordedCommand struct {
 }
 
 type fenceRunner struct{ calls []recordedCommand }
+
+type directXFSQuotaRunner struct {
+	xfsQuota string
+	calls    int
+}
+
+func (runner *directXFSQuotaRunner) Run(ctx context.Context, _ string, arguments ...string) ([]byte, error) {
+	for index, argument := range arguments {
+		if argument == runner.xfsQuota {
+			runner.calls++
+			return exec.CommandContext(ctx, argument, arguments[index+1:]...).CombinedOutput()
+		}
+	}
+	return nil, errors.New("cellhost test: transient command omitted xfs_quota")
+}
 
 func (runner *fenceRunner) Run(_ context.Context, executable string, arguments ...string) ([]byte, error) {
 	runner.calls = append(runner.calls, recordedCommand{executable: executable, arguments: append([]string(nil), arguments...)})
@@ -163,5 +186,140 @@ func TestXFSQuotaTransientPreservesHostMountNamespace(t *testing.T) {
 		if !strings.Contains(sysusers, required) {
 			t.Fatalf("sysusers transient is missing %q", required)
 		}
+	}
+}
+
+func TestAuthorityServiceDropInBindsDedicatedProjectScopedWriteStaging(t *testing.T) {
+	plan := cellplan.VolumePlan{ServiceUID: 210000, ServiceGID: 210001}
+	dropIn := authorityServiceDropIn(
+		plan,
+		"/srv/portablefs/volume",
+		"/etc/portablefs/volumes/volume",
+		"/var/lib/portablefs/volumes/volume",
+		"/srv/portablefs/.portablefs-control/volume/write-staging",
+	)
+	want := "[Service]\n" +
+		"User=210000\n" +
+		"Group=210001\n" +
+		"BindPaths=/srv/portablefs/volume:/srv/portablefs-volume\n" +
+		"BindReadOnlyPaths=/etc/portablefs/volumes/volume:/run/portablefs-volume\n" +
+		"BindPaths=/var/lib/portablefs/volumes/volume:/var/lib/portablefs-volume\n" +
+		"BindPaths=/srv/portablefs/.portablefs-control/volume/write-staging:/var/lib/portablefs-write-staging\n"
+	if dropIn != want {
+		t.Fatalf("service drop-in = %q, want %q", dropIn, want)
+	}
+}
+
+func TestWriteStagingIsAtomicPinnedAndSharesTheVolumeProjectQuota(t *testing.T) {
+	cellRoot := os.Getenv("PORTABLEFS_CELLHOST_XFS_TEST_ROOT")
+	if cellRoot == "" {
+		t.Skip("PORTABLEFS_CELLHOST_XFS_TEST_ROOT is required")
+	}
+	if os.Geteuid() != 0 {
+		t.Fatal("write-staging host boundary test requires root")
+	}
+	xfsQuota, err := exec.LookPath("xfs_quota")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid64, err := strconv.ParseUint(os.Getenv("PORTABLEFS_SERVICE_UID"), 10, 32)
+	if err != nil || uid64 < 1000 {
+		t.Fatal("PORTABLEFS_SERVICE_UID must name the test service identity")
+	}
+	gid64, err := strconv.ParseUint(os.Getenv("PORTABLEFS_SERVICE_GID"), 10, 32)
+	if err != nil || gid64 < 1000 {
+		t.Fatal("PORTABLEFS_SERVICE_GID must name the test service identity")
+	}
+	unique := uint64(time.Now().UnixNano()) & 0xffffffffffff
+	volumeID := fmt.Sprintf("22222222-2222-4222-8222-%012x", unique)
+	volumePath := filepath.Join(cellRoot, volumeID)
+	if err := os.Mkdir(volumePath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(filepath.Join(cellRoot, ".portablefs-control", volumeID))
+		_ = os.RemoveAll(volumePath)
+	})
+	projectID := uint32(100_000 + time.Now().UnixNano()%1_000_000)
+	quotaBytes := uint64(128 << 20)
+	quotaInodes := uint64(20_000)
+	for _, command := range []string{
+		fmt.Sprintf("project -s -p %s %d", volumePath, projectID),
+		fmt.Sprintf("limit -p bhard=%dk ihard=%d %d", quotaBytes/1024, quotaInodes, projectID),
+	} {
+		if output, err := exec.Command(xfsQuota, "-x", "-c", command, cellRoot).CombinedOutput(); err != nil {
+			t.Fatalf("xfs_quota %q: %v: %s", command, err, output)
+		}
+	}
+	plan := cellplan.VolumePlan{
+		VolumeID: volumeID, ProjectID: projectID, ServiceUID: uint32(uid64), ServiceGID: uint32(gid64),
+		QuotaBytes: quotaBytes, QuotaInodes: quotaInodes,
+	}
+	runner := &directXFSQuotaRunner{xfsQuota: xfsQuota}
+	host := &Host{cfg: Config{CellRoot: cellRoot, XFSQuotaBinary: xfsQuota, SystemdRunBinary: "/usr/bin/systemd-run", Runner: runner}}
+	stagingPath, err := host.ensureWriteStaging(context.Background(), plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPath := filepath.Join(cellRoot, ".portablefs-control", volumeID, "write-staging")
+	if stagingPath != wantPath {
+		t.Fatalf("staging path = %q, want %q", stagingPath, wantPath)
+	}
+	stagingFD, err := host.openWriteStaging(volumeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyProjectDirectory(stagingFD, plan, plan.ServiceUID, plan.ServiceGID, 0o700, "write staging"); err != nil {
+		_ = unix.Close(stagingFD)
+		t.Fatal(err)
+	}
+	_ = unix.Close(stagingFD)
+	for _, path := range []string{filepath.Join(cellRoot, ".portablefs-control"), filepath.Join(cellRoot, ".portablefs-control", volumeID)} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stat := info.Sys().(*syscall.Stat_t)
+		if stat.Uid != 0 || stat.Gid != 0 || info.Mode().Perm() != 0o711 {
+			t.Fatalf("control parent %q = %d:%d %o, want 0:0 711", path, stat.Uid, stat.Gid, info.Mode().Perm())
+		}
+	}
+	volumeControlPath := filepath.Join(cellRoot, ".portablefs-control", volumeID)
+	if err := os.Chown(volumeControlPath, 0, int(plan.ServiceGID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(volumeControlPath, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if fd, err := host.openWriteStaging(volumeID); err == nil {
+		_ = unix.Close(fd)
+		t.Fatal("observation accepted a service-replaceable staging parent")
+	}
+	if _, err := host.ensureWriteStaging(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	controlInfo, err := os.Stat(volumeControlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlStat := controlInfo.Sys().(*syscall.Stat_t)
+	if controlStat.Uid != 0 || controlStat.Gid != 0 || controlInfo.Mode().Perm() != 0o711 {
+		t.Fatalf("reconciled control parent = %d:%d %o, want 0:0 711", controlStat.Uid, controlStat.Gid, controlInfo.Mode().Perm())
+	}
+	if err := os.Chmod(stagingPath, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.ensureWriteStaging(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("idempotent staging migration ran xfs_quota %d times, want 1", runner.calls)
+	}
+	info, err := os.Stat(stagingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("reconciled staging mode = %o, want 700", info.Mode().Perm())
 	}
 }

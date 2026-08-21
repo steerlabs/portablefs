@@ -8,6 +8,7 @@ private func enumerationBytes(_ string: String) -> Data {
     Data(string.utf8)
 }
 
+extension PfsLocalMockDaemonTests {
 @Test func syntheticDotEntriesArePlannedWhenAttributesAreNotRequested() throws {
     let entries = try PfsEnumerationCookies.syntheticEntries(
         for: FSDirectoryCookie.initial.rawValue,
@@ -142,4 +143,5 @@ private func enumerationBytes(_ string: String) -> Data {
     }
     #expect(await daemon.stats().resourceAcceptedItemCounts.allSatisfy { $0 == 0 })
     try await core.close(item: root, retainingModes: .unspecified)
+}
 }

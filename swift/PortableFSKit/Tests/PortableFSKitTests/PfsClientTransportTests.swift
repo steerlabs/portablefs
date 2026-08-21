@@ -1,11 +1,37 @@
 import Foundation
 import Testing
 @testable import PortableFSKit
-import PortableFSKitMockDaemon
+@testable import PortableFSKitMockDaemon
 @preconcurrency import Darwin
 
 private func transportBytes(_ string: String) -> Data {
     Data(string.utf8)
+}
+
+private func writeRawTransportFrame(fd: Int32, envelope: PfsEnvelope) throws {
+    let frame = try PfsFrameCodec().encode(envelope)
+    try frame.withUnsafeBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.baseAddress else {
+            return
+        }
+        var offset = 0
+        while offset < frame.count {
+            let written = Darwin.send(
+                fd,
+                baseAddress.advanced(by: offset),
+                frame.count - offset,
+                0
+            )
+            if written > 0 {
+                offset += written
+                continue
+            }
+            if written < 0, errno == EINTR {
+                continue
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
 }
 
 private actor PfsTestAsyncGate {
@@ -28,6 +54,128 @@ private actor PfsTestAsyncGate {
         for continuation in pending {
             continuation.resume()
         }
+    }
+}
+
+extension PfsLocalMockDaemonTests {
+@Test func mockDaemonReleaseStopsAndJoinsItsRuntimeWithoutExplicitStop() throws {
+    for _ in 0..<64 {
+        weak var daemonReference: PfsLocalMockDaemon?
+        var socketPath = ""
+        var socketDirectory = ""
+        var peerFD: Int32?
+        do {
+            let daemon = try PfsLocalMockDaemon()
+            daemonReference = daemon
+            socketPath = daemon.socketPath
+            socketDirectory = (socketPath as NSString).deletingLastPathComponent
+            peerFD = try PfsUnixSocket.connect(path: socketPath)
+        }
+        if let peerFD {
+            PfsUnixSocket.close(peerFD)
+        }
+
+        try #require(daemonReference == nil)
+        var status = stat()
+        #expect(Darwin.lstat(socketPath, &status) != 0 && errno == ENOENT)
+        #expect(Darwin.lstat(socketDirectory, &status) != 0 && errno == ENOENT)
+    }
+}
+
+@Test func mockDaemonUsesPrivateEphemeralSocketStateAndCleansIt() throws {
+    let daemon = try PfsLocalMockDaemon()
+    let socketPath = daemon.socketPath
+    let directory = (socketPath as NSString).deletingLastPathComponent
+    var directoryStatus = stat()
+    var socketStatus = stat()
+    #expect(Darwin.lstat(directory, &directoryStatus) == 0)
+    #expect(directoryStatus.st_mode & S_IFMT == S_IFDIR)
+    #expect(directoryStatus.st_mode & 0o777 == 0o700)
+    #expect(Darwin.lstat(socketPath, &socketStatus) == 0)
+    #expect(socketStatus.st_mode & S_IFMT == S_IFSOCK)
+    #expect(socketStatus.st_mode & 0o777 == 0o600)
+
+    daemon.stop()
+
+    #expect(Darwin.lstat(socketPath, &socketStatus) != 0 && errno == ENOENT)
+    #expect(Darwin.lstat(directory, &directoryStatus) != 0 && errno == ENOENT)
+}
+
+@Test func mockDaemonStopOwnsBackpressuredResponseWrites() throws {
+    let daemon = try PfsLocalMockDaemon()
+    let peerFD = try PfsUnixSocket.connect(path: daemon.socketPath)
+    defer { PfsUnixSocket.close(peerFD) }
+
+    // A peer that deliberately does not read creates real socket backpressure.
+    // Repeated Hello frames are side-effect-free and each has a definite reply,
+    // so the pending-response observation below proves the writer is blocked
+    // without relying on a guessed Darwin buffer capacity.
+    var receiveBufferBytes: Int32 = 1_024
+    #expect(
+        setsockopt(
+            peerFD,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            &receiveBufferBytes,
+            socklen_t(MemoryLayout<Int32>.size)
+        ) == 0
+    )
+    for requestID in 1...4_096 {
+        var hello = PfsHello()
+        hello.protocolMajor = 1
+        hello.protocolMinor = 12
+        hello.clientName = "backpressure-owner"
+        hello.clientVersion = "1"
+        var envelope = PfsEnvelope()
+        envelope.requestID = UInt64(requestID)
+        envelope.body = .hello(hello)
+        try writeRawTransportFrame(fd: peerFD, envelope: envelope)
+    }
+
+    let backlogDeadline = ContinuousClock.now + .seconds(2)
+    while daemon.testingPendingResponseCount() == 0,
+          ContinuousClock.now < backlogDeadline {
+        Thread.sleep(forTimeInterval: 0.001)
+    }
+    #expect(daemon.testingPendingResponseCount() > 0)
+
+    // stop() is the exact ownership boundary: it interrupts the blocking
+    // writer, joins every client reader and async handler, then removes the
+    // private socket state. There is no timeout or detached cleanup path.
+    daemon.stop()
+    #expect(daemon.testingPendingResponseCount() == 0)
+    var status = stat()
+    #expect(Darwin.lstat(daemon.socketPath, &status) != 0 && errno == ENOENT)
+}
+
+@Test func mockDaemonStopCancelsAndJoinsDelayedRequestHandlers() async throws {
+    let daemon = try PfsLocalMockDaemon(
+        configuration: .init(lookupNoReplyNames: ["owned-delay"])
+    )
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+
+    var request = PfsLookupRequest()
+    request.dir = resolved.root
+    request.name = transportBytes("owned-delay")
+    let delayed = Task {
+        try await client.request(.lookup(request))
+    }
+    let enteredDeadline = ContinuousClock.now + .seconds(2)
+    while await daemon.stats().lookupRequests == 0,
+          ContinuousClock.now < enteredDeadline {
+        try await Task.sleep(for: .milliseconds(1))
+    }
+    #expect(await daemon.stats().lookupRequests == 1)
+
+    daemon.stop()
+    do {
+        _ = try await delayed.value
+        Issue.record("stopped daemon unexpectedly delivered a delayed reply")
+    } catch {
+        // The exact error is owned by the client-side socket close race. The
+        // invariant under test is that the one-hour mock handler was cancelled
+        // and joined before stop returned, not reclassified as a reply.
     }
 }
 
@@ -139,106 +287,6 @@ private final class PfsWeakWriteReceiptBox {
 
     // Late resource cleanup is request-scoped; it must not poison the mount.
     _ = try await client.request(.statfs(PfsStatfsRequest()))
-}
-
-@available(macOS 26.0, *)
-@Test func orderedRequestsStampExactSourcePhaseQueueabilityOnTheWire() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    let resolved = try await client.resolve(attachRef: "mock")
-
-    var create = PfsCreateRequest()
-    create.dir = resolved.root
-    create.name = transportBytes("source-phase-queueability")
-    create.mode = 0o644
-    create.exclusive = true
-    let created = try await client.withPublicationBoundary {
-        try await client.request(.create(create))
-    }
-    guard case let .createReply(createReply)? = created.body else {
-        Issue.record("mock create omitted its reply")
-        return
-    }
-    await daemon.resetStats()
-
-    let orderedOnly = PfsMacOSAdmittedCallbackTicket(
-        scope: PfsMacOSCallbackScope(selectors: [.orderedMutation])
-    )
-    var firstWrite = PfsWriteRequest()
-    firstWrite.handle = createReply.handle
-    firstWrite.data = transportBytes("ordered-only")
-    _ = try await PfsMacOSCallbackAdmission.$ticket.withValue(orderedOnly) {
-        try await client.withPublicationBoundary {
-            try await client.request(.write(firstWrite))
-        }
-    }
-
-    let mixed = PfsMacOSAdmittedCallbackTicket(
-        scope: PfsMacOSCallbackScope(selectors: [.orderedMutation])
-    )
-    _ = try await PfsMacOSCallbackAdmission.$ticket.withValue(mixed) {
-        try await client.withPublicationBoundary {
-            // Opening is nonpublishing but still ordinary callback history. The
-            // following write must therefore tell the authority not to queue
-            // this callback behind a distinct own-source PREPARE.
-            var open = PfsOpenRequest()
-            open.item = createReply.attr.item
-            open.mode = .readWrite
-            let opened = try await client.request(.open(open))
-            guard case let .openReply(openReply)? = opened.body else {
-                throw PfsLocalClientError.unexpectedReply(
-                    String(describing: opened.body)
-                )
-            }
-            var write = PfsWriteRequest()
-            write.handle = openReply.handle
-            write.data = transportBytes("mixed")
-            return try await client.request(.write(write))
-        }
-    }
-
-    let stats = await daemon.stats()
-    #expect(stats.openRequests == 1)
-    #expect(stats.writeRequests == 2)
-    #expect(stats.orderedMutationSourcePhaseQueueable == [true, false])
-}
-
-@Test func queueableOrderedRequestWithoutOperationIdentityFailsLocally() throws {
-    do {
-        try pfsValidateSourcePhaseQueueability(true, operationID: 0)
-        Issue.record("queueable request without an operation ID succeeded")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .invalidFrame(
-            "source-phase-queueable ordered mutation requires an operation ID"
-        ))
-    }
-    #expect(throws: Never.self) {
-        try pfsValidateSourcePhaseQueueability(false, operationID: 0)
-    }
-    #expect(throws: Never.self) {
-        try pfsValidateSourcePhaseQueueability(true, operationID: 8)
-    }
-}
-
-@Test func daemonCannotSetRequestOnlySourcePhaseQueueability() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(
-        sourcePhaseQueueableOnReplies: true
-    ))
-    defer { daemon.stop() }
-    let client = PfsLocalClient(
-        socketPath: daemon.socketPath,
-        configuration: .init(maxReconnectAttempts: 1)
-    )
-
-    do {
-        _ = try await client.resolve(attachRef: "mock")
-        Issue.record("client accepted request-only metadata on a daemon reply")
-    } catch let error as PfsLocalClientError {
-        #expect(error == .invalidFrame(
-            "daemon reply/event set request-only source_phase_queueable"
-        ))
-    }
 }
 
 private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
@@ -505,7 +553,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// interrupted process into a permanently fenced mount.
 @Test func requestCancellationLeavesTheStrictConnectionAndItsPublicationsIntact() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = Data(repeating: 0xE1, count: 16)
     contract.sessionID = Data(repeating: 0x51, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
@@ -608,7 +656,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// retryable timeout while the daemon may still apply the request.
 @Test func dispatchedMutationTimeoutTerminatesStrictMountAsUncertain() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = Data(repeating: 0xE3, count: 16)
     contract.sessionID = Data(repeating: 0x53, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
@@ -668,7 +716,7 @@ private func writerTestEnvelope(_ requestID: UInt64) -> PfsEnvelope {
 /// recurrence kills the connection and fails the follow-up below.
 @Test func immediateCancellationNeverLetsTheAckOvertakeItsRequest() async throws {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = Data(repeating: 0xE2, count: 16)
     contract.sessionID = Data(repeating: 0x52, count: 16)
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV1.rawValue
@@ -860,6 +908,27 @@ private func waitForTransportPublicationAcks(
     return await daemon.stats()
 }
 
+/// PublicationAck is also a one-way serial-reader transition. A subsequent
+/// ordinary reply is therefore an exact acknowledgement barrier, not a timing
+/// hint. Suspending the ack makes the former detached-dispatch model allow
+/// Statfs to reply while the operation was still unacknowledged.
+@Test func publicationAckPrecedesFollowingOrdinaryReply() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    await daemon.delayNextPublicationAck(nanoseconds: 250_000_000)
+
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+    _ = try await client.withPublicationBoundary {
+        try await client.request(.getAttr(getattr))
+    }
+    _ = try await client.request(.statfs(PfsStatfsRequest()))
+
+    #expect(await daemon.stats().publicationAcks == 1)
+}
+
 /// Captures an acknowledgement baseline that a later `==` can be trusted
 /// against.
 ///
@@ -889,6 +958,35 @@ private func settledAckBaseline(
         sourceLocation: sourceLocation
     )
     return owed
+}
+
+@Test func publicationAckCarriesTheExactCallbackSemanticCommit() async throws {
+    let daemon = try PfsLocalMockDaemon()
+    defer { daemon.stop() }
+    let client = PfsLocalClient(socketPath: daemon.socketPath)
+    let resolved = try await client.resolve(attachRef: "mock")
+    var getattr = PfsGetAttrRequest()
+    getattr.item = resolved.root
+
+    _ = try await client.withPublicationBoundary {
+        try await client.request(.getAttr(getattr))
+    }
+    var stats = try await waitForTransportPublicationAcks(daemon, atLeast: 1)
+    #expect(stats.publishedPublicationAcks == 1)
+    #expect(stats.notPublishedPublicationAcks == 0)
+
+    let (result, complete) = await client.withDeferredPublication {
+        _ = try await client.request(.getAttr(getattr))
+        throw PfsLocalClientError.cancelled
+    }
+    #expect(throws: PfsLocalClientError.cancelled) {
+        try result.get()
+    }
+    await complete(false)
+
+    stats = try await waitForTransportPublicationAcks(daemon, atLeast: 2)
+    #expect(stats.publishedPublicationAcks == 1)
+    #expect(stats.notPublishedPublicationAcks == 1)
 }
 
 /// A retraction is answered by REISSUING the operation, below userspace.
@@ -930,37 +1028,6 @@ private func settledAckBaseline(
     // The connection is unaffected — a retraction is the daemon speaking on a
     // healthy connection, not a transport failure.
     _ = try await client.request(.statfs(PfsStatfsRequest()))
-}
-
-/// Retraction creates a fresh logical operation for the transparent retry, but
-/// the FSKit framework callback (and therefore its admission ticket) is the
-/// same. The barrier must see the surviving attempt's ID; retaining attempt
-/// one's already-acknowledged ID lets source COMPLETE pass without awaiting the
-/// actual framework publication.
-@Test func retractedRetryUpdatesAdmissionTicketToTheSurvivingOperationID() async throws {
-    let daemon = try PfsLocalMockDaemon()
-    defer { daemon.stop() }
-
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    let resolved = try await client.resolve(attachRef: "mock")
-    var getattr = PfsGetAttrRequest()
-    getattr.item = resolved.root
-    let ticket = PfsMacOSAdmittedCallbackTicket()
-
-    await daemon.retractNextPublications()
-    let (result, complete) = await PfsMacOSCallbackAdmission.$ticket.withValue(ticket) {
-        await client.withDeferredPublication {
-            try await client.request(.getAttr(getattr))
-        }
-    }
-    _ = try result.get()
-
-    // Resolve is nonpublishing, so the retracted attempt owns ID 1 and the
-    // surviving retry owns ID 2 on this fresh connection.
-    #expect(ticket.currentOperationID() == 2)
-    await complete(true)
-    let stats = try await waitForTransportPublicationAcks(daemon, atLeast: 2)
-    #expect(stats.publicationAcks == 2)
 }
 
 @Test func retractedPublicationBoundaryIsReissuedAndBothAttemptsAcknowledged() async throws {
@@ -1151,14 +1218,31 @@ private func nextEvent(from stream: AsyncStream<PfsEvent>) async throws -> PfsEv
 
 private final class PfsRawServer: @unchecked Sendable {
     let socketPath: String
+    private let socketDirectory: String
     private let serverFD: Int32
     private let queue = DispatchQueue(label: "dev.portablefs.tests.rawserver", qos: .utility)
     private let group = DispatchGroup()
+    private let stateLock = NSLock()
     private var stopped = false
 
     init(onClient: @escaping @Sendable (Int32) -> Void) throws {
-        socketPath = "/tmp/pfs-raw-\(UUID().uuidString.prefix(12)).sock"
-        serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+        var template = Array("/tmp/pfs-raw.XXXXXX".utf8CString)
+        guard let created = Darwin.mkdtemp(&template) else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let directory = String(cString: created)
+        socketDirectory = directory
+        socketPath = directory + "/pfs.sock"
+        do {
+            serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+            guard Darwin.chmod(socketPath, 0o600) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+        } catch {
+            unlink(socketPath)
+            rmdir(directory)
+            throw error
+        }
         group.enter()
         queue.async { [serverFD, weak self] in
             defer {
@@ -1166,20 +1250,24 @@ private final class PfsRawServer: @unchecked Sendable {
             }
             do {
                 let fd = try PfsUnixSocket.accept(serverFD)
-                if self?.stopped == true {
+                if self?.isStopped() == true {
                     PfsUnixSocket.close(fd)
                     return
                 }
                 onClient(fd)
                 PfsUnixSocket.close(fd)
-            } catch {
-                if self?.stopped != true {}
-            }
+            } catch {}
         }
     }
 
     func stop() {
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            return
+        }
         stopped = true
+        stateLock.unlock()
         if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
             PfsUnixSocket.close(wakeFD)
         }
@@ -1187,6 +1275,13 @@ private final class PfsRawServer: @unchecked Sendable {
         Darwin.shutdown(serverFD, SHUT_RDWR)
         PfsUnixSocket.close(serverFD)
         unlink(socketPath)
+        rmdir(socketDirectory)
+    }
+
+    private func isStopped() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped
     }
 
     static func sendAll(fd: Int32, data: Data) throws {
@@ -1232,4 +1327,5 @@ private final class PfsRawServer: @unchecked Sendable {
             throw PfsLocalClientError.system(errno: Darwin.errno, operation: "recv")
         }
     }
+}
 }

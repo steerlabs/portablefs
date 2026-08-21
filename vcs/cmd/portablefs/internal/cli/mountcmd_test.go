@@ -66,6 +66,98 @@ func TestIsMountpoint(t *testing.T) {
 	}
 }
 
+func TestFSKitReadinessProofOrdersKernelWitnessKernel(t *testing.T) {
+	var sequence []string
+	verify := func() error {
+		sequence = append(sequence, "kernel")
+		return nil
+	}
+	bind := func() error {
+		sequence = append(sequence, "bind")
+		return nil
+	}
+	retry, err := proveFSKitReadyOnce(verify, bind)
+	if err != nil || retry {
+		t.Fatalf("proof = retry %v, error %v", retry, err)
+	}
+	if got := strings.Join(sequence, ","); got != "kernel,bind,kernel" {
+		t.Fatalf("proof order = %q", got)
+	}
+}
+
+func TestFSKitReadinessProofRetriesOnlyBeforeAnExactWitness(t *testing.T) {
+	verifyCalls := 0
+	retry, err := proveFSKitReadyOnce(func() error {
+		verifyCalls++
+		if verifyCalls == 1 {
+			return fmt.Errorf("not mounted yet")
+		}
+		return nil
+	}, func() error {
+		t.Fatal("bind ran before kernel identity was present")
+		return nil
+	})
+	if err == nil || !retry {
+		t.Fatalf("pre-bind absence = retry %v, error %v", retry, err)
+	}
+
+	retry, err = proveFSKitReadyOnce(
+		func() error { return nil },
+		func() error { return fmt.Errorf("root not serving yet") },
+	)
+	if err == nil || !retry {
+		t.Fatalf("pre-bind service gap = retry %v, error %v", retry, err)
+	}
+}
+
+func TestFSKitReadinessProofFailsImmediatelyOnPostWitnessIdentityDrift(t *testing.T) {
+	verifyCalls := 0
+	retry, err := proveFSKitReadyOnce(func() error {
+		verifyCalls++
+		if verifyCalls == 2 {
+			return fmt.Errorf("replacement mount")
+		}
+		return nil
+	}, func() error { return nil })
+	if err == nil || retry || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("post-bind drift = retry %v, error %v", retry, err)
+	}
+}
+
+func TestFSKitReadinessPolicyKeepsNativeAndLegacyChannelsDisjoint(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		policy     string
+		wantLegacy int
+		wantNative int
+	}{
+		{"macOS 26 v1", portablefsd.V3CachePolicyMacOS26V1, 1, 0},
+		{"macOS 26 v2", portablefsd.V3CachePolicyMacOS26, 1, 0},
+		{"native macOS 27", portablefsd.V3CachePolicyFSKit, 0, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacy, native := 0, 0
+			probe, err := fskitReadinessProbeForPolicy(
+				tc.policy,
+				func() error { legacy++; return nil },
+				func() error { native++; return nil },
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := probe(); err != nil {
+				t.Fatal(err)
+			}
+			if legacy != tc.wantLegacy || native != tc.wantNative {
+				t.Fatalf("legacy/native calls = %d/%d, want %d/%d", legacy, native, tc.wantLegacy, tc.wantNative)
+			}
+		})
+	}
+	if _, err := fskitReadinessProbeForPolicy("automatic", func() error { return nil }, func() error { return nil }); err == nil {
+		t.Fatal("unknown cache policy selected a readiness channel")
+	}
+}
+
 // umountTestEnv is testEnv plus an isolated mount state dir, the setup every
 // umount test needs.
 func umountTestEnv(t *testing.T) (e *cmdEnv, stdout, stderr *bytes.Buffer, stateDir string) {
@@ -351,21 +443,15 @@ func TestUmountStaleFSKitConvergesAfterDaemonAlreadyDetached(t *testing.T) {
 func TestMountOwnershipTreatsDeadSocketAsUnavailable(t *testing.T) {
 	e, _, _, stateDir := umountTestEnv(t)
 	e.kernelInventoryFn = func() ([]string, error) { return nil, nil }
-	socketDir := shortSocketDir(t)
-	frontendSock := filepath.Join(socketDir, "pfs.sock")
-	controlSock := filepath.Join(socketDir, "control.sock")
-	leaveCLIStaleUnixSocket(t, controlSock)
-	baseGetenv := e.getenv
-	e.getenv = func(key string) string {
-		switch key {
-		case fskitSocketEnv:
-			return frontendSock
-		case fskitControlEnv:
-			return controlSock
-		default:
-			return baseGetenv(key)
-		}
+	cfg, err := fskitConfigFromEnv(e.getenv)
+	if err != nil {
+		t.Fatal(err)
 	}
+	if err := privatepath.EnsureDir(filepath.Dir(cfg.controlSock)); err != nil {
+		t.Fatal(err)
+	}
+	leaveCLIStaleUnixSocket(t, cfg.controlSock)
+	t.Cleanup(func() { _ = os.Remove(cfg.controlSock) })
 	mountPath, err := canonicalMountPath(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -374,7 +460,7 @@ func TestMountOwnershipTreatsDeadSocketAsUnavailable(t *testing.T) {
 	if err := e.validateMountOwnership(stateDir, "vol_fresh", "main", mountPath); err != nil {
 		t.Fatalf("dead socket pathname was treated as a live daemon: %v", err)
 	}
-	if info, err := os.Lstat(controlSock); err != nil || info.Mode()&os.ModeSocket == 0 {
+	if info, err := os.Lstat(cfg.controlSock); err != nil || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("ownership check mutated stale socket: mode=%v err=%v", info, err)
 	}
 }

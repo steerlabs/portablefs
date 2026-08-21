@@ -11,6 +11,32 @@ private func adapterBytes(_ string: String) -> Data {
 }
 
 @available(macOS 26.0, *)
+private final class ProductionMountAdmissionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolverCalls = 0
+    private var loadResult: (hasVolume: Bool, errno: Int)?
+
+    func recordResolverCall() {
+        lock.lock()
+        resolverCalls += 1
+        lock.unlock()
+    }
+
+    func recordLoad(volume: FSVolume?, error: (any Error)?) {
+        lock.lock()
+        loadResult = (volume != nil, (error as NSError?)?.code ?? 0)
+        lock.unlock()
+    }
+
+    func snapshot() -> (resolverCalls: Int, hasVolume: Bool, errno: Int)? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let loadResult else { return nil }
+        return (resolverCalls, loadResult.hasVolume, loadResult.errno)
+    }
+}
+
+@available(macOS 26.0, *)
 private struct RecordedDirectoryEntry: Sendable, Equatable {
     var name: String
     var itemType: Int
@@ -206,6 +232,7 @@ private func makeAdapterHarness(
     return AdapterHarness(daemon: daemon, core: core, volume: volume, root: root)
 }
 
+extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func enumerationTransfersOnlyTheExactPackedItemPrefix() async throws {
     let harness = try await makeAdapterHarness()
@@ -275,6 +302,36 @@ private func makeAdapterHarness(
 
     #expect(await probe("dev.portablefs.oss://att_AAAAAAAAAAAAAAAAAAAAAA") == .usable)
     #expect(await probe("pfs://att_AAAAAAAAAAAAAAAAAAAAAA") == .notRecognized)
+}
+
+@available(macOS 26.0, *)
+@Test func unconfiguredAdapterRefusesBeforeSocketResolution() throws {
+    let identity = try PortableFSModuleIdentity(
+        fileSystemTypeName: PortableFSIdentity.fileSystemTypeName,
+        resourceScheme: PortableFSIdentity.resourceScheme
+    )
+    let state = ProductionMountAdmissionState()
+    let fileSystem = PortableFSFileSystem(
+        moduleIdentity: identity,
+        resolverFactory: {
+            state.recordResolverCall()
+            return PfsSocketPathResolver(bundle: .main)
+        }
+    )
+    let options = class_createInstance(FSTaskOptions.self, 0) as! FSTaskOptions
+    fileSystem.loadResource(
+        resource: FSGenericURLResource(
+            url: URL(string: "dev.portablefs.oss://att_AAAAAAAAAAAAAAAAAAAAAA")!
+        ),
+        options: options
+    ) { volume, error in
+        state.recordLoad(volume: volume, error: error)
+    }
+
+    let result = try #require(state.snapshot())
+    #expect(result.resolverCalls == 0)
+    #expect(result.hasVolume == false)
+    #expect(result.errno == Int(ENOTSUP))
 }
 
 @available(macOS 26.0, *)
@@ -580,10 +637,6 @@ private func adapterErrno(
 
     let afterSets = await harness.daemon.stats()
     #expect(afterSets.xattrSetRequests == beforeSets.xattrSetRequests)
-    #expect(
-        afterSets.orderedMutationSourcePhaseQueueable ==
-            beforeSets.orderedMutationSourcePhaseQueueable
-    )
 
     // Invalid input keeps its own verdict even when every valid set would be
     // refused by capability negotiation.
@@ -609,10 +662,6 @@ private func adapterErrno(
     } == Int(EINVAL))
     let afterInvalid = await harness.daemon.stats()
     #expect(afterInvalid.xattrSetRequests == beforeSets.xattrSetRequests)
-    #expect(
-        afterInvalid.orderedMutationSourcePhaseQueueable ==
-            beforeSets.orderedMutationSourcePhaseQueueable
-    )
 
     // Seed a pre-existing portable attribute through a peer that talks to the
     // writable mock directly. The negotiated gate is frontend-local; it must
@@ -669,10 +718,6 @@ private func adapterErrno(
     }
     let afterStale = await harness.daemon.stats()
     #expect(afterStale.xattrSetRequests == beforeStale.xattrSetRequests)
-    #expect(
-        afterStale.orderedMutationSourcePhaseQueueable ==
-            beforeStale.orderedMutationSourcePhaseQueueable
-    )
 
     // Grammar wins even when the same callback also names a reclaimed item.
     // This cross-product pins EINVAL > ESTALE > EOPNOTSUPP rather than testing
@@ -699,10 +744,6 @@ private func adapterErrno(
     } == Int(EINVAL))
     let afterCompoundInvalid = await harness.daemon.stats()
     #expect(afterCompoundInvalid.xattrSetRequests == beforeStale.xattrSetRequests)
-    #expect(
-        afterCompoundInvalid.orderedMutationSourcePhaseQueueable ==
-            beforeStale.orderedMutationSourcePhaseQueueable
-    )
 }
 
 @available(macOS 26.0, *)
@@ -1644,4 +1685,5 @@ private func adapterErrno(
         #expect(Set(names) == expected.union([".", ".."]), "packer capacity \(capacity) lost or repeated entries")
         #expect(Set(names).count == names.count, "packer capacity \(capacity) repeated an entry")
     }
+}
 }

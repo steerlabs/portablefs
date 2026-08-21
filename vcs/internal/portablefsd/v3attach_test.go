@@ -31,6 +31,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 	"github.com/steerlabs/portablefs/vcs/internal/mountrecord"
 	"github.com/steerlabs/portablefs/vcs/internal/pfslocal"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 // v3TestPKI is one private trust domain: a CA, an authority server identity
@@ -150,12 +151,14 @@ type v3TestAuthority struct {
 	epoch                        []byte
 	session                      []byte
 	leaseMillis                  uint64
+	maxFskitWrite                uint64
 	mountEnrollment              bool
 	initialAuthorizationDeadline int64
 	renewedAuthorizationDeadline int64
 
 	mu               sync.Mutex
 	keepAliveErrno   int32
+	statfsNameMax    uint32
 	attach           *authoritypb.AttachRequest
 	detach           *authoritypb.DetachRequest
 	lookups          int
@@ -163,15 +166,26 @@ type v3TestAuthority struct {
 	reauthorizations int
 }
 
+var v3TestNeverTerminal = make(chan struct{})
+
 func newV3TestAuthority() *v3TestAuthority {
 	return &v3TestAuthority{
-		epoch:       bytes.Repeat([]byte{0x5a}, 16),
-		session:     bytes.Repeat([]byte{0x6b}, 16),
-		leaseMillis: 30_000,
+		epoch:         bytes.Repeat([]byte{0x5a}, 16),
+		session:       bytes.Repeat([]byte{0x6b}, 16),
+		leaseMillis:   30_000,
+		maxFskitWrite: authorityrpc.RequiredFskitWriteBytes,
+		statfsNameMax: 255,
 	}
 }
 
-func (h *v3TestAuthority) Epoch() []byte { return append([]byte(nil), h.epoch...) }
+func (h *v3TestAuthority) Epoch() []byte                                       { return append([]byte(nil), h.epoch...) }
+func (h *v3TestAuthority) RegisterSessionEndHook(func(volumeserver.SessionID)) {}
+func (h *v3TestAuthority) SessionStateForTransport(volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	return volumeserver.SessionStateProvisional, true
+}
+func (h *v3TestAuthority) SessionTerminalForTransport(volumeserver.SessionID) (<-chan struct{}, bool) {
+	return v3TestNeverTerminal, true
+}
 
 func (h *v3TestAuthority) Bounds() authorityrpc.TransportBounds {
 	return authorityrpc.TransportBounds{
@@ -224,40 +238,57 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	case *authoritypb.Request_Hello:
 		bounds := h.Bounds()
 		features := []string{
-			"xfs-current-state", "session-exact-epoch", "direct-write",
-			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-			"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
+			"xfs-current-state", "session-exact-epoch", "framed-bulk-data-v1",
+			"authority-keyed-replay-fingerprint-v1", "mandatory-dual-transport-v1", "exact-resource-acquisition",
+			"fskit-sync-repair-v1", "fskit-source-publication-v1", "fskit-fragmented-write-v1",
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
 		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
-			ProtocolMajor: authorityrpc.ProtocolMajor,
-			Features:      features,
-			MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
-			MaxInFlight: uint32(bounds.MaxInFlight),
+			ProtocolMajor: authorityrpc.ProtocolMajor, Features: features,
+			Role: req.GetHello().GetRole(), ConnectionSetId: append([]byte(nil), req.GetHello().GetConnectionSetId()...),
+			FrontendProfile: req.GetHello().GetFrontendProfile(),
+			MaxFrameBytes:   bounds.MaxFrame, MaxReadBytes: 1 << 20, MaxWriteBytes: 1 << 20,
+			MaxInFlight: uint32(bounds.MaxInFlight), MaxFskitWriteBytes: h.maxFskitWrite,
 		}}
 	case *authoritypb.Request_Attach:
 		h.mu.Lock()
 		h.attach = req.GetAttach()
 		h.mu.Unlock()
+		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
+			SessionId: append([]byte(nil), h.session...), Generation: 1,
+			ResumeSecret: make([]byte, 32), ProvisionalDeadlineUnixNanos: time.Now().Add(time.Minute).UnixNano(),
+		}}
+	case *authoritypb.Request_Activate:
 		features := []string{
-			"write-through", "no-history", "no-branches", "direct-io-no-file-mmap",
+			"write-through", "no-history", "no-branches",
 			"user-xattr-readonly", "single-principal", "distributed-posix-locks",
-			"stable-item-identity", "readdir-plus-items", "volume-syncfs-barrier",
-			"strict-two-phase-visibility", "exact-parent-repair-interruption", "classified-visibility-interruption",
-			"source-phase-queueability", "namespace-post-binding-identity", "exact-resource-acquisition",
+			"stable-item-identity", "volume-syncfs-barrier", "exact-resource-acquisition",
+			"fskit-sync-repair-v1", "fskit-source-publication-v1", "fskit-fragmented-write-v1",
+			"peer-complete-fifo-feedback",
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
 		}
-		response.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
-			SessionId: append([]byte(nil), h.session...), SessionGeneration: 1,
-			ResumeSecret: make([]byte, 32), Root: h.rootItem(),
-			Features:                       features,
-			SessionLeaseMilliseconds:       h.leaseMillis,
+		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
+			Root:                     h.rootItem(),
+			Features:                 features,
+			SessionLeaseMilliseconds: h.leaseMillis,
+			FskitRepairCursor: &authoritypb.VisibilityCursor{
+				Sequence: 1,
+				Phase:    authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE,
+			},
 			AuthorizationDeadlineUnixNanos: h.initialAuthorizationDeadline,
+			RoutesRevision:                 bytes.Repeat([]byte{0xab}, 32),
+			State:                          authoritypb.SessionState_SESSION_STATE_ACTIVE,
+			Purpose:                        authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+			FrontendProfile:                authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
 		}}
+	case *authoritypb.Request_Resume:
+		response.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}
+	case *authoritypb.Request_AbortAttach:
+		response.Body = &authoritypb.Response_AbortAttach{AbortAttach: &authoritypb.AbortAttachReply{State: authoritypb.SessionState_SESSION_STATE_ABORTED}}
 	case *authoritypb.Request_Reauthorize:
 		h.mu.Lock()
 		h.reauthorizations++
@@ -272,9 +303,10 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 	case *authoritypb.Request_StatFs:
 		h.mu.Lock()
 		h.statfsCalls++
+		nameMax := h.statfsNameMax
 		h.mu.Unlock()
 		response.Body = &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{
-			BlockSize: 4096, Blocks: 1 << 20, BlocksAvailable: 1 << 19, NameMax: 255,
+			BlockSize: 4096, Blocks: 1 << 20, BlocksAvailable: 1 << 19, NameMax: nameMax,
 		}}
 	case *authoritypb.Request_Lookup:
 		h.mu.Lock()
@@ -291,7 +323,7 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 				Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Inode: 2, Mode: 0o644, Nlink: 1},
 			},
 		}}
-	case *authoritypb.Request_NextVisibility:
+	case *authoritypb.Request_NextFskitRepair:
 		// The strict long-poll: nothing becomes visible in these tests, so the
 		// poll parks until the session ends.
 		<-ctx.Done()
@@ -337,7 +369,7 @@ func startV3TestAuthority(t *testing.T, handler *v3TestAuthority, serverTLS *tls
 }
 
 func v3TestEnsureRequest(address string, pki v3TestPKI, mountPath string) ensureAttachRequest {
-	return ensureAttachRequest{
+	req := ensureAttachRequest{
 		VolumeID:            "vol-v3",
 		AuthorityURL:        address,
 		AuthToken:           "capability",
@@ -355,6 +387,14 @@ func v3TestEnsureRequest(address string, pki v3TestPKI, mountPath string) ensure
 			RoutesRevision:     strings.Repeat("ab", 32),
 		},
 	}
+	req.observePreKernelMountAbsence = func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+		return &authoritypb.MountAbsenceProof{
+			ObservedUnixNanos: time.Now().UnixNano(),
+			Observation:       []byte("test getfsstat exact attach source present=false stage=startup"),
+			Component:         "portablefsd-test/exact-mount-inventory",
+		}, nil
+	}
+	return req
 }
 
 func ensureV3TestAttach(t *testing.T, r *registry, req ensureAttachRequest) *attach {
@@ -431,6 +471,8 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 		EnrollmentExpiresAtMs: enrollmentExpires.UnixMilli(), AuthorityGeneration: 7,
 		InitialAuthorizationExpiresAtMs: initialDeadline.UnixMilli(),
 	}
+	// Automatic enrollment uses the same operational protocol-6 FSKit profile
+	// and registry path as an ordinary direct attach.
 	stateDir := privateTestDir(t)
 	r := newRegistry(stateDir)
 	t.Cleanup(r.stopPersister)
@@ -452,7 +494,8 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("portablefsd automatic owner did not publish the installed deadline: got %d, want %d", installedDeadline, renewedDeadline.UnixMilli())
+			t.Fatalf("portablefsd automatic owner never installed the renewed authority grant: calls=%d deadline=%d want=%d",
+				handler.reauthorizationCalls(), installedDeadline, renewedDeadline.UnixMilli())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -543,10 +586,10 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	// The daemon — not the frontend — declared the strict barrier contract.
 	admitted := handler.recordedAttach()
 	if admitted == nil ||
-		admitted.GetCoherenceProfile() != authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT ||
-		admitted.GetCachedNameCapacity() != 1024 ||
-		admitted.GetRepairBudgetMillis() != 60_000 ||
-		admitted.GetNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED ||
+		admitted.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR ||
+		admitted.GetFskitCachedNameCapacity() != 1024 ||
+		admitted.GetFskitRepairBudgetMillis() != 60_000 ||
+		admitted.GetFskitNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED ||
 		hex.EncodeToString(admitted.GetRoutesRevision()) != strings.Repeat("ab", 32) ||
 		string(admitted.GetAccessToken()) != "capability" {
 		t.Fatalf("authority admitted contract %+v", admitted)
@@ -594,6 +637,18 @@ func TestV3AttachResolveCarriesContractAndOpsRouteToV3Backend(t *testing.T) {
 	d := a.v3Backend()
 	if d == nil {
 		t.Fatal("no v3 data plane installed")
+	}
+	authorityClient, ok := d.client.(*authorityrpc.Client)
+	if !ok {
+		t.Fatalf("v3 data-plane client = %T, want authorityrpc.Client", d.client)
+	}
+	if cursor := authorityClient.InitialLeaseCursor(); cursor != nil {
+		t.Fatalf("FSKit activation installed Linux lease cursor %+v", cursor)
+	}
+	cursor := authorityClient.InitialVisibilityCursor()
+	if cursor == nil || cursor.GetSequence() != 1 ||
+		cursor.GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE {
+		t.Fatalf("FSKit activation repair cursor = %+v, want exact COMPLETE sequence 1", cursor)
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for d.bridge.readyForOperations() != nil {
@@ -709,6 +764,48 @@ func TestV3AttachTransportModeIsEnforcedExactly(t *testing.T) {
 	})
 	if handler.recordedAttach() != nil {
 		t.Fatal("a refused transport still reached the authority attach")
+	}
+}
+
+func TestV3AttachRequiresFullFSKitWriteCapacityBeforeAttach(t *testing.T) {
+	pki := newV3TestPKI(t)
+	handler := newV3TestAuthority()
+	handler.maxFskitWrite = authorityrpc.RequiredFskitWriteBytes - 1
+	address := startV3TestAuthority(t, handler, pki.serverTLS)
+	r := newRegistry(privateTestDir(t))
+	t.Cleanup(r.stopPersister)
+	if _, _, err := r.ensure(context.Background(), v3TestEnsureRequest(
+		address, pki, "/Volumes/PortableFSV3ShortWriteCapacity",
+	)); err == nil || !strings.Contains(err.Error(), "fragmented-write capacity") {
+		t.Fatalf("short FSKit write capacity = %v, want pre-Attach refusal", err)
+	}
+	if handler.recordedAttach() != nil || len(r.list()) != 0 {
+		t.Fatal("short FSKit write capacity left authority or daemon attach state")
+	}
+}
+
+func TestV3DataPlanePreflightFailureReleasesActiveSessionBeforeFSKitMount(t *testing.T) {
+	pki := newV3TestPKI(t)
+	handler := newV3TestAuthority()
+	// Zero NAME_MAX is an exact, post-ACTIVE constructor failure: the authority
+	// session exists, but portablefsd has not exposed this attach to FSKit.
+	handler.statfsNameMax = 0
+	address := startV3TestAuthority(t, handler, pki.serverTLS)
+	r := newRegistry(privateTestDir(t))
+	t.Cleanup(r.stopPersister)
+	req := v3TestEnsureRequest(address, pki, "/Volumes/PortableFSV3PreflightFailure")
+	if _, _, err := r.ensure(context.Background(), req); err == nil || !strings.Contains(err.Error(), "NAME_MAX") {
+		t.Fatalf("v3 preflight failure = %v, want NAME_MAX refusal", err)
+	}
+	if len(r.list()) != 0 {
+		t.Fatal("failed pre-FSKit v3 attach stayed registered")
+	}
+	proof := handler.recordedDetach()
+	if proof == nil || proof.GetMountAbsence() == nil ||
+		proof.GetMountAbsence().GetObservedUnixNanos() == 0 ||
+		proof.GetMountAbsence().GetComponent() != "portablefsd-test/exact-mount-inventory" ||
+		!strings.Contains(string(proof.GetMountAbsence().GetObservation()), "stage=startup") {
+		t.Fatalf("pre-FSKit ACTIVE cleanup delivered proof %+v", proof)
 	}
 }
 

@@ -7,7 +7,7 @@ Conflicts=portablefs-authority@%i.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/portablefs-archiver
+ExecStart=/opt/portablefs/current/bin/portablefs-archiver
 Restart=no
 NoNewPrivileges=yes
 # The archiver's whole role is to read every inode of exactly one volume. A

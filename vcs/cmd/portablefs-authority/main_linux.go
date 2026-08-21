@@ -13,7 +13,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -22,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
 	"github.com/steerlabs/portablefs/vcs/internal/volumecap"
@@ -30,8 +33,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var version = "dev"
+
 type options struct {
-	listen, volumeID, root                         string
+	listen, adminListen, volumeID, root            string
 	projectID                                      uint
 	tlsCert, tlsKey, clientCA, capabilityPublicKey string
 	productAuthorizationPublicKey                  string
@@ -45,9 +50,19 @@ type options struct {
 	maxItemsPerSession, maxOpensPerSession         uint
 	maxItems, maxOpens                             uint
 	maxRetainedReplyBytes, maxFrameBytesInFlight   uint64
+	writeStaging                                   string
+	maxWriteStagingBytesPerSession                 uint64
+	maxWriteStagingBytes                           uint64
+	maxWriteTransactionsPerSession                 uint
+	maxWriteTransactions                           uint
+	writeTransactionProgressTimeout                time.Duration
+	writeTransactionAbsoluteTimeout                time.Duration
+	terminalDeliveryTimeout                        time.Duration
 	capabilityLifetime                             time.Duration
 	capabilityNonces                               uint
 	sessionLease                                   time.Duration
+	cacheLeaseTTL                                  time.Duration
+	maxCacheLeasesPerSession, maxCacheLeases       uint
 	maxInFlight, maxConnections                    int
 	handshakeTimeout, idleTimeout, writeTimeout    time.Duration
 	visibilityMembership                           string
@@ -56,9 +71,15 @@ type options struct {
 	maxRepairBudget, visibilityClockSkew           time.Duration
 }
 
+// Recovery always waits this frozen maximum after an unclean process restart,
+// even when the active policy grants a shorter TTL. An operator can therefore
+// lower the configured TTL without making grants from the previous process
+// outlive the restart barrier.
 func run() error {
 	var o options
+	showVersion := flag.Bool("version", false, "print exact release identity and exit")
 	flag.StringVar(&o.listen, "listen", "", "TCP address to listen on")
+	flag.StringVar(&o.adminListen, "admin-listen", "127.0.0.1:7444", "loopback HTTP address for metrics and health endpoints")
 	flag.StringVar(&o.volumeID, "volume-id", "", "exact volume identity served by this process")
 	flag.StringVar(&o.root, "root", "", "absolute provisioned XFS project-directory root")
 	flag.UintVar(&o.projectID, "project-id", 0, "expected nonzero XFS project ID")
@@ -78,19 +99,30 @@ func run() error {
 	flag.UintVar(&o.maxRead, "max-read-bytes", 1<<20, "maximum bytes in one read reply")
 	flag.UintVar(&o.maxWrite, "max-write-bytes", 1<<20, "maximum bytes in one write request")
 	flag.UintVar(&o.replaySlots, "max-replay-slots", 256, "maximum concurrent retry slots per session")
-	flag.UintVar(&o.maxSessions, "max-sessions", 1024, "maximum live mount sessions for this volume worker")
+	flag.UintVar(&o.maxSessions, "max-sessions", defaultMaxSessions, "maximum live mount sessions for this volume worker")
 	flag.UintVar(&o.maxLockRecords, "max-lock-records", 65536, "maximum held and waiting POSIX lock records")
-	flag.UintVar(&o.maxItemsPerSession, "max-items-per-session", 8192, "maximum descriptor-backed item capabilities per session")
+	flag.UintVar(&o.maxItemsPerSession, "max-items-per-session", defaultMaxItemsPerSession, "maximum descriptor-backed item capabilities per session")
 	flag.UintVar(&o.maxOpensPerSession, "max-opens-per-session", 4096, "maximum open file descriptions per session")
 	flag.UintVar(&o.maxItems, "max-items", 65536, "maximum descriptor-backed item capabilities for the worker")
 	flag.UintVar(&o.maxOpens, "max-opens", 32768, "maximum open file descriptions for the worker")
 	flag.Uint64Var(&o.maxRetainedReplyBytes, "max-retained-reply-bytes", 512<<20, "total bytes this worker may hold in replay slots")
 	flag.Uint64Var(&o.maxFrameBytesInFlight, "max-frame-bytes-in-flight", 512<<20, "total bytes this worker may have allocated for inbound frames")
+	flag.StringVar(&o.writeStaging, "write-staging-dir", "", "absolute private 0700 directory for unnamed transactional-write staging")
+	flag.Uint64Var(&o.maxWriteStagingBytesPerSession, "max-write-staging-bytes-per-session", 16<<30, "staging bytes reserved by one session")
+	flag.Uint64Var(&o.maxWriteStagingBytes, "max-write-staging-bytes", 64<<30, "staging bytes reserved by this worker")
+	flag.UintVar(&o.maxWriteTransactionsPerSession, "max-write-transactions-per-session", defaultWriteTransactionsPerSession(defaultMaxInFlight, defaultMaxWriteTransactions), "inert or committing write transactions owned by one session")
+	flag.UintVar(&o.maxWriteTransactions, "max-write-transactions", defaultMaxWriteTransactions, "inert or committing write transactions owned by this worker")
+	flag.DurationVar(&o.writeTransactionProgressTimeout, "write-transaction-progress-timeout", 2*time.Minute, "maximum idle interval between write transaction phases")
+	flag.DurationVar(&o.writeTransactionAbsoluteTimeout, "write-transaction-absolute-timeout", 30*time.Minute, "absolute lifetime of a write transaction")
+	flag.DurationVar(&o.terminalDeliveryTimeout, "terminal-delivery-timeout", 45*time.Second, "maximum drain from a terminal exact result through peer repair and source kernel publication receipt")
 	flag.DurationVar(&o.capabilityLifetime, "capability-max-lifetime", 15*time.Minute, "longest capability validity window this authority will honour")
 	flag.UintVar(&o.capabilityNonces, "capability-nonce-records", 65536, "single-use capability records retained until expiry")
 	flag.DurationVar(&o.sessionLease, "session-lease", 2*time.Minute, "renewable session lease")
-	flag.IntVar(&o.maxInFlight, "max-in-flight", 256, "requests concurrently executing per TLS connection")
-	flag.IntVar(&o.maxConnections, "max-connections", 2048, "maximum accepted TLS connections for the worker")
+	flag.DurationVar(&o.cacheLeaseTTL, "cache-lease-ttl", volumeserver.Protocol6MaxLeaseTTL, "authority TTL for protocol-6 cache leases (maximum 20s)")
+	flag.UintVar(&o.maxCacheLeasesPerSession, "max-cache-leases-per-session", 65536, "maximum live protocol-6 cache grants held by one mount")
+	flag.UintVar(&o.maxCacheLeases, "max-cache-leases", 1<<20, "maximum live protocol-6 cache grants held by this worker")
+	flag.IntVar(&o.maxInFlight, "max-in-flight", defaultMaxInFlight, "requests concurrently executing per TLS connection")
+	flag.IntVar(&o.maxConnections, "max-connections", defaultMaxConnections, "maximum accepted TLS connections for the worker; must be at least 4 times max-sessions")
 	flag.DurationVar(&o.handshakeTimeout, "tls-handshake-timeout", 10*time.Second, "maximum TLS handshake duration")
 	flag.DurationVar(&o.idleTimeout, "connection-idle-timeout", 5*time.Minute, "maximum interval without a complete request frame")
 	flag.DurationVar(&o.writeTimeout, "connection-write-timeout", 30*time.Second, "maximum response frame write duration")
@@ -103,12 +135,25 @@ func run() error {
 	flag.DurationVar(&o.maxRepairBudget, "max-repair-budget", 30*time.Second, "longest per-phase cache-repair deadline a strict mount may commit to before it is fenced; must be at least the mount's -repair-budget")
 	flag.DurationVar(&o.visibilityClockSkew, "visibility-clock-skew", 5*time.Second, "clock disagreement tolerated when a mount timestamps its own kernel-mount absence")
 	flag.Parse()
+	writeTransactionLimitOverridden := false
+	flag.Visit(func(value *flag.Flag) {
+		if value.Name == "max-write-transactions-per-session" {
+			writeTransactionLimitOverridden = true
+		}
+	})
+	if !writeTransactionLimitOverridden {
+		o.maxWriteTransactionsPerSession = defaultWriteTransactionsPerSession(o.maxInFlight, o.maxWriteTransactions)
+	}
+	if *showVersion {
+		_, _ = fmt.Fprintln(os.Stdout, version)
+		return nil
+	}
 	if os.Geteuid() == 0 {
 		return errors.New("portablefs-authority refuses to run as root; provision XFS first, then run as the volume service owner")
 	}
 	if (o.listen == "" && !systemdSocketAvailable()) || o.volumeID == "" || o.root == "" || o.projectID == 0 ||
-		o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.visibilityMembership == "" {
-		return errors.New("a listen address or one systemd socket, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, and visibility membership file are required")
+		o.adminListen == "" || o.tlsCert == "" || o.tlsKey == "" || o.clientCA == "" || o.capabilityPublicKey == "" || o.visibilityMembership == "" || o.writeStaging == "" {
+		return errors.New("a listen address or one systemd socket, nonempty admin-listen, volume-id, root, nonzero project-id, TLS files, client CA, capability public key, visibility membership file, and write staging directory are required")
 	}
 	hosted := o.productAuthorizationPublicKey != "" || o.productIssuer != "" || o.authorizationDomain != "" ||
 		o.owner != "" || o.cellID != "" || o.authorityID != "" || o.authorityGeneration != 0
@@ -119,14 +164,23 @@ func run() error {
 	maxUint32 := uint(^uint32(0))
 	if o.projectID > maxUint32 || o.maxFrame == 0 || o.maxFrame > maxUint32 ||
 		o.maxRead == 0 || o.maxRead > maxUint32 || o.maxWrite == 0 || o.maxWrite > maxUint32 ||
-		o.replaySlots == 0 || o.replaySlots > maxUint32 || o.sessionLease < time.Second ||
+		o.replaySlots == 0 || o.replaySlots > maxUint32 || o.sessionLease < time.Second || o.cacheLeaseTTL <= 0 || o.cacheLeaseTTL > volumeserver.Protocol6MaxLeaseTTL ||
+		o.maxCacheLeasesPerSession == 0 || o.maxCacheLeasesPerSession > maxUint32 || o.maxCacheLeases == 0 || o.maxCacheLeasesPerSession > o.maxCacheLeases ||
 		o.maxSessions == 0 || o.maxSessions > maxUint32 || o.maxLockRecords == 0 || o.maxLockRecords > maxUint32 ||
 		o.maxItemsPerSession == 0 || o.maxItemsPerSession > maxUint32 || o.maxOpensPerSession == 0 || o.maxOpensPerSession > maxUint32 ||
 		o.maxItems == 0 || o.maxItems > maxUint32 || o.maxOpens == 0 || o.maxOpens > maxUint32 ||
 		o.maxItemsPerSession > o.maxItems || o.maxOpensPerSession > o.maxOpens ||
+		o.maxWriteStagingBytesPerSession < uint64(o.maxWrite) ||
+		o.maxWriteStagingBytes < o.maxWriteStagingBytesPerSession ||
+		o.maxWriteTransactionsPerSession == 0 || o.maxWriteTransactionsPerSession > maxUint32 ||
+		o.maxWriteTransactions == 0 || o.maxWriteTransactions > maxUint32 || o.maxWriteTransactionsPerSession > o.maxWriteTransactions ||
+		o.writeTransactionProgressTimeout <= 0 || o.writeTransactionAbsoluteTimeout < o.writeTransactionProgressTimeout || o.terminalDeliveryTimeout < o.maxRepairBudget ||
 		o.capabilityLifetime <= 0 || o.capabilityNonces == 0 || o.capabilityNonces > uint(^uint32(0)) ||
 		o.maxInFlight < 2 || uint64(o.maxInFlight) > uint64(maxUint32) || o.maxConnections <= 0 || o.handshakeTimeout <= 0 || o.idleTimeout <= o.sessionLease || o.writeTimeout <= 0 {
 		return errors.New("protocol allocation and replay bounds must be positive uint32 values, and max-in-flight must admit an ordinary request alongside a blocking lock wait")
+	}
+	if err := validateConnectionCapacity(o.maxSessions, o.maxConnections); err != nil {
+		return err
 	}
 	// The reserve straddles a process boundary: the client checks the bounds it
 	// is told against the same constant, so both sides must read it from the
@@ -149,6 +203,10 @@ func run() error {
 		return errors.New("max-frame-bytes-in-flight must admit at least one maximal request")
 	}
 
+	metrics, err := authoritymetrics.New(o.volumeID)
+	if err != nil {
+		return err
+	}
 	store, err := xfsstore.Open(o.root, xfsstore.Config{
 		ExpectedProjectID: uint32(o.projectID),
 		ExpectedOwnerUID:  uint32(os.Geteuid()), ExpectedOwnerGID: uint32(os.Getegid()),
@@ -157,9 +215,39 @@ func run() error {
 		return fmt.Errorf("open authoritative XFS volume: %w", err)
 	}
 	defer store.Close()
+	readiness := authoritymetrics.NewReadiness(func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err := store.Health(); err != nil {
+			return err
+		}
+		root, err := store.Root()
+		if err != nil {
+			return err
+		}
+		_, err = store.Getattr(root)
+		return err
+	})
+	readiness.SetVolumeOpen(true)
+	defer readiness.SetVolumeOpen(false)
+	writeStaging, err := authorityrpc.OpenWriteAdmission(o.writeStaging)
+	if err != nil {
+		return err
+	}
+	defer writeStaging.Close()
+	fskitWriteStaging, err := authorityrpc.OpenFskitWriteStaging(o.writeStaging)
+	if err != nil {
+		return err
+	}
+	defer fskitWriteStaging.Close()
 	runtime, err := volumeserver.New(o.volumeID, volumeserver.Config{
 		SessionLease: o.sessionLease, MaxReplaySlots: uint32(o.replaySlots),
 		MaxSessions: uint32(o.maxSessions), MaxLockRecords: uint32(o.maxLockRecords),
+		OnSessionActive:   func(volumeserver.SessionID) { metrics.SessionActivated() },
+		OnSessionTerminal: func(volumeserver.SessionID) { metrics.SessionEnded() },
 	})
 	if err != nil {
 		return err
@@ -179,42 +267,25 @@ func run() error {
 	for _, cleared := range membership.ClearedByOperatorAssertion() {
 		fmt.Fprintf(os.Stderr, "portablefs-authority: operator asserted prior strict mount %x fenced; cleared from durable membership for volume %s\n", cleared, o.volumeID)
 	}
-	if priorDisposition != volumeserver.PriorEpochStrictMountsFenced {
-		return errors.New("prior strict mounts remain active; fence their kernel mounts before starting a new authority epoch")
-	}
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: priorDisposition, Membership: membership, Fencer: runtime,
-		MaxCachedNameCapacity: o.maxCachedNameCapacity,
-		MaxRepairBudget:       o.maxRepairBudget,
-		MaxClockSkew:          o.visibilityClockSkew,
-		OnFence: func(id volumeserver.SessionID, reason error) {
-			// One mount left the barrier. This is deliberately not a process
-			// failure: the volume keeps serving every other mount.
-			fmt.Fprintf(os.Stderr, "portablefs-authority: fenced strict mount %x: %v\n", id, reason)
-		},
-		OnRefusedCommitment: func(id volumeserver.SessionID, reason error) {
-			// The mount only learns an errno, so this is the one place an
-			// operator can see which declared number exceeded which bound.
-			fmt.Fprintf(os.Stderr, "portablefs-authority: refused strict attach %x: %v\n", id, reason)
-		},
+	// The authority is the source of truth for the machine-local routing
+	// topology, so assembling coordination reads the declaration out of its own
+	// volume root before it serves anything. A volume with no loaded revision
+	// cannot tell an agreeing mount from a disagreeing one, so a declaration that
+	// will not parse stops the process here rather than admitting mounts against
+	// a topology this volume does not have.
+	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
+		Store: store, Fencer: runtime, Locks: runtime.Locks(),
+		Membership: membership, Prior: priorDisposition, ClockSkew: o.visibilityClockSkew,
+		MaxCachedNameCapacity: o.maxCachedNameCapacity, MaxRepairBudget: o.maxRepairBudget,
+		CacheLeaseTTL:            o.cacheLeaseTTL,
+		MaxCacheLeasesPerSession: uint32(o.maxCacheLeasesPerSession),
+		MaxCacheLeases:           uint64(o.maxCacheLeases),
+		OnBarrier:                metrics.ObserveVisibilityBarrier,
 	})
 	if err != nil {
 		return err
 	}
-	// The authority is the source of truth for the machine-local routing
-	// topology, so it reads the declaration out of its own volume root before it
-	// serves anything. A volume with no loaded revision cannot tell an agreeing
-	// mount from a disagreeing one, so a declaration that will not parse stops
-	// the process here rather than admitting mounts against a topology this
-	// volume does not have.
-	routes, err := authorityrpc.NewRoutesController(store, visibility)
-	if err != nil {
-		return err
-	}
-	if err := routes.Load(); err != nil {
-		return fmt.Errorf("load machine-local routing declaration: %w", err)
-	}
-	if revision, err := routes.Revision(); err == nil {
+	if revision, err := coordination.Routes.Revision(); err == nil {
 		fmt.Fprintf(os.Stderr, "portablefs-authority: volume %s routing revision %x\n", o.volumeID, revision)
 	}
 	publicKey, err := readEd25519PublicKey(o.capabilityPublicKey)
@@ -287,12 +358,25 @@ func run() error {
 	// Serve refuses to start if the handler ever advertises anything else.
 	maxFrame, maxInFlight := uint32(o.maxFrame), o.maxInFlight
 	handler := &authorityrpc.VolumeHandler{
-		Store: store, Runtime: runtime, Authorizer: authorizer,
-		Visibility: visibility, Routes: routes, Restore: restore, Quiesce: quiesce,
+		Store: store, Runtime: runtime, Authorizer: authorizer, Metrics: metrics,
+		Restore: restore, Quiesce: quiesce,
 		MaxFrame: maxFrame, MaxRead: uint32(o.maxRead), MaxWrite: uint32(o.maxWrite), MaxInFlight: uint32(maxInFlight),
 		MaxItemsPerSession: uint32(o.maxItemsPerSession), MaxOpensPerSession: uint32(o.maxOpensPerSession),
 		MaxItems: uint32(o.maxItems), MaxOpens: uint32(o.maxOpens),
-		MaxRetainedReplyBytes: o.maxRetainedReplyBytes,
+		MaxRetainedReplyBytes:   o.maxRetainedReplyBytes,
+		WriteAdmission:          writeStaging,
+		MaxFskitWriteBytes:      authorityrpc.RequiredFskitWriteBytes,
+		FskitWriteStaging:       fskitWriteStaging,
+		MaxWriteBytesPerSession: o.maxWriteStagingBytesPerSession, MaxWriteBytesInFlight: o.maxWriteStagingBytes,
+		MaxWritesPerSession: uint32(o.maxWriteTransactionsPerSession), MaxWrites: uint32(o.maxWriteTransactions),
+		WriteAdmissionProgressTimeout: o.writeTransactionProgressTimeout, WriteAbsoluteTimeout: o.writeTransactionAbsoluteTimeout,
+		MaxFskitWriteStagingBytesPerSession: o.maxWriteStagingBytesPerSession,
+		MaxFskitWriteStagingBytes:           o.maxWriteStagingBytes,
+		MaxFskitWritesPerSession:            uint32(o.maxWriteTransactionsPerSession),
+		MaxFskitWrites:                      uint32(o.maxWriteTransactions),
+		FskitWriteProgressTimeout:           o.writeTransactionProgressTimeout,
+		FskitWriteAbsoluteTimeout:           o.writeTransactionAbsoluteTimeout,
+		TerminalDeliveryTimeout:             o.terminalDeliveryTimeout,
 		OnStorageFailure: func(err error) {
 			select {
 			case storageFailure <- err:
@@ -308,15 +392,40 @@ func run() error {
 			stop()
 		},
 	}
+	coordination.Bind(handler)
 	server := &authorityrpc.Server{
-		Handler: handler, MaxFrame: maxFrame, MaxInFlight: maxInFlight, MaxConnections: o.maxConnections,
+		Handler: handler, Metrics: metrics, MaxFrame: maxFrame, MaxInFlight: maxInFlight, MaxConnections: o.maxConnections,
 		MaxFrameBytesInFlight: o.maxFrameBytesInFlight,
 		HandshakeTimeout:      o.handshakeTimeout, IdleTimeout: o.idleTimeout, WriteTimeout: o.writeTimeout,
+		OnServing: readiness.SetListenerUp,
 	}
 	listener, err := authorityListener(o.listen)
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
+	adminListener, err := net.Listen("tcp", o.adminListen)
+	if err != nil {
+		return fmt.Errorf("listen on authority admin address %s: %w", o.adminListen, err)
+	}
+	adminServer := &http.Server{
+		Handler:           authoritymetrics.AdminHandler(metrics.Registry(), readiness),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+	}
+	defer adminServer.Close()
+	go func() {
+		if err := adminServer.Serve(adminListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// An unexpected control-plane failure after a successful bind never
+			// terminates the data plane. Startup bind failure above remains fatal.
+			log.Printf("portablefs-authority: event=admin_listener_failed volume=%q address=%q error=%q", o.volumeID, o.adminListen, err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = adminServer.Close()
+	}()
 	go func() {
 		ticker := time.NewTicker(o.sessionLease / 4)
 		defer ticker.Stop()
@@ -337,6 +446,19 @@ func run() error {
 		return fmt.Errorf("strict cache coherence failed and this epoch was fenced: %w", failure)
 	default:
 		return serveErr
+	}
+}
+
+func fenceMetricReason(reason error) authoritymetrics.FenceReason {
+	switch {
+	case errors.Is(reason, volumeserver.ErrVisibilityLost):
+		return authoritymetrics.FenceFskitRepairLost
+	case errors.Is(reason, volumeserver.ErrVisibilityDeadline):
+		return authoritymetrics.FenceRepairDeadline
+	case errors.Is(reason, volumeserver.ErrVisibilitySequence), errors.Is(reason, volumeserver.ErrSourcePublicationGate):
+		return authoritymetrics.FenceProtocolViolation
+	default:
+		return authoritymetrics.FenceOther
 	}
 }
 

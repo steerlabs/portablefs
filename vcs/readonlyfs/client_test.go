@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,12 +97,42 @@ func TestClientRejectsAuthorityDirectoryPageAboveRequestedBound(t *testing.T) {
 	}
 }
 
+func TestClientAcknowledgesVisibilityWithoutCachingNamespaceState(t *testing.T) {
+	acknowledged := make(chan *authoritypb.VisibilityCursor, 1)
+	rpc := &fakeAuthority{
+		root: testItem(1, authoritypb.Attr_DIRECTORY, []byte("root"), 0),
+		visibilityEvent: &authoritypb.VisibilityEvent{Cursor: &authoritypb.VisibilityCursor{
+			Sequence: 2,
+			Phase:    authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE,
+		}},
+		visibilityAcknowledged: acknowledged,
+	}
+	client := newClient(rpc, time.Second)
+	t.Cleanup(func() { _ = client.Close() })
+
+	select {
+	case cursor := <-acknowledged:
+		if cursor.GetSequence() != 2 || cursor.GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE {
+			t.Fatalf("acknowledged cursor = %v", cursor)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cacheless client did not acknowledge the visibility event")
+	}
+}
+
 type fakeAuthority struct {
+	// releases counts authenticated detaches. Close must send exactly one, and
+	// a session that leaves without one costs the next writer two repair
+	// budgets, so the count is the assertion.
+	releases atomic.Int64
+
 	mu                     sync.Mutex
 	operations             []string
 	oversizedDirectoryPage bool
 	readDirCalls           int
 	root                   *authoritypb.Item
+	visibilityEvent        *authoritypb.VisibilityEvent
+	visibilityAcknowledged chan<- *authoritypb.VisibilityCursor
 }
 
 func (f *fakeAuthority) CallMutation(_ context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
@@ -164,8 +195,33 @@ func (f *fakeAuthority) CallRead(_ context.Context, request *authoritypb.Request
 	}
 }
 
-func (f *fakeAuthority) Close() error                { return nil }
-func (f *fakeAuthority) IOLimits() (uint32, uint32)  { return 2, 256 }
+func (f *fakeAuthority) Close() error { return nil }
+
+func (f *fakeAuthority) ReleaseBeforeMount(context.Context) error {
+	f.releases.Add(1)
+	return nil
+}
+func (f *fakeAuthority) IOLimits() (uint32, uint32) { return 2, 256 }
+func (f *fakeAuthority) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
+	return &authoritypb.VisibilityCursor{Sequence: 1}
+}
+func (f *fakeAuthority) NextVisibility(ctx context.Context, _ *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error) {
+	f.mu.Lock()
+	event := f.visibilityEvent
+	f.visibilityEvent = nil
+	f.mu.Unlock()
+	if event != nil {
+		return event, nil
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (f *fakeAuthority) AckVisibility(_ context.Context, cursor *authoritypb.VisibilityCursor) error {
+	if f.visibilityAcknowledged != nil {
+		f.visibilityAcknowledged <- cursor
+	}
+	return nil
+}
 func (f *fakeAuthority) Root() *authoritypb.Item     { return f.root }
 func (f *fakeAuthority) SessionLease() time.Duration { return time.Hour }
 
@@ -174,5 +230,29 @@ func testItem(inode uint64, kind authoritypb.Attr_Kind, token []byte, size int64
 		Attr:           &authoritypb.Attr{Inode: inode, Kind: kind, Mode: 0o644, Nlink: 1, Size: size},
 		StableIdentity: bytes.Repeat([]byte{byte(inode)}, 16),
 		Token:          append([]byte(nil), token...),
+	}
+}
+
+// A session that leaves without an authenticated detach stays in the
+// authority's barrier audience. The next peer mutation then waits this
+// session's whole repair budget for a phase nobody will acknowledge, and a
+// further budget of post-fence grace after that -- so the writer pays two
+// budgets for a reader that has already exited. Close must not do that.
+func TestClientDetachesBeforeClosingTheTransport(t *testing.T) {
+	rpc := &fakeAuthority{root: testItem(1, authoritypb.Attr_DIRECTORY, []byte("root"), 0)}
+	client := newClient(rpc, time.Second)
+	if err := client.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if released := rpc.releases.Load(); released != 1 {
+		t.Fatalf("close sent %d authenticated detaches, want exactly 1", released)
+	}
+	// Close is idempotent, and a second one must not send a second detach: the
+	// session is already gone and Detach on a departed session is an error.
+	if err := client.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if released := rpc.releases.Load(); released != 1 {
+		t.Fatalf("a repeated close sent %d detaches, want the first one only", released)
 	}
 }

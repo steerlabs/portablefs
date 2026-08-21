@@ -7,8 +7,11 @@ hosted stack adds a product-neutral manager and a narrow storage-cell control
 loop around the same authority data plane. It does not put the manager in the
 filesystem I/O path and it does not create a second writable filesystem truth.
 
+The exact mount transport is Linux FUSE. Shipping macOS 26 uses the named
+best-effort FSKit data plane against the same hosted authority.
+
 ```text
-product backend                    Mac / Linux mount
+product backend                    Linux mount
       | user authorization               | local private key + CSR
       +--------------------+--------------+
                            |
@@ -83,8 +86,28 @@ before a local process-absence proof.
 one strict root-owned config, constructs a fixed authority argument shape, and
 execs a root-owned authority binary. The authority itself runs under a unique
 service UID, receives its listener from systemd, sees only one bind-mounted
-volume/config/state triple, has no network namespace of its own, and refuses
-root.
+volume/config/state/staging set, has no network namespace of its own, and
+refuses root. Staging is outside the served namespace but inherits the exact
+volume XFS project and hard quota; its bind source cannot be replaced by the
+authority UID.
+
+`portablefs-files` is the optional read-only product adapter. It accepts only
+short-lived, body-bound requests signed by its colocated product backend, then
+uses a read-only capability and its own proof-of-possession identity to speak
+directly to the volume authority. It has bounded sessions, cursors, operations,
+downloads, request bodies, previews, and directory pages. It never mounts a
+volume and keeps no namespace or content cache. Protocol 5 has one strict
+session model, so the adapter still joins the visibility barrier with an exact
+no-kernel-mount observation and acknowledges each visibility phase immediately
+after observing it. It never adds a second filesystem truth or a weaker
+coherence profile.
+
+The intended deployment is one adapter beside one product backend in a shared
+pod network namespace, listening only on loopback. The product backend's exact
+public request-signing key is the adapter's sole HTTP trust root; the adapter
+does not receive that backend's private key or product-control credentials. Its
+private authority identity may persist for the pod lifetime, but active
+sessions and cursors are intentionally process-local and reconstructible.
 
 ## Authorization is deliberately two-party
 
@@ -104,10 +127,12 @@ useless. The manager's mTLS API also binds every product operation to the exact
 product issuer in its control certificate; a product principal cannot inspect,
 restart, retire, or mint for another product's volume.
 
-The client private key is generated on the Mac, Linux mount host, or sandbox.
-Only a signed CSR crosses the network. The manager verifies proof of possession,
-overwrites CSR identity fields, and returns a client certificate and capability
-bound to the CSR's SPKI. It never receives or generates the client private key.
+The client private key is generated on the Linux mount host, sandbox, or macOS
+host. The signed macOS product exercises the same key-custody boundary. Only a
+signed CSR crosses the network.
+The manager verifies proof of possession, overwrites CSR identity fields, and
+returns a client certificate and capability bound to the CSR's SPKI. It never
+receives or generates the client private key.
 
 When the product explicitly requests `automatic_reauthorization: true`, that
 initial two-party decision also creates one bounded mount enrollment. Ordinary
@@ -146,13 +171,15 @@ longer-lived enrollment certificate for the same local key. Its sole identity is
 Manager's enrollment endpoints; a short-lived authority client certificate has
 a different identity and cannot authenticate there.
 
-The product starts `portablefs mount` with the initial credential plus the
-Manager origin, Manager trust material, enrollment ID/certificate, exact
-authority generation, and both deadlines. After attach, one owner takes over:
-the per-mount FUSE supervisor on Linux or one renewer inside the existing
-`portablefsd` attach on macOS. There is no global mount daemon and no second
-sequencer. An automatic mount exposes no manual Linux rotation socket, and
-`portablefsd` refuses manual rotation for that attach.
+The production launcher starts `portablefs mount` with the initial credential
+plus the Manager origin, Manager trust material, enrollment ID/certificate,
+exact authority generation, and both deadlines. After Attach, the per-mount
+Linux FUSE supervisor is the one renewal owner. There is no global mount daemon
+and no second sequencer, and an automatic mount exposes no manual rotation
+socket.
+
+The macOS data plane has an equivalent single renewer inside its portablefsd
+attach and refuses manual rotation.
 
 The owner immediately asks
 `POST /v1/mount-enrollments/{id}/reauthorizations` for sequence one, then
@@ -182,7 +209,7 @@ liveness lane and:
 - extends the signed authorization deadline without replacing the filesystem
   session, locks, handles, or strict-cache membership.
 
-Attach returns the exact authority-verified initial deadline. The owner checks
+Activate returns the exact authority-verified initial deadline. The owner checks
 it against the Manager response and schedules only from the authority value, so
 a copied or malformed CLI timestamp cannot extend the safety window.
 
@@ -197,11 +224,12 @@ Changing the key is a new mTLS principal and requires a new mount/session.
 
 Temporary Manager failures retry the same sequence with bounded exponential
 backoff. A definitive denial fails closed immediately. If renewal cannot finish
-before the safety margin, Linux unmounts and the macOS data plane becomes
-terminal so its existing revocation watchdog performs the exact FSKit detach
-while the last grant is still valid. Clean detach closes the enrollment; the
-product may revoke it earlier. Revocation cannot erase an installed grant, so
-its remaining exposure is bounded by the short grant lifetime.
+before the safety margin, Linux unmounts while the last grant is still valid.
+Clean detach closes the enrollment; the product may revoke it earlier.
+Revocation cannot erase an installed grant, so its remaining exposure is
+bounded by the short grant lifetime. The qualification macOS implementation
+instead terminalizes its data plane and exercises its FSKit-detach watchdog;
+that historical path does not broaden production platform support.
 
 The security tradeoff is intentionally simple: possession of both the
 enrollment certificate and local private key can renew access to that one
@@ -215,15 +243,17 @@ Standalone mounts omit all enrollment flags and retain the explicit
 incomplete automatic configuration is refused and never falls back.
 
 Automatic authorization does not weaken strict-session continuity rules. If a
-Mac sleeps past the installed grant, `portablefsd` restarts, the Linux mount
-owner exits, or the authority changes epoch/generation, that exact session
-cannot safely be reconstructed from kernel caches. It fails closed and requires
-the existing exact unmount/remount flow. A normal sleep or network interruption
-shorter than the installed window simply resumes the same renewal loop.
+qualification Mac sleeps past the installed grant, `portablefsd` restarts, the
+Linux mount owner exits, or the authority changes epoch/generation, that exact
+session cannot safely be reconstructed from kernel caches. It fails closed and
+requires the existing exact unmount/remount flow. A normal sleep or network
+interruption shorter than the installed window simply resumes the same renewal
+loop.
 
 The product writes the returned certificates and CA bundle to protected local
-files and invokes the same cross-platform command shape (timestamps are Unix
-milliseconds):
+files and invokes this production Linux command shape (timestamps are Unix
+milliseconds). A qualification Mac can exercise the same credential syntax,
+but that does not bypass its pre-Attach platform gate:
 
 ```text
 PORTABLEFS_MOUNT_TOKEN="$CAPABILITY" portablefs mount "$VOLUME" "$PATH" \
@@ -353,7 +383,6 @@ deliberately neither `409` nor `503`: it is a durable deployment fact that no
 retry and no volume-state change resolves, and a client that filed it under
 "busy" would let a misconfigured deployment fail every archive sweep silently
 forever.
-
 The renewal-fence request and response have these exact shapes:
 
 ```json

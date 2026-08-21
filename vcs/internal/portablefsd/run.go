@@ -31,8 +31,13 @@ func (s *Server) Run(ctx context.Context) error {
 		return err
 	}
 	defer releaseSingleton(socketSingleton)
+	frontendSingleton, err := acquireFrontendSingleton(s.cfg.FrontendSocket)
+	if err != nil {
+		return err
+	}
+	defer releaseSingleton(frontendSingleton)
 
-	// Registry construction is intentionally behind BOTH singleton locks.
+	// Registry construction is intentionally behind every singleton lock.
 	// It opens local backing roots, replays the binding journal, stamps legacy
 	// WAL identity, sweeps WAL state, and starts a persister. A daemon that
 	// loses either lock must perform none of those operations.
@@ -42,19 +47,25 @@ func (s *Server) Run(ctx context.Context) error {
 	if err := socketSingleton.validate(); err != nil {
 		return fmt.Errorf("revalidate portablefsd socket singleton: %w", err)
 	}
+	if err := frontendSingleton.validate(); err != nil {
+		return fmt.Errorf("revalidate portablefsd frontend singleton: %w", err)
+	}
 	// A Unix socket pathname survives an unclean process exit and a machine
-	// reboot even though no listener survives with it. Reclaim only the two
-	// canonical sockets after this process owns BOTH singleton locks. A live
+	// reboot even though no listener survives with it. Reclaim only the three
+	// canonical sockets after this process owns every singleton lock. A live
 	// PortableFS daemon cannot reach this point concurrently, and the pinned
 	// directory/inode checks below refuse every non-socket or replaced entry.
 	// This is normal daemon restart, not an ownership fallback.
-	if filepath.Dir(s.cfg.FrontendSocket) != socketSingleton.dirPath ||
-		filepath.Dir(s.cfg.ControlSocket) != socketSingleton.dirPath ||
+	if filepath.Dir(s.cfg.ControlSocket) != socketSingleton.dirPath ||
+		filepath.Dir(s.cfg.FrontendSocket) != frontendSingleton.dirPath ||
 		s.cfg.FrontendSocket == s.cfg.ControlSocket {
-		return errors.New("portablefsd frontend and control sockets must be distinct entries in the singleton socket directory")
+		return errors.New("portablefsd frontend and control sockets must be distinct entries under their pinned exact roots")
 	}
-	for _, socketPath := range []string{s.cfg.FrontendSocket, s.cfg.ControlSocket} {
-		if err := reclaimStaleUnixSocket(socketSingleton, socketPath); err != nil {
+	if err := reclaimStaleUnixSocket(socketSingleton, s.cfg.ControlSocket); err != nil {
+		return err
+	}
+	for _, socketPath := range []string{s.cfg.FrontendSocket, s.mountRootSocketPath()} {
+		if err := reclaimStaleUnixSocket(frontendSingleton, socketPath); err != nil {
 			return err
 		}
 	}
@@ -346,6 +357,14 @@ func acquireSingleton(controlSocket string) (*singletonLock, error) {
 	return acquireLock(dir, ".portablefsd.lock", dir)
 }
 
+func acquireFrontendSingleton(frontendSocket string) (*singletonLock, error) {
+	if frontendSocket == "" {
+		return nil, errors.New("portablefsd frontend socket is required")
+	}
+	dir := filepath.Dir(frontendSocket)
+	return acquireLock(dir, ".portablefsd-frontend.lock", dir)
+}
+
 func acquireLock(dirPath, name, owner string) (*singletonLock, error) {
 	guard, err := tryAcquireLock(dirPath, name, owner)
 	if err == nil {
@@ -568,6 +587,21 @@ func Main(version string) int {
 	if showIdentity {
 		_ = json.NewEncoder(os.Stdout).Encode(fskitidentity.Current())
 		return 0
+	}
+	if err := prepareRuntimeConfig(&cfg); err != nil {
+		log.Printf("portablefsd: %v", err)
+		return 1
+	}
+	// After this point every diagnostic has somewhere to go. Config failures
+	// above still report to the inherited stderr, because the log's location is
+	// derived from the very config that has not been validated yet.
+	daemonLog, err := openDaemonLog(&cfg)
+	if err != nil {
+		log.Printf("%v", err)
+		return 1
+	}
+	if daemonLog != nil {
+		defer daemonLog.Close()
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

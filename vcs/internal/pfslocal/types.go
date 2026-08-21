@@ -41,10 +41,6 @@ const (
 	// cookies are scoped to the retained authority handle that issued them, so
 	// the zero-value behavior cannot reproduce a correct multi-page walk.
 	//
-	// ProtocolMinor 11 adds Envelope.SourcePhaseQueueable. Ignoring the bit
-	// recreates the own-source PREPARE cycle it distinguishes, so the existing
-	// minimum-minor handshake is the compatibility boundary.
-	//
 	// ProtocolMinor 12 adds ResourceReplyDisposition. A successful resource
 	// reply can transfer handles to VolumeCore and a (possibly shorter) prefix
 	// of items to FSKit. Socket delivery proves neither ownership boundary, so
@@ -57,7 +53,12 @@ const (
 	// ProtocolMinor 14 carries an authority-attested post-binding identity on
 	// namespace targets. macOS needs the association to refresh a retained vnode
 	// through a new rename/hard-link coordinate without reusing a stale locator.
-	ProtocolMinor = 14
+	//
+	// ProtocolMinor 15 is the coordinated one-version authority-v5 cut. It
+	// requires failure-atomic DATA/CONTROL transport activation, replaces source
+	// visibility phases with daemon-owned source-publication gates, and makes
+	// every callback's PublicationAck semantic-commit verdict explicit.
+	ProtocolMinor = 15
 	MaxFrameBytes = 16 << 20
 )
 
@@ -86,11 +87,6 @@ type Envelope struct {
 	// callback cannot return before its last request is answered. So a
 	// retraction always has a carrier that precedes the install.
 	PublicationRetracted bool
-	// SourcePhaseQueueable is valid only on an ordered mutating request with a
-	// nonzero OperationID. It is the frontend's request-scoped proof that this
-	// callback has issued no ordinary/cache-reading request and is therefore
-	// excluded from a distinct own-source PREPARE drain while it waits.
-	SourcePhaseQueueable bool
 	Body                 any
 }
 
@@ -112,9 +108,17 @@ type HelloReply struct {
 }
 
 type PublicationAck struct {
-	PublishedRequestID uint64
-	OperationID        uint64
+	OperationID    uint64
+	SemanticCommit PublicationSemanticCommit
 }
+
+type PublicationSemanticCommit uint32
+
+const (
+	PublicationSemanticCommitUnspecified  PublicationSemanticCommit = 0
+	PublicationSemanticCommitPublished    PublicationSemanticCommit = 1
+	PublicationSemanticCommitNotPublished PublicationSemanticCommit = 2
+)
 
 // ResourceReplyDisposition is the final ownership verdict for one successful
 // resource-bearing reply on this exact connection.
@@ -397,7 +401,10 @@ type RenameRequest struct {
 	ToName    []byte
 	NoReplace bool
 }
-type RenameReply struct{}
+type RenameReply struct {
+	NewPostIdentity []byte
+	OldPostIdentity []byte
+}
 
 type SymlinkRequest struct {
 	Dir    Item
@@ -505,11 +512,6 @@ type VisibilityTarget struct {
 	PostIdentity   []byte
 }
 
-type RoutesChange struct {
-	Revision []byte
-	Rules    []byte
-}
-
 type V3VisibilityEvent struct {
 	AuthorityEpoch     []byte
 	Cursor             VisibilityCursor
@@ -517,18 +519,11 @@ type V3VisibilityEvent struct {
 	MutationSlot       uint32
 	Targets            []VisibilityTarget
 	MutationSequence   uint64
-	Routes             *RoutesChange
-	// LocalOperationID is nonzero only for this mount's own authority
-	// mutation. It names the exact pfslocal publication unit that PREPARE must
-	// exempt and deferred COMPLETE must wait to observe published.
-	LocalOperationID uint64
 }
 
 type VisibilityAckRequest struct {
 	AuthorityEpoch            []byte
 	Cursor                    VisibilityCursor
-	Blocked                   bool
-	Reason                    string
 	OrderedAdmissionContended bool
 }
 

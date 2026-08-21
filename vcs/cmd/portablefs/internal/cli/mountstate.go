@@ -90,7 +90,7 @@ type mountState struct {
 	// the volume publishes no declaration) the two differ, and
 	// LocalRoutesPerMachine records exactly that case.
 	//
-	// Together they let `portablefs route`, `portablefs status` and
+	// Together they let `portablefs route`, `portablefs mounts` and
 	// `portablefs prune-local` answer without re-reading the volume.
 	LocalRoutes           []string `json:"localRoutes,omitempty"`
 	LocalRouteRevision    string   `json:"localRouteRevision,omitempty"`
@@ -108,11 +108,20 @@ type mountState struct {
 	// Status is the mount's health beyond pid-liveness. Empty means healthy
 	// ("live"); mountStatusCredentialExpired means the daemon is running but
 	// this mount's credential ended, so filesystem access is degraded until
-	// the mount is made again with a fresh volume mount capability. Additive:
-	// older records have no field.
+	// the mount is made again with a fresh volume mount capability;
+	// mountStatusRevoked means the mount self-revoked and refuses to serve.
+	// Additive: older records have no field.
 	Status string `json:"status,omitempty"`
 	// StatusChangedAtMs is when Status last transitioned (unix ms).
 	StatusChangedAtMs int64 `json:"statusChangedAtMs,omitempty"`
+	// StatusReason is the machine-readable class behind a revoked status: one
+	// token from the shared revocation vocabulary, the same on both platforms.
+	// A program branches on this; StatusDetail is the sentence a human reads.
+	// Both are recorded only for mountStatusRevoked — no other status has a
+	// classification to carry, and a record that carried one anyway would be
+	// two different verdicts wearing one file.
+	StatusReason string `json:"statusReason,omitempty"`
+	StatusDetail string `json:"statusDetail,omitempty"`
 	// ForceParkAcknowledged is the durable response frame for the exact
 	// identity-bound SIGUSR1 force protocol used by Linux FUSE. The owner
 	// publishes it only after CloseJournalDurable has fsynced the recovery
@@ -134,6 +143,77 @@ const (
 // but operations degrade until re-login and remount.
 const mountStatusCredentialExpired = "credential-expired"
 
+// mountStatusRevoked marks a mount that has self-revoked: it refuses to serve
+// and can never serve again. It is deliberately independent of whether the
+// kernel mount is still installed, because those are different facts and
+// conflating them is how a dead mount kept reporting itself live. A revoked
+// mount whose MNT_DETACH failed is still installed, still listed by findmnt,
+// and still answers nothing.
+const mountStatusRevoked = "revoked"
+
+// The shared revocation vocabulary. These are the exact tokens both engines
+// produce — the Linux fusev3 frontend classifies its own fatal cause into the
+// first four (see fusev3's RevocationSessionTerminal and friends), the macOS
+// supervisor's watchdog produces the last three — so `portablefs mounts --json`
+// answers with one vocabulary regardless of which platform recorded it.
+const (
+	mountRevokedSessionTerminal      = "session-terminal"
+	mountRevokedRepairBudgetExceeded = "repair-budget-exceeded"
+	mountRevokedRoutesChanged        = "routes-changed"
+	mountRevokedCoherenceViolation   = "coherence-violation"
+	mountRevokedDaemonUnreachable    = "daemon-unreachable"
+	mountRevokedAttachNotOwned       = "attach-not-owned"
+	// mountRevokedUnclassified is what an unrecognized token becomes. An
+	// engine that grows a new reason must not be able to make a revocation
+	// unrecordable, and mislabelling it as one of the known classes would be
+	// worse than admitting the record cannot name it.
+	mountRevokedUnclassified = "unclassified"
+)
+
+// mountRevocation is one platform's revocation verdict in the shape the
+// supervisor persists. It is deliberately platform-neutral: the Linux engine
+// reports a fusev3.RevocationReport and the macOS watchdog reports its own
+// probe decision, but both reduce to the same three facts, and `portablefs
+// mounts` must not have to know which one produced a row.
+type mountRevocation struct {
+	reason string
+	detail string
+	// kernelStateWithdrawn is false when the mount is revoked but its kernel
+	// mount could not be removed. It is the residual an operator has to know
+	// about: nothing this process can do will discharge it.
+	kernelStateWithdrawn bool
+}
+
+func validMountRevocationReason(reason string) bool {
+	switch reason {
+	case mountRevokedSessionTerminal, mountRevokedRepairBudgetExceeded,
+		mountRevokedRoutesChanged, mountRevokedCoherenceViolation,
+		mountRevokedDaemonUnreachable, mountRevokedAttachNotOwned,
+		mountRevokedUnclassified:
+		return true
+	}
+	return false
+}
+
+func normalizeMountRevocationReason(reason string) string {
+	if validMountRevocationReason(reason) {
+		return reason
+	}
+	return mountRevokedUnclassified
+}
+
+// maxStatusDetail bounds the prose a revoking engine may put in the record.
+// The sentence is diagnostic, and a state file is not a log.
+const maxStatusDetail = 2048
+
+func boundedStatusDetail(detail string) string {
+	detail = strings.TrimSpace(strings.ReplaceAll(detail, "\x00", ""))
+	if len(detail) > maxStatusDetail {
+		detail = strings.TrimSpace(detail[:maxStatusDetail])
+	}
+	return detail
+}
+
 var errRecordedMountAbsent = errors.New("recorded kernel mount is absent")
 
 func recordedKernelMountPresent(st *mountState) (bool, error) {
@@ -149,8 +229,18 @@ func recordedKernelMountPresent(st *mountState) (bool, error) {
 }
 
 // mountHealth folds pid-liveness and the persisted status into the one word
-// `portablefs mounts` and `portablefs status` print.
+// `portablefs mounts` and `portablefs doctor` print.
+//
+// Revocation is tested FIRST, before any liveness check. A self-revoked mount
+// whose withdrawal failed still has its owner process running and its kernel
+// mount installed, so every liveness check it is subjected to passes — which is
+// precisely how a dead mount used to report itself live. Revocation is a
+// recorded terminal verdict about whether this mount can serve, and it outranks
+// every observation about whether it is still there.
 func mountHealth(st *mountState) string {
+	if st.Status == mountStatusRevoked {
+		return mountStatusRevoked
+	}
 	if !recordedMountVerified(st) {
 		return "stale"
 	}
@@ -177,13 +267,44 @@ func recordedMountVerified(st *mountState) bool {
 // setMountStatus persists a status transition into the mount's state record
 // (read-modify-write, tolerating a not-yet-written record). It reports
 // whether a record was updated.
+//
+// A revoked record is never overwritten. Revocation is terminal — the mount
+// refuses to serve and cannot be repaired — so a later credential verdict
+// arriving from a renewal owner that has not noticed yet must not downgrade it
+// into something that reads as recoverable.
 func setMountStatus(dir, mountPath, status string, atMs int64) bool {
 	updated, err := updateMountState(dir, mountPath, func(st *mountState) {
+		if st.Status == mountStatusRevoked {
+			return
+		}
 		st.Status = status
 		st.StatusChangedAtMs = atMs
+		st.StatusReason, st.StatusDetail = "", ""
 		if status == "" {
 			st.StatusChangedAtMs = 0
 		}
+	})
+	return err == nil && updated
+}
+
+// setMountRevoked records the terminal self-revocation verdict: the status, the
+// machine-readable class, the engine's own sentence, and when it happened. It
+// is called by the mount supervisor on both platforms — the Linux one from the
+// fusev3 revocation observer, the macOS one from the FSKit revocation watchdog
+// — which is what makes `revoked` a first-class recorded status rather than a
+// message that only ever reached a log.
+//
+// The first revocation wins: escalation can observe the same terminal condition
+// more than once, and the earliest timestamp is the honest one.
+func setMountRevoked(dir, mountPath, reason, detail string, atMs int64) bool {
+	updated, err := updateMountState(dir, mountPath, func(st *mountState) {
+		if st.Status == mountStatusRevoked {
+			return
+		}
+		st.Status = mountStatusRevoked
+		st.StatusReason = normalizeMountRevocationReason(reason)
+		st.StatusDetail = boundedStatusDetail(detail)
+		st.StatusChangedAtMs = atMs
 	})
 	return err == nil && updated
 }
@@ -476,8 +597,24 @@ func validateMountStateRecord(path string, st *mountState) error {
 		if st.StatusChangedAtMs <= 0 {
 			return fmt.Errorf("mount state %s has credential-expired status without a transition timestamp", path)
 		}
+	case mountStatusRevoked:
+		if st.StatusChangedAtMs <= 0 {
+			return fmt.Errorf("mount state %s has revoked status without a transition timestamp", path)
+		}
+		if !validMountRevocationReason(st.StatusReason) {
+			return fmt.Errorf("mount state %s has invalid revocation reason %q", path, st.StatusReason)
+		}
+		if st.StatusDetail != "" && !validStateString(st.StatusDetail, maxStatusDetail) {
+			return fmt.Errorf("mount state %s has invalid revocation detail", path)
+		}
 	default:
 		return fmt.Errorf("mount state %s has invalid status %q", path, st.Status)
+	}
+	// A classification belongs to exactly one status. Carrying one without the
+	// revoked verdict would let a record answer for a revocation it does not
+	// record.
+	if st.Status != mountStatusRevoked && (st.StatusReason != "" || st.StatusDetail != "") {
+		return fmt.Errorf("mount state %s carries a revocation classification under status %q", path, st.Status)
 	}
 	if st.ForceRecoveryJobID != "" && !st.ForceParkAcknowledged {
 		return fmt.Errorf("mount state %s has a force-recovery job without a force-park acknowledgement", path)

@@ -31,6 +31,7 @@ func main() {
 }
 
 func run() error {
+	showVersion := flag.Bool("version", false, "print exact release identity and exit")
 	cellID := flag.String("cell-id", "", "stable cell UUID")
 	socket := flag.String("socket", "/run/portablefs-cell-helper/default.sock", "Unix socket used only by the cell agent")
 	agentUID := flag.Uint("agent-uid", 0, "exact unprivileged cell-agent UID")
@@ -51,6 +52,10 @@ func run() error {
 	planLifetime := flag.Duration("plan-max-lifetime", 15*time.Minute, "maximum accepted cell-plan lifetime")
 	clockSkew := flag.Duration("clock-skew", 5*time.Second, "maximum authenticated clock disagreement")
 	flag.Parse()
+	if *showVersion {
+		_, _ = fmt.Fprintln(os.Stdout, version)
+		return nil
+	}
 	if flag.NArg() != 0 || !cellplan.ValidID(*cellID) || *agentUID == 0 || *agentGID <= 0 || *planPublicKey == "" ||
 		!planLifetimeValid(planLifetime, clockSkew) {
 		return errors.New("cell ID, non-root agent UID/GID, plan public key, and valid lifetimes are required")

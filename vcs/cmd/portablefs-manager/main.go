@@ -58,6 +58,7 @@ func run() error {
 		}
 		return controlplane.MigrateStateV1ToV2(*from, *to)
 	}
+	showVersion := flag.Bool("version", false, "print exact release identity and exit")
 	var productKeys issuerKeyFlags
 	listen := flag.String("listen", "", "mTLS control address")
 	stateFile := flag.String("state-file", "", "absolute durable manager state path")
@@ -85,6 +86,10 @@ func run() error {
 	maxRestoringPerCell := flag.Int("max-restoring-per-cell", 4, "maximum concurrent restores placed on one cell")
 	clockSkew := flag.Duration("clock-skew", 5*time.Second, "maximum authenticated clock disagreement")
 	flag.Parse()
+	if *showVersion {
+		_, _ = fmt.Fprintln(os.Stdout, version)
+		return nil
+	}
 	if *maxArchivingPerCell <= 0 || *maxRestoringPerCell <= 0 {
 		return errors.New("max-archiving-per-cell and max-restoring-per-cell must be positive")
 	}

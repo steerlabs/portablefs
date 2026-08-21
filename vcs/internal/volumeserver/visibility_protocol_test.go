@@ -13,13 +13,13 @@ func TestVisibilityAckRetryAfterNextPhaseIsPending(t *testing.T) {
 	h.resolve(t, participant, "retry")
 	done := make(chan error, 1)
 	go func() {
-		done <- h.coordinator.Execute(context.Background(), SessionID{2}, MutationID{Slot: 3, Sequence: 4}, testVisibilityPrepare("retry"), func() ([]VisibilityTarget, bool) {
+		done <- h.coordinator.Execute(context.Background(), SessionID{2}, MutationID{Slot: 3, Sequence: 4}, testMutationDependencies("retry"), testVisibilityPrepare("retry"), func() ([]VisibilityTarget, bool) {
 			return testVisibilityTargets("retry"), true
 		})
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	prepare, err := h.coordinator.Next(ctx, participant, VisibilityCursor{})
+	prepare, err := nextFromInitialVisibilityCursor(t, h.coordinator, ctx, participant)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,13 +50,13 @@ func TestVisibilityLateRegistrationStartsAtCurrentCompleteCursor(t *testing.T) {
 	h.resolve(t, first, "first", "second")
 	done := make(chan error, 1)
 	go func() {
-		done <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1}, testVisibilityPrepare("first"), func() ([]VisibilityTarget, bool) {
+		done <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 1}, testMutationDependencies("first"), testVisibilityPrepare("first"), func() ([]VisibilityTarget, bool) {
 			return testVisibilityTargets("first"), true
 		})
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	complete := runBarrier(t, h.coordinator, first, VisibilityCursor{})
+	complete := runBarrier(t, h.coordinator, first, initialVisibilityCursor(t, h.coordinator, first))
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestVisibilityLateRegistrationStartsAtCurrentCompleteCursor(t *testing.T) {
 
 	secondDone := make(chan error, 1)
 	go func() {
-		secondDone <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 2}, testVisibilityPrepare("second"), func() ([]VisibilityTarget, bool) {
+		secondDone <- h.coordinator.Execute(context.Background(), SessionID{9}, MutationID{Sequence: 2}, testMutationDependencies("second"), testVisibilityPrepare("second"), func() ([]VisibilityTarget, bool) {
 			return testVisibilityTargets("second"), true
 		})
 	}()

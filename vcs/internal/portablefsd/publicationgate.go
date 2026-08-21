@@ -654,38 +654,6 @@ func frontendRequestPublishes(body any) bool {
 	}
 }
 
-// frontendRequestIsOrderedMutation is the daemon-side validation boundary for
-// Envelope.SourcePhaseQueueable. Only requests the authority executes through
-// its visibility coordinator may carry that progress proof. Keeping the list
-// beside frontendRequestPublishes makes wire admission and the v3 data-plane
-// mutation switch share one explicit contract.
-func frontendRequestIsOrderedMutation(body any) bool {
-	switch body.(type) {
-	case *pfslocal.SetAttrRequest,
-		*pfslocal.WriteRequest,
-		*pfslocal.CreateRequest,
-		*pfslocal.MkdirRequest,
-		*pfslocal.RemoveRequest,
-		*pfslocal.RenameRequest,
-		*pfslocal.SymlinkRequest,
-		*pfslocal.HardLinkRequest,
-		*pfslocal.XattrSetRequest,
-		*pfslocal.XattrRemoveRequest:
-		return true
-	default:
-		return false
-	}
-}
-
-func validFrontendSourcePhaseQueueability(
-	body any,
-	operationID uint64,
-	sourcePhaseQueueable bool,
-) bool {
-	return !sourcePhaseQueueable ||
-		(operationID != 0 && frontendRequestIsOrderedMutation(body))
-}
-
 // frontendOperationPaths derives the publication SCOPE of one frontend
 // request: which paths a reply to it may install cacheable state under.
 //

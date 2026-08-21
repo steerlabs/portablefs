@@ -3,54 +3,37 @@
 package fusev3
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
-	"github.com/steerlabs/portablefs/vcs/internal/visibilitywire"
-	"golang.org/x/sys/unix"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
-// CoherenceProfile is the kernel-cache contract a mount declares to the
-// authority. It describes what this frontend does with its kernel's caches,
-// never which operating system it runs on.
-//
-// CoherenceUncached is a supported deployment profile, not a degraded mode: it
-// caches nothing, so it owes the authority no repair and joins no barrier.
-// CoherenceStrict caches names and attributes and pays for that by executing
-// the authority's two-phase visibility barrier synchronously.
+// CoherenceProfile is the retained local spelling of protocol 6's one exact
+// lease-backed kernel-cache contract. Zero remains invalid so a caller cannot
+// accidentally mount with unspecified local semantics.
 type CoherenceProfile uint8
 
-const (
-	CoherenceUncached CoherenceProfile = iota
-	CoherenceStrict
-)
+const CoherenceStrict CoherenceProfile = 1
 
 func (p CoherenceProfile) String() string {
 	if p == CoherenceStrict {
 		return "strict"
 	}
-	return "uncached"
+	return "invalid"
 }
 
 const (
-	// strictEntryTimeout and strictAttrTimeout are the lifetimes a strict mount
-	// publishes with. They are no longer a correctness parameter, which is the
-	// whole point of joining the barrier: every authority-visible change to a
-	// name or an inode is repaired by NAMESPACE/DATA/ATTRIBUTES notification
-	// before the mutating call returns on the machine that made it, so no
-	// caller anywhere can observe the old value after the new one exists. A
-	// timeout expiry therefore never *fixes* anything; it only re-fetches state
-	// this mount already knows is current.
+	// strictEntryTimeout is retained as a policy ceiling, but protocol 6 always
+	// publishes kernel entry validity as zero. strictAttrTimeout is likewise
+	// only a ceiling; an exact reply-local A-R grant supplies the real lifetime.
 	//
 	// One minute is chosen as the largest value that still bounds the blast
 	// radius of a future repair defect to a single human-noticeable interval.
@@ -63,12 +46,27 @@ const (
 	strictEntryTimeout = 60 * time.Second
 	strictAttrTimeout  = 60 * time.Second
 
-	// defaultCachedNameCapacity is the number of (parent, name) bindings a
+	// defaultCachedNameCapacity is the number of (parent, name) resolutions a
 	// strict mount is willing to leave resident in its kernel. It is declared
 	// to the authority because it is exactly the amount of state this mount
 	// promises it can repair, and therefore also the amount it must be able to
-	// walk during self-revocation.
+	// walk during self-revocation. Absences count against it exactly like
+	// bindings: a name the kernel answers from cache is a repair obligation
+	// whether the cached answer is "here it is" or "it is not there".
 	defaultCachedNameCapacity = 1 << 16
+
+	// negativeNameShare bounds the part of that capacity spent on absences.
+	// The sub-bound exists because nothing reclaims a negative entry the way
+	// FORGET reclaims a binding: the kernel holds no inode for a name that does
+	// not exist, so it never tells this frontend that it dropped the dentry,
+	// and an absence therefore leaves the registry only through a repair or
+	// through self-revocation. Without a share, a workload that probes for
+	// absent names -- an interpreter walking a search path, a linker trying
+	// every -L directory -- could fill the whole declared budget with absences
+	// and stop the mount caching the names that do exist. A quarter is far more
+	// than any real probe set needs (SQLite probes two names per database) and
+	// leaves the majority of the declared state for real bindings.
+	negativeNameShare = 4
 
 	// defaultRepairBudget is the per-phase deadline a strict mount commits to.
 	// A phase is a handful of write(2) calls on /dev/fuse; the only thing that
@@ -76,10 +74,10 @@ const (
 	// the budget is sized for lock hand-off, not for I/O.
 	defaultRepairBudget = 15 * time.Second
 
-	// visibilityReserve is the authority in-flight slot that only the
-	// visibility loop may occupy. Acknowledging is what releases the mutating
+	// leaseControlReserve is the authority in-flight slot that only the lease
+	// CONTROL loop may occupy. Acknowledging is what releases the mutating
 	// machine, so this loop must never queue behind bulk kernel I/O.
-	visibilityReserve = 1
+	leaseControlReserve = 1
 )
 
 // MountAbsenceProof is the official supervisor's local observation that this
@@ -96,215 +94,130 @@ func (p MountAbsenceProof) valid() bool {
 	return p.ObservedUnixNanos != 0 && len(p.Observation) != 0 && p.Component != ""
 }
 
-// nameKey is one kernel-cached directory binding. The parent is the inode
-// number the authority publishes in attributes, which is what a
-// VisibilityTarget carries as parent_kernel_ino; the kernel NodeID is resolved
-// separately at repair time.
+// nameKey is one daemon-cached directory binding. The parent is the inode
+// number the authority publishes in attributes; the stable parent identity is
+// tracked separately in the exact N-lease coordinate.
 type nameKey struct {
 	parent uint64
 	name   string
 }
 
-type mutationTicket struct {
-	slot     uint32
-	sequence uint64
-}
-
-type mutationPublicationSlot struct {
-	// through is the greatest sequence whose response publication has settled.
-	// seen holds only later, out-of-order responses until every gap before them
-	// settles; transport concurrency bounds it independently of mount lifetime.
-	through uint64
-	seen    map[uint64]bool
-}
-
-// mutationPublicationLedger joins the transport's replay identity to the raw
-// FUSE callback which is publishing that mutation's reply. It retains one
-// watermark per replay slot plus only the concurrently out-of-order tail, so
-// its size is bounded by replay-slot and transport concurrency rather than by
-// mount lifetime. Every mutation response advances the slot: failed mutations
-// settle immediately, while every successful one settles only when its raw
-// callback returns. Tracking all successes avoids duplicating the authority's
-// visibility classification here; a new mutation kind cannot accidentally be
-// acknowledged before its reply merely because the frontend did not know it
-// could emit an event. An event which arrives first creates no entry at all,
-// preventing a malformed remote ticket from growing local state.
-type mutationPublicationLedger struct {
-	mu      sync.Mutex
-	bySlot  map[uint32]*mutationPublicationSlot
-	changed chan struct{}
-}
-
-func (l *mutationPublicationLedger) signalLocked() {
-	if l.changed != nil {
-		close(l.changed)
-	}
-	l.changed = make(chan struct{})
-}
-
-func advanceMutationSlot(slot *mutationPublicationSlot) {
-	for slot.seen[slot.through+1] {
-		delete(slot.seen, slot.through+1)
-		slot.through++
-	}
-}
-
-func (l *mutationPublicationLedger) accept(ticket mutationTicket, settled bool) error {
-	if ticket.sequence == 0 {
-		return errors.New("fusev3: authority returned a zero mutation sequence")
-	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.bySlot == nil {
-		l.bySlot = make(map[uint32]*mutationPublicationSlot)
-	}
-	slot := l.bySlot[ticket.slot]
-	if slot == nil {
-		slot = &mutationPublicationSlot{seen: make(map[uint64]bool)}
-		l.bySlot[ticket.slot] = slot
-	}
-	if ticket.sequence <= slot.through {
-		return fmt.Errorf("fusev3: duplicate mutation publication ticket for slot %d sequence %d", ticket.slot, ticket.sequence)
-	}
-	if _, exists := slot.seen[ticket.sequence]; exists {
-		return fmt.Errorf("fusev3: duplicate mutation publication ticket for slot %d sequence %d", ticket.slot, ticket.sequence)
-	}
-	slot.seen[ticket.sequence] = settled
-	advanceMutationSlot(slot)
-	l.signalLocked()
-	return nil
-}
-
-func (l *mutationPublicationLedger) complete(ticket mutationTicket) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	slot := l.bySlot[ticket.slot]
-	if slot == nil || ticket.sequence <= slot.through {
-		return
-	}
-	if _, exists := slot.seen[ticket.sequence]; !exists {
-		return
-	}
-	slot.seen[ticket.sequence] = true
-	advanceMutationSlot(slot)
-	l.signalLocked()
-}
-
-func (l *mutationPublicationLedger) wait(ctx context.Context, ticket mutationTicket) error {
-	if ticket.sequence == 0 {
-		return errors.New("fusev3: self COMPLETE omitted its mutation sequence")
-	}
-	for {
-		l.mu.Lock()
-		if slot := l.bySlot[ticket.slot]; slot != nil && slot.through >= ticket.sequence {
-			l.mu.Unlock()
-			return nil
-		}
-		if l.changed == nil {
-			l.changed = make(chan struct{})
-		}
-		changed := l.changed
-		l.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return fmt.Errorf("fusev3: wait for raw reply publication of mutation slot %d sequence %d: %w", ticket.slot, ticket.sequence, ctx.Err())
-		}
-	}
-}
-
 type mutationCallbackKey struct{}
 
 type mutationCallback struct {
-	ledger  *mutationPublicationLedger
-	mu      sync.Mutex
-	tickets []mutationTicket
-	done    bool
-}
-
-func (c *mutationCallback) accept(ticket mutationTicket) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.done {
-		return fmt.Errorf("fusev3: mutation slot %d sequence %d arrived after its raw callback returned", ticket.slot, ticket.sequence)
-	}
-	if err := c.ledger.accept(ticket, false); err != nil {
-		return err
-	}
-	c.tickets = append(c.tickets, ticket)
-	return nil
+	publication replyPublication
+	mount       *Mount
+	operationID uint64
 }
 
 func (c *mutationCallback) finish() {
-	c.mu.Lock()
-	if c.done {
-		c.mu.Unlock()
+	lease := c.publication.source
+	if lease != nil && lease.terminalAtCallbackReturn() {
+		lease.revoke()
+		lease.r.mount.revoke(errors.New("fusev3: visible mutation returned without completing its source publication result"))
+		c.publication.consumeAuthorityResponse()
 		return
 	}
-	c.done = true
-	tickets := append([]mutationTicket(nil), c.tickets...)
-	c.mu.Unlock()
-	for _, ticket := range tickets {
-		c.ledger.complete(ticket)
+	// A malformed authority result has no kernel state worth publishing. Once
+	// its callback revokes the local serving boundary, returning the terminal
+	// delivery receipt is safe and lets the fenced authority finish teardown
+	// without waiting for a /dev/fuse reply which the revoked mount may drop.
+	if c.mount != nil && c.mount.isRevoked() {
+		c.publication.consumeAuthorityResponse()
 	}
 }
 
-func mutationResponseNeedsCallback(request *authoritypb.Request, response *authoritypb.Response) bool {
-	if request.GetReclaim() != nil {
-		// A reclaim retires a capability the kernel has already forgotten, so
-		// its reply publishes nothing and its replay sequence settles the
-		// moment it is accepted. It still must settle: a reclaim consumes a
-		// sequence on its slot like any other mutation, and leaving that
-		// sequence unrecorded would leave a permanent hole in the slot's
-		// publication watermark, deadlocking the deferred self-COMPLETE of the
-		// next visible mutation the client assigns to the same slot.
-		return false
+func (c *mutationCallback) acquireSource(ctx context.Context, raw *rawFileSystem, gate *sourcePublicationGate) (*sourcePublicationLease, error) {
+	if c.publication.source != nil {
+		return nil, errors.New("fusev3: raw callback attempted more than one visible source mutation")
 	}
-	if responseErrno(response) == 0 {
-		return true
+	lease, err := raw.acquireSourcePublication(ctx, gate)
+	if err != nil {
+		return nil, err
 	}
-	// write(2) is the one Linux mutation which may commit a prefix and also
-	// report an error. The raw frontend returns that positive progress and the
-	// authority emits a DATA event for it, so its callback has the same source
-	// publication obligation as a wholly successful write.
-	return request.GetWrite() != nil && response.GetWrite().GetCount() != 0
+	c.publication.source = lease
+	return lease, nil
 }
 
-// recordMutationResponse is called while the raw callback is still active,
-// immediately after the transport has returned the authority's accepted replay
-// identity. Failed mutations have no COMPLETE to wait for, so they settle
-// immediately and advance the per-slot watermark. Every successful mutation
-// remains pending until the callback has finished its raw reply; that makes the
-// handshake future-proof against the authority adding a new visible operation.
-func (m *Mount) recordMutationResponse(ctx context.Context, request *authoritypb.Request, response *authoritypb.Response, callErr error) error {
-	if m.profile != CoherenceStrict || callErr != nil || response == nil || response.GetUncertain() {
+func sourceLeaseFromContext(ctx context.Context) *sourcePublicationLease {
+	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
+	if callback == nil {
 		return nil
 	}
-	state := response.GetMutation()
-	if state == nil {
-		if mutationResponseNeedsCallback(request, response) {
-			return errors.New("fusev3: successful mutation response omitted its replay identity")
-		}
-		return nil
-	}
-	ticket := mutationTicket{slot: state.GetSlot(), sequence: state.GetAcceptedSequence()}
-	if !mutationResponseNeedsCallback(request, response) {
-		return m.publications.accept(ticket, true)
-	}
-	callback, ok := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
-	if !ok || callback == nil {
-		return errors.New("fusev3: successful mutation response escaped its raw FUSE callback lifecycle")
-	}
-	return callback.accept(ticket)
+	return callback.publication.source
 }
 
-func (r *rawFileSystem) mutationContext() (context.Context, func()) {
+func replyPublicationFromContext(ctx context.Context) *replyPublication {
+	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
+	if callback == nil {
+		return nil
+	}
+	return &callback.publication
+}
+
+func retainAuthorityResponse(ctx context.Context, consumption authorityrpc.ResponseConsumption) error {
+	if consumption == nil {
+		return nil
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil || publication.owner == nil {
+		return errors.New("fusev3: authority response escaped its physical kernel reply lifecycle")
+	}
+	publication.owner.mu.Lock()
+	if publication.responseConsumptionOwner != responseConsumptionPublication {
+		publication.owner.mu.Unlock()
+		return errors.New("fusev3: authority response arrived after reply ownership transferred to settlement")
+	}
+	publication.responseConsumptions = append(publication.responseConsumptions, consumption)
+	publication.owner.mu.Unlock()
+	return nil
+}
+
+func completeSourcePublication(ctx context.Context) error {
+	lease := sourceLeaseFromContext(ctx)
+	if lease == nil {
+		return nil
+	}
+	if err := lease.markCallbackPublicationReady(); err != nil {
+		return err
+	}
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		return errors.New("fusev3: source publication escaped its reply ownership")
+	}
+	return nil
+}
+
+// completeDefiniteNoChangePublication closes an assigned source mutation whose
+// structured result proves no filesystem state was changed. Its response must
+// be physically ordered, but must not request a post-VFS receipt because the
+// kernel has no new state to install.
+func completeDefiniteNoChangePublication(ctx context.Context) error {
+	lease := sourceLeaseFromContext(ctx)
+	if lease == nil {
+		return errors.New("fusev3: definite no-change mutation escaped its source publication ownership")
+	}
+	lease.resolveAllNoBinding()
+	return lease.markDefiniteNoChange()
+}
+
+func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(), fuse.Status) {
 	ctx := r.opContext()
-	if r.profile != CoherenceStrict {
-		return ctx, func() {}
+	callback := &mutationCallback{mount: r.mount, operationID: unique}
+	if err := r.registerReplyPublication(unique, &callback.publication); err != nil {
+		// Registration is the ownership reservation for every fact this callback
+		// could make cacheable. It happens before any lookup/mutation RPC, so an
+		// impossible zero/reused FUSE identity cannot race an untracked success
+		// reply onto /dev/fuse.
+		r.mount.revoke(err)
+		return ctx, func() {}, fuse.Status(syscall.ENOTCONN)
 	}
-	callback := &mutationCallback{ledger: &r.mount.publications}
-	return context.WithValue(ctx, mutationCallbackKey{}, callback), callback.finish
+	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
+	return ctx, func() {
+		r.publishPostStateAttrs(ctx)
+		callback.finish()
+		r.finishReplyPublicationRegistration(unique, &callback.publication)
+	}, fuse.OK
 }
 
 // kernelMount is the identity of the installed FUSE mount, read once from
@@ -346,7 +259,13 @@ func observeKernelMount(mountpoint string) (kernelMount, error) {
 // the validated mountpoint after our attempt fails; that says nothing about
 // whether this exact PortableFS mount still exists. Conversely, finding the
 // unique source anywhere in the namespace is enough to refuse clean detach.
-func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsenceProof, error) {
+// ObservePlannedKernelMountAbsent proves that the exact, attempt-unique FUSE
+// source has not been published into this mount namespace. Mount supervisors
+// use it both immediately before handing an ACTIVE authority session to
+// MountVolume and inside MountVolume's failed-startup cleanup. Exporting this
+// one primitive keeps those two ownership boundaries backed by the identical
+// /proc/self/mountinfo observation rather than two subtly different parsers.
+func ObservePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsenceProof, error) {
 	if fsName == "" || mountpoint == "" {
 		return MountAbsenceProof{}, errors.New("fusev3: planned mount identity is incomplete")
 	}
@@ -390,6 +309,10 @@ func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsencePro
 		Observation:       []byte(observation),
 		Component:         mountInfoPath,
 	}, nil
+}
+
+func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsenceProof, error) {
+	return ObservePlannedKernelMountAbsent(fsName, mountpoint)
 }
 
 // absent reports whether this exact mount is no longer installed, and returns
@@ -460,500 +383,128 @@ func (k kernelMount) abortKernelConnection() error {
 	return os.WriteFile("/sys/fs/fuse/connections/"+minor+"/abort", []byte("1"), 0)
 }
 
-// coherence is the strict frontend's half of the two-phase visibility barrier.
-// It owns nothing the kernel-facing tables own: the cached-name registry and
-// the publication gate live in rawFileSystem under one lock, because they are
-// decided on the same code path that answers the kernel.
-type coherence struct {
-	mount   *Mount
-	session []byte
-	budget  time.Duration
-}
+// errRepairBudgetExceeded classifies the one revocation cause a supervisor can
+// act on differently: this mount was healthy but too slow to repair. It is a
+// sentinel rather than a formatted string so classifyRevocationReason never has
+// to read prose.
+var errRepairBudgetExceeded = errors.New("fusev3: lease cache withdrawal exceeded its safety budget")
 
-// run is the visibility loop. It is a dedicated goroutine holding a dedicated
-// transport lane: acknowledging is what releases the mutating machine on every
-// other participant, so this loop is never allowed to queue behind bulk I/O.
-func (c *coherence) run(ctx context.Context) {
-	defer c.mount.wg.Done()
-	cursor := c.mount.rpc.InitialVisibilityCursor()
-	for {
-		event, err := c.mount.rpc.NextVisibility(ctx, cursor)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			c.mount.revoke(fmt.Errorf("fusev3: visibility stream ended: %w", err))
-			return
-		}
-		if err := c.applyWithinBudget(ctx, event); err != nil {
-			c.mount.revoke(err)
-			return
-		}
-		if err := c.mount.rpc.AckVisibility(ctx, event.GetCursor()); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			c.mount.revoke(fmt.Errorf("fusev3: visibility acknowledgment refused: %w", err))
-			return
-		}
-		cursor = event.GetCursor()
-	}
-}
-
-// applyWithinBudget performs exactly one phase under the deadline this mount
-// declared at attach. A kernel notification cannot be cancelled once it is
-// inside write(2), so the budget is enforced by revoking the mount, which
-// aborts the connection and releases the stuck write; it is a commitment the
-// frontend keeps, not a hope that the kernel is quick.
-func (c *coherence) applyWithinBudget(ctx context.Context, event *authoritypb.VisibilityEvent) error {
-	overdue := time.AfterFunc(c.budget, func() {
-		c.mount.revoke(fmt.Errorf("fusev3: visibility phase exceeded the %s repair budget this mount declared", c.budget))
-	})
-	defer overdue.Stop()
-	return c.apply(ctx, event)
-}
-
-func (c *coherence) apply(ctx context.Context, event *authoritypb.VisibilityEvent) error {
-	// A change to the volume's route declaration is not a cache repair, and
-	// there is no repair that would answer it: the set of paths this mount
-	// serves locally was fixed at attach and is what the authority admitted it
-	// with. Continuing under the old topology while the volume has moved to a
-	// new one is precisely the divergence the revision check exists to prevent,
-	// so the mount stops — but it says so first. Dying silently would leave the
-	// authority holding this participant's phase until the declared repair
-	// budget expired, turning one routing change into a budget-long stall per
-	// strict mount; the blocked report discharges the phase immediately and is
-	// fenced to the same terminal outcome.
-	if err := routesEventChange(c.mount.routesRevision, event); err != nil {
-		return c.reportUnservable(ctx, event, err)
-	}
-	// initiator_session_id is the exemption ticket. A mount that repaired its
-	// own mutation would deadlock against itself: the repair needs the parent
-	// directory's i_rwsem, which the very syscall that caused the mutation
-	// holds across the whole authority round trip. It also has nothing to
-	// repair -- the VFS updates its own dcache from the reply to that syscall,
-	// under that same lock, which is strictly more precise than a notification.
-	self := len(c.session) != 0 && bytes.Equal(event.GetInitiatorSessionId(), c.session)
-	switch event.GetCursor().GetPhase() {
-	case authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE:
-		// PREPARE is never reportable. It closes cache admission by publishing
-		// uncacheable, which takes no lock any syscall of this mount can be
-		// holding, so there is no phase here that this mount cannot service.
-		return c.mount.raw.prepareVisibility(ctx, event.GetTargets(), self)
-	case authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE:
-		if self {
-			ticket := mutationTicket{slot: event.GetMutationSlot(), sequence: event.GetMutationSequence()}
-			if err := c.mount.publications.wait(ctx, ticket); err != nil {
-				return err
-			}
-		}
-		completion, blocked, err := c.mount.raw.beginVisibilityComplete(event.GetTargets(), self)
-		if err != nil {
-			return err
-		}
-		if blocked {
-			// The gate is already closed, so this report is not speculative: an
-			// admitted callback holds a parent for which this frontend has exact
-			// cached-name repair work. The authority refuses those overlapping
-			// requests before apply; this mount then drains them and continues.
-			if err := c.mount.rpc.ReportVisibilityBlocked(ctx, event.GetCursor(), completion.parentKernelInos); err != nil {
-				return fmt.Errorf("fusev3: authority could not interrupt an overlapping namespace mutation for visibility repair: %w", err)
-			}
-		}
-		return c.mount.raw.finishVisibilityComplete(ctx, completion)
-	default:
-		return fmt.Errorf("fusev3: visibility event %d carried no phase", event.GetCursor().GetSequence())
-	}
-}
-
-// reportUnservable delivers the blocked report for any terminal condition —
-// currently a routing revision this mount cannot adopt — and returns the cause
-// the mount revokes with. The report replaces
-// the acknowledgment (it IS the acknowledgment, carrying `blocked`), so the
-// authority discharges this participant's phase immediately instead of
-// waiting out the declared repair budget.
-func (c *coherence) reportUnservable(ctx context.Context, event *authoritypb.VisibilityEvent, cause error) error {
-	if err := c.mount.rpc.ReportVisibilityBlocked(ctx, event.GetCursor(), nil); err != nil && ctx.Err() == nil {
-		return errors.Join(cause, fmt.Errorf("fusev3: the authority did not accept this mount's report that it cannot repair: %w", err))
-	}
-	return cause
-}
-
-// visibilityKeys is one event's target set translated into this frontend's own
-// cache keys.
-type visibilityKeys struct {
-	names  []nameKey
-	inodes []uint64
-}
-
-// translate converts VisibilityTargets into cache keys. This frontend keys its
-// kernel caches by the attr inode number the authority publishes, so a target
-// carries that number explicitly (kernel_ino / parent_kernel_ino) alongside the
-// stable identity — the stable identity is the exact XFS export handle, whose
-// layout deliberately contains no device and no bare inode number, and is not
-// parsed here. A target missing its kernel inode or device is malformed and
-// fails closed: repairing a guessed coordinate would leave the real one stale.
-// The one backing device is pinned on first sight and any later disagreement is
-// a violation of the one-volume contract, not something to paper over.
-func (r *rawFileSystem) translate(targets []*authoritypb.VisibilityTarget) (visibilityKeys, error) {
-	var keys visibilityKeys
-	for _, target := range targets {
-		// The full shared wire contract is enforced, not just the fields this
-		// frontend repairs by. A frontend that silently tolerates a shape the
-		// other decoder refuses is how an encoder defect ships through every
-		// gate on one platform and revokes every mount on the other.
-		if err := visibilitywire.ValidateTarget(target); err != nil {
-			return visibilityKeys{}, fmt.Errorf("fusev3: %w", err)
-		}
-		if err := r.pinIdentityDevice(target.GetDevice()); err != nil {
-			return visibilityKeys{}, err
-		}
-		switch target.GetScope() {
-		case authoritypb.VisibilityScope_VISIBILITY_SCOPE_NAMESPACE:
-			keys.names = append(keys.names, nameKey{parent: target.GetParentKernelIno(), name: string(target.GetName())})
-		default:
-			keys.inodes = append(keys.inodes, target.GetKernelIno())
-		}
-	}
-	return keys, nil
-}
-
-func (r *rawFileSystem) pinIdentityDevice(device uint64) error {
-	if device == 0 {
-		return errors.New("fusev3: visibility target carried no backing device")
-	}
+// revokeCachedNames drops daemon-resident N payloads. The portable profile
+// gives kernel dentries zero validity, so there is no kernel namespace cache to
+// notify or drain at recall or teardown.
+func (r *rawFileSystem) revokeCachedNames(_ time.Time) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.identityDeviceKnown {
-		r.identityDevice, r.identityDeviceKnown = device, true
-		return nil
+	for key := range r.cachedNames {
+		r.dropCachedNameLocked(key)
 	}
-	if r.identityDevice != device {
-		return fmt.Errorf("fusev3: authority reported coordination identities from two devices (%x and %x); a volume is exactly one filesystem", r.identityDevice, device)
+	for key := range r.cachedNegatives {
+		r.dropCachedNegativeLocked(key)
 	}
-	return nil
-}
-
-// prepareVisibility closes cache admission for the affected keys.
-//
-// Closing admission means publishing them uncacheable, not withholding the
-// reply. Withholding a LOOKUP reply is wrong on Linux and would deadlock: the
-// process doing the lookup holds the parent's i_rwsem shared for the entire
-// round trip, and the COMPLETE repair for the same directory needs that
-// i_rwsem exclusively. Answering with a zero lifetime gives the caller the
-// pre-mutation truth -- which is still the truth, because the authority has not
-// applied yet -- while leaving nothing behind for COMPLETE to have to repair.
-func (r *rawFileSystem) prepareVisibility(ctx context.Context, targets []*authoritypb.VisibilityTarget, self bool) error {
-	keys, err := r.translate(targets)
-	if err != nil {
-		return err
-	}
-	r.mu.Lock()
-	if self {
-		// The initiating mount does not gate its own names. The VFS resolves
-		// the affected binding under the parent's i_rwsem and rebinds it from
-		// this operation's own reply under the same lock, so a concurrent local
-		// lookup of that name is already ordered against the mutation. Inode
-		// state has no such lock, so attributes and data stay gated.
-		keys.names = nil
-	}
-	for _, key := range keys.names {
-		r.heldNames[key] = struct{}{}
-	}
-	for _, inode := range keys.inodes {
-		r.heldInodes[inode] = struct{}{}
-	}
-	r.heldPhase = keys
 	r.mu.Unlock()
-	// Admission is closed; now wait out the publications that were already
-	// decided cacheable before it closed. They are pure local work with no
-	// authority round trip inside them, and no mutation waits on them, so this
-	// drain cannot participate in the barrier's own dependency cycle.
-	//
-	// The drain ends when the reply has been handed back to go-fuse, not when
-	// the kernel has installed it, and closing that last gap is the kernel's
-	// job rather than this frontend's. For a name it is the parent's i_rwsem:
-	// lookup_slow holds it across the entire round trip including
-	// d_splice_alias, and fuse_reverse_inval_entry takes it exclusively, so an
-	// invalidation can never interleave with an installation. For an inode it
-	// is fuse_change_attributes, which discards a reply whose attr_version
-	// predates the last invalidation. Both are load-bearing; the drain alone
-	// would leave a window.
-	return r.drainPublications(ctx, keys)
 }
 
-func (r *rawFileSystem) drainPublications(ctx context.Context, keys visibilityKeys) error {
-	for {
-		r.mu.Lock()
-		busy := false
-		for _, key := range keys.names {
-			if r.publishingNames[key] != 0 {
-				busy = true
-				break
-			}
-		}
-		if !busy {
-			for _, inode := range keys.inodes {
-				if r.publishingInodes[inode] != 0 {
-					busy = true
-					break
-				}
-			}
-		}
-		if !busy {
-			r.mu.Unlock()
-			return nil
-		}
-		settled := r.published
-		r.mu.Unlock()
-		select {
-		case <-settled:
-		case <-ctx.Done():
-			return fmt.Errorf("fusev3: visibility prepare could not drain in-flight publications: %w", ctx.Err())
-		}
-	}
-}
-
-// repair is one kernel cache repair this frontend owes.
-type repair struct {
-	parent uint64
-	child  uint64
-	name   string
-	inode  uint64
-	data   bool
-}
-
-// visibilityCompletion owns one COMPLETE's exact repair work and the parent
-// admission gates installed for its namespace notifications.
-type visibilityCompletion struct {
-	work             []repair
-	parents          map[uint64]struct{}
-	parentKernelInos []uint64
-}
-
-// beginVisibilityComplete resolves the event against the exact cache registry,
-// removes those entries from the registry, and closes parent admission in one
-// r.mu critical section. The returned boolean says that a callback was already
-// admitted in one of those exact parents and therefore needs the authority to
-// refuse its queued mutation before this frontend waits for it to drain.
-func (r *rawFileSystem) beginVisibilityComplete(targets []*authoritypb.VisibilityTarget, self bool) (visibilityCompletion, bool, error) {
-	keys, err := r.translate(targets)
-	if err != nil {
-		return visibilityCompletion{}, false, err
-	}
-	completion := visibilityCompletion{parents: make(map[uint64]struct{})}
+func (r *rawFileSystem) revokeCachedAttrs(deadline time.Time) []string {
 	r.mu.Lock()
-	if !self {
-		completion.work = make([]repair, 0, len(keys.names)+len(keys.inodes))
-		for _, key := range keys.names {
-			record := r.cachedNames[key]
-			if record == nil {
-				continue
-			}
-			parent := r.directoryLocked(key.parent)
-			r.dropCachedNameLocked(key)
-			if parent == nil {
-				continue
-			}
-			completion.work = append(completion.work, repair{parent: parent.id, child: record.id, name: key.name})
-			if _, already := completion.parents[key.parent]; !already {
-				completion.parents[key.parent] = struct{}{}
-				completion.parentKernelInos = append(completion.parentKernelInos, key.parent)
-			}
-		}
-		for _, inode := range keys.inodes {
-			record := r.byInodeLocked(inode)
-			if record != nil {
-				completion.work = append(completion.work, repair{inode: record.id, data: true})
-			}
+	work := make([]uint64, 0, len(r.cachedAttrs))
+	dataRecords := make(map[*inodeRecord]struct{}, len(r.cachedData))
+	for _, record := range r.cachedData {
+		dataRecords[record] = struct{}{}
+	}
+	for _, record := range r.cachedAttrs {
+		// The retained-data pass uses the same whole-inode primitive and
+		// therefore withdraws this record's attributes too. Leave it to that
+		// pass so one terminal obligation produces exactly one notification.
+		_, data := dataRecords[record]
+		if record != nil && !record.reclaimed && !data {
+			work = append(work, record.id)
 		}
 	}
-	for parent := range completion.parents {
-		r.repairingParents[parent]++
-	}
-	blocked := r.parkedOverlapLocked(completion.parents)
-	r.mu.Unlock()
-	return completion, blocked, nil
-}
-
-func (r *rawFileSystem) parkedOverlapLocked(parents map[uint64]struct{}) bool {
-	for record := range r.parked {
-		if _, overlap := parents[record.key.inode]; overlap {
-			return true
-		}
-	}
-	return false
-}
-
-// waitParkedParents waits on state transitions, not a timer. Progress comes from
-// the authority's definite pre-apply refusal of callbacks that won admission
-// before the gate. A callback arriving after the gate never parks at all.
-func (r *rawFileSystem) waitParkedParents(ctx context.Context, parents map[uint64]struct{}) error {
-	for {
-		r.mu.Lock()
-		if !r.parkedOverlapLocked(parents) {
-			r.mu.Unlock()
-			return nil
-		}
-		changed := r.parkedChanged
-		if changed == nil {
-			changed = make(chan struct{})
-			r.parkedChanged = changed
-		}
-		r.mu.Unlock()
-		select {
-		case <-changed:
-		case <-ctx.Done():
-			return fmt.Errorf("fusev3: visibility COMPLETE could not drain parent-exclusive callbacks: %w", ctx.Err())
-		}
-	}
-}
-
-// finishVisibilityComplete drains callbacks admitted before the gate, performs
-// the reverse notifications, then atomically reopens namespace and publication
-// admission. On failure both remain closed and the caller revokes the mount.
-func (r *rawFileSystem) finishVisibilityComplete(ctx context.Context, completion visibilityCompletion) error {
-	if err := r.waitParkedParents(ctx, completion.parents); err != nil {
-		return err
-	}
-	for _, item := range completion.work {
-		if err := r.applyRepair(item); err != nil {
-			// Admission stays closed on failure. The caller revokes this mount and,
-			// most importantly, must not acknowledge COMPLETE: a failed reverse
-			// notification means this kernel may still serve the pre-mutation state.
-			return err
-		}
-	}
-	r.releaseComplete(completion.parents)
-	return nil
-}
-
-// completeVisibility is retained as the direct, no-transport test seam. The
-// production path begins first so it can ask the authority to interrupt an
-// already-admitted overlap before finishing.
-func (r *rawFileSystem) completeVisibility(targets []*authoritypb.VisibilityTarget, self bool) error {
-	completion, _, err := r.beginVisibilityComplete(targets, self)
-	if err != nil {
-		return err
-	}
-	return r.finishVisibilityComplete(context.Background(), completion)
-}
-
-func (r *rawFileSystem) releaseComplete(parents map[uint64]struct{}) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for parent := range parents {
-		if r.repairingParents[parent]--; r.repairingParents[parent] <= 0 {
-			delete(r.repairingParents, parent)
-		}
-	}
-	for _, key := range r.heldPhase.names {
-		delete(r.heldNames, key)
-	}
-	for _, inode := range r.heldPhase.inodes {
-		delete(r.heldInodes, inode)
-	}
-	r.heldPhase = visibilityKeys{}
-	r.signalParkedLocked()
-}
-
-// applyRepair issues one reverse notification.
-//
-// NotifyDelete is preferred for a namespace binding because it is the only
-// notification that reaches inotify at all: without it a remote unlink is
-// invisible to every watcher on this machine. It is also a superset of
-// NotifyEntry -- the kernel invalidates the entry first and only then attempts
-// the delete against the child it was told about -- so when the delete half is
-// refused (the binding now names a different object, the entry is a mount
-// point, an old kernel does not implement it) the invalidation still has to be
-// made unconditionally, which is what the second call does.
-func (r *rawFileSystem) applyRepair(item repair) error {
-	server := r.mount.notifier()
-	if server == nil {
-		return errors.New("fusev3: kernel cache repair has no notification channel")
-	}
-	if item.data {
-		// Offset -1 is attribute-only invalidation; offset 0 with no length
-		// additionally drops every cached page. Data and attribute targets are
-		// both repaired the strong way because the authoritative post-mutation
-		// size cannot be *installed* through any Linux notification -- the
-		// kernel only forgets, it never accepts a new value here -- so the
-		// following GETATTR is what carries the new size, and it must not be
-		// answered from a cache.
-		if status := server.InodeNotify(item.inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: invalidate inode %d: %v", item.inode, status)
-		}
-		// ENOENT is the strongest successful outcome for invalidation: the
-		// kernel has no node state left that could answer from the old cache.
-		// It occurs normally when a namespace repair immediately before this
-		// one removed the inode's final dentry, and can also race ordinary
-		// kernel eviction. Treating absence as a repair failure revokes a
-		// healthy observer after a remote unlink.
-		return nil
-	}
-	deleteStatus := server.DeleteNotify(item.parent, item.child, item.name)
-	if deleteStatus.Ok() {
-		return nil
-	}
-	entryStatus := server.EntryNotify(item.parent, item.name)
-	if entryStatus.Ok() || entryStatus == fuse.ENOENT {
-		// ENOENT parallels the inode case above: the kernel reports that no
-		// parent alias or dentry for this name survives to answer from the old
-		// binding. Dentries are evicted independently of FORGET (which tracks
-		// the inode, not the name), so this occurs normally under dcache
-		// pressure, for the second alias of a hard link, and for a name whose
-		// inode an open descriptor still pins. Absence is the invalidated
-		// state; treating it as a repair failure would revoke a healthy mount.
-		// DeleteNotify alone is not trusted for this: it also reports ENOENT
-		// when the cached dentry names a different inode than the event's
-		// child, and that binding still had to fall to EntryNotify above.
-		return nil
-	}
-	return fmt.Errorf("fusev3: invalidate name %q under node %d: delete notification failed with %v and entry notification failed with %v",
-		item.name, item.parent, deleteStatus, entryStatus)
-}
-
-func (r *rawFileSystem) releaseHeld() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, key := range r.heldPhase.names {
-		delete(r.heldNames, key)
-	}
-	for _, inode := range r.heldPhase.inodes {
-		delete(r.heldInodes, inode)
-	}
-	r.heldPhase = visibilityKeys{}
-}
-
-// revokeCachedNames walks the exact set of bindings this mount published and
-// takes every one of them back. It is bounded by the cached-name capacity this
-// mount declared at attach, which is precisely why that number is part of the
-// contract: it is the amount of stale state a dying participant has to be able
-// to withdraw.
-func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
-	r.mu.Lock()
-	work := make([]repair, 0, len(r.cachedNames))
-	for key, record := range r.cachedNames {
-		parent := r.directoryLocked(key.parent)
-		if parent == nil {
-			continue
-		}
-		work = append(work, repair{parent: parent.id, child: record.id, name: key.name})
-	}
-	r.cachedNames = make(map[nameKey]*inodeRecord)
+	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
 	r.mu.Unlock()
 	server := r.mount.notifier()
 	if server == nil {
-		return
+		return nil
 	}
-	for _, item := range work {
+	var failures []string
+	for index, inode := range work {
 		if time.Now().After(deadline) {
-			return
+			failures = append(failures, fmt.Sprintf("attribute withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-index))
+			break
 		}
-		if status := server.DeleteNotify(item.parent, item.child, item.name); !status.Ok() {
-			server.EntryNotify(item.parent, item.name)
+		// Strict FUSE has no attribute-only invalidation. The exact terminal
+		// primitive is whole-inode withdrawal: it drops retained pages and
+		// This record has no retained-data obligation, so the stock attribute-only
+		// shape is sufficient and avoids evicting unrelated clean pages.
+		if status := server.InodeNotify(inode, -1, 0); !status.Ok() && status != fuse.ENOENT {
+			failures = append(failures, fmt.Sprintf("withdraw cached attributes for inode %d: %v", inode, status))
 		}
 	}
+	return failures
+}
+
+// revokeCachedData drops every page this mount told its kernel it could keep.
+//
+// This is the one withdrawal that has no softer form. A cached name or a cached
+// attribute is only ever an answer the kernel will ask about again once it
+// expires, and until then the serving path can refuse. A retained page is not:
+// with FOPEN_KEEP_CACHE a read of a resident folio is completed inside the
+// kernel with no request reaching this process at all, so revoked.Store(true)
+// and the ENOTCONN choke point in acquireBulk -- which are what bound every
+// other kind of stale service -- cannot see it, let alone refuse it. Neither
+// can the FUSE connection abort at the end of the withdrawal ladder: aborting
+// fails every future request, and a page that needs no request is unaffected.
+// Without this pass a preexisting fd can keep reading resident pre-fence pages.
+// The walk runs after namespace detach but before connection abort, while the
+// stock notification channel is still alive. Stock FUSE does not report the
+// kernel's final invalidate_inode_pages2 result, so a transiently busy page is
+// an explicit residual; connection abort prevents new fills but does not prove
+// that such a resident page was removed.
+func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
+	r.mu.Lock()
+	work := make([]uint64, 0, len(r.cachedData))
+	for _, record := range r.cachedData {
+		work = append(work, record.id)
+	}
+	r.cachedData = make(map[uint64]*inodeRecord)
+	r.mu.Unlock()
+	server := r.mount.notifier()
+	if server == nil {
+		return nil
+	}
+	var failures []string
+	for _, inode := range work {
+		if time.Now().After(deadline) {
+			failures = append(failures, fmt.Sprintf("data withdrawal exceeded the repair budget with %d inodes unwithdrawn", len(work)-len(failures)))
+			return failures
+		}
+		// ENOENT is the strongest possible outcome: the kernel holds no inode
+		// state at all, so there is nothing left that could answer from the old
+		// pages. Every other failure is recorded, because a page this mount
+		// could not take back is stale data a fenced participant can still
+		// serve, and the operator has to be told that in the revocation report.
+		if status := server.InodeNotify(inode, 0, 0); !status.Ok() && status != fuse.ENOENT {
+			failures = append(failures, fmt.Sprintf("withdraw cached data for inode %d: %v", inode, status))
+		}
+	}
+	return failures
+}
+
+// discardCachedOwnershipAfterConnectionGone clears only daemon bookkeeping.
+// It is legal after exact mount and connection absence make further reverse
+// notification impossible. It does not claim that a preexisting fd or mapping
+// has lost every resident page; that stock-kernel residual remains explicit.
+func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
+	r.mu.Lock()
+	r.cachedNames = make(map[nameKey]*inodeRecord)
+	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
+	r.cachedNameStable = make(map[nameKey]publicationNamespace)
+	r.cachedNameLeases = make(map[nameKey]leaseStamp)
+	r.cachedNegatives = make(map[nameKey]struct{})
+	r.cachedNegativeLeases = make(map[nameKey]leaseStamp)
+	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
+	r.cachedAttrPayloads = make(map[publicationIdentity]cachedAttrPayload)
+	r.cachedData = make(map[uint64]*inodeRecord)
+	r.mu.Unlock()
 }
 
 // revoke makes this mount unusable immediately and permanently. It is the local
@@ -961,13 +512,11 @@ func (r *rawFileSystem) revokeCachedNames(deadline time.Time) {
 // participant died: a strict mount that can no longer repair must stop serving
 // what it already cached rather than continue.
 //
-// The bound on stale service is stated in three parts, strongest first. Every
-// new request is refused synchronously, before this call returns. From the
-// mount namespace root the tree becomes unreachable in one syscall. For a
-// process whose working directory was already inside the mount, every binding
-// this frontend published is withdrawn within the declared repair budget, after
-// which the connection is aborted and there is no request this mount could
-// answer wrongly at all.
+// New requests are refused synchronously. The asynchronous ladder detaches the
+// namespace, attempts stock cache invalidations, and aborts the FUSE connection.
+// A failed notification is recorded rather than presented as clean withdrawal.
+// Stock FUSE does not expose the kernel's final data-purge result, so resident
+// pages reachable through a preexisting fd or mapping are not claimed removed.
 func (m *Mount) revoke(cause error) {
 	if cause == nil {
 		cause = errors.New("fusev3: strict mount revoked")
@@ -978,33 +527,269 @@ func (m *Mount) revoke(cause error) {
 	m.failAsync(cause)
 }
 
+// The revocation reason vocabulary. It is the machine-readable half of a
+// revocation report: one bounded token a supervisor can branch on and persist,
+// beside the frontend's own sentence which it can only print. The identical
+// tokens are the ones the macOS supervisor's watchdog produces (see the CLI's
+// fskit_revocation.go), so one operator-facing vocabulary covers both
+// platforms even though the mechanisms behind them cannot be shared.
+const (
+	// RevocationSessionTerminal: the authority session ended permanently, so
+	// nothing can repair this kernel's caches again.
+	RevocationSessionTerminal = "session-terminal"
+	// RevocationRepairBudgetExceeded: this mount was still connected but did
+	// not complete lease cache withdrawal inside the reserved safety interval.
+	RevocationRepairBudgetExceeded = "repair-budget-exceeded"
+	// RevocationRoutesChanged: the volume's machine-local route declaration
+	// moved under a mount whose topology is fixed for its lifetime.
+	RevocationRoutesChanged = "routes-changed"
+	// RevocationCoherenceViolation: the residual class. This frontend found a
+	// state it cannot serve coherently and stopped being a filesystem.
+	RevocationCoherenceViolation = "coherence-violation"
+)
+
+// classifyRevocationReason reduces the recorded cause to one vocabulary token.
+// Only causes with a sentinel behind them are classified; everything else is a
+// coherence violation, which is the honest default because that is what every
+// unclassified revoke callsite in this package actually is.
+func classifyRevocationReason(cause error) string {
+	switch {
+	case cause == nil:
+		return RevocationCoherenceViolation
+	case errors.Is(cause, errRepairBudgetExceeded):
+		return RevocationRepairBudgetExceeded
+	case errors.Is(cause, errRoutesChanged):
+		return RevocationRoutesChanged
+	case errors.Is(cause, authorityrpc.ErrSessionEnded):
+		return RevocationSessionTerminal
+	default:
+		return RevocationCoherenceViolation
+	}
+}
+
+// RevocationReport is one self-revocation made observable: why this mount
+// stopped serving, and what its escalating withdrawal actually proved about the
+// kernel state it left behind.
+//
+// KernelStateWithdrawn is the load-bearing field. A revoked mount whose kernel
+// mount is still installed is not a tidy failure: the dead FUSE mount remains
+// in the namespace, no mount-absence proof can be produced, and the authority's
+// durable strict membership therefore stays active until an operator discharges
+// it by hand. Reporting false is what lets a supervisor say so instead of
+// showing the mount as live.
+type RevocationReport struct {
+	Reason               string
+	Cause                string
+	KernelStateWithdrawn bool
+	// Withdrawal names every escalation step that failed, in order, as
+	// "<round>/<step>: <error>". It is empty on a first-attempt withdrawal.
+	// A "data-withdrawal" step is the one entry that reports residual stale
+	// service rather than residual mount state: it means retained pages this
+	// mount published could not be dropped, so a process still inside the
+	// mount may read pre-fence bytes.
+	Withdrawal []string
+}
+
+// withdrawalRounds bounds the escalation ladder. Three rounds is the smallest
+// number that expresses the whole escalation — detach, abort, re-detach — and
+// still leaves one round of margin; the ladder is additionally bounded by the
+// repair budget this mount declared, because a withdrawal that outlived the
+// budget has already lost the race it exists to win.
+const withdrawalRounds = 3
+
+// withdrawalRetryDelay is the first inter-round pause, doubled each round. It
+// is short: the kernel references a busy detach could not take back are
+// released by the abort in the same round, not by waiting.
+const withdrawalRetryDelay = 25 * time.Millisecond
+
+// withdrawalOutcome accumulates what the ladder did. installed records whether
+// there was a recorded kernel identity to withdraw at all, which is different
+// from having withdrawn one: a startup that failed before mountinfo yielded an
+// ID has nothing here whose absence could be proven.
+type withdrawalOutcome struct {
+	installed bool
+	withdrawn bool
+	failures  []string
+}
+
+func (o *withdrawalOutcome) record(round int, step string, err error) {
+	if err == nil {
+		return
+	}
+	o.failures = append(o.failures, fmt.Sprintf("%d/%s: %v", round, step, err))
+}
+
+// kernelWithdrawal is the set of kernel primitives the escalation ladder
+// drives. Production binds detach to the mount-owner fusermount helper and the
+// remaining steps to kernel interfaces; a test substitutes them
+// to exercise the escalation without a kernel, which is the only way to cover
+// the failure ladder at all.
+type kernelWithdrawal struct {
+	detach func(point string) error
+	abort  func(kernelMount) error
+	absent func(kernelMount) (MountAbsenceProof, error)
+	sleep  func(time.Duration)
+}
+
+func (m *Mount) productionKernelWithdrawal() kernelWithdrawal {
+	return kernelWithdrawal{
+		detach: func(string) error {
+			if m.server == nil {
+				return errors.New("fusev3: lazy detach has no FUSE server")
+			}
+			return m.server.UnmountLazy()
+		},
+		abort:  func(k kernelMount) error { return k.abortKernelConnection() },
+		absent: func(k kernelMount) (MountAbsenceProof, error) { return k.absent() },
+		sleep:  time.Sleep,
+	}
+}
+
+func (m *Mount) withdrawalOps() kernelWithdrawal {
+	if m.withdrawal.detach != nil {
+		return m.withdrawal
+	}
+	return m.productionKernelWithdrawal()
+}
+
 // withdrawKernelState is the strict half of teardown. It runs on the teardown
-// goroutine because two of its three steps can block, and none of them may
-// block whoever discovered the failure.
-func (m *Mount) withdrawKernelState() {
+// goroutine because most of its steps can block, and none of them may block
+// whoever discovered the failure.
+//
+// Every step's error is checked. A discarded detach failure leaves a dead FUSE
+// mount installed in the namespace with the CLI still reporting it live and
+// the authority still holding this participant's strict membership. So the
+// steps are an escalation ladder instead: withdraw retained kernel state while
+// /dev/fuse is still a valid notification channel, abort the connection,
+// lazy-detach through the mount owner's fusermount helper, then prove absence
+// and repeat if necessary, bounded by withdrawalRounds and by the declared
+// repair budget. Whatever it proves is returned, so the caller can persist a
+// truthful verdict either way.
+func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	m.revoked.Store(true)
+	ops := m.withdrawalOps()
 	installed := m.kernelMount
-	if installed.point != "" {
-		_ = unix.Unmount(installed.point, unix.MNT_DETACH)
-	}
+	out := withdrawalOutcome{installed: installed.point != ""}
+	// One repair budget covers the whole ladder rather than each step: it exists
+	// to fit inside the authority's fencing grace, and a per-step budget would
+	// let the rounds multiply it.
+	deadline := time.Now().Add(m.repairBudget)
+	writersJoined := true
 	if m.raw != nil {
-		m.raw.revokeCachedNames(time.Now().Add(m.repairBudget))
+		writersJoined = m.raw.terminalizeReplyCacheOwnership(deadline)
+		if !writersJoined {
+			out.record(0, "reply-writer-join", errRepairBudgetExceeded)
+		}
 	}
-	if installed.device != "" {
-		_ = installed.abortKernelConnection()
+
+	// The retained name, attribute, and data withdrawals run before the first
+	// abort because an aborted go-fuse loop can close the notification
+	// descriptor before userspace reaches it.
+	if m.raw != nil && writersJoined {
+		m.raw.revokeCachedNames(deadline)
+		for _, failure := range m.raw.revokeCachedAttrs(deadline) {
+			out.record(1, "attribute-withdrawal", errors.New(failure))
+		}
+		for _, failure := range m.raw.revokeCachedData(deadline) {
+			out.record(1, "data-withdrawal", errors.New(failure))
+		}
 	}
+	delay := withdrawalRetryDelay
+	for round := 1; ; round++ {
+		// Aborting is unconditional and comes first in every round. It unblocks
+		// any request still parked on an authority operation and terminates the
+		// serving connection, and only then is the namespace detach below safe:
+		// that step runs the mount owner's fusermount helper as a separate
+		// process, whose exec and path resolution can enter this very mount. A
+		// detach that ran first would deadlock a mount which can no longer
+		// answer - the helper waits for a reply this ladder can only produce
+		// after the helper returns - and buys nothing the abort does not.
+		if installed.device != "" {
+			out.record(round, "abort", ops.abort(installed))
+		}
+		if out.installed {
+			out.record(round, "detach", ops.detach(installed.point))
+		}
+		if !out.installed {
+			// No recorded kernel identity: startup failed before mountinfo
+			// yielded one. There is nothing here whose absence this ladder
+			// could prove, and the caller falls back to the ordinary unmount.
+			if !writersJoined && m.kernelConnectionAbsentBy(deadline) {
+				m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+				m.raw.discardCachedOwnershipAfterConnectionGone()
+			}
+			return out
+		}
+		if _, err := ops.absent(installed); err == nil {
+			if !writersJoined {
+				if !m.kernelConnectionAbsentBy(deadline) {
+					out.record(round, "connection-absence",
+						errors.New("FUSE serving connection did not terminate inside the withdrawal budget"))
+					return out
+				}
+				m.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+				m.raw.discardCachedOwnershipAfterConnectionGone()
+			}
+			out.withdrawn = true
+			return out
+		} else {
+			out.record(round, "absence", err)
+		}
+		if round >= withdrawalRounds || !time.Now().Before(deadline) {
+			return out
+		}
+		ops.sleep(delay)
+		delay *= 2
+	}
+}
+
+func (m *Mount) kernelConnectionAbsentBy(deadline time.Time) bool {
+	if !m.kernelConnectionStarted {
+		return true
+	}
+	if m.kernelConnectionDone == nil {
+		return false
+	}
+	return waitReplyTerminal(m.kernelConnectionDone, deadline)
+}
+
+// reportRevocation hands the supervisor the terminal verdict exactly once, from
+// the teardown goroutine, as soon as the ladder has finished. It deliberately
+// does not wait for Close: when withdrawal fails there may be no later moment
+// at which the supervisor learns anything at all, and an unobserved revocation
+// is the defect this whole path exists to remove.
+//
+// A recorded fatal cause is required. Not every path through the teardown
+// goroutine is a revocation: the benign /dev/fuse reply race that follows an
+// already-observed external unmount schedules the same teardown without
+// recording any cause, and reporting that as a revocation would stamp a
+// terminal verdict onto an ordinary clean unmount.
+func (m *Mount) reportRevocation(out withdrawalOutcome) {
+	observe := m.onRevoked
+	cause := m.fatalError()
+	if observe == nil || cause == nil {
+		return
+	}
+	report := RevocationReport{
+		Reason:               classifyRevocationReason(cause),
+		Cause:                cause.Error(),
+		KernelStateWithdrawn: out.withdrawn,
+		Withdrawal:           out.failures,
+	}
+	m.revokeOnce.Do(func() { observe(report) })
 }
 
 func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 
 // kernelNotifier is the reverse channel this frontend uses to take back what it
-// published. It is exactly the three go-fuse calls the repair needs, named as
-// an interface so the mapping from a visibility target to a notification can be
-// tested without a kernel; *fuse.Server is the only production implementation.
+// published. It is the stock go-fuse notification surface, named as an
+// interface so lease invalidation can be tested without a kernel; *fuse.Server
+// is the only production implementation.
 type kernelNotifier interface {
+	// InodeNotify(node, -1, 0) withdraws cached attributes only, which is what
+	// an A recall owes. InodeNotify(node, 0, 0) asks stock FUSE to invalidate
+	// the entire inode data range and its attributes for a D recall.
 	InodeNotify(node uint64, off int64, length int64) fuse.Status
-	EntryNotify(parent uint64, name string) fuse.Status
-	DeleteNotify(parent uint64, child uint64, name string) fuse.Status
 }
 
 var _ kernelNotifier = (*fuse.Server)(nil)
@@ -1031,13 +816,6 @@ func (m *Mount) setNotifier(notify kernelNotifier) {
 func (m *Mount) detach() error {
 	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
 	defer cancel()
-	if m.profile != CoherenceStrict {
-		// An uncached mount has no visibility membership to discharge. Detach is
-		// best-effort resource cleanup; connection close is sufficient if the
-		// authority is already unavailable.
-		_, _ = m.rpc.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_Detach{Detach: &authoritypb.DetachRequest{}}})
-		return nil
-	}
 	if m.kernelMount.point == "" {
 		// Startup may have installed a FUSE connection and then failed before
 		// mountinfo yielded its kernel ID. Once that connection is terminal, the

@@ -320,7 +320,7 @@ func (m *Mode) WithAttrLock(identity [16]byte, fn func() error) error {
 // Write serializes recall, drain, and a user write through the same chunk
 // state locks. Every stored chunk in the requested range is durably hydrated
 // before apply, so the accepted range cannot affect restore map state.
-func (m *Mode) Write(ctx context.Context, identity [16]byte, offset uint64, length uint32, apply func() (int, int64, error)) (int, int64, error) {
+func (m *Mode) Write(ctx context.Context, identity [16]byte, offset, length uint64, apply func() (int, int64, error)) (int, int64, error) {
 	// A zero-length write is a POSIX no-op: it moves no bytes and no mtime,
 	// so it must not record the entry as user-modified — that record would
 	// permanently suppress archived-mtime restoration for an untouched file.

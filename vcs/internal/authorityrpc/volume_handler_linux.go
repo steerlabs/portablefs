@@ -5,16 +5,20 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"math"
+	"sort"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
@@ -22,9 +26,14 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-var errInternal = errors.New("authorityrpc: internal handler failure")
+var (
+	errInternal                     = errors.New("authorityrpc: internal handler failure")
+	errCapabilityTableFull          = errnos.Sentinel("authorityrpc: descriptor-backed capability table full", syscall.ENFILE)
+	errCompositeDependenciesChanged = errors.New("authorityrpc: composite coherence dependencies changed")
+)
 
 // readDirReplyOverhead bounds the fixed part of a directory reply: the 16-byte
 // verifier, the EOF flag, and the protobuf tags wrapping the reply inside a
@@ -53,22 +62,25 @@ type volumeStore interface {
 	Forget(xfsstore.Capability) error
 	Getattr(xfsstore.Capability) (xfsstore.Attr, error)
 	Identity(xfsstore.Capability) ([16]byte, error)
+	CoordinateItem(xfsstore.Capability) (xfsstore.ObjectCoordinate, error)
 	IdentityOpen(xfsstore.Capability) ([16]byte, error)
+	CoordinateOpen(xfsstore.Capability) (xfsstore.ObjectCoordinate, error)
 	OpenFile(xfsstore.Capability, xfsstore.OpenFlags) (xfsstore.Capability, error)
 	CloseOpen(xfsstore.Capability) error
 	ReadAt(xfsstore.Capability, []byte, int64) (int, error)
 	WriteAt(xfsstore.Capability, []byte, int64) (int, error)
-	Append(xfsstore.Capability, []byte) (int, int64, error)
 	Truncate(xfsstore.Capability, int64) error
 	Fsync(xfsstore.Capability, bool) error
 	GetattrOpen(xfsstore.Capability) (xfsstore.Attr, error)
 	SyncFS() error
 	ReadDirOpen(xfsstore.Capability, uint64, [16]byte, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
 	StatOpenDirChild(xfsstore.Capability, string) (xfsstore.Attr, error)
+	LookupOpen(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error)
 	Chmod(xfsstore.Capability, fs.FileMode) error
 	Chown(xfsstore.Capability, int, int) error
 	SetTimes(xfsstore.Capability, *int64, *int64, bool, bool) error
 	TruncateObject(xfsstore.Capability, int64) error
+	SetAttr(xfsstore.Capability, xfsstore.Capability, xfsstore.SetAttrSpec) (xfsstore.Attr, error)
 	GetXattr(xfsstore.Capability, string) ([]byte, error)
 	SetXattr(xfsstore.Capability, string, []byte, xfsstore.XattrMode) error
 	RemoveXattr(xfsstore.Capability, string) error
@@ -83,10 +95,43 @@ type volumeStore interface {
 	Link(xfsstore.Capability, xfsstore.Capability, string) (xfsstore.Attr, error)
 }
 
+// writeStore is deliberately narrower than volumeStore. A write
+// transaction pins a stable inode target across inert BEGIN/DATA staging and
+// source-gated COMMIT; no ordinary handle operation may approximate that
+// lifetime. Production's *xfsstore.Volume is the sole implementation.
+type writeStore interface {
+	PinWriteTarget(xfsstore.Capability) (xfsstore.WriteTarget, error)
+}
+
+type writeTargetAttr interface {
+	Getattr() (xfsstore.Attr, error)
+}
+
+type coalescingFsyncStore interface {
+	FsyncCoalesced(xfsstore.Capability, bool) (int, error)
+}
+
+type tmpfileStore interface {
+	Tmpfile(xfsstore.Capability, fs.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error)
+}
+
+type mutationLockStore interface {
+	LockMutation([][16]byte) func()
+}
+
+func lockMutationStore(store volumeStore, identities ...[16]byte) (func(), error) {
+	locker, ok := store.(mutationLockStore)
+	if !ok {
+		return nil, errInternal
+	}
+	return locker.LockMutation(identities), nil
+}
+
 type VolumeHandler struct {
 	Store       volumeStore
 	Runtime     *volumeserver.Authority
 	Authorizer  Authorizer
+	Metrics     *authoritymetrics.Metrics
 	MaxFrame    uint32
 	MaxRead     uint32
 	MaxWrite    uint32
@@ -94,18 +139,46 @@ type VolumeHandler struct {
 	// Descriptor-backed capabilities have independent per-session and
 	// per-worker admission bounds. These limits exclude the one shared root
 	// descriptor owned by xfsstore.
-	MaxItemsPerSession uint32
-	MaxOpensPerSession uint32
-	MaxItems           uint32
-	MaxOpens           uint32
+	MaxItemsPerSession  uint32
+	MaxOpensPerSession  uint32
+	MaxItems            uint32
+	MaxOpens            uint32
+	postStateMu         sync.Mutex
+	objectVersions      map[[16]byte]uint64
+	postStateChanges    map[uint64]map[[16]byte]struct{}
+	postStateAllChanges map[uint64]map[[16]byte]struct{}
 	// MaxRetainedReplyBytes bounds the real quantity the replay cache consumes:
 	// the total encoded bytes retained across every live session's replay
 	// slots. Slot counts are not a proxy for it; one directory listing is five
 	// orders of magnitude larger than one create.
 	MaxRetainedReplyBytes uint64
-	// Visibility coordinates frontends that explicitly declare strict kernel
-	// caches. Uncached Linux mounts do not join its barrier.
+	// One ordinary WRITE retains one frame until XFS completes. These bounds
+	// cap the exact retained payload bytes and requests per session and worker.
+	WriteAdmission                      *WriteAdmission
+	MaxWriteBytesPerSession             uint64
+	MaxWriteBytesInFlight               uint64
+	MaxWritesPerSession                 uint32
+	MaxWrites                           uint32
+	MaxFskitWriteBytes                  uint64
+	FskitWriteStaging                   *FskitWriteStaging
+	MaxFskitWriteStagingBytesPerSession uint64
+	MaxFskitWriteStagingBytes           uint64
+	MaxFskitWritesPerSession            uint32
+	MaxFskitWrites                      uint32
+	FskitWriteProgressTimeout           time.Duration
+	FskitWriteAbsoluteTimeout           time.Duration
+	WriteAdmissionProgressTimeout       time.Duration
+	WriteAbsoluteTimeout                time.Duration
+	TerminalDeliveryTimeout             time.Duration
+	// Lifecycle durably records protocol-6 mounts and owns route-revision
+	// exclusion. Cache authority itself belongs exclusively to Leases.
+	Lifecycle *volumeserver.MountLifecycle
+	// Visibility owns the protocol-6 FSKit synchronous-repair participants. Linux
+	// sessions never enter it; composite mutations coordinate both profile sets.
 	Visibility *volumeserver.VisibilityCoordinator
+	// Leases is protocol 6's exact cache-authority table and recall stream. It
+	// is mandatory for every active filesystem session.
+	Leases *volumeserver.LeaseCoordinator
 	// Routes owns the volume's active machine-local routing revision. It is
 	// required: a volume with no loaded revision cannot tell an agreeing mount
 	// from a disagreeing one, and admitting mounts in that state is exactly the
@@ -120,22 +193,57 @@ type VolumeHandler struct {
 	OnStorageFailure   func(error)
 	OnCoherenceFailure func(error)
 
-	cleanupOnce          sync.Once
-	storageFailureOnce   sync.Once
-	coherenceFailureOnce sync.Once
-	resourcesMu          sync.Mutex
-	resources            map[volumeserver.SessionID]*sessionResources
-	totalItems           uint32
-	totalOpens           uint32
+	cleanupOnce            sync.Once
+	storageFailureOnce     sync.Once
+	coherenceFailureOnce   sync.Once
+	terminalFailureMu      sync.Mutex
+	terminalDraining       bool
+	terminalQuiesce        chan struct{}
+	terminalTimeoutArmed   bool
+	terminalForced         bool
+	terminalActive         uint64
+	terminalHandlerFrames  map[*authoritypb.Response]struct{}
+	terminalAdmittedFrames map[*authoritypb.Response]struct{}
+	terminalFrames         map[*authoritypb.Response]struct{}
+	// terminalReceiptFrames is the exact response-instance set which directly
+	// carried a terminal storage/coherence outcome. Sibling requests admitted
+	// before the fence are still held through their physical frame write, but
+	// only these terminal results need a cross-process frontend publication
+	// receipt. Pointer identity avoids both protobuf-body collisions and request-
+	// dialect guesses (some protocol clients have no deferred publication API).
+	terminalReceiptFrames map[*authoritypb.Response]struct{}
+	terminalResponses     map[[16]byte]struct{}
+	terminalTokenReader   io.Reader
+	terminalStorageErr    error
+	terminalCoherenceErr  error
+	resourcesMu           sync.Mutex
+	resources             map[volumeserver.SessionID]*sessionResources
+	totalItems            uint32
+	totalOpens            uint32
 	// retainedReplyBytes is the exact number of bytes currently held in replay
 	// slots; reservedReplyBytes covers mutations that are executing and whose
 	// reply size is not yet known.
-	retainedReplyBytes uint64
-	reservedReplyBytes uint64
+	retainedReplyBytes          uint64
+	reservedReplyBytes          uint64
+	writeAdmissionMu            sync.Mutex
+	writeAdmissionHead          *writeAdmissionWaiter
+	writeAdmissionTail          *writeAdmissionWaiter
+	totalWriteBytes             uint64
+	totalWrites                 uint32
+	fskitWriteCapacityMu        sync.Mutex
+	fskitWriteCapacityHead      *fskitWriteCapacityWaiter
+	fskitWriteCapacityTail      *fskitWriteCapacityWaiter
+	totalFskitWriteStagingBytes uint64
+	totalFskitWrites            uint32
 }
 
 type sessionResources struct {
 	ended bool
+	// attempt identifies the one protocol-6 attach transaction that owns these
+	// resources. Attach retries may race, but the runtime binds an attempt ID to
+	// one canonical request before this record is installed, so an exact retry
+	// observes this same record instead of allocating a second reply table.
+	attempt volumeserver.AttachAttemptID
 	// root is the one shared volume-root capability. It is owned by xfsstore,
 	// not by this session, so it is never forgotten during cleanup.
 	root xfsstore.Capability
@@ -154,14 +262,38 @@ type sessionResources struct {
 	reservedOpens uint32
 	// reply holds the retained reply size for each of this session's replay
 	// slots. Its length is the slot count the runtime admitted.
-	reply     []uint32
-	coherence volumeserver.CoherenceProfile
+	reply      []uint32
+	coherence  volumeserver.CoherenceProfile
+	profile    authoritypb.FrontendProfile
+	commitment volumeserver.VisibilityCommitment
+	// authorizationDeadline comes from the runtime's retained result, never
+	// from the local Authorize invocation: on an exact concurrent Attach replay
+	// only the first caller executes that invocation.
+	authorizationDeadline time.Time
+	// activation serializes the failure-atomic transition and the retained
+	// reply. The transport also serializes lifecycle requests, but keeping the
+	// invariant here makes direct handler use and tests obey the same contract.
+	activationMu    sync.Mutex
+	activationReply *authoritypb.ActivateReply
 	// routes is the machine-local routing revision this session was admitted
 	// against. It is held here, by the authority, rather than echoed on each
 	// request: a mount cannot present agreement it does not have, and a routing
 	// change makes every session whose revision is no longer active refuse its
 	// next request without any extra field on the wire.
-	routes [32]byte
+	routes  [32]byte
+	purpose authoritypb.SessionPurpose
+
+	writeReservedBytes  uint64
+	writeCount          uint32
+	writeAdmissionEnded bool
+
+	fskitWriteMu            sync.Mutex
+	fskitWrites             map[uint64]*fskitWrite
+	fskitWriteHighWater     uint64
+	fskitWriteTerminal      *fskitWriteTerminal
+	fskitWriteReservedBytes uint64
+	fskitWriteCount         uint32
+	fskitWriteCapacityEnded bool
 }
 
 type trackedCapability struct {
@@ -203,29 +335,76 @@ func (h *VolumeHandler) Bounds() TransportBounds {
 	return TransportBounds{MaxFrame: h.MaxFrame, MaxRequestFrame: uint32(request), MaxInFlight: int(h.MaxInFlight)}
 }
 
+func (h *VolumeHandler) SessionStateForTransport(id volumeserver.SessionID) (volumeserver.SessionState, bool) {
+	if h.Runtime == nil {
+		return volumeserver.SessionStateUnknown, false
+	}
+	return h.Runtime.SessionStateByID(id)
+}
+
+func (h *VolumeHandler) SessionTerminalForTransport(id volumeserver.SessionID) (<-chan struct{}, bool) {
+	if h.Runtime == nil {
+		return nil, false
+	}
+	terminal, err := h.Runtime.SessionTerminal(id)
+	return terminal, err == nil
+}
+
 // maxReplyBytes is the largest operation reply this authority can both retain
 // and put on the wire: whatever fits in a frame once the response envelope the
 // transport adds back is accounted for.
 func (h *VolumeHandler) maxReplyBytes() uint32 { return h.MaxFrame - responseEnvelopeReserve }
 
 func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
+	return h.handle(ctx, req, false)
+}
+
+// HandleForTransport retains the admitted-handler accounting through the
+// immutable response boundary. The server transfers that ownership to the
+// physical frame in FinishHandlerResponse before allowing terminal teardown.
+func (h *VolumeHandler) HandleForTransport(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
+	return h.handle(ctx, req, true)
+}
+
+func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, retainForTransport bool) (response *authoritypb.Response) {
+	requestID := uint64(0)
+	if req != nil {
+		requestID = req.GetRequestId()
+	}
+	if !h.beginTerminalRequest(req) {
+		return h.errorResponse(requestID, xfsstore.ErrFenced, false)
+	}
+	defer func() {
+		if retainForTransport {
+			h.retainTerminalHandlerResponse(response)
+			return
+		}
+		h.endTerminalRequest()
+	}()
+	if terminalQuiesceCancelable(req) {
+		select {
+		case <-h.TerminalQuiescing():
+			// A request admitted after the terminal edge must not begin a new
+			// unbounded wait. Existing waits are canceled by the server's
+			// quiesce hook; this closes the complementary post-edge race.
+			return h.errorResponse(requestID, xfsstore.ErrFenced, false)
+		default:
+		}
+	}
 	if h.Runtime != nil {
 		h.cleanupOnce.Do(func() { h.Runtime.OnSessionEnd(h.closeSessionResources) })
 	}
 	if req == nil {
 		return h.errorResponse(0, fs.ErrInvalid, false)
 	}
-	// This is an authority trust boundary, not merely a daemon assertion. A
-	// mount credential authenticates the caller but does not entitle it to mark
-	// arbitrary requests safe to queue behind an own-source visibility phase.
-	if !validSourcePhaseQueueability(req) {
-		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
-	}
 	if hello := req.GetHello(); hello != nil {
+		if req.GetFskitSourcePublication() != nil || req.GetFskitFrontendOperationId() != 0 {
+			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+		}
 		return h.hello(req.GetRequestId(), hello)
 	}
 	if attach := req.GetAttach(); attach != nil {
-		return h.attach(ctx, req.GetRequestId(), attach)
+		return h.attach(ctx, req)
 	}
 	if h.Store == nil || h.Runtime == nil || h.Authorizer == nil || h.Routes == nil {
 		return h.errorResponse(req.GetRequestId(), errInternal, false)
@@ -237,6 +416,30 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
+	if receipt := req.GetTerminalDeliveryReceipt(); receipt != nil {
+		return h.terminalDeliveryReceipt(req.GetRequestId(), receipt)
+	}
+	// These are the only requests a provisional credential can authorize. They
+	// must run before Begin: Begin intentionally gates every ordinary operation
+	// on ACTIVE, and neither Resume(PROVISIONAL) nor Abort may renew or publish a
+	// provisional session as executable.
+	switch body := req.GetBody().(type) {
+	case *authoritypb.Request_Resume:
+		return h.resume(ctx, req.GetRequestId(), cred)
+	case *authoritypb.Request_Activate:
+		return h.activate(ctx, req.GetRequestId(), cred, body.Activate)
+	case *authoritypb.Request_AbortAttach:
+		return h.abortAttach(ctx, req.GetRequestId(), cred, body.AbortAttach)
+	}
+	use, err := h.Runtime.Begin(cred)
+	if err != nil {
+		return h.errorResponse(req.GetRequestId(), err, false)
+	}
+	defer use.End()
+	// Reauthorization is an ordinary ACTIVE-session operation. Pin the runtime
+	// first, before presenting its signed token to an external verifier: a
+	// provisional credential must not consume or validate anything beyond its
+	// three lifecycle operations (Resume, Activate, AbortAttach).
 	if reauthorize := req.GetReauthorize(); reauthorize != nil {
 		verifier, ok := h.Authorizer.(Reauthorizer)
 		if !ok || reauthorize.GetSequence() == 0 || len(reauthorize.GetAccessToken()) == 0 {
@@ -255,20 +458,35 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		}}
 		return resp
 	}
-	use, err := h.Runtime.Begin(cred)
+	access := use.Access()
+	purpose, err := h.sessionPurpose(cred.ID)
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
-	defer use.End()
-	access := use.Access()
-	if access&volumeserver.AccessRead == 0 {
-		return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
-	}
-	if requestRequiresWrite(req) && access&volumeserver.AccessWrite == 0 {
-		return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
-	}
-	if requestRequiresAdmin(req) && access&volumeserver.AccessAdmin == 0 {
-		return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+	switch purpose {
+	case authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT:
+		if access&volumeserver.AccessRead == 0 || requestRequiresWrite(req) && access&volumeserver.AccessWrite == 0 {
+			return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+		}
+		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		if profileErr != nil || !requestAllowedForFrontend(req, frontendProfile) {
+			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
+		}
+		if req.GetApplyRoutes() != nil {
+			return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+		}
+	case authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN:
+		if access&volumeserver.AccessAdmin == 0 {
+			return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+		}
+		switch req.GetBody().(type) {
+		case *authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
+			*authoritypb.Request_ApplyRoutes, *authoritypb.Request_Cancel:
+		default:
+			return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+		}
+	default:
+		return h.errorResponse(req.GetRequestId(), errInternal, false)
 	}
 	topologyAdmitted := false
 	if requestUsesTopology(req) {
@@ -302,7 +520,8 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	// the commit point, so refusing them here would convert every routing
 	// change into one full repair-budget stall per strict participant.
 	if !topologyAdmitted && req.GetDetach() == nil && req.GetApplyRoutes() == nil &&
-		req.GetNextVisibility() == nil && req.GetAckVisibility() == nil {
+		req.GetNextLeaseEvent() == nil && req.GetAcknowledgeLeaseEvent() == nil && req.GetRenewLeases() == nil &&
+		req.GetAcknowledgeSourceLeaseDischarge() == nil && req.GetNextFskitRepair() == nil && req.GetAckFskitRepair() == nil {
 		if err := h.admitSessionRoutes(cred.ID); err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
@@ -315,70 +534,167 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 	}
 
 	switch body := req.GetBody().(type) {
-	case *authoritypb.Request_Resume, *authoritypb.Request_KeepAlive:
+	case *authoritypb.Request_KeepAlive:
 		if err := h.Runtime.Resume(cred); err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		return h.success(req.GetRequestId())
+	case *authoritypb.Request_NextFskitRepair:
+		if h.Visibility == nil {
+			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
+		}
+		cursor, cursorErr := visibilityCursor(body.NextFskitRepair.GetAfter())
+		if cursorErr != nil {
+			return h.errorResponse(req.GetRequestId(), cursorErr, false)
+		}
+		if body.NextFskitRepair.GetAcknowledgeAfter() {
+			if cursor == (volumeserver.VisibilityCursor{}) {
+				return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+			}
+			if ackErr := h.Visibility.AckWithContention(cred.ID, cursor, body.NextFskitRepair.GetOrderedAdmissionContended()); ackErr != nil {
+				return h.errorResponse(req.GetRequestId(), ackErr, false)
+			}
+		} else if body.NextFskitRepair.GetOrderedAdmissionContended() {
+			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+		}
+		event, nextErr := h.Visibility.Next(ctx, cred.ID, cursor)
+		if nextErr != nil {
+			return h.errorResponse(req.GetRequestId(), nextErr, false)
+		}
+		resp := h.success(req.GetRequestId())
+		resp.Body = &authoritypb.Response_FskitRepair{FskitRepair: visibilityEventProto(event)}
+		return resp
+	case *authoritypb.Request_AckFskitRepair:
+		if h.Visibility == nil {
+			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
+		}
+		cursor, cursorErr := visibilityCursor(body.AckFskitRepair.GetCursor())
+		if cursorErr != nil || cursor == (volumeserver.VisibilityCursor{}) {
+			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+		}
+		if ackErr := h.Visibility.AckWithContention(cred.ID, cursor, body.AckFskitRepair.GetOrderedAdmissionContended()); ackErr != nil {
+			return h.errorResponse(req.GetRequestId(), ackErr, false)
+		}
+		return h.success(req.GetRequestId())
 	case *authoritypb.Request_Detach:
+		if purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
+			if body.Detach.GetMountAbsence() != nil {
+				return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+			}
+			if err := h.Runtime.Detach(cred); err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			return h.success(req.GetRequestId())
+		}
 		profile, err := h.sessionCoherence(cred.ID)
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		if profile == volumeserver.CoherenceStrict {
-			// credential() authenticated this request as cred.ID and DetachRequest
-			// contains no caller-selected session. CleanDetach therefore trusts
-			// only the official supervisor for this exact mount. A frontend that
-			// cannot establish terminal kernel state sends no observation and lets
-			// the session die fenced, leaving durable membership active.
-			if h.Visibility == nil {
-				return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		if profile != volumeserver.CoherenceStrict || profileErr != nil || h.Lifecycle == nil {
+			return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
+		}
+		// credential() authenticated this request as cred.ID and DetachRequest
+		// contains no caller-selected session. CleanDetach therefore trusts only
+		// the official supervisor for this exact mount. A frontend that cannot
+		// establish terminal kernel state sends no observation and lets the
+		// session die fenced, leaving durable membership active.
+		proof := mountAbsenceProof(body.Detach.GetMountAbsence())
+		if err := h.Lifecycle.CleanDetach(cred.ID, proof, func() error {
+			switch frontendProfile {
+			case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+				if h.Leases == nil {
+					return errInternal
+				}
+				return h.Leases.RemoveHolder(cred.ID)
+			case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+				if h.Visibility == nil {
+					return errInternal
+				}
+				return h.Visibility.CleanDetachInMemory(cred.ID, proof)
+			default:
+				return errInternal
 			}
-			if err := h.Visibility.CleanDetach(cred.ID, mountAbsenceProof(body.Detach.GetMountAbsence())); err != nil {
-				return h.errorResponse(req.GetRequestId(), err, false)
-			}
+		}); err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		if err := h.Runtime.Detach(cred); err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		return h.success(req.GetRequestId())
-	case *authoritypb.Request_NextVisibility:
-		if h.Visibility == nil || !h.strictSession(cred.ID) {
+	case *authoritypb.Request_NextLeaseEvent:
+		if h.Leases == nil {
 			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
 		}
-		cursor, err := visibilityCursor(body.NextVisibility.GetAfter())
+		cursor, err := leaseEventCursor(body.NextLeaseEvent.GetAfter())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		event, err := h.Visibility.Next(ctx, cred.ID, cursor)
+		event, err := h.Leases.Next(ctx, cred.ID, cursor)
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
 		resp := h.success(req.GetRequestId())
-		resp.Body = &authoritypb.Response_Visibility{Visibility: visibilityEventProto(event)}
+		resp.Body = &authoritypb.Response_LeaseEvent{LeaseEvent: leaseEventProto(event)}
 		return resp
-	case *authoritypb.Request_AckVisibility:
-		if h.Visibility == nil || !h.strictSession(cred.ID) {
+	case *authoritypb.Request_AcknowledgeLeaseEvent:
+		if h.Leases == nil {
 			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
 		}
-		cursor, err := visibilityCursor(body.AckVisibility.GetCursor())
-		if err != nil || cursor == (volumeserver.VisibilityCursor{}) {
+		cursor, err := leaseEventCursor(body.AcknowledgeLeaseEvent.GetCursor())
+		if err != nil || cursor == (volumeserver.LeaseEventCursor{}) {
 			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 		}
-		if body.AckVisibility.GetBlocked() {
-			// For an ordinary parent-exclusive namespace COMPLETE, this installs
-			// a scoped pre-apply interruption and the same mount goes on to repair
-			// and Ack. A routes report remains terminal because topology cannot be
-			// repaired by releasing one kernel parent lock.
-			if err := h.Visibility.ReportBlocked(ctx, cred.ID, cursor, body.AckVisibility.GetBlockedParentKernelInos()); err != nil {
-				return h.errorResponse(req.GetRequestId(), err, false)
+		switch cursor.Phase {
+		case volumeserver.LeaseEventRevoke:
+			if len(body.AcknowledgeLeaseEvent.GetDischarges()) != 0 {
+				return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 			}
-			return h.success(req.GetRequestId())
+			err = h.Leases.AcknowledgeRevoke(cred.ID, cursor)
+		case volumeserver.LeaseEventComplete:
+			var discharges []volumeserver.LeaseDischarge
+			discharges, err = leaseDischarges(body.AcknowledgeLeaseEvent.GetDischarges())
+			if err == nil {
+				err = h.Leases.Discharge(cred.ID, cursor, discharges)
+			}
+		default:
+			err = syscall.EINVAL
 		}
-		if err := h.Visibility.AckWithContention(cred.ID, cursor, body.AckVisibility.GetOrderedAdmissionContended()); err != nil {
+		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		return h.success(req.GetRequestId())
+		resp := h.success(req.GetRequestId())
+		resp.Body = &authoritypb.Response_AcknowledgeLeaseEvent{AcknowledgeLeaseEvent: &authoritypb.AcknowledgeLeaseEventReply{}}
+		return resp
+	case *authoritypb.Request_RenewLeases:
+		if h.Leases == nil {
+			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
+		}
+		renewals, err := leaseRenewals(body.RenewLeases.GetLeases())
+		if err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		grants, withdrawn, err := h.Leases.Renew(cred.ID, renewals)
+		if err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		resp := h.success(req.GetRequestId())
+		resp.Body = &authoritypb.Response_RenewLeases{RenewLeases: &authoritypb.RenewLeasesReply{
+			Grants: leaseGrantsProto(h.Leases, grants), Withdrawn: leaseRenewalsProto(withdrawn),
+		}}
+		return resp
+	case *authoritypb.Request_AcknowledgeSourceLeaseDischarge:
+		if h.Leases == nil || body.AcknowledgeSourceLeaseDischarge.GetSequence() == 0 {
+			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+		}
+		if err := h.Leases.DischargeSource(cred.ID, body.AcknowledgeSourceLeaseDischarge.GetSequence()); err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		resp := h.success(req.GetRequestId())
+		resp.Body = &authoritypb.Response_AcknowledgeSourceLeaseDischarge{
+			AcknowledgeSourceLeaseDischarge: &authoritypb.AcknowledgeSourceLeaseDischargeReply{},
+		}
+		return resp
 	case *authoritypb.Request_ApplyRoutes:
 		expected, err := routesRevision(body.ApplyRoutes.GetExpectedRevision())
 		if err != nil {
@@ -399,44 +715,234 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		resp.Body = &authoritypb.Response_ApplyRoutes{ApplyRoutes: reply}
 		return resp
 	case *authoritypb.Request_Lookup:
+		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		if profileErr != nil {
+			return h.errorResponse(req.GetRequestId(), profileErr, false)
+		}
+		if frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			return h.mutate(ctx, req, cred, func() *authoritypb.Response {
+				parent, err := h.item(cred.ID, body.Lookup.GetParent())
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				protected := h.protectedChild(cred.ID, parent, body.Lookup.GetName())
+				item, attr, snapshot, err := h.lookupForSession(ctx, cred.ID, parent, body.Lookup.GetName())
+				if errors.Is(err, syscall.ENOENT) {
+					resp := h.success(0)
+					resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: snapshot}}
+					return resp
+				}
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				if err := h.trackItem(cred.ID, item, protected); err != nil {
+					h.forgetItem(item)
+					return h.errorResponse(0, err, false)
+				}
+				identity, err := h.Store.Identity(item)
+				if err != nil {
+					h.untrackItem(cred.ID, item)
+					h.forgetItem(item)
+					return h.errorResponse(0, err, false)
+				}
+				itemReply := itemProto(item, attr, identity)
+				itemReply.SnapshotSequence = snapshot
+				itemReply.ObjectVersion = h.sampledObjectVersion(identity, snapshot)
+				resp := h.success(0)
+				resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
+				return resp
+			})
+		}
+		if h.Leases == nil {
+			return h.errorResponse(req.GetRequestId(), errInternal, false)
+		}
 		// Lookup allocates and transfers an authority item capability. It is
 		// read-only in XFS, but not side-effect-free in this session: replaying a
 		// response lost after trackItem would allocate a second unreachable
 		// capability. Exact replay therefore owns the transfer just as it owns an
 		// Open handle; the frontend's later Reclaim retires it idempotently.
-		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
+		var grants []volumeserver.LeaseGrant
+		response, executed := h.mutateExecution(ctx, req, cred, func() *authoritypb.Response {
 			parent, err := h.item(cred.ID, body.Lookup.GetParent())
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
-			// Resolving a name under the protected namespace is the only way a
-			// capability inside it can enter this session, so it is the only place
-			// the mark has to be applied for the set to be closed at every depth.
-			protected := h.protectedChild(cred.ID, parent, body.Lookup.GetName())
-			item, attr, err := h.lookupForSession(ctx, cred.ID, parent, body.Lookup.GetName())
+			parentIdentity, err := h.Store.Identity(parent)
 			if err != nil {
 				return h.errorResponse(0, err, false)
 			}
-			if err := h.trackItem(cred.ID, item, protected); err != nil {
-				return h.errorResponse(0, err, false)
+			nameCoordinate := volumeserver.LeaseCoordinate{
+				Family: volumeserver.LeaseFamilyName, ParentIdentity: parentIdentity, Name: bytes.Clone(body.Lookup.GetName()),
 			}
-			identity, err := h.Store.Identity(item)
-			if err != nil {
-				h.untrackItem(cred.ID, item)
+			for {
+				// First learn the current binding under N alone. A positive result is
+				// only a probe: it is forgotten before atomically acquiring N+A, so
+				// no callback can hold N while waiting for a separately blocked A.
+				probe, err := h.Leases.BeginRead(ctx, cred.ID, nameCoordinate)
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				item, _, lookupErr := h.Store.Lookup(parent, string(body.Lookup.GetName()))
+				snapshot := probe.SnapshotSequence()
+				if errors.Is(lookupErr, syscall.ENOENT) {
+					grant, grantErr := probe.Grant(nameCoordinate, volumeserver.LeaseRightNameRead)
+					probe.Release()
+					if grantErr != nil && !errors.Is(grantErr, volumeserver.ErrLeaseCapacity) {
+						return h.errorResponse(0, grantErr, false)
+					}
+					if grantErr == nil {
+						grants = []volumeserver.LeaseGrant{grant}
+					}
+					resp := h.success(0)
+					resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: snapshot}}
+					return resp
+				}
+				if lookupErr != nil {
+					probe.Release()
+					return h.errorResponse(0, lookupErr, false)
+				}
+				identity, identityErr := h.Store.Identity(item)
 				h.forgetItem(item)
-				return h.errorResponse(0, err, false)
+				probe.Release()
+				if identityErr != nil {
+					return h.errorResponse(0, identityErr, false)
+				}
+
+				attributeCoordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: identity}
+				combined, err := h.Leases.BeginRead(ctx, cred.ID, nameCoordinate, attributeCoordinate)
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				item, attr, lookupErr := h.Store.Lookup(parent, string(body.Lookup.GetName()))
+				if lookupErr == nil {
+					current, currentErr := h.Store.Identity(item)
+					if currentErr != nil {
+						h.forgetItem(item)
+						combined.Release()
+						return h.errorResponse(0, currentErr, false)
+					}
+					if current != identity {
+						h.forgetItem(item)
+						combined.Release()
+						continue
+					}
+					attr, lookupErr = h.Store.Getattr(item)
+				}
+				if lookupErr != nil {
+					if item != (xfsstore.Capability{}) {
+						h.forgetItem(item)
+					}
+					combined.Release()
+					if errors.Is(lookupErr, syscall.ENOENT) {
+						continue
+					}
+					return h.errorResponse(0, lookupErr, false)
+				}
+				protected := h.protectedChild(cred.ID, parent, body.Lookup.GetName())
+				if err := h.trackItem(cred.ID, item, protected); err != nil {
+					h.forgetItem(item)
+					combined.Release()
+					return h.errorResponse(0, err, false)
+				}
+				snapshot = combined.SnapshotSequence()
+				grants, err = combined.GrantBatch([]volumeserver.LeaseGrantRequest{
+					{Coordinate: nameCoordinate, Right: volumeserver.LeaseRightNameRead},
+					{Coordinate: attributeCoordinate, Right: volumeserver.LeaseRightAttributesRead},
+				})
+				if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) {
+					h.untrackItem(cred.ID, item)
+					h.forgetItem(item)
+					combined.Release()
+					return h.errorResponse(0, err, false)
+				}
+				if errors.Is(err, volumeserver.ErrLeaseCapacity) {
+					grants = nil
+				}
+				combined.Release()
+				resp := h.success(0)
+				itemReply := itemProto(item, attr, identity)
+				itemReply.SnapshotSequence = snapshot
+				itemReply.ObjectVersion = snapshot
+				resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
+				return resp
 			}
-			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, identity)}}
-			return resp
 		})
+		if executed && response.GetErrno() == 0 {
+			response.LeaseGrants = leaseGrantsProto(h.Leases, grants)
+		}
+		return response
 	case *authoritypb.Request_GetAttr:
-		attr, err := h.getattr(ctx, cred.ID, body.GetAttr)
+		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		if profileErr != nil {
+			return h.errorResponse(req.GetRequestId(), profileErr, false)
+		}
+		if frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			attr, identity, snapshot, err := h.getattr(ctx, cred.ID, body.GetAttr)
+			if err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			resp := h.success(req.GetRequestId())
+			resp.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
+				Attr: attrProto(attr), ObjectVersion: h.sampledObjectVersion(identity, snapshot), SnapshotSequence: snapshot,
+			}}
+			return resp
+		}
+		if h.Leases == nil {
+			return h.errorResponse(req.GetRequestId(), errInternal, false)
+		}
+		var identity [16]byte
+		if len(body.GetAttr.GetHandle()) != 0 {
+			handle, err := h.open(cred.ID, body.GetAttr.GetHandle())
+			if err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			identity, err = h.Store.IdentityOpen(handle)
+			if err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+		} else {
+			item, err := h.item(cred.ID, body.GetAttr.GetItem())
+			if err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			identity, err = h.Store.Identity(item)
+			if err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+		}
+		coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: identity}
+		admission, err := h.Leases.BeginRead(ctx, cred.ID, coordinate)
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
+		defer admission.Release()
+		var attr xfsstore.Attr
+		if len(body.GetAttr.GetHandle()) != 0 {
+			handle, openErr := h.open(cred.ID, body.GetAttr.GetHandle())
+			if openErr != nil {
+				return h.errorResponse(req.GetRequestId(), openErr, false)
+			}
+			attr, err = h.getattrOpenRestored(identity, handle)
+		} else {
+			item, itemErr := h.item(cred.ID, body.GetAttr.GetItem())
+			if itemErr != nil {
+				return h.errorResponse(req.GetRequestId(), itemErr, false)
+			}
+			attr, err = h.getattrItemRestored(identity, item)
+		}
+		if err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		snapshot := admission.SnapshotSequence()
+		grant, err := admission.Grant(coordinate, volumeserver.LeaseRightAttributesRead)
+		if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
 		resp := h.success(req.GetRequestId())
-		resp.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: attrProto(attr)}}
+		resp.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: attrProto(attr), ObjectVersion: snapshot, SnapshotSequence: snapshot}}
+		if err == nil {
+			resp.LeaseGrants = leaseGrantsProto(h.Leases, []volumeserver.LeaseGrant{grant})
+		}
 		return resp
 	case *authoritypb.Request_SetAttr:
 		set := body.SetAttr
@@ -444,6 +950,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		var coordinate visibilityCoordinate
 		var oldSize int64
 		var mode fs.FileMode
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			if set.Mode == nil && set.Uid == nil && set.Gid == nil && set.Size == nil && set.AtimeNs == nil && set.MtimeNs == nil && !set.GetAtimeNow() && !set.GetMtimeNow() {
 				return nil, syscall.EINVAL
@@ -484,11 +991,28 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if (set.AtimeNs != nil || set.MtimeNs != nil || set.GetAtimeNow() || set.GetMtimeNow()) && item == (xfsstore.Capability{}) {
 				return nil, syscall.EINVAL
 			}
+			if item != (xfsstore.Capability{}) && handle != (xfsstore.Capability{}) {
+				itemIdentity, identityErr := h.Store.Identity(item)
+				if identityErr != nil {
+					return nil, identityErr
+				}
+				handleIdentity, identityErr := h.Store.IdentityOpen(handle)
+				if identityErr != nil {
+					return nil, identityErr
+				}
+				if itemIdentity != handleIdentity {
+					return nil, syscall.EINVAL
+				}
+			}
 			if handle != (xfsstore.Capability{}) {
 				coordinate, err = h.coordinateOpen(handle)
 			} else {
 				coordinate, err = h.coordinateItem(item)
 			}
+			if err != nil {
+				return nil, err
+			}
+			releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
 			if err != nil {
 				return nil, err
 			}
@@ -510,102 +1034,60 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			}
 			return targets, nil
 		}
-		completeTargets := func() []volumeserver.VisibilityTarget {
-			var attr xfsstore.Attr
-			var err error
-			if handle != (xfsstore.Capability{}) {
-				attr, err = h.Store.GetattrOpen(handle)
-			} else {
-				attr, err = h.Store.Getattr(item)
-			}
-			if err != nil {
-				return []volumeserver.VisibilityTarget{}
-			}
+		completeTargets := func(attr xfsstore.Attr) []volumeserver.VisibilityTarget {
 			targets := []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 			if set.Size != nil {
 				targets = append(targets, inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size))
 			}
 			return targets
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-			changed := false
-			var err error
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			var modePtr *fs.FileMode
 			if set.Mode != nil {
-				err = h.Store.Chmod(item, mode)
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
-			}
-			if set.Uid != nil || set.Gid != nil {
-				uid, gid := -1, -1
-				if set.Uid != nil {
-					uid = int(set.GetUid())
-				}
-				if set.Gid != nil {
-					gid = int(set.GetGid())
-				}
-				err = h.Store.Chown(item, uid, gid)
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
-			}
-			if set.Size != nil {
-				truncate := func() error {
-					if handle != (xfsstore.Capability{}) {
-						return h.Store.Truncate(handle, set.GetSize())
-					}
-					return h.Store.TruncateObject(item, set.GetSize())
-				}
-				if h.Restore != nil && h.Restore.Active() {
-					err = h.Restore.Truncate(ctx, coordinate.identity, oldSize, set.GetSize(), truncate)
-				} else {
-					err = truncate()
-				}
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
-			}
-			if set.AtimeNs != nil || set.MtimeNs != nil || set.GetAtimeNow() || set.GetMtimeNow() {
-				setTimes := func() error {
-					return h.Store.SetTimes(item, set.AtimeNs, set.MtimeNs, set.GetAtimeNow(), set.GetMtimeNow())
-				}
-				if h.Restore != nil && h.Restore.Active() && (set.MtimeNs != nil || set.GetMtimeNow()) {
-					err = h.Restore.UserMutation(coordinate.identity, setTimes)
-				} else {
-					err = setTimes()
-				}
-				if err != nil {
-					return h.errorResponse(0, err, changed), completeTargets()
-				}
-				changed = true
+				modePtr = &mode
 			}
 			var attr xfsstore.Attr
-			if handle != (xfsstore.Capability{}) {
-				attr, err = h.Store.GetattrOpen(handle)
-			} else {
-				attr, err = h.Store.Getattr(item)
-			}
-			if err != nil {
-				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
-			}
-			resp := h.success(0)
-			resp.PostAttr = attrProto(attr)
-			return resp, completeTargets()
-		})
-	case *authoritypb.Request_Create:
-		var parent xfsstore.Capability
-		var parentCoordinate, existingCoordinate visibilityCoordinate
-		var existingSize int64
-		var existed bool
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
-			if err := namespaceName(body.Create.GetName()); err != nil {
-				return nil, err
+			apply := func() error {
+				var applyErr error
+				attr, applyErr = h.Store.SetAttr(item, handle, xfsstore.SetAttrSpec{
+					Mode: modePtr, UID: set.Uid, GID: set.Gid, Size: set.Size,
+					ATimeNS: set.AtimeNs, MTimeNS: set.MtimeNs,
+					ATimeNow: set.GetAtimeNow(), MTimeNow: set.GetMtimeNow(),
+				})
+				return applyErr
 			}
 			var err error
-			parent, err = h.item(cred.ID, body.Create.GetParent())
+			if h.Restore != nil && h.Restore.Active() && set.Size != nil {
+				err = h.Restore.Truncate(ctx, coordinate.identity, oldSize, set.GetSize(), apply)
+			} else if h.Restore != nil && h.Restore.Active() && (set.MtimeNs != nil || set.GetMtimeNow()) {
+				err = h.Restore.UserMutation(coordinate.identity, apply)
+			} else {
+				err = apply()
+			}
+			if err != nil {
+				uncertain := uncertainFailure(err)
+				resp := h.errorResponse(0, err, uncertain)
+				if uncertain {
+					resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+					return resp, completeTargets(attr)
+				}
+				return resp, nil
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+			return resp, completeTargets(attr)
+		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
+	case *authoritypb.Request_Tmpfile:
+		var parent xfsstore.Capability
+		var parentCoordinate visibilityCoordinate
+		var releaseMutation func()
+		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+			var err error
+			parent, err = h.item(cred.ID, body.Tmpfile.GetParent())
 			if err != nil {
 				return nil, err
 			}
@@ -613,18 +1095,136 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if err != nil {
 				return nil, err
 			}
-			existingCoordinate, existingSize, existed, err = h.lookupCoordinateSizeOptional(parent, body.Create.GetName())
+			releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
 			if err != nil {
 				return nil, err
+			}
+			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
+		}
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			store, ok := h.Store.(tmpfileStore)
+			flags := body.Tmpfile.GetFlags()
+			mode, valid := modeFromProtocol(body.Tmpfile.GetMode())
+			if !ok || !valid || flags == nil || !flags.GetWrite() || flags.GetTruncate() {
+				return h.errorResponse(0, syscall.EINVAL, false), nil
+			}
+			reservation, err := h.reserveCapabilities(cred.ID, 1, 1)
+			if err != nil {
+				return h.errorResponse(0, err, false), nil
+			}
+			defer reservation.release()
+			item, attr, err := store.Tmpfile(parent, mode, body.Tmpfile.GetExclusive())
+			if err != nil {
+				resp := h.errorResponse(0, err, uncertainFailure(err))
+				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)})
+			}
+			handle, err := h.Store.OpenFile(item, openFlags(flags))
+			if err != nil {
+				h.forgetItem(item)
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			if err := reservation.commit(
+				[]trackedCapability{{value: item}},
+				[]trackedCapability{{value: handle}},
+			); err != nil {
+				h.closeOpen(handle)
+				h.forgetItem(item)
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			cleanupUndeliverable := func() {
+				h.untrackOpen(cred.ID, handle)
+				h.closeOpen(handle)
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
+			}
+			identity, err := h.Store.Identity(item)
+			if err != nil {
+				cleanupUndeliverable()
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			itemReply := itemProto(item, attr, identity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Tmpfile{Tmpfile: &authoritypb.TmpfileReply{
+				Item: itemReply, Handle: append([]byte(nil), handle[:]...),
+			}}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				cleanupUndeliverable()
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: identity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
+			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
+		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
+	case *authoritypb.Request_Create:
+		var parent xfsstore.Capability
+		var parentCoordinate, existingCoordinate visibilityCoordinate
+		var existingSize int64
+		var existed bool
+		var releaseMutation func()
+		bindingRefreshes := 0
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+			if err := namespaceName(body.Create.GetName()); err != nil {
+				return nil, err
+			}
+			resolvedParent, err := resolutions.item(body.Create.GetParent())
+			if err != nil {
+				return nil, err
+			}
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
+			resolvedName, err := resolutions.namespace(parent, body.Create.GetName())
+			if err != nil {
+				return nil, err
+			}
+			existingCoordinate, existingSize, existed = resolvedName.coordinate, resolvedName.size, resolvedName.found
+			lockIdentities := [][16]byte{parentCoordinate.identity}
+			if existed {
+				lockIdentities = append(lockIdentities, existingCoordinate.identity)
+			}
+			releaseMutation, err = lockMutationStore(h.Store, lockIdentities...)
+			if err != nil {
+				return nil, err
+			}
+			// The source gate prevents an authority namespace writer from passing
+			// while this dependency turn is held. Re-read under the complete XFS
+			// writer-stripe set as a negative control against a stale resolution;
+			// if the binding changed, this turn's target-identity dependency is no
+			// longer complete and the whole request must resolve again.
+			resolutions.invalidateNamespaceBindings()
+			lockedName, lookupErr := resolutions.namespace(parent, body.Create.GetName())
+			if lookupErr != nil || lockedName.found != existed || existed && lockedName.coordinate != existingCoordinate {
+				releaseMutation()
+				releaseMutation = nil
+				if lookupErr != nil {
+					return nil, lookupErr
+				}
+				bindingRefreshes++
+				if bindingRefreshes >= maxStabilizeAttempts {
+					return nil, syscall.EAGAIN
+				}
+				return nil, volumeserver.ErrVisibilityDependencyRefresh
+			}
+			if existed {
+				existingSize = lockedName.size
 			}
 			if !existed {
 				return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
 			}
-			// Opening an existing name does not mutate its parent or binding. Keep
-			// the unavoidable replay-ordered no-op barrier scoped to the existing
-			// inode; O_TRUNC adds data, while a plain existing create completes with
-			// no targets and therefore performs no peer repair.
-			targets := []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
+			// Existing-name CREATE publishes an exact name snapshot and both object
+			// records even when opening the target is a no-op. The source gate already
+			// covers this complete set; O_TRUNC additionally covers target data.
+			targets := []volumeserver.VisibilityTarget{
+				namespaceTarget(parentCoordinate, body.Create.GetName()),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+				inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0),
+			}
 			if body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
 				targets = append([]volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, existingSize)}, targets...)
 			}
@@ -643,7 +1243,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			mode, valid := modeFromProtocol(body.Create.GetMode())
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
@@ -659,15 +1259,15 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				return resp, uncertainVisibilityTargets(resp, createdTargets(xfsstore.Capability{}))
 			}
 			var handle xfsstore.Capability
-			openExisting := func() error {
+			openCreated := func() error {
 				var openErr error
 				handle, openErr = h.Store.OpenFile(item, openFlags(body.Create.GetFlags()))
 				return openErr
 			}
 			if h.Restore != nil && h.Restore.Active() && existed && body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
-				err = h.Restore.Truncate(ctx, existingCoordinate.identity, existingSize, 0, openExisting)
+				err = h.Restore.Truncate(ctx, existingCoordinate.identity, existingSize, 0, openCreated)
 			} else {
-				err = openExisting()
+				err = openCreated()
 			}
 			if err != nil {
 				targets := createdTargets(item)
@@ -692,12 +1292,12 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				h.untrackItem(cred.ID, item)
 				h.forgetItem(item)
 			}
-			if body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
-				post, err := h.Store.GetattrOpen(handle)
-				if err != nil {
+			if existed || body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
+				post, snapshotErr := h.Store.GetattrOpen(handle)
+				if snapshotErr != nil {
 					targets := createdTargets(item)
 					cleanupUndeliverable()
-					return h.errorResponse(0, err, true), targets
+					return h.errorResponse(0, snapshotErr, true), targets
 				}
 				attr = post
 			}
@@ -707,31 +1307,70 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				cleanupUndeliverable()
 				return h.errorResponse(0, identityErr, true), targets
 			}
-			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemProto(item, attr, itemIdentity), Handle: handle[:]}}
 			if existed {
-				if body.Create.GetFlags() == nil || !body.Create.GetFlags().GetTruncate() {
+				parentAttr, parentErr := h.Store.Getattr(parent)
+				if parentErr != nil {
+					cleanupUndeliverable()
+					return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+				}
+				truncated := body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate()
+				resp := h.success(0)
+				resp.PostState = h.mutationPostState(sequence,
+					postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleTarget, changed: truncated},
+					postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: false},
+				)
+				itemReply := itemProto(item, attr, itemIdentity)
+				for _, object := range resp.PostState.GetObjects() {
+					if bytes.Equal(object.GetStableIdentity(), itemIdentity[:]) {
+						itemReply.ObjectVersion = object.GetObjectVersion()
+						break
+					}
+				}
+				itemReply.SnapshotSequence = sequence
+				resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemReply, Handle: handle[:]}}
+				if !truncated {
 					return resp, nil
 				}
 				return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
 			}
-			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				cleanupUndeliverable()
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
+			itemReply := itemProto(item, attr, itemIdentity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: itemReply, Handle: handle[:]}}
+			return resp, []volumeserver.VisibilityTarget{
+				namespaceTargetPost(parentCoordinate, body.Create.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+			}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Mkdir:
 		var parent xfsstore.Capability
 		var parentCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		var releaseMutation func()
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Mkdir.GetName()); err != nil {
 				return nil, err
 			}
-			var err error
-			parent, err = h.item(cred.ID, body.Mkdir.GetParent())
+			resolvedParent, err := resolutions.item(body.Mkdir.GetParent())
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
 			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
+				releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
 			}
 			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			mode, valid := modeFromProtocol(body.Mkdir.GetMode())
 			if !valid {
 				return h.errorResponse(0, syscall.EINVAL, false), nil
@@ -758,67 +1397,122 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				return h.errorResponse(0, identityErr, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, itemIdentity)}}
-			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Mkdir.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
+			itemReply := itemProto(item, attr, itemIdentity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
+			return resp, []volumeserver.VisibilityTarget{
+				namespaceTargetPost(parentCoordinate, body.Mkdir.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+			}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Unlink:
 		var parent xfsstore.Capability
 		var parentCoordinate, removedCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		var releaseMutation func()
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Unlink.GetName()); err != nil {
 				return nil, err
 			}
-			var err error
-			parent, err = h.item(cred.ID, body.Unlink.GetParent())
-			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
+			resolvedParent, err := resolutions.item(body.Unlink.GetParent())
+			if err != nil {
+				return nil, err
 			}
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
+			resolvedName, err := resolutions.namespace(parent, body.Unlink.GetName())
+			if err == nil && !resolvedName.found {
+				err = syscall.ENOENT
+			}
+			removedCoordinate = resolvedName.coordinate
 			if err == nil {
-				removedCoordinate, _, err = h.lookupCoordinate(parent, body.Unlink.GetName())
+				releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity, removedCoordinate.identity)
 			}
 			return []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+			removed, _, lookupErr := h.Store.Lookup(parent, string(body.Unlink.GetName()))
+			if lookupErr != nil {
+				return h.errorResponse(0, lookupErr, false), nil
+			}
+			defer h.forgetItem(removed)
 			if err := h.Store.Unlink(parent, string(body.Unlink.GetName()), body.Unlink.GetDirectory()); err != nil {
 				resp := h.errorResponse(0, err, false)
 				targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
 			targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
-			return h.success(0), targets
+			removedAttr, removedErr := h.Store.Getattr(removed)
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if err := errors.Join(removedErr, parentErr); err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: removedCoordinate.identity, attr: removedAttr, roles: postStateRoleRemoved, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
+			return resp, targets
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Rename:
 		var oldParent, newParent xfsstore.Capability
 		var oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate visibilityCoordinate
 		var replaced bool
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		var releaseMutation func()
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Rename.GetOldName()); err != nil {
 				return nil, err
 			}
 			if err := namespaceName(body.Rename.GetNewName()); err != nil {
 				return nil, err
 			}
-			var err error
-			oldParent, err = h.item(cred.ID, body.Rename.GetOldParent())
+			resolvedOldParent, err := resolutions.item(body.Rename.GetOldParent())
+			if err != nil {
+				return nil, err
+			}
+			resolvedNewParent, err := resolutions.item(body.Rename.GetNewParent())
+			if err != nil {
+				return nil, err
+			}
+			oldParent, oldParentCoordinate = resolvedOldParent.cap, resolvedOldParent.coordinate
+			newParent, newParentCoordinate = resolvedNewParent.cap, resolvedNewParent.coordinate
+			moved, err := resolutions.namespace(oldParent, body.Rename.GetOldName())
+			if err == nil && !moved.found {
+				err = syscall.ENOENT
+			}
+			movedCoordinate = moved.coordinate
 			if err == nil {
-				newParent, err = h.item(cred.ID, body.Rename.GetNewParent())
+				var replacement namespaceResolution
+				replacement, err = resolutions.namespace(newParent, body.Rename.GetNewName())
+				replacedCoordinate, replaced = replacement.coordinate, replacement.found
 			}
 			if err == nil {
-				oldParentCoordinate, err = h.coordinateItem(oldParent)
+				identities := [][16]byte{oldParentCoordinate.identity, newParentCoordinate.identity, movedCoordinate.identity}
+				if replaced {
+					identities = append(identities, replacedCoordinate.identity)
+				}
+				releaseMutation, err = lockMutationStore(h.Store, identities...)
 			}
-			if err == nil {
-				newParentCoordinate, err = h.coordinateItem(newParent)
-			}
-			if err == nil {
-				movedCoordinate, _, err = h.lookupCoordinate(oldParent, body.Rename.GetOldName())
-			}
-			if err == nil {
-				replacedCoordinate, replaced, err = h.lookupCoordinateOptional(newParent, body.Rename.GetNewName())
-			}
-			targets := renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, false)
+			targets := renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, visibilityCoordinate{}, false, false)
 			return targets, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var flags xfsstore.RenameFlags
 			if body.Rename.GetNoReplace() {
 				flags |= xfsstore.RenameNoReplace
@@ -826,33 +1520,102 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if body.Rename.GetExchange() {
 				flags |= xfsstore.RenameExchange
 			}
+			moved, _, lookupErr := h.Store.Lookup(oldParent, string(body.Rename.GetOldName()))
+			if lookupErr != nil {
+				return h.errorResponse(0, lookupErr, false), nil
+			}
+			defer h.forgetItem(moved)
+			var overwritten xfsstore.Capability
+			if replaced && (body.Rename.GetExchange() || replacedCoordinate.identity != movedCoordinate.identity) {
+				overwritten, _, lookupErr = h.Store.Lookup(newParent, string(body.Rename.GetNewName()))
+				if lookupErr != nil {
+					return h.errorResponse(0, lookupErr, false), nil
+				}
+				defer h.forgetItem(overwritten)
+			}
 			if err := h.Store.Rename(oldParent, string(body.Rename.GetOldName()), newParent, string(body.Rename.GetNewName()), flags); err != nil {
 				resp := h.errorResponse(0, err, false)
-				return resp, uncertainVisibilityTargets(resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, false))
+				return resp, uncertainVisibilityTargets(resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, visibilityCoordinate{}, false, false))
 			}
-			return h.success(0), renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, true)
+			// The dependency set held both authoritative pre-bindings fixed through
+			// the syscall. POSIX therefore determines the exact post-state without
+			// another filesystem round trip: exchange swaps the two bindings; a
+			// normal rename whose names already bind the same inode is a no-op; any
+			// other successful normal rename removes old and binds new to moved.
+			// The identity comparison, not the flag alone, is the crucial no-op
+			// discriminator for distinct hard-link names.
+			newPostCoordinate := movedCoordinate
+			var oldPostCoordinate visibilityCoordinate
+			var oldPostBound bool
+			switch {
+			case body.Rename.GetExchange():
+				oldPostCoordinate, oldPostBound = replacedCoordinate, replaced
+			case replaced && replacedCoordinate.identity == movedCoordinate.identity:
+				oldPostCoordinate, oldPostBound = movedCoordinate, true
+			}
+			rename := &authoritypb.RenameReply{
+				NewPostIdentity: append([]byte(nil), newPostCoordinate.identity[:]...),
+			}
+			if oldPostBound {
+				rename.OldPostIdentity = append([]byte(nil), oldPostCoordinate.identity[:]...)
+			}
+			resp := h.success(0)
+			resp.Body = &authoritypb.Response_Rename{Rename: rename}
+			movedAttr, movedErr := h.Store.Getattr(moved)
+			oldParentAttr, oldParentErr := h.Store.Getattr(oldParent)
+			newParentAttr, newParentErr := h.Store.Getattr(newParent)
+			if err := errors.Join(movedErr, oldParentErr, newParentErr); err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			noChange := !body.Rename.GetExchange() && replaced && replacedCoordinate.identity == movedCoordinate.identity
+			snapshots := []postStateSnapshot{
+				{identity: movedCoordinate.identity, attr: movedAttr, roles: postStateRoleSource | postStateRoleDestination, changed: !noChange},
+				{identity: oldParentCoordinate.identity, attr: oldParentAttr, roles: postStateRoleOldParent, changed: !noChange},
+				{identity: newParentCoordinate.identity, attr: newParentAttr, roles: postStateRoleNewParent, changed: !noChange},
+			}
+			if replaced && (body.Rename.GetExchange() || replacedCoordinate.identity != movedCoordinate.identity) {
+				replacedAttr, replacedErr := h.Store.Getattr(overwritten)
+				if replacedErr != nil {
+					return h.errorResponse(0, replacedErr, true), []volumeserver.VisibilityTarget{}
+				}
+				roles := postStateRoleOverwritten
+				if body.Rename.GetExchange() {
+					roles = postStateRoleSource | postStateRoleDestination | postStateRoleExchanged
+					snapshots[0].roles |= postStateRoleExchanged
+				}
+				snapshots = append(snapshots, postStateSnapshot{identity: replacedCoordinate.identity, attr: replacedAttr, roles: roles, changed: !noChange})
+			}
+			resp.PostState = h.mutationPostState(sequence, snapshots...)
+			if noChange {
+				return resp, nil
+			}
+			return resp, renameVisibilityTargets(body.Rename, oldParentCoordinate, newParentCoordinate, movedCoordinate, replacedCoordinate, replaced, oldPostCoordinate, oldPostBound, true)
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Link:
 		var source, parent xfsstore.Capability
 		var sourceCoordinate, parentCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		var releaseMutation func()
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Link.GetNewName()); err != nil {
 				return nil, err
 			}
-			var err error
-			source, err = h.item(cred.ID, body.Link.GetExistingItem())
-			if err == nil {
-				parent, err = h.item(cred.ID, body.Link.GetNewParent())
+			resolvedSource, err := resolutions.item(body.Link.GetExistingItem())
+			if err != nil {
+				return nil, err
 			}
+			resolvedParent, err := resolutions.item(body.Link.GetNewParent())
+			source, sourceCoordinate = resolvedSource.cap, resolvedSource.coordinate
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
 			if err == nil {
-				sourceCoordinate, err = h.coordinateItem(source)
-			}
-			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
+				releaseMutation, err = lockMutationStore(h.Store, sourceCoordinate.identity, parentCoordinate.identity)
 			}
 			return linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, false), err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			attr, err := h.Store.Link(source, parent, string(body.Link.GetNewName()))
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
@@ -860,25 +1623,40 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: itemProto(source, attr, sourceCoordinate.identity)}}
+			itemReply := itemProto(source, attr, sourceCoordinate.identity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: itemReply}}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: sourceCoordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
 			targets := linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, true)
 			return resp, targets
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Symlink:
 		var parent xfsstore.Capability
 		var parentCoordinate visibilityCoordinate
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		var releaseMutation func()
+		prepare := func(resolutions *operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
 			if err := namespaceName(body.Symlink.GetName()); err != nil {
 				return nil, err
 			}
-			var err error
-			parent, err = h.item(cred.ID, body.Symlink.GetParent())
+			resolvedParent, err := resolutions.item(body.Symlink.GetParent())
+			parent, parentCoordinate = resolvedParent.cap, resolvedParent.coordinate
 			if err == nil {
-				parentCoordinate, err = h.coordinateItem(parent)
+				releaseMutation, err = lockMutationStore(h.Store, parentCoordinate.identity)
 			}
 			return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			reservation, err := h.reserveCapabilities(cred.ID, 1, 0)
 			if err != nil {
 				return h.errorResponse(0, err, false), nil
@@ -901,9 +1679,28 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				return h.errorResponse(0, identityErr, true), []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
 			}
 			resp := h.success(0)
-			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemProto(item, attr, itemIdentity)}}
-			return resp, []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Symlink.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}
+			itemReply := itemProto(item, attr, itemIdentity)
+			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
+			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
+			parentAttr, parentErr := h.Store.Getattr(parent)
+			if parentErr != nil {
+				h.untrackItem(cred.ID, item)
+				h.forgetItem(item)
+				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
+			}
+			resp.PostState = h.mutationPostState(sequence,
+				postStateSnapshot{identity: itemIdentity, attr: attr, roles: postStateRoleCreated, changed: true},
+				postStateSnapshot{identity: parentCoordinate.identity, attr: parentAttr, roles: postStateRoleParent, changed: true},
+			)
+			return resp, []volumeserver.VisibilityTarget{
+				namespaceTargetPost(parentCoordinate, body.Symlink.GetName(), visibilityCoordinate{identity: itemIdentity, ino: attr.Ino}),
+				inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0),
+			}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Readlink:
 		item, err := h.item(cred.ID, body.Readlink.GetItem())
 		if err != nil {
@@ -920,7 +1717,12 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		resp.Body = &authoritypb.Response_Readlink{Readlink: &authoritypb.ReadlinkReply{Target: []byte(target)}}
 		return resp
 	case *authoritypb.Request_Open:
+		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		if profileErr != nil {
+			return h.errorResponse(req.GetRequestId(), profileErr, false)
+		}
 		var openedHandle xfsstore.Capability
+		var openGrant volumeserver.LeaseGrant
 		cleanupOpenedHandle := func() {
 			if openedHandle == (xfsstore.Capability{}) {
 				return
@@ -954,22 +1756,101 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			return resp
 		}
 		if body.Open.GetFlags() == nil || !body.Open.GetFlags().GetTruncate() {
-			return h.mutate(ctx, req, cred, func() *authoritypb.Response {
+			if frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+				response, _ := h.mutateExecution(ctx, req, cred, func() *authoritypb.Response {
+					item, err := h.item(cred.ID, body.Open.GetItem())
+					if err != nil {
+						return h.errorResponse(0, err, false)
+					}
+					if err := h.stabilizeItem(ctx, cred.ID, item); err != nil {
+						return h.errorResponse(0, err, false)
+					}
+					return openApply(item)
+				})
+				return response
+			}
+			if h.Leases == nil {
+				return h.errorResponse(req.GetRequestId(), errInternal, false)
+			}
+			response, executed := h.mutateExecution(ctx, req, cred, func() *authoritypb.Response {
 				item, err := h.item(cred.ID, body.Open.GetItem())
 				if err != nil {
 					return h.errorResponse(0, err, false)
 				}
-				return openApply(item)
+				flags := body.Open.GetFlags()
+				if flags == nil || !flags.GetRead() || flags.GetWrite() {
+					return openApply(item)
+				}
+				identity, err := h.Store.Identity(item)
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				attr, err := h.Store.Getattr(item)
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyData, Identity: identity}
+				right := volumeserver.LeaseRightDataRead
+				mandatory := false
+				if attr.Kind == xfsstore.KindDirectory {
+					coordinate.Family = volumeserver.LeaseFamilyEnumeration
+					right = volumeserver.LeaseRightEnumerationRead
+					mandatory = true
+				}
+				// Opening a file for reading is admitted on the data lane, not the
+				// metadata lane. It is a data coordinate, and its reply is one a
+				// recall's whole-file purge waits for: the frontend registers this
+				// open's page-cache publication, so an open parked for the whole
+				// barrier would be a reply that purge waits on while the purge's own
+				// transaction waits on the open. The data lane releases at apply,
+				// strictly before any purge runs. Opening a directory keeps the full
+				// barrier: an enumeration reply publishes no pages, and nothing in a
+				// recall waits on it.
+				var admission *volumeserver.LeaseReadAdmission
+				if coordinate.Family == volumeserver.LeaseFamilyData {
+					admission, err = h.Leases.BeginDataRead(ctx, cred.ID, coordinate)
+				} else {
+					admission, err = h.Leases.BeginRead(ctx, cred.ID, coordinate)
+				}
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				defer admission.Release()
+				response := openApply(item)
+				if response.GetErrno() != 0 {
+					return response
+				}
+				openGrant, err = admission.Grant(coordinate, right)
+				// A coordinate still under recall opens without cache authority --
+				// the same answer a read past that transaction's apply receives. The
+				// handle is usable; the frontend just does not keep its pages.
+				if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) && !errors.Is(err, volumeserver.ErrLeaseBlocked) {
+					cleanupOpenedHandle()
+					return h.errorResponse(0, err, false)
+				}
+				if errors.Is(err, volumeserver.ErrLeaseCapacity) && mandatory {
+					cleanupOpenedHandle()
+					return h.errorResponse(0, syscall.ENOSPC, false)
+				}
+				return response
 			})
+			if executed && response.GetErrno() == 0 && openGrant.Epoch != 0 {
+				response.LeaseGrants = leaseGrantsProto(h.Leases, []volumeserver.LeaseGrant{openGrant})
+			}
+			return response
 		}
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
 		var oldSize int64
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			var err error
 			item, err = h.item(cred.ID, body.Open.GetItem())
 			if err == nil {
 				coordinate, err = h.coordinateItem(item)
+			}
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
 			}
 			if err == nil {
 				var attr xfsstore.Attr
@@ -978,7 +1859,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			var resp *authoritypb.Response
 			if h.Restore != nil && h.Restore.Active() {
 				err := h.Restore.Truncate(ctx, coordinate.identity, oldSize, 0, func() error {
@@ -1006,8 +1887,15 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				cleanupOpenedHandle()
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{
+				identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true,
+			})
 			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_Close:
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
 			handle, err := h.open(cred.ID, body.Close.GetHandle())
@@ -1042,14 +1930,50 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		if err := h.stabilizeOpen(ctx, cred.ID, handle); err != nil {
+		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		if profileErr != nil {
+			return h.errorResponse(req.GetRequestId(), profileErr, false)
+		}
+		if frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			if err := h.stabilizeOpen(ctx, cred.ID, handle); err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			if h.Restore != nil && h.Restore.Active() {
+				identity, identityErr := h.Store.IdentityOpen(handle)
+				if identityErr != nil {
+					return h.errorResponse(req.GetRequestId(), identityErr, false)
+				}
+				if err := h.Restore.EnsureHydrated(ctx, identity, body.Read.GetOffset(), uint64(body.Read.GetLength())); err != nil {
+					return h.errorResponse(req.GetRequestId(), err, false)
+				}
+			}
+			buf := make([]byte, body.Read.GetLength())
+			n, err := h.Store.ReadAt(handle, buf, int64(body.Read.GetOffset()))
+			if err != nil && !errors.Is(err, io.EOF) {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			resp := h.success(req.GetRequestId())
+			resp.Body = &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: buf[:n]}}
+			return resp
+		}
+		if h.Leases == nil {
+			return h.errorResponse(req.GetRequestId(), errInternal, false)
+		}
+		identity, err := h.Store.IdentityOpen(handle)
+		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
+		coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyData, Identity: identity}
+		// A blocking read(2) has no retryable errno, so a recall in progress is
+		// answered by waiting for the applied bytes rather than by refusing. The
+		// wait ends at apply, not at the end of the transaction: this callback
+		// holds the kernel folio the transaction's own whole-file purge needs.
+		admission, err := h.Leases.BeginDataRead(ctx, cred.ID, coordinate)
+		if err != nil {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
+		defer admission.Release()
 		if h.Restore != nil && h.Restore.Active() {
-			identity, identityErr := h.Store.IdentityOpen(handle)
-			if identityErr != nil {
-				return h.errorResponse(req.GetRequestId(), identityErr, false)
-			}
 			if err := h.Restore.EnsureHydrated(ctx, identity, body.Read.GetOffset(), uint64(body.Read.GetLength())); err != nil {
 				return h.errorResponse(req.GetRequestId(), err, false)
 			}
@@ -1059,96 +1983,78 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		if err != nil && !errors.Is(err, io.EOF) {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
+		// A coordinate still under recall serves its bytes and mints nothing:
+		// the reply is explicitly uncacheable, so the next read misses here again.
+		grant, err := admission.Grant(coordinate, volumeserver.LeaseRightDataRead)
+		if err != nil && !errors.Is(err, volumeserver.ErrLeaseCapacity) && !errors.Is(err, volumeserver.ErrLeaseBlocked) {
+			return h.errorResponse(req.GetRequestId(), err, false)
+		}
 		resp := h.success(req.GetRequestId())
 		resp.Body = &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: buf[:n]}}
+		if err == nil {
+			resp.LeaseGrants = leaseGrantsProto(h.Leases, []volumeserver.LeaseGrant{grant})
+		}
 		return resp
 	case *authoritypb.Request_Write:
-		if uint32(len(body.Write.GetData())) > h.MaxWrite {
-			return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+		return h.handleWrite(ctx, req, cred, body.Write)
+	case *authoritypb.Request_FskitWrite:
+		if body.FskitWrite.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT {
+			return h.commitFskitWrite(ctx, req, cred, body.FskitWrite)
 		}
-		var handle xfsstore.Capability
-		var coordinate visibilityCoordinate
-		var preparedSize int64
-		prepare := func() ([]volumeserver.VisibilityTarget, error) {
-			if body.Write.GetAppend() && body.Write.GetOffset() != 0 {
-				return nil, syscall.EINVAL
-			}
-			var err error
-			handle, err = h.open(cred.ID, body.Write.GetHandle())
-			if err != nil {
-				return nil, err
-			}
-			identity, err := h.Store.IdentityOpen(handle)
-			if err != nil {
-				return nil, err
-			}
-			attr, err := h.Store.GetattrOpen(handle)
-			preparedSize = attr.Size
-			coordinate = attrCoordinate(identity, attr)
-			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
-		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-			var err error
-			var n int
-			assigned := int64(-1)
-			applyWrite := func() (int, int64, error) {
-				if body.Write.GetAppend() {
-					return h.Store.Append(handle, body.Write.GetData())
-				}
-				n, err := h.Store.WriteAt(handle, body.Write.GetData(), int64(body.Write.GetOffset()))
-				return n, -1, err
-			}
-			if h.Restore != nil && h.Restore.Active() {
-				writeOffset := body.Write.GetOffset()
-				if body.Write.GetAppend() && preparedSize > 0 {
-					writeOffset = uint64(preparedSize)
-				}
-				n, assigned, err = h.Restore.Write(ctx, coordinate.identity, writeOffset, uint32(len(body.Write.GetData())), applyWrite)
-			} else {
-				n, assigned, err = applyWrite()
-			}
-			reportedAssigned := assigned
-			if reportedAssigned < 0 {
-				reportedAssigned = 0
-			}
-			resp := h.writeOutcome(n, reportedAssigned, err)
-			if visibilityChanged(resp) {
-				// A positive short count is already authoritative XFS progress even
-				// when the store then dies. COMPLETE must carry the actual resulting
-				// EOF; protobuf's default zero is not evidence and would let a peer
-				// truncate its cached object incorrectly. Failure to read EOF after
-				// apply returns an empty completion, which poisons the epoch closed.
-				attr, attrErr := h.Store.GetattrOpen(handle)
-				if attrErr != nil {
-					if n != 0 || resp.GetUncertain() {
-						return h.errorResponse(0, attrErr, true), []volumeserver.VisibilityTarget{}
-					}
-					return h.errorResponse(0, attrErr, false), nil
-				}
-				resp.PostAttr = attrProto(attr)
-			}
-			if !visibilityChanged(resp) {
-				return resp, nil
-			}
-			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, resp.GetPostAttr().GetSize()), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
-		})
+		return h.handleFskitWrite(ctx, req, cred, body.FskitWrite)
+	case *authoritypb.Request_Fallocate:
+		return h.handleFallocate(ctx, req, cred, body.Fallocate)
+	case *authoritypb.Request_CopyFileRange:
+		return h.handleCopyFileRange(ctx, req, cred, body.CopyFileRange)
 	case *authoritypb.Request_Fsync:
 		handle, err := h.open(cred.ID, body.Fsync.GetHandle())
 		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		if err := h.Store.Fsync(handle, body.Fsync.GetDataOnly()); err != nil {
+		group := 0
+		if store, ok := h.Store.(coalescingFsyncStore); ok {
+			group, err = store.FsyncCoalesced(handle, body.Fsync.GetDataOnly())
+		} else {
+			err = h.Store.Fsync(handle, body.Fsync.GetDataOnly())
+		}
+		if group != 0 && h.Metrics != nil {
+			h.Metrics.ObserveFsyncBatch(group)
+		}
+		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, true)
 		}
 		return h.success(req.GetRequestId())
 	case *authoritypb.Request_ReadDir:
-		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
+		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
+		if profileErr != nil {
+			return h.errorResponse(req.GetRequestId(), profileErr, false)
+		}
+		var directoryGrant volumeserver.LeaseGrant
+		response, executed := h.mutateExecution(ctx, req, cred, func() *authoritypb.Response {
 			if body.ReadDir.GetMaxEntries() == 0 || body.ReadDir.GetMaxEntries() > 4096 {
 				return h.errorResponse(0, syscall.EINVAL, false)
 			}
 			handle, err := h.open(cred.ID, body.ReadDir.GetHandle())
 			if err != nil {
 				return h.errorResponse(0, err, false)
+			}
+			directoryIdentity, err := h.Store.IdentityOpen(handle)
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			enumerationCoordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyEnumeration, Identity: directoryIdentity}
+			var admission *volumeserver.LeaseReadAdmission
+			if frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+				if h.Leases == nil {
+					return h.errorResponse(0, errInternal, false)
+				}
+				admission, err = h.Leases.BeginRead(ctx, cred.ID, enumerationCoordinate)
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				defer admission.Release()
+			} else if frontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR || h.Visibility == nil {
+				return h.errorResponse(0, errInternal, false)
 			}
 			cookie, err := decodeCookie(body.ReadDir.GetCookie())
 			if err != nil {
@@ -1165,13 +2071,13 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			var current [16]byte
 			var eof bool
 			var directory xfsstore.Capability
+			var pageSnapshot uint64
 			result := &authoritypb.ReadDirReply{}
 			// The reply is built to the same byte budget that was reserved for
 			// it, so a directory listing can never be the reply that does not
 			// fit in a frame. Stopping early is an ordinary short readdir: the
 			// caller resumes from the last entry's cookie.
 			budget := h.readDirEntryBudget(body.ReadDir.GetMaxEntries())
-			used := uint64(0)
 			type issuedItem struct {
 				item xfsstore.Capability
 				name []byte
@@ -1188,102 +2094,83 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			// empty non-final page advances no client cursor, so a batch whose
 			// every entry raced away is skipped over rather than published.
 			for batch := 0; ; batch++ {
-				// An enumeration is the one read that learns its own coordinates by
-				// reading. A page that raced a mutation on any of them is discarded
-				// and re-enumerated rather than published.
-				for attempt := 0; ; attempt++ {
+				var candidates []directoryPageCandidate
+				stabilized := false
+				for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
 					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, verifier, int(body.ReadDir.GetMaxEntries()))
 					if err != nil {
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
-					waited, err := h.stabilizeDirectoryPage(ctx, cred.ID, handle, directory, entries)
+					var conflict bool
+					candidates, budgetExhausted, conflict, err = h.constructDirectoryPage(
+						handle, entries, cookie, body.ReadDir.GetWantItems(), budget,
+					)
 					if err != nil {
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
-					if !waited {
-						break
+					if conflict {
+						continue
 					}
-					if attempt+1 >= maxStabilizeAttempts {
+					valid, verifyErr := h.revalidateDirectoryPage(
+						handle, directory, cookie, verifier, current,
+						int(body.ReadDir.GetMaxEntries()), entries, eof, candidates,
+					)
+					if verifyErr != nil {
+						h.forgetDirectoryCandidates(candidates)
 						forgetIssued()
-						return h.errorResponse(0, syscall.EAGAIN, false)
+						return h.errorResponse(0, verifyErr, false)
 					}
-				}
-				result.Verifier, result.Eof = current[:], eof
-				for i, entry := range entries {
-					nextCookie := encodeCookie(cookie + uint64(i) + 1)
-					attr, statErr := h.Store.StatOpenDirChild(handle, entry.Name)
-					if statErr != nil {
-						switch {
-						case errors.Is(statErr, syscall.ENOENT), errors.Is(statErr, xfsstore.ErrStaleObject):
-							// The name was unlinked or renamed away between
-							// enumeration and stat. Omitting it is the legal
-							// after-state observation of that overlapping
-							// mutation; failing the page would turn a peer's
-							// ordinary churn into a readdir error, which no
-							// local directory listing produces.
-							continue
-						case errors.Is(statErr, xfsstore.ErrForbiddenType), errors.Is(statErr, xfsstore.ErrProjectIsolation):
-							// An inode this authority never exposes — a device
-							// node, FIFO, socket, or foreign-owned inode some
-							// other writer placed in the tree — is listed
-							// opaquely with no capability, exactly as a local
-							// readdir lists a name whose later stat fails. One
-							// non-portable inode must not make the whole
-							// directory unreadable.
-							attr = xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
-						default:
+					if !valid {
+						h.forgetDirectoryCandidates(candidates)
+						continue
+					}
+					if admission != nil {
+						pageSnapshot = admission.SnapshotSequence()
+					} else {
+						waited, snapshot, stabilizeErr := h.stabilizeDirectoryPage(ctx, cred.ID, handle, candidates)
+						if stabilizeErr != nil {
+							h.forgetDirectoryCandidates(candidates)
 							forgetIssued()
-							return h.errorResponse(0, statErr, false)
+							return h.errorResponse(0, stabilizeErr, false)
 						}
-					}
-					dirent := &authoritypb.Dirent{Name: []byte(entry.Name), Attr: attrProto(attr), NextCookie: nextCookie}
-					var candidate xfsstore.Capability
-					if body.ReadDir.GetWantItems() && attr.Kind != xfsstore.KindOpaque {
-						var itemAttr xfsstore.Attr
-						candidate, itemAttr, err = h.lookupForSession(ctx, cred.ID, directory, []byte(entry.Name))
-						switch {
-						case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
+						if waited {
+							h.forgetDirectoryCandidates(candidates)
 							continue
-						case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
-							dirent.Attr = attrProto(xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino})
-						case err != nil:
-							forgetIssued()
-							return h.errorResponse(0, err, false)
-						case itemAttr.Ino != entry.Ino || itemAttr.Kind != entry.Kind:
-							// Replaced between enumeration and lookup: neither
-							// the enumerated binding nor its replacement is
-							// this page's to publish. The replacement is the
-							// next enumeration's ordinary entry.
-							h.forgetItem(candidate)
-							candidate = xfsstore.Capability{}
-							continue
-						default:
-							dirent.Attr = attrProto(itemAttr)
-							identity, identityErr := h.Store.Identity(candidate)
-							if identityErr != nil {
-								h.forgetItem(candidate)
-								forgetIssued()
-								return h.errorResponse(0, identityErr, false)
+						}
+						futureVersion := false
+						for _, candidate := range candidates {
+							if candidate.item != (xfsstore.Capability{}) && candidate.dirent.GetObjectVersion() > snapshot {
+								futureVersion = true
+								break
 							}
-							dirent.Item = itemProto(candidate, itemAttr, identity)
 						}
-					}
-					cost := direntCost(dirent)
-					if used+cost > uint64(budget) {
-						if candidate != (xfsstore.Capability{}) && dirent.Item != nil {
-							h.forgetItem(candidate)
+						if futureVersion {
+							h.forgetDirectoryCandidates(candidates)
+							continue
 						}
-						result.Eof = false
-						budgetExhausted = true
-						break
+						pageSnapshot = snapshot
 					}
-					used += cost
-					result.Entries = append(result.Entries, dirent)
-					if candidate != (xfsstore.Capability{}) && dirent.Item != nil {
-						issued = append(issued, issuedItem{item: candidate, name: dirent.Name})
+					stabilized = true
+					break
+				}
+				if !stabilized {
+					forgetIssued()
+					return h.errorResponse(0, syscall.EAGAIN, false)
+				}
+				result.Verifier, result.Eof = current[:], eof && !budgetExhausted
+				for _, candidate := range candidates {
+					candidate.dirent.ObjectVersion = pageSnapshot
+					candidate.dirent.SnapshotSequence = pageSnapshot
+					if candidate.dirent.GetItem() != nil {
+						candidate.dirent.Item.ObjectVersion = candidate.dirent.GetObjectVersion()
+						candidate.dirent.Item.SnapshotSequence = pageSnapshot
+						issued = append(issued, issuedItem{item: candidate.item, name: candidate.dirent.GetName()})
+					} else if candidate.item != (xfsstore.Capability{}) {
+						h.forgetItem(candidate.item)
 					}
+					result.Entries = append(result.Entries, candidate.dirent)
 				}
 				if len(result.Entries) != 0 || result.Eof || budgetExhausted {
 					break
@@ -1304,10 +2191,17 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 				forgetIssued()
 				return h.errorResponse(0, syscall.EOVERFLOW, false)
 			}
-			parentAttr, err := h.Store.GetattrOpen(handle)
-			if err != nil || !verifierMatches(current, parentAttr) {
-				forgetIssued()
-				return h.errorResponse(0, syscall.ESTALE, false)
+			var grant volumeserver.LeaseGrant
+			if admission != nil {
+				grant, err = admission.Grant(enumerationCoordinate, volumeserver.LeaseRightEnumerationRead)
+				if errors.Is(err, volumeserver.ErrLeaseCapacity) {
+					forgetIssued()
+					return h.errorResponse(0, syscall.ENOSPC, false)
+				}
+				if err != nil {
+					forgetIssued()
+					return h.errorResponse(0, err, false)
+				}
 			}
 			tracked := 0
 			for i, held := range issued {
@@ -1325,8 +2219,13 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			}
 			resp := h.success(0)
 			resp.Body = &authoritypb.Response_ReadDir{ReadDir: result}
+			directoryGrant = grant
 			return resp
 		})
+		if executed && response.GetErrno() == 0 && directoryGrant.Epoch != 0 {
+			response.LeaseGrants = leaseGrantsProto(h.Leases, []volumeserver.LeaseGrant{directoryGrant})
+		}
+		return response
 	case *authoritypb.Request_Reclaim:
 		// Reclaim changes the session's retained-capability accounting. It must
 		// use exact replay even though it does not change visible filesystem
@@ -1362,6 +2261,7 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
 		var mode xfsstore.XattrMode
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			var valid bool
 			mode, valid = xattrMode(body.SetXattr.GetMode())
@@ -1373,33 +2273,60 @@ func (h *VolumeHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			if err == nil {
 				coordinate, err = h.coordinateItem(item)
 			}
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			if err := h.Store.SetXattr(item, string(body.SetXattr.GetName()), body.SetXattr.GetValue(), mode); err != nil {
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)})
 			}
-			return h.success(0), []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
+			attr, err := h.Store.Getattr(item)
+			if err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_RemoveXattr:
 		var item xfsstore.Capability
 		var coordinate visibilityCoordinate
+		var releaseMutation func()
 		prepare := func() ([]volumeserver.VisibilityTarget, error) {
 			var err error
 			item, err = h.item(cred.ID, body.RemoveXattr.GetItem())
 			if err == nil {
 				coordinate, err = h.coordinateItem(item)
 			}
+			if err == nil {
+				releaseMutation, err = lockMutationStore(h.Store, coordinate.identity)
+			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
 		}
-		return h.mutateVisible(ctx, req, cred, prepare, func() (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		response := h.mutateVisibleSequence(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
 			if err := h.Store.RemoveXattr(item, string(body.RemoveXattr.GetName())); err != nil {
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)})
 			}
-			return h.success(0), []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
+			attr, err := h.Store.Getattr(item)
+			if err != nil {
+				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
+			}
+			resp := h.success(0)
+			resp.PostState = h.mutationPostState(sequence, postStateSnapshot{identity: coordinate.identity, attr: attr, roles: postStateRoleTarget, changed: true})
+			return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}
 		})
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+		return response
 	case *authoritypb.Request_ListXattr:
 		item, err := h.item(cred.ID, body.ListXattr.GetItem())
 		if err != nil {
@@ -1468,34 +2395,6 @@ func (h *VolumeHandler) cancelAcknowledgment(ctx context.Context, req *authority
 	return h.success(req.GetRequestId())
 }
 
-// writeOutcome turns one store write into exactly one reported outcome. A
-// write that made partial progress reports the short count and nothing else:
-// n bytes are already durable in XFS, so reporting a count together with an
-// errno would let the application conclude that nothing was written while the
-// file has already grown. The next write on the same range re-encounters the
-// condition and reports it with a zero count, which is what Linux does.
-func (h *VolumeHandler) writeOutcome(n int, assigned int64, err error) *authoritypb.Response {
-	if n == 0 {
-		if err != nil {
-			return h.errorResponse(0, err, false)
-		}
-		// A zero-length write is a legal no-op, not a failure.
-		resp := h.success(0)
-		resp.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{}}
-		return resp
-	}
-	h.recordStorageFailure(err)
-	resp := h.success(0)
-	resp.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{Count: uint32(n), AssignedOffset: uint64(assigned)}}
-	if uncertainFailure(err) {
-		// The store itself is gone. The count is still exact, but this mount
-		// cannot continue, so the outcome stays explicitly uncertain.
-		resp.Uncertain = true
-		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_STORAGE
-	}
-	return resp
-}
-
 func direntCost(dirent *authoritypb.Dirent) uint64 {
 	size := uint64(proto.Size(dirent))
 	return 1 + uint64(protowire.SizeVarint(size)) + size
@@ -1521,29 +2420,176 @@ func verifierMatches(verifier [16]byte, attr xfsstore.Attr) bool {
 	return binary.BigEndian.Uint64(verifier[0:8]) == attr.Ino && binary.BigEndian.Uint64(verifier[8:16]) == uint64(attr.CTimeNS)
 }
 
+type directoryPageCandidate struct {
+	enumerated xfsstore.Dirent
+	dirent     *authoritypb.Dirent
+	item       xfsstore.Capability
+	identity   [16]byte
+	attr       xfsstore.Attr
+}
+
+func (h *VolumeHandler) forgetDirectoryCandidates(candidates []directoryPageCandidate) {
+	for _, candidate := range candidates {
+		if candidate.item != (xfsstore.Capability{}) {
+			h.forgetItem(candidate.item)
+		}
+	}
+}
+
+func (h *VolumeHandler) constructDirectoryPage(
+	handle xfsstore.Capability,
+	entries []xfsstore.Dirent,
+	cookie uint64,
+	wantItems bool,
+	budget uint32,
+) ([]directoryPageCandidate, bool, bool, error) {
+	candidates := make([]directoryPageCandidate, 0, len(entries))
+	used := uint64(0)
+	for i, entry := range entries {
+		candidate := directoryPageCandidate{enumerated: entry}
+		attr := xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
+		if entry.Kind != xfsstore.KindOpaque {
+			item, itemAttr, err := h.Store.LookupOpen(handle, entry.Name)
+			switch {
+			case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
+				h.forgetDirectoryCandidates(candidates)
+				return nil, false, true, nil
+			case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
+				// The namespace fact remains exact, but this authority never
+				// exposes the object's metadata or a retained capability.
+			case err != nil:
+				h.forgetDirectoryCandidates(candidates)
+				return nil, false, false, err
+			case itemAttr.Ino != entry.Ino || itemAttr.Kind != entry.Kind:
+				h.forgetItem(item)
+				h.forgetDirectoryCandidates(candidates)
+				return nil, false, true, nil
+			default:
+				identity, identityErr := h.Store.Identity(item)
+				if identityErr != nil {
+					h.forgetItem(item)
+					h.forgetDirectoryCandidates(candidates)
+					return nil, false, false, identityErr
+				}
+				candidate.item, candidate.identity, candidate.attr = item, identity, itemAttr
+				attr = itemAttr
+			}
+		}
+		dirent := &authoritypb.Dirent{
+			Name: []byte(entry.Name), Attr: attrProto(attr),
+			NextCookie: encodeCookie(cookie + uint64(i) + 1),
+		}
+		if candidate.item != (xfsstore.Capability{}) {
+			dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, ^uint64(0))
+			if wantItems {
+				dirent.Item = itemProto(candidate.item, candidate.attr, candidate.identity)
+			}
+		}
+		candidate.dirent = dirent
+		cost := direntCost(dirent)
+		if used+cost > uint64(budget) {
+			if candidate.item != (xfsstore.Capability{}) {
+				h.forgetItem(candidate.item)
+			}
+			return candidates, true, false, nil
+		}
+		used += cost
+		candidates = append(candidates, candidate)
+	}
+	return candidates, false, false, nil
+}
+
+func sameDirectoryEnumeration(left, right []xfsstore.Dirent) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *VolumeHandler) revalidateDirectoryPage(
+	handle, directory xfsstore.Capability,
+	cookie uint64,
+	verifier, current [16]byte,
+	maxEntries int,
+	entries []xfsstore.Dirent,
+	eof bool,
+	candidates []directoryPageCandidate,
+) (bool, error) {
+	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
+	if err != nil {
+		return false, err
+	}
+	if checkDirectory != directory || checkVerifier != current || checkEOF != eof || !sameDirectoryEnumeration(checkEntries, entries) {
+		return false, nil
+	}
+	parentAttr, err := h.Store.GetattrOpen(handle)
+	if err != nil {
+		return false, err
+	}
+	if !verifierMatches(current, parentAttr) {
+		return false, nil
+	}
+	for _, candidate := range candidates {
+		if candidate.item == (xfsstore.Capability{}) {
+			continue
+		}
+		item, attr, lookupErr := h.Store.LookupOpen(handle, candidate.enumerated.Name)
+		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
+			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
+			return false, nil
+		}
+		if lookupErr != nil {
+			return false, lookupErr
+		}
+		identity, identityErr := h.Store.Identity(item)
+		forgetErr := h.Store.Forget(item)
+		if identityErr != nil {
+			return false, identityErr
+		}
+		if forgetErr != nil {
+			return false, forgetErr
+		}
+		if identity != candidate.identity || attr != candidate.attr {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest) *authoritypb.Response {
 	if hello.GetProtocolMajor() != ProtocolMajor {
 		return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
 	}
-	if !hasFeatures(hello.GetFeatures(), requiredHelloFeatures) {
+	required, valid := helloFeatures(hello.GetFrontendProfile())
+	if !valid || !hasFeatures(hello.GetFeatures(), required) {
 		return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
 	}
-	if !h.validBounds() {
+	if !h.validBounds() || hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR && !h.validFskitBounds() {
 		return h.errorResponse(requestID, syscall.EINVAL, false)
 	}
 	bounds := h.Bounds()
-	features := append([]string(nil), requiredHelloFeatures...)
+	features := append([]string(nil), required...)
 	features = append(features, peerCompleteFIFOFeedbackFeature, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
 	resp := h.success(requestID)
 	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 		ProtocolMajor: ProtocolMajor, Features: features,
 		MaxFrameBytes: bounds.MaxFrame, MaxReadBytes: h.MaxRead, MaxWriteBytes: h.MaxWrite,
-		MaxInFlight: uint32(bounds.MaxInFlight),
+		MaxInFlight: uint32(bounds.MaxInFlight), FrontendProfile: hello.GetFrontendProfile(),
 	}}
+	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		resp.GetHello().MaxFskitWriteBytes = h.MaxFskitWriteBytes
+	}
 	return resp
 }
 
-func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *authoritypb.AttachRequest) *authoritypb.Response {
+func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
+	requestID := req.GetRequestId()
+	attach := req.GetAttach()
 	if h.Store == nil || h.Runtime == nil || h.Authorizer == nil || attach.GetVolumeId() != h.Runtime.VolumeID() {
 		return h.errorResponse(requestID, syscall.EPERM, false)
 	}
@@ -1553,9 +2599,62 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	if h.Routes == nil {
 		return h.errorResponse(requestID, errInternal, false)
 	}
-	profile, err := coherenceProfile(attach.GetCoherenceProfile())
-	if err != nil || profile == volumeserver.CoherenceStrict && h.Visibility == nil {
-		return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
+	attemptID, err := attachAttemptID(attach.GetAttachAttemptId())
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	fingerprint, err := canonicalFingerprint(h.Runtime, req)
+	if err != nil {
+		return h.errorResponse(requestID, syscall.EINVAL, false)
+	}
+	purpose := attach.GetPurpose()
+	profile := volumeserver.CoherenceStrict
+	frontendProfile := attach.GetFrontendProfile()
+	commitment := volumeserver.VisibilityCommitment{}
+	switch purpose {
+	case authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT:
+		if h.Lifecycle == nil {
+			return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
+		}
+		switch frontendProfile {
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+			if h.Leases == nil || attach.GetFskitCachedNameCapacity() != 0 || attach.GetFskitRepairBudgetMillis() != 0 ||
+				attach.GetFskitNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
+				return h.errorResponse(requestID, syscall.EINVAL, false)
+			}
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+			if h.Visibility == nil || !h.validFskitBounds() || attach.GetFskitCachedNameCapacity() == 0 || attach.GetFskitRepairBudgetMillis() == 0 {
+				return h.errorResponse(requestID, syscall.EINVAL, false)
+			}
+			if attach.GetFskitRepairBudgetMillis() > uint64(math.MaxInt64/int64(time.Millisecond)) {
+				return h.errorResponse(requestID, syscall.EINVAL, false)
+			}
+			repair, repairErr := namespaceRepair(attach.GetFskitNamespaceRepair())
+			if repairErr != nil || repair != volumeserver.NamespaceRepairIndependent &&
+				repair != volumeserver.NamespaceRepairCallbackSerialized && repair != volumeserver.NamespaceRepairCallbackSerializedPipelined {
+				if repairErr == nil {
+					repairErr = syscall.EOPNOTSUPP
+				}
+				return h.errorResponse(requestID, repairErr, false)
+			}
+			commitment = volumeserver.VisibilityCommitment{
+				CachedNameCapacity: uint64(attach.GetFskitCachedNameCapacity()),
+				RepairBudget:       time.Duration(attach.GetFskitRepairBudgetMillis()) * time.Millisecond,
+				NamespaceRepair:    repair,
+				CompatibilityWriter: repair == volumeserver.NamespaceRepairCallbackSerialized ||
+					repair == volumeserver.NamespaceRepairCallbackSerializedPipelined,
+			}
+		default:
+			return h.errorResponse(requestID, syscall.EINVAL, false)
+		}
+	case authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN:
+		if frontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED || len(attach.GetRoutesRevision()) != 0 ||
+			attach.GetFskitCachedNameCapacity() != 0 || attach.GetFskitRepairBudgetMillis() != 0 ||
+			attach.GetFskitNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
+			return h.errorResponse(requestID, syscall.EINVAL, false)
+		}
+	default:
+		return h.errorResponse(requestID, syscall.EINVAL, false)
 	}
 	// Reject every peer-controlled, allocation-shaping attach value before the
 	// single-use capability is presented. These checks are deliberately pure;
@@ -1563,23 +2662,8 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	if err := h.Runtime.ValidateAttachSlots(attach.GetReplaySlots()); err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
-	var commitment volumeserver.VisibilityCommitment
-	if profile == volumeserver.CoherenceStrict {
-		if h.Quiesce != nil {
-			if err := h.Quiesce.Check(); err != nil {
-				return h.errorResponse(requestID, err, false)
-			}
-		}
-		repair, err := namespaceRepair(attach.GetNamespaceRepair())
-		if err != nil || attach.GetRepairBudgetMillis() > uint64((time.Duration(1<<63-1))/time.Millisecond) {
-			return h.errorResponse(requestID, syscall.EINVAL, false)
-		}
-		commitment = volumeserver.VisibilityCommitment{
-			CachedNameCapacity: attach.GetCachedNameCapacity(),
-			RepairBudget:       time.Duration(attach.GetRepairBudgetMillis()) * time.Millisecond,
-			NamespaceRepair:    repair,
-		}
-		if err := h.Visibility.ValidateCommitment(commitment); err != nil {
+	if purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT && h.Quiesce != nil {
+		if err := h.Quiesce.Check(); err != nil {
 			return h.errorResponse(requestID, err, false)
 		}
 	}
@@ -1603,92 +2687,357 @@ func (h *VolumeHandler) attach(ctx context.Context, requestID uint64, attach *au
 	// verifies one - and the declaration is readable by every mount of this
 	// volume, so it is not a secret being traded for the property above.
 	//
-	// Both profiles are checked. An uncached mount joins no barrier, but it
-	// routes exactly as much of the tree to local disk as a strict one does, so
-	// admitting it against a topology this volume does not run would hide a
-	// subtree from every peer with no error anywhere.
-	presented, declared, err := attachRoutesRevision(attach.GetRoutesRevision())
-	if err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	// An attach pins this revision until all session resources and, for a strict
-	// mount, durable visibility membership are installed. An uncached mount needs
-	// the same guard: routing, rather than cache behavior, is the invariant.
-	topology := h.Routes.AcquireTopologyRead()
-	defer topology.Release()
-	if err := h.Routes.Admit(presented, declared, "attach", false); err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	authorization, err := h.Authorizer.Authorize(ctx, attach.GetVolumeId(), attach.GetAccessToken())
-	if err != nil {
-		return h.errorResponse(requestID, syscall.EPERM, false)
+	// Every coherent mount is checked. Admitting it against a topology this
+	// volume does not run would hide a subtree from every peer with no error.
+	var presented [32]byte
+	if purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
+		var declared bool
+		presented, declared, err = attachRoutesRevision(attach.GetRoutesRevision())
+		if err != nil {
+			return h.errorResponse(requestID, err, false)
+		}
+		// A mount attach pins this revision until all session resources and
+		// durable membership are installed. A route-admin session deliberately
+		// takes no topology read side: otherwise it would become the holder that
+		// prevents its own clean-absence route change.
+		topology := h.Routes.AcquireTopologyRead()
+		defer topology.Release()
+		if err := h.Routes.Admit(presented, declared, "attach", false); err != nil {
+			return h.errorResponse(requestID, err, false)
+		}
 	}
 	peer, ok := PeerIdentity(ctx)
 	if !ok {
 		return h.errorResponse(requestID, syscall.EPERM, false)
 	}
-	root, err := h.Store.Root()
-	if err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	cred, err := h.Runtime.Attach(attach.GetReplaySlots(), volumeserver.PeerIdentity(peer), authorization)
-	if err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	attached := true
-	defer func() {
-		if attached {
-			_ = h.Runtime.Detach(cred)
+	var root xfsstore.Capability
+	if purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
+		root, err = h.Store.Root()
+		if err != nil {
+			return h.errorResponse(requestID, err, false)
 		}
-	}()
+	}
+	// PrepareAttach owns both admission and exact replay. It reserves the bounded
+	// attempt/session record before invoking Authorize, so a full authority never
+	// spends a single-use capability. Every other fallible, non-authorization
+	// prerequisite above is prepared first for the same reason.
+	cred, err := h.Runtime.PrepareAttach(
+		ctx,
+		attemptID,
+		volumeserver.AttachRequestFingerprint(fingerprint),
+		attach.GetReplaySlots(),
+		volumeserver.PeerIdentity(peer),
+		func(authorizeContext context.Context) (volumeserver.Authorization, error) {
+			authorization, authorizeErr := h.Authorizer.Authorize(authorizeContext, attach.GetVolumeId(), attach.GetAccessToken())
+			if authorizeErr != nil {
+				return volumeserver.Authorization{}, syscall.EPERM
+			}
+			return authorization, nil
+		},
+	)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	access, err := h.Runtime.ProvisionalAccess(cred, attemptID)
+	if err != nil || purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN && access&volumeserver.AccessAdmin == 0 {
+		_ = h.Runtime.AbortProvisional(ctx, cred, attemptID)
+		if err == nil {
+			err = syscall.EPERM
+		}
+		return h.errorResponse(requestID, err, false)
+	}
+	provisionalDeadline, err := h.Runtime.ProvisionalDeadline(cred, attemptID)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	authorizationDeadline, err := h.Runtime.AuthorizationDeadline(cred, attemptID)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
 	// The runtime accepted this exact slot count, so the per-slot reply
-	// accounting has the same length as the session's replay slots.
-	if err := h.startSessionResources(cred.ID, root, attach.GetReplaySlots(), presented, profile); err != nil {
+	// accounting has the same length as the session's replay slots. Concurrent
+	// exact Attach deliveries converge on one resource record; a changed reuse
+	// was already rejected by PrepareAttach before this point.
+	if _, err := h.ensureProvisionalSessionResources(sessionResourceSpec{
+		credential: cred, id: cred.ID, attempt: attemptID, root: root,
+		slots: attach.GetReplaySlots(), routes: presented,
+		coherence: profile, profile: frontendProfile, purpose: purpose, commitment: commitment, authorizationDeadline: authorizationDeadline,
+	}); err != nil {
+		// No ACTIVE transition is possible on the transport while Attach owns the
+		// pair transaction. Releasing this failed provisional allocation is the
+		// exact rollback; there is no legacy Detach fallback.
+		_ = h.Runtime.AbortProvisional(ctx, cred, attemptID)
 		return h.errorResponse(requestID, err, false)
-	}
-	// Re-checked after the revision is recorded, not because the first check was
-	// insufficient - every later request compares against this recording, so a
-	// change that lands between the two checks refuses the session's first
-	// operation anyway - but because a session that attaches and can then do
-	// nothing is a worse answer than a refused attach. After the recording, a
-	// change can only reach the active revision through ApplyRoutes, and the
-	// recording is what it will be compared against from here on.
-	if err := h.Routes.Admit(presented, declared, "attach", false); err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	attr, err := h.Store.Getattr(root)
-	if err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	rootIdentity, err := h.Store.Identity(root)
-	if err != nil {
-		return h.errorResponse(requestID, err, false)
-	}
-	var initialCursor *authoritypb.VisibilityCursor
-	if profile == volumeserver.CoherenceStrict {
-		terminal, err := h.Runtime.SessionTerminal(cred.ID)
-		if err != nil {
-			return h.errorResponse(requestID, err, false)
-		}
-		if err := h.Visibility.Register(cred.ID, profile, terminal, commitment); err != nil {
-			return h.errorResponse(requestID, err, false)
-		}
-		initial, err := h.Visibility.InitialCursor(cred.ID)
-		if err != nil {
-			return h.errorResponse(requestID, err, false)
-		}
-		initialCursor = visibilityCursorProto(initial)
-		// The root is the one coordinate every mount holds from attach onward.
-		h.Visibility.RecordResolvedInode(cred.ID, rootIdentity)
 	}
 	resp := h.success(requestID)
-	features := append([]string(nil), requiredAttachFeatures...)
-	features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
-	if profile == volumeserver.CoherenceStrict {
-		features = append(features, requiredStrictAttachFeatures...)
+	resp.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{
+		SessionId: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:],
+		ProvisionalDeadlineUnixNanos: provisionalDeadline.UnixNano(),
+	}}
+	return resp
+}
+
+func attachAttemptID(raw []byte) (volumeserver.AttachAttemptID, error) {
+	var attempt volumeserver.AttachAttemptID
+	if len(raw) != len(attempt) {
+		return attempt, syscall.EINVAL
 	}
-	resp.Body = &authoritypb.Response_Attach{Attach: &authoritypb.AttachReply{SessionId: cred.ID[:], SessionGeneration: cred.Generation, ResumeSecret: cred.Secret[:], Root: itemProto(root, attr, rootIdentity), Features: features, SessionLeaseMilliseconds: uint64(h.Runtime.SessionLease() / time.Millisecond), VisibilityCursor: initialCursor, RoutesRevision: append([]byte(nil), presented[:]...), AuthorizationDeadlineUnixNanos: authorization.Deadline.UnixNano()}}
-	attached = false
+	copy(attempt[:], raw)
+	if attempt == (volumeserver.AttachAttemptID{}) {
+		return attempt, syscall.EINVAL
+	}
+	return attempt, nil
+}
+
+func sessionStateProto(state volumeserver.SessionState) (authoritypb.SessionState, error) {
+	switch state {
+	case volumeserver.SessionStateProvisional:
+		return authoritypb.SessionState_SESSION_STATE_PROVISIONAL, nil
+	case volumeserver.SessionStateActive:
+		return authoritypb.SessionState_SESSION_STATE_ACTIVE, nil
+	case volumeserver.SessionStateAborted:
+		return authoritypb.SessionState_SESSION_STATE_ABORTED, nil
+	case volumeserver.SessionStateTerminal:
+		return authoritypb.SessionState_SESSION_STATE_TERMINAL, nil
+	default:
+		return authoritypb.SessionState_SESSION_STATE_UNSPECIFIED, volumeserver.ErrSessionFenced
+	}
+}
+
+func (h *VolumeHandler) resume(_ context.Context, requestID uint64, cred volumeserver.SessionCredential) *authoritypb.Response {
+	resources, err := h.sessionResources(cred.ID)
+	if err != nil || resources.attempt == (volumeserver.AttachAttemptID{}) {
+		return h.errorResponse(requestID, volumeserver.ErrSessionExpired, false)
+	}
+	state, err := h.Runtime.SessionState(cred, resources.attempt)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	if state == volumeserver.SessionStateActive {
+		// Only ACTIVE Resume renews the renewable lease. A provisional deadline
+		// is absolute: reconnecting cannot keep an abandoned attach alive.
+		if err := h.Runtime.Resume(cred); err != nil {
+			return h.errorResponse(requestID, err, false)
+		}
+	}
+	wireState, err := sessionStateProto(state)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	resp := h.success(requestID)
+	resp.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: wireState}}
+	return resp
+}
+
+func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred volumeserver.SessionCredential, request *authoritypb.ActivateRequest) *authoritypb.Response {
+	if request == nil || request.GetDataBindingGeneration() == 0 || request.GetControlBindingGeneration() == 0 {
+		return h.errorResponse(requestID, syscall.EINVAL, false)
+	}
+	attempt, err := attachAttemptID(request.GetAttachAttemptId())
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	resources, err := h.sessionResources(cred.ID)
+	if err != nil || resources.attempt != attempt {
+		return h.errorResponse(requestID, volumeserver.ErrRequestMismatch, false)
+	}
+	resources.activationMu.Lock()
+	defer resources.activationMu.Unlock()
+	if _, err := h.exactSessionResources(cred.ID, attempt); err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	h.resourcesMu.Lock()
+	retained := resources.activationReply
+	if retained != nil {
+		retained = proto.Clone(retained).(*authoritypb.ActivateReply)
+	}
+	h.resourcesMu.Unlock()
+	token, err := h.Runtime.PrepareActivation(ctx, cred, attempt)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	if token.Replay() {
+		if retained == nil {
+			return h.errorResponse(requestID, errInternal, false)
+		}
+		resp := h.success(requestID)
+		resp.Body = &authoritypb.Response_Activate{Activate: retained}
+		return resp
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			h.Runtime.CancelActivation(token)
+		}
+	}()
+	if resources.purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN {
+		revision, revisionErr := h.Routes.Revision()
+		if revisionErr != nil {
+			return h.errorResponse(requestID, revisionErr, false)
+		}
+		reply := &authoritypb.ActivateReply{
+			Features:                       []string{sessionReauthorizationFeature},
+			SessionLeaseMilliseconds:       uint64(h.Runtime.SessionLease() / time.Millisecond),
+			AuthorizationDeadlineUnixNanos: resources.authorizationDeadline.UnixNano(),
+			State:                          authoritypb.SessionState_SESSION_STATE_ACTIVE,
+			Purpose:                        authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN,
+			FrontendProfile:                authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED,
+			RoutesRevision:                 append([]byte(nil), revision[:]...),
+		}
+		if err := h.retainActivationReply(cred.ID, resources, reply); err != nil {
+			return h.errorResponse(requestID, err, false)
+		}
+		h.Runtime.CommitActivation(token)
+		committed = true
+		resp := h.success(requestID)
+		resp.Body = &authoritypb.Response_Activate{Activate: reply}
+		return resp
+	}
+	if resources.purpose != authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT {
+		return h.errorResponse(requestID, errInternal, false)
+	}
+	// Activation rechecks the pinned revision under the topology read side. An
+	// ApplyRoutes commit can happen after provisional Attach but can never fit
+	// between this check and ACTIVE publication. An already-ACTIVE exact replay
+	// returned above: it must reproduce its retained reply even if a later route
+	// switch has made ordinary work from that session stale.
+	topology := h.Routes.AcquireTopologyRead()
+	defer topology.Release()
+	if err := h.Routes.Admit(resources.routes, true, "activation", false); err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	terminal, err := h.Runtime.SessionTerminal(cred.ID)
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	if resources.coherence != volumeserver.CoherenceStrict || h.Lifecycle == nil {
+		return h.errorResponse(requestID, errInternal, false)
+	}
+	var reply *authoritypb.ActivateReply
+	err = h.Lifecycle.Activate(cred.ID, func() error {
+		rootAttr, readErr := h.Store.Getattr(resources.root)
+		if readErr != nil {
+			return readErr
+		}
+		rootIdentity, readErr := h.Store.Identity(resources.root)
+		if readErr != nil {
+			return readErr
+		}
+		switch resources.profile {
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+			if h.Leases == nil {
+				return errInternal
+			}
+			if activateErr := h.Leases.ActivateHolder(cred.ID, terminal); activateErr != nil {
+				return activateErr
+			}
+			leaseActivated := true
+			defer func() {
+				if leaseActivated {
+					_ = h.Leases.RemoveHolder(cred.ID)
+				}
+			}()
+			reply = h.newActivationReply(resources, rootAttr, rootIdentity, volumeserver.VisibilityCursor{})
+			if retainErr := h.retainActivationReply(cred.ID, resources, reply); retainErr != nil {
+				return retainErr
+			}
+			h.Runtime.CommitActivation(token)
+			leaseActivated = false
+			return nil
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+			if h.Visibility == nil {
+				return errInternal
+			}
+			_, activateErr := h.Visibility.ActivateParticipantInMemory(
+				cred.ID, volumeserver.CoherenceStrict, terminal, resources.commitment,
+				func(cursor volumeserver.VisibilityCursor) ([][16]byte, error) {
+					reply = h.newActivationReply(resources, rootAttr, rootIdentity, cursor)
+					return nil, h.retainActivationReply(cred.ID, resources, reply)
+				},
+				func() { h.Runtime.CommitActivation(token) },
+			)
+			return activateErr
+		default:
+			return errInternal
+		}
+	})
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	committed = true
+	resp := h.success(requestID)
+	resp.Body = &authoritypb.Response_Activate{Activate: reply}
+	return resp
+}
+
+func (h *VolumeHandler) newActivationReply(resources *sessionResources, rootAttr xfsstore.Attr, rootIdentity [16]byte, fskitCursor volumeserver.VisibilityCursor) *authoritypb.ActivateReply {
+	features, valid := activateFeatures(resources.profile)
+	if !valid {
+		return nil
+	}
+	features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
+	reply := &authoritypb.ActivateReply{
+		Root: itemProto(resources.root, rootAttr, rootIdentity), Features: features,
+		SessionLeaseMilliseconds:       uint64(h.Runtime.SessionLease() / time.Millisecond),
+		RoutesRevision:                 append([]byte(nil), resources.routes[:]...),
+		AuthorizationDeadlineUnixNanos: resources.authorizationDeadline.UnixNano(),
+		State:                          authoritypb.SessionState_SESSION_STATE_ACTIVE,
+		Purpose:                        authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:                resources.profile,
+	}
+	if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+		reply.LeaseCursor = &authoritypb.LeaseEventCursor{}
+	} else if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		reply.FskitRepairCursor = visibilityCursorProto(fskitCursor)
+	}
+	return reply
+}
+
+// retainActivationReply runs before the infallible runtime commit. For a
+// strict session it is the visibility transaction's precommit step, after the
+// exact initial cursor exists but before either membership or runtime ACTIVE
+// can escape. Thus there is no state in which an active session exists without
+// the response needed to recover a lost Activate write.
+func (h *VolumeHandler) retainActivationReply(id volumeserver.SessionID, resources *sessionResources, reply *authoritypb.ActivateReply) error {
+	if reply == nil {
+		return errInternal
+	}
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	if resources.ended || h.resources[id] != resources {
+		return volumeserver.ErrSessionExpired
+	}
+	if resources.activationReply != nil {
+		if !proto.Equal(resources.activationReply, reply) {
+			return volumeserver.ErrRequestMismatch
+		}
+		return nil
+	}
+	resources.activationReply = proto.Clone(reply).(*authoritypb.ActivateReply)
+	return nil
+}
+
+func (h *VolumeHandler) abortAttach(ctx context.Context, requestID uint64, cred volumeserver.SessionCredential, request *authoritypb.AbortAttachRequest) *authoritypb.Response {
+	if request == nil {
+		return h.errorResponse(requestID, syscall.EINVAL, false)
+	}
+	attempt, err := attachAttemptID(request.GetAttachAttemptId())
+	if err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	// If resources still exist, share activation's local serialization. They may
+	// already be gone on an exact Abort replay; the runtime keeps the bounded
+	// attempt tombstone and is the authority for idempotence in that case.
+	resources, _ := h.sessionResources(cred.ID)
+	if resources != nil {
+		resources.activationMu.Lock()
+		defer resources.activationMu.Unlock()
+	}
+	if err := h.Runtime.AbortProvisional(ctx, cred, attempt); err != nil {
+		return h.errorResponse(requestID, err, false)
+	}
+	resp := h.success(requestID)
+	resp.Body = &authoritypb.Response_AbortAttach{AbortAttach: &authoritypb.AbortAttachReply{State: authoritypb.SessionState_SESSION_STATE_ABORTED}}
 	return resp
 }
 
@@ -1701,7 +3050,20 @@ func (h *VolumeHandler) validBounds() bool {
 	return h.MaxFrame >= MinimumFrameBytes && h.MaxRead > 0 && h.MaxWrite > 0 && h.MaxInFlight >= 2 &&
 		uint64(h.MaxRead)+uint64(FramePayloadReserve) <= uint64(h.MaxFrame) &&
 		uint64(h.MaxWrite)+uint64(FramePayloadReserve) <= uint64(h.MaxFrame) &&
-		h.MaxRetainedReplyBytes >= uint64(h.maxReplyBytes())
+		h.MaxRetainedReplyBytes >= uint64(h.maxReplyBytes()) && h.WriteAdmission != nil &&
+		h.MaxWriteBytesPerSession >= uint64(h.MaxWrite) &&
+		h.MaxWriteBytesInFlight >= h.MaxWriteBytesPerSession &&
+		h.MaxWritesPerSession > 0 && h.MaxWrites >= h.MaxWritesPerSession &&
+		h.WriteAdmissionProgressTimeout > 0 && h.WriteAbsoluteTimeout >= h.WriteAdmissionProgressTimeout
+}
+
+func (h *VolumeHandler) validFskitBounds() bool {
+	return h.FskitWriteStaging != nil &&
+		h.MaxFskitWriteBytes >= uint64(h.MaxWrite) &&
+		h.MaxFskitWriteBytes <= h.MaxFskitWriteStagingBytesPerSession &&
+		h.MaxFskitWriteStagingBytesPerSession <= h.MaxFskitWriteStagingBytes &&
+		h.MaxFskitWritesPerSession > 0 && h.MaxFskitWritesPerSession <= h.MaxFskitWrites &&
+		h.FskitWriteProgressTimeout > 0 && h.FskitWriteAbsoluteTimeout >= h.FskitWriteProgressTimeout
 }
 
 // readDirEntryBudget is the byte budget available to directory entries. It is
@@ -1735,7 +3097,13 @@ func (h *VolumeHandler) requestReplyReserve(req *authoritypb.Request) uint32 {
 }
 
 func (h *VolumeHandler) mutate(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, apply func() *authoritypb.Response) *authoritypb.Response {
-	return h.mutateOperation(ctx, req, cred, func(volumeserver.MutationID) *authoritypb.Response { return apply() })
+	return h.mutateOperation(ctx, req, cred, func(volumeserver.MutationID) *authoritypb.Response { return apply() }, nil)
+}
+
+func (h *VolumeHandler) mutateExecution(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, apply func() *authoritypb.Response) (*authoritypb.Response, bool) {
+	executed := false
+	response := h.mutateOperation(ctx, req, cred, func(volumeserver.MutationID) *authoritypb.Response { return apply() }, &executed)
+	return response, executed
 }
 
 func (h *VolumeHandler) mutateVisible(
@@ -1745,50 +3113,493 @@ func (h *VolumeHandler) mutateVisible(
 	prepare func() ([]volumeserver.VisibilityTarget, error),
 	apply func() (*authoritypb.Response, []volumeserver.VisibilityTarget),
 ) *authoritypb.Response {
-	return h.mutateOperation(ctx, req, cred, func(id volumeserver.MutationID) *authoritypb.Response {
-		if h.Visibility == nil {
-			if _, err := prepare(); err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			resp, _ := apply()
-			return resp
-		}
-		held, err := h.heldDirectories(cred.ID, req)
-		if err != nil {
-			// Failing closed here is a liveness requirement, not only input
-			// validation. Silently dropping a parent would hide the exact kernel
-			// lock that a peer COMPLETE may need and recreate the cycle the
-			// interruption protocol exists to break.
-			return h.errorResponse(0, err, false)
-		}
-		var resp *authoritypb.Response
-		err = h.Visibility.ExecuteWithHeldParents(ctx, cred.ID, id, held, prepare, func() ([]volumeserver.VisibilityTarget, bool) {
-			var complete []volumeserver.VisibilityTarget
-			resp, complete = apply()
-			// nil is the explicit no-visible-change result. A non-nil empty
-			// slice means apply changed XFS but target construction failed;
-			// the coordinator detects and poisons that post-apply defect.
-			return complete, complete != nil && visibilityChanged(resp)
-		})
-		if err != nil {
-			var barrier *volumeserver.VisibilityBarrierError
-			uncertain := errors.As(err, &barrier) && barrier.Applied
-			if uncertain {
-				log.Printf(
-					"portablefs-authority: visible mutation applied but cache completion failed source=%x slot=%d sequence=%d frontend_operation_id=%d: %v",
-					cred.ID, id.Slot, id.Sequence, id.FrontendOperationID, err,
-				)
-			}
-			return h.errorResponse(0, err, uncertain)
-		}
-		// The initiating mount caches the inode it just created, and that
-		// coordinate is knowable only from the reply.
-		h.recordReplyItem(cred.ID, resp)
-		return resp
+	return h.mutateVisibleSequence(ctx, req, cred, prepare, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return apply()
 	})
 }
 
-func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, apply func(volumeserver.MutationID) *authoritypb.Response) *authoritypb.Response {
+func (h *VolumeHandler) mutateVisibleResolved(
+	ctx context.Context,
+	req *authoritypb.Request,
+	cred volumeserver.SessionCredential,
+	prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error),
+	apply func() (*authoritypb.Response, []volumeserver.VisibilityTarget),
+) *authoritypb.Response {
+	return h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		return apply()
+	})
+}
+
+func (h *VolumeHandler) mutateVisibleSequence(
+	ctx context.Context,
+	req *authoritypb.Request,
+	cred volumeserver.SessionCredential,
+	prepare func() ([]volumeserver.VisibilityTarget, error),
+	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
+) *authoritypb.Response {
+	return h.mutateVisibleSequenceResolved(ctx, req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+		return prepare()
+	}, apply)
+}
+
+func (h *VolumeHandler) mutateVisibleSequenceResolved(
+	ctx context.Context,
+	req *authoritypb.Request,
+	cred volumeserver.SessionCredential,
+	prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error),
+	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
+) *authoritypb.Response {
+	return h.mutateLeaseVisibleSequenceResolved(ctx, req, cred, prepare, apply)
+}
+
+func (h *VolumeHandler) mutateLeaseVisibleSequenceResolved(
+	ctx context.Context,
+	req *authoritypb.Request,
+	cred volumeserver.SessionCredential,
+	prepare func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error),
+	apply func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget),
+) *authoritypb.Response {
+	executed := false
+	response := h.mutateOperation(ctx, req, cred, func(mutationID volumeserver.MutationID) *authoritypb.Response {
+		writeCommit := req.GetFskitWrite()
+		if writeCommit != nil && writeCommit.GetPhase() != authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT {
+			writeCommit = nil
+		}
+		var writeCommitOwner *fskitWriteCommitOwner
+		defer func() {
+			if writeCommit != nil {
+				h.finishFskitWriteCommit(cred.ID, writeCommit, writeCommitOwner)
+			}
+		}()
+		definiteRejection := func(err error) *authoritypb.Response {
+			if req.GetWrite() != nil {
+				return stockWriteRejection(err, false)
+			}
+			if writeCommit != nil && writeCommitOwner != nil {
+				if rejected := h.rejectPendingFskitWrite(cred.ID, writeCommit, err); rejected != nil {
+					return rejected
+				}
+			}
+			return h.errorResponse(0, err, false)
+		}
+		if h.Leases == nil || h.Visibility == nil {
+			return definiteRejection(errInternal)
+		}
+		profile, err := h.sessionFrontendProfile(cred.ID)
+		if err != nil {
+			return definiteRejection(err)
+		}
+		var declared *volumeserver.SourcePublicationGate
+		var externalLeaseSource <-chan struct{}
+		var externalVisibilitySource <-chan struct{}
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			if writeCommit != nil {
+				if terminal, found, terminalErr := h.rejectedFskitWriteTerminal(req, cred.ID, writeCommit); terminalErr != nil {
+					return definiteRejection(terminalErr)
+				} else if found {
+					return terminal
+				}
+			}
+			if !validFskitSourcePublicationPresence(req) {
+				return definiteRejection(syscall.EINVAL)
+			}
+			declared, err = decodeFskitSourcePublication(req)
+			if err != nil || declared == nil {
+				return definiteRejection(syscall.EINVAL)
+			}
+			externalLeaseSource, err = h.Runtime.SessionTerminal(cred.ID)
+			if err != nil {
+				return definiteRejection(err)
+			}
+			if writeCommit != nil {
+				resolution := newOperationResolutionContext(h, cred.ID)
+				expected, gateErr := resolution.deriveSourcePublicationGate(req, true)
+				if gateErr != nil || !sourcePublicationGatesEqual(declared, &expected) {
+					if gateErr == nil {
+						gateErr = volumeserver.ErrSourcePublicationGate
+					}
+					return definiteRejection(gateErr)
+				}
+				declared = &expected
+				writeCommitOwner, err = h.markFskitWriteCommitting(cred.ID, req, writeCommit)
+				if err != nil {
+					return definiteRejection(err)
+				}
+			}
+		} else if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+			externalVisibilitySource, err = h.Runtime.SessionTerminal(cred.ID)
+			if err != nil {
+				return definiteRejection(err)
+			}
+		} else {
+			return definiteRejection(errInternal)
+		}
+
+		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
+			var declaration volumeserver.DependencyDeclaration
+			declarationOwned := false
+			if declared != nil {
+				declaration = h.Visibility.DeclareSourceGate(*declared)
+				declarationOwned = true
+			}
+			releaseDeclaration := func() {
+				if declarationOwned {
+					declaration.Release()
+					declarationOwned = false
+				}
+			}
+
+			resolutions := newOperationResolutionContext(h, cred.ID)
+			prepared, prepareErr := prepare(resolutions)
+			if prepareErr != nil {
+				releaseDeclaration()
+				if errors.Is(prepareErr, volumeserver.ErrVisibilityDependencyRefresh) {
+					continue
+				}
+				return definiteRejection(prepareErr)
+			}
+			if declared != nil {
+				expected, deriveErr := resolutions.deriveSourcePublicationGate(req, true)
+				if deriveErr != nil || !sourcePublicationGatesEqual(declared, &expected) {
+					releaseDeclaration()
+					return definiteRejection(volumeserver.ErrSourcePublicationGate)
+				}
+				declared = &expected
+			}
+			prepared, err = normalizeLeaseVisibilityTargets(prepared)
+			if err != nil {
+				releaseDeclaration()
+				return definiteRejection(err)
+			}
+			recallTargets, recallErr := leaseRecallTargets(prepared)
+			if recallErr != nil {
+				releaseDeclaration()
+				return definiteRejection(recallErr)
+			}
+			var transaction *volumeserver.LeaseRecallTransaction
+			if externalLeaseSource != nil {
+				transaction, recallErr = h.Leases.PrepareRecallFromExternalSource(ctx, cred.ID, externalLeaseSource, recallTargets)
+			} else {
+				transaction, recallErr = h.Leases.PrepareRecall(ctx, cred.ID, recallTargets)
+			}
+			if recallErr != nil {
+				releaseDeclaration()
+				return definiteRejection(recallErr)
+			}
+
+			revalidate := func() ([]volumeserver.VisibilityTarget, error) {
+				// Operation preparation acquires the authoritative mutation locks for
+				// every resolved identity before returning. Those locks remain held
+				// through both coherence barriers and XFS apply, so rerunning prepare
+				// here would recursively acquire the same lock rather than strengthen
+				// the proof. The visibility coordinator still revalidates its declared
+				// source gate against the dependency versions it admitted.
+				return cloneLeaseVisibilityTargets(prepared), nil
+			}
+
+			var resp *authoritypb.Response
+			var changedTargets []volumeserver.VisibilityTarget
+			var versions map[string]uint64
+			var postState []volumeserver.VisibilityObjectPostState
+			var snapshot uint64
+			var postErr error
+			applied, changed := false, false
+			applyOnce := func() ([]volumeserver.VisibilityTarget, bool) {
+				applied = true
+				resp, changedTargets = apply(transaction.Sequence())
+				if resp == nil {
+					postErr = errInternal
+					return nil, true
+				}
+				changed = changedTargets != nil
+				commitSequence := h.Leases.CommittedSequence()
+				if changed {
+					commitSequence = transaction.AssignCommitSequence()
+				}
+				versions = h.finalizeMutationPostState(transaction.Sequence(), commitSequence, resp.GetPostState())
+				rewriteLeaseMutationReplyMetadata(resp.ProtoReflect(), commitSequence, versions)
+				stampVisibilityTargets(changedTargets, resp.GetPostState())
+				if changed && !validMutationPostStateRoles(req, resp.GetPostState()) {
+					postErr = errInternal
+				}
+				postState, snapshot, err = leasePostState(resp.GetPostState(), changed)
+				if err != nil {
+					postErr = err
+				}
+				return changedTargets, changed
+			}
+
+			var visibilityErr error
+			if declared == nil {
+				visibilityErr = h.Visibility.ExecuteFromExternalSource(
+					ctx, cred.ID, externalVisibilitySource, mutationID, volumeserver.MutationDependenciesForTargets(prepared),
+					revalidate, applyOnce,
+				)
+			} else {
+				refresh := func() (volumeserver.SourcePublicationGate, error) {
+					return newOperationResolutionContext(h, cred.ID).deriveSourcePublicationGate(req, true)
+				}
+				published := func() ([]volumeserver.VisibilityResolution, error) {
+					return sourcePublicationResolutions(req, resp)
+				}
+				declarationOwned = false // Execute owns the declaration on every return path.
+				_, visibilityErr = h.Visibility.ExecuteWithSourceGateSequence(
+					ctx, cred.ID, mutationID, declaration, *declared, refresh, revalidate,
+					func(uint64) ([]volumeserver.VisibilityTarget, bool) { return applyOnce() }, published,
+				)
+			}
+			if visibilityErr != nil && !applied {
+				transaction.Abort()
+				if errors.Is(visibilityErr, errCompositeDependenciesChanged) || errors.Is(visibilityErr, volumeserver.ErrVisibilityDependencyRefresh) {
+					continue
+				}
+				return definiteRejection(visibilityErr)
+			}
+			if resp == nil {
+				transaction.Abort()
+				return h.errorResponse(0, errInternal, applied)
+			}
+			if postErr != nil {
+				source, _ := transaction.CompletePeers(context.Background(), nil, 0, changed)
+				failure := h.errorResponse(0, postErr, changed)
+				failure.SourceLeaseDischarge = sourceLeaseDischargeProto(source)
+				return failure
+			}
+			sourceDischarge, completeErr := transaction.CompletePeers(ctx, postState, snapshot, changed)
+			if completeErr != nil {
+				visibilityErr = errors.Join(visibilityErr, completeErr)
+			}
+			return h.finishLeaseMutationReply(req, resp, transaction, sourceDischarge, visibilityErr, changed)
+		}
+		return definiteRejection(syscall.EAGAIN)
+	}, &executed)
+	if writeCommit := req.GetFskitWrite(); writeCommit != nil &&
+		writeCommit.GetPhase() == authoritypb.FskitWritePhase_FSKIT_WRITE_PHASE_COMMIT &&
+		!executed && response.GetMutation() == nil && response.GetErrno() == int32(syscall.ENOMEM) {
+		return h.rejectUnadmittedFskitWrite(req, cred.ID, writeCommit)
+	}
+	return response
+}
+
+// finishLeaseMutationReply composes the reply once the coherence barrier has
+// returned. The order of the two decisions here is the whole point.
+//
+// A successor grant is a claim that this reply just established the state it
+// covers. A barrier that did not complete established nothing, so a failed
+// outcome mints no cache authority at all: no grant reaches the frontend, and
+// no leaseGranted record is left behind in the authority table for a recall to
+// have to sweep later. The coordinates stay recalled to none and the source's
+// next request is an ordinary miss.
+//
+// The source discharge obligation is the opposite: it travels with every
+// outcome. CompletePeers minted it before this function was reached, so the
+// source already owes that receipt; dropping it from an error reply does not
+// cancel the obligation, it only guarantees the session is fenced once
+// RecallBudget elapses.
+func (h *VolumeHandler) finishLeaseMutationReply(
+	req *authoritypb.Request,
+	resp *authoritypb.Response,
+	transaction *volumeserver.LeaseRecallTransaction,
+	sourceDischarge *volumeserver.LeaseSourceDischarge,
+	visibilityErr error,
+	changed bool,
+) *authoritypb.Response {
+	resp.SourceLeaseDischarge = sourceLeaseDischargeProto(sourceDischarge)
+	if visibilityErr != nil {
+		barrier := &volumeserver.VisibilityBarrierError{Applied: changed, Err: visibilityErr}
+		if req.GetWrite() != nil && changed && markWritePostApplyFailure(resp, barrier) {
+			h.deferCoherenceFailure(resp, barrier)
+			return resp
+		}
+		failure := h.errorResponse(0, barrier, changed)
+		failure.SourceLeaseDischarge = resp.GetSourceLeaseDischarge()
+		return failure
+	}
+	if changed {
+		resp.LeaseGrants = append(resp.LeaseGrants, leaseGrantsProto(h.Leases,
+			transaction.GrantSourcePostState(postStateAttributeGrants(resp.GetPostState())))...)
+	}
+	return resp
+}
+
+func stampVisibilityTargets(targets []volumeserver.VisibilityTarget, state *authoritypb.PostState) {
+	if state == nil {
+		return
+	}
+	states := make(map[[16]byte]volumeserver.VisibilityObjectPostState, len(state.GetObjects()))
+	for _, object := range state.GetObjects() {
+		if object == nil || len(object.GetStableIdentity()) != 16 {
+			continue
+		}
+		post := visibilityObjectPostState(object)
+		if post != nil {
+			states[post.StableIdentity] = *post
+		}
+	}
+	for index := range targets {
+		if targets[index].Scope == volumeserver.VisibilityNamespace {
+			continue
+		}
+		if post, ok := states[targets[index].Identity]; ok {
+			post := post
+			targets[index].ExactPostState = &post
+		}
+	}
+}
+
+func cloneLeaseVisibilityTargets(targets []volumeserver.VisibilityTarget) []volumeserver.VisibilityTarget {
+	cloned := append([]volumeserver.VisibilityTarget(nil), targets...)
+	for index := range cloned {
+		cloned[index].Name = bytes.Clone(cloned[index].Name)
+		if cloned[index].ExactPostState != nil {
+			post := *cloned[index].ExactPostState
+			cloned[index].ExactPostState = &post
+		}
+	}
+	return cloned
+}
+
+func rewriteLeaseMutationReplyMetadata(message protoreflect.Message, sequence uint64, versions map[string]uint64) {
+	if !message.IsValid() || sequence == 0 {
+		return
+	}
+	if message.Descriptor().Name() == "Item" {
+		identityField := message.Descriptor().Fields().ByName("stable_identity")
+		versionField := message.Descriptor().Fields().ByName("object_version")
+		snapshotField := message.Descriptor().Fields().ByName("snapshot_sequence")
+		if identityField != nil && versionField != nil && snapshotField != nil {
+			if version, ok := versions[string(message.Get(identityField).Bytes())]; ok {
+				message.Set(versionField, protoreflect.ValueOfUint64(version))
+				message.Set(snapshotField, protoreflect.ValueOfUint64(sequence))
+			}
+		}
+	}
+	message.Range(func(field protoreflect.FieldDescriptor, value protoreflect.Value) bool {
+		if field.IsList() && field.Kind() == protoreflect.MessageKind {
+			list := value.List()
+			for index := 0; index < list.Len(); index++ {
+				rewriteLeaseMutationReplyMetadata(list.Get(index).Message(), sequence, versions)
+			}
+			return true
+		}
+		if field.Kind() == protoreflect.MessageKind {
+			rewriteLeaseMutationReplyMetadata(value.Message(), sequence, versions)
+			return true
+		}
+		if field.Kind() != protoreflect.Uint64Kind || value.Uint() == 0 {
+			return true
+		}
+		if field.Name() == "visibility_sequence" {
+			message.Set(field, protoreflect.ValueOfUint64(sequence))
+		}
+		return true
+	})
+}
+
+// normalizeLeaseVisibilityTargets validates and deduplicates the storage
+// footprint without applying the retired kernel-repair dominance rule. In the
+// lease model A(identity) and D(identity) are independent cache authorities;
+// a data mutation commonly recalls both.
+func normalizeLeaseVisibilityTargets(targets []volumeserver.VisibilityTarget) ([]volumeserver.VisibilityTarget, error) {
+	normalized := make([]volumeserver.VisibilityTarget, 0, len(targets))
+	indexes := make(map[string]int, len(targets))
+	for index, target := range targets {
+		if err := validateAuthorityVisibilityTarget(target); err != nil {
+			return nil, fmt.Errorf("%w: target %d: %v", volumeserver.ErrVisibilityTargets, index, err)
+		}
+		var key string
+		if target.Scope == volumeserver.VisibilityNamespace {
+			key = string([]byte{byte(target.Scope)}) + string(target.ParentIdentity[:]) + string(target.Name)
+		} else {
+			key = string([]byte{byte(target.Scope)}) + string(target.Identity[:])
+		}
+		priorIndex, exists := indexes[key]
+		if !exists {
+			indexes[key] = len(normalized)
+			target.Name = bytes.Clone(target.Name)
+			target.RelatedIdentities = appendUniqueVisibilityIdentities(nil, target.RelatedIdentities)
+			normalized = append(normalized, target)
+			continue
+		}
+		prior := &normalized[priorIndex]
+		switch target.Scope {
+		case volumeserver.VisibilityNamespace:
+			if prior.ParentKernelIno != target.ParentKernelIno || prior.Device != target.Device || prior.PostIdentity != target.PostIdentity {
+				return nil, fmt.Errorf("%w: namespace coordinate %x/%q conflicts", volumeserver.ErrVisibilityTargets, target.ParentIdentity, target.Name)
+			}
+			prior.RelatedIdentities = appendUniqueVisibilityIdentities(prior.RelatedIdentities, target.RelatedIdentities)
+		case volumeserver.VisibilityData:
+			if prior.KernelIno != target.KernelIno || prior.Device != target.Device || prior.Size != target.Size {
+				return nil, fmt.Errorf("%w: data coordinate %x conflicts", volumeserver.ErrVisibilityTargets, target.Identity)
+			}
+		case volumeserver.VisibilityAttributes:
+			if prior.KernelIno != target.KernelIno || prior.Device != target.Device {
+				return nil, fmt.Errorf("%w: attribute coordinate %x conflicts", volumeserver.ErrVisibilityTargets, target.Identity)
+			}
+		default:
+			return nil, volumeserver.ErrVisibilityTargets
+		}
+	}
+	return normalized, nil
+}
+
+func leaseRecallTargets(targets []volumeserver.VisibilityTarget) ([]volumeserver.LeaseRecallTarget, error) {
+	coordinates := make(map[string]volumeserver.LeaseCoordinate)
+	add := func(coordinate volumeserver.LeaseCoordinate) {
+		coordinates[coordinate.String()] = coordinate
+	}
+	for _, target := range targets {
+		switch target.Scope {
+		case volumeserver.VisibilityNamespace:
+			add(volumeserver.LeaseCoordinate{
+				Family: volumeserver.LeaseFamilyName, ParentIdentity: target.ParentIdentity, Name: append([]byte(nil), target.Name...),
+			})
+			add(volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyEnumeration, Identity: target.ParentIdentity})
+		case volumeserver.VisibilityAttributes:
+			add(volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: target.Identity})
+		case volumeserver.VisibilityData:
+			add(volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyData, Identity: target.Identity})
+		default:
+			return nil, volumeserver.ErrLeaseCoordinate
+		}
+	}
+	if len(coordinates) == 0 {
+		return nil, volumeserver.ErrLeaseCoordinate
+	}
+	keys := make([]string, 0, len(coordinates))
+	for key := range coordinates {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	recalls := make([]volumeserver.LeaseRecallTarget, len(keys))
+	for index, key := range keys {
+		recalls[index] = volumeserver.LeaseRecallTarget{Coordinate: coordinates[key]}
+	}
+	return recalls, nil
+}
+
+func leasePostState(post *authoritypb.PostState, required bool) ([]volumeserver.VisibilityObjectPostState, uint64, error) {
+	if post == nil {
+		if required {
+			return nil, 0, errInternal
+		}
+		return nil, 0, nil
+	}
+	states := make([]volumeserver.VisibilityObjectPostState, len(post.GetObjects()))
+	for index, object := range post.GetObjects() {
+		state := visibilityObjectPostState(object)
+		if state == nil {
+			return nil, 0, errInternal
+		}
+		states[index] = *state
+	}
+	return states, post.GetSnapshotSequence(), nil
+}
+
+func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential, apply func(volumeserver.MutationID) *authoritypb.Response, executed *bool) *authoritypb.Response {
+	if executed != nil {
+		*executed = false
+	}
 	access, err := h.Runtime.Access(cred)
 	if err != nil {
 		return h.errorResponse(req.GetRequestId(), err, false)
@@ -1797,34 +3608,40 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		return h.errorResponse(req.GetRequestId(), syscall.EPERM, false)
 	}
 	mutation := req.GetMutation()
-	if mutation == nil || len(mutation.GetRequestHash()) != sha256.Size {
+	if mutation == nil {
 		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 	}
-	hash, err := canonicalHash(req)
-	if err != nil || !bytes.Equal(hash[:], mutation.GetRequestHash()) {
-		return h.errorResponse(req.GetRequestId(), volumeserver.ErrRequestMismatch, false)
+	fingerprint, err := canonicalFingerprintFromFrame(ctx, h.Runtime, req)
+	if err != nil {
+		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
 	}
 	// Admission is taken against the bytes this outcome may retain, before the
 	// operation reaches XFS. Refusing here is retryable; refusing after the
-	// filesystem changed would not be.
+	// filesystem changed would not be. The runtime invokes this admission while
+	// holding the exact replay-slot mutex, so a pipelined successor prices itself
+	// against this operation's settled outcome rather than the same stale one.
 	reserve := h.requestReplyReserve(req)
 	id := volumeserver.MutationID{
-		Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Hash: hash,
-		FrontendOperationID:  req.GetFrontendOperationId(),
-		SourcePhaseQueueable: req.GetSourcePhaseQueueable(),
+		Slot: mutation.GetSlot(), Sequence: mutation.GetSequence(), Fingerprint: fingerprint,
+		FrontendOperationID: req.GetFskitFrontendOperationId(),
 	}
-	reserved, err := h.reserveReplyBytes(cred.ID, id.Slot, reserve)
-	if err != nil {
-		return h.errorResponse(req.GetRequestId(), err, false)
-	}
+	var reserved uint32
 	settled := false
 	defer func() {
 		if !settled {
 			h.releaseReplyReservation(reserved)
 		}
 	}()
-	out, err := h.Runtime.ExecuteMutation(ctx, cred, id, func(context.Context) volumeserver.Outcome {
+	out, err := h.Runtime.ExecuteMutationAdmitted(ctx, cred, id, func() error {
+		var reserveErr error
+		reserved, reserveErr = h.reserveReplyBytes(cred.ID, id.Slot, reserve)
+		return reserveErr
+	}, func(context.Context) volumeserver.Outcome {
+		if executed != nil {
+			*executed = true
+		}
 		resp := apply(id)
+		terminalDeliveryRequired := h.takeTerminalReceiptFrame(resp)
 		encoded, encodeErr := marshalOutcome(resp)
 		if encodeErr != nil || uint32(len(encoded)) > reserve {
 			resp = h.errorResponse(0, syscall.EOVERFLOW, true)
@@ -1835,9 +3652,15 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		}
 		h.settleReplyBytes(cred.ID, id.Slot, uint32(len(encoded)), reserved)
 		settled = true
-		return volumeserver.Outcome{Errno: resp.GetErrno(), Reply: encoded}
+		return volumeserver.Outcome{
+			Errno: resp.GetErrno(), Reply: encoded,
+			TerminalDeliveryRequired: terminalDeliveryRequired,
+		}
 	})
 	if err != nil {
+		if req.GetWrite() != nil && errors.Is(err, volumeserver.ErrAdmission) {
+			return stockWriteResponseWithEnvelope(h, req.GetRequestId(), stockWriteRejection(syscall.ENOMEM, false))
+		}
 		// Nothing was recorded for this identity, so the response deliberately
 		// carries no MutationState and the peer's slot stays where it is.
 		return h.errorResponse(req.GetRequestId(), err, false)
@@ -1852,6 +3675,11 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 	// one recorded in the slot, whether it just executed or replayed. Reporting
 	// it is what keeps the peer's slot state a copy rather than an inference.
 	resp.Mutation = &authoritypb.MutationState{Slot: id.Slot, AcceptedSequence: id.Sequence}
+	if out.TerminalDeliveryRequired {
+		h.terminalFailureMu.Lock()
+		h.retainTerminalReceiptFrameLocked(resp)
+		h.terminalFailureMu.Unlock()
+	}
 	return resp
 }
 
@@ -1985,7 +3813,7 @@ func itemProto(item xfsstore.Capability, attr xfsstore.Attr, identity [16]byte) 
 	return &authoritypb.Item{Token: item[:], Attr: attrProto(attr), StableIdentity: identity[:]}
 }
 func attrProto(attr xfsstore.Attr) *authoritypb.Attr {
-	return &authoritypb.Attr{Kind: attrKindProto(attr.Kind), Inode: attr.Ino, Size: attr.Size, Blocks: attr.Blocks, Mode: modeToProtocol(attr.Mode), Uid: attr.UID, Gid: attr.GID, Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS, CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS}
+	return &authoritypb.Attr{Kind: attrKindProto(attr.Kind), Inode: attr.Ino, Size: attr.Size, Blocks: attr.Blocks, Mode: modeToProtocol(attr.Mode), Uid: attr.UID, Gid: attr.GID, Nlink: attr.Nlink, AtimeNs: attr.ATimeNS, MtimeNs: attr.MTimeNS, CtimeNs: attr.CTimeNS, BirthTimeNs: attr.BirthTimeNS, Rdev: attr.Rdev, Blksize: attr.BlockSize, Flags: attr.Flags}
 }
 
 // attrKindProto and xattrMode translate between two independently numbered
@@ -2049,49 +3877,59 @@ func modeToProtocol(mode fs.FileMode) uint32 {
 }
 
 // getattr answers under the restore mode's per-inode attribute lock while a
-// restore is active. What that lock guards is mtime, and only mtime: installing
-// a fetched chunk writes the archived bytes and then puts the archived mtime
-// back, and between those two calls the inode carries a timestamp no user
-// produced. Hydration is invisible base-byte movement by contract - a restored
-// tree must leave make and git status alone - so an attribute reader has to be
-// excluded from that interval rather than allowed to observe it. Modes are not
-// at issue: nothing in the serving authority ever changes one on its own.
-func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, req *authoritypb.GetAttrRequest) (xfsstore.Attr, error) {
+// restore is active. Installing a fetched chunk writes archived bytes and then
+// restores archived mtime; the lock prevents either frontend profile from
+// observing the transient hydration timestamp.
+func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, req *authoritypb.GetAttrRequest) (xfsstore.Attr, [16]byte, uint64, error) {
 	if len(req.GetHandle()) != 0 {
 		handle, err := h.open(id, req.GetHandle())
 		if err != nil {
-			return xfsstore.Attr{}, err
+			return xfsstore.Attr{}, [16]byte{}, 0, err
 		}
-		if err := h.stabilizeOpen(ctx, id, handle); err != nil {
-			return xfsstore.Attr{}, err
-		}
-		if h.Restore == nil || !h.Restore.Active() {
-			return h.Store.GetattrOpen(handle)
+		snapshot, err := h.stabilizeOpenSequence(ctx, id, handle)
+		if err != nil {
+			return xfsstore.Attr{}, [16]byte{}, 0, err
 		}
 		identity, err := h.Store.IdentityOpen(handle)
 		if err != nil {
-			return xfsstore.Attr{}, err
+			return xfsstore.Attr{}, [16]byte{}, 0, err
 		}
-		var attr xfsstore.Attr
-		err = h.Restore.WithAttrLock(identity, func() error { var getErr error; attr, getErr = h.Store.GetattrOpen(handle); return getErr })
-		return attr, err
+		attr, err := h.getattrOpenRestored(identity, handle)
+		return attr, identity, snapshot, err
 	}
 	item, err := h.item(id, req.GetItem())
 	if err != nil {
-		return xfsstore.Attr{}, err
+		return xfsstore.Attr{}, [16]byte{}, 0, err
 	}
-	if err := h.stabilizeItem(ctx, id, item); err != nil {
-		return xfsstore.Attr{}, err
-	}
-	if h.Restore == nil || !h.Restore.Active() {
-		return h.Store.Getattr(item)
+	snapshot, err := h.stabilizeItemSequence(ctx, id, item)
+	if err != nil {
+		return xfsstore.Attr{}, [16]byte{}, 0, err
 	}
 	identity, err := h.Store.Identity(item)
 	if err != nil {
-		return xfsstore.Attr{}, err
+		return xfsstore.Attr{}, [16]byte{}, 0, err
 	}
+	attr, err := h.getattrItemRestored(identity, item)
+	return attr, identity, snapshot, err
+}
+
+func (h *VolumeHandler) getattrOpenRestored(identity [16]byte, handle xfsstore.Capability) (xfsstore.Attr, error) {
 	var attr xfsstore.Attr
-	err = h.Restore.WithAttrLock(identity, func() error { var getErr error; attr, getErr = h.Store.Getattr(item); return getErr })
+	err := h.Restore.WithAttrLock(identity, func() error {
+		var getErr error
+		attr, getErr = h.Store.GetattrOpen(handle)
+		return getErr
+	})
+	return attr, err
+}
+
+func (h *VolumeHandler) getattrItemRestored(identity [16]byte, item xfsstore.Capability) (xfsstore.Attr, error) {
+	var attr xfsstore.Attr
+	err := h.Restore.WithAttrLock(identity, func() error {
+		var getErr error
+		attr, getErr = h.Store.Getattr(item)
+		return getErr
+	})
 	return attr, err
 }
 
@@ -2122,7 +3960,14 @@ func (h *VolumeHandler) setLock(ctx context.Context, req *authoritypb.Request, c
 		if request.GetUnlock() {
 			err = h.Runtime.Locks().Unlock(lock.Object, lock.Owner, lock.Range)
 		} else if request.GetWait() {
-			err = h.Runtime.Locks().Wait(ctx, lock)
+			wait, waitErr := h.Routes.beginLockWait(func() error {
+				return h.admitSessionRoutes(cred.ID)
+			}, lock)
+			if waitErr != nil {
+				err = waitErr
+			} else {
+				err = wait.Await(ctx)
+			}
 		} else {
 			err = h.Runtime.Locks().Set(lock)
 		}
@@ -2169,9 +4014,13 @@ func (h *VolumeHandler) success(requestID uint64) *authoritypb.Response {
 	return &authoritypb.Response{RequestId: requestID, Epoch: h.Epoch()}
 }
 
-func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain bool) *authoritypb.Response {
-	h.recordStorageFailure(err)
-	h.recordCoherenceFailure(err)
+func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain bool) (response *authoritypb.Response) {
+	// Generic errors carry no exact applied state for a frontend to publish.
+	// They still start and fence the terminal drain, but only the structured
+	// WRITE/FALLOCATE/CFR post-apply paths may bind a cross-process delivery
+	// receipt to a response instance.
+	defer func() { h.deferStorageFailure(nil, err) }()
+	defer func() { h.deferCoherenceFailure(nil, err) }()
 	if uncertainFailure(err) {
 		uncertain = true
 	}
@@ -2192,23 +4041,21 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		errno = errnos.ESTALE
 	case errors.Is(err, volumeserver.ErrSequenceGap), errors.Is(err, volumeserver.ErrRequestMismatch), errors.Is(err, volumeserver.ErrSlotRange),
 		errors.Is(err, volumeserver.ErrAuthorizationSequence), errors.Is(err, volumeserver.ErrAuthorizationBroadened),
-		errors.Is(err, volumeserver.ErrAuthorizationOwner):
+		errors.Is(err, volumeserver.ErrAuthorizationOwner), errors.Is(err, volumeserver.ErrAttachAttemptMismatch):
 		errno = errnos.EINVAL
-	case errors.Is(err, volumeserver.ErrAdmission):
+	case errors.Is(err, volumeserver.ErrSessionProvisional):
+		// An ordinary operation cannot be queued as a hidden activation retry. The
+		// mount must finish the explicit CONTROL activation transaction first.
 		errno = errnos.EAGAIN
 	case errors.Is(err, volumeserver.ErrQuiescing):
 		errno = errnos.EAGAIN
 	case errors.Is(err, restoremode.ErrRecallDeadline),
 		errors.Is(err, restoremode.ErrBlocked), errors.Is(err, restoremode.ErrCorrupt), errors.Is(err, restoremode.ErrProtocol):
-		// EIO, not EAGAIN: FUSE files are pollable, so EAGAIN on a blocking
-		// regular-file read parks poll-driven runtimes (Go's netpoller) on a
-		// readiness event that never fires — a hang, not an error. A restore
-		// that cannot serve bytes within its recall deadline is an I/O failure
-		// to the application; FAILURE_CLASS_RESTORE still tells every frontend
-		// and operator that the volume itself is healthy and retryable.
-		errno = errnos.EIO
+		// EIO, not EAGAIN: blocking regular-file reads are pollable and no
+		// readiness event exists for archive recall. The restore class preserves
+		// the stable retry/operator reason without fencing this healthy epoch.
 		resp := h.success(requestID)
-		resp.Errno, resp.Uncertain = errno, uncertain
+		resp.Errno, resp.Uncertain = errnos.EIO, uncertain
 		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_RESTORE
 		switch {
 		case errors.Is(err, restoremode.ErrCorrupt):
@@ -2221,6 +4068,14 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 			resp.RestoreDetail = "blocked"
 		}
 		return resp
+	case errors.Is(err, volumeserver.ErrSessionActive):
+		// AbortAttach is a provisional-only operation. Once ACTIVE, normal Detach
+		// is the sole lifecycle transition and carries the mount-absence proof.
+		errno = errnos.EBUSY
+	case errors.Is(err, volumeserver.ErrAdmission), errors.Is(err, volumeserver.ErrLeaseBlocked), errors.Is(err, volumeserver.ErrLeaseStartup):
+		errno = errnos.EAGAIN
+	case errors.Is(err, volumeserver.ErrLeaseRoutesLive):
+		errno = errnos.EBUSY
 	case errors.Is(err, volumeserver.ErrVisibilityInterrupted):
 		// This is a definite pre-apply interruption, not a coherence
 		// failure. Linux consumes EINTR to release the execution lane needed
@@ -2231,6 +4086,19 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		resp := h.success(requestID)
 		resp.Errno, resp.Uncertain = errno, uncertain
 		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_INTERRUPTED
+		return resp
+	case errors.Is(err, volumeserver.ErrVisibilityRetry):
+		var retry *volumeserver.VisibilityRetryError
+		if !errors.As(err, &retry) || retry.Sequence == 0 {
+			resp := h.success(requestID)
+			resp.Errno, resp.Uncertain = errnos.EIO, true
+			resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_INTERNAL
+			return resp
+		}
+		resp := h.success(requestID)
+		resp.Errno, resp.Uncertain = errnos.EINTR, uncertain
+		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_VISIBILITY_RETRY
+		resp.FskitRepairRetrySequence = retry.Sequence
 		return resp
 	case isVisibilityFenced(err):
 		// One mount left the barrier. Its session is gone and it must revoke
@@ -2277,11 +4145,154 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 	return resp
 }
 
-func (h *VolumeHandler) recordCoherenceFailure(err error) {
+// beginTerminalRequest admits only requests that arrived before the first
+// volume-terminal failure. That first failure fences XFS immediately, but the
+// handlers which were already admitted must be allowed to finish: another one
+// may also have changed XFS and need to register its own exact terminal reply.
+func terminalControlRequest(req *authoritypb.Request) bool {
+	if req == nil {
+		return false
+	}
+	switch req.GetBody().(type) {
+	case *authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent,
+		*authoritypb.Request_RenewLeases,
+		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
+		*authoritypb.Request_Cancel, *authoritypb.Request_TerminalDeliveryReceipt:
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *VolumeHandler) beginTerminalRequest(req *authoritypb.Request) bool {
+	if h == nil {
+		return false
+	}
+	h.terminalFailureMu.Lock()
+	defer h.terminalFailureMu.Unlock()
+	if h.terminalDraining && !terminalControlRequest(req) {
+		return false
+	}
+	h.terminalActive++
+	return true
+}
+
+func (h *VolumeHandler) TerminalQuiescing() <-chan struct{} {
+	h.terminalFailureMu.Lock()
+	defer h.terminalFailureMu.Unlock()
+	if h.terminalQuiesce == nil {
+		h.terminalQuiesce = make(chan struct{})
+		if h.terminalDraining {
+			close(h.terminalQuiesce)
+		}
+	}
+	return h.terminalQuiesce
+}
+
+func (h *VolumeHandler) startTerminalDrainLocked() {
+	if h.terminalDraining {
+		return
+	}
+	h.terminalDraining = true
+	if h.terminalQuiesce == nil {
+		h.terminalQuiesce = make(chan struct{})
+	}
+	close(h.terminalQuiesce)
+	if !h.terminalTimeoutArmed && h.TerminalDeliveryTimeout > 0 {
+		h.terminalTimeoutArmed = true
+		time.AfterFunc(h.TerminalDeliveryTimeout, h.forceTerminalTimeout)
+	}
+}
+
+func (h *VolumeHandler) forceTerminalTimeout() {
+	if h == nil {
+		return
+	}
+	h.terminalFailureMu.Lock()
+	if !h.terminalDraining || h.terminalStorageErr == nil && h.terminalCoherenceErr == nil {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	var storage, coherence error
+	if h.terminalStorageErr != nil {
+		storage = errors.Join(h.terminalStorageErr, context.DeadlineExceeded)
+	}
+	if h.terminalCoherenceErr != nil {
+		coherence = errors.Join(h.terminalCoherenceErr, context.DeadlineExceeded)
+	}
+	h.terminalForced = true
+	h.terminalStorageErr, h.terminalCoherenceErr = nil, nil
+	h.terminalResponses = nil
+	h.terminalAdmittedFrames = nil
+	h.terminalFrames = nil
+	h.terminalReceiptFrames = nil
+	h.terminalFailureMu.Unlock()
+	h.runTerminalCallbacks(storage, coherence)
+}
+
+func (h *VolumeHandler) retainTerminalHandlerResponse(response *authoritypb.Response) {
+	if h == nil {
+		return
+	}
+	h.terminalFailureMu.Lock()
+	if h.terminalHandlerFrames == nil {
+		h.terminalHandlerFrames = make(map[*authoritypb.Response]struct{})
+	}
+	h.terminalHandlerFrames[response] = struct{}{}
+	h.terminalFailureMu.Unlock()
+}
+
+func (h *VolumeHandler) endTerminalRequest() {
+	if h == nil {
+		return
+	}
+	h.terminalFailureMu.Lock()
+	if h.terminalActive == 0 {
+		h.terminalFailureMu.Unlock()
+		panic("authorityrpc: terminal request accounting underflow")
+	}
+	h.terminalActive--
+	storage, coherence := h.terminalCallbacksLocked()
+	h.terminalFailureMu.Unlock()
+	h.runTerminalCallbacks(storage, coherence)
+}
+
+// terminalCallbacksLocked transfers terminal causes only after every handler
+// admitted before the fence has returned and every exact terminal response it
+// registered has reached a physical frame-write attempt.
+func (h *VolumeHandler) terminalCallbacksLocked() (storage, coherence error) {
+	if !h.terminalDraining || h.terminalForced || h.terminalActive != 0 || len(h.terminalFrames) != 0 || len(h.terminalResponses) != 0 {
+		return nil, nil
+	}
+	storage, coherence = h.terminalStorageErr, h.terminalCoherenceErr
+	h.terminalStorageErr, h.terminalCoherenceErr = nil, nil
+	return storage, coherence
+}
+
+func (h *VolumeHandler) runTerminalCallbacks(storage, coherence error) {
+	if storage != nil && h.OnStorageFailure != nil {
+		h.storageFailureOnce.Do(func() { h.OnStorageFailure(storage) })
+	}
+	if coherence != nil && h.OnCoherenceFailure != nil {
+		h.coherenceFailureOnce.Do(func() { h.OnCoherenceFailure(coherence) })
+	}
+}
+
+func (h *VolumeHandler) deferCoherenceFailure(response *authoritypb.Response, err error) {
 	if !isVisibilityFailure(err) || h.OnCoherenceFailure == nil {
 		return
 	}
-	h.coherenceFailureOnce.Do(func() { h.OnCoherenceFailure(err) })
+	h.terminalFailureMu.Lock()
+	h.startTerminalDrainLocked()
+	h.terminalCoherenceErr = errors.Join(h.terminalCoherenceErr, err)
+	h.retainTerminalReceiptFrameLocked(response)
+	storage, coherence := h.terminalCallbacksLocked()
+	h.terminalFailureMu.Unlock()
+	h.runTerminalCallbacks(storage, coherence)
+}
+
+func (h *VolumeHandler) recordCoherenceFailure(err error) {
+	h.deferCoherenceFailure(nil, err)
 }
 
 // fatalStorageErrno reports the errnos with which the kernel says the
@@ -2300,24 +4311,278 @@ func fatalStorageErrno(err error) bool {
 // storageFailure reports whether an error came from the authoritative store
 // itself rather than from this handler's own logic.
 func storageFailure(err error) bool {
-	return fatalStorageErrno(err) || errors.Is(err, xfsstore.ErrFenced) || errors.Is(err, xfsstore.ErrOutcomeUncertain)
+	return fatalStorageErrno(err) || errors.Is(err, xfsstore.ErrFenced) || errors.Is(err, xfsstore.ErrOutcomeUncertain) ||
+		errors.Is(err, xfsstore.ErrWritePrivilege)
 }
 
 func uncertainFailure(err error) bool {
 	return fatalStorageErrno(err) || errors.Is(err, xfsstore.ErrOutcomeUncertain)
 }
 
-func (h *VolumeHandler) recordStorageFailure(err error) {
-	if h.Store == nil || !fatalStorageErrno(err) {
-		return
+func (h *VolumeHandler) fenceStorageFailure(err error) bool {
+	if h.Store == nil || !fatalStorageErrno(err) && !errors.Is(err, xfsstore.ErrWritePrivilege) &&
+		!errors.Is(err, xfsstore.ErrOutcomeUncertain) {
+		return false
 	}
 	h.Store.Fence(err)
-	if h.OnStorageFailure != nil {
-		h.storageFailureOnce.Do(func() { h.OnStorageFailure(err) })
+	return true
+}
+
+func (h *VolumeHandler) deferStorageFailure(response *authoritypb.Response, err error) {
+	if h.Store == nil || !fatalStorageErrno(err) && !errors.Is(err, xfsstore.ErrWritePrivilege) &&
+		!errors.Is(err, xfsstore.ErrOutcomeUncertain) {
+		return
 	}
+	if h.OnStorageFailure == nil {
+		h.Store.Fence(err)
+		return
+	}
+	// Do not synchronously stop the server here. A post-apply response may be
+	// carrying the only exact size/offset the source kernel can publish; closing
+	// the connection from inside Handle would race that response write. Track its
+	// exact retained bytes so marshal/unmarshal and replay cannot lose ownership.
+	h.terminalFailureMu.Lock()
+	h.startTerminalDrainLocked()
+	h.terminalStorageErr = errors.Join(h.terminalStorageErr, err)
+	h.retainTerminalReceiptFrameLocked(response)
+	h.terminalFailureMu.Unlock()
+	// Close admission before fencing the store. Otherwise a fresh filesystem
+	// request can slip between Fence and terminalDraining and become a hidden
+	// pre-fence operation.
+	h.Store.Fence(err)
+	h.terminalFailureMu.Lock()
+	storage, coherence := h.terminalCallbacksLocked()
+	h.terminalFailureMu.Unlock()
+	h.runTerminalCallbacks(storage, coherence)
+}
+
+func (h *VolumeHandler) recordStorageFailure(err error) {
+	h.deferStorageFailure(nil, err)
+}
+
+func (h *VolumeHandler) retainTerminalReceiptFrameLocked(response *authoritypb.Response) {
+	if response == nil {
+		return
+	}
+	if !terminalReceiptCarriesExactAppliedState(response) {
+		// A direct terminal receipt is meaningful only for a response whose exact
+		// post-apply state the frontend can install and publish. Preserve an
+		// impossible obligation so an accidental caller fails closed at the
+		// bounded terminal timeout instead of silently weakening that contract.
+		if h.terminalResponses == nil {
+			h.terminalResponses = make(map[[16]byte]struct{})
+		}
+		h.terminalResponses[[16]byte{}] = struct{}{}
+		log.Printf("portablefs-authority: refusing terminal receipt for non-postapply response")
+		return
+	}
+	if h.terminalReceiptFrames == nil {
+		h.terminalReceiptFrames = make(map[*authoritypb.Response]struct{})
+	}
+	h.terminalReceiptFrames[response] = struct{}{}
+}
+
+func (h *VolumeHandler) takeTerminalReceiptFrame(response *authoritypb.Response) bool {
+	if h == nil || response == nil {
+		return false
+	}
+	h.terminalFailureMu.Lock()
+	_, retained := h.terminalReceiptFrames[response]
+	delete(h.terminalReceiptFrames, response)
+	h.terminalFailureMu.Unlock()
+	return retained
+}
+
+func terminalReceiptCarriesExactAppliedState(response *authoritypb.Response) bool {
+	if response == nil || response.GetErrno() != 0 || response.GetUncertain() ||
+		!validPostStateShape(response.GetPostState(), true) {
+		return false
+	}
+	target := postStateTargetAttr(response.GetPostState())
+	if target == nil || target.GetKind() != authoritypb.Attr_REGULAR || target.GetSize() < 0 {
+		return false
+	}
+	validError := func(value int32) bool { return value < 0 && value >= -4095 }
+	postSize := uint64(target.GetSize())
+	if reply := response.GetWrite(); reply != nil {
+		return validError(reply.GetError()) && reply.GetPostAttr() != nil && reply.GetPostAttr().GetSize() == int64(postSize)
+	}
+	if reply := response.GetFallocate(); reply != nil {
+		return reply.GetFlags() == rangeReplyApplied|rangeReplyPostApply && reply.GetResultSize() == 0 &&
+			validError(reply.GetError()) && reply.GetVisibilitySequence() > 0 && reply.GetPostSize() == postSize
+	}
+	if reply := response.GetCopyFileRange(); reply != nil {
+		return reply.GetFlags() == rangeReplyApplied|rangeReplyPostApply &&
+			validError(reply.GetError()) && reply.GetVisibilitySequence() > 0 && reply.GetPostSize() == postSize
+	}
+	return false
+}
+
+func (h *VolumeHandler) terminalDeliveryReceipt(requestID uint64, receipt *authoritypb.TerminalDeliveryReceipt) *authoritypb.Response {
+	response := h.success(requestID)
+	response.Body = &authoritypb.Response_TerminalDeliveryReceipt{TerminalDeliveryReceipt: &authoritypb.TerminalDeliveryReceiptReply{}}
+	if receipt == nil || len(receipt.GetToken()) != 16 {
+		response.Errno = int32(syscall.EINVAL)
+		return response
+	}
+	var token [16]byte
+	copy(token[:], receipt.GetToken())
+	if token == ([16]byte{}) {
+		response.Errno = int32(syscall.EINVAL)
+		return response
+	}
+	h.terminalFailureMu.Lock()
+	if _, pending := h.terminalResponses[token]; !pending {
+		h.terminalFailureMu.Unlock()
+		response.Errno = int32(syscall.ESTALE)
+		return response
+	}
+	delete(h.terminalResponses, token)
+	h.terminalFailureMu.Unlock()
+	// This handler itself remains active until its ACK is physically written.
+	// executeTransportTerminalReceipt owns the final endTerminalRequest call.
+	return response
+}
+
+// PrepareResponseWrite runs at the immutable outer response boundary, after a
+// retained outcome has been reconstructed and after visibility COMPLETE. It
+// mints an opaque receipt only for an exact structured post-apply response
+// whose retained replay outcome carries the terminal-delivery bit; body
+// equality can never let an unrelated response consume this obligation.
+func (h *VolumeHandler) PrepareResponseWrite(request *authoritypb.Request, response *authoritypb.Response) {
+	h.prepareResponseWrite(request, response, false)
+}
+
+func (h *VolumeHandler) prepareResponseWrite(request *authoritypb.Request, response *authoritypb.Response, admitted bool) {
+	if h == nil || response == nil {
+		return
+	}
+	h.terminalFailureMu.Lock()
+	if h.terminalForced {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	if h.terminalFrames == nil {
+		h.terminalFrames = make(map[*authoritypb.Response]struct{})
+	}
+	h.terminalFrames[response] = struct{}{}
+	if admitted {
+		if h.terminalAdmittedFrames == nil {
+			h.terminalAdmittedFrames = make(map[*authoritypb.Response]struct{})
+		}
+		h.terminalAdmittedFrames[response] = struct{}{}
+	}
+	if !h.terminalDraining {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	if _, wasAdmitted := h.terminalAdmittedFrames[response]; !wasAdmitted {
+		// A request refused after terminal admission closed carries no applied
+		// state. Track its physical frame if one is attempted, but never mint a
+		// receipt which the already-poisoned frontend cannot owe.
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	if _, receiptRequired := h.terminalReceiptFrames[response]; !receiptRequired {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	if request == nil || request.GetTerminalDeliveryReceipt() != nil || terminalControlRequest(request) {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	if len(response.GetTerminalDeliveryToken()) != 0 {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	if h.terminalResponses == nil {
+		h.terminalResponses = make(map[[16]byte]struct{})
+	}
+	tokenReader := h.terminalTokenReader
+	if tokenReader == nil {
+		tokenReader = rand.Reader
+	}
+	var token [16]byte
+	for {
+		if _, err := io.ReadFull(tokenReader, token[:]); err != nil {
+			// Keep an impossible receipt outstanding so teardown reaches the
+			// bounded terminal timeout instead of silently losing publication
+			// ownership after an entropy-source failure.
+			h.terminalResponses[[16]byte{}] = struct{}{}
+			h.terminalFailureMu.Unlock()
+			return
+		}
+		if token == ([16]byte{}) {
+			continue
+		}
+		if _, collision := h.terminalResponses[token]; collision {
+			continue
+		}
+		break
+	}
+	h.terminalResponses[token] = struct{}{}
+	response.TerminalDeliveryToken = append([]byte(nil), token[:]...)
+	h.terminalFailureMu.Unlock()
+}
+
+// FinishHandlerResponse transfers one admitted handler into an immutable
+// transport-owned delivery obligation. It must run before terminalActive is
+// decremented; otherwise the first terminal response can trigger process stop
+// in the gap before the server registers its token.
+func (h *VolumeHandler) FinishHandlerResponse(request *authoritypb.Request, response *authoritypb.Response) {
+	if h == nil {
+		return
+	}
+	h.terminalFailureMu.Lock()
+	if _, retained := h.terminalHandlerFrames[response]; !retained {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	delete(h.terminalHandlerFrames, response)
+	h.terminalFailureMu.Unlock()
+	h.prepareResponseWrite(request, response, true)
+	h.endTerminalRequest()
+}
+
+// ResponseWritten observes only physical authority frame failures. A success
+// remains pending until the frontend returns TerminalDeliveryReceipt after its
+// kernel publication boundary; a failed frame can never be receipted, so it is
+// retired here and teardown proceeds once every other exact result settles.
+func (h *VolumeHandler) ResponseWritten(response *authoritypb.Response, writeErr error) {
+	if h == nil {
+		return
+	}
+	h.terminalFailureMu.Lock()
+	if _, frame := h.terminalFrames[response]; !frame {
+		h.terminalFailureMu.Unlock()
+		return
+	}
+	delete(h.terminalFrames, response)
+	delete(h.terminalAdmittedFrames, response)
+	delete(h.terminalReceiptFrames, response)
+	if writeErr != nil && len(response.GetTerminalDeliveryToken()) == 16 {
+		var token [16]byte
+		copy(token[:], response.GetTerminalDeliveryToken())
+		delete(h.terminalResponses, token)
+	}
+	storage, coherence := h.terminalCallbacksLocked()
+	h.terminalFailureMu.Unlock()
+	h.runTerminalCallbacks(storage, coherence)
 }
 
 func wireErrno(err error) int32 {
+	// Visibility interruption is a deliberate definite-preapply yield. Keep the
+	// mapping here, at the common error-to-wire boundary, so both ordinary
+	// envelopes and structured WRITE rejections tell Linux EINTR. The latter is
+	// essential when two mounts race on one inode: Linux releases the losing
+	// callback lane and retries after the winner's repair without surfacing a
+	// false EIO to the application.
+	if errors.Is(err, volumeserver.ErrVisibilityInterrupted) || errors.Is(err, volumeserver.ErrVisibilityRetry) {
+		return errnos.EINTR
+	}
+	if errors.Is(err, volumeserver.ErrCompatibilityWriterLease) {
+		return errnos.EBUSY
+	}
 	var errno syscall.Errno
 	if errors.As(err, &errno) && errno > 0 {
 		return int32(errno)
@@ -2325,19 +4590,151 @@ func wireErrno(err error) int32 {
 	return errnos.Of(err)
 }
 
+type sessionResourceSpec struct {
+	credential            volumeserver.SessionCredential
+	id                    volumeserver.SessionID
+	attempt               volumeserver.AttachAttemptID
+	root                  xfsstore.Capability
+	slots                 uint32
+	routes                [32]byte
+	coherence             volumeserver.CoherenceProfile
+	profile               authoritypb.FrontendProfile
+	purpose               authoritypb.SessionPurpose
+	commitment            volumeserver.VisibilityCommitment
+	authorizationDeadline time.Time
+}
+
+func (h *VolumeHandler) ensureProvisionalSessionResources(spec sessionResourceSpec) (*sessionResources, error) {
+	if h.Runtime == nil || spec.credential.ID != spec.id || spec.id == (volumeserver.SessionID{}) || spec.attempt == (volumeserver.AttachAttemptID{}) ||
+		spec.slots == 0 || spec.authorizationDeadline.IsZero() {
+		return nil, volumeserver.ErrRequestMismatch
+	}
+	h.resourcesMu.Lock()
+	if h.resources == nil {
+		h.resources = make(map[volumeserver.SessionID]*sessionResources)
+	}
+	resources := h.resources[spec.id]
+	installed := false
+	if resources != nil {
+		existing := resources
+		if existing.ended || existing.attempt != spec.attempt || existing.root != spec.root ||
+			uint32(len(existing.reply)) != spec.slots || existing.routes != spec.routes ||
+			existing.coherence != spec.coherence || existing.profile != spec.profile || existing.purpose != spec.purpose || existing.commitment != spec.commitment ||
+			!existing.authorizationDeadline.Equal(spec.authorizationDeadline) {
+			h.resourcesMu.Unlock()
+			return nil, volumeserver.ErrRequestMismatch
+		}
+	} else {
+		resources = &sessionResources{
+			attempt: spec.attempt, root: spec.root, items: make(map[xfsstore.Capability]bool),
+			opens: make(map[xfsstore.Capability]bool), reply: make([]uint32, spec.slots),
+			coherence: spec.coherence, profile: spec.profile, commitment: spec.commitment, routes: spec.routes,
+			purpose:               spec.purpose,
+			authorizationDeadline: spec.authorizationDeadline,
+		}
+		h.resources[spec.id] = resources
+		installed = true
+	}
+
+	// PrepareAttach necessarily publishes the runtime session before this
+	// handler can publish its descriptor/replay tables. Reconcile while holding
+	// resourcesMu, immediately after installation: an end hook that ran before
+	// installation is caught by these authoritative runtime facts, while an end
+	// after installation blocks on this mutex and then removes the exact record.
+	// Acquiring the terminal channel before the point state query closes the
+	// state-after-query race; the final nonblocking read covers an end between
+	// those two observations. Runtime end hooks never retain Authority locks
+	// while calling here, so this lock order has no callback cycle.
+	terminal, terminalErr := h.Runtime.SessionTerminal(spec.id)
+	state, stateErr := h.Runtime.SessionState(spec.credential, spec.attempt)
+	reconcileErr := terminalErr
+	if reconcileErr == nil {
+		reconcileErr = stateErr
+	}
+	if reconcileErr == nil {
+		switch state {
+		case volumeserver.SessionStateProvisional:
+		case volumeserver.SessionStateActive:
+			// ACTIVE is valid only for an exact Attach replay after another
+			// delivery returned the provisional credential and completed Activate.
+			// A first resource installation cannot be reached in that order.
+			if installed {
+				reconcileErr = volumeserver.ErrSessionFenced
+			}
+		case volumeserver.SessionStateAborted:
+			reconcileErr = volumeserver.ErrSessionExpired
+		default:
+			reconcileErr = volumeserver.ErrSessionFenced
+		}
+	}
+	if reconcileErr == nil {
+		select {
+		case <-terminal:
+			reconcileErr = volumeserver.ErrSessionExpired
+		default:
+		}
+	}
+	if reconcileErr != nil {
+		cleanup, taken := h.takeSessionResourcesLocked(spec.id, resources)
+		h.resourcesMu.Unlock()
+		if taken {
+			h.finishSessionResourceCleanup(cleanup)
+		}
+		return nil, reconcileErr
+	}
+	h.resourcesMu.Unlock()
+	return resources, nil
+}
+
+func (h *VolumeHandler) sessionResources(id volumeserver.SessionID) (*sessionResources, error) {
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	resources := h.resources[id]
+	if resources == nil || resources.ended {
+		return nil, volumeserver.ErrSessionExpired
+	}
+	return resources, nil
+}
+
+func (h *VolumeHandler) exactSessionResources(id volumeserver.SessionID, attempt volumeserver.AttachAttemptID) (*sessionResources, error) {
+	resources, err := h.sessionResources(id)
+	if err != nil {
+		return nil, err
+	}
+	if resources.attempt != attempt {
+		return nil, volumeserver.ErrRequestMismatch
+	}
+	return resources, nil
+}
+
+// startSessionResources is the direct-runtime Linux-profile test helper.
 func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID, root xfsstore.Capability, slots uint32, routes [32]byte, profiles ...volumeserver.CoherenceProfile) error {
-	profile := volumeserver.CoherenceUncached
+	profile := volumeserver.CoherenceStrict
 	if len(profiles) == 1 {
 		profile = profiles[0]
 	} else if len(profiles) > 1 {
 		return volumeserver.ErrVisibilityProfile
 	}
+	if profile != volumeserver.CoherenceStrict {
+		return volumeserver.ErrVisibilityProfile
+	}
+	return h.startSessionResourcesForProfile(id, root, slots, routes, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES)
+}
+
+// startSessionResourcesForProfile exists only for direct-runtime tests that do
+// not run the Attach/Activate transaction. It preserves the production profile
+// split: Linux sessions enter the lease table; FSKit sessions do not.
+func (h *VolumeHandler) startSessionResourcesForProfile(id volumeserver.SessionID, root xfsstore.Capability, slots uint32, routes [32]byte, frontend authoritypb.FrontendProfile) error {
+	if frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
+		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		return volumeserver.ErrVisibilityProfile
+	}
 	h.resourcesMu.Lock()
-	defer h.resourcesMu.Unlock()
 	if h.resources == nil {
 		h.resources = make(map[volumeserver.SessionID]*sessionResources)
 	}
 	if _, exists := h.resources[id]; exists {
+		h.resourcesMu.Unlock()
 		return volumeserver.ErrAdmission
 	}
 	h.resources[id] = &sessionResources{
@@ -2345,10 +4742,31 @@ func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID, root xf
 		items:     make(map[xfsstore.Capability]bool),
 		opens:     make(map[xfsstore.Capability]bool),
 		reply:     make([]uint32, slots),
-		coherence: profile,
+		coherence: volumeserver.CoherenceStrict,
+		profile:   frontend,
+		purpose:   authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 		routes:    routes,
 	}
+	h.resourcesMu.Unlock()
+	if frontend == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && h.Leases != nil {
+		if err := h.Leases.ActivateHolder(id, make(chan struct{})); err != nil {
+			h.resourcesMu.Lock()
+			delete(h.resources, id)
+			h.resourcesMu.Unlock()
+			return err
+		}
+	}
 	return nil
+}
+
+func (h *VolumeHandler) sessionFrontendProfile(id volumeserver.SessionID) (authoritypb.FrontendProfile, error) {
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	resources := h.resources[id]
+	if resources == nil || resources.ended {
+		return authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED, volumeserver.ErrSessionExpired
+	}
+	return resources.profile, nil
 }
 
 func (h *VolumeHandler) sessionCoherence(id volumeserver.SessionID) (volumeserver.CoherenceProfile, error) {
@@ -2359,6 +4777,16 @@ func (h *VolumeHandler) sessionCoherence(id volumeserver.SessionID) (volumeserve
 		return 0, volumeserver.ErrSessionExpired
 	}
 	return resources.coherence, nil
+}
+
+func (h *VolumeHandler) sessionPurpose(id volumeserver.SessionID) (authoritypb.SessionPurpose, error) {
+	h.resourcesMu.Lock()
+	defer h.resourcesMu.Unlock()
+	resources := h.resources[id]
+	if resources == nil || resources.ended {
+		return authoritypb.SessionPurpose_SESSION_PURPOSE_UNSPECIFIED, volumeserver.ErrSessionExpired
+	}
+	return resources.purpose, nil
 }
 
 func (h *VolumeHandler) strictSession(id volumeserver.SessionID) bool {
@@ -2382,33 +4810,6 @@ func (h *VolumeHandler) lookupCoordinate(parent xfsstore.Capability, name []byte
 	return attrCoordinate(identity, attr), true, nil
 }
 
-func (h *VolumeHandler) lookupCoordinateOptional(parent xfsstore.Capability, name []byte) (visibilityCoordinate, bool, error) {
-	coordinate, found, err := h.lookupCoordinate(parent, name)
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
-		return visibilityCoordinate{}, false, nil
-	}
-	return coordinate, found, err
-}
-
-func (h *VolumeHandler) lookupCoordinateSizeOptional(parent xfsstore.Capability, name []byte) (visibilityCoordinate, int64, bool, error) {
-	item, attr, err := h.Store.Lookup(parent, string(name))
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
-		return visibilityCoordinate{}, 0, false, nil
-	}
-	if err != nil {
-		return visibilityCoordinate{}, 0, false, err
-	}
-	identity, identityErr := h.Store.Identity(item)
-	forgetErr := h.Store.Forget(item)
-	if identityErr != nil {
-		return visibilityCoordinate{}, 0, false, identityErr
-	}
-	if forgetErr != nil {
-		return visibilityCoordinate{}, 0, false, forgetErr
-	}
-	return attrCoordinate(identity, attr), attr.Size, true, nil
-}
-
 func linkVisibilityTargets(
 	newName []byte,
 	parent, source visibilityCoordinate,
@@ -2428,14 +4829,16 @@ func linkVisibilityTargets(
 func renameVisibilityTargets(
 	rename *authoritypb.RenameRequest,
 	oldParent, newParent, moved, replaced visibilityCoordinate,
-	hasReplacement, attestPostBindings bool,
+	hasReplacement bool,
+	oldPost visibilityCoordinate,
+	hasOldPost, attestPostBindings bool,
 ) []volumeserver.VisibilityTarget {
 	oldNameTarget := namespaceTargetRelated(oldParent, rename.GetOldName(), moved)
 	newNameTarget := namespaceTargetRelated(newParent, rename.GetNewName(), moved)
 	if attestPostBindings {
 		newNameTarget = namespaceTargetPost(newParent, rename.GetNewName(), moved)
-		if rename.GetExchange() && hasReplacement {
-			oldNameTarget = namespaceTargetPost(oldParent, rename.GetOldName(), replaced)
+		if hasOldPost {
+			oldNameTarget = namespaceTargetPost(oldParent, rename.GetOldName(), oldPost)
 		}
 	}
 	if hasReplacement {
@@ -2488,7 +4891,11 @@ func (h *VolumeHandler) reserveCapabilities(id volumeserver.SessionID, items, op
 		uint64(h.totalItems)+uint64(items) > uint64(h.MaxItems) ||
 		uint64(len(resources.opens))+uint64(resources.reservedOpens)+uint64(opens) > uint64(h.MaxOpensPerSession) ||
 		uint64(h.totalOpens)+uint64(opens) > uint64(h.MaxOpens):
-		return nil, volumeserver.ErrAdmission
+		// These are descriptor tables, not a transient execution queue. Waiting
+		// would let lookup/readdir storms pin workers, while EAGAIN is not a legal
+		// blocking pathname result. ENFILE reports the exhausted authority-managed
+		// file table without pretending the caller's own descriptor limit was hit.
+		return nil, errCapabilityTableFull
 	}
 	resources.reservedItems += items
 	resources.reservedOpens += opens
@@ -2554,6 +4961,9 @@ func (r *capabilityReservation) commit(items, opens []trackedCapability) error {
 			resources.opens[open.value] = open.protected
 		}
 	}
+	if r.h.Metrics != nil {
+		r.h.Metrics.ObserveSessionItems(len(resources.items))
+	}
 	r.active = false
 	return nil
 }
@@ -2572,9 +4982,12 @@ func (h *VolumeHandler) trackItem(id volumeserver.SessionID, item xfsstore.Capab
 	case alreadyTracked:
 		resources.items[item] = resources.items[item] || protected
 	case uint64(len(resources.items))+uint64(resources.reservedItems) >= uint64(h.MaxItemsPerSession) || h.totalItems >= h.MaxItems:
-		err = volumeserver.ErrAdmission
+		err = errCapabilityTableFull
 	default:
 		trackCapability(resources.items, item, protected, &h.totalItems)
+		if h.Metrics != nil {
+			h.Metrics.ObserveSessionItems(len(resources.items))
+		}
 	}
 	h.resourcesMu.Unlock()
 	if err != nil {
@@ -2605,7 +5018,7 @@ func (h *VolumeHandler) trackOpen(id volumeserver.SessionID, handle xfsstore.Cap
 	case alreadyTracked:
 		resources.opens[handle] = resources.opens[handle] || protected
 	case uint64(len(resources.opens))+uint64(resources.reservedOpens) >= uint64(h.MaxOpensPerSession) || h.totalOpens >= h.MaxOpens:
-		err = volumeserver.ErrAdmission
+		err = errCapabilityTableFull
 	default:
 		trackCapability(resources.opens, handle, protected, &h.totalOpens)
 	}
@@ -2624,14 +5037,25 @@ func (h *VolumeHandler) untrackOpen(id volumeserver.SessionID, handle xfsstore.C
 	h.resourcesMu.Unlock()
 }
 
-func (h *VolumeHandler) closeSessionResources(id volumeserver.SessionID) {
-	h.resourcesMu.Lock()
+type sessionResourceCleanup struct {
+	handles     []xfsstore.Capability
+	items       []xfsstore.Capability
+	fskitWrites []fskitWriteCleanup
+}
+
+// takeSessionResourcesLocked transfers cleanup ownership for the exact record.
+// expected may be nil only for the runtime's authoritative by-ID end hook; a
+// reconciler always supplies its pointer so a stale observation cannot erase a
+// newer exact-replay record.
+func (h *VolumeHandler) takeSessionResourcesLocked(id volumeserver.SessionID, expected *sessionResources) (sessionResourceCleanup, bool) {
 	resources := h.resources[id]
-	if resources == nil || resources.ended {
-		h.resourcesMu.Unlock()
-		return
+	if resources == nil || resources.ended || expected != nil && resources != expected {
+		return sessionResourceCleanup{}, false
 	}
 	resources.ended = true
+	h.endWriteAdmission(resources)
+	h.endFskitWriteCapacityWaits(resources)
+	fskitWrites := closeFskitWrites(h, resources)
 	handles := make([]xfsstore.Capability, 0, len(resources.opens))
 	for handle := range resources.opens {
 		handles = append(handles, handle)
@@ -2653,18 +5077,33 @@ func (h *VolumeHandler) closeSessionResources(id volumeserver.SessionID) {
 	resources.reservedItems = 0
 	resources.reservedOpens = 0
 	resources.reply = nil
-	h.resourcesMu.Unlock()
-	for _, handle := range handles {
+	delete(h.resources, id)
+	return sessionResourceCleanup{handles: handles, items: items, fskitWrites: fskitWrites}, true
+}
+
+func (h *VolumeHandler) finishSessionResourceCleanup(cleanup sessionResourceCleanup) {
+	for _, write := range cleanup.fskitWrites {
+		write.finish()
+	}
+	for _, handle := range cleanup.handles {
 		h.closeOpen(handle)
 	}
-	for _, item := range items {
+	for _, item := range cleanup.items {
 		h.forgetItem(item)
 	}
+}
+
+func (h *VolumeHandler) closeExactSessionResources(id volumeserver.SessionID, expected *sessionResources) {
 	h.resourcesMu.Lock()
-	if h.resources[id] == resources {
-		delete(h.resources, id)
-	}
+	cleanup, taken := h.takeSessionResourcesLocked(id, expected)
 	h.resourcesMu.Unlock()
+	if taken {
+		h.finishSessionResourceCleanup(cleanup)
+	}
+}
+
+func (h *VolumeHandler) closeSessionResources(id volumeserver.SessionID) {
+	h.closeExactSessionResources(id, nil)
 }
 
 func (h *VolumeHandler) closeOpen(handle xfsstore.Capability) {

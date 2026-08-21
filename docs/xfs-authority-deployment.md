@@ -23,16 +23,15 @@ Two things an operator has to decide or accept before deploying:
   and systemd templates; see
   [hosted-control-plane.md](./hosted-control-plane.md) and
   [hosted-cell-deployment.md](./hosted-cell-deployment.md).
-- **Clean strict detach trusts the official mount supervisor.** The authority
-  accepts a terminal-mount observation only on the authenticated request for
-  that exact session. A missing or failed observation keeps durable membership
-  active. See [Clean detach](#clean-detach) and [Restarting the
-  authority](#restarting-the-authority).
+- **Lease recovery is TTL-bounded.** Clean detach returns leases immediately.
+  After an unclean stop, the authority waits the maximum lease TTL plus clock
+  skew before admitting conflicting mutations. See [Clean detach](#clean-detach)
+  and [Restarting the authority](#restarting-the-authority).
 
 ## Host and disk
 
-Use a current Nitro EC2 instance on a supported Linux baseline (6.12 or newer
-for the complete tested syscall and FUSE contract). Attach a dedicated,
+Use a current Nitro EC2 instance on a supported Linux baseline with stock FUSE
+protocol 7.31 or newer (Linux 5.10 is the product floor). Attach a dedicated,
 encrypted EBS data volume with `DeleteOnTermination=false`. Choose gp3 or io2
 from measured IOPS, throughput, latency, and durability requirements; the
 architecture does not impose one capacity tier. Do not use EBS Multi-Attach: two
@@ -120,6 +119,12 @@ The script refuses rather than repairs. It requires:
    lives there — beside the volumes but outside the user-visible project
    directory, so an authority restart cannot forget a still-mounted kernel while
    agents can never reach or mutate the record through PortableFS.
+6. **Creates private transactional-write staging.** The 0700
+   `<mount>/.portablefs-control/<volume-name>/write-staging` directory is owned by
+   the service identity, carries the volume's exact XFS project ID and
+   `PROJINHERIT`, and remains outside the served namespace. Unnamed O_TMPFILE
+   staging therefore consumes the same hard quota as visible volume data rather
+   than becoming an unbounded cell-wide side channel.
 
 On success it prints the destination, project, owner, limits, and the exact
 membership path to pass to the authority.
@@ -153,6 +158,7 @@ optimization.
 ```bash
 portablefs-authority \
   --listen 0.0.0.0:7443 \
+  --admin-listen 127.0.0.1:7444 \
   --volume-id vol_01JXYZ \
   --root /srv/portablefs/vol_01JXYZ \
   --project-id 42001 \
@@ -162,13 +168,16 @@ portablefs-authority \
   --capability-public-key /run/portablefs/capability-public.pem \
   --visibility-membership-file \
     /srv/portablefs/.portablefs-control/vol_01JXYZ/strict-membership \
+  --write-staging-dir \
+    /srv/portablefs/.portablefs-control/vol_01JXYZ/write-staging \
   --max-sessions 1024 \
+  --max-connections 4096 \
   --max-lock-records 65536
 ```
 
 ### Required flags
 
-All nine are mandatory and startup refuses without them.
+All ten are mandatory and startup refuses without them.
 
 | Flag | Meaning |
 | --- | --- |
@@ -180,18 +189,36 @@ All nine are mandatory and startup refuses without them.
 | `--tls-key` | server private key PEM; must be a regular file unreadable by group and other, opened `O_NOFOLLOW` |
 | `--client-ca` | client CA bundle PEM |
 | `--capability-public-key` | one `PUBLIC KEY` PEM block holding an Ed25519 key; anything else is refused |
-| `--visibility-membership-file` | absolute durable strict-mount membership file |
+| `--visibility-membership-file` | legacy-named durable session audit file; it is not a cache-coherence mechanism in protocol 6 |
+| `--write-staging-dir` | private 0700 directory for unnamed transactional-write staging; the provisioner places it outside the served namespace under the volume's XFS project quota |
 
-### Coherence and mount-lifecycle flags
+### Coherence and mount-lifecycle bounds
 
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--prior-strict-mounts-fenced` | `false` | operator assertion that every recorded prior strict kernel mount was proven unusable |
-| `--capability-max-lifetime` | `15m` | longest signed grant window the authority will honour; keepalive cannot extend it, while hosted reauthorization requires a fresh grant |
-| `--session-lease` | `2m` | renewable session lease |
-| `--max-repair-budget` | `30s` | longest per-phase cache-repair deadline a strict mount may commit to before it is fenced. Must be at least the mount's own `--repair-budget`, whose default is `15s`. |
-| `--visibility-clock-skew` | `5s` | clock disagreement tolerated when a mount timestamps its own kernel-mount absence |
-| `--max-cached-name-capacity` | `65536` | largest kernel-cache bound a strict mount may declare; sizes the per-session resolved index |
+Protocol 6 bounds session authorization, session liveness, lease TTL, clock
+skew, recall discharge, and the number of outstanding grants. Pin them
+explicitly in production. A lease TTL is permission to cache, not a mutation
+lease; every mutation remains write-through. The recall budget must be shorter
+than the lease-expiry bound so a nonresponsive holder is fenced before the
+authority relies on expiry. Exact flag names and defaults are printed by the
+deployed protocol-6 authority and must be reviewed with its release manifest.
+
+### Admin listener
+
+`--admin-listen` defaults to `127.0.0.1:7444` and serves plaintext HTTP for
+the node-local monitoring agent. It is a separate listener from the mutually
+authenticated TLS data plane. Keep it on loopback or behind an authenticated
+host-local proxy; the endpoint itself has no authentication layer and must not
+be exposed to an untrusted network. Give each worker a distinct admin address
+when several volume workers share one host.
+
+The worker binds both listeners before it begins serving. An unavailable admin
+address is therefore a startup failure, just like an unavailable authority
+address: running without the declared monitoring surface would make a fresh
+deployment deceptively healthy. An unexpected admin HTTP failure after a
+successful bind is different. It is logged as `event=admin_listener_failed`
+and does not stop the data plane; alert on the missing scrape and repair the
+monitoring path without turning an observability fault into a filesystem
+outage.
 
 ### Deployment-sized bounds
 
@@ -208,13 +235,15 @@ the worker class and workload measurements.
 | `--max-sessions` | `1024` |
 | `--max-lock-records` | `65536` |
 | `--max-items` | `65536` |
-| `--max-items-per-session` | `8192` |
+| `--max-items-per-session` | `65536` |
 | `--max-opens` | `32768` |
 | `--max-opens-per-session` | `4096` |
 | `--max-retained-reply-bytes` | `512 MiB` |
 | `--max-frame-bytes-in-flight` | `512 MiB` |
 | `--max-in-flight` | `256` |
-| `--max-connections` | `2048` |
+| `--max-write-transactions` | `4096` |
+| `--max-write-transactions-per-session` | effective `--max-in-flight`, capped by `--max-write-transactions` (`256` with stock defaults) |
+| `--max-connections` | `4096` |
 | `--capability-nonce-records` | `65536` |
 | `--tls-handshake-timeout` | `10s` |
 | `--connection-idle-timeout` | `5m` |
@@ -225,56 +254,42 @@ must leave a fixed reserve around each read/write payload, `--max-retained-reply
 must admit at least one maximal reply, `--max-frame-bytes-in-flight` must admit at
 least one maximal request, `--connection-idle-timeout` must exceed `--session-lease`,
 and `--max-in-flight` must be at least 2 so an ordinary request can proceed
-alongside a blocking lock wait.
+alongside a blocking lock wait. Protocol 6 also requires `--max-connections` to
+be at least four times `--max-sessions`: two slots hold each mount's current
+DATA and CONTROL lanes, while exact pair recovery must authenticate both
+candidate roles before either old generation can be retired. The authority
+refuses startup when that invariant is false; neither the old 2048-connection
+default nor a 3072 three-slot configuration can recover every saturated mount
+without waiting for an old connection to time out.
+
+Protocol-6 frames account protobuf metadata and the one optional bulk body
+together against both `--max-frame-bytes` and
+`--max-frame-bytes-in-flight`. The inbound reservation remains charged while a
+handler references the body and is released only after that handler returns.
+An out-of-line body on a message that does not declare one closes the connection
+as malformed.
 
 ### Clean detach
 
-The authority cannot inspect a remote kernel. PortableFS therefore makes the
-trust boundary explicit: the official mount supervisor is trusted to report its
-own completed teardown, and the authority accepts that report only through the
-current session credential bound to the authenticated peer. A request has no
-field with which it can select another session.
+The Linux supervisor first closes request admission, drains in-flight work,
+returns every lease, closes the FUSE connection, verifies the recorded mount ID
+is gone from `/proc/self/mountinfo`, and sends authenticated detach for that
+exact session. A lazy detach with retained references is not clean while its
+serve loop remains capable of answering.
 
-The report is produced after platform-specific terminal conditions:
-
-- macOS `portablefsd` unmounts the exact FSKit attach reference and re-reads
-  `getfsstat`; an unreadable table or a remaining/mismatched mount refuses the
-  report.
-- Linux requires the recorded mount ID to disappear from `/proc/self/mountinfo`
-  and the exact go-fuse serve loop to finish. This matters because `MNT_DETACH`
-  may hide a mount while a retained file or working directory keeps its FUSE
-  connection alive. If `fusermount3` fails before there is a mount ID, the
-  supervisor instead scans the complete mount table for that attempt's random
-  FUSE source. It reports clean detach only when the source is absent and no
-  serving loop remains capable of installing or serving it.
-
-Only then does the authority remove that exact participant and durably
-deactivate its membership. No independent host-attestation daemon or verifier
-command is involved. A compromised supervisor could lie; PortableFS's client
-model is cooperative, not Byzantine. A process crash, unavailable mount table,
-live connection, rejected request, or network loss sends no successful report
-and leaves membership active for explicit fencing.
+If any step fails, the supervisor does not invent success. The authority fences
+the session and relies on lease expiry before conflicting work proceeds. The
+client model is cooperative rather than Byzantine: the authority authenticates
+which session reported detach but cannot independently inspect a remote kernel.
 
 ### Restarting the authority
 
-The membership file contains only active strict mount-session identifiers. It is
-not filesystem content or operation history. Startup proceeds only when the
-record is empty or when every recorded prior strict mount has been cleared.
-
-If the previous process stopped with recorded strict mounts, the new process
-refuses to serve: `prior strict mounts remain active; fence their kernel mounts
-before starting a new authority epoch`. Recovery is to prove each exact kernel
-mount absent — or fence its host — and only then start once with
-`--prior-strict-mounts-fenced`. The assertion is unverified and it is the only
-input that can erase this authority's memory of an unsafe mount, so it is
-durably audited inside the membership record and also printed to stderr:
-
-```text
-portablefs-authority: operator asserted prior strict mount <id> fenced; cleared from durable membership for volume <volume>
-```
-
-Never set the flag merely because the authority process or a network connection
-stopped.
+The v1 lease table is volatile. A restarted authority creates a new epoch,
+refuses old sessions, and holds a grace period for the configured conservative
+maximum lease-expiry bound before admitting any mutation that could conflict
+with an unknown prior lease. Do not shorten or bypass this grace merely because the
+old authority process is gone. Fencing a host can make the old cache unservable,
+but it does not rewrite the configured lease bound.
 
 ### Service hardening
 
@@ -287,8 +302,8 @@ not expose the raw XFS mount to agent machines or containers.
 Note one launch restriction that surprises operators: **user-xattr writes are
 disabled.** XFS does not charge attribute-fork blocks to a project, so per-inode
 RPC limits cannot isolate a shared cell, and a separate logical counter would
-not be crash-atomic with XFS. Because authority protocol v3 requires the exact
-`user-xattr-readonly` feature at Attach, the Linux frontend validates the FUSE
+not be crash-atomic with XFS. Because authority protocol v5 requires the exact
+`user-xattr-readonly` feature at Activate, the Linux frontend validates the FUSE
 flags and returns `EOPNOTSUPP` locally without spending an authority RPC, replay
 sequence, or visibility transition. Direct authority requests receive the same
 answer. Read, list, and removal remain available for pre-existing portable user
@@ -312,7 +327,9 @@ A mount presents two independent credentials, and the authority requires both.
 
 **Transport identity.** Sessions are mutual TLS 1.3 with
 `RequireAndVerifyClientCert` against `--client-ca`, and ALPN
-`portablefs-authority-v3`. Plaintext cannot mount.
+`portablefs-authority-v6`. Plaintext cannot mount. Every active session owns one
+DATA and one CONTROL connection in the same authenticated connection set; a
+single transport cannot attach active and there is no older-protocol path.
 
 **A mount capability.** A capability is an Ed25519-signed token of the form
 `v1.<base64url payload>.<base64url signature>`, signed over a domain-separated
@@ -369,8 +386,9 @@ per-mount owner uses an enrollment to obtain exact, short-lived in-session
 reauthorizations without keeping the original product assertion alive. The
 manager does not authenticate end users itself; it verifies the product's
 signed authorization at enrollment creation. See
-[hosted-control-plane.md](./hosted-control-plane.md). A standalone mount still
-ends at its initial capability's deadline.
+[hosted-control-plane.md](./hosted-control-plane.md). A standalone mount has no
+manager to ask, so it renews from the credential file its own issuer rotates:
+see [Renewing a standalone mount](#renewing-a-standalone-mount).
 
 ## Mounting from Linux
 
@@ -396,11 +414,15 @@ required and must be `tls-private-ca` (with `--data-plane-server-name` and
 `plaintext` is refused with the reason named. `--client-key` must be mode 0600.
 Store the token and key in ordinary `0600` files.
 
-`--coherence` picks the kernel cache contract: `strict` (default — names and
-attributes are cached and repaired through the authority's synchronous
-visibility barrier) or `uncached` (cache nothing; Linux only). `--foreground`
-stays attached and unmounts on Ctrl-C. `--branch` and `--fast` are retired and
-passing either is an error.
+Protocol 6 has one lease-coherence contract. Every cacheable name, attribute,
+clean-data, or directory-enumeration answer requires an N/A/D/E lease. A
+conflicting mutation recalls peer leases and waits for discharge before the
+mutating syscall returns. The source response is the publication boundary;
+there is no private kernel publication message.
+`--coherence uncached` is retired and rejected before Attach; it is never an
+alias for `strict` and never selects a fallback. `--foreground` stays attached
+and unmounts on Ctrl-C. `--branch` and `--fast` are also retired and passing any
+of these retired options is an error.
 
 Machine-local directories are declared volume-wide in `.portablefs/local-dirs`,
 not per mount. `--local-dir` is refused unconditionally, because a route only
@@ -425,27 +447,74 @@ portablefs-mount-v3 \
 ```
 
 All eight of those are required. Notable optional flags are `--coherence`
-(`strict` default, or `uncached`), `--cached-name-capacity` (default `65536`),
-`--repair-budget` (default `15s`, and the authority's `--max-repair-budget` must
-be at least this), `--max-in-flight` (`128`), `--max-background` (`128`),
+(`strict` is the only accepted value), `--cached-name-capacity` (default
+`65536`), `--repair-budget` (default `15s`, and the authority's
+`--max-repair-budget` must be at least this), `--max-in-flight` (`128`),
+`--max-background` (`128`),
 `--reclaim-queue` (`4096`), `--dial-timeout` (`10s`), `--cancel-drain-timeout`
 (`10s`), `--request-timeout` (`45s`), `--local-backing`, and `--no-local-dirs`.
 `--local-dir` exists only to be refused with an explanation. The mountpoint must
 be a clean absolute path naming a real, empty directory that is not a symlink.
 
+### Renewing a standalone mount
+
+A capability is short lived and the authority bounds it further with
+`--capability-max-lifetime`. Session keepalive never extends a signed
+authorization deadline; only a new session-bound signed authorization does. A
+mount that never gets one is fenced when its deadline passes, and every open
+file under it fails.
+
+`portablefs-mount-v3` therefore renews from `--access-token-file`, the same file
+it attached with. There is no second flag and no second credential path: the
+issuer that minted the attach capability rotates the file in place, and the
+mount picks it up. Renewal is always running, so there is no configuration in
+which it is off.
+
+A reauthorization capability is bound to one session and one exact sequence, so
+the mount publishes both. At mount time it logs
+
+```
+authorization session <id> expires <RFC3339>; write the capability for sequence 1
+of this session to /run/portablefs/access.token to extend it
+```
+
+and after each renewal it logs the next sequence and the new deadline. Mint the
+replacement with `volumecap.Sign`, setting `session_id` and `sequence` to the
+logged values, the same `volume_id` and `peer_spki_sha256` as the attach
+capability, and access no broader than the mount already holds — the authority
+fences a session that is offered more access than it holds, and the mount
+refuses to present such a capability rather than provoke that. Replace the file
+atomically (write a sibling, then `rename`); mode `0600` is enforced on every
+read, as it is at startup.
+
+Rotation is the operator's only obligation and failing to meet it is safe. The
+mount retries with backoff, and if no usable capability appears before a safety
+margin ahead of the deadline it unmounts itself while its current authorization
+is still valid. That is the same fail-closed end state as having no renewal at
+all, reached slightly earlier and as an orderly unmount rather than as
+`ESTALE` in the middle of application I/O. The margin is a tenth of the
+authorization window, at least five seconds and at most a minute.
+
+Access may narrow across renewals and never broadens: a mount can be demoted to
+read-only by rotating in a narrower capability, and the narrowed access becomes
+the ceiling for every later renewal.
+
+The mutual-TLS client identity is not renewed this way. The capability is bound
+to that key, so `--tls-cert` must outlive the mount.
+
 ### What the Linux mount does and does not promise
 
-The exact Linux mount uses direct I/O and does not advertise shared file-backed
-`mmap`. It does not fall back to incoherent page caching. Process-local
-`MAP_PRIVATE` mappings retain their ordinary copy-on-write semantics. Workloads
-that require `MAP_SHARED` remain outside the launch compatibility contract until
-a synchronous lease/invalidation design is implemented and proven.
+Write-capable Linux opens use direct I/O. Read-only opens may retain clean
+kernel pages under D leases. Shared writable file-backed `mmap` is refused;
+read-only and `MAP_PRIVATE` mappings use the clean-data regime. There is no
+incoherent page-cache fallback.
 
 There is no write-back cache: `write(2)` returns after the authority has applied
 the bytes to XFS, and `fsync` waits for the authoritative server descriptor. Use
 `fsync`/`fdatasync` on files and `fsync` on changed parent directories for
-durability. Linux currently does not forward `syncfs(2)` to ordinary FUSE
-userspace servers, so it is not a remote durability boundary for this mount.
+targeted durability. FUSE SYNCFS is used when the stock kernel advertises it.
+The 7.31 floor predates that request, so PortableFS does not claim a remote
+volume `syncfs(2)` barrier on every supported kernel and does not emulate one.
 
 SQLite is verified in rollback-journal mode. WAL mode is outside the
 multi-machine contract because SQLite's wal-index requires shared memory among
@@ -459,9 +528,12 @@ and nothing is replayed — `--force` simply gives up on proving the drain.
 
 ## Mounting from macOS
 
-macOS mounts through the PortableFS FSKit extension. There is one transport per
-platform and no fallback: a host that cannot serve its platform's transport
-fails with guidance rather than degrading to a weaker consistency model.
+The shipping macOS build refuses protocol-6 FSKit mounting before it
+constructs an authority transport or sends Attach. Current public FSKit has no
+exact peer namespace/attribute invalidation primitive, and the macOS 26 callback
+result shapes cannot publish the complete post-mutation attributes required by
+the lease-discharge contract. This is a production admission decision, not a
+runtime feature flag: there is no opt-in, `uncached` mode, or fallback.
 
 1. Install PortableFS.app from the notarized release (see
    [release-identity.md](./release-identity.md)).
@@ -469,26 +541,34 @@ fails with guidance rather than degrading to a weaker consistency model.
    General -> Login Items & Extensions -> File System Extensions. This is an
    interactive user-controlled toggle and is deliberately not automatable. The
    app never claims the toggle is on; only a successful mount verifies it.
-3. Mount with the same `portablefs mount` command shape as Linux.
+3. Do not issue a production mount until a release explicitly qualifies the
+   native FSKit repair contract. The current daemon returns the admission error
+   without opening an authority session.
 
-The CLI manages the `portablefsd` daemon, which owns the authority session.
+The host's launchd-managed `portablefsd` owns the authority session; the CLI
+adopts it through the external owner-private control socket or wakes the exact
+containing app through NSWorkspace.
+An NSWorkspace callback timeout is an ambiguous request outcome, not a failed
+or successful daemon launch. The CLI proceeds only to a bounded exact control
+socket and release-identity proof; an explicit callback error still fails. The
+native bridge issues the request only from the process main thread and pumps
+that thread's RunLoop until the callback or timeout. A wrong-thread call is a
+definite pre-request refusal, never launch ambiguity.
 Authority TLS credentials and replay secrets never cross the local frontend
-socket to the extension. The daemon is always the exact `portablefsd` sibling
-from the same installed release; `PORTABLEFS_FSKIT_DAEMON` is rejected.
-`PORTABLEFS_FSKIT_SOCKET` and `PORTABLEFS_FSKIT_CONTROL_SOCKET` may override the
-daemon sockets explicitly, and `PORTABLEFS_FSKIT_TYPE` may only assert the
-signed release type.
+socket to the extension. The daemon is always the exact `portablefsd` inside
+the sealed `PortableFSDService.app` from the same installed release;
+`PORTABLEFS_FSKIT_DAEMON` is rejected. The
+frontend sockets are fixed by the release's signed app-group identity and the
+control socket is fixed under canonical account state, so
+`PORTABLEFS_FSKIT_SOCKET` and `PORTABLEFS_FSKIT_CONTROL_SOCKET` are rejected.
+`PORTABLEFS_FSKIT_TYPE` may only assert the signed release type.
 
-Two current macOS restrictions:
-
-- `--coherence uncached` is Linux only.
-- macOS does not yet join the route adoption protocol, so a volume that declares
-  machine-local routes mounts from Linux.
-
-The macOS coherence policy that ships today is an explicitly declared
-compatibility policy with open live-kernel gates. Read
-[macos-26-coherence-contract.md](./macos-26-coherence-contract.md) before
-treating a macOS mount as equivalent to a Linux one.
+A separately build-stamped qualification artifact may exercise the candidate
+native-revocation policy and remains fail-closed on any unrepresentable repair;
+it is not a shipping compatibility path. macOS also does not yet join the route
+adoption protocol. Read
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md) for the live
+evidence and remaining platform gates.
 
 ## Verifying cross-mount coherence
 
@@ -582,9 +662,82 @@ namespace — there is nothing to expose, because v3 keeps no history.
 
 ## Monitoring
 
-Monitor EBS status, queue/latency/throughput, filesystem free space and inodes,
-project quota headroom, authority restarts, TLS and capability rejection,
-session count, open descriptors, request latency and error codes, and backup
-restore age. Two log lines deserve alerts of their own: `refused strict attach`
-(a mount declared a bound this authority will not accept) and `fenced strict
-mount` (a mount left the visibility barrier).
+Scrape `http://127.0.0.1:7444/metrics` in Prometheus text exposition format.
+The admin listener also serves:
+
+- `GET /healthz`: HTTP 200 while the process and admin HTTP server are live. It
+  deliberately says nothing about whether the worker can serve filesystem
+  requests.
+- `GET /readyz`: HTTP 200 only while the validated TLS accept loop is active,
+  the volume remains open and unfenced, and a fresh `statx` through the already
+  open authoritative XFS root descriptor succeeds. It returns 503 during
+  startup, shutdown, and after a terminal storage fence. The probe never
+  re-resolves the configured root path.
+
+Every series has the bounded `volume` label. RPC series use a closed opcode
+set; write transactions are split into `write_transaction_begin`, `_data`,
+`_commit`, and `_abort`, because those phases have different load and failure
+profiles. `portablefs_authority_rpc_requests_total` adds one closed `outcome`
+label: `success`, `not_found`, `permission`, `stale`, `invalid`, `saturation`,
+`unsupported`, `conflict`, `canceled`, `storage`, `internal`, `coherence`,
+`routes`, `visibility_interrupted`, `visibility_retry`, `io`, or `other`.
+The storage, internal, coherence, routes, and visibility values come from the
+protocol's explicit failure class; the remaining values group Linux wire
+errnos. No peer-controlled string or numeric request ID becomes a metric
+label.
+
+| Metric | Operational question |
+| --- | --- |
+| `portablefs_authority_rpc_requests_total{opcode,outcome}` | Which operation is failing, saturating, or being retried, and in which semantic errno class? |
+| `portablefs_authority_rpc_duration_seconds{opcode}` | Which operation is consuming the handler latency budget? |
+| `portablefs_authority_active_sessions` | How many mounts are currently ACTIVE, rather than merely provisional or draining? |
+| `portablefs_authority_session_items_high_water` | Has one session approached `--max-items-per-session` since this worker started? The shared root descriptor is excluded, matching the configured bound. |
+| `portablefs_authority_write_transactions_active` | How much of the configured transaction-count admission capacity is occupied? |
+| `portablefs_authority_write_transactions_waiting` | Is the FIFO write admission queue currently saturated? |
+| `portablefs_authority_write_staged_bytes` | How many payload bytes currently live in inert transaction staging? This is actual DATA received, not the larger requested-size reservation. |
+| `portablefs_authority_write_admission_blocks_total` | How often did a BEGIN find transaction-count or byte capacity unavailable? |
+| `portablefs_authority_write_admission_wait_seconds` | How long did blocked BEGIN requests remain in FIFO capacity admission? |
+| `portablefs_authority_fsync_barrier_handles_total` / `portablefs_authority_fsync_storage_syncs_total` | How many fsync barrier requests did each completed storage sync serve? The ratio is group-commit effectiveness. |
+| `portablefs_authority_visibility_barrier_duration_seconds` | How long did PREPARE, XFS apply, and peer COMPLETE acknowledgment take end to end? |
+| `portablefs_authority_visibility_barrier_audience` | How many peer sessions had cache state to repair for each barrier? Routing changes count every strict participant. |
+| `portablefs_authority_fence_events_total{reason}` | Why was a participant told to revoke: `visibility_lost`, `repair_deadline`, `protocol_violation`, `write_transaction_mismatch`, or `other`? |
+
+The counters and gauges are atomics. RPC counter handles and every label set are
+precomputed at startup; a request does no metric-map lookup, label formatting,
+or allocation. Histograms use fixed buckets and render cumulative buckets only
+at scrape time. The worker has no Prometheus client-library dependency.
+
+Start with these alerts and tune duration windows from production baselines:
+
+- page when `/readyz` is not 200 for a running unit, or when the admin target is
+  absent while the authority TLS port still accepts connections;
+- page on any sustained increase in RPC outcomes `storage`, `internal`, or
+  `coherence`; investigate `io` and `other` immediately because they are
+  unclassified or direct I/O failures even when the epoch has not yet exited;
+- alert when `write_transactions_waiting` remains nonzero, the rate of
+  `write_admission_blocks_total` rises, or admission-wait p95 consumes a
+  material fraction of `--write-transaction-progress-timeout`;
+- alert before active transactions or staged bytes reach their configured
+  worker bounds, and before `session_items_high_water` reaches
+  `--max-items-per-session`;
+- compare visibility-barrier p99 with `--max-repair-budget`. A tail approaching
+  that budget predicts participant fencing; correlate it with audience size to
+  distinguish one slow mount from broad fan-out;
+- alert on every `repair_deadline`, `protocol_violation`, or
+  `write_transaction_mismatch` fence. A visibility-lost fence may accompany a
+  deliberate host loss, but it still leaves durable membership requiring the
+  restart proof described above.
+
+Continue monitoring EBS status and latency, filesystem and project-quota block
+and inode headroom, process restarts, file descriptors, TLS/capability
+rejections at the service boundary, and backup restore age; those facts are
+outside this per-worker registry.
+
+RPC lifecycle results and non-routine failures are also structured on stderr
+with `volume`, `request_id`, `session`, `opcode`, `outcome`, `errno`, and
+`duration_us`. Participant fencing and refused commitments retain the existing
+operator-facing `fenced strict mount` and `refused strict attach` lines, and add
+structured companion events with volume, session, and reason. Routine POSIX
+results such as a missing lookup are counted but not logged per request. Logs
+are for correlation by request ID; metrics and readiness, rather than grepping
+two string literals, are the monitoring contract.

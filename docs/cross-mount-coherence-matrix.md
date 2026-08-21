@@ -1,8 +1,9 @@
 # Cross-mount coherence matrix
 
-PortableFS's central claim is exact multi-machine POSIX semantics: one volume,
-mounted on several machines, full read/write everywhere. This is the automated
-instrument that verifies it.
+PortableFS's central Linux claim is one authoritative volume mounted through
+several stock-kernel FUSE clients with write-through, lease-coherent semantics.
+This is the black-box instrument that verifies it. macOS invocations are
+qualification runs and do not establish production FSKit support.
 
 ```bash
 scripts/coherence-matrix-linux.sh                      # Linux, two kernel FUSE mounts
@@ -45,13 +46,11 @@ production provisioner, mints credentials with the production capability signer
 * An atomic replacement is compared against the inode number the *other* mount
   resolves, not against content alone, because a stale binding can serve the
   right bytes from the wrong inode.
-* Nothing polls or retries. The correct answer is the first answer. In the
-  `uncached` profile the frontend holds no cache at all; in the `strict`
-  profile (the default) names and attributes are cached but every remote
-  mutation completes its two-phase repair on every mount *before* the
-  mutator's own call returns, so there is still no interval in which a settled
-  answer differs from the first one. A case that needed a settling delay would
-  be reporting a defect, not a timing artefact.
+* Nothing polls or retries. The correct answer is the first answer. Names,
+  attributes, clean data, and directory enumerations may be cached only under
+  authority leases; a conflicting mutation completes peer discharge before its
+  result is published. A case that needed a settling delay
+  would be reporting a defect, not a timing artefact.
 
 ## Falsifiability
 
@@ -110,7 +109,7 @@ Exit status is zero only when every case reached its **declared** status.
 | `remote_truncate_shrink_readable_eof` | a remote shrink is observed as a shorter readable EOF, not a stale tail |
 | `dir_listing_reflects_remote_creates_and_deletes` | an enumeration on one mount reflects creates and deletes performed on the other |
 | `concurrent_writers_distinct_files` | both mounts writing distinct files concurrently lose nothing and both see the full result |
-| `concurrent_same_file_append_atomicity` | concurrent `O_APPEND` writers to one file lose no record and tear no record; the interleaving is free |
+| `concurrent_same_file_append_atomicity` | exact cross-mount append: every record from both mounts lands whole, placed by the authority at the true EOF |
 | `concurrent_same_file_overwrite_integrity` | concurrent whole-record overwrites of one file leave one writer's record, never a mixture |
 | `hardlink_visible_same_inode` | a hard link made on one mount is observed on the other as the same inode with the right link count |
 | `symlink_visible_and_resolves` | a symlink created and atomically replaced on one mount is observed on the other with its exact current target and bytes |
@@ -125,9 +124,10 @@ Exit status is zero only when every case reached its **declared** status.
 ### `same_dir_concurrent_mutations` permits no fencing
 
 Two mounts mutating one directory is the directory-inode-lock contention case.
-The frontend reports a blocked repair only when its exact cached-binding and
-parked-directory registries prove the cycle, while racing reads leave Stabilize
-at apply rather than holding the directory lock until COMPLETE. The case still
+Every phase a frontend is delivered is one it repairs in place and
+acknowledges -- there is no report by which a frontend can decline one -- while
+racing reads leave Stabilize at apply rather than holding the directory lock
+until COMPLETE. The case still
 records how many participants were fenced (observed as `ENOTCONN` from the
 revoked mount), but the allowed count is zero: fencing either healthy mount is a
 regression.
@@ -206,10 +206,10 @@ principals are ever supported, the case becomes assertable and must be enabled.
 
 ## macOS
 
-`scripts/coherence-matrix-macos.sh` does not mount anything itself. Mounting on
-a developer machine goes through the `portablefsd` daemon and its state
-directory, which is separate production infrastructure; the harness stays out of
-it and takes live mountpoints as arguments.
+`scripts/coherence-matrix-macos.sh` does not mount anything itself. It accepts
+paths created by an explicitly stamped qualification build and stays out of the
+daemon lifecycle. A green run characterizes that adapter and OS only; it does
+not promote FSKit past the protocol-6 primitive gate.
 
 It refuses to run against ordinary directories. A directory on the boot volume
 is perfectly coherent with itself, so a run like that would print a wall of
@@ -227,11 +227,10 @@ Linux (`scripts/coherence-matrix-linux.sh`):
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `PORTABLEFS_COHERENCE` | `strict` | the kernel-cache contract the mounts declare (`strict` or `uncached`), matching `portablefs-mount-v3`'s own default |
 | `PORTABLEFS_ATOMIC_REPLACE_ROUNDS` | `20` | rounds of the atomic replacement case |
 | `PORTABLEFS_ALT_GID` | `200002` | supplementary GID for the ownership case |
-| `PORTABLEFS_CACHED_NAME_CAPACITY` | `65536` | strict-mount kernel-cache bound, set on both sides |
-| `PORTABLEFS_REPAIR_BUDGET` | `15s` | strict-mount repair deadline, set on both sides |
+| `PORTABLEFS_CACHED_NAME_CAPACITY` | `65536` | transitional admission bound used by both harness sides |
+| `PORTABLEFS_REPAIR_BUDGET` | `15s` | transitional recall/repair wall bound used by both harness sides |
 | `PORTABLEFS_ROUTE_RULES` | `node_modules/` | the declaration installed through admin `ApplyRoutes` before either mount attaches |
 | `PORTABLEFS_LOCAL_ROUTE` | `node_modules` | the directory name `local_route_isolation` drives; must be matched by the rules above |
 | `PORTABLEFS_CASE_TIMEOUT` | `8m` | driver per-case wall bound; larger than `same_dir_concurrent_mutations`' own 3m storm bound so the case reports a deadlock rather than the outer guillotine |
@@ -261,6 +260,14 @@ It asserts exactly three things and thresholds nothing:
 Wall time and the authority's work counters are **recorded into a table**, not
 gated. A timing threshold in CI turns a shared runner's bad afternoon into a red
 build, and a number nobody can act on gets raised until it never fires again.
+
+**It is not part of the merge gate.** It is a workload soak: it ran in the
+`linux-coherence-matrix` lane once and made that lane an order of magnitude
+slower than every other job in the workflow, for coverage a merge does not need
+to wait on. Run it on demand — it provisions the same container as the matrix
+above — and read the table. The concurrent-reader shape it drives is qualified
+after deploy by phase 8 of `deploy/opensteer/staging-qualification.sh`, against
+a live cell rather than a container.
 
 The fixture is hermetic: six tiny packages the script generates and `npm pack`s
 itself, installed from local tarballs, with no registry contacted and nothing

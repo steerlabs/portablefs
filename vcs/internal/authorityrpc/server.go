@@ -12,7 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritymetrics"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 type peerIdentityKey struct{}
@@ -45,11 +47,106 @@ type Handler interface {
 	Epoch() []byte
 	// Bounds are the limits this handler advertises during Hello.
 	Bounds() TransportBounds
+	// SessionStateForTransport closes the terminal-before-bind race. After a
+	// provisional result is bound into the registry, the server rechecks the
+	// runtime before exposing either lane; a terminal transition is therefore
+	// observed either by this query or by the runtime-owned terminal edge.
+	SessionStateForTransport(volumeserver.SessionID) (volumeserver.SessionState, bool)
+	// SessionTerminalForTransport exposes the runtime-owned terminal edge. It
+	// closes at fencing, before admitted filesystem work drains and before
+	// descriptor cleanup, so physical generations are revoked immediately.
+	SessionTerminalForTransport(volumeserver.SessionID) (<-chan struct{}, bool)
 	Handle(context.Context, *authoritypb.Request) *authoritypb.Response
+}
+
+// responseWriteObserver is an optional handler extension for terminal failures
+// whose response carries the only exact post-apply filesystem state. The
+// authoritative store is fenced before Handle returns, so no later operation
+// can enter XFS; process-wide teardown is deferred until the transport has made
+// exactly one physical attempt to deliver that retained response. This keeps a
+// security- or storage-fatal post-apply result from racing its own socket close.
+type responseWriteObserver interface {
+	PrepareResponseWrite(*authoritypb.Request, *authoritypb.Response)
+	ResponseWritten(*authoritypb.Response, error)
+}
+
+type terminalQuiescer interface {
+	TerminalQuiescing() <-chan struct{}
+}
+
+type handlerResponseFinisher interface {
+	FinishHandlerResponse(*authoritypb.Request, *authoritypb.Response)
+}
+
+type transportResponseHandler interface {
+	HandleForTransport(context.Context, *authoritypb.Request) *authoritypb.Response
+}
+
+func handleTransportRequest(handler Handler, ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	if retained, ok := handler.(transportResponseHandler); ok {
+		return retained.HandleForTransport(ctx, request)
+	}
+	return handler.Handle(ctx, request)
+}
+
+func finishHandlerResponse(handler Handler, request *authoritypb.Request, response *authoritypb.Response) func() {
+	if finisher, ok := handler.(handlerResponseFinisher); ok {
+		finisher.FinishHandlerResponse(request, response)
+	}
+	// Lifecycle validation can abandon a response after Handle transferred it
+	// into terminal frame ownership but before writeResponse is called. Invoke
+	// this cleanup on every enclosing-path exit. After an observed write it is
+	// an idempotent no-op; on abandonment it retires the unreachable frame and
+	// any delivery token associated with that failed physical attempt.
+	return func() {
+		if observer, ok := handler.(responseWriteObserver); ok {
+			observer.ResponseWritten(response, ErrTransportBinding)
+		}
+	}
+}
+
+func writeObservedResponse(conn net.Conn, maxFrame uint32, timeout time.Duration, handler Handler, request *authoritypb.Request, response *authoritypb.Response) (err error) {
+	requestID := uint64(0)
+	if request != nil {
+		requestID = request.GetRequestId()
+	}
+	if response == nil {
+		// A handler that produced nothing is an internal defect, never an epoch
+		// change: stamp the live epoch so the client is not told to remount after
+		// a failover that did not happen.
+		response = &authoritypb.Response{
+			RequestId: requestID, Epoch: handler.Epoch(),
+			Errno: int32(syscall.EIO), Uncertain: true, Failure: authoritypb.FailureClass_FAILURE_CLASS_INTERNAL,
+		}
+	}
+	writtenResponse := response
+	var observedErr error
+	if observer, ok := handler.(responseWriteObserver); ok {
+		observer.PrepareResponseWrite(request, writtenResponse)
+		defer func() { observer.ResponseWritten(writtenResponse, observedErr) }()
+	}
+	if err = conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		observedErr = err
+		return err
+	}
+	err = writeFrame(conn, maxFrame, response)
+	observedErr = err
+	if errors.Is(err, ErrFrameBounds) {
+		// The replacement must carry the same epoch and the same recorded
+		// replay-slot state as the reply it stands in for. Dropping either would
+		// report a failover or desynchronize the client's slot.
+		response = &authoritypb.Response{
+			RequestId: response.GetRequestId(), Epoch: handler.Epoch(),
+			Mutation: response.GetMutation(), Errno: int32(syscall.EOVERFLOW), Uncertain: true,
+		}
+		err = writeFrame(conn, maxFrame, response)
+	}
+	return err
 }
 
 type Server struct {
 	Handler        Handler
+	Metrics        *authoritymetrics.Metrics
 	MaxFrame       uint32
 	MaxInFlight    int
 	MaxConnections int
@@ -59,8 +156,14 @@ type Server struct {
 	HandshakeTimeout      time.Duration
 	IdleTimeout           time.Duration
 	WriteTimeout          time.Duration
+	// OnServing observes the lifetime of the validated TLS accept loop. It is
+	// used by readiness only and must be nonblocking.
+	OnServing func(bool)
 
 	budget *frameBudget
+
+	registryMu sync.Mutex
+	registry   *transportRegistry
 }
 
 func (s *Server) validate() (TransportBounds, error) {
@@ -70,6 +173,9 @@ func (s *Server) validate() (TransportBounds, error) {
 	}
 	if s.MaxInFlight < 2 {
 		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
+	}
+	if s.MaxConnections < 2 {
+		return TransportBounds{}, errors.New("authorityrpc: protocol 6 requires capacity for one DATA/CONTROL connection pair")
 	}
 	bounds := s.Handler.Bounds()
 	if bounds.MaxFrame != s.MaxFrame || bounds.MaxInFlight != s.MaxInFlight {
@@ -94,29 +200,37 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 		return errors.New("authorityrpc: TLS 1.3 and CA-verified client certificates are required")
 	}
 	s.budget = newFrameBudget(s.MaxFrameBytesInFlight)
+	if err := s.initializeTransportRegistry(); err != nil {
+		return err
+	}
 	tlsConfig = tlsConfig.Clone()
 	tlsConfig.NextProtos = []string{protocolALPN}
-	tlsListener := tls.NewListener(listener, tlsConfig)
+	tlsConfig.DynamicRecordSizingDisabled = true
 	serveCtx, cancel := context.WithCancel(ctx)
 	connections := make(chan struct{}, s.MaxConnections)
 	var connectionWorkers sync.WaitGroup
+	if s.OnServing != nil {
+		s.OnServing(true)
+		defer s.OnServing(false)
+	}
 	defer func() {
 		cancel()
-		_ = tlsListener.Close()
+		_ = listener.Close()
 		connectionWorkers.Wait()
 	}()
 	go func() {
 		<-serveCtx.Done()
-		_ = tlsListener.Close()
+		_ = listener.Close()
 	}()
 	for {
-		conn, err := tlsListener.Accept()
+		raw, err := listener.Accept()
 		if err != nil {
 			if serveCtx.Err() != nil {
 				return nil
 			}
 			return err
 		}
+		conn := newAuthorityTLSServer(raw, tlsConfig)
 		select {
 		case connections <- struct{}{}:
 			connectionWorkers.Add(1)
@@ -136,7 +250,7 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener, tlsConfig *tl
 // authorization decision downstream reads it from the request context.
 func (s *Server) serveConn(parent context.Context, conn net.Conn, bounds TransportBounds) error {
 	defer conn.Close()
-	tlsConn, ok := conn.(*tls.Conn)
+	tlsConn, ok := conn.(*authorityTLSConn)
 	if !ok {
 		return errors.New("authorityrpc: authority connections must be mutually authenticated TLS")
 	}
@@ -162,72 +276,98 @@ func (s *Server) serveConn(parent context.Context, conn net.Conn, bounds Transpo
 	if state.NegotiatedProtocol != protocolALPN {
 		return errors.New("authorityrpc: TLS peer did not negotiate the PortableFS authority protocol")
 	}
-	identity := sha256.Sum256(state.PeerCertificates[0].RawSubjectPublicKeyInfo)
+	identity := volumeserver.PeerIdentity(sha256.Sum256(state.PeerCertificates[0].RawSubjectPublicKeyInfo))
 	return s.serveSession(ctx, cancel, conn, bounds, identity)
 }
 
 // serveSession multiplexes one authenticated connection. It is separate from
 // serveConn so the transport can be exercised without standing up TLS, while
 // the exported path stays fail-closed.
-func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, conn net.Conn, bounds TransportBounds, identity [32]byte) error {
-	requestCtx := context.WithValue(ctx, peerIdentityKey{}, identity)
-	ordinaryLimit, blockingLimit := blockingWaitLane(s.MaxInFlight)
-	ordinary := make(chan struct{}, ordinaryLimit)
-	blocking := make(chan struct{}, blockingLimit)
-	var writers sync.Mutex
-	writeResponse := func(requestID uint64, response *authoritypb.Response) error {
-		if response == nil {
-			// A handler that produced nothing is an internal defect, never an
-			// epoch change: stamp the live epoch so the client is not told to
-			// remount after a failover that did not happen.
-			response = &authoritypb.Response{
-				RequestId: requestID, Epoch: s.Handler.Epoch(),
-				Errno: int32(syscall.EIO), Uncertain: true, Failure: authoritypb.FailureClass_FAILURE_CLASS_INTERNAL,
-			}
-		}
-		writers.Lock()
-		defer writers.Unlock()
-		if err := conn.SetWriteDeadline(time.Now().Add(s.WriteTimeout)); err != nil {
-			return err
-		}
-		err := writeFrame(conn, s.MaxFrame, response)
-		if errors.Is(err, ErrFrameBounds) {
-			// The replacement must carry the same epoch and the same recorded
-			// replay-slot state as the reply it stands in for. Dropping either
-			// would report a failover or desynchronize the client's slot.
-			response = &authoritypb.Response{
-				RequestId: response.GetRequestId(), Epoch: s.Handler.Epoch(),
-				Mutation: response.GetMutation(), Errno: int32(syscall.EOVERFLOW), Uncertain: true,
-			}
-			err = writeFrame(conn, s.MaxFrame, response)
-		}
+func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, conn net.Conn, bounds TransportBounds, identity volumeserver.PeerIdentity) error {
+	if err := s.initializeTransportRegistry(); err != nil {
 		return err
 	}
 	var workers sync.WaitGroup
-	var inflightMu sync.Mutex
-	inflight := make(map[uint64]context.CancelFunc)
+	var entry *transportConnection
 	defer func() {
 		cancel()
 		_ = conn.Close()
 		workers.Wait()
+		if entry != nil {
+			s.registry.unregister(entry)
+		}
 	}()
+	var requestCtx context.Context
+	var err error
+	entry, requestCtx, err = s.acceptTransportHello(ctx, cancel, conn, bounds, identity)
+	if err != nil {
+		return err
+	}
+	ordinaryLimit, blockingLimit := blockingWaitLane(s.MaxInFlight)
+	ordinary := make(chan struct{}, ordinaryLimit)
+	blocking := make(chan struct{}, blockingLimit)
+	var writers sync.Mutex
+	writeResponse := func(request *authoritypb.Request, response *authoritypb.Response) error {
+		writers.Lock()
+		defer writers.Unlock()
+		return writeObservedResponse(conn, s.MaxFrame, s.WriteTimeout, s.Handler, request, response)
+	}
+	type inflightRequest struct {
+		request *authoritypb.Request
+		cancel  context.CancelFunc
+	}
+	var inflightMu sync.Mutex
+	inflight := make(map[uint64]inflightRequest)
+	if quiescer, ok := s.Handler.(terminalQuiescer); ok {
+		go func() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-quiescer.TerminalQuiescing():
+			}
+			inflightMu.Lock()
+			for _, operation := range inflight {
+				if terminalQuiesceCancelable(operation.request) {
+					operation.cancel()
+				}
+			}
+			inflightMu.Unlock()
+		}()
+	}
 	for {
 		if err := conn.SetReadDeadline(time.Now().Add(s.IdleTimeout)); err != nil {
 			return err
 		}
 		request := new(authoritypb.Request)
-		if err := readFrame(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request); err != nil {
+		releaseFrame, payloadDigest, err := readRequestFrameRetained(conn, bounds.MaxRequestFrame, s.budget, s.WriteTimeout, request)
+		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
 				return nil
 			}
 			return err
 		}
 		if request.GetRequestId() == 0 {
+			releaseFrame()
 			return errors.New("authorityrpc: request ID zero is reserved")
 		}
+		frameRequestCtx := withFramePayloadDigest(requestCtx, payloadDigest)
+		if err := requestAllowedOnRole(request, entry.role); err != nil {
+			releaseFrame()
+			return err
+		}
 		if cancelRequest := request.GetCancel(); cancelRequest != nil {
+			session, sessionErr := sessionIDFromRequest(request)
+			if sessionErr != nil {
+				releaseFrame()
+				return sessionErr
+			}
+			_, pin, err := s.registry.pinCurrent(entry, session)
+			if err != nil {
+				releaseFrame()
+				return err
+			}
 			inflightMu.Lock()
-			cancelTarget := inflight[cancelRequest.GetTargetRequestId()]
+			cancelTarget := inflight[cancelRequest.GetTargetRequestId()].cancel
 			inflightMu.Unlock()
 			if cancelTarget != nil {
 				cancelTarget()
@@ -235,9 +375,16 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			// Cancellation must remain processable when every normal execution
 			// slot is occupied. Its handler only validates the epoch and returns
 			// the acknowledgment, so execute it inline outside the normal slots.
-			if err := writeResponse(request.GetRequestId(), s.Handler.Handle(requestCtx, request)); err != nil {
-				return err
+			response := s.dispatchRequest(frameRequestCtx, request)
+			finishResponse := finishHandlerResponse(s.Handler, request, response)
+			writeErr := writeResponse(request, response)
+			finishResponse()
+			pin.Release()
+			if writeErr != nil {
+				releaseFrame()
+				return writeErr
 			}
+			releaseFrame()
 			continue
 		}
 		// A blocking POSIX lock wait parks until an unrelated session releases a
@@ -258,38 +405,42 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			}
 		case <-ctx.Done():
 			admissionTimer.Stop()
+			releaseFrame()
 			return nil
 		case <-admissionTimer.C:
 			// A peer that exceeds the advertised connection bound loses only its
 			// connection after a bounded wait. Closing is safe: same-epoch
 			// mutations use replay identities, while unknown results remain
 			// explicitly uncertain.
+			releaseFrame()
 			return errors.New("authorityrpc: connection in-flight bound exceeded")
 		}
-		opCtx, opCancel := context.WithCancel(requestCtx)
+		opCtx, opCancel := context.WithCancel(frameRequestCtx)
 		inflightMu.Lock()
 		if _, duplicate := inflight[request.GetRequestId()]; duplicate {
 			inflightMu.Unlock()
 			opCancel()
 			<-lane
+			releaseFrame()
 			return errors.New("authorityrpc: duplicate in-flight request ID")
 		}
-		inflight[request.GetRequestId()] = opCancel
+		inflight[request.GetRequestId()] = inflightRequest{request: request, cancel: opCancel}
 		inflightMu.Unlock()
 		workers.Add(1)
-		go func(req *authoritypb.Request, opCtx context.Context, opCancel context.CancelFunc, lane chan struct{}) {
+		go func(req *authoritypb.Request, opCtx context.Context, opCancel context.CancelFunc, lane chan struct{}, releaseFrame func()) {
 			defer workers.Done()
 			defer func() { <-lane }()
+			defer releaseFrame()
 			defer opCancel()
 			defer func() {
 				inflightMu.Lock()
 				delete(inflight, req.GetRequestId())
 				inflightMu.Unlock()
 			}()
-			if err := writeResponse(req.GetRequestId(), s.Handler.Handle(opCtx, req)); err != nil {
+			if err := s.executeTransportRequest(opCtx, entry, req, writeResponse); err != nil {
 				cancel()
 				_ = conn.Close()
 			}
-		}(request, opCtx, opCancel, lane)
+		}(request, opCtx, opCancel, lane, releaseFrame)
 	}
 }

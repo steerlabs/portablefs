@@ -20,6 +20,8 @@ func TestSelectTransportDoesNotInspectHost(t *testing.T) {
 		{"darwin auto", "auto", "darwin", FSKit, ""},
 		{"linux auto", "auto", "linux", FUSE, ""},
 		{"empty is auto", "", "linux", FUSE, ""},
+		{"windows auto is primitive-gated", "auto", "windows", "", "authority-forwarded byte-range locks and synchronous cache control"},
+		{"windows empty is primitive-gated", "", "windows", "", "authority-forwarded byte-range locks and synchronous cache control"},
 		{"explicit fskit", "fskit", "darwin", FSKit, ""},
 		{"explicit fuse", "fuse", "linux", FUSE, ""},
 		{"fskit wrong os", "fskit", "linux", "", "requires darwin"},
@@ -40,6 +42,18 @@ func TestSelectTransportDoesNotInspectHost(t *testing.T) {
 				t.Fatalf("SelectTransport = %q, %v; want %q", got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestWindowsAutoSelectionHasStablePrimitiveGate(t *testing.T) {
+	for _, explicit := range []string{"", "auto"} {
+		transport, err := SelectTransport(explicit, "windows")
+		if transport != "" {
+			t.Fatalf("SelectTransport(%q, windows) selected %q", explicit, transport)
+		}
+		if !errors.Is(err, ErrWindowsPrimitivesUnavailable) {
+			t.Fatalf("SelectTransport(%q, windows) error = %v, want ErrWindowsPrimitivesUnavailable", explicit, err)
+		}
 	}
 }
 

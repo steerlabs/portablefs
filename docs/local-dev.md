@@ -7,29 +7,36 @@ and no package manager to install.
 ## The merge gate
 
 ```bash
-bash scripts/verify-local.sh
+bash scripts/verify-local.sh          # default: no Docker, no real mount
+bash scripts/verify-local.sh --full   # + both privileged real-mount suites
 ```
 
-That script is the single local gate, and it is plain bash so a developer Mac
-and a Linux CI runner execute the same steps:
+That script is the local gate, and it is plain bash so a developer Mac and a
+Linux CI runner execute the same steps. The default mode below stops short of
+the two real-mount suites and names them as not run; `--full` appends them.
 
 1. cross-platform compile and vet: `GOOS=darwin` and `GOOS=linux`, both built
    before anything runs, because the daemon, mount clients, and frontend
    adapters all carry per-GOOS files;
-2. the native Go suite, then the native race suite — these tests exercise real
+2. the pinned `govulncheck` reachable-call scan, which also enforces the exact
+   Go security patch level required by `vcs/go.mod`;
+3. the native Go suite, then the native race suite — these tests exercise real
    syscalls, sockets, and mounts, so they are only meaningful on the host;
-3. `swift test --package-path swift/PortableFSKit --no-parallel`.
-   Serial execution is required, not a performance knob: Swift Testing can run
-   cases concurrently inside one worker, while several tests share process
-   resources (sockets, mount points, the app-group container) or exercise hard
-   protocol deadlines. Skipped loudly on a host with no Swift toolchain; the
-   macOS CI job always runs it;
-4. release-trust policy: `sh -n scripts/install.sh`, `scripts/check-workflow-pins.mjs`,
-   and `scripts/check-install-release-trust.mjs` (dependency-free single-file
-   node programs that read the installer, the workflows, and `.goreleaser.yaml`
-   as text);
-5. the stale-architecture scan, which fails the run if the deleted journal-era
-   package and API surface reappears.
+4. `bash scripts/test-swift-xcode.sh` on macOS. The gate asks Xcode to
+   enumerate the complete package inventory, executes that already-built
+   inventory once through Xcode's native serial test runner, and rejects the
+   result unless the `.xcresult` contains the same unique all-passing set. This
+   avoids SwiftPM's separate Darwin helper process while preserving exact
+   coverage. Non-macOS hosts skip this macOS-only package loudly; the macOS CI
+   job always runs it;
+5. workflow semantics and release-trust policy: the pinned `actionlint`,
+   `sh -n scripts/install.sh`, `scripts/check-workflow-pins.mjs`, and
+   `scripts/check-install-release-trust.mjs` (the project checkers are
+   dependency-free single-file node programs that read the installer, the
+   workflows, and `.goreleaser.yaml` as text);
+6. stale-architecture and active-contract scans, which fail if the deleted
+   journal-era packages reappear or active docs/CI regain a private-kernel
+   dependency.
 
 The raw commands, when you want one piece:
 
@@ -38,7 +45,7 @@ GOOS=darwin go -C vcs build ./...
 GOOS=linux  go -C vcs vet ./...
 go -C vcs test ./...
 go -C vcs test -race ./...
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh
 ```
 
 
@@ -50,28 +57,27 @@ bash scripts/xfs-fuse-integration.sh --in-container   # container side; needs ro
 ```
 
 Runs a throwaway privileged container against a real XFS loopback filesystem
-with project quotas and real kernel FUSE mounts. The same script is the CI entry
-point and the local reproduction, so a green CI run and a developer run execute
-byte-identical provisioning. It enumerates 44 required tests by name: a test
-that is renamed, deleted, or skipped fails the job rather than quietly shrinking
-privileged coverage.
+with project quotas and real kernel FUSE mounts. Its host or VM must expose
+`/dev/fuse`, loop devices, and stock FUSE protocol 7.31 or newer. The same script
+is the CI entry point and local reproduction. It enumerates required tests by
+name: a test that is renamed, deleted, or skipped fails the job rather than
+quietly shrinking privileged coverage.
 
 ## The cross-mount coherence matrix
 
 ```bash
 bash scripts/coherence-matrix-linux.sh        # host side; needs docker
-PORTABLEFS_COHERENCE=uncached bash scripts/coherence-matrix-linux.sh
 ```
 
-Provisions a real XFS cell, starts a real authority and two real mount
+On a stock Linux host or VM, this provisions a real XFS cell, starts a real authority and two real mount
 processes, then drives both mountpoints with ordinary syscalls from a separate
-black-box program — 23 named cases, nothing in-process and nothing faked. It
-defaults to the `strict` kernel-cache profile; `PORTABLEFS_COHERENCE=uncached`
-measures the other supported profile with the same case list, and both must give
-the same answers.
+black-box program — 23 named cases, nothing in-process and nothing faked. The
+matrix proves only observed syscall behavior; dedicated protocol tests must
+prove grant, recall, and discharge. The harness has no weaker profile selector.
 
-On macOS the same cases run against paths you have already mounted yourself; the
-script never mounts, unmounts, or drives `portablefsd`:
+On macOS the same cases can run against paths mounted by a qualification build;
+the script never mounts, unmounts, or drives `portablefsd`, and a pass does not
+promote FSKit to product support:
 
 ```bash
 scripts/coherence-matrix-macos.sh --mount-a /path/a --mount-b /path/b

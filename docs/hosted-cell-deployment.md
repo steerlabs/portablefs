@@ -1,6 +1,6 @@
 # Deploying a hosted storage cell
 
-Status: **Linux reference deployment for the hosted v1 foundation**
+Status: **Linux reference deployment for the hosted v2 tiered foundation**
 
 Read [hosted-control-plane.md](./hosted-control-plane.md) first. This document
 only covers the host boundary. The standalone authority runbook remains in
@@ -25,35 +25,47 @@ The reference paths are:
 | Path | Owner/mode | Purpose |
 | --- | --- | --- |
 | `/srv/portablefs` | root, not tenant-writable | XFS cell root |
+| `/srv/portablefs/.portablefs-control/<volume>/write-staging` | volume UID `0700`, root-pinned parent | unnamed transactional-write staging, charged to the volume's exact XFS project quota |
 | `/etc/portablefs/trust` | root | manager CA and plan public key |
 | `/etc/portablefs/cells` | root | cell mTLS identity and root-owned environment |
-| `/etc/portablefs/cells/<cell-uuid>-archive.env` | root `0600` | archive-store read/write credentials and root-pinned endpoint, bucket, and prefix |
+| `/etc/portablefs/cells/<cell-uuid>-archive.env` | root `0600` | root-pinned archive endpoint, bucket, prefix, key version, and scoped credentials |
 | `/etc/portablefs/volumes` | root | generated per-volume authority config/keys/certs |
-| `/var/lib/portablefs/volumes` | per-volume UID | strict membership, restore hydration/convergence records, and runtime state |
+| `/var/lib/portablefs/volumes` | per-volume UID | membership, restore hydration/convergence records, and runtime state |
 | `/var/lib/portablefs-cell-helper` | root `0700` | pinned assignments and plan generation |
 | `/var/lib/portablefs-cell-helper/sysusers.d` | root | persistent, exact per-volume service-account definitions |
 | `/run/portablefs-cell-helper` | root:agent `0750` | cell-specific local helper sockets |
 | `/run/portablefs-cell-helper/<cell-uuid>.sock` | root:agent `0660` | local signed-plan boundary |
 
-## Install the six host binaries
+## Install one immutable hosted release
 
-Install root-owned, non-group-writable binaries at these reference locations:
+Build one clean-commit release with `scripts/build-hosted-linux-release.sh`.
+The bundle contains the Manager, cell agent, authority, archiver, hydrator,
+root helper, authority launcher, Linux `portablefs` client, and all seven unit
+templates. Every executable reports the same
+`pfs-hosted-YYYYMMDD-<commit>` identity and the bundle has exact-member SHA-256
+verification. The matched client is also the source for managed sandbox images;
+it is not built or selected by a second release process. Install the bundle
+beneath:
 
 ```text
-/usr/local/bin/portablefs-cell-agent
-/usr/local/bin/portablefs-authority
-/usr/local/bin/portablefs-archiver
-/usr/local/bin/portablefs-hydrator
-/usr/local/libexec/portablefs-cell-helper
-/usr/local/libexec/portablefs-authority-launcher
+/opt/portablefs/releases/<release-id>
+/opt/portablefs/current -> /opt/portablefs/releases/<release-id>
 ```
 
-The launcher refuses an authority binary that is not a root-owned regular file
-or is writable by group/other. Build production binaries with an exact release
-stamp, for example `-ldflags '-X main.version=v3.x.y+build-id'`; `dev` is visible
-and should never be mistaken for a release.
+`deploy/gcp/activate-hosted-release.sh` verifies every member and binary release
+identity before stopping a control process, installs the release under its
+immutable name, swaps the one `current` symlink, reloads systemd, and verifies
+the new process executable. A failed activation restores the former link and
+unit files. The launcher also refuses an authority binary that is not a
+root-owned regular file or is writable by group/other.
 
-Install the six units from `deploy/systemd/`:
+A cell software activation restarts only the cell helper and agent. It never
+restarts an active authority: replacing the one XFS writer remains a manager
+restart request, a strict-mount fence proof, local process-absence observation,
+and a monotonic authority generation. The next generation starts from the new
+release root.
+
+The release carries these seven units from `deploy/systemd/`:
 
 ```text
 portablefs-cell-helper@.service
@@ -66,24 +78,29 @@ portablefs-hydrator@.service
 
 The helper generates only typed per-volume drop-ins. The service template gives
 an authority an empty capability set, `NoNewPrivileges`, private devices/tmp/
-network, a read-only system, syscall restrictions, and its unchanged three bind
-mounts for the volume, config, and state roots. During RESTORING the authority's
-state-root bind exposes the hydrator AF_UNIX socket directory, so the authority
-does not gain a fourth bind. The hydrator unit separately receives network,
-read-scoped credentials, and that socket-directory bind, with no volume data-dir
-access. The archiver unit receives network, write-scoped credentials, and a
-read-only bind of the quiesced volume data directory. It is the one unit that
-does **not** run with an empty capability set: its bounding and ambient sets
-hold `CAP_DAC_READ_SEARCH` and nothing else. A volume is single-owner, and its
-owner may legitimately create a mode that denies the owner — a `0000` file, a
-directory without owner search — so an archive that had to be decided by the
-mode could not seal such a tree at all. `CAP_DAC_READ_SEARCH` grants read and
-traverse only: never write, never chown, never `CAP_DAC_OVERRIDE`. The
-capability is bounded by the same confinement as everything else — one
-read-only bind of one quiesced volume, `PrivateUsers=no` so it means what it
-says against host-owned inodes, and `NoNewPrivileges` alongside it. The socket unit owns the
-public TCP listener and passes one descriptor to the authority. Do not add a
-second `ListenStream` or a second authority unit for the same volume.
+network, a read-only system, syscall restrictions, and exactly four bind
+mounts: the served XFS project, read-only configuration, runtime state, and a
+separate write-staging directory under that same XFS project quota. The two
+control parents are root-owned and non-replaceable by the service identity.
+During RESTORING, the existing runtime-state bind exposes the hydrator socket;
+the authority gains no extra data-tree access. The hydrator receives network,
+read-scoped archive credentials, and that socket directory, but in serve mode
+no volume data-directory access. The archiver receives network, write-scoped
+credentials, and a read-only bind of one quiesced volume. Its sole capability
+is `CAP_DAC_READ_SEARCH`, required to preserve owner-denying modes such as
+`0000`; it never receives `CAP_DAC_OVERRIDE` or write access.
+The socket unit owns the public TCP listener and passes one descriptor
+to the authority. Do not add a second `ListenStream` or a second authority unit
+for the same volume.
+
+For a new host, keep credentials in a separate root-only configuration stage
+and run:
+
+```bash
+sudo deploy/gcp/install-cell.sh \
+  /absolute/portablefs-hosted_<release>_linux_<arch> \
+  /absolute/cell-config-stage CELL_UUID AGENT_UID AGENT_GID
+```
 
 ## Cell trust and identity
 
@@ -113,11 +130,10 @@ PORTABLEFS_MANAGER_URL=https://manager.internal:8443
 PORTABLEFS_MANAGER_SERVER_NAME=manager.internal
 ```
 
-The archive environment is root-provisioned, never plan-selected. It pins the
-archive-store endpoint, bucket, root prefix, and key version and supplies
-separate write scope for the archiver and read scope for the hydrator. Signed
-plans carry only attempt identities and digests; object keys are derived below
-that pinned prefix, and credentials never appear in a plan or observation.
+The archive environment is root-provisioned and never plan-selected. It pins
+the endpoint, bucket, root prefix, and key version and supplies separate write
+scope for the archiver and read scope for the hydrator. Plans contain attempt
+identities and digests, not credentials or arbitrary object keys.
 
 The plan public key is independent of control-channel TLS. Compromise of one
 does not silently turn an unsigned manager response into a root command: both
@@ -158,6 +174,12 @@ the authority. The long-running helper does not receive general write access
 to `/etc`. These system users and groups are persistent and are not deleted on
 retirement because allocator identities are never reused.
 
+Each successful volume assignment also records the exact helper release that
+applied it. Installing a new helper release therefore re-applies an unchanged
+signed plan once before it can return to observation. This is how new mandatory
+host resources are migrated without weakening plan identity or requiring an
+operator to manufacture a semantically empty plan change.
+
 XFS project assignment and hard-limit changes also run as fixed short-lived
 systemd units in the host mount namespace. Do not add `PrivateDevices` or
 `PrivateTmp` to those quota units: either creates a private mount namespace in
@@ -173,16 +195,16 @@ the long-running helper does not hold that capability.
 - A helper-state mismatch is a stop condition. Do not delete helper state to
   make it pass; reconcile the signed assignment and on-disk project first.
 - A `RELEASE` entry whose placement sequence, authority epoch, or destroy-proof
-  digest does not exactly match the helper's recorded proof is a stop condition;
-  reconciliation fails closed without removing the assignment.
+  digest differs from the recorded proof fails closed without removing the
+  assignment.
 - If an authority or socket remains active after fencing, the helper reports an
   error and the manager quarantines the volume. It does not start a successor.
 - A cell heartbeat loss makes mount issuance fail closed after the configured
   freshness window. Existing authority sessions continue until their own
   liveness/authorization/fencing rules end them.
-- `RETIRE` preserves the XFS directory. Operator snapshots and device
-  replacement remain offline runbooks; archive, restore, destroy, and release
-  run only as the typed v2 plan phases with their specified proofs.
+- `RETIRE` preserves the XFS directory. Archive, restore, destroy, and release
+  run only through typed v2 plan phases and their proofs; operator snapshots and
+  device replacement remain offline runbooks.
 
 Before a production rollout, exercise the failure paths on a disposable real
 XFS host: kill/stop races, a `SIGSTOP`ed worker, cgroup population, full block

@@ -11,6 +11,7 @@
 		A000000000000000000000002 /* ExtensionMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100000000000000000000201 /* ExtensionMain.swift */; };
 		A000000000000000000000003 /* PortableFSDev.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 100000000000000000000302 /* PortableFSDev.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A000000000000000000000004 /* PortableFSKit in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000901 /* PortableFSKit */; };
+		A000000000000000000000005 /* PortableFSAppCore in Frameworks */ = {isa = PBXBuildFile; productRef = 100000000000000000000902 /* PortableFSAppCore */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -53,6 +54,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A000000000000000000000005 /* PortableFSAppCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -123,6 +125,7 @@
 				100000000000000000000604 /* Host Sources */,
 				100000000000000000000602 /* Host Frameworks */,
 				100000000000000000000606 /* Host Resources */,
+				100000000000000000000608 /* Embed PortableFS tools */,
 				100000000000000000000601 /* Embed ExtensionKit Extensions */,
 			);
 			buildRules = (
@@ -131,6 +134,9 @@
 				100000000000000000000402 /* PBXTargetDependency */,
 			);
 			name = PortableFSKitDev;
+			packageProductDependencies = (
+				100000000000000000000902 /* PortableFSAppCore */,
+			);
 			productName = PortableFSKitDev;
 			productReference = 100000000000000000000301 /* PortableFSKitDev.app */;
 			productType = "com.apple.product-type.application";
@@ -167,9 +173,19 @@
 				TargetAttributes = {
 					100000000000000000000501 = {
 						CreatedOnToolsVersion = 26.6;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups = {
+								enabled = 1;
+							};
+						};
 					};
 					100000000000000000000502 = {
 						CreatedOnToolsVersion = 26.6;
+						SystemCapabilities = {
+							com.apple.ApplicationGroups = {
+								enabled = 1;
+							};
+						};
 					};
 				};
 			};
@@ -211,6 +227,29 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		100000000000000000000608 /* Embed PortableFS tools */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/../PortableFSApp/Config/PortableFSHelpers.entitlements",
+			);
+			name = "Embed PortableFS tools";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Helpers/portablefs",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/PortableFSDService.app/Contents/MacOS/portablefsd",
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchAgents/$(PRODUCT_BUNDLE_IDENTIFIER).portablefsd.plist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "PORTABLEFS_NATIVE_QUALIFICATION= \"$SRCROOT/../PortableFSApp/Scripts/embed-portablefs-tools.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		100000000000000000000604 /* Host Sources */ = {
@@ -281,6 +320,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 100000000000000000000801 /* Development.xcconfig */;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PortableFSKitDev/PortableFSKitDev.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -293,7 +333,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 0.3.0;
 				INFOPLIST_KEY_CFBundleDisplayName = "PortableFS OSS Dev";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -307,6 +347,7 @@
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 100000000000000000000801 /* Development.xcconfig */;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = PortableFSKitDev/PortableFSKitDev.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
@@ -319,7 +360,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 0.3.0;
 				INFOPLIST_KEY_CFBundleDisplayName = "PortableFS OSS Dev";
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -346,7 +387,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev.PortableFSDev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -374,7 +415,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				MARKETING_VERSION = 1.0;
+				MARKETING_VERSION = 0.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = dev.portablefs.oss.KitDev.PortableFSDev;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SKIP_INSTALL = YES;
@@ -427,6 +468,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 100000000000000000000900 /* XCLocalSwiftPackageReference "../PortableFSKit" */;
 			productName = PortableFSKit;
+		};
+		100000000000000000000902 /* PortableFSAppCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 100000000000000000000900 /* XCLocalSwiftPackageReference "../PortableFSKit" */;
+			productName = PortableFSAppCore;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

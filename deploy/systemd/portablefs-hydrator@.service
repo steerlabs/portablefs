@@ -8,7 +8,7 @@ Description=PortableFS hydrator for volume %i
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/portablefs-hydrator
+ExecStart=/opt/portablefs/current/bin/portablefs-hydrator
 Restart=no
 NoNewPrivileges=yes
 CapabilityBoundingSet=

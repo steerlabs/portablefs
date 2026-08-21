@@ -16,23 +16,24 @@ func TestClientExposesItsSessionID(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, handler, 5, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
-		Address: address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         address, TLS: clientTLS, VolumeID: "volume", AccessToken: []byte("cap"),
 		ReplaySlots: 5, MaxFrame: testMaxFrame, DialTimeout: time.Second,
 		CancelDrainTimeout: time.Second, MaxInFlight: 5,
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity: 4096, RepairBudget: 2 * time.Second,
-		NamespaceRepair: authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE,
+		ObservePreKernelMountAbsence: testPreKernelMountAbsence,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
 	id := client.SessionID()
-	if len(id) != 16 || !bytes.Equal(id, make([]byte, 16)) {
+	want := bytes.Repeat([]byte{0x52}, 16)
+	if len(id) != 16 || !bytes.Equal(id, want) {
 		t.Fatalf("SessionID = %x, want the 16-byte attach-reply session ID", id)
 	}
 	id[0] = 0xff
-	if client.SessionID()[0] != 0 {
+	if client.SessionID()[0] != want[0] {
 		t.Fatal("SessionID handed out its internal buffer")
 	}
 }

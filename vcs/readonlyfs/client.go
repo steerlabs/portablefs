@@ -16,6 +16,7 @@ import (
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
@@ -23,6 +24,9 @@ const (
 	defaultRequestTimeout = 30 * time.Second
 	maximumListEntries    = 500
 	authorityListPage     = 256
+	// repairBudget is the per-phase deadline this cacheless session commits to.
+	// It has nothing to purge, so the budget only bounds transport latency.
+	repairBudget = 10 * time.Second
 )
 
 type Config struct {
@@ -69,7 +73,16 @@ type authorityClient interface {
 	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	Close() error
+	// ReleaseBeforeMount is the authenticated detach for an ACTIVE session that
+	// never installed a kernel mount. That is the abort path for a mount
+	// supervisor and the permanent condition of this client, so it is the exact
+	// contract to leave on: it observes this process's own mount-absence
+	// evidence, sends Detach, and closes.
+	ReleaseBeforeMount(context.Context) error
 	IOLimits() (uint32, uint32)
+	InitialVisibilityCursor() *authoritypb.VisibilityCursor
+	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
+	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	Root() *authoritypb.Item
 	SessionLease() time.Duration
 }
@@ -83,6 +96,7 @@ type Client struct {
 	fatalMu        sync.Mutex
 	fatal          error
 	closeOnce      sync.Once
+	workers        sync.WaitGroup
 }
 
 func Dial(ctx context.Context, config Config) (*Client, error) {
@@ -97,15 +111,34 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("readonlyfs: client identity: %w", err)
 	}
-	rpc, _, err := mountv3.AttachWithRoutes(ctx, authorityrpc.ClientConfig{
-		AccessToken:        append([]byte(nil), config.Capability...),
-		Address:            config.Address,
-		CancelDrainTimeout: mountv3.CancelDrainTimeout,
-		CoherenceProfile:   authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED,
-		DialTimeout:        mountv3.DialTimeout,
-		MaxFrame:           mountv3.MaxFrame,
-		MaxInFlight:        mountv3.MaxInFlight,
-		ReplaySlots:        mountv3.ReplaySlots,
+	// The gateway is not a mount: it holds no kernel namespace, no page cache,
+	// and no lease state. Protocol-6 offers exactly two frontend contracts, and
+	// the synchronous-repair one is the only one that grants no cache leases, so
+	// it is the honest declaration here — every repair phase completes
+	// immediately for a client that caches nothing. Declaring the Linux lease
+	// profile would claim recall participation this client cannot honor and
+	// would stall writers behind a reader that never caches.
+	rpc, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
+		AccessToken:             append([]byte(nil), config.Capability...),
+		Address:                 config.Address,
+		CancelDrainTimeout:      mountv3.CancelDrainTimeout,
+		DialTimeout:             mountv3.DialTimeout,
+		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
+		FskitCachedNameCapacity: 1,
+		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT,
+		FskitRepairBudget:       repairBudget,
+		MaxFrame:                mountv3.MaxFrame,
+		MaxInFlight:             mountv3.MaxInFlight,
+		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
+			return &authoritypb.MountAbsenceProof{
+				ObservedUnixNanos: time.Now().UnixNano(),
+				Observation:       []byte("portablefs-files has no kernel mount, FUSE connection, or namespace cache"),
+				Component:         "portablefs-files/no-kernel-mount",
+			}, nil
+		},
+		Purpose:        authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		ReplaySlots:    mountv3.ReplaySlots,
+		RoutesRevision: localroutes.RuleSet{}.Revision(),
 		TLS: &tls.Config{
 			Certificates: []tls.Certificate{identity},
 			MinVersion:   tls.VersionTLS13,
@@ -113,7 +146,7 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 			ServerName:   config.AuthorityServerName,
 		},
 		VolumeID: config.VolumeID,
-	}, false)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +160,19 @@ func newClient(rpc authorityClient, timeout time.Duration) *Client {
 	maxRead, _ := rpc.IOLimits()
 	keepaliveContext, stop := context.WithCancel(context.Background())
 	client := &Client{rpc: rpc, requestTimeout: timeout, maxRead: maxRead, stop: stop, done: make(chan struct{})}
-	go client.keepalive(keepaliveContext)
+	client.workers.Add(2)
+	go func() {
+		defer client.workers.Done()
+		client.keepalive(keepaliveContext)
+	}()
+	go func() {
+		defer client.workers.Done()
+		client.acknowledgeVisibility(keepaliveContext)
+	}()
+	go func() {
+		client.workers.Wait()
+		close(client.done)
+	}()
 	return client
 }
 
@@ -323,7 +368,6 @@ func (c *Client) operationContext(parent context.Context) (context.Context, cont
 }
 
 func (c *Client) keepalive(ctx context.Context) {
-	defer close(c.done)
 	lease := c.rpc.SessionLease()
 	if lease <= 0 {
 		c.fail(errors.New("readonlyfs: authority omitted its session lease"))
@@ -354,10 +398,35 @@ func (c *Client) keepalive(ctx context.Context) {
 	}
 }
 
+// A files reader keeps no kernel or userspace namespace cache. Protocol 5 has
+// one coherent session model, so this cacheless participant still joins the
+// visibility stream and acknowledges each phase only after it has observed it.
+func (c *Client) acknowledgeVisibility(ctx context.Context) {
+	cursor := c.rpc.InitialVisibilityCursor()
+	if cursor == nil {
+		c.fail(errors.New("readonlyfs: authority omitted its initial visibility cursor"))
+		return
+	}
+	// A cacheless session has nothing to purge, so each repair phase is
+	// discharged by acknowledging it and polling the next one.
+	var event *authoritypb.VisibilityEvent
+	event, err := c.rpc.NextVisibility(ctx, cursor)
+	for err == nil {
+		if err = c.rpc.AckVisibility(ctx, event.GetCursor()); err != nil {
+			break
+		}
+		event, err = c.rpc.NextVisibility(ctx, event.GetCursor())
+	}
+	if ctx.Err() == nil {
+		c.fail(fmt.Errorf("readonlyfs: authority visibility stream: %w", err))
+	}
+}
+
 func (c *Client) fail(err error) {
 	c.fatalMu.Lock()
 	if c.fatal == nil {
 		c.fatal = err
+		c.stop()
 		_ = c.rpc.Close()
 	}
 	c.fatalMu.Unlock()
@@ -373,12 +442,35 @@ func (c *Client) sessionError() error {
 // as ENOENT do not poison the session and are not returned here.
 func (c *Client) Err() error { return c.sessionError() }
 
+// detachBudget bounds the authenticated detach on Close. Leaving without
+// detaching is not free: the authority keeps this session in the barrier
+// audience, so the next peer mutation waits this session's whole repair budget
+// for a phase nobody will acknowledge before the authority expels it. A
+// departure that costs a round trip is strictly better than one that costs a
+// writer a budget, so Close spends a bounded amount of time on it and gives up
+// rather than hanging.
+const detachBudget = 10 * time.Second
+
+// Close ends the session, detaching first.
+//
+// The workers stop before the detach rather than after it. Both of them treat a
+// failed call as a terminal session cause, and the detach deliberately ends the
+// session underneath them -- a visibility poll outstanding across it would
+// report the departure it was asked for as a fatal error.
+//
+// A session that already has a terminal cause does not detach: there is nothing
+// live to detach, and Err has already told the caller so.
 func (c *Client) Close() error {
 	var closeErr error
 	c.closeOnce.Do(func() {
 		c.stop()
-		closeErr = c.rpc.Close()
 		<-c.done
+		if c.sessionError() == nil {
+			detachContext, cancel := context.WithTimeout(context.Background(), detachBudget)
+			closeErr = c.rpc.ReleaseBeforeMount(detachContext)
+			cancel()
+		}
+		closeErr = errors.Join(closeErr, c.rpc.Close())
 	})
 	return closeErr
 }

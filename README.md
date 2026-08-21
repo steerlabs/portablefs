@@ -5,17 +5,27 @@ several machines at once. Every mount reads and writes the same current
 filesystem. There are no commits, no branches, and no user-visible history: the
 mounted tree is the product.
 
+Protocol 6 is under implementation and qualification. The writable Linux profile
+supports exact append, placed by the authority at the true EOF. macOS 26
+and 27 remain available through an explicit FSKit synchronous-repair profile;
+that profile is useful but does not claim Linux-equivalent cache withdrawal.
+The contracts below state the target and its blockers, not a claim that this
+migration has completed qualification.
+
 One volume is one XFS project directory on one Linux host, served by one
 `portablefs-authority` process. XFS is the only durable filesystem truth.
-PortableFS adds authentication, object capabilities, session-exact replay,
-distributed POSIX locks, and — for cached frontends — a synchronous visibility
-barrier. It adds no second inode tree, no mutation log, no checkpoint format,
-and no PortableFS-managed or offline write-back layer. Ordinary kernel page
-caches still obey each operating system's filesystem contract.
+PortableFS adds authentication, object capabilities, session-exact replay, an
+authority implementation of distributed POSIX locks, and authority-issued
+cache leases. Linux uses stock FUSE protocol 7.31 or newer and forwards those
+locks. macOS uses a separate, explicitly declared protocol-6
+`FSKIT_SYNC_REPAIR` profile: the authority orders its existing PREPARE/COMPLETE
+repair around the same XFS mutation, while the daemon drives the best cache
+repair the host API exposes. PortableFS adds no second inode tree, mutation
+log, checkpoint format, or managed or offline write-back layer.
 
 ```text
-Linux FUSE mount            macOS FSKit mount
-       \                          /
+stock Linux FUSE 7.31+ mounts     macOS 26/27 FSKit mounts
+                 |
         mutually authenticated TLS 1.3
                      |
         portablefs-authority (one per volume)
@@ -78,8 +88,9 @@ On macOS there is no standalone CLI. PortableFS ships only as the notarized
 extension as one signed unit. The installer audits the zip before extraction,
 then checks the Developer ID signature, the hardened runtime, Gatekeeper
 assessment, and the exact bundle identity: team ID, bundle identifier, app
-group, FSKit type, and resource scheme, with the CLI, daemon, and extension all
-agreeing on that tuple. Enabling the extension under System Settings is a
+group, FSKit type, and resource scheme. Host, daemon, and extension share the
+exact app-group entitlement; the shell CLI is explicitly unentitled while its
+stamped routing identity still matches. Enabling the extension under System Settings is a
 one-time manual step Apple does not let an installer perform.
 
 What establishes a release's identity, and the one known gap in the release
@@ -105,14 +116,15 @@ portablefs-authority \
   -tls-cert server.pem -tls-key server.key \
   -client-ca clients-ca.pem \
   -capability-public-key capability.pub.pem \
-  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership
+  -visibility-membership-file /srv/portablefs/.portablefs-control/my-workspace/membership \
+  -write-staging-dir /srv/portablefs/.portablefs-control/my-workspace/write-staging
 ```
 
-Then mount it, as above. On clean unmount the official mount supervisor first
-makes its exact kernel mount terminal, then sends a session-authenticated detach
-observation. The authority deactivates only that session's durable membership.
-If the supervisor crashes, cannot establish terminal mount state, or cannot
-deliver the detach, membership remains active and restart still fails closed.
+Then mount it, as above. On clean unmount the supervisor closes the FUSE
+connection, returns its leases, and sends a session-authenticated detach. If the
+supervisor crashes, the authority fences the session and reclaims its leases
+only after their conservative TTL bound. A restart grace period prevents a new
+mutation from racing leases the restarted authority no longer has in memory.
 
 Full operator guidance — provisioning, credentials, bounds, restart, and backups
 — is in [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md).
@@ -127,9 +139,11 @@ The repository also contains a product-neutral hosted foundation:
 - `portablefs-cell-agent` is unprivileged and outbound-only.
 - `portablefs-cell-helper` is the narrow root/XFS boundary and independently
   verifies signed plans.
-- `portablefs-files` is an optional unprivileged read gateway for a product's
-  human file browser. It uses standalone short read grants and talks directly
-  to authorities; it never mounts, indexes, copies, or watches a volume.
+- `portablefs-files` is an optional unprivileged, bounded read gateway for a
+  product's human file browser. It uses standalone short read grants and holds
+  short-lived authority sessions for live volumes; ARCHIVED volumes are read
+  directly from their sealed manifest and packs. It never mounts, indexes,
+  copies, watches, or caches a volume.
 - systemd owns each listener and supervises one sandboxed, unprivileged
   authority per active volume.
 
@@ -152,28 +166,29 @@ unprivileged reference image.
 - **XFS is the truth.** There is no PortableFS journal, manifest, checkpoint, or
   content index. XFS's own metadata journal is a crash-recovery mechanism inside
   XFS; it is not PortableFS history and is not user-visible.
-- **Protocol writes are through.** Linux direct-I/O `write(2)`, and every write
-  callback FSKit sends, return only after the authority applied the reported
-  bytes to XFS. macOS may acknowledge an application `write(2)` into its ordinary
-  kernel page cache before invoking FSKit; `fsync`/synchronize is the explicit
-  authority boundary there. PortableFS adds no daemon or offline write-back tail.
+- **Protocol writes are through.** Linux write-capable opens use stock FUSE
+  direct I/O. `write(2)` returns only after the authority applies the bytes to
+  XFS and discharges conflicting peer data leases. PortableFS adds no daemon or
+  offline write-back tail.
 - **`fsync` means fsync.** A successful `fsync`/`fdatasync` means the authority
   completed it on the authoritative open file description. `close` is not an
-  implicit `fsync`. On regular FUSE, `syncfs(2)` does not reach the authority at
-  all, so applications that need a durability boundary use file and directory
-  `fsync`.
+  implicit `fsync`. `FUSE_SYNCFS` is used when the stock kernel advertises it;
+  kernels at the 7.31 floor predate that request, so PortableFS does not claim a
+  remote-volume `syncfs(2)` barrier there.
 - **Execution is session-exact.** Duplicate delivery inside a live epoch returns
   the retained outcome from a replay slot and never re-executes. Nothing is
   silently continued across an epoch: a mutation whose reply is lost to authority
   death is reported `UNCERTAIN`, and the application inspects current state.
   Transparent exactly-once across server death is not claimed.
-- **Visibility is two-phase for cached mounts.** With a strict frontend attached,
-  a cache-affecting mutation quiesces every participant, applies to XFS, repairs
-  and collects acknowledgements, and only then returns. A mount that misses its
-  declared repair budget is fenced individually; the volume keeps serving.
-- **POSIX stays POSIX.** Atomic rename decides whole-file replacement. Open
-  descriptors keep working after unlink until final close. POSIX record locks and
-  BSD `flock` are distributed and independent of each other.
+- **Cached state is lease-governed.** Name, attribute, clean-data, and complete
+  directory-enumeration caches require authority leases. A conflicting mutation
+  recalls those leases, applies to XFS, and returns only after peer discharge.
+  A nonresponsive holder is fenced and the mutation waits for lease expiry.
+- **The platform contract stays explicit.** Atomic rename decides whole-file
+  replacement, and open descriptors keep working after unlink until final
+  close. Linux POSIX record locks and BSD `flock` are distributed and
+  independent. macOS declares the separate FSKit synchronous-repair profile and
+  its weaker cache, append, and lock edges rather than claiming Linux semantics.
 
 ## What PortableFS is not
 
@@ -181,9 +196,10 @@ unprivileged reference image.
   `adopt`. That was the v2 product, and the v3 reset removed its journal and
   journal control plane. The hosted v3 manager controls placement and access;
   it never stores filesystem history. See [COMPATIBILITY.md](./COMPATIBILITY.md).
-- **Not eventually consistent.** There is no asynchronous invalidation stream
-  that a reader can race. Either a mount holds no cached state for a name, or the
-  authority repaired it synchronously before the mutation returned.
+- **Not eventually consistent.** A cache right is discharged before a
+  conflicting mutation returns. The two bounded stock-FUSE clean-data
+  residuals are disclosed in the consistency contract rather than hidden as a
+  weaker mode.
 - **Not offline-capable.** There is no local write-back tail to replay. A mount
   that cannot reach its authority stops serving rather than diverging.
 - **Not a multi-user filesystem yet.** A volume is single-principal: every inode
@@ -197,33 +213,41 @@ unprivileged reference image.
 
 | Platform | Transport | Status |
 | --- | --- | --- |
-| Linux | kernel FUSE (`vcs/internal/fusev3`) | Production path. `strict` (default) and `uncached` profiles; proven by the privileged XFS + kernel-FUSE gate and the two-mount coherence matrix. |
-| macOS 26 | `portablefsd` v3 data plane + FSKit extension | Runs under the declared compatibility policy `macos26-synchronous-vfs-repair-v2`. The final macOS 26.5 breadth, retry-free saturation, same-vnode attribute/data, daemon-death revocation/recovery, and clean-detach runs are live-proven against Linux FUSE and raw XFS. Exact overlapping operations may surface definite-preapply `ECANCELED`; authority `EINTR` never crosses the FSKit edge. |
-| macOS 27 | native FSKit cache control (`DataCacheHandler`) | Primary target. No implementation exists; gated on the final SDK. Selecting the native policy today fails closed with `ENOTSUP`. |
+| Linux | stock kernel FUSE protocol 7.31+ (`vcs/internal/fusev3`) | The protocol-6 implementation target. Writable `O_APPEND` is supported and exact: the authority places every append at the true EOF under its per-inode writer stripe. Stock FUSE does not forward the per-call `RWF_APPEND`/`RWF_NOAPPEND` flags, and those two cases are disclosed deviations rather than guesses made from a cached offset. No private kernel capability or opcode is accepted. CI currently exercises one hosted Ubuntu stock kernel; the broader LTS matrix remains an open qualification gate. |
+| macOS 26 | FSKit synchronous VFS repair | Supported by the explicit protocol-6 FSKit profile. Mutations are ordered through PREPARE/COMPLETE, but host cache repair remains best-effort and append/lock/cache edges are not claimed equivalent to Linux. |
+| macOS 27 | FSKit synchronous VFS repair; separately signed native `DataCacheHandler` build | The ordinary app uses the same admitted v2 repair contract as macOS 26. A build-stamped native artifact strengthens retained-data revocation. Neither claims exact namespace/attribute withdrawal, append intent, or distributed locks. |
 
-The macOS 26 policy is an explicitly declared, owner-accepted compatibility
-policy with a bounded contract — never an automatic fallback and never a silent
-downgrade. Its exact callback-provenance deviations, live proofs, and remaining
-breadth/fault gates are in
+The macOS 26 policy and its historical measurements remain evidence for that
+weaker profile. The remaining platform gaps are in
 [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md).
 
 ## Development and verification
 
 ```bash
-bash scripts/verify-local.sh        # the single local merge gate
+bash scripts/verify-local.sh          # fast: everything that needs no Docker
+bash scripts/verify-local.sh --full   # + both privileged real-mount suites
 ```
 
-`verify-local.sh` runs cross-OS Go builds and vet, the Go suite, the Go race
-suite, the Swift suite (`swift test --package-path swift/PortableFSKit
---no-parallel`; serial execution is required, not a tuning knob), the
-release-trust policy checkers, and a stale-architecture scan.
+The default mode runs no real mount and says so: it closes by naming every gate
+it skipped and pointing at the CI lanes that run them. `--full` adds
+`scripts/xfs-fuse-integration.sh` and `scripts/coherence-matrix-linux.sh`, which
+need Docker and free loop devices.
+
+`verify-local.sh` runs cross-OS Go builds and vet, the pinned reachable-call
+vulnerability scan, the Go suite, the Go race suite, the native Xcode Swift
+gate on macOS, pinned workflow semantic validation, the release-trust policy
+checkers, and a stale-architecture scan. The Xcode gate separately enumerates
+the test inventory, executes one test process, and requires the xcresult to
+contain the same unique all-passing set. Socket-backed integration tests
+declare their process-wide resource constraint through a serialized Swift
+Testing suite; pure tests remain parallel.
 
 Deeper gates:
 
 ```bash
-bash scripts/xfs-fuse-integration.sh    # privileged: real XFS + kernel FUSE, 44 required tests
-bash scripts/coherence-matrix-linux.sh  # 23-case two-mount black-box matrix, with falsifiability controls
-bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume, recorded not gated
+bash scripts/xfs-fuse-integration.sh    # privileged: stock kernel FUSE + real XFS
+bash scripts/coherence-matrix-linux.sh  # stock kernel, two-mount black-box matrix
+bash scripts/package-manager-matrix.sh  # npm/yarn/bun installs on a shared volume; on demand, not a CI lane
 ```
 
 The macOS matrix runs against two already-mounted paths, optionally with a
@@ -237,13 +261,17 @@ scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-
 
 - [docs/architecture.md](./docs/architecture.md) — the product contract, in brief.
 - [docs/xfs-authority-architecture.md](./docs/xfs-authority-architecture.md) — the
-  full v3 design, failure model, security boundaries, and proof gates.
+  XFS authority, confinement, and storage foundation.
+- [docs/portable-coherence.md](./docs/portable-coherence.md) — the protocol-6
+  stock-FUSE lease architecture and proof obligations.
 - [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md) — running
   a volume yourself.
 - [docs/hosted-control-plane.md](./docs/hosted-control-plane.md) — the hosted
   manager, authorization, lifecycle, fencing, and deliberate v1 limits.
 - [docs/hosted-cell-deployment.md](./docs/hosted-cell-deployment.md) — deploying
   the outbound agent, root helper, and systemd authority units on a cell.
+- [docs/opensteer-production-deployment.md](./docs/opensteer-production-deployment.md) —
+  the single matched server/client promotion path used by OpenSteer.
 - [docs/consistency-model.md](./docs/consistency-model.md) — the exact
   visibility, durability, and retry rules.
 - [docs/failure-modes.md](./docs/failure-modes.md) — what breaks, and what a

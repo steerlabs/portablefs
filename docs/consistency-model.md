@@ -1,6 +1,8 @@
 # Consistency model
 
-Status: **v3 application-visible contract**
+PortableFS v3 has one exact consistency profile: authority protocol 6 on stock
+Linux FUSE protocol 7.31 or newer, under the N/A/D/E lease algorithm. There is
+no uncached profile, private kernel dialect, or negotiated downgrade.
 
 PortableFS v3 has one canonical representation per volume, selected by
 `(State, ArchiveCycleStep)`. READY uses the mounted XFS instance; ARCHIVED uses
@@ -12,9 +14,24 @@ write-back cache, or history. Ordinary kernel page caches still exist. The
 architectural decision behind that is in
 [xfs-authority-architecture.md](./xfs-authority-architecture.md).
 
-This document states what an application may rely on.
+macOS is the second declared profile, `FSKIT_SYNC_REPAIR`, and it is not the
+Linux profile with weaker timings — it is **explicit writer ownership**. A
+mounted Mac holds the volume's compatibility writer lease: it is the volume's
+only writer, Linux peers stay mounted and read its changes, a Linux visible
+mutation is refused `EBUSY` before prepare and before any XFS apply, and a
+second Mac is refused `EBUSY` at attach before durable membership or runtime
+activation. Clean Mac unmount releases the lease and Linux may write again. This
+is an admitted, named mode — not a hidden fallback — and it is explicitly **not**
+symmetric multi-writer coherence. Its boundaries are specified in
+[macos-26-coherence-contract.md](./macos-26-coherence-contract.md) and enforced
+in the authority's visibility coordinator.
 
-## Where truth lives
+The normative lease and invalidation algorithm is
+[portable-coherence.md](./portable-coherence.md). This document states the
+filesystem behavior applications may rely on. Unless a statement below names
+macOS, it describes the Linux lease profile.
+
+## Truth and operation ordering
 
 For a READY live volume the source of truth is exactly the mounted XFS instance:
 its VFS and page-cache state, its metadata journal, and the persisted device
@@ -31,45 +48,38 @@ cross-machine read-after-write is possible at all without merging separate
 local folders. Mounts are not independent sources of truth and never reconcile
 with each other.
 
-One naming trap is worth stating plainly: the data-plane wire version is
-`ProtocolMajor = 3` and its ALPN identifier is `portablefs-authority-v3`
-(`vcs/internal/authorityrpc/protocol.go`). That is the *protocol's* major
-version, not the product's. It is unrelated to the retired v2 architecture, and
-a v2 client and a v3 authority fail their handshake rather than enter a mixed
-mode. Protocol 3 classifies Lookup and every other resource acquisition as an
-exact-replay operation, so a lost successful reply cannot allocate an
-unreachable second capability on retry.
+Supported filesystem operations on Linux lease mounts are linearizable, except
+where this document names a residual: reverse dentry rendering (below), and the
+two stock-FUSE read-cache residuals under *File data and mappings*. Those are
+enumerated exceptions to this sentence, not qualifications of it. A mutation
+linearizes after its authoritative XFS apply and before its response, at a point
+consistent with overlapping observations. The response is the external completion/visibility
+boundary, not necessarily the exact linearization instant. Before the daemon
+permits it, every conflicting peer cache lease has been discharged. An
+operation whose relevant cache acquisition begins after that response observes
+the mutation or something ordered later. An overlapping operation may observe
+either side; if it observes new state, the mutation linearizes before that
+observation.
+
+The authority's internal COMPLETE result is an ordering barrier, not an
+externally visible linearization receipt. Stock FUSE completes the source mount's normal
+VFS reply processing before the syscall returns. No kernel publication receipt
+or PortableFS-private opcode participates.
 
 ## Write acceptance and durability
 
-The data-plane acknowledgement and authority application are the same event.
-The application syscall boundary depends on the frontend kernel contract.
+- Linux write-capable opens use direct I/O and writeback caching is disabled.
+  A successful `write(2)` means the authority applied the accepted bytes to XFS
+  and discharged conflicting D leases. No dirty client data remains to flush.
+- `fsync(2)` and `fdatasync(2)` run on the authoritative open file description
+  and are the durability barriers. `close(2)` is not an implicit `fsync`.
+- Namespace atomicity comes from the authoritative XFS syscall. Durable rename,
+  replacement, or creation still requires the application's ordinary
+  file-and-directory fsync discipline.
+- Protocol 6 uses FUSE `SYNCFS` when the stock kernel advertises it. FUSE 7.31
+  predates that request, so `syncfs(2)` is not a PortableFS remote-volume
+  durability promise on every supported kernel. The absence is not emulated.
 
-- **Linux direct-I/O `write(2)` returns only after authority application.**
-  There is no PortableFS write-back engine or local mutation log.
-- **macOS may first accept bytes into its kernel page cache.** Application
-  `write(2)` can return before FSKit submits those bytes. Every FSKit write
-  callback is still authority-through, and `fsync`/synchronize waits for the
-  authority. An application that needs a cross-machine completion boundary on
-  macOS must use `fsync`; `close` alone is not that boundary.
-- **`fsync`/`fdatasync` wait on the authoritative server file description.** A
-  successful return means the authority completed `fsync(2)` or `fdatasync(2)`
-  against that descriptor, with the ordinary
-  [Linux durability contract](https://man7.org/linux/man-pages/man2/fsync.2.html).
-- **`close` is not an implicit `fsync`.** It is not a remote durability or
-  cross-machine completion boundary on either frontend.
-- **`syncfs(2)` is not a remote durability boundary on ordinary FUSE.** The
-  kernel currently issues `FUSE_SYNCFS` only for `fuseblk` mounts, so a
-  `syncfs` completion on a PortableFS mount says nothing about XFS on the
-  authority. Applications use file `fsync` plus `fsync` of the changed parent
-  directory or directories, exactly as on local Linux. PortableFS does not
-  pretend otherwise; see the
-  [current kernel implementation](https://github.com/torvalds/linux/blob/master/fs/fuse/inode.c#L721-L759).
-- **A namespace operation is atomically visible when its XFS syscall
-  completes.** Making it durable across power loss is the caller's ordinary
-  file-and-directory `fsync` discipline.
-- **Two whole-file replacements are ordered atomic renames.** The later ordered
-  rename wins. PortableFS never merges file contents.
 - **RESTORING uses the archive ordering contract.** Before the authority
   acknowledges a partial-chunk write, shortening truncate, or read-modify-write,
   verified base bytes are durable in XFS and the hydration mark is durable; the
@@ -78,17 +88,23 @@ The application syscall boundary depends on the frontend kernel contract.
   These are exactly the orderings in
   [restore-mode.md](./tiered-storage/restore-mode.md#hydration-map).
 
-Because there is no client-side durability debt, `umount --force` has nothing
-to park and nothing to replay: it only gives up on proving the drain.
+## Cache leases
 
-## Cross-mount visibility
+Caching is allowed only under an authority lease:
 
-The application-visible boundary is the same on both Linux profiles: if a
-mutation `M` returned success before an operation `R` began on any mount of the
-same volume, `R` does not observe namespace, attributes, size, or data older
-than `M`, unless something ordered after `M` changed them again. An operation
-that overlaps `M` may observe either side, as it could between two processes on
-one machine.
+| Coordinate | Covered state |
+| --- | --- |
+| N(parent stable ID, raw name) | one positive or negative name binding |
+| A(stable ID) | the complete attribute record |
+| D(stable ID, whole file) | clean file data and read-ahead |
+| E(directory stable ID) | a complete directory membership enumeration |
+
+Kernel entry validity is always zero. Attribute validity is a conservative
+duration derived from the authority TTL and anchored at the client's
+request-start time. Network and processing delay can only reduce the installed
+duration; the client does not compare an authority absolute timestamp against
+its own wall clock. Daemon cache hits check the same request-anchored deadline
+and coordinate cursor. A reply without a covering lease carries zero validity.
 
 During RESTORING, a read of content not yet hydrated blocks until the authority
 has fetched, verified, and written that content, bounded by the recall deadline,
@@ -96,190 +112,159 @@ or fails with the named restore error carrying `FAILURE_CLASS_RESTORE`. It never
 returns stale bytes, a partial chunk, or zero-filled sparse placeholders as file
 content.
 
-Two profiles reach that boundary by opposite means, and `--coherence` selects
-between them (`vcs/internal/fusev3`):
+A conflicting mutation closes grant admission, recalls the conflicting rights,
+applies to XFS, sends exact post-state, and waits for peer discharge before the
+source response. Because D leases cover the whole file in v1, D recall always
+purges the whole file and returns the lease to none. Range purge and successor
+continuity are future protocol work, not a v1 discharge mode.
 
-- **`uncached`** (Linux only) caches nothing, so there is nothing to
-  invalidate. Entry and attribute timeouts are zero on every reply, regular
-  files open with `FOPEN_DIRECT_IO`, and every `read(2)`, `stat(2)` and path
-  resolution reaches the authority. There is no invalidation schedule that can
-  be late, because there is no cached answer to be stale. The cost is that a
-  repeated read cannot be served without a round trip.
-- **`strict`** (the default) caches names and attributes in the kernel and pays
-  for them by executing the authority's visibility barrier synchronously: for a
-  cache-visible mutation, every strict participant receives PREPARE, the XFS
-  syscall runs, and peers repair and acknowledge COMPLETE *before* the
-  mutation's reply is returned to its caller. The initiating mount receives a
-  deferred COMPLETE and must acknowledge its own kernel publication before its
-  next mutation. Visibility polling and acknowledgements use a reserved client
-  lane so the event stream cannot consume the last ordinary request slot.
+The daemon has an ordered installing lane for cache-bearing replies and
+invalidations, plus a non-installing metadata lane for zero-validity replies.
+Buffered READ is different: an already-admitted writer drains before recall
+acknowledgment, and a new request at a closed cut receives `EAGAIN` rather than
+waiting while it may hold a folio lock.
 
-Both profiles are held to the same contract and are run against the same case
-list by `scripts/coherence-matrix-linux.sh`
-(`PORTABLEFS_COHERENCE=strict|uncached`), because the entire point is that an
-application cannot tell them apart. That matrix is black box: it drives two
-real mountpoints through ordinary syscalls, compares content against the bytes
-a descriptor actually returns when read to EOF rather than against `stat.Size`,
-compares the namespace against the entries `readdir` actually enumerates,
-compares an atomic replacement against the inode number the *other* mount
-resolves, and never polls or retries. It also proves a red result is reachable
-before reporting a green one. See
-[cross-mount-coherence-matrix.md](./cross-mount-coherence-matrix.md).
+The mutating mount uses a source obligation rather than a self-recall. Its
+daemon purges A/D/E and daemon N state before replying. Kernel entry validity
+is always zero, so `d_move`/`d_exchange` cannot transplant an old leased name
+timeout and source discharge needs no undocumented namespace-notification
+receipt.
 
-When no strict participant is attached, the volume-wide visibility ticket is
-absent entirely and ordinary XFS concurrency is unchanged. The serialization
-exists only to close kernel publication gates, not to serialize the filesystem.
+This guarantee is for forward pathname resolution. Reverse rendering of an
+already-retained dentry (`getcwd`, `/proc/*/fd`, and other `d_path` users) does
+not revalidate and is outside the cross-mount coherence contract. Directory
+enumeration remains covered by E.
 
-### macOS
+## Names, attributes, and directories
 
-`portablefs mount` on macOS runs the portablefsd v3 data plane plus the FSKit
-extension under the declared compatibility cache policy
-`macos26-synchronous-vfs-repair-v2`. FSKit requires `--coherence strict`;
-`uncached` is Linux-only and the CLI says so rather than silently downgrading.
-That policy's bounded semantics, its unmet gates, and the reasons it must not
-be treated as a silent fallback are in
-[macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
+Positive and negative name bindings are cached by the daemon only under N
+leases; kernel entry validity remains zero. A creation recalls the negative
+binding it fills; unlink or rename recalls the positive binding it removes.
+Attribute replies are cached only under A leases.
 
-### Shared file-backed mmap is unsupported, not incoherent
+Directory enumeration uses plain READDIR. The daemon may cache a complete,
+possibly paginated enumeration only under E. Any namespace mutation touching
+the directory recalls E. Kernel directory caching and READDIRPLUS are not used,
+so there is no untracked membership or post-reply entry installation.
 
-PortableFS does not advertise `CAP_DIRECT_IO_ALLOW_MMAP`, so Linux refuses both
-writable and read-only `MAP_SHARED` mappings of a volume file rather than
-creating mapped pages the authority cannot revoke coherently. `MAP_PRIVATE`
-remains available: it is a process-local copy-on-write view that never writes
-through, and POSIX leaves its visibility of later external changes unspecified.
-That is ordinary filesystem behaviour, not a distributed coherence promise.
-See the kernel's
-[FUSE cached/direct/write-back distinction](https://cdn.kernel.org/doc/html/latest/filesystems/fuse/fuse-io.html)
-and the [`MAP_PRIVATE` contract](https://man7.org/linux/man-pages/man2/mmap.2.html).
+Machine-local routes are outside this rule by design. A name matched by the
+volume's `.portablefs/local-dirs` declaration is served from that machine's
+local backing tree and has no cross-mount coherence.
 
-If measurement or compatibility later demands shared mappings, the only
-acceptable extension is a synchronous lease protocol in which a writer waits
-until every live holder has flushed any authorized dirty mapping and completed
-kernel invalidation, or an external proof fences the exact kernel mount. Lease
-expiry alone is not fencing, and an asynchronous event stream alone is
-insufficient because a peer could read stale pages before processing the event.
+## File data and mappings
 
-## Ordering and retry
+Read-only opens may use the clean kernel page cache under D-R. Write-capable
+opens use direct I/O; the daemon may cache their clean reads under the same lease
+clock. Shared writable mappings and every path that could create dirty client
+pages are refused. Read-only and private mappings are supported under the clean
+data regime.
 
-Linux VFS and XFS supply each syscall's atomicity. The authority adds only:
-validate the TLS peer, capability, session, epoch and operation identity;
-execute the descriptor-relative XFS operation; retain the exact reply in that
-session's same-epoch replay slot; return. Different replay slots execute
-concurrently.
+Stock FUSE does not expose whether a data invalidation internally failed with
+`EBUSY`, and a notification need not finish before the authority horizon. The
+client starts withdrawal at its earlier cache deadline and terminalizes the
+mount if withdrawal is not proved in time. Channel abort prevents new FUSE work
+but does not erase resident folios: a preexisting read-only file descriptor or
+private mapping can therefore retain old clean bytes for its lifetime. No new
+open, cache miss, metadata answer, accepted write, or durability result is
+authorized after terminalization. This is an explicit exception, not described
+as a transient window. Removing it requires a bounded, result-bearing kernel
+invalidation or cache-generation primitive.
 
-There is no honest way to atomically commit an arbitrary XFS syscall together
-with a separate durable reply record, so the boundary is made explicit rather
-than hidden:
+A stopped-but-not-dead daemon creates a second disclosed residual: it cannot run
+the expiry purge for kernel-held clean pages after the authority fences it.
+Stale data then requires the conjunction of daemon wedge, fencing, peer
+mutation, and a cached read-only page. Metadata and writes are not affected.
 
-- **Duplicate delivery inside a live epoch returns the cached outcome.** A
-  replayed identity whose request hash matches the recorded one returns the
-  stored outcome and never re-executes
-  (`ExecuteMutation`, `vcs/internal/volumeserver`).
-- **A client state defect fences the session.** Reusing a slot identity with a
-  different request, or gapping the slot sequence, proves the client lost
-  state; the authority ends that session rather than interleaving with unknown
-  history.
-- **No request is silently continued across an epoch.** Side-effect-free calls
-  may reconnect and retry inside the same epoch. A mutation may not.
-- **A mutation whose reply is lost across authority death is `UNCERTAIN`.** The
-  response carries that marker explicitly, the client never auto-retries it,
-  and the application inspects current state and decides. Append offsets and
-  namespace outcomes are never guessed.
+## Append
 
-This gives session-exact execution without inventing a second writable truth.
-**Transparent exactly-once semantics across server death are not claimed.**
+Append is exact, and the authority — not either kernel — places it. A frontend
+forwards the intent and the authority assigns the offset at the object's true EOF
+inside the same per-inode writer stripe that serializes every other size-changing
+operation, then reports that offset back. A kernel `i_size` is advisory
+throughout: it is a shadow of what a daemon last published, and a peer may have
+moved EOF since.
 
-## Locks
+The intent it forwards is the writing description's `O_APPEND`, which stock FUSE
+reports. The two per-call flags it cannot see are disclosed deviations, not
+inferences: `RWF_APPEND` on a description without `O_APPEND` arrives as an
+ordinary positioned write and is placed at the offset the kernel derived from its
+advisory `i_size`, and `RWF_NOAPPEND` on a description with `O_APPEND` is placed
+at EOF like any other append. The system never reinterprets an offset it cannot
+disambiguate: guessing "this positioned write was really an append" is exactly
+what would misplace the ordinary sequential writes that carry the same offset.
 
-POSIX record locks and BSD `flock` locks are authority-epoch runtime state
-(`vcs/internal/volumeserver`). The Linux frontend refuses to mount if the
-kernel does not forward both, because partial forwarding would silently remove
-cross-machine exclusion.
+## Replay and uncertain outcomes
 
-- `FLUSH` removes a closing process owner's POSIX locks.
-- The final `RELEASE` removes an open-file-description `flock`.
-- Session expiry, fencing, or epoch end removes everything that session held.
+Protocol 6 is session-exact within one authority epoch. Each mutation carries a
+daemon-owned operation identity; exact replay returns the retained outcome and
+does not re-execute. Identity reuse with a different canonical request or a
+sequence gap fences the session.
 
-The two namespaces stay independent, as on local Linux. A blocking request that
-would close a cycle in the wait-for graph is refused with `EDEADLK` rather than
-hanging.
+There is no honest atomic transaction spanning an arbitrary XFS syscall and a
+separate durable replay database. A mutation whose reply is lost across
+authority death is reported `UNCERTAIN`; it is never silently retried in a new
+epoch. The application inspects current state and decides. For an `UNCERTAIN`
+append that means 0..n bytes may have been placed at an offset the caller was
+never told, known only to be at or after the pre-operation EOF; recovering means
+reading the object's current state, exactly as for any other uncertain write.
 
-## Extended attributes
+## Locks and open handles
 
-`setxattr` is not exposed at launch. XFS attribute-fork blocks are
-[not charged to project quotas](https://www.kernel.org/pub/linux/utils/fs/xfs/docs/xfs_filesystem_structure.pdf),
-so project quotas cannot isolate user-xattr writes on a shared cell and a
-PortableFS-side counter could not commit atomically with XFS. Both the Linux
-frontend and a direct authority request return `EOPNOTSUPP`. Authority protocol
-v3 requires `user-xattr-readonly` at Attach, so Linux returns that fixed verdict
-locally after validating the FUSE flags; it does not consume a mutation replay
-sequence or visibility work for an operation the authority can never accept.
-Read, list and remove of pre-existing portable `user.*` attributes remain
-available; `vcs/internal/xfsstore` (`ValidateXattr`) admits only the `user.`
-namespace and excludes the reserved `user.portablefs.` prefix, so internal
-metadata, `security.*`, ACL internals and `trusted.*` never cross the remote
-boundary.
+The authority implements independent POSIX record-lock and BSD `flock`
+namespaces. Linux forwards both; a kernel or frontend that cannot provide both
+is refused. Session expiry, fencing, or epoch end releases its locks.
 
-The production v3 resolve contract carries both `xattrs=true` and
-`xattr_set_supported=false`. FSKit first validates the target item and xattr
-name, then refuses set/create/replace/upsert locally, before any daemon request
-or ordered mutation exists. Its internal refusal is Darwin `ENOTSUP` (45), but
-the FSKit boundary returns Darwin's distinct `EOPNOTSUPP` (102): XNU treats 45
-as a request to fall back to an AppleDouble `._*` file. This prevents a second
-durable xattr representation from appearing beside XFS. Read, list, and
-removal of a pre-existing portable attribute continue to forward normally.
+An open file description remains usable after unlink until final close. Rename
+and unlink operate on namespace bindings, not on the lifetime of an already-open
+authority handle. See [open-after-unlink.md](./open-after-unlink.md).
 
-Writable xattrs require a substrate with one kernel-enforced aggregate capacity
-boundary. They will not be enabled by a per-inode limit or an in-memory
-counter.
+## Extended attributes and ownership
 
-## Ownership
+Writable xattrs are refused. XFS attribute-fork blocks are not charged to
+project quota, so an in-memory or per-inode approximation would violate storage
+isolation. Portable `user.*` reads, lists, and removals remain available; the
+reserved `user.portablefs.*` prefix and non-user namespaces do not cross the
+remote boundary.
 
-The volume model is deliberately single-principal — an agent's private
-workspace, not a multi-user Unix server. Every XFS inode is owned by the volume
-worker's stable unprivileged service UID/GID, each mount projects that
-principal to its local mounting user, and a `chown` to a different principal
-fails `EPERM`. Modes, sticky and set-ID bits, timestamps and pre-existing
-portable user xattrs remain ordinary XFS state.
+Each volume is single-principal. XFS inodes are owned by the volume service
+UID/GID and mounts project that principal to the local mounting user. A change
+to another principal fails rather than creating a host-ID mapping by accident.
 
-The coherence matrix's `remote_chown_visible` case therefore skips on v3: there
-is no ownership change to observe. If multiple POSIX principals are ever
-supported it becomes assertable and must be enabled. Supporting them requires an
-explicit portable identity-mapping design and will not be approximated with host
-IDs.
+## Platform boundary
 
-## Application compatibility
+Current FSKit cannot discharge protocol 6 N, A, and E leases, control
+per-reply metadata installation, or expose exact append intent or distributed
+lock callbacks. macOS therefore uses the explicit `FSKIT_SYNC_REPAIR` profile:
+mutations retain ordered PREPARE/COMPLETE repair, while those host-cache,
+append, and lock edges remain best-effort rather than Linux-equivalent. The
+compatibility writer lease is what makes that honest — a mounted Mac writes and
+everyone else reads, so the missing FSKit invalidation primitive is never asked
+to serve a concurrent remote mutation. Cross-machine `fcntl`/`flock` exclusion
+and cross-client atomic append need Linux mounts with no Mac writer attached.
 
-SQLite in rollback-journal mode is inside the tested compatibility contract.
-SQLite WAL mode is not: its wal-index requires a shared `-shm` mapping, and
-SQLite itself requires every WAL participant to be on the same host. Presenting
-WAL as safe across mounts on different machines would be a false guarantee, not
-ordinary shared-filesystem behaviour. Keep WAL databases local or use a
-database service. See SQLite's [WAL limitations](https://www.sqlite.org/wal.html)
-and [rollback-locking protocol](https://www.sqlite.org/lockingv3.html).
-
-An open descriptor remains usable after unlink until final close; the mechanism
-and its one boundary are in [open-after-unlink.md](./open-after-unlink.md).
-
-Machine-local routes are a deliberate hole in the shared namespace: paths a
-volume declares in `.portablefs/local-dirs` are served from per-machine disk and
-carry no cross-mount coherence at all, by design. They are Linux-only, declared
-volume-wide, and pinned to a revision the authority compares at attach. See
-[graft-security.md](./graft-security.md).
+Windows has no admitted transport. A future frontend must prove exact lease
+discharge, lock forwarding, and cache behavior before it can participate.
 
 ## What is not claimed
 
 - Transparent exactly-once mutation across authority death.
-- Shared file-backed `mmap`.
-- `syncfs(2)` as a remote durability barrier on ordinary FUSE.
+- Shared writable file-backed `mmap`.
+- Remote-volume `syncfs(2)` on a kernel that does not advertise FUSE SYNCFS.
+- Symmetric multi-writer coherence with a macOS mount attached: while a Mac
+  holds the compatibility writer lease, another Mac and every Linux peer are
+  readers and their visible mutations are refused `EBUSY`.
 - Multiple POSIX principals inside one volume.
 - Writable extended attributes.
-- Read caching beyond the two declared profiles. Any future caching must be a
-  synchronous lease protocol, never hidden baseline behaviour.
 - Local-XFS read latency during RESTORING. A cold content read may pay one
   archive-store recall round trip before it returns.
 - Content-read availability during `RESTORE_BLOCKED`. Content reads are
   suspended volume-wide; namespace and attribute operations continue.
+- Production FSKit or Windows mounts.
+- Elimination of the two stock-FUSE read-cache residuals described above.
 
-Failure behaviour — what fences a session, what fences the store, and what an
-epoch change costs — is in [failure-modes.md](./failure-modes.md).
+SQLite rollback-journal mode is inside the tested Linux compatibility contract.
+SQLite WAL is not: its shared-memory protocol requires all participants on one
+host. Keep WAL databases local or use a database service.
+
+Failure scope and fencing are specified in
+[failure-modes.md](./failure-modes.md).

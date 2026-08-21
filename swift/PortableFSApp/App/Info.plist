@@ -28,5 +28,7 @@
 	<true/>
 	<key>NSSystemExtensionUsageDescriptionKey</key>
 	<string>PortableFS mounts remote volumes through its FSKit file system extension.</string>
+	<key>PFSAppGroupIdentifier</key>
+	<string>$(PORTABLEFS_APP_GROUP)</string>
 </dict>
 </plist>

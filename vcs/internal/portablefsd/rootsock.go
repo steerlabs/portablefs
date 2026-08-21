@@ -5,9 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -48,10 +48,7 @@ func (s *Server) mountRootSocketPath() string {
 
 func (s *Server) ServeMountRootHandoff(ctx context.Context) error {
 	path := s.mountRootSocketPath()
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSocket != 0 {
-		_ = os.Remove(path)
-	}
-	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	ln, err := listenUnixSocket(path)
 	if err != nil {
 		return err
 	}
@@ -60,12 +57,17 @@ func (s *Server) ServeMountRootHandoff(ctx context.Context) error {
 		_ = ln.Close()
 	}()
 	for {
-		conn, err := ln.AcceptUnix()
+		accepted, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			return err
+		}
+		conn, ok := accepted.(*net.UnixConn)
+		if !ok {
+			_ = accepted.Close()
+			return fmt.Errorf("mount-root handoff listener accepted %T, want *net.UnixConn", accepted)
 		}
 		go s.handleMountRootHandoff(conn)
 	}

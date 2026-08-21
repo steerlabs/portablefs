@@ -8,7 +8,7 @@ package and two Xcode projects.
 - **`PortableFSKit`** — the SwiftPM package (`swift-tools-version: 6.2`,
   `.macOS(.v26)`). It holds everything that is not an app: the pfslocal client
   and its transport, `VolumeCore`, the FSKit Operations adapter, the macOS 26
-  strict coherence composition, the generated protobuf bindings, a mock daemon
+  best-effort coherence composition, the generated protobuf bindings, a mock daemon
   used by the tests, and `PortableFSAppCore`, a small support target for the
   menu-bar app.
 - **`PortableFSApp`** — the shipping product: `PortableFS.app` (a SwiftUI
@@ -47,7 +47,7 @@ downgraded.
 `PortableFSIdentity.swift`. These, with `VolumeCore`, are the only files that
 import FSKit.
 
-**The macOS 26 strict coherence composition** now lives in this target
+**The macOS 26 best-effort coherence composition** now lives in this target
 alongside the above, in five files:
 
 | File | Role |
@@ -85,19 +85,20 @@ The canonical command, from the repository root:
 
 ```sh
 swift build --package-path swift/PortableFSKit
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh # from the repository root
 ```
 
-**`--no-parallel` is required, not a tuning choice.** Swift Testing can run
-cases concurrently inside one SwiftPM worker. Several tests share process
-resources — sockets, mount points, the app-group container — or exercise hard
-protocol deadlines, so the corpus must run serially. The same command appears in `AGENTS.md`,
-`scripts/verify-local.sh`, the root `README.md`, and the `swift` job in
-`.github/workflows/ci.yml`.
+The native gate separately enumerates the package, executes one Xcode test
+process, and proves exact equality with the unique all-passing xcresult leaves.
+Socket-backed integration tests declare their process-wide resource constraint
+with a serialized Swift Testing suite. Pure value and protocol tests remain
+parallel within the process. The mock keeps ordinary filesystem requests
+concurrent, but consumes one-way ownership dispositions and publication
+acknowledgements on its serial socket reader before admitting the next frame,
+matching the production daemon's wire-order boundary.
 
-The suite is swift-testing, not XCTest, so a passing run ends with a line of the
-form `Test run with N tests in 0 suites passed`. It currently reports **186
-tests**, covering the pfslocal transport and wire goldens, the Operations
+The suite is swift-testing, not XCTest. It currently reports **344 tests**,
+covering the pfslocal transport and wire goldens, the Operations
 adapter and its open-handle lifecycle, attribute and error mapping, enumeration
 paging, write acknowledgement, and the macOS 26 coherence stack (namespace and
 live-object indexes, the publication barrier, the repair gate and authenticator,
@@ -177,8 +178,12 @@ verifies the complete code hierarchy, and emits a clearly marked development
 zip:
 
 ```sh
-scripts/package-macos-app.sh 0.2.3
+scripts/package-macos-app.sh
 ```
+
+The packager reads the repository's exact `VERSION` file. An optional version
+argument is accepted only when it equals that file, so local, CI, Xcode, and
+tagged release builds cannot drift onto different product versions.
 
 Distribution builds set `PORTABLEFS_RELEASE=1`, a monotonic
 `PORTABLEFS_BUILD_NUMBER`, `PORTABLEFS_DEVELOPER_ID_EXPORT=1`, and a

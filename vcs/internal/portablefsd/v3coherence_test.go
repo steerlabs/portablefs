@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"slices"
 	"sync"
 	"syscall"
@@ -34,7 +33,6 @@ type fakeV3VisibilityClient struct {
 	mu         sync.Mutex
 	acked      []*authoritypb.VisibilityCursor
 	contention []bool
-	blocked    []*authoritypb.VisibilityCursor
 	closed     bool
 	err        error
 }
@@ -70,12 +68,6 @@ func (f *fakeV3VisibilityClient) AckVisibilityWithContention(_ context.Context, 
 	f.acked = append(f.acked, cloneAuthorityCursor(cursor))
 	f.contention = append(f.contention, contended)
 	return nil
-}
-func (f *fakeV3VisibilityClient) ReportVisibilityBlocked(_ context.Context, cursor *authoritypb.VisibilityCursor, _ []uint64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.blocked = append(f.blocked, cloneAuthorityCursor(cursor))
-	return errors.New("test authority fenced blocked mount")
 }
 func (f *fakeV3VisibilityClient) SessionDone() <-chan struct{} { return f.done }
 func (f *fakeV3VisibilityClient) SessionError() error {
@@ -289,77 +281,27 @@ func TestV3CoherenceBridgeFencesIfPlannedDetachAbortsAfterFrontendExit(t *testin
 	}
 }
 
-func TestV3CoherenceBridgeMapsAndRetiresTheSourcePublicationIdentity(t *testing.T) {
+func TestV3CoherenceBridgeRejectsAnyFilesystemSourceEvent(t *testing.T) {
 	client := newFakeV3VisibilityClient()
 	defer client.Close()
-	bridge, err := newV3CoherenceBridge(client, v3CachePolicyFSKit, nil)
+	failures := make(chan error, 1)
+	bridge, err := newV3CoherenceBridge(client, v3CachePolicyFSKit, func(err error) { failures <- err })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := bridge.registerMutation(7, 31, 99); err != nil {
-		t.Fatal(err)
+	event := testV3Event(client, 11, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE)
+	event.InitiatorSessionId = append([]byte(nil), client.session...)
+	client.next <- v3VisibilityResult{event: event}
+	if err := bridge.run(context.Background(), func(*pfslocal.Event) error {
+		t.Fatal("source filesystem event reached the frontend")
+		return nil
+	}); err == nil {
+		t.Fatal("source filesystem event did not terminate the bridge")
 	}
-	makeSource := func(phase authoritypb.VisibilityPhase) *authoritypb.VisibilityEvent {
-		event := testV3Event(client, 11, phase)
-		event.InitiatorSessionId = append([]byte(nil), client.session...)
-		event.MutationSlot = 7
-		event.MutationSequence = 31
-		return event
-	}
-	client.next <- v3VisibilityResult{event: makeSource(authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE)}
-	client.next <- v3VisibilityResult{event: makeSource(authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE)}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	delivered := make(chan *pfslocal.V3VisibilityEvent, 2)
-	done := make(chan error, 1)
-	go func() {
-		done <- bridge.run(ctx, func(event *pfslocal.Event) error {
-			delivered <- event.Kind.(*pfslocal.V3VisibilityEvent)
-			return nil
-		})
-	}()
-	prepare := <-delivered
-	if prepare.LocalOperationID != 99 {
-		t.Fatalf("PREPARE local operation = %d, want 99", prepare.LocalOperationID)
-	}
-	if err := bridge.acknowledge(context.Background(), &pfslocal.VisibilityAckRequest{AuthorityEpoch: client.epoch, Cursor: prepare.Cursor}); err != nil {
-		t.Fatal(err)
-	}
-	complete := <-delivered
-	if complete.LocalOperationID != 99 {
-		t.Fatalf("COMPLETE local operation = %d, want 99", complete.LocalOperationID)
-	}
-	completeAck := make(chan error, 1)
-	go func() {
-		completeAck <- bridge.acknowledge(context.Background(), &pfslocal.VisibilityAckRequest{
-			AuthorityEpoch: client.epoch, Cursor: complete.Cursor,
-		})
-	}()
 	select {
-	case err := <-completeAck:
-		t.Fatalf("source COMPLETE advanced before publication: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	if got := client.ackedCursors(); len(got) != 1 {
-		t.Fatalf("authority saw %d acks before source publication, want only PREPARE", len(got))
-	}
-	if !bridge.acknowledgePublication(99) {
-		t.Fatal("source callback publication was not accepted")
-	}
-	if err := <-completeAck; err != nil {
-		t.Fatal(err)
-	}
-	bridge.mu.Lock()
-	remaining := len(bridge.operations)
-	remainingPublications := len(bridge.publications)
-	bridge.mu.Unlock()
-	if remaining != 0 || remainingPublications != 0 {
-		t.Fatalf("source ledger retained %d ticket(s), %d publication(s)", remaining, remainingPublications)
-	}
-	cancel()
-	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("subscriber exit = %v, want cancellation", err)
+	case <-failures:
+	case <-time.After(time.Second):
+		t.Fatal("source filesystem event did not publish a terminal failure")
 	}
 }
 
@@ -413,7 +355,74 @@ func TestV3CoherenceBridgeBindsContentionFeedbackToExactPeerComplete(t *testing.
 	}
 }
 
-func TestV3CoherenceBridgeAcceptsPublicationBeforeMutationRegistration(t *testing.T) {
+func TestV3CoherenceBridgeReportsDaemonLocalPeerFirstContentionAndHoldsCutThroughCompleteAck(t *testing.T) {
+	client := newFakeV3VisibilityClient()
+	defer client.Close()
+	bridge, err := newV3CoherenceBridge(client, v3CachePolicyMacOS26, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.next <- v3VisibilityResult{event: testV3Event(client, 11, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE)}
+	client.next <- v3VisibilityResult{event: testV3Event(client, 11, authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	delivered := make(chan *pfslocal.V3VisibilityEvent, 2)
+	done := make(chan error, 1)
+	go func() {
+		done <- bridge.run(ctx, func(event *pfslocal.Event) error {
+			delivered <- event.Kind.(*pfslocal.V3VisibilityEvent)
+			return nil
+		})
+	}()
+	prepare := <-delivered
+	if sequence, held := peerV3PublicationState(bridge.sourcePublication); sequence != 11 || held != 1 {
+		t.Fatalf("delivered PREPARE did not own its local cut: sequence=%d held=%d", sequence, held)
+	}
+	gate, err := v3NamespaceSourceGate(
+		testV3PublicationItem(1, 0x55), []byte("entry"), false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.reserveFrontendPublication(401)
+	if lease, err := bridge.sourcePublication.acquireSource(context.Background(), 401, gate); lease != nil || !errors.Is(err, errV3SourcePublicationInterrupted) {
+		t.Fatalf("peer-first callback = (%#v, %v), want definite local refusal", lease, err)
+	}
+	if err := bridge.acknowledge(context.Background(), &pfslocal.VisibilityAckRequest{
+		AuthorityEpoch: client.epoch, Cursor: prepare.Cursor,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	complete := <-delivered
+	if sequence, held := peerV3PublicationState(bridge.sourcePublication); sequence != 11 || held != 1 {
+		t.Fatalf("COMPLETE publication lost PREPARE cut before Ack: sequence=%d held=%d", sequence, held)
+	}
+	if err := bridge.acknowledge(context.Background(), &pfslocal.VisibilityAckRequest{
+		AuthorityEpoch: client.epoch, Cursor: complete.Cursor,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if sequence, held := peerV3PublicationState(bridge.sourcePublication); sequence != 0 || held != 0 {
+		t.Fatalf("successful COMPLETE Ack retained local cut: sequence=%d held=%d", sequence, held)
+	}
+	client.mu.Lock()
+	contention := append([]bool(nil), client.contention...)
+	client.mu.Unlock()
+	if want := []bool{false, true}; !slices.Equal(contention, want) {
+		t.Fatalf("daemon-local contention feedback = %v, want %v", contention, want)
+	}
+	if !acknowledgeBridgePublished(t, bridge, 401) {
+		t.Fatal("refused callback PublicationAck was not accepted")
+	}
+	bridge.releaseFrontendPublication(401)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("subscriber exit = %v, want cancellation", err)
+	}
+}
+
+func TestV3CoherenceBridgeEarlyPublicationAckPreventsSourceLeaseReopen(t *testing.T) {
 	client := newFakeV3VisibilityClient()
 	defer client.Close()
 	bridge, err := newV3CoherenceBridge(client, v3CachePolicyFSKit, nil)
@@ -423,42 +432,17 @@ func TestV3CoherenceBridgeAcceptsPublicationBeforeMutationRegistration(t *testin
 
 	const operationID = uint64(91)
 	bridge.reserveFrontendPublication(operationID)
-	if !bridge.acknowledgePublication(operationID) {
+	if !acknowledgeBridgePublished(t, bridge, operationID) {
 		t.Fatal("publication acknowledgement did not find the serial-reader reservation")
 	}
-	if err := bridge.registerMutation(7, 31, operationID); err != nil {
+	gate, err := v3ItemSourceGate(pfslocal.Item{
+		ItemID: 1, StableIdentity: [16]byte{1},
+	}, true)
+	if err != nil {
 		t.Fatal(err)
 	}
-
-	bridge.mu.Lock()
-	published := bridge.publications[operationID]
-	_, active := bridge.publicationReservations[operationID]
-	bridge.mu.Unlock()
-	if published == nil || !active {
-		t.Fatal("mutation registration did not reuse the acknowledged frontend state")
-	}
-	select {
-	case <-published:
-	default:
-		t.Fatal("early acknowledgement was lost when the mutation registered")
-	}
-
-	// Frontend retirement alone cannot discard a registered mutation's source
-	// publication witness. The authority ticket owns it until that ticket is
-	// abandoned or reaches source COMPLETE.
-	bridge.releaseFrontendPublication(operationID)
-	bridge.mu.Lock()
-	_, retained := bridge.publications[operationID]
-	bridge.mu.Unlock()
-	if !retained {
-		t.Fatal("frontend retirement discarded a registered mutation witness")
-	}
-	bridge.abandonMutation(7, 31, operationID)
-	bridge.mu.Lock()
-	_, retained = bridge.publications[operationID]
-	bridge.mu.Unlock()
-	if retained {
-		t.Fatal("settled mutation retained its publication witness")
+	if _, err := bridge.sourcePublication.acquireSource(context.Background(), operationID, gate); err == nil {
+		t.Fatal("early PublicationAck allowed a source lease to reopen")
 	}
 }
 
@@ -473,27 +457,26 @@ func TestV3CoherenceBridgeBoundsNonmutationPublicationReservations(t *testing.T)
 	// ACK before handler retirement: the channel is closed, then the absence of
 	// any authority ticket proves this was read-only and retirement removes it.
 	bridge.reserveFrontendPublication(101)
-	if !bridge.acknowledgePublication(101) {
+	if !acknowledgeBridgePublished(t, bridge, 101) {
 		t.Fatal("early read-only acknowledgement was refused")
 	}
 	bridge.releaseFrontendPublication(101)
 
-	// Handler retirement before ACK: no mutation can register after the last
-	// handler exits, so the bridge may discard the reservation immediately. The
-	// later frontend ACK remains valid in the connection ledger and has nothing
-	// authority-side to release.
+	// Handler retirement before ACK: minor 15 retains the bounded operation fact
+	// until the explicit semantic verdict arrives, even when no source lease was
+	// acquired. Otherwise a healthy read-only callback's mandatory Ack would be
+	// indistinguishable from an unknown operation.
 	bridge.reserveFrontendPublication(102)
 	bridge.releaseFrontendPublication(102)
-	if bridge.acknowledgePublication(102) {
-		t.Fatal("finish-before-ack recreated a retired read-only bridge state")
+	if !acknowledgeBridgePublished(t, bridge, 102) {
+		t.Fatal("finish-before-ack lost its read-only semantic-verdict state")
 	}
 
-	bridge.mu.Lock()
-	publications := len(bridge.publications)
-	reservations := len(bridge.publicationReservations)
-	bridge.mu.Unlock()
-	if publications != 0 || reservations != 0 {
-		t.Fatalf("read-only operations leaked %d publication(s), %d reservation(s)", publications, reservations)
+	bridge.sourcePublication.mu.Lock()
+	operations := len(bridge.sourcePublication.operations)
+	bridge.sourcePublication.mu.Unlock()
+	if operations != 0 {
+		t.Fatalf("read-only operations leaked %d source-publication operation(s)", operations)
 	}
 }
 
@@ -507,59 +490,34 @@ func TestV3CoherenceBridgeReactivatesSequentialContinuationBeforeEarlyAck(t *tes
 
 	const operationID = uint64(103)
 	// Request one is a completed read. The frontend operation remains available
-	// for a sequential continuation, but no handler is active, so its bounded
-	// bridge state is gone.
+	// for a sequential continuation and its bounded semantic-verdict state stays
+	// dormant while no handler is active.
 	bridge.reserveFrontendPublication(operationID)
 	bridge.releaseFrontendPublication(operationID)
 
 	// The serial reader sees request two before launching its handler and
 	// idempotently reactivates the same operation ID. Its ACK may then overtake
-	// handler scheduling without losing the later authority registration.
+	// handler scheduling; a later source lease must be refused before assignment.
 	bridge.reserveFrontendPublication(operationID)
-	if !bridge.acknowledgePublication(operationID) {
+	if !acknowledgeBridgePublished(t, bridge, operationID) {
 		t.Fatal("continuation acknowledgement did not find the reactivated reservation")
 	}
-	if err := bridge.registerMutation(9, 41, operationID); err != nil {
-		t.Fatal(err)
-	}
-	bridge.mu.Lock()
-	published := bridge.publications[operationID]
-	bridge.mu.Unlock()
-	select {
-	case <-published:
-	default:
-		t.Fatal("continuation mutation registration lost the early acknowledgement")
-	}
-
-	bridge.releaseFrontendPublication(operationID)
-	bridge.abandonMutation(9, 41, operationID)
-	bridge.mu.Lock()
-	publications := len(bridge.publications)
-	reservations := len(bridge.publicationReservations)
-	bridge.mu.Unlock()
-	if publications != 0 || reservations != 0 {
-		t.Fatalf("sequential continuation leaked %d publication(s), %d reservation(s)", publications, reservations)
-	}
-}
-
-func TestV3CoherenceBridgeFailsClosedWhenSourceTicketIsUnknown(t *testing.T) {
-	client := newFakeV3VisibilityClient()
-	defer client.Close()
-	failures := make(chan error, 1)
-	bridge, err := newV3CoherenceBridge(client, v3CachePolicyFSKit, func(err error) { failures <- err })
+	gate, err := v3ItemSourceGate(pfslocal.Item{
+		ItemID: 1, StableIdentity: [16]byte{1},
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	event := testV3Event(client, 11, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE)
-	event.InitiatorSessionId = append([]byte(nil), client.session...)
-	client.next <- v3VisibilityResult{event: event}
-	if err := bridge.run(context.Background(), func(*pfslocal.Event) error { return nil }); err == nil {
-		t.Fatal("unknown source ticket did not fail the bridge")
+	if _, err := bridge.sourcePublication.acquireSource(context.Background(), operationID, gate); err == nil {
+		t.Fatal("continuation mutation reopened after its callback acknowledgement")
 	}
-	select {
-	case <-failures:
-	case <-time.After(time.Second):
-		t.Fatal("unknown source ticket did not publish a terminal failure")
+
+	bridge.releaseFrontendPublication(operationID)
+	bridge.sourcePublication.mu.Lock()
+	operations := len(bridge.sourcePublication.operations)
+	bridge.sourcePublication.mu.Unlock()
+	if operations != 0 {
+		t.Fatalf("sequential continuation leaked %d operation(s)", operations)
 	}
 }
 
@@ -596,59 +554,7 @@ func TestV3CoherenceBridgeMissedBudgetClosesAuthoritySession(t *testing.T) {
 	}
 }
 
-func TestV3CoherenceBridgeTerminatesActualZeroTicketRoutePrepare(t *testing.T) {
-	client := newFakeV3VisibilityClient()
-	defer client.Close()
-	failures := make(chan error, 1)
-	bridge, err := newV3CoherenceBridge(client, v3CachePolicyMacOS26, func(err error) {
-		failures <- err
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	event := &authoritypb.VisibilityEvent{
-		Cursor: &authoritypb.VisibilityCursor{
-			Sequence: 11, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE,
-		},
-		InitiatorSessionId: make([]byte, 16),
-		Routes: &authoritypb.RoutesChange{
-			Revision: bytes.Repeat([]byte{0x51}, 32), Rules: []byte("/cache\n"),
-		},
-		// Route events carry the zero session identity and no mutation replay ticket.
-	}
-	client.next <- v3VisibilityResult{event: event}
-	delivered := false
-	err = bridge.run(context.Background(), func(*pfslocal.Event) error {
-		delivered = true
-		return nil
-	})
-	if !errors.Is(err, authorityrpc.ErrRoutesMismatch) {
-		t.Fatalf("route PREPARE = %v, want ErrRoutesMismatch", err)
-	}
-	if delivered {
-		t.Fatal("route PREPARE was forwarded to FSKit")
-	}
-	client.mu.Lock()
-	closed := client.closed
-	acks := len(client.acked)
-	client.mu.Unlock()
-	if !closed || acks != 0 {
-		t.Fatalf("route PREPARE left client closed=%v with %d Ack(s)", closed, acks)
-	}
-	select {
-	case failure := <-failures:
-		if !errors.Is(failure, authorityrpc.ErrRoutesMismatch) {
-			t.Fatalf("terminal route failure = %v", failure)
-		}
-	default:
-		t.Fatal("route PREPARE did not publish its terminal failure")
-	}
-	if err := bridge.bind(); !errors.Is(err, errV3VisibilityTerminal) {
-		t.Fatalf("route-terminated bridge rebound: %v", err)
-	}
-}
-
-func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
+func TestV3VisibilityTranslationValidatesEveryScope(t *testing.T) {
 	epoch := bytes.Repeat([]byte{0xa1}, 16)
 	base := &authoritypb.VisibilityEvent{
 		Cursor:             &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE},
@@ -674,14 +580,6 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 	if err != nil || len(translatedPost.Targets) != 1 ||
 		!bytes.Equal(translatedPost.Targets[0].PostIdentity, postTarget.PostIdentity) {
 		t.Fatalf("valid COMPLETE post-binding = %#v, %v", translatedPost, err)
-	}
-
-	routes := proto.Clone(base).(*authoritypb.VisibilityEvent)
-	routes.InitiatorSessionId = make([]byte, 16)
-	routes.MutationSequence = 0
-	routes.Routes = &authoritypb.RoutesChange{Revision: bytes.Repeat([]byte{4}, 32), Rules: []byte("/cache\n")}
-	if got, err := translateV3VisibilityEvent(epoch, routes); err != nil || got.Routes == nil {
-		t.Fatalf("valid route event = %#v, %v", got, err)
 	}
 
 	invalid := []*authoritypb.VisibilityEvent{}
@@ -710,9 +608,6 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 	preparePostTarget.PostIdentity = bytes.Repeat([]byte{4}, 16)
 	badPreparePost.Targets = []*authoritypb.VisibilityTarget{preparePostTarget}
 	invalid = append(invalid, badPreparePost)
-	badRoutes := proto.Clone(routes).(*authoritypb.VisibilityEvent)
-	badRoutes.Targets = []*authoritypb.VisibilityTarget{visibilitywire.Attributes(bytes.Repeat([]byte{3}, 16), 7, 0x700000001)}
-	invalid = append(invalid, badRoutes)
 	for i, event := range invalid {
 		if _, err := translateV3VisibilityEvent(epoch, event); err == nil {
 			t.Fatalf("invalid visibility case %d was accepted", i)
@@ -720,7 +615,7 @@ func TestV3VisibilityTranslationValidatesEveryScopeAndRoutes(t *testing.T) {
 	}
 }
 
-func TestV3CoherenceBridgeRefusesWrongAndBlockedAcknowledgements(t *testing.T) {
+func TestV3CoherenceBridgeRefusesAnAcknowledgementForAnotherAuthorityEpoch(t *testing.T) {
 	client := newFakeV3VisibilityClient()
 	defer client.Close()
 	bridge, err := newV3CoherenceBridge(client, v3CachePolicyMacOS26, nil)
@@ -737,35 +632,5 @@ func TestV3CoherenceBridgeRefusesWrongAndBlockedAcknowledgements(t *testing.T) {
 	client.mu.Unlock()
 	if !closedAfterViolation {
 		t.Fatal("cursor/epoch violation did not terminate the authority session")
-	}
-
-	client = newFakeV3VisibilityClient()
-	defer client.Close()
-	bridge, err = newV3CoherenceBridge(client, v3CachePolicyMacOS26, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client.next <- v3VisibilityResult{event: testV3Event(client, 11, authoritypb.VisibilityPhase_VISIBILITY_PHASE_PREPARE)}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	delivered := make(chan *pfslocal.V3VisibilityEvent, 1)
-	go func() {
-		_ = bridge.run(ctx, func(event *pfslocal.Event) error {
-			delivered <- event.Kind.(*pfslocal.V3VisibilityEvent)
-			return nil
-		})
-	}()
-	event := <-delivered
-	err = bridge.acknowledge(context.Background(), &pfslocal.VisibilityAckRequest{
-		AuthorityEpoch: client.epoch, Cursor: event.Cursor, Blocked: true, Reason: "proven parent-lock cycle",
-	})
-	if err == nil || errors.Is(err, io.EOF) {
-		t.Fatalf("blocked report returned %v", err)
-	}
-	client.mu.Lock()
-	blocked := len(client.blocked)
-	client.mu.Unlock()
-	if blocked != 1 {
-		t.Fatalf("authority received %d blocked reports, want 1", blocked)
 	}
 }

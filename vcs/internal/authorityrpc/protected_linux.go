@@ -128,6 +128,12 @@ func (h *VolumeHandler) refuseProtectedNamespace(id volumeserver.SessionID, req 
 		return object(body.RemoveXattr.GetItem())
 	case *authoritypb.Request_Write:
 		return object(body.Write.GetHandle())
+	case *authoritypb.Request_Fallocate:
+		return object(body.Fallocate.GetHandle())
+	case *authoritypb.Request_CopyFileRange:
+		return object(body.CopyFileRange.GetOutputHandle())
+	case *authoritypb.Request_Tmpfile:
+		return object(body.Tmpfile.GetParent())
 	case *authoritypb.Request_Open:
 		flags := body.Open.GetFlags()
 		if flags == nil || !(flags.GetWrite() || flags.GetAppend() || flags.GetTruncate()) {
@@ -139,50 +145,4 @@ func (h *VolumeHandler) refuseProtectedNamespace(id volumeserver.SessionID, req 
 	default:
 		return nil
 	}
-}
-
-// heldDirectories reports the directories whose kernel lock the submitting
-// mount holds for the whole of this call. On Linux the VFS holds a directory's
-// i_rwsem for write across the entire FUSE round trip of any namespace
-// mutation - fs/namei.c:4389 (unlink), :3895 (create/mkdir/symlink/link),
-// :4975 (rename, both parents) - so the parents named by such a request are
-// exactly the directories that mount cannot repair a cached binding in until
-// this authority answers it.
-//
-// It is derived from the request instead of being declared on the wire because
-// the request already says it, and a value the peer states separately is a
-// value the peer can state wrongly. Operations that hold only a file's lock,
-// or no directory lock at all, contribute nothing: a file's i_rwsem is not what
-// fuse_reverse_inval_entry takes.
-func (h *VolumeHandler) heldDirectories(id volumeserver.SessionID, req *authoritypb.Request) ([][16]byte, error) {
-	var raw [][]byte
-	switch body := req.GetBody().(type) {
-	case *authoritypb.Request_Create:
-		raw = [][]byte{body.Create.GetParent()}
-	case *authoritypb.Request_Mkdir:
-		raw = [][]byte{body.Mkdir.GetParent()}
-	case *authoritypb.Request_Symlink:
-		raw = [][]byte{body.Symlink.GetParent()}
-	case *authoritypb.Request_Unlink:
-		raw = [][]byte{body.Unlink.GetParent()}
-	case *authoritypb.Request_Link:
-		raw = [][]byte{body.Link.GetNewParent()}
-	case *authoritypb.Request_Rename:
-		raw = [][]byte{body.Rename.GetOldParent(), body.Rename.GetNewParent()}
-	default:
-		return nil, nil
-	}
-	directories := make([][16]byte, 0, len(raw))
-	for _, token := range raw {
-		capability, err := h.item(id, token)
-		if err != nil {
-			return nil, err
-		}
-		identity, err := h.Store.Identity(capability)
-		if err != nil {
-			return nil, err
-		}
-		directories = append(directories, identity)
-	}
-	return directories, nil
 }

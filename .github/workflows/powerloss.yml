@@ -1,0 +1,63 @@
+name: powerloss
+
+# The power-cut harness is deliberately not on the pull-request path. It needs
+# the privileged self-hosted runner, it replays a multi-gigabyte device image
+# once per cut, and it competes with the other jobs for that machine's
+# device-mapper namespace. It runs weekly and on demand instead, and its result
+# is evidence for docs/power-loss-testing.md rather than a merge gate.
+on:
+  workflow_dispatch:
+  schedule:
+    # 04:00 UTC on Mondays, after the weekend and before the working week.
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  # The device-mapper namespace is kernel-global on the runner, so two of these
+  # must never overlap. In-progress runs are NOT cancelled: a cancelled run
+  # leaves a device-mapper target and loop devices behind, which would break the
+  # next run rather than this one.
+  group: powerloss-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # dm-log-writes is not exposed on GitHub-hosted runners, so this instrument
+  # uses a capability-labeled self-host. The label says nothing about a custom
+  # FUSE dialect; the filesystem under test uses the same stock interface as CI.
+  linux-power-loss:
+    runs-on: [self-hosted, linux, x64, portablefs-dm-log-writes]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Every prerequisite is checked before the harness starts, so a runner
+      # that cannot carry the instrument says which piece is missing instead of
+      # failing somewhere inside a replay.
+      - name: Verify the runner can provide loop devices, /dev/fuse and dm-log-writes
+        run: |
+          set -euo pipefail
+          sudo modprobe loop
+          sudo modprobe fuse
+          sudo modprobe dm-log-writes
+          test -e /dev/loop-control
+          test -e /dev/fuse
+          sudo dmsetup targets | grep -q '^log-writes'
+      - name: Power-cut and crash-consistency harness
+        run: bash scripts/run-powerloss.sh
+      # The suite output and the data-plane process logs are what a failed run
+      # is read from. The harness writes them into this directory from inside
+      # the container, because the container's own /var/tmp is a tmpfs that
+      # leaves with it and would take a failed run's only record along.
+      - name: Make the run's evidence readable
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" powerloss-evidence || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: powerloss-evidence
+          path: powerloss-evidence
+          retention-days: 30
+          if-no-files-found: warn

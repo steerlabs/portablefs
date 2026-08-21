@@ -1,7 +1,7 @@
 # Release identity
 
-Status: **describes the release path as configured; not exercised since the v3
-reset (see [Known gaps](#known-gaps))**
+Status: **enforced release contract; a release is authoritative only after its
+immutable tag completes the whole workflow successfully**
 
 The shipped client release identity is offline: a validated git tag, a version
 string stamped into the binaries and re-proved by the installer, and two
@@ -11,17 +11,22 @@ Linux archives, and Apple Developer ID notarization for the macOS app.
 The optional hosted foundation additionally reports runtime identity. The
 manager exposes its exact stamp at `GET /v1/release`; authenticated cell
 observations record separate manager-plan, cell-agent, and root-helper release
-stamps. Those hosted binaries currently default visibly to `dev` unless the
-builder sets `main.version` with `-ldflags`. They are not yet members of the
-frozen two-binary Linux client archive or macOS app identity described below,
-so an operator must bind their build and deployment provenance independently.
+stamps. `scripts/build-hosted-linux-release.sh` builds manager, agent, helper,
+authority, launcher, and the Linux client from one clean commit, stamps every
+executable with one `pfs-hosted-YYYYMMDD-<commit>` identity, and emits an
+exact-member SHA-256 bundle. The client in this bundle is the input to a matched
+managed-sandbox image. The hosted activator verifies every hash and executable
+identity before installing the immutable release and atomically swapping the
+one runtime root.
+These operator artifacts remain intentionally separate from the frozen
+two-binary end-user Linux archive and macOS app identity described below.
 
 Everything below is enforced by `.github/workflows/release.yml`,
 `.goreleaser.yaml`, `scripts/install.sh`, and the two policy checkers
 `scripts/check-install-release-trust.mjs` and `scripts/check-workflow-pins.mjs`,
 which run in both `release.yml` and `ci.yml`.
 
-## The git tag is the identity
+## The tag and checked-in version are one identity
 
 Releases are triggered only by a pushed tag matching `v*`, and the first thing
 the `validate` job does — step *"Prove an exact stable tag at this source
@@ -35,17 +40,23 @@ fi
 test "$GITHUB_REF" = "refs/tags/$GITHUB_REF_NAME"
 test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
 test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+version="$(cat VERSION)"
+printf '%s\n' "$version" | cmp -s - VERSION
+test "$GITHUB_REF_NAME" = "v$version"
 ```
 
-That is four separate claims: the name is stable SemVer with no prerelease,
-build metadata, or leading zeroes; the ref really is a tag ref; the tag peels to
-the commit the push event named; and the tree actually checked out is that same
-commit. The checkout is `fetch-depth: 0` with `persist-credentials: false`, so
-the tag is resolved against real history rather than a shallow graft.
+These checks bind the stable SemVer tag, the push event's commit, the checked-out
+tree, and the repository's exact newline-terminated `VERSION` file. The checkout
+is `fetch-depth: 0` with `persist-credentials: false`, so the tag is resolved
+against real history rather than a shallow graft.
 
-Everything downstream derives its version from that one string as
-`"${GITHUB_REF_NAME#v}"`. There is no second source of truth and no build-arg
-override.
+`VERSION` is the local/Xcode authority: the production, macOS 26, and macOS 27
+projects must each contain exactly four matching `MARKETING_VERSION` settings;
+CI reads it directly; and the macOS packager rejects both environment overrides
+and positional arguments that do not equal it. The tag is the publication
+authority used by GoReleaser and artifact names. The equality gate makes these
+two representations one release identity instead of allowing either to
+override the other.
 
 Publication is immutable by construction. Before uploading anything the workflow
 proves no release exists for the tag — a `404` from
@@ -206,7 +217,8 @@ components, and no symlink or special entry.
 
 **Developer ID signing, hardened runtime, and Gatekeeper.**
 `codesign --verify --deep --strict` on the bundle, then for each of the app, the
-`PortableFSExt.appex`, the embedded `portablefs`, and the embedded `portablefsd`:
+`PortableFSExt.appex`, the unentitled `portablefs`, the nested
+`PortableFSDService.app`, and its `portablefsd` executable:
 an exact `TeamIdentifier=` line, an `Authority=Developer ID Application: `
 line, and a `CodeDirectory ... flags=...runtime` line proving the hardened
 runtime. Finally `spctl --assess --type execute` must accept the app, which is
@@ -229,9 +241,96 @@ the extension's bundle id is exactly `<bundle-id>.PortableFSExt`, that its
 as `pfs`, that it advertises exactly one `FSSupportedSchemes` entry equal to
 `dev.portablefs.oss` (a second entry is a hard failure), that
 `FSSupportsGenericURLResources` is true, that the app's
-`CFBundleShortVersionString` equals the release version, and that the
-extension's `PFSAppGroupIdentifier` matches its own signed
-`com.apple.security.application-groups` entitlement.
+`CFBundleShortVersionString` equals the release version, and that the host and
+extension `PFSAppGroupIdentifier` values match. It also requires exactly one
+`PortableFSDService.app` with bundle id `<bundle-id>.PortableFSDService`, an
+exact background-only Info.plist, no provisioning profile, and exactly one
+sealed `<bundle-id>.portablefsd.plist` whose only launch policy is the proven
+RunAtLoad/KeepAlive `BundleProgram` under that service app. The host app,
+extension, and nested `portablefsd` must each carry exactly one signed
+`com.apple.security.application-groups` value matching that metadata identity.
+The daemon service signature may carry no other entitlement, including
+`get-task-allow`.
+For signed development hosts, the outer host, extension, and unentitled CLI
+use the explicit Apple Development identity selected by Xcode, while the
+nested daemon service is independently signed with the configured
+`PORTABLEFS_SERVICE_SIGN_IDENTITY`. That setting must name the exact Developer
+ID Application identity; the embed phase never infers it from the keychain or
+reuses the host identity. Release export subsequently requires every nested
+component to prove the same Developer ID release authority.
+The embedded `portablefs` CLI must carry no app-group entitlement: its shell
+process wakes the exact host and uses the external private control socket, and
+never enters the protected container. Packaging rejects either missing daemon
+privilege or accidental CLI privilege.
+
+**An exact service-update identity.** Before an installed host permits bundle
+replacement, both the old and target nested services are bound by the service
+CodeDirectory hash, full executable SHA-256, daemon version, control identity
+schema, control protocol, and `pfslocal` major/minor. The owner-private durable
+activation lease stores those tuples, a bounded phase/deadline, and only the
+SHA-256 of a random one-use token. The plaintext token crosses only
+credential-checked Unix-socket sessions and never appears in defaults, argv,
+logs, or the lease. The installer keeps the exact displaced app until the
+replacement has independently proved the same live identity; an acknowledged
+failure is fenced before the old app may be restored.
+Every host termination edge closes the owner-private update listener, removes
+only the exact pinned socket inode it published, and re-proves the canonical
+name absent before any acknowledgement or exit. A replaced or unsafe inode is
+left in place and the durable phase stays fail-closed. If the commit reply is
+lost, the installer retains the plaintext token and accepts only one of two
+exact outcomes: `old-absent` plus disappearance of the authenticated prepared
+host enters the normal tokenized prepublication rollback, while
+`rollback-complete` additionally requires the installed old hierarchy and live
+daemon full tuple. Socket-path absence or presence alone is never transaction
+authority.
+The long-lived listener re-proves its exact pinned inode before every accept
+attempt. It retries only signal interruption and Darwin's documented
+`ECONNABORTED` result for a client that abandons a queued connection; every
+other accept failure stops and unpublishes the listener fail-closed.
+That fence is not a system-wide PID scan. Before mutation, the host
+authenticates the control peer's exact audit token, PID version, executable,
+Developer ID code identity, and release CodeDirectory hash, then pins that
+execution with `EVFILT_PROC`. Completion requires `NOTE_EXIT`, Service
+Management `notRegistered`, and all three socket names absent. If registration
+failed before an authenticated control peer was published, the host instead
+proves the canonical state-singleton lock is safely pinned and free; the daemon
+acquires that lock first and releases it last.
+The host replaces the active phase with a durable `target-complete` or
+`rollback-complete` terminal marker before acknowledging completion. A lost
+activation-accept acknowledgement does not destroy the installer session: the
+same in-memory token may open a new credential-checked `resume-target` or
+`resume-rollback` connection only while the lease is the matching exact active
+phase. The host revalidates the token hash, both old/target tuples, its sealed
+release, and the registered live release before exposing the completion edge;
+the resume path can neither activate nor fence a service. Loss of a readiness
+reply is different: the server fences the ready release back to
+`rollback-absent`, and the installer proceeds only after the authenticated
+ready-host PID and listener are both absent. A lost completion reply is
+accepted only after the installer proves that exact
+token-bound marker, the alternate app was already durably retired, and both the
+installed signed hierarchy and live daemon still prove its exact active tuple.
+If the marker was not yet published and the lease remains exact-active, the
+installer uses the same resume protocol and retries completion; plaintext token
+material is never persisted for either recovery.
+Every activation operation is admitted against one parent deadline before it
+starts. The client reserves the complete worst-case work that can follow the
+child request: live proof, accept reconciliation, terminal completion, and,
+while the target is only ready, enough time to fence it, prove exact host/socket
+absence, and run the old-release rollback activation. Every nested composition
+also retains a fixed scheduling/cancellation margin outside the exact operation
+budgets. A child timeout therefore
+cannot consume the time needed to reconcile a host action that crossed just
+after the client deadline. If the remaining budget is insufficient while a
+release is still ready, the client sends the official token-bound fence and
+proves `rollback-absent` plus exact process/listener absence; it never begins
+Accept or another launch at the deadline edge. Persistent failure after an
+exact safe-absent proof remains a fail-closed operator-recovery state rather
+than discarding the token while a host action may still be running.
+The terminal marker does not expire and is not deleted: a later authenticated
+prepare may replace it only after the sealed, registered, and live full tuple is
+re-proved. An expired nonterminal lease without its plaintext token instead
+blocks normal host startup and requires explicit operator recovery; it is never
+auto-removed or used as tokenless authority to mutate Service Management state.
 
 Then it makes the three executables agree with the extension. `portablefs
 lifecycle identity --json` and `portablefsd -identity-json` must report the same
@@ -275,7 +374,7 @@ push would catch.
   all four `.attestation.jsonl` asset names, still runs every validation gate
   (cross-OS builds, vet, the Go suite, the Go race suite, `sh -n
   scripts/install.sh`, both policy checkers, `govulncheck@v1.6.0`, `goreleaser
-  check`, `swift test --package-path swift/PortableFSKit --no-parallel`) with the three
+  check`, `bash scripts/test-swift-xcode.sh`) with the three
   `needs:` edges intact, and never uses `--clobber`.
 
 It also **bans container images from the release path outright.** If
@@ -307,9 +406,15 @@ integration-harness binary rather than a published operator artifact: ordinary
 Linux users mount through `portablefs`, while operators deploy the authority
 from the server archive.
 
-**The release workflow has not been run since the v3 reset.** The tags in this
-repository are `v0.1.0`, `v0.2.0`, `v0.2.1`, `v0.2.2`, and `v0.2.3`, all
-pointing at commits that predate `dba5b8f`. No tag names the current tree, so
-none of the v3 release path — attestation, membership, macOS identity — has been
-exercised end to end against it. Treat the first v3 tag as an unproven run, not
-a routine one.
+Tags through `v0.2.3` point at commits that predate `dba5b8f`. `v0.2.4` marks
+the first tagged v3 tree but is not release authority: its draft pipeline
+correctly stopped before publication when archive signing had no independently
+modeled Apple Development identity. `v0.2.5` is the first releasable v3 tree.
+It is accepted only when its immutable tag runs this complete workflow
+successfully: exact source/version proof, Linux archive membership and
+attestations, native Xcode tests, exact isolated Apple Development archive
+signing, separately isolated Developer ID export, notarization, stapling, and
+final publication. Developer ID export is manual and locally rooted in the
+exact release identity plus the frozen FSKit direct-distribution profile; it
+must never fall back to cloud-managed certificate or profile creation. A tag or
+draft release alone is not release authority.

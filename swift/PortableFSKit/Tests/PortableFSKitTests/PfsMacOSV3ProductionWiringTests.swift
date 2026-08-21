@@ -30,25 +30,6 @@ private func peerEvent(
     )
 }
 
-private func localEvent(
-    sequence: UInt64 = 1,
-    phase: PfsMacOSVisibilityPhase,
-    localOperationID: UInt64
-) throws -> PfsMacOSCoherenceEvent {
-    try PfsMacOSCoherenceEvent(
-        epoch: wiringEpoch,
-        sequence: sequence,
-        phase: phase,
-        initiator: try PfsMacOSMutationInitiator(
-            sessionID: wiringLocalSession,
-            replaySlot: 1,
-            mutationSequence: 7,
-            localOperationID: localOperationID
-        ),
-        repairs: []
-    )
-}
-
 @available(macOS 26.0, *)
 private struct WiringHarness {
     let daemon: PfsLocalMockDaemon
@@ -85,7 +66,7 @@ private func makeWiringHarness(
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let contract = cachePolicy.map { policy in
         PfsMacOSV3LocalContract(
-            authorityProtocolMajor: 3,
+            authorityProtocolMajor: 6,
             epoch: wiringEpoch,
             sessionID: wiringLocalSession,
             cachePolicy: policy,
@@ -163,6 +144,60 @@ private func waitUntil(
         try await Task.sleep(for: .milliseconds(5))
     }
     return await condition()
+}
+
+extension PfsLocalMockDaemonTests {
+@available(macOS 26.0, *)
+@Test func nativeDataCacheUpgradePublishesAfterTheRealReplyReturns() async throws {
+    let harness = try await makeWiringHarness(
+        cachePolicy: .nativeFSKitRevocationV1
+    )
+    let replyEntered = PfsReplyBox<Int>()
+    let releaseReply = DispatchSemaphore(value: 0)
+
+    harness.volume.admitNativeDataCacheUpgrade(harness.root) { error in
+        replyEntered.set((error as NSError?)?.code ?? 0)
+        releaseReply.wait()
+    }
+
+    #expect(try await waitUntil { replyEntered.get() != nil })
+    #expect(replyEntered.get() == 0)
+    #expect(await harness.coherence.barrier.admittedCallbackCount() == 1)
+
+    releaseReply.signal()
+    #expect(try await waitUntil {
+        await harness.coherence.barrier.admittedCallbackCount() == 0
+    })
+}
+
+@available(macOS 26.0, *)
+@Test func nativeDataCacheCloseFailureRetiresBeforeItsRealReply() async throws {
+    let harness = try await makeWiringHarness(
+        cachePolicy: .nativeFSKitRevocationV1
+    )
+    try await harness.volume.openItem(harness.root, modes: [.read])
+    await harness.daemon.failNextClose()
+
+    let replyEntered = PfsReplyBox<Bool>()
+    let releaseReply = DispatchSemaphore(value: 0)
+    harness.volume.closeNativeDataCacheItem(harness.root) {
+        replyEntered.set(true)
+        releaseReply.wait()
+    }
+
+    #expect(try await waitUntil { replyEntered.get() == true })
+    #expect(await harness.coherence.barrier.admittedCallbackCount() == 1)
+    do {
+        _ = try await harness.core.statfs()
+        Issue.record("native data-cache close failure left the volume live")
+    } catch {
+        #expect(error is PfsLocalClientError)
+    }
+
+    releaseReply.signal()
+    #expect(try await waitUntil {
+        await harness.coherence.barrier.admittedCallbackCount() == 0
+    })
 }
 
 @available(macOS 26.0, *)
@@ -776,10 +811,13 @@ private func expectEIO(_ error: any Error) {
         == [.removeSource])
 }
 
+}
+
 private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0x66, count: 16))
 
 // MARK: - Publication barrier
 
+extension PfsLocalMockDaemonTests {
 @available(macOS 26.0, *)
 @Test func barrierClosesAdmissionAtPrepareAndReopensAfterPeerCompleteAck() async throws {
     let harness = try await makeWiringHarness(cachePolicy: .synchronousVFSRepairV2)
@@ -927,7 +965,6 @@ private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0
 
     var stats = await harness.daemon.stats()
     #expect(stats.xattrSetRequests == 0)
-    #expect(stats.orderedMutationSourcePhaseQueueable.isEmpty)
 
     // Request validation remains ahead of capability refusal as well. An
     // invalid name is EINVAL, never EOPNOTSUPP or the barrier's ECANCELED.
@@ -971,7 +1008,6 @@ private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0
 
     stats = await harness.daemon.stats()
     #expect(stats.xattrSetRequests == 0)
-    #expect(stats.orderedMutationSourcePhaseQueueable.isEmpty)
 
     let complete = try peerEvent(phase: .complete)
     try await barrier.resume(complete)
@@ -1028,70 +1064,6 @@ private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0
     _ = try await harness.core.statfs()
 }
 
-@available(macOS 26.0, *)
-@Test func prepareExemptsExactlyTheInitiatingCallbackAndResumeWaitsForItsReply() async throws {
-    let harness = try await makeWiringHarness(
-        daemonConfiguration: .init(lookupDelaysNanoseconds: ["mutant": 300_000_000])
-    )
-    let barrier = harness.coherence.barrier
-
-    // The first publishing request on this connection takes logical operation
-    // ID 1; the daemon's delay keeps the callback in flight across both
-    // phases.
-    let replied = PfsReplyBox<Bool>()
-    harness.volume.lookupItem(
-        named: FSFileName(string: "mutant"),
-        inDirectory: harness.root
-    ) { _, _, error in
-        replied.set(error != nil)
-    }
-    #expect(try await waitUntil { await barrier.admittedCallbackCount() == 1 })
-
-    // PREPARE with the initiator exemption returns without draining the
-    // still-unpublished initiating callback: draining it would deadlock the
-    // very mutation this barrier serves.
-    let prepared = PfsReplyBox<Bool>()
-    let prepareTask = Task {
-        try await barrier.prepare(try localEvent(phase: .prepare, localOperationID: 1))
-        prepared.set(true)
-    }
-    #expect(try await waitUntil(.milliseconds(150)) { prepared.get() == true })
-    #expect(replied.get() == nil)
-    try await prepareTask.value
-
-    // The source callback's publication finishes this mount's cache change, so
-    // a newer callback can safely park. It cannot reach the authority until
-    // the deferred COMPLETE acknowledgement releases mutation order.
-    try await Task.sleep(for: .milliseconds(60))
-    #expect(await barrier.isAdmissionClosed())
-    #expect(try await waitUntil { replied.get() == true })
-    #expect(await barrier.isAdmissionClosed())
-
-    let parked = PfsReplyBox<Bool>()
-    let parkedAdmission = Task {
-        let ticket = try await barrier.admit(scope: PfsMacOSCallbackScope(
-            selectors: [.orderedMutation]
-        ))
-        parked.set(true)
-        return ticket
-    }
-    try await Task.sleep(for: .milliseconds(30))
-    #expect(parked.get() == nil)
-
-    // Receiving COMPLETE locally still does not release the parked callback.
-    let complete = try localEvent(phase: .complete, localOperationID: 1)
-    try await barrier.resume(complete)
-    #expect(replied.get() == true)
-    try await Task.sleep(for: .milliseconds(30))
-    #expect(parked.get() == nil)
-    #expect(await barrier.isAdmissionClosed())
-
-    await barrier.acknowledged(complete)
-    let admitted = try await parkedAdmission.value
-    #expect(parked.get() == true)
-    #expect(await barrier.isAdmissionClosed() == false)
-    await barrier.published(admitted)
-}
 
 @available(macOS 26.0, *)
 @Test func aFailedBarrierRefusesAdmissionInsteadOfHanging() async throws {
@@ -1121,7 +1093,7 @@ private let boundaryItemIdentity = try! PfsMacOSStableIdentity(Data(repeating: 0
 
 private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = wiringEpoch
     contract.sessionID = wiringLocalSession
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue
@@ -1209,8 +1181,8 @@ private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3Cohere
     #expect(try await waitUntil { await daemon.stats().visibilityAcks == 2 })
     let acknowledgements = await daemon.visibilityAcknowledgements()
     #expect(acknowledgements.map(\.cursor.phase) == [.prepare, .complete])
-    #expect(acknowledgements.allSatisfy { !$0.blocked })
 
     // The mount keeps serving after the barrier.
     _ = try await volume.lookupItem(named: FSFileName(string: "wired"), inDirectory: root)
+}
 }

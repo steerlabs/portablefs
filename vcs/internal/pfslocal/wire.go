@@ -23,7 +23,6 @@ func MarshalEnvelope(e *Envelope) ([]byte, error) {
 	b = appendBool(b, 2, e.PublicationAckRequired)
 	b = appendU64(b, 3, e.OperationID)
 	b = appendBool(b, 4, e.PublicationRetracted)
-	b = appendBool(b, 5, e.SourcePhaseQueueable)
 	if e.Body == nil {
 		return b, nil
 	}
@@ -84,16 +83,6 @@ func UnmarshalEnvelope(b []byte) (*Envelope, error) {
 				return nil, err
 			}
 			e.OperationID = v
-		case 5:
-			if wt != wireVarint {
-				return nil, ErrMalformed
-			}
-			var v uint64
-			v, b, err = consumeVarint(b)
-			if err != nil {
-				return nil, err
-			}
-			e.SourcePhaseQueueable = v != 0
 		case 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
 			60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 90, 91:
 			if wt != wireBytes {
@@ -208,7 +197,7 @@ func marshalBody(v any) (int, []byte, error) {
 	case *RemoveReply:
 		return 72, nil, nil
 	case *RenameReply:
-		return 73, nil, nil
+		return 73, marshalRenameReply(m), nil
 	case *SymlinkReply:
 		return 74, marshalSymlinkReply(m), nil
 	case *ReadlinkReply:
@@ -335,7 +324,7 @@ func unmarshalBody(num int, b []byte) (any, error) {
 	case 72:
 		return &RemoveReply{}, nil
 	case 73:
-		return &RenameReply{}, nil
+		return unmarshalRenameReply(b)
 	case 74:
 		return unmarshalSymlinkReply(b)
 	case 75:
@@ -443,25 +432,33 @@ func unmarshalHelloReply(b []byte) (*HelloReply, error) {
 
 func marshalPublicationAck(m *PublicationAck) []byte {
 	var b []byte
-	b = appendU64(b, 1, m.PublishedRequestID)
-	return appendU64(b, 2, m.OperationID)
+	b = appendU64(b, 2, m.OperationID)
+	return appendU32(b, 3, uint32(m.SemanticCommit))
 }
 
 func unmarshalPublicationAck(b []byte) (*PublicationAck, error) {
 	m := &PublicationAck{}
-	return m, scan(b, func(num int, wt int, raw []byte) error {
+	err := scan(b, func(num int, wt int, raw []byte) error {
 		switch num {
-		case 1:
-			v, err := scalarU64(wt, raw)
-			m.PublishedRequestID = v
-			return err
 		case 2:
 			v, err := scalarU64(wt, raw)
 			m.OperationID = v
 			return err
+		case 3:
+			v, err := scalarU64(wt, raw)
+			m.SemanticCommit = PublicationSemanticCommit(v)
+			return err
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	if m.SemanticCommit != PublicationSemanticCommitPublished &&
+		m.SemanticCommit != PublicationSemanticCommitNotPublished {
+		return nil, ErrMalformed
+	}
+	return m, nil
 }
 
 func marshalResourceReplyDisposition(m *ResourceReplyDisposition) []byte {
@@ -496,8 +493,6 @@ func marshalVisibilityAckRequest(m *VisibilityAckRequest) []byte {
 	var b []byte
 	b = appendBytesField(b, 1, m.AuthorityEpoch)
 	b = appendMsg(b, 2, marshalVisibilityCursor(&m.Cursor))
-	b = appendBool(b, 3, m.Blocked)
-	b = appendString(b, 4, m.Reason)
 	b = appendBool(b, 5, m.OrderedAdmissionContended)
 	return b
 }
@@ -511,12 +506,6 @@ func unmarshalVisibilityAckRequest(b []byte) (*VisibilityAckRequest, error) {
 			m.AuthorityEpoch, err = scalarBytes(wt, raw)
 		case 2:
 			m.Cursor, err = parseVisibilityCursorField(wt, raw)
-		case 3:
-			m.Blocked, err = scalarBool(wt, raw)
-		case 4:
-			var v []byte
-			v, err = scalarBytes(wt, raw)
-			m.Reason = string(v)
 		case 5:
 			m.OrderedAdmissionContended, err = scalarBool(wt, raw)
 		}
@@ -1501,6 +1490,27 @@ func unmarshalRenameRequest(b []byte) (*RenameRequest, error) {
 	})
 }
 
+func marshalRenameReply(m *RenameReply) []byte {
+	var b []byte
+	b = appendBytesField(b, 1, m.NewPostIdentity)
+	b = appendBytesField(b, 2, m.OldPostIdentity)
+	return b
+}
+
+func unmarshalRenameReply(b []byte) (*RenameReply, error) {
+	m := &RenameReply{}
+	return m, scan(b, func(num int, wt int, raw []byte) error {
+		var err error
+		switch num {
+		case 1:
+			m.NewPostIdentity, err = scalarBytes(wt, raw)
+		case 2:
+			m.OldPostIdentity, err = scalarBytes(wt, raw)
+		}
+		return err
+	})
+}
+
 func marshalSymlinkRequest(m *SymlinkRequest) []byte {
 	var b []byte
 	b = appendMsg(b, 1, marshalItem(&m.Dir))
@@ -1935,30 +1945,6 @@ func parseVisibilityTargetField(wt int, raw []byte) (VisibilityTarget, error) {
 	})
 }
 
-func marshalRoutesChange(m *RoutesChange) []byte {
-	var b []byte
-	b = appendBytesField(b, 1, m.Revision)
-	b = appendBytesField(b, 2, m.Rules)
-	return b
-}
-
-func parseRoutesChangeField(wt int, raw []byte) (*RoutesChange, error) {
-	if wt != wireBytes {
-		return nil, ErrMalformed
-	}
-	m := &RoutesChange{}
-	return m, scan(raw, func(num int, wt int, raw []byte) error {
-		var err error
-		switch num {
-		case 1:
-			m.Revision, err = scalarBytes(wt, raw)
-		case 2:
-			m.Rules, err = scalarBytes(wt, raw)
-		}
-		return err
-	})
-}
-
 func marshalV3VisibilityEvent(m *V3VisibilityEvent) []byte {
 	var b []byte
 	b = appendBytesField(b, 1, m.AuthorityEpoch)
@@ -1969,10 +1955,6 @@ func marshalV3VisibilityEvent(m *V3VisibilityEvent) []byte {
 		b = appendMsg(b, 5, marshalVisibilityTarget(&m.Targets[i]))
 	}
 	b = appendU64(b, 6, m.MutationSequence)
-	if m.Routes != nil {
-		b = appendMsg(b, 7, marshalRoutesChange(m.Routes))
-	}
-	b = appendU64(b, 8, m.LocalOperationID)
 	return b
 }
 
@@ -2002,10 +1984,6 @@ func parseV3VisibilityEventField(wt int, raw []byte) (V3VisibilityEvent, error) 
 			}
 		case 6:
 			m.MutationSequence, err = scalarU64(wt, raw)
-		case 7:
-			m.Routes, err = parseRoutesChangeField(wt, raw)
-		case 8:
-			m.LocalOperationID, err = scalarU64(wt, raw)
 		}
 		return err
 	})

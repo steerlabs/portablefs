@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import PortableFSAppCore
 
@@ -57,6 +58,39 @@ final class PortableFSCLILease: @unchecked Sendable {
             return handle
         }
         try? handle?.close()
+    }
+
+    /// Releases the lifecycle lease and proves the exact child has reaped.
+    /// The update server must not report the app quiesced while its shared
+    /// lifecycle holder can still block the install-exclusive handoff.
+    func releaseAndWait(timeout: TimeInterval = 6) throws {
+        release()
+        let cleanDeadline = Date().addingTimeInterval(timeout / 3)
+        while process.isRunning && Date() < cleanDeadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            process.terminate()
+        }
+        let terminateDeadline = Date().addingTimeInterval(timeout / 3)
+        while process.isRunning && Date() < terminateDeadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            _ = Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        let killDeadline = Date().addingTimeInterval(timeout / 3)
+        while process.isRunning && Date() < killDeadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        guard !process.isRunning else {
+            throw PortableFSCLIError(
+                command: command,
+                status: nil,
+                detail: "lifecycle holder did not exit within the bounded release deadline"
+            )
+        }
+        process.waitUntilExit()
     }
 
     func waitForUnexpectedExit() async -> PortableFSCLIError? {

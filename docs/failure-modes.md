@@ -1,323 +1,210 @@
 # Failure modes
 
-Status: **v3 failure contract**
+PortableFS protocol 6 is fail-closed except for two explicitly disclosed
+stock-FUSE clean-data residuals. This document states what fails, what scope is
+fenced, and what an application can observe.
 
-PortableFS v3 has one canonical representation per volume, selected by
-`(State, ArchiveCycleStep)`: XFS for READY, the sealed archive for ARCHIVED,
-and sealed base plus monotone hydration map plus XFS for RESTORING. A serving
-volume has one active authority epoch. Every failure below is scoped to the
-canonical storage, that epoch, one participant or session, one operation, or
-RESTORING content reads; the implementation never mixes those scopes.
-
-The architectural decision is in
-[xfs-authority-architecture.md](./xfs-authority-architecture.md); the
-application-visible guarantees are in
-[consistency-model.md](./consistency-model.md).
+The canonical storage depends on `(State, ArchiveCycleStep)`: XFS for READY,
+the sealed archive for ARCHIVED, and sealed base plus monotone hydration map
+plus XFS for RESTORING. A serving volume still has one authority epoch. Failure
+scope never turns these representations into competing writable truths.
 
 ## Failure scopes
 
-| scope | what it costs | recovery |
+| Scope | Examples | Result |
 | --- | --- | --- |
-| storage fatal | the epoch; the process exits | investigate the device/filesystem, then a new epoch |
-| coherence poison | the epoch | a new epoch |
-| participant fenced | one mount's session | that mount revokes itself and remounts |
-| session fenced | one mount's session | remount |
-| restore | one volume's content reads while blocked; never the epoch | auto-clears on archive-store recovery; corrupt content requires repair |
-| ordinary errno | one operation | the application's own error handling |
+| Request | validation, permission, quota, ordinary XFS errno | that request fails; session continues |
+| Session | protocol violation, replay mismatch, failed recall, lost lease control | that mount is fenced; other mounts continue |
+| Volume epoch | authority death, XFS I/O error, storage topology violation | all sessions end; restart creates a new epoch |
+| Restore | archive-store outage, absent hydrator, or digest failure | content reads fail uniformly with `FAILURE_CLASS_RESTORE`; the epoch and sessions remain alive |
+| Host frontend profile | unsupported FUSE level or a request outside the declared profile | Linux refuses during INIT and cleanly releases the pre-mount session; FSKit rejects Linux lease operations and Linux rejects FSKit repair operations |
 
-Responses carry the scope explicitly rather than making the client infer it
-from an errno: `FAILURE_CLASS_STORAGE`, `FAILURE_CLASS_COHERENCE`,
+Fencing never converts an already-applied mutation into a retry. If the
+authority cannot establish the exact result, it reports uncertainty or ends the
+affected scope.
+
+Responses distinguish `FAILURE_CLASS_STORAGE`, `FAILURE_CLASS_COHERENCE`,
 `FAILURE_CLASS_ROUTES`, `FAILURE_CLASS_RESTORE`, and
-`FAILURE_CLASS_INTERNAL`. A bare `EIO` cannot say whether the filesystem is
-gone or the authority merely failed to recognise one of its own errors, and
-those need different operator actions.
+`FAILURE_CLASS_INTERNAL`; errno alone is not the failure scope.
 
-## Storage failure fences the store and ends the epoch
+## Authority and storage failure
 
-`EIO` is the classic device failure, `EUCLEAN` is how XFS surfaces detected
-metadata corruption, `ESHUTDOWN` is a filesystem the kernel already shut down
-after an earlier failure, and `ENOTRECOVERABLE` is terminal state loss. All
-four are treated identically: the store is permanently fenced for this epoch
-and the authority process exits.
+An XFS I/O failure or a violation of the pinned volume root makes the store
+untrustworthy. The authority fences the volume epoch and stops accepting
+filesystem operations. It does not redirect to another directory, rebuild from
+a PortableFS journal, or keep a partial namespace alive.
 
-Fencing is not a retry backoff. After it, no mutation is attempted against a
-filesystem whose durable state can no longer be trusted, because continuing to
-serve would mean acknowledging writes that may never have landed. Operator
-guidance: treat the exit as not-ready, investigate the device and filesystem,
-and do not restart-loop a volume onto unhealthy storage.
+Authority death ends every live session and loses volatile locks and leases. A
+restarted authority uses a new epoch and holds a grace period for the maximum
+conservative lease-expiry bound before admitting a conflicting mutation. This
+prevents a new epoch from racing a lease the restarted process cannot remember.
+Persisted lease recovery is not claimed.
 
-## Authority death, restart, and epoch change
+A RESTORING replacement additionally loads the durable hydration map and sealed
+base identity. Those records are that state's canonical representation, not a
+mutation replay log.
 
-Ordinary authority runtime state is disposable, so there is no promotion
-protocol or warm standby to keep consistent. A READY replacement mounts the
-same XFS, increments the epoch, and serves. A RESTORING replacement also loads
-the durable hydration map and sealed-base identity; those records are part of
-that state's canonical representation, not replayable mutation history.
+## Lost mutation reply
 
-Everything scoped to the old epoch is gone at that instant:
+Inside one live epoch, exact replay of a daemon operation identity returns the
+retained result without re-execution. Reusing an identity for a different
+canonical body or skipping its required sequence fences the session.
 
-- All object and open-handle capabilities are invalid. Tokens are bound to the
-  epoch by construction, so a stale one is exactly a stale handle: `ESTALE`.
-- All POSIX and `flock` locks are released. They were epoch runtime state.
-- All same-epoch replay slots are gone, which is why no mutation is continued
-  across the boundary.
-- All server file descriptors are closed. An unlinked-but-still-open file whose
-  last name was already removed is destroyed by XFS at that point and cannot be
-  recovered; holders receive `ESTALE`/`EIO`. See
-  [open-after-unlink.md](./open-after-unlink.md).
+There is no atomic transaction spanning an arbitrary XFS syscall and a durable
+PortableFS replay record. If the authority may have applied a mutation but its
+reply is lost across authority death, the result is `UNCERTAIN`. The client does
+not resubmit it in the new epoch. The application inspects current state.
 
-What survives for READY is exactly what XFS made durable, plus the durable
-strict-mount membership record described below. RESTORING additionally retains
-the monotone hydration map and convergence record in StateRoot and the sealed
-base in the archive tier. `TestUnmountRemountObservesDurableState` in the
-privileged suite pins the READY case.
+## Lease recall and fencing
 
-## A lost reply is UNCERTAIN, not a retry
+A conflicting mutation closes grant admission, recalls peer N/A/D/E leases,
+applies to XFS, delivers exact post-state, and waits for discharge before the
+source response. A healthy peer purges all state covered by the recalled lease.
+Whole-file D leases recall only to none in v1; range-successor continuity is not
+implemented.
 
-A connection can die after XFS has already applied a mutation but before its
-reply arrives. The authority does not invent an errno for that, and the client
-does not replay it into a new epoch.
+If a peer does not discharge within the recall budget, the authority fences its
+session. The mutation may proceed only after the old conservative expiry bound
+has elapsed. This can delay one mutation; it does not fence the volume.
 
-The response carries an explicit `uncertain` marker, and the server-side marker
-`ErrOutcomeUncertain` (`vcs/internal/xfsstore`) deliberately carries no errno of
-its own, so an uncertain outcome can never be mistaken for the storage `EIO`
-that fences a volume. The application observes a definite error and inspects
-current state to decide what happened. Append offsets and namespace outcomes
-are never guessed.
+On Linux, the daemon uses an ordered installing lane and a zero-validity
+metadata lane. An already-admitted buffered READ drains before REVOKE
+acknowledgment; a new READ at a closed cut returns `EAGAIN` without waiting
+behind invalidation. The mutating mount uses an exact source obligation: A/D/E
+and daemon N purge before reply; kernel name validity is always zero, so source
+completion does not depend on a post-write namespace notification.
 
-Inside a live epoch the opposite holds: duplicate delivery returns the recorded
-outcome from the session's replay slot and never re-executes.
+Zero name validity governs forward pathname resolution, not reverse rendering
+of retained dentries. `getcwd`, `/proc/*/fd`, and other `d_path` users can show
+an older path after a remote rename because stock Linux performs no
+revalidation there; that operation class is outside the protocol-6 namespace
+contract.
 
-## Session fencing
+An invalidation error that stock FUSE reports fails the discharge and fences the
+mount. Stock FUSE does not report the result of data-page invalidation; that
+specific boundary is described below.
 
-A mount session ends — every further operation from it fails, and the mount
-must remount — for these reasons:
+## Mount process and machine failure
 
-- **Proven client-state loss.** A replay slot identity reused with a different
-  request (`ErrRequestMismatch`), or a slot sequence that gapped
-  (`ErrSequenceGap`). Interleaving with lost state would be undefined, so the
-  authority refuses to execute anything further from that session.
-- **A slot outside the negotiated range** (`ErrSlotRange`).
-- **Session lease expiry.** Keepalive is a liveness proof; a session that stops
-  renewing is reaped along with its locks and handles.
-- **Authorization expiry.** Keepalive cannot extend the signed authorization
-  deadline. A standalone mount must use a new credential and mount again. A
-  hosted live mount may extend its existing session only with the exact next
-  manager-signed `Reauthorize` grant; an expired, broadened, gapped, or changed
-  replay is refused and may fence the session.
-- **Strict participant fencing**, below.
+If the daemon dies, the kernel aborts the FUSE connection and no new request is
+served. The authority fences the session and reclaims its leases after the
+expiry bound. A machine loss has the same authority-side result.
 
-A fenced session never re-establishes itself under the same identity. A zombie
-that minted a fresh generation could overwrite its successor's work.
-`TestSessionExpiryReleasesABlockedLockWait` pins that a blocked lock waiter is
-released rather than left hanging when its session ends, and
-`TestAuthorityLossFailsCleanlyInsteadOfHanging` pins the same property for the
-authority disappearing underneath a mount.
+A clean unmount closes request admission, drains operations, returns leases,
+closes the FUSE connection, and sends authenticated detach. Force unmount makes
+no durability promise beyond operations that already returned; there is no
+client write-back tail to replay.
 
-## A lost strict participant is fenced individually
+## The two accepted clean-data residuals
 
-This is the availability decision that matters most in a multi-mount volume: a
-single dead cached frontend must not freeze the volume.
+### Wedged daemon
 
-A broken session, a missed repair budget, or an acknowledgement-cursor
-violation removes exactly that mount from admission to later visibility
-barriers and ends its authority session immediately through the
-`SessionFencer`. The volume keeps serving; the running mutation completes.
+Kernel-held clean pages have no independent lease timer. If a daemon is alive
+but cannot run—for example, stopped by SIGSTOP—it cannot purge those pages at
+lease expiry. After the authority fences that mount and a peer mutates the
+file, a process on the wedged mount can read stale cached bytes until the daemon
+resumes or dies.
 
-The obligation already held by that running mutation is retained for one full
-additional declared repair-budget grace and then discharged. A failed
-participant therefore costs at most two budgets — one phase deadline plus one
-fencing grace — rather than an unbounded volume outage. The grace is
-load-bearing only when the frontend can prove its old kernel cache became
-unservable before the grace ends.
+The trigger requires all of: a wedged-not-dead daemon, fencing, a peer mutation,
+and a cached read-only page. It does not affect metadata, accepted writes, or
+durability. Process supervision bounds the condition operationally but does not
+remove it from the contract.
 
-Linux proves it by detaching and aborting FUSE (below). macOS 26 proves it with
-the per-mount supervisor: after a daemon/session liveness failure it
-identity-checks and force-unmounts the exact FSKit mount. Live testing with a
-cached held descriptor showed reads continue for 8.6 seconds, the watchdog
-force-unmounts at about 10 seconds, and every later `pread` fails `EIO`, inside
-the fencing grace. A kernel that refuses forced unmount past the grace remains
-the stated platform residual. See
-[macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
+### Unproved data-cache withdrawal
 
-Participant-scoped fencing is reported to the client as `ESTALE`, never as a
-volume-wide I/O failure, precisely because the volume is unaffected.
+The client ends cache validity and starts D-page withdrawal five seconds before
+the authority horizon. Renewal, withdrawal, and the terminal watchdog are
+independent, so a blocked renewal cannot postpone that work. Stock Linux FUSE
+nevertheless discards `invalidate_inode_pages2_range`'s `EBUSY` result, and a
+notification can also remain blocked through the withdrawal interval. The
+watchdog terminalizes and aborts the mount before the authority proceeds.
 
-## Linux self-revocation
+Channel abort prevents new FUSE work but does not itself invalidate resident
+folios. A read-only file descriptor or private mapping that already references
+an old clean page can therefore keep observing it after a peer mutation,
+potentially for the reference's lifetime. No new open, cache miss, daemon
+answer, metadata answer, accepted write, or durability result is authorized.
+A later successful purge or destruction of the reference removes the
+exposure. Removing the exception requires a bounded, result-bearing kernel
+invalidation or cache-generation primitive; surfacing `EBUSY` alone does not
+solve a notification that never completes.
 
-When a strict Linux mount learns it can no longer repair, `Mount.revoke`
-(`vcs/internal/fusev3/coherence_linux.go`) makes the stale cache unservable in
-three steps, strongest first:
+## Partition and expiry
 
-1. every new request is refused synchronously, before the call returns;
-2. the mount point is detached with `MNT_DETACH`, so the tree is unreachable
-   from the namespace root in one syscall, and every published kernel binding
-   is withdrawn within the declared repair budget;
-3. the FUSE connection is aborted through
-   `/sys/fs/fuse/connections/<minor>/abort`, after which there is no request
-   this frontend could answer wrongly at all.
+A partitioned daemon cannot renew leases. Daemon cache hits check the earlier
+request-start-anchored cache deadline and miss then; kernel entry validity is
+zero and attribute validity expires no later than that deadline. The daemon
+starts purging D-covered pages five seconds before the authority horizon. If it
+cannot prove withdrawal, the independent watchdog terminalizes the mount before
+that horizon. New operations degrade to errors; preexisting cached data
+references remain subject to the explicit exception above.
 
-Afterwards the mount reports `ENOTCONN`. That is the exact truth: this frontend
-is no longer connected to anything it may speak for.
+Loss of the CONTROL transport closes lease grant and mutation admission. It is
+not replaced by polling DATA traffic or a reduced-coherence mode. Reconnection
+is valid only while session, epoch, transport generation, and leases remain
+exact.
 
-## Coherence poison
+## Capacity, quota, and routing
 
-Poison is reserved for authority-internal invariant violations — a COMPLETE
-naming a coordinate that PREPARE did not, a participant found holding two
-outstanding events. Those are defects no mount can cause, and no client input
-can trigger. `ErrVisibilityPoisoned` is permanent for the epoch and recovery
-requires a new one.
+XFS project-quota exhaustion returns the authoritative storage errno. In-memory
+bounds reject new work before unbounded allocation. Neither case redirects data
+to a different filesystem.
 
-The distinction from participant fencing is deliberate and must stay that way:
-one is a peer that died, the other is a bug in the coordinator. Collapsing them
-would either turn a dead laptop into a volume outage or turn a coordinator
-defect into silently degraded coherence.
+When block and inode hard limits are installed, `statfs` on the project
+directory reports the project's limits and remaining capacity. Hosted
+tiered-storage admission and `df` depend on that projection; a project without
+hard limits retains cell-wide XFS capacity.
 
-## Durable strict-mount membership and restart refusal
-
-Durable membership is the one authority control record that outlives every
-epoch. RESTORING additionally has the phase-bound hydration map and convergence
-record described above. Membership records only which cached kernel mounts a
-previous epoch admitted — no paths, inodes, bytes, mutations, or history — and
-it exists so a *replacement* authority cannot start serving underneath a kernel
-cache that is still live on some machine.
-
-- It is deliberately **not** cleared by fencing. A fenced mount is gone from
-  this epoch's barrier while still recorded.
-- Only the official supervisor's mount-absence observation on the authenticated
-  request for that exact session deactivates a record. The supervisor first
-  establishes its platform's terminal mount conditions; a crash, missing
-  observation, ambiguous kernel state, or delivery failure keeps the record.
-- A Linux attach that fails before kernel mount creation uses its random
-  per-attempt FUSE source as the identity. The session is deactivated only if
-  that source is absent everywhere in `mountinfo` and no serving loop can still
-  install it; path absence alone is not evidence.
-- On startup, a replacement authority refuses to serve until every recorded
-  prior strict kernel mount is proven absent, or the operator asserts
-  `--prior-strict-mounts-fenced` once after the control plane has actually
-  fenced those hosts.
-
-Availability is preserved inside an epoch and paid for across one. Never set
-`--prior-strict-mounts-fenced` merely because the authority process or its
-network connection stopped; a dead socket is not proof that a kernel cache is
-unservable. Deployment detail is in
-[xfs-authority-deployment.md](./xfs-authority-deployment.md).
-
-## Mount process or machine dies
-
-A v3 mount holds no durability debt: every acknowledged write was already
-applied to XFS before `write(2)` returned. A dead mount therefore loses
-nothing that was acknowledged. What it loses is its session — locks, handles,
-and any unlinked-but-open inode whose last name was already removed.
-
-Surviving mounts are unaffected. The coherence matrix asserts that directly
-with `peer_loss_does_not_break_surviving_mount`, which is only possible because
-the mounts are separate OS processes that can be killed uncleanly.
-
-## Capacity, quota, and admission
-
-- **Quota and disk exhaustion surface as the kernel's own `EDQUOT` and
-  `ENOSPC`.** They are ordinary operation failures. They do not fence the store
-  and are not in the fatal-storage set.
-- **`statfs` projects XFS project quota when hard limits are set.** Every hosted
-  volume has block and inode hard limits, so its project directory reports those
-  limits and their remaining capacity; `df` inside the mount and tiered-storage
-  usage measurement depend on that result. A project with no hard limit reports
-  cell-wide physical capacity.
-- **Deployment-sized bounds** on live sessions, replay slots, lock records,
-  in-flight requests, frame allocations, descriptors, tasks, and memory are
-  denial-of-service admission controls, not filesystem-size limits. Reaching one
-  answers `EAGAIN`. Because launch isolates one worker per volume, exhausting
-  them can fail that volume but cannot consume another tenant's worker state.
+A `.portablefs/local-dirs` revision mismatch refuses Attach and returns the
+authority's current declaration for an explicit same-capability retry. A live
+route change fences existing sessions because their local/shared classification
+is no longer the volume's declared one.
 
 ## Restore interruption and corruption
 
-`RESTORE_BLOCKED` means the archive store is unreachable, credentials are
-invalid, or the hydrator is absent. The state is volume-wide: every content read
-fails with the named restore error carrying `FAILURE_CLASS_RESTORE`, including
-reads of already hydrated content, while namespace and attribute operations
-continue. Mounts and sessions stay alive, drain retries with backoff, and the
-state clears when archive fetches succeed again.
+`RESTORE_BLOCKED` covers an unreachable archive store, invalid credentials, or
+an absent hydrator. Every content read fails with definite `EIO` and
+`FAILURE_CLASS_RESTORE`, including reads of hydrated content; namespace and
+attribute operations continue. Mounts stay alive, drain retries with backoff,
+and the state clears when verified fetches succeed again.
 
-`RESTORE_CORRUPT` means a fetched chunk failed digest verification. It is also a
-volume-level state: content reads stop uniformly rather than varying by hydrated
-versus cold data, the affected paths remain enumerable from the manifest, and
-unverified bytes are never served. Recovery requires repair that re-establishes
-a Manager-verified sealed representation. Both states answer applications with
-errno `EIO` — never `EAGAIN`, which parks poll-driven runtimes on a pollable
-FUSE file — but always under `FAILURE_CLASS_RESTORE`, which keeps them out of
-the fatal-storage classification entirely: hydration failures never enter the
-fatal-storage set and never end the epoch, however the errno reads. Mounts and
-sessions stay alive in both states.
+`RESTORE_CORRUPT` covers a fetched chunk that fails digest verification. Content
+reads stop uniformly, affected paths remain enumerable from the sealed
+manifest, and unverified bytes are never served. Repair must re-establish a
+Manager-verified sealed representation. Restore errors never enter the fatal
+storage set and never end the authority epoch.
 
-## Routing revision mismatch
+## Platform refusal
 
-`.portablefs/local-dirs` is volume-wide configuration replaced only through the
-authority's admin `ApplyRoutes`, which canonicalizes the declaration and
-compare-and-swaps its revision. An attach or an existing session on a different
-revision fails closed.
+A Linux kernel below FUSE protocol 7.31 is refused during FUSE INIT. INIT is the
+first point at which userspace learns the kernel protocol level, so the paired
+authority session already exists; the failure path proves that no usable mount
+was installed and cleanly detaches it. A kernel at or above the floor is not
+required to advertise any private PortableFS capability; none exists.
 
-The refusal is recoverable without spending a single-use capability: the
-routing check runs *before* the capability is verified, and the refusal carries
-the volume's active canonical rules, so a mount adopts them and attaches again
-on the same capability. A second refusal is a real disagreement and is surfaced
-verbatim; `routes_revision_mismatch` in the coherence matrix asserts that
-contract including the attempt count. A routing change applied while mounts are
-live revokes them with a remount message rather than letting two machines
-disagree about which paths are shared. If durable commit fails after PREPARE, current production mounts have already
-revoked during PREPARE and are not preserved. A truthful reported-active COMPLETE is relevant only to a future frontend that
-explicitly staged and ACKed PREPARE without leaving. A definite pre-publication
-failure reports the old revision and `Applied=false`; a post-rename
-durability-uncertain failure reports the next revision and `Applied=true`.
-Fresh attaches use whichever revision the commit reports active.
+The protocol-6 writable Linux profile is not production-ready: PortableFS can
+refuse `O_APPEND`, but stock FUSE does not forward `RWF_APPEND`, so the daemon
+cannot detect or refuse that append request. This is a correctness blocker, not
+a runtime fallback condition.
 
-## Launch topology
+macOS 26 and 27 mount through the explicit `FSKIT_SYNC_REPAIR` profile. Current
+FSKit cannot prove N/A/E lease discharge, per-reply metadata installation
+control, exact append intent, or distributed locks, so those edges are declared
+best-effort. The authority still orders its PREPARE/COMPLETE repair around the
+same XFS mutation and fences a session that misses that repair deadline.
 
-Launch is one Nitro EC2 instance and one encrypted, non-Multi-Attach EBS volume
-formatted XFS, with `DeleteOnTermination=false` so the volume outlives the
-instance. This is single-AZ durable storage, **not** cross-AZ HA. EBS
-replicates within one AZ; SLOs must use that fact rather than call one volume a
-replica set.
-
-Instance replacement is manual and ordered: prove the previous process cannot
-write, detach, attach in the same AZ, mount XFS and let journal replay finish,
-start a fresh epoch, publish the endpoint. There is no automatic second writer.
-
-Heartbeats, DNS, and leases do not fence an old writer. Force-detach is an
-emergency action, not a promotion protocol. Do not call EBS Multi-Attach a
-replica and do not mount ordinary XFS read-write on two hosts. Optional
-active-passive HA is a separate topology requiring independent fencing,
-one-writer enforcement, epoch advancement, and destructive split-brain tests
-before it is credible.
-
-Backups are disaster recovery, not a failure mode of the filesystem: they
-protect against deletion, bugs, compromised credentials, and operator error —
-the failures a live replica would faithfully copy. A snapshot is never mounted
-inside the live namespace and users see no version history. See
-[xfs-authority-deployment.md](./xfs-authority-deployment.md).
-
-## What this contract does not promise
-
-- Transparent exactly-once mutation across authority death. An uncertain
-  outcome is reported as uncertain.
-- Recovery of unlinked-but-open file content across an epoch change.
-- Cross-AZ high availability at launch.
-- Automatic failover of any kind.
-- That a macOS frontend can currently prove kernel withdrawal within the
-  fencing grace.
+Windows has no production frontend and is refused by its primitive gate.
 
 ## Verification
 
-These are the executable gates, not inspection:
+- `scripts/xfs-fuse-integration.sh` runs the privileged XFS and real stock-FUSE
+  integration suite and verifies every required test reported PASS.
+- `scripts/coherence-matrix-linux.sh` drives two independent stock-kernel
+  mount processes through ordinary syscalls and runs falsifiability controls.
+- `scripts/run-powerloss.sh` distinguishes process death from device-level
+  durability cuts.
+- `scripts/verify-local.sh` runs portable compile, unit, race, workflow-policy,
+  and active-contract scans; `--full` also runs the two suites above.
 
-```bash
-bash scripts/verify-local.sh            # the single local merge gate
-bash scripts/xfs-fuse-integration.sh    # privileged Linux: real XFS + kernel FUSE
-bash scripts/coherence-matrix-linux.sh  # black-box two-mount matrix, with controls
-```
-
-The privileged suite enumerates every test that must actually run and pass; a
-required test that is renamed, deleted, or skipped fails the job rather than
-quietly shrinking coverage. The coherence matrix proves a red result is
-reachable — a disjoint-namespace phase and a first-success stale-view phase —
-before it reports a green one.
+The exact lease algorithm and open upstream work are in
+[portable-coherence.md](./portable-coherence.md).

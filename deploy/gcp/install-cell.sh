@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-[[ $# == 4 && $1 == /* && -d $1 ]] || {
-  echo "usage: $0 /absolute/cell-stage CELL_UUID AGENT_UID AGENT_GID" >&2
+[[ $# == 5 && $1 == /* && -d $1 && $2 == /* && -d $2 ]] || {
+  echo "usage: $0 /absolute/hosted-release /absolute/cell-config-stage CELL_UUID AGENT_UID AGENT_GID" >&2
   exit 64
 }
 [[ $(id -u) == 0 ]] || {
@@ -10,27 +10,26 @@ set -euo pipefail
   exit 77
 }
 
-stage=$1
-cell_id=$2
-agent_uid=$3
-agent_gid=$4
+release=$1
+stage=$2
+cell_id=$3
+agent_uid=$4
+agent_gid=$5
 [[ $cell_id =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || exit 64
 [[ $agent_uid =~ ^[1-9][0-9]{3,8}$ && $agent_gid =~ ^[1-9][0-9]{3,8}$ ]] || exit 64
 
-for relative in \
-  portablefs-cell-agent portablefs-cell-helper portablefs-authority portablefs-authority-launcher \
-  portablefs-archiver portablefs-hydrator \
-  portablefs-cell-agent@.service portablefs-cell-helper@.service \
-  portablefs-authority@.socket portablefs-authority@.service \
-  portablefs-archiver@.service portablefs-hydrator@.service \
-  cell.cert cell.key manager-ca.pem plan-public.pem cell.env cell-archive.env; do
+for relative in cell.cert cell.key manager-ca.pem plan-public.pem cell.env cell-archive.env; do
   [[ -f $stage/$relative && ! -L $stage/$relative ]] || {
     echo "missing or unsafe staged file: $relative" >&2
     exit 66
   }
 done
 
-findmnt -n -o FSTYPE /srv/portablefs | grep -Fx xfs >/dev/null
+[[ $(findmnt -n -o TARGET --target /srv/portablefs) == /srv/portablefs ]] || {
+  echo "/srv/portablefs is not a dedicated mountpoint" >&2
+  exit 65
+}
+findmnt -n -o FSTYPE --target /srv/portablefs | grep -Fx xfs >/dev/null
 for option in prjquota nodev nosuid noexec noatime; do
   findmnt -n -o OPTIONS /srv/portablefs | tr ',' '\n' | grep -Fx "$option" >/dev/null || {
     echo "/srv/portablefs is missing $option" >&2
@@ -50,18 +49,6 @@ fi
   exit 65
 }
 
-install -o root -g root -m 0755 "$stage/portablefs-cell-agent" /usr/local/bin/portablefs-cell-agent
-install -o root -g root -m 0755 "$stage/portablefs-authority" /usr/local/bin/portablefs-authority
-install -o root -g root -m 0755 "$stage/portablefs-archiver" /usr/local/bin/portablefs-archiver
-install -o root -g root -m 0755 "$stage/portablefs-hydrator" /usr/local/bin/portablefs-hydrator
-install -d -o root -g root -m 0755 /usr/local/libexec
-install -o root -g root -m 0755 "$stage/portablefs-cell-helper" /usr/local/libexec/portablefs-cell-helper
-install -o root -g root -m 0755 "$stage/portablefs-authority-launcher" /usr/local/libexec/portablefs-authority-launcher
-
-for unit in portablefs-cell-agent@.service portablefs-cell-helper@.service portablefs-authority@.socket portablefs-authority@.service portablefs-archiver@.service portablefs-hydrator@.service; do
-  install -o root -g root -m 0644 "$stage/$unit" "/etc/systemd/system/$unit"
-done
-
 install -d -o root -g root -m 0755 /etc/portablefs/{trust,cells,volumes}
 install -d -o root -g root -m 0711 /var/lib/portablefs/volumes
 install -d -o root -g root -m 0700 /var/lib/portablefs-cell-helper/sysusers.d
@@ -75,6 +62,8 @@ install -o root -g root -m 0600 "$stage/cell.env" "/etc/portablefs/cells/$cell_i
 # when it writes the archiver/hydrator drop-ins.
 install -o root -g root -m 0600 "$stage/cell-archive.env" "/etc/portablefs/cells/$cell_id-archive.env"
 
+"$(dirname -- "$0")/activate-hosted-release.sh" "$release" cell >/dev/null
+
 # The authority socket deliberately has no template-level ListenStream. The
 # helper supplies its signed, per-volume listener in a drop-in, so verifying an
 # uninstantiated socket would correctly reject it as incomplete. Verify that
@@ -82,4 +71,6 @@ install -o root -g root -m 0600 "$stage/cell-archive.env" "/etc/portablefs/cells
 systemd-analyze verify \
   /etc/systemd/system/portablefs-cell-agent@.service \
   /etc/systemd/system/portablefs-cell-helper@.service
-systemctl daemon-reload
+systemctl enable --now "portablefs-cell-helper@$cell_id.service" "portablefs-cell-agent@$cell_id.service"
+systemctl --quiet is-active "portablefs-cell-helper@$cell_id.service"
+systemctl --quiet is-active "portablefs-cell-agent@$cell_id.service"

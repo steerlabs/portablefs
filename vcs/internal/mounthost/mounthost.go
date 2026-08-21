@@ -21,7 +21,16 @@
 //     invention. A mount is the only authority on whether a mount works.
 package mounthost
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrWindowsPrimitivesUnavailable is the fail-closed answer for Windows until
+// one supported native filesystem frontend can prove both halves of the v3
+// contract: byte-range locks owned by the authority and synchronous cache
+// control. A locally coherent drive is not a PortableFS multi-writer mount.
+var ErrWindowsPrimitivesUnavailable = errors.New("Windows mounting is unavailable: no supported native filesystem frontend exposes both authority-forwarded byte-range locks and synchronous cache control")
 
 // Transport is the single mount transport a platform supports. There is
 // deliberately one per platform and no fallback between them: a host that
@@ -141,6 +150,8 @@ func SelectTransport(explicit, goos string) (Transport, error) {
 			return FSKit, nil
 		case "linux":
 			return FUSE, nil
+		case "windows":
+			return "", ErrWindowsPrimitivesUnavailable
 		default:
 			return "", fmt.Errorf("mounting is not supported on %s (supported: darwin via FSKit, linux via FUSE)", goos)
 		}

@@ -3,10 +3,9 @@
 package fusev3
 
 import (
-	"bytes"
+	"errors"
 	"fmt"
 
-	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
 
@@ -45,22 +44,6 @@ func ActivateRoutes(declaration []byte) (localroutes.RuleSet, error) {
 	return rules, nil
 }
 
-// routesEventChange reports whether a visibility event announces a route
-// declaration this mount did not attach with.
-//
-// The authority sends the change on both phases of the barrier and this answers
-// on the first one it sees. Acting at PREPARE is deliberate: PREPARE is the
-// point at which the new topology is not yet visible anywhere, so a mount that
-// stops there has served nothing under the old rules that the new rules
-// contradict.
-func routesEventChange(mounted [32]byte, event *authoritypb.VisibilityEvent) error {
-	revision := event.GetRoutes().GetRevision()
-	if len(revision) == 0 || bytes.Equal(revision, mounted[:]) {
-		return nil
-	}
-	return routesChangeCause(mounted[:], revision)
-}
-
 // routesChangeCause is the message a mount self-revokes with when the volume's
 // route declaration moves under it.
 //
@@ -73,6 +56,10 @@ func routesEventChange(mounted [32]byte, event *authoritypb.VisibilityEvent) err
 // Neither outcome is expressible as a filesystem operation, so the mount stops
 // being a filesystem instead of silently becoming a wrong one.
 func routesChangeCause(mounted, announced []byte) error {
-	return fmt.Errorf("fusev3: the volume's %s declaration changed from revision %x to %x; machine-local route topology is fixed for the life of a mount, so this mount has revoked itself -- unmount and mount again to serve the new routes",
-		LocalDirsPath, mounted, announced)
+	return fmt.Errorf("%w: the volume's %s declaration changed from revision %x to %x; machine-local route topology is fixed for the life of a mount, so this mount has revoked itself -- unmount and mount again to serve the new routes",
+		errRoutesChanged, LocalDirsPath, mounted, announced)
 }
+
+// errRoutesChanged is the sentinel behind that sentence, so a supervisor can
+// classify the revocation without reading prose.
+var errRoutesChanged = errors.New("fusev3: the volume's machine-local route declaration changed under this mount")

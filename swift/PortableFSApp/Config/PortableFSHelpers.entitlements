@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The non-sandboxed CLI and daemon use the same signed app-group
+	     container as the host and FSKit extension. The embed build phase
+	     resolves this build setting before signing each helper. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(PORTABLEFS_APP_GROUP)</string>
+	</array>
+</dict>
+</plist>

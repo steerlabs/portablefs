@@ -25,7 +25,7 @@ private func v3Contract(
     initialCursor: PfsVisibilityCursor? = nil
 ) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 3
+    contract.authorityProtocolMajor = 6
     contract.authorityEpoch = epoch
     contract.sessionID = sessionID
     contract.cachePolicy = policy
@@ -58,7 +58,6 @@ private func v3Event(
     sequence: UInt64 = 1,
     phase: PfsVisibilityPhase = .prepare,
     initiatorSessionID: Data = v3PeerSession,
-    localOperationID: UInt64 = 0,
     targets: [PfsVisibilityTarget]
 ) -> PfsV3VisibilityEvent {
     var event = PfsV3VisibilityEvent()
@@ -67,7 +66,6 @@ private func v3Event(
     event.initiatorSessionID = initiatorSessionID
     event.mutationSlot = 7
     event.mutationSequence = 99
-    event.localOperationID = localOperationID
     event.targets = targets
     return event
 }
@@ -118,12 +116,13 @@ private func nextV3Event(
     }
 }
 
+extension PfsLocalMockDaemonTests {
 @Test func v3ContractParsingAcceptsOnlyCompleteValidatedTerms() throws {
     let complete = v3Cursor(sequence: 12, phase: .complete)
     let parsed = try PfsLocalMacOSV3CoherenceTransport.parseContract(
         v3Contract(initialCursor: complete)
     )
-    #expect(parsed.authorityProtocolMajor == 3)
+    #expect(parsed.authorityProtocolMajor == 6)
     #expect(parsed.epoch == v3Epoch)
     #expect(parsed.sessionID == v3LocalSession)
     #expect(parsed.cachePolicy == .synchronousVFSRepairV1)
@@ -138,6 +137,12 @@ private func nextV3Event(
     var contract = v3Contract()
     contract.authorityProtocolMajor = 1
     #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(1)) {
+        try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
+    }
+
+    contract = v3Contract()
+    contract.authorityProtocolMajor = 5
+    #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(5)) {
         try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
     }
 
@@ -291,7 +296,6 @@ private func nextV3Event(
 
     #expect(decoded.sequence == 1)
     #expect(decoded.phase == .prepare)
-    #expect(decoded.initiator.localOperationID == nil)
     #expect(decoded.repairs.count == 2)
     guard case let .invalidateData(dataPath, knownParent, knownIdentity, fileID, size) = decoded.repairs[0] else {
         Issue.record("expected data invalidation to subsume the same-coordinate eviction")
@@ -356,46 +360,18 @@ private func nextV3Event(
     #expect(name == Data("alias".utf8))
 }
 
-@Test func v3EventDecoderBindsLocalEventsToOneExactPublicationOperation() async throws {
+@Test func v3EventDecoderRejectsSourceFilesystemVisibilityEvents() async throws {
     let root = try v3Identity(1)
     let planner = PfsMacOSRepairPlanner(index: PfsMacOSNamespaceIndex(rootIdentity: root))
     let target = v3Target(scope: .attributes, identity: Data(repeating: 0x44, count: 16))
 
     let local = v3Event(
         initiatorSessionID: v3LocalSession,
-        localOperationID: 123,
-        targets: [target]
-    )
-    let decoded = try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-        local,
-        expectedEpoch: v3Epoch,
-        expectedSessionID: v3LocalSession,
-        planner: planner
-    )
-    #expect(decoded.initiator.localOperationID == 123)
-
-    let missingLocalID = v3Event(
-        initiatorSessionID: v3LocalSession,
-        localOperationID: 0,
         targets: [target]
     )
     await #expect(throws: PfsMacOSCoherenceError.invalidVisibilityTarget) {
         try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            missingLocalID,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
-
-    let forgedPeerID = v3Event(
-        initiatorSessionID: v3PeerSession,
-        localOperationID: 123,
-        targets: [target]
-    )
-    await #expect(throws: PfsMacOSCoherenceError.invalidVisibilityTarget) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            forgedPeerID,
+            local,
             expectedEpoch: v3Epoch,
             expectedSessionID: v3LocalSession,
             planner: planner
@@ -530,49 +506,6 @@ private func nextV3Event(
     )
     #expect(decodedComplete.phase == .complete)
     #expect(decodedComplete.repairs.isEmpty)
-
-    var routes = v3Event(targets: [])
-    routes.initiatorSessionID = Data(repeating: 0, count: 16)
-    routes.mutationSlot = 0
-    routes.mutationSequence = 0
-    routes.localOperationID = 0
-    var change = PfsRoutesChange()
-    change.revision = Data(repeating: 0xCC, count: 32)
-    change.rules = Data("rules".utf8)
-    routes.routes = change
-    await #expect(throws: PfsMacOSCoherenceError.routesChangeRequiresRemount) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            routes,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
-
-    change.revision = Data(repeating: 0xCC, count: 31)
-    routes.routes = change
-    await #expect(throws: PfsMacOSCoherenceError.invalidRoutesChange) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            routes,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
-
-    routes = v3Event(targets: [
-        v3Target(scope: .attributes, identity: Data(repeating: 0x44, count: 16))
-    ])
-    change.revision = Data(repeating: 0xCC, count: 32)
-    routes.routes = change
-    await #expect(throws: PfsMacOSCoherenceError.invalidRoutesChange) {
-        try await PfsLocalMacOSV3CoherenceTransport.decodeEvent(
-            routes,
-            expectedEpoch: v3Epoch,
-            expectedSessionID: v3LocalSession,
-            planner: planner
-        )
-    }
 }
 
 @Test func namespaceIndexPreservesAndRepairsEveryHardLinkAlias() async throws {
@@ -636,8 +569,6 @@ private func nextV3Event(
     #expect(acknowledgements[0].hasCursor)
     #expect(acknowledgements[0].cursor.sequence == 1)
     #expect(acknowledgements[0].cursor.phase == .prepare)
-    #expect(!acknowledgements[0].blocked)
-    #expect(acknowledgements[0].reason.isEmpty)
     #expect(await daemon.stats().visibilityAcks == 1)
 
     await #expect(throws: PfsMacOSCoherenceError.invalidSequence(0)) {
@@ -654,9 +585,9 @@ private func nextV3Event(
     }
     #expect(await daemon.stats().visibilityAcks == 1)
 
-    // Once success is acknowledged the transport must forget that delivered
-    // cursor. A later independent failure closes the client, but cannot send a
-    // contradictory BLOCKED verdict for the already-ACKed PREPARE.
+    // A later independent failure closes the client and sends nothing: the
+    // already-ACKed PREPARE stays acknowledged and no further acknowledgment
+    // is written on the way down.
     await transport.failClosed(epoch: v3Epoch, cursor: nil, reason: "later liveness failure")
     #expect(await daemon.stats().visibilityAcks == 1)
 }
@@ -724,47 +655,6 @@ private func nextV3Event(
         _ = try await client.request(.statfs(PfsStatfsRequest()))
     }
     #expect(await daemon.stats().visibilityAcks == 0)
-}
-
-@Test func concreteV3TransportReportsTheRouteCursorAsBlocked() async throws {
-    let daemon = try PfsLocalMockDaemon(configuration: .init(v3Coherence: v3Contract()))
-    defer { daemon.stop() }
-    let client = PfsLocalClient(socketPath: daemon.socketPath)
-    defer { Task { await client.close() } }
-
-    let resolved = try await client.resolve(attachRef: "mock")
-    let root = try v3Identity(1)
-    let transport = try await PfsLocalMacOSV3CoherenceTransport.connect(
-        client: client,
-        resolved: resolved,
-        planner: PfsMacOSRepairPlanner(index: PfsMacOSNamespaceIndex(rootIdentity: root))
-    )
-    var routeEvent = v3Event(sequence: 9, phase: .prepare, targets: [])
-    routeEvent.initiatorSessionID = Data(repeating: 0, count: 16)
-    routeEvent.mutationSlot = 0
-    routeEvent.mutationSequence = 0
-    routeEvent.localOperationID = 0
-    var routes = PfsRoutesChange()
-    routes.revision = Data(repeating: 0xDD, count: 32)
-    routeEvent.routes = routes
-    daemon.emitVisibility(routeEvent)
-
-    await #expect(throws: PfsMacOSCoherenceError.routesChangeRequiresRemount) {
-        _ = try await nextV3Event(from: transport)
-    }
-    await transport.failClosed(
-        epoch: v3Epoch,
-        cursor: nil,
-        reason: String(repeating: "🙂", count: 2_000)
-    )
-
-    let acknowledgements = await daemon.visibilityAcknowledgements()
-    #expect(acknowledgements.count == 1)
-    #expect(acknowledgements[0].blocked)
-    #expect(acknowledgements[0].cursor.sequence == 9)
-    #expect(acknowledgements[0].cursor.phase == .prepare)
-    #expect(acknowledgements[0].reason.utf8.count <= 1_024)
-    #expect(!acknowledgements[0].reason.isEmpty)
 }
 
 @Test func strictV3UDSDisconnectTerminatesWithoutReconnectOrQueueHang() async throws {
@@ -935,7 +825,6 @@ private func nextV3Event(
         _ = try await client.request(.statfs(PfsStatfsRequest()))
     }
 }
-
 @Test func strictV3PeriodicLivenessMismatchTerminatesWithoutReconnectOrSync() async throws {
     let contract = v3Contract(repairBudgetMillis: 60)
     let daemon = try PfsLocalMockDaemon(configuration: .init(
@@ -974,4 +863,5 @@ private func nextV3Event(
     await #expect(throws: PfsLocalClientError.shutdown) {
         _ = try await client.request(.statfs(PfsStatfsRequest()))
     }
+}
 }

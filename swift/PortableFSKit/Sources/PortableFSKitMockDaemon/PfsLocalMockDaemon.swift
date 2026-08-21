@@ -1,6 +1,110 @@
 import Foundation
 import PortableFSKit
+@preconcurrency import Dispatch
 @preconcurrency import Darwin
+
+/// Owns every Swift task created by the mock server. Socket reads and writes
+/// belong to dedicated Dispatch queues, while protocol handling remains async
+/// because the in-memory filesystem is an actor and several tests inject
+/// cancellable delays. Keeping those tasks in an explicit registry gives
+/// `stop()` one exact cancellation-and-join boundary instead of leaving
+/// detached work behind for the process to reap.
+private final class PfsMockRequestRegistry: @unchecked Sendable {
+    private let condition = NSCondition()
+    private let group = DispatchGroup()
+    private var accepting = true
+    private var registrationsInFlight = 0
+    private var tasks: [UUID: Task<Void, Never>] = [:]
+    private var completedBeforeRegistration: Set<UUID> = []
+
+    func spawn(_ operation: @escaping @Sendable () async -> Void) {
+        let id = UUID()
+
+        condition.lock()
+        guard accepting else {
+            condition.unlock()
+            return
+        }
+        registrationsInFlight += 1
+        group.enter()
+        condition.unlock()
+
+        let task = Task.detached(priority: .userInitiated) { [self] in
+            defer { finish(id) }
+            await operation()
+        }
+
+        condition.lock()
+        if completedBeforeRegistration.remove(id) == nil {
+            tasks[id] = task
+        }
+        registrationsInFlight -= 1
+        let shouldCancel = !accepting
+        condition.broadcast()
+        condition.unlock()
+
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    func cancelAndWait() {
+        condition.lock()
+        accepting = false
+        while registrationsInFlight != 0 {
+            condition.wait()
+        }
+        let active = Array(tasks.values)
+        condition.unlock()
+
+        for task in active {
+            task.cancel()
+        }
+        group.wait()
+    }
+
+    private func finish(_ id: UUID) {
+        condition.lock()
+        if tasks.removeValue(forKey: id) == nil {
+            completedBeforeRegistration.insert(id)
+        }
+        condition.unlock()
+        group.leave()
+    }
+}
+
+/// Bridges one actor-isolated wire-control transition back to the dedicated
+/// blocking socket reader. The reader thread is allowed to wait; Swift's
+/// cooperative executor is not. This is an ownership join with no timeout or
+/// alternate path: production consumes these one-way frames before it reads
+/// the next request, so the mock must establish the same ordering boundary.
+private enum PfsMockWireControlOutcome: Sendable {
+    case continueReading
+    case closeConnection
+}
+
+private final class PfsMockWireControlCompletion: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var outcome: PfsMockWireControlOutcome?
+
+    func complete(_ outcome: PfsMockWireControlOutcome) {
+        condition.lock()
+        precondition(self.outcome == nil)
+        self.outcome = outcome
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func wait() -> PfsMockWireControlOutcome {
+        condition.lock()
+        while outcome == nil {
+            condition.wait()
+        }
+        let resolved = outcome!
+        condition.unlock()
+        return resolved
+    }
+}
 
 public final class PfsLocalMockDaemon: @unchecked Sendable {
     public struct Stats: Sendable, Equatable {
@@ -10,10 +114,6 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var activeHandles: Int
         public var readRequests: Int
         public var writeRequests: Int
-        /// One entry per ordered mutation frame, in receive order. This is the
-        /// wire-level source-phase scheduling proof supplied by the frontend,
-        /// not a value the mock re-derives from request shape.
-        public var orderedMutationSourcePhaseQueueable: [Bool]
         public var enumerateRequests: Int
         public var getAttrRequests: Int
         public var setAttrRequests: Int
@@ -39,6 +139,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var maxReadLength: UInt32
         public var maxWriteLength: Int
         public var publicationAcks: Int
+        public var publishedPublicationAcks: Int
+        public var notPublishedPublicationAcks: Int
         public var resourceAccepts: Int
         public var resourceAbandons: Int
         /// Exact item-prefix verdict on each resource disposition, in receive
@@ -105,11 +207,6 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         public var xattrSetErrno: Int32?
         public var xattrListErrno: Int32?
         public var xattrRemoveErrno: Int32?
-        /// Test-only protocol corruption: stamps the request-only scheduling
-        /// bit on daemon replies so the Swift client's directional validator
-        /// can prove it closes the connection before delivering the frame.
-        public var sourcePhaseQueueableOnReplies: Bool
-
         public init(
             attachRef: String = "mock",
             volumeID: String = "mock-volume",
@@ -132,8 +229,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             xattrGetErrno: Int32? = nil,
             xattrSetErrno: Int32? = nil,
             xattrListErrno: Int32? = nil,
-            xattrRemoveErrno: Int32? = nil,
-            sourcePhaseQueueableOnReplies: Bool = false
+            xattrRemoveErrno: Int32? = nil
         ) {
             self.attachRef = attachRef
             self.volumeID = volumeID
@@ -157,35 +253,42 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
             self.xattrSetErrno = xattrSetErrno
             self.xattrListErrno = xattrListErrno
             self.xattrRemoveErrno = xattrRemoveErrno
-            self.sourcePhaseQueueableOnReplies = sourcePhaseQueueableOnReplies
         }
     }
 
     public let socketPath: String
-    private let configuration: Configuration
-    private let serverFD: Int32
     private let fileSystem: MockFileSystem
-    private let sessionLock = NSLock()
-    private var sessions: [Int32: MockSession] = [:]
-    private let acceptQueue = DispatchQueue(label: "dev.portablefs.mock.accept", qos: .utility)
-    private let clientQueue = DispatchQueue(label: "dev.portablefs.mock.client", qos: .utility, attributes: .concurrent)
-    private let acceptGroup = DispatchGroup()
-    private let lifecycleLock = NSLock()
-    private var acceptWorkItem: DispatchWorkItem?
-    private var stopped = false
+    private let runtime: PfsMockDaemonRuntime
 
     public init(configuration: Configuration = Configuration()) throws {
-        self.configuration = configuration
-        let suffix = UUID().uuidString.prefix(12)
-        self.socketPath = "/tmp/pfs-\(suffix).sock"
-        self.fileSystem = MockFileSystem(configuration: configuration)
-        self.serverFD = try PfsUnixSocket.bindAndListen(path: socketPath)
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.acceptLoop()
+        var template = Array("/tmp/pfs-mock.XXXXXX".utf8CString)
+        guard let created = Darwin.mkdtemp(&template) else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        self.acceptWorkItem = workItem
-        self.acceptGroup.enter()
-        self.acceptQueue.async(execute: workItem)
+        let directory = String(cString: created)
+        self.socketPath = directory + "/pfs.sock"
+        self.fileSystem = MockFileSystem(configuration: configuration)
+        let serverFD: Int32
+        do {
+            let boundFD = try PfsUnixSocket.bindAndListen(path: socketPath)
+            guard Darwin.chmod(socketPath, 0o600) == 0 else {
+                let failure = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                PfsUnixSocket.close(boundFD)
+                throw failure
+            }
+            serverFD = boundFD
+        } catch {
+            unlink(socketPath)
+            rmdir(directory)
+            throw error
+        }
+        self.runtime = PfsMockDaemonRuntime(
+            serverFD: serverFD,
+            socketPath: socketPath,
+            socketDirectory: directory,
+            fileSystem: fileSystem
+        )
+        runtime.start()
     }
 
     deinit {
@@ -193,31 +296,11 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
     }
 
     public func stop() {
-        lifecycleLock.lock()
-        guard !stopped else {
-            lifecycleLock.unlock()
-            return
-        }
-        stopped = true
-        lifecycleLock.unlock()
-
-        acceptWorkItem?.cancel()
-        if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
-            PfsUnixSocket.close(wakeFD)
-        }
-        _ = acceptGroup.wait(timeout: .now() + 2)
-        Darwin.shutdown(serverFD, SHUT_RDWR)
-        PfsUnixSocket.close(serverFD)
-        for session in sessionSnapshot() {
-            session.close()
-        }
-        unlink(socketPath)
+        runtime.stop()
     }
 
     public func dropConnections() {
-        for session in sessionSnapshot() {
-            session.close()
-        }
+        runtime.dropConnections()
     }
 
     /// Causes the next daemon close request to fail before releasing its
@@ -291,6 +374,20 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.delayNextClose(nanoseconds: nanoseconds)
     }
 
+    /// Holds the next ownership-disposition transition inside the mock's
+    /// reader-order boundary. Tests use this to prove that a following
+    /// ordinary request cannot overtake the one-way frame.
+    public func delayNextResourceDisposition(nanoseconds: UInt64) async {
+        await fileSystem.delayNextResourceDisposition(nanoseconds: nanoseconds)
+    }
+
+    /// Holds the next publication-acknowledgement transition inside the
+    /// reader-order boundary. This is the acknowledgement counterpart to
+    /// `delayNextResourceDisposition`.
+    public func delayNextPublicationAck(nanoseconds: UInt64) async {
+        await fileSystem.delayNextPublicationAck(nanoseconds: nanoseconds)
+    }
+
     public func delayNextRead(nanoseconds: UInt64) async {
         await fileSystem.delayNextRead(nanoseconds: nanoseconds)
     }
@@ -337,8 +434,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.requestID = 0
         envelope.body = .event(event)
 
-        for session in sessionSnapshot() where session.isSubscribed {
-            try? session.send(envelope)
+        for session in runtime.sessionSnapshot() where session.isSubscribed {
+            session.send(envelope)
         }
     }
 
@@ -353,8 +450,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.requestID = 0
         envelope.body = .event(event)
 
-        for session in sessionSnapshot() where session.isSubscribed {
-            try? session.send(envelope)
+        for session in runtime.sessionSnapshot() where session.isSubscribed {
+            session.send(envelope)
         }
     }
 
@@ -370,8 +467,8 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         envelope.requestID = 0
         envelope.body = .event(event)
 
-        for session in sessionSnapshot() where session.isSubscribed {
-            try? session.send(envelope)
+        for session in runtime.sessionSnapshot() where session.isSubscribed {
+            session.send(envelope)
         }
     }
 
@@ -395,20 +492,115 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         await fileSystem.resetStats()
     }
 
-    private func acceptLoop() {
-        defer {
-            acceptGroup.leave()
+    /// Test-only observation of responses that have left protocol handling but
+    /// have not yet completed their dedicated blocking socket write. It lets a
+    /// lifecycle regression prove shutdown while real backpressure exists,
+    /// rather than assuming a particular kernel socket-buffer size.
+    func testingPendingResponseCount() -> Int {
+        runtime.sessionSnapshot().reduce(0) { $0 + $1.pendingResponseCount }
+    }
+
+}
+
+/// Owns every blocking worker independently of the public daemon object.
+///
+/// A dispatch closure that calls a long-running instance method retains that
+/// instance for the entire call, even when the closure captured it weakly.
+/// Keeping the worker graph in this runtime lets `PfsLocalMockDaemon.deinit`
+/// synchronously stop and join the graph instead of being retained by it.
+private final class PfsMockDaemonRuntime: @unchecked Sendable {
+    private let serverFD: Int32
+    private let socketPath: String
+    private let socketDirectory: String
+    private let fileSystem: MockFileSystem
+    private let sessionLock = NSLock()
+    private var sessions: [Int32: MockSession] = [:]
+    private let acceptQueue = DispatchQueue(label: "dev.portablefs.mock.accept", qos: .userInitiated)
+    private let clientQueue = DispatchQueue(
+        label: "dev.portablefs.mock.client",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private let acceptGroup = DispatchGroup()
+    private let clientGroup = DispatchGroup()
+    private let requests = PfsMockRequestRegistry()
+    private let lifecycleLock = NSLock()
+    private var started = false
+    private var stopped = false
+
+    init(
+        serverFD: Int32,
+        socketPath: String,
+        socketDirectory: String,
+        fileSystem: MockFileSystem
+    ) {
+        self.serverFD = serverFD
+        self.socketPath = socketPath
+        self.socketDirectory = socketDirectory
+        self.fileSystem = fileSystem
+    }
+
+    func start() {
+        lifecycleLock.lock()
+        precondition(!started && !stopped)
+        started = true
+        acceptGroup.enter()
+        lifecycleLock.unlock()
+        acceptQueue.async { [runtime = self] in
+            defer { runtime.acceptGroup.leave() }
+            runtime.acceptLoop()
         }
-        while !isStopped && acceptWorkItem?.isCancelled != true {
+    }
+
+    func stop() {
+        lifecycleLock.lock()
+        guard !stopped else {
+            lifecycleLock.unlock()
+            return
+        }
+        stopped = true
+        lifecycleLock.unlock()
+
+        if let wakeFD = try? PfsUnixSocket.connect(path: socketPath) {
+            PfsUnixSocket.close(wakeFD)
+        }
+        // The wake connection makes accept return. This is an ownership join,
+        // not a best-effort timeout: cleanup must not race an accept that can
+        // still publish a new session.
+        acceptGroup.wait()
+        for session in sessionSnapshot() {
+            session.close()
+        }
+        // Closing each peer interrupts its blocking reader. Once all readers
+        // have left, no new protocol task can enter the request registry.
+        clientGroup.wait()
+        requests.cancelAndWait()
+        Darwin.shutdown(serverFD, SHUT_RDWR)
+        PfsUnixSocket.close(serverFD)
+        unlink(socketPath)
+        rmdir(socketDirectory)
+    }
+
+    func dropConnections() {
+        for session in sessionSnapshot() {
+            session.close()
+        }
+    }
+
+    private func acceptLoop() {
+        while !isStopped {
             do {
                 let clientFD = try PfsUnixSocket.accept(serverFD)
-                if isStopped || acceptWorkItem?.isCancelled == true {
+                if isStopped {
                     PfsUnixSocket.close(clientFD)
                     return
                 }
                 let session = MockSession(fd: clientFD)
                 addSession(session)
-                clientQueue.async { [weak self, session] in
+                clientGroup.enter()
+                let group = clientGroup
+                clientQueue.async { [weak self, session, group] in
+                    defer { group.leave() }
                     self?.clientLoop(session: session)
                 }
             } catch {
@@ -429,14 +621,50 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         while !isStopped {
             do {
                 let envelope = try reader.readFrame()
-                Task.detached { [fileSystem, session] in
+                // The production reader reserves an operation before its
+                // ordinary handler can run. Recording the ID in a detached
+                // handler allowed a priority-lane PublicationAck to overtake
+                // the very request that created its obligation.
+                session.noteOperationID(envelope.operationID)
+                switch envelope.body {
+                case .publicationAck?, .resourceReplyDisposition?:
+                    guard handleWireControl(envelope, session: session)
+                        == .continueReading else {
+                        return
+                    }
+                    continue
+                default:
+                    break
+                }
+                requests.spawn { [fileSystem, session] in
                     let reply = await fileSystem.handle(envelope, session: session)
-                    try? session.send(reply)
+                    session.send(reply)
                 }
             } catch {
                 return
             }
         }
+    }
+
+    /// Production handles ownership dispositions and publication
+    /// acknowledgements on the serial connection reader and emits no reply.
+    /// Ordinary filesystem bodies remain concurrent. The actor transition is
+    /// therefore joined here, on the dedicated Dispatch reader, before another
+    /// frame can be consumed; the task itself is owned by that joined reader
+    /// rather than escaping into the ordinary-request registry.
+    private func handleWireControl(
+        _ envelope: PfsEnvelope,
+        session: MockSession
+    ) -> PfsMockWireControlOutcome {
+        let completion = PfsMockWireControlCompletion()
+        Task.detached(priority: .userInitiated) { [fileSystem, session, completion] in
+            let outcome = await fileSystem.handleWireControl(
+                envelope,
+                session: session
+            )
+            completion.complete(outcome)
+        }
+        return completion.wait()
     }
 
     private var isStopped: Bool {
@@ -458,7 +686,7 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
         sessionLock.unlock()
     }
 
-    private func sessionSnapshot() -> [MockSession] {
+    func sessionSnapshot() -> [MockSession] {
         sessionLock.lock()
         let snapshot = Array(sessions.values)
         sessionLock.unlock()
@@ -468,10 +696,24 @@ public final class PfsLocalMockDaemon: @unchecked Sendable {
 
 private final class MockSession: @unchecked Sendable {
     let fd: Int32
-    private let ioLock = NSLock()
+    /// Blocking `send(2)` must never run on Swift's cooperative executor. A
+    /// full peer receive buffer previously let one response hold `ioLock`
+    /// while more detached request tasks blocked behind it, exhausting the
+    /// executor that the client needed to consume those responses. One owned
+    /// serial Dispatch queue is the socket's write executor and preserves
+    /// complete-frame ordering without consuming Swift task threads.
+    private let writeQueue = DispatchQueue(
+        label: "dev.portablefs.mock.session.write.\(UUID().uuidString)",
+        qos: .userInitiated
+    )
+    private let closeLock = NSLock()
+    private let closeGroup = DispatchGroup()
+    private let pendingResponseLock = NSLock()
     private let stateLock = NSLock()
     private var subscribed = false
-    private var closed = false
+    private var closeStarted = false
+    private var fdClosed = false
+    private var pendingResponses = 0
 
     var isSubscribed: Bool {
         stateLock.lock()
@@ -482,6 +724,7 @@ private final class MockSession: @unchecked Sendable {
 
     init(fd: Int32) {
         self.fd = fd
+        closeGroup.enter()
         PfsMockFrameIO.disableSigPipe(fd: fd)
     }
 
@@ -518,23 +761,105 @@ private final class MockSession: @unchecked Sendable {
     private var seenOperationIDs: Set<UInt64> = []
     private var acknowledgedOperationIDs: Set<UInt64> = []
 
-    func send(_ envelope: PfsEnvelope) throws {
-        ioLock.lock()
-        defer { ioLock.unlock() }
-        guard !closed else {
-            throw PfsLocalClientError.connectionClosed
+    func send(_ envelope: PfsEnvelope) {
+        let frame: Data
+        do {
+            frame = try PfsMockFrameIO.encode(envelope: envelope)
+        } catch {
+            close()
+            return
         }
-        try PfsMockFrameIO.writeFrame(fd: fd, envelope: envelope)
+
+        // Serialize admission with the close transition. Every admitted block
+        // is therefore ahead of close()'s writeQueue.sync barrier, and no
+        // response closure can appear after stop has joined the session.
+        closeLock.lock()
+        guard !closeStarted else {
+            closeLock.unlock()
+            return
+        }
+        pendingResponseLock.lock()
+        pendingResponses += 1
+        pendingResponseLock.unlock()
+        writeQueue.async { [self] in
+            defer {
+                pendingResponseLock.lock()
+                pendingResponses -= 1
+                pendingResponseLock.unlock()
+            }
+            guard !isClosing else {
+                return
+            }
+            do {
+                try PfsMockFrameIO.writeFrame(fd: fd, frame: frame)
+            } catch {
+                closeFromWriteQueue()
+            }
+        }
+        closeLock.unlock()
+    }
+
+    var pendingResponseCount: Int {
+        pendingResponseLock.lock()
+        let value = pendingResponses
+        pendingResponseLock.unlock()
+        return value
     }
 
     func close() {
-        ioLock.lock()
-        defer { ioLock.unlock() }
-        let shouldClose = !closed
-        closed = true
-        if shouldClose {
-            PfsUnixSocket.close(fd)
+        if beginClose() {
+            // shutdown(2) is deliberately outside the serial write queue: it
+            // is what interrupts a write already blocked in send(2). Exactly
+            // one caller can reach it, so the descriptor cannot be shut down
+            // after another caller has closed and the fd number was reused.
+            Darwin.shutdown(fd, SHUT_RDWR)
+            writeQueue.sync { [self] in
+                finishCloseOnWriteQueue()
+            }
+        } else {
+            closeGroup.wait()
         }
+    }
+
+    private var isClosing: Bool {
+        closeLock.lock()
+        let value = closeStarted
+        closeLock.unlock()
+        return value
+    }
+
+    private func beginClose() -> Bool {
+        closeLock.lock()
+        defer { closeLock.unlock() }
+        guard !closeStarted else {
+            return false
+        }
+        closeStarted = true
+        return true
+    }
+
+    /// The error originates on `writeQueue`, so this variant must not call
+    /// `writeQueue.sync`. It shares the same one-winner close transition as an
+    /// external stop and publishes completion through `closeGroup`.
+    private func closeFromWriteQueue() {
+        guard beginClose() else {
+            return
+        }
+        Darwin.shutdown(fd, SHUT_RDWR)
+        finishCloseOnWriteQueue()
+    }
+
+    private func finishCloseOnWriteQueue() {
+        closeLock.lock()
+        guard !fdClosed else {
+            closeLock.unlock()
+            return
+        }
+        fdClosed = true
+        closeLock.unlock()
+
+        PfsUnixSocket.close(fd)
+        closeGroup.leave()
     }
 }
 
@@ -587,15 +912,21 @@ private enum PfsMockFrameIO {
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &value, socklen_t(MemoryLayout<Int32>.size))
     }
 
-    static func writeFrame(fd: Int32, envelope: PfsEnvelope, maxFrameLength: Int = PfsFrameCodec.defaultMaxFrameLength) throws {
-        let data = try PfsFrameCodec(maxFrameLength: maxFrameLength).encode(envelope)
-        try data.withUnsafeBytes { rawBuffer in
+    static func encode(
+        envelope: PfsEnvelope,
+        maxFrameLength: Int = PfsFrameCodec.defaultMaxFrameLength
+    ) throws -> Data {
+        try PfsFrameCodec(maxFrameLength: maxFrameLength).encode(envelope)
+    }
+
+    static func writeFrame(fd: Int32, frame: Data) throws {
+        try frame.withUnsafeBytes { rawBuffer in
             guard let base = rawBuffer.baseAddress else {
                 return
             }
             var offset = 0
-            while offset < data.count {
-                let sent = Darwin.send(fd, base.advanced(by: offset), data.count - offset, 0)
+            while offset < frame.count {
+                let sent = Darwin.send(fd, base.advanced(by: offset), frame.count - offset, 0)
                 if sent > 0 {
                     offset += sent
                     continue
@@ -703,7 +1034,6 @@ private actor MockFileSystem {
     private var reclaimRequests = 0
     private var readRequests = 0
     private var writeRequests = 0
-    private var orderedMutationSourcePhaseQueueable: [Bool] = []
     private var enumerateRequests = 0
     private var getAttrRequests = 0
     private var setAttrRequests = 0
@@ -719,6 +1049,8 @@ private actor MockFileSystem {
     private var maxReadLength: UInt32 = 0
     private var maxWriteLength = 0
     private var publicationAcks = 0
+    private var publishedPublicationAcks = 0
+    private var notPublishedPublicationAcks = 0
     private var visibilityAcks: [PfsVisibilityAckRequest] = []
     private var v3LivenessRequests: [PfsV3LivenessRequest] = []
     private var syncVolumeRequests = 0
@@ -732,6 +1064,8 @@ private actor MockFileSystem {
     private var pendingCreateHandlesToOmit = 0
     private var pendingOpenHandlesToOmit = 0
     private var pendingLookupItemIdentifiersToCorrupt = 0
+    private var pendingResourceDispositionDelaysNanoseconds: [UInt64] = []
+    private var pendingPublicationAckDelaysNanoseconds: [UInt64] = []
     private struct ProvisionalResource {
         var handle: UInt64
         var itemCount: UInt32
@@ -772,7 +1106,6 @@ private actor MockFileSystem {
             activeHandles: handles.count,
             readRequests: readRequests,
             writeRequests: writeRequests,
-            orderedMutationSourcePhaseQueueable: orderedMutationSourcePhaseQueueable,
             enumerateRequests: enumerateRequests,
             getAttrRequests: getAttrRequests,
             setAttrRequests: setAttrRequests,
@@ -788,6 +1121,8 @@ private actor MockFileSystem {
             maxReadLength: maxReadLength,
             maxWriteLength: maxWriteLength,
             publicationAcks: publicationAcks,
+            publishedPublicationAcks: publishedPublicationAcks,
+            notPublishedPublicationAcks: notPublishedPublicationAcks,
             resourceAccepts: resourceAccepts,
             resourceAbandons: resourceAbandons,
             resourceAcceptedItemCounts: resourceAcceptedItemCounts,
@@ -811,7 +1146,6 @@ private actor MockFileSystem {
         reclaimRequests = 0
         readRequests = 0
         writeRequests = 0
-        orderedMutationSourcePhaseQueueable.removeAll()
         enumerateRequests = 0
         getAttrRequests = 0
         setAttrRequests = 0
@@ -830,6 +1164,8 @@ private actor MockFileSystem {
         maxReadLength = 0
         maxWriteLength = 0
         publicationAcks = 0
+        publishedPublicationAcks = 0
+        notPublishedPublicationAcks = 0
         visibilityAcks.removeAll()
         v3LivenessRequests.removeAll()
         syncVolumeRequests = 0
@@ -875,6 +1211,14 @@ private actor MockFileSystem {
         pendingCloseDelaysNanoseconds.append(nanoseconds)
     }
 
+    func delayNextResourceDisposition(nanoseconds: UInt64) {
+        pendingResourceDispositionDelaysNanoseconds.append(nanoseconds)
+    }
+
+    func delayNextPublicationAck(nanoseconds: UInt64) {
+        pendingPublicationAckDelaysNanoseconds.append(nanoseconds)
+    }
+
     func delayNextRead(nanoseconds: UInt64) {
         pendingReadDelaysNanoseconds.append(nanoseconds)
     }
@@ -892,21 +1236,11 @@ private actor MockFileSystem {
     }
 
     func handle(_ envelope: PfsEnvelope, session: MockSession) async -> PfsEnvelope {
-        session.noteOperationID(envelope.operationID)
         var reply = PfsEnvelope()
         reply.requestID = envelope.requestID
         do {
             guard let body = envelope.body else {
                 throw MockPOSIXError(errno: EINVAL, message: "missing body")
-            }
-            switch body {
-            case .setAttr, .write, .create, .mkdir, .remove, .rename,
-                 .symlink, .hardLink, .xattrSet, .xattrRemove:
-                orderedMutationSourcePhaseQueueable.append(
-                    envelope.sourcePhaseQueueable
-                )
-            default:
-                break
             }
             switch body {
             case .lookup(_), .enumerate(_), .getAttr(_), .setAttr(_),
@@ -1221,7 +1555,10 @@ private actor MockFileSystem {
                 if replacedID == childID {
                     // POSIX specifies a no-op when both names are hard links
                     // to the same inode: neither directory entry is removed.
-                    reply.body = .renameReply(PfsRenameReply())
+                    var response = PfsRenameReply()
+                    response.newPostIdentity = Node.stableIdentity(for: childID)
+                    response.oldPostIdentity = Node.stableIdentity(for: childID)
+                    reply.body = .renameReply(response)
                     break
                 }
                 fromDirectory.children.removeValue(forKey: request.fromName)
@@ -1233,7 +1570,9 @@ private actor MockFileSystem {
                 nodes[childID]?.parent = toDirectory.id
                 bump(fromDirectory)
                 bump(toDirectory)
-                reply.body = .renameReply(PfsRenameReply())
+                var response = PfsRenameReply()
+                response.newPostIdentity = Node.stableIdentity(for: childID)
+                reply.body = .renameReply(response)
             case let .symlink(request):
                 createRequests += 1
                 let directory = try node(for: request.dir)
@@ -1348,44 +1687,8 @@ private actor MockFileSystem {
             case .subscribeEvents:
                 session.setSubscribed()
                 reply.body = .subscribeEventsReply(PfsSubscribeEventsReply())
-            case let .publicationAck(request):
-                // One-way publication completion; requestID zero keeps the
-                // empty mock envelope outside the request multiplexer. The
-                // ledger check mirrors the real daemon: an ack for an
-                // operation this connection never showed on a request — for
-                // example one that overtook its own request on the priority
-                // lane — or a duplicate ack, closes the connection.
-                if session.acknowledgeOperation(request.operationID) {
-                    publicationAcks += 1
-                } else {
-                    session.close()
-                }
-                break
-            case let .resourceReplyDisposition(request):
-                guard let resource = provisionalResourcesByRequestID.removeValue(
-                    forKey: request.targetRequestID
-                ) else {
-                    throw MockPOSIXError(
-                        errno: EINVAL,
-                        message: "unknown or duplicate resource reply disposition"
-                    )
-                }
-                guard request.acceptedItemCount <= resource.itemCount,
-                      !request.acceptHandles || resource.handle != 0 else {
-                    session.close()
-                    break
-                }
-                resourceAcceptedItemCounts.append(request.acceptedItemCount)
-                if request.acceptHandles || request.acceptedItemCount > 0 {
-                    resourceAccepts += 1
-                } else {
-                    resourceAbandons += 1
-                }
-                if resource.handle != 0, !request.acceptHandles,
-                   let nodeID = handles.removeValue(forKey: resource.handle) {
-                    reapIfUnlinked(nodeID: nodeID)
-                }
-                break
+            case .publicationAck, .resourceReplyDisposition:
+                preconditionFailure("reader-ordered wire control reached ordinary dispatcher")
             case let .visibilityAck(request):
                 visibilityAcks.append(request)
                 reply.body = .visibilityAckReply(PfsVisibilityAckReply())
@@ -1436,8 +1739,65 @@ private actor MockFileSystem {
             errorReply.message = String(describing: error)
             reply.body = .error(errorReply)
         }
-        reply.sourcePhaseQueueable = configuration.sourcePhaseQueueableOnReplies
         return reply
+    }
+
+    /// Applies one-way control frames in exact connection-reader order. A
+    /// false result is the real daemon's fail-closed verdict: the reader owns
+    /// connection retirement and sends no synthetic request-ID-zero reply.
+    func handleWireControl(
+        _ envelope: PfsEnvelope,
+        session: MockSession
+    ) async -> PfsMockWireControlOutcome {
+        switch envelope.body {
+        case let .publicationAck(request):
+            if !pendingPublicationAckDelaysNanoseconds.isEmpty {
+                let delay = pendingPublicationAckDelaysNanoseconds.removeFirst()
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard envelope.requestID == 0,
+                  request.semanticCommit == .published
+                      || request.semanticCommit == .notPublished,
+                  session.acknowledgeOperation(request.operationID) else {
+                return .closeConnection
+            }
+            publicationAcks += 1
+            if request.semanticCommit == .published {
+                publishedPublicationAcks += 1
+            } else {
+                notPublishedPublicationAcks += 1
+            }
+            return .continueReading
+
+        case let .resourceReplyDisposition(request):
+            if !pendingResourceDispositionDelaysNanoseconds.isEmpty {
+                let delay = pendingResourceDispositionDelaysNanoseconds.removeFirst()
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard envelope.requestID == 0,
+                  request.targetRequestID != 0,
+                  let resource = provisionalResourcesByRequestID.removeValue(
+                    forKey: request.targetRequestID
+                  ),
+                  request.acceptedItemCount <= resource.itemCount,
+                  !request.acceptHandles || resource.handle != 0 else {
+                return .closeConnection
+            }
+            resourceAcceptedItemCounts.append(request.acceptedItemCount)
+            if request.acceptHandles || request.acceptedItemCount > 0 {
+                resourceAccepts += 1
+            } else {
+                resourceAbandons += 1
+            }
+            if resource.handle != 0, !request.acceptHandles,
+               let nodeID = handles.removeValue(forKey: resource.handle) {
+                reapIfUnlinked(nodeID: nodeID)
+            }
+            return .continueReading
+
+        default:
+            preconditionFailure("ordinary frame entered wire-control dispatcher")
+        }
     }
 
     private func node(for item: PfsItem) throws -> Node {

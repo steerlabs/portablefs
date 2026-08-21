@@ -12,9 +12,11 @@
 // the two interleave on the wire, so a control frame may legally carry a
 // LOWER id than an already-received ordinary frame and the daemon keeps one
 // replay watermark per lane. PublicationAck and ResourceReplyDisposition are
-// one-way client messages and use request_id 0. PublicationAck confirms that an
-// earlier operation reply — including a cacheable negative/error such as ENOENT
-// — has been fully published to the kernel, not merely read from the socket.
+// one-way client messages and use request_id 0. PublicationAck carries the
+// callback's explicit semantic verdict after its FSKit reply boundary:
+// PUBLISHED means the final result (including a cacheable negative/error such
+// as ENOENT) crossed into the kernel; NOT_PUBLISHED means it did not. Socket
+// receipt alone proves neither outcome.
 // ResourceReplyDisposition transfers or abandons provisional daemon handles
 // and item capabilities.
 // Daemon→client envelopes either
@@ -51,12 +53,6 @@
 // directory cookies belong to the retained open handle that issued them; a
 // frontend or daemon that omits this field cannot resume a multi-page walk
 // without either truncating it or silently repositioning it.
-// Protocol minor 11 adds Envelope.source_phase_queueable. The bit is the
-// frontend's per-request proof that an ordered-only callback can remain parked
-// behind a distinct callback's own-source visibility phase. An older daemon
-// would infer that proof from operation-ID inequality alone and can deadlock a
-// mixed read-then-mutate callback in PREPARE, so pairing across this boundary is
-// a correctness failure.
 // Protocol minor 12 adds ResourceReplyDisposition. OpenReply and CreateReply
 // carry daemon handles whose ownership cannot be inferred from socket delivery:
 // the frontend may cancel before observing the reply, or reject an otherwise
@@ -71,6 +67,13 @@
 // coordinate to its exact authority post-mutation owner, allowing macOS to
 // inode-attest a new rename/hard-link repair source instead of reusing an old
 // pathname whose authority stability ended at a namespace event.
+// Protocol minor 15 is the coordinated source-publication cut. The current
+// frontend requires nested authority protocol 6, replaces source
+// PREPARE/COMPLETE with the daemon-owned source-publication gate, and makes the
+// callback's semantic publication verdict explicit. The authority session owns
+// mandatory DATA and CONTROL transports and becomes usable only after its
+// provisional attach is activated. A pre-15 frontend cannot implement these
+// ordering and failure-atomicity rules, so it must fail the minimum-minor gate.
 //
 // O_APPEND (OpenRequest.append / CreateRequest.append / WriteRequest.append)
 // is deliberately NOT gated behind a minor bump: the daemon rejects any
@@ -90,15 +93,14 @@
 // minor is below its own, so a bump could only lock out frontends for no
 // semantic gain.
 //
-// PLATFORM CONSTRAINT (macOS FSKit): FSKit does not surface append intent to
-// a filesystem extension. FSVolumeOpenModes has only Read and Write, and
-// writeContents:toFile:atOffset: hands down an off_t the KERNEL already
-// resolved from its own cached vnode size. On that frontend an O_APPEND write
-// is indistinguishable from a positional write at the then-current EOF, so
-// two machines appending concurrently can still collide no matter what this
-// protocol offers. These fields exist so every frontend that DOES have the
-// intent (FUSE today, a future FSKit that surfaces it) gets serialized,
-// authority-assigned append offsets.
+// PLATFORM CONSTRAINT (macOS FSKit): FSKit does not surface per-write append
+// intent to a filesystem extension. FSVolumeOpenModes has only Read and Write,
+// and writeContents:toFile:atOffset: hands down an off_t the KERNEL already
+// resolved. Whenever append intent is known from the handle or request, that
+// off_t is the exact expected EOF: the authority validates it atomically with
+// the append write, so a stale kernel-resolved EOF cannot silently become a
+// second writer's offset. Without append intent, FSKit's callback remains
+// indistinguishable from an ordinary positional write.
 //
 // Identity model: items are addressed by (item_id, item_generation) — the
 // authority's NFSv4-style ino-addressed handles surfaced 1:1. The frontend
@@ -148,10 +150,10 @@ message Envelope {
   // decoded frame to its own Task), so a separate frame can be observed
   // after the reply it was meant to precede. Same frame, no reordering.
   //
-  // A retracted operation still owes its PublicationAck. Retraction governs
-  // what the FRONTEND installs; the ack is the daemon's own handoff gate and
-  // must be released either way, or the daemon waits on a callback that has
-  // already given up.
+  // A retracted operation still owes PublicationAck with NOT_PUBLISHED.
+  // Retraction governs what the FRONTEND installs. That explicit verdict
+  // retires an ordinary read/error publication, but is terminal if any visible
+  // authority mutation in the same logical operation already committed.
   //
   // UNLIKE the O_APPEND and chflags fields described below, this one IS
   // gated behind a minor bump (5 -> 6), and deliberately so. Those fields
@@ -163,15 +165,7 @@ message Envelope {
   // its own, and that rejection IS the gate: it is the only mechanism that
   // can guarantee no connected frontend ignores the bit.
   bool publication_retracted = 4;
-  // Set only on a client-to-daemon ordered mutation with a nonzero operation
-  // ID. True means this exact request belongs to a callback that has submitted
-  // no ordinary/cache-reading request, so a distinct own-source PREPARE will
-  // exclude the callback from its drain while the authority parks this
-  // mutation. False is fail-safe: the authority interrupts before apply.
-  //
-  // This is scheduling metadata, not a capability. The daemon validates its
-  // wire shape and forwards it to the authority's visibility coordinator.
-  bool source_phase_queueable = 5;
+  reserved 5;
   oneof body {
     // client → daemon
     Hello hello = 10;
@@ -250,15 +244,23 @@ message Hello {
   string client_version = 4;
 }
 
-// One-way completion for a cache/namespace-producing operation reply,
-// including a cacheable error or negative result. The envelope request_id is
-// 0; published_request_id names the original request whose result the frontend
-// has finished installing into FSKit.
+enum PublicationSemanticCommit {
+  PUBLICATION_SEMANTIC_COMMIT_UNSPECIFIED = 0;
+  PUBLICATION_SEMANTIC_COMMIT_PUBLISHED = 1;
+  PUBLICATION_SEMANTIC_COMMIT_NOT_PUBLISHED = 2;
+}
+
+// One-way completion for a cache/namespace-producing logical operation. The
+// envelope request_id is zero. semantic_commit says whether the callback's
+// final result crossed the FSKit reply boundary; it is mandatory even when the
+// operation produced only a cacheable error/negative result. NOT_PUBLISHED is
+// safe only when no visible authority mutation in the operation committed.
 message PublicationAck {
-  // Deprecated request-scoped identifier from protocol minor 1. Protocol
-  // minors 2 and later leave it zero and acknowledge operation_id instead.
-  uint64 published_request_id = 1;
+  // Retired request-scoped identifier from protocol minor 1. Protocol minor
+  // 15 is a coordinated one-version cut and reserves it permanently.
+  reserved 1;
   uint64 operation_id = 2;
+  PublicationSemanticCommit semantic_commit = 3;
 }
 
 // Final frontend ownership verdict for one successful resource-bearing reply.
@@ -533,9 +535,9 @@ message OpenRequest {
   Item item = 1;
   OpenMode mode = 2;
   // O_APPEND, sticky on the returned handle (POSIX puts the flag on the open
-  // file description, not on the write). Every write through that handle has
-  // its offset resolved at EOF by the authority in sequencer order, so two
-  // machines appending to one file can never land on the same byte range.
+  // file description, not on the write). Every write through that handle
+  // supplies the frontend/kernel-resolved expected EOF; the authority accepts
+  // it only if it still equals the current EOF under write serialization.
   bool append = 3;
 }
 message OpenReply {
@@ -567,10 +569,11 @@ message WriteRequest {
   uint64 offset = 2;
   bytes data = 3;
   // O_APPEND for THIS write, for frontends that learn the intent per write
-  // rather than at open. Offset must be zero and is ignored: the offset is
-  // assigned at EOF under the authority's write serialization and is never
-  // computed by the frontend from a cached size. A handle opened with
-  // OpenRequest.append appends regardless of this bit.
+  // rather than at open. For every append write, offset is the frontend/kernel
+  // resolved expected EOF; the authority compares it with the current EOF and
+  // writes only on an exact match under the same serialization boundary. A
+  // handle opened with OpenRequest.append uses this same offset contract even
+  // when this bit is false.
   bool append = 4;
 }
 message WriteReply {
@@ -617,7 +620,13 @@ message RenameRequest {
   bytes to_name = 4;
   bool no_replace = 5;
 }
-message RenameReply {}
+message RenameReply {
+  // Exact authority post-state identities. new_post is always the moved item;
+  // old_post is present whenever the source name remains bound (exchange or a
+  // POSIX same-path/same-inode no-op), and empty exactly when it is absent.
+  bytes new_post_identity = 1; // exactly 16 bytes on success
+  bytes old_post_identity = 2; // empty unless both names remain bound
+}
 
 message SymlinkRequest {
   Item dir = 1;
@@ -711,11 +720,6 @@ message VisibilityTarget {
   bytes post_identity = 6;
 }
 
-message RoutesChange {
-  bytes revision = 1;
-  bytes rules = 2;
-}
-
 message V3VisibilityEvent {
   bytes authority_epoch = 1;
   VisibilityCursor cursor = 2;
@@ -723,21 +727,24 @@ message V3VisibilityEvent {
   uint32 mutation_slot = 4;
   repeated VisibilityTarget targets = 5;
   uint64 mutation_sequence = 6;
-  RoutesChange routes = 7;
-  // Nonzero only when the authority initiator is this daemon session. It names
-  // the exact pfslocal callback publication unit whose authority mutation
-  // carries mutation_slot/mutation_sequence. PREPARE excludes only this unit;
-  // deferred source COMPLETE waits for its PublicationAck before reopening.
-  uint64 local_operation_id = 8;
+  // 7 was routes: the retired FSKit routes barrier delivered a routing
+  // revision as a two-phase visibility phase. A route change now commits only
+  // at clean mount absence, so no visibility event can carry one.
+  reserved 7;
+  reserved "routes";
+  reserved 8;
 }
 
 message VisibilityAckRequest {
   bytes authority_epoch = 1;
   VisibilityCursor cursor = 2;
-  bool blocked = 3;
-  string reason = 4;
+  // 3 and 4 were blocked/reason: a frontend declaring it could not adopt the
+  // delivered phase. The only unadoptable phase was a routing revision, and
+  // that barrier is retired.
+  reserved 3, 4;
+  reserved "blocked", "reason";
   // Liveness-only feedback carried on the exact peer COMPLETE Ack. It is false
-  // for PREPARE, source COMPLETE, terminal reports, and older minor peers.
+  // for PREPARE, terminal reports, and older minor peers.
   bool ordered_admission_contended = 5;
 }
 

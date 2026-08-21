@@ -13,7 +13,16 @@ const mountCheckSchemaVersion = 1
 type mountCheckEnvelope struct {
 	SchemaVersion int              `json:"schemaVersion"`
 	Facts         *mounthost.Facts `json:"facts,omitempty"`
-	Error         *mountCheckError `json:"error,omitempty"`
+	// KernelProbe is present only for --probe-mount, and only when a real
+	// throwaway mount completed the kernel INIT handshake.
+	KernelProbe any              `json:"kernelProbe,omitempty"`
+	Error       *mountCheckError `json:"error,omitempty"`
+}
+
+// errUnprobableTransport is the refusal for --probe-mount on a transport this
+// CLI cannot install by itself.
+func errUnprobableTransport(transport mounthost.Transport) error {
+	return fmt.Errorf("--probe-mount is available only for the fuse transport; %s installs its mount through the system extension", transport)
 }
 
 type mountCheckError struct {
@@ -103,7 +112,9 @@ func cmdMountCheck(e *cmdEnv, args []string) int {
 	var common commonOpts
 	var strategy string
 	addCommonFlags(fs, &common)
+	var probeMount bool
 	fs.StringVar(&strategy, "strategy", "auto", "mount strategy: auto (fskit on macOS, fuse on Linux), fskit, or fuse")
+	fs.BoolVar(&probeMount, "probe-mount", false, "install one real throwaway FUSE mount, complete the kernel INIT handshake, and unmount")
 	positionals, err := parseArgs(fs, args)
 	if err != nil {
 		if argsRequestJSON(args) {
@@ -136,8 +147,38 @@ func cmdMountCheck(e *cmdEnv, args []string) int {
 		}
 		return e.fail("mount-check", err)
 	}
-	if common.jsonOut {
-		envelope := mountCheckEnvelope{SchemaVersion: mountCheckSchemaVersion}
+	var probe any
+	if probeMount {
+		if facts.State == mounthost.Blocked {
+			// A blocked host has already named the missing primitive. Mounting
+			// anyway would replace that specific diagnosis with a mount error.
+			return e.reportMountCheck(common.jsonOut, facts, nil)
+		}
+		observed, probeErr := probeMountTransport(facts.Transport)
+		if probeErr != nil {
+			if common.jsonOut {
+				_ = e.printJSON(mountCheckEnvelope{
+					SchemaVersion: mountCheckSchemaVersion,
+					Error:         &mountCheckError{Kind: "probe", Message: probeErr.Error()},
+				})
+				return 1
+			}
+			return e.fail("mount-check", probeErr)
+		}
+		probe = observed
+		// A completed INIT handshake is a live mount answering this client, so
+		// it is proof of the transport rather than evidence about the host.
+		facts.State = mounthost.Verified
+		facts.Issue = mounthost.IssueNone
+		facts.Summary = fmt.Sprintf("a throwaway %s mount completed the kernel INIT handshake with this client", facts.Transport)
+		facts.Details = append([]mounthost.Detail{{Key: "kernel_init_probe", Value: "completed"}}, facts.Details...)
+	}
+	return e.reportMountCheck(common.jsonOut, facts, probe)
+}
+
+func (e *cmdEnv) reportMountCheck(jsonOut bool, facts mounthost.Facts, probe any) int {
+	if jsonOut {
+		envelope := mountCheckEnvelope{SchemaVersion: mountCheckSchemaVersion, KernelProbe: probe}
 		if facts.State == mounthost.Blocked {
 			envelope.Error = &mountCheckError{
 				Kind:    "blocked",

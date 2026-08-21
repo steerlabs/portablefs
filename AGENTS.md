@@ -9,24 +9,36 @@ agent that *uses* PortableFS workspaces, read
 There is no build system above the two languages and nothing to install:
 
 ```bash
-go -C vcs build ./...      # Go data plane (add GOOS=darwin / GOOS=linux to cross-check)
+CGO_ENABLED=1 GOOS=darwin go -C vcs build ./... # on macOS; Foundation resolver
+CGO_ENABLED=0 GOOS=linux go -C vcs build ./...  # static Linux release
 go -C vcs test ./...
 go -C vcs test -race ./...
 go -C vcs vet ./...
 
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh # macOS: authoritative native Swift gate
 ```
 
-`--no-parallel` on the Swift suite is required, not a tuning choice: Swift
-Testing can otherwise run cases concurrently inside one worker, and several
-tests share process resources or exercise hard protocol deadlines.
+The native gate runs one Xcode test process and proves exact equality between
+the enumerated inventory and the all-passing xcresult. Socket-backed integration
+tests declare their process-wide resource constraint with a serialized Swift
+Testing suite; pure tests remain parallel.
 
 ## Before You Finish
 
-Run `bash scripts/verify-local.sh` and make it pass. It is the local merge gate:
-darwin + linux builds and vet, the Go suite, the Go race suite, the Swift suite,
-the release-trust policy checks, and a stale-architecture scan. Do not report a
-change as complete with a failing or skipped `verify-local.sh`.
+Run `bash scripts/verify-local.sh` and make it pass. On macOS it builds and vets
+the real Foundation/cgo Darwin boundary plus static Linux, while Linux compiles
+its native product plus Darwin's deliberate !cgo refusal stub. CI always
+supplies the required native macOS Foundation lane. The gate also runs the
+native Go and race suites, the Swift suite, the release-trust policy checks, and
+a stale-architecture scan. Do not report a change as complete with a failing
+`verify-local.sh`.
+
+That default mode runs no real mount. It closes by naming every gate it did not
+run, and it is not merge evidence for a change to the authority, a frontend, or
+the coherence protocol. For those, run `bash scripts/verify-local.sh --full`,
+which adds the two privileged Docker suites CI runs on its ubuntu-24.04 lanes
+(`scripts/xfs-fuse-integration.sh` and `scripts/coherence-matrix-linux.sh`), and
+say in the PR which mode you ran.
 
 ## Frozen Surfaces
 

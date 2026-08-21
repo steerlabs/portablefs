@@ -33,6 +33,7 @@ func main() {
 }
 
 func run() error {
+	showVersion := flag.Bool("version", false, "print exact release identity and exit")
 	cellID := flag.String("cell-id", "", "stable cell UUID")
 	managerURL := flag.String("manager-url", "", "PortableFS manager HTTPS origin")
 	managerServerName := flag.String("manager-server-name", "", "manager TLS DNS name")
@@ -45,6 +46,10 @@ func run() error {
 	planLifetime := flag.Duration("plan-max-lifetime", 15*time.Minute, "maximum accepted cell-plan lifetime")
 	clockSkew := flag.Duration("clock-skew", 5*time.Second, "maximum authenticated clock disagreement")
 	flag.Parse()
+	if *showVersion {
+		_, _ = fmt.Fprintln(os.Stdout, version)
+		return nil
+	}
 	if flag.NArg() != 0 || !cellplan.ValidID(*cellID) || *managerURL == "" || *managerServerName == "" ||
 		*clientCert == "" || *clientKey == "" || *managerCA == "" || *planPublicKey == "" || *pollInterval <= 0 ||
 		*planLifetime <= 0 || *clockSkew < 0 || !filepath.IsAbs(*helperSocket) || filepath.Clean(*helperSocket) != *helperSocket {

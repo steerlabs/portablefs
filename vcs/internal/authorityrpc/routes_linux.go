@@ -63,8 +63,21 @@ const routesDirMode fs.FileMode = 0o755
 // hidden, and neither side would see an error - so the disagreement has to be
 // caught where both sides are visible, which is here.
 type RoutesController struct {
-	Store      *xfsstore.Volume
-	Visibility *volumeserver.VisibilityCoordinator
+	Store *xfsstore.Volume
+	// Mounts owns both topology exclusion and the durable mount set. Route
+	// changes are admitted only at clean mount absence, and both halves of that
+	// decision have to come from the same record.
+	Mounts *volumeserver.MountLifecycle
+	Leases *volumeserver.LeaseCoordinator
+	Locks  *volumeserver.LockTable
+
+	// lockWaitAdmission is a topology transition gate only for blocking byte-
+	// range lock admission. A wait holds the read side just long enough to
+	// validate its route revision and publish itself in Locks; Apply holds the
+	// write side while atomically interrupting the old queue and changing the
+	// revision. Unlike the main topology guard, it is never held while F_SETLKW
+	// sleeps, so one lock waiter cannot stall unrelated volume I/O.
+	lockWaitAdmission sync.RWMutex
 
 	mu        sync.RWMutex
 	loaded    bool
@@ -80,17 +93,20 @@ type RoutesController struct {
 // filesystem request. The caller checks admission only after acquiring it and
 // releases it only after the request can no longer reach XFS.
 func (r *RoutesController) AcquireTopologyRead() *volumeserver.TopologyReadGuard {
-	return r.Visibility.AcquireTopologyRead()
+	return r.Mounts.AcquireTopologyRead()
 }
 
-func NewRoutesController(store *xfsstore.Volume, visibility *volumeserver.VisibilityCoordinator) (*RoutesController, error) {
-	if store == nil || visibility == nil {
-		return nil, errors.New("authorityrpc: routing needs the volume store and the visibility coordinator")
+// newRoutesController is reached only through NewCoordination, which is what
+// makes every dependency below non-optional at every call site.
+func newRoutesController(store *xfsstore.Volume, mounts *volumeserver.MountLifecycle,
+	leases *volumeserver.LeaseCoordinator, locks *volumeserver.LockTable) (*RoutesController, error) {
+	if store == nil || mounts == nil || leases == nil || locks == nil {
+		return nil, errors.New("authorityrpc: routing needs the volume store, durable mount lifecycle, lease coordinator, and epoch lock table")
 	}
 	if routesDirName == "" || routesFileName == "" {
 		return nil, fmt.Errorf("authorityrpc: %q is not a two-component in-volume path", localroutes.ConfigPath)
 	}
-	return &RoutesController{Store: store, Visibility: visibility}, nil
+	return &RoutesController{Store: store, Mounts: mounts, Leases: leases, Locks: locks}, nil
 }
 
 // Load reads the declaration out of this authority's own volume root and makes
@@ -173,15 +189,21 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		return nil, fmt.Errorf("%w: %w", errRoutesInvalid, err)
 	}
 	next := volumeserver.RoutesChange{Revision: rules.Revision(), Canonical: rules.Canonical()}
+	// Serialize only blocking-lock admission, not ordinary filesystem work. A
+	// waiter admitted before this boundary is already visible in Locks and is
+	// interrupted in the checked transition below. A waiter arriving after it
+	// cannot validate the old revision until the topology change has finished.
+	r.lockWaitAdmission.Lock()
+	defer r.lockWaitAdmission.Unlock()
 
 	var active [32]byte
 	var activeCanonical []byte
 	apply := false
-	acknowledged, err := r.Visibility.ExecuteRoutesChecked(ctx, next, func() (bool, error) {
-		// This is the authoritative CAS. ExecuteRoutesChecked holds the topology
-		// writer before calling it, so no admitted request or attach is still
-		// running and no competing routing change can decide against the same old
-		// value.
+	check := func() (bool, error) {
+		// This is the authoritative CAS. ExecuteTopologyExclusive holds the
+		// topology writer before calling it, so no admitted request or attach is
+		// still running and no competing routing change can decide against the
+		// same old value.
 		r.mu.RLock()
 		loaded := r.loaded
 		active = r.revision
@@ -199,9 +221,9 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		if next.Revision == active {
 			return false, nil
 		}
-		apply = true
 		return true, nil
-	}, func() (volumeserver.RoutesChange, error) {
+	}
+	commit := func() (volumeserver.RoutesChange, error) {
 		published, err := r.write(raw)
 		if err != nil && !published {
 			r.mu.RLock()
@@ -216,6 +238,23 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		r.revision, r.canonical = next.Revision, append([]byte(nil), next.Canonical...)
 		r.mu.Unlock()
 		return next, err
+	}
+	acknowledged, err := r.Mounts.ExecuteTopologyExclusive(ctx, func() (int, error) {
+		shouldApply, checkErr := check()
+		if checkErr != nil || !shouldApply {
+			return 0, checkErr
+		}
+		if cleanErr := r.Mounts.RequireCleanRouteAbsence(); cleanErr != nil {
+			return 0, cleanErr
+		}
+		return r.Leases.ExecuteRoutes(ctx, next, func() (volumeserver.RoutesChange, error) {
+			// Every refusal check has passed under topology exclusion. Retire the
+			// old-revision lock queue immediately before durable publication; an
+			// ordinary CAS or live-mount refusal must not disturb it.
+			r.Locks.InterruptWaiters(volumeserver.ErrSessionExpired)
+			apply = true
+			return commit()
+		})
 	})
 	if err != nil {
 		return nil, err
@@ -233,6 +272,18 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		Canonical:                append([]byte(nil), next.Canonical...),
 		AcknowledgedParticipants: uint32(acknowledged),
 	}, nil
+}
+
+// beginLockWait admits one blocking byte-range lock against the active route
+// revision and publishes it into the epoch lock table as one indivisible short
+// critical section. The returned waiter owns no routing lock while it sleeps.
+func (r *RoutesController) beginLockWait(admit func() error, lock volumeserver.Lock) (*volumeserver.PendingLock, error) {
+	r.lockWaitAdmission.RLock()
+	defer r.lockWaitAdmission.RUnlock()
+	if err := admit(); err != nil {
+		return nil, err
+	}
+	return r.Locks.BeginWait(lock)
 }
 
 var errRoutesInvalid = errors.New("authorityrpc: routing declaration is not valid")
@@ -563,8 +614,6 @@ func namespaceRepair(repair authoritypb.NamespaceRepair) (volumeserver.Namespace
 	switch repair {
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED:
 		return volumeserver.NamespaceRepairUnspecified, nil
-	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE:
-		return volumeserver.NamespaceRepairParentExclusive, nil
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT:
 		return volumeserver.NamespaceRepairIndependent, nil
 	case authoritypb.NamespaceRepair_NAMESPACE_REPAIR_CALLBACK_SERIALIZED:

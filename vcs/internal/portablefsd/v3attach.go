@@ -127,6 +127,10 @@ type v3AttachConfig struct {
 	enrollmentID                 string
 	enrollmentExpires            time.Time
 	initialAuthorizationDeadline time.Time
+	// preKernelMountAbsence is non-nil only in package tests running without
+	// Darwin getfsstat. Production binds a fresh observer to a.mountPath and
+	// a.ref in startV3, after the stable attach identity exists.
+	preKernelMountAbsence authorityrpc.PreKernelMountAbsenceObserver
 	// revived marks a record loaded from disk after a daemon restart. Its
 	// strict session died with the previous process, and a replacement session
 	// cannot prove what the kernel cached before it, so a revived v3 attach is
@@ -377,6 +381,7 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 		cachePolicy:  v3.CachePolicy, routesRevision: revision,
 		enrollmentClient: enrollmentClient, enrollmentID: enrollmentID, enrollmentExpires: enrollmentExpires,
 		initialAuthorizationDeadline: initialAuthorizationDeadline,
+		preKernelMountAbsence:        req.observePreKernelMountAbsence,
 	}, nil
 }
 
@@ -488,7 +493,16 @@ func (a *attach) startV3(ctx context.Context) error {
 	a.credMu.RLock()
 	token := a.token
 	a.credMu.RUnlock()
+	preKernelMountAbsence := cfg.preKernelMountAbsence
+	if preKernelMountAbsence == nil {
+		preKernelMountAbsence, err = hostPreKernelFSKitMountAbsenceObserver(a.mountPath, a.ref)
+		if err != nil {
+			return fmt.Errorf("bind pre-kernel FSKit mount-absence observer: %w", err)
+		}
+	}
 	client, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
+		Purpose:                               authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile:                       authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
 		Address:                               a.authorityAddr,
 		TLS:                                   tlsCfg,
 		VolumeID:                              a.volumeID,
@@ -498,23 +512,24 @@ func (a *attach) startV3(ctx context.Context) error {
 		DialTimeout:                           v3AttachDialTimeout,
 		CancelDrainTimeout:                    v3AttachCancelDrainTimeout,
 		MaxInFlight:                           v3AttachMaxInFlight,
-		CoherenceProfile:                      authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT,
-		CachedNameCapacity:                    cfg.cachedNameCapacity,
-		RepairBudget:                          cfg.repairBudget,
-		NamespaceRepair:                       v3NamespaceRepair(cfg.cachePolicy),
+		FskitCachedNameCapacity:               cfg.cachedNameCapacity,
+		FskitRepairBudget:                     cfg.repairBudget,
+		FskitNamespaceRepair:                  v3NamespaceRepair(cfg.cachePolicy),
 		RoutesRevision:                        cfg.routesRevision,
 		RequireMountEnrollmentReauthorization: cfg.enrollmentClient != nil,
+		ObservePreKernelMountAbsence:          preKernelMountAbsence,
 	})
 	if err != nil {
 		return fmt.Errorf("attach v3 authority session: %w", err)
 	}
 	if cfg.enrollmentClient != nil && !client.InitialAuthorizationDeadline().Equal(cfg.initialAuthorizationDeadline) {
-		_ = client.Close()
-		return fmt.Errorf("authority installed authorization deadline %s, Manager response declared %s",
+		cause := fmt.Errorf("authority installed authorization deadline %s, Manager response declared %s",
 			client.InitialAuthorizationDeadline().UTC().Format(time.RFC3339Nano), cfg.initialAuthorizationDeadline.UTC().Format(time.RFC3339Nano))
+		return releaseV3ClientBeforeKernelMount(client, cause)
 	}
-	// The data plane owns the client from here: every constructor failure path
-	// inside newV3DataPlane records a terminal cause and closes it.
+	// Ownership passes to the data plane only after construction succeeds.
+	// Constructor failures retire any local bridge state but leave the ACTIVE
+	// client to the exact ReleaseBeforeMount transition below.
 	d, err := newV3DataPlane(a.lifetime(), v3DataPlaneConfig{
 		Client:         client,
 		VolumeID:       a.volumeID,
@@ -525,13 +540,13 @@ func (a *attach) startV3(ctx context.Context) error {
 		CachePolicy:    cfg.cachePolicy,
 	})
 	if err != nil {
-		return fmt.Errorf("construct v3 data plane: %w", err)
+		return releaseV3ClientBeforeKernelMount(client, fmt.Errorf("construct v3 data plane: %w", err))
 	}
 	a.mu.Lock()
 	if a.detached {
 		a.mu.Unlock()
-		_ = d.fail(errors.New("portablefsd: attach detached during v3 activation"))
-		return errors.New("attach is detached")
+		d.abandonBeforeMount(errors.New("portablefsd: attach detached during v3 activation"))
+		return releaseV3ClientBeforeKernelMount(client, errors.New("attach is detached"))
 	}
 	a.v3Data = d
 	a.v3Session = client
@@ -549,6 +564,12 @@ func (a *attach) startV3(ctx context.Context) error {
 		go a.runAutomaticMountRenewal(cfg, d, renewalEvents, renewalDone)
 	}
 	return nil
+}
+
+func releaseV3ClientBeforeKernelMount(client *authorityrpc.Client, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), v3AttachCancelDrainTimeout)
+	defer cancel()
+	return errors.Join(cause, client.ReleaseBeforeMount(ctx))
 }
 
 func (a *attach) runAutomaticMountRenewal(cfg *v3AttachConfig, d *v3DataPlane, events *mountlog.Writer, done chan struct{}) {
@@ -641,6 +662,41 @@ func (a *attach) v3RootReply() (pfslocal.ResolveReply, int32) {
 	return *reply, 0
 }
 
+// v3LatePublishingReplyDiscardable identifies replies which cannot represent
+// an applied filesystem mutation. FSKit may finish a callback (and acknowledge
+// NOT_PUBLISHED) while its authority request is still in flight. A late
+// read-only result or definite error can then be retired with that already
+// finished callback; it must not turn ordinary cancellation into mount death.
+// A successful mutation is deliberately excluded: if it crossed the authority
+// boundary after the callback ended, no local publication can make that state
+// exact and the attach must remain fail-closed.
+func v3LatePublishingReplyDiscardable(body any, errno int32) bool {
+	if errno != 0 {
+		return true
+	}
+	switch request := body.(type) {
+	case *pfslocal.LookupRequest,
+		*pfslocal.EnumerateRequest,
+		*pfslocal.GetAttrRequest,
+		*pfslocal.ReadRequest,
+		*pfslocal.ReadlinkRequest,
+		*pfslocal.XattrGetRequest,
+		*pfslocal.XattrListRequest:
+		return true
+	case *pfslocal.SetAttrRequest:
+		// Equal UID/GID assignments are validated locally and the authority call
+		// is a GetAttr. Non-equal assignments return a definite errno above.
+		return !request.SetFlags && request.Mode == nil && request.Size == nil &&
+			request.MtimeMs == nil && request.AtimeMs == nil
+	case *pfslocal.WriteRequest:
+		// Zero-length Write is implemented as an exact GetAttr and never opens a
+		// transaction or changes append/position state.
+		return len(request.Data) == 0
+	default:
+		return false
+	}
+}
+
 // handleV3Attached serves one frontend request of a v3 attach. It keeps the
 // connection's logical-operation ledger — reservation, exposure, and the one
 // post-callback PublicationAck — because the coherence bridge's source
@@ -652,7 +708,6 @@ func (c *frontendConn) handleV3Attached(
 	a *attach,
 	requestID uint64,
 	operationID uint64,
-	sourcePhaseQueueable bool,
 	initializeOperation bool,
 	body any,
 ) {
@@ -693,6 +748,13 @@ func (c *frontendConn) handleV3Attached(
 		resources.visible = true
 	}
 	dispatchCtx := context.WithValue(gateCtx, v3ReplyResourceContextKey{}, resources)
+	dispatchCtx = context.WithValue(
+		dispatchCtx,
+		v3ResponseConsumptionRevokerContextKey{},
+		v3ResponseConsumptionRevoker(func(cause error) {
+			c.revokeV3ResponseConsumption(a, cause)
+		}),
+	)
 	switch {
 	case d == nil:
 		eno = darwinEIO
@@ -700,7 +762,7 @@ func (c *frontendConn) handleV3Attached(
 		eno = darwinENOTCONN
 	default:
 		reply, eno = d.dispatchFrontend(
-			dispatchCtx, operationID, sourcePhaseQueueable, body,
+			dispatchCtx, operationID, body,
 		)
 		if eno == darwinEIO && d.terminalError() != nil {
 			// The failure that produced this errno killed the session. Report
@@ -732,11 +794,36 @@ func (c *frontendConn) handleV3Attached(
 				eno = darwinENOTCONN
 			}
 		}
+		if d != nil {
+			if terminal := d.terminalError(); terminal != nil {
+				// A retained visible result which could not be represented is not an
+				// ordinary ENOTCONN reply. Revoke the pfslocal serving boundary before
+				// the handler can expose any substitute frame; connection teardown
+				// will retire the response under the already-recorded terminal cause.
+				c.revokeV3ResponseConsumption(a, terminal)
+				consumeV3ResponseConsumptions(resources.responseConsumptions)
+				resources.responseConsumptions = nil
+				return
+			}
+		}
 		failure := &pfslocal.ErrorReply{Errno: eno, Message: errMessage(fmt.Sprintf("%T", body), eno)}
+		if !publishes {
+			_, written := c.replyWithPublicationWriteStatus(requestID, operationID, failure, false)
+			if written {
+				consumeV3ResponseConsumptions(resources.responseConsumptions)
+				resources.responseConsumptions = nil
+			} else if len(resources.responseConsumptions) != 0 {
+				c.revokeV3ResponseConsumption(a, errors.New("portablefsd: retained authority error reply was not delivered"))
+				consumeV3ResponseConsumptions(resources.responseConsumptions)
+				resources.responseConsumptions = nil
+			}
+			return
+		}
 		if publishes {
-			c.replyWithPublication(requestID, operationID, failure, true)
-		} else {
-			c.errorReplyForOperation(requestID, operationID, eno, failure.Message)
+			_, _, _ = c.replyWithPublicationDisposition(
+				requestID, operationID, failure, true,
+				v3LatePublishingReplyDiscardable(body, eno),
+			)
 		}
 		return
 	}
@@ -758,8 +845,10 @@ func (c *frontendConn) handleV3Attached(
 			}
 		}
 		resourceErr = errors.Join(resourceErr, prepareErr)
-		_ = d.fail(resourceErr)
-		_ = c.conn.Close()
+		c.revokeV3ResponseConsumption(a, resourceErr)
+		consumeV3ProvisionalResponses(provisional)
+		consumeV3ResponseConsumptions(resources.responseConsumptions)
+		resources.responseConsumptions = nil
 		return
 	}
 	if resourceReply {
@@ -778,14 +867,16 @@ func (c *frontendConn) handleV3Attached(
 					err = errors.Join(err, cleanupErr)
 				}
 			}
-			_ = d.fail(err)
-			_ = c.conn.Close()
+			c.revokeV3ResponseConsumption(a, err)
+			consumeV3ProvisionalResponses(provisional)
+			consumeV3ResponseConsumptions(resources.responseConsumptions)
+			resources.responseConsumptions = nil
 			return
 		}
 		cleanup, registered, err := c.registerProvisionalResourceOrAbandon(requestID, provisional)
 		if !registered {
 			if err != nil {
-				_ = d.fail(err)
+				c.revokeV3ResponseConsumption(a, err)
 			} else if cleanup.required() {
 				go func() {
 					if err := cleanup.finish(); err != nil {
@@ -793,11 +884,59 @@ func (c *frontendConn) handleV3Attached(
 					}
 				}()
 			}
-			_ = c.conn.Close()
+			if err == nil {
+				c.revokeV3ResponseConsumption(a, errors.New("portablefsd: retained resource reply lost its disposition table"))
+			}
+			consumeV3ProvisionalResponses(provisional)
+			consumeV3ResponseConsumptions(resources.responseConsumptions)
+			resources.responseConsumptions = nil
 			return
 		}
 	}
-	c.replyWithPublication(requestID, operationID, reply, publishes)
+	_, written, discarded := c.replyWithPublicationDisposition(
+		requestID, operationID, reply, publishes,
+		v3LatePublishingReplyDiscardable(body, 0),
+	)
+	if discarded && resourceReply {
+		// The callback already proved NOT_PUBLISHED, so no frontend can send a
+		// ResourceReplyDisposition for this unexposed frame. Withdraw the exact
+		// provisional capabilities without treating a read-only Lookup/Enumerate
+		// result as a failed visible mutation.
+		if !c.settleProvisionalResource(&pfslocal.ResourceReplyDisposition{
+			TargetRequestID: requestID,
+		}) {
+			c.revokeV3ResponseConsumption(a, errors.New(
+				"portablefsd: discarded late resource reply lost its provisional ownership",
+			))
+		}
+	}
+	if !resourceReply {
+		if written {
+			consumeV3ResponseConsumptions(resources.responseConsumptions)
+			resources.responseConsumptions = nil
+		} else if len(resources.responseConsumptions) != 0 {
+			c.revokeV3ResponseConsumption(a, errors.New("portablefsd: retained authority reply was not delivered"))
+			consumeV3ResponseConsumptions(resources.responseConsumptions)
+			resources.responseConsumptions = nil
+		}
+	}
+}
+
+func (c *frontendConn) revokeV3ResponseConsumption(a *attach, cause error) {
+	// Serialize against every pfslocal reply write: a retained authority
+	// response may still be in another handler, and fail-closed means its frame
+	// must either already be physically out or become unwritable before the
+	// authority's bounded force callback returns. Record the exact
+	// delivery-bound cause before closing the socket, so connection teardown
+	// cannot race in and replace it with context.Canceled.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if a != nil {
+		a.fenceV3(cause)
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
 }
 
 // detachV3 is the evidence-bearing unmount of one v3 attach. The caller owns

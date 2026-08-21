@@ -21,9 +21,9 @@ described in
   and is not conditioned on whether the volume publishes a declaration.
   `--no-local-dirs` refuses a declaring volume rather than ignoring its
   topology.
-- macOS does not join route adoption. The v3 attach refuses local-dir and graft
-  options outright (`vcs/internal/portablefsd/v3attach.go`), so a volume that
-  declares routes mounts from Linux. Grafts are Linux-only:
+- macOS v3 refuses local-dir and graft options outright
+  (`vcs/internal/portablefsd/v3attach.go`), so a volume that declares routes
+  mounts from Linux. Grafts are Linux-only:
   `vcs/internal/fusev3/graft_linux.go`, `vcs/internal/localdirs`,
   `vcs/internal/localroutes`.
 - Confinement is `vcs/internal/confinedfs`. Linux requires `openat2(2)` with
@@ -63,16 +63,18 @@ host and the acceptance on a case-sensitive one.
 
 Two honest limits apply to that probe today:
 
-- It sits on the retained daemon-side backing path. Because the v3 macOS attach
-  refuses grafts before any backing is opened, no macOS v3 mount reaches it.
+- It sits on the retained daemon-side backing path. Because production macOS
+  never reaches Attach and the qualification attach refuses grafts before any
+  backing is opened, no macOS FSKit path reaches it.
 - The Linux FUSE frontend has no equivalent probe. A graft backed by a
   case-insensitive filesystem mounted on Linux is still unguarded. That is an
   open gap, not a covered case.
 
 ## Real kernel confinement
 
-Unit tests and cross-compilation do not exercise `openat2(2)`. The privileged
-Linux gate does, against real XFS and a real kernel FUSE mount:
+Unit tests and cross-compilation do not exercise `openat2(2)`. The required
+privileged Linux gate does, against real XFS and a real FUSE mount on the exact
+stock kernel interface at FUSE protocol 7.31 or newer:
 
 ```bash
 bash scripts/xfs-fuse-integration.sh
@@ -94,16 +96,19 @@ Two-machine routing isolation is proven separately and black box by the
 Run the FSKit protocol and adapter suite on macOS:
 
 ```bash
-swift test --package-path swift/PortableFSKit --no-parallel
+bash scripts/test-swift-xcode.sh
 ```
 
-`--no-parallel` is required rather than a performance choice: several tests
-share process resources or exercise hard protocol deadlines. This suite covers
-the FSKit frontend, not graft confinement — the macOS graft refusal is a
-Go-side property and is covered by the `portablefsd` suite above.
+The shared gate disables Xcode parallel testing because several tests share
+process resources or exercise hard protocol deadlines. It separately
+enumerates and then proves the exact executed test set from the native
+`.xcresult`. This suite covers the qualification FSKit frontend, not graft
+confinement — the macOS graft refusal is a Go-side property and is covered by
+the `portablefsd` suite above.
 
-`bash scripts/verify-local.sh` is the repository's single local merge gate and
-runs the Go and Swift suites together.
+`bash scripts/verify-local.sh` is the repository's local gate and runs the Go
+and Swift suites together; `--full` also runs the two privileged real-mount
+suites.
 
 ## Source audit
 
@@ -136,8 +141,12 @@ replace these release-environment checks:
 - A Linux host with `/dev/fuse` and `fusermount3` must run the real kernel-mount
   integration suite. Docker Desktop does not expose `/dev/fuse` to its Linux VM
   by default, so it cannot certify this gate.
-- A production-signed and installed PortableFS FSKit extension must run the live
-  macOS kernel-mount matrix. The Swift mock/live-adapter suite cannot certify
-  extension activation, entitlements, signing, or kernel handoff.
+- A separately signed qualification PortableFS FSKit extension runs the live
+  macOS kernel-mount matrix when exercising that lane. The Swift mock/adapter
+  suite cannot certify extension activation, entitlements, signing, or kernel
+  handoff, and neither result admits a production macOS mount while the required
+  cache primitives are absent.
 
-Treat both as release blockers, not optional fallbacks.
+The Linux gate is a production release blocker. The signed macOS run is a gate
+for the qualification artifact only; it is neither a production release blocker
+nor a fallback, and passing it cannot admit current FSKit.

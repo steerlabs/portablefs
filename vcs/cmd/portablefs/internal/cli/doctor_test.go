@@ -96,7 +96,10 @@ func TestDoctorAllChecksPassOnLinux(t *testing.T) {
 		"UNKNOWN  mount transport: no definite blocker found; mount not verified",
 		"SKIP  fskit inventory: FSKit is macOS-only",
 		"SKIP  portablefsd:",
-		"SKIP  attaches: attach status is read from portablefsd (macOS-only)",
+		// Linux has no daemon attach table; the equivalent inventory is the
+		// per-mount session state the supervisor persists, and with no FUSE
+		// mount recorded there is nothing to report.
+		"SKIP  attaches: no FUSE mounts recorded on this machine",
 		"PASS  mounts: no mounts recorded",
 		"no definite problems found; 1 check(s) remain unverified",
 	)
@@ -295,4 +298,42 @@ func TestDoctorCommandRegistered(t *testing.T) {
 	if !strings.Contains(rootHelp(), "doctor") {
 		t.Fatal("root help must list doctor")
 	}
+}
+
+// A revoked mount is the one condition doctor previously could not name on
+// Linux: its owner process is alive, its kernel mount may still be installed,
+// and every other check therefore reads it as healthy.
+func TestDoctorReportsRevokedFUSESessionsOnLinux(t *testing.T) {
+	_, stdout, r, stateDir := doctorBaseline(t)
+	revoked := validFuseMountState(t, "/tmp/revoked")
+	revoked.VolumeID = "vol1"
+	revoked.Status = mountStatusRevoked
+	revoked.StatusReason = mountRevokedCoherenceViolation
+	revoked.StatusDetail = "the frontend cannot keep this kernel coherent"
+	revoked.StatusChangedAtMs = 1700000000000
+	if err := writeMountState(stateDir, revoked); err != nil {
+		t.Fatal(err)
+	}
+	if rc := r.execute(); rc != 1 {
+		t.Fatalf("rc = %d, want 1\n%s", rc, stdout.String())
+	}
+	requireContains(t, stdout.String(),
+		"FAIL  attaches: 1 of 1 FUSE session(s) revoked",
+		mountRevokedCoherenceViolation,
+		"the frontend cannot keep this kernel coherent",
+		"FAIL  mounts: 1 mount(s): 1 revoked",
+		"portablefs umount /tmp/revoked",
+	)
+}
+
+func TestDoctorPassesLinuxSessionsWhenNothingIsRevoked(t *testing.T) {
+	_, stdout, r, stateDir := doctorBaseline(t)
+	r.e.mountHealthFn = func(*mountState) string { return "live" }
+	if err := writeMountState(stateDir, validFuseMountState(t, "/tmp/ok")); err != nil {
+		t.Fatal(err)
+	}
+	if rc := r.execute(); rc != 0 {
+		t.Fatalf("rc = %d, want 0\n%s", rc, stdout.String())
+	}
+	requireContains(t, stdout.String(), "PASS  attaches: 1 FUSE session(s), none revoked")
 }

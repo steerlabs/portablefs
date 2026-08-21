@@ -6,9 +6,9 @@ the v2 architecture entirely"): this file was a running ledger from the
 stack. Most of that ledger is gone with the code it described. What remains
 below are the items whose subject matter survives the reset — an unexplained
 observation, four macOS platform gaps, and one design question that must be
-re-asked rather than carried forward as an answer. None of them is fixed, and
-none of them has been re-verified against a live v3 mount, because no live-mount
-campaign has been run on this tree.
+re-asked rather than carried forward as an answer. The platform gaps now form
+part of the reason protocol 6 refuses production macOS mounting. New live
+experiments are qualification only and must identify the adapter they exercise.
 
 ## Open
 
@@ -25,49 +25,55 @@ followed by a read that returns `ENODATA` rather than bytes or a definite error
 — is exactly the kind of defect the coherence work is meant to make impossible,
 and "we saw it once and never explained it" is not a closed item.
 
-Next step is a repro, not a fix: run `scripts/two-mac-stress.sh` against v3
-mounts with daemon tracing on and capture the failing sequence. Do not make code
-changes on the strength of the original sighting.
+If the historical symptom is investigated, the next step is a repro rather
+than a fix: run `scripts/two-mac-stress.sh` only against explicit qualification
+mounts with daemon tracing and capture the failing sequence. Do not make code or
+production-support changes on the strength of the original sighting.
 
 ### macOS FSKit platform gaps
 
 Kernel-verified on macOS 26 during the v2 campaign. These are properties of
-Apple's framework, not of PortableFS code, so the reset did not touch them. Each
-still needs a Feedback radar filed, and each still needs re-confirmation against
-the v3 FSKit extension before it is quoted as a v3 contract.
+Apple's framework, not of PortableFS code, so the reset did not touch them.
+Current Apple documentation and DTS evidence confirm the missing cache-control
+class; targeted qualification runs remain useful for characterizing particular
+kernels, not for substituting an undocumented contract.
 
 - **Negative dentries are cached permanently.** There is no revalidation against
   parent attributes and no invalidation API, so a lookup performed before a name
   exists blinds that machine to the name until a *local* mutation purges the
   directory's cache. Cross-machine "stat-poll until it appears" cannot work.
-  Enumeration always consults the filesystem and is the supported discovery
-  pattern. This is the same absence that makes the macOS 26 cache contract a
-  release gate rather than a claim; see
+  Enumeration happened to consult the filesystem in those experiments, but
+  using it as a discovery workaround would not discharge a protocol-6 N or E
+  lease. The retained SDK-26 adapter can characterize the behavior, but the
+  absence prevents a production cache claim;
+  see
   [macos-26-coherence-contract.md](./macos-26-coherence-contract.md).
 - **No advisory-lock operations.** FSKit exposes no lock callbacks, so
   cross-machine `fcntl`/`flock` exclusion is impossible from a macOS mount. The
   v3 adapter conforms to the operations, open/close, read/write, xattr, and
-  pathconf protocols and to nothing else, so this is unchanged. The supported
-  cross-machine mutual-exclusion primitive on macOS remains `O_EXCL` create,
-  which the authority serializes exactly once. Linux is not in this position:
+  pathconf protocols and to nothing else, so this is unchanged. Qualification
+  can exercise authority-serialized `O_EXCL` create, but there is no supported
+  cross-machine Mac mutual-exclusion surface. Linux is not in this position:
   the Linux frontend refuses to mount unless the kernel forwards both POSIX
   record locks and `flock` (see [consistency-model.md](./consistency-model.md)),
   so the two platforms differ here by design and the difference must stay stated.
 - **No append intent.** `FSVolume.OpenModes` carries only read and write access
   bits and writes arrive with kernel-resolved offsets, so cross-machine
   `O_APPEND` interleaving cannot be expressed on FSKit; FUSE mounts do get true
-  authority-assigned append offsets. Use per-writer files, or write-tmp+rename.
-  The boundary is stated in [fskit-mount.md](./fskit-mount.md).
+  authority-assigned append placement. This is a production-admission blocker,
+  not a concurrent-append usage recommendation. Stock FUSE also lacks the exact
+  intent/result surface. Protocol 6 can refuse `O_APPEND`, but `RWF_APPEND` is
+  not forwarded and therefore blocks a production-ready writable profile. The boundary is stated in
+  [fskit-mount.md](./fskit-mount.md).
 - **Replacing the hosting app tears down live mounts.** Replacing or
   re-registering an app that hosts an FSKit extension makes `pkd` `SIGTERM` the
   running extension instance, killing every live mount mid-write. Installers and
   updaters must drain mounts first. This one has a concrete v3 consequence that
   is not yet designed: the release installer replaces PortableFS.app, so the
-  install path and the mount lifecycle interact and neither currently accounts
-  for the other.
+  shipping install path and live mount lifecycle must remain coordinated.
 
-These belong in user-facing consistency documentation as contracts once
-re-confirmed, not only in a follow-up list.
+These facts define the refusal boundary and the requirements for any future
+production FSKit profile.
 
 ### Path-scoped repair versus inode-shared objects — re-ask, do not assume
 
@@ -87,17 +93,19 @@ from the first without retiring the object in the second.
 
 That is a different design, and the fact that it is a better-shaped design is
 not evidence that the original defect is absent. The question has to be put to
-the v3 daemon and the v3 FSKit adapter on their own terms:
+the v3 daemon and qualification FSKit adapter on their own terms:
 
 - can a repair whose plan was computed from one coordinate miss an alias that
   becomes reachable while the plan is executing;
 - can an alias discovered mid-operation force a repair the publication barrier
   has already admitted past;
-- and does the answer differ between the Linux FUSE mount, which has no such
-  barrier, and the macOS mount, which does.
+- and does the answer differ between the supported Linux FUSE mount and the
+  qualification macOS adapter's callback barrier.
 
 Nothing in the offline Swift suite can settle those, because none of it mounts a
-real FSKit volume. Treat this as open and unmeasured, not as inherited-and-fixed.
+real FSKit volume. A live qualification result can characterize the adapter but
+still cannot replace the missing documented invalidation primitive. Treat this
+as open and unmeasured, not as inherited-and-fixed.
 
 ## Made moot by the v3 reset
 

@@ -14,19 +14,14 @@ message Request {
   bytes epoch = 2; // 16 bytes after Hello/Attach
   SessionProof session = 3;
   Mutation mutation = 4; // required on mutating bodies
-  // Opaque logical publication/callback identity assigned by the filesystem
-  // frontend. A nonzero value lets CALLBACK_SERIALIZED_PIPELINED scheduling
-  // distinguish a later callback from another mutation issued by the initiating
-  // callback.
-  // Zero means unknown and preserves the fail-safe interruption rule. This is
-  // scheduling metadata only: it grants no authority and is not a replay ID.
-  uint64 frontend_operation_id = 5;
-  // Per-request frontend progress proof. True means this ordered mutation is
-  // from an ordered-only callback which the frontend will exclude from the
-  // drain of a distinct own-source visibility phase. False is fail-safe and
-  // requires definite pre-apply interruption while such a phase is pending.
-  // This is scheduling metadata only and grants no authority.
-  bool source_phase_queueable = 6;
+  reserved 5, 6, 7, 8, 16, 17, 33, 46;
+  reserved "frontend_operation_id", "source_phase_queueable", "source_publication_gate",
+    "visibility_retry_after_sequence", "next_visibility", "ack_visibility", "write_transaction";
+  // FSKit callbacks declare the exact local cache coordinates whose publication
+  // must remain closed until the framework callback has consumed the reply.
+  // Linux lease sessions must leave both fields zero.
+  FskitSourcePublication fskit_source_publication = 60;
+  uint64 fskit_frontend_operation_id = 61;
 
   oneof body {
     HelloRequest hello = 10;
@@ -35,8 +30,6 @@ message Request {
     KeepAliveRequest keep_alive = 13;
     DetachRequest detach = 14;
     CancelRequest cancel = 15;
-    NextVisibilityRequest next_visibility = 16;
-    AckVisibilityRequest ack_visibility = 17;
     ReauthorizeRequest reauthorize = 19;
     LookupRequest lookup = 20;
     GetAttrRequest get_attr = 21;
@@ -51,7 +44,6 @@ message Request {
     OpenRequest open = 30;
     CloseRequest close = 31;
     ReadRequest read = 32;
-    WriteRequest write = 33;
     FsyncRequest fsync = 34;
     ReadDirRequest read_dir = 35;
     ReclaimRequest reclaim = 36;
@@ -62,10 +54,60 @@ message Request {
     RemoveXattrRequest remove_xattr = 43;
     StatFSRequest stat_fs = 44;
     SyncFSRequest sync_fs = 45;
+    // One stock fallocate operation.
+    FallocateRequest fallocate = 47;
+    // One whole server-side SHARED-to-SHARED copy. Cross-domain copies are
+    // rejected by the kernel before transport.
+    CopyFileRangeRequest copy_file_range = 48;
+    // Creates one unnamed regular inode and its open handle. Because no name is
+    // published, this is replayed authority state but not a peer-visible
+    // mutation; the kernel still requires its generic publication receipt.
+    TmpfileRequest tmpfile = 49;
     GetLockRequest get_lock = 50;
     SetLockRequest set_lock = 51;
+    ActivateRequest activate = 52;
+    AbortAttachRequest abort_attach = 53;
+    // Completes the authority-to-frontend half of a terminal applied-state
+    // delivery. It is allowed only on CONTROL while the volume is fenced and
+    // carries no filesystem authority of its own.
+    TerminalDeliveryReceipt terminal_delivery_receipt = 54;
     ApplyRoutesRequest apply_routes = 18;
+    // One ordinary positioned FUSE write. The kernel has already performed
+    // generic write checks and bounded the payload to the negotiated frame.
+    // data is the frame's exact out-of-line bulk body.
+    WriteRequest write = 55;
+    NextLeaseEventRequest next_lease_event = 56;
+    AcknowledgeLeaseEventRequest acknowledge_lease_event = 57;
+    RenewLeasesRequest renew_leases = 58;
+    AcknowledgeSourceLeaseDischargeRequest acknowledge_source_lease_discharge = 59;
+    NextVisibilityRequest next_fskit_repair = 62;
+    AckVisibilityRequest ack_fskit_repair = 63;
+    FskitWriteRequest fskit_write = 64;
   }
+}
+
+message FskitSourcePublication {
+  repeated FskitSourcePublicationTarget targets = 1;
+}
+
+message FskitSourcePublicationTarget {
+  oneof coordinate {
+    FskitSourcePublicationItem item = 1;
+    FskitSourcePublicationNamespace namespace = 2;
+  }
+}
+
+message FskitSourcePublicationItem {
+  bytes identity = 1; // exactly 16 bytes
+  bool attributes = 2;
+  bool data = 3;
+}
+
+message FskitSourcePublicationNamespace {
+  bytes parent_identity = 1; // exactly 16 bytes
+  bytes name = 2; // one raw component
+  bool bound_attributes = 3;
+  bool bound_data = 4;
 }
 
 message Response {
@@ -73,7 +115,8 @@ message Response {
   bytes epoch = 2;
   int32 errno = 3; // Linux errno; zero is success
   bool uncertain = 4; // operation may have reached XFS; never auto-retry
-  Attr post_attr = 5;
+  reserved 5;
+  reserved "post_attr";
   // mutation is present exactly when the authority recorded this request in a
   // replay slot. It is the authoritative slot state; a client must copy it
   // rather than infer its own sequence, so the two counters cannot diverge.
@@ -87,33 +130,80 @@ message Response {
   // "your mount was refused" into "your local-dirs file is revision X, the
   // volume's is Y". See RoutesMismatch.
   RoutesMismatch routes_mismatch = 8;
+  // Present only on the final response that carries a volume-terminal exact
+  // outcome. The source returns it after its kernel publication boundary.
+  bytes terminal_delivery_token = 9; // exactly 16 nonzero bytes
+  // Present exactly with VISIBILITY_RETRY. It names the already-delivered
+  // peer phase whose local repair must finish before the Linux frontend may
+  // resubmit. This cross-lane identity prevents transport-speed retry loops.
+  reserved 43;
+  reserved "visibility_retry_sequence";
+  PostState post_state = 45;
+  // Cache authority is carried in one common envelope so LOOKUP, GETATTR,
+  // OPEN, READDIR, and mutation replies cannot invent operation-specific
+  // grant encodings.
+  repeated LeaseGrant lease_grants = 46;
+  // Present on a changed mutation reply when the source held cache authority
+  // over an affected coordinate. Those coordinates remain closed until the
+  // frontend purges every named A/D/E cache before returning the callback,
+  // writes the physical kernel reply, then acknowledges the obligation on
+  // CONTROL. Namespace state covered by normal VFS reply processing is proven
+  // only at that physical reply boundary.
+  SourceLeaseDischarge source_lease_discharge = 50;
+  uint64 fskit_repair_retry_sequence = 52;
+  reserved 26, 33, 38;
+  reserved "visibility", "write_transaction";
   // restore_detail is present with FAILURE_CLASS_RESTORE and gives the stable
   // retry/operator reason without overloading errno (blocked, corrupt,
   // recall_deadline, or protocol).
-  string restore_detail = 9;
+  string restore_detail = 55;
 
   oneof body {
     HelloReply hello = 10;
     AttachReply attach = 11;
+    ResumeReply resume = 12;
+    ActivateReply activate = 13;
+    AbortAttachReply abort_attach = 14;
     LookupReply lookup = 20;
     GetAttrReply get_attr = 21;
     CreateReply create = 22;
     ReadlinkReply readlink = 23;
     OpenReply open = 24;
     ReadReply read = 25;
-    WriteReply write = 26;
     ReadDirReply read_dir = 27;
     GetXattrReply get_xattr = 28;
     ListXattrReply list_xattr = 29;
     StatFSReply stat_fs = 30;
     GetLockReply get_lock = 31;
     LinkReply link = 32;
-    VisibilityEvent visibility = 33;
     ApplyRoutesReply apply_routes = 34;
     SyncFSReply sync_fs = 35;
     ReauthorizeReply reauthorize = 36;
+    RenameReply rename = 37;
+    FallocateReply fallocate = 39;
+    CopyFileRangeReply copy_file_range = 40;
+    TmpfileReply tmpfile = 41;
+    TerminalDeliveryReceiptReply terminal_delivery_receipt = 42;
+    WriteReply write = 44;
+    LeaseEvent lease_event = 47;
+    AcknowledgeLeaseEventReply acknowledge_lease_event = 48;
+    RenewLeasesReply renew_leases = 49;
+    AcknowledgeSourceLeaseDischargeReply acknowledge_source_lease_discharge = 51;
+    VisibilityEvent fskit_repair = 53;
+    FskitWriteReply fskit_write = 54;
   }
 }
+
+// TerminalDeliveryReceipt is sent on CONTROL only after the frontend has
+// consumed an exact terminal mutation outcome: a no-change result reached its
+// physical kernel reply, or an applied result completed the generic PUBLISH
+// ACK. The authority keeps the fenced epoch's transports alive until this
+// receipt; a successful authority socket write alone does not prove that the
+// source kernel installed the only truthful post-apply state.
+message TerminalDeliveryReceipt {
+  bytes token = 1; // exactly 16 nonzero authority-minted bytes
+}
+message TerminalDeliveryReceiptReply {}
 
 message SessionProof {
   bytes id = 1; // 16 bytes
@@ -124,12 +214,16 @@ message SessionProof {
 message Mutation {
   uint32 slot = 1;
   uint64 sequence = 2;
-  bytes request_hash = 3; // SHA-256 of canonical protobuf body
+  // Content identity is deliberately authority-private since protocol 4. The
+  // authority fingerprints the canonical body with its per-epoch secret; a
+  // client supplies only the replay slot and sequence it owns.
+  reserved 3;
+  reserved "request_hash";
 }
 
 // MutationState reports the replay-slot state the authority actually recorded.
 // It is envelope, not body: it is never part of a retained replay outcome and
-// never part of the canonical request hash.
+// never part of the canonical mutation body.
 message MutationState {
   uint32 slot = 1;
   uint64 accepted_sequence = 2; // sequence now durable in that slot for this session
@@ -155,10 +249,21 @@ enum FailureClass {
   // ECANCELED because macOS 26 may transparently re-enter a mutating callback
   // after EINTR, EBUSY, or EAGAIN. Frozen policy v1 exposes EINTR unchanged.
   FAILURE_CLASS_VISIBILITY_INTERRUPTED = 5;
+  // VISIBILITY_RETRY is a Linux scheduling handoff, never an application
+  // errno. For a mutation, the authority has definitely not applied it and,
+  // for a staged write, has retained the inert bytes. For a read, no result was
+  // published. The Linux frontend withdraws the aborted response or source
+  // gate, lets the named peer repair finish, and resubmits inside the same FUSE
+  // callback.
+  // A Linux namespace callback may retain this handoff because the strict
+  // kernel's notification path expires the cached binding without acquiring
+  // the parent lock held by that callback. Callback-serialized frontends never
+  // receive this class.
+  FAILURE_CLASS_VISIBILITY_RETRY = 6;
   // RESTORE is a definite, non-fatal refusal while sealed base content cannot
   // be recalled, recall admission is saturated, or corruption has made the
   // volume's content uniformly unavailable. The session and epoch stay live.
-  FAILURE_CLASS_RESTORE = 6;
+  FAILURE_CLASS_RESTORE = 7;
 }
 
 // RoutesMismatch names both sides of a routing-topology disagreement. All
@@ -197,6 +302,8 @@ message Item {
   // coordination metadata, never authorization; every operation still uses
   // token. All capabilities for hard-link aliases carry the same 16 bytes.
   bytes stable_identity = 3;
+  uint64 object_version = 4;
+  uint64 snapshot_sequence = 5;
 }
 
 message Attr {
@@ -218,9 +325,53 @@ message Attr {
   int64 mtime_ns = 10;
   int64 ctime_ns = 11;
   int64 birth_time_ns = 12;
+  uint32 rdev = 13;
+  uint32 blksize = 14;
+  uint32 flags = 15;
 }
 
-message HelloRequest { uint32 protocol_major = 1; repeated string features = 2; }
+message PostState {
+  uint64 visibility_sequence = 1;
+  repeated ObjectPostState objects = 2;
+  uint64 snapshot_sequence = 3;
+}
+
+message ObjectPostState {
+  bytes stable_identity = 1;
+  uint64 object_version = 2;
+  Attr attr = 3;
+  uint32 roles = 4;
+}
+
+// Every protocol-6 client owns exactly two authenticated transports for one
+// session. DATA carries filesystem traffic; CONTROL carries cache repair and
+// liveness traffic. The role and random connection-set identity are mandatory
+// at Hello and are echoed by the authority before either connection can take
+// part in attach.
+enum TransportRole {
+  TRANSPORT_ROLE_UNSPECIFIED = 0;
+  TRANSPORT_ROLE_DATA = 1;
+  TRANSPORT_ROLE_CONTROL = 2;
+}
+
+// Attach creates a provisional credential. It becomes an ordinary filesystem
+// session only after both role bindings are proven to Activate. A provisional
+// session cannot execute filesystem or visibility operations.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_PROVISIONAL = 1;
+  SESSION_STATE_ACTIVE = 2;
+  SESSION_STATE_ABORTED = 3;
+  SESSION_STATE_TERMINAL = 4;
+}
+
+message HelloRequest {
+  uint32 protocol_major = 1;
+  repeated string features = 2;
+  TransportRole role = 3;
+  bytes connection_set_id = 4; // exactly 32 random bytes
+  FrontendProfile frontend_profile = 10;
+}
 message HelloReply {
   uint32 protocol_major = 1;
   repeated string features = 2;
@@ -228,6 +379,13 @@ message HelloReply {
   uint32 max_read_bytes = 4;
   uint32 max_write_bytes = 5;
   uint32 max_in_flight = 6; // per TLS connection
+  TransportRole role = 7;
+  bytes connection_set_id = 8; // exact echo of HelloRequest.connection_set_id
+  // Retired pre-v6 fragmented-write bound.
+  reserved 9;
+  reserved "max_write_transaction_bytes";
+  FrontendProfile frontend_profile = 10;
+  uint64 max_fskit_write_bytes = 11;
 }
 
 message AttachRequest {
@@ -235,55 +393,109 @@ message AttachRequest {
   string volume_id = 1;
   bytes access_token = 2;
   uint32 replay_slots = 4;
-  CoherenceProfile coherence_profile = 5;
-  // cached_name_capacity is how many distinct resolutions this frontend's
+  reserved 5, 6, 7, 9;
+  reserved "coherence_profile", "cached_name_capacity", "repair_budget_millis", "namespace_repair";
+  // fskit_cached_name_capacity is how many distinct resolutions this frontend's
   // kernel cache is expected to hold. It sizes the authority's per-session
   // resolved-name index, which is what lets a mutation skip mounts that cannot
   // be holding the affected name. It is a precision and memory setting only:
   // the index never drops a coordinate, so understating this number costs
-  // wasted acknowledgments and never a missed one. Required and nonzero for a
-  // strict profile; ignored for an uncached one.
-  uint64 cached_name_capacity = 6;
-  // repair_budget_millis is the per-phase deadline this frontend commits to:
+  // wasted acknowledgments and never a missed one. Required and nonzero for
+  // the exact FSKit synchronous-repair profile.
+  // fskit_repair_budget_millis is the per-phase deadline this frontend commits to:
   // the longest it may take to acknowledge one PREPARE or one COMPLETE. The
   // authority fences this participant individually when the budget expires, and
   // the frontend must revoke its own kernel mount if it has not acknowledged a
   // phase within the same budget. The two sides use one number so the window in
   // which a fenced mount could still serve a stale name is bounded by it.
-  uint64 repair_budget_millis = 7;
   // routes_revision is the 32-byte SHA-256 over the canonical machine-local
   // routing rules this mount will run, derived from the volume file
   // .portablefs/local-dirs. The authority is the source of truth for that file
-  // and refuses any mount whose revision is not the active one, for every
-  // coherence profile: an uncached mount that routes a subtree locally hides
-  // exactly as much from its peers as a strict one does. An empty rule set has
-  // a revision too, so this field is required and a mount that omits it is
-  // refused - "I did not say" must never be admitted as "I agree".
+  // and refuses any mount whose revision is not the active one. An empty rule
+  // set has a revision too, so this field is required and a mount that omits it
+  // is refused - "I did not say" must never be admitted as "I agree".
   bytes routes_revision = 8;
-  // namespace_repair states how this frontend's kernel makes a cached binding
-  // unservable. Required and non-UNSPECIFIED for a strict profile; ignored for
-  // an uncached one, which caches no binding to repair. It is what lets the
-  // authority tell a proven repair cycle apart from an ordinary slow lock.
-  NamespaceRepair namespace_repair = 9;
+  // fskit_namespace_repair states how this frontend's kernel makes a cached binding
+  // unservable. Required and non-UNSPECIFIED. It is what lets the authority
+  // tell a proven repair cycle apart from an ordinary slow lock.
+  // One random identity for this attach transaction. It makes a lost
+  // provisional response and AbortAttach name exactly one attempt rather than
+  // whichever attach happens to be newest on the connection set.
+  bytes attach_attempt_id = 10; // exactly 32 random bytes
+  // MOUNT sessions enter durable mount membership and the lease service.
+  // ROUTE_ADMIN sessions are capability-authenticated control sessions: they
+  // never receive filesystem capabilities, cache leases, or route membership.
+  SessionPurpose purpose = 11;
+  FrontendProfile frontend_profile = 12;
+  uint32 fskit_cached_name_capacity = 13;
+  uint64 fskit_repair_budget_millis = 14;
+  NamespaceRepair fskit_namespace_repair = 15;
 }
 message AttachReply {
   bytes session_id = 1;
-  uint64 session_generation = 2;
+  uint64 generation = 2;
   bytes resume_secret = 3;
-  Item root = 4;
-  repeated string features = 5;
-  uint64 session_lease_milliseconds = 6;
-  VisibilityCursor visibility_cursor = 7; // strict participant's initial cursor
+  // Earlier protocol majors exposed an active filesystem session directly from
+  // Attach. Protocol 6 reserves that wire surface: active state is returned only
+  // by Activate after both authenticated role bindings exist.
+  reserved 4 to 9;
+  reserved "root", "features", "session_lease_milliseconds", "visibility_cursor", "routes_revision", "authorization_deadline_unix_nanos";
+  int64 provisional_deadline_unix_nanos = 10;
+  uint64 data_binding_generation = 11;
+  uint64 control_binding_generation = 12;
+}
+message ResumeRequest {}
+message ResumeReply {
+  TransportRole role = 1;
+  uint64 binding_generation = 2;
+  SessionState state = 3;
+}
+
+message ActivateRequest {
+  bytes attach_attempt_id = 1; // exactly 32 bytes
+  uint64 data_binding_generation = 2;
+  uint64 control_binding_generation = 3;
+}
+message ActivateReply {
+  Item root = 1;
+  repeated string features = 2;
+  uint64 session_lease_milliseconds = 3;
+  reserved 4;
+  reserved "visibility_cursor";
   // routes_revision is the revision this session was admitted against. It is
   // the same value the mount presented - an attach that disagreed was refused -
   // so it is an explicit confirmation rather than a value to adopt.
-  bytes routes_revision = 8;
+  bytes routes_revision = 5;
   // authorization_deadline_unix_nanos is the exact signed deadline installed
   // for this session. Automatic renewal schedules from this authority-verified
   // value, never from a caller's untrusted copy of the Manager response.
-  int64 authorization_deadline_unix_nanos = 9;
+  int64 authorization_deadline_unix_nanos = 6;
+  SessionState state = 7;
+  // Protocol 6 lease streams begin at the zero cursor. Carrying it explicitly
+  // makes activation/replay state self-contained and leaves room for a future
+  // nonzero restored cursor without changing attach semantics.
+  LeaseEventCursor lease_cursor = 8;
+  SessionPurpose purpose = 9;
+  FrontendProfile frontend_profile = 10;
+  VisibilityCursor fskit_repair_cursor = 11;
 }
-message ResumeRequest {}
+enum FrontendProfile {
+  FRONTEND_PROFILE_UNSPECIFIED = 0;
+  FRONTEND_PROFILE_LINUX_LEASES = 1;
+  FRONTEND_PROFILE_FSKIT_SYNC_REPAIR = 2;
+}
+enum SessionPurpose {
+  SESSION_PURPOSE_UNSPECIFIED = 0;
+  SESSION_PURPOSE_MOUNT = 1;
+  SESSION_PURPOSE_ROUTE_ADMIN = 2;
+}
+
+// AbortAttach releases one exact provisional attempt. It is invalid after the
+// session has become ACTIVE and has no compatibility or detach fallback.
+message AbortAttachRequest {
+  bytes attach_attempt_id = 1; // exactly 32 bytes
+}
+message AbortAttachReply { SessionState state = 1; }
 message KeepAliveRequest {}
 // Reauthorize replaces only the signed access decision of this exact live
 // session. The token is bound to the session ID, the TLS peer SPKI, and this
@@ -317,11 +529,13 @@ message DetachRequest {
 }
 message CancelRequest { uint64 target_request_id = 1; }
 
-// A frontend declares cache behavior, never an operating-system name. An
-// uncached mount has no remote repair obligation. A strict mount participates
-// in the ordered two-phase visibility barrier.
+// FSKit synchronous repair has one strict cache contract. Its frontend closes
+// the exact source-publication footprint and participates in the peer-only
+// repair barrier. Zero is deliberately invalid so an omitted profile cannot
+// enter that coordinator.
 enum CoherenceProfile {
-  COHERENCE_PROFILE_UNCACHED = 0;
+  reserved "COHERENCE_PROFILE_UNCACHED";
+  COHERENCE_PROFILE_UNSPECIFIED = 0;
   COHERENCE_PROFILE_STRICT = 1;
 }
 
@@ -329,15 +543,6 @@ enum CoherenceProfile {
 // name->inode binding unservable. It is declared, not inferred, because the
 // authority cannot see a remote kernel and the two answers have different
 // provable properties.
-//
-// PARENT_EXCLUSIVE is Linux FUSE. fs/fuse/dir.c:1351 takes
-// down_write(&parent->i_rwsem) unconditionally - before the FUSE_EXPIRE_ONLY
-// test at dir.c:1367 - and fs/namei.c:4389 / :3895 / :4975 hold that same
-// semaphore for write across the whole server round trip of any directory
-// mutation. A mount with an unanswered directory mutation in that parent
-// therefore cannot repair a name in it, and if the authority is the party that
-// owes the answer, the wait is a closed cycle rather than a slow lock. See the
-// proof at VisibilityCoordinator.ReportBlocked.
 //
 // INDEPENDENT means repair never waits on a lock the mount's own unanswered
 // operation can hold. A frontend may only declare it if that is true of its
@@ -352,18 +557,22 @@ enum CoherenceProfile {
 // of parking them behind the phase they would prevent it from repairing.
 //
 // CALLBACK_SERIALIZED_PIPELINED is the identity-aware current macOS 26
-// contract. Peer phases and mutations from the initiating callback retain the
-// interruption rule. A distinct nonzero frontend_operation_id may queue behind
-// an own-source phase only when that exact request also carries
-// source_phase_queueable: the frontend then excludes the already-dispatched
-// ordered-only callback from source PREPARE's drain. Mixed callbacks and zero
-// identities stay fail-safe and are interrupted before apply.
+// contract. Peer phases retain the interruption rule. A distinct nonzero
+// frontend_operation_id identifies a later callback for retry fairness after a
+// definite pre-apply interruption. Zero identities stay fail-safe. Filesystem
+// phases are peer-only: the initiating frontend closes its exact publication
+// gate before dispatch and never receives its own PREPARE or COMPLETE.
 enum NamespaceRepair {
   NAMESPACE_REPAIR_UNSPECIFIED = 0;
-  NAMESPACE_REPAIR_PARENT_EXCLUSIVE = 1;
   NAMESPACE_REPAIR_INDEPENDENT = 2;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED = 3;
   NAMESPACE_REPAIR_CALLBACK_SERIALIZED_PIPELINED = 4;
+  // 1 was NAMESPACE_REPAIR_PARENT_EXCLUSIVE, the retired stock-FUSE model:
+  // breaking its parent-i_rwsem cycle required surfacing a synthetic EINTR to
+  // ordinary applications. 5 was NAMESPACE_REPAIR_LOCKLESS_EXPIRATION, the
+  // retired patched-kernel model, whose private ABI no longer exists.
+  reserved 1, 5;
+  reserved "NAMESPACE_REPAIR_PARENT_EXCLUSIVE", "NAMESPACE_REPAIR_LOCKLESS_EXPIRATION";
 }
 
 enum VisibilityPhase {
@@ -403,17 +612,10 @@ message VisibilityTarget {
   // attest it. Empty for absent/unknown postconditions and for non-namespace
   // scopes; unlike dependency metadata, this association is safe to actuate.
   bytes post_identity = 9;
-}
-
-// RoutesChange makes a two-phase event say "this is a routing-topology change"
-// without overloading a namespace target. A routing change has no parent, no
-// name and no inode: it is not a cache coordinate, and encoding it as one would
-// mean a frontend could satisfy it by invalidating a dentry, which is not the
-// obligation. What a frontend owes here is to stop serving the old topology
-// entirely before it acknowledges COMPLETE.
-message RoutesChange {
-  bytes revision = 1; // 32 bytes; the revision that becomes active at COMPLETE
-  bytes rules = 2;    // canonical rule bytes the revision is the digest of
+  // Absent on PREPARE and NAMESPACE. Mandatory on every DATA or ATTRIBUTES
+  // target in COMPLETE; this is the exact retained mutation record peers
+  // install instead of making prior attributes inexact.
+  ObjectPostState exact_post_state = 10;
 }
 
 message VisibilityEvent {
@@ -422,9 +624,13 @@ message VisibilityEvent {
   uint32 mutation_slot = 3; // initiating callback exemption ticket
   repeated VisibilityTarget targets = 4;
   uint64 mutation_sequence = 5;
-  // routes is set exactly on the two phases of a routing-topology change, and
-  // targets is empty on those phases. The two are disjoint by construction.
-  RoutesChange routes = 6;
+  // 6 was routes: the retired FSKit routes barrier delivered a routing
+  // revision as a two-phase visibility phase, and a frontend that could not
+  // adopt it reported blocked. A route change now commits only at clean mount
+  // absence -- no mount exists to deliver a phase to -- so no visibility event
+  // can carry a routing revision.
+  reserved 6;
+  reserved "routes";
 }
 
 // ApplyRoutes installs a new machine-local routing topology for the whole
@@ -451,45 +657,175 @@ message ApplyRoutesReply {
   uint32 acknowledged_participants = 3;
 }
 
-message NextVisibilityRequest { VisibilityCursor after = 1; }
+message NextVisibilityRequest {
+  VisibilityCursor after = 1;
+  // acknowledge_after atomically acknowledges `after` and then long-polls for
+  // the next phase. This removes the empty Ack reply followed by a second Next
+  // request from the critical path while preserving the same cursor check. A
+  // lost response is retried safely because acknowledging the last accepted
+  // cursor is idempotent.
+  bool acknowledge_after = 2;
+  // Liveness-only COMPLETE feedback carried with the combined acknowledgment;
+  // it has the same constrained meaning as AckVisibilityRequest's field.
+  bool ordered_admission_contended = 3;
+}
 message AckVisibilityRequest {
   VisibilityCursor cursor = 1;
-  // blocked is a frontend saying it cannot yet service this phase because an
-  // exact namespace repair needs a parent lock its own unanswered request to
-  // this authority holds. For an ordinary parent-exclusive COMPLETE, the
-  // authority installs a cursor+parent-scoped pre-apply interruption. The
-  // frontend drains the refused request, performs repair, and acknowledges the
-  // same phase without losing the mount. A routes change remains terminal.
-  //
-  // Only the frontend can evaluate this. It needs BOTH that the mount has an
-  // unanswered namespace mutation in the affected parent - which the authority
-  // also knows - and that the mount actually holds a cached binding this phase
-  // names, which the authority does not: its audience comes from a monotone
-  // filter with no false negatives and therefore many false positives. A mount
-  // that has nothing cached to repair must acknowledge normally.
-  //
-  // The authority maps every reported inode through this exact pending event
-  // and enforces the interruption when the corresponding ordinary request is
-  // present or later arrives. This report never acknowledges the phase, so it
-  // cannot be used to skip repair; the ordinary phase deadline remains the
-  // fail-closed bound if the lock does not drain.
-  bool blocked = 2;
-  // Exact parent coordination inodes whose cached bindings require reverse
-  // invalidation. The authority maps each one back to this pending event's
-  // stable parent identity before installing an interruption. Required for an
-  // ordinary namespace blocked report; empty for a terminal routes report.
-  repeated uint64 blocked_parent_kernel_inos = 3;
+  // 2 was blocked: a participant declaring it could not adopt the phase it was
+  // delivered. The only unadoptable phase was a routing revision, and that
+  // barrier is retired; every phase a participant can now be delivered is one
+  // it repairs in place and acknowledges.
+  reserved 2;
+  reserved "blocked";
+  // 3 was blocked_parent_kernel_inos: the coordination inodes a parent-exclusive
+  // repair would have had to notify. That model is retired and no admitted
+  // profile can declare it.
+  reserved 3;
+  reserved "blocked_parent_kernel_inos";
   // Additive liveness-only feedback on a successful COMPLETE Ack. A macOS 26
-  // pipelined frontend sets it when peer repair refused at least one otherwise
-  // queueable ordered callback before that exact Ack. It never acknowledges a
-  // blocked phase and cannot exempt a mutation from ordinary eligibility.
+  // pipelined frontend sets it when peer repair refused at least one eligible
+  // later ordered callback before that exact Ack. It never acknowledges a
+  // terminal report and cannot exempt a mutation from ordinary eligibility.
   bool ordered_admission_contended = 4;
 }
 
+// Protocol 6 grants cache authority over four exact coordinate families. Name
+// coordinates use parent_identity+name; every other family uses identity. Data
+// coordinates are whole-file in v1.
+enum LeaseFamily {
+  LEASE_FAMILY_UNSPECIFIED = 0;
+  LEASE_FAMILY_NAME = 1;
+  LEASE_FAMILY_ATTRIBUTES = 2;
+  LEASE_FAMILY_DATA = 3;
+  LEASE_FAMILY_ENUMERATION = 4;
+}
+
+enum LeaseRight {
+  LEASE_RIGHT_UNSPECIFIED = 0;
+  LEASE_RIGHT_NAME_READ = 1;
+  LEASE_RIGHT_NAME_EXCLUSIVE = 2;
+  LEASE_RIGHT_ATTRIBUTES_READ = 3;
+  LEASE_RIGHT_ATTRIBUTES_EXCLUSIVE = 4;
+  LEASE_RIGHT_DATA_READ = 5;
+  LEASE_RIGHT_DATA_EXCLUSIVE = 6;
+  LEASE_RIGHT_ENUMERATION_READ = 7;
+}
+
+message LeaseCoordinate {
+  LeaseFamily family = 1;
+  bytes identity = 2;        // exactly 16 bytes for A/D/E
+  bytes parent_identity = 3; // exactly 16 bytes for N
+  bytes name = 4;            // one raw component for N
+}
+
+message LeaseGrant {
+  LeaseCoordinate coordinate = 1;
+  LeaseRight right = 2;
+  uint64 epoch = 3;
+  // The client anchors this conservative duration at request start using its
+  // monotonic clock. Transport delay only shortens validity; wall-clock skew is
+  // never part of the cache-safety proof.
+  uint64 valid_for_nanos = 4;
+  // Global lease-mutation cut at which the storage read and this grant were
+  // admitted. A frontend that has already processed a later recall rejects a
+  // delayed DATA response instead of installing authority from the past.
+  uint64 issued_sequence = 5;
+}
+
+enum LeaseEventPhase {
+  LEASE_EVENT_PHASE_UNSPECIFIED = 0;
+  // REVOKE closes the frontend's installing lane before authority apply.
+  LEASE_EVENT_PHASE_REVOKE = 1;
+  // COMPLETE carries exact post-state and is discharged after cache purge.
+  LEASE_EVENT_PHASE_COMPLETE = 2;
+}
+
+message LeaseEventCursor {
+  uint64 sequence = 1;
+  LeaseEventPhase phase = 2;
+}
+
+message LeaseRecall {
+  LeaseCoordinate coordinate = 1;
+  LeaseRight right = 2;
+  uint64 grant_epoch = 3;
+  uint64 revoke_epoch = 4;
+}
+
+message LeaseEvent {
+  LeaseEventCursor cursor = 1;
+  bytes initiator_session_id = 2; // exactly 16 bytes
+  repeated LeaseRecall recalls = 3;
+  PostState post_state = 4; // COMPLETE only
+  reserved 5;
+  reserved "routes";
+}
+
+message NextLeaseEventRequest {
+  LeaseEventCursor after = 1;
+}
+
+enum LeaseDischargeMode {
+  LEASE_DISCHARGE_MODE_UNSPECIFIED = 0;
+  LEASE_DISCHARGE_MODE_TO_NONE = 1;
+  // Reserved for a future range-capable D coordinate. Whole-file protocol-6
+  // v1 data leases cannot safely describe a retained-range successor.
+  LEASE_DISCHARGE_MODE_CONTINUITY = 2;
+}
+
+message LeaseDischarge {
+  LeaseCoordinate coordinate = 1;
+  uint64 revoke_epoch = 2;
+  LeaseDischargeMode mode = 3;
+  LeaseRight successor_right = 4;
+}
+
+message AcknowledgeLeaseEventRequest {
+  LeaseEventCursor cursor = 1;
+  // Empty for REVOKE. COMPLETE names every recalled lease exactly once.
+  repeated LeaseDischarge discharges = 2;
+}
+
+message AcknowledgeLeaseEventReply {}
+
+message LeaseRenewal {
+  LeaseCoordinate coordinate = 1;
+  uint64 epoch = 2;
+}
+
+message RenewLeasesRequest {
+  repeated LeaseRenewal leases = 1;
+}
+
+message RenewLeasesReply {
+  repeated LeaseGrant grants = 1;
+  // Exact requested tokens which expired or lost to a concurrent recall.
+  // Withdrawal is ordinary cache coherence and never terminalizes the mount.
+  repeated LeaseRenewal withdrawn = 2;
+}
+
+message SourceLeaseDischarge {
+  uint64 sequence = 1;
+  repeated LeaseRecall recalls = 2;
+}
+
+message AcknowledgeSourceLeaseDischargeRequest {
+  uint64 sequence = 1;
+}
+
+message AcknowledgeSourceLeaseDischargeReply {}
+
 message LookupRequest { bytes parent = 1; bytes name = 2; }
-message LookupReply { Item item = 1; }
+message LookupReply {
+  Item item = 1;
+  uint64 negative_snapshot_sequence = 2;
+}
 message GetAttrRequest { bytes item = 1; bytes handle = 2; }
-message GetAttrReply { Attr attr = 1; }
+message GetAttrReply {
+  Attr attr = 1;
+  uint64 object_version = 2;
+  uint64 snapshot_sequence = 3;
+}
 
 message SetAttrRequest {
   bytes item = 1;
@@ -526,6 +862,18 @@ message RenameRequest {
   bool no_replace = 5;
   bool exchange = 6;
 }
+// RenameReply carries the authoritative bindings produced by the completed
+// rename. A frontend cannot infer these from its local name cache: the moved
+// dentry may never have been published there, and RENAME_EXCHANGE moves two
+// different objects. The identities are emitted only after XFS reports
+// success, so the source publication gate can narrow its namespace wildcards
+// before the ordinary callback result is published.
+message RenameReply {
+  bytes new_post_identity = 1; // moved object, exactly 16 bytes
+  // The old name's post-binding. It is present for exchange and for the POSIX
+  // same-inode hard-link no-op; it is empty only when the old name is absent.
+  bytes old_post_identity = 2; // when present, exactly 16 bytes
+}
 message LinkRequest { bytes existing_item = 1; bytes new_parent = 2; bytes new_name = 3; }
 message LinkReply { Item item = 1; }
 message SymlinkRequest { bytes parent = 1; bytes name = 2; bytes target = 3; }
@@ -541,13 +889,153 @@ message CloseRequest {
 }
 message ReadRequest { bytes handle = 1; uint64 offset = 2; uint32 length = 3; }
 message ReadReply { bytes data = 1; }
+// WriteRequest is the stock FUSE_WRITE shape after kernel-side generic
+// write checks. The kernel has already bounded size and position; userspace
+// must not replay private RLIMIT/file-ceiling policy.
+//
+// Append placement is the one decision the kernel cannot make for a shared
+// volume: its i_size is only an advisory shadow of another machine's EOF. The
+// frontend therefore forwards the description's append intent and the authority
+// resolves it against the true EOF under the per-inode writer stripe. It never
+// reinterprets the kernel's offset: a write that states no append intent is
+// placed exactly where the kernel asked.
 message WriteRequest {
   bytes handle = 1;
-  uint64 offset = 2;
-  bytes data = 3;
-  bool append = 4; // distinct append intent; offset must be zero
+  uint64 position = 2;
+  reserved 3, 4, 8;
+  reserved "rlimit_fsize", "file_max_size", "flags";
+  uint64 lock_owner = 5;
+  uint32 size = 6;
+  uint32 write_flags = 7;
+  bytes data = 9; // transported out of line
+  // append requests authority-resolved placement at the object's true EOF. It
+  // carries the O_APPEND state of the writing file description, which stock
+  // FUSE_WRITE.flags reports. position must be zero; the resulting offset is
+  // returned as WriteReply.assigned_offset.
+  bool append = 10;
+  // The per-call durability intent of the writing file description. Linux keeps
+  // O_SYNC/O_DSYNC on the description and fcntl can change them, so they are a
+  // property of the call and are never inherited from the authority descriptor.
+  // sync is stronger than data_sync; both may not be set.
+  bool sync = 11;
+  bool data_sync = 12;
 }
-message WriteReply { uint32 count = 1; uint64 assigned_offset = 2; }
+
+// One stock write either reports the exact committed byte count, the offset the
+// authority assigned to the first committed byte, and the resulting attributes,
+// or a negative Linux errno in error.
+message WriteReply {
+  uint64 committed_size = 1;
+  Attr post_attr = 2;
+  int32 error = 3;
+  reserved 4, 5, 6;
+  reserved "visibility_sequence", "flags";
+  // assigned_offset is the offset of the first committed byte. It equals the
+  // requested position for a positioned write and the EOF the authority
+  // observed under the writer stripe for an append.
+  uint64 assigned_offset = 7;
+}
+
+// FSKit can deliver one logical write in multiple transport frames. BEGIN and
+// DATA only fill bounded session-owned staging state; COMMIT is the sole
+// replayed filesystem mutation and ABORT only retires unapplied staging.
+enum FskitWritePhase {
+  FSKIT_WRITE_PHASE_UNSPECIFIED = 0;
+  FSKIT_WRITE_PHASE_BEGIN = 1;
+  FSKIT_WRITE_PHASE_DATA = 2;
+  FSKIT_WRITE_PHASE_COMMIT = 3;
+  FSKIT_WRITE_PHASE_ABORT = 4;
+}
+
+message FskitWriteRequest {
+  uint64 transaction_id = 1;
+  bytes handle = 2;
+  uint64 requested_size = 3;
+  uint64 fragment_offset = 4;
+  uint64 rlimit_fsize = 5;
+  uint64 lock_owner = 6;
+  uint32 size = 7;
+  uint32 write_flags = 8;
+  uint32 flags = 9;
+  FskitWritePhase phase = 10;
+  bytes data = 11; // DATA only; transported out of line
+  uint64 position = 12;
+  uint64 file_max_size = 13;
+}
+
+message FskitWriteReply {
+  uint64 transaction_id = 1;
+  uint64 committed_size = 2;
+  uint64 assigned_offset = 3;
+  uint64 post_size = 4;
+  uint64 visibility_sequence = 5;
+  uint32 flags = 6;
+  int32 error = 7;
+}
+
+// FallocateRequest is the stock FUSE_FALLOCATE shape after VFS has run
+// inode_newsize_ok and file_modified. mode is the closed Linux fallocate
+// bitset; the authority does not replay kernel limit policy.
+message FallocateRequest {
+  bytes handle = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+  reserved 4, 5, 7;
+  reserved "rlimit_fsize", "file_max_size", "write_flags";
+  uint32 mode = 6;
+}
+
+// CopyFileRangeRequest is legal only for SHARED source and destination
+// handles. The authority independently resolves both stable identities and
+// takes source DATA+ATTR plus destination DATA+ATTR ordering cuts before it
+// reads any source byte. flags is reserved to the exact value zero.
+message CopyFileRangeRequest {
+  bytes input_handle = 1;
+  uint64 input_offset = 2;
+  bytes output_handle = 3;
+  uint64 output_offset = 4;
+  uint64 length = 5;
+  reserved 6, 7, 8;
+  reserved "rlimit_fsize", "file_max_size", "write_flags";
+  uint32 flags = 9;
+}
+
+// These reply messages intentionally mirror the common private FUSE result:
+// APPLIED=1, REJECTED=2, POSTAPPLY_ERROR=4, REJECTED_RLIMIT=8, NOOP=16.
+// APPLIED results carry a positive visibility sequence and are followed by a
+// generic kernel publication receipt. In particular, XFS fallocate-family
+// operations may commit internal transactions before their syscall returns an
+// error, so a post-dispatch error is APPLIED|POSTAPPLY_ERROR with exact post
+// state. Structured rejection is reserved for pre-dispatch validation/limit
+// failures; rejection/no-op results prove no XFS/local mutation and carry no
+// receipt.
+message FallocateReply {
+  uint64 result_size = 1; // always zero for a valid fallocate result
+  uint64 post_size = 2;
+  uint64 visibility_sequence = 3;
+  uint32 flags = 4;
+  int32 error = 5;
+}
+
+message CopyFileRangeReply {
+  uint64 result_size = 1; // positive applied prefix; zero only for NOOP/reject
+  uint64 post_size = 2;
+  uint64 visibility_sequence = 3;
+  uint32 flags = 4;
+  int32 error = 5;
+}
+
+message TmpfileRequest {
+  bytes parent = 1;
+  uint32 mode = 2;
+  OpenFlags flags = 3;
+  // Mirrors O_EXCL on O_TMPFILE: true creates a deliberately non-linkable
+  // inode, false permits a later linkat(AT_EMPTY_PATH) through the retained
+  // authority description.
+  bool exclusive = 4;
+}
+message TmpfileReply { Item item = 1; bytes handle = 2; }
+
 message FsyncRequest { bytes handle = 1; bool data_only = 2; }
 message FlushRequest { bytes handle = 1; uint64 lock_owner = 2; }
 
@@ -565,6 +1053,8 @@ message Dirent {
   Attr attr = 2;
   bytes next_cookie = 3;
   Item item = 4; // present for every entry exactly when want_items is true
+  uint64 object_version = 5;
+  uint64 snapshot_sequence = 6;
 }
 message ReadDirReply { repeated Dirent entries = 1; bytes verifier = 2; bool eof = 3; }
 message ReclaimRequest { bytes item = 1; }

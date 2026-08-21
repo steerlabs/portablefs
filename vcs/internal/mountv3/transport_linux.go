@@ -12,18 +12,14 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 )
 
-// Profile maps a coherence profile name to the two forms a mount needs: the
-// frontend's kernel-cache contract and the wire declaration the authority
-// sizes its barrier from. They travel together so a frontend can never mount
-// with one profile while having attached with the other.
-func Profile(name string) (fusev3.CoherenceProfile, authoritypb.CoherenceProfile, error) {
+// Profile validates the retained CLI spelling for protocol 6's one exact
+// frontend cache contract. The profile is no longer negotiated on the wire.
+func Profile(name string) (fusev3.CoherenceProfile, error) {
 	switch name {
 	case "strict":
-		return fusev3.CoherenceStrict, authoritypb.CoherenceProfile_COHERENCE_PROFILE_STRICT, nil
-	case "uncached":
-		return fusev3.CoherenceUncached, authoritypb.CoherenceProfile_COHERENCE_PROFILE_UNCACHED, nil
+		return fusev3.CoherenceStrict, nil
 	default:
-		return 0, 0, fmt.Errorf("coherence must be strict or uncached, not %q", name)
+		return 0, fmt.Errorf("coherence must be strict, not %q", name)
 	}
 }
 
@@ -36,25 +32,14 @@ type Transport struct {
 	session []byte
 }
 
-// sessionIdentified is the accessor a strict mount cannot do without. The
-// authority's visibility events name their initiator by session ID, and a
-// frontend that cannot tell whether an event is its own must either repair its
-// own in-flight mutation -- which deadlocks against the VFS lock that syscall
-// holds -- or skip repairs it owes. Neither is acceptable, so a strict mount is
-// refused outright when the transport cannot supply it.
-type sessionIdentified interface{ SessionID() []byte }
-
 // NewTransport wraps an attached authority client for fusev3.MountVolume.
-// profile must be the profile the client attached with.
-func NewTransport(client *authorityrpc.Client, profile fusev3.CoherenceProfile) (*Transport, error) {
-	transport := &Transport{Client: client}
-	if identified, ok := any(client).(sessionIdentified); ok {
-		transport.session = identified.SessionID()
-	}
-	if profile == fusev3.CoherenceStrict && len(transport.session) == 0 {
-		return nil, errors.New("strict coherence needs authorityrpc.Client to expose the attach reply's session ID (SessionID() []byte); mount with coherence=uncached until it does")
-	}
-	return transport, nil
+// authorityrpc.Client is concrete and DialClient validates the ACTIVE reply's
+// session ID before returning it, so there is no fallible adapter boundary
+// between an admitted session and MountVolume. Keeping a runtime interface
+// assertion here used to create a nominal post-ACTIVE/pre-kernel failure path
+// which could not occur for this type but still complicated exact cleanup.
+func NewTransport(client *authorityrpc.Client) *Transport {
+	return &Transport{Client: client, session: client.SessionID()}
 }
 
 func (t *Transport) SessionID() []byte { return t.session }

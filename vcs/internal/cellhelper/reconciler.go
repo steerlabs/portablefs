@@ -39,31 +39,32 @@ type HostUpdate struct {
 }
 
 type Assignment struct {
-	VolumeID            string                                 `json:"volume_id"`
-	AuthorizationDomain string                                 `json:"authorization_domain"`
-	Owner               string                                 `json:"owner"`
-	ProductIssuer       string                                 `json:"product_issuer"`
-	ProductPublicKeyPEM string                                 `json:"product_public_key_pem"`
-	CellID              string                                 `json:"cell_id"`
-	PlacementSequence   uint64                                 `json:"placement_sequence"`
-	ProjectID           uint32                                 `json:"project_id"`
-	ServiceUID          uint32                                 `json:"service_uid"`
-	ServiceGID          uint32                                 `json:"service_gid"`
-	ListenPort          uint16                                 `json:"listen_port"`
-	QuotaBytes          uint64                                 `json:"quota_bytes"`
-	QuotaInodes         uint64                                 `json:"quota_inodes"`
-	AppliedQuotaBytes   uint64                                 `json:"applied_quota_bytes"`
-	AppliedQuotaInodes  uint64                                 `json:"applied_quota_inodes"`
-	AuthorityID         string                                 `json:"authority_id"`
-	AuthorityServerName string                                 `json:"authority_server_name"`
-	AuthorityGeneration uint64                                 `json:"authority_generation"`
-	LastPhase           cellplan.VolumePhase                   `json:"last_phase"`
-	AuthorityAbsent     bool                                   `json:"authority_absent"`
-	ArchiveSealed       *controlplane.ArchiveSealedObservation `json:"archive_sealed,omitempty"`
-	DestroyProof        *DestroyProof                          `json:"destroy_proof,omitempty"`
-	LastQuiesceNonce    string                                 `json:"last_quiesce_nonce,omitempty"`
-	Applied             bool                                   `json:"applied"`
-	AppliedPlanHash     string                                 `json:"applied_plan_sha256,omitempty"`
+	VolumeID             string                                 `json:"volume_id"`
+	AuthorizationDomain  string                                 `json:"authorization_domain"`
+	Owner                string                                 `json:"owner"`
+	ProductIssuer        string                                 `json:"product_issuer"`
+	ProductPublicKeyPEM  string                                 `json:"product_public_key_pem"`
+	CellID               string                                 `json:"cell_id"`
+	PlacementSequence    uint64                                 `json:"placement_sequence"`
+	ProjectID            uint32                                 `json:"project_id"`
+	ServiceUID           uint32                                 `json:"service_uid"`
+	ServiceGID           uint32                                 `json:"service_gid"`
+	ListenPort           uint16                                 `json:"listen_port"`
+	QuotaBytes           uint64                                 `json:"quota_bytes"`
+	QuotaInodes          uint64                                 `json:"quota_inodes"`
+	AppliedQuotaBytes    uint64                                 `json:"applied_quota_bytes"`
+	AppliedQuotaInodes   uint64                                 `json:"applied_quota_inodes"`
+	AuthorityID          string                                 `json:"authority_id"`
+	AuthorityServerName  string                                 `json:"authority_server_name"`
+	AuthorityGeneration  uint64                                 `json:"authority_generation"`
+	LastPhase            cellplan.VolumePhase                   `json:"last_phase"`
+	AuthorityAbsent      bool                                   `json:"authority_absent"`
+	ArchiveSealed        *controlplane.ArchiveSealedObservation `json:"archive_sealed,omitempty"`
+	DestroyProof         *DestroyProof                          `json:"destroy_proof,omitempty"`
+	LastQuiesceNonce     string                                 `json:"last_quiesce_nonce,omitempty"`
+	Applied              bool                                   `json:"applied"`
+	AppliedPlanHash      string                                 `json:"applied_plan_sha256,omitempty"`
+	AppliedHelperRelease string                                 `json:"applied_helper_release,omitempty"`
 }
 
 // DestroyProof retains both the canonical postcondition record and its hash.
@@ -192,7 +193,7 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 			observed = controlplane.VolumeObservation{AuthorityAbsent: true, DestroyProofSHA256: previous.DestroyProof.SHA256}
 		default:
 			effective := effectiveVolumePlan(plan, volume)
-			if previous.Applied && previous.AppliedPlanHash == volumeDigestHex {
+			if previous.Applied && previous.AppliedPlanHash == volumeDigestHex && previous.AppliedHelperRelease == reconciler.ReleaseID {
 				observed, update = reconciler.Host.Observe(ctx, effective, previous)
 			} else {
 				observed, update = reconciler.Host.Apply(ctx, effective, previous)
@@ -200,6 +201,10 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 		}
 		setObservationIdentity(&observed, volume)
 		assignment := assignmentAfterObservation(previous, volume, reconciler.CellID, plan.Version, observed, update, volumeDigestHex)
+		assignment.AppliedHelperRelease = ""
+		if assignment.Applied {
+			assignment.AppliedHelperRelease = reconciler.ReleaseID
+		}
 		state.Assignments[volume.VolumeID] = assignment
 		observation.Volumes = append(observation.Volumes, observed)
 	}

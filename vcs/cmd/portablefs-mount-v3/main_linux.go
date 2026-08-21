@@ -37,7 +37,7 @@ func run() error {
 		authority          = flag.String("authority", "", "authority host:port")
 		volumeID           = flag.String("volume-id", "", "exact volume identity")
 		mountpoint         = flag.String("mountpoint", "", "existing empty mount directory")
-		accessTokenFile    = flag.String("access-token-file", "", "file containing a short-lived volume capability")
+		accessTokenFile    = flag.String("access-token-file", "", "file containing a short-lived volume capability; re-read for reauthorization whenever its issuer rotates it in place")
 		clientCert         = flag.String("tls-cert", "", "client TLS certificate PEM")
 		clientKey          = flag.String("tls-key", "", "client TLS private key PEM")
 		serverCA           = flag.String("tls-server-ca", "", "authority CA certificate PEM")
@@ -50,9 +50,9 @@ func run() error {
 		dialTimeout        = flag.Duration("dial-timeout", mountv3.DialTimeout, "authority dial and TLS timeout")
 		cancelDrainTimeout = flag.Duration("cancel-drain-timeout", mountv3.CancelDrainTimeout, "time to obtain an exact result after interrupting an in-flight request")
 		requestTimeout     = flag.Duration("request-timeout", mountv3.RequestTimeout, "non-blocking filesystem operation timeout")
-		coherence          = flag.String("coherence", "strict", "kernel cache contract: strict (cache names and attributes, join the authority visibility barrier) or uncached (cache nothing)")
-		cachedNames        = flag.Int("cached-name-capacity", mountv3.CachedNameCapacity, "directory bindings a strict mount may leave resident in its kernel")
-		repairBudget       = flag.Duration("repair-budget", mountv3.RepairBudget, "per-phase deadline a strict mount commits to before revoking itself")
+		coherence          = flag.String("coherence", "strict", "kernel cache contract: strict (the only protocol-6 profile)")
+		cachedNames        = flag.Int("cached-name-capacity", mountv3.CachedNameCapacity, "local daemon name-lease cache bound")
+		repairBudget       = flag.Duration("repair-budget", mountv3.RepairBudget, "local lease-recall and withdrawal deadline")
 		localBacking       = flag.String("local-backing", "", "per-machine directory holding the volume's machine-local route subtrees")
 		noLocalDirs        = flag.Bool("no-local-dirs", false, "refuse to mount a volume that declares machine-local routes in "+fusev3.LocalDirsPath)
 	)
@@ -106,38 +106,30 @@ func run() error {
 	if len(token) == 0 {
 		return errors.New("access token file is empty")
 	}
-	profile, protocolProfile, err := mountv3.Profile(*coherence)
+	profile, err := mountv3.Profile(*coherence)
 	if err != nil {
 		return err
 	}
-	if profile == fusev3.CoherenceStrict && (*cachedNames <= 0 || *repairBudget <= 0) {
-		return errors.New("strict coherence requires a positive cached-name capacity and repair budget; both are declared to the authority")
+	if *cachedNames <= 0 || *repairBudget <= 0 {
+		return errors.New("strict coherence requires a positive local cached-name capacity and repair budget")
 	}
 	mountInstanceID, err := mountid.NewMountInstance()
 	if err != nil {
 		return fmt.Errorf("create unique mount identity: %w", err)
 	}
+	preKernelAbsence, err := mountv3.PreKernelMountAbsenceObserver(absoluteMount, mountInstanceID)
+	if err != nil {
+		return fmt.Errorf("bind pre-kernel mount-absence observer: %w", err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	attach := authorityrpc.ClientConfig{
-		Address: *authority, TLS: tlsConfig, VolumeID: *volumeID,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		Address:         *authority, TLS: tlsConfig, VolumeID: *volumeID,
 		AccessToken: token, ReplaySlots: uint32(*replaySlots),
 		MaxFrame: uint32(*maxFrame), DialTimeout: *dialTimeout, CancelDrainTimeout: *cancelDrainTimeout, MaxInFlight: *maxInFlight,
-		// The two numbers a strict mount declares are the two the authority
-		// needs to size the barrier: how much cached state this frontend can be
-		// holding, and how long it may take to withdraw it.
-		CoherenceProfile: protocolProfile, CachedNameCapacity: uint64(*cachedNames), RepairBudget: *repairBudget,
-	}
-	// How this frontend's kernel makes a cached binding unservable. It is
-	// declared rather than inferred because the authority cannot observe a
-	// remote kernel, and on Linux FUSE the answer is load-bearing: making a
-	// binding unservable takes the parent directory's i_rwsem for write, which
-	// is the same lock a namespace syscall holds across the whole authority
-	// round trip. Saying so is what lets the authority tell a provably closed
-	// repair cycle apart from an ordinary slow lock, and fence one participant
-	// immediately instead of stalling the volume for a whole repair budget.
-	if profile == fusev3.CoherenceStrict {
-		attach.NamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_PARENT_EXCLUSIVE
+		ObservePreKernelMountAbsence: preKernelAbsence,
 	}
 	if len(localDirs) != 0 {
 		return fmt.Errorf("machine-local routes are declared volume-wide in %s; -local-dir would add a route only this machine knows about, which desynchronizes the routing topology the authority pins every mount to", fusev3.LocalDirsPath)
@@ -155,15 +147,11 @@ func run() error {
 		return err
 	}
 	if !routes.Empty() && *localBacking == "" {
-		_ = client.Close()
-		return fmt.Errorf("this volume declares machine-local routes in %s (%s); -local-backing must name the per-machine directory that serves them",
+		cause := fmt.Errorf("this volume declares machine-local routes in %s (%s); -local-backing must name the per-machine directory that serves them",
 			fusev3.LocalDirsPath, strings.Join(routes.Patterns(), " "))
+		return releaseClientBeforeKernelMount(client, *cancelDrainTimeout, cause)
 	}
-	transport, err := mountv3.NewTransport(client, profile)
-	if err != nil {
-		_ = client.Close()
-		return err
-	}
+	transport := mountv3.NewTransport(client)
 	mount, err := fusev3.MountVolume(context.Background(), absoluteMount, transport, fusev3.Config{
 		MountInstanceID: mountInstanceID, RequestTimeout: *requestTimeout,
 		MaxBackground: *maxBackground, MaxInFlight: *maxInFlight, ReclaimQueue: *reclaimQueue,
@@ -175,14 +163,35 @@ func run() error {
 		return err
 	}
 	log.Printf("PortableFS v3 volume %s mounted at %s (%s coherence)", *volumeID, absoluteMount, profile)
+	// The capability this mount attached with is short lived, and ordinary lease
+	// renewal never extends a signed authorization deadline. Renewal re-reads the
+	// same file, so a credential manager that rotates it in place keeps the mount
+	// alive and one that does not still fails closed.
 	done := make(chan struct{})
 	go func() { mount.Wait(); close(done) }()
+	renewal, err := startCredentialRenewal(client, *accessTokenFile, token)
+	if err != nil {
+		return errors.Join(err, shutdown(mount, done, absoluteMount))
+	}
+	defer renewal.Close()
 	select {
 	case <-done:
 		return mount.Close()
+	case err := <-renewal.failed:
+		// The mount still holds a valid authorization for the safety margin the
+		// renewer reserved. Withdrawing it now is the difference between an
+		// orderly unmount and every open file failing when the deadline passes.
+		log.Printf("automatic reauthorization failed closed: %v; unmounting %s", err, absoluteMount)
+		return errors.Join(err, shutdown(mount, done, absoluteMount))
 	case <-ctx.Done():
 		return shutdown(mount, done, absoluteMount)
 	}
+}
+
+func releaseClientBeforeKernelMount(client *authorityrpc.Client, timeout time.Duration, cause error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return errors.Join(cause, client.ReleaseBeforeMount(ctx))
 }
 
 // shutdown removes the kernel mount before this process exits.

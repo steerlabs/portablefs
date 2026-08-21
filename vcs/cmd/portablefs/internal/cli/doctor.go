@@ -286,7 +286,7 @@ func (r *doctorRun) checkDaemon() doctorResult {
 // thing to report is the attach's own state and the verdict that produced it.
 func (r *doctorRun) checkAttaches() doctorResult {
 	if r.goos != "darwin" {
-		return doctorSkip("attach status is read from portablefsd (macOS-only)")
+		return r.checkFUSESessions()
 	}
 	cfg, err := fskitConfigFromEnv(r.e.getenv)
 	if err != nil {
@@ -328,6 +328,63 @@ func (r *doctorRun) checkAttaches() doctorResult {
 	return res
 }
 
+// checkFUSESessions is the Linux answer to the same question the macOS attach
+// check asks: what does each mount's authority session look like right now?
+//
+// Linux has no daemon holding an attach table — a FUSE mount's session lives in
+// its own supervisor process — so the equivalent inventory is the one that
+// supervisor persists. That makes this check exactly as cheap as reading the
+// mount records, and it surfaces the one condition the platform previously had
+// no way to report at all: a mount that self-revoked. A revoked mount whose
+// withdrawal failed is still installed in the namespace and still owned by a
+// running process, so nothing else in doctor would call it a problem.
+func (r *doctorRun) checkFUSESessions() doctorResult {
+	stateDir, err := r.e.mountStateDir()
+	if err != nil {
+		return doctorFail(err.Error(), "ensure the current OS account has a real, uid-owned home directory")
+	}
+	states, err := listMountStates(stateDir)
+	if err != nil {
+		return doctorFail(fmt.Sprintf("cannot read mount state under %s: %v", stateDir, err),
+			"repair or explicitly reconcile the private mount-state inventory")
+	}
+	var lines []string
+	revoked := 0
+	sessions := 0
+	for i := range states {
+		st := &states[i]
+		if st.Strategy != "fuse" {
+			continue
+		}
+		sessions++
+		line := fmt.Sprintf("%s  %s  %s", st.MountPath, st.VolumeID, r.e.classifyMount(st))
+		if st.Status == mountStatusRevoked {
+			revoked++
+			line += "  (" + st.StatusReason
+			if st.StatusDetail != "" {
+				line += ": " + st.StatusDetail
+			}
+			line += ")"
+		}
+		lines = append(lines, line)
+	}
+	if sessions == 0 {
+		return doctorSkip("no FUSE mounts recorded on this machine")
+	}
+	if revoked > 0 {
+		res := doctorFail(
+			fmt.Sprintf("%d of %d FUSE session(s) revoked", revoked, sessions),
+			"a revoked mount refuses to serve and cannot be repaired: run `portablefs umount` on it and "+
+				"mount again; if its kernel mount could not be withdrawn the authority's strict membership "+
+				"for that session must also be discharged explicitly")
+		res.Lines = lines
+		return res
+	}
+	res := doctorPass(fmt.Sprintf("%d FUSE session(s), none revoked", sessions))
+	res.Lines = lines
+	return res
+}
+
 func (r *doctorRun) checkMounts() doctorResult {
 	stateDir, err := r.e.mountStateDir()
 	if err != nil {
@@ -341,18 +398,24 @@ func (r *doctorRun) checkMounts() doctorResult {
 		return doctorPass("no mounts recorded on this machine")
 	}
 	var lines []string
-	var stale, expired []string
+	var stale, expired, revoked []string
 	for _, st := range states {
 		health := r.e.classifyMount(&st)
-		lines = append(lines, fmt.Sprintf("%s  %s@%s  %s  %s", st.MountPath, st.VolumeID, st.Branch, st.Strategy, health))
+		line := fmt.Sprintf("%s  %s@%s  %s  %s", st.MountPath, st.VolumeID, st.Branch, st.Strategy, health)
+		if health == mountStatusRevoked && st.StatusReason != "" {
+			line += "  (" + st.StatusReason + ")"
+		}
+		lines = append(lines, line)
 		switch health {
 		case "stale":
 			stale = append(stale, st.MountPath)
 		case mountStatusCredentialExpired:
 			expired = append(expired, st.MountPath)
+		case mountStatusRevoked:
+			revoked = append(revoked, st.MountPath)
 		}
 	}
-	if len(stale) == 0 && len(expired) == 0 {
+	if len(stale) == 0 && len(expired) == 0 && len(revoked) == 0 {
 		res := doctorPass(fmt.Sprintf("%d mount(s), all live", len(states)))
 		res.Lines = lines
 		return res
@@ -361,6 +424,12 @@ func (r *doctorRun) checkMounts() doctorResult {
 	if len(stale) > 0 {
 		problems = append(problems, fmt.Sprintf("%d stale", len(stale)))
 		remedies = append(remedies, fmt.Sprintf("clean up stale mounts with `portablefs umount %s`", stale[0]))
+	}
+	if len(revoked) > 0 {
+		problems = append(problems, fmt.Sprintf("%d revoked", len(revoked)))
+		remedies = append(remedies, fmt.Sprintf(
+			"a revoked mount refuses to serve and cannot be repaired: run `portablefs umount %s` and mount again",
+			revoked[0]))
 	}
 	if len(expired) > 0 {
 		problems = append(problems, fmt.Sprintf("%d credential-expired", len(expired)))

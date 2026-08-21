@@ -25,7 +25,7 @@ set -euo pipefail
 
 # Digest-pinned like every other third-party image in this repository, and the
 # same image the privileged XFS/FUSE integration job uses.
-: "${PORTABLEFS_CI_IMAGE:=golang@sha256:1ecb7edf62a0408027bd5729dfd6b1b8766e578e8df93995b225dfd0944eb651}"
+: "${PORTABLEFS_CI_IMAGE:=golang@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36}"
 : "${PORTABLEFS_XFS_IMAGE_SIZE:=1G}"
 : "${PORTABLEFS_SERVICE_UID:=200001}"
 : "${PORTABLEFS_SERVICE_GID:=200001}"
@@ -37,26 +37,11 @@ set -euo pipefail
 : "${PORTABLEFS_VOLUME_NAME:=coherence-volume}"
 : "${PORTABLEFS_AUTHORITY_PORT:=17443}"
 : "${PORTABLEFS_ATOMIC_REPLACE_ROUNDS:=20}"
-# The kernel-cache contract the mount declares: strict (names and attributes
-# cached, joined to the authority's two-phase visibility barrier) or uncached
-# (nothing cached). Both are supposed to give the same POSIX answers, so this
-# matrix is the right instrument for either.
-#
-# The default is strict, matching portablefs-mount-v3's own default. An earlier
-# revision of this script defaulted to uncached and explained that strict could
-# not mount at all, because authorityrpc.Client did not expose the attach reply's
-# session ID. It does now (Client.SessionID), the strict frontend is implemented
-# in vcs/internal/fusev3/coherence_linux.go, and the matrix measures the cached
-# path by default. Set PORTABLEFS_COHERENCE=uncached to measure the other
-# supported profile with the same case list; both must give the same answers.
-: "${PORTABLEFS_COHERENCE:=strict}"
-# A strict mount declares a kernel-cache bound and a repair deadline, and the
-# authority refuses any commitment larger than its own maxima. The shipped
-# defaults agree (mount -repair-budget 15s under authority --max-repair-budget
-# 30s; both cached-name capacities 1<<16), so these are stated here only to pin
-# the harness's numbers explicitly: if the two commands' defaults ever diverge
-# again, the attach fails loudly with EOPNOTSUPP and this harness must report
-# that defect rather than paper over it with its own values.
+# This black-box harness proves only the syscall behavior its cases observe. It
+# does not inspect or prove protocol-6 lease grants, recalls, or discharge. The
+# legacy-named bounds remain explicit while their command-line admission surface
+# is retired; if mount and authority disagree, Attach must fail rather than let
+# the harness paper over it. Dedicated v6 tests must cover the mechanism.
 : "${PORTABLEFS_CACHED_NAME_CAPACITY:=65536}"
 : "${PORTABLEFS_REPAIR_BUDGET:=15s}"
 # The driver's per-case wall bound. It is deliberately larger than
@@ -92,14 +77,17 @@ FALSIFIABLE_CASES=(
   remote_chmod_visible
   # remote_chown_visible is deliberately absent: the v3 volume model is
   # single-principal, the volume refuses the ownership change itself, and the
-  # case skips with that reason on every profile. A case that cannot run cannot
+  # case skips with that reason on every mount. A case that cannot run cannot
   # demonstrate that it detects a stale view either.
   remote_utimes_visible
   remote_truncate_grow_readable_eof
   remote_truncate_shrink_readable_eof
   dir_listing_reflects_remote_creates_and_deletes
   concurrent_writers_distinct_files
-  concurrent_same_file_append_atomicity
+  # Protocol 6 refuses writable O_APPEND because stock FUSE cannot preserve
+  # append intent or return an authority-assigned offset. The real matrix
+  # declares that case FAIL; a case which is intentionally unavailable cannot
+  # also serve as evidence that the stale-view control detects a bug.
   concurrent_same_file_overwrite_integrity
   hardlink_visible_same_inode
   symlink_visible_and_resolves
@@ -147,7 +135,6 @@ run_host() {
     -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
     -e "PORTABLEFS_AUTHORITY_PORT=${PORTABLEFS_AUTHORITY_PORT}" \
     -e "PORTABLEFS_ATOMIC_REPLACE_ROUNDS=${PORTABLEFS_ATOMIC_REPLACE_ROUNDS}" \
-    -e "PORTABLEFS_COHERENCE=${PORTABLEFS_COHERENCE}" \
     -e "PORTABLEFS_CACHED_NAME_CAPACITY=${PORTABLEFS_CACHED_NAME_CAPACITY}" \
     -e "PORTABLEFS_REPAIR_BUDGET=${PORTABLEFS_REPAIR_BUDGET}" \
     -e "PORTABLEFS_CASE_TIMEOUT=${PORTABLEFS_CASE_TIMEOUT}" \
@@ -165,6 +152,17 @@ install_container_dependencies() {
   # unprivileged mount process needs. util-linux: findmnt. procps: pkill, used
   # to kill exactly one mount process uncleanly.
   apt-get install -y -qq --no-install-recommends xfsprogs fuse3 util-linux procps >/dev/null
+}
+
+# The FUSE control filesystem is the kernel interface a strict mount's
+# revocation ladder uses to abort its own serving connection. A production host
+# has it mounted; a container does not inherit it, and a mount that cannot abort
+# cannot release the requests parked in its kernel.
+provision_fuse_control() {
+  [[ -d /sys/fs/fuse/connections ]] || fail "/sys/fs/fuse/connections is missing; this kernel has no FUSE control interface" 69
+  mountpoint -q /sys/fs/fuse/connections ||
+    mount -t fusectl none /sys/fs/fuse/connections ||
+    fail "cannot mount the FUSE control filesystem; connection aborts would be unavailable" 69
 }
 
 provision_xfs() {
@@ -190,7 +188,8 @@ create_service_identity() {
   install -d -m 0700 -o "$PORTABLEFS_SERVICE_UID" -g "$PORTABLEFS_SERVICE_GID" \
     /home/portablefs /home/portablefs/gocache /home/portablefs/gomodcache \
     /home/portablefs/tmp /home/portablefs/bin /home/portablefs/creds \
-    /home/portablefs/mount-a /home/portablefs/mount-b /home/portablefs/logs
+    /home/portablefs/mount-a /home/portablefs/mount-b /home/portablefs/logs \
+    /home/portablefs/write-staging
 }
 
 # as_service runs a command as the unprivileged volume identity with a clean
@@ -219,7 +218,24 @@ build_binaries() {
 
 start_authority() {
   local volume=/srv/portablefs/$PORTABLEFS_VOLUME_NAME
-  local membership=/srv/portablefs/.portablefs-control/$PORTABLEFS_VOLUME_NAME/strict-membership
+  local control=/srv/portablefs/.portablefs-control/$PORTABLEFS_VOLUME_NAME
+  local membership=$control/strict-membership
+  local write_staging_source=$control/write-staging
+  local write_staging=/home/portablefs/write-staging
+  # Production gives the authority a private staging root through systemd's
+  # BindPaths boundary.  Do the same here: the cell's root-owned 0711 control
+  # directory is deliberately traversable-but-not-readable by the volume uid,
+  # while privatepath.OpenExistingDir deliberately opens every component and
+  # therefore must see only the service-owned 0700 presentation.  Both names
+  # resolve to the same project-inheriting XFS inode, so quota accounting cannot
+  # diverge from the visible volume.
+  mount --bind "$write_staging_source" "$write_staging"
+  WRITE_STAGING_BIND=$write_staging
+  [[ $(stat -c '%u:%g:%a' -- "$write_staging") == \
+      "$PORTABLEFS_SERVICE_UID:$PORTABLEFS_SERVICE_GID:700" ]] ||
+    fail "bound write staging is not the exact service-owned 0700 directory" 70
+  [[ $(findmnt -n -r -o TARGET --target "$write_staging") == "$write_staging" ]] ||
+    fail "write staging bind mount is not installed at $write_staging" 70
   as_service /home/portablefs/bin/pfs-coherence-credentials \
     --dir /home/portablefs/creds --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 ||
     fail "minting the credential set failed" 70
@@ -233,6 +249,7 @@ start_authority() {
     --client-ca /home/portablefs/creds/ca.pem \
     --capability-public-key /home/portablefs/creds/capability-public.pem \
     --visibility-membership-file "$membership" \
+    --write-staging-dir "$write_staging" \
     --max-cached-name-capacity "$PORTABLEFS_CACHED_NAME_CAPACITY" \
     --max-repair-budget "$PORTABLEFS_REPAIR_BUDGET" \
     >/home/portablefs/logs/authority.log 2>&1 &
@@ -326,7 +343,7 @@ start_mount() {
     --tls-server-ca /home/portablefs/creds/ca.pem \
     --tls-server-name authority.portablefs.test \
     --max-frame-bytes 16777216 \
-    --coherence "$PORTABLEFS_COHERENCE" \
+    --coherence strict \
     --cached-name-capacity "$PORTABLEFS_CACHED_NAME_CAPACITY" \
     --repair-budget "$PORTABLEFS_REPAIR_BUDGET" \
     --local-backing "$backing" \
@@ -360,6 +377,9 @@ teardown() {
   [[ -n ${MOUNT_B_PID:-} ]] && kill "$MOUNT_B_PID" 2>/dev/null
   [[ -n ${AUTHORITY_PID:-} ]] && kill "$AUTHORITY_PID" 2>/dev/null
   wait 2>/dev/null
+  if [[ -n ${WRITE_STAGING_BIND:-} ]]; then
+    umount "$WRITE_STAGING_BIND" 2>/dev/null || true
+  fi
   echo "==== route declaration apply log ===="
   cat /home/portablefs/logs/apply-routes.log 2>/dev/null
   echo "==== authority log ===="
@@ -419,7 +439,7 @@ run_disjoint_control() {
       # through a client that touches no mountpoint, so pointing the second root
       # at an unrelated directory cannot turn it red. It is expected to PASS
       # here, which is why it is simply not declared.
-      routes_revision_mismatch) continue ;;
+      routes_revision_mismatch|concurrent_same_file_append_atomicity) continue ;;
     esac
     arguments+=(--expect "${entry}=FAIL:a mount that shares no namespace with the other must fail this case")
   done
@@ -428,7 +448,7 @@ run_disjoint_control() {
   # consumes one single-use capability. Exclude it here so the final matrix is
   # the one phase that owns and spends that credential.
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
-    cut -f1 | grep -vx routes_revision_mismatch | paste -sd, -)
+    cut -f1 | grep -Ev '^(routes_revision_mismatch|concurrent_same_file_append_atomicity)$' | paste -sd, -)
   echo
   echo "======================================================================"
   echo "PHASE 1/3  disjoint-namespace control (second root is not the volume)"
@@ -462,7 +482,7 @@ run_falsifiability_control() {
     arguments+=(--expect "${name}=FAIL:a replayed first-success pathname observation must be detected by this case")
   done
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
-    cut -f1 | grep -vx routes_revision_mismatch | paste -sd, -)
+    cut -f1 | grep -Ev '^(routes_revision_mismatch|concurrent_same_file_append_atomicity)$' | paste -sd, -)
   echo
   echo "======================================================================"
   echo "PHASE 2/3  first-success stale-view control (deliberately broken pathname observations)"
@@ -478,7 +498,7 @@ run_falsifiability_control() {
     --routes-contract-command "$ROUTES_CONTRACT_COMMAND" \
     --label "falsifiability control: mount-A replays first-success pathname observations" \
     --expect "peer_loss_does_not_break_surviving_mount=SKIP:the control must not destroy a mount it still needs" \
-    --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal, so there is no observable ownership change on any profile" \
+    --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal, so there is no observable ownership change on this mount" \
     "${arguments[@]}" \
     --json /home/portablefs/logs/control.json ||
     fail "the falsifiability control did not behave as declared: at least one stale-sensitive case cannot detect a replayed pathname observation and must not be trusted" 71
@@ -498,7 +518,7 @@ run_matrix() {
     --local-route "$PORTABLEFS_LOCAL_ROUTE" \
     --routes-contract-command "$ROUTES_CONTRACT_COMMAND" \
     --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal (docs/xfs-authority-architecture.md), so a chown to another principal is refused by the volume itself and there is no ownership change to observe" \
-    --label "linux ${KERNEL_RELEASE}: two kernel FUSE mounts of one authoritative XFS volume, ${PORTABLEFS_COHERENCE} coherence" \
+    --label "linux ${KERNEL_RELEASE}: two stock-kernel FUSE mounts of one authoritative XFS volume" \
     --json /home/portablefs/logs/matrix.json
 }
 
@@ -507,6 +527,7 @@ run_container() {
   KERNEL_RELEASE=$(uname -r)
   install_container_dependencies
   create_service_identity
+  provision_fuse_control
   provision_xfs
   # The production provisioner is the single source of truth for project-quota
   # setup, so the harness exercises exactly what a deployment runs.
@@ -527,7 +548,7 @@ run_container() {
   # matrix process's own command line, so a pkill pattern would match and kill
   # the driver instead of the mount.
   FENCE_COMMAND="kill -9 ${MOUNT_B_PID}"
-  echo "coherence-matrix-linux: kernel $KERNEL_RELEASE, two independent mounts of volume $PORTABLEFS_VOLUME_NAME, ${PORTABLEFS_COHERENCE} coherence"
+  echo "coherence-matrix-linux: stock kernel $KERNEL_RELEASE, two independent mounts of volume $PORTABLEFS_VOLUME_NAME (black-box behavior only)"
   local both=(/home/portablefs/mount-a /home/portablefs/mount-b)
   assert_mounts_serving "before any phase ran" "${both[@]}"
   run_disjoint_control

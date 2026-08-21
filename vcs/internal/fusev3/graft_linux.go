@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"errors"
 	"math"
 	"strings"
 	"sync"
@@ -27,11 +28,10 @@ const (
 	// conventional loopback-filesystem value and is what the CLI mount publishes
 	// for the same paths, so the two clients agree.
 	//
-	// It is deliberately independent of the declared coherence profile. That
-	// profile is a statement about state the AUTHORITY can change underneath
-	// this kernel; a graft has none, so an uncached mount publishes this
-	// lifetime too rather than paying a round trip to re-derive a fact only it
-	// can have changed.
+	// It is deliberately independent of authority cache lifetimes. A graft has
+	// no state the authority or another machine can change underneath this
+	// kernel, so re-deriving its local-only facts through the authority would be
+	// both impossible and wasteful.
 	graftEntryTimeout = time.Second
 
 	// graftDirOffsetBase reserves the top bit of the READDIR offset space for
@@ -119,6 +119,7 @@ func fillGraftAttr(st *syscall.Stat_t, out *fuse.Attr, uid, gid uint32) {
 	out.FromStat(st)
 	out.Ino = localdirs.LocalIno(st.Ino)
 	out.Uid, out.Gid = uid, gid
+	out.Flags = 0
 }
 
 // publishGraftEntry hands one machine-local directory entry to the kernel.
@@ -384,12 +385,15 @@ func (r *rawFileSystem) graftLookup(parent *inodeRecord, name string, out *fuse.
 	if errno != 0 {
 		// A rule owns the NAME whether or not anything has created it, so the
 		// volume's same-named subtree stays shadowed and this is an honest
-		// ENOENT rather than a fall-through to the authority. The negative
-		// answer is not cached, for the same reason a negative authority answer
-		// is not: the entry that fills it in is created without this frontend
-		// being asked about the name.
-		out.SetEntryTimeout(0)
-		return true, fuse.Status(errno)
+		// local negative rather than a fall-through to the authority. Its class
+		// bit makes the successful zero-nodeid base reply distinguishable from a
+		// SHARED stamped negative without inventing a publication obligation.
+		if errno != syscall.ENOENT {
+			return true, fuse.Status(errno)
+		}
+		*out = fuse.EntryOut{}
+		out.Attr.Flags = 0
+		return true, fuse.OK
 	}
 	record, errno := r.internGraft(parent, name, &st)
 	if errno != 0 {
@@ -697,14 +701,31 @@ func (r *rawFileSystem) graftLink(source *inodeRecord, parent *inodeRecord, name
 		return true, fuse.Status(errno)
 	}
 	sourcePath, sourceRoot := "", ""
+	var anonymous *graftHandle
+	var anonymousRecord *handleRecord
 	if source.graft {
 		path, ok := r.path(source)
 		if !ok {
-			return true, fuse.Status(syscall.ESTALE)
-		}
-		sourcePath = path
-		if sourceRoot = r.grafts.Owner(path); sourceRoot == "" {
-			return true, fuse.EIO
+			r.mu.Lock()
+			anonymousFh, root := source.graftAnonymousFh, source.graftAnonymousRoot
+			r.mu.Unlock()
+			if anonymousFh == 0 || root == "" {
+				return true, fuse.Status(syscall.ESTALE)
+			}
+			anonymousRecord, anonymous = r.acquireGraftFileHandle(anonymousFh)
+			if anonymous == nil || anonymousRecord.inode != source {
+				if anonymousRecord != nil {
+					r.releaseHandleOperation(anonymousRecord)
+				}
+				return true, fuse.Status(syscall.ESTALE)
+			}
+			defer r.releaseHandleOperation(anonymousRecord)
+			sourceRoot = root
+		} else {
+			sourcePath = path
+			if sourceRoot = r.grafts.Owner(path); sourceRoot == "" {
+				return true, fuse.EIO
+			}
 		}
 	}
 	if sourceRoot == "" && resolved.root == "" {
@@ -716,15 +737,37 @@ func (r *rawFileSystem) graftLink(source *inodeRecord, parent *inodeRecord, name
 		// filesystems, which POSIX has exactly one answer for.
 		return true, fuse.Status(syscall.EXDEV)
 	}
-	if errno := r.grafts.Link(sourcePath, resolved.path); errno != 0 {
-		return true, fuse.Status(errno)
+	var linkErr syscall.Errno
+	if anonymous != nil {
+		linkErr = r.grafts.LinkTmpfile(sourceRoot, anonymous.fd, resolved.path)
+	} else {
+		linkErr = r.grafts.Link(sourcePath, resolved.path)
 	}
-	st, errno := r.grafts.Lstat(resolved.path)
-	if errno != 0 {
-		return true, fuse.Status(errno)
+	if linkErr != 0 {
+		return true, fuse.Status(linkErr)
+	}
+	var st syscall.Stat_t
+	if anonymous != nil {
+		if err := syscall.Fstat(anonymous.fd, &st); err != nil {
+			r.mount.revoke(errors.New("fusev3: linked LOCAL tmpfile lost its retained descriptor identity"))
+			return true, fuse.Status(syscall.ENOTCONN)
+		}
+	} else {
+		var statErr syscall.Errno
+		st, statErr = r.grafts.Lstat(resolved.path)
+		if statErr != 0 {
+			return true, fuse.Status(statErr)
+		}
 	}
 	record, errno := r.internGraft(parent, name, &st)
 	if errno != 0 {
+		if anonymous != nil {
+			// The directory entry now exists. Returning an ordinary error would
+			// invite the caller to retry a mutation that already happened while
+			// leaving our inode table unaware of it. Fail the mount closed instead.
+			r.mount.revoke(errors.New("fusev3: linked LOCAL tmpfile could not be interned after the link was applied"))
+			return true, fuse.Status(syscall.ENOTCONN)
+		}
 		return true, fuse.Status(errno)
 	}
 	r.publishGraftEntry(out, record, &st)

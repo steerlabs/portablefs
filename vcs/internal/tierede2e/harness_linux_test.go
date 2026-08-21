@@ -30,6 +30,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 	"github.com/steerlabs/portablefs/vcs/internal/mountid"
+	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 	"github.com/steerlabs/portablefs/vcs/internal/restoremode"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
@@ -248,8 +249,9 @@ func (authorizer) Authorize(context.Context, string, []byte) (volumeserver.Autho
 }
 
 type membershipRecorder struct {
-	mu     sync.Mutex
-	active map[volumeserver.SessionID]struct{}
+	mu      sync.Mutex
+	active  map[volumeserver.SessionID]struct{}
+	ordered []volumeserver.SessionID
 }
 
 func newMembershipRecorder() *membershipRecorder {
@@ -260,6 +262,7 @@ func (m *membershipRecorder) Activate(id volumeserver.SessionID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.active[id] = struct{}{}
+	m.ordered = append(m.ordered, id)
 	return nil
 }
 
@@ -270,11 +273,23 @@ func (m *membershipRecorder) Deactivate(id volumeserver.SessionID) error {
 	return nil
 }
 
+func (m *membershipRecorder) last() (volumeserver.SessionID, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.ordered) == 0 {
+		return volumeserver.SessionID{}, false
+	}
+	return m.ordered[len(m.ordered)-1], true
+}
+
 // transport is this harness's equivalent of the production mount binary's
 // adapter over the authority client.
-type transport struct{ *authorityrpc.Client }
+type transport struct {
+	*authorityrpc.Client
+	session []byte
+}
 
-func (t *transport) SessionID() []byte { return nil }
+func (t *transport) SessionID() []byte { return append([]byte(nil), t.session...) }
 
 func (t *transport) DetachAfterUnmount(ctx context.Context, proof fusev3.MountAbsenceProof) error {
 	return t.Client.DetachAfterUnmount(ctx, &authoritypb.MountAbsenceProof{
@@ -303,15 +318,17 @@ type serving struct {
 	t         *testing.T
 	mountPath string
 
-	store     *xfsstore.Volume
-	listener  net.Listener
-	client    *authorityrpc.Client
-	mount     *fusev3.Mount
-	restore   *restoreWiring
-	stopServe context.CancelFunc
-	served    chan error
-	stopped   bool
-	unmounted bool
+	store          *xfsstore.Volume
+	writeAdmission *authorityrpc.WriteAdmission
+	writeStaging   string
+	listener       net.Listener
+	client         *authorityrpc.Client
+	mount          *fusev3.Mount
+	restore        *restoreWiring
+	stopServe      context.CancelFunc
+	served         chan error
+	stopped        bool
+	unmounted      bool
 }
 
 func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
@@ -336,6 +353,16 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 			restore = s.restore.mode
 		}
 	}
+	writeStaging, err := os.MkdirTemp(filepath.Dir(volumeRoot), ".portablefs-tiered-write-staging-")
+	if err != nil {
+		t.Fatalf("create write-admission directory: %v", err)
+	}
+	s.writeStaging = writeStaging
+	writeAdmission, err := authorityrpc.OpenWriteAdmission(writeStaging)
+	if err != nil {
+		t.Fatalf("open write admission: %v", err)
+	}
+	s.writeAdmission = writeAdmission
 
 	authority, err := volumeserver.New(volumeID, volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: harnessReplaySlots,
@@ -346,26 +373,22 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 	}
 
 	membership := newMembershipRecorder()
-	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: volumeserver.PriorEpochStrictMountsFenced, Membership: membership, Fencer: authority,
-		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute, MaxClockSkew: time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("create visibility coordinator: %v", err)
-	}
 	// The authority is the source of truth for the volume's machine-local
 	// routing revision and refuses every mount whose declared revision is not
 	// the active one — for both coherence profiles. This volume declares no
 	// routes, but it still has to install that declaration through the same
 	// barrier a live operator's change would use, and the mount still has to
 	// declare agreement with it.
-	routes, err := authorityrpc.NewRoutesController(store, visibility)
+	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
+		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: membership,
+		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
+		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
+		CacheLeaseTTL: time.Second, MaxCacheLeasesPerSession: 4096, MaxCacheLeases: 16384,
+	})
 	if err != nil {
-		t.Fatalf("create routing controller: %v", err)
+		t.Fatalf("assemble authority coordination: %v", err)
 	}
-	if err := routes.Load(); err != nil {
-		t.Fatalf("load the volume's routing declaration: %v", err)
-	}
+	routes := coordination.Routes
 	active, err := routes.Revision()
 	if err != nil {
 		t.Fatalf("read the active routing revision: %v", err)
@@ -380,12 +403,21 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 
 	handler := &authorityrpc.VolumeHandler{
 		Store: store, Runtime: authority, Authorizer: authorizer{},
-		Visibility: visibility, Routes: routes, Restore: restore,
+		Restore:  restore,
 		MaxFrame: harnessMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight:        harnessServerInFlight,
 		MaxItemsPerSession: 4096, MaxOpensPerSession: 4096, MaxItems: 16384, MaxOpens: 16384,
-		MaxRetainedReplyBytes: harnessBudget,
+		MaxRetainedReplyBytes:         harnessBudget,
+		WriteAdmission:                writeAdmission,
+		MaxWriteBytesPerSession:       16 << 30,
+		MaxWriteBytesInFlight:         64 << 30,
+		MaxWritesPerSession:           8,
+		MaxWrites:                     4096,
+		WriteAdmissionProgressTimeout: 2 * time.Minute,
+		WriteAbsoluteTimeout:          30 * time.Minute,
+		TerminalDeliveryTimeout:       45 * time.Second,
 	}
+	coordination.Bind(handler)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -402,19 +434,6 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 			HandshakeTimeout:      5 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second,
 		}).Serve(ctx, listener, serverTLS)
 	}()
-
-	client, err := authorityrpc.DialClient(context.Background(), authorityrpc.ClientConfig{
-		Address: listener.Addr().String(), TLS: clientTLS.Clone(), VolumeID: volumeID,
-		AccessToken: []byte("tiered-e2e-capability"), ReplaySlots: harnessReplaySlots,
-		MaxFrame: harnessMaxFrame, DialTimeout: 5 * time.Second,
-		CancelDrainTimeout: 5 * time.Second, MaxInFlight: harnessMaxInFlight,
-		RoutesRevision: rules.Revision(),
-	})
-	if err != nil {
-		t.Fatalf("dial authority: %v", err)
-	}
-	s.client = client
-
 	mountRoot := t.TempDir()
 	s.mountPath = filepath.Join(mountRoot, "mnt")
 	if err := os.Mkdir(s.mountPath, 0o700); err != nil {
@@ -424,15 +443,42 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 	if err != nil {
 		t.Fatalf("create mount identity: %v", err)
 	}
-	mount, err := fusev3.MountVolume(context.Background(), s.mountPath, &transport{Client: client}, fusev3.Config{
+	preKernelAbsence, err := mountv3.PreKernelMountAbsenceObserver(s.mountPath, instance)
+	if err != nil {
+		t.Fatalf("bind pre-kernel mount-absence observer: %v", err)
+	}
+
+	client, err := authorityrpc.DialClient(context.Background(), authorityrpc.ClientConfig{
+		Address: listener.Addr().String(), TLS: clientTLS.Clone(), VolumeID: volumeID,
+		AccessToken: []byte("tiered-e2e-capability"), ReplaySlots: harnessReplaySlots,
+		Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
+		FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		MaxFrame:        harnessMaxFrame, DialTimeout: 5 * time.Second,
+		CancelDrainTimeout: 5 * time.Second, MaxInFlight: harnessMaxInFlight,
+		RoutesRevision:                 rules.Revision(),
+		ObservePreKernelMountAbsence:   preKernelAbsence,
+		RequireLocalSessionEnforcement: true,
+	})
+	if err != nil {
+		t.Fatalf("dial authority: %v", err)
+	}
+	s.client = client
+	session, ok := membership.last()
+	if !ok {
+		t.Fatal("attach registered no visibility participant")
+	}
+	mount, err := fusev3.MountVolume(context.Background(), s.mountPath, &transport{
+		Client: client, session: append([]byte(nil), session[:]...),
+	}, fusev3.Config{
 		MountInstanceID: instance, RequestTimeout: harnessRequestTimeout,
 		MaxBackground: 64, ReclaimQueue: 1024, MaxInFlight: harnessMaxInFlight,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-		// Uncached is deliberate: every read and every getattr must reach the
-		// authority, so a cold recall is provably a recall and an mtime
-		// assertion cannot be answered out of a kernel cache.
-		Coherence: fusev3.CoherenceUncached,
-		Routes:    rules,
+		// Protocol 6 has one Linux cache contract. A newly restored inode starts
+		// without N/A/D/E grants, so the first cold read and getattr still reach
+		// the authority; later caching is governed by the same lease machinery
+		// production uses.
+		Coherence: fusev3.CoherenceStrict, CachedNameCapacity: 4096, RepairBudget: time.Minute,
+		Routes: rules,
 	})
 	if err != nil {
 		t.Fatalf("mount %s: %v", s.mountPath, err)
@@ -503,6 +549,18 @@ func (s *serving) stop() {
 			}
 		}
 		s.restore = nil
+	}
+	if s.writeAdmission != nil {
+		if err := s.writeAdmission.Close(); err != nil {
+			s.t.Errorf("close write admission: %v", err)
+		}
+		s.writeAdmission = nil
+	}
+	if s.writeStaging != "" {
+		if err := os.RemoveAll(s.writeStaging); err != nil {
+			s.t.Errorf("remove write-admission directory: %v", err)
+		}
+		s.writeStaging = ""
 	}
 	if s.store != nil {
 		if err := s.store.Close(); err != nil {
