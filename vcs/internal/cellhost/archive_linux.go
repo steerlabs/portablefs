@@ -14,6 +14,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/steerlabs/portablefs/vcs/internal/archivestore"
 	"github.com/steerlabs/portablefs/vcs/internal/cellhelper"
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
@@ -58,25 +59,26 @@ func (host *Host) writeLaunchConfig(volumeID string, serviceGID uint32, name str
 }
 
 // ArchiveConfigured reports whether this cell can do archive or restore work at
-// all. It is answered on every status pass, so it costs one open and one fstat
-// and never reads the credentials: the file must be configured and satisfy the
-// same shape stageArchiveCredentials will demand of it (regular, non-empty,
-// unreadable by group and other). A false answer keeps the Manager from placing
-// export or hydration work here.
+// all. A false answer keeps the Manager from placing export or hydration work
+// here, so the answer has to mean what the archiver and the hydrator will find
+// when they get here: it parses the credentials with the same loader they use
+// on the staged copy (archivestore.LoadConfigFile), which pins the file's shape
+// - regular, unreadable by group and other, bounded - and its content, down to
+// every required key being present and every value addressable. A file that is
+// merely present admits a full archive cycle that can only fail at the far end,
+// long after the operator who could have fixed it stopped looking.
+//
+// This runs on every status pass. Reading and parsing a small private file is
+// what that costs; nothing here touches the network. Whether the store is
+// actually reachable belongs to the archive attempt, which has wake-cancel as
+// its recovery, and a reachability probe on the status path would turn a
+// transient outage into an unplaceable cell.
 func (host *Host) ArchiveConfigured() bool {
 	if host.cfg.ArchiveCredentialsPath == "" {
 		return false
 	}
-	fd, err := unix.Open(host.cfg.ArchiveCredentialsPath, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return false
-	}
-	defer unix.Close(fd)
-	var info unix.Stat_t
-	if err := unix.Fstat(fd, &info); err != nil {
-		return false
-	}
-	return info.Mode&unix.S_IFMT == unix.S_IFREG && info.Mode&0o077 == 0 && info.Size > 0
+	_, err := archivestore.LoadConfigFile(host.cfg.ArchiveCredentialsPath)
+	return err == nil
 }
 
 // stageArchiveCredentials copies the root-provisioned cell credentials into

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,12 @@ import (
 // file that is 0444 or 0000 and to walk a directory that is 0000. None of that
 // is possible for the identity that owns the volume without moving the mode:
 // ownership is not access, and no cell component holds CAP_DAC_OVERRIDE.
+//
+// The whole of that mode movement lives in the binding walk, which runs before
+// the volume server accepts a session. Once ResolveRestoreFiles has returned,
+// every hydration write goes through a descriptor that was opened for writing
+// while the mode was out of the way, and no mode is ever touched again - which
+// is what these cases are here to pin.
 //
 // Root bypasses discretionary access entirely, so as root these cases would
 // pass without the code under test existing. The Linux suites run as root in a
@@ -189,12 +196,13 @@ func (r restoredVolume) modeOf(t *testing.T, display string, id Capability) uint
 	return bits
 }
 
-// TestRestoreWritesThroughAnOwnerUnwritableMode is the whole point of the
-// fchmod-around-write dance: hydration must land in a file whose archived mode
-// forbids the write, and must leave that mode exactly as it found it.
-func TestRestoreWritesThroughAnOwnerUnwritableMode(t *testing.T) {
+// TestRestoreHydratesInodesTheirOwnerMayNotOpen is the whole point of binding
+// descriptors before serving: hydration must land in a file whose archived mode
+// forbids the write, through a descriptor the walk obtained, and must leave
+// every mode in the tree exactly as it found it.
+func TestRestoreHydratesInodesTheirOwnerMayNotOpen(t *testing.T) {
 	if !runsUnprivileged() {
-		rerunUnprivileged(t, "TestRestoreWritesThroughAnOwnerUnwritableMode")
+		rerunUnprivileged(t, "TestRestoreHydratesInodesTheirOwnerMayNotOpen")
 		return
 	}
 	restored := buildRestoredVolume(t)
@@ -277,13 +285,16 @@ func TestRestoreWritesThroughAnOwnerUnwritableMode(t *testing.T) {
 	}
 }
 
-// TestRestoreWriteRestoresTheModeOnFailure pins the error path: a write that
-// fails must still leave the archived mode behind it, because a volume that
-// blocks mid-restore is inspected by a human and must not have been silently
-// widened.
-func TestRestoreWriteRestoresTheModeOnFailure(t *testing.T) {
+// TestAUserChmodDuringServingSurvivesHydration is the defect the descriptor
+// redesign removes. The earlier shape read the mode, widened it, wrote, and
+// wrote the mode it had read back; a user chmod that landed inside that window
+// was acknowledged and then silently reverted, because the authority's SETATTR
+// path does not take the restore entry lock. Nothing reverts anything now: the
+// mode the user set is the mode that stands, in either direction, and hydration
+// keeps working through the descriptor the walk already holds.
+func TestAUserChmodDuringServingSurvivesHydration(t *testing.T) {
 	if !runsUnprivileged() {
-		rerunUnprivileged(t, "TestRestoreWriteRestoresTheModeOnFailure")
+		rerunUnprivileged(t, "TestAUserChmodDuringServingSurvivesHydration")
 		return
 	}
 	restored := buildRestoredVolume(t)
@@ -292,22 +303,51 @@ func TestRestoreWriteRestoresTheModeOnFailure(t *testing.T) {
 		t.Fatalf("resolve restore bindings: %v", err)
 	}
 	defer files.Close()
-	// A negative offset is rejected by the kernel, so the write inside the
-	// widened window fails while the window is open.
-	if err := files.PWrite(entryReadOnly, -1, []byte("x")); err == nil {
-		t.Fatal("PWrite at a negative offset succeeded")
-	}
-	if mode := restored.modeOf(t, readOnlyName, restored.caps[entryReadOnly]); mode != 0o444 {
-		t.Fatalf("a failed hydration write left %q at mode %#o, not %#o", readOnlyName, mode, 0o444)
+
+	// Widening and narrowing are both a user's business, and a hydration write
+	// must survive - and disturb - neither.
+	for _, step := range []struct {
+		entry uint32
+		mode  fs.FileMode
+	}{
+		{entryReadOnly, 0o755},
+		{entryReadOnly, 0o000},
+		{entryUnopened, 0o644},
+		{entryUnopened, 0o000},
+	} {
+		name := restored.names[step.entry]
+		if err := restored.volume.Chmod(restored.caps[step.entry], step.mode); err != nil {
+			t.Fatalf("chmod %q to %#o: %v", name, step.mode, err)
+		}
+		if err := files.PWrite(step.entry, 0, []byte("hydration after a user chmod")); err != nil {
+			t.Fatalf("PWrite into %q at user mode %#o: %v", name, step.mode, err)
+		}
+		if err := files.Fdatasync(step.entry); err != nil {
+			t.Fatalf("Fdatasync %q at user mode %#o: %v", name, step.mode, err)
+		}
+		if err := files.RestoreMtime(step.entry); err != nil {
+			t.Fatalf("RestoreMtime %q at user mode %#o: %v", name, step.mode, err)
+		}
+		if mode := restored.modeOf(t, name, restored.caps[step.entry]); mode != uint32(step.mode) {
+			t.Fatalf("hydration moved %q from the user's %#o to %#o", name, step.mode, mode)
+		}
+		// A write the kernel refuses must not be an excuse to touch the mode
+		// either: a volume that blocks mid-restore is inspected by a human.
+		if err := files.PWrite(step.entry, -1, []byte("x")); err == nil {
+			t.Fatalf("PWrite into %q at a negative offset succeeded", name)
+		}
+		if mode := restored.modeOf(t, name, restored.caps[step.entry]); mode != uint32(step.mode) {
+			t.Fatalf("a failed hydration write moved %q from the user's %#o to %#o", name, step.mode, mode)
+		}
 	}
 }
 
-// TestRestorePWriteStepsAroundAReadOnlyMode isolates the write half of the
-// dance. The volume here is flat, so the binding walk needs no help at all and
-// the only thing that can refuse the hydration write is the file's own 0444.
-func TestRestorePWriteStepsAroundAReadOnlyMode(t *testing.T) {
+// TestTheBindingWalkOpensAndRestoresAReadOnlyMode isolates the walk's EACCES
+// path. The volume here is flat, so the walk needs no help traversing anything
+// and the only thing that can refuse the O_RDWR open is the file's own 0444.
+func TestTheBindingWalkOpensAndRestoresAReadOnlyMode(t *testing.T) {
 	if !runsUnprivileged() {
-		rerunUnprivileged(t, "TestRestorePWriteStepsAroundAReadOnlyMode")
+		rerunUnprivileged(t, "TestTheBindingWalkOpensAndRestoresAReadOnlyMode")
 		return
 	}
 	path := filepath.Clean(t.TempDir())
@@ -343,6 +383,22 @@ func TestRestorePWriteStepsAroundAReadOnlyMode(t *testing.T) {
 		t.Fatalf("resolve restore bindings: %v", err)
 	}
 	defer files.Close()
+	// The walk had to widen this file to open it, and the mode has to be back
+	// before anything else happens - the walk is the only place a mode moves,
+	// and it must not survive the walk's return.
+	if attr, err := volume.Getattr(published); err != nil {
+		t.Fatal(err)
+	} else if attr.Mode.Perm() != 0o444 {
+		t.Fatalf("the binding walk left the file at mode %#o, not the %#o it found", attr.Mode.Perm(), 0o444)
+	}
+	// The descriptor the walk retained still writes even though nothing can
+	// open this file for writing any more.
+	if fd, err := unix.Open(filepath.Join(path, readOnlyName), unix.O_RDWR|unix.O_CLOEXEC, 0); err == nil {
+		_ = unix.Close(fd)
+		t.Fatalf("%q became writable to a fresh open; the walk did not narrow it back", readOnlyName)
+	} else if !errors.Is(err, unix.EACCES) {
+		t.Fatalf("open %q for writing after the walk = %v, want EACCES", readOnlyName, err)
+	}
 	payload := []byte("bytes the archive holds for a file its owner may not write")
 	if err := files.PWrite(entryReadOnly, 0, payload); err != nil {
 		t.Fatalf("PWrite into a 0444 file: %v", err)

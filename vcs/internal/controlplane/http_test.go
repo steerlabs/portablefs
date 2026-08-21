@@ -112,8 +112,8 @@ func TestHTTPArchiveWakeAndDeleteLifecycleRoutes(t *testing.T) {
 
 	archive := ArchiveVolumeRequest{VolumeID: volume.ID}
 	response := serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/archive",
-		archive, RoleProduct, "opensteer", "http-archive-unavailable")
-	if response.Code != http.StatusServiceUnavailable {
+		archive, RoleProduct, "opensteer", "http-archive-unsupported")
+	if response.Code != http.StatusNotImplemented {
 		t.Fatalf("archive without a verifier status=%d body=%s", response.Code, response.Body.String())
 	}
 	h.manager.cfg.ArchiveVerifier = &fakeArchiveVerifier{}
@@ -352,7 +352,9 @@ func TestHTTPRenewalFenceAdvanceAndFencedIssuance(t *testing.T) {
 }
 
 // Saturation and outage are retryable-unchanged; an exhausted fleet is the
-// caller's problem to resolve and stays a conflict.
+// caller's problem to resolve and stays a conflict; a deployment that cannot
+// archive at all is 501, so a client can route it to an operator instead of
+// retrying it as busy forever.
 func TestHTTPRetryableRefusalsAreDistinctFromCapacityConflicts(t *testing.T) {
 	h := newManagerHarness(t)
 	handler := testHTTPHandler(h.manager)
@@ -364,6 +366,7 @@ func TestHTTPRetryableRefusalsAreDistinctFromCapacityConflicts(t *testing.T) {
 		{name: "archive store outage", err: ErrArchiveStoreUnavailable, status: http.StatusServiceUnavailable},
 		{name: "cell concurrency saturated", err: ErrBusy, status: http.StatusServiceUnavailable},
 		{name: "fleet capacity exhausted", err: ErrCapacity, status: http.StatusConflict},
+		{name: "archiving unsupported here", err: ErrArchiveUnsupported, status: http.StatusNotImplemented},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()

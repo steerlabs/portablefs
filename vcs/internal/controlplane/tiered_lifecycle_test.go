@@ -168,7 +168,7 @@ func TestArchiveReleaseAndCrossCellWakeLifecycle(t *testing.T) {
 	if err != nil || readyAgain.State != VolumeReady || readyAgain.ArchiveSummary == nil {
 		t.Fatalf("cancel rearchive = %+v, %v", readyAgain, err)
 	}
-	if _, err := h.manager.DestroyVolume("delete-retained", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "workspace deleted"}); !errors.Is(err, ErrArchiveStoreUnavailable) {
+	if _, err := h.manager.DestroyVolume("delete-retained", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "workspace deleted"}); !errors.Is(err, ErrArchiveUnsupported) {
 		t.Fatalf("delete retained checkpoint without purger = %v", err)
 	}
 	purger := &fakeArchivePurger{}
@@ -295,7 +295,7 @@ func TestDestroyArchivedRequiresPurgerAndCommitsTerminalAfterPurge(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.manager.DestroyVolume("purge-unavailable", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "delete"}); !errors.Is(err, ErrArchiveStoreUnavailable) {
+	if _, err := h.manager.DestroyVolume("purge-unavailable", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "delete"}); !errors.Is(err, ErrArchiveUnsupported) {
 		t.Fatalf("missing purger = %v", err)
 	}
 	if current, _ := h.manager.GetVolume(volume.ID); current.State != VolumeArchived {
@@ -351,8 +351,10 @@ func TestArchiveRefusedWithoutAVerifierOrAnArchiveCapableCell(t *testing.T) {
 	cell, volume := readyVolumeForMount(t, h)
 	before := verifiedPlan(t, h.manager, cell.ID, *h.now).Generation
 	// A Manager with no archive credentials can never verify the seal it would
-	// be waiting for, so the cycle is refused before the volume stops serving.
-	if _, err := h.manager.ArchiveVolume("archive-no-verifier", ArchiveVolumeRequest{VolumeID: volume.ID}); !errors.Is(err, ErrArchiveStoreUnavailable) {
+	// be waiting for, so the cycle is refused before the volume stops serving —
+	// and refused as unsupported, not busy: a client must be able to tell a
+	// deployment that cannot archive from one that is momentarily loaded.
+	if _, err := h.manager.ArchiveVolume("archive-no-verifier", ArchiveVolumeRequest{VolumeID: volume.ID}); !errors.Is(err, ErrArchiveUnsupported) {
 		t.Fatalf("archive without a verifier = %v", err)
 	}
 	unchanged, _ := h.manager.GetVolume(volume.ID)
@@ -370,7 +372,7 @@ func TestArchiveRefusedWithoutAVerifierOrAnArchiveCapableCell(t *testing.T) {
 	// A cell whose helper holds no usable archive credentials can neither export
 	// nor hydrate; archive work is never placed on it.
 	observeTieredCell(t, h, cell.ID, "archive-capability-lost", false, ready)
-	if _, err := h.manager.ArchiveVolume("archive-incapable-cell", ArchiveVolumeRequest{VolumeID: volume.ID}); !errors.Is(err, ErrConflict) {
+	if _, err := h.manager.ArchiveVolume("archive-incapable-cell", ArchiveVolumeRequest{VolumeID: volume.ID}); !errors.Is(err, ErrArchiveUnsupported) {
 		t.Fatalf("archive on an archive-incapable cell = %v", err)
 	}
 	observeTieredCell(t, h, cell.ID, "archive-capability-restored", true, ready)

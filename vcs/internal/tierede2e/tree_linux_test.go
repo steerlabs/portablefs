@@ -60,10 +60,6 @@ func longName() string { return strings.Repeat("l", 251) + ".txt" }
 // longer exists on any filesystem.
 type sourceTree struct {
 	root string
-	// restricted reports whether the modes that deny the service identity its
-	// own inodes were included. It is decided by a runtime feasibility probe,
-	// never assumed.
-	restricted bool
 	// facts is the complete metadata-and-content snapshot taken immediately
 	// before the source was destroyed.
 	facts map[string]nodeFacts
@@ -78,9 +74,9 @@ type sourceTree struct {
 // real hole, a hardlink group, symlinks including a dangling one, user.*
 // xattrs, distinctive nanosecond mtimes, a unicode name, a 255-byte name, an
 // empty file and an empty directory, and a read-only file.
-func buildSourceTree(t *testing.T, root string, restricted bool) *sourceTree {
+func buildSourceTree(t *testing.T, root string) *sourceTree {
 	t.Helper()
-	tree := &sourceTree{root: root, restricted: restricted, bytes: map[string][]byte{}}
+	tree := &sourceTree{root: root, bytes: map[string][]byte{}}
 	chunk := uint64(lifecycleChunkSize)
 
 	mkdir := func(rel string, mode os.FileMode) {
@@ -158,15 +154,13 @@ func buildSourceTree(t *testing.T, root string, restricted bool) *sourceTree {
 	setXattr(t, filepath.Join(root, pathSmallA), "user.tierede2e.file", []byte("\x00\x01binary value"))
 	setXattr(t, filepath.Join(root, "docs"), "user.tierede2e.dir", []byte("directory attribute"))
 
-	if restricted {
-		// A file the owner may read but not write, a file the owner may not
-		// even read, and a directory the owner may read but not traverse. All
-		// three are only built when the runtime probe proved this build can
-		// archive, materialize, and hydrate them; see probeRestrictedModes.
-		write(pathReadOnly, pseudoRandom(chunk+777, 0x3c6ef372), 0o444)
-		write(pathSealed, pseudoRandom(1500, 0x5bf03635), 0o000)
-		mkdir(pathClosedDir, 0o444)
-	}
+	// A file the owner may read but not write, a file the owner may not even
+	// read, and a directory the owner may read but not traverse. These are not
+	// optional: an archive that cannot carry them cannot carry a real
+	// workspace, and RestrictedModesAreCarried is the stage that proves it.
+	write(pathReadOnly, pseudoRandom(chunk+777, 0x3c6ef372), 0o444)
+	write(pathSealed, pseudoRandom(1500, 0x5bf03635), 0o000)
+	mkdir(pathClosedDir, 0o444)
 
 	// mtimes last and deepest first: creating a child moves its parent's mtime,
 	// so the directories are stamped after everything inside them exists.

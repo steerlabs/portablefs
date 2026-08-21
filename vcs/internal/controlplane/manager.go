@@ -372,7 +372,7 @@ func (manager *Manager) ArchiveVolume(requestID string, request ArchiveVolumeReq
 	// an accepted cycle would wedge at cursor "verifying" with the volume no
 	// longer serving. Refuse before any state change.
 	if manager.cfg.ArchiveVerifier == nil {
-		return VolumeView{}, ErrArchiveStoreUnavailable
+		return VolumeView{}, ErrArchiveUnsupported
 	}
 	return manager.updateVolume(requestID, "archive-volume", request, func(state *State, volume *Volume, now int64) error {
 		if volume.State != VolumeReady || volume.Placement == nil {
@@ -380,7 +380,7 @@ func (manager *Manager) ArchiveVolume(requestID string, request ArchiveVolumeReq
 		}
 		cell := state.Cells[volume.Placement.CellID]
 		if !cellSupportsV2(cell) || !cell.ArchiveConfigured {
-			return ErrConflict
+			return ErrArchiveUnsupported
 		}
 		if archivingCellLoad(state, cell.ID) >= manager.cfg.MaxArchivingPerCell {
 			return ErrBusy
@@ -486,7 +486,7 @@ func (manager *Manager) DestroyVolume(requestID string, request DestroyVolumeReq
 	}
 	if checkpoint != nil {
 		if manager.cfg.ArchivePurger == nil {
-			return VolumeView{}, ErrArchiveStoreUnavailable
+			return VolumeView{}, ErrArchiveUnsupported
 		}
 		if err := manager.cfg.ArchivePurger.Purge(*checkpoint); err != nil {
 			return VolumeView{}, fmt.Errorf("%w: %v", ErrArchiveStoreUnavailable, err)
@@ -517,7 +517,7 @@ func (manager *Manager) DestroyVolume(requestID string, request DestroyVolumeReq
 				return ErrConflict
 			}
 			if manager.cfg.ArchivePurger == nil {
-				return ErrArchiveStoreUnavailable
+				return ErrArchiveUnsupported
 			}
 			volume.State = VolumeDestroying
 			volume.DeletionRequested = true
@@ -528,7 +528,7 @@ func (manager *Manager) DestroyVolume(requestID string, request DestroyVolumeReq
 				return nil
 			}
 			if manager.cfg.ArchivePurger == nil {
-				return ErrArchiveStoreUnavailable
+				return ErrArchiveUnsupported
 			}
 		case VolumeDestroyed:
 			return nil
@@ -1949,7 +1949,7 @@ func (manager *Manager) VerifyPendingSeal(requestID, volumeID string) (VolumeVie
 		return VolumeView{}, ErrInvalid
 	}
 	if manager.cfg.ArchiveVerifier == nil {
-		return VolumeView{}, ErrArchiveStoreUnavailable
+		return VolumeView{}, ErrArchiveUnsupported
 	}
 	var pending ArchiveRecord
 	var checkpoint *ArchiveRecord
@@ -1975,7 +1975,7 @@ func (manager *Manager) VerifyPendingSeal(requestID, volumeID string) (VolumeVie
 	}
 	if checkpoint != nil {
 		if manager.cfg.ArchivePurger == nil {
-			return VolumeView{}, ErrArchiveStoreUnavailable
+			return VolumeView{}, ErrArchiveUnsupported
 		}
 		if err := manager.cfg.ArchivePurger.Purge(*checkpoint); err != nil {
 			return VolumeView{}, fmt.Errorf("%w: %v", ErrArchiveStoreUnavailable, err)

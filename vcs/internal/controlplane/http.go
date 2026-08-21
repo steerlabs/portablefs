@@ -504,6 +504,13 @@ func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, 
 	// state, so neither is 409.
 	case errors.Is(err, ErrArchiveStoreUnavailable), errors.Is(err, ErrBusy):
 		status = http.StatusServiceUnavailable
+	// 501 is "this deployment cannot do that at all" — a cell without archive
+	// configuration or a Manager without its archive component. Retrying is
+	// useless and hiding it behind 409/503 would let a misconfigured
+	// deployment fail every sweep silently forever, so it gets a status a
+	// client can route to an operator.
+	case errors.Is(err, ErrArchiveUnsupported):
+		status = http.StatusNotImplemented
 	}
 	writeAPIError(writer, status, err.Error())
 }

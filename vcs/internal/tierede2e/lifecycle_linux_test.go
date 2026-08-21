@@ -27,6 +27,10 @@ package tierede2e
 //     size is present with zero allocated blocks.
 //   - ServeWhileCold proves reads, writes, truncates and holes through the
 //     kernel while the content is still in the archive.
+//   - RestrictedModesAreCarried proves the two halves of a mode that denies its
+//     own owner: the archiver reads such an inode under CAP_DAC_READ_SEARCH,
+//     and the restore then carries the exact mode and hydrates bytes into it
+//     with no capability at all.
 //   - RestoreBlockedAndRecovers proves the named degraded state: a dead
 //     hydrator fails content reads volume-wide with the restore class, not with
 //     a hang and not with fatal storage, and clears when it returns.
@@ -41,7 +45,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,32 +74,18 @@ const (
 	// authority that sealed.
 	lifecycleAuthorityEpoch = uint64(9)
 	lifecycleKeyVersion     = "v1"
-
-	probeVolumeID = "1a2b3c4d-5e6f-4a8b-8c9d-0e1f2a3b4c5d"
-	probeAttempt  = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
 )
 
 func TestTieredVolumeLifecycleOnXFS(t *testing.T) {
 	env := requirePrivilegedEnvironment(t)
 	client, objects := newTestStore(t)
 
-	// Modes that deny the service identity access to its own inodes are only
-	// archivable and hydratable when this build carries the capability for it.
-	// That work lands separately, so the tree asks the running binaries at
-	// runtime instead of assuming an answer.
-	restricted, restrictedReason := probeRestrictedModes(t, env, client)
-	stage(t, "RestrictedModesAreCarried", func(t *testing.T) {
-		if !restricted {
-			t.Skipf("this build cannot round-trip inodes whose modes deny the service identity: %s", restrictedReason)
-		}
-	})
-
 	// Everything with a lifetime — directories, the state root, the hydrator,
 	// the authority, the mount — is constructed against the top-level test, so
 	// that a subtest finishing never tears down what the next stage needs. The
 	// subtests carry assertions only.
 	sourceRoot := newVolumeDirectory(t, env, "source")
-	tree := buildSourceTree(t, sourceRoot, restricted)
+	tree := buildSourceTree(t, sourceRoot)
 	tree.facts = snapshotTree(t, sourceRoot)
 
 	sealed := runArchiver(t, client, sourceRoot)
@@ -147,6 +136,10 @@ func TestTieredVolumeLifecycleOnXFS(t *testing.T) {
 			t.Fatalf("INFO crossed the wire with chunk size %d, want %d", got, lifecycleChunkSize)
 		}
 		serveWhileCold(t, live, objects, tree, mutations, created)
+	})
+
+	stage(t, "RestrictedModesAreCarried", func(t *testing.T) {
+		checkRestrictedModes(t, live, targetRoot, tree, namespace, manifest)
 	})
 
 	// The failure surface, with content still cold: the hydrator dies.
@@ -837,77 +830,80 @@ func readProgress(stateDir string) (progressRecord, error) {
 }
 
 // ---------------------------------------------------------------------------
-// The restricted-mode feasibility probe.
+// Restricted modes.
 // ---------------------------------------------------------------------------
 
-// probeRestrictedModes asks the running binaries whether they can carry inodes
-// whose modes deny the service identity itself: a file the owner may read but
-// not write, a file the owner may not read at all, and a directory the owner
-// may read but not traverse. It drives the same three calls the lifecycle
-// depends on — the archiver's read of the source, the hydrator's
-// materialization, and the authority's hydration write — and answers no rather
-// than failing when any of them refuses.
+// checkRestrictedModes is the proof that an archive round-trips inodes whose
+// modes deny the identity that owns them. Two capabilities are separated here,
+// and the separation is the point:
 //
-// The point is not to be lenient. It is that this capability is landing in
-// parallel, and a lifecycle proof must not turn red because of another change's
-// timing; the skip is named, so a permanently absent capability is visible in
-// the CI log rather than silently tolerated.
-func probeRestrictedModes(t *testing.T, env privilegedEnv, client *archivestore.Client) (bool, string) {
+//   - The archiver reads a file its owner may not read. That is the one place
+//     in the cell that is granted CAP_DAC_READ_SEARCH, and reaching this stage
+//     at all means it worked: an archiver without it cannot open sealed.bin,
+//     and every stage downstream of ArchiveAndVerify would have failed first.
+//   - The restore serves those modes with no capability whatsoever. The
+//     hydrator materializes each inode at its exact archived mode, and the
+//     authority hydrates the bytes through descriptors its binding walk opened
+//     before it began serving - which is why a 0444 file can be filled in by a
+//     process that could not open it for writing now.
+//
+// The reads below are cold on purpose: each one has to fetch from the archive
+// and land in an inode whose mode forbids the write. The proof that it did is
+// the placement's own block accounting - the restore materialized every regular
+// file fully sparse, so a non-zero allocated block count afterwards is a
+// hydration write that reached this inode and nothing else. Mode and archived
+// mtime must both be exactly as they were.
+func checkRestrictedModes(t *testing.T, live *serving, targetRoot string, tree *sourceTree,
+	namespace map[string]nodeFacts, manifest *archive.Manifest) {
 	t.Helper()
-	source := newVolumeDirectory(t, env, "probe-source")
-	unreadable := filepath.Join(source, "unreadable.bin")
-	unwritable := filepath.Join(source, "unwritable.bin")
-	for path, mode := range map[string]os.FileMode{unreadable: 0o000, unwritable: 0o444} {
-		if err := os.WriteFile(path, pseudoRandom(4096, 0x1234), 0o600); err != nil {
-			t.Fatalf("write the probe file %s: %v", path, err)
-		}
-		if err := os.Chmod(path, mode); err != nil {
-			t.Fatalf("chmod the probe file %s: %v", path, err)
-		}
-	}
-	if err := os.Mkdir(filepath.Join(source, "untraversable"), 0o444); err != nil {
-		t.Fatalf("create the probe directory: %v", err)
-	}
-
-	sealed, err := archiveTree(t, client, source, archiverLaunchConfig(probeVolumeID, probeAttempt))
-	if err != nil {
-		return false, fmt.Sprintf("the archiver refused the tree: %v", err)
-	}
-	target := newVolumeDirectory(t, env, "probe-target")
-	stateDir := shortStateDir(t, "pfs-probe-state-")
-	if err := restoreNamespaceInto(t, client, sealed, target, stateDir); err != nil {
-		return false, fmt.Sprintf("the hydrator refused to materialize the namespace: %v", err)
-	}
-
-	manifest := loadManifest(t, client, sealed)
-	store, err := xfsstore.Open(target, xfsstore.Config{
-		ExpectedProjectID: env.projectID,
-		ExpectedOwnerUID:  uint32(os.Geteuid()),
-		ExpectedOwnerGID:  uint32(os.Getegid()),
-	})
-	if err != nil {
-		return false, fmt.Sprintf("the restored probe placement is not a usable volume: %v", err)
-	}
-	defer func() { _ = store.Close() }()
-	bindings, err := restoremode.LoadBindings(filepath.Join(stateDir, restoremode.BindingsFilename), 1<<24)
-	if err != nil {
-		return false, fmt.Sprintf("the restore bindings are unreadable: %v", err)
-	}
-	files, err := store.ResolveRestoreFiles(bindings.IdentityMap(), uint64(bindings.Len())*2+1024)
-	if err != nil {
-		return false, fmt.Sprintf("the authority cannot bind the restored identities: %v", err)
-	}
-	defer func() { _ = files.Close() }()
-	for _, name := range []string{"unreadable.bin", "unwritable.bin"} {
-		entry, ok := manifestEntryByName(t, manifest, name)
+	for _, restricted := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{pathReadOnly, 0o444},
+		{pathSealed, 0o000},
+		{pathClosedDir, os.ModeDir | 0o444},
+	} {
+		entry, ok := manifestEntryByName(t, manifest, restricted.path)
 		if !ok {
-			return false, fmt.Sprintf("the archive carries no entry named %q", name)
+			t.Fatalf("the archive carries no entry named %q", restricted.path)
 		}
-		if err := files.PWrite(entry, 0, []byte{0x5a}); err != nil {
-			return false, fmt.Sprintf("the authority cannot hydrate %s: %v", name, err)
+		if got := manifest.Entries[entry].Mode; got != uint32(restricted.mode.Perm()) {
+			t.Fatalf("the archive records %q at mode %#o, not the %#o it was archived from",
+				restricted.path, got, uint32(restricted.mode.Perm()))
+		}
+		info, err := os.Lstat(live.join(restricted.path))
+		if err != nil {
+			t.Fatalf("stat the restored %q: %v", restricted.path, err)
+		}
+		if info.Mode() != restricted.mode {
+			t.Fatalf("the restored %q is mode %v, not the %v the archive records", restricted.path, info.Mode(), restricted.mode)
+		}
+		if info.IsDir() {
+			continue
+		}
+		if blocks := namespace[restricted.path].blocks; blocks != 0 {
+			t.Fatalf("the restored %q already held %d allocated blocks, so a cold read proves nothing", restricted.path, blocks)
+		}
+
+		got := mustReadFile(t, live.join(restricted.path), "cold read of "+restricted.path)
+		if string(got) != string(tree.bytes[restricted.path]) {
+			t.Fatalf("the cold read of %q returned %s, not the archived bytes", restricted.path, describeBytes(got))
+		}
+		if blocks := describeNode(t, filepath.Join(targetRoot, restricted.path)).blocks; blocks == 0 {
+			t.Fatalf("%q still holds no allocated block, so the bytes it served were not hydrated into it", restricted.path)
+		}
+		after, err := os.Lstat(live.join(restricted.path))
+		if err != nil {
+			t.Fatalf("stat %q after hydration: %v", restricted.path, err)
+		}
+		if after.Mode() != restricted.mode {
+			t.Fatalf("hydrating %q moved its mode to %v; the archive records %v", restricted.path, after.Mode(), restricted.mode)
+		}
+		if got, want := after.ModTime().UnixNano(), tree.facts[restricted.path].mtimeNS; got != want {
+			t.Fatalf("hydrating %q moved its mtime to %d; the archive records %d", restricted.path, got, want)
 		}
 	}
-	return true, ""
 }
 
 // manifestEntryByName finds the entry index of a top-level name.

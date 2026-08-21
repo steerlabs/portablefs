@@ -2048,6 +2048,14 @@ func modeToProtocol(mode fs.FileMode) uint32 {
 	return result
 }
 
+// getattr answers under the restore mode's per-inode attribute lock while a
+// restore is active. What that lock guards is mtime, and only mtime: installing
+// a fetched chunk writes the archived bytes and then puts the archived mtime
+// back, and between those two calls the inode carries a timestamp no user
+// produced. Hydration is invisible base-byte movement by contract - a restored
+// tree must leave make and git status alone - so an attribute reader has to be
+// excluded from that interval rather than allowed to observe it. Modes are not
+// at issue: nothing in the serving authority ever changes one on its own.
 func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, req *authoritypb.GetAttrRequest) (xfsstore.Attr, error) {
 	if len(req.GetHandle()) != 0 {
 		handle, err := h.open(id, req.GetHandle())

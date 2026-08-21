@@ -367,14 +367,25 @@ func TestWriteRecallDurabilityOrderingAndMtime(t *testing.T) {
 			}
 		}
 	})
-	n, _, err := mode.Write(context.Background(), identity, 1, 1, func() (int, int64, error) { store.event("apply"); return 1, -1, nil })
+	fdatasyncsAtApply := 0
+	n, _, err := mode.Write(context.Background(), identity, 1, 1, func() (int, int64, error) {
+		store.mu.Lock()
+		for _, event := range store.events {
+			if event == "fdatasync" {
+				fdatasyncsAtApply++
+			}
+		}
+		store.mu.Unlock()
+		store.event("apply")
+		return 1, -1, nil
+	})
 	if err != nil || n != 1 {
 		t.Fatalf("write=%d,%v", n, err)
 	}
 	store.mu.Lock()
 	events := append([]string(nil), store.events...)
 	store.mu.Unlock()
-	want := []string{"pwrite", "mtime", "fdatasync", "mark-chunk", "mark-user", "apply", "fdatasync"}
+	want := []string{"pwrite", "mtime", "fdatasync", "mark-chunk", "mark-user", "apply"}
 	if len(events) != len(want) {
 		t.Fatalf("events=%v want=%v", events, want)
 	}
@@ -383,173 +394,128 @@ func TestWriteRecallDurabilityOrderingAndMtime(t *testing.T) {
 			t.Fatalf("events=%v want=%v", events, want)
 		}
 	}
-}
-
-func TestMixedWriteMarksActualFullChunksAndDrainDoesNotRefetch(t *testing.T) {
-	tests := []struct {
-		name            string
-		length          uint32
-		assigned        int64
-		actualStart     int64
-		user            string
-		want            string
-		wantChunkFetch  int
-		wantSecondFetch int
-	}{
-		{name: "pwrite", length: 6, assigned: -1, actualStart: 0, user: "UVWXYZ", want: "UVWXYZgh", wantSecondFetch: 1},
-		{name: "append-assigned-offset", length: 7, assigned: 1, actualStart: 1, user: "UVWXYZA", want: "aUVWXYZA", wantChunkFetch: 1, wantSecondFetch: 1},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			store := newFakeStore(map[uint32]int64{0: 8})
-			startDrain := make(chan struct{})
-			mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}, [2]uint32{0, 1}), map[chunkKey]Chunk{
-				{0, 0}: {Extents: []Extent{{Data: []byte("abcd")}}},
-				{0, 1}: {Extents: []Extent{{Data: []byte("efgh")}}},
-			}, func(c *Config) { c.drainStart = startDrain; c.DrainWorkers = 1; c.RecallLimit = 1 })
-			n, assigned, err := mode.Write(context.Background(), identity, 0, test.length, func() (int, int64, error) {
-				store.write(0, test.actualStart, []byte(test.user), "apply")
-				return len(test.user), test.assigned, nil
-			})
-			if err != nil || n != len(test.user) || assigned != test.assigned {
-				t.Fatalf("write = (%d, %d, %v)", n, assigned, err)
-			}
-			for chunk := uint32(0); chunk < 2; chunk++ {
-				if !mode.hmap.isDurable(chunkKey{0, chunk}) {
-					t.Fatalf("chunk %d is not durable after the mixed write", chunk)
-				}
-			}
-			if got := string(store.bytes(0)); got != test.want {
-				t.Fatalf("file bytes = %q, want %q", got, test.want)
-			}
-			before := [2]int{hydrator.fetchCount(chunkKey{0, 0}), hydrator.fetchCount(chunkKey{0, 1})}
-			if before != [2]int{test.wantChunkFetch, test.wantSecondFetch} {
-				t.Fatalf("fetches after write = %v, want [%d %d]", before, test.wantChunkFetch, test.wantSecondFetch)
-			}
-			close(startDrain)
-			waitForRestoreMode(t, 2*time.Second, "mixed write drain convergence", func() bool { return mode.converged.Load() })
-			after := [2]int{hydrator.fetchCount(chunkKey{0, 0}), hydrator.fetchCount(chunkKey{0, 1})}
-			if after != before {
-				t.Fatalf("drain refetched mixed-write chunks: before=%v after=%v", before, after)
-			}
-			if got := string(store.bytes(0)); got != test.want {
-				t.Fatalf("file bytes after drain = %q, want %q", got, test.want)
-			}
-		})
+	if fdatasyncsAtApply != 1 {
+		t.Fatalf("fdatasyncs before apply = %d, want hydration install only", fdatasyncsAtApply)
 	}
 }
 
-func TestShortPlannedFullWriteMergeRecallsOutsideActualRange(t *testing.T) {
-	tests := []struct {
-		name        string
-		assigned    int64
-		actualStart int64
-		want        string
-	}{
-		{name: "pwrite", assigned: -1, actualStart: 0, want: "XYcd"},
-		{name: "append-assigned-offset", assigned: 1, actualStart: 1, want: "aXYd"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			store := newFakeStore(map[uint32]int64{0: 4})
-			key := chunkKey{0, 0}
-			startDrain := make(chan struct{})
-			mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{
-				key: {Extents: []Extent{{Data: []byte("abcd")}}},
-			}, func(c *Config) { c.drainStart = startDrain; c.DrainWorkers = 1 })
-			n, assigned, err := mode.Write(context.Background(), identity, 0, 4, func() (int, int64, error) {
-				store.write(0, test.actualStart, []byte("XY"), "apply")
-				return 2, test.assigned, nil
-			})
-			if err != nil || n != 2 || assigned != test.assigned {
-				t.Fatalf("write = (%d, %d, %v)", n, assigned, err)
-			}
-			if got := string(store.bytes(0)); got != test.want {
-				t.Fatalf("merged bytes = %q, want %q", got, test.want)
-			}
-			if !mode.hmap.isDurable(key) || !mode.hmap.isModified(0) {
-				t.Fatal("merge-recalled chunk or entry-modified bit is not durable")
-			}
-			store.mu.Lock()
-			restores := store.mtimeRestores
-			store.mu.Unlock()
-			if restores != 0 {
-				t.Fatalf("merge-recall restored mtime %d times", restores)
-			}
-			if got := hydrator.fetchCount(key); got != 1 {
-				t.Fatalf("merge-recall fetches = %d, want 1", got)
-			}
-			close(startDrain)
-			waitForRestoreMode(t, 2*time.Second, "short-write drain convergence", func() bool { return mode.converged.Load() })
-			if got := hydrator.fetchCount(key); got != 1 {
-				t.Fatalf("later drain refetched repaired chunk: %d", got)
-			}
-			if got := string(store.bytes(0)); got != test.want {
-				t.Fatalf("merged bytes after drain = %q, want %q", got, test.want)
-			}
-		})
-	}
-}
-
-func TestShortWriteLeavesUntouchedPlannedFullChunkCold(t *testing.T) {
-	store := newFakeStore(map[uint32]int64{0: 8})
-	first, second := chunkKey{0, 0}, chunkKey{0, 1}
-	mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}, [2]uint32{0, 1}), map[chunkKey]Chunk{
-		first:  {Extents: []Extent{{Data: []byte("abcd")}}},
-		second: {Extents: []Extent{{Data: []byte("efgh")}}},
-	}, func(c *Config) { c.disableDrain = true })
-	n, _, err := mode.Write(context.Background(), identity, 0, 8, func() (int, int64, error) {
+func TestFullChunkWriteHydratesBeforeShortApplyAndDrainPreservesPrefix(t *testing.T) {
+	store := newFakeStore(map[uint32]int64{0: 4})
+	key := chunkKey{0, 0}
+	startDrain := make(chan struct{})
+	mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{
+		key: {Extents: []Extent{{Data: []byte("abcd")}}},
+	}, func(c *Config) { c.drainStart = startDrain; c.DrainWorkers = 1 })
+	n, _, err := mode.Write(context.Background(), identity, 0, 4, func() (int, int64, error) {
+		if !mode.hmap.isDurable(key) || !mode.hmap.isModified(0) {
+			t.Fatal("apply ran before the chunk and user-modified records were durable")
+		}
 		store.write(0, 0, []byte("XY"), "apply")
 		return 2, -1, nil
 	})
 	if err != nil || n != 2 {
 		t.Fatalf("write = (%d, %v)", n, err)
 	}
-	if !mode.hmap.isDurable(first) || mode.hmap.isHydrated(second) {
-		t.Fatal("short write did not leave only the untouched later chunk cold")
+	if got := string(store.bytes(0)); got != "XYcd" {
+		t.Fatalf("bytes after short write = %q, want XYcd", got)
 	}
-	if got := hydrator.fetchCount(second); got != 0 {
-		t.Fatalf("untouched chunk fetched during write: %d", got)
+	if got := hydrator.fetchCount(key); got != 1 {
+		t.Fatalf("write fetches = %d, want 1", got)
 	}
-	if err := mode.EnsureHydrated(context.Background(), identity, 4, 4); err != nil {
-		t.Fatal(err)
+	close(startDrain)
+	waitForRestoreMode(t, 2*time.Second, "short-write drain convergence", func() bool { return mode.converged.Load() })
+	if got := hydrator.fetchCount(key); got != 1 {
+		t.Fatalf("drain refetched the durable chunk: %d", got)
 	}
-	if got := string(store.bytes(0)); got != "XYcdefgh" {
-		t.Fatalf("bytes after later recall = %q, want %q", got, "XYcdefgh")
-	}
-	if got := hydrator.fetchCount(second); got != 1 {
-		t.Fatalf("later recall fetches = %d, want 1", got)
+	if got := string(store.bytes(0)); got != "XYcd" {
+		t.Fatalf("acked prefix after drain = %q, want XYcd", got)
 	}
 }
 
-func TestMergeRecallFailureFailsWriteAndLeavesChunkCold(t *testing.T) {
+func TestWriteHydrationFailureNeverApplies(t *testing.T) {
+	t.Run("hydrator error", func(t *testing.T) {
+		store := newFakeStore(map[uint32]int64{0: 4})
+		key := chunkKey{0, 0}
+		mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{key: {}}, func(c *Config) { c.disableDrain = true })
+		hydrator.mu.Lock()
+		hydrator.nextError = ErrBlocked
+		hydrator.mu.Unlock()
+		applied := false
+		n, assigned, err := mode.Write(context.Background(), identity, 0, 4, func() (int, int64, error) {
+			applied = true
+			return 4, -1, nil
+		})
+		if n != 0 || assigned != 0 || !errors.Is(err, ErrBlocked) || applied {
+			t.Fatalf("write = (%d, %d, %v), applied=%v", n, assigned, err, applied)
+		}
+	})
+
+	t.Run("recall deadline", func(t *testing.T) {
+		store := newFakeStore(map[uint32]int64{0: 4})
+		key := chunkKey{0, 0}
+		mode, _, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{key: {}}, func(c *Config) {
+			c.disableDrain = true
+			c.RecallLimit = 1
+			c.RecallDeadline = 50 * time.Millisecond
+		})
+		mode.recalls <- struct{}{}
+		defer func() { <-mode.recalls }()
+		applied := false
+		n, assigned, err := mode.Write(context.Background(), identity, 0, 4, func() (int, int64, error) {
+			applied = true
+			return 4, -1, nil
+		})
+		if n != 0 || assigned != 0 || !errors.Is(err, ErrRecallDeadline) || applied {
+			t.Fatalf("write = (%d, %d, %v), applied=%v", n, assigned, err, applied)
+		}
+	})
+}
+
+func TestWriteBeyondStoredRangeDurablyMarksEntryModified(t *testing.T) {
 	store := newFakeStore(map[uint32]int64{0: 4})
 	key := chunkKey{0, 0}
-	mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{
-		key: {Extents: []Extent{{Data: []byte("abcd")}}},
-	}, func(c *Config) { c.disableDrain = true })
-	hydrator.mu.Lock()
-	hydrator.nextError = ErrBlocked
-	hydrator.mu.Unlock()
-	n, _, err := mode.Write(context.Background(), identity, 0, 4, func() (int, int64, error) {
-		store.write(0, 0, []byte("XY"), "apply")
-		return 2, -1, nil
-	})
-	if n != 2 || !errors.Is(err, ErrBlocked) {
-		t.Fatalf("write = (%d, %v), want accepted prefix and ErrBlocked", n, err)
+	mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{key: {}}, func(c *Config) { c.disableDrain = true })
+	n, _, err := mode.Write(context.Background(), identity, 8, 2, func() (int, int64, error) { return 2, -1, nil })
+	if err != nil || n != 2 {
+		t.Fatalf("write = (%d, %v)", n, err)
 	}
-	if mode.hmap.isHydrated(key) {
-		t.Fatal("failed merge-recall marked the chunk")
+	if got := hydrator.fetchCount(key); got != 0 {
+		t.Fatalf("beyond-range fetches = %d, want 0", got)
 	}
-	if !mode.hmap.isModified(0) {
-		t.Fatal("failed write did not retain the durable entry-modified bit")
+	replayed, err := openHydrationMap(filepath.Join(mode.cfg.StateRoot, MapFilename), mode.ChunkSize(), mode.bindings.Digest(), 2, nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := mode.ContentError(); !errors.Is(err, ErrBlocked) {
-		t.Fatalf("failure state = %v, want ErrBlocked", err)
+	defer replayed.Close()
+	if !replayed.isModified(0) {
+		t.Fatal("entry-modified record did not replay")
 	}
 }
 
-func TestMergeRecallWaitsForAdmissionAndPreservesApplyError(t *testing.T) {
+func TestMultiChunkWriteHydratesEveryOverlappingColdChunk(t *testing.T) {
+	store := newFakeStore(map[uint32]int64{0: 8})
+	first, second := chunkKey{0, 0}, chunkKey{0, 1}
+	mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}, [2]uint32{0, 1}), map[chunkKey]Chunk{
+		first:  {Extents: []Extent{{Data: []byte("abcd")}}},
+		second: {Extents: []Extent{{Data: []byte("efgh")}}},
+	}, func(c *Config) { c.disableDrain = true; c.RecallLimit = 1 })
+	if _, _, err := mode.Write(context.Background(), identity, 2, 4, func() (int, int64, error) {
+		store.write(0, 2, []byte("WXYZ"), "apply")
+		return 4, -1, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []chunkKey{first, second} {
+		if got := hydrator.fetchCount(key); got != 1 || !mode.hmap.isDurable(key) {
+			t.Fatalf("chunk %+v fetches=%d durable=%v", key, got, mode.hmap.isDurable(key))
+		}
+	}
+	if got := string(store.bytes(0)); got != "abWXYZgh" {
+		t.Fatalf("file bytes = %q, want abWXYZgh", got)
+	}
+}
+
+func TestWriteRecallWaitsForAdmissionBeforeApply(t *testing.T) {
 	store := newFakeStore(map[uint32]int64{0: 4})
 	key := chunkKey{0, 0}
 	mode, _, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{
@@ -557,17 +523,21 @@ func TestMergeRecallWaitsForAdmissionAndPreservesApplyError(t *testing.T) {
 	}, func(c *Config) { c.disableDrain = true; c.RecallLimit = 1 })
 	mode.recalls <- struct{}{}
 	applyErr := errors.New("short pwrite")
+	applied := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
 		_, _, err := mode.Write(context.Background(), identity, 0, 4, func() (int, int64, error) {
+			close(applied)
 			store.write(0, 0, []byte("XY"), "apply")
 			return 2, -1, applyErr
 		})
 		result <- err
 	}()
 	select {
+	case <-applied:
+		t.Fatal("apply ran before recall admission")
 	case err := <-result:
-		t.Fatalf("mandatory repair did not wait for recall admission: %v", err)
+		t.Fatalf("write returned before recall admission: %v", err)
 	case <-time.After(30 * time.Millisecond):
 	}
 	<-mode.recalls
@@ -577,10 +547,10 @@ func TestMergeRecallWaitsForAdmissionAndPreservesApplyError(t *testing.T) {
 			t.Fatalf("write error = %v, want apply error", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("mandatory repair did not resume after recall admission")
+		t.Fatal("write did not resume after recall admission")
 	}
 	if !mode.hmap.isDurable(key) || string(store.bytes(0)) != "XYcd" {
-		t.Fatal("accepted prefix was not merge-repaired before propagating apply error")
+		t.Fatal("recall was not durable before the short apply")
 	}
 }
 
@@ -660,10 +630,16 @@ func TestRecallSaturationDoesNotBlockSessionKeepAlive(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newFakeStore(map[uint32]int64{0: 8})
+	// The deadline is deliberately far beyond the test's lifetime: the proof
+	// below is structural, not timed. The parked fetch never completes until
+	// this test releases it, so if the session lane shared anything with
+	// recall admission, Resume would hang here forever and the suite timeout
+	// would name this test — no wall-clock assertion is needed, and none
+	// could be honest on a loaded runner.
 	mode, hydrator, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{{0, 0}: {}}, func(c *Config) {
 		c.disableDrain = true
 		c.RecallLimit = 1
-		c.RecallDeadline = 80 * time.Millisecond
+		c.RecallDeadline = 20 * time.Second
 	})
 	hydrator.mu.Lock()
 	hydrator.blockFetch = make(chan struct{})
@@ -675,18 +651,23 @@ func TestRecallSaturationDoesNotBlockSessionKeepAlive(t *testing.T) {
 	// inside restore mode, so the authority's session lane stays free.
 	queued := make(chan error, 1)
 	go func() { queued <- mode.EnsureHydrated(context.Background(), identity, 0, 4) }()
-	start := time.Now()
 	if err := authority.Resume(credential); err != nil {
 		t.Fatalf("keepalive during recall saturation = %v", err)
 	}
-	if time.Since(start) > 20*time.Millisecond {
-		t.Fatal("keepalive waited behind recall saturation")
+	// Resume returned while the fetch was still parked, so it provably never
+	// waited behind recall admission: both recalls are still in flight.
+	if len(blocked) != 0 || len(queued) != 0 {
+		t.Fatal("recalls completed while the hydrator was parked")
 	}
-	if err := <-blocked; !errors.Is(err, ErrRecallDeadline) {
-		t.Fatalf("blocking recall = %v", err)
+	hydrator.mu.Lock()
+	close(hydrator.blockFetch)
+	hydrator.blockFetch = nil
+	hydrator.mu.Unlock()
+	if err := <-blocked; err != nil {
+		t.Fatalf("blocking recall after release = %v", err)
 	}
-	if err := <-queued; !errors.Is(err, ErrRecallDeadline) {
-		t.Fatalf("queued recall = %v", err)
+	if err := <-queued; err != nil {
+		t.Fatalf("queued recall after release = %v", err)
 	}
 	if err := authority.Resume(credential); err != nil {
 		t.Fatalf("session did not survive saturated recall: %v", err)
@@ -878,18 +859,29 @@ func TestDrainLosesRaceToWholeChunkWrite(t *testing.T) {
 		_, _, err := mode.Write(context.Background(), identity, 0, 4, func() (int, int64, error) { store.event("apply-user"); return 4, -1, nil })
 		done <- err
 	}()
+	select {
+	case <-hydrator.fetchStarted:
+	case <-time.After(time.Second):
+		t.Fatal("write did not recall after preempting drain")
+	}
+	close(block)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	close(block)
-	time.Sleep(100 * time.Millisecond)
 	store.mu.Lock()
 	events := append([]string(nil), store.events...)
 	store.mu.Unlock()
+	applied := false
 	for i, event := range events {
-		if event == "pwrite" {
+		if event == "apply-user" {
+			applied = true
+		}
+		if event == "pwrite" && applied {
 			t.Fatalf("late drain pwrite at %d after user write: %v", i, events)
 		}
+	}
+	if !applied || !mode.hmap.isDurable(chunkKey{0, 0}) {
+		t.Fatalf("write did not apply over a durable chunk: %v", events)
 	}
 }
 

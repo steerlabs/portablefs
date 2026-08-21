@@ -50,6 +50,15 @@ var (
 	ErrEnrollmentEnded         = errors.New("controlplane: mount enrollment has ended")
 	ErrRenewalScopeFenced      = errors.New("renewal_scope_fenced")
 	ErrArchiveStoreUnavailable = errors.New("controlplane: archive store unavailable")
+	// ErrArchiveUnsupported means this deployment cannot perform the requested
+	// archive-tier operation at all: the volume's cell advertises no archive
+	// configuration, or the Manager itself runs without the archive component
+	// (verifier, purger) the operation needs. It is a durable configuration
+	// fact, not load and not a state race, so clients must surface it to an
+	// operator rather than retry it as busy — which is why it is distinct from
+	// both ErrArchiveStoreUnavailable (the store exists but is unreachable
+	// right now) and ErrConflict (the volume is not in an eligible state).
+	ErrArchiveUnsupported = errors.New("controlplane: archiving is not supported by this deployment")
 	// ErrBusy is transient and carries no state change: the request was refused
 	// only because a per-cell archive/restore concurrency cap is currently full,
 	// so an unchanged retry on a later sweep is the correct response. It is

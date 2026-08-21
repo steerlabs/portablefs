@@ -149,12 +149,16 @@ func (c *hydratorClient) roundTrip(ctx context.Context, typ byte, payload []byte
 
 // Socket failures describe archive availability, not the health of XFS. Strip
 // any transport errno from the unwrap chain so an AF_UNIX EIO can never enter
-// the authority's fatal-storage classifier.
+// the authority's fatal-storage classifier. Every shape of transport timeout
+// — the ctx deadline, an os.ErrDeadlineExceeded read, or any net.Error that
+// reports Timeout — normalizes to the deadline, so the caller's recall
+// classification never depends on which timer happened to fire first.
 func hydratorTransportError(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	if errors.Is(err, os.ErrDeadlineExceeded) {
+	var netErr net.Error
+	if errors.Is(err, os.ErrDeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
 		return context.DeadlineExceeded
 	}
 	return &stateError{base: ErrBlocked, detail: err.Error()}

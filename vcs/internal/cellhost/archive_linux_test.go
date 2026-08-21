@@ -47,9 +47,7 @@ func TestLaunchConfigsAndWorkerDropInsUsePinnedBinds(t *testing.T) {
 	}
 	host, roots := archiveTestHost(t)
 	plan := archiveTestPlan()
-	if err := os.WriteFile(host.cfg.ArchiveCredentialsPath, []byte("credentials"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeArchiveCredentials(t, host, archiveCredentialLines(), 0o600)
 	if err := host.WriteArchiverConfig(plan); err != nil {
 		t.Fatal(err)
 	}
@@ -122,32 +120,105 @@ func TestResultReadersAreStrictBoundedAndReportAbsence(t *testing.T) {
 	}
 }
 
+// archiveCredentialLines is a complete, well-formed root-provisioned archive
+// credential file: every key archivestore.LoadConfigFile requires, and nothing
+// it does not understand.
+func archiveCredentialLines() []string {
+	return []string{
+		"PORTABLEFS_ARCHIVE_ENDPOINT=https://objects.example.com",
+		"PORTABLEFS_ARCHIVE_REGION=us-east-1",
+		"PORTABLEFS_ARCHIVE_BUCKET=portablefs-archive",
+		"PORTABLEFS_ARCHIVE_ACCESS_KEY_ID=AKIAEXAMPLECELLKEY",
+		"PORTABLEFS_ARCHIVE_SECRET_ACCESS_KEY=an-example-secret-access-key",
+		"PORTABLEFS_ARCHIVE_CHECKSUM_CAPABILITY=crc64nvme-full-object",
+	}
+}
+
+func writeArchiveCredentials(t *testing.T, host *Host, lines []string, mode os.FileMode) {
+	t.Helper()
+	body := ""
+	if len(lines) != 0 {
+		body = strings.Join(lines, "\n") + "\n"
+	}
+	if err := os.WriteFile(host.cfg.ArchiveCredentialsPath, []byte(body), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(host.cfg.ArchiveCredentialsPath, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // The Manager places export and hydration work only on cells that answer true
-// here, so the answer must track the credentials file exactly.
+// here, so the answer must track the credentials file exactly - not merely its
+// existence. A file that is present but cannot be parsed into a usable store
+// admits a whole archive cycle whose only possible outcome is a failure the
+// operator sees late and somewhere else.
 func TestArchiveConfiguredTracksUsableCredentials(t *testing.T) {
 	host, _ := archiveTestHost(t)
 	if host.ArchiveConfigured() {
 		t.Fatal("absent archive credentials reported as configured")
 	}
-	if err := os.WriteFile(host.cfg.ArchiveCredentialsPath, nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeArchiveCredentials(t, host, nil, 0o600)
 	if host.ArchiveConfigured() {
 		t.Fatal("empty archive credentials reported as configured")
 	}
-	if err := os.WriteFile(host.cfg.ArchiveCredentialsPath, []byte("credentials"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeArchiveCredentials(t, host, archiveCredentialLines(), 0o600)
 	if !host.ArchiveConfigured() {
 		t.Fatal("usable archive credentials reported as unconfigured")
 	}
 	// Credentials the whole cell can read are not credentials this helper will
 	// stage, so they are not a capability either.
-	if err := os.Chmod(host.cfg.ArchiveCredentialsPath, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeArchiveCredentials(t, host, archiveCredentialLines(), 0o644)
 	if host.ArchiveConfigured() {
 		t.Fatal("world-readable archive credentials reported as configured")
+	}
+}
+
+// Every way a present credentials file can still be unusable. Each case is one
+// mutation of the well-formed file, so a true answer would be the parse failing
+// to notice rather than the case being weak.
+func TestArchiveConfiguredRefusesMalformedCredentials(t *testing.T) {
+	for name, mutate := range map[string]func([]string) []string{
+		"not key=value": func(lines []string) []string {
+			return append(lines, "credentials")
+		},
+		"unknown key": func(lines []string) []string {
+			return append(lines, "PORTABLEFS_ARCHIVE_ROLE_ARN=arn:aws:iam::1:role/x")
+		},
+		"missing bucket": func(lines []string) []string {
+			return append(lines[:2:2], lines[3:]...)
+		},
+		"empty secret": func(lines []string) []string {
+			lines[4] = "PORTABLEFS_ARCHIVE_SECRET_ACCESS_KEY="
+			return lines
+		},
+		"duplicate key": func(lines []string) []string {
+			return append(lines, lines[1])
+		},
+		"quoted value": func(lines []string) []string {
+			lines[2] = `PORTABLEFS_ARCHIVE_BUCKET="portablefs-archive"`
+			return lines
+		},
+		"endpoint carries a path": func(lines []string) []string {
+			lines[0] = "PORTABLEFS_ARCHIVE_ENDPOINT=https://objects.example.com/archive"
+			return lines
+		},
+		"plaintext endpoint off loopback": func(lines []string) []string {
+			lines[0] = "PORTABLEFS_ARCHIVE_ENDPOINT=http://objects.example.com"
+			return lines
+		},
+		"unknown checksum capability": func(lines []string) []string {
+			lines[5] = "PORTABLEFS_ARCHIVE_CHECKSUM_CAPABILITY=sha256"
+			return lines
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			host, _ := archiveTestHost(t)
+			writeArchiveCredentials(t, host, mutate(archiveCredentialLines()), 0o600)
+			if host.ArchiveConfigured() {
+				t.Fatalf("archive credentials with %s reported as configured", name)
+			}
+		})
 	}
 }
 

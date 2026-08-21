@@ -336,19 +336,23 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product | `PUT /v1/volumes/{volume-id}/mount-enrollments/{enrollment-id}/revocation` | converge future renewal to revoked, closed, or absent within the product-owned volume |
 | product | `PUT /v1/renewal-fences` | atomically advance a batch of issuer-scoped renewal epoch fences and revoke superseded enrollments |
 
-Two refusals on the archive and wake routes are transient and carry no durable
-state change, so the correct client response to both is to retry the unchanged
-request later rather than to alter it:
+Three refusal classes on the archive, wake, and delete routes are kept
+distinct because each demands a different client response:
 
-| Status | Meaning | Raised by |
-| --- | --- | --- |
-| `503` | the Manager holds no archive-store credentials, or the archive store is unreachable | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` |
-| `503` | every eligible cell is at its per-cell archive or restore concurrency cap | `POST /v1/volumes/{id}/archive`, `POST /v1/volumes/{id}/wake` |
-| `409` | no cell in the pool has capacity for the volume at all | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` |
+| Status | Meaning | Raised by | Client response |
+| --- | --- | --- | --- |
+| `503` | the archive store is unreachable right now | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` | retry the unchanged request later |
+| `503` | every eligible cell is at its per-cell archive or restore concurrency cap | `POST /v1/volumes/{id}/archive`, `POST /v1/volumes/{id}/wake` | retry the unchanged request later |
+| `409` | no cell in the pool has capacity for the volume at all | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` | resolve the durable capacity state |
+| `501` | this deployment cannot archive at all: the volume's cell advertises no archive configuration, or the Manager runs without the archive component (verifier, purger) the operation needs | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` | surface to an operator; retrying is useless |
 
 Saturation is deliberately not `409`: a conflict names a durable state the
 caller must resolve, while a saturated cell resolves itself. Capacity
-exhaustion keeps `409` because it does not.
+exhaustion keeps `409` because it does not. Missing archive configuration is
+deliberately neither `409` nor `503`: it is a durable deployment fact that no
+retry and no volume-state change resolves, and a client that filed it under
+"busy" would let a misconfigured deployment fail every archive sweep silently
+forever.
 
 The renewal-fence request and response have these exact shapes:
 

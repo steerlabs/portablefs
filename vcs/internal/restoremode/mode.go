@@ -20,11 +20,6 @@ const (
 	drainBackoffMaximum = 30 * time.Second
 )
 
-type byteRange struct {
-	start uint64
-	end   uint64
-}
-
 type Mode struct {
 	cfg      Config
 	ready    readyRecord
@@ -323,10 +318,12 @@ func (m *Mode) WithAttrLock(identity [16]byte, fn func() error) error {
 }
 
 // Write serializes recall, drain, and a user write through the same chunk
-// state locks. apply returns the exact bytes XFS accepted and its assigned
-// offset (for append). Full aligned replacements are marked only after XFS
-// data durability; partial chunks are recalled and durably marked first.
+// state locks. Every stored chunk in the requested range is durably hydrated
+// before apply, so the accepted range cannot affect restore map state.
 func (m *Mode) Write(ctx context.Context, identity [16]byte, offset uint64, length uint32, apply func() (int, int64, error)) (int, int64, error) {
+	// A zero-length write is a POSIX no-op: it moves no bytes and no mtime,
+	// so it must not record the entry as user-modified — that record would
+	// permanently suppress archived-mtime restoration for an untouched file.
 	if m == nil || m.converged.Load() || length == 0 {
 		return apply()
 	}
@@ -341,20 +338,11 @@ func (m *Mode) Write(ctx context.Context, identity [16]byte, offset uint64, leng
 	m.preemptDrain()
 	locks := m.lockKeys(keys)
 	defer unlockLocks(locks)
-	chunkSize := uint64(m.ChunkSize())
-	var partial []chunkKey
-	for _, key := range keys {
-		start := uint64(key.chunk) * chunkSize
-		end := start + chunkSize
-		if offset > start || offset+uint64(length) < end {
-			partial = append(partial, key)
-		}
-	}
-	if len(partial) != 0 {
+	if len(keys) != 0 {
 		recallCtx, cancel := recallContext(ctx, m.cfg.RecallDeadline)
-		defer cancel()
-		for _, key := range partial {
+		for _, key := range keys {
 			if _, err := m.hydrateLocked(recallCtx, key, true, true); err != nil {
+				cancel()
 				err = namedRecallError(recallCtx, err)
 				if !errors.Is(err, ErrRecallDeadline) {
 					m.noteFailure(err)
@@ -362,77 +350,20 @@ func (m *Mode) Write(ctx context.Context, identity [16]byte, offset uint64, leng
 				return 0, 0, err
 			}
 		}
-		if err := m.hmap.markDurable(nil, &entry); err != nil {
-			return 0, 0, err
-		}
+		cancel()
 	}
-	m.entryLocks[entry].Lock()
-	n, assigned, applyErr := apply()
-	if n > 0 {
-		if err := m.finishWriteLocked(ctx, entry, keys, partial, offset, uint64(n), assigned); err != nil {
-			m.entryLocks[entry].Unlock()
-			return n, assigned, err
-		}
+	// A failed apply can conservatively suppress archived mtime restoration;
+	// recording the user mutation before apply keeps later hydration invisible.
+	if err := m.hmap.markDurable(nil, &entry); err != nil {
+		return 0, 0, err
 	}
-	m.entryLocks[entry].Unlock()
-	return n, assigned, applyErr
-}
-
-func (m *Mode) finishWriteLocked(ctx context.Context, entry uint32, keys, partial []chunkKey, offset, length uint64, assigned int64) error {
-	if err := m.cfg.Store.Fdatasync(entry); err != nil {
-		return err
-	}
-	actualStart := offset
-	if assigned >= 0 {
-		actualStart = uint64(assigned)
-	}
-	actualEnd := actualStart + length
-	if actualEnd < actualStart {
-		return errors.New("restoremode: accepted byte range overflow")
-	}
-	actual := byteRange{start: actualStart, end: actualEnd}
-	partialSet := make(map[chunkKey]struct{}, len(partial))
-	for _, key := range partial {
-		partialSet[key] = struct{}{}
-	}
-	chunkSize := uint64(m.ChunkSize())
-	full := make([]chunkKey, 0, len(keys))
-	repair := make([]chunkKey, 0, 2)
-	for _, key := range keys {
-		chunkStart := uint64(key.chunk) * chunkSize
-		chunkEnd := chunkStart + chunkSize
-		if actual.start <= chunkStart && actual.end >= chunkEnd {
-			full = append(full, key)
-			continue
-		}
-		_, wasPartial := partialSet[key]
-		if !wasPartial && actual.start < chunkEnd && actual.end > chunkStart && !m.hmap.isDurable(key) {
-			repair = append(repair, key)
-		}
-	}
-	// An assigned append can move beyond its predicted range, but not into a
+	// An assigned append can move beyond its requested range, but not into a
 	// cold stored chunk outside keys: restore starts at the sealed EOF, and a
 	// truncate durably marks the removed tail before a later append can reuse it.
-	if err := m.hmap.markDurable(full, &entry); err != nil {
-		return err
-	}
-	if len(repair) == 0 {
-		return nil
-	}
-	recallCtx, cancel := recallContext(ctx, m.cfg.RecallDeadline)
-	defer cancel()
-	for _, key := range repair {
-		fetched, err := m.mergeRecallLocked(recallCtx, key, actual)
-		if err != nil {
-			err = namedRecallError(recallCtx, err)
-			if !errors.Is(err, ErrRecallDeadline) {
-				m.noteFailure(err)
-			}
-			return err
-		}
-		m.recalledBytes.Add(fetched)
-	}
-	return nil
+	m.entryLocks[entry].Lock()
+	n, assigned, applyErr := apply()
+	m.entryLocks[entry].Unlock()
+	return n, assigned, applyErr
 }
 
 func (m *Mode) Truncate(ctx context.Context, identity [16]byte, oldSize, newSize int64, apply func() error) error {
@@ -550,7 +481,7 @@ func (m *Mode) hydrateLocked(ctx context.Context, key chunkKey, durable, demand 
 		return 0, err
 	}
 	m.entryLocks[key.entry].Lock()
-	err = m.installFetchedChunkLocked(key, chunk, durable, nil)
+	err = m.installFetchedChunkLocked(key, chunk, durable)
 	m.entryLocks[key.entry].Unlock()
 	if err != nil {
 		return 0, err
@@ -559,18 +490,6 @@ func (m *Mode) hydrateLocked(ctx context.Context, key chunkKey, durable, demand 
 	if demand {
 		m.recalledBytes.Add(chunk.Bytes)
 	}
-	return chunk.Bytes, nil
-}
-
-func (m *Mode) mergeRecallLocked(ctx context.Context, key chunkKey, preserve byteRange) (uint64, error) {
-	chunk, err := m.fetchChunk(ctx, key)
-	if err != nil {
-		return 0, err
-	}
-	if err := m.installFetchedChunkLocked(key, chunk, true, &preserve); err != nil {
-		return 0, err
-	}
-	m.clearBlocked()
 	return chunk.Bytes, nil
 }
 
@@ -597,30 +516,13 @@ func (m *Mode) fetchChunk(ctx context.Context, key chunkKey) (Chunk, error) {
 	return m.client.fetch(ctx, key, m.ChunkSize())
 }
 
-// installFetchedChunkLocked runs with the entry lock held. preserve names
-// acknowledged user bytes that archive extents must not overwrite.
-func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool, preserve *byteRange) error {
+// installFetchedChunkLocked runs with the entry lock held.
+func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool) error {
 	chunkStart := uint64(key.chunk) * uint64(m.ChunkSize())
 	for _, extent := range chunk.Extents {
 		start := chunkStart + extent.Offset
-		end := start + uint64(len(extent.Data))
-		if preserve == nil || preserve.end <= start || preserve.start >= end {
-			if err := m.cfg.Store.PWrite(key.entry, int64(start), extent.Data); err != nil {
-				return err
-			}
-			continue
-		}
-		if start < preserve.start {
-			leftEnd := min64(end, preserve.start)
-			if err := m.cfg.Store.PWrite(key.entry, int64(start), extent.Data[:leftEnd-start]); err != nil {
-				return err
-			}
-		}
-		if end > preserve.end {
-			rightStart := maxUint64(start, preserve.end)
-			if err := m.cfg.Store.PWrite(key.entry, int64(rightStart), extent.Data[rightStart-start:]); err != nil {
-				return err
-			}
+		if err := m.cfg.Store.PWrite(key.entry, int64(start), extent.Data); err != nil {
+			return err
 		}
 	}
 	if !m.hmap.isModified(key.entry) {
@@ -639,20 +541,6 @@ func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool
 		m.hmap.markLazy(key)
 	}
 	return nil
-}
-
-func min64(a, b uint64) uint64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func maxUint64(a, b uint64) uint64 {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // UserMutation protects a user-visible metadata mutation whose mtime must win

@@ -145,32 +145,42 @@ component and costs search permission, which a `0000` directory does not grant.
 `chmod` moves `ctime` only, so applying the mode last cannot disturb the
 timestamp just restored.
 
-**Hydration — fchmod around the write.** The namespace is materialized at final
-modes immediately, and the bytes arrive afterwards, so the authority routinely
-has to write into a file that is already `0444` or `0000`. Reopening such an
-inode `O_RDWR` answers `EACCES`. `xfsstore`'s restore store therefore performs
-the narrowest possible dance, and only on `EACCES` — the common path is
-untouched: read the exact mode from the held `O_PATH` descriptor, add owner
-read/write (`|0600`) through that same descriptor with `AT_EMPTY_PATH`, reopen,
-write, and put the exact original mode back, including on the error path. A
-failed restoration of the mode surfaces as an error joined onto the operation's
-own; it is never swallowed. Every step addresses the inode through the held
-descriptor, never by re-resolving a name, so a rename cannot redirect the chmod
-at a different inode. `RestoreMtime` needs no dance and does not have one:
-`utimensat` with explicit timestamps is permitted to the owner regardless of
-mode. The same dance, with `|0500`, covers the startup walk that binds restored
-identities: it must read a `0000` directory to reach the files inside it. That
-walk runs once, before the volume server accepts any session.
+**Hydration — descriptors opened before serving, no mode ever moved after.**
+The namespace is materialized at final modes immediately, and the bytes arrive
+afterwards, so the authority routinely has to write into a file that is already
+`0444` or `0000`. The kernel checks permission at `open(2)` and never again, so
+the startup binding walk — which runs once, strictly before the volume server
+accepts any session — opens each bound restore file `O_RDWR` and retains that
+one descriptor for the lifetime of the restore. Every hydration `pwrite`,
+`fdatasync`, and size query then addresses the retained descriptor directly:
+the serving authority never touches a mode, so there is no window for `LOOKUP`
+or `READDIR` to observe, no race with a user `chmod` (whatever the user sets
+simply stands — hydration neither consults nor disturbs it), and no way for a
+serving-time crash to leave a file widened. `RestoreMtime` needs no access at
+all: `utimensat` with explicit timestamps is permitted to the owner regardless
+of mode, addressed through the retained descriptor with `AT_EMPTY_PATH`.
 
-*Visibility, stated honestly.* Drain and recall hold the restore mode's
-per-entry lock across the write, and the authority's `GETATTR` takes that lock
-for reading, so a `GETATTR` of the inode cannot land inside the window.
-`LOOKUP` and `READDIR`-with-attributes do **not** take it: a concurrent listing
-can transiently report the owner-writable mode. The inode's `ctime` also moves
-twice per hydration write and is not restored — Linux offers no honest way, and
-the format records `ctime` as metadata only. A crash inside the window leaves
-the widened mode behind. The startup binding walk has no such exposure at all,
-because no client exists yet.
+The walk itself is where modes move, and only there: an archived mode can deny
+its own owner (the archiver holds `CAP_DAC_READ_SEARCH` precisely so such trees
+can be archived; the authority holds nothing), so on `EACCES` — and only then —
+the walk reads the exact bits through the entry's `O_PATH` descriptor, adds
+`|0500` to enumerate a directory or `|0600` to open a file for writing, and
+puts the exact bits back before moving on. Every step addresses the inode
+through the descriptor, never by re-resolving a name, so a rename cannot
+redirect the chmod at a different inode; a failed narrow-back is joined into
+the walk's error and refuses the restore rather than serving a quietly widened
+tree. The residual is one honest line: a crash between the walk's widen and its
+narrow-back leaves that single inode widened until the next restore
+materializes a fresh tree, and `ctime` moves and cannot be put back — the
+format records `ctime` as metadata only. No client exists during the walk, so
+neither is observable in a serving volume.
+
+*Attribute visibility.* Drain and recall hold the restore mode's per-entry
+lock across `pwrite` + `RestoreMtime`, and the authority's `GETATTR` takes that
+lock for reading. What the lock guards is **mtime**, not modes: between the
+write and the mtime restoration the inode carries a timestamp no user
+produced, and hydration is contractually invisible — `make` must not rebuild
+and `git status` must stay clean across a wake.
 
 ## Authority ↔ hydrator socket protocol (pinned)
 
@@ -225,31 +235,26 @@ surfaced volume-wide.
   1. *Recall for read*: fetch → verify slice digest → authority `pwrite`s
      base bytes → serve the read. Marking is lazy and needs no barrier:
      re-fetching sealed bytes is idempotent.
-  2. *Recall for write* (partial chunk overwrite, shortening truncate
-     boundary, RMW): fetch → verify → `pwrite` base bytes →
-     `fdatasync` the file → set the map bit → `fsync` the map → apply the
-     user mutation → acknowledge it. Base-byte durability strictly
-     precedes mark durability, which strictly precedes the user write:
-     a durable mark therefore always covers durable base bytes, and an
-     acknowledged user write is never applied to a chunk whose mark could
-     be lost.
-  3. *Whole-chunk-aligned overwrite* and *O_TRUNC to zero*: no fetch —
-     but the mark may only become durable once the replacement bytes are.
-     A write first recalls chunks that are partial in its requested range,
-     then applies the mutation. For every accepted prefix, including a
-     short write, the authority `fdatasync`s the file and durably records
-     both the user-modified bit and every stored chunk fully covered by the
-     actual range returned by XFS (using the assigned offset for append).
-     If that actual range only partially covers a requested-full cold
-     chunk, the authority merge-recalls it: fetch the sealed chunk, write
-     only extent bytes outside the accepted range, `fdatasync`, then mark
-     the chunk. This repair is mandatory rather than recall-admission
-     fail-fast. Its failure fails the write; the chunk remains unmarked, so
-     a later recall may restore sealed bytes over the failed write's
-     accepted prefix, as ordinary failed-write semantics permit. Marking
-     before the resulting bytes are durable would let a crash leave a
-     marked chunk whose XFS bytes are still the sparse restore placeholder
-     — a false canonical claim that would silently serve zeros.
+  2. *Recall for write* (every user write that overlaps cold stored
+     chunks, and the shortening-truncate boundary): fetch → verify →
+     `pwrite` base bytes → `fdatasync` the file → set the map bit →
+     `fsync` the map → durably record the entry's user-modified bit →
+     apply the user mutation → acknowledge it. **A user write only ever
+     lands on chunks that are already durably hydrated and durably
+     marked.** Once `apply` runs, no map state depends on the write's
+     outcome: a short write is a plain POSIX short write, the accepted
+     prefix sits on a marked chunk, and nothing — not a drain, not a
+     later recall — can ever restore sealed bytes over acknowledged user
+     bytes. If the recall fails, the write fails whole with nothing
+     accepted and nothing to repair. There is deliberately no
+     fetch-free whole-chunk-overwrite path: it saved nothing real (a
+     single FUSE write is capped well under the chunk size, so no write
+     can cover a chunk at shipped defaults) and it was the only path on
+     which an accepted prefix could exist on an unmarked chunk — the
+     one state the invariant forbids. The user write itself carries no
+     `fdatasync`: its durability is the client's `fsync` problem,
+     exactly as on a plain volume, because the map records nothing about
+     user-written bytes.
   Crash recovery is then exactly two lines: durably marked ⇒ XFS canonical
   for that chunk; unmarked ⇒ re-fetch from the sealed base. A crash
   between content durability and map `fsync` re-runs an idempotent step
@@ -292,9 +297,10 @@ surfaced volume-wide.
   Write prepare, SetAttr{size}). Namespace and attribute operations never
   recall — the namespace is fully materialized; only content does.
 - Single-flight per chunk. `O_TRUNC` to zero skips the fetch and marks the
-  chunk range hydrated; unlink of a fully-cold file fetches nothing; a
-  partial write or shortening truncate recalls the affected chunks first;
-  a whole-chunk-aligned overwrite marks without fetching.
+  chunk range hydrated; unlink of a fully-cold file fetches nothing; every
+  user write and shortening truncate recalls its overlapping cold chunks
+  first — there is no fetch-free overwrite path (ordering contract,
+  rule 2).
 - `fsync` on a partially hydrated file is already honest: hydrated chunks
   are durable in XFS, unhydrated chunks are durable in the sealed archive.
   fsync fsyncs XFS; nothing more is needed.

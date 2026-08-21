@@ -68,11 +68,29 @@ func requirePrivilegedEnvironment(t *testing.T) privilegedEnv {
 		t.Skipf("privileged gates are not configured; set %s, %s and %s=1", envXFSRoot, envXFSProject, envFUSE)
 	}
 	// default_permissions delegates every access decision to the kernel. Root
-	// bypasses all of it through CAP_DAC_OVERRIDE, which would make the
-	// restricted-mode feasibility probe answer yes for the wrong reason and
-	// every permission assertion vacuous.
+	// bypasses all of it through CAP_DAC_OVERRIDE, which would make every
+	// permission assertion vacuous - in particular the restricted-mode stage,
+	// where hydration must land in an inode this identity genuinely cannot open
+	// for writing. CI therefore runs the suite as the volume identity and grants
+	// it nothing beyond CAP_DAC_READ_SEARCH, which is the archiver's capability
+	// and bypasses read and search only; write is still refused, so the
+	// authority's descriptor binding is proved rather than assumed.
 	if required && os.Geteuid() == 0 {
 		t.Fatalf("%s=1 requires the unprivileged volume identity; running as root makes every DAC assertion vacuous", envRequired)
+	}
+	// The archiver's capability, and nothing beyond it. The tree this suite
+	// archives contains inodes whose modes deny their own owner, which is a
+	// shape a real workspace produces and the archive format promises to carry;
+	// reading them is the archiver's job, and the archiver unit is the one
+	// component in the cell that holds CAP_DAC_READ_SEARCH. Its absence is a
+	// provisioning fault rather than a reason to prove less, so under
+	// PORTABLEFS_XFS_TEST_REQUIRED it is a failure named at the top of the
+	// suite instead of an EACCES from somewhere deep inside the archiver.
+	if !holdsDACReadSearch(t) {
+		if required {
+			t.Fatalf("%s=1 but this process does not hold CAP_DAC_READ_SEARCH; the archiver's capability is provisioned by scripts/xfs-fuse-integration.sh", envRequired)
+		}
+		t.Skip("the tiered suite needs the archiver's CAP_DAC_READ_SEARCH; run it through scripts/xfs-fuse-integration.sh")
 	}
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		t.Fatalf("%s must be an absolute clean path, got %q", envXFSRoot, root)
@@ -82,6 +100,19 @@ func requirePrivilegedEnvironment(t *testing.T) privilegedEnv {
 		t.Fatalf("%s=%q is not a uint32: %v", envXFSProject, project, err)
 	}
 	return privilegedEnv{xfsRoot: root, projectID: uint32(parsed)}
+}
+
+// holdsDACReadSearch reports whether this process can actually read and search
+// past a mode that denies it. Capabilities are per-thread, but nothing in this
+// suite raises or lowers one, so every thread carries what exec handed it.
+func holdsDACReadSearch(t *testing.T) bool {
+	t.Helper()
+	header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var payload [2]unix.CapUserData
+	if err := unix.Capget(&header, &payload[0]); err != nil {
+		t.Fatalf("read this process's capability sets: %v", err)
+	}
+	return payload[0].Effective&(1<<unix.CAP_DAC_READ_SEARCH) != 0
 }
 
 // newVolumeDirectory creates a collision-free directory inside the provisioned
