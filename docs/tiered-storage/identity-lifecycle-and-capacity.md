@@ -218,6 +218,19 @@ The Manager records a durable per-volume cursor (`ArchiveCycleStep`:
 `quiescing → exporting → sealed → destroyed → released`). Every step is
 idempotent and crash-resumable by Manager, agent, helper, or archiver.
 
+**Preconditions, all checked before any state change.** An archive request
+that fails one of these is refused with the volume still READY and the cell
+plan unbumped; nothing is half-entered.
+
+- **The Manager can verify.** A Manager started without archive credentials
+  holds no verifier, so it could never complete step 3 and the volume would
+  wedge at cursor `verifying` no longer serving. `ArchiveVolume` refuses
+  such a request outright with `ErrArchiveStoreUnavailable` (503).
+- **The cell can export.** The placement cell must report
+  `archive_configured` (§4). A cell whose helper holds no readable
+  archive-store credentials can neither export nor hydrate.
+- **The cell has an archive slot.** See the per-cell caps in §5.
+
 1. **Quiesce** (active, not timed; the authority stays up until membership
    is empty).
    1. Revoke all mount enrollments (`terminateVolumeEnrollments`) and stop
@@ -431,8 +444,18 @@ type ArchiveRecord struct {
     LogicalBytes, LogicalInodes uint64          // display/product totals
     SealedAllocatedBytes, SealedInodes uint64   // admission sizing (pack-format.md)
     KeyVersion string
+    SealedMeasuredBytes, SealedMeasuredInodes uint64  // measured usage at seal commit; 0 = unmeasured
 }
 ```
+
+`SealedMeasured*` is captured by the Manager at the instant the verified seal
+commits, from the placement's last measurement. The volume is quiesced for the
+whole cycle, so that reading is exact or a pre-quiesce lower bound — both safe
+under the `max()` that restore admission applies (§5). Zero is a valid,
+permanently supported value: records sealed before the field existed decode
+zero and are charged from `SealedAllocatedBytes`/`SealedInodes` alone. It is
+Manager-internal admission input and is deliberately absent from
+`ArchiveSummaryView`, which stays the minimal product projection.
 
 Bounds: `len(Packs) <= 1024`, `len(ObjectRef.Key) <= 512`, serialized
 `ArchiveRecord <= 512 KiB`, and the helper's `ArchiveSealed` observation
@@ -537,6 +560,18 @@ agent; until then it signs v1 plans containing only v1-expressible
 phases. Archive/restore for volumes on a cell is gated on that cell's v2
 plan capability.
 
+The same observation carries one further capability, on the same
+declared-never-inferred rule: `archive_configured: bool`. The helper answers it
+on every status pass, true exactly when its configured archive-credentials path
+is non-empty and names a file that is present, non-empty, and unreadable by
+group and other — the same shape the helper will demand when it stages those
+credentials for an archiver or hydrator unit. It is a live fact, not a durable
+one: revoking the file stops new archive and restore placement on the next
+poll. The Manager stores it on the cell and requires it for `ArchiveVolume` and
+for restore admission; ordinary create placement does not require it. Absent
+from persisted state it decodes `false`, which refuses archive work until the
+cell reports otherwise — correct and safe under rollback.
+
 ## 5. Capacity model
 
 Removed: the hard sum-of-entitlement invariant and entitlement-sum
@@ -559,9 +594,13 @@ admission. Replaced by measured usage plus bounded in-flight charges.
   `PendingBytes/PendingInodes` charge set at admission. A create charges
   the configured provision floor and clears the charge at the first usage
   observation with `UsedObservedUnix > placement.CreatedUnix`. A restore
-  charges the archive's sizing requirement — `ceil(1.05 ×
-  SealedAllocatedBytes) + 64 MiB` and `SealedInodes + 1024` (constants are
-  configuration with these defaults) — and the charge is **retained until
+  charges the archive's sizing requirement — `ceil(1.05 × base) + 64 MiB`
+  and `baseInodes + 1024` (constants are configuration with these
+  defaults), where `base = max(SealedAllocatedBytes, SealedMeasuredBytes)`
+  and `baseInodes = max(SealedInodes, SealedMeasuredInodes)`: the archive's
+  packed sizing and the tree's measured allocation at seal time can each
+  understate the other, so admission charges the larger before overhead
+  (§3) — and the charge is **retained until
   the Manager has committed convergence**, then cleared by the first
   post-convergence measurement: the early namespace is sparse and the
   drain grows toward the sealed totals, so a pre-convergence measurement
@@ -575,13 +614,51 @@ admission. Replaced by measured usage plus bounded in-flight charges.
   decommissioning, `cellFresh` (live heartbeat at the current plan
   generation), and its newest usage observation is younger than the
   configured `UsageStaleAfter`; otherwise admission fails closed for that
-  cell. Then:
+  cell. Restore admission additionally requires the cell to declare plan
+  version 2 **and** `archive_configured` (§4); create admission requires
+  neither. Then:
   `Σ_over_placements charge(p) + incoming + reserve ≤ capacity`, where
   `reserve` is the configured cell reserve fraction and per placement
-  `charge(p) = max(fresh measured used, pending, provision floor)` — a
+  `charge(p) = max(measured used, pending, provision floor)` — a
   placement lacking a fresh measurement of its own always contributes at
   least `max(last measured, pending, floor)`, never zero, so one freshly
   measured placement cannot launder an unmeasured sibling's usage.
+  **Per-placement staleness is charged at quota.** The cell-level freshness
+  gate does not cover one placement whose own measurement froze while its
+  cell kept heartbeating — a host measurement failure on a single volume is
+  exactly that shape. When
+  `now - max(placement.UsedObservedUnix, placement.CreatedUnix) >
+  UsageStaleAfter`, that placement is charged
+  `max(volume.QuotaBytes, pending, floor)` (and `QuotaInodes` for inodes)
+  instead of the reading nobody is refreshing. A new placement therefore has
+  one `UsageStaleAfter` grace window from `CreatedUnix` and is charged at its
+  quota ceiling after that until it is measured.
+- **Per-cell archive and restore concurrency.** An archiver and a hydrator
+  are each a full-tree-I/O process colocated with live volume authorities,
+  and nothing else bounds how many a cell may run. Two configured caps do:
+  `MaxArchivingPerCell` (default 2, `-max-archiving-per-cell`) and
+  `MaxRestoringPerCell` (default 4, `-max-restoring-per-cell`); both must be
+  positive.
+  - `ArchiveVolume` counts, on the placement's cell, volumes in `ARCHIVING`
+    at cursor `quiescing` or `exporting`. Cursor `verifying` does **not**
+    count: phase exit already proved the archiver unit absent, and the only
+    outstanding work is the Manager's own archive-store verification, which
+    burdens the Manager rather than the cell. At the cap the request is
+    refused with `ErrBusy` and **no state change**, so a product sweep simply
+    retries the unchanged request on its next pass.
+  - Restore admission skips any cell already holding `MaxRestoringPerCell`
+    `RESTORING` placements. The skip is evaluated **after** every eligibility
+    and capacity check, so a cell rejected there is known to be otherwise
+    able to hold the placement.
+  - Busy is not capacity. If every candidate cell was passed over only for
+    the restore cap, admission returns `ErrBusy` (retry unchanged), not
+    `ErrCapacity` (the fleet cannot hold this volume). `WakeVolume`
+    propagates whichever it gets, unaltered.
+  - `GET /v1/capacity` keeps its simple probe: `RestoreAdmissible` is
+    "a restore would be admitted right now", so a fleet that is merely
+    saturated reports `false` exactly as an exhausted one does. The report
+    is a per-pool sizing view, not a diagnosis of why a single request would
+    be refused; the caller's error carries that distinction.
 - **Restore priority.** When post-admission headroom would fall below the
   configured wake-burst envelope, creates are refused with `ErrCapacity`
   while restores are still admitted. Fleet policy holds headroom ≥ the

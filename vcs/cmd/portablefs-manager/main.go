@@ -81,8 +81,13 @@ func run() error {
 	clientCertLifetime := flag.Duration("mount-client-cert-lifetime", time.Hour, "mount client certificate lifetime")
 	authorityCertLifetime := flag.Duration("authority-cert-lifetime", 24*time.Hour, "authority server certificate lifetime")
 	observedStale := flag.Duration("observed-stale-after", 2*time.Minute, "maximum cell observation age for mount issuance")
+	maxArchivingPerCell := flag.Int("max-archiving-per-cell", 2, "maximum concurrent archive cycles doing cell-side work on one cell")
+	maxRestoringPerCell := flag.Int("max-restoring-per-cell", 4, "maximum concurrent restores placed on one cell")
 	clockSkew := flag.Duration("clock-skew", 5*time.Second, "maximum authenticated clock disagreement")
 	flag.Parse()
+	if *maxArchivingPerCell <= 0 || *maxRestoringPerCell <= 0 {
+		return errors.New("max-archiving-per-cell and max-restoring-per-cell must be positive")
+	}
 	if flag.NArg() != 0 || *listen == "" || *stateFile == "" || *serverCert == "" || *serverKey == "" ||
 		*controlCA == "" || *planKey == "" || *capabilityKey == "" || *authorityCACert == "" ||
 		*authorityCAKey == "" || *clientCACert == "" || *clientCAKey == "" ||
@@ -171,6 +176,7 @@ func run() error {
 		EnrollmentLifetime: *enrollmentLifetime,
 		ProductMaxLifetime: *productLifetime, ClientCertLifetime: *clientCertLifetime,
 		AuthorityCertLifetime: *authorityCertLifetime, ObservedStaleAfter: *observedStale, ClockSkew: *clockSkew,
+		MaxArchivingPerCell: *maxArchivingPerCell, MaxRestoringPerCell: *maxRestoringPerCell,
 		ArchiveVerifier: archiveVerifier, ArchivePurger: archivePurger,
 	})
 	if err != nil {

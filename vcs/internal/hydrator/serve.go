@@ -20,8 +20,9 @@ import (
 
 // PackObjectName is the pinned last key component of pack object index. Keys
 // are derived, never carried: the manifest names how many packs there are and
-// nothing more.
-func PackObjectName(index int) string { return fmt.Sprintf("pack-%06d", index) }
+// nothing more. The definition lives with the key grammar in archivestore so
+// the writer, this reader, and the Manager's verifier cannot diverge.
+func PackObjectName(index int) string { return archivestore.PackObjectName(index) }
 
 const (
 	// MaxDrainPairs bounds the in-memory drain order at 8 Mi pairs, 64 MiB. At

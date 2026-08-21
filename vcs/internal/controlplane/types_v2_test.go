@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -37,6 +38,17 @@ func TestStateV2RejectsPlacementAndLifecycleCrossInvariantViolations(t *testing.
 			v.ArchiveCycleStep = "quiescing"
 			state.Volumes[v.ID] = v
 		}},
+		// Archive capability is a relayed cell report, never an assumption a
+		// never-observed cell gets for free.
+		{name: "archive capability without observation", mutate: func(state *State) {
+			unobserved := state.Cells[state.Volumes[volume.ID].Placement.CellID]
+			unobserved.ID = "44444444-4444-4444-8444-444444444444"
+			unobserved.LastObservedUnix = 0
+			unobserved.LastManagerRelease, unobserved.LastAgentRelease, unobserved.LastHelperRelease = "", "", ""
+			unobserved.Health = CellUnknown
+			unobserved.ArchiveConfigured = true
+			state.Cells[unobserved.ID] = unobserved
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			state, err := cloneState(base)
@@ -71,5 +83,15 @@ func TestArchiveRecordBoundsAreEnforced(t *testing.T) {
 	longKey.Manifest.Key = strings.Repeat("k", MaxArchiveObjectKeyBytes+1)
 	if err := longKey.Validate(); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("key bound = %v", err)
+	}
+	// Seal-time measured usage is optional in both directions: absent (zero) for
+	// records sealed before it existed, present for every new one.
+	measured := record
+	measured.SealedMeasuredBytes, measured.SealedMeasuredInodes = 1<<30, 4096
+	if err := measured.Validate(); err != nil {
+		t.Fatalf("measured record = %v", err)
+	}
+	if encoded, err := json.Marshal(record); err != nil || strings.Contains(string(encoded), "sealed_measured") {
+		t.Fatalf("unmeasured record encoding = %s, %v", encoded, err)
 	}
 }

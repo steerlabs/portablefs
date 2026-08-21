@@ -80,6 +80,24 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestARoutingChangeRevokesEveryMountWithARemountMessage"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftedFileDescriptorsSurviveTheRootBeingRebuilt"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestGraftsCarryARealWorkloadWithoutTheAuthority"
+  # The tiered-storage lifecycle. This is the only place the archiver, the
+  # hydrator, authority-side restore mode and a real kernel FUSE mount are
+  # driven as one system on real XFS, so every stage of it is named here rather
+  # than only the parent test: a stage that is renamed away, or that starts
+  # skipping, must fail this job instead of quietly removing the proof that a
+  # restored volume serves the bytes that were archived. The one stage that may
+  # legitimately skip - the restricted-mode capability probe - is deliberately
+  # absent from this list.
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ArchiveAndVerify"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/InstantNamespaceOnANewPlacement"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ServeWhileCold"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedIsUniformAndNonFatal"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/RestoreBlockedClearsWhenTheHydratorReturns"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ColdTreeMatchesTheArchive"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/Converge"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/PlainServingAfterConvergence"
+  "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ManagerIndependentVerification"
 )
 
 fail() {
@@ -161,10 +179,12 @@ run_suite() {
   fi
   # Deliberately unprivileged: the permission assertions in the suite are only
   # meaningful when DAC actually applies, and the production data plane never
-  # runs as root. PORTABLEFS_XFS_TEST_REQUIRED turns every gate skip into a
-  # failure so a broken provisioner cannot present as a green run. -p 1 keeps
-  # the three privileged packages from opening the one provisioned XFS cell
-  # concurrently, which its exclusive volume lock forbids.
+  # runs as root. It is also what makes the tiered lifecycle's restricted-mode
+  # probe honest: root would bypass every mode through CAP_DAC_OVERRIDE and
+  # answer yes for the wrong reason. PORTABLEFS_XFS_TEST_REQUIRED turns every
+  # gate skip into a failure so a broken provisioner cannot present as a green
+  # run. -p 1 keeps the privileged packages from opening the one provisioned XFS
+  # cell concurrently, which its exclusive volume lock forbids.
   set +e
   runuser -u portablefs -- env -i \
     HOME=/home/portablefs \
@@ -180,8 +200,8 @@ run_suite() {
     PORTABLEFS_FUSE_TEST=1 \
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 25m "${extra_go_test_flags[@]}" \
-    ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... \
+    go -C /work/vcs test -v -count=1 -p 1 -timeout 35m "${extra_go_test_flags[@]}" \
+    ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... ./internal/tierede2e/... \
     >"$log" 2>&1
   status=$?
   set -e

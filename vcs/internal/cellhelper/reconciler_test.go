@@ -16,13 +16,17 @@ import (
 )
 
 type fakeHost struct {
-	absent   bool
-	calls    []cellplan.VolumePlan
-	observes []cellplan.VolumePlan
+	absent            bool
+	archiveConfigured bool
+	calls             []cellplan.VolumePlan
+	observes          []cellplan.VolumePlan
 }
 
+func (host *fakeHost) ArchiveConfigured() bool { return host.archiveConfigured }
+
 type scriptedHost struct {
-	applies []struct {
+	archiveConfigured bool
+	applies           []struct {
 		observation controlplane.VolumeObservation
 		update      HostUpdate
 	}
@@ -31,6 +35,8 @@ type scriptedHost struct {
 		update      HostUpdate
 	}
 }
+
+func (host *scriptedHost) ArchiveConfigured() bool { return host.archiveConfigured }
 
 func (host *scriptedHost) Apply(_ context.Context, _ cellplan.VolumePlan, _ Assignment) (controlplane.VolumeObservation, HostUpdate) {
 	if len(host.applies) == 0 {
@@ -384,4 +390,28 @@ func signedHelperPlan(t *testing.T, key ed25519.PrivateKey, plan cellplan.Plan) 
 		t.Fatal(err)
 	}
 	return envelope
+}
+
+// The archive capability is a live per-pass fact, not a durable one: the helper
+// answers it on every observation so credentials appearing or being revoked
+// reach the Manager on the next poll.
+func TestReconcilerReportsHostArchiveCapabilityEveryPass(t *testing.T) {
+	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+	now := time.Unix(1_900_000_000, 0)
+	host := &fakeHost{archiveConfigured: true}
+	reconciler := &Reconciler{
+		CellID: "11111111-1111-4111-8111-111111111111", PlanPublicKey: publicKey,
+		ClockSkew: 10 * time.Second, PlanLifetime: 5 * time.Minute, Now: func() time.Time { return now },
+		StatePath: filepath.Join(t.TempDir(), "state"), Host: host, ReleaseID: "helper-test",
+	}
+	plan := helperPlan(now, reconciler.CellID, 1, 1, cellplan.PhaseServe)
+	observation, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, plan))
+	if err != nil || !observation.ArchiveConfigured {
+		t.Fatalf("configured helper observation = %+v, %v", observation, err)
+	}
+	host.archiveConfigured = false
+	observation, err = reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, plan))
+	if err != nil || observation.ArchiveConfigured {
+		t.Fatalf("revoked helper observation = %+v, %v", observation, err)
+	}
 }

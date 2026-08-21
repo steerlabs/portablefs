@@ -243,10 +243,12 @@ state clears when archive fetches succeed again.
 volume-level state: content reads stop uniformly rather than varying by hydrated
 versus cold data, the affected paths remain enumerable from the manifest, and
 unverified bytes are never served. Recovery requires repair that re-establishes
-a Manager-verified sealed representation. Neither state maps to `EIO`,
-`EUCLEAN`, `ESHUTDOWN`, or `ENOTRECOVERABLE`; hydration failures never enter the
-fatal-storage set and never end the epoch. Mounts and sessions stay alive in
-both states.
+a Manager-verified sealed representation. Both states answer applications with
+errno `EIO` — never `EAGAIN`, which parks poll-driven runtimes on a pollable
+FUSE file — but always under `FAILURE_CLASS_RESTORE`, which keeps them out of
+the fatal-storage classification entirely: hydration failures never enter the
+fatal-storage set and never end the epoch, however the errno reads. Mounts and
+sessions stay alive in both states.
 
 ## Routing revision mismatch
 

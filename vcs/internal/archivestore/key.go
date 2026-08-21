@@ -22,6 +22,19 @@ var (
 	objectPattern = regexp.MustCompile(`^[a-z0-9-]{1,64}$`)
 )
 
+// ManifestObjectName is the pinned last key component of an attempt's manifest
+// object. It is the only entry point into an attempt: the archive is never
+// listed.
+const ManifestObjectName = "manifest"
+
+// PackObjectName is the pinned last key component of pack object index. Keys
+// are derived, never carried, so the writer (archiver), the reader (hydrator),
+// and the independent verifier (archiveverify/Manager) MUST all derive from
+// this one definition — three private spellings once let the verifier derive a
+// key no archiver ever wrote, refusing every real archive. The zero-padded form
+// satisfies objectPattern for every index the format allows (archive.MaxPacks).
+func PackObjectName(index int) string { return fmt.Sprintf("pack-%06d", index) }
+
 // KeyFor derives the one object key for an archive attempt's object:
 //
 //	<prefix>/<volumeID>/<epoch>-<attempt>/<object>

@@ -27,13 +27,26 @@ const MaxRestoreDepth = 1024
 // group. Files, symlinks, and extended attributes are finished here.
 //
 // Pass two walks the directories again and finalizes them from the bottom up:
-// the archived mode (including set-ID and sticky bits), then the exact
-// nanosecond mtime, then fsync. Directory mtimes must be applied after every
-// child exists, because creating a child bumps its parent's mtime; splitting
-// the pass is what makes that ordering structural rather than delicate. It also
-// means every directory is still 0700 while the tree is being built, so the
-// link source of a hardlink group is always reachable no matter what mode the
+// the exact nanosecond mtime, then the archived mode (including set-ID and
+// sticky bits), then fsync. Directory mtimes must be applied after every child
+// exists, because creating a child bumps its parent's mtime; splitting the pass
+// is what makes that ordering structural rather than delicate. It also means
+// every directory is still 0700 while the tree is being built, so the link
+// source of a hardlink group is always reachable no matter what mode the
 // archive recorded for the directory it lives in.
+//
+// The single invariant that makes an archived mode denying its own owner
+// restorable is that nothing addresses a node by name after that node's mode
+// has landed. An archive can contain such modes - the archiver is granted
+// CAP_DAC_READ_SEARCH so it can read them, see
+// deploy/systemd/portablefs-archiver@.service - and the restorer holds no
+// capability at all, so it must never need one. For a file that is free: the
+// creating descriptor carries the access the creation granted, so truncate,
+// attributes, and the mode itself are all fd-relative, and only the mtime is
+// applied by name, while the parent is still 0700 and the file's own mode is
+// irrelevant to a utimensat the owner is entitled to make. For a directory it
+// is this pass: children first, then the directory's own mtime, then its mode
+// last, deepest first.
 func materialize(root *os.File, manifest *archive.Manifest) ([]Binding, error) {
 	if err := requireEmpty(root); err != nil {
 		return nil, err
@@ -381,13 +394,24 @@ func (r *restorer) finalizeDirectories() error {
 	return nil
 }
 
+// finalizeDirectory applies one directory's archived mtime and then its
+// archived mode, in that order and never the reverse.
+//
+// The order is a correctness requirement, not a preference. setTimesSelf is
+// utimensat(fd, ".", ...), and resolving even a single "." component costs
+// search permission on the directory it resolves in: against an archived mode
+// with no owner execute bit - 0000, 0400, 0600 - that call answers EACCES even
+// for the identity that owns the volume. The mode is therefore
+// the last thing applied to a directory, exactly as it is the last thing
+// applied to the subtree beneath it. chmod moves ctime only, never mtime, so
+// applying the mode afterwards cannot disturb the timestamp just restored.
 func (r *restorer) finalizeDirectory(directory *openDir) error {
 	entry := &r.manifest.Entries[directory.index]
-	if err := chmodFD(int(directory.file.Fd()), entry.Mode); err != nil {
-		return fmt.Errorf("hydrator: mode directory %d: %w", directory.index, err)
-	}
 	if err := setTimesSelf(int(directory.file.Fd()), entry.MTimeNanos); err != nil {
 		return err
+	}
+	if err := chmodFD(int(directory.file.Fd()), entry.Mode); err != nil {
+		return fmt.Errorf("hydrator: mode directory %d: %w", directory.index, err)
 	}
 	if err := fsyncFD(int(directory.file.Fd())); err != nil {
 		return fmt.Errorf("hydrator: sync directory %d: %w", directory.index, err)

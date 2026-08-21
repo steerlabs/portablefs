@@ -89,7 +89,7 @@ message Response {
   RoutesMismatch routes_mismatch = 8;
   // restore_detail is present with FAILURE_CLASS_RESTORE and gives the stable
   // retry/operator reason without overloading errno (blocked, corrupt,
-  // recall_saturated, recall_deadline, or protocol).
+  // recall_deadline, or protocol).
   string restore_detail = 9;
 
   oneof body {

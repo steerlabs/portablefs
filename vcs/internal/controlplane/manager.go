@@ -49,7 +49,13 @@ type ManagerConfig struct {
 	ArchiveKeyVersion       string
 	ArchiveVerifier         ArchiveVerifier
 	ArchivePurger           ArchivePurger
-	ClockSkew               time.Duration
+	// MaxArchivingPerCell and MaxRestoringPerCell bound how many archiver and
+	// hydrator processes — each a full-tree I/O job colocated with live volume
+	// authorities — one cell may run at once. Exceeding a cap is refused with
+	// ErrBusy and no state change, never queued.
+	MaxArchivingPerCell int
+	MaxRestoringPerCell int
+	ClockSkew           time.Duration
 }
 
 type ArchiveVerifier interface{ Verify(ArchiveRecord) error }
@@ -96,6 +102,12 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.ArchiveKeyVersion == "" {
 		cfg.ArchiveKeyVersion = "default"
 	}
+	if cfg.MaxArchivingPerCell == 0 {
+		cfg.MaxArchivingPerCell = 2
+	}
+	if cfg.MaxRestoringPerCell == 0 {
+		cfg.MaxRestoringPerCell = 4
+	}
 	if cfg.Store == nil || len(cfg.PlanPrivateKey) != ed25519.PrivateKeySize ||
 		len(cfg.CapabilityPrivateKey) != ed25519.PrivateKeySize || len(cfg.ProductIssuers) == 0 ||
 		cfg.AuthorityCA == nil || cfg.AuthorityCA.Certificate == nil || cfg.AuthorityCA.Signer == nil ||
@@ -108,7 +120,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		cfg.ClientCertLifetime <= 0 || cfg.AuthorityCertLifetime <= 0 || cfg.ObservedStaleAfter <= 0 || cfg.UsageStaleAfter <= 0 ||
 		cfg.ProvisionFloorBytes == 0 || cfg.ProvisionFloorInodes == 0 || cfg.CellReserveFraction <= 0 || cfg.CellReserveFraction >= 1 ||
 		cfg.RestoreOverheadFraction < 0 || cfg.RestoreOverheadFraction > 1 || cfg.RestoreOverheadBytes == 0 || cfg.RestoreOverheadInodes == 0 ||
-		!validIdentity(cfg.ArchiveKeyVersion) || cfg.ClockSkew < 0 {
+		!validIdentity(cfg.ArchiveKeyVersion) || cfg.MaxArchivingPerCell <= 0 || cfg.MaxRestoringPerCell <= 0 || cfg.ClockSkew < 0 {
 		return nil, ErrInvalid
 	}
 	if cfg.Now == nil {
@@ -356,13 +368,22 @@ func (manager *Manager) ArchiveVolume(requestID string, request ArchiveVolumeReq
 	if !cellplan.ValidID(request.VolumeID) {
 		return VolumeView{}, ErrInvalid
 	}
+	// A Manager started without archive credentials can never verify a seal, so
+	// an accepted cycle would wedge at cursor "verifying" with the volume no
+	// longer serving. Refuse before any state change.
+	if manager.cfg.ArchiveVerifier == nil {
+		return VolumeView{}, ErrArchiveStoreUnavailable
+	}
 	return manager.updateVolume(requestID, "archive-volume", request, func(state *State, volume *Volume, now int64) error {
 		if volume.State != VolumeReady || volume.Placement == nil {
 			return ErrConflict
 		}
 		cell := state.Cells[volume.Placement.CellID]
-		if !cellSupportsV2(cell) {
+		if !cellSupportsV2(cell) || !cell.ArchiveConfigured {
 			return ErrConflict
+		}
+		if archivingCellLoad(state, cell.ID) >= manager.cfg.MaxArchivingPerCell {
+			return ErrBusy
 		}
 		terminateVolumeEnrollments(state, volume.ID, "volume archiving", now)
 		volume.State = VolumeArchiving
@@ -654,6 +675,10 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 		cell.PlanVersions = append([]uint32(nil), observation.PlanVersions...)
 		cell.HelperPlanVersions = append([]uint32(nil), observation.HelperPlanVersions...)
 		cell.HelperStateVersions = append([]uint32(nil), observation.HelperStateVersions...)
+		// Archive capability is relayed verbatim from the helper's status pass;
+		// losing it immediately stops new archive and restore placements without
+		// disturbing cycles already in flight.
+		cell.ArchiveConfigured = observation.ArchiveConfigured
 		if wasV2Capable != cellSupportsV2(cell) {
 			manager.bumpPlan(&cell, now)
 		}
@@ -1682,14 +1707,19 @@ func (manager *Manager) NoteVerify(volumeID string) error {
 func (manager *Manager) admitPlacement(state *State, pool string, needBytes, needInodes uint64, isRestore bool, now int64) (*Cell, error) {
 	var selected *Cell
 	var selectedBytes, selectedInodes uint64
+	// busySkipped records that some cell cleared every eligibility and capacity
+	// gate and was passed over only for a concurrency cap. That distinction is
+	// the caller's error: a saturated fleet is retryable, an exhausted one is not.
+	busySkipped := false
+	staleAfter := int64(manager.cfg.UsageStaleAfter / time.Second)
 	for _, id := range sortedCellIDs(state.Cells) {
 		cell := state.Cells[id]
 		if cell.Pool != pool || cell.Health == CellQuarantined || cell.Decommissioning || cell.Abandoned || !manager.cellFresh(cell, now) ||
-			cell.LastObservedUnix == 0 || now-cell.LastObservedUnix > int64(manager.cfg.UsageStaleAfter/time.Second) || cell.NextProjectID == ^uint32(0) ||
+			cell.LastObservedUnix == 0 || now-cell.LastObservedUnix > staleAfter || cell.NextProjectID == ^uint32(0) ||
 			cell.NextServiceUID == ^uint32(0) || cell.NextPort == ^uint16(0) {
 			continue
 		}
-		if isRestore && !cellSupportsV2(cell) {
+		if isRestore && (!cellSupportsV2(cell) || !cell.ArchiveConfigured) {
 			continue
 		}
 		loadBytes, loadInodes, placements := uint64(0), uint64(0), 0
@@ -1700,6 +1730,15 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 			placements++
 			chargeBytes := max(volume.Placement.UsedBytes, volume.Placement.PendingBytes, manager.cfg.ProvisionFloorBytes)
 			chargeInodes := max(volume.Placement.UsedInodes, volume.Placement.PendingInodes, manager.cfg.ProvisionFloorInodes)
+			// The cell-level freshness gate above does not cover one placement
+			// whose own measurement froze while its cell kept heartbeating. Past
+			// UsageStaleAfter from the later of its last measurement and its
+			// creation — the grace window a never-yet-measured placement gets —
+			// charge the volume's quota ceiling instead of a stale reading.
+			if now-max(volume.Placement.UsedObservedUnix, volume.Placement.CreatedUnix) > staleAfter {
+				chargeBytes = max(volume.QuotaBytes, volume.Placement.PendingBytes, manager.cfg.ProvisionFloorBytes)
+				chargeInodes = max(volume.QuotaInodes, volume.Placement.PendingInodes, manager.cfg.ProvisionFloorInodes)
+			}
 			var ok bool
 			loadBytes, ok = addUint64(loadBytes, chargeBytes)
 			if !ok {
@@ -1725,6 +1764,12 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 		if !isRestore && cell.CapacityBytes-postBytes < manager.cfg.WakeBurstBytes {
 			continue
 		}
+		// Checked last so a cell rejected here is known to be otherwise able to
+		// hold the placement — merely busy, not out of room.
+		if isRestore && restoringCellLoad(state, id) >= manager.cfg.MaxRestoringPerCell {
+			busySkipped = true
+			continue
+		}
 		if selected == nil || loadBytes < selectedBytes || loadBytes == selectedBytes && loadInodes < selectedInodes {
 			copy := cell
 			selected = &copy
@@ -1732,14 +1777,50 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 		}
 	}
 	if selected == nil {
+		if busySkipped {
+			return nil, ErrBusy
+		}
 		return nil, ErrCapacity
 	}
 	return selected, nil
 }
 
+// archivingCellLoad counts archive cycles whose remaining work still runs on
+// the cell. Cursors "quiescing" and "exporting" hold the authority-stop and the
+// archiver unit; "verifying" does not — phase exit already proved the archiver
+// absent and the only outstanding work is the Manager's own archive-store
+// verification, which burdens the Manager, not the cell.
+func archivingCellLoad(state *State, cellID string) int {
+	count := 0
+	for _, volume := range state.Volumes {
+		if volume.State != VolumeArchiving || volume.Placement == nil || volume.Placement.CellID != cellID {
+			continue
+		}
+		if volume.ArchiveCycleStep == "quiescing" || volume.ArchiveCycleStep == "exporting" {
+			count++
+		}
+	}
+	return count
+}
+
+func restoringCellLoad(state *State, cellID string) int {
+	count := 0
+	for _, volume := range state.Volumes {
+		if volume.State == VolumeRestoring && volume.Placement != nil && volume.Placement.CellID == cellID {
+			count++
+		}
+	}
+	return count
+}
+
 func (manager *Manager) restoreCharge(record ArchiveRecord) (uint64, uint64, error) {
-	extra := uint64(float64(record.SealedAllocatedBytes)*manager.cfg.RestoreOverheadFraction + 0.999999)
-	bytes, ok := addUint64(record.SealedAllocatedBytes, extra)
+	// The archive's own sizing and the last measured allocation at seal time can
+	// each understate the other (sparse trees, block rounding, pre-quiesce
+	// measurement); admission charges the larger before overhead.
+	base := max(record.SealedAllocatedBytes, record.SealedMeasuredBytes)
+	baseInodes := max(record.SealedInodes, record.SealedMeasuredInodes)
+	extra := uint64(float64(base)*manager.cfg.RestoreOverheadFraction + 0.999999)
+	bytes, ok := addUint64(base, extra)
 	if !ok {
 		return 0, 0, ErrCapacity
 	}
@@ -1747,7 +1828,7 @@ func (manager *Manager) restoreCharge(record ArchiveRecord) (uint64, uint64, err
 	if !ok {
 		return 0, 0, ErrCapacity
 	}
-	inodes, ok := addUint64(record.SealedInodes, manager.cfg.RestoreOverheadInodes)
+	inodes, ok := addUint64(baseInodes, manager.cfg.RestoreOverheadInodes)
 	if !ok {
 		return 0, 0, ErrCapacity
 	}
@@ -1838,7 +1919,13 @@ func archiveRecordsEqual(left, right ArchiveRecord) bool {
 // The archive-store verification and any checkpoint purge run OUTSIDE the
 // store lock in VerifyPendingSeal; this function only mutates state.
 func applyVerifiedSeal(manager *Manager, state *State, volume *Volume, now int64) {
-	volume.Archive = volume.PendingSeal
+	// The volume is quiesced for the whole cycle, so the placement's last
+	// measurement is exact or a pre-quiesce lower bound. Either is safe: restore
+	// admission charges max(this, the archive's own sizing).
+	record := *volume.PendingSeal
+	record.SealedMeasuredBytes = volume.Placement.UsedBytes
+	record.SealedMeasuredInodes = volume.Placement.UsedInodes
+	volume.Archive = &record
 	volume.PendingSeal = nil
 	volume.ArchiveAttempt = ""
 	volume.State = VolumeArchived

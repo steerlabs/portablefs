@@ -91,7 +91,7 @@ func (s *Store) Verify(record controlplane.ArchiveRecord) error {
 	// The record's keys must be exactly the locally derived, prefix-pinned
 	// keys for the manifest's own identities — a record cannot point the
 	// destroy gate at somebody else's objects.
-	manifestKey, err := s.client.KeyFor(volumeID, record.SealedEpoch, attempt, "manifest")
+	manifestKey, err := s.client.KeyFor(volumeID, record.SealedEpoch, attempt, archivestore.ManifestObjectName)
 	if err != nil {
 		return fmt.Errorf("archiveverify: derive manifest key: %w", err)
 	}
@@ -103,7 +103,7 @@ func (s *Store) Verify(record controlplane.ArchiveRecord) error {
 	}
 	for index, pack := range manifest.Header.Packs {
 		recorded := record.Packs[index]
-		key, err := s.client.KeyFor(volumeID, record.SealedEpoch, attempt, fmt.Sprintf("pack-%d", index))
+		key, err := s.client.KeyFor(volumeID, record.SealedEpoch, attempt, archivestore.PackObjectName(index))
 		if err != nil {
 			return fmt.Errorf("archiveverify: derive pack key %d: %w", index, err)
 		}

@@ -336,6 +336,20 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product | `PUT /v1/volumes/{volume-id}/mount-enrollments/{enrollment-id}/revocation` | converge future renewal to revoked, closed, or absent within the product-owned volume |
 | product | `PUT /v1/renewal-fences` | atomically advance a batch of issuer-scoped renewal epoch fences and revoke superseded enrollments |
 
+Two refusals on the archive and wake routes are transient and carry no durable
+state change, so the correct client response to both is to retry the unchanged
+request later rather than to alter it:
+
+| Status | Meaning | Raised by |
+| --- | --- | --- |
+| `503` | the Manager holds no archive-store credentials, or the archive store is unreachable | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` |
+| `503` | every eligible cell is at its per-cell archive or restore concurrency cap | `POST /v1/volumes/{id}/archive`, `POST /v1/volumes/{id}/wake` |
+| `409` | no cell in the pool has capacity for the volume at all | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` |
+
+Saturation is deliberately not `409`: a conflict names a durable state the
+caller must resolve, while a saturated cell resolves itself. Capacity
+exhaustion keeps `409` because it does not.
+
 The renewal-fence request and response have these exact shapes:
 
 ```json

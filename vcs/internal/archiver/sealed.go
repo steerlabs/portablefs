@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/steerlabs/portablefs/vcs/internal/archivestore"
 )
 
 // SealedVersion is the only archive-sealed.json version this build writes or
@@ -199,16 +201,14 @@ func writeAndSync(file *os.File, payload []byte) error {
 	return file.Sync()
 }
 
-// packObjectName is the pinned last key component of pack object index.
-// archivestore's key grammar accepts only [a-z0-9-]{1,64}, which this form
-// satisfies for every index the format allows (archive.MaxPacks is 1024).
+// packObjectName and manifestObjectName delegate to the pinned definitions
+// beside the key grammar, so this writer, the hydrator's reader, and the
+// Manager's verifier derive object names from exactly one place.
 func packObjectName(index int) string {
-	return fmt.Sprintf("pack-%06d", index)
+	return archivestore.PackObjectName(index)
 }
 
-// manifestObjectName is the pinned last key component of the manifest object.
-// It is the only entry point into an attempt: the archive is never listed.
-const manifestObjectName = "manifest"
+const manifestObjectName = archivestore.ManifestObjectName
 
 func sealedPath(resultDir string) string {
 	return filepath.Join(resultDir, SealedName)

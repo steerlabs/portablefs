@@ -498,7 +498,11 @@ func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, 
 		status = http.StatusConflict
 	case errors.Is(err, ErrEnrollmentEnded):
 		status = http.StatusGone
-	case errors.Is(err, ErrArchiveStoreUnavailable):
+	// Both 503s are "the request was correct, retry it unchanged": the archive
+	// store is down, or every eligible cell is at its archive/restore
+	// concurrency cap. Neither is a client-visible conflict in the durable
+	// state, so neither is 409.
+	case errors.Is(err, ErrArchiveStoreUnavailable), errors.Is(err, ErrBusy):
 		status = http.StatusServiceUnavailable
 	}
 	writeAPIError(writer, status, err.Error())

@@ -162,3 +162,18 @@ func TestValidateKeyRejections(t *testing.T) {
 		}
 	}
 }
+
+// TestPinnedObjectNames pins the exact byte forms. These names are wire-frozen
+// object-store layout: the archiver writes them, the hydrator and the
+// Manager's verifier re-derive them, and existing sealed archives name them in
+// durable records — a change here orphans every archived volume.
+func TestPinnedObjectNames(t *testing.T) {
+	if ManifestObjectName != "manifest" {
+		t.Fatalf("ManifestObjectName = %q", ManifestObjectName)
+	}
+	for index, want := range map[int]string{0: "pack-000000", 1: "pack-000001", 1023: "pack-001023"} {
+		if got := PackObjectName(index); got != want {
+			t.Fatalf("PackObjectName(%d) = %q, want %q", index, got, want)
+		}
+	}
+}

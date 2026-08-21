@@ -311,12 +311,177 @@ func TestDestroyArchivedRequiresPurgerAndCommitsTerminalAfterPurge(t *testing.T)
 
 func observeTieredVolume(t *testing.T, h managerHarness, cellID, requestID string, observation VolumeObservation) {
 	t.Helper()
+	observeTieredCell(t, h, cellID, requestID, true, observation)
+}
+
+// observeTieredCell is the full-fidelity observation: a cell must report every
+// volume assigned to it on every pass, and its archive capability with them.
+func observeTieredCell(t *testing.T, h managerHarness, cellID, requestID string, archiveConfigured bool, observations ...VolumeObservation) {
+	t.Helper()
 	plan := verifiedPlan(t, h.manager, cellID, *h.now)
 	_, err := h.manager.ObserveCell(requestID, CellObservation{CellID: cellID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-v2", HelperReleaseID: "helper-v2", ObservedUnix: h.now.Unix(), PlanVersions: []uint32{1, 2},
-		HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2}, Volumes: []VolumeObservation{observation}})
+		HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2}, ArchiveConfigured: archiveConfigured,
+		Volumes: observations})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// storeVolume reads durable state: the product view sanitizes the archive
+// record, so record-level assertions are made at the store.
+func storeVolume(t *testing.T, h managerHarness, volumeID string) Volume {
+	t.Helper()
+	var volume Volume
+	if err := h.store.View(func(state State) error {
+		stored, ok := state.Volumes[volumeID]
+		if !ok {
+			t.Fatalf("volume %s is absent from durable state", volumeID)
+		}
+		volume = stored
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return volume
+}
+
+func TestArchiveRefusedWithoutAVerifierOrAnArchiveCapableCell(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	before := verifiedPlan(t, h.manager, cell.ID, *h.now).Generation
+	// A Manager with no archive credentials can never verify the seal it would
+	// be waiting for, so the cycle is refused before the volume stops serving.
+	if _, err := h.manager.ArchiveVolume("archive-no-verifier", ArchiveVolumeRequest{VolumeID: volume.ID}); !errors.Is(err, ErrArchiveStoreUnavailable) {
+		t.Fatalf("archive without a verifier = %v", err)
+	}
+	unchanged, _ := h.manager.GetVolume(volume.ID)
+	if unchanged.State != VolumeReady || unchanged.ArchiveCycleStep != "" || unchanged.ArchiveAttempt != "" {
+		t.Fatalf("refused archive changed volume state = %+v", unchanged)
+	}
+	if after := verifiedPlan(t, h.manager, cell.ID, *h.now).Generation; after != before {
+		t.Fatalf("refused archive bumped the plan %d -> %d", before, after)
+	}
+
+	h.manager.cfg.ArchiveVerifier = &fakeArchiveVerifier{}
+	ready := VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+		ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+		Provisioned: true, AuthorityRunning: true}
+	// A cell whose helper holds no usable archive credentials can neither export
+	// nor hydrate; archive work is never placed on it.
+	observeTieredCell(t, h, cell.ID, "archive-capability-lost", false, ready)
+	if _, err := h.manager.ArchiveVolume("archive-incapable-cell", ArchiveVolumeRequest{VolumeID: volume.ID}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("archive on an archive-incapable cell = %v", err)
+	}
+	observeTieredCell(t, h, cell.ID, "archive-capability-restored", true, ready)
+	if archiving, err := h.manager.ArchiveVolume("archive-capable-cell", ArchiveVolumeRequest{VolumeID: volume.ID}); err != nil ||
+		archiving.State != VolumeArchiving {
+		t.Fatalf("archive on a capable cell = %+v, %v", archiving, err)
+	}
+}
+
+func TestSealCapturesMeasuredUsageAndRaisesTheRestoreCharge(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.ArchiveVerifier = &fakeArchiveVerifier{}
+	cell, volume := readyVolumeForMount(t, h)
+	const measuredBytes, measuredInodes = 900 << 20, 4321
+	archiving, err := h.manager.ArchiveVolume("measured-archive", ArchiveVolumeRequest{VolumeID: volume.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observeTieredVolume(t, h, cell.ID, "measured-quiesced", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: archiving.AuthorityEpoch,
+		ProjectID: archiving.Placement.ProjectID, ServiceUID: archiving.Placement.ServiceUID, ServiceGID: archiving.Placement.ServiceGID,
+		ListenPort: archiving.Placement.ListenPort, Provisioned: true, AuthorityAbsent: true, QuiesceProven: true,
+		UsedBytes: measuredBytes, UsedInodes: measuredInodes})
+	exporting, _ := h.manager.GetVolume(volume.ID)
+	seal := validArchiveSeal(exporting.ArchiveAttempt)
+	observeTieredVolume(t, h, cell.ID, "measured-sealed", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: exporting.AuthorityEpoch,
+		ProjectID: exporting.Placement.ProjectID, ServiceUID: exporting.Placement.ServiceUID, ServiceGID: exporting.Placement.ServiceGID,
+		ListenPort: exporting.Placement.ListenPort, Provisioned: true, AuthorityAbsent: true, ArchiveSealed: &seal,
+		UsedBytes: measuredBytes, UsedInodes: measuredInodes})
+	// The pending seal carries only what the cell reported; the measurement is
+	// attached by the Manager at the moment the verified seal commits.
+	if pending := storeVolume(t, h, volume.ID).PendingSeal; pending == nil || pending.SealedMeasuredBytes != 0 || pending.SealedMeasuredInodes != 0 {
+		t.Fatalf("pending seal carried a measurement = %+v", pending)
+	}
+	if err := h.manager.NoteVerify(volume.ID); err != nil {
+		t.Fatal(err)
+	}
+	record := storeVolume(t, h, volume.ID).Archive
+	if record == nil || record.SealedMeasuredBytes != measuredBytes || record.SealedMeasuredInodes != measuredInodes {
+		t.Fatalf("committed archive record = %+v", record)
+	}
+	// The archive's own sizing (8 KiB of packed extents here) understates the
+	// tree the restore has to land; admission charges the measured base.
+	bytes, inodes, err := h.manager.restoreCharge(*record)
+	wantBytes := uint64(measuredBytes) + uint64(float64(measuredBytes)*h.manager.cfg.RestoreOverheadFraction+0.999999) + h.manager.cfg.RestoreOverheadBytes
+	if err != nil || bytes != wantBytes || inodes != measuredInodes+h.manager.cfg.RestoreOverheadInodes {
+		t.Fatalf("restore charge = %d, %d, %v (want %d)", bytes, inodes, err, wantBytes)
+	}
+	// A record sealed before the field existed decodes zero and must still
+	// charge the archive's own sizing.
+	unmeasured := *record
+	unmeasured.SealedMeasuredBytes, unmeasured.SealedMeasuredInodes = 0, 0
+	if err := unmeasured.Validate(); err != nil {
+		t.Fatalf("unmeasured record validity = %v", err)
+	}
+	legacyBytes, legacyInodes, err := h.manager.restoreCharge(unmeasured)
+	if err != nil || legacyBytes >= bytes || legacyInodes >= inodes || legacyBytes < record.SealedAllocatedBytes {
+		t.Fatalf("unmeasured restore charge = %d, %d, %v", legacyBytes, legacyInodes, err)
+	}
+}
+
+func TestWakePropagatesRestoreConcurrencySaturationAsRetryableBusy(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.MaxRestoringPerCell = 1
+	cell, volume := readyVolumeForMount(t, h)
+	occupant, err := h.manager.CreateVolume("busy-occupant", CreateVolumeRequest{AuthorizationDomain: "org", Owner: "owner",
+		ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 10_000, Pool: PoolProduct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Creating the occupant bumped the cell plan; admission needs a heartbeat at
+	// the current generation, which only a fresh observation supplies.
+	observeTieredCell(t, h, cell.ID, "busy-observe", true,
+		VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+			Provisioned: true, AuthorityRunning: true},
+		VolumeObservation{VolumeID: occupant.ID, AuthorityGeneration: occupant.AuthorityEpoch, ProjectID: occupant.Placement.ProjectID,
+			ServiceUID: occupant.Placement.ServiceUID, ServiceGID: occupant.Placement.ServiceGID, ListenPort: occupant.Placement.ListenPort,
+			Provisioned: true})
+	seal := validArchiveSeal("33333333-3333-4333-8333-333333333333")
+	sealed, err := archiveRecordFromObservation(Volume{ArchiveAttempt: seal.Attempt, AuthorityEpoch: volume.AuthorityEpoch}, &seal, h.now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The waker is placement-free ARCHIVED; the occupant already holds the
+	// cell's only restore slot.
+	if _, err := h.store.TransactNatural("seed-busy-restore", h.now.Unix(), func(state *State) (any, bool, error) {
+		waker := state.Volumes[volume.ID]
+		waker.State, waker.Placement, waker.Archive, waker.ArchiveCycleStep = VolumeArchived, nil, &sealed, "released"
+		waker.UpdatedUnix = h.now.Unix()
+		state.Volumes[waker.ID] = waker
+		restoring := state.Volumes[occupant.ID]
+		occupantSeal := sealed
+		occupantSeal.SealedEpoch = 1
+		restoring.AuthorityEpoch = 2
+		restoring.State, restoring.Archive, restoring.ArchiveCycleStep, restoring.RestoreStep = VolumeRestoring, &occupantSeal, "released", "restoring-namespace"
+		restoring.UpdatedUnix = h.now.Unix()
+		state.Volumes[restoring.ID] = restoring
+		return nil, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.manager.WakeVolume("wake-busy", WakeVolumeRequest{VolumeID: volume.ID}); !errors.Is(err, ErrBusy) {
+		t.Fatalf("wake against a saturated cell = %v", err)
+	}
+	if refused, _ := h.manager.GetVolume(volume.ID); refused.State != VolumeArchived || refused.Placement != nil || refused.PlacementSequence != 1 {
+		t.Fatalf("busy wake changed state = %+v", refused)
+	}
+	h.manager.cfg.MaxRestoringPerCell = 2
+	woken, err := h.manager.WakeVolume("wake-after-slot", WakeVolumeRequest{VolumeID: volume.ID})
+	if err != nil || woken.State != VolumeRestoring || woken.Placement == nil || woken.Placement.CellID != cell.ID {
+		t.Fatalf("wake after a slot freed = %+v, %v", woken, err)
 	}
 }
 

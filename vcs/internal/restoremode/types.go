@@ -17,11 +17,13 @@ import (
 )
 
 var (
-	ErrRecallSaturated = errors.New("restoremode: recall admission saturated")
-	ErrRecallDeadline  = errors.New("restoremode: recall deadline exceeded")
-	ErrBlocked         = errors.New("restoremode: restore blocked")
-	ErrCorrupt         = errors.New("restoremode: restore corrupt")
-	ErrProtocol        = errors.New("restoremode: hydrator protocol violation")
+	// A recall past RecallLimit queues inside fetchChunk rather than failing;
+	// only a deadline that expires while queued or fetching surfaces, as
+	// ErrRecallDeadline.
+	ErrRecallDeadline = errors.New("restoremode: recall deadline exceeded")
+	ErrBlocked        = errors.New("restoremode: restore blocked")
+	ErrCorrupt        = errors.New("restoremode: restore corrupt")
+	ErrProtocol       = errors.New("restoremode: hydrator protocol violation")
 )
 
 const (

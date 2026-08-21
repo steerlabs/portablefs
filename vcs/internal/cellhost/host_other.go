@@ -43,6 +43,10 @@ func (*Host) Observe(_ context.Context, _ cellplan.VolumePlan, _ cellhelper.Assi
 
 var errNotLinux = errors.New("cellhost: supported only on Linux")
 
+// ArchiveConfigured is false off Linux: no cell can hold archive credentials it
+// could ever use.
+func (*Host) ArchiveConfigured() bool { return false }
+
 func (*Host) MeasureUsage(string) (uint64, uint64, error) { return 0, 0, errNotLinux }
 
 func (*Host) StrictMembershipEmpty(string) (bool, error) { return false, errNotLinux }

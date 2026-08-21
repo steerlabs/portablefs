@@ -15,6 +15,16 @@ import (
 
 const chunkLockShards = 4096
 
+const (
+	drainBackoffInitial = time.Second
+	drainBackoffMaximum = 30 * time.Second
+)
+
+type byteRange struct {
+	start uint64
+	end   uint64
+}
+
 type Mode struct {
 	cfg      Config
 	ready    readyRecord
@@ -280,12 +290,6 @@ func (m *Mode) EnsureHydrated(ctx context.Context, identity [16]byte, offset, le
 	if err != nil || len(keys) == 0 {
 		return err
 	}
-	select {
-	case m.recalls <- struct{}{}:
-		defer func() { <-m.recalls }()
-	default:
-		return ErrRecallSaturated
-	}
 	m.preemptDrain()
 	recallCtx, cancel := recallContext(ctx, m.cfg.RecallDeadline)
 	defer cancel()
@@ -347,12 +351,6 @@ func (m *Mode) Write(ctx context.Context, identity [16]byte, offset uint64, leng
 		}
 	}
 	if len(partial) != 0 {
-		select {
-		case m.recalls <- struct{}{}:
-			defer func() { <-m.recalls }()
-		default:
-			return 0, 0, ErrRecallSaturated
-		}
 		recallCtx, cancel := recallContext(ctx, m.cfg.RecallDeadline)
 		defer cancel()
 		for _, key := range partial {
@@ -370,25 +368,71 @@ func (m *Mode) Write(ctx context.Context, identity [16]byte, offset uint64, leng
 	}
 	m.entryLocks[entry].Lock()
 	n, assigned, applyErr := apply()
-	if n > 0 && len(partial) == 0 {
-		if err := m.cfg.Store.Fdatasync(entry); err != nil {
+	if n > 0 {
+		if err := m.finishWriteLocked(ctx, entry, keys, partial, offset, uint64(n), assigned); err != nil {
 			m.entryLocks[entry].Unlock()
 			return n, assigned, err
-		}
-		actualStart := offset
-		if assigned >= 0 {
-			actualStart = uint64(assigned)
-		}
-		full, rangeErr := m.fullStoredKeys(entry, actualStart, uint64(n))
-		if rangeErr == nil {
-			if err := m.hmap.markDurable(full, &entry); err != nil {
-				m.entryLocks[entry].Unlock()
-				return n, assigned, err
-			}
 		}
 	}
 	m.entryLocks[entry].Unlock()
 	return n, assigned, applyErr
+}
+
+func (m *Mode) finishWriteLocked(ctx context.Context, entry uint32, keys, partial []chunkKey, offset, length uint64, assigned int64) error {
+	if err := m.cfg.Store.Fdatasync(entry); err != nil {
+		return err
+	}
+	actualStart := offset
+	if assigned >= 0 {
+		actualStart = uint64(assigned)
+	}
+	actualEnd := actualStart + length
+	if actualEnd < actualStart {
+		return errors.New("restoremode: accepted byte range overflow")
+	}
+	actual := byteRange{start: actualStart, end: actualEnd}
+	partialSet := make(map[chunkKey]struct{}, len(partial))
+	for _, key := range partial {
+		partialSet[key] = struct{}{}
+	}
+	chunkSize := uint64(m.ChunkSize())
+	full := make([]chunkKey, 0, len(keys))
+	repair := make([]chunkKey, 0, 2)
+	for _, key := range keys {
+		chunkStart := uint64(key.chunk) * chunkSize
+		chunkEnd := chunkStart + chunkSize
+		if actual.start <= chunkStart && actual.end >= chunkEnd {
+			full = append(full, key)
+			continue
+		}
+		_, wasPartial := partialSet[key]
+		if !wasPartial && actual.start < chunkEnd && actual.end > chunkStart && !m.hmap.isDurable(key) {
+			repair = append(repair, key)
+		}
+	}
+	// An assigned append can move beyond its predicted range, but not into a
+	// cold stored chunk outside keys: restore starts at the sealed EOF, and a
+	// truncate durably marks the removed tail before a later append can reuse it.
+	if err := m.hmap.markDurable(full, &entry); err != nil {
+		return err
+	}
+	if len(repair) == 0 {
+		return nil
+	}
+	recallCtx, cancel := recallContext(ctx, m.cfg.RecallDeadline)
+	defer cancel()
+	for _, key := range repair {
+		fetched, err := m.mergeRecallLocked(recallCtx, key, actual)
+		if err != nil {
+			err = namedRecallError(recallCtx, err)
+			if !errors.Is(err, ErrRecallDeadline) {
+				m.noteFailure(err)
+			}
+			return err
+		}
+		m.recalledBytes.Add(fetched)
+	}
+	return nil
 }
 
 func (m *Mode) Truncate(ctx context.Context, identity [16]byte, oldSize, newSize int64, apply func() error) error {
@@ -407,7 +451,7 @@ func (m *Mode) Truncate(ctx context.Context, identity [16]byte, oldSize, newSize
 	defer unlockLocks(locks)
 	if newSize > 0 && newSize < oldSize && uint64(newSize)%uint64(m.ChunkSize()) != 0 {
 		boundary := chunkKey{entry: entry, chunk: uint32(uint64(newSize) / uint64(m.ChunkSize()))}
-		if _, stored := m.stored[boundary]; stored {
+		if m.isStored(boundary) {
 			recallCtx, cancel := recallContext(ctx, m.cfg.RecallDeadline)
 			_, err := m.hydrateLocked(recallCtx, boundary, true, true)
 			cancel()
@@ -484,21 +528,11 @@ func (m *Mode) keysForRange(entry uint32, offset, length uint64) ([]chunkKey, er
 	return keys, nil
 }
 
-func (m *Mode) fullStoredKeys(entry uint32, offset, length uint64) ([]chunkKey, error) {
-	keys, err := m.keysForRange(entry, offset, length)
-	if err != nil {
-		return nil, err
-	}
-	end := offset + length
-	chunkSize := uint64(m.ChunkSize())
-	full := keys[:0]
-	for _, key := range keys {
-		start := uint64(key.chunk) * chunkSize
-		if offset <= start && end >= start+chunkSize {
-			full = append(full, key)
-		}
-	}
-	return full, nil
+func (m *Mode) isStored(key chunkKey) bool {
+	m.initMu.RLock()
+	defer m.initMu.RUnlock()
+	_, stored := m.stored[key]
+	return stored
 }
 
 func (m *Mode) hydrateLocked(ctx context.Context, key chunkKey, durable, demand bool) (uint64, error) {
@@ -511,49 +545,114 @@ func (m *Mode) hydrateLocked(ctx context.Context, key chunkKey, durable, demand 
 		}
 		return 0, m.hmap.markDurable([]chunkKey{key}, nil)
 	}
-	m.stateMu.RLock()
-	corrupt := m.state == StateCorrupt
-	detail := m.stateDetail
-	m.stateMu.RUnlock()
-	if corrupt {
-		return 0, &stateError{base: ErrCorrupt, detail: detail}
-	}
-	chunk, err := m.client.fetch(ctx, key, m.ChunkSize())
+	chunk, err := m.fetchChunk(ctx, key)
 	if err != nil {
 		return 0, err
 	}
 	m.entryLocks[key.entry].Lock()
-	for _, extent := range chunk.Extents {
-		off := int64(uint64(key.chunk)*uint64(m.ChunkSize()) + extent.Offset)
-		if err := m.cfg.Store.PWrite(key.entry, off, extent.Data); err != nil {
-			m.entryLocks[key.entry].Unlock()
-			return 0, err
-		}
-	}
-	if !m.hmap.isModified(key.entry) {
-		if err := m.cfg.Store.RestoreMtime(key.entry); err != nil {
-			m.entryLocks[key.entry].Unlock()
-			return 0, err
-		}
-	}
-	if durable {
-		if err := m.cfg.Store.Fdatasync(key.entry); err != nil {
-			m.entryLocks[key.entry].Unlock()
-			return 0, err
-		}
-		if err := m.hmap.markDurable([]chunkKey{key}, nil); err != nil {
-			m.entryLocks[key.entry].Unlock()
-			return 0, err
-		}
-	} else {
-		m.hmap.markLazy(key)
-	}
+	err = m.installFetchedChunkLocked(key, chunk, durable, nil)
 	m.entryLocks[key.entry].Unlock()
+	if err != nil {
+		return 0, err
+	}
 	m.clearBlocked()
 	if demand {
 		m.recalledBytes.Add(chunk.Bytes)
 	}
 	return chunk.Bytes, nil
+}
+
+func (m *Mode) mergeRecallLocked(ctx context.Context, key chunkKey, preserve byteRange) (uint64, error) {
+	chunk, err := m.fetchChunk(ctx, key)
+	if err != nil {
+		return 0, err
+	}
+	if err := m.installFetchedChunkLocked(key, chunk, true, &preserve); err != nil {
+		return 0, err
+	}
+	m.clearBlocked()
+	return chunk.Bytes, nil
+}
+
+// fetchChunk is the single admission point for hydrator fetches. The recall
+// semaphore is acquired here — innermost, after every chunk and entry lock —
+// so RecallLimit bounds concurrent hydrator I/O and nothing else: a saturated
+// volume queues fetches (bounded by the caller's recall deadline) instead of
+// failing reads, and a slot holder only ever performs socket I/O, so no
+// lock-ordering cycle through the semaphore can exist.
+func (m *Mode) fetchChunk(ctx context.Context, key chunkKey) (Chunk, error) {
+	m.stateMu.RLock()
+	corrupt := m.state == StateCorrupt
+	detail := m.stateDetail
+	m.stateMu.RUnlock()
+	if corrupt {
+		return Chunk{}, &stateError{base: ErrCorrupt, detail: detail}
+	}
+	select {
+	case m.recalls <- struct{}{}:
+		defer func() { <-m.recalls }()
+	case <-ctx.Done():
+		return Chunk{}, ctx.Err()
+	}
+	return m.client.fetch(ctx, key, m.ChunkSize())
+}
+
+// installFetchedChunkLocked runs with the entry lock held. preserve names
+// acknowledged user bytes that archive extents must not overwrite.
+func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool, preserve *byteRange) error {
+	chunkStart := uint64(key.chunk) * uint64(m.ChunkSize())
+	for _, extent := range chunk.Extents {
+		start := chunkStart + extent.Offset
+		end := start + uint64(len(extent.Data))
+		if preserve == nil || preserve.end <= start || preserve.start >= end {
+			if err := m.cfg.Store.PWrite(key.entry, int64(start), extent.Data); err != nil {
+				return err
+			}
+			continue
+		}
+		if start < preserve.start {
+			leftEnd := min64(end, preserve.start)
+			if err := m.cfg.Store.PWrite(key.entry, int64(start), extent.Data[:leftEnd-start]); err != nil {
+				return err
+			}
+		}
+		if end > preserve.end {
+			rightStart := maxUint64(start, preserve.end)
+			if err := m.cfg.Store.PWrite(key.entry, int64(rightStart), extent.Data[rightStart-start:]); err != nil {
+				return err
+			}
+		}
+	}
+	if !m.hmap.isModified(key.entry) {
+		if err := m.cfg.Store.RestoreMtime(key.entry); err != nil {
+			return err
+		}
+	}
+	if durable {
+		if err := m.cfg.Store.Fdatasync(key.entry); err != nil {
+			return err
+		}
+		if err := m.hmap.markDurable([]chunkKey{key}, nil); err != nil {
+			return err
+		}
+	} else {
+		m.hmap.markLazy(key)
+	}
+	return nil
+}
+
+func min64(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxUint64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // UserMutation protects a user-visible metadata mutation whose mtime must win
@@ -637,7 +736,11 @@ func (m *Mode) drain() {
 	for range workers {
 		go func() {
 			defer wg.Done()
+			backoff := drainBackoffInitial
 			for {
+				if m.isCorrupt() {
+					return
+				}
 				index := next.Add(1) - 1
 				m.initMu.RLock()
 				if index >= uint64(len(m.info.Order)) {
@@ -648,6 +751,9 @@ func (m *Mode) drain() {
 				m.initMu.RUnlock()
 				key := chunkKey{entry: pair[0], chunk: pair[1]}
 				for {
+					if m.isCorrupt() {
+						return
+					}
 					if !m.waitDrainHysteresis() {
 						return
 					}
@@ -679,11 +785,19 @@ func (m *Mode) drain() {
 					}
 					if err != nil {
 						m.noteFailure(err)
+						if errors.Is(err, ErrCorrupt) || m.isCorrupt() {
+							return
+						}
 						if !m.waitDrainHysteresis() {
 							return
 						}
+						if !m.waitDrainBackoff(backoff) {
+							return
+						}
+						backoff = minDuration(backoff*2, drainBackoffMaximum)
 						continue
 					}
+					backoff = drainBackoffInitial
 					if !complete {
 						timer := time.NewTimer(100 * time.Millisecond)
 						select {
@@ -703,8 +817,25 @@ func (m *Mode) drain() {
 		}()
 	}
 	wg.Wait()
-	if m.ctx.Err() == nil {
+	if m.ctx.Err() == nil && !m.isCorrupt() {
 		_ = m.commitConverged()
+	}
+}
+
+func (m *Mode) isCorrupt() bool {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.state == StateCorrupt
+}
+
+func (m *Mode) waitDrainBackoff(wait time.Duration) bool {
+	timer := time.NewTimer(wait)
+	select {
+	case <-m.ctx.Done():
+		timer.Stop()
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

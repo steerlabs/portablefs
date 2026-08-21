@@ -50,6 +50,12 @@ var (
 	ErrEnrollmentEnded         = errors.New("controlplane: mount enrollment has ended")
 	ErrRenewalScopeFenced      = errors.New("renewal_scope_fenced")
 	ErrArchiveStoreUnavailable = errors.New("controlplane: archive store unavailable")
+	// ErrBusy is transient and carries no state change: the request was refused
+	// only because a per-cell archive/restore concurrency cap is currently full,
+	// so an unchanged retry on a later sweep is the correct response. It is
+	// deliberately distinct from ErrCapacity, which means the fleet cannot hold
+	// the volume at all.
+	ErrBusy = errors.New("controlplane: cell archive or restore concurrency is saturated")
 )
 
 type VolumeState string
@@ -120,6 +126,12 @@ type Cell struct {
 	PlanVersions        []uint32   `json:"plan_versions,omitempty"`
 	HelperPlanVersions  []uint32   `json:"helper_plan_versions,omitempty"`
 	HelperStateVersions []uint32   `json:"helper_state_versions,omitempty"`
+	// ArchiveConfigured is the cell's own report that its helper holds readable
+	// archive-store credentials. A cell without them can neither export nor
+	// hydrate, so archive and restore work is never placed on one. Absent in
+	// persisted state it decodes false, which refuses that work until the cell
+	// reports otherwise.
+	ArchiveConfigured bool `json:"archive_configured,omitempty"`
 }
 
 type Volume struct {
@@ -196,6 +208,12 @@ type ArchiveRecord struct {
 	SealedAllocatedBytes uint64      `json:"sealed_allocated_bytes"`
 	SealedInodes         uint64      `json:"sealed_inodes"`
 	KeyVersion           string      `json:"key_version"`
+	// SealedMeasured* is the placement's last measured usage at the moment the
+	// verified seal committed. Zero means unmeasured and stays valid: records
+	// sealed before this field existed decode zero, and restore admission takes
+	// the maximum of it and the archive's own sizing.
+	SealedMeasuredBytes  uint64 `json:"sealed_measured_bytes,omitempty"`
+	SealedMeasuredInodes uint64 `json:"sealed_measured_inodes,omitempty"`
 }
 
 type OrphanedPlacement struct {
@@ -431,6 +449,7 @@ type CellObservation struct {
 	PlanVersions        []uint32            `json:"plan_versions,omitempty"`
 	HelperPlanVersions  []uint32            `json:"helper_plan_versions,omitempty"`
 	HelperStateVersions []uint32            `json:"helper_state_versions,omitempty"`
+	ArchiveConfigured   bool                `json:"archive_configured,omitempty"`
 }
 
 type CellHeartbeat struct {
@@ -569,6 +588,11 @@ func (state State) Validate() error {
 		}
 		if !validVersions(cell.PlanVersions) || !validVersions(cell.HelperPlanVersions) || !validVersions(cell.HelperStateVersions) {
 			return fmt.Errorf("%w: cell version capability", ErrInvalid)
+		}
+		// Archive capability is a reported observation, never an assumption: it
+		// can only be set on a cell that has actually reported.
+		if cell.ArchiveConfigured && !observedIdentity {
+			return fmt.Errorf("%w: cell archive capability without observation", ErrInvalid)
 		}
 		projects[id] = map[uint32]string{}
 		uids[id] = map[uint32]string{}

@@ -72,7 +72,16 @@ state-root bind exposes the hydrator AF_UNIX socket directory, so the authority
 does not gain a fourth bind. The hydrator unit separately receives network,
 read-scoped credentials, and that socket-directory bind, with no volume data-dir
 access. The archiver unit receives network, write-scoped credentials, and a
-read-only bind of the quiesced volume data directory. The socket unit owns the
+read-only bind of the quiesced volume data directory. It is the one unit that
+does **not** run with an empty capability set: its bounding and ambient sets
+hold `CAP_DAC_READ_SEARCH` and nothing else. A volume is single-owner, and its
+owner may legitimately create a mode that denies the owner — a `0000` file, a
+directory without owner search — so an archive that had to be decided by the
+mode could not seal such a tree at all. `CAP_DAC_READ_SEARCH` grants read and
+traverse only: never write, never chown, never `CAP_DAC_OVERRIDE`. The
+capability is bounded by the same confinement as everything else — one
+read-only bind of one quiesced volume, `PrivateUsers=no` so it means what it
+says against host-owned inodes, and `NoNewPrivileges` alongside it. The socket unit owns the
 public TCP listener and passes one descriptor to the authority. Do not add a
 second `ListenStream` or a second authority unit for the same volume.
 

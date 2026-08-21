@@ -57,6 +57,28 @@ func (host *Host) writeLaunchConfig(volumeID string, serviceGID uint32, name str
 	return writeAtomic(filepath.Join(directory, name), payload, 0, int(serviceGID), 0o440)
 }
 
+// ArchiveConfigured reports whether this cell can do archive or restore work at
+// all. It is answered on every status pass, so it costs one open and one fstat
+// and never reads the credentials: the file must be configured and satisfy the
+// same shape stageArchiveCredentials will demand of it (regular, non-empty,
+// unreadable by group and other). A false answer keeps the Manager from placing
+// export or hydration work here.
+func (host *Host) ArchiveConfigured() bool {
+	if host.cfg.ArchiveCredentialsPath == "" {
+		return false
+	}
+	fd, err := unix.Open(host.cfg.ArchiveCredentialsPath, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return false
+	}
+	defer unix.Close(fd)
+	var info unix.Stat_t
+	if err := unix.Fstat(fd, &info); err != nil {
+		return false
+	}
+	return info.Mode&unix.S_IFMT == unix.S_IFREG && info.Mode&0o077 == 0 && info.Size > 0
+}
+
 // stageArchiveCredentials copies the root-provisioned cell credentials into
 // the volume's ConfigRoot as root:<serviceGID> 0440, exactly like every other
 // per-volume config file. The unit binds this copy: binding the shared

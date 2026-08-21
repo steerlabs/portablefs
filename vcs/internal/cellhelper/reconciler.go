@@ -22,6 +22,10 @@ var ErrInvalid = errors.New("cellhelper: invalid reconciliation")
 type Host interface {
 	Apply(context.Context, cellplan.VolumePlan, Assignment) (controlplane.VolumeObservation, HostUpdate)
 	Observe(context.Context, cellplan.VolumePlan, Assignment) (controlplane.VolumeObservation, HostUpdate)
+	// ArchiveConfigured is a live cell capability, reported on every pass
+	// alongside the plan/state version capabilities: true only while the cell's
+	// archive-store credentials are actually usable.
+	ArchiveConfigured() bool
 }
 
 // HostUpdate contains only facts produced by a completed host operation that
@@ -155,6 +159,7 @@ func (reconciler *Reconciler) Reconcile(ctx context.Context, envelope cellplan.E
 		HelperReleaseID: reconciler.ReleaseID, ObservedUnix: now.Unix(),
 		HelperPlanVersions:  []uint32{cellplan.VersionV1, cellplan.Version},
 		HelperStateVersions: []uint32{helperStateVersionV1, helperStateVersion},
+		ArchiveConfigured:   reconciler.Host.ArchiveConfigured(),
 	}
 	for _, volume := range plan.Volumes {
 		if volume.Phase == cellplan.PhaseRelease {

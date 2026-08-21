@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -125,7 +124,7 @@ func sealedFixture(t *testing.T) (*fakeStore, *archivestore.Client, controlplane
 	if err != nil {
 		t.Fatalf("client: %v", err)
 	}
-	manifestKey, err := client.KeyFor(volumeUUID, epoch, attempt, "manifest")
+	manifestKey, err := client.KeyFor(volumeUUID, epoch, attempt, archivestore.ManifestObjectName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +141,10 @@ func sealedFixture(t *testing.T) (*fakeStore, *archivestore.Client, controlplane
 		KeyVersion: "default",
 	}
 	for index, pack := range manifest.Header.Packs {
-		key, err := client.KeyFor(volumeUUID, epoch, attempt, fmt.Sprintf("pack-%d", index))
+		// The canonical derivation, deliberately: this fixture once spelled its
+		// own "pack-%d", which matched the verifier's identical private spelling
+		// and hid that no real archiver ever wrote such a key.
+		key, err := client.KeyFor(volumeUUID, epoch, attempt, archivestore.PackObjectName(index))
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -173,16 +173,20 @@ func TestVisibilityInterruptedMapsToDefiniteEINTR(t *testing.T) {
 	}
 }
 
-func TestRestoreFailuresAreDefiniteNonFatalEAGAIN(t *testing.T) {
+// Restore failures answer EIO, never EAGAIN: FUSE files are pollable, so an
+// EAGAIN on a blocking regular-file read parks poll-driven runtimes on a
+// readiness event that never fires. The failure class keeps the retryable
+// nature on the wire while the application sees an honest I/O error.
+func TestRestoreFailuresAreDefiniteNonFatalEIO(t *testing.T) {
 	h := &VolumeHandler{}
 	for _, failure := range []error{
-		restoremode.ErrRecallSaturated, restoremode.ErrRecallDeadline,
+		restoremode.ErrRecallDeadline,
 		restoremode.ErrBlocked, restoremode.ErrCorrupt,
 	} {
 		response := h.errorResponse(9, failure, false)
-		if response.GetErrno() != errnos.EAGAIN || response.GetUncertain() ||
+		if response.GetErrno() != errnos.EIO || response.GetUncertain() ||
 			response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_RESTORE {
-			t.Fatalf("restore failure %v = %+v, want definite classified EAGAIN", failure, response)
+			t.Fatalf("restore failure %v = %+v, want definite classified EIO", failure, response)
 		}
 		if fatalStorageErrno(failure) {
 			t.Fatalf("restore failure %v entered fatal storage classification", failure)

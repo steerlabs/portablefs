@@ -69,6 +69,7 @@ func TestRunOnceVerifiesReconcilesAndReportsExactReleases(t *testing.T) {
 		return jsonResponse(t, controlplane.CellObservation{
 			CellID: cellID, PlanGeneration: plan.Generation, ManagerReleaseID: plan.ReleaseID,
 			HelperReleaseID: "helper-r1", ObservedUnix: now.Unix(), HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+			ArchiveConfigured: true,
 		}), nil
 	})}
 	agent, err := New(Config{
@@ -93,6 +94,10 @@ func TestRunOnceVerifiesReconcilesAndReportsExactReleases(t *testing.T) {
 	}
 	if len(reported.PlanVersions) != 2 || len(reported.HelperPlanVersions) != 2 || len(reported.HelperStateVersions) != 2 {
 		t.Fatalf("reported capability lists = %+v", reported)
+	}
+	// The agent relays helper capabilities verbatim and infers none of its own.
+	if !reported.ArchiveConfigured {
+		t.Fatalf("agent dropped the helper archive capability = %+v", reported)
 	}
 }
 

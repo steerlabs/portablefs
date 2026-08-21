@@ -112,6 +112,12 @@ func TestHTTPArchiveWakeAndDeleteLifecycleRoutes(t *testing.T) {
 
 	archive := ArchiveVolumeRequest{VolumeID: volume.ID}
 	response := serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/archive",
+		archive, RoleProduct, "opensteer", "http-archive-unavailable")
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("archive without a verifier status=%d body=%s", response.Code, response.Body.String())
+	}
+	h.manager.cfg.ArchiveVerifier = &fakeArchiveVerifier{}
+	response = serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/archive",
 		archive, RoleProduct, "opensteer", "http-archive")
 	if response.Code != http.StatusOK {
 		t.Fatalf("archive status=%d body=%s", response.Code, response.Body.String())
@@ -342,6 +348,30 @@ func TestHTTPRenewalFenceAdvanceAndFencedIssuance(t *testing.T) {
 	response = serveControlRequest(t, handler, http.MethodPut, fencePath+"/legacy-scope", request, RoleProduct, "opensteer", "")
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("single-scope fence route status = %d, body=%s", response.Code, response.Body.String())
+	}
+}
+
+// Saturation and outage are retryable-unchanged; an exhausted fleet is the
+// caller's problem to resolve and stays a conflict.
+func TestHTTPRetryableRefusalsAreDistinctFromCapacityConflicts(t *testing.T) {
+	h := newManagerHarness(t)
+	handler := testHTTPHandler(h.manager)
+	for _, test := range []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{name: "archive store outage", err: ErrArchiveStoreUnavailable, status: http.StatusServiceUnavailable},
+		{name: "cell concurrency saturated", err: ErrBusy, status: http.StatusServiceUnavailable},
+		{name: "fleet capacity exhausted", err: ErrCapacity, status: http.StatusConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handler.writeResult(recorder, nil, test.err)
+			if recorder.Code != test.status {
+				t.Fatalf("status = %d, want %d", recorder.Code, test.status)
+			}
+		})
 	}
 }
 

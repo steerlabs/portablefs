@@ -99,6 +99,79 @@ enters restore mode iff `restore-namespace-ready.json` is present and
 launcher argv, and `SERVE` can never re-enable base replay because the
 converged record gates before the hydrator socket is even dialed.
 
+## Permissions and materialization
+
+A PortableFS volume is single-owner: `xfsstore` refuses any chown away from the
+volume owner, so every inode in the tree belongs to the one service identity
+that archives, restores, and serves it. The archive namespace is exactly
+`{regular, directory, symlink}` plus `user.*` extended attributes, and modes
+travel through it verbatim — including modes that deny that single owner. A
+`0000` file, a directory with no owner search bit, a `0444` file published the
+way `git`, `dpkg`, and `rpm` publish: users create these, and a tier that could
+not carry them would silently be a tier that could not carry the volume.
+
+Ownership is not access. Discretionary access is checked against the mode even
+for the owner, so each of the three phases has one place where the mode would
+otherwise decide the outcome. Each is handled at its own layer; none of them
+uses `CAP_DAC_OVERRIDE`, which no component holds.
+
+**Archive — one capability, the narrowest one.** The archiver must read every
+inode of exactly one volume, so it cannot be stopped by that volume's own
+modes. `deploy/systemd/portablefs-archiver@.service` grants
+`CAP_DAC_READ_SEARCH` in both the bounding and ambient sets and nothing else:
+read and traverse, never write, never chown. The per-volume drop-in already
+runs the unit as the placement's unprivileged service account, which is what
+makes an ambient capability the mechanism at all; `NoNewPrivileges=yes` is
+compatible with it and `PrivateUsers=no` is required for it to mean anything
+against host-owned inodes. The confinement, not the capability, is the bound:
+the unit still sees only a read-only bind of one quiesced volume.
+`UnreadableInodeError` stays in the walk as tamper defense — production should
+never reach it, and if it does, the archive fails loudly rather than sealing a
+manifest that omits an inode.
+
+**Restore-namespace — modes land last, deepest first.** Materialization creates
+every directory `0700` and applies the archived mode only after the whole
+subtree beneath it exists, on the way back up. The invariant is that nothing is
+addressed *by name* after that name's mode has landed. For a regular file this
+is free: the creating descriptor already carries the access the creation
+granted, so size, `user.*` attributes, and the mode itself are all fd-relative,
+and the only by-name step — the exact nanosecond mtime — happens while the
+parent is still `0700` and needs only ownership, not write permission. For a
+directory the deferral is the second pass: children, then the directory's own
+mtime, then its mode. That order is not cosmetic. Directory mtimes must follow
+their children because creating a child bumps the parent; the directory's mode
+must follow its own mtime because `utimensat(fd, ".", …)` resolves a path
+component and costs search permission, which a `0000` directory does not grant.
+`chmod` moves `ctime` only, so applying the mode last cannot disturb the
+timestamp just restored.
+
+**Hydration — fchmod around the write.** The namespace is materialized at final
+modes immediately, and the bytes arrive afterwards, so the authority routinely
+has to write into a file that is already `0444` or `0000`. Reopening such an
+inode `O_RDWR` answers `EACCES`. `xfsstore`'s restore store therefore performs
+the narrowest possible dance, and only on `EACCES` — the common path is
+untouched: read the exact mode from the held `O_PATH` descriptor, add owner
+read/write (`|0600`) through that same descriptor with `AT_EMPTY_PATH`, reopen,
+write, and put the exact original mode back, including on the error path. A
+failed restoration of the mode surfaces as an error joined onto the operation's
+own; it is never swallowed. Every step addresses the inode through the held
+descriptor, never by re-resolving a name, so a rename cannot redirect the chmod
+at a different inode. `RestoreMtime` needs no dance and does not have one:
+`utimensat` with explicit timestamps is permitted to the owner regardless of
+mode. The same dance, with `|0500`, covers the startup walk that binds restored
+identities: it must read a `0000` directory to reach the files inside it. That
+walk runs once, before the volume server accepts any session.
+
+*Visibility, stated honestly.* Drain and recall hold the restore mode's
+per-entry lock across the write, and the authority's `GETATTR` takes that lock
+for reading, so a `GETATTR` of the inode cannot land inside the window.
+`LOOKUP` and `READDIR`-with-attributes do **not** take it: a concurrent listing
+can transiently report the owner-writable mode. The inode's `ctime` also moves
+twice per hydration write and is not restored — Linux offers no honest way, and
+the format records `ctime` as metadata only. A crash inside the window leaves
+the widened mode behind. The startup binding walk has no such exposure at all,
+because no client exists yet.
+
 ## Authority ↔ hydrator socket protocol (pinned)
 
 One AF_UNIX stream socket at `StateRoot/<vol>/hydrator.sock` (inside the
@@ -161,13 +234,22 @@ surfaced volume-wide.
      acknowledged user write is never applied to a chunk whose mark could
      be lost.
   3. *Whole-chunk-aligned overwrite* and *O_TRUNC to zero*: no fetch —
-     but the mark may only become durable once the replacement bytes are:
-     apply the mutation (`pwrite` the full replacement / `ftruncate`) →
-     `fdatasync` the file → set the map bit(s) → `fsync` the map →
-     acknowledge. Marking before the mutation is durable would let a crash
-     leave a marked chunk whose XFS bytes are still the sparse restore
-     placeholder — a false canonical claim that would silently serve
-     zeros. The durable mark always covers durable replacement bytes.
+     but the mark may only become durable once the replacement bytes are.
+     A write first recalls chunks that are partial in its requested range,
+     then applies the mutation. For every accepted prefix, including a
+     short write, the authority `fdatasync`s the file and durably records
+     both the user-modified bit and every stored chunk fully covered by the
+     actual range returned by XFS (using the assigned offset for append).
+     If that actual range only partially covers a requested-full cold
+     chunk, the authority merge-recalls it: fetch the sealed chunk, write
+     only extent bytes outside the accepted range, `fdatasync`, then mark
+     the chunk. This repair is mandatory rather than recall-admission
+     fail-fast. Its failure fails the write; the chunk remains unmarked, so
+     a later recall may restore sealed bytes over the failed write's
+     accepted prefix, as ordinary failed-write semantics permit. Marking
+     before the resulting bytes are durable would let a crash leave a
+     marked chunk whose XFS bytes are still the sparse restore placeholder
+     — a false canonical claim that would silently serve zeros.
   Crash recovery is then exactly two lines: durably marked ⇒ XFS canonical
   for that chunk; unmarked ⇒ re-fetch from the sealed base. A crash
   between content durability and map `fsync` re-runs an idempotent step
@@ -219,15 +301,22 @@ surfaced volume-wide.
 - **Blocking discipline:** a read of unhydrated content blocks until
   hydrated with a hard per-recall deadline well under the connection
   `WriteTimeout`, failing with a named, non-fatal error — never parking a
-  connection past the admission guillotine. Concurrent in-recall requests
-  are capped at a small fraction of the ordinary lane (~16 of 64); at the
-  cap, further cold reads fail fast with the same named error and the
-  client retries. CI proves the session lease and keepalive survive recall
-  saturation. This keeps the v3 wire protocol unchanged — no new lanes, no
-  frozen-surface touch.
+  connection past the admission guillotine. The recall cap (`RecallLimit`,
+  16) bounds concurrent hydrator fetches at the single admission point
+  inside the fetch itself — innermost, after every chunk and entry lock —
+  so a wake burst past the cap queues (bounded by each caller's recall
+  deadline) instead of surfacing errors to applications, and no
+  lock-ordering cycle through the cap can exist. CI proves the session
+  lease and keepalive survive recall saturation. This keeps the v3 wire
+  protocol unchanged — no new lanes, no frozen-surface touch.
 - Hydration failures map to a new additive failure class
-  (`FAILURE_CLASS_RESTORE`), reported like the admission `EAGAIN` precedent
-  (`failure-modes.md:210-222`) — never `EIO`, never fatal-storage.
+  (`FAILURE_CLASS_RESTORE`) carrying errno `EIO`, never fatal-storage.
+  `EAGAIN` is specifically forbidden here: FUSE files are pollable, so
+  `EAGAIN` on a blocking regular-file read parks poll-driven runtimes
+  (Go's netpoller) on a readiness event that never fires — a hang, not an
+  error. The failure class and its stable detail (`blocked`, `corrupt`,
+  `protocol`, `recall_deadline`) keep the retryable nature on the wire
+  while the application sees an honest I/O error.
 
 ## Drain
 
@@ -236,7 +325,11 @@ surfaced volume-wide.
   concurrency sized to the cell NIC (~1 stream per 85–90 MB/s), driven by
   the hydrator and written through the authority's same write path.
 - Demand recall preempts drain (cancelled drain fetches resume) with ~5 s
-  hysteresis. Drain bypasses hot caches.
+  hysteresis. A drain worker retries blocked failures with an interruptible
+  per-worker exponential backoff, starting at 1 s, doubling to a 30 s cap,
+  and resetting after success; this is in addition to recall hysteresis.
+  A corrupt-class failure halts every drain worker, and RESTORE_CORRUPT
+  never commits convergence. Drain bypasses hot caches.
 - Completion: every chunk marked. Verification is per-fetch, not
   post-hoc: every recalled or drained chunk was digest-verified at fetch
   time, and every unfetched chunk was made canonical by a user mutation —

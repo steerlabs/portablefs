@@ -10,8 +10,33 @@ Type=simple
 ExecStart=/usr/local/bin/portablefs-archiver
 Restart=no
 NoNewPrivileges=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
+# The archiver's whole role is to read every inode of exactly one volume. A
+# volume is single-owner by contract (xfsstore refuses any chown away from the
+# volume owner), and users legitimately create modes that deny their own owner:
+# a 0000 file, a directory without owner search. Discretionary access is the
+# owner's own choice about their own data, not a boundary between principals
+# here, so a read of that data for the owner's own archive must not be decided
+# by it. CAP_DAC_READ_SEARCH is the narrowest capability that makes such inodes
+# archivable: it grants read and traverse only, never write, never chown, never
+# any other override. CAP_DAC_OVERRIDE would additionally grant write, which
+# this component must never hold - it runs against a read-only bind.
+#
+# The grant is safe because the confinement, not the capability, is what bounds
+# the archiver: it sees only /srv/portablefs-volume (a read-only bind of one
+# quiesced volume) and /run/portablefs-volume, both written by the helper's
+# per-volume drop-in, under ProtectSystem=strict with ProtectHome and
+# ProtectProc. Reading more of that one tree is exactly the job.
+#
+# Mechanism: the per-volume drop-in sets User=/Group= to the placement's
+# unprivileged service account, and AmbientCapabilities= is how a non-root unit
+# is given a capability at all. NoNewPrivileges=yes is compatible - systemd
+# raises the ambient set before the exec and NNP does not clear it - and
+# PrivateUsers=no (below) is required for the capability to mean anything
+# against host-owned inodes. AmbientCapabilities= is only honoured for
+# capabilities that are also in the bounding set, so both are named. Nothing
+# else in this unit or in the helper-written drop-in touches either set.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
 PrivateDevices=yes
 PrivateTmp=yes
 PrivateUsers=no

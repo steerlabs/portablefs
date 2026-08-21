@@ -122,6 +122,35 @@ func TestResultReadersAreStrictBoundedAndReportAbsence(t *testing.T) {
 	}
 }
 
+// The Manager places export and hydration work only on cells that answer true
+// here, so the answer must track the credentials file exactly.
+func TestArchiveConfiguredTracksUsableCredentials(t *testing.T) {
+	host, _ := archiveTestHost(t)
+	if host.ArchiveConfigured() {
+		t.Fatal("absent archive credentials reported as configured")
+	}
+	if err := os.WriteFile(host.cfg.ArchiveCredentialsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if host.ArchiveConfigured() {
+		t.Fatal("empty archive credentials reported as configured")
+	}
+	if err := os.WriteFile(host.cfg.ArchiveCredentialsPath, []byte("credentials"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !host.ArchiveConfigured() {
+		t.Fatal("usable archive credentials reported as unconfigured")
+	}
+	// Credentials the whole cell can read are not credentials this helper will
+	// stage, so they are not a capability either.
+	if err := os.Chmod(host.cfg.ArchiveCredentialsPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if host.ArchiveConfigured() {
+		t.Fatal("world-readable archive credentials reported as configured")
+	}
+}
+
 type archiveRoots struct{ cell, config, state, units string }
 
 func archiveTestHost(t *testing.T) (*Host, archiveRoots) {

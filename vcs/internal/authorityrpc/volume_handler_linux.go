@@ -2190,9 +2190,15 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		errno = errnos.EAGAIN
 	case errors.Is(err, volumeserver.ErrQuiescing):
 		errno = errnos.EAGAIN
-	case errors.Is(err, restoremode.ErrRecallSaturated), errors.Is(err, restoremode.ErrRecallDeadline),
+	case errors.Is(err, restoremode.ErrRecallDeadline),
 		errors.Is(err, restoremode.ErrBlocked), errors.Is(err, restoremode.ErrCorrupt), errors.Is(err, restoremode.ErrProtocol):
-		errno = errnos.EAGAIN
+		// EIO, not EAGAIN: FUSE files are pollable, so EAGAIN on a blocking
+		// regular-file read parks poll-driven runtimes (Go's netpoller) on a
+		// readiness event that never fires — a hang, not an error. A restore
+		// that cannot serve bytes within its recall deadline is an I/O failure
+		// to the application; FAILURE_CLASS_RESTORE still tells every frontend
+		// and operator that the volume itself is healthy and retryable.
+		errno = errnos.EIO
 		resp := h.success(requestID)
 		resp.Errno, resp.Uncertain = errno, uncertain
 		resp.Failure = authoritypb.FailureClass_FAILURE_CLASS_RESTORE
@@ -2201,8 +2207,6 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 			resp.RestoreDetail = "corrupt"
 		case errors.Is(err, restoremode.ErrProtocol):
 			resp.RestoreDetail = "protocol"
-		case errors.Is(err, restoremode.ErrRecallSaturated):
-			resp.RestoreDetail = "recall_saturated"
 		case errors.Is(err, restoremode.ErrRecallDeadline):
 			resp.RestoreDetail = "recall_deadline"
 		default:

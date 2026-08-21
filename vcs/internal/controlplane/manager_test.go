@@ -1464,6 +1464,7 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+		ArchiveConfigured: true,
 		Volumes: []VolumeObservation{{
 			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
 			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
@@ -1478,6 +1479,7 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+		ArchiveConfigured: true,
 		Volumes: []VolumeObservation{{
 			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
 			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
@@ -1500,6 +1502,7 @@ func prepareCellForAdmission(t *testing.T, h managerHarness, cell Cell) Cell {
 		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+		ArchiveConfigured: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1509,6 +1512,7 @@ func prepareCellForAdmission(t *testing.T, h managerHarness, cell Cell) Cell {
 			CellID: cell.ID, PlanGeneration: observed.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
 			AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 			PlanVersions: []uint32{1, 2}, HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2},
+			ArchiveConfigured: true,
 		})
 		if err != nil {
 			t.Fatal(err)

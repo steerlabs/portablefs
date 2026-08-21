@@ -64,16 +64,16 @@ func (e *UnsupportedInodeError) Error() string {
 func (e *UnsupportedInodeError) Is(target error) bool { return target == ErrInvalid }
 
 // UnreadableInodeError names a path the archive could not read because its own
-// mode denies the volume's service identity — a mode-0000 file, a
-// non-searchable directory.
+// mode denies the reading identity — a mode-0000 file, a non-searchable
+// directory.
 //
-// The archiver holds no capability that overrides discretionary access, by
-// design: it reads one volume tree as exactly the identity that owns it. So a
-// tree containing a node its owner cannot read cannot be archived, and the
-// archive fails with this error rather than sealing a manifest that quietly
-// omits the node or its extended attributes. The operator's remedy is to relax
-// the mode; the contract's remedy is to decide whether such modes may exist at
-// all, which is above this component.
+// In production this is tamper defense, not policy: the archiver unit runs as
+// the identity that owns the volume WITH ambient CAP_DAC_READ_SEARCH (see
+// deploy/systemd/portablefs-archiver@.service), precisely so that owner-denying
+// modes — which users legitimately create — remain archivable. This error
+// therefore fires only where that grant is absent or something stripped it,
+// and the archive fails rather than sealing a manifest that quietly omits the
+// node or its extended attributes.
 type UnreadableInodeError struct {
 	Path string
 	Mode uint32
