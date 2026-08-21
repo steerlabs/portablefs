@@ -89,6 +89,12 @@ REQUIRED_TESTS=(
   # skipping, must fail this job instead of quietly removing the proof that a
   # restored volume serves the bytes that were archived. No stage of it is
   # allowed to skip, restricted modes included - see run_tiered_suite.
+  # The hydrator/restore-mode interop proof needs real XFS export handles, so
+  # the everywhere `go` lane skips it on its ext4 runner; this suite is where
+  # it must actually run, on the provisioned volume, and never skip.
+  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode"
+  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/ConvergesAgainstTheRealHydrator"
+  "github.com/steerlabs/portablefs/vcs/internal/restoremode:TestInteropHydratorAndRestoreMode/SurfacesHydratorCorruptionAsErrCorrupt"
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS"
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ArchiveAndVerify"
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/InstantNamespaceOnANewPlacement"
@@ -263,7 +269,7 @@ suite_command() {
 run_plain_suite() {
   local log=$1
   local -a command=()
-  mapfile -d '' -t command < <(suite_command ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/...)
+  mapfile -d '' -t command < <(suite_command ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... ./internal/restoremode/...)
   runuser -u portablefs -- "${command[@]}" >>"$log" 2>&1
 }
 

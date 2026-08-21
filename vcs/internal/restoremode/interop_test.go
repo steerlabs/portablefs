@@ -332,7 +332,7 @@ func newInteropFixture(t *testing.T) *interopFixture {
 		client:     client,
 		manifest:   manifest,
 		packKeys:   packKeys,
-		volumeRoot: t.TempDir(),
+		volumeRoot: interopVolumeRoot(t),
 		// The state directory holds the AF_UNIX socket, which is capped at
 		// about a hundred bytes; a test temporary directory is often longer
 		// than that on its own.
