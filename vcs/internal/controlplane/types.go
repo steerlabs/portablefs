@@ -109,31 +109,33 @@ type State struct {
 }
 
 type Cell struct {
-	ID                  string     `json:"id"`
-	AvailabilityZone    string     `json:"availability_zone"`
-	AuthorityHost       string     `json:"authority_host"`
-	AuthorityDNSZone    string     `json:"authority_dns_zone"`
-	CapacityBytes       uint64     `json:"capacity_bytes"`
-	CapacityInodes      uint64     `json:"capacity_inodes"`
-	Pool                string     `json:"pool"`
-	Decommissioning     bool       `json:"decommissioning,omitempty"`
-	Abandoned           bool       `json:"abandoned,omitempty"`
-	NextProjectID       uint32     `json:"next_project_id"`
-	NextServiceUID      uint32     `json:"next_service_uid"`
-	NextPort            uint16     `json:"next_port"`
-	PlanGeneration      uint64     `json:"plan_generation"`
-	PlanReleaseID       string     `json:"plan_release_id,omitempty"`
-	PlanIssuedUnix      int64      `json:"plan_issued_unix"`
-	PlanExpiresUnix     int64      `json:"plan_expires_unix"`
-	LastObservedUnix    int64      `json:"last_observed_unix,omitempty"`
-	LastManagerRelease  string     `json:"last_manager_release,omitempty"`
-	LastAgentRelease    string     `json:"last_agent_release,omitempty"`
-	LastHelperRelease   string     `json:"last_helper_release,omitempty"`
-	Health              CellHealth `json:"health"`
-	QuarantineReason    string     `json:"quarantine_reason,omitempty"`
-	PlanVersions        []uint32   `json:"plan_versions,omitempty"`
-	HelperPlanVersions  []uint32   `json:"helper_plan_versions,omitempty"`
-	HelperStateVersions []uint32   `json:"helper_state_versions,omitempty"`
+	ID                 string     `json:"id"`
+	AvailabilityZone   string     `json:"availability_zone"`
+	AuthorityHost      string     `json:"authority_host"`
+	AuthorityDNSZone   string     `json:"authority_dns_zone"`
+	CapacityBytes      uint64     `json:"capacity_bytes"`
+	CapacityInodes     uint64     `json:"capacity_inodes"`
+	Pool               string     `json:"pool"`
+	Decommissioning    bool       `json:"decommissioning,omitempty"`
+	Abandoned          bool       `json:"abandoned,omitempty"`
+	NextProjectID      uint32     `json:"next_project_id"`
+	NextServiceUID     uint32     `json:"next_service_uid"`
+	NextPort           uint16     `json:"next_port"`
+	PlanGeneration     uint64     `json:"plan_generation"`
+	PlanReleaseID      string     `json:"plan_release_id,omitempty"`
+	PlanIssuedUnix     int64      `json:"plan_issued_unix"`
+	PlanExpiresUnix    int64      `json:"plan_expires_unix"`
+	LastObservedUnix   int64      `json:"last_observed_unix,omitempty"`
+	LastManagerRelease string     `json:"last_manager_release,omitempty"`
+	LastAgentRelease   string     `json:"last_agent_release,omitempty"`
+	LastHelperRelease  string     `json:"last_helper_release,omitempty"`
+	Health             CellHealth `json:"health"`
+	QuarantineReason   string     `json:"quarantine_reason,omitempty"`
+	// These arrays remain in the durable schema so strict decoding accepts
+	// schema-v2 snapshots written before plan negotiation was removed.
+	PlanVersions        []uint32 `json:"plan_versions,omitempty"`
+	HelperPlanVersions  []uint32 `json:"helper_plan_versions,omitempty"`
+	HelperStateVersions []uint32 `json:"helper_state_versions,omitempty"`
 	// ArchiveConfigured is the cell's own report that its helper holds readable
 	// archive-store credentials. A cell without them can neither export nor
 	// hydrate, so archive and restore work is never placed on one. Absent in
@@ -442,17 +444,14 @@ type MountAuthorization struct {
 }
 
 type CellObservation struct {
-	CellID              string              `json:"cell_id"`
-	PlanGeneration      uint64              `json:"plan_generation"`
-	ManagerReleaseID    string              `json:"manager_release_id"`
-	AgentReleaseID      string              `json:"agent_release_id"`
-	HelperReleaseID     string              `json:"helper_release_id"`
-	Volumes             []VolumeObservation `json:"volumes"`
-	ObservedUnix        int64               `json:"observed_unix"`
-	PlanVersions        []uint32            `json:"plan_versions,omitempty"`
-	HelperPlanVersions  []uint32            `json:"helper_plan_versions,omitempty"`
-	HelperStateVersions []uint32            `json:"helper_state_versions,omitempty"`
-	ArchiveConfigured   bool                `json:"archive_configured,omitempty"`
+	CellID            string              `json:"cell_id"`
+	PlanGeneration    uint64              `json:"plan_generation"`
+	ManagerReleaseID  string              `json:"manager_release_id"`
+	AgentReleaseID    string              `json:"agent_release_id"`
+	HelperReleaseID   string              `json:"helper_release_id"`
+	Volumes           []VolumeObservation `json:"volumes"`
+	ObservedUnix      int64               `json:"observed_unix"`
+	ArchiveConfigured bool                `json:"archive_configured,omitempty"`
 }
 
 type CellHeartbeat struct {
@@ -588,9 +587,6 @@ func (state State) Validate() error {
 		if (cell.LastObservedUnix > 0) != observedIdentity || observedIdentity &&
 			(cell.LastManagerRelease == "" || cell.LastAgentRelease == "" || cell.LastHelperRelease == "") {
 			return fmt.Errorf("%w: cell observation identity", ErrInvalid)
-		}
-		if !validVersions(cell.PlanVersions) || !validVersions(cell.HelperPlanVersions) || !validVersions(cell.HelperStateVersions) {
-			return fmt.Errorf("%w: cell version capability", ErrInvalid)
 		}
 		// Archive capability is a reported observation, never an assumption: it
 		// can only be set on a cell that has actually reported.
@@ -945,17 +941,6 @@ func validateObjectRef(ref ObjectRef) error {
 
 func validPool(pool string) bool {
 	return pool == PoolProduct || pool == PoolSystem || pool == PoolTest
-}
-
-func validVersions(versions []uint32) bool {
-	previous := uint32(0)
-	for _, version := range versions {
-		if version == 0 || version > 2 || version <= previous {
-			return false
-		}
-		previous = version
-	}
-	return true
 }
 
 func (state State) volumeView(volume Volume) VolumeView {

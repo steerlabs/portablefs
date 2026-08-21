@@ -100,7 +100,7 @@ case "$command" in
         printf '%s\n' "$result"
         exit 0
       fi
-      [[ $state != QUARANTINED && $state != RETIRED ]] || {
+      [[ $state != QUARANTINED ]] || {
         printf '%s\n' "$result" >&2
         exit 69
       }

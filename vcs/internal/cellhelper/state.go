@@ -18,47 +18,9 @@ import (
 )
 
 const (
-	helperStateVersionV1 uint32 = 1
-	helperStateVersion   uint32 = 2
-	maxHelperStateBytes         = 8 << 20
-	legacyPhaseRetire           = cellplan.VolumePhase("RETIRE")
+	helperStateVersion  uint32 = 2
+	maxHelperStateBytes        = 8 << 20
 )
-
-// The v1 shapes are kept separate from the live structs. The rollout gate is
-// an encoding promise, not merely omission of zero-valued v2 fields: until a
-// v2 plan is accepted, an old helper must be able to read the exact state
-// shape a new helper writes.
-type stateV1 struct {
-	Version        uint32                  `json:"version"`
-	CellID         string                  `json:"cell_id"`
-	PlanGeneration uint64                  `json:"plan_generation"`
-	PlanHash       string                  `json:"plan_sha256"`
-	Assignments    map[string]assignmentV1 `json:"assignments"`
-}
-
-type assignmentV1 struct {
-	VolumeID             string               `json:"volume_id"`
-	AuthorizationDomain  string               `json:"authorization_domain"`
-	Owner                string               `json:"owner"`
-	ProductIssuer        string               `json:"product_issuer"`
-	ProductPublicKeyPEM  string               `json:"product_public_key_pem"`
-	CellID               string               `json:"cell_id"`
-	ProjectID            uint32               `json:"project_id"`
-	ServiceUID           uint32               `json:"service_uid"`
-	ServiceGID           uint32               `json:"service_gid"`
-	ListenPort           uint16               `json:"listen_port"`
-	QuotaBytes           uint64               `json:"quota_bytes"`
-	QuotaInodes          uint64               `json:"quota_inodes"`
-	AuthorityID          string               `json:"authority_id"`
-	AuthorityServerName  string               `json:"authority_server_name"`
-	AuthorityGeneration  uint64               `json:"authority_generation"`
-	LastPhase            cellplan.VolumePhase `json:"last_phase"`
-	AuthorityAbsent      bool                 `json:"authority_absent"`
-	QuotaApplied         bool                 `json:"quota_applied"`
-	Applied              bool                 `json:"applied"`
-	AppliedPlanHash      string               `json:"applied_plan_sha256,omitempty"`
-	AppliedHelperRelease string               `json:"applied_helper_release,omitempty"`
-}
 
 func loadState(path, cellID string) (State, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -66,7 +28,7 @@ func loadState(path, cellID string) (State, error) {
 	}
 	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if errors.Is(err, unix.ENOENT) {
-		return State{Version: helperStateVersionV1, CellID: cellID, PlanVersionApplied: cellplan.VersionV1,
+		return State{Version: helperStateVersion, CellID: cellID, PlanVersionApplied: cellplan.Version,
 			Assignments: map[string]Assignment{}, Tombstones: map[string]Tombstone{}}, nil
 	}
 	if err != nil {
@@ -96,20 +58,12 @@ func loadState(path, cellID string) (State, error) {
 	if err := json.Unmarshal(payload, &header); err != nil {
 		return State{}, err
 	}
-	var state State
-	switch header.Version {
-	case helperStateVersionV1:
-		var old stateV1
-		if err := decodeStateStrict(payload, &old); err != nil {
-			return State{}, err
-		}
-		state = migrateStateV1(old)
-	case helperStateVersion:
-		if err := decodeStateStrict(payload, &state); err != nil {
-			return State{}, err
-		}
-	default:
+	if header.Version != helperStateVersion {
 		return State{}, errors.New("cellhelper: unsupported state version")
+	}
+	var state State
+	if err := decodeStateStrict(payload, &state); err != nil {
+		return State{}, err
 	}
 	if err := validateState(state, cellID); err != nil {
 		return State{}, err
@@ -129,37 +83,9 @@ func decodeStateStrict(payload []byte, target any) error {
 	return nil
 }
 
-func migrateStateV1(old stateV1) State {
-	state := State{Version: helperStateVersionV1, CellID: old.CellID, PlanGeneration: old.PlanGeneration,
-		PlanHash: old.PlanHash, PlanVersionApplied: cellplan.VersionV1,
-		Assignments: make(map[string]Assignment, len(old.Assignments)), Tombstones: map[string]Tombstone{}}
-	for id, item := range old.Assignments {
-		assignment := Assignment{
-			VolumeID: item.VolumeID, AuthorizationDomain: item.AuthorizationDomain, Owner: item.Owner,
-			ProductIssuer: item.ProductIssuer, ProductPublicKeyPEM: item.ProductPublicKeyPEM,
-			CellID: item.CellID, PlacementSequence: 1, ProjectID: item.ProjectID,
-			ServiceUID: item.ServiceUID, ServiceGID: item.ServiceGID, ListenPort: item.ListenPort,
-			QuotaBytes: item.QuotaBytes, QuotaInodes: item.QuotaInodes,
-			AuthorityID: item.AuthorityID, AuthorityServerName: item.AuthorityServerName,
-			AuthorityGeneration: item.AuthorityGeneration, LastPhase: item.LastPhase,
-			AuthorityAbsent: item.AuthorityAbsent, Applied: item.Applied, AppliedPlanHash: item.AppliedPlanHash,
-			AppliedHelperRelease: item.AppliedHelperRelease,
-		}
-		if item.QuotaApplied {
-			assignment.AppliedQuotaBytes = item.QuotaBytes
-			assignment.AppliedQuotaInodes = item.QuotaInodes
-		}
-		state.Assignments[id] = assignment
-	}
-	return state
-}
-
 func validateState(state State, cellID string) error {
-	if state.Version != helperStateVersionV1 && state.Version != helperStateVersion || state.CellID != cellID ||
-		state.Assignments == nil || state.Tombstones == nil ||
-		state.PlanVersionApplied != cellplan.VersionV1 && state.PlanVersionApplied != cellplan.Version ||
-		state.Version == helperStateVersionV1 && state.PlanVersionApplied != cellplan.VersionV1 ||
-		state.Version == helperStateVersion && state.PlanVersionApplied != cellplan.Version {
+	if state.Version != helperStateVersion || state.CellID != cellID || state.Assignments == nil || state.Tombstones == nil ||
+		state.PlanVersionApplied != cellplan.Version {
 		return errors.New("cellhelper: state identity mismatch")
 	}
 	if state.PlanGeneration == 0 {
@@ -176,7 +102,7 @@ func validateState(state State, cellID string) error {
 			assignment.ServiceUID < 1000 || assignment.ServiceGID < 1000 || assignment.ListenPort < 1024 ||
 			assignment.QuotaBytes == 0 || assignment.QuotaInodes == 0 || assignment.AuthorityGeneration == 0 ||
 			assignment.AppliedQuotaBytes > assignment.QuotaBytes || assignment.AppliedQuotaInodes > assignment.QuotaInodes ||
-			!validStoredPhase(assignment.LastPhase) || state.Version == helperStateVersionV1 && !validStoredPhaseV1(assignment.LastPhase) {
+			!validStoredPhase(assignment.LastPhase) {
 			return errors.New("cellhelper: state contains an invalid assignment")
 		}
 		if assignment.Applied {
@@ -251,17 +177,8 @@ func validDigest(value string) bool {
 
 func validStoredPhase(phase cellplan.VolumePhase) bool {
 	switch phase {
-	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, legacyPhaseRetire,
+	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence,
 		cellplan.PhaseArchive, cellplan.PhaseRestore, cellplan.PhaseDestroy:
-		return true
-	default:
-		return false
-	}
-}
-
-func validStoredPhaseV1(phase cellplan.VolumePhase) bool {
-	switch phase {
-	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, legacyPhaseRetire:
 		return true
 	default:
 		return false
@@ -315,24 +232,6 @@ func saveState(path string, state State) error {
 }
 
 func marshalState(state State) ([]byte, error) {
-	if state.PlanVersionApplied >= cellplan.Version {
-		state.Version = helperStateVersion
-		return json.Marshal(state)
-	}
-	old := stateV1{Version: helperStateVersionV1, CellID: state.CellID, PlanGeneration: state.PlanGeneration,
-		PlanHash: state.PlanHash, Assignments: make(map[string]assignmentV1, len(state.Assignments))}
-	for id, item := range state.Assignments {
-		old.Assignments[id] = assignmentV1{
-			VolumeID: item.VolumeID, AuthorizationDomain: item.AuthorizationDomain, Owner: item.Owner,
-			ProductIssuer: item.ProductIssuer, ProductPublicKeyPEM: item.ProductPublicKeyPEM, CellID: item.CellID,
-			ProjectID: item.ProjectID, ServiceUID: item.ServiceUID, ServiceGID: item.ServiceGID, ListenPort: item.ListenPort,
-			QuotaBytes: item.QuotaBytes, QuotaInodes: item.QuotaInodes, AuthorityID: item.AuthorityID,
-			AuthorityServerName: item.AuthorityServerName, AuthorityGeneration: item.AuthorityGeneration,
-			LastPhase: item.LastPhase, AuthorityAbsent: item.AuthorityAbsent,
-			QuotaApplied: item.AppliedQuotaBytes == item.QuotaBytes && item.AppliedQuotaInodes == item.QuotaInodes,
-			Applied:      item.Applied, AppliedPlanHash: item.AppliedPlanHash,
-			AppliedHelperRelease: item.AppliedHelperRelease,
-		}
-	}
-	return json.Marshal(old)
+	state.Version = helperStateVersion
+	return json.Marshal(state)
 }

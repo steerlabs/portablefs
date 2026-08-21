@@ -24,19 +24,6 @@ func validPlan(now time.Time) Plan {
 	}
 }
 
-func validV1Plan(now time.Time) Plan {
-	plan := validPlan(now)
-	plan.Version = VersionV1
-	plan.AuthorityCAPEM = ""
-	plan.ClientCAPEM = ""
-	plan.CapabilityPublicKey = ""
-	plan.Volumes[0].PlacementSequence = 0
-	plan.Volumes[0].AuthorityCAPEM = "authority-ca"
-	plan.Volumes[0].ClientCAPEM = "client-ca"
-	plan.Volumes[0].CapabilityPublicKey = "cap-key"
-	return plan
-}
-
 func TestSignedPlanBindsCellAndExactPayload(t *testing.T) {
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(1_700_000_000, 0)
@@ -66,27 +53,22 @@ func TestSignedPlanBindsCellAndExactPayload(t *testing.T) {
 	}
 }
 
-func TestV1AndV2RoundTripAndDomainsAreDisjoint(t *testing.T) {
+func TestPlanAcceptsOnlyV2EnvelopeAndPayload(t *testing.T) {
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(1_700_000_000, 0)
-	for _, plan := range []Plan{validV1Plan(now), validPlan(now)} {
-		envelope, err := Sign(privateKey, plan)
-		if err != nil {
-			t.Fatal(err)
-		}
-		got, _, err := Verify(publicKey, envelope, plan.CellID, now, time.Second, 5*time.Minute)
-		if err != nil || got.Version != plan.Version {
-			t.Fatalf("version %d round trip = %d, %v", plan.Version, got.Version, err)
-		}
-		parts := strings.Split(envelope.Token, ".")
-		if plan.Version == VersionV1 {
-			parts[0] = "v2"
-		} else {
-			parts[0] = "v1"
-		}
-		if _, _, err := Verify(publicKey, Envelope{Token: strings.Join(parts, ".")}, plan.CellID, now, time.Second, 5*time.Minute); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("cross-version envelope for %d = %v", plan.Version, err)
-		}
+	plan := validPlan(now)
+	envelope, err := Sign(privateKey, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(envelope.Token, ".")
+	parts[0] = "v1"
+	if _, _, err := Verify(publicKey, Envelope{Token: strings.Join(parts, ".")}, plan.CellID, now, time.Second, 5*time.Minute); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("v1 envelope = %v", err)
+	}
+	plan.Version = 1
+	if _, err := Sign(privateKey, plan); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("v1 payload = %v", err)
 	}
 }
 
@@ -127,12 +109,6 @@ func TestPhaseSpecificFieldsAreExact(t *testing.T) {
 				t.Fatalf("Validate = %v, want ErrInvalid", err)
 			}
 		})
-	}
-	v1 := validV1Plan(time.Unix(1_700_000_000, 0))
-	v1.Volumes[0].Phase = PhaseArchive
-	v1.Volumes[0].ArchiveTo = &ArchiveTarget{Attempt: "33333333-3333-4333-8333-333333333333", KeyVersion: "k1"}
-	if err := Validate(v1); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("v1 archive = %v", err)
 	}
 }
 

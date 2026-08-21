@@ -320,8 +320,7 @@ func observeTieredCell(t *testing.T, h managerHarness, cellID, requestID string,
 	t.Helper()
 	plan := verifiedPlan(t, h.manager, cellID, *h.now)
 	_, err := h.manager.ObserveCell(requestID, CellObservation{CellID: cellID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
-		AgentReleaseID: "agent-v2", HelperReleaseID: "helper-v2", ObservedUnix: h.now.Unix(), PlanVersions: []uint32{1, 2},
-		HelperPlanVersions: []uint32{1, 2}, HelperStateVersions: []uint32{1, 2}, ArchiveConfigured: archiveConfigured,
+		AgentReleaseID: "agent-v2", HelperReleaseID: "helper-v2", ObservedUnix: h.now.Unix(), ArchiveConfigured: archiveConfigured,
 		Volumes: observations})
 	if err != nil {
 		t.Fatal(err)

@@ -101,10 +101,6 @@ func (agent *Agent) RunOnce(ctx context.Context) error {
 		return fmt.Errorf("%w: helper observation changed or omitted a signed volume assignment", ErrInvalid)
 	}
 	observation.AgentReleaseID = agent.cfg.ReleaseID
-	// The agent declares only its own envelope capability. Helper capabilities
-	// are returned by the privileged process and relayed without inference or
-	// release-string coupling.
-	observation.PlanVersions = []uint32{cellplan.VersionV1, cellplan.Version}
 	digest, err := observationDigest(observation)
 	if err != nil {
 		return err

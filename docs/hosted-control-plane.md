@@ -1,6 +1,6 @@
 # Hosted control plane
 
-Status: **implemented v1 foundation; single-manager and single-AZ by design**
+Status: **implemented; single-manager and single-AZ by design**
 
 PortableFS can still be self-hosted with credentials minted out of band. The
 hosted stack adds a product-neutral manager and a narrow storage-cell control
@@ -277,15 +277,13 @@ no second writer or unsafe epoch restart is introduced.
 
 ## Volume lifecycle and fencing
 
-The v1 state machine remains the baseline. State schema v2 adds the archive
-cycle and terminal destruction:
+Manager state schema v2 has one volume lifecycle:
 
 ```text
-PROVISIONING -> READY <-> FENCING                      (existing, unchanged)
+PROVISIONING -> READY <-> FENCING
 READY -> ARCHIVING -> ARCHIVED -> RESTORING -> READY   (READY at a later epoch)
-READY | ARCHIVED -> DESTROYED                          (terminal, durable record)
-READY -> RETIRED                                       (v1 retained)
-QUARANTINED                                            (unchanged)
+READY | ARCHIVED -> DESTROYING -> DESTROYED            (terminal, durable record)
+QUARANTINED
 ```
 
 Archive first closes strict-attach admission and proves membership empty, then
@@ -406,16 +404,14 @@ header. Reusing a retained key with different bytes or another operation is
 refused. Receipts are durable and byte-identical on retry for a 24-hour retry
 window; observations are state-based and reapplying them is safe.
 
-## Deliberate v1 limits
+## Current limits
 
 - One manager process owns the state file. There is no manager HA or consensus
   protocol yet. Run it on durable storage with process supervision and backups.
 - Placement is single-cell and single-AZ. There is no automatic cross-cell
   migration, block-device failover, or second writer.
-- A cell plan admits at most 256 placement assignments. Retired assignments
-  still count because their isolation IDs and data are deliberately retained;
-  released placements do not, because `RELEASE` removes the assignment and
-  frees the plan slot.
+- A cell plan admits at most 256 placement assignments. An assignment counts
+  until `RELEASE` removes it and frees the plan slot.
 - Operator EBS snapshots remain an offline storage-provider workflow. The
   archive tier's `portablefs-archiver` and `portablefs-hydrator` are the
   narrow-identity controllers reserved by that boundary: typed archive phases

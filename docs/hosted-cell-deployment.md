@@ -202,9 +202,9 @@ the long-running helper does not hold that capability.
 - A cell heartbeat loss makes mount issuance fail closed after the configured
   freshness window. Existing authority sessions continue until their own
   liveness/authorization/fencing rules end them.
-- `RETIRE` preserves the XFS directory. Archive, restore, destroy, and release
-  run only through typed v2 plan phases and their proofs; operator snapshots and
-  device replacement remain offline runbooks.
+- Archive, restore, destroy, and release run only through typed v2 plan phases
+  and their proofs; operator snapshots and device replacement remain offline
+  runbooks.
 
 Before a production rollout, exercise the failure paths on a disposable real
 XFS host: kill/stop races, a `SIGSTOP`ed worker, cgroup population, full block

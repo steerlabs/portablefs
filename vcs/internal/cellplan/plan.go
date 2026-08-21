@@ -25,11 +25,9 @@ import (
 )
 
 const (
-	VersionV1        = 1
 	Version          = 2
 	MaxPayloadBytes  = 3 << 20
 	MaxEnvelopeBytes = 4 << 20
-	domainV1         = "portablefs-cell-plan-v1\x00"
 	domainV2         = "portablefs-cell-plan-v2\x00"
 )
 
@@ -130,12 +128,8 @@ func Sign(privateKey ed25519.PrivateKey, plan Plan) (Envelope, error) {
 	if len(payload) > MaxPayloadBytes {
 		return Envelope{}, fmt.Errorf("%w: plan exceeds payload bound", ErrInvalid)
 	}
-	prefix, signatureDomain, ok := versionEnvelope(plan.Version)
-	if !ok {
-		return Envelope{}, ErrInvalid
-	}
-	signature := ed25519.Sign(privateKey, append([]byte(signatureDomain), payload...))
-	token := prefix + "." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature)
+	signature := ed25519.Sign(privateKey, append([]byte(domainV2), payload...))
+	token := "v2." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(signature)
 	if len(token) > MaxEnvelopeBytes {
 		return Envelope{}, fmt.Errorf("%w: plan exceeds envelope bound", ErrInvalid)
 	}
@@ -151,8 +145,7 @@ func Verify(publicKey ed25519.PublicKey, envelope Envelope, cellID string, now t
 	if len(parts) != 3 {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
-	version, signatureDomain, ok := envelopeVersion(parts[0])
-	if !ok {
+	if parts[0] != "v2" {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -161,7 +154,7 @@ func Verify(publicKey ed25519.PublicKey, envelope Envelope, cellID string, now t
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil || len(signature) != ed25519.SignatureSize ||
-		!ed25519.Verify(publicKey, append([]byte(signatureDomain), payload...), signature) {
+		!ed25519.Verify(publicKey, append([]byte(domainV2), payload...), signature) {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
@@ -173,7 +166,7 @@ func Verify(publicKey ed25519.PublicKey, envelope Envelope, cellID string, now t
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
-	if plan.Version != version {
+	if plan.Version != Version {
 		return Plan{}, [32]byte{}, ErrInvalid
 	}
 	if err := Validate(plan); err != nil || plan.CellID != cellID {
@@ -187,15 +180,11 @@ func Verify(publicKey ed25519.PublicKey, envelope Envelope, cellID string, now t
 }
 
 func Validate(plan Plan) error {
-	if plan.Version != VersionV1 && plan.Version != Version || !uuidPattern.MatchString(plan.CellID) || plan.Generation == 0 ||
+	if plan.Version != Version || !uuidPattern.MatchString(plan.CellID) || plan.Generation == 0 ||
 		plan.IssuedAt <= 0 || plan.ExpiresAt <= plan.IssuedAt || !validText(plan.ReleaseID, 256) {
 		return ErrInvalid
 	}
-	if plan.Version == VersionV1 {
-		if plan.AuthorityCAPEM != "" || plan.ClientCAPEM != "" || plan.CapabilityPublicKey != "" {
-			return fmt.Errorf("%w: v1 plan-level trust material", ErrInvalid)
-		}
-	} else if plan.AuthorityCAPEM == "" || plan.ClientCAPEM == "" || plan.CapabilityPublicKey == "" {
+	if plan.AuthorityCAPEM == "" || plan.ClientCAPEM == "" || plan.CapabilityPublicKey == "" {
 		return fmt.Errorf("%w: v2 plan-level trust material", ErrInvalid)
 	}
 	seenVolume := make(map[string]struct{}, len(plan.Volumes))
@@ -211,12 +200,7 @@ func Validate(plan Plan) error {
 			volume.AuthorityServerName == "" {
 			return fmt.Errorf("%w: incomplete volume %q", ErrInvalid, volume.VolumeID)
 		}
-		if plan.Version == VersionV1 {
-			if volume.AuthorityCAPEM == "" || volume.ClientCAPEM == "" || volume.CapabilityPublicKey == "" ||
-				volume.PlacementSequence != 0 || volume.ArchiveTo != nil || volume.RestoreFrom != nil || volume.ReleaseProof != nil {
-				return fmt.Errorf("%w: v1 volume shape", ErrInvalid)
-			}
-		} else if volume.AuthorityCAPEM != "" || volume.ClientCAPEM != "" || volume.CapabilityPublicKey != "" || volume.PlacementSequence == 0 {
+		if volume.AuthorityCAPEM != "" || volume.ClientCAPEM != "" || volume.CapabilityPublicKey != "" || volume.PlacementSequence == 0 {
 			return fmt.Errorf("%w: v2 volume shape", ErrInvalid)
 		}
 		switch volume.Phase {
@@ -226,19 +210,16 @@ func Validate(plan Plan) error {
 				return fmt.Errorf("%w: serving volume has no authority certificate", ErrInvalid)
 			}
 		case PhaseArchive:
-			if plan.Version != Version || volume.ArchiveTo == nil || !uuidPattern.MatchString(volume.ArchiveTo.Attempt) || !validText(volume.ArchiveTo.KeyVersion, 256) {
+			if volume.ArchiveTo == nil || !uuidPattern.MatchString(volume.ArchiveTo.Attempt) || !validText(volume.ArchiveTo.KeyVersion, 256) {
 				return fmt.Errorf("%w: archive phase", ErrInvalid)
 			}
 		case PhaseRestore:
-			if plan.Version != Version || !validRestoreSource(volume.RestoreFrom) {
+			if !validRestoreSource(volume.RestoreFrom) {
 				return fmt.Errorf("%w: restore phase", ErrInvalid)
 			}
 		case PhaseDestroy:
-			if plan.Version != Version {
-				return fmt.Errorf("%w: destroy phase", ErrInvalid)
-			}
 		case PhaseRelease:
-			if plan.Version != Version || !validReleaseProof(volume.ReleaseProof) {
+			if !validReleaseProof(volume.ReleaseProof) {
 				return fmt.Errorf("%w: release phase", ErrInvalid)
 			}
 		default:
@@ -269,28 +250,6 @@ func Validate(plan Plan) error {
 		return fmt.Errorf("%w: volumes are not in canonical order", ErrInvalid)
 	}
 	return nil
-}
-
-func versionEnvelope(version uint32) (string, string, bool) {
-	switch version {
-	case VersionV1:
-		return "v1", domainV1, true
-	case Version:
-		return "v2", domainV2, true
-	default:
-		return "", "", false
-	}
-}
-
-func envelopeVersion(prefix string) (uint32, string, bool) {
-	switch prefix {
-	case "v1":
-		return VersionV1, domainV1, true
-	case "v2":
-		return Version, domainV2, true
-	default:
-		return 0, "", false
-	}
 }
 
 func validRestoreSource(source *RestoreSource) bool {

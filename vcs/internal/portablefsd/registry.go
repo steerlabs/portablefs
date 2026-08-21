@@ -249,7 +249,7 @@ func newRegistryWithMountLogDir(stateDir, mountLogDir string) *registry {
 		}
 		a.mountLogDir = r.mountLogDir
 		if e.V3 == nil {
-			// A RECORD FROM THE RETIRED CLIENT-JOURNAL ARCHITECTURE.
+			// A RECORD FROM THE OBSOLETE CLIENT-JOURNAL ARCHITECTURE.
 			//
 			// It names a kernel mount this daemon can still reconcile, but no
 			// engine in this build can serve it: the write-back/journal data

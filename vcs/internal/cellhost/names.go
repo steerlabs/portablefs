@@ -26,18 +26,15 @@ const accountNameLimit = 31
 // never deleted (destroy removes the sysusers configuration and keeps the
 // account), so every name this returns must be unique for all time.
 //
-//   - placementSequence 1 is the v1 placement and keeps the v1 name,
-//     base32 of the volume UUID's 16 raw bytes, so migrated volumes keep the
-//     account, UID, and drop-ins they already have.
+//   - placementSequence 1 uses base32 of the volume UUID's 16 raw bytes.
 //   - every later placement uses the first 16 bytes of
 //     SHA-256(rawUUID || be64(placementSequence)), which cannot collide with a
-//     v1 name except by a 128-bit preimage.
+//     sequence-one name except by a 128-bit preimage.
 //
 // Both forms are 30 characters. This is the derivation named in
 // docs/tiered-storage/identity-lifecycle-and-capacity.md section 1; wiring it
-// into provisioning belongs to the plan/helper lane, so serviceIdentityConfig
-// still derives the v1 name itself and this function is the single place the
-// per-placement rule is stated.
+// into provisioning belongs to the plan/helper lane, so this function is the
+// single place the per-placement rule is stated.
 func PlacementServiceAccountName(volumeID string, placementSequence uint64) (string, error) {
 	if !cellplan.ValidID(volumeID) || placementSequence == 0 {
 		return "", ErrInvalid

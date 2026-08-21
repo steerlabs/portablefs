@@ -49,19 +49,19 @@ Placement (per-placement identity)  cell, placement sequence, project ID,
                                     service UID/GID, port, endpoint name —
                                     allocated fresh per placement, never reused
       |
-Wire session epoch (random 16B)     per authority process, unchanged from v1
+Wire session epoch (random 16B)     per authority process
 ```
 
 Four identities, each with one meaning:
 
 - **VolumeID** — the durable identity a product stores. Archive, wake, and
   future migration never change it.
-- **Authority epoch** — the v1 `AuthorityGeneration` renamed (the JSON key
-  `authority_generation` is retained on every existing wire surface). It is
+- **Authority epoch** — the durable `AuthorityGeneration` counter (the JSON key
+  remains `authority_generation` on every wire surface). It is
   the durable counter naming which authorization regime is current: grants,
-  capabilities, and enrollments pin it and fail closed across an advance,
-  exactly as in v1. It advances on every within-placement fencing restart
-  (existing behavior) and on every archive-cycle transition (§2). It is
+  capabilities, and enrollments pin it and fail closed across an advance. It
+  advances on every within-placement fencing restart
+  and on every archive-cycle transition (§2). It is
   **not** the wire session epoch: every authority process still mints a
   random 16-byte protocol epoch at startup
   (`volumeserver/session.go:30-34`), so an accidental same-epoch process
@@ -69,8 +69,8 @@ Four identities, each with one meaning:
   the wire epoch.
 - **Placement** — one volume's residence on one cell. Each placement gets a
   fresh identity tuple from the cell's monotonic allocators plus a
-  per-volume monotonic `PlacementSequence` (starts at 1 for the v1
-  placement). Within a placement, the tuple and the endpoint name are
+  per-volume monotonic `PlacementSequence` (starts at 1). Within a placement,
+  the tuple and the endpoint name are
   immutable (the helper's `immutableAssignmentMatches` rule is preserved);
   the epoch advances freely within a placement. Identity tuples are never
   reused.
@@ -82,8 +82,8 @@ Four identities, each with one meaning:
   nothing that survived an archive cycle can hold a still-valid endpoint
   name. Clients always resolve endpoints through the Manager grant/exchange
   flow, which pins the epoch. `AuthorityID == AuthorityServerName` stays
-  enforced. The v1 placement keeps its existing un-suffixed name
-  (`v-<id>.<zone>`) for compatibility; sequence suffixes start at wake.
+  enforced. Placement sequence 1 uses `v-<id>.<zone>`; later placements use
+  the sequence suffix.
 - The per-volume service account name is per-placement:
   `pfs-` + lowercase base32, no padding, of the first 16 bytes of
   `SHA-256(preimage)` where the preimage is exactly the 16 RFC 4122 UUID
@@ -92,8 +92,8 @@ Four identities, each with one meaning:
   user-name bound; a golden vector pins the encoding). A pre-existing
   account whose name matches but whose UID/GID differ is a placement
   refusal — `verifyServiceIdentity` fails closed in both directions and
-  never adopts or renames. The v1 placement keeps the
-  existing `pfs-<base32(volume-uuid)>` name. Accounts remain persistent and
+  never adopts or renames. Placement sequence 1 uses
+  `pfs-<base32(volume-uuid)>`. Accounts remain persistent and
   are never deleted — allocator identities are never reused — so a volume
   that lived on a cell N times leaves N accounts, each having owned a
   distinct UID exactly once. `verifyServiceIdentity`'s four-way check works
@@ -169,8 +169,8 @@ construction, and the quiesce refusal makes it visible rather than wedging.
   Manager-side orphaned-placement record `{cell, tuple, epoch, "data
   orphaned, not proven destroyed"}` — the volume becomes placement-free
   ARCHIVED and can restore anywhere; ACTIVE/RESTORING volumes become
-  QUARANTINED with the loss recorded (single-AZ reality, unchanged from
-  v1). An abandoned cell ID is never re-registered; if the machine
+  QUARANTINED with the loss recorded (the declared single-AZ failure mode).
+  An abandoned cell ID is never re-registered; if the machine
   returns, its helper state no longer corresponds to any plan and fails
   closed, and the operator wipes and registers a fresh cell. This is what
   makes "cell/AZ loss cannot strand archived volumes" true rather than
@@ -181,15 +181,15 @@ construction, and the quiesce refusal makes it visible rather than wedging.
 ## 2. Volume lifecycle
 
 ```text
-PROVISIONING -> READY <-> FENCING                      (existing, unchanged)
+PROVISIONING -> READY <-> FENCING
 READY -> ARCHIVING -> ARCHIVED -> RESTORING -> READY   (READY at a later epoch)
-READY | ARCHIVED -> DESTROYED                          (terminal, durable record)
-QUARANTINED                                            (unchanged)
+READY | ARCHIVED -> DESTROYING -> DESTROYED            (terminal, durable record)
+QUARANTINED
 ```
 
 `ARCHIVING`, `ARCHIVED`, and `RESTORING` are first-class states in which an
-absent authority is the **expected** observation; the v1 READY auto-fence
-never fires for them. Every switch over `VolumeState` and
+absent authority is the **expected** observation; READY auto-fencing does not
+run for them. Every switch over `VolumeState` and
 `cellplan.VolumePhase` becomes exhaustive with an error default.
 
 ### Canonical-representation invariant (one per state, explicit)
@@ -407,7 +407,7 @@ type Volume struct {
     ID, AuthorizationDomain, Owner, ProductIssuer, ProductPublicKeyPEM
     QuotaBytes, QuotaInodes         // safety ceilings; monotonically raisable
     AuthorityEpoch uint64           // renamed AuthorityGeneration; JSON key kept
-    PlacementSequence uint64        // monotonic; 1 for a migrated v1 placement
+    PlacementSequence uint64        // monotonic; starts at 1
     State VolumeState               // + ARCHIVING, ARCHIVED, RESTORING, DESTROYED
     Pool  string
 
@@ -484,26 +484,12 @@ lose `AllocatedBytes`/`AllocatedInodes` entirely. Product-role
 - `DESTROYED` volumes must have `Placement == nil`, `Archive == nil`, and
   `DestroyedUnix > 0`.
 
-### Offline migration v1 → v2
-
-`portablefs-manager migrate-state`: read the v1 file under the v1 validator
-(the loader gains per-version validator dispatch), transform — `Pool:
-"product"`, `AuthorityEpoch := AuthorityGeneration`, `PlacementSequence :=
-1`, `Placement` extracted from the flat fields (keeping the v1 endpoint and
-account names), usage fields zeroed, v1 `RETIRED` volumes stay `RETIRED`
-(pre-existing retirements keep their preserved-data semantics; new code
-paths use ARCHIVED/DESTROYED) — and write a fresh single-record v2
-compacted snapshot to a new file, installing it atomically. The v1 file is
-preserved unmodified as the rollback artifact. A v2 manager refuses a v1
-state file with instructions; the gate is one-way and lives in the release
-runbook.
-
 ## 4. Cell plan v2 and helper contract
 
 `cellplan.Version = 2`, token prefix `v2.`, signature domain
-`portablefs-cell-plan-v2\0` — a v1 verifier cannot mistake a v2 envelope
-and vice versa. Phases: `PROVISION`, `SERVE`, `FENCE`, `RETIRE` (retained),
-`ARCHIVE`, `RESTORE`, `DESTROY`, `RELEASE`.
+`portablefs-cell-plan-v2\0`. Agents and helpers accept that exact version.
+Phases: `PROVISION`, `SERVE`, `FENCE`, `ARCHIVE`, `RESTORE`, `DESTROY`,
+`RELEASE`.
 
 Releasing a volume from a cell touches four seams that today jointly forbid
 it; they change together in this contract:
@@ -546,19 +532,10 @@ Helper state v2 (`helperStateVersion = 2`):
   `PlacementSequence > tombstone.PlacementSequence` (and, transitively,
   a fresh identity tuple by allocator construction).
 
-Rollout is a release gate, mechanically enforced: **helper → agent →
-manager.** The v2 helper reads v1 and v2 state and verifies v1 and v2
-envelopes, but keeps writing v1-shaped state until it first applies a v2
-plan (the dual-write gate) — so helper and agent binaries can be rolled
-back freely until the manager starts signing v2. Capability is explicit,
-never inferred from release-ID strings: the cell observation gains
-`plan_versions: []uint32` and `helper_state_versions: []uint32` (the
-helper declares its own; the agent relays them and appends its own plan
-versions). The manager signs a v2 plan for a cell only when that cell's
-last durable observation declares plan version 2 for both helper and
-agent; until then it signs v1 plans containing only v1-expressible
-phases. Archive/restore for volumes on a cell is gated on that cell's v2
-plan capability.
+The Manager always signs cell plan version 2. The agent and helper accept only
+that version, so plan delivery cannot depend on a capability observation from
+a plan that has not yet been applied. Archive and restore admission depend on
+the helper's live archive configuration, not on version negotiation.
 
 The same observation carries one further capability, on the same
 declared-never-inferred rule: `archive_configured: bool`. The helper answers it

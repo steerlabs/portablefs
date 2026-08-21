@@ -150,48 +150,26 @@ func (store *Store) Close() error {
 }
 
 func (store *Store) load() error {
-	legacyOnly, sawV2 := false, false
 	sequence, checksum, err := readStoreChain(store.file, store.recoverTail, func(envelope rawStoreEnvelope) error {
 		version, err := stateVersion(envelope.State)
 		if err != nil {
 			return err
 		}
-		switch version {
-		case StateSchemaVersion:
-			if legacyOnly {
-				return errors.New("manager state hash chain mixes schema versions")
-			}
-			sawV2 = true
-			state, err := decodeStrict[State](envelope.State)
-			if err != nil {
-				return fmt.Errorf("decode manager state: %w", err)
-			}
-			if err := state.Validate(); err != nil {
-				return fmt.Errorf("validate manager state: %w", err)
-			}
-			store.state = state
-		case 1:
-			if sawV2 {
-				return errors.New("manager state hash chain mixes schema versions")
-			}
-			state, err := decodeStrict[stateV1](envelope.State)
-			if err != nil {
-				return fmt.Errorf("decode v1 manager state: %w", err)
-			}
-			if err := state.Validate(); err != nil {
-				return fmt.Errorf("validate v1 manager state: %w", err)
-			}
-			legacyOnly = true
-		default:
+		if version != StateSchemaVersion {
 			return fmt.Errorf("manager state schema version %d is unsupported", version)
 		}
+		state, err := decodeStrict[State](envelope.State)
+		if err != nil {
+			return fmt.Errorf("decode manager state: %w", err)
+		}
+		if err := state.Validate(); err != nil {
+			return fmt.Errorf("validate manager state: %w", err)
+		}
+		store.state = state
 		return nil
 	})
 	if err != nil {
 		return err
-	}
-	if legacyOnly {
-		return errors.New("manager state schema v1 requires `portablefs-manager migrate-state -from <v1> -to <v2>`")
 	}
 	store.sequence, store.lastHash = sequence, checksum
 	_, err = store.file.Seek(0, io.SeekEnd)
@@ -463,63 +441,6 @@ func stateVersion(raw json.RawMessage) (uint32, error) {
 	return header.SchemaVersion, nil
 }
 
-// StateFileVersion validates a complete manager-state hash chain and reports
-// its one schema version. Activation uses this while the Manager is stopped so
-// the v1-to-v2 cutover is explicit and cannot race a writer.
-func StateFileVersion(path string) (uint32, error) {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return 0, fmt.Errorf("%w: manager state path must be clean and absolute", ErrInvalid)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return 0, fmt.Errorf("open manager state: %w", err)
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return 0, errors.New("manager state must be a regular file")
-	}
-	var schema uint32
-	_, _, err = readStoreChain(file, nil, func(envelope rawStoreEnvelope) error {
-		version, err := stateVersion(envelope.State)
-		if err != nil {
-			return err
-		}
-		if schema != 0 && schema != version {
-			return errors.New("manager state hash chain mixes schema versions")
-		}
-		switch version {
-		case 1:
-			state, err := decodeStrict[stateV1](envelope.State)
-			if err != nil {
-				return fmt.Errorf("decode v1 manager state: %w", err)
-			}
-			if err := state.Validate(); err != nil {
-				return fmt.Errorf("validate v1 manager state: %w", err)
-			}
-		case StateSchemaVersion:
-			state, err := decodeStrict[State](envelope.State)
-			if err != nil {
-				return fmt.Errorf("decode manager state: %w", err)
-			}
-			if err := state.Validate(); err != nil {
-				return fmt.Errorf("validate manager state: %w", err)
-			}
-		default:
-			return fmt.Errorf("manager state schema version %d is unsupported", version)
-		}
-		schema = version
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	if schema == 0 {
-		return 0, errors.New("manager state contains no snapshot records")
-	}
-	return schema, nil
-}
-
 func decodeStrict[T any](raw []byte) (T, error) {
 	var value T
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -531,140 +452,6 @@ func decodeStrict[T any](raw []byte) (T, error) {
 		return value, errors.New("trailing JSON")
 	}
 	return value, nil
-}
-
-// MigrateStateV1ToV2 validates the complete v1 hash chain and writes one fresh
-// compacted v2 snapshot. The source is opened read-only and is never modified.
-func MigrateStateV1ToV2(v1Path, v2Path string) error {
-	if !filepath.IsAbs(v1Path) || filepath.Clean(v1Path) != v1Path || !filepath.IsAbs(v2Path) || filepath.Clean(v2Path) != v2Path || v1Path == v2Path {
-		return fmt.Errorf("%w: migration paths must be distinct, clean, and absolute", ErrInvalid)
-	}
-	source, err := os.Open(v1Path)
-	if err != nil {
-		return fmt.Errorf("open v1 manager state: %w", err)
-	}
-	defer source.Close()
-	info, err := source.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return errors.New("v1 manager state must be a regular file")
-	}
-	var legacy stateV1
-	count := 0
-	_, _, err = readStoreChain(source, nil, func(envelope rawStoreEnvelope) error {
-		version, err := stateVersion(envelope.State)
-		if err != nil {
-			return err
-		}
-		if version != 1 {
-			return fmt.Errorf("migration source schema is %d, want 1", version)
-		}
-		decoded, err := decodeStrict[stateV1](envelope.State)
-		if err != nil {
-			return fmt.Errorf("decode v1 manager state: %w", err)
-		}
-		if err := decoded.Validate(); err != nil {
-			return fmt.Errorf("validate v1 manager state: %w", err)
-		}
-		legacy = decoded
-		count++
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if count == 0 {
-		return errors.New("v1 manager state contains no snapshot records")
-	}
-	state := migrateV1State(legacy)
-	if err := state.Validate(); err != nil {
-		return fmt.Errorf("validate migrated v2 manager state: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Dir(v2Path), 0o700); err != nil {
-		return fmt.Errorf("create v2 state directory: %w", err)
-	}
-	if _, err := os.Lstat(v2Path); err == nil {
-		return fmt.Errorf("v2 manager state already exists: %s", v2Path)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	record, _, err := snapshotRecord(state)
-	if err != nil {
-		return err
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(v2Path), ".portablefs-manager-migrate-")
-	if err != nil {
-		return err
-	}
-	temporaryPath := temporary.Name()
-	defer func() { _ = temporary.Close(); _ = os.Remove(temporaryPath) }()
-	if err := temporary.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := temporary.Write(record); err != nil {
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		return err
-	}
-	if err := os.Link(temporaryPath, v2Path); err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("v2 manager state already exists: %s", v2Path)
-		}
-		return fmt.Errorf("install migrated v2 manager state: %w", err)
-	}
-	if err := syncDirectory(filepath.Dir(v2Path)); err != nil {
-		return err
-	}
-	return nil
-}
-
-func migrateV1State(old stateV1) State {
-	state := NewState()
-	state.Receipts = old.Receipts
-	state.AuthorizationNonces = old.AuthorizationNonces
-	state.MountEnrollments = old.MountEnrollments
-	state.MountAuthorizationContexts = old.MountAuthorizationContexts
-	state.RenewalFences = old.RenewalFences
-	for id, oldCell := range old.Cells {
-		state.Cells[id] = Cell{ID: oldCell.ID, AvailabilityZone: oldCell.AvailabilityZone, AuthorityHost: oldCell.AuthorityHost,
-			AuthorityDNSZone: oldCell.AuthorityDNSZone, CapacityBytes: oldCell.CapacityBytes, CapacityInodes: oldCell.CapacityInodes, Pool: PoolProduct,
-			NextProjectID: oldCell.NextProjectID, NextServiceUID: oldCell.NextServiceUID, NextPort: oldCell.NextPort,
-			PlanGeneration: oldCell.PlanGeneration, PlanReleaseID: oldCell.PlanReleaseID, PlanIssuedUnix: oldCell.PlanIssuedUnix,
-			PlanExpiresUnix: oldCell.PlanExpiresUnix, LastObservedUnix: oldCell.LastObservedUnix, LastManagerRelease: oldCell.LastManagerRelease,
-			LastAgentRelease: oldCell.LastAgentRelease, LastHelperRelease: oldCell.LastHelperRelease, Health: oldCell.Health, QuarantineReason: oldCell.QuarantineReason}
-	}
-	for id, oldVolume := range old.Volumes {
-		volumeState := oldVolume.State
-		archiveCycleStep := ""
-		deletionRequested := false
-		if oldVolume.State == legacyVolumeRetired {
-			// v1 RETIRED merely stopped serving and retained the placement
-			// forever. v2 has one deletion path with destroy and release proofs,
-			// so an old retired placement resumes directly at host-data destroy:
-			// its authority was already removed by the v1 RETIRE phase.
-			volumeState = VolumeDestroying
-			archiveCycleStep = "destroying"
-			deletionRequested = true
-		}
-		state.Volumes[id] = Volume{ID: oldVolume.ID, AuthorizationDomain: oldVolume.AuthorizationDomain, Owner: oldVolume.Owner,
-			ProductIssuer: oldVolume.ProductIssuer, ProductPublicKeyPEM: oldVolume.ProductPublicKeyPEM, QuotaBytes: oldVolume.QuotaBytes,
-			QuotaInodes: oldVolume.QuotaInodes, AuthorityEpoch: oldVolume.AuthorityGeneration, PlacementSequence: 1, State: volumeState, Pool: PoolProduct,
-			Placement: &Placement{CellID: oldVolume.CellID, Sequence: 1, ProjectID: oldVolume.ProjectID, ServiceUID: oldVolume.ServiceUID,
-				ServiceGID: oldVolume.ServiceGID, ListenPort: oldVolume.ListenPort, AuthorityID: oldVolume.AuthorityID,
-				AuthorityServerName: oldVolume.AuthorityServerName, AuthorityCSRPEM: oldVolume.AuthorityCSRPEM,
-				AuthorityCertificatePEM: oldVolume.AuthorityCertificate, AuthorityCertExpires: oldVolume.AuthorityCertExpires,
-				PriorStrictFenced: oldVolume.PriorStrictFenced, StrictFenceEvidence: oldVolume.StrictFenceEvidence,
-				CreatedUnix: oldVolume.CreatedUnix, LastObservedUnix: oldVolume.LastObservedUnix},
-			ArchiveCycleStep: archiveCycleStep, DeletionRequested: deletionRequested,
-			QuarantineReason: oldVolume.QuarantineReason, CreatedUnix: oldVolume.CreatedUnix, UpdatedUnix: oldVolume.UpdatedUnix}
-		if deletionRequested {
-			terminateVolumeEnrollments(&state, id, "legacy retired volume cleanup", oldVolume.UpdatedUnix)
-		}
-	}
-	return state
 }
 
 func (store *Store) View(read func(State) error) error {
