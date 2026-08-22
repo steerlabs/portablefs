@@ -350,7 +350,8 @@ func helperPlan(now time.Time, cellID string, generation, authorityGeneration ui
 	return cellplan.Plan{
 		Version: cellplan.Version, CellID: cellID, Generation: generation,
 		IssuedAt: now.Unix(), ExpiresAt: now.Add(time.Minute).Unix(), ReleaseID: "release",
-		AuthorityCAPEM: "authority-ca", ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
+		UsageRefreshSeconds: 300,
+		AuthorityCAPEM:      "authority-ca", ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
 		Volumes: []cellplan.VolumePlan{{
 			VolumeID: "22222222-2222-4222-8222-222222222222", Phase: phase,
 			AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "product", ProductPublicKeyPEM: "product-key",

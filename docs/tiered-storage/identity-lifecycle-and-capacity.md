@@ -537,6 +537,14 @@ that version, so plan delivery cannot depend on a capability observation from
 a plan that has not yet been applied. Archive and restore admission depend on
 the helper's live archive configuration, not on version negotiation.
 
+Every v2 plan also carries the required positive `usage_refresh_seconds` value
+derived from the Manager's `UsageStaleAfter` setting. The agent posts a full
+observation when its last accepted full observation reaches one third of that
+bound, even if the usage digest did not change; polls before that point retain
+the heartbeat-only optimization. Heartbeats do not refresh durable usage
+evidence. This keeps idle measurements current without weakening the rule that
+frozen per-placement measurements are charged at quota.
+
 The same observation carries one further capability, on the same
 declared-never-inferred rule: `archive_configured: bool`. The helper answers it
 on every status pass, true exactly when its configured archive-credentials path
