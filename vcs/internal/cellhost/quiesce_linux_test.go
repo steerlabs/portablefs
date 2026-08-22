@@ -3,13 +3,40 @@
 package cellhost
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/steerlabs/portablefs/vcs/internal/cellhelper"
+	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
 )
+
+type quiesceFenceRunner struct {
+	active bool
+	calls  []recordedCommand
+}
+
+func (runner *quiesceFenceRunner) Run(_ context.Context, executable string, arguments ...string) ([]byte, error) {
+	runner.calls = append(runner.calls, recordedCommand{executable: executable, arguments: append([]string(nil), arguments...)})
+	if len(arguments) == 0 {
+		return nil, nil
+	}
+	switch arguments[0] {
+	case "is-active":
+		if runner.active && strings.HasSuffix(arguments[len(arguments)-1], ".service") {
+			return nil, nil
+		}
+		return nil, errors.New("inactive")
+	case "stop":
+		runner.active = false
+	}
+	return nil, nil
+}
 
 func quiesceRequestPath(fixture *placementFixture) string {
 	return filepath.Join(fixture.configRoot, testVolumeID, quiesceRequestName)
@@ -198,4 +225,78 @@ func TestReadQuiesceProofFailsClosed(t *testing.T) {
 	if _, err := linked.host.ReadQuiesceProof(testVolumeID); err == nil {
 		t.Fatal("a symlinked quiesce proof path was followed")
 	}
+}
+
+func TestApplyQuiesceFenceAcceptsMatchingProofAndFencesAuthority(t *testing.T) {
+	fixture := newPlacementFixture(t)
+	runner := &quiesceFenceRunner{active: true}
+	fixture.host.cfg.Runner = runner
+	nonce := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	writeProof(t, fixture, answeredProof(nonce), 0o600)
+	writeMembership(t, fixture, membershipDocument(testVolumeID), 0o600)
+	plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+	previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: nonce}
+
+	observed, update := fixture.host.Apply(context.Background(), plan, previous)
+	if observed.Error != "" || !observed.AuthorityAbsent || !observed.QuiesceProven || update.LastQuiesceNonce != "" {
+		t.Fatalf("quiesce observation = %+v, update = %+v", observed, update)
+	}
+	if runner.active {
+		t.Fatal("matching quiesce proof did not stop the authority")
+	}
+}
+
+func TestApplyQuiesceFenceRefusesStaleProof(t *testing.T) {
+	fixture := newPlacementFixture(t)
+	runner := &quiesceFenceRunner{active: true}
+	fixture.host.cfg.Runner = runner
+	requested := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+	stale := hex.EncodeToString([]byte("abcdef0123456789abcdef0123456789"))
+	writeProof(t, fixture, answeredProof(stale), 0o600)
+	plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+	previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: requested}
+
+	observed, _ := fixture.host.Apply(context.Background(), plan, previous)
+	if !strings.Contains(observed.Error, "does not match the current request") || observed.AuthorityAbsent || observed.QuiesceProven {
+		t.Fatalf("stale proof observation = %+v", observed)
+	}
+	if !runner.active {
+		t.Fatal("stale quiesce proof stopped the authority")
+	}
+}
+
+func TestApplyQuiesceFenceHandlesAuthorityAlreadyAbsent(t *testing.T) {
+	t.Run("matching persisted proof converges", func(t *testing.T) {
+		fixture := newPlacementFixture(t)
+		fixture.host.cfg.Runner = &quiesceFenceRunner{}
+		nonce := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+		writeProof(t, fixture, answeredProof(nonce), 0o600)
+		writeMembership(t, fixture, membershipDocument(testVolumeID), 0o600)
+		plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+		previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: nonce}
+
+		observed, _ := fixture.host.Apply(context.Background(), plan, previous)
+		if observed.Error != "" || !observed.AuthorityAbsent || !observed.QuiesceProven {
+			t.Fatalf("already-absent observation = %+v", observed)
+		}
+	})
+
+	t.Run("missing proof fails without restart", func(t *testing.T) {
+		fixture := newPlacementFixture(t)
+		runner := &quiesceFenceRunner{}
+		fixture.host.cfg.Runner = runner
+		nonce := hex.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
+		plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7, ServiceGID: 210000}
+		previous := cellhelper.Assignment{LastPhase: cellplan.PhaseQuiesce, LastQuiesceNonce: nonce}
+
+		observed, _ := fixture.host.Apply(context.Background(), plan, previous)
+		if !strings.Contains(observed.Error, "disappeared before writing its quiesce proof") || observed.AuthorityAbsent || observed.QuiesceProven {
+			t.Fatalf("missing-proof observation = %+v", observed)
+		}
+		for _, call := range runner.calls {
+			if len(call.arguments) > 0 && (call.arguments[0] == "start" || call.arguments[0] == "restart") {
+				t.Fatalf("already-absent authority was restarted: %+v", call)
+			}
+		}
+	})
 }

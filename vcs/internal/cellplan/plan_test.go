@@ -93,6 +93,7 @@ func TestPhaseSpecificFieldsAreExact(t *testing.T) {
 		apply func(*VolumePlan)
 		valid bool
 	}{
+		{name: "quiesce", phase: PhaseQuiesce, valid: true},
 		{name: "archive", phase: PhaseArchive, valid: true, apply: func(v *VolumePlan) {
 			v.ArchiveTo = &ArchiveTarget{Attempt: "33333333-3333-4333-8333-333333333333", KeyVersion: "k1"}
 		}},
@@ -104,6 +105,9 @@ func TestPhaseSpecificFieldsAreExact(t *testing.T) {
 			v.ReleaseProof = &ReleaseProof{PlacementSequence: 1, AuthorityEpoch: 2, DestroyProofSHA256: strings.Repeat("b", 64)}
 		}},
 		{name: "serve with archive", phase: PhaseServe, apply: func(v *VolumePlan) {
+			v.ArchiveTo = &ArchiveTarget{Attempt: "33333333-3333-4333-8333-333333333333", KeyVersion: "k1"}
+		}},
+		{name: "quiesce with archive", phase: PhaseQuiesce, apply: func(v *VolumePlan) {
 			v.ArchiveTo = &ArchiveTarget{Attempt: "33333333-3333-4333-8333-333333333333", KeyVersion: "k1"}
 		}},
 	} {

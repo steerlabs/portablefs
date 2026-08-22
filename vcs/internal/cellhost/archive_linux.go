@@ -334,92 +334,23 @@ func readResult(path string, limit int64, absent error, target any) error {
 }
 
 func (host *Host) applyArchive(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
-	observed := controlplane.VolumeObservation{Provisioned: host.volumeExists(plan.VolumeID)}
-	if previous.LastQuiesceNonce == "" {
-		if !host.unitActive(ctx, authorityServiceUnit(plan.VolumeID)) {
-			observed.Error = "cellhost: archive cannot establish quiesce proof because the authority is absent"
-			return observed, cellhelper.HostUpdate{}
-		}
-		nonce, err := host.WriteQuiesceRequest(plan.VolumeID, plan.ServiceGID)
-		if err != nil {
-			observed.Error = err.Error()
-			return observed, cellhelper.HostUpdate{}
-		}
-		observed.AuthorityRunning = true
-		return observed, cellhelper.HostUpdate{LastQuiesceNonce: nonce}
+	observed, update := host.applyQuiesceFence(ctx, plan, previous)
+	if observed.Error != "" || !observed.AuthorityAbsent || !observed.QuiesceProven {
+		return observed, update
 	}
-	proof, err := host.ReadQuiesceProof(plan.VolumeID)
-	if errors.Is(err, ErrQuiesceProofAbsent) {
-		observed.AuthorityRunning = host.unitActive(ctx, authorityServiceUnit(plan.VolumeID))
-		if !observed.AuthorityRunning {
-			observed.Error = "cellhost: authority disappeared before writing its quiesce proof"
-		}
-		return observed, cellhelper.HostUpdate{}
+	archived, archiveUpdate := host.observeArchive(ctx, plan, previous)
+	if archiveUpdate.ArchiveSealed != nil {
+		update.ArchiveSealed = archiveUpdate.ArchiveSealed
 	}
-	if err != nil || !proof.Proves(plan.VolumeID, plan.AuthorityGeneration, previous.LastQuiesceNonce) {
-		if err == nil {
-			err = errors.New("cellhost: quiesce proof does not match the current request")
-		}
-		observed.Error = err.Error()
-		return observed, cellhelper.HostUpdate{}
-	}
-	if host.unitActive(ctx, authorityServiceUnit(plan.VolumeID)) {
-		absent, fenceErr := host.fence(ctx, plan.VolumeID)
-		if fenceErr != nil || !absent {
-			if fenceErr == nil {
-				fenceErr = errors.New("cellhost: authority remained present after quiesce fence")
-			}
-			observed.Error = fenceErr.Error()
-			return observed, cellhelper.HostUpdate{}
-		}
-		empty, membershipErr := host.StrictMembershipEmpty(plan.VolumeID)
-		if membershipErr != nil || !empty {
-			if membershipErr == nil {
-				membershipErr = errors.New("cellhost: strict membership disagrees with the quiesce proof")
-			}
-			observed.Error = membershipErr.Error()
-			return observed, cellhelper.HostUpdate{}
-		}
-		proofAfter, proofErr := host.ReadQuiesceProof(plan.VolumeID)
-		if proofErr != nil || !proofAfter.Proves(plan.VolumeID, plan.AuthorityGeneration, previous.LastQuiesceNonce) {
-			if proofErr == nil {
-				proofErr = errors.New("cellhost: quiesce proof changed across the authority fence")
-			}
-			observed.Error = proofErr.Error()
-			return observed, cellhelper.HostUpdate{}
-		}
-		observed.AuthorityAbsent, observed.QuiesceProven = true, true
-		return observed, cellhelper.HostUpdate{}
-	}
-	return host.observeArchive(ctx, plan, previous)
+	return archived, update
 }
 
 func (host *Host) observeArchive(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
-	observed := controlplane.VolumeObservation{Provisioned: host.volumeExists(plan.VolumeID), AuthorityAbsent: true, QuiesceProven: true}
-	absent, err := host.authorityAbsent(ctx, plan.VolumeID)
-	if err != nil || !absent {
-		if err == nil {
-			err = errors.New("cellhost: authority is present during archive export")
-		}
-		observed.AuthorityAbsent, observed.QuiesceProven, observed.Error = false, false, err.Error()
+	observed := host.observeQuiesceFence(ctx, plan, previous)
+	if observed.Error != "" {
 		return observed, cellhelper.HostUpdate{}
 	}
-	proof, err := host.ReadQuiesceProof(plan.VolumeID)
-	if err != nil || !proof.Proves(plan.VolumeID, plan.AuthorityGeneration, previous.LastQuiesceNonce) {
-		if err == nil {
-			err = errors.New("cellhost: archive export lacks the matching quiesce proof")
-		}
-		observed.Error = err.Error()
-		return observed, cellhelper.HostUpdate{}
-	}
-	empty, err := host.StrictMembershipEmpty(plan.VolumeID)
-	if err != nil || !empty {
-		if err == nil {
-			err = errors.New("cellhost: strict membership is not empty after quiesce")
-		}
-		observed.Error = err.Error()
-		return observed, cellhelper.HostUpdate{}
-	}
+	var err error
 	record, err := host.ReadArchiveSealed(plan.VolumeID)
 	if err == nil {
 		if plan.ArchiveTo == nil || record.Attempt != plan.ArchiveTo.Attempt || record.SealedEpoch != plan.AuthorityGeneration ||

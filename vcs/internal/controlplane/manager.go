@@ -1026,7 +1026,7 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 			case VolumeDestroying:
 				switch volume.ArchiveCycleStep {
 				case "quiescing":
-					phase = cellplan.PhaseFence
+					phase = cellplan.PhaseQuiesce
 				case "destroying":
 					phase = cellplan.PhaseDestroy
 				case "destroyed":
@@ -1055,7 +1055,7 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 				entry.RestoreFrom = restoreSource(*volume.Archive)
 			case cellplan.PhaseRelease:
 				entry.ReleaseProof = &cellplan.ReleaseProof{PlacementSequence: placement.Sequence, AuthorityEpoch: volume.AuthorityEpoch, DestroyProofSHA256: placement.DestroyProofSHA256}
-			case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseDestroy:
+			case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseQuiesce, cellplan.PhaseDestroy:
 			default:
 				return fmt.Errorf("%w: cell plan phase", ErrInvalid)
 			}

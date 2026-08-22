@@ -42,6 +42,7 @@ const (
 	PhaseProvision VolumePhase = "PROVISION"
 	PhaseServe     VolumePhase = "SERVE"
 	PhaseFence     VolumePhase = "FENCE"
+	PhaseQuiesce   VolumePhase = "QUIESCE"
 	PhaseArchive   VolumePhase = "ARCHIVE"
 	PhaseRestore   VolumePhase = "RESTORE"
 	PhaseDestroy   VolumePhase = "DESTROY"
@@ -206,7 +207,7 @@ func Validate(plan Plan) error {
 			return fmt.Errorf("%w: v2 volume shape", ErrInvalid)
 		}
 		switch volume.Phase {
-		case PhaseProvision, PhaseFence:
+		case PhaseProvision, PhaseFence, PhaseQuiesce:
 		case PhaseServe:
 			if volume.AuthorityCertificate == "" {
 				return fmt.Errorf("%w: serving volume has no authority certificate", ErrInvalid)

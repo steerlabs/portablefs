@@ -240,7 +240,7 @@ func TestDestroyLiveVolumeRunsFenceDestroyRelease(t *testing.T) {
 	if err != nil || destroying.State != VolumeDestroying || destroying.ArchiveCycleStep != "quiescing" {
 		t.Fatalf("DestroyVolume = %+v, %v", destroying, err)
 	}
-	if plan := verifiedPlan(t, h.manager, cell.ID, *h.now); plan.Volumes[0].Phase != cellplan.PhaseFence {
+	if plan := verifiedPlan(t, h.manager, cell.ID, *h.now); plan.Volumes[0].Phase != cellplan.PhaseQuiesce {
 		t.Fatalf("destroy quiesce plan = %+v", plan.Volumes[0])
 	}
 	observeTieredVolume(t, h, cell.ID, "delete-quiesced", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
