@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -195,6 +196,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
 	server := &http.Server{
 		Handler: &controlplane.HTTPHandler{Manager: manager, Authenticate: authenticate}, ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute,
@@ -233,11 +235,43 @@ func run() error {
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
-	err = server.Serve(listener)
+	err = serveManager(server, listener, notifySystemdReady)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
+}
+
+func serveManager(server *http.Server, listener net.Listener, notifyReady func() error) error {
+	// The listener is already bound here. Notify immediately before Serve enters
+	// its accept loop so systemd cannot report startup before the control plane
+	// can receive connections.
+	if err := notifyReady(); err != nil {
+		return fmt.Errorf("notify systemd readiness: %w", err)
+	}
+	return server.Serve(listener)
+}
+
+func notifySystemdReady() error {
+	socket := os.Getenv("NOTIFY_SOCKET")
+	if socket == "" {
+		return nil
+	}
+	address := systemdNotifyAddress(socket)
+	connection, err := net.DialUnix("unixgram", nil, address)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	_, err = connection.Write([]byte("READY=1"))
+	return err
+}
+
+func systemdNotifyAddress(socket string) *net.UnixAddr {
+	if strings.HasPrefix(socket, "@") {
+		socket = "\x00" + socket[1:]
+	}
+	return &net.UnixAddr{Name: socket, Net: "unixgram"}
 }
 
 func cleanAbsolutePath(path string) bool {
