@@ -68,7 +68,6 @@ type mountState struct {
 	AuthorizationSessionID       string `json:"authorizationSessionId,omitempty"`
 	ReauthorizationControlSocket string `json:"reauthorizationControlSocket,omitempty"`
 	MountEnrollmentID            string `json:"mountEnrollmentId,omitempty"`
-	EnrollmentExpiresAtMs        int64  `json:"enrollmentExpiresAtMs,omitempty"`
 	AuthorizationDeadlineAtMs    int64  `json:"authorizationDeadlineAtMs,omitempty"`
 	LastReauthorizationAtMs      int64  `json:"lastReauthorizationAtMs,omitempty"`
 	NextReauthorizationAtMs      int64  `json:"nextReauthorizationAtMs,omitempty"`
@@ -557,12 +556,12 @@ func validateMountStateRecord(path string, st *mountState) error {
 	}
 	if st.MountEnrollmentID != "" {
 		if !validStateString(st.MountEnrollmentID, 256) || st.AuthorizationSessionID == "" ||
-			st.EnrollmentExpiresAtMs <= 0 || st.AuthorizationDeadlineAtMs <= 0 ||
+			st.AuthorizationDeadlineAtMs <= 0 ||
 			st.LastReauthorizationAtMs < 0 || st.NextReauthorizationAtMs < 0 ||
 			st.ReauthorizationError != "" && !validStateString(st.ReauthorizationError, 2048) || st.ReauthorizationControlSocket != "" {
 			return fmt.Errorf("mount state %s has invalid automatic mount enrollment state", path)
 		}
-	} else if st.EnrollmentExpiresAtMs != 0 || st.AuthorizationDeadlineAtMs != 0 ||
+	} else if st.AuthorizationDeadlineAtMs != 0 ||
 		st.LastReauthorizationAtMs != 0 || st.NextReauthorizationAtMs != 0 || st.ReauthorizationFailures != 0 || st.ReauthorizationError != "" {
 		return fmt.Errorf("mount state %s has renewal health without a mount enrollment", path)
 	}

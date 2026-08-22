@@ -359,7 +359,6 @@ type fskitV3MountEnrollmentRequest struct {
 	ManagerCAPEM                    string `json:"managerCaPem"`
 	EnrollmentID                    string `json:"enrollmentId"`
 	EnrollmentCertificatePEM        string `json:"enrollmentCertificatePem"`
-	EnrollmentExpiresAtMs           int64  `json:"enrollmentExpiresAtMs"`
 	AuthorityGeneration             uint64 `json:"authorityGeneration"`
 	InitialAuthorizationExpiresAtMs int64  `json:"initialAuthorizationExpiresAtMs"`
 }
@@ -430,7 +429,6 @@ type cliAttachStatus struct {
 	// revocation watchdog branches on it.
 	SessionTerminal           bool   `json:"sessionTerminal"`
 	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
-	EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
 	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
 	LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
 	NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`

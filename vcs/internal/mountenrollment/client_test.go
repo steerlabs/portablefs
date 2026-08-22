@@ -26,7 +26,7 @@ func TestClientUsesExactMTLSEnrollmentAndDeterministicRefresh(t *testing.T) {
 	managerCert, _ := testSignedCertificate(t, caCert, caKey, now, "manager", nil, []string{"manager.test"}, false)
 	enrollmentID := "22222222-2222-4222-8222-222222222222"
 	enrollmentURI, _ := url.Parse("spiffe://portablefs/mount-enrollment/" + enrollmentID)
-	enrollmentCert, mountKeyPEM := testSignedCertificate(t, caCert, caKey, now, enrollmentID, enrollmentURI, nil, true)
+	enrollmentCert, mountKeyPEM := testSignedCertificateWithLifetime(t, caCert, caKey, now, 23*time.Hour, enrollmentID, enrollmentURI, nil, true)
 	replacementCert, _ := testSignedCertificateForKey(t, caCert, caKey, now, "mount-client", nil, nil, true, mountKeyPEM)
 
 	var mu sync.Mutex
@@ -73,7 +73,7 @@ func TestClientUsesExactMTLSEnrollmentAndDeterministicRefresh(t *testing.T) {
 		ManagerURL: server.URL, ManagerServerName: "manager.test", ManagerCAPEM: []byte(caPEM),
 		EnrollmentID: enrollmentID, EnrollmentCertificatePEM: []byte(certificatePEM(enrollmentCert.Certificate[0])),
 		ClientKeyPEM: []byte(mountKeyPEM), VolumeID: "volume", AuthorityGeneration: 7,
-		EnrollmentExpires: now.Add(time.Hour), Timeout: 5 * time.Second,
+		Timeout: 5 * time.Second,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -117,6 +117,10 @@ func testEnrollmentCA(t *testing.T, now time.Time) (*x509.Certificate, ed25519.P
 }
 
 func testSignedCertificate(t *testing.T, ca *x509.Certificate, caKey ed25519.PrivateKey, now time.Time, name string, identity *url.URL, dns []string, client bool) (tls.Certificate, string) {
+	return testSignedCertificateWithLifetime(t, ca, caKey, now, time.Hour, name, identity, dns, client)
+}
+
+func testSignedCertificateWithLifetime(t *testing.T, ca *x509.Certificate, caKey ed25519.PrivateKey, now time.Time, lifetime time.Duration, name string, identity *url.URL, dns []string, client bool) (tls.Certificate, string) {
 	t.Helper()
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -127,7 +131,7 @@ func testSignedCertificate(t *testing.T, ca *x509.Certificate, caKey ed25519.Pri
 		t.Fatal(err)
 	}
 	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
-	certPEM, _ := testSignedCertificateForKey(t, ca, caKey, now, name, identity, dns, client, keyPEM)
+	certPEM, _ := testSignedCertificateForKeyLifetime(t, ca, caKey, now, lifetime, name, identity, dns, client, keyPEM)
 	identityPair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
 	if err != nil {
 		t.Fatal(err)
@@ -136,6 +140,10 @@ func testSignedCertificate(t *testing.T, ca *x509.Certificate, caKey ed25519.Pri
 }
 
 func testSignedCertificateForKey(t *testing.T, ca *x509.Certificate, caKey ed25519.PrivateKey, now time.Time, name string, identity *url.URL, dns []string, client bool, keyPEM string) (string, time.Time) {
+	return testSignedCertificateForKeyLifetime(t, ca, caKey, now, time.Hour, name, identity, dns, client, keyPEM)
+}
+
+func testSignedCertificateForKeyLifetime(t *testing.T, ca *x509.Certificate, caKey ed25519.PrivateKey, now time.Time, lifetime time.Duration, name string, identity *url.URL, dns []string, client bool, keyPEM string) (string, time.Time) {
 	t.Helper()
 	block, _ := pem.Decode([]byte(keyPEM))
 	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
@@ -148,7 +156,7 @@ func testSignedCertificateForKey(t *testing.T, ca *x509.Certificate, caKey ed255
 		t.Fatal(err)
 	}
 	template := &x509.Certificate{
-		SerialNumber: serial, Subject: pkix.Name{CommonName: name}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(time.Hour),
+		SerialNumber: serial, Subject: pkix.Name{CommonName: name}, NotBefore: now.Add(-time.Minute), NotAfter: now.Add(lifetime),
 		BasicConstraintsValid: true, KeyUsage: x509.KeyUsageDigitalSignature, DNSNames: dns,
 	}
 	if client {

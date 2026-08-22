@@ -97,7 +97,6 @@ type v3MountEnrollmentRequest struct {
 	ManagerCAPEM                    string `json:"managerCaPem"`
 	EnrollmentID                    string `json:"enrollmentId"`
 	EnrollmentCertificatePEM        string `json:"enrollmentCertificatePem"`
-	EnrollmentExpiresAtMs           int64  `json:"enrollmentExpiresAtMs"`
 	AuthorityGeneration             uint64 `json:"authorityGeneration"`
 	InitialAuthorizationExpiresAtMs int64  `json:"initialAuthorizationExpiresAtMs"`
 }
@@ -125,7 +124,6 @@ type v3AttachConfig struct {
 	routesRevision               [32]byte
 	enrollmentClient             *mountenrollment.Client
 	enrollmentID                 string
-	enrollmentExpires            time.Time
 	initialAuthorizationDeadline time.Time
 	// preKernelMountAbsence is non-nil only in package tests running without
 	// Darwin getfsstat. Production binds a fresh observer to a.mountPath and
@@ -352,34 +350,30 @@ func v3ConfigForEnsure(req ensureAttachRequest) (*v3AttachConfig, error) {
 	}
 	var enrollmentClient *mountenrollment.Client
 	var enrollmentID string
-	var enrollmentExpires time.Time
 	var initialAuthorizationDeadline time.Time
 	if v3.Enrollment != nil {
 		enrollment := v3.Enrollment
 		if req.AuthTokenExpiresAtMs != enrollment.InitialAuthorizationExpiresAtMs ||
-			enrollment.InitialAuthorizationExpiresAtMs <= time.Now().UnixMilli() ||
-			enrollment.EnrollmentExpiresAtMs <= enrollment.InitialAuthorizationExpiresAtMs {
-			return nil, errors.New("v3 automatic enrollment requires matching, unexpired authorization lifetimes")
+			enrollment.InitialAuthorizationExpiresAtMs <= time.Now().UnixMilli() {
+			return nil, errors.New("v3 automatic enrollment requires a matching, unexpired initial authorization")
 		}
 		enrollmentClient, err = mountenrollment.NewClient(mountenrollment.Config{
 			ManagerURL: enrollment.ManagerURL, ManagerServerName: enrollment.ManagerServerName,
 			ManagerCAPEM: []byte(enrollment.ManagerCAPEM), EnrollmentID: enrollment.EnrollmentID,
 			EnrollmentCertificatePEM: []byte(enrollment.EnrollmentCertificatePEM), ClientKeyPEM: []byte(v3.ClientKeyPEM),
 			VolumeID: req.VolumeID, AuthorityGeneration: enrollment.AuthorityGeneration,
-			EnrollmentExpires: time.UnixMilli(enrollment.EnrollmentExpiresAtMs),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("invalid v3 automatic mount enrollment: %w", err)
 		}
 		enrollmentID = enrollment.EnrollmentID
-		enrollmentExpires = time.UnixMilli(enrollment.EnrollmentExpiresAtMs)
 		initialAuthorizationDeadline = time.UnixMilli(enrollment.InitialAuthorizationExpiresAtMs)
 	}
 	return &v3AttachConfig{
 		identity: &identity, cachedNameCapacity: v3.CachedNameCapacity,
 		repairBudget: time.Duration(v3.RepairBudgetMillis) * time.Millisecond,
 		cachePolicy:  v3.CachePolicy, routesRevision: revision,
-		enrollmentClient: enrollmentClient, enrollmentID: enrollmentID, enrollmentExpires: enrollmentExpires,
+		enrollmentClient: enrollmentClient, enrollmentID: enrollmentID,
 		initialAuthorizationDeadline: initialAuthorizationDeadline,
 		preKernelMountAbsence:        req.observePreKernelMountAbsence,
 	}, nil

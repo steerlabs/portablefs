@@ -45,29 +45,28 @@ type mountOpts struct {
 	// branch stays a field because the mount records, ownership locks, and
 	// persistence keys are branch-shaped; a v3 mount is branchless, so it is
 	// always empty (the --branch flag itself is retired).
-	branch                string
-	strategy              string
-	addr                  string
-	mountToken            string
-	dataPlaneTransport    string
-	dataPlaneServerName   string
-	dataPlaneCAPath       string
-	clientCertPath        string
-	clientKeyPath         string
-	authExpiresAtMs       int64
-	managerURL            string
-	managerServerName     string
-	managerCAPath         string
-	enrollmentID          string
-	enrollmentCertPath    string
-	enrollmentExpiresAtMs int64
-	authorityGeneration   uint64
-	coherence             string
-	foreground            bool
-	readyFD               int
-	opLockFD              int
-	localDirs             stringListFlag
-	noLocalDirs           bool
+	branch              string
+	strategy            string
+	addr                string
+	mountToken          string
+	dataPlaneTransport  string
+	dataPlaneServerName string
+	dataPlaneCAPath     string
+	clientCertPath      string
+	clientKeyPath       string
+	authExpiresAtMs     int64
+	managerURL          string
+	managerServerName   string
+	managerCAPath       string
+	enrollmentID        string
+	enrollmentCertPath  string
+	authorityGeneration uint64
+	coherence           string
+	foreground          bool
+	readyFD             int
+	opLockFD            int
+	localDirs           stringListFlag
+	noLocalDirs         bool
 }
 
 // errFastRetired is the typed refusal for the retired --fast flag. Write mode
@@ -124,7 +123,6 @@ func addMountFlags(fs *flag.FlagSet, o *mountOpts) {
 	fs.StringVar(&o.managerCAPath, "manager-ca", "", "Manager private CA bundle PEM file")
 	fs.StringVar(&o.enrollmentID, "mount-enrollment-id", "", "Manager-issued key-bound mount enrollment identity")
 	fs.StringVar(&o.enrollmentCertPath, "mount-enrollment-cert", "", "Manager-issued mount enrollment certificate PEM file")
-	fs.Int64Var(&o.enrollmentExpiresAtMs, "mount-enrollment-expires-at-ms", 0, "mount enrollment expiry as unix milliseconds")
 	fs.Uint64Var(&o.authorityGeneration, "authority-generation", 0, "exact hosted authority generation bound to the mount enrollment")
 	fs.StringVar(&o.coherence, "coherence", "strict", "kernel cache contract: strict (the only protocol-6 profile)")
 	fs.BoolFunc("fast", "retired: v3 mounts are strict write-through; passing this flag is an error", func(string) error {
@@ -167,7 +165,7 @@ func validateDirectV3MountOpts(o *mountOpts, getenv func(string) string) (dataPl
 	}
 	enrollmentFields := []bool{
 		o.managerURL != "", o.managerServerName != "", o.managerCAPath != "", o.enrollmentID != "",
-		o.enrollmentCertPath != "", o.enrollmentExpiresAtMs != 0, o.authorityGeneration != 0, o.authExpiresAtMs != 0,
+		o.enrollmentCertPath != "", o.authorityGeneration != 0, o.authExpiresAtMs != 0,
 	}
 	var enrollmentSet int
 	for _, set := range enrollmentFields {
@@ -176,10 +174,10 @@ func validateDirectV3MountOpts(o *mountOpts, getenv func(string) string) (dataPl
 		}
 	}
 	if enrollmentSet != 0 && enrollmentSet != len(enrollmentFields) {
-		return dataPlaneTransport{}, errors.New("automatic mount authorization requires --manager-url, --manager-server-name, --manager-ca, --mount-enrollment-id, --mount-enrollment-cert, --mount-enrollment-expires-at-ms, --authority-generation, and --auth-expires-at-ms together")
+		return dataPlaneTransport{}, errors.New("automatic mount authorization requires --manager-url, --manager-server-name, --manager-ca, --mount-enrollment-id, --mount-enrollment-cert, --authority-generation, and --auth-expires-at-ms together")
 	}
-	if enrollmentSet != 0 && (o.authExpiresAtMs <= time.Now().UnixMilli() || o.enrollmentExpiresAtMs <= o.authExpiresAtMs) {
-		return dataPlaneTransport{}, errors.New("automatic mount enrollment and initial authorization must both be unexpired, with the enrollment outliving the initial authorization")
+	if enrollmentSet != 0 && o.authExpiresAtMs <= time.Now().UnixMilli() {
+		return dataPlaneTransport{}, errors.New("automatic mount initial authorization must be unexpired")
 	}
 	if o.coherence != "strict" {
 		return dataPlaneTransport{}, fmt.Errorf("--coherence must be strict, not %q", o.coherence)
@@ -203,7 +201,6 @@ func (o *mountOpts) automaticEnrollment(clientIdentity *clientTLSIdentity, volum
 		ManagerURL: o.managerURL, ManagerServerName: o.managerServerName, ManagerCAPEM: managerCA,
 		EnrollmentID: o.enrollmentID, EnrollmentCertificatePEM: enrollmentCertificate,
 		ClientKeyPEM: clientIdentity.keyPEM, VolumeID: volumeID, AuthorityGeneration: o.authorityGeneration,
-		EnrollmentExpires: time.UnixMilli(o.enrollmentExpiresAtMs),
 	})
 	if err != nil {
 		return nil, time.Time{}, err
@@ -911,7 +908,6 @@ func (e *cmdEnv) daemonizeMount(o *mountOpts, volumeID, mountPath, stateDir stri
 			"--manager-ca", o.managerCAPath,
 			"--mount-enrollment-id", o.enrollmentID,
 			"--mount-enrollment-cert", o.enrollmentCertPath,
-			"--mount-enrollment-expires-at-ms", strconv.FormatInt(o.enrollmentExpiresAtMs, 10),
 			"--authority-generation", strconv.FormatUint(o.authorityGeneration, 10),
 			"--auth-expires-at-ms", strconv.FormatInt(o.authExpiresAtMs, 10),
 		)
@@ -1775,7 +1771,6 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			state.ReauthorizationControlSocket = reauthorizationControl.SocketPath()
 		} else {
 			state.MountEnrollmentID = o.enrollmentID
-			state.EnrollmentExpiresAtMs = o.enrollmentExpiresAtMs
 			state.AuthorizationDeadlineAtMs = initialAuthorizationDeadline.UnixMilli()
 		}
 		ready.AuthorizationSessionID = authorizationSessionID
@@ -1937,7 +1932,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			daemonEnrollment = &fskitV3MountEnrollmentRequest{
 				ManagerURL: o.managerURL, ManagerServerName: o.managerServerName, ManagerCAPEM: string(managerCA),
 				EnrollmentID: o.enrollmentID, EnrollmentCertificatePEM: string(enrollmentCertificate),
-				EnrollmentExpiresAtMs: o.enrollmentExpiresAtMs, AuthorityGeneration: o.authorityGeneration,
+				AuthorityGeneration:             o.authorityGeneration,
 				InitialAuthorizationExpiresAtMs: o.authExpiresAtMs,
 			}
 		}
@@ -2067,7 +2062,6 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 		state.AuthorizationSessionID = attachReply.AuthorizationSessionID
 		if enrollmentClient != nil {
 			state.MountEnrollmentID = o.enrollmentID
-			state.EnrollmentExpiresAtMs = o.enrollmentExpiresAtMs
 			state.AuthorizationDeadlineAtMs = initialAuthorizationDeadline.UnixMilli()
 		}
 		state.LocalDirs = attachReply.LocalDirs
@@ -3686,7 +3680,6 @@ type mountInventoryRow struct {
 	CleanupRequired           bool   `json:"cleanupRequired,omitempty"`
 	OperationPhase            string `json:"operationPhase,omitempty"`
 	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
-	EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
 	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
 	LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
 	NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
@@ -3732,25 +3725,25 @@ func cmdMounts(e *cmdEnv, args []string) int {
 		// needs it for renewal. Never embed that persistence object in a
 		// presentation type: JSON output is routinely captured in agent logs.
 		row := mountInventoryRow{
-			MountPath:              st.MountPath,
-			VolumeID:               st.VolumeID,
-			Branch:                 st.Branch,
-			PID:                    st.PID,
-			Strategy:               st.Strategy,
-			AuthorityURL:           st.AuthorityURL,
-			AttachRef:              st.AttachRef,
-			AuthorizationSessionID: st.AuthorizationSessionID,
-			StartedAtMs:            st.StartedAtMs,
-			LocalDirs:              st.LocalDirs,
-			LocalRoutes:            st.LocalRoutes,
-			LocalRouteRevision:     st.LocalRouteRevision,
-			Alive:                  mountProcessMatches(st),
-			Status:                 st.Status,
-			Health:                 e.classifyMount(st),
-			StatusChangedAtMs:      st.StatusChangedAtMs,
-			StatusReason:           st.StatusReason,
-			StatusDetail:           st.StatusDetail,
-			MountEnrollmentID:      st.MountEnrollmentID, EnrollmentExpiresAtMs: st.EnrollmentExpiresAtMs,
+			MountPath:                 st.MountPath,
+			VolumeID:                  st.VolumeID,
+			Branch:                    st.Branch,
+			PID:                       st.PID,
+			Strategy:                  st.Strategy,
+			AuthorityURL:              st.AuthorityURL,
+			AttachRef:                 st.AttachRef,
+			AuthorizationSessionID:    st.AuthorizationSessionID,
+			StartedAtMs:               st.StartedAtMs,
+			LocalDirs:                 st.LocalDirs,
+			LocalRoutes:               st.LocalRoutes,
+			LocalRouteRevision:        st.LocalRouteRevision,
+			Alive:                     mountProcessMatches(st),
+			Status:                    st.Status,
+			Health:                    e.classifyMount(st),
+			StatusChangedAtMs:         st.StatusChangedAtMs,
+			StatusReason:              st.StatusReason,
+			StatusDetail:              st.StatusDetail,
+			MountEnrollmentID:         st.MountEnrollmentID,
 			AuthorizationDeadlineAtMs: st.AuthorizationDeadlineAtMs, LastReauthorizationAtMs: st.LastReauthorizationAtMs,
 			NextReauthorizationAtMs: st.NextReauthorizationAtMs, ReauthorizationFailures: st.ReauthorizationFailures,
 			ReauthorizationError: st.ReauthorizationError,
@@ -3761,7 +3754,6 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			row.SessionTerminal = a.SessionTerminal
 			if a.MountEnrollmentID != "" {
 				row.MountEnrollmentID = a.MountEnrollmentID
-				row.EnrollmentExpiresAtMs = a.EnrollmentExpiresAtMs
 				row.AuthorizationDeadlineAtMs = a.AuthorizationDeadlineAtMs
 				row.LastReauthorizationAtMs = a.LastReauthorizationAtMs
 				row.NextReauthorizationAtMs = a.NextReauthorizationAtMs

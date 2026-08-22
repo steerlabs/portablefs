@@ -123,7 +123,6 @@ func TestFUSERenewalEventUpdatesSnapshotAndPerMountLog(t *testing.T) {
 	st := validFuseMountState(t, "/tmp/renewal-observation")
 	st.AuthorizationSessionID = base64.RawURLEncoding.EncodeToString(make([]byte, 16))
 	st.MountEnrollmentID = "enrollment-1"
-	st.EnrollmentExpiresAtMs = time.Now().Add(time.Hour).UnixMilli()
 	st.AuthorizationDeadlineAtMs = time.Now().Add(time.Minute).UnixMilli()
 	if err := writeMountState(dir, st); err != nil {
 		t.Fatal(err)

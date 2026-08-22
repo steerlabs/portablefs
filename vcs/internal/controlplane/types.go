@@ -264,6 +264,7 @@ const (
 	MountEnrollmentActive  MountEnrollmentState = "ACTIVE"
 	MountEnrollmentClosed  MountEnrollmentState = "CLOSED"
 	MountEnrollmentRevoked MountEnrollmentState = "REVOKED"
+	MountEnrollmentExpired MountEnrollmentState = "EXPIRED"
 )
 
 // MountEnrollment is the durable Manager decision that lets one already-live
@@ -301,6 +302,7 @@ type MountEnrollmentRevocationOutcome string
 const (
 	MountEnrollmentRevocationRevoked MountEnrollmentRevocationOutcome = "REVOKED"
 	MountEnrollmentRevocationClosed  MountEnrollmentRevocationOutcome = "CLOSED"
+	MountEnrollmentRevocationExpired MountEnrollmentRevocationOutcome = "EXPIRED"
 	MountEnrollmentRevocationAbsent  MountEnrollmentRevocationOutcome = "ABSENT"
 )
 
@@ -440,7 +442,6 @@ type MountAuthorization struct {
 	ReleaseID                string   `json:"release_id"`
 	EnrollmentID             string   `json:"enrollment_id,omitempty"`
 	EnrollmentCertificatePEM string   `json:"enrollment_certificate_pem,omitempty"`
-	EnrollmentExpiresUnix    int64    `json:"enrollment_expires_unix,omitempty"`
 }
 
 type CellObservation struct {
@@ -611,7 +612,7 @@ func (state State) Validate() error {
 	activeEnrollments := 0
 	activeByAuthorizationDomain := make(map[string]int)
 	activeByVolume := make(map[string]int)
-	activeRenewalScopes := make(map[string]struct{})
+	activeRenewalScopeVolumes := make(map[string]struct{})
 	referencedAuthorizationContexts := make(map[string]struct{})
 	for id, enrollment := range state.MountEnrollments {
 		if id != enrollment.ID || !cellplan.ValidID(id) || !cellplan.ValidID(enrollment.VolumeID) ||
@@ -645,11 +646,11 @@ func (state State) Validate() error {
 				return fmt.Errorf("%w: active mount enrollment termination", ErrInvalid)
 			}
 			if enrollment.RenewalScope != "" {
-				key := renewalFenceKey(enrollment.ProductIssuer, enrollment.RenewalScope)
-				if _, exists := activeRenewalScopes[key]; exists {
-					return fmt.Errorf("%w: active mount enrollment renewal scope", ErrInvalid)
+				key := renewalFenceKey(enrollment.ProductIssuer, enrollment.RenewalScope) + "\x00" + enrollment.VolumeID
+				if _, exists := activeRenewalScopeVolumes[key]; exists {
+					return fmt.Errorf("%w: active mount enrollment renewal scope and volume", ErrInvalid)
 				}
-				activeRenewalScopes[key] = struct{}{}
+				activeRenewalScopeVolumes[key] = struct{}{}
 			}
 			if volume.Placement == nil || !cellplan.ValidID(enrollment.CellID) || !validDNSName(enrollment.AuthorityID) || enrollment.AuthorityGeneration == 0 ||
 				volume.Placement.CellID != enrollment.CellID || volume.Placement.AuthorityID != enrollment.AuthorityID || volume.AuthorityEpoch != enrollment.AuthorityGeneration {
@@ -658,7 +659,7 @@ func (state State) Validate() error {
 			activeEnrollments++
 			activeByAuthorizationDomain[enrollment.AuthorizationDomain]++
 			activeByVolume[enrollment.VolumeID]++
-		case MountEnrollmentClosed, MountEnrollmentRevoked:
+		case MountEnrollmentClosed, MountEnrollmentRevoked, MountEnrollmentExpired:
 			if enrollment.TerminationReason == "" {
 				return fmt.Errorf("%w: terminated mount enrollment reason", ErrInvalid)
 			}

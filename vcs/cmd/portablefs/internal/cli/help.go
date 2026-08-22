@@ -166,7 +166,6 @@ EXAMPLES
                    [--manager-url https://manager --manager-server-name name
                     --manager-ca manager-ca.pem --mount-enrollment-id id
                     --mount-enrollment-cert enrollment.pem
-                    --mount-enrollment-expires-at-ms ms
                     --authority-generation n --auth-expires-at-ms ms]
                    [--coherence strict] [--no-local-dirs]
                    [--strategy auto|fskit|fuse] [--foreground] [--json]

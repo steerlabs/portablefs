@@ -66,7 +66,7 @@ func run() error {
 	archiveCredentials := flag.String("archive-credentials", "", "archive-store credentials file enabling seal verification and purge (optional)")
 	planLifetime := flag.Duration("plan-lifetime", 15*time.Minute, "signed cell plan lifetime")
 	grantLifetime := flag.Duration("grant-lifetime", 10*time.Minute, "mount grant lifetime")
-	enrollmentLifetime := flag.Duration("mount-enrollment-lifetime", 24*time.Hour, "maximum lifetime of one key-bound automatic mount enrollment")
+	enrollmentLease := flag.Duration("mount-enrollment-lease", 30*time.Minute, "sliding lease for one key-bound automatic mount enrollment")
 	productLifetime := flag.Duration("product-authorization-max-lifetime", 15*time.Minute, "maximum product assertion lifetime")
 	clientCertLifetime := flag.Duration("mount-client-cert-lifetime", time.Hour, "mount client certificate lifetime")
 	authorityCertLifetime := flag.Duration("authority-cert-lifetime", 24*time.Hour, "authority server certificate lifetime")
@@ -167,7 +167,7 @@ func run() error {
 		Store: store, PlanPrivateKey: planPrivate, CapabilityPrivateKey: capabilityPrivate,
 		ProductIssuers: issuers, AuthorityCA: authorityCA, ClientCA: clientCA, EnrollmentCA: enrollmentCA,
 		ReleaseID: version, PlanLifetime: *planLifetime, GrantLifetime: *grantLifetime,
-		EnrollmentLifetime: *enrollmentLifetime,
+		EnrollmentLease:    *enrollmentLease,
 		ProductMaxLifetime: *productLifetime, ClientCertLifetime: *clientCertLifetime,
 		AuthorityCertLifetime: *authorityCertLifetime, ObservedStaleAfter: *observedStale, ClockSkew: *clockSkew,
 		MaxArchivingPerCell: *maxArchivingPerCell, MaxRestoringPerCell: *maxRestoringPerCell,

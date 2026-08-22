@@ -137,7 +137,6 @@ func TestReauthorizeCommandRefusesAnAutomaticallyOwnedMountBeforeDelivery(t *tes
 	state.DataPlaneServerName = "authority.example"
 	state.AuthorizationSessionID = "AAAAAAAAAAAAAAAAAAAAAA"
 	state.MountEnrollmentID = "22222222-2222-4222-8222-222222222222"
-	state.EnrollmentExpiresAtMs = time.Now().Add(time.Hour).UnixMilli()
 	state.AuthorizationDeadlineAtMs = time.Now().Add(10 * time.Minute).UnixMilli()
 	writeRawMountState(t, stateDir, state)
 	e.mountHealthFn = func(*mountState) string { return "live" }

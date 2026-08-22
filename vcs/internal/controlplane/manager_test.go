@@ -52,7 +52,7 @@ func newManagerHarness(t *testing.T) managerHarness {
 		AuthorityCA:    authorityCA, ClientCA: clientCA, EnrollmentCA: enrollmentCA,
 		Now: func() time.Time { return now }, ReleaseID: "v3.1.0-test",
 		PlanLifetime: 10 * time.Minute, GrantLifetime: 10 * time.Minute, ProductMaxLifetime: 15 * time.Minute,
-		EnrollmentLifetime: 24 * time.Hour,
+		EnrollmentLease:    30 * time.Minute,
 		ClientCertLifetime: time.Hour, AuthorityCertLifetime: 24 * time.Hour,
 		ObservedStaleAfter: 2 * time.Minute, ClockSkew: 5 * time.Second,
 	})
@@ -131,7 +131,7 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "standalone-mount", []string{"read"}),
 		ClientCSRPEM:         clientCSR, Access: []string{"read"},
 	})
-	if err != nil || standalone.EnrollmentID != "" || standalone.EnrollmentCertificatePEM != "" || standalone.EnrollmentExpiresUnix != 0 {
+	if err != nil || standalone.EnrollmentID != "" || standalone.EnrollmentCertificatePEM != "" {
 		t.Fatalf("standalone mount received an unrequested enrollment = %+v, %v", standalone, err)
 	}
 	productToken := signedProductAuthorization(t, h, volume.Volume, peer, "mount-1", []string{"write"})
@@ -174,8 +174,8 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach enrollment-owned authority session: %v", err)
 	}
-	if authorization.EnrollmentID == "" || authorization.EnrollmentCertificatePEM == "" || authorization.EnrollmentExpiresUnix <= authorization.ExpiresUnix {
-		t.Fatalf("initial mount omitted bounded automatic enrollment: %+v", authorization)
+	if authorization.EnrollmentID == "" || authorization.EnrollmentCertificatePEM == "" {
+		t.Fatalf("initial mount omitted automatic enrollment identity: %+v", authorization)
 	}
 	if initialAccess.MountEnrollmentID != authorization.EnrollmentID {
 		t.Fatalf("initial authority session owner = %q, want %q", initialAccess.MountEnrollmentID, authorization.EnrollmentID)
@@ -196,6 +196,9 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	enrollmentLeaf, err := x509.ParseCertificate(enrollmentBlock.Bytes)
 	if err != nil || len(enrollmentLeaf.URIs) != 1 || enrollmentLeaf.URIs[0].String() != "spiffe://portablefs/mount-enrollment/"+authorization.EnrollmentID {
 		t.Fatalf("mount enrollment identity = %v, %v", enrollmentLeaf.URIs, err)
+	}
+	if !enrollmentLeaf.NotAfter.Equal(h.manager.cfg.EnrollmentCA.Certificate.NotAfter) {
+		t.Fatalf("mount enrollment certificate expires at %s, want enrollment CA expiry %s", enrollmentLeaf.NotAfter, h.manager.cfg.EnrollmentCA.Certificate.NotAfter)
 	}
 	enrollmentRoots := x509.NewCertPool()
 	enrollmentRoots.AddCert(h.manager.cfg.EnrollmentCA.Certificate)
@@ -383,6 +386,157 @@ func TestCreateVolumeRejectsQuotaNotRepresentableInXFSKiB(t *testing.T) {
 	}
 }
 
+func TestManagerRequiresEnrollmentLeaseAtLeastTwiceGrantLifetime(t *testing.T) {
+	h := newManagerHarness(t)
+	cfg := h.manager.cfg
+	cfg.EnrollmentLease = 2*cfg.GrantLifetime - time.Nanosecond
+	if _, err := NewManager(cfg); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("short enrollment lease = %v, want ErrInvalid", err)
+	}
+	cfg.EnrollmentLease = 2 * cfg.GrantLifetime
+	if _, err := NewManager(cfg); err != nil {
+		t.Fatalf("exact two-grant enrollment lease: %v", err)
+	}
+}
+
+func TestMountEnrollmentLeaseSlidesOnlyOnFreshSuccessfulRefresh(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	issued, err := h.manager.IssueMount("lease-issue", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "lease-issue", []string{"write"}),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseExpiry := func() int64 {
+		t.Helper()
+		var expires int64
+		if err := h.store.View(func(state State) error {
+			expires = state.MountEnrollments[issued.EnrollmentID].ExpiresUnix
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return expires
+	}
+	initialExpiry := h.now.Add(h.manager.cfg.EnrollmentLease).Unix()
+	if got := leaseExpiry(); got != initialExpiry {
+		t.Fatalf("issued lease expiry = %d, want %d", got, initialExpiry)
+	}
+
+	sessionID := base64.RawURLEncoding.EncodeToString([]byte("lease-session-id"))
+	request := RefreshMountEnrollmentRequest{ClientCSRPEM: clientCSR, SessionID: sessionID, Sequence: 1}
+	first, err := h.manager.RefreshMountEnrollment("lease-refresh-1", issued.EnrollmentID, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := leaseExpiry(); got != initialExpiry {
+		t.Fatalf("same-instant fresh refresh expiry = %d, want %d", got, initialExpiry)
+	}
+
+	*h.now = h.now.Add(time.Minute)
+	if _, err := h.manager.RefreshMountEnrollment("lease-replay", issued.EnrollmentID, request); err != nil {
+		t.Fatal(err)
+	}
+	if got := leaseExpiry(); got != initialExpiry {
+		t.Fatalf("replay extended lease to %d, want %d", got, initialExpiry)
+	}
+	request.Sequence = 2
+	if _, err := h.manager.RefreshMountEnrollment("lease-rate-limited", issued.EnrollmentID, request); !errors.Is(err, ErrConflict) {
+		t.Fatalf("rate-limited refresh = %v, want ErrConflict", err)
+	}
+	if got := leaseExpiry(); got != initialExpiry {
+		t.Fatalf("rate-limited refresh extended lease to %d, want %d", got, initialExpiry)
+	}
+
+	*h.now = h.now.Add(h.manager.cfg.EnrollmentLease - 2*time.Minute)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, wrongCSR := testCSR(t)
+	request.ClientCSRPEM = wrongCSR
+	if _, err := h.manager.RefreshMountEnrollment("lease-failed", issued.EnrollmentID, request); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("failed refresh = %v, want ErrInvalid", err)
+	}
+	if got := leaseExpiry(); got != initialExpiry {
+		t.Fatalf("failed refresh extended lease to %d, want %d", got, initialExpiry)
+	}
+
+	request.ClientCSRPEM = clientCSR
+	second, err := h.manager.RefreshMountEnrollment("lease-refresh-2", issued.EnrollmentID, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantLeaseExpiry := h.now.Add(h.manager.cfg.EnrollmentLease).Unix()
+	if got := leaseExpiry(); got != wantLeaseExpiry {
+		t.Fatalf("fresh refresh lease expiry = %d, want %d", got, wantLeaseExpiry)
+	}
+	if second.ExpiresUnix != h.now.Add(h.manager.cfg.GrantLifetime).Unix() || second.ExpiresUnix <= initialExpiry {
+		t.Fatalf("fresh grant expiry = %d, want %d beyond old lease %d", second.ExpiresUnix, h.now.Add(h.manager.cfg.GrantLifetime).Unix(), initialExpiry)
+	}
+	if first.Sequence != 1 || second.Sequence != 2 {
+		t.Fatalf("refresh sequences = %d, %d", first.Sequence, second.Sequence)
+	}
+}
+
+func TestMountEnrollmentLeaseExpiryEndsRefreshAndRetainsExpiredTombstone(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	issued, err := h.manager.IssueMount("expiring-lease", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "expiring-lease", []string{"write"}),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	*h.now = h.now.Add(h.manager.cfg.EnrollmentLease)
+	request := RefreshMountEnrollmentRequest{
+		ClientCSRPEM: clientCSR, SessionID: base64.RawURLEncoding.EncodeToString([]byte("expired-session!")), Sequence: 1,
+	}
+	if _, err := h.manager.RefreshMountEnrollment("refresh-expired-lease", issued.EnrollmentID, request); !errors.Is(err, ErrEnrollmentEnded) {
+		t.Fatalf("refresh at lease expiry = %v, want ErrEnrollmentEnded", err)
+	}
+	if err := h.store.View(func(state State) error {
+		enrollment := state.MountEnrollments[issued.EnrollmentID]
+		if enrollment.State != MountEnrollmentExpired || enrollment.TerminationReason != "lease-expired" || enrollment.UpdatedUnix != h.now.Unix() {
+			t.Fatalf("expired enrollment = %+v", enrollment)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	revocation, err := h.manager.RevokeVolumeMountEnrollment(
+		"opensteer", volume.ID, issued.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "cleanup-after-expiry"},
+	)
+	if err != nil || revocation.Outcome != MountEnrollmentRevocationExpired {
+		t.Fatalf("revocation during expired retention = %+v, %v", revocation, err)
+	}
+
+	*h.now = h.now.Add(mountEnrollmentRetention)
+	revocation, err = h.manager.RevokeVolumeMountEnrollment(
+		"opensteer", volume.ID, issued.EnrollmentID, TerminateMountEnrollmentRequest{Reason: "cleanup-after-expiry"},
+	)
+	if err != nil || revocation.Outcome != MountEnrollmentRevocationAbsent {
+		t.Fatalf("revocation after expired retention = %+v, %v", revocation, err)
+	}
+}
+
 func TestMountEnrollmentAdmissionBoundsActiveOwnersWithoutTombstoneExhaustion(t *testing.T) {
 	active := func(id, authorizationDomain, volume string, updated int64) MountEnrollment {
 		return MountEnrollment{ID: id, AuthorizationDomain: authorizationDomain, VolumeID: volume, State: MountEnrollmentActive, UpdatedUnix: updated}
@@ -440,7 +594,7 @@ func TestMountEnrollmentAdmissionBoundsActiveOwnersWithoutTombstoneExhaustion(t 
 	}
 }
 
-func TestPruneMountEnrollmentsRemovesExpiredOwnersAndOrphanedReplayContexts(t *testing.T) {
+func TestPruneMountEnrollmentsTransitionsExpiredLeaseThenPrunesAfterRetention(t *testing.T) {
 	state := NewState()
 	context := MountAuthorizationContext{AuthorityCAPEM: "ca", ReleaseID: "release"}
 	contextID := mountAuthorizationContextID(context)
@@ -459,8 +613,8 @@ func TestPruneMountEnrollmentsRemovesExpiredOwnersAndOrphanedReplayContexts(t *t
 	if !pruneMountEnrollments(&state, now) {
 		t.Fatal("prune reported no state change")
 	}
-	if _, ok := state.MountEnrollments["expired"]; ok {
-		t.Fatal("expired active enrollment was retained")
+	if expired := state.MountEnrollments["expired"]; expired.State != MountEnrollmentExpired || expired.TerminationReason != "lease-expired" || expired.UpdatedUnix != now {
+		t.Fatalf("expired enrollment = %+v", expired)
 	}
 	if _, ok := state.MountEnrollments["recent-terminal"]; ok {
 		t.Fatal("terminal enrollment at the retention boundary was retained")
@@ -468,15 +622,24 @@ func TestPruneMountEnrollmentsRemovesExpiredOwnersAndOrphanedReplayContexts(t *t
 	if _, ok := state.MountEnrollments["old-terminal"]; ok {
 		t.Fatal("old terminal enrollment was retained")
 	}
+	if len(state.MountAuthorizationContexts) != 1 {
+		t.Fatal("live expired tombstone lost its replay context before retention")
+	}
+	if !pruneMountEnrollments(&state, now+int64(mountEnrollmentRetention/time.Second)) {
+		t.Fatal("retention prune reported no state change")
+	}
+	if _, ok := state.MountEnrollments["expired"]; ok {
+		t.Fatal("expired enrollment survived terminal retention")
+	}
 	if len(state.MountAuthorizationContexts) != 0 {
-		t.Fatal("orphaned replay context was retained")
+		t.Fatal("orphaned replay context survived terminal retention")
 	}
 }
 
-func TestScopedRenewalIssuanceRotatesSameEpochEnrollment(t *testing.T) {
+func TestScopedRenewalIssuanceSupersedesPerVolumeAndEpochFenceRevokesScope(t *testing.T) {
 	h := newManagerHarness(t)
-	_, volume := readyVolumeForMount(t, h)
-	issue := func(requestID, scope string, epoch uint64) MountAuthorization {
+	_, volumeA, volumeB := readyVolumesForMount(t, h)
+	issue := func(requestID string, volume VolumeView, epoch uint64) MountAuthorization {
 		t.Helper()
 		clientPublic, clientCSR := testCSR(t)
 		peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
@@ -486,7 +649,7 @@ func TestScopedRenewalIssuanceRotatesSameEpochEnrollment(t *testing.T) {
 		peer := sha256.Sum256(peerSPKI)
 		authorization, err := h.manager.IssueMount(requestID, IssueMountRequest{
 			VolumeID: volume.ID, ProductAuthorization: signedProductAuthorizationWithRenewal(
-				t, h, volume.Volume, peer, requestID, []string{"write"}, scope, epoch,
+				t, h, volume.Volume, peer, requestID, []string{"write"}, "cloud-private-state:computer-1", epoch,
 			),
 			ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
 		})
@@ -496,28 +659,38 @@ func TestScopedRenewalIssuanceRotatesSameEpochEnrollment(t *testing.T) {
 		return authorization
 	}
 
-	first := issue("scope-epoch-2", "cloud-private-state:computer-1", 2)
-	second := issue("scope-epoch-2-fresh-csr", "cloud-private-state:computer-1", 2)
+	firstA := issue("scope-volume-a-first", volumeA, 1)
+	firstB := issue("scope-volume-b-first", volumeB, 1)
+	secondA := issue("scope-volume-a-second", volumeA, 1)
 
 	if err := h.store.View(func(state State) error {
-		if got := state.RenewalFences[renewalFenceKey("opensteer", "cloud-private-state:computer-1")]; got != 2 {
-			t.Fatalf("renewal fence = %d, want 2", got)
+		if got := state.RenewalFences[renewalFenceKey("opensteer", "cloud-private-state:computer-1")]; got != 1 {
+			t.Fatalf("renewal fence = %d, want 1", got)
 		}
-		if enrollment := state.MountEnrollments[first.EnrollmentID]; enrollment.State != MountEnrollmentRevoked ||
-			enrollment.TerminationReason != "renewal-scope-superseded" || enrollment.RenewalScope != "cloud-private-state:computer-1" || enrollment.RenewalEpoch != 2 {
+		if enrollment := state.MountEnrollments[firstA.EnrollmentID]; enrollment.State != MountEnrollmentRevoked ||
+			enrollment.TerminationReason != "renewal-scope-superseded" || enrollment.RenewalScope != "cloud-private-state:computer-1" || enrollment.RenewalEpoch != 1 {
 			t.Fatalf("superseded enrollment = %+v", enrollment)
 		}
-		active := 0
-		for _, enrollment := range state.MountEnrollments {
-			if enrollment.ProductIssuer == "opensteer" && enrollment.RenewalScope == "cloud-private-state:computer-1" && enrollment.State == MountEnrollmentActive {
-				active++
-				if enrollment.ID != second.EnrollmentID {
-					t.Fatalf("active scoped enrollment = %+v, want %s", enrollment, second.EnrollmentID)
-				}
+		for _, id := range []string{firstB.EnrollmentID, secondA.EnrollmentID} {
+			if enrollment := state.MountEnrollments[id]; enrollment.State != MountEnrollmentActive {
+				t.Fatalf("per-volume active enrollment %s = %+v", id, enrollment)
 			}
 		}
-		if active != 1 {
-			t.Fatalf("active scoped enrollments = %d, want 1", active)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondB := issue("scope-volume-b-epoch-2", volumeB, 2)
+	if err := h.store.View(func(state State) error {
+		for _, id := range []string{firstB.EnrollmentID, secondA.EnrollmentID} {
+			enrollment := state.MountEnrollments[id]
+			if enrollment.State != MountEnrollmentRevoked || enrollment.TerminationReason != "renewal-scope-superseded" {
+				t.Fatalf("epoch-fenced enrollment %s = %+v", id, enrollment)
+			}
+		}
+		if enrollment := state.MountEnrollments[secondB.EnrollmentID]; enrollment.State != MountEnrollmentActive || enrollment.RenewalEpoch != 2 {
+			t.Fatalf("new epoch enrollment = %+v", enrollment)
 		}
 		return nil
 	}); err != nil {
@@ -829,7 +1002,7 @@ func TestRenewalScopeTerminalizationIsIssuerScopedAndPreservesTerminals(t *testi
 	}
 }
 
-func TestStateRejectsTwoActiveEnrollmentsInOneRenewalScope(t *testing.T) {
+func TestStateRejectsTwoActiveEnrollmentsInOneRenewalScopeAndVolume(t *testing.T) {
 	h := newManagerHarness(t)
 	_, volume := readyVolumeForMount(t, h)
 	clientPublic, clientCSR := testCSR(t)
@@ -859,7 +1032,7 @@ func TestStateRejectsTwoActiveEnrollmentsInOneRenewalScope(t *testing.T) {
 	duplicate.ID = newUUID()
 	invalid.MountEnrollments[duplicate.ID] = duplicate
 	if err := invalid.Validate(); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("duplicate active renewal scope validation = %v, want ErrInvalid", err)
+		t.Fatalf("duplicate active renewal scope and volume validation = %v, want ErrInvalid", err)
 	}
 }
 
@@ -1498,6 +1671,72 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 		t.Fatalf("ready volume = %+v, %v", volume, err)
 	}
 	return cell, volume
+}
+
+func readyVolumesForMount(t *testing.T, h managerHarness) (Cell, VolumeView, VolumeView) {
+	t.Helper()
+	cell, err := h.manager.RegisterCell("ready-multi-cell", RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 16 << 30, CapacityInodes: 400_000, Pool: PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareCellForAdmission(t, h, cell)
+	create := func(requestID, owner string) VolumeView {
+		t.Helper()
+		volume, err := h.manager.CreateVolume(requestID, CreateVolumeRequest{
+			AuthorizationDomain: "org", Owner: owner, ProductIssuer: "opensteer", QuotaBytes: 1 << 30, QuotaInodes: 100_000,
+		})
+		if err != nil {
+			t.Fatalf("create %s: %v", requestID, err)
+		}
+		return volume
+	}
+	volumeA := create("ready-volume-a", "owner-a")
+	if err := h.manager.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: verifiedPlan(t, h.manager, cell.ID, *h.now).Generation,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	volumeB := create("ready-volume-b", "owner-b")
+	_, csrA := testCSR(t)
+	_, csrB := testCSR(t)
+	observation := func(volume VolumeView, csr string, running bool) VolumeObservation {
+		return VolumeObservation{
+			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+			Provisioned: true, AuthorityCSRPEM: csr, AuthorityRunning: running,
+		}
+	}
+	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
+	cell, err = h.manager.ObserveCell("ready-multi-csr", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(), ArchiveConfigured: true,
+		Volumes: []VolumeObservation{observation(volumeA, csrA, false), observation(volumeB, csrB, false)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
+	cell, err = h.manager.ObserveCell("ready-multi-running", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(), ArchiveConfigured: true,
+		Volumes: []VolumeObservation{observation(volumeA, "", true), observation(volumeB, "", true)},
+	})
+	if err != nil || cell.Health != CellHealthy {
+		t.Fatalf("ready multi-volume cell = %+v, %v", cell, err)
+	}
+	volumeA, err = h.manager.GetVolume(volumeA.ID)
+	if err != nil || volumeA.State != VolumeReady {
+		t.Fatalf("ready volume A = %+v, %v", volumeA, err)
+	}
+	volumeB, err = h.manager.GetVolume(volumeB.ID)
+	if err != nil || volumeB.State != VolumeReady {
+		t.Fatalf("ready volume B = %+v, %v", volumeB, err)
+	}
+	return cell, volumeA, volumeB
 }
 
 func prepareCellForAdmission(t *testing.T, h managerHarness, cell Cell) Cell {

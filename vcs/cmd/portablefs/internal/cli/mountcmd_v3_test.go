@@ -88,6 +88,29 @@ func TestValidateDirectV3MountOptsAcceptsTheDocumentedShape(t *testing.T) {
 	}
 }
 
+func TestMountOptionsParseAutomaticEnrollmentWithoutLeaseExpiryFlag(t *testing.T) {
+	fs := newFlagSet("mount")
+	parsed := &mountOpts{}
+	addMountFlags(fs, parsed)
+	positionals, err := parseArgs(fs, []string{
+		"volume", "/mnt/volume", "--manager-url", "https://manager.example",
+		"--manager-server-name", "manager.example", "--manager-ca", "/manager-ca.pem",
+		"--mount-enrollment-id", "22222222-2222-4222-8222-222222222222",
+		"--mount-enrollment-cert", "/enrollment.pem", "--authority-generation", "7",
+		"--auth-expires-at-ms", "2000000000000",
+	})
+	if err != nil || len(positionals) != 2 || parsed.enrollmentID == "" || parsed.authorityGeneration != 7 {
+		t.Fatalf("automatic enrollment options = %+v, positionals=%v, err=%v", parsed, positionals, err)
+	}
+
+	removed := newFlagSet("mount")
+	addMountFlags(removed, &mountOpts{})
+	removedExpiryFlag := "--mount-enrollment-" + "expires-at-ms"
+	if _, err := parseArgs(removed, []string{"volume", "/mnt/volume", removedExpiryFlag, "2000000000000"}); err == nil {
+		t.Fatalf("removed %s flag was accepted", removedExpiryFlag)
+	}
+}
+
 func TestValidateDirectV3MountOptsRefusesPartialOrExpiredAutomaticEnrollment(t *testing.T) {
 	o := v3MountOpts(t)
 	o.managerURL = "https://manager.example"
@@ -101,10 +124,9 @@ func TestValidateDirectV3MountOptsRefusesPartialOrExpiredAutomaticEnrollment(t *
 	o.enrollmentID = "22222222-2222-4222-8222-222222222222"
 	o.enrollmentCertPath = "/enrollment.pem"
 	o.authorityGeneration = 7
-	o.authExpiresAtMs = now.Add(time.Minute).UnixMilli()
-	o.enrollmentExpiresAtMs = now.Add(30 * time.Second).UnixMilli()
-	if _, err := validateDirectV3MountOpts(o, noEnv); err == nil || !strings.Contains(err.Error(), "outliving") {
-		t.Fatalf("enrollment shorter than grant = %v", err)
+	o.authExpiresAtMs = now.Add(-time.Second).UnixMilli()
+	if _, err := validateDirectV3MountOpts(o, noEnv); err == nil || !strings.Contains(err.Error(), "must be unexpired") {
+		t.Fatalf("expired initial authorization = %v", err)
 	}
 }
 

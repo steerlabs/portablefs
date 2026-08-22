@@ -18,7 +18,7 @@ import (
 )
 
 const hostedMountReauthorizationFeature = "hosted-mount-reauthorization-v1"
-const hostedAutomaticMountReauthorizationFeature = "hosted-automatic-mount-reauthorization-v1"
+const hostedAutomaticMountReauthorizationFeature = "hosted-automatic-mount-reauthorization-v2"
 
 // cmdEnv carries the process environment a command runs in; tests substitute
 // writers, env lookups, the config path, and the poll sleeper.
