@@ -177,7 +177,7 @@ func validDigest(value string) bool {
 
 func validStoredPhase(phase cellplan.VolumePhase) bool {
 	switch phase {
-	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence,
+	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence, cellplan.PhaseQuiesce,
 		cellplan.PhaseArchive, cellplan.PhaseRestore, cellplan.PhaseDestroy:
 		return true
 	default:

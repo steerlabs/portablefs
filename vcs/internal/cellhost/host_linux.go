@@ -131,6 +131,8 @@ func (host *Host) Apply(ctx context.Context, plan cellplan.VolumePlan, previous 
 	case cellplan.PhaseFence:
 		observed.AuthorityAbsent, err = host.fence(ctx, plan.VolumeID)
 		observed.Provisioned = host.volumeExists(plan.VolumeID)
+	case cellplan.PhaseQuiesce:
+		observed, update = host.applyQuiesceFence(ctx, plan, previous)
 	case cellplan.PhaseArchive:
 		observed, update = host.applyArchive(ctx, plan, previous)
 	case cellplan.PhaseRestore:
@@ -195,6 +197,8 @@ func (host *Host) Observe(ctx context.Context, plan cellplan.VolumePlan, previou
 		if err != nil {
 			observed.Error = err.Error()
 		}
+	case cellplan.PhaseQuiesce:
+		observed = host.observeQuiesceFence(ctx, plan, previous)
 	case cellplan.PhaseArchive:
 		observed, _ = host.observeArchive(ctx, plan, previous)
 	case cellplan.PhaseRestore:

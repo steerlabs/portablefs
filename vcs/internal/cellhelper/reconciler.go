@@ -223,7 +223,7 @@ func validatePlanTransition(plan cellplan.Plan, state State, cellID string) erro
 				return errors.New("cellhelper: authority generation is stale or skipped")
 			}
 			if volume.AuthorityGeneration == previous.AuthorityGeneration+1 &&
-				!((previous.LastPhase == cellplan.PhaseFence || previous.LastPhase == cellplan.PhaseArchive) && previous.AuthorityAbsent) {
+				!((previous.LastPhase == cellplan.PhaseFence || previous.LastPhase == cellplan.PhaseQuiesce || previous.LastPhase == cellplan.PhaseArchive) && previous.AuthorityAbsent) {
 				return errors.New("cellhelper: replacement authority lacks local process-absence proof")
 			}
 			continue
@@ -276,6 +276,9 @@ func assignmentAfterObservation(previous Assignment, volume cellplan.VolumePlan,
 	}
 	assignment.QuotaBytes, assignment.QuotaInodes = volume.QuotaBytes, volume.QuotaInodes
 	assignment.AuthorityGeneration = volume.AuthorityGeneration
+	if previous.LastPhase != volume.Phase && (volume.Phase == cellplan.PhaseQuiesce || volume.Phase == cellplan.PhaseArchive) {
+		assignment.LastQuiesceNonce = ""
+	}
 	assignment.LastPhase = volume.Phase
 	assignment.AuthorityAbsent = observed.AuthorityAbsent
 	if update.LastQuiesceNonce != "" {
@@ -305,6 +308,8 @@ func phaseApplied(phase cellplan.VolumePhase, observed controlplane.VolumeObserv
 		return false
 	}
 	switch phase {
+	case cellplan.PhaseQuiesce:
+		return observed.AuthorityAbsent && observed.QuiesceProven
 	case cellplan.PhaseArchive:
 		return observed.ArchiveSealed != nil
 	case cellplan.PhaseRestore:

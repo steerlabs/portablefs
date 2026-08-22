@@ -228,6 +228,42 @@ func TestArchiveStateMachinePersistsNonceAndSeal(t *testing.T) {
 	}
 }
 
+func TestQuiesceStateMachinePersistsNonceUntilProofAndThenObserves(t *testing.T) {
+	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+	now := time.Unix(1_900_000_000, 0)
+	host := &scriptedHost{
+		applies: []struct {
+			observation controlplane.VolumeObservation
+			update      HostUpdate
+		}{
+			{controlplane.VolumeObservation{Provisioned: true, AuthorityRunning: true}, HostUpdate{LastQuiesceNonce: strings64("a")}},
+			{controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true, QuiesceProven: true}, HostUpdate{}},
+		},
+		observes: []struct {
+			observation controlplane.VolumeObservation
+			update      HostUpdate
+		}{{controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true, QuiesceProven: true}, HostUpdate{}}},
+	}
+	reconciler := testReconciler(t, publicKey, now, host)
+	plan := helperPlan(now, reconciler.CellID, 1, 1, cellplan.PhaseQuiesce)
+	for pass := 0; pass < 3; pass++ {
+		if _, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, plan)); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if len(host.applies) != 0 || len(host.observes) != 0 {
+		t.Fatalf("quiesce did not switch from apply to observe: applies=%d observes=%d", len(host.applies), len(host.observes))
+	}
+	state, err := loadState(reconciler.StatePath, reconciler.CellID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment := state.Assignments[plan.Volumes[0].VolumeID]
+	if assignment.LastPhase != cellplan.PhaseQuiesce || assignment.LastQuiesceNonce != strings64("a") || !assignment.Applied || !assignment.AuthorityAbsent {
+		t.Fatalf("durable quiesce state = %+v", assignment)
+	}
+}
+
 func TestDestroyReleaseWritesExactTombstoneAndLeavingPlanIsSafe(t *testing.T) {
 	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
 	now := time.Unix(1_900_000_000, 0)
