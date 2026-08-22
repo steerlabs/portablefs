@@ -156,4 +156,18 @@ grep -Fxq 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' "$authority_unit" |
   exit 65
 }
 
+# Manager activation is complete only after its main process reports that the
+# mTLS control listener is bound and entering its accept loop. The AF_UNIX
+# allowance is required for the systemd notification datagram.
+manager_unit=$stage/systemd/portablefs-manager.service
+for directive in \
+  'Type=notify' \
+  'NotifyAccess=main' \
+  'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'; do
+  grep -Fxq "$directive" "$manager_unit" || {
+    echo "hosted manager unit does not carry the readiness contract: expected '$directive', found '$(grep -F "${directive%%=*}=" "$manager_unit" || echo none)'" >&2
+    exit 65
+  }
+done
+
 echo "$release_id"

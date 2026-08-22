@@ -4,7 +4,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-Type=exec
+Type=notify
+NotifyAccess=main
 EnvironmentFile=/etc/portablefs/manager/manager.env
 ExecStart=/opt/portablefs/current/bin/portablefs-manager \
   -listen=${PORTABLEFS_MANAGER_LISTEN} \
@@ -46,7 +47,7 @@ ProtectSystem=strict
 ReadWritePaths=/var/lib/portablefs-manager
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
