@@ -117,7 +117,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		len(cfg.ClientCA.CertificatePEM) == 0 || len(cfg.ClientCA.CertificatePEM) > 4096 ||
 		len(cfg.EnrollmentCA.CertificatePEM) == 0 || len(cfg.EnrollmentCA.CertificatePEM) > 4096 ||
 		cfg.PlanLifetime <= 0 || cfg.GrantLifetime <= 0 || cfg.EnrollmentLifetime <= cfg.GrantLifetime || cfg.ProductMaxLifetime <= 0 ||
-		cfg.ClientCertLifetime <= 0 || cfg.AuthorityCertLifetime <= 0 || cfg.ObservedStaleAfter <= 0 || cfg.UsageStaleAfter <= 0 ||
+		cfg.ClientCertLifetime <= 0 || cfg.AuthorityCertLifetime <= 0 || cfg.ObservedStaleAfter <= 0 || cfg.UsageStaleAfter < time.Second ||
 		cfg.ProvisionFloorBytes == 0 || cfg.ProvisionFloorInodes == 0 || cfg.CellReserveFraction <= 0 || cfg.CellReserveFraction >= 1 ||
 		cfg.RestoreOverheadFraction < 0 || cfg.RestoreOverheadFraction > 1 || cfg.RestoreOverheadBytes == 0 || cfg.RestoreOverheadInodes == 0 ||
 		!validIdentity(cfg.ArchiveKeyVersion) || cfg.MaxArchivingPerCell <= 0 || cfg.MaxRestoringPerCell <= 0 || cfg.ClockSkew < 0 {
@@ -991,7 +991,8 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 		plan = cellplan.Plan{
 			Version: cellplan.Version, CellID: cell.ID, Generation: cell.PlanGeneration,
 			IssuedAt: cell.PlanIssuedUnix, ExpiresAt: cell.PlanExpiresUnix, ReleaseID: manager.cfg.ReleaseID,
-			AuthorityCAPEM: manager.cfg.AuthorityCA.CertificatePEM, ClientCAPEM: manager.cfg.ClientCA.CertificatePEM,
+			UsageRefreshSeconds: uint64(manager.cfg.UsageStaleAfter / time.Second),
+			AuthorityCAPEM:      manager.cfg.AuthorityCA.CertificatePEM, ClientCAPEM: manager.cfg.ClientCA.CertificatePEM,
 			CapabilityPublicKey: manager.capabilityPublicKeyPEM,
 		}
 		for _, volume := range state.Volumes {

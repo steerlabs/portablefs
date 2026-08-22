@@ -1199,7 +1199,8 @@ func TestCellPlanIsV2WithDestroyPhaseAndNoRecordedCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
-	if plan.Version != cellplan.Version || len(plan.Volumes) != 1 || plan.Volumes[0].Phase != cellplan.PhaseDestroy {
+	if plan.Version != cellplan.Version || plan.UsageRefreshSeconds != uint64(h.manager.cfg.UsageStaleAfter/time.Second) ||
+		len(plan.Volumes) != 1 || plan.Volumes[0].Phase != cellplan.PhaseDestroy {
 		t.Fatalf("v2 destroy plan = %+v", plan)
 	}
 	if err := h.store.View(func(state State) error {

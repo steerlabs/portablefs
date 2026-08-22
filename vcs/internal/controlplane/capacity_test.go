@@ -91,6 +91,47 @@ func TestStalePerPlacementUsageIsChargedAtQuota(t *testing.T) {
 	}
 }
 
+func TestPeriodicUnchangedObservationsKeepIdleCellAdmissible(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.WakeBurstBytes = 1
+	cell, err := h.manager.RegisterCell("idle-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111",
+		AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 40 << 30, CapacityInodes: 2_000_000, Pool: PoolProduct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareCellForAdmission(t, h, cell)
+	var observations []VolumeObservation
+	for index := range 2 {
+		volume, err := h.manager.CreateVolume(fmt.Sprintf("idle-volume-%d", index), CreateVolumeRequest{
+			AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+			QuotaBytes: 10 << 30, QuotaInodes: 1_000_000, Pool: PoolProduct,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		observations = append(observations, VolumeObservation{
+			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+			UsedBytes: 26 << 20, UsedInodes: 987,
+		})
+		observeTieredCell(t, h, cell.ID, fmt.Sprintf("idle-created-%d", index), true, observations...)
+	}
+	for refresh := range 8 {
+		*h.now = h.now.Add(90 * time.Second)
+		observeTieredCell(t, h, cell.ID, fmt.Sprintf("idle-refresh-%d", refresh), true, observations...)
+	}
+	report, err := h.manager.Capacity()
+	if err != nil || !report.Pools[0].CreateAdmissible {
+		t.Fatalf("capacity after periodic unchanged observations = %+v, %v", report, err)
+	}
+	for _, volume := range currentState(t, h).Volumes {
+		if h.now.Unix()-volume.Placement.UsedObservedUnix > int64(h.manager.cfg.UsageStaleAfter/time.Second) {
+			t.Fatalf("periodic observation left stale usage = %+v", volume.Placement)
+		}
+	}
+}
+
 // Restore work requires a cell whose helper can hydrate; creates never do.
 func TestRestoreAdmissionRequiresAnArchiveCapableCell(t *testing.T) {
 	h := newManagerHarness(t)

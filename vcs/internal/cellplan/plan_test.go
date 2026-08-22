@@ -13,7 +13,8 @@ func validPlan(now time.Time) Plan {
 	return Plan{
 		Version: Version, CellID: "11111111-1111-4111-8111-111111111111", Generation: 3,
 		IssuedAt: now.Unix(), ExpiresAt: now.Add(time.Minute).Unix(), ReleaseID: "v3-test",
-		AuthorityCAPEM: "authority-ca", ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
+		UsageRefreshSeconds: 300,
+		AuthorityCAPEM:      "authority-ca", ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
 		Volumes: []VolumePlan{{
 			VolumeID: "22222222-2222-4222-8222-222222222222", Phase: PhaseServe,
 			AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "product", ProductPublicKeyPEM: "product-key",
@@ -21,6 +22,18 @@ func validPlan(now time.Time) Plan {
 			ServiceUID: 200001, ServiceGID: 200001, ListenPort: 20001, QuotaBytes: 1 << 30, QuotaInodes: 1000,
 			AuthorityServerName: "volume.example", AuthorityCertificate: "cert", PlacementSequence: 1,
 		}},
+	}
+}
+
+func TestPlanRequiresPositiveRepresentableUsageRefresh(t *testing.T) {
+	plan := validPlan(time.Unix(1_700_000_000, 0))
+	plan.UsageRefreshSeconds = 0
+	if err := Validate(plan); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("zero usage refresh = %v, want ErrInvalid", err)
+	}
+	plan.UsageRefreshSeconds = uint64(time.Duration(1<<63-1)/time.Second) + 1
+	if err := Validate(plan); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unrepresentable usage refresh = %v, want ErrInvalid", err)
 	}
 }
 

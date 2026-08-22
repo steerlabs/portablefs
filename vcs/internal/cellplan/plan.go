@@ -55,6 +55,7 @@ type Plan struct {
 	IssuedAt            int64        `json:"issued_at"`
 	ExpiresAt           int64        `json:"expires_at"`
 	ReleaseID           string       `json:"release_id"`
+	UsageRefreshSeconds uint64       `json:"usage_refresh_seconds"`
 	AuthorityCAPEM      string       `json:"authority_ca_pem,omitempty"`
 	ClientCAPEM         string       `json:"client_ca_pem,omitempty"`
 	CapabilityPublicKey string       `json:"capability_public_key_pem,omitempty"`
@@ -181,7 +182,8 @@ func Verify(publicKey ed25519.PublicKey, envelope Envelope, cellID string, now t
 
 func Validate(plan Plan) error {
 	if plan.Version != Version || !uuidPattern.MatchString(plan.CellID) || plan.Generation == 0 ||
-		plan.IssuedAt <= 0 || plan.ExpiresAt <= plan.IssuedAt || !validText(plan.ReleaseID, 256) {
+		plan.IssuedAt <= 0 || plan.ExpiresAt <= plan.IssuedAt || !validText(plan.ReleaseID, 256) ||
+		plan.UsageRefreshSeconds == 0 || plan.UsageRefreshSeconds > uint64(time.Duration(1<<63-1)/time.Second) {
 		return ErrInvalid
 	}
 	if plan.AuthorityCAPEM == "" || plan.ClientCAPEM == "" || plan.CapabilityPublicKey == "" {

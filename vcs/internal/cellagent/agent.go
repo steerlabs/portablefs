@@ -45,6 +45,7 @@ type Agent struct {
 	runMu              sync.Mutex
 	lastObservation    [32]byte
 	hasLastObservation bool
+	lastObservationAt  time.Time
 }
 
 func New(config Config) (*Agent, error) {
@@ -105,12 +106,18 @@ func (agent *Agent) RunOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !agent.hasLastObservation || digest != agent.lastObservation {
+	now := agent.cfg.Now().UTC()
+	refreshAfter := time.Duration(plan.UsageRefreshSeconds) * time.Second / 3
+	// Usage timestamps are durable admission evidence. Refresh them well before
+	// the manager's bound even when reconciliation found no state change.
+	refreshDue := agent.hasLastObservation && (now.Before(agent.lastObservationAt) || now.Sub(agent.lastObservationAt) >= refreshAfter)
+	if !agent.hasLastObservation || digest != agent.lastObservation || refreshDue {
 		if err := agent.observe(ctx, observation); err != nil {
 			return err
 		}
 		agent.lastObservation = digest
 		agent.hasLastObservation = true
+		agent.lastObservationAt = now
 		return nil
 	}
 	return agent.heartbeat(ctx, controlplane.CellHeartbeat{

@@ -97,6 +97,57 @@ func TestRunOnceVerifiesReconcilesAndReportsExactReleases(t *testing.T) {
 	}
 }
 
+func TestRunOnceRefreshesUnchangedObservationAtPlanInterval(t *testing.T) {
+	publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+	now := time.Unix(1_900_000_000, 0)
+	cellID := "11111111-1111-4111-8111-111111111111"
+	plan := testPlan(now, cellID)
+	plan.UsageRefreshSeconds = 90
+	envelope, err := cellplan.Sign(privateKey, plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observationKeys []string
+	heartbeats := 0
+	managerClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodGet {
+			return jsonResponse(t, envelope), nil
+		}
+		if strings.HasSuffix(request.URL.Path, "/heartbeat") {
+			heartbeats++
+		} else {
+			observationKeys = append(observationKeys, request.Header.Get("Idempotency-Key"))
+		}
+		return jsonResponse(t, map[string]string{"ok": "true"}), nil
+	})}
+	helperClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return jsonResponse(t, controlplane.CellObservation{
+			CellID: cellID, PlanGeneration: plan.Generation, ManagerReleaseID: plan.ReleaseID,
+			HelperReleaseID: "helper-r1", ObservedUnix: now.Unix(),
+		}), nil
+	})}
+	agent, err := New(Config{
+		CellID: cellID, ManagerURL: "https://manager.example", PlanPublicKey: publicKey,
+		PlanLifetime: 5 * time.Minute, ClockSkew: time.Second, PollInterval: time.Second,
+		ReleaseID: "agent-r2", ManagerClient: managerClient, HelperClient: helperClient, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, advance := range []time.Duration{0, 29 * time.Second, time.Second} {
+		now = now.Add(advance)
+		if err := agent.RunOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(observationKeys) != 2 || heartbeats != 1 {
+		t.Fatalf("observations=%d heartbeats=%d, want 2 and 1", len(observationKeys), heartbeats)
+	}
+	if observationKeys[0] == observationKeys[1] {
+		t.Fatal("timed observations reused an idempotency key")
+	}
+}
+
 func TestRunOnceRejectsUnverifiedPlanBeforePrivilegeBoundary(t *testing.T) {
 	publicKey, _, _ := ed25519.GenerateKey(nil)
 	_, wrongPrivateKey, _ := ed25519.GenerateKey(nil)
@@ -220,7 +271,8 @@ func testPlan(now time.Time, cellID string) cellplan.Plan {
 	return cellplan.Plan{
 		Version: cellplan.Version, CellID: cellID, Generation: 7, IssuedAt: now.Unix(),
 		ExpiresAt: now.Add(time.Minute).Unix(), ReleaseID: "manager-r3",
-		AuthorityCAPEM: "authority-ca", ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
+		UsageRefreshSeconds: 300,
+		AuthorityCAPEM:      "authority-ca", ClientCAPEM: "client-ca", CapabilityPublicKey: "cap-key",
 	}
 }
 
