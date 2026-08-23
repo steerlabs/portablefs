@@ -63,6 +63,40 @@ restore the prior symlink if an individual atomic activation fails before it
 finishes; that is transaction failure handling, not an operator rollback of a
 completed deployment.
 
+## Staging shares one global release transaction
+
+The `deploy-opensteer-staging` workflow and OpenSteer's staging Cloud Build
+both mutate the same Manager/cells, E2B default template, and serving system.
+GitHub's `concurrency` block serializes only this repository, so the staging
+workflow additionally contends on the exact generation-fenced object
+`gs://opensteer-tfstate/release-locks/opensteer-staging`.
+
+Candidate bundle construction and candidate E2B smoke remain outside the live
+transaction. Immediately before `deploy-production.sh` stages anything on a
+control host, `deploy-staging-locked.sh` acquires the shared object. It holds
+the lock through host activation, cell convergence, every Authority fence and
+restart, E2B default promotion, the final drain, and release evidence. A
+heartbeat advances the GCS generation by compare-and-swap. Losing that
+generation stops the next live mutation; a failed deployment leaves the object
+owned until GitHub reports that exact run attempt terminal. Successful release
+stops the heartbeat and deletes only the exact final generation.
+
+`deploy/opensteer/staging-release-lock.py`, its JSON decision vectors, and its
+unit test are deliberately byte-identical to their counterparts in
+`steerlabs/opensteer-infra`. Change the schema or decision matrix in both
+repositories in one reviewed rollout. Unknown owner kinds, malformed metadata,
+unknown platform status, and unavailable status APIs all fail closed. A
+terminal owner can be superseded early; elapsed time alone cannot fence an
+owner that its platform still reports active.
+
+Before this workflow version may merge, the preceding OpenSteer admin
+Terraform change must already be applied. That change grants
+`portablefs-deployer@opensteer-staging.iam.gserviceaccount.com` only four object
+permissions on the one exact lock object and only `cloudbuild.builds.get` for
+authoritative Cloud Build owner status. It grants no object listing and no
+Terraform-state prefix access. Deploying either writer before that ordered
+prerequisite is an incomplete release and must fail closed.
+
 ## Reviewed cell inventory
 
 The release coordinator accepts one file through

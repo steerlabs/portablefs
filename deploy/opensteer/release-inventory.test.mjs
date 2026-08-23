@@ -227,7 +227,12 @@ test("SSH transport takes each host's explicit zone", () => {
 });
 
 test("release scripts parse and cannot promote before the final fleet plan", async () => {
-  for (const name of ["deploy-production.sh", "manager-api.sh", "cell-authority-state.sh"]) {
+  for (const name of [
+    "deploy-production.sh",
+    "deploy-staging-locked.sh",
+    "manager-api.sh",
+    "cell-authority-state.sh",
+  ]) {
     const filename = path.join(scriptRoot, name);
     const result = spawnSync("bash", ["-n", filename], { encoding: "utf8" });
     assert.equal(result.status, 0, `${name}: ${result.stderr}`);
@@ -244,6 +249,25 @@ test("release scripts parse and cannot promote before the final fleet plan", asy
   assert.match(deploy, /manager_call wait-cell-release/);
   assert.match(deploy, /cell_call "\$cell_id" inspect-release/);
   assert.doesNotMatch(deploy, /cell_call[^\n]*\|\| true/);
+  assert.match(deploy, /release_lock_check/);
+  assert.match(deploy, /global staging release lock was lost; refusing the next live mutation/);
+  assert.match(deploy, /opensteer-staging requires the global release-lock transaction wrapper/);
+  assert.match(deploy, /staging-release-lock\.py" assert-owned/);
+
+  const lockedDeploy = await readFile(
+    path.join(scriptRoot, "deploy-staging-locked.sh"),
+    "utf8",
+  );
+  const acquire = lockedDeploy.indexOf("acquire-once");
+  const heartbeat = lockedDeploy.indexOf("heartbeat-loop");
+  const liveDeploy = lockedDeploy.indexOf('"$root/deploy/opensteer/deploy-production.sh"');
+  const release = lockedDeploy.indexOf('"$lock_script" release');
+  assert.ok(acquire >= 0 && heartbeat > acquire && liveDeploy > heartbeat && release > liveDeploy);
+  assert.match(lockedDeploy, /--owner-kind github-actions/);
+  assert.match(lockedDeploy, /--owner-id "\$owner_id"/);
+  assert.match(lockedDeploy, /--source-commit "\$source_commit"/);
+  assert.match(lockedDeploy, /--hold-seconds 7200/);
+  assert.match(lockedDeploy, /OPENSTEER_RELEASE_LOCK_LOST_FILE/);
 
   const managerAPI = await readFile(path.join(scriptRoot, "manager-api.sh"), "utf8");
   const converge = managerAPI.slice(
@@ -260,6 +284,13 @@ test("release scripts parse and cannot promote before the final fleet plan", asy
   assert.match(stagingWorkflow, /\n      cell_inventory:\n/);
   assert.match(stagingWorkflow, /cell_inventory:[\s\S]*?required: true/);
   assert.doesNotMatch(stagingWorkflow, /vars\.OPENSTEER_CELL_INVENTORY/);
+  assert.match(stagingWorkflow, /permissions:\n  actions: read\n  contents: read\n  id-token: write/);
+  assert.match(stagingWorkflow, /run: deploy\/opensteer\/deploy-staging-locked\.sh/);
+  assert.doesNotMatch(stagingWorkflow, /run: deploy\/opensteer\/deploy-production\.sh/);
+  assert.ok(
+    stagingWorkflow.indexOf("Build and smoke-test the candidate E2B template") <
+      stagingWorkflow.indexOf("deploy/opensteer/deploy-staging-locked.sh"),
+  );
   assert.ok(
     stagingWorkflow.indexOf("release-inventory.mjs validate") <
       stagingWorkflow.indexOf("google-github-actions/auth@"),

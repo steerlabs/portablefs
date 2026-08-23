@@ -27,6 +27,7 @@ on:
         type: string
 
 permissions:
+  actions: read
   contents: read
   id-token: write
 
@@ -37,7 +38,10 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Candidate construction is outside the live transaction. Once acquired,
+    # the shared lock admits at most two hours of live mutation; the remaining
+    # budget is an explicit bounded wait behind an in-flight Cloud Build.
+    timeout-minutes: 360
     environment: opensteer-staging
     env:
       OPENSTEER_CELL_INVENTORY_JSON: ${{ inputs.cell_inventory }}
@@ -239,8 +243,9 @@ jobs:
           OPENSTEER_E2B_SDK_ROOT: ${{ runner.temp }}/opensteer-e2b-sdk
           OPENSTEER_EVIDENCE_DIR: ${{ runner.temp }}/opensteer-deployment-evidence
           OPENSTEER_CELL_INVENTORY_FILE: ${{ steps.inventory.outputs.file }}
+          OPENSTEER_RELEASE_LOCK_GITHUB_TOKEN: ${{ github.token }}
           OPENSTEER_RELEASE_DIR: ${{ steps.release.outputs.release_dir }}
-        run: deploy/opensteer/deploy-production.sh
+        run: deploy/opensteer/deploy-staging-locked.sh
 
       - name: Retain the fencing and release evidence
         if: always()
