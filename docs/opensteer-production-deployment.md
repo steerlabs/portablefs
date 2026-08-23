@@ -63,39 +63,46 @@ restore the prior symlink if an individual atomic activation fails before it
 finishes; that is transaction failure handling, not an operator rollback of a
 completed deployment.
 
-## Staging shares one global release transaction
+## Staging has one activation authority
 
-The `deploy-opensteer-staging` workflow and OpenSteer's staging Cloud Build
-both mutate the same Manager/cells, E2B default template, and serving system.
-GitHub's `concurrency` block serializes only this repository, so the staging
-workflow additionally contends on the exact generation-fenced object
-`gs://opensteer-tfstate/release-locks/opensteer-staging`.
+PortableFS does not deploy staging. Every push to PortableFS `main` runs
+`.github/workflows/files-image.yml`, which publishes artifacts only:
 
-Candidate bundle construction and candidate E2B smoke remain outside the live
-transaction. Immediately before `deploy-production.sh` stages anything on a
-control host, `deploy-staging-locked.sh` acquires the shared object. It holds
-the lock through host activation, cell convergence, every Authority fence and
-restart, E2B default promotion, the final drain, and release evidence. A
-heartbeat advances the GCS generation by compare-and-swap. Losing that
-generation stops the next live mutation; a failed deployment leaves the object
-owned until GitHub reports that exact run attempt terminal. Successful release
-stops the heartbeat and deletes only the exact final generation.
+1. Publish or reuse and deeply reverify
+   `portablefs-files:sha-<full-source-commit>`.
+2. Build the hosted Linux release from the ordinary clean checkout, verify its
+   exact members, binary identities, VCS stamps, and checksums, and combine it
+   with the five reviewed deployment helpers.
+3. Publish or reuse
+   `portablefs-release:sha-<full-source-commit>` last. This scratch capsule has
+   one Linux/amd64 manifest and one filesystem layer rooted at
+   `/opensteer-portablefs-release/`. Its canonical `release.json` binds the
+   repository ID, `main` workflow/ref, source commit, hosted release and client
+   digest, and the already-verified `portablefs-files` image digest.
 
-`deploy/opensteer/staging-release-lock.py`, its JSON decision vectors, and its
-unit test are deliberately byte-identical to their counterparts in
-`steerlabs/opensteer-infra`. Change the schema or decision matrix in both
-repositories in one reviewed rollout. Unknown owner kinds, malformed metadata,
-unknown platform status, and unavailable status APIs all fail closed. A
-terminal owner can be superseded early; elapsed time alone cannot fence an
-owner that its platform still reports active.
+Artifact Registry tags are immutable. A retry re-reads every descriptor,
+config, layer, path, mode, checksum, and embedded identity from the registry;
+it does not trust tag existence. If publication stops after the component, no
+aggregate exists. If the aggregate exists, every artifact it names was already
+complete and verified.
 
-Before this workflow version may merge, the preceding OpenSteer admin
-Terraform change must already be applied. That change grants
-`portablefs-deployer@opensteer-staging.iam.gserviceaccount.com` only four object
-permissions on the one exact lock object and only `cloudbuild.builds.get` for
-authoritative Cloud Build owner status. It grants no object listing and no
-Terraform-state prefix access. Deploying either writer before that ordered
-prerequisite is an incomplete release and must fail closed.
+Both images live only beneath the dedicated
+`us-west1-docker.pkg.dev/opensteer-admin/portablefs-releases` repository. Its
+publisher service account and workload-identity provider admit only the
+PortableFS repository ID, owner ID, `main` ref, and this exact workflow. The
+`opensteer-infra` repository and its deployer cannot publish these artifacts.
+The dedicated repository, provider, and service account are an ordered infra
+prerequisite; this workflow must not publish before that prerequisite is
+applied.
+
+The `steerlabs/opensteer-infra` staging Cloud Build is the sole process allowed
+to consume that capsule and mutate the staging Manager, cells, volumes, E2B
+template, Kubernetes resources, or serving system. It owns the global release
+lock, forward-only state, activation, smoke, and deployment evidence as one
+transaction. PortableFS has no staging workflow, staging environment, E2B key,
+or staging deployer path. `deploy-production.sh` explicitly refuses the
+`opensteer-staging` project so the production coordinator cannot become a
+second staging writer.
 
 ## Reviewed cell inventory
 

@@ -1,54 +1,188 @@
 name: files-image
 
+# PortableFS publishes artifacts; opensteer-infra is the only staging
+# activation authority. The component image is complete first and the
+# aggregate release capsule is created last, so an interruption leaves either
+# no aggregate or one that names already-verifiable component bytes.
 on:
   push:
     branches:
       - main
-    paths:
-      - ".github/workflows/files-image.yml"
-      - "deploy/files/**"
-      - "vcs/**"
-  workflow_dispatch:
 
 permissions:
   contents: read
   id-token: write
 
 concurrency:
-  group: files-image-${{ github.ref }}
+  group: portablefs-staging-artifacts-main
   cancel-in-progress: false
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
+    env:
+      BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
+      REGISTRY: us-west1-docker.pkg.dev/opensteer-admin/portablefs-releases
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out the exact main commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Prove the immutable publication identity
+        id: identity
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = steerlabs/portablefs
+          test "$GITHUB_REPOSITORY_OWNER_ID" = 252926615
+          test "$GITHUB_REPOSITORY_ID" = 1313214092
+          test "$GITHUB_REF" = refs/heads/main
+          test "$GITHUB_WORKFLOW_REF" = steerlabs/portablefs/.github/workflows/files-image.yml@refs/heads/main
+          source_revision=$(git rev-parse --verify HEAD)
+          test "$source_revision" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          commit_epoch=$(git show -s --format=%ct HEAD)
+          release_date=$(date --utc --date="@$commit_epoch" +%Y%m%d)
+          release_id="pfs-hosted-$release_date-${source_revision:0:12}"
+          {
+            echo "source_revision=$source_revision"
+            echo "release_id=$release_id"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Set up the exact Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: vcs/go.mod
+          cache-dependency-path: vcs/go.sum
+
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Install the pinned registry reader
+        run: |
+          set -euo pipefail
+          GOBIN="$RUNNER_TEMP/portablefs-tools" \
+            go install github.com/google/go-containerregistry/cmd/crane@v0.20.3
+          echo "$RUNNER_TEMP/portablefs-tools" >>"$GITHUB_PATH"
 
       - id: auth
+        name: Authenticate the artifact publisher without a stored key
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
-          workload_identity_provider: projects/920572344872/locations/global/workloadIdentityPools/github/providers/github-image-publisher
-          service_account: gha-deployer@opensteer-admin.iam.gserviceaccount.com
+          workload_identity_provider: projects/920572344872/locations/global/workloadIdentityPools/github/providers/github-portablefs-publisher
+          service_account: gha-portablefs-publisher@opensteer-admin.iam.gserviceaccount.com
           token_format: access_token
+          create_credentials_file: false
 
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - name: Authenticate BuildKit and crane to Artifact Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: us-west1-docker.pkg.dev
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
 
-      - uses: docker/bake-action@d3418bd7d0e9324001bca92fa8ba175ea7e6dc9b # v7.3.0
-        with:
-          source: .
-          files: deploy/files/docker-bake.hcl
-          push: true
-          set: |
-            *.cache-from=type=gha,scope=portablefs-files
-            *.cache-to=type=gha,scope=portablefs-files,mode=max
+      - name: Publish or reuse and deeply verify portablefs-files
+        id: files
         env:
-          TAG: sha-${{ github.sha }}
+          SOURCE_REVISION: ${{ steps.identity.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          tag="$REGISTRY/portablefs-files:sha-$SOURCE_REVISION"
+          digest_error="$RUNNER_TEMP/portablefs-files-digest-error"
+          if timeout --kill-after=5s 60s crane digest "$tag" >/dev/null 2>"$digest_error"; then
+            echo "Reusing immutable $tag"
+          elif grep -Fq 'MANIFEST_UNKNOWN' "$digest_error"; then
+            archive="$RUNNER_TEMP/portablefs-files.oci.tar"
+            layout="$RUNNER_TEMP/portablefs-files.oci"
+            export TAG="sha-$SOURCE_REVISION"
+            docker buildx bake --allow "fs.write=$RUNNER_TEMP" \
+              --file deploy/files/docker-bake.hcl \
+              --set "*.output=type=oci,dest=$archive" \
+              --set "*.cache-from=type=gha,scope=portablefs-files" \
+              --set "*.cache-to=type=gha,scope=portablefs-files,mode=max"
+            mkdir -m 0700 "$layout"
+            tar -xf "$archive" -C "$layout"
+            if ! timeout --kill-after=30s 600s crane push "$layout" "$tag"; then
+              # Another publisher may have won after our typed absence read.
+              # Only a full verification of that immutable winner is success.
+              deploy/files/verify-registry-image.sh files "$tag" "$SOURCE_REVISION" >/dev/null
+            fi
+          else
+            cat "$digest_error" >&2
+            echo "Could not distinguish a missing tag from a registry failure; refusing publication" >&2
+            exit 1
+          fi
+          digest=$(deploy/files/verify-registry-image.sh files "$tag" "$SOURCE_REVISION")
+          {
+            echo "digest=$digest"
+            echo "image=$REGISTRY/portablefs-files@$digest"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Publish or reuse and deeply verify the aggregate release capsule
+        id: release
+        env:
+          FILES_IMAGE: ${{ steps.files.outputs.image }}
+          RELEASE_ID: ${{ steps.identity.outputs.release_id }}
+          SOURCE_REVISION: ${{ steps.identity.outputs.source_revision }}
+        run: |
+          set -euo pipefail
+          tag="$REGISTRY/portablefs-release:sha-$SOURCE_REVISION"
+          digest_error="$RUNNER_TEMP/portablefs-release-digest-error"
+          if timeout --kill-after=5s 60s crane digest "$tag" >/dev/null 2>"$digest_error"; then
+            echo "Reusing immutable $tag"
+          elif grep -Fq 'MANIFEST_UNKNOWN' "$digest_error"; then
+            hosted_root="$RUNNER_TEMP/portablefs-hosted"
+            mkdir -m 0700 "$hosted_root"
+            hosted=$(scripts/build-hosted-linux-release.sh "$hosted_root" "$RELEASE_ID" amd64)
+
+            capsule="$RUNNER_TEMP/portablefs-capsule"
+            python3 deploy/files/release_registry.py assemble \
+              --hosted "$hosted" \
+              --output "$capsule" \
+              --source "$SOURCE_REVISION" \
+              --release-id "$RELEASE_ID" \
+              --files-image "$FILES_IMAGE"
+            python3 deploy/files/release_registry.py verify-directory \
+              "$capsule" --source "$SOURCE_REVISION" --files-image "$FILES_IMAGE"
+
+            archive="$RUNNER_TEMP/portablefs-release.oci.tar"
+            layout="$RUNNER_TEMP/portablefs-release.oci"
+            docker buildx build \
+              --file deploy/files/ReleaseContainerfile \
+              --platform linux/amd64 \
+              --provenance=false \
+              --sbom=false \
+              --build-arg "RELEASE_ID=$RELEASE_ID" \
+              --build-arg "SOURCE_REVISION=$SOURCE_REVISION" \
+              --output "type=oci,dest=$archive" \
+              "$capsule"
+            mkdir -m 0700 "$layout"
+            tar -xf "$archive" -C "$layout"
+            if ! timeout --kill-after=30s 600s crane push "$layout" "$tag"; then
+              # A concurrent create is recoverable only when its complete
+              # immutable bytes satisfy this exact source/component contract.
+              deploy/files/verify-registry-image.sh \
+                release "$tag" "$SOURCE_REVISION" "$FILES_IMAGE" >/dev/null
+            fi
+          else
+            cat "$digest_error" >&2
+            echo "Could not distinguish a missing tag from a registry failure; refusing publication" >&2
+            exit 1
+          fi
+          digest=$(deploy/files/verify-registry-image.sh \
+            release "$tag" "$SOURCE_REVISION" "$FILES_IMAGE")
+          {
+            echo "digest=$digest"
+            echo "image=$REGISTRY/portablefs-release@$digest"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Report the complete immutable publication
+        env:
+          FILES_IMAGE: ${{ steps.files.outputs.image }}
+          RELEASE_IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          set -euo pipefail
+          printf 'portablefs-files=%s\nportablefs-release=%s\n' \
+            "$FILES_IMAGE" "$RELEASE_IMAGE"

@@ -1,0 +1,10 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM scratch
+ARG RELEASE_ID
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.source="https://github.com/steerlabs/portablefs" \
+      org.opencontainers.image.revision="$SOURCE_REVISION" \
+      org.opencontainers.image.version="$RELEASE_ID" \
+      io.opensteer.portablefs.release-record="/opensteer-portablefs-release/release.json"
+COPY . /opensteer-portablefs-release/

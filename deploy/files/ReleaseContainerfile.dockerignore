@@ -1,0 +1,6 @@
+**
+!release.json
+!hosted/
+!hosted/**
+!tools/
+!tools/**

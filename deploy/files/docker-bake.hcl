@@ -1,5 +1,5 @@
 variable "REGISTRY" {
-  default = "us-west1-docker.pkg.dev/opensteer-admin/staging"
+  default = "us-west1-docker.pkg.dev/opensteer-admin/portablefs-releases"
 }
 
 variable "TAG" {
@@ -8,6 +8,10 @@ variable "TAG" {
 
 variable "DOCKERHUB_MIRROR" {
   default = "us-west1-docker.pkg.dev/opensteer-admin/dockerhub"
+}
+
+variable "SOURCE_REVISION" {
+  default = "0000000000000000000000000000000000000000"
 }
 
 group "default" {
@@ -20,8 +24,9 @@ target "portablefs-files" {
   platforms  = ["linux/amd64"]
   provenance = false
   args = {
-    GO_IMAGE     = "${DOCKERHUB_MIRROR}/library/golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36"
-    UBUNTU_IMAGE = "${DOCKERHUB_MIRROR}/library/ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea"
+    GO_IMAGE       = "${DOCKERHUB_MIRROR}/library/golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36"
+    SOURCE_REVISION = "${SOURCE_REVISION}"
+    UBUNTU_IMAGE   = "${DOCKERHUB_MIRROR}/library/ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea"
   }
   tags = ["${REGISTRY}/portablefs-files:${TAG}"]
 }
