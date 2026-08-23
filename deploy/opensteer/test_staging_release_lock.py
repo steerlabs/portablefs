@@ -378,12 +378,32 @@ class PlatformStatusTests(unittest.TestCase):
 
 
 class GcloudBackendTests(unittest.TestCase):
+    @staticmethod
+    def gcloud_object(expected: object, generation: str = "18") -> dict[str, object]:
+        """Fixture matching real `gcloud storage ... --format=json` output."""
+
+        return {
+            "bucket": "opensteer-tfstate",
+            "content_type": "application/json",
+            "crc32c_hash": "AAAAAA==",
+            "creation_time": "2026-08-23T00:00:00+0000",
+            "custom_fields": expected.metadata(),
+            "etag": "fixture-etag",
+            "generation": generation,
+            "md5_hash": "fixture-md5",
+            "metageneration": 1,
+            "name": "release-locks/opensteer-staging",
+            "size": 1,
+            "storage_class": "STANDARD",
+            "storage_class_update_time": "2026-08-23T00:00:00+0000",
+            "storage_url": lock.LOCK_URL,
+            "update_time": "2026-08-23T00:00:00+0000",
+        }
+
     def test_write_uses_exact_generation_and_observes_full_metadata(self) -> None:
         expected = owner()
         backend = lock.GcloudBackend()
-        describe = json.dumps(
-            {"generation": "18", "metadata": expected.metadata()}
-        )
+        describe = json.dumps(self.gcloud_object(expected))
         with mock.patch.object(
             backend,
             "_run",
@@ -402,6 +422,42 @@ class GcloudBackendTests(unittest.TestCase):
         )
         for key, value in expected.metadata().items():
             self.assertIn(f"{key}={value}", metadata)
+
+    def test_describe_accepts_real_gcloud_cli_schema(self) -> None:
+        expected = owner()
+        backend = lock.GcloudBackend()
+        with mock.patch.object(
+            backend,
+            "_run",
+            return_value=subprocess.CompletedProcess(
+                [], 0, json.dumps(self.gcloud_object(expected, "23")), ""
+            ),
+        ):
+            self.assertEqual(backend.describe(), lock.LockObject(23, expected))
+
+    def test_describe_rejects_rest_shape_unknown_fields_and_noncanonical_generation(
+        self,
+    ) -> None:
+        expected = owner()
+        invalid_documents = (
+            {"generation": "18", "metadata": expected.metadata()},
+            {
+                **self.gcloud_object(expected),
+                "custom_fields": {**expected.metadata(), "unknown": "field"},
+            },
+            self.gcloud_object(expected, "018"),
+            {**self.gcloud_object(expected), "generation": 18},
+        )
+        backend = lock.GcloudBackend()
+        for document in invalid_documents:
+            with self.subTest(document=document), mock.patch.object(
+                backend,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, json.dumps(document), ""
+                ),
+            ), self.assertRaises(lock.LockError):
+                backend.describe()
 
     def test_write_precondition_race_is_busy(self) -> None:
         backend = lock.GcloudBackend()

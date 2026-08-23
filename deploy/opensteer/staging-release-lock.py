@@ -303,10 +303,23 @@ class GcloudBackend:
             raise LockError("could not describe the staging release lock")
         try:
             document = json.loads(result.stdout)
-            generation = int(document["generation"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            if not isinstance(document, dict):
+                raise TypeError("object description is not a mapping")
+            generation_value = document.get("generation")
+            if (
+                not isinstance(generation_value, str)
+                or POSITIVE_DECIMAL.fullmatch(generation_value) is None
+            ):
+                raise ValueError("object generation is not a canonical decimal string")
+            generation = int(generation_value)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise LockError("Cloud Storage returned invalid lock metadata") from error
-        owner = owner_from_metadata(document.get("metadata"), now=int(time.time()))
+        # `gcloud storage objects describe --format=json` is not the Cloud
+        # Storage REST resource: its CLI schema uses snake_case and exposes
+        # custom object metadata as `custom_fields`. Accept only that observed
+        # transport shape so a renamed/empty field cannot silently erase the
+        # strict owner schema.
+        owner = owner_from_metadata(document.get("custom_fields"), now=int(time.time()))
         return LockObject(generation=generation, owner=owner)
 
     def put(self, owner: Owner, if_generation_match: int) -> LockObject:

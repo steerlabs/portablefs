@@ -25,7 +25,7 @@
       "ownerStatus": "unknown"
     }
   ],
-  "implementationSha256": "712fb2339da38c1b53215c1995a511042548ab8969cd4eb45b2bd1644cfcd472",
+  "implementationSha256": "9d959434b2e396311603cb76bee15fcffe11c23464c7bc15710cab00e7ec0213",
   "lockUrl": "gs://opensteer-tfstate/release-locks/opensteer-staging",
   "maxHoldSeconds": {
     "cloud-build": 18000,
