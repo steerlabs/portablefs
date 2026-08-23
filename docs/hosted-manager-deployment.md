@@ -123,8 +123,9 @@ Before admitting a real product:
 2. Converge a disposable cell with `PUT /v1/cells/{id}` and provision a
    disposable quota-limited volume. Prove exact registration replay is a no-op
    over live allocator, capacity, health, and plan state; prove a changed
-   declaration conflicts; prove operator cell and volume inventories are
-   stable-ID sorted.
+   declaration conflicts; prove the explicit allocator ends are enforced over
+   lifetime create/delete exhaustion; prove operator cell and volume
+   inventories are stable-ID sorted.
 3. Prove an exact idempotent volume retry is byte-identical and changed reuse
    fails.
 4. Restart the manager and prove a fresh behind-generation heartbeat restores

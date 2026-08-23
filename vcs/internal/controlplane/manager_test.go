@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +31,12 @@ type managerHarness struct {
 	now        *time.Time
 	productKey ed25519.PrivateKey
 }
+
+const (
+	testLastProjectID  = uint32(19_999)
+	testLastServiceUID = uint32(209_999)
+	testLastPort       = uint16(29_999)
+)
 
 func newManagerHarness(t *testing.T) managerHarness {
 	t.Helper()
@@ -69,6 +76,7 @@ func TestConvergentCellRegistrationNeverOverwritesLiveState(t *testing.T) {
 		AvailabilityZone: " zone-a ", AuthorityHost: "CELL.TEST", AuthorityDNSZone: "CELL.TEST",
 		CapacityBytes: 8 << 30, CapacityInodes: 800_000, Pool: "PRODUCT",
 		FirstProjectID: 12_000, FirstServiceUID: 22_000, FirstPort: 32_000,
+		LastProjectID: 19_999, LastServiceUID: 29_999, LastPort: 39_999,
 	}
 	cellID := "11111111-1111-4111-8111-111111111111"
 	cell, err := h.manager.ConvergeCell(cellID, declaration)
@@ -114,57 +122,120 @@ func TestConvergentCellRegistrationNeverOverwritesLiveState(t *testing.T) {
 		t.Fatalf("initial-capacity declaration mismatch = %v", err)
 	}
 	mismatch = declaration
+	mismatch.LastPort--
+	if _, err := h.manager.ConvergeCell(cellID, mismatch); !errors.Is(err, ErrConflict) {
+		t.Fatalf("allocator-end declaration mismatch = %v", err)
+	}
+	mismatch = declaration
 	mismatch.ID = "22222222-2222-4222-8222-222222222222"
 	if _, err := h.manager.ConvergeCell(cellID, mismatch); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("path/body identity mismatch = %v", err)
 	}
 }
 
-func TestConvergentCellRegistrationPinsCompatiblePreDigestStateOnce(t *testing.T) {
+func TestConvergentCellRegistrationPinsCompatiblePreBoundStateOnce(t *testing.T) {
 	h := newManagerHarness(t)
 	cellID := "11111111-1111-4111-8111-111111111111"
 	declaration := RegisterCellRequest{
 		ID: cellID, AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
 		CapacityBytes: 8 << 30, CapacityInodes: 800_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	}
-	cell, err := h.manager.RegisterCell("pre-digest-cell", declaration)
+	cell, err := h.manager.RegisterCell("pre-bound-cell", declaration)
 	if err != nil {
 		t.Fatal(err)
 	}
 	prepareCellForAdmission(t, h, cell)
-	if _, err := h.manager.CreateVolume("pre-digest-volume", CreateVolumeRequest{
+	if _, err := h.manager.CreateVolume("pre-bound-volume", CreateVolumeRequest{
 		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
 		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.manager.UpdateCellCapacity("pre-digest-raise", cellID, UpdateCellCapacityRequest{
+	if _, err := h.manager.CreateVolume("pre-bound-volume-2", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner-2", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.manager.UpdateCellCapacity("pre-bound-raise", cellID, UpdateCellCapacityRequest{
 		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := h.store.TransactNatural("test-pre-registration-digest", h.now.Unix(), func(state *State) (any, bool, error) {
+	if _, err := h.store.TransactNatural("test-pre-bound-registration", h.now.Unix(), func(state *State) (any, bool, error) {
 		current := state.Cells[cellID]
-		current.RegistrationSHA256 = ""
+		current.RegistrationSHA256 = strings.Repeat("b", 64)
+		current.LastProjectID = 0
+		current.LastServiceUID = 0
+		current.LastPort = 0
 		state.Cells[cellID] = current
 		return current, true, nil
 	}); err != nil {
 		t.Fatal(err)
 	}
 	before := currentState(t, h).Cells[cellID]
+	oldFingerprint := before.RegistrationSHA256
+	if oldFingerprint == "" {
+		t.Fatal("fixture must exercise adoption from the earlier declaration digest")
+	}
 	sequence := h.store.sequence
+	tooSmallCases := []struct {
+		name   string
+		mutate func(*RegisterCellRequest)
+	}{
+		{"project ID", func(request *RegisterCellRequest) { request.LastProjectID = before.NextProjectID - 2 }},
+		{"service UID", func(request *RegisterCellRequest) { request.LastServiceUID = before.NextServiceUID - 2 }},
+		{"port", func(request *RegisterCellRequest) { request.LastPort = before.NextPort - 2 }},
+	}
+	for _, test := range tooSmallCases {
+		t.Run(test.name, func(t *testing.T) {
+			tooSmall := declaration
+			test.mutate(&tooSmall)
+			if _, err := h.manager.ConvergeCell(cellID, tooSmall); !errors.Is(err, ErrConflict) {
+				t.Fatalf("pre-bound adoption around an advanced allocator = %v", err)
+			}
+			if h.store.sequence != sequence || !reflect.DeepEqual(currentState(t, h).Cells[cellID], before) {
+				t.Fatal("failed allocator-bound adoption changed durable state")
+			}
+		})
+	}
 	pinned, err := h.manager.ConvergeCell(cellID, declaration)
 	if err != nil || pinned.RegistrationSHA256 == "" {
-		t.Fatalf("compatible pre-digest registration = %+v, %v", pinned, err)
+		t.Fatalf("compatible pre-bound registration = %+v, %v", pinned, err)
 	}
 	want := before
+	want.LastProjectID = declaration.LastProjectID
+	want.LastServiceUID = declaration.LastServiceUID
+	want.LastPort = declaration.LastPort
 	want.RegistrationSHA256 = pinned.RegistrationSHA256
 	if !reflect.DeepEqual(pinned, want) || h.store.sequence != sequence+1 {
 		t.Fatalf("digest adoption changed live state or append count: got=%+v want=%+v sequence=%d->%d", pinned, want, sequence, h.store.sequence)
 	}
+	if pinned.RegistrationSHA256 == oldFingerprint {
+		t.Fatal("bounded declaration did not supersede the pre-bound fingerprint")
+	}
 	sequence = h.store.sequence
 	if replay, err := h.manager.ConvergeCell(cellID, declaration); err != nil || !reflect.DeepEqual(replay, pinned) || h.store.sequence != sequence {
 		t.Fatalf("post-adoption exact replay = %+v, %v sequence=%d->%d", replay, err, sequence, h.store.sequence)
+	}
+}
+
+func TestCellRegistrationRequiresExplicitFiniteAllocatorEnds(t *testing.T) {
+	h := newManagerHarness(t)
+	request := RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 8 << 30, CapacityInodes: 800_000, Pool: PoolProduct,
+	}
+	if _, err := h.manager.RegisterCell("unbounded-cell", request); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("registration without allocator ends = %v", err)
+	}
+	request.LastProjectID = ^uint32(0)
+	request.LastServiceUID = testLastServiceUID
+	request.LastPort = testLastPort
+	if _, err := h.manager.RegisterCell("overflowing-cell", request); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("registration whose exhausted sentinel would overflow = %v", err)
 	}
 }
 
@@ -291,6 +362,7 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "us-west-2a",
 		AuthorityHost: "cell.example.test", AuthorityDNSZone: "cell.example.test",
 		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1539,6 +1611,7 @@ func TestManagerReleaseUpgradeAdvancesTheSignedPlanGeneration(t *testing.T) {
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "us-west-2a",
 		AuthorityHost: "cell.example.test", AuthorityDNSZone: "cell.example.test",
 		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1573,7 +1646,8 @@ func TestManagerReleaseUpgradeAdvancesTheSignedPlanGeneration(t *testing.T) {
 func TestCellPlanIsV2WithDestroyPhaseAndNoRecordedCapabilities(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("v2-plan", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1615,6 +1689,7 @@ func TestObservationCannotSwapIsolationIdentity(t *testing.T) {
 	cell, _ := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
 		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	prepareCellForAdmission(t, h, cell)
 	volume, _ := h.manager.CreateVolume("create", CreateVolumeRequest{
@@ -1642,6 +1717,7 @@ func TestObservationCannotOmitAssignedVolume(t *testing.T) {
 	cell, _ := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
 		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	prepareCellForAdmission(t, h, cell)
 	volume, _ := h.manager.CreateVolume("create", CreateVolumeRequest{
@@ -1666,6 +1742,7 @@ func TestHeartbeatIsLiveFailClosedStateAndDoesNotPretendToSurviveRestart(t *test
 	cell, err := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
 		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1734,6 +1811,7 @@ func TestAuthorityCertificateRenewsOnTheSameGenerationAndCSR(t *testing.T) {
 	cell, err := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
 		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1782,6 +1860,7 @@ func TestAuthorityCSRSwapWithinGenerationQuarantinesVolume(t *testing.T) {
 	cell, _ := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
 		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	prepareCellForAdmission(t, h, cell)
 	volume, _ := h.manager.CreateVolume("create", CreateVolumeRequest{
@@ -1819,6 +1898,7 @@ func TestReadyAuthorityHostFailureFencesForRetryWithoutIdentityQuarantine(t *tes
 	cell, err := h.manager.RegisterCell("register", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a", AuthorityHost: "cell.test",
 		AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1885,6 +1965,7 @@ func readyVolumeForMount(t *testing.T, h managerHarness) (Cell, VolumeView) {
 	cell, err := h.manager.RegisterCell("ready-cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1937,6 +2018,7 @@ func readyVolumesForMount(t *testing.T, h managerHarness) (Cell, VolumeView, Vol
 	cell, err := h.manager.RegisterCell("ready-multi-cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 16 << 30, CapacityInodes: 400_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)

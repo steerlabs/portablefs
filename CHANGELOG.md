@@ -54,6 +54,11 @@ this file is the human-curated summary.
   for the same product issuer, renewal scope, and volume. One machine scope can
   therefore keep one active enrollment for each mounted volume; epoch advances
   still revoke every lower-epoch enrollment in that scope.
+- Hosted cell declarations now carry immutable inclusive project-ID,
+  service-UID, and listener-port ends. Placement admission stops before any
+  lifetime-monotonic allocator crosses its declared range, including after
+  prior volumes are deleted; pre-bound schema-v2 cells accept one constrained
+  declaration that pins only those ends and the new exact digest.
 
 - `.github/workflows/deploy-opensteer-staging.yml` takes the runner image as a
   required `workflow_dispatch` input instead of hardcoding a digest, and refuses
@@ -97,9 +102,11 @@ this file is the human-curated summary.
   other check in the script accepted.
 - `.github/workflows/deploy-opensteer-staging.yml`: a `workflow_dispatch`
   staging deploy mirroring the production workflow against project
-  `opensteer-staging`, zone `us-west1-b`, instance `portablefs-bench-1` as both
-  Manager and cell. Its first step refuses, by name, an `opensteer-staging`
-  GitHub environment whose WIF variables or E2B secret are not provisioned.
+  `opensteer-staging`. Its required, reviewed schema-v1 inventory names the
+  Manager and every cell instance and zone; the release discovers all volumes
+  from the Manager rather than accepting a hand-maintained list. Its first step
+  refuses, by name, an `opensteer-staging` GitHub environment whose WIF
+  variables or E2B secret are not provisioned.
 
 ## [0.3.0] - 2026-08-19
 

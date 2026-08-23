@@ -113,18 +113,23 @@ type State struct {
 }
 
 type Cell struct {
-	ID                 string     `json:"id"`
-	AvailabilityZone   string     `json:"availability_zone"`
-	AuthorityHost      string     `json:"authority_host"`
-	AuthorityDNSZone   string     `json:"authority_dns_zone"`
-	CapacityBytes      uint64     `json:"capacity_bytes"`
-	CapacityInodes     uint64     `json:"capacity_inodes"`
-	Pool               string     `json:"pool"`
-	Decommissioning    bool       `json:"decommissioning,omitempty"`
-	Abandoned          bool       `json:"abandoned,omitempty"`
-	NextProjectID      uint32     `json:"next_project_id"`
-	NextServiceUID     uint32     `json:"next_service_uid"`
-	NextPort           uint16     `json:"next_port"`
+	ID               string `json:"id"`
+	AvailabilityZone string `json:"availability_zone"`
+	AuthorityHost    string `json:"authority_host"`
+	AuthorityDNSZone string `json:"authority_dns_zone"`
+	CapacityBytes    uint64 `json:"capacity_bytes"`
+	CapacityInodes   uint64 `json:"capacity_inodes"`
+	Pool             string `json:"pool"`
+	Decommissioning  bool   `json:"decommissioning,omitempty"`
+	Abandoned        bool   `json:"abandoned,omitempty"`
+	NextProjectID    uint32 `json:"next_project_id"`
+	NextServiceUID   uint32 `json:"next_service_uid"`
+	NextPort         uint16 `json:"next_port"`
+	// Last* values are inclusive immutable lifetime bounds. Next* may equal
+	// Last*+1 only after the final identity has been consumed.
+	LastProjectID      uint32     `json:"last_project_id,omitempty"`
+	LastServiceUID     uint32     `json:"last_service_uid,omitempty"`
+	LastPort           uint16     `json:"last_port,omitempty"`
 	PlanGeneration     uint64     `json:"plan_generation"`
 	PlanReleaseID      string     `json:"plan_release_id,omitempty"`
 	PlanIssuedUnix     int64      `json:"plan_issued_unix"`
@@ -150,6 +155,10 @@ type Cell struct {
 	// Convergent PUT may then return the live Cell without replaying initial
 	// capacity or allocator values over state that has advanced since creation.
 	RegistrationSHA256 string `json:"registration_sha256,omitempty"`
+}
+
+func cellAllocatorBounded(cell Cell) bool {
+	return cell.LastProjectID != 0 && cell.LastServiceUID != 0 && cell.LastPort != 0
 }
 
 type Volume struct {
@@ -351,6 +360,9 @@ type RegisterCellRequest struct {
 	FirstProjectID   uint32 `json:"first_project_id,omitempty"`
 	FirstServiceUID  uint32 `json:"first_service_uid,omitempty"`
 	FirstPort        uint16 `json:"first_port,omitempty"`
+	LastProjectID    uint32 `json:"last_project_id"`
+	LastServiceUID   uint32 `json:"last_service_uid"`
+	LastPort         uint16 `json:"last_port"`
 }
 
 type CreateVolumeRequest struct {
@@ -596,6 +608,7 @@ func (state State) Validate() error {
 	ports := make(map[string]map[uint16]string)
 	var volumeCounts = make(map[string]int)
 	for id, cell := range state.Cells {
+		boundedAllocators := cell.LastProjectID != 0 || cell.LastServiceUID != 0 || cell.LastPort != 0
 		if id != cell.ID || !cellplan.ValidID(id) || !validIdentity(cell.AvailabilityZone) ||
 			net.ParseIP(cell.AuthorityHost) == nil && !validDNSName(cell.AuthorityHost) ||
 			!validDNSName(cell.AuthorityDNSZone) || cell.CapacityBytes == 0 || cell.CapacityInodes == 0 ||
@@ -606,6 +619,12 @@ func (state State) Validate() error {
 			!validOptionalIdentity(cell.LastHelperRelease) || !validOptionalIdentity(cell.QuarantineReason) ||
 			cell.RegistrationSHA256 != "" && !validSHA256Hex(cell.RegistrationSHA256) {
 			return fmt.Errorf("%w: cell %q", ErrInvalid, id)
+		}
+		if boundedAllocators != cellAllocatorBounded(cell) ||
+			cellAllocatorBounded(cell) && cell.RegistrationSHA256 == "" ||
+			cellAllocatorBounded(cell) && (cell.LastProjectID == ^uint32(0) || cell.LastServiceUID == ^uint32(0) || cell.LastPort == ^uint16(0) ||
+				cell.NextProjectID > cell.LastProjectID+1 || cell.NextServiceUID > cell.LastServiceUID+1 || cell.NextPort > cell.LastPort+1) {
+			return fmt.Errorf("%w: cell allocator bounds", ErrInvalid)
 		}
 		if cell.PlanIssuedUnix <= 0 || cell.PlanExpiresUnix <= cell.PlanIssuedUnix {
 			return fmt.Errorf("%w: cell plan lifetime", ErrInvalid)
@@ -768,7 +787,8 @@ func (state State) Validate() error {
 		uids[placement.CellID][placement.ServiceUID] = id
 		ports[placement.CellID][placement.ListenPort] = id
 		volumeCounts[placement.CellID]++
-		if placement.ProjectID >= cell.NextProjectID || placement.ServiceUID >= cell.NextServiceUID || placement.ListenPort >= cell.NextPort {
+		if placement.ProjectID >= cell.NextProjectID || placement.ServiceUID >= cell.NextServiceUID || placement.ListenPort >= cell.NextPort ||
+			cellAllocatorBounded(cell) && (placement.ProjectID > cell.LastProjectID || placement.ServiceUID > cell.LastServiceUID || placement.ListenPort > cell.LastPort) {
 			return fmt.Errorf("%w: allocator reuse boundary", ErrInvalid)
 		}
 	}
@@ -789,11 +809,18 @@ func (state State) Validate() error {
 			return fmt.Errorf("%w: orphaned placement", ErrInvalid)
 		}
 		cell, ok := state.Cells[orphan.CellID]
+		if !ok {
+			return fmt.Errorf("%w: orphaned placement cell", ErrInvalid)
+		}
+		if cellAllocatorBounded(cell) &&
+			(orphan.Placement.ProjectID > cell.LastProjectID || orphan.Placement.ServiceUID > cell.LastServiceUID || orphan.Placement.ListenPort > cell.LastPort) {
+			return fmt.Errorf("%w: orphaned placement allocator boundary", ErrInvalid)
+		}
 		want := "v-" + strings.ReplaceAll(orphan.VolumeID, "-", "") + "." + cell.AuthorityDNSZone
 		if orphan.Placement.Sequence >= 2 {
 			want = fmt.Sprintf("v-%s-p%d.%s", strings.ReplaceAll(orphan.VolumeID, "-", ""), orphan.Placement.Sequence, cell.AuthorityDNSZone)
 		}
-		if !ok || orphan.Placement.AuthorityServerName != want {
+		if orphan.Placement.AuthorityServerName != want {
 			return fmt.Errorf("%w: orphaned placement endpoint", ErrInvalid)
 		}
 	}

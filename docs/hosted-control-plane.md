@@ -387,16 +387,26 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product | `PUT /v1/renewal-fences` | atomically advance a batch of issuer-scoped renewal epoch fences and revoke superseded enrollments |
 
 `PUT /v1/cells/{id}` accepts no `Idempotency-Key`. The path supplies the cell
-identity and the body is normalized exactly as for registration. The first PUT
+identity and the body is normalized exactly as for registration. Every
+registration explicitly declares inclusive first and last project IDs, service
+UIDs, and listener ports. The last values are immutable safety boundaries, not
+capacity hints: admission stops before any next allocator exceeds one, and a
+terminal deletion never moves an allocator backward. The first PUT
 creates the cell; an exact normalized replay returns the live current cell as a
 no-op. It never resets a monotonic capacity raise, allocator progress, health,
 or desired-plan state. Any changed registration declaration returns `409` and
-leaves state untouched. A schema-v2 cell written before declaration digests
-existed accepts one compatible declaration (same identities and pool, with
-capacity and allocator starts no greater than their monotonic live values) and
-persists only its digest; later replays use the exact rule. The two operator
-inventory GETs always return arrays, including when empty, with entries sorted
-by stable ID.
+leaves state untouched. A schema-v2 cell written before allocator bounds
+existed accepts one compatible declaration, whether or not it already carries
+the earlier pre-bound declaration digest (same identities and pool, with
+capacity and allocator starts no greater than their monotonic live values). Its
+current next project ID, UID, and port must each be no greater than the
+declared last value plus the single exhausted sentinel. Thus a legacy cell that
+already consumed the final declared identity can be pinned truthfully as
+exhausted without inventing a larger range. That one transaction installs only
+the three bounds and the exact declaration digest; it does not otherwise
+rewrite live state. Later replays use the exact rule. There is no implicit or
+unbounded allocator range. The two operator inventory GETs always return
+arrays, including when empty, with entries sorted by stable ID.
 
 Refusal classes on create, archive, wake, and delete routes are kept
 distinct because each demands a different client response:
@@ -406,7 +416,7 @@ distinct because each demands a different client response:
 | `503` | the archive store is unreachable right now | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` | retry the unchanged request later |
 | `503` | every eligible cell is at its per-cell archive or restore concurrency cap | `POST /v1/volumes/{id}/archive`, `POST /v1/volumes/{id}/wake` | retry the unchanged request later |
 | `503` | a cell can physically hold the placement, but every such cell lacks a fresh heartbeat or full usage observation | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` | retry the unchanged request after cell reconciliation recovers |
-| `409` | no cell in the pool has capacity for the volume at all | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` | resolve the durable capacity state |
+| `409` | no cell in the pool has physical or allocator-range capacity for the volume | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` | add a bounded cell or resolve the durable capacity state |
 | `501` | this deployment cannot archive at all: the volume's cell advertises no archive configuration, or the Manager runs without the archive component (verifier, purger) the operation needs | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` | surface to an operator; retrying is useless |
 
 Saturation and missing fresh cell evidence are deliberately not `409`: a

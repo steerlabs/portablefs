@@ -34,7 +34,8 @@ func TestArchiveReleaseAndCrossCellWakeLifecycle(t *testing.T) {
 	h.manager.cfg.ArchiveVerifier = verifier
 	first, volume := readyVolumeForMount(t, h)
 	second, err := h.manager.RegisterCell("second-cell", RegisterCellRequest{ID: "33333333-3333-4333-8333-333333333333", AvailabilityZone: "zone-b",
-		AuthorityHost: "cell-b.test", AuthorityDNSZone: "cell-b.test", CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct})
+		AuthorityHost: "cell-b.test", AuthorityDNSZone: "cell-b.test", CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}

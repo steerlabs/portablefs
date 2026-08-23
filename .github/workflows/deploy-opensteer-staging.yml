@@ -9,12 +9,13 @@ name: deploy-opensteer-staging
 on:
   workflow_dispatch:
     inputs:
-      volume_ids:
+      cell_inventory:
         description: >-
-          Comma-separated staging volume IDs to redeploy. Leave empty to use
-          the opensteer-staging environment variable OPENSTEER_VOLUME_IDS.
-        required: false
-        default: ""
+          Exact canonical schema-v1 cell inventory reviewed with the staging
+          infrastructure release. It declares the Manager and every cell host,
+          zone, immutable registration declaration, and optional pinned leaf
+          secret metadata. Mutable environment copies are not accepted.
+        required: true
         type: string
       runner_image:
         description: >-
@@ -39,14 +40,8 @@ jobs:
     timeout-minutes: 45
     environment: opensteer-staging
     env:
-      # The staging cell and the staging Manager are the same host, which the
-      # deploy driver handles: it stages the tarball once and activates both
-      # roles on it.
-      OPENSTEER_CELL_INSTANCE: portablefs-bench-1
+      OPENSTEER_CELL_INVENTORY_JSON: ${{ inputs.cell_inventory }}
       OPENSTEER_GCP_PROJECT: opensteer-staging
-      OPENSTEER_GCP_ZONE: us-west1-b
-      OPENSTEER_MANAGER_INSTANCE: portablefs-bench-1
-      OPENSTEER_VOLUME_IDS: ${{ inputs.volume_ids != '' && inputs.volume_ids || vars.OPENSTEER_VOLUME_IDS }}
       # Deliberately NOT pinned here. The infra pin
       # (releases/staging/opensteer.json in opensteer-infra) is the source of
       # truth, and it lives in a repository this workflow cannot read at
@@ -100,10 +95,8 @@ jobs:
             missing+=("secret E2B_API_KEY is not set on the GitHub environment 'opensteer-staging'. It must be a staging-scoped E2B key: this workflow promotes an E2B template to default, and a production key would repoint production Cloud Computers")
           fi
 
-          if [[ -z ${OPENSTEER_VOLUME_IDS:-} ]]; then
-            missing+=("no staging volumes to deploy. Set environment variable OPENSTEER_VOLUME_IDS on the GitHub environment 'opensteer-staging' to a comma-separated list of volume UUIDs, or pass the volume_ids workflow_dispatch input")
-          elif [[ ! $OPENSTEER_VOLUME_IDS =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(,[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})*$ ]]; then
-            missing+=("OPENSTEER_VOLUME_IDS is not a comma-separated list of volume UUIDs (got '$OPENSTEER_VOLUME_IDS')")
+          if [[ -z ${OPENSTEER_CELL_INVENTORY_JSON:-} ]]; then
+            missing+=("the required cell_inventory workflow input is empty. Paste the exact canonical schema-v1 inventory reviewed with the opensteer-infra staging release")
           fi
 
           if ((${#missing[@]} > 0)); then
@@ -114,8 +107,8 @@ jobs:
           Provision these by hand (this workflow deliberately creates no IAM or
           WIF resources):
             1. GitHub -> Settings -> Environments -> create 'opensteer-staging'.
-            2. Add its variables WIF_PROVIDER, WIF_SERVICE_ACCOUNT,
-               OPENSTEER_VOLUME_IDS and its secret E2B_API_KEY.
+            2. Add its variables WIF_PROVIDER and WIF_SERVICE_ACCOUNT and its
+               secret E2B_API_KEY.
             3. In GCP, grant the WIF_SERVICE_ACCOUNT principal
                roles/iam.workloadIdentityUser for this repository's OIDC subject
                on the pool named by WIF_PROVIDER, and give that service account
@@ -133,12 +126,26 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Set up the OpenSteer Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
+
       - name: Record the dispatched commit
         env:
           DISPATCH_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
           echo "Deploying $DISPATCH_REF at $(git rev-parse HEAD) to opensteer-staging"
+
+      - name: Validate the exact reviewed cell inventory
+        id: inventory
+        run: |
+          set -euo pipefail
+          inventory_file="$RUNNER_TEMP/opensteer-cell-inventory.json"
+          printf '%s\n' "$OPENSTEER_CELL_INVENTORY_JSON" >"$inventory_file"
+          node deploy/opensteer/release-inventory.mjs validate "$inventory_file" >/dev/null
+          echo "file=$inventory_file" >>"$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -203,11 +210,6 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
 
-      - name: Set up the OpenSteer Node runtime
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24.13.0
-
       - name: Install the pinned E2B SDK
         run: |
           set -euo pipefail
@@ -236,6 +238,7 @@ jobs:
           OPENSTEER_E2B_CANDIDATE: ${{ steps.release.outputs.candidate }}
           OPENSTEER_E2B_SDK_ROOT: ${{ runner.temp }}/opensteer-e2b-sdk
           OPENSTEER_EVIDENCE_DIR: ${{ runner.temp }}/opensteer-deployment-evidence
+          OPENSTEER_CELL_INVENTORY_FILE: ${{ steps.inventory.outputs.file }}
           OPENSTEER_RELEASE_DIR: ${{ steps.release.outputs.release_dir }}
         run: deploy/opensteer/deploy-production.sh
 

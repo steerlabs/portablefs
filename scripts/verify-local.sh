@@ -143,6 +143,9 @@ fi
 if [ -f scripts/check-install-release-trust.mjs ]; then
   node scripts/check-install-release-trust.mjs
 fi
+if [ -f deploy/opensteer/release-inventory.test.mjs ]; then
+  node --test deploy/opensteer/release-inventory.test.mjs
+fi
 
 # 7. Stale-architecture scan. v3 is the direct-store system: a Go data plane
 # addressing an XFS-backed authority, with the FSKit frontend on top. The
