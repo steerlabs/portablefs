@@ -3,13 +3,23 @@ package cellagent
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"io"
+	"math/big"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/cellhelper"
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
 	"github.com/steerlabs/portablefs/vcs/internal/controlplane"
 )
@@ -95,6 +105,241 @@ func TestRunOnceVerifiesReconcilesAndReportsExactReleases(t *testing.T) {
 	if !reported.ArchiveConfigured {
 		t.Fatalf("agent dropped the helper archive capability = %+v", reported)
 	}
+}
+
+type convergenceHost struct {
+	mu       sync.Mutex
+	applied  []string
+	observed []string
+}
+
+func (host *convergenceHost) Apply(_ context.Context, plan cellplan.VolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	host.applied = append(host.applied, plan.VolumeID)
+	return controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true}, cellhelper.HostUpdate{}
+}
+
+func (host *convergenceHost) Observe(_ context.Context, plan cellplan.VolumePlan, _ cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+	host.mu.Lock()
+	defer host.mu.Unlock()
+	host.observed = append(host.observed, plan.VolumeID)
+	return controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true}, cellhelper.HostUpdate{}
+}
+
+func (*convergenceHost) ArchiveConfigured() bool { return true }
+
+func TestManagerAgentHelperAppliesCompletePlanAfterSkippingGenerations(t *testing.T) {
+	now := time.Unix(1_900_000_000, 0).UTC()
+	planPublic, planPrivate, _ := ed25519.GenerateKey(rand.Reader)
+	_, capabilityPrivate, _ := ed25519.GenerateKey(rand.Reader)
+	productPublic, _, _ := ed25519.GenerateKey(rand.Reader)
+	ca := agentTestCA(t, now)
+	store, err := controlplane.OpenStore(filepath.Join(t.TempDir(), "manager.state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	manager, err := controlplane.NewManager(controlplane.ManagerConfig{
+		Store: store, PlanPrivateKey: planPrivate, CapabilityPrivateKey: capabilityPrivate,
+		ProductIssuers: map[string]ed25519.PublicKey{"opensteer": productPublic},
+		AuthorityCA:    ca, ClientCA: ca, EnrollmentCA: ca, Now: func() time.Time { return now }, ReleaseID: "manager-r3",
+		PlanLifetime: 10 * time.Minute, GrantLifetime: 10 * time.Minute, EnrollmentLease: 30 * time.Minute,
+		ProductMaxLifetime: 15 * time.Minute, ClientCertLifetime: time.Hour, AuthorityCertLifetime: time.Hour,
+		ObservedStaleAfter: 2 * time.Minute, ClockSkew: time.Second, WakeBurstBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cellID := "11111111-1111-4111-8111-111111111111"
+	cell, err := manager.RegisterCell("generation-skip-cell", controlplane.RegisterCellRequest{
+		ID: cellID, AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 20 << 30, CapacityInodes: 2_000_000, Pool: controlplane.PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	managerObservations, managerHeartbeats := 0, 0
+	managerClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch {
+		case request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/plan"):
+			envelope, planErr := manager.CellPlan(cellID)
+			if planErr != nil {
+				t.Fatal(planErr)
+			}
+			return jsonResponse(t, envelope), nil
+		case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/observations"):
+			managerObservations++
+			var observation controlplane.CellObservation
+			if decodeErr := json.NewDecoder(request.Body).Decode(&observation); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			observed, observeErr := manager.ObserveCell(request.Header.Get("Idempotency-Key"), observation)
+			if observeErr != nil {
+				t.Fatal(observeErr)
+			}
+			return jsonResponse(t, observed), nil
+		case request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/heartbeat"):
+			managerHeartbeats++
+			var heartbeat controlplane.CellHeartbeat
+			if decodeErr := json.NewDecoder(request.Body).Decode(&heartbeat); decodeErr != nil {
+				t.Fatal(decodeErr)
+			}
+			if heartbeatErr := manager.HeartbeatCell(heartbeat); heartbeatErr != nil {
+				t.Fatal(heartbeatErr)
+			}
+			return jsonResponse(t, map[string]string{"status": "ok"}), nil
+		default:
+			t.Fatalf("unexpected Manager request %s %s", request.Method, request.URL.Path)
+			return nil, nil
+		}
+	})}
+	host := &convergenceHost{}
+	helperStatePath := filepath.Join(t.TempDir(), "helper.state")
+	helperFails := false
+	reconciler := &cellhelper.Reconciler{
+		CellID: cellID, PlanPublicKey: planPublic, ClockSkew: time.Second, PlanLifetime: 10 * time.Minute,
+		ReleaseID: "helper-r1", Now: func() time.Time { return now }, StatePath: helperStatePath, Host: host,
+	}
+	helperClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method != http.MethodPost || request.URL.String() != "http://unix/v1/reconcile" {
+			t.Fatalf("unexpected Helper request %s %s", request.Method, request.URL)
+		}
+		if helperFails {
+			return &http.Response{StatusCode: http.StatusInternalServerError, Header: make(http.Header),
+				Body: io.NopCloser(strings.NewReader(`{"error":"reconciliation failed"}`))}, nil
+		}
+		var envelope cellplan.Envelope
+		if decodeErr := json.NewDecoder(request.Body).Decode(&envelope); decodeErr != nil {
+			t.Fatal(decodeErr)
+		}
+		observation, reconcileErr := reconciler.Reconcile(request.Context(), envelope)
+		if reconcileErr != nil {
+			t.Fatal(reconcileErr)
+		}
+		return jsonResponse(t, observation), nil
+	})}
+	agent, err := New(Config{
+		CellID: cellID, ManagerURL: "https://manager.example", PlanPublicKey: planPublic,
+		PlanLifetime: 10 * time.Minute, ClockSkew: time.Second, PollInterval: time.Second, ReleaseID: "agent-r2",
+		ManagerClient: managerClient, HelperClient: helperClient, Now: func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	initialState := readHelperState(t, helperStatePath)
+	if initialState.PlanGeneration != cell.PlanGeneration || len(initialState.Assignments) != 0 {
+		t.Fatalf("initial helper state = %+v", initialState)
+	}
+	for index := range 3 {
+		if _, err := manager.CreateVolume("generation-skip-volume-"+string(rune('a'+index)), controlplane.CreateVolumeRequest{
+			AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+			QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: controlplane.PoolProduct,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latestEnvelope, err := manager.CellPlan(cellID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latestPlan, _, err := cellplan.Verify(planPublic, latestEnvelope, cellID, now, time.Second, 10*time.Minute)
+	if err != nil || latestPlan.Generation != cell.PlanGeneration+3 || len(latestPlan.Volumes) != 3 {
+		t.Fatalf("latest complete Manager plan = %+v, %v", latestPlan, err)
+	}
+	if err := agent.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	convergedState := readHelperState(t, helperStatePath)
+	if convergedState.PlanGeneration != latestPlan.Generation || len(convergedState.Assignments) != 3 || len(host.applied) != 3 {
+		t.Fatalf("generation-skipping reconcile: helper=%+v applies=%v", convergedState, host.applied)
+	}
+	if err := agent.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if managerObservations != 2 || managerHeartbeats != 1 || len(host.observed) != 3 {
+		t.Fatalf("level-triggered calls: observations=%d heartbeats=%d applies=%d observes=%d",
+			managerObservations, managerHeartbeats, len(host.applied), len(host.observed))
+	}
+	failedPlacement, err := manager.CreateVolume("generation-skip-unreconciled", controlplane.CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "unreconciled", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: controlplane.PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperFails = true
+	if err := agent.RunOnce(context.Background()); err == nil {
+		t.Fatal("failed helper reconciliation was reported as successful")
+	}
+	now = now.Add(3 * time.Minute)
+	if _, err := manager.CreateVolume("generation-skip-after-failure", controlplane.CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "after-failure", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: controlplane.PoolProduct,
+	}); !errors.Is(err, controlplane.ErrCellUnavailable) {
+		t.Fatalf("placement after reconciliation liveness aged = %v", err)
+	}
+	volumes, err := manager.ListVolumes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained := false
+	for _, volume := range volumes.Volumes {
+		if volume.ID == failedPlacement.ID {
+			retained = volume.Placement != nil && volume.Placement.PendingBytes == failedPlacement.Placement.PendingBytes &&
+				volume.Placement.PendingInodes == failedPlacement.Placement.PendingInodes && volume.Placement.PendingBytes > 0
+		}
+	}
+	report, reportErr := manager.Capacity()
+	if !retained || reportErr != nil || report.Pools[0].CreateStatus != controlplane.AdmissionCellUnavailable {
+		t.Fatalf("failed reconcile reservation/report: retained=%v report=%+v err=%v", retained, report, reportErr)
+	}
+}
+
+func agentTestCA(t *testing.T, now time.Time) *controlplane.CertificateAuthority {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "agent-test-ca"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(48 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true, IsCA: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, public, private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := controlplane.ParseCertificateAuthority(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ca
+}
+
+func readHelperState(t *testing.T, path string) cellhelper.State {
+	t.Helper()
+	payload, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state cellhelper.State
+	if err := json.Unmarshal(payload, &state); err != nil {
+		t.Fatal(err)
+	}
+	return state
 }
 
 func TestRunOnceRefreshesUnchangedObservationAtPlanInterval(t *testing.T) {

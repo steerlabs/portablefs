@@ -39,10 +39,14 @@ const (
 )
 
 var (
-	ErrInvalid                 = errors.New("controlplane: invalid request")
-	ErrNotFound                = errors.New("controlplane: not found")
-	ErrConflict                = errors.New("controlplane: conflict")
-	ErrCapacity                = errors.New("controlplane: no cell has sufficient capacity")
+	ErrInvalid  = errors.New("controlplane: invalid request")
+	ErrNotFound = errors.New("controlplane: not found")
+	ErrConflict = errors.New("controlplane: conflict")
+	ErrCapacity = errors.New("controlplane: no cell has sufficient capacity")
+	// ErrCellUnavailable is transient and carries no state change: a durable
+	// cell can fit the placement, but its process-liveness or full-usage
+	// evidence is not currently fresh enough for admission.
+	ErrCellUnavailable         = errors.New("controlplane: cells with sufficient capacity are temporarily unavailable")
 	ErrEnrollmentCapacity      = errors.New("controlplane: mount enrollment capacity reached")
 	ErrRenewalFenceCapacity    = errors.New("controlplane: renewal fence capacity reached")
 	ErrIdempotencyReuse        = errors.New("controlplane: idempotency key reused for a different request")
@@ -142,6 +146,10 @@ type Cell struct {
 	// persisted state it decodes false, which refuses that work until the cell
 	// reports otherwise.
 	ArchiveConfigured bool `json:"archive_configured,omitempty"`
+	// RegistrationSHA256 pins the exact normalized registration declaration.
+	// Convergent PUT may then return the live Cell without replaying initial
+	// capacity or allocator values over state that has advanced since creation.
+	RegistrationSHA256 string `json:"registration_sha256,omitempty"`
 }
 
 type Volume struct {
@@ -514,10 +522,32 @@ type PoolCapacity struct {
 	ArchivedVolumes    uint64 `json:"archived_volumes"`
 	CreateAdmissible   bool   `json:"create_admissible"`
 	RestoreAdmissible  bool   `json:"restore_admissible"`
+	// CreateStatus and RestoreStatus preserve the two historical booleans while
+	// distinguishing transient cell unavailability from durable headroom
+	// exhaustion. They are the result of probing the standard provision floor.
+	CreateStatus  AdmissionStatus `json:"create_status"`
+	RestoreStatus AdmissionStatus `json:"restore_status"`
 }
+
+type AdmissionStatus string
+
+const (
+	AdmissionAdmissible      AdmissionStatus = "ADMISSIBLE"
+	AdmissionCellUnavailable AdmissionStatus = "CELL_UNAVAILABLE"
+	AdmissionCapacity        AdmissionStatus = "CAPACITY_EXHAUSTED"
+	AdmissionBusy            AdmissionStatus = "BUSY"
+)
 
 type CapacityReport struct {
 	Pools []PoolCapacity `json:"pools"`
+}
+
+type CellList struct {
+	Cells []Cell `json:"cells"`
+}
+
+type VolumeList struct {
+	Volumes []VolumeView `json:"volumes"`
 }
 
 // ArchiveSummaryView is the product-facing projection of a sealed archive:
@@ -573,7 +603,8 @@ func (state State) Validate() error {
 			!validPool(cell.Pool) ||
 			!validOptionalIdentity(cell.PlanReleaseID) ||
 			!validOptionalIdentity(cell.LastManagerRelease) || !validOptionalIdentity(cell.LastAgentRelease) ||
-			!validOptionalIdentity(cell.LastHelperRelease) || !validOptionalIdentity(cell.QuarantineReason) {
+			!validOptionalIdentity(cell.LastHelperRelease) || !validOptionalIdentity(cell.QuarantineReason) ||
+			cell.RegistrationSHA256 != "" && !validSHA256Hex(cell.RegistrationSHA256) {
 			return fmt.Errorf("%w: cell %q", ErrInvalid, id)
 		}
 		if cell.PlanIssuedUnix <= 0 || cell.PlanExpiresUnix <= cell.PlanIssuedUnix {

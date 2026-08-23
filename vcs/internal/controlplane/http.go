@@ -67,6 +67,21 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			}
 			return handler.Manager.RegisterCell(idempotencyKey(request), body)
 		})
+	case request.Method == http.MethodGet && path == "v1/cells":
+		if principal.Role != RoleOperator {
+			writeAPIError(writer, http.StatusForbidden, "role not permitted")
+			return
+		}
+		result, err := handler.Manager.ListCells()
+		handler.writeResult(writer, result, err)
+	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "cells" && request.Method == http.MethodPut:
+		handler.requireConvergentRole(writer, request, principal, RoleOperator, func() (any, error) {
+			var body RegisterCellRequest
+			if err := decodeJSON(request, &body); err != nil {
+				return nil, err
+			}
+			return handler.Manager.ConvergeCell(parts[2], body)
+		})
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "cells" && parts[3] == "capacity" && request.Method == http.MethodPatch:
 		handler.requireRole(writer, request, principal, RoleOperator, func() (any, error) {
 			var body UpdateCellCapacityRequest
@@ -159,6 +174,13 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			}
 			return handler.Manager.CreateVolume(idempotencyKey(request), body)
 		})
+	case request.Method == http.MethodGet && path == "v1/volumes":
+		if principal.Role != RoleOperator {
+			writeAPIError(writer, http.StatusForbidden, "role not permitted")
+			return
+		}
+		result, err := handler.Manager.ListVolumes()
+		handler.writeResult(writer, result, err)
 	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "volumes" && request.Method == http.MethodGet:
 		if principal.Role != RoleProduct && principal.Role != RoleOperator {
 			writeAPIError(writer, http.StatusForbidden, "role not permitted")
@@ -484,11 +506,11 @@ func (handler *HTTPHandler) writeResult(writer http.ResponseWriter, result any, 
 		status = http.StatusConflict
 	case errors.Is(err, ErrEnrollmentEnded):
 		status = http.StatusGone
-	// Both 503s are "the request was correct, retry it unchanged": the archive
-	// store is down, or every eligible cell is at its archive/restore
-	// concurrency cap. Neither is a client-visible conflict in the durable
-	// state, so neither is 409.
-	case errors.Is(err, ErrArchiveStoreUnavailable), errors.Is(err, ErrBusy):
+	// These 503s are "the request was correct, retry it unchanged": the archive
+	// store is down, every fitting cell lacks fresh availability evidence, or
+	// every eligible cell is at its archive/restore concurrency cap. None is a
+	// client-visible conflict in durable state, so none is 409.
+	case errors.Is(err, ErrArchiveStoreUnavailable), errors.Is(err, ErrCellUnavailable), errors.Is(err, ErrBusy):
 		status = http.StatusServiceUnavailable
 	// 501 is "this deployment cannot do that at all" — a cell without archive
 	// configuration or a Manager without its archive component. Retrying is

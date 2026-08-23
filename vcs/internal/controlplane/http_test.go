@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"testing"
 )
 
@@ -100,8 +101,92 @@ func TestHTTPCapacityAndCellCapacityRaise(t *testing.T) {
 		t.Fatalf("capacity report status=%d body=%s", response.Code, response.Body.String())
 	}
 	var report CapacityReport
-	if err := json.Unmarshal(response.Body.Bytes(), &report); err != nil || len(report.Pools) != 3 || report.Pools[0].CapacityBytes != 3<<30 {
+	if err := json.Unmarshal(response.Body.Bytes(), &report); err != nil || len(report.Pools) != 3 || report.Pools[0].CapacityBytes != 3<<30 ||
+		report.Pools[0].CreateStatus != AdmissionCellUnavailable {
 		t.Fatalf("capacity report = %+v, %v", report, err)
+	}
+}
+
+func TestHTTPConvergentCellRegistrationAndSortedOperatorInventory(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.WakeBurstBytes = 1
+	handler := testHTTPHandler(h.manager)
+	cellIDs := []string{
+		"33333333-3333-4333-8333-333333333333",
+		"11111111-1111-4111-8111-111111111111",
+		"22222222-2222-4222-8222-222222222222",
+	}
+	declaration := func(id string) RegisterCellRequest {
+		return RegisterCellRequest{AvailabilityZone: "zone-a", AuthorityHost: id[:8] + ".cell.test", AuthorityDNSZone: "cell.test",
+			CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct}
+	}
+	for _, id := range cellIDs {
+		response := serveControlRequest(t, handler, http.MethodPut, "/v1/cells/"+id, declaration(id), RoleOperator, "operator", "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("PUT cell %s status=%d body=%s", id, response.Code, response.Body.String())
+		}
+	}
+	sequence := h.store.sequence
+	replay := serveControlRequest(t, handler, http.MethodPut, "/v1/cells/"+cellIDs[0], declaration(cellIDs[0]), RoleOperator, "operator", "")
+	if replay.Code != http.StatusOK || h.store.sequence != sequence {
+		t.Fatalf("exact PUT replay status=%d sequence=%d->%d body=%s", replay.Code, sequence, h.store.sequence, replay.Body.String())
+	}
+	withKey := serveControlRequest(t, handler, http.MethodPut, "/v1/cells/"+cellIDs[0], declaration(cellIDs[0]), RoleOperator, "operator", "must-not-apply")
+	if withKey.Code != http.StatusBadRequest {
+		t.Fatalf("PUT cell with idempotency key status=%d body=%s", withKey.Code, withKey.Body.String())
+	}
+	mismatch := declaration(cellIDs[0])
+	mismatch.AuthorityHost = "different.cell.test"
+	conflict := serveControlRequest(t, handler, http.MethodPut, "/v1/cells/"+cellIDs[0], mismatch, RoleOperator, "operator", "")
+	if conflict.Code != http.StatusConflict || h.store.sequence != sequence {
+		t.Fatalf("mismatched PUT status=%d sequence=%d->%d body=%s", conflict.Code, sequence, h.store.sequence, conflict.Body.String())
+	}
+
+	active := currentState(t, h).Cells[cellIDs[0]]
+	prepareCellForAdmission(t, h, active)
+	for index := range 3 {
+		if _, err := h.manager.CreateVolume("http-list-volume-"+string(rune('a'+index)), CreateVolumeRequest{
+			AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+			QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cellsResponse := serveControlRequest(t, handler, http.MethodGet, "/v1/cells", nil, RoleOperator, "operator", "")
+	if cellsResponse.Code != http.StatusOK {
+		t.Fatalf("GET cells status=%d body=%s", cellsResponse.Code, cellsResponse.Body.String())
+	}
+	var cells CellList
+	if err := json.Unmarshal(cellsResponse.Body.Bytes(), &cells); err != nil {
+		t.Fatal(err)
+	}
+	gotCellIDs := make([]string, 0, len(cells.Cells))
+	for _, cell := range cells.Cells {
+		gotCellIDs = append(gotCellIDs, cell.ID)
+	}
+	if len(gotCellIDs) != 3 || !slices.IsSorted(gotCellIDs) {
+		t.Fatalf("cell inventory order = %v", gotCellIDs)
+	}
+	volumesResponse := serveControlRequest(t, handler, http.MethodGet, "/v1/volumes", nil, RoleOperator, "operator", "")
+	if volumesResponse.Code != http.StatusOK {
+		t.Fatalf("GET volumes status=%d body=%s", volumesResponse.Code, volumesResponse.Body.String())
+	}
+	var volumes VolumeList
+	if err := json.Unmarshal(volumesResponse.Body.Bytes(), &volumes); err != nil {
+		t.Fatal(err)
+	}
+	gotVolumeIDs := make([]string, 0, len(volumes.Volumes))
+	for _, volume := range volumes.Volumes {
+		gotVolumeIDs = append(gotVolumeIDs, volume.ID)
+	}
+	if len(gotVolumeIDs) != 3 || !slices.IsSorted(gotVolumeIDs) {
+		t.Fatalf("volume inventory order = %v", gotVolumeIDs)
+	}
+	for _, path := range []string{"/v1/cells", "/v1/volumes"} {
+		response := serveControlRequest(t, handler, http.MethodGet, path, nil, RoleProduct, "opensteer", "")
+		if response.Code != http.StatusForbidden {
+			t.Fatalf("product GET %s status=%d body=%s", path, response.Code, response.Body.String())
+		}
 	}
 }
 
@@ -364,6 +449,7 @@ func TestHTTPRetryableRefusalsAreDistinctFromCapacityConflicts(t *testing.T) {
 		status int
 	}{
 		{name: "archive store outage", err: ErrArchiveStoreUnavailable, status: http.StatusServiceUnavailable},
+		{name: "fitting cell unavailable", err: ErrCellUnavailable, status: http.StatusServiceUnavailable},
 		{name: "cell concurrency saturated", err: ErrBusy, status: http.StatusServiceUnavailable},
 		{name: "fleet capacity exhausted", err: ErrCapacity, status: http.StatusConflict},
 		{name: "archiving unsupported here", err: ErrArchiveUnsupported, status: http.StatusNotImplemented},

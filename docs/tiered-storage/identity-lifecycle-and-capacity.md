@@ -1,8 +1,8 @@
 # Tiered storage: identity, lifecycle, and capacity contract
 
-Status: **Phase 0 contract, revision 3 — incorporates both adversarial
-reviews (review-phase0-codex.md, review-phase0-codex-r2.md); frozen before
-implementation**
+Status: **Phase 0 contract, revision 4 — incorporates both adversarial
+reviews (review-phase0-codex.md, review-phase0-codex-r2.md) and separates
+cell liveness from desired-plan convergence; frozen before implementation**
 
 ## 0. Trust boundary for host facts
 
@@ -596,12 +596,23 @@ admission. Replaced by measured usage plus bounded in-flight charges.
   serialized-double-admit hole without reintroducing lifetime entitlement
   reservation.
 - **Admission.** A cell is eligible only if: not quarantined, not
-  decommissioning, `cellFresh` (live heartbeat at the current plan
-  generation), and its newest usage observation is younger than the
-  configured `UsageStaleAfter`; otherwise admission fails closed for that
-  cell. Restore admission additionally requires the cell to declare plan
-  version 2 **and** `archive_configured` (§4); create admission requires
-  neither. Then:
+  decommissioning, `cellLive` (a fresh authenticated heartbeat from an
+  applied generation at or behind the Manager's desired generation), and its
+  newest usage observation is younger than the configured `UsageStaleAfter`;
+  otherwise admission fails closed for that cell. An ahead generation is
+  refused as never issued. Desired plan and applied plan are deliberately
+  separate facts: every placement transaction durably reserves its capacity
+  charge and never-reused allocator tuple before publishing a new complete,
+  level-triggered plan. The helper may therefore skip intermediate plan
+  generations and reconcile the newest complete plan without oversubscription
+  or identity reuse. Requiring exact convergence for the next placement would
+  turn the normal poll interval into false fleet exhaustion after every
+  create. The fresh-heartbeat bound and `MaxVolumesPerCell` bound how much
+  unconverged desired work can accumulate if a cell stops applying plans.
+  Mount issue and renewal remain gated by `cellConverged`: a fresh heartbeat
+  at the exact current generation. Restore admission additionally requires the
+  cell to declare plan version 2 **and** `archive_configured` (§4); create
+  admission requires neither. Then:
   `Σ_over_placements charge(p) + incoming + reserve ≤ capacity`, where
   `reserve` is the configured cell reserve fraction and per placement
   `charge(p) = max(measured used, pending, provision floor)` — a
@@ -639,11 +650,14 @@ admission. Replaced by measured usage plus bounded in-flight charges.
     the restore cap, admission returns `ErrBusy` (retry unchanged), not
     `ErrCapacity` (the fleet cannot hold this volume). `WakeVolume`
     propagates whichever it gets, unaltered.
-  - `GET /v1/capacity` keeps its simple probe: `RestoreAdmissible` is
-    "a restore would be admitted right now", so a fleet that is merely
-    saturated reports `false` exactly as an exhausted one does. The report
-    is a per-pool sizing view, not a diagnosis of why a single request would
-    be refused; the caller's error carries that distinction.
+  - `GET /v1/capacity` preserves the `create_admissible` and
+    `restore_admissible` booleans and additively reports stable `create_status`
+    and `restore_status` values: `ADMISSIBLE`, `CELL_UNAVAILABLE`,
+    `CAPACITY_EXHAUSTED`, or `BUSY`. A fitting cell with a stale or absent
+    heartbeat/full usage observation is `CELL_UNAVAILABLE` and placement
+    returns `ErrCellUnavailable` (HTTP 503); a request that cannot physically
+    fit any durably eligible cell is `CAPACITY_EXHAUSTED` and returns
+    `ErrCapacity` (HTTP 409). Pending charges remain in both cases.
 - **Restore priority.** When post-admission headroom would fall below the
   configured wake-burst envelope, creates are refused with `ErrCapacity`
   while restores are still admitted. Fleet policy holds headroom ≥ the
@@ -653,7 +667,12 @@ admission. Replaced by measured usage plus bounded in-flight charges.
   pool. The warm-cache preference for a recently departed volume's
   previous cell is a pure optimization hint, deferred until wake p95
   demands it.
-- **Operations:** cell registration requires the pool label;
+- **Operations:** cell registration requires the pool label.
+  `PUT /v1/cells/{id}` declaratively creates or exactly replays a normalized
+  registration; replay returns current live state without resetting health,
+  desired generation, allocator counters, or monotonic capacity raises, while
+  any registration mismatch conflicts. `GET /v1/cells` and
+  `GET /v1/volumes` are operator-only stable-ID-sorted inventories;
   `PATCH /v1/cells/{id}/capacity` (monotonic raise, for online EBS
   growth); `POST /v1/cells/{id}/decommission`; `GET /v1/capacity` returns
   per-pool capacity, measured use, pending charges, placement and archived
