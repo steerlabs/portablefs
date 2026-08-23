@@ -106,6 +106,24 @@ export async function verifyWorkflowPins(workflowsDir) {
   if (ciWorkflow.includes("actionlint/cmd/actionlint@latest")) {
     failures.push("ci.yml: actionlint must use an exact reviewed version, not @latest");
   }
+  const filesImageWorkflow = await readFile(path.join(root, "files-image.yml"), "utf8");
+  const filesImageBake = await readFile(
+    path.resolve(root, "../../deploy/files/docker-bake.hcl"),
+    "utf8"
+  );
+  if (/type=registry[^\n]*cache/u.test(filesImageBake)) {
+    failures.push(
+      "deploy/files/docker-bake.hcl: release repository must not contain a mutable registry cache"
+    );
+  }
+  for (const cacheContract of [
+    "*.cache-from=type=gha,scope=portablefs-files",
+    "*.cache-to=type=gha,scope=portablefs-files,mode=max",
+  ]) {
+    if (!filesImageWorkflow.includes(cacheContract)) {
+      failures.push(`files-image.yml: missing immutable-registry cache separation ${cacheContract}`);
+    }
+  }
   const privilegedJob = /\n  linux-xfs-fuse:\n([\s\S]*?)(?=\n  [a-zA-Z0-9_-]+:\n|\s*$)/u.exec(
     ciWorkflow
   );
