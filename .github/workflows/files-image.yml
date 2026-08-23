@@ -47,5 +47,8 @@ jobs:
           source: .
           files: deploy/files/docker-bake.hcl
           push: true
+          set: |
+            *.cache-from=type=gha,scope=portablefs-files
+            *.cache-to=type=gha,scope=portablefs-files,mode=max
         env:
           TAG: sha-${{ github.sha }}
