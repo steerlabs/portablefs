@@ -26,7 +26,7 @@ jobs:
       REGISTRY: us-west1-docker.pkg.dev/opensteer-admin/portablefs-releases
     steps:
       - name: Check out the exact main commit
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -52,7 +52,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
 
       - name: Set up the exact Go toolchain
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum

@@ -151,8 +151,8 @@ export async function verifyWorkflowPins(workflowsDir) {
     }
   }
   for (const artifactContract of [
-    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
-    "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5",
+    "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0",
+    "actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0",
     "branches:\n      - main",
     "REGISTRY: us-west1-docker.pkg.dev/opensteer-admin/portablefs-releases",
     "test \"$GITHUB_REPOSITORY_OWNER_ID\" = 252926615",
