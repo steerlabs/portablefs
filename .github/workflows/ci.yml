@@ -198,13 +198,14 @@ jobs:
   # PORTABLEFS_XFS_TEST_REQUIRED=1 turns a missing gate into a test failure, and
   # the script additionally verifies that each required test reported PASS, so a
   # provisioning regression or a deleted test cannot present as a green run.
-  # Runs natively on the runner in about two minutes. The timeout is a
-  # fail-fast bound on a hang, not a budget: the suite's own `go test -timeout`
-  # fires first and prints a full goroutine dump, so a job that reaches this
-  # limit has hung outside the test binary.
+  # Each of the two privilege profiles has its own 35-minute `go test` timeout.
+  # The outer job budget must let either profile emit its native timeout and
+  # goroutine dump, while still covering image pull, package installation, XFS
+  # provisioning, and teardown. A shorter Actions timeout would cancel the
+  # only useful diagnostic and turn ordinary runner variance into a false red.
   linux-xfs-fuse:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 80
     steps:
       - uses: actions/checkout@v4
         with:
