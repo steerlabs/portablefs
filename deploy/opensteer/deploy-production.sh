@@ -4,16 +4,8 @@ set -euo pipefail
 declare -A host_instances=() host_zones=() host_roles=() prepared_hosts=()
 declare -A cell_instances=() cell_zones=()
 
-release_lock_check() {
-  if [[ -n ${OPENSTEER_RELEASE_LOCK_LOST_FILE:-} && -f $OPENSTEER_RELEASE_LOCK_LOST_FILE ]]; then
-    echo "global staging release lock was lost; refusing the next live mutation" >&2
-    return 75
-  fi
-}
-
 ssh_run() {
   local zone=$1 instance=$2 command=$3
-  release_lock_check
   gcloud compute ssh "$instance" \
     --project "$gcp_project" --zone "$zone" --tunnel-through-iap --quiet \
     --command="$command"
@@ -22,7 +14,6 @@ ssh_run() {
 copy_to() {
   local zone=$1 instance=$2
   local command="set -euo pipefail; tar -xzf - -C \"\$HOME/$remote_stage\""
-  release_lock_check
   gcloud compute ssh "$instance" \
     --project "$gcp_project" --zone "$zone" --tunnel-through-iap --quiet \
     --command="$command" <"$transfer_archive"
@@ -68,7 +59,6 @@ sorted_lines() {
 
 manager_call() {
   local command
-  release_lock_check
   command=$(append_remote_arguments "sudo \"\$HOME/$remote_stage/manager-api.sh\"" "$@")
   ssh_run "$manager_zone" "$manager_instance" "$command"
 }
@@ -81,7 +71,6 @@ cell_call() {
     echo "no declared host for cell $cell_id" >&2
     return 65
   }
-  release_lock_check
   command=$(append_remote_arguments "sudo \"\$HOME/$remote_stage/cell-authority-state.sh\"" "$@")
   ssh_run "${cell_zones[$cell_id]}" "${cell_instances[$cell_id]}" "$command"
 }
@@ -90,10 +79,6 @@ cleanup_remote() {
   local host_key command
   command="rm -rf -- \"\$HOME/$remote_stage\""
   for host_key in "${!prepared_hosts[@]}"; do
-    if ! release_lock_check; then
-      echo "Leaving staged remote release files because the global release fence was lost" >&2
-      return
-    fi
     ssh_run "${host_zones[$host_key]}" "${host_instances[$host_key]}" "$command" >/dev/null 2>&1 || true
   done
 }
@@ -104,7 +89,6 @@ cleanup() {
 }
 
 e2b_release() {
-  release_lock_check
   node "$root/deploy/opensteer/e2b-release.mjs" "$@"
 }
 
@@ -137,15 +121,10 @@ main() {
     exit 64
   }
   [[ $gcp_project =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || exit 64
-  if [[ $gcp_project == opensteer-staging ]]; then
-    [[ ${OPENSTEER_RELEASE_LOCK_STATE_FILE:-} == /* && -f $OPENSTEER_RELEASE_LOCK_STATE_FILE &&
-      ${OPENSTEER_RELEASE_LOCK_LOST_FILE:-} == /* ]] || {
-      echo "opensteer-staging requires the global release-lock transaction wrapper" >&2
-      exit 64
-    }
-    python3 "$root/deploy/opensteer/staging-release-lock.py" assert-owned \
-      --state-file "$OPENSTEER_RELEASE_LOCK_STATE_FILE"
-  fi
+  [[ $gcp_project != opensteer-staging ]] || {
+    echo "PortableFS does not activate staging; opensteer-infra Cloud Build is its sole release authority" >&2
+    exit 64
+  }
   node "$root/deploy/opensteer/release-inventory.mjs" validate "$inventory_file" >/dev/null
 
   release_id=$(<"$release_dir/release-id")

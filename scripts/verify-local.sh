@@ -146,8 +146,8 @@ fi
 if [ -f deploy/opensteer/release-inventory.test.mjs ]; then
   node --test deploy/opensteer/release-inventory.test.mjs
 fi
-if [ -f deploy/opensteer/test_staging_release_lock.py ]; then
-  python3 deploy/opensteer/test_staging_release_lock.py
+if [ -f deploy/files/test_release_registry.py ]; then
+  python3 deploy/files/test_release_registry.py
 fi
 
 # 7. Stale-architecture scan. v3 is the direct-store system: a Go data plane

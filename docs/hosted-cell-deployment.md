@@ -52,6 +52,13 @@ beneath:
 /opt/portablefs/current -> /opt/portablefs/releases/<release-id>
 ```
 
+OpenSteer staging does not rebuild or fetch this directory from a branch.
+PortableFS `main` publishes it inside the immutable, digest-addressed
+`portablefs-release:sha-<source>` capsule after `portablefs-files` is complete.
+`opensteer-infra` deeply verifies and extracts that exact capsule inside its
+single staging release transaction. PortableFS has no staging activation
+workflow of its own.
+
 `deploy/gcp/activate-hosted-release.sh` verifies every member and binary release
 identity before stopping a control process, installs the release under its
 immutable name, swaps the one `current` symlink, reloads systemd, and verifies

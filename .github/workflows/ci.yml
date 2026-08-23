@@ -44,6 +44,12 @@ jobs:
           set -euo pipefail
           sh -n scripts/install.sh
           node scripts/check-install-release-trust.mjs
+      - name: Verify the artifact-only staging publication boundary
+        run: |
+          set -euo pipefail
+          bash -n deploy/files/verify-registry-image.sh deploy/opensteer/deploy-production.sh
+          python3 deploy/files/test_release_registry.py
+          node --test deploy/opensteer/release-inventory.test.mjs
 
   # The Swift suite covers the FSKit adapter, installer core, service updater,
   # and macOS 26/27 coherence boundaries. Xcode first enumerates the package

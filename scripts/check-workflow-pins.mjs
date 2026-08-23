@@ -98,6 +98,9 @@ export async function verifyWorkflowPins(workflowsDir) {
     'GOBIN="$RUNNER_TEMP/actionlint-bin"',
     "go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.10",
     '"$RUNNER_TEMP/actionlint-bin/actionlint" .github/workflows/*.yml',
+    "Verify the artifact-only staging publication boundary",
+    "python3 deploy/files/test_release_registry.py",
+    "node --test deploy/opensteer/release-inventory.test.mjs",
   ]) {
     if (!ciWorkflow.includes(semanticGate)) {
       failures.push(`ci.yml: missing frozen workflow semantic gate ${semanticGate}`);
@@ -111,9 +114,32 @@ export async function verifyWorkflowPins(workflowsDir) {
     path.resolve(root, "../../deploy/files/docker-bake.hcl"),
     "utf8"
   );
+  const releaseContainerfile = await readFile(
+    path.resolve(root, "../../deploy/files/ReleaseContainerfile"),
+    "utf8"
+  );
+  const registryVerifier = await readFile(
+    path.resolve(root, "../../deploy/files/verify-registry-image.sh"),
+    "utf8"
+  );
+  if (entries.includes("deploy-opensteer-staging.yml")) {
+    failures.push(
+      "deploy-opensteer-staging.yml: PortableFS may publish staging artifacts but opensteer-infra Cloud Build is the sole staging activation authority"
+    );
+  }
   if (/type=registry[^\n]*cache/u.test(filesImageBake)) {
     failures.push(
       "deploy/files/docker-bake.hcl: release repository must not contain a mutable registry cache"
+    );
+  }
+  if (
+    !filesImageBake.includes(
+      'default = "us-west1-docker.pkg.dev/opensteer-admin/portablefs-releases"'
+    ) ||
+    filesImageBake.includes('default = "us-west1-docker.pkg.dev/opensteer-admin/staging"')
+  ) {
+    failures.push(
+      "deploy/files/docker-bake.hcl: images must target the dedicated PortableFS release repository"
     );
   }
   for (const cacheContract of [
@@ -123,6 +149,99 @@ export async function verifyWorkflowPins(workflowsDir) {
     if (!filesImageWorkflow.includes(cacheContract)) {
       failures.push(`files-image.yml: missing immutable-registry cache separation ${cacheContract}`);
     }
+  }
+  for (const artifactContract of [
+    "actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
+    "actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5",
+    "branches:\n      - main",
+    "REGISTRY: us-west1-docker.pkg.dev/opensteer-admin/portablefs-releases",
+    "test \"$GITHUB_REPOSITORY_OWNER_ID\" = 252926615",
+    "test \"$GITHUB_REPOSITORY_ID\" = 1313214092",
+    "test \"$GITHUB_WORKFLOW_REF\" = steerlabs/portablefs/.github/workflows/files-image.yml@refs/heads/main",
+    "github/providers/github-portablefs-publisher",
+    "gha-portablefs-publisher@opensteer-admin.iam.gserviceaccount.com",
+    "BUILDX_NO_DEFAULT_ATTESTATIONS: \"1\"",
+    "create_credentials_file: false",
+    "go install github.com/google/go-containerregistry/cmd/crane@v0.20.3",
+    'timeout --kill-after=5s 60s crane digest "$tag"',
+    'timeout --kill-after=30s 600s crane push "$layout" "$tag"',
+    'grep -Fq \'MANIFEST_UNKNOWN\' "$digest_error"',
+    "deploy/files/verify-registry-image.sh files",
+    'release "$tag" "$SOURCE_REVISION" "$FILES_IMAGE"',
+    "portablefs-files:sha-$SOURCE_REVISION",
+    "portablefs-release:sha-$SOURCE_REVISION",
+    "python3 deploy/files/release_registry.py assemble",
+  ]) {
+    if (!filesImageWorkflow.includes(artifactContract)) {
+      failures.push(`files-image.yml: missing immutable artifact contract ${artifactContract}`);
+    }
+  }
+  for (const sharedWriter of [
+    "opensteer-admin/staging/portablefs-files",
+    "opensteer-admin/staging/portablefs-release",
+    "github/providers/github-image-publisher",
+    "gha-deployer@opensteer-admin.iam.gserviceaccount.com",
+  ]) {
+    if (filesImageWorkflow.includes(sharedWriter)) {
+      failures.push(`files-image.yml: publisher still trusts shared writer ${sharedWriter}`);
+    }
+  }
+  if (/workflow_dispatch:|\n\s+paths:/u.test(filesImageWorkflow)) {
+    failures.push("files-image.yml: artifact publication must run on every main push only");
+  }
+  if (/NAME_UNKNOWN|not found/u.test(filesImageWorkflow)) {
+    failures.push(
+      "files-image.yml: only MANIFEST_UNKNOWN may authorize creation of an absent immutable tag"
+    );
+  }
+  if (!registryVerifier.includes('arguments+=(--source-root "$root")')) {
+    failures.push(
+      "verify-registry-image.sh: publisher must compare every embedded deployment helper with the exact source checkout"
+    );
+  }
+  for (const registryContract of [
+    'record_files_image=$(timeout --kill-after=2s 10s python3 -c',
+    'files_tag="$registry/portablefs-files:sha-$source_revision"',
+    '"$root/deploy/files/verify-registry-image.sh"',
+    '[[ $verified_files_digest == "$record_files_digest" ]]',
+  ]) {
+    if (!registryVerifier.includes(registryContract)) {
+      failures.push(
+        `verify-registry-image.sh: missing capsule-selected component verification ${registryContract}`
+      );
+    }
+  }
+  for (const forbiddenLiveSurface of [
+    "E2B_API_KEY",
+    "gcloud compute",
+    "deploy-production.sh",
+    "deploy-staging",
+    "e2b-release.mjs",
+    "staging-release-lock",
+  ]) {
+    if (filesImageWorkflow.includes(forbiddenLiveSurface)) {
+      failures.push(
+        `files-image.yml: artifact-only publisher contains live staging surface ${forbiddenLiveSurface}`
+      );
+    }
+  }
+  const filesPosition = filesImageWorkflow.indexOf("id: files");
+  const releasePosition = filesImageWorkflow.indexOf("id: release");
+  if (filesPosition < 0 || releasePosition <= filesPosition) {
+    failures.push("files-image.yml: aggregate release must publish after portablefs-files");
+  }
+  const releaseInstructions = releaseContainerfile
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  if (
+    releaseInstructions[0] !== "FROM scratch" ||
+    releaseInstructions.filter((line) => /^COPY\b/u.test(line)).length !== 1 ||
+    releaseInstructions.some((line) => /^(?:ADD|CMD|ENTRYPOINT|ENV|RUN|USER|WORKDIR)\b/u.test(line))
+  ) {
+    failures.push(
+      "deploy/files/ReleaseContainerfile: release capsule must be a non-executable one-COPY scratch artifact"
+    );
   }
   const privilegedJob = /\n  linux-xfs-fuse:\n([\s\S]*?)(?=\n  [a-zA-Z0-9_-]+:\n|\s*$)/u.exec(
     ciWorkflow
