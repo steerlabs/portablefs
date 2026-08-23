@@ -27,18 +27,29 @@ one serialized deployment:
    image, then start a disposable candidate sandbox and run the template smoke.
    See [What the smoke proves](#what-the-smoke-proves) — it is a narrow gate,
    not a qualification.
-4. Stream one gzip-compressed release archive through each private IAP tunnel,
-   then activate it on the Manager and cell control processes. This does not
-   restart a live Authority.
-5. Preflight every configured volume, drain OpenSteer E2B sandboxes once, and
-   request each required Manager restart transaction. A co-located Manager and
-   cell are activated as two explicit roles; sharing a VM does not skip either
-   unit set.
-6. Drain once more, prove each old Authority service, listener, and cgroup is
+4. Validate one canonical schema-v1 inventory, then stream and remotely verify
+   the release on the Manager and every declared cell host before changing any
+   host. SSH routing uses each host's own instance and zone. A co-located
+   Manager and cell is one explicit `manager-cell` activation; sharing a VM
+   does not skip either unit set.
+5. Activate the Manager, converge every exact cell declaration, and compare the
+   complete operator cell inventory with the reviewed declaration. Any unknown
+   live cell, duplicate, declaration conflict, or missing cell stops the
+   release.
+6. Activate every remaining cell control host, prove the concrete agent and
+   helper for every declared cell execute the exact release, and wait until the
+   Manager has accepted that cell's healthy exact-release observation. Then
+   discover the complete volume set from operator `GET /v1/volumes` and map
+   every placement to its declared cell host. There is no hand-maintained
+   volume list. Unknown placements, duplicate volumes, and impossible unplaced
+   live volumes stop the release.
+7. Drain OpenSteer E2B sandboxes, request each required Manager restart, then
+   drain once more, prove each old Authority service, listener, and cgroup is
    absent, and submit that evidence SHA-256 to every fencing volume. The
    Manager advances each Authority generation; the cell starts every new
    Authority from the same immutable release.
-7. Verify every new generation and executable release, atomically move E2B's
+8. Verify every new generation and executable release, re-read the full volume
+   inventory and capacity report, then atomically move E2B's
    `default` tag to the tested candidate, and drain once more. That final pass
    removes a sandbox that might have been created with the old default tag
    during the maintenance window.
@@ -51,6 +62,96 @@ is live, a problem is fixed by promoting another commit. The host activator does
 restore the prior symlink if an individual atomic activation fails before it
 finishes; that is transaction failure handling, not an operator rollback of a
 completed deployment.
+
+## Staging shares one global release transaction
+
+The `deploy-opensteer-staging` workflow and OpenSteer's staging Cloud Build
+both mutate the same Manager/cells, E2B default template, and serving system.
+GitHub's `concurrency` block serializes only this repository, so the staging
+workflow additionally contends on the exact generation-fenced object
+`gs://opensteer-tfstate/release-locks/opensteer-staging`.
+
+Candidate bundle construction and candidate E2B smoke remain outside the live
+transaction. Immediately before `deploy-production.sh` stages anything on a
+control host, `deploy-staging-locked.sh` acquires the shared object. It holds
+the lock through host activation, cell convergence, every Authority fence and
+restart, E2B default promotion, the final drain, and release evidence. A
+heartbeat advances the GCS generation by compare-and-swap. Losing that
+generation stops the next live mutation; a failed deployment leaves the object
+owned until GitHub reports that exact run attempt terminal. Successful release
+stops the heartbeat and deletes only the exact final generation.
+
+`deploy/opensteer/staging-release-lock.py`, its JSON decision vectors, and its
+unit test are deliberately byte-identical to their counterparts in
+`steerlabs/opensteer-infra`. Change the schema or decision matrix in both
+repositories in one reviewed rollout. Unknown owner kinds, malformed metadata,
+unknown platform status, and unavailable status APIs all fail closed. A
+terminal owner can be superseded early; elapsed time alone cannot fence an
+owner that its platform still reports active.
+
+Before this workflow version may merge, the preceding OpenSteer admin
+Terraform change must already be applied. That change grants
+`portablefs-deployer@opensteer-staging.iam.gserviceaccount.com` only four object
+permissions on the one exact lock object and only `cloudbuild.builds.get` for
+authoritative Cloud Build owner status. It grants no object listing and no
+Terraform-state prefix access. Deploying either writer before that ordered
+prerequisite is an incomplete release and must fail closed.
+
+## Reviewed cell inventory
+
+The release coordinator accepts one file through
+`OPENSTEER_CELL_INVENTORY_FILE`. The file is canonical compact JSON with a
+trailing newline, `schema_version: 1`, one exact Manager host, and a non-empty
+cell array sorted by cell ID. Objects accept no unknown keys. Staging supplies
+this value directly as the required `cell_inventory` workflow-dispatch input;
+it never falls back to a mutable GitHub environment copy. Generate the exact
+review value with:
+
+```bash
+jq -cS . reviewed-cells.json
+```
+
+The semantic shape is:
+
+```json
+{
+  "schema_version": 1,
+  "manager": {"instance": "portablefs-bench-1", "zone": "us-west1-b"},
+  "cells": [{
+    "id": "<stable-cell-uuid>",
+    "instance": "portablefs-bench-1",
+    "zone": "us-west1-b",
+    "declaration": {
+      "availability_zone": "us-west1-b",
+      "authority_host": "<cell-authority-host>",
+      "authority_dns_zone": "<cell-authority-dns-zone>",
+      "capacity_bytes": 53687091200,
+      "capacity_inodes": 2000000,
+      "pool": "product",
+      "first_project_id": 10000,
+      "last_project_id": 10255,
+      "first_service_uid": 210000,
+      "last_service_uid": 210255,
+      "first_port": 23000,
+      "last_port": 23255
+    },
+    "leaf_secret": {
+      "version_resource": "projects/<project>/secrets/<name>/versions/<number>",
+      "sha256": "<64 lowercase hex>"
+    }
+  }]
+}
+```
+
+`leaf_secret` is optional pinned metadata; the coordinator never reads secret
+material. The existing staging cell's intended inclusive allocator ranges are
+`10000..10255`, `210000..210255`, and `23000..23255`. The second cell uses
+`11000..11255`, `211000..211255`, and `24000..24255`. These ranges are
+non-overlapping and their port ends match the firewall. They are lifetime
+ranges: deleting a volume does not release an ID or port, and changing an end
+conflicts with the cell's exact registration digest. Cells placed on the same
+VM must have disjoint project-ID, service-UID, and listener-port ranges; schema
+validation rejects any overlap on a shared host.
 
 ## What the smoke proves
 
@@ -110,7 +211,9 @@ not guess at or automatically manufacture data conversions.
 ## One-time setup
 
 Create a GitHub environment named `opensteer-production`. Allow deployments
-from `main` and add one secret, `E2B_API_KEY`. A `workflow_run` deployment uses
+from `main`, add one secret, `E2B_API_KEY`, and set
+`OPENSTEER_CELL_INVENTORY_JSON` to the exact canonical production inventory.
+A `workflow_run` deployment uses
 the workflow file from GitHub's default branch, so GitHub evaluates the
 environment against `main`; the job itself separately requires an exact
 successful `opensteer-production` push from this repository. Do not store a
@@ -192,7 +295,8 @@ deployment.
 
 ## Fixed inputs
 
-The workflow pins the OpenSteer Runner by image digest. That image contains all
+The workflow pins the OpenSteer Runner by image digest and validates the exact
+cell inventory before authentication or deployment. That image contains all
 OpenSteer-owned activation and Runner code; this repository adds only the exact
 PortableFS client built by the promoted commit. When OpenSteer publishes a new
 production Runner, update the one digest in a reviewed PortableFS pull request.

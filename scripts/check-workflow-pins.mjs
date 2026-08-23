@@ -106,6 +106,33 @@ export async function verifyWorkflowPins(workflowsDir) {
   if (ciWorkflow.includes("actionlint/cmd/actionlint@latest")) {
     failures.push("ci.yml: actionlint must use an exact reviewed version, not @latest");
   }
+  const privilegedJob = /\n  linux-xfs-fuse:\n([\s\S]*?)(?=\n  [a-zA-Z0-9_-]+:\n|\s*$)/u.exec(
+    ciWorkflow
+  );
+  const privilegedJobTimeout = privilegedJob
+    ? /timeout-minutes:\s*(\d+)/u.exec(privilegedJob[1])
+    : null;
+  const privilegedSuite = await readFile(
+    path.resolve(root, "../../scripts/xfs-fuse-integration.sh"),
+    "utf8"
+  );
+  const privilegedProfileTimeout = /-timeout\s+(\d+)m/u.exec(privilegedSuite);
+  if (!privilegedJobTimeout || !privilegedProfileTimeout) {
+    failures.push(
+      "ci.yml: privileged XFS/FUSE job and native go-test timeout must remain explicit"
+    );
+  } else {
+    // The plain and capability-limited profiles run sequentially. Preserve
+    // enough outer budget for both native timeout diagnostics plus bounded
+    // image pull, package installation, filesystem provisioning, and teardown.
+    const requiredMinutes = Number(privilegedProfileTimeout[1]) * 2 + 10;
+    if (Number(privilegedJobTimeout[1]) < requiredMinutes) {
+      failures.push(
+        `ci.yml: linux-xfs-fuse timeout must be at least ${requiredMinutes} minutes ` +
+          `for two ${privilegedProfileTimeout[1]}-minute native profiles`
+      );
+    }
+  }
   if (failures.length > 0) {
     throw new Error(`workflow pin policy failed:\n- ${failures.join("\n- ")}`);
   }

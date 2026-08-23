@@ -155,6 +155,7 @@ func TestManagerAgentHelperAppliesCompletePlanAfterSkippingGenerations(t *testin
 	cell, err := manager.RegisterCell("generation-skip-cell", controlplane.RegisterCellRequest{
 		ID: cellID, AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
 		CapacityBytes: 20 << 30, CapacityInodes: 2_000_000, Pool: controlplane.PoolProduct,
+		LastProjectID: 19_999, LastServiceUID: 209_999, LastPort: 29_999,
 	})
 	if err != nil {
 		t.Fatal(err)

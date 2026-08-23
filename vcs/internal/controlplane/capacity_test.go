@@ -1,8 +1,10 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -25,13 +27,180 @@ func TestAdmissionStatusPreservesStableRefusalClasses(t *testing.T) {
 	}
 }
 
+func TestAllocatorLifetimeExhaustionSurvivesVolumeDeletionAndIsCapacity(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.WakeBurstBytes = 1
+	cell, err := h.manager.RegisterCell("one-lifetime-placement", RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+		FirstProjectID: 12_000, FirstServiceUID: 212_000, FirstPort: 32_000,
+		LastProjectID: 12_000, LastServiceUID: 212_000, LastPort: 32_000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareCellForAdmission(t, h, cell)
+	volume, err := h.manager.CreateVolume("lifetime-first", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, csr := testCSR(t)
+	observeTieredVolume(t, h, cell.ID, "lifetime-csr", VolumeObservation{
+		VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch,
+		ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID,
+		ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+		Provisioned: true, AuthorityCSRPEM: csr,
+	})
+	volume, _ = h.manager.GetVolume(volume.ID)
+	observeTieredVolume(t, h, cell.ID, "lifetime-running", VolumeObservation{
+		VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch,
+		ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID,
+		ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+		Provisioned: true, AuthorityRunning: true,
+	})
+	volume, _ = h.manager.GetVolume(volume.ID)
+	destroying, err := h.manager.DestroyVolume("lifetime-delete", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "deleted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observeTieredVolume(t, h, cell.ID, "lifetime-quiesced", VolumeObservation{
+		VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
+		ProjectID: destroying.Placement.ProjectID, ServiceUID: destroying.Placement.ServiceUID,
+		ServiceGID: destroying.Placement.ServiceGID, ListenPort: destroying.Placement.ListenPort,
+		AuthorityAbsent: true, QuiesceProven: true,
+	})
+	destroying, _ = h.manager.GetVolume(volume.ID)
+	observeTieredVolume(t, h, cell.ID, "lifetime-destroyed", VolumeObservation{
+		VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
+		ProjectID: destroying.Placement.ProjectID, ServiceUID: destroying.Placement.ServiceUID,
+		ServiceGID: destroying.Placement.ServiceGID, ListenPort: destroying.Placement.ListenPort,
+		AuthorityAbsent: true, DestroyProofSHA256: strings.Repeat("a", 64),
+	})
+	destroying, _ = h.manager.GetVolume(volume.ID)
+	observeTieredVolume(t, h, cell.ID, "lifetime-released", VolumeObservation{
+		VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
+		ProjectID: destroying.Placement.ProjectID, ServiceUID: destroying.Placement.ServiceUID,
+		ServiceGID: destroying.Placement.ServiceGID, ListenPort: destroying.Placement.ListenPort,
+		AuthorityAbsent: true, Released: true,
+	})
+	if terminal, _ := h.manager.GetVolume(volume.ID); terminal.State != VolumeDestroyed || terminal.Placement != nil {
+		t.Fatalf("terminal deletion = %+v", terminal)
+	}
+	if _, err := h.manager.CreateVolume("lifetime-second", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "other", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("allocation after deleted lifetime range = %v", err)
+	}
+	createResponse := serveControlRequest(t, testHTTPHandler(h.manager), "POST", "/v1/volumes", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "http-other", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}, RoleProduct, "opensteer", "lifetime-http-create")
+	if createResponse.Code != 409 || !strings.Contains(createResponse.Body.String(), ErrCapacity.Error()) {
+		t.Fatalf("allocator exhaustion HTTP classification status=%d body=%s", createResponse.Code, createResponse.Body.String())
+	}
+
+	response := serveControlRequest(t, testHTTPHandler(h.manager), "GET", "/v1/capacity", nil, RoleProduct, "opensteer", "")
+	if response.Code != 200 {
+		t.Fatalf("capacity HTTP status=%d body=%s", response.Code, response.Body.String())
+	}
+	var report CapacityReport
+	if err := json.Unmarshal(response.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Pools[0].CreateAdmissible || report.Pools[0].CreateStatus != AdmissionCapacity {
+		t.Fatalf("exhausted allocator capacity report = %+v", report.Pools[0])
+	}
+}
+
+func TestPreBoundAdoptionPreservesExhaustedCursorAndReportsCapacity(t *testing.T) {
+	h := newManagerHarness(t)
+	declaration := RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+		FirstProjectID: 12_000, FirstServiceUID: 212_000, FirstPort: 32_000,
+		LastProjectID: 12_000, LastServiceUID: 212_000, LastPort: 32_000,
+	}
+	cell, err := h.manager.RegisterCell("exhausted-pre-bound-cell", declaration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareCellForAdmission(t, h, cell)
+	if _, err := h.manager.CreateVolume("exhausted-pre-bound-first", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.TransactNatural("test-exhausted-pre-bound-registration", h.now.Unix(), func(state *State) (any, bool, error) {
+		current := state.Cells[cell.ID]
+		current.RegistrationSHA256 = strings.Repeat("b", 64)
+		current.LastProjectID = 0
+		current.LastServiceUID = 0
+		current.LastPort = 0
+		state.Cells[cell.ID] = current
+		return current, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := currentState(t, h).Cells[cell.ID]
+	if before.NextProjectID != declaration.LastProjectID+1 ||
+		before.NextServiceUID != declaration.LastServiceUID+1 ||
+		before.NextPort != declaration.LastPort+1 {
+		t.Fatalf("fixture allocator cursors are not exhausted: %+v", before)
+	}
+	sequence := h.store.sequence
+	pinned, err := h.manager.ConvergeCell(cell.ID, declaration)
+	if err != nil {
+		t.Fatalf("fully exhausted pre-bound adoption = %v", err)
+	}
+	want := before
+	want.LastProjectID = declaration.LastProjectID
+	want.LastServiceUID = declaration.LastServiceUID
+	want.LastPort = declaration.LastPort
+	want.RegistrationSHA256 = pinned.RegistrationSHA256
+	if !reflect.DeepEqual(pinned, want) || h.store.sequence != sequence+1 {
+		t.Fatalf("exhausted adoption changed live state or append count: got=%+v want=%+v sequence=%d->%d", pinned, want, sequence, h.store.sequence)
+	}
+	if _, err := h.manager.CreateVolume("exhausted-pre-bound-second", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "other", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("allocation after exhausted pre-bound adoption = %v", err)
+	}
+
+	response := serveControlRequest(t, testHTTPHandler(h.manager), "GET", "/v1/capacity", nil, RoleProduct, "opensteer", "")
+	if response.Code != 200 {
+		t.Fatalf("capacity HTTP status=%d body=%s", response.Code, response.Body.String())
+	}
+	var report CapacityReport
+	if err := json.Unmarshal(response.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	for _, pool := range report.Pools {
+		if pool.Pool == PoolProduct {
+			if pool.CreateAdmissible || pool.CreateStatus != AdmissionCapacity {
+				t.Fatalf("exhausted adopted allocator capacity report = %+v", pool)
+			}
+			return
+		}
+	}
+	t.Fatalf("product pool missing from capacity report: %+v", report)
+}
+
 func TestPlacementAdmissionUsesPendingChargesAndStaleUsageFailsClosed(t *testing.T) {
 	h := newManagerHarness(t)
 	h.manager.cfg.ProvisionFloorBytes = 700 << 20
 	h.manager.cfg.ProvisionFloorInodes = 1000
 	h.manager.cfg.WakeBurstBytes = 1
 	cell, err := h.manager.RegisterCell("capacity-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 1500 << 20, CapacityInodes: 100_000, Pool: PoolProduct})
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 1500 << 20, CapacityInodes: 100_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,6 +240,7 @@ func TestConcurrentCreatesSerializeAllocatorReservationsAndSurviveReopen(t *test
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 100 << 30,
 		CapacityInodes: 10_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -181,6 +351,7 @@ func TestFailedReconciliationAgesAvailabilityWithoutReleasingReservations(t *tes
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 10 << 30,
 		CapacityInodes: 1_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -225,6 +396,7 @@ func TestFreshHeartbeatCannotSubstituteForStaleFullUsage(t *testing.T) {
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 10 << 30,
 		CapacityInodes: 1_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -257,7 +429,8 @@ func TestStalePerPlacementUsageIsChargedAtQuota(t *testing.T) {
 	h.manager.cfg.WakeBurstBytes = 1
 	cell, err := h.manager.RegisterCell("stale-placement-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111",
 		AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
-		CapacityBytes: 3 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+		CapacityBytes: 3 << 30, CapacityInodes: 100_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +471,8 @@ func TestPeriodicUnchangedObservationsKeepIdleCellAdmissible(t *testing.T) {
 	h.manager.cfg.WakeBurstBytes = 1
 	cell, err := h.manager.RegisterCell("idle-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111",
 		AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
-		CapacityBytes: 40 << 30, CapacityInodes: 2_000_000, Pool: PoolProduct})
+		CapacityBytes: 40 << 30, CapacityInodes: 2_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +513,8 @@ func TestPlacementAdmissionDoesNotConfuseDesiredPlanConvergenceWithCapacity(t *t
 	h.manager.cfg.WakeBurstBytes = 1
 	cell, err := h.manager.RegisterCell("convergence-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111",
 		AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
-		CapacityBytes: 40 << 30, CapacityInodes: 2_000_000, Pool: PoolProduct})
+		CapacityBytes: 40 << 30, CapacityInodes: 2_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +612,8 @@ func TestRestoreAdmissionRequiresAnArchiveCapableCell(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("restore-capability-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111",
 		AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
-		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct})
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -466,7 +642,8 @@ func TestRestoreConcurrencyCapIsBusyNotCapacity(t *testing.T) {
 	h.manager.cfg.MaxRestoringPerCell = 2
 	cell, err := h.manager.RegisterCell("restore-cap-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111",
 		AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
-		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct})
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +745,8 @@ func currentState(t *testing.T, h managerHarness) *State {
 func TestPoolIsolationDecommissionCapacityRaiseAndReport(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("system-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 4 << 30, CapacityInodes: 100_000, Pool: PoolSystem})
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 4 << 30, CapacityInodes: 100_000, Pool: PoolSystem,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,7 +787,8 @@ func TestRestorePriorityUsesWakeBurstHeadroom(t *testing.T) {
 	h := newManagerHarness(t)
 	h.manager.cfg.WakeBurstBytes = 1500 << 20
 	cell, err := h.manager.RegisterCell("priority-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -684,7 +863,8 @@ func TestAbandonmentForceClearsOnlyVerifiedArchivesAndCellIDIsPermanent(t *testi
 		t.Fatal(err)
 	}
 	if _, err := h.manager.RegisterCell("reuse-abandoned", RegisterCellRequest{ID: cell.ID, AvailabilityZone: "zone-a", AuthorityHost: "new.test",
-		AuthorityDNSZone: "new.test", CapacityBytes: 1 << 30, CapacityInodes: 1000, Pool: PoolProduct}); !errors.Is(err, ErrQuarantined) {
+		AuthorityDNSZone: "new.test", CapacityBytes: 1 << 30, CapacityInodes: 1000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort}); !errors.Is(err, ErrQuarantined) {
 		t.Fatalf("abandoned re-register = %v", err)
 	}
 	if _, err := h.manager.CreateVolume("abandoned-admission", CreateVolumeRequest{AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",

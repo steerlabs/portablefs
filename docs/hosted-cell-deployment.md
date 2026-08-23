@@ -146,8 +146,13 @@ Converge the cell through the manager operator
 normalized declaration is a no-op; a changed host, zone, pool, initial
 capacity, or allocator declaration is an operator conflict and never rewrites
 the cell's live state. The registered capacity is admission capacity, not a
-replacement for XFS's own free-space accounting. Choose non-overlapping
-allocator starts for project ID, service UID, and TCP port.
+replacement for XFS's own free-space accounting. Declare non-overlapping,
+inclusive first and last values for project ID, service UID, and TCP port. The
+last values must match the host firewall and account policy exactly. Allocation
+is lifetime-monotonic: deletion does not recycle an identity, and the Manager
+classifies the cell as capacity-exhausted before assigning beyond any declared
+last value. Expanding a range is a new cell declaration, not an in-place edit
+to an existing cell.
 
 Then enable the two cell services using the cell UUID as the instance:
 

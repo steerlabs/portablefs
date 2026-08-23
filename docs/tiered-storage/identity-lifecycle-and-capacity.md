@@ -667,7 +667,12 @@ admission. Replaced by measured usage plus bounded in-flight charges.
   pool. The warm-cache preference for a recently departed volume's
   previous cell is a pure optimization hint, deferred until wake p95
   demands it.
-- **Operations:** cell registration requires the pool label.
+- **Operations:** cell registration requires the pool label. Each registration
+  also requires inclusive first and last project IDs, service UIDs, and
+  listener ports. Ends are immutable, participate in the exact declaration
+  digest, and gate placement before a never-reused allocator can leave its
+  host's declared and firewalled range. Exhaustion is durable
+  `CAPACITY_EXHAUSTED`, even after every prior placement is deleted.
   `PUT /v1/cells/{id}` declaratively creates or exactly replays a normalized
   registration; replay returns current live state without resetting health,
   desired generation, allocator counters, or monotonic capacity raises, while

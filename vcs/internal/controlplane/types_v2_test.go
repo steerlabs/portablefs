@@ -38,6 +38,22 @@ func TestStateV2RejectsPlacementAndLifecycleCrossInvariantViolations(t *testing.
 			v.ArchiveCycleStep = "quiescing"
 			state.Volumes[v.ID] = v
 		}},
+		{name: "partial allocator bound", mutate: func(state *State) {
+			cell := state.Cells[state.Volumes[volume.ID].Placement.CellID]
+			cell.LastPort = 0
+			state.Cells[cell.ID] = cell
+		}},
+		{name: "bounded allocator without declaration digest", mutate: func(state *State) {
+			cell := state.Cells[state.Volumes[volume.ID].Placement.CellID]
+			cell.RegistrationSHA256 = ""
+			state.Cells[cell.ID] = cell
+		}},
+		{name: "placement outside allocator bound", mutate: func(state *State) {
+			v := state.Volumes[volume.ID]
+			cell := state.Cells[v.Placement.CellID]
+			cell.LastPort = v.Placement.ListenPort - 1
+			state.Cells[cell.ID] = cell
+		}},
 		// Archive capability is a relayed cell report, never an assumption a
 		// never-observed cell gets for free.
 		{name: "archive capability without observation", mutate: func(state *State) {

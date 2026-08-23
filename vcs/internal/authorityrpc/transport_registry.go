@@ -66,10 +66,16 @@ type transportPair struct {
 	session   volumeserver.SessionID
 	state     authoritypb.SessionState
 	terminal  <-chan struct{}
-	// done closes exactly when this pair is removed by a terminal transition.
+	// done closes exactly when this pair enters a terminal transition.
 	// A replacement may stop waiting for an ancient predecessor only on this
 	// edge, because no successor will then be exposed.
 	done chan struct{}
+	// terminalClosing fences the pair while its physical connections are being
+	// retired. terminalClosed is the completion barrier shared by every racing
+	// terminal observer. The pair remains indexed until this barrier closes, so
+	// no observer can mistake an in-progress close for completed cleanup.
+	terminalClosing bool
+	terminalClosed  chan struct{}
 	// terminalResponder is the one CONTROL connection allowed to attempt a
 	// planned Abort/Detach response after the runtime becomes terminal. The
 	// terminal transition still removes the pair and fences every generation;
@@ -165,6 +171,10 @@ func (r *transportRegistry) register(
 		r.pairs[key] = pair
 	} else if pair.profile != profile {
 		return nil, fmt.Errorf("%w: connection-set frontend profile mismatch", ErrTransportBinding)
+	} else if pair.terminalClosing ||
+		pair.state == authoritypb.SessionState_SESSION_STATE_ABORTED ||
+		pair.state == authoritypb.SessionState_SESSION_STATE_TERMINAL {
+		return nil, fmt.Errorf("%w: connection set is terminating", ErrTransportBinding)
 	}
 	slot := pair.roleBinding(role)
 	if slot == nil {
@@ -229,6 +239,12 @@ func (r *transportRegistry) unregister(entry *transportConnection) {
 }
 
 func (r *transportRegistry) removeIfFinishedLocked(pair *transportPair) {
+	if pair != nil && pair.terminalClosing {
+		// The terminal owner removes both indexes only after every connection it
+		// captured has completed its close. Deferred unregister calls must not
+		// publish an incomplete terminal transition by deleting them early.
+		return
+	}
 	if pair == nil || pair.data.current != nil || pair.data.candidate != nil ||
 		pair.control.current != nil || pair.control.candidate != nil {
 		return
@@ -719,20 +735,31 @@ func (r *transportRegistry) finishTerminalResponse(entry *transportConnection) b
 	return terminal
 }
 
-// markTerminal is the one runtime-to-transport terminal transition. It drops
-// the bounded pair/session indexes immediately and returns every physical
-// generation that may be closed now. A planned response connection is omitted
-// until finishTerminalResponse; it has no registry authority in the interim.
-func (r *transportRegistry) markTerminal(session volumeserver.SessionID, state authoritypb.SessionState) []*transportConnection {
+// terminateSession is the one runtime-to-transport terminal transition. The
+// first caller atomically fences every generation, closes pair.done, and owns
+// physical retirement. Racing callers wait on the same completion barrier.
+// The pair remains indexed until all non-responder closes finish, making index
+// removal a truthful proof of completed cleanup rather than merely intent.
+// A planned response connection is omitted until finishTerminalResponse; it
+// has no registry authority while the transition is in progress.
+func (r *transportRegistry) terminateSession(session volumeserver.SessionID, state authoritypb.SessionState) {
 	if state != authoritypb.SessionState_SESSION_STATE_ABORTED && state != authoritypb.SessionState_SESSION_STATE_TERMINAL {
-		return nil
+		return
 	}
 	r.mu.Lock()
 	pair := r.bySession[session]
 	if pair == nil {
 		r.mu.Unlock()
-		return nil
+		return
 	}
+	if pair.terminalClosing {
+		closed := pair.terminalClosed
+		r.mu.Unlock()
+		<-closed
+		return
+	}
+	pair.terminalClosing = true
+	pair.terminalClosed = make(chan struct{})
 	pair.state = state
 	entries := uniqueTransportConnections(
 		pair.data.current, pair.data.candidate, pair.control.current, pair.control.candidate,
@@ -740,22 +767,29 @@ func (r *transportRegistry) markTerminal(session volumeserver.SessionID, state a
 	responder := pair.terminalResponder
 	pair.data = transportRoleBinding{}
 	pair.control = transportRoleBinding{}
-	delete(r.pairs, pair.key)
+	close(pair.done)
+	closed := pair.terminalClosed
+	r.mu.Unlock()
+	closeNow := entries
+	if responder != nil {
+		closeNow = entries[:0]
+		for _, candidate := range entries {
+			if candidate != responder {
+				closeNow = append(closeNow, candidate)
+			}
+		}
+	}
+	terminateTransportConnections(closeNow...)
+
+	r.mu.Lock()
+	if r.pairs[pair.key] == pair {
+		delete(r.pairs, pair.key)
+	}
 	if r.bySession[session] == pair {
 		delete(r.bySession, session)
 	}
-	close(pair.done)
+	close(closed)
 	r.mu.Unlock()
-	if responder == nil {
-		return entries
-	}
-	closeNow := entries[:0]
-	for _, candidate := range entries {
-		if candidate != responder {
-			closeNow = append(closeNow, candidate)
-		}
-	}
-	return closeNow
 }
 
 func uniqueTransportConnections(entries ...*transportConnection) []*transportConnection {

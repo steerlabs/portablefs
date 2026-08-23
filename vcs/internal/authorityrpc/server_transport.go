@@ -127,23 +127,23 @@ func responseSucceeded(response *authoritypb.Response) bool {
 func (s *Server) bindRuntimeTerminal(entry *transportConnection, session volumeserver.SessionID) error {
 	terminal, ok := s.Handler.SessionTerminalForTransport(session)
 	if !ok || terminal == nil {
-		terminateTransportConnections(s.registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)...)
+		s.registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)
 		return fmt.Errorf("%w: runtime omitted the bound session terminal edge", ErrTransportBinding)
 	}
 	installed, err := s.registry.bindTerminal(entry, session, terminal)
 	if err != nil {
-		terminateTransportConnections(s.registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)...)
+		s.registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)
 		return err
 	}
 	if installed {
 		go func() {
 			<-terminal
-			terminateTransportConnections(s.registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)...)
+			s.registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)
 		}()
 	}
 	select {
 	case <-terminal:
-		terminateTransportConnections(s.registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)...)
+		s.registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)
 		return fmt.Errorf("%w: runtime session ended before transport exposure", ErrTransportBinding)
 	default:
 		return nil
@@ -353,7 +353,7 @@ func (s *Server) executeTransportAbort(ctx context.Context, entry *transportConn
 		}
 		// Test handlers may not own a runtime, while production's runtime hook may
 		// already have performed this exact transition. It is idempotent either way.
-		terminateTransportConnections(s.registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_ABORTED)...)
+		s.registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_ABORTED)
 	}
 	writeErr := writeResponse(request, response)
 	if s.registry.finishTerminalResponse(entry) {
@@ -377,7 +377,7 @@ func (s *Server) executeTransportDetach(ctx context.Context, entry *transportCon
 	response := s.dispatchRequest(ctx, request)
 	defer finishHandlerResponse(s.Handler, request, response)()
 	if responseSucceeded(response) {
-		terminateTransportConnections(s.registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)...)
+		s.registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)
 	}
 	writeErr := writeResponse(request, response)
 	if s.registry.finishTerminalResponse(entry) {

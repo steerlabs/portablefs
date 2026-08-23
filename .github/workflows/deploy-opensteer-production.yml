@@ -25,11 +25,8 @@ jobs:
     timeout-minutes: 45
     environment: opensteer-production
     env:
-      OPENSTEER_CELL_INSTANCE: pfs-v3-authority-01
+      OPENSTEER_CELL_INVENTORY_JSON: ${{ vars.OPENSTEER_CELL_INVENTORY_JSON }}
       OPENSTEER_GCP_PROJECT: smooth-comfort-488701-t3
-      OPENSTEER_GCP_ZONE: us-east4-a
-      OPENSTEER_MANAGER_INSTANCE: pfs-v3-manager-01
-      OPENSTEER_VOLUME_IDS: 57483c00-a90d-42f1-bc80-945c0b477227
       OPENSTEER_RUNNER_IMAGE: us-west1-docker.pkg.dev/opensteer-admin/staging/runner@sha256:1e310bb87984279ed3971a6b543f8e55acca09738a3a8b8905a882386dd454dc
       WIF_PROVIDER: projects/920572344872/locations/global/workloadIdentityPools/github/providers/github-oidc
       WIF_SERVICE_ACCOUNT: portablefs-deployer@opensteer-admin.iam.gserviceaccount.com
@@ -40,6 +37,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up the OpenSteer Node runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.13.0
 
       - name: Prove the successful commit is still the promotion branch head
         env:
@@ -53,6 +55,19 @@ jobs:
           promoted_tree=$(git rev-parse 'HEAD^{tree}')
           git log --format=%T origin/main >"$RUNNER_TEMP/main-trees"
           grep -Fx "$promoted_tree" "$RUNNER_TEMP/main-trees" >/dev/null
+
+      - name: Validate the protected production cell inventory
+        id: inventory
+        run: |
+          set -euo pipefail
+          [[ -n ${OPENSTEER_CELL_INVENTORY_JSON:-} ]] || {
+            echo "OPENSTEER_CELL_INVENTORY_JSON is not set on the opensteer-production environment" >&2
+            exit 64
+          }
+          inventory_file="$RUNNER_TEMP/opensteer-cell-inventory.json"
+          printf '%s\n' "$OPENSTEER_CELL_INVENTORY_JSON" >"$inventory_file"
+          node deploy/opensteer/release-inventory.mjs validate "$inventory_file" >/dev/null
+          echo "file=$inventory_file" >>"$GITHUB_OUTPUT"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -86,11 +101,6 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
 
-      - name: Set up the OpenSteer Node runtime
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24.13.0
-
       - name: Install the pinned E2B SDK
         run: |
           set -euo pipefail
@@ -119,6 +129,7 @@ jobs:
           OPENSTEER_E2B_CANDIDATE: ${{ steps.release.outputs.candidate }}
           OPENSTEER_E2B_SDK_ROOT: ${{ runner.temp }}/opensteer-e2b-sdk
           OPENSTEER_EVIDENCE_DIR: ${{ runner.temp }}/opensteer-deployment-evidence
+          OPENSTEER_CELL_INVENTORY_FILE: ${{ steps.inventory.outputs.file }}
           OPENSTEER_RELEASE_DIR: ${{ steps.release.outputs.release_dir }}
         run: deploy/opensteer/deploy-production.sh
 

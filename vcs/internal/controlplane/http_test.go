@@ -18,6 +18,7 @@ func TestHTTPProductCannotOperateOnAnotherIssuerVolume(t *testing.T) {
 	cell, err := harness.manager.RegisterCell("cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +52,7 @@ func TestHTTPProductIdentityMustMatchCreatedIssuer(t *testing.T) {
 	_, err := harness.manager.RegisterCell("cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -69,6 +71,7 @@ func TestHTTPCellObservationRequiresIdempotencyKey(t *testing.T) {
 	cell, err := harness.manager.RegisterCell("cell", RegisterCellRequest{
 		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
 		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 200_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +89,8 @@ func TestHTTPCellObservationRequiresIdempotencyKey(t *testing.T) {
 func TestHTTPCapacityAndCellCapacityRaise(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("http-capacity-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +122,8 @@ func TestHTTPConvergentCellRegistrationAndSortedOperatorInventory(t *testing.T) 
 	}
 	declaration := func(id string) RegisterCellRequest {
 		return RegisterCellRequest{AvailabilityZone: "zone-a", AuthorityHost: id[:8] + ".cell.test", AuthorityDNSZone: "cell.test",
-			CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct}
+			CapacityBytes: 10 << 30, CapacityInodes: 1_000_000, Pool: PoolProduct,
+			LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort}
 	}
 	for _, id := range cellIDs {
 		response := serveControlRequest(t, handler, http.MethodPut, "/v1/cells/"+id, declaration(id), RoleOperator, "operator", "")
@@ -229,7 +234,8 @@ func TestHTTPArchiveWakeAndDeleteLifecycleRoutes(t *testing.T) {
 func TestHTTPCellObservationHasTwoMiBExclusiveBodyLimit(t *testing.T) {
 	h := newManagerHarness(t)
 	cell, err := h.manager.RegisterCell("http-large-observation", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
-		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct})
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 2 << 30, CapacityInodes: 100_000, Pool: PoolProduct,
+		LastProjectID: testLastProjectID, LastServiceUID: testLastServiceUID, LastPort: testLastPort})
 	if err != nil {
 		t.Fatal(err)
 	}

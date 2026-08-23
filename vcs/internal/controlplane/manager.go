@@ -203,22 +203,34 @@ func (manager *Manager) ConvergeCell(cellID string, request RegisterCellRequest)
 			return nil, false, ErrQuarantined
 		}
 		fingerprint := registerCellFingerprint(request)
-		if current.RegistrationSHA256 != "" {
+		if cellAllocatorBounded(current) {
 			if current.RegistrationSHA256 != fingerprint {
 				return nil, false, ErrConflict
 			}
 			return current, false, nil
 		}
-		// Schema-v2 cells written before convergent registration have no exact
-		// declaration digest. The first compatible operator declaration pins it
-		// without changing any live field. Capacity and allocator starts may only
-		// describe floors the current cell has already advanced beyond.
+		// Schema-v2 cells written before allocator bounds may already have the
+		// earlier declaration digest or may predate convergent registration
+		// entirely. The first compatible bounded declaration supersedes that
+		// pre-bound digest exactly once. It pins the ends and the complete new
+		// declaration without changing any pre-existing live field. Capacity and
+		// allocator starts may only describe floors the current cell has already
+		// advanced beyond.
 		if current.ID != request.ID || current.AvailabilityZone != request.AvailabilityZone ||
 			current.AuthorityHost != request.AuthorityHost || current.AuthorityDNSZone != request.AuthorityDNSZone || current.Pool != request.Pool ||
 			request.CapacityBytes > current.CapacityBytes || request.CapacityInodes > current.CapacityInodes ||
-			request.FirstProjectID > current.NextProjectID || request.FirstServiceUID > current.NextServiceUID || request.FirstPort > current.NextPort {
+			request.FirstProjectID > current.NextProjectID || request.FirstServiceUID > current.NextServiceUID || request.FirstPort > current.NextPort ||
+			uint64(current.NextProjectID) > uint64(request.LastProjectID)+1 ||
+			uint64(current.NextServiceUID) > uint64(request.LastServiceUID)+1 ||
+			uint64(current.NextPort) > uint64(request.LastPort)+1 {
 			return nil, false, ErrConflict
 		}
+		// A schema-v2 cell that predates allocator bounds is admitted exactly
+		// once. The declaration may only put immutable ends around allocator
+		// cursors that already exist; it never rewinds or advances live state.
+		current.LastProjectID = request.LastProjectID
+		current.LastServiceUID = request.LastServiceUID
+		current.LastPort = request.LastPort
 		current.RegistrationSHA256 = fingerprint
 		state.Cells[cellID] = current
 		return current, true, nil
@@ -282,7 +294,10 @@ func normalizeRegisterCellRequest(request RegisterCellRequest, generateID bool) 
 	if request.FirstPort == 0 {
 		request.FirstPort = 20_000
 	}
-	if request.FirstProjectID == 0 || request.FirstServiceUID < 1000 || request.FirstPort < 1024 {
+	if request.FirstProjectID == 0 || request.FirstServiceUID < 1000 || request.FirstPort < 1024 ||
+		request.FirstProjectID > request.LastProjectID || request.LastProjectID == ^uint32(0) ||
+		request.FirstServiceUID > request.LastServiceUID || request.LastServiceUID == ^uint32(0) ||
+		request.FirstPort > request.LastPort || request.LastPort == ^uint16(0) {
 		return RegisterCellRequest{}, ErrInvalid
 	}
 	return request, nil
@@ -299,6 +314,7 @@ func (manager *Manager) newCell(request RegisterCellRequest, now int64) Cell {
 		ID: request.ID, AvailabilityZone: request.AvailabilityZone, AuthorityHost: request.AuthorityHost,
 		AuthorityDNSZone: request.AuthorityDNSZone, CapacityBytes: request.CapacityBytes, CapacityInodes: request.CapacityInodes, Pool: request.Pool,
 		NextProjectID: request.FirstProjectID, NextServiceUID: request.FirstServiceUID, NextPort: request.FirstPort,
+		LastProjectID: request.LastProjectID, LastServiceUID: request.LastServiceUID, LastPort: request.LastPort,
 		PlanGeneration: 1, PlanReleaseID: manager.cfg.ReleaseID,
 		PlanIssuedUnix: now, PlanExpiresUnix: now + int64(manager.cfg.PlanLifetime/time.Second),
 		Health: CellUnknown, RegistrationSHA256: registerCellFingerprint(request),
@@ -1825,8 +1841,12 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 	staleAfter := int64(manager.cfg.UsageStaleAfter / time.Second)
 	for _, id := range sortedCellIDs(state.Cells) {
 		cell := state.Cells[id]
-		if cell.Pool != pool || cell.Health == CellQuarantined || cell.Decommissioning || cell.Abandoned || cell.NextProjectID == ^uint32(0) ||
-			cell.NextServiceUID == ^uint32(0) || cell.NextPort == ^uint16(0) {
+		// Allocator identities are lifetime reservations, not current-placement
+		// counts. A deleted volume releases physical capacity but never its
+		// project ID, service UID, or listener port; reaching any declared end is
+		// therefore durable capacity exhaustion for this cell.
+		if cell.Pool != pool || cell.Health == CellQuarantined || cell.Decommissioning || cell.Abandoned ||
+			!cellAllocatorAvailable(cell) {
 			continue
 		}
 		if isRestore && !cell.ArchiveConfigured {
@@ -1900,6 +1920,11 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 		return nil, ErrCapacity
 	}
 	return selected, nil
+}
+
+func cellAllocatorAvailable(cell Cell) bool {
+	return cellAllocatorBounded(cell) &&
+		cell.NextProjectID <= cell.LastProjectID && cell.NextServiceUID <= cell.LastServiceUID && cell.NextPort <= cell.LastPort
 }
 
 func admissionStatus(err error) AdmissionStatus {
