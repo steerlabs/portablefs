@@ -324,7 +324,7 @@ func TestTransportTerminalEdgeEndsExecutionDrainWithoutExposure(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("replacement did not start")
 	}
-	terminateTransportConnections(registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)...)
+	registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)
 	select {
 	case exposed := <-drainResult:
 		if exposed {

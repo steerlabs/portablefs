@@ -289,8 +289,7 @@ func TestTransportRegistryTerminalCleanupIsGenerationSafe(t *testing.T) {
 	if err := registry.exposeCurrentPair(data, session); err != nil {
 		t.Fatal(err)
 	}
-	entries := registry.markTerminal(session, authoritypb.SessionState_SESSION_STATE_ABORTED)
-	terminateTransportConnections(entries...)
+	registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_ABORTED)
 	if dataClosed.Load() != 1 || controlClosed.Load() != 1 {
 		t.Fatalf("terminal closes = data %d control %d", dataClosed.Load(), controlClosed.Load())
 	}
@@ -304,6 +303,97 @@ func TestTransportRegistryTerminalCleanupIsGenerationSafe(t *testing.T) {
 	snapshot, err := registry.snapshot(replacement)
 	if err != nil || !snapshot.current {
 		t.Fatalf("stale unregister removed replacement: %+v, %v", snapshot, err)
+	}
+}
+
+func TestTransportRegistryTerminalCleanupHasOnePhysicalCompletionBarrier(t *testing.T) {
+	registry, _ := newTransportRegistry(1)
+	var set connectionSetID
+	set[0] = 2
+	peer := volumeserver.PeerIdentity{1}
+	dataCloseEntered := make(chan struct{})
+	releaseDataClose := make(chan struct{})
+	var dataClosed atomic.Int32
+	data, err := registry.register(
+		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		func() {}, func() error {
+			dataClosed.Add(1)
+			close(dataCloseEntered)
+			<-releaseDataClose
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var controlClosed atomic.Int32
+	_, err = registry.register(
+		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		func() {}, func() error { controlClosed.Add(1); return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := volumeserver.SessionID{0x91}
+	if _, _, err := registry.bindProvisional(data, session); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.exposeCurrentPair(data, session); err != nil {
+		t.Fatal(err)
+	}
+
+	firstDone := make(chan struct{})
+	go func() {
+		registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_TERMINAL)
+		close(firstDone)
+	}()
+	select {
+	case <-dataCloseEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first terminal observer did not begin physical closure")
+	}
+	secondDone := make(chan struct{})
+	go func() {
+		registry.terminateSession(session, authoritypb.SessionState_SESSION_STATE_ABORTED)
+		close(secondDone)
+	}()
+	select {
+	case <-secondDone:
+		t.Fatal("racing terminal observer crossed an incomplete physical close")
+	case <-time.After(20 * time.Millisecond):
+	}
+	registry.mu.Lock()
+	pairs, sessions := len(registry.pairs), len(registry.bySession)
+	registry.mu.Unlock()
+	if pairs != 1 || sessions != 1 {
+		t.Fatalf("in-progress terminal close published registry removal: pairs=%d sessions=%d", pairs, sessions)
+	}
+	if _, err := registry.register(
+		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA,
+		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
+		func() {}, func() error { return nil },
+	); !errors.Is(err, ErrTransportBinding) {
+		t.Fatalf("terminating connection set admitted a replacement: %v", err)
+	}
+
+	close(releaseDataClose)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("terminal owner did not complete after physical close")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("racing terminal observer did not cross the shared completion barrier")
+	}
+	if dataClosed.Load() != 1 || controlClosed.Load() != 1 {
+		t.Fatalf("terminal close counts = DATA %d CONTROL %d, want 1/1", dataClosed.Load(), controlClosed.Load())
+	}
+	if len(registry.pairs) != 0 || len(registry.bySession) != 0 {
+		t.Fatalf("completed terminal registry retained %d pairs / %d sessions", len(registry.pairs), len(registry.bySession))
 	}
 }
 
