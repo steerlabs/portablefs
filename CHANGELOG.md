@@ -42,6 +42,19 @@ this file is the human-curated summary.
 
 ### Changed
 
+- Hosted automatic mount enrollment now uses a 30-minute sliding lease instead
+  of an absolute enrollment lifetime. Fresh successful refreshes renew the
+  lease, while exact replays, rate-limited requests, and failures leave it
+  unchanged. Enrollment certificates carry only the Manager-facing identity
+  and remain valid through the enrollment CA's remaining lifetime. The Manager
+  wire and mount CLI no longer carry an enrollment-expiry timestamp. Clients
+  advertise
+  `hosted-automatic-mount-reauthorization-v2` for this contract.
+- Scoped enrollment issuance now supersedes only the prior active enrollment
+  for the same product issuer, renewal scope, and volume. One machine scope can
+  therefore keep one active enrollment for each mounted volume; epoch advances
+  still revoke every lower-epoch enrollment in that scope.
+
 - `.github/workflows/deploy-opensteer-staging.yml` takes the runner image as a
   required `workflow_dispatch` input instead of hardcoding a digest, and refuses
   anything not of the form `REGISTRY/PATH@sha256:<64 hex>`. The infra pin

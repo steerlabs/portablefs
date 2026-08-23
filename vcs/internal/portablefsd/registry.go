@@ -125,7 +125,6 @@ type attachStatus struct {
 	// kernel mount must be made unservable within the repair budget.
 	SessionTerminal           bool   `json:"sessionTerminal,omitempty"`
 	MountEnrollmentID         string `json:"mountEnrollmentId,omitempty"`
-	EnrollmentExpiresAtMs     int64  `json:"enrollmentExpiresAtMs,omitempty"`
 	AuthorizationDeadlineAtMs int64  `json:"authorizationDeadlineAtMs,omitempty"`
 	LastReauthorizationAtMs   int64  `json:"lastReauthorizationAtMs,omitempty"`
 	NextReauthorizationAtMs   int64  `json:"nextReauthorizationAtMs,omitempty"`
@@ -1877,10 +1876,8 @@ func (a *attach) status() attachStatus {
 	reauthorizationFailures := a.reauthorizationFailures
 	reauthorizationError := a.reauthorizationError
 	enrollmentID := ""
-	enrollmentExpiresAtMs := int64(0)
 	if a.v3Config != nil {
 		enrollmentID = a.v3Config.enrollmentID
-		enrollmentExpiresAtMs = a.v3Config.enrollmentExpires.UnixMilli()
 	}
 	a.mu.RUnlock()
 	credential := ""
@@ -1902,7 +1899,7 @@ func (a *attach) status() attachStatus {
 		AttachRef: a.ref, VolumeID: a.volumeID, Branch: a.branch, MountPath: a.mountPath,
 		State: stateString(state), VolumeName: volumeName, LastError: lastErr,
 		Credential: credential, SessionTerminal: sessionTerminal,
-		MountEnrollmentID: enrollmentID, EnrollmentExpiresAtMs: enrollmentExpiresAtMs,
+		MountEnrollmentID:         enrollmentID,
 		AuthorizationDeadlineAtMs: authorizationDeadlineAtMs, LastReauthorizationAtMs: lastReauthorizationAtMs,
 		NextReauthorizationAtMs: nextReauthorizationAtMs, ReauthorizationFailures: reauthorizationFailures,
 		ReauthorizationError: reauthorizationError,

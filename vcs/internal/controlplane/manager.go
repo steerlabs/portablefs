@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -33,7 +32,7 @@ type ManagerConfig struct {
 	ReleaseID               string
 	PlanLifetime            time.Duration
 	GrantLifetime           time.Duration
-	EnrollmentLifetime      time.Duration
+	EnrollmentLease         time.Duration
 	ProductMaxLifetime      time.Duration
 	ClientCertLifetime      time.Duration
 	AuthorityCertLifetime   time.Duration
@@ -116,7 +115,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		len(cfg.AuthorityCA.CertificatePEM) == 0 || len(cfg.AuthorityCA.CertificatePEM) > 4096 ||
 		len(cfg.ClientCA.CertificatePEM) == 0 || len(cfg.ClientCA.CertificatePEM) > 4096 ||
 		len(cfg.EnrollmentCA.CertificatePEM) == 0 || len(cfg.EnrollmentCA.CertificatePEM) > 4096 ||
-		cfg.PlanLifetime <= 0 || cfg.GrantLifetime <= 0 || cfg.EnrollmentLifetime <= cfg.GrantLifetime || cfg.ProductMaxLifetime <= 0 ||
+		cfg.PlanLifetime <= 0 || cfg.GrantLifetime <= 0 || cfg.EnrollmentLease/2 < cfg.GrantLifetime || cfg.ProductMaxLifetime <= 0 ||
 		cfg.ClientCertLifetime <= 0 || cfg.AuthorityCertLifetime <= 0 || cfg.ObservedStaleAfter <= 0 || cfg.UsageStaleAfter < time.Second ||
 		cfg.ProvisionFloorBytes == 0 || cfg.ProvisionFloorInodes == 0 || cfg.CellReserveFraction <= 0 || cfg.CellReserveFraction >= 1 ||
 		cfg.RestoreOverheadFraction < 0 || cfg.RestoreOverheadFraction > 1 || cfg.RestoreOverheadBytes == 0 || cfg.RestoreOverheadInodes == 0 ||
@@ -1150,10 +1149,9 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 					return nil, err
 				}
 			}
+			revokeRenewalScopeEnrollmentsBeforeEpoch(state, volume.ProductIssuer, verified.Claims.RenewalScope, highWater, "renewal-scope-superseded", now)
 			if createEnrollment {
-				supersedeRenewalScopeEnrollments(state, volume.ProductIssuer, verified.Claims.RenewalScope, "renewal-scope-superseded", now)
-			} else {
-				revokeRenewalScopeEnrollmentsBeforeEpoch(state, volume.ProductIssuer, verified.Claims.RenewalScope, highWater, "renewal-scope-superseded", now)
+				supersedeRenewalScopeEnrollments(state, volume.ProductIssuer, verified.Claims.RenewalScope, volume.ID, "renewal-scope-superseded", now)
 			}
 		}
 		nonceKey := volume.ProductIssuer + "\x00" + verified.Claims.Nonce
@@ -1166,7 +1164,6 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 			expires = productExpiry
 		}
 		var enrollmentID, enrollmentCertificate string
-		var enrollmentExpires time.Time
 		if createEnrollment {
 			if err := admitMountEnrollment(state, volume); err != nil {
 				return nil, err
@@ -1176,14 +1173,11 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 			if err != nil {
 				return nil, err
 			}
-			enrollmentCertificate, enrollmentExpires, err = manager.cfg.EnrollmentCA.SignClientCSR(
-				[]byte(csrPEM), enrollmentID, identity, nowTime, manager.cfg.EnrollmentLifetime,
+			enrollmentCertificate, _, err = manager.cfg.EnrollmentCA.SignClientCSR(
+				[]byte(csrPEM), enrollmentID, identity, nowTime, manager.cfg.EnrollmentCA.Certificate.NotAfter.Sub(nowTime),
 			)
 			if err != nil {
 				return nil, err
-			}
-			if !enrollmentExpires.After(expires) {
-				return nil, errors.New("mount enrollment CA cannot issue an enrollment that outlives the initial grant")
 			}
 		}
 		clientName := base64.RawURLEncoding.EncodeToString(peer[:])
@@ -1218,12 +1212,11 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 				Access: append([]string(nil), access...), PeerSPKI: hex.EncodeToString(peer[:]),
 				AuthorizationDomain: volume.AuthorizationDomain, ProductIssuer: volume.ProductIssuer,
 				CellID: placement.CellID, AuthorityID: placement.AuthorityID, AuthorityGeneration: volume.AuthorityEpoch,
-				CreatedUnix: now, ExpiresUnix: enrollmentExpires.Unix(), State: MountEnrollmentActive, UpdatedUnix: now,
+				CreatedUnix: now, ExpiresUnix: nowTime.Add(manager.cfg.EnrollmentLease).Unix(), State: MountEnrollmentActive, UpdatedUnix: now,
 				RenewalScope: verified.Claims.RenewalScope, RenewalEpoch: verified.Claims.RenewalEpoch,
 			}
 			authorization.EnrollmentID = enrollmentID
 			authorization.EnrollmentCertificatePEM = enrollmentCertificate
-			authorization.EnrollmentExpiresUnix = enrollmentExpires.Unix()
 		}
 		return authorization, nil
 	})
@@ -1257,6 +1250,7 @@ func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, r
 	requestDigest := hex.EncodeToString(requestSHA[:])
 	nowTime := manager.cfg.Now().UTC()
 	now := nowTime.Unix()
+	enrollmentEnded := false
 	raw, err := manager.cfg.Store.TransactNatural("refresh-mount-enrollment", now, func(state *State) (any, bool, error) {
 		pruned := pruneMountEnrollments(state, now)
 		enrollment, ok := state.MountEnrollments[enrollmentID]
@@ -1267,7 +1261,8 @@ func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, r
 		cell, cellOK := state.Cells[enrollment.CellID]
 		if enrollment.State != MountEnrollmentActive || now >= enrollment.ExpiresUnix || !volumeOK || volume.Placement == nil ||
 			volume.AuthorityEpoch != enrollment.AuthorityGeneration || volume.Placement.AuthorityID != enrollment.AuthorityID {
-			return nil, false, ErrEnrollmentEnded
+			enrollmentEnded = true
+			return MountAuthorization{}, pruned, nil
 		}
 		if !cellOK || !mountableVolume(volume) || cell.Health != CellHealthy || !manager.cellFresh(cell, now) {
 			return nil, false, ErrConflict
@@ -1300,9 +1295,6 @@ func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, r
 			return nil, false, ErrConflict
 		}
 		expires := nowTime.Add(manager.cfg.GrantLifetime)
-		if enrollmentExpiry := time.Unix(enrollment.ExpiresUnix, 0); enrollmentExpiry.Before(expires) {
-			expires = enrollmentExpiry
-		}
 		clientName := base64.RawURLEncoding.EncodeToString(peer[:])
 		certificate, certificateExpires, err := manager.cfg.ClientCA.SignCSR(
 			[]byte(request.ClientCSRPEM), clientName, nil, true, nowTime, manager.cfg.ClientCertLifetime,
@@ -1344,6 +1336,7 @@ func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, r
 		state.MountAuthorizationContexts[contextID] = context
 		enrollment.LastAuthorization = &replay
 		enrollment.LastAuthorizationContext = contextID
+		enrollment.ExpiresUnix = nowTime.Add(manager.cfg.EnrollmentLease).Unix()
 		enrollment.UpdatedUnix = now
 		state.MountEnrollments[enrollmentID] = enrollment
 		pruneMountAuthorizationContexts(state)
@@ -1351,6 +1344,9 @@ func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, r
 	})
 	if err != nil {
 		return MountAuthorization{}, err
+	}
+	if enrollmentEnded {
+		return MountAuthorization{}, ErrEnrollmentEnded
 	}
 	return decode[MountAuthorization](raw)
 }
@@ -1385,6 +1381,9 @@ func (manager *Manager) RevokeVolumeMountEnrollment(productIssuer, volumeID, enr
 			return result, pruned, nil
 		case MountEnrollmentRevoked:
 			result.Outcome = MountEnrollmentRevocationRevoked
+			return result, pruned, nil
+		case MountEnrollmentExpired:
+			result.Outcome = MountEnrollmentRevocationExpired
 			return result, pruned, nil
 		case MountEnrollmentActive:
 			enrollment.State = MountEnrollmentRevoked
@@ -1801,7 +1800,7 @@ func clearPlacementAuthority(placement *Placement) {
 }
 func pruneVolumeEnrollments(state *State, volumeID string) {
 	for id, enrollment := range state.MountEnrollments {
-		if enrollment.VolumeID == volumeID {
+		if enrollment.VolumeID == volumeID && enrollment.State != MountEnrollmentActive {
 			delete(state.MountEnrollments, id)
 		}
 	}
@@ -2009,10 +2008,11 @@ func advanceRenewalFenceHighWater(state *State, key string, epoch uint64) (uint6
 	return epoch, true, nil
 }
 
-func supersedeRenewalScopeEnrollments(state *State, productIssuer, scope, reason string, now int64) bool {
+func supersedeRenewalScopeEnrollments(state *State, productIssuer, scope, volumeID, reason string, now int64) bool {
 	changed := false
 	for id, enrollment := range state.MountEnrollments {
-		if enrollment.ProductIssuer != productIssuer || enrollment.RenewalScope != scope || enrollment.State != MountEnrollmentActive {
+		if enrollment.ProductIssuer != productIssuer || enrollment.RenewalScope != scope || enrollment.VolumeID != volumeID ||
+			enrollment.State != MountEnrollmentActive {
 			continue
 		}
 		enrollment.State = MountEnrollmentRevoked
@@ -2098,8 +2098,15 @@ func pruneMountEnrollments(state *State, now int64) bool {
 	retention := int64(mountEnrollmentRetention / time.Second)
 	changed := false
 	for id, enrollment := range state.MountEnrollments {
-		if enrollment.State == MountEnrollmentActive && enrollment.ExpiresUnix <= now ||
-			enrollment.State != MountEnrollmentActive && enrollment.UpdatedUnix+retention <= now {
+		if enrollment.State == MountEnrollmentActive && enrollment.ExpiresUnix <= now {
+			enrollment.State = MountEnrollmentExpired
+			enrollment.TerminationReason = "lease-expired"
+			enrollment.UpdatedUnix = now
+			state.MountEnrollments[id] = enrollment
+			changed = true
+			continue
+		}
+		if enrollment.State != MountEnrollmentActive && enrollment.UpdatedUnix+retention <= now {
 			delete(state.MountEnrollments, id)
 			changed = true
 		}

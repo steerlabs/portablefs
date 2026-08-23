@@ -468,7 +468,7 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 	req.V3.Enrollment = &v3MountEnrollmentRequest{
 		ManagerURL: manager.URL, ManagerServerName: "localhost", ManagerCAPEM: pki.caPEM,
 		EnrollmentID: enrollmentID, EnrollmentCertificatePEM: enrollmentCertificate,
-		EnrollmentExpiresAtMs: enrollmentExpires.UnixMilli(), AuthorityGeneration: 7,
+		AuthorityGeneration:             7,
 		InitialAuthorizationExpiresAtMs: initialDeadline.UnixMilli(),
 	}
 	// Automatic enrollment uses the same operational protocol-6 FSKit profile

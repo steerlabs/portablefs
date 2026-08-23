@@ -42,7 +42,6 @@ type Config struct {
 	ClientKeyPEM             []byte
 	VolumeID                 string
 	AuthorityGeneration      uint64
-	EnrollmentExpires        time.Time
 	Timeout                  time.Duration
 }
 
@@ -52,7 +51,6 @@ type Client struct {
 	enrollmentID        string
 	volumeID            string
 	authorityGeneration uint64
-	enrollmentExpires   time.Time
 	csrPEM              string
 	keySPKI             []byte
 }
@@ -65,8 +63,7 @@ func NewClient(cfg Config) (*Client, error) {
 		return nil, errors.New("mount enrollment requires an origin-only HTTPS Manager URL")
 	}
 	if cfg.ManagerServerName == "" || cfg.EnrollmentID == "" || cfg.VolumeID == "" || cfg.AuthorityGeneration == 0 ||
-		len(cfg.ManagerCAPEM) == 0 || len(cfg.EnrollmentCertificatePEM) == 0 || len(cfg.ClientKeyPEM) == 0 ||
-		cfg.EnrollmentExpires.IsZero() {
+		len(cfg.ManagerCAPEM) == 0 || len(cfg.EnrollmentCertificatePEM) == 0 || len(cfg.ClientKeyPEM) == 0 {
 		return nil, errors.New("complete mount enrollment configuration is required")
 	}
 	if cfg.Timeout <= 0 {
@@ -92,8 +89,8 @@ func NewClient(cfg Config) (*Client, error) {
 		}
 	}
 	if err != nil || len(leaf.URIs) != 1 || leaf.URIs[0].String() != "spiffe://portablefs/mount-enrollment/"+cfg.EnrollmentID ||
-		!leaf.NotAfter.Equal(cfg.EnrollmentExpires) || time.Now().Before(leaf.NotBefore) || !cfg.EnrollmentExpires.After(time.Now()) || !clientAuth {
-		return nil, errors.New("mount enrollment certificate does not match its declared identity or lifetime")
+		time.Now().Before(leaf.NotBefore) || !leaf.NotAfter.After(time.Now()) || !clientAuth {
+		return nil, errors.New("mount enrollment certificate does not match its declared identity or validity")
 	}
 	spki, err := x509.MarshalPKIXPublicKey(signer.Public())
 	if err != nil {
@@ -123,12 +120,10 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	return &Client{
 		baseURL: baseURL, http: httpClient, enrollmentID: cfg.EnrollmentID, volumeID: cfg.VolumeID,
-		authorityGeneration: cfg.AuthorityGeneration, enrollmentExpires: cfg.EnrollmentExpires.UTC(),
-		csrPEM: string(csrPEM), keySPKI: spki,
+		authorityGeneration: cfg.AuthorityGeneration,
+		csrPEM:              string(csrPEM), keySPKI: spki,
 	}, nil
 }
-
-func (client *Client) EnrollmentExpires() time.Time { return client.enrollmentExpires }
 
 func (client *Client) Refresh(ctx context.Context, sessionID string, sequence uint64) (controlplane.MountAuthorization, error) {
 	if client == nil || sessionID == "" || sequence == 0 {
@@ -160,7 +155,8 @@ func (client *Client) Close(ctx context.Context, reason string) error {
 	for {
 		var response controlplane.MountEnrollment
 		err := client.do(ctx, http.MethodPost, "close", requestID, controlplane.TerminateMountEnrollmentRequest{Reason: reason}, &response)
-		if err == nil && (response.ID != client.enrollmentID || response.State != controlplane.MountEnrollmentClosed && response.State != controlplane.MountEnrollmentRevoked) {
+		if err == nil && (response.ID != client.enrollmentID || response.State != controlplane.MountEnrollmentClosed &&
+			response.State != controlplane.MountEnrollmentRevoked && response.State != controlplane.MountEnrollmentExpired) {
 			err = fmt.Errorf("%w: Manager returned a mismatched mount enrollment close result", ErrDefinitiveDenial)
 		}
 		if err == nil {

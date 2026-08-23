@@ -247,6 +247,21 @@ selects synchronous VFS repair v2 on macOS 26 and 27 before Attach. Only the
 separately stamped SDK-27 artifact selects native readiness; unsupported OS and
 policy combinations still fail before Attach.
 
+Automatic hosted mounts advertise
+`hosted-automatic-mount-reauthorization-v2`. Their enrollment identity has the
+enrollment CA's remaining certificate validity, while the Manager keeps a
+separate sliding lease. A fresh successful refresh renews that lease; replayed,
+rate-limited, and failed refreshes do not. The Manager mount-authorization wire
+has no enrollment-expiry field, and `portablefs mount` has no enrollment-expiry
+timestamp option. A lapsed active lease becomes
+`EXPIRED` with termination reason `lease-expired` before ordinary terminal
+retention pruning.
+
+A renewal scope names one machine incarnation and may hold one active
+enrollment per volume. Scoped issuance supersedes the prior active enrollment
+only for the same product issuer, scope, and volume; advancing the scope epoch
+still revokes every lower-epoch enrollment in the scope.
+
 ### Release identity
 
 The tag-to-artifact identity chain — SemVer tag, stamped binary version, the

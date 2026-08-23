@@ -53,8 +53,7 @@
 #   `portablefs mount` unchanged:
 #     --manager-url --manager-server-name --manager-ca
 #     --mount-enrollment-id --mount-enrollment-cert
-#     --mount-enrollment-expires-at-ms --authority-generation
-#     --auth-expires-at-ms
+#     --authority-generation --auth-expires-at-ms
 #
 # EXIT
 #   0  every phase passed
@@ -100,7 +99,7 @@ while (( $# )); do
     --volume-id) volume_id=$2; shift 2 ;;
     --addr|--data-plane-transport|--data-plane-server-name|--data-plane-ca|\
     --client-cert|--client-key|--manager-url|--manager-server-name|--manager-ca|\
-    --mount-enrollment-id|--mount-enrollment-cert|--mount-enrollment-expires-at-ms|\
+    --mount-enrollment-id|--mount-enrollment-cert|\
     --authority-generation|--auth-expires-at-ms)
       mount_args+=("$1" "$2"); shift 2 ;;
     --no-local-dirs) mount_args+=("$1"); shift ;;

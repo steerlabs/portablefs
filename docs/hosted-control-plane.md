@@ -166,14 +166,16 @@ Keepalive still proves only liveness. It cannot extend authorization.
 An initial grant is single-use and creates a session with authorization
 sequence zero. With `automatic_reauthorization: true`, `POST
 /v1/mount-authorizations` returns both the short-lived attach credential and a
-longer-lived enrollment certificate for the same local key. Its sole identity is
+Manager enrollment certificate for the same local key. Its sole identity is
 `spiffe://portablefs/mount-enrollment/{id}`. It authenticates only to the
 Manager's enrollment endpoints; a short-lived authority client certificate has
-a different identity and cannot authenticate there.
+a different identity and cannot authenticate there. The enrollment certificate
+is an identity credential signed through the enrollment CA's remaining
+validity. Its certificate expiry does not set the enrollment lease deadline.
 
 The production launcher starts `portablefs mount` with the initial credential
 plus the Manager origin, Manager trust material, enrollment ID/certificate,
-exact authority generation, and both deadlines. After Attach, the per-mount
+exact authority generation, and initial grant deadline. After Attach, the per-mount
 Linux FUSE supervisor is the one renewal owner. There is no global mount daemon
 and no second sequencer, and an automatic mount exposes no manual rotation
 socket.
@@ -189,11 +191,14 @@ idempotency by `(enrollment, session, sequence, request digest)`, not only the
 HTTP header, so a lost response cannot mint a different proof for the same
 authority sequence. Only that one current response is retained on the
 enrollment; periodic refreshes do not create generic response receipts. The
-Manager rate-limits sequence advancement relative to the grant lifetime. The
+Manager rate-limits sequence advancement relative to the grant lifetime. Each
+fresh successful refresh sets the enrollment lease deadline to `now + lease`.
+An exact replay, rate-limited request, or failed request does not move that
+deadline. The
 durable store admits at most 2,048 active enrollments, including at most 512 per
 authorization domain (tenant) and 256 per volume. It retains at most 4,096 enrollment records
-in total; expired enrollments are removed immediately, terminated retry
-tombstones expire after 15 minutes, and the oldest terminal tombstone is
+in total. A lapsed active lease transitions to `EXPIRED` with termination reason
+`lease-expired`; all terminal retry tombstones expire after 15 minutes, and the oldest terminal tombstone is
 evicted first if a new active enrollment needs that retained-state slot. The
 latest non-derivable response is stored once per enrollment, while Manager-wide
 CA and release material is content-addressed and shared rather than copied into
@@ -231,12 +236,20 @@ bounded by the short grant lifetime. The qualification macOS implementation
 instead terminalizes its data plane and exercises its FSKit-detach watchdog;
 that historical path does not broaden production platform support.
 
-The security tradeoff is intentionally simple: possession of both the
-enrollment certificate and local private key can renew access to that one
-volume, at no more than its recorded access ceiling, until enrollment expiry or
-revocation. It is not an account-wide Manager credential. The default is 24
-hours versus a ten-minute grant; deployments can pin a shorter
-`--mount-enrollment-lifetime`.
+A live enrollment lease may renew short data grants without an absolute
+session-age limit. Explicit revocation, renewal fencing, authority replacement,
+volume state, or a missed lease renewal ends future grants. Previously issued
+data access may remain usable until its grant expiry plus bounded clock skew and
+fail-close effects. Possession of both the enrollment certificate and local
+private key authorizes only that enrollment's volume and recorded access
+ceiling; it is not an account-wide Manager credential. The lease defaults to 30
+minutes and must be at least twice the grant lifetime; deployments can set it
+with `--mount-enrollment-lease`.
+
+A renewal scope names one machine incarnation. Scoped issuance permits one live
+enrollment per `(scope, volume)`: issuing a replacement for volume A supersedes
+the prior active enrollment for volume A but leaves volume B active. Advancing
+the scope's epoch still revokes every lower-epoch enrollment in that scope.
 
 Standalone mounts omit all enrollment flags and retain the explicit
 `portablefs reauthorize` path. The mode is fixed at mount creation. An
@@ -265,7 +278,6 @@ PORTABLEFS_MOUNT_TOKEN="$CAPABILITY" portablefs mount "$VOLUME" "$PATH" \
   --manager-url "$MANAGER_ORIGIN" --manager-server-name "$MANAGER_SERVER_NAME" \
   --manager-ca manager-ca.pem --mount-enrollment-id "$ENROLLMENT_ID" \
   --mount-enrollment-cert enrollment.pem \
-  --mount-enrollment-expires-at-ms "$ENROLLMENT_EXPIRES_MS" \
   --authority-generation "$AUTHORITY_GENERATION"
 ```
 
@@ -360,7 +372,7 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product | `POST /v1/mount-reauthorizations` | renew cert plus exact session grant |
 | enrolled mount | `POST /v1/mount-enrollments/{id}/reauthorizations` | obtain the exact next live-session grant |
 | enrolled mount | `POST /v1/mount-enrollments/{id}/close` | close enrollment after exact detach |
-| product | `PUT /v1/volumes/{volume-id}/mount-enrollments/{enrollment-id}/revocation` | converge future renewal to revoked, closed, or absent within the product-owned volume |
+| product | `PUT /v1/volumes/{volume-id}/mount-enrollments/{enrollment-id}/revocation` | converge future renewal to revoked, closed, expired, or absent within the product-owned volume |
 | product | `PUT /v1/renewal-fences` | atomically advance a batch of issuer-scoped renewal epoch fences and revoke superseded enrollments |
 
 Three refusal classes on the archive, wake, and delete routes are kept
@@ -427,7 +439,8 @@ window; observations are state-based and reapplying them is safe.
   the frozen v3 authority protocol. The authority `Reauthorize` RPC is additive
   and advertised as `session-reauthorization-v1`. Automatic mounts additionally
   require `mount-enrollment-reauthorization-v1` and refuse an older authority
-  rather than changing renewal modes.
+  rather than changing renewal modes. A client that supports the sliding lease
+  contract advertises `hosted-automatic-mount-reauthorization-v2`.
 - Tiered storage uses Manager state schema v2 and signed cell-plan v2. Rollout is
   gated helper, then agent, then Manager using explicit advertised plan and
   helper-state versions; the Manager does not sign v2 or admit archive/restore
