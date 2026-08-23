@@ -123,6 +123,25 @@ test("schema-v1 inventory is exact, canonical, and allocator-bounded", async () 
   }
 });
 
+test("authority hosts use the same normalized IP-or-DNS contract as Manager state", () => {
+  for (const authorityHost of ["35.247.78.117", "2001:db8::1", "cell-a"]) {
+    const value = inventory();
+    value.cells[0].declaration.authority_host = authorityHost;
+    assert.equal(validateInventory(value), value);
+  }
+
+  for (const authorityHost of [
+    "2001:db8::zz",
+    "[2001:db8::1]",
+    "2001:DB8::1",
+    "cell_a.staging.internal",
+  ]) {
+    const value = inventory();
+    value.cells[0].declaration.authority_host = authorityHost;
+    assert.throws(() => validateInventory(value), /authority_host is invalid/);
+  }
+});
+
 test("release plan groups every discovered volume and supports a shared manager-cell host", () => {
   const plan = buildReleasePlan(inventory(), managerCells(), managerVolumes());
   assert.deepEqual(plan.hosts, [

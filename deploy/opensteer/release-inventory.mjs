@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
 import { readFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const INSTANCE = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
 const ZONE = /^[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
-const DNS_NAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+const DNS_NAME = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
 const SECRET_VERSION = /^projects\/[a-z0-9-]+\/secrets\/[A-Za-z0-9_-]+\/versions\/[1-9][0-9]*$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const POOLS = new Set(["product", "system", "test"]);
@@ -57,6 +58,17 @@ function requireString(value, pattern, location) {
   if (typeof value !== "string" || !pattern.test(value)) fail(`${location} is invalid`);
 }
 
+function requireAuthorityHost(value, location) {
+  if (
+    typeof value !== "string" ||
+    value !== value.trim() ||
+    value !== value.toLowerCase() ||
+    (isIP(value) === 0 && !DNS_NAME.test(value))
+  ) {
+    fail(`${location} is invalid`);
+  }
+}
+
 function requireInteger(value, minimum, maximum, location) {
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     fail(`${location} must be a safe integer from ${minimum} through ${maximum}`);
@@ -98,7 +110,7 @@ function validateDeclaration(declaration, location) {
     location,
   );
   requireString(declaration.availability_zone, ZONE, `${location}.availability_zone`);
-  requireString(declaration.authority_host, DNS_NAME, `${location}.authority_host`);
+  requireAuthorityHost(declaration.authority_host, `${location}.authority_host`);
   requireString(declaration.authority_dns_zone, DNS_NAME, `${location}.authority_dns_zone`);
   requireInteger(declaration.capacity_bytes, 1, Number.MAX_SAFE_INTEGER, `${location}.capacity_bytes`);
   requireInteger(declaration.capacity_inodes, 1, Number.MAX_SAFE_INTEGER, `${location}.capacity_inodes`);
