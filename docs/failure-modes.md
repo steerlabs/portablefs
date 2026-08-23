@@ -155,6 +155,14 @@ directory reports the project's limits and remaining capacity. Hosted
 tiered-storage admission and `df` depend on that projection; a project without
 hard limits retains cell-wide XFS capacity.
 
+Hosted placement separates physical exhaustion from unavailable evidence. If
+a durably eligible cell can hold the reservation but every such cell lacks a
+fresh authenticated heartbeat or full usage observation, create/wake fails
+unchanged with `ErrCellUnavailable` (HTTP 503). If no eligible cell can fit the
+reservation after pending charges, quota-charged stale placements, reserve,
+and wake headroom, it fails with `ErrCapacity` (HTTP 409). Neither refusal
+releases an existing placement's durable pending charge or allocator identity.
+
 A `.portablefs/local-dirs` revision mismatch refuses Attach and returns the
 authority's current declaration for an explicit same-capability retry. A live
 route change fences existing sessions because their local/shared classification

@@ -441,8 +441,8 @@ func TestWakePropagatesRestoreConcurrencySaturationAsRetryableBusy(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Creating the occupant bumped the cell plan; admission needs a heartbeat at
-	// the current generation, which only a fresh observation supplies.
+	// Apply the complete desired plan so the following restore fixture describes
+	// the occupant as an observed in-flight restore, not merely a reservation.
 	observeTieredCell(t, h, cell.ID, "busy-observe", true,
 		VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
 			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,

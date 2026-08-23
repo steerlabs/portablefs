@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -60,6 +61,228 @@ func newManagerHarness(t *testing.T) managerHarness {
 		t.Fatal(err)
 	}
 	return managerHarness{manager: manager, store: store, now: &now, productKey: productPrivate}
+}
+
+func TestConvergentCellRegistrationNeverOverwritesLiveState(t *testing.T) {
+	h := newManagerHarness(t)
+	declaration := RegisterCellRequest{
+		AvailabilityZone: " zone-a ", AuthorityHost: "CELL.TEST", AuthorityDNSZone: "CELL.TEST",
+		CapacityBytes: 8 << 30, CapacityInodes: 800_000, Pool: "PRODUCT",
+		FirstProjectID: 12_000, FirstServiceUID: 22_000, FirstPort: 32_000,
+	}
+	cellID := "11111111-1111-4111-8111-111111111111"
+	cell, err := h.manager.ConvergeCell(cellID, declaration)
+	if err != nil || cell.ID != cellID || cell.RegistrationSHA256 == "" {
+		t.Fatalf("initial convergent registration = %+v, %v", cell, err)
+	}
+	prepareCellForAdmission(t, h, cell)
+	if _, err := h.manager.CreateVolume("convergent-cell-volume", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.manager.UpdateCellCapacity("convergent-cell-raise", cellID, UpdateCellCapacityRequest{
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current := currentState(t, h).Cells[cellID]
+	sequence := h.store.sequence
+	replayed, err := h.manager.ConvergeCell(cellID, declaration)
+	if err != nil || !reflect.DeepEqual(replayed, current) {
+		t.Fatalf("exact replay = %+v, %v; want live current %+v", replayed, err, current)
+	}
+	if h.store.sequence != sequence {
+		t.Fatalf("exact replay appended durable state: %d -> %d", sequence, h.store.sequence)
+	}
+	if replayed.CapacityBytes != 10<<30 || replayed.NextProjectID != 12_001 || replayed.PlanGeneration <= cell.PlanGeneration {
+		t.Fatalf("exact replay reset live fields = %+v", replayed)
+	}
+
+	mismatch := declaration
+	mismatch.AuthorityHost = "other.test"
+	if _, err := h.manager.ConvergeCell(cellID, mismatch); !errors.Is(err, ErrConflict) {
+		t.Fatalf("immutable registration mismatch = %v", err)
+	}
+	if h.store.sequence != sequence || !reflect.DeepEqual(currentState(t, h).Cells[cellID], current) {
+		t.Fatal("registration mismatch changed durable live state")
+	}
+	mismatch = declaration
+	mismatch.CapacityBytes++
+	if _, err := h.manager.ConvergeCell(cellID, mismatch); !errors.Is(err, ErrConflict) {
+		t.Fatalf("initial-capacity declaration mismatch = %v", err)
+	}
+	mismatch = declaration
+	mismatch.ID = "22222222-2222-4222-8222-222222222222"
+	if _, err := h.manager.ConvergeCell(cellID, mismatch); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("path/body identity mismatch = %v", err)
+	}
+}
+
+func TestConvergentCellRegistrationPinsCompatiblePreDigestStateOnce(t *testing.T) {
+	h := newManagerHarness(t)
+	cellID := "11111111-1111-4111-8111-111111111111"
+	declaration := RegisterCellRequest{
+		ID: cellID, AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 8 << 30, CapacityInodes: 800_000, Pool: PoolProduct,
+	}
+	cell, err := h.manager.RegisterCell("pre-digest-cell", declaration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareCellForAdmission(t, h, cell)
+	if _, err := h.manager.CreateVolume("pre-digest-volume", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.manager.UpdateCellCapacity("pre-digest-raise", cellID, UpdateCellCapacityRequest{
+		CapacityBytes: 10 << 30, CapacityInodes: 1_000_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.store.TransactNatural("test-pre-registration-digest", h.now.Unix(), func(state *State) (any, bool, error) {
+		current := state.Cells[cellID]
+		current.RegistrationSHA256 = ""
+		state.Cells[cellID] = current
+		return current, true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := currentState(t, h).Cells[cellID]
+	sequence := h.store.sequence
+	pinned, err := h.manager.ConvergeCell(cellID, declaration)
+	if err != nil || pinned.RegistrationSHA256 == "" {
+		t.Fatalf("compatible pre-digest registration = %+v, %v", pinned, err)
+	}
+	want := before
+	want.RegistrationSHA256 = pinned.RegistrationSHA256
+	if !reflect.DeepEqual(pinned, want) || h.store.sequence != sequence+1 {
+		t.Fatalf("digest adoption changed live state or append count: got=%+v want=%+v sequence=%d->%d", pinned, want, sequence, h.store.sequence)
+	}
+	sequence = h.store.sequence
+	if replay, err := h.manager.ConvergeCell(cellID, declaration); err != nil || !reflect.DeepEqual(replay, pinned) || h.store.sequence != sequence {
+		t.Fatalf("post-adoption exact replay = %+v, %v sequence=%d->%d", replay, err, sequence, h.store.sequence)
+	}
+}
+
+func TestManagerRestartAcceptsBehindHeartbeatButMountsWaitForExactPlan(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	appliedGeneration := cell.PlanGeneration
+	if _, err := h.manager.CreateVolume("restart-behind-sibling", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "sibling", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 50_000, Pool: PoolProduct,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	desired := currentState(t, h).Cells[cell.ID]
+	if desired.PlanGeneration <= appliedGeneration {
+		t.Fatalf("desired generation = %d, applied = %d", desired.PlanGeneration, appliedGeneration)
+	}
+	statePath := h.store.path
+	managerConfig := h.manager.cfg
+	if err := h.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	managerConfig.Store = reopened
+	restarted, err := NewManager(managerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.cellLive(desired, h.now.Unix()) || restarted.cellConverged(desired, h.now.Unix()) {
+		t.Fatal("manager restart trusted process-local liveness it did not observe")
+	}
+	if err := restarted.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: appliedGeneration, ManagerReleaseID: restarted.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatalf("behind post-restart heartbeat = %v", err)
+	}
+	if !restarted.cellLive(desired, h.now.Unix()) || restarted.cellConverged(desired, h.now.Unix()) {
+		t.Fatalf("behind heartbeat liveness/convergence = %v/%v", restarted.cellLive(desired, h.now.Unix()), restarted.cellConverged(desired, h.now.Unix()))
+	}
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	issue := func(requestID string) (MountAuthorization, error) {
+		return restarted.IssueMount(requestID, IssueMountRequest{
+			VolumeID: volume.ID, ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, requestID, []string{"read"}),
+			ClientCSRPEM: clientCSR, Access: []string{"read"},
+		})
+	}
+	if _, err := issue("restart-behind-refused"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("mount while post-restart plan is behind = %v", err)
+	}
+	if err := restarted.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: desired.PlanGeneration, ManagerReleaseID: restarted.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatalf("exact post-restart heartbeat = %v", err)
+	}
+	if authorization, err := issue("restart-converged-issued"); err != nil || authorization.VolumeID != volume.ID {
+		t.Fatalf("mount after exact convergence = %+v, %v", authorization, err)
+	}
+}
+
+func TestEnrollmentRefreshWaitsForExactPlanDuringConvergence(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	clientPublic, clientCSR := testCSR(t)
+	peerSPKI, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(peerSPKI)
+	issued, err := h.manager.IssueMount("convergence-enrollment-issue", IssueMountRequest{
+		VolumeID: volume.ID, ProductAuthorization: signedProductAuthorization(t, h, volume.Volume, peer, "convergence-enrollment-issue", []string{"write"}),
+		ClientCSRPEM: clientCSR, Access: []string{"write"}, AutomaticReauthorization: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appliedGeneration := cell.PlanGeneration
+	if _, err := h.manager.CreateVolume("convergence-enrollment-sibling", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "sibling", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 50_000, Pool: PoolProduct,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	desired := currentState(t, h).Cells[cell.ID]
+	if desired.PlanGeneration <= appliedGeneration || !h.manager.cellLive(desired, h.now.Unix()) || h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatalf("converging cell = %+v; live=%v converged=%v", desired,
+			h.manager.cellLive(desired, h.now.Unix()), h.manager.cellConverged(desired, h.now.Unix()))
+	}
+	request := RefreshMountEnrollmentRequest{
+		ClientCSRPEM: clientCSR, SessionID: base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef")), Sequence: 1,
+	}
+	sequence := h.store.sequence
+	if _, err := h.manager.RefreshMountEnrollment("convergence-refresh-refused", issued.EnrollmentID, request); !errors.Is(err, ErrConflict) {
+		t.Fatalf("enrollment refresh during convergence = %v", err)
+	}
+	if h.store.sequence != sequence {
+		t.Fatalf("refused convergence refresh appended state: %d -> %d", sequence, h.store.sequence)
+	}
+	if err := h.manager.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: desired.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatalf("exact convergence heartbeat = %v", err)
+	}
+	refreshed, err := h.manager.RefreshMountEnrollment("convergence-refresh-issued", issued.EnrollmentID, request)
+	if err != nil || refreshed.Sequence != 1 || refreshed.SessionID != request.SessionID {
+		t.Fatalf("enrollment refresh after convergence = %+v, %v", refreshed, err)
+	}
 }
 
 func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
@@ -1451,22 +1674,58 @@ func TestHeartbeatIsLiveFailClosedStateAndDoesNotPretendToSurviveRestart(t *test
 		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
 		AgentReleaseID: "agent-r1", HelperReleaseID: "helper-r1", ObservedUnix: h.now.Unix(),
 	}
-	if err := h.manager.HeartbeatCell(heartbeat); err != nil || !h.manager.cellFresh(cell, h.now.Unix()) {
-		t.Fatalf("live heartbeat = %v, fresh=%v", err, h.manager.cellFresh(cell, h.now.Unix()))
+	if err := h.manager.HeartbeatCell(heartbeat); err != nil || !h.manager.cellConverged(cell, h.now.Unix()) {
+		t.Fatalf("live heartbeat = %v, converged=%v", err, h.manager.cellConverged(cell, h.now.Unix()))
 	}
 	restarted, err := NewManager(h.manager.cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if restarted.cellFresh(cell, h.now.Unix()) {
+	if restarted.cellConverged(cell, h.now.Unix()) {
 		t.Fatal("a manager restart inherited a heartbeat it did not observe")
 	}
-	if err := restarted.HeartbeatCell(heartbeat); err != nil || !restarted.cellFresh(cell, h.now.Unix()) {
-		t.Fatalf("post-restart heartbeat = %v, fresh=%v", err, restarted.cellFresh(cell, h.now.Unix()))
+	if err := restarted.HeartbeatCell(heartbeat); err != nil || !restarted.cellConverged(cell, h.now.Unix()) {
+		t.Fatalf("post-restart heartbeat = %v, converged=%v", err, restarted.cellConverged(cell, h.now.Unix()))
 	}
 	heartbeat.PlanGeneration++
 	if err := restarted.HeartbeatCell(heartbeat); !errors.Is(err, ErrConflict) {
 		t.Fatalf("ahead heartbeat = %v", err)
+	}
+}
+
+func TestMountAuthorizationRequiresExactDesiredPlanConvergence(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, ready := readyVolumeForMount(t, h)
+	if _, err := h.manager.CreateVolume("converging-sibling", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "sibling", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	desired := currentState(t, h).Cells[cell.ID]
+	if !h.manager.cellLive(desired, h.now.Unix()) || h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatalf("post-placement state: live=%v converged=%v", h.manager.cellLive(desired, h.now.Unix()), h.manager.cellConverged(desired, h.now.Unix()))
+	}
+	clientPublic, clientCSR := testCSR(t)
+	spki, err := x509.MarshalPKIXPublicKey(clientPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := sha256.Sum256(spki)
+	request := IssueMountRequest{VolumeID: ready.ID,
+		ProductAuthorization: signedProductAuthorization(t, h, ready.Volume, peer, "converging-mount", []string{"read"}),
+		ClientCSRPEM:         clientCSR, Access: []string{"read"}}
+	if _, err := h.manager.IssueMount("converging-mount", request); !errors.Is(err, ErrConflict) {
+		t.Fatalf("mount before exact plan convergence = %v", err)
+	}
+	*h.now = h.now.Add(time.Second)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{CellID: cell.ID, PlanGeneration: desired.PlanGeneration,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	request.ProductAuthorization = signedProductAuthorization(t, h, ready.Volume, peer, "converged-mount", []string{"read"})
+	if _, err := h.manager.IssueMount("converged-mount", request); err != nil {
+		t.Fatalf("mount after exact plan convergence = %v", err)
 	}
 }
 
@@ -1694,12 +1953,6 @@ func readyVolumesForMount(t *testing.T, h managerHarness) (Cell, VolumeView, Vol
 		return volume
 	}
 	volumeA := create("ready-volume-a", "owner-a")
-	if err := h.manager.HeartbeatCell(CellHeartbeat{
-		CellID: cell.ID, PlanGeneration: verifiedPlan(t, h.manager, cell.ID, *h.now).Generation,
-		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
-	}); err != nil {
-		t.Fatal(err)
-	}
 	volumeB := create("ready-volume-b", "owner-b")
 	_, csrA := testCSR(t)
 	_, csrB := testCSR(t)

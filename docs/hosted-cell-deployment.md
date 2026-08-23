@@ -141,10 +141,13 @@ the agent and helper still require a valid cell-plan signature.
 
 ## Start and verify
 
-Register the cell through the manager operator API before starting the agent.
-The registered capacity is admission capacity, not a replacement for XFS's own
-free-space accounting. Choose non-overlapping allocator starts for project ID,
-service UID, and TCP port.
+Converge the cell through the manager operator
+`PUT /v1/cells/{cell-uuid}` API before starting the agent. Reapplying the exact
+normalized declaration is a no-op; a changed host, zone, pool, initial
+capacity, or allocator declaration is an operator conflict and never rewrites
+the cell's live state. The registered capacity is admission capacity, not a
+replacement for XFS's own free-space accounting. Choose non-overlapping
+allocator starts for project ID, service UID, and TCP port.
 
 Then enable the two cell services using the cell UUID as the instance:
 

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -69,6 +70,7 @@ type Manager struct {
 	capabilityPublicKeyPEM string
 	heartbeatMu            sync.RWMutex
 	heartbeats             map[string]CellHeartbeat
+	heartbeatConflictUnix  map[string]int64
 }
 
 const mountEnrollmentRetention = 15 * time.Minute
@@ -146,21 +148,130 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Manager{cfg: cfg, planPublicKeyPEM: planPEM, capabilityPublicKeyPEM: capabilityPEM, heartbeats: make(map[string]CellHeartbeat)}, nil
+	return &Manager{
+		cfg: cfg, planPublicKeyPEM: planPEM, capabilityPublicKeyPEM: capabilityPEM,
+		heartbeats: make(map[string]CellHeartbeat), heartbeatConflictUnix: make(map[string]int64),
+	}, nil
 }
 
 func (manager *Manager) RegisterCell(requestID string, request RegisterCellRequest) (Cell, error) {
+	var err error
+	request, err = normalizeRegisterCellRequest(request, true)
+	if err != nil {
+		return Cell{}, err
+	}
+	now := nowUnix(manager.cfg.Now)
+	raw, _, err := manager.cfg.Store.Transact(requestID, "register-cell", request, now, func(state *State) (any, error) {
+		if previous, exists := state.Cells[request.ID]; exists {
+			if previous.Abandoned {
+				return nil, ErrQuarantined
+			}
+			return nil, ErrConflict
+		}
+		cell := manager.newCell(request, now)
+		state.Cells[cell.ID] = cell
+		return cell, nil
+	})
+	if err != nil {
+		return Cell{}, err
+	}
+	return decode[Cell](raw)
+}
+
+// ConvergeCell registers one declaratively named cell. Reapplying the exact
+// normalized declaration returns the live current Cell without replacing
+// capacity raises, allocator progress, health, or desired-plan state.
+func (manager *Manager) ConvergeCell(cellID string, request RegisterCellRequest) (Cell, error) {
+	if !cellplan.ValidID(cellID) || request.ID != "" && request.ID != cellID {
+		return Cell{}, ErrInvalid
+	}
+	request.ID = cellID
+	var err error
+	request, err = normalizeRegisterCellRequest(request, false)
+	if err != nil {
+		return Cell{}, err
+	}
+	now := nowUnix(manager.cfg.Now)
+	raw, err := manager.cfg.Store.TransactNatural("converge-cell-registration", now, func(state *State) (any, bool, error) {
+		current, exists := state.Cells[cellID]
+		if !exists {
+			cell := manager.newCell(request, now)
+			state.Cells[cell.ID] = cell
+			return cell, true, nil
+		}
+		if current.Abandoned {
+			return nil, false, ErrQuarantined
+		}
+		fingerprint := registerCellFingerprint(request)
+		if current.RegistrationSHA256 != "" {
+			if current.RegistrationSHA256 != fingerprint {
+				return nil, false, ErrConflict
+			}
+			return current, false, nil
+		}
+		// Schema-v2 cells written before convergent registration have no exact
+		// declaration digest. The first compatible operator declaration pins it
+		// without changing any live field. Capacity and allocator starts may only
+		// describe floors the current cell has already advanced beyond.
+		if current.ID != request.ID || current.AvailabilityZone != request.AvailabilityZone ||
+			current.AuthorityHost != request.AuthorityHost || current.AuthorityDNSZone != request.AuthorityDNSZone || current.Pool != request.Pool ||
+			request.CapacityBytes > current.CapacityBytes || request.CapacityInodes > current.CapacityInodes ||
+			request.FirstProjectID > current.NextProjectID || request.FirstServiceUID > current.NextServiceUID || request.FirstPort > current.NextPort {
+			return nil, false, ErrConflict
+		}
+		current.RegistrationSHA256 = fingerprint
+		state.Cells[cellID] = current
+		return current, true, nil
+	})
+	if err != nil {
+		return Cell{}, err
+	}
+	return decode[Cell](raw)
+}
+
+// ListCells returns the complete operator inventory in stable ID order.
+func (manager *Manager) ListCells() (CellList, error) {
+	result := CellList{Cells: make([]Cell, 0)}
+	err := manager.cfg.Store.View(func(state State) error {
+		result.Cells = make([]Cell, 0, len(state.Cells))
+		for _, id := range sortedCellIDs(state.Cells) {
+			result.Cells = append(result.Cells, state.Cells[id])
+		}
+		return nil
+	})
+	return result, err
+}
+
+// ListVolumes returns the complete operator inventory in stable ID order.
+func (manager *Manager) ListVolumes() (VolumeList, error) {
+	result := VolumeList{Volumes: make([]VolumeView, 0)}
+	err := manager.cfg.Store.View(func(state State) error {
+		ids := make([]string, 0, len(state.Volumes))
+		for id := range state.Volumes {
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		result.Volumes = make([]VolumeView, 0, len(ids))
+		for _, id := range ids {
+			result.Volumes = append(result.Volumes, state.volumeView(state.Volumes[id]))
+		}
+		return nil
+	})
+	return result, err
+}
+
+func normalizeRegisterCellRequest(request RegisterCellRequest, generateID bool) (RegisterCellRequest, error) {
 	request.AvailabilityZone = strings.TrimSpace(request.AvailabilityZone)
 	request.AuthorityHost = strings.ToLower(strings.TrimSpace(request.AuthorityHost))
 	request.AuthorityDNSZone = strings.ToLower(strings.TrimSpace(request.AuthorityDNSZone))
 	request.Pool = strings.ToLower(strings.TrimSpace(request.Pool))
-	if request.ID == "" {
+	if request.ID == "" && generateID {
 		request.ID = newUUID()
 	}
 	if !cellplan.ValidID(request.ID) || !validIdentity(request.AvailabilityZone) ||
 		net.ParseIP(request.AuthorityHost) == nil && !validDNSName(request.AuthorityHost) ||
 		!validDNSName(request.AuthorityDNSZone) || request.CapacityBytes == 0 || request.CapacityInodes == 0 || !validPool(request.Pool) {
-		return Cell{}, ErrInvalid
+		return RegisterCellRequest{}, ErrInvalid
 	}
 	if request.FirstProjectID == 0 {
 		request.FirstProjectID = 10_000
@@ -171,34 +282,35 @@ func (manager *Manager) RegisterCell(requestID string, request RegisterCellReque
 	if request.FirstPort == 0 {
 		request.FirstPort = 20_000
 	}
-	now := nowUnix(manager.cfg.Now)
-	raw, _, err := manager.cfg.Store.Transact(requestID, "register-cell", request, now, func(state *State) (any, error) {
-		if previous, exists := state.Cells[request.ID]; exists {
-			if previous.Abandoned {
-				return nil, ErrQuarantined
-			}
-			return nil, ErrConflict
-		}
-		cell := Cell{
-			ID: request.ID, AvailabilityZone: request.AvailabilityZone, AuthorityHost: request.AuthorityHost,
-			AuthorityDNSZone: request.AuthorityDNSZone, CapacityBytes: request.CapacityBytes, CapacityInodes: request.CapacityInodes, Pool: request.Pool,
-			NextProjectID: request.FirstProjectID, NextServiceUID: request.FirstServiceUID, NextPort: request.FirstPort,
-			PlanGeneration: 1, PlanReleaseID: manager.cfg.ReleaseID,
-			PlanIssuedUnix: now, PlanExpiresUnix: now + int64(manager.cfg.PlanLifetime/time.Second),
-			Health: CellUnknown,
-		}
-		state.Cells[cell.ID] = cell
-		return cell, nil
-	})
-	if err != nil {
-		return Cell{}, err
+	if request.FirstProjectID == 0 || request.FirstServiceUID < 1000 || request.FirstPort < 1024 {
+		return RegisterCellRequest{}, ErrInvalid
 	}
-	return decode[Cell](raw)
+	return request, nil
 }
 
-// HeartbeatCell refreshes live admission health without appending a durable
-// full-state record. Desired/observed changes still use ObserveCell; after a
-// manager restart, mounts fail closed until the next authenticated heartbeat.
+func registerCellFingerprint(request RegisterCellRequest) string {
+	payload, _ := json.Marshal(request)
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:])
+}
+
+func (manager *Manager) newCell(request RegisterCellRequest, now int64) Cell {
+	return Cell{
+		ID: request.ID, AvailabilityZone: request.AvailabilityZone, AuthorityHost: request.AuthorityHost,
+		AuthorityDNSZone: request.AuthorityDNSZone, CapacityBytes: request.CapacityBytes, CapacityInodes: request.CapacityInodes, Pool: request.Pool,
+		NextProjectID: request.FirstProjectID, NextServiceUID: request.FirstServiceUID, NextPort: request.FirstPort,
+		PlanGeneration: 1, PlanReleaseID: manager.cfg.ReleaseID,
+		PlanIssuedUnix: now, PlanExpiresUnix: now + int64(manager.cfg.PlanLifetime/time.Second),
+		Health: CellUnknown, RegistrationSHA256: registerCellFingerprint(request),
+	}
+}
+
+// HeartbeatCell refreshes process liveness without appending a durable
+// full-state record. The applied generation may trail the Manager's complete
+// desired plan while the cell converges, but it may never lead it. Exact
+// convergence remains a separate mount-authorization gate. Desired/observed
+// changes still use ObserveCell; after a manager restart, mounts fail closed
+// until the next authenticated heartbeat.
 func (manager *Manager) HeartbeatCell(heartbeat CellHeartbeat) error {
 	now := manager.cfg.Now().UTC()
 	if !cellplan.ValidID(heartbeat.CellID) || heartbeat.PlanGeneration == 0 || heartbeat.ManagerReleaseID != manager.cfg.ReleaseID ||
@@ -211,7 +323,7 @@ func (manager *Manager) HeartbeatCell(heartbeat CellHeartbeat) error {
 		if !ok {
 			return ErrNotFound
 		}
-		if cell.PlanGeneration != heartbeat.PlanGeneration || cell.Health == CellQuarantined {
+		if heartbeat.PlanGeneration > cell.PlanGeneration || cell.Health == CellQuarantined {
 			return ErrConflict
 		}
 		return nil
@@ -226,18 +338,60 @@ func (manager *Manager) recordHeartbeat(heartbeat CellHeartbeat) {
 	manager.heartbeatMu.Lock()
 	defer manager.heartbeatMu.Unlock()
 	previous := manager.heartbeats[heartbeat.CellID]
-	if heartbeat.ObservedUnix >= previous.ObservedUnix {
+	// The cell's observation time orders evidence. An older packet cannot
+	// replace newer evidence, but a newer observation at a lower generation is
+	// a real convergence regression and must be recorded.
+	if heartbeat.ObservedUnix > previous.ObservedUnix {
 		manager.heartbeats[heartbeat.CellID] = heartbeat
+		if previous.PlanGeneration > 0 && heartbeat.PlanGeneration < previous.PlanGeneration {
+			manager.heartbeatConflictUnix[heartbeat.CellID] = heartbeat.ObservedUnix
+		} else {
+			delete(manager.heartbeatConflictUnix, heartbeat.CellID)
+		}
+		return
 	}
+	if heartbeat.ObservedUnix < previous.ObservedUnix {
+		return
+	}
+	if heartbeat.PlanGeneration < previous.PlanGeneration {
+		// Generations may advance several times inside one timestamp second, but
+		// they may not move backward. A same-time regression is therefore
+		// ambiguous reordered evidence: retain its lower generation and refuse
+		// to reopen convergence at that timestamp.
+		manager.heartbeats[heartbeat.CellID] = heartbeat
+		manager.heartbeatConflictUnix[heartbeat.CellID] = heartbeat.ObservedUnix
+		return
+	}
+	if manager.heartbeatConflictUnix[heartbeat.CellID] == heartbeat.ObservedUnix {
+		return
+	}
+	manager.heartbeats[heartbeat.CellID] = heartbeat
 }
 
-func (manager *Manager) cellFresh(cell Cell, now int64) bool {
+func (manager *Manager) cellHeartbeat(cellID string) CellHeartbeat {
 	manager.heartbeatMu.RLock()
-	heartbeat := manager.heartbeats[cell.ID]
+	heartbeat := manager.heartbeats[cellID]
 	manager.heartbeatMu.RUnlock()
-	return heartbeat.CellID == cell.ID && heartbeat.PlanGeneration == cell.PlanGeneration &&
+	return heartbeat
+}
+
+func (manager *Manager) heartbeatLive(cell Cell, heartbeat CellHeartbeat, now int64) bool {
+	return heartbeat.CellID == cell.ID && heartbeat.PlanGeneration > 0 && heartbeat.PlanGeneration <= cell.PlanGeneration &&
 		heartbeat.ManagerReleaseID == manager.cfg.ReleaseID && heartbeat.AgentReleaseID != "" && heartbeat.HelperReleaseID != "" &&
 		now-heartbeat.ObservedUnix <= int64(manager.cfg.ObservedStaleAfter/time.Second)
+}
+
+func (manager *Manager) cellLive(cell Cell, now int64) bool {
+	return manager.heartbeatLive(cell, manager.cellHeartbeat(cell.ID), now)
+}
+
+// cellConverged is stronger than liveness: the helper has applied the exact
+// complete desired plan. Serving credentials require this; placement does not,
+// because each transaction already reserves capacity and allocator identities
+// in the next complete level-triggered plan.
+func (manager *Manager) cellConverged(cell Cell, now int64) bool {
+	heartbeat := manager.cellHeartbeat(cell.ID)
+	return manager.heartbeatLive(cell, heartbeat, now) && heartbeat.PlanGeneration == cell.PlanGeneration
 }
 
 func (manager *Manager) CreateVolume(requestID string, request CreateVolumeRequest) (VolumeView, error) {
@@ -1110,7 +1264,7 @@ func (manager *Manager) issueMount(requestID, operation, volumeID, productToken,
 		}
 		placement := volume.Placement
 		cell := state.Cells[placement.CellID]
-		if !mountableVolume(volume) || cell.Health != CellHealthy || !manager.cellFresh(cell, now) {
+		if !mountableVolume(volume) || cell.Health != CellHealthy || !manager.cellConverged(cell, now) {
 			return nil, ErrConflict
 		}
 		// Once an enrollment binds sequence one, Manager refuses another issuer
@@ -1264,7 +1418,7 @@ func (manager *Manager) RefreshMountEnrollment(requestID, enrollmentID string, r
 			enrollmentEnded = true
 			return MountAuthorization{}, pruned, nil
 		}
-		if !cellOK || !mountableVolume(volume) || cell.Health != CellHealthy || !manager.cellFresh(cell, now) {
+		if !cellOK || !mountableVolume(volume) || cell.Health != CellHealthy || !manager.cellConverged(cell, now) {
 			return nil, false, ErrConflict
 		}
 		if enrollment.PeerSPKI != hex.EncodeToString(peer[:]) {
@@ -1625,6 +1779,8 @@ func (manager *Manager) Capacity() (CapacityReport, error) {
 			_, restoreErr := manager.admitPlacement(&state, pool, manager.cfg.ProvisionFloorBytes, manager.cfg.ProvisionFloorInodes, true, now)
 			byPool[pool].CreateAdmissible = createErr == nil
 			byPool[pool].RestoreAdmissible = restoreErr == nil
+			byPool[pool].CreateStatus = admissionStatus(createErr)
+			byPool[pool].RestoreStatus = admissionStatus(restoreErr)
 			report.Pools = append(report.Pools, *byPool[pool])
 		}
 		return nil
@@ -1661,11 +1817,15 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 	// gate and was passed over only for a concurrency cap. That distinction is
 	// the caller's error: a saturated fleet is retryable, an exhausted one is not.
 	busySkipped := false
+	// unavailableSkipped means at least one durable cell could physically hold
+	// the placement, but its current liveness or full-usage evidence is stale.
+	// This is retryable without changing the request and is therefore distinct
+	// from fleet capacity exhaustion.
+	unavailableSkipped := false
 	staleAfter := int64(manager.cfg.UsageStaleAfter / time.Second)
 	for _, id := range sortedCellIDs(state.Cells) {
 		cell := state.Cells[id]
-		if cell.Pool != pool || cell.Health == CellQuarantined || cell.Decommissioning || cell.Abandoned || !manager.cellFresh(cell, now) ||
-			cell.LastObservedUnix == 0 || now-cell.LastObservedUnix > staleAfter || cell.NextProjectID == ^uint32(0) ||
+		if cell.Pool != pool || cell.Health == CellQuarantined || cell.Decommissioning || cell.Abandoned || cell.NextProjectID == ^uint32(0) ||
 			cell.NextServiceUID == ^uint32(0) || cell.NextPort == ^uint16(0) {
 			continue
 		}
@@ -1680,7 +1840,7 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 			placements++
 			chargeBytes := max(volume.Placement.UsedBytes, volume.Placement.PendingBytes, manager.cfg.ProvisionFloorBytes)
 			chargeInodes := max(volume.Placement.UsedInodes, volume.Placement.PendingInodes, manager.cfg.ProvisionFloorInodes)
-			// The cell-level freshness gate above does not cover one placement
+			// The cell-level freshness gate below does not cover one placement
 			// whose own measurement froze while its cell kept heartbeating. Past
 			// UsageStaleAfter from the later of its last measurement and its
 			// creation — the grace window a never-yet-measured placement gets —
@@ -1714,6 +1874,10 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 		if !isRestore && cell.CapacityBytes-postBytes < manager.cfg.WakeBurstBytes {
 			continue
 		}
+		if !manager.cellLive(cell, now) || cell.LastObservedUnix == 0 || now-cell.LastObservedUnix > staleAfter {
+			unavailableSkipped = true
+			continue
+		}
 		// Checked last so a cell rejected here is known to be otherwise able to
 		// hold the placement — merely busy, not out of room.
 		if isRestore && restoringCellLoad(state, id) >= manager.cfg.MaxRestoringPerCell {
@@ -1730,9 +1894,25 @@ func (manager *Manager) admitPlacement(state *State, pool string, needBytes, nee
 		if busySkipped {
 			return nil, ErrBusy
 		}
+		if unavailableSkipped {
+			return nil, ErrCellUnavailable
+		}
 		return nil, ErrCapacity
 	}
 	return selected, nil
+}
+
+func admissionStatus(err error) AdmissionStatus {
+	switch {
+	case err == nil:
+		return AdmissionAdmissible
+	case errors.Is(err, ErrCellUnavailable):
+		return AdmissionCellUnavailable
+	case errors.Is(err, ErrBusy):
+		return AdmissionBusy
+	default:
+		return AdmissionCapacity
+	}
 }
 
 // archivingCellLoad counts archive cycles whose remaining work still runs on

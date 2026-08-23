@@ -4,9 +4,26 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestAdmissionStatusPreservesStableRefusalClasses(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want AdmissionStatus
+	}{
+		{err: nil, want: "ADMISSIBLE"},
+		{err: ErrCellUnavailable, want: "CELL_UNAVAILABLE"},
+		{err: ErrCapacity, want: "CAPACITY_EXHAUSTED"},
+		{err: ErrBusy, want: "BUSY"},
+	} {
+		if got := admissionStatus(test.err); got != test.want {
+			t.Fatalf("admissionStatus(%v) = %q, want %q", test.err, got, test.want)
+		}
+	}
+}
 
 func TestPlacementAdmissionUsesPendingChargesAndStaleUsageFailsClosed(t *testing.T) {
 	h := newManagerHarness(t)
@@ -44,6 +61,191 @@ func TestPlacementAdmissionUsesPendingChargesAndStaleUsageFailsClosed(t *testing
 	if _, err := h.manager.CreateVolume("stale-usage", CreateVolumeRequest{AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
 		QuotaBytes: 1 << 30, QuotaInodes: 1000, Pool: PoolProduct}); !errors.Is(err, ErrCapacity) {
 		t.Fatalf("stale usage admission = %v", err)
+	}
+}
+
+func TestConcurrentCreatesSerializeAllocatorReservationsAndSurviveReopen(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.WakeBurstBytes = 1
+	cell, err := h.manager.RegisterCell("concurrent-cell", RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 100 << 30,
+		CapacityInodes: 10_000_000, Pool: PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell = prepareCellForAdmission(t, h, cell)
+	const creates = 32
+	type result struct {
+		volume VolumeView
+		err    error
+	}
+	results := make(chan result, creates)
+	var group sync.WaitGroup
+	for index := range creates {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			volume, createErr := h.manager.CreateVolume(fmt.Sprintf("concurrent-create-%02d", index), CreateVolumeRequest{
+				AuthorizationDomain: "org", Owner: fmt.Sprintf("owner-%02d", index), ProductIssuer: "opensteer",
+				QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+			})
+			results <- result{volume: volume, err: createErr}
+		}()
+	}
+	group.Wait()
+	close(results)
+
+	volumeIDs := make(map[string]struct{}, creates)
+	allocatorTuples := make(map[string]struct{}, creates)
+	projectIDs := make(map[uint32]struct{}, creates)
+	serviceUIDs := make(map[uint32]struct{}, creates)
+	ports := make(map[uint16]struct{}, creates)
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("concurrent create = %v", result.err)
+		}
+		if result.volume.Placement == nil {
+			t.Fatalf("concurrent create had no placement = %+v", result.volume)
+		}
+		volumeIDs[result.volume.ID] = struct{}{}
+		tuple := fmt.Sprintf("%d/%d/%d", result.volume.Placement.ProjectID, result.volume.Placement.ServiceUID, result.volume.Placement.ListenPort)
+		allocatorTuples[tuple] = struct{}{}
+		projectIDs[result.volume.Placement.ProjectID] = struct{}{}
+		serviceUIDs[result.volume.Placement.ServiceUID] = struct{}{}
+		ports[result.volume.Placement.ListenPort] = struct{}{}
+	}
+	if len(volumeIDs) != creates || len(allocatorTuples) != creates || len(projectIDs) != creates || len(serviceUIDs) != creates || len(ports) != creates {
+		t.Fatalf("unique volumes/tuples/projects/uids/ports = %d/%d/%d/%d/%d, want %d each",
+			len(volumeIDs), len(allocatorTuples), len(projectIDs), len(serviceUIDs), len(ports), creates)
+	}
+	state := currentState(t, h)
+	gotCell := state.Cells[cell.ID]
+	if len(state.Volumes) != creates || gotCell.PlanGeneration != cell.PlanGeneration+creates ||
+		gotCell.NextProjectID != cell.NextProjectID+creates || gotCell.NextServiceUID != cell.NextServiceUID+creates ||
+		gotCell.NextPort != cell.NextPort+creates {
+		t.Fatalf("serialized durable allocation = cell %+v, volumes %d", gotCell, len(state.Volumes))
+	}
+	for _, volume := range state.Volumes {
+		if volume.Placement == nil || volume.Placement.PendingBytes != h.manager.cfg.ProvisionFloorBytes ||
+			volume.Placement.PendingInodes != h.manager.cfg.ProvisionFloorInodes {
+			t.Fatalf("missing durable reservation = %+v", volume)
+		}
+	}
+
+	statePath := h.store.path
+	managerConfig := h.manager.cfg
+	if err := h.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	managerConfig.Store = reopened
+	restarted, err := NewManager(managerConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := restarted.ListVolumes()
+	if err != nil || len(listed.Volumes) != creates {
+		t.Fatalf("reopened volumes = %d, %v", len(listed.Volumes), err)
+	}
+	if err := reopened.View(func(current State) error {
+		currentCell := current.Cells[cell.ID]
+		if currentCell.NextProjectID != cell.NextProjectID+creates || currentCell.NextServiceUID != cell.NextServiceUID+creates ||
+			currentCell.NextPort != cell.NextPort+creates || currentCell.PlanGeneration != cell.PlanGeneration+creates {
+			t.Fatalf("reopened allocator/plan state = %+v", currentCell)
+		}
+		for id, volume := range current.Volumes {
+			if _, ok := volumeIDs[id]; !ok || volume.Placement == nil {
+				t.Fatalf("reopened volume identity = %s %+v", id, volume)
+			}
+			tuple := fmt.Sprintf("%d/%d/%d", volume.Placement.ProjectID, volume.Placement.ServiceUID, volume.Placement.ListenPort)
+			if _, ok := allocatorTuples[tuple]; !ok {
+				t.Fatalf("reopened allocator tuple = %s", tuple)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFailedReconciliationAgesAvailabilityWithoutReleasingReservations(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.WakeBurstBytes = 1
+	cell, err := h.manager.RegisterCell("failed-reconcile-cell", RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 10 << 30,
+		CapacityInodes: 1_000_000, Pool: PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareCellForAdmission(t, h, cell)
+	volume, err := h.manager.CreateVolume("unreconciled-volume", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := currentState(t, h)
+	beforeSequence := h.store.sequence
+	*h.now = h.now.Add(max(h.manager.cfg.ObservedStaleAfter, h.manager.cfg.UsageStaleAfter) + time.Second)
+	if _, err := h.manager.CreateVolume("cell-unavailable-create", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner-2", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); !errors.Is(err, ErrCellUnavailable) {
+		t.Fatalf("aged failed reconciliation = %v", err)
+	}
+	after := currentState(t, h)
+	if h.store.sequence != beforeSequence || len(after.Volumes) != len(before.Volumes) ||
+		after.Cells[cell.ID].NextProjectID != before.Cells[cell.ID].NextProjectID {
+		t.Fatalf("unavailable refusal mutated durable state: before=%+v after=%+v", before.Cells[cell.ID], after.Cells[cell.ID])
+	}
+	retained := after.Volumes[volume.ID]
+	if retained.Placement == nil || retained.Placement.PendingBytes != h.manager.cfg.ProvisionFloorBytes ||
+		retained.Placement.PendingInodes != h.manager.cfg.ProvisionFloorInodes {
+		t.Fatalf("failed reconciliation released its charge = %+v", retained)
+	}
+	report, err := h.manager.Capacity()
+	if err != nil || report.Pools[0].CreateAdmissible || report.Pools[0].CreateStatus != AdmissionCellUnavailable {
+		t.Fatalf("unavailable capacity report = %+v, %v", report, err)
+	}
+}
+
+func TestFreshHeartbeatCannotSubstituteForStaleFullUsage(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.WakeBurstBytes = 1
+	cell, err := h.manager.RegisterCell("stale-full-usage-cell", RegisterCellRequest{
+		ID: "11111111-1111-4111-8111-111111111111", AvailabilityZone: "zone-a",
+		AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test", CapacityBytes: 10 << 30,
+		CapacityInodes: 1_000_000, Pool: PoolProduct,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell = prepareCellForAdmission(t, h, cell)
+	*h.now = h.now.Add(h.manager.cfg.UsageStaleAfter + time.Second)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{
+		CellID: cell.ID, PlanGeneration: cell.PlanGeneration, ManagerReleaseID: h.manager.ReleaseIdentity(),
+		AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.manager.CreateVolume("stale-full-usage-create", CreateVolumeRequest{
+		AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+		QuotaBytes: 1 << 30, QuotaInodes: 100_000, Pool: PoolProduct,
+	}); !errors.Is(err, ErrCellUnavailable) {
+		t.Fatalf("fresh heartbeat with stale full usage = %v", err)
+	}
+	report, err := h.manager.Capacity()
+	if err != nil || report.Pools[0].CreateStatus != AdmissionCellUnavailable {
+		t.Fatalf("stale full-usage report = %+v, %v", report, err)
 	}
 }
 
@@ -122,13 +324,111 @@ func TestPeriodicUnchangedObservationsKeepIdleCellAdmissible(t *testing.T) {
 		observeTieredCell(t, h, cell.ID, fmt.Sprintf("idle-refresh-%d", refresh), true, observations...)
 	}
 	report, err := h.manager.Capacity()
-	if err != nil || !report.Pools[0].CreateAdmissible {
+	if err != nil || !report.Pools[0].CreateAdmissible || report.Pools[0].CreateStatus != AdmissionAdmissible {
 		t.Fatalf("capacity after periodic unchanged observations = %+v, %v", report, err)
 	}
 	for _, volume := range currentState(t, h).Volumes {
 		if h.now.Unix()-volume.Placement.UsedObservedUnix > int64(h.manager.cfg.UsageStaleAfter/time.Second) {
 			t.Fatalf("periodic observation left stale usage = %+v", volume.Placement)
 		}
+	}
+}
+
+func TestPlacementAdmissionDoesNotConfuseDesiredPlanConvergenceWithCapacity(t *testing.T) {
+	h := newManagerHarness(t)
+	h.manager.cfg.WakeBurstBytes = 1
+	cell, err := h.manager.RegisterCell("convergence-cell", RegisterCellRequest{ID: "11111111-1111-4111-8111-111111111111",
+		AvailabilityZone: "zone-a", AuthorityHost: "cell.test", AuthorityDNSZone: "cell.test",
+		CapacityBytes: 40 << 30, CapacityInodes: 2_000_000, Pool: PoolProduct})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell = prepareCellForAdmission(t, h, cell)
+	appliedGeneration := cell.PlanGeneration
+	var observations []VolumeObservation
+	for index := range 10 {
+		volume, createErr := h.manager.CreateVolume(fmt.Sprintf("convergence-volume-%d", index), CreateVolumeRequest{
+			AuthorizationDomain: "org", Owner: "owner", ProductIssuer: "opensteer",
+			QuotaBytes: 10 << 30, QuotaInodes: 1_000_000, Pool: PoolProduct,
+		})
+		if createErr != nil {
+			t.Fatalf("create %d while the complete desired plan was converging = %v", index, createErr)
+		}
+		observations = append(observations, VolumeObservation{
+			VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+		})
+	}
+	state := currentState(t, h)
+	desired := state.Cells[cell.ID]
+	if desired.PlanGeneration != appliedGeneration+10 || !h.manager.cellLive(desired, h.now.Unix()) || h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatalf("desired/applied generations did not remain distinct: desired=%d applied=%d live=%v converged=%v",
+			desired.PlanGeneration, appliedGeneration, h.manager.cellLive(desired, h.now.Unix()), h.manager.cellConverged(desired, h.now.Unix()))
+	}
+	report, err := h.manager.Capacity()
+	if err != nil || !report.Pools[0].CreateAdmissible || report.Pools[0].PendingBytes != 10*h.manager.cfg.ProvisionFloorBytes {
+		t.Fatalf("capacity during convergence = %+v, %v", report, err)
+	}
+
+	// A heartbeat racing the desired-plan mutations still proves the cell
+	// processes are live. It does not claim that the newer complete plan has
+	// been applied.
+	*h.now = h.now.Add(time.Second)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{CellID: cell.ID, PlanGeneration: appliedGeneration,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix()}); err != nil {
+		t.Fatalf("live heartbeat from the last applied generation = %v", err)
+	}
+	if !h.manager.cellLive(desired, h.now.Unix()) || h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatalf("racing heartbeat changed convergence: live=%v converged=%v",
+			h.manager.cellLive(desired, h.now.Unix()), h.manager.cellConverged(desired, h.now.Unix()))
+	}
+	if err := h.manager.HeartbeatCell(CellHeartbeat{CellID: cell.ID, PlanGeneration: desired.PlanGeneration + 1,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix()}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("never-issued generation heartbeat = %v", err)
+	}
+
+	observeTieredCell(t, h, cell.ID, "convergence-applied", true, observations...)
+	desired = currentState(t, h).Cells[cell.ID]
+	if !h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatal("the exact applied complete plan did not restore convergence")
+	}
+	// A genuinely delayed lower-generation packet has an older cell timestamp
+	// and cannot replace the newer convergence evidence.
+	delayedObservedUnix := h.now.Add(-time.Second).Unix()
+	*h.now = h.now.Add(time.Second)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{CellID: cell.ID, PlanGeneration: appliedGeneration,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: delayedObservedUnix}); err != nil {
+		t.Fatalf("delayed older heartbeat = %v", err)
+	}
+	if !h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatal("a delayed older heartbeat replaced newer convergence evidence")
+	}
+	// A newer report at the lower generation is not delayed: it says the cell
+	// regressed and must immediately close the convergence gate.
+	if err := h.manager.HeartbeatCell(CellHeartbeat{CellID: cell.ID, PlanGeneration: appliedGeneration,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix()}); err != nil {
+		t.Fatalf("newer regressed heartbeat = %v", err)
+	}
+	if !h.manager.cellLive(desired, h.now.Unix()) || h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatalf("newer regression did not fail closed: live=%v converged=%v",
+			h.manager.cellLive(desired, h.now.Unix()), h.manager.cellConverged(desired, h.now.Unix()))
+	}
+	// Conflicting generations with the same second are ambiguous. Retaining
+	// the lower generation is conservative until a later observation arrives.
+	if err := h.manager.HeartbeatCell(CellHeartbeat{CellID: cell.ID, PlanGeneration: desired.PlanGeneration,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix()}); err != nil {
+		t.Fatalf("same-time exact heartbeat = %v", err)
+	}
+	if h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatal("same-time conflicting heartbeat reopened convergence")
+	}
+	*h.now = h.now.Add(time.Second)
+	if err := h.manager.HeartbeatCell(CellHeartbeat{CellID: cell.ID, PlanGeneration: desired.PlanGeneration,
+		ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix()}); err != nil {
+		t.Fatalf("later exact heartbeat = %v", err)
+	}
+	if !h.manager.cellConverged(desired, h.now.Unix()) {
+		t.Fatal("a later exact heartbeat did not restore convergence")
 	}
 }
 
@@ -153,7 +453,8 @@ func TestRestoreAdmissionRequiresAnArchiveCapableCell(t *testing.T) {
 		t.Fatalf("create onto an archive-incapable cell = %v", err)
 	}
 	report, err := h.manager.Capacity()
-	if err != nil || report.Pools[0].Pool != PoolProduct || !report.Pools[0].CreateAdmissible || report.Pools[0].RestoreAdmissible {
+	if err != nil || report.Pools[0].Pool != PoolProduct || !report.Pools[0].CreateAdmissible || report.Pools[0].RestoreAdmissible ||
+		report.Pools[0].CreateStatus != AdmissionAdmissible || report.Pools[0].RestoreStatus != AdmissionCapacity {
 		t.Fatalf("capacity report = %+v, %v", report, err)
 	}
 }
@@ -298,7 +599,8 @@ func TestPoolIsolationDecommissionCapacityRaiseAndReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Pools) != 3 || report.Pools[1].Pool != PoolSystem || report.Pools[1].CapacityBytes != 5<<30 || report.Pools[1].CreateAdmissible {
+	if len(report.Pools) != 3 || report.Pools[1].Pool != PoolSystem || report.Pools[1].CapacityBytes != 5<<30 || report.Pools[1].CreateAdmissible ||
+		report.Pools[1].CreateStatus != AdmissionCapacity {
 		t.Fatalf("capacity report = %+v", report)
 	}
 }

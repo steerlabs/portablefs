@@ -120,15 +120,25 @@ Before admitting a real product:
 
 1. Prove unauthenticated TLS, wrong-role clients, wrong cell IDs, and unknown
    product issuers are rejected.
-2. Register a disposable cell and provision a disposable quota-limited volume.
-3. Prove an exact idempotent retry is byte-identical and changed reuse fails.
-4. Restart the manager and prove mount issuance remains closed until a fresh
-   cell heartbeat.
+2. Converge a disposable cell with `PUT /v1/cells/{id}` and provision a
+   disposable quota-limited volume. Prove exact registration replay is a no-op
+   over live allocator, capacity, health, and plan state; prove a changed
+   declaration conflicts; prove operator cell and volume inventories are
+   stable-ID sorted.
+3. Prove an exact idempotent volume retry is byte-identical and changed reuse
+   fails.
+4. Restart the manager and prove a fresh behind-generation heartbeat restores
+   placement liveness but mount issue and renewal remain closed until a later
+   heartbeat reports the exact desired generation.
 5. Attempt a concurrent second manager and prove the state lock rejects it.
 6. Restore the state disk snapshot onto a replacement VM while the original is
    fenced, then reconcile without advancing an authority generation.
 7. Exercise block and inode quota exhaustion, authority crash, helper/agent
    restart, certificate renewal, strict-fence refusal, and cross-tenant denial.
+8. Submit a burst of placement requests inside one cell poll interval. Prove
+   each request receives a distinct durable reservation, the cell reconciles
+   the newest complete plan, and mount issuance stays closed until that exact
+   generation is observed.
 
 Never attach a restored state disk to a replacement manager until the original
 VM is stopped and externally fenced. Snapshots are backups, not distributed

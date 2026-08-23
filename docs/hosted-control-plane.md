@@ -74,6 +74,14 @@ durable observation only when observed state changes, and otherwise sends a
 non-durable heartbeat. After a manager restart, mount issuance fails closed
 until a fresh authenticated heartbeat arrives.
 
+The Manager tracks process liveness and desired-plan convergence separately.
+A fresh heartbeat from an applied generation at or behind the current desired
+generation keeps placement admission live while the cell reconciles a newer
+complete plan; durable pending charges and never-reused allocator identities
+make those placements safe to batch. Mount issuance and renewal require a
+heartbeat at the exact desired generation. A heartbeat claiming a generation
+the Manager never issued is refused.
+
 `portablefs-cell-helper` is the small root boundary. It has no network listener.
 Its Unix socket accepts only the configured agent UID using `SO_PEERCRED`. It
 verifies the same manager signature again and accepts no network-selected path,
@@ -354,6 +362,8 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | Caller | Endpoint | Purpose |
 | --- | --- | --- |
 | operator | `POST /v1/cells` | register cell capacity and allocator ranges |
+| operator | `PUT /v1/cells/{id}` | converge an exactly named cell registration without overwriting live state |
+| operator | `GET /v1/cells` | list the complete cell inventory in cell-ID order |
 | operator | `PATCH /v1/cells/{id}/capacity` | raise registered cell capacity monotonically (v2) |
 | operator | `POST /v1/cells/{id}/decommission` | stop admission and drain the cell through archive (v2) |
 | operator | `POST /v1/cells/{id}/abandon` | record a permanently lost cell and release only Manager-verified archived placements (v2) |
@@ -362,6 +372,7 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | cell | `POST /v1/cells/{id}/observations` | reconcile changed observed state |
 | cell | `POST /v1/cells/{id}/heartbeat` | refresh live health without a durable log write |
 | product | `POST /v1/volumes` | allocate a volume |
+| operator | `GET /v1/volumes` | list the complete volume inventory in volume-ID order |
 | product/operator | `GET /v1/volumes/{id}` | inspect an authorized volume |
 | product | `POST /v1/volumes/{id}/restart` | enter the fencing state |
 | operator | `POST /v1/volumes/{id}/strict-fence` | record external strict-mount fence evidence |
@@ -375,19 +386,33 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | product | `PUT /v1/volumes/{volume-id}/mount-enrollments/{enrollment-id}/revocation` | converge future renewal to revoked, closed, expired, or absent within the product-owned volume |
 | product | `PUT /v1/renewal-fences` | atomically advance a batch of issuer-scoped renewal epoch fences and revoke superseded enrollments |
 
-Three refusal classes on the archive, wake, and delete routes are kept
+`PUT /v1/cells/{id}` accepts no `Idempotency-Key`. The path supplies the cell
+identity and the body is normalized exactly as for registration. The first PUT
+creates the cell; an exact normalized replay returns the live current cell as a
+no-op. It never resets a monotonic capacity raise, allocator progress, health,
+or desired-plan state. Any changed registration declaration returns `409` and
+leaves state untouched. A schema-v2 cell written before declaration digests
+existed accepts one compatible declaration (same identities and pool, with
+capacity and allocator starts no greater than their monotonic live values) and
+persists only its digest; later replays use the exact rule. The two operator
+inventory GETs always return arrays, including when empty, with entries sorted
+by stable ID.
+
+Refusal classes on create, archive, wake, and delete routes are kept
 distinct because each demands a different client response:
 
 | Status | Meaning | Raised by | Client response |
 | --- | --- | --- | --- |
 | `503` | the archive store is unreachable right now | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` | retry the unchanged request later |
 | `503` | every eligible cell is at its per-cell archive or restore concurrency cap | `POST /v1/volumes/{id}/archive`, `POST /v1/volumes/{id}/wake` | retry the unchanged request later |
+| `503` | a cell can physically hold the placement, but every such cell lacks a fresh heartbeat or full usage observation | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` | retry the unchanged request after cell reconciliation recovers |
 | `409` | no cell in the pool has capacity for the volume at all | `POST /v1/volumes`, `POST /v1/volumes/{id}/wake` | resolve the durable capacity state |
 | `501` | this deployment cannot archive at all: the volume's cell advertises no archive configuration, or the Manager runs without the archive component (verifier, purger) the operation needs | `POST /v1/volumes/{id}/archive`, `DELETE /v1/volumes/{id}` | surface to an operator; retrying is useless |
 
-Saturation is deliberately not `409`: a conflict names a durable state the
-caller must resolve, while a saturated cell resolves itself. Capacity
-exhaustion keeps `409` because it does not. Missing archive configuration is
+Saturation and missing fresh cell evidence are deliberately not `409`: a
+conflict names a durable state the caller must resolve, while those conditions
+can resolve without changing the request. Capacity exhaustion keeps `409`
+because it does not. Missing archive configuration is
 deliberately neither `409` nor `503`: it is a durable deployment fact that no
 retry and no volume-state change resolves, and a client that filed it under
 "busy" would let a misconfigured deployment fail every archive sweep silently
