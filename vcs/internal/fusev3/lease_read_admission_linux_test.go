@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
@@ -200,89 +201,81 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 	}
 }
 
-// TestSaturatedBulkLaneDoesNotStallASourcePurge covers the lane inversion. A
-// whole-file purge waits for the buffered reads already admitted for that inode,
-// and the source mutation that drives that purge is itself holding one of the
-// mount's bounded bulk slots. If a read could register its data publication
-// before taking a slot, a saturated lane would make the purge wait on reads that
-// are waiting on the lane the purge's own mutation is occupying -- a cycle
-// broken only by the repair budget, which revokes the mount.
+// TestSaturatedBulkLaneDoesNotStallASourcePurge covers the lane inversion at
+// the exact admission boundary. A whole-file purge waits for the buffered reads
+// already admitted for that inode, and the source mutation that drives that
+// purge is itself holding one of the mount's bounded bulk slots. If a read
+// registers its data publication before taking a slot, a saturated lane makes
+// the purge wait on a read which is waiting on the lane the purge occupies.
 //
-// The saturation is spread across many files on purpose. Filling the lane is
-// what this test needs; pinning one inode's folios continuously is a different
-// experiment -- it measures how long stock's whole-file invalidation can be
-// starved of the locks it needs, which docs/portable-coherence.md §7.3b records
-// as an unbounded kernel-side residual rather than something this ordering can
-// fix.
+// This is deliberately a transport-admission test, not a live-kernel load
+// test. Continuously reading the target through FUSE also continuously takes
+// its folio locks; stock invalidate_inode_pages2 can be starved by those locks,
+// which is the separate, explicitly unbounded residual in
+// docs/portable-coherence.md §7.3b. Driving that unrelated scheduler race made
+// the former integration test take anywhere from 19 to 49 seconds and
+// occasionally revoke a correct mount at its authority horizon. Filling the
+// actual lane and observing the publication registry proves the intended
+// ordering directly and deterministically.
 func TestSaturatedBulkLaneDoesNotStallASourcePurge(t *testing.T) {
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
-	const size = 64 * 1024
-	const loadFiles = 32
-	payload := bytes.Repeat([]byte{'r'}, size)
-	mustMkdir(t, f.join(0, "load"))
-	handles := make([]*os.File, 0, 96)
-	for index := range loadFiles {
-		name := f.join(0, "load", fmt.Sprintf("f%02d", index))
-		mustWrite(t, name, payload, 0o600)
-		for range 3 {
-			file, err := os.Open(name)
-			if err != nil {
-				t.Fatalf("open a saturating reader: %v", err)
-			}
-			handles = append(handles, file)
-		}
-	}
-	// The mutated file carries only its own two readers, so the purge below is
-	// contending for lane capacity rather than for one inode's folio locks.
-	target := f.join(0, "saturated")
-	mustWrite(t, target, payload, 0o600)
-	for range 2 {
-		file, err := os.Open(target)
-		if err != nil {
-			t.Fatalf("open the target reader: %v", err)
-		}
-		handles = append(handles, file)
+	fixture := newStrictFixture(t)
+	item := testItem(91, authoritypb.Attr_REGULAR, 91)
+	fixture.rpc.item = item
+	fixture.rpc.byName = map[string]*authoritypb.Item{"saturated": item}
+	fixture.rpc.fileData = []byte("data")
+	entry := fixture.lookup(t, fuse.FUSE_ROOT_ID, "saturated")
+	opened := fixture.openForData(t, entry.NodeId)
+
+	for range cap(fixture.mount.bulk) {
+		fixture.mount.bulk <- struct{}{}
 	}
 	t.Cleanup(func() {
-		for _, file := range handles {
-			file.Close()
+		for len(fixture.mount.bulk) != 0 {
+			<-fixture.mount.bulk
 		}
 	})
 
-	stop := make(chan struct{})
-	var load sync.WaitGroup
-	for _, file := range handles {
-		load.Add(1)
-		go func() {
-			defer load.Done()
-			buf := make([]byte, size)
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				if _, err := syscall.Pread(int(file.Fd()), buf, 0); err != nil {
-					return
-				}
-			}
-		}()
+	type readOutcome struct {
+		result fuse.ReadResult
+		status fuse.Status
 	}
-	t.Cleanup(func() { close(stop); load.Wait() })
+	unique := fixture.unique.Add(2)
+	readDone := make(chan readOutcome, 1)
+	go func() {
+		result, status := fixture.raw.Read(nil, &fuse.ReadIn{
+			InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 4,
+		}, make([]byte, 4))
+		readDone <- readOutcome{result: result, status: status}
+	}()
 
-	deadline := time.Now().Add(60 * time.Second)
-	for round := range 24 {
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d of 24 source mutations completed; the purge is queued behind the lane its own mutation holds", round)
-		}
-		if err := os.WriteFile(target, bytes.Repeat([]byte{byte('a' + round%26)}, size), 0o600); err != nil {
-			t.Fatalf("round %d: source mutation under saturation: %v (%s)", round, err, f.sessionDiagnostics())
+	waitFor(t, "the lane-blocked read to reserve its reply lifecycle", func() bool {
+		fixture.raw.mu.Lock()
+		defer fixture.raw.mu.Unlock()
+		return fixture.raw.replyPublications[unique] != nil
+	})
+	coordinate := publicationCoordinate{kind: publicationItemData, item: publicationIdentity(item.GetStableIdentity())}
+	fixture.raw.mu.Lock()
+	publication := fixture.raw.replyPublications[unique]
+	for _, admitted := range publication.admittedData {
+		if admitted == coordinate {
+			fixture.raw.mu.Unlock()
+			t.Fatal("a read waiting for bulk-lane capacity registered a data publication")
 		}
 	}
-	for index := range 2 {
-		if cause := f.mounts[index].fatalError(); cause != nil {
-			t.Fatalf("mount %d revoked under saturation: %v", index, cause)
+	fixture.raw.mu.Unlock()
+	if err := fixture.raw.drainDataPublications(coordinate); err != nil {
+		t.Fatalf("a source purge waited on a read which had not entered the bulk lane: %v", err)
+	}
+
+	<-fixture.mount.bulk
+	select {
+	case outcome := <-readDone:
+		if !outcome.status.Ok() || outcome.result == nil || outcome.result.Size() != 4 {
+			t.Fatalf("admitted READ = (%v, %v), want four bytes", outcome.result, outcome.status)
 		}
+		completeTestReply(t, fixture.raw, unique, fuse.OK)
+	case <-time.After(2 * time.Second):
+		t.Fatal("read did not enter the lane after capacity was released")
 	}
 }
 
