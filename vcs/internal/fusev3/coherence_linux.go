@@ -232,10 +232,12 @@ type kernelMount struct {
 
 const mountInfoPath = "/proc/self/mountinfo"
 
+var readMountInfo = func() ([]byte, error) { return os.ReadFile(mountInfoPath) }
+
 // observeKernelMount records the installed mount so its later disappearance can
 // be proven. It is called once, after the kernel has answered INIT.
 func observeKernelMount(mountpoint string) (kernelMount, error) {
-	data, err := os.ReadFile(mountInfoPath)
+	data, err := readMountInfo()
 	if err != nil {
 		return kernelMount{}, fmt.Errorf("fusev3: read %s: %w", mountInfoPath, err)
 	}
@@ -269,15 +271,18 @@ func ObservePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsencePro
 	if fsName == "" || mountpoint == "" {
 		return MountAbsenceProof{}, errors.New("fusev3: planned mount identity is incomplete")
 	}
-	data, err := os.ReadFile(mountInfoPath)
+	data, err := readMountInfo()
 	if err != nil {
 		return MountAbsenceProof{}, fmt.Errorf("fusev3: read %s: %w", mountInfoPath, err)
 	}
 	records := 0
 	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
 		fields := strings.Fields(line)
 		if len(fields) < 10 {
-			continue
+			return MountAbsenceProof{}, fmt.Errorf("fusev3: %s contains a malformed mount record", mountInfoPath)
 		}
 		separator := -1
 		for i := 6; i < len(fields); i++ {
@@ -287,7 +292,7 @@ func ObservePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsencePro
 			}
 		}
 		if separator < 0 || separator+2 >= len(fields) {
-			continue
+			return MountAbsenceProof{}, fmt.Errorf("fusev3: %s contains a malformed mount record", mountInfoPath)
 		}
 		records++
 		if unescapeMountField(fields[separator+2]) == fsName {
@@ -326,7 +331,7 @@ func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsencePro
 // serving connection to terminate, then calls absent again for the final
 // timestamped observation.
 func (k kernelMount) absent() (MountAbsenceProof, error) {
-	data, err := os.ReadFile(mountInfoPath)
+	data, err := readMountInfo()
 	if err != nil {
 		return MountAbsenceProof{}, fmt.Errorf("fusev3: read %s: %w", mountInfoPath, err)
 	}

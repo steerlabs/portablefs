@@ -129,6 +129,105 @@ func TestPlannedMountSourceAbsenceRefusesAnInstalledSource(t *testing.T) {
 	t.Fatal("mountinfo contained no installed source to test")
 }
 
+func TestFailedHelperMountIsExactlyUnmountedBeforeSessionRelease(t *testing.T) {
+	fixture := newStrictFixture(t)
+	directory := t.TempDir()
+	mountInfo := directory + "/mountinfo"
+	fsName := "portablefs:11111111-1111-4111-8111-111111111111"
+	mountpoint := "/workspaces/example"
+	if err := os.WriteFile(mountInfo, []byte("42 1 0:99 / /workspaces/example rw - fuse.portablefs "+fsName+" rw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	priorReadMountInfo, priorUnmount := readMountInfo, unmountFailedHelperMount
+	readMountInfo = func() ([]byte, error) { return os.ReadFile(mountInfo) }
+	unmountFailedHelperMount = func(path string) error {
+		if path != mountpoint {
+			t.Fatalf("unmount path = %q, want %q", path, mountpoint)
+		}
+		if err := os.WriteFile(mountInfo, []byte("1 0 0:1 / / rw - ext4 /dev/root rw\n"), 0o600); err != nil {
+			return err
+		}
+		return errors.New("fusermount removed the mount but failed to update mtab")
+	}
+	t.Cleanup(func() {
+		readMountInfo, unmountFailedHelperMount = priorReadMountInfo, priorUnmount
+	})
+
+	if err := releaseMountInstalledByFailedHelper(fixture.rpc, fsName, mountpoint); err != nil {
+		t.Fatalf("release failed helper mount: %v", err)
+	}
+	fixture.rpc.mu.Lock()
+	defer fixture.rpc.mu.Unlock()
+	if len(fixture.rpc.detachProofs) != 1 || !fixture.rpc.detachProofs[0].valid() {
+		t.Fatalf("detach proofs = %+v, want one exact absence proof", fixture.rpc.detachProofs)
+	}
+}
+
+func TestFailedHelperMountCleanupRetainsSessionWhenUnmountDoesNotRemoveMount(t *testing.T) {
+	fixture := newStrictFixture(t)
+	mountInfo := t.TempDir() + "/mountinfo"
+	fsName := "portablefs:22222222-2222-4222-8222-222222222222"
+	mountpoint := "/workspaces/example"
+	installed := "42 1 0:99 / /workspaces/example rw - fuse.portablefs " + fsName + " rw\n"
+	if err := os.WriteFile(mountInfo, []byte(installed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	priorReadMountInfo, priorUnmount := readMountInfo, unmountFailedHelperMount
+	readMountInfo = func() ([]byte, error) { return os.ReadFile(mountInfo) }
+	unmountFailedHelperMount = func(string) error { return errors.New("fusermount failed") }
+	t.Cleanup(func() {
+		readMountInfo, unmountFailedHelperMount = priorReadMountInfo, priorUnmount
+	})
+
+	if err := releaseMountInstalledByFailedHelper(fixture.rpc, fsName, mountpoint); err == nil {
+		t.Fatal("failed unmount was treated as clean")
+	}
+	fixture.rpc.mu.Lock()
+	defer fixture.rpc.mu.Unlock()
+	if len(fixture.rpc.detachProofs) != 0 {
+		t.Fatalf("detach proofs = %d, want none while the mount remains", len(fixture.rpc.detachProofs))
+	}
+}
+
+func TestFailedHelperMountCleanupRefusesUnexpectedKernelIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		records string
+	}{
+		{name: "different path", records: "42 1 0:99 / /other rw - fuse.portablefs portablefs:test rw\n"},
+		{name: "foreign overmount", records: "42 1 0:99 / /workspaces/example rw - ext4 /dev/foreign rw\n43 1 0:100 / /workspaces/example rw - fuse.portablefs portablefs:test rw\n"},
+		{name: "different filesystem", records: "42 1 0:99 / /workspaces/example rw - fuse.other portablefs:test rw\n"},
+		{name: "stacked", records: "42 1 0:99 / /workspaces/example rw - fuse.portablefs portablefs:test rw\n43 1 0:100 / /workspaces/example rw - fuse.portablefs portablefs:test rw\n"},
+		{name: "malformed record", records: "malformed\n42 1 0:99 / /workspaces/example rw - fuse.portablefs portablefs:test rw\n"},
+		{name: "malformed record without planned source", records: "1 0 0:1 / / rw - ext4 /dev/root rw\nmalformed\n"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newStrictFixture(t)
+			mountInfo := t.TempDir() + "/mountinfo"
+			if err := os.WriteFile(mountInfo, []byte(test.records), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			priorReadMountInfo, priorUnmount := readMountInfo, unmountFailedHelperMount
+			readMountInfo = func() ([]byte, error) { return os.ReadFile(mountInfo) }
+			unmounted := false
+			unmountFailedHelperMount = func(string) error { unmounted = true; return nil }
+			t.Cleanup(func() {
+				readMountInfo, unmountFailedHelperMount = priorReadMountInfo, priorUnmount
+			})
+
+			if err := releaseMountInstalledByFailedHelper(fixture.rpc, "portablefs:test", "/workspaces/example"); err == nil {
+				t.Fatal("unexpected kernel identity was cleaned")
+			}
+			fixture.rpc.mu.Lock()
+			proofs := len(fixture.rpc.detachProofs)
+			fixture.rpc.mu.Unlock()
+			if unmounted || proofs != 0 {
+				t.Fatalf("unmounted = %t, detach proofs = %d; want fail-closed", unmounted, proofs)
+			}
+		})
+	}
+}
+
 func TestMountInfoPathsAreUnescaped(t *testing.T) {
 	if got := unescapeMountField(`/tmp/with\040space`); got != "/tmp/with space" {
 		t.Fatalf("unescaped %q, want %q", got, "/tmp/with space")

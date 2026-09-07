@@ -10,6 +10,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -369,7 +371,11 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	server, err := fuse.NewServer(newRawFileSystem(m, root), mountpoint, options)
 	if err != nil {
 		m.cancel()
-		return failBeforeKernelMount(errors.Join(fmt.Errorf("mount PortableFS v3: %w", err), grafts.Close()))
+		cause := errors.Join(fmt.Errorf("mount PortableFS v3: %w", err), grafts.Close())
+		if cleanupErr := releaseMountInstalledByFailedHelper(rpc, fsName, mountpoint); cleanupErr != nil {
+			return nil, errors.Join(cause, cleanupErr)
+		}
+		return nil, markCleanStartupFailure(cause)
 	}
 	m.server = server
 	m.setNotifier(server)
@@ -409,6 +415,85 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		return nil, m.abortMount(err)
 	}
 	return m, nil
+}
+
+var unmountFailedHelperMount = func(mountpoint string) error {
+	binary, err := exec.LookPath("fusermount3")
+	if err != nil {
+		binary, err = exec.LookPath("fusermount")
+	}
+	if err != nil {
+		return fmt.Errorf("fusev3: locate fusermount for failed-startup cleanup: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
+	defer cancel()
+	output, commandErr := exec.CommandContext(ctx, binary, "-u", mountpoint).CombinedOutput()
+	if commandErr != nil {
+		return fmt.Errorf("fusev3: unmount failed-startup FUSE mount: %w: %s", commandErr, output)
+	}
+	return nil
+}
+
+func releaseMountInstalledByFailedHelper(rpc RPC, fsName, mountpoint string) error {
+	if _, err := observePlannedKernelMountAbsent(fsName, mountpoint); err == nil {
+		return releaseUninstalledSession(rpc, fsName, mountpoint)
+	}
+	installed, err := observeExactPlannedKernelMount(fsName, mountpoint)
+	if err != nil {
+		rpc.FinishLocalSessionEnforcement()
+		return errors.Join(err, rpc.Close())
+	}
+	if err := unmountFailedHelperMount(installed.point); err != nil {
+		// The helper may have removed the mount before failing to update its
+		// userspace mount table. Only the kernel observation decides cleanup.
+		if _, absenceErr := observePlannedKernelMountAbsent(fsName, mountpoint); absenceErr != nil {
+			rpc.FinishLocalSessionEnforcement()
+			return errors.Join(err, absenceErr, rpc.Close())
+		}
+	}
+	return releaseUninstalledSession(rpc, fsName, mountpoint)
+}
+
+func observeExactPlannedKernelMount(fsName, mountpoint string) (kernelMount, error) {
+	data, err := readMountInfo()
+	if err != nil {
+		return kernelMount{}, fmt.Errorf("fusev3: read %s: %w", mountInfoPath, err)
+	}
+	var atPath []kernelMount
+	var sourceElsewhere bool
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			return kernelMount{}, fmt.Errorf("fusev3: %s contains a malformed mount record", mountInfoPath)
+		}
+		separator := -1
+		for i := 6; i < len(fields); i++ {
+			if fields[i] == "-" {
+				separator = i
+				break
+			}
+		}
+		if separator < 0 || separator+2 >= len(fields) {
+			return kernelMount{}, fmt.Errorf("fusev3: %s contains a malformed mount record", mountInfoPath)
+		}
+		point, source := unescapeMountField(fields[4]), unescapeMountField(fields[separator+2])
+		if source == fsName && point != mountpoint {
+			sourceElsewhere = true
+		}
+		if point == mountpoint {
+			atPath = append(atPath, kernelMount{id: fields[0], device: fields[2], point: point})
+			if fields[separator+1] != "fuse.portablefs" || source != fsName {
+				return kernelMount{}, fmt.Errorf("fusev3: mountpoint %s has an unexpected kernel identity", mountpoint)
+			}
+		}
+	}
+	if sourceElsewhere || len(atPath) != 1 {
+		return kernelMount{}, fmt.Errorf("fusev3: planned mount source %s has an ambiguous kernel identity", fsName)
+	}
+	return atPath[0], nil
 }
 
 // releaseUninstalledSession discharges an authority session whose unique FUSE
