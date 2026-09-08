@@ -907,7 +907,7 @@ func (r *rawFileSystem) terminalizeReplyCacheOwnership(deadline time.Time) bool 
 	}
 	r.mu.Unlock()
 
-	// The writer callback runs only after go-fuse releases writeMu. Waiting
+	// The writer callback runs only after go-fuse releases its descriptor lock. Waiting
 	// without rawFileSystem.mu lets every reply which froze its final bytes
 	// report whether those bytes physically reached the kernel. No withdrawal
 	// snapshot may precede this join.
@@ -1454,9 +1454,9 @@ func (r *rawFileSystem) byIdentityLocked(identity publicationIdentity) *inodeRec
 	return found
 }
 
-// ReplyWriteOrdered joins cache/source-bearing replies to go-fuse's ordered
-// physical writer boundary.
-func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
+// ReplyWriteTracked joins cache/source-bearing replies to go-fuse's physical
+// write lifecycle.
+func (r *rawFileSystem) ReplyWriteTracked(unique uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.replyTerminal || r.replyTerminalizing {
@@ -1465,9 +1465,11 @@ func (r *rawFileSystem) ReplyWriteOrdered(unique uint64) bool {
 	return r.replyPublications[unique] != nil
 }
 
-// PrepareReplyPayload is the PENDING-to-FINALIZED transition. It runs under
-// go-fuse's physical writer mutex, so no notification can overtake the bytes
-// whose lifetimes and DROP decisions are frozen here.
+// PrepareReplyPayload is the PENDING-to-FINALIZED transition. The r.mu cut is
+// also the invalidation-ordering boundary: a recall either revokes the pending
+// candidates here or observes a finalized installer and waits for ReplyWritten.
+// go-fuse deliberately permits a notification syscall to overlap this reply,
+// because the kernel notification may need the reply to release a folio.
 func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, outData, payload []byte, payloadSize int) (int, fuse.Status, fuse.Status) {
 	r.mu.Lock()
 	if r.replyTerminal || r.replyTerminalizing {
@@ -1624,7 +1626,7 @@ func zeroAttrLifetime(opcode uint32, out []byte) {
 }
 
 // ReplyWritten is called by the maintained go-fuse fork only after the real
-// /dev/fuse write attempt and after its ordering mutex has been released.
+// /dev/fuse write attempt and after its descriptor lock has been released.
 func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	r.mu.Lock()
 	if r.replyTerminal {
@@ -1648,7 +1650,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	publication := r.replyPublications[unique]
 	if publication == nil || publication.originalWrote {
 		r.mu.Unlock()
-		r.mount.revoke(fmt.Errorf("fusev3: ordered FUSE reply %d lost its publication ownership", unique))
+		r.mount.revoke(fmt.Errorf("fusev3: tracked FUSE reply %d lost its publication ownership", unique))
 		return
 	}
 	publication.originalWrote = true

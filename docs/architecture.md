@@ -75,15 +75,18 @@ opens may preserve clean kernel pages under a D lease. Write-capable opens use
 direct I/O, writeback caching is disabled, and shared writable mappings are
 refused.
 
-The daemon orders cache-installing replies and invalidation notifications per
-coordinate. Metadata replies may use a separate zero-validity lane. Buffered
+The daemon orders cache-installing replies and invalidation notifications at
+the per-coordinate admission and settlement cut; their `/dev/fuse` syscalls may
+overlap so a blocked invalidation cannot withhold a reply needed for progress.
+Metadata replies may use a separate zero-validity lane. Buffered
 READ has no validity field: an already-admitted reply drains before recall
-acknowledgment, while a new request at a closed cut receives `EAGAIN` without
-parking behind invalidation. A peer discharges a recall only after a full
-whole-file purge. Range-successor continuity is not part of v1. The mutating
-mount purges A/D/E and daemon N state before its reply. Kernel entry validity is
-always zero, including under N-R, so stock rename cannot transplant an old
-leased timeout and no post-write namespace receipt is required.
+acknowledgment, while a new request at a closed cut proceeds on the data lane,
+is answered from applied authority state, and is included when the invalidation
+takes its pre-purge snapshot. A later reply carries only post-apply bytes. A peer
+discharges a recall only after the full purge. Range-successor continuity is not
+part of v1. The mutating mount purges A/D/E and daemon N state before its reply.
+Kernel entry validity is always zero, including under N-R, so stock rename cannot
+transplant an old leased timeout and no post-write namespace receipt is required.
 
 The namespace contract covers forward pathname resolution and directory
 enumeration. Reverse rendering of an already-held dentry (`getcwd`,
