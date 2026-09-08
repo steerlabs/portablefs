@@ -157,6 +157,16 @@ volume with no active mount enrollments — mounts detach cleanly at the end
 of every Run in ordinary operation — the exception path is rare by
 construction, and the quiesce refusal makes it visible rather than wedging.
 
+Terminal deletion has the corresponding operator recovery for a client that
+cannot cleanly detach. The strict-fence request names purpose `deletion`, the
+evidence digest, and the complete current placement tuple. It is accepted only
+at `DESTROYING/quiescing`. The signed plan then permits the helper to fence the
+exact local authority without treating stale membership as empty. The helper
+reports authority absence but never `QuiesceProven`; the Manager advances only
+because the tuple-bound operator attestation is also durable. Host destruction
+and release still require their ordinary verified proofs, and the attestation
+remains in the terminal volume record after the placement is removed.
+
 ### Consequences
 
 - Cross-cell restore is native: wake placement is ordinary placement.

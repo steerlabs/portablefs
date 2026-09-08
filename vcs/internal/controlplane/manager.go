@@ -495,15 +495,35 @@ func (manager *Manager) RestartVolume(requestID string, request RestartVolumeReq
 }
 
 func (manager *Manager) ConfirmStrictMountsFenced(requestID string, request ConfirmStrictFenceRequest) (VolumeView, error) {
-	if !cellplan.ValidID(request.VolumeID) || len(request.EvidenceSHA256) != 64 {
+	if !cellplan.ValidID(request.VolumeID) ||
+		(request.Purpose != StrictFencePurposeRestart && request.Purpose != StrictFencePurposeDeletion) ||
+		len(request.EvidenceSHA256) != 64 {
 		return VolumeView{}, ErrInvalid
 	}
 	if _, err := hex.DecodeString(request.EvidenceSHA256); err != nil || strings.ToLower(request.EvidenceSHA256) != request.EvidenceSHA256 {
 		return VolumeView{}, ErrInvalid
 	}
 	return manager.updateVolume(requestID, "confirm-strict-fence", request, func(state *State, volume *Volume, now int64) error {
-		if volume.State != VolumeFencing {
+		if volume.Placement == nil || request.Placement != strictFencePlacement(*volume) {
 			return ErrConflict
+		}
+		record := &StrictFenceRecord{Purpose: request.Purpose, Placement: request.Placement, EvidenceSHA256: request.EvidenceSHA256, RecordedUnix: now}
+		switch request.Purpose {
+		case StrictFencePurposeRestart:
+			if volume.State != VolumeFencing {
+				return ErrConflict
+			}
+		case StrictFencePurposeDeletion:
+			if volume.State != VolumeDestroying || volume.ArchiveCycleStep != "quiescing" {
+				return ErrConflict
+			}
+			if volume.DeletionFence != nil {
+				if volume.DeletionFence.Purpose != record.Purpose || volume.DeletionFence.Placement != record.Placement || volume.DeletionFence.EvidenceSHA256 != record.EvidenceSHA256 {
+					return ErrConflict
+				}
+				return nil
+			}
+			volume.DeletionFence = record
 		}
 		volume.Placement.PriorStrictFenced = true
 		volume.Placement.StrictFenceEvidence = request.EvidenceSHA256
@@ -513,6 +533,15 @@ func (manager *Manager) ConfirmStrictMountsFenced(requestID string, request Conf
 		state.Cells[cell.ID] = cell
 		return nil
 	})
+}
+
+func strictFencePlacement(volume Volume) StrictFencePlacement {
+	placement := volume.Placement
+	return StrictFencePlacement{
+		CellID: placement.CellID, PlacementSequence: placement.Sequence, AuthorityGeneration: volume.AuthorityEpoch,
+		ProjectID: placement.ProjectID, ServiceUID: placement.ServiceUID, ServiceGID: placement.ServiceGID,
+		ListenPort: placement.ListenPort, AuthorityID: placement.AuthorityID, AuthorityServerName: placement.AuthorityServerName,
+	}
 }
 
 func (manager *Manager) ArchiveVolume(requestID string, request ArchiveVolumeRequest) (VolumeView, error) {
@@ -1033,7 +1062,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			case VolumeDestroying:
 				switch volume.ArchiveCycleStep {
 				case "quiescing":
-					if observed.AuthorityAbsent && observed.QuiesceProven {
+					if observed.AuthorityAbsent && (observed.QuiesceProven || volume.DeletionFence != nil) {
 						volume.ArchiveCycleStep = "destroying"
 						volume.UpdatedUnix = now
 						manager.bumpPlan(&cell, now)
@@ -1215,7 +1244,7 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 				ProjectID: placement.ProjectID, ServiceUID: placement.ServiceUID, ServiceGID: placement.ServiceGID,
 				ListenPort: placement.ListenPort, QuotaBytes: volume.QuotaBytes, QuotaInodes: volume.QuotaInodes,
 				AuthorityServerName: placement.AuthorityServerName, AuthorityCertificate: placement.AuthorityCertificatePEM,
-				PriorStrictFenced: placement.PriorStrictFenced, PlacementSequence: placement.Sequence,
+				PriorStrictFenced: priorStrictFenceForPlan(volume, phase), PlacementSequence: placement.Sequence,
 			}
 			switch phase {
 			case cellplan.PhaseArchive:
@@ -1237,6 +1266,17 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 		return cellplan.Envelope{}, err
 	}
 	return cellplan.Sign(manager.cfg.PlanPrivateKey, plan)
+}
+
+func priorStrictFenceForPlan(volume Volume, phase cellplan.VolumePhase) bool {
+	switch phase {
+	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence:
+		return volume.Placement.PriorStrictFenced
+	case cellplan.PhaseQuiesce:
+		return volume.State == VolumeDestroying && volume.DeletionFence != nil
+	default:
+		return false
+	}
 }
 
 func (manager *Manager) IssueMount(requestID string, request IssueMountRequest) (MountAuthorization, error) {

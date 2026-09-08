@@ -276,6 +276,87 @@ func TestDestroyLiveVolumeRunsFenceDestroyRelease(t *testing.T) {
 	}
 }
 
+func TestOperatorDeletionFenceRecoversQuiesceWithoutClaimingProof(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	destroying, err := h.manager.DestroyVolume("delete-fenced", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "disposable canary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := strings.Repeat("a", 64)
+	request := ConfirmStrictFenceRequest{VolumeID: volume.ID, Purpose: StrictFencePurposeDeletion,
+		Placement: strictFencePlacement(destroying.Volume), EvidenceSHA256: evidence}
+	stale := request
+	stale.Placement.PlacementSequence++
+	if _, err := h.manager.ConfirmStrictMountsFenced("stale-delete-fence", stale); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale placement fence = %v", err)
+	}
+	fenced, err := h.manager.ConfirmStrictMountsFenced("delete-fence", request)
+	if err != nil || fenced.DeletionFence == nil || fenced.DeletionFence.EvidenceSHA256 != evidence {
+		t.Fatalf("deletion fence = %+v, %v", fenced, err)
+	}
+	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
+	if plan.Volumes[0].Phase != cellplan.PhaseQuiesce || !plan.Volumes[0].PriorStrictFenced {
+		t.Fatalf("externally fenced quiesce plan = %+v", plan.Volumes[0])
+	}
+	observeTieredVolume(t, h, cell.ID, "fence-still-running", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
+		ProjectID: destroying.Placement.ProjectID, ServiceUID: destroying.Placement.ServiceUID, ServiceGID: destroying.Placement.ServiceGID,
+		ListenPort: destroying.Placement.ListenPort, Provisioned: true, AuthorityRunning: true})
+	if current, _ := h.manager.GetVolume(volume.ID); current.ArchiveCycleStep != "quiescing" {
+		t.Fatalf("attestation advanced without authority absence: %+v", current)
+	}
+	observeTieredVolume(t, h, cell.ID, "externally-fenced-absent", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
+		ProjectID: destroying.Placement.ProjectID, ServiceUID: destroying.Placement.ServiceUID, ServiceGID: destroying.Placement.ServiceGID,
+		ListenPort: destroying.Placement.ListenPort, AuthorityAbsent: true, QuiesceProven: false})
+	destroying, _ = h.manager.GetVolume(volume.ID)
+	if destroying.ArchiveCycleStep != "destroying" {
+		t.Fatalf("external fence did not advance destroy: %+v", destroying)
+	}
+	proof := strings.Repeat("b", 64)
+	observeTieredVolume(t, h, cell.ID, "external-delete-proof", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
+		ProjectID: destroying.Placement.ProjectID, ServiceUID: destroying.Placement.ServiceUID, ServiceGID: destroying.Placement.ServiceGID,
+		ListenPort: destroying.Placement.ListenPort, AuthorityAbsent: true, DestroyProofSHA256: proof})
+	destroying, _ = h.manager.GetVolume(volume.ID)
+	observeTieredVolume(t, h, cell.ID, "external-delete-release", VolumeObservation{VolumeID: volume.ID, AuthorityGeneration: destroying.AuthorityEpoch,
+		ProjectID: destroying.Placement.ProjectID, ServiceUID: destroying.Placement.ServiceUID, ServiceGID: destroying.Placement.ServiceGID,
+		ListenPort: destroying.Placement.ListenPort, AuthorityAbsent: true, Released: true})
+	terminal, _ := h.manager.GetVolume(volume.ID)
+	if terminal.State != VolumeDestroyed || terminal.DeletionFence == nil || terminal.DeletionFence.Placement != request.Placement ||
+		terminal.DeletionFence.EvidenceSHA256 != evidence {
+		t.Fatalf("terminal deletion fence audit = %+v", terminal)
+	}
+}
+
+func TestRestartFenceDoesNotAuthorizeLaterQuiesce(t *testing.T) {
+	for _, lifecycle := range []string{"archive", "delete"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			h := newManagerHarness(t)
+			cell, volume := readyVolumeForMount(t, h)
+			if _, err := h.store.TransactNatural("seed-completed-restart-fence", h.now.Unix(), func(state *State) (any, bool, error) {
+				stored := state.Volumes[volume.ID]
+				stored.Placement.PriorStrictFenced = true
+				stored.Placement.StrictFenceEvidence = strings.Repeat("d", 64)
+				state.Volumes[stored.ID] = stored
+				return nil, true, nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if lifecycle == "archive" {
+				h.manager.cfg.ArchiveVerifier = &fakeArchiveVerifier{}
+				if _, err := h.manager.ArchiveVolume("archive-after-restart", ArchiveVolumeRequest{VolumeID: volume.ID}); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := h.manager.DestroyVolume("delete-after-restart", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "delete"}); err != nil {
+				t.Fatal(err)
+			}
+			plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
+			if plan.Volumes[0].PriorStrictFenced {
+				t.Fatalf("stale restart fence authorized %s quiesce: %+v", lifecycle, plan.Volumes[0])
+			}
+		})
+	}
+}
+
 func TestDestroyArchivedRequiresPurgerAndCommitsTerminalAfterPurge(t *testing.T) {
 	h := newManagerHarness(t)
 	_, volume := readyVolumeForMount(t, h)

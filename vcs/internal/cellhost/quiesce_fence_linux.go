@@ -15,6 +15,9 @@ import (
 // before using the ordinary process fence. Archive and destructive quiesce use
 // this one implementation; restart fencing deliberately does not.
 func (host *Host) applyQuiesceFence(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) (controlplane.VolumeObservation, cellhelper.HostUpdate) {
+	if plan.PriorStrictFenced {
+		return host.applyExternallyFencedQuiesce(ctx, plan), cellhelper.HostUpdate{}
+	}
 	observed := controlplane.VolumeObservation{Provisioned: host.volumeExists(plan.VolumeID)}
 	nonce := previous.LastQuiesceNonce
 	if previous.LastPhase != plan.Phase {
@@ -79,6 +82,25 @@ func (host *Host) applyQuiesceFence(ctx context.Context, plan cellplan.VolumePla
 	return observed, cellhelper.HostUpdate{}
 }
 
+// applyExternallyFencedQuiesce is the operator recovery path for durable strict
+// membership left by clients that have been physically fenced. The signed plan
+// binds that attestation to this placement. The helper still establishes local
+// authority absence, but it does not claim that the authority completed its
+// ordinary empty-membership handshake.
+func (host *Host) applyExternallyFencedQuiesce(ctx context.Context, plan cellplan.VolumePlan) controlplane.VolumeObservation {
+	observed := controlplane.VolumeObservation{Provisioned: host.volumeExists(plan.VolumeID)}
+	absent, err := host.fence(ctx, plan.VolumeID)
+	if err != nil || !absent {
+		if err == nil {
+			err = errors.New("cellhost: externally fenced quiesce left the authority present")
+		}
+		observed.Error = err.Error()
+		return observed
+	}
+	observed.AuthorityAbsent = true
+	return observed
+}
+
 func (host *Host) observeQuiesceFence(ctx context.Context, plan cellplan.VolumePlan, previous cellhelper.Assignment) controlplane.VolumeObservation {
 	observed := controlplane.VolumeObservation{Provisioned: host.volumeExists(plan.VolumeID)}
 	absent, err := host.authorityAbsent(ctx, plan.VolumeID)
@@ -87,6 +109,10 @@ func (host *Host) observeQuiesceFence(ctx context.Context, plan cellplan.VolumeP
 			err = errors.New("cellhost: authority is present after quiesce")
 		}
 		observed.Error = err.Error()
+		return observed
+	}
+	if plan.PriorStrictFenced {
+		observed.AuthorityAbsent = true
 		return observed
 	}
 	proof, err := host.ReadQuiesceProof(plan.VolumeID)

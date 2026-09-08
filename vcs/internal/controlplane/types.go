@@ -162,32 +162,33 @@ func cellAllocatorBounded(cell Cell) bool {
 }
 
 type Volume struct {
-	ID                      string         `json:"id"`
-	AuthorizationDomain     string         `json:"authorization_domain"`
-	Owner                   string         `json:"owner"`
-	ProductIssuer           string         `json:"product_issuer"`
-	ProductPublicKeyPEM     string         `json:"product_public_key_pem"`
-	QuotaBytes              uint64         `json:"quota_bytes"`
-	QuotaInodes             uint64         `json:"quota_inodes"`
-	AuthorityEpoch          uint64         `json:"authority_generation"`
-	PlacementSequence       uint64         `json:"placement_sequence"`
-	State                   VolumeState    `json:"state"`
-	Pool                    string         `json:"pool"`
-	Placement               *Placement     `json:"placement,omitempty"`
-	Archive                 *ArchiveRecord `json:"archive,omitempty"`
-	PendingSeal             *ArchiveRecord `json:"pending_seal,omitempty"`
-	ArchiveCycleStep        string         `json:"archive_cycle_step,omitempty"`
-	ArchiveAttempt          string         `json:"archive_attempt,omitempty"`
-	RestoreStep             string         `json:"restore_step,omitempty"`
-	RestoreProgressPermille uint32         `json:"restore_progress_permille,omitempty"`
-	RestoreState            string         `json:"restore_state,omitempty"`
-	RestoreConvergedUnix    int64          `json:"restore_converged_unix,omitempty"`
-	WakeRequested           bool           `json:"wake_requested,omitempty"`
-	DeletionRequested       bool           `json:"deletion_requested,omitempty"`
-	DestroyedUnix           int64          `json:"destroyed_unix,omitempty"`
-	QuarantineReason        string         `json:"quarantine_reason,omitempty"`
-	CreatedUnix             int64          `json:"created_unix"`
-	UpdatedUnix             int64          `json:"updated_unix"`
+	ID                      string             `json:"id"`
+	AuthorizationDomain     string             `json:"authorization_domain"`
+	Owner                   string             `json:"owner"`
+	ProductIssuer           string             `json:"product_issuer"`
+	ProductPublicKeyPEM     string             `json:"product_public_key_pem"`
+	QuotaBytes              uint64             `json:"quota_bytes"`
+	QuotaInodes             uint64             `json:"quota_inodes"`
+	AuthorityEpoch          uint64             `json:"authority_generation"`
+	PlacementSequence       uint64             `json:"placement_sequence"`
+	State                   VolumeState        `json:"state"`
+	Pool                    string             `json:"pool"`
+	Placement               *Placement         `json:"placement,omitempty"`
+	Archive                 *ArchiveRecord     `json:"archive,omitempty"`
+	PendingSeal             *ArchiveRecord     `json:"pending_seal,omitempty"`
+	ArchiveCycleStep        string             `json:"archive_cycle_step,omitempty"`
+	ArchiveAttempt          string             `json:"archive_attempt,omitempty"`
+	RestoreStep             string             `json:"restore_step,omitempty"`
+	RestoreProgressPermille uint32             `json:"restore_progress_permille,omitempty"`
+	RestoreState            string             `json:"restore_state,omitempty"`
+	RestoreConvergedUnix    int64              `json:"restore_converged_unix,omitempty"`
+	WakeRequested           bool               `json:"wake_requested,omitempty"`
+	DeletionRequested       bool               `json:"deletion_requested,omitempty"`
+	DeletionFence           *StrictFenceRecord `json:"deletion_fence,omitempty"`
+	DestroyedUnix           int64              `json:"destroyed_unix,omitempty"`
+	QuarantineReason        string             `json:"quarantine_reason,omitempty"`
+	CreatedUnix             int64              `json:"created_unix"`
+	UpdatedUnix             int64              `json:"updated_unix"`
 }
 
 type Placement struct {
@@ -401,8 +402,37 @@ type RestartVolumeRequest struct {
 }
 
 type ConfirmStrictFenceRequest struct {
-	VolumeID       string `json:"volume_id"`
-	EvidenceSHA256 string `json:"evidence_sha256"`
+	VolumeID       string               `json:"volume_id"`
+	Purpose        string               `json:"purpose"`
+	Placement      StrictFencePlacement `json:"placement"`
+	EvidenceSHA256 string               `json:"evidence_sha256"`
+}
+
+const (
+	StrictFencePurposeRestart  = "restart"
+	StrictFencePurposeDeletion = "deletion"
+)
+
+// StrictFencePlacement binds an operator's external evidence to one immutable
+// placement. A proof for an earlier residence or authority epoch must never
+// fence a later incarnation of the same volume.
+type StrictFencePlacement struct {
+	CellID              string `json:"cell_id"`
+	PlacementSequence   uint64 `json:"placement_sequence"`
+	AuthorityGeneration uint64 `json:"authority_generation"`
+	ProjectID           uint32 `json:"project_id"`
+	ServiceUID          uint32 `json:"service_uid"`
+	ServiceGID          uint32 `json:"service_gid"`
+	ListenPort          uint16 `json:"listen_port"`
+	AuthorityID         string `json:"authority_id"`
+	AuthorityServerName string `json:"authority_server_name"`
+}
+
+type StrictFenceRecord struct {
+	Purpose        string               `json:"purpose"`
+	Placement      StrictFencePlacement `json:"placement"`
+	EvidenceSHA256 string               `json:"evidence_sha256"`
+	RecordedUnix   int64                `json:"recorded_unix"`
 }
 
 type IssueMountRequest struct {
@@ -835,6 +865,21 @@ func validateVolume(id string, volume Volume, cells map[string]Cell) error {
 		volume.RestoreProgressPermille > 1000 || volume.RestoreState != "" && volume.RestoreState != "blocked" && volume.RestoreState != "corrupt" {
 		return fmt.Errorf("%w: volume %q", ErrInvalid, id)
 	}
+	if volume.DeletionFence != nil {
+		record := volume.DeletionFence
+		placement := record.Placement
+		if record.Purpose != StrictFencePurposeDeletion || !validSHA256Hex(record.EvidenceSHA256) || record.RecordedUnix < volume.CreatedUnix ||
+			!cellplan.ValidID(placement.CellID) || cells[placement.CellID].ID == "" || placement.PlacementSequence != volume.PlacementSequence ||
+			placement.AuthorityGeneration != volume.AuthorityEpoch || placement.ProjectID == 0 || placement.ServiceUID < 1000 ||
+			placement.ServiceGID != placement.ServiceUID || placement.ListenPort < 1024 || placement.AuthorityID == "" ||
+			placement.AuthorityID != placement.AuthorityServerName || !validDNSName(placement.AuthorityServerName) ||
+			volume.State != VolumeDestroying && volume.State != VolumeDestroyed {
+			return fmt.Errorf("%w: deletion fence", ErrInvalid)
+		}
+		if volume.Placement != nil && placement != strictFencePlacement(volume) {
+			return fmt.Errorf("%w: deletion fence placement", ErrInvalid)
+		}
+	}
 	if volume.Placement != nil {
 		if err := validatePlacement(id, volume.PlacementSequence, *volume.Placement, cells, true); err != nil {
 			return err
@@ -930,7 +975,7 @@ func validateVolume(id string, volume Volume, cells map[string]Cell) error {
 				return fmt.Errorf("%w: destroying proof", ErrInvalid)
 			}
 		case "purging-archive":
-			if volume.Placement != nil || volume.Archive == nil || volume.Archive.SealedEpoch != volume.AuthorityEpoch {
+			if volume.Placement != nil || volume.Archive == nil || volume.Archive.SealedEpoch != volume.AuthorityEpoch || volume.DeletionFence != nil {
 				return fmt.Errorf("%w: archive purge", ErrInvalid)
 			}
 		default:
