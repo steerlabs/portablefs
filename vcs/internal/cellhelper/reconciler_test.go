@@ -262,6 +262,65 @@ func TestQuiesceStateMachinePersistsNonceUntilProofAndThenObserves(t *testing.T)
 	if assignment.LastPhase != cellplan.PhaseQuiesce || assignment.LastQuiesceNonce != strings64("a") || !assignment.Applied || !assignment.AuthorityAbsent {
 		t.Fatalf("durable quiesce state = %+v", assignment)
 	}
+	host.applies = append(host.applies, struct {
+		observation controlplane.VolumeObservation
+		update      HostUpdate
+	}{controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true}, HostUpdate{}})
+	replacement := helperPlan(now, reconciler.CellID, 2, 2, cellplan.PhaseProvision)
+	if _, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, replacement)); err != nil {
+		t.Fatalf("replacement after proved quiesce: %v", err)
+	}
+	state, err = loadState(reconciler.StatePath, reconciler.CellID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assignment = state.Assignments[plan.Volumes[0].VolumeID]
+	if assignment.AuthorityGeneration != 2 || assignment.LastPhase != cellplan.PhaseProvision {
+		t.Fatalf("replacement assignment = %+v", assignment)
+	}
+}
+
+func TestReplacementGenerationRequiresProvedOrExternallyFencedQuiesce(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		externallyFenced bool
+		wantAccepted     bool
+	}{
+		{name: "absent without proof", wantAccepted: false},
+		{name: "signed external fence", externallyFenced: true, wantAccepted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			publicKey, privateKey, _ := ed25519.GenerateKey(nil)
+			now := time.Unix(1_900_000_000, 0)
+			host := &scriptedHost{applies: []struct {
+				observation controlplane.VolumeObservation
+				update      HostUpdate
+			}{
+				{controlplane.VolumeObservation{Provisioned: true, AuthorityRunning: true}, HostUpdate{}},
+				{controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true}, HostUpdate{}},
+				{controlplane.VolumeObservation{Provisioned: true, AuthorityAbsent: true}, HostUpdate{}},
+			}}
+			reconciler := testReconciler(t, publicKey, now, host)
+			serving := helperPlan(now, reconciler.CellID, 1, 1, cellplan.PhaseServe)
+			if _, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, serving)); err != nil {
+				t.Fatal(err)
+			}
+			quiescing := helperPlan(now, reconciler.CellID, 2, 1, cellplan.PhaseQuiesce)
+			quiescing.Volumes[0].PriorStrictFenced = test.externallyFenced
+			if _, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, quiescing)); err != nil {
+				t.Fatal(err)
+			}
+			replacement := helperPlan(now, reconciler.CellID, 3, 2, cellplan.PhaseProvision)
+			replacement.Volumes[0].PriorStrictFenced = test.externallyFenced
+			_, err := reconciler.Reconcile(context.Background(), signedHelperPlan(t, privateKey, replacement))
+			if test.wantAccepted && err != nil {
+				t.Fatalf("replacement after externally fenced quiesce: %v", err)
+			}
+			if !test.wantAccepted && err == nil {
+				t.Fatal("replacement followed an absent but unproved quiesce")
+			}
+		})
+	}
 }
 
 func TestDestroyReleaseWritesExactTombstoneAndLeavingPlanIsSafe(t *testing.T) {

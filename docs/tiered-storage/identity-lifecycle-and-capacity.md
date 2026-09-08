@@ -147,12 +147,13 @@ quiesce fails closed. The helper removes both files when a quiesce is
 cancelled; a fresh request nonce supersedes any stale proof.
 
 No operator attestation exists in the archive/wake path for the normal
-case. The exception path is honest and pre-existing: a volume whose
-membership holds records for fenced mounts that will never `CleanDetach`
-(a crashed client machine) cannot quiesce; recovering it is the existing
-restart + operator strict-fence flow (`POST /v1/volumes/{id}/strict-fence`),
-after which the volume is READY with an empty membership and archive
-proceeds normally. Because the product's archive policy requires an idle
+case. A planned restart uses this same quiesce handshake and advances its
+authority epoch only after the helper reports both authority absence and the
+authority's process-bound empty-membership proof. If the authority or a client
+crashes before that proof, recovery requires explicit, placement-bound operator
+strict-fence evidence (`POST /v1/volumes/{id}/strict-fence`). An unplanned
+authority failure never selects the quiesce path and always requires that
+external evidence. Because the product's archive policy requires an idle
 volume with no active mount enrollments — mounts detach cleanly at the end
 of every Run in ordinary operation — the exception path is rare by
 construction, and the quiesce refusal makes it visible rather than wedging.

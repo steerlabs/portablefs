@@ -172,7 +172,8 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			if strings.TrimSpace(body.ProductIssuer) != principal.ID {
 				return nil, ErrNotFound
 			}
-			return handler.Manager.CreateVolume(idempotencyKey(request), body)
+			result, err := handler.Manager.CreateVolume(idempotencyKey(request), body)
+			return productVolumeView(result), err
 		})
 	case request.Method == http.MethodGet && path == "v1/volumes":
 		if principal.Role != RoleOperator {
@@ -189,6 +190,8 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 		result, err := handler.Manager.GetVolume(parts[2])
 		if err == nil && principal.Role == RoleProduct && result.ProductIssuer != principal.ID {
 			err = ErrNotFound
+		} else if err == nil && principal.Role == RoleProduct {
+			result = productVolumeView(result)
 		}
 		handler.writeResult(writer, result, err)
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "restart" && request.Method == http.MethodPost:
@@ -203,7 +206,8 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
 				return nil, err
 			}
-			return handler.Manager.RestartVolume(idempotencyKey(request), body)
+			result, err := handler.Manager.RestartVolume(idempotencyKey(request), body)
+			return productVolumeView(result), err
 		})
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "strict-fence" && request.Method == http.MethodPost:
 		handler.requireRole(writer, request, principal, RoleOperator, func() (any, error) {
@@ -228,7 +232,8 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
 				return nil, err
 			}
-			return handler.Manager.ArchiveVolume(idempotencyKey(request), body)
+			result, err := handler.Manager.ArchiveVolume(idempotencyKey(request), body)
+			return productVolumeView(result), err
 		})
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "volumes" && parts[3] == "wake" && request.Method == http.MethodPost:
 		if principal.Role != RoleProduct {
@@ -253,6 +258,7 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			return
 		}
 		result, err := handler.Manager.WakeVolume(idempotencyKey(request), body)
+		result = productVolumeView(result)
 		if err == nil && result.WakeRequested {
 			writeJSON(writer, http.StatusAccepted, result)
 			return
@@ -270,7 +276,8 @@ func (handler *HTTPHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			if err := handler.requireProductVolume(principal, body.VolumeID); err != nil {
 				return nil, err
 			}
-			return handler.Manager.DestroyVolume(idempotencyKey(request), body)
+			result, err := handler.Manager.DestroyVolume(idempotencyKey(request), body)
+			return productVolumeView(result), err
 		})
 	case request.Method == http.MethodPost && path == "v1/mount-authorizations":
 		handler.requireRole(writer, request, principal, RoleProduct, func() (any, error) {
@@ -361,6 +368,11 @@ func (handler *HTTPHandler) requireProductVolume(principal Principal, volumeID s
 		return ErrNotFound
 	}
 	return nil
+}
+
+func productVolumeView(volume VolumeView) VolumeView {
+	volume.RestartRequested = false
+	return volume
 }
 
 func AuthenticateMTLS(request *http.Request) (Principal, error) {

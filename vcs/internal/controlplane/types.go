@@ -183,6 +183,7 @@ type Volume struct {
 	RestoreState            string             `json:"restore_state,omitempty"`
 	RestoreConvergedUnix    int64              `json:"restore_converged_unix,omitempty"`
 	WakeRequested           bool               `json:"wake_requested,omitempty"`
+	RestartRequested        bool               `json:"restart_requested,omitempty"` // The HTTP boundary removes this Manager cursor from product views.
 	DeletionRequested       bool               `json:"deletion_requested,omitempty"`
 	DeletionFence           *StrictFenceRecord `json:"deletion_fence,omitempty"`
 	DestroyedUnix           int64              `json:"destroyed_unix,omitempty"`
@@ -896,6 +897,9 @@ func validateVolume(id string, volume Volume, cells map[string]Cell) error {
 		if err := volume.PendingSeal.Validate(); err != nil {
 			return err
 		}
+	}
+	if volume.RestartRequested && volume.State != VolumeFencing {
+		return fmt.Errorf("%w: planned restart cursor", ErrInvalid)
 	}
 	switch volume.State {
 	case VolumeProvisioning, VolumeReady, VolumeFencing, VolumeQuarantined:

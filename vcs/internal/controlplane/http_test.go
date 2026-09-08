@@ -48,6 +48,25 @@ func TestHTTPProductCannotOperateOnAnotherIssuerVolume(t *testing.T) {
 	}
 }
 
+func TestHTTPRestartIntentIsVisibleOnlyToOperators(t *testing.T) {
+	harness := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, harness)
+	handler := testHTTPHandler(harness.manager)
+	restart := serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/restart",
+		RestartVolumeRequest{VolumeID: volume.ID, Reason: "planned rollout"}, RoleProduct, "opensteer", "restart-for-operator-view")
+	if restart.Code != http.StatusOK || strings.Contains(restart.Body.String(), `"restart_requested"`) {
+		t.Fatalf("product restart response status=%d body=%s", restart.Code, restart.Body.String())
+	}
+	product := serveControlRequest(t, handler, http.MethodGet, "/v1/volumes/"+volume.ID, nil, RoleProduct, "opensteer", "")
+	if product.Code != http.StatusOK || strings.Contains(product.Body.String(), `"restart_requested"`) {
+		t.Fatalf("product restart view status=%d body=%s", product.Code, product.Body.String())
+	}
+	operator := serveControlRequest(t, handler, http.MethodGet, "/v1/volumes/"+volume.ID, nil, RoleOperator, "operator", "")
+	if operator.Code != http.StatusOK || !strings.Contains(operator.Body.String(), `"restart_requested":true`) {
+		t.Fatalf("operator restart view status=%d body=%s", operator.Code, operator.Body.String())
+	}
+}
+
 func TestHTTPProductIdentityMustMatchCreatedIssuer(t *testing.T) {
 	harness := newManagerHarness(t)
 	_, err := harness.manager.RegisterCell("cell", RegisterCellRequest{

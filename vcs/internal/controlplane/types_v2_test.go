@@ -19,6 +19,11 @@ func TestStateV2RejectsPlacementAndLifecycleCrossInvariantViolations(t *testing.
 		mutate func(*State)
 	}{
 		{name: "ready without placement", mutate: func(state *State) { v := state.Volumes[volume.ID]; v.Placement = nil; state.Volumes[v.ID] = v }},
+		{name: "restart intent outside fencing", mutate: func(state *State) {
+			v := state.Volumes[volume.ID]
+			v.RestartRequested = true
+			state.Volumes[v.ID] = v
+		}},
 		{name: "sequence two legacy endpoint", mutate: func(state *State) {
 			v := state.Volumes[volume.ID]
 			v.PlacementSequence = 2
