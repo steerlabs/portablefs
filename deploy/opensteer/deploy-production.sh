@@ -299,7 +299,8 @@ main() {
       cell_id=$(jq -r '.placement.cell_id' <<<"$volume")
       if [[ $state == FENCING ]]; then
         cell_call "$cell_id" wait-absent "$volume_id" 300 >/dev/null
-        manager_call strict-fence "$volume_id" "$release_id" "$evidence_sha" >/dev/null
+		placement=$(jq -c '{cell_id:.placement.cell_id,placement_sequence:.placement.sequence,authority_generation:.authority_generation,project_id:.placement.project_id,service_uid:.placement.service_uid,service_gid:.placement.service_gid,listen_port:.placement.listen_port,authority_id:.placement.authority_id,authority_server_name:.placement.authority_server_name}' <<<"$volume")
+		manager_call strict-fence "$volume_id" "$release_id" restart "$placement" "$evidence_sha" >/dev/null
       elif [[ $state != PROVISIONING ]]; then
         echo "volume $volume_id entered unexpected state $state during the restart" >&2
         exit 69

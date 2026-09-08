@@ -643,7 +643,8 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		t.Fatalf("fencing plan = %+v", plan.Volumes[0])
 	}
 	volume, err = h.manager.ConfirmStrictMountsFenced("fence-proof-1", ConfirmStrictFenceRequest{
-		VolumeID: volume.ID, EvidenceSHA256: EvidenceHash([]byte("external client-host fence receipt")),
+		VolumeID: volume.ID, Purpose: StrictFencePurposeRestart, Placement: strictFencePlacement(volume.Volume),
+		EvidenceSHA256: EvidenceHash([]byte("external client-host fence receipt")),
 	})
 	if err != nil || !volume.Placement.PriorStrictFenced {
 		t.Fatalf("strict fence = %+v, %v", volume, err)

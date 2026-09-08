@@ -9,7 +9,7 @@ usage() {
 usage: $0 list-cells | converge-cell CELL_ID DECLARATION_JSON |
           wait-cell-release CELL_ID RELEASE_ID TIMEOUT_SECONDS | list-volumes | capacity |
           get|get-operator VOLUME_ID | restart VOLUME_ID RELEASE_ID |
-          strict-fence VOLUME_ID RELEASE_ID EVIDENCE_SHA256 |
+          strict-fence VOLUME_ID RELEASE_ID PURPOSE PLACEMENT_JSON EVIDENCE_SHA256 |
           wait-ready VOLUME_ID MIN_GENERATION TIMEOUT_SECONDS |
           wait-destroyed VOLUME_ID TIMEOUT_SECONDS
 EOF
@@ -224,14 +224,18 @@ case "$command" in
     printf '%s\n' "$result"
     ;;
   strict-fence)
-    [[ $# == 4 && $2 =~ $volume_pattern && $3 =~ $release_pattern && $4 =~ ^[0-9a-f]{64}$ ]] || usage
+	[[ $# == 6 && $2 =~ $volume_pattern && $3 =~ $release_pattern && ($4 == restart || $4 == deletion) && $6 =~ ^[0-9a-f]{64}$ ]] || usage
     volume_id=$2
     release_id=$3
-    evidence_sha=$4
-    body=$(jq -cn --arg volume "$volume_id" --arg evidence "$evidence_sha" \
-      '{volume_id:$volume,evidence_sha256:$evidence}')
+	purpose=$4
+	placement=$5
+	evidence_sha=$6
+	jq -e 'type == "object" and keys == ["authority_generation","authority_id","authority_server_name","cell_id","listen_port","placement_sequence","project_id","service_gid","service_uid"]' \
+		<<<"$placement" >/dev/null || usage
+	body=$(jq -cn --arg volume "$volume_id" --arg purpose "$purpose" --arg evidence "$evidence_sha" --argjson placement "$placement" \
+		'{volume_id:$volume,purpose:$purpose,placement:$placement,evidence_sha256:$evidence}')
     result=$(request operator POST "/v1/volumes/$volume_id/strict-fence" 200 "$body" \
-      "opensteer-$release_id-$volume_id-strict-${evidence_sha:0:16}")
+		"opensteer-$release_id-$volume_id-$purpose-strict-${evidence_sha:0:16}")
     require_json "$result" ".id == \"$volume_id\"" 'strict-fenced volume'
     printf '%s\n' "$result"
     ;;

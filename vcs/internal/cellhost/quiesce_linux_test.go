@@ -246,6 +246,32 @@ func TestApplyQuiesceFenceAcceptsMatchingProofAndFencesAuthority(t *testing.T) {
 	}
 }
 
+func TestApplyQuiesceFenceUsesExternalFenceWithoutClaimingQuiesceProof(t *testing.T) {
+	fixture := newPlacementFixture(t)
+	runner := &quiesceFenceRunner{active: true}
+	fixture.host.cfg.Runner = runner
+	// A stale membership is the reason this recovery path exists. It remains
+	// untouched; the signed operator fence replaces only the remote-mount
+	// absence proof, while the helper independently kills the local authority.
+	var staleSession [16]byte
+	staleSession[0] = 1
+	writeMembership(t, fixture, membershipDocument(testVolumeID, staleSession), 0o600)
+	plan := cellplan.VolumePlan{VolumeID: testVolumeID, Phase: cellplan.PhaseQuiesce, AuthorityGeneration: 7,
+		ServiceGID: 210000, PriorStrictFenced: true}
+
+	observed, update := fixture.host.Apply(context.Background(), plan, cellhelper.Assignment{})
+	if observed.Error != "" || !observed.AuthorityAbsent || observed.QuiesceProven || update.LastQuiesceNonce != "" {
+		t.Fatalf("externally fenced quiesce = %+v, update = %+v", observed, update)
+	}
+	if runner.active {
+		t.Fatal("externally fenced quiesce did not stop the authority")
+	}
+	observed, _ = fixture.host.Observe(context.Background(), plan, cellhelper.Assignment{Applied: true})
+	if observed.Error != "" || !observed.AuthorityAbsent || observed.QuiesceProven {
+		t.Fatalf("externally fenced observation = %+v", observed)
+	}
+}
+
 func TestApplyQuiesceFenceRefusesStaleProof(t *testing.T) {
 	fixture := newPlacementFixture(t)
 	runner := &quiesceFenceRunner{active: true}

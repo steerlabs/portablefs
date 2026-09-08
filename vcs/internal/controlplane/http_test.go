@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -228,6 +229,35 @@ func TestHTTPArchiveWakeAndDeleteLifecycleRoutes(t *testing.T) {
 		wake, RoleOperator, "operator", "http-wake-operator")
 	if response.Code != http.StatusForbidden {
 		t.Fatalf("operator wake status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestHTTPDeletionFenceIsOperatorOnlyAndPlacementBound(t *testing.T) {
+	h := newManagerHarness(t)
+	_, volume := readyVolumeForMount(t, h)
+	destroying, err := h.manager.DestroyVolume("http-delete-fence-start", DestroyVolumeRequest{VolumeID: volume.ID, Reason: "disposable canary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := ConfirmStrictFenceRequest{VolumeID: volume.ID, Purpose: StrictFencePurposeDeletion,
+		Placement: strictFencePlacement(destroying.Volume), EvidenceSHA256: strings.Repeat("c", 64)}
+	handler := testHTTPHandler(h.manager)
+	response := serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/strict-fence",
+		body, RoleProduct, "opensteer", "http-delete-fence-product")
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("product deletion fence status=%d body=%s", response.Code, response.Body.String())
+	}
+	body.Placement.AuthorityGeneration++
+	response = serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/strict-fence",
+		body, RoleOperator, "operator", "http-delete-fence-stale")
+	if response.Code != http.StatusConflict {
+		t.Fatalf("stale deletion fence status=%d body=%s", response.Code, response.Body.String())
+	}
+	body.Placement.AuthorityGeneration--
+	response = serveControlRequest(t, handler, http.MethodPost, "/v1/volumes/"+volume.ID+"/strict-fence",
+		body, RoleOperator, "operator", "http-delete-fence")
+	if response.Code != http.StatusOK {
+		t.Fatalf("operator deletion fence status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

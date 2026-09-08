@@ -375,7 +375,7 @@ spiffe://portablefs/mount-enrollment/<enrollment-id>
 | operator | `GET /v1/volumes` | list the complete volume inventory in volume-ID order |
 | product/operator | `GET /v1/volumes/{id}` | inspect an authorized volume |
 | product | `POST /v1/volumes/{id}/restart` | enter the fencing state |
-| operator | `POST /v1/volumes/{id}/strict-fence` | record external strict-mount fence evidence |
+| operator | `POST /v1/volumes/{id}/strict-fence` | record purpose-specific, placement-bound external strict-mount fence evidence for restart or terminal deletion recovery |
 | product | `POST /v1/volumes/{id}/archive` | enter the typed archive cycle (v2 surface) |
 | product | `POST /v1/volumes/{id}/wake` | place and restore an ARCHIVED volume (v2 surface) |
 | product | `DELETE /v1/volumes/{id}` | destroy the volume and retain the terminal audit record (v2) |
