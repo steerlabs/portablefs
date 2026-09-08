@@ -329,14 +329,19 @@ represents these limits in KiB. The manager rejects unrepresentable values;
 the helper reads the resulting project identity and block/inode totals back
 from XFS before it reports provisioning success.
 
-Restart is a fencing transaction, not `kill` followed by hope. The helper kills
-the complete service cgroup, stops both service and listener, verifies both are
-inactive, and verifies the cgroup is empty. The manager will allocate the next
-authority generation only after that local absence proof and either an
-operator's external proof that every prior strict kernel mount is absent or
-fenced, for restart, or the authority's process-bound quiesce proof, for
-archive. On restart the helper independently remembers that the previous signed
-phase was `FENCE` and refuses a skipped or premature generation.
+Planned restart uses the authority-owned quiesce handshake before stopping the
+complete service cgroup. The authority closes attach admission and proves its
+strict membership empty; the helper then stops both service and listener,
+verifies the cgroup empty, and rechecks the proof. The manager allocates the
+next authority generation only after `AuthorityAbsent && QuiesceProven`. A live
+client that has not detached therefore leaves the restart waiting rather than
+being forced off. An authority failure still enters fail-closed fencing and
+requires placement-bound operator evidence that every prior strict mount is
+absent or fenced. The same explicit evidence is the crash-recovery exception
+for a planned restart whose authority cannot finish quiescing. Operator volume
+views expose the durable `restart_requested` cursor so a release retry can keep
+waiting on that planned transaction while refusing an unplanned `FENCING`
+volume; product views omit the cursor.
 
 Retirement stops serving but preserves the XFS directory and all allocation
 identities. IDs are not recycled. Destruction is a typed, proof-bearing plan

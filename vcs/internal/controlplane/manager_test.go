@@ -638,19 +638,29 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 	if err != nil || volume.State != VolumeFencing {
 		t.Fatalf("restart = %+v, %v", volume, err)
 	}
-	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
-	if plan.Volumes[0].Phase != cellplan.PhaseFence {
-		t.Fatalf("fencing plan = %+v", plan.Volumes[0])
+	if !volume.RestartRequested || !currentState(t, h).Volumes[volume.ID].RestartRequested {
+		t.Fatal("planned restart intent was not retained internally and projected for operators")
 	}
-	volume, err = h.manager.ConfirmStrictMountsFenced("fence-proof-1", ConfirmStrictFenceRequest{
-		VolumeID: volume.ID, Purpose: StrictFencePurposeRestart, Placement: strictFencePlacement(volume.Volume),
-		EvidenceSHA256: EvidenceHash([]byte("external client-host fence receipt")),
+	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
+	if plan.Volumes[0].Phase != cellplan.PhaseQuiesce || plan.Volumes[0].PriorStrictFenced {
+		t.Fatalf("planned restart plan = %+v", plan.Volumes[0])
+	}
+	_, err = h.manager.ObserveCell("observe-restart-quiescing", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{
+			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+			Provisioned: true, AuthorityRunning: true,
+		}},
 	})
-	if err != nil || !volume.Placement.PriorStrictFenced {
-		t.Fatalf("strict fence = %+v, %v", volume, err)
+	if err != nil {
+		t.Fatal(err)
 	}
-	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
-	_, err = h.manager.ObserveCell("observe-absent", CellObservation{
+	volume, _ = h.manager.GetVolume(volume.ID)
+	if volume.State != VolumeFencing || volume.AuthorityEpoch != 1 {
+		t.Fatalf("running planned restart advanced = %+v", volume.Volume)
+	}
+	_, err = h.manager.ObserveCell("observe-unproved-absent", CellObservation{
 		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
 		Volumes: []VolumeObservation{{
 			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID,
@@ -662,12 +672,27 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	volume, _ = h.manager.GetVolume(volume.ID)
+	if volume.State != VolumeFencing || volume.AuthorityEpoch != 1 {
+		t.Fatalf("unproved restart advanced = %+v", volume.Volume)
+	}
+	_, err = h.manager.ObserveCell("observe-quiesced", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{
+			VolumeID: volume.ID, AuthorityGeneration: 1, ProjectID: volume.Placement.ProjectID,
+			ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID, ListenPort: volume.Placement.ListenPort,
+			Provisioned: true, AuthorityAbsent: true, QuiesceProven: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume, _ = h.manager.GetVolume(volume.ID)
 	if volume.State != VolumeProvisioning || volume.AuthorityEpoch != 2 || volume.Placement.AuthorityCertificatePEM != "" {
 		t.Fatalf("replacement authority state = %+v", volume.Volume)
 	}
 	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
-	if !plan.Volumes[0].PriorStrictFenced {
-		t.Fatal("replacement plan lost the external strict-mount fence proof")
+	if plan.Volumes[0].PriorStrictFenced {
+		t.Fatal("ordinary quiesce synthesized an external strict-mount fence proof")
 	}
 }
 
@@ -679,6 +704,87 @@ func TestCreateVolumeRejectsQuotaNotRepresentableInXFSKiB(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("unaligned XFS quota = %v, want ErrInvalid", err)
+	}
+}
+
+func TestPlannedRestartAcceptsOnlyAnExactExplicitCrashRecoveryFence(t *testing.T) {
+	h := newManagerHarness(t)
+	cell, volume := readyVolumeForMount(t, h)
+	var err error
+	volume, err = h.manager.RestartVolume("planned-restart", RestartVolumeRequest{VolumeID: volume.ID, Reason: "planned rollout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := strictFencePlacement(volume.Volume)
+	stale.AuthorityGeneration++
+	if _, err := h.manager.ConfirmStrictMountsFenced("stale-restart-fence", ConfirmStrictFenceRequest{
+		VolumeID: volume.ID, Purpose: StrictFencePurposeRestart, Placement: stale,
+		EvidenceSHA256: EvidenceHash([]byte("stale placement evidence")),
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale restart fence = %v", err)
+	}
+	volume, err = h.manager.ConfirmStrictMountsFenced("exact-restart-fence", ConfirmStrictFenceRequest{
+		VolumeID: volume.ID, Purpose: StrictFencePurposeRestart, Placement: strictFencePlacement(volume.Volume),
+		EvidenceSHA256: EvidenceHash([]byte("independent crash recovery evidence")),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := verifiedPlan(t, h.manager, cell.ID, *h.now)
+	if plan.Volumes[0].Phase != cellplan.PhaseQuiesce || !plan.Volumes[0].PriorStrictFenced {
+		t.Fatalf("attested planned restart plan = %+v", plan.Volumes[0])
+	}
+	_, err = h.manager.ObserveCell("attested-restart-absent", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{VolumeID: volume.ID, AuthorityGeneration: volume.AuthorityEpoch,
+			ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID,
+			ListenPort: volume.Placement.ListenPort, Provisioned: true, AuthorityAbsent: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume, _ = h.manager.GetVolume(volume.ID)
+	if volume.State != VolumeProvisioning || volume.AuthorityEpoch != 2 {
+		t.Fatalf("attested restart did not advance = %+v", volume.Volume)
+	}
+	_, csr := testCSR(t)
+	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
+	_, err = h.manager.ObserveCell("replacement-csr", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{VolumeID: volume.ID, AuthorityGeneration: 2,
+			ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID,
+			ListenPort: volume.Placement.ListenPort, Provisioned: true, AuthorityCSRPEM: csr, AuthorityAbsent: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
+	_, err = h.manager.ObserveCell("replacement-ready", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{VolumeID: volume.ID, AuthorityGeneration: 2,
+			ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID,
+			ListenPort: volume.Placement.ListenPort, Provisioned: true, AuthorityRunning: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := currentState(t, h).Volumes[volume.ID]
+	if stored.State != VolumeReady || stored.RestartRequested || stored.Placement.PriorStrictFenced || stored.Placement.StrictFenceEvidence != "" {
+		t.Fatalf("ready replacement retained restart fence = %+v", stored)
+	}
+	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
+	_, err = h.manager.ObserveCell("replacement-failed", CellObservation{
+		CellID: cell.ID, PlanGeneration: plan.Generation, ManagerReleaseID: h.manager.ReleaseIdentity(), AgentReleaseID: "agent-test", HelperReleaseID: "helper-test", ObservedUnix: h.now.Unix(),
+		Volumes: []VolumeObservation{{VolumeID: volume.ID, AuthorityGeneration: 2,
+			ProjectID: volume.Placement.ProjectID, ServiceUID: volume.Placement.ServiceUID, ServiceGID: volume.Placement.ServiceGID,
+			ListenPort: volume.Placement.ListenPort, Provisioned: true, AuthorityAbsent: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan = verifiedPlan(t, h.manager, cell.ID, *h.now)
+	if plan.Volumes[0].Phase != cellplan.PhaseFence || plan.Volumes[0].PriorStrictFenced {
+		t.Fatalf("later unplanned failure reused restart proof = %+v", plan.Volumes[0])
 	}
 }
 

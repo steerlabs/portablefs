@@ -222,9 +222,13 @@ func validatePlanTransition(plan cellplan.Plan, state State, cellID string) erro
 			if volume.AuthorityGeneration < previous.AuthorityGeneration || volume.AuthorityGeneration > previous.AuthorityGeneration+1 {
 				return errors.New("cellhelper: authority generation is stale or skipped")
 			}
-			if volume.AuthorityGeneration == previous.AuthorityGeneration+1 &&
-				!((previous.LastPhase == cellplan.PhaseFence || previous.LastPhase == cellplan.PhaseQuiesce || previous.LastPhase == cellplan.PhaseArchive) && previous.AuthorityAbsent) {
-				return errors.New("cellhelper: replacement authority lacks local process-absence proof")
+			if volume.AuthorityGeneration == previous.AuthorityGeneration+1 {
+				fenced := previous.LastPhase == cellplan.PhaseFence && previous.AuthorityAbsent
+				quiesced := previous.LastPhase == cellplan.PhaseQuiesce && previous.AuthorityAbsent && previous.Applied
+				archived := previous.LastPhase == cellplan.PhaseArchive && previous.AuthorityAbsent
+				if !fenced && !quiesced && !archived {
+					return errors.New("cellhelper: replacement authority lacks local process-absence proof")
+				}
 			}
 			continue
 		}
@@ -295,7 +299,7 @@ func assignmentAfterObservation(previous Assignment, volume cellplan.VolumePlan,
 		(volume.Phase == cellplan.PhaseProvision || volume.Phase == cellplan.PhaseServe || volume.Phase == cellplan.PhaseRestore) {
 		assignment.AppliedQuotaBytes, assignment.AppliedQuotaInodes = volume.QuotaBytes, volume.QuotaInodes
 	}
-	assignment.Applied = phaseApplied(volume.Phase, observed)
+	assignment.Applied = phaseApplied(volume, observed)
 	assignment.AppliedPlanHash = ""
 	if assignment.Applied {
 		assignment.AppliedPlanHash = digest
@@ -303,13 +307,13 @@ func assignmentAfterObservation(previous Assignment, volume cellplan.VolumePlan,
 	return assignment
 }
 
-func phaseApplied(phase cellplan.VolumePhase, observed controlplane.VolumeObservation) bool {
+func phaseApplied(volume cellplan.VolumePlan, observed controlplane.VolumeObservation) bool {
 	if observed.Error != "" {
 		return false
 	}
-	switch phase {
+	switch volume.Phase {
 	case cellplan.PhaseQuiesce:
-		return observed.AuthorityAbsent && observed.QuiesceProven
+		return observed.AuthorityAbsent && (observed.QuiesceProven || volume.PriorStrictFenced)
 	case cellplan.PhaseArchive:
 		return observed.ArchiveSealed != nil
 	case cellplan.PhaseRestore:

@@ -483,6 +483,7 @@ func (manager *Manager) RestartVolume(requestID string, request RestartVolumeReq
 			return ErrConflict
 		}
 		volume.State = VolumeFencing
+		volume.RestartRequested = true
 		volume.Placement.PriorStrictFenced = false
 		volume.Placement.StrictFenceEvidence = ""
 		volume.UpdatedUnix = now
@@ -900,6 +901,7 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 				// strand the volume with no safe reconciliation path.
 				if volume.State == VolumeReady {
 					volume.State = VolumeFencing
+					volume.RestartRequested = false
 					placement.PriorStrictFenced = false
 					placement.StrictFenceEvidence = ""
 					volume.UpdatedUnix = now
@@ -950,11 +952,17 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 			case VolumeProvisioning:
 				if placement.AuthorityCertificatePEM != "" && observed.Provisioned && observed.AuthorityRunning {
 					volume.State = VolumeReady
+					if placement.PriorStrictFenced {
+						placement.PriorStrictFenced = false
+						placement.StrictFenceEvidence = ""
+						manager.bumpPlan(&cell, now)
+					}
 					volume.UpdatedUnix = now
 				}
 			case VolumeReady:
 				if !observed.AuthorityRunning {
 					volume.State = VolumeFencing
+					volume.RestartRequested = false
 					placement.PriorStrictFenced = false
 					placement.StrictFenceEvidence = ""
 					volume.UpdatedUnix = now
@@ -965,10 +973,11 @@ func (manager *Manager) ObserveCell(requestID string, observation CellObservatio
 				if observed.AuthorityRunning {
 					break
 				}
-				if observed.AuthorityAbsent && placement.PriorStrictFenced {
+				if observed.AuthorityAbsent && (placement.PriorStrictFenced || volume.RestartRequested && observed.QuiesceProven) {
 					terminateVolumeEnrollments(state, volume.ID, "authority generation changed", now)
 					volume.AuthorityEpoch++
 					clearPlacementAuthority(placement)
+					volume.RestartRequested = false
 					volume.State = VolumeProvisioning
 					volume.UpdatedUnix = now
 					manager.bumpPlan(&cell, now)
@@ -1206,7 +1215,13 @@ func (manager *Manager) CellPlan(cellID string) (cellplan.Envelope, error) {
 				if placement.AuthorityCertificatePEM != "" {
 					phase = cellplan.PhaseServe
 				}
-			case VolumeFencing, VolumeQuarantined:
+			case VolumeFencing:
+				if volume.RestartRequested {
+					phase = cellplan.PhaseQuiesce
+				} else {
+					phase = cellplan.PhaseFence
+				}
+			case VolumeQuarantined:
 				phase = cellplan.PhaseFence
 			case VolumeArchiving:
 				phase = cellplan.PhaseArchive
@@ -1273,7 +1288,8 @@ func priorStrictFenceForPlan(volume Volume, phase cellplan.VolumePhase) bool {
 	case cellplan.PhaseProvision, cellplan.PhaseServe, cellplan.PhaseFence:
 		return volume.Placement.PriorStrictFenced
 	case cellplan.PhaseQuiesce:
-		return volume.State == VolumeDestroying && volume.DeletionFence != nil
+		return volume.State == VolumeDestroying && volume.DeletionFence != nil ||
+			volume.State == VolumeFencing && volume.RestartRequested && volume.Placement.PriorStrictFenced
 	default:
 		return false
 	}
