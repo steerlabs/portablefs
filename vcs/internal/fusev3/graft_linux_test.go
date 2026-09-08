@@ -324,7 +324,7 @@ func TestStrictLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) 
 	} else if !status.Ok() {
 		t.Fatalf("first name for local TMPFILE = %v", status)
 	}
-	if linked.NodeId != linkable.NodeId || linked.Attr.Flags != 0 || f.raw.ReplyWriteOrdered(linkUnique) {
+	if linked.NodeId != linkable.NodeId || linked.Attr.Flags != 0 || f.raw.ReplyWriteTracked(linkUnique) {
 		t.Fatalf("linked local TMPFILE output/lifecycle = %+v", linked)
 	}
 	if got, status := f.readNode(t, linked.NodeId, 8); !status.Ok() || string(got) != "linkable" {
@@ -345,7 +345,7 @@ func TestStrictLocalTmpfileAndRangeOperationsStayDescriptorDirect(t *testing.T) 
 		tmp.OpenFlags != fuse.FOPEN_KEEP_CACHE {
 		t.Fatalf("local TMPFILE output = %+v", tmp)
 	}
-	if f.raw.ReplyWriteOrdered(unique) {
+	if f.raw.ReplyWriteTracked(unique) {
 		t.Fatal("LOCAL TMPFILE entered the SHARED post-VFS publication path")
 	}
 	if status := f.raw.Link(nil, &fuse.LinkIn{
@@ -407,7 +407,7 @@ func TestRouteClaimedNegativeLookupIsLocalAcrossA_SHAREDParent(t *testing.T) {
 	if routeOut.NodeId != 0 || routeOut.Attr.Flags != 0 {
 		t.Fatalf("missing route root = %+v, want LOCAL zero-nodeid shape", routeOut)
 	}
-	if f.raw.ReplyWriteOrdered(routeUnique) {
+	if f.raw.ReplyWriteTracked(routeUnique) {
 		t.Fatal("route-owned negative below SHARED parent entered SHARED publication lifecycle")
 	}
 
@@ -417,7 +417,7 @@ func TestRouteClaimedNegativeLookupIsLocalAcrossA_SHAREDParent(t *testing.T) {
 	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: localUnique, NodeId: root.NodeId}, "missing", localOut); !status.Ok() {
 		t.Fatalf("missing local child LOOKUP = %v, want structured success", status)
 	}
-	if localOut.NodeId != 0 || localOut.Attr.Flags != 0 || f.raw.ReplyWriteOrdered(localUnique) {
+	if localOut.NodeId != 0 || localOut.Attr.Flags != 0 || f.raw.ReplyWriteTracked(localUnique) {
 		t.Fatal("negative LOOKUP below LOCAL parent entered shared publication lifecycle")
 	}
 }

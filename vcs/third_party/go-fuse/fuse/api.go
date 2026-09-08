@@ -490,16 +490,19 @@ type RawFileSystem interface {
 // ReplyWriteLifecycle is an optional RawFileSystem extension for filesystems
 // whose correctness depends on the physical publication of selected replies.
 //
-// ReplyWriteOrdered is called after the RawFileSystem method has returned but
-// before the response write. Returning true serializes that response with FUSE
-// notification writes. ReplyWritten is then called after the response write
-// attempt and after that ordering lock has been released. status describes the
-// write itself, not the errno encoded in the response.
+// ReplyWriteTracked is called after the RawFileSystem method has returned but
+// before the response write. Returning true selects the physical lifecycle:
+// payload preparation occurs immediately before the write, and ReplyWritten is
+// called after the write attempt and after the device lock has been released.
+// FUSE notifications can remain in the kernel while replies proceed; the
+// filesystem must order cache admission and invalidation at its own coordinate
+// boundary. status describes the write itself, not the errno encoded in the
+// response.
 //
 // The lifecycle is implemented only by Server's real /dev/fuse path. The
 // in-process ProtocolServer intentionally does not claim physical publication.
 type ReplyWriteLifecycle interface {
-	ReplyWriteOrdered(unique uint64) bool
+	ReplyWriteTracked(unique uint64) bool
 	ReplyWritten(unique uint64, status Status)
 }
 

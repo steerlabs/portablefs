@@ -11,7 +11,7 @@
 #
 #   default   Everything that runs without Docker and without a privileged
 #             container: cross-platform build and vet, govulncheck, the native
-#             Go suites, the go-fuse reply-ordering seam, the Swift suite on
+#             Go suites, the go-fuse physical-reply seam, the Swift suite on
 #             macOS, workflow/release-trust policy, and the architecture scans.
 #             It does NOT run either real-mount suite. The closing banner names
 #             what it skipped; this mode alone is not merge evidence for a
@@ -108,13 +108,13 @@ go -C vcs test -race ./...
 
 # The maintained go-fuse fork is a nested module, so the suite above does not
 # enter it. Protocol 6 retains one stock-FUSE-neutral seam: ReplyWriteLifecycle
-# serializes selected physical replies and notifications through writeMu. Gate
-# that ordering hook without running the retired private-ABI tests.
-step "maintained go-fuse reply ordering seam"
+# tracks selected physical replies while descriptor lifetime is shared with
+# notifications. Gate that lifecycle without running the retired private-ABI tests.
+step "maintained go-fuse physical reply seam"
 go -C vcs/third_party/go-fuse build ./fuse
 go -C vcs/third_party/go-fuse vet ./fuse
-go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
-go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+go -C vcs/third_party/go-fuse test ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites)$'
+go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites)$'
 
 # 5. The Swift suite. On macOS the shared gate uses Xcode's native test runner,
 # separately enumerates the complete inventory, and requires the xcresult to
@@ -272,7 +272,7 @@ if [[ "$VERIFY_LOCAL_FULL" == "1" ]]; then
 
   echo
   echo "verify-local: ok (full)"
-  echo "  ran: build/vet, govulncheck, native go suites, go-fuse reply seam,"
+  echo "  ran: build/vet, govulncheck, native go suites, go-fuse physical-reply seam,"
   echo "       Swift suite (macOS host only), workflow/release-trust policy,"
   echo "       architecture scans, xfs-fuse-integration.sh, coherence-matrix-linux.sh"
   echo "  still NOT run by --full:"

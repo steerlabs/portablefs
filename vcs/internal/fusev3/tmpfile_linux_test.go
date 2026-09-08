@@ -47,7 +47,7 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 		request.GetFlags().GetAppend() || request.GetFlags().GetTruncate() || !request.GetExclusive() {
 		t.Fatalf("authority TMPFILE mapping = %+v", request)
 	}
-	if !fixture.raw.ReplyWriteOrdered(unique) {
+	if !fixture.raw.ReplyWriteTracked(unique) {
 		t.Fatal("TMPFILE lost its daemon-local source publication ownership")
 	}
 	if out.NodeId == 0 || out.Fh == 0 || out.Attr.Ino != 81 || out.Attr.Flags != 0 ||

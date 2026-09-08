@@ -100,13 +100,13 @@ jobs:
       - run: go -C vcs test ./...
       - name: Race suite
         run: go -C vcs test -race ./...
-      - name: Maintained go-fuse reply ordering seam
+      - name: Maintained go-fuse physical reply seam
         run: |
           set -euo pipefail
           go -C vcs/third_party/go-fuse build ./fuse
           go -C vcs/third_party/go-fuse vet ./fuse
-          go -C vcs/third_party/go-fuse test ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
-          go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(OrderedReplyLifecycle|UnselectedReply)'
+          go -C vcs/third_party/go-fuse test ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites)$'
+          go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(TrackedReplyLifecycle.*|UntrackedReply.*|BlockedNotificationAllowsTrackedReply|FailedTrackedReplyFinalizesAfterDescriptorUnlock|CloseWaitsForNotificationAndRejectsLateWrites)$'
 
   go-darwin:
     runs-on: macos-26

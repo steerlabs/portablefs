@@ -735,22 +735,17 @@ it.
 **The exposure has a liveness face as well as a staleness one.** Stock's
 whole-file invalidation is not a bounded operation: `INVAL_INODE` is a
 synchronous write to `/dev/fuse` that returns only once the kernel has walked
-the mapping, and it must take each folio's lock to do so. A workload that keeps
-one inode's folios continuously locked -- several processes on the same mount
-reading the same file in a tight loop -- can therefore hold that notification in
-the kernel for a long time. The mount discharging the recall is blocked in that
-write, so it does not answer COMPLETE, and the mutating mount's transaction
-burns its whole `RecallBudget` waiting for a discharge that is starved rather
-than lost. Observed shape: three processes re-opening and re-reading one file
-while a peer rewrites it stalls the writer for the full budget and ends its
-operation as uncertain. Pacing those readers reduces the rate but does not
-remove it -- a 2 ms gap between reads still reached the stall within a few dozen
-rewrites -- because what matters is whether the inode is ever quiet, not how
-fast the readers go. Access that lets the inode fall idle between bursts, which
-is what ordinary workloads do, does not reproduce it. The daemon cannot bound this from
-userspace -- it cannot decline to serve the reads, and it cannot cancel a
-notification already in the kernel -- so, like the silent `-EBUSY`, it is closed
-by the §13 result-bearing invalidation primitive and not before.
+the mapping, and it must take each folio's lock to do so. The daemon therefore
+allows reply writes to proceed concurrently with that syscall. A pending FUSE
+read can release the very folio the invalidation is waiting for; serializing
+the reply behind the notification would create a userspace circular wait.
+
+Concurrency removes that device-wide cycle, but it cannot cancel a notification
+already blocked inside the kernel or prove that the mapping walk removed every
+folio. A retained reference that keeps a folio busy without waiting for a daemon
+reply can still delay the notification through the withdrawal interval. That
+remaining kernel-side liveness and result gap, like silent `-EBUSY`, requires
+the §13 bounded, result-bearing invalidation primitive to close.
 
 In either case the watchdog terminalizes and
 aborts the mount before the authority proceeds, but aborting the FUSE channel

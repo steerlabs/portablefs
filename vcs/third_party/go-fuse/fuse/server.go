@@ -45,16 +45,18 @@ type Server struct {
 	// Empty if unmounted.
 	mountPoint string
 	// mountMu serializes ordinary unmount with Linux lazy detach. The latter
-	// returns before the serving loops exit, so it cannot use writeMu (which
-	// also protects replies and notifications).
+	// returns before the serving loops exit, so it cannot use fdMu (which
+	// protects the device descriptor).
 	mountMu sync.Mutex
 
-	// writeMu serializes close, notify writes, and the selected replies whose
-	// filesystem publication lifecycle requires the same ordering boundary.
-	writeMu sync.Mutex
+	// fdMu keeps mountFd alive across replies, reverse notifications, and
+	// passthrough ioctls. It deliberately permits concurrent syscalls: a
+	// synchronous invalidation may be waiting for the FUSE reply that releases
+	// the folio it is trying to remove.
+	fdMu sync.RWMutex
 	// replyWriteLifecycle is the optional filesystem-owned publication
-	// boundary. Only replies selected by ReplyWriteOrdered join writeMu, so
-	// ordinary read parallelism remains unchanged.
+	// boundary. Coordinate admission and settlement provide its ordering;
+	// fdMu protects only the descriptor used at the physical edge.
 	replyWriteLifecycle ReplyWriteLifecycle
 
 	// I/O with kernel and daemon.
@@ -78,8 +80,10 @@ type Server struct {
 
 	singleReader bool
 	canSplice    bool
-	loops        sync.WaitGroup
-	serving      bool // for preventing duplicate Serve() calls
+	// loops covers every reader loop and, on single-reader platforms, every
+	// request handler that can still publish a reply before mountFd is closed.
+	loops   sync.WaitGroup
+	serving bool // for preventing duplicate Serve() calls
 
 	// Used to implement WaitMount on macos.
 	ready chan error
@@ -234,6 +238,7 @@ func NewServer(fs RawFileSystem, mountPoint string, opts *MountOptions) (*Server
 		maxReaders:   maxReaders,
 		singleReader: useSingleReader,
 		ready:        make(chan error, 1),
+		mountFd:      -1,
 	}
 	ms.replyWriteLifecycle, _ = fs.(ReplyWriteLifecycle)
 
@@ -471,9 +476,7 @@ func (ms *Server) Serve() {
 	ms.loop()
 	ms.loops.Wait()
 
-	ms.writeMu.Lock()
-	syscall.Close(ms.mountFd)
-	ms.writeMu.Unlock()
+	ms.closeMountFd()
 
 	// shutdown in-flight cache retrieves.
 	//
@@ -580,7 +583,13 @@ exit:
 		}
 
 		if ms.singleReader {
-			go ms.handleRequest(req)
+			// Add while this reader loop is still counted, so Serve cannot reach
+			// the descriptor close between launching and tracking the handler.
+			ms.loops.Add(1)
+			go func(req *requestAlloc) {
+				defer ms.loops.Done()
+				ms.handleRequest(req)
+			}(req)
 		} else {
 			ms.handleRequest(req)
 		}
@@ -651,7 +660,12 @@ func (ms *Server) ReplyWriteLifecycleArmed() bool {
 
 func (ms *Server) writeReply(req *request) Status {
 	unique := req.inHeader().Unique
-	return runReplyWriteLifecycle(ms.replyWriteLifecycle, unique, &ms.writeMu, func() Status {
+	return runReplyWriteLifecycle(ms.replyWriteLifecycle, unique, func() Status {
+		ms.fdMu.RLock()
+		defer ms.fdMu.RUnlock()
+		if ms.mountFd < 0 {
+			return ENODEV
+		}
 		if status := ms.prepareReplyForWrite(req); !status.Ok() {
 			return status
 		}
@@ -685,24 +699,20 @@ func (ms *Server) prepareReplyForWrite(req *request) Status {
 	// conversion may serialize once more if its realized length differs.
 	req.serializeHeader(req.outPayloadSize())
 	if ms.opts != nil && ms.opts.Debug {
-		ms.opts.Logger.Printf("physical tx %d: unique=%#x ordered=%t",
+		ms.opts.Logger.Printf("physical tx %d: unique=%#x tracked=%t",
 			unique, req.outHeader().Unique,
-			ms.replyWriteLifecycle != nil && ms.replyWriteLifecycle.ReplyWriteOrdered(unique))
+			ms.replyWriteLifecycle != nil && ms.replyWriteLifecycle.ReplyWriteTracked(unique))
 	}
 	return OK
 }
 
-func runReplyWriteLifecycle(lifecycle ReplyWriteLifecycle, unique uint64, writeMu *sync.Mutex, write func() Status) Status {
-	ordered := lifecycle != nil && lifecycle.ReplyWriteOrdered(unique)
-	if ordered {
-		writeMu.Lock()
-	}
+func runReplyWriteLifecycle(lifecycle ReplyWriteLifecycle, unique uint64, write func() Status) Status {
+	tracked := lifecycle != nil && lifecycle.ReplyWriteTracked(unique)
 	status := write()
-	if ordered {
-		writeMu.Unlock()
-		// Never invoke filesystem code while holding writeMu: a failed reply
+	if tracked {
+		// Never invoke filesystem code while holding a device lock: a failed reply
 		// may terminalize the mount and synchronously schedule notifications or
-		// connection teardown through the same ordering boundary.
+		// connection teardown.
 		lifecycle.ReplyWritten(unique, status)
 	}
 	return status
@@ -726,10 +736,16 @@ func notifyWrite(writev func([][]byte) (int, syscall.Errno), opts *MountOptions,
 }
 
 func (ms *Server) writev(iov [][]byte) (int, syscall.Errno) {
-	// Protect against concurrent close.
-	ms.writeMu.Lock()
-	defer ms.writeMu.Unlock()
-	n, err := writev(ms.mountFd, iov)
+	return ms.writevWith(iov, writev)
+}
+
+func (ms *Server) writevWith(iov [][]byte, write func(int, [][]byte) (int, error)) (int, syscall.Errno) {
+	ms.fdMu.RLock()
+	defer ms.fdMu.RUnlock()
+	if ms.mountFd < 0 {
+		return 0, syscall.ENODEV
+	}
+	n, err := write(ms.mountFd, iov)
 
 	var errno syscall.Errno
 	if err != nil {
@@ -741,6 +757,16 @@ func (ms *Server) writev(iov [][]byte) (int, syscall.Errno) {
 		}
 	}
 	return n, errno
+}
+
+func (ms *Server) closeMountFd() {
+	ms.fdMu.Lock()
+	defer ms.fdMu.Unlock()
+	fd := ms.mountFd
+	ms.mountFd = -1
+	if fd >= 0 {
+		syscall.Close(fd)
+	}
 }
 
 func (ms *protocolServer) notifyWrite(req *request) Status {

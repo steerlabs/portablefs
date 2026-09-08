@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -144,7 +143,6 @@ func TestLeaseHorizonWatchdogSurvivesSharedMountCancellation(t *testing.T) {
 		directAbort <- time.Now()
 		return nil
 	}
-	fixture.mount.leases.setWithdrawalStage(key, "inode-notify")
 	teardownBlocked := make(chan struct{})
 	fixture.mount.withdrawal = kernelWithdrawal{
 		detach: func(string) error { <-teardownBlocked; return nil },
@@ -173,10 +171,6 @@ func TestLeaseHorizonWatchdogSurvivesSharedMountCancellation(t *testing.T) {
 		if !invoked.Before(horizon) {
 			close(teardownBlocked)
 			t.Fatalf("direct abort at %v, not before authority horizon %v", invoked, horizon)
-		}
-		if cause := fixture.mount.fatalError(); cause == nil || !strings.Contains(cause.Error(), "during inode-notify") {
-			close(teardownBlocked)
-			t.Fatalf("lease horizon cause omitted the active withdrawal stage: %v", cause)
 		}
 	case <-time.After(time.Second):
 		close(teardownBlocked)

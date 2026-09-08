@@ -664,10 +664,10 @@ const (
 )
 
 // completeTestReply models the physical /dev/fuse response edge exposed by the
-// neutral ordered-writer lifecycle.
+// neutral tracked-reply lifecycle.
 func completeTestReply(t *testing.T, raw *rawFileSystem, unique uint64, status fuse.Status) {
 	t.Helper()
-	if raw.ReplyWriteOrdered(unique) {
+	if raw.ReplyWriteTracked(unique) {
 		raw.ReplyWritten(unique, status)
 	}
 }
@@ -1233,7 +1233,7 @@ func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	}
 	unique := nextTestRequestUnique()
 	frontend.Release(nil, &fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: unique}, Fh: id})
-	if frontend.ReplyWriteOrdered(unique) {
+	if frontend.ReplyWriteTracked(unique) {
 		frontend.ReplyWritten(unique, fuse.OK)
 	}
 	err := mount.fatalError()
@@ -1653,8 +1653,8 @@ func TestSyncFSUsesOneReplayMutationAndNoPublicationGate(t *testing.T) {
 				f.syncFS, f.calls, f.mutationCalls, f.mutationSeq, f.reads)
 		}
 	})
-	if !frontend.ReplyWriteOrdered(unique) {
-		t.Fatal("SYNCFS omitted physical reply ordering or created a cache/source publication obligation")
+	if !frontend.ReplyWriteTracked(unique) {
+		t.Fatal("SYNCFS omitted physical reply tracking or created a cache/source publication obligation")
 	}
 	if got := consumption.calls.Load(); got != 0 {
 		t.Fatalf("SYNCFS consumed response %d time(s) before physical reply", got)
@@ -1682,8 +1682,8 @@ func TestSyncFSPropagatesDefiniteErrorAndRejectsMalformedSuccess(t *testing.T) {
 		}}); status != fuse.EIO || mount.isRevoked() {
 			t.Fatalf("definite SYNCFS error = %v, revoked=%t", status, mount.isRevoked())
 		}
-		if !frontend.ReplyWriteOrdered(unique) {
-			t.Fatal("definite SYNCFS error omitted physical reply ordering or created publication")
+		if !frontend.ReplyWriteTracked(unique) {
+			t.Fatal("definite SYNCFS error omitted physical reply tracking or created publication")
 		}
 		if got := consumption.calls.Load(); got != 0 {
 			t.Fatalf("definite SYNCFS error consumed response %d time(s) before physical reply", got)

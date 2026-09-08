@@ -44,14 +44,13 @@ type heldLease struct {
 }
 
 type leaseRegistry struct {
-	mount           *Mount
-	mu              sync.Mutex
-	leases          map[leaseKey]*heldLease
-	leaseCounts     map[authoritypb.LeaseFamily]int
-	maxPerFamily    int
-	pendingRecalls  map[leaseKey]*authoritypb.LeaseRecall
-	withdrawalStage map[leaseKey]string
-	grantFloor      uint64
+	mount          *Mount
+	mu             sync.Mutex
+	leases         map[leaseKey]*heldLease
+	leaseCounts    map[authoritypb.LeaseFamily]int
+	maxPerFamily   int
+	pendingRecalls map[leaseKey]*authoritypb.LeaseRecall
+	grantFloor     uint64
 }
 
 func newLeaseRegistry(mount *Mount) *leaseRegistry {
@@ -61,30 +60,7 @@ func newLeaseRegistry(mount *Mount) *leaseRegistry {
 	}
 	return &leaseRegistry{
 		mount: mount, leases: make(map[leaseKey]*heldLease), leaseCounts: make(map[authoritypb.LeaseFamily]int),
-		maxPerFamily: capacity, pendingRecalls: make(map[leaseKey]*authoritypb.LeaseRecall), withdrawalStage: make(map[leaseKey]string),
-	}
-}
-
-func (r *leaseRegistry) setWithdrawalStage(key leaseKey, stage string) {
-	r.mu.Lock()
-	r.withdrawalStage[key] = stage
-	r.mu.Unlock()
-}
-
-func (r *leaseRegistry) withdrawalStageFor(key leaseKey) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if stage := r.withdrawalStage[key]; stage != "" {
-		return stage
-	}
-	return "unknown"
-}
-
-func (r *leaseRegistry) setRecallStage(recalls []*authoritypb.LeaseRecall, stage string) {
-	for _, recall := range recalls {
-		if validated, err := validateLeaseRecall(recall); err == nil {
-			r.setWithdrawalStage(validated.key(), stage)
-		}
+		maxPerFamily: capacity, pendingRecalls: make(map[leaseKey]*authoritypb.LeaseRecall),
 	}
 }
 
@@ -316,7 +292,6 @@ func (r *leaseRegistry) beginRecalls(ctx context.Context, sequence uint64, recal
 	r.mu.Unlock()
 	for _, key := range keys {
 		if coordinate, ok := key.publicationCoordinate(); ok && r.mount.raw != nil {
-			r.setWithdrawalStage(key, "close-coordinate")
 			if err := r.mount.raw.closeLeaseCoordinate(ctx, coordinate); err != nil {
 				return nil, err
 			}
@@ -366,7 +341,6 @@ func (r *leaseRegistry) completeRecalls(recalls []*authoritypb.LeaseRecall) ([]*
 	discharges := make([]*authoritypb.LeaseDischarge, 0, len(items))
 	for _, item := range items {
 		if r.mount.raw != nil {
-			r.setWithdrawalStage(item.key, "invalidate")
 			if err := r.mount.raw.invalidateLease(item.key); err != nil {
 				return nil, err
 			}
@@ -390,7 +364,6 @@ func (r *leaseRegistry) finishRecalls(recalls []*authoritypb.LeaseRecall) error 
 		key := validated.key()
 		r.deleteLeaseLocked(key)
 		delete(r.pendingRecalls, key)
-		delete(r.withdrawalStage, key)
 		keys = append(keys, key)
 	}
 	r.mu.Unlock()
@@ -712,7 +685,6 @@ func (m *Mount) runLeaseEvents(ctx context.Context) {
 				m.failAsync(err)
 				return
 			}
-			m.leases.setRecallStage(event.GetRecalls(), "acknowledge-revoke")
 			err = m.rpc.AcknowledgeLeaseEvent(ackCtx, event.GetCursor(), nil)
 			cancel()
 		case authoritypb.LeaseEventPhase_LEASE_EVENT_PHASE_COMPLETE:
@@ -726,7 +698,6 @@ func (m *Mount) runLeaseEvents(ctx context.Context) {
 				return
 			}
 			ackCtx, cancel := context.WithTimeout(ctx, m.repairBudget)
-			m.leases.setRecallStage(event.GetRecalls(), "acknowledge-complete")
 			err = m.rpc.AcknowledgeLeaseEvent(ackCtx, event.GetCursor(), discharges)
 			cancel()
 			if err == nil {
@@ -840,8 +811,7 @@ func (m *Mount) runLeaseHardWatchdog(ctx context.Context) {
 // post-fence state is reported as an unproved withdrawal by the ordinary
 // revocation ladder instead of being mislabeled as repaired cache state.
 func (m *Mount) abortAtLeaseHorizon(key leaseKey) {
-	stage := m.leases.withdrawalStageFor(key)
-	cause := fmt.Errorf("%w: cache lease family %s reached its authority horizon during %s", errRepairBudgetExceeded, key.family.String(), stage)
+	cause := fmt.Errorf("%w: cache lease family %s reached its authority horizon before local withdrawal completed", errRepairBudgetExceeded, key.family.String())
 	m.revoked.Store(true)
 	m.recordFatalCause(cause)
 	if m.cancel != nil {
@@ -1129,7 +1099,6 @@ func (r *rawFileSystem) invalidateLease(key leaseKey) error {
 		_, err := r.invalidateDaemonNameLease(key)
 		return err
 	case authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES:
-		r.mount.leases.setWithdrawalStage(key, "inode-notify")
 		notifier := r.mount.notifier()
 		if notifier == nil {
 			return errors.New("fusev3: attribute lease invalidation has no kernel notification channel")
@@ -1154,7 +1123,6 @@ func (r *rawFileSystem) invalidateLease(key leaseKey) error {
 		if notifier == nil {
 			return errors.New("fusev3: data lease invalidation has no kernel notification channel")
 		}
-		r.mount.leases.setWithdrawalStage(key, "drain-publications")
 		if err := r.drainDataPublications(publicationCoordinate{kind: publicationItemData, item: key.identity}); err != nil {
 			return err
 		}
@@ -1170,7 +1138,6 @@ func (r *rawFileSystem) invalidateLease(key leaseKey) error {
 		}
 		r.mu.Unlock()
 		if record != nil {
-			r.mount.leases.setWithdrawalStage(key, "inode-notify")
 			if status := notifier.InodeNotify(record.id, 0, 0); !status.Ok() && status != fuse.ENOENT {
 				return fmt.Errorf("fusev3: invalidate leased data for inode %d: %v", record.id, status)
 			}

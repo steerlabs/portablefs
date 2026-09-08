@@ -260,7 +260,7 @@ suite_command() {
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
     "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
-    go -C /work/vcs test -v -count=1 -p 1 -timeout 35m \
+    go -C /work/vcs test -v -count=1 -failfast -p 1 -timeout 35m \
     "${extra_go_test_flags[@]}" "$@"
 }
 
@@ -303,15 +303,17 @@ run_tiered_suite() {
 
 run_suite() {
   local log=/home/portablefs/tmp/go-test.log
-  local status=0 slice=0
+  local status=0
   : >"$log"
   set +e
   run_plain_suite "$log"
-  slice=$?
-  [[ $slice -eq 0 ]] || status=$slice
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    cat -- "$log"
+    fail "go test exited $status" "$status"
+  fi
   run_tiered_suite "$log"
-  slice=$?
-  [[ $slice -eq 0 ]] || status=$slice
+  status=$?
   set -e
   cat -- "$log"
   [[ $status -eq 0 ]] || fail "go test exited $status" "$status"
