@@ -471,7 +471,7 @@ func TestV3AutomaticEnrollmentOwnsRenewalWithoutManualFallback(t *testing.T) {
 		AuthorityGeneration:             7,
 		InitialAuthorizationExpiresAtMs: initialDeadline.UnixMilli(),
 	}
-	// Automatic enrollment uses the same operational protocol-6 FSKit profile
+	// Automatic enrollment uses the same operational protocol-7 FSKit profile
 	// and registry path as an ordinary direct attach.
 	stateDir := privateTestDir(t)
 	r := newRegistry(stateDir)

@@ -4,7 +4,13 @@ Workstream G integrates the handler and Linux client against [wire.md](wire.md).
 The starting tree is `aa046b1` on `cv2-integrate`. This record distinguishes
 observed results from qualification still outstanding.
 
-## Step 1: real mounts (in progress)
+Steps 1–6 are implemented and committed. Step 7 is running its final full gate
+after the SQLite fixture correction. The sections below are a chronological
+record: early failure and backlog statements are superseded by later run
+evidence. [results.md](results.md) contains the final measured build;
+[changed-files.txt](changed-files.txt) lists the complete workstream file delta.
+
+## Initial step 1: real mounts
 
 The first real CREATE failed with EIO: the coordinator began at volume version
 zero while the storage handler began at one. Version zero is not a valid cache
@@ -50,7 +56,7 @@ after recall. Concurrent writers and lazy unmount pass with these changes. The b
 500-read requirement and now paces the writer to collect at least eight reads
 per rewrite instead of depending on v6 execution latency.
 
-## Step 2: directory decision (implemented, not fully qualified)
+## Initial step 2: directory decision
 
 Use XFS `getdents` continuation offsets as opaque cookies, preserving each
 entry's `d_off` through the store and wire reply. The directory verifier guards
@@ -65,7 +71,7 @@ unchanged anchors must appear exactly once and no ESTALE is allowed.
 The former v6 ESTALE expectation conflicts with design rule F3. No focused
 consistency guarantee has been removed.
 
-## Outstanding qualification
+## Initial qualification backlog
 
 The v7 matrix conversion, v6 engine deletion, the 20,000-file git-add regression,
 baseline profiling and measurements, public documentation, and the full local
@@ -664,3 +670,21 @@ Architecture, consistency, failure, matrix, performance, README, compatibility,
 and changelog text now agree with those interfaces. Full-gate qualification
 follows below; earlier status sections in this chronological record describe
 work outstanding at the time of each run.
+
+Run 155 completes `bash scripts/verify-local.sh --full` with exit 0: all 66
+required privileged tests, the root boundary test, and the matrix's 28 PASS /
+zero FAIL / unchanged single-principal chown SKIP. Both negative controls have
+their declared outcomes. This is the Linux qualification before the following
+Mac boundary correction, not the final tree's gate result.
+
+The documentation audit finds Swift's production nested-contract parser still
+requires authority major 6, although portablefsd emits ProtocolMajor (7). Its
+independently constructed Swift fixtures also used 6, so 344 passing tests had
+not covered the pair. The parser and all accepted fixtures now use exact 7;
+explicit negative cases refuse 6 and 8. A new shared pfslocal golden compares
+an actual Go `newV3CoherenceBridge(...).resolveContract()` Resolve frame against
+both language fixture copies, and Swift decodes that frame through its shipping
+parser. Local pfslocal remains major 1/minor 15 with unchanged field numbers and
+cache-policy names. Go bridge tests pass; run 156's native Xcode gate enumerates
+and passes the exact 345-test inventory (59 AppCore, 286 Kit). No real FSKit mount
+is claimed by that test. Run 156 repeats the complete full gate after this fix.

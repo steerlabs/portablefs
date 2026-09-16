@@ -3,7 +3,10 @@ package portablefsd
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"syscall"
@@ -124,6 +127,41 @@ func TestV3CoherenceBridgeContractIsExactAndCloned(t *testing.T) {
 	again := bridge.resolveContract()
 	if !bytes.Equal(again.AuthorityEpoch, client.epoch) || !bytes.Equal(again.SessionID, client.session) {
 		t.Fatal("resolve contract exposed mutable bridge identity")
+	}
+}
+
+// Pin the contract emitted by the real bridge to the same Resolve frame that
+// Swift decodes and admits. Independent language-local fixtures hid a major
+// mismatch even while both suites passed.
+func TestV3CoherenceBridgeResolveMatchesSwiftGolden(t *testing.T) {
+	client := newFakeV3VisibilityClient()
+	defer client.Close()
+	bridge, err := newV3CoherenceBridge(client, v3CachePolicyFSKit, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := pfslocal.EncodeFrame(&pfslocal.Envelope{
+		RequestID: 7,
+		Body:      &pfslocal.ResolveReply{V3Coherence: bridge.resolveContract()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		"pfslocal/testdata/v7_resolve_contract.hex",
+		"swift/PortableFSKit/Tests/PortableFSKitTests/Goldens/v7_resolve_contract.hex",
+	} {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "..", path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		golden, err := hex.DecodeString(string(bytes.TrimSpace(raw)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(frame, golden) {
+			t.Fatalf("daemon Resolve differs from %s:\n got %x\nwant %x", path, frame, golden)
+		}
 	}
 }
 
