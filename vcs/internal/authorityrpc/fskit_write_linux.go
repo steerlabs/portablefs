@@ -1133,7 +1133,7 @@ func (h *VolumeHandler) commitFskitWrite(ctx context.Context, request *authority
 			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
-	})
+	}, &releaseMutation)
 	if releaseMutation != nil {
 		releaseMutation()
 	}

@@ -12,7 +12,7 @@ import (
 )
 
 // CoordinationConfig is the complete construction input for one volume's
-// protocol-6 coordination. Every field is a safety property of the deployment,
+// protocol-7 coordination. Every field is a safety property of the deployment,
 // so none of them has a default a caller may inherit silently.
 type CoordinationConfig struct {
 	Store  *xfsstore.Volume
@@ -36,20 +36,18 @@ type CoordinationConfig struct {
 	OnBarrier func(time.Duration, int)
 }
 
-// Coordination is a volume's complete protocol-6 coordination assembly.
+// Coordination is a volume's complete protocol-7 coordination assembly.
 //
-// The four coordinators are one unit, not four independent options. The route
-// controller needs the same durable mount lifecycle that admits mounts and the
-// same lease table that owns cache authority, and an authority that has some of
-// them is not a protocol-6 authority at all - it is one that refuses every
-// route change or admits mounts nothing can recall. Assembling them here, once,
-// is what keeps a test fixture and production from disagreeing about which
-// parts a working authority has.
+// Linux subscription state is epoch-local. FSKit repair and durable mount
+// membership retain their existing coordinators. The legacy lease table is
+// confined to route-controller startup and topology bookkeeping; protocol 7
+// does not activate Linux lease holders or dispatch lease requests.
 type Coordination struct {
 	Store      *xfsstore.Volume
 	Lifecycle  *volumeserver.MountLifecycle
 	Visibility *volumeserver.VisibilityCoordinator
 	Leases     *volumeserver.LeaseCoordinator
+	Coherence  *volumeserver.CoherenceCoordinator
 	Routes     *RoutesController
 }
 
@@ -93,12 +91,13 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 		return nil, fmt.Errorf("load machine-local routing declaration: %w", err)
 	}
 	return &Coordination{
-		Store: cfg.Store, Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes,
+		Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{}), Store: cfg.Store, Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes,
 	}, nil
 }
 
-// Bind installs this assembly on a handler. It is the only way the four
-// coordinators reach one, so a handler can never be given a partial set.
+// Bind installs the volume assembly on its handler.
 func (c *Coordination) Bind(h *VolumeHandler) {
 	h.Lifecycle, h.Visibility, h.Leases, h.Routes = c.Lifecycle, c.Visibility, c.Leases, c.Routes
+	h.Coherence = c.Coherence
+	h.initCoherence()
 }

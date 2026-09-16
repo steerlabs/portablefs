@@ -186,21 +186,17 @@ func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeser
 	return false, h.storageCut(), nil
 }
 
-// storageCut is the volume's object-version domain: the latest completed
-// storage cut. Object versions are stamped from it -- finalizeMutationPostState
-// records the lease commit sequence, and LeaseReadAdmission.SnapshotSequence
-// publishes the same counter -- so a page stabilized against it is directly
-// comparable to the versions its entries carry, for either frontend profile.
+// storageCut is the volume's object-version domain: the latest coherence
+// publication cut. Object versions are stamped from this same ordered domain,
+// so a page stabilized against it is directly comparable to the versions its
+// entries carry for either frontend profile.
 //
 // It floors at 1 for the same reason sampledObjectVersion floors an unstamped
 // object at 1: before anything has committed, the domain's first value is 1.
 // Returning 0 would make every unstamped entry look like it came from the
 // future on a volume nothing had written to yet.
 func (h *VolumeHandler) storageCut() uint64 {
-	if h.Leases == nil {
-		return 1
-	}
-	if cut := h.Leases.CommittedSequence(); cut != 0 {
+	if cut := h.coherenceVersionNow(); cut != 0 {
 		return cut
 	}
 	return 1

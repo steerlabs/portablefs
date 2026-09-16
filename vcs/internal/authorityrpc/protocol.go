@@ -162,7 +162,7 @@ func terminalQuiesceCancelable(req *authoritypb.Request) bool {
 	if req == nil {
 		return false
 	}
-	if blockingWait(req) || req.GetNextControlEvent() != nil || req.GetNextLeaseEvent() != nil || req.GetNextFskitRepair() != nil || req.GetApplyRoutes() != nil {
+	if blockingWait(req) || req.GetNextControlEvent() != nil || req.GetNextFskitRepair() != nil || req.GetApplyRoutes() != nil {
 		return true
 	}
 	return false
@@ -250,9 +250,7 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 		case *authoritypb.Request_Flush, *authoritypb.Request_Fallocate,
 			*authoritypb.Request_CopyFileRange, *authoritypb.Request_Tmpfile,
 			*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
-			*authoritypb.Request_Write, *authoritypb.Request_NextLeaseEvent,
-			*authoritypb.Request_AcknowledgeLeaseEvent, *authoritypb.Request_RenewLeases,
-			*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
+			*authoritypb.Request_Write,
 			*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,
 			*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
 			*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
@@ -408,9 +406,6 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 		*authoritypb.Request_Reauthorize,
 		*authoritypb.Request_Detach, *authoritypb.Request_Cancel,
 		*authoritypb.Request_TerminalDeliveryReceipt,
-		*authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent,
-		*authoritypb.Request_RenewLeases,
-		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
 		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
 		*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,
 		*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
