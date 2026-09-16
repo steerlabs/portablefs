@@ -1243,3 +1243,45 @@ func TestBlockingWaitClassification(t *testing.T) {
 		}
 	}
 }
+
+func TestServerParkedControlPollUsesIndependentLane(t *testing.T) {
+	poll := &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
+	if !serverParkedRequest(poll) {
+		t.Fatal("NextControlEvent must not consume acknowledgment and renewal capacity")
+	}
+	for name, req := range map[string]*authoritypb.Request{
+		"renew":      {Body: &authoritypb.Request_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionRequest{}}},
+		"change ack": {Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}},
+		"recall ack": {Body: &authoritypb.Request_DelegationRecallAck{DelegationRecallAck: &authoritypb.DelegationRecallAck{}}},
+	} {
+		if serverParkedRequest(req) {
+			t.Fatalf("%s must retain the ordinary CONTROL lane", name)
+		}
+	}
+}
+
+func TestServerDelegatedFlushUsesIndependentDataLane(t *testing.T) {
+	delegation := &authoritypb.DelegationRef{Id: bytes.Repeat([]byte{1}, 16), Generation: 1}
+	for name, req := range map[string]*authoritypb.Request{
+		"write":     {Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Delegation: delegation}}},
+		"setattr":   {Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Delegation: delegation}}},
+		"fallocate": {Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Delegation: delegation}}},
+	} {
+		if !delegatedFlushRequest(req) {
+			t.Fatalf("%s delegated mutation did not use flush lane", name)
+		}
+	}
+	if delegatedFlushRequest(&authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{}}}) {
+		t.Fatal("ordinary write used flush lane")
+	}
+	for _, limit := range []int{3, 8, 127} {
+		ordinary, blocking, flush := serverExecutionLanes(limit, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES)
+		if ordinary < 1 || blocking < 1 || flush < 1 || ordinary+blocking+flush != limit || blocking != limit/2 {
+			t.Fatalf("serverExecutionLanes(%d) = %d,%d,%d", limit, ordinary, blocking, flush)
+		}
+	}
+	ordinary, blocking, flush := serverExecutionLanes(2, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
+	if ordinary != 1 || blocking != 1 || flush != 0 {
+		t.Fatalf("FSKit serverExecutionLanes(2) = %d,%d,%d", ordinary, blocking, flush)
+	}
+}

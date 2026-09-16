@@ -122,14 +122,19 @@ func TestCoherenceDelegationCacheModes(t *testing.T) {
 					t.Fatal(err)
 				}
 				got, _ := c.LookupDelegation(f)
-				if i+1 == peerHandles && got.Mode != DelegationFull {
-					t.Fatal("last close did not upgrade")
+				if i+1 == peerHandles && got.Mode != DelegationWritethrough {
+					t.Fatal("mode changed before holder acknowledgment")
 				}
 			}
 			if peerHandles > 0 {
 				e := cv2Event(t, c, a, StreamDelegationMode)
 				if e.Delegation.Mode != DelegationFull {
 					t.Fatal(e)
+				}
+				cv2CutAck(t, c, a, e, 0)
+				got, _ := c.LookupDelegation(f)
+				if got.Mode != DelegationFull {
+					t.Fatal("last close did not upgrade after holder acknowledgment")
 				}
 			}
 			if _, err := c.ReleaseBatch(a, []Delegation{g}); err != nil {
@@ -142,6 +147,35 @@ func TestCoherenceDelegationCacheModes(t *testing.T) {
 				t.Fatalf("released open=%v %v", ok, err)
 			}
 		})
+	}
+}
+
+func TestCoherenceDelegationModeTimeoutRetiresGeneration(t *testing.T) {
+	c, clock := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	peer := cv2Subscribe(t, c, 2)
+	identity := [16]byte{0x19}
+	if ok, err := c.OpenCacheCapable(peer, identity); !ok || err != nil {
+		t.Fatalf("peer cache handle = %v, %v", ok, err)
+	}
+	grant := cv2Grant(t, c, holder, identity, peer)
+	if grant.Mode != DelegationWritethrough {
+		t.Fatalf("grant mode = %v", grant.Mode)
+	}
+	if err := c.CloseCacheCapable(peer, identity); err != nil {
+		t.Fatal(err)
+	}
+	event := cv2Event(t, c, holder, StreamDelegationMode)
+	if event.Request == 0 || event.Deadline.IsZero() {
+		t.Fatalf("mode event has no acknowledged obligation: %+v", event)
+	}
+	clock.Advance(DelegationRecallBudget)
+	c.Sweep()
+	if _, ok := c.LookupDelegation(identity); ok {
+		t.Fatal("timed-out mode transition retained generation")
+	}
+	if c.LossSequence(holder.Session) != 1 {
+		t.Fatalf("loss sequence = %d, want 1", c.LossSequence(holder.Session))
 	}
 }
 func TestCoherenceReservedIdentityClosesCachingAndColdSnapshot(t *testing.T) {
@@ -219,6 +253,181 @@ func TestCoherenceBreakFlushCutAndRecall(t *testing.T) {
 	}
 	if c.LossSequence(a.Session) != 0 {
 		t.Fatal("clean recall recorded loss")
+	}
+}
+
+func TestCoherenceSynchronousMutationIsPinnedAndNeverRecalled(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	peer := cv2Subscribe(t, c, 2)
+	identity := [16]byte{0x51}
+
+	type result struct {
+		flush *DelegationFlush
+		err   error
+	}
+	granted := make(chan result, 1)
+	go func() {
+		flush, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+		granted <- result{flush: flush, err: err}
+	}()
+
+	// The private reservation is published before it can become active.
+	reserved := cv2Event(t, c, peer, StreamChange)
+	if reserved.Change.Kind != DelegationGranted || reserved.Change.Identity != identity {
+		t.Fatalf("reservation change = %+v", reserved)
+	}
+	if err := c.Ack(peer, reserved.Position); err != nil {
+		t.Fatal(err)
+	}
+	var flush *DelegationFlush
+	select {
+	case got := <-granted:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		flush = got.flush
+	case <-time.After(5 * time.Second):
+		t.Fatal("synchronous mutation did not acquire")
+	}
+	if flush == nil {
+		t.Fatal("synchronous mutation returned no storage pin")
+	}
+
+	consumed := make(chan error, 1)
+	go func() {
+		guard, err := c.DataConsumed(t.Context(), peer, identity)
+		if guard != nil {
+			guard.Release()
+		}
+		consumed <- err
+	}()
+	select {
+	case err := <-consumed:
+		t.Fatalf("peer passed active synchronous mutation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	// No recall or break is addressed to the holder for the private generation.
+	c.mu.Lock()
+	for position := c.subscribers[holder.Session].acked + 1; position <= c.position; position++ {
+		event := c.log[(position-1)%uint64(len(c.log))]
+		if event.Target == holder.Session && (event.Kind == StreamRecall || event.Kind == StreamBreakForRead) {
+			c.mu.Unlock()
+			t.Fatalf("private generation emitted holder obligation: %+v", event)
+		}
+	}
+	c.mu.Unlock()
+
+	flush.End(17)
+	if err := cv2Result(t, consumed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.LookupDelegation(identity); ok {
+		t.Fatal("private generation survived synchronous mutation")
+	}
+	changes := cv2AckAll(t, c, peer)
+	foundRelease := false
+	for _, event := range changes {
+		foundRelease = foundRelease || event.Kind == StreamChange && event.Change.Kind == DelegationReleased && event.Change.Identity == identity
+	}
+	if !foundRelease {
+		t.Fatalf("release changes = %+v", changes)
+	}
+}
+
+func TestCoherenceSynchronousMutationPinsExistingHolderGrant(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	identity := [16]byte{0x52}
+	grant := cv2Grant(t, c, holder, identity)
+
+	flush, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush.End(23)
+	got, ok := c.LookupDelegation(identity)
+	if !ok || got.ID != grant.ID || got.Generation != grant.Generation {
+		t.Fatalf("existing grant after synchronous mutation = %+v, %v", got, ok)
+	}
+}
+
+func TestCoherenceSynchronousMutationRetainsSuccessfulGrant(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	peer := cv2Subscribe(t, c, 2)
+	identity := [16]byte{0x53}
+	if ok, err := c.OpenCacheCapable(peer, identity); !ok || err != nil {
+		t.Fatalf("peer cache handle = %v, %v", ok, err)
+	}
+	type result struct {
+		flush *DelegationFlush
+		err   error
+	}
+	acquired := make(chan result, 1)
+	go func() {
+		flush, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+		acquired <- result{flush, err}
+	}()
+	event := cv2Event(t, c, peer, StreamChange)
+	if err := c.Ack(peer, event.Position); err != nil {
+		t.Fatal(err)
+	}
+	got := <-acquired
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if err := c.CloseCacheCapable(peer, identity); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	for position := c.first; position <= c.position; position++ {
+		if event := c.log[(position-1)%uint64(len(c.log))]; event.Kind == StreamDelegationMode && event.Target == holder.Session {
+			c.mu.Unlock()
+			t.Fatalf("private generation emitted mode event: %+v", event)
+		}
+	}
+	c.mu.Unlock()
+	grant, err := got.flush.RetainDelegation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got.flush.End(31)
+	if live, ok := c.LookupDelegation(identity); !ok || live.ID != grant.ID || live.Generation != grant.Generation {
+		t.Fatalf("retained grant = %+v, %v", live, ok)
+	}
+	if grant.Mode != DelegationFull {
+		t.Fatalf("retained mode = %v, want current full mode", grant.Mode)
+	}
+	if _, err := got.flush.RetainDelegation(); !errors.Is(err, ErrDelegationStale) {
+		t.Fatalf("retain after End = %v", err)
+	}
+}
+
+func TestCoherenceConcurrentSynchronousFailureCannotRetireRetainedGrant(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	identity := [16]byte{0x54}
+	first, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.End(0)
+	if _, ok := c.LookupDelegation(identity); !ok {
+		t.Fatal("failed operation retired a generation still pinned by its peer")
+	}
+	grant, err := second.RetainDelegation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.End(32)
+	if live, ok := c.LookupDelegation(identity); !ok || live.ID != grant.ID {
+		t.Fatalf("concurrently retained grant = %+v, %v", live, ok)
 	}
 }
 func TestCoherenceRecallPassesPendingWithdrawalToSameSession(t *testing.T) {
@@ -448,6 +657,17 @@ func TestCoherenceReleaseBatchIsAtomic(t *testing.T) {
 			t.Fatal("partial release")
 		}
 	}
+	applied, err := c.BeginFlush(a, x, gx.ID, gx.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied.End(7)
+	if _, err := c.ReleaseAppliedBatch(a, []Delegation{gx, gy}, []uint64{0, 0}); !errors.Is(err, ErrDelegationAck) {
+		t.Fatalf("stale applied cut = %v", err)
+	}
+	if _, ok := c.LookupDelegation(y); !ok {
+		t.Fatal("stale applied cut partially released batch")
+	}
 	pin, err := c.BeginFlush(a, y, gy.ID, gy.Generation)
 	if err != nil {
 		t.Fatal(err)
@@ -456,7 +676,7 @@ func TestCoherenceReleaseBatchIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	pin.End(0)
-	if _, err := c.ReleaseBatch(a, []Delegation{gx, gy}); err != nil {
+	if _, err := c.ReleaseAppliedBatch(a, []Delegation{gx, gy}, []uint64{7, 0}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -533,9 +753,11 @@ func TestCoherenceCacheHandlesSurviveColdResubscribe(t *testing.T) {
 	if err := c.CloseCacheCapable(snapshot.Token, f); err != nil {
 		t.Fatal(err)
 	}
+	event := cv2Event(t, c, a, StreamDelegationMode)
+	cv2CutAck(t, c, a, event, 0)
 	g, _ = c.LookupDelegation(f)
 	if g.Mode != DelegationFull {
-		t.Fatal("close did not upgrade")
+		t.Fatal("close acknowledgment did not upgrade")
 	}
 }
 

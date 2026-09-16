@@ -252,7 +252,7 @@ func TestLinuxProfileRejectsFskitRepairControlBeforeTopologyAdmission(t *testing
 	}
 }
 
-func TestFskitSourceMutationRecallsLinuxLeaseWithoutSourceDischarge(t *testing.T) {
+func TestFskitSourceMutationWaitsForV7ChangeWithdrawal(t *testing.T) {
 	runtime, err := volumeserver.New("mixed-profile-recall", volumeserver.Config{
 		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 4, MaxLockRecords: 8,
 	})
@@ -284,21 +284,17 @@ func TestFskitSourceMutationRecallsLinuxLeaseWithoutSourceDischarge(t *testing.T
 
 	h := testVolumeHandler()
 	h.Runtime, h.Store, h.Visibility = runtime, &resourceAdmissionFaultStore{}, visibility
+	h.initCoherence()
 	root := xfsstore.Capability{0x31}
 	if err := h.startSessionResourcesForProfile(source.ID, root, 2, [32]byte{}, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR); err != nil {
 		t.Fatal(err)
 	}
 	peer := volumeserver.SessionID{0x42}
-	peerTerminal := make(chan struct{})
-	if err := h.Leases.ActivateHolder(peer, peerTerminal); err != nil {
+	subscription, err := h.Coherence.Subscribe(peer)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { close(peerTerminal) })
 	identity := [16]byte{root[0]}
-	coordinate := volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: identity}
-	if _, err := h.Leases.Grant(context.Background(), peer, coordinate, volumeserver.LeaseRightAttributesRead); err != nil {
-		t.Fatal(err)
-	}
 
 	request := &authoritypb.Request{
 		RequestId: 1,
@@ -335,27 +331,24 @@ func TestFskitSourceMutationRecallsLinuxLeaseWithoutSourceDischarge(t *testing.T
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	revoke, err := h.Leases.Next(ctx, peer, volumeserver.LeaseEventCursor{})
+	events, err := h.Coherence.Poll(ctx, subscription.Token, subscription.Position, nil, 8)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if revoke.Initiator != source.ID || revoke.Cursor.Phase != volumeserver.LeaseEventRevoke {
-		t.Fatalf("mixed-profile revoke = %+v", revoke)
+	if len(events) != 1 || events[0].Kind != volumeserver.StreamChange || events[0].Change.Identity != identity ||
+		events[0].Change.Kind != volumeserver.AttributesChanged {
+		t.Fatalf("mixed-profile change = %+v", events)
 	}
-	if err := h.Leases.AcknowledgeRevoke(peer, revoke.Cursor); err != nil {
-		t.Fatal(err)
+	select {
+	case result := <-response:
+		t.Fatalf("mutation returned before change withdrawal: %+v", result)
+	default:
 	}
-	complete, err := h.Leases.Next(ctx, peer, revoke.Cursor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Leases.Discharge(peer, complete.Cursor, []volumeserver.LeaseDischarge{{
-		Coordinate: coordinate, RevokeEpoch: complete.Recalls[0].RevokeEpoch, Mode: volumeserver.LeaseDischargeToNone,
-	}}); err != nil {
+	if err := h.Coherence.Ack(subscription.Token, events[0].Position); err != nil {
 		t.Fatal(err)
 	}
 	result := <-response
-	if result.GetErrno() != 0 || result.GetUncertain() || result.GetSourceLeaseDischarge() != nil {
+	if result.GetErrno() != 0 || result.GetUncertain() {
 		t.Fatalf("mixed-profile mutation response = %+v", result)
 	}
 	if applyCalls != 1 {
@@ -3583,6 +3576,7 @@ type reauthorizationTestAuthorizer struct {
 	sequence uint64
 	deadline time.Time
 	proof    [32]byte
+	calls    *atomic.Int32
 }
 
 func (authorizer reauthorizationTestAuthorizer) Authorize(context.Context, string, []byte) (volumeserver.Authorization, error) {
@@ -3590,6 +3584,9 @@ func (authorizer reauthorizationTestAuthorizer) Authorize(context.Context, strin
 }
 
 func (authorizer reauthorizationTestAuthorizer) Reauthorize(_ context.Context, _ string, session volumeserver.SessionID, sequence uint64, token []byte) (volumeserver.Authorization, [32]byte, error) {
+	if authorizer.calls != nil {
+		authorizer.calls.Add(1)
+	}
 	if session != authorizer.session || sequence != authorizer.sequence || string(token) != "renewed" {
 		return volumeserver.Authorization{}, [32]byte{}, errors.New("wrong reauthorization binding")
 	}
@@ -3614,6 +3611,29 @@ func TestVolumeHandlerReauthorizesExactLiveSessionBeforeOrdinaryPeerAdmission(t 
 	access, err := handler.Runtime.Access(credential)
 	if err != nil || access != volumeserver.AccessRead {
 		t.Fatalf("reauthorized access = %v, %v", access, err)
+	}
+}
+
+func TestVolumeHandlerChecksLinuxSubscriptionBeforeReauthorization(t *testing.T) {
+	handler, ctx, credential, _ := resourceAdmissionRequestHarness(t, &resourceAdmissionFaultStore{}, 8, 8)
+	var calls atomic.Int32
+	handler.Authorizer = reauthorizationTestAuthorizer{
+		session: credential.ID, sequence: 1, deadline: time.Now().Add(time.Hour), proof: [32]byte{1}, calls: &calls,
+	}
+	handler.Coherence.ExpireSession(credential.ID)
+	request := &authoritypb.Request{
+		RequestId: 8, Epoch: credential.Epoch[:],
+		Session: &authoritypb.SessionProof{Id: credential.ID[:], Generation: credential.Generation, ResumeSecret: credential.Secret[:]},
+		Body: &authoritypb.Request_Reauthorize{Reauthorize: &authoritypb.ReauthorizeRequest{
+			AccessToken: []byte("renewed"), Sequence: 1,
+		}},
+	}
+	response := handler.Handle(ctx, request)
+	if response.GetErrno() != errnos.EIO || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+		t.Fatalf("reauthorization after subscription expiry = %+v", response)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("expired Linux subscription reached external reauthorization verifier")
 	}
 }
 
@@ -3760,11 +3780,19 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 
 	attachSession := func(id uint64) (*authoritypb.ActivateReply, []byte, *authoritypb.SessionProof) {
 		t.Helper()
-		return attachAndActivateHandler(t, h, ctx, id, &authoritypb.AttachRequest{
+		activated, epoch, proof := attachAndActivateHandler(t, h, ctx, id, &authoritypb.AttachRequest{
 			VolumeId: "volume-lockwait", AccessToken: []byte("test-only"), ReplaySlots: 2, RoutesRevision: emptyRoutesRevision(),
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
 		})
+		subscribed := h.Handle(ctx, &authoritypb.Request{
+			RequestId: id + 100, Epoch: epoch, Session: proof,
+			Body: &authoritypb.Request_Subscribe{Subscribe: &authoritypb.SubscribeRequest{}},
+		})
+		if subscribed.GetErrno() != 0 || subscribed.GetSubscribe() == nil {
+			t.Fatalf("Subscribe after activation = %v", subscribed)
+		}
+		return activated, epoch, proof
 	}
 	holder, epoch, holderProof := attachSession(1)
 
@@ -3820,8 +3848,8 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 
 	// The topology writer must not queue behind the parked wait. Before the
 	// fix, this Apply blocked until the lock wait ended — and because a queued
-	// RWMutex writer stops new readers, every guarded request on the volume
-	// blocked with it. Protocol 6 commits a route change only at clean mount
+	// topology writer stops new readers, every guarded request on the volume
+	// blocked with it. The authority commits a route change only at clean mount
 	// absence, so the answer here is a prompt EBUSY-class refusal naming that
 	// absence. Reaching that decision at all is the property under test: it is
 	// made under topology exclusion, which the parked wait must not be holding.

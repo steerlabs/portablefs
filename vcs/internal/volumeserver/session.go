@@ -337,6 +337,7 @@ type Authority struct {
 	sessionCount uint32
 	locks        *LockTable
 	endHooks     []func(SessionID)
+	sweepHooks   []func()
 }
 
 func New(volumeID string, cfg Config) (*Authority, error) {
@@ -893,6 +894,18 @@ func (a *Authority) OnSessionEnd(hook func(SessionID)) {
 	a.mu.Unlock()
 }
 
+// OnSweep registers idle coordination cleanup driven by the authority's
+// existing runtime ticker. Hooks run after expired-session cleanup and outside
+// Authority locks. They must not block the next runtime sweep.
+func (a *Authority) OnSweep(hook func()) {
+	if hook == nil {
+		return
+	}
+	a.mu.Lock()
+	a.sweepHooks = append(a.sweepHooks, hook)
+	a.mu.Unlock()
+}
+
 func (a *Authority) notifySessionEnd(id SessionID) {
 	a.mu.Lock()
 	hooks := append([]func(SessionID){}, a.endHooks...)
@@ -1421,9 +1434,13 @@ func (a *Authority) Sweep() int {
 		s.mu.Unlock()
 	}
 	a.purgeAttachAttemptsLocked(now)
+	hooks := append([]func(){}, a.sweepHooks...)
 	a.mu.Unlock()
 	for _, id := range cleanup {
 		a.finishSession(id)
+	}
+	for _, hook := range hooks {
+		hook()
 	}
 	return removed
 }

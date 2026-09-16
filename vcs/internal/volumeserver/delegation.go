@@ -47,10 +47,12 @@ type delegationRecord struct {
 	retired        bool
 	readers        uint64
 	closingReaders bool
+	ephemeral      bool
 }
 type delegationCut struct {
 	request  uint64
 	recall   bool
+	mode     DelegationMode
 	deadline time.Time
 	done     bool
 	applied  uint64
@@ -114,10 +116,47 @@ func (c *CoherenceCoordinator) closeHandlesLocked(s *changeSubscriber, identity 
 	if counts.total == 0 {
 		delete(c.cacheHandles, identity)
 	}
-	if r := c.delegations[identity]; r != nil && !r.retired && r.grant.Mode == DelegationWritethrough && c.modeLocked(identity, r.grant.Holder) == DelegationFull {
-		r.grant.Mode = DelegationFull
-		if r.grant.State == DelegationActive {
-			c.appendLocked(StreamEvent{Kind: StreamDelegationMode, Target: r.grant.Holder, Delegation: r.grant})
+	if r := c.delegations[identity]; r != nil && !r.retired {
+		c.issueModeChangeLocked(r)
+	}
+}
+
+// issueModeChangeLocked starts an acknowledged transition only when no other
+// cut owns the identity. The live grant retains its old mode until the holder
+// proves it installed the target; recalls and breaks serialize through pending.
+func (c *CoherenceCoordinator) issueModeChangeLocked(r *delegationRecord) {
+	if r == nil || r.retired || r.ephemeral || r.grant.State != DelegationActive || r.pending != nil {
+		return
+	}
+	target := c.modeLocked(r.grant.Identity, r.grant.Holder)
+	if target == r.grant.Mode {
+		return
+	}
+	c.nextRequest++
+	if c.nextRequest == 0 {
+		panic("volumeserver: delegation request exhausted")
+	}
+	p := &delegationCut{
+		request: c.nextRequest, mode: target,
+		deadline: c.clock.Now().Add(DelegationRecallBudget), floor: r.applied,
+	}
+	r.pending = p
+	eventGrant := r.grant
+	eventGrant.Mode = target
+	c.appendLocked(StreamEvent{
+		Kind: StreamDelegationMode, Target: r.grant.Holder, Delegation: eventGrant,
+		Request: p.request, Deadline: p.deadline, AppliedSequence: p.floor,
+	})
+}
+
+// expireDelegationCutsLocked covers asynchronous mode changes, which have no
+// waiting request goroutine to observe their deadline. Recall and break waiters
+// perform the same transition in cut; repeating it here is idempotent.
+func (c *CoherenceCoordinator) expireDelegationCutsLocked() {
+	now := c.clock.Now()
+	for _, r := range c.delegations {
+		if r.pending != nil && !now.Before(r.pending.deadline) {
+			c.dropDelegationLocked(r, true)
 		}
 	}
 }
@@ -231,17 +270,40 @@ func (c *CoherenceCoordinator) Reserve(ctx context.Context, token SubscriptionTo
 	}
 }
 func (r *DelegationReservation) Grant(ctx context.Context) (Delegation, error) {
+	grant, _, err := r.grant(ctx, false, false)
+	return grant, err
+}
+
+// grant can install the storage pin before releasing the identity's request
+// turn. That ordering is needed by server-owned synchronous mutations: a peer
+// must observe either the reservation or the active pin, never an unpinned
+// grant that it could recall between Grant and BeginFlush.
+func (r *DelegationReservation) grant(ctx context.Context, pin, ephemeral bool) (Delegation, *DelegationFlush, error) {
 	if r == nil || r.finished {
-		return Delegation{}, ErrDelegationStale
+		return Delegation{}, nil, ErrDelegationStale
 	}
 	c := r.coordinator
+	if ephemeral && r.existing {
+		return Delegation{}, nil, ErrDelegationBusy
+	}
+	if ephemeral {
+		c.mu.Lock()
+		if r.record.retired || c.delegations[r.record.grant.Identity] != r.record || r.record.grant.State != DelegationReserved {
+			c.mu.Unlock()
+			r.Abort()
+			return Delegation{}, nil, ErrDelegationStale
+		}
+		r.record.ephemeral = true
+		c.mu.Unlock()
+	}
 	if !r.existing {
 		if err := c.WaitWithdrawn(ctx, r.record.position, r.record.grant.Holder); err != nil {
 			r.Abort()
-			return Delegation{}, err
+			return Delegation{}, nil, err
 		}
 	}
 	var grant Delegation
+	var flush *DelegationFlush
 	for {
 		c.mu.Lock()
 		_, err := c.subscriberLocked(r.record.owner.token)
@@ -251,7 +313,7 @@ func (r *DelegationReservation) Grant(ctx context.Context) (Delegation, error) {
 		if err != nil {
 			c.mu.Unlock()
 			r.Abort()
-			return Delegation{}, err
+			return Delegation{}, nil, err
 		}
 		// Once withdrawals are complete no new read may join this generation's
 		// drain. Already pinned replies can finish without any request-turn lock.
@@ -263,6 +325,10 @@ func (r *DelegationReservation) Grant(ctx context.Context) (Delegation, error) {
 			r.record.grant.State = DelegationActive
 			r.record.grant.Mode = c.modeLocked(r.record.grant.Identity, r.record.grant.Holder)
 			grant = r.record.grant
+			if pin {
+				r.record.active++
+				flush = &DelegationFlush{coordinator: c, record: r.record}
+			}
 			c.signalLocked()
 			c.mu.Unlock()
 			break
@@ -272,12 +338,12 @@ func (r *DelegationReservation) Grant(ctx context.Context) (Delegation, error) {
 		c.mu.Unlock()
 		if err := c.wait(ctx, changed, deadline); err != nil {
 			r.Abort()
-			return Delegation{}, err
+			return Delegation{}, nil, err
 		}
 	}
 
 	r.finish()
-	return grant, nil
+	return grant, flush, nil
 }
 func (r *DelegationReservation) finish() {
 	r.finished = true
@@ -306,6 +372,21 @@ func (c *CoherenceCoordinator) DataMutated(ctx context.Context, token Subscripti
 		return Delegation{}, err
 	}
 	return r.Grant(ctx)
+}
+
+// BeginSynchronousMutation admits an authority-applied mutation which has no
+// client delegation reference. A newly created delegation is private to this
+// operation and is released by End; an existing grant owned by the same
+// session is merely pinned and remains live. Peers wait for a private mutation
+// to finish instead of receiving a recall for a generation the client never
+// learned.
+func (c *CoherenceCoordinator) BeginSynchronousMutation(ctx context.Context, token SubscriptionToken, identity [16]byte) (*DelegationFlush, error) {
+	r, err := c.Reserve(ctx, token, identity)
+	if err != nil {
+		return nil, err
+	}
+	_, flush, err := r.grant(ctx, true, !r.existing)
+	return flush, err
 }
 
 // DataGuard excludes delegation reassignment through a peer's storage read.
@@ -515,6 +596,28 @@ func (c *CoherenceCoordinator) cut(ctx context.Context, r *delegationRecord, rec
 		c.mu.Unlock()
 		return seq, ctx.Err()
 	}
+	if r.ephemeral {
+		c.mu.Unlock()
+		for {
+			c.mu.Lock()
+			c.expireLocked()
+			if r.retired {
+				seq := r.applied
+				c.mu.Unlock()
+				return seq, ctx.Err()
+			}
+			if !r.ephemeral {
+				c.mu.Unlock()
+				return c.cut(ctx, r, recall)
+			}
+			changed := c.notificationLocked()
+			deadline := r.owner.horizon
+			c.mu.Unlock()
+			if err := c.wait(ctx, changed, deadline); err != nil {
+				return 0, err
+			}
+		}
+	}
 	p := r.pending
 	if p == nil {
 		c.nextRequest++
@@ -593,6 +696,10 @@ func (c *CoherenceCoordinator) AckDelegation(token SubscriptionToken, identity [
 		c.dropDelegationLocked(r, false)
 	} else {
 		r.pending = nil
+		if p.mode != 0 {
+			r.grant.Mode = p.mode
+		}
+		c.issueModeChangeLocked(r)
 	}
 	c.signalLocked()
 	return nil
@@ -604,7 +711,36 @@ func (c *CoherenceCoordinator) AckDelegation(token SubscriptionToken, identity [
 type DelegationFlush struct {
 	coordinator *CoherenceCoordinator
 	record      *delegationRecord
+	mu          sync.Mutex
+	ended       bool
 	once        sync.Once
+}
+
+// RetainDelegation promotes a private synchronous-mutation generation into a
+// client-visible grant. It must run after successful storage application and
+// before End, so a failed operation never leaks a grant absent from its reply.
+// Calling it for an already-visible same-holder generation is an idempotent
+// query for that exact grant.
+func (f *DelegationFlush) RetainDelegation() (Delegation, error) {
+	if f == nil {
+		return Delegation{}, ErrDelegationStale
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ended {
+		return Delegation{}, ErrDelegationStale
+	}
+	c := f.coordinator
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r := f.record
+	if r.retired || c.delegations[r.grant.Identity] != r || r.grant.State == DelegationReserved {
+		return Delegation{}, ErrDelegationStale
+	}
+	r.grant.Mode = c.modeLocked(r.grant.Identity, r.grant.Holder)
+	r.ephemeral = false
+	c.signalLocked()
+	return r.grant, nil
 }
 
 func (c *CoherenceCoordinator) BeginFlush(token SubscriptionToken, identity [16]byte, id, generation uint64) (*DelegationFlush, error) {
@@ -635,12 +771,18 @@ func (f *DelegationFlush) End(applied uint64) {
 		return
 	}
 	f.once.Do(func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.ended = true
 		c := f.coordinator
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		r := f.record
 		r.applied = max(r.applied, applied)
 		r.active--
+		if r.ephemeral && r.active == 0 {
+			c.dropDelegationLocked(r, false)
+		}
 		c.finishRetiredLocked(r)
 		c.signalLocked()
 	})
@@ -678,6 +820,21 @@ func (c *CoherenceCoordinator) finishRetiredLocked(r *delegationRecord) {
 // caller attests last-handle close and completed flush; active pins or cuts
 // refuse release. Duplicate identities and stale generations reject the batch.
 func (c *CoherenceCoordinator) ReleaseBatch(token SubscriptionToken, grants []Delegation) (uint64, error) {
+	return c.releaseBatch(token, grants, nil)
+}
+
+// ReleaseAppliedBatch additionally proves that every release ticket covers the
+// latest storage application admitted under that generation. CONTROL validates
+// ticket ownership first; this comparison closes the remaining same-identity
+// stale-ticket case atomically with reference and active-pin validation.
+func (c *CoherenceCoordinator) ReleaseAppliedBatch(token SubscriptionToken, grants []Delegation, applied []uint64) (uint64, error) {
+	if len(applied) != len(grants) {
+		return 0, ErrDelegationAck
+	}
+	return c.releaseBatch(token, grants, applied)
+}
+
+func (c *CoherenceCoordinator) releaseBatch(token SubscriptionToken, grants []Delegation, applied []uint64) (uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s, err := c.subscriberLocked(token)
@@ -685,7 +842,7 @@ func (c *CoherenceCoordinator) ReleaseBatch(token SubscriptionToken, grants []De
 		return 0, err
 	}
 	seen := make(map[[16]byte]struct{}, len(grants))
-	for _, g := range grants {
+	for index, g := range grants {
 		r := c.delegations[g.Identity]
 		if _, ok := seen[g.Identity]; ok {
 			return 0, ErrDelegationStale
@@ -696,6 +853,9 @@ func (c *CoherenceCoordinator) ReleaseBatch(token SubscriptionToken, grants []De
 		}
 		if r.active != 0 || r.pending != nil || r.grant.State != DelegationActive {
 			return 0, ErrDelegationBusy
+		}
+		if applied != nil && applied[index] < r.applied {
+			return 0, ErrDelegationAck
 		}
 	}
 	for _, g := range grants {

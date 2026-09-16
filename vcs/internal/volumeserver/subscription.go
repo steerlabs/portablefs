@@ -509,7 +509,12 @@ func (c *CoherenceCoordinator) ExpireSession(id SessionID) {
 }
 
 // Sweep permits an authority housekeeping loop to retire idle expired state.
-func (c *CoherenceCoordinator) Sweep() { c.mu.Lock(); defer c.mu.Unlock(); c.expireLocked() }
+func (c *CoherenceCoordinator) Sweep() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.expireLocked()
+	c.expireDelegationCutsLocked()
+}
 
 // ForgetSession requires proven cache absence or a passed subscription horizon.
 // The runtime must also have permanently retired this session's handles; a
