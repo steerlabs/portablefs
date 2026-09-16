@@ -86,6 +86,12 @@ func TestProtocolV7FeatureSetsAreExact(t *testing.T) {
 		activate []string
 	}{
 		{
+			name:     "cacheless",
+			profile:  authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER,
+			hello:    append(append([]string(nil), commonHello...), "cacheless-peer-reader-v1"),
+			activate: append(append([]string(nil), commonActivate...), "cacheless-peer-reader-v1"),
+		},
+		{
 			name:     "unspecified",
 			profile:  authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED,
 			hello:    commonHello,
@@ -122,13 +128,13 @@ func TestProtocolV7FeatureSetsAreExact(t *testing.T) {
 			}
 		})
 	}
-	if !slices.Equal(requiredHelloFeatures, tests[1].hello) {
-		t.Fatalf("Linux Hello alias = %v, want exactly %v", requiredHelloFeatures, tests[1].hello)
+	if !slices.Equal(requiredHelloFeatures, tests[2].hello) {
+		t.Fatalf("Linux Hello alias = %v, want exactly %v", requiredHelloFeatures, tests[2].hello)
 	}
 	if !slices.Equal(requiredAttachFeatures, commonActivate) {
 		t.Fatalf("common Activate alias = %v, want exactly %v", requiredAttachFeatures, commonActivate)
 	}
-	wantStrict := tests[1].activate[len(commonActivate):]
+	wantStrict := tests[2].activate[len(commonActivate):]
 	if !slices.Equal(requiredStrictAttachFeatures, wantStrict) {
 		t.Fatalf("Linux strict Activate alias = %v, want exactly %v", requiredStrictAttachFeatures, wantStrict)
 	}

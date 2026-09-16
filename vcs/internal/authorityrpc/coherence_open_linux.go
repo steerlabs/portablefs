@@ -84,6 +84,14 @@ func (h *VolumeHandler) coherenceReserveCreated(ctx context.Context, id volumese
 }
 
 func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential) *authoritypb.Response {
+	profile, err := h.sessionFrontendProfile(cred.ID)
+	if err != nil {
+		return h.coherenceError(req.GetRequestId(), err)
+	}
+	cacheless := profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
+	if cacheless && (requestRequiresWrite(req) || req.GetOpen().GetWriteIntent() || req.GetOpen().GetCacheCapable()) {
+		return h.coherenceError(req.GetRequestId(), syscall.EPERM)
+	}
 	if req.GetOpen().GetWriteIntent() || req.GetOpen().GetFlags().GetWrite() {
 		h.coherenceProfileAdmission.RLock()
 		defer h.coherenceProfileAdmission.RUnlock()
@@ -104,9 +112,12 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 		if err != nil {
 			return h.coherenceError(0, err)
 		}
-		token, err := h.coherenceToken(cred.ID)
-		if err != nil {
-			return h.coherenceError(0, err)
+		var token volumeserver.SubscriptionToken
+		if !cacheless {
+			token, err = h.coherenceToken(cred.ID)
+			if err != nil {
+				return h.coherenceError(0, err)
+			}
 		}
 		var delegationReservation *volumeserver.DelegationReservation
 		if body.GetWriteIntent() {
@@ -117,7 +128,7 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 			defer reservation.Abort()
 			delegationReservation = reservation
 		}
-		guard, err := h.Coherence.DataConsumed(ctx, token, identity)
+		guard, err := h.coherenceReadAdmission(ctx, cred.ID, identity)
 		if err != nil {
 			return h.coherenceError(0, err)
 		}

@@ -103,3 +103,18 @@ lifetime. `TestLookupPublishesHolderBufferedSize` passes; the real two-mount
 CRUD/mapping test passed three consecutive runs in `/tmp/cv2-g-overlay-34.log`.
 The diagnostic crash connections were aborted by their exact fusectl connection
 IDs; unrelated containers were left running.
+
+## Gateway profile
+
+The files gateway now declares the additive `CACHELESS_READER` profile and
+`cacheless-peer-reader-v1`. Attach requires exactly read access. The handler
+permits only authenticated lifecycle and read operations and rejects write
+intent and cache-capable opens. Data and attribute reads use BreakForRead;
+activation does not recall Linux writers or join the Mac writer exclusion.
+The gateway no longer runs a FSKit repair acknowledgment worker.
+
+The real gateway listing/read and graceful/abrupt-departure tests passed three
+consecutive runs in `/tmp/cv2-g-focus-46.log`, with the writer delegation held
+across activation and the first listing. The same run passed the exact-access
+attach and local cache-admission tests three times. It is not a full-gate pass:
+metadata-cache timing and the racing-reader/writer test still failed.

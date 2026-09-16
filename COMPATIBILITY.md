@@ -76,7 +76,10 @@ leaves draft they are frozen.
   deletes their old handler/client paths. FSKit retains `FSKIT_SYNC_REPAIR`,
   its repair/source-publication/fragmented-write assertions, and writer
   exclusion for every attached Mac mount. A feature advertisement cannot
-  manufacture a callback the frontend does not expose.
+  manufacture a callback the frontend does not expose. The additive
+  `CACHELESS_READER` profile requires `cacheless-peer-reader-v1`, exactly read
+  access, no cache permission and no repair participation. Gateway reads break
+  delegated data for read without excluding Linux writers.
 
 - **One volume-wide subscription controls Linux caching.** Its authority
   horizon is 10 seconds, renewed every 3 seconds, with durations anchored

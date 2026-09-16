@@ -13,66 +13,67 @@ import (
 
 func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *testing.T) {
 	tests := []struct {
-		body  any
-		linux bool
-		fskit bool
+		body      any
+		linux     bool
+		fskit     bool
+		cacheless bool
 	}{
-		{&authoritypb.Request_Hello{}, true, true},
-		{&authoritypb.Request_Attach{}, true, true},
-		{&authoritypb.Request_Resume{}, true, true},
-		{&authoritypb.Request_KeepAlive{}, true, true},
-		{&authoritypb.Request_Detach{}, true, true},
-		{&authoritypb.Request_Cancel{}, true, true},
-		{&authoritypb.Request_Reauthorize{}, true, true},
-		{&authoritypb.Request_Lookup{}, true, true},
-		{&authoritypb.Request_GetAttr{}, true, true},
-		{&authoritypb.Request_SetAttr{}, true, true},
-		{&authoritypb.Request_Create{}, true, true},
-		{&authoritypb.Request_Mkdir{}, true, true},
-		{&authoritypb.Request_Unlink{}, true, true},
-		{&authoritypb.Request_Rename{}, true, true},
-		{&authoritypb.Request_Link{}, true, true},
-		{&authoritypb.Request_Symlink{}, true, true},
-		{&authoritypb.Request_Readlink{}, true, true},
-		{&authoritypb.Request_Open{}, true, true},
-		{&authoritypb.Request_Close{}, true, true},
-		{&authoritypb.Request_Read{}, true, true},
-		{&authoritypb.Request_Fsync{}, true, true},
-		{&authoritypb.Request_ReadDir{}, true, true},
-		{&authoritypb.Request_Reclaim{}, true, true},
-		{&authoritypb.Request_GetXattr{}, true, true},
-		{&authoritypb.Request_SetXattr{}, true, true},
-		{&authoritypb.Request_ListXattr{}, true, true},
-		{&authoritypb.Request_RemoveXattr{}, true, true},
-		{&authoritypb.Request_StatFs{}, true, true},
-		{&authoritypb.Request_SyncFs{}, true, true},
-		{&authoritypb.Request_ApplyRoutes{}, true, true},
-		{&authoritypb.Request_Activate{}, true, true},
-		{&authoritypb.Request_AbortAttach{}, true, true},
-		{&authoritypb.Request_TerminalDeliveryReceipt{}, true, true},
-		{&authoritypb.Request_Flush{}, true, false},
-		{&authoritypb.Request_Fallocate{}, true, false},
-		{&authoritypb.Request_CopyFileRange{}, true, false},
-		{&authoritypb.Request_Tmpfile{}, true, false},
-		{&authoritypb.Request_GetLock{}, true, false},
-		{&authoritypb.Request_SetLock{}, true, false},
-		{&authoritypb.Request_Write{}, true, false},
-		{&authoritypb.Request_NextLeaseEvent{}, false, false},
-		{&authoritypb.Request_AcknowledgeLeaseEvent{}, false, false},
-		{&authoritypb.Request_RenewLeases{}, false, false},
-		{&authoritypb.Request_AcknowledgeSourceLeaseDischarge{}, false, false},
-		{&authoritypb.Request_NextFskitRepair{}, false, true},
-		{&authoritypb.Request_AckFskitRepair{}, false, true},
-		{&authoritypb.Request_FskitWrite{}, false, true},
-		{&authoritypb.Request_Subscribe{}, true, false},
-		{&authoritypb.Request_RenewSubscription{}, true, false},
-		{&authoritypb.Request_NextControlEvent{}, true, false},
-		{&authoritypb.Request_ChangeAck{}, true, false},
-		{&authoritypb.Request_DelegationRecallAck{}, true, false},
-		{&authoritypb.Request_DelegationBreakAck{}, true, false},
-		{&authoritypb.Request_DelegationModeChangeAck{}, true, false},
-		{&authoritypb.Request_DelegationRelease{}, true, false},
-		{&authoritypb.Request_Barrier{}, true, false},
+		{&authoritypb.Request_Hello{}, true, true, true},
+		{&authoritypb.Request_Attach{}, true, true, true},
+		{&authoritypb.Request_Resume{}, true, true, true},
+		{&authoritypb.Request_KeepAlive{}, true, true, true},
+		{&authoritypb.Request_Detach{}, true, true, true},
+		{&authoritypb.Request_Cancel{}, true, true, true},
+		{&authoritypb.Request_Reauthorize{}, true, true, true},
+		{&authoritypb.Request_Lookup{}, true, true, true},
+		{&authoritypb.Request_GetAttr{}, true, true, true},
+		{&authoritypb.Request_SetAttr{}, true, true, false},
+		{&authoritypb.Request_Create{}, true, true, false},
+		{&authoritypb.Request_Mkdir{}, true, true, false},
+		{&authoritypb.Request_Unlink{}, true, true, false},
+		{&authoritypb.Request_Rename{}, true, true, false},
+		{&authoritypb.Request_Link{}, true, true, false},
+		{&authoritypb.Request_Symlink{}, true, true, false},
+		{&authoritypb.Request_Readlink{}, true, true, false},
+		{&authoritypb.Request_Open{}, true, true, true},
+		{&authoritypb.Request_Close{}, true, true, true},
+		{&authoritypb.Request_Read{}, true, true, true},
+		{&authoritypb.Request_Fsync{}, true, true, false},
+		{&authoritypb.Request_ReadDir{}, true, true, true},
+		{&authoritypb.Request_Reclaim{}, true, true, true},
+		{&authoritypb.Request_GetXattr{}, true, true, false},
+		{&authoritypb.Request_SetXattr{}, true, true, false},
+		{&authoritypb.Request_ListXattr{}, true, true, false},
+		{&authoritypb.Request_RemoveXattr{}, true, true, false},
+		{&authoritypb.Request_StatFs{}, true, true, false},
+		{&authoritypb.Request_SyncFs{}, true, true, false},
+		{&authoritypb.Request_ApplyRoutes{}, true, true, false},
+		{&authoritypb.Request_Activate{}, true, true, true},
+		{&authoritypb.Request_AbortAttach{}, true, true, true},
+		{&authoritypb.Request_TerminalDeliveryReceipt{}, true, true, true},
+		{&authoritypb.Request_Flush{}, true, false, false},
+		{&authoritypb.Request_Fallocate{}, true, false, false},
+		{&authoritypb.Request_CopyFileRange{}, true, false, false},
+		{&authoritypb.Request_Tmpfile{}, true, false, false},
+		{&authoritypb.Request_GetLock{}, true, false, false},
+		{&authoritypb.Request_SetLock{}, true, false, false},
+		{&authoritypb.Request_Write{}, true, false, false},
+		{&authoritypb.Request_NextLeaseEvent{}, false, false, false},
+		{&authoritypb.Request_AcknowledgeLeaseEvent{}, false, false, false},
+		{&authoritypb.Request_RenewLeases{}, false, false, false},
+		{&authoritypb.Request_AcknowledgeSourceLeaseDischarge{}, false, false, false},
+		{&authoritypb.Request_NextFskitRepair{}, false, true, false},
+		{&authoritypb.Request_AckFskitRepair{}, false, true, false},
+		{&authoritypb.Request_FskitWrite{}, false, true, false},
+		{&authoritypb.Request_Subscribe{}, true, false, false},
+		{&authoritypb.Request_RenewSubscription{}, true, false, false},
+		{&authoritypb.Request_NextControlEvent{}, true, false, false},
+		{&authoritypb.Request_ChangeAck{}, true, false, false},
+		{&authoritypb.Request_DelegationRecallAck{}, true, false, false},
+		{&authoritypb.Request_DelegationBreakAck{}, true, false, false},
+		{&authoritypb.Request_DelegationModeChangeAck{}, true, false, false},
+		{&authoritypb.Request_DelegationRelease{}, true, false, false},
+		{&authoritypb.Request_Barrier{}, true, false, false},
 	}
 	descriptorBodies := (&authoritypb.Request{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
 	if len(tests) != descriptorBodies {
@@ -92,6 +93,9 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		}
 		if got := requestAllowedForFrontend(request, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR); got != test.fskit {
 			t.Fatalf("%T FSKit allowed=%t, want %t", test.body, got, test.fskit)
+		}
+		if got := requestAllowedForFrontend(request, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER); got != test.cacheless {
+			t.Fatalf("%T cacheless allowed=%t, want %t", test.body, got, test.cacheless)
 		}
 	}
 }
@@ -286,5 +290,18 @@ func TestV7OpenWriteIntentRequiresWriteAccess(t *testing.T) {
 				t.Fatalf("write access = %v, want %v", got, test.write)
 			}
 		})
+	}
+}
+
+func TestCachelessReaderOpenCannotAcquireWriteOrCachePermission(t *testing.T) {
+	for _, request := range []*authoritypb.OpenRequest{
+		{Flags: &authoritypb.OpenFlags{Write: true}},
+		{Flags: &authoritypb.OpenFlags{Read: true}, WriteIntent: true},
+		{Flags: &authoritypb.OpenFlags{Read: true}, CacheCapable: true},
+		{Flags: &authoritypb.OpenFlags{Read: true, Truncate: true}},
+	} {
+		if requestAllowedForFrontend(&authoritypb.Request{Body: &authoritypb.Request_Open{Open: request}}, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER) {
+			t.Fatalf("cacheless open accepted %v", request)
+		}
 	}
 }

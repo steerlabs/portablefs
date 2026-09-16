@@ -99,20 +99,17 @@ func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 		t.Fatalf("the mount was revoked across a polite close: %v", cause)
 	}
 
-	// The sidecar's other departure -- being killed, which is what a pod restart
-	// actually does -- is deliberately not exercised here, because it is an open
-	// defect rather than a covered case. Measured with a proxy standing in for
-	// the process, severed and then refusing to accept again: the first peer
-	// write costs 20.02s and fails EIO, with the mount revoking itself and
-	// reporting an uncertain outcome, three runs out of three. Two budgets is
-	// where that comes from -- the phase deadline the dead session never
-	// acknowledges, plus a post-fence grace granted in full regardless of how
-	// long it had already been silent -- and the mount's own bounded-contact
-	// watchdog is one budget. Shortening the grace to what remains of the
-	// frontend's watchdog does fix it, and also breaks
-	// TestRepeatedOpenForReadRacingAPeerWriteKeepsBothMountsServing, so the fix
-	// needs to come with an explanation of that. Asserting the current cost here
-	// would cement it and asserting survival would be false.
+	// Abrupt process death cannot add a withdrawal obligation: this session
+	// never had cache permission or a compatibility-writer commitment.
+	proxy := newTransportProxy(t, peer.AuthorityAddress())
+	abrupt := dial("the gateway that disappears", proxy)
+	defer abrupt.Close()
+	requireGatewayContent(t, ctx, abrupt, servedKey, []byte("after polite close"), "before abrupt departure")
+	proxy.close()
+	requireWrite("write immediately after abrupt gateway death", []byte("after abrupt departure"))
+	if cause := peer.MountFatal(0); cause != nil {
+		t.Fatalf("gateway death revoked writer: %v", cause)
+	}
 
 	// The sidecar comes back. It caches nothing, so the guarantee is that a
 	// reattached session is a new participant reading current state, never one

@@ -145,7 +145,8 @@ func validTransportRole(role authoritypb.TransportRole) bool {
 func validFrontendProfile(profile authoritypb.FrontendProfile) bool {
 	return profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED ||
 		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES ||
-		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR ||
+		profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
 }
 
 func (r *transportRegistry) register(

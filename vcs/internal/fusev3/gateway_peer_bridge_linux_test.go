@@ -72,7 +72,7 @@ func (p *GatewayPeerFixture) ClientPrivateKeyPEM() []byte {
 func (p *GatewayPeerFixture) ServerName() string { return p.f.credentials.ServerName }
 
 // Capability is the access token the fixture's authorizer accepts.
-func (p *GatewayPeerFixture) Capability() []byte { return []byte("test-capability") }
+func (p *GatewayPeerFixture) Capability() []byte { return []byte("gateway-read-capability") }
 
 // Join builds a host path to a volume object as seen through mount i.
 func (p *GatewayPeerFixture) Join(i int, elements ...string) string {
@@ -90,9 +90,9 @@ func (p *GatewayPeerFixture) LastAttachProfile() authoritypb.FrontendProfile {
 	return authoritypb.FrontendProfile(p.attachProfile.Load())
 }
 
-// SyncRepairProfile names the profile a non-caching frontend declares.
-func SyncRepairProfile() authoritypb.FrontendProfile {
-	return authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
+// CachelessReaderProfile names the profile a non-caching frontend declares.
+func CachelessReaderProfile() authoritypb.FrontendProfile {
+	return authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
 }
 
 // ActiveParticipants is the number of sessions currently in the volume's
@@ -108,3 +108,7 @@ func (p *GatewayPeerFixture) MountFatal(i int) error { return p.f.mounts[i].fata
 
 // Diagnostics describes every mount session, for failure messages.
 func (p *GatewayPeerFixture) Diagnostics() string { return p.f.sessionDiagnostics() }
+
+func (p *GatewayPeerFixture) DelegatedIdentityCount() int {
+	return len(p.f.coherence.DelegatedIdentities())
+}

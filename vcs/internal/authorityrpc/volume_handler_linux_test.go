@@ -3963,3 +3963,23 @@ func stampNamespacePublication(request *authoritypb.Request, operationID uint64,
 		}}},
 	}}
 }
+
+func TestCachelessReaderAttachRequiresExactlyReadAccess(t *testing.T) {
+	for _, access := range []volumeserver.Access{volumeserver.AccessRead, volumeserver.AccessRead | volumeserver.AccessWrite, volumeserver.AccessRead | volumeserver.AccessAdmin} {
+		h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
+		authorizer.access = access
+		request := fskitAttachRequest(49)
+		attach := request.GetAttach()
+		attach.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
+		attach.FskitCachedNameCapacity, attach.FskitRepairBudgetMillis = 0, 0
+		attach.FskitNamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
+		response := h.Handle(ctx, request)
+		want := int32(errnos.EPERM)
+		if access == volumeserver.AccessRead {
+			want = 0
+		}
+		if response.Errno != want {
+			t.Fatalf("access=%v response=%v", access, response)
+		}
+	}
+}

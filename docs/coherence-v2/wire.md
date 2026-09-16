@@ -23,9 +23,11 @@ identifier `requiredAttachFeatures`.
 |---|---|
 | Hello, every profile | `xfs-current-state`, `session-exact-epoch`, `framed-bulk-data-v1`, `authority-keyed-replay-fingerprint-v1`, `mandatory-dual-transport-v1`, `exact-resource-acquisition` |
 | Hello, Linux additions | `direct-write`, `volume-subscription-v1`, `ordered-change-stream-v1`, `file-write-delegation-v1` |
+| Hello, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Hello, FSKit additions | `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1` |
 | Activate, every profile | `no-history`, `no-branches`, `user-xattr-readonly`, `single-principal`, `stable-item-identity`, `volume-syncfs-barrier`, `exact-resource-acquisition` |
 | Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1` |
+| Activate, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Activate, FSKit additions | `write-through`, `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1`, `peer-complete-fifo-feedback` |
 
 `volume-subscription-v1` includes cold subscription, pagination, renewal,
@@ -49,6 +51,15 @@ The frozen enum spelling `FRONTEND_PROFILE_LINUX_LEASES = 1` remains the Linux
 frontend identifier. Major 7 determines its subscription/delegation contract;
 it is not a switch to a v6 execution path. FSKit retains its explicit repair
 profile and the design's compatibility writer exclusion for every Mac mount.
+`FRONTEND_PROFILE_CACHELESS_READER = 3` is an authenticated peer reader. Attach
+requires exactly read access. The profile admits lifecycle operations, LOOKUP,
+GETATTR, read-only OPEN/CLOSE, READ, READDIR and RECLAIM. It admits no mutation,
+cache-capable handle, subscription, delegation or FSKit repair operation. Each
+data-consuming operation uses BreakForRead before storage admission and binding
+revalidation. It neither recalls the Linux writer nor joins the Mac writer
+exclusion; no writer waits for a cacheless reader's acknowledgment. The files
+gateway uses this profile. Its transport loss leaves no cache withdrawal duty.
+
 Optional session and enrollment reauthorization feature names are unchanged.
 
 ## Framing, envelopes, and counter domains

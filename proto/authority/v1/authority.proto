@@ -511,6 +511,8 @@ enum FrontendProfile {
   // Frozen profile spelling; v7 uses subscription/delegation semantics.
   FRONTEND_PROFILE_LINUX_LEASES = 1;
   FRONTEND_PROFILE_FSKIT_SYNC_REPAIR = 2;
+  // Authenticated non-subscribing reader; reads break delegated writeback.
+  FRONTEND_PROFILE_CACHELESS_READER = 3;
 }
 enum SessionPurpose {
   SESSION_PURPOSE_UNSPECIFIED = 0;

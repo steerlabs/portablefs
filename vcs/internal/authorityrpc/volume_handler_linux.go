@@ -661,6 +661,8 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		proof := mountAbsenceProof(body.Detach.GetMountAbsence())
 		if err := h.Lifecycle.CleanDetach(cred.ID, proof, func() error {
 			switch frontendProfile {
+			case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+				return nil
 			case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 				h.Coherence.ExpireSession(cred.ID)
 				return nil
@@ -2323,7 +2325,7 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 			return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
 		}
 		switch frontendProfile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 			if attach.GetFskitCachedNameCapacity() != 0 || attach.GetFskitRepairBudgetMillis() != 0 ||
 				attach.GetFskitNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
 				return h.errorResponse(requestID, syscall.EINVAL, false)
@@ -2444,7 +2446,8 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 		return h.errorResponse(requestID, err, false)
 	}
 	access, err := h.Runtime.ProvisionalAccess(cred, attemptID)
-	if err != nil || purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN && access&volumeserver.AccessAdmin == 0 {
+	if err != nil || purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN && access&volumeserver.AccessAdmin == 0 ||
+		frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER && access != volumeserver.AccessRead {
 		_ = h.Runtime.AbortProvisional(ctx, cred, attemptID)
 		if err == nil {
 			err = syscall.EPERM
@@ -2638,7 +2641,7 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 			return readErr
 		}
 		switch resources.profile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 			reply = h.newActivationReply(resources, rootAttr, rootIdentity, volumeserver.VisibilityCursor{})
 			if retainErr := h.retainActivationReply(cred.ID, resources, reply); retainErr != nil {
 				return retainErr
@@ -4096,7 +4099,8 @@ func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID, root xf
 // split: Linux sessions enter the lease table; FSKit sessions do not.
 func (h *VolumeHandler) startSessionResourcesForProfile(id volumeserver.SessionID, root xfsstore.Capability, slots uint32, routes [32]byte, frontend authoritypb.FrontendProfile) error {
 	if frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
-		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
+		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return volumeserver.ErrVisibilityProfile
 	}
 	h.resourcesMu.Lock()

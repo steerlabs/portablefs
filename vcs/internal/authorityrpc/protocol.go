@@ -60,6 +60,7 @@ const RequiredFskitWriteBytes uint64 = 0x7ffff000
 const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
 const sessionReauthorizationFeature = "session-reauthorization-v1"
 const mountEnrollmentReauthorizationFeature = "mount-enrollment-reauthorization-v1"
+const cachelessReaderFeature = "cacheless-peer-reader-v1"
 const subscriptionFeature = "volume-subscription-v1"
 const changeStreamFeature = "ordered-change-stream-v1"
 const delegationFeature = "file-write-delegation-v1"
@@ -108,6 +109,8 @@ func helloFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
 	switch profile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED:
 		return features, true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		return append(features, cachelessReaderFeature), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		return append(features, requiredLinuxHelloFeatures...), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
@@ -122,6 +125,8 @@ func activateFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
 	switch profile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED:
 		return features, true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		return append(features, cachelessReaderFeature), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		return append(features, requiredLinuxAttachFeatures...), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
@@ -242,6 +247,25 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 		}
 	}
 	switch profile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		if req.GetFskitSourcePublication() != nil || req.GetFskitFrontendOperationId() != 0 {
+			return false
+		}
+		switch req.GetBody().(type) {
+		case *authoritypb.Request_Hello, *authoritypb.Request_Attach,
+			*authoritypb.Request_Resume, *authoritypb.Request_Activate,
+			*authoritypb.Request_AbortAttach, *authoritypb.Request_TerminalDeliveryReceipt,
+			*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
+			*authoritypb.Request_Cancel, *authoritypb.Request_Reauthorize,
+			*authoritypb.Request_Lookup, *authoritypb.Request_GetAttr,
+			*authoritypb.Request_Close, *authoritypb.Request_Read,
+			*authoritypb.Request_ReadDir, *authoritypb.Request_Reclaim:
+			return true
+		case *authoritypb.Request_Open:
+			return !requestRequiresWrite(req) && !req.GetOpen().GetWriteIntent() && !req.GetOpen().GetCacheCapable()
+		default:
+			return false
+		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		if req.GetFskitSourcePublication() != nil || req.GetFskitFrontendOperationId() != 0 {
 			return false

@@ -156,9 +156,10 @@ session state only after handle retirement and horizon expiry. Cache resubscribe
 does not reset application tickets or manufacture durability.
 
 Every FSKit mount retains the macOS compatibility-writer exclusion, including a
-read-only Mac mount. This conservatively includes independent-repair FSKit
-sessions used by the current files gateway; that gateway cannot coexist with a
-Linux writer until it adopts a subscription-capable profile. Activation recalls
+read-only Mac mount. The files gateway instead uses the authenticated cacheless
+reader profile: exactly read access, no subscription or cache-capable handles,
+and BreakForRead before consuming delegated data or attributes. It never joins
+Mac exclusion or requires acknowledgment to let a writer proceed. FSKit Activation recalls
 existing Linux delegations before enabling the exclusion. Exact-generation holder
 flushes bypass the activation admission gate so those recalls can drain;
 BeginFlush still validates them, and activation waits for all pins to retire

@@ -146,12 +146,16 @@ const (
 
 type integrationAuthorizer struct{ now func() time.Time }
 
-func (a integrationAuthorizer) Authorize(context.Context, string, []byte) (volumeserver.Authorization, error) {
+func (a integrationAuthorizer) Authorize(_ context.Context, _ string, token []byte) (volumeserver.Authorization, error) {
+	access := volumeserver.AccessRead | volumeserver.AccessWrite
+	if string(token) == "gateway-read-capability" {
+		access = volumeserver.AccessRead
+	}
 	// The signed authorization deadline is deliberately far beyond anything a
 	// test advances the clock to, so lease expiry is what the session tests
 	// observe rather than an incidentally expired grant.
 	return volumeserver.Authorization{
-		Access:   volumeserver.AccessRead | volumeserver.AccessWrite,
+		Access:   access,
 		Deadline: a.now().Add(24 * time.Hour),
 	}, nil
 }
@@ -320,6 +324,7 @@ type integrationFixture struct {
 	store        *xfsstore.Volume
 	routes       *authorityrpc.RoutesController
 	authority    *volumeserver.Authority
+	coherence    *volumeserver.CoherenceCoordinator
 	fskitStaging *authorityrpc.FskitWriteStaging
 	membership   *recordingMembership
 	fencer       *recordingFencer
@@ -501,6 +506,7 @@ func (f *integrationFixture) start() {
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)
 	}
+	f.coherence = coordination.Coherence
 	routes := coordination.Routes
 	active, err := routes.Revision()
 	if err != nil {

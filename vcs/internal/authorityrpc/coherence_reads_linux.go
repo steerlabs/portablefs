@@ -21,7 +21,7 @@ func (h *VolumeHandler) coherenceRead(ctx context.Context, req *authoritypb.Requ
 		return nil, false
 	}
 	profile, err := h.sessionFrontendProfile(cred.ID)
-	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return nil, false
 	}
 	switch body := req.GetBody().(type) {
@@ -101,6 +101,13 @@ func coherenceBindingDependencies(parent [16]byte, name []byte, identity [16]byt
 func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volumeserver.SessionID, identity [16]byte) (*volumeserver.DataGuard, error) {
 	if h.Coherence == nil || h.coherenceStorage == nil {
 		return nil, errInternal
+	}
+	profile, err := h.sessionFrontendProfile(session)
+	if err != nil {
+		return nil, err
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+		return nil, h.Coherence.BreakForRead(ctx, identity)
 	}
 	token, err := h.coherenceToken(session)
 	if err != nil {

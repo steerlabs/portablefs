@@ -24,9 +24,6 @@ const (
 	defaultRequestTimeout = 30 * time.Second
 	maximumListEntries    = 500
 	authorityListPage     = 256
-	// repairBudget is the per-phase deadline this cacheless session commits to.
-	// It has nothing to purge, so the budget only bounds transport latency.
-	repairBudget = 10 * time.Second
 )
 
 type Config struct {
@@ -80,9 +77,6 @@ type authorityClient interface {
 	// evidence, sends Detach, and closes.
 	ReleaseBeforeMount(context.Context) error
 	IOLimits() (uint32, uint32)
-	InitialVisibilityCursor() *authoritypb.VisibilityCursor
-	AckVisibility(context.Context, *authoritypb.VisibilityCursor) error
-	NextVisibility(context.Context, *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error)
 	Root() *authoritypb.Item
 	SessionLease() time.Duration
 }
@@ -111,24 +105,16 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("readonlyfs: client identity: %w", err)
 	}
-	// The gateway is not a mount: it holds no kernel namespace, no page cache,
-	// and no lease state. Protocol-6 offers exactly two frontend contracts, and
-	// the synchronous-repair one is the only one that grants no cache leases, so
-	// it is the honest declaration here — every repair phase completes
-	// immediately for a client that caches nothing. Declaring the Linux lease
-	// profile would claim recall participation this client cannot honor and
-	// would stall writers behind a reader that never caches.
+	// This peer owns no kernel cache and joins no mutation withdrawal barrier.
+	// The authority breaks active delegations before answering its reads.
 	rpc, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
-		AccessToken:             append([]byte(nil), config.Capability...),
-		Address:                 config.Address,
-		CancelDrainTimeout:      mountv3.CancelDrainTimeout,
-		DialTimeout:             mountv3.DialTimeout,
-		FrontendProfile:         authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR,
-		FskitCachedNameCapacity: 1,
-		FskitNamespaceRepair:    authoritypb.NamespaceRepair_NAMESPACE_REPAIR_INDEPENDENT,
-		FskitRepairBudget:       repairBudget,
-		MaxFrame:                mountv3.MaxFrame,
-		MaxInFlight:             mountv3.MaxInFlight,
+		AccessToken:        append([]byte(nil), config.Capability...),
+		Address:            config.Address,
+		CancelDrainTimeout: mountv3.CancelDrainTimeout,
+		DialTimeout:        mountv3.DialTimeout,
+		FrontendProfile:    authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER,
+		MaxFrame:           mountv3.MaxFrame,
+		MaxInFlight:        mountv3.MaxInFlight,
 		ObservePreKernelMountAbsence: func(context.Context) (*authoritypb.MountAbsenceProof, error) {
 			return &authoritypb.MountAbsenceProof{
 				ObservedUnixNanos: time.Now().UnixNano(),
@@ -160,15 +146,12 @@ func newClient(rpc authorityClient, timeout time.Duration) *Client {
 	maxRead, _ := rpc.IOLimits()
 	keepaliveContext, stop := context.WithCancel(context.Background())
 	client := &Client{rpc: rpc, requestTimeout: timeout, maxRead: maxRead, stop: stop, done: make(chan struct{})}
-	client.workers.Add(2)
+	client.workers.Add(1)
 	go func() {
 		defer client.workers.Done()
 		client.keepalive(keepaliveContext)
 	}()
-	go func() {
-		defer client.workers.Done()
-		client.acknowledgeVisibility(keepaliveContext)
-	}()
+
 	go func() {
 		client.workers.Wait()
 		close(client.done)
@@ -401,27 +384,6 @@ func (c *Client) keepalive(ctx context.Context) {
 // A files reader keeps no kernel or userspace namespace cache. Protocol 5 has
 // one coherent session model, so this cacheless participant still joins the
 // visibility stream and acknowledges each phase only after it has observed it.
-func (c *Client) acknowledgeVisibility(ctx context.Context) {
-	cursor := c.rpc.InitialVisibilityCursor()
-	if cursor == nil {
-		c.fail(errors.New("readonlyfs: authority omitted its initial visibility cursor"))
-		return
-	}
-	// A cacheless session has nothing to purge, so each repair phase is
-	// discharged by acknowledging it and polling the next one.
-	var event *authoritypb.VisibilityEvent
-	event, err := c.rpc.NextVisibility(ctx, cursor)
-	for err == nil {
-		if err = c.rpc.AckVisibility(ctx, event.GetCursor()); err != nil {
-			break
-		}
-		event, err = c.rpc.NextVisibility(ctx, event.GetCursor())
-	}
-	if ctx.Err() == nil {
-		c.fail(fmt.Errorf("readonlyfs: authority visibility stream: %w", err))
-	}
-}
-
 func (c *Client) fail(err error) {
 	c.fatalMu.Lock()
 	if c.fatal == nil {
@@ -442,21 +404,12 @@ func (c *Client) sessionError() error {
 // as ENOENT do not poison the session and are not returned here.
 func (c *Client) Err() error { return c.sessionError() }
 
-// detachBudget bounds the authenticated detach on Close. Leaving without
-// detaching is not free: the authority keeps this session in the barrier
-// audience, so the next peer mutation waits this session's whole repair budget
-// for a phase nobody will acknowledge before the authority expels it. A
-// departure that costs a round trip is strictly better than one that costs a
-// writer a budget, so Close spends a bounded amount of time on it and gives up
-// rather than hanging.
+// detachBudget bounds authenticated departure from durable topology membership.
 const detachBudget = 10 * time.Second
 
 // Close ends the session, detaching first.
 //
-// The workers stop before the detach rather than after it. Both of them treat a
-// failed call as a terminal session cause, and the detach deliberately ends the
-// session underneath them -- a visibility poll outstanding across it would
-// report the departure it was asked for as a fatal error.
+// The keepalive worker stops before detach deliberately ends the session.
 //
 // A session that already has a terminal cause does not detach: there is nothing
 // live to detach, and Err has already told the caller so.

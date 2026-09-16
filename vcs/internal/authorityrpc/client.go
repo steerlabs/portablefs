@@ -276,7 +276,7 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 			return nil, errors.New("authorityrpc: strict coherence requires an exact pre-kernel mount-absence observer")
 		}
 		switch cfg.FrontendProfile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 			if cfg.FskitCachedNameCapacity != 0 || cfg.FskitRepairBudget != 0 ||
 				cfg.FskitNamespaceRepair != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
 				return nil, errors.New("authorityrpc: Linux subscription profile cannot declare FSKit repair state")
@@ -639,7 +639,7 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	}
 	fskitCursor := active.GetFskitRepairCursor()
 	switch c.cfg.FrontendProfile {
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 		if active.GetLeaseCursor() != nil || fskitCursor != nil {
 			return errors.New("authorityrpc: authority returned obsolete Linux lease activation state")
 		}
@@ -1575,6 +1575,10 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {
 	switch c.cfg.FrontendProfile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil || response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil || response.GetSourceLeaseDischarge() != nil || response.GetAcknowledgeSourceLeaseDischarge() != nil || response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
+			return fmt.Errorf("%w: cacheless reader received cache participation state", ErrTransportBinding)
+		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil ||
 			response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil ||

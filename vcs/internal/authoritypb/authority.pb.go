@@ -230,6 +230,8 @@ const (
 	// Frozen profile spelling; v7 uses subscription/delegation semantics.
 	FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES      FrontendProfile = 1
 	FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR FrontendProfile = 2
+	// Authenticated non-subscribing reader; reads break delegated writeback.
+	FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER FrontendProfile = 3
 )
 
 // Enum value maps for FrontendProfile.
@@ -238,11 +240,13 @@ var (
 		0: "FRONTEND_PROFILE_UNSPECIFIED",
 		1: "FRONTEND_PROFILE_LINUX_LEASES",
 		2: "FRONTEND_PROFILE_FSKIT_SYNC_REPAIR",
+		3: "FRONTEND_PROFILE_CACHELESS_READER",
 	}
 	FrontendProfile_value = map[string]int32{
 		"FRONTEND_PROFILE_UNSPECIFIED":       0,
 		"FRONTEND_PROFILE_LINUX_LEASES":      1,
 		"FRONTEND_PROFILE_FSKIT_SYNC_REPAIR": 2,
+		"FRONTEND_PROFILE_CACHELESS_READER":  3,
 	}
 )
 
@@ -12237,11 +12241,12 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x19SESSION_STATE_PROVISIONAL\x10\x01\x12\x18\n" +
 	"\x14SESSION_STATE_ACTIVE\x10\x02\x12\x19\n" +
 	"\x15SESSION_STATE_ABORTED\x10\x03\x12\x1a\n" +
-	"\x16SESSION_STATE_TERMINAL\x10\x04*~\n" +
+	"\x16SESSION_STATE_TERMINAL\x10\x04*\xa5\x01\n" +
 	"\x0fFrontendProfile\x12 \n" +
 	"\x1cFRONTEND_PROFILE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dFRONTEND_PROFILE_LINUX_LEASES\x10\x01\x12&\n" +
-	"\"FRONTEND_PROFILE_FSKIT_SYNC_REPAIR\x10\x02*m\n" +
+	"\"FRONTEND_PROFILE_FSKIT_SYNC_REPAIR\x10\x02\x12%\n" +
+	"!FRONTEND_PROFILE_CACHELESS_READER\x10\x03*m\n" +
 	"\x0eSessionPurpose\x12\x1f\n" +
 	"\x1bSESSION_PURPOSE_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15SESSION_PURPOSE_MOUNT\x10\x01\x12\x1f\n" +

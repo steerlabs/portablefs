@@ -253,7 +253,7 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 			hello.GetMaxReadBytes(), hello.GetMaxWriteBytes(),
 		))
 	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hello.GetMaxFskitWriteBytes() != 0 {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR && hello.GetMaxFskitWriteBytes() != 0 {
 		return fail(errors.New("authorityrpc: Linux profile received FSKit write capacity"))
 	}
 	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
