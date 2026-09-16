@@ -16,7 +16,7 @@ const (
 	transportRequestControl
 )
 
-// classifyTransportRequest is the one protocol-6 role allowlist. New request
+// classifyTransportRequest is the one protocol-7 role allowlist. New request
 // bodies fail closed until they are assigned deliberately; neither the client
 // nor server may infer a role from traffic size or current load.
 func classifyTransportRequest(request *authoritypb.Request) (transportRequestClass, error) {
@@ -45,7 +45,7 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		*authoritypb.Request_ListXattr, *authoritypb.Request_RemoveXattr,
 		*authoritypb.Request_StatFs, *authoritypb.Request_SyncFs,
 		*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
-		*authoritypb.Request_ApplyRoutes:
+		*authoritypb.Request_ApplyRoutes, *authoritypb.Request_Barrier:
 		return transportRequestData, nil
 	case *authoritypb.Request_Activate, *authoritypb.Request_AbortAttach,
 		*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
@@ -53,7 +53,11 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		*authoritypb.Request_RenewLeases,
 		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
 		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
-		*authoritypb.Request_Reauthorize, *authoritypb.Request_TerminalDeliveryReceipt:
+		*authoritypb.Request_Reauthorize, *authoritypb.Request_TerminalDeliveryReceipt,
+		*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,
+		*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
+		*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
+		*authoritypb.Request_DelegationModeChangeAck, *authoritypb.Request_DelegationRelease:
 		return transportRequestControl, nil
 	default:
 		return transportRequestInvalid, fmt.Errorf("%w: unclassified request body %T", ErrTransportBinding, request.GetBody())

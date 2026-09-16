@@ -34,6 +34,15 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_NextLeaseEvent{}}, {Body: &authoritypb.Request_AcknowledgeLeaseEvent{}},
 		{Body: &authoritypb.Request_RenewLeases{}},
 		{Body: &authoritypb.Request_AcknowledgeSourceLeaseDischarge{}},
+		{Body: &authoritypb.Request_Subscribe{}},
+		{Body: &authoritypb.Request_RenewSubscription{}},
+		{Body: &authoritypb.Request_NextControlEvent{}},
+		{Body: &authoritypb.Request_ChangeAck{}},
+		{Body: &authoritypb.Request_DelegationRecallAck{}},
+		{Body: &authoritypb.Request_DelegationBreakAck{}},
+		{Body: &authoritypb.Request_DelegationModeChangeAck{}},
+		{Body: &authoritypb.Request_DelegationRelease{}},
+		{Body: &authoritypb.Request_Barrier{}},
 	}
 	descriptorBodies := (&authoritypb.Request{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
 	if len(requests) != descriptorBodies {
@@ -60,6 +69,15 @@ func TestTransportRoleAllowlistIsStrict(t *testing.T) {
 		control bool
 	}{
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_Subscribe{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_ChangeAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationRecallAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationBreakAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationModeChangeAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_Barrier{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Write{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{}}, control: true},

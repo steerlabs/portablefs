@@ -14,14 +14,13 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// ProtocolMajor 6 is the stock-kernel lease architecture. It is intentionally
-// incompatible with the previous private-kernel publication profile; there is no
-// negotiated downgrade or second execution path.
-const ProtocolMajor uint32 = 6
+// ProtocolMajor 7 replaces per-coordinate leases with volume subscriptions and
+// file delegations. There is no negotiated downgrade or mixed-major execution.
+const ProtocolMajor uint32 = 7
 
 // ProtocolALPN is exported so the production authority listener and the RPC
 // server package cannot drift onto different exact protocols.
-const ProtocolALPN = "portablefs-authority-v6"
+const ProtocolALPN = "portablefs-authority-v7"
 
 const protocolALPN = ProtocolALPN
 
@@ -32,7 +31,7 @@ const protocolALPN = ProtocolALPN
 // configuration against it, and both read the same constant.
 const FramePayloadReserve uint32 = 1024
 
-// responseEnvelopeReserve is the protocol-6 retained-response allowance. It
+// responseEnvelopeReserve is the protocol-7 retained-response allowance. It
 // covers the maximum four-object post-state envelope, including field 45's
 // two-byte tag, as well as the request, epoch, errno, mutation state, and
 // terminal-delivery token restored around a retained outcome.
@@ -61,11 +60,12 @@ const RequiredFskitWriteBytes uint64 = 0x7ffff000
 const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
 const sessionReauthorizationFeature = "session-reauthorization-v1"
 const mountEnrollmentReauthorizationFeature = "mount-enrollment-reauthorization-v1"
-const leaseCoherenceFeature = "lease-coherence-v1"
-const leaseRecallFeature = "lease-recall-v1"
-const leaseRenewalFeature = "lease-renewal-v1"
-const directoryEnumerationLeaseFeature = "directory-enumeration-lease-v1"
-const openByIdentityFeature = "open-by-identity-v1"
+const subscriptionFeature = "volume-subscription-v1"
+const changeStreamFeature = "ordered-change-stream-v1"
+const delegationFeature = "file-write-delegation-v1"
+const delegationControlFeature = "delegation-control-v1"
+const durableSequenceFeature = "session-durable-sequence-v1"
+const directoryBarrierFeature = "root-directory-barrier-v1"
 const fskitSyncRepairFeature = "fskit-sync-repair-v1"
 const fskitSourcePublicationFeature = "fskit-source-publication-v1"
 const fskitFragmentedWriteFeature = "fskit-fragmented-write-v1"
@@ -77,21 +77,22 @@ var (
 	}
 	requiredLinuxHelloFeatures = []string{
 		"direct-write",
-		leaseCoherenceFeature, directoryEnumerationLeaseFeature,
+		subscriptionFeature, changeStreamFeature, delegationFeature,
 	}
 	requiredFskitHelloFeatures = []string{
 		fskitSyncRepairFeature, fskitSourcePublicationFeature, fskitFragmentedWriteFeature,
 	}
 	requiredCommonAttachFeatures = []string{
-		"write-through", "no-history", "no-branches", "user-xattr-readonly",
+		"no-history", "no-branches", "user-xattr-readonly",
 		"single-principal", "stable-item-identity", "volume-syncfs-barrier",
 		"exact-resource-acquisition",
 	}
 	requiredLinuxAttachFeatures = []string{
 		"direct-io-no-file-mmap", "distributed-posix-locks",
-		leaseRenewalFeature, leaseRecallFeature, openByIdentityFeature,
+		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature,
 	}
 	requiredFskitAttachFeatures = []string{
+		"write-through",
 		fskitSyncRepairFeature, fskitSourcePublicationFeature, fskitFragmentedWriteFeature,
 		peerCompleteFIFOFeedbackFeature,
 	}
@@ -161,7 +162,7 @@ func terminalQuiesceCancelable(req *authoritypb.Request) bool {
 	if req == nil {
 		return false
 	}
-	if blockingWait(req) || req.GetNextLeaseEvent() != nil || req.GetNextFskitRepair() != nil || req.GetApplyRoutes() != nil {
+	if blockingWait(req) || req.GetNextControlEvent() != nil || req.GetNextLeaseEvent() != nil || req.GetNextFskitRepair() != nil || req.GetApplyRoutes() != nil {
 		return true
 	}
 	return false
@@ -191,7 +192,7 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 		return true
 	case *authoritypb.Request_Open:
 		flags := body.Open.GetFlags()
-		return flags != nil && (flags.GetWrite() || flags.GetAppend() || flags.GetTruncate())
+		return body.Open.GetWriteIntent() || flags != nil && (flags.GetWrite() || flags.GetAppend() || flags.GetTruncate())
 	case *authoritypb.Request_SetLock:
 		return !body.SetLock.GetUnlock() && body.SetLock.GetLock() != nil && body.SetLock.GetLock().GetWrite()
 	case *authoritypb.Request_Write:
@@ -251,7 +252,12 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 			*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
 			*authoritypb.Request_Write, *authoritypb.Request_NextLeaseEvent,
 			*authoritypb.Request_AcknowledgeLeaseEvent, *authoritypb.Request_RenewLeases,
-			*authoritypb.Request_AcknowledgeSourceLeaseDischarge:
+			*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
+			*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,
+			*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
+			*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
+			*authoritypb.Request_DelegationModeChangeAck, *authoritypb.Request_DelegationRelease,
+			*authoritypb.Request_Barrier:
 			return true
 		default:
 			return common()
@@ -406,6 +412,10 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 		*authoritypb.Request_RenewLeases,
 		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
 		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
+		*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,
+		*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
+		*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
+		*authoritypb.Request_DelegationModeChangeAck, *authoritypb.Request_DelegationRelease,
 		*authoritypb.Request_ApplyRoutes:
 		return false
 	case *authoritypb.Request_SetLock:

@@ -76,6 +76,7 @@ message Request {
     // generic write checks and bounded the payload to the negotiated frame.
     // data is the frame's exact out-of-line bulk body.
     WriteRequest write = 55;
+    // Historical v6 lease-family bodies: not sent or honoured on v7.
     NextLeaseEventRequest next_lease_event = 56;
     AcknowledgeLeaseEventRequest acknowledge_lease_event = 57;
     RenewLeasesRequest renew_leases = 58;
@@ -83,6 +84,15 @@ message Request {
     NextVisibilityRequest next_fskit_repair = 62;
     AckVisibilityRequest ack_fskit_repair = 63;
     FskitWriteRequest fskit_write = 64;
+    SubscribeRequest subscribe = 65;
+    RenewSubscriptionRequest renew_subscription = 66;
+    NextControlEventRequest next_control_event = 67;
+    ChangeAck change_ack = 68;
+    DelegationRecallAck delegation_recall_ack = 69;
+    DelegationBreakAck delegation_break_ack = 70;
+    DelegationModeChangeAck delegation_mode_change_ack = 71;
+    BarrierRequest barrier = 72;
+    DelegationReleaseRequest delegation_release = 73;
   }
 }
 
@@ -142,14 +152,14 @@ message Response {
   // Cache authority is carried in one common envelope so LOOKUP, GETATTR,
   // OPEN, READDIR, and mutation replies cannot invent operation-specific
   // grant encodings.
-  repeated LeaseGrant lease_grants = 46;
+  repeated LeaseGrant lease_grants = 46; // v6 only; not sent on v7
   // Present on a changed mutation reply when the source held cache authority
   // over an affected coordinate. Those coordinates remain closed until the
   // frontend purges every named A/D/E cache before returning the callback,
   // writes the physical kernel reply, then acknowledges the obligation on
   // CONTROL. Namespace state covered by normal VFS reply processing is proven
   // only at that physical reply boundary.
-  SourceLeaseDischarge source_lease_discharge = 50;
+  SourceLeaseDischarge source_lease_discharge = 50; // v6 only; not sent on v7
   uint64 fskit_repair_retry_sequence = 52;
   reserved 26, 33, 38;
   reserved "visibility", "write_transaction";
@@ -157,6 +167,12 @@ message Response {
   // retry/operator reason without overloading errno (blocked, corrupt,
   // recall_deadline, or protocol).
   string restore_detail = 55;
+  // v7 session-scoped application ticket. Present on successful changed data
+  // mutations (including SETATTR and FALLOCATE); never a replay-slot sequence.
+  uint64 applied_sequence = 56;
+  // Version at which a cache-installing reply was served, including negative
+  // LOOKUP and empty READDIR. Publication must compare with local withdrawals.
+  uint64 volume_version = 67;
 
   oneof body {
     HelloReply hello = 10;
@@ -185,12 +201,23 @@ message Response {
     TmpfileReply tmpfile = 41;
     TerminalDeliveryReceiptReply terminal_delivery_receipt = 42;
     WriteReply write = 44;
+    // Historical v6 lease-family replies: not sent on v7.
     LeaseEvent lease_event = 47;
     AcknowledgeLeaseEventReply acknowledge_lease_event = 48;
     RenewLeasesReply renew_leases = 49;
     AcknowledgeSourceLeaseDischargeReply acknowledge_source_lease_discharge = 51;
     VisibilityEvent fskit_repair = 53;
     FskitWriteReply fskit_write = 54;
+    SubscribeReply subscribe = 57;
+    RenewSubscriptionReply renew_subscription = 58;
+    ControlEvent control_event = 59;
+    ChangeAckReply change_ack = 60;
+    DelegationRecallAckReply delegation_recall_ack = 61;
+    DelegationBreakAckReply delegation_break_ack = 62;
+    DelegationModeChangeAckReply delegation_mode_change_ack = 63;
+    BarrierReply barrier = 64;
+    DelegationReleaseReply delegation_release = 65;
+    FsyncReply fsync = 66;
   }
 }
 
@@ -343,7 +370,7 @@ message ObjectPostState {
   uint32 roles = 4;
 }
 
-// Every protocol-6 client owns exactly two authenticated transports for one
+// Every protocol-7 client owns exactly two authenticated transports for one
 // session. DATA carries filesystem traffic; CONTROL carries cache repair and
 // liveness traffic. The role and random connection-set identity are mandatory
 // at Hello and are echoed by the authority before either connection can take
@@ -474,13 +501,14 @@ message ActivateReply {
   // Protocol 6 lease streams begin at the zero cursor. Carrying it explicitly
   // makes activation/replay state self-contained and leaves room for a future
   // nonzero restored cursor without changing attach semantics.
-  LeaseEventCursor lease_cursor = 8;
+  LeaseEventCursor lease_cursor = 8; // v6 only; not sent on v7
   SessionPurpose purpose = 9;
   FrontendProfile frontend_profile = 10;
   VisibilityCursor fskit_repair_cursor = 11;
 }
 enum FrontendProfile {
   FRONTEND_PROFILE_UNSPECIFIED = 0;
+  // Frozen profile spelling; v7 uses subscription/delegation semantics.
   FRONTEND_PROFILE_LINUX_LEASES = 1;
   FRONTEND_PROFILE_FSKIT_SYNC_REPAIR = 2;
 }
@@ -689,6 +717,9 @@ message AckVisibilityRequest {
   bool ordered_admission_contended = 4;
 }
 
+// Historical v6 only: every Lease* message/enum and the NextLeaseEvent,
+// AcknowledgeLeaseEvent, RenewLeases, SourceLeaseDischarge, and
+// AcknowledgeSourceLeaseDischarge families below are not sent or honoured on v7.
 // Protocol 6 grants cache authority over four exact coordinate families. Name
 // coordinates use parent_identity+name; every other family uses identity. Data
 // coordinates are whole-file in v1.
@@ -838,6 +869,7 @@ message SetAttrRequest {
   optional int64 mtime_ns = 8;
   bool atime_now = 9;
   bool mtime_now = 10;
+  DelegationRef delegation = 11; // required for a delegated flush
 }
 
 message OpenFlags {
@@ -849,8 +881,21 @@ message OpenFlags {
   bool data_sync = 6;
 }
 
-message CreateRequest { bytes parent = 1; bytes name = 2; uint32 mode = 3; OpenFlags flags = 4; bool exclusive = 5; }
-message CreateReply { Item item = 1; bytes handle = 2; }
+message CreateRequest {
+  bytes parent = 1;
+  bytes name = 2;
+  uint32 mode = 3;
+  OpenFlags flags = 4;
+  bool exclusive = 5;
+  bool write_intent = 6; // request a delegation, consistent with flags.write
+  bool cache_capable = 7; // requested kernel cache capability, not a grant
+}
+message CreateReply {
+  Item item = 1;
+  bytes handle = 2;
+  Delegation delegation = 3; // absent means no delegation
+  bool cache_capable = 4; // authority-admitted capability for this handle
+}
 message MkdirRequest { bytes parent = 1; bytes name = 2; uint32 mode = 3; }
 message UnlinkRequest { bytes parent = 1; bytes name = 2; bool directory = 3; }
 
@@ -880,15 +925,24 @@ message SymlinkRequest { bytes parent = 1; bytes name = 2; bytes target = 3; }
 message ReadlinkRequest { bytes item = 1; }
 message ReadlinkReply { bytes target = 1; }
 
-message OpenRequest { bytes item = 1; OpenFlags flags = 2; }
-message OpenReply { bytes handle = 1; }
+message OpenRequest {
+  bytes item = 1;
+  OpenFlags flags = 2;
+  bool write_intent = 3;
+  bool cache_capable = 4;
+}
+message OpenReply {
+  bytes handle = 1;
+  Delegation delegation = 2;
+  bool cache_capable = 3;
+}
 message CloseRequest {
   bytes handle = 1;
   uint64 lock_owner = 2;
   bool flock_unlock = 3;
 }
 message ReadRequest { bytes handle = 1; uint64 offset = 2; uint32 length = 3; }
-message ReadReply { bytes data = 1; }
+message ReadReply { bytes data = 1; uint64 volume_version = 2; }
 // WriteRequest is the stock FUSE_WRITE shape after kernel-side generic
 // write checks. The kernel has already bounded size and position; userspace
 // must not replay private RLIMIT/file-ceiling policy.
@@ -919,6 +973,7 @@ message WriteRequest {
   // sync is stronger than data_sync; both may not be set.
   bool sync = 11;
   bool data_sync = 12;
+  DelegationRef delegation = 13; // required for a delegated flush
 }
 
 // One stock write either reports the exact committed byte count, the offset the
@@ -934,6 +989,7 @@ message WriteReply {
   // requested position for a positioned write and the EOF the authority
   // observed under the writer stripe for an append.
   uint64 assigned_offset = 7;
+  uint64 durable_sequence = 8; // session-wide durable application prefix
 }
 
 // FSKit can deliver one logical write in multiple transport frames. BEGIN and
@@ -983,6 +1039,7 @@ message FallocateRequest {
   reserved 4, 5, 7;
   reserved "rlimit_fsize", "file_max_size", "write_flags";
   uint32 mode = 6;
+  DelegationRef delegation = 8; // required for a delegated flush
 }
 
 // CopyFileRangeRequest is legal only for SHARED source and destination
@@ -1037,6 +1094,7 @@ message TmpfileRequest {
 message TmpfileReply { Item item = 1; bytes handle = 2; }
 
 message FsyncRequest { bytes handle = 1; bool data_only = 2; }
+message FsyncReply { uint64 durable_sequence = 1; }
 message FlushRequest { bytes handle = 1; uint64 lock_owner = 2; }
 
 message ReadDirRequest {
@@ -1078,9 +1136,148 @@ message StatFSReply {
 // Replay-safe, volume-wide durability barrier ordered with mutations before
 // invoking syncfs(2). It carries no cache visibility change of its own.
 message SyncFSRequest {}
-message SyncFSReply {}
+message SyncFSReply { uint64 durable_sequence = 1; }
 message LockRange { uint64 start = 1; uint64 end = 2; }
 message LockSpec { bytes item = 1; uint64 owner = 2; bool write = 3; LockRange range = 4; bool flock = 5; }
 message GetLockRequest { LockSpec lock = 1; }
 message GetLockReply { bool conflict = 1; LockSpec held = 2; }
 message SetLockRequest { LockSpec lock = 1; bool wait = 2; bool unlock = 3; }
+
+// Protocol 7 coherence. Normative ordering and counter domains are specified in
+// docs/coherence-v2/wire.md. All these control requests use CONTROL except Barrier
+// (DATA). Stable identities are coordination keys, never capabilities.
+message SubscribeRequest {
+  bytes snapshot_id = 1; // empty starts a cold subscription; otherwise pagination
+  bytes after_identity = 2; // exact previous next_after_identity
+}
+message SubscribeReply {
+  uint64 watermark = 1; // volume version of the atomic subscription snapshot
+  repeated bytes delegated_identities = 2; // sorted unique 16-byte identities
+  uint64 incarnation = 3; // nonzero, advances on each cold subscribe
+  uint64 horizon_nanos = 4; // validity duration anchored at initial request start
+  bytes snapshot_id = 5; // 16-byte pagination token, scoped to this incarnation
+  bytes next_after_identity = 6; // empty on final page
+}
+message RenewSubscriptionRequest { uint64 incarnation = 1; }
+message RenewSubscriptionReply {
+  uint64 incarnation = 1;
+  uint64 horizon_nanos = 2; // validity duration anchored at renewal request start
+}
+
+// One outstanding poll per subscription. Delivery is not acknowledgment; the
+// next poll may run before any event's withdrawal or flush completes.
+message NextControlEventRequest {
+  uint64 incarnation = 1;
+  uint64 after_sequence = 2; // last received ControlEvent.sequence; initially zero
+}
+message ControlEvent {
+  uint64 incarnation = 1;
+  uint64 sequence = 2; // contiguous delivery cursor, distinct from change position
+  oneof event {
+    ChangeBatch change_batch = 3;
+    DelegationRecall delegation_recall = 4;
+    DelegationBreak delegation_break = 5;
+    DelegationModeChange delegation_mode_change = 6;
+  }
+}
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  CHANGE_KIND_NAMESPACE_CHANGED = 1;
+  CHANGE_KIND_ATTRIBUTES_CHANGED = 2;
+  CHANGE_KIND_DATA_CHANGED = 3;
+  CHANGE_KIND_DELEGATION_GRANTED = 4;
+  CHANGE_KIND_DELEGATION_RELEASED = 5;
+  CHANGE_KIND_DIRECTORY_CHANGED = 6;
+}
+message ByteRange {
+  uint64 offset = 1;
+  uint64 length = 2; // positive; half-open range, no overflow
+}
+message ChangeEntry {
+  uint64 position = 1; // contiguous per-subscription change position
+  uint64 volume_version = 2;
+  ChangeKind kind = 3;
+  bytes identity = 4;
+  bytes parent_identity = 5;
+  bytes name = 6;
+  ByteRange byte_range = 7; // DATA_CHANGED only; absent means the whole file
+}
+message ChangeBatch {
+  uint64 incarnation = 1;
+  repeated ChangeEntry entries = 2; // nonempty, strictly ascending position
+}
+message ChangeAck {
+  uint64 position = 1; // every change through here is fully withdrawn
+  uint64 incarnation = 2;
+}
+message ChangeAckReply {}
+
+enum DelegationMode {
+  DELEGATION_MODE_UNSPECIFIED = 0;
+  DELEGATION_MODE_FULL = 1;
+  DELEGATION_MODE_WRITETHROUGH = 2;
+}
+message DelegationRef {
+  bytes id = 1; // 16 nonzero bytes, epoch/session scoped
+  uint64 generation = 2; // nonzero; stale generations reject the entire flush
+}
+message Delegation {
+  bytes id = 1;
+  uint64 generation = 2;
+  DelegationMode mode = 3;
+}
+message DelegationRecall {
+  DelegationRef delegation = 1;
+  bytes identity = 2;
+  uint64 budget_nanos = 3; // at most 5 seconds; authority deadline starts at issue
+}
+message DelegationBreak {
+  DelegationRef delegation = 1;
+  bytes identity = 2;
+  uint64 budget_nanos = 3;
+}
+message DelegationModeChange {
+  DelegationRef delegation = 1;
+  bytes identity = 2;
+  DelegationMode mode = 3;
+  uint64 budget_nanos = 4;
+}
+message DelegationRecallAck {
+  uint64 incarnation = 1;
+  uint64 event_sequence = 2;
+  DelegationRef delegation = 3;
+  uint64 applied_sequence = 4; // application ticket covering the drained cut
+}
+message DelegationRecallAckReply {}
+message DelegationBreakAck {
+  uint64 incarnation = 1;
+  uint64 event_sequence = 2;
+  DelegationRef delegation = 3;
+  uint64 applied_sequence = 4;
+}
+message DelegationBreakAckReply {}
+message DelegationModeChangeAck {
+  uint64 incarnation = 1;
+  uint64 event_sequence = 2;
+  DelegationRef delegation = 3;
+  uint64 applied_sequence = 4;
+}
+message DelegationModeChangeAckReply {}
+message DelegationRelease {
+  DelegationRef delegation = 1;
+  uint64 applied_sequence = 2; // final flushed cut, not a durability assertion
+}
+message DelegationReleaseRequest {
+  uint64 incarnation = 1;
+  repeated DelegationRelease delegations = 2; // unique, sorted by id
+}
+message DelegationReleaseReply {}
+
+// The client flushes its accepted-entry cut first, then supplies the largest
+// application ticket covering that cut. The Authority must not wait for bytes
+// that the client has not yet sent. FUSE_FSYNCDIR on the root invokes this RPC.
+message BarrierRequest { uint64 cut_sequence = 1; }
+message BarrierReply {
+  uint64 applied_sequence = 1;
+  uint64 durable_sequence = 2;
+}
