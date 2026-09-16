@@ -1,0 +1,729 @@
+//go:build linux
+
+package fusev3
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+)
+
+type subscriptionTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *subscriptionTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *subscriptionTestClock) NewTimer(d time.Duration) subscriptionTimer {
+	return wallSubscriptionTimer{timer: time.NewTimer(d)}
+}
+
+func (c *subscriptionTestClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+type subscriptionTestRPC struct {
+	mu sync.Mutex
+
+	pages       []*authoritypb.SubscribeReply
+	page        int
+	horizon     time.Time
+	events      []*authoritypb.ControlEvent
+	event       int
+	eventNotify chan struct{}
+	acks        []uint64
+	log         *[]string
+}
+
+func (r *subscriptionTestRPC) Subscribe(_ context.Context, snapshotID, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.log != nil {
+		*r.log = append(*r.log, "subscribe")
+	}
+	if r.page >= len(r.pages) {
+		return nil, time.Time{}, errors.New("unexpected subscribe")
+	}
+	reply := r.pages[r.page]
+	if r.page == 0 && (len(snapshotID) != 0 || len(after) != 0) {
+		return nil, time.Time{}, errors.New("initial subscribe carried a cursor")
+	}
+	if r.page > 0 {
+		if !bytes.Equal(snapshotID, r.pages[0].GetSnapshotId()) ||
+			!bytes.Equal(after, r.pages[r.page-1].GetNextAfterIdentity()) {
+			return nil, time.Time{}, errors.New("continuation subscribe carried the wrong snapshot cursor")
+		}
+	}
+	r.page++
+	return reply, r.horizon, nil
+}
+
+func (r *subscriptionTestRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.horizon, nil
+}
+
+func (r *subscriptionTestRPC) NextControlEvent(ctx context.Context, _ uint64, _ uint64) (*authoritypb.ControlEvent, error) {
+	r.mu.Lock()
+	if r.event < len(r.events) {
+		event := r.events[r.event]
+		r.event++
+		if r.eventNotify != nil {
+			select {
+			case r.eventNotify <- struct{}{}:
+			default:
+			}
+		}
+		r.mu.Unlock()
+		return event, nil
+	}
+	r.mu.Unlock()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (r *subscriptionTestRPC) AcknowledgeChanges(_ context.Context, _ uint64, position uint64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.acks = append(r.acks, position)
+	if r.log != nil {
+		*r.log = append(*r.log, "ack")
+	}
+	return nil
+}
+
+type subscriptionTestInvalidator struct {
+	mu sync.Mutex
+
+	all       int
+	closed    []publicationCoordinate
+	opened    []publicationCoordinate
+	stale     []publicationIdentity
+	log       *[]string
+	fail      error
+	block     <-chan struct{}
+	entered   chan<- struct{}
+	blockOnce sync.Once
+}
+
+func (i *subscriptionTestInvalidator) CloseCacheCoordinate(_ context.Context, coordinate publicationCoordinate) error {
+	i.mu.Lock()
+	i.closed = append(i.closed, coordinate)
+	if i.log != nil {
+		*i.log = append(*i.log, "close")
+	}
+	i.mu.Unlock()
+	return nil
+}
+
+func (i *subscriptionTestInvalidator) InvalidateCacheCoordinate(context.Context, publicationCoordinate, *authoritypb.ByteRange) error {
+	i.blockOnce.Do(func() {
+		if i.entered != nil {
+			i.entered <- struct{}{}
+		}
+		if i.block != nil {
+			<-i.block
+		}
+	})
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if i.log != nil {
+		*i.log = append(*i.log, "invalidate")
+	}
+	return i.fail
+}
+
+func (i *subscriptionTestInvalidator) OpenCacheCoordinate(context publicationCoordinate) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.opened = append(i.opened, context)
+	if i.log != nil {
+		*i.log = append(*i.log, "open")
+	}
+}
+
+func (i *subscriptionTestInvalidator) InvalidateAllCaches(context.Context) error {
+	i.mu.Lock()
+	i.all++
+	i.mu.Unlock()
+	return nil
+}
+
+func (i *subscriptionTestInvalidator) MarkIdentityStale(identity publicationIdentity) {
+	i.mu.Lock()
+	i.stale = append(i.stale, identity)
+	i.mu.Unlock()
+}
+
+type subscriptionTestControl struct {
+	mu          sync.Mutex
+	incarnation uint64
+	events      []*authoritypb.ControlEvent
+	delivered   chan struct{}
+	fences      []string
+	log         *[]string
+}
+
+func (c *subscriptionTestControl) FenceSubscription(reason string) {
+	c.mu.Lock()
+	c.fences = append(c.fences, reason)
+	if c.log != nil {
+		*c.log = append(*c.log, "fence")
+	}
+	c.mu.Unlock()
+}
+
+func (c *subscriptionTestControl) SetIncarnation(incarnation uint64) {
+	c.mu.Lock()
+	c.incarnation = incarnation
+	if c.log != nil {
+		*c.log = append(*c.log, "incarnation")
+	}
+	c.mu.Unlock()
+}
+
+func (c *subscriptionTestControl) HandleControlEvent(_ context.Context, event *authoritypb.ControlEvent) {
+	c.mu.Lock()
+	c.events = append(c.events, event)
+	c.mu.Unlock()
+	if c.delivered != nil {
+		select {
+		case c.delivered <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func subscriptionIdentity(value byte) publicationIdentity {
+	var identity publicationIdentity
+	for index := range identity {
+		identity[index] = value
+	}
+	return identity
+}
+
+func subscriptionIdentityBytes(value byte) []byte {
+	identity := subscriptionIdentity(value)
+	return bytes.Clone(identity[:])
+}
+
+func newSubscriptionTestRegistry(clock *subscriptionTestClock, rpc *subscriptionTestRPC, invalidator *subscriptionTestInvalidator, control subscriptionControlHandler) *subscriptionRegistry {
+	return newSubscriptionRegistryWithConfig(nil, rpc, control, subscriptionConfig{
+		clock: clock, retryDelay: time.Millisecond, repairLead: time.Second,
+		maxPages: 16, invalidator: invalidator,
+	})
+}
+
+func TestSubscriptionColdPaginationWatermarkAndStaleReply(t *testing.T) {
+	clock := &subscriptionTestClock{now: time.Unix(100, 0)}
+	controlLog := make([]string, 0, 4)
+	rpc := &subscriptionTestRPC{
+		horizon: clock.Now().Add(10 * time.Second),
+		log:     &controlLog,
+		pages: []*authoritypb.SubscribeReply{
+			{Watermark: 10, Incarnation: 7, HorizonNanos: uint64(10 * time.Second), SnapshotId: []byte("snapshot"), DelegatedIdentities: [][]byte{subscriptionIdentityBytes(1)}, NextAfterIdentity: subscriptionIdentityBytes(1)},
+			{Watermark: 10, Incarnation: 7, HorizonNanos: uint64(10 * time.Second), SnapshotId: []byte("snapshot"), DelegatedIdentities: [][]byte{subscriptionIdentityBytes(2)}},
+		},
+	}
+	invalidator := &subscriptionTestInvalidator{}
+	control := &subscriptionTestControl{log: &controlLog}
+	registry := newSubscriptionTestRegistry(clock, rpc, invalidator, control)
+	if err := registry.subscribe(context.Background()); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	if invalidator.all != 1 {
+		t.Fatalf("cold invalidations = %d, want 1", invalidator.all)
+	}
+	if control.incarnation != 7 {
+		t.Fatalf("delegation incarnation = %d, want 7", control.incarnation)
+	}
+	if len(control.fences) != 1 || control.fences[0] != "cold subscription replacement" {
+		t.Fatalf("delegation fences = %v, want one cold replacement", control.fences)
+	}
+	wantControlLog := []string{"fence", "subscribe", "subscribe", "incarnation"}
+	if !slices.Equal(controlLog, wantControlLog) {
+		t.Fatalf("cold subscription order = %v, want %v", controlLog, wantControlLog)
+	}
+
+	stamp := registry.stamp()
+	identity := subscriptionIdentity(1)
+	attr := publicationCoordinate{kind: publicationItemAttributes, item: identity}
+	name := publicationCoordinate{kind: publicationNamespaceName, parent: identity, name: "file"}
+	if got := registry.remaining(attr, stamp, 10, clock.Now()); got != 0 {
+		t.Fatalf("delegated attribute remained cacheable for %s", got)
+	}
+	if got := registry.remaining(name, stamp, 9, clock.Now()); got != 0 {
+		t.Fatalf("pre-watermark name remained cacheable for %s", got)
+	}
+	if got := registry.remaining(name, stamp, 10, clock.Now()); got <= 0 {
+		t.Fatalf("watermark name was not cacheable: %s", got)
+	}
+
+	entry := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 11, Kind: authoritypb.ChangeKind_CHANGE_KIND_NAMESPACE_CHANGED, ParentIdentity: identity[:], Name: []byte("file")}
+	batch := &authoritypb.ChangeBatch{Incarnation: 7, Entries: []*authoritypb.ChangeEntry{entry}}
+	if err := registry.registerChangeBatch(7, batch); err != nil {
+		t.Fatalf("register change: %v", err)
+	}
+	if got := registry.remaining(name, stamp, 11, clock.Now()); got != 0 {
+		t.Fatalf("pre-withdrawal stamp remained cacheable for %s", got)
+	}
+	fresh := registry.stamp()
+	if got := registry.remaining(name, fresh, 10, clock.Now()); got != 0 {
+		t.Fatalf("reply older than coordinate version remained cacheable for %s", got)
+	}
+	if got := registry.remaining(name, fresh, 11, clock.Now()); got <= 0 {
+		t.Fatalf("fresh reply at change version was not cacheable: %s", got)
+	}
+
+	clock.advance(9 * time.Second)
+	if got := registry.remaining(name, fresh, 11, clock.Now()); got != 0 {
+		t.Fatalf("cache survived conservative horizon for %s", got)
+	}
+}
+
+func TestSubscriptionAckFollowsProvenWithdrawal(t *testing.T) {
+	clock := &subscriptionTestClock{now: time.Unix(200, 0)}
+	log := make([]string, 0, 4)
+	rpc := &subscriptionTestRPC{horizon: clock.Now().Add(10 * time.Second), log: &log}
+	invalidator := &subscriptionTestInvalidator{log: &log}
+	registry := newSubscriptionTestRegistry(clock, rpc, invalidator, nil)
+	registry.mu.Lock()
+	registry.active, registry.incarnation = true, 3
+	registry.horizon, registry.cacheUntil = rpc.horizon, rpc.horizon.Add(-time.Second)
+	registry.mu.Unlock()
+	identity := subscriptionIdentity(3)
+	entry := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 4, Kind: authoritypb.ChangeKind_CHANGE_KIND_DATA_CHANGED, Identity: identity[:]}
+	batch := &authoritypb.ChangeBatch{Incarnation: 3, Entries: []*authoritypb.ChangeEntry{entry}}
+	if err := registry.registerChangeBatch(3, batch); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	queue := newSubscriptionChangeQueue()
+	if err := queue.push(batch); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- registry.changeLoop(ctx, 3, queue) }()
+	deadline := time.After(time.Second)
+	for {
+		rpc.mu.Lock()
+		acked := len(rpc.acks) != 0
+		rpc.mu.Unlock()
+		if acked {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("change acknowledgment did not arrive")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	queue.close()
+	<-done
+	want := []string{"close", "invalidate", "open", "ack"}
+	if len(log) != len(want) {
+		t.Fatalf("withdrawal log = %v, want %v", log, want)
+	}
+	for index := range want {
+		if log[index] != want[index] {
+			t.Fatalf("withdrawal log = %v, want %v", log, want)
+		}
+	}
+}
+
+func TestSubscriptionFailedNotifyMarksIdentityStaleWithoutAck(t *testing.T) {
+	clock := &subscriptionTestClock{now: time.Now()}
+	rpc := &subscriptionTestRPC{horizon: clock.Now().Add(time.Second)}
+	invalidator := &subscriptionTestInvalidator{fail: errors.New("notify busy")}
+	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{
+		clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: 5 * time.Millisecond,
+		maxPages: 2, invalidator: invalidator,
+	})
+	registry.mu.Lock()
+	registry.active, registry.incarnation = true, 9
+	registry.horizon, registry.cacheUntil = time.Now().Add(time.Second), time.Now().Add(time.Second)
+	registry.mu.Unlock()
+	identity := subscriptionIdentity(9)
+	entry := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 1, Kind: authoritypb.ChangeKind_CHANGE_KIND_ATTRIBUTES_CHANGED, Identity: identity[:]}
+	batch := &authoritypb.ChangeBatch{Incarnation: 9, Entries: []*authoritypb.ChangeEntry{entry}}
+	if err := registry.registerChangeBatch(9, batch); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	queue := newSubscriptionChangeQueue()
+	if err := queue.push(batch); err != nil {
+		t.Fatalf("queue: %v", err)
+	}
+	if err := registry.changeLoop(context.Background(), 9, queue); err == nil {
+		t.Fatal("change loop accepted an unconfirmed invalidation")
+	}
+	if len(invalidator.stale) != 1 || invalidator.stale[0] != identity {
+		t.Fatalf("stale identities = %x, want %x", invalidator.stale, identity)
+	}
+	if len(rpc.acks) != 0 {
+		t.Fatalf("acknowledged unconfirmed invalidation: %v", rpc.acks)
+	}
+}
+
+func TestSubscriptionPollDeliversDelegationWhileWithdrawalBlocked(t *testing.T) {
+	clock := &subscriptionTestClock{now: time.Now()}
+	identity := subscriptionIdentity(4)
+	change := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 1, Kind: authoritypb.ChangeKind_CHANGE_KIND_ATTRIBUTES_CHANGED, Identity: identity[:]}
+	rpc := &subscriptionTestRPC{events: []*authoritypb.ControlEvent{
+		{Incarnation: 5, Sequence: 1, Event: &authoritypb.ControlEvent_ChangeBatch{ChangeBatch: &authoritypb.ChangeBatch{Incarnation: 5, Entries: []*authoritypb.ChangeEntry{change}}}},
+		{Incarnation: 5, Sequence: 2, Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{Identity: identity[:]}}},
+	}}
+	unblock := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	invalidator := &subscriptionTestInvalidator{block: unblock, entered: entered}
+	control := &subscriptionTestControl{delivered: make(chan struct{}, 1)}
+	registry := newSubscriptionTestRegistry(clock, rpc, invalidator, control)
+	registry.mu.Lock()
+	registry.active, registry.incarnation = true, 5
+	registry.horizon, registry.cacheUntil = clock.Now().Add(time.Minute), clock.Now().Add(time.Minute)
+	registry.mu.Unlock()
+	queue := newSubscriptionChangeQueue()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	changeDone := make(chan error, 1)
+	go func() { changeDone <- registry.changeLoop(ctx, 5, queue) }()
+	pollDone := make(chan error, 1)
+	go func() { pollDone <- registry.pollLoop(ctx, 5, queue) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("withdrawal never entered invalidation")
+	}
+	select {
+	case <-control.delivered:
+	case <-time.After(time.Second):
+		t.Fatal("delegation event was blocked behind withdrawal")
+	}
+	close(unblock)
+	cancel()
+	queue.close()
+	<-changeDone
+	<-pollDone
+}
+
+func TestSubscriptionSuspendDrainsWorkersBeforeResume(t *testing.T) {
+	clock := &subscriptionTestClock{now: time.Now()}
+	rpc := &subscriptionTestRPC{}
+	registry := newSubscriptionTestRegistry(clock, rpc, &subscriptionTestInvalidator{}, nil)
+	registry.mu.Lock()
+	registry.active, registry.incarnation = true, 12
+	registry.horizon, registry.cacheUntil = clock.Now().Add(time.Minute), clock.Now().Add(time.Minute)
+	registry.mu.Unlock()
+	done := make(chan error, 1)
+	go func() { done <- registry.serveIncarnation(context.Background()) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		registry.mu.RLock()
+		serving := registry.serveDone
+		registry.mu.RUnlock()
+		select {
+		case <-serving:
+			if time.Now().After(deadline) {
+				t.Fatal("subscription workers did not start")
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		default:
+		}
+		break
+	}
+	registry.suspend()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := registry.drainSuspended(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, errSubscriptionExpired) {
+		t.Fatalf("serve after suspension = %v, want expiration", err)
+	}
+	if stamp := registry.stamp(); stamp != (subscriptionStamp{}) {
+		t.Fatalf("suspended subscription issued stamp %+v", stamp)
+	}
+	registry.resume()
+	registry.mu.RLock()
+	paused := registry.paused
+	registry.mu.RUnlock()
+	if paused {
+		t.Fatal("resume left subscription paused")
+	}
+}
+
+func TestSubscriptionHorizonInvalidatesAllCaches(t *testing.T) {
+	now := time.Now()
+	rpc := &subscriptionTestRPC{
+		horizon: now.Add(time.Minute),
+		pages: []*authoritypb.SubscribeReply{{
+			Watermark: 2, Incarnation: 24, HorizonNanos: uint64(time.Minute), SnapshotId: []byte("replacement"),
+		}},
+	}
+	invalidator := &subscriptionTestInvalidator{}
+	control := &subscriptionTestControl{}
+	registry := newSubscriptionRegistryWithConfig(nil, rpc, control, subscriptionConfig{
+		clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: time.Millisecond,
+		maxPages: 2, invalidator: invalidator,
+	})
+	registry.mu.Lock()
+	registry.active, registry.incarnation = true, 23
+	registry.horizon = now.Add(30 * time.Millisecond)
+	registry.cacheUntil = now.Add(15 * time.Millisecond)
+	registry.mu.Unlock()
+
+	err := registry.serveIncarnation(context.Background())
+	if !errors.Is(err, errSubscriptionExpired) {
+		t.Fatalf("serve at horizon = %v, want subscription expiry", err)
+	}
+	invalidator.mu.Lock()
+	invalidations := invalidator.all
+	invalidator.mu.Unlock()
+	if invalidations != 1 {
+		t.Fatalf("cold invalidations after horizon = %d, want 1", invalidations)
+	}
+	if stamp := registry.stamp(); stamp != (subscriptionStamp{}) {
+		t.Fatalf("expired subscription issued stamp %+v", stamp)
+	}
+	if err := registry.subscribe(context.Background()); err != nil {
+		t.Fatalf("cold subscribe after horizon: %v", err)
+	}
+	control.mu.Lock()
+	fences := slices.Clone(control.fences)
+	incarnation := control.incarnation
+	control.mu.Unlock()
+	if len(fences) != 1 || incarnation != 24 {
+		t.Fatalf("cold recovery delegation fence/incarnation = %v/%d, want one fence then 24", fences, incarnation)
+	}
+}
+
+func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
+	fixture := newStrictFixture(t)
+	root := fixture.raw.acquire(1)
+	if root == nil {
+		t.Fatal("root inode")
+	}
+	defer fixture.raw.release(root)
+	negative := nameKey{parent: root.id, name: "absent"}
+	fixture.raw.mu.Lock()
+	fixture.raw.bindCachedNegativeLocked(negative, subscriptionStamp{incarnation: 1, generation: 1, version: 1})
+	fixture.raw.mu.Unlock()
+	epochRecord, errno := fixture.raw.intern(context.Background(), testItem(78, authoritypb.Attr_REGULAR, 78))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	repairableRecord, errno := fixture.raw.intern(context.Background(), testItem(79, authoritypb.Attr_REGULAR, 79))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	epochRecord.stale.Store(true)
+	epochRecord.node.stale.Store(true)
+	epochRecord.node.epochStale.Store(true)
+	repairableRecord.stale.Store(true)
+	repairableRecord.node.stale.Store(true)
+
+	if err := fixture.raw.invalidateAllCaches(context.Background()); err != nil {
+		t.Fatalf("cold invalidation: %v", err)
+	}
+	if !epochRecord.stale.Load() || !epochRecord.node.stale.Load() || !epochRecord.node.epochStale.Load() {
+		t.Fatal("cold subscription resurrected an old-epoch inode")
+	}
+	if repairableRecord.stale.Load() || repairableRecord.node.stale.Load() {
+		t.Fatal("cold subscription retained repairable coherence staleness")
+	}
+	fixture.raw.mu.Lock()
+	_, retainedNegative := fixture.raw.cachedNegatives[negative]
+	fixture.raw.mu.Unlock()
+	if retainedNegative {
+		t.Fatal("cold subscription retained a daemon negative entry")
+	}
+	fixture.notify.mu.Lock()
+	defer fixture.notify.mu.Unlock()
+	foundNegativeNotify := false
+	for _, call := range fixture.notify.calls {
+		if call.kind == "entry" && call.parent == root.id && call.name == negative.name {
+			foundNegativeNotify = true
+		}
+	}
+	if !foundNegativeNotify {
+		t.Fatal("cold subscription did not withdraw the kernel negative dentry")
+	}
+}
+
+func TestUnlicensedReadRemainsIndexedUntilPostWritePurge(t *testing.T) {
+	fixture := newStrictFixture(t)
+	record, errno := fixture.raw.intern(context.Background(), testItem(80, authoritypb.Attr_REGULAR, 80))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	unique := fixture.unique.Add(2)
+	ctx, finish, status := fixture.raw.mutationContext(unique)
+	if !status.Ok() {
+		t.Fatal(status)
+	}
+	if !fixture.raw.beginBufferedRead(ctx, record) {
+		t.Fatal("buffered read was not admitted")
+	}
+	finish()
+	fixture.mount.subscription.deactivate()
+	if _, _, payloadStatus := fixture.raw.PrepareReplyPayload(unique, record.id, 15, nil, nil, 0); !payloadStatus.Ok() {
+		t.Fatalf("prepare unlicensed READ reply: %v", payloadStatus)
+	}
+
+	coordinate := publicationCoordinate{kind: publicationItemData, item: record.identity}
+	fixture.raw.mu.Lock()
+	publication := fixture.raw.replyPublications[unique]
+	_, indexed := fixture.raw.dataPublications[record.identity][publication]
+	unlicensed := publication != nil && len(publication.unlicensed) == 1
+	fixture.raw.mu.Unlock()
+	if !indexed || !unlicensed {
+		t.Fatalf("finalized unlicensed READ = indexed %t unlicensed %t, want true/true", indexed, unlicensed)
+	}
+
+	notifyEntered := make(chan struct{}, 1)
+	notifyRelease := make(chan struct{})
+	fixture.notify.mu.Lock()
+	fixture.notify.block = notifyRelease
+	fixture.notify.onInode = func(uint64, int64, int64) { notifyEntered <- struct{}{} }
+	fixture.notify.mu.Unlock()
+	closeDone := make(chan error, 1)
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), time.Second)
+	defer cancelClose()
+	go func() { closeDone <- fixture.raw.closeCacheCoordinate(closeCtx, coordinate) }()
+	replyDone := make(chan struct{})
+	go func() {
+		fixture.raw.ReplyWritten(unique, fuse.OK)
+		close(replyDone)
+	}()
+	select {
+	case <-notifyEntered:
+	case <-time.After(time.Second):
+		close(notifyRelease)
+		t.Fatal("unlicensed READ did not enter its post-write purge")
+	}
+	select {
+	case err := <-closeDone:
+		close(notifyRelease)
+		t.Fatalf("coordinate withdrawal crossed the blocked post-write purge: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(notifyRelease)
+	select {
+	case <-replyDone:
+	case <-time.After(time.Second):
+		t.Fatal("unlicensed READ reply did not settle after its purge")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coordinate withdrawal did not resume after physical reply drain")
+	}
+	fixture.raw.mu.Lock()
+	_, retained := fixture.raw.dataPublications[record.identity][publication]
+	fixture.raw.mu.Unlock()
+	if retained || fixture.raw.ReplyWriteTracked(unique) {
+		t.Fatal("settled READ remained in the per-identity publication index")
+	}
+}
+
+func TestCancelledBufferedReadReleasesIdentityIndex(t *testing.T) {
+	fixture := newStrictFixture(t)
+	record, errno := fixture.raw.intern(context.Background(), testItem(81, authoritypb.Attr_REGULAR, 81))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	unique := fixture.unique.Add(2)
+	ctx, finish, status := fixture.raw.mutationContext(unique)
+	if !status.Ok() {
+		t.Fatal(status)
+	}
+	if !fixture.raw.beginBufferedRead(ctx, record) {
+		t.Fatal("buffered read was not admitted")
+	}
+	fixture.raw.mu.Lock()
+	publication := fixture.raw.replyPublications[unique]
+	fixture.raw.mu.Unlock()
+	fixture.raw.cancelBufferedRead(ctx, record)
+	finish()
+
+	fixture.raw.mu.Lock()
+	_, indexed := fixture.raw.dataPublications[record.identity][publication]
+	fixture.raw.mu.Unlock()
+	if indexed {
+		t.Fatal("canceled READ leaked its per-identity publication index")
+	}
+	if fixture.raw.ReplyWriteTracked(unique) {
+		t.Fatal("empty canceled READ retained physical reply tracking")
+	}
+}
+
+var benchmarkSubscriptionDuration time.Duration
+
+func BenchmarkSubscriptionCachePermission(b *testing.B) {
+	clock := &subscriptionTestClock{now: time.Unix(500, 0)}
+	registry := newSubscriptionTestRegistry(clock, &subscriptionTestRPC{}, &subscriptionTestInvalidator{}, nil)
+	registry.mu.Lock()
+	registry.active = true
+	registry.incarnation = 31
+	registry.generation = 1
+	registry.watermark = 1
+	registry.horizon = clock.Now().Add(time.Hour)
+	registry.cacheUntil = registry.horizon.Add(-time.Second)
+	registry.mu.Unlock()
+	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: subscriptionIdentity(31), name: "benchmark"}
+	stamp := registry.stamp().withVersion(1)
+	now := clock.Now()
+	b.ReportAllocs()
+	b.ResetTimer()
+	var remaining time.Duration
+	for range b.N {
+		remaining = registry.remaining(coordinate, stamp, stamp.version, now)
+	}
+	benchmarkSubscriptionDuration = remaining
+}
+
+func BenchmarkSubscriptionChangeAdmission(b *testing.B) {
+	clock := &subscriptionTestClock{now: time.Unix(600, 0)}
+	registry := newSubscriptionTestRegistry(clock, &subscriptionTestRPC{}, &subscriptionTestInvalidator{}, nil)
+	registry.mu.Lock()
+	registry.active = true
+	registry.incarnation = 32
+	registry.horizon = clock.Now().Add(time.Hour)
+	registry.cacheUntil = registry.horizon.Add(-time.Second)
+	registry.mu.Unlock()
+	identity := subscriptionIdentity(32)
+	entry := &authoritypb.ChangeEntry{
+		Kind: authoritypb.ChangeKind_CHANGE_KIND_ATTRIBUTES_CHANGED, Identity: identity[:],
+	}
+	batch := &authoritypb.ChangeBatch{Incarnation: 32, Entries: []*authoritypb.ChangeEntry{entry}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		position := uint64(index + 1)
+		entry.Position = position
+		entry.VolumeVersion = position
+		if err := registry.registerChangeBatch(32, batch); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

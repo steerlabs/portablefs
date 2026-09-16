@@ -16,8 +16,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
-// CoherenceProfile is the retained local spelling of protocol 6's one exact
-// lease-backed kernel-cache contract. Zero remains invalid so a caller cannot
+// CoherenceProfile is the retained local spelling of protocol 7's one exact
+// subscription kernel-cache contract. Zero remains invalid so a caller cannot
 // accidentally mount with unspecified local semantics.
 type CoherenceProfile uint8
 
@@ -31,9 +31,9 @@ func (p CoherenceProfile) String() string {
 }
 
 const (
-	// strictEntryTimeout is retained as a policy ceiling, but protocol 6 always
+	// strictEntryTimeout is retained as a policy ceiling, but protocol 7 always
 	// publishes kernel entry validity as zero. strictAttrTimeout is likewise
-	// only a ceiling; an exact reply-local A-R grant supplies the real lifetime.
+	// only a ceiling; the subscription horizon supplies the real lifetime.
 	//
 	// One minute is chosen as the largest value that still bounds the blast
 	// radius of a future repair defect to a single human-noticeable interval.
@@ -74,10 +74,10 @@ const (
 	// the budget is sized for lock hand-off, not for I/O.
 	defaultRepairBudget = 15 * time.Second
 
-	// leaseControlReserve is the authority in-flight slot that only the lease
+	// subscriptionControlReserve is the authority in-flight slot that only the lease
 	// CONTROL loop may occupy. Acknowledging is what releases the mutating
 	// machine, so this loop must never queue behind bulk kernel I/O.
-	leaseControlReserve = 1
+	subscriptionControlReserve = 1
 )
 
 // MountAbsenceProof is the official supervisor's local observation that this
@@ -96,7 +96,7 @@ func (p MountAbsenceProof) valid() bool {
 
 // nameKey is one daemon-cached directory binding. The parent is the inode
 // number the authority publishes in attributes; the stable parent identity is
-// tracked separately in the exact N-lease coordinate.
+// tracked separately in the exact namespace coordinate.
 type nameKey struct {
 	parent uint64
 	name   string
@@ -202,7 +202,8 @@ func completeDefiniteNoChangePublication(ctx context.Context) error {
 }
 
 func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(), fuse.Status) {
-	ctx := r.opContext()
+	r.mount.epochMu.RLock()
+	ctx, cancel := context.WithTimeout(r.opContext(), r.requestTimeout)
 	callback := &mutationCallback{mount: r.mount, operationID: unique}
 	if err := r.registerReplyPublication(unique, &callback.publication); err != nil {
 		// Registration is the ownership reservation for every fact this callback
@@ -210,10 +211,14 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 		// impossible zero/reused FUSE identity cannot race an untracked success
 		// reply onto /dev/fuse.
 		r.mount.revoke(err)
+		r.mount.epochMu.RUnlock()
+		cancel()
 		return ctx, func() {}, fuse.Status(syscall.ENOTCONN)
 	}
 	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
 	return ctx, func() {
+		defer r.mount.epochMu.RUnlock()
+		defer cancel()
 		r.publishPostStateAttrs(ctx)
 		callback.finish()
 		r.finishReplyPublicationRegistration(unique, &callback.publication)
@@ -503,9 +508,9 @@ func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 	r.cachedNames = make(map[nameKey]*inodeRecord)
 	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
 	r.cachedNameStable = make(map[nameKey]publicationNamespace)
-	r.cachedNameLeases = make(map[nameKey]leaseStamp)
+	r.cachedNameStamps = make(map[nameKey]subscriptionStamp)
 	r.cachedNegatives = make(map[nameKey]struct{})
-	r.cachedNegativeLeases = make(map[nameKey]leaseStamp)
+	r.cachedNegativeStamps = make(map[nameKey]subscriptionStamp)
 	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
 	r.cachedAttrPayloads = make(map[publicationIdentity]cachedAttrPayload)
 	r.cachedData = make(map[uint64]*inodeRecord)
@@ -791,6 +796,7 @@ func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 // interface so lease invalidation can be tested without a kernel; *fuse.Server
 // is the only production implementation.
 type kernelNotifier interface {
+	EntryNotify(parent uint64, name string) fuse.Status
 	// InodeNotify(node, -1, 0) withdraws cached attributes only, which is what
 	// an A recall owes. InodeNotify(node, 0, 0) asks stock FUSE to invalidate
 	// the entire inode data range and its attributes for a D recall.

@@ -24,7 +24,7 @@ import (
 
 var (
 	ErrTransportUncertain = errors.New("authorityrpc: connection ended before the operation outcome was received")
-	ErrAuthorityChanged   = errors.New("authorityrpc: authority epoch changed; remount is required")
+	ErrAuthorityChanged   = errors.New("authorityrpc: authority epoch changed; cold session reattach is required")
 	ErrSessionEnded       = errors.New("authorityrpc: authority session ended; remount is required")
 	// ErrReplayDesynchronized is terminal. It means the authority recorded a
 	// replay identity this client did not submit, which invalidates exact-once
@@ -59,8 +59,8 @@ type ClientConfig struct {
 	// sessions and must be dialed through DialRouteAdminClient.
 	Purpose authoritypb.SessionPurpose
 	// FrontendProfile selects one immutable cache-coherence contract for the
-	// complete session. Linux mounts use exact N/A/D/E leases; FSKit mounts use
-	// the platform synchronous-repair stream and never receive cache leases.
+	// complete session. Linux mounts use volume subscriptions and file write
+	// delegations; FSKit mounts use the platform synchronous-repair stream.
 	FrontendProfile authoritypb.FrontendProfile
 	// The FSKit repair declaration is mandatory only for FSKIT_SYNC_REPAIR and
 	// forbidden for every other profile.
@@ -172,45 +172,52 @@ type Client struct {
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
 	// be able to reconnect and make progress independently.
-	lifecycle              sync.Mutex
-	data                   *clientTransport
-	control                *clientTransport
-	connectionSetID        [32]byte
-	attachAttemptID        [32]byte
-	ordinary               lane
-	blocking               lane
-	leaseControl           lane
-	liveness               lane
-	epoch                  []byte
-	helloFeatures          []string
-	negotiatedFrame        uint32
-	negotiatedInFlight     uint32
-	proof                  *authoritypb.SessionProof
-	root                   *authoritypb.Item
-	routesRevision         [32]byte
-	authorizationDeadline  time.Time
-	maxRead                uint32
-	maxWrite               uint32
-	maxFskitWrite          uint64
-	lease                  time.Duration
-	leaseCursor            *authoritypb.LeaseEventCursor
-	fskitRepairCursor      *authoritypb.VisibilityCursor
-	sessionReauthorization atomic.Bool
-	poisoned               atomic.Bool
-	closed                 atomic.Bool
-	fatalMu                sync.Mutex
-	fatalErr               error
-	fatalDone              chan struct{}
-	fatalPendingDone       chan struct{}
-	fatalPending           bool
-	fatalPendingPublished  bool
-	fatalPublished         bool
-	localEnforcementDone   bool
-	fatalDrainTimer        *time.Timer
-	responseConsumptions   map[*responseConsumption]struct{}
-	preMountReleaseMu      sync.Mutex
-	preMountReleaseDone    chan struct{}
-	preMountReleaseErr     error
+	lifecycle                sync.Mutex
+	data                     *clientTransport
+	control                  *clientTransport
+	connectionSetID          [32]byte
+	attachAttemptID          [32]byte
+	ordinary                 lane
+	blocking                 lane
+	repairControl            lane
+	controlPoll              lane
+	controlAck               lane
+	liveness                 lane
+	epoch                    []byte
+	helloFeatures            []string
+	negotiatedFrame          uint32
+	negotiatedInFlight       uint32
+	proof                    *authoritypb.SessionProof
+	root                     *authoritypb.Item
+	routesRevision           [32]byte
+	authorizationDeadline    time.Time
+	maxRead                  uint32
+	maxWrite                 uint32
+	maxFskitWrite            uint64
+	lease                    time.Duration
+	subscriptionMu           sync.Mutex
+	subscriptionSnapshot     []byte
+	subscriptionWatermark    uint64
+	subscriptionIncarnation  uint64
+	subscriptionHorizonNanos uint64
+	subscriptionDeadline     time.Time
+	fskitRepairCursor        *authoritypb.VisibilityCursor
+	sessionReauthorization   atomic.Bool
+	poisoned                 atomic.Bool
+	closed                   atomic.Bool
+	fatalMu                  sync.Mutex
+	fatalErr                 error
+	fatalDone                chan struct{}
+	fatalPendingDone         chan struct{}
+	fatalPending             bool
+	fatalPendingPublished    bool
+	fatalPublished           bool
+	localEnforcementDone     bool
+	fatalDrainTimer          *time.Timer
+	responseConsumptions     map[*responseConsumption]struct{}
+	preMountReleaseMu        sync.Mutex
+	preMountReleaseDone      chan struct{}
+	preMountReleaseErr       error
 	// testAfterResponseParsed pauses the retained mutation path after readLoop
 	// has delivered a complete frame but before the frontend caller can consume
 	// it. Nil in production.
@@ -272,7 +279,7 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 			if cfg.FskitCachedNameCapacity != 0 || cfg.FskitRepairBudget != 0 ||
 				cfg.FskitNamespaceRepair != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
-				return nil, errors.New("authorityrpc: Linux lease profile cannot declare FSKit repair state")
+				return nil, errors.New("authorityrpc: Linux subscription profile cannot declare FSKit repair state")
 			}
 		case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
 			if cfg.FskitCachedNameCapacity == 0 || cfg.FskitCachedNameCapacity > math.MaxUint32 ||
@@ -309,12 +316,14 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	split := cfg.ReplaySlots - uint32(blockingLimit)
 	c := &Client{
 		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
-		data:         newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
-		control:      newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
-		ordinary:     lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
-		blocking:     lane{permits: make(chan struct{}, blockingLimit), slots: slots[split:], base: split},
-		leaseControl: lane{permits: make(chan struct{}, 1)},
-		liveness:     lane{permits: make(chan struct{}, 1)},
+		data:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
+		control:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
+		ordinary:      lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
+		blocking:      lane{permits: make(chan struct{}, blockingLimit), slots: slots[split:], base: split},
+		repairControl: lane{permits: make(chan struct{}, 1)},
+		controlPoll:   lane{permits: make(chan struct{}, 1)},
+		controlAck:    lane{permits: make(chan struct{}, 1)},
+		liveness:      lane{permits: make(chan struct{}, 1)},
 	}
 	connectionSetID, err := randomProtocolIdentity()
 	if err != nil {
@@ -628,15 +637,14 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 		!equalBytes(active.GetRoutesRevision(), c.cfg.RoutesRevision[:]) {
 		return errors.New("authorityrpc: activation did not confirm the exact routing revision")
 	}
-	leaseCursor := active.GetLeaseCursor()
 	fskitCursor := active.GetFskitRepairCursor()
 	switch c.cfg.FrontendProfile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
-		if leaseCursor == nil || leaseCursor.GetSequence() != 0 || leaseCursor.GetPhase() != authoritypb.LeaseEventPhase_LEASE_EVENT_PHASE_UNSPECIFIED || fskitCursor != nil {
-			return errors.New("authorityrpc: authority returned invalid Linux lease activation state")
+		if active.GetLeaseCursor() != nil || fskitCursor != nil {
+			return errors.New("authorityrpc: authority returned obsolete Linux lease activation state")
 		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
-		if leaseCursor != nil || fskitCursor == nil || fskitCursor.GetSequence() == 0 ||
+		if active.GetLeaseCursor() != nil || fskitCursor == nil || fskitCursor.GetSequence() == 0 ||
 			fskitCursor.GetPhase() != authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE ||
 			c.maxFskitWrite < RequiredFskitWriteBytes {
 			return errors.New("authorityrpc: authority returned invalid FSKit repair activation state")
@@ -651,9 +659,6 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	c.lease = lease
 	if active.GetAuthorizationDeadlineUnixNanos() != 0 {
 		c.authorizationDeadline = authorizationDeadline
-	}
-	if leaseCursor != nil {
-		c.leaseCursor = proto.Clone(leaseCursor).(*authoritypb.LeaseEventCursor)
 	}
 	if fskitCursor != nil {
 		c.fskitRepairCursor = proto.Clone(fskitCursor).(*authoritypb.VisibilityCursor)
@@ -690,6 +695,37 @@ func (c *Client) Reconnect(ctx context.Context) error {
 		return c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL)
 	}
 	return nil
+}
+
+// RecoverEpoch creates a fresh epoch-scoped session while leaving
+// the ended client intact for already-admitted callers to observe their
+// terminal result. The frontend first makes every old server handle
+// permanently stale and drops non-durable buffered state, then swaps in the
+// returned client, subscribes cold, and closes the old client. Reusing the old
+// Client in place would let an operation admitted under an old handle race onto
+// the new session, where capabilities and replay slots have unrelated meaning.
+func (c *Client) RecoverEpoch(ctx context.Context) (*Client, error) {
+	if c == nil || ctx == nil {
+		return nil, syscall.EINVAL
+	}
+	if !errors.Is(c.SessionEndCause(), ErrAuthorityChanged) {
+		return nil, errors.New("authorityrpc: epoch reattach requested without an observed epoch change")
+	}
+	c.lifecycle.Lock()
+	cfg := c.cfg
+	cfg.AccessToken = append([]byte(nil), c.cfg.AccessToken...)
+	oldEpoch := append([]byte(nil), c.epoch...)
+	c.lifecycle.Unlock()
+
+	replacement, err := DialClient(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("authorityrpc: attach replacement epoch: %w", err)
+	}
+	if equalBytes(oldEpoch, replacement.Epoch()) {
+		_ = replacement.Close()
+		return nil, errors.New("authorityrpc: replacement session retained the ended authority epoch")
+	}
+	return replacement, nil
 }
 
 func (c *Client) Root() *authoritypb.Item {
@@ -889,14 +925,10 @@ func (c *Client) InitialAuthorizationDeadline() time.Time {
 	return c.authorizationDeadline
 }
 
-func (c *Client) InitialLeaseCursor() *authoritypb.LeaseEventCursor {
-	c.lifecycle.Lock()
-	defer c.lifecycle.Unlock()
-	if c.leaseCursor == nil {
-		return nil
-	}
-	return proto.Clone(c.leaseCursor).(*authoritypb.LeaseEventCursor)
-}
+// InitialLeaseCursor remains as a nil-valued ABI accessor for the shared
+// portablefsd attachment checks. Protocol 7 activation rejects a non-nil lease
+// cursor and the Linux client has no executable lease-event path.
+func (c *Client) InitialLeaseCursor() *authoritypb.LeaseEventCursor { return nil }
 
 func (c *Client) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
 	c.lifecycle.Lock()
@@ -908,7 +940,8 @@ func (c *Client) InitialVisibilityCursor() *authoritypb.VisibilityCursor {
 }
 
 // VisibilityRepairBudget is the exact per-phase deadline declared by this
-// FSKit mount at Attach. Linux lease mounts have no platform repair budget.
+// FSKit mount at Attach. Linux subscription mounts have no platform repair
+// budget because their horizon and invalidation budget are wire-defined.
 func (c *Client) VisibilityRepairBudget() time.Duration {
 	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return 0
@@ -917,8 +950,8 @@ func (c *Client) VisibilityRepairBudget() time.Duration {
 }
 
 // NextVisibility long-polls the FSKit synchronous-repair stream. The method
-// name is retained at the daemon boundary; the protocol-6 wire body is
-// explicitly profile-scoped and cannot be sent by a Linux lease mount.
+// name is retained at the daemon boundary; the wire body is explicitly
+// profile-scoped and cannot be sent by a Linux subscription mount.
 func (c *Client) NextVisibility(ctx context.Context, after *authoritypb.VisibilityCursor) (*authoritypb.VisibilityEvent, error) {
 	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return nil, syscall.EOPNOTSUPP
@@ -930,10 +963,10 @@ func (c *Client) NextVisibility(ctx context.Context, after *authoritypb.Visibili
 		return nil, err
 	}
 	if response.GetErrno() != 0 {
-		return nil, c.endStrictMount(syscall.Errno(response.GetErrno()))
+		return nil, c.endFSKitMount(syscall.Errno(response.GetErrno()))
 	}
 	if response.GetFskitRepair() == nil {
-		return nil, c.endStrictMount(errors.New("authorityrpc: FSKit repair poll returned no event"))
+		return nil, c.endFSKitMount(errors.New("authorityrpc: FSKit repair poll returned no event"))
 	}
 	return proto.Clone(response.GetFskitRepair()).(*authoritypb.VisibilityEvent), nil
 }
@@ -958,143 +991,17 @@ func (c *Client) AckVisibilityWithContention(ctx context.Context, cursor *author
 		return err
 	}
 	if response.GetErrno() != 0 {
-		return c.endStrictMount(syscall.Errno(response.GetErrno()))
+		return c.endFSKitMount(syscall.Errno(response.GetErrno()))
 	}
 	return nil
 }
 
-// endStrictMount makes a lease-control protocol failure terminal. Once the
-// authority can no longer prove this mount participates in recalls, serving
-// from its kernel cache is unsafe.
-func (c *Client) endStrictMount(cause error) error {
+// endFSKitMount makes a synchronous-repair protocol failure terminal. The
+// Linux subscription profile handles coherence refusal by horizon expiry and
+// cold resubscription instead of ending the mount.
+func (c *Client) endFSKitMount(cause error) error {
 	c.signalSessionEnd(ErrSessionEnded)
 	return cause
-}
-
-// NextLeaseEvent long-polls the exact next protocol-6 recall phase. The zero
-// cursor returned at activation begins the stream.
-func (c *Client) NextLeaseEvent(ctx context.Context, after *authoritypb.LeaseEventCursor) (*authoritypb.LeaseEvent, error) {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return nil, syscall.EOPNOTSUPP
-	}
-	response, err := c.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{
-		NextLeaseEvent: &authoritypb.NextLeaseEventRequest{After: after},
-	}})
-	if err != nil {
-		return nil, err
-	}
-	if response.GetErrno() != 0 {
-		return nil, c.endStrictMount(syscall.Errno(response.GetErrno()))
-	}
-	if response.GetLeaseEvent() == nil {
-		return nil, c.endStrictMount(errors.New("authorityrpc: lease poll returned no event"))
-	}
-	if err := ValidateLeaseEvent(response.GetLeaseEvent()); err != nil {
-		return nil, c.endStrictMount(err)
-	}
-	return proto.Clone(response.GetLeaseEvent()).(*authoritypb.LeaseEvent), nil
-}
-
-// AcknowledgeLeaseEvent accepts REVOKE with no discharges and COMPLETE with one
-// exact recall-to-none discharge per lease. The last cursor is idempotent.
-func (c *Client) AcknowledgeLeaseEvent(ctx context.Context, cursor *authoritypb.LeaseEventCursor, discharges []*authoritypb.LeaseDischarge) error {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return syscall.EOPNOTSUPP
-	}
-	if cursor == nil || cursor.GetSequence() == 0 {
-		return syscall.EINVAL
-	}
-	request := &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{
-		AcknowledgeLeaseEvent: &authoritypb.AcknowledgeLeaseEventRequest{Cursor: cursor, Discharges: discharges},
-	}}
-	response, err := c.Call(ctx, request)
-	if err != nil {
-		return err
-	}
-	if response.GetErrno() != 0 {
-		return c.endStrictMount(syscall.Errno(response.GetErrno()))
-	}
-	if response.GetAcknowledgeLeaseEvent() == nil {
-		return c.endStrictMount(errors.New("authorityrpc: lease acknowledgment returned no result"))
-	}
-	return nil
-}
-
-// AcknowledgeSourceLeaseDischarge releases a changed mutation's source-side
-// barrier. The frontend first purges named A/D/E caches before callback return,
-// then calls this synchronously after the physical kernel reply write.
-func (c *Client) AcknowledgeSourceLeaseDischarge(ctx context.Context, sequence uint64) error {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return syscall.EOPNOTSUPP
-	}
-	if sequence == 0 {
-		return syscall.EINVAL
-	}
-	response, err := c.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeSourceLeaseDischarge{
-		AcknowledgeSourceLeaseDischarge: &authoritypb.AcknowledgeSourceLeaseDischargeRequest{Sequence: sequence},
-	}})
-	if err != nil {
-		return err
-	}
-	if response.GetErrno() != 0 {
-		return c.endStrictMount(syscall.Errno(response.GetErrno()))
-	}
-	if response.GetAcknowledgeSourceLeaseDischarge() == nil {
-		return c.endStrictMount(errors.New("authorityrpc: source lease discharge returned no result"))
-	}
-	return nil
-}
-
-// RenewLeases refreshes exact live epochs and returns coordinate withdrawals
-// for tokens which expired or lost to a concurrent recall.
-// requestStarted must be sampled before Call so response delay shortens, never
-// lengthens, the local monotonic validity window.
-func (c *Client) RenewLeases(ctx context.Context, leases []*authoritypb.LeaseRenewal) (LeaseRenewalOutcome, error) {
-	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
-		return LeaseRenewalOutcome{}, syscall.EOPNOTSUPP
-	}
-	if len(leases) == 0 {
-		return LeaseRenewalOutcome{}, syscall.EINVAL
-	}
-	seen := make(map[string]struct{}, len(leases))
-	for _, renewal := range leases {
-		key, err := wireLeaseRenewalKey(renewal)
-		if err != nil {
-			return LeaseRenewalOutcome{}, err
-		}
-		if _, duplicate := seen[key]; duplicate {
-			return LeaseRenewalOutcome{}, syscall.EINVAL
-		}
-		seen[key] = struct{}{}
-	}
-	combined := LeaseRenewalOutcome{}
-	for start := 0; start < len(leases); start += maxLeasesPerControlMessage {
-		end := min(start+maxLeasesPerControlMessage, len(leases))
-		outcome, err := c.renewLeaseChunk(ctx, leases[start:end])
-		if err != nil {
-			return LeaseRenewalOutcome{}, err
-		}
-		combined.Grants = append(combined.Grants, outcome.Grants...)
-		combined.Withdrawn = append(combined.Withdrawn, outcome.Withdrawn...)
-	}
-	return combined, nil
-}
-
-func (c *Client) renewLeaseChunk(ctx context.Context, leases []*authoritypb.LeaseRenewal) (LeaseRenewalOutcome, error) {
-	requestStarted := time.Now()
-	response, err := c.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_RenewLeases{
-		RenewLeases: &authoritypb.RenewLeasesRequest{Leases: leases},
-	}})
-	if err != nil {
-		return LeaseRenewalOutcome{}, err
-	}
-	if response.GetErrno() != 0 {
-		return LeaseRenewalOutcome{}, syscall.Errno(response.GetErrno())
-	}
-	if response.GetRenewLeases() == nil {
-		return LeaseRenewalOutcome{}, errors.New("authorityrpc: lease renewal returned no result")
-	}
-	return ValidateLeaseRenewalOutcome(leases, response.GetRenewLeases(), requestStarted)
 }
 
 // ApplyRoutes installs a new machine-local routing declaration for the whole
@@ -1289,7 +1196,12 @@ func (c *Client) signalSessionEnd(err error) {
 		c.fatalMu.Unlock()
 		return
 	}
-	if c.fatalDrainTimer == nil {
+	// An epoch change is a recoverable coherence boundary. Recovery stales every
+	// old handle and waits for already-admitted replies to cross their physical
+	// publication boundary; forcing their callbacks through the terminal
+	// revocation hook would abort the mount that is meant to reattach. Transport
+	// death and uncertain outcomes retain the bounded fail-closed drain.
+	if c.fatalDrainTimer == nil && !errors.Is(c.fatalErr, ErrAuthorityChanged) {
 		timeout := c.cfg.CancelDrainTimeout
 		if timeout <= 0 {
 			// DialClient requires a positive bound. Keep directly constructed test
@@ -1483,13 +1395,19 @@ func (c *Client) forceResponseConsumptionDrain() {
 }
 
 func (c *Client) laneFor(request *authoritypb.Request) *lane {
-	if request.GetNextLeaseEvent() != nil || request.GetAcknowledgeLeaseEvent() != nil ||
-		request.GetNextFskitRepair() != nil || request.GetAckFskitRepair() != nil {
-		return &c.leaseControl
+	if request.GetNextControlEvent() != nil {
+		return &c.controlPoll
+	}
+	if request.GetSubscribe() != nil || request.GetChangeAck() != nil ||
+		request.GetDelegationRecallAck() != nil || request.GetDelegationBreakAck() != nil ||
+		request.GetDelegationModeChangeAck() != nil || request.GetDelegationRelease() != nil {
+		return &c.controlAck
+	}
+	if request.GetNextFskitRepair() != nil || request.GetAckFskitRepair() != nil {
+		return &c.repairControl
 	}
 	if request.GetReauthorize() != nil || request.GetKeepAlive() != nil || request.GetDetach() != nil ||
-		request.GetTerminalDeliveryReceipt() != nil || request.GetRenewLeases() != nil ||
-		request.GetAcknowledgeSourceLeaseDischarge() != nil {
+		request.GetTerminalDeliveryReceipt() != nil || request.GetRenewSubscription() != nil {
 		return &c.liveness
 	}
 	if blockingWait(request) {
@@ -1534,6 +1452,10 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 		request.GetActivate() != nil || request.GetAbortAttach() != nil || request.GetCancel() != nil {
 		return nil, syscall.EINVAL
 	}
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
+		obsoleteLinuxLeaseRequest(request) {
+		return nil, syscall.EOPNOTSUPP
+	}
 	if _, err := roleForRequest(request); err != nil {
 		return nil, syscall.EINVAL
 	}
@@ -1544,6 +1466,11 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 		return nil, ctx.Err()
 	}
 	return admitted, nil
+}
+
+func obsoleteLinuxLeaseRequest(request *authoritypb.Request) bool {
+	return request.GetNextLeaseEvent() != nil || request.GetAcknowledgeLeaseEvent() != nil ||
+		request.GetRenewLeases() != nil || request.GetAcknowledgeSourceLeaseDischarge() != nil
 }
 
 // dispatchOwned performs one round trip, stamping and sending a request the
@@ -1558,6 +1485,10 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 }
 
 func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
+		obsoleteLinuxLeaseRequest(request) {
+		return nil, nil, syscall.EOPNOTSUPP
+	}
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT &&
 		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
 		return nil, nil, syscall.EOPNOTSUPP
@@ -1645,8 +1576,11 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {
 	switch c.cfg.FrontendProfile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
-		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
-			return fmt.Errorf("%w: Linux lease session received FSKit response state", ErrTransportBinding)
+		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil ||
+			response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil ||
+			response.GetAcknowledgeSourceLeaseDischarge() != nil || response.GetSourceLeaseDischarge() != nil ||
+			response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
+			return fmt.Errorf("%w: Linux subscription session received obsolete lease or FSKit response state", ErrTransportBinding)
 		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
 		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil ||
@@ -1970,7 +1904,8 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 				c.signalSessionEnd(errors.New("authorityrpc: authority response carried a malformed terminal delivery token"))
 			}
 		}
-		if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+		if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE &&
+			c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 			c.signalSessionEnd(ErrSessionEnded)
 		}
 		// The volume's routing topology moved under this mount. Continuing would

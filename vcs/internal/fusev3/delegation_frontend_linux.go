@@ -1,0 +1,208 @@
+//go:build linux
+
+package fusev3
+
+import (
+	"context"
+	"errors"
+	"syscall"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
+	"google.golang.org/protobuf/proto"
+)
+
+func bufferErrno(err error) syscall.Errno {
+	if err == nil {
+		return 0
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno
+	}
+	return syscall.EIO
+}
+
+func captureServedVersion(ctx context.Context, response *authoritypb.Response) {
+	if response == nil {
+		return
+	}
+	if p := replyPublicationFromContext(ctx); p != nil {
+		version := response.GetVolumeVersion()
+		if version != 0 && (p.servedVersion == 0 || version < p.servedVersion) {
+			p.servedVersion = version
+		}
+	}
+}
+
+func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.Delegation) error {
+	manager := n.mount.delegations
+	if grant != nil {
+		if err := manager.Install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant); err != nil {
+			return err
+		}
+	} else if manager.Owns(n.item.GetStableIdentity()) {
+		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token); err != nil {
+			return err
+		}
+	}
+	handle.lossObserved = manager.IdentityLoss(n.item.GetStableIdentity())
+	return nil
+}
+
+type acquiredDelegationHandleKey struct{}
+type acquiredDelegationHandle struct{ token []byte }
+
+// A recalled open description remains usable. A subsequent mutation obtains a
+// fresh grant, but the old grant is never used to admit another buffer entry.
+func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) error {
+	if n.stale.Load() || (handle != nil && handle.stale.Load()) {
+		return syscall.EIO
+	}
+	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
+		return nil
+	}
+	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true}}})
+	if errno != 0 {
+		return errno
+	}
+	opened := response.GetOpen()
+	if opened == nil || opened.GetDelegation() == nil || len(opened.GetHandle()) == 0 {
+		return syscall.EIO
+	}
+	token := opened.GetHandle()
+	if handle != nil {
+		token = handle.token
+	}
+	if err := n.mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation()); err != nil {
+		return err
+	}
+	if handle == nil {
+		if acquired, _ := ctx.Value(acquiredDelegationHandleKey{}).(*acquiredDelegationHandle); acquired != nil {
+			acquired.token = cloneBytes(token)
+		}
+	}
+	if handle != nil {
+		_, errno = n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
+		if errno != 0 {
+			return errno
+		}
+	}
+	return nil
+}
+
+func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Errno {
+	if base == nil {
+		return syscall.EIO
+	}
+	attrs, err := n.mount.delegations.OverlayAttributes(n.item.GetStableIdentity(), writeback.Attributes{
+		Mode: base.GetMode(), Size: base.GetSize(), ATimeNS: base.GetAtimeNs(), MTimeNS: base.GetMtimeNs(),
+		HasMode: true, HasSize: true, HasATime: true, HasMTime: true,
+	})
+	if err != nil {
+		return bufferErrno(err)
+	}
+	attr := proto.Clone(base).(*authoritypb.Attr)
+	if attrs.HasMode {
+		attr.Mode = attrs.Mode
+	}
+	if attrs.HasSize {
+		attr.Size = attrs.Size
+	}
+	if attrs.HasATime {
+		attr.AtimeNs = attrs.ATimeNS
+	}
+	if attrs.HasMTime {
+		attr.MtimeNs = attrs.MTimeNS
+	}
+	fillAttr(attr, &out.Attr, n.mount.uid, n.mount.gid)
+	// Holder attributes come from a live daemon overlay, never a kernel timeout.
+	out.SetTimeout(0)
+	return 0
+}
+
+func (n *node) invalidateOwnData(ctx context.Context, offset, length int64) error {
+	r := n.mount.raw
+	if r == nil {
+		return nil
+	}
+	identity, ok := publicationIdentityFromItem(n.item)
+	if !ok {
+		return syscall.EIO
+	}
+	coordinate := publicationCoordinate{kind: publicationItemData, item: identity}
+	if err := r.closeCacheCoordinate(ctx, coordinate); err != nil {
+		return err
+	}
+	defer r.openCacheCoordinate(coordinate)
+	var byteRange *authoritypb.ByteRange
+	if offset >= 0 && length > 0 {
+		byteRange = &authoritypb.ByteRange{Offset: uint64(offset), Length: uint64(length)}
+	}
+	if err := r.invalidateCacheCoordinateContext(ctx, coordinate, byteRange); err != nil {
+		r.markIdentityStale(identity)
+		return err
+	}
+	return nil
+}
+
+// F4 uses the same exact namespace cut as source publication. A cold name is
+// resolved before flushing; it must never make a dirty inode invisible to the
+// dependency check simply because its daemon name payload was evicted.
+func (m *Mount) flushNamespaceDependencies(ctx context.Context, request *authoritypb.Request, lease *sourcePublicationLease) error {
+	type named struct {
+		parent []byte
+		name   []byte
+	}
+	var names []named
+	switch body := request.GetBody().(type) {
+	case *authoritypb.Request_Unlink:
+		names = append(names, named{body.Unlink.Parent, body.Unlink.Name})
+	case *authoritypb.Request_Rename:
+		names = append(names, named{body.Rename.OldParent, body.Rename.OldName}, named{body.Rename.NewParent, body.Rename.NewName})
+	case *authoritypb.Request_Link:
+		for coordinate := range lease.coordinates {
+			if coordinate.kind == publicationItemAttributes {
+				if _, err := m.delegations.FlushIdentity(ctx, coordinate.item[:]); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	default:
+		return nil
+	}
+	allKnown := len(lease.preBindings) == len(lease.names)
+	if allKnown {
+		for _, identity := range lease.preBindings {
+			if _, err := m.delegations.FlushIdentity(ctx, identity[:]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, name := range names {
+		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: cloneBytes(name.parent), Name: cloneBytes(name.name)}}})
+		if err != nil {
+			return err
+		}
+		errno := responseErrno(response)
+		if errno == syscall.ENOENT {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		item := response.GetLookup().GetItem()
+		if item == nil {
+			continue
+		}
+		_, flushErr := m.delegations.FlushIdentity(ctx, item.GetStableIdentity())
+		m.deferReclaim(item.GetToken())
+		if flushErr != nil {
+			return flushErr
+		}
+	}
+	return nil
+}

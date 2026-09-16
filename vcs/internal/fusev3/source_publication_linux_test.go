@@ -5,7 +5,6 @@ package fusev3
 import (
 	"context"
 	"fmt"
-	"syscall"
 	"testing"
 	"time"
 
@@ -406,10 +405,10 @@ func TestUnresolvedCreateIgnoresUnrelatedRecallAndAllowsUnrelatedPublication(t *
 		t.Fatal(err)
 	}
 	unrelated := publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(testIdentity(112))}
-	if err := fixture.raw.closeLeaseCoordinate(context.Background(), unrelated); err != nil {
+	if err := fixture.raw.closeCacheCoordinate(context.Background(), unrelated); err != nil {
 		t.Fatal(err)
 	}
-	defer fixture.raw.openLeaseCoordinate(unrelated)
+	defer fixture.raw.openCacheCoordinate(unrelated)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -463,15 +462,7 @@ func TestReplyDiscoveredCoordinateCoOwnershipSurvivesEitherReleaseOrder(t *testi
 			if err := replyLease.markAssigned(); err != nil {
 				t.Fatal(err)
 			}
-			recall := &authoritypb.LeaseRecall{
-				Coordinate:  &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, Identity: childIdentity[:]},
-				Right:       authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ,
-				GrantEpoch:  1,
-				RevokeEpoch: 2,
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-			defer cancel()
-			if err := replyLease.attachDischarge(ctx, &authoritypb.SourceLeaseDischarge{Sequence: 1, Recalls: []*authoritypb.LeaseRecall{recall}}); err != nil {
+			if err := replyLease.attachCoordinates(map[publicationCoordinate]struct{}{coordinate: {}}); err != nil {
 				t.Fatalf("co-own reply-discovered coordinate: %v", err)
 			}
 			fixture.raw.mu.Lock()
@@ -526,157 +517,54 @@ func TestSourceDischargeBindsUnknownChildBeforePurging(t *testing.T) {
 	fixture := newStrictFixture(t)
 	parent := testItem(115, authoritypb.Attr_DIRECTORY, 115)
 	child := testItem(116, authoritypb.Attr_REGULAR, 116)
-	childRecord, errno := fixture.raw.intern(context.Background(), child)
-	if errno != 0 {
-		t.Fatal(errno)
-	}
-	if childRecord == nil {
-		t.Fatal("child record")
-	}
 	childIdentity, _ := publicationIdentityFromItem(child)
-	attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: childIdentity}
-
-	// Admit an attribute reply before the create owns the child identity. It is
-	// not cache state yet: the physical reply edge below performs the install.
-	attrUnique := fixture.unique.Add(2)
-	attrCtx, attrFinish, status := fixture.raw.mutationContext(attrUnique)
-	if !status.Ok() {
-		t.Fatal(status)
-	}
-	now := time.Now()
-	grants, err := validateLeaseGrants([]*authoritypb.LeaseGrant{attrGrant(childIdentity[:], 1, 1)}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if accepted := fixture.mount.leases.install(grants, now); len(accepted) != 1 {
-		t.Fatalf("installed attribute grants = %d, want 1", len(accepted))
-	} else {
-		publication := replyPublicationFromContext(attrCtx)
-		publication.leaseGrants = accepted
-		publication.cacheStamp = &cacheSnapshot{ObjectVersion: 1, SnapshotSequence: 1}
-	}
-	attrOut := &fuse.AttrOut{}
-	fixture.raw.publishAttr(attrCtx, attrOut, childIdentity, child.GetAttr())
-	if len(replyPublicationFromContext(attrCtx).attrs) != 1 {
-		t.Fatal("attribute reply was not admitted for caching")
-	}
-	attrFinish()
+	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: childIdentity}
+	done := make(chan struct{})
 	fixture.raw.mu.Lock()
-	publishing := fixture.raw.sourcePublishing[attrCoordinate]
-	_, installedEarly := fixture.raw.cachedAttrs[childIdentity]
+	fixture.raw.replyPublications[41] = &replyPublication{attrs: []replyAttrPublication{{coordinate: coordinate}}, originalFinalized: true, originalDone: done}
+	fixture.raw.sourcePublishing[coordinate] = 1
 	fixture.raw.mu.Unlock()
-	if publishing != 1 || installedEarly {
-		t.Fatalf("staged attribute publication = publishing %d installed %t, want 1/false", publishing, installedEarly)
-	}
-
-	recall := &authoritypb.LeaseRecall{
-		Coordinate:  &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, Identity: childIdentity[:]},
-		Right:       authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ,
-		GrantEpoch:  1,
-		RevokeEpoch: 2,
-	}
-	discharge := &authoritypb.SourceLeaseDischarge{Sequence: 17, Recalls: []*authoritypb.LeaseRecall{recall}}
-	fixture.rpc.mu.Lock()
-	fixture.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetCreate() == nil {
-			return nil, fmt.Errorf("unexpected authority request %T", request.GetBody())
-		}
-		return &authoritypb.Response{
-			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{
-				Item: cloneItem(child), Handle: testToken(216),
-			}},
-			SourceLeaseDischarge: discharge,
-		}, nil
-	}
-	authorityReturned := make(chan struct{})
-	fixture.rpc.afterMutation = func() { close(authorityReturned) }
-	fixture.rpc.mu.Unlock()
-	request, gate, err := createGateRequest(parent, "created")
+	gate, err := namespaceSourceGate(parent, "created", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceUnique := fixture.unique.Add(2)
-	sourceBase, sourceFinish, status := fixture.raw.mutationContext(sourceUnique)
-	if !status.Ok() {
-		t.Fatal(status)
+	lease, err := fixture.raw.acquireSourcePublication(context.Background(), gate)
+	if err != nil {
+		t.Fatal(err)
 	}
-	sourceCtx, cancelSource := context.WithTimeout(sourceBase, 2*time.Second)
-	defer cancelSource()
-	parentNode := &node{mount: fixture.mount, item: parent, requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
-	type mutationResult struct {
-		response *authoritypb.Response
-		errno    syscall.Errno
+	if err := lease.markAssigned(); err != nil {
+		t.Fatal(err)
 	}
-	mutationDone := make(chan mutationResult, 1)
+	attached := make(chan error, 1)
 	go func() {
-		response, mutationErrno := parentNode.mutateWithSource(sourceCtx, request, gate)
-		mutationDone <- mutationResult{response: response, errno: mutationErrno}
+		attached <- lease.attachBinding(context.Background(), publicationNamespace{parent: publicationIdentity(testIdentity(115)), name: "created"}, childIdentity)
 	}()
 	select {
-	case <-authorityReturned:
-	case <-time.After(time.Second):
-		t.Fatal("create response did not return from the authority")
+	case err := <-attached:
+		t.Fatalf("reply-discovered identity crossed its staged cache reply: %v", err)
+	case <-time.After(20 * time.Millisecond):
 	}
+	close(done)
+	fixture.raw.mu.Lock()
+	delete(fixture.raw.sourcePublishing, coordinate)
+	fixture.raw.signalSourceChangedLocked()
+	fixture.raw.mu.Unlock()
 	select {
-	case result := <-mutationDone:
-		t.Fatalf("source discharge crossed the unknown child's staged attribute reply: response=%v errno=%v", result.response, result.errno)
-	case <-time.After(25 * time.Millisecond):
-	}
-	fixture.rpc.mu.Lock()
-	acksBeforeDrain := append([]uint64(nil), fixture.rpc.sourceAcks...)
-	fixture.rpc.mu.Unlock()
-	if len(acksBeforeDrain) != 0 {
-		t.Fatalf("source discharge ACKs before reply drain = %v", acksBeforeDrain)
-	}
-
-	// The prior cache-installing reply lands, waking the exact drain. The
-	// discharge purge must then remove what that reply just installed.
-	if !fixture.raw.ReplyWriteTracked(attrUnique) {
-		t.Fatal("staged attribute reply lost physical-write tracking")
-	}
-	fixture.raw.ReplyWritten(attrUnique, fuse.OK)
-	select {
-	case result := <-mutationDone:
-		if result.errno != 0 || result.response == nil {
-			t.Fatalf("create after attribute drain = response %v errno %v", result.response, result.errno)
+	case err := <-attached:
+		if err != nil {
+			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("source discharge did not resume after the exact attribute reply drained")
+		t.Fatal("reply-discovered identity did not resume after exact reply drain")
 	}
-	fixture.raw.mu.Lock()
-	_, staleAttr := fixture.raw.cachedAttrs[childIdentity]
-	fixture.raw.mu.Unlock()
-	if staleAttr {
-		t.Fatal("source discharge left the drained attribute reply cached")
-	}
-	fixture.rpc.mu.Lock()
-	acksBeforeSourceReply := append([]uint64(nil), fixture.rpc.sourceAcks...)
-	fixture.rpc.mu.Unlock()
-	if len(acksBeforeSourceReply) != 0 {
-		t.Fatalf("source discharge ACKs before source reply = %v", acksBeforeSourceReply)
-	}
-
-	sourceLease := sourceLeaseFromContext(sourceCtx)
-	sourceLease.resolveAllNoBinding()
-	if err := completeSourcePublication(sourceCtx); err != nil {
+	if err := lease.markCallbackPublicationReady(); err != nil {
 		t.Fatal(err)
 	}
-	sourceFinish()
-	if !fixture.raw.ReplyWriteTracked(sourceUnique) {
-		t.Fatal("source reply lost physical-write tracking")
-	}
-	fixture.raw.ReplyWritten(sourceUnique, fuse.OK)
-	fixture.rpc.mu.Lock()
-	acks := append([]uint64(nil), fixture.rpc.sourceAcks...)
-	fixture.rpc.mu.Unlock()
-	if len(acks) != 1 || acks[0] != 17 {
-		t.Fatalf("source discharge ACKs = %v, want [17] after source reply", acks)
-	}
+	lease.release()
 }
 
 func TestSourceDischargeDoesNotWaitForExistingExactSourceGate(t *testing.T) {
 	fixture := newStrictFixture(t)
-	parent := testItem(117, authoritypb.Attr_DIRECTORY, 117)
 	child := testItem(118, authoritypb.Attr_REGULAR, 118)
 	childIdentity, _ := publicationIdentityFromItem(child)
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: childIdentity}
@@ -691,87 +579,27 @@ func TestSourceDischargeDoesNotWaitForExistingExactSourceGate(t *testing.T) {
 	if err := childLease.markAssigned(); err != nil {
 		t.Fatal(err)
 	}
-
-	recall := &authoritypb.LeaseRecall{
-		Coordinate:  &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, Identity: childIdentity[:]},
-		Right:       authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ,
-		GrantEpoch:  1,
-		RevokeEpoch: 2,
-	}
-	discharge := &authoritypb.SourceLeaseDischarge{Sequence: 18, Recalls: []*authoritypb.LeaseRecall{recall}}
-	fixture.rpc.mu.Lock()
-	fixture.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetCreate() == nil {
-			return nil, fmt.Errorf("unexpected authority request %T", request.GetBody())
-		}
-		return &authoritypb.Response{
-			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{
-				Item: cloneItem(child), Handle: testToken(218),
-			}},
-			SourceLeaseDischarge: discharge,
-		}, nil
-	}
-	fixture.rpc.mu.Unlock()
-	request, gate, err := createGateRequest(parent, "created")
-	if err != nil {
-		t.Fatal(err)
-	}
-	unique := fixture.unique.Add(2)
-	base, finish, status := fixture.raw.mutationContext(unique)
-	if !status.Ok() {
-		t.Fatal(status)
-	}
-	ctx, cancel := context.WithTimeout(base, 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	parentNode := &node{mount: fixture.mount, item: parent, requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
-	response, mutationErrno := parentNode.mutateWithSource(ctx, request, gate)
-	if mutationErrno != 0 || response == nil {
-		t.Fatalf("reply-discovered coordinate co-ownership = response %v errno %v", response, mutationErrno)
+	if err := fixture.raw.closeCacheCoordinate(ctx, coordinate); err != nil {
+		t.Fatalf("subscription withdrawal waited for an existing source gate: %v", err)
 	}
-	fixture.rpc.mu.Lock()
-	acksBeforeReply := append([]uint64(nil), fixture.rpc.sourceAcks...)
-	fixture.rpc.mu.Unlock()
-	if len(acksBeforeReply) != 0 {
-		t.Fatalf("source discharge ACKs before source reply = %v", acksBeforeReply)
-	}
+	fixture.raw.openCacheCoordinate(coordinate)
 	fixture.raw.mu.Lock()
-	allowedWhileBothHeld := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+	openedEarly := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
 	fixture.raw.mu.Unlock()
-	if allowedWhileBothHeld {
-		t.Fatal("reply-discovered coordinate reopened while the exact request remained in flight")
-	}
-
-	responseLease := sourceLeaseFromContext(ctx)
-	responseLease.resolveAllNoBinding()
-	if err := completeSourcePublication(ctx); err != nil {
-		t.Fatal(err)
-	}
-	finish()
-	if !fixture.raw.ReplyWriteTracked(unique) {
-		t.Fatal("source reply lost physical-write tracking")
-	}
-	fixture.raw.ReplyWritten(unique, fuse.OK)
-	fixture.rpc.mu.Lock()
-	acks := append([]uint64(nil), fixture.rpc.sourceAcks...)
-	fixture.rpc.mu.Unlock()
-	if len(acks) != 1 || acks[0] != 18 {
-		t.Fatalf("source discharge ACKs = %v, want [18] without releasing the exact request", acks)
-	}
-	fixture.raw.mu.Lock()
-	allowedAfterSourceReply := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
-	fixture.raw.mu.Unlock()
-	if allowedAfterSourceReply {
-		t.Fatal("source reply release reopened a coordinate still held by the exact request")
+	if openedEarly {
+		t.Fatal("cache withdrawal reopened a coordinate held by the exact source request")
 	}
 	if err := childLease.markCallbackPublicationReady(); err != nil {
 		t.Fatal(err)
 	}
 	childLease.release()
 	fixture.raw.mu.Lock()
-	allowedAfterBoth := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+	opened := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
 	fixture.raw.mu.Unlock()
-	if !allowedAfterBoth {
-		t.Fatal("final exact request release left the coordinate closed")
+	if !opened {
+		t.Fatal("final exact source release left the coordinate closed")
 	}
 }
 

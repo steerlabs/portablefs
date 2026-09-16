@@ -19,7 +19,6 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
-	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -130,6 +129,7 @@ type fakeRPC struct {
 	// response is returned to the frontend, allowing ordering tests to place a
 	// raw callback precisely on either side of transport delivery.
 	mutationStates       []*authoritypb.MutationState
+	applied              uint64
 	mutationSeq          uint64
 	afterMutation        func()
 	retainedConsumption  authorityrpc.ResponseConsumption
@@ -152,7 +152,7 @@ func newFakeRPC() *fakeRPC {
 		maxRead:      64 * 1024,
 		maxWrite:     64 * 1024,
 		readSequence: 1,
-		lease:        volumeserver.Protocol6MaxLeaseTTL,
+		lease:        10 * time.Second,
 		leaseEpoch:   1,
 		leaseIssued:  1,
 		missingNames: make(map[string]bool),
@@ -169,40 +169,31 @@ func (f *fakeRPC) SessionError() error                { return nil }
 func (f *fakeRPC) SessionEndPending() <-chan struct{} { return f.done }
 func (f *fakeRPC) SessionEndCause() error             { return nil }
 func (f *fakeRPC) FinishLocalSessionEnforcement()     {}
-func (f *fakeRPC) InitialLeaseCursor() *authoritypb.LeaseEventCursor {
-	return &authoritypb.LeaseEventCursor{}
+func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, time.Now().Add(10 * time.Second), nil
 }
-func (f *fakeRPC) NextLeaseEvent(ctx context.Context, _ *authoritypb.LeaseEventCursor) (*authoritypb.LeaseEvent, error) {
+func (f *fakeRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
+	return time.Now().Add(10 * time.Second), nil
+}
+func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after uint64) (*authoritypb.ControlEvent, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
-func (f *fakeRPC) AcknowledgeLeaseEvent(context.Context, *authoritypb.LeaseEventCursor, []*authoritypb.LeaseDischarge) error {
+func (f *fakeRPC) AcknowledgeChanges(context.Context, uint64, uint64) error { return nil }
+func (f *fakeRPC) AcknowledgeDelegationRecall(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error {
 	return nil
 }
-func (f *fakeRPC) AcknowledgeSourceLeaseDischarge(_ context.Context, sequence uint64) error {
-	f.mu.Lock()
-	f.sourceAcks = append(f.sourceAcks, sequence)
-	f.mu.Unlock()
+func (f *fakeRPC) AcknowledgeDelegationBreak(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error {
 	return nil
 }
-func (f *fakeRPC) RenewLeases(_ context.Context, renewals []*authoritypb.LeaseRenewal) (authorityrpc.LeaseRenewalOutcome, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	grants := make([]*authoritypb.LeaseGrant, 0, len(renewals))
-	for _, renewal := range renewals {
-		right := authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ
-		switch renewal.GetCoordinate().GetFamily() {
-		case authoritypb.LeaseFamily_LEASE_FAMILY_NAME:
-			right = authoritypb.LeaseRight_LEASE_RIGHT_NAME_READ
-		case authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES:
-			right = authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ
-		case authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION:
-			right = authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ
-		}
-		grants = append(grants, &authoritypb.LeaseGrant{Coordinate: proto.Clone(renewal.GetCoordinate()).(*authoritypb.LeaseCoordinate), Right: right, Epoch: renewal.GetEpoch(), ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued})
-	}
-	timed, err := authorityrpc.TimedLeaseGrants(grants, time.Now())
-	return authorityrpc.LeaseRenewalOutcome{Grants: timed}, err
+func (f *fakeRPC) AcknowledgeDelegationModeChange(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error {
+	return nil
+}
+func (f *fakeRPC) ReleaseDelegations(context.Context, uint64, []*authoritypb.DelegationRelease) error {
+	return nil
+}
+func (f *fakeRPC) Barrier(ctx context.Context, cut uint64) (*authoritypb.BarrierReply, error) {
+	return &authoritypb.BarrierReply{AppliedSequence: cut, DurableSequence: cut}, nil
 }
 
 func (f *fakeRPC) Close() error {
@@ -361,9 +352,34 @@ func (f *fakeRPC) noteCancel(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, error) {
+func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Response, resultErr error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	defer func() {
+		if result == nil {
+			return
+		}
+		if result.VolumeVersion == 0 {
+			result.VolumeVersion = max(f.readSequence, uint64(2))
+		}
+		if result.GetRead() != nil && result.GetRead().VolumeVersion == 0 {
+			result.GetRead().VolumeVersion = result.VolumeVersion
+		}
+		if result.AppliedSequence == 0 && (request.GetWrite() != nil || request.GetSetAttr() != nil || request.GetFallocate() != nil) {
+			f.applied++
+			result.AppliedSequence = f.applied
+		}
+		if f.replyOverride == nil && request.GetOpen() != nil && result.GetOpen() != nil {
+			result.GetOpen().CacheCapable = request.GetOpen().GetCacheCapable()
+			if request.GetOpen().GetWriteIntent() {
+				result.GetOpen().Delegation = testDelegation()
+			}
+		}
+		if request.GetCreate() != nil && result.GetCreate() != nil && request.GetCreate().GetWriteIntent() {
+			result.GetCreate().Delegation = testDelegation()
+		}
+		result.LeaseGrants = nil
+	}()
 	if f.replyOverride != nil {
 		return f.replyOverride(request)
 	}
@@ -387,6 +403,9 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		f.flushes = append(f.flushes, proto.Clone(request.GetFlush()).(*authoritypb.FlushRequest))
 	case request.GetFsync() != nil:
 		f.fsyncs = append(f.fsyncs, proto.Clone(request.GetFsync()).(*authoritypb.FsyncRequest))
+		return &authoritypb.Response{Body: &authoritypb.Response_Fsync{Fsync: &authoritypb.FsyncReply{DurableSequence: f.applied}}}, nil
+	case request.GetBarrier() != nil:
+		return &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{AppliedSequence: f.applied, DurableSequence: f.applied}}}, nil
 	case request.GetSyncFs() != nil:
 		f.syncFS++
 		return &authoritypb.Response{Body: &authoritypb.Response_SyncFs{SyncFs: &authoritypb.SyncFSReply{}}}, nil
@@ -443,17 +462,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 	case request.GetOpen() != nil:
 		response := &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: cloneBytes(f.handle)}}}
 		target := f.itemForTokenLocked(request.GetOpen().GetItem())
-		if request.GetOpen().GetFlags().GetRead() && !request.GetOpen().GetFlags().GetWrite() && target != nil {
-			family, right := authoritypb.LeaseFamily_LEASE_FAMILY_DATA, authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ
-			if target.GetAttr().GetKind() == authoritypb.Attr_DIRECTORY {
-				family, right = authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ
-			}
-			response.LeaseGrants = []*authoritypb.LeaseGrant{{
-				Coordinate: &authoritypb.LeaseCoordinate{Family: family, Identity: cloneBytes(target.GetStableIdentity())},
-				Right:      right, Epoch: f.leaseEpoch,
-				ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
-			}}
-		}
+
 		if request.GetOpen().GetFlags().GetTruncate() {
 			response.PostState = exactTestPostState(2, struct {
 				item  *authoritypb.Item
@@ -484,23 +493,15 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}
 		return &authoritypb.Response{
 			Body: &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: data}},
-			LeaseGrants: []*authoritypb.LeaseGrant{{
-				Coordinate: &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_DATA, Identity: cloneBytes(f.item.GetStableIdentity())},
-				Right:      authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ, Epoch: f.leaseEpoch, ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
-			}},
 		}, nil
 	case request.GetReadDir() != nil:
 		f.readdirs = append(f.readdirs, proto.Clone(request.GetReadDir()).(*authoritypb.ReadDirRequest))
-		enumerationGrants := []*authoritypb.LeaseGrant{{
-			Coordinate: &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, Identity: cloneBytes(f.root.GetStableIdentity())},
-			Right:      authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ, Epoch: f.leaseEpoch, ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
-		}}
 		if f.dirPageIndex >= len(f.dirPages) {
-			return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{Verifier: testToken(5), Eof: true}}, LeaseGrants: enumerationGrants}, nil
+			return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{Verifier: testToken(5), Eof: true}}}, nil
 		}
 		page := f.dirPages[f.dirPageIndex]
 		f.dirPageIndex++
-		return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: proto.Clone(page).(*authoritypb.ReadDirReply)}, LeaseGrants: enumerationGrants}, nil
+		return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: proto.Clone(page).(*authoritypb.ReadDirReply)}}, nil
 	case request.GetWrite() != nil:
 		f.writeRequests = append(f.writeRequests, proto.Clone(request).(*authoritypb.Request))
 		writeRequest := proto.Clone(request.GetWrite()).(*authoritypb.WriteRequest)
@@ -509,7 +510,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		postAttr := &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)}
 		return &authoritypb.Response{
 			PostState: testMutationPostState(postAttr),
-			Body:      &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(writeRequest.GetSize()), PostAttr: postAttr}},
+			Body:      &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(writeRequest.GetSize()), AssignedOffset: writeRequest.GetPosition(), PostAttr: postAttr}},
 		}, nil
 	case request.GetSetAttr() != nil:
 		f.setattrs = append(f.setattrs, request.GetSetAttr())
@@ -637,7 +638,11 @@ func testMount(t *testing.T, watermark int) (*Mount, *fakeRPC) {
 	mount.plannedMountpoint = t.TempDir()
 	root := &node{mount: mount, item: testItem(1, authoritypb.Attr_DIRECTORY, 0), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
 	newRawFileSystem(mount, root)
-	t.Cleanup(mount.cancel)
+	mount.setNotifier(&fakeNotifier{})
+	if err := mount.subscription.subscribe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mount.cancel(); mount.delegations.Stop() })
 	return mount, rpc
 }
 
@@ -721,11 +726,11 @@ func popReclaim(t *testing.T, mount *Mount) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	token, ok := mount.reclaim.pop(ctx)
+	entry, ok := mount.reclaim.pop(ctx)
 	if !ok {
 		t.Fatal("expected a queued reclaim")
 	}
-	return token
+	return entry.token
 }
 
 func waitFor(t *testing.T, what string, condition func() bool) {
@@ -764,14 +769,14 @@ func TestOpenCacheModeFollowsDataLeaseAndWriteCapability(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("Open errno = %v", errno)
 	}
-	if flags != 0 {
-		t.Fatalf("first D-R-backed read-only OPEN flags = %#x, want buffered purge-on-open", flags)
+	if flags != fuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("cache-capable read-only OPEN flags = %#x, want KEEP_CACHE", flags)
 	}
 	secondCtx, finishSecond := testMutationContext(t, mount)
 	_, secondFlags, errno := n.Open(secondCtx, syscall.O_RDONLY)
 	finishSecond(errno == 0)
 	if errno != 0 || secondFlags != fuse.FOPEN_KEEP_CACHE {
-		t.Fatalf("warm D-R-backed OPEN = (%#x, %v), want KEEP_CACHE", secondFlags, errno)
+		t.Fatalf("warm cache-capable OPEN = (%#x, %v), want KEEP_CACHE", secondFlags, errno)
 	}
 	ctx, finish := testMutationContext(t, mount)
 	_, _, createFlags, errno := n.Create(ctx, "child", syscall.O_RDWR|syscall.O_CREAT, 0o644)
@@ -994,6 +999,30 @@ func TestCleanupPressureThrottlesInterningAndNeverDestroysTheMount(t *testing.T)
 	}
 }
 
+func TestReclaimQueueBindsCapabilityToAuthorityEpoch(t *testing.T) {
+	oldTransport := newFakeRPC()
+	newTransport := newFakeRPC()
+	facade := newEpochRPC(oldTransport)
+	mount := &Mount{rpc: facade, reclaim: newReclaimQueue(4)}
+
+	mount.deferReclaim(testToken(1))
+	facade.mu.Lock()
+	facade.rpc = newTransport
+	facade.mu.Unlock()
+	mount.deferReclaim(testToken(2))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	first, ok := mount.reclaim.pop(ctx)
+	if !ok || first.transport != oldTransport {
+		t.Fatalf("old capability transport = %T, want original epoch", first.transport)
+	}
+	second, ok := mount.reclaim.pop(ctx)
+	if !ok || second.transport != newTransport {
+		t.Fatalf("new capability transport = %T, want replacement epoch", second.transport)
+	}
+}
+
 func TestForgetNeverBlocksUnderCleanupPressure(t *testing.T) {
 	frontend, mount, _ := testRawFileSystem(t, 1)
 	records := make([]*inodeRecord, 0, 64)
@@ -1193,8 +1222,8 @@ func TestGenericTerminalCauseCannotMaskAnExistingRouteCause(t *testing.T) {
 func TestLivenessAndCleanupLanesAreReserved(t *testing.T) {
 	cfg := testConfig(8)
 	mount, rpc := testMount(t, 8)
-	if cap(mount.bulk)+mount.reclaimWorkers+livenessReserve+leaseControlReserve != cfg.MaxInFlight {
-		t.Fatalf("bulk %d + cleanup %d + liveness %d + lease control %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, livenessReserve, leaseControlReserve, cfg.MaxInFlight)
+	if cap(mount.bulk)+mount.reclaimWorkers+livenessReserve+subscriptionControlReserve != cfg.MaxInFlight {
+		t.Fatalf("bulk %d + cleanup %d + liveness %d + lease control %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, livenessReserve, subscriptionControlReserve, cfg.MaxInFlight)
 	}
 	for range cap(mount.bulk) {
 		mount.bulk <- struct{}{}
@@ -1304,8 +1333,8 @@ func TestOpendirWithoutAnEnumerationLeaseOpensUncached(t *testing.T) {
 	if mount.isRevoked() {
 		t.Fatalf("OPENDIR without an E lease revoked the mount: %v", mount.fatalError())
 	}
-	if handle.pageLease != (leaseStamp{}) {
-		t.Fatalf("uncovered directory handle carries lease stamp %+v, want none", handle.pageLease)
+	if handle.pageStamp != (subscriptionStamp{}) {
+		t.Fatalf("uncovered directory handle carries lease stamp %+v, want none", handle.pageStamp)
 	}
 }
 
@@ -1502,7 +1531,7 @@ func testDirHandle(t *testing.T, frontend *rawFileSystem, pages ...*authoritypb.
 	if errno != 0 {
 		t.Fatal(errno)
 	}
-	rpc := frontend.mount.rpc.(*fakeRPC)
+	rpc := frontend.mount.rpc.(*epochRPC).current().(*fakeRPC)
 	rpc.dirPages = pages
 	rpc.root = cloneItem(record.node.item)
 	id, ok := frontend.addHandle(record, &handleRecord{dir: &dirHandle{node: record.node, token: testToken(100)}})
@@ -1895,6 +1924,9 @@ func TestSetattrProjectsSinglePrincipal(t *testing.T) {
 	if errno != 0 {
 		t.Fatal(errno)
 	}
+	if _, err := mount.delegations.FlushIdentity(context.Background(), n.item.GetStableIdentity()); err != nil {
+		t.Fatal(err)
+	}
 	if len(rpc.setattrs) != 1 || rpc.setattrs[0].Uid != nil || rpc.setattrs[0].Gid != nil || rpc.setattrs[0].GetMode() != 0o600 {
 		t.Fatalf("projected setattr = %#v", rpc.setattrs)
 	}
@@ -1909,18 +1941,24 @@ func TestSetattrPreservesServerClockNowIntent(t *testing.T) {
 	n := testNode(mount)
 	in := &fuse.SetAttrIn{}
 	in.Valid = fuse.FATTR_ATIME_NOW | fuse.FATTR_MTIME_NOW
+	before := time.Now().UnixNano()
 	_, errno := testVisibleMutation(t, mount, func(ctx context.Context) (struct{}, syscall.Errno) {
 		return struct{}{}, n.Setattr(ctx, nil, in, &fuse.AttrOut{})
 	})
 	if errno != 0 {
 		t.Fatal(errno)
 	}
+	if _, err := mount.delegations.FlushIdentity(context.Background(), n.item.GetStableIdentity()); err != nil {
+		t.Fatal(err)
+	}
 	if len(rpc.setattrs) != 1 {
 		t.Fatalf("setattr calls = %d, want 1", len(rpc.setattrs))
 	}
 	request := rpc.setattrs[0]
-	if !request.GetAtimeNow() || !request.GetMtimeNow() || request.AtimeNs != nil || request.MtimeNs != nil {
-		t.Fatalf("server-clock setattr intent lost: %#v", request)
+	// Writeback resolves NOW once at admission; retrying the immutable entry
+	// must retain those timestamps instead of moving them to flush time.
+	if request.GetAtimeNow() || request.GetMtimeNow() || request.AtimeNs == nil || request.MtimeNs == nil || request.GetAtimeNs() < before || request.GetMtimeNs() < before || request.GetAtimeNs() > time.Now().UnixNano() {
+		t.Fatalf("buffered timestamp intent lost: %#v", request)
 	}
 }
 
@@ -2161,4 +2199,8 @@ func (f *fakeRPC) DetachAfterUnmount(_ context.Context, proof MountAbsenceProof)
 	defer f.mu.Unlock()
 	f.detachProofs = append(f.detachProofs, proof)
 	return f.detachErr
+}
+
+func testDelegation() *authoritypb.Delegation {
+	return &authoritypb.Delegation{Id: testToken(700), Generation: 1, Mode: authoritypb.DelegationMode_DELEGATION_MODE_FULL}
 }
