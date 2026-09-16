@@ -727,3 +727,20 @@ func BenchmarkSubscriptionChangeAdmission(b *testing.B) {
 		}
 	}
 }
+
+func TestSubscriptionLocalPromotedOwnershipClosesCacheAdmission(t *testing.T) {
+	mount, _ := testMount(t, 8)
+	identity := delegationTestIdentity(24)
+	coordinate := publicationCoordinate{kind: publicationItemAttributes}
+	copy(coordinate.item[:], identity)
+	stamp := mount.subscription.stamp()
+	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got <= 0 {
+		t.Fatalf("initial permission=%v", got)
+	}
+	if err := mount.delegations.Install(identity, []byte{24, 1}, []byte{24, 2}, delegationTestGrant(56, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
+	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got != 0 {
+		t.Fatalf("locally owned identity retains cache permission=%v", got)
+	}
+}

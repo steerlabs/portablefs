@@ -238,6 +238,12 @@ func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp
 	if s == nil || stamp.incarnation == 0 {
 		return 0
 	}
+	// A private synchronous generation can become an owned delegation in its
+	// DATA reply without a source stream event. Local ownership is decisive,
+	// including when an older release event overtakes that reply.
+	if (coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData) && s.mount != nil && s.mount.delegations != nil && s.mount.delegations.Owns(coordinate.item[:]) {
+		return 0
+	}
 	if servedVersion == 0 {
 		servedVersion = stamp.version
 	}

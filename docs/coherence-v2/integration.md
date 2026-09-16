@@ -118,3 +118,30 @@ consecutive runs in `/tmp/cv2-g-focus-46.log`, with the writer delegation held
 across activation and the first listing. The same run passed the exact-access
 attach and local cache-admission tests three times. It is not a full-gate pass:
 metadata-cache timing and the racing-reader/writer test still failed.
+
+## Grant reply ordering and enumeration regression
+
+Stack capture found a circular wait in truncating OPEN: an activated delegation
+was not yet reported to its holder because the handler waited for peer withdrawal.
+A peer READ requested a break; its folio blocked kernel invalidation; the holder
+could not acknowledge the break until OPEN returned. Successful private mutations
+now return to reserved state while withdrawal finishes. A pending private cut
+retries reserved-read admission across that transition. Existing visible grants
+return their applied receipt before detached withdrawal, as exact-reference
+flushes already do. The focused racing-open test passed three consecutive runs
+in about 0.2 s each in `/tmp/cv2-g-reserve-52.log`, previously failing at 5 s.
+The coordinator regression also covers reads already waiting before promotion.
+
+The F3 replacement now interleaves 600 long immutable names with mutable slots
+and runs an independent peer creator/deleter throughout the walk. Every unchanged
+name appears exactly once; returned unique transient names cannot duplicate;
+ESTALE and nontermination fail. Three runs passed in `/tmp/cv2-g-reserve-50.log`.
+The install/enumeration stress no longer tolerates ESTALE.
+
+Cache-reuse fixtures now drain the Authority's exact stream prefix after
+asynchronous close before warming caches. A local empty delegation set alone
+could precede delivery of a queued grant/release pair. Metadata measurements take
+an explicit durable cut so buffered writes are counted; fewer pre-operation
+LOOKUPs are accepted, while follow-up GETATTR and operation counts retain their
+bounds. The same-name CREATE portion still exposes a ten-second stall and is
+under investigation; the full suite is not green yet.

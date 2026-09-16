@@ -264,10 +264,7 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				}
 				if pin != nil && response.GetErrno() == 0 && (req.GetCreate().GetWriteIntent() || req.GetOpen().GetWriteIntent()) {
 					op := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
-					op.delegation, retainedGrantErr = pin.RetainDelegation()
-					if retainedGrantErr == nil {
-						retainedGrantErr = h.rememberCoherenceDelegation(op.delegation)
-					}
+					op.reservation, op.delegation, retainedGrantErr = pin.RetainDelegation()
 				}
 				position = h.publishCoherenceCommit(req, cred.ID, identity, provisional, response, changes)
 				stampVisibilityTargets(changes, response.GetPostState())
@@ -292,7 +289,20 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				h.discardCoherenceOpenReply(cred.ID, response)
 				response = h.coherenceError(0, retainedGrantErr)
 			}
+			if err != nil {
+				return h.errorResponse(0, err, changes != nil)
+			}
 			op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
+			if position != 0 {
+				wait := func() { _ = h.Coherence.WaitWithdrawn(context.WithoutCancel(ctx), position, cred.ID) }
+				if response.GetAppliedSequence() != 0 && (coherenceFlushReference(req) != nil || op != nil && op.delegation.ID != 0) {
+					// The response is an application receipt. Holder cut acknowledgments must
+					// be able to pass a withdrawal of the holder's pending read publication.
+					go wait()
+				} else {
+					wait()
+				}
+			}
 			if op != nil && op.reservation != nil {
 				if response.GetErrno() != 0 {
 					op.reservation.Abort()
@@ -320,19 +330,6 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				}
 				if o := response.GetOpen(); o != nil && req.GetOpen().GetWriteIntent() {
 					o.Delegation = coherenceDelegationProto(op.delegation)
-				}
-			}
-			if err != nil {
-				return h.errorResponse(0, err, changes != nil)
-			}
-			if position != 0 {
-				wait := func() { _ = h.Coherence.WaitWithdrawn(context.WithoutCancel(ctx), position, cred.ID) }
-				if coherenceFlushReference(req) != nil && response.GetAppliedSequence() != 0 {
-					// The response is an application receipt. Holder cut acknowledgments must
-					// be able to pass a withdrawal of the holder's pending read publication.
-					go wait()
-				} else {
-					wait()
 				}
 			}
 			return response

@@ -10,6 +10,7 @@ import (
 var (
 	ErrDelegationStale = errors.New("volumeserver: stale delegation generation")
 	ErrDelegationBusy  = errors.New("volumeserver: delegation has an active operation")
+	errDelegationRetry = errors.New("volumeserver: delegation returned to reservation")
 	ErrDelegationAck   = errors.New("volumeserver: invalid delegation acknowledgment")
 )
 
@@ -199,18 +200,22 @@ func (c *CoherenceCoordinator) ReserveNew(token SubscriptionToken, identity [16]
 	if c.delegations[identity] != nil {
 		return nil, ErrDelegationBusy
 	}
-	return c.reserveLocked(s, identity, nil), nil
+	return c.reserveLocked(s, identity, nil, false), nil
 }
-func (c *CoherenceCoordinator) reserveLocked(s *changeSubscriber, identity [16]byte, turn *mutationSequencerWaiter) *DelegationReservation {
+func (c *CoherenceCoordinator) reserveLocked(s *changeSubscriber, identity [16]byte, turn *mutationSequencerWaiter, ephemeral bool) *DelegationReservation {
 	c.nextDelegation++
 	if c.nextDelegation == 0 {
 		panic("volumeserver: delegation generation exhausted")
 	}
 	// A volume-global generation avoids retaining one counter per deleted file.
-	r := &delegationRecord{owner: s, grant: Delegation{ID: c.nextDelegation, Identity: identity, Holder: s.token.Session, Generation: c.nextDelegation, Mode: c.modeLocked(identity, s.token.Session), State: DelegationReserved}}
+	r := &delegationRecord{owner: s, ephemeral: ephemeral, grant: Delegation{ID: c.nextDelegation, Identity: identity, Holder: s.token.Session, Generation: c.nextDelegation, Mode: c.modeLocked(identity, s.token.Session), State: DelegationReserved}}
 	c.delegations[identity] = r
 	s.held[identity] = r
-	r.position = c.appendLocked(StreamEvent{Kind: StreamChange, Change: ChangeEntry{Kind: DelegationGranted, Identity: identity, VolumeVersion: c.watermark}})
+	var source SessionID
+	if ephemeral {
+		source = s.token.Session
+	}
+	r.position = c.appendLocked(StreamEvent{Kind: StreamChange, Source: source, Change: ChangeEntry{Kind: DelegationGranted, Identity: identity, VolumeVersion: c.watermark}})
 	return &DelegationReservation{coordinator: c, record: r, turn: turn}
 }
 
@@ -219,6 +224,10 @@ func (c *CoherenceCoordinator) reserveLocked(s *changeSubscriber, identity [16]b
 // this queue, so A requesting B's identity and B requesting A's identity do
 // not form a cycle. Disjoint identities own independent sequencer keys.
 func (c *CoherenceCoordinator) Reserve(ctx context.Context, token SubscriptionToken, identity [16]byte) (*DelegationReservation, error) {
+	return c.reserve(ctx, token, identity, false)
+}
+
+func (c *CoherenceCoordinator) reserve(ctx context.Context, token SubscriptionToken, identity [16]byte, ephemeral bool) (*DelegationReservation, error) {
 	if identity == ([16]byte{}) {
 		return nil, ErrCoherenceIdentity
 	}
@@ -241,7 +250,7 @@ func (c *CoherenceCoordinator) Reserve(ctx context.Context, token SubscriptionTo
 		}
 		r := c.delegations[identity]
 		if r == nil {
-			reservation := c.reserveLocked(s, identity, turn)
+			reservation := c.reserveLocked(s, identity, turn, ephemeral)
 			c.mu.Unlock()
 			success = true
 			return reservation, nil
@@ -264,7 +273,7 @@ func (c *CoherenceCoordinator) Reserve(ctx context.Context, token SubscriptionTo
 			continue
 		}
 		c.mu.Unlock()
-		if _, err := c.cut(ctx, r, true); err != nil {
+		if _, err := c.cut(ctx, r, true); err != nil && !errors.Is(err, errDelegationRetry) {
 			return nil, err
 		}
 	}
@@ -398,7 +407,7 @@ func (c *CoherenceCoordinator) BeginSynchronousMutation(ctx context.Context, tok
 		return &DelegationFlush{coordinator: c, record: current}, nil
 	}
 	c.mu.Unlock()
-	r, err := c.Reserve(ctx, token, identity)
+	r, err := c.reserve(ctx, token, identity, true)
 	if err != nil {
 		return nil, err
 	}
@@ -516,6 +525,9 @@ func (c *CoherenceCoordinator) consume(ctx context.Context, identity [16]byte) (
 		if ready && !r.retired && r.grant.State != DelegationReserved {
 			c.mu.Unlock()
 			seq, err := c.cut(ctx, r, false)
+			if errors.Is(err, errDelegationRetry) {
+				continue
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -597,6 +609,9 @@ func (c *CoherenceCoordinator) Recall(ctx context.Context, identity [16]byte) er
 		}
 		c.mu.Unlock()
 		_, err := c.cut(ctx, r, true)
+		if errors.Is(err, errDelegationRetry) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -624,7 +639,11 @@ func (c *CoherenceCoordinator) cut(ctx context.Context, r *delegationRecord, rec
 				return seq, ctx.Err()
 			}
 			if !r.ephemeral {
+				reserved := r.grant.State == DelegationReserved
 				c.mu.Unlock()
+				if reserved {
+					return 0, errDelegationRetry
+				}
 				return c.cut(ctx, r, recall)
 			}
 			changed := c.notificationLocked()
@@ -733,31 +752,37 @@ type DelegationFlush struct {
 	once        sync.Once
 }
 
-// RetainDelegation promotes a private synchronous-mutation generation into a
-// client-visible grant. It must run after successful storage application and
-// before End, so a failed operation never leaks a grant absent from its reply.
-// Calling it for an already-visible same-holder generation is an idempotent
-// query for that exact grant.
-func (f *DelegationFlush) RetainDelegation() (Delegation, error) {
+// RetainDelegation preserves a successful synchronous operation's generation
+// for an OPEN/CREATE reply. A private generation returns to reserved state:
+// peer reads can drain pending cache withdrawals without asking an unreported
+// holder for a cut. End the storage pin, wait for mutation visibility, then
+// Grant immediately before publishing the DATA reply.
+func (f *DelegationFlush) RetainDelegation() (*DelegationReservation, Delegation, error) {
 	if f == nil {
-		return Delegation{}, ErrDelegationStale
+		return nil, Delegation{}, ErrDelegationStale
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.ended {
-		return Delegation{}, ErrDelegationStale
+		return nil, Delegation{}, ErrDelegationStale
 	}
 	c := f.coordinator
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := f.record
 	if r.retired || c.delegations[r.grant.Identity] != r || r.grant.State == DelegationReserved {
-		return Delegation{}, ErrDelegationStale
+		return nil, Delegation{}, ErrDelegationStale
 	}
-	r.grant.Mode = c.modeLocked(r.grant.Identity, r.grant.Holder)
-	r.ephemeral = false
+	if !r.ephemeral {
+		return nil, r.grant, nil
+	}
+	{
+		r.grant.State = DelegationReserved
+		r.closingReaders = false
+		r.ephemeral = false
+	}
 	c.signalLocked()
-	return r.grant, nil
+	return &DelegationReservation{coordinator: c, record: r}, Delegation{}, nil
 }
 
 func (c *CoherenceCoordinator) BeginFlush(token SubscriptionToken, identity [16]byte, id, generation uint64) (*DelegationFlush, error) {
@@ -830,7 +855,11 @@ func (c *CoherenceCoordinator) finishRetiredLocked(r *delegationRecord) {
 	// Release follows the final pinned flush's OnCommit, so clients cannot start
 	// caching while an admitted old-generation write is still applying.
 	delete(c.delegations, r.grant.Identity)
-	c.appendLocked(StreamEvent{Kind: StreamChange, Change: ChangeEntry{Kind: DelegationReleased, Identity: r.grant.Identity, VolumeVersion: c.watermark}})
+	var source SessionID
+	if r.ephemeral {
+		source = r.owner.token.Session
+	}
+	c.appendLocked(StreamEvent{Kind: StreamChange, Source: source, Change: ChangeEntry{Kind: DelegationReleased, Identity: r.grant.Identity, VolumeVersion: c.watermark}})
 }
 
 // ReleaseBatch validates the entire batch before changing any record. The

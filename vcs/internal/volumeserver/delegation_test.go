@@ -3,6 +3,7 @@ package volumeserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -424,18 +425,22 @@ func TestCoherenceSynchronousMutationRetainsSuccessfulGrant(t *testing.T) {
 		}
 	}
 	c.mu.Unlock()
-	grant, err := got.flush.RetainDelegation()
+	reservation, _, err := got.flush.RetainDelegation()
 	if err != nil {
 		t.Fatal(err)
 	}
 	got.flush.End(31)
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if live, ok := c.LookupDelegation(identity); !ok || live.ID != grant.ID || live.Generation != grant.Generation {
 		t.Fatalf("retained grant = %+v, %v", live, ok)
 	}
 	if grant.Mode != DelegationFull {
 		t.Fatalf("retained mode = %v, want current full mode", grant.Mode)
 	}
-	if _, err := got.flush.RetainDelegation(); !errors.Is(err, ErrDelegationStale) {
+	if _, _, err := got.flush.RetainDelegation(); !errors.Is(err, ErrDelegationStale) {
 		t.Fatalf("retain after End = %v", err)
 	}
 }
@@ -456,11 +461,15 @@ func TestCoherenceConcurrentSynchronousFailureCannotRetireRetainedGrant(t *testi
 	if _, ok := c.LookupDelegation(identity); !ok {
 		t.Fatal("failed operation retired a generation still pinned by its peer")
 	}
-	grant, err := second.RetainDelegation()
+	reservation, _, err := second.RetainDelegation()
 	if err != nil {
 		t.Fatal(err)
 	}
 	second.End(32)
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if live, ok := c.LookupDelegation(identity); !ok || live.ID != grant.ID {
 		t.Fatalf("concurrently retained grant = %+v, %v", live, ok)
 	}
@@ -926,6 +935,129 @@ func TestCoherenceReleaseCompletesPendingPeerCut(t *testing.T) {
 				if event.Kind == StreamLoss {
 					t.Fatal("release reported loss")
 				}
+			}
+		})
+	}
+}
+
+func TestCoherencePrivateMutationExcludesSourceUntilPromotion(t *testing.T) {
+	for _, promote := range []bool{false, true} {
+		c, _ := cv2Coordinator(t)
+		source, peer := cv2Subscribe(t, c, 1), cv2Subscribe(t, c, 2)
+		identity := [16]byte{94}
+		type result struct {
+			pin *DelegationFlush
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			pin, err := c.BeginSynchronousMutation(t.Context(), source, identity)
+			done <- result{pin, err}
+		}()
+		cv2Event(t, c, peer, StreamChange)
+		cv2AckAll(t, c, peer)
+		var pin *DelegationFlush
+		select {
+		case outcome := <-done:
+			if outcome.err != nil {
+				t.Fatal(outcome.err)
+			}
+			pin = outcome.pin
+		case <-time.After(time.Second):
+			t.Fatal("private mutation did not acquire")
+		}
+		var reservation *DelegationReservation
+		if promote {
+			var err error
+			reservation, _, err = pin.RetainDelegation()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		pin.End(7)
+		if promote {
+			grant, err := reservation.Grant(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.ReleaseAppliedBatch(source, []Delegation{grant}, []uint64{7}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		events, err := c.Poll(t.Context(), source, 0, nil, 8)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("source events=%v err=%v", events, err)
+		}
+		if events[0].Kind != StreamAdvance {
+			t.Fatal("private grant notified its source")
+		}
+		want := StreamAdvance
+		if promote {
+			want = StreamChange
+		}
+		if events[1].Kind != want {
+			t.Fatalf("promote=%v release kind=%v", promote, events[1].Kind)
+		}
+		peerEvents := cv2AckAll(t, c, peer)
+		if len(peerEvents) != 1 || peerEvents[0].Change.Kind != DelegationReleased {
+			t.Fatalf("peer release=%v", peerEvents)
+		}
+	}
+}
+
+func TestCoherencePromotedPrivateGrantDrainsPendingReaders(t *testing.T) {
+	for _, beforePromotion := range []bool{false, true} {
+		t.Run(fmt.Sprint(beforePromotion), func(t *testing.T) {
+			c, clock := cv2Coordinator(t)
+			holder := cv2Subscribe(t, c, 1)
+			identity := [16]byte{0x61}
+			pin, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := cv2Subscribe(t, c, 2)
+			type result struct {
+				guard *DataGuard
+				err   error
+			}
+			read := make(chan result, 1)
+			startRead := func() {
+				go func() { guard, err := c.DataConsumed(t.Context(), peer, identity); read <- result{guard, err} }()
+			}
+			if beforePromotion {
+				startRead()
+				clock.waitForTimers(t, 1)
+			}
+			reservation, existing, err := pin.RetainDelegation()
+			if err != nil || reservation == nil || existing.ID != 0 {
+				t.Fatalf("retain=%v %v %v", reservation, existing, err)
+			}
+			pin.End(17)
+			if !beforePromotion {
+				startRead()
+			}
+			var guard *DataGuard
+			select {
+			case got := <-read:
+				if got.err != nil || got.guard.record == nil {
+					t.Fatalf("read admission=%+v", got)
+				}
+				guard = got.guard
+			case <-time.After(time.Second):
+				t.Fatal("reader waited for an unreported delegation break")
+			}
+			defer guard.Release()
+			granted := make(chan error, 1)
+			go func() { _, err := reservation.Grant(t.Context()); granted <- err }()
+			clock.waitForTimers(t, 1)
+			select {
+			case err := <-granted:
+				t.Fatalf("grant passed pinned reader: %v", err)
+			default:
+			}
+			guard.Release()
+			if err := cv2Result(t, granted); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}

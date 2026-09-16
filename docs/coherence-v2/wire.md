@@ -450,3 +450,17 @@ The separately invoked `bash scripts/coherence-matrix-linux.sh` passed with
 `remote_chown_visible` skip (23 total, zero unexpected results). Both
 falsifiability controls reached their declared expectations. This exercises
 the current frontend paths; it does not prove the new C/F state machines.
+
+## Integration ordering clarifications
+
+A new OPEN/CREATE grant remains reserved until the operation's synchronous
+withdrawal completes. Pending peer reads may sample storage under a reservation;
+grant activation drains those samples before the DATA reply. CONTROL may then
+overtake DATA, so the client still handles that ordering. A synchronous mutation
+under an already installed grant returns its application receipt before its
+visibility wait, allowing the holder to acknowledge a peer cut independently.
+
+Private synchronous generations exclude their source from grant/release reverse
+notifications; its exact publication gate and post-state repair those coordinates.
+Promotion to a visible grant restores the ordinary release notification. Normal
+client-visible grants remain broadcast to purge the holder's earlier cached pages.

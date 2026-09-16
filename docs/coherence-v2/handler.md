@@ -77,9 +77,14 @@ uses a private generation that ends with the storage operation if the client did
 not already hold a grant. Peers wait for that local apply rather than receiving a
 recall for an unreported delegation. The coordinator exposes
 `BeginSynchronousMutation` for this required handler case. Existing-name CREATE
-and truncating OPEN promote that private generation with `RetainDelegation` only
-after successful storage application; a failed open cannot leak an unreported
-grant. The ordinary nontruncating OPEN keeps its reservation until storage and
+and truncating OPEN preserve that private generation with `RetainDelegation`
+after successful storage application. It returns to reserved state while peer
+withdrawal completes, then activates immediately before the DATA reply. A peer
+read already waiting on the private generation retries reserved-read admission.
+Activating earlier deadlocks an overtaking break against the withheld OPEN reply.
+An already installed same-holder grant stays active and returns its application
+receipt before the detached visibility wait, like an exact-reference flush.
+A failed open cannot leak an unreported grant. The ordinary nontruncating OPEN keeps its reservation until storage and
 handle tracking succeed, then grants after releasing storage admission.
 
 Delegation cuts occur before acquiring storage dependencies. Multi-identity

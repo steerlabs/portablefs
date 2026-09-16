@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -96,5 +97,74 @@ func TestCoherenceExistingCreateFailureLeavesNoDelegation(t *testing.T) {
 	}
 	if store.create.Load() != 1 || store.open.Load() != 1 {
 		t.Fatalf("storage calls = create %d open %d", store.create.Load(), store.open.Load())
+	}
+}
+
+func TestCoherenceCreateKeepsReplyGrantReservedThroughWithdrawal(t *testing.T) {
+	item := xfsstore.Capability{0x35}
+	store := &coherenceExistingCreateStore{
+		resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: item},
+		item:                        item, handle: xfsstore.Capability{0x46},
+	}
+	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+	peer, err := h.Coherence.Subscribe(volumeserver.SessionID{9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *authoritypb.Response, 1)
+	request := coherenceExistingCreateRequest(credential, root)
+	request.GetCreate().Flags.Truncate = true
+	go func() { done <- h.Handle(ctx, request) }()
+	events, err := h.Coherence.Poll(t.Context(), peer.Token, peer.Position, nil, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position := events[len(events)-1].Position
+	if err := h.Coherence.Ack(peer.Token, position); err != nil {
+		t.Fatal(err)
+	}
+	events, err = h.Coherence.Poll(t.Context(), peer.Token, position, nil, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	position = events[len(events)-1].Position
+	// The storage mutation is published, but its peer withdrawal is held. A
+	// pending READ must sample it without waiting for an unreported grant's cut.
+	type result struct {
+		guard *volumeserver.DataGuard
+		err   error
+	}
+	read := make(chan result, 1)
+	go func() {
+		guard, err := h.Coherence.DataConsumed(t.Context(), peer.Token, [16]byte{item[0]})
+		read <- result{guard, err}
+	}()
+	var guard *volumeserver.DataGuard
+	select {
+	case got := <-read:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		guard = got.guard
+	case <-time.After(time.Second):
+		t.Fatal("pending reader waited for a break before the grant reply")
+	}
+	defer guard.Release()
+	select {
+	case response := <-done:
+		t.Fatalf("CREATE passed unacknowledged withdrawal: %v", response)
+	default:
+	}
+	if err := h.Coherence.Ack(peer.Token, position); err != nil {
+		t.Fatal(err)
+	}
+	guard.Release()
+	select {
+	case response := <-done:
+		if response.GetErrno() != 0 || response.GetCreate().GetDelegation() == nil {
+			t.Fatalf("CREATE reply: %v", response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CREATE did not grant after withdrawal and reader drain")
 	}
 }
