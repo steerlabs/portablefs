@@ -30,7 +30,7 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 	lo := r.off
 	hi := lo + int64(len(r.data))
 	if r.kind == Write && len(r.data) <= MaxPayload {
-		for n := r.next; n != nil && n.seq <= cut.Sequence && n.state == Accepted && n.kind == Write && n.generation == r.generation; n = n.next {
+		for n := r.next; n != nil && n.seq <= cut.Sequence && n.state == Accepted && n.kind == Write && n.generation == r.generation && n.writeOptions == r.writeOptions; n = n.next {
 			end := n.off + int64(len(n.data))
 			a, z := min(lo, n.off), max(hi, end)
 			if n.off > hi || end < lo || z-a > MaxPayload {
@@ -57,7 +57,7 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 			b.token++
 			p.entries = append(p.entries, Entry{
 				Token: b.token, First: r.seq, Last: last.seq, Generation: r.generation,
-				Kind: Write, Offset: lo + int64(off), Data: data[off:end],
+				Kind: Write, Offset: lo + int64(off), Data: data[off:end], WriteOptions: r.writeOptions,
 			})
 		}
 	} else {
@@ -271,7 +271,10 @@ func (b *Buffer) waitDurable(ctx context.Context, id *Identity, cut Cut) error {
 	}
 }
 func (b *Buffer) WriteSync(ctx context.Context, id Identity, off int64, data []byte) (Cut, error) {
-	cut, err := b.Write(ctx, id, off, data)
+	return b.WriteSyncWithOptions(ctx, id, off, data, WriteOptions{})
+}
+func (b *Buffer) WriteSyncWithOptions(ctx context.Context, id Identity, off int64, data []byte, opts WriteOptions) (Cut, error) {
+	cut, err := b.WriteWithOptions(ctx, id, off, data, opts)
 	if err != nil {
 		return cut, err
 	}

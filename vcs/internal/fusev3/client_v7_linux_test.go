@@ -8,6 +8,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -201,4 +202,57 @@ func TestV7SetattrUsesCurrentDelegationBase(t *testing.T) {
 	if status != fuse.OK || out.Size != 41 || out.Mode&0o777 != 0o640 {
 		t.Fatalf("setattr current base: status=%v size=%d mode=%o", status, out.Size, out.Mode)
 	}
+}
+
+func TestV7BufferedWritePublishesImplicitTimesBeforeFlush(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.item.Attr.MtimeNs, f.rpc.item.Attr.CtimeNs = 11, 12
+	entry := f.lookup(t, 1, "file")
+	opened := openV7Writer(t, f, entry.NodeId)
+	before := time.Now().UnixNano()
+	writeV7(t, f, entry.NodeId, opened.Fh, 0, []byte("new"))
+	after := time.Now().UnixNano()
+	out := &fuse.AttrOut{}
+	if status := f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Flags_: fuse.FUSE_GETATTR_FH, Fh_: opened.Fh}, out)
+	}); status != fuse.OK {
+		t.Fatal(status)
+	}
+	mtime, ctime := int64(out.Mtime)*1e9+int64(out.Mtimensec), int64(out.Ctime)*1e9+int64(out.Ctimensec)
+	if mtime < before || mtime > after || ctime != mtime {
+		t.Fatalf("accepted write times: mtime=%d ctime=%d range=[%d,%d]", mtime, ctime, before, after)
+	}
+	f.rpc.snapshot(func(rpc *fakeRPC) {
+		if len(rpc.writes) != 0 {
+			t.Fatal("implicit timestamps forced a write RPC")
+		}
+	})
+}
+
+func TestV7BufferedWritePreservesKernelFlagsAndLockOwner(t *testing.T) {
+	f := newStrictFixture(t)
+	f.rpc.item.Attr.Mode = 0o6755
+	entry := f.lookup(t, 1, "file")
+	opened := openV7Writer(t, f, entry.NodeId)
+	flags := uint32(fuse.WRITE_KILL_SUIDGID | fuse.WRITE_LOCKOWNER)
+	if status := f.rawCall(func(unique uint64) fuse.Status {
+		_, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 3, WriteFlags: flags, LockOwner: 91, Flags: uint32(syscall.O_RDWR)}, []byte("new"))
+		return status
+	}); status != fuse.OK {
+		t.Fatal(status)
+	}
+	out := &fuse.AttrOut{}
+	if status := f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Flags_: fuse.FUSE_GETATTR_FH, Fh_: opened.Fh}, out)
+	}); status != fuse.OK || out.Mode&0o7777 != 0o755 {
+		t.Fatalf("buffered killpriv: %v mode=%o", status, out.Mode)
+	}
+	if status := f.rename(1, 1, "file", "after", 0); status != fuse.OK {
+		t.Fatal(status)
+	}
+	f.rpc.snapshot(func(rpc *fakeRPC) {
+		if len(rpc.writes) != 1 || rpc.writes[0].GetWriteFlags() != flags || rpc.writes[0].GetLockOwner() != 91 {
+			t.Fatalf("flushed write metadata: %v", rpc.writes)
+		}
+	})
 }

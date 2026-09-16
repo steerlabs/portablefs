@@ -48,6 +48,9 @@ type Attributes struct {
 	Size, ATimeNS, MTimeNS                               int64
 	HasMode, HasUID, HasGID, HasSize, HasATime, HasMTime bool
 	ATimeNow, MTimeNow                                   bool
+	// CTime is overlay-only; it is never sent as a user SETATTR value.
+	CTimeNS  int64
+	HasCTime bool
 }
 
 // Cut is an immutable mount-local accepted-sequence snapshot. Use only cuts
@@ -55,6 +58,15 @@ type Attributes struct {
 type Cut struct {
 	Sequence     uint64
 	LossSequence uint64
+}
+
+// WriteOptions preserves transport ownership and privilege effects across buffering.
+// Flags is opaque to the buffer. KillPrivileges describes the corresponding
+// relative mode change for the local overlay; later chmod records still win.
+type WriteOptions struct {
+	Flags          uint32
+	LockOwner      uint64
+	KillPrivileges bool
 }
 
 // Entry is one immutable transport operation. Token is stable across retries.
@@ -66,6 +78,7 @@ type Entry struct {
 	Offset                         int64
 	Data                           []byte
 	Attributes                     Attributes
+	WriteOptions                   WriteOptions
 }
 
 // Flusher applies one operation, returning its nonzero Authority sequence.

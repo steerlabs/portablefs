@@ -14,7 +14,10 @@ import (
 // Accounting belongs to the server description, not the RPC delivery. These
 // helpers run inside exact replay and cleanup removes the record atomically.
 func (h *VolumeHandler) coherenceAdmitOpen(id volumeserver.SessionID, handle xfsstore.Capability, identity [16]byte, requested, writeIntent bool) (bool, error) {
-	if !requested || writeIntent {
+	// Restore health is a volume-wide content admission decision. A cached
+	// page would bypass it after the hydrator disappears, including for files
+	// already hydrated. Active restore handles therefore remain direct I/O.
+	if !requested || writeIntent || h.Restore != nil && h.Restore.Active() {
 		return false, nil
 	}
 	token, err := h.coherenceToken(id)

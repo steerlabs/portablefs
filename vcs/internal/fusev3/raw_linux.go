@@ -1040,7 +1040,19 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	owned := r.mount.delegations.Owns(record.identity[:])
 	if owned {
 		var err error
-		attr, err = r.mount.overlayProtoAttr(record.identity[:], attr)
+		version := uint64(0)
+		if publication.cacheStamp != nil {
+			version = publication.cacheStamp.ObjectVersion
+		}
+		if publication.postState != nil {
+			for _, object := range publication.postState.GetObjects() {
+				if bytes.Equal(object.GetStableIdentity(), record.identity[:]) {
+					version = object.GetObjectVersion()
+					break
+				}
+			}
+		}
+		attr, err = r.mount.overlayProtoAttr(record.identity[:], attr, version)
 		if err != nil {
 			return err
 		}
@@ -2198,9 +2210,12 @@ func (r *rawFileSystem) publishPostStateAttrs(ctx context.Context) {
 	}
 	for _, object := range publication.postState.GetObjects() {
 		identity, ok := publicationIdentityFromBytes(object.GetStableIdentity())
-		if !ok || object.GetRoles()&postStateRoleRemoved != 0 || object.GetAttr() == nil {
+		if !ok || object.GetAttr() == nil {
 			continue
 		}
+		// A removed binding can leave hard-link aliases or open descriptors alive.
+		// Its inode attributes remain exact post-state, including a zero link count.
+		_ = r.mount.delegations.SetBaseAttr(identity[:], object.GetAttr(), object.GetObjectVersion())
 		if _, already := published[identity]; already {
 			continue
 		}

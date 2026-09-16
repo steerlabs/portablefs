@@ -52,15 +52,16 @@ type delegationState struct {
 	// making the long-poll loop wait for a flush or acknowledgment.
 	controlTail <-chan struct{}
 
-	identity writeback.Identity
-	ref      *authoritypb.DelegationRef
-	mode     authoritypb.DelegationMode
-	item     []byte
-	handles  map[string][]byte
-	writers  map[string][]byte
-	bindings map[uint64]delegationBinding
-	retire   *writeback.Retirement
-	base     *authoritypb.Attr
+	identity                            writeback.Identity
+	ref                                 *authoritypb.DelegationRef
+	mode                                authoritypb.DelegationMode
+	item                                []byte
+	handles                             map[string][]byte
+	writers                             map[string][]byte
+	bindings                            map[uint64]delegationBinding
+	retire                              *writeback.Retirement
+	base                                *authoritypb.Attr
+	baseVersion, baseInvalidatedThrough uint64
 
 	meta        sync.Mutex
 	acceptedCut uint64
@@ -253,7 +254,7 @@ func (m *delegationManager) Owns(identity []byte) bool {
 	return s.ref != nil
 }
 
-func (m *delegationManager) SetBaseAttr(identity []byte, attr *authoritypb.Attr) error {
+func (m *delegationManager) SetBaseAttr(identity []byte, attr *authoritypb.Attr, version uint64) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
 		return err
@@ -263,13 +264,35 @@ func (m *delegationManager) SetBaseAttr(identity []byte, attr *authoritypb.Attr)
 		return nil
 	}
 	s.meta.Lock()
-	if attr == nil {
-		s.base = nil
-	} else {
-		s.base = proto.Clone(attr).(*authoritypb.Attr)
-	}
+	s.installBaseLocked(attr, version)
 	s.meta.Unlock()
 	return nil
+}
+
+// installBaseLocked compares object versions, never snapshot watermarks.
+func (s *delegationState) installBaseLocked(attr *authoritypb.Attr, version uint64) {
+	if attr != nil && version != 0 && version >= s.baseVersion && version >= s.baseInvalidatedThrough {
+		s.base, s.baseVersion = proto.Clone(attr).(*authoritypb.Attr), version
+	}
+}
+
+func (m *delegationManager) InvalidateBaseAttr(identity []byte, version uint64) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	state := m.lookupState(id)
+	if state == nil {
+		return
+	}
+	state.meta.Lock()
+	defer state.meta.Unlock()
+	state.baseInvalidatedThrough = max(state.baseInvalidatedThrough, version)
+	if state.baseVersion < version {
+		state.base = nil
+	}
 }
 
 func (m *delegationManager) BaseAttr(identity []byte) (*authoritypb.Attr, bool) {
@@ -344,6 +367,7 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 		// ownership interval. Fetch a current base before caching it again.
 		s.meta.Lock()
 		s.base = nil
+		s.baseVersion, s.baseInvalidatedThrough = 0, 0
 		// A cut receipt belongs to this ownership generation. Carrying the
 		// previous grant's last ticket into an empty successor break would
 		// acknowledge data never applied under the successor reference.
@@ -453,6 +477,9 @@ func (m *delegationManager) markAccepted(s *delegationState, cut writeback.Cut) 
 }
 
 func (m *delegationManager) Write(ctx context.Context, identity []byte, off int64, data []byte, syncWrite bool) (writeback.Cut, error) {
+	return m.WriteWithOptions(ctx, identity, off, data, syncWrite, writeback.WriteOptions{})
+}
+func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byte, off int64, data []byte, syncWrite bool, opts writeback.WriteOptions) (writeback.Cut, error) {
 	id, err := delegationIdentity(identity)
 	if err != nil {
 		return writeback.Cut{}, err
@@ -478,9 +505,9 @@ func (m *delegationManager) Write(ctx context.Context, identity []byte, off int6
 		// marker lets that callback use the state protected by this read fence
 		// without recursively taking admission.RLock behind a queued writer.
 		flushCtx := context.WithValue(ctx, delegationAdmissionContextKey{}, s)
-		cut, err = b.WriteSync(flushCtx, id, off, data)
+		cut, err = b.WriteSyncWithOptions(flushCtx, id, off, data, opts)
 	} else {
-		cut, err = b.Write(ctx, id, off, data)
+		cut, err = b.WriteWithOptions(ctx, id, off, data, opts)
 	}
 	if err == nil {
 		m.markAccepted(s, cut)
@@ -749,7 +776,9 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 	}
 	binding, ok := s.bindings[entry.Generation]
 	handle := firstDelegatedHandle(s.handles)
-	if entry.Kind == writeback.Write {
+	// ftruncate requires a writable descriptor just like pwrite. A read-only
+	// handle can join the holder while a buffered size change awaits flush.
+	if entry.Kind == writeback.Write || entry.Kind == writeback.Truncate || entry.Attributes.HasSize {
 		handle = firstDelegatedHandle(s.writers)
 	}
 	if admissionHeld != s {
@@ -806,7 +835,10 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 		m.loseDelegation(s, "delegated mutation permanently refused")
 		return 0, writeback.ErrLost
 	}
-	m.updateBaseFromResponse(s, response)
+	if !m.updateBaseFromResponse(s, response) {
+		m.loseDelegation(s, "delegated metadata omitted exact post attributes")
+		return 0, writeback.ErrLost
+	}
 	sequence := response.GetAppliedSequence()
 	if sequence == 0 {
 		m.loseDelegation(s, "delegated flush omitted application ticket")
@@ -840,6 +872,7 @@ func (m *delegationManager) flushWrite(ctx context.Context, s *delegationState, 
 		chunk := entry.Data[progress.bytes:end]
 		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
 			Handle: handle, Position: uint64(position), Size: uint32(len(chunk)), Data: chunk,
+			WriteFlags: entry.WriteOptions.Flags, LockOwner: entry.WriteOptions.LockOwner,
 			Delegation: cloneDelegationRef(binding.ref),
 		}}})
 		if err != nil {
@@ -855,7 +888,7 @@ func (m *delegationManager) flushWrite(ctx context.Context, s *delegationState, 
 			return 0, writeback.ErrLost
 		}
 		reply := response.GetWrite()
-		if reply == nil || reply.GetCommittedSize() != uint64(len(chunk)) || reply.GetAssignedOffset() != uint64(position) || reply.GetError() != 0 || response.GetAppliedSequence() == 0 || response.GetAppliedSequence() < progress.sequence {
+		if reply == nil || response.GetVolumeVersion() == 0 || reply.GetPostAttr() == nil || reply.GetPostAttr().GetKind() != authoritypb.Attr_REGULAR || reply.GetPostAttr().GetSize() < position+int64(len(chunk)) || reply.GetCommittedSize() != uint64(len(chunk)) || reply.GetAssignedOffset() != uint64(position) || reply.GetError() != 0 || response.GetAppliedSequence() == 0 || response.GetAppliedSequence() < progress.sequence {
 			m.loseDelegation(s, "malformed delegated write success")
 			return 0, writeback.ErrLost
 		}
@@ -874,10 +907,12 @@ func (m *delegationManager) flushWrite(ctx context.Context, s *delegationState, 
 		m.durabilityMu.Lock()
 		m.appliedHigh = max(m.appliedHigh, progress.sequence)
 		m.durabilityMu.Unlock()
+		// Retiring the overlay must expose the exact applied attributes, never
+		// the pre-write base that the buffered timestamp temporarily covered.
+		m.updateBaseFromResponse(s, response)
 		if reply.GetDurableSequence() != 0 {
 			m.durableCurrent(reply.GetDurableSequence())
 		}
-		m.updateBaseFromResponse(s, response)
 		select {
 		case m.durableKick <- struct{}{}:
 		default:
@@ -886,8 +921,9 @@ func (m *delegationManager) flushWrite(ctx context.Context, s *delegationState, 
 	return progress.sequence, nil
 }
 
-func (m *delegationManager) updateBaseFromResponse(s *delegationState, response *authoritypb.Response) {
+func (m *delegationManager) updateBaseFromResponse(s *delegationState, response *authoritypb.Response) bool {
 	var attr *authoritypb.Attr
+	version := response.GetVolumeVersion()
 	if response.GetWrite() != nil {
 		attr = response.GetWrite().GetPostAttr()
 	}
@@ -895,15 +931,18 @@ func (m *delegationManager) updateBaseFromResponse(s *delegationState, response 
 		for _, object := range response.GetPostState().GetObjects() {
 			if bytes.Equal(object.GetStableIdentity(), s.identity[:]) {
 				attr = object.GetAttr()
+				version = object.GetObjectVersion()
 				break
 			}
 		}
 	}
-	if attr != nil {
-		s.meta.Lock()
-		s.base = proto.Clone(attr).(*authoritypb.Attr)
-		s.meta.Unlock()
+	if attr == nil || version == 0 {
+		return false
 	}
+	s.meta.Lock()
+	s.installBaseLocked(attr, version)
+	s.meta.Unlock()
+	return true
 }
 
 func delegationApplied(s *delegationState, _ uint64) uint64 {

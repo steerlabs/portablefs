@@ -236,3 +236,74 @@ Run 78 passes Git, read-open/release, rename physical-publication (including a
 final FORGET), and refetched-page stamp regressions twenty times each. Its exit
 70 is only the focused inventory check. Darwin Foundation and static Linux
 builds pass; native authorityrpc/volumeserver race suites pass in run 69.
+
+## Buffered attributes and active restore admission
+
+Run 82 passes the complete fusev3/Authority group and the formerly failing
+ServeWhileCold lifecycle stage. Buffered write, truncate and size changes now
+carry admission-time implicit mtime/ctime in the holder overlay, in program
+order with explicit SETATTR values. They add no wire operation. Flush requires
+valid post attributes and installs the exact Authority base before consuming a
+durability watermark. Base selection and overlay sampling share the delegation
+metadata lock, so retirement cannot pair an old base with an empty overlay.
+
+Positioned writes also retain kernel write flags and lock owner. Coalescing
+requires identical write options. Privilege clearing is a relative operation
+at the write's position: it clears setuid and executable setgid, while a later
+chmod still wins. Regressions cover the local mode, metadata ordering, transport
+flags, coalescing boundaries, malformed post attributes, and the retired-overlay
+handoff. The writeback race suite passes in run 81.
+
+Run 82 then exposes active-restore cache admission: the Linux profile granted
+kernel caching to a previously hydrated read handle, bypassing volume-wide
+RESTORE_BLOCKED after the hydrator disappeared. Active restore now refuses
+cache-capable OPEN/CREATE admission, using the existing reply permission bit.
+These handles remain direct I/O through convergence; new handles may cache
+once restore is inactive. The existing lifecycle assertion is retained without
+relaxation and a handler regression checks the admission rule.
+
+Run 83 and focused run 85 exposed a stale source link count; run 86 happened to
+pass it and completed every tiered lifecycle stage. The source's change entries
+are intentionally filtered, but its publication gate only drained pending
+replies: it did not purge settled daemon attribute payloads. Source completion
+now purges its exact ATTR/DATA payloads while leaving kernel-data obligations
+registered. Surviving hard links and open unlinked inodes also receive REMOVED
+objects' exact post attributes. This is not a change to unlink semantics.
+
+Delegation bases now compare object versions. A delayed LOOKUP cannot replace a
+newer applied base, and a newer namespace reply can update link count without
+being replaced by older delegation metadata. Peer ATTR/DATA changes establish
+an invalidation floor; older replies cannot resurrect the base. Base selection
+and overlay sampling remain atomic through metadata/overlay locks.
+
+Run 87 passes all selected frontend, source-cache, base-version and handler
+regressions twenty times, including cross-mount link count. The tiered lifecycle
+passes 19 of 20 repetitions; one later cold-tree comparison still sees archived
+mtime on the truncated file. That failure is under investigation and is not
+counted as a passing gate.
+
+The lifecycle now opens a root handle before its mutation stage and requires a
+successful directory barrier before deliberately stopping the hydrator. This
+replaces the v6 assumption that successful close already completed the preceding
+run. Run 88 makes the remaining loss explicit: four barriers fail before the
+hydrator is stopped. Investigation identifies writable-handle selection, not
+restore timestamp ordering. Buffered size SETATTR selected an arbitrary retained
+handle; an overlapping read could make that descriptor read-only, and XFS
+correctly refused ftruncate. Size-bearing metadata now selects the retained
+writer set, like positioned data writes. The regression exercises both buffered
+TRUNCATE and SETATTR-size while many read handles coexist.
+
+Run 88 also found a test-lifetime mistake: its new barrier descriptor remained
+open through the later unmount. It now closes immediately after the barrier.
+Run 89 passes the full `bash scripts/xfs-fuse-integration.sh` gate, including the
+complete tiered lifecycle, required inventory, and root boundary tests. The
+subsequent writable-handle selection regression is being repeated separately.
+
+Run 90 passes both writable-handle metadata variants and the complete tiered
+lifecycle twenty times each. The lifecycle barrier passes before every injected
+hydrator failure, and every cold-tree/unmount/convergence assertion passes.
+Its wrapper exits 70 only because the focused command omits other required
+inventory. Together with full run 89 (66 privileged tests and one root boundary
+test), this closes the current step-1 real-mount qualification. The final full
+verification and matrix still remain mandatory after the later deletion and
+performance work.

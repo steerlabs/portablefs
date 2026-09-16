@@ -900,6 +900,11 @@ func (s *subscriptionRegistry) applyChange(ctx context.Context, incarnation uint
 		s.mu.Unlock()
 		return nil
 	}
+	if entry.GetKind() == authoritypb.ChangeKind_CHANGE_KIND_ATTRIBUTES_CHANGED || entry.GetKind() == authoritypb.ChangeKind_CHANGE_KIND_DATA_CHANGED {
+		if invalidator, ok := s.control.(interface{ InvalidateBaseAttr([]byte, uint64) }); ok {
+			invalidator.InvalidateBaseAttr(identity[:], entry.GetVolumeVersion())
+		}
+	}
 	for _, coordinate := range coordinates {
 		if err := s.withdrawCoordinate(ctx, coordinate, entry.GetByteRange()); err != nil {
 			s.markChangeStale(coordinate)

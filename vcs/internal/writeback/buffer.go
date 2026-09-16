@@ -11,10 +11,12 @@ import (
 type record struct {
 	next                       *record
 	seq, generation, applied   uint64
+	acceptedAt                 int64
 	kind                       Kind
 	off                        int64
 	data                       []byte
 	attrs                      Attributes
+	writeOptions               WriteOptions
 	state                      State
 	file                       *file
 	extents                    *extent
@@ -132,24 +134,27 @@ func (b *Buffer) trigger() {
 }
 
 func (b *Buffer) Write(ctx context.Context, id Identity, off int64, data []byte) (Cut, error) {
+	return b.WriteWithOptions(ctx, id, off, data, WriteOptions{})
+}
+func (b *Buffer) WriteWithOptions(ctx context.Context, id Identity, off int64, data []byte, opts WriteOptions) (Cut, error) {
 	if off < 0 || len(data) == 0 || int64(len(data)) > math.MaxInt64-off || int64(len(data)) > b.maxBytes {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, Write, off, data, Attributes{})
+	return b.admit(ctx, id, Write, off, data, Attributes{}, opts)
 }
 func (b *Buffer) Truncate(ctx context.Context, id Identity, size int64) (Cut, error) {
 	if size < 0 {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, Truncate, 0, nil, Attributes{Size: size, HasSize: true})
+	return b.admit(ctx, id, Truncate, 0, nil, Attributes{Size: size, HasSize: true}, WriteOptions{})
 }
 func (b *Buffer) SetAttr(ctx context.Context, id Identity, a Attributes) (Cut, error) {
-	if a.HasSize && a.Size < 0 || a.ATimeNow && a.HasATime || a.MTimeNow && a.HasMTime {
+	if a.HasCTime || a.HasSize && a.Size < 0 || a.ATimeNow && a.HasATime || a.MTimeNow && a.HasMTime {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, SetAttr, 0, nil, a)
+	return b.admit(ctx, id, SetAttr, 0, nil, a, WriteOptions{})
 }
-func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, data []byte, a Attributes) (Cut, error) {
+func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, data []byte, a Attributes, opts WriteOptions) (Cut, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for {
@@ -164,8 +169,8 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 			// Copy is inside the admission fence: BeginRetire cannot miss a reserved
 			// operation, and cancellation never leaves an unreported accepted entry.
 			copied := append([]byte(nil), data...)
+			now := time.Now().UnixNano()
 			if a.ATimeNow || a.MTimeNow {
-				now := time.Now().UnixNano()
 				if a.ATimeNow {
 					a.ATimeNS = now
 					a.HasATime = true
@@ -180,7 +185,7 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 			r := b.free
 			b.free = r.next
 			b.sequence++
-			*r = record{file: f, seq: b.sequence, generation: f.generation, kind: kind, off: off, data: copied, attrs: a, state: Accepted}
+			*r = record{file: f, seq: b.sequence, generation: f.generation, kind: kind, off: off, data: copied, attrs: a, state: Accepted, acceptedAt: now, writeOptions: opts}
 			if f.tail == nil {
 				f.head = r
 			} else {

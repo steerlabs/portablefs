@@ -1132,6 +1132,10 @@ func TestReadOverlayTruncateAndAttributes(t *testing.T) {
 	}
 	got := b.OverlayAttributes(id, Attributes{HasMode: true, Mode: 0o644, HasGID: true, GID: 8, HasSize: true, Size: 100})
 	want := Attributes{HasMode: true, Mode: 0o600, HasUID: true, UID: 7, HasGID: true, GID: 8, HasSize: true, Size: 6, HasMTime: true, MTimeNS: 99}
+	if !got.HasCTime || got.CTimeNS <= 0 {
+		t.Fatal("missing implicit ctime", got)
+	}
+	got.CTimeNS, got.HasCTime = 0, false
 	if got != want {
 		t.Fatalf("OverlayAttributes = %+v, want %+v", got, want)
 	}
@@ -1412,5 +1416,96 @@ func assertBlocked[T any](t *testing.T, ch <-chan T, what string) {
 	case value := <-ch:
 		t.Fatalf("%s completed early with %v", what, value)
 	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestImplicitTimestampOverlayPreservesOrderUntilDurability(t *testing.T) {
+	b := newTestBuffer(t, &recordingFlusher{})
+	id := testIdentity(81)
+	base := Attributes{HasMTime: true, MTimeNS: 1, HasCTime: true, CTimeNS: 2}
+	var cut Cut
+	var err error
+	steps := []struct {
+		name     string
+		admit    func() (Cut, error)
+		explicit int64
+	}{
+		{"write", func() (Cut, error) { return b.Write(t.Context(), id, 0, []byte("a")) }, 0},
+		{"explicit mtime after write", func() (Cut, error) { return b.SetAttr(t.Context(), id, Attributes{HasMTime: true, MTimeNS: 99}) }, 99},
+		{"size and explicit mtime", func() (Cut, error) {
+			return b.SetAttr(t.Context(), id, Attributes{HasSize: true, Size: 3, HasMTime: true, MTimeNS: 77})
+		}, 77},
+		{"write after explicit mtime", func() (Cut, error) { return b.Write(t.Context(), id, 1, []byte("b")) }, 0},
+		{"truncate", func() (Cut, error) { return b.Truncate(t.Context(), id, 2) }, 0},
+	}
+	for _, step := range steps {
+		before := time.Now().UnixNano()
+		cut, err = step.admit()
+		after := time.Now().UnixNano()
+		if err != nil {
+			t.Fatal(step.name, err)
+		}
+		got := b.OverlayAttributes(id, base)
+		if !got.HasCTime || got.CTimeNS < before || got.CTimeNS > after {
+			t.Fatalf("%s ctime outside admission: %+v", step.name, got)
+		}
+		if step.explicit != 0 {
+			if got.MTimeNS != step.explicit {
+				t.Fatalf("%s explicit mtime lost: %+v", step.name, got)
+			}
+		} else if got.MTimeNS != got.CTimeNS {
+			t.Fatalf("%s implicit timestamps differ: %+v", step.name, got)
+		}
+	}
+	want := b.OverlayAttributes(id, base)
+	sequence, err := b.FlushIdentity(t.Context(), id, cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := b.OverlayAttributes(id, base); got != want {
+		t.Fatalf("application retired implicit attributes: got %+v want %+v", got, want)
+	}
+	b.DurableSequence(sequence)
+	if got := b.OverlayAttributes(id, base); got.MTimeNS != base.MTimeNS || got.CTimeNS != base.CTimeNS {
+		t.Fatalf("durable overlay did not retire: %+v", got)
+	}
+}
+
+func TestWriteOptionsFenceCoalescingAndPreservePrivilegeOrder(t *testing.T) {
+	ctx := context.Background()
+	f := &recordingFlusher{}
+	b := newTestBuffer(t, f)
+	id := testIdentity(81)
+	first := WriteOptions{Flags: 6, LockOwner: 11, KillPrivileges: true}
+	second := WriteOptions{Flags: 6, LockOwner: 12, KillPrivileges: true}
+	for i, opts := range []WriteOptions{first, first, second, {}} {
+		if _, err := b.WriteWithOptions(ctx, id, int64(i), []byte("x"), opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := b.FlushIdentity(ctx, id, b.Snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.snapshot()
+	if len(calls) != 3 || len(calls[0].entry.Data) != 2 || calls[0].entry.WriteOptions != first || calls[1].entry.WriteOptions != second || calls[2].entry.WriteOptions != (WriteOptions{}) {
+		t.Fatalf("write metadata coalescing: %+v", calls)
+	}
+	for _, tc := range []struct{ mode, want uint32 }{{0o6755, 0o755}, {0o6744, 0o2744}} {
+		base := Attributes{Mode: tc.mode, HasMode: true}
+		if got := b.OverlayAttributes(id, base).Mode; got != tc.want {
+			t.Fatalf("killpriv %o: got %o want %o", tc.mode, got, tc.want)
+		}
+	}
+	if _, err := b.SetAttr(ctx, id, Attributes{Mode: 0o6755, HasMode: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.OverlayAttributes(id, Attributes{Mode: 0o755, HasMode: true}).Mode; got != 0o6755 {
+		t.Fatalf("later chmod lost: %o", got)
+	}
+	if _, err := b.WriteWithOptions(ctx, id, 4, []byte("x"), first); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.OverlayAttributes(id, Attributes{Mode: 0o755, HasMode: true}).Mode; got != 0o755 {
+		t.Fatalf("write after chmod kept privileges: %o", got)
 	}
 }

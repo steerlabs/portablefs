@@ -17,14 +17,15 @@ import (
 )
 
 type delegationFakeRPC struct {
-	mu        sync.Mutex
-	sequence  uint64
-	mutations []*authoritypb.Request
-	controls  []*authoritypb.Request
-	barriers  int
-	maxWrite  uint32
-	block     <-chan struct{}
-	fail      error
+	mu           sync.Mutex
+	sequence     uint64
+	mutations    []*authoritypb.Request
+	controls     []*authoritypb.Request
+	barriers     int
+	maxWrite     uint32
+	block        <-chan struct{}
+	fail         error
+	omitPostAttr bool
 }
 
 func (f *delegationFakeRPC) IOLimits() (uint32, uint32) {
@@ -136,8 +137,9 @@ func (f *delegationPipelineRPC) CallMutation(ctx context.Context, request *autho
 	sequence := f.sequence
 	f.mutations = append(f.mutations, proto.Clone(request).(*authoritypb.Request))
 	f.mu.Unlock()
-	return &authoritypb.Response{AppliedSequence: sequence, Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
+	return &authoritypb.Response{AppliedSequence: sequence, VolumeVersion: sequence, Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
 		CommittedSize: uint64(len(write.GetData())), AssignedOffset: write.GetPosition(),
+		PostAttr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Size: int64(write.GetPosition()) + int64(len(write.GetData()))},
 	}}}, nil
 }
 
@@ -162,11 +164,18 @@ func (f *delegationFakeRPC) CallMutation(ctx context.Context, request *authority
 	}
 	f.sequence++
 	f.mutations = append(f.mutations, proto.Clone(request).(*authoritypb.Request))
-	response := &authoritypb.Response{AppliedSequence: f.sequence}
+	response := &authoritypb.Response{AppliedSequence: f.sequence, VolumeVersion: f.sequence}
 	if write := request.GetWrite(); write != nil {
 		response.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
 			CommittedSize: uint64(len(write.GetData())), AssignedOffset: write.GetPosition(),
+			PostAttr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Size: int64(write.GetPosition()) + int64(len(write.GetData()))},
 		}}
+	}
+	if set := request.GetSetAttr(); set != nil && !f.omitPostAttr {
+		response.PostState = &authoritypb.PostState{Objects: []*authoritypb.ObjectPostState{{StableIdentity: delegationTestIdentity(set.GetHandle()[0]), ObjectVersion: f.sequence, Attr: &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Size: set.GetSize(), Mode: set.GetMode()}}}}
+	}
+	if f.omitPostAttr && response.GetWrite() != nil {
+		response.GetWrite().PostAttr = nil
 	}
 	return response, nil
 }
@@ -784,7 +793,7 @@ func TestDelegationColdLookupsDoNotAllocateState(t *testing.T) {
 	if attr, ok := m.BaseAttr(id); ok || attr != nil {
 		t.Fatalf("unknown identity base attr=(%v, %t)", attr, ok)
 	}
-	if err := m.SetBaseAttr(id, &authoritypb.Attr{Size: 1}); err != nil {
+	if err := m.SetBaseAttr(id, &authoritypb.Attr{Size: 1}, 1); err != nil {
 		t.Fatal(err)
 	}
 	m.mu.Lock()
@@ -1108,6 +1117,139 @@ func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T)
 			}
 			if got := m.TracksHandle(id, reader); got != owned {
 				t.Fatalf("reader tracking=%t, want %t", got, owned)
+			}
+		})
+	}
+}
+
+func TestDelegatedWriteRejectsMissingPostAttributes(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{omitPostAttr: true})
+	id := installDelegationForTest(t, m, 61, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(context.Background(), id, 0, []byte("x"), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.FlushIdentity(context.Background(), id); !errors.Is(err, writeback.ErrLost) {
+		t.Fatalf("missing post attributes = %v, want loss", err)
+	}
+}
+
+func TestDelegatedAttributeOverlayUsesCurrentBaseAfterDurability(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	id := installDelegationForTest(t, m, 62, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	old := &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Mode: 0o6755, MtimeNs: 11, CtimeNs: 12}
+	if err := m.SetBaseAttr(id, old, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Write(context.Background(), id, 0, []byte("x"), false); err != nil {
+		t.Fatal(err)
+	}
+	sampled, ok := m.BaseAttr(id)
+	if !ok {
+		t.Fatal("missing sampled base")
+	}
+	seq, err := m.FlushIdentity(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied := &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Size: 1, Mode: 0o755, MtimeNs: 21, CtimeNs: 22}
+	if err := m.SetBaseAttr(id, applied, 2); err != nil {
+		t.Fatal(err)
+	}
+	m.DurableSequence(seq)
+	mount := &Mount{delegations: m}
+	got, err := mount.overlayProtoAttr(id, sampled, 1)
+	if err != nil || got.GetMtimeNs() != 21 || got.GetCtimeNs() != 22 || got.GetMode() != 0o755 {
+		t.Fatalf("retired overlay exposed sampled base: %v, %v", got, err)
+	}
+}
+
+func TestDelegatedBaseVersionsOrderRepliesAndInvalidations(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	id := installDelegationForTest(t, m, 63, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	mount := &Mount{delegations: m}
+	attr := func(links uint32) *authoritypb.Attr {
+		return &authoritypb.Attr{Kind: authoritypb.Attr_REGULAR, Nlink: links}
+	}
+	if err := m.SetBaseAttr(id, attr(2), 10); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name                   string
+		incoming, invalidation uint64
+		links, want            uint32
+	}{
+		{"newer namespace metadata", 11, 0, 1, 1},
+		{"older delayed lookup", 10, 0, 2, 1},
+		{"older withdrawal preserves new base", 10, 9, 2, 1},
+		{"exact committed version survives withdrawal", 11, 11, 1, 1},
+		{"newer withdrawal forces refetch", 12, 12, 3, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.invalidation != 0 {
+				m.InvalidateBaseAttr(id, tc.invalidation)
+			}
+			if tc.invalidation == 12 {
+				if _, ok := m.BaseAttr(id); ok {
+					t.Fatal("withdrawn base still available")
+				}
+				if err := m.SetBaseAttr(id, attr(2), 10); err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := m.BaseAttr(id); ok {
+					t.Fatal("old reply resurrected withdrawn base")
+				}
+			}
+			got, err := mount.overlayProtoAttr(id, attr(tc.links), tc.incoming)
+			if err != nil || got.GetNlink() != tc.want {
+				t.Fatalf("base order: %v, %v; want links=%d", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDelegatedMetadataRejectsMissingPostAttributes(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{omitPostAttr: true})
+	id := installDelegationForTest(t, m, 64, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Truncate(context.Background(), id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.FlushIdentity(context.Background(), id); !errors.Is(err, writeback.ErrLost) {
+		t.Fatalf("missing metadata post attributes = %v, want loss", err)
+	}
+}
+
+func TestDelegationTruncationAlwaysFlushesThroughWritableHandle(t *testing.T) {
+	for _, kind := range []writeback.Kind{writeback.Truncate, writeback.SetAttr} {
+		t.Run(fmt.Sprint(kind), func(t *testing.T) {
+			fake := &delegationFakeRPC{}
+			m := newDelegationTestManager(t, fake)
+			id := installDelegationForTest(t, m, 65, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			writer := []byte{65, 2}
+			for i := byte(3); i < 35; i++ {
+				if err := m.AddHandle(id, []byte{65, 1}, []byte{65, i}, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for size := int64(1); size <= 32; size++ {
+				var err error
+				if kind == writeback.Truncate {
+					_, err = m.Truncate(t.Context(), id, size)
+				} else {
+					_, err = m.SetAttr(t.Context(), id, writeback.Attributes{Size: size, HasSize: true})
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := m.FlushIdentity(t.Context(), id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fake.mu.Lock()
+			defer fake.mu.Unlock()
+			for _, request := range fake.mutations {
+				if set := request.GetSetAttr(); set != nil && !bytes.Equal(set.GetHandle(), writer) {
+					t.Fatalf("truncate used read-only handle: %v", set)
+				}
 			}
 		})
 	}

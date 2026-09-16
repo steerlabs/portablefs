@@ -104,8 +104,10 @@
 // Read snapshots immutable dirty slices before fetching. Fetch must read from
 // the coherent Authority view of the same delegation. Integration retains its
 // per-identity read/publication drain and invalidates local cached read handles
-// after each accepted mutation. OverlayAttributes covers explicit metadata;
-// integration supplies implicit write timestamps and privilege-bit changes.
+// after each accepted mutation. OverlayAttributes folds explicit metadata and
+// implicit write/truncate timestamps in admission order. Implicit timestamps
+// stay local until the exact Authority post-attributes replace retired entries;
+// integration supplies privilege-bit changes.
 // Now timestamps resolve once using the client clock at acceptance. Append
 // placement, lock-owner checks, access checks, handles, write flags, and wire
 // encoding belong to integration; this package admits only positioned writes.

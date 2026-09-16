@@ -129,6 +129,14 @@ func TestTieredVolumeLifecycleOnXFS(t *testing.T) {
 		wiring = openRestoreMode(t, store, stateDir)
 		return wiring
 	})
+	// The restore failure stage starts only after the preceding run's accepted
+	// writes are durable. Protocol 7 makes that boundary an explicit root-handle
+	// barrier; close alone can leave a delegated flush outstanding.
+	barrier, err := os.Open(live.mountPath)
+	if err != nil {
+		t.Fatalf("open lifecycle barrier: %v", err)
+	}
+	defer barrier.Close()
 	mutations := map[string]expectation{}
 	created := map[string][]byte{}
 	stage(t, "ServeWhileCold", func(t *testing.T) {
@@ -141,6 +149,13 @@ func TestTieredVolumeLifecycleOnXFS(t *testing.T) {
 	stage(t, "RestrictedModesAreCarried", func(t *testing.T) {
 		checkRestrictedModes(t, live, targetRoot, tree, namespace, manifest)
 	})
+
+	if err := barrier.Sync(); err != nil {
+		t.Fatalf("complete cold mutation run before hydrator failure: %v", err)
+	}
+	if err := barrier.Close(); err != nil {
+		t.Fatalf("close lifecycle barrier: %v", err)
+	}
 
 	// The failure surface, with content still cold: the hydrator dies.
 	serve.stop(t)

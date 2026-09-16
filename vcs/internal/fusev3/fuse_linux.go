@@ -1476,7 +1476,7 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 		BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags(),
 	}
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
-		n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), attr)
+		n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), attr, objectVersion)
 		return n.overlayAttr(attr, out)
 	}
 	n.mount.publishAttr(ctx, out, n.item, attr)
@@ -1542,7 +1542,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	}
 	if openFlags.GetTruncate() {
 		if object := postStateObject(response.GetPostState(), n.item.GetStableIdentity(), postStateRoleTarget); object != nil {
-			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), object.GetAttr())
+			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 		}
 	}
 	return handle, kernelFlags, 0
@@ -2092,7 +2092,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 		object = postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleCreated)
 	}
 	if object != nil {
-		n.mount.delegations.SetBaseAttr(item.GetStableIdentity(), object.GetAttr())
+		n.mount.delegations.SetBaseAttr(item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 	}
 	return item, handle, kernelFlags, 0
 }
@@ -2544,7 +2544,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 				return syscall.EIO
 			}
 			base = response.GetGetAttr().GetAttr()
-			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), base)
+			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), base, response.GetGetAttr().GetObjectVersion())
 		}
 		return n.overlayAttr(base, out)
 	}

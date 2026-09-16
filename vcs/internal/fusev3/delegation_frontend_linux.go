@@ -121,17 +121,39 @@ func (n *node) withWriteDelegation(ctx context.Context, handle *fileHandle, call
 	}
 }
 
-func (m *Mount) overlayProtoAttr(identity []byte, base *authoritypb.Attr) (*authoritypb.Attr, error) {
+func (m *Mount) overlayProtoAttr(identity []byte, base *authoritypb.Attr, version uint64) (*authoritypb.Attr, error) {
 	if base == nil {
 		return nil, syscall.EIO
 	}
-	attrs, err := m.delegations.OverlayAttributes(identity, writeback.Attributes{
-		Mode: base.GetMode(), Size: base.GetSize(), ATimeNS: base.GetAtimeNs(), MTimeNS: base.GetMtimeNs(),
-		HasMode: true, HasSize: true, HasATime: true, HasMTime: true,
-	})
+	manager := m.delegations
+	id, err := delegationIdentity(identity)
 	if err != nil {
 		return nil, err
 	}
+	manager.epoch.RLock()
+	defer manager.epoch.RUnlock()
+	state := manager.lookupState(id)
+	if manager.incarnation() == 0 || state == nil {
+		return proto.Clone(base).(*authoritypb.Attr), nil
+	}
+	state.admission.RLock()
+	defer state.admission.RUnlock()
+	if state.ref == nil {
+		return proto.Clone(base).(*authoritypb.Attr), nil
+	}
+	// The base and retained overlay are one read snapshot. A flush updates the
+	// base before durability can retire its records; holding meta across overlay
+	// sampling prevents an old base from being paired with an empty overlay.
+	state.meta.Lock()
+	defer state.meta.Unlock()
+	state.installBaseLocked(base, version)
+	if state.base != nil && state.baseVersion >= version {
+		base = state.base
+	}
+	attrs := manager.buf.OverlayAttributes(id, writeback.Attributes{
+		Mode: base.GetMode(), Size: base.GetSize(), ATimeNS: base.GetAtimeNs(), MTimeNS: base.GetMtimeNs(), CTimeNS: base.GetCtimeNs(),
+		HasMode: true, HasSize: true, HasATime: true, HasMTime: true, HasCTime: true,
+	})
 	attr := proto.Clone(base).(*authoritypb.Attr)
 	if attrs.HasMode {
 		attr.Mode = attrs.Mode
@@ -145,11 +167,14 @@ func (m *Mount) overlayProtoAttr(identity []byte, base *authoritypb.Attr) (*auth
 	if attrs.HasMTime {
 		attr.MtimeNs = attrs.MTimeNS
 	}
+	if attrs.HasCTime {
+		attr.CtimeNs = attrs.CTimeNS
+	}
 	return attr, nil
 }
 
 func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Errno {
-	attr, err := n.mount.overlayProtoAttr(n.item.GetStableIdentity(), base)
+	attr, err := n.mount.overlayProtoAttr(n.item.GetStableIdentity(), base, 0)
 	if err != nil {
 		return bufferErrno(err)
 	}

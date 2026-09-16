@@ -533,6 +533,16 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 	if l.unresolvedAttributes != 0 || l.unresolvedData != 0 {
 		return errors.New("fusev3: source callback publication retained unresolved namespace bindings")
 	}
+	// Own commits are omitted from the peer stream. Drain protects pending
+	// replies, but settled daemon attributes must also be withdrawn before the
+	// exact post-state can replace them at reply settlement. Kernel data records
+	// remain registered: they carry a separate invalidation obligation.
+	for coordinate := range l.coordinates {
+		if coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData {
+			delete(l.r.cachedAttrs, coordinate.item)
+			delete(l.r.cachedAttrPayloads, coordinate.item)
+		}
+	}
 	l.ready = true
 	return nil
 }

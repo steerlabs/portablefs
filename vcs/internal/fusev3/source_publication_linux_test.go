@@ -642,3 +642,32 @@ func BenchmarkSourcePublicationAdmissionWithUnrelatedCoordinates(b *testing.B) {
 		})
 	}
 }
+
+func TestSourceCompletionWithdrawsSettledAttributesAndKeepsDataObligation(t *testing.T) {
+	for _, kind := range []publicationCoordinateKind{publicationItemAttributes, publicationItemData} {
+		t.Run(fmt.Sprint(kind), func(t *testing.T) {
+			f := newStrictFixture(t)
+			entry := f.lookup(t, 1, "file")
+			record := f.raw.acquire(entry.NodeId)
+			defer f.raw.release(record)
+			coordinate := publicationCoordinate{kind: kind, item: record.identity}
+			lease := &sourcePublicationLease{r: f.raw, assigned: true, coordinates: map[publicationCoordinate]struct{}{coordinate: {}}}
+			f.raw.mu.Lock()
+			f.raw.cachedAttrs[record.identity] = record
+			f.raw.cachedAttrPayloads[record.identity] = cachedAttrPayload{attr: &authoritypb.Attr{Nlink: 2}}
+			f.raw.cachedData[record.key.inode] = record
+			f.raw.mu.Unlock()
+			if err := lease.markCallbackPublicationReady(); err != nil {
+				t.Fatal(err)
+			}
+			f.raw.mu.Lock()
+			defer f.raw.mu.Unlock()
+			if f.raw.cachedAttrs[record.identity] != nil || f.raw.cachedAttrPayloads[record.identity].attr != nil {
+				t.Fatal("source completion retained stale link-count payload")
+			}
+			if f.raw.cachedData[record.key.inode] != record {
+				t.Fatal("source completion discarded kernel data obligation")
+			}
+		})
+	}
+}
