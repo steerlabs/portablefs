@@ -1371,6 +1371,9 @@ func (m *Mount) retainSourceLeaseDischarge(ctx context.Context, response *author
 		}
 	}
 	publication.sourceLeaseDischarge = proto.Clone(discharge).(*authoritypb.SourceLeaseDischarge)
+	if err := publication.source.attachDischarge(ctx, discharge); err != nil {
+		return err
+	}
 	if err := m.prepareSourceLeaseDischarge(publication); err != nil {
 		return err
 	}

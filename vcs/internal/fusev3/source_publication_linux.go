@@ -65,6 +65,8 @@ type namespaceBounds struct {
 // fields after r are protected by r.mu. A revoked lease deliberately remains
 // installed until mount teardown; reopening after an uncertain assigned result
 // would permit stale state to become cacheable without an authoritative result.
+// Unresolved counts validate reply completion only; they never widen the cut
+// beyond the identities and names in coordinates.
 type sourcePublicationLease struct {
 	r                    *rawFileSystem
 	coordinates          map[publicationCoordinate]struct{}
@@ -255,7 +257,7 @@ func (r *rawFileSystem) signalSourceChangedLocked() {
 
 func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
 	for coordinate := range coordinates {
-		if held := r.sourceHolds[coordinate]; held != nil && held != owner {
+		if held := r.sourceHolds[coordinate]; held != nil && (held != owner || len(r.sourceSharedHolds[coordinate]) != 0) {
 			return true
 		}
 	}
@@ -265,63 +267,6 @@ func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoor
 func (r *rawFileSystem) leaseRecallHeldLocked(coordinates map[publicationCoordinate]struct{}) bool {
 	for coordinate := range coordinates {
 		if r.repairingCoordinates[coordinate] {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *rawFileSystem) leaseRecallOverlapsUnresolvedLocked(attributes, data int) bool {
-	if attributes == 0 && data == 0 {
-		return false
-	}
-	for coordinate, held := range r.repairingCoordinates {
-		if !held {
-			continue
-		}
-		if attributes != 0 && coordinate.kind == publicationItemAttributes ||
-			data != 0 && coordinate.kind == publicationItemData {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *rawFileSystem) unresolvedSourceOverlapLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
-	for coordinate := range coordinates {
-		switch coordinate.kind {
-		case publicationItemAttributes:
-			for lease := range r.sourceUnresolvedAttributes {
-				if lease != owner {
-					return true
-				}
-			}
-		case publicationItemData:
-			for lease := range r.sourceUnresolvedData {
-				if lease != owner {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-// unresolvedGateOverlapsSourceHoldsLocked handles the converse direction: a
-// new namespace wildcard may bind any item identity of its declared scope, so
-// it cannot be installed across an already-owned item source lease. Distinct
-// namespace wildcards remain independent until either resolves to an exact
-// common identity; attachBinding then serializes that exact collision.
-func (r *rawFileSystem) unresolvedGateOverlapsSourceHoldsLocked(attributes, data int, owner *sourcePublicationLease) bool {
-	if attributes == 0 && data == 0 {
-		return false
-	}
-	for coordinate, lease := range r.sourceHolds {
-		if lease == owner {
-			continue
-		}
-		if attributes != 0 && coordinate.kind == publicationItemAttributes ||
-			data != 0 && coordinate.kind == publicationItemData {
 			return true
 		}
 	}
@@ -377,33 +322,20 @@ func (r *rawFileSystem) sourceCoordinateBusyLocked(coordinate publicationCoordin
 	return publishing != 0
 }
 
-func (r *rawFileSystem) sourcePublicationsBusyLocked(coordinates map[publicationCoordinate]struct{}, unresolvedAttributes, unresolvedData int, owner *sourcePublicationLease) bool {
+func (r *rawFileSystem) sourcePublicationsBusyLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
 	for coordinate := range coordinates {
 		if r.sourceCoordinateBusyLocked(coordinate, owner) {
 			return true
 		}
 	}
-	// Before the authority result supplies the child's stable identity, an
-	// admitted item publication cannot be proven disjoint from the exact bound
-	// namespace. Drain the declared scope globally only for this unresolved
-	// interval; attachBinding immediately narrows it back to exact identity.
-	if unresolvedAttributes != 0 || unresolvedData != 0 {
-		for coordinate, publishing := range r.sourcePublishing {
-			if publishing == 0 {
-				continue
-			}
-			if unresolvedAttributes != 0 && coordinate.kind == publicationItemAttributes ||
-				unresolvedData != 0 && coordinate.kind == publicationItemData {
-				return true
-			}
-		}
-	}
 	return false
 }
 
-// acquireSourcePublication closes every exact coordinate atomically, then
+// acquireSourcePublication closes every known exact coordinate atomically, then
 // drains publication decisions made before the cut. It happens before replay
 // assignment, so an acquisition failure cannot have reached the authority.
+// A namespace with no cached child holds only its name and explicit items
+// (including parent attributes); attachBinding adds the child on the reply.
 func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sourcePublicationGate) (*sourcePublicationLease, error) {
 	base, names, err := coordinatesForSourceGate(gate)
 	if err != nil {
@@ -435,7 +367,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		// lock, so every source gate can wait behind an older peer publication.
 		// This is an internal scheduling boundary: no synthetic EINTR escapes to
 		// applications for either namespace or inode mutations.
-		if r.leaseRecallHeldLocked(coordinates) || r.leaseRecallOverlapsUnresolvedLocked(lease.unresolvedAttributes, lease.unresolvedData) {
+		if r.leaseRecallHeldLocked(coordinates) {
 			changed := r.sourceChanged
 			r.mu.Unlock()
 			select {
@@ -445,9 +377,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 				return nil, fmt.Errorf("fusev3: wait for prior peer publication: %w", ctx.Err())
 			}
 		}
-		if r.sourceLeaseOverlapLocked(coordinates, nil) ||
-			r.unresolvedSourceOverlapLocked(coordinates, nil) ||
-			r.unresolvedGateOverlapsSourceHoldsLocked(lease.unresolvedAttributes, lease.unresolvedData, nil) {
+		if r.sourceLeaseOverlapLocked(coordinates, nil) {
 			changed := r.sourceChanged
 			r.mu.Unlock()
 			select {
@@ -460,12 +390,6 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		lease.coordinates = coordinates
 		for coordinate := range coordinates {
 			r.sourceHolds[coordinate] = lease
-		}
-		if lease.unresolvedAttributes != 0 {
-			r.sourceUnresolvedAttributes[lease] = lease.unresolvedAttributes
-		}
-		if lease.unresolvedData != 0 {
-			r.sourceUnresolvedData[lease] = lease.unresolvedData
 		}
 		r.signalSourceChangedLocked()
 		r.mu.Unlock()
@@ -532,7 +456,7 @@ func (l *sourcePublicationLease) refreshPreBindings(ctx context.Context) error {
 func (l *sourcePublicationLease) drain(ctx context.Context) error {
 	for {
 		l.r.mu.Lock()
-		busy := l.r.sourcePublicationsBusyLocked(l.coordinates, l.unresolvedAttributes, l.unresolvedData, l)
+		busy := l.r.sourcePublicationsBusyLocked(l.coordinates, l)
 		changed := l.r.sourceChanged
 		l.r.mu.Unlock()
 		if !busy {
@@ -621,8 +545,9 @@ func (l *sourcePublicationLease) terminalAtCallbackReturn() bool {
 	return !l.revoked && !l.released && !l.ready
 }
 
-// attachBinding extends a namespace wildcard to a definitive returned/post
-// item before the owner makes that binding or its attributes cacheable.
+// attachBinding adds the definitive returned/post identity to the exact name
+// cut, then drains replies admitted before that identity was known. An unknown
+// child never excludes unrelated identities while the authority call runs.
 func (l *sourcePublicationLease) attachBinding(ctx context.Context, namespace publicationNamespace, identity publicationIdentity) error {
 	if l == nil || identity == (publicationIdentity{}) {
 		return nil
@@ -635,38 +560,78 @@ func (l *sourcePublicationLease) attachBinding(ctx context.Context, namespace pu
 	}
 	additional := make(map[publicationCoordinate]struct{}, 2)
 	addBoundCoordinates(additional, identity, bounds)
-	for {
-		l.r.mu.Lock()
-		if l.released || l.revoked {
-			l.r.mu.Unlock()
-			return errors.New("fusev3: cannot attach a binding to an inactive source publication lease")
-		}
-		// A peer PREPARE may already be installed here: the unresolved
-		// namespace wildcard made it wait for this owner. Attaching the
-		// definitive item narrows that wildcard without yielding ownership;
-		// rejecting the waiting peer would terminalize the valid source-first
-		// ordering. Other source owners still conflict below.
-		if l.r.sourceLeaseOverlapLocked(additional, l) {
-			changed := l.r.sourceChanged
-			l.r.mu.Unlock()
-			select {
-			case <-changed:
-				continue
-			case <-ctx.Done():
-				return fmt.Errorf("fusev3: wait to attach definitive source binding: %w", ctx.Err())
-			}
-		}
-		for coordinate := range additional {
-			if _, exists := l.coordinates[coordinate]; !exists {
-				l.coordinates[coordinate] = struct{}{}
-				l.r.sourceHolds[coordinate] = l
-			}
-		}
-		l.resolveNamespaceLocked(namespace, bounds)
-		l.r.signalSourceChangedLocked()
-		l.r.mu.Unlock()
-		return l.drain(ctx)
+	if err := l.attachCoordinates(additional); err != nil {
+		return err
 	}
+	l.r.mu.Lock()
+	l.resolveNamespaceLocked(namespace, bounds)
+	l.r.signalSourceChangedLocked()
+	l.r.mu.Unlock()
+	return l.drain(ctx)
+}
+
+// attachDischarge closes the exact coordinates learned from the authority
+// before their source purge. Otherwise a delayed cache reply could install
+// between that purge and operation-specific child binding. Draining first
+// makes the purge cover every reply admitted while the identity was unknown.
+func (l *sourcePublicationLease) attachDischarge(ctx context.Context, discharge *authoritypb.SourceLeaseDischarge) error {
+	var coordinates map[publicationCoordinate]struct{}
+	l.r.mu.Lock()
+	for _, recall := range discharge.GetRecalls() {
+		grant, err := validateLeaseRecall(recall)
+		if err != nil {
+			l.r.mu.Unlock()
+			return err
+		}
+		if coordinate, ok := grant.key().publicationCoordinate(); ok {
+			if _, held := l.coordinates[coordinate]; !held {
+				if coordinates == nil {
+					coordinates = make(map[publicationCoordinate]struct{})
+				}
+				coordinates[coordinate] = struct{}{}
+			}
+		}
+	}
+	l.r.mu.Unlock()
+	if err := l.attachCoordinates(coordinates); err != nil {
+		return err
+	}
+	return l.drain(ctx)
+}
+
+// Reply-discovered coordinates must not wait for another source owner: that
+// owner's authority call may be waiting for this reply's discharge. Join its
+// exact closure instead. Multiple owners suppress even their own cache installs
+// until only one remains, and each keeps admission closed through its reply.
+// Upfront acquisition still serializes every already-known identity and name.
+func (l *sourcePublicationLease) attachCoordinates(additional map[publicationCoordinate]struct{}) error {
+	if len(additional) == 0 {
+		return nil
+	}
+	l.r.mu.Lock()
+	defer l.r.mu.Unlock()
+	if l.released || l.revoked {
+		return errors.New("fusev3: cannot attach coordinates to an inactive source publication lease")
+	}
+	for coordinate := range additional {
+		if _, exists := l.coordinates[coordinate]; exists {
+			continue
+		}
+		l.coordinates[coordinate] = struct{}{}
+		if held := l.r.sourceHolds[coordinate]; held == nil {
+			l.r.sourceHolds[coordinate] = l
+		} else if held != l {
+			if l.r.sourceSharedHolds == nil {
+				l.r.sourceSharedHolds = make(map[publicationCoordinate]map[*sourcePublicationLease]struct{})
+			}
+			if l.r.sourceSharedHolds[coordinate] == nil {
+				l.r.sourceSharedHolds[coordinate] = make(map[*sourcePublicationLease]struct{})
+			}
+			l.r.sourceSharedHolds[coordinate][l] = struct{}{}
+		}
+	}
+	l.r.signalSourceChangedLocked()
+	return nil
 }
 
 func (l *sourcePublicationLease) resolveNamespaceLocked(namespace publicationNamespace, bounds namespaceBounds) {
@@ -676,19 +641,9 @@ func (l *sourcePublicationLease) resolveNamespaceLocked(namespace publicationNam
 	delete(l.names, namespace)
 	if bounds.attributes && l.unresolvedAttributes > 0 {
 		l.unresolvedAttributes--
-		if l.unresolvedAttributes == 0 {
-			delete(l.r.sourceUnresolvedAttributes, l)
-		} else {
-			l.r.sourceUnresolvedAttributes[l] = l.unresolvedAttributes
-		}
 	}
 	if bounds.data && l.unresolvedData > 0 {
 		l.unresolvedData--
-		if l.unresolvedData == 0 {
-			delete(l.r.sourceUnresolvedData, l)
-		} else {
-			l.r.sourceUnresolvedData[l] = l.unresolvedData
-		}
 	}
 }
 
@@ -766,7 +721,7 @@ func (l *sourcePublicationLease) revoke() {
 	l.r.mu.Lock()
 	l.revoked = true
 	// Revocation is a terminal fail-closed transition, not a release. In
-	// particular, an unresolved namespace wildcard remains closed until the
+	// particular, an unresolved namespace coordinate remains closed until the
 	// authority fences this dead session; reopening it would admit a local
 	// cache publication through the same uncertain mutation result.
 	l.r.signalSourceChangedLocked()
@@ -783,11 +738,19 @@ func (l *sourcePublicationLease) release() {
 		return
 	}
 	l.released = true
-	delete(l.r.sourceUnresolvedAttributes, l)
-	delete(l.r.sourceUnresolvedData, l)
 	for coordinate := range l.coordinates {
+		shared := l.r.sourceSharedHolds[coordinate]
+		delete(shared, l)
 		if l.r.sourceHolds[coordinate] == l {
 			delete(l.r.sourceHolds, coordinate)
+			for successor := range shared {
+				l.r.sourceHolds[coordinate] = successor
+				delete(shared, successor)
+				break
+			}
+		}
+		if len(shared) == 0 {
+			delete(l.r.sourceSharedHolds, coordinate)
 		}
 	}
 	l.r.signalSourceChangedLocked()
@@ -795,28 +758,7 @@ func (l *sourcePublicationLease) release() {
 
 func (r *rawFileSystem) sourcePublicationAllowedLocked(coordinate publicationCoordinate, owner *sourcePublicationLease) bool {
 	held := r.sourceHolds[coordinate]
-	if held != nil && held != owner {
-		return false
-	}
-	// An unresolved exact namespace wildcard owns the potential bound item.
-	// Ordinary cached replies have no owner and therefore publish with zero TTL
-	// until the definitive identity narrows the wildcard. The owning callback is
-	// allowed so it can attach and publish its returned binding.
-	switch coordinate.kind {
-	case publicationItemAttributes:
-		for lease := range r.sourceUnresolvedAttributes {
-			if lease != owner {
-				return false
-			}
-		}
-	case publicationItemData:
-		for lease := range r.sourceUnresolvedData {
-			if lease != owner {
-				return false
-			}
-		}
-	}
-	return true
+	return (held == nil || held == owner) && len(r.sourceSharedHolds[coordinate]) == 0
 }
 
 func (r *rawFileSystem) admitSourcePublicationLocked(coordinate publicationCoordinate) {
