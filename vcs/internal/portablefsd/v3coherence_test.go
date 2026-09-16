@@ -105,6 +105,19 @@ func testV3Event(client *fakeV3VisibilityClient, sequence uint64, phase authorit
 	}
 }
 
+// TestV3CoherenceContractMajorMatchesFSKitExtension pins the authority major the
+// daemon stamps into the pfslocal contract to the literal the Swift extension
+// requires in MacOSV3PfsLocalTransport.parseContract. The two sides are compiled
+// separately; a constant bump on one side without the other fails every Mac
+// mount at Resolve, which the Swift fixtures alone cannot detect because they
+// compare against their own literal.
+func TestV3CoherenceContractMajorMatchesFSKitExtension(t *testing.T) {
+	const fskitExtensionAuthorityMajor = 7
+	if authorityrpc.ProtocolMajor != fskitExtensionAuthorityMajor {
+		t.Fatalf("authorityrpc.ProtocolMajor = %d; the FSKit extension guard in swift/PortableFSKit/Sources/PortableFSKit/MacOSV3PfsLocalTransport.swift requires %d; update both together", authorityrpc.ProtocolMajor, fskitExtensionAuthorityMajor)
+	}
+}
+
 func TestV3CoherenceBridgeContractIsExactAndCloned(t *testing.T) {
 	client := newFakeV3VisibilityClient()
 	defer client.Close()
