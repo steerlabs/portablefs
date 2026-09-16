@@ -82,3 +82,16 @@ write. Cache proofs wait for the asynchronous initial delegation release before
 opening a cache-capable reader; immediate post-write freshness is still checked
 before waiting for release. Saturated I/O still produces an uncertain assigned
 mutation and a disconnected mount. Install/enumeration churn still times out.
+
+The saturation and enumeration timeout root cause was source self-notification.
+A kernel EntryNotify for an initiating CREATE/RENAME waited on that mount's VFS
+lock, while cumulative peer acknowledgments waited behind the notification.
+`OnCommitFrom` filters ordinary committed changes for their source; the source's
+existing exact publication gate and post-state perform local repair. Delegation
+events remain broadcast. The handler retires internal positions only when all
+wire changes have been acknowledged. A 1,024-commit test exceeds the 256-entry
+log without fencing the source. `/tmp/cv2-g-source-31.log` passes saturation
+(0.11 s), install/enumeration (2.23 s), and enumeration recall (2.76 s). The
+remaining metadata-count assertion in that run expected immediate write-through;
+its v7 replacement measures application after an explicit durable cut while
+retaining the zero-follow-up-GETATTR requirement.

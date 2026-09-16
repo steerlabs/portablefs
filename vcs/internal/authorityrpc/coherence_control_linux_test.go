@@ -652,3 +652,39 @@ func TestCoherenceReleaseCompletesRacingBreak(t *testing.T) {
 		})
 	}
 }
+
+func TestCoherenceSourceOnlyCommitsRetireInternalPositions(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribe, token := subscribeCoherenceControlTest(t, handler, id)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	done := make(chan *authoritypb.Response, 1)
+	go func() {
+		done <- handler.handleCoherencePoll(ctx, 1, id, &authoritypb.NextControlEventRequest{Incarnation: subscribe.Incarnation})
+	}()
+	for sequence := uint64(2); sequence < 1026; sequence++ {
+		position := coordinator.OnCommitFrom([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{2}, VolumeVersion: sequence}}, id)
+		for {
+			state := handler.initCoherenceControlState()
+			state.mu.Lock()
+			cursor := state.sessions[id].coordinatorCursor
+			state.mu.Unlock()
+			if cursor >= position {
+				break
+			}
+			select {
+			case response := <-done:
+				t.Fatalf("source-only poll ended: %v", response)
+			case <-ctx.Done():
+				t.Fatal("source-only cursor did not advance")
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}
+	if err := coordinator.CheckSession(token); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-done
+}

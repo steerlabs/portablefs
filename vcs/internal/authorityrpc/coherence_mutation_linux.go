@@ -391,7 +391,7 @@ func (h *VolumeHandler) publishCoherenceCommit(req *authoritypb.Request, id volu
 		return 0
 	}
 	entries := coherenceChanges(req, resp, targets, seq)
-	position := h.Coherence.OnCommit(entries)
+	position := h.Coherence.OnCommitFrom(entries, id)
 	if identity != ([16]byte{}) && (req.GetWrite() != nil || req.GetSetAttr() != nil || req.GetFallocate() != nil) {
 		resp.AppliedSequence = h.coherenceDurability.recordApplied(id, identity, seq)
 	}

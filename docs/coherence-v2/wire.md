@@ -189,6 +189,10 @@ have no PREPARE/COMPLETE handshake. A committed namespace operation completes
 externally after its required deliveries/withdrawals. A delegation reservation
 becomes a grant only after peers' DELEGATION_GRANTED withdrawals finish. The
 initiating session handles its own publication boundary locally.
+Its committed changes are omitted from its wire change stream: a reverse
+notification can otherwise wait on the initiating syscall's VFS locks and
+block acknowledgments needed by a concurrent peer mutation. Skipped internal
+positions do not create holes in the session's wire change positions.
 
 ## Delegations and flushes
 

@@ -457,6 +457,16 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 			return coherenceControlEventResponse(h, requestID, event)
 		}
 		cursor := session.coordinatorCursor
+		// With no undispatched or unacknowledged changes, only internal
+		// advances remain through this cursor. Retire them so source-only
+		// traffic cannot overrun its own subscription log. Delegation cuts
+		// retain their separate explicit completion obligation.
+		if session.changeAcked == session.changeDelivered {
+			if err := h.Coherence.Ack(token, cursor); err != nil {
+				state.mu.Unlock()
+				return h.coherenceError(requestID, err)
+			}
+		}
 		state.mu.Unlock()
 
 		events, pollErr := h.Coherence.Poll(ctx, token, cursor, nil, coherenceControlBatchLimit)

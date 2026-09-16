@@ -595,3 +595,19 @@ func TestWaitWithdrawnDoesNotHoldCoordinatorLock(t *testing.T) {
 		t.Fatal("WaitWithdrawn did not observe cumulative ack")
 	}
 }
+
+func TestCoherenceCommitNotifiesOnlyPeersOfSource(t *testing.T) {
+	coordinator, _ := cv2Coordinator(t)
+	source := cv2Subscribe(t, coordinator, 1)
+	peer := cv2Subscribe(t, coordinator, 2)
+	position := coordinator.OnCommitFrom([]ChangeEntry{{Kind: AttributesChanged, Identity: [16]byte{1}, VolumeVersion: 2}}, source.Session)
+	for _, tc := range []struct {
+		token SubscriptionToken
+		kind  StreamEventKind
+	}{{source, StreamAdvance}, {peer, StreamChange}} {
+		events, err := coordinator.Poll(t.Context(), tc.token, 0, nil, 1)
+		if err != nil || len(events) != 1 || events[0].Kind != tc.kind || events[0].Position != position {
+			t.Fatalf("source-filtered stream: %+v, %v", events, err)
+		}
+	}
+}

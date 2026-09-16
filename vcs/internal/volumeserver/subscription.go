@@ -83,6 +83,7 @@ type StreamEvent struct {
 	Position                               uint64
 	Kind                                   StreamEventKind
 	Target                                 SessionID
+	Source                                 SessionID
 	Change                                 ChangeEntry
 	Delegation                             Delegation
 	Request, AppliedSequence, LossSequence uint64
@@ -297,6 +298,14 @@ func (c *CoherenceCoordinator) Renew(token SubscriptionToken) (time.Time, error)
 // Caller supplies immutable entries and monotonically published VolumeVersion;
 // disjoint operations may apply concurrently but must publish their cuts here.
 func (c *CoherenceCoordinator) OnCommit(entries []ChangeEntry) uint64 {
+	return c.OnCommitFrom(entries, SessionID{})
+}
+
+// OnCommitFrom excludes the initiating frontend from reverse notifications.
+// Its exact source publication gate repairs its local caches before replying;
+// notifying it while the syscall holds VFS locks can deadlock cumulative peer
+// acknowledgments against concurrent commits on another mount.
+func (c *CoherenceCoordinator) OnCommitFrom(entries []ChangeEntry, source SessionID) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.expireLocked()
@@ -304,7 +313,7 @@ func (c *CoherenceCoordinator) OnCommit(entries []ChangeEntry) uint64 {
 		if entry.VolumeVersion > c.watermark {
 			c.watermark = entry.VolumeVersion
 		}
-		c.appendLocked(StreamEvent{Kind: StreamChange, Change: entry})
+		c.appendLocked(StreamEvent{Kind: StreamChange, Change: entry, Source: source})
 	}
 	return c.position
 }
@@ -370,7 +379,7 @@ func (c *CoherenceCoordinator) Poll(ctx context.Context, token SubscriptionToken
 			}
 			for pos := after + 1; pos <= end; pos++ {
 				event := c.log[(pos-1)%uint64(len(c.log))]
-				if event.Target != (SessionID{}) && event.Target != token.Session {
+				if event.Source == token.Session || event.Target != (SessionID{}) && event.Target != token.Session {
 					event = StreamEvent{Position: pos, Kind: StreamAdvance}
 				}
 				dst = append(dst, event)
