@@ -7,7 +7,7 @@ the shared vocabulary every workstream must use, and the definition of done.
 ## Ground rules (apply to every workstream)
 
 - Branch base: `coherence-v2` from `origin/main` `67c52ef`. Each workstream works in its own
-  git worktree and branch (`coherence-v2/<stream>`), commits with DCO (`git commit -s`), no
+  git worktree and branch (`cv2-<stream>`), commits with DCO (`git commit -s`), no
   emojis, `gofmt`-clean, table-driven tests, errors wrapped with context.
 - This is protocol major **7**. The wire is frozen per COMPATIBILITY.md: v7 gets a new ALPN
   (`portablefs-authority-v7`) and a new protocol major; v6 is refused at the handshake. Inside v7
