@@ -106,14 +106,19 @@ type delegationManager struct {
 	controlWG sync.WaitGroup
 	workerWG  sync.WaitGroup
 
-	durabilityMu  sync.Mutex
-	durableBuffer *writeback.Buffer
-	appliedHigh   uint64
-	durableHigh   uint64
-	durableKick   chan struct{}
-	tokenMu       sync.Mutex
-	tokens        map[uint64]delegationFlushProgress
-	closeQueue    chan delegationClose
+	durabilityMu   sync.Mutex
+	durableBuffer  *writeback.Buffer
+	appliedHigh    uint64
+	durableHigh    uint64
+	durableKick    chan struct{}
+	tokenMu        sync.Mutex
+	tokens         map[uint64]delegationFlushProgress
+	closeQueue     chan delegationClose
+	closeMu        sync.Mutex
+	closePending   int
+	closeChanged   chan struct{}
+	closeProducers sync.WaitGroup
+	closeStopped   bool
 
 	hookMu          sync.RWMutex
 	withdrawalDrain func(context.Context, []byte) error
@@ -1499,6 +1504,49 @@ func (m *delegationManager) CloseHandle(ctx context.Context, identity, handle []
 	return nil
 }
 
+// Bound deferred cleanup well below the Authority's normal open table. New
+// handle admission waits before acquiring any per-identity operation locks;
+// cleanup must remain able to flush and release the handles it already owns.
+const deferredCloseAdmissionLimit = 256
+
+func (m *delegationManager) waitCloseCapacity(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	for m.closePending >= deferredCloseAdmissionLimit {
+		if m.closeChanged == nil {
+			m.closeChanged = make(chan struct{})
+		}
+		changed := m.closeChanged
+		m.closeMu.Unlock()
+		var err error
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-m.ctx.Done():
+			err = writeback.ErrClosed
+		}
+		m.closeMu.Lock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *delegationManager) changePendingCloses(delta int) {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	m.closePending += delta
+	if delta < 0 && m.closeChanged != nil {
+		close(m.closeChanged)
+		m.closeChanged = nil
+	}
+}
+
 // QueueClose transfers a FUSE RELEASE to the cleanup worker. RELEASE has no
 // kernel reply, so a short collection window can combine final-handle
 // delegation releases while keeping every server handle alive through its
@@ -1511,27 +1559,37 @@ func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64
 		return errors.New("fusev3: cannot queue an empty server handle")
 	}
 	m.epoch.RLock()
-	defer m.epoch.RUnlock()
 	pending := delegationClose{
 		identity: cloneBytes(identity), handle: cloneBytes(handle), lockOwner: lockOwner,
 		flockUnlock: flockUnlock, epoch: m.epochSerial,
 	}
+	m.epoch.RUnlock()
+	m.closeMu.Lock()
+	if m.closeStopped || m.ctx.Err() != nil {
+		m.closeMu.Unlock()
+		return writeback.ErrClosed
+	}
+	m.closePending++
+	m.closeProducers.Add(1)
+	m.closeMu.Unlock()
+	defer m.closeProducers.Done()
 	select {
 	case m.closeQueue <- pending:
 		return nil
 	case <-m.ctx.Done():
+		m.changePendingCloses(-1)
 		return writeback.ErrClosed
 	}
 }
 
 func (m *delegationManager) closeLoop() {
 	defer m.workerWG.Done()
+	defer m.finishCloseQueue()
 	for {
 		var first delegationClose
 		select {
 		case first = <-m.closeQueue:
 		case <-m.ctx.Done():
-			m.drainCloseQueue()
 			return
 		}
 		batch := []delegationClose{first}
@@ -1546,7 +1604,6 @@ func (m *delegationManager) closeLoop() {
 			case <-m.ctx.Done():
 				timer.Stop()
 				m.processCloseBatch(batch)
-				m.drainCloseQueue()
 				return
 			}
 		}
@@ -1558,6 +1615,17 @@ func (m *delegationManager) closeLoop() {
 		}
 		m.processCloseBatch(batch)
 	}
+}
+
+// A canceled select can still choose a ready enqueue. Seal producers and
+// join those already admitted before the final drain, so Stop cannot strand
+// a late close after its cleanup worker has exited.
+func (m *delegationManager) finishCloseQueue() {
+	m.closeMu.Lock()
+	m.closeStopped = true
+	m.closeMu.Unlock()
+	m.closeProducers.Wait()
+	m.drainCloseQueue()
 }
 
 func (m *delegationManager) drainCloseQueue() {
@@ -1580,6 +1648,7 @@ func (m *delegationManager) drainCloseQueue() {
 }
 
 func (m *delegationManager) processCloseBatch(batch []delegationClose) {
+	defer m.changePendingCloses(-len(batch))
 	// A background close retains its exact replay identity through an outage.
 	// The queue is bounded, and mount shutdown cancels this work.
 	if err := m.CloseHandles(m.ctx, batch); err != nil {
@@ -1688,10 +1757,17 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 			return err
 		}
 		applied = delegationApplied(s, applied)
-		if err := m.buf.Fsync(ctx, group.id); err != nil {
+		releasing = append(releasing, releasedGroup{group: group, release: &authoritypb.DelegationRelease{Delegation: ref, AppliedSequence: applied}})
+	}
+	// Apply the whole close batch before waiting for durability. Waiting per
+	// file turns a batched release into one serialized storage barrier per
+	// handle and lets asynchronous closes exhaust the Authority's open table.
+	// Admission is retired and the operation locks remain held, so no accepted
+	// entry can slip past this cut before ownership is surrendered.
+	for _, released := range releasing {
+		if err := m.buf.Fsync(ctx, released.group.id); err != nil {
 			return err
 		}
-		releasing = append(releasing, releasedGroup{group: group, release: &authoritypb.DelegationRelease{Delegation: ref, AppliedSequence: applied}})
 	}
 	if len(releasing) != 0 {
 		sort.Slice(releasing, func(i, j int) bool {
@@ -1750,6 +1826,7 @@ func (m *delegationManager) EpochChanged(reason string) {
 	for {
 		select {
 		case <-m.closeQueue:
+			m.changePendingCloses(-1)
 			continue
 		default:
 		}

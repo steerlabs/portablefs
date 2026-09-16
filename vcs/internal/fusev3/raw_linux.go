@@ -521,7 +521,6 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		sourceHolds:             make(map[publicationCoordinate]*sourcePublicationLease),
 		sourcePublishing:        make(map[publicationCoordinate]int),
 		publishingNegativeNames: make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
-		sourceChanged:           make(chan struct{}),
 		repairingCoordinates:    make(map[publicationCoordinate]bool),
 		cacheReservations:       make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
 	}

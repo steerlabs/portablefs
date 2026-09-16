@@ -2,6 +2,8 @@ package writeback
 
 import (
 	"context"
+	"encoding/binary"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -193,5 +195,38 @@ func BenchmarkCapAdmissionUnderContention(b *testing.B) {
 	}
 	if stats := buffer.Stats(); stats.Entries != 0 {
 		b.Fatalf("flush left %d entries", stats.Entries)
+	}
+}
+
+// Timer/cap batches must not create a goroutine for each dirty identity.
+func BenchmarkBackgroundFlushBurst(b *testing.B) {
+	for _, count := range []int{32, 4096} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			flusher := &benchmarkFlusher{}
+			buffer, err := New(flusher, Options{MaxEntries: count + 1, MaxBytes: int64(count + 1), FlushInterval: -1})
+			if err != nil {
+				b.Fatal(err)
+			}
+			flusher.buffer.Store(buffer)
+			b.Cleanup(buffer.Stop)
+			ctx := context.Background()
+			payload := []byte{1}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				for i := range count {
+					var id Identity
+					binary.LittleEndian.PutUint64(id[:], uint64(i+1))
+					if _, err := buffer.Write(ctx, id, 0, payload); err != nil {
+						b.Fatal(err)
+					}
+				}
+				cut := buffer.Snapshot()
+				buffer.trigger()
+				if err := buffer.waitDurable(ctx, nil, cut); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

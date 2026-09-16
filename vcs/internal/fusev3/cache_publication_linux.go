@@ -96,7 +96,7 @@ func (r *rawFileSystem) drainDataPublicationsContext(ctx context.Context, coordi
 			r.mu.Unlock()
 			return nil
 		}
-		changed := r.sourceChanged
+		changed := r.sourceChangedWaitLocked()
 		r.mu.Unlock()
 		timer := time.NewTimer(time.Until(deadline))
 		select {

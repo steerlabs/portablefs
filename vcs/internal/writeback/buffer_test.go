@@ -1509,3 +1509,73 @@ func TestWriteOptionsFenceCoalescingAndPreservePrivilegeOrder(t *testing.T) {
 		t.Fatalf("write after chmod kept privileges: %o", got)
 	}
 }
+
+func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) {
+	entered := make(chan Identity, 128)
+	release := make(chan struct{})
+	var sequence atomic.Uint64
+	explicit := testIdentity(200)
+	flusher := flusherFunc(func(ctx context.Context, id Identity, _ Entry) (uint64, error) {
+		if id == explicit {
+			return sequence.Add(1), nil
+		}
+		select {
+		case entered <- id:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		select {
+		case <-release:
+			return sequence.Add(1), nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+	b := newTestBuffer(t, flusher)
+	for i := 0; i < 96; i++ {
+		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
+	}
+	b.trigger()
+	await(t, entered, "background worker")
+	assertBlocked(t, entered, "background fanout beyond worker bound")
+	cut := mustWrite(t, b, explicit, 0, "priority")
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if _, err := b.FlushIdentity(ctx, explicit, cut); err != nil {
+		t.Fatalf("explicit flush waited behind background queue: %v", err)
+	}
+	// A coalesced kick during the active batch must preserve new work.
+	later := testIdentity(201)
+	mustWrite(t, b, later, 0, "later")
+	b.trigger()
+	close(release)
+	seen := false
+	for range 96 {
+		if id := await(t, entered, "remaining background work"); id == later {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("kick during active batch lost later admission")
+	}
+}
+
+func TestStopCancelsBlockedBackgroundBatch(t *testing.T) {
+	entered := make(chan struct{}, 128)
+	b := newTestBuffer(t, flusherFunc(func(ctx context.Context, _ Identity, _ Entry) (uint64, error) {
+		entered <- struct{}{}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}))
+	for i := 0; i < 96; i++ {
+		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
+	}
+	b.trigger()
+	await(t, entered, "blocked worker")
+	done := make(chan struct{})
+	go func() { b.Stop(); close(done) }()
+	await(t, done, "stop of blocked worker batch")
+	if got := b.Stats().Entries; got != 96 {
+		t.Fatalf("Stop discarded retained entries: %d", got)
+	}
+}

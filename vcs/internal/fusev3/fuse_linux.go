@@ -1490,6 +1490,9 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	if errno != 0 {
 		return nil, 0, errno
 	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, 0, bufferErrno(err)
+	}
 	if openFlags.GetWrite() {
 		id, err := delegationIdentity(n.item.GetStableIdentity())
 		if err != nil {
@@ -1655,6 +1658,9 @@ func (h *fileHandle) close(ctx context.Context, lockOwner uint64, flockUnlock bo
 func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uint32, syscall.Errno) {
 	if flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY) {
 		return nil, 0, syscall.EISDIR
+	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, 0, bufferErrno(err)
 	}
 	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Read: true}}}})
 	if errno != 0 {
@@ -2035,6 +2041,9 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, nil, 0, bufferErrno(err)
+	}
 	if identity, ok := n.cachedBoundIdentity(name); ok && openFlags.GetWrite() {
 		id, err := delegationIdentity(identity[:])
 		if err != nil {
@@ -2132,6 +2141,9 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 		}
 		return nil, nil, 0, errno
 	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, nil, 0, bufferErrno(err)
+	}
 	gate, err := itemSourceGate(n.item, false)
 	if err != nil {
 		return nil, nil, 0, syscall.EIO
@@ -2178,6 +2190,9 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 	}
 	if rdev != 0 {
 		return nil, syscall.EPERM
+	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, bufferErrno(err)
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
 		Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777,

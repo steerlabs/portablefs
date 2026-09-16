@@ -220,7 +220,7 @@ func delegationTestGrant(seed byte, mode authoritypb.DelegationMode) *authorityp
 	return &authoritypb.Delegation{Id: bytes.Repeat([]byte{seed}, 16), Generation: 1, Mode: mode}
 }
 
-func newDelegationTestManager(t *testing.T, fake *delegationFakeRPC) *delegationManager {
+func newDelegationTestManager(t *testing.T, fake delegationRPC) *delegationManager {
 	t.Helper()
 	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
 	if err != nil {
@@ -1252,5 +1252,142 @@ func TestDelegationTruncationAlwaysFlushesThroughWritableHandle(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDelegationCloseBatchAppliesAllFilesBeforeWaitingForDurability(t *testing.T) {
+	fake := &delegationBlockedBarrierRPC{barrierStarted: make(chan struct{}), releaseBarrier: make(chan struct{})}
+	m := newDelegationTestManager(t, fake)
+	var closes []delegationClose
+	for i := byte(1); i <= 16; i++ {
+		id := installDelegationForTest(t, m, i, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+		if _, err := m.Write(t.Context(), id, 0, []byte("batch"), false); err != nil {
+			t.Fatal(err)
+		}
+		closes = append(closes, delegationClose{identity: id, handle: []byte{i, 2}})
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- m.CloseHandles(ctx, closes) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		fake.mu.Lock()
+		writes := 0
+		for _, request := range fake.mutations {
+			if request.GetWrite() != nil {
+				writes++
+			}
+		}
+		releases := len(fake.controls)
+		fake.mu.Unlock()
+		if releases != 0 {
+			t.Fatal("released ownership before durability")
+		}
+		if writes == len(closes) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d/%d writes applied while durability was blocked", writes, len(closes))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("close returned before durability: %v", err)
+	default:
+	}
+	close(fake.releaseBarrier)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("close batch did not complete")
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.controls) != 1 || len(fake.controls[0].GetDelegationRelease().GetDelegations()) != len(closes) {
+		t.Fatalf("release was not one complete batch: %v", fake.controls)
+	}
+}
+
+func TestDeferredCloseBacklogBlocksNewHandleAdmissionUntilCleanup(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	fake := &delegationFakeRPC{block: release}
+	m := newDelegationTestManager(t, fake)
+	id := installDelegationForTest(t, m, 17, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	handles := make([][]byte, 0, deferredCloseAdmissionLimit)
+	for i := 0; i < deferredCloseAdmissionLimit; i++ {
+		handle := []byte{17, 2}
+		if i != 0 {
+			handle = []byte{17, 3, byte(i)}
+			if err := m.AddHandle(id, []byte{17, 1}, handle, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		handles = append(handles, handle)
+	}
+	for _, handle := range handles {
+		if err := m.QueueClose(id, handle, 0, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := m.waitCloseCapacity(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("new handle bypassed deferred-close backpressure: %v", err)
+	}
+	once.Do(func() { close(release) })
+	ctx, cancel = context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := m.waitCloseCapacity(ctx); err != nil {
+		t.Fatalf("cleanup did not resume handle admission: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.closeMu.Lock()
+		pending := m.closePending
+		m.closeMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending closes did not retire: %d", pending)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDeferredCloseShutdownJoinsRacingEnqueues(t *testing.T) {
+	for range 20 {
+		m := newDelegationTestManager(t, &delegationFakeRPC{})
+		start := make(chan struct{})
+		var producers sync.WaitGroup
+		for worker := range 8 {
+			producers.Add(1)
+			go func() {
+				defer producers.Done()
+				<-start
+				for i := range 100 {
+					err := m.QueueClose(delegationTestIdentity(17), []byte{17, byte(worker), byte(i)}, 0, false)
+					if err != nil && !errors.Is(err, writeback.ErrClosed) {
+						t.Errorf("queue: %v", err)
+					}
+				}
+			}()
+		}
+		close(start)
+		m.Stop()
+		producers.Wait()
+		m.closeMu.Lock()
+		pending := m.closePending
+		m.closeMu.Unlock()
+		if pending != 0 || len(m.closeQueue) != 0 {
+			t.Fatalf("shutdown stranded closes: pending=%d queued=%d", pending, len(m.closeQueue))
+		}
 	}
 }

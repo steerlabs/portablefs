@@ -16,7 +16,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -31,9 +30,9 @@ type WorkloadResult struct {
 	Files       int    `json:"files,omitempty"`
 	Directories int    `json:"directories,omitempty"`
 	Workers     int    `json:"workers,omitempty"`
-	// TransientRetries records ESTALE directory-enumeration retries in the
-	// two-view workload. Protocol v6 permits that error when a paged listing
-	// races a mutation, and the retry is part of its observed cost.
+	// TransientRetries is retained for comparison with the v6 JSON records.
+	// Protocol 7 treats every enumeration error as a workload failure, so a
+	// successful run reports zero.
 	TransientRetries         int64   `json:"transient_retries,omitempty"`
 	DirectoryScans           int64   `json:"directory_scans,omitempty"`
 	IncompleteReadRetries    int64   `json:"incomplete_read_retries,omitempty"`
@@ -359,10 +358,6 @@ func readPublishedFiles(
 		entries, err := os.ReadDir(root)
 		readyOnce.Do(func() { close(ready) })
 		if err != nil {
-			if errors.Is(err, syscall.ESTALE) {
-				stats.estale.Add(1)
-				continue
-			}
 			return fmt.Errorf("list peer directory: %w", err)
 		}
 		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })

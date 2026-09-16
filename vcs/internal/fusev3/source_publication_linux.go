@@ -251,9 +251,20 @@ func coordinatesForSourceGate(gate *sourcePublicationGate) (map[publicationCoord
 	return coordinates, names, nil
 }
 
+// A signal without waiters needs no allocation: every waiter checks its
+// predicate and takes this channel under the same mutex as the signaler.
+func (r *rawFileSystem) sourceChangedWaitLocked() <-chan struct{} {
+	if r.sourceChanged == nil {
+		r.sourceChanged = make(chan struct{})
+	}
+	return r.sourceChanged
+}
+
 func (r *rawFileSystem) signalSourceChangedLocked() {
-	close(r.sourceChanged)
-	r.sourceChanged = make(chan struct{})
+	if r.sourceChanged != nil {
+		close(r.sourceChanged)
+		r.sourceChanged = nil
+	}
 }
 
 func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
@@ -369,7 +380,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		// This is an internal scheduling boundary: no synthetic EINTR escapes to
 		// applications for either namespace or inode mutations.
 		if r.leaseRecallHeldLocked(coordinates) {
-			changed := r.sourceChanged
+			changed := r.sourceChangedWaitLocked()
 			r.mu.Unlock()
 			select {
 			case <-changed:
@@ -379,7 +390,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 			}
 		}
 		if r.sourceLeaseOverlapLocked(coordinates, nil) {
-			changed := r.sourceChanged
+			changed := r.sourceChangedWaitLocked()
 			r.mu.Unlock()
 			select {
 			case <-changed:
@@ -430,7 +441,7 @@ func (l *sourcePublicationLease) refreshPreBindings(ctx context.Context) error {
 			}
 		}
 		if l.r.sourceLeaseOverlapLocked(additional, l) {
-			changed := l.r.sourceChanged
+			changed := l.r.sourceChangedWaitLocked()
 			l.r.mu.Unlock()
 			select {
 			case <-changed:
@@ -457,12 +468,12 @@ func (l *sourcePublicationLease) refreshPreBindings(ctx context.Context) error {
 func (l *sourcePublicationLease) drain(ctx context.Context) error {
 	for {
 		l.r.mu.Lock()
-		busy := l.r.sourcePublicationsBusyLocked(l.coordinates, l)
-		changed := l.r.sourceChanged
-		l.r.mu.Unlock()
-		if !busy {
+		if !l.r.sourcePublicationsBusyLocked(l.coordinates, l) {
+			l.r.mu.Unlock()
 			return nil
 		}
+		changed := l.r.sourceChangedWaitLocked()
+		l.r.mu.Unlock()
 		select {
 		case <-changed:
 		case <-ctx.Done():

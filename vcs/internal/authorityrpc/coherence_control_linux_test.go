@@ -210,21 +210,25 @@ func TestCoherenceChangeBatchesRespectReplyFrameLimit(t *testing.T) {
 			ParentIdentity: [16]byte{1}, Name: string(bytes.Repeat([]byte{byte('a' + i)}, 64)),
 		}
 	}
-	coordinator.OnCommit(changes)
-
 	after := uint64(0)
-	positions := make([]uint64, 0, len(changes))
-	for len(positions) < len(changes) {
-		response := pollCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), after)
-		if response.GetErrno() != 0 || response.GetControlEvent().GetChangeBatch() == nil {
-			t.Fatalf("bounded poll = %+v", response)
+	positions := make([]uint64, 0, 2*len(changes))
+	for round := 0; round < 2; round++ {
+		coordinator.OnCommit(changes)
+		for len(positions) < (round+1)*len(changes) {
+			response := pollCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), after)
+			if response.GetErrno() != 0 || response.GetControlEvent().GetChangeBatch() == nil {
+				t.Fatalf("bounded poll = %+v", response)
+			}
+			if proto.Size(response.GetControlEvent()) > handler.coherenceReplyLimit() {
+				t.Fatalf("control event size = %d, limit = %d", proto.Size(response.GetControlEvent()), handler.coherenceReplyLimit())
+			}
+			after = response.GetControlEvent().GetSequence()
+			for _, entry := range response.GetControlEvent().GetChangeBatch().GetEntries() {
+				positions = append(positions, entry.GetPosition())
+			}
 		}
-		if proto.Size(response.GetControlEvent()) > handler.coherenceReplyLimit() {
-			t.Fatalf("control event size = %d, limit = %d", proto.Size(response.GetControlEvent()), handler.coherenceReplyLimit())
-		}
-		after = response.GetControlEvent().GetSequence()
-		for _, entry := range response.GetControlEvent().GetChangeBatch().GetEntries() {
-			positions = append(positions, entry.GetPosition())
+		if ack := ackChangeCoherenceControlTest(t, handler, id, subscribe.Incarnation, uint64(len(positions))); ack.Errno != 0 {
+			t.Fatal(ack)
 		}
 	}
 	for i, position := range positions {
@@ -819,5 +823,58 @@ func TestCoherenceCompletedEventReceiptCannotAcknowledgeFailedHandler(t *testing
 	}
 	if _, live := coordinator.LookupDelegation(grant.Identity); live {
 		t.Fatal("failed handler retained grant")
+	}
+}
+
+func TestCoherencePollReusesBoundedStorageWithoutAliasingReplies(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, _ := subscribeCoherenceControlTest(t, handler, id)
+	var first *authoritypb.ControlEvent
+	var saved *authoritypb.ControlEvent
+	var backing *volumeserver.StreamEvent
+	var after uint64
+	for round := 0; round < 3; round++ {
+		changes := make([]volumeserver.ChangeEntry, 64)
+		for i := range changes {
+			changes[i] = volumeserver.ChangeEntry{VolumeVersion: uint64(round + 1), Kind: volumeserver.NamespaceChanged, ParentIdentity: [16]byte{1}, Name: fmt.Sprintf("round-%d-name-%d", round, i)}
+		}
+		coordinator.OnCommit(changes)
+		response := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, after)
+		event := response.GetControlEvent()
+		if response.Errno != 0 || len(event.GetChangeBatch().GetEntries()) != len(changes) {
+			t.Fatalf("round %d: %v", round, response)
+		}
+		for i, entry := range event.GetChangeBatch().GetEntries() {
+			if string(entry.Name) != changes[i].Name || entry.Position != uint64(round*64+i+1) {
+				t.Fatalf("round %d entry %d: %v", round, i, entry)
+			}
+		}
+		state := handler.initCoherenceControlState()
+		state.mu.Lock()
+		buffer := state.sessions[id].pollBuffer
+		if len(buffer) != 64 || cap(buffer) > coherenceControlBatchLimit {
+			t.Errorf("buffer len=%d cap=%d", len(buffer), cap(buffer))
+		}
+		if round == 0 {
+			backing = &buffer[0]
+		} else if backing != &buffer[0] {
+			t.Error("poll failed to reuse its bounded buffer")
+		}
+		state.mu.Unlock()
+		if round == 0 {
+			first = event
+			saved = proto.Clone(event).(*authoritypb.ControlEvent)
+		} else if !proto.Equal(first, saved) {
+			t.Fatal("buffer reuse changed an earlier wire response")
+		}
+		replay := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, after)
+		if !proto.Equal(event, replay.GetControlEvent()) {
+			t.Fatal("buffer reuse changed current replay")
+		}
+		after = event.Sequence
+		if ack := ackChangeCoherenceControlTest(t, handler, id, subscribed.Incarnation, uint64((round+1)*64)); ack.Errno != 0 {
+			t.Fatal(ack)
+		}
 	}
 }

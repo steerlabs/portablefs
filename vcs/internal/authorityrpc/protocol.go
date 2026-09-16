@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -559,11 +560,14 @@ func canonicalWrite(writer io.Writer, message protoreflect.Message) error {
 }
 
 func canonicalWriteWithOptions(writer io.Writer, message protoreflect.Message, options canonicalWriteOptions) error {
-	fields, err := canonicalPresentFields(message)
+	fields, err := canonicalOrderedFields(message)
 	if err != nil {
 		return err
 	}
 	for _, field := range fields {
+		if !message.Has(field) {
+			continue
+		}
 		value := message.Get(field)
 		if field.IsMap() {
 			return fmt.Errorf("%w: map fields have no canonical order", errNonCanonical)
@@ -584,33 +588,42 @@ func canonicalWriteWithOptions(writer io.Writer, message protoreflect.Message, o
 	return nil
 }
 
-func canonicalPresentFields(message protoreflect.Message) ([]protoreflect.FieldDescriptor, error) {
+// Descriptors are immutable and come from the fixed protocol schema, not peer
+// input. Cache their numeric order once; presence remains message-specific.
+var canonicalFieldOrder sync.Map // protoreflect.MessageDescriptor -> []protoreflect.FieldDescriptor
+
+func canonicalOrderedFields(message protoreflect.Message) ([]protoreflect.FieldDescriptor, error) {
 	if len(message.GetUnknown()) != 0 {
 		return nil, fmt.Errorf("%w: unknown fields are not part of this protocol", errNonCanonical)
 	}
-	fields := message.Descriptor().Fields()
-	present := make([]protoreflect.FieldDescriptor, 0, fields.Len())
-	for i := 0; i < fields.Len(); i++ {
-		field := fields.Get(i)
-		if message.Has(field) {
-			present = append(present, field)
+	descriptor := message.Descriptor()
+	if cached, ok := canonicalFieldOrder.Load(descriptor); ok {
+		return cached.([]protoreflect.FieldDescriptor), nil
+	}
+	fields := descriptor.Fields()
+	ordered := make([]protoreflect.FieldDescriptor, fields.Len())
+	for i := range ordered {
+		ordered[i] = fields.Get(i)
+	}
+	for i := 1; i < len(ordered); i++ {
+		for j := i; j > 0 && ordered[j].Number() < ordered[j-1].Number(); j-- {
+			ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
 		}
 	}
-	for i := 1; i < len(present); i++ {
-		for j := i; j > 0 && present[j].Number() < present[j-1].Number(); j-- {
-			present[j], present[j-1] = present[j-1], present[j]
-		}
-	}
-	return present, nil
+	cached, _ := canonicalFieldOrder.LoadOrStore(descriptor, ordered)
+	return cached.([]protoreflect.FieldDescriptor), nil
 }
 
 func canonicalMessageSize(message protoreflect.Message, options canonicalWriteOptions) (int, error) {
-	fields, err := canonicalPresentFields(message)
+	fields, err := canonicalOrderedFields(message)
 	if err != nil {
 		return 0, err
 	}
 	total := 0
 	for _, field := range fields {
+		if !message.Has(field) {
+			continue
+		}
 		value := message.Get(field)
 		if field.IsMap() {
 			return 0, fmt.Errorf("%w: map fields have no canonical order", errNonCanonical)

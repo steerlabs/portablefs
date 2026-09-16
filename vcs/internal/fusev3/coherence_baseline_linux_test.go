@@ -37,6 +37,7 @@ type baselineMeasurement struct {
 	AuthorityFilesystemPerOp float64        `json:"authority_filesystem_requests_per_operation"`
 	AuthorityFilesystemKinds map[string]int `json:"authority_filesystem_breakdown,omitempty"`
 	AuthorityControlKinds    map[string]int `json:"authority_control_breakdown,omitempty"`
+	AuthorityBarrierSeconds  float64        `json:"authority_barrier_seconds,omitempty"`
 	AuthorityDrainSeconds    float64        `json:"authority_drain_seconds,omitempty"`
 }
 
@@ -77,7 +78,7 @@ func TestCoherenceBaseline(t *testing.T) {
 			if err := os.Mkdir(root, 0o700); err != nil {
 				t.Fatalf("create mounted install root: %v", err)
 			}
-			measureBaseline(t, "portablefs", fixture.counter, func() (coherencebench.WorkloadResult, error) {
+			measureBaseline(t, "portablefs", "install", fixture, func() (coherencebench.WorkloadResult, error) {
 				return coherencebench.Install(root, baselineInstallFiles, baselineInstallDirs, workers)
 			})
 		})
@@ -126,7 +127,7 @@ func TestCoherenceBaseline(t *testing.T) {
 		fixture.remount()
 		enableBaselineOpenTracking(fixture.counter)
 		for _, temperature := range []string{"cold", "warm"} {
-			measureBaseline(t, "portablefs", fixture.counter, func() (coherencebench.WorkloadResult, error) {
+			measureBaseline(t, "portablefs", temperature, fixture, func() (coherencebench.WorkloadResult, error) {
 				return coherencebench.GitStatus(root, temperature, baselineGitFiles)
 			})
 		}
@@ -152,7 +153,7 @@ func TestCoherenceBaseline(t *testing.T) {
 		if err := waitForEnumeratedName(fixture.mountPath(1), "peer", 30*time.Second); err != nil {
 			t.Fatalf("discover peer root through mount B: %v", err)
 		}
-		measureBaseline(t, "portablefs", fixture.counter, func() (coherencebench.WorkloadResult, error) {
+		measureBaseline(t, "portablefs", "peer", fixture, func() (coherencebench.WorkloadResult, error) {
 			return coherencebench.PeerWriteRead(rootA, rootB, baselinePeerFiles)
 		})
 	})
@@ -198,15 +199,29 @@ func waitForEnumeratedName(root, name string, timeout time.Duration) error {
 	}
 }
 
-func measureBaseline(t *testing.T, target string, counter *countingHandler, run func() (coherencebench.WorkloadResult, error)) {
+func measureBaseline(t *testing.T, target, phase string, fixture *integrationFixture, run func() (coherencebench.WorkloadResult, error)) {
 	t.Helper()
+	counter := fixture.counter
 	drainBaselineOpens(t, counter)
+	barrier := mustOpenFile(t, fixture.mountPath(0), os.O_RDONLY, 0)
+	defer barrier.Close()
+	stopProfile := startBaselineProfile(t, phase)
+	defer stopProfile()
 	meter := &baselineRequestMeter{byKind: make(map[string]int)}
 	counter.setBeforeHandle(meter.observe)
 	result, err := run()
 	if err != nil {
 		counter.setBeforeHandle(nil)
 		t.Fatalf("%s %s: %v", target, result.Scenario, err)
+	}
+
+	barrierStart := time.Now()
+	if err := barrier.Sync(); err != nil {
+		t.Fatalf("%s completion barrier: %v", result.Scenario, err)
+	}
+	barrierSeconds := time.Since(barrierStart).Seconds()
+	if err := barrier.Close(); err != nil {
+		t.Fatal(err)
 	}
 	// close(2) can return before FUSE RELEASE reaches the daemon. Keep counting
 	// through the corresponding Authority CLOSE replies, without adding that
@@ -229,7 +244,7 @@ func measureBaseline(t *testing.T, target string, counter *countingHandler, run 
 		AuthorityRequestsPerOp: totalRate, AuthorityFilesystem: filesystemTotal,
 		AuthorityFilesystemPerOp: filesystemRate, AuthorityFilesystemKinds: filesystem,
 		AuthorityControlKinds: control,
-		AuthorityDrainSeconds: drainSeconds,
+		AuthorityDrainSeconds: drainSeconds, AuthorityBarrierSeconds: barrierSeconds,
 	})
 }
 

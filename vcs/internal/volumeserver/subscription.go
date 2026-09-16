@@ -405,6 +405,15 @@ func (c *CoherenceCoordinator) Poll(ctx context.Context, token SubscriptionToken
 			if end-after > uint64(limit) {
 				end = after + uint64(limit)
 			}
+			needed := len(dst) + int(end-after)
+			if cap(dst) < needed {
+				// Grow amortized, but never retain more than one requested batch
+				// beyond the caller's existing prefix.
+				capacity := min(max(needed, 2*cap(dst)), len(dst)+limit)
+				grown := make([]StreamEvent, len(dst), capacity)
+				copy(grown, dst)
+				dst = grown
+			}
 			for pos := after + 1; pos <= end; pos++ {
 				event := c.log[(pos-1)%uint64(len(c.log))]
 				if event.Source == token.Session || event.Target != (SessionID{}) && event.Target != token.Session {

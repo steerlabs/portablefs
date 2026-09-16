@@ -624,6 +624,7 @@ func BenchmarkSourcePublicationAdmissionWithUnrelatedCoordinates(b *testing.B) {
 			}
 			raw.mu.Unlock()
 
+			b.ReportAllocs()
 			b.ResetTimer()
 			for iteration := 0; iteration < b.N; iteration++ {
 				lease, err := raw.acquireSourcePublication(context.Background(), gate)
@@ -669,5 +670,37 @@ func TestSourceCompletionWithdrawsSettledAttributesAndKeepsDataObligation(t *tes
 				t.Fatal("source completion discarded kernel data obligation")
 			}
 		})
+	}
+}
+
+func TestSourceChangedChannelIsDemandAllocated(t *testing.T) {
+	f := newStrictFixture(t)
+	r := f.raw
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sourceChanged != nil {
+		t.Fatal("uncontended setup allocated a wake channel")
+	}
+	for range 100 {
+		r.signalSourceChangedLocked()
+	}
+	if r.sourceChanged != nil {
+		t.Fatal("signals without waiters allocated a wake channel")
+	}
+	first := r.sourceChangedWaitLocked()
+	if second := r.sourceChangedWaitLocked(); second != first {
+		t.Fatal("waiters did not share a wake channel")
+	}
+	r.signalSourceChangedLocked()
+	select {
+	case <-first:
+	default:
+		t.Fatal("signal did not wake waiters")
+	}
+	if r.sourceChanged != nil {
+		t.Fatal("signal retained a closed channel")
+	}
+	if next := r.sourceChangedWaitLocked(); next == first {
+		t.Fatal("next waiter received the previous closed channel")
 	}
 }

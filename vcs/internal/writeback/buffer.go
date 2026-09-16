@@ -365,10 +365,13 @@ func (b *Buffer) Stop() {
 	b.cancel()
 	<-b.done
 }
+
+// The Authority has one reserved delegated-flush execution slot. A single
+// background worker avoids filling the ordinary RPC lane with timer work;
+// explicit fsync, recall and close flushes can overtake locally queued jobs.
 func (b *Buffer) schedule() {
 	defer close(b.done)
-	var wg sync.WaitGroup
-	defer wg.Wait()
+	var jobs []*file
 	var tick <-chan time.Time
 	if b.interval > 0 {
 		timer := time.NewTicker(b.interval)
@@ -394,20 +397,23 @@ func (b *Buffer) schedule() {
 				continue
 			}
 			f.scheduled = true
-			wg.Add(1)
-			go func(f *file) {
-				defer wg.Done()
-				_, err := b.FlushIdentity(b.ctx, f.id, cut)
-				b.mu.Lock()
-				f.scheduled = false
-				if err == nil && f.reschedule && f.accepted != nil {
-					f.reschedule = false
-					b.trigger()
-				}
-				b.mu.Unlock()
-			}(f)
+			jobs = append(jobs, f)
 		}
 		b.mu.Unlock()
+		// Dispatch outside the admission mutex. The scheduler itself is the
+		// single background worker; explicit flushes run independently.
+		for _, f := range jobs {
+			_, err := b.FlushIdentity(b.ctx, f.id, cut)
+			b.mu.Lock()
+			f.scheduled = false
+			if err == nil && f.reschedule && f.accepted != nil {
+				f.reschedule = false
+				b.trigger()
+			}
+			b.mu.Unlock()
+		}
+		clear(jobs)
+		jobs = jobs[:0]
 	}
 }
 

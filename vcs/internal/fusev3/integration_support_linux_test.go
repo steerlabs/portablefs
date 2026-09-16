@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
@@ -545,9 +546,11 @@ func (f *integrationFixture) start() {
 		MaxFrameBytesInFlight: integrationAllocationBudget,
 		HandshakeTimeout:      5 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second,
 	}
-	go func() { served <- f.server.Serve(ctx, listener, f.serverTLS) }()
+	go func() {
+		pprof.Do(ctx, pprof.Labels("component", "authority"), func(ctx context.Context) { served <- f.server.Serve(ctx, listener, f.serverTLS) })
+	}()
 
-	f.mountAll()
+	pprof.Do(ctx, pprof.Labels("component", "frontend"), func(context.Context) { f.mountAll() })
 }
 
 // mountAll installs every mountpoint against the running authority, each
@@ -652,7 +655,9 @@ func (f *integrationFixture) resumeAuthority() {
 	ctx, cancel := context.WithCancel(context.Background())
 	f.stopServe, f.served, f.stopped = cancel, make(chan error, 1), false
 	served := f.served
-	go func() { served <- f.server.Serve(ctx, listener, f.serverTLS) }()
+	go func() {
+		pprof.Do(ctx, pprof.Labels("component", "authority"), func(ctx context.Context) { served <- f.server.Serve(ctx, listener, f.serverTLS) })
+	}()
 }
 
 func (f *integrationFixture) closeStore() {

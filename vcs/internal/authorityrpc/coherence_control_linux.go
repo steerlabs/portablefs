@@ -72,6 +72,7 @@ type coherenceControlSession struct {
 	snapshot               *coherenceSnapshotState
 	coordinatorCursor      uint64
 	queued                 []volumeserver.StreamEvent
+	pollBuffer             []volumeserver.StreamEvent
 	controlDelivered       uint64
 	changeDelivered        uint64
 	changeAcked            uint64
@@ -491,9 +492,13 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 				return h.coherenceError(requestID, err)
 			}
 		}
+		// The sole active poll owns this bounded batch. Wire events and replay
+		// have independent storage, and the queue is fully drained here.
+		clear(session.pollBuffer)
+		dst := session.pollBuffer[:0]
 		state.mu.Unlock()
 
-		events, pollErr := h.Coherence.Poll(ctx, token, cursor, nil, coherenceControlBatchLimit)
+		events, pollErr := h.Coherence.Poll(ctx, token, cursor, dst, coherenceControlBatchLimit)
 		if pollErr != nil {
 			return h.coherenceError(requestID, pollErr)
 		}
@@ -502,9 +507,10 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 			state.mu.Unlock()
 			return h.coherenceError(requestID, volumeserver.ErrSubscription)
 		}
+		session.pollBuffer = events
 		if len(events) != 0 {
 			session.coordinatorCursor = events[len(events)-1].Position
-			session.queued = append(session.queued, events...)
+			session.queued = events
 		}
 		state.mu.Unlock()
 	}

@@ -148,15 +148,23 @@ run_host() {
   command -v docker >/dev/null || fail "docker is required to run the privileged integration suite" 69
   local root
   root=$(repository_root)
+  local profile_root=""
+  local -a profile_options=() docker_action=(run --rm)
+  if [[ -n "${PORTABLEFS_PROFILE_DIR:-}" ]]; then
+    mkdir -p -- "$PORTABLEFS_PROFILE_DIR"
+    profile_root=$(cd -- "$PORTABLEFS_PROFILE_DIR" && pwd)
+    profile_options=(-e PORTABLEFS_PROFILE_DIR=/profiles)
+    docker_action=(create)
+  fi
   echo "xfs-fuse-integration: launching ${PORTABLEFS_CI_IMAGE}"
   # The working tree is mounted read-only: the container provisions its own XFS
   # image and must never be able to mutate the checkout it is testing.
-  run_container() {
-    docker run --rm --privileged \
+  launch_container() {
+    docker "${docker_action[@]}" --privileged \
       --tmpfs /var/tmp:exec,mode=1777 \
       -v "${root}/vcs:/work/vcs:ro" \
       -v "${root}/scripts:/work/scripts:ro" \
-      "$@" \
+      "$@" "${profile_options[@]}" \
       -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
       -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
       -e "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
@@ -169,6 +177,22 @@ run_host() {
       "${PORTABLEFS_CI_IMAGE}" \
       bash /work/scripts/xfs-fuse-integration.sh --in-container
   }
+  run_container() {
+    if [[ -z "$profile_root" ]]; then
+      launch_container "$@"
+      return
+    fi
+    # Copy after the run instead of bind-mounting a host path: remote Docker
+    # contexts need not share /tmp (or any artifact directory) with the host.
+    profile_container=$(launch_container "$@")
+    trap 'if [[ -n "${profile_container:-}" ]]; then docker rm -f "$profile_container" >/dev/null 2>&1 || true; fi' EXIT
+    local status=0
+    docker start -a "$profile_container" || status=$?
+    docker cp "$profile_container:/profiles/." "$profile_root/" || status=1
+    docker rm "$profile_container" >/dev/null
+    profile_container=""
+    return "$status"
+  }
   if [[ -d /lib/modules/$(uname -r) ]]; then
     run_container -v /lib/modules:/lib/modules:ro
   else
@@ -177,6 +201,10 @@ run_host() {
 }
 
 install_container_dependencies() {
+  if [[ -n "${PORTABLEFS_PROFILE_DIR:-}" ]]; then
+    mkdir -p -- "$PORTABLEFS_PROFILE_DIR"
+    chmod 1777 "$PORTABLEFS_PROFILE_DIR"
+  fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   # xfsprogs: mkfs.xfs and xfs_quota. fuse3: the setuid fusermount3 helper the
@@ -268,6 +296,7 @@ suite_command() {
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
     "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
     "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
+    "PORTABLEFS_PROFILE_DIR=${PORTABLEFS_PROFILE_DIR:-}" \
     go -C /work/vcs test -v -count=1 -failfast -p 1 -timeout 35m \
     "${extra_go_test_flags[@]}" "$@"
 }

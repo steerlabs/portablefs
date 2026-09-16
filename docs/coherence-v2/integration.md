@@ -547,3 +547,90 @@ wrapper exits 70 for the intentionally omitted inventory. This replaces the v6
 ENOTCONN result with a successful fresh shipping-capacity run; no cache-size
 workaround remains. The bench package unit suite also passes. The complete
 measurement below will repeat this setup after the final bridge deletion.
+
+## Step 6: measurement and profile-driven changes
+
+Run 122 passes the full-size v7 baseline in 118.44 seconds: both install worker
+counts, fresh 20,000-file Git setup, cold/warm status, and overlapping peer
+write/list/read. The peer path now fails any enumeration error instead of
+retrying ESTALE. A root directory handle opened before each measured phase
+must pass its completion barrier; barrier and asynchronous CLOSE drain time
+are separate from the historical POSIX wall-time column. The complete records
+and protocol-6 comparison are in [results.md](results.md).
+
+Optional `PORTABLEFS_PROFILE_DIR` captures CPU, allocation deltas, mutex/block
+snapshots, and the exact executable. Authority and frontend are in the same
+real-mount test process: inherited CPU labels identify each component; heap
+analysis uses stacks. The Docker wrapper copies artifacts from the container's
+regular writable layer so remote Docker contexts need not share a host path.
+Runs 123–125 exposed profile-export plumbing mistakes (BSD chmod ordering,
+unshared host /tmp, then ephemeral tmpfs); run 125's install profiles were
+recovered before container teardown, and run 126 repeated Git profiles with
+working export. These were not product failures or passing full gates.
+
+The profiles drove four bounded changes:
+
+- Cache immutable canonical field order by schema descriptor; reevaluate field
+  presence and reject unknown fields on every message. The wire bytes and
+  replay fingerprints are unchanged.
+- Reuse one bounded CONTROL event batch only after its queue drains. Responses
+  and replay own their data; prefix growth is bounded by the requested batch.
+  Tests retain old responses across reuse, replay the current response, and
+  force frame splitting before reusing storage.
+- Allocate source-publication notification channels only when a waiter exists.
+  Predicates, waiter registration, and signaling remain under the same mutex.
+  The source gate scans request coordinates, not the global cache.
+- Replace one background goroutine per dirty identity with one scheduler
+  worker. The Authority already has one reserved delegated-flush execution
+  slot. A 32-worker intermediate experiment reduced contention but could fill
+  every ordinary client permit in the integration configuration. One worker
+  preserves room for explicit close/fsync/recall flushes and avoids a timer
+  stampede. Explicit flushes remain independent; queued jobs keep their cut,
+  kicks survive an active batch, and cancellation preserves retained entries.
+
+Focused run 129 passes canonical, control/replay, and source-publication tests;
+its exit 70 is omitted inventory. Native race run 131 passes authorityrpc,
+volumeserver, and writeback. Writeback race run 139 passes bounded dispatch,
+explicit bypass, cap rescheduling, and stop cancellation after the final
+single-worker change. Run 138 was a test-constant compile typo, corrected before
+139. The additional hot-path benchmarks report allocations as well as time.
+Final measurement and full-gate evidence follow below.
+
+Run 140 exposed a real backlog failure after the single-worker change: the
+8-worker install returned ENFILE at file 6,597. The unbounded background fan-out
+had masked per-file durability waits in the close batch. Close cleanup now
+applies every retiring file before waiting for each file's durable cut; no
+release or server CLOSE precedes durability. A blocked-barrier regression
+requires all 16 files to apply while no release can escape (run 142 passes;
+141 was a test-helper type mismatch corrected before that run).
+
+New OPEN/CREATE/TMPFILE and directory-handle admissions also wait when 256
+asynchronous closes are pending, before taking identity or source gates. The
+count includes work already removed from the queue into an active close batch.
+Completion and epoch-discard wake admission; cancellation is bounded by the
+request/mount context. QueueClose snapshots its epoch without retaining the
+epoch lock over a blocking enqueue. This bounds deferred cleanup below the
+unchanged 4,096-open integration limit rather than increasing the limit. The
+regression blocks real queued cleanup, checks admission cancellation, resumes
+cleanup, and requires the pending count to return to zero.
+
+The close producer gate now joins racing QueueClose calls before shutdown's
+final drain. A cancellation-ready enqueue can no longer land after the worker
+exits. Race run 146 stopped in a test setup deadlock: the fixture added handles
+after allowing a blocked close batch to take the same transition lock. It now
+registers every handle before enqueueing cleanup. Race run 149 passes the
+Linux delegation, pending-close, shutdown-race, publication-channel, control
+replay, frame-splitting, and canonical tests. Its exit 70 is solely the focused
+inventory omission. The 256-close threshold is backpressure with concurrent
+admission headroom, not a negotiated reservation for arbitrary smaller custom
+Authority open-table limits.
+
+Final run 150 passes every baseline phase in 112.96 seconds, including the
+fresh 20,000-file index/commit at capacity 65,536 and its passing root barrier.
+Final unprofiled wall times are 21.029/15.706 seconds for 1/8-worker installs,
+1.380/1.196 for cold/warm Git status, and 2.645 for the peer workload. The peer
+run verifies all 2,000 files with no ESTALE retry, but only one before the writer
+finishes; results.md discloses the changed overlap and mixed before/after v7
+wall times. Run 145 supplies final CPU/heap/mutex profiles for both components.
+These focused wrappers exit 70 for omitted inventory. Step 6 is measured and
+regression-tested; the final full gate remains the step-7 obligation.

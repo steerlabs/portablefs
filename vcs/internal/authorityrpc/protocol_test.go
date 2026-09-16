@@ -2,6 +2,7 @@ package authorityrpc
 
 import (
 	"bytes"
+	"io"
 	"reflect"
 	"testing"
 	"time"
@@ -302,6 +303,50 @@ func TestCachelessReaderOpenCannotAcquireWriteOrCachePermission(t *testing.T) {
 	} {
 		if requestAllowedForFrontend(&authoritypb.Request{Body: &authoritypb.Request_Open{Open: request}}, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER) {
 			t.Fatalf("cacheless open accepted %v", request)
+		}
+	}
+}
+
+// Reusing descriptor order must not cache a particular message's presence.
+func TestCanonicalDescriptorCacheTracksPresenceAndRejectsUnknownFields(t *testing.T) {
+	request := &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Item: []byte{1}, Mode: proto.Uint32(0)}}}
+	for _, mode := range []*uint32{proto.Uint32(0), nil, proto.Uint32(0o755), nil} {
+		request.GetSetAttr().Mode = mode
+		var got bytes.Buffer
+		if err := canonicalWrite(&got, request.ProtoReflect()); err != nil {
+			t.Fatal(err)
+		}
+		want, err := proto.MarshalOptions{Deterministic: true}.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got.Bytes(), want) {
+			t.Fatalf("cached field presence: got %x want %x", got.Bytes(), want)
+		}
+		size, err := canonicalMessageSize(request.ProtoReflect(), canonicalWriteOptions{})
+		if err != nil || size != len(want) {
+			t.Fatalf("size=%d err=%v want=%d", size, err, len(want))
+		}
+	}
+	request.GetSetAttr().ProtoReflect().SetUnknown([]byte{0xf8, 0x07, 0x01})
+	if err := canonicalWrite(io.Discard, request.ProtoReflect()); err == nil {
+		t.Fatal("cached descriptor admitted unknown nested fields")
+	}
+	if _, err := canonicalMessageSize(request.ProtoReflect(), canonicalWriteOptions{}); err == nil {
+		t.Fatal("cached descriptor sized unknown nested fields")
+	}
+}
+
+func BenchmarkCanonicalSmallWrite(b *testing.B) {
+	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: []byte{1}, Data: make([]byte, 1024)}}}
+	if err := canonicalWrite(io.Discard, request.ProtoReflect()); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if err := canonicalWrite(io.Discard, request.ProtoReflect()); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
