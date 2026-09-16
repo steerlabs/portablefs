@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -568,5 +569,86 @@ func TestCoherenceDelegationIDEncodingRejectsForeignDomain(t *testing.T) {
 	raw[0] ^= 0xff
 	if _, err := parseCoherenceDelegationID(raw); err == nil {
 		t.Fatal("foreign delegation domain was accepted")
+	}
+}
+
+func TestCoherenceReleaseCompletesRacingBreak(t *testing.T) {
+	for _, delivered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("delivered=%v", delivered), func(t *testing.T) {
+			handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+			id := volumeserver.SessionID{1}
+			subscribe, token := subscribeCoherenceControlTest(t, handler, id)
+			identity := [16]byte{93}
+			reservation, err := coordinator.ReserveNew(token, identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant, err := reservation.Grant(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := handler.rememberCoherenceDelegation(grant); err != nil {
+				t.Fatal(err)
+			}
+			change := pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, 0).GetControlEvent()
+			if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.Incarnation, 1); response.Errno != 0 {
+				t.Fatal(response)
+			}
+			done := make(chan error, 1)
+			go func() { done <- coordinator.BreakForRead(t.Context(), identity) }()
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			state := handler.initCoherenceControlState()
+			state.mu.Lock()
+			cursor := state.sessions[id].coordinatorCursor
+			state.mu.Unlock()
+			for found := false; !found; {
+				events, err := coordinator.Poll(ctx, token, cursor, nil, 128)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, event := range events {
+					cursor = event.Position
+					if event.Kind == volumeserver.StreamBreakForRead {
+						found = true
+					}
+				}
+			}
+			var event *authoritypb.ControlEvent
+			if delivered {
+				event = pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, change.Sequence).GetControlEvent()
+				if event.GetDelegationBreak() == nil {
+					t.Fatal(event)
+				}
+			}
+			request := &authoritypb.DelegationReleaseRequest{Incarnation: subscribe.Incarnation, Delegations: []*authoritypb.DelegationRelease{{Delegation: coherenceDelegationRefProto(grant)}}}
+			for attempt := 0; attempt < 2; attempt++ {
+				if response := handler.handleCoherenceDelegationRelease(20, id, request); response.Errno != 0 {
+					t.Fatal(response)
+				}
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("release did not complete peer break")
+			}
+			if delivered {
+				response := handler.handleCoherenceDelegationAck(21, id, coherenceControlBreak, subscribe.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0)
+				if response.Errno != 0 {
+					t.Fatal(response)
+				}
+			} else {
+				response := pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, change.Sequence)
+				if response.Errno != 0 || response.GetControlEvent().GetChangeBatch() == nil {
+					t.Fatalf("released reference emitted control obligation: %v", response)
+				}
+			}
+			if coordinator.LossSequence(id) != 0 {
+				t.Fatal("release recorded loss")
+			}
+		})
 	}
 }

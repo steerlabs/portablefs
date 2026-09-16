@@ -381,6 +381,23 @@ func (c *CoherenceCoordinator) DataMutated(ctx context.Context, token Subscripti
 // to finish instead of receiving a recall for a generation the client never
 // learned.
 func (c *CoherenceCoordinator) BeginSynchronousMutation(ctx context.Context, token SubscriptionToken, identity [16]byte) (*DelegationFlush, error) {
+	// A holder can already be executing a synchronous append, truncate, or
+	// metadata operation when a peer requests a cut. It must apply on the same
+	// lane as a delegated flush: queuing behind the peer would wait for a cut
+	// acknowledgment that the holder cannot send until this operation returns.
+	c.mu.Lock()
+	s, checkErr := c.subscriberLocked(token)
+	if checkErr != nil {
+		c.mu.Unlock()
+		return nil, checkErr
+	}
+	current := c.delegations[identity]
+	if current != nil && !current.retired && current.owner == s && current.grant.State != DelegationReserved {
+		current.active++
+		c.mu.Unlock()
+		return &DelegationFlush{coordinator: c, record: current}, nil
+	}
+	c.mu.Unlock()
 	r, err := c.Reserve(ctx, token, identity)
 	if err != nil {
 		return nil, err
@@ -851,15 +868,23 @@ func (c *CoherenceCoordinator) releaseBatch(token SubscriptionToken, grants []De
 		if r == nil || r.retired || r.owner != s || r.grant.ID != g.ID || r.grant.Generation != g.Generation {
 			return 0, ErrDelegationStale
 		}
-		if r.active != 0 || r.pending != nil || r.grant.State != DelegationActive {
+		if r.active != 0 || r.grant.State == DelegationReserved {
 			return 0, ErrDelegationBusy
 		}
-		if applied != nil && applied[index] < r.applied {
+		if applied != nil && applied[index] != r.applied {
 			return 0, ErrDelegationAck
 		}
 	}
 	for _, g := range grants {
-		c.dropDelegationLocked(c.delegations[g.Identity], false)
+		r := c.delegations[g.Identity]
+		// Last-handle release is a terminal cut: admission has stopped and all
+		// storage pins have drained. It also satisfies a racing peer cut,
+		// without requiring the holder to service CONTROL while closing.
+		if r.pending != nil {
+			r.pending.applied = r.applied
+			r.pending.done = true
+		}
+		c.dropDelegationLocked(r, false)
 	}
 	return c.position, nil
 }

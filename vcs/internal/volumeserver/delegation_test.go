@@ -353,6 +353,41 @@ func TestCoherenceSynchronousMutationPinsExistingHolderGrant(t *testing.T) {
 	}
 }
 
+func TestCoherenceHolderSynchronousMutationPassesPendingPeerCut(t *testing.T) {
+	for _, recall := range []bool{false, true} {
+		c, _ := cv2Coordinator(t)
+		holder := cv2Subscribe(t, c, 1)
+		identity := [16]byte{0x53}
+		grant := cv2Grant(t, c, holder, identity)
+		done := make(chan error, 1)
+		kind := StreamBreakForRead
+		if recall {
+			kind = StreamRecall
+		}
+		go func() {
+			if recall {
+				done <- c.Recall(t.Context(), identity)
+			} else {
+				done <- c.BreakForRead(t.Context(), identity)
+			}
+		}()
+		event := cv2Event(t, c, holder, kind)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		flush, err := c.BeginSynchronousMutation(ctx, holder, identity)
+		cancel()
+		if err != nil {
+			t.Fatalf("holder apply behind pending %v: %v", kind, err)
+		}
+		flush.End(23)
+		if err := c.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, 23); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestCoherenceSynchronousMutationRetainsSuccessfulGrant(t *testing.T) {
 	c, _ := cv2Coordinator(t)
 	holder := cv2Subscribe(t, c, 1)
@@ -840,5 +875,58 @@ func TestCoherencePermanentSessionEndDuringRecall(t *testing.T) {
 	}
 	if fresh.Token.Incarnation <= holder.Incarnation {
 		t.Fatal("forgotten incarnation was reused")
+	}
+}
+
+func TestCoherenceReleaseCompletesPendingPeerCut(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind StreamEventKind
+	}{
+		{"break", StreamBreakForRead},
+		{"recall", StreamRecall},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := cv2Coordinator(t)
+			holder := cv2Subscribe(t, c, 1)
+			identity := [16]byte{91}
+			grant := cv2Grant(t, c, holder, identity)
+			done := make(chan error, 1)
+			go func() {
+				if tc.kind == StreamRecall {
+					done <- c.Recall(t.Context(), identity)
+				} else {
+					done <- c.BreakForRead(t.Context(), identity)
+				}
+			}()
+			cv2Event(t, c, holder, tc.kind)
+			pin, err := c.BeginFlush(holder, identity, grant.ID, grant.Generation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{0}); !errors.Is(err, ErrDelegationBusy) {
+				t.Fatalf("active release = %v", err)
+			}
+			pin.End(13)
+			for _, ticket := range []uint64{0, 12, 14} {
+				if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{ticket}); !errors.Is(err, ErrDelegationAck) {
+					t.Fatalf("inexact release %d = %v", ticket, err)
+				}
+			}
+			if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{13}); err != nil {
+				t.Fatal(err)
+			}
+			if err := cv2Result(t, done); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := c.LookupDelegation(identity); exists {
+				t.Fatal("released grant remains live")
+			}
+			for _, event := range cv2AckAll(t, c, holder) {
+				if event.Kind == StreamLoss {
+					t.Fatal("release reported loss")
+				}
+			}
+		})
 	}
 }

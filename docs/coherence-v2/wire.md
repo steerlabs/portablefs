@@ -310,6 +310,12 @@ completion records so a retry after removing the live grant remains distinguisha
 from a stale-generation request. After release the authority
 emits DELEGATION_RELEASED. Unmount/planned restart must still wait for durability.
 
+A release whose exact applied ticket covers the final storage application also
+completes any pending recall, break, or mode-change cut for that reference. All
+storage pins must have drained. The authority suppresses an undelivered event
+for the released reference; an already delivered event is completed by the
+release. A later exact acknowledgment of that completed cut is idempotent.
+
 ## Root directory barrier
 
 `BarrierRequest` (request body 72) has `cut_sequence` (1).

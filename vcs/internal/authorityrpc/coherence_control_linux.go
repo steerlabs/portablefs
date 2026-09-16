@@ -542,6 +542,12 @@ func (h *VolumeHandler) nextCoherenceControlEventLocked(session *coherenceContro
 			}
 			return finishCoherenceControlEventLocked(session, event), true, nil
 		case volumeserver.StreamRecall, volumeserver.StreamBreakForRead, volumeserver.StreamDelegationMode:
+			if tracked := session.delegations[first.Delegation.ID]; tracked != nil &&
+				(tracked.retired || tracked.generation > first.Delegation.Generation) {
+				// A last-handle release can complete the terminal cut before
+				// its queued control event reaches the wire.
+				continue
+			}
 			if first.Delegation.ID == 0 || first.Delegation.Generation == 0 || first.Delegation.Identity == ([16]byte{}) ||
 				first.Request == 0 || first.Deadline.IsZero() {
 				return nil, false, errInternal
@@ -804,8 +810,14 @@ func (h *VolumeHandler) handleCoherenceDelegationRelease(requestID uint64, id vo
 	if _, err := h.Coherence.ReleaseAppliedBatch(token, grants, applied); err != nil {
 		return h.coherenceError(requestID, err)
 	}
-	for _, grant := range grants {
+	for i, grant := range grants {
 		session.delegations[grant.ID].retired = true
+		for _, obligation := range session.obligations {
+			if !obligation.completed && obligation.id == grant.ID && obligation.generation == grant.Generation {
+				obligation.completed = true
+				obligation.appliedSequence = applied[i]
+			}
+		}
 	}
 	session.releaseReplays[digest] = struct{}{}
 	return coherenceDelegationReleaseResponse(h, requestID)
