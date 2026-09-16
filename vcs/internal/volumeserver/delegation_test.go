@@ -481,13 +481,22 @@ func TestCoherenceCanceledReservationAndCutCleanUp(t *testing.T) {
 	ctx, cancel = context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- c.Recall(ctx, f) }()
-	cv2Event(t, c, a, StreamRecall)
+	event := cv2Event(t, c, a, StreamRecall)
 	cancel()
+	select {
+	case <-done:
+		t.Fatal("cancellation skipped holder drain")
+	default:
+	}
+	cv2CutAck(t, c, a, event, 0)
 	if err := cv2Result(t, done); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 	if _, ok := c.LookupDelegation(f); ok {
 		t.Fatal("canceled recall revived delegation")
+	}
+	if c.LossSequence(a.Session) != 0 {
+		t.Fatal("caller cancellation discarded holder data")
 	}
 }
 
@@ -544,5 +553,70 @@ func TestCoherenceAckRejectsFutureAppliedCut(t *testing.T) {
 	cv2CutAck(t, c, a, e, 0)
 	if err := cv2Result(t, done); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCoherencePermanentSessionEndDuringRecall(t *testing.T) {
+	c, clock := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	peer := cv2Subscribe(t, c, 2)
+	f, other := [16]byte{1}, [16]byte{2}
+	if ok, err := c.OpenCacheCapable(holder, other); !ok || err != nil {
+		t.Fatalf("open=%v %v", ok, err)
+	}
+	cv2Grant(t, c, holder, f, peer)
+	cv2AckAll(t, c, holder)
+	recalled := make(chan error, 1)
+	go func() { recalled <- c.Recall(t.Context(), f) }()
+	cv2Event(t, c, holder, StreamRecall)
+	// Backing reads needed by a flushing holder must not queue behind recall.
+	guard, err := c.DataConsumed(t.Context(), holder, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard.Release()
+	position := c.OnCommit([]ChangeEntry{{Kind: AttributesChanged, Identity: other, VolumeVersion: 1}})
+	withdrawn := make(chan error, 1)
+	go func() { withdrawn <- c.WaitWithdrawn(t.Context(), position, peer.Session) }()
+	c.ExpireSession(holder.Session)
+	if err := cv2Result(t, recalled); err != nil {
+		t.Fatal(err)
+	}
+	if c.LossSequence(holder.Session) != 1 {
+		t.Fatal("terminal holder did not record loss")
+	}
+	if err := c.CheckSession(holder); !errors.Is(err, ErrSessionFenced) {
+		t.Fatal(err)
+	}
+	if err := c.ForgetSession(holder.Session); !errors.Is(err, ErrSessionActive) {
+		t.Fatalf("forgot old cache horizon: %v", err)
+	}
+	c.mu.Lock()
+	handlesRemain := c.cacheHandles[other] != nil
+	c.mu.Unlock()
+	if handlesRemain {
+		t.Fatal("terminal handles retained")
+	}
+	select {
+	case <-withdrawn:
+		t.Fatal("terminal runtime shortened cache horizon")
+	default:
+	}
+	clock.Advance(SubscriptionTTL)
+	if err := cv2Result(t, withdrawn); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ForgetSession(holder.Session); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckSession(holder); !errors.Is(err, ErrSubscription) {
+		t.Fatal(err)
+	}
+	fresh, err := c.Subscribe(holder.Session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Token.Incarnation <= holder.Incarnation {
+		t.Fatal("forgotten incarnation was reused")
 	}
 }

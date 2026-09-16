@@ -505,12 +505,15 @@ func (c *CoherenceCoordinator) Recall(ctx context.Context, identity [16]byte) er
 	}
 }
 func (c *CoherenceCoordinator) cut(ctx context.Context, r *delegationRecord, recall bool) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	c.mu.Lock()
 	c.expireLocked()
 	if r.retired {
 		seq := r.applied
 		c.mu.Unlock()
-		return seq, nil
+		return seq, ctx.Err()
 	}
 	p := r.pending
 	if p == nil {
@@ -534,27 +537,21 @@ func (c *CoherenceCoordinator) cut(ctx context.Context, r *delegationRecord, rec
 		if p.done || r.retired {
 			seq := max(p.applied, r.applied)
 			c.mu.Unlock()
-			return seq, nil
+			return seq, ctx.Err()
 		}
 		if !c.clock.Now().Before(p.deadline) {
 			c.dropDelegationLocked(r, true)
 			seq := r.applied
 			c.mu.Unlock()
-			return seq, nil
+			return seq, ctx.Err()
 		}
 		changed := c.notificationLocked()
 		deadline := minTime(p.deadline, r.owner.horizon)
 		c.mu.Unlock()
-		if err := c.wait(ctx, changed, deadline); err != nil {
-			// Once a cut was sent, cancellation cannot revive the retiring generation.
-			// Retire conservatively; active flush pins still prevent reassignment.
-			c.mu.Lock()
-			if !p.done && !r.retired {
-				c.dropDelegationLocked(r, true)
-			}
-			c.mu.Unlock()
-			return 0, err
-		}
+		// A sent cut is a terminal obligation, even if its triggering read or
+		// mutation is canceled. Give the healthy holder its entire drain budget;
+		// cancellation alone must not discard acknowledged buffered writes.
+		_ = c.wait(context.WithoutCancel(ctx), changed, deadline)
 	}
 }
 
