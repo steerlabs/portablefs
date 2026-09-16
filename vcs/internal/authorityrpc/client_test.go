@@ -47,8 +47,8 @@ func testPreKernelMountAbsence(context.Context) (*authoritypb.MountAbsenceProof,
 	}, nil
 }
 
-// coherentTestClientConfig keeps ordinary transport tests on the exact
-// protocol-6 mount contract.
+// coherentTestClientConfig keeps ordinary transport tests on the exact Linux
+// protocol-7 mount contract.
 func coherentTestClientConfig(address string, clientTLS *tls.Config, volumeID string, replaySlots uint32, maxInFlight int) ClientConfig {
 	return ClientConfig{
 		Address: address, TLS: clientTLS, VolumeID: volumeID, AccessToken: []byte("cap"),
@@ -335,7 +335,6 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 		response.Body = &authoritypb.Response_Activate{Activate: &authoritypb.ActivateReply{
 			Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000,
 			AuthorizationDeadlineUnixNanos: deadline, RoutesRevision: append([]byte(nil), req.GetSession().GetId()...),
-			LeaseCursor:     &authoritypb.LeaseEventCursor{},
 			State:           authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
@@ -370,7 +369,7 @@ func (h clientTestHandler) Handle(ctx context.Context, req *authoritypb.Request)
 	return response
 }
 
-func TestStrictClientReservesAnIndependentLeaseControlLane(t *testing.T) {
+func TestStrictClientReservesIndependentProtocol7ControlLanes(t *testing.T) {
 	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, 5, time.Minute)
 	defer stop()
 	client, err := DialClient(context.Background(), ClientConfig{
@@ -385,14 +384,14 @@ func TestStrictClientReservesAnIndependentLeaseControlLane(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if cap(client.ordinary.permits) != 3 || cap(client.leaseControl.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 2 {
-		t.Fatalf("strict lanes ordinary/lease-control/liveness/blocking = %d/%d/%d/%d, want 3/1/1/2",
-			cap(client.ordinary.permits), cap(client.leaseControl.permits), cap(client.liveness.permits), cap(client.blocking.permits))
+	if cap(client.ordinary.permits) != 3 || cap(client.controlPoll.permits) != 1 || cap(client.controlAck.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 2 {
+		t.Fatalf("strict lanes ordinary/poll/ack/liveness/blocking = %d/%d/%d/%d/%d, want 3/1/1/1/2",
+			cap(client.ordinary.permits), cap(client.controlPoll.permits), cap(client.controlAck.permits), cap(client.liveness.permits), cap(client.blocking.permits))
 	}
-	next := &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{NextLeaseEvent: &authoritypb.NextLeaseEventRequest{}}}
-	ack := &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{AcknowledgeLeaseEvent: &authoritypb.AcknowledgeLeaseEventRequest{}}}
-	if client.laneFor(next) != &client.leaseControl || client.laneFor(ack) != &client.leaseControl {
-		t.Fatal("lease control calls did not use the reserved lane")
+	next := &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
+	ack := &authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}
+	if client.laneFor(next) != &client.controlPoll || client.laneFor(ack) != &client.controlAck {
+		t.Fatal("subscription control calls did not use independent reserved lanes")
 	}
 	keepalive := &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}
 	if client.laneFor(keepalive) != &client.liveness {
@@ -409,19 +408,24 @@ func TestFrontendProfileControlMethodsCannotCrossProfiles(t *testing.T) {
 	if err := linux.AckVisibility(ctx, &authoritypb.VisibilityCursor{}); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("Linux AckVisibility error = %v, want EOPNOTSUPP", err)
 	}
+	if _, err := linux.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{
+		NextLeaseEvent: &authoritypb.NextLeaseEventRequest{},
+	}}); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("Linux legacy lease request error = %v, want EOPNOTSUPP", err)
+	}
 
 	fskit := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR}}
-	if _, err := fskit.NextLeaseEvent(ctx, nil); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("FSKit NextLeaseEvent error = %v, want EOPNOTSUPP", err)
+	if _, _, err := fskit.Subscribe(ctx, nil, nil); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("FSKit Subscribe error = %v, want EOPNOTSUPP", err)
 	}
-	if err := fskit.AcknowledgeLeaseEvent(ctx, &authoritypb.LeaseEventCursor{}, nil); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("FSKit AcknowledgeLeaseEvent error = %v, want EOPNOTSUPP", err)
+	if _, err := fskit.RenewSubscription(ctx, 1); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("FSKit RenewSubscription error = %v, want EOPNOTSUPP", err)
 	}
-	if err := fskit.AcknowledgeSourceLeaseDischarge(ctx, 1); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("FSKit AcknowledgeSourceLeaseDischarge error = %v, want EOPNOTSUPP", err)
+	if _, err := fskit.NextControlEvent(ctx, 1, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("FSKit NextControlEvent error = %v, want EOPNOTSUPP", err)
 	}
-	if _, err := fskit.RenewLeases(ctx, nil); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatalf("FSKit RenewLeases error = %v, want EOPNOTSUPP", err)
+	if err := fskit.AcknowledgeChanges(ctx, 1, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("FSKit AcknowledgeChanges error = %v, want EOPNOTSUPP", err)
 	}
 }
 
@@ -639,7 +643,7 @@ func (h *strictContractHandler) Handle(_ context.Context, req *authoritypb.Reque
 			Root: testAuthorityRoot(), Features: features, SessionLeaseMilliseconds: 30_000,
 			RoutesRevision: make([]byte, 32), State: authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
-			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, LeaseCursor: &authoritypb.LeaseEventCursor{},
+			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
 		}}
 	case req.GetResume() != nil:
 		response.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}
@@ -664,7 +668,7 @@ func (h *strictContractHandler) recordedDetach() *authoritypb.DetachRequest {
 // committedCleanupHandler models only the ownership boundary under test: an
 // ACTIVE response means the strict membership is durable, and only a
 // successful authenticated Detach removes it. Transport state transitions are
-// still exercised by the real protocol-6 Server around this handler.
+// still exercised by the real protocol-7 Server around this handler.
 type committedCleanupHandler struct {
 	clientTestHandler
 	mutateActive    func(*authoritypb.ActivateReply)
@@ -2596,7 +2600,6 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 			RoutesRevision:           make([]byte, 32), State: authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-			LeaseCursor:     &authoritypb.LeaseEventCursor{},
 		}}}
 	case *authoritypb.Request_Resume:
 		var cred volumeserver.SessionCredential
@@ -2887,7 +2890,6 @@ func (h *blockingLockHandler) Handle(ctx context.Context, req *authoritypb.Reque
 			State:           authoritypb.SessionState_SESSION_STATE_ACTIVE,
 			Purpose:         authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT,
 			FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-			LeaseCursor:     &authoritypb.LeaseEventCursor{},
 		}}
 	case *authoritypb.Request_Resume:
 		response.Body = &authoritypb.Response_Resume{Resume: &authoritypb.ResumeReply{State: authoritypb.SessionState_SESSION_STATE_ACTIVE}}

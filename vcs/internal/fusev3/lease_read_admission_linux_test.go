@@ -4,7 +4,6 @@ package fusev3
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -17,77 +16,44 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
-func attrRecall(identity []byte, grantEpoch, revokeEpoch uint64) *authoritypb.LeaseRecall {
-	return &authoritypb.LeaseRecall{
-		Coordinate: &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, Identity: identity},
-		Right:      authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, GrantEpoch: grantEpoch, RevokeEpoch: revokeEpoch,
-	}
-}
-
-// TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled covers the lane
-// race the successor grant introduced: CONTROL and the mutation reply are
-// independent, so a peer's REVOKE for a coordinate can reach this mount before
-// the reply carrying a successor grant over the same coordinate does. Installing
-// that grant would hand the frontend authority over state a recall is in the
-// middle of taking away.
-func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
-	fixture := newStrictFixture(t)
-	registry := fixture.mount.leases
-	identity := testIdentity(90)
-	key := leaseKey{
-		family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, identity: publicationIdentity(identity),
-	}
-	now := time.Now()
-	if accepted := registry.install(mustValidateLeaseGrant(t, attrGrant(identity, 4, 8), now), now); len(accepted) != 1 {
-		t.Fatalf("initial attribute grant was refused: %+v", accepted)
-	}
-	if remaining := registry.remaining(key, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, now); remaining <= 0 {
-		t.Fatal("the coordinate was not held before the recall")
-	}
-
-	recalls := []*authoritypb.LeaseRecall{attrRecall(identity, 4, 5)}
-	if _, err := registry.beginRecalls(context.Background(), 12, recalls); err != nil {
-		t.Fatalf("deliver the peer REVOKE: %v", err)
-	}
-	accepted := registry.install(mustValidateLeaseGrant(t, attrGrant(identity, 6, 12), now), now)
-	if len(accepted) != 0 {
-		t.Fatalf("successor grant installed under a pending recall: %+v", accepted)
-	}
-	if remaining := registry.remaining(key, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, now); remaining > 0 {
-		t.Fatalf("a follow-up stat would be served locally for %v instead of missing to the authority", remaining)
-	}
-
-	if _, err := registry.completeRecalls(recalls); err != nil {
-		t.Fatalf("complete the peer recall: %v", err)
-	}
-	registry.finishRecalls(recalls)
-
-	// The recall is over, but its issued-generation floor is not: a grant minted
-	// before the recall's sequence is still stale and must not install.
-	if accepted := registry.install(mustValidateLeaseGrant(t, attrGrant(identity, 7, 11), now), now); len(accepted) != 0 {
-		t.Fatalf("grant below the recall floor installed: %+v", accepted)
-	}
-	if remaining := registry.remaining(key, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, now); remaining > 0 {
-		t.Fatalf("a stale-generation grant became a local stat answer for %v", remaining)
-	}
-	if accepted := registry.install(mustValidateLeaseGrant(t, attrGrant(identity, 8, 12), now), now); len(accepted) != 1 {
-		t.Fatalf("grant at the recall floor was refused: %+v", accepted)
-	}
-	if remaining := registry.remaining(key, authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ, now); remaining <= 0 {
-		t.Fatal("the coordinate did not become cacheable again after the recall completed")
-	}
-}
-
-func mustValidateLeaseGrant(t *testing.T, grant *authoritypb.LeaseGrant, now time.Time) []validatedLeaseGrant {
+func activeSubscriptionFixture(t *testing.T, incarnation uint64) (*subscriptionRegistry, *subscriptionTestClock, *subscriptionTestRPC, *subscriptionTestInvalidator) {
 	t.Helper()
-	grants, err := validateLeaseGrants([]*authoritypb.LeaseGrant{grant}, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return grants
+	clock := &subscriptionTestClock{now: time.Now()}
+	rpc := &subscriptionTestRPC{horizon: clock.Now().Add(time.Minute)}
+	invalidator := &subscriptionTestInvalidator{}
+	registry := newSubscriptionTestRegistry(clock, rpc, invalidator, nil)
+	registry.mu.Lock()
+	registry.active = true
+	registry.incarnation = incarnation
+	registry.generation = 1
+	registry.watermark = 1
+	registry.horizon = rpc.horizon
+	registry.cacheUntil = rpc.horizon.Add(-time.Second)
+	registry.mu.Unlock()
+	return registry, clock, rpc, invalidator
 }
 
-// TestBlockingReadNeverFailsWhileAPeerRewritesTheFile is the regression the
+// TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled now covers the
+// equivalent protocol-7 race: a reply admitted before a change delivery may
+// complete after that delivery, but its exact-coordinate generation cannot be
+// installed and delegation exclusion must take effect immediately.
+func TestSuccessorGrantLosingToAnEarlierPeerRecallIsNotInstalled(t *testing.T) {
+	registry, clock, _, _ := activeSubscriptionFixture(t, 1)
+	identity := subscriptionIdentity(21)
+	coordinate := publicationCoordinate{kind: publicationItemData, item: identity}
+	preWithdrawal := registry.stamp()
+	entry := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 2, Kind: authoritypb.ChangeKind_CHANGE_KIND_DELEGATION_GRANTED, Identity: identity[:]}
+	if err := registry.registerChangeBatch(1, &authoritypb.ChangeBatch{Incarnation: 1, Entries: []*authoritypb.ChangeEntry{entry}}); err != nil {
+		t.Fatalf("register grant withdrawal: %v", err)
+	}
+	if got := registry.remaining(coordinate, preWithdrawal, 2, clock.Now()); got != 0 {
+		t.Fatalf("reply admitted before delegation withdrawal survived for %s", got)
+	}
+	if got := registry.remaining(coordinate, registry.stamp(), 2, clock.Now()); got != 0 {
+		t.Fatalf("delegated identity admitted data caching for %s", got)
+	}
+}
+
 // lease protocol's read admission exists for. A blocking read(2) has no
 // retryable errno: EAGAIN reaches the caller verbatim, where a Go runtime
 // registers the descriptor with its poller and never wakes. Every coherence

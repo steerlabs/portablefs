@@ -570,35 +570,6 @@ func (l *sourcePublicationLease) attachBinding(ctx context.Context, namespace pu
 	return l.drain(ctx)
 }
 
-// attachDischarge closes the exact coordinates learned from the authority
-// before their source purge. Otherwise a delayed cache reply could install
-// between that purge and operation-specific child binding. Draining first
-// makes the purge cover every reply admitted while the identity was unknown.
-func (l *sourcePublicationLease) attachDischarge(ctx context.Context, discharge *authoritypb.SourceLeaseDischarge) error {
-	var coordinates map[publicationCoordinate]struct{}
-	l.r.mu.Lock()
-	for _, recall := range discharge.GetRecalls() {
-		grant, err := validateLeaseRecall(recall)
-		if err != nil {
-			l.r.mu.Unlock()
-			return err
-		}
-		if coordinate, ok := grant.key().publicationCoordinate(); ok {
-			if _, held := l.coordinates[coordinate]; !held {
-				if coordinates == nil {
-					coordinates = make(map[publicationCoordinate]struct{})
-				}
-				coordinates[coordinate] = struct{}{}
-			}
-		}
-	}
-	l.r.mu.Unlock()
-	if err := l.attachCoordinates(coordinates); err != nil {
-		return err
-	}
-	return l.drain(ctx)
-}
-
 // Reply-discovered coordinates must not wait for another source owner: that
 // owner's authority call may be waiting for this reply's discharge. Join its
 // exact closure instead. Multiple owners suppress even their own cache installs
@@ -770,4 +741,16 @@ func (r *rawFileSystem) settleSourcePublicationLocked(coordinate publicationCoor
 		delete(r.sourcePublishing, coordinate)
 	}
 	r.signalSourceChangedLocked()
+}
+
+// retireEpoch preserves the physical reply cut but abandons the old epoch's
+// post-state obligation. That session can no longer supply valid capabilities;
+// cold subscription admission remains closed until recovery completes.
+func (l *sourcePublicationLease) retireEpoch() {
+	l.r.mu.Lock()
+	l.ready = true
+	l.names = nil
+	l.unresolvedAttributes, l.unresolvedData = 0, 0
+	l.r.signalSourceChangedLocked()
+	l.r.mu.Unlock()
 }

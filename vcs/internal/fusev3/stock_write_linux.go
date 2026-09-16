@@ -25,6 +25,9 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 	if handleRecord.inode == nil || input.NodeId != handleRecord.inode.id || handleRecord.inode.key.kind != authoritypb.Attr_REGULAR || handle.node != handleRecord.inode.node {
 		return 0, fuse.EBADF
 	}
+	if handle.stale.Load() || handle.node.stale.Load() {
+		return 0, fuse.EIO
+	}
 	inode := handleRecord.inode.key.inode
 	placement := resolveAppendPlacement(input.Flags&uint32(syscall.O_APPEND) != 0, input.Offset)
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
@@ -32,19 +35,71 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		return 0, lifecycle
 	}
 	defer finish()
+	identity := handleRecord.inode.identity[:]
+	if handle.observeLoss() {
+		return 0, fuse.EIO
+	}
+	if err := handle.node.ensureWriteDelegation(ctx, handle); err != nil {
+		return 0, fuse.Status(delegationErrno(err))
+	}
+	syncWrite := input.Flags&uint32(syscall.O_SYNC) == uint32(syscall.O_SYNC) || input.Flags&uint32(unix.O_DSYNC) != 0
+	if !placement.append {
+		gate, err := itemSourceGate(handle.node.item, true)
+		if err != nil {
+			return 0, fuse.EIO
+		}
+		callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
+		if callback == nil || r.mount.raw == nil {
+			return 0, fuse.EIO
+		}
+		lease, err := callback.acquireSource(ctx, r.mount.raw, gate)
+		if err != nil {
+			return 0, fuse.Status(delegationErrno(err))
+		}
+		if err := lease.markAssigned(); err != nil {
+			lease.revoke()
+			return 0, fuse.EIO
+		}
+		if _, err := r.mount.delegations.Write(ctx, identity, int64(placement.position), data, syncWrite); err != nil {
+			lease.resolveAllNoBinding()
+			_ = lease.markDefiniteNoChange()
+			return 0, fuse.Status(delegationErrno(err))
+		}
+		if err := completeSourcePublication(ctx); err != nil {
+			_ = r.mount.delegations.DropIdentity(identity, "holder kernel range invalidation failed")
+			return 0, fuse.EIO
+		}
+		return input.Size, fuse.OK
+	}
 	gate, err := itemSourceGate(handle.node.item, true)
 	if err != nil {
 		return 0, fuse.EIO
 	}
-	response, errno := handle.node.mutateWithSource(ctx, &authoritypb.Request{
-		Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+	request := func(ref *authoritypb.DelegationRef) *authoritypb.Request {
+		return &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
 			Handle: cloneBytes(handle.token), Position: placement.position, LockOwner: input.LockOwner,
 			Size: input.Size, WriteFlags: input.WriteFlags, Data: data,
-			Append:   placement.append,
-			Sync:     input.Flags&uint32(syscall.O_SYNC) == uint32(syscall.O_SYNC),
-			DataSync: input.Flags&uint32(syscall.O_SYNC) != uint32(syscall.O_SYNC) && input.Flags&uint32(unix.O_DSYNC) != 0,
-		}},
-	}, gate)
+			Append: placement.append, Sync: input.Flags&uint32(syscall.O_SYNC) == uint32(syscall.O_SYNC),
+			DataSync:   input.Flags&uint32(syscall.O_SYNC) != uint32(syscall.O_SYNC) && input.Flags&uint32(unix.O_DSYNC) != 0,
+			Delegation: ref,
+		}}}
+	}
+	var response *authoritypb.Response
+	var errno syscall.Errno
+	if r.mount.delegations.Owns(identity) {
+		response, err = r.mount.delegations.Synchronous(ctx, identity, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+			candidate, callErrno := handle.node.mutateWithSource(ctx, request(ref), gate)
+			if callErrno != 0 {
+				return candidate, callErrno
+			}
+			return candidate, nil
+		})
+		if err != nil {
+			return 0, fuse.Status(delegationErrno(err))
+		}
+	} else {
+		response, errno = handle.node.mutateWithSource(ctx, request(nil), gate)
+	}
 	if errno != 0 {
 		return 0, fuse.Status(errno)
 	}
@@ -100,4 +155,18 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		return 0, fuse.Status(syscall.ENOTCONN)
 	}
 	return uint32(reply.GetCommittedSize()), fuse.OK
+}
+
+func delegationErrno(err error) syscall.Errno {
+	if err == nil {
+		return 0
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) && errno != 0 {
+		return errno
+	}
+	if mapped := contextErrno(err); mapped != 0 {
+		return mapped
+	}
+	return syscall.EIO
 }
