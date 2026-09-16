@@ -101,12 +101,11 @@ func TestCoherenceBaseline(t *testing.T) {
 	})
 
 	t.Run("git-portablefs", func(t *testing.T) {
-		preparationConfig := baselineIntegrationConfig(1)
-		// The 20k setup disconnected during git add with the shipping cache.
-		// Prepare with the working integration cache, then recreate the Authority
-		// and mount with the shipping capacity before either measured status.
-		preparationConfig.CachedNameCapacity = integrationCachedNames
-		fixture := newIntegrationFixture(t, preparationConfig)
+		// Reproduce the v6 ENOTCONN at the shipping capacity from the first
+		// CREATE through git add and commit; no smaller-cache setup workaround.
+		fixture := newIntegrationFixture(t, baselineIntegrationConfig(1))
+		barrier := mustOpenFile(t, fixture.mountPath(0), os.O_RDONLY, 0)
+
 		root := fixture.join(0, "repo")
 		if err := os.Mkdir(root, 0o700); err != nil {
 			t.Fatalf("create mounted git repository: %v", err)
@@ -114,7 +113,16 @@ func TestCoherenceBaseline(t *testing.T) {
 		if err := coherencebench.PrepareGit(root, baselineGitFiles); err != nil {
 			t.Fatalf("prepare mounted git repository: %v; mount health: %s", err, fixture.sessionDiagnostics())
 		}
-		fixture.cfg.CachedNameCapacity = baselineNameCapacity
+		if err := barrier.Sync(); err != nil {
+			t.Fatalf("fresh 20000-file git barrier: %v", err)
+		}
+		if err := barrier.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if fixture.mounts[0].isRevoked() || fixture.clients[0].SessionEndCause() != nil || !isMounted(t, fixture.mountPath(0)) {
+			t.Fatalf("fresh 20000-file git lost mount: %s", fixture.sessionDiagnostics())
+		}
+		t.Logf("PORTABLEFS_GIT_ADD_REGRESSION files=%d cached_name_capacity=%d committed=true barrier=PASS mount=LIVE", baselineGitFiles, fixture.cfg.CachedNameCapacity)
 		fixture.remount()
 		enableBaselineOpenTracking(fixture.counter)
 		for _, temperature := range []string{"cold", "warm"} {

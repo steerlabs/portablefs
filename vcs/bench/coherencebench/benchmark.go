@@ -193,6 +193,16 @@ func PrepareGit(root string, fileCount int) error {
 	if err := runGit(root, "add", "."); err != nil {
 		return err
 	}
+
+	command := exec.Command("git", "-C", root, "ls-files", "-z")
+	command.Env = append(os.Environ(), "LC_ALL=C", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	tracked, err := command.Output()
+	if err != nil {
+		return fmt.Errorf("verify git index: %w", err)
+	}
+	if count := bytes.Count(tracked, []byte{0}); count != fileCount {
+		return fmt.Errorf("git add tracked %d files, want %d", count, fileCount)
+	}
 	if err := runGit(root, "commit", "-q", "-m", "coherence baseline"); err != nil {
 		return err
 	}

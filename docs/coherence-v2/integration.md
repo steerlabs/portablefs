@@ -529,3 +529,21 @@ focused Docker run 121 passes the handler/coherence/stock-write suites, includin
 three new Linux/Mac exclusion and dependency-validation regressions. Run 119
 was a compile typo, corrected before 121. The focused wrapper's exit 70 is only
 unrun full-suite inventory.
+
+## Step 5: fresh 20,000-file Git regression
+
+The baseline's setup-capacity override is deleted. `git-portablefs` starts a
+fresh mount at 65,536 cached names, writes 20,000 files, runs `git add`, checks
+that the index contains exactly 20,000 paths, and commits. A root handle opened
+before preparation must fsync successfully, and the original mount/session must
+still be live before the cold-status remount. The remount uses the same shipping
+capacity and retains the v6 cold/warm measurement boundary.
+
+Run 118 uses
+`PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$/^git-portablefs$' bash scripts/xfs-fuse-integration.sh`.
+It passes in 65.70 seconds, logs `files=20000 cached_name_capacity=65536
+committed=true barrier=PASS mount=LIVE`, and passes both status phases. The
+wrapper exits 70 for the intentionally omitted inventory. This replaces the v6
+ENOTCONN result with a successful fresh shipping-capacity run; no cache-size
+workaround remains. The bench package unit suite also passes. The complete
+measurement below will repeat this setup after the final bridge deletion.
