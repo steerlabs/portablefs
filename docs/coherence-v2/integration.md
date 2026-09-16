@@ -634,3 +634,33 @@ finishes; results.md discloses the changed overlap and mixed before/after v7
 wall times. Run 145 supplies final CPU/heap/mutex profiles for both components.
 These focused wrappers exit 70 for omitted inventory. Step 6 is measured and
 regression-tested; the final full gate remains the step-7 obligation.
+
+
+## Step 7: final-gate corrections and public contracts
+
+Full run 151 passes Darwin Foundation/cgo and Linux static builds/vet,
+govulncheck, native Go and race suites, the go-fuse reply seam, the native
+Swift/Xcode inventory (344 enumerated and passed), release policy, and
+architecture scans. The real-mount suite then fails the SQLite handoff: the
+first mount sees two rows instead of three. This is not a passing full gate.
+
+Focused run 152 reproduces on repetition six. Run 153 captures the previously
+ignored holder process output and proves its COMMIT failed with SQLITE_BUSY;
+`busy_timeout=0` allowed no wait for the contender's transient SHARED lock.
+Closing stdin then rolled the uncommitted holder transaction back. SQLite
+[documents this COMMIT result](https://www.sqlite.org/lang_transaction.html).
+The fixture now gives the holder the same bounded 60-second busy timeout as the
+waiter, checks its exit status, and requires the exact three ordered row values
+on both mounts in addition to integrity and count. The contender still uses an
+ordinary implicit INSERT transaction, must remain blocked for the full one-second
+hold, and both mounts' first final queries must be correct. No filesystem
+implementation or coherence guarantee changed. Run 154 passes all 30 repetitions;
+the focused wrapper exits 70 only because the other required tests were omitted.
+
+Public contracts replace the v6 description with subscription, delegation,
+break-for-read, stable-cookie enumeration, barrier/loss, and cold epoch recovery.
+The three design residuals are copied verbatim into portable-coherence.md.
+Architecture, consistency, failure, matrix, performance, README, compatibility,
+and changelog text now agree with those interfaces. Full-gate qualification
+follows below; earlier status sections in this chronological record describe
+work outstanding at the time of each run.

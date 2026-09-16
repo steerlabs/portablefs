@@ -1396,6 +1396,8 @@ func requireSQLiteRollbackJournalHandoff(t *testing.T, f *integrationFixture) {
 	}
 
 	holder := exec.Command("sqlite3", databaseA)
+	var holderOutput bytes.Buffer
+	holder.Stdout, holder.Stderr = &holderOutput, &holderOutput
 	stdin, err := holder.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -1403,8 +1405,17 @@ func requireSQLiteRollbackJournalHandoff(t *testing.T, f *integrationFixture) {
 	if err := holder.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = holder.Wait() }()
-	if _, err := io.WriteString(stdin, "PRAGMA busy_timeout=0;\nBEGIN IMMEDIATE;\nINSERT INTO items VALUES('holder');\n"); err != nil {
+	holderWaited := false
+	defer func() {
+		if !holderWaited {
+			_ = holder.Process.Kill()
+			_ = holder.Wait()
+		}
+	}()
+	// The contender briefly takes SHARED while attempting RESERVED. COMMIT
+	// must be allowed to wait for that reader when upgrading to EXCLUSIVE;
+	// busy_timeout=0 can legally abort this transaction before lock handoff.
+	if _, err := io.WriteString(stdin, "PRAGMA busy_timeout=60000;\nBEGIN IMMEDIATE;\nINSERT INTO items VALUES('holder');\n"); err != nil {
 		t.Fatal(err)
 	}
 	// The rollback journal appearing on the *other* mount is the observable proof
@@ -1461,11 +1472,16 @@ func requireSQLiteRollbackJournalHandoff(t *testing.T, f *integrationFixture) {
 		t.Fatal("the waiting writer never acquired the write lock after the holder committed")
 	}
 
+	holderErr := holder.Wait()
+	holderWaited = true
+	if holderErr != nil {
+		t.Fatalf("the holding writer failed to commit: %v\n%s", holderErr, holderOutput.String())
+	}
 	for _, database := range []string{databaseA, databaseB} {
 		output, err := exec.Command("sqlite3", database,
-			"PRAGMA integrity_check; SELECT count(*) FROM items;").CombinedOutput()
-		if err != nil || strings.TrimSpace(string(output)) != "ok\n3" {
-			t.Fatalf("sqlite state at %s = %q, %v; want integrity ok and 3 rows", database, output, err)
+			"PRAGMA integrity_check; SELECT count(*) FROM items; SELECT value FROM items ORDER BY value;").CombinedOutput()
+		if err != nil || strings.TrimSpace(string(output)) != "ok\n3\nholder\nportable\nwaiter" {
+			t.Fatalf("sqlite state at %s = %q, %v; want integrity ok and all 3 committed rows", database, output, err)
 		}
 	}
 }
