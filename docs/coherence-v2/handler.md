@@ -181,9 +181,9 @@ cache-handle accounting, reserve-before-binding publication, guarded reads and
 copy sources, volume durability holes, and lifecycle sweeping. Guard and OnCommit
 benchmarks report allocations as well as time.
 
-F2 has not landed in this worktree. Full kernel-FUSE and coherence-matrix results
-are not evidence supplied by F1; historical frontend lease calls now fail as
-required. No files in `fusev3`, `portablefsd`, or `mountv3` change here.
+F1 originally stopped at the handler boundary. Workstream G has since
+integrated F2, deleted the old Linux lease paths, and qualified real mounts.
+The current evidence and remaining product gates are in [integration.md](integration.md).
 
 Integration replaces ordinal cookies with XFS getdents offsets. Continuation seeks to
 the store cookie without rejecting a changed verifier. The concurrent peer
@@ -199,15 +199,13 @@ Coordinator deadlines still govern unfinished cuts whose adapter replay was surr
 Long-lived session tests cover 100,000 application tickets and 10,000 delegation/control
 cycles.
 
-Detached visibility waits remain outstanding until peer acknowledgment or horizon expiry and require workload measurement.
+Detached change-delivery waits still end at acknowledgment or horizon expiry.
+Their workload costs are included in [results.md](results.md).
 
-FSKit still retains its existing storage admission across PREPARE repair waits.
-F1 releases it after OnCommit and before COMPLETE or subscription withdrawal.
-Releasing and reacquiring only that turn would invert lock order with Linux
-mutations, which acquire storage admission before entering visibility, and can
-deadlock both operations. Changing the earlier FSKit phase therefore requires
-one coordinated repair/storage sequencer; this work does not claim to remove
-that inherited pre-apply constraint.
+FSKit retains its existing PREPARE/COMPLETE repair and compatibility-writer
+exclusion. Linux mutations now use only the protocol-7 storage turn; the
+ExecuteFromExternalSource bridge into the Mac coordinator is deleted. The
+pre-apply FSKit repair constraint remains a separate platform boundary.
 
 ## Test record
 

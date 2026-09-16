@@ -1,7 +1,8 @@
 # Cross-mount coherence matrix
 
 PortableFS's central Linux claim is one authoritative volume mounted through
-several stock-kernel FUSE clients with write-through, lease-coherent semantics.
+several stock-kernel FUSE clients with protocol-7 subscriptions, file
+delegations, break-for-read, and directory-handle completion barriers.
 This is the black-box instrument that verifies it. macOS invocations are
 qualification runs and do not establish production FSKit support.
 
@@ -15,11 +16,11 @@ scripts/coherence-matrix-macos.sh --mount-a A \
   --remote-binary /path/to/linux/pfs-coherence-matrix  # mixed macOS/Linux
 ```
 
-Both scripts run the same named cases through the same driver
-(`vcs/test/coherence/cmd/pfs-coherence-matrix`), so a Linux result and a macOS
-result are directly comparable line for line. A case that is green on one
-platform and red on the other is a frontend defect on the red one, not a
-difference in what was measured.
+Both scripts use the same driver (`vcs/test/coherence/cmd/pfs-coherence-matrix`)
+for the original 23 cases. The Linux harness adds six protocol-7 cases,
+including process pause and authority restart controls that require its
+lifecycle setup. Compare common cases across platforms under their declared
+contracts; a Linux lifecycle case is not evidence of FSKit qualification.
 
 ## What it is
 
@@ -46,10 +47,11 @@ production provisioner, mints credentials with the production capability signer
 * An atomic replacement is compared against the inode number the *other* mount
   resolves, not against content alone, because a stale binding can serve the
   right bytes from the wrong inode.
-* Nothing polls or retries. The correct answer is the first answer. Names,
+* Coherence observations do not poll or retry. The correct answer is the first
+  answer. Fault-lifecycle cases separately wait for bounded recovery. Names,
   attributes, clean data, and directory enumerations may be cached only under
-  authority leases; a conflicting mutation completes peer discharge before its
-  result is published. A case that needed a settling delay
+  a live subscription with no conflicting delegation; a namespace mutation
+  completes peer withdrawal before its result is published. A case that needed a settling delay
   would be reporting a defect, not a timing artefact.
 
 ## Falsifiability
@@ -121,16 +123,31 @@ Exit status is zero only when every case reached its **declared** status.
 | `routes_revision_mismatch` | an attach carrying a stale routing revision is refused with both revisions and the volume's canonical rules, and adopting them lets the same capability attach on exactly the second attempt |
 | `peer_loss_does_not_break_surviving_mount` | one mount dying uncleanly must not stop the other mount from serving |
 
+Protocol 7 retains these 23 cases and adds six Linux cases. The existing
+same-file overwrite and append cases also exercise delegation competition.
+
+| Protocol-7 case | Guarantee |
+|---|---|
+| `peer_cached_handle_forces_writethrough` | a pre-existing cached descriptor observes every completed peer write |
+| `git_index_lock_protocol` | exactly one exclusive index.lock winner; rename publishes complete index bytes |
+| `write_then_rename_flushes_before_visibility` | dirty data is flushed before the peer first reads the renamed binding |
+| `gateway_reads_delegated_data_without_obstructing_writer` | gateway list/read sees flushed data and excludes no Linux writer |
+| `recall_budget_loss_fails_barrier` | stopped holder misses recall; affected handles and old root barrier fail EIO while healthy work continues |
+| `epoch_change_stales_handles_and_new_barrier_passes` | same mounts survive Authority replacement; old handles fail and new work/barrier succeeds |
+
+The Linux script exercises process stop/resume and Authority replacement for
+the lifecycle cases. Shared production code supplies the authenticated gateway.
+The existing chown skip remains explicit because a single-principal volume
+cannot produce an ownership change. Current results and controls are in
+[coherence-v2/integration.md](./coherence-v2/integration.md).
+
 ### `same_dir_concurrent_mutations` permits no fencing
 
 Two mounts mutating one directory is the directory-inode-lock contention case.
-Every phase a frontend is delivered is one it repairs in place and
-acknowledges -- there is no report by which a frontend can decline one -- while
-racing reads leave Stabilize at apply rather than holding the directory lock
-until COMPLETE. The case still
-records how many participants were fenced (observed as `ENOTCONN` from the
-revoked mount), but the allowed count is zero: fencing either healthy mount is a
-regression.
+The subscription and exact publication paths must repair the affected
+coordinates without aborting either mount. Namespace changes remain ordered at
+the Authority, and unrelated coordinates do not inherit a mount-wide gate.
+The case records participants that stop serving; the allowed count is zero.
 
 The case also fails if a storm does not complete within its stated bound, if
 either mount stops serving, or if the mounts disagree about the exact surviving
@@ -209,7 +226,7 @@ principals are ever supported, the case becomes assertable and must be enabled.
 `scripts/coherence-matrix-macos.sh` does not mount anything itself. It accepts
 paths created by an explicitly stamped qualification build and stays out of the
 daemon lifecycle. A green run characterizes that adapter and OS only; it does
-not promote FSKit past the protocol-6 primitive gate.
+not establish Linux-equivalent FSKit withdrawal or lift Mac writer exclusion.
 
 It refuses to run against ordinary directories. A directory on the boot volume
 is perfectly coherent with itself, so a run like that would print a wall of

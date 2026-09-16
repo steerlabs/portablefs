@@ -62,7 +62,9 @@ Buffer supplies extent overlays, coalescing, cuts, and per-file application
 ordering. Its flusher sends at most the smaller of 1 MiB and the negotiated
 write limit per WRITE, with the exact delegation id and generation on WRITE
 and SETATTR. Split entries retain acknowledged-prefix progress across definite
-transient failures. Different identities can flush concurrently. Completed
+transient failures. Explicit flushes of different identities remain concurrent; background timer/cap
+work uses one worker matching the Authority flush lane. Deferred close admission
+is bounded, and close batches apply all files before waiting for durability. Completed
 replay records retire at the durable prefix.
 
 Holder reads use `Buffer.Read`. GETATTR uses the holder's base attributes with

@@ -4,8 +4,10 @@ Workstream G integrates the handler and Linux client against [wire.md](wire.md).
 The starting tree is `aa046b1` on `cv2-integrate`. This record distinguishes
 observed results from qualification still outstanding.
 
-Steps 1–6 are implemented and committed. Step 7 is running its final full gate
-after the SQLite fixture correction. The sections below are a chronological
+Workstream G is implemented and locally qualified. The final full gate and
+independent matrix repeat both exit 0 after the SQLite fixture and Swift
+contract corrections. Remaining limits and unrun production qualification are
+listed explicitly below. The sections below are a chronological
 record: early failure and backlog statements are superseded by later run
 evidence. [results.md](results.md) contains the final measured build;
 [changed-files.txt](changed-files.txt) lists the complete workstream file delta.
@@ -688,3 +690,82 @@ parser. Local pfslocal remains major 1/minor 15 with unchanged field numbers and
 cache-policy names. Go bridge tests pass; run 156's native Xcode gate enumerates
 and passes the exact 345-test inventory (59 AppCore, 286 Kit). No real FSKit mount
 is claimed by that test. Run 156 repeats the complete full gate after this fix.
+
+## Remaining limits and unrun qualification
+
+- The design's three accepted residuals remain: a stopped daemon cannot fence
+  resident kernel pages; quota exhaustion may be learned after buffered
+  acceptance; contended files require write-through. The exact design wording
+  is reproduced in [portable-coherence.md](../portable-coherence.md).
+- Epoch recovery reuses the configured attach grant before restarting exact
+  session-bound reauthorization. The matrix proves recovery with a valid grant.
+  An expired/refused grant leaves the mount cold and retrying; acquisition and
+  installation of a fresh attach grant is not implemented on that path.
+- Prior Linux membership waits out its old subscription horizon for serving,
+  but remains unproven for route changes and archival until an absence proof.
+  Old untyped membership is conservatively treated as Mac compatibility state.
+  Inferring absence from an epoch change would be unsafe.
+- Reverse `d_path`/`getcwd` rendering of retained dentries is outside the
+  forward-lookup contract. Stock FUSE shared writable mmap and per-call
+  RWF_APPEND/RWF_NOAPPEND remain unsupported. Mac name/attribute invalidation,
+  append, and advisory-lock limitations remain behind Mac writer exclusion.
+- `remote_chown_visible` retains its declared SKIP. A single-principal volume
+  refuses a change to another owner with EPERM, so the ownership transition
+  cannot be demonstrated. The other original 22 and all six additions pass in
+  final runs 156 and 157. No passing case became a skip.
+- The 256-pending-close budget protects the shipping open-table limit. It is
+  not negotiated for arbitrarily smaller custom limits, which may return
+  ENFILE. Concurrent handle admissions retain bounded headroom rather than
+  reserving individual Authority slots.
+- Performance evidence is one shared 4-CPU/8-GiB VM, loopback TLS, and tmpfs-backed
+  loop XFS. It does not qualify physical storage, production RTT, or an SLO.
+  Final peer overlap is only one of 2,000 files; all are verified, and separate
+  concurrent regressions preserve overlap. Final-versus-initial v7 wall times
+  are mixed. Defensive asynchronous protobuf/replay/callback ownership still
+  allocates; the profiles do not justify unsafe pooling.
+- Production runner kernel/image pinning, broader LTS qualification, and
+  OpenSteer run-start/root-handle barrier wiring at completion, sandbox exit,
+  and detach are deployment obligations outside this local workstream.
+  Directory delegation, quota reservation, and transparent recovery of old
+  handles are deliberately outside this foundation.
+- `scripts/package-manager-matrix.sh` was not run: it is the separate optional
+  workload soak, not either required privileged gate. A live
+  `scripts/coherence-matrix-macos.sh` was not run: it needs a user-enabled FSKit
+  extension and is not established by native Swift tests. No
+  `deploy/opensteer/staging-qualification.sh` against a deployed cell was run.
+  These omissions are also printed by `verify-local.sh --full`.
+
+## Final verification record
+
+Run 156 executes `bash scripts/verify-local.sh --full` on the final runtime
+changes and exits 0. It passes Darwin Foundation/cgo and static Linux builds
+and vet, the pinned govulncheck (no vulnerabilities), native Go and race suites,
+the maintained go-fuse physical-reply lifecycle tests, exact native Xcode
+inventory (345 enumerated = 345 passed), workflow/release-trust policy, and
+stale-architecture/active-contract scans. The privileged suite reports all 66
+required unprivileged tests and its one root boundary test passed. Its matrix
+runs both falsifiability controls and reports 28 PASS, zero unexpected failures,
+and only the unchanged `remote_chown_visible` SKIP. The full log is
+`/tmp/cv2-g-verify-full-156.log`.
+
+The matrix's disjoint and stale-view controls intentionally print FAIL outcomes
+for their declared negative cases; those are required evidence, not hidden
+failures. The expected destructive peer-loss case also prints the killed mount
+process during cleanup. The gate exits 0 only after those expectations match.
+A separate invocation of `bash scripts/coherence-matrix-linux.sh` is run as 157;
+its final result is recorded below.
+
+
+Run 157 independently executes `bash scripts/coherence-matrix-linux.sh` and
+exits 0. Both negative controls match; the real matrix again reports 28 PASS,
+zero unexpected failures, and the same single-principal chown SKIP. Its log is
+`/tmp/cv2-g-matrix-157.log`. This closes the requested final matrix repeat.
+
+Final review confirms every changed Go file is gofmt-clean, relative links in
+changed Markdown resolve, the three residual paragraphs match design.md
+verbatim, and `git diff --check` passes. No `LEASE_RIGHT_*`, `lease_grants`,
+`NextLeaseEvent`, `RenewLeases`, or `SourceLeaseDischarge` reference remains in
+fusev3, mountv3, or the Linux mount command. Frozen schema history and refusal
+tests remain deliberately. Every workstream commit uses Tim Jang's requested
+author identity and DCO sign-off. The full [file list](changed-files.txt) covers
+154 added, modified, or deleted paths from the starting tree.

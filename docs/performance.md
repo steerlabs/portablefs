@@ -1,12 +1,49 @@
 # Performance
 
-Status: **historical protocol-4/5 measurements only; the protocol-6 stock-FUSE
-profile has not been measured and has no release SLO**
+Status: **protocol-7 local engineering measurements; no production SLO**
 
-The measurements below are retained unchanged as evidence for retired
-configurations. They must not be quoted as protocol-6 performance. PortableFS
-will add a separate stock-kernel section only after the new profile is measured
-end to end with the same byte-verification discipline.
+## September 16, 2026 protocol-7 measurement
+
+The same full-size harness as the protocol-6 reference runs on the shared
+4 CPU, 8 GiB Docker VM, kernel `6.8.0-100-generic`, loopback TLS, and real FUSE
+on loop-backed XFS stored on tmpfs. It is not an isolated speedup experiment or
+physical-disk benchmark. Install is 40,000 1 KiB files plus 2,000 directories;
+Git status covers 20,000 tracked files; the peer workload writes and verifies
+2,000 files. Request counts include control traffic, final root barrier, and
+close drain; workload wall time excludes barrier/drain, reported separately in
+[the complete results](./coherence-v2/results.md).
+
+| Workload | v6 wall (s) | v7 wall (s) | v6 requests/op | v7 requests/op |
+|---|---:|---:|---:|---:|
+| install (1 worker) | 386.763 | 21.029 | 7.8544 | 7.4805 |
+| install (8 workers) | 273.738 | 15.706 | 7.5615 | 6.8495 |
+| git-status-cold | 10.573 | 1.380 | 1.0405 | 1.0274 |
+| git-status-warm | 2.042 | 1.196 | 0.0277 | 0.0186 |
+| two-mount-write-list-read | 12.536 | 2.645 | 7.8775 | 9.8195 |
+
+Direct-XFS v7 times are 0.393/0.299 seconds for 1/8-worker install,
+0.0075/0.0072 for cold/warm Git, and 0.0361 for the peer workload. VM contention,
+cold-cache differences, and changed reader/writer overlap limit comparisons.
+The final mounted peer verifies one file during writing and all 2,000 overall,
+with no ESTALE retries; the v6 reference verified 467 during writing and retried
+203 ESTALE results. Independent churn tests retain stronger overlap assertions.
+
+Fresh 20,000-file `git add` now succeeds at the shipping 65,536 cache capacity,
+commits, and passes its run barrier without disconnecting. The v6 reference
+failed ENOTCONN there and needed a setup-capacity workaround.
+
+Profiles of the Authority and daemon identify canonical field-slice allocation,
+CONTROL batch allocation, source wake channels, and background flush fan-out.
+Descriptor caching, bounded batch reuse, demand-allocated wakeups, single-worker
+background dispatch, and phased close cleanup reduce sampled allocation and
+mutex wait. Final wall times versus the first v7 run are mixed; eight-worker
+install is 15.706 seconds versus 12.856 initially. The full before/after record,
+raw request breakdown, profile commands, and failed ENFILE intermediate run are
+preserved in [results.md](./coherence-v2/results.md). A close admission budget
+now provides backpressure under the shipping open-table limit.
+
+The protocol-4/5 sections below are historical evidence for retired builds and
+must not be quoted as protocol-7 performance.
 
 ## August 15, 2026 protocol-5 Linux measurement
 
@@ -284,31 +321,25 @@ These are not regressions to be optimised away later. They are the price of the
 guarantees in [consistency-model.md](./consistency-model.md), and a change that
 removes one of them has to explain which guarantee it is trading.
 
-**Every data-plane write crosses the wire.** There is no PortableFS-managed
-write-back cache. Linux direct-I/O `write(2)` pays at least one authority round
-trip. macOS may coalesce application writes in its ordinary kernel page cache;
-each FSKit write callback crosses the authority, and `fsync` is the explicit
-completion boundary. Benchmarks must identify which syscall boundary they time.
+**Namespace operations still cross the wire.** The Authority owns create,
+rename, unlink, and the other namespace operations. Independent requests can
+run concurrently, but sequential namespace operations retain round-trip cost.
+An uncontended delegated data write can return from the daemon buffer; fsync,
+O_SYNC, and the root-directory run barrier wait for durable application.
+Contended cached-handle cases force write-through. macOS retains synchronous
+repair and its separately declared host-cache behavior.
 
-**Names and attributes are coherently cached, and mutation pays for it.** The
-single protocol lets repeated path walks be served from the kernel without an
-authority lookup. The bill arrives on the other side: a cache-affecting mutation
-holds its stable-identity dependency set and the source's exact local
-publication footprint, quiesces affected non-source cache holders, applies to
-XFS, drives each peer's repair, and collects acknowledgements before it returns.
-Mutations that share an inode, directory, or binding remain ordered; disjoint
-sets can execute concurrently and do not inherit one another's repair latency.
-With one mount attached there is no network visibility phase. With several, a
-mutation that overlaps an actively caching peer costs a PREPARE and COMPLETE
-round trip to the slowest such participant; exact semantics cannot remove those
-two crossings. Historical or disjoint participants should eventually cost
-nothing once the exact cache-grant ledger replaces the current monotone index.
+**Cache coherence still needs withdrawal.** A volume subscription caches
+undelegated state. Change acknowledgment includes exact reply drain and kernel
+invalidation; a mutation or grant waits for acknowledgment or the subscriber's
+horizon. New peer reads of delegated data break the owner for read. A pre-existing
+cacheable peer handle requires per-commit invalidation. Shared kernel name
+validity remains zero, while the daemon caches bindings and attributes.
 
-**Shared file-backed `mmap` is refused, not slow.** PortableFS does not advertise
-the FUSE capability that would allow shared mapped pages on a direct-I/O inode,
-so `MAP_SHARED` on a file fails. Programs that would have used it fall back to
-read and write, which is slower and correct. `MAP_PRIVATE` works with ordinary
-copy-on-write semantics.
+**Shared writable mmap is refused.** Read-only/private mappings are supported
+on cacheable handles. The implementation does not depend on direct-I/O mmap
+support, and the stalled-daemon resident-page residual remains explicit in
+[portable-coherence.md](./portable-coherence.md).
 
 **SQLite WAL mode does not work across machines.** Its wal-index needs a shared
 `-shm` mapping and SQLite itself requires every WAL participant to be on one

@@ -7,13 +7,13 @@ mixed-major execution path; the protocol-7 handshake refuses protocol 6.
 Status: **verification candidate (pre-launch)**. PortableFS has not launched.
 The coherence v2 [design](./docs/coherence-v2/design.md) and protocol-7
 [wire contract](./docs/coherence-v2/wire.md) specify the replacement. Workstream
-A supplies the wire; coordinator and frontend integration remain separate
-workstreams under [PLAN.md](./docs/coherence-v2/PLAN.md). A protocol-7 build is
-not evidence that those state machines or the kernel proofs are complete.
-The surfaces below are reviewed as frozen; verification cannot silently alter
-them. The historical protocol-6 specification in
-[docs/portable-coherence.md](./docs/portable-coherence.md) does not define v7
-subscription/delegation semantics.
+A supplies the wire; integration and local real-mount qualification are recorded
+in [integration.md](./docs/coherence-v2/integration.md), with measurements in
+[results.md](./docs/coherence-v2/results.md). Production kernel and runner
+completion integration remain separate qualification boundaries. The surfaces
+below are reviewed as frozen; verification cannot silently alter them.
+[docs/portable-coherence.md](./docs/portable-coherence.md) describes the current
+protocol-7 subscription/delegation contract.
 
 ## v2 is gone
 
@@ -73,8 +73,8 @@ leaves draft they are frozen.
   The frozen enum spelling `LINUX_LEASES` still identifies the Linux frontend;
   protocol major 7 gives it subscription/delegation semantics. The historical
   lease messages and field numbers remain in the schema for inspection of
-  history, but v7 does not send or honour them. The integration workstream
-  deletes their old handler/client paths. FSKit retains `FSKIT_SYNC_REPAIR`,
+  history, but v7 does not send or honour them. Their old Linux handler/client
+  execution paths have been deleted. FSKit retains `FSKIT_SYNC_REPAIR`,
   its repair/source-publication/fragmented-write assertions, and writer
   exclusion for every attached Mac mount. A feature advertisement cannot
   manufacture a callback the frontend does not expose. The additive
@@ -194,7 +194,7 @@ SDK-27 native adapter is selected only by an app built and signed with its exact
 compile-time capability stamp
 `sdk27-live-qualification-only` in the CLI and the compile-time
 `portablefs_macos27_qualification` packaging tag. The historical spelling is
-frozen even though protocol 6 admits the resulting stronger actuator; it is a
+frozen even though protocol 7 admits the resulting stronger actuator; it is a
 property of the signed artifact, not a runtime toggle or fallback. The stamp
 does not alter the ordinary v2 policy or automatically admit a future macOS
 release. An unsupported repair terminates the mount before COMPLETE.
@@ -275,6 +275,8 @@ Additive evolution with versioning; consumers tolerate additions.
   or not at all.
 - `pfslocal` minor version bumps. The local protocol between `portablefsd` and
   the FSKit extension is major 1, currently minor 15, and grows additively.
+  Its nested authority contract now requires exact major 7; major 6 is refused.
+  This does not change the local major/minor or any frozen field numbers.
 - New environment variables, where leaving one unset preserves previous
   behaviour.
 - New authority bounds and timeouts. Their defaults may change; a deployment that
