@@ -167,6 +167,14 @@ type integrationConfig struct {
 	// activates, in the syntax the volume file carries. Empty means the volume
 	// declares nothing and every path is served from the authority.
 	Routes string
+	// MaxItemsPerSession and MaxItems override the descriptor-backed item
+	// table bounds for workloads whose deliberate working set exceeds the
+	// fixture's compact default. Zero preserves the normal integration limits.
+	MaxItemsPerSession uint32
+	MaxItems           uint32
+	// CachedNameCapacity overrides the compact integration cache. Zero keeps
+	// the existing 4,096-name test profile.
+	CachedNameCapacity int
 
 	// rules is the compiled form of Routes, derived in newIntegrationFixture.
 	rules localroutes.RuleSet
@@ -334,6 +342,15 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 	if cfg.SessionLease <= 0 {
 		cfg.SessionLease = time.Minute
 	}
+	if cfg.MaxItemsPerSession == 0 {
+		cfg.MaxItemsPerSession = 4096
+	}
+	if cfg.MaxItems == 0 {
+		cfg.MaxItems = 16384
+	}
+	if cfg.CachedNameCapacity == 0 {
+		cfg.CachedNameCapacity = integrationCachedNames
+	}
 	rules, err := ActivateRoutes([]byte(cfg.Routes))
 	if err != nil {
 		t.Fatalf("compile route declaration: %v", err)
@@ -477,7 +494,7 @@ func (f *integrationFixture) start() {
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: f.fencer, Locks: authority.Locks(), Membership: f.membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
-		MaxCachedNameCapacity: integrationCachedNames, MaxRepairBudget: time.Minute,
+		MaxCachedNameCapacity: uint64(f.cfg.CachedNameCapacity), MaxRepairBudget: time.Minute,
 		CacheLeaseTTL: integrationCacheLeaseTTL, MaxCacheLeasesPerSession: integrationCacheLeasesPerSession,
 		MaxCacheLeases: integrationCacheLeases, Now: f.now,
 	})
@@ -497,7 +514,8 @@ func (f *integrationFixture) start() {
 		Store: store, Runtime: authority, Authorizer: integrationAuthorizer{now: f.now},
 		MaxFrame: integrationMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight:        integrationServerInFlight,
-		MaxItemsPerSession: 4096, MaxOpensPerSession: 4096, MaxItems: 16384, MaxOpens: 16384,
+		MaxItemsPerSession: f.cfg.MaxItemsPerSession, MaxOpensPerSession: 4096,
+		MaxItems: f.cfg.MaxItems, MaxOpens: 16384,
 		MaxRetainedReplyBytes:         integrationAllocationBudget,
 		WriteAdmission:                f.writeAdmission,
 		MaxWriteBytesPerSession:       integrationWriteBytesPerSession,
@@ -552,7 +570,7 @@ func (f *integrationFixture) mountAll() {
 			// out of this number, so it must be exactly the transport's bound.
 			MaxInFlight:  integrationMaxInFlight,
 			PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-			Coherence: CoherenceStrict, CachedNameCapacity: integrationCachedNames,
+			Coherence: CoherenceStrict, CachedNameCapacity: f.cfg.CachedNameCapacity,
 			RepairBudget: integrationRepairBudget,
 			Routes:       f.cfg.rules, LocalBacking: f.backing[i],
 			Debug: os.Getenv(envFUSEDebug) == "1",
@@ -995,7 +1013,14 @@ type countingHandler struct {
 	mu           sync.Mutex
 	byKind       map[string]int
 	beforeHandle func(*authoritypb.Request)
+	// Benchmarks opt in before opening workload descriptors so asynchronous
+	// FUSE RELEASE calls can be drained across measurement boundaries.
+	trackOpens     bool
+	openOperations int
+	openHandles    map[integrationOpenKey]struct{}
 }
+
+type integrationOpenKey struct{ session, handle string }
 
 func (h *countingHandler) Epoch() []byte                        { return h.inner.Epoch() }
 func (h *countingHandler) Bounds() authorityrpc.TransportBounds { return h.inner.Bounds() }
@@ -1013,11 +1038,39 @@ func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Reque
 	}
 	h.byKind[requestKind(request)]++
 	before := h.beforeHandle
+	track := h.trackOpens && (request.GetOpen() != nil || request.GetCreate() != nil || request.GetTmpfile() != nil || request.GetClose() != nil)
+	if track {
+		h.openOperations++
+	}
 	h.mu.Unlock()
 	if before != nil {
 		before(request)
 	}
-	return h.inner.Handle(ctx, request)
+	response := h.inner.Handle(ctx, request)
+	if track {
+		h.mu.Lock()
+		if response != nil && response.GetErrno() == 0 && !response.GetUncertain() {
+			var opened []byte
+			switch {
+			case response.GetOpen() != nil:
+				opened = response.GetOpen().GetHandle()
+			case response.GetCreate() != nil:
+				opened = response.GetCreate().GetHandle()
+			case response.GetTmpfile() != nil:
+				opened = response.GetTmpfile().GetHandle()
+			}
+			session := string(request.GetSession().GetId())
+			if len(opened) != 0 {
+				h.openHandles[integrationOpenKey{session, string(opened)}] = struct{}{}
+			}
+			if close := request.GetClose(); close != nil {
+				delete(h.openHandles, integrationOpenKey{session, string(close.GetHandle())})
+			}
+		}
+		h.openOperations--
+		h.mu.Unlock()
+	}
+	return response
 }
 
 func (h *countingHandler) setBeforeHandle(before func(*authoritypb.Request)) {
