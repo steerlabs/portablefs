@@ -28,7 +28,7 @@ import (
 //
 // Transport bounds negotiate downward against the authority's advertised
 // limits. CachedNameCapacity and RepairBudget are local resource and recall
-// bounds under protocol 6's one exact lease profile.
+// bounds under protocol 7's bounded cache profile.
 const (
 	ReplaySlots  uint32 = 128
 	MaxInFlight         = 128

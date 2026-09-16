@@ -49,9 +49,6 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		return transportRequestData, nil
 	case *authoritypb.Request_Activate, *authoritypb.Request_AbortAttach,
 		*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
-		*authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent,
-		*authoritypb.Request_RenewLeases,
-		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
 		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
 		*authoritypb.Request_Reauthorize, *authoritypb.Request_TerminalDeliveryReceipt,
 		*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,

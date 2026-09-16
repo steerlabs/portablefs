@@ -54,12 +54,7 @@ func exactAuthorityTestTargets(sequence uint64, targets []volumeserver.Visibilit
 }
 
 func testVolumeHandler() *VolumeHandler {
-	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
-		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384, PriorGrantsFenced: true, Fencer: noopFencer{},
-	})
-	if err != nil {
-		panic(err)
-	}
+
 	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
 		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
 	})
@@ -92,7 +87,6 @@ func testVolumeHandler() *VolumeHandler {
 		MaxFskitWrites:                      32,
 		FskitWriteProgressTimeout:           time.Minute,
 		FskitWriteAbsoluteTimeout:           time.Hour,
-		Leases:                              leases,
 		Lifecycle:                           lifecycle,
 		Visibility:                          visibility,
 	}
@@ -2766,7 +2760,7 @@ func testAttachAttempt(id uint64) []byte {
 	return attempt
 }
 
-// attachAndActivateHandler drives the protocol-6 lifecycle directly at the
+// attachAndActivateHandler drives the protocol-7 lifecycle directly at the
 // handler boundary. Transport-registry tests separately prove that the two
 // nonzero binding generations came from the exact DATA/CONTROL pair.
 func attachAndActivateHandler(
@@ -3864,8 +3858,8 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	}()
 	select {
 	case err := <-applyDone:
-		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
-			t.Fatalf("ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
+		if !errors.Is(err, volumeserver.ErrRoutesLive) {
+			t.Fatalf("ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("ApplyRoutes deadlocked behind a blocked lock wait")
@@ -3893,8 +3887,8 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	}()
 	select {
 	case err := <-applyDone:
-		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
-			t.Fatalf("second ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
+		if !errors.Is(err, volumeserver.ErrRoutesLive) {
+			t.Fatalf("second ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a second ApplyRoutes deadlocked behind a blocked lock wait")

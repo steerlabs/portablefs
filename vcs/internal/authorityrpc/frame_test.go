@@ -511,22 +511,11 @@ func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
 }
 
 func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
-	recalls := make([]*authoritypb.LeaseRecall, maxWireRepeatedElements+1)
-	for i := range recalls {
-		recalls[i] = &authoritypb.LeaseRecall{
-			Coordinate: &authoritypb.LeaseCoordinate{
-				Family:   authoritypb.LeaseFamily_LEASE_FAMILY_DATA,
-				Identity: bytes.Repeat([]byte{byte(i + 1)}, 16),
-			},
-			Right: authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ,
-		}
+	entries := make([]*authoritypb.ChangeEntry, maxWireRepeatedElements+1)
+	for i := range entries {
+		entries[i] = &authoritypb.ChangeEntry{Identity: bytes.Repeat([]byte{byte(i + 1)}, 16)}
 	}
-	response := &authoritypb.Response{
-		RequestId: 22,
-		Body: &authoritypb.Response_LeaseEvent{LeaseEvent: &authoritypb.LeaseEvent{
-			Recalls: recalls,
-		}},
-	}
+	response := &authoritypb.Response{RequestId: 22, Body: &authoritypb.Response_ControlEvent{ControlEvent: &authoritypb.ControlEvent{Event: &authoritypb.ControlEvent_ChangeBatch{ChangeBatch: &authoritypb.ChangeBatch{Entries: entries}}}}}
 	metadata, err := proto.Marshal(response)
 	if err != nil {
 		t.Fatal(err)

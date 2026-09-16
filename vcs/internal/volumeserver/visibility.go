@@ -703,7 +703,7 @@ type VisibilityConfig struct {
 	Prior      PriorEpochDisposition
 	Membership DurableVisibilityMembership
 	// ExternalMembership makes MountLifecycle the sole durable membership
-	// owner. Protocol-6 FSKit repair still uses this coordinator's ordered
+	// owner. Protocol-7 FSKit repair still uses this coordinator's ordered
 	// participant set, but activation/detach persistence is composed by the
 	// authority handler instead of being written twice here.
 	ExternalMembership bool
@@ -742,13 +742,6 @@ type VisibilityConfig struct {
 // permanent for this epoch, and recovery requires a new epoch plus durable
 // proof that every old strict kernel mount is unusable.
 type VisibilityCoordinator struct {
-	// topology excludes a volume-wide routing revision switch from every
-	// filesystem request and attach that was admitted against the previous
-	// revision. It is deliberately separate from registration: strict participant
-	// registration needs the write side of registration while attach itself holds
-	// the read side of topology, and making those the same lock would recursively
-	// deadlock.
-	topology sync.RWMutex
 	// registration prevents attach from becoming visible during an overlapping
 	// mutation. With no strict participants mutations retain XFS concurrency by
 	// sharing this read lock.
@@ -779,32 +772,6 @@ type VisibilityCoordinator struct {
 	laneChanged    chan struct{}
 }
 
-// TopologyReadGuard pins the routing revision a filesystem request or attach
-// was admitted against. ApplyRoutes takes the corresponding write side before
-// it rechecks compare-and-swap and keeps it through durable commit, so a request
-// can never pass admission under one topology and reach XFS under another.
-//
-// The guard is intentionally opaque and pointer-only. Release is idempotent so
-// a deferred release remains safe on every handler exit.
-type TopologyReadGuard struct {
-	release func()
-	once    sync.Once
-}
-
-// AcquireTopologyRead begins one route-revision admission critical section.
-func (c *VisibilityCoordinator) AcquireTopologyRead() *TopologyReadGuard {
-	c.topology.RLock()
-	return &TopologyReadGuard{release: c.topology.RUnlock}
-}
-
-// Release ends one route-revision admission critical section.
-func (g *TopologyReadGuard) Release() {
-	if g == nil || g.release == nil {
-		return
-	}
-	g.once.Do(g.release)
-}
-
 func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, error) {
 	if cfg.Fencer == nil || cfg.Membership == nil && !cfg.ExternalMembership || cfg.Membership != nil && cfg.ExternalMembership {
 		return nil, errors.New("volumeserver: visibility needs durable membership and a session fencer")
@@ -831,7 +798,7 @@ func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, err
 	}, nil
 }
 
-// Register is the direct-test active helper. Production protocol-6 activation
+// Register is the direct-test active helper. Production protocol-7 activation
 // uses ActivateParticipantInMemory inside MountLifecycle's durable transaction,
 // so the durable mount record has exactly one owner.
 func (c *VisibilityCoordinator) Register(id SessionID, profile CoherenceProfile, terminal <-chan struct{}, commitment VisibilityCommitment) error {
@@ -840,7 +807,7 @@ func (c *VisibilityCoordinator) Register(id SessionID, profile CoherenceProfile,
 }
 
 // ActivateParticipant preserves the coordinator-owned membership mode used by
-// direct coordinator callers. Protocol-6 server activation must instead call
+// direct coordinator callers. Protocol-7 server activation must instead call
 // ActivateParticipantInMemory from inside MountLifecycle.Activate.
 func (c *VisibilityCoordinator) ActivateParticipant(
 	id SessionID,
@@ -873,7 +840,7 @@ func (c *VisibilityCoordinator) ActivateParticipantInMemory(
 // index is allocated before global exclusion. While registration is write-locked,
 // the participant and exact initial cursor are installed and commit publishes
 // runtime ACTIVE state. Direct coordinator callers may also ask this method to
-// persist membership; protocol 6 instead encloses it in MountLifecycle's sole
+// persist membership; protocol 7 instead encloses it in MountLifecycle's sole
 // durable transaction.
 //
 // precommit and commit run without c.mu but under registration exclusion.

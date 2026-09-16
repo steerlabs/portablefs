@@ -57,6 +57,10 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		seen[typeOf] = struct{}{}
 		class, err := classifyTransportRequest(request)
 		if err != nil || class == transportRequestInvalid {
+			switch request.GetBody().(type) {
+			case *authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent, *authoritypb.Request_RenewLeases, *authoritypb.Request_AcknowledgeSourceLeaseDischarge:
+				continue // Frozen schema tombstones have no executable transport lane.
+			}
 			t.Fatalf("%T class=%d err=%v", request.GetBody(), class, err)
 		}
 	}
@@ -81,9 +85,9 @@ func TestTransportRoleAllowlistIsStrict(t *testing.T) {
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Write{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{}}, control: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{}}, control: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{}}, control: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewLeases{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{}}},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{}}},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewLeases{}}},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Activate{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_TerminalDeliveryReceipt{}}, control: true},

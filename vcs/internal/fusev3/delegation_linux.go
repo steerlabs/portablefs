@@ -1580,9 +1580,9 @@ func (m *delegationManager) drainCloseQueue() {
 }
 
 func (m *delegationManager) processCloseBatch(batch []delegationClose) {
-	ctx, cancel := context.WithTimeout(context.Background(), m.timeout)
-	defer cancel()
-	if err := m.CloseHandles(ctx, batch); err != nil {
+	// A background close retains its exact replay identity through an outage.
+	// The queue is bounded, and mount shutdown cancels this work.
+	if err := m.CloseHandles(m.ctx, batch); err != nil {
 		for _, pending := range batch {
 			id, parseErr := delegationIdentity(pending.identity)
 			if parseErr == nil {

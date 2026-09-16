@@ -378,7 +378,6 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 		if request.GetCreate() != nil && result.GetCreate() != nil && request.GetCreate().GetWriteIntent() {
 			result.GetCreate().Delegation = testDelegation()
 		}
-		result.LeaseGrants = nil
 	}()
 	if f.replyOverride != nil {
 		return f.replyOverride(request)
@@ -2257,4 +2256,35 @@ func TestKeepAliveTransportTimeoutDoesNotRevokeMount(t *testing.T) {
 	}
 	mount.cancel()
 	mount.wg.Wait()
+}
+
+func TestReadDuringColdSubscriptionFailsWithoutRPC(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired-%t", expired), func(t *testing.T) {
+			mount, rpc := testMount(t, 8)
+			n := testNode(mount)
+			mount.subscription.mu.Lock()
+			if expired {
+				mount.subscription.cacheUntil = time.Now().Add(-time.Second)
+			} else {
+				mount.subscription.active = false
+			}
+			mount.subscription.mu.Unlock()
+			before := 0
+			rpc.snapshot(func(f *fakeRPC) { before = f.calls })
+			handle := &fileHandle{node: n, token: []byte("handle")}
+			result, errno := n.Read(context.Background(), handle, make([]byte, 4096), 0)
+			if result != nil || errno != syscall.EIO {
+				t.Fatalf("cold read=%v,%v", result, errno)
+			}
+			rpc.snapshot(func(f *fakeRPC) {
+				if f.calls != before {
+					t.Fatal("cold read reached the transport")
+				}
+			})
+			if mount.isRevoked() {
+				t.Fatal("cold read revoked mount")
+			}
+		})
+	}
 }

@@ -397,8 +397,8 @@ func TestARoutingChangeIsRefusedWhileAnyMountIsLive(t *testing.T) {
 	// The operator path is refused too, and for a different reason: the mounts
 	// are live. The refusal names clean mount absence, and it is an ordinary
 	// retryable answer rather than a half-applied topology.
-	if _, err := f.routes.Apply(t.Context(), changed.Canonical(), current); !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
-		t.Fatalf("ApplyRoutes with live mounts = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
+	if _, err := f.routes.Apply(t.Context(), changed.Canonical(), current); !errors.Is(err, volumeserver.ErrRoutesLive) {
+		t.Fatalf("ApplyRoutes with live mounts = %v, want %v", err, volumeserver.ErrRoutesLive)
 	}
 	if active, err := f.routes.Revision(); err != nil {
 		t.Fatal(err)

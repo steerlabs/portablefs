@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1059,74 +1060,73 @@ func TestConcurrentCrossMountWritersToOneFile(t *testing.T) {
 	}
 }
 
-// TestAuthorityLossFailsCleanlyInsteadOfHanging asserts that losing the volume
-// authority is a bounded, diagnosable mount failure rather than a wedged mount
-// point or an indefinitely blocked syscall.
+// Authority loss expires cache permission and fails an affected operation within
+// its bound. It must not revoke either kernel mount; epoch recovery is qualified
+// separately by the real two-mount matrix.
 func TestAuthorityLossFailsCleanlyInsteadOfHanging(t *testing.T) {
+	testAuthorityHorizonWithdrawalAndRecovery(t, []byte("pre-outage payload"))
+}
+
+func testAuthorityHorizonWithdrawalAndRecovery(t *testing.T, payload []byte) {
+	t.Helper()
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
-	payload := []byte("pre-outage payload")
-	mustWrite(t, f.join(0, "payload"), payload, 0o600)
-	requireContent(t, f.join(1, "payload"), payload, "before the authority outage")
+	enableBaselineOpenTracking(f.counter)
+	mustWrite(t, f.join(0, "payload"), payload, 0600)
+	drainBaselineOpens(t, f.counter)
+	requireContent(t, f.join(1, "payload"), payload, "before authority outage")
+	drainBaselineOpens(t, f.counter)
+	f.waitForDelegationReleases(t)
 	retained := mustOpenFile(t, f.join(1, "payload"), os.O_RDONLY, 0)
-	if got := readExactlyAt(t, retained, 0, len(payload), "before the authority outage"); !bytes.Equal(got, payload) {
-		t.Fatal("retained descriptor did not serve the payload before the outage")
+	defer retained.Close()
+	if got := readExactlyAt(t, retained, 0, len(payload), "prime retained pages"); !bytes.Equal(got, payload) {
+		t.Fatal("bad initial data")
 	}
-	if !isMounted(t, f.mountPath(1)) {
-		t.Fatalf("%s is not a mount point before the outage", f.mountPath(1))
-	}
-
 	f.stopAuthority()
-
-	for i := range 2 {
-		cause := f.requireSessionEnded(i, 30*time.Second)
-		t.Logf("mount %d terminal cause: %v", i, cause)
-	}
-	// The mount nothing is holding open must remove itself rather than linger as
-	// a path that fails or blocks every process that later touches it.
-	waitUntil(t, 30*time.Second, "the idle mount to tear itself down", func() bool {
-		return !isMounted(t, f.mountPath(0))
+	waitUntil(t, 20*time.Second, "subscription withdrawal", func() bool {
+		return f.mounts[1].subscription.stamp() == (subscriptionStamp{}) && f.mounts[1].delegations.incarnation() == 0
 	})
-
-	// The mount this test still holds a descriptor on cannot be unmounted while
-	// it is busy, which is ordinary POSIX. What must hold is that it fails
-	// immediately and never serves the pre-outage bytes again.
 	outcome := make(chan error, 1)
-	go func() {
-		_, err := retained.ReadAt(make([]byte, len(payload)), 0)
-		outcome <- err
-	}()
+	buf := make([]byte, len(payload))
+	go func() { _, err := retained.ReadAt(buf, 0); outcome <- err }()
 	select {
 	case err := <-outcome:
-		if err == nil {
-			t.Fatal("a read through a descriptor of a destroyed authority succeeded")
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("post-horizon retained read=%v, want scoped EIO", err)
 		}
-		// Losing the authority means this frontend can no longer be told that
-		// what it cached has changed, so it revokes itself and stops being a
-		// filesystem rather than failing only this operation.
-		//
-		// This read is served through a descriptor whose pages the earlier read
-		// left resident, so with FOPEN_KEEP_CACHE it is also the assertion that
-		// the revocation ladder's whole-inode data withdrawal actually ran: the
-		// kernel could otherwise answer it without any request reaching this
-		// frontend, and neither the revoked check nor the connection abort
-		// would see it.
-		if !errors.Is(err, syscall.ENOTCONN) {
-			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked)", err)
+	case <-time.After(integrationRequestTimeout + 5*time.Second):
+		buf := make([]byte, 2<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("post-horizon read hung\n%s", buf[:n])
+	}
+	if bytes.Equal(buf, payload) {
+		t.Fatal("post-horizon failed read returned retained bytes")
+	}
+	assertHealthy := func() {
+		for i, mount := range f.mounts {
+			if !isMounted(t, f.mountPath(i)) || mount.isRevoked() || f.clients[i].SessionEndCause() != nil {
+				t.Fatalf("mount %d ended after transport outage: mount=%v session=%v", i, mount.fatalError(), f.clients[i].SessionEndCause())
+			}
 		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("a read through a descriptor of a destroyed authority hung")
 	}
-
-	// Releasing the last reference must let the aborted mount disappear too. A
-	// mount that stays installed after its authority died, and that Unmount can
-	// no longer remove because the session was already closed, is a permanently
-	// EIO path that only an administrator can clear.
-	if err := retained.Close(); err != nil {
-		t.Logf("closing the retained descriptor reported %v", err)
-	}
-	waitUntil(t, 30*time.Second, "the busy mount to tear itself down once its last descriptor is closed", func() bool {
-		return !isMounted(t, f.mountPath(1))
+	assertHealthy()
+	f.resumeAuthority()
+	waitUntil(t, 20*time.Second, "cold subscription recovery", func() bool {
+		return f.mounts[1].subscription.stamp() != (subscriptionStamp{})
 	})
+	if got := readExactlyAt(t, retained, 0, len(payload), "retained handle after recovery"); !bytes.Equal(got, payload) {
+		t.Fatal("recovered retained handle returned wrong data")
+	}
+	requireContent(t, f.join(0, "payload"), payload, "fresh read after recovery")
+	for i := range f.mounts {
+		root := mustOpenFile(t, f.mountPath(i), os.O_RDONLY, 0)
+		if err := root.Sync(); err != nil {
+			t.Fatalf("mount %d recovered barrier: %v", i, err)
+		}
+		if err := root.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertHealthy()
 }
 
 // TestSessionExpiryReleasesABlockedLockWait asserts that an operation parked in
@@ -2383,65 +2383,9 @@ func TestPrivateMappingsAreTornDownByTheDataBarrier(t *testing.T) {
 	}
 }
 
-// TestRevokedMountCannotServeRetainedPages is the fencing half, and it is the
-// assertion that separates this platform from the macOS defect recorded in
-// docs/failure-modes.md.
-//
-// Every other kind of stale service a revoked mount could commit is bounded by
-// refusing requests. A retained page is not: with FOPEN_KEEP_CACHE the read is
-// answered inside the kernel and never becomes a request, so neither the
-// frontend's revoked check nor the FUSE connection abort can see it. What
-// closes it is the explicit whole-inode withdrawal the revocation ladder issues
-// before the abort closes its notification channel. If that regressed, this
-// reader would keep observing
-// pre-fence bytes for as long as it held the file open.
-//
-// REQUIRES THE PRIVILEGED RUNNER: revocation is only observable against a real
-// kernel mount, and the reader has to be a real process holding a real mapping
-// of a real page cache.
+// TestRevokedMountCannotServeRetainedPages preserves the retained-page proof
+// under the v7 withdrawal contract: the mount stays installed, resident bytes
+// cannot satisfy reads after the horizon, and the same open handle recovers.
 func TestRevokedMountCannotServeRetainedPages(t *testing.T) {
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
-	nameA, nameB := f.join(0, "fenced"), f.join(1, "fenced")
-
-	const size = 8 * 1024
-	payload := bytes.Repeat([]byte{'z'}, size)
-	mustWrite(t, nameA, payload, 0o600)
-
-	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
-	defer reader.Close()
-	if got := readExactlyAt(t, reader, 0, size, "pre-revocation read"); !bytes.Equal(got, payload) {
-		t.Fatal("pre-revocation read returned the wrong bytes")
-	}
-
-	// The pages are now resident on mount B. Losing the authority is what fences
-	// it: it can no longer be told that what it holds has changed, so it revokes
-	// itself. Then read through the descriptor that is already open -- the exact
-	// case the mount-namespace detach cannot reach.
-	f.stopAuthority()
-	for i := range 2 {
-		t.Logf("mount %d terminal cause: %v", i, f.requireSessionEnded(i, 30*time.Second))
-	}
-
-	outcome := make(chan error, 1)
-	buf := make([]byte, size)
-	go func() {
-		_, err := reader.ReadAt(buf, 0)
-		outcome <- err
-	}()
-	select {
-	case err := <-outcome:
-		if err == nil {
-			t.Fatal("a fenced mount served its retained pages; this is the stale-read window the withdrawal pass exists to close")
-		}
-		// ENOTCONN from the aborted connection, or EIO from a refaulted page
-		// that cannot be filled. Which one depends on where in the teardown the
-		// read landed; pinning that would pin a race rather than a contract.
-		// What must never happen is a successful read.
-		t.Logf("fenced-mount read failed as required: %v", err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("a read of retained pages on a fenced mount hung")
-	}
-	if bytes.Equal(buf, payload) {
-		t.Fatal("the fenced read filled the caller's buffer with pre-fence bytes even though it reported an error")
-	}
+	testAuthorityHorizonWithdrawalAndRecovery(t, bytes.Repeat([]byte{'z'}, 8*1024))
 }

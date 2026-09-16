@@ -118,9 +118,9 @@ func run() error {
 	flag.DurationVar(&o.capabilityLifetime, "capability-max-lifetime", 15*time.Minute, "longest capability validity window this authority will honour")
 	flag.UintVar(&o.capabilityNonces, "capability-nonce-records", 65536, "single-use capability records retained until expiry")
 	flag.DurationVar(&o.sessionLease, "session-lease", 2*time.Minute, "renewable session lease")
-	flag.DurationVar(&o.cacheLeaseTTL, "cache-lease-ttl", volumeserver.Protocol6MaxLeaseTTL, "authority TTL for protocol-6 cache leases (maximum 20s)")
-	flag.UintVar(&o.maxCacheLeasesPerSession, "max-cache-leases-per-session", 65536, "maximum live protocol-6 cache grants held by one mount")
-	flag.UintVar(&o.maxCacheLeases, "max-cache-leases", 1<<20, "maximum live protocol-6 cache grants held by this worker")
+	flag.DurationVar(&o.cacheLeaseTTL, "cache-lease-ttl", 20*time.Second, "deprecated compatibility option; unused by protocol 7 (maximum 20s)")
+	flag.UintVar(&o.maxCacheLeasesPerSession, "max-cache-leases-per-session", 65536, "deprecated compatibility option; unused by protocol 7")
+	flag.UintVar(&o.maxCacheLeases, "max-cache-leases", 1<<20, "deprecated compatibility option; unused by protocol 7")
 	flag.IntVar(&o.maxInFlight, "max-in-flight", defaultMaxInFlight, "requests concurrently executing per TLS connection")
 	flag.IntVar(&o.maxConnections, "max-connections", defaultMaxConnections, "maximum accepted TLS connections for the worker; must be at least 4 times max-sessions")
 	flag.DurationVar(&o.handshakeTimeout, "tls-handshake-timeout", 10*time.Second, "maximum TLS handshake duration")
@@ -164,7 +164,7 @@ func run() error {
 	maxUint32 := uint(^uint32(0))
 	if o.projectID > maxUint32 || o.maxFrame == 0 || o.maxFrame > maxUint32 ||
 		o.maxRead == 0 || o.maxRead > maxUint32 || o.maxWrite == 0 || o.maxWrite > maxUint32 ||
-		o.replaySlots == 0 || o.replaySlots > maxUint32 || o.sessionLease < time.Second || o.cacheLeaseTTL <= 0 || o.cacheLeaseTTL > volumeserver.Protocol6MaxLeaseTTL ||
+		o.replaySlots == 0 || o.replaySlots > maxUint32 || o.sessionLease < time.Second || o.cacheLeaseTTL <= 0 || o.cacheLeaseTTL > 20*time.Second ||
 		o.maxCacheLeasesPerSession == 0 || o.maxCacheLeasesPerSession > maxUint32 || o.maxCacheLeases == 0 || o.maxCacheLeasesPerSession > o.maxCacheLeases ||
 		o.maxSessions == 0 || o.maxSessions > maxUint32 || o.maxLockRecords == 0 || o.maxLockRecords > maxUint32 ||
 		o.maxItemsPerSession == 0 || o.maxItemsPerSession > maxUint32 || o.maxOpensPerSession == 0 || o.maxOpensPerSession > maxUint32 ||
@@ -277,10 +277,7 @@ func run() error {
 		Store: store, Fencer: runtime, Locks: runtime.Locks(),
 		Membership: membership, Prior: priorDisposition, ClockSkew: o.visibilityClockSkew,
 		MaxCachedNameCapacity: o.maxCachedNameCapacity, MaxRepairBudget: o.maxRepairBudget,
-		CacheLeaseTTL:            o.cacheLeaseTTL,
-		MaxCacheLeasesPerSession: uint32(o.maxCacheLeasesPerSession),
-		MaxCacheLeases:           uint64(o.maxCacheLeases),
-		OnBarrier:                metrics.ObserveVisibilityBarrier,
+		OnBarrier: metrics.ObserveVisibilityBarrier,
 	})
 	if err != nil {
 		return err

@@ -302,7 +302,8 @@ func baselineControlRequest(kind string) bool {
 	switch kind {
 	case "hello", "attach", "resume", "keep_alive", "detach", "cancel", "reauthorize",
 		"reclaim", "activate", "abort_attach", "terminal_delivery_receipt", "apply_routes",
-		"next_lease_event", "acknowledge_lease_event", "renew_leases", "acknowledge_source_lease_discharge",
+		"subscribe", "renew_subscription", "next_control_event", "change_ack",
+		"delegation_recall_ack", "delegation_break_ack", "delegation_mode_change_ack", "delegation_release", "barrier",
 		"next_fskit_repair", "ack_fskit_repair":
 		return true
 	default:

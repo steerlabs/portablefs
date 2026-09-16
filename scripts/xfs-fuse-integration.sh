@@ -57,10 +57,8 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesStrictMembership"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts"
-  # Retained real-VFS regression coverage. These test names predate protocol 6
-  # and do not, by themselves, prove lease grant/recall/discharge. Keep them
-  # required for the behavior they exercise until dedicated v6 tests land; add
-  # those tests by exact name rather than relabeling this block as lease proof.
+  # Retained real-VFS regression coverage. Historical names remain required;
+  # their assertions now exercise protocol 7 subscriptions and delegations.
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns"
@@ -111,8 +109,8 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/Converge"
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/PlainServingAfterConvergence"
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ManagerIndependentVerification"
-  # The files gateway is the only synchronous-repair frontend shipped on Linux
-  # and the only participant that is not a mount. Keep its real handshake with
+  # The files gateway is a cacheless peer reader, never a compatibility writer.
+  # Keep its real handshake with
   # the real volume handler required: every other readonlyfs test drives a fake,
   # which cannot observe attach negotiation, a real barrier, or whether a
   # cacheless reader can stall a writing mount.

@@ -184,15 +184,11 @@ type VolumeHandler struct {
 	WriteAdmissionProgressTimeout       time.Duration
 	WriteAbsoluteTimeout                time.Duration
 	TerminalDeliveryTimeout             time.Duration
-	// Lifecycle durably records protocol-6 mounts and owns route-revision
-	// exclusion. Cache authority itself belongs exclusively to Leases.
+	// Lifecycle durably records mounts and owns route-revision exclusion.
 	Lifecycle *volumeserver.MountLifecycle
-	// Visibility owns the protocol-6 FSKit synchronous-repair participants. Linux
+	// Visibility owns the protocol-7 FSKit synchronous-repair participants. Linux
 	// sessions never enter it; composite mutations coordinate both profile sets.
 	Visibility *volumeserver.VisibilityCoordinator
-	// Leases retains route-administration bookkeeping until the routing layer
-	// removes its historical startup table. No v7 session enters the table.
-	Leases *volumeserver.LeaseCoordinator
 	// Routes owns the volume's active machine-local routing revision. It is
 	// required: a volume with no loaded revision cannot tell an agreeing mount
 	// from a disagreeing one, and admitting mounts in that state is exactly the
@@ -255,7 +251,7 @@ type sessionResources struct {
 	cacheOpens map[xfsstore.Capability][16]byte
 
 	ended bool
-	// attempt identifies the one protocol-6 attach transaction that owns these
+	// attempt identifies the one protocol-7 attach transaction that owns these
 	// resources. Attach retries may race, but the runtime binds an attempt ID to
 	// one canonical request before this record is installed, so an exact retry
 	// observes this same record instead of allocating a second reply table.
@@ -3451,9 +3447,9 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		// AbortAttach is a provisional-only operation. Once ACTIVE, normal Detach
 		// is the sole lifecycle transition and carries the mount-absence proof.
 		errno = errnos.EBUSY
-	case errors.Is(err, volumeserver.ErrAdmission), errors.Is(err, volumeserver.ErrLeaseBlocked), errors.Is(err, volumeserver.ErrLeaseStartup):
+	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN
-	case errors.Is(err, volumeserver.ErrLeaseRoutesLive):
+	case errors.Is(err, volumeserver.ErrRoutesLive):
 		errno = errnos.EBUSY
 	case errors.Is(err, volumeserver.ErrVisibilityInterrupted):
 		// This is a definite pre-apply interruption, not a coherence
@@ -4102,7 +4098,7 @@ func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID, root xf
 
 // startSessionResourcesForProfile exists only for direct-runtime tests that do
 // not run the Attach/Activate transaction. It preserves the production profile
-// split: Linux sessions enter the lease table; FSKit sessions do not.
+// split: Linux sessions enter the subscription coordinator; FSKit sessions do not.
 func (h *VolumeHandler) startSessionResourcesForProfile(id volumeserver.SessionID, root xfsstore.Capability, slots uint32, routes [32]byte, frontend authoritypb.FrontendProfile) error {
 	if frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
 		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&

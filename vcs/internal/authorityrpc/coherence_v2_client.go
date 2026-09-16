@@ -18,6 +18,9 @@ const (
 	coherenceIdentityBytes     = 16
 )
 
+// ErrSubscriptionReset requires cold withdrawal before a new incarnation.
+var ErrSubscriptionReset = errors.New("authorityrpc: uncertain control result requires cold subscription")
+
 // Subscribe starts a cold volume subscription when snapshotID and
 // afterIdentity are empty, or fetches the next page of the frozen delegated
 // identity set when both are present. The returned deadline is anchored at the
@@ -77,6 +80,9 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 // revive an expired subscription because the deadline is measured from the
 // request start rather than response receipt.
 func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (time.Time, error) {
+	if incarnation != 0 && incarnation == c.releaseInvalidIncarnation.Load() {
+		return time.Time{}, ErrSubscriptionReset
+	}
 	if !c.linuxSubscriptionProfile() {
 		return time.Time{}, syscall.EOPNOTSUPP
 	}
@@ -104,6 +110,9 @@ func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (tim
 // Client admission allows only one such poll at a time, while renewal and
 // acknowledgment requests retain independent CONTROL capacity.
 func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequence, completedThrough uint64) (*authoritypb.ControlEvent, error) {
+	if incarnation != 0 && incarnation == c.releaseInvalidIncarnation.Load() {
+		return nil, ErrSubscriptionReset
+	}
 	if !c.linuxSubscriptionProfile() {
 		return nil, syscall.EOPNOTSUPP
 	}

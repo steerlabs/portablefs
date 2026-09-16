@@ -127,10 +127,6 @@ const (
 	// The strict cache commitment every mount in this fixture declares.
 	integrationCachedNames  = 4096
 	integrationRepairBudget = 20 * time.Second
-	// The protocol-6 cache-authority bounds, at the production defaults.
-	integrationCacheLeaseTTL         = volumeserver.Protocol6MaxLeaseTTL
-	integrationCacheLeasesPerSession = 65536
-	integrationCacheLeases           = 1 << 20
 
 	// Match the production authority's bounded standard-WRITE admission
 	// profile without making the integration fixture a weaker peer than the
@@ -329,6 +325,7 @@ type integrationFixture struct {
 	membership   *recordingMembership
 	fencer       *recordingFencer
 	counter      *countingHandler
+	server       *authorityrpc.Server
 	listener     net.Listener
 	stopServe    context.CancelFunc
 	served       chan error
@@ -482,10 +479,8 @@ func (f *integrationFixture) start() {
 	f.fencer = &recordingFencer{inner: authority}
 	// The FSKit-write bounds are what makes this authority able to accept a
 	// synchronous-repair frontend at all: HELLO refuses that profile outright
-	// unless they are complete. Nothing in this fixture issues an FSKit write --
-	// the only sync-repair participant here is the read-only files gateway --
-	// but an authority that could not have accepted one would be answering a
-	// handshake production never runs.
+	// unless they are complete. The cacheless gateway never enters that profile;
+	// keeping the Mac bounds here matches the production authority assembly.
 	fskitStaging, err := authorityrpc.OpenFskitWriteStaging(f.writeStagingRoot)
 	if err != nil {
 		t.Fatalf("open FSKit write staging: %v", err)
@@ -499,9 +494,7 @@ func (f *integrationFixture) start() {
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: f.fencer, Locks: authority.Locks(), Membership: f.membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
-		MaxCachedNameCapacity: uint64(f.cfg.CachedNameCapacity), MaxRepairBudget: time.Minute,
-		CacheLeaseTTL: integrationCacheLeaseTTL, MaxCacheLeasesPerSession: integrationCacheLeasesPerSession,
-		MaxCacheLeases: integrationCacheLeases, Now: f.now,
+		MaxCachedNameCapacity: uint64(f.cfg.CachedNameCapacity), MaxRepairBudget: time.Minute, Now: f.now,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)
@@ -546,14 +539,13 @@ func (f *integrationFixture) start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	f.stopServe, f.served, f.stopped = cancel, make(chan error, 1), false
 	served := f.served
-	go func() {
-		served <- (&authorityrpc.Server{
-			Handler: f.counter, MaxFrame: integrationMaxFrame,
-			MaxInFlight: integrationServerInFlight, MaxConnections: 16,
-			MaxFrameBytesInFlight: integrationAllocationBudget,
-			HandshakeTimeout:      5 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second,
-		}).Serve(ctx, listener, f.serverTLS)
-	}()
+	f.server = &authorityrpc.Server{
+		Handler: f.counter, MaxFrame: integrationMaxFrame,
+		MaxInFlight: integrationServerInFlight, MaxConnections: 16,
+		MaxFrameBytesInFlight: integrationAllocationBudget,
+		HandshakeTimeout:      5 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second,
+	}
+	go func() { served <- f.server.Serve(ctx, listener, f.serverTLS) }()
 
 	f.mountAll()
 }
@@ -647,6 +639,20 @@ func (f *integrationFixture) stopAuthority() {
 	if err := f.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Errorf("close authority listener: %v", err)
 	}
+}
+
+// resumeAuthority retains the epoch, sessions, and transport replay registry.
+func (f *integrationFixture) resumeAuthority() {
+	f.t.Helper()
+	listener, err := net.Listen("tcp", f.listener.Addr().String())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.listener = listener
+	ctx, cancel := context.WithCancel(context.Background())
+	f.stopServe, f.served, f.stopped = cancel, make(chan error, 1), false
+	served := f.served
+	go func() { served <- f.server.Serve(ctx, listener, f.serverTLS) }()
 }
 
 func (f *integrationFixture) closeStore() {
@@ -1101,10 +1107,10 @@ func requestKind(request *authoritypb.Request) string {
 		return "lookup"
 	case request.GetGetAttr() != nil:
 		return "getattr"
-	case request.GetNextLeaseEvent() != nil:
-		return "next-lease-event"
-	case request.GetAcknowledgeLeaseEvent() != nil:
-		return "ack-lease-event"
+	case request.GetNextControlEvent() != nil:
+		return "next-control-event"
+	case request.GetChangeAck() != nil:
+		return "change-ack"
 	case request.GetReclaim() != nil:
 		return "reclaim"
 	case request.GetKeepAlive() != nil:

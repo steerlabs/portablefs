@@ -62,13 +62,17 @@ const routesDirMode fs.FileMode = 0o755
 // one machine's platform-specific dependency tree into a subtree the other has
 // hidden, and neither side would see an error - so the disagreement has to be
 // caught where both sides are visible, which is here.
+type routesChange struct {
+	Revision  [32]byte
+	Canonical []byte
+}
+
 type RoutesController struct {
 	Store *xfsstore.Volume
 	// Mounts owns both topology exclusion and the durable mount set. Route
 	// changes are admitted only at clean mount absence, and both halves of that
 	// decision have to come from the same record.
 	Mounts *volumeserver.MountLifecycle
-	Leases *volumeserver.LeaseCoordinator
 	Locks  *volumeserver.LockTable
 
 	// lockWaitAdmission is a topology transition gate only for blocking byte-
@@ -99,14 +103,14 @@ func (r *RoutesController) AcquireTopologyRead() *volumeserver.TopologyReadGuard
 // newRoutesController is reached only through NewCoordination, which is what
 // makes every dependency below non-optional at every call site.
 func newRoutesController(store *xfsstore.Volume, mounts *volumeserver.MountLifecycle,
-	leases *volumeserver.LeaseCoordinator, locks *volumeserver.LockTable) (*RoutesController, error) {
-	if store == nil || mounts == nil || leases == nil || locks == nil {
-		return nil, errors.New("authorityrpc: routing needs the volume store, durable mount lifecycle, lease coordinator, and epoch lock table")
+	locks *volumeserver.LockTable) (*RoutesController, error) {
+	if store == nil || mounts == nil || locks == nil {
+		return nil, errors.New("authorityrpc: routing needs the volume store, durable mount lifecycle, and epoch lock table")
 	}
 	if routesDirName == "" || routesFileName == "" {
 		return nil, fmt.Errorf("authorityrpc: %q is not a two-component in-volume path", localroutes.ConfigPath)
 	}
-	return &RoutesController{Store: store, Mounts: mounts, Leases: leases, Locks: locks}, nil
+	return &RoutesController{Store: store, Mounts: mounts, Locks: locks}, nil
 }
 
 // Load reads the declaration out of this authority's own volume root and makes
@@ -188,7 +192,7 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		// a bad request and not an uncertain outcome.
 		return nil, fmt.Errorf("%w: %w", errRoutesInvalid, err)
 	}
-	next := volumeserver.RoutesChange{Revision: rules.Revision(), Canonical: rules.Canonical()}
+	next := routesChange{Revision: rules.Revision(), Canonical: rules.Canonical()}
 	// Serialize only blocking-lock admission, not ordinary filesystem work. A
 	// waiter admitted before this boundary is already visible in Locks and is
 	// interrupted in the checked transition below. A waiter arriving after it
@@ -223,17 +227,17 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		}
 		return true, nil
 	}
-	commit := func() (volumeserver.RoutesChange, error) {
+	commit := func() (routesChange, error) {
 		published, err := r.write(raw)
 		if err != nil && !published {
 			r.mu.RLock()
-			current := volumeserver.RoutesChange{Revision: r.revision, Canonical: append([]byte(nil), r.canonical...)}
+			current := routesChange{Revision: r.revision, Canonical: append([]byte(nil), r.canonical...)}
 			r.mu.RUnlock()
 			return current, err
 		}
 		// Rename is the logical publication point. Even when syncing its parent
 		// reports an uncertain failure, the live name may already be the new file;
-		// in-memory state and COMPLETE must never lie by announcing the old rules.
+		// in-memory state must not announce the old rules.
 		r.mu.Lock()
 		r.revision, r.canonical = next.Revision, append([]byte(nil), next.Canonical...)
 		r.mu.Unlock()
@@ -247,14 +251,11 @@ func (r *RoutesController) Apply(ctx context.Context, raw []byte, expected [32]b
 		if cleanErr := r.Mounts.RequireCleanRouteAbsence(); cleanErr != nil {
 			return 0, cleanErr
 		}
-		return r.Leases.ExecuteRoutes(ctx, next, func() (volumeserver.RoutesChange, error) {
-			// Every refusal check has passed under topology exclusion. Retire the
-			// old-revision lock queue immediately before durable publication; an
-			// ordinary CAS or live-mount refusal must not disturb it.
-			r.Locks.InterruptWaiters(volumeserver.ErrSessionExpired)
-			apply = true
-			return commit()
-		})
+		// Topology exclusion and clean absence cover the whole revision switch.
+		r.Locks.InterruptWaiters(volumeserver.ErrSessionExpired)
+		apply = true
+		_, err := commit()
+		return 0, err
 	})
 	if err != nil {
 		return nil, err

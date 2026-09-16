@@ -3270,3 +3270,55 @@ func TestDelegationReleaseSequenceSurvivesControlReconnectAndHoldsLane(t *testin
 		}
 	}
 }
+
+func TestUncertainDelegationReleaseRequiresColdSubscriptionWithoutEndingSession(t *testing.T) {
+	seen := make(chan *authoritypb.DelegationReleaseRequest, 1)
+	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
+		if r.GetDelegationRelease().GetIncarnation() == 1 {
+			if transport, ok := transportConnectionFromContext(ctx); ok {
+				transport.close()
+			}
+		} else {
+			seen <- proto.Clone(r.GetDelegationRelease()).(*authoritypb.DelegationReleaseRequest)
+		}
+		return releaseReceiptResponse(r)
+	}}
+	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	defer stop()
+	config := coherentTestClientConfig(address, tlsConfig, "volume", 5, 5)
+	config.CancelDrainTimeout = 10 * time.Millisecond
+	client, err := DialClient(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := client.CallIdempotent(ctx, releaseReceiptRequest(1, 1)); err == nil {
+		t.Fatal("lost release reply succeeded")
+	}
+	if client.poisoned.Load() || client.SessionEndCause() != nil || client.releaseCompleted != 0 {
+		t.Fatal("uncertain release ended session or receipted an unknown result")
+	}
+	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 2)); !errors.Is(err, ErrSubscriptionReset) {
+		t.Fatalf("next release=%v", err)
+	}
+	if _, err := client.RenewSubscription(t.Context(), 1); !errors.Is(err, ErrSubscriptionReset) {
+		t.Fatalf("renew=%v", err)
+	}
+	if _, err := client.NextControlEvent(t.Context(), 1, 0, 0); !errors.Is(err, ErrSubscriptionReset) {
+		t.Fatalf("poll=%v", err)
+	}
+	if client.releaseSequence != 1 {
+		t.Fatal("issued another sequence in uncertain replay domain")
+	}
+	// The subscription owner supplies the new incarnation only after cold
+	// withdrawal. Its first release must not receipt the uncertain old result.
+	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(2, 3)); err != nil {
+		t.Fatal(err)
+	}
+	request := <-seen
+	if request.ReleaseSequence != 1 || request.CompletedReleaseThrough != 0 || client.releaseCompleted != 1 {
+		t.Fatalf("new replay domain: %v", request)
+	}
+}

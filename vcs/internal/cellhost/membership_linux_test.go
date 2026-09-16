@@ -12,7 +12,7 @@ import (
 
 // membershipDocument builds the record in the writer's exact format
 // (volumeserver/visibility_membership.go persistLocked): header line, the hex
-// of the volume ID's own bytes, then one hex session ID per active line. The
+// of the volume ID's own bytes, then one hex session ID and profile per active line. The
 // helper's parser is tested against these bytes rather than against the
 // authority's code, because the file - not the package - is the interface.
 func membershipDocument(volumeID string, sessions ...[16]byte) string {

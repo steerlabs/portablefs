@@ -396,3 +396,123 @@ final destructive peer-loss case. Run 103 passes Linux standalone renewal,
 cell-host membership parsing, exact authorization snapshots, and keepalive
 regressions. This closes step 3; the later deletion/performance changes still
 require final full qualification.
+
+
+## Step 4: deleting the retired engine
+
+Deleted `volumeserver/leases.go` and its test file, the client lease grant and
+renewal validators and tests, and the unused visibility route coordinator and
+tests. Routes now use MountLifecycle's topology writer and clean-absence check
+directly, preserving CAS, durable publication, and lock-wait interruption. The
+handler and production assembly no longer construct or retain a LeaseCoordinator.
+The three frozen cache-lease CLI flags remain accepted and validated with their
+old bounds, but are explicitly deprecated and do not configure protocol 7.
+
+Removed executable transport classification for the four old control methods.
+The frozen protobuf tags and negative profile/refusal tests remain, together
+with one shared rejection check for obsolete response state; they cannot grant,
+recall, renew, or discharge anything. Linux request dispatch uses the v7 profile
+allowlist. The nested-frame allocation-limit test now uses ChangeBatch entries.
+Baseline request classification now counts v7 CONTROL and barrier operations.
+
+No Linux lease ticker or hard-deadline watchdog remains. Subscription horizons,
+recall budgets, and epoch transitions invalidate/fail the affected state while
+the mount stays up. The remaining `revoke` calls protect malformed protocol
+results, impossible callback/publication ownership, or uncertain applied
+namespace outcomes; deleting them would weaken the exact-result guarantee.
+Mac compatibility exclusion and synchronous repair remain separate and active.
+
+The two previously missing replacement regressions now pass:
+`TestCoherenceDelegationChurnRetainsOnlyLiveRecordsAndScalarGeneration` exercises
+1,024 identities and reuse without retained per-identity grant history;
+`TestCoherenceDataConsumedWakesWhenCanceledRecallRetiresGeneration` proves the
+queued reader wakes after exact holder drain without reviving ownership.
+Native coordinator/transport tests pass after deletion (runs 104 and 106).
+Static Linux product and frontend-test compilation pass. Full real-mount run
+107 is in progress.
+
+The following mapping preserves every test from the deleted lease suite:
+
+| # | Retired v6 test | Protocol 7 replacement or disposition |
+|---:|---|---|
+| 1 | `TestLeaseStartupGraceBlocksMutationsUntilExactPriorTTL` | `TestNewAuthorityRejectsOldEpoch` and `TestEpochRecoveryStalesOldHandlesAndAdmitsNewOpens`. Protocol 7 makes old capabilities permanently stale instead of trusting a grace interval. |
+| 2 | `TestLeaseGrantPolicyAndConflicts` | `TestCoherenceDelegationCacheModes` and `TestCoherenceReservedIdentityClosesCachingAndColdSnapshot`. Protocol 7 has one writer delegation; peer cached handles force writethrough or direct I/O. |
+| 3 | `TestLeaseHolderCoordinateChurnRetainsOnlyLiveRecordsAndScalarEpoch` | `TestCoherenceDelegationChurnRetainsOnlyLiveRecordsAndScalarGeneration` (added and passing). |
+| 4 | `TestLeaseGrantCapacityRefusesCachingWithoutEviction` | `TestSessionResourceAdmissionAndTerminalState`, `TestCapabilityReservationIsPreApplyAndSymmetric`, and `TestCoherenceOpenGrantFailureRetiresTrackedHandle`. Persistent delegations are bounded by admitted open/item resources; refusal precedes publication and does not evict existing state. |
+| 5 | `TestLeaseGrantBatchIsAllOrNoneAtCapacity` | `TestCapabilityReservationIsPreApplyAndSymmetric` and `TestCoherenceOpenStorageFailureAbortsUnpublishedReservation`. Protocol 7 has no multi-coordinate grant batch; the stronger filesystem resource reservation is atomic and rolls back before reply publication. |
+| 6 | `TestLeaseRecallSelfExemptionAndExactDischarge` | `TestCoherenceCommitNotifiesOnlyPeersOfSource`, `TestWaitWithdrawnExcludesSourceAndHonorsPartitionHorizon`, and `TestCoherencePrivateMutationExcludesSourceUntilPromotion`. The source never owes its own peer withdrawal; promotion and release are explicit. |
+| 7 | `TestLeaseRecallFromExternalSourceRecallsPeerWithoutSourceObligation` | `TestCoherenceBreakFlushCutAndRecall`, `TestCoherenceReadWaitsForDelegationBreakBeforeStorage`, and `TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer`. An authenticated gateway read breaks the holder and never becomes a writer/source participant. |
+| 8 | `TestLeaseRecallFromExternalSourceFenceBeforeAndDuringRecall` | `TestCoherencePermanentSessionEndDuringRecall` and `TestFilesGatewayCloseDoesNotStallAMutatingMount`. |
+| 9 | `TestLeaseCanceledCompleteCannotReopenAdmission` | `TestCoherenceCanceledReservationAndCutCleanUp`. After a dispatched control cut, cancellation waits for holder drain and cannot revive ownership. |
+| 10 | `TestLeaseDischargeRejectsContinuityAndStaleEpoch` | `TestCoherenceDelegationBreakRecallAcksValidateTicketIdentityAndReplay`, `TestCoherenceReleaseBatchIsAtomic`, and `TestCoherenceAckRejectsFutureAppliedCut`. |
+| 11 | `TestLeaseRenewalReturnsExactCoordinateWithdrawals` | `TestSubscriptionRenewBoundary` and `TestSubscriptionColdSnapshotIncludesDelegatedSet`. Protocol 7 renews one subscription horizon; exact delegated identities come from the cold snapshot and control stream. |
+| 12 | `TestLeaseRepeatedReadGrantKeepsRenewableEpoch` | `TestCoherenceCacheHandlesSurviveColdResubscribe` and `TestCoherenceDelegationCacheModes`. Open-description counts survive renewal/cold subscribe without minting a conflicting generation. |
+| 13 | `TestLeaseRenewalLosingToRecallIsNonfatalWithdrawal` | `TestCoherenceRenewAndChangeStreamUseIndependentCursors` and `TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked`. Renewal stays independent and nonterminal while control withdrawal is outstanding. |
+| 14 | `TestLeaseRenewalRestampsAdmissionGenerationAfterDisjointRecall` | `TestSubscriptionColdPaginationWatermarkAndStaleReply`. Reply-local incarnation/generation and exact coordinate version reject a stale reply while a fresh disjoint reply remains cacheable. |
+| 15 | `TestLeaseDisjointSourceMutationsDischargeOutOfOrder` | `TestCoherenceDisjointRequestBypassesRecall` and `TestDelegationWritebackPipelinesDisjointFiles`. Protocol 7 intentionally has independent identity lanes and no source-discharge token. |
+| 16 | `TestLeaseRouteChangeRequiresCleanMountAbsence` | `TestMountLifecyclePriorUnprovenOnlyBlocksRouteChanges` and `TestMountLifecycleActivationRollbackAndExactCleanDetach`. |
+| 17 | `TestLeaseRecallExpiryFencesAndImplicitlyDischarges` | `TestCoherenceRecallExpiryAndBudget` and `TestDelegationRecallBudgetMissDropsAndAdvancesLoss`. Protocol 7 retires only the generation, reports loss/EIO, and keeps the mount alive. |
+| 18 | `TestLeaseIndependentCoordinatesRecallConcurrently` | `TestCoherenceDisjointRequestBypassesRecall` and `TestDelegationWritebackPipelinesDisjointFiles`. |
+| 19 | `TestLeaseSameHolderSerializesAcrossRevokeCompleteGap` | `TestCoherenceBreakRacingRecallIsFIFO` and `TestDelegationControlEventsPreservePerIdentityDeliveryOrder`. The old cross-coordinate holder lane is deliberately gone; protocol 7 serializes the same identity and lets disjoint identities proceed. |
+| 20 | `TestLeaseReadAdmissionMakesStaleReplyGrantPartOfRecall` | `TestCoherenceOpenGrantsOnlyAfterHandleReady`, `TestCoherenceCreateKeepsReplyGrantReservedThroughWithdrawal`, and `TestSubscriptionColdPaginationWatermarkAndStaleReply`. |
+| 21 | `TestLeaseReadAdmissionCannotGrantAfterRelease` | `TestCoherenceCanceledReservationAndCutCleanUp` and `TestCoherenceOpenStorageFailureAbortsUnpublishedReservation`. |
+| 22 | `TestLeasePrepareCancellationCannotSkipDispatchedRevoke` | `TestCoherenceCanceledReservationAndCutCleanUp`; this is its exact protocol 7 assertion. |
+| 23 | `TestLeaseNewReadWaitsUntilOldCacheIsDischarged` | `TestCoherenceReadWaitsForDelegationBreakBeforeStorage` and `TestCoherenceBreakFlushCutAndRecall`. Stronger protocol 7 rule: storage read is not entered until the holder flush cut is acknowledged. |
+| 24 | `TestLeaseFencePreventsGrantAndRenewal` | `TestCoherencePermanentSessionEndDuringRecall`, `TestSubscriptionOverflowFencesEveryAdmissionPath`, and `TestCoherenceReadPathsRefuseExpiredSubscriptionBeforeStorage`. |
+| 25 | `TestLeaseFencedSourceKeepsBarrierUntilOriginalGrantExpiry` | `TestCoherencePermanentSessionEndDuringRecall` and `TestWaitWithdrawnExcludesSourceAndHonorsPartitionHorizon`. Terminal runtime drops write authority but never shortens the old cache horizon. |
+| 26 | `TestLeaseNoopPreservesSourceGrantForLaterPeerRecall` | `TestCoherenceSynchronousMutationPinsExistingHolderGrant` and `TestCoherenceConcurrentSynchronousFailureCannotRetireRetainedGrant`. |
+| 27 | `TestLeaseEventCursorIsExactTokenNotMonotonicSequence` | `TestCoherenceChangesSkipInternalEventsWithoutCursorHoles`, `TestCoherenceRenewAndChangeStreamUseIndependentCursors`, and `TestDelegationControlEventsPreservePerIdentityDeliveryOrder`. Protocol 7 deliberately replaces opaque/nonmonotonic v6 tokens with a contiguous control sequence and separate change position. |
+| 28 | `TestLeaseConstructorRejectsTTLBeyondProtocolHorizon` | `TestCoherenceGrantWaitsOnlyToPartitionHorizon` and `TestSubscriptionRenewBoundary`. Protocol 7 TTL and recall budget are frozen constants, not configuration. |
+| 29 | `TestLeaseDataReadWaitsForApplyAndThenMissesUntilDischarge` | `TestCoherenceReadWaitsForDelegationBreakBeforeStorage` and `TestCoherencePromotedPrivateGrantDrainsPendingReaders`. Protocol 7 breaks and flushes before storage instead of serving a post-apply uncacheable v6 reply. |
+| 30 | `TestLeaseSourceDataReadWaitsForItsOwnApplyThenSeesAppliedState` | `TestDelegationReadAndAttributeOverlay` and `TestCoherenceSynchronousMutationPinsExistingHolderGrant`. The stronger holder rule makes accepted buffered state visible locally even before apply, while synchronous apply pins ownership. |
+| 31 | `TestLeaseDataReadWakesWhenTheRecallAborts` | `TestCoherenceDataConsumedWakesWhenCanceledRecallRetiresGeneration` (added and passing). |
+| 32 | `TestLeaseSourcePostStateGrantRejectsAnUnpreparedCoordinate` | `TestCoherenceSynchronousMutationRetainsSuccessfulGrant` and `TestCoherenceCreateReservesBeforeBindingPublication`. Arbitrary successor coordinates are unrepresentable in protocol 7: `RetainDelegation` is bound to the exact mutation-pin identity, while `ReserveNew` is the explicit created-identity path. |
+
+The deleted visibility-route tests have these stronger replacements:
+
+| Retired test | Stronger existing replacement |
+|---|---|
+| `TestTopologyReadGuardExcludesRouteCASForPausedRequestsAndAttaches` | `TestPausedAttachPinsItsAdmittedTopologyUntilAdmissionFinishes` and `TestPausedFilesystemRequestPinsItsAdmittedTopologyUntilCompletion`; these exercise the real handler admission paths. |
+| `TestTopologyExclusiveSerializesConcurrentRouteCompareAndSwap` | `TestRoutesControllerSerializesConcurrentApplyCompareAndSwapOnXFS`; this exercises the same exclusion through the real route controller and XFS persistence. |
+
+Run 107 exposed two stale transport-loss tests that still required automatic
+unmount/ENOTCONN. Their protocol 7 replacement keeps both original inventory
+names and proves bounded EIO after completed horizon withdrawal, absence of old
+bytes in the failed read, live mounts and authenticated sessions, same-runtime
+listener recovery, successful reads through the retained handle, and a passing
+root barrier on both mounts. Runs 109 and 111 also exposed an invalid test
+observation: a zero subscription stamp marks withdrawal admission closing,
+not completed inode notification. The test now waits for the post-withdrawal
+incarnation fence before trying to refault retained pages.
+
+An uncertain release receipt now fences its subscription incarnation instead
+of poisoning the authenticated session. The client refuses release, renewal,
+and poll on that incarnation; the subscription worker drains, withdraws caches,
+and cold-subscribes before any new release domain can begin. A malformed
+response remains terminal. The regression loses every reply in incarnation 1,
+proves no completion receipt or successor is issued there, then proves that
+incarnation 2 starts at release sequence 1/completion 0. The wire contract
+records this decision. Background reclaim and close batches retain their exact
+replay identity through a transport gap using the mount lifetime context.
+
+Run 112 captured the remaining read wait in transport reconnect after cold
+withdrawal. A kernel refault could enter another bounded network wait instead
+of receiving the subscription's scoped failure. Read now refuses locally with
+EIO while the subscription stamp is zero, before either buffer overlay or RPC.
+This preserves the session and becomes usable after cold Subscribe. The unit
+regression checks inactive and elapsed subscriptions without any transport call.
+Run 114 passes that test and both real-mount outage/recovery tests (9.04 seconds
+each); its wrapper exits 70 only for deliberately unrun inventory. Native race
+tests for authorityrpc and volumeserver pass in run 113. Full run 116 is pending.
+
+Deletion validation also passes native `go -C vcs test ./...` (run 115),
+`go -C vcs vet ./...` (run 117), Foundation/cgo Darwin build, and static Linux
+build. The requested retired-wire identifiers have no remaining references in
+`fusev3`, `mountv3`, or the Linux mount command. Frozen schema and explicit
+shared-transport refusal tests remain as described above. Full run 116 is not
+yet claimed green; its result and the final full gate will qualify subsequent
+benchmark changes as well.
+
+Run 116 exits 0: the complete XFS/FUSE suite passes all 66 required privileged
+tests and the additional root-boundary test after engine deletion and cold-read
+recovery. This closes step 4's real-mount qualification.

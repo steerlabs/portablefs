@@ -7,10 +7,13 @@ import (
 	"time"
 )
 
-// MountLifecycle owns the protocol-6 durable mount set and topology exclusion.
-// It deliberately has no cache-repair stream: LeaseCoordinator owns cache
-// authority, while durable membership exists only to prove LOCAL route absence
-// across authority restarts.
+var (
+	ErrMountHolder = errors.New("volumeserver: mount holder is not active")
+	ErrRoutesLive  = errors.New("volumeserver: route change requires clean mount absence")
+)
+
+// MountLifecycle owns durable mount membership and topology exclusion.
+// Cache authority belongs to the independent v7 and Mac coordinators.
 type MountLifecycle struct {
 	membership DurableVisibilityMembership
 	now        func() time.Time
@@ -72,7 +75,7 @@ func (l *MountLifecycle) RequireCleanRouteAbsence() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.priorUnproven || len(l.active) != 0 {
-		return ErrLeaseRoutesLive
+		return ErrRoutesLive
 	}
 	return nil
 }
@@ -95,12 +98,12 @@ func activateMembership(m DurableVisibilityMembership, id SessionID, profile Mou
 
 func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipProfile, publish func() error) error {
 	if id == (SessionID{}) || publish == nil {
-		return ErrLeaseHolder
+		return ErrMountHolder
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, exists := l.active[id]; exists {
-		return ErrLeaseHolder
+		return ErrMountHolder
 	}
 	if err := activateMembership(l.membership, id, profile); err != nil {
 		return err
@@ -162,4 +165,24 @@ func (l *MountLifecycle) validateMountAbsence(proof MountAbsenceProof, registere
 		return ErrVisibilityProof
 	}
 	return nil
+}
+
+// TopologyReadGuard pins the routing revision a filesystem request or attach
+// was admitted against. ApplyRoutes takes the corresponding write side before
+// it rechecks compare-and-swap and keeps it through durable commit, so a request
+// can never pass admission under one topology and reach XFS under another.
+//
+// The guard is intentionally opaque and pointer-only. Release is idempotent so
+// a deferred release remains safe on every handler exit.
+type TopologyReadGuard struct {
+	release func()
+	once    sync.Once
+}
+
+// Release ends one route-revision admission critical section.
+func (g *TopologyReadGuard) Release() {
+	if g == nil || g.release == nil {
+		return
+	}
+	g.once.Do(g.release)
 }

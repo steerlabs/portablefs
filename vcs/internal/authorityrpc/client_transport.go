@@ -17,7 +17,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
-// clientTransport is one physical protocol-6 lane. Everything whose identity
+// clientTransport is one physical protocol-7 lane. Everything whose identity
 // is scoped to a TCP/TLS connection lives here: publication, serialization,
 // request IDs, waiters, reconnect exclusion, and negotiated frame accounting.
 // Session identity is deliberately not duplicated here; both transports prove

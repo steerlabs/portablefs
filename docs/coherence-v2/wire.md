@@ -169,9 +169,10 @@ acknowledgments while the poll is parked.
 Release operations share one serialized acknowledgment lane, held across reconnect and
 exact retry. A new release carries sequence H+1 and completion H, where H is the last
 accepted sequence. The Authority retains only the latest exact request fingerprint and
-result, including definite errors. An exact retry repeats both coordinates. A malformed
-or uncertain final response ends the client session before another release can surrender
-that result. Invalid local request shapes consume no sequence. Linux attach requires
+result, including definite errors. An exact retry repeats both coordinates. A malformed final response ends the client session. An uncertain final response fences
+the subscription incarnation: no further release, renewal, or poll may use that incarnation.
+The client withdraws its caches before a cold subscription creates a new release replay
+domain; it cannot acknowledge or surrender the uncertain result in the old domain. Invalid local request shapes consume no sequence. Linux attach requires
 `bounded-control-replay-v1` so clients cannot silently omit these coordinates.
 
 Application tickets retain monotonic applied/durable counters and only the

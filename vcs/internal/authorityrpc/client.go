@@ -172,55 +172,56 @@ type Client struct {
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
 	// be able to reconnect and make progress independently.
-	lifecycle                sync.Mutex
-	data                     *clientTransport
-	control                  *clientTransport
-	connectionSetID          [32]byte
-	attachAttemptID          [32]byte
-	ordinary                 lane
-	blocking                 lane
-	repairControl            lane
-	controlPoll              lane
-	controlAck               lane
-	liveness                 lane
-	epoch                    []byte
-	helloFeatures            []string
-	negotiatedFrame          uint32
-	negotiatedInFlight       uint32
-	proof                    *authoritypb.SessionProof
-	root                     *authoritypb.Item
-	routesRevision           [32]byte
-	authorizationDeadline    time.Time
-	maxRead                  uint32
-	maxWrite                 uint32
-	maxFskitWrite            uint64
-	lease                    time.Duration
-	releaseIncarnation       uint64 // protected by the single controlAck permit
-	releaseSequence          uint64
-	releaseCompleted         uint64
-	subscriptionMu           sync.Mutex
-	subscriptionSnapshot     []byte
-	subscriptionWatermark    uint64
-	subscriptionIncarnation  uint64
-	subscriptionHorizonNanos uint64
-	subscriptionDeadline     time.Time
-	fskitRepairCursor        *authoritypb.VisibilityCursor
-	sessionReauthorization   atomic.Bool
-	poisoned                 atomic.Bool
-	closed                   atomic.Bool
-	fatalMu                  sync.Mutex
-	fatalErr                 error
-	fatalDone                chan struct{}
-	fatalPendingDone         chan struct{}
-	fatalPending             bool
-	fatalPendingPublished    bool
-	fatalPublished           bool
-	localEnforcementDone     bool
-	fatalDrainTimer          *time.Timer
-	responseConsumptions     map[*responseConsumption]struct{}
-	preMountReleaseMu        sync.Mutex
-	preMountReleaseDone      chan struct{}
-	preMountReleaseErr       error
+	lifecycle                 sync.Mutex
+	data                      *clientTransport
+	control                   *clientTransport
+	connectionSetID           [32]byte
+	attachAttemptID           [32]byte
+	ordinary                  lane
+	blocking                  lane
+	repairControl             lane
+	controlPoll               lane
+	controlAck                lane
+	liveness                  lane
+	epoch                     []byte
+	helloFeatures             []string
+	negotiatedFrame           uint32
+	negotiatedInFlight        uint32
+	proof                     *authoritypb.SessionProof
+	root                      *authoritypb.Item
+	routesRevision            [32]byte
+	authorizationDeadline     time.Time
+	maxRead                   uint32
+	maxWrite                  uint32
+	maxFskitWrite             uint64
+	lease                     time.Duration
+	releaseInvalidIncarnation atomic.Uint64
+	releaseIncarnation        uint64 // protected by the single controlAck permit
+	releaseSequence           uint64
+	releaseCompleted          uint64
+	subscriptionMu            sync.Mutex
+	subscriptionSnapshot      []byte
+	subscriptionWatermark     uint64
+	subscriptionIncarnation   uint64
+	subscriptionHorizonNanos  uint64
+	subscriptionDeadline      time.Time
+	fskitRepairCursor         *authoritypb.VisibilityCursor
+	sessionReauthorization    atomic.Bool
+	poisoned                  atomic.Bool
+	closed                    atomic.Bool
+	fatalMu                   sync.Mutex
+	fatalErr                  error
+	fatalDone                 chan struct{}
+	fatalPendingDone          chan struct{}
+	fatalPending              bool
+	fatalPendingPublished     bool
+	fatalPublished            bool
+	localEnforcementDone      bool
+	fatalDrainTimer           *time.Timer
+	responseConsumptions      map[*responseConsumption]struct{}
+	preMountReleaseMu         sync.Mutex
+	preMountReleaseDone       chan struct{}
+	preMountReleaseErr        error
 	// testAfterResponseParsed pauses the retained mutation path after readLoop
 	// has delivered a complete frame but before the frontend caller can consume
 	// it. Nil in production.
@@ -1455,8 +1456,8 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 		request.GetActivate() != nil || request.GetAbortAttach() != nil || request.GetCancel() != nil {
 		return nil, syscall.EINVAL
 	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
-		obsoleteLinuxLeaseRequest(request) {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED &&
+		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
 		return nil, syscall.EOPNOTSUPP
 	}
 	if _, err := roleForRequest(request); err != nil {
@@ -1471,11 +1472,6 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 	return admitted, nil
 }
 
-func obsoleteLinuxLeaseRequest(request *authoritypb.Request) bool {
-	return request.GetNextLeaseEvent() != nil || request.GetAcknowledgeLeaseEvent() != nil ||
-		request.GetRenewLeases() != nil || request.GetAcknowledgeSourceLeaseDischarge() != nil
-}
-
 // dispatchOwned performs one round trip, stamping and sending a request the
 // client owns. Admission is the caller's responsibility so that a replay slot is
 // never taken before the permit that bounds it. Mutation dispatch assigns its
@@ -1488,8 +1484,8 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 }
 
 func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
-		obsoleteLinuxLeaseRequest(request) {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED &&
+		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
 		return nil, nil, syscall.EOPNOTSUPP
 	}
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT &&
@@ -1577,24 +1573,21 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 }
 
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {
+	// The schema keeps historical tags to prevent accidental reuse. This is a
+	// rejection guard shared by every profile, not an executable v6 client.
+	if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil || response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil || response.GetSourceLeaseDischarge() != nil || response.GetAcknowledgeSourceLeaseDischarge() != nil {
+		return fmt.Errorf("%w: peer sent retired protocol state", ErrTransportBinding)
+	}
 	switch c.cfg.FrontendProfile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil || response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil || response.GetSourceLeaseDischarge() != nil || response.GetAcknowledgeSourceLeaseDischarge() != nil || response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
+		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
 			return fmt.Errorf("%w: cacheless reader received cache participation state", ErrTransportBinding)
 		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
-		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil ||
-			response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil ||
-			response.GetAcknowledgeSourceLeaseDischarge() != nil || response.GetSourceLeaseDischarge() != nil ||
-			response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
-			return fmt.Errorf("%w: Linux subscription session received obsolete lease or FSKit response state", ErrTransportBinding)
+		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
+			return fmt.Errorf("%w: Linux subscription session received FSKit response state", ErrTransportBinding)
 		}
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
-		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil ||
-			response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil ||
-			response.GetAcknowledgeSourceLeaseDischarge() != nil || response.GetSourceLeaseDischarge() != nil {
-			return fmt.Errorf("%w: FSKit repair session received Linux lease state", ErrTransportBinding)
-		}
+
 	}
 	return nil
 }
@@ -1695,6 +1688,9 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 			}
 			previous = release.GetDelegation().GetId()
 		}
+		if body.GetIncarnation() == c.releaseInvalidIncarnation.Load() {
+			return nil, nil, ErrSubscriptionReset
+		}
 		if body.GetIncarnation() < c.releaseIncarnation || body.GetIncarnation() == 0 {
 			return nil, nil, syscall.EINVAL
 		}
@@ -1713,10 +1709,14 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 			}
 			if err == nil {
 				err = errors.New("authorityrpc: malformed delegation release result")
+				c.signalSessionEnd(err)
+				return
 			}
-			// There is no receipt for an uncertain result. End this session before
-			// allowing another release to surrender its replay record.
-			c.signalSessionEnd(err)
+			// An uncertain release cannot surrender its replay receipt or issue
+			// another batch in this incarnation. Cold Subscribe retires that
+			// replay domain after local cache/buffer withdrawal, without ending
+			// the authenticated session or the kernel mount.
+			c.releaseInvalidIncarnation.Store(body.GetIncarnation())
 		}()
 	}
 	response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)

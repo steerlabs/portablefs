@@ -785,12 +785,12 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 		if entry.transport != m.rpc.(*epochRPC).current() {
 			continue
 		}
-		callCtx, cancel := context.WithTimeout(ctx, m.requestTimeout)
+		// Background cleanup has no syscall deadline. Retain its replay slot
+		// across a transport gap until exact resolution or mount shutdown.
 		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: entry.token}}}
 		response, consumption, err := entry.transport.CallMutationWithIdentityRetained(
-			callCtx, request, nil, m.forceTerminalResponseRevocation,
+			ctx, request, nil, m.forceTerminalResponseRevocation,
 		)
-		cancel()
 		if ctx.Err() != nil {
 			if consumption != nil {
 				m.revoke(errors.New("fusev3: mount ended before an authority reclaim response was consumed"))
@@ -1557,6 +1557,13 @@ func (n *node) Read(ctx context.Context, handle *fileHandle, dest []byte, off in
 	if handle.stale.Load() || n.stale.Load() {
 		return nil, syscall.EIO
 	}
+	// Cold withdrawal closes read admission until the replacement subscription
+	// is installed. In particular, a kernel refault must not enter repeated
+	// network timeouts while the Authority has already fenced this incarnation.
+	if n.mount.subscription != nil && n.mount.subscription.stamp() == (subscriptionStamp{}) {
+		return nil, syscall.EIO
+	}
+
 	data, err := n.mount.delegations.Read(ctx, n.item.GetStableIdentity(), off, len(dest), func(fetchCtx context.Context, offset int64, length int) ([]byte, error) {
 		data := make([]byte, 0, length)
 		for len(data) < length {

@@ -74,7 +74,7 @@ const (
 	// the budget is sized for lock hand-off, not for I/O.
 	defaultRepairBudget = 15 * time.Second
 
-	// subscriptionControlReserve is the authority in-flight slot that only the lease
+	// subscriptionControlReserve is the authority in-flight slot that only the subscription
 	// CONTROL loop may occupy. Acknowledging is what releases the mutating
 	// machine, so this loop must never queue behind bulk kernel I/O.
 	subscriptionControlReserve = 1
@@ -397,7 +397,7 @@ func (k kernelMount) abortKernelConnection() error {
 // act on differently: this mount was healthy but too slow to repair. It is a
 // sentinel rather than a formatted string so classifyRevocationReason never has
 // to read prose.
-var errRepairBudgetExceeded = errors.New("fusev3: lease cache withdrawal exceeded its safety budget")
+var errRepairBudgetExceeded = errors.New("fusev3: cache withdrawal exceeded its safety budget")
 
 // revokeCachedNames drops daemon-resident N payloads. The portable profile
 // gives kernel dentries zero validity, so there is no kernel namespace cache to
@@ -548,7 +548,7 @@ const (
 	// nothing can repair this kernel's caches again.
 	RevocationSessionTerminal = "session-terminal"
 	// RevocationRepairBudgetExceeded: this mount was still connected but did
-	// not complete lease cache withdrawal inside the reserved safety interval.
+	// not complete cache withdrawal inside the reserved safety interval.
 	RevocationRepairBudgetExceeded = "repair-budget-exceeded"
 	// RevocationRoutesChanged: the volume's machine-local route declaration
 	// moved under a mount whose topology is fixed for its lifetime.
@@ -793,7 +793,7 @@ func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 
 // kernelNotifier is the reverse channel this frontend uses to take back what it
 // published. It is the stock go-fuse notification surface, named as an
-// interface so lease invalidation can be tested without a kernel; *fuse.Server
+// interface so cache invalidation can be tested without a kernel; *fuse.Server
 // is the only production implementation.
 type kernelNotifier interface {
 	EntryNotify(parent uint64, name string) fuse.Status

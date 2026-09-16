@@ -14,6 +14,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 )
 
 const (
@@ -706,6 +707,9 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 	for {
 		event, err := s.rpc.NextControlEvent(ctx, incarnation, after, changes.completedThrough())
 		if err != nil {
+			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+				return err
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -978,6 +982,9 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 		}
 		deadline, err := s.rpc.RenewSubscription(ctx, incarnation)
 		if err != nil {
+			if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+				return err
+			}
 			continue
 		}
 		if !s.acceptRenewal(incarnation, deadline, s.config.clock.Now()) {
