@@ -126,6 +126,7 @@ REQUIRED_TESTS=(
 if [[ ${PORTABLEFS_PERFORMANCE_TEST:-} == 1 ]]; then
   REQUIRED_TESTS+=(
     "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCoherenceBaseline"
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestShippingCapacityGitAddCompletes"
   )
 fi
 
@@ -150,11 +151,24 @@ run_host() {
   command -v docker >/dev/null || fail "docker is required to run the privileged integration suite" 69
   local root
   root=$(repository_root)
+  if [[ -n ${PORTABLEFS_PROFILE_DIR:-} ]]; then
+    [[ ${PORTABLEFS_PROFILE_DIR} == /* ]] || fail "PORTABLEFS_PROFILE_DIR must be an absolute host path" 64
+    if [[ ! -e ${PORTABLEFS_PROFILE_DIR} ]]; then
+      mkdir -p -- "$PORTABLEFS_PROFILE_DIR"
+    fi
+    [[ -d ${PORTABLEFS_PROFILE_DIR} ]] || fail "PORTABLEFS_PROFILE_DIR is not a directory" 64
+  fi
   echo "xfs-fuse-integration: launching ${PORTABLEFS_CI_IMAGE}"
   # The working tree is mounted read-only: the container provisions its own XFS
   # image and must never be able to mutate the checkout it is testing.
   run_container() {
-    docker run --rm --privileged \
+    local -a lifecycle=(--rm)
+    local profile_state= container_id= run_status=0
+    if [[ -n ${PORTABLEFS_PROFILE_DIR:-} ]]; then
+      profile_state=$(mktemp -d)
+      lifecycle=(--cidfile "$profile_state/container-id")
+    fi
+    if docker run "${lifecycle[@]}" --privileged \
       --tmpfs /var/tmp:exec,mode=1777 \
       -v "${root}/vcs:/work/vcs:ro" \
       -v "${root}/scripts:/work/scripts:ro" \
@@ -167,9 +181,26 @@ run_host() {
       -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
       -e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
       -e "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
+      -e "PORTABLEFS_PROFILE_DIR=${PORTABLEFS_PROFILE_DIR:+/home/portablefs/profiles}" \
+      -e "PORTABLEFS_PROFILE_RUN=${PORTABLEFS_PROFILE_RUN:-}" \
       -w /work \
       "${PORTABLEFS_CI_IMAGE}" \
-      bash /work/scripts/xfs-fuse-integration.sh --in-container
+      bash /work/scripts/xfs-fuse-integration.sh --in-container; then
+      run_status=0
+    else
+      run_status=$?
+    fi
+    if [[ -n $profile_state ]]; then
+      if [[ -s $profile_state/container-id ]]; then
+        container_id=$(cat "$profile_state/container-id")
+        # Docker's VM may not share the host's /tmp. Copy after exit, including
+        # failures, rather than bind-mounting a path from another filesystem.
+        docker cp "$container_id:/home/portablefs/profiles/." "$PORTABLEFS_PROFILE_DIR/" || run_status=1
+        docker rm "$container_id" >/dev/null || run_status=1
+      fi
+      rm -rf -- "$profile_state"
+    fi
+    return "$run_status"
   }
   if [[ -d /lib/modules/$(uname -r) ]]; then
     run_container -v /lib/modules:/lib/modules:ro
@@ -231,7 +262,7 @@ create_service_identity() {
   groupadd -g "$PORTABLEFS_SERVICE_GID" portablefs
   useradd -u "$PORTABLEFS_SERVICE_UID" -g "$PORTABLEFS_SERVICE_GID" -M -d /home/portablefs -s /bin/bash portablefs
   install -d -m 0700 -o "$PORTABLEFS_SERVICE_UID" -g "$PORTABLEFS_SERVICE_GID" \
-    /home/portablefs /home/portablefs/gocache /home/portablefs/gomodcache /home/portablefs/tmp
+    /home/portablefs /home/portablefs/gocache /home/portablefs/gomodcache /home/portablefs/tmp /home/portablefs/profiles
 }
 
 # suite_command emits the fully pinned `go test` invocation, environment and
@@ -270,6 +301,8 @@ suite_command() {
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
     "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
     "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
+    "PORTABLEFS_PROFILE_DIR=${PORTABLEFS_PROFILE_DIR:-}" \
+    "PORTABLEFS_PROFILE_RUN=${PORTABLEFS_PROFILE_RUN:-}" \
     go -C /work/vcs test -v -count=1 -failfast -p 1 -timeout 35m \
     "${extra_go_test_flags[@]}" "$@"
 }
