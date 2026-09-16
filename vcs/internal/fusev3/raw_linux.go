@@ -461,15 +461,16 @@ type rawFileSystem struct {
 
 	// Source-owned gates close publication before the mutation gets a replay
 	// identity or can put bytes on the wire. They are keyed only by stable
-	// filesystem identities and exact names.
-	sourceHolds                map[publicationCoordinate]*sourcePublicationLease
-	sourcePublishing           map[publicationCoordinate]int
-	publishingNegativeNames    map[publicationCoordinate]map[*negativeNamePublication]struct{}
-	sourceUnresolvedAttributes map[*sourcePublicationLease]int
-	sourceUnresolvedData       map[*sourcePublicationLease]int
-	sourceChanged              chan struct{}
-	repairingCoordinates       map[publicationCoordinate]bool
-	cacheReservations          map[publicationCoordinate]map[*cacheInstallReservation]struct{}
+	// filesystem identities and exact names. Reply-discovered identities can
+	// share an existing closure until both callbacks finish; only those rare
+	// collisions allocate sourceSharedHolds.
+	sourceHolds             map[publicationCoordinate]*sourcePublicationLease
+	sourceSharedHolds       map[publicationCoordinate]map[*sourcePublicationLease]struct{}
+	sourcePublishing        map[publicationCoordinate]int
+	publishingNegativeNames map[publicationCoordinate]map[*negativeNamePublication]struct{}
+	sourceChanged           chan struct{}
+	repairingCoordinates    map[publicationCoordinate]bool
+	cacheReservations       map[publicationCoordinate]map[*cacheInstallReservation]struct{}
 }
 
 var _ fuse.RawFileSystem = (*rawFileSystem)(nil)
@@ -504,27 +505,25 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		nextHandle:       1,
 		handles:          make(map[uint64]*handleRecord),
 
-		cachedNames:                make(map[nameKey]*inodeRecord),
-		cachedStableNames:          make(map[publicationNamespace]*inodeRecord),
-		cachedNameStable:           make(map[nameKey]publicationNamespace),
-		cachedNameLeases:           make(map[nameKey]leaseStamp),
-		cachedNegatives:            make(map[nameKey]struct{}),
-		cachedNegativeLeases:       make(map[nameKey]leaseStamp),
-		cachedAttrs:                make(map[publicationIdentity]*inodeRecord),
-		cachedAttrPayloads:         make(map[publicationIdentity]cachedAttrPayload),
-		cachedData:                 make(map[uint64]*inodeRecord),
-		publishingNames:            make(map[nameKey]int),
-		publishingInodes:           make(map[uint64]int),
-		published:                  make(chan struct{}),
-		replyPublications:          make(map[uint64]*replyPublication),
-		sourceHolds:                make(map[publicationCoordinate]*sourcePublicationLease),
-		sourcePublishing:           make(map[publicationCoordinate]int),
-		publishingNegativeNames:    make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
-		sourceUnresolvedAttributes: make(map[*sourcePublicationLease]int),
-		sourceUnresolvedData:       make(map[*sourcePublicationLease]int),
-		sourceChanged:              make(chan struct{}),
-		repairingCoordinates:       make(map[publicationCoordinate]bool),
-		cacheReservations:          make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
+		cachedNames:             make(map[nameKey]*inodeRecord),
+		cachedStableNames:       make(map[publicationNamespace]*inodeRecord),
+		cachedNameStable:        make(map[nameKey]publicationNamespace),
+		cachedNameLeases:        make(map[nameKey]leaseStamp),
+		cachedNegatives:         make(map[nameKey]struct{}),
+		cachedNegativeLeases:    make(map[nameKey]leaseStamp),
+		cachedAttrs:             make(map[publicationIdentity]*inodeRecord),
+		cachedAttrPayloads:      make(map[publicationIdentity]cachedAttrPayload),
+		cachedData:              make(map[uint64]*inodeRecord),
+		publishingNames:         make(map[nameKey]int),
+		publishingInodes:        make(map[uint64]int),
+		published:               make(chan struct{}),
+		replyPublications:       make(map[uint64]*replyPublication),
+		sourceHolds:             make(map[publicationCoordinate]*sourcePublicationLease),
+		sourcePublishing:        make(map[publicationCoordinate]int),
+		publishingNegativeNames: make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
+		sourceChanged:           make(chan struct{}),
+		repairingCoordinates:    make(map[publicationCoordinate]bool),
+		cacheReservations:       make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
 	}
 	mount.raw = r
 	return r

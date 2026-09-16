@@ -1,0 +1,816 @@
+//go:build linux
+
+package fusev3
+
+import (
+	"context"
+	"fmt"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+)
+
+type gateMutationResult struct {
+	response *authoritypb.Response
+	err      error
+}
+
+// startGateMutation exercises the same source-publication acquisition and
+// physical-reply release edges as a raw callback, while leaving operation-
+// specific response validation out of scheduling tests.
+func startGateMutation(t *testing.T, fixture *strictFixture, request *authoritypb.Request, gate *sourcePublicationGate) <-chan gateMutationResult {
+	t.Helper()
+	unique := fixture.unique.Add(2)
+	ctx, finish, status := fixture.raw.mutationContext(unique)
+	if !status.Ok() {
+		t.Fatalf("reserve mutation publication: %v", status)
+	}
+	result := make(chan gateMutationResult, 1)
+	go func() {
+		response, err := fixture.mount.callMutation(ctx, request, gate)
+		if err == nil {
+			lease := sourceLeaseFromContext(ctx)
+			lease.resolveAllNoBinding()
+			err = completeSourcePublication(ctx)
+		}
+		finish()
+		if fixture.raw.ReplyWriteTracked(unique) {
+			fixture.raw.ReplyWritten(unique, fuse.OK)
+		}
+		result <- gateMutationResult{response: response, err: err}
+	}()
+	return result
+}
+
+func awaitGateMutation(t *testing.T, result <-chan gateMutationResult) *authoritypb.Response {
+	t.Helper()
+	select {
+	case completed := <-result:
+		if completed.err != nil {
+			t.Fatalf("gated mutation: %v", completed.err)
+		}
+		return completed.response
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for gated mutation")
+		return nil
+	}
+}
+
+func createGateRequest(parent *authoritypb.Item, name string) (*authoritypb.Request, *sourcePublicationGate, error) {
+	gate, err := namespaceSourceGate(parent, name, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
+		Parent: cloneBytes(parent.GetToken()), Name: []byte(name), Mode: 0o600,
+		Flags: &authoritypb.OpenFlags{Write: true}, Exclusive: true,
+	}}}, gate, nil
+}
+
+func writeGateRequest(item *authoritypb.Item, marker byte) (*authoritypb.Request, *sourcePublicationGate, error) {
+	gate, err := itemSourceGate(item, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+		Handle: []byte{marker}, Size: 1, Data: []byte{marker},
+	}}}, gate, nil
+}
+
+func installAuthorityHook(fixture *strictFixture, hook func(*authoritypb.Request)) {
+	fixture.rpc.mu.Lock()
+	fixture.rpc.hook = hook
+	fixture.rpc.mu.Unlock()
+}
+
+func finishDirectSourceLease(t *testing.T, lease *sourcePublicationLease, resolveNames bool) {
+	t.Helper()
+	if err := lease.markAssigned(); err != nil {
+		t.Fatal(err)
+	}
+	if resolveNames {
+		lease.resolveAllNoBinding()
+	}
+	if err := lease.markCallbackPublicationReady(); err != nil {
+		t.Fatal(err)
+	}
+	lease.release()
+}
+
+func TestDistinctDirectoryCreatesReachAuthorityConcurrently(t *testing.T) {
+	fixture := newStrictFixture(t)
+	firstParent := testItem(101, authoritypb.Attr_DIRECTORY, 101)
+	secondParent := testItem(102, authoritypb.Attr_DIRECTORY, 102)
+	firstRequest, firstGate, err := createGateRequest(firstParent, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest, secondGate, err := createGateRequest(secondParent, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	installAuthorityHook(fixture, func(request *authoritypb.Request) {
+		create := request.GetCreate()
+		if create == nil {
+			return
+		}
+		switch string(create.GetName()) {
+		case "first":
+			close(firstEntered)
+			<-releaseFirst
+		case "second":
+			close(secondEntered)
+		}
+	})
+
+	firstResult := startGateMutation(t, fixture, firstRequest, firstGate)
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first create did not reach the authority")
+	}
+	secondResult := startGateMutation(t, fixture, secondRequest, secondGate)
+	select {
+	case <-secondEntered:
+		// The first authority call is still waiting for releaseFirst.
+	case <-time.After(time.Second):
+		close(releaseFirst)
+		t.Fatal("create in a distinct directory did not reach the authority concurrently")
+	}
+	close(releaseFirst)
+	awaitGateMutation(t, firstResult)
+	awaitGateMutation(t, secondResult)
+}
+
+func TestUnrelatedWriteReachesAuthorityWhileCreatePending(t *testing.T) {
+	fixture := newStrictFixture(t)
+	parent := testItem(103, authoritypb.Attr_DIRECTORY, 103)
+	unrelated := testItem(104, authoritypb.Attr_REGULAR, 104)
+	createRequest, createGate, err := createGateRequest(parent, "created")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRequest, writeGate, err := writeGateRequest(unrelated, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	createEntered := make(chan struct{})
+	writeEntered := make(chan struct{})
+	releaseCreate := make(chan struct{})
+	installAuthorityHook(fixture, func(request *authoritypb.Request) {
+		switch {
+		case request.GetCreate() != nil:
+			close(createEntered)
+			<-releaseCreate
+		case request.GetWrite() != nil:
+			close(writeEntered)
+		}
+	})
+
+	createResult := startGateMutation(t, fixture, createRequest, createGate)
+	select {
+	case <-createEntered:
+	case <-time.After(time.Second):
+		t.Fatal("create did not reach the authority")
+	}
+	writeResult := startGateMutation(t, fixture, writeRequest, writeGate)
+	select {
+	case <-writeEntered:
+		// The create reply remains held by releaseCreate.
+	case <-time.After(time.Second):
+		close(releaseCreate)
+		t.Fatal("write to an unrelated identity did not reach the authority concurrently")
+	}
+	close(releaseCreate)
+	awaitGateMutation(t, createResult)
+	awaitGateMutation(t, writeResult)
+}
+
+func TestSameIdentityWritesSerializeAtSourcePublicationGate(t *testing.T) {
+	fixture := newStrictFixture(t)
+	item := testItem(105, authoritypb.Attr_REGULAR, 105)
+	firstRequest, firstGate, err := writeGateRequest(item, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest, secondGate, err := writeGateRequest(item, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	installAuthorityHook(fixture, func(request *authoritypb.Request) {
+		write := request.GetWrite()
+		if write == nil {
+			return
+		}
+		switch write.GetData()[0] {
+		case 1:
+			close(firstEntered)
+			<-releaseFirst
+		case 2:
+			close(secondEntered)
+		}
+	})
+
+	firstResult := startGateMutation(t, fixture, firstRequest, firstGate)
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first write did not reach the authority")
+	}
+	secondResult := startGateMutation(t, fixture, secondRequest, secondGate)
+	select {
+	case <-secondEntered:
+		close(releaseFirst)
+		t.Fatal("second write reached the authority across the first identity gate")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseFirst)
+	awaitGateMutation(t, firstResult)
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second write did not reach the authority after the first reply was published")
+	}
+	awaitGateMutation(t, secondResult)
+}
+
+func TestCreateAndWriteOnKnownIdentitySerialize(t *testing.T) {
+	fixture := newStrictFixture(t)
+	parent := testItem(106, authoritypb.Attr_DIRECTORY, 106)
+	child := testItem(107, authoritypb.Attr_REGULAR, 107)
+	record, errno := fixture.raw.intern(context.Background(), child)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	parentIdentity, ok := publicationIdentityFromItem(parent)
+	if !ok {
+		t.Fatal("parent identity")
+	}
+	fixture.raw.mu.Lock()
+	fixture.raw.cachedStableNames[publicationNamespace{parent: parentIdentity, name: "known"}] = record
+	fixture.raw.mu.Unlock()
+
+	createRequest, createGate, err := createGateRequest(parent, "known")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRequest, writeGate, err := writeGateRequest(child, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createEntered := make(chan struct{})
+	writeEntered := make(chan struct{})
+	releaseCreate := make(chan struct{})
+	installAuthorityHook(fixture, func(request *authoritypb.Request) {
+		switch {
+		case request.GetCreate() != nil:
+			close(createEntered)
+			<-releaseCreate
+		case request.GetWrite() != nil:
+			close(writeEntered)
+		}
+	})
+
+	createResult := startGateMutation(t, fixture, createRequest, createGate)
+	select {
+	case <-createEntered:
+	case <-time.After(time.Second):
+		t.Fatal("create did not reach the authority")
+	}
+	writeResult := startGateMutation(t, fixture, writeRequest, writeGate)
+	select {
+	case <-writeEntered:
+		close(releaseCreate)
+		t.Fatal("write reached the authority across the create's known child identity gate")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseCreate)
+	awaitGateMutation(t, createResult)
+	select {
+	case <-writeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("write did not reach the authority after the create reply was published")
+	}
+	awaitGateMutation(t, writeResult)
+}
+
+func TestCreateReplyBindingDrainsOnlyExactIdentityPublications(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		publishing publicationIdentity
+		blocks     bool
+	}{
+		{name: "exact child", publishing: publicationIdentity(testIdentity(109)), blocks: true},
+		{name: "unrelated child", publishing: publicationIdentity(testIdentity(110)), blocks: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newStrictFixture(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			parent := testItem(108, authoritypb.Attr_DIRECTORY, 108)
+			gate, err := namespaceSourceGate(parent, "created", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			coordinate := publicationCoordinate{kind: publicationItemAttributes, item: test.publishing}
+			fixture.raw.mu.Lock()
+			fixture.raw.admitSourcePublicationLocked(coordinate)
+			fixture.raw.mu.Unlock()
+			publishing := true
+			defer func() {
+				if !publishing {
+					return
+				}
+				fixture.raw.mu.Lock()
+				fixture.raw.settleSourcePublicationLocked(coordinate)
+				fixture.raw.mu.Unlock()
+			}()
+
+			lease, err := fixture.raw.acquireSourcePublication(ctx, gate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := lease.markAssigned(); err != nil {
+				t.Fatal(err)
+			}
+			parentIdentity, _ := publicationIdentityFromItem(parent)
+			namespace := publicationNamespace{parent: parentIdentity, name: "created"}
+			child := publicationIdentity(testIdentity(109))
+			attached := make(chan error, 1)
+			go func() {
+				attached <- lease.attachBinding(ctx, namespace, child)
+			}()
+
+			if test.blocks {
+				waitFor(t, "reply binding to own the exact child coordinate", func() bool {
+					fixture.raw.mu.Lock()
+					defer fixture.raw.mu.Unlock()
+					return fixture.raw.sourceHolds[publicationCoordinate{kind: publicationItemAttributes, item: child}] == lease &&
+						lease.unresolvedAttributes == 0
+				})
+				select {
+				case err := <-attached:
+					t.Fatalf("exact child binding crossed its in-flight cache publication: %v", err)
+				default:
+				}
+			} else {
+				select {
+				case err := <-attached:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("unrelated cache publication blocked definitive create binding")
+				}
+			}
+
+			fixture.raw.mu.Lock()
+			fixture.raw.settleSourcePublicationLocked(coordinate)
+			fixture.raw.mu.Unlock()
+			publishing = false
+			if test.blocks {
+				select {
+				case err := <-attached:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("create binding did not resume after exact cache publication drained")
+				}
+			}
+			if err := lease.markCallbackPublicationReady(); err != nil {
+				t.Fatal(err)
+			}
+			lease.release()
+		})
+	}
+}
+
+func TestUnresolvedCreateIgnoresUnrelatedRecallAndAllowsUnrelatedPublication(t *testing.T) {
+	fixture := newStrictFixture(t)
+	parent := testItem(111, authoritypb.Attr_DIRECTORY, 111)
+	gate, err := namespaceSourceGate(parent, "created", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated := publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(testIdentity(112))}
+	if err := fixture.raw.closeLeaseCoordinate(context.Background(), unrelated); err != nil {
+		t.Fatal(err)
+	}
+	defer fixture.raw.openLeaseCoordinate(unrelated)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	lease, err := fixture.raw.acquireSourcePublication(ctx, gate)
+	if err != nil {
+		t.Fatalf("unresolved create waited for unrelated recall: %v", err)
+	}
+	parentIdentity, _ := publicationIdentityFromItem(parent)
+	parentCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: parentIdentity}
+	fixture.raw.mu.Lock()
+	unrelatedAllowed := fixture.raw.sourcePublicationAllowedLocked(unrelated, nil)
+	parentAllowed := fixture.raw.sourcePublicationAllowedLocked(parentCoordinate, nil)
+	ownerAllowed := fixture.raw.sourcePublicationAllowedLocked(parentCoordinate, lease)
+	fixture.raw.mu.Unlock()
+	if !unrelatedAllowed {
+		t.Fatal("unresolved create suppressed publication on an unrelated identity")
+	}
+	if parentAllowed || !ownerAllowed {
+		t.Fatalf("exact parent publication admission = foreign %t owner %t, want false/true", parentAllowed, ownerAllowed)
+	}
+	finishDirectSourceLease(t, lease, true)
+}
+
+func TestReplyDiscoveredCoordinateCoOwnershipSurvivesEitherReleaseOrder(t *testing.T) {
+	for _, releaseReplyFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("release_reply_first=%t", releaseReplyFirst), func(t *testing.T) {
+			fixture := newStrictFixture(t)
+			parent := testItem(113, authoritypb.Attr_DIRECTORY, 113)
+			child := testItem(114, authoritypb.Attr_REGULAR, 114)
+			childIdentity, _ := publicationIdentityFromItem(child)
+			coordinate := publicationCoordinate{kind: publicationItemAttributes, item: childIdentity}
+			childGate, err := itemSourceGate(child, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			childLease, err := fixture.raw.acquireSourcePublication(context.Background(), childGate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := childLease.markAssigned(); err != nil {
+				t.Fatal(err)
+			}
+			createGate, err := namespaceSourceGate(parent, "created", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replyLease, err := fixture.raw.acquireSourcePublication(context.Background(), createGate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := replyLease.markAssigned(); err != nil {
+				t.Fatal(err)
+			}
+			recall := &authoritypb.LeaseRecall{
+				Coordinate:  &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, Identity: childIdentity[:]},
+				Right:       authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ,
+				GrantEpoch:  1,
+				RevokeEpoch: 2,
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			if err := replyLease.attachDischarge(ctx, &authoritypb.SourceLeaseDischarge{Sequence: 1, Recalls: []*authoritypb.LeaseRecall{recall}}); err != nil {
+				t.Fatalf("co-own reply-discovered coordinate: %v", err)
+			}
+			fixture.raw.mu.Lock()
+			allowedForeign := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+			allowedChildOwner := fixture.raw.sourcePublicationAllowedLocked(coordinate, childLease)
+			allowedReplyOwner := fixture.raw.sourcePublicationAllowedLocked(coordinate, replyLease)
+			fixture.raw.mu.Unlock()
+			if allowedForeign || allowedChildOwner || allowedReplyOwner {
+				t.Fatalf("co-owned publication admission = foreign %t child %t reply %t, want all false", allowedForeign, allowedChildOwner, allowedReplyOwner)
+			}
+
+			releaseChild := func() {
+				if err := childLease.markCallbackPublicationReady(); err != nil {
+					t.Fatal(err)
+				}
+				childLease.release()
+			}
+			releaseReply := func() {
+				replyLease.resolveAllNoBinding()
+				if err := replyLease.markCallbackPublicationReady(); err != nil {
+					t.Fatal(err)
+				}
+				replyLease.release()
+			}
+			if releaseReplyFirst {
+				releaseReply()
+			} else {
+				releaseChild()
+			}
+			fixture.raw.mu.Lock()
+			allowedAfterOneRelease := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+			fixture.raw.mu.Unlock()
+			if allowedAfterOneRelease {
+				t.Fatal("first co-owner release reopened the coordinate")
+			}
+			if releaseReplyFirst {
+				releaseChild()
+			} else {
+				releaseReply()
+			}
+			fixture.raw.mu.Lock()
+			allowedAfterBothRelease := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+			fixture.raw.mu.Unlock()
+			if !allowedAfterBothRelease {
+				t.Fatal("final co-owner release left the coordinate closed")
+			}
+		})
+	}
+}
+
+func TestSourceDischargeBindsUnknownChildBeforePurging(t *testing.T) {
+	fixture := newStrictFixture(t)
+	parent := testItem(115, authoritypb.Attr_DIRECTORY, 115)
+	child := testItem(116, authoritypb.Attr_REGULAR, 116)
+	childRecord, errno := fixture.raw.intern(context.Background(), child)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	if childRecord == nil {
+		t.Fatal("child record")
+	}
+	childIdentity, _ := publicationIdentityFromItem(child)
+	attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: childIdentity}
+
+	// Admit an attribute reply before the create owns the child identity. It is
+	// not cache state yet: the physical reply edge below performs the install.
+	attrUnique := fixture.unique.Add(2)
+	attrCtx, attrFinish, status := fixture.raw.mutationContext(attrUnique)
+	if !status.Ok() {
+		t.Fatal(status)
+	}
+	now := time.Now()
+	grants, err := validateLeaseGrants([]*authoritypb.LeaseGrant{attrGrant(childIdentity[:], 1, 1)}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted := fixture.mount.leases.install(grants, now); len(accepted) != 1 {
+		t.Fatalf("installed attribute grants = %d, want 1", len(accepted))
+	} else {
+		publication := replyPublicationFromContext(attrCtx)
+		publication.leaseGrants = accepted
+		publication.cacheStamp = &cacheSnapshot{ObjectVersion: 1, SnapshotSequence: 1}
+	}
+	attrOut := &fuse.AttrOut{}
+	fixture.raw.publishAttr(attrCtx, attrOut, childIdentity, child.GetAttr())
+	if len(replyPublicationFromContext(attrCtx).attrs) != 1 {
+		t.Fatal("attribute reply was not admitted for caching")
+	}
+	attrFinish()
+	fixture.raw.mu.Lock()
+	publishing := fixture.raw.sourcePublishing[attrCoordinate]
+	_, installedEarly := fixture.raw.cachedAttrs[childIdentity]
+	fixture.raw.mu.Unlock()
+	if publishing != 1 || installedEarly {
+		t.Fatalf("staged attribute publication = publishing %d installed %t, want 1/false", publishing, installedEarly)
+	}
+
+	recall := &authoritypb.LeaseRecall{
+		Coordinate:  &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, Identity: childIdentity[:]},
+		Right:       authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ,
+		GrantEpoch:  1,
+		RevokeEpoch: 2,
+	}
+	discharge := &authoritypb.SourceLeaseDischarge{Sequence: 17, Recalls: []*authoritypb.LeaseRecall{recall}}
+	fixture.rpc.mu.Lock()
+	fixture.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetCreate() == nil {
+			return nil, fmt.Errorf("unexpected authority request %T", request.GetBody())
+		}
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{
+				Item: cloneItem(child), Handle: testToken(216),
+			}},
+			SourceLeaseDischarge: discharge,
+		}, nil
+	}
+	authorityReturned := make(chan struct{})
+	fixture.rpc.afterMutation = func() { close(authorityReturned) }
+	fixture.rpc.mu.Unlock()
+	request, gate, err := createGateRequest(parent, "created")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceUnique := fixture.unique.Add(2)
+	sourceBase, sourceFinish, status := fixture.raw.mutationContext(sourceUnique)
+	if !status.Ok() {
+		t.Fatal(status)
+	}
+	sourceCtx, cancelSource := context.WithTimeout(sourceBase, 2*time.Second)
+	defer cancelSource()
+	parentNode := &node{mount: fixture.mount, item: parent, requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
+	type mutationResult struct {
+		response *authoritypb.Response
+		errno    syscall.Errno
+	}
+	mutationDone := make(chan mutationResult, 1)
+	go func() {
+		response, mutationErrno := parentNode.mutateWithSource(sourceCtx, request, gate)
+		mutationDone <- mutationResult{response: response, errno: mutationErrno}
+	}()
+	select {
+	case <-authorityReturned:
+	case <-time.After(time.Second):
+		t.Fatal("create response did not return from the authority")
+	}
+	select {
+	case result := <-mutationDone:
+		t.Fatalf("source discharge crossed the unknown child's staged attribute reply: response=%v errno=%v", result.response, result.errno)
+	case <-time.After(25 * time.Millisecond):
+	}
+	fixture.rpc.mu.Lock()
+	acksBeforeDrain := append([]uint64(nil), fixture.rpc.sourceAcks...)
+	fixture.rpc.mu.Unlock()
+	if len(acksBeforeDrain) != 0 {
+		t.Fatalf("source discharge ACKs before reply drain = %v", acksBeforeDrain)
+	}
+
+	// The prior cache-installing reply lands, waking the exact drain. The
+	// discharge purge must then remove what that reply just installed.
+	if !fixture.raw.ReplyWriteTracked(attrUnique) {
+		t.Fatal("staged attribute reply lost physical-write tracking")
+	}
+	fixture.raw.ReplyWritten(attrUnique, fuse.OK)
+	select {
+	case result := <-mutationDone:
+		if result.errno != 0 || result.response == nil {
+			t.Fatalf("create after attribute drain = response %v errno %v", result.response, result.errno)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source discharge did not resume after the exact attribute reply drained")
+	}
+	fixture.raw.mu.Lock()
+	_, staleAttr := fixture.raw.cachedAttrs[childIdentity]
+	fixture.raw.mu.Unlock()
+	if staleAttr {
+		t.Fatal("source discharge left the drained attribute reply cached")
+	}
+	fixture.rpc.mu.Lock()
+	acksBeforeSourceReply := append([]uint64(nil), fixture.rpc.sourceAcks...)
+	fixture.rpc.mu.Unlock()
+	if len(acksBeforeSourceReply) != 0 {
+		t.Fatalf("source discharge ACKs before source reply = %v", acksBeforeSourceReply)
+	}
+
+	sourceLease := sourceLeaseFromContext(sourceCtx)
+	sourceLease.resolveAllNoBinding()
+	if err := completeSourcePublication(sourceCtx); err != nil {
+		t.Fatal(err)
+	}
+	sourceFinish()
+	if !fixture.raw.ReplyWriteTracked(sourceUnique) {
+		t.Fatal("source reply lost physical-write tracking")
+	}
+	fixture.raw.ReplyWritten(sourceUnique, fuse.OK)
+	fixture.rpc.mu.Lock()
+	acks := append([]uint64(nil), fixture.rpc.sourceAcks...)
+	fixture.rpc.mu.Unlock()
+	if len(acks) != 1 || acks[0] != 17 {
+		t.Fatalf("source discharge ACKs = %v, want [17] after source reply", acks)
+	}
+}
+
+func TestSourceDischargeDoesNotWaitForExistingExactSourceGate(t *testing.T) {
+	fixture := newStrictFixture(t)
+	parent := testItem(117, authoritypb.Attr_DIRECTORY, 117)
+	child := testItem(118, authoritypb.Attr_REGULAR, 118)
+	childIdentity, _ := publicationIdentityFromItem(child)
+	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: childIdentity}
+	childGate, err := itemSourceGate(child, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childLease, err := fixture.raw.acquireSourcePublication(context.Background(), childGate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := childLease.markAssigned(); err != nil {
+		t.Fatal(err)
+	}
+
+	recall := &authoritypb.LeaseRecall{
+		Coordinate:  &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES, Identity: childIdentity[:]},
+		Right:       authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ,
+		GrantEpoch:  1,
+		RevokeEpoch: 2,
+	}
+	discharge := &authoritypb.SourceLeaseDischarge{Sequence: 18, Recalls: []*authoritypb.LeaseRecall{recall}}
+	fixture.rpc.mu.Lock()
+	fixture.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetCreate() == nil {
+			return nil, fmt.Errorf("unexpected authority request %T", request.GetBody())
+		}
+		return &authoritypb.Response{
+			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{
+				Item: cloneItem(child), Handle: testToken(218),
+			}},
+			SourceLeaseDischarge: discharge,
+		}, nil
+	}
+	fixture.rpc.mu.Unlock()
+	request, gate, err := createGateRequest(parent, "created")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unique := fixture.unique.Add(2)
+	base, finish, status := fixture.raw.mutationContext(unique)
+	if !status.Ok() {
+		t.Fatal(status)
+	}
+	ctx, cancel := context.WithTimeout(base, 2*time.Second)
+	defer cancel()
+	parentNode := &node{mount: fixture.mount, item: parent, requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
+	response, mutationErrno := parentNode.mutateWithSource(ctx, request, gate)
+	if mutationErrno != 0 || response == nil {
+		t.Fatalf("reply-discovered coordinate co-ownership = response %v errno %v", response, mutationErrno)
+	}
+	fixture.rpc.mu.Lock()
+	acksBeforeReply := append([]uint64(nil), fixture.rpc.sourceAcks...)
+	fixture.rpc.mu.Unlock()
+	if len(acksBeforeReply) != 0 {
+		t.Fatalf("source discharge ACKs before source reply = %v", acksBeforeReply)
+	}
+	fixture.raw.mu.Lock()
+	allowedWhileBothHeld := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+	fixture.raw.mu.Unlock()
+	if allowedWhileBothHeld {
+		t.Fatal("reply-discovered coordinate reopened while the exact request remained in flight")
+	}
+
+	responseLease := sourceLeaseFromContext(ctx)
+	responseLease.resolveAllNoBinding()
+	if err := completeSourcePublication(ctx); err != nil {
+		t.Fatal(err)
+	}
+	finish()
+	if !fixture.raw.ReplyWriteTracked(unique) {
+		t.Fatal("source reply lost physical-write tracking")
+	}
+	fixture.raw.ReplyWritten(unique, fuse.OK)
+	fixture.rpc.mu.Lock()
+	acks := append([]uint64(nil), fixture.rpc.sourceAcks...)
+	fixture.rpc.mu.Unlock()
+	if len(acks) != 1 || acks[0] != 18 {
+		t.Fatalf("source discharge ACKs = %v, want [18] without releasing the exact request", acks)
+	}
+	fixture.raw.mu.Lock()
+	allowedAfterSourceReply := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+	fixture.raw.mu.Unlock()
+	if allowedAfterSourceReply {
+		t.Fatal("source reply release reopened a coordinate still held by the exact request")
+	}
+	if err := childLease.markCallbackPublicationReady(); err != nil {
+		t.Fatal(err)
+	}
+	childLease.release()
+	fixture.raw.mu.Lock()
+	allowedAfterBoth := fixture.raw.sourcePublicationAllowedLocked(coordinate, nil)
+	fixture.raw.mu.Unlock()
+	if !allowedAfterBoth {
+		t.Fatal("final exact request release left the coordinate closed")
+	}
+}
+
+func BenchmarkSourcePublicationAdmissionWithUnrelatedCoordinates(b *testing.B) {
+	for _, unrelated := range []int{0, 4096} {
+		b.Run(fmt.Sprintf("unrelated=%d", unrelated), func(b *testing.B) {
+			rpc := newFakeRPC()
+			mount := newMount(context.Background(), rpc, testConfig(8))
+			b.Cleanup(mount.cancel)
+			parent := testItem(200, authoritypb.Attr_DIRECTORY, 200)
+			root := &node{mount: mount, item: parent, requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
+			raw := newRawFileSystem(mount, root)
+			gate, err := namespaceSourceGate(parent, "bench", false)
+			if err != nil {
+				b.Fatal(err)
+			}
+			raw.mu.Lock()
+			for index := 0; index < unrelated; index++ {
+				identity := publicationIdentity(testIdentity(uint64(1000 + index)))
+				raw.sourcePublishing[publicationCoordinate{kind: publicationItemAttributes, item: identity}] = 1
+				raw.sourceHolds[publicationCoordinate{kind: publicationItemData, item: identity}] = &sourcePublicationLease{}
+			}
+			raw.mu.Unlock()
+
+			b.ResetTimer()
+			for iteration := 0; iteration < b.N; iteration++ {
+				lease, err := raw.acquireSourcePublication(context.Background(), gate)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := lease.markAssigned(); err != nil {
+					b.Fatal(err)
+				}
+				lease.resolveAllNoBinding()
+				if err := lease.markCallbackPublicationReady(); err != nil {
+					b.Fatal(err)
+				}
+				lease.release()
+			}
+		})
+	}
+}

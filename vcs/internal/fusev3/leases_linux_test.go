@@ -1078,11 +1078,15 @@ func TestSourcePublicationWaitsForOverlappingLeaseRecall(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		coordinate func(*inodeRecord) publicationCoordinate
+		knownChild bool
 	}{
 		{name: "exact name", coordinate: func(root *inodeRecord) publicationCoordinate {
 			return publicationCoordinate{kind: publicationNamespaceName, parent: root.identity, name: "victim"}
 		}},
-		{name: "unresolved child attributes", coordinate: func(*inodeRecord) publicationCoordinate {
+		{name: "parent attributes", coordinate: func(root *inodeRecord) publicationCoordinate {
+			return publicationCoordinate{kind: publicationItemAttributes, item: root.identity}
+		}},
+		{name: "known child attributes", knownChild: true, coordinate: func(*inodeRecord) publicationCoordinate {
 			return publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(testIdentity(95))}
 		}},
 	} {
@@ -1093,6 +1097,16 @@ func TestSourcePublicationWaitsForOverlappingLeaseRecall(t *testing.T) {
 				t.Fatal("root record")
 			}
 			defer fixture.raw.release(root)
+			if test.knownChild {
+				child, errno := fixture.raw.intern(context.Background(), testItem(95, authoritypb.Attr_REGULAR, 95))
+				if errno != 0 {
+					t.Fatal(errno)
+				}
+				fixture.raw.mu.Lock()
+				fixture.raw.bindCachedNameLocked(nameKey{parent: root.key.inode, name: "victim"},
+					publicationNamespace{parent: root.identity, name: "victim"}, child, leaseStamp{epoch: 1, issuedSequence: 1})
+				fixture.raw.mu.Unlock()
+			}
 			gate, err := namespaceSourceGate(root.node.item, "victim", false)
 			if err != nil {
 				t.Fatal(err)
@@ -1321,7 +1335,22 @@ func TestSourceDischargeDoesNotRequirePostStateOrMatchingCommitSequence(t *testi
 		{name: "commit sequence is independent", response: &authoritypb.Response{PostState: &authoritypb.PostState{VisibilitySequence: 3}, SourceLeaseDischarge: &authoritypb.SourceLeaseDischarge{Sequence: 9, Recalls: []*authoritypb.LeaseRecall{recall}}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			callback := &mutationCallback{publication: replyPublication{source: &sourcePublicationLease{}}}
+			gate, err := namespaceSourceGate(fixture.raw.nodesByID[fuse.FUSE_ROOT_ID].node.item, "x", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := fixture.raw.acquireSourcePublication(context.Background(), gate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				lease.resolveAllNoBinding()
+				if err := lease.markDefiniteNoChange(); err != nil {
+					t.Fatal(err)
+				}
+				lease.release()
+			})
+			callback := &mutationCallback{publication: replyPublication{source: lease}}
 			ctx := context.WithValue(context.Background(), mutationCallbackKey{}, callback)
 			if err := fixture.mount.retainSourceLeaseDischarge(ctx, test.response); err != nil {
 				t.Fatal(err)
