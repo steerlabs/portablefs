@@ -39,6 +39,7 @@ type file struct {
 	accepted     *record
 	lastApplied  uint64
 	scheduled    bool
+	reschedule   bool
 }
 type Buffer struct {
 	mu                                      sync.Mutex
@@ -315,6 +316,7 @@ func (b *Buffer) Drop(id Identity, reason string) DropReport {
 	f.head = nil
 	f.tail = nil
 	f.pending = nil
+	f.reschedule = false
 	f.batchStorage = batch{}
 	f.entryStorage[0] = Entry{}
 	f.accepted = nil
@@ -379,6 +381,11 @@ func (b *Buffer) schedule() {
 		cut := Cut{b.sequence, b.loss}
 		for _, f := range b.active {
 			if f.scheduled || f.flushing {
+				f.reschedule = true
+				continue
+			}
+			f.reschedule = false
+			if f.accepted == nil {
 				continue
 			}
 			f.scheduled = true
@@ -388,7 +395,8 @@ func (b *Buffer) schedule() {
 				_, err := b.FlushIdentity(b.ctx, f.id, cut)
 				b.mu.Lock()
 				f.scheduled = false
-				if err == nil && f.accepted != nil {
+				if err == nil && f.reschedule && f.accepted != nil {
+					f.reschedule = false
 					b.trigger()
 				}
 				b.mu.Unlock()

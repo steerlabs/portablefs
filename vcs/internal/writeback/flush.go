@@ -91,7 +91,8 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		b.mu.Lock()
 		f.flushing = false
 		b.signal()
-		if completed && f.accepted != nil {
+		if completed && f.reschedule && f.accepted != nil {
+			f.reschedule = false
 			b.trigger()
 		}
 		b.mu.Unlock()

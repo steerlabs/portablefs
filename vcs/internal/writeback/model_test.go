@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 )
 
 // Compare the retained overlay and transport coalescing against a separate
@@ -100,4 +101,21 @@ func applyModelEntry(file []byte, e Entry) []byte {
 		}
 	}
 	return file
+}
+
+func TestExplicitCutDoesNotScheduleLaterAdmissions(t *testing.T) {
+	calls := make(chan Entry, 4)
+	b := newTestBuffer(t, flusherFunc(func(_ context.Context, _ Identity, e Entry) (uint64, error) { calls <- e; return e.Last, nil }))
+	id := Identity{33}
+	cut := mustWrite(t, b, id, 0, "first")
+	mustWrite(t, b, id, 5, "later")
+	if _, err := b.FlushIdentity(context.Background(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	<-calls
+	select {
+	case e := <-calls:
+		t.Fatalf("explicit cut scheduled later entry %d", e.First)
+	case <-time.After(20 * time.Millisecond):
+	}
 }
