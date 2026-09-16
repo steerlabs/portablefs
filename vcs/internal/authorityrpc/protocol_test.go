@@ -64,6 +64,15 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		{&authoritypb.Request_NextFskitRepair{}, false, true},
 		{&authoritypb.Request_AckFskitRepair{}, false, true},
 		{&authoritypb.Request_FskitWrite{}, false, true},
+		{&authoritypb.Request_Subscribe{}, true, false},
+		{&authoritypb.Request_RenewSubscription{}, true, false},
+		{&authoritypb.Request_NextControlEvent{}, true, false},
+		{&authoritypb.Request_ChangeAck{}, true, false},
+		{&authoritypb.Request_DelegationRecallAck{}, true, false},
+		{&authoritypb.Request_DelegationBreakAck{}, true, false},
+		{&authoritypb.Request_DelegationModeChangeAck{}, true, false},
+		{&authoritypb.Request_DelegationRelease{}, true, false},
+		{&authoritypb.Request_Barrier{}, true, false},
 	}
 	descriptorBodies := (&authoritypb.Request{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
 	if len(tests) != descriptorBodies {
@@ -179,19 +188,22 @@ func TestCanonicalStreamMatchesFrozenEncoding(t *testing.T) {
 	}
 }
 
-func TestAuthorityProtocolV6RequiresLeaseCoherenceAndExactResourceAcquisition(t *testing.T) {
-	if ProtocolMajor != 6 || ProtocolALPN != "portablefs-authority-v6" {
-		t.Fatalf("authority protocol=(major %d, ALPN %q), want (6, portablefs-authority-v6)", ProtocolMajor, ProtocolALPN)
+func TestAuthorityProtocolV7RequiresSubscriptionAndDelegation(t *testing.T) {
+	if ProtocolMajor != 7 || ProtocolALPN != "portablefs-authority-v7" {
+		t.Fatalf("protocol=(%d, %q), want (7, portablefs-authority-v7)", ProtocolMajor, ProtocolALPN)
 	}
-	required := []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", leaseCoherenceFeature, directoryEnumerationLeaseFeature}
-	if !hasFeatures(requiredHelloFeatures, required) {
-		t.Fatalf("Hello features %v omit protocol-6 requirements %v", requiredHelloFeatures, required)
+	if !hasFeatures(requiredHelloFeatures, []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", subscriptionFeature, changeStreamFeature, delegationFeature}) {
+		t.Fatalf("incomplete v7 Hello: %v", requiredHelloFeatures)
 	}
-	if !hasFeatures(requiredAttachFeatures, []string{"exact-resource-acquisition"}) {
-		t.Fatalf("Attach features %v omit v6 filesystem requirements", requiredAttachFeatures)
+	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature}) {
+		t.Fatalf("incomplete v7 Activate: %v", requiredStrictAttachFeatures)
 	}
-	if !hasFeatures(requiredStrictAttachFeatures, []string{leaseRecallFeature, leaseRenewalFeature, openByIdentityFeature}) {
-		t.Fatalf("lease Attach features %v are incomplete", requiredStrictAttachFeatures)
+	for _, retired := range []string{"lease-coherence-v1", "directory-enumeration-lease-v1", "lease-recall-v1", "lease-renewal-v1", "open-by-identity-v1", "write-through"} {
+		for _, features := range [][]string{requiredHelloFeatures, requiredAttachFeatures, requiredStrictAttachFeatures} {
+			if hasFeatures(features, []string{retired}) {
+				t.Fatalf("Linux v7 advertises retired feature %q", retired)
+			}
+		}
 	}
 }
 
@@ -228,5 +240,51 @@ func TestRequestUsesTopologyReleasesBlockingLockWaits(t *testing.T) {
 		if requestUsesTopology(request) {
 			t.Fatalf("lifecycle request %T must own its explicit topology boundary", request.GetBody())
 		}
+	}
+}
+
+func TestV7ControlRequestsDoNotHoldTopologyDuringPeerWaits(t *testing.T) {
+	for _, request := range []*authoritypb.Request{
+		{Body: &authoritypb.Request_Subscribe{Subscribe: &authoritypb.SubscribeRequest{}}},
+		{Body: &authoritypb.Request_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionRequest{}}},
+		{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}},
+		{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}},
+		{Body: &authoritypb.Request_DelegationRecallAck{DelegationRecallAck: &authoritypb.DelegationRecallAck{}}},
+		{Body: &authoritypb.Request_DelegationBreakAck{DelegationBreakAck: &authoritypb.DelegationBreakAck{}}},
+		{Body: &authoritypb.Request_DelegationModeChangeAck{DelegationModeChangeAck: &authoritypb.DelegationModeChangeAck{}}},
+		{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{}}},
+	} {
+		if requestUsesTopology(request) {
+			t.Fatalf("%T would hold topology while servicing coherence", request.GetBody())
+		}
+		if requestRequiresWrite(request) {
+			t.Fatalf("%T cannot discharge state after write access expires", request.GetBody())
+		}
+	}
+	poll := &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
+	if !terminalQuiesceCancelable(poll) {
+		t.Fatal("terminal drain must cancel a parked CONTROL poll")
+	}
+	barrier := &authoritypb.Request{Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{}}}
+	if !requestUsesTopology(barrier) || requestRequiresWrite(barrier) {
+		t.Fatal("barrier must keep its filesystem boundary and permit read-only root observers")
+	}
+}
+
+func TestV7OpenWriteIntentRequiresWriteAccess(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		open  *authoritypb.OpenRequest
+		write bool
+	}{
+		{"read", &authoritypb.OpenRequest{Flags: &authoritypb.OpenFlags{Read: true}, CacheCapable: true}, false},
+		{"intent", &authoritypb.OpenRequest{WriteIntent: true}, true},
+		{"write flag", &authoritypb.OpenRequest{Flags: &authoritypb.OpenFlags{Write: true}}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := requestRequiresWrite(&authoritypb.Request{Body: &authoritypb.Request_Open{Open: test.open}}); got != test.write {
+				t.Fatalf("write access = %v, want %v", got, test.write)
+			}
+		})
 	}
 }
