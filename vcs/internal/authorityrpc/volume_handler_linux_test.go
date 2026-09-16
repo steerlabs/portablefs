@@ -2514,7 +2514,7 @@ func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
 	var verifier [16]byte
 	binary.BigEndian.PutUint64(verifier[0:8], uint64(s.root[0]))
 	binary.BigEndian.PutUint64(verifier[8:16], 10)
-	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0])}}, 1, verifier, true, s.root, nil
+	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), NextCookie: 1}}, 1, verifier, true, s.root, nil
 }
 
 func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {

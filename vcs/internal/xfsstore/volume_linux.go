@@ -27,12 +27,6 @@ const (
 	direntHeaderSize = 19
 	// dirBufferSize is one getdents64(2) transfer, retained per open handle.
 	dirBufferSize = 32 << 10
-	// checkpointStride bounds repositioning work. The kernel directory offset
-	// is remembered every this many entries, so resuming at any issued cookie
-	// costs one lseek plus at most this many entry parses, whatever the
-	// cookie's magnitude. Enumeration is therefore linear in the directory,
-	// not quadratic.
-	checkpointStride = 512
 	// pageAllocationCap bounds the slice a single readdir page preallocates so
 	// an absurd max cannot be turned into an allocation by a peer.
 	pageAllocationCap = 512
@@ -1902,47 +1896,13 @@ func (v *Volume) SyncFS() error {
 // Volume is published.
 func (v *Volume) rootCapability() Capability { return v.root }
 
-// dirCursor is the server side of one directory enumeration. Cookies are entry
-// ordinals within a snapshot that the verifier pins; checkpoints remember the
-// kernel's own directory offset every checkpointStride entries so repositioning
-// to an already issued cookie is a seek plus a bounded scan instead of a
-// re-read of everything before it.
+// dirCursor retains the kernel's opaque continuation offset and unread dirents.
+// Namespace changes do not invalidate XFS offsets; they only change which of
+// the concurrently modified entries a walk may encounter.
 type dirCursor struct {
-	verifier    [16]byte
-	index       uint64
-	high        uint64
-	checkpoints []int64
-	buf         []byte
-	pos, end    int
-}
-
-// restart drops every position this cursor knows. It runs whenever the
-// directory snapshot changes, because no offset recorded against the old
-// snapshot describes a position in the new one.
-func (c *dirCursor) restart(verifier [16]byte) {
-	c.verifier = verifier
-	c.index, c.high = 0, 0
-	c.checkpoints = c.checkpoints[:0]
-	c.pos, c.end = 0, 0
-}
-
-func (c *dirCursor) note(off int64) {
-	if c.index == 0 || c.index%checkpointStride != 0 {
-		return
-	}
-	if k := c.index/checkpointStride - 1; uint64(len(c.checkpoints)) == k {
-		c.checkpoints = append(c.checkpoints, off)
-	}
-}
-
-// rewind positions the kernel offset and resets the parse buffer together;
-// they are one piece of state and drifting apart would silently skip entries.
-func (c *dirCursor) rewind(fd int, off int64, index uint64) error {
-	if _, err := unix.Seek(fd, off, io.SeekStart); err != nil {
-		return err
-	}
-	c.index, c.pos, c.end = index, 0, 0
-	return nil
+	offset   uint64
+	buf      []byte
+	pos, end int
 }
 
 // next yields one real directory entry. "." and ".." are consumed here: this
@@ -1973,6 +1933,7 @@ func (c *dirCursor) next(fd int) (name string, ino uint64, off int64, typ byte, 
 		}
 		record := c.buf[c.pos : c.pos+reclen]
 		c.pos += reclen
+		c.offset = binary.NativeEndian.Uint64(record[8:])
 		raw := record[direntHeaderSize:]
 		if i := bytes.IndexByte(raw, 0); i >= 0 {
 			raw = raw[:i]
@@ -1985,10 +1946,8 @@ func (c *dirCursor) next(fd int) (name string, ino uint64, off int64, typ byte, 
 	}
 }
 
-// ReadDirOpen provides a sequential, verifier-checked enumeration cursor on a
-// retained directory handle. Nonzero cookies are meaningful only on this open
-// handle and this authority epoch, and only together with the verifier that
-// was issued with them.
+// ReadDirOpen resumes from the XFS getdents cookie, including after mutation.
+// The verifier stamps the sampled page; it does not authorize continuation.
 //
 // Entry kind and inode come from getdents64 itself. Nothing is stat'ed per
 // entry, so a concurrent unlink cannot turn one entry's ENOENT into a failure
@@ -2016,30 +1975,6 @@ func (v *Volume) ReadDirOpen(id Capability, cookie uint64, verifier [16]byte, ma
 	}
 	binary.BigEndian.PutUint64(current[0:8], attr.Ino)
 	binary.BigEndian.PutUint64(current[8:16], uint64(attr.CTimeNS))
-	// The verifier is not optional past the first page. A resume is a claim
-	// about a snapshot, and a client that cannot name the snapshot it is
-	// resuming has no position to resume to: without this, omitting the
-	// verifier bought a client silent repositioning into a directory that had
-	// changed underneath it. An all-zero verifier can only mean "absent",
-	// because it embeds a live inode number, which is never zero.
-	switch {
-	case cookie == 0:
-		// Starting over needs no prior snapshot, but a client that presents
-		// one is asserting it, and an assertion that is false must fail.
-		if verifier != ([16]byte{}) && verifier != current {
-			return nil, 0, current, false, parent, syscall.ESTALE
-		}
-	case verifier == ([16]byte{}):
-		return nil, 0, current, false, parent, fs.ErrInvalid
-	case verifier != current:
-		return nil, 0, current, false, parent, syscall.ESTALE
-	}
-	if opened.cursor.verifier != current {
-		opened.cursor.restart(current)
-		if err := opened.cursor.rewind(opened.fd(), 0, 0); err != nil {
-			return nil, 0, current, false, parent, err
-		}
-	}
 	if err := opened.seekCursor(cookie); err != nil {
 		return nil, 0, current, false, parent, err
 	}
@@ -2062,14 +1997,9 @@ func (v *Volume) ReadDirOpen(id Capability, cookie uint64, verifier [16]byte, ma
 		if err != nil {
 			return nil, 0, current, false, parent, err
 		}
-		opened.cursor.index++
-		opened.cursor.note(off)
-		entries = append(entries, Dirent{Name: name, Kind: kind, Ino: ino})
+		entries = append(entries, Dirent{Name: name, Kind: kind, Ino: ino, NextCookie: uint64(off)})
 	}
-	if opened.cursor.index > opened.cursor.high {
-		opened.cursor.high = opened.cursor.index
-	}
-	return entries, opened.cursor.index, current, eof, v.installedParent(opened.object), nil
+	return entries, opened.cursor.offset, current, eof, v.installedParent(opened.object), nil
 }
 
 // entryKind resolves d_type. XFS with ftype - the mkfs default this store
@@ -2101,45 +2031,20 @@ func (f *openFile) entryKind(typ byte, name string) (Kind, error) {
 	}
 }
 
-// seekCursor positions the enumeration at an already issued cookie. It starts
-// from the nearest known position at or before the target - the live cursor
-// when it has not passed the target, otherwise the last checkpoint - so the
-// scan it performs is bounded by checkpointStride and never by the cookie.
+// seekCursor resets the parse buffer together with the kernel offset. Cookies
+// are positions, not entry counts; no history or directory rescan is needed.
 func (f *openFile) seekCursor(cookie uint64) error {
 	c := &f.cursor
-	if cookie == c.index {
+	if cookie > math.MaxInt64 {
+		return syscall.EINVAL
+	}
+	if cookie == c.offset {
 		return nil
 	}
-	if cookie > c.high {
-		// A position this handle never issued. Repositioning to it would
-		// return a page from an arbitrary place in the directory.
-		return syscall.ESTALE
+	if _, err := unix.Seek(f.fd(), int64(cookie), io.SeekStart); err != nil {
+		return err
 	}
-	if cookie < c.index {
-		start, off := uint64(0), int64(0)
-		if k := cookie / checkpointStride; k > 0 {
-			if uint64(len(c.checkpoints)) < k {
-				return syscall.ESTALE
-			}
-			start, off = k*checkpointStride, c.checkpoints[k-1]
-		}
-		if err := c.rewind(f.fd(), off, start); err != nil {
-			return err
-		}
-	}
-	for c.index < cookie {
-		_, _, off, _, ok, err := c.next(f.fd())
-		if err != nil {
-			return err
-		}
-		if !ok {
-			// The snapshot the verifier pinned has fewer entries than the
-			// cookie names, which cannot happen while the verifier holds.
-			return syscall.ESTALE
-		}
-		c.index++
-		c.note(off)
-	}
+	c.offset, c.pos, c.end = cookie, 0, 0
 	return nil
 }
 

@@ -785,12 +785,11 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if set.Mode != nil {
 				var valid bool
 				mode, valid = modeFromProtocol(set.GetMode())
-				if !valid || item == (xfsstore.Capability{}) {
+				if !valid {
 					return nil, syscall.EINVAL
 				}
 			}
-			if (set.Uid != nil || set.Gid != nil) && (item == (xfsstore.Capability{}) ||
-				(set.Uid != nil && set.GetUid() == ^uint32(0)) || (set.Gid != nil && set.GetGid() == ^uint32(0))) {
+			if (set.Uid != nil || set.Gid != nil) && ((set.Uid != nil && set.GetUid() == ^uint32(0)) || (set.Gid != nil && set.GetGid() == ^uint32(0))) {
 				return nil, syscall.EINVAL
 			}
 			if set.Size != nil && set.GetSize() < 0 {
@@ -799,9 +798,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if set.AtimeNs != nil && set.GetAtimeNow() || set.MtimeNs != nil && set.GetMtimeNow() {
 				return nil, syscall.EINVAL
 			}
-			if (set.AtimeNs != nil || set.MtimeNs != nil || set.GetAtimeNow() || set.GetMtimeNow()) && item == (xfsstore.Capability{}) {
-				return nil, syscall.EINVAL
-			}
+
 			if item != (xfsstore.Capability{}) && handle != (xfsstore.Capability{}) {
 				itemIdentity, identityErr := h.Store.Identity(item)
 				if identityErr != nil {
@@ -1899,7 +1896,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				if len(entries) == 0 {
 					break
 				}
-				cookie += uint64(len(entries))
+				cookie = entries[len(entries)-1].NextCookie
 				if batch+1 >= maxSkippedReaddirBatches {
 					forgetIssued()
 					return h.errorResponse(0, syscall.EAGAIN, false)
@@ -2152,7 +2149,7 @@ func (h *VolumeHandler) constructDirectoryPage(
 ) ([]directoryPageCandidate, bool, bool, error) {
 	candidates := make([]directoryPageCandidate, 0, len(entries))
 	used := uint64(0)
-	for i, entry := range entries {
+	for _, entry := range entries {
 		candidate := directoryPageCandidate{enumerated: entry}
 		attr := xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
 		if entry.Kind != xfsstore.KindOpaque {
@@ -2184,7 +2181,7 @@ func (h *VolumeHandler) constructDirectoryPage(
 		}
 		dirent := &authoritypb.Dirent{
 			Name: []byte(entry.Name), Attr: attrProto(attr),
-			NextCookie: encodeCookie(cookie + uint64(i) + 1),
+			NextCookie: encodeCookie(entry.NextCookie),
 		}
 		if candidate.item != (xfsstore.Capability{}) {
 			dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, ^uint64(0))

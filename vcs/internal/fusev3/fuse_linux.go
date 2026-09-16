@@ -1488,6 +1488,15 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	if errno != 0 {
 		return nil, 0, errno
 	}
+	if openFlags.GetWrite() {
+		id, err := delegationIdentity(n.item.GetStableIdentity())
+		if err != nil {
+			return nil, 0, syscall.EIO
+		}
+		state := n.mount.delegations.state(id)
+		state.acquire.Lock()
+		defer state.acquire.Unlock()
+	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: openFlags, WriteIntent: openFlags.GetWrite(), CacheCapable: !openFlags.GetWrite()}}}
 	var gate *sourcePublicationGate
 	if openFlags.GetTruncate() {
@@ -1507,7 +1516,11 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 			}
 			return result, nil
 		})
-		errno = bufferErrno(callErr)
+		if errors.Is(callErr, errDelegationNotOwned) {
+			response, errno = n.mutateWithSource(ctx, request, gate)
+		} else {
+			errno = bufferErrno(callErr)
+		}
 	} else {
 		response, errno = n.mutateWithSource(ctx, request, gate)
 	}
@@ -1621,7 +1634,7 @@ func (h *fileHandle) close(ctx context.Context, lockOwner uint64, flockUnlock bo
 	}
 	var errno syscall.Errno
 	h.once.Do(func() {
-		if h.node.mount.delegations.Owns(h.node.item.GetStableIdentity()) {
+		if h.node.mount.delegations.TracksHandle(h.node.item.GetStableIdentity(), h.token) {
 			errno = bufferErrno(h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock))
 			return
 		}
@@ -1848,29 +1861,10 @@ func (h *dirHandle) authorityPageExhausted() bool {
 
 func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 	if h.uncovered {
-		// This handle is between kernel callbacks holding a page no lease covers,
-		// so no recall will arrive to invalidate it if the directory changed in
-		// the gap. Its entries were exact when the authority produced them and
-		// are not claimed to be exact now, so the page is retired here rather
-		// than served again.
-		//
-		// What is deliberately NOT dropped is the position. h.cookie is the
-		// authority cookie following the last entry this handle actually handed
-		// to the kernel, and h.verifier is the snapshot that cookie counts in.
-		// Keeping both is the whole of the exactness claim: the refetch resumes
-		// at exactly the next undelivered entry, so it repeats nothing and skips
-		// nothing, and if the directory moved in the gap the authority refuses
-		// the resume with ESTALE (xfsstore.Volume.ReadDirOpen) instead of
-		// silently repositioning. h.uncovered stays set for the same reason --
-		// clearing it here left a live cookie behind a zero lease stamp, which
-		// peek's guard then read as a dead lease and restarted from the
-		// beginning, re-delivering every entry the kernel already had.
-		//
-		// An end-of-stream this handle holds no authority over is retired with
-		// the rest of the page. Re-establishing it costs one authority round
-		// trip and is the difference between reporting a directory finished
-		// because it was finished and reporting it finished because a page that
-		// nothing was obliged to withdraw still said so.
+		// The page lost its subscription coverage between callbacks. Retire
+		// its entries and EOF, but preserve the last delivered XFS cookie.
+		// Stable offsets resume after that entry across directory mutations;
+		// the verifier only validates a newly fetched page for publication.
 		h.discardPageItemsLocked()
 		h.page, h.index, h.eof = nil, 0, false
 		h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
@@ -1904,7 +1898,7 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		// Starting the directory over abandons every position this handle held,
 		// so there is nothing left for the uncovered mark to protect. A seek to
 		// any other offset keeps it: that offset is itself an authority cookie
-		// and is still resumed under the verifier.
+		// and resumes from the same XFS continuation offset.
 		h.verifier = nil
 		h.uncovered = false
 	}
@@ -2021,6 +2015,15 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 	if errno != 0 {
 		return nil, nil, 0, errno
 	}
+	if identity, ok := n.cachedBoundIdentity(name); ok && openFlags.GetWrite() {
+		id, err := delegationIdentity(identity[:])
+		if err != nil {
+			return nil, nil, 0, syscall.EIO
+		}
+		state := n.mount.delegations.state(id)
+		state.acquire.Lock()
+		defer state.acquire.Unlock()
+	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777, Flags: openFlags, Exclusive: flags&uint32(syscall.O_EXCL) != 0, WriteIntent: openFlags.GetWrite(), CacheCapable: !openFlags.GetWrite()}}}
 	gate, err := namespaceSourceGate(n.item, name, openFlags.GetTruncate())
 	if err != nil {
@@ -2037,7 +2040,11 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 			}
 			return result, nil
 		})
-		errno = bufferErrno(callErr)
+		if errors.Is(callErr, errDelegationNotOwned) {
+			response, errno = n.mutateWithSource(ctx, request, gate)
+		} else {
+			errno = bufferErrno(callErr)
+		}
 	} else {
 		response, errno = n.mutateWithSource(ctx, request, gate)
 	}
@@ -2440,7 +2447,10 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 	if request.Mode == nil && request.Size == nil && request.AtimeNs == nil && request.MtimeNs == nil && !request.GetAtimeNow() && !request.GetMtimeNow() {
 		return n.Getattr(ctx, fh, out)
 	}
-	if n.item.GetAttr().GetKind() == authoritypb.Attr_REGULAR {
+	// Metadata on an unowned file uses the ordinary synchronous SETATTR path.
+	// Acquiring a data-write OPEN would wrongly require write permission for
+	// chmod by the owner of a mode-000 file.
+	if n.item.GetAttr().GetKind() == authoritypb.Attr_REGULAR && (request.Size != nil || n.mount.delegations.Owns(n.item.GetStableIdentity())) {
 		acquired := &acquiredDelegationHandle{}
 		ctx = context.WithValue(ctx, acquiredDelegationHandleKey{}, acquired)
 		defer func() {
@@ -2448,8 +2458,10 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 				_ = n.mount.delegations.QueueClose(n.item.GetStableIdentity(), acquired.token, 0, false)
 			}
 		}()
-		if err := n.ensureWriteDelegation(ctx, fh); err != nil {
-			return bufferErrno(err)
+		if request.Size != nil {
+			if err := n.ensureWriteDelegation(ctx, fh); err != nil {
+				return bufferErrno(err)
+			}
 		}
 		gate, gateErr := itemSourceGate(n.item, request.Size != nil)
 		if gateErr != nil {
@@ -2459,13 +2471,15 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		if callback == nil {
 			return syscall.EIO
 		}
-		lease, gateErr := callback.acquireSource(ctx, n.mount.raw, gate)
-		if gateErr != nil {
-			return bufferErrno(gateErr)
-		}
-		if gateErr = lease.markAssigned(); gateErr != nil {
-			return syscall.EIO
-		}
+		var lease *sourcePublicationLease
+		ctx = context.WithValue(ctx, delegationPrepareContextKey{}, func() error {
+			var acquireErr error
+			lease, acquireErr = callback.acquireSource(ctx, n.mount.raw, gate)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			return lease.markAssigned()
+		})
 		attrs := writeback.Attributes{ATimeNow: request.AtimeNow, MTimeNow: request.MtimeNow}
 		if request.Mode != nil {
 			attrs.HasMode = true
@@ -2483,9 +2497,24 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 			attrs.HasMTime = true
 			attrs.MTimeNS = *request.MtimeNs
 		}
-		if _, err := n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs); err != nil {
-			_ = lease.markCallbackPublicationReady()
-			return bufferErrno(err)
+		var admissionErr error
+		for {
+			_, admissionErr = n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs)
+			if !errors.Is(admissionErr, errDelegationNotOwned) {
+				break
+			}
+			if request.Size == nil {
+				goto synchronousSetattr
+			}
+			if admissionErr = n.ensureWriteDelegation(ctx, fh); admissionErr != nil {
+				break
+			}
+		}
+		if admissionErr != nil {
+			if lease != nil {
+				_ = lease.markCallbackPublicationReady()
+			}
+			return bufferErrno(admissionErr)
 		}
 		if err := n.invalidateOwnData(ctx, 0, 0); err != nil {
 			_ = lease.markCallbackPublicationReady()
@@ -2508,6 +2537,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		}
 		return n.overlayAttr(base, out)
 	}
+synchronousSetattr:
 	gate, err := itemSourceGate(n.item, request.Size != nil)
 	if err != nil {
 		return syscall.EIO

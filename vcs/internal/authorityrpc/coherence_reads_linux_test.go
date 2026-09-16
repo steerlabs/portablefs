@@ -378,14 +378,10 @@ func (s *coherenceChangingDirectoryStore) ReadDirOpen(
 	}
 	s.calls.Add(1)
 	fresh := [16]byte{0x91}
-	old := [16]byte{0x81}
-	if verifier == old {
-		return nil, 0, fresh, false, s.directory, syscall.ESTALE
-	}
 	all := []xfsstore.Dirent{
-		{Name: "a", Kind: xfsstore.KindRegular, Ino: 1},
-		{Name: "b", Kind: xfsstore.KindRegular, Ino: 2},
-		{Name: "c", Kind: xfsstore.KindRegular, Ino: 3},
+		{Name: "a", Kind: xfsstore.KindRegular, Ino: 1, NextCookie: 1},
+		{Name: "b", Kind: xfsstore.KindRegular, Ino: 2, NextCookie: 2},
+		{Name: "c", Kind: xfsstore.KindRegular, Ino: 3, NextCookie: 3},
 	}
 	if cookie > uint64(len(all)) {
 		return nil, uint64(len(all)), fresh, true, s.directory, nil
@@ -412,8 +408,8 @@ func TestCoherenceReadDirContinuesAfterDirectoryChangeWithoutESTALE(t *testing.T
 	if verifier != ([16]byte{0x91}) || directory != store.directory {
 		t.Fatalf("continued coordinates = verifier=%x directory=%x", verifier, directory)
 	}
-	if calls := store.calls.Load(); calls != 3 {
-		t.Fatalf("ReadDirOpen calls = %d, want stale attempt, current scan, and continuation", calls)
+	if calls := store.calls.Load(); calls != 1 {
+		t.Fatalf("ReadDirOpen calls = %d, want direct stable-cookie continuation", calls)
 	}
 }
 

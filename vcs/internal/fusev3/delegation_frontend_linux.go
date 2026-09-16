@@ -39,11 +39,11 @@ func captureServedVersion(ctx context.Context, response *authoritypb.Response) {
 func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.Delegation) error {
 	manager := n.mount.delegations
 	if grant != nil {
-		if err := manager.Install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant); err != nil {
+		if err := manager.Install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant); err != nil && !errors.Is(err, errDelegationRetired) {
 			return err
 		}
 	} else if manager.Owns(n.item.GetStableIdentity()) {
-		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token); err != nil {
+		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, handle.openFlags&syscall.O_ACCMODE != syscall.O_RDONLY); err != nil {
 			return err
 		}
 	}
@@ -60,36 +60,64 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 	if n.stale.Load() || (handle != nil && handle.stale.Load()) {
 		return syscall.EIO
 	}
+	id, err := delegationIdentity(n.item.GetStableIdentity())
+	if err != nil {
+		return err
+	}
+	state := n.mount.delegations.state(id)
+	state.acquire.Lock()
+	defer state.acquire.Unlock()
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
 		return nil
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true}}})
-	if errno != 0 {
-		return errno
-	}
-	opened := response.GetOpen()
-	if opened == nil || opened.GetDelegation() == nil || len(opened.GetHandle()) == 0 {
-		return syscall.EIO
-	}
-	token := opened.GetHandle()
-	if handle != nil {
-		token = handle.token
-	}
-	if err := n.mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation()); err != nil {
-		return err
-	}
-	if handle == nil {
-		if acquired, _ := ctx.Value(acquiredDelegationHandleKey{}).(*acquiredDelegationHandle); acquired != nil {
-			acquired.token = cloneBytes(token)
-		}
-	}
-	if handle != nil {
-		_, errno = n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
+	for {
+		response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true}}})
 		if errno != 0 {
 			return errno
 		}
+		opened := response.GetOpen()
+		if opened == nil || opened.GetDelegation() == nil || len(opened.GetHandle()) == 0 {
+			return syscall.EIO
+		}
+		token := opened.GetHandle()
+		if handle != nil {
+			token = handle.token
+		}
+		if err := n.mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation()); err != nil {
+			_, closeErrno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
+			if closeErrno != 0 {
+				return closeErrno
+			}
+			if errors.Is(err, errDelegationRetired) {
+				continue
+			}
+			return err
+		}
+		if handle == nil {
+			if acquired, _ := ctx.Value(acquiredDelegationHandleKey{}).(*acquiredDelegationHandle); acquired != nil {
+				acquired.token = cloneBytes(token)
+			}
+		}
+		if handle != nil {
+			_, errno = n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
+			if errno != 0 {
+				return errno
+			}
+		}
+		return nil
 	}
-	return nil
+}
+
+func (n *node) withWriteDelegation(ctx context.Context, handle *fileHandle, call func(*authoritypb.DelegationRef) (*authoritypb.Response, error)) (*authoritypb.Response, error) {
+	for {
+		if err := n.ensureWriteDelegation(ctx, handle); err != nil {
+			return nil, err
+		}
+		response, err := n.mount.delegations.Synchronous(ctx, n.item.GetStableIdentity(), call)
+		if !errors.Is(err, errDelegationNotOwned) {
+			return response, err
+		}
+	}
 }
 
 func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Errno {

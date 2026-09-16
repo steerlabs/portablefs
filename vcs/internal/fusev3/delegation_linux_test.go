@@ -385,6 +385,97 @@ func TestDelegationReadAndAttributeOverlay(t *testing.T) {
 	}
 }
 
+func TestDelegationMetadataFlushUsesRetainedOpenHandle(t *testing.T) {
+	fake := &delegationFakeRPC{}
+	m := newDelegationTestManager(t, fake)
+	id := installDelegationForTest(t, m, 3, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.SetAttr(t.Context(), id, writeback.Attributes{HasMode: true, Mode: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.FlushIdentity(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, request := range fake.mutations {
+		if set := request.GetSetAttr(); set != nil {
+			if len(set.GetItem()) != 0 || len(set.GetHandle()) == 0 || set.Mode == nil || set.GetMode() != 0 {
+				t.Fatalf("metadata flush must use the retained handle: %v", set)
+			}
+			return
+		}
+	}
+	t.Fatal("no metadata flush")
+}
+
+func TestDelegationAdmissionChecksOwnershipBeforePublication(t *testing.T) {
+	fake := &delegationFakeRPC{}
+	m := newDelegationTestManager(t, fake)
+	id := delegationTestIdentity(18)
+	prepared := false
+	ctx := context.WithValue(t.Context(), delegationPrepareContextKey{}, func() error { prepared = true; return nil })
+	if _, err := m.Write(ctx, id, 0, []byte("pending"), false); !errors.Is(err, errDelegationNotOwned) || prepared {
+		t.Fatalf("unowned admission = %v, prepared=%v", err, prepared)
+	}
+	installDelegationForTest(t, m, 18, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(ctx, id, 0, []byte("accepted"), false); err != nil || !prepared {
+		t.Fatalf("owned admission=%v prepared=%v", err, prepared)
+	}
+}
+
+func TestDelegationControlWaitsForGrantReplyAndRejectsResurrection(t *testing.T) {
+	fake := &delegationFakeRPC{}
+	m := newDelegationTestManager(t, fake)
+	id := delegationTestIdentity(19)
+	grant := delegationTestGrant(51, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	m.HandleControlEvent(t.Context(), &authoritypb.ControlEvent{Incarnation: 7, Sequence: 1,
+		Event: &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{
+			Delegation: cloneDelegationRef(&authoritypb.DelegationRef{Id: grant.Id, Generation: grant.Generation}), Identity: id, BudgetNanos: uint64(time.Second),
+		}}})
+	if err := m.Install(id, []byte{19, 1}, []byte{19, 2}, grant); err != nil {
+		t.Fatal(err)
+	}
+	m.controlWG.Wait()
+	if fakeControlCount(fake, func(r *authoritypb.Request) bool { return r.GetDelegationRecallAck() != nil }) != 1 {
+		t.Fatal("overtaking recall was not acknowledged")
+	}
+	if err := m.Install(id, []byte{19, 1}, []byte{19, 3}, grant); !errors.Is(err, errDelegationRetired) {
+		t.Fatalf("retired grant reinstallation=%v", err)
+	}
+}
+
+func TestDelegationSuccessorEmptyCutDoesNotReusePriorTicket(t *testing.T) {
+	fake := &delegationFakeRPC{}
+	m := newDelegationTestManager(t, fake)
+	id := installDelegationForTest(t, m, 20, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), id, 0, []byte("old"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ReleaseBatch(t.Context(), [][]byte{id}); err != nil {
+		t.Fatal(err)
+	}
+	grant := delegationTestGrant(53, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	grant.Generation = 2
+	if err := m.Install(id, []byte{20, 1}, []byte{20, 3}, grant); err != nil {
+		t.Fatal(err)
+	}
+	m.HandleControlEvent(t.Context(), &authoritypb.ControlEvent{Incarnation: 7, Sequence: 1, Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{
+		Delegation: &authoritypb.DelegationRef{Id: grant.Id, Generation: 2}, Identity: id, BudgetNanos: uint64(time.Second),
+	}}})
+	m.controlWG.Wait()
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, r := range fake.controls {
+		if ack := r.GetDelegationBreakAck(); ack != nil {
+			if ack.GetAppliedSequence() != 0 {
+				t.Fatalf("empty successor cut=%d", ack.GetAppliedSequence())
+			}
+			return
+		}
+	}
+	t.Fatal("no break acknowledgment")
+}
+
 func TestDelegationBreakFlushesCutAndRetainsOwnership(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)
@@ -965,5 +1056,34 @@ func BenchmarkDelegationOwns(b *testing.B) {
 				_ = m.Owns(id)
 			}
 		})
+	}
+}
+
+func TestDelegationFlushKeepsWritableCapabilityUntilApplication(t *testing.T) {
+	fake := &delegationFakeRPC{}
+	m := newDelegationTestManager(t, fake)
+	id := installDelegationForTest(t, m, 21, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	writer, reader := []byte{21, 2}, []byte{1, 1}
+	if err := m.AddHandle(id, []byte{21, 1}, reader, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Write(t.Context(), id, 0, []byte("retained"), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: writer}}); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	for _, request := range fake.mutations {
+		if write := request.GetWrite(); write != nil && !bytes.Equal(write.Handle, writer) {
+			t.Errorf("flush used non-writable handle %x", write.Handle)
+		}
+	}
+	fake.mu.Unlock()
+	if m.TracksHandle(id, writer) || !m.TracksHandle(id, reader) {
+		t.Fatal("closed writable handle remains registered or reader disappeared")
+	}
+	if m.LossSequence() != 0 {
+		t.Fatal("closing writer reported loss")
 	}
 }

@@ -34,6 +34,9 @@ type delegationBinding struct {
 }
 
 type delegationState struct {
+	acquire           sync.Mutex
+	grantChanged      chan struct{}
+	retiredGeneration uint64
 	// transition serializes recall, break, mode changes, release, and grant
 	// installation for one identity. No network operation holds manager.mu.
 	transition sync.Mutex
@@ -54,6 +57,7 @@ type delegationState struct {
 	mode     authoritypb.DelegationMode
 	item     []byte
 	handles  map[string][]byte
+	writers  map[string][]byte
 	bindings map[uint64]delegationBinding
 	retire   *writeback.Retirement
 	base     *authoritypb.Attr
@@ -191,7 +195,7 @@ func (m *delegationManager) state(id writeback.Identity) *delegationState {
 	defer m.mu.Unlock()
 	s := m.byID[id]
 	if s == nil {
-		s = &delegationState{identity: id, handles: make(map[string][]byte), bindings: make(map[uint64]delegationBinding)}
+		s = &delegationState{grantChanged: make(chan struct{}), identity: id, handles: make(map[string][]byte), writers: make(map[string][]byte), bindings: make(map[uint64]delegationBinding)}
 		m.byID[id] = s
 	}
 	return s
@@ -329,6 +333,9 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 	defer s.operation.Unlock()
 	s.admission.Lock()
 	defer s.admission.Unlock()
+	if ref.GetGeneration() <= s.retiredGeneration {
+		return errDelegationRetired
+	}
 	if s.ref != nil && !sameDelegation(s.ref, ref) {
 		return errors.New("fusev3: identity received a second live delegation")
 	}
@@ -337,10 +344,17 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 		// ownership interval. Fetch a current base before caching it again.
 		s.meta.Lock()
 		s.base = nil
+		// A cut receipt belongs to this ownership generation. Carrying the
+		// previous grant's last ticket into an empty successor break would
+		// acknowledge data never applied under the successor reference.
+		s.applied, s.appliedCut, s.acceptedCut, s.dirty = 0, 0, 0, false
 		s.meta.Unlock()
 	}
 	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)
+	close(s.grantChanged)
+	s.grantChanged = make(chan struct{})
 	s.handles[string(handle)] = cloneBytes(handle)
+	s.writers[string(handle)] = cloneBytes(handle)
 	if s.retire != nil {
 		generation := m.buf.Generation(id) + 1
 		s.bindings[generation] = delegationBinding{ref: cloneDelegationRef(ref), item: cloneBytes(item), generation: generation}
@@ -356,7 +370,7 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 	return nil
 }
 
-func (m *delegationManager) AddHandle(identity, item, handle []byte) error {
+func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bool) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
 		return err
@@ -376,8 +390,37 @@ func (m *delegationManager) AddHandle(identity, item, handle []byte) error {
 		s.item = cloneBytes(item)
 	}
 	s.handles[string(handle)] = cloneBytes(handle)
+	if writable {
+		s.writers[string(handle)] = cloneBytes(handle)
+	}
 	return nil
 }
+
+// A frontend closes its publication coordinates inside the same operation turn
+// that checks ownership and admits the entry. A failed ownership check must not
+// leave a source gate held while reacquisition waits for a recall.
+type delegationPrepareContextKey struct{}
+
+func prepareDelegationAdmission(ctx context.Context) error {
+	if prepare, ok := ctx.Value(delegationPrepareContextKey{}).(func() error); ok {
+		return prepare()
+	}
+	return nil
+}
+
+var errDelegationRetired = errors.New("fusev3: grant response names a retired generation")
+
+func (s *delegationState) clearGrantLocked() {
+	if s.ref != nil {
+		s.retiredGeneration = max(s.retiredGeneration, s.ref.GetGeneration())
+	}
+	s.ref = nil
+	s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
+	close(s.grantChanged)
+	s.grantChanged = make(chan struct{})
+}
+
+var errDelegationNotOwned = errors.New("fusev3: mutation has no write delegation")
 
 func (m *delegationManager) modeAndBuffer(id writeback.Identity) (*delegationState, *writeback.Buffer, authoritypb.DelegationMode, error) {
 	if m.incarnation() == 0 {
@@ -387,7 +430,7 @@ func (m *delegationManager) modeAndBuffer(id writeback.Identity) (*delegationSta
 	s.admission.RLock()
 	if s.ref == nil {
 		s.admission.RUnlock()
-		return nil, nil, 0, errors.New("fusev3: mutation has no write delegation")
+		return nil, nil, 0, errDelegationNotOwned
 	}
 	mode := s.mode
 	return s, m.buf, mode, nil
@@ -417,6 +460,10 @@ func (m *delegationManager) Write(ctx context.Context, identity []byte, off int6
 	defer s.operation.Unlock()
 	s, b, mode, err := m.modeAndBuffer(id)
 	if err != nil {
+		return writeback.Cut{}, err
+	}
+	if err := prepareDelegationAdmission(ctx); err != nil {
+		s.admission.RUnlock()
 		return writeback.Cut{}, err
 	}
 	var cut writeback.Cut
@@ -484,6 +531,10 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	defer s.operation.Unlock()
 	s, b, mode, err := m.modeAndBuffer(id)
 	if err != nil {
+		return writeback.Cut{}, err
+	}
+	if err := prepareDelegationAdmission(ctx); err != nil {
+		s.admission.RUnlock()
 		return writeback.Cut{}, err
 	}
 	cut, err := admit(b, id)
@@ -692,16 +743,19 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 	}
 	binding, ok := s.bindings[entry.Generation]
 	handle := firstDelegatedHandle(s.handles)
+	if entry.Kind == writeback.Write {
+		handle = firstDelegatedHandle(s.writers)
+	}
 	if admissionHeld != s {
 		s.admission.RUnlock()
 	}
 	if !ok || binding.ref == nil {
 		return 0, errors.New("fusev3: writeback entry has no delegation generation binding")
 	}
+	if len(handle) == 0 {
+		return 0, errors.New("fusev3: delegated flush has no live server handle")
+	}
 	if entry.Kind == writeback.Write {
-		if len(handle) == 0 {
-			return 0, errors.New("fusev3: delegated write has no live server handle")
-		}
 		return m.flushWrite(ctx, s, binding, handle, entry, progress)
 	}
 	// Generated oneof interfaces are package-private, so construct the request
@@ -710,7 +764,7 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 	switch entry.Kind {
 	case writeback.Truncate, writeback.SetAttr:
 		a := entry.Attributes
-		set := &authoritypb.SetAttrRequest{Item: cloneBytes(binding.item), Delegation: cloneDelegationRef(binding.ref), AtimeNow: a.ATimeNow, MtimeNow: a.MTimeNow}
+		set := &authoritypb.SetAttrRequest{Handle: cloneBytes(handle), Delegation: cloneDelegationRef(binding.ref), AtimeNow: a.ATimeNow, MtimeNow: a.MTimeNow}
 		if a.HasMode {
 			set.Mode = &a.Mode
 		}
@@ -846,10 +900,13 @@ func (m *delegationManager) updateBaseFromResponse(s *delegationState, response 
 	}
 }
 
-func delegationApplied(s *delegationState, flushed uint64) uint64 {
+func delegationApplied(s *delegationState, _ uint64) uint64 {
 	s.meta.Lock()
 	defer s.meta.Unlock()
-	return max(flushed, s.applied)
+	// Buffer retains an identity's application high-water across generations.
+	// CONTROL receipts must name only this grant's applications; each flusher
+	// updates s.applied before returning its receipt to Buffer.
+	return s.applied
 }
 
 func firstDelegatedHandle(handles map[string][]byte) []byte {
@@ -913,7 +970,7 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	ref := cloneDelegationRef(s.ref)
 	s.admission.RUnlock()
 	if ref == nil {
-		return nil, errors.New("fusev3: synchronous mutation has no write delegation")
+		return nil, errDelegationNotOwned
 	}
 	// An external range mutation can replace bytes represented by retained
 	// applied extents. Retire the prior cut before dispatch so the holder's
@@ -1079,10 +1136,6 @@ func (m *delegationManager) handleControlEvent(ctx context.Context, event *autho
 	if epoch != m.epochSerial {
 		return
 	}
-	s.transition.Lock()
-	defer s.transition.Unlock()
-	s.operation.Lock()
-	defer s.operation.Unlock()
 	var ref *authoritypb.DelegationRef
 	switch {
 	case event.GetDelegationRecall() != nil:
@@ -1092,12 +1145,30 @@ func (m *delegationManager) handleControlEvent(ctx context.Context, event *autho
 	case event.GetDelegationModeChange() != nil:
 		ref = event.GetDelegationModeChange().GetDelegation()
 	}
-	s.admission.RLock()
-	live := cloneDelegationRef(s.ref)
-	s.admission.RUnlock()
-	if !sameDelegation(live, ref) {
-		return
+	// CONTROL may overtake the DATA reply carrying a newly activated grant.
+	// Wait without transition/operation locks: Install needs both to publish it.
+	for {
+		s.transition.Lock()
+		s.operation.Lock()
+		s.admission.RLock()
+		live, changed, retired := cloneDelegationRef(s.ref), s.grantChanged, s.retiredGeneration
+		s.admission.RUnlock()
+		if sameDelegation(live, ref) {
+			break
+		}
+		s.operation.Unlock()
+		s.transition.Unlock()
+		if retired >= ref.GetGeneration() || live != nil && live.GetGeneration() > ref.GetGeneration() {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return
+		}
 	}
+	defer s.transition.Unlock()
+	defer s.operation.Unlock()
 	if event.GetDelegationRecall() != nil {
 		m.recall(ctx, event, s)
 		return
@@ -1124,8 +1195,7 @@ func (m *delegationManager) beginRetire(ctx context.Context, s *delegationState)
 
 func (m *delegationManager) loseDelegation(s *delegationState, reason string) {
 	s.admission.Lock()
-	s.ref = nil
-	s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
+	s.clearGrantLocked()
 	s.admission.Unlock()
 	// Closing the manager admission gate before Drop is the frontend retirement
 	// boundary. Calling Buffer.BeginRetire from inside a Flusher callback would
@@ -1173,8 +1243,7 @@ func (m *delegationManager) recall(ctx context.Context, event *authoritypb.Contr
 		return
 	}
 	s.admission.Lock()
-	s.ref = nil
-	s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
+	s.clearGrantLocked()
 	s.admission.Unlock()
 }
 
@@ -1322,11 +1391,25 @@ func (m *delegationManager) ReleaseBatch(ctx context.Context, identities [][]byt
 	}
 	for _, item := range items {
 		item.s.admission.Lock()
-		item.s.ref = nil
-		item.s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
+		item.s.clearGrantLocked()
 		item.s.admission.Unlock()
 	}
 	return nil
+}
+
+func (m *delegationManager) TracksHandle(identity, handle []byte) bool {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return false
+	}
+	s := m.lookupState(id)
+	if s == nil {
+		return false
+	}
+	s.admission.RLock()
+	_, tracked := s.handles[string(handle)]
+	s.admission.RUnlock()
+	return tracked
 }
 
 func (m *delegationManager) CloseHandle(ctx context.Context, identity, handle []byte) error {
@@ -1343,6 +1426,7 @@ func (m *delegationManager) CloseHandle(ctx context.Context, identity, handle []
 	if present && !last {
 		s.admission.Lock()
 		delete(s.handles, string(handle))
+		delete(s.writers, string(handle))
 		s.admission.Unlock()
 	}
 	s.transition.Unlock()
@@ -1357,6 +1441,7 @@ func (m *delegationManager) CloseHandle(ctx context.Context, identity, handle []
 	}
 	s.admission.Lock()
 	delete(s.handles, string(handle))
+	delete(s.writers, string(handle))
 	s.admission.Unlock()
 	return nil
 }
@@ -1503,6 +1588,10 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 	}
 	sort.Slice(groups, func(i, j int) bool { return bytes.Compare(groups[i].id[:], groups[j].id[:]) < 0 })
 	for _, group := range groups {
+		group.state.acquire.Lock()
+		defer group.state.acquire.Unlock()
+	}
+	for _, group := range groups {
 		group.state.transition.Lock()
 		defer group.state.transition.Unlock()
 		group.state.operation.Lock()
@@ -1526,7 +1615,15 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		}
 		ref := cloneDelegationRef(s.ref)
 		s.admission.RUnlock()
-		if !allClosing || ref == nil {
+		if ref == nil {
+			continue
+		}
+		if !allClosing {
+			// A read-only description may outlive the last writable one. Apply
+			// accepted bytes before closing their retained writable capability.
+			if _, err := m.buf.FlushIdentity(ctx, group.id, m.buf.Snapshot()); err != nil {
+				return err
+			}
 			continue
 		}
 		retire, err := m.beginRetire(ctx, s)
@@ -1563,8 +1660,7 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		}
 		for _, released := range releasing {
 			released.group.state.admission.Lock()
-			released.group.state.ref = nil
-			released.group.state.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
+			released.group.state.clearGrantLocked()
 			released.group.state.admission.Unlock()
 		}
 	}
@@ -1582,6 +1678,7 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		if err == nil {
 			s.admission.Lock()
 			delete(s.handles, string(pending.handle))
+			delete(s.writers, string(pending.handle))
 			s.admission.Unlock()
 		} else if firstErr == nil {
 			firstErr = err

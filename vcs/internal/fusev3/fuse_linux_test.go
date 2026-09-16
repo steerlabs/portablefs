@@ -1939,6 +1939,9 @@ func TestSetattrProjectsSinglePrincipal(t *testing.T) {
 func TestSetattrPreservesServerClockNowIntent(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	n := testNode(mount)
+	if err := mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), testToken(100), delegationTestGrant(44, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
 	in := &fuse.SetAttrIn{}
 	in.Valid = fuse.FATTR_ATIME_NOW | fuse.FATTR_MTIME_NOW
 	before := time.Now().UnixNano()

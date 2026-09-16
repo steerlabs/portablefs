@@ -1152,3 +1152,27 @@ func (f *integrationFixture) countRequests(kind string, fn func()) int {
 	fn()
 	return f.counter.count(kind) - before
 }
+
+// Cache-reuse proofs must open their reader after the asynchronous RELEASE
+// completes. An open while a delegation exists is deliberately direct-I/O.
+func waitForDelegationReleases(t *testing.T, mount *Mount) {
+	t.Helper()
+	waitUntil(t, 2*time.Second, "closed writable handles to release delegations", func() bool {
+		m := mount.delegations
+		m.mu.Lock()
+		states := make([]*delegationState, 0, len(m.byID))
+		for _, state := range m.byID {
+			states = append(states, state)
+		}
+		m.mu.Unlock()
+		for _, state := range states {
+			state.admission.RLock()
+			owned := state.ref != nil
+			state.admission.RUnlock()
+			if owned {
+				return false
+			}
+		}
+		return true
+	})
+}

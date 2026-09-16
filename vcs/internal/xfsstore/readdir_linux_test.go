@@ -5,7 +5,6 @@ package xfsstore
 import (
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"sync"
 	"syscall"
@@ -30,6 +29,33 @@ func readDirAll(t *testing.T, v *Volume, handle Capability, page int) []Dirent {
 		if eof {
 			return all
 		}
+	}
+}
+
+func TestOpenHandleMetadataSurvivesItemReclaim(t *testing.T) {
+	v := openTestVolume(t)
+	root, _ := v.Root()
+	item, _, err := v.Create(root, "metadata", 0o600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	if err := v.Forget(item); err != nil {
+		t.Fatal(err)
+	}
+	mode := os.FileMode(0)
+	mtime := int64(1234567890000000000)
+	attr, err := v.SetAttr(Capability{}, handle, SetAttrSpec{Mode: &mode, MTimeNS: &mtime})
+	if err != nil || attr.Mode.Perm() != 0 || attr.MTimeNS != mtime {
+		t.Fatalf("metadata after reclaim = %+v, %v", attr, err)
+	}
+	mode = 0o600
+	if _, err := v.SetAttr(Capability{}, handle, SetAttrSpec{Mode: &mode}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -123,50 +149,64 @@ func TestReadDirListsForbiddenInodeTypes(t *testing.T) {
 	}
 }
 
-// TestReadDirRefusesResumeWithoutVerifier is the bypass: a client that simply
-// omitted the verifier field got zero staleness checking and a silently wrong
-// page. An omitted verifier is now a refused request, not a weaker one.
-func TestReadDirRefusesResumeWithoutVerifier(t *testing.T) {
+// A changed or omitted page stamp never invalidates an issued XFS position.
+func TestReadDirStableCookiesSurviveMutation(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
-	for i := range 20 {
-		if _, _, err := v.Create(root, fmt.Sprintf("f%02d", i), 0o600, true); err != nil {
+	const total = 1100
+	for i := range total {
+		if _, _, err := v.Create(root, fmt.Sprintf("anchor-%04d", i), 0o600, true); err != nil {
 			t.Fatal(err)
 		}
 	}
 	handle := mustOpenDir(t, v, root)
-	_, cookie, verifier, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, 5)
-	if err != nil {
-		t.Fatal(err)
+	seen := make(map[string]int)
+	var cookie uint64
+	var verifier [16]byte
+	for page := 0; ; page++ {
+		entries, next, current, eof, _, err := v.ReadDirOpen(handle, cookie, verifier, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			seen[entry.Name]++
+		}
+		if len(entries) > 0 && next != entries[len(entries)-1].NextCookie {
+			t.Fatalf("page cookie %d disagrees with final entry", next)
+		}
+		if eof {
+			break
+		}
+		if page > total {
+			t.Fatal("enumeration did not terminate")
+		}
+		name := fmt.Sprintf("transient-%04d", page)
+		if _, _, err := v.Create(root, name, 0o600, true); err != nil {
+			t.Fatal(err)
+		}
+		if page > 0 {
+			if err := v.Unlink(root, fmt.Sprintf("transient-%04d", page-1), false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		cookie = next
+		verifier = current
+		if page%2 == 0 {
+			verifier = [16]byte{}
+		}
 	}
-	if _, _, _, _, _, err := v.ReadDirOpen(handle, cookie, [16]byte{}, 5); !errors.Is(err, fs.ErrInvalid) {
-		t.Fatalf("resume with an omitted verifier = %v, want a refused request", err)
-	}
-	var wrong [16]byte
-	wrong[0] = verifier[0] ^ 0xff
-	if _, _, _, _, _, err := v.ReadDirOpen(handle, cookie, wrong, 5); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("resume with a wrong verifier = %v, want ESTALE", err)
-	}
-	if _, _, _, _, _, err := v.ReadDirOpen(handle, cookie, verifier, 5); err != nil {
-		t.Fatalf("resume with the issued verifier: %v", err)
-	}
-	// Starting over needs no verifier, and a stale one presented there is
-	// still an assertion that must fail.
-	if _, _, _, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, 5); err != nil {
-		t.Fatalf("fresh enumeration: %v", err)
-	}
-	if _, _, _, _, _, err := v.ReadDirOpen(handle, 0, wrong, 5); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("fresh enumeration with a wrong verifier = %v, want ESTALE", err)
+	for i := range total {
+		name := fmt.Sprintf("anchor-%04d", i)
+		if seen[name] != 1 {
+			t.Errorf("unchanged entry %q returned %d times", name, seen[name])
+		}
 	}
 }
 
-// TestReadDirResumesDeepCookieExactly covers repositioning past the
-// checkpoint stride: resuming used to re-read every entry before the cookie,
-// which is quadratic over a full enumeration.
 func TestReadDirResumesDeepCookieExactly(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
-	const total = checkpointStride*2 + 37
+	const total = 1061
 	for i := range total {
 		if _, _, err := v.Create(root, fmt.Sprintf("e%05d", i), 0o600, true); err != nil {
 			t.Fatal(err)
@@ -177,25 +217,21 @@ func TestReadDirResumesDeepCookieExactly(t *testing.T) {
 	if len(all) != total {
 		t.Fatalf("enumerated %d entries, want %d", len(all), total)
 	}
-	_, _, verifier, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, cookie := range []uint64{1, checkpointStride - 1, checkpointStride,
-		checkpointStride + 1, 2 * checkpointStride, total - 1} {
-		page, next, _, _, _, err := v.ReadDirOpen(handle, cookie, verifier, 3)
+	for _, index := range []int{1, 511, 512, 513, 1024, total - 1} {
+		cookie := all[index-1].NextCookie
+		page, next, _, _, _, err := v.ReadDirOpen(handle, cookie, [16]byte{}, 3)
 		if err != nil {
 			t.Fatalf("resume at %d: %v", cookie, err)
 		}
-		if len(page) == 0 || page[0].Name != all[cookie].Name {
-			t.Fatalf("resume at %d began with %v, want %q", cookie, page, all[cookie].Name)
+		if len(page) == 0 || page[0].Name != all[index].Name {
+			t.Fatalf("resume at %d began with %v, want %q", cookie, page, all[index].Name)
 		}
-		if next != cookie+uint64(len(page)) {
-			t.Fatalf("resume at %d issued next cookie %d for %d entries", cookie, next, len(page))
+		if next != page[len(page)-1].NextCookie {
+			t.Fatalf("resume cookie %d differs from final entry", next)
 		}
 	}
-	if _, _, _, _, _, err := v.ReadDirOpen(handle, total+1, verifier, 3); !errors.Is(err, syscall.ESTALE) {
-		t.Fatalf("resume past the end = %v, want ESTALE", err)
+	if _, _, _, _, _, err := v.ReadDirOpen(handle, 1<<63, [16]byte{}, 3); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("negative offset = %v, want EINVAL", err)
 	}
 }
 

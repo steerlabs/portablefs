@@ -43,7 +43,7 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountDirectoryListingCoherence"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDirectoryWithNonPortableInodeRemainsListable"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirReturnsEveryNameExactlyOnce"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirRefusesToPageAcrossARemoteMutation"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirContinuesAcrossRemoteMutation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestConcurrentCrossMountWritersToOneFile"
   # A package-manager tree install (rename(2) publication into one directory)
   # racing concurrent enumerating readers. This is the exact shape that revoked

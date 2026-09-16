@@ -467,53 +467,7 @@ func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 	return true, nil
 }
 
-// coherenceReadDirPage converts the old verifier-bound ordinal cursor into the
-// protocol-7 continuation rule. A directory change discards the old snapshot,
-// replays the ordinal against the current directory, and returns whatever the
-// POSIX continuation now names. It may duplicate or omit concurrently changed
-// entries, but it never reports ESTALE solely because the directory changed.
-func (h *VolumeHandler) coherenceReadDirPage(
-	handle xfsstore.Capability,
-	cookie uint64,
-	verifier [16]byte,
-	maxEntries int,
-) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
-	entries, next, current, eof, directory, err := h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
-	if !errors.Is(err, syscall.ESTALE) {
-		return entries, next, current, eof, directory, err
-	}
-	for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-		position := uint64(0)
-		var fresh [16]byte
-		for position < cookie {
-			remaining := cookie - position
-			batch := uint64(4096)
-			if remaining < batch {
-				batch = remaining
-			}
-			_, advanced, observed, atEOF, parent, scanErr := h.Store.ReadDirOpen(handle, position, fresh, int(batch))
-			if scanErr != nil {
-				if errors.Is(scanErr, syscall.ESTALE) {
-					break
-				}
-				return nil, 0, observed, false, parent, scanErr
-			}
-			fresh, directory = observed, parent
-			if atEOF && advanced < cookie {
-				return nil, advanced, fresh, true, directory, nil
-			}
-			if advanced <= position {
-				return nil, 0, fresh, false, directory, syscall.EIO
-			}
-			position = advanced
-		}
-		if position != cookie {
-			continue
-		}
-		entries, next, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, fresh, maxEntries)
-		if !errors.Is(err, syscall.ESTALE) {
-			return entries, next, current, eof, directory, err
-		}
-	}
-	return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EAGAIN
+// coherenceReadDirPage uses the store's stable XFS continuation offsets.
+func (h *VolumeHandler) coherenceReadDirPage(handle xfsstore.Capability, cookie uint64, verifier [16]byte, maxEntries int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	return h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
 }

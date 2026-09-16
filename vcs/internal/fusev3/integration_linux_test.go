@@ -790,54 +790,47 @@ func TestPagedReaddirReturnsEveryNameExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestPagedReaddirRefusesToPageAcrossARemoteMutation asserts the verifier
-// contract: an enumeration cursor is invalidated by a concurrent directory
-// mutation and reports ESTALE, rather than silently returning a listing that
-// mixes two different directory states.
-func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
+// TestPagedReaddirContinuesAcrossRemoteMutation preserves every unchanged
+// entry exactly once while the other mount creates and removes transient names.
+func TestPagedReaddirContinuesAcrossRemoteMutation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	directoryA, directoryB := f.join(0, "paged"), f.join(1, "paged")
 	mustMkdir(t, directoryA)
 	for i := range pagedEntryCount {
 		mustWrite(t, filepath.Join(directoryA, pagedEntryName(i)), nil, 0o600)
 	}
-
 	directory, err := os.Open(directoryB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer directory.Close()
-
-	// One kernel READDIR carries at most a page of entries, so consuming a single
-	// entry guarantees the enumeration is started but not finished.
-	if _, err := directory.ReadDir(1); err != nil {
-		t.Fatalf("start the enumeration: %v", err)
-	}
-	mustWrite(t, filepath.Join(directoryA, "inserted-midway"), nil, 0o600)
-
-	var consumed int
-	var readErr error
-	for {
-		batch, err := directory.ReadDir(1)
-		consumed += len(batch)
-		if err != nil {
-			readErr = err
+	seen := make(map[string]int)
+	for page := 0; ; page++ {
+		entries, err := directory.ReadDir(7)
+		for _, entry := range entries {
+			seen[entry.Name()]++
+		}
+		if errors.Is(err, io.EOF) {
 			break
 		}
+		if err != nil {
+			t.Fatalf("continued enumeration: %v", err)
+		}
+		if page > pagedEntryCount {
+			t.Fatal("enumeration did not terminate")
+		}
+		mustWrite(t, filepath.Join(directoryA, fmt.Sprintf("transient-%04d", page)), nil, 0o600)
+		if page > 0 {
+			if err := os.Remove(filepath.Join(directoryA, fmt.Sprintf("transient-%04d", page-1))); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	if errors.Is(readErr, io.EOF) {
-		t.Fatalf("enumeration completed across a concurrent remote create after %d entries; "+
-			"the readdir verifier did not invalidate the cursor", consumed)
-	}
-	requireErrno(t, readErr, syscall.ESTALE, "paging across a concurrent remote directory mutation")
-
-	// The invalidation must be recoverable: a fresh enumeration sees the new set.
-	entries, err := os.ReadDir(directoryB)
-	if err != nil {
-		t.Fatalf("re-enumerate after the invalidation: %v", err)
-	}
-	if len(entries) != pagedEntryCount+1 {
-		t.Fatalf("re-enumeration returned %d entries, want %d", len(entries), pagedEntryCount+1)
+	for i := range pagedEntryCount {
+		name := pagedEntryName(i)
+		if seen[name] != 1 {
+			t.Errorf("unchanged entry %q returned %d times", name, seen[name])
+		}
 	}
 }
 
@@ -848,7 +841,9 @@ func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
 func TestStockWriteRequestSplitting(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	path := f.join(0, "write-size-classes")
-	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR, 0o600)
+	// Synchronous writes expose each kernel split at the authority. Ordinary
+	// v7 positioned writes can coalesce before background application.
+	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR|syscall.O_SYNC, 0o600)
 	defer file.Close()
 
 	countWrite := func(write func() error) int {
@@ -2003,6 +1998,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 func TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	mustWrite(t, f.join(0, "cached"), []byte("payload"), 0o600)
+	waitForDelegationReleases(t, f.mounts[0])
 	requireContent(t, f.join(1, "cached"), []byte("payload"), "establishing the cached binding")
 	// Prove it really is cached: a second resolution must not reach the wire.
 	if reached := f.countRequests("lookup", func() {
@@ -2189,6 +2185,7 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 		payload[i] = byte('a' + i%26)
 	}
 	mustWrite(t, nameA, payload, 0o600)
+	waitForDelegationReleases(t, f.mounts[0])
 
 	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
 	defer reader.Close()
@@ -2218,6 +2215,10 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 	mustWrite(t, nameA, rewritten, 0o600)
 	if got := readExactlyAt(t, reader, 0, size, "re-read after a same-length remote rewrite"); !bytes.Equal(got, rewritten) {
 		t.Fatal("a same-length remote rewrite left this mount serving pre-write pages from its kernel; the DATA repair did not withdraw them")
+	}
+	waitForDelegationReleases(t, f.mounts[0])
+	if got := readExactlyAt(t, reader, 0, size, "repopulate after delegation release"); !bytes.Equal(got, rewritten) {
+		t.Fatal("delegation release restored stale cached pages")
 	}
 
 	// And the cache is repopulated rather than disabled: reuse must survive a

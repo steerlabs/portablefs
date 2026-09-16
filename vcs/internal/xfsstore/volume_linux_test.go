@@ -1994,14 +1994,14 @@ func TestReadDirCanSeekToIssuedCookie(t *testing.T) {
 	}
 	defer v.CloseOpen(handle)
 	first, next, verifier, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, 2)
-	if err != nil || len(first) != 2 || next != 2 {
+	if err != nil || len(first) != 2 || next != first[1].NextCookie {
 		t.Fatalf("first page = %v, %d, %v", first, next, err)
 	}
 	if _, _, _, _, _, err := v.ReadDirOpen(handle, next, verifier, 2); err != nil {
 		t.Fatal(err)
 	}
-	back, next, _, _, _, err := v.ReadDirOpen(handle, 1, verifier, 1)
-	if err != nil || len(back) != 1 || next != 2 || back[0].Name != first[1].Name {
+	back, next, _, _, _, err := v.ReadDirOpen(handle, first[0].NextCookie, verifier, 1)
+	if err != nil || len(back) != 1 || next != first[1].NextCookie || back[0].Name != first[1].Name {
 		t.Fatalf("seeked page = %v, %d, %v", back, next, err)
 	}
 }
