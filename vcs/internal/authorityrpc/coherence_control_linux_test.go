@@ -17,6 +17,37 @@ import (
 
 type coherenceValidatorFunc func(volumeserver.SessionID, [16]byte, uint64) bool
 
+func TestCoherenceChangesSkipInternalEventsWithoutCursorHoles(t *testing.T) {
+	for _, internal := range []volumeserver.StreamEventKind{volumeserver.StreamAdvance, volumeserver.StreamLoss} {
+		for _, trailing := range []bool{false, true} {
+			handler, _ := newCoherenceControlTestHandler(t, 1<<20)
+			change := func(position uint64) volumeserver.StreamEvent {
+				return volumeserver.StreamEvent{Position: position, Kind: volumeserver.StreamChange,
+					Change: volumeserver.ChangeEntry{VolumeVersion: 1, Kind: volumeserver.AttributesChanged, Identity: [16]byte{1}}}
+			}
+			session := &coherenceControlSession{token: volumeserver.SubscriptionToken{Session: volumeserver.SessionID{1}, Incarnation: 1},
+				queued: []volumeserver.StreamEvent{change(1), {Position: 2, Kind: internal}, {Position: 3, Kind: internal}}}
+			want := 1
+			if !trailing {
+				session.queued = append(session.queued, change(4))
+				want++
+			}
+			event, ok, err := handler.nextCoherenceControlEventLocked(session)
+			if err != nil || !ok || len(event.GetChangeBatch().GetEntries()) != want {
+				t.Fatalf("internal=%d trailing=%t: event=%v ok=%t err=%v", internal, trailing, event, ok, err)
+			}
+			for index, entry := range event.GetChangeBatch().GetEntries() {
+				if entry.GetPosition() != uint64(index+1) {
+					t.Fatalf("change position %d = %d", index, entry.GetPosition())
+				}
+			}
+			if len(session.queued) != 0 || session.changeDelivered != uint64(want) {
+				t.Fatalf("queue/cursor = %v/%d", session.queued, session.changeDelivered)
+			}
+		}
+	}
+}
+
 func (f coherenceValidatorFunc) ValidateCoherenceApplication(session volumeserver.SessionID, identity [16]byte, sequence uint64) bool {
 	return f(session, identity, sequence)
 }

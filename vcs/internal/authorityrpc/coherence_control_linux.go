@@ -526,11 +526,15 @@ func (h *VolumeHandler) nextCoherenceControlEventLocked(session *coherenceContro
 				if len(entries) == coherenceControlBatchLimit || len(session.queued) == 0 {
 					break
 				}
-				first = session.queued[0]
-				if first.Kind == volumeserver.StreamAdvance || first.Kind == volumeserver.StreamLoss {
+				// Internal cursor advances have no wire change coordinate. Skip
+				// them before selecting the next change, including at batch end.
+				for len(session.queued) != 0 && (session.queued[0].Kind == volumeserver.StreamAdvance || session.queued[0].Kind == volumeserver.StreamLoss) {
 					session.queued = session.queued[1:]
-					continue
 				}
+				if len(session.queued) == 0 {
+					break
+				}
+				first = session.queued[0]
 				if first.Kind != volumeserver.StreamChange {
 					break
 				}
