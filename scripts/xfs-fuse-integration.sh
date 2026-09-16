@@ -123,6 +123,12 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFilesGatewayCloseDoesNotStallAMutatingMount"
 )
 
+if [[ ${PORTABLEFS_PERFORMANCE_TEST:-} == 1 ]]; then
+  REQUIRED_TESTS+=(
+    "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCoherenceBaseline"
+  )
+fi
+
 # This boundary is root-owned provisioning work and therefore cannot run under
 # the unprivileged authority identity used for the data-plane suite. Keeping an
 # exact required list prevents a renamed or skipped test from masquerading as
@@ -160,6 +166,7 @@ run_host() {
       -e "PORTABLEFS_VOLUME_NAME=${PORTABLEFS_VOLUME_NAME}" \
       -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
       -e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
+      -e "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
       -w /work \
       "${PORTABLEFS_CI_IMAGE}" \
       bash /work/scripts/xfs-fuse-integration.sh --in-container
@@ -262,6 +269,7 @@ suite_command() {
     PORTABLEFS_WORKLOAD_TEST=1 \
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
     "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
+    "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
     go -C /work/vcs test -v -count=1 -failfast -p 1 -timeout 35m \
     "${extra_go_test_flags[@]}" "$@"
 }
