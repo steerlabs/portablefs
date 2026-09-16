@@ -48,7 +48,7 @@ func (s subscriptionStamp) withVersion(version uint64) subscriptionStamp {
 type subscriptionRPC interface {
 	Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, time.Time, error)
 	RenewSubscription(context.Context, uint64) (time.Time, error)
-	NextControlEvent(context.Context, uint64, uint64) (*authoritypb.ControlEvent, error)
+	NextControlEvent(context.Context, uint64, uint64, uint64) (*authoritypb.ControlEvent, error)
 	AcknowledgeChanges(context.Context, uint64, uint64) error
 }
 
@@ -59,7 +59,7 @@ type subscriptionRPC interface {
 type subscriptionControlHandler interface {
 	FenceSubscription(string)
 	SetIncarnation(uint64)
-	HandleControlEvent(context.Context, *authoritypb.ControlEvent)
+	HandleControlEvent(context.Context, *authoritypb.ControlEvent) <-chan struct{}
 }
 
 type subscriptionInvalidator interface {
@@ -603,24 +603,55 @@ func (s *subscriptionRegistry) serveIncarnation(parent context.Context) error {
 }
 
 type subscriptionChangeQueue struct {
-	mu     sync.Mutex
-	wake   chan struct{}
-	closed bool
-	head   int
-	items  []*authoritypb.ChangeBatch
+	mu        sync.Mutex
+	wake      chan struct{}
+	closed    bool
+	head      int
+	items     []subscriptionChangeWork
+	completed uint64
+	finished  map[uint64]struct{}
+}
+
+type subscriptionChangeWork struct {
+	batch    *authoritypb.ChangeBatch
+	sequence uint64
+}
+
+func (q *subscriptionChangeQueue) complete(sequence uint64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if sequence <= q.completed {
+		return
+	}
+	if q.finished == nil {
+		q.finished = make(map[uint64]struct{})
+	}
+	q.finished[sequence] = struct{}{}
+	for {
+		if _, ok := q.finished[q.completed+1]; !ok {
+			break
+		}
+		q.completed++
+		delete(q.finished, q.completed)
+	}
+}
+func (q *subscriptionChangeQueue) completedThrough() uint64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.completed
 }
 
 func newSubscriptionChangeQueue() *subscriptionChangeQueue {
 	return &subscriptionChangeQueue{wake: make(chan struct{}, 1)}
 }
 
-func (q *subscriptionChangeQueue) push(batch *authoritypb.ChangeBatch) error {
+func (q *subscriptionChangeQueue) push(batch *authoritypb.ChangeBatch, sequence uint64) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
 		return context.Canceled
 	}
-	q.items = append(q.items, batch)
+	q.items = append(q.items, subscriptionChangeWork{batch, sequence})
 	select {
 	case q.wake <- struct{}{}:
 	default:
@@ -628,12 +659,12 @@ func (q *subscriptionChangeQueue) push(batch *authoritypb.ChangeBatch) error {
 	return nil
 }
 
-func (q *subscriptionChangeQueue) pop(ctx context.Context) (*authoritypb.ChangeBatch, error) {
+func (q *subscriptionChangeQueue) pop(ctx context.Context) (subscriptionChangeWork, error) {
 	for {
 		q.mu.Lock()
 		if q.head < len(q.items) {
 			batch := q.items[q.head]
-			q.items[q.head] = nil
+			q.items[q.head] = subscriptionChangeWork{}
 			q.head++
 			if q.head == len(q.items) {
 				q.items = q.items[:0]
@@ -648,12 +679,12 @@ func (q *subscriptionChangeQueue) pop(ctx context.Context) (*authoritypb.ChangeB
 		closed := q.closed
 		q.mu.Unlock()
 		if closed {
-			return nil, context.Canceled
+			return subscriptionChangeWork{}, context.Canceled
 		}
 		select {
 		case <-q.wake:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return subscriptionChangeWork{}, ctx.Err()
 		}
 	}
 }
@@ -673,7 +704,7 @@ func (q *subscriptionChangeQueue) close() {
 func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64, changes *subscriptionChangeQueue) error {
 	var after uint64
 	for {
-		event, err := s.rpc.NextControlEvent(ctx, incarnation, after)
+		event, err := s.rpc.NextControlEvent(ctx, incarnation, after, changes.completedThrough())
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -693,13 +724,20 @@ func (s *subscriptionRegistry) pollLoop(ctx context.Context, incarnation uint64,
 			if err := s.registerChangeBatch(incarnation, batch); err != nil {
 				return err
 			}
-			if err := changes.push(batch); err != nil {
+			if err := changes.push(batch, event.GetSequence()); err != nil {
 				return err
 			}
 		} else if s.control == nil {
 			return fmt.Errorf("%w: delegation event has no handler", errSubscriptionInvalid)
 		} else {
-			s.control.HandleControlEvent(ctx, event)
+			done := s.control.HandleControlEvent(ctx, event)
+			go func(sequence uint64) {
+				select {
+				case <-done:
+					changes.complete(sequence)
+				case <-ctx.Done():
+				}
+			}(event.GetSequence())
 		}
 		after = event.GetSequence()
 	}
@@ -826,10 +864,11 @@ func validateChangeEntry(entry *authoritypb.ChangeEntry) ([]publicationCoordinat
 
 func (s *subscriptionRegistry) changeLoop(ctx context.Context, incarnation uint64, changes *subscriptionChangeQueue) error {
 	for {
-		batch, err := changes.pop(ctx)
+		work, err := changes.pop(ctx)
 		if err != nil {
 			return err
 		}
+		batch := work.batch
 		for _, entry := range batch.GetEntries() {
 			if err := s.applyChange(ctx, incarnation, entry); err != nil {
 				return err
@@ -844,6 +883,7 @@ func (s *subscriptionRegistry) changeLoop(ctx context.Context, incarnation uint6
 			s.lastChangeAck = position
 		}
 		s.mu.Unlock()
+		changes.complete(work.sequence)
 	}
 }
 
@@ -1007,10 +1047,6 @@ func (r *rawFileSystem) invalidateCacheCoordinateContext(ctx context.Context, co
 	}
 	switch coordinate.kind {
 	case publicationNamespaceName:
-		notifier := r.mount.notifier()
-		if notifier == nil {
-			return errors.New("fusev3: namespace invalidation has no kernel notification channel")
-		}
 		r.mu.Lock()
 		parent := r.byIdentityLocked(coordinate.parent)
 		if parent == nil {
@@ -1022,12 +1058,12 @@ func (r *rawFileSystem) invalidateCacheCoordinateContext(ctx context.Context, co
 		r.dropCachedNameLocked(key)
 		r.dropCachedNegativeLocked(key)
 		reclaim := r.collectLocked(child)
-		parentNode := parent.id
 		r.mu.Unlock()
 		r.mount.deferReclaim(reclaim)
-		if status := notifier.EntryNotify(parentNode, coordinate.name); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: invalidate name %q under inode %d: %v", coordinate.name, parentNode, status)
-		}
+		// Every Authority-backed kernel name reply has entry_valid=0. Purging daemon bindings
+		// after the exact reply drain fully withdraws namespace permission.
+		// EntryNotify adds no validity proof and can deadlock on a parent lock
+		// held by a mutation callback that has not reached our source gate yet.
 		return nil
 	case publicationItemEnumeration:
 		r.mu.Lock()
@@ -1141,21 +1177,6 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	}
 
 	r.mu.Lock()
-	type nameInvalidation struct {
-		parent uint64
-		name   string
-	}
-	nameInvalidations := make([]nameInvalidation, 0, len(r.cachedStableNames)+len(r.cachedNegatives))
-	for namespace := range r.cachedStableNames {
-		if parent := r.byIdentityLocked(namespace.parent); parent != nil {
-			nameInvalidations = append(nameInvalidations, nameInvalidation{parent: parent.id, name: namespace.name})
-		}
-	}
-	for key := range r.cachedNegatives {
-		if parent := r.nodesByID[key.parent]; parent != nil && !parent.reclaimed {
-			nameInvalidations = append(nameInvalidations, nameInvalidation{parent: parent.id, name: key.name})
-		}
-	}
 	for key := range r.cachedNames {
 		r.dropCachedNameLocked(key)
 	}
@@ -1200,13 +1221,8 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		handle.invalidateEnumeration()
 	}
 	notifier := r.mount.notifier()
-	if notifier == nil && len(nameInvalidations)+len(dataRecords)+len(attrRecords) != 0 {
+	if notifier == nil && len(dataRecords)+len(attrRecords) != 0 {
 		return errors.New("fusev3: cold cache invalidation has no kernel notification channel")
-	}
-	for _, name := range nameInvalidations {
-		if status := notifier.EntryNotify(name.parent, name.name); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: cold invalidate name %q under inode %d: %v", name.name, name.parent, status)
-		}
 	}
 	identities := make([]publicationIdentity, 0, len(dataRecords)+len(attrRecords))
 	for record := range dataRecords {

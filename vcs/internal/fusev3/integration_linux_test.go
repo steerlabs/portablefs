@@ -512,32 +512,35 @@ func TestCrossMountPositiveDentryInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	requireAbsent(t, fileB, "file after a remote unlink")
-	requireAbsent(t, directoryB, "directory after a remote rmdir")
+	if calls := f.countLookupName("victim", func() { requireAbsent(t, fileB, "file after a remote unlink") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
+	if calls := f.countLookupName("victim-dir", func() { requireAbsent(t, directoryB, "directory after a remote rmdir") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 	_, err := os.Open(fileB)
 	requireErrno(t, err, syscall.ENOENT, "open after a remote unlink")
 	requireDirectoryNames(t, f.mountPath(1), nil, "after the remote removals")
 }
 
-// TestCrossMountNegativeDentryInvalidation is the counterpart, and the one this
-// project calls out as a platform hazard: a name that was looked up and found
-// missing must start resolving as soon as the other mount creates it. A cached
-// negative dentry makes the second stat below fail.
-//
-// The repeated probes below are not defensive any more. A strict mount
-// publishes an absence with a real lifetime, so after the first miss the
-// following two are answered by this kernel with no upcall at all, and the only
-// thing that can make the later stat succeed is the creating mount's barrier
-// expiring this entry before its own create(2) returns.
+// TestCrossMountNegativeDentryInvalidation proves cached daemon absences are
+// withdrawn before a peer CREATE returns. Shared kernel names have zero entry
+// validity: every forward lookup re-enters FUSE, but unchanged names can reuse
+// subscription-backed daemon payloads without an Authority request.
 func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	ghostA, ghostB := f.join(0, "ghost"), f.join(1, "ghost")
 	directoryA, directoryB := f.join(0, "ghost-dir"), f.join(1, "ghost-dir")
 
-	// Look the names up repeatedly so any negative caching is well established.
-	for range 3 {
-		requireAbsent(t, ghostB, "before the remote create")
-		requireAbsent(t, directoryB, "before the remote mkdir")
+	requireAbsent(t, ghostB, "before the remote create")
+	requireAbsent(t, directoryB, "before the remote mkdir")
+	if calls := f.countRequests("lookup", func() {
+		for range 2 {
+			requireAbsent(t, ghostB, "repeated absent file")
+			requireAbsent(t, directoryB, "repeated absent directory")
+		}
+	}); calls != 0 {
+		t.Fatalf("unchanged negative names required %d Authority lookups", calls)
 	}
 
 	mustWrite(t, ghostA, []byte("materialised"), 0o600)
@@ -545,7 +548,9 @@ func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	requireContent(t, ghostB, []byte("materialised"), "after the remote create")
+	if calls := f.countLookupName("ghost", func() { requireContent(t, ghostB, []byte("materialised"), "after the remote create") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 	info, err := os.Stat(directoryB)
 	if err != nil || !info.IsDir() {
 		t.Fatalf("stat after the remote mkdir = %v, %v", info, err)
@@ -556,16 +561,22 @@ func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 	if err := os.Remove(ghostA); err != nil {
 		t.Fatal(err)
 	}
-	requireAbsent(t, ghostB, "after the second remote unlink")
+	if calls := f.countLookupName("ghost", func() { requireAbsent(t, ghostB, "after the second remote unlink") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 	mustWrite(t, ghostA, []byte("again"), 0o600)
-	requireContent(t, ghostB, []byte("again"), "after the second remote create")
+	if calls := f.countLookupName("ghost", func() { requireContent(t, ghostB, []byte("again"), "after the second remote create") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 
 	// A name inside a remotely created directory must resolve without the
 	// observing mount having ever listed that directory.
 	nestedA, nestedB := filepath.Join(directoryA, "nested"), filepath.Join(directoryB, "nested")
 	requireAbsent(t, nestedB, "before the nested remote create")
 	mustWrite(t, nestedA, []byte("deep"), 0o600)
-	requireContent(t, nestedB, []byte("deep"), "after the nested remote create")
+	if calls := f.countLookupName("nested", func() { requireContent(t, nestedB, []byte("deep"), "after the nested remote create") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 }
 
 // TestCrossMountRenameCoherence asserts both halves of a remote rename: the old
@@ -1557,6 +1568,7 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 	for i := range files {
 		mustWrite(t, filepath.Join(directory, fmt.Sprintf("file-%03d", i)), []byte("x"), 0o600)
 	}
+	f.waitForDelegationReleases(t)
 	observed := filepath.Join(f.mountPath(1), "tree")
 	walk := func() {
 		for i := range files {
@@ -1607,6 +1619,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		open, tmpfile, fallocate, copyFileRange, removeXattr                                 int
 	}
 	measure := func(operation string, fn func()) counts {
+		loss := f.mounts[0].delegations.LossSequence()
 		before := counts{
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
 			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
@@ -1618,6 +1631,12 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			removeXattr: f.counter.count("remove-xattr"),
 		}
 		fn()
+		// v7 can answer the stat from the accepted overlay before application.
+		// Measure the authority operations after a durable cut while retaining
+		// the zero-follow-up-GETATTR assertion for the operation and its stat.
+		if err := f.mounts[0].delegations.Barrier(t.Context(), loss); err != nil {
+			t.Fatalf("%s durability barrier: %v", operation, err)
+		}
 		after := counts{
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
 			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
@@ -1646,8 +1665,15 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	}
 	requireCounts := func(operation string, got, want counts) {
 		t.Helper()
+		// The kernel may reuse a negative dentry instead of repeating LOOKUP.
+		// Fewer lookups strengthen the bound; every other operation stays exact.
+		lookup := got.lookup
+		if lookup <= want.lookup {
+			got.lookup = want.lookup
+		}
 		if got != want {
-			t.Fatalf("%s RPCs = %+v, want %+v", operation, got, want)
+			got.lookup = lookup
+			t.Fatalf("%s RPCs = %+v, want at most lookup=%d and other counts %+v", operation, got, want.lookup, want)
 		}
 	}
 
@@ -1694,6 +1720,10 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	if err := created.Close(); err != nil {
 		t.Fatalf("close created file: %v", err)
 	}
+	f.waitForDelegationReleases(t)
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("warm metadata after delegation release: %v", err)
+	}
 
 	setattrRPCs := measure("setattr plus warm stat", func() {
 		if err := os.Chmod(createdPath, 0o640); err != nil {
@@ -1738,6 +1768,11 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	requireCounts("fallocate plus warm fstat", fallocateRPCs, counts{fallocate: 1})
 	if err := fallocateFile.Close(); err != nil {
 		t.Fatalf("close fallocate target: %v", err)
+	}
+
+	f.waitForDelegationReleases(t)
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("warm metadata after fallocate delegation release: %v", err)
 	}
 
 	const removableXattr = "user.portablefs-post-state-remove"
@@ -1849,6 +1884,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	copySourcePath, copyDestinationPath := filepath.Join(root, "post-state-copy-source"), filepath.Join(root, "post-state-copy-destination")
 	mustWrite(t, copySourcePath, []byte("copy"), 0o600)
 	mustWrite(t, copyDestinationPath, nil, 0o600)
+	f.waitForDelegationReleases(t)
 	copySource, err := os.Open(copySourcePath)
 	if err != nil {
 		t.Fatalf("open copy source: %v", err)
@@ -1951,6 +1987,11 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	})
 	defer f.transports[0].setAfterMutation(nil)
 	var existingOpenErr error
+	existingStart := time.Now()
+	existingIncarnations := make([]uint64, len(f.mounts))
+	for i, mount := range f.mounts {
+		existingIncarnations[i], _, _, _ = mount.subscription.currentIncarnation()
+	}
 	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
 		file, openErr := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if openErr != nil {
@@ -1979,6 +2020,14 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	if injectionErr != nil {
 		t.Fatalf("materialize existing-create race through the peer mount: %v", injectionErr)
 	}
+	if elapsed := time.Since(existingStart); elapsed > 2*time.Second {
+		t.Fatalf("same-name CREATE waited %v for subscription expiry", elapsed)
+	}
+	for i, mount := range f.mounts {
+		if incarnation, _, _, active := mount.subscription.currentIncarnation(); incarnation != existingIncarnations[i] || !active {
+			t.Fatal("same-name CREATE expired a subscription")
+		}
+	}
 	var rpcResults []existingCreateResult
 	for len(results) != 0 {
 		rpcResults = append(rpcResults, <-results)
@@ -2005,6 +2054,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 
 	unlinkedPath := filepath.Join(root, "post-state-unlinked")
 	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
+	f.waitForDelegationReleases(t)
 	if _, err := os.Lstat(unlinkedPath); err != nil {
 		t.Fatalf("warm unlink source: %v", err)
 	}
@@ -2026,6 +2076,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	mustMkdir(t, newParent)
 	source, destination := filepath.Join(oldParent, "source"), filepath.Join(newParent, "destination")
 	mustWrite(t, source, []byte("rename"), 0o600)
+	f.waitForDelegationReleases(t)
 	for _, path := range []string{oldParent, newParent, source} {
 		if _, err := os.Lstat(path); err != nil {
 			t.Fatalf("warm rename path %s: %v", path, err)
@@ -2044,9 +2095,9 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			}
 		}
 	})
-	// The warmed source name resolves inside the daemon under its N lease, so
-	// only the destination's absence -- which carries no cacheable fact -- costs
-	// the kernel's pre-rename LOOKUP a round trip.
+	// F4 reuses the known source identity and resolves the destination once.
+	// Exact rename post-state supplies fresh name and attribute payloads, so
+	// all follow-up stats complete without Authority metadata requests.
 	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
 }
 
@@ -2058,7 +2109,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 func TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	mustWrite(t, f.join(0, "cached"), []byte("payload"), 0o600)
-	waitForDelegationReleases(t, f.mounts[0])
+	f.waitForDelegationReleases(t)
 	requireContent(t, f.join(1, "cached"), []byte("payload"), "establishing the cached binding")
 	// Prove it really is cached: a second resolution must not reach the wire.
 	if reached := f.countRequests("lookup", func() {
@@ -2245,7 +2296,7 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 		payload[i] = byte('a' + i%26)
 	}
 	mustWrite(t, nameA, payload, 0o600)
-	waitForDelegationReleases(t, f.mounts[0])
+	f.waitForDelegationReleases(t)
 
 	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
 	defer reader.Close()
@@ -2276,7 +2327,7 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 	if got := readExactlyAt(t, reader, 0, size, "re-read after a same-length remote rewrite"); !bytes.Equal(got, rewritten) {
 		t.Fatal("a same-length remote rewrite left this mount serving pre-write pages from its kernel; the DATA repair did not withdraw them")
 	}
-	waitForDelegationReleases(t, f.mounts[0])
+	f.waitForDelegationReleases(t)
 	if got := readExactlyAt(t, reader, 0, size, "repopulate after delegation release"); !bytes.Equal(got, rewritten) {
 		t.Fatal("delegation release restored stale cached pages")
 	}

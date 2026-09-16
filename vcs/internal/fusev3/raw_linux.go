@@ -1342,7 +1342,7 @@ func (r *rawFileSystem) settleNamePublicationLocked(publication replyNamePublica
 			if publication.negativeState == nil || !publication.negativeState.superseded {
 				r.bindCachedNegativeLocked(publication.key, publication.stamp)
 			}
-		} else {
+		} else if publication.record != nil && !publication.record.reclaimed {
 			r.bindCachedNameLocked(publication.key, publication.stable, publication.record, publication.stamp)
 		}
 	}
@@ -2147,6 +2147,34 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 	p.servedVersion = min(stamp.version, payload.stamp.version)
 	p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
 	return record, attr, false
+}
+
+// publishRenameBindings admits fresh coordinate stamps from authoritative
+// post-state. A pre-rename stamp never follows the kernel's d_move. Candidates
+// settle only at the mutation reply's physical publication boundary.
+func (r *rawFileSystem) publishRenameBindings(ctx context.Context) {
+	lease, publication := sourceLeaseFromContext(ctx), replyPublicationFromContext(ctx)
+	if lease == nil || publication == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for namespace, identity := range lease.renameBindings {
+		parent := r.byIdentityLocked(namespace.parent)
+		if parent == nil || parent.reclaimed {
+			continue
+		}
+		var candidate replyNamePublication
+		var admitted bool
+		if identity == (publicationIdentity{}) {
+			_, candidate, admitted = r.admitNegativeNameLocked(ctx, parent, namespace.name)
+		} else if record := r.byIdentityLocked(identity); record != nil && !record.reclaimed {
+			_, candidate, admitted = r.admitNameLocked(ctx, parent, namespace.name, record)
+		}
+		if admitted {
+			publication.names = append(publication.names, candidate)
+		}
+	}
 }
 
 // publishPostStateAttrs records the exact applied attributes of every object a
@@ -3035,6 +3063,7 @@ func (r *rawFileSystem) Rename(_ <-chan struct{}, input *fuse.RenameIn, oldName,
 		if exchange || !oldRemains {
 			r.moveSelf(oldParent, oldName, newParent, newName, exchange)
 		}
+		r.publishRenameBindings(ctx)
 		if err := completeSourcePublication(ctx); err != nil {
 			r.mount.revoke(err)
 			return fuse.Status(syscall.ENOTCONN)
@@ -3329,7 +3358,7 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 		if entry == nil || !out.AddDirEntry(*entry) {
 			return fuse.OK
 		}
-		handle.consume()
+		handle.consume(entry)
 	}
 }
 

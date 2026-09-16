@@ -4,7 +4,6 @@ package authorityrpc
 
 import (
 	"context"
-	"math"
 	"sort"
 	"sync"
 	"syscall"
@@ -13,13 +12,10 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
-type coherenceApplication struct {
-	volumeVersion uint64
-	identity      [16]byte
-}
-
 type coherenceSessionApplications struct {
-	applications []coherenceApplication
+	applied, durable uint64
+	lastVersion      uint64
+	applications     []uint64 // volume versions above the durable ticket prefix
 }
 
 // coherenceDurability maps the session application-ticket domain exposed
@@ -49,17 +45,16 @@ func (s *coherenceDurability) recordApplied(session volumeserver.SessionID, iden
 		state = &coherenceSessionApplications{}
 		s.sessions[session] = state
 	}
-	if len(state.applications) == math.MaxInt {
+	if state.applied == ^uint64(0) {
 		panic("authorityrpc: coherence application ticket exhausted")
 	}
-	if count := len(state.applications); count != 0 && state.applications[count-1].volumeVersion >= volumeVersion {
+	if state.lastVersion >= volumeVersion {
 		panic("authorityrpc: coherence application volume version did not advance")
 	}
-	state.applications = append(state.applications, coherenceApplication{
-		volumeVersion: volumeVersion,
-		identity:      identity,
-	})
-	return uint64(len(state.applications))
+	state.applied++
+	state.lastVersion = volumeVersion
+	state.applications = append(state.applications, volumeVersion)
+	return state.applied
 }
 
 // latest converts one proven durable volume cut to the session's largest
@@ -72,35 +67,39 @@ func (s *coherenceDurability) latest(session volumeserver.SessionID, durableVolu
 	if state == nil {
 		return 0, 0
 	}
-	applied = uint64(len(state.applications))
-	durable = uint64(sort.Search(len(state.applications), func(index int) bool {
-		return state.applications[index].volumeVersion > durableVolumeVersion
+	applied = state.applied
+	durable = state.durable + uint64(sort.Search(len(state.applications), func(index int) bool {
+		return state.applications[index] > durableVolumeVersion
 	}))
 	return applied, durable
 }
 
-func (s *coherenceDurability) validate(session volumeserver.SessionID, identity [16]byte, sequence uint64) bool {
-	if sequence == 0 {
-		return true
+// retire drops proof records covered by the durable volume cut for every
+// session, including idle readers whose last writes another session synced.
+func (s *coherenceDurability) retire(volumeCut uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, state := range s.sessions {
+		n := sort.Search(len(state.applications), func(i int) bool { return state.applications[i] > volumeCut })
+		if n == 0 {
+			continue
+		}
+		state.durable += uint64(n)
+		tail := state.applications[n:]
+		if len(tail) == 0 {
+			state.applications = nil
+		} else if len(tail)*2 < cap(state.applications) {
+			state.applications = append([]uint64(nil), tail...)
+		} else {
+			state.applications = tail
+		}
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	state := s.sessions[session]
-	return state != nil && sequence <= uint64(len(state.applications)) &&
-		state.applications[sequence-1].identity == identity
 }
 
 func (s *coherenceDurability) forget(session volumeserver.SessionID) {
 	s.mu.Lock()
 	delete(s.sessions, session)
 	s.mu.Unlock()
-}
-
-// ValidateCoherenceApplication checks that a holder's cut acknowledgment names
-// a ticket issued for the same authenticated session and identity. Zero is the
-// valid empty cut used when the holder never applied a mutation for the file.
-func (h *VolumeHandler) ValidateCoherenceApplication(session volumeserver.SessionID, identity [16]byte, sequence uint64) bool {
-	return h.coherenceDurability.validate(session, identity, sequence)
 }
 
 func (h *VolumeHandler) forgetCoherenceApplications(session volumeserver.SessionID) {
@@ -129,6 +128,7 @@ func (h *VolumeHandler) coherenceSyncVolume(session volumeserver.SessionID) (app
 		return 0, 0, err
 	}
 	h.Coherence.DurableSequence(cut)
+	h.coherenceDurability.retire(cut)
 	applied, durable = h.latestCoherenceDurability(session)
 	return applied, durable, nil
 }

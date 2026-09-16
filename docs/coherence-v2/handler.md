@@ -185,17 +185,21 @@ F2 has not landed in this worktree. Full kernel-FUSE and coherence-matrix result
 are not evidence supplied by F1; historical frontend lease calls now fail as
 required. No files in `fusev3`, `portablefsd`, or `mountv3` change here.
 
-The current xfsstore directory iterator uses ordinal cookies and a ctime verifier.
-The v7 handler restarts/rescans after a changed verifier rather than returning a
-normal-concurrency ESTALE. This does not prove stable XFS-offset enumeration under
-concurrent namespace mutation; that store/frontend work remains separate.
+Integration replaces ordinal cookies with XFS getdents offsets. Continuation seeks to
+the store cookie without rejecting a changed verifier. The concurrent peer
+creator/deleter regression requires every unchanged entry exactly once and refuses
+ESTALE.
 
-Per-session application records and completed control replay records persist
-until permanent session retirement. Their memory cost grows with a long-lived
-session's issued tickets/events; this implementation does not claim a bounded
-retention policy. Detached visibility waits also remain outstanding until peer
-acknowledgment or horizon expiry. These costs need workload measurement alongside
-F2 before production qualification.
+Application-ticket history is retired through each session's durable prefix, retaining
+only monotonic counters and undurable volume versions. Active delegation cuts validate
+their exact ticket floor and newly issued tickets independently. CONTROL ACK replay is
+surrendered by the explicit completed-event prefix, not the delivery cursor; release
+replay uses serialized contiguous operation/result receipts and retains one result.
+Coordinator deadlines still govern unfinished cuts whose adapter replay was surrendered.
+Long-lived session tests cover 100,000 application tickets and 10,000 delegation/control
+cycles.
+
+Detached visibility waits remain outstanding until peer acknowledgment or horizon expiry and require workload measurement.
 
 FSKit still retains its existing storage admission across PREPARE repair waits.
 F1 releases it after OnCommit and before COMPLETE or subscription withdrawal.

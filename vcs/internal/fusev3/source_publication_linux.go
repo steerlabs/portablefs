@@ -72,6 +72,7 @@ type sourcePublicationLease struct {
 	coordinates          map[publicationCoordinate]struct{}
 	names                map[publicationNamespace]namespaceBounds
 	preBindings          map[publicationNamespace]publicationIdentity
+	renameBindings       map[publicationNamespace]publicationIdentity
 	unresolvedAttributes int
 	unresolvedData       int
 	assigned             bool
@@ -679,9 +680,22 @@ func (l *sourcePublicationLease) attachRename(ctx context.Context, oldName, newN
 		if *oldPost == (publicationIdentity{}) {
 			return errors.New("fusev3: successful rename returned a zero retained-source identity")
 		}
-		return l.attachBinding(ctx, oldName, *oldPost)
+		if err := l.attachBinding(ctx, oldName, *oldPost); err != nil {
+			return err
+		}
+	} else {
+		l.resolveNoBinding(oldName)
 	}
-	l.resolveNoBinding(oldName)
+	bindings := map[publicationNamespace]publicationIdentity{newName: newPost}
+	if oldName != newName {
+		bindings[oldName] = publicationIdentity{}
+		if oldPost != nil {
+			bindings[oldName] = *oldPost
+		}
+	}
+	l.r.mu.Lock()
+	l.renameBindings = bindings
+	l.r.mu.Unlock()
 	return nil
 }
 

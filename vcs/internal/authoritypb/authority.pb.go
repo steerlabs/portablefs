@@ -10095,11 +10095,12 @@ func (x *RenewSubscriptionReply) GetHorizonNanos() uint64 {
 // One outstanding poll per subscription. Delivery is not acknowledgment; the
 // next poll may run before any event's withdrawal or flush completes.
 type NextControlEventRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Incarnation   uint64                 `protobuf:"varint,1,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
-	AfterSequence uint64                 `protobuf:"varint,2,opt,name=after_sequence,json=afterSequence,proto3" json:"after_sequence,omitempty"` // last received ControlEvent.sequence; initially zero
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	Incarnation           uint64                 `protobuf:"varint,1,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
+	AfterSequence         uint64                 `protobuf:"varint,2,opt,name=after_sequence,json=afterSequence,proto3" json:"after_sequence,omitempty"`                           // last received ControlEvent.sequence; initially zero
+	CompletedEventThrough uint64                 `protobuf:"varint,3,opt,name=completed_event_through,json=completedEventThrough,proto3" json:"completed_event_through,omitempty"` // explicit surrender of further event ACK retries through this position; not a cut ACK
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *NextControlEventRequest) Reset() {
@@ -10142,6 +10143,13 @@ func (x *NextControlEventRequest) GetIncarnation() uint64 {
 func (x *NextControlEventRequest) GetAfterSequence() uint64 {
 	if x != nil {
 		return x.AfterSequence
+	}
+	return 0
+}
+
+func (x *NextControlEventRequest) GetCompletedEventThrough() uint64 {
+	if x != nil {
+		return x.CompletedEventThrough
 	}
 	return 0
 }
@@ -11225,11 +11233,13 @@ func (x *DelegationRelease) GetAppliedSequence() uint64 {
 }
 
 type DelegationReleaseRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Incarnation   uint64                 `protobuf:"varint,1,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
-	Delegations   []*DelegationRelease   `protobuf:"bytes,2,rep,name=delegations,proto3" json:"delegations,omitempty"` // unique, sorted by id
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	Incarnation             uint64                 `protobuf:"varint,1,opt,name=incarnation,proto3" json:"incarnation,omitempty"`
+	Delegations             []*DelegationRelease   `protobuf:"bytes,2,rep,name=delegations,proto3" json:"delegations,omitempty"`                                                           // unique, sorted by id
+	ReleaseSequence         uint64                 `protobuf:"varint,3,opt,name=release_sequence,json=releaseSequence,proto3" json:"release_sequence,omitempty"`                           // contiguous logical release operation, starts at 1
+	CompletedReleaseThrough uint64                 `protobuf:"varint,4,opt,name=completed_release_through,json=completedReleaseThrough,proto3" json:"completed_release_through,omitempty"` // received results, never retried after this receipt
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *DelegationReleaseRequest) Reset() {
@@ -11274,6 +11284,20 @@ func (x *DelegationReleaseRequest) GetDelegations() []*DelegationRelease {
 		return x.Delegations
 	}
 	return nil
+}
+
+func (x *DelegationReleaseRequest) GetReleaseSequence() uint64 {
+	if x != nil {
+		return x.ReleaseSequence
+	}
+	return 0
+}
+
+func (x *DelegationReleaseRequest) GetCompletedReleaseThrough() uint64 {
+	if x != nil {
+		return x.CompletedReleaseThrough
+	}
+	return 0
 }
 
 type DelegationReleaseReply struct {
@@ -12123,10 +12147,11 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\vincarnation\x18\x01 \x01(\x04R\vincarnation\"_\n" +
 	"\x16RenewSubscriptionReply\x12 \n" +
 	"\vincarnation\x18\x01 \x01(\x04R\vincarnation\x12#\n" +
-	"\rhorizon_nanos\x18\x02 \x01(\x04R\fhorizonNanos\"b\n" +
+	"\rhorizon_nanos\x18\x02 \x01(\x04R\fhorizonNanos\"\x9a\x01\n" +
 	"\x17NextControlEventRequest\x12 \n" +
 	"\vincarnation\x18\x01 \x01(\x04R\vincarnation\x12%\n" +
-	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\"\xb8\x03\n" +
+	"\x0eafter_sequence\x18\x02 \x01(\x04R\rafterSequence\x126\n" +
+	"\x17completed_event_through\x18\x03 \x01(\x04R\x15completedEventThrough\"\xb8\x03\n" +
 	"\fControlEvent\x12 \n" +
 	"\vincarnation\x18\x01 \x01(\x04R\vincarnation\x12\x1a\n" +
 	"\bsequence\x18\x02 \x01(\x04R\bsequence\x12I\n" +
@@ -12213,10 +12238,12 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\n" +
 	"delegation\x18\x01 \x01(\v2&.portablefs.authority.v1.DelegationRefR\n" +
 	"delegation\x12)\n" +
-	"\x10applied_sequence\x18\x02 \x01(\x04R\x0fappliedSequence\"\x8a\x01\n" +
+	"\x10applied_sequence\x18\x02 \x01(\x04R\x0fappliedSequence\"\xf1\x01\n" +
 	"\x18DelegationReleaseRequest\x12 \n" +
 	"\vincarnation\x18\x01 \x01(\x04R\vincarnation\x12L\n" +
-	"\vdelegations\x18\x02 \x03(\v2*.portablefs.authority.v1.DelegationReleaseR\vdelegations\"\x18\n" +
+	"\vdelegations\x18\x02 \x03(\v2*.portablefs.authority.v1.DelegationReleaseR\vdelegations\x12)\n" +
+	"\x10release_sequence\x18\x03 \x01(\x04R\x0freleaseSequence\x12:\n" +
+	"\x19completed_release_through\x18\x04 \x01(\x04R\x17completedReleaseThrough\"\x18\n" +
 	"\x16DelegationReleaseReply\"3\n" +
 	"\x0eBarrierRequest\x12!\n" +
 	"\fcut_sequence\x18\x01 \x01(\x04R\vcutSequence\"d\n" +

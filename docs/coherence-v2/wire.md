@@ -26,7 +26,7 @@ identifier `requiredAttachFeatures`.
 | Hello, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Hello, FSKit additions | `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1` |
 | Activate, every profile | `no-history`, `no-branches`, `user-xattr-readonly`, `single-principal`, `stable-item-identity`, `volume-syncfs-barrier`, `exact-resource-acquisition` |
-| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1` |
+| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1`, `bounded-control-replay-v1` |
 | Activate, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Activate, FSKit additions | `write-through`, `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1`, `peer-complete-fifo-feedback` |
 
@@ -124,7 +124,7 @@ reject an equal-version reply that predates delegation withdrawal.
 | `SubscribeReply`; response 57 | `watermark` (1): atomic snapshot volume version. `delegated_identities` (2): sorted unique identities excluded by a reservation or live delegation at that snapshot, in bytewise order across pages. `incarnation` (3): new nonzero incarnation. `horizon_nanos` (4): conservative validity duration, at most 10,000,000,000 ns, anchored at the initial request's monotonic start. `snapshot_id` (5): token binding every page to this snapshot/session/incarnation. `next_after_identity` (6): final identity on a nonfinal page; empty marks completion. |
 | `RenewSubscriptionRequest`; request 66 | `incarnation` (1): exact current subscription. |
 | `RenewSubscriptionReply`; response 58 | `incarnation` (1): exact echo. `horizon_nanos` (2): conservative duration, at most 10 seconds, anchored at renewal request start. |
-| `NextControlEventRequest`; request 67 | `incarnation` (1): exact subscription. `after_sequence` (2): last received CONTROL event sequence, initially zero. Long-polls for its successor. |
+| `NextControlEventRequest`; request 67 | `incarnation` (1): exact subscription. `after_sequence` (2): last received CONTROL event sequence, initially zero. `completed_event_through` (3): contiguous prefix whose ACK retries are surrendered. Long-polls for the delivered cursor's successor. |
 | `ControlEvent`; response 59 | `incarnation` (1), `sequence` (2), and exactly one of `change_batch` (3), `delegation_recall` (4), `delegation_break` (5), `delegation_mode_change` (6). The outer request id matches the poll; events are never unsolicited response frames. |
 | `ChangeBatch`; ControlEvent 3 | `incarnation` (1): equals the event envelope. `entries` (2): nonempty ordered list of `ChangeEntry`, contiguous with the preceding batch. |
 | `ChangeAck`; request 68 | `position` (1): greatest fully withdrawn change prefix; zero acknowledges nothing. `incarnation` (2): exact current subscription. |
@@ -153,14 +153,32 @@ all ordinary requests at expiry; only cold subscription and required transport/
 session recovery plumbing may establish a usable incarnation again. Renewal
 cannot revive an expired incarnation.
 
-Only one poll may be outstanding per incarnation. Retrying the same poll
-cursor returns the same event until a subsequent cursor proves receipt.
-Receipt is independent of ChangeAck and delegation acknowledgments. Retain
-outstanding obligations until ack or horizon/budget expiry. A poll can deliver
-a recall while an earlier ChangeBatch is still being withdrawn; this separation
-prevents an ack/flush dependency from stopping delivery of the event that can
-resolve it. C and F must reserve independent CONTROL execution capacity for
-renewal and acknowledgments while the poll is parked.
+Only one poll may be outstanding per incarnation. Retrying the same poll cursor returns
+the same event until a subsequent cursor proves receipt. Receipt is independent of
+ChangeAck and delegation acknowledgments. Retain adapter ACK replay records until
+`completed_event_through` explicitly surrenders retries. This receipt is distinct from
+delivery and is not a cut acknowledgment: failed handlers may surrender replay while
+coordinator deadlines still govern their unfinished cuts. The client advances the
+receipt only across a contiguous prefix of finished handlers. Completed records at or
+below the receipt are deleted; current grant tracking is deleted at recall or release. A
+poll can deliver a recall while an earlier ChangeBatch is still being withdrawn; this
+separation prevents an ack/flush dependency from stopping delivery of the event that can
+resolve it. C and F must reserve independent CONTROL execution capacity for renewal and
+acknowledgments while the poll is parked.
+
+Release operations share one serialized acknowledgment lane, held across reconnect and
+exact retry. A new release carries sequence H+1 and completion H, where H is the last
+accepted sequence. The Authority retains only the latest exact request fingerprint and
+result, including definite errors. An exact retry repeats both coordinates. A malformed
+or uncertain final response ends the client session before another release can surrender
+that result. Invalid local request shapes consume no sequence. Linux attach requires
+`bounded-control-replay-v1` so clients cannot silently omit these coordinates.
+
+Application tickets retain monotonic applied/durable counters and only the
+volume-version suffix above the session's durable prefix. Volume sync retires covered
+records for every session, including idle sessions. Exact delegation ACK validation uses
+the active cut's floor and tickets issued while that cut is pending, independent of
+retired durability history.
 
 ## Change entries and withdrawal
 
@@ -185,14 +203,18 @@ coordinates must be empty, and `byte_range` is legal only for DATA_CHANGED.
 Namespace operations emit all affected bindings/directories and object changes;
 a rename may therefore produce several entries at the same volume version.
 
-ChangeAck(N, I) means **every change through position N in incarnation I has
-finished local withdrawal**. Reverse notify has returned for all affected
-kernel state, and pending cache-installing replies on those coordinates have
-drained or been discarded. A client can process disjoint entries concurrently,
-but cannot acknowledge past a hole. An identical or older ack is an idempotent
-no-op within that incarnation; a future/undelivered position is invalid. An old
-incarnation is refused, never translated to a current cursor. Transient notify
-failure gets a bounded retry, not a premature ack.
+ChangeAck(N, I) means **every change through position N in incarnation I has finished
+local withdrawal**. Inode notification has returned for affected kernel data and
+attributes, and pending cache-installing replies on those coordinates have drained or
+been discarded. Authority-backed shared names always have zero kernel entry validity.
+Their withdrawal closes the coordinate, revokes or drains old replies, and purges daemon
+positive/negative bindings and stamps; no entry notification is required. The next
+forward lookup must re-enter FUSE. Retained kernel dentry objects used by reverse
+`d_path` remain outside the contract; machine-local graft names are separate. A client
+can process disjoint entries concurrently, but cannot acknowledge past a hole. An
+identical or older ack is an idempotent no-op within that incarnation; a
+future/undelivered position is invalid. An old incarnation is refused, never translated
+to a current cursor. Transient notify failure gets a bounded retry, not a premature ack.
 
 An operation/grant awaiting withdrawal from a subscriber waits for that
 subscriber's ack through the relevant position or its horizon. Change entries
@@ -283,7 +305,7 @@ an authority timeout. The generation check remains decisive after a timeout.
 | `DelegationBreakAckReply`; response 62 | Empty success receipt. |
 | `DelegationModeChangeAckReply`; response 63 | Empty success receipt. |
 | `DelegationRelease` | `delegation` (1), `applied_sequence` (2), naming the last flushed identity cut. |
-| `DelegationReleaseRequest`; request 73 | `incarnation` (1), nonempty `delegations` (2), sorted by id, each id exactly once, at most 4,096 entries. |
+| `DelegationReleaseRequest`; request 73 | `incarnation` (1), nonempty `delegations` (2), sorted by id, each id exactly once, at most 4,096 entries. `release_sequence` (3): contiguous logical operation starting at 1. `completed_release_through` (4): prior result received and no longer retried. |
 | `DelegationReleaseReply`; response 65 | Empty all-or-error success receipt; validate the whole batch before releasing any grant. |
 
 Recall is the two-phase ownership transition: authority withdrawal request,

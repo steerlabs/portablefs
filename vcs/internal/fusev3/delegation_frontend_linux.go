@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"syscall"
@@ -42,7 +43,7 @@ func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.De
 		if err := manager.Install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant); err != nil && !errors.Is(err, errDelegationRetired) {
 			return err
 		}
-	} else if manager.Owns(n.item.GetStableIdentity()) {
+	} else {
 		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, handle.openFlags&syscall.O_ACCMODE != syscall.O_RDONLY); err != nil {
 			return err
 		}
@@ -187,15 +188,16 @@ func (n *node) invalidateOwnData(ctx context.Context, offset, length int64) erro
 // dependency check simply because its daemon name payload was evicted.
 func (m *Mount) flushNamespaceDependencies(ctx context.Context, request *authoritypb.Request, lease *sourcePublicationLease) error {
 	type named struct {
-		parent []byte
-		name   []byte
+		parent   []byte
+		name     []byte
+		identity publicationIdentity
 	}
 	var names []named
 	switch body := request.GetBody().(type) {
 	case *authoritypb.Request_Unlink:
-		names = append(names, named{body.Unlink.Parent, body.Unlink.Name})
+		names = append(names, named{body.Unlink.Parent, body.Unlink.Name, publicationIdentity{}})
 	case *authoritypb.Request_Rename:
-		names = append(names, named{body.Rename.OldParent, body.Rename.OldName}, named{body.Rename.NewParent, body.Rename.NewName})
+		names = append(names, named{body.Rename.OldParent, body.Rename.OldName, publicationIdentity{}}, named{body.Rename.NewParent, body.Rename.NewName, publicationIdentity{}})
 	case *authoritypb.Request_Link:
 		for coordinate := range lease.coordinates {
 			if coordinate.kind == publicationItemAttributes {
@@ -218,6 +220,24 @@ func (m *Mount) flushNamespaceDependencies(ctx context.Context, request *authori
 		return nil
 	}
 	for _, name := range names {
+		m.raw.mu.Lock()
+		for namespace := range lease.names {
+			if namespace.name != string(name.name) {
+				continue
+			}
+			parent := m.raw.byIdentityLocked(namespace.parent)
+			if parent != nil && bytes.Equal(parent.node.item.GetToken(), name.parent) {
+				name.identity = lease.preBindings[namespace]
+				break
+			}
+		}
+		m.raw.mu.Unlock()
+		if name.identity != (publicationIdentity{}) {
+			if _, err := m.delegations.FlushIdentity(ctx, name.identity[:]); err != nil {
+				return err
+			}
+			continue
+		}
 		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: cloneBytes(name.parent), Name: cloneBytes(name.name)}}})
 		if err != nil {
 			return err

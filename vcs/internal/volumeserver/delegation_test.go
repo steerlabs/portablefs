@@ -1062,3 +1062,45 @@ func TestCoherencePromotedPrivateGrantDrainsPendingReaders(t *testing.T) {
 		})
 	}
 }
+
+func TestCoherenceCutValidatesExactTicketsWithoutHistoricalLedger(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	identity, other := [16]byte{71}, [16]byte{72}
+	grant := cv2Grant(t, c, holder, identity)
+	otherGrant := cv2Grant(t, c, holder, other)
+	apply := func(g Delegation, ticket uint64) {
+		pin, err := c.BeginFlush(holder, g.Identity, g.ID, g.Generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pin.End(ticket)
+	}
+	apply(grant, 1)
+	cv2AckAll(t, c, holder)
+	done := make(chan error, 1)
+	go func() { done <- c.BreakForRead(t.Context(), identity) }()
+	event := cv2Event(t, c, holder, StreamBreakForRead)
+	apply(grant, 3)
+	apply(otherGrant, 4)
+	apply(grant, 5)
+	if err := c.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, 4); !errors.Is(err, ErrDelegationAck) {
+		t.Fatalf("foreign identity ticket=%v", err)
+	}
+	// A later same-file application does not invalidate the reader's earlier cut.
+	cv2CutAck(t, c, holder, event, 3)
+	if err := cv2Result(t, done); err != nil {
+		t.Fatal(err)
+	}
+	cv2AckAll(t, c, holder)
+	go func() { done <- c.Recall(t.Context(), identity) }()
+	event = cv2Event(t, c, holder, StreamRecall)
+	apply(grant, 7)
+	if err := c.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, 5); !errors.Is(err, ErrDelegationAck) {
+		t.Fatalf("recall did not cover final application: %v", err)
+	}
+	cv2CutAck(t, c, holder, event, 7)
+	if err := cv2Result(t, done); err != nil {
+		t.Fatal(err)
+	}
+}

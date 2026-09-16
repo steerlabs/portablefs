@@ -103,7 +103,7 @@ func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (tim
 // NextControlEvent long-polls for exactly the successor of afterSequence.
 // Client admission allows only one such poll at a time, while renewal and
 // acknowledgment requests retain independent CONTROL capacity.
-func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequence uint64) (*authoritypb.ControlEvent, error) {
+func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequence, completedThrough uint64) (*authoritypb.ControlEvent, error) {
 	if !c.linuxSubscriptionProfile() {
 		return nil, syscall.EOPNOTSUPP
 	}
@@ -111,7 +111,7 @@ func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequenc
 		return nil, syscall.EINVAL
 	}
 	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{
-		NextControlEvent: &authoritypb.NextControlEventRequest{Incarnation: incarnation, AfterSequence: afterSequence},
+		NextControlEvent: &authoritypb.NextControlEventRequest{Incarnation: incarnation, AfterSequence: afterSequence, CompletedEventThrough: completedThrough},
 	}})
 	if err != nil {
 		return nil, err

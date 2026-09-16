@@ -421,7 +421,7 @@ func TestFrontendProfileControlMethodsCannotCrossProfiles(t *testing.T) {
 	if _, err := fskit.RenewSubscription(ctx, 1); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("FSKit RenewSubscription error = %v, want EOPNOTSUPP", err)
 	}
-	if _, err := fskit.NextControlEvent(ctx, 1, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
+	if _, err := fskit.NextControlEvent(ctx, 1, 0, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("FSKit NextControlEvent error = %v, want EOPNOTSUPP", err)
 	}
 	if err := fskit.AcknowledgeChanges(ctx, 1, 0); !errors.Is(err, syscall.EOPNOTSUPP) {
@@ -3071,4 +3071,171 @@ func testTLSConfigs(t testing.TB) (*tls.Config, *tls.Config) {
 	pool := x509.NewCertPool()
 	pool.AddCert(ca)
 	return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{serverCert}}, &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{clientCert}, ServerName: "localhost"}
+}
+
+type releaseReceiptTestHandler struct {
+	clientTestHandler
+	release func(context.Context, *authoritypb.Request) *authoritypb.Response
+}
+
+func (h *releaseReceiptTestHandler) Handle(ctx context.Context, request *authoritypb.Request) *authoritypb.Response {
+	if request.GetDelegationRelease() != nil {
+		return h.release(ctx, request)
+	}
+	return h.clientTestHandler.Handle(ctx, request)
+}
+
+func releaseReceiptRequest(incarnation uint64, identity byte) *authoritypb.Request {
+	return &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{
+		Incarnation: incarnation, Delegations: []*authoritypb.DelegationRelease{{Delegation: &authoritypb.DelegationRef{Id: bytes.Repeat([]byte{identity}, 16), Generation: 1}}},
+	}}}
+}
+
+func releaseReceiptResponse(request *authoritypb.Request) *authoritypb.Response {
+	return &authoritypb.Response{RequestId: request.RequestId, Epoch: make([]byte, 16), Body: &authoritypb.Response_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseReply{}}}
+}
+
+func TestInvalidDelegationReleaseDoesNotConsumeSequence(t *testing.T) {
+	for _, field := range []string{"sequence", "completion", "shape"} {
+		t.Run(field, func(t *testing.T) {
+			seen := make(chan *authoritypb.DelegationReleaseRequest, 3)
+			handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(_ context.Context, r *authoritypb.Request) *authoritypb.Response {
+				seen <- proto.Clone(r.GetDelegationRelease()).(*authoritypb.DelegationReleaseRequest)
+				return releaseReceiptResponse(r)
+			}}
+			address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+			defer stop()
+			client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(5, 1)); err != nil {
+				t.Fatal(err)
+			}
+			invalid := releaseReceiptRequest(6, 2)
+			switch field {
+			case "sequence":
+				invalid.GetDelegationRelease().ReleaseSequence = 99
+			case "completion":
+				invalid.GetDelegationRelease().CompletedReleaseThrough = 99
+			case "shape":
+				invalid.GetDelegationRelease().Delegations = nil
+			}
+			if _, err := client.CallIdempotent(t.Context(), invalid); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("invalid release: %v", err)
+			}
+			if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(5, 3)); err != nil {
+				t.Fatal(err)
+			}
+			for sequence := uint64(1); sequence <= 2; sequence++ {
+				request := <-seen
+				if request.ReleaseSequence != sequence || request.CompletedReleaseThrough != sequence-1 {
+					t.Fatal(request)
+				}
+			}
+			if len(seen) != 0 {
+				t.Fatal("invalid release reached wire")
+			}
+		})
+	}
+}
+
+func TestMalformedDelegationReleaseReplyEndsSession(t *testing.T) {
+	var calls atomic.Int32
+	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(_ context.Context, r *authoritypb.Request) *authoritypb.Response {
+		calls.Add(1)
+		return &authoritypb.Response{RequestId: r.RequestId, Epoch: make([]byte, 16), Body: &authoritypb.Response_ChangeAck{ChangeAck: &authoritypb.ChangeAckReply{}}}
+	}}
+	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	defer stop()
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 1)); err == nil {
+		t.Fatal("malformed release succeeded")
+	}
+	if client.releaseCompleted != 0 || !client.poisoned.Load() || client.SessionError() == nil {
+		t.Fatal("uncertain result was receipted or session survived")
+	}
+	if _, err := client.CallIdempotent(t.Context(), releaseReceiptRequest(1, 2)); !errors.Is(err, ErrTransportUncertain) {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatal("later release reached wire")
+	}
+}
+
+func TestDelegationReleaseSequenceSurvivesControlReconnectAndHoldsLane(t *testing.T) {
+	seen := make(chan *authoritypb.DelegationReleaseRequest, 3)
+	dropFirst, allowReplay := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	handler := &releaseReceiptTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 5}, release: func(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
+		call := calls.Add(1)
+		seen <- proto.Clone(r.GetDelegationRelease()).(*authoritypb.DelegationReleaseRequest)
+		switch call {
+		case 1:
+			select {
+			case <-dropFirst:
+			case <-ctx.Done():
+			}
+			if transport, ok := transportConnectionFromContext(ctx); ok {
+				transport.close()
+			}
+		case 2:
+			select {
+			case <-allowReplay:
+			case <-ctx.Done():
+			}
+		}
+		return releaseReceiptResponse(r)
+	}}
+	address, tlsConfig, stop := startTestServer(t, handler, 5, time.Minute)
+	defer stop()
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tlsConfig, "volume", 5, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	results := make(chan error, 2)
+	go func() { _, err := client.CallIdempotent(ctx, releaseReceiptRequest(1, 1)); results <- err }()
+	var first, replay *authoritypb.DelegationReleaseRequest
+	select {
+	case first = <-seen:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	go func() { _, err := client.CallIdempotent(ctx, releaseReceiptRequest(1, 2)); results <- err }()
+	close(dropFirst)
+	select {
+	case replay = <-seen:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if !proto.Equal(first, replay) || replay.ReleaseSequence != 1 || replay.CompletedReleaseThrough != 0 {
+		t.Fatalf("replay changed: %v / %v", first, replay)
+	}
+	select {
+	case unexpected := <-seen:
+		t.Fatalf("later release overtook replay: %v", unexpected)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(allowReplay)
+	select {
+	case next := <-seen:
+		if next.ReleaseSequence != 2 || next.CompletedReleaseThrough != 1 {
+			t.Fatal(next)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
 }

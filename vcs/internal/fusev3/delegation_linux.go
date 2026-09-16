@@ -370,6 +370,9 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 	return nil
 }
 
+// AddHandle joins a currently owned generation if one remains. A read-only
+// OPEN can race last-handle release; a successful Authority open stays valid
+// when that release wins and must then close as an ordinary handle.
 func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bool) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
@@ -378,13 +381,16 @@ func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bo
 	if len(handle) == 0 {
 		return errors.New("fusev3: empty delegated handle")
 	}
-	s := m.state(id)
+	s := m.lookupState(id)
+	if s == nil {
+		return nil
+	}
 	s.transition.Lock()
 	defer s.transition.Unlock()
 	s.admission.Lock()
 	defer s.admission.Unlock()
 	if s.ref == nil {
-		return errors.New("fusev3: handle joined an identity without a delegation")
+		return nil
 	}
 	if len(item) != 0 {
 		s.item = cloneBytes(item)
@@ -1081,16 +1087,23 @@ func (m *delegationManager) Barrier(ctx context.Context, observedLoss uint64) er
 	return nil
 }
 
-func (m *delegationManager) HandleControlEvent(parent context.Context, event *authoritypb.ControlEvent) {
+func (m *delegationManager) HandleControlEvent(parent context.Context, event *authoritypb.ControlEvent) <-chan struct{} {
+	done := make(chan struct{})
+	started := false
+	defer func() {
+		if !started {
+			close(done)
+		}
+	}()
 	if event == nil {
-		return
+		return done
 	}
 	cloned := proto.Clone(event).(*authoritypb.ControlEvent)
 	if cloned.GetIncarnation() == 0 || cloned.GetIncarnation() != m.incarnation() || cloned.GetSequence() == 0 {
-		return
+		return done
 	}
 	if cloned.GetDelegationRecall() == nil && cloned.GetDelegationBreak() == nil && cloned.GetDelegationModeChange() == nil {
-		return
+		return done
 	}
 	var rawID []byte
 	var budget uint64
@@ -1104,7 +1117,7 @@ func (m *delegationManager) HandleControlEvent(parent context.Context, event *au
 	}
 	id, err := delegationIdentity(rawID)
 	if err != nil || budget == 0 || budget > uint64(5*time.Second) {
-		return
+		return done
 	}
 	// The local budget begins at receipt, including time spent behind an
 	// earlier transition for this identity.
@@ -1113,12 +1126,12 @@ func (m *delegationManager) HandleControlEvent(parent context.Context, event *au
 	epoch := m.epochSerial
 	s := m.state(id)
 	m.epoch.RUnlock()
-	done := make(chan struct{})
 	s.controlMu.Lock()
 	predecessor := s.controlTail
 	s.controlTail = done
 	s.controlMu.Unlock()
 	m.controlWG.Add(1)
+	started = true
 	go func() {
 		defer m.controlWG.Done()
 		defer cancel()
@@ -1128,6 +1141,7 @@ func (m *delegationManager) HandleControlEvent(parent context.Context, event *au
 		}
 		m.handleControlEvent(ctx, cloned, s, epoch)
 	}()
+	return done
 }
 
 func (m *delegationManager) handleControlEvent(ctx context.Context, event *authoritypb.ControlEvent, s *delegationState, epoch uint64) {

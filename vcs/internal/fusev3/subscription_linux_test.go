@@ -78,7 +78,7 @@ func (r *subscriptionTestRPC) RenewSubscription(context.Context, uint64) (time.T
 	return r.horizon, nil
 }
 
-func (r *subscriptionTestRPC) NextControlEvent(ctx context.Context, _ uint64, _ uint64) (*authoritypb.ControlEvent, error) {
+func (r *subscriptionTestRPC) NextControlEvent(ctx context.Context, _ uint64, _ uint64, _ uint64) (*authoritypb.ControlEvent, error) {
 	r.mu.Lock()
 	if r.event < len(r.events) {
 		event := r.events[r.event]
@@ -197,7 +197,7 @@ func (c *subscriptionTestControl) SetIncarnation(incarnation uint64) {
 	c.mu.Unlock()
 }
 
-func (c *subscriptionTestControl) HandleControlEvent(_ context.Context, event *authoritypb.ControlEvent) {
+func (c *subscriptionTestControl) HandleControlEvent(_ context.Context, event *authoritypb.ControlEvent) <-chan struct{} {
 	c.mu.Lock()
 	c.events = append(c.events, event)
 	c.mu.Unlock()
@@ -207,6 +207,9 @@ func (c *subscriptionTestControl) HandleControlEvent(_ context.Context, event *a
 		default:
 		}
 	}
+	done := make(chan struct{})
+	close(done)
+	return done
 }
 
 func subscriptionIdentity(value byte) publicationIdentity {
@@ -313,7 +316,7 @@ func TestSubscriptionAckFollowsProvenWithdrawal(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	queue := newSubscriptionChangeQueue()
-	if err := queue.push(batch); err != nil {
+	if err := queue.push(batch, 0); err != nil {
 		t.Fatalf("queue: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -367,7 +370,7 @@ func TestSubscriptionFailedNotifyMarksIdentityStaleWithoutAck(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	queue := newSubscriptionChangeQueue()
-	if err := queue.push(batch); err != nil {
+	if err := queue.push(batch, 0); err != nil {
 		t.Fatalf("queue: %v", err)
 	}
 	if err := registry.changeLoop(context.Background(), 9, queue); err == nil {
@@ -562,8 +565,8 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 			foundNegativeNotify = true
 		}
 	}
-	if !foundNegativeNotify {
-		t.Fatal("cold subscription did not withdraw the kernel negative dentry")
+	if foundNegativeNotify {
+		t.Fatal("cold subscription sent a parent-lock notification for an uncached kernel name")
 	}
 }
 
@@ -742,5 +745,24 @@ func TestSubscriptionLocalPromotedOwnershipClosesCacheAdmission(t *testing.T) {
 	}
 	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got != 0 {
 		t.Fatalf("locally owned identity retains cache permission=%v", got)
+	}
+}
+
+func TestControlCompletionReceiptWaitsForEveryEarlierHandler(t *testing.T) {
+	queue := newSubscriptionChangeQueue()
+	queue.complete(2)
+	if got := queue.completedThrough(); got != 0 {
+		t.Fatalf("receipt skipped unfinished event 1: %d", got)
+	}
+	queue.complete(1)
+	if got := queue.completedThrough(); got != 2 {
+		t.Fatalf("receipt=%d", got)
+	}
+	queue.complete(1)
+	for sequence := uint64(3); sequence <= 10000; sequence++ {
+		queue.complete(sequence)
+	}
+	if queue.completedThrough() != 10000 || len(queue.finished) != 0 {
+		t.Fatalf("completion retained history: %+v", queue)
 	}
 }

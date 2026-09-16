@@ -36,13 +36,14 @@ the inode stale and does not earn an acknowledgment. A successful cold
 withdrawal can repair a coherence-stale inode. It cannot revive an old-epoch
 inode or handle.
 
-Names retain zero kernel dentry validity. Their daemon payloads and directory
-page entries, including attributes, live under the subscription. This preserves
-the existing protection against a kernel rename moving a cached name into a
-coordinate which never authorized it. Entry and inode notifications still
-withdraw existing kernel state. READ replies which finish without permission
-receive a post-write purge before their physical publication drain completes.
-The implementation indexes pending data publications by stable identity;
+Names retain zero kernel dentry validity. Their daemon payloads and directory page
+entries, including attributes, live under the subscription. This preserves the existing
+protection against a kernel rename moving a cached name into a coordinate which never
+authorized it. Namespace withdrawal revokes or drains pending replies and purges daemon
+bindings; zero entry validity makes an entry notification unnecessary. Inode
+notifications still withdraw kernel data and attributes. READ replies which finish
+without permission receive a post-write purge before their physical publication drain
+completes. The implementation indexes pending data publications by stable identity;
 ordinary withdrawal does not scan unrelated pending reads.
 
 The exact-coordinate source gate remains in place. A buffered write closes the

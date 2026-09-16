@@ -16,8 +16,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-type coherenceValidatorFunc func(volumeserver.SessionID, [16]byte, uint64) bool
-
 func TestCoherenceChangesSkipInternalEventsWithoutCursorHoles(t *testing.T) {
 	for _, internal := range []volumeserver.StreamEventKind{volumeserver.StreamAdvance, volumeserver.StreamLoss} {
 		for _, trailing := range []bool{false, true} {
@@ -49,15 +47,10 @@ func TestCoherenceChangesSkipInternalEventsWithoutCursorHoles(t *testing.T) {
 	}
 }
 
-func (f coherenceValidatorFunc) ValidateCoherenceApplication(session volumeserver.SessionID, identity [16]byte, sequence uint64) bool {
-	return f(session, identity, sequence)
-}
-
 func newCoherenceControlTestHandler(t *testing.T, maxFrame uint32) (*VolumeHandler, *volumeserver.CoherenceCoordinator) {
 	t.Helper()
 	coordinator := volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{MaxLogEntries: 256})
 	handler := &VolumeHandler{Coherence: coordinator, MaxFrame: maxFrame}
-	handler.CoherenceApplications = coherenceValidatorFunc(func(volumeserver.SessionID, [16]byte, uint64) bool { return true })
 	state := handler.initCoherenceControlState()
 	state.random = bytes.NewReader(bytes.Repeat([]byte{0x7a}, 1024))
 	return handler, coordinator
@@ -353,9 +346,6 @@ func TestCoherenceDelegationBreakRecallAcksValidateTicketIdentityAndReplay(t *te
 		t.Fatal(err)
 	}
 	flush.End(3)
-	handler.CoherenceApplications = coherenceValidatorFunc(func(gotSession volumeserver.SessionID, gotIdentity [16]byte, sequence uint64) bool {
-		return gotSession == id && gotIdentity == identity && (sequence == 0 || sequence == 3)
-	})
 
 	// The holder first receives the reservation's broadcast change.
 	change := pollCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), 0).GetControlEvent()
@@ -502,7 +492,7 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 	}
 	flush.End(5)
 	request := &authoritypb.Request{RequestId: 12, Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{
-		Incarnation: subscribe.GetIncarnation(), Delegations: releases,
+		Incarnation: subscribe.GetIncarnation(), Delegations: releases, ReleaseSequence: 1,
 	}}}
 	for _, stale := range []uint64{0, 3} {
 		request.GetDelegationRelease().Delegations[0].AppliedSequence = stale
@@ -515,6 +505,8 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 				t.Fatal("stale applied ticket partially released batch")
 			}
 		}
+		request.GetDelegationRelease().CompletedReleaseThrough = request.GetDelegationRelease().ReleaseSequence
+		request.GetDelegationRelease().ReleaseSequence++
 	}
 	request.GetDelegationRelease().Delegations[0].AppliedSequence = 5
 	for attempt := 0; attempt < 2; attempt++ {
@@ -536,6 +528,8 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 	}
 	stale := proto.Clone(request).(*authoritypb.Request)
 	stale.GetDelegationRelease().Delegations[0].Delegation.Generation++
+	stale.GetDelegationRelease().CompletedReleaseThrough = stale.GetDelegationRelease().ReleaseSequence
+	stale.GetDelegationRelease().ReleaseSequence++
 	response, _ = handler.handleCoherenceControl(t.Context(), stale, volumeserver.SessionCredential{ID: id})
 	if response.GetErrno() != errnos.EIO || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 		t.Fatalf("stale generation response = %+v", response)
@@ -621,7 +615,7 @@ func TestCoherenceReleaseCompletesRacingBreak(t *testing.T) {
 					t.Fatal(event)
 				}
 			}
-			request := &authoritypb.DelegationReleaseRequest{Incarnation: subscribe.Incarnation, Delegations: []*authoritypb.DelegationRelease{{Delegation: coherenceDelegationRefProto(grant)}}}
+			request := &authoritypb.DelegationReleaseRequest{Incarnation: subscribe.Incarnation, ReleaseSequence: 1, Delegations: []*authoritypb.DelegationRelease{{Delegation: coherenceDelegationRefProto(grant)}}}
 			for attempt := 0; attempt < 2; attempt++ {
 				if response := handler.handleCoherenceDelegationRelease(20, id, request); response.Errno != 0 {
 					t.Fatal(response)
@@ -687,4 +681,143 @@ func TestCoherenceSourceOnlyCommitsRetireInternalPositions(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+func TestCoherenceLongLivedControlReplayRetiresOnlyExplicitReceipts(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, token := subscribeCoherenceControlTest(t, handler, id)
+	var cursor, completed uint64
+	poll := func() *authoritypb.ControlEvent {
+		t.Helper()
+		response := handler.handleCoherencePoll(t.Context(), 1, id, &authoritypb.NextControlEventRequest{Incarnation: subscribed.Incarnation, AfterSequence: cursor, CompletedEventThrough: completed})
+		if response.Errno != 0 {
+			t.Fatal(response)
+		}
+		event := response.GetControlEvent()
+		cursor = event.Sequence
+		return event
+	}
+	ackChange := func(event *authoritypb.ControlEvent) {
+		t.Helper()
+		entries := event.GetChangeBatch().GetEntries()
+		if len(entries) == 0 {
+			t.Fatal(event)
+		}
+		if response := ackChangeCoherenceControlTest(t, handler, id, subscribed.Incarnation, entries[len(entries)-1].Position); response.Errno != 0 {
+			t.Fatal(response)
+		}
+		completed = event.Sequence
+	}
+	for sequence := uint64(1); sequence <= 10000; sequence++ {
+		if sequence%1000 == 0 {
+			if _, err := coordinator.Renew(token); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reservation, err := coordinator.ReserveNew(token, [16]byte{1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		grant, err := reservation.Grant(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := handler.rememberCoherenceDelegation(grant); err != nil {
+			t.Fatal(err)
+		}
+		ackChange(poll())
+		done := make(chan error, 1)
+		go func() { done <- coordinator.BreakForRead(t.Context(), grant.Identity) }()
+		event := poll()
+		for range 2 {
+			response := handler.handleCoherenceDelegationAck(2, id, coherenceControlBreak, subscribed.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0)
+			if response.Errno != 0 {
+				t.Fatal(response)
+			}
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		release := &authoritypb.DelegationReleaseRequest{Incarnation: subscribed.Incarnation, ReleaseSequence: sequence, CompletedReleaseThrough: sequence - 1, Delegations: []*authoritypb.DelegationRelease{{Delegation: coherenceDelegationRefProto(grant)}}}
+		if sequence == 1 {
+			gap := proto.Clone(release).(*authoritypb.DelegationReleaseRequest)
+			gap.ReleaseSequence = 2
+			if response := handler.handleCoherenceDelegationRelease(3, id, gap); response.Errno == 0 {
+				t.Fatal("release sequence gap accepted")
+			}
+		}
+		for range 2 {
+			if response := handler.handleCoherenceDelegationRelease(3, id, release); response.Errno != 0 {
+				t.Fatal(response)
+			}
+		}
+		// Delivery can overtake an ACK retry; it must not discard that result.
+		released := poll()
+		if response := handler.handleCoherenceDelegationAck(4, id, coherenceControlBreak, subscribed.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0); response.Errno != 0 {
+			t.Fatal("poll delivery retired ACK replay", response)
+		}
+		ackChange(released)
+		state := handler.initCoherenceControlState().sessions[id]
+		if len(state.obligations) > 1 || len(state.delegations) != 0 || state.releaseReplay == nil || state.releaseReplay.sequence != sequence {
+			t.Fatalf("retained history: obligations=%d grants=%d replay=%v", len(state.obligations), len(state.delegations), state.releaseReplay)
+		}
+	}
+}
+
+func TestCoherenceCompletedEventReceiptCannotAcknowledgeFailedHandler(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, token := subscribeCoherenceControlTest(t, handler, id)
+	reservation, err := coordinator.ReserveNew(token, [16]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, 0).GetControlEvent()
+	entries := initial.GetChangeBatch().GetEntries()
+	if response := ackChangeCoherenceControlTest(t, handler, id, subscribed.Incarnation, entries[len(entries)-1].Position); response.Errno != 0 {
+		t.Fatal(response)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- coordinator.BreakForRead(ctx, grant.Identity) }()
+	event := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, initial.Sequence).GetControlEvent()
+	if event.GetDelegationBreak() == nil {
+		t.Fatal(event)
+	}
+	coordinator.OnCommit([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{2}, VolumeVersion: 1}})
+	response := handler.handleCoherencePoll(ctx, 4, id, &authoritypb.NextControlEventRequest{Incarnation: subscribed.Incarnation, AfterSequence: event.Sequence, CompletedEventThrough: event.Sequence})
+	if response.Errno != 0 {
+		t.Fatal(response)
+	}
+	if len(handler.initCoherenceControlState().sessions[id].obligations) != 0 {
+		t.Fatal("surrendered replay retained")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("receipt completed unacknowledged cut: %v", err)
+	default:
+	}
+	if response := handler.handleCoherenceDelegationAck(5, id, coherenceControlBreak, subscribed.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0); response.Errno == 0 {
+		t.Fatal("surrendered ACK replay accepted")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if coordinator.LossSequence(id) == 0 {
+		t.Fatal("failed handler did not advance loss at recall deadline")
+	}
+	if _, live := coordinator.LookupDelegation(grant.Identity); live {
+		t.Fatal("failed handler retained grant")
+	}
 }

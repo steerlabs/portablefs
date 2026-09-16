@@ -195,6 +195,9 @@ type Client struct {
 	maxWrite                 uint32
 	maxFskitWrite            uint64
 	lease                    time.Duration
+	releaseIncarnation       uint64 // protected by the single controlAck permit
+	releaseSequence          uint64
+	releaseCompleted         uint64
 	subscriptionMu           sync.Mutex
 	subscriptionSnapshot     []byte
 	subscriptionWatermark    uint64
@@ -1670,16 +1673,59 @@ func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Reques
 	return detachResponseFrame(response, releaseFrame), err
 }
 
-func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
+func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), err error) {
 	if c.poisoned.Load() {
 		return nil, nil, ErrTransportUncertain
 	}
-	response, releaseFrame, err := c.callFrame(ctx, request)
+	admitted, err := c.admitCall(ctx, request)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { <-admitted.permits }()
+	// One logical idempotent call owns its lane across reconnect and replay.
+	// A release result must be validated before any later release can receipt it.
+	if body := request.GetDelegationRelease(); body != nil {
+		if body.GetReleaseSequence() != 0 || body.GetCompletedReleaseThrough() != 0 || len(body.GetDelegations()) == 0 || len(body.GetDelegations()) > maxWireRepeatedElements {
+			return nil, nil, syscall.EINVAL
+		}
+		var previous []byte
+		for _, release := range body.GetDelegations() {
+			if release == nil || !validDelegationRef(release.GetDelegation()) || previous != nil && bytes.Compare(previous, release.GetDelegation().GetId()) >= 0 {
+				return nil, nil, syscall.EINVAL
+			}
+			previous = release.GetDelegation().GetId()
+		}
+		if body.GetIncarnation() < c.releaseIncarnation || body.GetIncarnation() == 0 {
+			return nil, nil, syscall.EINVAL
+		}
+		if body.GetIncarnation() != c.releaseIncarnation {
+			c.releaseIncarnation, c.releaseSequence, c.releaseCompleted = body.GetIncarnation(), 0, 0
+		}
+		c.releaseSequence++
+		if c.releaseSequence == 0 {
+			panic("authorityrpc: delegation release sequence exhausted")
+		}
+		body.ReleaseSequence, body.CompletedReleaseThrough = c.releaseSequence, c.releaseCompleted
+		defer func() {
+			if err == nil && response != nil && (response.GetErrno() != 0 || response.GetDelegationRelease() != nil) {
+				c.releaseCompleted = body.ReleaseSequence
+				return
+			}
+			if err == nil {
+				err = errors.New("authorityrpc: malformed delegation release result")
+			}
+			// There is no receipt for an uncertain result. End this session before
+			// allowing another release to surrender its replay record.
+			c.signalSessionEnd(err)
+		}()
+	}
+	response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
 	if !errors.Is(err, ErrTransportUncertain) {
 		return response, releaseFrame, err
 	}
 	if releaseFrame != nil {
 		releaseFrame()
+		releaseFrame = nil
 	}
 	role, roleErr := roleForRequest(request)
 	if roleErr != nil {
@@ -1691,7 +1737,7 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		}
 		return nil, nil, err
 	}
-	return c.callFrame(ctx, request)
+	return c.dispatchOwnedFrame(ctx, request)
 }
 
 // CallIdempotentRetained is the staged-write counterpart to

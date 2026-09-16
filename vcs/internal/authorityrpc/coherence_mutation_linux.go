@@ -28,9 +28,6 @@ func (h *VolumeHandler) initCoherence() {
 		}
 		h.coherenceStorage = volumeserver.NewStorageSequencer()
 		h.coherenceVersion = 1
-		if h.CoherenceApplications == nil {
-			h.CoherenceApplications = h
-		}
 
 	})
 }

@@ -175,7 +175,7 @@ func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*autho
 func (f *fakeRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
 	return time.Now().Add(10 * time.Second), nil
 }
-func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after uint64) (*authoritypb.ControlEvent, error) {
+func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after, completed uint64) (*authoritypb.ControlEvent, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -1576,7 +1576,7 @@ func TestDirHandleBuffersOneAuthorityPageAcrossEntries(t *testing.T) {
 			t.Fatalf("peek is not idempotent: %q then %q", entry.Name, again.Name)
 		}
 		names = append(names, entry.Name)
-		handle.consume()
+		handle.consume(entry)
 	}
 	entry, _, errno := handle.peek(ctx, false)
 	if errno != 0 || entry != nil {

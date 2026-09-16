@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -1085,5 +1086,29 @@ func TestDelegationFlushKeepsWritableCapabilityUntilApplication(t *testing.T) {
 	}
 	if m.LossSequence() != 0 {
 		t.Fatal("closing writer reported loss")
+	}
+}
+
+func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T) {
+	for _, owned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("owned=%t", owned), func(t *testing.T) {
+			m := newDelegationTestManager(t, &delegationFakeRPC{})
+			id := installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			if !m.Owns(id) {
+				t.Fatal("grant not installed")
+			}
+			if !owned {
+				if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: []byte{22, 2}}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			reader := []byte{22, 3}
+			if err := m.AddHandle(id, []byte{22, 1}, reader, false); err != nil {
+				t.Fatalf("successful read OPEN failed registration: %v", err)
+			}
+			if got := m.TracksHandle(id, reader); got != owned {
+				t.Fatalf("reader tracking=%t, want %t", got, owned)
+			}
+		})
 	}
 }

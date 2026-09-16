@@ -64,6 +64,7 @@ const cachelessReaderFeature = "cacheless-peer-reader-v1"
 const subscriptionFeature = "volume-subscription-v1"
 const changeStreamFeature = "ordered-change-stream-v1"
 const delegationFeature = "file-write-delegation-v1"
+const boundedControlReplayFeature = "bounded-control-replay-v1"
 const delegationControlFeature = "delegation-control-v1"
 const durableSequenceFeature = "session-durable-sequence-v1"
 const directoryBarrierFeature = "root-directory-barrier-v1"
@@ -90,7 +91,7 @@ var (
 	}
 	requiredLinuxAttachFeatures = []string{
 		"direct-io-no-file-mmap", "distributed-posix-locks",
-		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature,
+		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, boundedControlReplayFeature,
 	}
 	requiredFskitAttachFeatures = []string{
 		"write-through",

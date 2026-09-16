@@ -53,33 +53,9 @@ func TestCoherenceDurabilityMapsVolumeCutsToSessionPrefixes(t *testing.T) {
 		})
 	}
 
-	for _, test := range []struct {
-		name     string
-		session  volumeserver.SessionID
-		identity [16]byte
-		sequence uint64
-		want     bool
-	}{
-		{name: "empty cut", session: firstSession, identity: firstIdentity, want: true},
-		{name: "exact first", session: firstSession, identity: firstIdentity, sequence: 1, want: true},
-		{name: "exact second", session: firstSession, identity: secondIdentity, sequence: 2, want: true},
-		{name: "wrong identity", session: firstSession, identity: secondIdentity, sequence: 1},
-		{name: "foreign session", session: secondSession, identity: firstIdentity, sequence: 1},
-		{name: "future", session: firstSession, identity: secondIdentity, sequence: 3},
-	} {
-		t.Run("validate "+test.name, func(t *testing.T) {
-			if got := state.validate(test.session, test.identity, test.sequence); got != test.want {
-				t.Fatalf("validate = %t, want %t", got, test.want)
-			}
-		})
-	}
-
 	state.forget(firstSession)
 	if applied, durable := state.latest(firstSession, 4); applied != 0 || durable != 0 {
 		t.Fatalf("latest after forget = (%d, %d), want (0, 0)", applied, durable)
-	}
-	if state.validate(firstSession, firstIdentity, 1) {
-		t.Fatal("forgotten application ticket remained valid")
 	}
 }
 
@@ -244,5 +220,40 @@ func TestCoherenceBarrierHandlerIsReplaySafe(t *testing.T) {
 	}
 	if store.calls.Load() != 1 {
 		t.Fatalf("future Barrier reached syncfs: calls = %d", store.calls.Load())
+	}
+}
+
+func TestCoherenceDurableTicketsDoNotAccumulateInLongLivedSessions(t *testing.T) {
+	var ledger coherenceDurability
+	writer, idle := volumeserver.SessionID{1}, volumeserver.SessionID{2}
+	identity := [16]byte{9}
+	ledger.recordApplied(idle, identity, 1)
+	for ticket := uint64(1); ticket <= 100000; ticket++ {
+		if got := ledger.recordApplied(writer, identity, ticket+1); got != ticket {
+			t.Fatalf("ticket=%d want=%d", got, ticket)
+		}
+		if ticket%64 == 0 {
+			ledger.retire(ticket) // Leave the newest application unproven.
+			state := ledger.sessions[writer]
+			if len(state.applications) != 1 || state.durable != ticket-1 {
+				t.Fatalf("retained=%d durable=%d", len(state.applications), state.durable)
+			}
+			if cap(state.applications) > 64 {
+				t.Fatalf("retained backing capacity=%d", cap(state.applications))
+			}
+		}
+	}
+	ledger.retire(100001)
+	for _, session := range []volumeserver.SessionID{writer, idle} {
+		state := ledger.sessions[session]
+		if state.applications != nil || state.durable != state.applied {
+			t.Fatalf("durable session retained history: %+v", state)
+		}
+	}
+	if applied, durable := ledger.latest(writer, 100001); applied != 100000 || durable != 100000 {
+		t.Fatalf("prefix=%d/%d", applied, durable)
+	}
+	if next := ledger.recordApplied(writer, identity, 100002); next != 100001 {
+		t.Fatalf("retirement reset sequence: %d", next)
 	}
 }

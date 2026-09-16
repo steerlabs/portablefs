@@ -131,7 +131,6 @@ type VolumeHandler struct {
 	coherenceProfileAdmission coherenceProfileGate
 
 	Coherence                  *volumeserver.CoherenceCoordinator
-	CoherenceApplications      coherenceApplicationValidator
 	coherenceOnce              sync.Once
 	coherenceControlOnce       sync.Once
 	coherenceControl           *coherenceControlState

@@ -114,7 +114,7 @@ type RPC interface {
 	SessionID() []byte
 	Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, time.Time, error)
 	RenewSubscription(context.Context, uint64) (time.Time, error)
-	NextControlEvent(context.Context, uint64, uint64) (*authoritypb.ControlEvent, error)
+	NextControlEvent(context.Context, uint64, uint64, uint64) (*authoritypb.ControlEvent, error)
 	AcknowledgeChanges(context.Context, uint64, uint64) error
 	AcknowledgeDelegationRecall(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error
 	AcknowledgeDelegationBreak(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error
@@ -1710,6 +1710,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 				continue
 			}
 			generation := h.cursorGeneration
+			pageStamp := h.node.mount.subscription.stamp()
 			request := &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
 				Handle: cloneBytes(h.token), Cookie: cloneBytes(h.cookie), MaxEntries: 256, WantItems: wantItems,
 			}}}
@@ -1747,9 +1748,11 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 				h.node.mount.revoke(errors.New("fusev3: READDIR answered for an item with no stable identity"))
 				return nil, nil, syscall.ENOTCONN
 			}
-			publication := replyPublicationFromContext(ctx)
 			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
-			h.pageStamp = publication.subscriptionCacheStamp()
+			// A callback can fetch several pages across a withdrawal. Its aggregate
+			// reply stamp keeps the oldest version, but each buffered page owns
+			// its own RPC admission stamp and served version.
+			h.pageStamp = pageStamp.withVersion(response.GetVolumeVersion())
 			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: identity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0
 			h.pageWantItems = wantItems
 			h.verifier = cloneBytes(page.GetVerifier())
@@ -1811,19 +1814,27 @@ func (h *dirHandle) peekLocalLocked() *fuse.DirEntry {
 // consume accepts the entry last returned by peek. Until it is called the entry
 // stays buffered, so an entry that did not fit in a READDIR reply is delivered
 // by the next one instead of being silently skipped.
-func (h *dirHandle) consume() {
+func (h *dirHandle) consume(delivered *fuse.DirEntry) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.pending == nil {
-		if h.localIndex < len(h.local) {
-			h.next = h.local[h.localIndex].Off
-			h.localIndex++
-		}
+	if delivered.Off&graftDirOffsetBase != 0 {
+		h.next = delivered.Off
+		h.localIndex = int(delivered.Off &^ graftDirOffsetBase)
 		return
 	}
-	h.index++
-	h.cookie = h.pendingCookie
-	h.next = h.pending.Off
+	// Invalidation may discard pending between peek and AddDirEntry. The
+	// accepted entry still owns its continuation cookie; losing that receipt
+	// would return the same unmodified name again on the next page.
+	if h.pending == delivered {
+		h.index++
+	} else {
+		h.discardPageItemsLocked()
+		h.page, h.index, h.eof = nil, 0, false
+		h.pageStamp = subscriptionStamp{}
+		h.cursorGeneration++
+	}
+	h.cookie = encodeCookie(delivered.Off)
+	h.next = delivered.Off
 	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
 }
 

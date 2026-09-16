@@ -143,7 +143,7 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 
 	pollResult := make(chan error, 1)
 	go func() {
-		event, err := client.NextControlEvent(context.Background(), 7, 0)
+		event, err := client.NextControlEvent(context.Background(), 7, 0, 0)
 		if err == nil && (event.GetSequence() != 1 || event.GetChangeBatch() == nil) {
 			err = errors.New("control poll returned the wrong event")
 		}

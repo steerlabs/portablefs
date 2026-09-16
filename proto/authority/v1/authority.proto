@@ -1171,6 +1171,7 @@ message RenewSubscriptionReply {
 message NextControlEventRequest {
   uint64 incarnation = 1;
   uint64 after_sequence = 2; // last received ControlEvent.sequence; initially zero
+  uint64 completed_event_through = 3; // explicit surrender of further event ACK retries through this position; not a cut ACK
 }
 message ControlEvent {
   uint64 incarnation = 1;
@@ -1272,6 +1273,8 @@ message DelegationRelease {
 message DelegationReleaseRequest {
   uint64 incarnation = 1;
   repeated DelegationRelease delegations = 2; // unique, sorted by id
+  uint64 release_sequence = 3; // contiguous logical release operation, starts at 1
+  uint64 completed_release_through = 4; // received results, never retried after this receipt
 }
 message DelegationReleaseReply {}
 

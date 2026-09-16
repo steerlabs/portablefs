@@ -104,7 +104,7 @@ func TestProtocolV7FeatureSetsAreExact(t *testing.T) {
 				"direct-write", "volume-subscription-v1", "ordered-change-stream-v1", "file-write-delegation-v1"),
 			activate: append(append([]string(nil), commonActivate...),
 				"direct-io-no-file-mmap", "distributed-posix-locks", "delegation-control-v1",
-				"session-durable-sequence-v1", "root-directory-barrier-v1"),
+				"session-durable-sequence-v1", "root-directory-barrier-v1", "bounded-control-replay-v1"),
 		},
 		{
 			name:    "fskit",

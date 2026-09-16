@@ -130,8 +130,8 @@ func (e *epochRPC) RenewSubscription(ctx context.Context, incarnation uint64) (t
 	return e.current().RenewSubscription(ctx, incarnation)
 }
 
-func (e *epochRPC) NextControlEvent(ctx context.Context, incarnation, afterSequence uint64) (*authoritypb.ControlEvent, error) {
-	return e.current().NextControlEvent(ctx, incarnation, afterSequence)
+func (e *epochRPC) NextControlEvent(ctx context.Context, incarnation, afterSequence, completedThrough uint64) (*authoritypb.ControlEvent, error) {
+	return e.current().NextControlEvent(ctx, incarnation, afterSequence, completedThrough)
 }
 
 func (e *epochRPC) AcknowledgeChanges(ctx context.Context, incarnation, position uint64) error {

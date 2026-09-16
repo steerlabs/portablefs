@@ -58,6 +58,7 @@ type delegationCut struct {
 	done     bool
 	applied  uint64
 	floor    uint64
+	issued   map[uint64]struct{} // exact application tickets issued while this cut is pending
 }
 type cacheHandleCounts struct {
 	total    uint64
@@ -723,7 +724,12 @@ func (c *CoherenceCoordinator) AckDelegation(token SubscriptionToken, identity [
 	if p.recall && r.active != 0 {
 		return ErrDelegationBusy
 	}
-	if applied < p.floor || applied > r.applied {
+	if applied != p.floor {
+		if _, issued := p.issued[applied]; !issued {
+			return ErrDelegationAck
+		}
+	}
+	if p.recall && applied != r.applied {
 		return ErrDelegationAck
 	}
 	p.applied = applied
@@ -821,6 +827,12 @@ func (f *DelegationFlush) End(applied uint64) {
 		defer c.mu.Unlock()
 		r := f.record
 		r.applied = max(r.applied, applied)
+		if p := r.pending; p != nil && applied > p.floor {
+			if p.issued == nil {
+				p.issued = make(map[uint64]struct{})
+			}
+			p.issued[applied] = struct{}{}
+		}
 		r.active--
 		if r.ephemeral && r.active == 0 {
 			c.dropDelegationLocked(r, false)

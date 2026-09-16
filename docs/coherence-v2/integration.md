@@ -67,9 +67,11 @@ consistency guarantee has been removed.
 
 ## Outstanding qualification
 
-Gateway reader admission, ticket/replay retention, the v7 matrix conversion,
-v6 engine deletion, the 20,000-file git-add regression, baseline profiling and
-measurements, public documentation, and the full local gate remain outstanding.
+The v7 matrix conversion, v6 engine deletion, the 20,000-file git-add regression,
+baseline profiling and measurements, public documentation, and the full local
+gate remain outstanding. Gateway admission, bounded ticket/control replay, and
+stable-cookie enumeration are implemented; their integration regressions and
+remaining qualification are recorded below.
 No v7 performance result is claimed yet.
 
 Latest focused evidence: `/tmp/cv2-g-lifetime-24.log` passes concurrent writers,
@@ -145,3 +147,92 @@ an explicit durable cut so buffered writes are counted; fewer pre-operation
 LOOKUPs are accepted, while follow-up GETATTR and operation counts retain their
 bounds. The same-name CREATE portion still exposes a ten-second stall and is
 under investigation; the full suite is not green yet.
+
+## Namespace withdrawal and rename publication
+
+The same-name CREATE stall was a peer EntryNotify waiting for the parent VFS
+lock held by the initiating syscall. Checking whether a source gate already
+exists is insufficient: the kernel takes that lock before entering the callback.
+All Authority-backed shared names already use zero kernel entry validity.
+Namespace withdrawal therefore closes the exact coordinate, revokes or drains
+old replies, and purges daemon bindings and stamps before ACK, without EntryNotify.
+Forward lookup must re-enter FUSE. Kernel dentry objects used by reverse d_path
+remain outside the contract, and machine-local graft names are separate. DATA
+and ATTR retain their returned inode-notification proof. The design, wire and
+client descriptions now state this boundary explicitly.
+
+The regression holds both positive and negative LOOKUP replies across a peer
+change, then proves late physical completion cannot refill withdrawn payloads.
+Real cross-mount tests require the first observation of each changed component
+to reach the Authority and unchanged negative probes to reuse daemon payloads.
+
+RENAME exposed two extra requests: F4 re-resolved an already known source when
+only the destination was unknown, and its authoritative post-bindings were not
+published into the daemon cache. Dependency flush now resolves each unknown
+coordinate independently. Rename admits fresh coordinate stamps from validated
+post-state, owned by its existing reply receipt; it never moves the old name's
+stamp. The metadata regression retains its original one-LOOKUP/zero-GETATTR
+rename bound. It passed in `/tmp/cv2-g-rename-67.log`; the same-name CREATE took
+less than two seconds and retained both subscription incarnations. This focused
+run passed all selected tests but exited 70 because the full inventory was not
+selected.
+
+## Bounded session retention
+
+Application tickets retain monotonic applied/durable counters and only the
+undurable suffix of volume versions. Every volume durability cut retires the
+covered prefix for all sessions, including idle writers. Active delegation cuts
+validate their exact floor and tickets issued during the cut, independent of
+retired application history. The 100,000-ticket regression checks backing capacity,
+idle-session retirement, and sequence continuity after complete pruning.
+
+Delivery is not completion: CONTROL polls can overtake flush ACK retries.
+The additive `completed_event_through` field explicitly surrenders ACK replay
+through a contiguous handler-completion prefix. It does not acknowledge a flush.
+The Authority deletes surrendered adapter records; coordinator cuts still expire
+on their own deadlines. A failed-handler test verifies that surrender neither
+completes the cut nor suppresses the loss increment at its five-second deadline.
+
+Release requests carry contiguous `release_sequence` and
+`completed_release_through` coordinates. The client owns the ACK lane across
+reconnect and exact retry and validates the result before admitting a successor.
+The Authority retains one exact request fingerprint/result, including definite
+errors. Malformed or uncertain final responses end the session; invalid local
+request shapes consume no sequence. Linux attach requires the additive
+`bounded-control-replay-v1` feature. Existing protobuf tags remain unchanged.
+
+The 10,000-cycle grant/break/release test bounds retained grants, obligations and
+release replay while retrying exact ACKs after later delivery. These tests and
+the failed-handler deadline test pass in `/tmp/cv2-g-retention-65.log`; that run
+still failed the newly added nested-name request counter, which counted a parent
+attribute miss as a child lookup. The assertion now counts the exact component;
+all cross-mount name tests pass in run 67. Native reconnect, malformed-result,
+local-validation and golden-wire tests pass in `/tmp/cv2-g-client-64.log`.
+
+The full suite in `/tmp/cv2-g-full-68.log` exposed two further races. Directory
+invalidation could clear `pending` after READDIR selected an entry but before
+its accepted reply entry advanced the continuation cookie. Consumption now uses
+the delivered entry's own cookie even if its buffered page was withdrawn. A
+unit regression forces that exact interval. A refetched page also needs its own
+RPC-start generation and served version: borrowing the whole callback's oldest
+stamp discarded each fresh page repeatedly. Five concurrent churn runs pass in
+`/tmp/cv2-g-git-72.log` (1.63–5.62 s), after three correctness passes in run 70
+that took 23–40 s before the stamp fix. These are regression timings, not the
+requested baseline measurements.
+
+Git intermittently received EIO from a successful read-only OPEN. Diagnostics
+in run 72 identified local registration: it observed ownership, waited behind
+last-writer release, then treated the absent delegation as an error. Registration
+now joins the generation only if it still exists; otherwise the valid Authority
+handle remains ordinary and closes through CLOSE. A regression checks both
+outcomes. No mount abort or authority error was involved. Full-gate qualification
+remains pending.
+
+Run 77 passes every fusev3, xfsstore, Authority RPC, restoremode, archiver and
+hydrator test. It reaches the separately gated tiered lifecycle and fails
+ServeWhileCold: a buffered writer's stat still reports archived mtime. This is
+an unimplemented implicit-attribute overlay, not an allowed v7 test relaxation.
+Run 78 passes Git, read-open/release, rename physical-publication (including a
+final FORGET), and refetched-page stamp regressions twenty times each. Its exit
+70 is only the focused inventory check. Darwin Foundation and static Linux
+builds pass; native authorityrpc/volumeserver race suites pass in run 69.

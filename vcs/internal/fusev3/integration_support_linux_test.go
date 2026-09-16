@@ -1161,24 +1161,53 @@ func (f *integrationFixture) countRequests(kind string, fn func()) int {
 
 // Cache-reuse proofs must open their reader after the asynchronous RELEASE
 // completes. An open while a delegation exists is deliberately direct-I/O.
-func waitForDelegationReleases(t *testing.T, mount *Mount) {
+func (f *integrationFixture) waitForDelegationReleases(t *testing.T) {
 	t.Helper()
 	waitUntil(t, 2*time.Second, "closed writable handles to release delegations", func() bool {
-		m := mount.delegations
-		m.mu.Lock()
-		states := make([]*delegationState, 0, len(m.byID))
-		for _, state := range m.byID {
-			states = append(states, state)
-		}
-		m.mu.Unlock()
-		for _, state := range states {
-			state.admission.RLock()
-			owned := state.ref != nil
-			state.admission.RUnlock()
-			if owned {
+		for _, mount := range f.mounts {
+			m := mount.delegations
+			m.mu.Lock()
+			states := make([]*delegationState, 0, len(m.byID))
+			for _, state := range m.byID {
+				states = append(states, state)
+			}
+			m.mu.Unlock()
+			for _, state := range states {
+				state.admission.RLock()
+				owned := state.ref != nil
+				state.admission.RUnlock()
+				if owned {
+					return false
+				}
+			}
+			mount.subscription.mu.RLock()
+			pending := len(mount.subscription.delegated)
+			mount.subscription.mu.RUnlock()
+			if pending != 0 {
 				return false
 			}
 		}
 		return true
 	})
+	// Local ref removal precedes delivery of the grant/release stream pair.
+	// Drain the Authority's exact current prefix before warming any cache.
+	position := f.coherence.OnCommit(nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if err := f.coherence.WaitWithdrawn(ctx, position, volumeserver.SessionID{}); err != nil {
+		t.Fatalf("drain delegation release changes through %d: %v", position, err)
+	}
+}
+
+// countLookupName isolates the withdrawn component from parent attribute misses.
+func (f *integrationFixture) countLookupName(name string, fn func()) int {
+	var calls atomic.Int32
+	f.counter.setBeforeHandle(func(request *authoritypb.Request) {
+		if lookup := request.GetLookup(); lookup != nil && string(lookup.GetName()) == name {
+			calls.Add(1)
+		}
+	})
+	defer f.counter.setBeforeHandle(nil)
+	fn()
+	return int(calls.Load())
 }
