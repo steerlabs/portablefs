@@ -792,6 +792,17 @@ issues EntryNotify, and resolves negative-name parents by Authority inode,
 matching their cache keys, rather than by FUSE node id. Cached-data records
 remain as invalidation indexes for surviving handles, with their pages withdrawn.
 The focused Docker command selecting this test and
-`TestColdSubscriptionNeverClearsEpochStaleness` passes (10.03 seconds for the
+`TestColdSubscriptionNeverClearsEpochStaleness` passes (10.02 seconds for the
 transport test); the wrapper exits 70 solely for omitted full-suite inventory.
 Logs: `/tmp/cv2-g2-r1-before.log`, `/tmp/cv2-g2-r1-after2.log`.
+
+### R2: bounded reconnect without a caller deadline
+
+Reconnect now uses an internal SubscriptionTTL deadline. A shorter caller
+cancellation/deadline keeps its original error; exhaustion of the internal
+bound returns ErrTransportUncertain without inventing a session verdict.
+`TestReconnectUnavailableListenerHonorsCallerDeadline/background` failed after
+11 seconds without the change and now returns at ten seconds. The caller
+50 ms deadline and listener-gap same/new-epoch tests pass. Exact command:
+`go -C vcs test ./internal/authorityrpc -run '^Test(ReconnectUnavailableListenerHonorsCallerDeadline|ReconnectSurvivesListenerGapBeforeEpochVerdict|IdleLinuxControlLossResumesWithoutEndingSession)$' -count=1`.
+Logs: `/tmp/cv2-g2-r2-before.log`, `/tmp/cv2-g2-r2-after.log`.

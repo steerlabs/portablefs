@@ -103,4 +103,18 @@ func TestReconnectUnavailableListenerHonorsCallerDeadline(t *testing.T) {
 	if err := client.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("deadline: %v", err)
 	}
+	t.Run("background", func(t *testing.T) {
+		result := make(chan error, 1)
+		go func() {
+			result <- client.reconnectTransport(context.Background(), authoritypb.TransportRole_TRANSPORT_ROLE_DATA)
+		}()
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrTransportUncertain) {
+				t.Fatalf("internal reconnect bound: %v", err)
+			}
+		case <-time.After(11 * time.Second):
+			t.Fatal("background reconnect has no internal deadline")
+		}
+	})
 }

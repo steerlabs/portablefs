@@ -475,11 +475,21 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 // A refused TCP connection during restart proves no session outcome. Keep the
 // caller's replay identity and retry transport establishment until its deadline
 // or an authenticated Hello/Resume establishes the epoch and session verdict.
+// Even a caller without a deadline cannot retry beyond one subscription TTL.
 func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) error {
+	caller := ctx
+	ctx, cancel := context.WithTimeout(ctx, volumeserver.SubscriptionTTL)
+	defer cancel()
+	boundedError := func() error {
+		if caller.Err() != nil {
+			return caller.Err()
+		}
+		return fmt.Errorf("%w: reconnect exceeded subscription horizon", ErrTransportUncertain)
+	}
 	for {
 		err := c.reconnectTransportOnce(ctx, role)
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return boundedError()
 		}
 		if err == nil || c.closed.Load() || c.poisoned.Load() {
 			return err
@@ -489,7 +499,7 @@ func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.Transp
 			return err
 		}
 		if err := waitTransportRetry(ctx); err != nil {
-			return err
+			return boundedError()
 		}
 	}
 }
