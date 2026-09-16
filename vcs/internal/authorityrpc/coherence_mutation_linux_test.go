@@ -310,3 +310,59 @@ func TestCoherenceNoOpWriteReportsExistingDurablePrefix(t *testing.T) {
 		t.Fatalf("no-op receipt = %v", response)
 	}
 }
+
+func TestCoherenceRecallFlushPassesPendingMacActivation(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	token, _ := h.coherenceToken(cred.ID)
+	identity := [16]byte{0x41}
+	grant, err := h.Coherence.DataMutated(t.Context(), token, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &writeTestTarget{committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0600, Nlink: 1}}
+	handle := prepareOneShotTarget(t, h, cred, store, target)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	recalled := make(chan error, 1)
+	go func() {
+		h.coherenceProfileAdmission.Lock()
+		defer h.coherenceProfileAdmission.Unlock()
+		recalled <- h.Coherence.Recall(ctx, identity)
+	}()
+	var event volumeserver.StreamEvent
+	var cursor uint64
+	for event.Kind != volumeserver.StreamRecall {
+		events, err := h.Coherence.Poll(ctx, token, cursor, nil, 32)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, next := range events {
+			cursor = next.Position
+			if next.Kind == volumeserver.StreamRecall {
+				event = next
+			}
+		}
+	}
+	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	req.GetWrite().Delegation = coherenceDelegationRefProto(grant)
+	done := make(chan *authoritypb.Response, 1)
+	go func() { done <- h.handleWrite(ctx, req, cred, req.GetWrite()) }()
+	var response *authoritypb.Response
+	select {
+	case response = <-done:
+	case <-ctx.Done():
+		t.Fatal("Mac activation blocked the flush needed by its recall")
+	}
+	if response.GetErrno() != 0 || response.GetAppliedSequence() != 1 {
+		t.Fatalf("flush = %v", response)
+	}
+	if err := h.Coherence.AckDelegation(token, identity, grant.ID, grant.Generation, event.Request, response.GetAppliedSequence()); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-recalled; err != nil {
+		t.Fatal(err)
+	}
+	if _, live := h.Coherence.LookupDelegation(identity); live {
+		t.Fatal("Mac activation left a live Linux delegation")
+	}
+}

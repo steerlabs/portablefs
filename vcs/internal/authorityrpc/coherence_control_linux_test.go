@@ -464,9 +464,27 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 	for i, grant := range grants {
 		releases[i] = &authoritypb.DelegationRelease{Delegation: coherenceDelegationRefProto(grant)}
 	}
+	flush, err := coordinator.BeginFlush(token, grants[0].Identity, grants[0].ID, grants[0].Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flush.End(5)
 	request := &authoritypb.Request{RequestId: 12, Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{
 		Incarnation: subscribe.GetIncarnation(), Delegations: releases,
 	}}}
+	for _, stale := range []uint64{0, 3} {
+		request.GetDelegationRelease().Delegations[0].AppliedSequence = stale
+		response, _ := handler.handleCoherenceControl(t.Context(), request, volumeserver.SessionCredential{ID: id})
+		if response.GetErrno() != errnos.EINVAL {
+			t.Fatalf("release with stale applied ticket %d = %+v", stale, response)
+		}
+		for _, grant := range grants {
+			if _, exists := coordinator.LookupDelegation(grant.Identity); !exists {
+				t.Fatal("stale applied ticket partially released batch")
+			}
+		}
+	}
+	request.GetDelegationRelease().Delegations[0].AppliedSequence = 5
 	for attempt := 0; attempt < 2; attempt++ {
 		response, _ := handler.handleCoherenceControl(t.Context(), request, volumeserver.SessionCredential{ID: id})
 		if response.GetErrno() != 0 || response.GetDelegationRelease() == nil {

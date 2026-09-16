@@ -308,3 +308,9 @@ retained as a qualification limit rather than hidden by changing its assertion.
 The full mode does not run the package-manager soak, live macOS FSKit mount
 matrix, or live-cell staging qualification. These remain integration/release
 qualification work, alongside wiring the new coordinator into protocol 7.
+
+`ReleaseAppliedBatch(token, grants, applied)` is the wire-adapter release hook.
+It checks the entire batch and requires each supplied application ticket to cover
+that generation's latest admitted apply before retiring any grant. The handler
+separately proves each ticket was issued to the same session and identity.
+`ReleaseBatch` remains the trusted internal-cleanup form without a wire receipt.

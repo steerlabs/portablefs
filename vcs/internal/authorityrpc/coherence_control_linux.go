@@ -777,6 +777,7 @@ func (h *VolumeHandler) handleCoherenceDelegationRelease(requestID uint64, id vo
 		return coherenceDelegationReleaseResponse(h, requestID)
 	}
 	grants := make([]volumeserver.Delegation, len(request.GetDelegations()))
+	applied := make([]uint64, len(request.GetDelegations()))
 	for i, release := range request.GetDelegations() {
 		ref := release.GetDelegation()
 		delegationID, parseErr := parseCoherenceDelegationID(ref.GetId())
@@ -794,8 +795,9 @@ func (h *VolumeHandler) handleCoherenceDelegationRelease(requestID uint64, id vo
 			return h.coherenceError(requestID, volumeserver.ErrDelegationAck)
 		}
 		grants[i] = volumeserver.Delegation{ID: delegationID, Identity: tracked.identity, Holder: id, Generation: tracked.generation}
+		applied[i] = release.GetAppliedSequence()
 	}
-	if _, err := h.Coherence.ReleaseBatch(token, grants); err != nil {
+	if _, err := h.Coherence.ReleaseAppliedBatch(token, grants, applied); err != nil {
 		return h.coherenceError(requestID, err)
 	}
 	for _, grant := range grants {

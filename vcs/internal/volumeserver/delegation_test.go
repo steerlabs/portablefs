@@ -657,6 +657,17 @@ func TestCoherenceReleaseBatchIsAtomic(t *testing.T) {
 			t.Fatal("partial release")
 		}
 	}
+	applied, err := c.BeginFlush(a, x, gx.ID, gx.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied.End(7)
+	if _, err := c.ReleaseAppliedBatch(a, []Delegation{gx, gy}, []uint64{0, 0}); !errors.Is(err, ErrDelegationAck) {
+		t.Fatalf("stale applied cut = %v", err)
+	}
+	if _, ok := c.LookupDelegation(y); !ok {
+		t.Fatal("stale applied cut partially released batch")
+	}
 	pin, err := c.BeginFlush(a, y, gy.ID, gy.Generation)
 	if err != nil {
 		t.Fatal(err)
@@ -665,7 +676,7 @@ func TestCoherenceReleaseBatchIsAtomic(t *testing.T) {
 		t.Fatal(err)
 	}
 	pin.End(0)
-	if _, err := c.ReleaseBatch(a, []Delegation{gx, gy}); err != nil {
+	if _, err := c.ReleaseAppliedBatch(a, []Delegation{gx, gy}, []uint64{7, 0}); err != nil {
 		t.Fatal(err)
 	}
 }

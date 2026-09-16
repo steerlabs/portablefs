@@ -165,11 +165,17 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return h.mutateFskitCoherence(ctx, req, cred, prepare, apply, releases...)
 	}
-	h.coherenceProfileAdmission.RLock()
-	defer h.coherenceProfileAdmission.RUnlock()
-	if err := h.Visibility.CheckCompatibilityWriter(cred.ID); err != nil {
-		return h.coherenceError(req.GetRequestId(), err)
+	if coherenceFlushReference(req) == nil {
+		h.coherenceProfileAdmission.RLock()
+		defer h.coherenceProfileAdmission.RUnlock()
+		if err := h.Visibility.CheckCompatibilityWriter(cred.ID); err != nil {
+			return h.coherenceError(req.GetRequestId(), err)
+		}
 	}
+	// Mac activation holds exclusive profile admission while recalling old
+	// delegations. Their exact-generation flushes must still pass so recall can
+	// drain. BeginFlush rejects stale references; activation publishes the Mac
+	// participant only after every recalled generation and active pin retires.
 	if ctx.Value(coherenceOperationKey{}) == nil {
 		ctx = context.WithValue(ctx, coherenceOperationKey{}, &coherenceOperation{})
 	}

@@ -820,6 +820,21 @@ func (c *CoherenceCoordinator) finishRetiredLocked(r *delegationRecord) {
 // caller attests last-handle close and completed flush; active pins or cuts
 // refuse release. Duplicate identities and stale generations reject the batch.
 func (c *CoherenceCoordinator) ReleaseBatch(token SubscriptionToken, grants []Delegation) (uint64, error) {
+	return c.releaseBatch(token, grants, nil)
+}
+
+// ReleaseAppliedBatch additionally proves that every release ticket covers the
+// latest storage application admitted under that generation. CONTROL validates
+// ticket ownership first; this comparison closes the remaining same-identity
+// stale-ticket case atomically with reference and active-pin validation.
+func (c *CoherenceCoordinator) ReleaseAppliedBatch(token SubscriptionToken, grants []Delegation, applied []uint64) (uint64, error) {
+	if len(applied) != len(grants) {
+		return 0, ErrDelegationAck
+	}
+	return c.releaseBatch(token, grants, applied)
+}
+
+func (c *CoherenceCoordinator) releaseBatch(token SubscriptionToken, grants []Delegation, applied []uint64) (uint64, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	s, err := c.subscriberLocked(token)
@@ -827,7 +842,7 @@ func (c *CoherenceCoordinator) ReleaseBatch(token SubscriptionToken, grants []De
 		return 0, err
 	}
 	seen := make(map[[16]byte]struct{}, len(grants))
-	for _, g := range grants {
+	for index, g := range grants {
 		r := c.delegations[g.Identity]
 		if _, ok := seen[g.Identity]; ok {
 			return 0, ErrDelegationStale
@@ -838,6 +853,9 @@ func (c *CoherenceCoordinator) ReleaseBatch(token SubscriptionToken, grants []De
 		}
 		if r.active != 0 || r.pending != nil || r.grant.State != DelegationActive {
 			return 0, ErrDelegationBusy
+		}
+		if applied != nil && applied[index] < r.applied {
+			return 0, ErrDelegationAck
 		}
 	}
 	for _, g := range grants {
