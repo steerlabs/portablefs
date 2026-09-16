@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -796,40 +797,99 @@ func TestPagedReaddirContinuesAcrossRemoteMutation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	directoryA, directoryB := f.join(0, "paged"), f.join(1, "paged")
 	mustMkdir(t, directoryA)
-	for i := range pagedEntryCount {
-		mustWrite(t, filepath.Join(directoryA, pagedEntryName(i)), nil, 0o600)
+	const anchors = 600
+	const slots = 64
+	padding := strings.Repeat("x", 180)
+	anchorName := func(i int) string { return fmt.Sprintf("anchor-%04d-%s", i, padding) }
+	churnName := func(i int) string { return fmt.Sprintf("churn-%06d-%s", i, padding[:160+i%20]) }
+	mutable := make([]string, slots)
+	for i := range anchors {
+		mustWrite(t, filepath.Join(directoryA, anchorName(i)), nil, 0o600)
+		if i < slots {
+			mutable[i] = churnName(i)
+			mustWrite(t, filepath.Join(directoryA, mutable[i]), nil, 0o600)
+		}
 	}
 	directory, err := os.Open(directoryB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer directory.Close()
-	seen := make(map[string]int)
+	first, err := directory.Readdirnames(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{first[0]: 1}
+	stop, done := make(chan struct{}), make(chan struct{})
+	failures := make(chan error, 1)
+	var cycles atomic.Int64
+	go func() {
+		defer close(done)
+		for i := slots; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			slot := i % slots
+			if err := os.Remove(filepath.Join(directoryA, mutable[slot])); err != nil {
+				failures <- err
+				return
+			}
+			name := churnName(i)
+			if err := os.WriteFile(filepath.Join(directoryA, name), nil, 0o600); err != nil {
+				failures <- err
+				return
+			}
+			mutable[slot] = name
+			cycles.Add(1)
+		}
+	}()
+	defer func() { close(stop); <-done }()
 	for page := 0; ; page++ {
-		entries, err := directory.ReadDir(7)
-		for _, entry := range entries {
-			seen[entry.Name()]++
+		// Force overlap across many kernel callbacks without coupling mutation to
+		// any individual cookie. Long names defeat the userspace getdents buffer.
+		wantCycles := int64(1 + page/5)
+		deadline := time.Now().Add(2 * time.Second)
+		for cycles.Load() < wantCycles && time.Now().Before(deadline) {
+			select {
+			case err := <-failures:
+				t.Fatalf("peer mutation: %v", err)
+			default:
+			}
+			time.Sleep(time.Millisecond)
+		}
+		names, err := directory.Readdirnames(5)
+		for _, name := range names {
+			seen[name]++
 		}
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
-			t.Fatalf("continued enumeration: %v", err)
+			t.Fatalf("continued enumeration (ESTALE forbidden): %v", err)
 		}
-		if page > pagedEntryCount {
+		if page > 2*anchors {
 			t.Fatal("enumeration did not terminate")
 		}
-		mustWrite(t, filepath.Join(directoryA, fmt.Sprintf("transient-%04d", page)), nil, 0o600)
-		if page > 0 {
-			if err := os.Remove(filepath.Join(directoryA, fmt.Sprintf("transient-%04d", page-1))); err != nil {
-				t.Fatal(err)
-			}
-		}
 	}
-	for i := range pagedEntryCount {
-		name := pagedEntryName(i)
+	select {
+	case err := <-failures:
+		t.Fatalf("peer mutation: %v", err)
+	default:
+	}
+	if cycles.Load() < 16 {
+		t.Fatalf("only %d concurrent mutation cycles", cycles.Load())
+	}
+	for i := range anchors {
+		name := anchorName(i)
 		if seen[name] != 1 {
 			t.Errorf("unchanged entry %q returned %d times", name, seen[name])
+		}
+	}
+	for name, count := range seen {
+		if count != 1 {
+			t.Errorf("entry %q returned %d times", name, count)
 		}
 	}
 }
