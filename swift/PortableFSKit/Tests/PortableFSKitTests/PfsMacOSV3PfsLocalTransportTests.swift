@@ -25,7 +25,7 @@ private func v3Contract(
     initialCursor: PfsVisibilityCursor? = nil
 ) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 6
+    contract.authorityProtocolMajor = 7
     contract.authorityEpoch = epoch
     contract.sessionID = sessionID
     contract.cachePolicy = policy
@@ -122,7 +122,7 @@ extension PfsLocalMockDaemonTests {
     let parsed = try PfsLocalMacOSV3CoherenceTransport.parseContract(
         v3Contract(initialCursor: complete)
     )
-    #expect(parsed.authorityProtocolMajor == 6)
+    #expect(parsed.authorityProtocolMajor == 7)
     #expect(parsed.epoch == v3Epoch)
     #expect(parsed.sessionID == v3LocalSession)
     #expect(parsed.cachePolicy == .synchronousVFSRepairV1)
@@ -143,6 +143,13 @@ extension PfsLocalMockDaemonTests {
     contract = v3Contract()
     contract.authorityProtocolMajor = 5
     #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(5)) {
+        try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
+    }
+
+    // Protocol 6 was the previous FSKit contract; it is refused, not translated.
+    contract = v3Contract()
+    contract.authorityProtocolMajor = 6
+    #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(6)) {
         try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
     }
 
