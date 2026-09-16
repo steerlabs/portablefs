@@ -307,3 +307,92 @@ inventory. Together with full run 89 (66 privileged tests and one root boundary
 test), this closes the current step-1 real-mount qualification. The final full
 verification and matrix still remain mandatory after the later deletion and
 performance work.
+
+## Step 3: expanded black-box matrix
+
+Run 91 passes the original 23-case matrix under v7: 22 PASS and the existing
+single-principal chown SKIP. Concurrent same-file append is enabled and is also
+required to fail in the stale-observation negative control. Added cases cover a
+retained peer cached handle, Git index.lock exclusion and rename publication,
+F4 rename with the writer still open and no prior fsync, authenticated gateway
+reads, recall-budget loss with an old-root failed barrier, and Authority epoch
+replacement without remounting either kernel filesystem. The destructive
+peer-loss case remains last. External gateway and fault-injection cases are
+excluded from controls whose intentionally broken actors cannot model them.
+
+Run 92 exposed a fixture validity-window error before mounting: the one-second
+NotBefore skew made a nominal one-hour capability exceed a one-hour maximum.
+The helper now measures the requested lifetime from NotBefore. Run 93 passes
+all original non-destructive cases and the new cached-handle, Git lock, F4, and
+recall-budget cases. The latter observes a 5.505-second acquisition, EIO on the
+old writer/root barrier, and healthy fresh handles.
+
+Run 93 also exposes two production gaps. The gateway always presented the empty
+routing revision and could not read a volume with a local-directory declaration.
+It now uses the common, validated one-retry adoption flow, with kernel enforcement
+required only for the Linux frontend. Authority restart also caused mounts to
+terminate on the first transient reconnect failure before detecting the new
+epoch; this remains under repair. Renewal was independently bound to the original
+client. The mount now publishes an exact authorization-session snapshot and its
+retirement channel; renewal cancels and joins the retired worker, constructs a
+fresh file source and renewer, and starts sequence one against the replacement's
+deadline. A retired worker never forwards its capability to a new client.
+These changes are not yet counted as a passing matrix gate.
+
+Runs 94 and 95 pass the exact-session authorization snapshot regression and all
+standalone renewal tests. Run 96 passes the routed gateway case. Its epoch
+replacement helper cannot append to a root-owned authority log; the harness
+now makes that log writable by the service identity. Transport reconnect now
+retries network errors within the caller's deadline while retaining the original
+request/replay identity. A new authenticated epoch is never replayed into. A
+sent mutation whose reconnect deadline expires retains the uncertain-outcome
+verdict. Linux idle CONTROL loss and local keepalive timeout no longer revoke
+the mount: its subscription horizon owns cache withdrawal. FSKit's terminal
+CONTROL behavior and authenticated session/auth failures remain terminal.
+
+The two terminal EOF publication tests are replaced by
+`TestTerminalSessionEndCannotOvertakeBufferedDataResponse` and
+`TestTerminalSessionEndCannotOvertakeDeliveredResponseCallback`; they inject an
+actual terminal session verdict and preserve the exact publication/drain
+assertions. `TestIdleLinuxControlLossResumesWithoutEndingSession` proves the v7
+replacement for idle-EOF revocation, including independent DATA preservation.
+`TestReconnectSurvivesListenerGapBeforeEpochVerdict` covers both same-epoch
+resume and a new epoch across a real unbound-listener interval. The caller
+deadline remains bounded. `TestKeepAliveTransportTimeoutDoesNotRevokeMount`
+complements the retained authenticated-keepalive-refusal abort test.
+
+Run 97 passes old-handle EIO, fresh reads, new root barriers, and renewal session
+replacement, then exposes a fresh-write startup refusal. The single durable
+membership set had conflated prior Linux mounts with Mac compatibility caches.
+`PFS-VISIBILITY-2` now records `linux-v7`, `compatibility`, or `cacheless` per
+session. Every v1 record remains conservatively `compatibility`; migration never
+infers Linux. Activation, clean-detach rollback, and the cell-host archive reader
+preserve and validate that classification. Operator assertions still audit and
+clear the exact recorded IDs. Aggregate prior membership remains unproven for
+route changes and archive proof, including old Linux IDs: epoch recovery is not
+proof that a kernel mount is absent.
+
+A prior Linux cache set delays mutations and delegation reservation for ten
+seconds from the new coordinator's creation, covering the longest old
+subscription horizon. This wait holds no identity/storage turn and is
+cancelable; cold Subscribe, reads, and barriers remain available. Prior Mac or
+untyped records still require the existing external fencing proof. The epoch
+matrix now additionally creates and publishes new data to its peer after
+recovery, so a passing read-only/barrier path cannot hide mutation refusal.
+
+Run 100 passes all 29 matrix outcomes (28 PASS, the existing chown SKIP), but
+its teardown needs intervention: runuser's parent monitor stops itself when the
+recall case SIGSTOPs the child and does not resume with the child. The harness
+now uses setpriv with the same service UID/GID, supplementary groups, and clean
+environment. Run 101 repeats the complete controls and real matrix to qualify
+normal process exit. Run 102 passes native race tests for volumeserver and
+authorityrpc. Final full verification remains outstanding.
+
+Run 101 exits 0 without intervention: both negative controls behave as declared,
+and the real matrix reports 28 PASS, zero failures, and the unchanged chown SKIP.
+The authority process and epoch change while kernel mount IDs and serving PIDs
+stay fixed. New data is written and read across the recovered mounts before the
+final destructive peer-loss case. Run 103 passes Linux standalone renewal,
+cell-host membership parsing, exact authorization snapshots, and keepalive
+regressions. This closes step 3; the later deletion/performance changes still
+require final full qualification.

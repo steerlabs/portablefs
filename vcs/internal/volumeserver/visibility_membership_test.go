@@ -167,3 +167,89 @@ func TestFileVisibilityMembershipIsBoundToOneVolume(t *testing.T) {
 		t.Fatal("membership file was accepted for a different volume")
 	}
 }
+
+func TestProfiledMembershipPreservesMacExclusionAcrossRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		profiles      []MountMembershipProfile
+		compatibility PriorEpochDisposition
+		linux         bool
+	}{
+		{"linux", []MountMembershipProfile{MembershipLinuxV7}, PriorEpochStrictMountsFenced, true},
+		{"mac", []MountMembershipProfile{MembershipCompatibility}, PriorEpochUnproven, false},
+		{"gateway", []MountMembershipProfile{MembershipCacheless}, PriorEpochStrictMountsFenced, false},
+		{"mixed", []MountMembershipProfile{MembershipLinuxV7, MembershipCompatibility, MembershipCacheless}, PriorEpochUnproven, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.Chmod(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "membership")
+			m, _, err := OpenFileVisibilityMembership(path, "vol", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, p := range tc.profiles {
+				if err := m.ActivateProfile(SessionID{byte(i + 1)}, p); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, prior, err := OpenFileVisibilityMembership(path, "vol", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			compatibility, linux := m.PriorCacheState()
+			if prior != PriorEpochUnproven || compatibility != tc.compatibility || linux != tc.linux {
+				t.Fatalf("prior=%v compatibility=%v linux=%v", prior, compatibility, linux)
+			}
+			for i, p := range tc.profiles {
+				if m.profiles[SessionID{byte(i + 1)}] != p {
+					t.Fatal("profile lost on reload")
+				}
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			m, prior, err = OpenFileVisibilityMembership(path, "vol", true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.Close()
+			compatibility, linux = m.PriorCacheState()
+			if prior != PriorEpochStrictMountsFenced || compatibility != PriorEpochStrictMountsFenced || linux || len(m.ClearedByOperatorAssertion()) != len(tc.profiles) {
+				t.Fatal("operator clear did not audit and clear every profile")
+			}
+		})
+	}
+}
+
+func TestLegacyMembershipCannotBeInferredToBeLinux(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "membership")
+	id := SessionID{7}
+	if err := os.WriteFile(path, []byte("PFS-VISIBILITY-1\n"+hex.EncodeToString([]byte("vol"))+"\n"+hex.EncodeToString(id[:])+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m, prior, err := OpenFileVisibilityMembership(path, "vol", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	compatibility, linux := m.PriorCacheState()
+	if prior != PriorEpochUnproven || compatibility != PriorEpochUnproven || linux {
+		t.Fatal("legacy record lost conservative fencing obligation")
+	}
+	if err := m.ActivateProfile(SessionID{8}, MembershipLinuxV7); err != nil {
+		t.Fatal(err)
+	}
+	if m.profiles[id] != MembershipCompatibility {
+		t.Fatal("migration reclassified legacy mount")
+	}
+}

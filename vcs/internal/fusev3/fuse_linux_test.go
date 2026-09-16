@@ -2228,3 +2228,33 @@ func TestLookupPublishesHolderBufferedSize(t *testing.T) {
 		t.Fatalf("holder lookup published stale size or cache lifetime: %+v", out)
 	}
 }
+
+func TestKeepAliveTransportTimeoutDoesNotRevokeMount(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	calls := make(chan struct{}, 8)
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetKeepAlive() != nil {
+			calls <- struct{}{}
+			return nil, context.DeadlineExceeded
+		}
+		return nil, nil
+	}
+	mount.wg.Add(1)
+	go mount.keepAlive(mount.ctx, 15*time.Millisecond)
+	for range 3 {
+		select {
+		case <-calls:
+		case <-mount.ctx.Done():
+			t.Fatal("transport timeout revoked mount")
+		case <-time.After(time.Second):
+			t.Fatal("keepalive did not retry")
+		}
+	}
+	select {
+	case <-mount.ctx.Done():
+		t.Fatal("transport timeout revoked mount")
+	default:
+	}
+	mount.cancel()
+	mount.wg.Wait()
+}

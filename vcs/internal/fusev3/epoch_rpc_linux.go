@@ -25,12 +25,15 @@ type epochRecoverableRPC interface {
 // epoch transport before dispatch. Recovery publishes its replacement with one
 // pointer swap, so no consumer can observe a mixture of old and new methods.
 type epochRPC struct {
-	mu        sync.RWMutex
-	recoverMu sync.Mutex
-	rpc       RPC
+	mu                   sync.RWMutex
+	recoverMu            sync.Mutex
+	rpc                  RPC
+	authorizationChanged chan struct{}
 }
 
-func newEpochRPC(rpc RPC) *epochRPC { return &epochRPC{rpc: rpc} }
+func newEpochRPC(rpc RPC) *epochRPC {
+	return &epochRPC{rpc: rpc, authorizationChanged: make(chan struct{})}
+}
 
 func (e *epochRPC) current() RPC {
 	e.mu.RLock()
@@ -79,6 +82,8 @@ func (e *epochRPC) recover(ctx context.Context) error {
 	old.FinishLocalSessionEnforcement()
 	e.mu.Lock()
 	e.rpc = replacement
+	close(e.authorizationChanged)
+	e.authorizationChanged = make(chan struct{})
 	e.mu.Unlock()
 	_ = old.Close()
 	return nil

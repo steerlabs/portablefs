@@ -32,6 +32,7 @@ const (
 // goroutine, an open descriptor, an ssh client, or a shell helper cannot survive
 // into a later case.
 type isolatedSpec struct {
+	Commands       v7Commands   `json:"v7_commands"`
 	Mode           isolatedMode `json:"mode"`
 	CaseName       string       `json:"case_name,omitempty"`
 	MountA         string       `json:"mount_a"`
@@ -207,6 +208,7 @@ func runCaseInChild(entry coherenceCase, spec isolatedSpec) (outcome, error) {
 		replaces:       spec.Replaces,
 		localRoute:     spec.LocalRoute,
 		routesContract: spec.RoutesContract,
+		commands:       spec.Commands,
 	}), nil
 }
 
@@ -217,7 +219,7 @@ func executeCaseDirect(entry coherenceCase, a, b actor, runID string, inputs cas
 	run := &caseRun{
 		a: a, b: b, dir: runID + "/" + entry.name,
 		altGID: inputs.altGID, fenceCmd: inputs.fenceCmd, replaces: inputs.replaces,
-		localRoute: inputs.localRoute, routesContract: inputs.routesContract,
+		localRoute: inputs.localRoute, routesContract: inputs.routesContract, commands: inputs.commands,
 	}
 	result = outcome{Name: entry.name, What: entry.what}
 	started := time.Now()
@@ -294,6 +296,7 @@ func executeIsolatedCase(entry coherenceCase, base isolatedSpec, inputs caseInpu
 	spec.Replaces = inputs.replaces
 	spec.LocalRoute = inputs.localRoute
 	spec.RoutesContract = inputs.routesContract
+	spec.Commands = inputs.commands
 
 	execution, err := invokeIsolatedChild(spec, timeout)
 	if err != nil {

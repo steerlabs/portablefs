@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 )
@@ -83,7 +84,7 @@ func AttachWithRoutes(ctx context.Context, attach authorityrpc.ClientConfig, ado
 	// This package hands the session to the strict Linux FUSE frontend. Its
 	// public terminal edge must certify that the bounded kernel withdrawal has
 	// finished, rather than racing ahead and triggering that withdrawal.
-	attach.RequireLocalSessionEnforcement = true
+	attach.RequireLocalSessionEnforcement = attach.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
 	rules := localroutes.RuleSet{}
 	attach.RoutesRevision = rules.Revision()
 	client, err := dialOnce(ctx, attach)

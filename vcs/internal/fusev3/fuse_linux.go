@@ -729,6 +729,11 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 			if errors.Is(err, authorityrpc.ErrAuthorityChanged) || errors.Is(m.rpc.SessionEndCause(), authorityrpc.ErrAuthorityChanged) {
 				continue
 			}
+			// A local timeout says nothing about the remote epoch or session.
+			// Subscription expiry independently withdraws every cached item.
+			if err != nil && m.rpc.SessionEndCause() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, authorityrpc.ErrTransportUncertain)) {
+				continue
+			}
 			if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 				m.subscription.deactivate()
 				continue
@@ -746,12 +751,9 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 	}
 }
 
-// keepAliveInterval makes the strict frontend's authority-contact failure
-// bound no larger than its cache-repair contract. The authority may fence a
-// participant whose lease CONTROL connection was lost; after that fence, this
-// lane is how the frontend learns it must abort even though it never received
-// the recall that would have started a withdrawal timer. One interval to start a renewal
-// plus one interval for its deadline is at most two thirds of RepairBudget.
+// keepAliveInterval reserves regular contact for runtime session and signed
+// authorization checks. Subscription horizons, not heartbeat transport errors,
+// govern Linux cache withdrawal.
 func keepAliveInterval(lease time.Duration, repairBudget time.Duration) time.Duration {
 	interval := lease / 3
 	if strict := repairBudget / 3; strict < interval {

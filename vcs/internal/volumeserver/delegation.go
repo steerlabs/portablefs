@@ -229,6 +229,9 @@ func (c *CoherenceCoordinator) Reserve(ctx context.Context, token SubscriptionTo
 }
 
 func (c *CoherenceCoordinator) reserve(ctx context.Context, token SubscriptionToken, identity [16]byte, ephemeral bool) (*DelegationReservation, error) {
+	if err := c.WaitPriorCacheHorizon(ctx); err != nil {
+		return nil, err
+	}
 	if identity == ([16]byte{}) {
 		return nil, ErrCoherenceIdentity
 	}

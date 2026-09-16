@@ -486,3 +486,13 @@ Private synchronous generations exclude their source from grant/release reverse
 notifications; its exact publication gate and post-state repair those coordinates.
 Promotion to a visible grant restores the ordinary release notification. Normal
 client-visible grants remain broadcast to purge the holder's earlier cached pages.
+
+A new Authority process must also account for the preceding epoch's cache
+horizon. Durable membership distinguishes Linux v7, cacheless readers, and
+compatibility mounts. If any prior Linux v7 mount is recorded, the replacement
+waits a full SubscriptionTTL from coordinator creation before granting a writer
+delegation or applying a mutation. Cold Subscribe, ordinary reads, and barriers
+remain available during that interval. A canceled wait takes no storage or
+identity turn. This bound does not establish kernel mount absence: old durable
+records still block topology changes and archive proof. Prior compatibility or
+untyped legacy membership continues to require explicit fencing evidence.

@@ -1080,22 +1080,47 @@ func TestClientSignalsTerminalSessionOnExpiredKeepAlive(t *testing.T) {
 	stop()
 }
 
-func TestIdleConnectionClosureSignalsTerminalSession(t *testing.T) {
-	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, 50*time.Millisecond)
+func TestIdleLinuxControlLossResumesWithoutEndingSession(t *testing.T) {
+	address, clientTLS, stop := startTestServer(t, clientTestHandler{epoch: make([]byte, 16), maxInFlight: testMaxInFlight}, testMaxInFlight, time.Minute)
+	defer stop()
 	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "volume", 4, 4))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer client.Close()
+	client.control.pendingMu.Lock()
+	old := client.control.conn
+	generation := client.control.binding.Load()
+	client.control.pendingMu.Unlock()
+	client.data.pendingMu.Lock()
+	data := client.data.conn
+	client.data.pendingMu.Unlock()
+	client.failConnection(client.control, old, ErrTransportUncertain)
 	select {
 	case <-client.SessionDone():
-		if !errors.Is(client.SessionError(), ErrTransportUncertain) {
-			t.Fatalf("SessionError = %v", client.SessionError())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("idle connection death was not signaled")
+		t.Fatalf("socket loss ended Linux session: %v", client.SessionError())
+	default:
 	}
-	_ = client.Close()
-	stop()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	response, err := client.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
+	if err != nil || response.GetErrno() != 0 {
+		t.Fatalf("resume: %v %v", response, err)
+	}
+	client.control.pendingMu.Lock()
+	replaced := client.control.conn != nil && client.control.conn != old
+	client.control.pendingMu.Unlock()
+	client.data.pendingMu.Lock()
+	sameData := client.data.conn == data
+	client.data.pendingMu.Unlock()
+	if !replaced || !sameData || client.control.binding.Load() <= generation {
+		t.Fatal("CONTROL resume did not preserve independent DATA")
+	}
+	select {
+	case <-client.SessionDone():
+		t.Fatalf("resumed session ended: %v", client.SessionError())
+	default:
+	}
 }
 
 func TestClientRequiresArchitectureFeatures(t *testing.T) {
@@ -2019,7 +2044,7 @@ func TestTerminalDeliveryTokenAndAcknowledgmentShapesAreExact(t *testing.T) {
 	}
 }
 
-func TestTerminalControlEOFCannotOvertakeBufferedDataResponse(t *testing.T) {
+func TestTerminalSessionEndCannotOvertakeBufferedDataResponse(t *testing.T) {
 	dataClient, dataPeer := net.Pipe()
 	controlClient, controlPeer := net.Pipe()
 	gate := make(chan struct{})
@@ -2050,15 +2075,17 @@ func TestTerminalControlEOFCannotOvertakeBufferedDataResponse(t *testing.T) {
 	writeDone := make(chan error, 1)
 	go func() { writeDone <- writeFrame(dataPeer, testMaxFrame, terminalAppliedMutationResponse(request)) }()
 
-	// The sibling CONTROL lane closes while DATA's exact terminal frame is
-	// already being written but its reader is deliberately paused.
+	// The session ends while its exact DATA frame is already being written
+	// but its reader is deliberately paused.
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	client.signalSessionEnd(ErrSessionEnded)
 	waitForClientTerminalCause(t, client)
 	select {
 	case <-client.SessionDone():
-		t.Fatal("CONTROL EOF exposed SessionDone before buffered DATA was parsed")
+		t.Fatal("terminal verdict exposed SessionDone before buffered DATA was parsed")
 	default:
 	}
 	close(gate)
@@ -2082,7 +2109,7 @@ func TestTerminalControlEOFCannotOvertakeBufferedDataResponse(t *testing.T) {
 	}
 }
 
-func TestTerminalEOFCannotOvertakeDeliveredResponseCallback(t *testing.T) {
+func TestTerminalSessionEndCannotOvertakeDeliveredResponseCallback(t *testing.T) {
 	dataClient, dataPeer := net.Pipe()
 	controlClient, controlPeer := net.Pipe()
 	client := newTerminalDrainTestClient(dataClient, controlClient, time.Second)
@@ -2123,10 +2150,12 @@ func TestTerminalEOFCannotOvertakeDeliveredResponseCallback(t *testing.T) {
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	client.signalSessionEnd(ErrSessionEnded)
 	waitForClientTerminalCause(t, client)
 	select {
 	case <-client.SessionDone():
-		t.Fatal("terminal EOF overtook an exact response delivered to a paused callback")
+		t.Fatal("terminal verdict overtook an exact response delivered to a paused callback")
 	default:
 	}
 	close(releaseCallback)
@@ -2180,6 +2209,8 @@ func TestTerminalDrainRevokesBeforeForcedSessionDone(t *testing.T) {
 	if err := controlPeer.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// An authenticated session verdict, not a socket EOF, is terminal in v7.
+	client.signalSessionEnd(ErrSessionEnded)
 	select {
 	case <-forced:
 	case <-time.After(time.Second):

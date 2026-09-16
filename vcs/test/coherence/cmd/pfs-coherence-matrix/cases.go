@@ -50,6 +50,7 @@ type caseRun struct {
 	// by itself, so asserting the refusal needs a client that does not. Empty
 	// means the same loud skip.
 	routesContract string
+	commands       v7Commands
 }
 
 // sameDirToleratedFencedMounts is deliberately zero. The frontend reports a
@@ -193,11 +194,8 @@ func parseSummary(text string) map[string]string {
 	return out
 }
 
-// mountFenced reports whether this mount has revoked itself. A strict frontend
-// that misses its declared repair budget withdraws every binding it published
-// and aborts its kernel connection, after which the kernel answers every request
-// with ENOTCONN. That is a definite answer, not a hang, so the harness can tell
-// "fenced" apart from "wedged" without any privileged inspection.
+// mountFenced detects a lost kernel connection. Ordinary v7 recall, subscription
+// expiry and epoch changes must preserve that connection and report scoped EIO.
 func (c *caseRun) mountFenced(who actor) bool {
 	out := c.do(who, request{Op: "stat", Path: c.dir})
 	return out.Errno == int(syscall.ENOTCONN)
@@ -237,7 +235,7 @@ func preview(data []byte) string {
 // the matrix
 // ---------------------------------------------------------------------------
 
-func allCases() []coherenceCase {
+func baselineCases() []coherenceCase {
 	return []coherenceCase{
 		{
 			name: "remote_create_visible",
@@ -644,6 +642,8 @@ func allCases() []coherenceCase {
 				}
 				// Read from the other mount too: both must observe the same file.
 				c.expectBytes(c.b, target, data, "the same shared append file seen from the other mount")
+				c.barrier(c.a)
+				c.barrier(c.b)
 			},
 		},
 		{
@@ -693,6 +693,8 @@ func allCases() []coherenceCase {
 						c.a.name(), aCount, bCount, len(data)-aCount-bCount, size)
 				}
 				c.expectBytes(c.b, target, data, "the same shared file seen from the other mount")
+				c.barrier(c.a)
+				c.barrier(c.b)
 			},
 		},
 		{

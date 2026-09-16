@@ -107,7 +107,7 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 	}
 	// This peer owns no kernel cache and joins no mutation withdrawal barrier.
 	// The authority breaks active delegations before answering its reads.
-	rpc, err := authorityrpc.DialClient(ctx, authorityrpc.ClientConfig{
+	rpc, _, err := mountv3.AttachWithRoutes(ctx, authorityrpc.ClientConfig{
 		AccessToken:        append([]byte(nil), config.Capability...),
 		Address:            config.Address,
 		CancelDrainTimeout: mountv3.CancelDrainTimeout,
@@ -132,7 +132,7 @@ func Dial(ctx context.Context, config Config) (*Client, error) {
 			ServerName:   config.AuthorityServerName,
 		},
 		VolumeID: config.VolumeID,
-	})
+	}, true)
 	if err != nil {
 		return nil, err
 	}

@@ -137,7 +137,7 @@ func run(arguments []string) error {
 			Subject:   subject,
 			Access:    access,
 			NotBefore: now.Add(-time.Second).Unix(),
-			Expires:   now.Add(*lifetime).Unix(),
+			Expires:   now.Add(*lifetime - time.Second).Unix(),
 			PeerSPKI:  base64.RawURLEncoding.EncodeToString(peer[:]),
 			Nonce:     hex.EncodeToString(nonce[:]),
 		})
@@ -150,6 +150,13 @@ func run(arguments []string) error {
 		if err := write(fmt.Sprintf("access-%d.token", index), 0o600, token); err != nil {
 			return err
 		}
+	}
+	gatewayToken, err := mint("coherence-gateway", []string{"read"})
+	if err != nil {
+		return err
+	}
+	if err := write("gateway.token", 0o600, gatewayToken); err != nil {
+		return err
 	}
 	for index := range *adminTokens {
 		token, err := mint(fmt.Sprintf("coherence-admin-%d", index), []string{"admin"})

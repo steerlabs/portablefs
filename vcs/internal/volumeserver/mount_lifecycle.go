@@ -19,6 +19,7 @@ type MountLifecycle struct {
 	topology sync.RWMutex
 	mu       sync.Mutex
 	active   map[SessionID]time.Time
+	profiles map[SessionID]MountMembershipProfile
 	// priorUnproven cannot be cleared by process-local events. Only reopening the
 	// durable membership with the operator's fencing assertion can clear it.
 	priorUnproven bool
@@ -40,7 +41,7 @@ func NewMountLifecycle(cfg MountLifecycleConfig) (*MountLifecycle, error) {
 	}
 	return &MountLifecycle{
 		membership: cfg.Membership, now: cfg.Now, clockSkew: cfg.ClockSkew,
-		active: make(map[SessionID]time.Time), priorUnproven: cfg.Prior != PriorEpochStrictMountsFenced,
+		active: make(map[SessionID]time.Time), profiles: make(map[SessionID]MountMembershipProfile), priorUnproven: cfg.Prior != PriorEpochStrictMountsFenced,
 	}, nil
 }
 
@@ -80,6 +81,19 @@ func (l *MountLifecycle) RequireCleanRouteAbsence() error {
 // publication can escape. The caller already holds a topology read guard so a
 // route change cannot fit between revision admission and this registration.
 func (l *MountLifecycle) Activate(id SessionID, publish func() error) error {
+	return l.ActivateProfile(id, MembershipCompatibility, publish)
+}
+
+func activateMembership(m DurableVisibilityMembership, id SessionID, profile MountMembershipProfile) error {
+	if typed, ok := m.(interface {
+		ActivateProfile(SessionID, MountMembershipProfile) error
+	}); ok {
+		return typed.ActivateProfile(id, profile)
+	}
+	return m.Activate(id)
+}
+
+func (l *MountLifecycle) ActivateProfile(id SessionID, profile MountMembershipProfile, publish func() error) error {
 	if id == (SessionID{}) || publish == nil {
 		return ErrLeaseHolder
 	}
@@ -88,7 +102,7 @@ func (l *MountLifecycle) Activate(id SessionID, publish func() error) error {
 	if _, exists := l.active[id]; exists {
 		return ErrLeaseHolder
 	}
-	if err := l.membership.Activate(id); err != nil {
+	if err := activateMembership(l.membership, id, profile); err != nil {
 		return err
 	}
 	if err := publish(); err != nil {
@@ -102,6 +116,7 @@ func (l *MountLifecycle) Activate(id SessionID, publish func() error) error {
 		return errors.Join(err, rollbackErr)
 	}
 	l.active[id] = l.now()
+	l.profiles[id] = profile
 	return nil
 }
 
@@ -125,13 +140,14 @@ func (l *MountLifecycle) CleanDetach(id SessionID, proof MountAbsenceProof, remo
 		return err
 	}
 	if err := remove(); err != nil {
-		rollbackErr := l.membership.Activate(id)
+		rollbackErr := activateMembership(l.membership, id, l.profiles[id])
 		if rollbackErr != nil {
 			l.priorUnproven = true
 		}
 		return errors.Join(err, rollbackErr)
 	}
 	delete(l.active, id)
+	delete(l.profiles, id)
 	return nil
 }
 

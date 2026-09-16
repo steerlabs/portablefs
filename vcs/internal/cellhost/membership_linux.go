@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/steerlabs/portablefs/vcs/internal/cellplan"
@@ -18,9 +19,8 @@ import (
 
 // The durable strict-mount membership record is written and owned by the
 // authority; these constants mirror its on-disk format exactly as implemented
-// in vcs/internal/volumeserver/visibility_membership.go (header at :15, the
-// writer at persistLocked :211-262, the reader at load :170-209) with the
-// session identifier width from volumeserver/session.go:31.
+// in vcs/internal/volumeserver/visibility_membership.go, with the session
+// identifier width from volumeserver/session.go.
 //
 // The helper deliberately re-implements the read side instead of importing
 // volumeserver: volumeserver is the authority's package, the authority is the
@@ -30,9 +30,9 @@ import (
 // the bytes in the writer's format.
 const (
 	visibilityMembershipName    = "visibility.membership"
-	visibilityMembershipHeader  = "PFS-VISIBILITY-1"
+	visibilityMembershipHeader  = "PFS-VISIBILITY-2"
 	visibilityMembershipIDBytes = 16
-	// A membership line is 33 bytes, so this bound admits roughly 32k
+	// A profiled membership line is at most 47 bytes, so this admits over 22k
 	// concurrent strict mounts - orders of magnitude above any real volume -
 	// and refuses a file that has stopped being a membership record.
 	visibilityMembershipMaxBytes = 1 << 20
@@ -102,7 +102,11 @@ func (host *Host) StrictMembershipEmpty(volumeID string) (bool, error) {
 // active line. Every deviation is an error; nothing is skipped.
 func parseStrictMembership(reader io.Reader, volumeID string) (int, error) {
 	scanner := bufio.NewScanner(reader)
-	if !scanner.Scan() || scanner.Text() != visibilityMembershipHeader {
+	if !scanner.Scan() {
+		return 0, errors.New("cellhost: missing strict-mount membership header")
+	}
+	legacy := scanner.Text() == "PFS-VISIBILITY-1"
+	if !legacy && scanner.Text() != visibilityMembershipHeader {
 		return 0, errors.New("cellhost: invalid strict-mount membership header")
 	}
 	if !scanner.Scan() || scanner.Text() != hex.EncodeToString([]byte(volumeID)) {
@@ -110,7 +114,20 @@ func parseStrictMembership(reader io.Reader, volumeID string) (int, error) {
 	}
 	seen := make(map[[visibilityMembershipIDBytes]byte]struct{})
 	for scanner.Scan() {
-		raw, err := hex.DecodeString(scanner.Text())
+		record := scanner.Text()
+		if !legacy {
+			fields := strings.Split(record, "\t")
+			if len(fields) != 2 {
+				return 0, errors.New("cellhost: invalid profiled membership record")
+			}
+			switch fields[1] {
+			case "compatibility", "linux-v7", "cacheless":
+			default:
+				return 0, errors.New("cellhost: unknown membership profile")
+			}
+			record = fields[0]
+		}
+		raw, err := hex.DecodeString(record)
 		if err != nil || len(raw) != visibilityMembershipIDBytes {
 			return 0, errors.New("cellhost: invalid strict-mount membership record")
 		}

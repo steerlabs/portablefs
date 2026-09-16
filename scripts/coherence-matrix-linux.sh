@@ -37,11 +37,8 @@ set -euo pipefail
 : "${PORTABLEFS_VOLUME_NAME:=coherence-volume}"
 : "${PORTABLEFS_AUTHORITY_PORT:=17443}"
 : "${PORTABLEFS_ATOMIC_REPLACE_ROUNDS:=20}"
-# This black-box harness proves only the syscall behavior its cases observe. It
-# does not inspect or prove protocol-6 lease grants, recalls, or discharge. The
-# legacy-named bounds remain explicit while their command-line admission surface
-# is retired; if mount and authority disagree, Attach must fail rather than let
-# the harness paper over it. Dedicated v6 tests must cover the mechanism.
+# The cases assert protocol-7 subscription/delegation behavior through syscalls.
+# Cache bounds remain explicit so Attach refuses incompatible admission limits.
 : "${PORTABLEFS_CACHED_NAME_CAPACITY:=65536}"
 : "${PORTABLEFS_REPAIR_BUDGET:=15s}"
 # The driver's per-case wall bound. It is deliberately larger than
@@ -84,11 +81,10 @@ FALSIFIABLE_CASES=(
   remote_truncate_shrink_readable_eof
   dir_listing_reflects_remote_creates_and_deletes
   concurrent_writers_distinct_files
-  # Protocol 6 refuses writable O_APPEND because stock FUSE cannot preserve
-  # append intent or return an authority-assigned offset. The real matrix
-  # declares that case FAIL; a case which is intentionally unavailable cannot
-  # also serve as evidence that the stale-view control detects a bug.
+  concurrent_same_file_append_atomicity
   concurrent_same_file_overwrite_integrity
+  git_index_lock_protocol
+  write_then_rename_flushes_before_visibility
   hardlink_visible_same_inode
   symlink_visible_and_resolves
   deep_nesting
@@ -196,7 +192,7 @@ create_service_identity() {
 # environment. The data plane never runs as root, and root would bypass every
 # DAC decision the mounts delegate to the kernel.
 as_service() {
-  runuser -u portablefs -- env -i \
+  setpriv --reuid portablefs --regid portablefs --init-groups -- env -i \
     HOME=/home/portablefs \
     PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin \
     TMPDIR=/home/portablefs/tmp \
@@ -237,9 +233,13 @@ start_authority() {
   [[ $(findmnt -n -r -o TARGET --target "$write_staging") == "$write_staging" ]] ||
     fail "write staging bind mount is not installed at $write_staging" 70
   as_service /home/portablefs/bin/pfs-coherence-credentials \
-    --dir /home/portablefs/creds --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 ||
+    --dir /home/portablefs/creds --volume-id "$PORTABLEFS_VOLUME_NAME" --tokens 6 --admin-tokens 2 --lifetime 1h ||
     fail "minting the credential set failed" 70
-  as_service /home/portablefs/bin/portablefs-authority \
+  cat > /home/portablefs/launch-authority.sh <<LAUNCH
+#!/usr/bin/env bash
+set -euo pipefail
+echo \$\$ > /home/portablefs/authority.pid
+exec /home/portablefs/bin/portablefs-authority \
     --listen "127.0.0.1:${PORTABLEFS_AUTHORITY_PORT}" \
     --volume-id "$PORTABLEFS_VOLUME_NAME" \
     --root "$volume" \
@@ -252,8 +252,14 @@ start_authority() {
     --write-staging-dir "$write_staging" \
     --max-cached-name-capacity "$PORTABLEFS_CACHED_NAME_CAPACITY" \
     --max-repair-budget "$PORTABLEFS_REPAIR_BUDGET" \
-    >/home/portablefs/logs/authority.log 2>&1 &
+    --capability-max-lifetime 1h
+LAUNCH
+  chmod 0700 /home/portablefs/launch-authority.sh
+  chown portablefs:portablefs /home/portablefs/launch-authority.sh
+  as_service /home/portablefs/launch-authority.sh >/home/portablefs/logs/authority.log 2>&1 &
   AUTHORITY_PID=$!
+  touch /home/portablefs/logs/authority.log
+  chown portablefs:portablefs /home/portablefs/logs/authority.log
   local waited=0
   until (exec 3<>/dev/tcp/127.0.0.1/"$PORTABLEFS_AUTHORITY_PORT") 2>/dev/null; do
     exec 3>&- 2>/dev/null || true
@@ -356,14 +362,15 @@ start_mount() {
     waited=$((waited + 1))
     (( waited < 150 )) || { cat "/home/portablefs/logs/mount-${index}.log" >&2; fail "mount $index never appeared at $point" 70; }
   done
-  # $! is runuser's PID and root owns it; the matrix runs as the unprivileged
-  # volume identity and could not signal it. Resolve the mount process itself,
+  # $! may name the supervising shell; the matrix runs as the unprivileged
+  # volume identity and must signal the actual mount process. Resolve the mount process itself,
   # owned by that identity, so the fence case delivers a real SIGKILL to a live
   # mount instead of reporting a permission error as a dead peer.
   local real
   real=$(pgrep -u portablefs -f -- "--mountpoint $point" | head -1)
   [[ -n $real ]] || fail "cannot resolve the mount process serving $point" 70
   printf -v "$pidvar" '%s' "$real"
+  printf '%s\n' "$real" > "/home/portablefs/mount-${index}.pid"
   echo "coherence-matrix-linux: mount $index pid $pid live at $point ($(findmnt -n -r -o FSTYPE,SOURCE --target "$point"))"
 }
 
@@ -375,6 +382,7 @@ teardown() {
   done
   [[ -n ${MOUNT_A_PID:-} ]] && kill "$MOUNT_A_PID" 2>/dev/null
   [[ -n ${MOUNT_B_PID:-} ]] && kill "$MOUNT_B_PID" 2>/dev/null
+  [[ -f /home/portablefs/authority.pid ]] && kill "$(cat /home/portablefs/authority.pid)" 2>/dev/null
   [[ -n ${AUTHORITY_PID:-} ]] && kill "$AUTHORITY_PID" 2>/dev/null
   wait 2>/dev/null
   if [[ -n ${WRITE_STAGING_BIND:-} ]]; then
@@ -439,7 +447,7 @@ run_disjoint_control() {
       # through a client that touches no mountpoint, so pointing the second root
       # at an unrelated directory cannot turn it red. It is expected to PASS
       # here, which is why it is simply not declared.
-      routes_revision_mismatch|concurrent_same_file_append_atomicity) continue ;;
+      routes_revision_mismatch|gateway_reads_delegated_data_without_obstructing_writer|recall_budget_loss_fails_barrier|epoch_change_stales_handles_and_new_barrier_passes) continue ;;
     esac
     arguments+=(--expect "${entry}=FAIL:a mount that shares no namespace with the other must fail this case")
   done
@@ -448,7 +456,7 @@ run_disjoint_control() {
   # consumes one single-use capability. Exclude it here so the final matrix is
   # the one phase that owns and spends that credential.
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
-    cut -f1 | grep -Ev '^(routes_revision_mismatch|concurrent_same_file_append_atomicity)$' | paste -sd, -)
+    cut -f1 | grep -Ev '^(routes_revision_mismatch|gateway_reads_delegated_data_without_obstructing_writer|recall_budget_loss_fails_barrier|epoch_change_stales_handles_and_new_barrier_passes)$' | paste -sd, -)
   echo
   echo "======================================================================"
   echo "PHASE 1/3  disjoint-namespace control (second root is not the volume)"
@@ -482,7 +490,7 @@ run_falsifiability_control() {
     arguments+=(--expect "${name}=FAIL:a replayed first-success pathname observation must be detected by this case")
   done
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
-    cut -f1 | grep -Ev '^(routes_revision_mismatch|concurrent_same_file_append_atomicity)$' | paste -sd, -)
+    cut -f1 | grep -Ev '^(routes_revision_mismatch|gateway_reads_delegated_data_without_obstructing_writer|recall_budget_loss_fails_barrier|epoch_change_stales_handles_and_new_barrier_passes)$' | paste -sd, -)
   echo
   echo "======================================================================"
   echo "PHASE 2/3  first-success stale-view control (deliberately broken pathname observations)"
@@ -515,11 +523,48 @@ run_matrix() {
     --atomic-replace-rounds "$PORTABLEFS_ATOMIC_REPLACE_ROUNDS" \
     --case-timeout "$PORTABLEFS_CASE_TIMEOUT" \
     --fence-command "$FENCE_COMMAND" \
+    --pause-command "$PAUSE_COMMAND" \
+    --resume-command "$RESUME_COMMAND" \
+    --epoch-command /home/portablefs/restart-authority.sh \
+    --gateway-command "$GATEWAY_COMMAND" \
     --local-route "$PORTABLEFS_LOCAL_ROUTE" \
     --routes-contract-command "$ROUTES_CONTRACT_COMMAND" \
     --expect "remote_chown_visible=SKIP:the v3 volume model is single-principal (docs/xfs-authority-architecture.md), so a chown to another principal is refused by the volume itself and there is no ownership change to observe" \
     --label "linux ${KERNEL_RELEASE}: two stock-kernel FUSE mounts of one authoritative XFS volume" \
     --json /home/portablefs/logs/matrix.json
+}
+
+# Retain credentials, placement, and real mount identities across a new wire epoch.
+install_epoch_restart_helper() {
+  cat > /home/portablefs/restart-authority.sh <<'RESTART'
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo "epoch restart failed at line $LINENO" >&2' ERR
+before_a=$(findmnt -n -r -o ID,SOURCE --target /home/portablefs/mount-a)
+before_b=$(findmnt -n -r -o ID,SOURCE --target /home/portablefs/mount-b)
+old=$(cat /home/portablefs/authority.pid)
+kill -TERM "$old"
+for ((i=0; i<200; i++)); do
+  if ! kill -0 "$old" 2>/dev/null || [[ $(ps -o stat= -p "$old") == Z* ]]; then break; fi
+  sleep 0.05
+done
+if kill -0 "$old" 2>/dev/null && [[ $(ps -o stat= -p "$old") != Z* ]]; then exit 1; fi
+setsid /home/portablefs/launch-authority.sh </dev/null >>/home/portablefs/logs/authority.log 2>&1 &
+for ((i=0; i<200; i++)); do
+  new=$(cat /home/portablefs/authority.pid)
+  if [[ $new != "$old" ]] && kill -0 "$new" 2>/dev/null && (exec 3<>/dev/tcp/127.0.0.1/PORT_PLACEHOLDER) 2>/dev/null; then break; fi
+  sleep 0.05
+done
+[[ $new != "$old" ]]
+kill -0 "$new"
+[[ $(findmnt -n -r -o ID,SOURCE --target /home/portablefs/mount-a) == "$before_a" ]]
+[[ $(findmnt -n -r -o ID,SOURCE --target /home/portablefs/mount-b) == "$before_b" ]]
+kill -0 "$(cat /home/portablefs/mount-0.pid)" "$(cat /home/portablefs/mount-1.pid)"
+echo authority_replaced_without_remount=true
+RESTART
+  sed -i "s/PORT_PLACEHOLDER/${PORTABLEFS_AUTHORITY_PORT}/g" /home/portablefs/restart-authority.sh
+  chmod 0700 /home/portablefs/restart-authority.sh
+  chown portablefs:portablefs /home/portablefs/restart-authority.sh
 }
 
 run_container() {
@@ -548,6 +593,10 @@ run_container() {
   # matrix process's own command line, so a pkill pattern would match and kill
   # the driver instead of the mount.
   FENCE_COMMAND="kill -9 ${MOUNT_B_PID}"
+  RESUME_COMMAND="kill -CONT ${MOUNT_B_PID}"
+  PAUSE_COMMAND="(sleep 5.5; kill -CONT ${MOUNT_B_PID}) </dev/null >/dev/null 2>&1 & kill -STOP ${MOUNT_B_PID}"
+  GATEWAY_COMMAND="/home/portablefs/bin/pfs-coherence-routes --authority 127.0.0.1:${PORTABLEFS_AUTHORITY_PORT} --volume-id ${PORTABLEFS_VOLUME_NAME} --access-token-file /home/portablefs/creds/gateway.token --tls-cert /home/portablefs/creds/client.crt --tls-key /home/portablefs/creds/client.key --tls-server-ca /home/portablefs/creds/ca.pem --tls-server-name authority.portablefs.test --gateway-mount-root /home/portablefs/mount-a"
+  install_epoch_restart_helper
   echo "coherence-matrix-linux: stock kernel $KERNEL_RELEASE, two independent mounts of volume $PORTABLEFS_VOLUME_NAME (black-box behavior only)"
   local both=(/home/portablefs/mount-a /home/portablefs/mount-b)
   assert_mounts_serving "before any phase ran" "${both[@]}"

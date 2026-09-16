@@ -66,8 +66,14 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 	if err != nil {
 		return nil, err
 	}
+	compatibilityPrior, priorLinux := cfg.Prior, false
+	if typed, ok := cfg.Membership.(interface {
+		PriorCacheState() (volumeserver.PriorEpochDisposition, bool)
+	}); ok {
+		compatibilityPrior, priorLinux = typed.PriorCacheState()
+	}
 	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: cfg.Prior, ExternalMembership: true, Fencer: cfg.Fencer,
+		Prior: compatibilityPrior, ExternalMembership: true, Fencer: cfg.Fencer,
 		MaxCachedNameCapacity: cfg.MaxCachedNameCapacity, MaxRepairBudget: cfg.MaxRepairBudget,
 		MaxClockSkew: cfg.ClockSkew, Now: cfg.Now, OnBarrier: cfg.OnBarrier,
 	})
@@ -91,7 +97,7 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 		return nil, fmt.Errorf("load machine-local routing declaration: %w", err)
 	}
 	return &Coordination{
-		Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{}), Store: cfg.Store, Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes,
+		Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{PriorLinuxCaches: priorLinux}), Store: cfg.Store, Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes,
 	}, nil
 }
 

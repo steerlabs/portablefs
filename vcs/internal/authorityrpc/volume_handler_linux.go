@@ -2630,7 +2630,14 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 		}
 	}
 	var reply *authoritypb.ActivateReply
-	err = h.Lifecycle.Activate(cred.ID, func() error {
+	membershipProfile := volumeserver.MembershipCompatibility
+	switch resources.profile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		membershipProfile = volumeserver.MembershipLinuxV7
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		membershipProfile = volumeserver.MembershipCacheless
+	}
+	err = h.Lifecycle.ActivateProfile(cred.ID, membershipProfile, func() error {
 		rootAttr, readErr := h.Store.Getattr(resources.root)
 		if readErr != nil {
 			return readErr

@@ -102,7 +102,8 @@ type SubscriptionSnapshot struct {
 }
 
 type CoherenceConfig struct {
-	Clock CoherenceClock
+	PriorLinuxCaches bool
+	Clock            CoherenceClock
 	// MaxLogEntries bounds retention even if a live subscriber renews without
 	// acking. Overflow requires cold resubscription, but never shortens its old
 	// cache horizon: WaitWithdrawn still waits until that horizon or a cold reset.
@@ -175,6 +176,7 @@ func (h *subscriberHeap) Pop() any {
 type CoherenceCoordinator struct {
 	mu                                      sync.Mutex
 	clock                                   CoherenceClock
+	priorCacheUntil                         time.Time
 	subscribers                             map[SessionID]*changeSubscriber
 	acks, horizons                          subscriberHeap
 	log                                     []StreamEvent
@@ -194,12 +196,38 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 	if cfg.MaxLogEntries <= 0 {
 		cfg.MaxLogEntries = 65536
 	}
-	return &CoherenceCoordinator{clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
+	var priorCacheUntil time.Time
+	if cfg.PriorLinuxCaches {
+		priorCacheUntil = cfg.Clock.Now().Add(SubscriptionTTL)
+	}
+	return &CoherenceCoordinator{priorCacheUntil: priorCacheUntil, clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
 		// The initial storage snapshot is version 1, matching the handler. A
 		// reservation can publish a cache withdrawal before the first commit.
 		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1, watermark: 1,
 		requests: newMutationSequencer(), delegations: make(map[[16]byte]*delegationRecord), cacheHandles: make(map[[16]byte]*cacheHandleCounts)}
 }
+
+// WaitPriorCacheHorizon fences only prior Linux cache authority. Durable mount
+// records remain intact for topology/archive proof; unknown or Mac records are
+// separately subject to the compatibility coordinator's unbounded exclusion.
+func (c *CoherenceCoordinator) WaitPriorCacheHorizon(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("volumeserver: prior-cache wait needs a context")
+	}
+	remaining := c.priorCacheUntil.Sub(c.clock.Now())
+	if remaining <= 0 {
+		return ctx.Err()
+	}
+	timer := c.clock.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C():
+		return ctx.Err()
+	}
+}
+
 func (c *CoherenceCoordinator) signalLocked() {
 	if c.changed != nil {
 		close(c.changed)

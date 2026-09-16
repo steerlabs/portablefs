@@ -20,7 +20,7 @@ func membershipDocument(volumeID string, sessions ...[16]byte) string {
 	builder.WriteString(visibilityMembershipHeader + "\n")
 	builder.WriteString(hex.EncodeToString([]byte(volumeID)) + "\n")
 	for _, session := range sessions {
-		builder.WriteString(hex.EncodeToString(session[:]) + "\n")
+		builder.WriteString(hex.EncodeToString(session[:]) + "\tcompatibility\n")
 	}
 	return builder.String()
 }
@@ -85,7 +85,7 @@ func TestStrictMembershipEmptyFailsClosedOnAnythingUnreadable(t *testing.T) {
 	session := hex.EncodeToString(make([]byte, 16))
 	cases := map[string]string{
 		"empty file":       "",
-		"wrong header":     "PFS-VISIBILITY-2\n" + hex.EncodeToString([]byte(testVolumeID)) + "\n",
+		"wrong header":     "PFS-VISIBILITY-3\n" + hex.EncodeToString([]byte(testVolumeID)) + "\n",
 		"header only":      visibilityMembershipHeader + "\n",
 		"another volume":   membershipDocument(other),
 		"plaintext volume": visibilityMembershipHeader + "\n" + testVolumeID + "\n",
@@ -127,5 +127,23 @@ func TestStrictMembershipEmptyFailsClosedOnAnythingUnreadable(t *testing.T) {
 
 	if _, err := linked.host.StrictMembershipEmpty("not-a-uuid"); err == nil {
 		t.Fatal("an invalid volume ID was accepted")
+	}
+}
+
+func TestStrictMembershipParsesLegacyAndEveryCurrentProfile(t *testing.T) {
+	id := [16]byte{1}
+	for _, profile := range []string{"compatibility", "linux-v7", "cacheless"} {
+		document := strings.ReplaceAll(membershipDocument(testVolumeID, id), "compatibility", profile)
+		if count, err := parseStrictMembership(strings.NewReader(document), testVolumeID); err != nil || count != 1 {
+			t.Fatalf("%s: %d %v", profile, count, err)
+		}
+	}
+	legacy := "PFS-VISIBILITY-1\n" + hex.EncodeToString([]byte(testVolumeID)) + "\n" + hex.EncodeToString(id[:]) + "\n"
+	if count, err := parseStrictMembership(strings.NewReader(legacy), testVolumeID); err != nil || count != 1 {
+		t.Fatalf("legacy: %d %v", count, err)
+	}
+	invalid := strings.ReplaceAll(membershipDocument(testVolumeID, id), "compatibility", "unknown")
+	if _, err := parseStrictMembership(strings.NewReader(invalid), testVolumeID); err == nil {
+		t.Fatal("unknown profile accepted")
 	}
 }

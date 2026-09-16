@@ -472,7 +472,29 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 	return nil
 }
 
+// A refused TCP connection during restart proves no session outcome. Keep the
+// caller's replay identity and retry transport establishment until its deadline
+// or an authenticated Hello/Resume establishes the epoch and session verdict.
 func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) error {
+	for {
+		err := c.reconnectTransportOnce(ctx, role)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil || c.closed.Load() || c.poisoned.Load() {
+			return err
+		}
+		var networkError *net.OpError
+		if !errors.As(err, &networkError) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if err := waitTransportRetry(ctx); err != nil {
+			return err
+		}
+	}
+}
+
+func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) error {
 	transport := c.transportForRole(role)
 	if transport == nil {
 		return ErrTransportBinding

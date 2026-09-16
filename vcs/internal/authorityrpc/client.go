@@ -1732,7 +1732,7 @@ func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.R
 		return nil, nil, syscall.EINVAL
 	}
 	if err := c.reconnectTransport(ctx, role); err != nil {
-		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
+		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 			c.signalSessionEnd(err)
 		}
 		return nil, nil, err
@@ -1876,6 +1876,9 @@ func (c *Client) CallMutationWithIdentityRetained(
 			releaseFrame()
 		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
+			if !errors.Is(reconnectErr, ErrAuthorityChanged) && !errors.Is(reconnectErr, ErrSessionEnded) && !errors.Is(reconnectErr, ErrTransportBinding) {
+				reconnectErr = ErrTransportUncertain
+			}
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
 		}
@@ -1997,9 +2000,10 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	idle := len(pending) == 0 && !c.closed.Load()
 	// Losing an idle DATA socket is only a transport event: the next safe read
 	// or exact mutation replay lazily resumes that one role. CONTROL owns the
-	// visibility/liveness contract, so an idle loss still ends the mount under
-	// the existing fail-closed safety rule.
-	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
+	// v7 subscription horizon, which independently withdraws stale caches. An
+	// idle socket loss cannot prove an epoch or session outcome. Other profiles
+	// retain their existing terminal CONTROL contract.
+	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		c.signalSessionEnd(err)
 	}
 	transport.pendingMu.Unlock()

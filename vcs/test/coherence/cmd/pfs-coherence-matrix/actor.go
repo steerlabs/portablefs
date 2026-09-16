@@ -442,6 +442,9 @@ func (a *localActor) execute(req request) (response, error) {
 		// Used only by the harness itself (for example to fence a mount).
 		command := exec.Command("/bin/sh", "-c", req.Tag)
 		output, err := command.CombinedOutput()
+		if err != nil {
+			err = fmt.Errorf("%w: %s", err, output)
+		}
 		return response{Str: string(output)}, err
 	default:
 		return response{}, fmt.Errorf("unknown op %q", req.Op)
