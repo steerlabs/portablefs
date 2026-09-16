@@ -10,6 +10,29 @@ import (
 	"time"
 )
 
+func TestInitialDelegationWithdrawalHasStorageVersion(t *testing.T) {
+	c := NewCoherenceCoordinator(CoherenceConfig{})
+	snapshot, err := c.Subscribe(SessionID{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Watermark != 1 {
+		t.Fatalf("initial watermark = %d, want handler initial storage version 1", snapshot.Watermark)
+	}
+	reservation, err := c.ReserveNew(snapshot.Token, [16]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reservation.Abort()
+	events, err := c.Poll(t.Context(), snapshot.Token, snapshot.Position, nil, 1)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("initial withdrawal = %v, %v", events, err)
+	}
+	if events[0].Change.Kind != DelegationGranted || events[0].Change.VolumeVersion != snapshot.Watermark {
+		t.Fatalf("withdrawal before first commit = %+v", events[0])
+	}
+}
+
 // cv2Clock is a deterministic monotonic clock shared by the coherence-v2
 // coordinator tests. Timer channels are buffered so advancing the clock never
 // depends on a waiter being scheduled, and stopped timers are never delivered.

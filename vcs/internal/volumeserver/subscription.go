@@ -194,7 +194,9 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 		cfg.MaxLogEntries = 65536
 	}
 	return &CoherenceCoordinator{clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
-		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1,
+		// The initial storage snapshot is version 1, matching the handler. A
+		// reservation can publish a cache withdrawal before the first commit.
+		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1, watermark: 1,
 		requests: newMutationSequencer(), delegations: make(map[[16]byte]*delegationRecord), cacheHandles: make(map[[16]byte]*cacheHandleCounts)}
 }
 func (c *CoherenceCoordinator) signalLocked() {
