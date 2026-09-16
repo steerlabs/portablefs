@@ -95,3 +95,11 @@ log without fencing the source. `/tmp/cv2-g-source-31.log` passes saturation
 remaining metadata-count assertion in that run expected immediate write-through;
 its v7 replacement measures application after an explicit durable cut while
 retaining the zero-follow-up-GETATTR requirement.
+
+A later full run exposed a private-mapping SIGBUS after reopen: LOOKUP published
+storage size zero while the holder had accepted 4 KiB in its buffer. Entry
+publication now overlays owned buffered metadata and uses zero attribute cache
+lifetime. `TestLookupPublishesHolderBufferedSize` passes; the real two-mount
+CRUD/mapping test passed three consecutive runs in `/tmp/cv2-g-overlay-34.log`.
+The diagnostic crash connections were aborted by their exact fusectl connection
+IDs; unrelated containers were left running.

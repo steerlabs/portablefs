@@ -120,16 +120,16 @@ func (n *node) withWriteDelegation(ctx context.Context, handle *fileHandle, call
 	}
 }
 
-func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Errno {
+func (m *Mount) overlayProtoAttr(identity []byte, base *authoritypb.Attr) (*authoritypb.Attr, error) {
 	if base == nil {
-		return syscall.EIO
+		return nil, syscall.EIO
 	}
-	attrs, err := n.mount.delegations.OverlayAttributes(n.item.GetStableIdentity(), writeback.Attributes{
+	attrs, err := m.delegations.OverlayAttributes(identity, writeback.Attributes{
 		Mode: base.GetMode(), Size: base.GetSize(), ATimeNS: base.GetAtimeNs(), MTimeNS: base.GetMtimeNs(),
 		HasMode: true, HasSize: true, HasATime: true, HasMTime: true,
 	})
 	if err != nil {
-		return bufferErrno(err)
+		return nil, err
 	}
 	attr := proto.Clone(base).(*authoritypb.Attr)
 	if attrs.HasMode {
@@ -144,8 +144,15 @@ func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Er
 	if attrs.HasMTime {
 		attr.MtimeNs = attrs.MTimeNS
 	}
+	return attr, nil
+}
+
+func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Errno {
+	attr, err := n.mount.overlayProtoAttr(n.item.GetStableIdentity(), base)
+	if err != nil {
+		return bufferErrno(err)
+	}
 	fillAttr(attr, &out.Attr, n.mount.uid, n.mount.gid)
-	// Holder attributes come from a live daemon overlay, never a kernel timeout.
 	out.SetTimeout(0)
 	return 0
 }

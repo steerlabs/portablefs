@@ -1034,13 +1034,24 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 			return err
 		}
 	}
+	// A holder's LOOKUP can return storage metadata older than its accepted
+	// write buffer. Publishing that size can truncate the kernel inode and
+	// make a private page fault SIGBUS before background application.
+	owned := r.mount.delegations.Owns(record.identity[:])
+	if owned {
+		var err error
+		attr, err = r.mount.overlayProtoAttr(record.identity[:], attr)
+		if err != nil {
+			return err
+		}
+	}
 	r.mu.Lock()
 	entry, namePublication, cachedName := r.admitNameLocked(ctx, parent, name, record)
 	inode := attr.GetInode()
 	attrLifetime := time.Duration(0)
 	var attrCoordinate publicationCoordinate
 	cachedAttr := false
-	if cachedName && publication.postState == nil {
+	if cachedName && publication.postState == nil && !owned {
 		var attrReservation *cacheInstallReservation
 		attrLifetime, attrCoordinate, attrReservation, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
 		if cachedAttr {

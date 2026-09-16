@@ -2207,3 +2207,24 @@ func (f *fakeRPC) DetachAfterUnmount(_ context.Context, proof MountAbsenceProof)
 func testDelegation() *authoritypb.Delegation {
 	return &authoritypb.Delegation{Id: testToken(700), Generation: 1, Mode: authoritypb.DelegationMode_DELEGATION_MODE_FULL}
 }
+
+func TestLookupPublishesHolderBufferedSize(t *testing.T) {
+	raw, mount, rpc := testRawFileSystem(t, 8)
+	rpc.item.Attr.Size = 0
+	identity := rpc.item.GetStableIdentity()
+	if err := mount.delegations.Install(identity, rpc.item.GetToken(), testToken(100), delegationTestGrant(45, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mount.delegations.Write(t.Context(), identity, 0, make([]byte, 4096), false); err != nil {
+		t.Fatal(err)
+	}
+	out := &fuse.EntryOut{}
+	if status := testRawCall(t, raw, func(unique uint64) fuse.Status {
+		return raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "buffered", out)
+	}); !status.Ok() {
+		t.Fatal(status)
+	}
+	if out.Size != 4096 || out.AttrValid != 0 || out.AttrValidNsec != 0 {
+		t.Fatalf("holder lookup published stale size or cache lifetime: %+v", out)
+	}
+}
