@@ -516,3 +516,16 @@ benchmark changes as well.
 Run 116 exits 0: the complete XFS/FUSE suite passes all 66 required privileged
 tests and the additional root-boundary test after engine deletion and cold-read
 recovery. This closes step 4's real-mount qualification.
+
+A final call-path audit found the F1 `ExecuteFromExternalSource` bridge still
+scheduled Linux mutations through an empty Mac repair audience. Removed the
+bridge and external-source terminal machinery. Linux now uses only its v7
+storage turn, with the same pure preparation/committed-target validators and
+runtime terminal check. `strictCache` also restricts old repair read admission
+to FSKit. Ordinary Linux mutations still hold profile admission and reject a
+live Mac compatibility writer before replay assignment; exact-generation recall
+flushes still pass pending Mac activation. Native target validation passes, and
+focused Docker run 121 passes the handler/coherence/stock-write suites, including
+three new Linux/Mac exclusion and dependency-validation regressions. Run 119
+was a compile typo, corrected before 121. The focused wrapper's exit 70 is only
+unrun full-suite inventory.

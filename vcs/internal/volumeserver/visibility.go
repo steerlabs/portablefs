@@ -1255,19 +1255,6 @@ func (c *VisibilityCoordinator) Execute(ctx context.Context, source SessionID, m
 		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil)
 }
 
-// ExecuteFromExternalSource coordinates FSKit repair participants for a
-// mutation initiated by an authenticated frontend that does not participate in
-// this repair protocol. The terminal channel is the source's runtime-liveness
-// proof and is checked atomically at the pre-apply cut.
-func (c *VisibilityCoordinator) ExecuteFromExternalSource(ctx context.Context, source SessionID, terminal <-chan struct{}, mutation MutationID,
-	dependencies MutationDependencies, prepare func() ([]VisibilityTarget, error), apply func() ([]VisibilityTarget, bool)) error {
-	if source == (SessionID{}) || terminal == nil {
-		return &VisibilityBarrierError{Err: ErrVisibilityLost}
-	}
-	return c.execute(ctx, source, mutation, dependencies, DependencyDeclaration{}, nil, nil, prepare,
-		func(uint64) ([]VisibilityTarget, bool) { return apply() }, nil, terminal)
-}
-
 // ExecuteWithSourceGate is the production FSKit repair entry point. gate is the
 // initiating frontend's pre-dispatch local publication cut. published runs
 // immediately after apply, while the dependency set is still held, and returns any
@@ -1300,24 +1287,9 @@ func (c *VisibilityCoordinator) ExecuteWithSourceGateSequence(ctx context.Contex
 func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, mutation MutationID,
 	dependencies MutationDependencies, declaration DependencyDeclaration,
 	gate *SourcePublicationGate, refresh func() (SourcePublicationGate, error), prepare func() ([]VisibilityTarget, error),
-	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error), externalSource ...<-chan struct{}) error {
+	apply func(uint64) ([]VisibilityTarget, bool), published func() ([]VisibilityResolution, error)) error {
 	if ctx == nil || prepare == nil || apply == nil {
 		return errors.New("volumeserver: visibility context, prepare, and mutation callbacks are required")
-	}
-	if len(externalSource) > 1 {
-		return errors.New("volumeserver: visibility mutation has multiple external source proofs")
-	}
-	var externalTerminal <-chan struct{}
-	if len(externalSource) == 1 {
-		externalTerminal = externalSource[0]
-		if source == (SessionID{}) || externalTerminal == nil {
-			return &VisibilityBarrierError{Err: ErrVisibilityLost}
-		}
-		select {
-		case <-externalTerminal:
-			return &VisibilityBarrierError{Err: ErrVisibilityLost}
-		default:
-		}
 	}
 	if gate != nil {
 		defer declaration.Release()
@@ -1358,16 +1330,13 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if gate != nil && !sourceStrict {
 		return &VisibilityBarrierError{Err: ErrVisibilityLost}
 	}
-	if externalTerminal != nil && sourceStrict {
-		return &VisibilityBarrierError{Err: ErrVisibilityProfile}
-	}
 	if compatibilityWriterBlocked {
 		// This check precedes dependency admission and every prepare/apply callback.
 		// EBUSY is therefore a retryable product-policy result, not an uncertain
 		// mutation and not a coherence failure. The Mac may continue serving.
 		return ErrCompatibilityWriterLease
 	}
-	if !strict && !c.cfg.ExternalMembership && externalTerminal == nil {
+	if !strict && !c.cfg.ExternalMembership {
 		// An ACTIVE FSKit repair session is installed in this map in
 		// the same activation transaction that makes its runtime executable.
 		// Reaching a visible mutation with no participant therefore means the
@@ -1478,10 +1447,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if err != nil {
 		return err
 	}
-	if err := validateVisibilityTargets(prepareTargets); err != nil {
-		return &VisibilityBarrierError{Err: ErrVisibilityTargets}
-	}
-	if !dependencies.covers(prepareTargets) {
+	if err := dependencies.ValidateTargets(prepareTargets); err != nil {
 		return &VisibilityBarrierError{Err: ErrVisibilityTargets}
 	}
 	// prepare is the authority's independent derivation/validation boundary.
@@ -1516,7 +1482,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	if gate != nil {
 		requiredSource = sourceParticipant
 	}
-	if !c.beginApply(ticket.Cursor.Sequence, requiredSource, externalTerminal) {
+	if !c.beginApply(ticket.Cursor.Sequence, requiredSource) {
 		return &VisibilityBarrierError{Err: ErrVisibilityLost}
 	}
 
@@ -1836,42 +1802,8 @@ func (c *VisibilityCoordinator) recordSourceResolutions(source SessionID, resolu
 // defects that no participant can cause: the mutation already reached XFS and
 // the authority cannot describe what it did.
 func (c *VisibilityCoordinator) validateCompletion(_ uint64, complete, prepared []VisibilityTarget) error {
-	if err := validateVisibilityTargets(complete); err != nil {
-		return c.poison(ErrVisibilityTargets)
-	}
-	exactCount := 0
-	for _, target := range complete {
-		if target.Scope == VisibilityNamespace {
-			continue
-		}
-		exactCount++
-		if target.ExactPostState == nil || target.ExactPostState.ObjectVersion == 0 {
-			return c.poison(fmt.Errorf("%w: completion inode target omitted exact committed attributes", ErrVisibilityTargets))
-		}
-	}
-	if exactCount > 4 {
-		return c.poison(fmt.Errorf("%w: completion exceeded the four-object exact repair bound", ErrVisibilityTargets))
-	}
-	// Fan-out chooses its audience from the PREPARE targets. A COMPLETE target
-	// outside that set would be a repair instruction addressed to mounts that
-	// were never asked to close publication for it, so it is an invariant
-	// violation rather than a case to widen the audience for.
-	if !visibilityTargetsCovered(complete, prepared) {
-		return c.poison(fmt.Errorf("%w: completion named a coordinate prepare did not", ErrVisibilityTargets))
-	}
-	completeKeys := visibilityTargetKeySet(complete)
-	for _, target := range complete {
-		if target.Scope != VisibilityAttributes {
-			continue
-		}
-		for _, preparedTarget := range prepared {
-			if preparedTarget.Scope != VisibilityNamespace || preparedTarget.ParentIdentity != target.Identity {
-				continue
-			}
-			if _, ok := completeKeys[string(preparedTarget.key())]; !ok {
-				return c.poison(fmt.Errorf("%w: parent attributes completed without a prepared namespace dependency", ErrVisibilityTargets))
-			}
-		}
+	if err := ValidateMutationCompletion(complete, prepared); err != nil {
+		return c.poison(err)
 	}
 	return nil
 }
@@ -2064,7 +1996,7 @@ func (c *VisibilityCoordinator) openBarrier(ctx context.Context, source SessionI
 // compliant frontend still has publication admission closed, and from this
 // point even an audience member must wait for XFS apply before reading one of
 // the mutation's coordinates.
-func (c *VisibilityCoordinator) beginApply(sequence uint64, source *visibilityParticipant, externalTerminal <-chan struct{}) bool {
+func (c *VisibilityCoordinator) beginApply(sequence uint64, source *visibilityParticipant) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if source != nil {
@@ -2073,13 +2005,6 @@ func (c *VisibilityCoordinator) beginApply(sequence uint64, source *visibilityPa
 		}
 		select {
 		case <-source.terminal:
-			return false
-		default:
-		}
-	}
-	if externalTerminal != nil {
-		select {
-		case <-externalTerminal:
 			return false
 		default:
 		}

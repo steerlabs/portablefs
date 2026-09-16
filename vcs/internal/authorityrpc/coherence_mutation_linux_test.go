@@ -366,3 +366,97 @@ func TestCoherenceRecallFlushPassesPendingMacActivation(t *testing.T) {
 		t.Fatal("Mac activation left a live Linux delegation")
 	}
 }
+
+func TestLinuxV7MutationRefusedBeforeApplyByActiveMacCompatibilityWriter(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	mac, err := h.Runtime.AttachActiveForTest(4, volumeserver.PeerIdentity{2}, volumeserver.Authorization{Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := h.Runtime.SessionTerminal(mac.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Visibility.Register(mac.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairCallbackSerializedPipelined, CompatibilityWriter: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target := &writeTestTarget{committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0600, Nlink: 1}}
+	handle := prepareOneShotTarget(t, h, cred, store, target)
+	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	response := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+	if response.GetErrno() != int32(syscall.EBUSY) || response.GetAppliedSequence() != 0 || response.GetMutation() != nil {
+		t.Fatalf("Mac exclusion=%v", response)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 0 {
+		t.Fatal("excluded Linux write reached storage")
+	}
+	h.Visibility.Fence(mac.ID, volumeserver.ErrVisibilityLost)
+	response = h.handleWrite(t.Context(), req, cred, req.GetWrite())
+	if response.GetErrno() != 0 || response.GetAppliedSequence() != 1 {
+		t.Fatalf("write after Mac departure=%v", response)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 1 {
+		t.Fatalf("applies=%d", calls)
+	}
+	if h.strictCache(cred.ID) != nil {
+		t.Fatal("Linux entered Mac read repair")
+	}
+}
+
+func TestLinuxV7MutationHoldsMacAdmissionThroughStorageApply(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	target := &writeTestTarget{committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0600, Nlink: 1}, started: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-target.release:
+		default:
+			close(target.release)
+		}
+	}()
+	handle := prepareOneShotTarget(t, h, cred, store, target)
+	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	done := make(chan *authoritypb.Response, 1)
+	go func() { done <- h.handleWrite(t.Context(), req, cred, req.GetWrite()) }()
+	waitWriteTestSignal(t, target.started, "Linux storage apply")
+	admitted := make(chan struct{})
+	attempting := make(chan struct{})
+	go func() {
+		close(attempting)
+		h.coherenceProfileAdmission.Lock()
+		close(admitted)
+		h.coherenceProfileAdmission.Unlock()
+	}()
+	<-attempting
+	select {
+	case <-admitted:
+		t.Fatal("Mac activation passed live Linux apply")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(target.release)
+	select {
+	case response := <-done:
+		if response.GetErrno() != 0 {
+			t.Fatal(response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Linux write did not finish")
+	}
+	waitWriteTestSignal(t, admitted, "Mac admission after Linux apply")
+}
+
+func TestLinuxV7PreparationCannotEscapeStorageDependencies(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	handle := prepareOneShotTarget(t, h, cred, store, &writeTestTarget{})
+	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	response := h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+		return []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{0x99}}}, nil
+	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		t.Fatal("uncovered preparation applied")
+		return nil, nil
+	})
+	if response.GetErrno() == 0 || response.GetAppliedSequence() != 0 {
+		t.Fatalf("uncovered preparation=%v", response)
+	}
+}

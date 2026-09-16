@@ -44,7 +44,8 @@ func namespaceName(name []byte) error {
 // non-coherent session returns nil only on an already-invalid runtime path; no
 // attach can activate such a session.
 func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.VisibilityCoordinator {
-	if h.Visibility == nil || !h.strictSession(id) {
+	profile, err := h.sessionFrontendProfile(id)
+	if h.Visibility == nil || err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return nil
 	}
 	return h.Visibility

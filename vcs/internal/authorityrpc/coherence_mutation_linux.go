@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"syscall"
 
@@ -193,7 +194,7 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			}
 		}
 	}
-	return h.mutateOperation(ctx, req, cred, func(mid volumeserver.MutationID) *authoritypb.Response {
+	return h.mutateOperation(ctx, req, cred, func(_ volumeserver.MutationID) *authoritypb.Response {
 		defer releaseStorage()
 		if op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation); op != nil && op.beforeAdmission != nil {
 			admit := op.beforeAdmission
@@ -253,50 +254,61 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				}
 				return h.coherenceError(0, err)
 			}
-			provisional := h.coherenceOperationSequence.Add(1)
-			// Reserve zero as the baseline and use a separate provisional domain.
-			provisional |= uint64(1) << 63
-			var response *authoritypb.Response
-			var changes []volumeserver.VisibilityTarget
-			var position uint64
-			var retainedGrantErr error
-			terminal, _ := h.Runtime.SessionTerminal(cred.ID)
-			applied := false
-			err = h.Visibility.ExecuteFromExternalSource(ctx, cred.ID, terminal, mid, dependencies, func() ([]volumeserver.VisibilityTarget, error) { return prepared, nil }, func() ([]volumeserver.VisibilityTarget, bool) {
-				response, changes = apply(provisional)
-				applied = true
-				if response == nil {
-					response = h.errorResponse(0, errInternal, true)
-				}
-				if pin != nil && response.GetErrno() == 0 && (req.GetCreate().GetWriteIntent() || req.GetOpen().GetWriteIntent()) {
-					op := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
-					op.reservation, op.delegation, retainedGrantErr = pin.RetainDelegation()
-				}
-				position = h.publishCoherenceCommit(req, cred.ID, identity, provisional, response, changes)
-				stampVisibilityTargets(changes, response.GetPostState())
-				releaseStorage()
-				releaseTurn()
-				finishPin(response.GetAppliedSequence())
-				return changes, changes != nil
-			})
-			if !applied {
+
+			if err := dependencies.ValidateTargets(prepared); err != nil {
 				releaseStorage()
 				releaseTurn()
 				finishPin(0)
 				return h.coherenceError(0, err)
 			}
+			terminal, err := h.Runtime.SessionTerminal(cred.ID)
+			if err == nil {
+				select {
+				case <-terminal:
+					err = volumeserver.ErrSessionFenced
+				default:
+				}
+			}
+			if err != nil || ctx.Err() != nil {
+				releaseStorage()
+				releaseTurn()
+				finishPin(0)
+				if err == nil {
+					err = ctx.Err()
+				}
+				return h.coherenceError(0, err)
+			}
+			// Profile admission excludes Mac activation across ordinary Linux
+			// mutations. Recall flushes have an exact generation pin instead.
+			// The v7 storage turn is the sole mutation scheduler on this path.
+			provisional := h.coherenceOperationSequence.Add(1) | uint64(1)<<63
+			response, changes := apply(provisional)
 			if response == nil {
 				response = h.errorResponse(0, errInternal, true)
 			}
+			var retainedGrantErr error
+
+			position := h.publishCoherenceCommit(req, cred.ID, identity, provisional, response, changes)
+			stampVisibilityTargets(changes, response.GetPostState())
+			if changes != nil {
+				err = volumeserver.ValidateMutationCompletion(changes, prepared)
+			}
+			if err == nil {
+				if pin != nil && response.GetErrno() == 0 && (req.GetCreate().GetWriteIntent() || req.GetOpen().GetWriteIntent()) {
+					op := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
+					op.reservation, op.delegation, retainedGrantErr = pin.RetainDelegation()
+				}
+			}
+
 			releaseStorage()
 			releaseTurn()
 			finishPin(response.GetAppliedSequence())
+			if err != nil {
+				return h.errorResponse(0, fmt.Errorf("%w: %w", volumeserver.ErrVisibilityPoisoned, err), true)
+			}
 			if retainedGrantErr != nil {
 				h.discardCoherenceOpenReply(cred.ID, response)
 				response = h.coherenceError(0, retainedGrantErr)
-			}
-			if err != nil {
-				return h.errorResponse(0, err, changes != nil)
 			}
 			op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
 			if position != 0 {
