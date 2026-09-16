@@ -1152,7 +1152,7 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		coordinates[publicationCoordinate{kind: publicationNamespaceName, parent: namespace.parent, name: namespace.name}] = struct{}{}
 	}
 	for key := range r.cachedNegatives {
-		if parent := r.nodesByID[key.parent]; parent != nil && !parent.reclaimed {
+		if parent := r.directoryLocked(key.parent); parent != nil && !parent.reclaimed {
 			coordinates[publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: key.name}] = struct{}{}
 		}
 	}
@@ -1189,6 +1189,21 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	}
 
 	r.mu.Lock()
+	type nameInvalidation struct {
+		parent uint64
+		name   string
+	}
+	nameInvalidations := make([]nameInvalidation, 0, len(r.cachedStableNames)+len(r.cachedNegatives))
+	for namespace := range r.cachedStableNames {
+		if parent := r.byIdentityLocked(namespace.parent); parent != nil {
+			nameInvalidations = append(nameInvalidations, nameInvalidation{parent: parent.id, name: namespace.name})
+		}
+	}
+	for key := range r.cachedNegatives {
+		if parent := r.directoryLocked(key.parent); parent != nil && !parent.reclaimed {
+			nameInvalidations = append(nameInvalidations, nameInvalidation{parent: parent.id, name: key.name})
+		}
+	}
 	for key := range r.cachedNames {
 		r.dropCachedNameLocked(key)
 	}
@@ -1233,8 +1248,13 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		handle.invalidateEnumeration()
 	}
 	notifier := r.mount.notifier()
-	if notifier == nil && len(dataRecords)+len(attrRecords) != 0 {
+	if notifier == nil && len(nameInvalidations)+len(dataRecords)+len(attrRecords) != 0 {
 		return errors.New("fusev3: cold cache invalidation has no kernel notification channel")
+	}
+	for _, name := range nameInvalidations {
+		if status := notifier.EntryNotify(name.parent, name.name); !status.Ok() && status != fuse.ENOENT {
+			return fmt.Errorf("fusev3: cold invalidate name %q under inode %d: %v", name.name, name.parent, status)
+		}
 	}
 	identities := make([]publicationIdentity, 0, len(dataRecords)+len(attrRecords))
 	for record := range dataRecords {

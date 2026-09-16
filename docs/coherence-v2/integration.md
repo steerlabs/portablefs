@@ -769,3 +769,29 @@ fusev3, mountv3, or the Linux mount command. Frozen schema history and refusal
 tests remain deliberately. Every workstream commit uses Tim Jang's requested
 author identity and DCO sign-off. The full [file list](changed-files.txt) covers
 154 added, modified, or deleted paths from the starting tree.
+
+## G2
+
+G2 continues on `cv2-integrate`. The review items below supersede conflicting
+G decisions above. Each item records its regression evidence; final full-gate
+and performance qualification remain outstanding until explicitly recorded.
+
+### R1: CONTROL-only loss and the cold cache boundary
+
+`TestControlTransportLossWithdrawsEveryCacheAtHorizon` closes only the reader's
+CONTROL socket and rejects replacement connections, retaining both processes,
+the reader's DATA socket and the peer's transports. It snapshots positive and
+negative names and cached inodes, checks every returned reverse notification,
+requires empty daemon payload caches and EIO on retained kernel-page reads,
+and checks Authority refusal through the still-connected DATA socket. A peer
+write completes after the horizon; the reader sees its new bytes only after
+cold resubscription. Neither authenticated session nor mount terminates.
+
+The test failed on both missing name notifications. Cold invalidation now
+issues EntryNotify, and resolves negative-name parents by Authority inode,
+matching their cache keys, rather than by FUSE node id. Cached-data records
+remain as invalidation indexes for surviving handles, with their pages withdrawn.
+The focused Docker command selecting this test and
+`TestColdSubscriptionNeverClearsEpochStaleness` passes (10.03 seconds for the
+transport test); the wrapper exits 70 solely for omitted full-suite inventory.
+Logs: `/tmp/cv2-g2-r1-before.log`, `/tmp/cv2-g2-r1-after2.log`.

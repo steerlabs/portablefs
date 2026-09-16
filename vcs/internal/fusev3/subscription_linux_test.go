@@ -524,7 +524,7 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 		t.Fatal("root inode")
 	}
 	defer fixture.raw.release(root)
-	negative := nameKey{parent: root.id, name: "absent"}
+	negative := nameKey{parent: root.key.inode, name: "absent"}
 	fixture.raw.mu.Lock()
 	fixture.raw.bindCachedNegativeLocked(negative, subscriptionStamp{incarnation: 1, generation: 1, version: 1})
 	fixture.raw.mu.Unlock()
@@ -565,8 +565,8 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 			foundNegativeNotify = true
 		}
 	}
-	if foundNegativeNotify {
-		t.Fatal("cold subscription sent a parent-lock notification for an uncached kernel name")
+	if !foundNegativeNotify {
+		t.Fatal("cold subscription omitted notification for a cached negative name")
 	}
 }
 

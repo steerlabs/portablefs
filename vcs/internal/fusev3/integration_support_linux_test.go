@@ -176,6 +176,7 @@ type integrationConfig struct {
 	// CachedNameCapacity overrides the compact integration cache. Zero keeps
 	// the existing 4,096-name test profile.
 	CachedNameCapacity int
+	wrapListener       func(net.Listener) net.Listener
 
 	// rules is the compiled form of Routes, derived in newIntegrationFixture.
 	rules localroutes.RuleSet
@@ -474,6 +475,9 @@ func (f *integrationFixture) start() {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
+	}
+	if f.cfg.wrapListener != nil {
+		listener = f.cfg.wrapListener(listener)
 	}
 	f.listener = listener
 	f.membership = newRecordingMembership()
