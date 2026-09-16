@@ -1,0 +1,374 @@
+<title>PortableFS Coherence v2</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --paper:#F5F6F4; --ink:#1B2028; --muted:#5B6470; --rule:#D9DDDA; --panel:#ECEFEA;
+  --accent:#2F5D9E; --accent-ink:#FFFFFF;
+  --crit:#B42318; --high:#C4661F; --med:#9A7B0A; --low:#3C7A5A;
+  --crit-bg:#FBE9E6; --high-bg:#FBEEE2; --med-bg:#F8F1D8; --low-bg:#E4F1E9;
+  --code-bg:#E9ECE7;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#14181E; --ink:#E6E9EC; --muted:#9AA3AE; --rule:#2A3139; --panel:#1B2129;
+    --accent:#7FA6E0; --accent-ink:#0F1419;
+    --crit:#F08A80; --high:#F0A86A; --med:#E0C462; --low:#7FC49A;
+    --crit-bg:#3A1F1C; --high-bg:#3A2A1A; --med-bg:#36301A; --low-bg:#1C3226;
+    --code-bg:#20272F;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#14181E; --ink:#E6E9EC; --muted:#9AA3AE; --rule:#2A3139; --panel:#1B2129;
+  --accent:#7FA6E0; --accent-ink:#0F1419;
+  --crit:#F08A80; --high:#F0A86A; --med:#E0C462; --low:#7FC49A;
+  --crit-bg:#3A1F1C; --high-bg:#3A2A1A; --med-bg:#36301A; --low-bg:#1C3226;
+  --code-bg:#20272F;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:16px;line-height:1.55;padding-inline:16px;padding-block:0 80px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;grid-template-columns:220px minmax(0,1fr);gap:48px}
+@media (max-width:960px){.wrap{grid-template-columns:minmax(0,1fr)}nav.toc{display:none}}
+nav.toc{position:sticky;top:0;align-self:start;padding-block:40px 24px;font-size:13px}
+nav.toc .eyebrow{margin-bottom:12px}
+nav.toc a{display:block;color:var(--muted);text-decoration:none;padding:4px 0;border-left:2px solid transparent;padding-left:10px;margin-left:-12px}
+nav.toc a:hover,nav.toc a:focus-visible{color:var(--ink);border-left-color:var(--accent);outline:none}
+main{max-width:76ch;padding-block:40px 0}
+header.masthead{border-bottom:1px solid var(--rule);padding-bottom:24px;margin-bottom:32px}
+.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500}
+h1{font-size:clamp(28px,4vw,38px);line-height:1.15;font-weight:600;letter-spacing:-.01em;margin:8px 0 12px;text-wrap:balance}
+h2{font-size:22px;font-weight:600;letter-spacing:-.005em;margin:48px 0 12px;text-wrap:balance;scroll-margin-top:16px}
+h3{font-size:17px;font-weight:600;margin:28px 0 8px;text-wrap:balance}
+p{margin:0 0 14px}
+.lede{font-size:18px;color:var(--ink);max-width:66ch}
+.meta{display:flex;flex-wrap:wrap;gap:8px 24px;font-size:13px;color:var(--muted);margin-top:14px}
+.meta code{font-size:12px}
+code,kbd{font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.88em;background:var(--code-bg);padding:1px 5px;border-radius:3px}
+pre{background:var(--code-bg);padding:14px 16px;border-radius:6px;overflow-x:auto;font-size:13px;line-height:1.5;margin:0 0 16px}
+pre code{background:none;padding:0;font-size:inherit}
+ul,ol{padding-left:22px;margin:0 0 14px}
+li{margin-bottom:6px}
+li strong{font-weight:600}
+.verdict{background:var(--panel);border-radius:8px;padding:20px 22px;margin:0 0 28px}
+.verdict p:last-child{margin-bottom:0}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0 26px}
+.tile{border:1px solid var(--rule);border-radius:6px;padding:12px 14px}
+.tile .n{font-family:"IBM Plex Mono",monospace;font-size:24px;font-weight:500;line-height:1.1;font-variant-numeric:tabular-nums}
+.tile .l{font-size:12.5px;color:var(--muted);margin-top:4px;line-height:1.35}
+table{border-collapse:collapse;width:100%;font-size:14px;margin:0 0 18px}
+.tablewrap{overflow-x:auto;margin:0 0 18px}
+th,td{text-align:left;vertical-align:top;padding:9px 10px;border-bottom:1px solid var(--rule)}
+th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;border-bottom:1px solid var(--ink)}
+td.num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;white-space:nowrap}
+td code{white-space:nowrap}
+.sev{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:3px;white-space:nowrap}
+.sev.c{color:var(--crit);background:var(--crit-bg)}
+.sev.h{color:var(--high);background:var(--high-bg)}
+.sev.m{color:var(--med);background:var(--med-bg)}
+.sev.l{color:var(--low);background:var(--low-bg)}
+.ok{display:inline-block;font-size:11px;font-weight:500;letter-spacing:.04em;padding:2px 7px;border-radius:3px;background:var(--panel);color:var(--muted);white-space:nowrap}
+.ok.v{color:var(--low)}
+figure{margin:20px 0 24px}
+figure svg{max-width:100%;height:auto;display:block;color:var(--ink)}
+figcaption{font-size:13px;color:var(--muted);margin-top:8px;line-height:1.45}
+.note{border-left:3px solid var(--accent);padding:6px 14px;margin:0 0 16px;color:var(--ink);background:var(--panel);border-radius:0 6px 6px 0}
+.note p:last-child{margin-bottom:0}
+.rec{display:grid;grid-template-columns:auto minmax(0,1fr);gap:10px 14px;margin:0 0 14px;align-items:start}
+.rec .k{font-family:"IBM Plex Mono",monospace;font-size:13px;color:var(--accent);padding-top:2px;white-space:nowrap}
+.rec .b{margin:0}
+.rec .b strong{display:block;font-weight:600;margin-bottom:2px}
+hr{border:0;border-top:1px solid var(--rule);margin:36px 0}
+small.src{color:var(--muted);font-size:12.5px}
+a{color:var(--accent)}
+@media (prefers-reduced-motion: reduce){*{scroll-behavior:auto}}
+</style>
+<div class="wrap">
+<nav class="toc" aria-label="Sections">
+  <div class="eyebrow">Contents</div>
+  <a href="#decision">The decision</a>
+  <a href="#rule">The contract</a>
+  <a href="#primitives">Primitives</a>
+  <a href="#walk">Walkthroughs</a>
+  <a href="#failures">Failure matrix</a>
+  <a href="#rules">Fixed rules</a>
+  <a href="#perf">What it buys</a>
+  <a href="#ext">Directory delegation, later</a>
+  <a href="#residuals">Residuals and proofs</a>
+  <a href="#changes">What changes</a>
+  <a href="#review">Review trail</a>
+  <a href="#sequence">Build order</a>
+</nav>
+<main>
+<header class="masthead">
+  <div class="eyebrow">Design proposal · PortableFS · revision 3</div>
+  <h1>PortableFS Coherence v2</h1>
+  <p class="lede">The Authority owns the namespace. Mounts own the files they are writing, through identity-scoped write delegations with daemon-side write-back. Readers cache under one volume-wide subscription whose permission is withdrawn before any delegation is granted. One writer or five, one contract.</p>
+  <div class="meta"><span>2026-09-16</span><span>Status: proposal for review, revision 3</span><span>Red-teamed three times by Codex (gpt-6-astra, high), once by a second reviewer, and checked twice against the Authority and FUSE client source</span><span>Companion to the <a href="https://claude.ai/artifact/GdJBZyco6WXNvSgMLESg8a">PortableFS Audit</a></span></div>
+</header>
+
+<div class="verdict">
+<p><strong>What changed since revision 1.</strong> Revision 1 gave mounts local authority over directory subtrees, so creates and renames ran locally and were journaled. Three reviews produced counterexamples that each needed a new rule: a peer removing a directory whose local children are unflushed, two machines moving directories into each other, a rename over a file another machine is writing, the parent pointer of a moved directory, pre-assigned identities that the storage layer cannot provide. Each is closable. Together they are a second distributed filesystem hidden inside the first. So the namespace goes back to the Authority, where the sequencer already orders it correctly, and delegation is scoped to files. That drops most of revision 1's obligations and keeps the two things that matter: writes never wait on the network, and reads are served from cache.</p>
+<p><strong>What changed in revision 3.</strong> A final adversarial pass found four more holes and three assumptions the code contradicts. A peer holding an ordinary buffered read handle could re-cache a delegated file, so a delegation now drops to write-through while any peer holds a cache-capable handle, which is the SMB lease-break rule. Stock FUSE does not deliver <code>syncfs</code> to the daemon, so the completion barrier is <code>fsync</code> on a directory handle opened at run start, which the kernel always delivers. There is no open-by-identity path, so an Authority restart stales every open handle and fails the runs holding them, rather than pretending to recover. Quota reservation, immutable listing snapshots, and transparent epoch recovery were removed as machinery that bought less than it cost. Known residuals and the proofs required before implementation are now listed explicitly.</p>
+<p><strong>What it costs.</strong> One round trip per namespace operation per process, in parallel across processes, instead of three serialized round trips per file behind a mount-wide gate. Directory delegation, which would make namespace operations local too, is specified as a later extension with its obligations listed, to be built only if measurement after this foundation says the namespace round trip is still the bottleneck.</p>
+</div>
+
+<div class="tiles">
+  <div class="tile"><div class="n">0</div><div class="l">Round trips on the foreground path for <code>write</code>, <code>ftruncate</code>, <code>utime</code>, and <code>fsync</code>-free <code>close</code> of an uncontended delegated file</div></div>
+  <div class="tile"><div class="n">1</div><div class="l">Round trip per namespace operation, ordered by the Authority's sequencer, no client-side gate; today 1 to 3 serialized per file</div></div>
+  <div class="tile"><div class="n">2</div><div class="l">Primitives: change subscription, file write delegation. Replaces four lease families, the gate, and the watchdog abort</div></div>
+  <div class="tile"><div class="n">1</div><div class="l">Barrier per run: <code>opendir</code> the mount root at start, <code>fsync</code> that handle at the end. <code>EIO</code> means the run lost data</div></div>
+</div>
+
+<h2 id="decision">The decision</h2>
+<p>Three designs were on the table. Whole-volume ownership, the Archil shape, refuses two machines writing one workspace. Subtree or directory delegation with local namespace authority gets the best numbers and the longest list of correctness obligations. Authority-owned namespace with file delegations is the smallest design that gives concurrent writers on different files, correct competition for the same file, local-speed data, and cached reads. It is the NFSv4 delegation and SMB lease shape, which is the shape every production network filesystem with write caching has converged on. It is chosen here for the same reason the reviewers gave: the obligations it removes are the ones that generate weird bugs.</p>
+
+<h2 id="rule">The contract</h2>
+<ol>
+  <li><strong>Namespace operations execute at the Authority.</strong> create, mkdir, unlink, rmdir, rename, link, symlink, and mknod are one synchronous request each. The Authority's mutation sequencer orders them by identity and (parent, name), so independent operations from different processes and different mounts run concurrently. The client keeps no gate.</li>
+  <li><strong>Data and file attributes execute locally under a write delegation.</strong> A mount holding a delegation on file identity F buffers writes, truncates, and attribute changes to F in the daemon and returns immediately. The buffer is flushed on a timer, at a cap, on <code>fsync</code>, at the run barrier, on recall, on unmount, and before any namespace operation that names F.</li>
+  <li><strong>A subscriber caches an item only while nobody holds a delegation on it.</strong> Granting a delegation on F first withdraws every other subscriber's cache permission for F, and the grant activates when each has acked or its horizon has passed. A committed namespace operation delivers its change entries to subscribers the same way before it is acknowledged.</li>
+  <li><strong>Peer access to a delegated file breaks the delegation before it is answered.</strong> Any server-side operation that consumes F's data, size, or attributes (READ, GETATTR, LOOKUP and READDIR that return attributes, FSYNC, the source side of COPY_FILE_RANGE) first makes the holder flush F to an accepted-sequence cut, then is answered. Any server-side operation that mutates F's data or size (WRITE, SETATTR size, FALLOCATE, the destination side of COPY_FILE_RANGE) recalls the delegation first. While any other session holds a cache-capable handle on F, the delegation is held in write-through form: writes still go through the daemon but are sent immediately, and each commit invalidates the peers through change delivery. Handles a peer opens on an already-delegated file are direct-IO and do not downgrade it.</li>
+</ol>
+
+<figure>
+<svg viewBox="0 0 900 470" role="img" aria-label="Sequence diagram with three lifelines: mount A, the Authority, and mount B. Row one: A creates a file; the Authority applies it and delivers a change to B, which acks; A's create returns. Row two: A writes the file; the Authority withdraws B's cache permission for it, B acks, and grants A a delegation; A's writes are then buffered locally. Row three: B opens the file; the Authority asks A to flush; A flushes; B is served the fresh contents, uncached. Row four: A renames the file; A flushes its dirty data first, then the Authority applies the rename and delivers the change to B." xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker>
+  </defs>
+  <g font-family="IBM Plex Sans, system-ui, sans-serif" font-size="12" fill="currentColor">
+    <rect x="80" y="16" width="140" height="40" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <text x="150" y="34" text-anchor="middle" font-weight="600">mount A</text>
+    <text x="150" y="49" text-anchor="middle" font-size="11">subscription · delegations</text>
+    <rect x="380" y="16" width="140" height="40" rx="4" fill="#2F5D9E" fill-opacity=".12" stroke="#2F5D9E" stroke-width="1.4"/>
+    <text x="450" y="34" text-anchor="middle" font-weight="600" fill="#2F5D9E">Authority</text>
+    <text x="450" y="49" text-anchor="middle" font-size="11" fill="#2F5D9E">namespace · sequencer · XFS</text>
+    <rect x="680" y="16" width="140" height="40" rx="4" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    <text x="750" y="34" text-anchor="middle" font-weight="600">mount B</text>
+    <text x="750" y="49" text-anchor="middle" font-size="11">subscription</text>
+
+    <line x1="150" y1="56" x2="150" y2="450" stroke="currentColor" stroke-width="1" stroke-dasharray="3 4" opacity=".5"/>
+    <line x1="450" y1="56" x2="450" y2="450" stroke="currentColor" stroke-width="1" stroke-dasharray="3 4" opacity=".5"/>
+    <line x1="750" y1="56" x2="750" y2="450" stroke="currentColor" stroke-width="1" stroke-dasharray="3 4" opacity=".5"/>
+
+    <text x="30" y="84" font-size="11" font-weight="600" letter-spacing=".06em">NAMESPACE</text>
+    <line x1="158" y1="96" x2="442" y2="96" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="300" y="90" text-anchor="middle" font-size="11">create src/f (1 RTT, sequencer-ordered)</text>
+    <line x1="458" y1="118" x2="742" y2="118" stroke="#2F5D9E" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="600" y="112" text-anchor="middle" font-size="11" fill="#2F5D9E">change: (src, f) → B drops listing, acks</text>
+    <line x1="442" y1="140" x2="158" y2="140" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="300" y="134" text-anchor="middle" font-size="11">created, identity F</text>
+
+    <text x="30" y="178" font-size="11" font-weight="600" letter-spacing=".06em">DELEGATION</text>
+    <line x1="158" y1="190" x2="442" y2="190" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="300" y="184" text-anchor="middle" font-size="11">first write to F: request delegation</text>
+    <line x1="458" y1="212" x2="742" y2="212" stroke="#2F5D9E" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="600" y="206" text-anchor="middle" font-size="11" fill="#2F5D9E">withdraw cache permission for F → B acks</text>
+    <line x1="442" y1="234" x2="158" y2="234" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="300" y="228" text-anchor="middle" font-size="11">delegation F, generation 1</text>
+    <text x="150" y="258" text-anchor="middle" font-size="11" font-style="italic">writes, truncate, utime on F: local, 0 RTT</text>
+
+    <text x="30" y="292" font-size="11" font-weight="600" letter-spacing=".06em">PEER READ</text>
+    <line x1="742" y1="304" x2="458" y2="304" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="600" y="298" text-anchor="middle" font-size="11">open src/f</text>
+    <line x1="442" y1="326" x2="158" y2="326" stroke="#2F5D9E" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="300" y="320" text-anchor="middle" font-size="11" fill="#2F5D9E">break for read: flush F</text>
+    <line x1="158" y1="348" x2="442" y2="348" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="300" y="342" text-anchor="middle" font-size="11">dirty ranges of F, in order</text>
+    <line x1="458" y1="370" x2="742" y2="370" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="600" y="364" text-anchor="middle" font-size="11">fresh F, not cached; A keeps delegation</text>
+
+    <text x="30" y="404" font-size="11" font-weight="600" letter-spacing=".06em">RENAME</text>
+    <line x1="158" y1="416" x2="442" y2="416" stroke="currentColor" stroke-width="1.2" marker-end="url(#arr2)"/>
+    <text x="300" y="410" text-anchor="middle" font-size="11">flush F's dirty data, then rename f → g</text>
+    <line x1="458" y1="438" x2="742" y2="438" stroke="#2F5D9E" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="600" y="432" text-anchor="middle" font-size="11" fill="#2F5D9E">change: (src, f), (src, g) → B acks</text>
+  </g>
+</svg>
+<figcaption>Namespace operations are one ordered round trip. Data under a delegation is local until a peer looks, a timer fires, or a namespace operation names the file. Cache permission and delegation never coexist on one identity.</figcaption>
+</figure>
+
+<h2 id="primitives">Primitives</h2>
+
+<h3>Change subscription</h3>
+<ul>
+  <li>One per mounted participant, volume-wide. TTL 10 s on the Authority clock, renewed every 3 s. At its horizon without renewal the client drops every cached item and invalidates the kernel's copies. The horizon is the fence for a partitioned reader.</li>
+  <li>Each committed namespace operation, and each delegation grant or release, appends an ordered change entry: identities, (parent, name) pairs, and the volume version. Entries stream to every other subscriber over the CONTROL connection in batches, and a subscriber acks cumulatively by stream position. An ack of position N means every entry through N has been fully withdrawn on that client: kernel pages, attributes, and names invalidated through reverse notify, and every pending reply that could install cache state for those items drained, within the same subscription incarnation. The Authority waits for that ack, or the subscriber's horizon, before acknowledging the operation or activating the grant. At the horizon the subscriber's session is fenced: nothing it sends is honoured until it resubscribes cold, which it may do only after invalidating everything.</li>
+  <li>Subscribing returns a version watermark and the set of currently delegated identities, so a fresh subscriber opens delegated files direct-IO from its first lookup. The first cacheable read is at or after the watermark. Read replies carry the version at which they were served; the client's publication step discards any reply older than the last withdrawal or change for that item, so a delayed reply cannot repopulate a cache after its ack. This is the existing read-publication drain, kept.</li>
+  <li>Under a subscription the client caches attributes, name bindings, negative lookups, directory listings, and data pages. Listing replies already carry every entry's attributes on the wire; under a subscription they are cacheable as they arrive, because a later change to any entry invalidates it. The admission-ordering problem the audit found for per-entry leases does not exist here.</li>
+</ul>
+
+<h3>File write delegation</h3>
+<ul>
+  <li>Scope is one file identity: its data, size, and attributes. Requested inside CREATE and inside OPEN-for-write, so it never costs a separate round trip on the common path; the Authority reserves the delegation before it exposes the new binding, so no peer can cache the identity between the create and the grant. After a recall, the next write on an already-open handle re-requests it, one round trip. Granted when no other participant holds a delegation on it, after every other subscriber's cache permission for it has been withdrawn. Released in batches once the mount has closed its last handle and flushed, so the Authority's 65,536-per-session grant table is never the limit during an install.</li>
+  <li>Under a delegation the daemon buffers writes, truncates, and attribute changes and returns immediately. File handles stay <code>FOPEN_DIRECT_IO</code>, so every <code>write(2)</code> reaches the daemon in one context switch and is admitted or refused there. The kernel write-back cache stays off, which is what makes a recall enforceable: the daemon stops admitting, and there is no kernel-resident dirty state to chase.</li>
+  <li>Flush triggers: a 1 s timer, the cap (64 MiB dirty or 10,000 entries per mount, after which writes block until the flush advances), <code>fsync</code> of the file, the directory-handle barrier, a break for read, a recall, unmount, and any namespace operation that names the identity. Flushed writes go through the existing 1 MiB write RPC, pipelined across the RPC lane, in per-file order.</li>
+  <li>Each entry moves through four states: accepted, applied, visible, durable. The daemon keeps an entry until it is durable, which the Authority signals with its existing coalesced fsync group. A write on a handle opened with <code>O_SYNC</code> or <code>O_DSYNC</code> returns only when its entry is durable. An epoch change with any non-durable entry outstanding advances the mount's loss sequence.</li>
+  <li>Recall is two-phase: withdraw, stop admitting under the retiring generation, drain in-flight writes, flush, ack with the applied sequence. Budget 5 s. A missed budget drops the delegation and its buffer, advances the loss sequence, and returns <code>EIO</code> on the affected handles' next write, close, or fsync. The mount stays up.</li>
+  <li>Flushes carry (delegation id, generation). A flush from a stale generation is rejected whole and advances the sender's loss sequence.</li>
+  <li>Reads on the holder's own mount see its buffer: the daemon overlays dirty ranges on fetched data. Read handles on a locally delegated file may still use the kernel page cache, because every accepted local write to that file invalidates the written range in the kernel when a cacheable read handle is open. So a compiler can still <code>mmap</code> a file the agent just wrote. Today there is no daemon-side data buffer or overlay; this is the largest single piece of new client code.</li>
+</ul>
+
+<h2 id="walk">Walkthroughs</h2>
+
+<h3>One writer installs 40,000 files</h3>
+<p>Each file is one create round trip that returns the delegation with it, then buffered writes and attribute changes at local speed. The round trip per file pipelines across the installer's worker threads and across processes, up to the 94 concurrent slots the client lane allows once the gate is gone; creates in the same directory serialize on that directory's attributes at the Authority, creates in different directories do not. Data flushes on the timer in the background. Compared with today: three round trips per file, each serialized against every other mutation on the mount. The create round trip is what remains, and it is what directory delegation would remove.</p>
+
+<h3>A user opens a file the agent is writing</h3>
+<p>The user's mount asks the Authority for the file. The Authority sees A's delegation, sends A a flush for that identity to an accepted-sequence cut, A flushes, and the Authority answers. The reader's handle was opened after the delegation existed, so it is direct-IO and caches nothing; A keeps buffering. If instead the reader had held an ordinary cached handle from before A started writing, A's delegation would have dropped to write-through for as long as that handle stays open, and every A commit would invalidate the reader through change delivery. If the reader writes, the delegation is recalled from A and granted to the reader. The Files sidecar reads through the gateway with no kernel cache, so it never downgrades anyone.</p>
+
+<h3>Git's lock protocol across two machines</h3>
+<p>Machine A commits: <code>.git/index.lock</code> is created with O_EXCL at the Authority, written under a delegation, and renamed over <code>.git/index</code>, and the rename flushes the lock file's data first, then executes at the Authority. Machine B runs <code>git status</code>: its lookup of <code>.git/index</code> is a name binding, which the rename's change delivery already invalidated, so B fetches the new binding and, because A's delegation may still cover the identity, reads it after a break for read. If B instead takes the lock, its O_EXCL create is ordered by the sequencer against A's, and exactly one wins. Nothing here depends on timers.</p>
+
+<h3>Two writers, same directory</h3>
+<p>A and B both create files under <code>pkg/</code>. Each create is a sequencer-ordered round trip; they interleave without conflict because they touch different (parent, name) pairs. Each side gets delegations on the files it opened for writing. The directory listing on each side is invalidated by the other's creates and refetched lazily. There is no directory lease to contend for.</p>
+
+<h3>Two writers, same file</h3>
+<p>A holds the delegation and is writing. B writes. The Authority recalls A's delegation, A flushes and acks, B is granted it. If both keep writing, the delegation moves on each switch, and each switch costs A or B a flush. Bytes from both sides land in the order the flushes were applied. No filesystem merges concurrent edits to one file; this one keeps every acknowledged byte and never lets two machines' buffers diverge silently.</p>
+
+<h3>Runner failover</h3>
+<p>The new runner mounts, subscribes, and starts creating and writing. Its first write to a file the old runner delegated triggers a recall. If the old runner is alive, it flushes. If it is dead, the recall times out at 5 s and the delegation is dropped; up to one flush interval of the old runner's un-fsynced data is gone, which is the local-disk contract. Its namespace operations were all already applied, because the namespace is never buffered.</p>
+
+<h2 id="failures">Failure matrix</h2>
+<div class="tablewrap"><table>
+<tr><th>Event</th><th>What is lost</th><th>What processes see</th><th>Mount</th></tr>
+<tr><td>Writer host crash</td><td>Buffered data accepted after the last completed flush; typically under a second, at most one cap. Nothing fsync'd, nothing written with <code>O_SYNC</code>, and no namespace operation</td><td>Same as a local disk after a power cut</td><td>Gone with the host</td></tr>
+<tr><td>Writer partitioned from Authority</td><td>Buffers under delegations that expire during the partition</td><td>Writes block at the cap, then <code>EIO</code> on affected handles; loss sequence advances; namespace operations fail with <code>EIO</code> immediately since they need the Authority</td><td>Stays up; reconnects and resubscribes cold</td></tr>
+<tr><td>Writer misses a recall budget</td><td>That file's buffer</td><td><code>EIO</code> on next write, close, or fsync of that file; loss sequence advances</td><td>Stays up</td></tr>
+<tr><td>Reader misses a change delivery or its horizon</td><td>Its cache</td><td>Nothing after the daemon invalidates; next reads miss and refetch. Residual: a process reading a page already resident through a descriptor it holds, while the daemon itself is stalled, can see pre-withdrawal bytes until the daemon resumes and invalidates. This is inherent to stock FUSE and is the same residual the current code documents</td><td>Stays up, resubscribes after invalidating everything</td></tr>
+<tr><td>Reader partitioned</td><td>Nothing on the Authority. Writers' operations that must invalidate it wait at most the reader's horizon, 10 s</td><td>Reader's processes see cached data until the horizon, then errors until reconnect</td><td>Stays up</td></tr>
+<tr><td>Authority crash (new epoch)</td><td>Every mount's non-durable buffer; every delegation, subscription, lock, and open server handle</td><td>Every handle open at the time is permanently stale with <code>EIO</code>, because item capabilities are epoch-local and there is no open-by-identity. The loss sequence advances. New opens work after re-attach. Runs holding files at the time fail at their barrier and are restarted by the product</td><td>Stays up after re-attach; today this is a forced remount</td></tr>
+<tr><td>Authority planned restart</td><td>Nothing: the control plane quiesce recalls every delegation, which flushes every buffer, and waits for durability</td><td>A pause; handles survive because the session is resumed within the same epoch</td><td>Stays up</td></tr>
+<tr><td>Stale-generation flush</td><td>That flush, whole</td><td><code>EIO</code> on affected handles; loss sequence advances</td><td>Stays up</td></tr>
+<tr><td>Quota exhausted</td><td>The buffered entries the Authority rejects with <code>EDQUOT</code> at flush</td><td><code>ENOSPC</code> on the affected handles' next write, close, or fsync, and at the run barrier. The Authority never reads quota usage today and a reservation scheme would be new state on both sides; delayed reporting is the NFS contract and is accepted here</td><td>Stays up</td></tr>
+<tr><td>Unmount with a dirty buffer and unreachable Authority</td><td>The buffer, after waiting to the delegation horizon</td><td>Unmount completes after the horizon; loss logged</td><td>Gone by request</td></tr>
+</table></div>
+
+<h2 id="rules">Fixed rules</h2>
+<p>Each closes a hole a reviewer demonstrated. Each is one rule that always applies.</p>
+<div class="rec"><div class="k">F1</div><p class="b"><strong>Application locks are always Authority-mediated.</strong> <code>flock</code> and <code>fcntl</code> go to the Authority regardless of delegations. They die with the epoch along with every other open handle; nothing is reclaimed. Half the RPC lane stays reserved for blocking lock waits.</p></div>
+<div class="rec"><div class="k">F2</div><p class="b"><strong>No shared writable mmap.</strong> Refused at <code>mmap</code>, as today. Private and read-only mappings work on cacheable handles, and are invalidated through reverse notify, which unmaps them. Runner kernels are not pinned anywhere in OpenSteer, so <code>FUSE_DIRECT_IO_ALLOW_MMAP</code> cannot be assumed, and the design does not depend on it.</p></div>
+<div class="rec"><div class="k">F3</div><p class="b"><strong>Listings continue from the Authority's cookie.</strong> Directory pages are fetched by the Authority's cookie, which is XFS's stable offset, and cached under the subscription. A change to the directory invalidates the cached listing; a handle mid-iteration continues from its cookie and sees the POSIX-permitted unspecified result for entries added or removed during the walk, never <code>ESTALE</code>. Revision 2's immutable per-handle snapshot was removed as more than readdir promises.</p></div>
+<div class="rec"><div class="k">F4</div><p class="b"><strong>A namespace operation that names a delegated file flushes it first.</strong> rename, link, and unlink of an identity with dirty data flush that identity before the request is sent. This is ext4's rename-flush behaviour made explicit, and it is what makes write-then-rename safe without flushing on every close.</p></div>
+<div class="rec"><div class="k">F5</div><p class="b"><strong>Flush order follows program order per file, and every barrier takes a cut.</strong> <code>fsync(F)</code> flushes F's accepted entries and waits for their durability. A barrier on the mount snapshots every accepted entry at call time, waits for application and durability of that cut, and lets later operations proceed. Neither overtakes an accepted entry.</p></div>
+<div class="rec"><div class="k">F6</div><p class="b"><strong>The run barrier is <code>fsync</code> on a directory handle.</strong> Stock FUSE does not deliver <code>syncfs</code> to the daemon on ordinary mounts, only on virtiofs, so <code>syncfs</code> can return 0 without the daemon ever seeing it. <code>FUSE_OPENDIR</code> and <code>FUSE_FSYNCDIR</code> are always delivered. The daemon records the mount's loss sequence when a directory handle on the mount root is opened; <code>fsync</code> on that handle performs the mount-wide cut and returns <code>EIO</code> if the loss sequence advanced since the open. No new control surface, no sticky flag, no remount, and concurrent runs on one mount each observe only losses during their own lifetime. Revision 2's per-mount sticky flag was removed.</p></div>
+<div class="rec"><div class="k">F7</div><p class="b"><strong>Completion contract.</strong> The runner opens the mount root directory before a run's first operation, and at run completion, sandbox exit, and detach it calls <code>fsync</code> on that handle and fails the step on <code>EIO</code>. Archive and planned Authority restart perform the same barrier from the control plane. A run is successful only after its barrier returns 0. Today OpenSteer gets this implicitly from write-through; with write-back it has to be a call.</p></div>
+<div class="rec"><div class="k">F8</div><p class="b"><strong>Admission stops before draining.</strong> On a recall or cap, the daemon stops accepting entries under the retiring generation, drains in-flight ones, then flushes. Writes arriving during the drain block; they neither fail nor slip into the old generation.</p></div>
+<div class="rec"><div class="k">F9</div><p class="b"><strong>The Authority never holds a commit lock while waiting on a peer.</strong> Change delivery, recall, and flush application run on separate lanes; a recall ack names the sequence it drained to. Requests queue FIFO among conflicting identities only; disjoint requests proceed.</p></div>
+<div class="rec"><div class="k">F10</div><p class="b"><strong>Withdrawal is proven, not assumed.</strong> A subscriber acks a stream position only after reverse notify has returned for every item through that position and every pending cache-installing reply for those items has drained. The daemon retries a notify that fails transiently within the budget. Stock FUSE discards the kernel's final page-invalidation result, so a returned notify is the strongest proof userspace can obtain; the F10 kernel test must show that with write-back off and no private page data, <code>invalidate_inode_pages2_range</code> removes every page, mapped ones included, before <code>notify_inval_inode</code> returns. The residual beyond that is the stalled-daemon case in the failure matrix, and it is stated there rather than hidden.</p></div>
+<div class="rec"><div class="k">F11</div><p class="b"><strong>macOS keeps the compatibility writer lease, for every Mac mount.</strong> FSKit on the shipping SDK cannot invalidate names or attributes, and the SDK 27 adapter in the repo covers data only. A read-only Mac mount caches negative lookups it can never revoke, so any attached Mac mount, not only one with write intent, excludes other writers exactly as today. Lifting that is a platform project with its own proof.</p></div>
+<div class="rec"><div class="k">F12</div><p class="b"><strong>Cache-installing replies drain per identity, not mount-wide.</strong> A delayed reply to the holder's own SETATTR can install old attributes after a recall and a peer's change. The current source-publication machinery already keys this per identity; the design keeps that keyed barrier and deletes only the two mount-wide predicates that serialize unrelated mutations.</p></div>
+
+<h2 id="perf">What it buys, and what it does not</h2>
+<div class="tablewrap"><table>
+<tr><th>Workload</th><th>Today</th><th>This design</th><th>Remaining gap to local disk</th></tr>
+<tr><td>Write and close one file (open exists)</td><td>1 round trip per <code>write(2)</code>, serialized mount-wide</td><td>0 round trips; flushed in the background</td><td>None on the foreground path</td></tr>
+<tr><td>Create 40,000 files, one process</td><td>3 round trips each, serialized</td><td>1 round trip each (the create returns the delegation), pipelined only as far as the process is concurrent</td><td>The create round trip. Sequential creates in one process are bounded by RTT</td></tr>
+<tr><td>Create 40,000 files, 8 workers</td><td>Same as one process: the gate serializes</td><td>Round trips overlap across workers; throughput bounded by Authority ops per second</td><td>Smaller by the worker count</td></tr>
+<tr><td>Cold <code>git status</code>, 20,000 files</td><td>Two round trips per entry</td><td>One listing round trip per page; entries cached with their attributes</td><td>Near none</td></tr>
+<tr><td>Warm <code>git status</code></td><td>Cached under leases with 20 s TTL churn</td><td>Cached until changed</td><td>None</td></tr>
+<tr><td>Peer reading while owner writes</td><td>Four control round trips per recall, every write</td><td>One flush per peer read of a dirty file</td><td>Inherent</td></tr>
+</table></div>
+<p>The remaining gap is the namespace round trip per process. Two levers close it: reduce the round trip by placing Authorities and runners in the same zone, which the audit already recommended and which needs a measurement, and directory delegation, below. Measure before choosing.</p>
+
+<h2 id="ext">Directory delegation, specified later</h2>
+<p>A delegation on a directory would let its holder create, remove, and rename entries locally and journal them. That is what would make an install or checkout run at local speed in a single process. It is deliberately not in the foundation because the reviews showed it carries these obligations, each of which is a rule with its own failure modes:</p>
+<ul>
+  <li>Local objects need identities before the Authority has assigned one, and PortableFS identity is the XFS export handle, derived after creation. A daemon-side identity namespace with remapping at flush, stable within a mount, and a rule for hard-link aliases discovered after flush.</li>
+  <li>Removing or renaming a directory whose delegation another mount holds must recall it and flush its local children before checking emptiness, or the peer's accepted creates target a removed directory.</li>
+  <li>Concurrent local directory moves on two mounts can form a cycle that no later Authority check can reject without breaking one already-acknowledged operation. Directory moves would have to stay synchronous.</li>
+  <li>A moved directory's parent pointer and attributes belong to someone; rename over a file another mount holds must pin that identity for the holder's open handle.</li>
+  <li>Grant scope needs an allocation policy that converges instead of oscillating, with queued requests counted as conflicts and explicit identity exceptions inside a directory scope.</li>
+</ul>
+<p>If, after the foundation ships and the latency work is done, a single-process install is still bounded by create round trips, this extension gets its own document with those obligations resolved one by one and a fault test for each. Not before.</p>
+
+<h2 id="residuals">Known residuals and required proofs</h2>
+<p>Three things this design does not make perfect, stated so nobody discovers them in production, and two things that must be demonstrated before implementation starts.</p>
+<ul>
+  <li><strong>Stalled daemon, resident pages.</strong> If a reader's daemon stops responding past its horizon, a process on that mount holding an open descriptor or a private mapping can read pages that were resident before the withdrawal, until the daemon resumes and invalidates. Stock FUSE offers no way for userspace to fence this. The current code has the same residual and documents it. The Authority proceeds at the horizon so a healthy writer is not held hostage by a dead reader.</li>
+  <li><strong>Delayed <code>ENOSPC</code>.</strong> A write accepted into the buffer can fail with <code>EDQUOT</code> at flush; the process learns at its next write, close, or fsync on that file, or at the run barrier. This is the NFS contract. A reservation scheme would need quota usage the Authority does not read today.</li>
+  <li><strong>Contended files run at today's speed.</strong> A file that a peer holds a cached handle on, or writes concurrently, is write-through with invalidation per commit. That is correct and it is what the current system does for every file.</li>
+</ul>
+<ul>
+  <li><strong>Proof 1, kernel invalidation.</strong> On the pinned runner kernel, with kernel write-back off, show that <code>notify_inval_inode</code> returns only after every page of the range, including pages under a private mapping, has left the page cache, and that a concurrent <code>read(2)</code> and a concurrent page fault after return both go to the daemon. Without this, F10 is an assumption.</li>
+  <li><strong>Proof 2, barrier delivery.</strong> On the same kernel, show that <code>fsync</code> on a directory handle reaches the daemon as <code>FUSE_FSYNCDIR</code> with the handle it was opened with, and that <code>syncfs</code> does not reach it, so nobody builds on <code>syncfs</code> by mistake.</li>
+</ul>
+
+<h2 id="changes">What changes</h2>
+
+<h3>Authority</h3>
+<div class="tablewrap"><table>
+<tr><th>Capability</th><th>Today</th><th>Change</th></tr>
+<tr><td>Namespace execution and ordering</td><td><span class="ok v">exists</span> per-op handlers, sequencer on identity and (parent, name), atomic multi-key grant, FIFO</td><td>None. This is the core the design keeps.</td></tr>
+<tr><td>Monotonic volume version</td><td><span class="ok v">exists</span></td><td>None</td></tr>
+<tr><td>Epoch, session generation, grant and revoke epochs</td><td><span class="ok v">exists</span></td><td>Add a delegation id; carry (id, generation) on flushed writes</td></tr>
+<tr><td>Per-session replay slots</td><td><span class="ok v">exists</span></td><td>Sufficient. Flushes are same-epoch by design; an epoch change advances the loss sequence if anything non-durable was outstanding.</td></tr>
+<tr><td>Coalesced fsync and the <code>syncfs</code> barrier RPC</td><td><span class="ok v">exists</span></td><td>Return a durable sequence so the client can retire entries; the daemon calls the barrier RPC from <code>FUSE_FSYNCDIR</code> on the root, never from <code>FUSE_SYNCFS</code></td></tr>
+<tr><td>Recall delivery over CONTROL long-poll, two-phase ack</td><td><span class="ok">partial</span> one pending slot per holder, REVOKE and COMPLETE phases, so two round trips per event, serialized per holder</td><td>Replace with an ordered change stream: batched entries, cumulative acks by position. Keep two-phase only for delegation recall.</td></tr>
+<tr><td>Change subscription and change entries</td><td><span class="sev c">missing</span></td><td>New. One per participant; entries per committed namespace op and per delegation event; ack-or-horizon before acknowledgment.</td></tr>
+<tr><td>File write delegation with cache withdrawal</td><td><span class="ok">partial</span> <code>LEASE_RIGHT_DATA_EXCLUSIVE</code> exists and is grantable; nothing withdraws peers' cache rights first; the Authority does not know which sessions hold cache-capable handles</td><td>Extend: reserve-then-withdraw-then-grant inside CREATE and OPEN, per-identity count of cache-capable handles per session for the write-through downgrade, break on every data-consuming operation, recall on every data-mutating one.</td></tr>
+<tr><td>Batch or transactional apply</td><td><span class="sev c">missing</span></td><td>Not needed.</td></tr>
+<tr><td>Lease persistence, grace, reclaim, open-by-identity</td><td><span class="sev c">missing</span> item capabilities are epoch-local and <code>stable_identity</code> is explicitly non-authorizing</td><td>Not built. An epoch change stales every open handle; runs restart.</td></tr>
+<tr><td>Quota usage</td><td><span class="sev c">missing</span> no <code>quotactl</code> anywhere; the kernel returns <code>EDQUOT</code> at write</td><td>Not built. <code>ENOSPC</code> is delayed to flush and surfaced at the barrier.</td></tr>
+<tr><td>Subtree or directory scope</td><td><span class="sev c">missing</span></td><td>Not in this design.</td></tr>
+</table></div>
+
+<h3>Linux client</h3>
+<ul>
+  <li><strong>New:</strong> daemon write buffer with admission, per-file ordering, caps, generation cut, four-state tracking, retirement on durability, and the dirty-range overlay for the holder's own reads; subscription with watermark, change application, proven-withdrawal acks, and horizon enforcement; delegation table with the write-through downgrade; the loss sequence and the directory-handle barrier; stale-all-handles on epoch change.</li>
+  <li><strong>Kept:</strong> FUSE mount profile (direct-IO write handles, explicit data cache control, no kernel write-back), the per-identity publication drain for every cache-installing reply, reverse notify on the fixed go-fuse, the transport, the blocking-lock lane, cookie-based directory paging.</li>
+  <li><strong>Deleted:</strong> the four lease families and their tickers, the two mount-wide overlap predicates in the source publication gate, the hard-deadline watchdog that aborts the mount, and every <code>revoke()</code> whose cause is a coherence condition. Revoke remains for transport death and operator unmount.</li>
+  <li><strong>Changed:</strong> an epoch change re-attaches and resubscribes cold with every previously open handle stale, instead of forcing a remount.</li>
+</ul>
+
+<h3>OpenSteer</h3>
+<ul>
+  <li>Open the mount root directory at run start; <code>fsync</code> that handle at run completion, sandbox exit, and detach, and fail the step on <code>EIO</code>. Restart runs whose handles were staled by an Authority epoch change.</li>
+  <li>Pin the runner node kernel. Nothing in the repository pins a node image or kernel version; the only floor is a seccomp profile's 4.8. The design needs 5.10 for the FUSE protocol floor already in use and nothing newer, but the F10 kernel test must run on the pinned version.</li>
+  <li>Remove <code>noLocalDirs: true</code>; the graft is orthogonal.</li>
+  <li>The Files sidecar needs nothing. Its reads are peer reads and break for read at the Authority.</li>
+</ul>
+
+<h2 id="review">Review trail</h2>
+<p>Revision 1 went to Codex (gpt-6-astra, high) and to an Opus source check. The result went to a second reviewer, whose six findings and the second Codex round produced this revision.</p>
+<div class="tablewrap"><table>
+<tr><th>Finding</th><th>Disposition</th></tr>
+<tr><td>A subscriber serves cached data while the owner writes locally, because the owner's write is not a commit and the cached read never reaches the Authority</td><td>Accepted; the central hole in revision 1. Cache permission and delegation are now mutually exclusive per identity, with withdrawal before grant.</td></tr>
+<tr><td>Pre-assigned identity blocks are impossible: identity is the XFS export handle, derived after creation</td><td>Accepted. Local creates are gone from the foundation; the identity question moves to the directory-delegation extension.</td></tr>
+<tr><td>"One EIO then fresh handles" is unsafe for lock holders and unlinked-but-open files across an Authority restart</td><td>Accepted as the stale-handle rule: handles with locks, non-durable data, or unopenable identities stay stale; no reclaim.</td></tr>
+<tr><td>The 1 s loss bound and 5 s recall are unsupported; a job can close everything and succeed before a later timeout discards its outputs</td><td>Accepted. Loss is stated as "after the last completed flush", the loss sequence plus the completion barrier make every loss observable (revision 2 used a sticky flag and <code>syncfs</code>; revision 3 replaced both, see F6), and applied-but-not-durable entries are retained until the durability ack.</td></tr>
+<tr><td>Disabling kernel write-back does not fence cached reads, names, or mappings; "zero mount aborts" was an unsupported promise</td><td>Accepted. F10 replaces the promise with a mechanism and a required kernel test; the claim is now "no coherence condition aborts the mount; a failed invalidation stales that inode".</td></tr>
+<tr><td>macOS "does not subscribe" does not stop the kernel from caching; the SDK 27 adapter covers data only</td><td>Accepted. The compatibility writer lease stays.</td></tr>
+<tr><td>Retained set can be empty, so the root ping-pongs; open-file leases overlap granted scopes; directory rename changes containment; replay slots do not order across slots; an immutable listing needs materialization; N RPCs per second is not one RPC</td><td>Accepted. Subtree scope is removed from the foundation. Listings are materialized per handle. Flush ordering is per file. The performance table states time to durable, not foreground time alone.</td></tr>
+<tr><td>Codex round 2: rmdir against unflushed local children, concurrent directory-move cycles, rename over a held identity, parent-pointer ownership, identity exceptions, local inode namespace collisions</td><td>Accepted, and decisive. These are the obligations listed under the extension. None applies while the namespace is Authority-owned.</td></tr>
+<tr><td>Codex round 2: a delayed read reply repopulates a cache after the withdrawal ack</td><td>Accepted. Replies carry the served version; publication discards replies older than the last withdrawal or change for that item.</td></tr>
+<tr><td>Codex round 2: applied-but-not-durable data lost in an Authority crash with nothing to report it</td><td>Accepted. Entries are retired only on the durability ack; an epoch change with non-durable entries advances the loss sequence.</td></tr>
+<tr><td>Codex round 2: <code>syncfs</code> can overtake an accepted write; per-observer errseq has no observer on <code>FUSE_SYNCFS</code></td><td>Accepted in revision 2 as a sticky flag; superseded in revision 3 by the directory-handle barrier, which takes a cut and has a real observer.</td></tr>
+<tr><td>Codex round 2: strict volume FIFO lets a partitioned holder block unrelated requests</td><td>Accepted. FIFO among conflicting identities only.</td></tr>
+<tr><td>Codex round 2: break-for-read must include dirty kernel pages</td><td>Not applicable: kernel write-back is off, so the daemon buffer is the only dirty state. Recorded so nobody turns it on later.</td></tr>
+<tr><td>Both reviewers: start with Authority-owned namespace and file delegations; make subtree delegation a separately justified extension</td><td>Accepted, after resisting it for one revision. The counterexamples are what changed the decision, not the recommendation.</td></tr>
+<tr><td>Round 3: a peer's pre-existing buffered read handle re-caches a delegated file after a break, because <code>FOPEN_DIRECT_IO</code> belongs to the open description and cannot be retrofitted</td><td>Accepted; the most important round-3 finding. Delegations drop to write-through while any peer holds a cache-capable handle; peers' new handles on delegated files are direct-IO. This is the SMB lease-break rule.</td></tr>
+<tr><td>Round 3: stock FUSE does not deliver <code>syncfs</code> to the daemon on ordinary mounts, so the completion contract could return 0 without a barrier</td><td>Accepted and verified against the kernel gating. The barrier is now <code>fsync</code> on a directory handle opened at run start, which is always delivered and gives per-run loss observation for free.</td></tr>
+<tr><td>Round 3 and source check: no open-by-identity path exists; item capabilities are epoch-local; transparent epoch recovery is over-engineering</td><td>Accepted. An epoch change stales every open handle and the product restarts affected runs.</td></tr>
+<tr><td>Round 3: a delayed reply to the holder's own mutation can install stale cache state after a recall; deleting the source-publication gate wholesale is unsafe</td><td>Accepted as F12. Only the two mount-wide predicates are deleted; the per-identity keyed drain stays.</td></tr>
+<tr><td>Round 3: <code>O_SYNC</code> semantics vanish under write-back; <code>copy_file_range</code>, <code>fallocate</code>, and a peer's <code>fsync</code> bypass the break</td><td>Accepted. <code>O_SYNC</code> waits for durability; every data-consuming operation breaks for read and every data-mutating one recalls.</td></tr>
+<tr><td>Round 3: a read-only Mac mount caches negative lookups it cannot revoke</td><td>Accepted. Every attached Mac mount excludes other writers.</td></tr>
+<tr><td>Round 3: cumulative stream acks are only safe if an ack means proven withdrawal through kernel publication, in one subscription incarnation</td><td>Accepted as the definition of an ack.</td></tr>
+<tr><td>Round 3 and source check: quota reservation has no usage source (no <code>quotactl</code>); immutable listing snapshots exceed readdir's promise; a loss counter has no daemon surface reachable from sandboxes</td><td>Accepted. Reservation removed in favour of delayed <code>ENOSPC</code>; snapshots replaced by cookie continuation; the counter is observed through the directory-handle barrier, which needs no new surface.</td></tr>
+<tr><td>Round 3: CREATE piggyback needs the delegation reserved before the binding is exposed</td><td>Accepted, and the piggyback cuts the per-file cost to one round trip.</td></tr>
+<tr><td>Source check: change delivery today is one slot per holder with two phases per event; the client reserves one CONTROL slot</td><td>Accepted. The Authority change is an ordered stream with cumulative acks, not a queue behind the existing two-phase path.</td></tr>
+</table></div>
+
+<h2 id="sequence">Build order</h2>
+<ol>
+  <li><strong>Baseline.</strong> Measure the three workloads on the current build: 40,000-file install with one and eight workers, cold and warm <code>git status</code> over 20,000 files, and a peer listing while the owner writes. Record runner-to-Authority round trip. There is no committed benchmark today.</li>
+  <li><strong>Remove the mount-wide gate.</strong> Key the client gate on the same identity and (parent, name) coordinates the sequencer uses, or delete it and let the Authority order. This is independent of everything else and unblocks parallel creates immediately.</li>
+  <li><strong>Subscription and change entries.</strong> Replace the N, A, and E lease families with the subscription; cache listings with attributes. Delete their tickers. This removes the readdir <code>ESTALE</code> and the lease-timing <code>mmap</code> behaviour.</li>
+  <li><strong>File write delegation.</strong> Reserve-withdraw-grant inside CREATE and OPEN, daemon buffer with overlay, four states, flush triggers, <code>O_SYNC</code>, F4 rename-flush, break on every data-consuming operation, recall on every data-mutating one, write-through downgrade while a peer holds a cacheable handle, stale-generation rejection. Delete the D family and unconditional write-through.</li>
+  <li><strong>Loss sequence, directory-handle barrier, stale-all-handles on epoch change, re-attach.</strong> Delete the watchdog abort and coherence-caused revokes. The F10 kernel test and a test that <code>FUSE_FSYNCDIR</code> reaches the daemon on the pinned runner kernel ship with this step and gate it.</li>
+  <li><strong>OpenSteer completion contract.</strong> The directory-handle barrier at run start and end, restart of runs staled by an epoch change, and a pinned runner kernel.</li>
+  <li><strong>Measure again, then decide</strong> between Authority placement and the directory-delegation extension.</li>
+</ol>
+
+<hr>
+<p><small class="src">Sources read: <code>vcs/internal/volumeserver/leases.go</code>, <code>visibility.go</code>, <code>mutation_sequencer.go</code>, <code>session.go</code>; <code>vcs/internal/authorityrpc/volume_handler_linux.go</code>, <code>protocol.go</code>, <code>client.go</code>; <code>vcs/internal/fusev3/source_publication_linux.go</code>, <code>leases_linux.go</code>, <code>coherence_linux.go</code>, <code>raw_linux.go</code>, <code>fuse_linux.go</code>; <code>vcs/internal/xfsstore/volume_linux.go</code> (<code>stableIdentityFD</code>), <code>fsync_group.go</code>; <code>vcs/internal/portablefsd/publicationgate.go</code>, <code>repairactuate_darwin.go</code>, <code>v3dataplane.go</code>; <code>proto/authority/v1/authority.proto</code>. Codex jobs <code>01a0aae4-4ed0-71d1-8934-26fb947e14b8</code>, <code>01a0ab09-a293-7662-9bb3-b0ee0522acf4</code>, and <code>01a0ab16-2e57-7740-a3db-89cd55ac6422</code>.</small></p>
+</main>
+</div>
