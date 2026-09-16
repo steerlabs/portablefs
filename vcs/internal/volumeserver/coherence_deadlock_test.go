@@ -189,8 +189,8 @@ func TestCoherenceRecallSuppressesCacheModeUpgrade(t *testing.T) {
 	afterClose := c.position
 	mode := c.delegations[identity].grant.Mode
 	c.mu.Unlock()
-	if mode != DelegationFull {
-		t.Fatalf("internal recalling mode = %v, want full", mode)
+	if mode != DelegationWritethrough {
+		t.Fatalf("internal recalling mode = %v, want writethrough until recall completes", mode)
 	}
 	if afterClose != beforeClose {
 		t.Fatalf("peer close published event at %d during recall; position was %d", afterClose, beforeClose)

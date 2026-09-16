@@ -43,8 +43,10 @@ must select this component on the v7 path and remove the old lease path there.
   reservation, active delegation, or pinned retired record exists is direct-IO,
   including a new handle on the holder. Existing holder handles do not force
   writethrough; existing peer handles do. Closing the last peer handle upgrades
-  an active delegation through the holder's outbox. A recalling generation never
-  receives an upgrade event.
+  an active delegation through the holder's outbox. The old mode remains live
+  until the exact mode event is acknowledged; a missed mode deadline retires the
+  generation and records loss. A recalling generation never receives an upgrade
+  event.
 - A volume-global id/generation counter increases on every grant reservation.
   No counter is retained for a deleted identity. Releases validate their entire
   batch before changing state. Failed generations and missed cuts advance the
@@ -75,9 +77,18 @@ and `CoherenceSessionHooks`; the coordinator implements all three.
 1. Authenticate with the runtime, then call `CheckSession` on every subscribed
    request. Map CONTROL to `Poll`, `Ack`, `AckDelegation`, and `Renew`. Keep CONTROL
    and flush-application capacity available while ordinary RPCs are waiting.
+   Snapshot and change pages contain at most 4,096 entries and must include the
+   continuation cursor when checking the negotiated reply-frame limit.
 2. For existing-file OPEN/CREATE with write intent, or first data mutation, call
    `Reserve` outside storage and commit locks, then `Grant`. `DataMutated` combines
    those two calls. Always finish a returned reservation with `Grant` or `Abort`.
+   An ordinary synchronous mutation whose request has no delegation reference
+   calls `BeginSynchronousMutation`; it atomically pins an existing holder grant
+   or creates a private grant that `DelegationFlush.End` releases. Peers wait for
+   that private apply instead of receiving a recall for a grant the client never
+   learned. A successful write-intent operation may call `RetainDelegation`
+   before `End` and return that exact grant; a failed operation omits the call
+   and cannot leak an unreported generation.
 3. New CREATE needs a binding-publication exclusion from the handler/sequencer.
    After storage assigns the new stable identity, call nonblocking `ReserveNew`
    before allowing any peer to resolve or cache the binding. `Store.Create` alone
@@ -202,6 +213,7 @@ func (*CoherenceCoordinator) CloseCacheCapable(SubscriptionToken, [16]byte) erro
 func (*CoherenceCoordinator) ReserveNew(SubscriptionToken, [16]byte) (*DelegationReservation, error)
 func (*CoherenceCoordinator) Reserve(context.Context, SubscriptionToken, [16]byte) (*DelegationReservation, error)
 func (*CoherenceCoordinator) DataMutated(context.Context, SubscriptionToken, [16]byte) (Delegation, error)
+func (*CoherenceCoordinator) BeginSynchronousMutation(context.Context, SubscriptionToken, [16]byte) (*DelegationFlush, error)
 func (*CoherenceCoordinator) DataConsumed(context.Context, SubscriptionToken, [16]byte) (*DataGuard, error)
 func (*CoherenceCoordinator) BreakForRead(context.Context, [16]byte) error
 func (*CoherenceCoordinator) Recall(context.Context, [16]byte) error
@@ -213,6 +225,7 @@ func (*CoherenceCoordinator) LookupDelegation([16]byte) (Delegation, bool)
 type DelegationReservation struct { /* private state */ }
 func (*DelegationReservation) Grant(context.Context) (Delegation, error)
 func (*DelegationReservation) Abort()
+func (*DelegationFlush) RetainDelegation() (Delegation, error)
 type DataGuard struct { AppliedSequence uint64 /* plus private state */ }
 func (*DataGuard) Release()
 type DelegationFlush struct { /* private state */ }
