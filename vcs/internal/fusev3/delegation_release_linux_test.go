@@ -233,3 +233,40 @@ func TestCloseBatchRejectsMalformedOutcomesBeforeRemovingHandles(t *testing.T) {
 		})
 	}
 }
+
+func TestCloseBatchEpochChangeLeavesMountRecoveryInCharge(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		revoke bool
+	}{
+		{"epoch", authorityrpc.ErrAuthorityChanged, false},
+		{"uncertain", authorityrpc.ErrTransportUncertain, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &releaseOutcomeRPC{close: func(*authoritypb.CloseBatchRequest) (*authoritypb.Response, error) { return nil, tc.err }}
+			m := newDelegationTestManager(t, fake)
+			id := installDelegationForTest(t, m, 91, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			if _, err := m.Write(t.Context(), id, 0, []byte("retained"), false); err != nil {
+				t.Fatal(err)
+			}
+			var revoked bool
+			m.SetCleanupFailureReporter(func(error) { revoked = true })
+			if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: delegationTestToken(91, 2)}}); err == nil {
+				t.Fatal("cleanup error hidden")
+			}
+			if revoked != tc.revoke {
+				t.Fatalf("mount revoke=%v want=%v", revoked, tc.revoke)
+			}
+			if m.LossSequence() != 0 || m.buf.Stats().Entries != 1 {
+				t.Fatal("cleanup discarded retained durability obligation")
+			}
+			if !tc.revoke {
+				m.EpochChanged("test epoch replacement")
+				if m.LossSequence() != 1 || m.buf.Stats().Entries != 0 {
+					t.Fatal("epoch recovery failed to discharge old retained obligation")
+				}
+			}
+		})
+	}
+}

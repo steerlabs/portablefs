@@ -1705,3 +1705,21 @@ The full `bash scripts/xfs-fuse-integration.sh` gate at `b87a8f8` passes all 75
 required privileged tests and the one required root boundary test. Log:
 `/tmp/cv2-g2-after-handoff-xfs.log`. This covers the handoff and worker-pool
 follow-ups with the unchanged mounted race bound.
+
+#### G2 gate follow-up: deferred close across epoch replacement
+
+The next full coherence matrix passed the coherence cases through recall loss,
+then the epoch-restart helper observed mount B disappear. Its queued CLOSE
+received authenticated `ErrAuthorityChanged`, and the item 4 unknown-cleanup
+reporter incorrectly revoked the mount. An epoch replacement destroys the old
+Authority descriptor table; normal cold recovery owns old-handle staling and
+retained-data loss. Deferred cleanup now returns its error without invoking
+mount teardown for that exact case. Unknown same-epoch transport outcomes still
+invoke the cleanup reporter.
+
+The regression fails the former code by observing an unwanted revoke
+(`/tmp/cv2-g2-close-epoch-fault.log`). Its epoch and transport-uncertain arms
+check retained accounting; epoch recovery subsequently reports the old data
+loss once. Close/release/malformed-outcome tests pass 20 repetitions
+(`/tmp/cv2-g2-close-epoch-unit.log`). The failing matrix is retained at
+`/tmp/cv2-g2-after-handoff-matrix.log`; a full rerun is in progress.

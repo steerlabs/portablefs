@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"sort"
 )
@@ -266,6 +267,12 @@ type delegationCleanupError struct{ error }
 // Unknown cleanup owns an Authority descriptor until terminal session cleanup.
 // End the mounted session rather than silently discharging its admission debt.
 func (m *delegationManager) unknownCloseOutcome(err error) error {
+	if errors.Is(err, authorityrpc.ErrAuthorityChanged) {
+		// The authenticated epoch replacement destroyed the old descriptor
+		// table. Recovery owns its local handles and retained-data loss; an
+		// asynchronous close must not turn that boundary into mount teardown.
+		return delegationCleanupError{err}
+	}
 	m.hookMu.RLock()
 	report := m.cleanupFailure
 	m.hookMu.RUnlock()
