@@ -829,6 +829,50 @@ func TestMountRetirementBlocksNewIdentitiesAndCompetingRetirements(t *testing.T)
 	}
 }
 
+func TestDropDuringSuccessfulFlushInvalidatesBatchAndOverlay(t *testing.T) {
+	started := make(chan Entry, 1)
+	release := make(chan struct{})
+	flusher := flusherFunc(func(ctx context.Context, _ Identity, entry Entry) (uint64, error) {
+		started <- entry
+		select {
+		case <-release:
+			return 50, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+	b := newTestBuffer(t, flusher)
+	id := testIdentity(14)
+	cut := mustWrite(t, b, id, 1, "dirty")
+	result := make(chan error, 1)
+	go func() { _, err := b.FlushIdentity(context.Background(), id, cut); result <- err }()
+	await(t, started, "in-flight successful flush")
+	report := b.Drop(id, "stale generation")
+	if report.Identity != id || report.Reason != "stale generation" || report.Bytes != 5 || report.Entries != 1 || report.LossSequence != 1 {
+		t.Fatalf("Drop report = %+v", report)
+	}
+	close(release)
+	if err := await(t, result, "dropped successful flush"); !errors.Is(err, ErrLost) {
+		t.Fatalf("FlushIdentity error = %v, want ErrLost", err)
+	}
+	assertStats(t, b, Stats{LossSequence: 1})
+	assertRead(t, b, id, 0, 7, []byte("clean!!"), []byte("clean!!"))
+	if !b.Lost(id) || b.IdentityLoss(id) != 1 {
+		t.Fatalf("loss state = (%v, %d), want (true, 1)", b.Lost(id), b.IdentityLoss(id))
+	}
+	if !b.ClearLost(id) || b.ClearLost(id) {
+		t.Fatal("ClearLost must report the sticky identity error exactly once")
+	}
+	if b.IdentityLoss(id) != 1 {
+		t.Fatal("ClearLost erased per-handle loss observation")
+	}
+	if got := b.Generation(id); got != 2 {
+		t.Fatalf("generation after drop = %d, want 2", got)
+	}
+	b.VisibleSequence(50)
+	b.DurableSequence(50)
+}
+
 func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	started := make(chan Entry, 1)
 	release := make(chan struct{})
