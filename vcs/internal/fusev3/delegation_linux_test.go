@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"syscall"
 	"testing"
@@ -1012,12 +1013,21 @@ func TestDelegationEpochChangeWithoutDirtyDataPreservesLoss(t *testing.T) {
 
 func TestDropReporterSuppressesCleanDelegationLoss(t *testing.T) {
 	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	var logged bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(previous) })
 	var reports []writeback.DropReport
 	m.SetDropReporter(func(report writeback.DropReport) { reports = append(reports, report) })
 	m.reportDrop(writeback.DropReport{LossSequence: 1, Reason: "clean delegation outcome unknown"})
 	m.reportDrop(writeback.DropReport{Entries: 1, LossSequence: 2, Reason: "retained writeback lost"})
 	if len(reports) != 1 || reports[0].Entries != 1 || reports[0].LossSequence != 2 {
 		t.Fatalf("writeback reports = %+v, want only retained loss", reports)
+	}
+	for _, reason := range [][]byte{[]byte("clean delegation outcome unknown"), []byte("retained writeback lost")} {
+		if !bytes.Contains(logged.Bytes(), reason) {
+			t.Fatalf("drop log %q omits reason %q", logged.String(), reason)
+		}
 	}
 }
 
