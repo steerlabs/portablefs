@@ -91,6 +91,8 @@ type fakeRPC struct {
 	mkdirFailure   syscall.Errno
 	reclaimFailure syscall.Errno
 	reclaimClass   authoritypb.FailureClass
+	subscribeGate  <-chan struct{}
+	subscribeCalls int
 	keepAliveErr   syscall.Errno
 	sessionEnd     error
 	xattrValue     []byte
@@ -176,6 +178,17 @@ func (f *fakeRPC) SessionEndCause() error {
 }
 func (f *fakeRPC) FinishLocalSessionEnforcement() {}
 func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+	f.mu.Lock()
+	f.subscribeCalls++
+	gate := f.subscribeGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, time.Time{}, ctx.Err()
+		}
+	}
 	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, time.Now().Add(10 * time.Second), nil
 }
 func (f *fakeRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
@@ -2317,6 +2330,59 @@ func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.
 	case <-mount.ctx.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("terminal session cleanup failure did not revoke mount")
+	}
+}
+
+func TestRefusedReclaimRequeuesAfterColdSubscription(t *testing.T) {
+	mount, rpc := testMount(t, 64)
+	reactivate := make(chan struct{})
+	rpc.mu.Lock()
+	rpc.subscribeGate = reactivate
+	reclaimCalls := 0
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetReclaim() == nil {
+			return &authoritypb.Response{}, nil
+		}
+		reclaimCalls++
+		if reclaimCalls == 1 {
+			return &authoritypb.Response{
+				Errno:   int32(syscall.EIO),
+				Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
+			}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	rpc.mu.Unlock()
+
+	mount.start(time.Hour)
+	defer func() {
+		mount.cancel()
+		mount.wg.Wait()
+	}()
+	mount.deferReclaim(testToken(71))
+	waitFor(t, "refused reclaim and parked cold subscribe", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return reclaimCalls == 1 && rpc.subscribeCalls >= 2
+	})
+	if mount.isRevoked() {
+		t.Fatal("coherence reclaim refusal revoked the mount")
+	}
+	rpc.mu.Lock()
+	if reclaimCalls != 1 {
+		t.Fatalf("reclaim retried before subscription reactivation: %d", reclaimCalls)
+	}
+	rpc.mu.Unlock()
+
+	close(reactivate)
+	waitFor(t, "reclaim retry after cold subscription", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return reclaimCalls == 2
+	})
+	waitFor(t, "reclaim queue drain", func() bool { return mount.reclaim.pending() == 0 })
+	if mount.isRevoked() || mount.ctx.Err() != nil {
+		t.Fatalf("reclaim recovery stopped the worker: revoked=%v context=%v", mount.isRevoked(), mount.ctx.Err())
 	}
 }
 
