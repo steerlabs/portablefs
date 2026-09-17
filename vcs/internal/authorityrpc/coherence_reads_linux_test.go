@@ -3,6 +3,7 @@
 package authorityrpc
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"sync/atomic"
@@ -361,6 +362,22 @@ type coherenceEmptyDirectoryStore struct {
 	calls             atomic.Uint32
 }
 
+type coherenceRestampedEmptyDirectoryStore struct {
+	coherenceEmptyDirectoryStore
+}
+
+func (s *coherenceRestampedEmptyDirectoryStore) ReadDirOpen(
+	handle xfsstore.Capability,
+	cookie uint64,
+	_ int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if handle != s.handle {
+		return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EBADF
+	}
+	call := s.calls.Add(1)
+	return nil, cookie, [16]byte{byte(call)}, true, s.directory, nil
+}
+
 func (s *coherenceEmptyDirectoryStore) IdentityOpen(handle xfsstore.Capability) ([16]byte, error) {
 	if handle != s.handle {
 		return [16]byte{}, syscall.EBADF
@@ -453,6 +470,30 @@ func TestCoherenceLookupAndEmptyReadDirCarrySampledVersion(t *testing.T) {
 			t.Fatalf("ReadDirOpen calls = %d, want initial read and locked revalidation", calls)
 		}
 	})
+}
+
+func TestCoherenceReadDirPublishesRevalidatedPageStamp(t *testing.T) {
+	store := &coherenceRestampedEmptyDirectoryStore{coherenceEmptyDirectoryStore: coherenceEmptyDirectoryStore{
+		handle: xfsstore.Capability{0x53}, directory: xfsstore.Capability{0x54},
+	}}
+	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := coherenceReadRequest(credential)
+	request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: store.handle[:], MaxEntries: 8}}
+	stampMutation(t, request, 0, 1)
+
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != 0 || response.GetReadDir() == nil {
+		t.Fatalf("READDIR response = %+v", response)
+	}
+	if got, want := response.GetReadDir().GetVerifier(), []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; !bytes.Equal(got, want) {
+		t.Fatalf("published verifier = %x, want locked revalidation stamp %x", got, want)
+	}
+	if calls := store.calls.Load(); calls != 2 {
+		t.Fatalf("ReadDirOpen calls = %d, want initial read and locked revalidation", calls)
+	}
 }
 
 func (s *coherenceChangingDirectoryStore) ReadDirOpen(
