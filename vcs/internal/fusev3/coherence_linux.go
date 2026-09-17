@@ -503,7 +503,7 @@ func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
 	r.cachedNameStable = make(map[nameKey]publicationNamespace)
 	r.cachedNameStamps = make(map[nameKey]subscriptionStamp)
-	r.cachedNegatives = make(map[nameKey]struct{})
+	r.cachedNegatives = make(map[nameKey]string)
 	r.cachedNegativeStamps = make(map[nameKey]subscriptionStamp)
 	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
 	r.cachedAttrPayloads = make(map[publicationIdentity]cachedAttrPayload)

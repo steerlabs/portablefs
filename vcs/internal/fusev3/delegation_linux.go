@@ -10,6 +10,7 @@ import (
 	"log"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -94,7 +95,7 @@ type delegationManager struct {
 	// is replaced. Existing handles compare against it once; newly registered
 	// handles start at the retained value.
 	identityLoss map[writeback.Identity]uint64
-	inc          uint64
+	inc          atomic.Uint64
 	// epochSerial rejects server handles queued before an Authority epoch
 	// replacement. It is protected by epoch rather than mu because it fences
 	// network use of those capabilities with buffer replacement.
@@ -138,9 +139,10 @@ func newDelegationManager(rpc delegationRPC, timeout time.Duration, incarnation 
 		return nil, errors.New("fusev3: delegation manager requires an authority and request timeout")
 	}
 	m := &delegationManager{
-		rpc: rpc, timeout: timeout, byID: make(map[writeback.Identity]*delegationState), identityLoss: make(map[writeback.Identity]uint64), inc: incarnation, epochSerial: 1,
+		rpc: rpc, timeout: timeout, byID: make(map[writeback.Identity]*delegationState), identityLoss: make(map[writeback.Identity]uint64), epochSerial: 1,
 		maxWrite: writeback.MaxPayload, durableKick: make(chan struct{}, 1), tokens: make(map[uint64]delegationFlushProgress), closeQueue: make(chan delegationClose, 4096),
 	}
+	m.inc.Store(incarnation)
 	if limits, ok := rpc.(interface{ IOLimits() (uint32, uint32) }); ok {
 		_, maxWrite := limits.IOLimits()
 		if maxWrite != 0 && maxWrite < uint32(m.maxWrite) {
@@ -214,9 +216,7 @@ func (m *delegationManager) lookupState(id writeback.Identity) *delegationState 
 }
 
 func (m *delegationManager) SetIncarnation(incarnation uint64) {
-	m.mu.Lock()
-	m.inc = incarnation
-	m.mu.Unlock()
+	m.inc.Store(incarnation)
 }
 
 // FenceSubscription synchronously abandons every grant and buffered entry
@@ -327,9 +327,7 @@ func (m *delegationManager) BaseAttr(identity []byte) (*authoritypb.Attr, bool) 
 }
 
 func (m *delegationManager) incarnation() uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.inc
+	return m.inc.Load()
 }
 
 // Install records a grant returned by CREATE or OPEN. handle and item are the

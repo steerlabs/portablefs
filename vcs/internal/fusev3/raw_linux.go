@@ -109,6 +109,7 @@ type replyAttrPublication struct {
 }
 
 type cachedAttrPayload struct {
+	fuseAttr      fuse.Attr
 	stamp         subscriptionStamp
 	attr          *authoritypb.Attr
 	objectVersion uint64
@@ -190,10 +191,13 @@ type replyDataPublication struct {
 // RawFileSystem method returns. They settle after their physical /dev/fuse
 // write, which is the stock-kernel publication edge available to userspace.
 type replyPublication struct {
-	names  []replyNamePublication
-	attrs  []replyAttrPublication
-	data   []replyDataPublication
-	source *sourcePublicationLease
+	cachedNext        *replyPublication
+	cachedCoordinates [2]publicationCoordinate
+	cachedCount       int
+	names             []replyNamePublication
+	attrs             []replyAttrPublication
+	data              []replyDataPublication
+	source            *sourcePublicationLease
 	// responseConsumptions prevent authority transport EOF from exposing the
 	// session terminal edge until every authority response contributing to this
 	// kernel result is either physically written or fail-closed locally. One
@@ -361,6 +365,8 @@ func (h *handleRecord) is(kind handleKind) bool {
 // high-level layer: the authority returns a fresh capability on every Lookup,
 // and only this table knows whether that candidate won or must be reclaimed.
 type rawFileSystem struct {
+	cachedReplyArena [256]replyPublication
+	cachedReplyFree  *replyPublication
 	dataPublications map[publicationIdentity]map[*replyPublication]struct{}
 	fuse.RawFileSystem
 	mount *Mount
@@ -416,9 +422,9 @@ type rawFileSystem struct {
 	cachedNameStable  map[nameKey]publicationNamespace
 	cachedNameStamps  map[nameKey]subscriptionStamp
 	// cachedNegatives is the same daemon-local registry for the other half of
-	// the namespace. It is a set rather than a map to a record because an
-	// absence names nothing.
-	cachedNegatives      map[nameKey]struct{}
+	// the namespace. Its value owns the stable name used by cached replies;
+	// an absence names no inode record.
+	cachedNegatives      map[nameKey]string
 	cachedNegativeStamps map[nameKey]subscriptionStamp
 	// cachedAttrs is the exact set of inode attributes this daemon has allowed
 	// its kernel to retain. It gives attribute candidates the same bounded,
@@ -509,7 +515,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		cachedStableNames:       make(map[publicationNamespace]*inodeRecord),
 		cachedNameStable:        make(map[nameKey]publicationNamespace),
 		cachedNameStamps:        make(map[nameKey]subscriptionStamp),
-		cachedNegatives:         make(map[nameKey]struct{}),
+		cachedNegatives:         make(map[nameKey]string),
 		cachedNegativeStamps:    make(map[nameKey]subscriptionStamp),
 		cachedAttrs:             make(map[publicationIdentity]*inodeRecord),
 		cachedAttrPayloads:      make(map[publicationIdentity]cachedAttrPayload),
@@ -517,12 +523,16 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		publishingNames:         make(map[nameKey]int),
 		publishingInodes:        make(map[uint64]int),
 		published:               make(chan struct{}),
-		replyPublications:       make(map[uint64]*replyPublication),
+		replyPublications:       make(map[uint64]*replyPublication, 256),
 		sourceHolds:             make(map[publicationCoordinate]*sourcePublicationLease),
 		sourcePublishing:        make(map[publicationCoordinate]int),
 		publishingNegativeNames: make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
 		repairingCoordinates:    make(map[publicationCoordinate]bool),
 		cacheReservations:       make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
+	}
+	for i := range r.cachedReplyArena {
+		r.cachedReplyArena[i].cachedNext = r.cachedReplyFree
+		r.cachedReplyFree = &r.cachedReplyArena[i]
 	}
 	mount.raw = r
 	mount.delegations.SetAcceptedWriteInvalidator(func(ctx context.Context, identity []byte, offset, length int64) error {
@@ -630,7 +640,7 @@ func (r *rawFileSystem) supersedeNegativeNameLocked(key nameKey, coordinate publ
 // kernel refuses as protocol corruption rather than ignoring.
 func (r *rawFileSystem) bindCachedNegativeLocked(key nameKey, lease subscriptionStamp) {
 	r.dropCachedNameLocked(key)
-	r.cachedNegatives[key] = struct{}{}
+	r.cachedNegatives[key] = key.name
 	r.cachedNegativeStamps[key] = lease
 }
 
@@ -928,7 +938,7 @@ func (r *rawFileSystem) terminalizeReplyCacheOwnership(deadline time.Time) bool 
 	originalWrites := make([]<-chan struct{}, 0, len(seen))
 	for publication := range seen {
 		if publication.originalFinalized && !publication.originalWrote {
-			originalWrites = append(originalWrites, publication.originalDone)
+			originalWrites = append(originalWrites, publication.originalDoneLocked())
 		}
 	}
 	r.mu.Unlock()
@@ -992,7 +1002,7 @@ func (r *rawFileSystem) finishReplyCacheTerminalization(connectionGone bool) boo
 		delete(r.replyPublications, publication.requestUnique)
 		physical := !connectionGone && publication.originalWrote && publication.originalStatus.Ok()
 		if connectionGone && !publication.originalWrote {
-			close(publication.originalDone)
+			publication.closeOriginalDoneLocked()
 		}
 		dirPlus := r.settleDirPlusLookupTransactionLocked(publication, physical)
 		responseConsumption := r.settleReplyPublicationLocked(publication, physical)
@@ -1059,12 +1069,11 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	r.mu.Lock()
 	entry, namePublication, cachedName := r.admitNameLocked(ctx, parent, name, record)
 	inode := attr.GetInode()
-	attrLifetime := time.Duration(0)
 	var attrCoordinate publicationCoordinate
 	cachedAttr := false
 	if cachedName && publication.postState == nil && !owned {
 		var attrReservation *cacheInstallReservation
-		attrLifetime, attrCoordinate, attrReservation, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
+		_, attrCoordinate, attrReservation, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
 		if cachedAttr {
 			objectVersion, snapshot := cacheCandidateVersion(publication)
 			publication.attrs = append(publication.attrs, replyAttrPublication{
@@ -1085,7 +1094,7 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	// zero even when this answer remains reusable inside the daemon.
 	_ = entry
 	out.SetEntryTimeout(0)
-	out.SetAttrTimeout(attrLifetime)
+	out.SetAttrTimeout(0)
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 	return nil
 }
@@ -1326,9 +1335,16 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 	if publication == nil || record == nil || attr == nil {
 		return errors.New("fusev3: anonymous entry escaped its post-VFS reply-publication lifecycle")
 	}
-	r.mu.Lock()
-	lifetime, coordinate, reservation, cached := r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
-	r.mu.Unlock()
+	var coordinate publicationCoordinate
+	var reservation *cacheInstallReservation
+	cached := false
+	// Mutation post-state supplies the exact versioned payload at callback
+	// completion. A versionless candidate here would hide that later admission.
+	if publication.postState == nil {
+		r.mu.Lock()
+		_, coordinate, reservation, cached = r.admitAttrLocked(ctx, attr.GetInode(), record.identity)
+		r.mu.Unlock()
+	}
 	if cached {
 		objectVersion, snapshot := cacheCandidateVersion(publication)
 		publication.attrs = append(publication.attrs, replyAttrPublication{
@@ -1339,7 +1355,7 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 	}
 	out.NodeId, out.Generation = record.id, 1
 	out.SetEntryTimeout(0)
-	out.SetAttrTimeout(lifetime)
+	out.SetAttrTimeout(0)
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 	return nil
 }
@@ -1374,8 +1390,11 @@ func (r *rawFileSystem) settleAttrPublicationLocked(publication replyAttrPublica
 	if successful && (publication.reservation == nil || !publication.reservation.revoked) && publication.record != nil && !publication.record.reclaimed {
 		r.cachedAttrs[publication.identity] = publication.record
 		if publication.stamp.incarnation != 0 && publication.attr != nil && publication.objectVersion != 0 && publication.snapshot != 0 {
+			var rendered fuse.Attr
+			fillAttr(publication.attr, &rendered, r.mount.uid, r.mount.gid)
 			r.cachedAttrPayloads[publication.identity] = cachedAttrPayload{
-				stamp: publication.stamp, attr: proto.Clone(publication.attr).(*authoritypb.Attr),
+				fuseAttr: rendered,
+				stamp:    publication.stamp, attr: proto.Clone(publication.attr).(*authoritypb.Attr),
 				objectVersion: publication.objectVersion, snapshot: publication.snapshot,
 			}
 		} else {
@@ -1404,6 +1423,9 @@ func (r *rawFileSystem) settleDataPublicationLocked(publication replyDataPublica
 }
 
 func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) responseConsumptionClaim {
+	if publication.cachedCount != 0 {
+		r.signalSourceChangedLocked()
+	}
 	// Failure before the physical edge and receipt settlement both pass here.
 	// The former still owns capacity; the latter finds it already consumed.
 	r.releaseReplyCapacityLocked(publication)
@@ -1523,6 +1545,10 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		// already holds - a buffered READDIR page, a served READ - carries a real
 		// payload that no publication decision applies to, and shortening it is
 		// indistinguishable to the kernel from end-of-data.
+		r.mu.Unlock()
+		return payloadSize, fuse.OK, fuse.OK
+	}
+	if publication.cachedCount != 0 {
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
@@ -1672,7 +1698,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 		if publication != nil && publication.originalFinalized && !publication.originalWrote {
 			publication.originalWrote = true
 			publication.originalStatus = status
-			close(publication.originalDone)
+			publication.closeOriginalDoneLocked()
 			if status.Ok() {
 				r.releaseReplyCapacityLocked(publication)
 			}
@@ -1716,7 +1742,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	}
 	publication.originalWrote = true
 	publication.originalStatus = status
-	close(publication.originalDone)
+	publication.closeOriginalDoneLocked()
 	if status.Ok() {
 		// Capacity bounds how many reply writers may be admitted, not how long a
 		// physically written candidate remains addressable for peer revocation.
@@ -1740,6 +1766,12 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	}
 
 	consumeClaimedAuthorityResponses(responseConsumption)
+	if publication.cachedCount != 0 {
+		r.mu.Lock()
+		*publication = replyPublication{cachedNext: r.cachedReplyFree}
+		r.cachedReplyFree = publication
+		r.mu.Unlock()
+	}
 }
 
 func (r *rawFileSystem) Init(server *fuse.Server) {
@@ -2251,10 +2283,7 @@ func (r *rawFileSystem) publishPostStateAttrs(ctx context.Context) {
 }
 
 // cachedAttrRecord answers one GETATTR from the daemon attribute cache under a
-// live subscription. The kernel's own attribute timer covers the common repeat
-// stat; this covers the requests it cannot -- a descriptor stat, a component
-// whose attributes a peer's mutation just invalidated, and any inode whose
-// kernel timer lapsed while this mount still holds cache authority.
+// live subscription. Kernel attribute validity is always zero.
 func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecord) (*authoritypb.Attr, bool) {
 	if record != nil && r.mount.delegations.Owns(record.identity[:]) {
 		return nil, false
@@ -2292,6 +2321,9 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 		if handled, status := r.graftLookup(parent, name, out); handled {
 			return status
 		}
+	}
+	if r.lookupCachedReply(header.Unique, parent, name, out) {
+		return fuse.OK
 	}
 	ctx, finish, lifecycle := r.mutationContext(header.Unique)
 	if !lifecycle.Ok() {
@@ -2383,6 +2415,9 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 		if handleRecord.inode != record {
 			return fuse.EBADF
 		}
+	}
+	if r.attrCachedReply(input.Unique, record, out) {
+		return fuse.OK
 	}
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
@@ -3602,9 +3637,8 @@ func (m *Mount) kernelConnectionTerminated() {
 // allows. It is the attribute-side twin of publishEntry: the same gate, the
 // same drain, and the same rule that uncacheable is always a legal answer.
 //
-// A nonzero lifetime is legal only under the exact reply-local subscription stamp. The
-// authority recalls that coordinate and waits for this mount's invalidation
-// before a conflicting mutation can return.
+// Only the daemon retains attributes under the reply-local subscription stamp.
+// The kernel receives zero validity, with physical replies ordered before withdrawal.
 func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, identity publicationIdentity, attr *authoritypb.Attr) {
 	publication := replyPublicationFromContext(ctx)
 	if publication == nil {
@@ -3616,10 +3650,10 @@ func (r *rawFileSystem) publishAttr(ctx context.Context, out *fuse.AttrOut, iden
 	inode := attr.GetInode()
 	r.mu.Lock()
 	record := r.byIdentityLocked(identity)
-	lifetime, coordinate, reservation, cached := r.admitAttrLocked(ctx, inode, identity)
+	_, coordinate, reservation, cached := r.admitAttrLocked(ctx, inode, identity)
 	r.mu.Unlock()
 	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
-	out.SetTimeout(lifetime)
+	out.SetTimeout(0)
 	if cached {
 		objectVersion, snapshot := cacheCandidateVersion(publication)
 		publication.attrs = append(publication.attrs, replyAttrPublication{

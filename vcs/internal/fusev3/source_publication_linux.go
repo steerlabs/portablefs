@@ -321,6 +321,13 @@ func (r *rawFileSystem) supersedableNegativePublicationLocked(publication *negat
 }
 
 func (r *rawFileSystem) sourceCoordinateBusyLocked(coordinate publicationCoordinate, owner *sourcePublicationLease) bool {
+	for _, publication := range r.replyPublications {
+		for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
+			if cached == coordinate {
+				return true
+			}
+		}
+	}
 	publishing := r.sourcePublishing[coordinate]
 	if publishing == 0 {
 		return false

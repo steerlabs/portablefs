@@ -23,6 +23,13 @@ func (r *rawFileSystem) closeCacheCoordinate(ctx context.Context, coordinate pub
 			candidates[publication] = struct{}{}
 		}
 	}
+	for _, publication := range r.replyPublications {
+		for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
+			if cached == coordinate {
+				candidates[publication] = struct{}{}
+			}
+		}
+	}
 	for publication := range candidates {
 		for index := range publication.data {
 			if publication.data[index].coordinate == coordinate && !publication.originalFinalized {
@@ -30,7 +37,7 @@ func (r *rawFileSystem) closeCacheCoordinate(ctx context.Context, coordinate pub
 			}
 		}
 		if publication.originalFinalized && !publication.originalWrote {
-			pending = append(pending, publication.originalDone)
+			pending = append(pending, publication.originalDoneLocked())
 		}
 	}
 	r.signalSourceChangedLocked()
@@ -48,6 +55,11 @@ func (r *rawFileSystem) closeCacheCoordinate(ctx context.Context, coordinate pub
 func publicationInstallsCoordinate(publication *replyPublication, coordinate publicationCoordinate) bool {
 	if publication == nil {
 		return false
+	}
+	for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
+		if cached == coordinate {
+			return true
+		}
 	}
 	for _, name := range publication.names {
 		if name.coordinate == coordinate {
@@ -157,7 +169,7 @@ func (r *rawFileSystem) waitFinalizedCacheCoordinateLocked(ctx context.Context, 
 				if superseded {
 					continue
 				}
-				done = prior.originalDone
+				done = prior.originalDoneLocked()
 				break
 			}
 		}

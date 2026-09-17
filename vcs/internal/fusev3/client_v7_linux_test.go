@@ -324,3 +324,149 @@ func TestV7FallocateCarriesExactDelegationReference(t *testing.T) {
 		t.Fatalf("fallocate grant=%v, want %v", captured, expected)
 	}
 }
+
+func TestV7CachedMetadataHasZeroValidityRPCsAndAllocations(t *testing.T) {
+	for _, kind := range []string{"lookup", "getattr", "negative"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newStrictFixture(t)
+			if kind == "negative" {
+				f.rpc.missingNames["cached"] = true
+			}
+			entry := f.lookup(t, 1, "cached")
+			if entry.EntryValid != 0 || entry.EntryValidNsec != 0 || entry.AttrValid != 0 || entry.AttrValidNsec != 0 {
+				t.Errorf("kernel entry/attribute validity must be zero: %+v", entry)
+			}
+			f.rpc.mu.Lock()
+			before := f.rpc.calls
+			f.rpc.mu.Unlock()
+			var out fuse.EntryOut
+			var attr fuse.AttrOut
+			var status fuse.Status
+			var badValidity bool
+			allocs := testing.AllocsPerRun(1000, func() {
+				unique := f.unique.Add(2)
+				if kind == "getattr" {
+					status = f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &attr)
+					badValidity = badValidity || attr.AttrValid != 0 || attr.AttrValidNsec != 0
+				} else {
+					status = f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &out)
+					badValidity = badValidity || out.AttrValid != 0 || out.AttrValidNsec != 0 || out.EntryValid != 0 || out.EntryValidNsec != 0
+				}
+				f.raw.PrepareReplyPayload(unique, 1, 1, nil, nil, 0)
+				if f.raw.ReplyWriteTracked(unique) {
+					f.raw.ReplyWritten(unique, fuse.OK)
+				}
+			})
+			if status != fuse.OK || badValidity {
+				t.Errorf("cached reply status=%v nonzero validity=%v", status, badValidity)
+			}
+			if allocs != 0 {
+				t.Errorf("cached %s allocations=%g, want zero", kind, allocs)
+			}
+			f.rpc.mu.Lock()
+			defer f.rpc.mu.Unlock()
+			if f.rpc.calls != before {
+				t.Errorf("cached metadata Authority calls=%d", f.rpc.calls-before)
+			}
+		})
+	}
+}
+
+func TestV7CachedMetadataWithdrawalJoinsPhysicalReply(t *testing.T) {
+	for _, kind := range []string{"lookup", "getattr", "negative"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newStrictFixture(t)
+			if kind == "negative" {
+				f.rpc.missingNames["cached"] = true
+			}
+			entry := f.lookup(t, 1, "cached")
+			unique := f.unique.Add(2)
+			var status fuse.Status
+			coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: f.raw.nodesByID[1].identity, name: "cached"}
+			if kind == "getattr" {
+				coordinate = publicationCoordinate{kind: publicationItemAttributes, item: f.raw.nodesByID[entry.NodeId].identity}
+				status = f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{})
+			} else {
+				status = f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{})
+			}
+			if status != fuse.OK {
+				t.Fatal(status)
+			}
+			f.raw.mu.Lock()
+			publication := f.raw.replyPublications[unique]
+			if publication == nil || publication.cachedCount == 0 {
+				f.raw.mu.Unlock()
+				t.Fatal("cached reply escaped physical ownership")
+			}
+			if !f.raw.sourceCoordinateBusyLocked(coordinate, nil) {
+				f.raw.mu.Unlock()
+				t.Fatal("initiator gate omitted cached reply")
+			}
+			f.raw.mu.Unlock()
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			done := make(chan error, 1)
+			go func() { done <- f.raw.closeCacheCoordinate(ctx, coordinate) }()
+			// Observe the withdrawal's locked cut, including its installed receipt.
+			for {
+				f.raw.mu.Lock()
+				waiting := f.raw.repairingCoordinates[coordinate] && publication.originalDone != nil
+				f.raw.mu.Unlock()
+				if waiting {
+					break
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("withdrawal crossed unwritten reply: %v", err)
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				default:
+				}
+				time.Sleep(time.Millisecond)
+			}
+			select {
+			case err := <-done:
+				t.Fatalf("withdrawal crossed unwritten reply: %v", err)
+			default:
+			}
+			f.raw.ReplyWritten(unique, fuse.OK)
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			f.raw.mu.Lock()
+			busy := f.raw.sourceCoordinateBusyLocked(coordinate, nil)
+			f.raw.mu.Unlock()
+			if busy {
+				t.Fatal("physical reply left initiator gate busy")
+			}
+		})
+	}
+}
+
+func TestV7CachedReplyTerminalizationWaitsForPhysicalWrite(t *testing.T) {
+	f := newStrictFixture(t)
+	f.lookup(t, 1, "cached")
+	unique := f.unique.Add(2)
+	if status := f.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "cached", &fuse.EntryOut{}); status != fuse.OK {
+		t.Fatal(status)
+	}
+	f.raw.mu.Lock()
+	p := f.raw.replyPublications[unique]
+	if p == nil || p.cachedCount == 0 || p.originalDone != nil {
+		f.raw.mu.Unlock()
+		t.Fatal("cached reply did not retain lazy ownership")
+	}
+	f.raw.mu.Unlock()
+	if f.raw.terminalizeReplyCacheOwnership(time.Now()) {
+		t.Fatal("terminalization passed an unwritten cached reply")
+	}
+	f.raw.ReplyWritten(unique, fuse.OK)
+	if !f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second)) {
+		t.Fatal("terminalization did not join written cached reply")
+	}
+	f.raw.mu.Lock()
+	defer f.raw.mu.Unlock()
+	if len(f.raw.replyPublications) != 0 {
+		t.Fatal("terminalization retained cached reply ownership")
+	}
+}

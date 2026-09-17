@@ -1709,11 +1709,8 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	var created *os.File
 	createRPCs := measure("create plus child/parent stat", func() {
 		var err error
-		// Linux always performs one fresh LOOKUP for a negative dentry before
-		// CREATE, including the ordinary non-exclusive path. It precedes the
-		// mutation and therefore says nothing about post-state completeness; the
-		// child and parent stats below are the follow-up requests this assertion
-		// requires the CREATE post-state to eliminate.
+		// The kernel's LOOKUP before CREATE is answered by the warmed daemon
+		// absence. CREATE post-state also eliminates child/parent metadata RPCs.
 		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
 			t.Fatalf("create: %v", err)

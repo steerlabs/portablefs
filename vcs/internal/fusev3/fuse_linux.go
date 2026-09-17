@@ -169,6 +169,8 @@ type Config struct {
 	// Debug enables the underlying FUSE request/reply trace. It is diagnostic
 	// only and leaves the negotiated protocol and serving semantics unchanged.
 	Debug bool
+	// latencies is installed before Serve for in-package kernel timing proofs.
+	latencies fuse.LatencyMap
 
 	// OnRevoked is called exactly once, from the teardown goroutine, when this
 	// mount self-revokes and its kernel-state withdrawal has finished. It is a
@@ -363,6 +365,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		return nil, markCleanStartupFailure(cause)
 	}
 	m.server = server
+	server.RecordLatencies(cfg.latencies)
 	m.setNotifier(server)
 	if !m.raw.replyLifecycleReady() {
 		// NewServer has already installed the mount and consumed INIT, but Serve

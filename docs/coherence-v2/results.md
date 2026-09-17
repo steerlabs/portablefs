@@ -216,3 +216,34 @@ Fresh Git preparation again logs `files=20000 cached_name_capacity=65536
 committed=true barrier=PASS mount=LIVE`. No setup-capacity workaround or
 ESTALE retry remains. This reproduces the exact shipping-capacity scenario
 that failed with ENOTCONN on v6 and proves completion on the final v7 build.
+
+## G2 cached metadata, intermediate
+
+The amended F10 keeps Authority-backed Linux entry and attribute validity at
+zero. Deterministic callback tests, including PrepareReplyPayload and
+ReplyWritten, measured the following allocations per warm call. Authority RPCs
+are zero for every row.
+
+| Cached operation | Before allocations/call | After allocations/call |
+|---|---:|---:|
+| positive LOOKUP | 22 | 0 |
+| negative LOOKUP | 9 | 0 |
+| GETATTR | 18 | 0 |
+
+The initial mounted check (`/tmp/cv2-g2-cache-mounted3.log`) reports 2,000 warm
+`Lstat` operations at 70.042 us median and 81.167 us p95, with zero Authority
+LOOKUP or GETATTR RPCs. This is whole-syscall latency, not an isolated FUSE
+LOOKUP callback. A separate warmed-absence CREATE issues zero LOOKUP RPCs.
+An arbitrary unseen name still needs an Authority fact; this result does not
+claim that a daemon can infer absence without a cached negative or a complete
+directory snapshot. The below-20-us kernel round-trip target is not established
+by this full-stat result. Workload measurements follow after the next changes.
+
+The isolated opcode probe (`/tmp/cv2-g2-cache-mounted7.log`) confirms 2,000
+cached FUSE LOOKUPs and zero Authority LOOKUPs. LOOKUP service from reading
+`/dev/fuse` through writing its reply is 4.417 us median / 5.708 us p95. This
+excludes kernel scheduling before the daemon read. The enclosing `faccessat`
+syscall costs 70.125 us median / 79.958 us p95 and also issues 4,000 permission
+GETATTRs because attribute validity is zero. These boundaries are reported
+separately; dividing syscall latency by its three requests would not prove a
+single-request round trip. The repeated Lstat sample is 74.209 / 84.417 us.

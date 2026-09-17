@@ -259,6 +259,16 @@ func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp
 	if (coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData) && s.mount != nil && s.mount.delegations != nil && s.mount.delegations.Owns(coordinate.item[:]) {
 		return 0
 	}
+	return s.remainingAfterOwnershipCheck(coordinate, stamp, servedVersion, now)
+}
+
+// remainingAfterOwnershipCheck is used by a cached reply after checking local
+// delegation ownership outside raw.mu. Acquiring delegation locks under raw.mu
+// could deadlock with a queued epoch fence and a write's source gate.
+func (s *subscriptionRegistry) remainingAfterOwnershipCheck(coordinate publicationCoordinate, stamp subscriptionStamp, servedVersion uint64, now time.Time) time.Duration {
+	if s == nil || stamp.incarnation == 0 {
+		return 0
+	}
 	if servedVersion == 0 {
 		servedVersion = stamp.version
 	}
@@ -1171,6 +1181,9 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	for _, publication := range r.replyPublications {
 		if publication == nil {
 			continue
+		}
+		for _, coordinate := range publication.cachedCoordinates[:publication.cachedCount] {
+			coordinates[coordinate] = struct{}{}
 		}
 		for _, candidate := range publication.names {
 			coordinates[candidate.coordinate] = struct{}{}

@@ -66,6 +66,9 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedMetadataKernelRoundTrip"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedLookupKernelRoundTrip"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateUsesSubscribedNegativeWithoutLookupRPC"
   # Machine-local routing must be proven against the real kernel and the real
   # authority transport. Keep the zero-RPC tests here in particular: the
   # cross-process matrix proves two-machine isolation, but intentionally does

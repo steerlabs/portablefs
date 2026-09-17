@@ -1294,3 +1294,41 @@ runner's replacement subscribe explicitly. Old-handle rejection and routing
 assertions are unchanged. The unprivileged Docker fusev3 suite passes after
 these corrections, excluding only the FUSE-device probe; mounted tests retain
 their existing environment skips (`/tmp/cv2-g2-cache-suite2.log`).
+
+### Part 2 amended 3/8: allocation-free subscribed metadata replies
+
+Authority-backed entry_valid and attr_valid are now both zero on every ordinary
+metadata output path, including anonymous creation. Shared cached positive and
+negative LOOKUP and GETATTR bypass mutationContext and protobuf cloning. Cached
+attributes retain a prefilled fuse.Attr. A bounded 256-slot reply arena preserves
+physical reply ownership; exhausted slots fall back to the ordinary tracked
+path. Hit registration and cache/source checks share raw.mu, while delegation
+ownership is checked outside it. Subscription-only validation avoids acquiring
+a delegation epoch reader beneath raw.mu. Delegation incarnation is atomic.
+
+The lean reply is conservatively finalized at registration. Peer withdrawal,
+cold invalidation, source gates, and terminalization all join its physical write.
+Waiters allocate completion channels only when they attach. It neither
+re-admits nor clones cached facts. Unit tests prove zero Authority calls and
+zero allocations through PrepareReplyPayload/ReplyWritten: positive LOOKUP
+22 -> 0, negative LOOKUP 9 -> 0, GETATTR 18 -> 0. Withdrawal and shutdown tests
+pin the lazy receipt and source-gate drain. Before/after logs are
+`/tmp/cv2-g2-cache-before.log`, `/tmp/cv2-g2-cache-proof2.log`, and the final
+unprivileged Docker suite `/tmp/cv2-g2-cache-final-unit.log` (FUSE probe excluded;
+real-mount tests keep their environment skips).
+
+Zero attribute validity exposed a pre-existing TMPFILE cache hole: a versionless
+anonymous-entry candidate hid the exact post-state candidate. Anonymous mutation
+replies now defer attribute admission to versioned post-state. The retained
+real-mount post-state request-count table passes (`/tmp/cv2-g2-cache-mounted3.log`).
+
+New required mounted tests prove warm stat has zero LOOKUP/GETATTR RPCs and
+CREATE with a subscribed negative has zero LOOKUP RPCs. The negative must be
+known; arbitrary unseen names still need an Authority fact. The combined
+CREATE-plus-stat test still permits one LOOKUP while its FULL delegation is
+held; optimizing that holder path is separate from shared-cache reuse.
+Mounted timing and its boundaries are in results.md. LOOKUP daemon read-to-reply
+is 4.417 us median, while the enclosing syscall with two permission GETATTRs is
+70.125 us; the full below-20-us round-trip target is not established. The focused
+wrapper exits 70 for omitted inventory, not a test failure
+(`/tmp/cv2-g2-cache-mounted7.log`). Final full qualification remains pending.

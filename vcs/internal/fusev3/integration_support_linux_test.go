@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"math/big"
 	"net"
 	"os"
@@ -158,6 +159,7 @@ func (a integrationAuthorizer) Authorize(_ context.Context, _ string, token []by
 }
 
 type integrationConfig struct {
+	latencies fuse.LatencyMap
 	// Mounts is the number of independent kernel FUSE mounts of the same
 	// volume. Defaults to two, the minimum needed to observe coherence.
 	Mounts int
@@ -593,7 +595,7 @@ func (f *integrationFixture) mountAll() {
 			Coherence: CoherenceStrict, CachedNameCapacity: f.cfg.CachedNameCapacity,
 			RepairBudget: integrationRepairBudget,
 			Routes:       f.cfg.rules, LocalBacking: f.backing[i],
-			Debug: os.Getenv(envFUSEDebug) == "1",
+			Debug: os.Getenv(envFUSEDebug) == "1", latencies: f.cfg.latencies,
 		})
 		if err != nil {
 			t.Fatalf("mount %s: %v", f.paths[i], err)

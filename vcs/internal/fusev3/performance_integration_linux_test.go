@@ -13,9 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/benchmark"
 	"golang.org/x/sys/unix"
 )
 
@@ -491,4 +493,129 @@ func requestDelta(before, after map[string]int) map[string]int {
 		result[kind] = count - before[kind]
 	}
 	return result
+}
+
+type lookupLatencyRecorder struct {
+	mu      sync.Mutex
+	counts  map[string]int
+	lookups []time.Duration
+}
+
+func (r *lookupLatencyRecorder) Add(name string, elapsed time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.counts[name]++
+	if name == "LOOKUP" {
+		r.lookups = append(r.lookups, elapsed)
+	}
+}
+func (r *lookupLatencyRecorder) snapshot() (map[string]int, []time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	counts := make(map[string]int, len(r.counts))
+	for kind, count := range r.counts {
+		counts[kind] = count
+	}
+	return counts, append([]time.Duration(nil), r.lookups...)
+}
+
+// This measures the complete cached metadata syscall, including the kernel /
+// daemon round trip. It is not an Authority RPC latency or a pure callback timer.
+func TestCachedMetadataKernelRoundTrip(t *testing.T) {
+	timings := benchmark.NewLatencyMap()
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, latencies: timings})
+	path := f.join(0, "cached-metadata")
+	if err := os.WriteFile(path, []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.waitForDelegationReleases(t)
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatal(err)
+	}
+	lookupBefore, attrBefore := f.counter.count("lookup"), f.counter.count("getattr")
+	const n = 2000
+	latencies := make([]time.Duration, n)
+	for i := range latencies {
+		start := time.Now()
+		info, err := os.Lstat(path)
+		latencies[i] = time.Since(start)
+		if err != nil || info.Size() != 6 {
+			t.Fatalf("cached stat=%v, %v", info, err)
+		}
+	}
+	lookups, attrs := f.counter.count("lookup")-lookupBefore, f.counter.count("getattr")-attrBefore
+	if lookups != 0 || attrs != 0 {
+		t.Fatalf("warm metadata Authority RPCs: LOOKUP=%d GETATTR=%d", lookups, attrs)
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	t.Logf("PORTABLEFS_CACHED_METADATA n=%d p50_us=%.3f p95_us=%.3f lookup_rpc=%d getattr_rpc=%d", n, float64(latencies[n/2])/float64(time.Microsecond), float64(latencies[n*95/100])/float64(time.Microsecond), lookups, attrs)
+}
+
+func TestCachedLookupKernelRoundTrip(t *testing.T) {
+	timings := &lookupLatencyRecorder{counts: make(map[string]int), lookups: make([]time.Duration, 0, 4096)}
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, latencies: timings})
+	path := f.join(0, "cached-lookup")
+	if err := os.WriteFile(path, []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.waitForDelegationReleases(t)
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(f.mountPath(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	before, _ := timings.snapshot()
+	lookupBefore := f.counter.count("lookup")
+	const n = 2000
+	latencies := make([]time.Duration, n)
+	for i := range latencies {
+		start := time.Now()
+		err := unix.Faccessat(int(dir.Fd()), "cached-lookup", unix.F_OK, 0)
+		latencies[i] = time.Since(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitUntil(t, time.Second, "final LOOKUP timing receipt", func() bool {
+		counts, _ := timings.snapshot()
+		return counts["LOOKUP"]-before["LOOKUP"] >= n
+	})
+	after, lookupTimes := timings.snapshot()
+	if got := after["LOOKUP"] - before["LOOKUP"]; got != n {
+		t.Fatalf("kernel LOOKUPs=%d, want %d", got, n)
+	}
+
+	if got := f.counter.count("lookup") - lookupBefore; got != 0 {
+		t.Fatalf("cached LOOKUP Authority RPCs=%d", got)
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	lookupTimes = lookupTimes[len(lookupTimes)-n:]
+	sort.Slice(lookupTimes, func(i, j int) bool { return lookupTimes[i] < lookupTimes[j] })
+	// go-fuse timestamps after reading /dev/fuse and after the reply write.
+	// This isolates daemon service, excluding scheduling before the read;
+	// faccessat also performs permission GETATTRs, reported separately.
+	t.Logf("PORTABLEFS_CACHED_LOOKUP n=%d syscall_p50_us=%.3f syscall_p95_us=%.3f lookup_read_to_reply_p50_us=%.3f lookup_read_to_reply_p95_us=%.3f permission_getattrs=%d authority_lookup_rpc=0", n, float64(latencies[n/2])/float64(time.Microsecond), float64(latencies[n*95/100])/float64(time.Microsecond), float64(lookupTimes[n/2])/float64(time.Microsecond), float64(lookupTimes[n*95/100])/float64(time.Microsecond), after["GETATTR"]-before["GETATTR"])
+}
+
+func TestCreateUsesSubscribedNegativeWithoutLookupRPC(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	path := f.join(0, "cached-absence")
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm absence: %v", err)
+	}
+	before := f.counter.count("lookup")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta := f.counter.count("lookup") - before
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if delta != 0 {
+		t.Fatalf("CREATE with subscribed negative issued %d LOOKUP RPCs", delta)
+	}
 }
