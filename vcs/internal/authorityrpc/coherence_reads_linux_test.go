@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -493,6 +494,72 @@ func TestCoherenceReadDirPublishesRevalidatedPageStamp(t *testing.T) {
 	}
 	if calls := store.calls.Load(); calls != 2 {
 		t.Fatalf("ReadDirOpen calls = %d, want initial read and locked revalidation", calls)
+	}
+}
+
+type coherenceChurningDirectoryStore struct {
+	readdirPostStabilizationChangeStore
+	lookupCalls atomic.Uint32
+	unstableFor uint32
+	eagainFor   uint32
+}
+
+func (s *coherenceChurningDirectoryStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	call := s.lookupCalls.Add(1)
+	if call <= s.eagainFor {
+		return xfsstore.Capability{}, xfsstore.Attr{}, syscall.EAGAIN
+	}
+	mode := os.FileMode(0o640)
+	if call <= s.eagainFor+s.unstableFor {
+		if (call-s.eagainFor)%2 == 1 {
+			mode = 0o600
+		}
+	}
+	return s.child, xfsstore.Attr{
+		Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: mode,
+		Nlink: 1, DeviceMinor: 1,
+	}, nil
+}
+
+func TestCoherenceReadDirNeverSurfacesEAGAINUnderContinuousMutation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		unstable uint32
+		eagain   uint32
+	}{
+		{name: "revalidation changes", unstable: 2 * maxStabilizeAttempts},
+		{name: "openat2 retry", eagain: maxStabilizeAttempts + 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &coherenceChurningDirectoryStore{
+				readdirPostStabilizationChangeStore: readdirPostStabilizationChangeStore{
+					root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
+				},
+				unstableFor: test.unstable, eagainFor: test.eagain,
+			}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 64, 4)
+			if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+				t.Fatal(err)
+			}
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+				Handle: store.handle[:], MaxEntries: 16, WantItems: true,
+			}}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 || response.GetReadDir().GetEntries()[0].GetAttr().GetMode() != 0o640 {
+				t.Fatalf("READDIR under churn = %+v", response)
+			}
+			if calls := store.lookupCalls.Load(); calls <= maxStabilizeAttempts {
+				t.Fatalf("lookup calls=%d, regression did not cross the former retry bound", calls)
+			}
+			if got := len(h.resources[credential.ID].items); got != 1 {
+				t.Fatalf("tracked capabilities=%d, want only the published candidate", got)
+			}
+			if forgotten := store.forget.Load(); forgotten+1 != store.lookupCalls.Load()-store.eagainFor {
+				t.Fatalf("forgotten capabilities=%d successful lookups=%d", forgotten, store.lookupCalls.Load()-store.eagainFor)
+			}
+		})
 	}
 }
 

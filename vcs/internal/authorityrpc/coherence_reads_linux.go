@@ -376,6 +376,10 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 		if request == nil || request.GetMaxEntries() == 0 || request.GetMaxEntries() > 4096 {
 			return h.errorResponse(0, syscall.EINVAL, false)
 		}
+		heldIdentities, err := heldDirectoryIdentities(request)
+		if err != nil {
+			return h.errorResponse(0, err, false)
+		}
 		handle, err := h.open(cred.ID, request.GetHandle())
 		if err != nil {
 			return h.errorResponse(0, err, false)
@@ -398,7 +402,10 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 		if err != nil {
 			return h.coherenceError(0, err)
 		}
-		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
+		for {
+			if err := ctx.Err(); err != nil {
+				return h.errorResponse(0, err, false)
+			}
 			directoryGuard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, directoryIdentity)
 			if guardErr != nil {
 				return h.coherenceError(0, guardErr)
@@ -406,11 +413,17 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			entries, _, current, eof, directory, readErr := h.coherenceReadDirPage(handle, cookie, int(request.GetMaxEntries()))
 			if readErr != nil {
 				directoryGuard.Release()
+				if errors.Is(readErr, syscall.EAGAIN) {
+					continue
+				}
 				return h.errorResponse(0, readErr, false)
 			}
-			candidates, budgetExhausted, conflict, buildErr := h.constructDirectoryPage(handle, entries, cookie, request.GetWantItems(), budget)
+			candidates, budgetExhausted, conflict, buildErr := h.constructDirectoryPage(handle, entries, cookie, request.GetWantItems(), heldIdentities, budget)
 			if buildErr != nil {
 				directoryGuard.Release()
+				if errors.Is(buildErr, syscall.EAGAIN) {
+					continue
+				}
 				return h.errorResponse(0, buildErr, false)
 			}
 			if conflict {
@@ -456,6 +469,9 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				pageGuard.Release()
 				h.forgetDirectoryCandidates(candidates)
 				if verifyErr != nil {
+					if errors.Is(verifyErr, syscall.EAGAIN) {
+						continue
+					}
 					return h.errorResponse(0, verifyErr, false)
 				}
 				continue
@@ -515,7 +531,6 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			response.Body = &authoritypb.Response_ReadDir{ReadDir: result}
 			return response
 		}
-		return h.errorResponse(0, syscall.EAGAIN, false)
 	})
 }
 
@@ -557,6 +572,9 @@ func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 		item, attr, lookupErr := h.Store.LookupOpen(handle, candidate.enumerated.Name)
 		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
 			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
+			return false, checkVerifier, nil
+		}
+		if errors.Is(lookupErr, syscall.EAGAIN) {
 			return false, checkVerifier, nil
 		}
 		if lookupErr != nil {

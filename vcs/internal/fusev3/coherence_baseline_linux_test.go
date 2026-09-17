@@ -239,6 +239,7 @@ func measureBaseline(t *testing.T, target, phase string, fixture *integrationFix
 		totalRate = float64(total) / float64(result.Operations)
 		filesystemRate = float64(filesystemTotal) / float64(result.Operations)
 	}
+	assertBaselineOpcodeBounds(t, target, result.Scenario, totalRate, filesystem, control)
 	recordBaseline(t, baselineMeasurement{
 		WorkloadResult: result, Target: target, AuthorityRequests: total,
 		AuthorityRequestsPerOp: totalRate, AuthorityFilesystem: filesystemTotal,
@@ -246,6 +247,23 @@ func measureBaseline(t *testing.T, target, phase string, fixture *integrationFix
 		AuthorityControlKinds: control,
 		AuthorityDrainSeconds: drainSeconds, AuthorityBarrierSeconds: barrierSeconds,
 	})
+}
+
+func assertBaselineOpcodeBounds(t *testing.T, target, scenario string, requestsPerOperation float64, filesystem, control map[string]int) {
+	t.Helper()
+	if target != "portablefs" {
+		return
+	}
+	switch scenario {
+	case "git-status-warm":
+		if control["reclaim"] > 64 || filesystem["lookup"]+filesystem["get_attr"] != 0 || requestsPerOperation > 0.02 {
+			t.Fatalf("warm status exceeded G4 opcode bounds: requests/op=%.6f filesystem=%v control=%v", requestsPerOperation, filesystem, control)
+		}
+	case "two-mount-write-list-read":
+		if requestsPerOperation > 9.8 || control["reclaim"] > filesystem["read_dir"] {
+			t.Fatalf("two-mount workload exceeded G4 opcode bounds: requests/op=%.6f filesystem=%v control=%v", requestsPerOperation, filesystem, control)
+		}
+	}
 }
 
 func enableBaselineOpenTracking(counter *countingHandler) {
@@ -413,5 +431,21 @@ func TestBaselineMeterFreezesAtDrainBoundary(t *testing.T) {
 	after, _, _ := meter.result()
 	if all["close"] != 1 || after["close"] != 1 {
 		t.Fatalf("late callback changed completed measurement: before=%v after=%v", all, after)
+	}
+}
+
+func TestBaselineOpcodeBoundsRejectReclaimRegression(t *testing.T) {
+	for _, test := range []struct {
+		name, scenario string
+		rate           float64
+		filesystem     map[string]int
+		control        map[string]int
+	}{
+		{name: "warm", scenario: "git-status-warm", rate: 0.018, filesystem: map[string]int{}, control: map[string]int{"reclaim": 64}},
+		{name: "peer", scenario: "two-mount-write-list-read", rate: 9.8, filesystem: map[string]int{"read_dir": 20}, control: map[string]int{"reclaim": 20}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertBaselineOpcodeBounds(t, "portablefs", test.scenario, test.rate, test.filesystem, test.control)
+		})
 	}
 }

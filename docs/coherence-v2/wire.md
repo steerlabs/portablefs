@@ -91,6 +91,33 @@ session-exact mutation replay header. A response echoes the request id and
 epoch; nonzero `errno` means the operation did not provide the successful
 contract below. Existing uncertainty and failure classification still apply.
 
+### Directory-page capability reuse and reclaim
+
+`ReadDirRequest.want_items` remains tag 5. The additive
+`held_identities` field (tag 6) is a sorted, unique list of nonzero 16-byte
+stable identities that the session already retains for the page beginning at
+the request cookie. It is a page-local optimization hint, never authority.
+It is legal only with `want_items`, contains at most 4,096 identities, and
+irrelevant identities have no effect. A cold page or an unknown cached page
+sends an empty list.
+
+Every resolvable `Dirent` carries `stable_identity` at tag 7 together with its
+attributes, object version, and snapshot sequence. When `want_items` is true,
+the Authority returns a fresh `Item` unless that exact stable identity appears
+in `held_identities`; for a held identity it omits `Item`. The client may use
+the identity only to find its already-retained capability. It must fail closed
+if that binding is absent or mismatched. The Authority still resolves and
+revalidates every entry under the page's storage cut and never turns the hint
+into access authority.
+
+`ReclaimRequest.item` remains the legacy singular tag 1. The additive `items`
+field at tag 2 carries 1–4,096 distinct item capabilities. Exactly one form is
+nonempty. The complete shape and every session capability are validated before
+retirement begins, and one mutation replay slot owns the whole ordered batch.
+The client batches lazily at its cleanup watermark or timer and never combines
+tokens from different Authority epochs. A negotiated frame bound may require a
+smaller batch.
+
 | Counter | Scope and meaning |
 |---|---|
 | `volume_version`, subscription `watermark` | Authority volume version within an epoch. Comparable with served reply versions, never with a client or replay-slot sequence. Delegation changes may share the current storage version; stream position orders every entry, including equal-version entries. |

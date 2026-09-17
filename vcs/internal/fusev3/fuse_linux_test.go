@@ -395,7 +395,12 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 			return &authoritypb.Response{Errno: int32(f.keepAliveErr)}, nil
 		}
 	case request.GetReclaim() != nil:
-		f.reclaims = append(f.reclaims, cloneBytes(request.GetReclaim().GetItem()))
+		if item := request.GetReclaim().GetItem(); len(item) != 0 {
+			f.reclaims = append(f.reclaims, cloneBytes(item))
+		}
+		for _, item := range request.GetReclaim().GetItems() {
+			f.reclaims = append(f.reclaims, cloneBytes(item))
+		}
 		if f.reclaimFailure != 0 {
 			return &authoritypb.Response{Errno: int32(f.reclaimFailure), Failure: f.reclaimClass}, nil
 		}
@@ -1095,22 +1100,19 @@ func TestForgetNeverBlocksUnderCleanupPressure(t *testing.T) {
 	}
 }
 
-func TestReclaimDrainIsConcurrent(t *testing.T) {
+func TestReclaimDrainBatchesTimerResidue(t *testing.T) {
 	mount, rpc := testMount(t, 1024)
-	width := mount.reclaimWorkers
-	if width < 2 {
-		t.Fatalf("reclaim lane width = %d, want at least 2", width)
-	}
-	reached := make(chan struct{}, width)
+	reached := make(chan *authoritypb.ReclaimRequest, 2)
 	release := make(chan struct{})
 	rpc.hook = func(request *authoritypb.Request) {
-		if request.GetReclaim() == nil {
+		reclaim := request.GetReclaim()
+		if reclaim == nil {
 			return
 		}
-		reached <- struct{}{}
+		reached <- proto.Clone(reclaim).(*authoritypb.ReclaimRequest)
 		<-release
 	}
-	for id := uint64(1); id <= uint64(width); id++ {
+	for id := uint64(1); id <= 100; id++ {
 		mount.deferReclaim(testToken(id))
 	}
 	mount.start(time.Hour)
@@ -1118,12 +1120,38 @@ func TestReclaimDrainIsConcurrent(t *testing.T) {
 		close(release)
 		_ = mount.Close()
 	}()
-	for count := 0; count < width; count++ {
-		select {
-		case <-reached:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("only %d of %d reclaims were in flight at once; a serial drain cannot keep up with ordinary path walking", count, width)
+	select {
+	case request := <-reached:
+		if len(request.GetItem()) != 0 || len(request.GetItems()) != 100 {
+			t.Fatalf("reclaim request = legacy:%x batch:%d, want one 100-token batch", request.GetItem(), len(request.GetItems()))
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reclaim residue was not sent at the timer")
+	}
+	select {
+	case request := <-reached:
+		t.Fatalf("timer residue fragmented into another request: %+v", request)
+	case <-time.After(2 * reclaimBatchDelay):
+	}
+}
+
+func TestReclaimQueueFlushesAtWatermarkWithoutMixingEpochs(t *testing.T) {
+	oldTransport, newTransport := newFakeRPC(), newFakeRPC()
+	queue := newReclaimQueue(4)
+	for id := uint64(1); id <= 4; id++ {
+		queue.push(queuedReclaim{token: testToken(id), transport: oldTransport})
+	}
+	queue.push(queuedReclaim{token: testToken(5), transport: newTransport})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	batch, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
+	if !ok || len(batch) != 4 || batch[0].transport != oldTransport || time.Since(start) >= reclaimBatchDelay {
+		t.Fatalf("watermark batch = %d ok=%v transport=%T elapsed=%s", len(batch), ok, batch[0].transport, time.Since(start))
+	}
+	next, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
+	if !ok || len(next) != 1 || next[0].transport != newTransport {
+		t.Fatalf("replacement-epoch batch = %+v ok=%v", next, ok)
 	}
 }
 

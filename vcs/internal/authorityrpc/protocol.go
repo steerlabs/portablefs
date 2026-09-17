@@ -70,6 +70,13 @@ const batchedCloseFeature = "batched-close-v1"
 // MaxCloseBatch bounds both the request and its retained per-handle outcome.
 const MaxCloseBatch = 128
 
+const (
+	// MaxReadDirHeldIdentities is the largest page-local capability reuse hint.
+	MaxReadDirHeldIdentities = 4096
+	// MaxReclaimBatch bounds one exact cleanup mutation.
+	MaxReclaimBatch = 4096
+)
+
 const boundedControlReplayFeature = "bounded-control-replay-v1"
 const delegationControlFeature = "delegation-control-v1"
 const durableSequenceFeature = "session-durable-sequence-v1"

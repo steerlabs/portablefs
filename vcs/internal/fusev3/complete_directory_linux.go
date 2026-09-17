@@ -3,7 +3,10 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"sort"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -31,6 +34,75 @@ func (r *rawFileSystem) dropCompleteDirectoryLocked(identity publicationIdentity
 		proof.valid = false
 		delete(r.completeDirectories, identity)
 	}
+}
+
+func (r *rawFileSystem) dropDirectoryPageHintsLocked(identity publicationIdentity) {
+	for key := range r.directoryPageHints {
+		if key.directory == identity {
+			delete(r.directoryPageHints, key)
+		}
+	}
+}
+
+func (r *rawFileSystem) heldDirectoryPageIdentities(directory publicationIdentity, cookie []byte) [][]byte {
+	r.mu.RLock()
+	hint, ok := r.directoryPageHints[directoryPageKey{directory: directory, cookie: string(cookie)}]
+	if !ok || r.mount.subscription.remaining(
+		publicationCoordinate{kind: publicationItemEnumeration, item: directory}, hint.stamp, hint.stamp.version, time.Now(),
+	) <= 0 {
+		r.mu.RUnlock()
+		return nil
+	}
+	held := make([][]byte, 0, len(hint.identities))
+	seen := make(map[publicationIdentity]struct{}, len(hint.identities))
+	for _, identity := range hint.identities {
+		record := r.nodesByIdentity[identity]
+		if record == nil || record.reclaimed || record.stale.Load() || record.node == nil || record.node.stale.Load() {
+			continue
+		}
+		if _, duplicate := seen[identity]; duplicate {
+			continue
+		}
+		seen[identity] = struct{}{}
+		held = append(held, append([]byte(nil), identity[:]...))
+	}
+	r.mu.RUnlock()
+	sort.Slice(held, func(i, j int) bool { return bytes.Compare(held[i], held[j]) < 0 })
+	return held
+}
+
+func (r *rawFileSystem) stageDirectoryPageHint(ctx context.Context, directory publicationIdentity, cookie []byte, stamp subscriptionStamp, entries []*authoritypb.Dirent) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		return errors.New("fusev3: READDIRPLUS page hint escaped its reply lifecycle")
+	}
+	identities := make([]publicationIdentity, 0, len(entries))
+	for _, entry := range entries {
+		raw := entry.GetStableIdentity()
+		if len(raw) == 0 {
+			continue
+		}
+		if len(raw) != len(publicationIdentity{}) || (entry.GetItem() != nil && !bytes.Equal(raw, entry.GetItem().GetStableIdentity())) {
+			return errors.New("fusev3: READDIRPLUS page carried an inconsistent stable identity")
+		}
+		var identity publicationIdentity
+		copy(identity[:], raw)
+		identities = append(identities, identity)
+	}
+	if len(identities) == 0 {
+		return nil
+	}
+	key := directoryPageKey{directory: directory, cookie: string(cookie)}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.replyPublications[publication.requestUnique] != publication || publication.dirPlusLookups == nil || publication.dirPlusLookups.settled {
+		return errors.New("fusev3: READDIRPLUS page hint lost its reply transaction")
+	}
+	if publication.dirPlusLookups.pageHints == nil {
+		publication.dirPlusLookups.pageHints = make(map[directoryPageKey]directoryPageHint)
+	}
+	publication.dirPlusLookups.pageHints[key] = directoryPageHint{stamp: stamp, identities: identities}
+	return nil
 }
 
 // The source gate owns the parent enumeration until the physical reply. The

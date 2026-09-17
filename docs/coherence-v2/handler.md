@@ -212,7 +212,19 @@ verifier remains optional and shape-checked; it does not authorize continuation.
 The reply publishes the page stamp sampled by the storage-turn revalidation,
 not the earlier probe's stamp. The concurrent peer
 creator/deleter regression requires every unchanged entry exactly once and refuses
-ESTALE.
+ESTALE or EAGAIN. A page retries legitimate enumeration, child-resolution, and
+revalidation races until it succeeds or its request context ends; the fixed
+stabilization budget does not escape as a directory errno.
+
+Linux READDIRPLUS may supply up to 4,096 sorted unique 16-byte held identities
+for the exact cached page. The handler still resolves each child, acquires the
+complete page footprint, and returns its stable identity, attributes, object
+version, and snapshot sequence. It omits the Item only when the returned
+identity is in that set, and immediately forgets the provisional store
+capability instead of charging it to the session. Reclaim accepts the frozen
+singular form or an additive batch of at most 4,096 distinct capabilities;
+the batch is shape-checked and resolved against session accounting before any
+retirement.
 
 Application-ticket history is retired through each session's durable prefix, retaining
 only monotonic counters and undurable volume versions. Active delegation cuts validate

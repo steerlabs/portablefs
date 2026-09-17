@@ -74,6 +74,21 @@ kernel entry and attribute validity remain zero. Capability transfer and cursor
 advancement are provisional until the physical reply succeeds; failure rolls
 back lookup ownership and the cursor. Mixed local-route mounts retain READDIR.
 
+A physically accepted page also retains a bounded, subscription-stamped hint
+from its start cookie to its stable identities. A warm READDIRPLUS sends only
+that page's identities which still resolve in `nodesByIdentity`; a cold or
+unknown page sends none. For an Item-less reply entry, the client resolves
+`Dirent.stable_identity` through that table and takes a lookup reference with
+`addLookupExisting` before any Item path can run. A missing or mismatched record
+fails closed. Kernel FORGET drops lookup ownership but retains the daemon record
+and capability while a live subscribed binding fits the registry. Name
+eviction, horizon withdrawal, epoch replacement, or unmount retires it.
+
+Unavoidable capabilities are reclaimed in exact batches of at most 4,096.
+One collector coalesces same-epoch tokens until the cleanup watermark or a
+short timer; FORGET itself remains nonblocking. This bounds cleanup RPCs by
+pages or batches instead of entries without weakening replay or epoch fencing.
+
 Under FULL ownership, FUSE FLUSH returns locally after checking loss unless the
 closing POSIX lock owner may hold record locks on that identity. SETLK/SETLKW
 acquisition attempts record this obligation before dispatch; successful FLUSH

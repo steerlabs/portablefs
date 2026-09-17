@@ -1116,20 +1116,35 @@ message ReadDirRequest {
   bytes cookie = 2;
   bytes verifier = 3;
   uint32 max_entries = 4;
-  // Ask for a fresh usable Item capability for every returned entry. Linux
-  // readdir leaves this false; the macOS pfslocal contract requires Items.
+  // Ask for a usable Item capability for returned entries. READDIRPLUS may
+  // name capabilities it already retains in held_identities; the authority
+  // omits a fresh Item for those entries. Plain READDIR leaves this false;
+  // the macOS pfslocal contract requires Items and sends no held identities.
   bool want_items = 5;
+  // Sorted unique stable identities retained by this session for the page
+  // beginning at cookie. Each value is exactly 16 bytes and the collection is
+  // bounded by the ordinary repeated-field limit.
+  repeated bytes held_identities = 6;
 }
 message Dirent {
   bytes name = 1;
   Attr attr = 2;
   bytes next_cookie = 3;
-  Item item = 4; // present for every entry exactly when want_items is true
+  // Present for resolvable entries when want_items is true unless the entry's
+  // stable_identity was declared in held_identities.
+  Item item = 4;
   uint64 object_version = 5;
   uint64 snapshot_sequence = 6;
+  // Present for every resolvable entry, including one whose Item was omitted.
+  bytes stable_identity = 7;
 }
 message ReadDirReply { repeated Dirent entries = 1; bytes verifier = 2; bool eof = 3; }
-message ReclaimRequest { bytes item = 1; }
+message ReclaimRequest {
+  // Legacy singular form. Exactly one of item and items is nonempty.
+  bytes item = 1;
+  // Batched form: 1..4096 distinct item capabilities.
+  repeated bytes items = 2;
+}
 
 message GetXattrRequest { bytes item = 1; bytes handle = 2; bytes name = 3; }
 message GetXattrReply { bytes value = 1; }

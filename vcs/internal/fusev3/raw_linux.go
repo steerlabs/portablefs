@@ -129,6 +129,16 @@ type stagedDirPlusLookup struct {
 	name   string
 }
 
+type directoryPageKey struct {
+	directory publicationIdentity
+	cookie    string
+}
+
+type directoryPageHint struct {
+	stamp      subscriptionStamp
+	identities []publicationIdentity
+}
+
 // dirPlusLookupTransaction owns every provisional resource used to construct
 // one READDIRPLUS page. The authority capabilities and daemon lookup counts
 // exist before the kernel can own them, so the physical reply write is the
@@ -137,6 +147,7 @@ type dirPlusLookupTransaction struct {
 	cursor       *dirPlusCursorTransaction
 	handleRecord *handleRecord
 	lookups      []stagedDirPlusLookup
+	pageHints    map[directoryPageKey]directoryPageHint
 	ready        bool
 	settled      bool
 }
@@ -424,6 +435,7 @@ type rawFileSystem struct {
 	// portable profile, so recall only has to drop this local binding.
 	cachedNames         map[nameKey]*inodeRecord
 	completeDirectories map[publicationIdentity]*directoryCompleteness
+	directoryPageHints  map[directoryPageKey]directoryPageHint
 	cachedStableNames   map[publicationNamespace]*inodeRecord
 	cachedNameStable    map[nameKey]publicationNamespace
 	cachedNameStamps    map[nameKey]subscriptionStamp
@@ -520,6 +532,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 
 		cachedNames:             make(map[nameKey]*inodeRecord),
 		completeDirectories:     make(map[publicationIdentity]*directoryCompleteness),
+		directoryPageHints:      make(map[directoryPageKey]directoryPageHint),
 		cachedStableNames:       make(map[publicationNamespace]*inodeRecord),
 		cachedNameStable:        make(map[nameKey]publicationNamespace),
 		cachedNameStamps:        make(map[nameKey]subscriptionStamp),
@@ -1201,6 +1214,11 @@ func (r *rawFileSystem) settleDirPlusLookupTransactionLocked(publication *replyP
 		for _, lookup := range tx.lookups {
 			r.bindPathLocked(lookup.record, lookup.parent, lookup.name)
 		}
+		for key, hint := range tx.pageHints {
+			if _, exists := r.directoryPageHints[key]; exists || len(r.directoryPageHints) < r.nameCapacity {
+				r.directoryPageHints[key] = hint
+			}
+		}
 		return completion
 	}
 	for _, lookup := range tx.lookups {
@@ -1210,7 +1228,7 @@ func (r *rawFileSystem) settleDirPlusLookupTransactionLocked(publication *replyP
 			continue
 		}
 		record.lookups--
-		if index := r.identityIndexLocked(record); record.lookups == 0 && record.pins == 0 && index[record.key] == record {
+		if index := r.identityIndexLocked(record); record.lookups == 0 && record.pins == 0 && len(record.names) == 0 && index[record.key] == record {
 			delete(index, record.key)
 		}
 		if reclaim := r.collectLocked(record); len(reclaim) != 0 {
@@ -1975,6 +1993,27 @@ func (r *rawFileSystem) addLookupExisting(record *inodeRecord) bool {
 	return true
 }
 
+func (r *rawFileSystem) addLookupHeldDirent(dirent *authoritypb.Dirent) (*inodeRecord, *authoritypb.Item, bool) {
+	if dirent == nil || dirent.GetAttr() == nil || len(dirent.GetStableIdentity()) != len(publicationIdentity{}) {
+		return nil, nil, false
+	}
+	var identity publicationIdentity
+	copy(identity[:], dirent.GetStableIdentity())
+	r.mu.RLock()
+	record := r.nodesByIdentity[identity]
+	valid := record != nil && !record.reclaimed && !record.stale.Load() && record.node != nil && !record.node.stale.Load() && record.key == itemKey(&authoritypb.Item{Attr: dirent.GetAttr()})
+	r.mu.RUnlock()
+	if !valid || !r.addLookupExisting(record) {
+		return nil, nil, false
+	}
+	item := cloneItem(record.node.item)
+	item.Attr = proto.Clone(dirent.GetAttr()).(*authoritypb.Attr)
+	item.StableIdentity = cloneBytes(dirent.GetStableIdentity())
+	item.ObjectVersion = dirent.GetObjectVersion()
+	item.SnapshotSequence = dirent.GetSnapshotSequence()
+	return record, item, true
+}
+
 func (r *rawFileSystem) acquire(nodeID uint64) *inodeRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -2014,7 +2053,7 @@ func (r *rawFileSystem) Forget(nodeID, nlookup uint64) {
 		} else {
 			record.lookups -= nlookup
 		}
-		if index := r.identityIndexLocked(record); record.lookups == 0 && record.pins == 0 && index[record.key] == record {
+		if index := r.identityIndexLocked(record); record.lookups == 0 && record.pins == 0 && len(record.names) == 0 && index[record.key] == record {
 			delete(index, record.key)
 		}
 		reclaim = r.collectLocked(record)
@@ -2031,6 +2070,7 @@ func (r *rawFileSystem) collectLocked(record *inodeRecord) []byte {
 		return nil
 	}
 	record.reclaimed = true
+	r.dropDirectoryPageHintsLocked(record.identity)
 	r.dropCompleteDirectoryLocked(record.identity)
 	delete(r.nodesByID, record.id)
 	if r.nodesByIdentity[record.identity] == record {
@@ -2186,7 +2226,7 @@ func (r *rawFileSystem) unpin(record *inodeRecord) {
 		// directory would leave the mount unable to resolve any coordination
 		// identity rooted there -- silently turning every later namespace
 		// repair into a no-op.
-		if index := r.identityIndexLocked(record); !record.root && record.lookups == 0 && record.pins == 0 && index[record.key] == record {
+		if index := r.identityIndexLocked(record); !record.root && record.lookups == 0 && record.pins == 0 && len(record.names) == 0 && index[record.key] == record {
 			delete(index, record.key)
 		}
 		reclaim = r.collectLocked(record)
@@ -3580,15 +3620,25 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 			break
 		}
 		emitted++
-		if item != nil && entry.Name != "." && entry.Name != ".." {
-			if item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) {
+		if (item != nil || len(dirent.GetStableIdentity()) != 0) && entry.Name != "." && entry.Name != ".." {
+			freshItem := item != nil
+			if freshItem && (item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) || !bytes.Equal(item.GetStableIdentity(), dirent.GetStableIdentity())) {
 				r.mount.deferReclaim(item.GetToken())
 				return fuse.EIO
 			}
-			record, errno := r.intern(ctx, item)
-			if errno != 0 {
-				r.mount.deferReclaim(item.GetToken())
-				return fuse.Status(errno)
+			var record *inodeRecord
+			if !freshItem {
+				var ok bool
+				record, item, ok = r.addLookupHeldDirent(dirent)
+				if !ok {
+					return fuse.EIO
+				}
+			} else {
+				record, errno = r.intern(ctx, item)
+				if errno != 0 {
+					r.mount.deferReclaim(item.GetToken())
+					return fuse.Status(errno)
+				}
 			}
 			if err := r.stageDirPlusLookup(ctx, record, held.inode, entry.Name); err != nil {
 				r.Forget(record.id, 1)

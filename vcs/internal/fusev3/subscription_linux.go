@@ -1098,6 +1098,7 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	}
 
 	r.mu.Lock()
+	clear(r.directoryPageHints)
 	type nameInvalidation struct {
 		parent uint64
 		name   string
@@ -1215,8 +1216,17 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		delete(r.repairingCoordinates, coordinate)
 		delete(r.repairOwners, coordinate)
 	}
+	reclaims := make([][]byte, 0)
+	for _, record := range r.nodesByID {
+		if token := r.collectLocked(record); len(token) != 0 {
+			reclaims = append(reclaims, token)
+		}
+	}
 	r.signalSourceChangedLocked()
 	r.mu.Unlock()
+	for _, token := range reclaims {
+		r.mount.deferReclaim(token)
+	}
 	return nil
 }
 

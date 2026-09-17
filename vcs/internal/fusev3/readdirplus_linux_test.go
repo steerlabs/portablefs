@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"syscall"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"google.golang.org/protobuf/proto"
 )
 
 func plusTestPages(count int) []*authoritypb.ReadDirReply {
@@ -21,7 +23,7 @@ func plusTestPages(count int) []*authoritypb.ReadDirReply {
 		for i := start; i < end; i++ {
 			item := testItem(uint64(i+100), authoritypb.Attr_REGULAR, uint64(i+100))
 			item.ObjectVersion, item.SnapshotSequence = 2, 2
-			page.Entries = append(page.Entries, &authoritypb.Dirent{Name: []byte(fmt.Sprintf("file-%04d", i)), Attr: item.Attr, Item: item, NextCookie: encodeCookie(uint64(i + 1)), ObjectVersion: 2, SnapshotSequence: 2})
+			page.Entries = append(page.Entries, &authoritypb.Dirent{Name: []byte(fmt.Sprintf("file-%04d", i)), Attr: item.Attr, Item: item, NextCookie: encodeCookie(uint64(i + 1)), ObjectVersion: 2, SnapshotSequence: 2, StableIdentity: cloneBytes(item.GetStableIdentity())})
 		}
 		pages = append(pages, page)
 	}
@@ -75,6 +77,77 @@ func TestReadDirPlusThousandEntriesPopulateDaemonCaches(t *testing.T) {
 	}
 	if out.EntryValid != 0 || out.AttrValid != 0 {
 		t.Fatal("PLUS restored kernel lifetimes")
+	}
+}
+
+func TestWarmReadDirPlusReusesRetainedPageCapabilities(t *testing.T) {
+	raw, mount, rpc := testRawFileSystem(t, 16)
+	page := plusTestPages(1)[0]
+	firstHandle, _ := testDirHandle(t, raw, page)
+	first := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	firstUnique := nextTestRequestUnique()
+	if status := raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: firstUnique}, Fh: firstHandle}, first); status != fuse.OK {
+		t.Fatal(status)
+	}
+	raw.PrepareReplyPayload(firstUnique, 42, 44, nil, nil, 0)
+	completeTestReply(t, raw, firstUnique, fuse.OK)
+
+	var child *inodeRecord
+	raw.mu.RLock()
+	for _, record := range raw.nodesByID {
+		if record != nil && record.key.inode == 100 {
+			child = record
+			break
+		}
+	}
+	var directory *inodeRecord
+	if handle := raw.handles[firstHandle]; handle != nil {
+		directory = handle.inode
+	}
+	raw.mu.RUnlock()
+	if child == nil || directory == nil {
+		t.Fatal("cold READDIRPLUS did not intern its directory and child")
+	}
+	raw.Forget(child.id, 1)
+	if mount.reclaim.pending() != 0 {
+		t.Fatal("kernel FORGET reclaimed a binding retained by the live subscription")
+	}
+	raw.mu.RLock()
+	if raw.nodesByIdentity[child.identity] != child || raw.nodesByKey[child.key] != child {
+		raw.mu.RUnlock()
+		t.Fatal("FORGET removed a retained daemon binding from an identity index")
+	}
+	raw.mu.RUnlock()
+	heldIdentities := raw.heldDirectoryPageIdentities(directory.identity, nil)
+	if len(heldIdentities) != 1 || !bytes.Equal(heldIdentities[0], child.identity[:]) {
+		t.Fatalf("cached page held identities = %x, want %x", heldIdentities, child.identity)
+	}
+
+	itemless := proto.Clone(page).(*authoritypb.ReadDirReply)
+	itemless.Entries[0].Item = nil
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		readDir := request.GetReadDir()
+		if readDir == nil {
+			return nil, fmt.Errorf("unexpected request %T", request.GetBody())
+		}
+		if len(readDir.GetHeldIdentities()) != 1 || !bytes.Equal(readDir.GetHeldIdentities()[0], child.identity[:]) {
+			return nil, fmt.Errorf("held identities = %x, want %x", readDir.GetHeldIdentities(), child.identity)
+		}
+		return &authoritypb.Response{VolumeVersion: 2, Body: &authoritypb.Response_ReadDir{ReadDir: itemless}}, nil
+	}
+	secondHandle, ok := raw.addHandle(directory, &handleRecord{dir: &dirHandle{node: directory.node, token: testToken(101)}})
+	if !ok {
+		t.Fatal("add warm directory handle")
+	}
+	second := fuse.NewDirEntryList(make([]byte, 4096), 0)
+	secondUnique := nextTestRequestUnique()
+	if status := raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: secondUnique}, Fh: secondHandle}, second); status != fuse.OK {
+		t.Fatalf("warm READDIRPLUS = %v", status)
+	}
+	raw.PrepareReplyPayload(secondUnique, 42, 44, nil, nil, 0)
+	completeTestReply(t, raw, secondUnique, fuse.OK)
+	if child.lookups != 1 || mount.reclaim.pending() != 0 {
+		t.Fatalf("warm lookup refs=%d reclaim debt=%d, want retained lookup and no fresh capability", child.lookups, mount.reclaim.pending())
 	}
 }
 

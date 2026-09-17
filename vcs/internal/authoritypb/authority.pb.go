@@ -8968,11 +8968,17 @@ type ReadDirRequest struct {
 	Cookie     []byte                 `protobuf:"bytes,2,opt,name=cookie,proto3" json:"cookie,omitempty"`
 	Verifier   []byte                 `protobuf:"bytes,3,opt,name=verifier,proto3" json:"verifier,omitempty"`
 	MaxEntries uint32                 `protobuf:"varint,4,opt,name=max_entries,json=maxEntries,proto3" json:"max_entries,omitempty"`
-	// Ask for a fresh usable Item capability for every returned entry. Linux
-	// readdir leaves this false; the macOS pfslocal contract requires Items.
-	WantItems     bool `protobuf:"varint,5,opt,name=want_items,json=wantItems,proto3" json:"want_items,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Ask for a usable Item capability for returned entries. READDIRPLUS may
+	// name capabilities it already retains in held_identities; the authority
+	// omits a fresh Item for those entries. Plain READDIR leaves this false;
+	// the macOS pfslocal contract requires Items and sends no held identities.
+	WantItems bool `protobuf:"varint,5,opt,name=want_items,json=wantItems,proto3" json:"want_items,omitempty"`
+	// Sorted unique stable identities retained by this session for the page
+	// beginning at cookie. Each value is exactly 16 bytes and the collection is
+	// bounded by the ordinary repeated-field limit.
+	HeldIdentities [][]byte `protobuf:"bytes,6,rep,name=held_identities,json=heldIdentities,proto3" json:"held_identities,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ReadDirRequest) Reset() {
@@ -9040,16 +9046,27 @@ func (x *ReadDirRequest) GetWantItems() bool {
 	return false
 }
 
+func (x *ReadDirRequest) GetHeldIdentities() [][]byte {
+	if x != nil {
+		return x.HeldIdentities
+	}
+	return nil
+}
+
 type Dirent struct {
-	state            protoimpl.MessageState `protogen:"open.v1"`
-	Name             []byte                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Attr             *Attr                  `protobuf:"bytes,2,opt,name=attr,proto3" json:"attr,omitempty"`
-	NextCookie       []byte                 `protobuf:"bytes,3,opt,name=next_cookie,json=nextCookie,proto3" json:"next_cookie,omitempty"`
-	Item             *Item                  `protobuf:"bytes,4,opt,name=item,proto3" json:"item,omitempty"` // present for every entry exactly when want_items is true
-	ObjectVersion    uint64                 `protobuf:"varint,5,opt,name=object_version,json=objectVersion,proto3" json:"object_version,omitempty"`
-	SnapshotSequence uint64                 `protobuf:"varint,6,opt,name=snapshot_sequence,json=snapshotSequence,proto3" json:"snapshot_sequence,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Name       []byte                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Attr       *Attr                  `protobuf:"bytes,2,opt,name=attr,proto3" json:"attr,omitempty"`
+	NextCookie []byte                 `protobuf:"bytes,3,opt,name=next_cookie,json=nextCookie,proto3" json:"next_cookie,omitempty"`
+	// Present for resolvable entries when want_items is true unless the entry's
+	// stable_identity was declared in held_identities.
+	Item             *Item  `protobuf:"bytes,4,opt,name=item,proto3" json:"item,omitempty"`
+	ObjectVersion    uint64 `protobuf:"varint,5,opt,name=object_version,json=objectVersion,proto3" json:"object_version,omitempty"`
+	SnapshotSequence uint64 `protobuf:"varint,6,opt,name=snapshot_sequence,json=snapshotSequence,proto3" json:"snapshot_sequence,omitempty"`
+	// Present for every resolvable entry, including one whose Item was omitted.
+	StableIdentity []byte `protobuf:"bytes,7,opt,name=stable_identity,json=stableIdentity,proto3" json:"stable_identity,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *Dirent) Reset() {
@@ -9124,6 +9141,13 @@ func (x *Dirent) GetSnapshotSequence() uint64 {
 	return 0
 }
 
+func (x *Dirent) GetStableIdentity() []byte {
+	if x != nil {
+		return x.StableIdentity
+	}
+	return nil
+}
+
 type ReadDirReply struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Entries       []*Dirent              `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
@@ -9185,8 +9209,11 @@ func (x *ReadDirReply) GetEof() bool {
 }
 
 type ReclaimRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Item          []byte                 `protobuf:"bytes,1,opt,name=item,proto3" json:"item,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Legacy singular form. Exactly one of item and items is nonempty.
+	Item []byte `protobuf:"bytes,1,opt,name=item,proto3" json:"item,omitempty"`
+	// Batched form: 1..4096 distinct item capabilities.
+	Items         [][]byte `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -9224,6 +9251,13 @@ func (*ReclaimRequest) Descriptor() ([]byte, []int) {
 func (x *ReclaimRequest) GetItem() []byte {
 	if x != nil {
 		return x.Item
+	}
+	return nil
+}
+
+func (x *ReclaimRequest) GetItems() [][]byte {
+	if x != nil {
+		return x.Items
 	}
 	return nil
 }
@@ -12263,7 +12297,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\fFlushRequest\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\fR\x06handle\x12\x1d\n" +
 	"\n" +
-	"lock_owner\x18\x02 \x01(\x04R\tlockOwner\"\x9c\x01\n" +
+	"lock_owner\x18\x02 \x01(\x04R\tlockOwner\"\xc5\x01\n" +
 	"\x0eReadDirRequest\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\fR\x06handle\x12\x16\n" +
 	"\x06cookie\x18\x02 \x01(\fR\x06cookie\x12\x1a\n" +
@@ -12271,7 +12305,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\vmax_entries\x18\x04 \x01(\rR\n" +
 	"maxEntries\x12\x1d\n" +
 	"\n" +
-	"want_items\x18\x05 \x01(\bR\twantItems\"\xf7\x01\n" +
+	"want_items\x18\x05 \x01(\bR\twantItems\x12'\n" +
+	"\x0fheld_identities\x18\x06 \x03(\fR\x0eheldIdentities\"\xa0\x02\n" +
 	"\x06Dirent\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\fR\x04name\x121\n" +
 	"\x04attr\x18\x02 \x01(\v2\x1d.portablefs.authority.v1.AttrR\x04attr\x12\x1f\n" +
@@ -12279,13 +12314,15 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"nextCookie\x121\n" +
 	"\x04item\x18\x04 \x01(\v2\x1d.portablefs.authority.v1.ItemR\x04item\x12%\n" +
 	"\x0eobject_version\x18\x05 \x01(\x04R\robjectVersion\x12+\n" +
-	"\x11snapshot_sequence\x18\x06 \x01(\x04R\x10snapshotSequence\"w\n" +
+	"\x11snapshot_sequence\x18\x06 \x01(\x04R\x10snapshotSequence\x12'\n" +
+	"\x0fstable_identity\x18\a \x01(\fR\x0estableIdentity\"w\n" +
 	"\fReadDirReply\x129\n" +
 	"\aentries\x18\x01 \x03(\v2\x1f.portablefs.authority.v1.DirentR\aentries\x12\x1a\n" +
 	"\bverifier\x18\x02 \x01(\fR\bverifier\x12\x10\n" +
-	"\x03eof\x18\x03 \x01(\bR\x03eof\"$\n" +
+	"\x03eof\x18\x03 \x01(\bR\x03eof\":\n" +
 	"\x0eReclaimRequest\x12\x12\n" +
-	"\x04item\x18\x01 \x01(\fR\x04item\"Q\n" +
+	"\x04item\x18\x01 \x01(\fR\x04item\x12\x14\n" +
+	"\x05items\x18\x02 \x03(\fR\x05items\"Q\n" +
 	"\x0fGetXattrRequest\x12\x12\n" +
 	"\x04item\x18\x01 \x01(\fR\x04item\x12\x16\n" +
 	"\x06handle\x18\x02 \x01(\fR\x06handle\x12\x12\n" +

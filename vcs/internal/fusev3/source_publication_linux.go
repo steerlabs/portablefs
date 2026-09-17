@@ -566,6 +566,7 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 			delete(l.r.cachedAttrPayloads, coordinate.item)
 		}
 		if coordinate.kind == publicationItemEnumeration {
+			l.r.dropDirectoryPageHintsLocked(coordinate.item)
 			if coordinate.item != l.completeParent || l.r.completeDirectories[coordinate.item] != l.completeProof {
 				l.r.dropCompleteDirectoryLocked(coordinate.item)
 			}

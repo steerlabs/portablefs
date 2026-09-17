@@ -55,6 +55,7 @@ const (
 	// fixed fraction of the same budget rather than as an independent knob that
 	// could be configured out of proportion with it.
 	reclaimLaneDivisor = 4
+	reclaimBatchDelay  = 50 * time.Millisecond
 
 	// livenessReserve is the number of authority in-flight slots that only
 	// session keepalive may occupy.
@@ -799,17 +800,22 @@ func (m *Mount) watchSession(ctx context.Context, done <-chan struct{}) {
 func (m *Mount) reclaimLoop(ctx context.Context) {
 	defer m.wg.Done()
 	for {
-		entry, ok := m.reclaim.pop(ctx)
+		batch, ok := m.reclaim.popBatch(ctx, authorityrpc.MaxReclaimBatch)
 		if !ok {
 			return
 		}
-		if entry.transport != m.rpc.(*epochRPC).current() {
+		transport := batch[0].transport
+		if transport != m.rpc.(*epochRPC).current() {
 			continue
 		}
 		// Background cleanup has no syscall deadline. Retain its replay slot
 		// across a transport gap until exact resolution or mount shutdown.
-		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: entry.token}}}
-		response, consumption, err := entry.transport.CallMutationWithIdentityRetained(
+		tokens := make([][]byte, len(batch))
+		for i, entry := range batch {
+			tokens[i] = entry.token
+		}
+		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: tokens}}}
+		response, consumption, err := transport.CallMutationWithIdentityRetained(
 			ctx, request, nil, m.forceTerminalResponseRevocation,
 		)
 		if ctx.Err() != nil {
@@ -819,8 +825,8 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 			}
 			return
 		}
-		if entry.transport != m.rpc.(*epochRPC).current() ||
-			errors.Is(entry.transport.SessionEndCause(), authorityrpc.ErrAuthorityChanged) ||
+		if transport != m.rpc.(*epochRPC).current() ||
+			errors.Is(transport.SessionEndCause(), authorityrpc.ErrAuthorityChanged) ||
 			errors.Is(err, authorityrpc.ErrAuthorityChanged) {
 			if consumption != nil {
 				consumption.Consume()
@@ -842,8 +848,10 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 				if waitErr := m.subscription.waitActive(ctx); waitErr != nil {
 					return
 				}
-				if entry.transport == m.rpc.(*epochRPC).current() {
-					m.reclaim.push(entry)
+				if transport == m.rpc.(*epochRPC).current() {
+					for _, entry := range batch {
+						m.reclaim.push(entry)
+					}
 				}
 			}
 			continue
@@ -1003,6 +1011,7 @@ func (m *Mount) holdBulk(parent context.Context) (context.Context, func(), sysca
 // against this watermark before producing more cleanup debt.
 type reclaimQueue struct {
 	watermark int
+	batchMu   sync.Mutex
 
 	mu     sync.Mutex
 	tokens []queuedReclaim
@@ -1047,19 +1056,7 @@ func (q *reclaimQueue) pop(ctx context.Context) (queuedReclaim, bool) {
 	for {
 		q.mu.Lock()
 		if q.head < len(q.tokens) {
-			entry := q.tokens[q.head]
-			q.tokens[q.head] = queuedReclaim{}
-			q.head++
-			if q.head == len(q.tokens) {
-				// Reset instead of resliding so the backing array is reused
-				// rather than growing without bound.
-				q.tokens, q.head = q.tokens[:0], 0
-			}
-			remaining := len(q.tokens) - q.head
-			if remaining < q.watermark && q.room != nil {
-				close(q.room)
-				q.room = nil
-			}
+			entry, remaining := q.popLocked()
 			q.mu.Unlock()
 			if remaining > 0 {
 				q.signal()
@@ -1073,6 +1070,69 @@ func (q *reclaimQueue) pop(ctx context.Context) (queuedReclaim, bool) {
 			return queuedReclaim{}, false
 		}
 	}
+}
+
+func (q *reclaimQueue) popLocked() (queuedReclaim, int) {
+	entry := q.tokens[q.head]
+	q.tokens[q.head] = queuedReclaim{}
+	q.head++
+	if q.head == len(q.tokens) {
+		// Reset instead of resliding so the backing array is reused rather than
+		// growing without bound.
+		q.tokens, q.head = q.tokens[:0], 0
+	}
+	remaining := len(q.tokens) - q.head
+	if remaining < q.watermark && q.room != nil {
+		close(q.room)
+		q.room = nil
+	}
+	return entry, remaining
+}
+
+// popBatch leaves FORGET nonblocking while one collector coalesces cleanup
+// debt. A full admission watermark drains immediately; unavoidable residue is
+// sent after a short timer. The collector never combines authority epochs.
+func (q *reclaimQueue) popBatch(ctx context.Context, max int) ([]queuedReclaim, bool) {
+	q.batchMu.Lock()
+	defer q.batchMu.Unlock()
+	first, ok := q.pop(ctx)
+	if !ok {
+		return nil, false
+	}
+	batch := make([]queuedReclaim, 0, min(max, q.watermark))
+	batch = append(batch, first)
+	flushAt := min(max, q.watermark)
+	timer := time.NewTimer(reclaimBatchDelay)
+	defer timer.Stop()
+	for len(batch) < max {
+		q.mu.Lock()
+		if q.head < len(q.tokens) {
+			next := q.tokens[q.head]
+			if next.transport != first.transport {
+				q.mu.Unlock()
+				return batch, true
+			}
+			next, remaining := q.popLocked()
+			q.mu.Unlock()
+			batch = append(batch, next)
+			if remaining > 0 {
+				q.signal()
+			}
+			if len(batch) >= flushAt {
+				return batch, true
+			}
+			continue
+		}
+		q.mu.Unlock()
+		select {
+		case <-q.wake:
+		case <-timer.C:
+			return batch, true
+		case <-ctx.Done():
+			return batch, true
+		}
+	}
+	return batch, true
 }
 
 // admit blocks a producer that is about to create new cleanup debt until the
@@ -1915,8 +1975,14 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			}
 			generation := h.cursorGeneration
 			pageStamp := h.node.mount.subscription.stamp()
+			requestCookie := cloneBytes(h.cookie)
+			directoryIdentity, identityOK := publicationIdentityFromItem(h.node.item)
+			var heldIdentities [][]byte
+			if wantItems && identityOK && h.node.mount.raw != nil {
+				heldIdentities = h.node.mount.raw.heldDirectoryPageIdentities(directoryIdentity, requestCookie)
+			}
 			request := &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
-				Handle: cloneBytes(h.token), Cookie: cloneBytes(h.cookie), MaxEntries: 256, WantItems: wantItems,
+				Handle: cloneBytes(h.token), Cookie: requestCookie, MaxEntries: 256, WantItems: wantItems, HeldIdentities: heldIdentities,
 			}}}
 			h.fetching = true
 			h.fetchDone = make(chan struct{})
@@ -1954,8 +2020,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			if page == nil {
 				return nil, nil, syscall.EIO
 			}
-			identity, ok := publicationIdentityFromItem(h.node.item)
-			if !ok {
+			if !identityOK {
 				for _, entry := range page.GetEntries() {
 					if item := entry.GetItem(); item != nil {
 						h.node.mount.deferReclaim(item.GetToken())
@@ -1969,7 +2034,12 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			// reply stamp keeps the oldest version, but each buffered page owns
 			// its own RPC admission stamp and served version.
 			h.pageStamp = pageStamp.withVersion(response.GetVolumeVersion())
-			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: identity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0
+			if wantItems && h.node.mount.raw != nil {
+				if err := h.node.mount.raw.stageDirectoryPageHint(ctx, directoryIdentity, requestCookie, h.pageStamp, h.page); err != nil {
+					return nil, nil, syscall.EIO
+				}
+			}
+			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: directoryIdentity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0
 			h.pageWantItems = wantItems
 			h.verifier = cloneBytes(page.GetVerifier())
 			if len(h.page) == 0 && !h.eof {

@@ -2594,6 +2594,68 @@ func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing
 	}
 }
 
+func TestReadDirPlusOmitsCapabilitiesAlreadyHeldByTheSession(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		t.Run(fmt.Sprintf("held=%v", held), func(t *testing.T) {
+			store := &readdirPostStabilizationChangeStore{
+				root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
+			}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
+			if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+				t.Fatal(err)
+			}
+			identity := [16]byte{store.child[0]}
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+				Handle: store.handle[:], MaxEntries: 16, WantItems: true,
+			}}
+			if held {
+				request.GetReadDir().HeldIdentities = [][]byte{identity[:]}
+			}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 {
+				t.Fatalf("READDIRPLUS response = %+v", response)
+			}
+			entry := response.GetReadDir().GetEntries()[0]
+			if !bytes.Equal(entry.GetStableIdentity(), identity[:]) || entry.GetAttr() == nil || entry.GetObjectVersion() == 0 || entry.GetSnapshotSequence() == 0 {
+				t.Fatalf("entry omitted stable metadata: %+v", entry)
+			}
+			if (entry.GetItem() == nil) != held {
+				t.Fatalf("held=%v item=%+v", held, entry.GetItem())
+			}
+			resources := h.resources[credential.ID]
+			if got, want := len(resources.items), map[bool]int{false: 1, true: 0}[held]; got != want {
+				t.Fatalf("held=%v tracked items=%d want=%d", held, got, want)
+			}
+		})
+	}
+}
+
+func TestReadDirHeldIdentitiesAreValidatedBeforeEnumeration(t *testing.T) {
+	validA, validB := bytes.Repeat([]byte{1}, 16), bytes.Repeat([]byte{2}, 16)
+	tests := map[string]*authoritypb.ReadDirRequest{
+		"without items": {MaxEntries: 8, HeldIdentities: [][]byte{validA}},
+		"short":         {MaxEntries: 8, WantItems: true, HeldIdentities: [][]byte{{1}}},
+		"duplicate":     {MaxEntries: 8, WantItems: true, HeldIdentities: [][]byte{validA, validA}},
+		"unsorted":      {MaxEntries: 8, WantItems: true, HeldIdentities: [][]byte{validB, validA}},
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := &coherenceEmptyDirectoryStore{handle: xfsstore.Capability{0x51}, directory: xfsstore.Capability{0x52}}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+			body.Handle = store.handle[:]
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_ReadDir{ReadDir: body}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != int32(syscall.EINVAL) || store.calls.Load() != 0 {
+				t.Fatalf("response=%+v enumeration calls=%d", response, store.calls.Load())
+			}
+		})
+	}
+}
+
 func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
 	item := xfsstore.Capability{0x7a}
 	store := &resourceAdmissionFaultStore{lookupItem: item}
@@ -2658,6 +2720,44 @@ func TestCapabilityAccountingIsSymmetric(t *testing.T) {
 	h.closeSessionResources(session)
 	if h.totalItems != 0 || h.totalOpens != 0 {
 		t.Fatalf("cleanup left %d items / %d opens", h.totalItems, h.totalOpens)
+	}
+}
+
+func TestReclaimBatchValidatesBeforeRetiringCapabilities(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		duplicate bool
+	}{
+		{name: "batch"},
+		{name: "duplicate", duplicate: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
+			items := []xfsstore.Capability{{0x81}, {0x82}, {0x83}}
+			for _, item := range items {
+				if err := h.trackItem(credential.ID, item, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			raw := [][]byte{items[0][:], items[1][:], items[2][:]}
+			if test.duplicate {
+				raw[2] = items[0][:]
+			}
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: raw}}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if test.duplicate {
+				if response.GetErrno() != int32(syscall.EINVAL) || store.forget.Load() != 0 || len(h.resources[credential.ID].items) != len(items) {
+					t.Fatalf("duplicate response=%+v forget=%d retained=%d", response, store.forget.Load(), len(h.resources[credential.ID].items))
+				}
+				return
+			}
+			if response.GetErrno() != 0 || store.forget.Load() != uint32(len(items)) || len(h.resources[credential.ID].items) != 0 {
+				t.Fatalf("batch response=%+v forget=%d retained=%d", response, store.forget.Load(), len(h.resources[credential.ID].items))
+			}
+		})
 	}
 }
 

@@ -1766,6 +1766,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if body.ReadDir.GetMaxEntries() == 0 || body.ReadDir.GetMaxEntries() > 4096 {
 				return h.errorResponse(0, syscall.EINVAL, false)
 			}
+			heldIdentities, err := heldDirectoryIdentities(body.ReadDir)
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
 			handle, err := h.open(cred.ID, body.ReadDir.GetHandle())
 			if err != nil {
 				return h.errorResponse(0, err, false)
@@ -1816,20 +1820,33 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			// A page carries at least one entry unless it is the final one: an
 			// empty non-final page advances no client cursor, so a batch whose
 			// every entry raced away is skipped over rather than published.
-			for batch := 0; ; batch++ {
+			for {
+				if err := ctx.Err(); err != nil {
+					forgetIssued()
+					return h.errorResponse(0, err, false)
+				}
 				var candidates []directoryPageCandidate
-				stabilized := false
-				for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
+				for {
+					if err := ctx.Err(); err != nil {
+						forgetIssued()
+						return h.errorResponse(0, err, false)
+					}
 					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, int(body.ReadDir.GetMaxEntries()))
 					if err != nil {
+						if errors.Is(err, syscall.EAGAIN) {
+							continue
+						}
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
 					var conflict bool
 					candidates, budgetExhausted, conflict, err = h.constructDirectoryPage(
-						handle, entries, cookie, body.ReadDir.GetWantItems(), budget,
+						handle, entries, cookie, body.ReadDir.GetWantItems(), heldIdentities, budget,
 					)
 					if err != nil {
+						if errors.Is(err, syscall.EAGAIN) {
+							continue
+						}
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
@@ -1842,6 +1859,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					)
 					if verifyErr != nil {
 						h.forgetDirectoryCandidates(candidates)
+						if errors.Is(verifyErr, syscall.EAGAIN) {
+							continue
+						}
 						forgetIssued()
 						return h.errorResponse(0, verifyErr, false)
 					}
@@ -1872,12 +1892,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 						continue
 					}
 					pageSnapshot = snapshot
-					stabilized = true
 					break
-				}
-				if !stabilized {
-					forgetIssued()
-					return h.errorResponse(0, syscall.EAGAIN, false)
 				}
 				result.Verifier, result.Eof = current[:], eof && !budgetExhausted
 				for _, candidate := range candidates {
@@ -1899,10 +1914,6 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					break
 				}
 				cookie = entries[len(entries)-1].NextCookie
-				if batch+1 >= maxSkippedReaddirBatches {
-					forgetIssued()
-					return h.errorResponse(0, syscall.EAGAIN, false)
-				}
 			}
 			if budgetExhausted && len(result.Entries) == 0 {
 				// A single entry larger than the whole budget would make this
@@ -1937,14 +1948,35 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		// state: if the first success reply is lost, re-executing a read-style
 		// retry would resolve an already-retired capability as ESTALE.
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			item, err := h.item(cred.ID, body.Reclaim.GetItem())
-			if err != nil {
-				return h.errorResponse(0, err, false)
+			rawItems := body.Reclaim.GetItems()
+			if legacy := body.Reclaim.GetItem(); len(legacy) != 0 {
+				if len(rawItems) != 0 {
+					return h.errorResponse(0, syscall.EINVAL, false)
+				}
+				rawItems = [][]byte{legacy}
 			}
-			if err := h.Store.Forget(item); err != nil && !errors.Is(err, xfsstore.ErrStaleObject) {
-				return h.errorResponse(0, err, false)
+			if len(rawItems) == 0 || len(rawItems) > MaxReclaimBatch {
+				return h.errorResponse(0, syscall.EINVAL, false)
 			}
-			h.untrackItem(cred.ID, item)
+			items := make([]xfsstore.Capability, 0, len(rawItems))
+			seen := make(map[xfsstore.Capability]struct{}, len(rawItems))
+			for _, raw := range rawItems {
+				item, err := h.item(cred.ID, raw)
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				if _, duplicate := seen[item]; duplicate {
+					return h.errorResponse(0, syscall.EINVAL, false)
+				}
+				seen[item] = struct{}{}
+				items = append(items, item)
+			}
+			for _, item := range items {
+				if err := h.Store.Forget(item); err != nil && !errors.Is(err, xfsstore.ErrStaleObject) {
+					return h.errorResponse(0, err, false)
+				}
+				h.untrackItem(cred.ID, item)
+			}
 			return h.success(0)
 		})
 	case *authoritypb.Request_GetXattr:
@@ -2147,6 +2179,7 @@ func (h *VolumeHandler) constructDirectoryPage(
 	entries []xfsstore.Dirent,
 	cookie uint64,
 	wantItems bool,
+	heldIdentities map[[16]byte]struct{},
 	budget uint32,
 ) ([]directoryPageCandidate, bool, bool, error) {
 	candidates := make([]directoryPageCandidate, 0, len(entries))
@@ -2157,7 +2190,7 @@ func (h *VolumeHandler) constructDirectoryPage(
 		if entry.Kind != xfsstore.KindOpaque {
 			item, itemAttr, err := h.Store.LookupOpen(handle, entry.Name)
 			switch {
-			case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
+			case errors.Is(err, syscall.ENOENT), errors.Is(err, syscall.EAGAIN), errors.Is(err, xfsstore.ErrStaleObject):
 				h.forgetDirectoryCandidates(candidates)
 				return nil, false, true, nil
 			case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
@@ -2187,7 +2220,8 @@ func (h *VolumeHandler) constructDirectoryPage(
 		}
 		if candidate.item != (xfsstore.Capability{}) {
 			dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, ^uint64(0))
-			if wantItems {
+			dirent.StableIdentity = append([]byte(nil), candidate.identity[:]...)
+			if _, held := heldIdentities[candidate.identity]; wantItems && !held {
 				dirent.Item = itemProto(candidate.item, candidate.attr, candidate.identity)
 			}
 		}
@@ -2203,6 +2237,28 @@ func (h *VolumeHandler) constructDirectoryPage(
 		candidates = append(candidates, candidate)
 	}
 	return candidates, false, false, nil
+}
+
+func heldDirectoryIdentities(request *authoritypb.ReadDirRequest) (map[[16]byte]struct{}, error) {
+	held := request.GetHeldIdentities()
+	if len(held) == 0 {
+		return nil, nil
+	}
+	if !request.GetWantItems() || len(held) > MaxReadDirHeldIdentities {
+		return nil, syscall.EINVAL
+	}
+	result := make(map[[16]byte]struct{}, len(held))
+	var previous []byte
+	for _, raw := range held {
+		if len(raw) != 16 || (previous != nil && bytes.Compare(previous, raw) >= 0) {
+			return nil, syscall.EINVAL
+		}
+		var identity [16]byte
+		copy(identity[:], raw)
+		result[identity] = struct{}{}
+		previous = raw
+	}
+	return result, nil
 }
 
 func sameDirectoryEnumeration(left, right []xfsstore.Dirent) bool {

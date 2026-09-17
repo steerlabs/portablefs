@@ -48,6 +48,7 @@ func (r *rawFileSystem) invalidateCacheCoordinatesContext(ctx context.Context, w
 		coordinate := w.coordinate
 		switch coordinate.kind {
 		case publicationNamespaceName:
+			r.dropDirectoryPageHintsLocked(coordinate.parent)
 			r.dropCompleteDirectoryLocked(coordinate.parent)
 			parent := r.byIdentityLocked(coordinate.parent)
 			if parent == nil {
@@ -61,6 +62,7 @@ func (r *rawFileSystem) invalidateCacheCoordinatesContext(ctx context.Context, w
 				reclaim = append(reclaim, token)
 			}
 		case publicationItemEnumeration:
+			r.dropDirectoryPageHintsLocked(coordinate.item)
 			r.dropCompleteDirectoryLocked(coordinate.item)
 			enumerations[coordinate.item] = struct{}{}
 		case publicationItemAttributes, publicationItemData:
