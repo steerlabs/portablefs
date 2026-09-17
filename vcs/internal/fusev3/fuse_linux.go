@@ -56,6 +56,7 @@ const (
 	// could be configured out of proportion with it.
 	reclaimLaneDivisor = 4
 	reclaimBatchDelay  = 50 * time.Millisecond
+	reclaimRetryDelay  = 100 * time.Millisecond
 
 	// livenessReserve is the number of authority in-flight slots that only
 	// session keepalive may occupy.
@@ -799,13 +800,18 @@ func (m *Mount) watchSession(ctx context.Context, done <-chan struct{}) {
 // independent of how saturated ordinary filesystem I/O is.
 func (m *Mount) reclaimLoop(ctx context.Context) {
 	defer m.wg.Done()
+	rpc, ok := m.rpc.(*epochRPC)
+	if !ok {
+		m.recordFatalCause(errors.New("fusev3: reclaim worker requires the epoch RPC facade"))
+		return
+	}
 	for {
 		batch, ok := m.reclaim.popBatch(ctx, authorityrpc.MaxReclaimBatch)
 		if !ok {
 			return
 		}
 		transport := batch[0].transport
-		if transport != m.rpc.(*epochRPC).current() {
+		if transport != rpc.current() {
 			continue
 		}
 		// Background cleanup has no syscall deadline. Retain its replay slot
@@ -824,7 +830,7 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 			}
 			return
 		}
-		if transport != m.rpc.(*epochRPC).current() ||
+		if transport != rpc.current() ||
 			errors.Is(transport.SessionEndCause(), authorityrpc.ErrAuthorityChanged) ||
 			errors.Is(err, authorityrpc.ErrAuthorityChanged) {
 			if consumption != nil {
@@ -847,7 +853,19 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 				if waitErr := m.subscription.waitActive(ctx); waitErr != nil {
 					return
 				}
-				if transport == m.rpc.(*epochRPC).current() {
+				timer := time.NewTimer(reclaimRetryDelay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				}
+				if transport == rpc.current() {
 					for _, entry := range batch {
 						m.reclaim.push(entry)
 					}
