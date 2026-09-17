@@ -534,6 +534,21 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				roles uint32
 			}{parent, postStateRoleParent},
 		)}, nil
+	case request.GetLink() != nil:
+		link := request.GetLink()
+		linked := f.itemForTokenLocked(link.GetExistingItem())
+		linked.Attr.Nlink++
+		parent := f.itemForTokenLocked(link.GetNewParent())
+		if f.byName != nil {
+			f.byName[string(link.GetNewName())] = linked
+		}
+		return &authoritypb.Response{PostState: exactTestPostState(2, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{linked, postStateRoleTarget}, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{parent, postStateRoleParent}), Body: &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: cloneItem(linked)}}}, nil
 	case request.GetRename() != nil:
 		rename := request.GetRename()
 		moved := f.itemForTokenLocked(nil)

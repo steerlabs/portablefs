@@ -1241,3 +1241,13 @@ matrix (`/tmp/cv2-g2-c8.log`). An overlay omitting the permanent-refusal loss
 transition makes both rows fail (`/tmp/cv2-g2-c8-fault.log`). Existing production
 behavior was correct; this distinguishes coherence refusal from C1's recoverable
 capacity refusal. Linux binaries ran in the pinned Docker image.
+
+### C9: namespace dependencies cover unlink, link, and evicted bindings
+
+The F4 regression now covers rename, unlink, hard link, and unlink after eviction
+of the daemon name binding. Each requires the buffered WRITE before the namespace
+mutation; the evicted row additionally requires the fallback LOOKUP before WRITE.
+The existing runtime passes (`/tmp/cv2-g2-c9.log`). An overlay bypassing
+flushNamespaceDependencies fails all four rows (`/tmp/cv2-g2-c9-fault.log`). Both
+Linux binaries ran in the pinned Docker image with
+`-test.run '^TestV7F4RenameFlushesBeforeMutation$'`.

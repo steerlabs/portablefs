@@ -5,6 +5,7 @@ package fusev3
 import (
 	"bytes"
 	"context"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -78,31 +79,64 @@ func TestV7FullWriteHolderReadAndGetattr(t *testing.T) {
 }
 
 func TestV7F4RenameFlushesBeforeMutation(t *testing.T) {
-	f := newStrictFixture(t)
-	entry := f.lookup(t, 1, "before")
-	opened := openV7Writer(t, f, entry.NodeId)
-	writeV7(t, f, entry.NodeId, opened.Fh, 0, []byte("dirty"))
-	var mu sync.Mutex
-	var order []string
-	f.rpc.mu.Lock()
-	f.rpc.hook = func(request *authoritypb.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		if request.GetWrite() != nil {
-			order = append(order, "write")
-		}
-		if request.GetRename() != nil {
-			order = append(order, "rename")
-		}
-	}
-	f.rpc.mu.Unlock()
-	if status := f.rename(1, 1, "before", "after", 0); status != fuse.OK {
-		t.Fatalf("rename: %v", status)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(order) != 2 || order[0] != "write" || order[1] != "rename" {
-		t.Fatalf("dependency order: %v", order)
+	for _, kind := range []string{"rename", "unlink", "link", "evicted-unlink"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newStrictFixture(t)
+			entry := f.lookup(t, 1, "before")
+			opened := openV7Writer(t, f, entry.NodeId)
+			writeV7(t, f, entry.NodeId, opened.Fh, 0, []byte("dirty"))
+			if kind == "evicted-unlink" {
+				f.raw.mu.Lock()
+				parent := f.raw.nodesByID[1]
+				f.raw.dropCachedNameLocked(nameKey{parent: parent.key.inode, name: "before"})
+				f.raw.mu.Unlock()
+			}
+			var mu sync.Mutex
+			var order []string
+			f.rpc.mu.Lock()
+			f.rpc.hook = func(request *authoritypb.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case request.GetWrite() != nil:
+					order = append(order, "write")
+				case request.GetRename() != nil:
+					order = append(order, "rename")
+				case request.GetUnlink() != nil:
+					order = append(order, "unlink")
+				case request.GetLink() != nil:
+					order = append(order, "link")
+				case request.GetLookup() != nil && kind == "evicted-unlink":
+					order = append(order, "lookup")
+				}
+			}
+			f.rpc.mu.Unlock()
+			var status fuse.Status
+			switch kind {
+			case "rename":
+				status = f.rename(1, 1, "before", "after", 0)
+			case "unlink", "evicted-unlink":
+				status = f.rawCall(func(unique uint64) fuse.Status {
+					return f.raw.Unlink(nil, &fuse.InHeader{Unique: unique, NodeId: 1}, "before")
+				})
+			case "link":
+				status = f.rawCall(func(unique uint64) fuse.Status {
+					return f.raw.Link(nil, &fuse.LinkIn{InHeader: fuse.InHeader{Unique: unique, NodeId: 1}, Oldnodeid: entry.NodeId}, "after", &fuse.EntryOut{})
+				})
+			}
+			if status != fuse.OK {
+				t.Fatalf("namespace operation=%v", status)
+			}
+			want := []string{"write", kind}
+			if kind == "evicted-unlink" {
+				want = []string{"lookup", "write", "unlink"}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if !slices.Equal(order, want) {
+				t.Fatalf("dependency order=%v, want %v", order, want)
+			}
+		})
 	}
 }
 
