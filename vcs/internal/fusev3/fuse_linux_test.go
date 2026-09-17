@@ -1160,6 +1160,8 @@ func TestReclaimQueueFlushesAtWatermarkWithoutMixingEpochs(t *testing.T) {
 func TestCancelledShutdownIsNotReportedAsFailure(t *testing.T) {
 	mount, rpc := testMount(t, 64)
 	rpc.block = make(chan struct{})
+	consumption := &recordingResponseConsumption{}
+	rpc.retainedConsumption = consumption
 	mount.start(time.Hour)
 	for id := uint64(1); id <= 8; id++ {
 		mount.deferReclaim(testToken(id))
@@ -1174,6 +1176,9 @@ func TestCancelledShutdownIsNotReportedAsFailure(t *testing.T) {
 	}
 	if err := mount.fatalError(); err != nil {
 		t.Fatalf("shutdown recorded a fatal error: %v", err)
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("cancelled reclaim response consumption = %d, want 1", got)
 	}
 }
 

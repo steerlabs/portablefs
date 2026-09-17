@@ -820,7 +820,6 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 		)
 		if ctx.Err() != nil {
 			if consumption != nil {
-				m.revoke(errors.New("fusev3: mount ended before an authority reclaim response was consumed"))
 				consumption.Consume()
 			}
 			return
