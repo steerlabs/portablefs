@@ -1129,6 +1129,8 @@ func (h *countingHandler) count(kind string) int {
 // coherence.
 func requestKind(request *authoritypb.Request) string {
 	switch {
+	case request.GetBarrier() != nil:
+		return "barrier"
 	case request.GetLookup() != nil:
 		return "lookup"
 	case request.GetGetAttr() != nil:

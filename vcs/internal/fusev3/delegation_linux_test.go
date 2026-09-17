@@ -1607,3 +1607,58 @@ func TestDelegationCoherenceRejectionLosesGrantAndAdvancesLoss(t *testing.T) {
 		})
 	}
 }
+
+func TestDelegationDurabilityFallbackIsRateLimitedAndPrefersReplies(t *testing.T) {
+	start := time.Unix(100, 0)
+	var fallback durabilityFallback
+	if fallback.due(start, 0, 0) {
+		t.Fatal("clean buffer requested fallback")
+	}
+	if !fallback.due(start, 1, 0) {
+		t.Fatal("first stalled cut could not progress")
+	}
+	for i := 1; i <= 1000; i++ {
+		if fallback.due(start.Add(time.Duration(i)*time.Microsecond), uint64(i+1), 0) {
+			t.Fatal("application burst requested another Barrier inside one second")
+		}
+	}
+	if !fallback.due(start.Add(time.Second), 1001, 0) {
+		t.Fatal("stalled prefix did not retry after one second")
+	}
+	if fallback.due(start.Add(2*time.Second), 1001, 500) {
+		t.Fatal("reply prefix progress triggered fallback")
+	}
+	if fallback.due(start.Add(2500*time.Millisecond), 1001, 500) {
+		t.Fatal("fallback ignored recent reply progress")
+	}
+	if !fallback.due(start.Add(3*time.Second), 1001, 500) {
+		t.Fatal("remaining nondurable entries stopped progressing")
+	}
+	if fallback.due(start.Add(4*time.Second), 1001, 1001) {
+		t.Fatal("durable prefix requested fallback")
+	}
+}
+
+func TestDelegationThousandAppliedWritesDoNotIssuePerFileBarriers(t *testing.T) {
+	fake := &delegationFakeRPC{}
+	m := newDelegationTestManager(t, fake)
+	id := installDelegationForTest(t, m, 111, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	started := time.Now()
+	for i := 0; i < 1000; i++ {
+		if _, err := m.Write(t.Context(), id, int64(i), []byte{1}, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.FlushIdentity(t.Context(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake.mu.Lock()
+	barriers := fake.barriers
+	fake.mu.Unlock()
+	// The elapsed-time bound remains valid on slow CI hosts; the policy test
+	// above proves the interval without relying on scheduler speed.
+	limit := 1 + int(time.Since(started)/durabilityFallbackInterval)
+	if barriers > limit {
+		t.Fatalf("1000 applied writes issued %d Barriers, rate limit=%d", barriers, limit)
+	}
+}

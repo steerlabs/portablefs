@@ -734,10 +734,36 @@ func (m *delegationManager) durableForBuffer(buffer *writeback.Buffer, sequence 
 	m.tokenMu.Unlock()
 }
 
+const durabilityFallbackInterval = time.Second
+
+// Reply-carried prefixes retire entries immediately. The fallback is only for
+// a stalled nondurable prefix; bursts of application kicks cannot turn it into
+// a volume syncfs per file. The first stalled cut can make progress immediately.
+type durabilityFallback struct {
+	durable     uint64
+	lastAttempt time.Time
+	quietUntil  time.Time
+}
+
+func (f *durabilityFallback) due(now time.Time, applied, durable uint64) bool {
+	if durable > f.durable {
+		f.durable = durable
+		f.quietUntil = now.Add(durabilityFallbackInterval)
+		return false
+	}
+	if applied <= durable || now.Before(f.quietUntil) || !f.lastAttempt.IsZero() && now.Sub(f.lastAttempt) < durabilityFallbackInterval {
+		return false
+	}
+	f.lastAttempt = now
+	return true
+}
+
 func (m *delegationManager) durabilityLoop() {
 	defer m.workerWG.Done()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	var fallback durabilityFallback
+	var fallbackBuffer *writeback.Buffer
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -745,7 +771,18 @@ func (m *delegationManager) durabilityLoop() {
 		case <-m.durableKick:
 		case <-ticker.C:
 		}
-		m.advanceDurability()
+		m.durabilityMu.Lock()
+		applied, durable, buffer := m.appliedHigh, m.durableHigh, m.durableBuffer
+		m.durabilityMu.Unlock()
+		if fallbackBuffer != buffer {
+			fallback, fallbackBuffer = durabilityFallback{}, buffer
+		}
+		if fallback.due(time.Now(), applied, durable) {
+			m.advanceDurability()
+			m.durabilityMu.Lock()
+			fallback.durable = m.durableHigh
+			m.durabilityMu.Unlock()
+		}
 	}
 }
 

@@ -619,3 +619,23 @@ func TestCreateUsesSubscribedNegativeWithoutLookupRPC(t *testing.T) {
 		t.Fatalf("CREATE with subscribed negative issued %d LOOKUP RPCs", delta)
 	}
 }
+
+func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	barrier := mustOpenFile(t, f.mountPath(0), os.O_RDONLY, 0)
+	defer barrier.Close()
+	before := f.counter.count("barrier")
+	for i := 0; i < 1000; i++ {
+		if err := os.WriteFile(f.join(0, fmt.Sprintf("install-%04d", i)), []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := barrier.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	count := f.counter.count("barrier") - before
+	if count < 1 || count > 8 {
+		t.Fatalf("1000-file install issued %d Barriers, want 1 through 8 including explicit completion", count)
+	}
+	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d", count)
+}

@@ -1348,3 +1348,29 @@ prefix is missing (`/tmp/cv2-g2-profile-before.log`) and passes with the unified
 path (`/tmp/cv2-g2-profile.log`). The wrapper passes bash syntax validation and
 the profile analysis script compiles. profiles.md distinguishes the historical
 measurement from the replacement command.
+
+### Part 2 item 0a: amortize fallback durability barriers
+
+WRITE and FSYNC reply prefixes still retire retained entries immediately. The
+fallback pump now caps Barrier attempts at one per second and defers them for a
+second after observing reply-carried prefix progress. A first stalled cut may
+advance immediately; application kicks thereafter cannot trigger per-file
+syncfs. Epoch buffer replacement resets the fallback observation. The pump's
+short timer only checks this constant-time policy; it does not scan retained
+entries or issue a Barrier on every tick.
+
+The deterministic policy test covers clean buffers, a thousand application
+kicks, stalled retry, reply progress, and complete durability. The real flush
+burst passes; an overlay restoring unconditional per-kick Barrier dispatch
+fails with six Barriers inside the one-second limit
+(`/tmp/cv2-g2-durable-fault.log`). All delegation tests pass with their existing
+liveness deadlines (`/tmp/cv2-g2-durable.log`). The required mounted 1,000-file
+install also passes its at-most-eight-Barrier assertion
+(`/tmp/cv2-g2-durable-mounted.log`); the focused wrapper exits 70 only for omitted
+inventory. Explicit completion barriers remain independent of this fallback cap.
+
+The first mounted counter sample was invalid: the integration classifier folded
+Barrier into `other`. The classifier now names Barrier, and the test also
+requires at least the explicit completion Barrier so a missing counter cannot
+pass. The corrected run observes seven Barriers for 1,000 files in 5.36 seconds
+(`/tmp/cv2-g2-durable-mounted2.log`).
