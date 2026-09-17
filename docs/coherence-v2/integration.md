@@ -978,3 +978,23 @@ handler test refuses malformed lengths before any enumeration call.
 bash scripts/xfs-fuse-integration.sh` passes every selected test with no selected
 skip, including deep-cookie seeks and concurrent directory mutation. Exit 70
 reports only unselected full-suite inventory. Log: `/tmp/cv2-g2-r5.log`.
+
+### R6: concurrent truncating opens and peer withdrawal
+
+The new real-kernel test
+`TestConcurrentTruncatingOpensDoNotBlockReservedGrantWithdrawal` holds a peer's
+cached read descriptor, pauses its returned InodeNotify after storage size
+reaches zero, and starts two truncating opens on the source mount. While the
+withdrawal acknowledgment is withheld, the peer must read EOF promptly and
+neither OPEN may complete. Both finish after release, with unchanged subscription
+incarnations, no loss advance, and size zero. The notifier's storage-size check
+separates pre-apply reservation invalidation from the post-apply interval under
+test; the initial test draft incorrectly assumed the first notification implied
+storage application.
+
+No production lock change was required. The acquire lock serializes local OPEN
+installation; CONTROL does not take it. The unreported grant stays reserved
+through withdrawal, allowing the peer read without a break against an OPEN reply
+the holder has not received. Ten repetitions pass in the privileged suite with
+`PORTABLEFS_GO_TEST_FLAGS='-run ^TestConcurrentTruncatingOpensDoNotBlockReservedGrantWithdrawal$ -count=10'`.
+Log `/tmp/cv2-g2-r6-postapply.log`; wrapper exit 70 is unselected inventory.
