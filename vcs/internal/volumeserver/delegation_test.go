@@ -94,12 +94,18 @@ func cv2CutAck(t *testing.T, c *CoherenceCoordinator, token SubscriptionToken, e
 }
 
 func TestCoherenceDelegationCacheModes(t *testing.T) {
-	for _, peerHandles := range []int{0, 1, 3} {
-		t.Run(string(rune('0'+peerHandles)), func(t *testing.T) {
+	for _, test := range []struct{ holderHandles, peerHandles int }{{0, 0}, {0, 1}, {0, 3}, {1, 0}, {3, 0}, {3, 1}} {
+		peerHandles := test.peerHandles
+		t.Run(fmt.Sprintf("holder=%d/peer=%d", test.holderHandles, peerHandles), func(t *testing.T) {
 			c, _ := cv2Coordinator(t)
 			a := cv2Subscribe(t, c, 1)
 			b := cv2Subscribe(t, c, 2)
 			f := [16]byte{9}
+			for range test.holderHandles {
+				if ok, err := c.OpenCacheCapable(a, f); !ok || err != nil {
+					t.Fatalf("holder open = %v %v", ok, err)
+				}
+			}
 			for range peerHandles {
 				if ok, err := c.OpenCacheCapable(b, f); !ok || err != nil {
 					t.Fatalf("open = %v %v", ok, err)
@@ -143,6 +149,11 @@ func TestCoherenceDelegationCacheModes(t *testing.T) {
 			}
 			if _, ok := c.LookupDelegation(f); ok {
 				t.Fatal("released grant retained")
+			}
+			for range test.holderHandles {
+				if err := c.CloseCacheCapable(a, f); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if ok, err := c.OpenCacheCapable(b, f); !ok || err != nil {
 				t.Fatalf("released open=%v %v", ok, err)

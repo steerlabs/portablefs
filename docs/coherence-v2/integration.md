@@ -1210,3 +1210,14 @@ overlay that bypasses BeginSynchronousMutation makes all three rows fail because
 no recall is emitted (`/tmp/cv2-g2-c5-fault.log`); the repository runtime was not
 modified for that counterexample. Both binaries ran with
 `-test.run '^TestCoherenceMutationsRecallPeerDelegationBeforeStorage$' -test.v`.
+
+### C6: holder cache handles do not force writethrough
+
+The cache-mode table now includes one and three holder-owned cache-capable
+handles with no peer handles, plus a mixed holder/peer row. Holder-only grants
+must remain FULL; peer handles still require WRITETHROUGH and closing the last
+peer still upgrades only after the holder acknowledges. Existing runtime logic
+is correct. The native table passes 20 repetitions (`/tmp/cv2-g2-c6.log`). A Go
+overlay replacing the holder-subtracted count with the total count fails both
+holder-only rows and the mixed-row upgrade (`/tmp/cv2-g2-c6-fault.log`). Command:
+`go -C vcs test ./internal/volumeserver -run '^TestCoherenceDelegationCacheModes$' -count=20`.
