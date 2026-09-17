@@ -361,6 +361,13 @@ func TestReadDirPlusReclaimsDiscardedPageBeforeFetchingAgain(t *testing.T) {
 	defer raw.releaseHandleOperation(held)
 	ctx, finish := testMutationContext(t, mount)
 	defer finish(false)
+	cursor, errno := handle.beginDirPlus(ctx, 0)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	if err := raw.attachDirPlusLookupTransaction(ctx, cursor, held); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, errno := handle.peek(ctx, true); errno != 0 {
 		t.Fatal(errno)
 	}
