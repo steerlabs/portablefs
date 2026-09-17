@@ -766,3 +766,28 @@ func TestControlCompletionReceiptWaitsForEveryEarlierHandler(t *testing.T) {
 		t.Fatalf("completion retained history: %+v", queue)
 	}
 }
+
+func TestNamespaceWithdrawalRequiresReturnedEntryNotify(t *testing.T) {
+	fixture := newStrictFixture(t)
+	root := fixture.raw.acquire(1)
+	defer fixture.raw.release(root)
+	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: root.identity, name: "absent"}
+	key := nameKey{parent: root.key.inode, name: coordinate.name}
+	fixture.raw.mu.Lock()
+	fixture.raw.bindCachedNegativeLocked(key, fixture.mount.subscription.stamp())
+	fixture.raw.mu.Unlock()
+	fixture.notify.entryST = fuse.EIO
+	if err := fixture.raw.invalidateCacheCoordinateContext(context.Background(), coordinate, nil); err == nil {
+		t.Fatal("withdrawal succeeded without returned EntryNotify")
+	}
+	fixture.notify.mu.Lock()
+	calls := len(fixture.notify.calls)
+	fixture.notify.entryST = fuse.OK
+	fixture.notify.mu.Unlock()
+	if calls == 0 {
+		t.Fatal("withdrawal never issued EntryNotify")
+	}
+	if err := fixture.raw.invalidateCacheCoordinateContext(context.Background(), coordinate, nil); err != nil {
+		t.Fatal(err)
+	}
+}

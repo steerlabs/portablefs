@@ -806,3 +806,78 @@ bound returns ErrTransportUncertain without inventing a session verdict.
 50 ms deadline and listener-gap same/new-epoch tests pass. Exact command:
 `go -C vcs test ./internal/authorityrpc -run '^Test(ReconnectUnavailableListenerHonorsCallerDeadline|ReconnectSurvivesListenerGapBeforeEpochVerdict|IdleLinuxControlLossResumesWithoutEndingSession)$' -count=1`.
 Logs: `/tmp/cv2-g2-r2-before.log`, `/tmp/cv2-g2-r2-after.log`.
+
+### R3: restored F10; namespace-lock cycle blocks qualification
+
+Restored F10 verbatim from `coherence-v2:docs/coherence-v2/design.md` and
+removed the conflicting zero-entry-validity exception from the subscription,
+wire and client descriptions. Namespace withdrawal now requires returned
+EntryNotify; attribute/data withdrawal retains InodeNotify. The new
+`TestNamespaceWithdrawalRequiresReturnedEntryNotify` fails without the change
+and passes with it, including a refused notification followed by a successful
+retry after the daemon binding has already gone.
+
+`TestKernelEntryInvalidationProof` keeps a positive dentry in use through an
+open fd with one-hour entry and attribute validity. Removing the daemon
+binding alone leaves stat cached; returned EntryNotify forces exactly one
+new LOOKUP and observes ENOENT. The shipping kernel proves that mechanism.
+`TestKernelEntryNotifyWaitsForNamespaceCallback` separately holds a CREATE
+callback open, then notifies another name in that same parent. The notification
+cannot finish until the CREATE callback returns. No PortableFS coordinator,
+transport or daemon lock participates in this second proof.
+
+This is a blocking conflict with the existing acknowledgment ordering. A
+namespace syscall acquires the kernel parent lock before reaching the daemon.
+A peer commit waits for this mount's withdrawal acknowledgment, but EntryNotify
+needs that same parent lock. If the held syscall needs the peer's completion,
+none can finish until the subscription horizon. Moving a daemon acquire lock
+or dispatching the notification on another goroutine cannot release the VFS lock.
+Linux 6.8 `fuse_reverse_inval_entry` takes `inode_lock_nested(parent,
+I_MUTEX_PARENT)` before looking up or expiring the dentry; FUSE_EXPIRE_ONLY
+still takes it. See the [kernel implementation](https://github.com/torvalds/linux/blob/v6.8/fs/fuse/dir.c#L1254).
+
+The unchanged `TestMutationPostStateEliminatesFollowupMetadataRPCs` reproduces
+this conflict: same-name CREATE takes 10.005831796 s in the focused run and
+10.002519301 s in the full suite, exceeding its two-second bound and expiring
+a subscription. The assertion remains unchanged. The full matrix also fails
+its stale-view control after transport termination; this is a failed gate,
+not an expected negative-control result.
+
+Commands and evidence:
+
+- `PORTABLEFS_GO_TEST_FLAGS='-run ^Test(NamespaceWithdrawalRequiresReturnedEntryNotify|KernelEntryInvalidationProof)$' bash scripts/xfs-fuse-integration.sh`: before restoration, the namespace proof fails; kernel entry proof passes. Log `/tmp/cv2-g2-r3-before.log`.
+- `PORTABLEFS_GO_TEST_FLAGS='-run ^Test(NamespaceWithdrawalRequiresReturnedEntryNotify|KernelEntryInvalidationProof|MutationPostStateEliminatesFollowupMetadataRPCs)$' bash scripts/xfs-fuse-integration.sh`: fails the existing CREATE timing assertion. Log `/tmp/cv2-g2-r3-after.log`.
+- `PORTABLEFS_GO_TEST_FLAGS='-run ^Test(KernelEntryInvalidationProof|KernelEntryNotifyWaitsForNamespaceCallback|NamespaceWithdrawalRequiresReturnedEntryNotify|Subscription|ColdSubscription)' bash scripts/xfs-fuse-integration.sh`: all selected proofs/subscription tests pass; wrapper exits 70 for unselected required inventory. Log `/tmp/cv2-g2-r3-proofs.log`.
+- `bash scripts/xfs-fuse-integration.sh`: exit 1 at the unchanged CREATE timing assertion. Log `/tmp/cv2-g2-xfs-full.log`.
+- `bash scripts/coherence-matrix-linux.sh`: exits 71 in its stale-view control, including unexpected cached-handle and peer-loss results after mount transport termination. Log `/tmp/cv2-g2-matrix.log`.
+
+G2 is **incomplete and not merge-ready**. R1 and R2 have passing focused
+regressions; R3 restores the requested contract but demonstrates an unresolved
+kernel/protocol ordering conflict. R4–R10, the initiator-gate follow-up, C1–C11,
+and Part 2 remain unimplemented. No G2 workload measurements or speedup claims
+are made, and no existing test has been weakened. The next implementation must
+resolve the parent-lock cycle while retaining returned EntryNotify before ACK,
+before enabling nonzero kernel lifetimes or claiming full-gate completion.
+
+`bash scripts/verify-local.sh --full` exits 1 on the same unchanged CREATE
+regression after 72.889 seconds in fusev3. Before that failure it passes the
+Darwin Foundation/cgo and static Linux builds/vet, vulnerability check, native
+Go and race suites, physical-reply seam, all 345 enumerated Swift tests,
+release-trust policy and architecture/contract scans. Its embedded matrix does
+not run because XFS/FUSE failed; the separate matrix result above supplies that
+attempt. Full log: `/tmp/cv2-g2-verify-full.log`.
+
+G2 exposes no new wire or cross-workstream interface. Changed paths are
+`vcs/internal/authorityrpc/{client_transport.go,client_restart_test.go}`,
+`vcs/internal/fusev3/{control_horizon_linux_test.go,integration_support_linux_test.go,subscription_linux.go,subscription_linux_test.go,kernel_invalidation_proof_linux_test.go,kernel_namespace_lock_proof_linux_test.go}`,
+and `docs/coherence-v2/{design.md,wire.md,client.md,integration.md}`.
+
+| Measured regression observation | Before | After |
+| --- | --- | --- |
+| Background reconnect to an unavailable listener | Still waiting at 11 s; regression fails | Returns ErrTransportUncertain at the 10 s internal bound |
+| CONTROL-only horizon, positive/negative name notifications | Both missing; regression fails | Every snapshotted name/inode notified; test passes in 10.02 s |
+| Namespace withdrawal with failed EntryNotify | Incorrect success | Error; successful notification retry then succeeds |
+| Same-name CREATE with restored EntryNotify | G's zero-validity implementation qualified by run 156; no new G2 baseline timing | 10.006 s focused, 10.003 s standalone full suite; unchanged <2 s requirement fails |
+
+These observations measure regressions, not install or Git performance. Part 2
+has not begun, so results.md and docs/performance.md retain G's measurements.
