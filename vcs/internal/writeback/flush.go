@@ -222,6 +222,20 @@ func (b *Buffer) targets(cut Cut) []Identity {
 // FlushAll flushes the cut concurrently across identities, retaining per-file
 // order, using a bounded worker pool. It visits every target even if one fails.
 func (b *Buffer) FlushAll(ctx context.Context, cut Cut) (uint64, error) {
+	return b.flushAll(ctx, cut, true)
+}
+
+// FlushBarrier flushes exactly the registered barrier prefix. A loss caused by
+// work admitted after that prefix is not an error for this operation; the
+// barrier tracker still records any drop that contained a prefix entry.
+func (b *Buffer) FlushBarrier(ctx context.Context, barrier BarrierCut) (uint64, error) {
+	if barrier.state == nil {
+		return 0, ErrInvalid
+	}
+	return b.flushAll(ctx, barrier.Cut, false)
+}
+
+func (b *Buffer) flushAll(ctx context.Context, cut Cut, includeLaterLoss bool) (uint64, error) {
 	ids := b.targets(cut)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -255,7 +269,7 @@ func (b *Buffer) FlushAll(ctx context.Context, cut Cut) (uint64, error) {
 	b.mu.Lock()
 	lost := b.loss > cut.LossSequence
 	b.mu.Unlock()
-	if first == nil && lost {
+	if first == nil && includeLaterLoss && lost {
 		first = ErrLost
 	}
 	return seq, first
@@ -435,11 +449,42 @@ func (b *Buffer) Fsync(ctx context.Context, id Identity) error {
 	}
 	return b.waitDurable(ctx, &id, cut)
 }
-func (b *Buffer) Barrier(ctx context.Context, observedLoss uint64) (bool, error) {
-	cut := b.Snapshot()
-	_, err := b.FlushAll(ctx, cut)
-	if err == nil {
-		err = b.waitDurable(ctx, nil, cut)
+func (b *Buffer) WaitBarrier(ctx context.Context, barrier BarrierCut) (bool, error) {
+	if barrier.state == nil {
+		return false, ErrInvalid
 	}
-	return b.LossSequence() > observedLoss, err
+	defer b.EndBarrier(barrier)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for {
+		if barrier.state.lost {
+			if barrier.state.generic {
+				return true, nil
+			}
+			if barrier.state.errno != 0 {
+				return true, barrier.state.errno
+			}
+			return true, nil
+		}
+		pending := false
+		for _, f := range b.active {
+			if f.head != nil && f.head.seq <= barrier.Sequence {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return false, nil
+		}
+		if b.stopped {
+			return false, ErrLost
+		}
+		ch := b.change()
+		b.mu.Unlock()
+		err := wait(ctx, ch)
+		b.mu.Lock()
+		if err != nil {
+			return false, err
+		}
+	}
 }

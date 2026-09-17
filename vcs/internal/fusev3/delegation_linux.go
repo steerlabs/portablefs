@@ -823,24 +823,32 @@ func (m *delegationManager) visibleForBuffer(buffer *writeback.Buffer, sequence 
 }
 
 func (m *delegationManager) waitVisibility(ctx context.Context, buffer *writeback.Buffer, id writeback.Identity, cut writeback.Cut, applied uint64) error {
+	visible, err := m.visibilityCompletion(ctx, applied)
+	if err != nil {
+		return err
+	}
+	m.visibleForBuffer(buffer, visible)
+	return buffer.WaitVisible(ctx, id, cut)
+}
+
+func (m *delegationManager) visibilityCompletion(ctx context.Context, applied uint64) (uint64, error) {
 	if applied == 0 {
-		return errors.New("fusev3: visibility wait has no application ticket")
+		return 0, errors.New("fusev3: visibility wait has no application ticket")
 	}
 	response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{
 		WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: applied},
 	}})
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := successfulDelegationResponse(response); err != nil {
-		return err
+		return 0, err
 	}
 	reply := response.GetWaitVisibility()
 	if reply == nil || reply.GetAppliedSequence() < reply.GetVisibleSequence() || reply.GetVisibleSequence() < applied || response.GetVisibleSequence() != reply.GetVisibleSequence() {
-		return errors.New("fusev3: malformed visibility completion reply")
+		return 0, errors.New("fusev3: malformed visibility completion reply")
 	}
-	m.visibleForBuffer(buffer, reply.GetVisibleSequence())
-	return buffer.WaitVisible(ctx, id, cut)
+	return reply.GetVisibleSequence(), nil
 }
 
 const durabilityFallbackInterval = time.Second
@@ -906,14 +914,21 @@ func (m *delegationManager) advanceDurability() {
 	}
 	ctx, cancel := context.WithTimeout(m.ctx, m.timeout)
 	response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{CutSequence: cut}}})
-	cancel()
 	if err != nil || successfulDelegationResponse(response) != nil {
+		cancel()
 		return
 	}
 	reply := response.GetBarrier()
 	if reply == nil || reply.GetAppliedSequence() < reply.GetDurableSequence() || reply.GetDurableSequence() < cut {
+		cancel()
 		return
 	}
+	visible, err := m.visibilityCompletion(ctx, cut)
+	cancel()
+	if err != nil {
+		return
+	}
+	m.visibleForBuffer(buffer, visible)
 	m.durableForBuffer(buffer, reply.GetDurableSequence())
 }
 
@@ -1324,21 +1339,28 @@ func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly
 }
 
 // Barrier implements the root-directory completion barrier. Admission is
-// briefly fenced because Buffer's public durability waiter captures its own
-// cut; the fence makes that cut identical to the ticket sent on the wire.
+// fenced only while the local cut and the already-applied ticket floor are
+// captured. Flush, remote visibility and durability do not block later work.
 func (m *delegationManager) Barrier(ctx context.Context, observedLoss uint64) error {
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	m.frontend.Lock()
-	defer m.frontend.Unlock()
-	cut := m.buf.Snapshot()
-	applied, err := m.buf.FlushAll(ctx, cut)
+	barrier := m.buf.BeginBarrier(observedLoss)
+	m.durabilityMu.Lock()
+	appliedFloor := m.appliedHigh
+	m.durabilityMu.Unlock()
+	m.frontend.Unlock()
+	completed := false
+	defer func() {
+		if !completed {
+			m.buf.EndBarrier(barrier)
+		}
+	}()
+	applied, err := m.buf.FlushBarrier(ctx, barrier)
 	if err != nil {
 		return err
 	}
-	m.durabilityMu.Lock()
-	applied = max(applied, m.appliedHigh)
-	m.durabilityMu.Unlock()
+	applied = max(applied, appliedFloor)
 	response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{CutSequence: applied}}})
 	if err != nil {
 		return err
@@ -1351,14 +1373,20 @@ func (m *delegationManager) Barrier(ctx context.Context, observedLoss uint64) er
 		return errors.New("fusev3: malformed barrier reply")
 	}
 	m.durableCurrent(reply.GetDurableSequence())
-	lost, err := m.buf.Barrier(ctx, observedLoss)
+	if applied != 0 {
+		var visible uint64
+		visible, err = m.visibilityCompletion(ctx, applied)
+		if err != nil {
+			return err
+		}
+		m.visibleForBuffer(m.buf, visible)
+	}
+	lost, err := m.buf.WaitBarrier(ctx, barrier)
+	completed = true
 	if err != nil {
 		return err
 	}
 	if lost {
-		if errno := m.buf.ErrnoSince(observedLoss); errno != 0 {
-			return errno
-		}
 		return writeback.ErrLost
 	}
 	return nil

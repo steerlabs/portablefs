@@ -61,6 +61,14 @@ type Cut struct {
 	LossSequence uint64
 }
 
+// BarrierCut retains the exact accepted and loss prefixes observed while
+// admission was fenced. It must be released after the barrier completes or
+// aborts so later loss accounting no longer needs to update it.
+type BarrierCut struct {
+	Cut
+	state *barrierState
+}
+
 // WriteOptions preserves transport ownership and privilege effects across buffering.
 // Flags is opaque to the buffer. KillPrivileges describes the corresponding
 // relative mode change for the local overlay; later chmod records still win.

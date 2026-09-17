@@ -573,6 +573,7 @@ func TestDelegationRecallAcknowledgesBeforeDurability(t *testing.T) {
 	if err != nil || string(got) != "new" {
 		t.Fatalf("retired overlay still serves reads: %q %v", got, err)
 	}
+	m.VisibleSequence(1)
 	m.durableCurrent(1)
 	if stats := m.buf.Stats(); stats.Entries != 0 || stats.Bytes != 0 {
 		t.Fatalf("durable prefix did not retire recalled records: %+v", stats)
@@ -1144,6 +1145,88 @@ func TestDelegationBarrierRunsWithWithdrawnIdentity(t *testing.T) {
 	}
 }
 
+func TestDelegationBarrierReleasesAdmissionAndKeepsItsOriginalCut(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		dropCut   bool
+		dropErrno syscall.Errno
+		wantErr   error
+	}{
+		{name: "later unrelated loss is outside cut"},
+		{name: "generic loss inside cut", dropCut: true, wantErr: writeback.ErrLost},
+		{name: "capacity loss inside cut", dropCut: true, dropErrno: syscall.ENOSPC, wantErr: syscall.ENOSPC},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			waitErr := func(ch <-chan error, what string) error {
+				t.Helper()
+				select {
+				case err := <-ch:
+					return err
+				case <-time.After(time.Second):
+					t.Fatalf("timed out waiting for %s", what)
+					return nil
+				}
+			}
+			fake := &delegationBlockedBarrierRPC{
+				barrierStarted: make(chan struct{}),
+				releaseBarrier: make(chan struct{}),
+			}
+			m := newDelegationTestManager(t, fake)
+			inside := installDelegationForTest(t, m, 91, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			later := installDelegationForTest(t, m, 92, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			if _, err := m.Write(t.Context(), inside, 0, []byte("inside"), false); err != nil {
+				t.Fatal(err)
+			}
+			result := make(chan error, 1)
+			go func() { result <- m.Barrier(t.Context(), m.LossSequence()) }()
+			select {
+			case <-fake.barrierStarted:
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for Authority barrier after cut capture")
+			}
+
+			writeDone := make(chan error, 1)
+			go func() {
+				_, err := m.Write(t.Context(), later, 0, []byte("outside"), false)
+				writeDone <- err
+			}()
+			if err := waitErr(writeDone, "post-cut write admission"); err != nil {
+				t.Fatal(err)
+			}
+			created := delegationTestIdentity(93)
+			installDone := make(chan error, 1)
+			go func() {
+				installDone <- m.Install(created, delegationTestToken(93, 1), delegationTestToken(93, 2), delegationTestGrant(125, authoritypb.DelegationMode_DELEGATION_MODE_FULL))
+			}()
+			if err := waitErr(installDone, "post-cut CREATE grant installation"); err != nil {
+				t.Fatal(err)
+			}
+
+			insideID, err := delegationIdentity(inside)
+			if err != nil {
+				t.Fatal(err)
+			}
+			laterID, err := delegationIdentity(later)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.dropCut {
+				m.buf.DropWithErrno(insideID, "barrier cut loss", test.dropErrno)
+			} else {
+				m.buf.Drop(laterID, "post-cut unrelated loss")
+			}
+			close(fake.releaseBarrier)
+			err = waitErr(result, "root barrier completion")
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("barrier error = %v, want %v", err, test.wantErr)
+			}
+			if !test.dropCut && m.buf.HasRetained(insideID) {
+				t.Fatal("barrier left its original durable cut retained")
+			}
+		})
+	}
+}
+
 func BenchmarkDelegationOwns(b *testing.B) {
 	for _, hot := range []bool{false, true} {
 		name := "cold"
@@ -1270,6 +1353,7 @@ func TestDelegatedAttributeOverlayUsesCurrentBaseAfterDurability(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.DurableSequence(seq)
+	m.VisibleSequence(seq)
 	mount := &Mount{delegations: m}
 	got, err := mount.overlayProtoAttr(id, sampled, 1)
 	if err != nil || got.GetMtimeNs() != 21 || got.GetCtimeNs() != 22 || got.GetMode() != 0o755 {

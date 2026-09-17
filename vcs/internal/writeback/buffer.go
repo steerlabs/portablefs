@@ -48,6 +48,12 @@ type file struct {
 	scheduled       bool
 	reschedule      bool
 }
+type barrierState struct {
+	cut     Cut
+	lost    bool
+	generic bool
+	errno   syscall.Errno
+}
 type Buffer struct {
 	batcher                                 BatchFlusher
 	batchWidth, batchPayload                int
@@ -67,6 +73,7 @@ type Buffer struct {
 	sequence, loss, token, visible, durable uint64
 	lastErrno                               syscall.Errno
 	lastGenericLoss                         uint64
+	barriers                                map[*barrierState]struct{}
 	changed                                 chan struct{}
 	retiringAll, stopped                    bool
 	flusher                                 Flusher
@@ -95,7 +102,7 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 	}
 	b := &Buffer{maxFlushIdentities: opts.MaxFlushIdentities,
 		loss:  opts.InitialLossSequence,
-		files: make(map[Identity]*file), active: make(map[Identity]*file),
+		files: make(map[Identity]*file), active: make(map[Identity]*file), barriers: make(map[*barrierState]struct{}),
 		appliedHeap: make(recordHeap, 0, opts.MaxEntries),
 		visibleHeap: make(recordHeap, 0, opts.MaxEntries),
 		records:     make([]record, opts.MaxEntries),
@@ -266,6 +273,36 @@ func (b *Buffer) sizeLocked(f *file) {
 	}
 }
 func (b *Buffer) Snapshot() Cut { b.mu.Lock(); defer b.mu.Unlock(); return Cut{b.sequence, b.loss} }
+
+// BeginBarrier captures a root completion cut. Callers hold their admission
+// fence only around this method, then pass the returned cut through flushing,
+// the remote barrier, and WaitBarrier. The registered state makes a later drop
+// fail this barrier only when the drop contains an operation in its prefix.
+func (b *Buffer) BeginBarrier(observedLoss uint64) BarrierCut {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cut := Cut{Sequence: b.sequence, LossSequence: b.loss}
+	state := &barrierState{cut: cut, lost: b.loss > observedLoss}
+	if state.lost {
+		if b.lastGenericLoss > observedLoss {
+			state.generic = true
+		} else {
+			state.errno = b.lastErrno
+		}
+	}
+	b.barriers[state] = struct{}{}
+	return BarrierCut{Cut: cut, state: state}
+}
+
+// EndBarrier releases a cut whose operation aborted before WaitBarrier.
+func (b *Buffer) EndBarrier(cut BarrierCut) {
+	if cut.state == nil {
+		return
+	}
+	b.mu.Lock()
+	delete(b.barriers, cut.state)
+	b.mu.Unlock()
+}
 func (b *Buffer) Size(id Identity, base int64) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -380,6 +417,23 @@ func (b *Buffer) DropAll(reason string) []DropReport {
 
 func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) DropReport {
 	f := b.file(id)
+	for barrier := range b.barriers {
+		affected := false
+		for r := f.head; r != nil && r.seq <= barrier.cut.Sequence; r = r.next {
+			affected = true
+			break
+		}
+		if !affected {
+			continue
+		}
+		barrier.lost = true
+		if errno == 0 {
+			barrier.generic = true
+			barrier.errno = 0
+		} else if !barrier.generic {
+			barrier.errno = errno
+		}
+	}
 	b.loss++
 	f.lastLoss = b.loss
 	f.lastErrno, b.lastErrno = errno, errno

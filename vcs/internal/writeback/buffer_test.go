@@ -1161,7 +1161,17 @@ func TestBarrierUsesCallTimeCutAndReportsObservedLoss(t *testing.T) {
 		err  error
 	}
 	result := make(chan barrierResult, 1)
-	go func() { lost, err := b.Barrier(context.Background(), 0); result <- barrierResult{lost, err} }()
+	barrier := b.BeginBarrier(0)
+	go func() {
+		_, err := b.FlushBarrier(context.Background(), barrier)
+		if err != nil {
+			b.EndBarrier(barrier)
+			result <- barrierResult{false, err}
+			return
+		}
+		lost, err := b.WaitBarrier(context.Background(), barrier)
+		result <- barrierResult{lost, err}
+	}()
 	if id := await(t, entered, "barrier flush"); id != before {
 		t.Fatalf("barrier flushed identity %x, want %x", id, before)
 	}
@@ -1179,7 +1189,13 @@ func TestBarrierUsesCallTimeCutAndReportsObservedLoss(t *testing.T) {
 	}
 
 	b.Drop(after, "test loss")
-	lost, err := b.Barrier(context.Background(), 0)
+	barrier = b.BeginBarrier(0)
+	_, err := b.FlushBarrier(context.Background(), barrier)
+	if err != nil {
+		b.EndBarrier(barrier)
+		t.Fatal(err)
+	}
+	lost, err := b.WaitBarrier(context.Background(), barrier)
 	if !lost || err != nil {
 		t.Fatalf("Barrier observing prior loss = (%v, %v), want (true, nil)", lost, err)
 	}
