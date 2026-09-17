@@ -104,6 +104,54 @@ func TestReadDirPlusPhysicalFailureRollsBackCursorAndLookups(t *testing.T) {
 	}
 }
 
+func TestReadDirPlusConstructionFailureRollsBackEveryStagedLookup(t *testing.T) {
+	raw, _, _ := testRawFileSystem(t, 16)
+	page := plusTestPages(3)[0]
+	// The first two entries stage successfully. The inconsistent final item is
+	// rejected by the page publication preflight after all three were interned.
+	page.Entries[2].Item.SnapshotSequence++
+	id, _ := testDirHandle(t, raw, page)
+	held, handle := raw.acquireDirHandle(id)
+	raw.releaseHandleOperation(held)
+
+	first := page.Entries[0].Item
+	existing, errno := raw.intern(context.Background(), first)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	before := existing.lookups
+	identities := make([]publicationIdentity, len(page.Entries))
+	for i, entry := range page.Entries {
+		copy(identities[i][:], entry.Item.GetStableIdentity())
+	}
+
+	unique := nextTestRequestUnique()
+	status := raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: id}, fuse.NewDirEntryList(make([]byte, 4096), 0))
+	if status != fuse.EIO {
+		t.Fatalf("READDIRPLUS status=%v, want EIO", status)
+	}
+	if handle.next != 0 || handle.plusReply != nil {
+		t.Fatalf("construction failure retained cursor: next=%d tx=%v", handle.next, handle.plusReply)
+	}
+	raw.mu.Lock()
+	for i, identity := range identities {
+		got := uint64(0)
+		if record := raw.nodesByIdentity[identity]; record != nil {
+			got = record.lookups
+		}
+		want := uint64(0)
+		if i == 0 {
+			want = before
+		}
+		if got != want {
+			raw.mu.Unlock()
+			t.Fatalf("entry %d lookups=%d, want pre-call value %d", i, got, want)
+		}
+	}
+	raw.mu.Unlock()
+	completeTestReply(t, raw, unique, fuse.EIO)
+}
+
 func TestReadDirPlusTakeOwnsCapabilityAcrossInvalidation(t *testing.T) {
 	raw, mount, _ := testRawFileSystem(t, 16)
 	id, _ := testDirHandle(t, raw, plusTestPages(1)...)

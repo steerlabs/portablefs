@@ -1170,6 +1170,14 @@ func (r *rawFileSystem) commitDirPlusLookupTransaction(ctx context.Context) erro
 	return nil
 }
 
+func (r *rawFileSystem) abortDirPlusLookupTransaction(ctx context.Context) {
+	publication := replyPublicationFromContext(ctx)
+	r.mu.Lock()
+	completion := r.settleDirPlusLookupTransactionLocked(publication, false)
+	r.mu.Unlock()
+	r.finishDirPlusLookupCompletion(completion)
+}
+
 // settleDirPlusLookupTransactionLocked transfers the staged lookup references
 // to the kernel only when a complete successful page reached /dev/fuse. Cache
 // validity is governed separately by the exact reply-local leases; lookup and
@@ -3535,6 +3543,12 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		return fuse.EIO
 	}
 	attached = true
+	ready := false
+	defer func() {
+		if !ready {
+			r.abortDirPlusLookupTransaction(ctx)
+		}
+	}()
 	candidates := make([]dirPlusCandidate, 0, 32)
 	emitted := 0
 	var page dirPlusPageBoundary
@@ -3585,6 +3599,7 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 	if err := r.commitDirPlusLookupTransaction(ctx); err != nil {
 		return fuse.EIO
 	}
+	ready = true
 	return fuse.OK
 }
 
