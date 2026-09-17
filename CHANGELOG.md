@@ -10,104 +10,102 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
-### Fixed
+## [0.4.0] - 2026-09-16
 
-- The FSKit nested authority contract now accepts exact protocol 7 and refuses
-  protocol 6. A shared Go/Swift Resolve golden covers the production parser.
-- Protocol-7 directory walks continue from stable XFS cookies across concurrent
-  mutation, with every unchanged entry returned exactly once and no ESTALE.
-- Fresh 20,000-file Git preparation completes at the shipping 65,536 cache
-  capacity without the protocol-6 ENOTCONN failure.
-- The files gateway is an authenticated cacheless peer reader. It breaks
-  delegated files for read and never excludes Linux writers.
-- Application tickets and completed control replay retire at their durable and
-  acknowledged prefixes. Background flush dispatch and deferred close cleanup
-  are bounded; close batches establish application before waiting for durability.
-- `deploy/opensteer/staging-qualification.sh` phase 9 can now actually run. An
-  initial mount grant is single-use, so the remount could never reuse
-  `PORTABLEFS_MOUNT_TOKEN` and always failed with errno 1 — meaning durability
-  across unmount/remount had never once been scored. The phase now takes its own
-  capability, from `--mount-token-command CMD` (preferred: a grant is short-lived
-  and one minted before phase 1 can expire before phase 9) or a pre-minted
-  `PORTABLEFS_REMOUNT_TOKEN`. With neither, the phase skips loudly and says the
-  run did not qualify durability, instead of failing at the end of a good run.
+### Compatibility
+
+- Authority protocol major 7 and ALPN `portablefs-authority-v7` refuse protocol
+  6. Every Authority, Linux mount, files gateway, and Mac client on a volume
+  must upgrade in one drained maintenance window. Product generation remains
+  v3; the pre-1.0 release version advances from 0.3.0 to 0.4.0.
+- The Go daemon and Swift extension require the same source commit. Their
+  shared Resolve golden tests the production nested authority contract, which
+  accepts exact 7 and refuses 6 and 8. Local `pfslocal` stays at 1.15.
+- Linux requires stock FUSE 7.31 or newer. Production runner nodes need a
+  pinned kernel 5.10 or newer and qualification on that exact kernel.
 
 ### Changed
 
-- Authority protocol 7 replaces Linux N/A/E/D leases with volume subscriptions,
-  file write delegations, and daemon-side write-back. Run completion is fsync
-  on a mount-root directory handle opened at run start. Epoch replacement
-  stales old handles while allowing new opens after cold reattachment.
-- Removed the v6 Linux lease engine, tickers, coherence-abort watchdog, and
-  Linux bridge into Mac repair. FSKit compatibility-writer exclusion remains.
-- Published full-size v6/v7 comparisons, request counts, and profile results in
-  `docs/coherence-v2/results.md`; these are shared-VM observations, not an SLO.
+- Volume subscriptions and file write delegations replace Linux N/A/D/E leases
+  and unconditional write-through. The subscription horizon is 10 seconds,
+  renewal interval 3 seconds, and recall budget at most 5 seconds. Namespace
+  operations remain synchronous at the Authority.
+- Run completion uses `fsync` on the mount-root directory handle opened at run
+  start. Epoch replacement stales old handles; cold reattachment admits new
+  opens. Applied data remains retained until durability is proven.
+- The files gateway uses the read-only `CACHELESS_READER` profile and
+  BreakForRead without joining Mac writer exclusion. Every attached Mac mount
+  retains compatibility writer exclusion.
+- Stable XFS directory cookies permit continuation across concurrent mutation.
+  Pure Authority mounts negotiate READDIRPLUS; routed mounts retain READDIR.
+  Linux kernel entry and attribute validity remain zero, with metadata caching
+  in the subscribed daemon.
+- Completed control replay and application tickets retire at their acknowledged
+  and durable prefixes. Background flush dispatch and deferred closes are
+  bounded. Fallback durability Barriers run at most once per second; explicit
+  completion barriers remain independent. Unlocked FULL-delegation FLUSH is
+  local; lock-owning and write-through handles retain Authority FLUSH.
 
-- Hosted automatic mount enrollment now uses a 30-minute sliding lease instead
-  of an absolute enrollment lifetime. Fresh successful refreshes renew the
-  lease, while exact replays, rate-limited requests, and failures leave it
-  unchanged. Enrollment certificates carry only the Manager-facing identity
-  and remain valid through the enrollment CA's remaining lifetime. The Manager
-  wire and mount CLI no longer carry an enrollment-expiry timestamp. Clients
-  advertise
-  `hosted-automatic-mount-reauthorization-v2` for this contract.
-- Scoped enrollment issuance now supersedes only the prior active enrollment
-  for the same product issuer, renewal scope, and volume. One machine scope can
-  therefore keep one active enrollment for each mounted volume; epoch advances
-  still revoke every lower-epoch enrollment in that scope.
-- Hosted cell declarations now carry immutable inclusive project-ID,
-  service-UID, and listener-port ends. Placement admission stops before any
-  lifetime-monotonic allocator crosses its declared range, including after
-  prior volumes are deleted; pre-bound schema-v2 cells accept one constrained
-  declaration that pins only those ends and the new exact digest.
+### Removed
 
-- `.github/workflows/deploy-opensteer-staging.yml` takes the runner image as a
-  required `workflow_dispatch` input instead of hardcoding a digest, and refuses
-  anything not of the form `REGISTRY/PATH@sha256:<64 hex>`. The infra pin
-  (`releases/staging/opensteer.json` in `opensteer-infra`) is the source of
-  truth and this repository cannot read it at dispatch time, so the operator
-  pastes it and the workflow validates it. The copy this workflow shipped with
-  had already drifted from the pin.
+- The executable v6 Linux lease engine, lease tickers, coherence-abort
+  watchdog, and Linux bridge into Mac repair. Historical protobuf tags and
+  explicit refusal tests remain; no old lease execution path remains.
 
 ### Fixed
 
-- In the earlier protocol-6 build, a Linux mount was no longer revoked when
-  an enumeration reply carried no E(dir) grant. A grant on a read-side reply is a MAY, not a MUST
-  (docs/portable-coherence.md §2.2), and the frontend independently declines to
-  install a grant that a newer recall's grant floor, an unfinished local recall,
-  or the family's cache budget has overtaken. All of those mean one thing --
-  this reply is uncached -- but OPENDIR and READDIR treated them as an authority
-  protocol violation and failed the mount closed. A dependency-tree install
-  (per-package `rename(2)` publication into one directory) racing readers that
-  enumerate that directory hits the window continuously: live staging
-  qualification lost its mount in about seven seconds, three runs out of three,
-  with the authority journal showing no fence and nothing to notice. The
-  frontend now serves the ungranted page uncached and bounded to the kernel
-  callback that fetched it, retiring the buffer at the next callback and
-  resuming from the authority cookie so the verifier -- not a cache lease -- is
-  what catches a mutation across the gap. A directory reply carrying no stable
-  identity remains terminal: no coordinate can name it, so no recall could ever
-  reach it. Covered by
-  `TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing`,
-  which is bounded, required, and fails on the unfixed frontend in under a
-  second.
+- Fresh 20,000-file Git preparation completes with 65,536 cached names, a
+  committed index, a passing root barrier, and the original mount still live.
+- CONTROL-only loss withdraws caches at the horizon; reconnect without a caller
+  deadline has a 10-second internal bound. Capacity-blocked writes wake on a
+  cold subscription. Dirty shutdown reports retained-data loss after its
+  bounded durability attempt.
+- Definite unapplied ENOSPC, EDQUOT, and EFBIG flush refusals retain their errno;
+  coherence refusals retire the grant and advance loss. Namespace dependency
+  flushes cover rename, unlink, hard link, and evicted bindings.
+- Cached positive LOOKUP, negative LOOKUP, and GETATTR callbacks use zero
+  Authority RPCs and zero allocations through physical reply settlement in
+  the recorded deterministic tests, down from 22, 9, and 18 allocations.
 
-### Added
+### Hosted release and deployment
 
-- `deploy/gcp/verify-hosted-release.sh` now asserts each released binary's Go
-  VCS stamp: `vcs.revision` must equal the release's recorded `source-commit`
-  and `vcs.modified` must be `false`, with an absent stamp treated as the
-  failure rather than as not-applicable. That absence is exactly what a release
-  built from a linked git worktree produces -- Go's `-buildvcs` support drops
-  silently there -- and it shipped a provenance-stripped artifact that every
-  other check in the script accepted.
-- `.github/workflows/deploy-opensteer-staging.yml`: a `workflow_dispatch`
-  staging deploy mirroring the production workflow against project
-  `opensteer-staging`. Its required, reviewed schema-v1 inventory names the
-  Manager and every cell instance and zone; the release discovers all volumes
-  from the Manager rather than accepting a hand-maintained list. Its first step
-  refuses, by name, an `opensteer-staging` GitHub environment whose WIF
-  variables or E2B secret are not provisioned.
+- Automatic mount enrollment uses a 30-minute sliding lease; successful fresh
+  refreshes renew it, while replayed, rate-limited, and failed refreshes do not.
+  Enrollment identity lasts through the enrollment CA's lifetime. Scoped
+  issuance supersedes only the same product, scope, and volume; scope epoch
+  advances revoke lower-epoch enrollments.
+- Cell declarations carry immutable inclusive project-ID, service-UID, and
+  listener-port ends, and placement refuses exhausted lifetime ranges.
+- Hosted verification requires every Go VCS revision to match `source-commit`
+  and `vcs.modified=false`. Publication supplies the files component before its
+  verified aggregate capsule; `opensteer-infra` owns staging activation.
+- Staging qualification accepts a fresh remount capability through
+  `--mount-token-command` or `PORTABLEFS_REMOUNT_TOKEN`. Without one, phase 9
+  explicitly skips and does not qualify remount durability.
+
+### Measurements and qualification
+
+- The pre-G2 full gate (run 156) passed 66 required privileged-suite tests,
+  one root-boundary test, and 345 native Swift tests. Its matrix and the
+  independent run 157 reported 28 PASS, zero unexpected failures, and the
+  existing single-principal ownership SKIP. Later G2 changes have targeted
+  evidence; their final full gate remains outstanding in the integration record.
+- The recorded pre-G2 full-size v6 to v7 install times were 386.762771 to
+  21.028568 seconds at one worker and 273.738199 to 15.706301 seconds at eight
+  workers, for 40,000 files and 2,000 directories. Cold/warm status over 20,000
+  tracked files took 1.379696/1.195970 seconds on v7. The peer workload verified
+  2,000 files but overlapped only one read with the writer; its Authority
+  requests increased from 31,510 to 39,278.
+- Targeted G2 observations: a 1,000-file install used seven Barriers and zero
+  FLUSH, ChangeAck, or additional control polls in 5.26 seconds. Cold `ls -ln`
+  over 1,000 entries used four READDIR RPCs and zero LOOKUP RPCs.
+- These measurements use a shared 4-CPU/8-GiB Docker VM, kernel
+  `6.8.0-100-generic`, loopback TLS, and tmpfs-backed loop XFS. They do not
+  establish production latency or an SLO. Production kernel, deployed staging,
+  and live FSKit qualification remain separate gates. See
+  [integration](docs/coherence-v2/integration.md),
+  [measurements](docs/coherence-v2/results.md), and
+  [rollout](docs/coherence-v2/rollout.md).
 
 ## [0.3.0] - 2026-08-19
 

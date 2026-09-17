@@ -8,11 +8,9 @@ import { fileURLToPath } from "node:url";
 // dependency: the checks are line-anchored and fail closed on anything they
 // cannot prove):
 //
-// 1. `uses:` references. First-party `actions/*` steps may float on a major
-//    tag (GitHub maintains them) or be SHA-pinned. EVERY other owner is
-//    third-party and MUST be pinned to a full 40-hex commit SHA with a
-//    trailing `# <version>` evidence comment. Local `./` composite actions
-//    and `docker://` images pinned by digest are allowed.
+// 1. `uses:` references. Every remote action MUST be pinned to a full 40-hex
+//    commit SHA with a trailing `# <version>` evidence comment. Local `./`
+//    composite actions and `docker://` images pinned by digest are allowed.
 // 2. `runs-on:` must name an explicitly versioned runner image (for example
 //    ubuntu-24.04), never a mutable `-latest` alias.
 // 3. Every workflow must declare top-level `permissions:` (least privilege)
@@ -21,11 +19,9 @@ import { fileURLToPath } from "node:url";
 // This mirrors the vendored-protocol posture: mutable identities cannot
 // reach CI/release without an immutable pin and reviewable evidence.
 
-const FIRST_PARTY_OWNERS = new Set(["actions"]);
 const USES_PATTERN = /^\s*(?:-\s+)?uses:\s*(.+?)\s*(?:#(.*))?$/;
 const RUNS_ON_PATTERN = /^\s*runs-on:\s*(.+?)\s*$/;
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
-const TAG_PATTERN = /^v\d+(?:\.\d+){0,2}$/;
 
 export async function verifyWorkflowPins(workflowsDir) {
   const root =
@@ -72,7 +68,6 @@ export async function verifyWorkflowPins(workflowsDir) {
       }
       const action = reference.slice(0, at);
       const ref = reference.slice(at + 1);
-      const owner = action.split("/")[0];
       if (SHA_PATTERN.test(ref)) {
         if (comment === "") {
           failures.push(
@@ -82,12 +77,8 @@ export async function verifyWorkflowPins(workflowsDir) {
         checked.push(`${action}@${ref}`);
         return;
       }
-      if (FIRST_PARTY_OWNERS.has(owner) && TAG_PATTERN.test(ref)) {
-        checked.push(`${action}@${ref}`);
-        return;
-      }
       failures.push(
-        `${location}: third-party action "${action}" must be pinned to a 40-hex commit SHA ` +
+        `${location}: remote action "${action}" must be pinned to a 40-hex commit SHA ` +
           `with a version comment (got "@${ref}")`
       );
     });

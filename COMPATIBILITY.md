@@ -45,6 +45,27 @@ still a coordinated protocol-major change, not a silent edit. Pre-launch, pin
 against these knowing the draft specification can still move a detail; after it
 leaves draft they are frozen.
 
+### Frozen-surface release map
+
+Release 0.4.0 is the protocol-7 reset of 0.3.0's protocol 6. The release
+version, product generation v3, authority major, and local protocol version
+are separate identities. No mixed-major volume deployment is supported.
+
+| Frozen surface | Protocol 7 / release 0.4.0 | Retired protocol 6 surface |
+| --- | --- | --- |
+| Authority TLS / Hello | Exact `portablefs-authority-v7` / major `7` | `portablefs-authority-v6` / major `6`, refused at handshake |
+| Linux cache authority | Volume subscription, ordered changes, file write delegation; exact feature sets in [wire.md](docs/coherence-v2/wire.md#required-features) | N/A/D/E lease families; `lease-coherence-v1`, `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`, `open-by-identity-v1`, and unconditional Linux `write-through` |
+| Historical wire bodies | Tags and names retained and never reused; no executable old lease path | `Lease*`, `NextLeaseEvent`, `AcknowledgeLeaseEvent`, `RenewLeases`, `SourceLeaseDischarge`, `AcknowledgeSourceLeaseDischarge`, `lease_grants`, `source_lease_discharge`, `lease_cursor` |
+| Frontend enum | Frozen `LINUX_LEASES` spelling now has major-7 semantics; FSKit retains `FSKIT_SYNC_REPAIR`; gateway uses `CACHELESS_READER` | Linux lease execution and gateway use of FSKit repair |
+| Mac daemon / extension | `pfslocal` 1.15; nested authority major 7; shared Go/Swift Resolve golden, built from one commit | Nested authority major 6, refused even though the local major/minor is unchanged |
+| Completion | Root-directory FSYNCDIR barrier and per-handle loss observation; explicit fsync durability | Linux unconditional write-through; stock FUSE_SYNCFS is not a completion surface |
+| Retained identities | Existing cache-policy names, local-dirs syntax/hash, environment and CLI spellings, release archive names and signing identity | None renamed or repurposed by this release |
+
+The coordinated [rollout](docs/coherence-v2/rollout.md) covers Authorities,
+Linux mounts, the files gateway, and Mac clients. A signed Mac app must contain
+its CLI, Go daemon, and Swift extension from the same immutable commit; the
+shared golden is necessary evidence, not a live FSKit qualification.
+
 ### The authority wire
 
 - **Transport is mutually authenticated TLS 1.3**, with the single ALPN
