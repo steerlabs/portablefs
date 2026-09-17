@@ -1021,6 +1021,34 @@ func TestDropReporterSuppressesCleanDelegationLoss(t *testing.T) {
 	}
 }
 
+func TestCleanupDropReporterMayChangeEpoch(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	id := installDelegationForTest(t, m, 33, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), id, 0, []byte("retained"), false); err != nil {
+		t.Fatal(err)
+	}
+	reported := make(chan struct{})
+	m.SetDropReporter(func(writeback.DropReport) {
+		m.EpochChanged("drop reporter epoch change")
+		close(reported)
+	})
+	done := make(chan struct{})
+	go func() {
+		m.failCleanupIdentity(id, "deferred cleanup refused")
+		close(done)
+	}()
+	select {
+	case <-reported:
+	case <-time.After(time.Second):
+		t.Fatal("drop reporter deadlocked while changing epoch")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup remained blocked after drop reporter returned")
+	}
+}
+
 func TestDelegationSubscriptionFenceDropsOldBufferAndAllowsColdGrant(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)

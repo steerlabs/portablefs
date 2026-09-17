@@ -1478,20 +1478,27 @@ func (m *delegationManager) failCleanupIdentity(identity []byte, reason string) 
 		return
 	}
 	m.epoch.RLock()
-	defer m.epoch.RUnlock()
 	s := m.lookupState(id)
 	if s == nil {
+		m.epoch.RUnlock()
 		return
 	}
 	s.admission.Lock()
 	s.clearGrantLocked()
 	s.admission.Unlock()
+	var report writeback.DropReport
+	dropped := false
 	if m.buf.HasRetained(id) {
-		m.reportDrop(m.buf.Drop(id, reason))
+		report = m.buf.Drop(id, reason)
+		dropped = true
 	}
 	s.meta.Lock()
 	s.dirty = false
 	s.meta.Unlock()
+	m.epoch.RUnlock()
+	if dropped {
+		m.reportDrop(report)
+	}
 }
 
 func (m *delegationManager) recall(ctx context.Context, event *authoritypb.ControlEvent, s *delegationState) {
