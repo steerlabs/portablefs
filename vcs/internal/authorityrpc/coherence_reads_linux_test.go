@@ -180,7 +180,7 @@ func TestCoherenceReadPathsRefuseExpiredSubscriptionBeforeStorage(t *testing.T) 
 	}
 }
 
-func grantPeerDelegationForReadTest(t *testing.T, h *VolumeHandler, reader volumeserver.SessionCredential, root xfsstore.Capability, identity [16]byte) (volumeserver.SubscriptionToken, volumeserver.Delegation, uint64) {
+func grantPeerDelegationForReadTest(t *testing.T, h *VolumeHandler, reader volumeserver.SessionCredential, root xfsstore.Capability, identity [16]byte) (volumeserver.SubscriptionToken, volumeserver.Delegation, uint64, uint64) {
 	t.Helper()
 	holder := volumeserver.SessionID{0x92}
 	if err := h.startSessionResources(holder, root, 2, routesRevisionOf("")); err != nil {
@@ -214,7 +214,7 @@ func grantPeerDelegationForReadTest(t *testing.T, h *VolumeHandler, reader volum
 		t.Fatal(err)
 	}
 
-	return holderToken, grant, holderEvents[len(holderEvents)-1].Position
+	return holderToken, grant, holderEvents[len(holderEvents)-1].Position, readerEvents[len(readerEvents)-1].Position
 }
 
 func TestCoherenceReadWaitsForDelegationBreakBeforeStorage(t *testing.T) {
@@ -241,7 +241,7 @@ func TestCoherenceReadWaitsForDelegationBreakBeforeStorage(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			holder, grant, cursor := grantPeerDelegationForReadTest(t, h, reader, root, identity)
+			holder, grant, cursor, _ := grantPeerDelegationForReadTest(t, h, reader, root, identity)
 			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 			defer cancel()
 			var run func() *authoritypb.Response

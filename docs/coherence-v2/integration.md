@@ -1195,3 +1195,18 @@ than hiding discovery I/O in the counter.
 The pre-change READDIR failure is `/tmp/cv2-g2-c4-before.log`. All selected
 `^TestCoherence(Read|Lookup)` tests pass in the pinned Docker image after the
 change (`/tmp/cv2-g2-c4-after.log`), using the cross-compiled authorityrpc binary.
+
+### C5: recall peer grants before size and range mutations
+
+A full-handler table now holds a peer delegation while issuing SETATTR-size,
+FALLOCATE, or COPY_FILE_RANGE. The copy row delegates only the destination, pairing
+with the retained source-break test. Each row requires an exact-identity
+StreamRecall, zero storage applications before AckDelegation, and one successful
+application after that ACK and the subsequent change withdrawals. Production
+preflight already implements this ordering; no runtime change was needed.
+
+The table passes in the pinned Docker image (`/tmp/cv2-g2-c5.log`). A Go build
+overlay that bypasses BeginSynchronousMutation makes all three rows fail because
+no recall is emitted (`/tmp/cv2-g2-c5-fault.log`); the repository runtime was not
+modified for that counterexample. Both binaries ran with
+`-test.run '^TestCoherenceMutationsRecallPeerDelegationBeforeStorage$' -test.v`.

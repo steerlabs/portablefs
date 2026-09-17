@@ -496,3 +496,125 @@ func TestCoherenceSetAttrRequiresItemOrHandle(t *testing.T) {
 		})
 	}
 }
+
+type coherenceRecallMutationStore struct {
+	resourceAdmissionFaultStore
+	applied atomic.Uint32
+}
+
+func (*coherenceRecallMutationStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(handle[0]), Size: 8, Mode: 0600, Nlink: 1, DeviceMinor: 1}, nil
+}
+func (s *coherenceRecallMutationStore) SetAttr(_ xfsstore.Capability, handle xfsstore.Capability, spec xfsstore.SetAttrSpec) (xfsstore.Attr, error) {
+	s.applied.Add(1)
+	attr, _ := s.GetattrOpen(handle)
+	attr.Size = *spec.Size
+	return attr, nil
+}
+func (s *coherenceRecallMutationStore) Fallocate(handle xfsstore.Capability, _ xfsstore.FallocateSpec) (xfsstore.Attr, error) {
+	s.applied.Add(1)
+	return s.GetattrOpen(handle)
+}
+func (s *coherenceRecallMutationStore) CopyFileRange(_, output xfsstore.Capability, _ xfsstore.CopyFileRangeSpec) (uint64, xfsstore.Attr, error) {
+	s.applied.Add(1)
+	attr, _ := s.GetattrOpen(output)
+	return 1, attr, nil
+}
+func (*coherenceRecallMutationStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestCoherenceMutationsRecallPeerDelegationBeforeStorage(t *testing.T) {
+	for _, kind := range []string{"setattr-size", "fallocate", "copy-destination"} {
+		t.Run(kind, func(t *testing.T) {
+			store := &coherenceRecallMutationStore{}
+			h, authCtx, cred, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+			input, output := xfsstore.Capability{0x21}, xfsstore.Capability{0x31}
+			for _, handle := range []xfsstore.Capability{input, output} {
+				if err := h.trackOpen(cred.ID, handle, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := coherenceReadRequest(cred)
+			identity := [16]byte{input[0]}
+			switch kind {
+			case "setattr-size":
+				request.Body = &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Handle: input[:], Size: proto.Int64(1)}}
+			case "fallocate":
+				request.Body = &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: input[:], Length: 1}}
+			case "copy-destination":
+				request.Body = &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{InputHandle: input[:], OutputHandle: output[:], Length: 1}}
+				identity = [16]byte{output[0]}
+			}
+			stampMutation(t, request, 0, 1)
+			holder, grant, cursor, sourceCursor := grantPeerDelegationForReadTest(t, h, cred, root, identity)
+			source, err := h.coherenceToken(cred.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(authCtx, 2*time.Second)
+			defer cancel()
+			response := make(chan *authoritypb.Response, 1)
+			go func() { response <- h.Handle(ctx, request) }()
+			events, err := h.Coherence.Poll(ctx, holder, cursor, nil, 16)
+			if err != nil || len(events) == 0 {
+				t.Fatalf("recall events=%v err=%v", events, err)
+			}
+			var recall volumeserver.StreamEvent
+			for _, event := range events {
+				if event.Kind == volumeserver.StreamRecall && event.Delegation.Identity == identity {
+					recall = event
+					break
+				}
+			}
+			if recall.Kind != volumeserver.StreamRecall {
+				t.Fatalf("expected recall of mutation destination %x: %v", identity, events)
+			}
+			if store.applied.Load() != 0 {
+				t.Fatal("mutation reached storage before recall ack")
+			}
+			select {
+			case reply := <-response:
+				t.Fatalf("mutation completed before recall ack: %v", reply)
+			default:
+			}
+			if err := h.Coherence.AckDelegation(holder, identity, grant.ID, grant.Generation, recall.Request, recall.AppliedSequence); err != nil {
+				t.Fatal(err)
+			}
+			cursor = events[len(events)-1].Position
+			if err := h.Coherence.Ack(holder, cursor); err != nil {
+				t.Fatal(err)
+			}
+			drainErrors := make(chan error, 2)
+			drain := func(token volumeserver.SubscriptionToken, after uint64) {
+				for {
+					events, err := h.Coherence.Poll(ctx, token, after, nil, 16)
+					if err != nil {
+						if ctx.Err() == nil {
+							drainErrors <- err
+						}
+						return
+					}
+					if len(events) == 0 {
+						continue
+					}
+					after = events[len(events)-1].Position
+					if err := h.Coherence.Ack(token, after); err != nil {
+						drainErrors <- err
+						return
+					}
+				}
+			}
+			go drain(holder, cursor)
+			go drain(source, sourceCursor)
+			select {
+			case reply := <-response:
+				if reply.GetErrno() != 0 || reply.GetUncertain() || store.applied.Load() != 1 {
+					t.Fatalf("mutation after recall=%v applies=%d", reply, store.applied.Load())
+				}
+			case err := <-drainErrors:
+				t.Fatal(err)
+			case <-ctx.Done():
+				t.Fatal("mutation did not finish after recall ack")
+			}
+		})
+	}
+}
