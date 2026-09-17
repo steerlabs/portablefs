@@ -67,6 +67,12 @@ work uses one worker matching the Authority flush lane. Deferred close admission
 is bounded, and close batches apply all files before waiting for durability. Completed
 replay records retire at the durable prefix.
 
+Under FULL ownership, FUSE FLUSH returns locally after checking loss unless the
+closing POSIX lock owner may hold record locks on that identity. SETLK/SETLKW
+acquisition attempts record this obligation before dispatch; successful FLUSH
+clears only the generation it observed. The Authority remains responsible for
+synchronous record-lock release. RELEASE retains its deferred CLOSE obligation.
+
 Holder reads use `Buffer.Read`. GETATTR uses the holder's base attributes with
 the buffer's size and metadata overlay. A new ownership interval fetches its
 base lazily from the Authority; it does not reuse pre-OPEN LOOKUP attributes.

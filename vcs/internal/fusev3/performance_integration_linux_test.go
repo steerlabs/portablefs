@@ -625,6 +625,7 @@ func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
 	barrier := mustOpenFile(t, f.mountPath(0), os.O_RDONLY, 0)
 	defer barrier.Close()
 	before := f.counter.count("barrier")
+	flushBefore := f.counter.count("flush")
 	ackBefore, pollBefore := f.counter.count("change-ack"), f.counter.count("next-control-event")
 	for i := 0; i < 1000; i++ {
 		if err := os.WriteFile(f.join(0, fmt.Sprintf("install-%04d", i)), []byte("payload"), 0o600); err != nil {
@@ -638,9 +639,13 @@ func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
 	if count < 1 || count > 8 {
 		t.Fatalf("1000-file install issued %d Barriers, want 1 through 8 including explicit completion", count)
 	}
+	flushes := f.counter.count("flush") - flushBefore
+	if flushes != 0 {
+		t.Fatalf("unlocked FULL install issued %d FLUSH requests", flushes)
+	}
 	acks, polls := f.counter.count("change-ack")-ackBefore, f.counter.count("next-control-event")-pollBefore
 	if acks != 0 || polls > 3 {
 		t.Fatalf("lone writer control traffic: acknowledgements=%d polls=%d", acks, polls)
 	}
-	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d change_ack=%d next_control_event=%d", count, acks, polls)
+	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d flush=%d change_ack=%d next_control_event=%d", count, flushes, acks, polls)
 }

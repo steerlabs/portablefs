@@ -210,7 +210,10 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
-	server *fuse.Server
+	posixMu       sync.Mutex
+	posixLocks    map[posixLockKey]uint64
+	posixSequence uint64
+	server        *fuse.Server
 	// kernelConnectionDone closes only after go-fuse has stopped every request
 	// loop, closed this mount's /dev/fuse descriptor, and run OnUnmount. Mount
 	// table absence alone is insufficient on Linux: MNT_DETACH can hide a mount
@@ -1643,7 +1646,15 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	if errno := handle.observeLoss(); errno != 0 {
 		return errno
 	}
+	key := n.posixLockKey(lockOwner)
+	generation := n.mount.possiblePOSIXLock(key)
+	if generation == 0 && n.mount.delegations.ownsFull(n.item.GetStableIdentity()) {
+		return 0
+	}
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Flush{Flush: &authoritypb.FlushRequest{Handle: cloneBytes(handle.token), LockOwner: lockOwner}}})
+	if errno == 0 {
+		n.mount.dischargePOSIXLock(key, generation)
+	}
 	return errno
 }
 
@@ -2750,6 +2761,9 @@ func (n *node) Setlkw(ctx context.Context, owner uint64, lock *fuse.FileLock, fl
 func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, flags uint32, wait bool) syscall.Errno {
 	if lock.Typ != syscall.F_RDLCK && lock.Typ != syscall.F_WRLCK && lock.Typ != syscall.F_UNLCK || flags&^uint32(fuse.FUSE_LK_FLOCK) != 0 {
 		return syscall.EINVAL
+	}
+	if flags&uint32(fuse.FUSE_LK_FLOCK) == 0 && lock.Typ != syscall.F_UNLCK {
+		n.mount.notePOSIXLock(n.posixLockKey(owner))
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: lockRequest(n.item.GetToken(), owner, lock, flags), Wait: wait, Unlock: lock.Typ == syscall.F_UNLCK}}}
 	if !wait {

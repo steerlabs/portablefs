@@ -1404,3 +1404,22 @@ ChangeAck requests, and zero additional NextControlEvent requests (the initial
 long poll remains outstanding), `/tmp/cv2-g2-own-mounted.log`. The focused wrapper
 exits 70 for the intentionally omitted full inventory; this is targeted evidence,
 not the final full gate.
+
+### Part 2 item 1: local FULL-delegation FLUSH
+
+An unlocked FULL holder now handles FLUSH locally after the existing stale/loss
+checks. WRITETHROUGH and nondelegated handles retain the RPC. POSIX record-lock
+owners retain synchronous Authority FLUSH even under FULL: tracking is per
+stable identity and kernel owner, shared across handles, and begins before an
+acquisition RPC. A successful FLUSH removes only its observed generation. A
+mount-wide monotonic generation prevents both concurrent acquisition loss and
+ABA after a key was removed. Flock remains a RELEASE/CLOSE obligation.
+
+The table covers unlocked FULL, locked FULL, and WRITETHROUGH; generation tests
+cover concurrency and reacquisition. Existing lock-owner forwarding and capacity
+loss tests pass (`/tmp/cv2-g2-flush.log`). Disabling the fast path makes the new
+FULL rows fail (`/tmp/cv2-g2-flush-before.log`). The mounted two-peer POSIX test
+passes without retrying lock acquisition after close, and the 1,000-file install
+passes in 5.26 seconds with zero FLUSH, zero ChangeAck, zero additional control
+polls, and seven Barriers (`/tmp/cv2-g2-flush-mounted.log`). The focused wrapper
+omits the other required tests; the full gate remains pending.
