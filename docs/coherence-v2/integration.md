@@ -1907,3 +1907,107 @@ older/younger claims and nonblocking child admission
 (`/tmp/cv2-g2-lookup-expand-coordinator3.log`). Restoring the old handler fails
 the one-probe assertion (`/tmp/cv2-g2-lookup-fault.log`). The READDIR coordinator
 batch in the second half of item 9 remains pending.
+
+## G3
+
+G3 is split between the Linux frontend stream (G3a) and this Authority stream
+(G3b). G3b merged the soak harness at `679be11` and changed only the Authority,
+coordinator-facing handler tests, authority command, architecture scan, and
+Authority contract records. S1, S2, S3, S5 and review follow-ups 1, 2, 3, 8,
+9, 11, 12 and 14 remain assigned to G3a; this record makes no frontend
+qualification claim for them.
+
+### S4: exclusive CREATE is sequenced before delegation cuts
+
+The unmodified merged tree reproduced the two-mount failure at race 3:
+`TestSoakGitLock` returned EIO with `FAILURE_CLASS_COHERENCE`. An exclusive
+CREATE no longer binds the pre-existing object as its synchronous-mutation
+identity, and its preflight omits that binding from `DataConsumed`. The storage
+dependency turn still revalidates the name and XFS decides EEXIST. The loser
+therefore cannot recall or break the winner's Reserved or Active delegation.
+
+`TestCoherenceExclusiveCreateDoesNotCutExistingDelegation` runs 100 alternating
+Reserved/Active cases. Every loser returns definite EEXIST with an unspecified
+failure class, no delegation control cut is appended, and the Active winner's
+exact reference still passes `BeginFlush`. The real workload supplies the
+separate write/close/rename and alternating-mount coverage.
+
+The first 1,000-race attempt found a narrower sequencer race after the original
+fix: a loser's initial name snapshot could be absent, the winner could install
+the name, and the locked prepare would then include the winner inode although
+exclusive CREATE's dependency footprint correctly omitted it. The handler
+rejected that footprint mismatch as a coherence defect. Exclusive CREATE now
+keeps both its dependency and repair scope to the namespace binding and parent;
+it never locks or publishes the raced winner inode.
+`TestCoherenceExclusiveCreateBindingRaceReturnsEEXIST` deterministically moves
+the binding between those two snapshots and receives definite EEXIST.
+
+The final mounted run repeated the 100-race workload ten times. All 1,000 races
+passed: 3.450 seconds of measured workload time, 52,518 Authority requests,
+and 0.321--0.371 seconds per repetition. The focused wrapper exited 70 only
+because its required full-suite inventory was intentionally omitted. Results:
+`/tmp/cv2-g3b-soak-lock-1000-final/soak-results.jsonl`.
+
+G3a still owns the secondary client hardening for a CREATE-time coherence
+refusal: after confirming a live subscription, one synchronous retry may replace
+an EIO. G3b does not change `client.go` or the frontend retry policy.
+
+### Authority review follow-ups
+
+- Follow-up 4 restores an atomic pre-apply source-liveness cut. Under the held
+  storage turn, the handler checks cancellation and takes a fresh runtime use;
+  `FenceSession` either wins before that cut or follows an operation already
+  admitted to apply. `TestLinuxV7MutationFenceBeforeApplyDoesNotCommitStorage`
+  fences at the former select/apply gap and observes zero storage commits.
+- Follow-up 5 makes the CONTROL poll-buffer reuse precondition executable.
+  `queued` may alias a suffix of `pollBuffer`, so reuse panics unless the queue
+  is drained. The regression leaves a delegation break in that exact aliased
+  suffix, receives it intact on the next poll, and completes its cut.
+- Follow-up 6 maps the four deleted client lease-validator tests to
+  `TestLinuxProfileRejectsRetiredLeaseResponseState`. The shared protocol-7
+  guard rejects both `lease_grants` and `source_lease_discharge` with
+  `ErrTransportBinding` before interpreting retired v6 semantics.
+- Follow-up 7 deletes the orphaned `strictSession` predicate, makes its name an
+  architecture-scan failure, and stops validating the three accepted-but-inert
+  lease flags. This supersedes G step 4's statement that the old flag bounds
+  remain validated; the names stay accepted solely for command compatibility.
+- Follow-up 13 removes the dead first-page verifier input from directory-page
+  revalidation. A reply now publishes the page stamp sampled under the storage
+  turn. The regression changes the stamp while keeping the page identical and
+  succeeds after exactly the initial read and locked revalidation.
+
+The design owner approved the existing uncertain `DelegationRelease` contract:
+an uncertain result invalidates only the subscription incarnation and forces a
+cold resubscribe; it does not end the authenticated session. G3 keeps that wire
+behavior unchanged.
+
+### G3b validation and handoff
+
+The scoped local gates are green:
+
+- `CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...`
+- `CGO_ENABLED=0 GOOS=linux go -C vcs build ./...`
+- `go -C vcs test ./...`
+- `go -C vcs test -race ./internal/authorityrpc ./internal/volumeserver`
+- `bash scripts/test-swift-xcode.sh` (345/345 tests passed)
+- the executable retired-profile architecture scan from
+  `scripts/verify-local.sh`
+
+`bash scripts/coherence-matrix-linux.sh` passed with 28 cases, the declared
+single-principal chown skip, and no unexpected result. In particular,
+`git_index_lock_protocol` passed. The final S4 mounted repeat and focused Linux
+handler runs are recorded above.
+
+The unintegrated G3b branch cannot supply a green cross-stream full gate. The
+prescribed full soak recorded 12/12 measured workloads as passing, including
+`TestSoakGitLock`, but its outer suite failed the G3a-owned fault cases and NPM
+cleanup and timed out `TestSoakGit` at its 20-minute bound. Artifacts are under
+`/tmp/cv2-g3b-whole-soak`. Standard `bash scripts/xfs-fuse-integration.sh`
+runs first exposed and then, in a focused rerun, passed the corrected impossible
+exclusive-existing-create fixture. Full reruns stop earlier in the frontend-
+owned `TestPagedReaddirContinuesAcrossRemoteMutation` with ENFILE after
+asynchronous close losses. `bash scripts/verify-local.sh --full` stops earlier
+in untouched `vcs/internal/authorityrpc/client.go:332` because `go vet` reports
+a copied atomic lock value. G3b does not edit either owner surface; these
+results must be rerun after G3a is integrated. No test was weakened or skipped
+to conceal them.
