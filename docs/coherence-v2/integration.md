@@ -1845,3 +1845,24 @@ other file's five bytes. All three time out on the old code
 unprivileged FUSE suite pass (`file-durability-buffer.log`,
 `file-durability-full.log`, same prefix). Ordinary asynchronous writes still use
 reply prefixes and the bounded fallback; explicit file sync adds no Barrier RPC.
+
+#### G2 gate follow-up: terminal session response wins socket close
+
+The next full XFS run passed the partition test but failed
+`TestSessionExpiryReleasesABlockedLockWait`: the lock returned ESTALE promptly,
+yet the client did not observe session termination within 24 s. Session expiry
+wakes the lock waiter and the transport watcher concurrently. When the reply
+wins, ESTALE alone was indistinguishable from an ordinary stale handle. The
+isolated test passed through the slower socket-close/reconnect path, confirming
+the race rather than qualifying the full run.
+
+The additive `Response.session_terminal` witness identifies expired/fenced
+sessions explicitly. The client enforces it before delivering the response;
+ordinary capability ESTALE stays nonterminal. A malformed success carrying the
+marker is refused. Exact epoch mismatch behavior remains unchanged. Tests keep
+the socket open, prove immediate ErrSessionEnded, and prove an ordinary stale
+handle leaves the session usable. Restoring the former client fails that test
+(`/tmp/cv2-g2-terminal-reply-fault.log`). Host race and Linux focused suites pass
+ten repetitions (`terminal-reply.log`, `terminal-reply-linux.log`, same prefix).
+Original full failure: `/tmp/cv2-g2-item7-full-xfs2.log`; isolated diagnostic:
+`/tmp/cv2-g2-item7-expiry-isolated.log` (selected test pass, wrapper 70).

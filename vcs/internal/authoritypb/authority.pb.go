@@ -2373,6 +2373,9 @@ type Response struct {
 	// Version at which a cache-installing reply was served, including negative
 	// LOOKUP and empty READDIR. Publication must compare with local withdrawals.
 	VolumeVersion uint64 `protobuf:"varint,67,opt,name=volume_version,json=volumeVersion,proto3" json:"volume_version,omitempty"`
+	// This exact session expired or was fenced. Unlike an ordinary ESTALE
+	// capability error, it requires immediate local session enforcement.
+	SessionTerminal bool `protobuf:"varint,69,opt,name=session_terminal,json=sessionTerminal,proto3" json:"session_terminal,omitempty"` // present only with envelope errno ESTALE
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Response_Hello
@@ -2556,6 +2559,13 @@ func (x *Response) GetVolumeVersion() uint64 {
 		return x.VolumeVersion
 	}
 	return 0
+}
+
+func (x *Response) GetSessionTerminal() bool {
+	if x != nil {
+		return x.SessionTerminal
+	}
+	return false
 }
 
 func (x *Response) GetBody() isResponse_Body {
@@ -11721,7 +11731,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\fR\x04name\x12)\n" +
 	"\x10bound_attributes\x18\x03 \x01(\bR\x0fboundAttributes\x12\x1d\n" +
 	"\n" +
-	"bound_data\x18\x04 \x01(\bR\tboundData\"\x98!\n" +
+	"bound_data\x18\x04 \x01(\bR\tboundData\"\xc3!\n" +
 	"\bResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -11739,7 +11749,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x1bfskit_repair_retry_sequence\x184 \x01(\x04R\x18fskitRepairRetrySequence\x12%\n" +
 	"\x0erestore_detail\x187 \x01(\tR\rrestoreDetail\x12)\n" +
 	"\x10applied_sequence\x188 \x01(\x04R\x0fappliedSequence\x12%\n" +
-	"\x0evolume_version\x18C \x01(\x04R\rvolumeVersion\x12;\n" +
+	"\x0evolume_version\x18C \x01(\x04R\rvolumeVersion\x12)\n" +
+	"\x10session_terminal\x18E \x01(\bR\x0fsessionTerminal\x12;\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2#.portablefs.authority.v1.HelloReplyH\x00R\x05hello\x12>\n" +
 	"\x06attach\x18\v \x01(\v2$.portablefs.authority.v1.AttachReplyH\x00R\x06attach\x12>\n" +

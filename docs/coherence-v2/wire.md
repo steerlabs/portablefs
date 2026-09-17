@@ -575,3 +575,10 @@ the grant and report the errno. A partial acceptance record remains retained and
 is excluded from the applied acceptance cut until its final chunk succeeds.
 Scatter spans use the existing single bulk carrier and canonical frame bytes;
 there is no new bulk encoding or payload-copy requirement.
+
+`Response.session_terminal` (69) is an additive terminal-session witness. It is
+true only with envelope ESTALE when this exact Authority session expired or was
+fenced. The client starts local session enforcement before delivering that
+response, even if the transport remains connected. Ordinary stale item/handle
+ESTALE omits the field and remains nonterminal. Epoch mismatch retains the
+existing exact-epoch comparison; this field does not change its recovery path.

@@ -3425,6 +3425,12 @@ func (h *VolumeHandler) success(requestID uint64) *authoritypb.Response {
 }
 
 func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain bool) (response *authoritypb.Response) {
+	defer func() {
+		if response != nil && (errors.Is(err, volumeserver.ErrSessionExpired) || errors.Is(err, volumeserver.ErrSessionFenced)) {
+			response.SessionTerminal = true
+		}
+	}()
+
 	// Generic errors carry no exact applied state for a frontend to publish.
 	// They still start and fence the terminal drain, but only the structured
 	// WRITE/FALLOCATE/CFR post-apply paths may bind a cross-process delivery

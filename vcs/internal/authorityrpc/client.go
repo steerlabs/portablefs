@@ -1592,6 +1592,10 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 }
 
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {
+	if response.GetSessionTerminal() && response.GetErrno() != int32(syscall.ESTALE) {
+		return fmt.Errorf("%w: terminal session response omitted ESTALE", ErrTransportBinding)
+	}
+
 	// The schema keeps historical tags to prevent accidental reuse. This is a
 	// rejection guard shared by every profile, not an executable v6 client.
 	if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil || response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil || response.GetSourceLeaseDischarge() != nil || response.GetAcknowledgeSourceLeaseDischarge() != nil {
@@ -2003,6 +2007,13 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 			releaseFrame()
 			c.failConnection(transport, conn, ErrAuthorityChanged)
 			return
+		}
+		if response.GetSessionTerminal() {
+			if response.GetErrno() != int32(syscall.ESTALE) {
+				c.signalSessionEnd(ErrTransportBinding)
+			} else {
+				c.signalSessionEnd(ErrSessionEnded)
+			}
 		}
 		if response.GetUncertain() {
 			c.signalSessionEnd(ErrTransportUncertain)
