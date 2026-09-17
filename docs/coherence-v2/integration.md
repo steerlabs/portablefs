@@ -1644,3 +1644,13 @@ new-directory-completeness arms remain blocked until the peer heals. Total test
 `/tmp/cv2-g2-footprint-mounted.log`, `footprint-rpc-final.log`,
 `footprint-admissions3.log`, `footprint-fuse.log`, `footprint-race3.log`
 (the latter names use the same `/tmp/cv2-g2-` prefix).
+
+#### G2 gate follow-up: epoch fixture handle registration
+
+The first full XFS gate after item 6 stopped in the epoch-recovery unit fixture:
+it inserted a buffered handle directly into `raw.handles`, bypassing item 5's
+reader/pin accounting. The fixture now uses `addHandle` for its file and root
+directory descriptions. The production underflow invariant stays intact and all
+epoch/loss/stale-handle assertions remain. The full unprivileged FUSE suite
+passes (`/tmp/cv2-g2-epoch-registration.log`); the original gate failure is
+retained in `/tmp/cv2-g2-after-item6-xfs.log`. The full gate is being rerun.
