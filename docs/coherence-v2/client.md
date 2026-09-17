@@ -99,11 +99,12 @@ admission, as specified by the writeback package, so retries retain the same
 timestamps.
 
 Recall retires admission, drains that identity's cache-installing replies,
-flushes the retirement cut, waits for its durability, and acknowledges the
-applied ticket. The extra durability wait retires the old overlay before a
-peer can change the file; it remains inside the recall budget. Final-handle
-release instead detaches the applied overlay while retaining its records until
-durability; it waits only for application. Break flushes a captured cut without
+flushes the retirement cut to application, detaches its read overlay, and
+acknowledges the applied ticket. Its applied records remain charged until the
+durable prefix arrives. Final-handle release uses the same separation of
+visibility ownership from durability. Synchronous range mutations detach the
+applied overlay and resume buffer admission before dispatch, preserving the
+prior records' durability obligation without masking the new Authority bytes. Break flushes a captured cut without
 surrendering ownership. Mode downgrade fences admission
 through the flush before installing WRITETHROUGH. Upgrade installs FULL before
 acknowledgment. A missed budget or an unprovable flush drops retained entries

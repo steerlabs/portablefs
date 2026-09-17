@@ -49,8 +49,6 @@ func TestCreateTruncateRetiresExistingDelegatedOverlayBeforeDispatch(t *testing.
 			order = append(order, "write")
 		case request.GetFsync() != nil:
 			order = append(order, "fsync")
-		case request.GetBarrier() != nil:
-			order = append(order, "barrier")
 		case request.GetCreate() != nil:
 			order = append(order, "create")
 		}
@@ -70,10 +68,7 @@ func TestCreateTruncateRetiresExistingDelegatedOverlayBeforeDispatch(t *testing.
 		case request.GetFsync() != nil:
 			return &authoritypb.Response{Body: &authoritypb.Response_Fsync{Fsync: &authoritypb.FsyncReply{DurableSequence: rpc.applied}}}, nil
 		case request.GetBarrier() != nil:
-			cut := request.GetBarrier().GetCutSequence()
-			return &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{
-				AppliedSequence: cut, DurableSequence: cut,
-			}}}, nil
+			return &authoritypb.Response{Errno: int32(syscall.EAGAIN)}, nil
 		case request.GetCreate() != nil:
 			target := cloneItem(existing)
 			target.Attr.Size = 0
@@ -109,8 +104,11 @@ func TestCreateTruncateRetiresExistingDelegatedOverlayBeforeDispatch(t *testing.
 	orderMu.Lock()
 	got := append([]string(nil), order...)
 	orderMu.Unlock()
-	if want := []string{"write", "barrier", "create"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"write", "create"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("delegated CREATE order = %v, want %v", got, want)
+	}
+	if stats := mount.delegations.buf.Stats(); stats.Entries != 1 || stats.Bytes != 5 {
+		t.Fatalf("CREATE discarded prior durability obligation: %+v", stats)
 	}
 	data, err := mount.delegations.Read(context.Background(), existing.GetStableIdentity(), 0, 4, func(context.Context, int64, int) ([]byte, error) {
 		return []byte("base"), nil

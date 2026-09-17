@@ -409,3 +409,15 @@ horizon; forcing the global target set fails the new regression. Related-parent
 and newly created-directory completeness arms still block before withdrawal.
 This is an isolated partition test, not a claim about ordinary two-mount
 throughput. Log: `/tmp/cv2-g2-footprint-mounted.log`.
+
+## G2 handoff durability follow-up
+
+The unchanged 96-round repeated-open/peer-write regression took 99.89 seconds
+in the full gate after item 6. Removing the recall durability wait alone left
+100.49 seconds; removing the synchronous truncating-open wait as well produced
+0.33 and 0.35 seconds on two focused mounted runs. Both paths retain applied
+records until durability and detach their old read overlay before handoff.
+The 20-second regression bound is unchanged. These are test wall times, not a
+full baseline or an isolated VM experiment; request counts were not collected.
+Logs: `/tmp/cv2-g2-after-item6-xfs2.log`, `/tmp/cv2-g2-recall-mounted.log`,
+`/tmp/cv2-g2-recall-mounted2.log`. Full gates remain required.

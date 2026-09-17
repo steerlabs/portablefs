@@ -1654,3 +1654,36 @@ directory descriptions. The production underflow invariant stays intact and all
 epoch/loss/stale-handle assertions remain. The full unprivileged FUSE suite
 passes (`/tmp/cv2-g2-epoch-registration.log`); the original gate failure is
 retained in `/tmp/cv2-g2-after-item6-xfs.log`. The full gate is being rerun.
+
+#### G2 gate follow-up: application-only handoff
+
+The full XFS gate reached the repeated-open/peer-write regression and failed
+its unchanged 20-second limit: 96 rounds took 99.89 seconds. The one-second
+fallback durability cadence exposed two older visibility paths that waited on
+`Buffer.Fsync`: recall and synchronous range/truncating-open dispatch. Recall
+now flushes to application, detaches the old overlay and acknowledges that
+applied ticket. Synchronous dispatch uses the same detach, then installs the
+successor buffer-generation binding and resumes admission under its operation
+lock. Applied records remain charged until their durable prefix arrives.
+`client.md` now matches the wire contract: recall ACK does not assert durability.
+
+A blocked-durability regression fails the former recall path after 100 ms with
+no ACK and a false loss (`/tmp/cv2-g2-recall-fault.log`). Tests now prove both
+handoffs complete while durability is blocked, retain bytes and loss accounting,
+read the Authority after detach, and flush a successor through the preserved
+grant. CREATE-truncate still checks write-before-create ordering, authoritative
+post-size and no stale overlay; its obsolete requirement for an intervening
+Barrier is replaced by an explicit retained-obligation assertion. Release
+outcome fixtures withhold the background durability prefix so their retained
+record assertions cannot race legitimate retirement.
+
+The recall-only intermediate still took 100.49 seconds, identifying synchronous
+dispatch as the mounted regression's remaining cause. With both paths fixed,
+the exact mounted test passes twice in 0.33 and 0.35 seconds
+(`/tmp/cv2-g2-recall-mounted2.log`). The focused wrapper exits 70 for omitted
+inventory; this is not a full gate result.
+
+Final validation for this follow-up: the full unprivileged FUSE suite passes
+(`/tmp/cv2-g2-recall-fullunit3.log`) and the writeback race suite passes
+(`/tmp/cv2-g2-recall-writeback.log`). Privileged-only tests are left to the full
+Docker gate.

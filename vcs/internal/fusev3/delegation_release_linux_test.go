@@ -26,6 +26,11 @@ func (f *releaseOutcomeRPC) CallIdempotent(ctx context.Context, request *authori
 	return f.delegationFakeRPC.CallIdempotent(ctx, request)
 }
 func (f *releaseOutcomeRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetBarrier() != nil {
+		// These cases inspect retained obligations after ownership transfer.
+		// A background durable prefix would race the assertion itself.
+		return nil, errors.New("durability withheld while checking retained records")
+	}
 	if batch := request.GetCloseBatch(); batch != nil && f.close != nil {
 		return f.close(batch)
 	}

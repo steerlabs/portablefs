@@ -536,6 +536,39 @@ func TestDelegationRecallFlushesThenWithdraws(t *testing.T) {
 	}
 }
 
+// Recall transfers visibility ownership; the applied records still belong to
+// the mount's durability cut after their overlay stops serving reads.
+func TestDelegationRecallAcknowledgesBeforeDurability(t *testing.T) {
+	fake := &delegationBlockedBarrierRPC{barrierStarted: make(chan struct{}), releaseBarrier: make(chan struct{})}
+	m := newDelegationTestManager(t, fake)
+	defer close(fake.releaseBarrier)
+	id := installDelegationForTest(t, m, 29, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), id, 0, []byte("old"), false); err != nil {
+		t.Fatal(err)
+	}
+	grant := delegationTestGrant(61, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	m.HandleControlEvent(t.Context(), &authoritypb.ControlEvent{
+		Incarnation: 7, Sequence: 21, Event: &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{
+			Delegation: &authoritypb.DelegationRef{Id: grant.GetId(), Generation: 1}, Identity: id, BudgetNanos: uint64(100 * time.Millisecond),
+		}},
+	})
+	m.controlWG.Wait()
+	if got := fakeControlCount(&fake.delegationFakeRPC, func(r *authoritypb.Request) bool { return r.GetDelegationRecallAck() != nil }); got != 1 {
+		t.Fatalf("recall waited for durability: acknowledgments=%d loss=%d", got, m.LossSequence())
+	}
+	if stats := m.buf.Stats(); stats.Entries != 1 || stats.Bytes != 3 || m.LossSequence() != 0 {
+		t.Fatalf("applied obligation was discarded: stats=%+v loss=%d", stats, m.LossSequence())
+	}
+	got, err := m.Read(t.Context(), id, 0, 3, func(context.Context, int64, int) ([]byte, error) { return []byte("new"), nil })
+	if err != nil || string(got) != "new" {
+		t.Fatalf("retired overlay still serves reads: %q %v", got, err)
+	}
+	m.durableCurrent(1)
+	if stats := m.buf.Stats(); stats.Entries != 0 || stats.Bytes != 0 {
+		t.Fatalf("durable prefix did not retire recalled records: %+v", stats)
+	}
+}
+
 func TestDelegationRecallStopsServingRetainedOverlay(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)
@@ -711,43 +744,47 @@ func TestDelegationSynchronousFlushesBeforeOperation(t *testing.T) {
 
 func TestDelegationSynchronousRetiresOverlayBeforeExternalMutation(t *testing.T) {
 	fake := &delegationBlockedBarrierRPC{barrierStarted: make(chan struct{}), releaseBarrier: make(chan struct{})}
-	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{FlushInterval: -1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(m.Stop)
+	m := newDelegationTestManager(t, fake)
+	defer close(fake.releaseBarrier)
 	id := installDelegationForTest(t, m, 27, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	if _, err := m.Write(context.Background(), id, 0, []byte("old"), false); err != nil {
+	if _, err := m.Write(t.Context(), id, 0, []byte("old"), false); err != nil {
 		t.Fatal(err)
 	}
-	called := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		_, err := m.Synchronous(context.Background(), id, func(*authoritypb.DelegationRef) (*authoritypb.Response, error) {
-			close(called)
-			return &authoritypb.Response{AppliedSequence: 2}, nil
-		})
-		done <- err
-	}()
-	select {
-	case <-fake.barrierStarted:
-	case <-time.After(time.Second):
-		t.Fatal("prior write did not enter durability barrier")
-	}
-	select {
-	case <-called:
-		t.Fatal("external mutation ran before prior overlay retired")
-	default:
-	}
-	close(fake.releaseBarrier)
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	got, err := m.Read(context.Background(), id, 0, 3, func(context.Context, int64, int) ([]byte, error) {
-		return []byte("new"), nil
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	_, err := m.Synchronous(ctx, id, func(*authoritypb.DelegationRef) (*authoritypb.Response, error) {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		if len(fake.mutations) != 1 || fake.mutations[0].GetWrite() == nil {
+			t.Fatal("external mutation overtook buffered WRITE")
+		}
+		fake.sequence = 2
+		return &authoritypb.Response{AppliedSequence: 2}, nil
 	})
+	if err != nil {
+		t.Fatalf("external mutation waited for durability: %v", err)
+	}
+	if stats := m.buf.Stats(); stats.Entries != 1 || stats.Bytes != 3 || m.LossSequence() != 0 {
+		t.Fatalf("prior durability obligation discarded: %+v", stats)
+	}
+	got, err := m.Read(t.Context(), id, 0, 3, func(context.Context, int64, int) ([]byte, error) { return []byte("new"), nil })
 	if err != nil || string(got) != "new" {
 		t.Fatalf("post-mutation overlay read=(%q, %v), want Authority bytes", got, err)
+	}
+	if _, err := m.Write(t.Context(), id, 0, []byte("next"), false); err != nil {
+		t.Fatalf("successor generation did not resume admission: %v", err)
+	}
+	if _, err := m.FlushIdentity(t.Context(), id); err != nil {
+		t.Fatalf("successor buffer generation has no valid binding: %v", err)
+	}
+	fake.mu.Lock()
+	if len(fake.mutations) != 2 || !sameDelegation(fake.mutations[0].GetWrite().GetDelegation(), fake.mutations[1].GetWrite().GetDelegation()) {
+		t.Error("successor WRITE lost the preserved grant")
+	}
+	fake.mu.Unlock()
+	m.durableCurrent(2)
+	if stats := m.buf.Stats(); stats.Entries != 1 || stats.Bytes != 4 {
+		t.Fatalf("durable prefix retired successor or retained old records: %+v", stats)
 	}
 }
 

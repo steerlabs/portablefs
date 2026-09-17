@@ -1078,7 +1078,31 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	// An external range mutation can replace bytes represented by retained
 	// applied extents. Retire the prior cut before dispatch so the holder's
 	// overlay cannot hide the operation's new Authority contents afterward.
-	if err := m.buf.Fsync(ctx, id); err != nil {
+	retire, err := m.beginRetire(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = m.buf.FlushIdentity(ctx, id, retire.Cut()); err == nil {
+		err = retire.DetachOverlay()
+	}
+	s.admission.Lock()
+	finished := err != nil
+	if err == nil {
+		next := m.buf.Generation(id) + 1
+		s.bindings[next] = delegationBinding{ref: cloneDelegationRef(ref), item: cloneBytes(s.item), generation: next}
+		err = retire.Resume()
+		finished = err == nil
+		if err != nil {
+			delete(s.bindings, next)
+		}
+	} else {
+		retire.Cancel()
+	}
+	if finished && s.retire == retire {
+		s.retire = nil
+	}
+	s.admission.Unlock()
+	if err != nil {
 		return nil, err
 	}
 	response, err := call(ref)
@@ -1408,10 +1432,10 @@ func (m *delegationManager) recall(ctx context.Context, event *authoritypb.Contr
 		applied = delegationApplied(s, applied)
 	}
 	if err == nil {
-		// Once ownership is surrendered, a peer may replace these ranges. Retire
-		// the old overlay first so a later local read or reacquisition cannot
-		// mask the peer's Authority bytes with retained applied extents.
-		err = m.buf.Fsync(ctx, s.identity)
+		// A recall transfers visibility, not durability. Stop serving the old
+		// overlay before ACK while retaining its applied records until the
+		// durable prefix arrives; a peer can replace these ranges meanwhile.
+		err = retire.DetachOverlay()
 	}
 	if err == nil {
 		ack := &authoritypb.DelegationRecallAck{Incarnation: event.GetIncarnation(), EventSequence: event.GetSequence(), Delegation: cloneDelegationRef(s.ref), AppliedSequence: applied}
