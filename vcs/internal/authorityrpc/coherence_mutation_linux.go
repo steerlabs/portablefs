@@ -327,8 +327,13 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				}
 			}
 			op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
+			applied := response.GetAppliedSequence()
 			if withdrawal.Position != 0 {
-				wait := func() { _ = h.Coherence.WaitTargeted(context.WithoutCancel(ctx), withdrawal) }
+				wait := func() {
+					if h.Coherence.WaitTargeted(context.WithoutCancel(ctx), withdrawal) == nil {
+						h.coherenceDurability.markVisible(cred.ID, applied)
+					}
+				}
 				if response.GetAppliedSequence() != 0 && (coherenceFlushReference(req) != nil || op != nil && op.delegation.ID != 0) {
 					// The response is an application receipt. Holder cut acknowledgments must
 					// be able to pass a withdrawal of the holder's pending read publication.
@@ -336,7 +341,10 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				} else {
 					wait()
 				}
+			} else {
+				h.coherenceDurability.markVisible(cred.ID, applied)
 			}
+			response.VisibleSequence = h.coherenceDurability.latestVisible(cred.ID)
 			if op != nil && op.reservation != nil {
 				if response.GetErrno() != 0 {
 					op.reservation.Abort()

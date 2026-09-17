@@ -269,14 +269,12 @@ func (b *Buffer) VisibleSequence(seq uint64) {
 	b.signal()
 }
 
-// DurableSequence is a cumulative Authority watermark. The integration must
-// deliver it only after visibility through seq is established. It therefore
-// proves both Visible and Durable, even if it races ahead of a Flush reply.
+// DurableSequence is a cumulative Authority storage watermark. Visibility is
+// established independently by VisibleSequence; either proof may arrive first.
 func (b *Buffer) DurableSequence(seq uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.durable = max(b.durable, seq)
-	b.visible = max(b.visible, seq)
 	b.advanceLocked()
 	b.signal()
 }
@@ -362,6 +360,43 @@ func (b *Buffer) waitDurable(ctx context.Context, id *Identity, cut Cut) error {
 			}
 			for _, f := range b.active {
 				pending = pending || (f.head != nil && f.head.seq <= cut.Sequence)
+			}
+		}
+		if !pending {
+			return nil
+		}
+		if b.stopped {
+			return ErrLost
+		}
+		ch := b.change()
+		b.mu.Unlock()
+		err := wait(ctx, ch)
+		b.mu.Lock()
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (b *Buffer) WaitVisible(ctx context.Context, id Identity, cut Cut) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for {
+		f := b.files[id]
+		if f == nil {
+			return nil
+		}
+		if f.lastLoss > cut.LossSequence {
+			if f.lastGenericLoss > cut.LossSequence {
+				return ErrLost
+			}
+			return recordedLossError(f.lastErrno)
+		}
+		pending := false
+		for r := f.head; r != nil && r.seq <= cut.Sequence; r = r.next {
+			if r.state == Accepted || r.state == Applied {
+				pending = true
+				break
 			}
 		}
 		if !pending {

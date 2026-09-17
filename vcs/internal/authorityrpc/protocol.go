@@ -81,6 +81,7 @@ const boundedControlReplayFeature = "bounded-control-replay-v1"
 const delegationControlFeature = "delegation-control-v1"
 const durableSequenceFeature = "session-durable-sequence-v1"
 const directoryBarrierFeature = "root-directory-barrier-v1"
+const visibilityCompletionFeature = "foreground-visibility-completion-v1"
 const fskitSyncRepairFeature = "fskit-sync-repair-v1"
 const fskitSourcePublicationFeature = "fskit-source-publication-v1"
 const fskitFragmentedWriteFeature = "fskit-fragmented-write-v1"
@@ -105,6 +106,7 @@ var (
 	requiredLinuxAttachFeatures = []string{
 		"direct-io-no-file-mmap", "distributed-posix-locks",
 		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, boundedControlReplayFeature,
+		visibilityCompletionFeature,
 	}
 	requiredFskitAttachFeatures = []string{
 		"write-through",
@@ -177,6 +179,9 @@ func hasFeatures(advertised, required []string) bool {
 // admission lane on both peers so they can never consume the last ordinary
 // execution slot, which is what a keepalive needs to stay live.
 func blockingWait(req *authoritypb.Request) bool {
+	if req.GetWaitVisibility() != nil {
+		return true
+	}
 	lock := req.GetSetLock()
 	return lock != nil && lock.GetWait() && !lock.GetUnlock()
 }
@@ -302,7 +307,7 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 			*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
 			*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
 			*authoritypb.Request_DelegationModeChangeAck, *authoritypb.Request_DelegationRelease,
-			*authoritypb.Request_Barrier:
+			*authoritypb.Request_Barrier, *authoritypb.Request_WaitVisibility:
 			return true
 		default:
 			return common()
@@ -458,6 +463,7 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 		*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
 		*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
 		*authoritypb.Request_DelegationModeChangeAck, *authoritypb.Request_DelegationRelease,
+		*authoritypb.Request_WaitVisibility,
 		*authoritypb.Request_ApplyRoutes:
 		return false
 	case *authoritypb.Request_SetLock:

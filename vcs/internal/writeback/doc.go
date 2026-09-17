@@ -38,11 +38,9 @@
 // Every record follows accepted -> applied -> visible -> durable (retired), or
 // any retained state -> lost on Drop. Flush acknowledgments supply nonzero,
 // nondecreasing per-identity Authority sequences. VisibleSequence advances the
-// optional intermediate state. DurableSequence proves visibility as well as
-// durability: integration must delay that notification until change delivery
-// or subscriber horizons establish visibility through the watermark. Early,
-// duplicate, and reordered cumulative notifications are safe, including ones
-// delivered from inside Flusher.Flush before its reply. For a chunked write,
+// peer-withdrawal state, while DurableSequence advances the independent storage
+// watermark. Either may arrive first; retirement requires both. Early,
+// duplicate, and reordered cumulative notifications are safe. For a chunked write,
 // all chunks must apply before the original acceptance becomes applied; the
 // last chunk's sequence covers the complete write.
 //

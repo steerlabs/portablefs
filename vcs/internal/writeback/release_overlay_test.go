@@ -55,6 +55,7 @@ func TestReleasedOverlayRetainsDurabilityAndProtectsSuccessor(t *testing.T) {
 	if _, err := b.Write(t.Context(), id, 4, []byte("new")); err != nil {
 		t.Fatal(err)
 	}
+	b.VisibleSequence(applied)
 	b.DurableSequence(applied)
 	if b.Stats().Entries != 2 {
 		t.Fatal("old prefix retired successor records")
@@ -70,6 +71,7 @@ func TestReleasedOverlayRetainsDurabilityAndProtectsSuccessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	b.VisibleSequence(last)
 	b.DurableSequence(last)
 	if b.Stats().Entries != 0 {
 		t.Fatal("durable records retained")

@@ -219,6 +219,7 @@ func TestBufferStateTransitionsAndPartialOverlayRetirement(t *testing.T) {
 	assertStats(t, b, Stats{Bytes: 10, Entries: 2, Applied: 2})
 	b.VisibleSequence(10)
 	assertStats(t, b, Stats{Bytes: 10, Entries: 2, Applied: 1, Visible: 1})
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	assertStats(t, b, Stats{Bytes: 2, Entries: 1, Applied: 1})
 	// The old extent is now in the Authority image. The newer dirty extent must
@@ -227,12 +228,13 @@ func TestBufferStateTransitionsAndPartialOverlayRetirement(t *testing.T) {
 
 	b.VisibleSequence(20)
 	assertStats(t, b, Stats{Bytes: 2, Entries: 1, Visible: 1})
+	b.VisibleSequence(20)
 	b.DurableSequence(20)
 	assertStats(t, b, Stats{})
 	assertRead(t, b, id, 0, 8, []byte("ABxyEFGH"), []byte("ABxyEFGH"))
 }
 
-func TestDurableNotificationMayRaceAheadOfFlushReply(t *testing.T) {
+func TestDurabilityCannotStandInForVisibility(t *testing.T) {
 	var b *Buffer
 	flusher := flusherFunc(func(_ context.Context, _ Identity, _ Entry) (uint64, error) {
 		b.DurableSequence(42)
@@ -245,6 +247,18 @@ func TestDurableNotificationMayRaceAheadOfFlushReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := b.FlushIdentity(context.Background(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	assertStats(t, b, Stats{Bytes: 1, Entries: 1, Applied: 1})
+	visible := make(chan error, 1)
+	go func() { visible <- b.WaitVisible(context.Background(), id, cut) }()
+	select {
+	case err := <-visible:
+		t.Fatalf("durability completed visibility wait: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	b.VisibleSequence(42)
+	if err := await(t, visible, "visibility wait"); err != nil {
 		t.Fatal(err)
 	}
 	assertStats(t, b, Stats{})
@@ -274,15 +288,18 @@ func TestPartialDurabilityRetiresOldWriteAndTruncateButKeepsLaterWrite(t *testin
 	want := []byte{'A', 'B', 'C', 0, 0, 'Z'}
 	assertRead(t, b, id, 0, 20, []byte("abcdefgh"), want)
 
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	assertStats(t, b, Stats{Bytes: 1, Entries: 2, Applied: 2})
 	assertRead(t, b, id, 0, 20, []byte("ABCDEFGH"), want)
+	b.VisibleSequence(20)
 	b.DurableSequence(20)
 	assertStats(t, b, Stats{Bytes: 1, Entries: 1, Applied: 1})
 	assertRead(t, b, id, 0, 20, []byte("ABC"), want)
 	if got := b.Size(id, 3); got != 6 {
 		t.Fatalf("size after truncate retirement with later write = %d, want 6", got)
 	}
+	b.VisibleSequence(30)
 	b.DurableSequence(30)
 	assertStats(t, b, Stats{})
 }
@@ -632,6 +649,7 @@ func TestAdmissionBlocksAtCapsUntilDurableRetirement(t *testing.T) {
 			close(release)
 			// Application alone does not release retained dirty capacity.
 			assertBlocked(t, result, "admission before durability")
+			b.VisibleSequence(10)
 			b.DurableSequence(10)
 			if err := await(t, result, "admission after durability"); err != nil {
 				t.Fatal(err)
@@ -695,6 +713,7 @@ func TestFullByteCapBlocksMetadataAdmissions(t *testing.T) {
 	close(release)
 	assertBlocked(t, truncated, "truncate before durable retirement")
 	assertBlocked(t, attributed, "setattr before durable retirement")
+	b.VisibleSequence(12)
 	b.DurableSequence(12)
 	if err := await(t, truncated, "truncate after capacity release"); err != nil {
 		t.Fatal(err)
@@ -1110,6 +1129,7 @@ func TestFsyncWaitsForItsIdentityCutOnly(t *testing.T) {
 		t.Fatalf("Fsync flushed %x, want %x", id, target)
 	}
 	assertBlocked(t, result, "Fsync before durability")
+	b.VisibleSequence(40)
 	b.DurableSequence(40)
 	if err := await(t, result, "Fsync target durability"); err != nil {
 		t.Fatal(err)
@@ -1147,6 +1167,7 @@ func TestBarrierUsesCallTimeCutAndReportsObservedLoss(t *testing.T) {
 	}
 	mustWrite(t, b, after, 0, "after")
 	close(release)
+	b.VisibleSequence(80)
 	b.DurableSequence(80)
 	got := await(t, result, "barrier")
 	if got.lost || got.err != nil {
@@ -1235,6 +1256,7 @@ func TestReadSnapshotSurvivesConcurrentDurableRetirement(t *testing.T) {
 		}{data, err}
 	}()
 	await(t, fetchEntered, "blocked fetch after overlay snapshot")
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	assertStats(t, b, Stats{})
 	close(fetchRelease)
@@ -1296,6 +1318,7 @@ func TestForgetOnlyReleasesIdleCleanIdentity(t *testing.T) {
 	if _, err := b.FlushIdentity(context.Background(), id, cut); err != nil {
 		t.Fatal(err)
 	}
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	if !b.Forget(id) {
 		t.Fatal("Forget clean identity = false")
@@ -1529,6 +1552,7 @@ func TestImplicitTimestampOverlayPreservesOrderUntilDurability(t *testing.T) {
 	if got := b.OverlayAttributes(id, base); got != want {
 		t.Fatalf("application retired implicit attributes: got %+v want %+v", got, want)
 	}
+	b.VisibleSequence(sequence)
 	b.DurableSequence(sequence)
 	if got := b.OverlayAttributes(id, base); got.MTimeNS != base.MTimeNS || got.CTimeNS != base.CTimeNS {
 		t.Fatalf("durable overlay did not retire: %+v", got)

@@ -1118,6 +1118,7 @@ type Request struct {
 	//	*Request_Barrier
 	//	*Request_DelegationRelease
 	//	*Request_CloseBatch
+	//	*Request_WaitVisibility
 	Body          isRequest_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1715,6 +1716,15 @@ func (x *Request) GetCloseBatch() *CloseBatchRequest {
 	return nil
 }
 
+func (x *Request) GetWaitVisibility() *WaitVisibilityRequest {
+	if x != nil {
+		if x, ok := x.Body.(*Request_WaitVisibility); ok {
+			return x.WaitVisibility
+		}
+	}
+	return nil
+}
+
 type isRequest_Body interface {
 	isRequest_Body()
 }
@@ -1960,6 +1970,10 @@ type Request_CloseBatch struct {
 	CloseBatch *CloseBatchRequest `protobuf:"bytes,74,opt,name=close_batch,json=closeBatch,proto3,oneof"`
 }
 
+type Request_WaitVisibility struct {
+	WaitVisibility *WaitVisibilityRequest `protobuf:"bytes,75,opt,name=wait_visibility,json=waitVisibility,proto3,oneof"`
+}
+
 func (*Request_Hello) isRequest_Body() {}
 
 func (*Request_Attach) isRequest_Body() {}
@@ -2073,6 +2087,8 @@ func (*Request_Barrier) isRequest_Body() {}
 func (*Request_DelegationRelease) isRequest_Body() {}
 
 func (*Request_CloseBatch) isRequest_Body() {}
+
+func (*Request_WaitVisibility) isRequest_Body() {}
 
 type FskitSourcePublication struct {
 	state         protoimpl.MessageState          `protogen:"open.v1"`
@@ -2376,6 +2392,9 @@ type Response struct {
 	// This exact session expired or was fenced. Unlike an ordinary ESTALE
 	// capability error, it requires immediate local session enforcement.
 	SessionTerminal bool `protobuf:"varint,69,opt,name=session_terminal,json=sessionTerminal,proto3" json:"session_terminal,omitempty"` // present only with envelope errno ESTALE
+	// Largest contiguous session application prefix whose peer withdrawals have
+	// completed. Durability is reported separately and does not imply this cut.
+	VisibleSequence uint64 `protobuf:"varint,70,opt,name=visible_sequence,json=visibleSequence,proto3" json:"visible_sequence,omitempty"`
 	// Types that are valid to be assigned to Body:
 	//
 	//	*Response_Hello
@@ -2421,6 +2440,7 @@ type Response struct {
 	//	*Response_DelegationRelease
 	//	*Response_Fsync
 	//	*Response_CloseBatch
+	//	*Response_WaitVisibility
 	Body          isResponse_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2566,6 +2586,13 @@ func (x *Response) GetSessionTerminal() bool {
 		return x.SessionTerminal
 	}
 	return false
+}
+
+func (x *Response) GetVisibleSequence() uint64 {
+	if x != nil {
+		return x.VisibleSequence
+	}
+	return 0
 }
 
 func (x *Response) GetBody() isResponse_Body {
@@ -2962,6 +2989,15 @@ func (x *Response) GetCloseBatch() *CloseBatchReply {
 	return nil
 }
 
+func (x *Response) GetWaitVisibility() *WaitVisibilityReply {
+	if x != nil {
+		if x, ok := x.Body.(*Response_WaitVisibility); ok {
+			return x.WaitVisibility
+		}
+	}
+	return nil
+}
+
 type isResponse_Body interface {
 	isResponse_Body()
 }
@@ -3139,6 +3175,10 @@ type Response_CloseBatch struct {
 	CloseBatch *CloseBatchReply `protobuf:"bytes,68,opt,name=close_batch,json=closeBatch,proto3,oneof"`
 }
 
+type Response_WaitVisibility struct {
+	WaitVisibility *WaitVisibilityReply `protobuf:"bytes,71,opt,name=wait_visibility,json=waitVisibility,proto3,oneof"`
+}
+
 func (*Response_Hello) isResponse_Body() {}
 
 func (*Response_Attach) isResponse_Body() {}
@@ -3224,6 +3264,8 @@ func (*Response_DelegationRelease) isResponse_Body() {}
 func (*Response_Fsync) isResponse_Body() {}
 
 func (*Response_CloseBatch) isResponse_Body() {}
+
+func (*Response_WaitVisibility) isResponse_Body() {}
 
 // TerminalDeliveryReceipt is sent on CONTROL only after the frontend has
 // consumed an exact terminal mutation outcome: a no-change result reached its
@@ -10094,7 +10136,7 @@ func (x *SetLockRequest) GetUnlock() bool {
 
 // Protocol 7 coherence. Normative ordering and counter domains are specified in
 // docs/coherence-v2/wire.md. All these control requests use CONTROL except Barrier
-// (DATA). Stable identities are coordination keys, never capabilities.
+// and WaitVisibility (DATA). Stable identities are coordination keys, never capabilities.
 type SubscribeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SnapshotId    []byte                 `protobuf:"bytes,1,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`          // empty starts a cold subscription; otherwise pagination
@@ -11670,11 +11712,109 @@ func (x *BarrierReply) GetDurableSequence() uint64 {
 	return 0
 }
 
+// Waits for peer cache withdrawal through one already-issued session
+// application ticket. It performs no storage or durability operation.
+type WaitVisibilityRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	CutSequence   uint64                 `protobuf:"varint,1,opt,name=cut_sequence,json=cutSequence,proto3" json:"cut_sequence,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WaitVisibilityRequest) Reset() {
+	*x = WaitVisibilityRequest{}
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[138]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WaitVisibilityRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WaitVisibilityRequest) ProtoMessage() {}
+
+func (x *WaitVisibilityRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[138]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WaitVisibilityRequest.ProtoReflect.Descriptor instead.
+func (*WaitVisibilityRequest) Descriptor() ([]byte, []int) {
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{138}
+}
+
+func (x *WaitVisibilityRequest) GetCutSequence() uint64 {
+	if x != nil {
+		return x.CutSequence
+	}
+	return 0
+}
+
+type WaitVisibilityReply struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	AppliedSequence uint64                 `protobuf:"varint,1,opt,name=applied_sequence,json=appliedSequence,proto3" json:"applied_sequence,omitempty"`
+	VisibleSequence uint64                 `protobuf:"varint,2,opt,name=visible_sequence,json=visibleSequence,proto3" json:"visible_sequence,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *WaitVisibilityReply) Reset() {
+	*x = WaitVisibilityReply{}
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[139]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WaitVisibilityReply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WaitVisibilityReply) ProtoMessage() {}
+
+func (x *WaitVisibilityReply) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[139]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WaitVisibilityReply.ProtoReflect.Descriptor instead.
+func (*WaitVisibilityReply) Descriptor() ([]byte, []int) {
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{139}
+}
+
+func (x *WaitVisibilityReply) GetAppliedSequence() uint64 {
+	if x != nil {
+		return x.AppliedSequence
+	}
+	return 0
+}
+
+func (x *WaitVisibilityReply) GetVisibleSequence() uint64 {
+	if x != nil {
+		return x.VisibleSequence
+	}
+	return 0
+}
+
 var File_proto_authority_v1_authority_proto protoreflect.FileDescriptor
 
 const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\n" +
-	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xff&\n" +
+	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xda'\n" +
 	"\aRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -11745,7 +11885,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\abarrier\x18H \x01(\v2'.portablefs.authority.v1.BarrierRequestH\x00R\abarrier\x12b\n" +
 	"\x12delegation_release\x18I \x01(\v21.portablefs.authority.v1.DelegationReleaseRequestH\x00R\x11delegationRelease\x12M\n" +
 	"\vclose_batch\x18J \x01(\v2*.portablefs.authority.v1.CloseBatchRequestH\x00R\n" +
-	"closeBatchB\x06\n" +
+	"closeBatch\x12Y\n" +
+	"\x0fwait_visibility\x18K \x01(\v2..portablefs.authority.v1.WaitVisibilityRequestH\x00R\x0ewaitVisibilityB\x06\n" +
 	"\x04bodyJ\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\x10\x10\x11J\x04\b\x11\x10\x12J\x04\b!\x10\"J\x04\b.\x10/R\x15frontend_operation_idR\x16source_phase_queueableR\x17source_publication_gateR\x1fvisibility_retry_after_sequenceR\x0fnext_visibilityR\x0eack_visibilityR\x11write_transaction\"i\n" +
 	"\x16FskitSourcePublication\x12O\n" +
 	"\atargets\x18\x01 \x03(\v25.portablefs.authority.v1.FskitSourcePublicationTargetR\atargets\"\xd1\x01\n" +
@@ -11765,7 +11906,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\fR\x04name\x12)\n" +
 	"\x10bound_attributes\x18\x03 \x01(\bR\x0fboundAttributes\x12\x1d\n" +
 	"\n" +
-	"bound_data\x18\x04 \x01(\bR\tboundData\"\xc3!\n" +
+	"bound_data\x18\x04 \x01(\bR\tboundData\"\xc7\"\n" +
 	"\bResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -11784,7 +11925,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x0erestore_detail\x187 \x01(\tR\rrestoreDetail\x12)\n" +
 	"\x10applied_sequence\x188 \x01(\x04R\x0fappliedSequence\x12%\n" +
 	"\x0evolume_version\x18C \x01(\x04R\rvolumeVersion\x12)\n" +
-	"\x10session_terminal\x18E \x01(\bR\x0fsessionTerminal\x12;\n" +
+	"\x10session_terminal\x18E \x01(\bR\x0fsessionTerminal\x12)\n" +
+	"\x10visible_sequence\x18F \x01(\x04R\x0fvisibleSequence\x12;\n" +
 	"\x05hello\x18\n" +
 	" \x01(\v2#.portablefs.authority.v1.HelloReplyH\x00R\x05hello\x12>\n" +
 	"\x06attach\x18\v \x01(\v2$.portablefs.authority.v1.AttachReplyH\x00R\x06attach\x12>\n" +
@@ -11833,7 +11975,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x12delegation_release\x18A \x01(\v2/.portablefs.authority.v1.DelegationReleaseReplyH\x00R\x11delegationRelease\x12;\n" +
 	"\x05fsync\x18B \x01(\v2#.portablefs.authority.v1.FsyncReplyH\x00R\x05fsync\x12K\n" +
 	"\vclose_batch\x18D \x01(\v2(.portablefs.authority.v1.CloseBatchReplyH\x00R\n" +
-	"closeBatchB\x06\n" +
+	"closeBatch\x12W\n" +
+	"\x0fwait_visibility\x18G \x01(\v2,.portablefs.authority.v1.WaitVisibilityReplyH\x00R\x0ewaitVisibilityB\x06\n" +
 	"\x04bodyJ\x04\b\x05\x10\x06J\x04\b+\x10,J\x04\b\x1a\x10\x1bJ\x04\b!\x10\"J\x04\b&\x10'R\tpost_attrR\x19visibility_retry_sequenceR\n" +
 	"visibilityR\x11write_transaction\"/\n" +
 	"\x17TerminalDeliveryReceipt\x12\x14\n" +
@@ -12501,7 +12644,12 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\fcut_sequence\x18\x01 \x01(\x04R\vcutSequence\"d\n" +
 	"\fBarrierReply\x12)\n" +
 	"\x10applied_sequence\x18\x01 \x01(\x04R\x0fappliedSequence\x12)\n" +
-	"\x10durable_sequence\x18\x02 \x01(\x04R\x0fdurableSequence*\x84\x02\n" +
+	"\x10durable_sequence\x18\x02 \x01(\x04R\x0fdurableSequence\":\n" +
+	"\x15WaitVisibilityRequest\x12!\n" +
+	"\fcut_sequence\x18\x01 \x01(\x04R\vcutSequence\"k\n" +
+	"\x13WaitVisibilityReply\x12)\n" +
+	"\x10applied_sequence\x18\x01 \x01(\x04R\x0fappliedSequence\x12)\n" +
+	"\x10visible_sequence\x18\x02 \x01(\x04R\x0fvisibleSequence*\x84\x02\n" +
 	"\fFailureClass\x12\x1d\n" +
 	"\x19FAILURE_CLASS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15FAILURE_CLASS_STORAGE\x10\x01\x12\x1a\n" +
@@ -12604,7 +12752,7 @@ func file_proto_authority_v1_authority_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_authority_v1_authority_proto_enumTypes = make([]protoimpl.EnumInfo, 18)
-var file_proto_authority_v1_authority_proto_msgTypes = make([]protoimpl.MessageInfo, 138)
+var file_proto_authority_v1_authority_proto_msgTypes = make([]protoimpl.MessageInfo, 140)
 var file_proto_authority_v1_authority_proto_goTypes = []any{
 	(FailureClass)(0),                              // 0: portablefs.authority.v1.FailureClass
 	(TransportRole)(0),                             // 1: portablefs.authority.v1.TransportRole
@@ -12762,6 +12910,8 @@ var file_proto_authority_v1_authority_proto_goTypes = []any{
 	(*DelegationReleaseReply)(nil),                 // 153: portablefs.authority.v1.DelegationReleaseReply
 	(*BarrierRequest)(nil),                         // 154: portablefs.authority.v1.BarrierRequest
 	(*BarrierReply)(nil),                           // 155: portablefs.authority.v1.BarrierReply
+	(*WaitVisibilityRequest)(nil),                  // 156: portablefs.authority.v1.WaitVisibilityRequest
+	(*WaitVisibilityReply)(nil),                    // 157: portablefs.authority.v1.WaitVisibilityReply
 }
 var file_proto_authority_v1_authority_proto_depIdxs = []int32{
 	26,  // 0: portablefs.authority.v1.Request.session:type_name -> portablefs.authority.v1.SessionProof
@@ -12824,154 +12974,156 @@ var file_proto_authority_v1_authority_proto_depIdxs = []int32{
 	154, // 57: portablefs.authority.v1.Request.barrier:type_name -> portablefs.authority.v1.BarrierRequest
 	152, // 58: portablefs.authority.v1.Request.delegation_release:type_name -> portablefs.authority.v1.DelegationReleaseRequest
 	92,  // 59: portablefs.authority.v1.Request.close_batch:type_name -> portablefs.authority.v1.CloseBatchRequest
-	20,  // 60: portablefs.authority.v1.FskitSourcePublication.targets:type_name -> portablefs.authority.v1.FskitSourcePublicationTarget
-	21,  // 61: portablefs.authority.v1.FskitSourcePublicationTarget.item:type_name -> portablefs.authority.v1.FskitSourcePublicationItem
-	22,  // 62: portablefs.authority.v1.FskitSourcePublicationTarget.namespace:type_name -> portablefs.authority.v1.FskitSourcePublicationNamespace
-	28,  // 63: portablefs.authority.v1.Response.mutation:type_name -> portablefs.authority.v1.MutationState
-	0,   // 64: portablefs.authority.v1.Response.failure:type_name -> portablefs.authority.v1.FailureClass
-	29,  // 65: portablefs.authority.v1.Response.routes_mismatch:type_name -> portablefs.authority.v1.RoutesMismatch
-	32,  // 66: portablefs.authority.v1.Response.post_state:type_name -> portablefs.authority.v1.PostState
-	58,  // 67: portablefs.authority.v1.Response.lease_grants:type_name -> portablefs.authority.v1.LeaseGrant
-	69,  // 68: portablefs.authority.v1.Response.source_lease_discharge:type_name -> portablefs.authority.v1.SourceLeaseDischarge
-	35,  // 69: portablefs.authority.v1.Response.hello:type_name -> portablefs.authority.v1.HelloReply
-	37,  // 70: portablefs.authority.v1.Response.attach:type_name -> portablefs.authority.v1.AttachReply
-	39,  // 71: portablefs.authority.v1.Response.resume:type_name -> portablefs.authority.v1.ResumeReply
-	41,  // 72: portablefs.authority.v1.Response.activate:type_name -> portablefs.authority.v1.ActivateReply
-	43,  // 73: portablefs.authority.v1.Response.abort_attach:type_name -> portablefs.authority.v1.AbortAttachReply
-	73,  // 74: portablefs.authority.v1.Response.lookup:type_name -> portablefs.authority.v1.LookupReply
-	75,  // 75: portablefs.authority.v1.Response.get_attr:type_name -> portablefs.authority.v1.GetAttrReply
-	79,  // 76: portablefs.authority.v1.Response.create:type_name -> portablefs.authority.v1.CreateReply
-	88,  // 77: portablefs.authority.v1.Response.readlink:type_name -> portablefs.authority.v1.ReadlinkReply
-	90,  // 78: portablefs.authority.v1.Response.open:type_name -> portablefs.authority.v1.OpenReply
-	96,  // 79: portablefs.authority.v1.Response.read:type_name -> portablefs.authority.v1.ReadReply
-	112, // 80: portablefs.authority.v1.Response.read_dir:type_name -> portablefs.authority.v1.ReadDirReply
-	115, // 81: portablefs.authority.v1.Response.get_xattr:type_name -> portablefs.authority.v1.GetXattrReply
-	118, // 82: portablefs.authority.v1.Response.list_xattr:type_name -> portablefs.authority.v1.ListXattrReply
-	121, // 83: portablefs.authority.v1.Response.stat_fs:type_name -> portablefs.authority.v1.StatFSReply
-	127, // 84: portablefs.authority.v1.Response.get_lock:type_name -> portablefs.authority.v1.GetLockReply
-	85,  // 85: portablefs.authority.v1.Response.link:type_name -> portablefs.authority.v1.LinkReply
-	54,  // 86: portablefs.authority.v1.Response.apply_routes:type_name -> portablefs.authority.v1.ApplyRoutesReply
-	123, // 87: portablefs.authority.v1.Response.sync_fs:type_name -> portablefs.authority.v1.SyncFSReply
-	46,  // 88: portablefs.authority.v1.Response.reauthorize:type_name -> portablefs.authority.v1.ReauthorizeReply
-	83,  // 89: portablefs.authority.v1.Response.rename:type_name -> portablefs.authority.v1.RenameReply
-	103, // 90: portablefs.authority.v1.Response.fallocate:type_name -> portablefs.authority.v1.FallocateReply
-	104, // 91: portablefs.authority.v1.Response.copy_file_range:type_name -> portablefs.authority.v1.CopyFileRangeReply
-	106, // 92: portablefs.authority.v1.Response.tmpfile:type_name -> portablefs.authority.v1.TmpfileReply
-	25,  // 93: portablefs.authority.v1.Response.terminal_delivery_receipt:type_name -> portablefs.authority.v1.TerminalDeliveryReceiptReply
-	98,  // 94: portablefs.authority.v1.Response.write:type_name -> portablefs.authority.v1.WriteReply
-	61,  // 95: portablefs.authority.v1.Response.lease_event:type_name -> portablefs.authority.v1.LeaseEvent
-	65,  // 96: portablefs.authority.v1.Response.acknowledge_lease_event:type_name -> portablefs.authority.v1.AcknowledgeLeaseEventReply
-	68,  // 97: portablefs.authority.v1.Response.renew_leases:type_name -> portablefs.authority.v1.RenewLeasesReply
-	71,  // 98: portablefs.authority.v1.Response.acknowledge_source_lease_discharge:type_name -> portablefs.authority.v1.AcknowledgeSourceLeaseDischargeReply
-	52,  // 99: portablefs.authority.v1.Response.fskit_repair:type_name -> portablefs.authority.v1.VisibilityEvent
-	100, // 100: portablefs.authority.v1.Response.fskit_write:type_name -> portablefs.authority.v1.FskitWriteReply
-	130, // 101: portablefs.authority.v1.Response.subscribe:type_name -> portablefs.authority.v1.SubscribeReply
-	132, // 102: portablefs.authority.v1.Response.renew_subscription:type_name -> portablefs.authority.v1.RenewSubscriptionReply
-	134, // 103: portablefs.authority.v1.Response.control_event:type_name -> portablefs.authority.v1.ControlEvent
-	139, // 104: portablefs.authority.v1.Response.change_ack:type_name -> portablefs.authority.v1.ChangeAckReply
-	146, // 105: portablefs.authority.v1.Response.delegation_recall_ack:type_name -> portablefs.authority.v1.DelegationRecallAckReply
-	148, // 106: portablefs.authority.v1.Response.delegation_break_ack:type_name -> portablefs.authority.v1.DelegationBreakAckReply
-	150, // 107: portablefs.authority.v1.Response.delegation_mode_change_ack:type_name -> portablefs.authority.v1.DelegationModeChangeAckReply
-	155, // 108: portablefs.authority.v1.Response.barrier:type_name -> portablefs.authority.v1.BarrierReply
-	153, // 109: portablefs.authority.v1.Response.delegation_release:type_name -> portablefs.authority.v1.DelegationReleaseReply
-	108, // 110: portablefs.authority.v1.Response.fsync:type_name -> portablefs.authority.v1.FsyncReply
-	94,  // 111: portablefs.authority.v1.Response.close_batch:type_name -> portablefs.authority.v1.CloseBatchReply
-	31,  // 112: portablefs.authority.v1.Item.attr:type_name -> portablefs.authority.v1.Attr
-	16,  // 113: portablefs.authority.v1.Attr.kind:type_name -> portablefs.authority.v1.Attr.Kind
-	33,  // 114: portablefs.authority.v1.PostState.objects:type_name -> portablefs.authority.v1.ObjectPostState
-	31,  // 115: portablefs.authority.v1.ObjectPostState.attr:type_name -> portablefs.authority.v1.Attr
-	1,   // 116: portablefs.authority.v1.HelloRequest.role:type_name -> portablefs.authority.v1.TransportRole
-	3,   // 117: portablefs.authority.v1.HelloRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	1,   // 118: portablefs.authority.v1.HelloReply.role:type_name -> portablefs.authority.v1.TransportRole
-	3,   // 119: portablefs.authority.v1.HelloReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	4,   // 120: portablefs.authority.v1.AttachRequest.purpose:type_name -> portablefs.authority.v1.SessionPurpose
-	3,   // 121: portablefs.authority.v1.AttachRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	6,   // 122: portablefs.authority.v1.AttachRequest.fskit_namespace_repair:type_name -> portablefs.authority.v1.NamespaceRepair
-	1,   // 123: portablefs.authority.v1.ResumeReply.role:type_name -> portablefs.authority.v1.TransportRole
-	2,   // 124: portablefs.authority.v1.ResumeReply.state:type_name -> portablefs.authority.v1.SessionState
-	30,  // 125: portablefs.authority.v1.ActivateReply.root:type_name -> portablefs.authority.v1.Item
-	2,   // 126: portablefs.authority.v1.ActivateReply.state:type_name -> portablefs.authority.v1.SessionState
-	59,  // 127: portablefs.authority.v1.ActivateReply.lease_cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
-	4,   // 128: portablefs.authority.v1.ActivateReply.purpose:type_name -> portablefs.authority.v1.SessionPurpose
-	3,   // 129: portablefs.authority.v1.ActivateReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	50,  // 130: portablefs.authority.v1.ActivateReply.fskit_repair_cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	2,   // 131: portablefs.authority.v1.AbortAttachReply.state:type_name -> portablefs.authority.v1.SessionState
-	47,  // 132: portablefs.authority.v1.DetachRequest.mount_absence:type_name -> portablefs.authority.v1.MountAbsenceProof
-	7,   // 133: portablefs.authority.v1.VisibilityCursor.phase:type_name -> portablefs.authority.v1.VisibilityPhase
-	8,   // 134: portablefs.authority.v1.VisibilityTarget.scope:type_name -> portablefs.authority.v1.VisibilityScope
-	33,  // 135: portablefs.authority.v1.VisibilityTarget.exact_post_state:type_name -> portablefs.authority.v1.ObjectPostState
-	50,  // 136: portablefs.authority.v1.VisibilityEvent.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	51,  // 137: portablefs.authority.v1.VisibilityEvent.targets:type_name -> portablefs.authority.v1.VisibilityTarget
-	50,  // 138: portablefs.authority.v1.NextVisibilityRequest.after:type_name -> portablefs.authority.v1.VisibilityCursor
-	50,  // 139: portablefs.authority.v1.AckVisibilityRequest.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	9,   // 140: portablefs.authority.v1.LeaseCoordinate.family:type_name -> portablefs.authority.v1.LeaseFamily
-	57,  // 141: portablefs.authority.v1.LeaseGrant.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	10,  // 142: portablefs.authority.v1.LeaseGrant.right:type_name -> portablefs.authority.v1.LeaseRight
-	11,  // 143: portablefs.authority.v1.LeaseEventCursor.phase:type_name -> portablefs.authority.v1.LeaseEventPhase
-	57,  // 144: portablefs.authority.v1.LeaseRecall.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	10,  // 145: portablefs.authority.v1.LeaseRecall.right:type_name -> portablefs.authority.v1.LeaseRight
-	59,  // 146: portablefs.authority.v1.LeaseEvent.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
-	60,  // 147: portablefs.authority.v1.LeaseEvent.recalls:type_name -> portablefs.authority.v1.LeaseRecall
-	32,  // 148: portablefs.authority.v1.LeaseEvent.post_state:type_name -> portablefs.authority.v1.PostState
-	59,  // 149: portablefs.authority.v1.NextLeaseEventRequest.after:type_name -> portablefs.authority.v1.LeaseEventCursor
-	57,  // 150: portablefs.authority.v1.LeaseDischarge.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	12,  // 151: portablefs.authority.v1.LeaseDischarge.mode:type_name -> portablefs.authority.v1.LeaseDischargeMode
-	10,  // 152: portablefs.authority.v1.LeaseDischarge.successor_right:type_name -> portablefs.authority.v1.LeaseRight
-	59,  // 153: portablefs.authority.v1.AcknowledgeLeaseEventRequest.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
-	63,  // 154: portablefs.authority.v1.AcknowledgeLeaseEventRequest.discharges:type_name -> portablefs.authority.v1.LeaseDischarge
-	57,  // 155: portablefs.authority.v1.LeaseRenewal.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	66,  // 156: portablefs.authority.v1.RenewLeasesRequest.leases:type_name -> portablefs.authority.v1.LeaseRenewal
-	58,  // 157: portablefs.authority.v1.RenewLeasesReply.grants:type_name -> portablefs.authority.v1.LeaseGrant
-	66,  // 158: portablefs.authority.v1.RenewLeasesReply.withdrawn:type_name -> portablefs.authority.v1.LeaseRenewal
-	60,  // 159: portablefs.authority.v1.SourceLeaseDischarge.recalls:type_name -> portablefs.authority.v1.LeaseRecall
-	30,  // 160: portablefs.authority.v1.LookupReply.item:type_name -> portablefs.authority.v1.Item
-	31,  // 161: portablefs.authority.v1.GetAttrReply.attr:type_name -> portablefs.authority.v1.Attr
-	140, // 162: portablefs.authority.v1.SetAttrRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	77,  // 163: portablefs.authority.v1.CreateRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	30,  // 164: portablefs.authority.v1.CreateReply.item:type_name -> portablefs.authority.v1.Item
-	141, // 165: portablefs.authority.v1.CreateReply.delegation:type_name -> portablefs.authority.v1.Delegation
-	30,  // 166: portablefs.authority.v1.LinkReply.item:type_name -> portablefs.authority.v1.Item
-	77,  // 167: portablefs.authority.v1.OpenRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	141, // 168: portablefs.authority.v1.OpenReply.delegation:type_name -> portablefs.authority.v1.Delegation
-	91,  // 169: portablefs.authority.v1.CloseBatchRequest.closes:type_name -> portablefs.authority.v1.CloseRequest
-	0,   // 170: portablefs.authority.v1.CloseBatchResult.failure:type_name -> portablefs.authority.v1.FailureClass
-	93,  // 171: portablefs.authority.v1.CloseBatchReply.results:type_name -> portablefs.authority.v1.CloseBatchResult
-	140, // 172: portablefs.authority.v1.WriteRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	31,  // 173: portablefs.authority.v1.WriteReply.post_attr:type_name -> portablefs.authority.v1.Attr
-	13,  // 174: portablefs.authority.v1.FskitWriteRequest.phase:type_name -> portablefs.authority.v1.FskitWritePhase
-	140, // 175: portablefs.authority.v1.FallocateRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	77,  // 176: portablefs.authority.v1.TmpfileRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	30,  // 177: portablefs.authority.v1.TmpfileReply.item:type_name -> portablefs.authority.v1.Item
-	31,  // 178: portablefs.authority.v1.Dirent.attr:type_name -> portablefs.authority.v1.Attr
-	30,  // 179: portablefs.authority.v1.Dirent.item:type_name -> portablefs.authority.v1.Item
-	111, // 180: portablefs.authority.v1.ReadDirReply.entries:type_name -> portablefs.authority.v1.Dirent
-	17,  // 181: portablefs.authority.v1.SetXattrRequest.mode:type_name -> portablefs.authority.v1.SetXattrRequest.Mode
-	124, // 182: portablefs.authority.v1.LockSpec.range:type_name -> portablefs.authority.v1.LockRange
-	125, // 183: portablefs.authority.v1.GetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
-	125, // 184: portablefs.authority.v1.GetLockReply.held:type_name -> portablefs.authority.v1.LockSpec
-	125, // 185: portablefs.authority.v1.SetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
-	137, // 186: portablefs.authority.v1.ControlEvent.change_batch:type_name -> portablefs.authority.v1.ChangeBatch
-	142, // 187: portablefs.authority.v1.ControlEvent.delegation_recall:type_name -> portablefs.authority.v1.DelegationRecall
-	143, // 188: portablefs.authority.v1.ControlEvent.delegation_break:type_name -> portablefs.authority.v1.DelegationBreak
-	144, // 189: portablefs.authority.v1.ControlEvent.delegation_mode_change:type_name -> portablefs.authority.v1.DelegationModeChange
-	14,  // 190: portablefs.authority.v1.ChangeEntry.kind:type_name -> portablefs.authority.v1.ChangeKind
-	135, // 191: portablefs.authority.v1.ChangeEntry.byte_range:type_name -> portablefs.authority.v1.ByteRange
-	136, // 192: portablefs.authority.v1.ChangeBatch.entries:type_name -> portablefs.authority.v1.ChangeEntry
-	15,  // 193: portablefs.authority.v1.Delegation.mode:type_name -> portablefs.authority.v1.DelegationMode
-	140, // 194: portablefs.authority.v1.DelegationRecall.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	140, // 195: portablefs.authority.v1.DelegationBreak.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	140, // 196: portablefs.authority.v1.DelegationModeChange.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	15,  // 197: portablefs.authority.v1.DelegationModeChange.mode:type_name -> portablefs.authority.v1.DelegationMode
-	140, // 198: portablefs.authority.v1.DelegationRecallAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	140, // 199: portablefs.authority.v1.DelegationBreakAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	140, // 200: portablefs.authority.v1.DelegationModeChangeAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	140, // 201: portablefs.authority.v1.DelegationRelease.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	151, // 202: portablefs.authority.v1.DelegationReleaseRequest.delegations:type_name -> portablefs.authority.v1.DelegationRelease
-	203, // [203:203] is the sub-list for method output_type
-	203, // [203:203] is the sub-list for method input_type
-	203, // [203:203] is the sub-list for extension type_name
-	203, // [203:203] is the sub-list for extension extendee
-	0,   // [0:203] is the sub-list for field type_name
+	156, // 60: portablefs.authority.v1.Request.wait_visibility:type_name -> portablefs.authority.v1.WaitVisibilityRequest
+	20,  // 61: portablefs.authority.v1.FskitSourcePublication.targets:type_name -> portablefs.authority.v1.FskitSourcePublicationTarget
+	21,  // 62: portablefs.authority.v1.FskitSourcePublicationTarget.item:type_name -> portablefs.authority.v1.FskitSourcePublicationItem
+	22,  // 63: portablefs.authority.v1.FskitSourcePublicationTarget.namespace:type_name -> portablefs.authority.v1.FskitSourcePublicationNamespace
+	28,  // 64: portablefs.authority.v1.Response.mutation:type_name -> portablefs.authority.v1.MutationState
+	0,   // 65: portablefs.authority.v1.Response.failure:type_name -> portablefs.authority.v1.FailureClass
+	29,  // 66: portablefs.authority.v1.Response.routes_mismatch:type_name -> portablefs.authority.v1.RoutesMismatch
+	32,  // 67: portablefs.authority.v1.Response.post_state:type_name -> portablefs.authority.v1.PostState
+	58,  // 68: portablefs.authority.v1.Response.lease_grants:type_name -> portablefs.authority.v1.LeaseGrant
+	69,  // 69: portablefs.authority.v1.Response.source_lease_discharge:type_name -> portablefs.authority.v1.SourceLeaseDischarge
+	35,  // 70: portablefs.authority.v1.Response.hello:type_name -> portablefs.authority.v1.HelloReply
+	37,  // 71: portablefs.authority.v1.Response.attach:type_name -> portablefs.authority.v1.AttachReply
+	39,  // 72: portablefs.authority.v1.Response.resume:type_name -> portablefs.authority.v1.ResumeReply
+	41,  // 73: portablefs.authority.v1.Response.activate:type_name -> portablefs.authority.v1.ActivateReply
+	43,  // 74: portablefs.authority.v1.Response.abort_attach:type_name -> portablefs.authority.v1.AbortAttachReply
+	73,  // 75: portablefs.authority.v1.Response.lookup:type_name -> portablefs.authority.v1.LookupReply
+	75,  // 76: portablefs.authority.v1.Response.get_attr:type_name -> portablefs.authority.v1.GetAttrReply
+	79,  // 77: portablefs.authority.v1.Response.create:type_name -> portablefs.authority.v1.CreateReply
+	88,  // 78: portablefs.authority.v1.Response.readlink:type_name -> portablefs.authority.v1.ReadlinkReply
+	90,  // 79: portablefs.authority.v1.Response.open:type_name -> portablefs.authority.v1.OpenReply
+	96,  // 80: portablefs.authority.v1.Response.read:type_name -> portablefs.authority.v1.ReadReply
+	112, // 81: portablefs.authority.v1.Response.read_dir:type_name -> portablefs.authority.v1.ReadDirReply
+	115, // 82: portablefs.authority.v1.Response.get_xattr:type_name -> portablefs.authority.v1.GetXattrReply
+	118, // 83: portablefs.authority.v1.Response.list_xattr:type_name -> portablefs.authority.v1.ListXattrReply
+	121, // 84: portablefs.authority.v1.Response.stat_fs:type_name -> portablefs.authority.v1.StatFSReply
+	127, // 85: portablefs.authority.v1.Response.get_lock:type_name -> portablefs.authority.v1.GetLockReply
+	85,  // 86: portablefs.authority.v1.Response.link:type_name -> portablefs.authority.v1.LinkReply
+	54,  // 87: portablefs.authority.v1.Response.apply_routes:type_name -> portablefs.authority.v1.ApplyRoutesReply
+	123, // 88: portablefs.authority.v1.Response.sync_fs:type_name -> portablefs.authority.v1.SyncFSReply
+	46,  // 89: portablefs.authority.v1.Response.reauthorize:type_name -> portablefs.authority.v1.ReauthorizeReply
+	83,  // 90: portablefs.authority.v1.Response.rename:type_name -> portablefs.authority.v1.RenameReply
+	103, // 91: portablefs.authority.v1.Response.fallocate:type_name -> portablefs.authority.v1.FallocateReply
+	104, // 92: portablefs.authority.v1.Response.copy_file_range:type_name -> portablefs.authority.v1.CopyFileRangeReply
+	106, // 93: portablefs.authority.v1.Response.tmpfile:type_name -> portablefs.authority.v1.TmpfileReply
+	25,  // 94: portablefs.authority.v1.Response.terminal_delivery_receipt:type_name -> portablefs.authority.v1.TerminalDeliveryReceiptReply
+	98,  // 95: portablefs.authority.v1.Response.write:type_name -> portablefs.authority.v1.WriteReply
+	61,  // 96: portablefs.authority.v1.Response.lease_event:type_name -> portablefs.authority.v1.LeaseEvent
+	65,  // 97: portablefs.authority.v1.Response.acknowledge_lease_event:type_name -> portablefs.authority.v1.AcknowledgeLeaseEventReply
+	68,  // 98: portablefs.authority.v1.Response.renew_leases:type_name -> portablefs.authority.v1.RenewLeasesReply
+	71,  // 99: portablefs.authority.v1.Response.acknowledge_source_lease_discharge:type_name -> portablefs.authority.v1.AcknowledgeSourceLeaseDischargeReply
+	52,  // 100: portablefs.authority.v1.Response.fskit_repair:type_name -> portablefs.authority.v1.VisibilityEvent
+	100, // 101: portablefs.authority.v1.Response.fskit_write:type_name -> portablefs.authority.v1.FskitWriteReply
+	130, // 102: portablefs.authority.v1.Response.subscribe:type_name -> portablefs.authority.v1.SubscribeReply
+	132, // 103: portablefs.authority.v1.Response.renew_subscription:type_name -> portablefs.authority.v1.RenewSubscriptionReply
+	134, // 104: portablefs.authority.v1.Response.control_event:type_name -> portablefs.authority.v1.ControlEvent
+	139, // 105: portablefs.authority.v1.Response.change_ack:type_name -> portablefs.authority.v1.ChangeAckReply
+	146, // 106: portablefs.authority.v1.Response.delegation_recall_ack:type_name -> portablefs.authority.v1.DelegationRecallAckReply
+	148, // 107: portablefs.authority.v1.Response.delegation_break_ack:type_name -> portablefs.authority.v1.DelegationBreakAckReply
+	150, // 108: portablefs.authority.v1.Response.delegation_mode_change_ack:type_name -> portablefs.authority.v1.DelegationModeChangeAckReply
+	155, // 109: portablefs.authority.v1.Response.barrier:type_name -> portablefs.authority.v1.BarrierReply
+	153, // 110: portablefs.authority.v1.Response.delegation_release:type_name -> portablefs.authority.v1.DelegationReleaseReply
+	108, // 111: portablefs.authority.v1.Response.fsync:type_name -> portablefs.authority.v1.FsyncReply
+	94,  // 112: portablefs.authority.v1.Response.close_batch:type_name -> portablefs.authority.v1.CloseBatchReply
+	157, // 113: portablefs.authority.v1.Response.wait_visibility:type_name -> portablefs.authority.v1.WaitVisibilityReply
+	31,  // 114: portablefs.authority.v1.Item.attr:type_name -> portablefs.authority.v1.Attr
+	16,  // 115: portablefs.authority.v1.Attr.kind:type_name -> portablefs.authority.v1.Attr.Kind
+	33,  // 116: portablefs.authority.v1.PostState.objects:type_name -> portablefs.authority.v1.ObjectPostState
+	31,  // 117: portablefs.authority.v1.ObjectPostState.attr:type_name -> portablefs.authority.v1.Attr
+	1,   // 118: portablefs.authority.v1.HelloRequest.role:type_name -> portablefs.authority.v1.TransportRole
+	3,   // 119: portablefs.authority.v1.HelloRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	1,   // 120: portablefs.authority.v1.HelloReply.role:type_name -> portablefs.authority.v1.TransportRole
+	3,   // 121: portablefs.authority.v1.HelloReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	4,   // 122: portablefs.authority.v1.AttachRequest.purpose:type_name -> portablefs.authority.v1.SessionPurpose
+	3,   // 123: portablefs.authority.v1.AttachRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	6,   // 124: portablefs.authority.v1.AttachRequest.fskit_namespace_repair:type_name -> portablefs.authority.v1.NamespaceRepair
+	1,   // 125: portablefs.authority.v1.ResumeReply.role:type_name -> portablefs.authority.v1.TransportRole
+	2,   // 126: portablefs.authority.v1.ResumeReply.state:type_name -> portablefs.authority.v1.SessionState
+	30,  // 127: portablefs.authority.v1.ActivateReply.root:type_name -> portablefs.authority.v1.Item
+	2,   // 128: portablefs.authority.v1.ActivateReply.state:type_name -> portablefs.authority.v1.SessionState
+	59,  // 129: portablefs.authority.v1.ActivateReply.lease_cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
+	4,   // 130: portablefs.authority.v1.ActivateReply.purpose:type_name -> portablefs.authority.v1.SessionPurpose
+	3,   // 131: portablefs.authority.v1.ActivateReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	50,  // 132: portablefs.authority.v1.ActivateReply.fskit_repair_cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	2,   // 133: portablefs.authority.v1.AbortAttachReply.state:type_name -> portablefs.authority.v1.SessionState
+	47,  // 134: portablefs.authority.v1.DetachRequest.mount_absence:type_name -> portablefs.authority.v1.MountAbsenceProof
+	7,   // 135: portablefs.authority.v1.VisibilityCursor.phase:type_name -> portablefs.authority.v1.VisibilityPhase
+	8,   // 136: portablefs.authority.v1.VisibilityTarget.scope:type_name -> portablefs.authority.v1.VisibilityScope
+	33,  // 137: portablefs.authority.v1.VisibilityTarget.exact_post_state:type_name -> portablefs.authority.v1.ObjectPostState
+	50,  // 138: portablefs.authority.v1.VisibilityEvent.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	51,  // 139: portablefs.authority.v1.VisibilityEvent.targets:type_name -> portablefs.authority.v1.VisibilityTarget
+	50,  // 140: portablefs.authority.v1.NextVisibilityRequest.after:type_name -> portablefs.authority.v1.VisibilityCursor
+	50,  // 141: portablefs.authority.v1.AckVisibilityRequest.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	9,   // 142: portablefs.authority.v1.LeaseCoordinate.family:type_name -> portablefs.authority.v1.LeaseFamily
+	57,  // 143: portablefs.authority.v1.LeaseGrant.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	10,  // 144: portablefs.authority.v1.LeaseGrant.right:type_name -> portablefs.authority.v1.LeaseRight
+	11,  // 145: portablefs.authority.v1.LeaseEventCursor.phase:type_name -> portablefs.authority.v1.LeaseEventPhase
+	57,  // 146: portablefs.authority.v1.LeaseRecall.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	10,  // 147: portablefs.authority.v1.LeaseRecall.right:type_name -> portablefs.authority.v1.LeaseRight
+	59,  // 148: portablefs.authority.v1.LeaseEvent.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
+	60,  // 149: portablefs.authority.v1.LeaseEvent.recalls:type_name -> portablefs.authority.v1.LeaseRecall
+	32,  // 150: portablefs.authority.v1.LeaseEvent.post_state:type_name -> portablefs.authority.v1.PostState
+	59,  // 151: portablefs.authority.v1.NextLeaseEventRequest.after:type_name -> portablefs.authority.v1.LeaseEventCursor
+	57,  // 152: portablefs.authority.v1.LeaseDischarge.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	12,  // 153: portablefs.authority.v1.LeaseDischarge.mode:type_name -> portablefs.authority.v1.LeaseDischargeMode
+	10,  // 154: portablefs.authority.v1.LeaseDischarge.successor_right:type_name -> portablefs.authority.v1.LeaseRight
+	59,  // 155: portablefs.authority.v1.AcknowledgeLeaseEventRequest.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
+	63,  // 156: portablefs.authority.v1.AcknowledgeLeaseEventRequest.discharges:type_name -> portablefs.authority.v1.LeaseDischarge
+	57,  // 157: portablefs.authority.v1.LeaseRenewal.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	66,  // 158: portablefs.authority.v1.RenewLeasesRequest.leases:type_name -> portablefs.authority.v1.LeaseRenewal
+	58,  // 159: portablefs.authority.v1.RenewLeasesReply.grants:type_name -> portablefs.authority.v1.LeaseGrant
+	66,  // 160: portablefs.authority.v1.RenewLeasesReply.withdrawn:type_name -> portablefs.authority.v1.LeaseRenewal
+	60,  // 161: portablefs.authority.v1.SourceLeaseDischarge.recalls:type_name -> portablefs.authority.v1.LeaseRecall
+	30,  // 162: portablefs.authority.v1.LookupReply.item:type_name -> portablefs.authority.v1.Item
+	31,  // 163: portablefs.authority.v1.GetAttrReply.attr:type_name -> portablefs.authority.v1.Attr
+	140, // 164: portablefs.authority.v1.SetAttrRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	77,  // 165: portablefs.authority.v1.CreateRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	30,  // 166: portablefs.authority.v1.CreateReply.item:type_name -> portablefs.authority.v1.Item
+	141, // 167: portablefs.authority.v1.CreateReply.delegation:type_name -> portablefs.authority.v1.Delegation
+	30,  // 168: portablefs.authority.v1.LinkReply.item:type_name -> portablefs.authority.v1.Item
+	77,  // 169: portablefs.authority.v1.OpenRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	141, // 170: portablefs.authority.v1.OpenReply.delegation:type_name -> portablefs.authority.v1.Delegation
+	91,  // 171: portablefs.authority.v1.CloseBatchRequest.closes:type_name -> portablefs.authority.v1.CloseRequest
+	0,   // 172: portablefs.authority.v1.CloseBatchResult.failure:type_name -> portablefs.authority.v1.FailureClass
+	93,  // 173: portablefs.authority.v1.CloseBatchReply.results:type_name -> portablefs.authority.v1.CloseBatchResult
+	140, // 174: portablefs.authority.v1.WriteRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	31,  // 175: portablefs.authority.v1.WriteReply.post_attr:type_name -> portablefs.authority.v1.Attr
+	13,  // 176: portablefs.authority.v1.FskitWriteRequest.phase:type_name -> portablefs.authority.v1.FskitWritePhase
+	140, // 177: portablefs.authority.v1.FallocateRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	77,  // 178: portablefs.authority.v1.TmpfileRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	30,  // 179: portablefs.authority.v1.TmpfileReply.item:type_name -> portablefs.authority.v1.Item
+	31,  // 180: portablefs.authority.v1.Dirent.attr:type_name -> portablefs.authority.v1.Attr
+	30,  // 181: portablefs.authority.v1.Dirent.item:type_name -> portablefs.authority.v1.Item
+	111, // 182: portablefs.authority.v1.ReadDirReply.entries:type_name -> portablefs.authority.v1.Dirent
+	17,  // 183: portablefs.authority.v1.SetXattrRequest.mode:type_name -> portablefs.authority.v1.SetXattrRequest.Mode
+	124, // 184: portablefs.authority.v1.LockSpec.range:type_name -> portablefs.authority.v1.LockRange
+	125, // 185: portablefs.authority.v1.GetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
+	125, // 186: portablefs.authority.v1.GetLockReply.held:type_name -> portablefs.authority.v1.LockSpec
+	125, // 187: portablefs.authority.v1.SetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
+	137, // 188: portablefs.authority.v1.ControlEvent.change_batch:type_name -> portablefs.authority.v1.ChangeBatch
+	142, // 189: portablefs.authority.v1.ControlEvent.delegation_recall:type_name -> portablefs.authority.v1.DelegationRecall
+	143, // 190: portablefs.authority.v1.ControlEvent.delegation_break:type_name -> portablefs.authority.v1.DelegationBreak
+	144, // 191: portablefs.authority.v1.ControlEvent.delegation_mode_change:type_name -> portablefs.authority.v1.DelegationModeChange
+	14,  // 192: portablefs.authority.v1.ChangeEntry.kind:type_name -> portablefs.authority.v1.ChangeKind
+	135, // 193: portablefs.authority.v1.ChangeEntry.byte_range:type_name -> portablefs.authority.v1.ByteRange
+	136, // 194: portablefs.authority.v1.ChangeBatch.entries:type_name -> portablefs.authority.v1.ChangeEntry
+	15,  // 195: portablefs.authority.v1.Delegation.mode:type_name -> portablefs.authority.v1.DelegationMode
+	140, // 196: portablefs.authority.v1.DelegationRecall.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 197: portablefs.authority.v1.DelegationBreak.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 198: portablefs.authority.v1.DelegationModeChange.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	15,  // 199: portablefs.authority.v1.DelegationModeChange.mode:type_name -> portablefs.authority.v1.DelegationMode
+	140, // 200: portablefs.authority.v1.DelegationRecallAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 201: portablefs.authority.v1.DelegationBreakAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 202: portablefs.authority.v1.DelegationModeChangeAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 203: portablefs.authority.v1.DelegationRelease.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	151, // 204: portablefs.authority.v1.DelegationReleaseRequest.delegations:type_name -> portablefs.authority.v1.DelegationRelease
+	205, // [205:205] is the sub-list for method output_type
+	205, // [205:205] is the sub-list for method input_type
+	205, // [205:205] is the sub-list for extension type_name
+	205, // [205:205] is the sub-list for extension extendee
+	0,   // [0:205] is the sub-list for field type_name
 }
 
 func init() { file_proto_authority_v1_authority_proto_init() }
@@ -13037,6 +13189,7 @@ func file_proto_authority_v1_authority_proto_init() {
 		(*Request_Barrier)(nil),
 		(*Request_DelegationRelease)(nil),
 		(*Request_CloseBatch)(nil),
+		(*Request_WaitVisibility)(nil),
 	}
 	file_proto_authority_v1_authority_proto_msgTypes[2].OneofWrappers = []any{
 		(*FskitSourcePublicationTarget_Item)(nil),
@@ -13086,6 +13239,7 @@ func file_proto_authority_v1_authority_proto_init() {
 		(*Response_DelegationRelease)(nil),
 		(*Response_Fsync)(nil),
 		(*Response_CloseBatch)(nil),
+		(*Response_WaitVisibility)(nil),
 	}
 	file_proto_authority_v1_authority_proto_msgTypes[58].OneofWrappers = []any{}
 	file_proto_authority_v1_authority_proto_msgTypes[116].OneofWrappers = []any{
@@ -13100,7 +13254,7 @@ func file_proto_authority_v1_authority_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_authority_v1_authority_proto_rawDesc), len(file_proto_authority_v1_authority_proto_rawDesc)),
 			NumEnums:      18,
-			NumMessages:   138,
+			NumMessages:   140,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

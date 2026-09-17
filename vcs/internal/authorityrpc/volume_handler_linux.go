@@ -600,6 +600,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	if req.GetBarrier() != nil {
 		return h.handleCoherenceBarrier(ctx, req, cred)
 	}
+	if req.GetWaitVisibility() != nil {
+		return h.handleCoherenceVisibility(ctx, req, cred)
+	}
 	ctx = context.WithValue(ctx, coherenceOperationKey{}, &coherenceOperation{})
 
 	switch body := req.GetBody().(type) {

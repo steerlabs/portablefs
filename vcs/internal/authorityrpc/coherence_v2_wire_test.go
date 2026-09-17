@@ -101,6 +101,8 @@ func TestCoherenceV2CanonicalMessageRoundTrips(t *testing.T) {
 		{"delegation release reply", &authoritypb.DelegationReleaseReply{}},
 		{"barrier request", &authoritypb.BarrierRequest{CutSequence: 6}},
 		{"barrier reply", &authoritypb.BarrierReply{AppliedSequence: 6, DurableSequence: 5}},
+		{"wait visibility request", &authoritypb.WaitVisibilityRequest{CutSequence: 6}},
+		{"wait visibility reply", &authoritypb.WaitVisibilityReply{AppliedSequence: 6, VisibleSequence: 5}},
 		{"control change batch", &authoritypb.ControlEvent{Incarnation: 2, Sequence: 3, Event: &authoritypb.ControlEvent_ChangeBatch{ChangeBatch: &authoritypb.ChangeBatch{Incarnation: 2, Entries: []*authoritypb.ChangeEntry{entry}}}}},
 		{"control delegation recall", &authoritypb.ControlEvent{Incarnation: 2, Sequence: 3, Event: &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{Delegation: ref, Identity: bytes.Repeat([]byte{0x44}, 16), BudgetNanos: 5}}}},
 		{"control delegation break", &authoritypb.ControlEvent{Incarnation: 2, Sequence: 3, Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{Delegation: ref, Identity: bytes.Repeat([]byte{0x44}, 16), BudgetNanos: 5}}}},
@@ -127,6 +129,7 @@ func TestCoherenceV2RequestFrameRoundTrips(t *testing.T) {
 		{"delegation break ack", &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_DelegationBreakAck{DelegationBreakAck: &authoritypb.DelegationBreakAck{Incarnation: 2, EventSequence: 3, Delegation: ref, AppliedSequence: 4}}}},
 		{"delegation mode change ack", &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_DelegationModeChangeAck{DelegationModeChangeAck: &authoritypb.DelegationModeChangeAck{Incarnation: 2, EventSequence: 3, Delegation: ref, AppliedSequence: 4}}}},
 		{"barrier", &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{CutSequence: 5}}}},
+		{"wait visibility", &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: 5}}}},
 		{"delegation release", &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{Incarnation: 2, ReleaseSequence: 4, CompletedReleaseThrough: 3, Delegations: []*authoritypb.DelegationRelease{{Delegation: ref, AppliedSequence: 4}}}}}},
 		{"create delegation intent", &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: bytes.Repeat([]byte{1}, 16), Name: []byte("new"), Mode: 0o644, Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true, CacheCapable: true}}}},
 		{"open delegation intent", &authoritypb.Request{RequestId: 7, Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: bytes.Repeat([]byte{1}, 16), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true, CacheCapable: true}}}},
@@ -163,6 +166,7 @@ func TestCoherenceV2ResponseFrameRoundTrips(t *testing.T) {
 		{"delegation break ack", &authoritypb.Response{RequestId: 7, Body: &authoritypb.Response_DelegationBreakAck{DelegationBreakAck: &authoritypb.DelegationBreakAckReply{}}}},
 		{"delegation mode change ack", &authoritypb.Response{RequestId: 7, Body: &authoritypb.Response_DelegationModeChangeAck{DelegationModeChangeAck: &authoritypb.DelegationModeChangeAckReply{}}}},
 		{"barrier", &authoritypb.Response{RequestId: 7, Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{AppliedSequence: 6, DurableSequence: 5}}}},
+		{"wait visibility", &authoritypb.Response{RequestId: 7, VisibleSequence: 5, Body: &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{AppliedSequence: 6, VisibleSequence: 5}}}},
 		{"delegation release", &authoritypb.Response{RequestId: 7, Body: &authoritypb.Response_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseReply{}}}},
 		{"create delegation", &authoritypb.Response{RequestId: 7, VolumeVersion: 10, Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Delegation: coherenceV2Delegation(), CacheCapable: true}}}},
 		{"open delegation", &authoritypb.Response{RequestId: 7, VolumeVersion: 10, Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: bytes.Repeat([]byte{3}, 16), Delegation: coherenceV2Delegation(), CacheCapable: true}}}},
@@ -209,6 +213,8 @@ func TestCoherenceV2CanonicalGoldenEncodings(t *testing.T) {
 		{"delegation release request", &authoritypb.DelegationReleaseRequest{Incarnation: 1, ReleaseSequence: 4, CompletedReleaseThrough: 3, Delegations: []*authoritypb.DelegationRelease{{Delegation: ref, AppliedSequence: 3}}}, "080112090a050a01aa1002100318042003"},
 		{"barrier request", &authoritypb.BarrierRequest{CutSequence: 1}, "0801"},
 		{"barrier reply", &authoritypb.BarrierReply{AppliedSequence: 1, DurableSequence: 2}, "08011002"},
+		{"wait visibility request", &authoritypb.WaitVisibilityRequest{CutSequence: 1}, "0801"},
+		{"wait visibility reply", &authoritypb.WaitVisibilityReply{AppliedSequence: 1, VisibleSequence: 2}, "08011002"},
 		{"control change tag", &authoritypb.ControlEvent{Incarnation: 1, Sequence: 2, Event: &authoritypb.ControlEvent_ChangeBatch{ChangeBatch: &authoritypb.ChangeBatch{}}}, "080110021a00"},
 		{"control recall tag", &authoritypb.ControlEvent{Event: &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{}}}, "2200"},
 		{"control break tag", &authoritypb.ControlEvent{Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{}}}, "2a00"},
@@ -225,6 +231,7 @@ func TestCoherenceV2CanonicalGoldenEncodings(t *testing.T) {
 		{"syncfs durable sequence tag", &authoritypb.SyncFSReply{DurableSequence: 1}, "0801"},
 		{"response applied sequence tag", &authoritypb.Response{AppliedSequence: 1}, "c00301"},
 		{"response volume version tag", &authoritypb.Response{VolumeVersion: 1}, "980401"},
+		{"response visible sequence tag", &authoritypb.Response{VisibleSequence: 1}, "b00401"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -258,6 +265,7 @@ func TestCoherenceV2EnvelopeBodyTagsAreFrozen(t *testing.T) {
 		{"request mode change ack 71", &authoritypb.Request{Body: &authoritypb.Request_DelegationModeChangeAck{DelegationModeChangeAck: &authoritypb.DelegationModeChangeAck{}}}, "ba0400"},
 		{"request barrier 72", &authoritypb.Request{Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{}}}, "c20400"},
 		{"request delegation release 73", &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{}}}, "ca0400"},
+		{"request wait visibility 75", &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityRequest{}}}, "da0400"},
 		{"response subscribe 57", &authoritypb.Response{Body: &authoritypb.Response_Subscribe{Subscribe: &authoritypb.SubscribeReply{}}}, "ca0300"},
 		{"response renew subscription 58", &authoritypb.Response{Body: &authoritypb.Response_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionReply{}}}, "d20300"},
 		{"response control event 59", &authoritypb.Response{Body: &authoritypb.Response_ControlEvent{ControlEvent: &authoritypb.ControlEvent{}}}, "da0300"},
@@ -268,6 +276,7 @@ func TestCoherenceV2EnvelopeBodyTagsAreFrozen(t *testing.T) {
 		{"response barrier 64", &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{}}}, "820400"},
 		{"response delegation release 65", &authoritypb.Response{Body: &authoritypb.Response_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseReply{}}}, "8a0400"},
 		{"response fsync 66", &authoritypb.Response{Body: &authoritypb.Response_Fsync{Fsync: &authoritypb.FsyncReply{}}}, "920400"},
+		{"response wait visibility 71", &authoritypb.Response{Body: &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{}}}, "ba0400"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

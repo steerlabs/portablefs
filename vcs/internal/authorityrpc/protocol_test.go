@@ -76,6 +76,7 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		{&authoritypb.Request_DelegationModeChangeAck{}, true, false, false},
 		{&authoritypb.Request_DelegationRelease{}, true, false, false},
 		{&authoritypb.Request_Barrier{}, true, false, false},
+		{&authoritypb.Request_WaitVisibility{}, true, false, false},
 	}
 	descriptorBodies := (&authoritypb.Request{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
 	if len(tests) != descriptorBodies {
@@ -201,7 +202,7 @@ func TestAuthorityProtocolV7RequiresSubscriptionAndDelegation(t *testing.T) {
 	if !hasFeatures(requiredHelloFeatures, []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", subscriptionFeature, changeStreamFeature, delegationFeature}) {
 		t.Fatalf("incomplete v7 Hello: %v", requiredHelloFeatures)
 	}
-	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature}) {
+	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, visibilityCompletionFeature}) {
 		t.Fatalf("incomplete v7 Activate: %v", requiredStrictAttachFeatures)
 	}
 	for _, retired := range []string{"lease-coherence-v1", "directory-enumeration-lease-v1", "lease-recall-v1", "lease-renewal-v1", "open-by-identity-v1", "write-through"} {
@@ -259,6 +260,7 @@ func TestV7ControlRequestsDoNotHoldTopologyDuringPeerWaits(t *testing.T) {
 		{Body: &authoritypb.Request_DelegationBreakAck{DelegationBreakAck: &authoritypb.DelegationBreakAck{}}},
 		{Body: &authoritypb.Request_DelegationModeChangeAck{DelegationModeChangeAck: &authoritypb.DelegationModeChangeAck{}}},
 		{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{}}},
+		{Body: &authoritypb.Request_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityRequest{}}},
 	} {
 		if requestUsesTopology(request) {
 			t.Fatalf("%T would hold topology while servicing coherence", request.GetBody())

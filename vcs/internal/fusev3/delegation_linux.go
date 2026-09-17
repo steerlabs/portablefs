@@ -531,12 +531,22 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	m.frontend.RLock()
-	defer m.frontend.RUnlock()
+	frontendLocked := true
+	defer func() {
+		if frontendLocked {
+			m.frontend.RUnlock()
+		}
+	}()
 	s := m.state(id)
 	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
 		return writeback.Cut{}, err
 	}
-	defer s.operation.Unlock()
+	operationLocked := true
+	defer func() {
+		if operationLocked {
+			s.operation.Unlock()
+		}
+	}()
 	s, b, mode, err := m.modeAndBuffer(id)
 	if err != nil {
 		return writeback.Cut{}, err
@@ -550,10 +560,11 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 		m.markAccepted(s, cut)
 	}
 	s.admission.RUnlock()
+	var applied uint64
 	if err == nil && syncWrite {
 		// The operation lock fixes the accepted cut. Release admission before a
 		// flush can record a refusal and rebind the successor buffer generation.
-		err = m.syncIdentityCut(ctx, s, b, cut, false)
+		applied, err = m.syncIdentityCut(ctx, s, b, cut, false)
 	}
 	if err != nil {
 		return cut, err
@@ -564,8 +575,23 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	mode = s.mode
 	s.admission.RUnlock()
 	if mode == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH && !syncWrite {
-		if _, err := b.FlushIdentity(ctx, id, cut); err != nil {
+		applied, err = b.FlushIdentity(ctx, id, cut)
+	}
+	if err != nil {
+		return cut, err
+	}
+	if syncWrite || mode == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH {
+		s.operation.Unlock()
+		operationLocked = false
+		m.frontend.RUnlock()
+		frontendLocked = false
+		if err := m.waitVisibility(ctx, b, id, cut, applied); err != nil {
 			return cut, err
+		}
+		if syncWrite {
+			if err := b.DurableIdentity(id, cut); err != nil {
+				return cut, err
+			}
 		}
 	}
 	return cut, nil
@@ -591,12 +617,22 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	m.frontend.RLock()
-	defer m.frontend.RUnlock()
+	frontendLocked := true
+	defer func() {
+		if frontendLocked {
+			m.frontend.RUnlock()
+		}
+	}()
 	s := m.state(id)
 	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
 		return writeback.Cut{}, err
 	}
-	defer s.operation.Unlock()
+	operationLocked := true
+	defer func() {
+		if operationLocked {
+			s.operation.Unlock()
+		}
+	}()
 	s, b, mode, err := m.modeAndBuffer(id)
 	if err != nil {
 		return writeback.Cut{}, err
@@ -615,7 +651,15 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 		mode = s.mode
 		s.admission.RUnlock()
 		if mode == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH {
-			_, err = b.FlushIdentity(ctx, id, cut)
+			var applied uint64
+			applied, err = b.FlushIdentity(ctx, id, cut)
+			if err == nil {
+				s.operation.Unlock()
+				operationLocked = false
+				m.frontend.RUnlock()
+				frontendLocked = false
+				err = m.waitVisibility(ctx, b, id, cut, applied)
+			}
 		}
 	}
 	return cut, err
@@ -751,7 +795,6 @@ func (m *delegationManager) durableCurrent(sequence uint64) {
 }
 
 func (m *delegationManager) durableForBuffer(buffer *writeback.Buffer, sequence uint64) {
-	buffer.VisibleSequence(sequence)
 	buffer.DurableSequence(sequence)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -769,6 +812,33 @@ func (m *delegationManager) durableForBuffer(buffer *writeback.Buffer, sequence 
 		}
 	}
 	m.tokenMu.Unlock()
+}
+
+func (m *delegationManager) visibleForBuffer(buffer *writeback.Buffer, sequence uint64) {
+	if sequence != 0 {
+		buffer.VisibleSequence(sequence)
+	}
+}
+
+func (m *delegationManager) waitVisibility(ctx context.Context, buffer *writeback.Buffer, id writeback.Identity, cut writeback.Cut, applied uint64) error {
+	if applied == 0 {
+		return errors.New("fusev3: visibility wait has no application ticket")
+	}
+	response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{
+		WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: applied},
+	}})
+	if err != nil {
+		return err
+	}
+	if err := successfulDelegationResponse(response); err != nil {
+		return err
+	}
+	reply := response.GetWaitVisibility()
+	if reply == nil || reply.GetAppliedSequence() < reply.GetVisibleSequence() || reply.GetVisibleSequence() < applied || response.GetVisibleSequence() != reply.GetVisibleSequence() {
+		return errors.New("fusev3: malformed visibility completion reply")
+	}
+	m.visibleForBuffer(buffer, reply.GetVisibleSequence())
+	return buffer.WaitVisible(ctx, id, cut)
 }
 
 const durabilityFallbackInterval = time.Second
@@ -924,6 +994,7 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 		m.loseDelegation(s, "delegated mutation permanently refused")
 		return 0, writeback.ErrLost
 	}
+	m.visibleForBuffer(m.buf, response.GetVisibleSequence())
 	if !m.updateBaseFromResponse(s, response) {
 		m.loseDelegation(s, "delegated metadata omitted exact post attributes")
 		return 0, writeback.ErrLost
@@ -1100,12 +1171,22 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	m.frontend.RLock()
-	defer m.frontend.RUnlock()
+	frontendLocked := true
+	defer func() {
+		if frontendLocked {
+			m.frontend.RUnlock()
+		}
+	}()
 	s := m.state(id)
 	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
 		return nil, err
 	}
-	defer s.operation.Unlock()
+	operationLocked := true
+	defer func() {
+		if operationLocked {
+			s.operation.Unlock()
+		}
+	}()
 	s.admission.RLock()
 	ref := cloneDelegationRef(s.ref)
 	s.admission.RUnlock()
@@ -1149,6 +1230,7 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	if err := successfulDelegationResponse(response); err != nil {
 		return response, err
 	}
+	m.visibleForBuffer(m.buf, response.GetVisibleSequence())
 	if response.GetAppliedSequence() != 0 {
 		s.meta.Lock()
 		s.applied = max(s.applied, response.GetAppliedSequence())
@@ -1165,6 +1247,16 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 		m.durableCurrent(response.GetWrite().GetDurableSequence())
 	}
 	m.updateBaseFromResponse(s, response)
+	if response.GetAppliedSequence() != 0 {
+		cut := m.buf.Snapshot()
+		s.operation.Unlock()
+		operationLocked = false
+		m.frontend.RUnlock()
+		frontendLocked = false
+		if err := m.waitVisibility(ctx, m.buf, id, cut, response.GetAppliedSequence()); err != nil {
+			return response, err
+		}
+	}
 	return response, nil
 }
 
@@ -1191,14 +1283,15 @@ func (m *delegationManager) syncIdentity(ctx context.Context, s *delegationState
 
 // The operation lock fixes this identity's accepted cut. FSYNC proves only
 // that file durable; its common prefix may remain behind an unrelated writer.
-func (m *delegationManager) syncIdentityCut(ctx context.Context, s *delegationState, b *writeback.Buffer, cut writeback.Cut, dataOnly bool) error {
-	if _, err := b.FlushIdentity(ctx, s.identity, cut); err != nil {
-		return err
+func (m *delegationManager) syncIdentityCut(ctx context.Context, s *delegationState, b *writeback.Buffer, cut writeback.Cut, dataOnly bool) (uint64, error) {
+	applied, err := b.FlushIdentity(ctx, s.identity, cut)
+	if err != nil {
+		return applied, err
 	}
 	if err := m.syncIdentity(ctx, s, dataOnly); err != nil {
-		return err
+		return applied, err
 	}
-	return b.DurableIdentity(s.identity, cut)
+	return applied, nil
 }
 
 func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly bool) error {
@@ -1212,9 +1305,19 @@ func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly
 	if err := s.lockAfterRelease(ctx, delegationTransition|delegationOperation); err != nil {
 		return err
 	}
-	defer s.transition.Unlock()
-	defer s.operation.Unlock()
-	return m.syncIdentityCut(ctx, s, m.buf, m.buf.Snapshot(), dataOnly)
+	cut := m.buf.Snapshot()
+	applied, err := m.syncIdentityCut(ctx, s, m.buf, cut, dataOnly)
+	s.operation.Unlock()
+	s.transition.Unlock()
+	if err != nil {
+		return err
+	}
+	if applied != 0 {
+		if err := m.waitVisibility(ctx, m.buf, id, cut, applied); err != nil {
+			return err
+		}
+	}
+	return m.buf.DurableIdentity(id, cut)
 }
 
 // Barrier implements the root-directory completion barrier. Admission is

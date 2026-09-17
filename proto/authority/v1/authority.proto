@@ -94,6 +94,7 @@ message Request {
     BarrierRequest barrier = 72;
     DelegationReleaseRequest delegation_release = 73;
     CloseBatchRequest close_batch = 74;
+    WaitVisibilityRequest wait_visibility = 75;
   }
 }
 
@@ -177,6 +178,9 @@ message Response {
   // This exact session expired or was fenced. Unlike an ordinary ESTALE
   // capability error, it requires immediate local session enforcement.
   bool session_terminal = 69; // present only with envelope errno ESTALE
+  // Largest contiguous session application prefix whose peer withdrawals have
+  // completed. Durability is reported separately and does not imply this cut.
+  uint64 visible_sequence = 70;
 
   oneof body {
     HelloReply hello = 10;
@@ -223,6 +227,7 @@ message Response {
     DelegationReleaseReply delegation_release = 65;
     FsyncReply fsync = 66;
     CloseBatchReply close_batch = 68;
+    WaitVisibilityReply wait_visibility = 71;
   }
 }
 
@@ -1174,7 +1179,7 @@ message SetLockRequest { LockSpec lock = 1; bool wait = 2; bool unlock = 3; }
 
 // Protocol 7 coherence. Normative ordering and counter domains are specified in
 // docs/coherence-v2/wire.md. All these control requests use CONTROL except Barrier
-// (DATA). Stable identities are coordination keys, never capabilities.
+// and WaitVisibility (DATA). Stable identities are coordination keys, never capabilities.
 message SubscribeRequest {
   bytes snapshot_id = 1; // empty starts a cold subscription; otherwise pagination
   bytes after_identity = 2; // exact previous next_after_identity
@@ -1312,4 +1317,12 @@ message BarrierRequest { uint64 cut_sequence = 1; }
 message BarrierReply {
   uint64 applied_sequence = 1;
   uint64 durable_sequence = 2;
+}
+
+// Waits for peer cache withdrawal through one already-issued session
+// application ticket. It performs no storage or durability operation.
+message WaitVisibilityRequest { uint64 cut_sequence = 1; }
+message WaitVisibilityReply {
+  uint64 applied_sequence = 1;
+  uint64 visible_sequence = 2;
 }

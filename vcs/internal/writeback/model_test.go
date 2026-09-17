@@ -50,7 +50,9 @@ func TestPartialDurabilityAgainstNaiveFilesystem(t *testing.T) {
 					}
 				case 5:
 					if seq > 0 {
-						b.DurableSequence(uint64(rng.Int63n(int64(seq) + 1)))
+						cut := uint64(rng.Int63n(int64(seq) + 1))
+						b.VisibleSequence(cut)
+						b.DurableSequence(cut)
 					}
 				}
 				for j := range model {
@@ -75,6 +77,7 @@ func TestPartialDurabilityAgainstNaiveFilesystem(t *testing.T) {
 					t.Fatalf("final authority bytes %x, want %x", remote[i], model[i])
 				}
 			}
+			b.VisibleSequence(seq)
 			b.DurableSequence(seq)
 			if stats := b.Stats(); stats.Entries != 0 || stats.Bytes != 0 {
 				t.Fatalf("retained after final durability: %+v", stats)

@@ -209,6 +209,13 @@ func (f *delegationFakeRPC) CallIdempotent(ctx context.Context, request *authori
 	switch {
 	case request.GetFsync() != nil:
 		response.Body = &authoritypb.Response_Fsync{Fsync: &authoritypb.FsyncReply{DurableSequence: f.sequence}}
+	case request.GetWaitVisibility() != nil:
+		cut := request.GetWaitVisibility().GetCutSequence()
+		response.VisibleSequence = max(f.sequence, cut)
+		response.Body = &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{
+			AppliedSequence: response.VisibleSequence,
+			VisibleSequence: response.VisibleSequence,
+		}}
 	case request.GetDelegationRecallAck() != nil:
 		response.Body = &authoritypb.Response_DelegationRecallAck{DelegationRecallAck: &authoritypb.DelegationRecallAckReply{}}
 	case request.GetDelegationBreakAck() != nil:

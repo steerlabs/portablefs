@@ -1224,6 +1224,10 @@ func TestBlockingWaitClassification(t *testing.T) {
 	if !blockingWait(wait) {
 		t.Fatal("a waiting SetLock must use the blocking lane")
 	}
+	visibility := &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: 1}}}
+	if !blockingWait(visibility) {
+		t.Fatal("a visibility completion must use the blocking lane")
+	}
 	for name, req := range map[string]*authoritypb.Request{
 		"unlock":  {Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Wait: true, Unlock: true}}},
 		"trylock": {Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{}}},

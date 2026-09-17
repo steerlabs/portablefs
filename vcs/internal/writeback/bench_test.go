@@ -23,6 +23,7 @@ type benchmarkFlusher struct {
 
 func (f *benchmarkFlusher) Flush(_ context.Context, _ Identity, _ Entry) (uint64, error) {
 	seq := f.seq.Add(1)
+	f.buffer.Load().VisibleSequence(seq)
 	f.buffer.Load().DurableSequence(seq)
 	return seq, nil
 }

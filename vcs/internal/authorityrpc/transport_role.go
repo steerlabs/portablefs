@@ -45,7 +45,8 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		*authoritypb.Request_ListXattr, *authoritypb.Request_RemoveXattr,
 		*authoritypb.Request_StatFs, *authoritypb.Request_SyncFs,
 		*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
-		*authoritypb.Request_ApplyRoutes, *authoritypb.Request_Barrier:
+		*authoritypb.Request_ApplyRoutes, *authoritypb.Request_Barrier,
+		*authoritypb.Request_WaitVisibility:
 		return transportRequestData, nil
 	case *authoritypb.Request_Activate, *authoritypb.Request_AbortAttach,
 		*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,

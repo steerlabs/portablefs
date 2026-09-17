@@ -91,6 +91,9 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := h.Coherence.AdmitCache(peer.Token, volumeserver.CacheAdmission{Data: [][16]byte{{0x41}}}); err != nil {
+		t.Fatal(err)
+	}
 	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
 	req.GetWrite().Delegation = coherenceDelegationRefProto(delegation)
 	done := make(chan *authoritypb.Response, 1)
@@ -104,6 +107,9 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 	if result.GetErrno() != 0 || result.GetAppliedSequence() != 1 || result.GetWrite().GetCommittedSize() != 4 {
 		t.Fatalf("applied result = %v", result)
 	}
+	if result.GetVisibleSequence() != 0 {
+		t.Fatalf("unwithdrawn application reported visible sequence %d", result.GetVisibleSequence())
+	}
 	events, err := h.Coherence.Poll(t.Context(), peer.Token, peer.Position, nil, 32)
 	if err != nil || len(events) == 0 {
 		t.Fatalf("changes=%v, err=%v", events, err)
@@ -116,6 +122,20 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 		t.Fatalf("unacked peer became visible: %v", err)
 	case <-time.After(10 * time.Millisecond):
 	}
+	visible := make(chan *authoritypb.Response, 1)
+	go func() {
+		visible <- h.handleCoherenceVisibility(t.Context(), &authoritypb.Request{
+			RequestId: 2,
+			Body: &authoritypb.Request_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityRequest{
+				CutSequence: result.GetAppliedSequence(),
+			}},
+		}, cred)
+	}()
+	select {
+	case reply := <-visible:
+		t.Fatalf("visibility completion preceded withdrawal: %v", reply)
+	case <-time.After(10 * time.Millisecond):
+	}
 	if err := h.Coherence.Ack(peer.Token, position); err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +146,14 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("acked change did not become visible")
+	}
+	select {
+	case reply := <-visible:
+		if reply.GetErrno() != 0 || reply.GetVisibleSequence() != 1 || reply.GetWaitVisibility().GetAppliedSequence() != 1 || reply.GetWaitVisibility().GetVisibleSequence() != 1 {
+			t.Fatalf("visibility completion = %v", reply)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("visibility completion did not follow withdrawal")
 	}
 	replay := h.handleWrite(t.Context(), req, cred, req.GetWrite())
 	if replay.GetAppliedSequence() != 1 {

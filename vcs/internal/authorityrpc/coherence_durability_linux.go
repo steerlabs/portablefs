@@ -13,9 +13,12 @@ import (
 )
 
 type coherenceSessionApplications struct {
-	applied, durable uint64
-	lastVersion      uint64
-	applications     []uint64 // volume versions above the durable ticket prefix
+	applied, visible, durable uint64
+	lastVersion               uint64
+	applications              []uint64 // volume versions above the durable ticket prefix
+	visibleOutOfOrder         map[uint64]struct{}
+	visibilityChanged         chan struct{}
+	forgotten                 bool
 }
 
 // coherenceDurability maps the session application-ticket domain exposed
@@ -42,7 +45,7 @@ func (s *coherenceDurability) recordApplied(session volumeserver.SessionID, iden
 	}
 	state := s.sessions[session]
 	if state == nil {
-		state = &coherenceSessionApplications{}
+		state = &coherenceSessionApplications{visibilityChanged: make(chan struct{})}
 		s.sessions[session] = state
 	}
 	if state.applied == ^uint64(0) {
@@ -55,6 +58,68 @@ func (s *coherenceDurability) recordApplied(session volumeserver.SessionID, iden
 	state.lastVersion = volumeVersion
 	state.applications = append(state.applications, volumeVersion)
 	return state.applied
+}
+
+func (s *coherenceDurability) markVisible(session volumeserver.SessionID, sequence uint64) {
+	if sequence == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state := s.sessions[session]
+	if state == nil || state.forgotten || sequence > state.applied || sequence <= state.visible {
+		return
+	}
+	if state.visibleOutOfOrder == nil {
+		state.visibleOutOfOrder = make(map[uint64]struct{})
+	}
+	state.visibleOutOfOrder[sequence] = struct{}{}
+	for {
+		next := state.visible + 1
+		if _, ok := state.visibleOutOfOrder[next]; !ok {
+			break
+		}
+		delete(state.visibleOutOfOrder, next)
+		state.visible = next
+	}
+	close(state.visibilityChanged)
+	state.visibilityChanged = make(chan struct{})
+}
+
+func (s *coherenceDurability) latestVisible(session volumeserver.SessionID) uint64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if state := s.sessions[session]; state != nil && !state.forgotten {
+		return state.visible
+	}
+	return 0
+}
+
+func (s *coherenceDurability) waitVisible(ctx context.Context, session volumeserver.SessionID, sequence uint64) (applied, visible uint64, err error) {
+	for {
+		s.mu.RLock()
+		state := s.sessions[session]
+		if state == nil || state.forgotten {
+			s.mu.RUnlock()
+			return 0, 0, volumeserver.ErrSubscription
+		}
+		applied, visible = state.applied, state.visible
+		if sequence > applied {
+			s.mu.RUnlock()
+			return applied, visible, syscall.EINVAL
+		}
+		if visible >= sequence {
+			s.mu.RUnlock()
+			return applied, visible, nil
+		}
+		changed := state.visibilityChanged
+		s.mu.RUnlock()
+		select {
+		case <-ctx.Done():
+			return applied, visible, ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 // latest converts one proven durable volume cut to the session's largest
@@ -98,6 +163,10 @@ func (s *coherenceDurability) retire(volumeCut uint64) {
 
 func (s *coherenceDurability) forget(session volumeserver.SessionID) {
 	s.mu.Lock()
+	if state := s.sessions[session]; state != nil && !state.forgotten {
+		state.forgotten = true
+		close(state.visibilityChanged)
+	}
 	delete(s.sessions, session)
 	s.mu.Unlock()
 }
@@ -168,4 +237,22 @@ func (h *VolumeHandler) handleCoherenceBarrier(ctx context.Context, req *authori
 		}}
 		return response
 	})
+}
+
+func (h *VolumeHandler) handleCoherenceVisibility(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential) *authoritypb.Response {
+	body := req.GetWaitVisibility()
+	if body == nil || body.GetCutSequence() == 0 {
+		return h.errorResponse(req.GetRequestId(), syscall.EINVAL, false)
+	}
+	applied, visible, err := h.coherenceDurability.waitVisible(ctx, cred.ID, body.GetCutSequence())
+	if err != nil {
+		return h.errorResponse(req.GetRequestId(), err, false)
+	}
+	response := h.success(req.GetRequestId())
+	response.VisibleSequence = visible
+	response.Body = &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{
+		AppliedSequence: applied,
+		VisibleSequence: visible,
+	}}
+	return response
 }

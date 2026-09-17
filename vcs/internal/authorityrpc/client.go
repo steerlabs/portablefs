@@ -1612,12 +1612,16 @@ func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response)
 	}
 	switch c.cfg.FrontendProfile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
-		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
+		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
 			return fmt.Errorf("%w: cacheless reader received cache participation state", ErrTransportBinding)
 		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
 			return fmt.Errorf("%w: Linux subscription session received FSKit response state", ErrTransportBinding)
+		}
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
+		if response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 {
+			return fmt.Errorf("%w: FSKit session received Linux subscription state", ErrTransportBinding)
 		}
 
 	}

@@ -289,6 +289,31 @@ func (c *Client) Barrier(ctx context.Context, cutSequence uint64) (*authoritypb.
 	return proto.Clone(reply).(*authoritypb.BarrierReply), nil
 }
 
+// WaitVisibility joins peer withdrawal through an already-issued application
+// ticket. It performs no durability operation and is safe to retry.
+func (c *Client) WaitVisibility(ctx context.Context, cutSequence uint64) (*authoritypb.WaitVisibilityReply, error) {
+	if !c.linuxSubscriptionProfile() {
+		return nil, syscall.EOPNOTSUPP
+	}
+	if cutSequence == 0 {
+		return nil, syscall.EINVAL
+	}
+	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{
+		WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: cutSequence},
+	}})
+	if err != nil {
+		return nil, err
+	}
+	if err := successfulControlResponse(response); err != nil {
+		return nil, err
+	}
+	reply := response.GetWaitVisibility()
+	if reply == nil || reply.GetAppliedSequence() < reply.GetVisibleSequence() || reply.GetVisibleSequence() < cutSequence || response.GetVisibleSequence() != reply.GetVisibleSequence() {
+		return nil, errors.New("authorityrpc: visibility wait returned an invalid sequence proof")
+	}
+	return proto.Clone(reply).(*authoritypb.WaitVisibilityReply), nil
+}
+
 func (c *Client) linuxSubscriptionProfile() bool {
 	return c != nil && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
 }

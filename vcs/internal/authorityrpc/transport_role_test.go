@@ -43,6 +43,7 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_DelegationModeChangeAck{}},
 		{Body: &authoritypb.Request_DelegationRelease{}},
 		{Body: &authoritypb.Request_Barrier{}},
+		{Body: &authoritypb.Request_WaitVisibility{}},
 	}
 	descriptorBodies := (&authoritypb.Request{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
 	if len(requests) != descriptorBodies {
@@ -83,6 +84,7 @@ func TestTransportRoleAllowlistIsStrict(t *testing.T) {
 		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationModeChangeAck{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Barrier{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Write{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{}}, control: true},

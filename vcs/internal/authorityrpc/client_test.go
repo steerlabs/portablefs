@@ -1556,6 +1556,12 @@ func TestResponseStateCannotCrossFrontendProfiles(t *testing.T) {
 	}); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("FSKit lease grant validation = %v, want ErrTransportBinding", err)
 	}
+	if err := fskit.validateResponseFrontendProfile(&authoritypb.Response{
+		VisibleSequence: 1,
+		Body:            &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{}},
+	}); !errors.Is(err, ErrTransportBinding) {
+		t.Fatalf("FSKit visibility response validation = %v, want ErrTransportBinding", err)
+	}
 }
 
 func TestLinuxProfileRejectsRetiredLeaseResponseState(t *testing.T) {

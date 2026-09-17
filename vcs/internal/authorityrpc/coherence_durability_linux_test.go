@@ -3,15 +3,54 @@
 package authorityrpc
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestCoherenceVisibilityAdvancesOnlyContiguousApplications(t *testing.T) {
+	var ledger coherenceDurability
+	session := volumeserver.SessionID{1}
+	identity := [16]byte{1}
+	for version := uint64(1); version <= 3; version++ {
+		ledger.recordApplied(session, identity, version)
+	}
+	ledger.markVisible(session, 3)
+	ledger.markVisible(session, 1)
+	if got := ledger.latestVisible(session); got != 1 {
+		t.Fatalf("visible prefix with gap = %d, want 1", got)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		applied, visible, err := ledger.waitVisible(context.Background(), session, 3)
+		if err == nil && (applied != 3 || visible != 3) {
+			err = errors.New("visibility waiter returned the wrong prefix")
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("visibility waiter crossed a gap: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	ledger.markVisible(session, 2)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("visibility waiter did not observe the contiguous prefix")
+	}
+}
 
 func TestCoherenceDurabilityMapsVolumeCutsToSessionPrefixes(t *testing.T) {
 	var state coherenceDurability
