@@ -204,14 +204,18 @@ coordinates must be empty, and `byte_range` is legal only for DATA_CHANGED.
 Namespace operations emit all affected bindings/directories and object changes;
 a rename may therefore produce several entries at the same volume version.
 
-ChangeAck(N, I) means **every change through position N in incarnation I has
-finished local withdrawal**. EntryNotify must return for withdrawn names;
-InodeNotify must return for withdrawn attributes and data. Pending replies that
-could install those facts must drain or be revoked before the acknowledgment.
-A client cannot acknowledge past a hole. Identical or older acknowledgments
-are idempotent within the incarnation; future or undelivered positions are
-invalid. Old incarnations are refused. Transient notification failure receives
-a bounded retry, never a premature acknowledgment.
+ChangeAck(N, I) means **every change through position N in incarnation I has finished
+local withdrawal**. Inode notification has returned for affected kernel data and
+attributes, and pending cache-installing replies on those coordinates have drained or
+been discarded. Authority-backed shared names always have zero kernel entry validity.
+Their withdrawal closes the coordinate, revokes or drains old replies, and purges daemon
+positive/negative bindings and stamps; no entry notification is required. The next
+forward lookup must re-enter FUSE. Retained kernel dentry objects used by reverse
+`d_path` remain outside the contract; machine-local graft names are separate. A client
+can process disjoint entries concurrently, but cannot acknowledge past a hole. An
+identical or older ack is an idempotent no-op within that incarnation; a
+future/undelivered position is invalid. An old incarnation is refused, never translated
+to a current cursor. Transient notify failure gets a bounded retry, not a premature ack.
 
 An operation/grant awaiting withdrawal from a subscriber waits for that
 subscriber's ack through the relevant position or its horizon. Change entries

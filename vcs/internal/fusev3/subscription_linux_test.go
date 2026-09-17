@@ -767,7 +767,7 @@ func TestControlCompletionReceiptWaitsForEveryEarlierHandler(t *testing.T) {
 	}
 }
 
-func TestNamespaceWithdrawalRequiresReturnedEntryNotify(t *testing.T) {
+func TestNamespaceWithdrawalPurgesBindingsWithoutEntryNotify(t *testing.T) {
 	fixture := newStrictFixture(t)
 	root := fixture.raw.acquire(1)
 	defer fixture.raw.release(root)
@@ -777,17 +777,18 @@ func TestNamespaceWithdrawalRequiresReturnedEntryNotify(t *testing.T) {
 	fixture.raw.bindCachedNegativeLocked(key, fixture.mount.subscription.stamp())
 	fixture.raw.mu.Unlock()
 	fixture.notify.entryST = fuse.EIO
-	if err := fixture.raw.invalidateCacheCoordinateContext(context.Background(), coordinate, nil); err == nil {
-		t.Fatal("withdrawal succeeded without returned EntryNotify")
+	if err := fixture.raw.invalidateCacheCoordinateContext(context.Background(), coordinate, nil); err != nil {
+		t.Fatalf("zero-validity namespace withdrawal: %v", err)
+	}
+	fixture.raw.mu.Lock()
+	_, retained := fixture.raw.cachedNegatives[key]
+	fixture.raw.mu.Unlock()
+	if retained {
+		t.Fatal("withdrawal retained the negative binding")
 	}
 	fixture.notify.mu.Lock()
-	calls := len(fixture.notify.calls)
-	fixture.notify.entryST = fuse.OK
-	fixture.notify.mu.Unlock()
-	if calls == 0 {
-		t.Fatal("withdrawal never issued EntryNotify")
-	}
-	if err := fixture.raw.invalidateCacheCoordinateContext(context.Background(), coordinate, nil); err != nil {
-		t.Fatal(err)
+	defer fixture.notify.mu.Unlock()
+	if len(fixture.notify.calls) != 0 {
+		t.Fatal("namespace withdrawal issued EntryNotify, which can wait on a CREATE parent lock")
 	}
 }

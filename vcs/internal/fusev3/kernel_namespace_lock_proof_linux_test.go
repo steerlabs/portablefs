@@ -26,7 +26,7 @@ func (f *kernelNamespaceLockProofFS) Create(_ <-chan struct{}, _ *fuse.CreateIn,
 	return fuse.EACCES
 }
 
-func TestKernelEntryNotifyWaitsForNamespaceCallback(t *testing.T) {
+func TestKernelEntryNotifyUnderHeldParentLockStallsAndMustNotGateAck(t *testing.T) {
 	fs := &kernelNamespaceLockProofFS{
 		kernelProofFS: &kernelProofFS{RawFileSystem: fuse.NewDefaultRawFileSystem()},
 		entered:       make(chan struct{}), release: make(chan struct{}),

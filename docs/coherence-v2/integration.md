@@ -881,3 +881,32 @@ and `docs/coherence-v2/{design.md,wire.md,client.md,integration.md}`.
 
 These observations measure regressions, not install or Git performance. Part 2
 has not begun, so results.md and docs/performance.md retain G's measurements.
+
+### R3 reversal: design owner approved zero kernel validity
+
+The design owner accepted the kernel lock-cycle proof and reversed R3. G's
+F10 amendment stands: kernel entry_valid and attr_valid stay zero, daemon
+bindings and attributes live under the subscription, and acknowledgment covers
+purged bindings plus returned InodeNotify for cached pages. EntryNotify never
+participates in the change acknowledgment path. Cold horizon withdrawal retains
+R1's notifications and transport-loss proof.
+
+Restored the pre-R3 behavior and its wire/client descriptions. The retained
+`TestKernelEntryNotifyUnderHeldParentLockStallsAndMustNotGateAck` names the
+parent-lock constraint explicitly; the positive-dentry notification proof also
+remains. `TestNamespaceWithdrawalPurgesBindingsWithoutEntryNotify` fails against
+R3 when EntryNotify returns EIO, and requires both a removed negative binding
+and no notification call. Before log: `/tmp/cv2-g2-r3-reversal-before.log`.
+
+This decision supersedes the preceding R3 requirement and its unresolved
+contract statement. Part 2 item 3 now requires allocation-free daemon cache
+hits and negative caching, with zero Authority LOOKUPs for a warm stat and a
+create whose absent binding is cached. Nonzero kernel cache lifetimes are
+excluded by the approved contract.
+
+The standalone matrix exits 0 (28 PASS, the unchanged chown SKIP, both negative
+controls matched), log `/tmp/cv2-g2-r3-reversal-matrix.log`. The initial full
+XFS/FUSE run stops on a duplicate LOOKUP count after unlink; a focused repetition
+also exposes an existing-name CREATE coherence refusal. Neither assertion was
+relaxed. Gate repair continues before R4. The no-EntryNotify regression and
+renamed kernel parent-lock proof pass in the focused repetition.

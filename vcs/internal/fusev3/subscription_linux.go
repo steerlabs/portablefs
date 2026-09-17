@@ -1059,10 +1059,6 @@ func (r *rawFileSystem) invalidateCacheCoordinateContext(ctx context.Context, co
 	}
 	switch coordinate.kind {
 	case publicationNamespaceName:
-		notifier := r.mount.notifier()
-		if notifier == nil {
-			return errors.New("fusev3: namespace invalidation has no kernel notification channel")
-		}
 		r.mu.Lock()
 		parent := r.byIdentityLocked(coordinate.parent)
 		if parent == nil {
@@ -1074,12 +1070,12 @@ func (r *rawFileSystem) invalidateCacheCoordinateContext(ctx context.Context, co
 		r.dropCachedNameLocked(key)
 		r.dropCachedNegativeLocked(key)
 		reclaim := r.collectLocked(child)
-		parentNode := parent.id
 		r.mu.Unlock()
 		r.mount.deferReclaim(reclaim)
-		if status := notifier.EntryNotify(parentNode, coordinate.name); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: invalidate name %q under inode %d: %v", coordinate.name, parentNode, status)
-		}
+		// Every Authority-backed kernel name reply has entry_valid=0. Purging daemon bindings
+		// after the exact reply drain fully withdraws namespace permission.
+		// EntryNotify adds no validity proof and can deadlock on a parent lock
+		// held by a mutation callback that has not reached our source gate yet.
 		return nil
 	case publicationItemEnumeration:
 		r.mu.Lock()
