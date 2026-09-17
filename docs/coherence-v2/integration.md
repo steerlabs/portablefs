@@ -1687,3 +1687,16 @@ Final validation for this follow-up: the full unprivileged FUSE suite passes
 (`/tmp/cv2-g2-recall-fullunit3.log`) and the writeback race suite passes
 (`/tmp/cv2-g2-recall-writeback.log`). Privileged-only tests are left to the full
 Docker gate.
+
+#### G2 Part 2 item 7a: bound all-identity flush fan-out
+
+`FlushAll` now uses at most 16 workers by default, configurable through the
+internal `MaxFlushIdentities` option. Each worker retains the existing per-file
+serialization and visits the remaining cut even after another identity fails.
+Explicit identity flushes used by recall and fsync remain independently
+admissible. A 100-identity test checks exact peak concurrency at limits 1, 2 and
+4, all-target completion after a refusal, and explicit flush progress while
+all workers are parked. Restoring the former one-goroutine-per-identity loop
+fails that test (`/tmp/cv2-g2-flush-pool-fault.log`); the writeback race suite
+passes (`/tmp/cv2-g2-flush-pool-root.log`). Four-chunk per-file dispatch and
+retained-record scatter transmission are the remaining portions of item 7.

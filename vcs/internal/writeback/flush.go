@@ -171,24 +171,35 @@ func (b *Buffer) targets(cut Cut) []Identity {
 }
 
 // FlushAll flushes the cut concurrently across identities, retaining per-file
-// order. It waits for every started call even if one fails.
+// order, using a bounded worker pool. It visits every target even if one fails.
 func (b *Buffer) FlushAll(ctx context.Context, cut Cut) (uint64, error) {
 	ids := b.targets(cut)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var seq uint64
 	var first error
-	for _, id := range ids {
+	next := 0
+	for worker := 0; worker < min(b.maxFlushIdentities, len(ids)); worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s, e := b.FlushIdentity(ctx, id, cut)
-			mu.Lock()
-			seq = max(seq, s)
-			if first == nil {
-				first = e
+			for {
+				mu.Lock()
+				if next == len(ids) {
+					mu.Unlock()
+					return
+				}
+				id := ids[next]
+				next++
+				mu.Unlock()
+				s, e := b.FlushIdentity(ctx, id, cut)
+				mu.Lock()
+				seq = max(seq, s)
+				if first == nil {
+					first = e
+				}
+				mu.Unlock()
 			}
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()

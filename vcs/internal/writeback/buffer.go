@@ -48,6 +48,7 @@ type file struct {
 	reschedule      bool
 }
 type Buffer struct {
+	maxFlushIdentities                      int
 	waitingAdmissions                       int
 	mu                                      sync.Mutex
 	files                                   map[Identity]*file
@@ -74,7 +75,7 @@ type Buffer struct {
 }
 
 func New(flusher Flusher, opts Options) (*Buffer, error) {
-	if flusher == nil || opts.MaxBytes < 0 || opts.MaxEntries < 0 {
+	if flusher == nil || opts.MaxBytes < 0 || opts.MaxEntries < 0 || opts.MaxFlushIdentities < 0 {
 		return nil, ErrInvalid
 	}
 	if opts.MaxBytes == 0 {
@@ -86,7 +87,10 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 	if opts.FlushInterval == 0 {
 		opts.FlushInterval = time.Second
 	}
-	b := &Buffer{
+	if opts.MaxFlushIdentities == 0 {
+		opts.MaxFlushIdentities = 16
+	}
+	b := &Buffer{maxFlushIdentities: opts.MaxFlushIdentities,
 		loss:  opts.InitialLossSequence,
 		files: make(map[Identity]*file), active: make(map[Identity]*file),
 		appliedHeap: make(recordHeap, 0, opts.MaxEntries),
