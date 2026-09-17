@@ -921,8 +921,9 @@ func (m *Mount) holdBulk(parent context.Context) (context.Context, func(), sysca
 // destroyed mount.
 //
 // The backlog is bounded even though push never fails: the only tokens that can
-// enter it are one per interned inode plus one per admitted duplicate lookup,
-// and interning is exactly what admission throttles.
+// enter it are retained inode capabilities, admitted duplicate lookups, and
+// unused PLUS page capabilities. Interning and PLUS page fetches both throttle
+// against this watermark before producing more cleanup debt.
 type reclaimQueue struct {
 	watermark int
 
@@ -1800,7 +1801,19 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			h.fetchDone = make(chan struct{})
 			done := h.fetchDone
 			h.mu.Unlock()
-			response, errno := h.node.mutate(ctx, request)
+			// A withdrawn PLUS page can discard every capability without
+			// reaching intern. Throttle replacement pages before minting more
+			// cleanup debt, outside the cursor lock needed by withdrawal.
+			var response *authoritypb.Response
+			var errno syscall.Errno
+			if wantItems {
+				admitCtx, cancel := context.WithTimeout(ctx, h.node.requestTimeout)
+				errno = contextErrno(h.node.mount.reclaim.admit(admitCtx))
+				cancel()
+			}
+			if errno == 0 {
+				response, errno = h.node.mutate(ctx, request)
+			}
 			h.mu.Lock()
 			h.fetching = false
 			h.fetchDone = nil

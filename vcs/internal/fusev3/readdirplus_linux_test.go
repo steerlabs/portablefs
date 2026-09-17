@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"fmt"
+	"syscall"
 	"testing"
 	"time"
 
@@ -222,5 +223,38 @@ func TestReadDirPlusWithdrawalStopsTheCurrentReplyPage(t *testing.T) {
 				t.Fatal("next callback lost the replacement page")
 			}
 		})
+	}
+}
+
+func TestReadDirPlusReclaimsDiscardedPageBeforeFetchingAgain(t *testing.T) {
+	raw, mount, rpc := testRawFileSystem(t, 1)
+	id, _ := testDirHandle(t, raw, plusTestPages(1)[0], plusTestPages(1)[0])
+	held, handle := raw.acquireDirHandle(id)
+	defer raw.releaseHandleOperation(held)
+	ctx, finish := testMutationContext(t, mount)
+	defer finish(false)
+	if _, _, errno := handle.peek(ctx, true); errno != 0 {
+		t.Fatal(errno)
+	}
+	handle.invalidateEnumeration()
+	if mount.reclaim.pending() != 1 {
+		t.Fatal("withdrawal did not queue the unused page capability")
+	}
+	blocked, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, _, errno := handle.peek(blocked, true); errno != syscall.ETIMEDOUT {
+		t.Fatalf("page fetch with full cleanup queue = %v, want timeout before minting capabilities", errno)
+	}
+	if len(rpc.readdirs) != 1 {
+		t.Fatalf("minted another page before cleanup: READDIR calls=%d", len(rpc.readdirs))
+	}
+	if _, ok := mount.reclaim.pop(ctx); !ok {
+		t.Fatal("missing discarded capability")
+	}
+	if _, _, errno := handle.peek(ctx, true); errno != 0 {
+		t.Fatal(errno)
+	}
+	if len(rpc.readdirs) != 2 {
+		t.Fatal("cleanup did not reopen page admission")
 	}
 }

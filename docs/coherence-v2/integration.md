@@ -2179,3 +2179,23 @@ repetitions pass (`/tmp/cv2-g2-state-index.log`, `state-index-race.log`). Tests 
 prove epoch pointer replacement and zero allocations per indexed ownership check.
 The full gate at `50b44bb` was green (`/tmp/cv2-g2-final-full3.log`); it is being
 repeated with this final index change.
+
+#### G2 final-gate PLUS cleanup admission
+
+The full gate at `e15df61` failed the unchanged paged-enumeration churn test
+with ENFILE; a focused repetition failed on its eighth iteration. A withdrawn
+PLUS reply queued all 256 capabilities and immediately fetched another page,
+bypassing the admission in `intern` because none of its entries was interned.
+Sixteen discarded pages can exhaust the 4,096-capability session table.
+
+PLUS page fetches now wait for reclaim-queue admission before the RPC, outside
+the cursor lock. This covers both discarded buffered pages and replies whose
+cursor generation changed in flight. No capacity or assertion changed. The
+regression invalidates an unused page, holds its cleanup debt at the watermark,
+and proves no new READDIR occurs until cleanup makes room. It fails against the
+old code (`/tmp/cv2-g2-page-admit-fault.log`). Ten PLUS unit repetitions, five
+Linux race repetitions, and ten unchanged mounted churn repetitions pass
+(`page-admit.log`, `page-admit-race.log`, `paged-churn-fixed.log`, all under
+`/tmp/cv2-g2-`). The focused mounted wrapper exits 70 for omitted inventory.
+Independent read-only review confirms server capability issue/rollback is
+balanced and the new wait holds no cursor or publication lock.
