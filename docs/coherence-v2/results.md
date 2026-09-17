@@ -533,3 +533,43 @@ Logs: `/tmp/cv2-g2-registry-bench-before.log` and `registry-bench-after.log`.
 The benchmark contains only readers; real callbacks also acquire exclusive
 publication and reference-accounting cuts. No mounted throughput claim follows
 from this isolated read-lock result.
+
+## G2 isolated kernel LOOKUP round trip
+
+The first exact probe attempt used `fuse_get_unique`; that symbol did not observe
+ordinary requests in this kernel build and produced no samples. It is discarded.
+The working [bpftrace probe](../../scripts/cached-lookup-roundtrip.bt) pairs
+`queue_request_and_unlock` with `fuse_request_end` by the live request address.
+Linux 6.8's [request path](https://github.com/torvalds/linux/blob/v6.8/fs/fuse/dev.c)
+places those boundaries before queue insertion and after reply copy, respectively.
+The interval includes daemon wakeup/service and kernel reply acceptance; it
+excludes initial request allocation and the requester's final wakeup. Permission
+GETATTRs are excluded by opcode. Probe overhead after the start is included.
+
+The mounted test pins and labels only its measured syscall thread. Both modes
+produce exactly 2,000 unique request pairs, 2,000 daemon LOOKUPs, and zero Authority
+LOOKUP or GETATTR RPCs. Kernel entry/attribute validity remains zero. Results on
+the shared Linux 6.8.0-100-generic arm64 VM, with another profile run active:
+
+| Mode | Kernel round trip p50 / p95 | Samples below 20 us | Whole syscall p50 / p95 |
+| --- | ---: | ---: | ---: |
+| Shared cached binding | 2.708 / 14.750 us | 1,931 / 2,000 | 20.000 / 88.334 us |
+| Dirty FULL holder | 10.292 / 29.458 us | 1,766 / 2,000 | 72.250 / 155.584 us |
+
+Both medians satisfy the below-20-us target; the holder tail does not. Maximum
+samples were approximately 2.5 ms, reflecting the shared scheduling environment.
+These are the first measurements at this boundary, so there is no comparable
+pre-change kernel-round-trip number. They must not be compared as a speedup
+against the earlier daemon-service or whole-syscall figures.
+
+Reproduction: start `bpftrace -q scripts/cached-lookup-roundtrip.bt` as root in a
+privileged container in the same VM (mount tracefs there if needed), wait for
+`LOOKUP_PROBE_READY`, then run
+`PORTABLEFS_GO_TEST_FLAGS='-run ^TestCachedLookupKernelRoundTrip$' bash scripts/xfs-fuse-integration.sh`.
+Stop the tracer with SIGINT after both subtests pass. Group `LOOKUP_NS` rows by
+label, require exactly 2,000 distinct request IDs each, sort nanoseconds, and
+select indices 1,000 and 1,900 for p50/p95. Tracing is optional measurement
+infrastructure, not a dependency of the default or full gate. The focused wrapper
+exits 70 for omitted inventory. Logs: `/tmp/cv2-g2-lookup-exact-mounted2.log` and
+`/tmp/cv2-g2-lookup-kernel2.log`; bpftrace 0.17.0. The unchanged syscall and daemon
+service counters remain available alongside the kernel probe.

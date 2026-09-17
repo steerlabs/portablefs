@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"testing"
@@ -594,6 +595,29 @@ func cachedLookupKernelRoundTrip(t *testing.T, full bool) {
 	lookupBefore, attrBefore := f.counter.count("lookup"), f.counter.count("getattr")
 	const n = 2000
 	latencies := make([]time.Duration, n)
+	// A kernel kprobe can identify only this workload thread, then pair unique
+	// request IDs to exclude permission GETATTRs from the LOOKUP round trip.
+	runtime.LockOSThread()
+	threadComm := fmt.Sprintf("/proc/self/task/%d/comm", unix.Gettid())
+	oldComm, err := os.ReadFile(threadComm)
+	if err != nil {
+		runtime.UnlockOSThread()
+		t.Fatal(err)
+	}
+	label := "pfs-look-share"
+	if full {
+		label = "pfs-look-full"
+	}
+	if err := os.WriteFile(threadComm, []byte(label), 0o600); err != nil {
+		runtime.UnlockOSThread()
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.WriteFile(threadComm, oldComm, 0o600); err != nil {
+			t.Error(err)
+		}
+		runtime.UnlockOSThread()
+	}()
 	for i := range latencies {
 		start := time.Now()
 		err := unix.Faccessat(int(dir.Fd()), "cached-lookup", unix.F_OK, 0)

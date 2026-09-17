@@ -2129,3 +2129,19 @@ malformed identities do not. Independent read-only review confirms the
 nonblocking path preserves the existing epoch and final subscription checks.
 The failed profile run retained completed install profiles but no Git results;
 it is not a passing baseline. Repeated baseline and full gates follow.
+
+#### G2 amended item 3: exact kernel LOOKUP measurement
+
+The cached LOOKUP test labels its pinned workload thread so a kernel probe can
+exclude permission GETATTRs. The new optional bpftrace program pairs queue entry
+and reply acceptance using the request address. It records exactly 2,000 unique
+LOOKUPs in both shared and dirty FULL-holder modes while the existing test proves
+zero Authority LOOKUP/GETATTR requests. The measured medians are 2.708 and
+10.292 us; p95 is 14.750 and 29.458 us. Results.md states the exact boundaries,
+probe overhead, shared-VM contention and reproduction command. This establishes
+the median target without relabeling daemon service time as a round trip.
+
+The focused mounted test passes (`/tmp/cv2-g2-lookup-exact-mounted2.log`); its
+wrapper exits 70 because only this test was selected. The first ineffective
+`fuse_get_unique` probe produced zero samples and was discarded. No production
+cache lifetime or notification behavior changed for the measurement.
