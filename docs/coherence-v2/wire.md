@@ -261,6 +261,12 @@ express a preference; only the reply authorizes kernel caching. A write-intent
 handle is direct-IO. A separate holder read handle can be cache-capable if the
 holder invalidates affected local kernel ranges on every accepted write.
 
+SETATTR mode, uid, gid, timestamps, and size require an item capability or an
+open handle owned by the session. A handle alone authorizes the operation even
+if the item capability has been reclaimed; when both are present they must name
+the same identity. Neither a stable identity nor a DelegationRef substitutes for
+these capabilities. Omitting both returns EINVAL before storage application.
+
 An absent DelegationRef is an ordinary synchronous operation, including a
 first write that needs authority ownership arbitration. It never authorizes
 local buffering. Reacquisition through OPEN with write_intent supplies the new

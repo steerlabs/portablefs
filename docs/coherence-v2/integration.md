@@ -949,3 +949,17 @@ exits 0 with all 66 required tests and the root boundary test passing
 exits 0 with 28 PASS, the unchanged chown SKIP, and both controls matching
 (`/tmp/cv2-g2-restored-matrix-2.log`). The full local gate remains due after the
 remaining G2 work.
+
+### R4: SETATTR capability contract
+
+wire.md now states that mode/uid/gid/times and size SETATTR accept a retained
+session handle without an item capability, require matching identities when
+both are supplied, and refuse neither with EINVAL. The handler already enforces
+this refusal; no runtime change was necessary. The new table
+`TestCoherenceSetAttrRequiresItemOrHandle` drives the full handler for all eight
+field forms and requires EINVAL, no application ticket, and no post-state.
+
+Validation: cross-compiled `./internal/authorityrpc` with
+`CGO_ENABLED=0 GOOS=linux go -C vcs test -c`, then executed the test binary in
+the pinned Docker image with `-test.run '^TestCoherenceSetAttrRequiresItemOrHandle$'
+-test.v`. All eight cases pass; log `/tmp/cv2-g2-r4.log`.

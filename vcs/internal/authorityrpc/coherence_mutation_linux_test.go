@@ -460,3 +460,31 @@ func TestLinuxV7PreparationCannotEscapeStorageDependencies(t *testing.T) {
 		t.Fatalf("uncovered preparation=%v", response)
 	}
 }
+
+func TestCoherenceSetAttrRequiresItemOrHandle(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		set  *authoritypb.SetAttrRequest
+	}{
+		{"mode", &authoritypb.SetAttrRequest{Mode: proto.Uint32(0600)}},
+		{"uid", &authoritypb.SetAttrRequest{Uid: proto.Uint32(1000)}},
+		{"gid", &authoritypb.SetAttrRequest{Gid: proto.Uint32(1000)}},
+		{"atime", &authoritypb.SetAttrRequest{AtimeNs: proto.Int64(1)}},
+		{"mtime", &authoritypb.SetAttrRequest{MtimeNs: proto.Int64(1)}},
+		{"atime-now", &authoritypb.SetAttrRequest{AtimeNow: true}},
+		{"mtime-now", &authoritypb.SetAttrRequest{MtimeNow: true}},
+		{"size", &authoritypb.SetAttrRequest{Size: proto.Int64(0)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+			request := coherenceReadRequest(credential)
+			request.Mutation = &authoritypb.Mutation{Sequence: 1}
+			request.Body = &authoritypb.Request_SetAttr{SetAttr: test.set}
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != int32(syscall.EINVAL) || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
+				t.Fatalf("unauthorized SETATTR = %v, want unapplied EINVAL", response)
+			}
+		})
+	}
+}
