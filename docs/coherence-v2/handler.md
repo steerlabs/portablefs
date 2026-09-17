@@ -209,8 +209,11 @@ Integration replaces ordinal cookies with XFS getdents offsets. The store ReadDi
 current page stamp for publication revalidation. Continuation seeks to the
 store cookie without accepting an unused input verifier. The frozen wire
 verifier remains optional and shape-checked; it does not authorize continuation.
-The reply publishes the page stamp sampled by the storage-turn revalidation,
-not the earlier probe's stamp. The concurrent peer
+The handler holds the directory's store read turn across the initial page read,
+child resolution, and revalidation. If a newly discovered child expands the
+dependency set, it reacquires that complete set and rereads; no bounded retry
+may surface `EAGAIN`. The reply publishes the page stamp sampled by the
+storage-turn revalidation, not the earlier probe's stamp. The concurrent peer
 creator/deleter regression requires every unchanged entry exactly once and refuses
 ESTALE or EAGAIN. A page retries legitimate enumeration, child-resolution, and
 revalidation races until it succeeds or its request context ends; the fixed

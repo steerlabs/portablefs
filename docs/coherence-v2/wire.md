@@ -75,7 +75,7 @@ It rejects unknown fields, maps, and fixed-width fields. No new message uses a
 map or fixed-width field. The write-data digest substitution is unchanged.
 Changing delegation id or generation changes a mutation's replay fingerprint.
 
-Repeated collections have at most 4,096 elements, except CloseBatch requests
+Repeated collections have at most 4,096 elements, except `CloseBatchRequest`
 and replies, whose limit is 128. Every collection must also fit the
 negotiated frame byte bound; senders split batches/pages earlier when needed.
 Identities are exactly 16 bytes and nonzero. Delegation ids and snapshot ids
@@ -340,8 +340,8 @@ an authority timeout. The generation check remains decisive after a timeout.
 | `DelegationBreak` | `delegation` (1), `identity` (2), `budget_nanos` (3). Flush an accepted cut for a waiting peer read; retain ownership. |
 | `DelegationModeChange` | `delegation` (1), `identity` (2), target `mode` (3), `budget_nanos` (4). |
 | `DelegationRecallAck`; request 69 | `incarnation` (1), `event_sequence` (2), `delegation` (3), `applied_sequence` (4). |
-| `DelegationBreakAck`; request 70 | Same field names/numbers as RecallAck. |
-| `DelegationModeChangeAck`; request 71 | Same field names/numbers as RecallAck. |
+| `DelegationBreakAck`; request 70 | Same field names/numbers as `DelegationRecallAck`. |
+| `DelegationModeChangeAck`; request 71 | Same field names/numbers as `DelegationRecallAck`. |
 | `DelegationRecallAckReply`; response 61 | Empty success receipt. |
 | `DelegationBreakAckReply`; response 62 | Empty success receipt. |
 | `DelegationModeChangeAckReply`; response 63 | Empty success receipt. |
@@ -445,7 +445,7 @@ storage mutation. No commit lock may span an ack, recall, horizon, or durability
 wait. The authority's existing mutation sequencer orders conflicting work.
 
 The historical v6 lease schema stays for inspection of stored wire history.
-`Lease*`, NextLeaseEvent, AcknowledgeLeaseEvent, RenewLeases,
+`Lease*`, `NextLeaseEventRequest`, `AcknowledgeLeaseEventRequest`, `RenewLeasesRequest`,
 SourceLeaseDischarge, AcknowledgeSourceLeaseDischarge, `lease_grants`,
 `source_lease_discharge`, and Activate's `lease_cursor` are not sent or honoured
 by the completed v7 implementation. F owns deletion of their executable

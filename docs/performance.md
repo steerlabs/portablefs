@@ -2,6 +2,36 @@
 
 Status: **protocol-7 local engineering measurements; no production SLO**
 
+## September 17, 2026 G4 final measurement
+
+G4 removes the READDIRPLUS capability-cleanup regression while retaining zero
+Linux kernel entry and attribute validity. The final run uses the same shared
+Linux VM and full-size workload as the historical v6 and G samples.
+
+| Workload | v6 wall (s) | G wall (s) | G4 wall (s) | v6 requests/op | G requests/op | G4 requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker | 386.762771 | 21.028568 | 21.552428 | 7.854381 | 7.480524 | 1.977476 |
+| install, 8 workers | 273.738199 | 15.706301 | 11.839633 | 7.561476 | 6.849524 | 1.977357 |
+| git-status-cold | 10.572948 | 1.379696 | 1.751086 | 1.040450 | 1.027400 | 1.027050 |
+| git-status-warm | 2.042038 | 1.195970 | 2.177457 | 0.027650 | 0.018600 | 0.018250 |
+| two-mount-write-list-read | 12.536042 | 2.644504 | 2.974838 | 7.877500 | 9.819500 | 6.216750 |
+
+Warm status over 20,000 files issues zero LOOKUP/GETATTR requests and one
+RECLAIM. The two-mount run issues 214 RECLAIMs for 858 READDIR pages. The
+per-opcode tables and the ten raw JSON observations are in
+[results.md](./coherence-v2/results.md#g4-final-baseline-and-qualification).
+
+One 100-sample profile splits the one-worker CREATE syscall into mean stage
+latencies of 170 us kernel-to-daemon, 33 us daemon-to-Authority, 53 us inside
+the Authority handler, and 79 us from handler return to syscall return. This
+335 us CREATE mean, plus write, close, directory, and scheduling work, explains
+the measured install floor; G4 does not attempt another install optimization.
+
+The exact all-case soak passes in 1,052.64 seconds, including full-size Git at
+906.12 seconds and every fault case. `verify-local.sh --full` and the standalone
+matrix results are recorded in the integration record. These are local
+engineering observations, not a production latency claim.
+
 ## September 17, 2026 G2 measurement
 
 G2 preserves zero Linux kernel entry and attribute validity. Daemon LOOKUP and

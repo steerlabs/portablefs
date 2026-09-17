@@ -2464,3 +2464,116 @@ Final evidence:
   and the Linux matrix; log `/tmp/cv2-g3a-verify-full2.log`.
 - The final focused baseline passed all subtests in 116.27 seconds. Its numbers
   are recorded in `results.md`; log `/tmp/cv2-g3a-final-baseline.log`.
+
+## G4
+
+G4 merged the 0.4.0 release draft first (`be42687`) and retained its rollout
+documents. The implementation then corrected the merged-tree regressions and
+qualified the result without changing protocol major 7, Linux's zero kernel
+entry/attribute validity policy, or any frozen command or environment name.
+
+### READDIRPLUS capability ownership and reclaim
+
+The diagnosed warm-status regression was duplicate capability ownership, not a
+metadata miss. Every warm READDIRPLUS page asked for Items; the Authority minted
+one capability per entry, the client found the identity already interned, and
+the losing token generated one RECLAIM RPC. Peer page churn multiplied the same
+path. The fix is additive:
+
+- `ReadDirRequest.held_identities` tag 6 is a sorted, unique, page-local list of
+  at most 4,096 stable identities whose bindings the mount already retains.
+- `Dirent.stable_identity` tag 7 lets an Item-less entry select only that
+  retained binding. `addLookupHeldDirent` validates identity, inode key, stale
+  state, and lookup overflow under the registry lock before incrementing the
+  kernel lookup reference. A missing or mismatched binding fails closed.
+- `ReclaimRequest.items` tag 2 carries at most 4,096 tokens. One replay identity
+  owns the same-epoch batch; a watermark or timer flushes residue. FORGET stays
+  nonblocking.
+- A record with zero kernel lookups remains retained while its live subscribed
+  name binding fits the bounded registry. Eviction, withdrawal, epoch change,
+  or unmount retires it. Successful unlink/rmdir also retains the mutation-
+  proven absence, eliminating the warm `.git/index.lock` LOOKUP.
+
+The regression assertions use opcode counts rather than totals. Final warm Git
+has zero LOOKUP+GETATTR, one RECLAIM (limit 64), and 0.01825 requests per file
+(limit 0.02). The final peer run has 6.21675 requests per operation (limit 9.8)
+and 214 RECLAIMs for 858 READDIR pages. Commit `8032e11` contains the wire,
+Authority, client, batching, and baseline tests; `88ecb2f` contains the
+mutation-proven absence fix.
+
+### Directory pages under peer mutation
+
+The G3a NPM artifact's server-side EAGAIN came from page probing and later
+revalidation straddling a concurrent directory mutation. READDIR now owns the
+directory's XFS storage read turn across the first page read, child resolution,
+and revalidation. When child discovery expands the dependency set, it acquires
+the complete set and rereads. The regression churns the directory from a peer
+and proves that enumeration holds that turn; no bounded stabilization loop may
+surface EAGAIN. Commit `7f28835` contains the change and regression.
+
+### Soak-discovered shutdown and launch defects
+
+The first merged full-size Git soak reached sustained peer status traffic but
+eventually stopped in Linux `kernel_clone`. The test process was both FUSE
+daemon and workload parent: Go's pre-exec child performed `chdir` into the FUSE
+mount while the parent runtime was in the fork critical section. With both
+scheduler threads in simultaneous launches, runnable FUSE callbacks could not
+serve that child. Workload commands now serialize only `Cmd.Start`, exec
+`/usr/bin/env` from `/`, and use its `-C` option to enter the mounted worktree
+after exec. Commands still overlap; the peer status race is unchanged. The two
+deterministic launch regressions are commits `527eab4` and `b8a70c9`.
+
+The next full-size run completed history and all 200 checkouts, then found that
+a clean cold remount could cancel an in-flight batched reclaim after a retained
+response had been returned. The response still must be consumed, but normal
+mount-context cancellation must not invoke the fatal revocation ladder. The
+enhanced shutdown regression requires both nonfatal close and exactly one
+response consumption. Commit `a6e1b91` contains that fix.
+
+The exact required soak command then passed every case in 1,052.64 seconds.
+
+| Case | Seconds | Result |
+| --- | ---: | --- |
+| `TestSoakChaos` | 0.151 | PASS |
+| `TestSoakPackageTree` | 46.547 | PASS |
+| `TestSoakGit` | 906.120 | PASS |
+| `TestSoakCompiler` | 42.150 | PASS |
+| `TestSoakNPM` | 22.413 | PASS |
+| `TestSoakGitLock` | 0.331 | PASS |
+| fault: authority new epoch | 1.042 | PASS |
+| fault: control horizon | 15.040 | PASS |
+| fault: dirty unmount | 11.008 | PASS |
+| fault: writeback cap | 3.012 | PASS |
+| async-close/break reproducer | 1.009 | PASS |
+| rewrite/read reproducer | 1.844 | PASS |
+| seeded alias reproducer | 1.361 | PASS |
+
+Artifacts are under `/tmp/portablefs-g4-soak-final`. The full Git case used
+5,000 files and 200 commits, passed both mounted phases and the direct-XFS
+reference, and completed its fsck and cross-mount manifest checks within the
+unchanged 20-minute budget.
+
+### Final measurement and install decision
+
+The unprofiled final baseline passes in 111.03 seconds. Raw rows are in
+`results-g4-final.jsonl`; the v6/G/G4 comparison and opcode tables are in
+`results.md`. Warm Git has 365 total requests; the peer workload has 24,867.
+
+One isolated 100-sample profile measured CREATE at 170 us mean from syscall to
+daemon, 33 us from daemon to Authority handler, 53 us in the handler, and 79 us
+from handler return to syscall return. The 335 us CREATE mean excludes the
+following write and close. The profiled one-worker install took 20.247920
+seconds; the final uninstrumented run took 21.552428 seconds for 40,000 files
+and 2,000 directories. G4 therefore accepts the namespace round-trip floor and
+does not add another install optimization.
+
+### Contract audit
+
+Rule F6 preserves exact definite pre-apply `ENOSPC`, `EDQUOT`, and `EFBIG` and
+uses EIO for generic accepted-write loss. The design failure matrix and quota
+row now use the same rule. `client.md` describes held page identities, retained
+bindings, and batched reclaim; `handler.md` describes the directory storage
+turn; `wire.md` uses the exact protobuf message and field names. An identifier
+audit compared every documented protocol message and field with
+`proto/authority/v1/authority.proto`; the only initial differences were prose
+shorthands, which were expanded to their exact message names.

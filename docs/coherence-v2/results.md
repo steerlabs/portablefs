@@ -808,3 +808,84 @@ intermediate baseline, PortableFS install wall time fell from 34.664636 to
 21.825695 seconds with one worker and from 15.408795 to 11.694983 seconds with
 eight. The bounded background pool preserves per-identity order; these figures
 are one machine observation rather than a general throughput claim.
+
+## G4 final baseline and qualification
+
+The final G4 baseline ran on Linux 6.8.0-100-generic with the same 4-CPU,
+8-GiB Docker VM, loopback TLS, tmpfs-backed loop XFS, workload sizes, and
+denominators as the v6 and G records. All subtests passed in 111.03 seconds.
+[Raw final observations](results-g4-final.jsonl) preserve all ten rows.
+
+| Workload | v6 wall (s) | G wall (s) | G4 wall (s) | v6 requests/op | G requests/op | G4 requests/op | G4 filesystem requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker | 386.762771 | 21.028568 | 21.552428 | 7.854381 | 7.480524 | 1.977476 | 1.964595 |
+| install, 8 workers | 273.738199 | 15.706301 | 11.839633 | 7.561476 | 6.849524 | 1.977357 | 1.967619 |
+| git-status-cold | 10.572948 | 1.379696 | 1.751086 | 1.040450 | 1.027400 | 1.027050 | 1.026000 |
+| git-status-warm | 2.042038 | 1.195970 | 2.177457 | 0.027650 | 0.018600 | 0.018250 | 0.018050 |
+| two-mount-write-list-read | 12.536042 | 2.644504 | 2.974838 | 7.877500 | 9.819500 | 6.216750 | 3.302750 |
+
+The warm-status regression target is met: LOOKUP + GETATTR is zero, RECLAIM is
+one (limit 64), and total traffic is 0.01825 requests per file (limit 0.02).
+The two-mount target is also met: 6.21675 requests per operation (limit 9.8),
+and 214 RECLAIM requests are no more than its 858 READDIR pages. The peer run
+performed five scans, observed 173 files while the writer was active, and
+verified all 2,000 files. Scheduling and overlap differ between historical
+runs, so these wall times remain observations rather than isolated speedups.
+
+| Warm-status opcode | Requests | Requests/op |
+| --- | ---: | ---: |
+| close | 120 | 0.006000 |
+| close_batch | 1 | 0.000050 |
+| create | 1 | 0.000050 |
+| flush | 16 | 0.000800 |
+| lookup + get_attr | 0 | 0.000000 |
+| open | 119 | 0.005950 |
+| read_dir | 103 | 0.005150 |
+| unlink | 1 | 0.000050 |
+| barrier | 1 | 0.000050 |
+| delegation_release | 1 | 0.000050 |
+| reclaim | 1 | 0.000050 |
+| renew_subscription | 1 | 0.000050 |
+
+| Two-mount opcode | Requests | Requests/op |
+| --- | ---: | ---: |
+| close | 2,006 | 0.501500 |
+| close_batch | 77 | 0.019250 |
+| create | 2,000 | 0.500000 |
+| flush | 2,000 | 0.500000 |
+| get_attr | 65 | 0.016250 |
+| lookup | 193 | 0.048250 |
+| open | 2,005 | 0.501250 |
+| read | 2,007 | 0.501750 |
+| read_dir | 858 | 0.214500 |
+| write | 2,000 | 0.500000 |
+| barrier | 4 | 0.001000 |
+| change_ack | 4,268 | 1.067000 |
+| delegation_break_ack | 1,409 | 0.352250 |
+| delegation_release | 77 | 0.019250 |
+| next_control_event | 5,683 | 1.420750 |
+| reclaim | 214 | 0.053500 |
+| renew_subscription | 1 | 0.000250 |
+
+### One-worker CREATE latency profile
+
+One isolated profile sampled 100 evenly spaced `open(O_CREAT|O_EXCL)` calls
+from the 40,000-file, one-worker install. Temporary timestamp probes used one
+process monotonic clock at syscall entry, raw FUSE CREATE entry, Authority
+handler entry/exit, and syscall return; the probes were removed before final
+qualification. Values are microseconds per CREATE and exclude the subsequent
+1 KiB write and close.
+
+| Stage | Mean (us) | p50 (us) | p95 (us) |
+| --- | ---: | ---: | ---: |
+| kernel to daemon | 170 | 172 | 222 |
+| daemon to Authority | 33 | 29 | 77 |
+| Authority apply | 53 | 50 | 83 |
+| reply to syscall return | 79 | 75 | 115 |
+
+The stage means total 335 us per CREATE. The same profiled install completed in
+20.247920 seconds; the final uninstrumented run took 21.552428 seconds for
+40,000 create/write/close operations plus 2,000 directory creations. The
+remaining install wall time is therefore the namespace round-trip floor plus
+write, close, directory, and scheduling work. G4 deliberately does not add a
+new install optimization.

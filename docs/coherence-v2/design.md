@@ -103,7 +103,7 @@ The new runner mounts, subscribes, and starts creating and writing. Its first wr
 | Authority crash (new epoch) | Every mount's non-durable buffer; every delegation, subscription, lock, and open server handle | Every handle open at the time is permanently stale with EIO, because item capabilities are epoch-local and there is no open-by-identity. The loss sequence advances. New opens work after re-attach. Runs holding files at the time fail at their barrier and are restarted by the product | Stays up after re-attach; today this is a forced remount |
 | Authority planned restart | Nothing: the control plane quiesce recalls every delegation, which flushes every buffer, and waits for durability | A pause; handles survive because the session is resumed within the same epoch | Stays up |
 | Stale-generation flush | That flush, whole | EIO on affected handles; loss sequence advances | Stays up |
-| Quota exhausted | The buffered entries the Authority rejects with EDQUOT at flush | ENOSPC on the affected handles' next write, close, or fsync, and at the run barrier. The Authority never reads quota usage today and a reservation scheme would be new state on both sides; delayed reporting is the NFS contract and is accepted here | Stays up |
+| Capacity exhausted | The buffered entries the Authority definitely rejects before apply with ENOSPC, EDQUOT, or EFBIG at flush | The exact errno on the affected handles' next write, close, or fsync, and at the run barrier. The Authority never reads quota usage today and a reservation scheme would be new state on both sides; delayed reporting is the NFS contract and is accepted here | Stays up |
 | Unmount with a dirty buffer and unreachable Authority | The buffer, after waiting to the delegation horizon | Unmount completes after the horizon; loss logged | Gone by request |
 
 ## Fixed rules
@@ -193,7 +193,7 @@ Three things this design does not make perfect, stated so nobody discovers them 
 | File write delegation with cache withdrawal | partial LEASE_RIGHT_DATA_EXCLUSIVE exists and is grantable; nothing withdraws peers' cache rights first; the Authority does not know which sessions hold cache-capable handles | Extend: reserve-then-withdraw-then-grant inside CREATE and OPEN, per-identity count of cache-capable handles per session for the write-through downgrade, break on every data-consuming operation, recall on every data-mutating one. |
 | Batch or transactional apply | missing | Not needed. |
 | Lease persistence, grace, reclaim, open-by-identity | missing item capabilities are epoch-local and stable_identity is explicitly non-authorizing | Not built. An epoch change stales every open handle; runs restart. |
-| Quota usage | missing no quotactl anywhere; the kernel returns EDQUOT at write | Not built. ENOSPC is delayed to flush and surfaced at the barrier. |
+| Quota usage | missing no quotactl anywhere; the kernel reports its exact capacity errno at apply | Not built. Definite pre-apply ENOSPC, EDQUOT, or EFBIG is delayed to flush and preserved at the barrier. |
 | Subtree or directory scope | missing | Not in this design. |
 
 ### Linux client

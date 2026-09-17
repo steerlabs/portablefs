@@ -144,7 +144,7 @@ The following three residuals are reproduced verbatim from the design:
 
   - **Stalled daemon, resident pages.** If a reader's daemon stops responding past its horizon, a process on that mount holding an open descriptor or a private mapping can read pages that were resident before the withdrawal, until the daemon resumes and invalidates. Stock FUSE offers no way for userspace to fence this. The current code has the same residual and documents it. The Authority proceeds at the horizon so a healthy writer is not held hostage by a dead reader.
 
-  - **Delayed `ENOSPC`.** A write accepted into the buffer can fail with `EDQUOT` at flush; the process learns at its next write, close, or fsync on that file, or at the run barrier. This is the NFS contract. A reservation scheme would need quota usage the Authority does not read today.
+  - **Delayed capacity refusal.** A write accepted into the buffer can fail with `ENOSPC`, `EDQUOT`, or `EFBIG` at flush; the process learns the exact definite pre-apply errno at its next write, close, or fsync on that file, or at the run barrier. This is the NFS contract. A reservation scheme would need quota usage the Authority does not read today.
 
   - **Contended files run at today's speed.** A file that a peer holds a cached handle on, or writes concurrently, is write-through with invalidation per commit. That is correct and it is what the current system does for every file.
 
@@ -159,6 +159,16 @@ Commands and final gate results are recorded in
 [integration.md](./coherence-v2/integration.md). Measurements and profiling,
 including direct XFS and protocol 6 comparisons, are in
 [results.md](./coherence-v2/results.md).
+
+The final G4 baseline records 0.01825 Authority requests per file for warm Git
+status (zero LOOKUP/GETATTR and one RECLAIM) and 6.21675 requests per operation
+for the two-mount workload (214 RECLAIMs for 858 READDIR pages). The exact
+all-case soak passes, including the full 5,000-file/200-commit Git workload and
+all fault cases. The additive directory contract lets a client name page-local
+stable identities whose capabilities it already retains; the Authority omits a
+new Item only for those identities. Residual capabilities are reclaimed in
+batches of at most 4,096. Directory page construction owns the store read turn
+and never surfaces server-generated `EAGAIN` under peer mutation.
 
 These are local Docker/kernel qualification results, not a production SLO or a
 broader kernel certification. Production must pin and qualify its runner kernel

@@ -40,6 +40,9 @@ this file is the human-curated summary.
   Pure Authority mounts negotiate READDIRPLUS; routed mounts retain READDIR.
   Linux kernel entry and attribute validity remain zero, with metadata caching
   in the subscribed daemon.
+- Warm READDIRPLUS pages name stable identities whose capabilities the mount
+  already retains, so the Authority does not mint duplicate Items. Residual
+  capabilities are reclaimed in same-epoch batches of at most 4,096.
 - Completed control replay and application tickets retire at their acknowledged
   and durable prefixes. Background flush dispatch and deferred closes are
   bounded. Fallback durability Barriers run at most once per second; explicit
@@ -66,6 +69,9 @@ this file is the human-curated summary.
 - Cached positive LOOKUP, negative LOOKUP, and GETATTR callbacks use zero
   Authority RPCs and zero allocations through physical reply settlement in
   the recorded deterministic tests, down from 22, 9, and 18 allocations.
+- Authority READDIR holds the directory storage turn across page construction
+  and dependency revalidation, so peer mutation cannot escape as server-side
+  EAGAIN. Clean unmount remains nonfatal when it cancels an in-flight reclaim.
 
 ### Hosted release and deployment
 
@@ -85,20 +91,15 @@ this file is the human-curated summary.
 
 ### Measurements and qualification
 
-- The pre-G2 full gate (run 156) passed 66 required privileged-suite tests,
-  one root-boundary test, and 345 native Swift tests. Its matrix and the
-  independent run 157 reported 28 PASS, zero unexpected failures, and the
-  existing single-principal ownership SKIP. Later G2 changes have targeted
-  evidence; their final full gate remains outstanding in the integration record.
-- The recorded pre-G2 full-size v6 to v7 install times were 386.762771 to
-  21.028568 seconds at one worker and 273.738199 to 15.706301 seconds at eight
-  workers, for 40,000 files and 2,000 directories. Cold/warm status over 20,000
-  tracked files took 1.379696/1.195970 seconds on v7. The peer workload verified
-  2,000 files but overlapped only one read with the writer; its Authority
-  requests increased from 31,510 to 39,278.
-- Targeted G2 observations: a 1,000-file install used seven Barriers and zero
-  FLUSH, ChangeAck, or additional control polls in 5.26 seconds. Cold `ls -ln`
-  over 1,000 entries used four READDIR RPCs and zero LOOKUP RPCs.
+- The G4 baseline passes in 111.03 seconds. One/eight-worker 40,000-file installs
+  take 21.552428/11.839633 seconds at 1.977476/1.977357 requests per operation.
+  Warm status over 20,000 files takes 2.177457 seconds at 0.01825 requests per
+  file, with zero LOOKUP/GETATTR and one RECLAIM. The two-mount workload takes
+  2.974838 seconds at 6.21675 requests per operation; 214 RECLAIMs are below its
+  858 READDIR pages.
+- The exact all-case soak passes in 1,052.64 seconds. Full-size Git passes in
+  906.12 seconds, and package, compiler, NPM, Git-lock, chaos, epoch, horizon,
+  dirty-unmount, writeback-cap, and reduced long-run regressions all pass.
 - These measurements use a shared 4-CPU/8-GiB Docker VM, kernel
   `6.8.0-100-generic`, loopback TLS, and tmpfs-backed loop XFS. They do not
   establish production latency or an SLO. Production kernel, deployed staging,
