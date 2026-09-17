@@ -120,7 +120,7 @@ func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb
 				identity = t.BoundIdentities[0]
 			}
 		}
-		if !intent && !b.Create.GetFlags().GetTruncate() {
+		if b.Create.GetExclusive() || (!intent && !b.Create.GetFlags().GetTruncate()) {
 			identity = [16]byte{}
 		}
 	}
@@ -132,6 +132,11 @@ func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb
 		// cuts are still necessary for attribute-bearing mutation post-state.
 		for _, t := range gate.Targets {
 			ids := t.BoundIdentities
+			if create := req.GetCreate(); create != nil && create.GetExclusive() {
+				// O_EXCL can never mutate the pre-existing object. The storage
+				// turn decides EEXIST without cutting the winner's delegation.
+				ids = nil
+			}
 			if t.Identity != ([16]byte{}) {
 				ids = append(append([][16]byte(nil), ids...), t.Identity)
 			}

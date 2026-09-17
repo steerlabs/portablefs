@@ -3,6 +3,8 @@
 package authorityrpc
 
 import (
+	"context"
+	"errors"
 	"io/fs"
 	"syscall"
 	"testing"
@@ -19,8 +21,11 @@ type coherenceExistingCreateStore struct {
 	openErr      error
 }
 
-func (s *coherenceExistingCreateStore) Create(xfsstore.Capability, string, fs.FileMode, bool) (xfsstore.Capability, xfsstore.Attr, error) {
+func (s *coherenceExistingCreateStore) Create(_ xfsstore.Capability, _ string, _ fs.FileMode, exclusive bool) (xfsstore.Capability, xfsstore.Attr, error) {
 	s.create.Add(1)
+	if exclusive {
+		return xfsstore.Capability{}, xfsstore.Attr{}, syscall.EEXIST
+	}
 	return s.item, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 2, Size: 7, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
 }
 
@@ -97,6 +102,90 @@ func TestCoherenceExistingCreateFailureLeavesNoDelegation(t *testing.T) {
 	}
 	if store.create.Load() != 1 || store.open.Load() != 1 {
 		t.Fatalf("storage calls = create %d open %d", store.create.Load(), store.open.Load())
+	}
+}
+
+func TestCoherenceExclusiveCreateDoesNotCutExistingDelegation(t *testing.T) {
+	item := xfsstore.Capability{0x36}
+	store := &coherenceExistingCreateStore{
+		resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: item},
+		item:                        item, handle: xfsstore.Capability{0x47},
+	}
+	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 128, 8)
+	source, err := h.coherenceToken(credential.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := h.Coherence.Subscribe(volumeserver.SessionID{9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceCursor, peerCursor := uint64(0), uint64(0)
+	drain := func(token volumeserver.SubscriptionToken, cursor *uint64) {
+		t.Helper()
+		events, pollErr := h.Coherence.Poll(t.Context(), token, *cursor, nil, 16)
+		if pollErr != nil {
+			t.Fatal(pollErr)
+		}
+		if len(events) == 0 {
+			t.Fatal("coordinator returned an empty nonblocking poll")
+		}
+		*cursor = events[len(events)-1].Position
+		if ackErr := h.Coherence.Ack(token, *cursor); ackErr != nil {
+			t.Fatal(ackErr)
+		}
+	}
+
+	for race := 0; race < 100; race++ {
+		reservation, err := h.Coherence.ReserveNew(peer.Token, [16]byte{item[0]})
+		if err != nil {
+			t.Fatalf("race %d reserve: %v", race, err)
+		}
+		drain(source, &sourceCursor)
+		drain(peer.Token, &peerCursor)
+		var grant volumeserver.Delegation
+		if race%2 != 0 {
+			grant, err = reservation.Grant(t.Context())
+			if err != nil {
+				t.Fatalf("race %d grant: %v", race, err)
+			}
+		}
+
+		request := coherenceExistingCreateRequest(credential, root)
+		request.RequestId = uint64(race + 1)
+		request.Mutation.Sequence = uint64(race + 1)
+		request.GetCreate().Exclusive = true
+		done := make(chan *authoritypb.Response, 1)
+		go func() { done <- h.Handle(ctx, request) }()
+		select {
+		case response := <-done:
+			if response.GetErrno() != int32(syscall.EEXIST) || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED || response.GetUncertain() {
+				t.Fatalf("race %d exclusive CREATE = %+v", race, response)
+			}
+		case <-time.After(250 * time.Millisecond):
+			t.Fatalf("race %d exclusive CREATE waited on the existing delegation", race)
+		}
+
+		pollCtx, cancel := context.WithTimeout(t.Context(), 5*time.Millisecond)
+		events, pollErr := h.Coherence.Poll(pollCtx, peer.Token, peerCursor, nil, 16)
+		cancel()
+		if len(events) != 0 || !errors.Is(pollErr, context.DeadlineExceeded) {
+			t.Fatalf("race %d exclusive CREATE emitted control cut: events=%+v err=%v", race, events, pollErr)
+		}
+		if race%2 == 0 {
+			reservation.Abort()
+			continue
+		}
+		pin, err := h.Coherence.BeginFlush(peer.Token, [16]byte{item[0]}, grant.ID, grant.Generation)
+		if err != nil {
+			t.Fatalf("race %d winner delegation no longer flushes: %v", race, err)
+		}
+		pin.End(0)
+		if _, err := h.Coherence.ReleaseBatch(peer.Token, []volumeserver.Delegation{grant}); err != nil {
+			t.Fatalf("race %d release: %v", race, err)
+		}
+		drain(source, &sourceCursor)
+		drain(peer.Token, &peerCursor)
 	}
 }
 
