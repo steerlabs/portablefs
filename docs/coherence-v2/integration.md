@@ -1173,3 +1173,25 @@ check and Barrier. That order also prevents a clean-buffer check from racing a
 new accepted write. The corrected close, clean-close, budget, and delegation
 suites pass (`/tmp/cv2-g2-c3-final-unit.log`); the counterexample is recorded in
 `/tmp/cv2-g2-c3-cap-before.log`.
+
+### C4: prove break-for-read ordering for every read family
+
+The break test now covers READ, GETATTR, LOOKUP, READDIR, and FSYNC. It observes
+the actual StreamBreakForRead before checking storage counters, acknowledges that
+exact cut, and verifies the resumed result and call counts. The new READDIR row
+fails before the change: its first directory page was read before admission.
+READDIR now admits the directory before that page and candidate construction,
+then releases its guard before admitting children to avoid nested identity guards.
+The final storage turn still revalidates the page.
+
+LOOKUP has an explicit identity-discovery qualification: one binding probe is
+needed to discover the child whose delegation must be broken. The test requires
+exactly that one probe and zero authoritative attribute samples before the ACK;
+it does not claim literally zero Store.Lookup calls. The discarded probe is not
+published. READ, GETATTR, READDIR, and FSYNC require zero corresponding value
+reads/syncs before ACK. This preserves the actual publication contract rather
+than hiding discovery I/O in the counter.
+
+The pre-change READDIR failure is `/tmp/cv2-g2-c4-before.log`. All selected
+`^TestCoherence(Read|Lookup)` tests pass in the pinned Docker image after the
+change (`/tmp/cv2-g2-c4-after.log`), using the cross-compiled authorityrpc binary.

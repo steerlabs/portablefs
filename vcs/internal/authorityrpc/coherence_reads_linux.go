@@ -326,11 +326,19 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 		}
 		budget := h.readDirEntryBudget(request.GetMaxEntries())
 		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
+			directoryGuard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, directoryIdentity)
+			if guardErr != nil {
+				return h.coherenceError(0, guardErr)
+			}
 			entries, _, current, eof, directory, readErr := h.coherenceReadDirPage(handle, cookie, int(request.GetMaxEntries()))
 			if readErr != nil {
+				directoryGuard.Release()
 				return h.errorResponse(0, readErr, false)
 			}
 			candidates, budgetExhausted, conflict, buildErr := h.constructDirectoryPage(handle, entries, cookie, request.GetWantItems(), budget)
+			// Never nest identity guards: child breaks can visit the same directory
+			// in the opposite order. The storage turn below revalidates this page.
+			directoryGuard.Release()
 			if buildErr != nil {
 				return h.errorResponse(0, buildErr, false)
 			}
@@ -338,8 +346,7 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				continue
 			}
 
-			identities := make([][16]byte, 0, len(candidates)+1)
-			identities = append(identities, directoryIdentity)
+			identities := make([][16]byte, 0, len(candidates))
 			seen := map[[16]byte]struct{}{directoryIdentity: {}}
 			for _, candidate := range candidates {
 				if candidate.identity == ([16]byte{}) {
