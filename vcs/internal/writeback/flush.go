@@ -156,13 +156,18 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 			seq, err = b.flusher.Flush(ctx, id, entry)
 		}
 		b.mu.Lock()
+		if f.pending != p {
+			errno := f.lastErrno
+			if f.lastGenericLoss > cut.LossSequence {
+				errno = 0
+			}
+			lost := recordedLossError(errno)
+			b.mu.Unlock()
+			return applied, lost
+		}
 		if err != nil {
 			b.mu.Unlock()
 			return applied, fmt.Errorf("flush %x token %d: %w", id, entry.Token, err)
-		}
-		if f.pending != p {
-			b.mu.Unlock()
-			return applied, ErrLost
 		}
 		if seq == 0 || seq < p.applied || seq < f.lastApplied {
 			b.mu.Unlock()

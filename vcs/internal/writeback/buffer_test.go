@@ -832,11 +832,12 @@ func TestMountRetirementBlocksNewIdentitiesAndCompetingRetirements(t *testing.T)
 func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	started := make(chan Entry, 1)
 	release := make(chan struct{})
+	transportErr := errors.New("injected retryable transport failure")
 	flusher := flusherFunc(func(ctx context.Context, _ Identity, entry Entry) (uint64, error) {
 		started <- entry
 		select {
 		case <-release:
-			return 50, nil
+			return 0, transportErr
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
@@ -854,6 +855,8 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	close(release)
 	if err := await(t, result, "dropped flush"); !errors.Is(err, ErrLost) {
 		t.Fatalf("FlushIdentity error = %v, want ErrLost", err)
+	} else if errors.Is(err, transportErr) {
+		t.Fatalf("rebinding loss was hidden by transport error: %v", err)
 	}
 	assertStats(t, b, Stats{LossSequence: 1})
 	assertRead(t, b, id, 0, 7, []byte("clean!!"), []byte("clean!!"))
