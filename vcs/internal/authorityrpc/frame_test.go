@@ -503,11 +503,15 @@ func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
 	if decoded.GetHello() != nil {
 		t.Fatal("repeated-field amplification reached protobuf decode")
 	}
-	// The sender runs the exact same grammar, so an internal producer cannot
-	// put a frame on the wire that every conforming receiver must reject.
-	if err := writeFrame(io.Discard, 4096, request); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("writeFrame oversized repeated field = %v, want ErrFrameEncoding", err)
+	// The typed outbound encoder does not repeat untrusted ingress validation.
+	var outbound bytes.Buffer
+	if err := writeFrame(&outbound, 4096, request); err != nil {
+		t.Fatal(err)
 	}
+	if err := readFrame(&outbound, 4096, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("encoded oversized repetition escaped ingress: %v", err)
+	}
+
 }
 
 func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
@@ -527,8 +531,12 @@ func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
 	if decoded.GetBody() != nil {
 		t.Fatal("nested allocation amplification reached protobuf decode")
 	}
-	if err := writeFrame(io.Discard, 1<<20, response); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("writeFrame nested allocation amplification = %v, want ErrFrameEncoding", err)
+	var outbound bytes.Buffer
+	if err := writeFrame(&outbound, 1<<20, response); err != nil {
+		t.Fatal(err)
+	}
+	if err := readFrame(&outbound, 1<<20, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("encoded nested amplification escaped ingress: %v", err)
 	}
 }
 

@@ -136,7 +136,7 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 	client := dialCoherenceV2TestClient(t, handler)
 
 	if client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}) != &client.controlPoll ||
-		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}) != &client.controlAck ||
+		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}) != &client.changeAck ||
 		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionRequest{}}}) != &client.liveness {
 		t.Fatal("protocol-7 poll, acknowledgment, and renewal did not receive independent admission lanes")
 	}

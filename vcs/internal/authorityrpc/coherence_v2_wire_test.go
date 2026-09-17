@@ -442,8 +442,13 @@ func TestCoherenceV2RepeatedCollectionsRespectFrameBound(t *testing.T) {
 			if err := writeFrame(io.Discard, 1<<20, test.atMax); err != nil {
 				t.Fatalf("collection at frame bound: %v", err)
 			}
-			if err := writeFrame(io.Discard, 1<<20, test.over); !errors.Is(err, ErrFrameEncoding) {
-				t.Fatalf("collection over frame bound = %v, want ErrFrameEncoding", err)
+			var frame bytes.Buffer
+			if err := writeFrame(&frame, 1<<20, test.over); err != nil {
+				t.Fatal(err)
+			}
+			decoded := test.over.ProtoReflect().Type().New().Interface()
+			if err := readFrame(&frame, 1<<20, nil, 0, decoded); !errors.Is(err, ErrFrameEncoding) {
+				t.Fatalf("collection over ingress frame bound = %v, want ErrFrameEncoding", err)
 			}
 		})
 	}

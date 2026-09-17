@@ -313,9 +313,8 @@ func writeFrameBulk(w io.Writer, max uint32, message proto.Message, segments [][
 		return fmt.Errorf("encode protobuf frame: %w", err)
 	}
 	metadata := prefix[frameHeaderBytes:]
-	if err := validateWireMessage(metadata, message.ProtoReflect().Descriptor()); err != nil {
-		return err
-	}
+	// Canonical encoding is produced by the typed deterministic marshaler.
+	// Reflective grammar and allocation bounds are checked once, on ingress.
 	bulkBytes := uint64(len(bulk))
 	if segments != nil {
 		bulkBytes = segmentedBytes

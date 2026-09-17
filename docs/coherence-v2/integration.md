@@ -1963,3 +1963,30 @@ fails with the old handler (`/tmp/cv2-g2-read-set-fault.log`). The final root
 Linux Authority suite passes (`/tmp/cv2-g2-read-set-root.log`), including the
 unchanged C4 break-before-storage table. Local page-admission measurements are
 recorded in results.md.
+
+The full XFS gate at `b38a0f8` passed all 76 privileged tests and the root
+boundary test (`/tmp/cv2-g2-read-set-full-xfs.log`).
+
+#### G2 item 10a: CONTROL encoding and independent acknowledgments
+
+Outbound frames now use deterministic typed protobuf encoding without a second
+reflective grammar walk. Ingress still validates canonical metadata and decoded
+allocation bounds before unmarshal; outbound frame and bulk-carrier byte bounds
+remain enforced. Existing amplification tests now encode through the outbound
+path and prove the receiver refuses those same oversized collections. This
+changes validation placement, not the wire grammar or ingress refusal contract.
+
+CONTROL batch construction keeps an exact running protobuf byte count, including
+nested length-prefix growth. Boundary tests cover 127/128 and 16383/16384 and
+prove both that every batch fits and that the next queued entry cannot fit.
+Change acknowledgments have their own single permit, independent of delegation
+acknowledgments and release. A socket test parks each acknowledgment kind in
+turn and proves the other completes; both directions time out with the old
+client (`/tmp/cv2-g2-ack-lane-fault.log`).
+
+The full host Authority race suite passes (`/tmp/cv2-g2-control-host-race.log`),
+as does the full Linux Authority suite (`/tmp/cv2-g2-control-root.log`). Exact
+length-prefix tests pass three repetitions. Actual old/new handler binaries
+were benchmarked on the same Docker VM; results.md records the batch-size table
+(`/tmp/cv2-g2-control-bench-before.log`, `control-bench-after.log`, same prefix).
+The client-side batch withdrawal portion of item 10 follows separately.

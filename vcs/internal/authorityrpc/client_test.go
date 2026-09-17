@@ -390,7 +390,7 @@ func TestStrictClientReservesIndependentProtocol7ControlLanes(t *testing.T) {
 	}
 	next := &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
 	ack := &authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}
-	if client.laneFor(next) != &client.controlPoll || client.laneFor(ack) != &client.controlAck {
+	if client.laneFor(next) != &client.controlPoll || client.laneFor(ack) != &client.changeAck {
 		t.Fatal("subscription control calls did not use independent reserved lanes")
 	}
 	keepalive := &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}}

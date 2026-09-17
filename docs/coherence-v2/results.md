@@ -453,3 +453,21 @@ allocations. These unit measurements include physical reply settlement.
 This isolates coordinator work with no foreign delegation. It excludes storage,
 RPC and kernel time. The new guard also remains held through storage revalidation;
 the former loop did not provide that exclusion.
+
+## G2 CONTROL batch construction
+
+Actual pre-change and updated handler binaries, Linux arm64 Docker VM,
+`BenchmarkCoherenceBatchAssembly`, median of three single-iteration samples.
+The VM is shared; these are local CPU-path observations, not latency guarantees.
+
+| Entries | Former repeated prefix sizing | Running byte count |
+| ---: | ---: | ---: |
+| 64 | 63.208 us | 27.167 us |
+| 256 | 489.961 us | 41.042 us |
+| 1,024 | 6,949.290 us | 141.126 us |
+| 4,096 | 109,887.755 us | 1,118.173 us |
+
+Allocation counts are unchanged after descriptor warmup (278, 1,050, 4,128 and
+16,424 per batch respectively). The improvement removes repeated prefix walks;
+it does not change CONTROL wire bytes or event count. Logs:
+`/tmp/cv2-g2-control-bench-before.log` and `control-bench-after.log`.

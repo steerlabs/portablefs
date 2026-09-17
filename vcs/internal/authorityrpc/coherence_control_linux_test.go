@@ -959,3 +959,53 @@ func TestCoherencePeerAckRetiresTrailingSourceAdvance(t *testing.T) {
 func publishPeerControlChange(c *volumeserver.CoherenceCoordinator) {
 	c.OnCommit([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{0xf0}, VolumeVersion: 1}})
 }
+
+func TestCoherenceBatchSizingPreservesLengthPrefixBoundaries(t *testing.T) {
+	for _, boundary := range []int{127, 128, 129, 16383, 16384, 16385} {
+		for _, limit := range []int{boundary - 1, boundary, boundary + 1} {
+			handler, _ := newCoherenceControlTestHandler(t, responseEnvelopeReserve+uint32(limit))
+			session := &coherenceControlSession{token: volumeserver.SubscriptionToken{Session: volumeserver.SessionID{1}, Incarnation: 128}}
+			for i := 0; i < 1000; i++ {
+				session.queued = append(session.queued, volumeserver.StreamEvent{Kind: volumeserver.StreamChange, Position: uint64(i + 1), Change: volumeserver.ChangeEntry{VolumeVersion: 16384, Kind: volumeserver.NamespaceChanged, ParentIdentity: [16]byte{1}, Name: "child"}})
+			}
+			event, ok, err := handler.nextCoherenceControlEventLocked(session)
+			if err != nil || !ok {
+				t.Fatalf("limit %d: %v", limit, err)
+			}
+			if size := proto.Size(event); size > limit {
+				t.Fatalf("limit %d: size=%d", limit, size)
+			}
+			if len(session.queued) == 0 {
+				t.Fatal("fixture did not reach frame boundary")
+			}
+			next, err := coherenceChangeEntryProto(session.queued[0].Change, session.changeDelivered+1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			event.GetChangeBatch().Entries = append(event.GetChangeBatch().Entries, next)
+			if proto.Size(event) <= limit {
+				t.Fatalf("limit %d unnecessarily truncated batch", limit)
+			}
+		}
+	}
+}
+
+func BenchmarkCoherenceBatchAssembly(b *testing.B) {
+	for _, count := range []int{64, 256, 1024, 4096} {
+		b.Run(fmt.Sprintf("entries-%d", count), func(b *testing.B) {
+			handler := &VolumeHandler{MaxFrame: 4 << 20}
+			events := make([]volumeserver.StreamEvent, count)
+			for i := range events {
+				events[i] = volumeserver.StreamEvent{Kind: volumeserver.StreamChange, Position: uint64(i + 1), Change: volumeserver.ChangeEntry{VolumeVersion: 1, Kind: volumeserver.AttributesChanged, Identity: [16]byte{1}}}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				session := &coherenceControlSession{token: volumeserver.SubscriptionToken{Session: volumeserver.SessionID{1}, Incarnation: 1}, queued: append([]volumeserver.StreamEvent(nil), events...)}
+				event, ok, err := handler.nextCoherenceControlEventLocked(session)
+				if err != nil || !ok || len(event.GetChangeBatch().GetEntries()) != count {
+					b.Fatal("incomplete batch", err)
+				}
+			}
+		})
+	}
+}

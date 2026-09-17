@@ -185,6 +185,7 @@ type Client struct {
 	repairControl             lane
 	controlPoll               lane
 	controlAck                lane
+	changeAck                 lane
 	liveness                  lane
 	epoch                     []byte
 	helloFeatures             []string
@@ -338,6 +339,7 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		repairControl: lane{permits: make(chan struct{}, 1)},
 		controlPoll:   lane{permits: make(chan struct{}, 1)},
 		controlAck:    lane{permits: make(chan struct{}, 1)},
+		changeAck:     lane{permits: make(chan struct{}, 1)},
 		liveness:      lane{permits: make(chan struct{}, 1)},
 	}
 	connectionSetID, err := randomProtocolIdentity()
@@ -1421,7 +1423,10 @@ func (c *Client) laneFor(request *authoritypb.Request) *lane {
 	if request.GetNextControlEvent() != nil {
 		return &c.controlPoll
 	}
-	if request.GetSubscribe() != nil || request.GetChangeAck() != nil ||
+	if request.GetChangeAck() != nil {
+		return &c.changeAck
+	}
+	if request.GetSubscribe() != nil ||
 		request.GetDelegationRecallAck() != nil || request.GetDelegationBreakAck() != nil ||
 		request.GetDelegationModeChangeAck() != nil || request.GetDelegationRelease() != nil {
 		return &c.controlAck

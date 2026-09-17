@@ -18,6 +18,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/errnos"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -540,6 +541,8 @@ func (h *VolumeHandler) nextCoherenceControlEventLocked(session *coherenceContro
 					Incarnation: session.token.Incarnation, Entries: entries,
 				}},
 			}
+			batchBytes := proto.Size(event.GetChangeBatch())
+			envelopeBytes := proto.Size(event) - protowire.SizeTag(3) - protowire.SizeBytes(batchBytes)
 			for {
 				position := session.changeDelivered + 1
 				if position == 0 {
@@ -551,7 +554,8 @@ func (h *VolumeHandler) nextCoherenceControlEventLocked(session *coherenceContro
 				}
 				entries = append(entries, entry)
 				event.GetChangeBatch().Entries = entries
-				if proto.Size(event) > h.coherenceReplyLimit() {
+				candidateBytes := batchBytes + protowire.SizeTag(2) + protowire.SizeBytes(proto.Size(entry))
+				if envelopeBytes+protowire.SizeTag(3)+protowire.SizeBytes(candidateBytes) > h.coherenceReplyLimit() {
 					entries = entries[:len(entries)-1]
 					event.GetChangeBatch().Entries = entries
 					session.queued = append([]volumeserver.StreamEvent{first}, session.queued...)
@@ -560,6 +564,7 @@ func (h *VolumeHandler) nextCoherenceControlEventLocked(session *coherenceContro
 					}
 					break
 				}
+				batchBytes = candidateBytes
 				session.changeDelivered = position
 				session.changePositions = append(session.changePositions, coherenceChangePosition{wire: position, coordinator: first.Position})
 				if len(entries) == coherenceControlBatchLimit || len(session.queued) == 0 {
