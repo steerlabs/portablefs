@@ -1395,6 +1395,24 @@ func (r *rawFileSystem) publishNegativeEntry(ctx context.Context, out *fuse.Entr
 	return fuse.OK, nil
 }
 
+// publishNegativePostState retains the absence proved by a successful source
+// mutation. The mutation reply itself is the physical publication boundary;
+// no kernel negative lifetime is needed for the daemon to answer a later path
+// walk under the same live subscription.
+func (r *rawFileSystem) publishNegativePostState(ctx context.Context, parent *inodeRecord, name string) error {
+	publication := replyPublicationFromContext(ctx)
+	if publication == nil {
+		return errors.New("fusev3: mutation absence escaped its reply-publication lifecycle")
+	}
+	r.mu.Lock()
+	_, candidate, cached := r.admitNegativeNameLocked(ctx, parent, name)
+	r.mu.Unlock()
+	if cached {
+		publication.names = append(publication.names, candidate)
+	}
+	return nil
+}
+
 // publishAnonymousEntry publishes the inode/attribute half of TMPFILE without
 // inventing a namespace binding. Even an attr lifetime of zero still updates
 // kernel inode state after the reply wakes the requester, so SHARED results
@@ -3201,6 +3219,10 @@ func (r *rawFileSystem) unlink(_ <-chan struct{}, header *fuse.InHeader, name st
 		// already retains the exact post-VFS boundary for peers.
 		r.unbindSelf(parent.key.inode, name)
 		r.unbindPath(parent, name)
+		if err := r.publishNegativePostState(ctx, parent, name); err != nil {
+			r.mount.revoke(err)
+			return fuse.Status(syscall.ENOTCONN)
+		}
 		if err := completeSourcePublication(ctx); err != nil {
 			r.mount.revoke(err)
 			return fuse.Status(syscall.ENOTCONN)

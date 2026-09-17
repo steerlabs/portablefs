@@ -2087,7 +2087,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after unlink: %v", err)
 		}
 	})
-	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{lookup: 1, unlink: 1})
+	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{unlink: 1})
 
 	oldParent, newParent := filepath.Join(root, "old-parent"), filepath.Join(root, "new-parent")
 	mustMkdir(t, oldParent)
