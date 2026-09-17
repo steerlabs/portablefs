@@ -2077,3 +2077,12 @@ FULL-holder LOOKUP/GETATTR zero-allocation and zero-RPC assertions remain green.
 The four-worker read-only registry microbenchmark median is 42.75 ns before and
 22.64 ns after, both zero allocations (three 500 ms samples on the shared VM).
 This is a registry microbenchmark, not a mounted latency result.
+
+#### G2 full-gate initialization follow-up
+
+The first final full gate stopped at vet: ordered-lane initialization copied a
+`lane` containing an atomic counter. Construction now places the counter directly
+in its final Client field and only carries the channel, slot slice and base from
+configuration. `go -C vcs vet ./internal/authorityrpc` and three focused protocol
+lane/ordered-frame race repetitions pass (`/tmp/cv2-g2-lane-vet.log`). The failed
+full attempt is preserved as `/tmp/cv2-g2-final-full.log`; it is not gate evidence.
