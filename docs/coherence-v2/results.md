@@ -602,3 +602,70 @@ batches and 412 delegation releases across 40,000 files. It issued one LOOKUP,
 issued 53 LOOKUPs and 19 GETATTRs. Warm Git issued one LOOKUP but retained 20,104
 RECLAIMs; the peer workload retained 62,923 RECLAIMs and 3,672 change ACKs.
 These remaining costs are visible in the complete request totals.
+
+## G2 complete profile capture
+
+The successful full profile run at `50b44bb` (plus failure-diagnostic text only)
+passes in 113.07 seconds, including Git preparation at shipping cache capacity
+and all completion barriers. It precedes the final concurrent state index.
+[Raw observations](results-g2-profile.jsonl) and 26 artifacts are retained under
+`/tmp/cv2-g2-final-profiles3` with prefix `g2-final3`: the exact test executable and
+CPU/allocation-before/allocation-after/mutex/block profiles for five phases.
+Log: `/tmp/cv2-g2-final-profile3.log`. Timings include instrumentation overhead.
+
+| Profiled workload | Seconds | Authority requests | Requests/operation |
+| --- | ---: | ---: | ---: |
+| install, 1 worker(s) | 21.770078 | 83,174 | 1.980333 |
+| install, 8 worker(s) | 11.413452 | 91,028 | 2.167333 |
+| git-status-cold | 1.952416 | 40,626 | 2.031300 |
+| git-status-warm | 2.430362 | 20,469 | 1.023450 |
+| two-mount-write-list-read | 3.232395 | 100,880 | 25.220000 |
+
+The one-worker CPU profile contains 17.74 sample-seconds over 21.79 seconds:
+45.49% is in the common syscall leaf, 2.42% cumulatively in delegated FlushBatch,
+2.03% in the scatter mutation client path, and 0.56% in canonical WRITE metadata
+fingerprinting with the retained digest. These overlapping cumulative fractions
+are not additive. They do not establish per-file flush RPC overhead as the
+remaining dominant cost, so no speculative multi-identity flush message was
+added. Warm Git has 20,104 capability RECLAIM requests; its 1.62 sample-seconds
+contain 48.15% syscall leaf and 11.73% READDIR handler work. Capability cleanup
+remains an explicit optimization gap.
+
+The initial profile captured install artifacts but deadlocked in Git preparation;
+the nonblocking ownership fix addresses its captured lock cycle. A second run
+aborted an eight-worker mount without recording its initiating cause. Three
+focused eight-worker profile repetitions and this complete profile subsequently
+pass. The historical abort remains unexplained; it is not counted as successful
+measurement evidence. Failure diagnostics now include mount/session health.
+The final state-index change removes ownership misses caused by unrelated
+registry writers; its unprofiled results follow separately.
+
+## G2 state-index baseline
+
+The unprofiled run at `e15df61` passes all workloads in 120.40 seconds
+(`/tmp/cv2-g2-final-baseline2.log`); the focused wrapper exits 70 for omitted
+inventory. [Raw observations](results-g2-state-index.jsonl) include all opcode
+counts and completion timings. This precedes the subsequently diagnosed PLUS
+page cleanup-admission fix. It is retained separately from the final run.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | direct-xfs | 0.580798 | 0 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.356834 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 22.019743 | 83,135 | 1.979405 | 1.965548 |
+| install, 8 worker(s) | portablefs | 12.597974 | 83,202 | 1.981000 | 1.967905 |
+| git-status-cold | direct-xfs | 0.009597 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.007758 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.879047 | 40,626 | 2.031300 | 1.026000 |
+| git-status-warm | portablefs | 1.511553 | 20,469 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | direct-xfs | 0.056715 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.036862 | 93,536 | 23.384000 | 3.332750 |
+
+One-worker install issues zero LOOKUP, GETATTR, FLUSH, ChangeAck and control
+poll requests. Its 40,000 CREATE and 40,000 WRITE requests dominate; 549 close
+batches/releases and 23 Barriers are amortized. Eight-worker install issues 218
+LOOKUPs and 116 GETATTRs, down from 3,649 and 1,084 in the preceding profiled
+run; these are different instrumented conditions, not an isolated latency
+comparison. Cold and warm Git retain 20,104 RECLAIMs each. The peer workload
+observes 720 files during writing across eight scans, verifies all 2,000, and
+retains 71,127 RECLAIMs. Total traffic includes these cleanup costs.
