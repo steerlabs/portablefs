@@ -94,7 +94,9 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 		return h.coherenceError(req.GetRequestId(), syscall.EPERM)
 	}
 	if req.GetOpen().GetWriteIntent() || req.GetOpen().GetFlags().GetWrite() {
-		h.coherenceProfileAdmission.RLock()
+		if err := h.coherenceProfileAdmission.RLockContext(ctx); err != nil {
+			return h.coherenceError(req.GetRequestId(), err)
+		}
 		defer h.coherenceProfileAdmission.RUnlock()
 		if err := h.Visibility.CheckCompatibilityWriter(cred.ID); err != nil {
 			return h.coherenceError(req.GetRequestId(), err)

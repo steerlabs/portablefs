@@ -1,6 +1,9 @@
 package volumeserver
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // CacheAdmission records facts that a reply may install. Call while the storage
 // dependencies protecting that reply are still held. Admissions are scoped to
@@ -83,13 +86,14 @@ type Withdrawal struct {
 	SourceCurrent bool
 	Position      uint64
 	targets       []SubscriptionToken
+	deadline      time.Time
 }
 
 func (c *CoherenceCoordinator) OnCommitTargeted(entries []ChangeEntry, source SubscriptionToken, a CacheAdmission) Withdrawal {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.expireLocked()
-	var result Withdrawal
+	result := Withdrawal{deadline: c.clock.Now().Add(SubscriptionTTL)}
 	if len(entries) > 0 {
 		for _, s := range c.subscribers {
 			if s.token == source || s.ackIndex < 0 {
@@ -126,9 +130,14 @@ func (c *CoherenceCoordinator) WaitTargeted(ctx context.Context, w Withdrawal) e
 			return ErrSubscriptionPosition
 		}
 		var pending *changeSubscriber
+		now := c.clock.Now()
 		for _, token := range w.targets {
 			s := c.subscribers[token.Session]
 			if s == nil || s.token != token || s.ackIndex < 0 || s.acked >= w.Position {
+				continue
+			}
+			if !now.Before(w.deadline) {
+				c.retireSubscriberLocked(s)
 				continue
 			}
 			if pending == nil || s.horizon.Before(pending.horizon) {
@@ -139,7 +148,7 @@ func (c *CoherenceCoordinator) WaitTargeted(ctx context.Context, w Withdrawal) e
 			c.mu.Unlock()
 			return nil
 		}
-		changed, deadline := c.notificationLocked(), pending.horizon
+		changed, deadline := c.notificationLocked(), minTime(pending.horizon, w.deadline)
 		c.mu.Unlock()
 		if err := c.wait(ctx, changed, deadline); err != nil {
 			return err

@@ -185,6 +185,10 @@ func (b *Buffer) SetAttr(ctx context.Context, id Identity, a Attributes) (Cut, e
 	return b.admit(ctx, id, SetAttr, 0, nil, a, WriteOptions{})
 }
 func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, data []byte, a Attributes, opts WriteOptions) (Cut, error) {
+	// The caller's payload becomes immutable before admission, but the copy is
+	// deliberately outside the global buffer mutex so a large write does not
+	// stall disjoint reads, acknowledgements, or capacity release.
+	copied := append([]byte(nil), data...)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for {
@@ -196,9 +200,6 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 		}
 		f := b.file(id)
 		if !b.retiringAll && !f.retiring && b.count < b.maxEntries && b.bytes < b.maxBytes && int64(len(data)) <= b.maxBytes-b.bytes {
-			// Copy is inside the admission fence: BeginRetire cannot miss a reserved
-			// operation, and cancellation never leaves an unreported accepted entry.
-			copied := append([]byte(nil), data...)
 			now := time.Now().UnixNano()
 			if a.ATimeNow || a.MTimeNow {
 				if a.ATimeNow {

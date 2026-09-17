@@ -178,7 +178,9 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 		return h.mutateFskitCoherence(ctx, req, cred, prepare, apply, releases...)
 	}
 	if coherenceFlushReference(req) == nil {
-		h.coherenceProfileAdmission.RLock()
+		if err := h.coherenceProfileAdmission.RLockContext(ctx); err != nil {
+			return h.coherenceError(req.GetRequestId(), err)
+		}
 		defer h.coherenceProfileAdmission.RUnlock()
 		if err := h.Visibility.CheckCompatibilityWriter(cred.ID); err != nil {
 			return h.coherenceError(req.GetRequestId(), err)

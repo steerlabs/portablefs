@@ -2684,10 +2684,14 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 		return h.errorResponse(requestID, errInternal, false)
 	}
 	if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		h.coherenceProfileAdmission.Lock()
+		activationCtx, cancelActivation := context.WithDeadline(ctx, resources.authorizationDeadline)
+		defer cancelActivation()
+		if err := h.coherenceProfileAdmission.LockContext(activationCtx); err != nil {
+			return h.coherenceError(requestID, err)
+		}
 		defer h.coherenceProfileAdmission.Unlock()
 		for _, identity := range h.Coherence.DelegatedIdentities() {
-			if err := h.Coherence.Recall(ctx, identity); err != nil {
+			if err := h.Coherence.Recall(activationCtx, identity); err != nil {
 				return h.coherenceError(requestID, err)
 			}
 		}

@@ -2,39 +2,59 @@
 
 package authorityrpc
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // coherenceProfileGate lets ordinary Linux writer admission overlap while a
 // macOS compatibility-writer activation remains exclusive. The mutex protects
-// only the counters and condition variable; callers hold a counted permit,
+// only the counters and wake channel; callers hold a counted permit,
 // rather than this mutex, across storage and coordinator waits.
 //
 // Pending exclusive admission has priority over new shared admission. That
 // bounds activation even when Linux write traffic is continuous.
 type coherenceProfileGate struct {
 	mu             sync.Mutex
-	changed        *sync.Cond
+	changed        chan struct{}
 	readers        uint64
 	writersWaiting uint64
 	writer         bool
 }
 
-func (g *coherenceProfileGate) conditionLocked() *sync.Cond {
+func (g *coherenceProfileGate) notificationLocked() <-chan struct{} {
 	if g.changed == nil {
-		g.changed = sync.NewCond(&g.mu)
+		g.changed = make(chan struct{})
 	}
 	return g.changed
 }
 
-func (g *coherenceProfileGate) RLock() {
-	g.mu.Lock()
-	changed := g.conditionLocked()
-	for g.writer || g.writersWaiting != 0 {
-		changed.Wait()
+func (g *coherenceProfileGate) signalLocked() {
+	if g.changed != nil {
+		close(g.changed)
+		g.changed = nil
 	}
-	g.readers++
-	g.mu.Unlock()
 }
+
+func (g *coherenceProfileGate) RLockContext(ctx context.Context) error {
+	for {
+		g.mu.Lock()
+		if !g.writer && g.writersWaiting == 0 {
+			g.readers++
+			g.mu.Unlock()
+			return nil
+		}
+		changed := g.notificationLocked()
+		g.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (g *coherenceProfileGate) RLock() { _ = g.RLockContext(context.Background()) }
 
 func (g *coherenceProfileGate) RUnlock() {
 	g.mu.Lock()
@@ -44,22 +64,37 @@ func (g *coherenceProfileGate) RUnlock() {
 	}
 	g.readers--
 	if g.readers == 0 {
-		g.conditionLocked().Broadcast()
+		g.signalLocked()
 	}
 	g.mu.Unlock()
 }
 
-func (g *coherenceProfileGate) Lock() {
+func (g *coherenceProfileGate) LockContext(ctx context.Context) error {
 	g.mu.Lock()
-	changed := g.conditionLocked()
 	g.writersWaiting++
-	for g.writer || g.readers != 0 {
-		changed.Wait()
+	for {
+		if !g.writer && g.readers == 0 {
+			g.writersWaiting--
+			g.writer = true
+			g.mu.Unlock()
+			return nil
+		}
+		changed := g.notificationLocked()
+		g.mu.Unlock()
+		select {
+		case <-changed:
+			g.mu.Lock()
+		case <-ctx.Done():
+			g.mu.Lock()
+			g.writersWaiting--
+			g.signalLocked()
+			g.mu.Unlock()
+			return ctx.Err()
+		}
 	}
-	g.writersWaiting--
-	g.writer = true
-	g.mu.Unlock()
 }
+
+func (g *coherenceProfileGate) Lock() { _ = g.LockContext(context.Background()) }
 
 func (g *coherenceProfileGate) Unlock() {
 	g.mu.Lock()
@@ -68,6 +103,6 @@ func (g *coherenceProfileGate) Unlock() {
 		panic("authorityrpc: coherence profile exclusive admission not held")
 	}
 	g.writer = false
-	g.conditionLocked().Broadcast()
+	g.signalLocked()
 	g.mu.Unlock()
 }

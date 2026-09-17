@@ -180,6 +180,21 @@ func TestDelegationReleaseRPCDoesNotHoldStateLocks(t *testing.T) {
 	}
 }
 
+func TestDelegationLockAcquisitionHonorsContext(t *testing.T) {
+	state := &delegationState{}
+	state.operation.Lock()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := state.lockAfterRelease(ctx, delegationOperation); !errors.Is(err, context.Canceled) {
+		t.Fatalf("lockAfterRelease = %v, want context cancellation", err)
+	}
+	state.operation.Unlock()
+	if !state.operation.TryLock() {
+		t.Fatal("canceled lock acquisition leaked the operation mutex")
+	}
+	state.operation.Unlock()
+}
+
 func TestDelegationCloseFailureRetainsAppliedRecords(t *testing.T) {
 	for _, retired := range []bool{false, true} {
 		t.Run(map[bool]string{false: "unknown", true: "retired"}[retired], func(t *testing.T) {

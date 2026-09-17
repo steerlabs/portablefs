@@ -3,6 +3,8 @@
 package authorityrpc
 
 import (
+	"context"
+	"errors"
 	"runtime"
 	"testing"
 	"time"
@@ -93,4 +95,31 @@ func TestCoherenceProfileGateExclusiveAdmissionHasWriterPriority(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("shared admission did not resume after exclusive release")
 	}
+}
+
+func TestCoherenceProfileGateWaitsHonorContext(t *testing.T) {
+	t.Run("shared waiter", func(t *testing.T) {
+		var gate coherenceProfileGate
+		gate.Lock()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := gate.RLockContext(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("RLockContext = %v, want context cancellation", err)
+		}
+		gate.Unlock()
+	})
+	t.Run("exclusive waiter preserves admission", func(t *testing.T) {
+		var gate coherenceProfileGate
+		gate.RLock()
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := gate.LockContext(ctx); !errors.Is(err, context.Canceled) {
+			t.Fatalf("LockContext = %v, want context cancellation", err)
+		}
+		gate.RUnlock()
+		if err := gate.RLockContext(t.Context()); err != nil {
+			t.Fatalf("canceled writer stranded shared admission: %v", err)
+		}
+		gate.RUnlock()
+	})
 }

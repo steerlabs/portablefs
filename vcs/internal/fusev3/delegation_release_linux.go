@@ -32,11 +32,24 @@ func (s *delegationState) lockAfterRelease(ctx context.Context, mask delegationL
 			return err
 		}
 		if mask&delegationAcquire != 0 {
-			s.acquire.Lock()
+			if err := s.acquire.LockContext(ctx); err != nil {
+				return err
+			}
 		}
-		s.transition.Lock()
+		if err := s.transition.LockContext(ctx); err != nil {
+			if mask&delegationAcquire != 0 {
+				s.acquire.Unlock()
+			}
+			return err
+		}
 		if mask&delegationOperation != 0 {
-			s.operation.Lock()
+			if err := s.operation.LockContext(ctx); err != nil {
+				s.transition.Unlock()
+				if mask&delegationAcquire != 0 {
+					s.acquire.Unlock()
+				}
+				return err
+			}
 		}
 		flight := s.releaseFlight
 		if flight == nil {
@@ -97,12 +110,40 @@ func (m *delegationManager) prepareReleaseBatch(ctx context.Context, buf *writeb
 		return bytes.Compare(groups[i].state.identity[:], groups[j].state.identity[:]) < 0
 	})
 	for {
-		for _, g := range groups {
-			g.state.acquire.Lock()
+		acquired := 0
+		for i, g := range groups {
+			if err := g.state.acquire.LockContext(ctx); err != nil {
+				for j := i - 1; j >= 0; j-- {
+					groups[j].state.acquire.Unlock()
+				}
+				return nil, err
+			}
+			acquired++
 		}
-		for _, g := range groups {
-			g.state.transition.Lock()
-			g.state.operation.Lock()
+		locked := 0
+		for i, g := range groups {
+			if err := g.state.transition.LockContext(ctx); err != nil {
+				for j := locked - 1; j >= 0; j-- {
+					groups[j].state.operation.Unlock()
+					groups[j].state.transition.Unlock()
+				}
+				for j := acquired - 1; j >= 0; j-- {
+					groups[j].state.acquire.Unlock()
+				}
+				return nil, err
+			}
+			if err := g.state.operation.LockContext(ctx); err != nil {
+				g.state.transition.Unlock()
+				for j := i - 1; j >= 0; j-- {
+					groups[j].state.operation.Unlock()
+					groups[j].state.transition.Unlock()
+				}
+				for j := acquired - 1; j >= 0; j-- {
+					groups[j].state.acquire.Unlock()
+				}
+				return nil, err
+			}
+			locked++
 		}
 		unlock := func() {
 			for i := len(groups) - 1; i >= 0; i-- {

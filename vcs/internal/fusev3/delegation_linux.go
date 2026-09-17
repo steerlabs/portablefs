@@ -34,19 +34,74 @@ type delegationBinding struct {
 	generation uint64
 }
 
+// delegationMutex preserves ordinary mutex semantics while allowing request
+// paths to abandon lock acquisition when their coherence budget expires.
+type delegationMutex struct {
+	mu      sync.Mutex
+	held    bool
+	changed chan struct{}
+}
+
+func (m *delegationMutex) LockContext(ctx context.Context) error {
+	for {
+		m.mu.Lock()
+		if !m.held {
+			m.held = true
+			m.mu.Unlock()
+			return nil
+		}
+		if m.changed == nil {
+			m.changed = make(chan struct{})
+		}
+		changed := m.changed
+		m.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (m *delegationMutex) Lock() { _ = m.LockContext(context.Background()) }
+
+func (m *delegationMutex) TryLock() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.held {
+		return false
+	}
+	m.held = true
+	return true
+}
+
+func (m *delegationMutex) Unlock() {
+	m.mu.Lock()
+	if !m.held {
+		m.mu.Unlock()
+		panic("fusev3: unlock of unlocked delegation mutex")
+	}
+	m.held = false
+	if m.changed != nil {
+		close(m.changed)
+		m.changed = nil
+	}
+	m.mu.Unlock()
+}
+
 type delegationState struct {
 	flushOrdinal      uint64                   // meta; dense within the exact Authority grant
 	releaseFlight     *delegationReleaseFlight // protected by transition
-	acquire           sync.Mutex
+	acquire           delegationMutex
 	grantChanged      chan struct{}
 	retiredGeneration uint64
 	// transition serializes recall, break, mode changes, release, and grant
 	// installation for one identity. No network operation holds manager.mu.
-	transition sync.Mutex
+	transition delegationMutex
 	// operation orders frontend admissions and synchronous operations for one
 	// file. An append or fallocate flushes the accepted prefix while holding it,
 	// so no later local admission can overtake the wire mutation.
-	operation sync.Mutex
+	operation delegationMutex
 	// admission closes the race between checking the mode and Buffer accepting
 	// an entry. It is held only across local Buffer calls, never network I/O.
 	admission sync.RWMutex

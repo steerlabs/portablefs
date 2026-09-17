@@ -163,6 +163,43 @@ func TestTargetedSourceAdmissionWithoutCommitAndAfterCommitSnapshot(t *testing.T
 	}
 }
 
+func TestTargetedWithdrawalDeadlineDoesNotMoveWithRenewal(t *testing.T) {
+	clock := newCV2Clock()
+	c := NewCoherenceCoordinator(CoherenceConfig{Clock: clock})
+	source, _ := c.Subscribe(SessionID{1})
+	peer, _ := c.Subscribe(SessionID{2})
+	id := [16]byte{7}
+	if err := c.AdmitCache(peer.Token, CacheAdmission{Data: [][16]byte{id}}); err != nil {
+		t.Fatal(err)
+	}
+	w := c.OnCommitTargeted([]ChangeEntry{{Kind: DataChanged, Identity: id}}, source.Token, CacheAdmission{})
+	done := make(chan error, 1)
+	go func() { done <- c.WaitTargeted(t.Context(), w) }()
+	for range 3 {
+		clock.Advance(3 * time.Second)
+		if _, err := c.Renew(peer.Token); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("withdrawal completed before its fixed deadline: %v", err)
+	default:
+	}
+	clock.Advance(time.Second)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renewals extended withdrawal beyond its issue-time deadline")
+	}
+	if err := c.CheckSession(peer.Token); !errors.Is(err, ErrSessionFenced) {
+		t.Fatalf("target after fixed withdrawal deadline = %v, want fenced", err)
+	}
+}
+
 func TestCacheHandleCloseUsesSessionOwnershipAcrossColdSubscribe(t *testing.T) {
 	c := NewCoherenceCoordinator(CoherenceConfig{})
 	old, _ := c.Subscribe(SessionID{1})
