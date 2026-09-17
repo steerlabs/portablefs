@@ -2693,5 +2693,27 @@ existing alias-preservation integration test and
 `TestCoherencePollBufferReuseRequiresDrainedQueue` are the regression evidence;
 G5 makes no runtime change for this accepted item.
 
-Final full-gate, standalone matrix, control-horizon soak, and epoch-fault
-evidence follows after the committed focused checks above.
+### G5 qualification
+
+The scoped destructive fault command selected Authority epoch replacement,
+S2 control-horizon recovery, and dirty unmount. All three passed: 1.06 seconds,
+15.05 seconds, and 11.01 seconds respectively. Dirty unmount emitted the exact
+`cold subscription replacement` report. The focused wrapper exited at its
+required-inventory check because the unrelated soak cases were deliberately
+not selected; the selected Go suite passed. Artifacts are under
+`/tmp/portablefs-g5-soak`.
+
+`bash scripts/verify-local.sh --full` exits 0 on the committed G5 runtime and
+test changes (`/tmp/cv2-g5-verify-full.log`). It passes Foundation/cgo Darwin
+and static Linux builds, vet, dependency scanning, native Go and race suites,
+the maintained go-fuse seam, all 345 Xcode-native Swift tests, release-trust and
+architecture scans, all 76 required privileged XFS/FUSE cases plus the root
+boundary, and the embedded Linux matrix. The matrix reports 28 passes, no
+unexpected result, both controls matching, and only the declared
+single-principal `remote_chown_visible` skip.
+
+The separately invoked `bash scripts/coherence-matrix-linux.sh` also exits 0
+(`/tmp/cv2-g5-matrix.log`) with the same 28 passes, declared chown skip, and
+matching controls. The package-manager soak, live macOS FSKit matrix, and
+deployed-cell staging qualification remain outside `--full` and are not claimed
+by G5.
