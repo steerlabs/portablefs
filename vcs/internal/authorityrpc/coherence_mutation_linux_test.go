@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"context"
 	"io/fs"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -15,6 +16,20 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
 )
+
+type fenceOnArmedContext struct {
+	context.Context
+	armed atomic.Bool
+	once  sync.Once
+	fence func()
+}
+
+func (c *fenceOnArmedContext) Err() error {
+	if c.armed.Load() {
+		c.once.Do(c.fence)
+	}
+	return c.Context.Err()
+}
 
 func TestCoherenceStaleFlushRefusedWhole(t *testing.T) {
 	for _, kind := range []string{"write", "setattr", "fallocate"} {
@@ -452,6 +467,27 @@ func TestLinuxV7MutationHoldsMacAdmissionThroughStorageApply(t *testing.T) {
 		t.Fatal("Linux write did not finish")
 	}
 	waitWriteTestSignal(t, admitted, "Mac admission after Linux apply")
+}
+
+func TestLinuxV7MutationFenceBeforeApplyDoesNotCommitStorage(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	handle := prepareOneShotTarget(t, h, cred, store, &writeTestTarget{})
+	request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	ctx := &fenceOnArmedContext{Context: t.Context(), fence: func() { h.Runtime.FenceSession(cred.ID) }}
+	var applies atomic.Uint32
+	response := h.mutateCoherenceVisibleSequenceResolved(ctx, request, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+		ctx.armed.Store(true)
+		return []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityData, Identity: [16]byte{0x41}}}, nil
+	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		applies.Add(1)
+		return &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{}}}, nil
+	})
+	if response.GetErrno() == 0 || response.GetAppliedSequence() != 0 {
+		t.Fatalf("fenced mutation response = %+v", response)
+	}
+	if got := applies.Load(); got != 0 {
+		t.Fatalf("storage applies after source fence = %d, want 0", got)
+	}
 }
 
 func TestLinuxV7PreparationCannotEscapeStorageDependencies(t *testing.T) {

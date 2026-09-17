@@ -266,28 +266,31 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				finishPin(0)
 				return h.coherenceError(0, err)
 			}
-			terminal, err := h.Runtime.SessionTerminal(cred.ID)
-			if err == nil {
-				select {
-				case <-terminal:
-					err = volumeserver.ErrSessionFenced
-				default:
-				}
-			}
-			if err != nil || ctx.Err() != nil {
+			if err := ctx.Err(); err != nil {
 				releaseStorage()
 				releaseTurn()
 				finishPin(0)
-				if err == nil {
-					err = ctx.Err()
-				}
+				return h.coherenceError(0, err)
+			}
+			applyUse, err := h.Runtime.Begin(cred)
+			if err != nil {
+				releaseStorage()
+				releaseTurn()
+				finishPin(0)
 				return h.coherenceError(0, err)
 			}
 			// Profile admission excludes Mac activation across ordinary Linux
 			// mutations. Recall flushes have an exact generation pin instead.
-			// The v7 storage turn is the sole mutation scheduler on this path.
+			// The fresh runtime pin is the atomic source-liveness cut: a fence
+			// either wins before it or follows an operation already admitted to
+			// apply. The v7 storage turn remains the sole mutation scheduler.
 			provisional := h.coherenceOperationSequence.Add(1) | uint64(1)<<63
-			response, changes := apply(provisional)
+			var response *authoritypb.Response
+			var changes []volumeserver.VisibilityTarget
+			func() {
+				defer applyUse.End()
+				response, changes = apply(provisional)
+			}()
 			if response == nil {
 				response = h.errorResponse(0, errInternal, true)
 			}
