@@ -911,7 +911,11 @@ func (m *Mount) cleanupFailed(operation string, err error, stale func()) bool {
 		return true
 	}
 	terminal := errors.As(err, &classified) && classified.cleanupIsTerminal()
-	if cause := m.rpc.SessionEndCause(); cause != nil {
+	if cause := m.rpc.SessionEndCause(); errors.Is(cause, authorityrpc.ErrAuthorityChanged) || errors.Is(cause, authorityrpc.ErrSubscriptionReset) {
+		m.subscription.deactivate()
+		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, errors.Join(err, cause))
+		return true
+	} else if cause != nil {
 		terminal = true
 		err = errors.Join(err, cause)
 	}

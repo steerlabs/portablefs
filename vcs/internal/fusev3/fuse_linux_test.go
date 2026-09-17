@@ -2262,6 +2262,20 @@ func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.
 	if retry := mount.cleanupFailed("object reclaim", resourceCleanupError{cause: syscall.EIO}, nil); retry || mount.isRevoked() {
 		t.Fatalf("definite scoped refusal retry=%v revoked=%v", retry, mount.isRevoked())
 	}
+	mount.subscription.mu.Lock()
+	mount.subscription.active = true
+	mount.subscription.incarnation = 8
+	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.mu.Unlock()
+	rpc.mu.Lock()
+	rpc.sessionEnd = authorityrpc.ErrAuthorityChanged
+	rpc.mu.Unlock()
+	if retry := mount.cleanupFailed("deferred close", resourceCleanupError{cause: authorityrpc.ErrAuthorityChanged}, nil); !retry {
+		t.Fatal("epoch replacement cleanup was not deferred")
+	}
+	if mount.isRevoked() || mount.subscription.stamp() != (subscriptionStamp{}) {
+		t.Fatalf("epoch replacement revoked or retained subscription: revoked=%v stamp=%+v", mount.isRevoked(), mount.subscription.stamp())
+	}
 	rpc.mu.Lock()
 	rpc.sessionEnd = authorityrpc.ErrSessionEnded
 	rpc.mu.Unlock()
