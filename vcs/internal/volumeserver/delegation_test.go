@@ -1104,3 +1104,53 @@ func TestCoherenceCutValidatesExactTicketsWithoutHistoricalLedger(t *testing.T) 
 		t.Fatal(err)
 	}
 }
+
+func TestCoherenceReleaseCutCoversSynchronousMutationAdmittedAfterRecall(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	identity := [16]byte{92}
+	grant := cv2Grant(t, c, holder, identity)
+	c.mu.Lock()
+	record := c.delegations[identity]
+	c.mu.Unlock()
+	type result struct {
+		applied uint64
+		err     error
+	}
+	cut := make(chan result, 1)
+	go func() {
+		applied, err := c.cut(t.Context(), record, true)
+		cut <- result{applied, err}
+	}()
+	event := cv2Event(t, c, holder, StreamRecall)
+	if event.AppliedSequence != 0 {
+		t.Fatalf("recall floor = %d, want 0", event.AppliedSequence)
+	}
+	pin, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin.End(17)
+	if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{17}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	pending := record.pending
+	completed := pending != nil && pending.done
+	reported := uint64(0)
+	if pending != nil {
+		reported = pending.applied
+	}
+	c.mu.Unlock()
+	if !completed || reported != 17 {
+		t.Fatalf("completed release cut = done %v, applied %d; want true, 17", completed, reported)
+	}
+	select {
+	case got := <-cut:
+		if got.err != nil || got.applied != 17 {
+			t.Fatalf("cut = %+v, want applied 17", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("release did not complete recall cut")
+	}
+}

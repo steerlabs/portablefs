@@ -998,3 +998,15 @@ through withdrawal, allowing the peer read without a break against an OPEN reply
 the holder has not received. Ten repetitions pass in the privileged suite with
 `PORTABLEFS_GO_TEST_FLAGS='-run ^TestConcurrentTruncatingOpensDoNotBlockReservedGrantWithdrawal$ -count=10'`.
 Log `/tmp/cv2-g2-r6-postapply.log`; wrapper exit 70 is unselected inventory.
+
+### R7: release covers a synchronous mutation admitted after recall
+
+`TestCoherenceReleaseCutCoversSynchronousMutationAdmittedAfterRecall` observes a
+recall with ticket floor zero, admits a holder synchronous mutation afterward,
+ends it with ticket 17, and releases that exact applied cut. It requires both
+the completed pending cut and its waiter to report 17. Existing production code
+already provides this guarantee. Removing the release-to-pending ticket assignment
+through a Go build overlay makes the test fail with `applied 0; want 17`
+(`/tmp/cv2-g2-r7-before.log`), without modifying the working runtime source.
+The unmodified implementation passes 20 repetitions with
+`go -C vcs test ./internal/volumeserver -run '^TestCoherenceReleaseCutCoversSynchronousMutationAdmittedAfterRecall$' -count=20`.
