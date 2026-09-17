@@ -2045,6 +2045,26 @@ func TestUncertainResponseFailsClosed(t *testing.T) {
 	}
 }
 
+func TestMissingSubscriptionRegistryFailsClosed(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	n := testNode(mount)
+	handle := &fileHandle{node: n, token: testToken(100)}
+	ctx, finish := testMutationContext(t, mount)
+	mount.subscription = nil
+	before := rpc.calls
+	if _, errno := n.Read(t.Context(), handle, make([]byte, 1), 0); errno != syscall.EIO {
+		t.Fatalf("read errno=%v, want EIO", errno)
+	}
+	_, err := mount.callMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{}}}, nil)
+	finish(false)
+	if err == nil {
+		t.Fatal("mutation without subscription registry succeeded")
+	}
+	if rpc.calls != before {
+		t.Fatalf("missing registry reached Authority: calls=%d want %d", rpc.calls, before)
+	}
+}
+
 func TestRawInodeInterningReclaimsEveryCapabilityExactlyOnce(t *testing.T) {
 	frontend, mount, rpc := testRawFileSystem(t, 1024)
 	const lookups = 64

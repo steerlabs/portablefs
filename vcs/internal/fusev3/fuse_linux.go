@@ -1348,7 +1348,10 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 	// The local horizon is conservative: the Authority may still answer before
 	// its later deadline. Cold namespace reads and mutations must nevertheless
 	// fail until this mount installs a new subscription.
-	if (requiresGate || request.GetLookup() != nil) && m.subscription != nil && m.subscription.stamp() == (subscriptionStamp{}) {
+	if m.subscription == nil {
+		return nil, errors.New("fusev3: mutation has no subscription registry")
+	}
+	if (requiresGate || request.GetLookup() != nil) && m.subscription.stamp() == (subscriptionStamp{}) {
 		return nil, syscall.EIO
 	}
 	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
@@ -1670,7 +1673,7 @@ func (n *node) Read(ctx context.Context, handle *fileHandle, dest []byte, off in
 	// Cold withdrawal closes read admission until the replacement subscription
 	// is installed. In particular, a kernel refault must not enter repeated
 	// network timeouts while the Authority has already fenced this incarnation.
-	if n.mount.subscription != nil && n.mount.subscription.stamp() == (subscriptionStamp{}) {
+	if n.mount.subscription == nil || n.mount.subscription.stamp() == (subscriptionStamp{}) {
 		return nil, syscall.EIO
 	}
 
