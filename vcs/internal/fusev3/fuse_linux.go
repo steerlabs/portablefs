@@ -1729,8 +1729,10 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	}
 	key := n.posixLockKey(lockOwner)
 	generation := n.mount.possiblePOSIXLock(key)
-	if generation == 0 && n.mount.delegations.ownsFull(n.item.GetStableIdentity()) {
-		return 0
+	if generation == 0 {
+		if local, errno := handle.flushLocally(); local {
+			return errno
+		}
 	}
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Flush{Flush: &authoritypb.FlushRequest{Handle: cloneBytes(handle.token), LockOwner: lockOwner}}})
 	if errno == 0 {
@@ -1755,6 +1757,27 @@ func (h *fileHandle) observeLoss() syscall.Errno {
 		return errno
 	}
 	return syscall.EIO
+}
+
+func (h *fileHandle) flushLocally() (bool, syscall.Errno) {
+	if h == nil || h.node == nil || h.node.mount == nil {
+		return false, 0
+	}
+	h.lossMu.Lock()
+	defer h.lossMu.Unlock()
+	local, loss, errno := h.node.mount.delegations.localFullFlush(h.node.item.GetStableIdentity(), h.lossObserved)
+	if !local {
+		return false, 0
+	}
+	lost := loss != h.lossObserved
+	h.lossObserved = loss
+	if !lost {
+		return true, 0
+	}
+	if errno != 0 {
+		return true, errno
+	}
+	return true, syscall.EIO
 }
 
 func (n *node) Release(ctx context.Context, handle *fileHandle) syscall.Errno {

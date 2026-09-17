@@ -4,11 +4,13 @@ package fusev3
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 func TestFullDelegationFlushIsLocalUnlessPOSIXOwnerNeedsDischarge(t *testing.T) {
@@ -53,6 +55,40 @@ func TestFullDelegationFlushIsLocalUnlessPOSIXOwnerNeedsDischarge(t *testing.T) 
 				}
 			}
 		})
+	}
+}
+
+func TestFullDelegationFlushSamplesLossAndRetirementAtomically(t *testing.T) {
+	mount, _ := testMount(t, 8)
+	n := testNode(mount)
+	handle := &fileHandle{node: n, token: testToken(100)}
+	identity := n.item.GetStableIdentity()
+	if err := mount.delegations.Install(identity, n.item.GetToken(), handle.token, delegationTestGrant(44, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
+	handle.lossObserved = mount.delegations.IdentityLoss(identity)
+	if errno := handle.observeLoss(); errno != 0 {
+		t.Fatalf("initial loss observation = %v", errno)
+	}
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount.delegations.buf.Drop(id, "recall failure after initial FLUSH sample")
+	if local, errno := handle.flushLocally(); !local || errno != syscall.EIO {
+		t.Fatalf("local flush after loss = (%v, %v), want (true, EIO)", local, errno)
+	}
+
+	state := mount.delegations.state(id)
+	retire, err := mount.delegations.beginRetire(t.Context(), state)
+	if err != nil && !errors.Is(err, writeback.ErrLost) {
+		t.Fatal(err)
+	}
+	if retire != nil {
+		defer retire.Cancel()
+	}
+	if local, _ := handle.flushLocally(); local {
+		t.Fatal("retiring delegation completed FLUSH locally")
 	}
 }
 
