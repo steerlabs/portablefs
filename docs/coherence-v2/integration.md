@@ -2621,3 +2621,77 @@ matrix, and deployed-cell staging qualification. G4 ran the prescribed
 all-case Linux soak instead of the package-manager-only matrix. The remaining
 macOS live-extension and deployed-staging work requires those external
 environments and is not evidence available from this worktree.
+
+## G5
+
+G5 reviewed the ten independent follow-ups against the complete chronological
+record above. G4 resolved none of them, so no item was skipped as already
+complete. The changes preserve protocol major 7, the frozen wire grammar, and
+Linux's zero kernel entry and attribute validity policy.
+
+### Deferred cleanup recovery
+
+The mount constructor created the deferred-close retry method value before it
+created the subscription registry. Because a Go method value captures its
+receiver immediately, every production retry was permanently bound to nil.
+The registry is now constructed before the waiter is installed. The Mount-level
+regression queues a real deferred close, receives a coherence-class refusal,
+keeps the close pending while the subscription is inactive, cold-subscribes,
+and requires the second CLOSE to succeed (`d7b4909`).
+
+RECLAIM now has corresponding worker-loop coverage. The test starts the mount,
+injects a coherence refusal, holds the replacement Subscribe, proves the mount
+remains live with no premature retry, then reactivates the subscription and
+requires the requeued capability to drain (`3d63e40`). The loop no longer uses
+unchecked `*epochRPC` assertions, records a missing facade as an internal mount
+error, and backs every repeated coherence refusal with a context-cancellable
+delay. A permanently refused reclaim therefore cannot spin (`d9be0eb`).
+
+Cleanup classification guards an absent subscription registry on all three
+recovery branches: explicit subscription reset, coherence refusal, and
+Authority replacement. The nil-registry table proves each branch defers without
+panic or revocation (`ac410ff`).
+
+### Drop reporting and writeback races
+
+`failCleanupIdentity` still drops the buffer and clears delegation state under
+the epoch read lock, but invokes the user drop reporter only after releasing
+that lock. Its regression installs a reporter which calls `EpochChanged` and
+requires both callback and cleanup to finish (`0dddad7`).
+
+Zero-entry delegation losses remain suppressed from the external data-loss
+reporter, but the standard diagnostic log is no longer suppressed. The reporter
+test requires both the clean-delegation and retained-writeback log records while
+delivering only the retained record externally (`39cefc2`).
+
+The writeback test suite again covers a Drop which rebinds an in-flight flush
+whose transport later succeeds, alongside the retained transport-failure case.
+Both must return `ErrLost`, preserve the new generation and discard the old
+overlay; a successful stale transport completion cannot resurrect the batch
+(`819a098`).
+
+### Soak and FSKit coverage
+
+The dirty-unmount fault hook deterministically drives the cold-subscription
+fence. Its mounted assertion now requires the exact
+`cold subscription replacement` reason instead of accepting the unrelated
+barrier-failure path, which retains separate unit coverage (`2075f9c`).
+
+An exclusive FSKit CREATE of an existing name must be sequenced only by the
+parent and namespace binding. Source-gate derivation no longer adds the losing
+existing inode to its private storage dependencies. The regression holds that
+inode's storage turn and requires prompt definite `EEXIST`, parent-only mutation
+locking, no OPEN, and no success post-state (`5c23478`).
+
+### Accepted poll-buffer invariant
+
+The design owner accepts the panic in `reuseCoherencePollBufferLocked`. A
+nonempty aliased queue at that point is an internal programming invariant
+violation, not peer-controlled request input, even though detection occurs on
+an Authority request path. The panic remains intentionally executable. The
+existing alias-preservation integration test and
+`TestCoherencePollBufferReuseRequiresDrainedQueue` are the regression evidence;
+G5 makes no runtime change for this accepted item.
+
+Final full-gate, standalone matrix, control-horizon soak, and epoch-fault
+evidence follows after the committed focused checks above.
