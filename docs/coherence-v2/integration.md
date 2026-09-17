@@ -1925,3 +1925,13 @@ Authority LOOKUP and permission-GETATTR requests in both modes. Both pass
 (`/tmp/cv2-g2-holder-mounted.log`, selected gate wrapper exits 70 because the
 other mandatory cases were not selected). Timing details and the remaining
 kernel-round-trip measurement limitation are recorded in results.md.
+
+The full XFS run at `bcf7be6` exposed a pre-partition fixture race in R1:
+`stat(absent)` had returned to the kernel caller while the daemon had not yet
+settled that negative reply into its cache. The setup therefore counted only
+one name (`/tmp/cv2-g2-holder-full-xfs.log`). R1 now waits for the exact positive
+and negative bindings before taking its coverage snapshot and killing CONTROL.
+The required coverage, per-entry/per-inode notifications, post-horizon refusal,
+peer write and cold-resubscribe checks are unchanged. The diagnostic isolated
+run passed three times even before the fix, consistent with a receipt race
+(`/tmp/cv2-g2-holder-horizon-diagnostic.log`, selected gate wrapper 70).

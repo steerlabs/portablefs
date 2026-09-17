@@ -115,6 +115,14 @@ func TestControlTransportLossWithdrawsEveryCacheAtHorizon(t *testing.T) {
 	}
 	mount := f.mounts[1]
 	raw := mount.raw
+	// The kernel can wake stat before the daemon's post-write receipt installs
+	// the negative binding. Partition only after both cache facts actually exist.
+	waitUntil(t, time.Second, "positive and negative reply settlement", func() bool {
+		raw.mu.Lock()
+		defer raw.mu.Unlock()
+		parent := raw.nodesByID[1].key.inode
+		return raw.cachedNames[nameKey{parent: parent, name: "payload"}] != nil && raw.cachedNegatives[nameKey{parent: parent, name: "absent"}] == "absent"
+	})
 	notify := &recordingKernelNotifier{kernelNotifier: mount.notifier(), entries: make(map[nameKey]bool), inodes: make(map[uint64]bool)}
 	mount.setNotifier(notify)
 	raw.mu.Lock()
@@ -138,7 +146,7 @@ func TestControlTransportLossWithdrawsEveryCacheAtHorizon(t *testing.T) {
 	}
 	raw.mu.Unlock()
 	if len(names) < 2 || len(inodes) == 0 {
-		t.Fatalf("insufficient cache coverage: names=%d inodes=%d", len(names), len(inodes))
+		t.Fatalf("insufficient cache coverage: names=%v inodes=%v", names, inodes)
 	}
 	incarnation := mount.subscription.stamp().incarnation
 	listener.partition(t, 1)
