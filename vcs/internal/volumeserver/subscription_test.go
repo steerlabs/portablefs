@@ -3,6 +3,7 @@ package volumeserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"sync"
@@ -609,5 +610,121 @@ func TestCoherenceCommitNotifiesOnlyPeersOfSource(t *testing.T) {
 		if err != nil || len(events) != 1 || events[0].Kind != tc.kind || events[0].Position != position {
 			t.Fatalf("source-filtered stream: %+v, %v", events, err)
 		}
+	}
+}
+
+func TestPollControlImplicitSourcePreservesPeerWithdrawal(t *testing.T) {
+	c := NewCoherenceCoordinator(CoherenceConfig{})
+	source, err := c.Subscribe(SessionID{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := c.Subscribe(SessionID{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	type result struct {
+		events []StreamEvent
+		cursor uint64
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		events, cursor, err := c.PollControl(ctx, source.Token, 0, nil, 128)
+		done <- result{events, cursor, err}
+	}()
+	var position uint64
+	for i := uint64(1); i <= 1000; i++ {
+		position = c.OnCommitFrom([]ChangeEntry{{Kind: AttributesChanged, Identity: [16]byte{3}, VolumeVersion: i + 1}}, source.Token.Session)
+	}
+	if err := c.WaitWithdrawn(ctx, position, peer.Token.Session); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-done:
+		t.Fatalf("source-only poll returned: %+v", result)
+	default:
+	}
+	c.mu.Lock()
+	retained := c.first
+	peerAck := c.subscribers[peer.Token.Session].acked
+	c.mu.Unlock()
+	if retained != 1 || peerAck != 0 {
+		t.Fatalf("implicit source ack discarded peer obligation: first=%d ack=%d", retained, peerAck)
+	}
+	peerEvents, err := c.Poll(ctx, peer.Token, 0, nil, 1000)
+	if err != nil || len(peerEvents) != 1000 {
+		t.Fatalf("peer changes=%d, %v", len(peerEvents), err)
+	}
+	for _, event := range peerEvents {
+		if event.Kind != StreamChange {
+			t.Fatalf("peer lost change: %+v", event)
+		}
+	}
+	visible := c.OnCommitFrom([]ChangeEntry{{Kind: AttributesChanged, Identity: [16]byte{4}, VolumeVersion: 1002}}, peer.Token.Session)
+	got := <-done
+	if got.err != nil || got.cursor != visible || len(got.events) != 1 || got.events[0].Kind != StreamChange || got.events[0].Position != visible {
+		t.Fatalf("visible peer event after implicit prefix: %+v", got)
+	}
+	c.mu.Lock()
+	acked := c.subscribers[source.Token.Session].acked
+	c.mu.Unlock()
+	if acked != position {
+		t.Fatalf("visible peer event acked without withdrawal: ack=%d prefix=%d", acked, position)
+	}
+}
+
+func TestPollControlLocalDelegationReleaseReachesColdIncarnation(t *testing.T) {
+	for _, ephemeral := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ephemeral=%v", ephemeral), func(t *testing.T) {
+			c, _ := cv2Coordinator(t)
+			old := cv2Subscribe(t, c, 1)
+			identity := [16]byte{42}
+			grant := cv2Grant(t, c, old, identity)
+			// Exercise the same delayed-release privacy rule for server-owned grants.
+			c.mu.Lock()
+			c.delegations[identity].ephemeral = ephemeral
+			c.mu.Unlock()
+			pin, err := c.BeginFlush(old, identity, grant.ID, grant.Generation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := c.Subscribe(old.Session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Delegated) != 1 || snapshot.Delegated[0] != identity {
+				t.Fatalf("cold snapshot lost pinned identity: %+v", snapshot)
+			}
+			pin.End(0)
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			events, _, err := c.PollControl(ctx, snapshot.Token, snapshot.Position, nil, 8)
+			if err != nil || len(events) != 1 || events[0].Kind != StreamChange || events[0].Change.Kind != DelegationReleased {
+				t.Fatalf("old release hidden from cold incarnation: %+v, %v", events, err)
+			}
+		})
+	}
+}
+
+func TestPollControlLocalGrantReleaseStayImplicit(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	peer := cv2Subscribe(t, c, 2)
+	grant := cv2Grant(t, c, holder, [16]byte{42}, peer)
+	if _, err := c.ReleaseBatch(holder, []Delegation{grant}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	events, cursor, err := c.PollControl(ctx, holder, 0, nil, 8)
+	if !errors.Is(err, context.Canceled) || len(events) != 0 || cursor != 2 {
+		t.Fatalf("holder bookkeeping: %+v cursor=%d err=%v", events, cursor, err)
+	}
+	events = cv2AckAll(t, c, peer)
+	if len(events) != 1 || events[0].Kind != StreamChange || events[0].Change.Kind != DelegationReleased {
+		t.Fatalf("peer lost release: %+v", events)
 	}
 }

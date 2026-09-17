@@ -765,6 +765,21 @@ func TestSubscriptionLocalPromotedOwnershipClosesCacheAdmission(t *testing.T) {
 	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got != 0 {
 		t.Fatalf("locally owned identity retains cache permission=%v", got)
 	}
+
+	if _, present := mount.subscription.delegated[coordinate.item]; present {
+		t.Fatal("test depends on a holder-local grant event")
+	}
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mount.delegations.state(id)
+	state.admission.Lock()
+	state.clearGrantLocked()
+	state.admission.Unlock()
+	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got <= 0 {
+		t.Fatalf("released local grant retains cache exclusion=%v", got)
+	}
 }
 
 func TestControlCompletionReceiptWaitsForEveryEarlierHandler(t *testing.T) {

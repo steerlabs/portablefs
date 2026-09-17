@@ -1374,3 +1374,33 @@ Barrier into `other`. The classifier now names Barrier, and the test also
 requires at least the explicit completion Barrier so a missing counter cannot
 pass. The corrected run observes seven Barriers for 1,000 files in 5.36 seconds
 (`/tmp/cv2-g2-durable-mounted2.log`).
+
+### Part 2 item 0b: implicit source progress
+
+The CONTROL coordinator now consumes source-only changes inside the outstanding
+long poll, advancing its delivered/acknowledged position without emitting a wire
+event. A peer change still requires its withdrawal receipt; a trailing internal
+advance retires immediately when that receipt arrives. The handler retains the
+advanced cursor even when a poll is cancelled. Public coordinator Poll semantics
+remain unchanged.
+
+Grant/release events carry an internal exact-token owner. The current owner
+installs and retires its grant through DATA/release replies and the local grant
+registry, so it needs no duplicate subscription event. A cold incarnation still
+receives an old pinned delegation's eventual release, including an ephemeral
+one; SessionID equality cannot hide that cleanup. No wire fields changed.
+
+Coordinator proofs pass ten repetitions, including peer obligations and cold
+incarnations (`/tmp/cv2-g2-own-coordinator.log`). All authorityrpc coherence tests
+pass in Docker (`/tmp/cv2-g2-own-authority.log`); replay tests now use genuine
+broadcast changes where they previously used holder-local bookkeeping. Their
+replay, sequence, and cut assertions remain intact. The frontend test proves
+local ownership closes and reopens cache admission without subscription events.
+The implicit-progress proof fails when PollControl uses the former behavior
+(`/tmp/cv2-g2-poll-fault.log`).
+
+The mounted 1,000-file install passes in 5.37 seconds with seven Barriers, zero
+ChangeAck requests, and zero additional NextControlEvent requests (the initial
+long poll remains outstanding), `/tmp/cv2-g2-own-mounted.log`. The focused wrapper
+exits 70 for the intentionally omitted full inventory; this is targeted evidence,
+not the final full gate.

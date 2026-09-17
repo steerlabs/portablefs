@@ -222,7 +222,12 @@ subscriber's ack through the relevant position or its horizon. Change entries
 have no PREPARE/COMPLETE handshake. A committed namespace operation completes
 externally after its required deliveries/withdrawals. A delegation reservation
 becomes a grant only after peers' DELEGATION_GRANTED withdrawals finish. The
-initiating session handles its own publication boundary locally.
+initiating session handles its own publication boundary locally. Its source
+commits advance the coordinator cursor internally and produce no CONTROL event
+or ChangeAck. Delegation grant/release bookkeeping is likewise implicit for the
+exact owning subscription incarnation; a cold incarnation still receives a
+delayed old-generation release retained by its snapshot. An intervening peer
+change prevents implicit acknowledgement across that outstanding withdrawal.
 Its committed changes are omitted from its wire change stream: a reverse
 notification can otherwise wait on the initiating syscall's VFS locks and
 block acknowledgments needed by a concurrent peer mutation. Skipped internal

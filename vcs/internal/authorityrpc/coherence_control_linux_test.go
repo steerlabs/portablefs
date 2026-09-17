@@ -351,12 +351,13 @@ func TestCoherenceDelegationBreakRecallAcksValidateTicketIdentityAndReplay(t *te
 	}
 	flush.End(3)
 
-	// The holder first receives the reservation's broadcast change.
+	// A peer change precedes the private break and requires an explicit receipt.
+	publishPeerControlChange(coordinator)
 	change := pollCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), 0).GetControlEvent()
 	if change.GetChangeBatch() == nil {
 		t.Fatalf("first event = %+v, want change batch", change)
 	}
-	if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), 1); response.GetErrno() != 0 {
+	if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), change.GetChangeBatch().Entries[0].Position); response.GetErrno() != 0 {
 		t.Fatal(response)
 	}
 
@@ -439,6 +440,7 @@ func TestCoherenceDelegationModeAckControlsTransition(t *testing.T) {
 	if err := handler.rememberCoherenceDelegation(grant); err != nil {
 		t.Fatal(err)
 	}
+	publishPeerControlChange(coordinator)
 	grantEvent := pollCoherenceControlTest(t, handler, holder, holderSubscribe.GetIncarnation(), 0).GetControlEvent()
 	if grantEvent.GetChangeBatch() == nil {
 		t.Fatalf("grant event = %+v", grantEvent)
@@ -588,8 +590,9 @@ func TestCoherenceReleaseCompletesRacingBreak(t *testing.T) {
 			if err := handler.rememberCoherenceDelegation(grant); err != nil {
 				t.Fatal(err)
 			}
+			publishPeerControlChange(coordinator)
 			change := pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, 0).GetControlEvent()
-			if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.Incarnation, 1); response.Errno != 0 {
+			if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.Incarnation, change.GetChangeBatch().Entries[0].Position); response.Errno != 0 {
 				t.Fatal(response)
 			}
 			done := make(chan error, 1)
@@ -639,6 +642,7 @@ func TestCoherenceReleaseCompletesRacingBreak(t *testing.T) {
 					t.Fatal(response)
 				}
 			} else {
+				publishPeerControlChange(coordinator)
 				response := pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, change.Sequence)
 				if response.Errno != 0 || response.GetControlEvent().GetChangeBatch() == nil {
 					t.Fatalf("released reference emitted control obligation: %v", response)
@@ -663,28 +667,35 @@ func TestCoherenceSourceOnlyCommitsRetireInternalPositions(t *testing.T) {
 	}()
 	for sequence := uint64(2); sequence < 1026; sequence++ {
 		position := coordinator.OnCommitFrom([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{2}, VolumeVersion: sequence}}, id)
-		for {
-			state := handler.initCoherenceControlState()
-			state.mu.Lock()
-			cursor := state.sessions[id].coordinatorCursor
-			state.mu.Unlock()
-			if cursor >= position {
-				break
-			}
-			select {
-			case response := <-done:
-				t.Fatalf("source-only poll ended: %v", response)
-			case <-ctx.Done():
-				t.Fatal("source-only cursor did not advance")
-			case <-time.After(time.Millisecond):
-			}
+		if err := coordinator.WaitWithdrawn(ctx, position, volumeserver.SessionID{}); err != nil {
+			t.Fatalf("source-only position did not retire internally: %v", err)
 		}
+		select {
+		case response := <-done:
+			t.Fatalf("source-only poll ended: %v", response)
+		default:
+		}
+
 	}
 	if err := coordinator.CheckSession(token); err != nil {
 		t.Fatal(err)
 	}
 	cancel()
 	<-done
+	state := handler.initCoherenceControlState()
+	state.mu.Lock()
+	cursor := state.sessions[id].coordinatorCursor
+	state.mu.Unlock()
+	if cursor < 1024 {
+		t.Fatalf("cancelled poll lost implicit cursor: %d", cursor)
+	}
+	// A replacement long poll resumes from the internally acknowledged cursor.
+	retry, stop := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer stop()
+	response := handler.handleCoherencePoll(retry, 2, id, &authoritypb.NextControlEventRequest{Incarnation: subscribe.Incarnation})
+	if response.GetErrno() == int32(errnos.EINVAL) {
+		t.Fatalf("retry rejected retained cursor: %v", response)
+	}
 }
 
 func TestCoherenceLongLivedControlReplayRetiresOnlyExplicitReceipts(t *testing.T) {
@@ -730,6 +741,7 @@ func TestCoherenceLongLivedControlReplayRetiresOnlyExplicitReceipts(t *testing.T
 		if err := handler.rememberCoherenceDelegation(grant); err != nil {
 			t.Fatal(err)
 		}
+		publishPeerControlChange(coordinator)
 		ackChange(poll())
 		done := make(chan error, 1)
 		go func() { done <- coordinator.BreakForRead(t.Context(), grant.Identity) }()
@@ -757,6 +769,7 @@ func TestCoherenceLongLivedControlReplayRetiresOnlyExplicitReceipts(t *testing.T
 			}
 		}
 		// Delivery can overtake an ACK retry; it must not discard that result.
+		publishPeerControlChange(coordinator)
 		released := poll()
 		if response := handler.handleCoherenceDelegationAck(4, id, coherenceControlBreak, subscribed.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0); response.Errno != 0 {
 			t.Fatal("poll delivery retired ACK replay", response)
@@ -781,6 +794,7 @@ func TestCoherenceCompletedEventReceiptCannotAcknowledgeFailedHandler(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	publishPeerControlChange(coordinator)
 	initial := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, 0).GetControlEvent()
 	entries := initial.GetChangeBatch().GetEntries()
 	if response := ackChangeCoherenceControlTest(t, handler, id, subscribed.Incarnation, entries[len(entries)-1].Position); response.Errno != 0 {
@@ -913,4 +927,35 @@ func TestCoherenceControlAutoAckRequiresDrainedQueue(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCoherencePeerAckRetiresTrailingSourceAdvance(t *testing.T) {
+	h, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, _ := subscribeCoherenceControlTest(t, h, id)
+	coordinator.OnCommit([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{3}, VolumeVersion: 2}})
+	last := coordinator.OnCommitFrom([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{4}, VolumeVersion: 3}}, id)
+	event := pollCoherenceControlTest(t, h, id, subscribed.Incarnation, 0).GetControlEvent()
+	entries := event.GetChangeBatch().GetEntries()
+	if len(entries) != 1 {
+		t.Fatalf("wire entries=%v, want exact peer change", entries)
+	}
+	before, cancelBefore := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancelBefore()
+	if err := coordinator.WaitWithdrawn(before, last, volumeserver.SessionID{}); err == nil {
+		t.Fatal("source advance acknowledged an unwithdrawn peer change")
+	}
+	if response := ackChangeCoherenceControlTest(t, h, id, subscribed.Incarnation, entries[0].Position); response.GetErrno() != 0 {
+		t.Fatal(response)
+	}
+	after, cancelAfter := context.WithTimeout(t.Context(), time.Second)
+	defer cancelAfter()
+	if err := coordinator.WaitWithdrawn(after, last, volumeserver.SessionID{}); err != nil {
+		t.Fatalf("peer ACK did not retire trailing source advance: %v", err)
+	}
+}
+
+// Real peer facts keep replay tests independent of holder-local bookkeeping.
+func publishPeerControlChange(c *volumeserver.CoherenceCoordinator) {
+	c.OnCommit([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{0xf0}, VolumeVersion: 1}})
 }

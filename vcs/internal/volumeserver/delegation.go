@@ -216,7 +216,7 @@ func (c *CoherenceCoordinator) reserveLocked(s *changeSubscriber, identity [16]b
 	if ephemeral {
 		source = s.token.Session
 	}
-	r.position = c.appendLocked(StreamEvent{Kind: StreamChange, Source: source, Change: ChangeEntry{Kind: DelegationGranted, Identity: identity, VolumeVersion: c.watermark}})
+	r.position = c.appendLocked(StreamEvent{Kind: StreamChange, Source: source, LocalOwner: s.token, Change: ChangeEntry{Kind: DelegationGranted, Identity: identity, VolumeVersion: c.watermark}})
 	return &DelegationReservation{coordinator: c, record: r, turn: turn}
 }
 
@@ -874,7 +874,7 @@ func (c *CoherenceCoordinator) finishRetiredLocked(r *delegationRecord) {
 	if r.ephemeral {
 		source = r.owner.token.Session
 	}
-	c.appendLocked(StreamEvent{Kind: StreamChange, Source: source, Change: ChangeEntry{Kind: DelegationReleased, Identity: r.grant.Identity, VolumeVersion: c.watermark}})
+	c.appendLocked(StreamEvent{Kind: StreamChange, Source: source, LocalOwner: r.owner.token, Change: ChangeEntry{Kind: DelegationReleased, Identity: r.grant.Identity, VolumeVersion: c.watermark}})
 }
 
 // ReleaseBatch validates the entire batch before changing any record. The

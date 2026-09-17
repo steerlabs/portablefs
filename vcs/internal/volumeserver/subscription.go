@@ -80,10 +80,12 @@ const (
 // broadcast change. A private event becomes StreamAdvance in other outboxes.
 // Request identifies a break/recall independently of cumulative withdrawal ack.
 type StreamEvent struct {
-	Position                               uint64
-	Kind                                   StreamEventKind
-	Target                                 SessionID
-	Source                                 SessionID
+	Position uint64
+	Kind     StreamEventKind
+	Target   SessionID
+	Source   SessionID
+	// LocalOwner limits implicit delegation bookkeeping to one incarnation.
+	LocalOwner                             SubscriptionToken
 	Change                                 ChangeEntry
 	Delegation                             Delegation
 	Request, AppliedSequence, LossSequence uint64
@@ -381,30 +383,44 @@ func (c *CoherenceCoordinator) truncateLocked() {
 // an unacked cursor replays safely; Poll never waits for withdrawal acks, so a
 // recall behind a pending withdrawal can always reach the holder.
 func (c *CoherenceCoordinator) Poll(ctx context.Context, token SubscriptionToken, after uint64, dst []StreamEvent, limit int) ([]StreamEvent, error) {
+	events, _, err := c.poll(ctx, token, after, dst, limit, false)
+	return events, err
+}
+
+// PollControl silently retires source-only positions covered by the initiating
+// frontend's publication gate. A delivered or queued peer change still requires
+// its withdrawal receipt. The returned cursor must be saved even on cancellation.
+func (c *CoherenceCoordinator) PollControl(ctx context.Context, token SubscriptionToken, after uint64, dst []StreamEvent, limit int) ([]StreamEvent, uint64, error) {
+	return c.poll(ctx, token, after, dst, limit, true)
+}
+
+func (c *CoherenceCoordinator) poll(ctx context.Context, token SubscriptionToken, after uint64, dst []StreamEvent, limit int, implicitSource bool) ([]StreamEvent, uint64, error) {
 	if limit <= 0 {
-		return dst, ErrSubscriptionPosition
+		return dst, after, ErrSubscriptionPosition
 	}
 	for {
 		c.mu.Lock()
 		s, err := c.subscriberLocked(token)
 		if err != nil {
 			c.mu.Unlock()
-			return dst, err
+			return dst, after, err
 		}
 		if s.acked+1 < c.first {
 			s.fenced = true
 			c.mu.Unlock()
-			return dst, ErrSessionFenced
+			return dst, after, ErrSessionFenced
 		}
 		if after < s.acked || after > s.delivered {
 			c.mu.Unlock()
-			return dst, ErrSubscriptionPosition
+			return dst, after, ErrSubscriptionPosition
 		}
 		if after < c.position {
 			end := c.position
 			if end-after > uint64(limit) {
 				end = after + uint64(limit)
 			}
+			ownOnly := implicitSource && after == s.acked && after == s.delivered
+			base := len(dst)
 			needed := len(dst) + int(end-after)
 			if cap(dst) < needed {
 				// Grow amortized, but never retain more than one requested batch
@@ -416,7 +432,14 @@ func (c *CoherenceCoordinator) Poll(ctx context.Context, token SubscriptionToken
 			}
 			for pos := after + 1; pos <= end; pos++ {
 				event := c.log[(pos-1)%uint64(len(c.log))]
-				if event.Source == token.Session || event.Target != (SessionID{}) && event.Target != token.Session {
+				local := event.Source == token.Session
+				if implicitSource && event.LocalOwner != (SubscriptionToken{}) {
+					local = event.LocalOwner == token
+				}
+				if event.Kind != StreamChange || !local {
+					ownOnly = false
+				}
+				if local || event.Target != (SessionID{}) && event.Target != token.Session {
 					event = StreamEvent{Position: pos, Kind: StreamAdvance}
 				}
 				dst = append(dst, event)
@@ -424,14 +447,25 @@ func (c *CoherenceCoordinator) Poll(ctx context.Context, token SubscriptionToken
 			if end > s.delivered {
 				s.delivered = end
 			}
+			after = end
+			if ownOnly {
+				clear(dst[base:])
+				dst = dst[:base]
+				s.acked = end
+				heap.Fix(&c.acks, s.ackIndex)
+				c.truncateLocked()
+				c.signalLocked()
+				c.mu.Unlock()
+				continue
+			}
 			c.mu.Unlock()
-			return dst, nil
+			return dst, after, nil
 		}
 		changed := c.notificationLocked()
 		deadline := s.horizon
 		c.mu.Unlock()
 		if err := c.wait(ctx, changed, deadline); err != nil {
-			return dst, err
+			return dst, after, err
 		}
 	}
 }

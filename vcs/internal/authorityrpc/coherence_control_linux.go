@@ -496,18 +496,19 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 		dst := session.pollBuffer[:0]
 		state.mu.Unlock()
 
-		events, pollErr := h.Coherence.Poll(ctx, token, cursor, dst, coherenceControlBatchLimit)
-		if pollErr != nil {
-			return h.coherenceError(requestID, pollErr)
-		}
+		events, nextCursor, pollErr := h.Coherence.PollControl(ctx, token, cursor, dst, coherenceControlBatchLimit)
 		state.mu.Lock()
 		if state.sessions[id] != session {
 			state.mu.Unlock()
 			return h.coherenceError(requestID, volumeserver.ErrSubscription)
 		}
 		session.pollBuffer = events
+		session.coordinatorCursor = max(session.coordinatorCursor, nextCursor)
+		if pollErr != nil {
+			state.mu.Unlock()
+			return h.coherenceError(requestID, pollErr)
+		}
 		if len(events) != 0 {
-			session.coordinatorCursor = events[len(events)-1].Position
 			session.queued = events
 		}
 		state.mu.Unlock()
@@ -727,6 +728,9 @@ func (h *VolumeHandler) handleCoherenceChangeAck(requestID uint64, id volumeserv
 	}
 	session.changeAcked = position
 	session.changePositions = session.changePositions[index+1:]
+	if err := h.retireCoherenceAdvancesLocked(session); err != nil {
+		return h.coherenceError(requestID, err)
+	}
 	return coherenceChangeAckResponse(h, requestID)
 }
 
