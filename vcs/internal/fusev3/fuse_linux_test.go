@@ -2333,6 +2333,32 @@ func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.
 	}
 }
 
+func TestCleanupRecoveryWithoutSubscriptionRegistryDoesNotPanic(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		sessionEnd error
+	}{
+		{name: "subscription reset", err: authorityrpc.ErrSubscriptionReset},
+		{name: "coherence refusal", err: resourceCleanupError{cause: syscall.EIO, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}},
+		{name: "authority replacement", err: resourceCleanupError{cause: syscall.EIO}, sessionEnd: authorityrpc.ErrAuthorityChanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mount, rpc := testMount(t, 64)
+			mount.subscription = nil
+			rpc.mu.Lock()
+			rpc.sessionEnd = tc.sessionEnd
+			rpc.mu.Unlock()
+			if retry := mount.cleanupFailed("object reclaim", tc.err, nil); !retry {
+				t.Fatal("recoverable cleanup failure was not deferred")
+			}
+			if mount.isRevoked() {
+				t.Fatal("recoverable cleanup failure revoked mount without a subscription registry")
+			}
+		})
+	}
+}
+
 func TestRefusedReclaimRequeuesAfterColdSubscription(t *testing.T) {
 	mount, rpc := testMount(t, 64)
 	reactivate := make(chan struct{})

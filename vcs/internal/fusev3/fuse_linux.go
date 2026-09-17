@@ -905,7 +905,9 @@ func (m *Mount) cleanupFailed(operation string, err error, stale func()) bool {
 	}
 	var classified cleanupClassified
 	if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
-		m.subscription.deactivate()
+		if m.subscription != nil {
+			m.subscription.deactivate()
+		}
 		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, err)
 		return true
 	}
@@ -913,13 +915,17 @@ func (m *Mount) cleanupFailed(operation string, err error, stale func()) bool {
 		if stale != nil {
 			stale()
 		}
-		m.subscription.deactivate()
+		if m.subscription != nil {
+			m.subscription.deactivate()
+		}
 		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, err)
 		return true
 	}
 	terminal := errors.As(err, &classified) && classified.cleanupIsTerminal()
 	if cause := m.rpc.SessionEndCause(); errors.Is(cause, authorityrpc.ErrAuthorityChanged) || errors.Is(cause, authorityrpc.ErrSubscriptionReset) {
-		m.subscription.deactivate()
+		if m.subscription != nil {
+			m.subscription.deactivate()
+		}
 		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, errors.Join(err, cause))
 		return true
 	} else if cause != nil {
