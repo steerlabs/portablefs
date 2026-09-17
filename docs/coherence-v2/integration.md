@@ -2760,5 +2760,32 @@ buffer mutex. Application, visibility, and durability remain distinct states;
 the coalesced durability worker obtains visibility proof before retiring a
 durable prefix (`b5bc217`).
 
-Final full-gate, standalone matrix, complete soak, and post-fix baseline results
-follow after qualification.
+### G6 qualification
+
+`bash scripts/verify-local.sh --full` exits 0 on the committed G6 runtime and
+documentation changes. It passes Darwin Foundation/cgo and static Linux
+builds, vet, dependency scanning, native Go and race suites, the maintained
+go-fuse seam, all 345 Xcode-native Swift tests, release-trust and architecture
+scans, all 78 required privileged XFS/FUSE cases plus the root-boundary case,
+and the embedded Linux matrix. The matrix reports 28 passes, no unexpected
+result, both controls matching, and only the declared single-principal
+`remote_chown_visible` skip.
+
+The separately invoked `bash scripts/coherence-matrix-linux.sh` also exits 0
+with the same 28 passes, declared chown skip, and matching controls.
+
+The exact requested soak command,
+`PORTABLEFS_SOAK_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestSoak' bash scripts/xfs-fuse-integration.sh`,
+passes its complete selected inventory in 933.899 seconds. The 5,000-file,
+200-commit PortableFS Git case passes in 787.86 seconds, including checkout,
+cold and warm status, GC, rebase, direct-XFS comparison, and the run barrier.
+The compiler case passes in 41.94 seconds. The wrapper reports that the soak
+inventory passed and that the standard privileged suites were intentionally
+not selected; those suites passed in the full gate above.
+
+One final `TestCoherenceBaseline` run passes all subtests in 109.89 seconds on
+Linux 6.8.0-100-generic. The focused wrapper exits at the required-inventory
+check because its selector omits the unrelated privileged cases. The measured
+test itself passes. Its ten observations and request breakdown are appended to
+`results.md`. Warm status remains 0.01825 requests per operation, and the
+two-mount workload records 6.72275, both inside their existing limits.

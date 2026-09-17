@@ -888,3 +888,49 @@ The stage means total 335 us per CREATE. The same profiled install completed in
 remaining install wall time is therefore the namespace round-trip floor plus
 write, close, directory, and scheduling work. G4 deliberately does not add a
 new install optimization.
+
+## G6 final adversarial-fix baseline
+
+The final G6 baseline ran once on Linux 6.8.0-100-generic with the unchanged
+workloads and capacities:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 \
+PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' \
+bash scripts/xfs-fuse-integration.sh
+```
+
+Every `TestCoherenceBaseline` subtest passed in 109.89 seconds. The focused
+wrapper subsequently exited at its required-inventory check because the
+selector intentionally omitted the other privileged tests; the unfiltered
+78-test suite passed in the preceding full gate.
+
+| Workload | Target | Wall (s) | Authority requests | Requests/op | Filesystem requests/op |
+| --- | --- | ---: | ---: | ---: | ---: |
+| install, 1 worker | direct-xfs | 0.573902 | 0 | 0.000000 | 0.000000 |
+| install, 8 workers | direct-xfs | 0.314843 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker | portablefs | 21.321879 | 83,132 | 1.979333 | 1.965786 |
+| install, 8 workers | portablefs | 11.525351 | 83,082 | 1.978143 | 1.968310 |
+| git-status-cold | direct-xfs | 0.007169 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006457 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.907801 | 20,541 | 1.027050 | 1.026000 |
+| git-status-warm | portablefs | 2.327022 | 365 | 0.018250 | 0.018050 |
+| two-mount-write-list-read | direct-xfs | 0.032626 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.114409 | 26,891 | 6.722750 | 3.254500 |
+
+The additive visibility boundary appears explicitly in the filesystem meter.
+The one-worker and eight-worker installs issued 22 and 12 `wait_visibility`
+requests respectively; the two-mount workload issued five. Warm Git issued no
+visibility wait and remains at 0.01825 total requests per file. The two-mount
+run performed three directory scans, observed one file while the writer was
+active, and verified all 2,000 files.
+
+PortableFS request breakdowns:
+
+| Workload | Filesystem requests | Control requests |
+| --- | --- | --- |
+| install, 1 worker | close 2; close_batch 537; create 40,000; mkdir 2,000; open 1; read_dir 1; wait_visibility 22; write 40,000 | barrier 22; delegation_release 537; keep_alive 3; renew_subscription 7 |
+| install, 8 workers | close 2; close_batch 313; create 40,000; get_attr 113; lookup 227; mkdir 2,000; open 1; read_dir 1; wait_visibility 12; write 40,000 | barrier 12; delegation_release 313; keep_alive 1; reclaim 84; renew_subscription 3 |
+| git-status-cold | close 120; close_batch 1; create 1; flush 16; lookup 20,139; open 119; read 20; read_dir 103; unlink 1 | barrier 1; delegation_release 1; reclaim 19 |
+| git-status-warm | close 120; close_batch 1; create 1; flush 16; open 119; read_dir 103; unlink 1 | barrier 1; delegation_release 1; reclaim 1; renew_subscription 1 |
+| two-mount-write-list-read | close 2,004; close_batch 80; create 2,000; flush 2,000; get_attr 3; lookup 4; open 2,003; read 2,001; read_dir 918; wait_visibility 5; write 2,000 | barrier 5; change_ack 4,394; delegation_break_ack 2,384; delegation_release 80; next_control_event 6,784; reclaim 224; renew_subscription 2 |
