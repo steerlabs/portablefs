@@ -269,6 +269,18 @@ func (t *integrationTransport) CallMutation(ctx context.Context, request *author
 	return t.Client.CallMutation(ctx, request)
 }
 
+func (t *integrationTransport) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	t.hookMu.Lock()
+	before := t.beforeDelegatedMutation
+	t.hookMu.Unlock()
+	if before != nil {
+		if err := before(ctx, request); err != nil {
+			return nil, err
+		}
+	}
+	return t.Client.CallMutationSegments(ctx, request, segments, assigned)
+}
+
 func (t *integrationTransport) SessionID() []byte { return append([]byte(nil), t.session...) }
 
 func (t *integrationTransport) DetachAfterUnmount(ctx context.Context, proof fusev3.MountAbsenceProof) error {

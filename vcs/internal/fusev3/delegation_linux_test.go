@@ -1010,6 +1010,17 @@ func TestDelegationEpochChangeWithoutDirtyDataPreservesLoss(t *testing.T) {
 	}
 }
 
+func TestDropReporterSuppressesCleanDelegationLoss(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	var reports []writeback.DropReport
+	m.SetDropReporter(func(report writeback.DropReport) { reports = append(reports, report) })
+	m.reportDrop(writeback.DropReport{LossSequence: 1, Reason: "clean delegation outcome unknown"})
+	m.reportDrop(writeback.DropReport{Entries: 1, LossSequence: 2, Reason: "retained writeback lost"})
+	if len(reports) != 1 || reports[0].Entries != 1 || reports[0].LossSequence != 2 {
+		t.Fatalf("writeback reports = %+v, want only retained loss", reports)
+	}
+}
+
 func TestDelegationSubscriptionFenceDropsOldBufferAndAllowsColdGrant(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)
