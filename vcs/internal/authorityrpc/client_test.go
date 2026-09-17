@@ -1558,6 +1558,23 @@ func TestResponseStateCannotCrossFrontendProfiles(t *testing.T) {
 	}
 }
 
+func TestLinuxProfileRejectsRetiredLeaseResponseState(t *testing.T) {
+	client := &Client{cfg: ClientConfig{FrontendProfile: authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES}}
+	for _, test := range []struct {
+		name     string
+		response *authoritypb.Response
+	}{
+		{"lease grants", &authoritypb.Response{LeaseGrants: []*authoritypb.LeaseGrant{{}}}},
+		{"source lease discharge", &authoritypb.Response{SourceLeaseDischarge: &authoritypb.SourceLeaseDischarge{}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := client.validateResponseFrontendProfile(test.response); !errors.Is(err, ErrTransportBinding) {
+				t.Fatalf("retired Linux response state validation = %v, want ErrTransportBinding", err)
+			}
+		})
+	}
+}
+
 type dualPendingHandler struct {
 	clientTestHandler
 	reached chan authoritypb.TransportRole

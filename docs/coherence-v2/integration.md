@@ -476,6 +476,17 @@ The following mapping preserves every test from the deleted lease suite:
 | 31 | `TestLeaseDataReadWakesWhenTheRecallAborts` | `TestCoherenceDataConsumedWakesWhenCanceledRecallRetiresGeneration` (added and passing). |
 | 32 | `TestLeaseSourcePostStateGrantRejectsAnUnpreparedCoordinate` | `TestCoherenceSynchronousMutationRetainsSuccessfulGrant` and `TestCoherenceCreateReservesBeforeBindingPublication`. Arbitrary successor coordinates are unrepresentable in protocol 7: `RetainDelegation` is bound to the exact mutation-pin identity, while `ReserveNew` is the explicit created-identity path. |
 
+The deleted client-side lease validator tests map to the shared protocol-7
+response guard. Protocol 7 rejects the historical envelope before interpreting
+the retired identity, TTL, recall-generation, or renewal-partition semantics.
+
+| Retired client test | Protocol 7 replacement |
+|---|---|
+| `TestTimedLeaseGrantsRejectZeroIdentity` | `TestLinuxProfileRejectsRetiredLeaseResponseState` |
+| `TestTimedLeaseGrantsEnforceAuthoritySafetyHorizon` | `TestLinuxProfileRejectsRetiredLeaseResponseState` |
+| `TestTimedResponseLeaseGrantsRejectLateDataAfterRecall` | `TestLinuxProfileRejectsRetiredLeaseResponseState` |
+| `TestValidateLeaseRenewalOutcomeRequiresExactPartition` | `TestLinuxProfileRejectsRetiredLeaseResponseState` |
+
 The deleted visibility-route tests have these stronger replacements:
 
 | Retired test | Stronger existing replacement |
