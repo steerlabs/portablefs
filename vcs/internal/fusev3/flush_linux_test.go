@@ -4,11 +4,13 @@ package fusev3
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"testing"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 func TestFullDelegationFlushIsLocalUnlessPOSIXOwnerNeedsDischarge(t *testing.T) {
@@ -56,6 +58,40 @@ func TestFullDelegationFlushIsLocalUnlessPOSIXOwnerNeedsDischarge(t *testing.T) 
 	}
 }
 
+func TestFullDelegationFlushSamplesLossAndRetirementAtomically(t *testing.T) {
+	mount, _ := testMount(t, 8)
+	n := testNode(mount)
+	handle := &fileHandle{node: n, token: testToken(100)}
+	identity := n.item.GetStableIdentity()
+	if err := mount.delegations.Install(identity, n.item.GetToken(), handle.token, delegationTestGrant(44, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
+	handle.lossObserved = mount.delegations.IdentityLoss(identity)
+	if errno := handle.observeLoss(); errno != 0 {
+		t.Fatalf("initial loss observation = %v", errno)
+	}
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount.delegations.buf.Drop(id, "recall failure after initial FLUSH sample")
+	if local, errno := handle.flushLocally(); !local || errno != syscall.EIO {
+		t.Fatalf("local flush after loss = (%v, %v), want (true, EIO)", local, errno)
+	}
+
+	state := mount.delegations.state(id)
+	retire, err := mount.delegations.beginRetire(t.Context(), state)
+	if err != nil && !errors.Is(err, writeback.ErrLost) {
+		t.Fatal(err)
+	}
+	if retire != nil {
+		defer retire.Cancel()
+	}
+	if local, _ := handle.flushLocally(); local {
+		t.Fatal("retiring delegation completed FLUSH locally")
+	}
+}
+
 func TestPOSIXFlushReceiptCannotEraseLaterAcquisition(t *testing.T) {
 	m := &Mount{}
 	key := posixLockKey{identity: publicationIdentity{1}, owner: 41}
@@ -72,5 +108,43 @@ func TestPOSIXFlushReceiptCannotEraseLaterAcquisition(t *testing.T) {
 	m.dischargePOSIXLock(key, first)
 	if m.possiblePOSIXLock(key) == 0 {
 		t.Fatal("generation reuse erased reacquisition")
+	}
+}
+
+func TestPOSIXLockOwnersDischargeOnUnlockAndClose(t *testing.T) {
+	const owners = 10_000
+	mount, _ := testMount(t, 8)
+	n := testNode(mount)
+	call := func(operation func(context.Context) syscall.Errno) syscall.Errno {
+		ctx, finish := testMutationContext(t, mount)
+		errno := operation(ctx)
+		finish(errno == 0)
+		return errno
+	}
+	for owner := uint64(1); owner <= owners; owner++ {
+		if errno := call(func(ctx context.Context) syscall.Errno {
+			return n.Setlk(ctx, owner, &fuse.FileLock{Typ: syscall.F_WRLCK, End: 1}, 0)
+		}); errno != 0 {
+			t.Fatalf("owner %d lock: %v", owner, errno)
+		}
+		if owner%2 == 0 {
+			if errno := call(func(ctx context.Context) syscall.Errno {
+				return n.Setlk(ctx, owner, &fuse.FileLock{Typ: syscall.F_UNLCK, End: 1}, 0)
+			}); errno != 0 {
+				t.Fatalf("owner %d unlock: %v", owner, errno)
+			}
+			continue
+		}
+		handle := &fileHandle{node: n, token: testToken(owner)}
+		if errno := call(func(ctx context.Context) syscall.Errno {
+			return handle.close(ctx, owner, false)
+		}); errno != 0 {
+			t.Fatalf("owner %d close: %v", owner, errno)
+		}
+	}
+	mount.posixMu.Lock()
+	defer mount.posixMu.Unlock()
+	if len(mount.posixLocks) != 0 {
+		t.Fatalf("POSIX lock owner map retained %d entries", len(mount.posixLocks))
 	}
 }

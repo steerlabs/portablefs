@@ -41,12 +41,15 @@ func TestSoakReproRewriteReadLoop(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	f.measure(t, "rewrite-close-stat-read-30", func() error {
+	const iterations = 1000
+	f.measure(t, "rewrite-close-stat-read-1000", func() error {
 		path := filepath.Join(f.b, "heartbeat")
-		latencies := make([]time.Duration, 0, 30)
-		for i := 0; i < 30; i++ {
+		latencies := make([]time.Duration, 0, iterations)
+		for i := 0; i < iterations; i++ {
 			data := []byte(fmt.Sprint(i))
-			t.Logf("REWRITE iteration=%d", i)
+			if i%100 == 0 {
+				t.Logf("REWRITE iteration=%d", i)
+			}
 			started := time.Now()
 			if err := f.bounded(t, fmt.Sprintf("rewrite iteration=%d", i), 15*time.Second, func() error {
 				if err := os.WriteFile(path, data, 0600); err != nil {
@@ -69,7 +72,7 @@ func TestSoakReproRewriteReadLoop(t *testing.T) {
 			latencies = append(latencies, time.Since(started))
 		}
 		sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-		t.Logf("SOAK_LATENCY rewrite iterations=30 p50=%s p95=%s max=%s", latencies[15], latencies[28], latencies[29])
+		t.Logf("SOAK_LATENCY rewrite iterations=%d p50=%s p95=%s max=%s", iterations, latencies[iterations/2], latencies[iterations*95/100-1], latencies[iterations-1])
 		f.barrier(t)
 		return nil
 	})

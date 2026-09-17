@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"sync"
@@ -541,7 +542,10 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		panic(err)
 	} // validated configuration and constant buffer bounds
 	mount.delegations.SetDropReporter(cfg.OnWritebackDrop)
-	mount.delegations.SetCleanupFailureReporter(mount.revoke)
+	mount.delegations.SetCleanupFailureReporter(func(err error) {
+		mount.cleanupFailed("deferred close", err, nil)
+	})
+	mount.delegations.SetCleanupRetryWaiter(mount.subscription.waitActive)
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
 	return mount
 }
@@ -827,11 +831,22 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 			if err == nil {
 				err = fmt.Errorf("reclaim refused: %w", responseErrno(response))
 			}
-			m.cleanupFailed("object reclaim", err)
+			outcome := resourceCleanupError{cause: err}
+			if response != nil {
+				outcome.failure = response.GetFailure()
+			}
 			if consumption != nil {
 				consumption.Consume()
 			}
-			return
+			if m.cleanupFailed("object reclaim", outcome, nil) {
+				if waitErr := m.subscription.waitActive(ctx); waitErr != nil {
+					return
+				}
+				if entry.transport == m.rpc.(*epochRPC).current() {
+					m.reclaim.push(entry)
+				}
+			}
+			continue
 		}
 		if consumption != nil {
 			consumption.Consume()
@@ -839,18 +854,80 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 	}
 }
 
-// cleanupFailed is the single policy this mount applies when the authority
-// refuses to release a resource the frontend has already given up locally
-// (a forgotten capability, or a file handle the kernel has closed). Both mean
-// the frontend and the authority no longer agree about who owns an object; the
-// session cannot continue correctly, and continuing would surface later as
-// unexplained per-session admission failures on ordinary open() calls.
-func (m *Mount) cleanupFailed(operation string, err error) {
+type cleanupClassified interface {
+	cleanupFailureClass() authoritypb.FailureClass
+	cleanupIsTerminal() bool
+}
+
+type resourceCleanupError struct {
+	cause    error
+	failure  authoritypb.FailureClass
+	terminal bool
+}
+
+func (e resourceCleanupError) Error() string {
+	if e.cause == nil {
+		return "resource cleanup failed"
+	}
+	return e.cause.Error()
+}
+func (e resourceCleanupError) Unwrap() error { return e.cause }
+func (e resourceCleanupError) cleanupFailureClass() authoritypb.FailureClass {
+	return e.failure
+}
+func (e resourceCleanupError) cleanupIsTerminal() bool { return e.terminal }
+func (e resourceCleanupError) failed() bool            { return e.cause != nil }
+func (e resourceCleanupError) errno() syscall.Errno {
+	if e.cause == nil {
+		return 0
+	}
+	if errno, ok := e.cause.(syscall.Errno); ok {
+		return errno
+	}
+	return bufferErrno(e.cause)
+}
+
+// cleanupFailed scopes definite cleanup refusals to the resource. Subscription
+// fencing triggers cold recovery; only an unresolved or already-terminal
+// session outcome revokes the mount. It returns true when cleanup should be
+// retried after the replacement subscription becomes active.
+func (m *Mount) cleanupFailed(operation string, err error, stale func()) bool {
 	if m.ctx != nil && m.ctx.Err() != nil {
 		// Teardown already released everything through Detach.
-		return
+		return false
 	}
-	m.revoke(fmt.Errorf("fusev3: authority refused %s of a frontend-owned resource: %w", operation, err))
+	var classified cleanupClassified
+	if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+		m.subscription.deactivate()
+		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, err)
+		return true
+	}
+	if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+		if stale != nil {
+			stale()
+		}
+		m.subscription.deactivate()
+		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, err)
+		return true
+	}
+	terminal := errors.As(err, &classified) && classified.cleanupIsTerminal()
+	if cause := m.rpc.SessionEndCause(); errors.Is(cause, authorityrpc.ErrAuthorityChanged) || errors.Is(cause, authorityrpc.ErrSubscriptionReset) {
+		m.subscription.deactivate()
+		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, errors.Join(err, cause))
+		return true
+	} else if cause != nil {
+		terminal = true
+		err = errors.Join(err, cause)
+	}
+	if terminal {
+		m.revoke(fmt.Errorf("fusev3: unresolved %s of a frontend-owned resource: %w", operation, err))
+		return false
+	}
+	if stale != nil {
+		stale()
+	}
+	log.Printf("portablefs: scoped cleanup failure operation=%q cause=%v", operation, err)
+	return false
 }
 
 // acquireBulk admits one kernel-driven authority call. The non-blocking attempt
@@ -1170,6 +1247,7 @@ type fileHandle struct {
 	lossMu       sync.Mutex
 	lossObserved uint64
 	once         sync.Once
+	closeOutcome resourceCleanupError
 }
 
 type dirHandle struct {
@@ -1200,6 +1278,7 @@ type dirHandle struct {
 	pageWantItems bool
 	eof           bool
 	once          sync.Once
+	closeOutcome  resourceCleanupError
 	// plusReply serializes the directory cursor across the physical reply edge.
 	// READDIRPLUS transfers authority capabilities while building a page, but
 	// the kernel owns their lookup references only after /dev/fuse accepts the
@@ -1274,7 +1353,10 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 	// The local horizon is conservative: the Authority may still answer before
 	// its later deadline. Cold namespace reads and mutations must nevertheless
 	// fail until this mount installs a new subscription.
-	if (requiresGate || request.GetLookup() != nil) && m.subscription != nil && m.subscription.stamp() == (subscriptionStamp{}) {
+	if m.subscription == nil {
+		return nil, errors.New("fusev3: mutation has no subscription registry")
+	}
+	if (requiresGate || request.GetLookup() != nil) && m.subscription.stamp() == (subscriptionStamp{}) {
 		return nil, syscall.EIO
 	}
 	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
@@ -1604,7 +1686,7 @@ func (n *node) Read(ctx context.Context, handle *fileHandle, dest []byte, off in
 	// Cold withdrawal closes read admission until the replacement subscription
 	// is installed. In particular, a kernel refault must not enter repeated
 	// network timeouts while the Authority has already fenced this incarnation.
-	if n.mount.subscription != nil && n.mount.subscription.stamp() == (subscriptionStamp{}) {
+	if n.mount.subscription == nil || n.mount.subscription.stamp() == (subscriptionStamp{}) {
 		return nil, syscall.EIO
 	}
 
@@ -1663,8 +1745,10 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	}
 	key := n.posixLockKey(lockOwner)
 	generation := n.mount.possiblePOSIXLock(key)
-	if generation == 0 && n.mount.delegations.ownsFull(n.item.GetStableIdentity()) {
-		return 0
+	if generation == 0 {
+		if local, errno := handle.flushLocally(); local {
+			return errno
+		}
 	}
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Flush{Flush: &authoritypb.FlushRequest{Handle: cloneBytes(handle.token), LockOwner: lockOwner}}})
 	if errno == 0 {
@@ -1691,6 +1775,27 @@ func (h *fileHandle) observeLoss() syscall.Errno {
 	return syscall.EIO
 }
 
+func (h *fileHandle) flushLocally() (bool, syscall.Errno) {
+	if h == nil || h.node == nil || h.node.mount == nil {
+		return false, 0
+	}
+	h.lossMu.Lock()
+	defer h.lossMu.Unlock()
+	local, loss, errno := h.node.mount.delegations.localFullFlush(h.node.item.GetStableIdentity(), h.lossObserved)
+	if !local {
+		return false, 0
+	}
+	lost := loss != h.lossObserved
+	h.lossObserved = loss
+	if !lost {
+		return true, 0
+	}
+	if errno != 0 {
+		return true, errno
+	}
+	return true, syscall.EIO
+}
+
 func (n *node) Release(ctx context.Context, handle *fileHandle) syscall.Errno {
 	if handle == nil {
 		return syscall.EBADF
@@ -1699,18 +1804,34 @@ func (n *node) Release(ctx context.Context, handle *fileHandle) syscall.Errno {
 }
 
 func (h *fileHandle) close(ctx context.Context, lockOwner uint64, flockUnlock bool) syscall.Errno {
-	if h.stale.Load() || h.node.epochStale.Load() {
-		return syscall.EIO
+	return h.closeForCleanup(ctx, lockOwner, flockUnlock).errno()
+}
+
+func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, flockUnlock bool) resourceCleanupError {
+	if h != nil && h.node != nil && h.node.mount != nil {
+		// Closing any descriptor releases this owner's POSIX locks on the inode,
+		// even when the Authority close itself is refused or its result is lost.
+		h.node.mount.forgetPOSIXLock(h.node.posixLockKey(lockOwner))
 	}
-	var errno syscall.Errno
+	if h.stale.Load() || h.node.epochStale.Load() {
+		return resourceCleanupError{cause: syscall.EIO}
+	}
 	h.once.Do(func() {
 		if h.node.mount.delegations.TracksHandle(h.node.item.GetStableIdentity(), h.token) {
-			errno = bufferErrno(h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock))
+			if err := h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock); err != nil {
+				h.closeOutcome.cause = err
+			}
 			return
 		}
-		_, errno = h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token), LockOwner: lockOwner, FlockUnlock: flockUnlock}}})
+		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token), LockOwner: lockOwner, FlockUnlock: flockUnlock}}})
+		if errno != 0 {
+			h.closeOutcome.cause = errno
+			if response != nil {
+				h.closeOutcome.failure = response.GetFailure()
+			}
+		}
 	})
-	return errno
+	return h.closeOutcome
 }
 
 func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uint32, syscall.Errno) {
@@ -2082,17 +2203,26 @@ func (h *dirHandle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
 }
 
 func (h *dirHandle) close(ctx context.Context) syscall.Errno {
+	return h.closeForCleanup(ctx).errno()
+}
+
+func (h *dirHandle) closeForCleanup(ctx context.Context) resourceCleanupError {
 	if h.stale.Load() || h.node.epochStale.Load() {
-		return syscall.EIO
+		return resourceCleanupError{cause: syscall.EIO}
 	}
-	var errno syscall.Errno
 	h.once.Do(func() {
 		h.mu.Lock()
 		h.discardPageItemsLocked()
 		h.mu.Unlock()
-		_, errno = h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
+		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
+		if errno != 0 {
+			h.closeOutcome.cause = errno
+			if response != nil {
+				h.closeOutcome.failure = response.GetFailure()
+			}
+		}
 	})
-	return errno
+	return h.closeOutcome
 }
 
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*authoritypb.Item, *fileHandle, uint32, syscall.Errno) {
@@ -2281,9 +2411,13 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 	// mknod(2) does not hand an open file description to the caller, so the one
 	// the authority just created is this frontend's to release immediately.
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle())}
-	if errno := handle.close(ctx, 0, false); errno != 0 {
-		n.mount.cleanupFailed("open-file close after mknod", errno)
-		return nil, errno
+	if outcome := handle.closeForCleanup(ctx, 0, false); outcome.failed() {
+		n.mount.cleanupFailed("open-file close after mknod", outcome, func() {
+			handle.stale.Store(true)
+			handle.node.stale.Store(true)
+			n.mount.delegations.failCleanupIdentity(handle.node.item.GetStableIdentity(), "mknod handle cleanup refused")
+		})
+		return nil, outcome.errno()
 	}
 	return item, 0
 }
@@ -2780,12 +2914,22 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	if lock.Typ != syscall.F_RDLCK && lock.Typ != syscall.F_WRLCK && lock.Typ != syscall.F_UNLCK || flags&^uint32(fuse.FUSE_LK_FLOCK) != 0 {
 		return syscall.EINVAL
 	}
-	if flags&uint32(fuse.FUSE_LK_FLOCK) == 0 && lock.Typ != syscall.F_UNLCK {
-		n.mount.notePOSIXLock(n.posixLockKey(owner))
+	posix := flags&uint32(fuse.FUSE_LK_FLOCK) == 0
+	key := n.posixLockKey(owner)
+	generation := uint64(0)
+	if posix {
+		if lock.Typ == syscall.F_UNLCK {
+			generation = n.mount.possiblePOSIXLock(key)
+		} else {
+			n.mount.notePOSIXLock(key)
+		}
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: lockRequest(n.item.GetToken(), owner, lock, flags), Wait: wait, Unlock: lock.Typ == syscall.F_UNLCK}}}
 	if !wait {
 		_, errno := n.mutate(ctx, request)
+		if errno == 0 && lock.Typ == syscall.F_UNLCK && posix {
+			n.mount.dischargePOSIXLock(key, generation)
+		}
 		return errno
 	}
 	// A blocking lock request has no operation deadline: it is defined to wait
@@ -2797,7 +2941,11 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	}
 	defer releaseBulk()
 	response, err := n.mount.callMutation(ctx, request, nil)
-	return rpcErrno(response, err)
+	errno = rpcErrno(response, err)
+	if errno == 0 && lock.Typ == syscall.F_UNLCK && posix {
+		n.mount.dischargePOSIXLock(key, generation)
+	}
+	return errno
 }
 
 func protocolOpenFlags(flags uint32) (*authoritypb.OpenFlags, syscall.Errno) {

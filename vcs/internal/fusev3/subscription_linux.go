@@ -494,6 +494,23 @@ func (s *subscriptionRegistry) currentIncarnation() (uint64, time.Time, <-chan s
 	return s.incarnation, s.cacheUntil, s.horizonChanged, s.active
 }
 
+func (s *subscriptionRegistry) waitActive(ctx context.Context) error {
+	if s == nil {
+		return errors.New("fusev3: subscription registry is required")
+	}
+	for {
+		_, _, changed, active := s.currentIncarnation()
+		if active {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
 // run keeps CONTROL delivery, renewal, and cumulative withdrawal independent.
 // It returns only when the mount context ends. Every recovery iteration first
 // performs a cold cache withdrawal, so an expired incarnation is never revived.

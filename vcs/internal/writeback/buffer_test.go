@@ -832,11 +832,12 @@ func TestMountRetirementBlocksNewIdentitiesAndCompetingRetirements(t *testing.T)
 func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	started := make(chan Entry, 1)
 	release := make(chan struct{})
+	transportErr := errors.New("injected retryable transport failure")
 	flusher := flusherFunc(func(ctx context.Context, _ Identity, entry Entry) (uint64, error) {
 		started <- entry
 		select {
 		case <-release:
-			return 50, nil
+			return 0, transportErr
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
@@ -854,6 +855,8 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	close(release)
 	if err := await(t, result, "dropped flush"); !errors.Is(err, ErrLost) {
 		t.Fatalf("FlushIdentity error = %v, want ErrLost", err)
+	} else if errors.Is(err, transportErr) {
+		t.Fatalf("rebinding loss was hidden by transport error: %v", err)
 	}
 	assertStats(t, b, Stats{LossSequence: 1})
 	assertRead(t, b, id, 0, 7, []byte("clean!!"), []byte("clean!!"))
@@ -872,6 +875,22 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	// Late cumulative notifications for the dropped operation must be harmless.
 	b.VisibleSequence(50)
 	b.DurableSequence(50)
+}
+
+func TestFenceAdmissionsInterruptsDurabilityWait(t *testing.T) {
+	b := newTestBuffer(t, &recordingFlusher{})
+	id := testIdentity(15)
+	cut := mustWrite(t, b, id, 0, "undurable")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.waitDurable(context.Background(), &id, cut) }()
+	assertBlocked(t, done, "durability wait before fence")
+	b.FenceAdmissions()
+	if err := await(t, done, "fenced durability wait"); !errors.Is(err, ErrLost) {
+		t.Fatalf("waitDurable error = %v, want ErrLost", err)
+	}
 }
 
 func TestFlushCancellationRetainsStableRetry(t *testing.T) {
@@ -1532,12 +1551,13 @@ func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) 
 			return 0, ctx.Err()
 		}
 	})
-	b := newTestBuffer(t, flusher)
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 8 << 20, MaxEntries: 256, FlushInterval: -1, MaxFlushIdentities: 2})
 	for i := 0; i < 96; i++ {
 		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
 	}
 	b.trigger()
-	await(t, entered, "background worker")
+	await(t, entered, "first background worker")
+	await(t, entered, "second background worker")
 	assertBlocked(t, entered, "background fanout beyond worker bound")
 	cut := mustWrite(t, b, explicit, 0, "priority")
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -1551,7 +1571,7 @@ func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) 
 	b.trigger()
 	close(release)
 	seen := false
-	for range 96 {
+	for range 95 {
 		if id := await(t, entered, "remaining background work"); id == later {
 			seen = true
 		}

@@ -778,3 +778,33 @@ and 72 GETATTRs. Cold Git issued 20,140 LOOKUPs; warm Git issued two. The peer
 workload's 130,308 RECLAIMs continue to dominate its request count. These
 measurements include profiling overhead and do not isolate the small G3b
 Authority correctness changes from run-to-run host variance.
+
+## G3 client final baseline
+
+The final G3a client baseline ran alone on Linux 6.8.0-100-generic. All baseline
+subtests passed in 116.27 seconds. The focused wrapper exited 70 only because its
+test filter deliberately omitted the full privileged inventory; the subsequent
+unfiltered `verify-local.sh --full` passed all 76 required XFS/FUSE tests. Log:
+`/tmp/cv2-g3a-final-baseline.log`.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---|---:|---:|---:|---:|
+| install, 1 worker | direct-xfs | 0.579639 | 0 | 0.000000 | 0.000000 |
+| install, 8 workers | direct-xfs | 0.330761 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker | portablefs | 21.825695 | 83,060 | 1.977619 | 1.964667 |
+| install, 8 workers | portablefs | 11.694983 | 83,161 | 1.980024 | 1.967095 |
+| git-status-cold | direct-xfs | 0.007606 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006981 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.921703 | 40,628 | 2.031400 | 1.026050 |
+| git-status-warm | portablefs | 2.232928 | 20,471 | 1.023550 | 0.018150 |
+| two-mount-write-list-read | direct-xfs | 0.039458 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.206865 | 112,028 | 28.007000 | 3.121750 |
+
+The one-worker install issued 40,000 CREATEs and WRITEs, 2,000 MKDIRs,
+512 `CloseBatch`/`DelegationRelease` pairs, and 22 barriers. The eight-worker
+install issued the same CREATE/WRITE/MKDIR core, 313 close/release pairs,
+13 barriers, 213 LOOKUP/RECLAIM pairs, and 88 GETATTRs. Compared with the G2
+intermediate baseline, PortableFS install wall time fell from 34.664636 to
+21.825695 seconds with one worker and from 15.408795 to 11.694983 seconds with
+eight. The bounded background pool preserves per-identity order; these figures
+are one machine observation rather than a general throughput claim.

@@ -62,10 +62,11 @@ Buffer supplies extent overlays, coalescing, cuts, and per-file application
 ordering. Its flusher sends at most the smaller of 1 MiB and the negotiated
 write limit per WRITE, with the exact delegation id and generation on WRITE
 and SETATTR. Split entries retain acknowledged-prefix progress across definite
-transient failures. Explicit flushes of different identities remain concurrent; background timer/cap
-work uses one worker matching the Authority flush lane. Deferred close admission
-is bounded, and close batches apply all files before waiting for durability. Completed
-replay records retire at the durable prefix.
+transient failures. Explicit flushes of different identities remain concurrent;
+background timer/cap work uses a bounded worker pool while preserving
+per-identity order. Deferred close admission is bounded. Close batches wait for
+application and release visibility ownership without waiting for durability;
+completed replay records remain retained until the durable prefix advances.
 
 Pure Authority mounts negotiate READDIRPLUS. Each 256-entry Authority page
 admits daemon name and attribute payloads under its subscription stamp while
@@ -122,8 +123,9 @@ A mount-root OPENDIR records the mount loss sequence. FSYNCDIR on that exact
 handle flushes a Buffer cut, sends Barrier with the Authority application ticket,
 and waits for its durable prefix. Clean detach also performs a bounded barrier
 before stopping the buffer when retained entries or non-durable tickets remain.
-FSYNCDIR returns EIO if the barrier fails or loss
-advanced since OPENDIR. FUSE_SYNCFS is not the completion mechanism.
+FSYNCDIR returns EIO if the barrier fails or a generic loss advanced since
+OPENDIR. A definite pre-apply capacity loss retains its original ENOSPC,
+EDQUOT, or EFBIG instead. FUSE_SYNCFS is not the completion mechanism.
 
 ## Epoch replacement
 

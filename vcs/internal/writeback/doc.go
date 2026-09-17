@@ -84,6 +84,10 @@
 // cap is full. Background transient errors retain the batch for the next timer
 // or explicit retry; explicit flushes return wrapped errors. A permanent
 // rejection (including stale generation) requires Drop; record its report.
+// If Drop rebinds an in-flight batch before its transport returns, FlushIdentity
+// returns the recorded loss (ErrLost, or a preserved capacity errno) even when
+// that transport also failed: retryable transport status cannot describe data
+// whose retained generation no longer exists.
 // Never synchronously reenter a flush for the same identity from Flush.
 //
 // Drop fences results of an in-flight flush, reports retained bytes by identity,

@@ -329,7 +329,8 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		ordinaryLimit -= volumeserver.OrderedFlushWindow
 		base := split - volumeserver.OrderedFlushWindow
 		orderedPermits = make(chan struct{}, volumeserver.OrderedFlushWindow)
-		orderedSlots, orderedBase = slots[base:split], base
+		orderedSlots = slots[base:split]
+		orderedBase = base
 		split = base
 	}
 	blockingBase := cfg.ReplaySlots - uint32(blockingLimit)

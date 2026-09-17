@@ -1177,6 +1177,14 @@ func (r *rawFileSystem) commitDirPlusLookupTransaction(ctx context.Context) erro
 	return nil
 }
 
+func (r *rawFileSystem) abortDirPlusLookupTransaction(ctx context.Context) {
+	publication := replyPublicationFromContext(ctx)
+	r.mu.Lock()
+	completion := r.settleDirPlusLookupTransactionLocked(publication, false)
+	r.mu.Unlock()
+	r.finishDirPlusLookupCompletion(completion)
+}
+
 // settleDirPlusLookupTransactionLocked transfers the staged lookup references
 // to the kernel only when a complete successful page reached /dev/fuse. Cache
 // validity is governed separately by the exact reply-local leases; lookup and
@@ -2667,8 +2675,12 @@ func (r *rawFileSystem) discardUnpublishedFileHandle(ctx context.Context, id uin
 // this mount has: a refused release means the two sides no longer agree about
 // who owns the object.
 func (r *rawFileSystem) closeOrphanedFile(ctx context.Context, handle *fileHandle) {
-	if errno := handle.close(ctx, 0, false); errno != 0 {
-		r.mount.cleanupFailed("open-file close", errno)
+	if outcome := handle.closeForCleanup(ctx, 0, false); outcome.failed() {
+		r.mount.cleanupFailed("open-file close", outcome, func() {
+			handle.stale.Store(true)
+			handle.node.stale.Store(true)
+			r.mount.delegations.failCleanupIdentity(handle.node.item.GetStableIdentity(), "orphaned file cleanup refused")
+		})
 	}
 }
 
@@ -2818,6 +2830,7 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 	// Epoch recovery retired this capability; closing it on the new session
 	// cannot release any old resource and must not revoke the recovered mount.
 	if handle.file.stale.Load() || handle.file.node.epochStale.Load() {
+		handle.file.node.mount.forgetPOSIXLock(handle.file.node.posixLockKey(input.LockOwner))
 		return
 	}
 	// RELEASE has no reply, so the kernel has already forgotten this file
@@ -2825,8 +2838,12 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 	// holding the open file description and its resources.opens entry for the
 	// rest of the session, and the only symptom would be later open() calls
 	// failing with an admission error that names nothing.
-	if errno := handle.file.close(ctx, input.LockOwner, input.ReleaseFlags&fuse.FUSE_RELEASE_FLOCK_UNLOCK != 0); errno != 0 {
-		r.mount.cleanupFailed("open-file close", errno)
+	if outcome := handle.file.closeForCleanup(ctx, input.LockOwner, input.ReleaseFlags&fuse.FUSE_RELEASE_FLOCK_UNLOCK != 0); outcome.failed() {
+		r.mount.cleanupFailed("open-file close", outcome, func() {
+			handle.file.stale.Store(true)
+			handle.file.node.stale.Store(true)
+			r.mount.delegations.failCleanupIdentity(handle.file.node.item.GetStableIdentity(), "released file cleanup refused")
+		})
 	}
 }
 
@@ -3443,15 +3460,15 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 		// twice or not at all across the reply boundary.
 		dir, ok := r.path(record)
 		if !ok {
-			if errno := handle.close(ctx); errno != 0 {
-				r.mount.cleanupFailed("open-directory close", errno)
+			if outcome := handle.closeForCleanup(ctx); outcome.failed() {
+				r.mount.cleanupFailed("open-directory close", outcome, func() { handle.stale.Store(true); handle.node.stale.Store(true) })
 			}
 			return fuse.EIO
 		}
 		local, errno := r.mergedRoots(dir)
 		if errno != 0 {
-			if errno := handle.close(ctx); errno != 0 {
-				r.mount.cleanupFailed("open-directory close", errno)
+			if outcome := handle.closeForCleanup(ctx); outcome.failed() {
+				r.mount.cleanupFailed("open-directory close", outcome, func() { handle.stale.Store(true); handle.node.stale.Store(true) })
 			}
 			return fuse.Status(errno)
 		}
@@ -3459,8 +3476,8 @@ func (r *rawFileSystem) OpenDir(_ <-chan struct{}, input *fuse.OpenIn, out *fuse
 	}
 	id, ok := r.addHandle(record, &handleRecord{dir: handle})
 	if !ok {
-		if errno := handle.close(ctx); errno != 0 {
-			r.mount.cleanupFailed("open-directory close", errno)
+		if outcome := handle.closeForCleanup(ctx); outcome.failed() {
+			r.mount.cleanupFailed("open-directory close", outcome, func() { handle.stale.Store(true); handle.node.stale.Store(true) })
 		}
 		return fuse.EIO
 	}
@@ -3539,6 +3556,12 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		return fuse.EIO
 	}
 	attached = true
+	ready := false
+	defer func() {
+		if !ready {
+			r.abortDirPlusLookupTransaction(ctx)
+		}
+	}()
 	candidates := make([]dirPlusCandidate, 0, 32)
 	emitted := 0
 	var page dirPlusPageBoundary
@@ -3589,6 +3612,7 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 	if err := r.commitDirPlusLookupTransaction(ctx); err != nil {
 		return fuse.EIO
 	}
+	ready = true
 	return fuse.OK
 }
 
@@ -3640,8 +3664,8 @@ func (r *rawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 	if handle.dir.stale.Load() || handle.dir.node.epochStale.Load() {
 		return
 	}
-	if errno := handle.dir.close(ctx); errno != 0 {
-		r.mount.cleanupFailed("open-directory close", errno)
+	if outcome := handle.dir.closeForCleanup(ctx); outcome.failed() {
+		r.mount.cleanupFailed("open-directory close", outcome, func() { handle.dir.stale.Store(true); handle.dir.node.stale.Store(true) })
 	}
 }
 

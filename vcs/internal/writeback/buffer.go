@@ -327,6 +327,13 @@ func (b *Buffer) IdentityLoss(id Identity) uint64 {
 	return f.lastLoss
 }
 
+func (b *Buffer) HasRetained(id Identity) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.files[id]
+	return f != nil && f.head != nil
+}
+
 // IdentityFailure returns the loss ticket and its errno as one observation.
 func (b *Buffer) IdentityFailure(id Identity, observed uint64) (uint64, syscall.Errno) {
 	b.mu.Lock()
@@ -446,12 +453,43 @@ func (b *Buffer) Stop() {
 	<-b.done
 }
 
-// The Authority has one reserved delegated-flush execution slot. A single
-// background worker avoids filling the ordinary RPC lane with timer work;
-// explicit fsync, recall and close flushes can overtake locally queued jobs.
+type backgroundFlush struct {
+	file *file
+	cut  Cut
+}
+
+// Background application uses a bounded pool so an unavailable identity does
+// not hold unrelated accepted data behind it. Explicit fsync, recall and close
+// flushes bypass the pool and can overtake locally queued jobs.
 func (b *Buffer) schedule() {
-	defer close(b.done)
-	var jobs []*file
+	jobs := make(chan backgroundFlush, b.maxFlushIdentities)
+	var workers sync.WaitGroup
+	for range b.maxFlushIdentities {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				_, err := b.FlushIdentity(b.ctx, job.file.id, job.cut)
+				if err == nil {
+					if observer, ok := b.flusher.(FlushCycleObserver); ok {
+						observer.FlushCycleCompleted(b.ctx, job.file.id)
+					}
+				}
+				b.mu.Lock()
+				job.file.scheduled = false
+				if err == nil && job.file.reschedule && job.file.accepted != nil {
+					job.file.reschedule = false
+					b.trigger()
+				}
+				b.mu.Unlock()
+			}
+		}()
+	}
+	defer func() {
+		close(jobs)
+		workers.Wait()
+		close(b.done)
+	}()
 	var tick <-chan time.Time
 	if b.interval > 0 {
 		timer := time.NewTicker(b.interval)
@@ -467,6 +505,7 @@ func (b *Buffer) schedule() {
 		}
 		b.mu.Lock()
 		cut := Cut{b.sequence, b.loss}
+		var pending []backgroundFlush
 		for _, f := range b.active {
 			if f.scheduled || f.flushing {
 				f.reschedule = true
@@ -477,28 +516,16 @@ func (b *Buffer) schedule() {
 				continue
 			}
 			f.scheduled = true
-			jobs = append(jobs, f)
+			pending = append(pending, backgroundFlush{file: f, cut: cut})
 		}
 		b.mu.Unlock()
-		// Dispatch outside the admission mutex. The scheduler itself is the
-		// single background worker; explicit flushes run independently.
-		for _, f := range jobs {
-			_, err := b.FlushIdentity(b.ctx, f.id, cut)
-			if err == nil {
-				if observer, ok := b.flusher.(FlushCycleObserver); ok {
-					observer.FlushCycleCompleted(b.ctx, f.id)
-				}
+		for _, job := range pending {
+			select {
+			case jobs <- job:
+			case <-b.ctx.Done():
+				return
 			}
-			b.mu.Lock()
-			f.scheduled = false
-			if err == nil && f.reschedule && f.accepted != nil {
-				f.reschedule = false
-				b.trigger()
-			}
-			b.mu.Unlock()
 		}
-		clear(jobs)
-		jobs = jobs[:0]
 	}
 }
 
