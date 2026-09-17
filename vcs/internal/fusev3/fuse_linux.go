@@ -126,6 +126,9 @@ type RPC interface {
 	DetachAfterUnmount(context.Context, MountAbsenceProof) error
 }
 
+// WritebackDropReport describes accepted data discarded before durability.
+type WritebackDropReport = writeback.DropReport
+
 type Config struct {
 	// MountInstanceID is the random identity created before attach. MountVolume
 	// derives the kernel source from it, so every attempt is distinguishable even
@@ -176,6 +179,9 @@ type Config struct {
 	// It must not block: the same goroutine goes on to unmount and release the
 	// authority session. Persisting one small state record is what it is for.
 	OnRevoked func(RevocationReport)
+	// OnWritebackDrop receives every discarded-buffer report, including shutdown
+	// and quota failures. It must not block or call back into this mount.
+	OnWritebackDrop func(WritebackDropReport)
 }
 
 // cleanStartupFailure is an error whose failed mount attempt has no remaining
@@ -528,6 +534,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	if err != nil {
 		panic(err)
 	} // validated configuration and constant buffer bounds
+	mount.delegations.SetDropReporter(cfg.OnWritebackDrop)
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
 	return mount
 }
@@ -1099,12 +1106,19 @@ func (m *Mount) closeLocked() error {
 }
 
 func (m *Mount) flushDelegationsBeforeClose() error {
-	if m == nil || m.delegations == nil || m.revoked.Load() || m.rpc.SessionEndCause() != nil || !m.delegations.hasRetainedEntries() {
+	if m == nil || m.delegations == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
+	// A parked admission must wake before Barrier takes the frontend write lock,
+	// and no new admission may race the empty-buffer check below.
+	m.delegations.FenceAdmissions()
+	if !m.delegations.hasRetainedEntries() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), m.subscription.shutdownBudget())
 	defer cancel()
 	if err := m.delegations.Barrier(ctx, m.delegations.LossSequence()); err != nil {
+		m.delegations.DropRetained(fmt.Sprintf("session detach barrier failed: %v", err))
 		return fmt.Errorf("fusev3: flush delegated writes before session detach: %w", err)
 	}
 	return nil

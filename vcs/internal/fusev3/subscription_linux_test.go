@@ -13,6 +13,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 type subscriptionTestClock struct {
@@ -884,6 +885,29 @@ func TestCachedLookupWaitsForFinalizedReplyCacheSettlement(t *testing.T) {
 				}
 			case <-time.After(time.Second):
 				t.Fatal("cache lookup did not resume after settlement")
+			}
+		})
+	}
+}
+
+func TestSubscriptionShutdownBudgetUsesLiveHorizon(t *testing.T) {
+	now := time.Unix(1234, 0)
+	for _, test := range []struct {
+		name    string
+		active  bool
+		horizon time.Time
+		want    time.Duration
+	}{
+		{"live", true, now.Add(700 * time.Millisecond), 700 * time.Millisecond},
+		{"expired", true, now.Add(-time.Millisecond), 0},
+		{"inactive", false, now.Add(time.Second), volumeserver.SubscriptionTTL},
+		{"no horizon", true, time.Time{}, volumeserver.SubscriptionTTL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := newSubscriptionRegistryWithConfig(nil, nil, nil, subscriptionConfig{clock: &subscriptionTestClock{now: now}})
+			registry.active, registry.horizon = test.active, test.horizon
+			if got := registry.shutdownBudget(); got != test.want {
+				t.Fatalf("budget=%s, want %s", got, test.want)
 			}
 		})
 	}

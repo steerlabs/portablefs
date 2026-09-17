@@ -15,6 +15,7 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 const (
@@ -217,6 +218,20 @@ func newSubscriptionRegistryWithConfig(mount *Mount, rpc subscriptionRPC, contro
 		pauseChanged:   make(chan struct{}),
 		serveDone:      serveDone,
 	}
+}
+
+// shutdownBudget uses the Authority horizon, not the earlier cache boundary.
+// An expired live horizon still requires a barrier attempt with zero budget.
+func (s *subscriptionRegistry) shutdownBudget() time.Duration {
+	if s == nil {
+		return volumeserver.SubscriptionTTL
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.active || s.horizon.IsZero() {
+		return volumeserver.SubscriptionTTL
+	}
+	return max(time.Duration(0), s.horizon.Sub(s.config.clock.Now()))
 }
 
 func (s *subscriptionRegistry) stamp() subscriptionStamp {

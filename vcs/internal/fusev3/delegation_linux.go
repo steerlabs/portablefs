@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"sync"
 	"syscall"
@@ -118,6 +119,7 @@ type delegationManager struct {
 	closeProducers sync.WaitGroup
 	closeStopped   bool
 
+	dropReporter    func(writeback.DropReport)
 	hookMu          sync.RWMutex
 	withdrawalDrain func(context.Context, []byte) error
 	acceptedWrite   func(context.Context, []byte, int64, int64) error
@@ -1292,7 +1294,7 @@ func definiteDelegationCapacityRefusal(response *authoritypb.Response, write boo
 func (m *delegationManager) refuseBufferedMutation(s *delegationState, errno syscall.Errno) {
 	s.admission.Lock()
 	defer s.admission.Unlock()
-	m.buf.DropWithErrno(s.identity, "delegated mutation capacity refusal", errno)
+	m.reportDrop(m.buf.DropWithErrno(s.identity, "delegated mutation capacity refusal", errno))
 	generation := m.buf.Generation(s.identity)
 	clear(s.bindings)
 	if s.ref != nil {
@@ -1303,6 +1305,41 @@ func (m *delegationManager) refuseBufferedMutation(s *delegationState, errno sys
 	s.meta.Unlock()
 }
 
+func (m *delegationManager) SetDropReporter(reporter func(writeback.DropReport)) {
+	m.hookMu.Lock()
+	m.dropReporter = reporter
+	m.hookMu.Unlock()
+}
+
+func (m *delegationManager) reportDrop(report writeback.DropReport) {
+	log.Printf("portablefs: dropped delegated writeback identity=%x bytes=%d entries=%d loss_sequence=%d errno=%d reason=%q", report.Identity, report.Bytes, report.Entries, report.LossSequence, report.Errno, report.Reason)
+	m.hookMu.RLock()
+	reporter := m.dropReporter
+	m.hookMu.RUnlock()
+	if reporter != nil {
+		reporter(report)
+	}
+}
+
+// FenceAdmissions begins shutdown before inspecting its final retained cut.
+func (m *delegationManager) FenceAdmissions() {
+	m.epoch.RLock()
+	m.buf.FenceAdmissions()
+	m.epoch.RUnlock()
+}
+
+// DropRetained closes final admission before reporting each shutdown loss.
+func (m *delegationManager) DropRetained(reason string) {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	m.buf.FenceAdmissions()
+	m.frontend.Lock()
+	defer m.frontend.Unlock()
+	for _, report := range m.buf.DropAll(reason) {
+		m.reportDrop(report)
+	}
+}
+
 func (m *delegationManager) loseDelegation(s *delegationState, reason string) {
 	s.admission.Lock()
 	s.clearGrantLocked()
@@ -1310,7 +1347,7 @@ func (m *delegationManager) loseDelegation(s *delegationState, reason string) {
 	// Closing the manager admission gate before Drop is the frontend retirement
 	// boundary. Calling Buffer.BeginRetire from inside a Flusher callback would
 	// wait on the very flush which is reporting the permanent failure.
-	m.buf.Drop(s.identity, reason)
+	m.reportDrop(m.buf.Drop(s.identity, reason))
 	s.meta.Lock()
 	s.dirty = false
 	s.meta.Unlock()
@@ -1907,7 +1944,7 @@ func (m *delegationManager) EpochChanged(reason string) {
 		s.meta.Lock()
 		atRisk := s.dirty && (s.appliedCut < s.acceptedCut || s.applied == 0 || s.applied > durable)
 		if atRisk {
-			old.Drop(s.identity, reason)
+			m.reportDrop(old.Drop(s.identity, reason))
 		}
 		m.identityLoss[s.identity] = max(m.identityLoss[s.identity], old.IdentityLoss(s.identity))
 		s.meta.Unlock()

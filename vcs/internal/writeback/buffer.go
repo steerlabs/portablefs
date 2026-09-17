@@ -337,6 +337,23 @@ func (b *Buffer) Drop(id Identity, reason string) DropReport {
 func (b *Buffer) DropWithErrno(id Identity, reason string, errno syscall.Errno) DropReport {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	return b.dropLocked(id, reason, errno)
+}
+
+// DropAll reports exactly the identities that still retain non-durable records.
+func (b *Buffer) DropAll(reason string) []DropReport {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	reports := make([]DropReport, 0, len(b.active))
+	for id, f := range b.active {
+		if f.head != nil {
+			reports = append(reports, b.dropLocked(id, reason, 0))
+		}
+	}
+	return reports
+}
+
+func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) DropReport {
 	f := b.file(id)
 	b.loss++
 	f.lastLoss = b.loss

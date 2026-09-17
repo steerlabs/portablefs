@@ -1141,3 +1141,35 @@ repetitions), `go -C vcs test -race ./internal/writeback` passes. The privileged
 selection `PORTABLEFS_GO_TEST_FLAGS='-run ^Test(TransportLossInterruptsWritebackCapacityWaitAtHorizon|NamespaceRequestsRefusedWhileSubscriptionCold)$' bash scripts/xfs-fuse-integration.sh`
 passes both selected tests, including the mounted horizon at 9.03 s; wrapper
 exit 70 names the unselected inventory. Log `/tmp/cv2-g2-c2-mounted-4.log`.
+
+### C3: bound dirty shutdown by the subscription horizon and report loss
+
+Dirty shutdown attempts its barrier even after revocation or a session-end
+signal. Its budget is the remaining live Authority horizon, including zero for
+an expired horizon; an absent live horizon falls back to SubscriptionTTL. Failed
+barriers fence final admission, drop every retained identity, and emit its exact
+DropReport through Config.OnWritebackDrop and the standard log. Quota, coherence,
+and epoch drops use the same reporting path. Reports include identity, retained
+bytes and entries, loss sequence, errno, and cause.
+
+The regression retains an applied-but-not-durable write, makes Barrier unreachable,
+and exposes a preexisting terminal session cause. It fails before the change
+because shutdown returns nil without a barrier. After the change it waits through
+an 80 ms live horizon, returns DeadlineExceeded, reports one eight-byte record,
+and leaves no buffered entries. The budget table covers live, expired, inactive,
+and absent horizons. DropAll tests accepted, applied, and visible records and
+requires that repeating shutdown does not invent another loss.
+
+Validation: `/tmp/cv2-g2-c3-before.log`, `/tmp/cv2-g2-c3-after.log` (shutdown,
+clean-close, and delegation suites), `/tmp/cv2-g2-c3-budget.log` (ten repetitions
+of shutdown and budget tests), and `/tmp/cv2-g2-c3-writeback.log` from
+`go -C vcs test -race ./internal/writeback`. Linux unit binaries ran in the pinned
+Docker image. No wire fields or kernel cache policy changed.
+
+Shutdown review added `TestCloseFencesCapacityWaitBeforeBarrier`: a real manager
+admission parked at a one-entry cap prevented Barrier from acquiring its frontend
+lock. The test fails before moving the admission fence ahead of both the retained
+check and Barrier. That order also prevents a clean-buffer check from racing a
+new accepted write. The corrected close, clean-close, budget, and delegation
+suites pass (`/tmp/cv2-g2-c3-final-unit.log`); the counterexample is recorded in
+`/tmp/cv2-g2-c3-cap-before.log`.

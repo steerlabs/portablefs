@@ -1633,3 +1633,42 @@ func TestMixedLossesCannotHideUncertainDataBehindCapacityErrno(t *testing.T) {
 		})
 	}
 }
+
+func TestDropAllReportsEveryRetainedIdentity(t *testing.T) {
+	b := newTestBuffer(t, &recordingFlusher{})
+	ids := []Identity{testIdentity(94), testIdentity(95), testIdentity(96)}
+	for i, id := range ids {
+		cut := mustWrite(t, b, id, 0, "kept")
+		if i < 2 {
+			if _, err := b.FlushIdentity(t.Context(), id, cut); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	b.VisibleSequence(10)
+	if stats := b.Stats(); stats.Accepted != 1 || stats.Applied != 1 || stats.Visible != 1 {
+		t.Fatalf("retention setup=%+v", stats)
+	}
+	reports := b.DropAll("unreachable on detach")
+	if len(reports) != 3 {
+		t.Fatalf("reports=%+v", reports)
+	}
+	seen := make(map[Identity]bool)
+	for _, report := range reports {
+		if seen[report.Identity] || report.Bytes != 4 || report.Entries != 1 || report.LossSequence == 0 || report.Reason != "unreachable on detach" {
+			t.Fatalf("report=%+v", report)
+		}
+		seen[report.Identity] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			t.Fatalf("missing identity %x", id)
+		}
+	}
+	if stats := b.Stats(); stats.Bytes != 0 || stats.Entries != 0 || stats.LossSequence != 3 {
+		t.Fatalf("after drop=%+v", stats)
+	}
+	if again := b.DropAll("again"); len(again) != 0 || b.LossSequence() != 3 {
+		t.Fatalf("duplicate shutdown loss=%+v", again)
+	}
+}
