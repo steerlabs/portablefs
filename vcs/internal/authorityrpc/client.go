@@ -321,15 +321,19 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	ordinaryLimit, blockingLimit := blockingWaitLane(cfg.MaxInFlight)
 	slots := make([]clientSlot, cfg.ReplaySlots)
 	split := cfg.ReplaySlots - uint32(blockingLimit)
-	var ordered lane
+	var orderedPermits chan struct{}
+	var orderedSlots []clientSlot
+	var orderedBase uint32
 	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && ordinaryLimit >= volumeserver.OrderedFlushWindow+1 {
 		ordinaryLimit -= volumeserver.OrderedFlushWindow
 		base := split - volumeserver.OrderedFlushWindow
-		ordered = lane{permits: make(chan struct{}, volumeserver.OrderedFlushWindow), slots: slots[base:split], base: base}
+		orderedPermits = make(chan struct{}, volumeserver.OrderedFlushWindow)
+		orderedSlots = slots[base:split]
+		orderedBase = base
 		split = base
 	}
 	blockingBase := cfg.ReplaySlots - uint32(blockingLimit)
-	c := &Client{ordered: ordered,
+	c := &Client{ordered: lane{permits: orderedPermits, slots: orderedSlots, base: orderedBase},
 		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 		data:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
