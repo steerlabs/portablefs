@@ -38,8 +38,8 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 	}
 	defer finish()
 	identity := handleRecord.inode.identity[:]
-	if handle.observeLoss() {
-		return 0, fuse.EIO
+	if errno := handle.observeLoss(); errno != 0 {
+		return 0, fuse.Status(errno)
 	}
 	if err := handle.node.ensureWriteDelegation(ctx, handle); err != nil {
 		return 0, fuse.Status(delegationErrno(err))

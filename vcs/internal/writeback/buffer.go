@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -24,24 +25,26 @@ type record struct {
 	heapIndex                  int
 }
 type file struct {
-	batchStorage batch
-	entryStorage [1]Entry
-	id           Identity
-	generation   uint64
-	retiring     bool
-	head, tail   *record
-	extents      extentMap
-	size         int64
-	exact        bool
-	lastLoss     uint64
-	lost         bool
-	flushing     bool
-	pending      *batch
-	lastTruncate *record
-	accepted     *record
-	lastApplied  uint64
-	scheduled    bool
-	reschedule   bool
+	batchStorage    batch
+	entryStorage    [1]Entry
+	id              Identity
+	generation      uint64
+	retiring        bool
+	head, tail      *record
+	extents         extentMap
+	size            int64
+	exact           bool
+	lastLoss        uint64
+	lastErrno       syscall.Errno
+	lastGenericLoss uint64
+	lost            bool
+	flushing        bool
+	pending         *batch
+	lastTruncate    *record
+	accepted        *record
+	lastApplied     uint64
+	scheduled       bool
+	reschedule      bool
 }
 type Buffer struct {
 	mu                                      sync.Mutex
@@ -56,6 +59,8 @@ type Buffer struct {
 	maxBytes                                int64
 	maxEntries                              int
 	sequence, loss, token, visible, durable uint64
+	lastErrno                               syscall.Errno
+	lastGenericLoss                         uint64
 	changed                                 chan struct{}
 	retiringAll, stopped                    bool
 	flusher                                 Flusher
@@ -300,14 +305,44 @@ func (b *Buffer) IdentityLoss(id Identity) uint64 {
 	}
 	return f.lastLoss
 }
+
+// IdentityFailure returns the loss ticket and its errno as one observation.
+func (b *Buffer) IdentityFailure(id Identity, observed uint64) (uint64, syscall.Errno) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if f := b.files[id]; f != nil {
+		if f.lastGenericLoss > observed || f.lastLoss <= observed {
+			return f.lastLoss, 0
+		}
+		return f.lastLoss, f.lastErrno
+	}
+	return 0, 0
+}
+func (b *Buffer) ErrnoSince(observed uint64) syscall.Errno {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.loss > observed && b.lastGenericLoss <= observed {
+		return b.lastErrno
+	}
+	return 0
+}
 func (b *Buffer) Drop(id Identity, reason string) DropReport {
+	return b.DropWithErrno(id, reason, 0)
+}
+
+// DropWithErrno preserves a definite storage refusal for every open observer.
+func (b *Buffer) DropWithErrno(id Identity, reason string, errno syscall.Errno) DropReport {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	f := b.file(id)
 	b.loss++
 	f.lastLoss = b.loss
+	f.lastErrno, b.lastErrno = errno, errno
+	if errno == 0 {
+		f.lastGenericLoss, b.lastGenericLoss = b.loss, b.loss
+	}
 	f.lost = true
-	report := DropReport{Identity: id, Reason: reason, LossSequence: b.loss}
+	report := DropReport{Identity: id, Reason: reason, LossSequence: b.loss, Errno: errno}
 	f.extents.clear()
 	f.size = 0
 	f.exact = false
@@ -518,4 +553,11 @@ func (r *Retirement) Resume() error {
 	r.resumed = true
 	b.signal()
 	return nil
+}
+
+func recordedLossError(errno syscall.Errno) error {
+	if errno != 0 {
+		return errno
+	}
+	return ErrLost
 }

@@ -104,8 +104,13 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		}
 		b.mu.Lock()
 		if f.lastLoss > cut.LossSequence {
+			errno := f.lastErrno
+			if f.lastGenericLoss > cut.LossSequence {
+				errno = 0
+			}
+			err := recordedLossError(errno)
 			b.mu.Unlock()
-			return applied, ErrLost
+			return applied, err
 		}
 		applied = max(applied, f.lastApplied)
 		p := b.batchLocked(f, cut)
@@ -118,13 +123,13 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		b.mu.Unlock()
 		seq, err := b.flusher.Flush(ctx, id, entry)
 		b.mu.Lock()
-		if f.pending != p {
-			b.mu.Unlock()
-			return applied, ErrLost
-		}
 		if err != nil {
 			b.mu.Unlock()
 			return applied, fmt.Errorf("flush %x token %d: %w", id, entry.Token, err)
+		}
+		if f.pending != p {
+			b.mu.Unlock()
+			return applied, ErrLost
 		}
 		if seq == 0 || seq < p.applied || seq < f.lastApplied {
 			b.mu.Unlock()
@@ -246,13 +251,19 @@ func (b *Buffer) waitDurable(ctx context.Context, id *Identity, cut Cut) error {
 			f := b.files[*id]
 			if f != nil {
 				if f.lastLoss > cut.LossSequence {
-					return ErrLost
+					if f.lastGenericLoss > cut.LossSequence {
+						return ErrLost
+					}
+					return recordedLossError(f.lastErrno)
 				}
 				pending = f.head != nil && f.head.seq <= cut.Sequence
 			}
 		} else {
 			if b.loss > cut.LossSequence {
-				return ErrLost
+				if b.lastGenericLoss > cut.LossSequence {
+					return ErrLost
+				}
+				return recordedLossError(b.lastErrno)
 			}
 			for _, f := range b.active {
 				pending = pending || (f.head != nil && f.head.seq <= cut.Sequence)

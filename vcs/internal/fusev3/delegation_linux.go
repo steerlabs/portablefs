@@ -70,8 +70,6 @@ type delegationState struct {
 	dirty       bool
 }
 
-type delegationAdmissionContextKey struct{}
-
 type delegationFlushProgress struct {
 	bytes    int
 	sequence uint64
@@ -504,20 +502,16 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 		s.admission.RUnlock()
 		return writeback.Cut{}, err
 	}
-	var cut writeback.Cut
-	if syncWrite {
-		// WriteSync re-enters the manager through Flusher.Flush. The context
-		// marker lets that callback use the state protected by this read fence
-		// without recursively taking admission.RLock behind a queued writer.
-		flushCtx := context.WithValue(ctx, delegationAdmissionContextKey{}, s)
-		cut, err = b.WriteSyncWithOptions(flushCtx, id, off, data, opts)
-	} else {
-		cut, err = b.WriteWithOptions(ctx, id, off, data, opts)
-	}
+	cut, err := b.WriteWithOptions(ctx, id, off, data, opts)
 	if err == nil {
 		m.markAccepted(s, cut)
 	}
 	s.admission.RUnlock()
+	if err == nil && syncWrite {
+		// The operation lock fixes the accepted cut. Release admission before a
+		// flush can record a refusal and rebind the successor buffer generation.
+		err = b.Fsync(ctx, id)
+	}
 	if err != nil {
 		return cut, err
 	}
@@ -662,6 +656,23 @@ func (m *delegationManager) IdentityLoss(identity []byte) uint64 {
 	return max(current, historical)
 }
 
+func (m *delegationManager) IdentityFailure(identity []byte, observed uint64) (uint64, syscall.Errno) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return 0, 0
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	loss, errno := m.buf.IdentityFailure(id, observed)
+	m.mu.Lock()
+	historical := m.identityLoss[id]
+	m.mu.Unlock()
+	if historical > loss {
+		return historical, 0
+	}
+	return loss, errno
+}
+
 func (m *delegationManager) DropIdentity(identity []byte, reason string) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
@@ -775,10 +786,7 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 		return progress.sequence, nil
 	}
 	m.tokenMu.Unlock()
-	admissionHeld, _ := ctx.Value(delegationAdmissionContextKey{}).(*delegationState)
-	if admissionHeld != s {
-		s.admission.RLock()
-	}
+	s.admission.RLock()
 	binding, ok := s.bindings[entry.Generation]
 	handle := firstDelegatedHandle(s.handles)
 	// ftruncate requires a writable descriptor just like pwrite. A read-only
@@ -786,9 +794,7 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 	if entry.Kind == writeback.Write || entry.Kind == writeback.Truncate || entry.Attributes.HasSize {
 		handle = firstDelegatedHandle(s.writers)
 	}
-	if admissionHeld != s {
-		s.admission.RUnlock()
-	}
+	s.admission.RUnlock()
 	if !ok || binding.ref == nil {
 		return 0, errors.New("fusev3: writeback entry has no delegation generation binding")
 	}
@@ -835,6 +841,10 @@ func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, en
 			return 0, writeback.ErrLost
 		}
 		return 0, err
+	}
+	if errno := definiteDelegationCapacityRefusal(response, false); errno != 0 {
+		m.refuseBufferedMutation(s, errno)
+		return 0, errno
 	}
 	if err := successfulDelegationResponse(response); err != nil {
 		m.loseDelegation(s, "delegated mutation permanently refused")
@@ -887,6 +897,10 @@ func (m *delegationManager) flushWrite(ctx context.Context, s *delegationState, 
 				return 0, writeback.ErrLost
 			}
 			return 0, err
+		}
+		if errno := definiteDelegationCapacityRefusal(response, true); errno != 0 {
+			m.refuseBufferedMutation(s, errno)
+			return 0, errno
 		}
 		if err := successfulDelegationResponse(response); err != nil {
 			m.loseDelegation(s, "delegated mutation permanently refused")
@@ -1126,6 +1140,9 @@ func (m *delegationManager) Barrier(ctx context.Context, observedLoss uint64) er
 		return err
 	}
 	if lost {
+		if errno := m.buf.ErrnoSince(observedLoss); errno != 0 {
+			return errno
+		}
 		return writeback.ErrLost
 	}
 	return nil
@@ -1249,6 +1266,41 @@ func (m *delegationManager) beginRetire(ctx context.Context, s *delegationState)
 		s.retire = r
 	}
 	return r, err
+}
+
+// Only a definite, unapplied capacity refusal preserves the grant. A reply
+// with a ticket or partial write is an uncertain application, even with ENOSPC.
+func definiteDelegationCapacityRefusal(response *authoritypb.Response, write bool) syscall.Errno {
+	if response == nil || response.GetUncertain() || response.GetFailure() != 0 || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
+		return 0
+	}
+	errno := syscall.Errno(response.GetErrno())
+	if response.GetBody() != nil {
+		reply := response.GetWrite()
+		if !write || reply == nil || errno != 0 || reply.GetCommittedSize() != 0 || reply.GetAssignedOffset() != 0 || reply.GetPostAttr() != nil || reply.GetDurableSequence() != 0 || reply.GetError() >= 0 || reply.GetError() < -4095 {
+			return 0
+		}
+		errno = syscall.Errno(-reply.GetError())
+	}
+	switch errno {
+	case syscall.ENOSPC, syscall.EDQUOT, syscall.EFBIG:
+		return errno
+	}
+	return 0
+}
+
+func (m *delegationManager) refuseBufferedMutation(s *delegationState, errno syscall.Errno) {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+	m.buf.DropWithErrno(s.identity, "delegated mutation capacity refusal", errno)
+	generation := m.buf.Generation(s.identity)
+	clear(s.bindings)
+	if s.ref != nil {
+		s.bindings[generation] = delegationBinding{ref: cloneDelegationRef(s.ref), item: cloneBytes(s.item), generation: generation}
+	}
+	s.meta.Lock()
+	s.dirty = false
+	s.meta.Unlock()
 }
 
 func (m *delegationManager) loseDelegation(s *delegationState, reason string) {

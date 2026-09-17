@@ -3,6 +3,7 @@ package writeback
 import (
 	"context"
 	"errors"
+	"syscall"
 	"time"
 )
 
@@ -110,6 +111,7 @@ type Stats struct {
 }
 
 type DropReport struct {
+	Errno        syscall.Errno
 	Identity     Identity
 	Reason       string
 	Bytes        int64

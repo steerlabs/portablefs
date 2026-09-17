@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -988,14 +989,14 @@ func TestDelegationSubscriptionFenceDropsOldBufferAndAllowsColdGrant(t *testing.
 		t.Fatal("grant installed before cold subscription incarnation")
 	}
 	m.SetIncarnation(8)
-	if !existing.observeLoss() {
+	if existing.observeLoss() != syscall.EIO {
 		t.Fatal("existing handle missed loss retained across cold reset")
 	}
-	if existing.observeLoss() {
+	if existing.observeLoss() != 0 {
 		t.Fatal("existing handle reported the same retained loss twice")
 	}
 	newHandle := &fileHandle{node: n, lossObserved: m.IdentityLoss(id)}
-	if newHandle.observeLoss() {
+	if newHandle.observeLoss() != 0 {
 		t.Fatal("new handle did not start at retained identity loss")
 	}
 	if err := m.Install(id, []byte{32, 1}, []byte{32, 3}, newGrant); err != nil {
@@ -1400,5 +1401,124 @@ func TestDeferredCloseShutdownJoinsRacingEnqueues(t *testing.T) {
 		if pending != 0 || len(m.closeQueue) != 0 {
 			t.Fatalf("shutdown stranded closes: pending=%d queued=%d", pending, len(m.closeQueue))
 		}
+	}
+}
+
+type delegationRefusalRPC struct {
+	delegationFakeRPC
+	refusal *authoritypb.Response
+}
+
+func (f *delegationRefusalRPC) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	if request.GetWrite() != nil || request.GetSetAttr() != nil {
+		f.mu.Lock()
+		response := f.refusal
+		f.mu.Unlock()
+		if response != nil {
+			return response, nil
+		}
+	}
+	return f.delegationFakeRPC.CallMutation(ctx, request)
+}
+
+func TestDelegationCapacityRefusalPreservesGrantAndErrno(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.ENOSPC, syscall.EDQUOT, syscall.EFBIG} {
+		for _, operation := range []string{"write", "setattr", "sync-write"} {
+			t.Run(fmt.Sprintf("%s/%s", errno, operation), func(t *testing.T) {
+				fake := &delegationRefusalRPC{refusal: &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{Error: -int32(errno)}}}}
+				if operation == "setattr" {
+					fake.refusal = &authoritypb.Response{Errno: int32(errno)}
+				}
+				m := newDelegationTestManager(t, fake)
+				id := installDelegationForTest(t, m, 87, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+				n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: cloneBytes(id)}}
+				syncHandle, closeHandle := &fileHandle{node: n}, &fileHandle{node: n}
+				writeHandle := &fileHandle{node: n}
+				before := m.LossSequence()
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+				var err error
+				switch operation {
+				case "setattr":
+					_, err = m.Truncate(ctx, id, 5)
+				case "sync-write":
+					_, err = m.Write(ctx, id, 0, []byte("quota"), true)
+				default:
+					_, err = m.Write(ctx, id, 0, []byte("quota"), false)
+				}
+				if operation != "sync-write" {
+					if err != nil {
+						t.Fatal(err)
+					}
+					_, err = m.FlushIdentity(ctx, id)
+				}
+				if !errors.Is(err, errno) {
+					t.Fatalf("flush refusal = %v, want %v", err, errno)
+				}
+				if !m.Owns(id) {
+					t.Fatal("capacity refusal retired delegation")
+				}
+				if m.LossSequence() <= before {
+					t.Fatal("discarded write did not advance loss")
+				}
+				if got := writeHandle.observeLoss(); got != errno {
+					t.Fatalf("next write observation = %v, want %v", got, errno)
+				}
+				if got := writeHandle.observeLoss(); got != 0 {
+					t.Fatalf("repeated observation = %v", got)
+				}
+				if got := n.Fsync(ctx, syncHandle, 0); got != errno {
+					t.Fatalf("fsync = %v, want %v", got, errno)
+				}
+				if got := n.Flush(ctx, closeHandle, 0); got != errno {
+					t.Fatalf("close flush = %v, want %v", got, errno)
+				}
+				if err := m.Barrier(ctx, before); !errors.Is(err, errno) {
+					t.Fatalf("root barrier = %v, want %v", err, errno)
+				}
+				fake.mu.Lock()
+				fake.refusal = nil
+				fake.mu.Unlock()
+				if _, err := m.Write(ctx, id, 0, []byte("retry"), false); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := m.FlushIdentity(ctx, id); err != nil {
+					t.Fatalf("retained grant cannot flush successor generation: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestDelegationCapacityRefusalRequiresUnappliedReply(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response *authoritypb.Response
+	}{
+		{"coherence", &authoritypb.Response{Errno: int32(syscall.ENOSPC), Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}},
+		{"applied", &authoritypb.Response{Errno: int32(syscall.ENOSPC), AppliedSequence: 1}},
+		{"partial", &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{Error: -int32(syscall.ENOSPC), CommittedSize: 1}}}},
+		{"post attributes", &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{Error: -int32(syscall.ENOSPC), PostAttr: &authoritypb.Attr{}}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := definiteDelegationCapacityRefusal(test.response, true); got != 0 {
+				t.Fatalf("uncertain reply classified as definite capacity refusal: %v", got)
+			}
+		})
+	}
+}
+
+func TestUncertainCapacityRefusalLosesDelegation(t *testing.T) {
+	fake := &delegationRefusalRPC{refusal: &authoritypb.Response{Errno: int32(syscall.ENOSPC), Uncertain: true}}
+	m := newDelegationTestManager(t, fake)
+	id := installDelegationForTest(t, m, 88, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), id, 0, []byte("uncertain"), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.FlushIdentity(t.Context(), id); !errors.Is(err, writeback.ErrLost) {
+		t.Fatalf("uncertain flush = %v", err)
+	}
+	if m.Owns(id) || m.IdentityLoss(id) == 0 {
+		t.Fatal("uncertain quota reply preserved grant or failed to record loss")
 	}
 }

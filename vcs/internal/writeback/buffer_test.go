@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1577,5 +1578,58 @@ func TestStopCancelsBlockedBackgroundBatch(t *testing.T) {
 	await(t, done, "stop of blocked worker batch")
 	if got := b.Stats().Entries; got != 96 {
 		t.Fatalf("Stop discarded retained entries: %d", got)
+	}
+}
+
+func TestCapacityRefusalKeepsErrnoAcrossDropDuringFlush(t *testing.T) {
+	var b *Buffer
+	var report DropReport
+	b = newTestBuffer(t, flusherFunc(func(_ context.Context, id Identity, _ Entry) (uint64, error) {
+		report = b.DropWithErrno(id, "full", syscall.ENOSPC)
+		return 0, syscall.ENOSPC
+	}))
+	id := testIdentity(91)
+	cut := mustWrite(t, b, id, 0, "dirty")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("flush = %v", err)
+	}
+	if report.Errno != syscall.ENOSPC || report.Bytes != 5 || report.Entries != 1 || report.LossSequence != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	loss, errno := b.IdentityFailure(id, 0)
+	if loss != 1 || errno != syscall.ENOSPC || b.ErrnoSince(0) != syscall.ENOSPC || b.ErrnoSince(1) != 0 {
+		t.Fatalf("failure = %d/%v", loss, errno)
+	}
+	report = b.Drop(id, "fenced")
+	loss, errno = b.IdentityFailure(id, 0)
+	if loss != 2 || errno != 0 || report.Errno != 0 || b.ErrnoSince(0) != 0 {
+		t.Fatalf("fence failure = %d/%v", loss, errno)
+	}
+}
+
+func TestMixedLossesCannotHideUncertainDataBehindCapacityErrno(t *testing.T) {
+	for _, capacityFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint(capacityFirst), func(t *testing.T) {
+			b := newTestBuffer(t, &recordingFlusher{})
+			id := testIdentity(92)
+			if capacityFirst {
+				b.DropWithErrno(id, "full", syscall.ENOSPC)
+				b.Drop(id, "coherence")
+			} else {
+				b.Drop(id, "coherence")
+				b.DropWithErrno(id, "full", syscall.ENOSPC)
+			}
+			if loss, errno := b.IdentityFailure(id, 0); loss != 2 || errno != 0 {
+				t.Fatalf("mixed identity failure = %d/%v", loss, errno)
+			}
+			if !capacityFirst {
+				if loss, errno := b.IdentityFailure(id, 1); loss != 2 || errno != syscall.ENOSPC {
+					t.Fatalf("capacity after observed coherence loss = %d/%v", loss, errno)
+				}
+			}
+			if got := b.ErrnoSince(0); got != 0 {
+				t.Fatalf("capacity errno %v hid an unobserved coherence loss", got)
+			}
+		})
 	}
 }

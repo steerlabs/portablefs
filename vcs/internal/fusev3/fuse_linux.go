@@ -1600,8 +1600,8 @@ func (n *node) Fsync(ctx context.Context, handle *fileHandle, flags uint32) sysc
 	if handle.stale.Load() || n.stale.Load() {
 		return syscall.EIO
 	}
-	if handle.observeLoss() {
-		return syscall.EIO
+	if errno := handle.observeLoss(); errno != 0 {
+		return errno
 	}
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
 		return bufferErrno(n.mount.delegations.Fsync(ctx, n.item.GetStableIdentity(), flags&fsyncDataOnly != 0))
@@ -1614,23 +1614,32 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	if handle == nil {
 		return syscall.EBADF
 	}
-	if handle.stale.Load() || n.stale.Load() || handle.observeLoss() {
+	if handle.stale.Load() || n.stale.Load() {
 		return syscall.EIO
+	}
+	if errno := handle.observeLoss(); errno != 0 {
+		return errno
 	}
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Flush{Flush: &authoritypb.FlushRequest{Handle: cloneBytes(handle.token), LockOwner: lockOwner}}})
 	return errno
 }
 
-func (h *fileHandle) observeLoss() bool {
+func (h *fileHandle) observeLoss() syscall.Errno {
 	if h == nil || h.node == nil || h.node.mount == nil {
-		return false
+		return 0
 	}
 	h.lossMu.Lock()
 	defer h.lossMu.Unlock()
-	loss := h.node.mount.delegations.IdentityLoss(h.node.item.GetStableIdentity())
+	loss, errno := h.node.mount.delegations.IdentityFailure(h.node.item.GetStableIdentity(), h.lossObserved)
 	lost := loss != h.lossObserved
 	h.lossObserved = loss
-	return lost
+	if !lost {
+		return 0
+	}
+	if errno != 0 {
+		return errno
+	}
+	return syscall.EIO
 }
 
 func (n *node) Release(ctx context.Context, handle *fileHandle) syscall.Errno {

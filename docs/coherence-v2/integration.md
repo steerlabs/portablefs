@@ -1073,3 +1073,39 @@ producer inventory pass in the pinned Docker image. Logs:
 `CGO_ENABLED=0 GOOS=linux go -C vcs test -c`; selected tests were
 `^Test.*(Source|Gate|CreateReply|UnrelatedWrite)` and
 `^TestCoherenceChangeCoordinates$`.
+
+### C1: preserve definite capacity errors through delegated writeback
+
+Definite unapplied ENOSPC, EDQUOT, and EFBIG refusals now discard the affected
+buffer with its exact errno and retain the delegation. Classification handles
+both top-level errno and the stock WRITE negative-error envelope; partial or
+applied replies remain uncertain failures. DropReport records errno, and paired
+identity loss/errno observations preserve it for each open handle and the root
+barrier. The buffer no longer overwrites a flusher's refusal with generic loss
+when that callback dropped its records. The retained grant is rebound to the
+buffer's successor generation so a later write can succeed.
+
+Synchronous writes release the admission read fence before flushing, while the
+per-identity operation lock preserves their cut. This lets a flush failure take
+the admission write lock to retire or rebind the generation without self-wait.
+The regression matrix covers all three errnos for WRITE, SETATTR-size, and
+synchronous WRITE, next-write observation, close FLUSH, FSYNC, root barrier, loss
+advance, and a successful successor write. Before the fix ordinary WRITE and
+SETATTR rows fail with generic lost-buffer errors. Afterward all delegation
+tests pass in the pinned Docker image, and the writeback suite passes with race
+detection. Logs: `/tmp/cv2-g2-c1-before.log`,
+`/tmp/cv2-g2-c1-delegations.log`, `/tmp/cv2-g2-c1-writeback.log`.
+Exact commands: cross-compiled fusev3 binary with `-test.run '^TestDelegation'`,
+and `go -C vcs test -race ./internal/writeback`. The separate C8 coherence-rejection
+regression follows in its requested order; drop-report delivery is C3.
+
+Review added two boundary checks before this commit: an uncertain ENOSPC reply
+must retire the delegation, and a later quota error cannot hide a generic loss
+newer than an observer's cut. Per-identity and mount loss records retain the
+latest generic-loss ticket as well as the latest errno; generic loss takes
+precedence until observed. The mixed-loss test fails with the first implementation
+and passes with that correction. Quota rebinding also removes obsolete generation
+bindings. The broader unprivileged FUSE run passed after excluding only
+`TestKernelFUSEProbeCompletesInit`, whose required fusermount executable is absent
+from the base Go image; mounted tests self-skipped there. This is unit evidence,
+not a replacement for the unchanged privileged final gate.
