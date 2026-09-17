@@ -3976,3 +3976,55 @@ func TestCachelessReaderAttachRequiresExactlyReadAccess(t *testing.T) {
 		}
 	}
 }
+
+func TestReadOnlyAttachCompatibilityWriterExclusion(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		profile  authoritypb.FrontendProfile
+		excluded bool
+	}{
+		{"fskit", authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR, true},
+		{"cacheless", authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
+			authorizer.access = volumeserver.AccessRead
+			request := fskitAttachRequest(81).GetAttach()
+			request.FrontendProfile = tc.profile
+			if !tc.excluded {
+				request.FskitCachedNameCapacity, request.FskitRepairBudgetMillis = 0, 0
+				request.FskitNamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
+			}
+			_, _, proof := attachAndActivateHandler(t, h, ctx, 81, request)
+			var id volumeserver.SessionID
+			copy(id[:], proof.GetId())
+			h.resourcesMu.Lock()
+			commitment := h.resources[id].commitment
+			h.resourcesMu.Unlock()
+			if commitment.CompatibilityWriter != tc.excluded {
+				t.Fatalf("read-only commitment exclusion=%v, want %v", commitment.CompatibilityWriter, tc.excluded)
+			}
+			err := h.Visibility.CheckCompatibilityWriter(volumeserver.SessionID{0x77})
+			if tc.excluded {
+				if !errors.Is(err, volumeserver.ErrCompatibilityWriterLease) {
+					t.Fatalf("read-only FSKit writer admission=%v, want compatibility exclusion", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("cacheless reader excluded Linux writer: %v", err)
+			}
+			authorizer.access = volumeserver.AccessRead | volumeserver.AccessWrite
+			writer := fskitAttachRequest(91).GetAttach()
+			writer.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+			writer.FskitCachedNameCapacity, writer.FskitRepairBudgetMillis = 0, 0
+			writer.FskitNamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
+			_, _, writerProof := attachAndActivateHandler(t, h, ctx, 91, writer)
+			var writerID volumeserver.SessionID
+			copy(writerID[:], writerProof.GetId())
+			if err := h.Visibility.CheckCompatibilityWriter(writerID); err != nil {
+				t.Fatalf("concurrent activated Linux writer excluded: %v", err)
+			}
+		})
+	}
+}

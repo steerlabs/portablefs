@@ -1251,3 +1251,14 @@ The existing runtime passes (`/tmp/cv2-g2-c9.log`). An overlay bypassing
 flushNamespaceDependencies fails all four rows (`/tmp/cv2-g2-c9-fault.log`). Both
 Linux binaries ran in the pinned Docker image with
 `-test.run '^TestV7F4RenameFlushesBeforeMutation$'`.
+
+### C10: attach profiles determine compatibility exclusion
+
+The actual Attach/Activate path now has a read-only FSKit row requiring the
+compatibility-writer commitment and an EBUSY writer exclusion. A read-only
+CACHELESS_READER row requires a false commitment, permits a concurrent read/write
+Linux Attach/Activate, and leaves its writer admission open. Existing production
+behavior passes (`/tmp/cv2-g2-c10.log`). An overlay removing the FSKit commitment
+fails the positive row (`/tmp/cv2-g2-c10-fault.log`). Linux binaries ran in the
+pinned Docker image with
+`-test.run '^TestReadOnlyAttachCompatibilityWriterExclusion$'`.
