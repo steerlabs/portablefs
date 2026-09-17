@@ -1023,3 +1023,14 @@ passes afterward in the pinned Docker image. Logs:
 `/tmp/cv2-g2-r8-before.log`, `/tmp/cv2-g2-r8-after.log`; the binary was built with
 `CGO_ENABLED=0 GOOS=linux go -C vcs test -c` and executed with
 `-test.run '^TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins$' -test.v`.
+
+### R9: auto-ack requires an empty adapter queue
+
+Internal coordinator advances retire only when the wire withdrawal prefix is
+complete and the adapter queue is empty. The new test invokes that action
+against a real coordinator and checks WaitWithdrawn: a queued change with equal
+wire cursors must still block, as must a delivered unacknowledged change; a
+drained acknowledged position completes. The queued row fails before the queue
+guard and passes after it. Logs `/tmp/cv2-g2-r9-before.log` and
+`/tmp/cv2-g2-r9-after.log`, using the cross-compiled authorityrpc test binary in
+the pinned Docker image with `-test.run '^TestCoherenceControlAutoAckRequiresDrainedQueue$' -test.v`.

@@ -486,11 +486,9 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 		// advances remain through this cursor. Retire them so source-only
 		// traffic cannot overrun its own subscription log. Delegation cuts
 		// retain their separate explicit completion obligation.
-		if session.changeAcked == session.changeDelivered {
-			if err := h.Coherence.Ack(token, cursor); err != nil {
-				state.mu.Unlock()
-				return h.coherenceError(requestID, err)
-			}
+		if err := h.retireCoherenceAdvancesLocked(session); err != nil {
+			state.mu.Unlock()
+			return h.coherenceError(requestID, err)
 		}
 		// The sole active poll owns this bounded batch. Wire events and replay
 		// have independent storage, and the queue is fully drained here.
@@ -923,5 +921,14 @@ func (h *VolumeHandler) forgetCoherenceSession(id volumeserver.SessionID) error 
 	delete(state.sessions, id)
 	state.mu.Unlock()
 	h.forgetCoherenceApplications(id)
+	return nil
+}
+
+// retireCoherenceAdvancesLocked acknowledges only coordinator positions with
+// no remaining wire withdrawal obligation. The control-state mutex is held.
+func (h *VolumeHandler) retireCoherenceAdvancesLocked(session *coherenceControlSession) error {
+	if len(session.queued) == 0 && session.changeAcked == session.changeDelivered {
+		return h.Coherence.Ack(session.token, session.coordinatorCursor)
+	}
 	return nil
 }

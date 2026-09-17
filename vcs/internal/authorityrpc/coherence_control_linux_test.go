@@ -878,3 +878,39 @@ func TestCoherencePollReusesBoundedStorageWithoutAliasingReplies(t *testing.T) {
 		}
 	}
 }
+
+func TestCoherenceControlAutoAckRequiresDrainedQueue(t *testing.T) {
+	for _, state := range []string{"queued", "unacknowledged", "drained"} {
+		t.Run(state, func(t *testing.T) {
+			h, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+			_, token := subscribeCoherenceControlTest(t, h, volumeserver.SessionID{1})
+			position := coordinator.OnCommit([]volumeserver.ChangeEntry{{VolumeVersion: 1, Kind: volumeserver.AttributesChanged, Identity: [16]byte{1}}})
+			events, err := coordinator.Poll(t.Context(), token, 0, nil, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := &coherenceControlSession{token: token, coordinatorCursor: position}
+			switch state {
+			case "queued":
+				session.queued = events
+			case "unacknowledged":
+				session.changeDelivered = 1
+			case "drained":
+				session.changeDelivered, session.changeAcked = 1, 1
+			}
+			if err := h.retireCoherenceAdvancesLocked(session); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+			defer cancel()
+			err = coordinator.WaitWithdrawn(ctx, position, volumeserver.SessionID{})
+			if state == "drained" {
+				if err != nil {
+					t.Fatalf("drained position not retired: %v", err)
+				}
+			} else if err == nil {
+				t.Fatalf("%s change acknowledged without wire withdrawal", state)
+			}
+		})
+	}
+}
