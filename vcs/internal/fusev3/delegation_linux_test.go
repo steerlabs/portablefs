@@ -1385,10 +1385,14 @@ func TestDeferredCloseBacklogBlocksNewHandleAdmissionUntilCleanup(t *testing.T) 
 			t.Fatal(err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	started := time.Now()
 	if err := m.waitCloseCapacity(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("new handle bypassed deferred-close backpressure: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 100*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("close-cap admission bound = %s, want internal relief before caller deadline", elapsed)
 	}
 	once.Do(func() { close(release) })
 	ctx, cancel = context.WithTimeout(t.Context(), time.Second)
@@ -1408,6 +1412,27 @@ func TestDeferredCloseBacklogBlocksNewHandleAdmissionUntilCleanup(t *testing.T) 
 			t.Fatalf("pending closes did not retire: %d", pending)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDeferredCloseBatchUsesRequestDeadline(t *testing.T) {
+	fake := &delegationFakeRPC{block: make(chan struct{})}
+	m, err := newDelegationManager(fake, 50*time.Millisecond, 7, writeback.Options{FlushInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	if err := m.QueueClose(delegationTestIdentity(18), delegationTestToken(18, 2), 0, false); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	waitUntil(t, time.Second, "deadline-scoped deferred close", func() bool {
+		m.closeMu.Lock()
+		defer m.closeMu.Unlock()
+		return m.closePending == 0
+	})
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("deferred close exceeded request deadline: %s", elapsed)
 	}
 }
 

@@ -1663,10 +1663,21 @@ func (m *delegationManager) CloseHandle(ctx context.Context, identity, handle []
 // cleanup must remain able to flush and release the handles it already owns.
 const deferredCloseAdmissionLimit = 256
 
+func deferredCloseReliefBound(requestTimeout time.Duration) time.Duration {
+	const maximum = time.Second
+	bound := requestTimeout / 4
+	if bound <= 0 || bound > maximum {
+		return maximum
+	}
+	return bound
+}
+
 func (m *delegationManager) waitCloseCapacity(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
+	waitCtx, cancel := context.WithTimeout(ctx, deferredCloseReliefBound(m.timeout))
+	defer cancel()
 	m.closeMu.Lock()
 	defer m.closeMu.Unlock()
 	for m.closePending >= deferredCloseAdmissionLimit {
@@ -1678,8 +1689,8 @@ func (m *delegationManager) waitCloseCapacity(ctx context.Context) error {
 		var err error
 		select {
 		case <-changed:
-		case <-ctx.Done():
-			err = ctx.Err()
+		case <-waitCtx.Done():
+			err = waitCtx.Err()
 		case <-m.ctx.Done():
 			err = writeback.ErrClosed
 		}
@@ -1810,7 +1821,9 @@ func (m *delegationManager) processCloseBatch(batch []delegationClose) {
 	}()
 	// A background close retains its exact replay identity through an outage.
 	// The queue is bounded, and mount shutdown cancels this work.
-	if err := m.CloseHandles(m.ctx, batch); err != nil {
+	ctx, cancel := context.WithTimeout(m.ctx, m.timeout)
+	defer cancel()
+	if err := m.CloseHandles(ctx, batch); err != nil {
 		var cleanup delegationCleanupError
 		var finalized delegationReleaseFinalizedError
 		if errors.As(err, &cleanup) || errors.As(err, &finalized) {
