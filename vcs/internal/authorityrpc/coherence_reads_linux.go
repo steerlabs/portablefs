@@ -128,6 +128,10 @@ func (h *VolumeHandler) coherenceReadData(ctx context.Context, requestID uint64,
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
+	cacheToken, err := h.coherenceCacheToken(session)
+	if err != nil {
+		return h.coherenceError(requestID, err)
+	}
 	guard, err := h.coherenceReadAdmission(ctx, session, identity)
 	if err != nil {
 		return h.coherenceError(requestID, err)
@@ -147,6 +151,9 @@ func (h *VolumeHandler) coherenceReadData(ctx context.Context, requestID uint64,
 	n, err := h.Store.ReadAt(handle, buf, int64(request.GetOffset()))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return h.errorResponse(requestID, err, false)
+	}
+	if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Data: [][16]byte{identity}}); err != nil {
+		return h.coherenceError(requestID, err)
 	}
 	version := h.coherenceVersionNow()
 	response := h.success(requestID)
@@ -179,6 +186,10 @@ func (h *VolumeHandler) coherenceGetAttr(ctx context.Context, requestID uint64, 
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
+	cacheToken, err := h.coherenceCacheToken(session)
+	if err != nil {
+		return h.coherenceError(requestID, err)
+	}
 	guard, err := h.coherenceReadAdmission(ctx, session, identity)
 	if err != nil {
 		return h.coherenceError(requestID, err)
@@ -197,6 +208,9 @@ func (h *VolumeHandler) coherenceGetAttr(ctx context.Context, requestID uint64, 
 	}
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
+	}
+	if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Attributes: [][16]byte{identity}}); err != nil {
+		return h.coherenceError(requestID, err)
 	}
 	version := h.coherenceVersionNow()
 	response := h.success(requestID)
@@ -220,6 +234,10 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 		if err != nil {
 			return h.errorResponse(0, err, false)
 		}
+		cacheToken, err := h.coherenceCacheToken(cred.ID)
+		if err != nil {
+			return h.coherenceError(0, err)
+		}
 		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
 			probeRelease, acquireErr := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies(parentIdentity, request.GetName(), [16]byte{}))
 			if acquireErr != nil {
@@ -227,6 +245,10 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 			}
 			probe, _, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
 			if errors.Is(lookupErr, syscall.ENOENT) {
+				if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Directories: [][16]byte{parentIdentity}}); err != nil {
+					probeRelease()
+					return h.coherenceError(0, err)
+				}
 				version := h.coherenceVersionNow()
 				probeRelease()
 				response := h.success(0)
@@ -282,6 +304,12 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 				}
 				return h.errorResponse(0, lookupErr, false)
 			}
+			if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Directories: [][16]byte{parentIdentity}, Attributes: [][16]byte{identity}}); err != nil {
+				h.forgetItem(item)
+				completeRelease()
+				guard.Release()
+				return h.coherenceError(0, err)
+			}
 			version := h.coherenceVersionNow()
 			if err := h.trackItem(cred.ID, item, h.protectedChild(cred.ID, parent, request.GetName())); err != nil {
 				completeRelease()
@@ -325,6 +353,10 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			return h.errorResponse(0, syscall.EINVAL, false)
 		}
 		budget := h.readDirEntryBudget(request.GetMaxEntries())
+		cacheToken, err := h.coherenceCacheToken(cred.ID)
+		if err != nil {
+			return h.coherenceError(0, err)
+		}
 		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
 			directoryGuard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, directoryIdentity)
 			if guardErr != nil {
@@ -381,6 +413,17 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 					return h.errorResponse(0, verifyErr, false)
 				}
 				continue
+			}
+			admission := volumeserver.CacheAdmission{Directories: [][16]byte{directoryIdentity}}
+			for _, candidate := range candidates {
+				if candidate.identity != ([16]byte{}) {
+					admission.Attributes = append(admission.Attributes, candidate.identity)
+				}
+			}
+			if err := h.admitCoherenceCache(cacheToken, admission); err != nil {
+				release()
+				h.forgetDirectoryCandidates(candidates)
+				return h.coherenceError(0, err)
 			}
 			version := h.coherenceVersionNow()
 			release()

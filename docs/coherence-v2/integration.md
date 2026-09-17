@@ -1603,3 +1603,44 @@ does `go -C vcs test -race ./internal/writeback`. The new required mounted
 release/reopen. Focused wrapper exit 70 is expected for omitted gate inventory.
 Logs: `/tmp/cv2-g2-own-cache-suite.log`, `own-cache-final.log`,
 `own-cache-writeback.log`, `own-cache-mounted.log` (same `/tmp/cv2-g2-` prefix).
+
+#### G2 Part 2 item 6: target namespace waits by admitted cache facts
+
+The coordinator records separate directory, attribute and data footprints per
+exact subscription token. Reads register under their final storage dependency
+turn; mutation source gates and authoritative post-state register atomically
+with commit publication, including unchanged existing-name CREATE and MKDIR's
+new empty-directory proof. Plain READDIR also admits its attribute-bearing
+entries. A commit snapshots only subscribers that could hold affected facts;
+broadcast delivery remains unchanged. The wait checks exact tokens through ACK,
+proven cold replacement or horizon, never treating a merely fenced session as
+withdrawn. Delegation grant/recall retains its existing global withdrawal proof.
+
+Footprints are conservative sets since the cold watermark, bounded at 65,536
+identities per scope. Overflow targets all coordinates in that scope until cold
+reset; no LRU eviction and no unsafe inference from current open-handle counts.
+Cached handles carry their refill obligation through cold Subscribe, while
+server-owned close accounting now follows the session across that race. Root
+Activate attributes are not a subscription cache fact: raw starts with empty
+attribute caches and the first GETATTR samples the Authority. CACHELESS_READER
+records no footprint.
+
+Review found a cold mutation race: an old request can apply storage after its
+last token check but lose to Subscribe before commit publication. Source ownership
+now uses the exact token; that old response is a coherence-class uncertain
+refusal with no cache-bearing body, never a false definite-no-change result.
+Exact replay preserves it without applying storage twice. A cold boundary after
+commit is covered by the existing physical publication stamp/reservation fence.
+
+Validation: coordinator race suite passes; full Authority unit suite passes;
+handler admission tests cover negative/positive LOOKUP, READ, GETATTR, plain/PLUS
+READDIR, cacheless reads, unchanged CREATE, MKDIR completeness and cold read/
+mutation races. Frontend tests prove the first root GETATTR fetches fresh data.
+Forcing all subscribers into the target set fails the unrelated-cache regression
+(`/tmp/cv2-g2-footprint-fault.log`). The required mounted partition test passes:
+unrelated subscriber CONTROL loss permits MKDIR in 416.794 us; cached-parent and
+new-directory-completeness arms remain blocked until the peer heals. Total test
+0.26 seconds; focused wrapper exit 70 names omitted full-gate inventory. Logs:
+`/tmp/cv2-g2-footprint-mounted.log`, `footprint-rpc-final.log`,
+`footprint-admissions3.log`, `footprint-fuse.log`, `footprint-race3.log`
+(the latter names use the same `/tmp/cv2-g2-` prefix).

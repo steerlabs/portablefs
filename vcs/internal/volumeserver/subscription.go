@@ -110,17 +110,21 @@ type CoherenceConfig struct {
 	// acking. Overflow requires cold resubscription, but never shortens its old
 	// cache horizon: WaitWithdrawn still waits until that horizon or a cold reset.
 	MaxLogEntries int
+	// Per scope and subscription. Overflow conservatively targets every
+	// coordinate in that scope until the next proven cold subscription.
+	MaxCacheFootprint int
 }
 
 type changeSubscriber struct {
-	token               SubscriptionToken
-	acked, delivered    uint64
-	horizon             time.Time
-	fenced              bool
-	ackIndex, timeIndex int
-	loss                uint64
-	held                map[[16]byte]*delegationRecord
-	handles             map[[16]byte]uint64
+	directories, attributes, data cacheFootprint
+	token                         SubscriptionToken
+	acked, delivered              uint64
+	horizon                       time.Time
+	fenced                        bool
+	ackIndex, timeIndex           int
+	loss                          uint64
+	held                          map[[16]byte]*delegationRecord
+	handles                       map[[16]byte]uint64
 }
 
 // subscriberHeap is indexed, so renewal and ack cost O(log subscribers), with
@@ -176,6 +180,7 @@ func (h *subscriberHeap) Pop() any {
 // plus amortized reclamation of entries; lookup is O(1). Notification channels
 // are allocated only when somebody actually waits, never per appended entry.
 type CoherenceCoordinator struct {
+	maxCacheFootprint                       int
 	mu                                      sync.Mutex
 	clock                                   CoherenceClock
 	priorCacheUntil                         time.Time
@@ -195,6 +200,9 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 	if cfg.Clock == nil {
 		cfg.Clock = coherenceWallClock{}
 	}
+	if cfg.MaxCacheFootprint <= 0 {
+		cfg.MaxCacheFootprint = 65536
+	}
 	if cfg.MaxLogEntries <= 0 {
 		cfg.MaxLogEntries = 65536
 	}
@@ -202,7 +210,7 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 	if cfg.PriorLinuxCaches {
 		priorCacheUntil = cfg.Clock.Now().Add(SubscriptionTTL)
 	}
-	return &CoherenceCoordinator{priorCacheUntil: priorCacheUntil, clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
+	return &CoherenceCoordinator{maxCacheFootprint: cfg.MaxCacheFootprint, priorCacheUntil: priorCacheUntil, clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
 		// The initial storage snapshot is version 1, matching the handler. A
 		// reservation can publish a cache withdrawal before the first commit.
 		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1, watermark: 1,
@@ -250,6 +258,11 @@ func (c *CoherenceCoordinator) notificationLocked() <-chan struct{} {
 // pages does not change FOPEN_KEEP_CACHE on an existing open description. Their
 // counts remain conservative until close or permanent runtime session removal.
 func (c *CoherenceCoordinator) Subscribe(id SessionID) (SubscriptionSnapshot, error) {
+	return c.SubscribeWithCache(id, CacheAdmission{})
+}
+
+// SubscribeWithCache includes bootstrap facts in the same cut as registration.
+func (c *CoherenceCoordinator) SubscribeWithCache(id SessionID, initial CacheAdmission) (SubscriptionSnapshot, error) {
 	if id == (SessionID{}) {
 		return SubscriptionSnapshot{}, ErrSubscription
 	}
@@ -270,6 +283,10 @@ func (c *CoherenceCoordinator) Subscribe(id SessionID) (SubscriptionSnapshot, er
 	s := &changeSubscriber{token: SubscriptionToken{id, c.incarnation}, acked: c.position, delivered: c.position,
 		horizon: c.clock.Now().Add(SubscriptionTTL), ackIndex: -1, timeIndex: -1, loss: loss,
 		held: make(map[[16]byte]*delegationRecord), handles: handles}
+	s.admit(initial, c.maxCacheFootprint)
+	for identity := range handles {
+		s.data.add([][16]byte{identity}, c.maxCacheFootprint)
+	}
 	c.subscribers[id] = s
 	heap.Push(&c.acks, s)
 	heap.Push(&c.horizons, s)
@@ -559,6 +576,7 @@ func (c *CoherenceCoordinator) expireLocked() {
 }
 func (c *CoherenceCoordinator) retireSubscriberLocked(s *changeSubscriber) {
 	s.fenced = true
+	s.directories, s.attributes, s.data = cacheFootprint{}, cacheFootprint{}, cacheFootprint{}
 	if s.timeIndex >= 0 {
 		heap.Remove(&c.horizons, s.timeIndex)
 	}

@@ -72,6 +72,7 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestThousandFileInstallAmortizesDurabilityBarriers"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNewDirectoryInstallAvoidsLookupRPCs"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSameMountWritesInvalidateLiveAndReopenedCachedReaders"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalWaitsOnlyForAffectedCacheHolders"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReadDirPlusColdListingAvoidsLookupRPCs"
   # Machine-local routing must be proven against the real kernel and the real
   # authority transport. Keep the zero-RPC tests here in particular: the

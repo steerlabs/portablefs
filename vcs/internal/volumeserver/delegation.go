@@ -89,6 +89,7 @@ func (c *CoherenceCoordinator) OpenCacheCapable(token SubscriptionToken, identit
 	counts.total++
 	counts.sessions[token.Session]++
 	s.handles[identity]++
+	s.data.add([][16]byte{identity}, c.maxCacheFootprint)
 	return true, nil
 }
 func (c *CoherenceCoordinator) CloseCacheCapable(token SubscriptionToken, identity [16]byte) error {
@@ -104,6 +105,18 @@ func (c *CoherenceCoordinator) CloseCacheCapable(token SubscriptionToken, identi
 	c.closeHandlesLocked(s, identity, 1)
 	return nil
 }
+
+// CloseCacheCapableSession retires server-owned handle accounting across a
+// cold subscription. The handle belongs to the runtime session, so a token
+// captured before Subscribe must not strand its transferred reader count.
+func (c *CoherenceCoordinator) CloseCacheCapableSession(id SessionID, identity [16]byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s := c.subscribers[id]; s != nil && s.handles[identity] != 0 {
+		c.closeHandlesLocked(s, identity, 1)
+	}
+}
+
 func (c *CoherenceCoordinator) closeHandlesLocked(s *changeSubscriber, identity [16]byte, n uint64) {
 	counts := c.cacheHandles[identity]
 	counts.total -= n
@@ -212,6 +225,7 @@ func (c *CoherenceCoordinator) reserveLocked(s *changeSubscriber, identity [16]b
 	r := &delegationRecord{owner: s, ephemeral: ephemeral, grant: Delegation{ID: c.nextDelegation, Identity: identity, Holder: s.token.Session, Generation: c.nextDelegation, Mode: c.modeLocked(identity, s.token.Session), State: DelegationReserved}}
 	c.delegations[identity] = r
 	s.held[identity] = r
+	s.data.add([][16]byte{identity}, c.maxCacheFootprint)
 	var source SessionID
 	if ephemeral {
 		source = s.token.Session

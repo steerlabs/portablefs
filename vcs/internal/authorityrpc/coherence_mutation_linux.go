@@ -288,12 +288,15 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			}
 			var retainedGrantErr error
 
-			position := h.publishCoherenceCommit(req, cred.ID, identity, provisional, response, changes)
+			withdrawal := h.publishCoherenceCommitAdmitted(req, cred.ID, identity, provisional, response, changes, &token, sourceCacheAdmission(gate, response))
 			stampVisibilityTargets(changes, response.GetPostState())
 			if changes != nil {
 				err = volumeserver.ValidateMutationCompletion(changes, prepared)
 			}
-			if err == nil {
+			if !withdrawal.SourceCurrent {
+				retainedGrantErr = volumeserver.ErrSubscription
+			}
+			if err == nil && withdrawal.SourceCurrent {
 				if pin != nil && response.GetErrno() == 0 && (req.GetCreate().GetWriteIntent() || req.GetOpen().GetWriteIntent()) {
 					op := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
 					op.reservation, op.delegation, retainedGrantErr = pin.RetainDelegation()
@@ -309,10 +312,15 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 			if retainedGrantErr != nil {
 				h.discardCoherenceOpenReply(cred.ID, response)
 				response = h.coherenceError(0, retainedGrantErr)
+				if !withdrawal.SourceCurrent {
+					// Storage already ran. Without the old reply's post-state the
+					// source must fence, never resolve this as definite no-change.
+					response.Uncertain = true
+				}
 			}
 			op, _ := ctx.Value(coherenceOperationKey{}).(*coherenceOperation)
-			if position != 0 {
-				wait := func() { _ = h.Coherence.WaitWithdrawn(context.WithoutCancel(ctx), position, cred.ID) }
+			if withdrawal.Position != 0 {
+				wait := func() { _ = h.Coherence.WaitTargeted(context.WithoutCancel(ctx), withdrawal) }
 				if response.GetAppliedSequence() != 0 && (coherenceFlushReference(req) != nil || op != nil && op.delegation.ID != 0) {
 					// The response is an application receipt. Holder cut acknowledgments must
 					// be able to pass a withdrawal of the holder's pending read publication.
@@ -386,6 +394,10 @@ func coherenceDelegationProto(d volumeserver.Delegation) *authoritypb.Delegation
 }
 
 func (h *VolumeHandler) publishCoherenceCommit(req *authoritypb.Request, id volumeserver.SessionID, identity [16]byte, provisional uint64, resp *authoritypb.Response, targets []volumeserver.VisibilityTarget) uint64 {
+	return h.publishCoherenceCommitAdmitted(req, id, identity, provisional, resp, targets, nil, volumeserver.CacheAdmission{}).Position
+}
+
+func (h *VolumeHandler) publishCoherenceCommitAdmitted(req *authoritypb.Request, id volumeserver.SessionID, identity [16]byte, provisional uint64, resp *authoritypb.Response, targets []volumeserver.VisibilityTarget, source *volumeserver.SubscriptionToken, admission volumeserver.CacheAdmission) volumeserver.Withdrawal {
 	h.coherenceCommitMu.Lock()
 	defer h.coherenceCommitMu.Unlock()
 	changed := targets != nil
@@ -402,15 +414,23 @@ func (h *VolumeHandler) publishCoherenceCommit(req *authoritypb.Request, id volu
 	if w := resp.GetWrite(); w != nil {
 		_, w.DurableSequence = h.latestCoherenceDurability(id)
 	}
-	if !changed {
-		return 0
+	var entries []volumeserver.ChangeEntry
+	if changed {
+		entries = coherenceChanges(req, resp, targets, seq)
 	}
-	entries := coherenceChanges(req, resp, targets, seq)
-	position := h.Coherence.OnCommitFrom(entries, id)
+	var withdrawal volumeserver.Withdrawal
+	if source != nil {
+		withdrawal = h.Coherence.OnCommitTargeted(entries, *source, admission)
+	} else if changed {
+		withdrawal.Position = h.Coherence.OnCommitFrom(entries, id)
+	}
+	if !changed {
+		return withdrawal
+	}
 	if identity != ([16]byte{}) && (req.GetWrite() != nil || req.GetSetAttr() != nil || req.GetFallocate() != nil) {
 		resp.AppliedSequence = h.coherenceDurability.recordApplied(id, identity, seq)
 	}
-	return position
+	return withdrawal
 }
 func coherenceChanges(req *authoritypb.Request, resp *authoritypb.Response, targets []volumeserver.VisibilityTarget, version uint64) []volumeserver.ChangeEntry {
 	entries := make([]volumeserver.ChangeEntry, 0, len(targets)*2+len(resp.GetPostState().GetObjects()))

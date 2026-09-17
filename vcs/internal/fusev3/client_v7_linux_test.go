@@ -470,3 +470,26 @@ func TestV7CachedReplyTerminalizationWaitsForPhysicalWrite(t *testing.T) {
 		t.Fatal("terminalization retained cached reply ownership")
 	}
 }
+
+func TestV7RootBootstrapAttributesRequireFreshGetattr(t *testing.T) {
+	f := newStrictFixture(t)
+	// Activate's root metadata predates the subscription. It is not a cached
+	// attribute fact and must never satisfy the first kernel GETATTR.
+	f.raw.nodesByID[1].node.item.Attr.Mode = 0777
+	f.rpc.mu.Lock()
+	f.rpc.item = testItem(1, authoritypb.Attr_DIRECTORY, 0)
+	f.rpc.item.Attr.Mode = 0500
+	before := f.rpc.calls
+	f.rpc.mu.Unlock()
+	out := &fuse.AttrOut{}
+	if status := f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: 1}}, out)
+	}); status != fuse.OK {
+		t.Fatal(status)
+	}
+	f.rpc.mu.Lock()
+	defer f.rpc.mu.Unlock()
+	if f.rpc.calls != before+1 || out.Mode&0777 != 0500 {
+		t.Fatalf("bootstrap root reused: calls=%d want=%d mode=%o", f.rpc.calls, before+1, out.Mode)
+	}
+}

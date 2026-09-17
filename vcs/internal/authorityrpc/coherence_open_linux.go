@@ -32,7 +32,7 @@ func (h *VolumeHandler) coherenceAdmitOpen(id volumeserver.SessionID, handle xfs
 	resources := h.resources[id]
 	if resources == nil || resources.ended {
 		h.resourcesMu.Unlock()
-		_ = h.Coherence.CloseCacheCapable(token, identity)
+		h.Coherence.CloseCacheCapableSession(id, identity)
 		return false, volumeserver.ErrSessionExpired
 	}
 	if resources.cacheOpens == nil {
@@ -51,9 +51,7 @@ func (h *VolumeHandler) coherenceCloseAccounting(id volumeserver.SessionID, hand
 	}
 	h.resourcesMu.Unlock()
 	if identity != ([16]byte{}) {
-		if token, err := h.coherenceToken(id); err == nil {
-			_ = h.Coherence.CloseCacheCapable(token, identity)
-		}
+		h.Coherence.CloseCacheCapableSession(id, identity)
 	}
 }
 

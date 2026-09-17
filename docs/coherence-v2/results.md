@@ -399,3 +399,13 @@ previously closed cached reader, three disjoint writes produce zero immediate
 notifications and one merged range at the flush/reopen boundary. Live-reader
 writes retain a synchronous notify before successful return. These are operation
 counts, not a new full-workload latency measurement.
+
+### Targeted namespace withdrawal (item 6)
+
+With a second mount's CONTROL transport partitioned and its cache confined to
+an unrelated directory, a mounted MKDIR completes in 416.794 us. The previous
+global wait includes that subscriber until ACK or its approximately 10-second
+horizon; forcing the global target set fails the new regression. Related-parent
+and newly created-directory completeness arms still block before withdrawal.
+This is an isolated partition test, not a claim about ordinary two-mount
+throughput. Log: `/tmp/cv2-g2-footprint-mounted.log`.

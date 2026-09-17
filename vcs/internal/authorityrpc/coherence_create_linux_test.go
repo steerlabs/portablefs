@@ -111,6 +111,13 @@ func TestCoherenceCreateKeepsReplyGrantReservedThroughWithdrawal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The peer has cached this binding and its target's attributes/data. A
+	// subscription with no affected fact is intentionally outside the wait set.
+	if err := h.Coherence.AdmitCache(peer.Token, volumeserver.CacheAdmission{
+		Directories: [][16]byte{{root[0]}}, Attributes: [][16]byte{{item[0]}}, Data: [][16]byte{{item[0]}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan *authoritypb.Response, 1)
 	request := coherenceExistingCreateRequest(credential, root)
 	request.GetCreate().Flags.Truncate = true

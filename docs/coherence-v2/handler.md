@@ -105,7 +105,27 @@ range operations that shift the remaining file invalidate the whole identity.
 The handler releases storage stripes and the dependency turn before waiting on
 peer withdrawal. It uses `context.WithoutCancel` after commit so cancellation
 cannot erase the obligation. Namespace operations and synchronous data mutations
-return after WaitWithdrawn. A delegation-bearing flush returns its application
+return after a targeted withdrawal cut. Each subscription records directory,
+attribute and data facts admitted since its cold watermark. Read admissions occur
+before releasing their storage dependencies; source post-state admission and the
+exact-token target snapshot occur atomically with commit publication. Namespace
+changes target parent-directory readers, attribute changes target identity readers
+(including hard-link aliases), and data changes target identities that may retain
+pages after handle close. Unrelated subscribers still receive the broadcast but
+do not delay the syscall. Delegation grant/recall uses its existing global proof.
+
+Each footprint scope is bounded at 65,536 identities. Overflow targets every
+coordinate in that scope until a proven cold boundary; entries are never evicted
+as a performance shortcut. Footprints are conservative since-watermark sets,
+not cleared on individual ACKs. Cold subscription preserves data obligations for
+surviving cached handles. Activation metadata supplies identity only: the Linux
+root needs a fresh GETATTR before caching attributes under the subscription.
+
+A cold successor cannot inherit its predecessor's source exemption. If it wins
+before commit, the old mutation reply is refused as uncertain because storage
+may already have changed. If it wins after commit, the frontend's original
+publication stamp prevents the old reply from installing into the new cache.
+A delegation-bearing flush returns its application
 receipt first and performs the visibility wait separately; this response promises
 application, not completion of peer withdrawal. F2 must let the holder acknowledge
 a break/recall from that receipt without waiting for change withdrawal.
