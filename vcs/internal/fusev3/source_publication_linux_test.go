@@ -10,6 +10,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 type gateMutationResult struct {
@@ -702,5 +703,95 @@ func TestSourceChangedChannelIsDemandAllocated(t *testing.T) {
 	}
 	if next := r.sourceChangedWaitLocked(); next == first {
 		t.Fatal("next waiter received the previous closed channel")
+	}
+}
+
+func TestNamespaceSourceGateCoversEveryEmittedChangeKind(t *testing.T) {
+	seen := make(map[volumeserver.ChangeKind]bool)
+	for _, truncate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("truncate=%t", truncate), func(t *testing.T) {
+			f := newStrictFixture(t)
+			entry := f.lookup(t, 1, "file")
+			child := f.raw.acquire(entry.NodeId)
+			parent := f.raw.acquire(1)
+			defer f.raw.release(child)
+			defer f.raw.release(parent)
+			name := publicationNamespace{parent: parent.identity, name: "new-link"}
+			if truncate {
+				name.name = "file"
+			}
+			gate, err := namespaceSourceGate(parent.node.item, name.name, truncate, child.node.item)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease, err := f.raw.acquireSourcePublication(t.Context(), gate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer lease.release()
+			if err := lease.markAssigned(); err != nil {
+				t.Fatal(err)
+			}
+			if err := lease.attachBinding(t.Context(), name, child.identity); err != nil {
+				t.Fatal(err)
+			}
+			coordinates := map[volumeserver.ChangeKind][]publicationCoordinate{
+				volumeserver.NamespaceChanged:  {{kind: publicationNamespaceName, parent: parent.identity, name: name.name}},
+				volumeserver.DirectoryChanged:  {{kind: publicationItemEnumeration, item: parent.identity}},
+				volumeserver.AttributesChanged: {{kind: publicationItemAttributes, item: parent.identity}, {kind: publicationItemAttributes, item: child.identity}},
+			}
+			if truncate {
+				coordinates[volumeserver.DataChanged] = []publicationCoordinate{{kind: publicationItemData, item: child.identity}}
+			}
+			dir := &dirHandle{node: parent.node, page: []*authoritypb.Dirent{{Name: []byte("old")}}, eof: true}
+			f.raw.mu.Lock()
+			f.raw.handles[999] = &handleRecord{inode: parent, dir: dir}
+			for _, record := range []*inodeRecord{parent, child} {
+				f.raw.cachedAttrs[record.identity] = record
+				f.raw.cachedAttrPayloads[record.identity] = cachedAttrPayload{attr: &authoritypb.Attr{Nlink: 1}}
+			}
+			f.raw.cachedData[child.key.inode] = child
+			for kind, targets := range coordinates {
+				seen[kind] = true
+				for _, target := range targets {
+					if _, ok := lease.coordinates[target]; !ok || f.raw.sourceHolds[target] != lease || f.raw.sourcePublicationAllowedLocked(target, nil) {
+						t.Errorf("kind %v coordinate %+v is not closed by source gate", kind, target)
+					}
+				}
+			}
+			f.raw.mu.Unlock()
+			if err := lease.markCallbackPublicationReady(); err != nil {
+				t.Fatal(err)
+			}
+			dir.mu.Lock()
+			if len(dir.page) != 0 || dir.eof || dir.cursorGeneration != 1 {
+				t.Errorf("source enumeration retained page/EOF: page=%v eof=%v generation=%d", dir.page, dir.eof, dir.cursorGeneration)
+			}
+			dir.mu.Unlock()
+			f.raw.mu.Lock()
+			for _, record := range []*inodeRecord{parent, child} {
+				if f.raw.cachedAttrs[record.identity] != nil || f.raw.cachedAttrPayloads[record.identity].attr != nil {
+					t.Error("source retained stale attributes/link count")
+				}
+			}
+			if f.raw.cachedData[child.key.inode] != child {
+				t.Error("source forgot kernel data obligation")
+			}
+			f.raw.mu.Unlock()
+			lease.release()
+			f.raw.mu.Lock()
+			for _, targets := range coordinates {
+				for _, target := range targets {
+					if !f.raw.sourcePublicationAllowedLocked(target, nil) {
+						t.Errorf("coordinate %+v did not reopen", target)
+					}
+				}
+			}
+			delete(f.raw.handles, 999)
+			f.raw.mu.Unlock()
+		})
+	}
+	if len(seen) != 4 {
+		t.Fatalf("namespace change inventory = %v", seen)
 	}
 }

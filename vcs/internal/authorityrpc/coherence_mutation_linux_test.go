@@ -130,12 +130,20 @@ func TestCoherenceChangeCoordinates(t *testing.T) {
 	if len(entries) != 4 {
 		t.Fatalf("changes = %+v", entries)
 	}
+	counts := make(map[volumeserver.ChangeKind]int)
 	for _, e := range entries {
+		counts[e.Kind]++
 		if e.VolumeVersion != 8 {
 			t.Fatalf("wrong version %+v", e)
 		}
 		if e.Kind == volumeserver.DataChanged && (!e.HasRange || e.Offset != 3 || e.Length != 7) {
 			t.Fatalf("wrong range %+v", e)
+		}
+	}
+
+	for _, kind := range []volumeserver.ChangeKind{volumeserver.NamespaceChanged, volumeserver.DirectoryChanged, volumeserver.AttributesChanged, volumeserver.DataChanged} {
+		if counts[kind] != 1 {
+			t.Errorf("namespace operation change kind %v count = %d", kind, counts[kind])
 		}
 	}
 }

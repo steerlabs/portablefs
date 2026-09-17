@@ -1051,3 +1051,25 @@ coverage is claimed for their process/handle mechanisms.
 This is a rationale-only change: selected cases and expectations are identical.
 `bash -n scripts/coherence-matrix-linux.sh` passes. The initial complete matrix
 runs above exercised these unchanged filters; the final matrix remains required.
+
+### Initiator gate: cover directory enumeration as well as names
+
+The producer inventory test now names all four namespace-operation change kinds:
+namespace, directory enumeration, attributes, and data (truncating create).
+Source gates omitted the enumeration coordinate. Because the source's own stream
+omits those changes, an open directory handle could retain an old page or EOF.
+Namespace gates now drain the parent's enumeration coordinate and invalidate its
+registered directory cursors before making callback publication ready. Cursor
+locks are taken outside the inode-table lock; the source gate stays closed.
+
+The link/truncating-create table verifies all four kinds, source ownership and
+exclusion through publication, directory page/EOF retirement, parent and child
+attribute retirement (including the stale link-count regression), and retention
+of the kernel data obligation. Before the fix both rows report an uncovered
+directory coordinate and retained EOF; afterward the source/gate suite and
+producer inventory pass in the pinned Docker image. Logs:
+`/tmp/cv2-g2-source-before.log`, `/tmp/cv2-g2-source-after.log`, and
+`/tmp/cv2-g2-source-producer.log`. Test binaries were cross-compiled with
+`CGO_ENABLED=0 GOOS=linux go -C vcs test -c`; selected tests were
+`^Test.*(Source|Gate|CreateReply|UnrelatedWrite)` and
+`^TestCoherenceChangeCoordinates$`.

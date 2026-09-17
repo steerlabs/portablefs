@@ -246,6 +246,7 @@ func coordinatesForSourceGate(gate *sourcePublicationGate) (map[publicationCoord
 		}
 		name := publicationNamespace{parent: namespace.parent, name: namespace.name}
 		coordinates[publicationCoordinate{kind: publicationNamespaceName, parent: namespace.parent, name: namespace.name}] = struct{}{}
+		coordinates[publicationCoordinate{kind: publicationItemEnumeration, item: namespace.parent}] = struct{}{}
 		names[name] = namespaceBounds{attributes: namespace.attributes, data: namespace.data}
 	}
 	return coordinates, names, nil
@@ -537,22 +538,42 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 		return nil
 	}
 	l.r.mu.Lock()
-	defer l.r.mu.Unlock()
 	if l.released || l.revoked || l.ready || !l.assigned {
+		l.r.mu.Unlock()
 		return errors.New("fusev3: source publication lease has an invalid callback-publication transition")
 	}
 	if l.unresolvedAttributes != 0 || l.unresolvedData != 0 {
+		l.r.mu.Unlock()
 		return errors.New("fusev3: source callback publication retained unresolved namespace bindings")
 	}
 	// Own commits are omitted from the peer stream. Drain protects pending
 	// replies, but settled daemon attributes must also be withdrawn before the
 	// exact post-state can replace them at reply settlement. Kernel data records
 	// remain registered: they carry a separate invalidation obligation.
+	var directories []*dirHandle
 	for coordinate := range l.coordinates {
 		if coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData {
 			delete(l.r.cachedAttrs, coordinate.item)
 			delete(l.r.cachedAttrPayloads, coordinate.item)
 		}
+		if coordinate.kind == publicationItemEnumeration {
+			for _, handle := range l.r.handles {
+				if handle != nil && handle.dir != nil && handle.inode != nil && handle.inode.identity == coordinate.item {
+					directories = append(directories, handle.dir)
+				}
+			}
+		}
+	}
+	// Directory cursor locks must never nest inside the inode-table lock. The
+	// source gate stays closed while buffered pages and in-flight fetches retire.
+	l.r.mu.Unlock()
+	for _, directory := range directories {
+		directory.invalidateEnumeration()
+	}
+	l.r.mu.Lock()
+	defer l.r.mu.Unlock()
+	if l.released || l.revoked || l.ready {
+		return errors.New("fusev3: source publication ended while retiring enumeration")
 	}
 	l.ready = true
 	return nil
