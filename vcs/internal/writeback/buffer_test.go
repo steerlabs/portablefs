@@ -1548,12 +1548,13 @@ func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) 
 			return 0, ctx.Err()
 		}
 	})
-	b := newTestBuffer(t, flusher)
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 8 << 20, MaxEntries: 256, FlushInterval: -1, MaxFlushIdentities: 2})
 	for i := 0; i < 96; i++ {
 		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
 	}
 	b.trigger()
-	await(t, entered, "background worker")
+	await(t, entered, "first background worker")
+	await(t, entered, "second background worker")
 	assertBlocked(t, entered, "background fanout beyond worker bound")
 	cut := mustWrite(t, b, explicit, 0, "priority")
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -1567,7 +1568,7 @@ func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) 
 	b.trigger()
 	close(release)
 	seen := false
-	for range 96 {
+	for range 95 {
 		if id := await(t, entered, "remaining background work"); id == later {
 			seen = true
 		}
