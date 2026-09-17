@@ -1,12 +1,125 @@
 # Performance
 
-Status: **historical protocol-4/5 measurements only; the protocol-6 stock-FUSE
-profile has not been measured and has no release SLO**
+Status: **protocol-7 local engineering measurements; no production SLO**
 
-The measurements below are retained unchanged as evidence for retired
-configurations. They must not be quoted as protocol-6 performance. PortableFS
-will add a separate stock-kernel section only after the new profile is measured
-end to end with the same byte-verification discipline.
+## September 17, 2026 G4 final measurement
+
+G4 removes the READDIRPLUS capability-cleanup regression while retaining zero
+Linux kernel entry and attribute validity. The final run uses the same shared
+Linux VM and full-size workload as the historical v6 and G samples.
+
+| Workload | v6 wall (s) | G wall (s) | G4 wall (s) | v6 requests/op | G requests/op | G4 requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker | 386.762771 | 21.028568 | 21.089135 | 7.854381 | 7.480524 | 1.978286 |
+| install, 8 workers | 273.738199 | 15.706301 | 11.512895 | 7.561476 | 6.849524 | 1.976857 |
+| git-status-cold | 10.572948 | 1.379696 | 1.868078 | 1.040450 | 1.027400 | 1.027050 |
+| git-status-warm | 2.042038 | 1.195970 | 2.260461 | 0.027650 | 0.018600 | 0.018250 |
+| two-mount-write-list-read | 12.536042 | 2.644504 | 2.432345 | 7.877500 | 9.819500 | 8.127250 |
+
+Warm status over 20,000 files issues zero LOOKUP/GETATTR requests and one
+RECLAIM. The two-mount run issues 62 RECLAIMs for 229 READDIR pages. The
+per-opcode tables and the ten raw JSON observations are in
+[results.md](./coherence-v2/results.md#g4-final-baseline-and-qualification).
+
+One 100-sample profile splits the one-worker CREATE syscall into mean stage
+latencies of 170 us kernel-to-daemon, 33 us daemon-to-Authority, 53 us inside
+the Authority handler, and 79 us from handler return to syscall return. This
+335 us CREATE mean, plus write, close, directory, and scheduling work, explains
+the measured install floor; G4 does not attempt another install optimization.
+
+The exact all-case soak passes in 1,052.64 seconds, including full-size Git at
+906.12 seconds and every fault case. `verify-local.sh --full` and the standalone
+matrix results are recorded in the integration record. These are local
+engineering observations, not a production latency claim.
+
+## September 17, 2026 G2 measurement
+
+G2 preserves zero Linux kernel entry and attribute validity. Daemon LOOKUP and
+GETATTR hits allocate nothing and issue no Authority RPCs. New-directory
+completeness, local FULL FLUSH, implicit source progress and batched close reduce
+install traffic to one CREATE and one background WRITE per file plus amortized
+work. This table compares the preceding G result with final G2 on the same
+shared Linux VM; counts include filesystem and control traffic.
+
+| Workload | G before (s) | G2 final (s) | G requests/op | G2 requests/op | G2 filesystem requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | 21.028568 | 22.479856 | 7.480524 | 1.980643 | 1.966167 |
+| install, 8 worker(s) | 15.706301 | 11.717305 | 6.849524 | 1.979524 | 1.966929 |
+| git-status-cold | 1.379696 | 2.084653 | 1.027400 | 2.031300 | 1.026000 |
+| git-status-warm | 1.195970 | 2.372260 | 0.018600 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | 2.644504 | 3.229293 | 9.819500 | 23.142500 | 3.170500 |
+
+One-worker install retains one CREATE and one background WRITE per file;
+LOOKUP, GETATTR, FLUSH, ChangeAck and additional control polling are all zero. Directory
+creation and close/release batches are amortized. Eight-worker misses and every
+control request remain visible in the linked full opcode table. The install denominator is
+42,000 operations (40,000 files plus 2,000 directories); opcode/file divides by
+40,000. These are different denominators.
+
+Cold and warm Git each issue 20,104 RECLAIMs;
+READDIRPLUS capability cleanup raises total RPC counts even though warm metadata
+is cached. The peer workload issues 69,257 RECLAIMs,
+performs 5 scans, observes 140 files during writing,
+and verifies all 2,000. G's preceding peer sample observed one file during
+writing; the overlap differs materially. These shared-VM timings are not an
+isolated speedup experiment, and Git/peer totals are explicit remaining costs.
+
+The exact kernel LOOKUP probe measures shared p50/p95 at 2.708/14.750 us and
+FULL-holder at 10.292/29.458 us. Both medians meet the below-20-us target; the
+holder tail does not. Each mode has 2,000 samples and zero Authority LOOKUP or
+GETATTR requests. The probe boundaries and overhead are stated in
+[results.md](./coherence-v2/results.md#g2-isolated-kernel-lookup-round-trip).
+
+`bash scripts/verify-local.sh --full` passes at the measured production commit,
+including the XFS and coherence suites. Complete opcode counts, direct-XFS
+comparisons, barrier/drain timing, profiles and failed intermediate runs are
+preserved in [results.md](./coherence-v2/results.md#g2-final-baseline-and-qualification).
+The [G2 report](./coherence-v2/G2-report.md) lists the implementation, regressions,
+interfaces and remaining gaps. No production-network or live macOS performance
+claim follows from these local measurements.
+
+## September 16, 2026 protocol-7 measurement (before G2)
+
+The same full-size harness as the protocol-6 reference runs on the shared
+4 CPU, 8 GiB Docker VM, kernel `6.8.0-100-generic`, loopback TLS, and real FUSE
+on loop-backed XFS stored on tmpfs. It is not an isolated speedup experiment or
+physical-disk benchmark. Install is 40,000 1 KiB files plus 2,000 directories;
+Git status covers 20,000 tracked files; the peer workload writes and verifies
+2,000 files. Request counts include control traffic, final root barrier, and
+close drain; workload wall time excludes barrier/drain, reported separately in
+[the complete results](./coherence-v2/results.md).
+
+| Workload | v6 wall (s) | v7 wall (s) | v6 requests/op | v7 requests/op |
+|---|---:|---:|---:|---:|
+| install (1 worker) | 386.763 | 21.029 | 7.8544 | 7.4805 |
+| install (8 workers) | 273.738 | 15.706 | 7.5615 | 6.8495 |
+| git-status-cold | 10.573 | 1.380 | 1.0405 | 1.0274 |
+| git-status-warm | 2.042 | 1.196 | 0.0277 | 0.0186 |
+| two-mount-write-list-read | 12.536 | 2.645 | 7.8775 | 9.8195 |
+
+Direct-XFS v7 times are 0.393/0.299 seconds for 1/8-worker install,
+0.0075/0.0072 for cold/warm Git, and 0.0361 for the peer workload. VM contention,
+cold-cache differences, and changed reader/writer overlap limit comparisons.
+The final mounted peer verifies one file during writing and all 2,000 overall,
+with no ESTALE retries; the v6 reference verified 467 during writing and retried
+203 ESTALE results. Independent churn tests retain stronger overlap assertions.
+
+Fresh 20,000-file `git add` now succeeds at the shipping 65,536 cache capacity,
+commits, and passes its run barrier without disconnecting. The v6 reference
+failed ENOTCONN there and needed a setup-capacity workaround.
+
+Profiles of the Authority and daemon identify canonical field-slice allocation,
+CONTROL batch allocation, source wake channels, and background flush fan-out.
+Descriptor caching, bounded batch reuse, demand-allocated wakeups, single-worker
+background dispatch, and phased close cleanup reduce sampled allocation and
+mutex wait. Final wall times versus the first v7 run are mixed; eight-worker
+install is 15.706 seconds versus 12.856 initially. The full before/after record,
+raw request breakdown, profile commands, and failed ENFILE intermediate run are
+preserved in [results.md](./coherence-v2/results.md). A close admission budget
+now provides backpressure under the shipping open-table limit.
+
+The protocol-4/5 sections below are historical evidence for retired builds and
+must not be quoted as protocol-7 performance.
 
 ## August 15, 2026 protocol-5 Linux measurement
 
@@ -284,31 +397,25 @@ These are not regressions to be optimised away later. They are the price of the
 guarantees in [consistency-model.md](./consistency-model.md), and a change that
 removes one of them has to explain which guarantee it is trading.
 
-**Every data-plane write crosses the wire.** There is no PortableFS-managed
-write-back cache. Linux direct-I/O `write(2)` pays at least one authority round
-trip. macOS may coalesce application writes in its ordinary kernel page cache;
-each FSKit write callback crosses the authority, and `fsync` is the explicit
-completion boundary. Benchmarks must identify which syscall boundary they time.
+**Namespace operations still cross the wire.** The Authority owns create,
+rename, unlink, and the other namespace operations. Independent requests can
+run concurrently, but sequential namespace operations retain round-trip cost.
+An uncontended delegated data write can return from the daemon buffer; fsync,
+O_SYNC, and the root-directory run barrier wait for durable application.
+Contended cached-handle cases force write-through. macOS retains synchronous
+repair and its separately declared host-cache behavior.
 
-**Names and attributes are coherently cached, and mutation pays for it.** The
-single protocol lets repeated path walks be served from the kernel without an
-authority lookup. The bill arrives on the other side: a cache-affecting mutation
-holds its stable-identity dependency set and the source's exact local
-publication footprint, quiesces affected non-source cache holders, applies to
-XFS, drives each peer's repair, and collects acknowledgements before it returns.
-Mutations that share an inode, directory, or binding remain ordered; disjoint
-sets can execute concurrently and do not inherit one another's repair latency.
-With one mount attached there is no network visibility phase. With several, a
-mutation that overlaps an actively caching peer costs a PREPARE and COMPLETE
-round trip to the slowest such participant; exact semantics cannot remove those
-two crossings. Historical or disjoint participants should eventually cost
-nothing once the exact cache-grant ledger replaces the current monotone index.
+**Cache coherence still needs withdrawal.** A volume subscription caches
+undelegated state. Change acknowledgment includes exact reply drain and kernel
+invalidation; a mutation or grant waits for acknowledgment or the subscriber's
+horizon. New peer reads of delegated data break the owner for read. A pre-existing
+cacheable peer handle requires per-commit invalidation. Shared kernel name
+validity remains zero, while the daemon caches bindings and attributes.
 
-**Shared file-backed `mmap` is refused, not slow.** PortableFS does not advertise
-the FUSE capability that would allow shared mapped pages on a direct-I/O inode,
-so `MAP_SHARED` on a file fails. Programs that would have used it fall back to
-read and write, which is slower and correct. `MAP_PRIVATE` works with ordinary
-copy-on-write semantics.
+**Shared writable mmap is refused.** Read-only/private mappings are supported
+on cacheable handles. The implementation does not depend on direct-I/O mmap
+support, and the stalled-daemon resident-page residual remains explicit in
+[portable-coherence.md](./portable-coherence.md).
 
 **SQLite WAL mode does not work across machines.** Its wal-index needs a shared
 `-shm` mapping and SQLite itself requires every WAL participant to be on one

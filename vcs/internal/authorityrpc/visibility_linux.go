@@ -21,14 +21,6 @@ import (
 // name and is told to come back rather than being starved silently.
 const maxStabilizeAttempts = 8
 
-// maxSkippedReaddirBatches bounds how many consecutive enumeration batches a
-// readdir may pass over when every entry in them raced away (unlinked or
-// renamed between enumeration and stat). Each skipped batch advances the
-// cookie by a full page, so exhausting this bound means the directory is
-// being churned faster than it can be listed; the caller is told to come
-// back rather than the server scanning without limit.
-const maxSkippedReaddirBatches = 8
-
 // namespaceName is the precondition every namespace-mutating request checks
 // before it constructs a visibility target. It is the store's own directory
 // entry predicate, and it accepts exactly the names the target validator
@@ -44,7 +36,8 @@ func namespaceName(name []byte) error {
 // non-coherent session returns nil only on an already-invalid runtime path; no
 // attach can activate such a session.
 func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.VisibilityCoordinator {
-	if h.Visibility == nil || !h.strictSession(id) {
+	profile, err := h.sessionFrontendProfile(id)
+	if h.Visibility == nil || err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return nil
 	}
 	return h.Visibility

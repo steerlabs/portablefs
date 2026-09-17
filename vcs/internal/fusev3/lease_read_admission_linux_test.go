@@ -121,12 +121,26 @@ func TestBlockingReadNeverFailsWhileAPeerRewritesTheFile(t *testing.T) {
 
 	payloads := [2][]byte{after, before}
 	for round := range 64 {
+		startedReads := reads.Load()
 		if err := os.WriteFile(writerPath, payloads[round%2], 0o600); err != nil {
 			t.Fatalf("round %d: peer write: %v (mount 0 revocation: %v; mount 1 revocation: %v)",
 				round, err, f.mounts[0].fatalError(), f.mounts[1].fatalError())
 		}
 		if failure := readFailure.Load(); failure != nil {
 			t.Fatalf("round %d: %v", round, *failure)
+		}
+		// Buffered writes can finish faster than the paced readers get CPU.
+		// Keep every rewrite round live until readers make progress, retaining
+		// the original minimum sample instead of relying on v6 write latency.
+		deadline := time.Now().Add(2 * time.Second)
+		for reads.Load()-startedReads < 8 {
+			if failure := readFailure.Load(); failure != nil {
+				t.Fatal(*failure)
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("blocking readers stopped making progress")
+			}
+			time.Sleep(time.Millisecond)
 		}
 	}
 	stopReaders()

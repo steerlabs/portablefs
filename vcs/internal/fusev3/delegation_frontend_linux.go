@@ -3,9 +3,11 @@
 package fusev3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -39,11 +41,11 @@ func captureServedVersion(ctx context.Context, response *authoritypb.Response) {
 func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.Delegation) error {
 	manager := n.mount.delegations
 	if grant != nil {
-		if err := manager.Install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant); err != nil {
+		if err := manager.Install(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, grant); err != nil && !errors.Is(err, errDelegationRetired) {
 			return err
 		}
-	} else if manager.Owns(n.item.GetStableIdentity()) {
-		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token); err != nil {
+	} else {
+		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, handle.openFlags&syscall.O_ACCMODE != syscall.O_RDONLY); err != nil && !errors.Is(err, errDelegationRetired) {
 			return err
 		}
 	}
@@ -60,49 +62,101 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 	if n.stale.Load() || (handle != nil && handle.stale.Load()) {
 		return syscall.EIO
 	}
+	id, err := delegationIdentity(n.item.GetStableIdentity())
+	if err != nil {
+		return err
+	}
+	state := n.mount.delegations.state(id)
+	if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
+		return err
+	}
+	defer state.acquire.Unlock()
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
 		return nil
 	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true}}})
-	if errno != 0 {
-		return errno
-	}
-	opened := response.GetOpen()
-	if opened == nil || opened.GetDelegation() == nil || len(opened.GetHandle()) == 0 {
-		return syscall.EIO
-	}
-	token := opened.GetHandle()
-	if handle != nil {
-		token = handle.token
-	}
-	if err := n.mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation()); err != nil {
-		return err
-	}
-	if handle == nil {
-		if acquired, _ := ctx.Value(acquiredDelegationHandleKey{}).(*acquiredDelegationHandle); acquired != nil {
-			acquired.token = cloneBytes(token)
-		}
-	}
-	if handle != nil {
-		_, errno = n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
+	for {
+		response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true}}})
 		if errno != 0 {
 			return errno
 		}
+		opened := response.GetOpen()
+		if opened == nil || opened.GetDelegation() == nil || len(opened.GetHandle()) == 0 {
+			return syscall.EIO
+		}
+		token := opened.GetHandle()
+		if handle != nil {
+			token = handle.token
+		}
+		if err := n.mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), token, opened.GetDelegation()); err != nil {
+			_, closeErrno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
+			if closeErrno != 0 {
+				return closeErrno
+			}
+			if errors.Is(err, errDelegationRetired) {
+				continue
+			}
+			return err
+		}
+		if handle == nil {
+			if acquired, _ := ctx.Value(acquiredDelegationHandleKey{}).(*acquiredDelegationHandle); acquired != nil {
+				acquired.token = cloneBytes(token)
+			}
+		}
+		if handle != nil {
+			_, errno = n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(opened.GetHandle())}}})
+			if errno != 0 {
+				return errno
+			}
+		}
+		return nil
 	}
-	return nil
 }
 
-func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Errno {
+func (n *node) withWriteDelegation(ctx context.Context, handle *fileHandle, call func(*authoritypb.DelegationRef) (*authoritypb.Response, error)) (*authoritypb.Response, error) {
+	for {
+		if err := n.ensureWriteDelegation(ctx, handle); err != nil {
+			return nil, err
+		}
+		response, err := n.mount.delegations.Synchronous(ctx, n.item.GetStableIdentity(), call)
+		if !errors.Is(err, errDelegationNotOwned) {
+			return response, err
+		}
+	}
+}
+
+func (m *Mount) overlayProtoAttr(identity []byte, base *authoritypb.Attr, version uint64) (*authoritypb.Attr, error) {
 	if base == nil {
-		return syscall.EIO
+		return nil, syscall.EIO
 	}
-	attrs, err := n.mount.delegations.OverlayAttributes(n.item.GetStableIdentity(), writeback.Attributes{
-		Mode: base.GetMode(), Size: base.GetSize(), ATimeNS: base.GetAtimeNs(), MTimeNS: base.GetMtimeNs(),
-		HasMode: true, HasSize: true, HasATime: true, HasMTime: true,
-	})
+	manager := m.delegations
+	id, err := delegationIdentity(identity)
 	if err != nil {
-		return bufferErrno(err)
+		return nil, err
 	}
+	manager.epoch.RLock()
+	defer manager.epoch.RUnlock()
+	state := manager.lookupState(id)
+	if manager.incarnation() == 0 || state == nil {
+		return proto.Clone(base).(*authoritypb.Attr), nil
+	}
+	state.admission.RLock()
+	defer state.admission.RUnlock()
+	if state.ref == nil {
+		return proto.Clone(base).(*authoritypb.Attr), nil
+	}
+	// The base and retained overlay are one read snapshot. A flush updates the
+	// base before durability can retire its records; holding meta across overlay
+	// sampling prevents an old base from being paired with an empty overlay.
+	state.meta.Lock()
+	defer state.meta.Unlock()
+	state.installBaseLocked(base, version)
+	if state.base != nil && state.baseVersion >= version {
+		base = state.base
+	}
+	attrs := manager.buf.OverlayAttributes(id, writeback.Attributes{
+		Mode: base.GetMode(), Size: base.GetSize(), ATimeNS: base.GetAtimeNs(), MTimeNS: base.GetMtimeNs(), CTimeNS: base.GetCtimeNs(),
+		HasMode: true, HasSize: true, HasATime: true, HasMTime: true, HasCTime: true,
+	})
 	attr := proto.Clone(base).(*authoritypb.Attr)
 	if attrs.HasMode {
 		attr.Mode = attrs.Mode
@@ -116,8 +170,18 @@ func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Er
 	if attrs.HasMTime {
 		attr.MtimeNs = attrs.MTimeNS
 	}
+	if attrs.HasCTime {
+		attr.CtimeNs = attrs.CTimeNS
+	}
+	return attr, nil
+}
+
+func (n *node) overlayAttr(base *authoritypb.Attr, out *fuse.AttrOut) syscall.Errno {
+	attr, err := n.mount.overlayProtoAttr(n.item.GetStableIdentity(), base, 0)
+	if err != nil {
+		return bufferErrno(err)
+	}
 	fillAttr(attr, &out.Attr, n.mount.uid, n.mount.gid)
-	// Holder attributes come from a live daemon overlay, never a kernel timeout.
 	out.SetTimeout(0)
 	return 0
 }
@@ -132,15 +196,25 @@ func (n *node) invalidateOwnData(ctx context.Context, offset, length int64) erro
 		return syscall.EIO
 	}
 	coordinate := publicationCoordinate{kind: publicationItemData, item: identity}
-	if err := r.closeCacheCoordinate(ctx, coordinate); err != nil {
+	lease, err := r.closeCacheCoordinate(ctx, coordinate)
+	if err != nil {
 		return err
 	}
-	defer r.openCacheCoordinate(coordinate)
+	defer lease.Open()
 	var byteRange *authoritypb.ByteRange
 	if offset >= 0 && length > 0 {
 		byteRange = &authoritypb.ByteRange{Offset: uint64(offset), Length: uint64(length)}
 	}
-	if err := r.invalidateCacheCoordinateContext(ctx, coordinate, byteRange); err != nil {
+	budget := n.mount.subscription.config.repairLead
+	if budget <= 0 {
+		budget = time.Second
+	}
+	repairCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	deadline := n.mount.subscription.config.clock.Now().Add(budget)
+	if err := n.mount.subscription.retry(repairCtx, deadline, func() error {
+		return r.invalidateCacheCoordinateContext(repairCtx, coordinate, byteRange)
+	}); err != nil {
 		r.markIdentityStale(identity)
 		return err
 	}
@@ -152,15 +226,16 @@ func (n *node) invalidateOwnData(ctx context.Context, offset, length int64) erro
 // dependency check simply because its daemon name payload was evicted.
 func (m *Mount) flushNamespaceDependencies(ctx context.Context, request *authoritypb.Request, lease *sourcePublicationLease) error {
 	type named struct {
-		parent []byte
-		name   []byte
+		parent   []byte
+		name     []byte
+		identity publicationIdentity
 	}
 	var names []named
 	switch body := request.GetBody().(type) {
 	case *authoritypb.Request_Unlink:
-		names = append(names, named{body.Unlink.Parent, body.Unlink.Name})
+		names = append(names, named{body.Unlink.Parent, body.Unlink.Name, publicationIdentity{}})
 	case *authoritypb.Request_Rename:
-		names = append(names, named{body.Rename.OldParent, body.Rename.OldName}, named{body.Rename.NewParent, body.Rename.NewName})
+		names = append(names, named{body.Rename.OldParent, body.Rename.OldName, publicationIdentity{}}, named{body.Rename.NewParent, body.Rename.NewName, publicationIdentity{}})
 	case *authoritypb.Request_Link:
 		for coordinate := range lease.coordinates {
 			if coordinate.kind == publicationItemAttributes {
@@ -183,6 +258,24 @@ func (m *Mount) flushNamespaceDependencies(ctx context.Context, request *authori
 		return nil
 	}
 	for _, name := range names {
+		m.raw.mu.Lock()
+		for namespace := range lease.names {
+			if namespace.name != string(name.name) {
+				continue
+			}
+			parent := m.raw.byIdentityLocked(namespace.parent)
+			if parent != nil && bytes.Equal(parent.node.item.GetToken(), name.parent) {
+				name.identity = lease.preBindings[namespace]
+				break
+			}
+		}
+		m.raw.mu.Unlock()
+		if name.identity != (publicationIdentity{}) {
+			if _, err := m.delegations.FlushIdentity(ctx, name.identity[:]); err != nil {
+				return err
+			}
+			continue
+		}
 		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: cloneBytes(name.parent), Name: cloneBytes(name.name)}}})
 		if err != nil {
 			return err

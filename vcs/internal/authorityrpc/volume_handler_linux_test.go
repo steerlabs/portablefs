@@ -54,12 +54,7 @@ func exactAuthorityTestTargets(sequence uint64, targets []volumeserver.Visibilit
 }
 
 func testVolumeHandler() *VolumeHandler {
-	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
-		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384, PriorGrantsFenced: true, Fencer: noopFencer{},
-	})
-	if err != nil {
-		panic(err)
-	}
+
 	lifecycle, err := volumeserver.NewMountLifecycle(volumeserver.MountLifecycleConfig{
 		Membership: noopMembership{}, Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
 	})
@@ -92,7 +87,6 @@ func testVolumeHandler() *VolumeHandler {
 		MaxFskitWrites:                      32,
 		FskitWriteProgressTimeout:           time.Minute,
 		FskitWriteAbsoluteTimeout:           time.Hour,
-		Leases:                              leases,
 		Lifecycle:                           lifecycle,
 		Visibility:                          visibility,
 	}
@@ -2336,6 +2330,7 @@ type existingCreateMutationLockStore struct {
 	identities [][16]byte
 	lookups    uint32
 	creates    uint32
+	opens      uint32
 }
 
 func (s *existingCreateMutationLockStore) LockMutation(identities [][16]byte) func() {
@@ -2378,7 +2373,7 @@ func (s *existingCreateMutationLockStore) CoordinateItem(item xfsstore.Capabilit
 	return xfsstore.ObjectCoordinate{Stable: [16]byte{item[0]}, Ino: uint64(item[0]), DeviceMinor: 1}, nil
 }
 
-func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, exclusive bool) (xfsstore.Capability, xfsstore.Attr, error) {
 	s.requireLocked("existing CREATE apply")
 	s.mu.Lock()
 	s.creates++
@@ -2390,11 +2385,17 @@ func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ s
 	if parent != s.parent {
 		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
 	}
+	if exclusive {
+		return xfsstore.Capability{}, xfsstore.Attr{}, syscall.EEXIST
+	}
 	return target, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
 }
 
 func (s *existingCreateMutationLockStore) OpenFile(item xfsstore.Capability, flags xfsstore.OpenFlags) (xfsstore.Capability, error) {
 	s.requireLocked("existing CREATE open")
+	s.mu.Lock()
+	s.opens++
+	s.mu.Unlock()
 	target := s.target
 	if s.bindingChanges {
 		target = s.replacement
@@ -2440,6 +2441,7 @@ func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
 			}
 			h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
 			request := resourceAcquisitionRequest(t, "create", credential, root)
+			request.GetCreate().Exclusive = false
 			request.GetCreate().Flags.Truncate = truncate
 			for _, target := range request.GetFskitSourcePublication().GetTargets() {
 				if namespace := target.GetNamespace(); namespace != nil {
@@ -2474,13 +2476,59 @@ func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
 	}
 }
 
+func TestExclusiveExistingCreateDoesNotWaitForFskitBoundIdentity(t *testing.T) {
+	store := &existingCreateMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+		handle: xfsstore.Capability{0x74},
+	}
+	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
+	release, err := h.coherenceStorage.Acquire(t.Context(), coherenceInodeDependencies([16]byte{store.target[0]}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	done := make(chan *authoritypb.Response, 1)
+	go func() { done <- h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root)) }()
+	var response *authoritypb.Response
+	select {
+	case response = <-done:
+	case <-time.After(250 * time.Millisecond):
+		release()
+		released = true
+		response = <-done
+		t.Fatalf("exclusive existing CREATE waited for target identity turn: %+v", response)
+	}
+	if response.GetErrno() != int32(syscall.EEXIST) || response.GetUncertain() || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED {
+		t.Fatalf("exclusive existing CREATE response = %+v, want definite EEXIST", response)
+	}
+	if response.GetCreate() != nil || response.GetPostState() != nil {
+		t.Fatalf("exclusive existing CREATE published success state: %+v", response)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.creates != 1 || store.opens != 0 || store.locked || !store.released {
+		t.Fatalf("exclusive existing CREATE lifecycle: creates=%d opens=%d locked=%v released=%v", store.creates, store.opens, store.locked, store.released)
+	}
+	if len(store.identities) != 1 || store.identities[0] != [16]byte{store.parent[0]} {
+		t.Fatalf("exclusive existing CREATE lock set = %x, want parent only", store.identities)
+	}
+}
+
 func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
 	store := &existingCreateMutationLockStore{
 		t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
 		replacement: xfsstore.Capability{0x74}, handle: xfsstore.Capability{0x75}, bindingChanges: true,
 	}
 	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
-	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	request := resourceAcquisitionRequest(t, "create", credential, root)
+	request.GetCreate().Exclusive = false
+	response := h.Handle(ctx, request)
 	if response.GetErrno() != 0 || response.GetUncertain() || response.GetCreate() == nil {
 		t.Fatalf("binding-change response = %+v, want successful re-resolved CREATE", response)
 	}
@@ -2504,7 +2552,6 @@ type readdirPostStabilizationChangeStore struct {
 func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
 	open xfsstore.Capability,
 	_ uint64,
-	_ [16]byte,
 	_ int,
 ) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
 	if open != s.handle {
@@ -2514,7 +2561,7 @@ func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
 	var verifier [16]byte
 	binary.BigEndian.PutUint64(verifier[0:8], uint64(s.root[0]))
 	binary.BigEndian.PutUint64(verifier[8:16], 10)
-	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0])}}, 1, verifier, true, s.root, nil
+	return []xfsstore.Dirent{{Name: "child", Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), NextCookie: 1}}, 1, verifier, true, s.root, nil
 }
 
 func (s *readdirPostStabilizationChangeStore) Lookup(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error) {
@@ -2598,6 +2645,68 @@ func TestReadDirPlusRetriesWholePageAfterPostStabilizationChildChange(t *testing
 	}
 }
 
+func TestReadDirPlusOmitsCapabilitiesAlreadyHeldByTheSession(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		t.Run(fmt.Sprintf("held=%v", held), func(t *testing.T) {
+			store := &readdirPostStabilizationChangeStore{
+				root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
+			}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
+			if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+				t.Fatal(err)
+			}
+			identity := [16]byte{store.child[0]}
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+				Handle: store.handle[:], MaxEntries: 16, WantItems: true,
+			}}
+			if held {
+				request.GetReadDir().HeldIdentities = [][]byte{identity[:]}
+			}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 {
+				t.Fatalf("READDIRPLUS response = %+v", response)
+			}
+			entry := response.GetReadDir().GetEntries()[0]
+			if !bytes.Equal(entry.GetStableIdentity(), identity[:]) || entry.GetAttr() == nil || entry.GetObjectVersion() == 0 || entry.GetSnapshotSequence() == 0 {
+				t.Fatalf("entry omitted stable metadata: %+v", entry)
+			}
+			if (entry.GetItem() == nil) != held {
+				t.Fatalf("held=%v item=%+v", held, entry.GetItem())
+			}
+			resources := h.resources[credential.ID]
+			if got, want := len(resources.items), map[bool]int{false: 1, true: 0}[held]; got != want {
+				t.Fatalf("held=%v tracked items=%d want=%d", held, got, want)
+			}
+		})
+	}
+}
+
+func TestReadDirHeldIdentitiesAreValidatedBeforeEnumeration(t *testing.T) {
+	validA, validB := bytes.Repeat([]byte{1}, 16), bytes.Repeat([]byte{2}, 16)
+	tests := map[string]*authoritypb.ReadDirRequest{
+		"without items": {MaxEntries: 8, HeldIdentities: [][]byte{validA}},
+		"short":         {MaxEntries: 8, WantItems: true, HeldIdentities: [][]byte{{1}}},
+		"duplicate":     {MaxEntries: 8, WantItems: true, HeldIdentities: [][]byte{validA, validA}},
+		"unsorted":      {MaxEntries: 8, WantItems: true, HeldIdentities: [][]byte{validB, validA}},
+	}
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := &coherenceEmptyDirectoryStore{handle: xfsstore.Capability{0x51}, directory: xfsstore.Capability{0x52}}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+			body.Handle = store.handle[:]
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_ReadDir{ReadDir: body}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != int32(syscall.EINVAL) || store.calls.Load() != 0 {
+				t.Fatalf("response=%+v enumeration calls=%d", response, store.calls.Load())
+			}
+		})
+	}
+}
+
 func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
 	item := xfsstore.Capability{0x7a}
 	store := &resourceAdmissionFaultStore{lookupItem: item}
@@ -2621,11 +2730,10 @@ func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
 		!bytes.Equal(replayed.GetLookup().GetItem().GetToken(), item[:]) {
 		t.Fatalf("replayed lookup=%+v", replayed)
 	}
-	// A positive Linux lookup resolves once under N, then re-resolves under the
-	// atomic N+A admission that authorizes its returned attributes. Exact replay
-	// reuses that retained result and performs neither read again.
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("lookup store calls=%d, want two-phase N then N+A acquisition", calls)
+	// The capability from the identity probe survives binding revalidation.
+	// Exact replay reuses the recorded result without another store lookup.
+	if calls := store.lookup.Load(); calls != 1 {
+		t.Fatalf("lookup store calls=%d, want one retained probe across replay", calls)
 	}
 	resources := h.resources[cred.ID]
 	if len(resources.items) != 1 || h.totalItems != 1 {
@@ -2663,6 +2771,44 @@ func TestCapabilityAccountingIsSymmetric(t *testing.T) {
 	h.closeSessionResources(session)
 	if h.totalItems != 0 || h.totalOpens != 0 {
 		t.Fatalf("cleanup left %d items / %d opens", h.totalItems, h.totalOpens)
+	}
+}
+
+func TestReclaimBatchValidatesBeforeRetiringCapabilities(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		duplicate bool
+	}{
+		{name: "batch"},
+		{name: "duplicate", duplicate: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 4)
+			items := []xfsstore.Capability{{0x81}, {0x82}, {0x83}}
+			for _, item := range items {
+				if err := h.trackItem(credential.ID, item, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			raw := [][]byte{items[0][:], items[1][:], items[2][:]}
+			if test.duplicate {
+				raw[2] = items[0][:]
+			}
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: raw}}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if test.duplicate {
+				if response.GetErrno() != int32(syscall.EINVAL) || store.forget.Load() != 0 || len(h.resources[credential.ID].items) != len(items) {
+					t.Fatalf("duplicate response=%+v forget=%d retained=%d", response, store.forget.Load(), len(h.resources[credential.ID].items))
+				}
+				return
+			}
+			if response.GetErrno() != 0 || store.forget.Load() != uint32(len(items)) || len(h.resources[credential.ID].items) != 0 {
+				t.Fatalf("batch response=%+v forget=%d retained=%d", response, store.forget.Load(), len(h.resources[credential.ID].items))
+			}
+		})
 	}
 }
 
@@ -2766,7 +2912,7 @@ func testAttachAttempt(id uint64) []byte {
 	return attempt
 }
 
-// attachAndActivateHandler drives the protocol-6 lifecycle directly at the
+// attachAndActivateHandler drives the protocol-7 lifecycle directly at the
 // handler boundary. Transport-registry tests separately prove that the two
 // nonzero binding generations came from the exact DATA/CONTROL pair.
 func attachAndActivateHandler(
@@ -3864,8 +4010,8 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	}()
 	select {
 	case err := <-applyDone:
-		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
-			t.Fatalf("ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
+		if !errors.Is(err, volumeserver.ErrRoutesLive) {
+			t.Fatalf("ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("ApplyRoutes deadlocked behind a blocked lock wait")
@@ -3893,8 +4039,8 @@ func TestBlockedLockWaitDoesNotHoldTheTopologyGuard(t *testing.T) {
 	}()
 	select {
 	case err := <-applyDone:
-		if !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
-			t.Fatalf("second ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
+		if !errors.Is(err, volumeserver.ErrRoutesLive) {
+			t.Fatalf("second ApplyRoutes beside a blocked lock wait = %v, want %v", err, volumeserver.ErrRoutesLive)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a second ApplyRoutes deadlocked behind a blocked lock wait")
@@ -3962,4 +4108,76 @@ func stampNamespacePublication(request *authoritypb.Request, operationID uint64,
 			BoundAttributes: true,
 		}}},
 	}}
+}
+
+func TestCachelessReaderAttachRequiresExactlyReadAccess(t *testing.T) {
+	for _, access := range []volumeserver.Access{volumeserver.AccessRead, volumeserver.AccessRead | volumeserver.AccessWrite, volumeserver.AccessRead | volumeserver.AccessAdmin} {
+		h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
+		authorizer.access = access
+		request := fskitAttachRequest(49)
+		attach := request.GetAttach()
+		attach.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
+		attach.FskitCachedNameCapacity, attach.FskitRepairBudgetMillis = 0, 0
+		attach.FskitNamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
+		response := h.Handle(ctx, request)
+		want := int32(errnos.EPERM)
+		if access == volumeserver.AccessRead {
+			want = 0
+		}
+		if response.Errno != want {
+			t.Fatalf("access=%v response=%v", access, response)
+		}
+	}
+}
+
+func TestReadOnlyAttachCompatibilityWriterExclusion(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		profile  authoritypb.FrontendProfile
+		excluded bool
+	}{
+		{"fskit", authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR, true},
+		{"cacheless", authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, ctx, authorizer, _ := newProtocol5Handler(t, nil)
+			authorizer.access = volumeserver.AccessRead
+			request := fskitAttachRequest(81).GetAttach()
+			request.FrontendProfile = tc.profile
+			if !tc.excluded {
+				request.FskitCachedNameCapacity, request.FskitRepairBudgetMillis = 0, 0
+				request.FskitNamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
+			}
+			_, _, proof := attachAndActivateHandler(t, h, ctx, 81, request)
+			var id volumeserver.SessionID
+			copy(id[:], proof.GetId())
+			h.resourcesMu.Lock()
+			commitment := h.resources[id].commitment
+			h.resourcesMu.Unlock()
+			if commitment.CompatibilityWriter != tc.excluded {
+				t.Fatalf("read-only commitment exclusion=%v, want %v", commitment.CompatibilityWriter, tc.excluded)
+			}
+			err := h.Visibility.CheckCompatibilityWriter(volumeserver.SessionID{0x77})
+			if tc.excluded {
+				if !errors.Is(err, volumeserver.ErrCompatibilityWriterLease) {
+					t.Fatalf("read-only FSKit writer admission=%v, want compatibility exclusion", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("cacheless reader excluded Linux writer: %v", err)
+			}
+			authorizer.access = volumeserver.AccessRead | volumeserver.AccessWrite
+			writer := fskitAttachRequest(91).GetAttach()
+			writer.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
+			writer.FskitCachedNameCapacity, writer.FskitRepairBudgetMillis = 0, 0
+			writer.FskitNamespaceRepair = authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED
+			_, _, writerProof := attachAndActivateHandler(t, h, ctx, 91, writer)
+			var writerID volumeserver.SessionID
+			copy(writerID[:], writerProof.GetId())
+			if err := h.Visibility.CheckCompatibilityWriter(writerID); err != nil {
+				t.Fatalf("concurrent activated Linux writer excluded: %v", err)
+			}
+		})
+	}
 }

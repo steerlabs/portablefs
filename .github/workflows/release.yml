@@ -227,6 +227,16 @@ jobs:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
 
+      - name: Prove the paired daemon and extension wire contract
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          for golden in pfslocal/testdata/*.hex; do
+            cmp "$golden" "swift/PortableFSKit/Tests/PortableFSKitTests/Goldens/${golden##*/}"
+          done
+          CGO_ENABLED=1 GOOS=darwin go -C vcs test ./internal/portablefsd \
+            -run '^TestV3CoherenceBridgeResolveMatchesSwiftGolden$' -count=1
+
       - name: Verify the Foundation-enabled Darwin data plane
         run: |
           set -euo pipefail

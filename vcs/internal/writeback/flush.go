@@ -7,6 +7,9 @@ import (
 )
 
 type batch struct {
+	wave                 bool
+	completedLast        *record
+	endOffset            int
 	entries              []Entry
 	next                 int
 	first, last, applied uint64
@@ -22,6 +25,9 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 		}
 		return f.pending
 	}
+	if b.batcher != nil {
+		return b.waveLocked(f, cut)
+	}
 	r := f.accepted
 	if r == nil || r.seq > cut.Sequence {
 		return nil
@@ -30,7 +36,7 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 	lo := r.off
 	hi := lo + int64(len(r.data))
 	if r.kind == Write && len(r.data) <= MaxPayload {
-		for n := r.next; n != nil && n.seq <= cut.Sequence && n.state == Accepted && n.kind == Write && n.generation == r.generation; n = n.next {
+		for n := r.next; n != nil && n.seq <= cut.Sequence && n.state == Accepted && n.kind == Write && n.generation == r.generation && n.writeOptions == r.writeOptions; n = n.next {
 			end := n.off + int64(len(n.data))
 			a, z := min(lo, n.off), max(hi, end)
 			if n.off > hi || end < lo || z-a > MaxPayload {
@@ -57,7 +63,7 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 			b.token++
 			p.entries = append(p.entries, Entry{
 				Token: b.token, First: r.seq, Last: last.seq, Generation: r.generation,
-				Kind: Write, Offset: lo + int64(off), Data: data[off:end],
+				Kind: Write, Offset: lo + int64(off), Data: data[off:end], WriteOptions: r.writeOptions,
 			})
 		}
 	} else {
@@ -104,8 +110,13 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		}
 		b.mu.Lock()
 		if f.lastLoss > cut.LossSequence {
+			errno := f.lastErrno
+			if f.lastGenericLoss > cut.LossSequence {
+				errno = 0
+			}
+			err := recordedLossError(errno)
 			b.mu.Unlock()
-			return applied, ErrLost
+			return applied, err
 		}
 		applied = max(applied, f.lastApplied)
 		p := b.batchLocked(f, cut)
@@ -115,12 +126,44 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 			return applied, nil
 		}
 		entry := p.entries[p.next]
+		wave := p.wave
+		floor := max(p.applied, f.lastApplied)
+		var retained [4]Entry
+		entries := retained[:0]
+		if wave {
+			entries = retained[:len(p.entries)]
+			copy(entries, p.entries)
+		}
 		b.mu.Unlock()
-		seq, err := b.flusher.Flush(ctx, id, entry)
+		seq := floor
+		var err error
+		if wave {
+			var sequences []uint64
+			sequences, err = b.batcher.FlushBatch(ctx, id, entries)
+			if err == nil {
+				if len(sequences) != len(entries) {
+					err = ErrInvalid
+				}
+				for _, next := range sequences {
+					if next == 0 || next < seq {
+						err = ErrInvalid
+						break
+					}
+					seq = next
+				}
+			}
+		} else {
+			seq, err = b.flusher.Flush(ctx, id, entry)
+		}
 		b.mu.Lock()
 		if f.pending != p {
+			errno := f.lastErrno
+			if f.lastGenericLoss > cut.LossSequence {
+				errno = 0
+			}
+			lost := recordedLossError(errno)
 			b.mu.Unlock()
-			return applied, ErrLost
+			return applied, lost
 		}
 		if err != nil {
 			b.mu.Unlock()
@@ -134,8 +177,19 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		p.applied = max(p.applied, seq)
 		applied = max(applied, seq)
 		p.next++
+		if p.wave {
+			p.next = len(p.entries)
+		}
 		if p.next == len(p.entries) {
-			for r := f.accepted; r != nil && r.seq <= p.last; r = r.next {
+			last := p.last
+			if p.wave {
+				last = 0
+				if p.completedLast != nil {
+					last = p.completedLast.seq
+				}
+				f.flushOffset = p.endOffset
+			}
+			for r := f.accepted; r != nil && r.seq <= last; r = r.next {
 				if r.seq >= p.first {
 					r.applied = p.applied
 					r.state = Applied
@@ -145,7 +199,7 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 			}
 			f.pending = nil
 			*p = batch{}
-			f.entryStorage[0] = Entry{}
+			clear(f.entryStorage[:])
 			b.advanceLocked()
 			b.signal()
 		}
@@ -166,31 +220,56 @@ func (b *Buffer) targets(cut Cut) []Identity {
 }
 
 // FlushAll flushes the cut concurrently across identities, retaining per-file
-// order. It waits for every started call even if one fails.
+// order, using a bounded worker pool. It visits every target even if one fails.
 func (b *Buffer) FlushAll(ctx context.Context, cut Cut) (uint64, error) {
+	return b.flushAll(ctx, cut, true)
+}
+
+// FlushBarrier flushes exactly the registered barrier prefix. A loss caused by
+// work admitted after that prefix is not an error for this operation; the
+// barrier tracker still records any drop that contained a prefix entry.
+func (b *Buffer) FlushBarrier(ctx context.Context, barrier BarrierCut) (uint64, error) {
+	if barrier.state == nil {
+		return 0, ErrInvalid
+	}
+	return b.flushAll(ctx, barrier.Cut, false)
+}
+
+func (b *Buffer) flushAll(ctx context.Context, cut Cut, includeLaterLoss bool) (uint64, error) {
 	ids := b.targets(cut)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var seq uint64
 	var first error
-	for _, id := range ids {
+	next := 0
+	for worker := 0; worker < min(b.maxFlushIdentities, len(ids)); worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s, e := b.FlushIdentity(ctx, id, cut)
-			mu.Lock()
-			seq = max(seq, s)
-			if first == nil {
-				first = e
+			for {
+				mu.Lock()
+				if next == len(ids) {
+					mu.Unlock()
+					return
+				}
+				id := ids[next]
+				next++
+				mu.Unlock()
+				s, e := b.FlushIdentity(ctx, id, cut)
+				mu.Lock()
+				seq = max(seq, s)
+				if first == nil {
+					first = e
+				}
+				mu.Unlock()
 			}
-			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 	b.mu.Lock()
 	lost := b.loss > cut.LossSequence
 	b.mu.Unlock()
-	if first == nil && lost {
+	if first == nil && includeLaterLoss && lost {
 		first = ErrLost
 	}
 	return seq, first
@@ -204,17 +283,50 @@ func (b *Buffer) VisibleSequence(seq uint64) {
 	b.signal()
 }
 
-// DurableSequence is a cumulative Authority watermark. The integration must
-// deliver it only after visibility through seq is established. It therefore
-// proves both Visible and Durable, even if it races ahead of a Flush reply.
+// DurableSequence is a cumulative Authority storage watermark. Visibility is
+// established independently by VisibleSequence; either proof may arrive first.
 func (b *Buffer) DurableSequence(seq uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.durable = max(b.durable, seq)
-	b.visible = max(b.visible, seq)
 	b.advanceLocked()
 	b.signal()
 }
+
+// DurableIdentity records a successful file FSYNC for the already-applied cut.
+// It cannot advance the volume prefix: another identity may still be dirty.
+func (b *Buffer) DurableIdentity(id Identity, cut Cut) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.files[id]
+	if f == nil {
+		return nil
+	}
+	if f.lastLoss > cut.LossSequence {
+		if f.lastGenericLoss > cut.LossSequence {
+			return ErrLost
+		}
+		return recordedLossError(f.lastErrno)
+	}
+	for r := f.head; r != nil && r.seq <= cut.Sequence; r = r.next {
+		if r.state == Accepted {
+			return ErrInvalid
+		}
+	}
+	for f.head != nil && f.head.seq <= cut.Sequence {
+		r := f.head
+		f.head = r.next
+		b.release(r)
+	}
+	if f.head == nil {
+		f.tail = nil
+		delete(b.active, id)
+	}
+	b.sizeLocked(f)
+	b.signal()
+	return nil
+}
+
 func (b *Buffer) advanceLocked() {
 	for len(b.appliedHeap) > 0 && b.appliedHeap[0].applied <= b.visible {
 		r := b.appliedHeap.remove(0)
@@ -246,13 +358,19 @@ func (b *Buffer) waitDurable(ctx context.Context, id *Identity, cut Cut) error {
 			f := b.files[*id]
 			if f != nil {
 				if f.lastLoss > cut.LossSequence {
-					return ErrLost
+					if f.lastGenericLoss > cut.LossSequence {
+						return ErrLost
+					}
+					return recordedLossError(f.lastErrno)
 				}
 				pending = f.head != nil && f.head.seq <= cut.Sequence
 			}
 		} else {
 			if b.loss > cut.LossSequence {
-				return ErrLost
+				if b.lastGenericLoss > cut.LossSequence {
+					return ErrLost
+				}
+				return recordedLossError(b.lastErrno)
 			}
 			for _, f := range b.active {
 				pending = pending || (f.head != nil && f.head.seq <= cut.Sequence)
@@ -260,6 +378,46 @@ func (b *Buffer) waitDurable(ctx context.Context, id *Identity, cut Cut) error {
 		}
 		if !pending {
 			return nil
+		}
+		if b.stopped {
+			return ErrLost
+		}
+		ch := b.change()
+		b.mu.Unlock()
+		err := wait(ctx, ch)
+		b.mu.Lock()
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (b *Buffer) WaitVisible(ctx context.Context, id Identity, cut Cut) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for {
+		f := b.files[id]
+		if f == nil {
+			return nil
+		}
+		if f.lastLoss > cut.LossSequence {
+			if f.lastGenericLoss > cut.LossSequence {
+				return ErrLost
+			}
+			return recordedLossError(f.lastErrno)
+		}
+		pending := false
+		for r := f.head; r != nil && r.seq <= cut.Sequence; r = r.next {
+			if r.state == Accepted || r.state == Applied {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return nil
+		}
+		if b.stopped {
+			return ErrLost
 		}
 		ch := b.change()
 		b.mu.Unlock()
@@ -271,7 +429,10 @@ func (b *Buffer) waitDurable(ctx context.Context, id *Identity, cut Cut) error {
 	}
 }
 func (b *Buffer) WriteSync(ctx context.Context, id Identity, off int64, data []byte) (Cut, error) {
-	cut, err := b.Write(ctx, id, off, data)
+	return b.WriteSyncWithOptions(ctx, id, off, data, WriteOptions{})
+}
+func (b *Buffer) WriteSyncWithOptions(ctx context.Context, id Identity, off int64, data []byte, opts WriteOptions) (Cut, error) {
+	cut, err := b.WriteWithOptions(ctx, id, off, data, opts)
 	if err != nil {
 		return cut, err
 	}
@@ -288,11 +449,42 @@ func (b *Buffer) Fsync(ctx context.Context, id Identity) error {
 	}
 	return b.waitDurable(ctx, &id, cut)
 }
-func (b *Buffer) Barrier(ctx context.Context, observedLoss uint64) (bool, error) {
-	cut := b.Snapshot()
-	_, err := b.FlushAll(ctx, cut)
-	if err == nil {
-		err = b.waitDurable(ctx, nil, cut)
+func (b *Buffer) WaitBarrier(ctx context.Context, barrier BarrierCut) (bool, error) {
+	if barrier.state == nil {
+		return false, ErrInvalid
 	}
-	return b.LossSequence() > observedLoss, err
+	defer b.EndBarrier(barrier)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for {
+		if barrier.state.lost {
+			if barrier.state.generic {
+				return true, nil
+			}
+			if barrier.state.errno != 0 {
+				return true, barrier.state.errno
+			}
+			return true, nil
+		}
+		pending := false
+		for _, f := range b.active {
+			if f.head != nil && f.head.seq <= barrier.Sequence {
+				pending = true
+				break
+			}
+		}
+		if !pending {
+			return false, nil
+		}
+		if b.stopped {
+			return false, ErrLost
+		}
+		ch := b.change()
+		b.mu.Unlock()
+		err := wait(ctx, ch)
+		b.mu.Lock()
+		if err != nil {
+			return false, err
+		}
+	}
 }

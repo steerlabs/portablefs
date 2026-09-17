@@ -43,7 +43,7 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCrossMountDirectoryListingCoherence"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDirectoryWithNonPortableInodeRemainsListable"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirReturnsEveryNameExactlyOnce"
-  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirRefusesToPageAcrossARemoteMutation"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestPagedReaddirContinuesAcrossRemoteMutation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestConcurrentCrossMountWritersToOneFile"
   # A package-manager tree install (rename(2) publication into one directory)
   # racing concurrent enumerating readers. This is the exact shape that revoked
@@ -51,22 +51,32 @@ REQUIRED_TESTS=(
   # unfixed it fails in under a second, three runs out of three.
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAuthorityLossFailsCleanlyInsteadOfHanging"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTransportLossInterruptsWritebackCapacityWaitAtHorizon"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSessionExpiryReleasesABlockedLockWait"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDurableState"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestFailedKernelMountDischargesStrictMembership"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadGitAcrossMounts"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkloadSQLiteAcrossMounts"
-  # Retained real-VFS regression coverage. These test names predate protocol 6
-  # and do not, by themselves, prove lease grant/recall/discharge. Keep them
-  # required for the behavior they exercise until dedicated v6 tests land; add
-  # those tests by exact name rather than relabeling this block as lease proof.
+  # Retained real-VFS regression coverage. Historical names remain required;
+  # their assertions now exercise protocol 7 subscriptions and delegations.
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestRemoteWriteIsRepairedBeforeTheWritersCallReturns"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTheInitiatingMountDoesNotDeadlockOnItsOwnMutation"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestVisibilityAcknowledgmentSurvivesSaturatedIO"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestMetadataWorkloadRPCCost"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedMetadataKernelRoundTrip"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCachedLookupKernelRoundTrip"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestCreateUsesSubscribedNegativeWithoutLookupRPC"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestThousandFileInstallAmortizesDurabilityBarriers"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNewDirectoryInstallAvoidsLookupRPCs"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSameMountWritesInvalidateLiveAndReopenedCachedReaders"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReopenNotificationFailureIsInodeLocal"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestForegroundWritethroughWaitsForPeerVisibility"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDelegationPipelinePreservesOverlappingMountedWrites"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestNamespaceWithdrawalWaitsOnlyForAffectedCacheHolders"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestReadDirPlusColdListingAvoidsLookupRPCs"
   # Machine-local routing must be proven against the real kernel and the real
   # authority transport. Keep the zero-RPC tests here in particular: the
   # cross-process matrix proves two-machine isolation, but intentionally does
@@ -111,8 +121,8 @@ REQUIRED_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/Converge"
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/PlainServingAfterConvergence"
   "github.com/steerlabs/portablefs/vcs/internal/tierede2e:TestTieredVolumeLifecycleOnXFS/ManagerIndependentVerification"
-  # The files gateway is the only synchronous-repair frontend shipped on Linux
-  # and the only participant that is not a mount. Keep its real handshake with
+  # The files gateway is a cacheless peer reader, never a compatibility writer.
+  # Keep its real handshake with
   # the real volume handler required: every other readonlyfs test drives a fake,
   # which cannot observe attach negotiation, a real barrier, or whether a
   # cacheless reader can stall a writing mount.
@@ -150,15 +160,26 @@ run_host() {
   command -v docker >/dev/null || fail "docker is required to run the privileged integration suite" 69
   local root
   root=$(repository_root)
+  local profile_root=""
+  local -a profile_options=() docker_action=(run --rm) soak_options=()
+  if [[ ${PORTABLEFS_SOAK_TEST:-} == 1 ]]; then
+    soak_options=(--memory=2g --memory-swap=2g --cpus=2)
+  fi
+  if [[ -n "${PORTABLEFS_PROFILE_DIR:-}" ]]; then
+    mkdir -p -- "$PORTABLEFS_PROFILE_DIR"
+    profile_root=$(cd -- "$PORTABLEFS_PROFILE_DIR" && pwd)
+    profile_options=(-e PORTABLEFS_PROFILE_DIR=/profiles)
+    docker_action=(create)
+  fi
   echo "xfs-fuse-integration: launching ${PORTABLEFS_CI_IMAGE}"
   # The working tree is mounted read-only: the container provisions its own XFS
   # image and must never be able to mutate the checkout it is testing.
-  run_container() {
-    docker run --rm --privileged \
+  launch_container() {
+    docker "${docker_action[@]}" --privileged "${soak_options[@]}" \
       --tmpfs /var/tmp:exec,mode=1777 \
       -v "${root}/vcs:/work/vcs:ro" \
       -v "${root}/scripts:/work/scripts:ro" \
-      "$@" \
+      "$@" "${profile_options[@]}" \
       -e "PORTABLEFS_XFS_IMAGE_SIZE=${PORTABLEFS_XFS_IMAGE_SIZE}" \
       -e "PORTABLEFS_SERVICE_UID=${PORTABLEFS_SERVICE_UID}" \
       -e "PORTABLEFS_SERVICE_GID=${PORTABLEFS_SERVICE_GID}" \
@@ -167,9 +188,27 @@ run_host() {
       -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
       -e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
       -e "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
+      -e "PORTABLEFS_SOAK_TEST=${PORTABLEFS_SOAK_TEST:-}" \
+      -e "PORTABLEFS_PROFILE_RUN=${PORTABLEFS_PROFILE_RUN:-}" \
       -w /work \
       "${PORTABLEFS_CI_IMAGE}" \
       bash /work/scripts/xfs-fuse-integration.sh --in-container
+  }
+  run_container() {
+    if [[ -z "$profile_root" ]]; then
+      launch_container "$@"
+      return
+    fi
+    # Copy after the run instead of bind-mounting a host path: remote Docker
+    # contexts need not share /tmp (or any artifact directory) with the host.
+    profile_container=$(launch_container "$@")
+    trap 'if [[ -n "${profile_container:-}" ]]; then docker rm -f "$profile_container" >/dev/null 2>&1 || true; fi' EXIT
+    local status=0
+    docker start -a "$profile_container" || status=$?
+    docker cp "$profile_container:/profiles/." "$profile_root/" || status=1
+    docker rm "$profile_container" >/dev/null
+    profile_container=""
+    return "$status"
   }
   if [[ -d /lib/modules/$(uname -r) ]]; then
     run_container -v /lib/modules:/lib/modules:ro
@@ -179,6 +218,10 @@ run_host() {
 }
 
 install_container_dependencies() {
+  if [[ -n "${PORTABLEFS_PROFILE_DIR:-}" ]]; then
+    mkdir -p -- "$PORTABLEFS_PROFILE_DIR"
+    chmod 1777 "$PORTABLEFS_PROFILE_DIR"
+  fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   # xfsprogs: mkfs.xfs and xfs_quota. fuse3: the setuid fusermount3 helper the
@@ -188,6 +231,9 @@ install_container_dependencies() {
   # kmod supplies the tooling used while provisioning the kernel FUSE control
   # surface inherited from the host.
   apt-get install -y -qq --no-install-recommends xfsprogs fuse3 sqlite3 git util-linux libcap2-bin kmod >/dev/null
+  if [[ ${PORTABLEFS_SOAK_TEST:-} == 1 ]]; then
+    apt-get install -y -qq --no-install-recommends nodejs npm >/dev/null
+  fi
 }
 
 # The FUSE control filesystem is the kernel interface a strict mount's
@@ -243,7 +289,10 @@ create_service_identity() {
 # from opening the one provisioned XFS cell concurrently, which its exclusive
 # volume lock forbids.
 suite_command() {
-  local -a extra_go_test_flags=()
+  local -a extra_go_test_flags=() soak_env=()
+  if [[ ${PORTABLEFS_SOAK_TEST:-} == 1 ]]; then
+    soak_env=(GOMAXPROCS=2 GOMEMLIMIT=768MiB)
+  fi
   if [[ -n ${PORTABLEFS_GO_TEST_FLAGS:-} ]]; then
     read -r -a extra_go_test_flags <<<"$PORTABLEFS_GO_TEST_FLAGS"
   fi
@@ -270,6 +319,10 @@ suite_command() {
     PORTABLEFS_XFS_TEST_REQUIRED=1 \
     "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
     "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
+    "PORTABLEFS_SOAK_TEST=${PORTABLEFS_SOAK_TEST:-}" \
+    "${soak_env[@]}" \
+    "PORTABLEFS_PROFILE_DIR=${PORTABLEFS_PROFILE_DIR:-}" \
+    "PORTABLEFS_PROFILE_RUN=${PORTABLEFS_PROFILE_RUN:-}" \
     go -C /work/vcs test -v -count=1 -failfast -p 1 -timeout 35m \
     "${extra_go_test_flags[@]}" "$@"
 }
@@ -281,6 +334,12 @@ suite_command() {
 # an archived directory refuses to open for reading.
 run_plain_suite() {
   local log=$1
+  if [[ ${PORTABLEFS_SOAK_TEST:-} == 1 ]]; then
+    local -a soak_command=()
+    mapfile -d '' -t soak_command < <(suite_command -failfast=false ./test/soak)
+    runuser -u portablefs -- "${soak_command[@]}" >>"$log" 2>&1
+    return
+  fi
   local -a command=()
   mapfile -d '' -t command < <(suite_command ./internal/fusev3/... ./internal/xfsstore/... ./internal/authorityrpc/... ./internal/restoremode/... ./internal/archiver/... ./internal/hydrator/...)
   runuser -u portablefs -- "${command[@]}" >>"$log" 2>&1
@@ -321,6 +380,14 @@ run_suite() {
   if [[ $status -ne 0 ]]; then
     cat -- "$log"
     fail "go test exited $status" "$status"
+  fi
+  if [[ ${PORTABLEFS_SOAK_TEST:-} == 1 ]]; then
+    cat -- "$log"
+    verify_exact_tests "$log" \
+      soak:TestSoakPackageTree soak:TestSoakGit soak:TestSoakCompiler soak:TestSoakChaos \
+      soak:TestSoakFaults soak:TestSoakNPM soak:TestSoakGitLock
+    echo "xfs-fuse-integration: soak inventory passed; standard privileged suites not selected"
+    return
   fi
   run_tiered_suite "$log"
   status=$?
@@ -393,7 +460,9 @@ run_container() {
   provision_xfs
   provision_volume
   run_suite
-  run_root_boundary_suite
+  if [[ ${PORTABLEFS_SOAK_TEST:-} != 1 ]]; then
+    run_root_boundary_suite
+  fi
 }
 
 case "${1:-}" in

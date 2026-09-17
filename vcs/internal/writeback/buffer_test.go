@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -218,6 +219,7 @@ func TestBufferStateTransitionsAndPartialOverlayRetirement(t *testing.T) {
 	assertStats(t, b, Stats{Bytes: 10, Entries: 2, Applied: 2})
 	b.VisibleSequence(10)
 	assertStats(t, b, Stats{Bytes: 10, Entries: 2, Applied: 1, Visible: 1})
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	assertStats(t, b, Stats{Bytes: 2, Entries: 1, Applied: 1})
 	// The old extent is now in the Authority image. The newer dirty extent must
@@ -226,12 +228,13 @@ func TestBufferStateTransitionsAndPartialOverlayRetirement(t *testing.T) {
 
 	b.VisibleSequence(20)
 	assertStats(t, b, Stats{Bytes: 2, Entries: 1, Visible: 1})
+	b.VisibleSequence(20)
 	b.DurableSequence(20)
 	assertStats(t, b, Stats{})
 	assertRead(t, b, id, 0, 8, []byte("ABxyEFGH"), []byte("ABxyEFGH"))
 }
 
-func TestDurableNotificationMayRaceAheadOfFlushReply(t *testing.T) {
+func TestDurabilityCannotStandInForVisibility(t *testing.T) {
 	var b *Buffer
 	flusher := flusherFunc(func(_ context.Context, _ Identity, _ Entry) (uint64, error) {
 		b.DurableSequence(42)
@@ -244,6 +247,18 @@ func TestDurableNotificationMayRaceAheadOfFlushReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := b.FlushIdentity(context.Background(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	assertStats(t, b, Stats{Bytes: 1, Entries: 1, Applied: 1})
+	visible := make(chan error, 1)
+	go func() { visible <- b.WaitVisible(context.Background(), id, cut) }()
+	select {
+	case err := <-visible:
+		t.Fatalf("durability completed visibility wait: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	b.VisibleSequence(42)
+	if err := await(t, visible, "visibility wait"); err != nil {
 		t.Fatal(err)
 	}
 	assertStats(t, b, Stats{})
@@ -273,15 +288,18 @@ func TestPartialDurabilityRetiresOldWriteAndTruncateButKeepsLaterWrite(t *testin
 	want := []byte{'A', 'B', 'C', 0, 0, 'Z'}
 	assertRead(t, b, id, 0, 20, []byte("abcdefgh"), want)
 
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	assertStats(t, b, Stats{Bytes: 1, Entries: 2, Applied: 2})
 	assertRead(t, b, id, 0, 20, []byte("ABCDEFGH"), want)
+	b.VisibleSequence(20)
 	b.DurableSequence(20)
 	assertStats(t, b, Stats{Bytes: 1, Entries: 1, Applied: 1})
 	assertRead(t, b, id, 0, 20, []byte("ABC"), want)
 	if got := b.Size(id, 3); got != 6 {
 		t.Fatalf("size after truncate retirement with later write = %d, want 6", got)
 	}
+	b.VisibleSequence(30)
 	b.DurableSequence(30)
 	assertStats(t, b, Stats{})
 }
@@ -631,6 +649,7 @@ func TestAdmissionBlocksAtCapsUntilDurableRetirement(t *testing.T) {
 			close(release)
 			// Application alone does not release retained dirty capacity.
 			assertBlocked(t, result, "admission before durability")
+			b.VisibleSequence(10)
 			b.DurableSequence(10)
 			if err := await(t, result, "admission after durability"); err != nil {
 				t.Fatal(err)
@@ -694,6 +713,7 @@ func TestFullByteCapBlocksMetadataAdmissions(t *testing.T) {
 	close(release)
 	assertBlocked(t, truncated, "truncate before durable retirement")
 	assertBlocked(t, attributed, "setattr before durable retirement")
+	b.VisibleSequence(12)
 	b.DurableSequence(12)
 	if err := await(t, truncated, "truncate after capacity release"); err != nil {
 		t.Fatal(err)
@@ -828,7 +848,7 @@ func TestMountRetirementBlocksNewIdentitiesAndCompetingRetirements(t *testing.T)
 	}
 }
 
-func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
+func TestDropDuringSuccessfulFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	started := make(chan Entry, 1)
 	release := make(chan struct{})
 	flusher := flusherFunc(func(ctx context.Context, _ Identity, entry Entry) (uint64, error) {
@@ -836,6 +856,51 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 		select {
 		case <-release:
 			return 50, nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+	b := newTestBuffer(t, flusher)
+	id := testIdentity(14)
+	cut := mustWrite(t, b, id, 1, "dirty")
+	result := make(chan error, 1)
+	go func() { _, err := b.FlushIdentity(context.Background(), id, cut); result <- err }()
+	await(t, started, "in-flight successful flush")
+	report := b.Drop(id, "stale generation")
+	if report.Identity != id || report.Reason != "stale generation" || report.Bytes != 5 || report.Entries != 1 || report.LossSequence != 1 {
+		t.Fatalf("Drop report = %+v", report)
+	}
+	close(release)
+	if err := await(t, result, "dropped successful flush"); !errors.Is(err, ErrLost) {
+		t.Fatalf("FlushIdentity error = %v, want ErrLost", err)
+	}
+	assertStats(t, b, Stats{LossSequence: 1})
+	assertRead(t, b, id, 0, 7, []byte("clean!!"), []byte("clean!!"))
+	if !b.Lost(id) || b.IdentityLoss(id) != 1 {
+		t.Fatalf("loss state = (%v, %d), want (true, 1)", b.Lost(id), b.IdentityLoss(id))
+	}
+	if !b.ClearLost(id) || b.ClearLost(id) {
+		t.Fatal("ClearLost must report the sticky identity error exactly once")
+	}
+	if b.IdentityLoss(id) != 1 {
+		t.Fatal("ClearLost erased per-handle loss observation")
+	}
+	if got := b.Generation(id); got != 2 {
+		t.Fatalf("generation after drop = %d, want 2", got)
+	}
+	b.VisibleSequence(50)
+	b.DurableSequence(50)
+}
+
+func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
+	started := make(chan Entry, 1)
+	release := make(chan struct{})
+	transportErr := errors.New("injected retryable transport failure")
+	flusher := flusherFunc(func(ctx context.Context, _ Identity, entry Entry) (uint64, error) {
+		started <- entry
+		select {
+		case <-release:
+			return 0, transportErr
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
@@ -853,6 +918,8 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	close(release)
 	if err := await(t, result, "dropped flush"); !errors.Is(err, ErrLost) {
 		t.Fatalf("FlushIdentity error = %v, want ErrLost", err)
+	} else if errors.Is(err, transportErr) {
+		t.Fatalf("rebinding loss was hidden by transport error: %v", err)
 	}
 	assertStats(t, b, Stats{LossSequence: 1})
 	assertRead(t, b, id, 0, 7, []byte("clean!!"), []byte("clean!!"))
@@ -871,6 +938,22 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	// Late cumulative notifications for the dropped operation must be harmless.
 	b.VisibleSequence(50)
 	b.DurableSequence(50)
+}
+
+func TestFenceAdmissionsInterruptsDurabilityWait(t *testing.T) {
+	b := newTestBuffer(t, &recordingFlusher{})
+	id := testIdentity(15)
+	cut := mustWrite(t, b, id, 0, "undurable")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.waitDurable(context.Background(), &id, cut) }()
+	assertBlocked(t, done, "durability wait before fence")
+	b.FenceAdmissions()
+	if err := await(t, done, "fenced durability wait"); !errors.Is(err, ErrLost) {
+		t.Fatalf("waitDurable error = %v, want ErrLost", err)
+	}
 }
 
 func TestFlushCancellationRetainsStableRetry(t *testing.T) {
@@ -1046,6 +1129,7 @@ func TestFsyncWaitsForItsIdentityCutOnly(t *testing.T) {
 		t.Fatalf("Fsync flushed %x, want %x", id, target)
 	}
 	assertBlocked(t, result, "Fsync before durability")
+	b.VisibleSequence(40)
 	b.DurableSequence(40)
 	if err := await(t, result, "Fsync target durability"); err != nil {
 		t.Fatal(err)
@@ -1077,12 +1161,23 @@ func TestBarrierUsesCallTimeCutAndReportsObservedLoss(t *testing.T) {
 		err  error
 	}
 	result := make(chan barrierResult, 1)
-	go func() { lost, err := b.Barrier(context.Background(), 0); result <- barrierResult{lost, err} }()
+	barrier := b.BeginBarrier(0)
+	go func() {
+		_, err := b.FlushBarrier(context.Background(), barrier)
+		if err != nil {
+			b.EndBarrier(barrier)
+			result <- barrierResult{false, err}
+			return
+		}
+		lost, err := b.WaitBarrier(context.Background(), barrier)
+		result <- barrierResult{lost, err}
+	}()
 	if id := await(t, entered, "barrier flush"); id != before {
 		t.Fatalf("barrier flushed identity %x, want %x", id, before)
 	}
 	mustWrite(t, b, after, 0, "after")
 	close(release)
+	b.VisibleSequence(80)
 	b.DurableSequence(80)
 	got := await(t, result, "barrier")
 	if got.lost || got.err != nil {
@@ -1094,7 +1189,13 @@ func TestBarrierUsesCallTimeCutAndReportsObservedLoss(t *testing.T) {
 	}
 
 	b.Drop(after, "test loss")
-	lost, err := b.Barrier(context.Background(), 0)
+	barrier = b.BeginBarrier(0)
+	_, err := b.FlushBarrier(context.Background(), barrier)
+	if err != nil {
+		b.EndBarrier(barrier)
+		t.Fatal(err)
+	}
+	lost, err := b.WaitBarrier(context.Background(), barrier)
 	if !lost || err != nil {
 		t.Fatalf("Barrier observing prior loss = (%v, %v), want (true, nil)", lost, err)
 	}
@@ -1132,6 +1233,10 @@ func TestReadOverlayTruncateAndAttributes(t *testing.T) {
 	}
 	got := b.OverlayAttributes(id, Attributes{HasMode: true, Mode: 0o644, HasGID: true, GID: 8, HasSize: true, Size: 100})
 	want := Attributes{HasMode: true, Mode: 0o600, HasUID: true, UID: 7, HasGID: true, GID: 8, HasSize: true, Size: 6, HasMTime: true, MTimeNS: 99}
+	if !got.HasCTime || got.CTimeNS <= 0 {
+		t.Fatal("missing implicit ctime", got)
+	}
+	got.CTimeNS, got.HasCTime = 0, false
 	if got != want {
 		t.Fatalf("OverlayAttributes = %+v, want %+v", got, want)
 	}
@@ -1167,6 +1272,7 @@ func TestReadSnapshotSurvivesConcurrentDurableRetirement(t *testing.T) {
 		}{data, err}
 	}()
 	await(t, fetchEntered, "blocked fetch after overlay snapshot")
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	assertStats(t, b, Stats{})
 	close(fetchRelease)
@@ -1228,6 +1334,7 @@ func TestForgetOnlyReleasesIdleCleanIdentity(t *testing.T) {
 	if _, err := b.FlushIdentity(context.Background(), id, cut); err != nil {
 		t.Fatal(err)
 	}
+	b.VisibleSequence(10)
 	b.DurableSequence(10)
 	if !b.Forget(id) {
 		t.Fatal("Forget clean identity = false")
@@ -1412,5 +1519,260 @@ func assertBlocked[T any](t *testing.T, ch <-chan T, what string) {
 	case value := <-ch:
 		t.Fatalf("%s completed early with %v", what, value)
 	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestImplicitTimestampOverlayPreservesOrderUntilDurability(t *testing.T) {
+	b := newTestBuffer(t, &recordingFlusher{})
+	id := testIdentity(81)
+	base := Attributes{HasMTime: true, MTimeNS: 1, HasCTime: true, CTimeNS: 2}
+	var cut Cut
+	var err error
+	steps := []struct {
+		name     string
+		admit    func() (Cut, error)
+		explicit int64
+	}{
+		{"write", func() (Cut, error) { return b.Write(t.Context(), id, 0, []byte("a")) }, 0},
+		{"explicit mtime after write", func() (Cut, error) { return b.SetAttr(t.Context(), id, Attributes{HasMTime: true, MTimeNS: 99}) }, 99},
+		{"size and explicit mtime", func() (Cut, error) {
+			return b.SetAttr(t.Context(), id, Attributes{HasSize: true, Size: 3, HasMTime: true, MTimeNS: 77})
+		}, 77},
+		{"write after explicit mtime", func() (Cut, error) { return b.Write(t.Context(), id, 1, []byte("b")) }, 0},
+		{"truncate", func() (Cut, error) { return b.Truncate(t.Context(), id, 2) }, 0},
+	}
+	for _, step := range steps {
+		before := time.Now().UnixNano()
+		cut, err = step.admit()
+		after := time.Now().UnixNano()
+		if err != nil {
+			t.Fatal(step.name, err)
+		}
+		got := b.OverlayAttributes(id, base)
+		if !got.HasCTime || got.CTimeNS < before || got.CTimeNS > after {
+			t.Fatalf("%s ctime outside admission: %+v", step.name, got)
+		}
+		if step.explicit != 0 {
+			if got.MTimeNS != step.explicit {
+				t.Fatalf("%s explicit mtime lost: %+v", step.name, got)
+			}
+		} else if got.MTimeNS != got.CTimeNS {
+			t.Fatalf("%s implicit timestamps differ: %+v", step.name, got)
+		}
+	}
+	want := b.OverlayAttributes(id, base)
+	sequence, err := b.FlushIdentity(t.Context(), id, cut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := b.OverlayAttributes(id, base); got != want {
+		t.Fatalf("application retired implicit attributes: got %+v want %+v", got, want)
+	}
+	b.VisibleSequence(sequence)
+	b.DurableSequence(sequence)
+	if got := b.OverlayAttributes(id, base); got.MTimeNS != base.MTimeNS || got.CTimeNS != base.CTimeNS {
+		t.Fatalf("durable overlay did not retire: %+v", got)
+	}
+}
+
+func TestWriteOptionsFenceCoalescingAndPreservePrivilegeOrder(t *testing.T) {
+	ctx := context.Background()
+	f := &recordingFlusher{}
+	b := newTestBuffer(t, f)
+	id := testIdentity(81)
+	first := WriteOptions{Flags: 6, LockOwner: 11, KillPrivileges: true}
+	second := WriteOptions{Flags: 6, LockOwner: 12, KillPrivileges: true}
+	for i, opts := range []WriteOptions{first, first, second, {}} {
+		if _, err := b.WriteWithOptions(ctx, id, int64(i), []byte("x"), opts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := b.FlushIdentity(ctx, id, b.Snapshot()); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.snapshot()
+	if len(calls) != 3 || len(calls[0].entry.Data) != 2 || calls[0].entry.WriteOptions != first || calls[1].entry.WriteOptions != second || calls[2].entry.WriteOptions != (WriteOptions{}) {
+		t.Fatalf("write metadata coalescing: %+v", calls)
+	}
+	for _, tc := range []struct{ mode, want uint32 }{{0o6755, 0o755}, {0o6744, 0o2744}} {
+		base := Attributes{Mode: tc.mode, HasMode: true}
+		if got := b.OverlayAttributes(id, base).Mode; got != tc.want {
+			t.Fatalf("killpriv %o: got %o want %o", tc.mode, got, tc.want)
+		}
+	}
+	if _, err := b.SetAttr(ctx, id, Attributes{Mode: 0o6755, HasMode: true}); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.OverlayAttributes(id, Attributes{Mode: 0o755, HasMode: true}).Mode; got != 0o6755 {
+		t.Fatalf("later chmod lost: %o", got)
+	}
+	if _, err := b.WriteWithOptions(ctx, id, 4, []byte("x"), first); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.OverlayAttributes(id, Attributes{Mode: 0o755, HasMode: true}).Mode; got != 0o755 {
+		t.Fatalf("write after chmod kept privileges: %o", got)
+	}
+}
+
+func TestBackgroundFlushBoundsFanoutAndExplicitFlushBypassesQueue(t *testing.T) {
+	entered := make(chan Identity, 128)
+	release := make(chan struct{})
+	var sequence atomic.Uint64
+	explicit := testIdentity(200)
+	flusher := flusherFunc(func(ctx context.Context, id Identity, _ Entry) (uint64, error) {
+		if id == explicit {
+			return sequence.Add(1), nil
+		}
+		select {
+		case entered <- id:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+		select {
+		case <-release:
+			return sequence.Add(1), nil
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	})
+	b := newTestBuffer(t, flusher, Options{MaxBytes: 8 << 20, MaxEntries: 256, FlushInterval: -1, MaxFlushIdentities: 2})
+	for i := 0; i < 96; i++ {
+		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
+	}
+	b.trigger()
+	await(t, entered, "first background worker")
+	await(t, entered, "second background worker")
+	assertBlocked(t, entered, "background fanout beyond worker bound")
+	cut := mustWrite(t, b, explicit, 0, "priority")
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if _, err := b.FlushIdentity(ctx, explicit, cut); err != nil {
+		t.Fatalf("explicit flush waited behind background queue: %v", err)
+	}
+	// A coalesced kick during the active batch must preserve new work.
+	later := testIdentity(201)
+	mustWrite(t, b, later, 0, "later")
+	b.trigger()
+	close(release)
+	seen := false
+	for range 95 {
+		if id := await(t, entered, "remaining background work"); id == later {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("kick during active batch lost later admission")
+	}
+}
+
+func TestStopCancelsBlockedBackgroundBatch(t *testing.T) {
+	entered := make(chan struct{}, 128)
+	b := newTestBuffer(t, flusherFunc(func(ctx context.Context, _ Identity, _ Entry) (uint64, error) {
+		entered <- struct{}{}
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}))
+	for i := 0; i < 96; i++ {
+		mustWrite(t, b, testIdentity(byte(i)), 0, "x")
+	}
+	b.trigger()
+	await(t, entered, "blocked worker")
+	done := make(chan struct{})
+	go func() { b.Stop(); close(done) }()
+	await(t, done, "stop of blocked worker batch")
+	if got := b.Stats().Entries; got != 96 {
+		t.Fatalf("Stop discarded retained entries: %d", got)
+	}
+}
+
+func TestCapacityRefusalKeepsErrnoAcrossDropDuringFlush(t *testing.T) {
+	var b *Buffer
+	var report DropReport
+	b = newTestBuffer(t, flusherFunc(func(_ context.Context, id Identity, _ Entry) (uint64, error) {
+		report = b.DropWithErrno(id, "full", syscall.ENOSPC)
+		return 0, syscall.ENOSPC
+	}))
+	id := testIdentity(91)
+	cut := mustWrite(t, b, id, 0, "dirty")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("flush = %v", err)
+	}
+	if report.Errno != syscall.ENOSPC || report.Bytes != 5 || report.Entries != 1 || report.LossSequence != 1 {
+		t.Fatalf("report = %+v", report)
+	}
+	loss, errno := b.IdentityFailure(id, 0)
+	if loss != 1 || errno != syscall.ENOSPC || b.ErrnoSince(0) != syscall.ENOSPC || b.ErrnoSince(1) != 0 {
+		t.Fatalf("failure = %d/%v", loss, errno)
+	}
+	report = b.Drop(id, "fenced")
+	loss, errno = b.IdentityFailure(id, 0)
+	if loss != 2 || errno != 0 || report.Errno != 0 || b.ErrnoSince(0) != 0 {
+		t.Fatalf("fence failure = %d/%v", loss, errno)
+	}
+}
+
+func TestMixedLossesCannotHideUncertainDataBehindCapacityErrno(t *testing.T) {
+	for _, capacityFirst := range []bool{false, true} {
+		t.Run(fmt.Sprint(capacityFirst), func(t *testing.T) {
+			b := newTestBuffer(t, &recordingFlusher{})
+			id := testIdentity(92)
+			if capacityFirst {
+				b.DropWithErrno(id, "full", syscall.ENOSPC)
+				b.Drop(id, "coherence")
+			} else {
+				b.Drop(id, "coherence")
+				b.DropWithErrno(id, "full", syscall.ENOSPC)
+			}
+			if loss, errno := b.IdentityFailure(id, 0); loss != 2 || errno != 0 {
+				t.Fatalf("mixed identity failure = %d/%v", loss, errno)
+			}
+			if !capacityFirst {
+				if loss, errno := b.IdentityFailure(id, 1); loss != 2 || errno != syscall.ENOSPC {
+					t.Fatalf("capacity after observed coherence loss = %d/%v", loss, errno)
+				}
+			}
+			if got := b.ErrnoSince(0); got != 0 {
+				t.Fatalf("capacity errno %v hid an unobserved coherence loss", got)
+			}
+		})
+	}
+}
+
+func TestDropAllReportsEveryRetainedIdentity(t *testing.T) {
+	b := newTestBuffer(t, &recordingFlusher{})
+	ids := []Identity{testIdentity(94), testIdentity(95), testIdentity(96)}
+	for i, id := range ids {
+		cut := mustWrite(t, b, id, 0, "kept")
+		if i < 2 {
+			if _, err := b.FlushIdentity(t.Context(), id, cut); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	b.VisibleSequence(10)
+	if stats := b.Stats(); stats.Accepted != 1 || stats.Applied != 1 || stats.Visible != 1 {
+		t.Fatalf("retention setup=%+v", stats)
+	}
+	reports := b.DropAll("unreachable on detach")
+	if len(reports) != 3 {
+		t.Fatalf("reports=%+v", reports)
+	}
+	seen := make(map[Identity]bool)
+	for _, report := range reports {
+		if seen[report.Identity] || report.Bytes != 4 || report.Entries != 1 || report.LossSequence == 0 || report.Reason != "unreachable on detach" {
+			t.Fatalf("report=%+v", report)
+		}
+		seen[report.Identity] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			t.Fatalf("missing identity %x", id)
+		}
+	}
+	if stats := b.Stats(); stats.Bytes != 0 || stats.Entries != 0 || stats.LossSequence != 3 {
+		t.Fatalf("after drop=%+v", stats)
+	}
+	if again := b.DropAll("again"); len(again) != 0 || b.LossSequence() != 3 {
+		t.Fatalf("duplicate shutdown loss=%+v", again)
 	}
 }

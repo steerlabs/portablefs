@@ -302,7 +302,7 @@ func TestExpiredEnumerationPageIsNotServedAfterResume(t *testing.T) {
 	if errno != 0 || entry == nil || entry.Name != "a" {
 		t.Fatalf("prime enumeration = (%v, %v)", entry, errno)
 	}
-	handle.consume()
+	handle.consume(entry)
 	oldStamp := handle.pageStamp
 	frontend.mount.subscription.mu.Lock()
 	frontend.mount.subscription.incarnation++
@@ -537,4 +537,179 @@ func TestRenewalPreservesDaemonPayloadForSameEpoch(t *testing.T) {
 
 func TestSourceDischargeDoesNotRequirePostStateOrMatchingCommitSequence(t *testing.T) {
 	TestSubscriptionAckFollowsProvenWithdrawal(t)
+}
+
+func TestNamespaceWithdrawalRejectsPendingRepliesWithoutKernelNotify(t *testing.T) {
+	for _, negative := range []bool{false, true} {
+		t.Run(fmt.Sprint(negative), func(t *testing.T) {
+			fixture := newStrictFixture(t)
+			const name = "pending-name"
+			fixture.rpc.byName = map[string]*authoritypb.Item{name: testItem(94, authoritypb.Attr_REGULAR, 94)}
+			fixture.rpc.missingNames[name] = negative
+			unique := fixture.unique.Add(2)
+			out := &fuse.EntryOut{}
+			status := fixture.raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, name, out)
+			if !status.Ok() || (out.NodeId == 0) != negative || out.EntryValid != 0 || out.EntryValidNsec != 0 {
+				t.Fatalf("pending reply status=%v out=%v", status, out)
+			}
+			parent := publicationIdentity(testIdentity(1))
+			entry := &authoritypb.ChangeEntry{Position: 1, VolumeVersion: 2, Kind: authoritypb.ChangeKind_CHANGE_KIND_NAMESPACE_CHANGED, ParentIdentity: parent[:], Name: []byte(name)}
+			registry := fixture.mount.subscription
+			incarnation := registry.stamp().incarnation
+			if err := registry.registerChangeBatch(incarnation, &authoritypb.ChangeBatch{Incarnation: incarnation, Entries: []*authoritypb.ChangeEntry{entry}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.applyChange(t.Context(), incarnation, entry); err != nil {
+				t.Fatal(err)
+			}
+			completeTestReply(t, fixture.raw, unique, fuse.OK)
+			fixture.raw.mu.Lock()
+			key := nameKey{parent: fuse.FUSE_ROOT_ID, name: name}
+			_, positive := fixture.raw.cachedNames[key]
+			_, absent := fixture.raw.cachedNegatives[key]
+			fixture.raw.mu.Unlock()
+			if positive || absent {
+				t.Fatal("old reply refilled withdrawn namespace permission")
+			}
+			for _, call := range fixture.notify.snapshot() {
+				if call.kind == "entry" {
+					t.Fatal("namespace withdrawal acquired a VFS parent lock")
+				}
+			}
+			fixture.rpc.mu.Lock()
+			before := fixture.rpc.calls
+			fixture.rpc.readSequence = 2
+			fixture.rpc.missingNames[name] = !negative
+			fixture.rpc.mu.Unlock()
+			next := fixture.lookup(t, fuse.FUSE_ROOT_ID, name)
+			fixture.rpc.mu.Lock()
+			calls := fixture.rpc.calls
+			fixture.rpc.mu.Unlock()
+			if calls != before+1 || (next.NodeId == 0) == negative || next.EntryValid != 0 || next.EntryValidNsec != 0 {
+				t.Fatalf("next lookup: calls %d->%d reply=%v", before, calls, next)
+			}
+		})
+	}
+}
+
+func TestRenamePostBindingsSettleOnlyAtFreshReplyBoundary(t *testing.T) {
+	for _, scenario := range []struct {
+		name                 string
+		withdrawn, forgotten bool
+	}{{name: "fresh"}, {name: "withdrawn", withdrawn: true}, {name: "forgotten", forgotten: true}} {
+		t.Run(scenario.name, func(t *testing.T) {
+			f := newStrictFixture(t)
+			f.rpc.byName = map[string]*authoritypb.Item{"old": f.rpc.item}
+			f.rpc.missingNames["new"] = true
+			moved := f.lookup(t, 1, "old")
+			f.lookup(t, 1, "new")
+			unique := f.unique.Add(2)
+			if status := f.raw.Rename(nil, &fuse.RenameIn{InHeader: fuse.InHeader{Unique: unique, NodeId: 1}, Newdir: 1}, "old", "new"); !status.Ok() {
+				t.Fatal(status)
+			}
+			f.raw.mu.Lock()
+			_, premature := f.raw.cachedNames[nameKey{parent: 1, name: "new"}]
+			f.raw.mu.Unlock()
+			if premature {
+				t.Fatal("rename installed a binding before physical reply")
+			}
+			if scenario.withdrawn {
+				registry := f.mount.subscription
+				incarnation := registry.stamp().incarnation
+				entries := []*authoritypb.ChangeEntry{}
+				for i, name := range []string{"old", "new"} {
+					entries = append(entries, &authoritypb.ChangeEntry{Position: uint64(i + 1), VolumeVersion: 3, Kind: authoritypb.ChangeKind_CHANGE_KIND_NAMESPACE_CHANGED, ParentIdentity: testIdentity(1), Name: []byte(name)})
+				}
+				if err := registry.registerChangeBatch(incarnation, &authoritypb.ChangeBatch{Incarnation: incarnation, Entries: entries}); err != nil {
+					t.Fatal(err)
+				}
+				for _, entry := range entries {
+					if err := registry.applyChange(t.Context(), incarnation, entry); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if scenario.forgotten {
+				f.raw.Forget(moved.NodeId, 1)
+			}
+			completeTestReply(t, f.raw, unique, fuse.OK)
+			f.raw.mu.Lock()
+			bound := f.raw.cachedNames[nameKey{parent: 1, name: "new"}]
+			_, absent := f.raw.cachedNegatives[nameKey{parent: 1, name: "old"}]
+			f.raw.mu.Unlock()
+			if scenario.withdrawn {
+				if bound != nil || absent {
+					t.Fatal("withdrawn rename reply restored namespace payloads")
+				}
+			} else if scenario.forgotten {
+				if bound != nil || !absent {
+					t.Fatal("forgotten rename record refilled daemon binding")
+				}
+			} else if bound == nil || bound.id != moved.NodeId || !absent {
+				t.Fatalf("fresh rename post-bindings: moved=%v oldAbsent=%t", bound, absent)
+			}
+		})
+	}
+}
+
+func TestEnumerationInvalidationBetweenPeekAndConsumePreservesDeliveredCookie(t *testing.T) {
+	frontend, _, rpc := testRawFileSystem(t, 8)
+	record, errno := frontend.intern(t.Context(), testItem(87, authoritypb.Attr_DIRECTORY, 87))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	rpc.root = cloneItem(record.node.item)
+	rpc.dirPages = []*authoritypb.ReadDirReply{testDirPage(2, true, func(index int) []byte { return encodeCookie(uint64(100 + index)) })}
+	handle := &dirHandle{node: record.node, token: testToken(111)}
+	ctx, finish := testMutationContext(t, frontend.mount)
+	defer finish(true)
+	entry, _, errno := handle.peek(ctx, false)
+	if errno != 0 || entry == nil {
+		t.Fatalf("peek: %v %v", entry, errno)
+	}
+	handle.invalidateEnumeration()
+	handle.consume(entry)
+	if cookie, ok := decodeCookie(handle.cookie); !ok || cookie != entry.Off || handle.next != entry.Off {
+		t.Fatalf("lost delivered cookie: %x next=%d want=%d", handle.cookie, handle.next, entry.Off)
+	}
+	if len(handle.page) != 0 || handle.pending != nil {
+		t.Fatal("withdrawn page survived delivery receipt")
+	}
+}
+
+func TestEnumerationRefetchUsesItsOwnAdmissionStampWithinCallback(t *testing.T) {
+	frontend, _, rpc := testRawFileSystem(t, 8)
+	record, errno := frontend.intern(t.Context(), testItem(88, authoritypb.Attr_DIRECTORY, 88))
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	rpc.root = cloneItem(record.node.item)
+	first := testDirPage(1, true, func(int) []byte { return encodeCookie(100) })
+	second := testDirPage(2, true, func(i int) []byte { return encodeCookie(uint64(101 + i)) })
+	second.Entries[0].Name, second.Entries[1].Name = []byte("fresh-b"), []byte("fresh-c")
+	rpc.dirPages = []*authoritypb.ReadDirReply{first, second}
+	handle := &dirHandle{node: record.node, token: testToken(112)}
+	ctx, finish := testMutationContext(t, frontend.mount)
+	defer finish(true)
+	entry, _, errno := handle.peek(ctx, false)
+	if errno != 0 || entry == nil {
+		t.Fatal(errno)
+	}
+	handle.consume(entry)
+	registry := frontend.mount.subscription
+	registry.mu.Lock()
+	registry.generation++
+	registry.coordinates[publicationCoordinate{kind: publicationItemEnumeration, item: record.identity}] = subscriptionCoordinateState{generation: registry.generation, minVersion: 3}
+	registry.mu.Unlock()
+	handle.invalidateEnumeration()
+	rpc.mu.Lock()
+	rpc.readSequence = 3
+	rpc.mu.Unlock()
+	for _, want := range []string{"fresh-b", "fresh-c"} {
+		entry, _, errno := handle.peek(ctx, false)
+		if errno != 0 || entry == nil || entry.Name != want {
+			t.Fatalf("refetched page: %v %v, want %s", entry, errno, want)
+		}
+		handle.consume(entry)
+	}
 }

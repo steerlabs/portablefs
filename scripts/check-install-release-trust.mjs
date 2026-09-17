@@ -217,7 +217,6 @@ const failures = [];
 const versionMatch = /^((?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))\n$/.exec(
   versionFile
 );
-const releaseVersion = versionMatch?.[1] ?? "";
 if (!versionMatch) {
   failures.push("VERSION must contain one newline-terminated stable SemVer without leading zeroes");
 }
@@ -492,6 +491,7 @@ for (const { relativePath, contents } of appGroupBuildConfigs) {
     }
   }
 }
+let developerProjectVersion = "";
 for (const { relativePath, contents } of [
   {
     relativePath: "swift/PortableFSApp/PortableFSApp.xcodeproj/project.pbxproj",
@@ -502,12 +502,22 @@ for (const { relativePath, contents } of [
   const projectVersions = [
     ...contents.matchAll(/MARKETING_VERSION = ([^;]+);/g),
   ].map((match) => match[1]);
+  const projectVersion = projectVersions[0] ?? "";
   if (
     projectVersions.length !== 4 ||
-    projectVersions.some((version) => version !== releaseVersion)
+    !/^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/.test(
+      projectVersion
+    ) ||
+    projectVersions.some((version) => version !== projectVersion)
   ) {
     failures.push(
-      `${relativePath} must give all four build configurations exact VERSION ${releaseVersion || "<invalid>"}`
+      `${relativePath} must give all four development configurations one stable SemVer default`
+    );
+  }
+  if (developerProjectVersion === "") developerProjectVersion = projectVersion;
+  if (projectVersion !== developerProjectVersion) {
+    failures.push(
+      `${relativePath} development version ${projectVersion || "<invalid>"} differs from ${developerProjectVersion}`
     );
   }
 }
@@ -749,13 +759,7 @@ for (const unsignedBuildVerification of [
   '[ "$host_group" = "$extension_group" ]',
   '[ "$cli_group" = "$app_group" ]',
   '[ "$daemon_group" = "$app_group" ]',
-  '[ "$app_version" = "$version" ]',
-  '[ "$extension_version" = "$version" ]',
-  '[ "$service_version" = "$version" ]',
-  '"$cli" version | grep -Fx "portablefs $version"',
-  '"$daemon" -version | grep -Fx "$version"',
   'PORTABLEFS_APP_GROUP="$app_group"',
-  'MARKETING_VERSION="$version"',
   'PORTABLEFS_GO="$go_binary"',
   "PORTABLEFS_NATIVE_QUALIFICATION=",
   'go_root=$(GOTOOLCHAIN=auto "$go_candidate" -C "$repo_root/vcs" env GOROOT)',
@@ -766,6 +770,34 @@ for (const unsignedBuildVerification of [
     unsignedBuildVerification,
     `unsigned package app-group proof ${unsignedBuildVerification}`
   );
+}
+
+for (const releaseVersionBoundary of [
+  'MARKETING_VERSION="$version"',
+  'CURRENT_PROJECT_VERSION="$build_number"',
+  '[ "$app_version" = "$version" ]',
+  '[ "$extension_version" = "$version" ]',
+  '[ "$service_version" = "$version" ]',
+  '"$cli" version | grep -Fx "portablefs $version"',
+  '"$daemon" -version | grep -Fx "$version"',
+  'zip="$out_root/portablefs_${version}_darwin_universal_app.zip"',
+]) {
+  requireText(
+    packager,
+    releaseVersionBoundary,
+    `macOS release version boundary ${releaseVersionBoundary}`
+  );
+}
+for (const singleArchiveContract of [
+  'ARCHS="arm64 x86_64" \\',
+  'MARKETING_VERSION="$version" \\',
+  'CURRENT_PROJECT_VERSION="$build_number" \\',
+]) {
+  if (packager.split(singleArchiveContract).length - 1 !== 1) {
+    failures.push(
+      `macOS packager must carry one exact archive contract ${singleArchiveContract}`
+    );
+  }
 }
 
 for (const exactHostContract of [
@@ -960,6 +992,10 @@ for (const releaseGate of [
   'test "$GITHUB_REF_NAME" = "v$version"',
   "CGO_ENABLED=0 GOOS=linux go -C vcs build ./...",
   "Verify the Foundation-enabled Darwin data plane",
+  "Prove the paired daemon and extension wire contract",
+  'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+  'cmp "$golden" "swift/PortableFSKit/Tests/PortableFSKitTests/Goldens/${golden##*/}"',
+  "TestV3CoherenceBridgeResolveMatchesSwiftGolden",
   "CGO_ENABLED=1 GOOS=darwin go -C vcs build ./...",
   "CGO_ENABLED=1 GOOS=darwin go -C vcs vet ./...",
   "CGO_ENABLED=1 GOOS=darwin go -C vcs test ./...",

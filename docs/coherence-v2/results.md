@@ -1,0 +1,936 @@
+# Protocol 7 integration measurements
+
+The v6 reference is [baseline.md](./baseline.md). These are local engineering
+observations, not an SLO or an isolated speedup experiment. Both runs use the
+4 CPU, 8 GiB Docker VM, kernel `6.8.0-100-generic`, the digest-pinned Go image,
+loopback TLS, real kernel FUSE, and a 1 GiB loop-backed XFS image on tmpfs with
+a 512 MiB / 200,000-inode project quota. Unrelated containers share the VM.
+Neither run measures physical-disk throughput or a production network.
+
+The workload sizes and denominators are unchanged: 40,000 1 KiB files plus
+2,000 directories (42,000 operations) at one and eight workers; cold and warm
+Git status over 20,000 tracked files; and 2,000 peer writes plus verified reads
+(4,000 operations). Cold PortableFS Git recreates the Authority and mount;
+cold direct XFS evicts clean file pages but retains inode/dentry caches.
+
+Protocol 7 setup also runs the formerly failing fresh 20,000-file `git add` at
+the shipping 65,536 cached-name capacity. It checks the index count, commits,
+passes a root-handle barrier opened before setup, and checks the original mount
+is still live. The v6 result needed 4,096 during setup before remounting at
+65,536. Protocol 7 makes any enumeration error fatal; it does not retry ESTALE.
+
+A root barrier is opened before each measured mounted phase and fsynced after
+it. Workload wall time preserves the v6 POSIX boundary. Barrier latency and
+asynchronous CLOSE drain are reported separately; requests include both,
+including the extra barrier and root CLOSE, while the root OPEN is outside the
+meter. The barrier validates accepted-write loss and durability. Direct-XFS
+rows retain the original workload timing and do not imply per-file fsync.
+Request counts belong to the fixture handler, so unrelated containers affect
+timing but do not enter these counts.
+
+## Reproduction
+
+Unprofiled full-size measurements:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 \
+PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' \
+bash scripts/xfs-fuse-integration.sh
+```
+
+Optional profiles are exported to an explicit host artifact directory:
+
+```sh
+PORTABLEFS_PROFILE_DIR=/tmp/portablefs-profiles \
+PORTABLEFS_PERFORMANCE_TEST=1 \
+PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$/(install-portablefs-workers-[18]|git-portablefs)$' \
+bash scripts/xfs-fuse-integration.sh
+```
+
+The Authority and mount daemon live in one Go test process. CPU profiles label
+inherited workers as `component=authority` or `component=frontend`; allocation
+profiles use package/function stack filters. Every phase exports CPU, allocation
+before/after, mutex, and block profiles plus the exact test executable. CPU and
+allocation snapshots cover completion/drain as well as the syscall workload.
+Mutex/block snapshots are cumulative process observations. Profiled timings are
+kept separate because instrumentation changes scheduling and allocation cost.
+The focused wrapper exits 70 for omitted required-suite inventory after a
+passing benchmark; that is not a full verification result.
+
+## Before profiling
+
+Run 122 passes every workload in 118.44 seconds. The complete observations are
+in [results-before.jsonl](./results-before.jsonl). The wrapper exits 70 only for
+unrun inventory. The fresh 20,000-file Git regression passes again after the
+Linux/Mac bridge deletion.
+
+| Workload | Target | Workers | Wall (s) | Authority requests | Requests/op | Filesystem requests | Filesystem requests/op | Barrier (s) | Close drain (s) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| install | direct-xfs | 1 | 0.602526 | 0 | 0.000000 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| install | direct-xfs | 8 | 0.355244 | 0 | 0.000000 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| install | portablefs | 1 | 23.364615 | 329,873 | 7.854119 | 206,005 | 4.904881 | 0.002893 | 0.003370 |
+| install | portablefs | 8 | 12.855778 | 274,845 | 6.543929 | 206,238 | 4.910429 | 0.114971 | 0.147401 |
+| git-status-cold | direct-xfs | - | 0.008836 | 0 | 0.000000 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | - | 0.008893 | 0 | 0.000000 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | - | 1.589802 | 20,566 | 1.028300 | 20,540 | 1.027000 | 0.000140 | 0.011691 |
+| git-status-warm | portablefs | - | 1.105835 | 372 | 0.018600 | 364 | 0.018200 | 0.000194 | 0.011495 |
+| two-mount-write-list-read | direct-xfs | - | 0.029348 | 0 | 0.000000 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | - | 2.114936 | 40,304 | 10.076000 | 21,433 | 5.358250 | 0.000095 | 0.001153 |
+
+The initial mounted peer run performs nine scans, no enumeration retries, and
+verifies 1,405 files before the writer finishes. Direct XFS performs seven scans
+and verifies 1,363 files during the write. The protocol-7 request count is higher
+than v6 for this peer run; control cuts, barrier frequency, and the amount of
+reader/writer overlap differ. Faster wall time does not imply fewer requests.
+
+## Profiling and changes
+
+The before profiles are runs 125 (install) and 126 (Git), executable build ID
+`7c4bd6de75baa58c0a45da7abc6dd68b606d1908`. The final profiles are run 145,
+`622cffd29e1c89ccea559db8322d571652420f85`. They are retained locally in
+`/tmp/cv2-g-profiles-pre` and `/tmp/cv2-g-profiles-complete`. Example analysis:
+
+```sh
+go tool pprof -top -tagfocus=component=authority \
+  /tmp/cv2-g-profiles-complete/fusev3.test \
+  /tmp/cv2-g-profiles-complete/TestCoherenceBaseline-install-portablefs-workers-8-install.cpu.pprof
+go tool pprof -top -tagfocus=component=frontend \
+  /tmp/cv2-g-profiles-complete/fusev3.test \
+  /tmp/cv2-g-profiles-complete/TestCoherenceBaseline-git-portablefs-cold.cpu.pprof
+go tool pprof -top -alloc_space \
+  -base /tmp/cv2-g-profiles-complete/TestCoherenceBaseline-install-portablefs-workers-8-install.allocs-before.pprof \
+  /tmp/cv2-g-profiles-complete/fusev3.test \
+  /tmp/cv2-g-profiles-complete/TestCoherenceBaseline-install-portablefs-workers-8-install.allocs-after.pprof
+```
+
+Allocation numbers below are sampled `alloc_space` deltas in MiB. They include
+both components, runtime sampling variance, and allocation-profile GC-cycle
+lag. They are not live-heap size or a deterministic allocation count. Mutex
+numbers are cumulative sampled aggregate waiter-seconds at the end of the
+8-worker phase, including the earlier 1-worker phase; they are neither wall
+time nor seconds spent holding a lock.
+
+| Observation | Before | Final |
+|---|---:|---:|
+| 8-worker install sampled allocation | 4,434.79 MiB | 3,774.31 MiB |
+| Cold Git status sampled allocation | 577.07 MiB | 518.83 MiB |
+| Canonical present-field slice, install flat allocation | 212.18 MiB | no samples after descriptor caching |
+| Source signal channels, install flat allocation | 144.52 MiB | no samples after demand allocation |
+| Coordinator Poll event-slice growth, install flat allocation | 230.86 MiB | no samples after bounded batch reuse |
+| Install cumulative mutex wait | 390.47 s | 11.33 s |
+
+The Authority and frontend CPU views are both dominated by syscalls, runtime
+allocation/clearing, and timing. Before changes, the 8-worker CPU sample total
+was 21.03 seconds over 14.96 seconds elapsed; final is 22.19 over 15.22. This
+is not a CPU-speedup result. The first warm Git profile is only 900 ms of CPU
+samples, too small for fine-grained ranking. Kernel `syncfs` wait is not sampled
+CPU and is not reliably represented by Go block profiles.
+
+The changes address measured costs without changing the wire:
+
+- Canonical encoding caches immutable descriptor order, checking message
+  presence and unknown fields each time. Frozen encoding, presence changes,
+  and unknown nested fields are tested. The small-write microbenchmark is
+  1,208 ns/op, 72 B/op, 3 allocations/op on the native M5 Max; that is not a
+  Linux/VM throughput measurement.
+- CONTROL reuses a session batch only after all queued entries drain. A new
+  poll cannot mutate a returned response or its exact replay. Storage is bounded
+  by 4,096 events and is cleared before waiting. Tests include split frames and
+  old-response retention across reuse.
+- Source-publication wake channels exist only while needed by waiters, with
+  predicate checks and signaling under the same mutex. Source admission still
+  checks only request coordinates; its unrelated-coordinate benchmark covers
+  4,096 other entries. No per-operation global cache scan was found there.
+- A timer/cap flush no longer launches one goroutine per dirty identity. One
+  background worker matches the Authority's single delegated-flush lane and
+  leaves ordinary client permits available to explicit flushes. Explicit
+  fsync, recall, and close remain independent. The native burst benchmark is
+  7.76 microseconds for 32 files and 1.946 milliseconds for 4,096 files; it
+  uses a fake durable flusher and does not measure network or storage.
+- Close batches apply all their files before waiting for durability, then
+  release ownership and server handles. A 256-pending-close admission budget
+  prevents the measured install from outrunning deferred cleanup. The budget
+  assumes the unchanged shipping open-table limits; smaller custom Authority
+  limits are not negotiated and can still return ENFILE.
+
+Run 140 found ENFILE after file 6,597 when bounded background dispatch exposed
+serialized per-file close barriers. It is a failed run, not omitted noise.
+The blocked-durability and deferred-close regressions cover the fix; run 145
+then passes both install sizes, fresh Git setup, both status phases, and the
+focused delegation tests. The profile wrapper exits 70 for omitted inventory.
+
+An intermediate allocation-only run is preserved in
+[results-after-allocations.jsonl](results-after-allocations.jsonl), and profiles
+from that stage reduced allocation further in some samples. It is not the final
+result: the final scheduler prioritizes bounded work and recall headroom.
+Per-file close/barrier timing still changes the number of coalesced durability
+RPCs. Profiled final install takes 19.720 seconds (one worker) and 15.198 seconds
+(eight), with 22,951 and 23,411 Barrier requests respectively; cold/warm Git take
+1.309/1.256 seconds. The final unprofiled table below is the comparison to v6.
+
+Remaining measured costs include defensive protobuf/replay objects, callback
+lifetime objects, timers, and exact cache reservations. Their ownership spans
+asynchronous replies, so indiscriminate pooling would violate replay or
+publication lifetime. Background scheduling scans the bounded active buffer
+at a timer/cap event, not on each accepted write. Namespace and cold pathname
+lookups still require Authority requests. This work does not claim local-disk
+latency or fewer requests for every workload.
+
+## Final unprofiled comparison
+
+Run 150 passes the entire baseline in 112.96 seconds. The wrapper exits 70
+only because the focused invocation omits the required full-suite inventory.
+[results-final.jsonl](results-final.jsonl) contains every observation and the
+filesystem/control request breakdown. Each paired cell is **v6 → final v7**;
+barrier time is new v7 evidence and is not included in syscall wall time.
+
+| Workload | Target | Workers | Wall (s), v6 → v7 | Authority requests, v6 → v7 | Requests/op, v6 → v7 | Filesystem requests, v6 → v7 | Filesystem requests/op, v6 → v7 | Close drain (s), v6 → v7 | v7 barrier (s) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| install | direct-xfs | 1 | 0.578806 → 0.392895 | 0 → 0 | 0.000000 → 0.000000 | 0 → 0 | 0.000000 → 0.000000 | 0.000000 → 0.000000 | 0.000000 |
+| install | direct-xfs | 8 | 0.344368 → 0.299482 | 0 → 0 | 0.000000 → 0.000000 | 0 → 0 | 0.000000 → 0.000000 | 0.000000 → 0.000000 | 0.000000 |
+| install | portablefs | 1 | 386.762771 → 21.028568 | 329,884 → 314,182 | 7.854381 → 7.480524 | 210,201 → 206,005 | 5.004786 → 4.904881 | 0.001376 → 0.013845 | 0.000934 |
+| install | portablefs | 8 | 273.738199 → 15.706301 | 317,582 → 287,680 | 7.561476 → 6.849524 | 208,079 → 206,229 | 4.954262 → 4.910214 | 0.002229 → 0.020364 | 0.005549 |
+| git-status-cold | direct-xfs | - | 0.037750 → 0.007525 | 0 → 0 | 0.000000 → 0.000000 | 0 → 0 | 0.000000 → 0.000000 | 0.000000 → 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | - | 0.021925 → 0.007188 | 0 → 0 | 0.000000 → 0.000000 | 0 → 0 | 0.000000 → 0.000000 | 0.000000 → 0.000000 | 0.000000 |
+| git-status-cold | portablefs | - | 10.572948 → 1.379696 | 20,809 → 20,548 | 1.040450 → 1.027400 | 20,525 → 20,531 | 1.026250 → 1.026550 | 0.000003 → 0.010518 | 0.000200 |
+| git-status-warm | portablefs | - | 2.042038 → 1.195970 | 553 → 372 | 0.027650 → 0.018600 | 363 → 364 | 0.018150 → 0.018200 | 0.000004 → 0.011706 | 0.000209 |
+| two-mount-write-list-read | direct-xfs | - | 0.063784 → 0.036116 | 0 → 0 | 0.000000 → 0.000000 | 0 → 0 | 0.000000 → 0.000000 | 0.000000 → 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | - | 12.536042 → 2.644504 | 31,510 → 39,278 | 7.877500 → 9.819500 | 22,680 → 20,317 | 5.670000 → 5.079250 | 0.001131 → 0.001261 | 0.000229 |
+
+The final peer run performs three scans, no ESTALE/incomplete/vanished retries,
+and verifies one file before the writer completes. It verifies all 2,000 files
+overall. Direct XFS performs seven scans and verifies 1,672 files during writes.
+The first v7 run had substantially more overlap (1,405 files), and the v6
+reference had 467. Scheduling and the amount of overlap differ materially;
+these peer wall times are observations, not an isolated protocol speedup. The
+separate churn and concurrent-writer tests retain their stronger overlap checks.
+
+Final versus initial v7 is mixed: one-worker install is 23.365 → 21.029 seconds,
+eight-worker install 12.856 → 15.706, cold status 1.590 → 1.380, warm status
+1.106 → 1.196, and peer workload 2.115 → 2.645. The final implementation spends
+less sampled allocation and avoids the background lock stampede, but dispatch
+and barrier coalescing change. No claim is made that every optimization improved
+every wall time. Direct-XFS timings also changed on this shared VM.
+
+Fresh Git preparation again logs `files=20000 cached_name_capacity=65536
+committed=true barrier=PASS mount=LIVE`. No setup-capacity workaround or
+ESTALE retry remains. This reproduces the exact shipping-capacity scenario
+that failed with ENOTCONN on v6 and proves completion on the final v7 build.
+
+## G2 cached metadata, intermediate
+
+The amended F10 keeps Authority-backed Linux entry and attribute validity at
+zero. Deterministic callback tests, including PrepareReplyPayload and
+ReplyWritten, measured the following allocations per warm call. Authority RPCs
+are zero for every row.
+
+| Cached operation | Before allocations/call | After allocations/call |
+|---|---:|---:|
+| positive LOOKUP | 22 | 0 |
+| negative LOOKUP | 9 | 0 |
+| GETATTR | 18 | 0 |
+
+The initial mounted check (`/tmp/cv2-g2-cache-mounted3.log`) reports 2,000 warm
+`Lstat` operations at 70.042 us median and 81.167 us p95, with zero Authority
+LOOKUP or GETATTR RPCs. This is whole-syscall latency, not an isolated FUSE
+LOOKUP callback. A separate warmed-absence CREATE issues zero LOOKUP RPCs.
+An arbitrary unseen name still needs an Authority fact; this result does not
+claim that a daemon can infer absence without a cached negative or a complete
+directory snapshot. The below-20-us kernel round-trip target is not established
+by this full-stat result. Workload measurements follow after the next changes.
+
+The isolated opcode probe (`/tmp/cv2-g2-cache-mounted7.log`) confirms 2,000
+cached FUSE LOOKUPs and zero Authority LOOKUPs. LOOKUP service from reading
+`/dev/fuse` through writing its reply is 4.417 us median / 5.708 us p95. This
+excludes kernel scheduling before the daemon read. The enclosing `faccessat`
+syscall costs 70.125 us median / 79.958 us p95 and also issues 4,000 permission
+GETATTRs because attribute validity is zero. These boundaries are reported
+separately; dividing syscall latency by its three requests would not prove a
+single-request round trip. The repeated Lstat sample is 74.209 / 84.417 us.
+
+## G2 first RPC reductions
+
+Targeted Docker/XFS measurements precede the full baseline below. The 1,000-file
+install includes an explicit root completion barrier; close drain still has its
+old durability wait at this stage.
+
+| Stage | Files | Seconds | Barrier/file | FLUSH/file | ChangeAck/file | Additional control polls/file |
+|---|---:|---:|---:|---:|---:|---:|
+| fallback Barrier cap (0a) | 1,000 | 5.36 | 0.007 | unmeasured | unmeasured | unmeasured |
+| implicit source progress (0b) | 1,000 | 5.37 | 0.007 | unmeasured | 0 | 0 |
+| local unlocked FULL FLUSH (1) | 1,000 | 5.26 | 0.007 | 0 | 0 | 0 |
+
+With READDIRPLUS (2), a cold mounted `ls -ln` over 1,000 entries issues four
+READDIR RPCs (0.004/entry) and zero LOOKUP RPCs. Its 0.57-second test duration
+includes setup and teardown and is not a listing latency measurement. Source
+logs: `/tmp/cv2-g2-durable-mounted2.log`, `/tmp/cv2-g2-own-mounted.log`,
+`/tmp/cv2-g2-flush-mounted.log`, and `/tmp/cv2-g2-plus-mounted.log`.
+
+### Baseline after items 0a, 0b, 1, 2, and amended 3/8
+
+Measured commit `68fd4cf` on Linux `6.8.0-100-generic` with:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' PORTABLEFS_PROFILE_RUN=g2-after-1-3 bash scripts/xfs-fuse-integration.sh
+```
+
+The install and Git subtests completed; the overall run failed on a peer
+READDIRPLUS EIO. This is intermediate measurement evidence, not a passing gate.
+The exact output is `/tmp/cv2-g2-baseline-1-3.log`.
+
+| Workload | Direct XFS seconds | PortableFS seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---:|---:|---:|---:|---:|
+| Install, 40,000 files + 2,000 directories, 1 worker | 0.624 | 277.050 | 164,750 | 3.9226 | 3.9049 |
+| Install, 40,000 files + 2,000 directories, 8 workers | 0.333 | 274.056 | 165,062 | 3.9300 | 3.9094 |
+| Git status cold, 20,000 files | 0.00844 | 1.910 | 40,628 | 2.0314 | 1.0261 |
+| Git status warm, 20,000 files | 0.00745 | 1.322 | 20,471 | 1.0236 | 0.0182 |
+
+| Install opcode, 1 worker | Requests | Requests/file |
+|---|---:|---:|
+| CREATE | 40,000 | 1 |
+| WRITE | 40,000 | 1 |
+| LOOKUP | 42,000 | 1.05 |
+| CLOSE | 40,002 | 1.00005 |
+| MKDIR | 2,000 | 0.05 |
+| OPEN / READDIR | 1 / 1 | 0.000025 each |
+| Barrier | 274 | 0.00685 |
+| DelegationRelease | 339 | 0.008475 |
+| KeepAlive / RenewSubscription | 41 / 92 | 0.001025 / 0.0023 |
+| FLUSH / ChangeAck / additional control polls | 0 / 0 / 0 | 0 |
+
+Install time regressed sharply despite fewer requests: the retained close path
+still waits for durability while the fallback Barrier now runs at most once per
+second. Item 4 must remove that wait before claiming an install speedup. Cold Git
+still does 20,140 LOOKUPs; warm Git does two, while both runs reclaim 20,105
+capabilities. READDIRPLUS eliminates LOOKUPs for the cold `ls -ln` test but does
+not eliminate cold Git's index-driven stat pass. The fresh 20,000-file git-add
+regression passes at the shipping 65,536-name capacity and leaves the mount live.
+
+### Applied release and batched close (item 4)
+
+The mounted 1,000-file conformance workload falls from 5.26 seconds after item 1
+to 0.69 and 0.64 seconds in two repeats. These are whole-test durations including
+fixture setup/teardown, not isolated install timers. The final close collection
+window is bounded at 25 milliseconds or 128 handles. The initial 10-millisecond
+window measured 1.08 seconds and 69 batches and failed the new amortization
+assertion; the final runs issue 19 and 16 batches. Logs:
+`/tmp/cv2-g2-close-mounted.log`, `/tmp/cv2-g2-close-mounted2.log`.
+
+| RPC per file, 1,000-file install | After item 1 | After item 4, repeats |
+|---|---:|---:|
+| Barrier | 0.007 | 0.002 / 0.002 |
+| FLUSH | 0 | 0 / 0 |
+| ChangeAck | 0 | 0 / 0 |
+| Additional control poll | 0 | 0 / 0 |
+| Serial CLOSE | unmeasured | 0 / 0 |
+| CloseBatch | unavailable | 0.019 / 0.016 |
+
+The full 40,000-file install and Git baseline will be rerun after the remaining
+new-name LOOKUP optimization. These focused results do not replace it.
+
+### New-name lookup elimination (item 0c)
+
+The required mounted test creates 1,000 files beneath a newly created directory
+with zero LOOKUP RPCs in both repetitions (`/tmp/cv2-g2-complete-mounted.log`).
+This is 0 LOOKUP/file, compared with the 1.05 LOOKUP/file measured across the
+40,000-file/2,000-directory baseline before completeness caching. The different
+workload sizes are explicit; the full baseline below is the comparable result.
+Unknown preexisting directories still require an Authority lookup.
+
+### Baseline after items 0–4 (amended kernel-cache policy)
+
+Measured `7ca2d25`, Linux `6.8.0-100-generic`, with
+`PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' bash scripts/xfs-fuse-integration.sh`.
+All baseline subtests passed in 182.20 seconds. The wrapper exits 70 because
+this focused invocation omits the required full-gate inventory; it is not a
+full gate pass. Log: `/tmp/cv2-g2-baseline-0-4-plain.log`. Another Docker soak
+workload was active on the same VM. A preceding profile-enabled attempt failed
+in the second direct-XFS install with ENOSPC before PortableFS ran; the unchanged
+plain rerun passed. No cause is established and no profile was captured.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---|---:|---:|---:|---:|
+| install, 1 worker(s) | direct-xfs | 0.574807 | 0 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.429848 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 34.664636 | 84,043 | 2.001024 | 1.976143 |
+| install, 8 worker(s) | portablefs | 15.408795 | 82,976 | 1.975619 | 1.964333 |
+| git-status-cold | direct-xfs | 0.011487 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.011241 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 2.355368 | 40,628 | 2.031400 | 1.026050 |
+| git-status-warm | portablefs | 1.667565 | 20,471 | 1.023550 | 0.018150 |
+| two-mount-write-list-read | direct-xfs | 0.046432 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 5.722640 | 97,405 | 24.351250 | 3.154750 |
+
+| Install opcode | 1 worker requests | Requests/file | 8 workers requests | Requests/file |
+|---|---:|---:|---:|---:|
+| barrier | 35 | 0.000875 | 16 | 0.000400 |
+| change_ack | 0 | 0.000000 | 0 | 0.000000 |
+| close | 2 | 0.000050 | 2 | 0.000050 |
+| close_batch | 994 | 0.024850 | 313 | 0.007825 |
+| create | 40,000 | 1.000000 | 40,000 | 1.000000 |
+| delegation_release | 994 | 0.024850 | 313 | 0.007825 |
+| flush | 0 | 0.000000 | 0 | 0.000000 |
+| get_attr | 0 | 0.000000 | 47 | 0.001175 |
+| keep_alive | 5 | 0.000125 | 2 | 0.000050 |
+| lookup | 0 | 0.000000 | 138 | 0.003450 |
+| mkdir | 2,000 | 0.050000 | 2,000 | 0.050000 |
+| next_control_event | 0 | 0.000000 | 0 | 0.000000 |
+| open | 1 | 0.000025 | 1 | 0.000025 |
+| read_dir | 1 | 0.000025 | 1 | 0.000025 |
+| reclaim | 0 | 0.000000 | 138 | 0.003450 |
+| renew_subscription | 11 | 0.000275 | 5 | 0.000125 |
+| write | 40,000 | 1.000000 | 40,000 | 1.000000 |
+
+Compared with the preceding intermediate run, install time falls from
+277.050 to 34.665 seconds (one worker) and 274.056 to 15.409 seconds (eight).
+The one-worker path reaches one CREATE plus one background WRITE per file,
+with directory creation and close/release batches amortized. The eight-worker
+run retains 138 LOOKUPs and 47 GETATTRs. Cold Git still performs 20,140 LOOKUPs;
+warm Git performs two. Both Git runs issue 20,105 RECLAIMs. The peer workload
+now passes but still issues 73,709 RECLAIMs, 4,491 change ACKs and 5,467 control
+polls; its request count remains an optimization target.
+
+### Reader-aware write invalidation (item 5)
+
+A deterministic 100-write daemon test compares the previous unconditional
+path with the new never-cached-inode path: InodeNotify calls fall from 100 to
+zero; the new invalidation fast path allocates zero objects per write. With a
+previously closed cached reader, three disjoint writes produce zero immediate
+notifications and one merged range at the flush/reopen boundary. Live-reader
+writes retain a synchronous notify before successful return. These are operation
+counts, not a new full-workload latency measurement.
+
+### Targeted namespace withdrawal (item 6)
+
+With a second mount's CONTROL transport partitioned and its cache confined to
+an unrelated directory, a mounted MKDIR completes in 416.794 us. The previous
+global wait includes that subscriber until ACK or its approximately 10-second
+horizon; forcing the global target set fails the new regression. Related-parent
+and newly created-directory completeness arms still block before withdrawal.
+This is an isolated partition test, not a claim about ordinary two-mount
+throughput. Log: `/tmp/cv2-g2-footprint-mounted.log`.
+
+## G2 handoff durability follow-up
+
+The unchanged 96-round repeated-open/peer-write regression took 99.89 seconds
+in the full gate after item 6. Removing the recall durability wait alone left
+100.49 seconds; removing the synchronous truncating-open wait as well produced
+0.33 and 0.35 seconds on two focused mounted runs. Both paths retain applied
+records until durability and detach their old read overlay before handoff.
+The 20-second regression bound is unchanged. These are test wall times, not a
+full baseline or an isolated VM experiment; request counts were not collected.
+Logs: `/tmp/cv2-g2-after-item6-xfs2.log`, `/tmp/cv2-g2-recall-mounted.log`,
+`/tmp/cv2-g2-recall-mounted2.log`. Full gates remain required.
+
+## G2 FULL-holder metadata follow-up
+
+The same 2,000-call mounted LOOKUP probe now exercises a shared cached file and
+an open FULL holder with a dirty size extension. Both issue zero Authority
+LOOKUP and GETATTR requests. Measurements from `/tmp/cv2-g2-holder-mounted.log`:
+
+| Mode | Syscall p50 / p95, us | LOOKUP read-to-reply p50 / p95, us | FUSE permission GETATTRs |
+| --- | ---: | ---: | ---: |
+| Shared | 71.208 / 82.417 | 4.750 / 6.125 | 4,000 |
+| FULL holder | 71.208 / 81.625 | 4.792 / 6.167 | 4,000 |
+
+The syscall includes one LOOKUP and two permission GETATTRs. The daemon timer
+starts after reading /dev/fuse and excludes prior kernel scheduling. Neither
+number establishes an isolated kernel-to-daemon LOOKUP round trip below 20 us.
+The callback allocation regression has a direct before/after result: holder
+GETATTR was 13 allocations and is now zero; holder LOOKUP also has zero
+allocations. These unit measurements include physical reply settlement.
+
+## G2 READDIR page admission
+
+`BenchmarkReadPageAdmission256`, Apple M5 Max host, three 300 ms samples
+(`/tmp/cv2-g2-read-set-bench.log`):
+
+| 256-identity coordinator admission | Time per page | Bytes per page | Allocations | Request turns |
+| --- | ---: | ---: | ---: | ---: |
+| Former per-entry loop | 64.4–65.4 us | 92,160–92,166 | 1,792 | 256 |
+| Composite page guard | 19.0–19.2 us | 32,945 | 520 | 1 |
+
+This isolates coordinator work with no foreign delegation. It excludes storage,
+RPC and kernel time. The new guard also remains held through storage revalidation;
+the former loop did not provide that exclusion.
+
+## G2 CONTROL batch construction
+
+Actual pre-change and updated handler binaries, Linux arm64 Docker VM,
+`BenchmarkCoherenceBatchAssembly`, median of three single-iteration samples.
+The VM is shared; these are local CPU-path observations, not latency guarantees.
+
+| Entries | Former repeated prefix sizing | Running byte count |
+| ---: | ---: | ---: |
+| 64 | 63.208 us | 27.167 us |
+| 256 | 489.961 us | 41.042 us |
+| 1,024 | 6,949.290 us | 141.126 us |
+| 4,096 | 109,887.755 us | 1,118.173 us |
+
+Allocation counts are unchanged after descriptor warmup (278, 1,050, 4,128 and
+16,424 per batch respectively). The improvement removes repeated prefix walks;
+it does not change CONTROL wire bytes or event count. Logs:
+`/tmp/cv2-g2-control-bench-before.log` and `control-bench-after.log`.
+
+## G2 replay fingerprint accounting
+
+The production request reader already hashes bulk bytes during ingress and
+passes that digest into canonical metadata hashing (prior G commits `ad12b9c`
+and `04cdfab`). No second payload walk remains to remove. Three 750 ms samples
+on the Apple M5 Max host, median, `/tmp/cv2-g2-fingerprint-bench.log`:
+
+| 1 MiB WRITE path | Time | Bytes allocated | Allocations |
+| --- | ---: | ---: | ---: |
+| Standalone fingerprint, including payload SHA-256 | 331.101 us | 520 | 9 |
+| Production canonical fingerprint with ingress digest | 1.404 us | 520 | 9 |
+| Retained frame read with ingress digest | 329.866 us | 1,105 | 14 |
+| Retained frame read without digest | 13.787 us | 504–528 | 10 |
+| Protobuf clone | 54.933 us | 1,048,873–1,048,874 | 5 |
+| Protobuf marshal | 38.024 us | 1,056,792 | 2 |
+
+These isolate CPU work over an in-memory frame. They are not end-to-end write
+latencies or a new before/after implementation claim. Payload authentication
+still costs CPU; metadata canonicalization is below one percent of the digesting
+reader time. The existing digest-equivalence regression passes with these runs.
+
+## G2 mutation queue scaling
+
+Per-key claim queues replace the repeated global waiter scan. Actual before/after
+host binaries, Apple M5 Max, median of three one-iteration contended samples:
+
+| Pending mutations on one key | Former scan | Per-key queues |
+| ---: | ---: | ---: |
+| 64 | 106.333 us | 15.625 us |
+| 256 | 1,679.000 us | 38.916 us |
+| 1,024 | 26,856.750 us | 142.458 us |
+| 4,096 | 435,402.708 us | 548.375 us |
+
+At 4,096 waiters, retained claim bookkeeping increases this single-key case from
+1,016,432 to 1,278,984 allocated bytes, and from 16,393 to 20,495 allocations.
+For 256 waiters each reserving a common key plus its own distinct key, removing
+repeated reservation-map construction reduces allocation from 5,755,139 to
+122,162 bytes. The regression enforces a generous 524,288-byte linear budget.
+
+The existing disjoint workload is unchanged: three 500 ms samples have median
+3.731 us before and 3.741 us after for dependency keys, versus 67.990 and
+68.108 us for its global-turn reference model. Short one-iteration warmups of
+that benchmark were too noisy and are excluded. Logs:
+`/tmp/cv2-g2-sequencer-before.log`, `sequencer-after.log`,
+`disjoint-before.log`, `disjoint-after.log` (same prefix). These are coordinator
+CPU measurements, not RPC or mounted-workload timings.
+
+## G2 shared registry reads
+
+`BenchmarkPhysicalReplyRegistryRead`, Linux arm64 shared Docker VM, four workers,
+median of three 500 ms samples:
+
+| Read-only reply tracking | Time per lookup | Allocations |
+| --- | ---: | ---: |
+| Exclusive registry mutex | 42.75 ns | 0 |
+| Shared registry lock | 22.64 ns | 0 |
+
+Logs: `/tmp/cv2-g2-registry-bench-before.log` and `registry-bench-after.log`.
+The benchmark contains only readers; real callbacks also acquire exclusive
+publication and reference-accounting cuts. No mounted throughput claim follows
+from this isolated read-lock result.
+
+## G2 isolated kernel LOOKUP round trip
+
+The first exact probe attempt used `fuse_get_unique`; that symbol did not observe
+ordinary requests in this kernel build and produced no samples. It is discarded.
+The working [bpftrace probe](../../scripts/cached-lookup-roundtrip.bt) pairs
+`queue_request_and_unlock` with `fuse_request_end` by the live request address.
+Linux 6.8's [request path](https://github.com/torvalds/linux/blob/v6.8/fs/fuse/dev.c)
+places those boundaries before queue insertion and after reply copy, respectively.
+The interval includes daemon wakeup/service and kernel reply acceptance; it
+excludes initial request allocation and the requester's final wakeup. Permission
+GETATTRs are excluded by opcode. Probe overhead after the start is included.
+
+The mounted test pins and labels only its measured syscall thread. Both modes
+produce exactly 2,000 unique request pairs, 2,000 daemon LOOKUPs, and zero Authority
+LOOKUP or GETATTR RPCs. Kernel entry/attribute validity remains zero. Results on
+the shared Linux 6.8.0-100-generic arm64 VM, with another profile run active:
+
+| Mode | Kernel round trip p50 / p95 | Samples below 20 us | Whole syscall p50 / p95 |
+| --- | ---: | ---: | ---: |
+| Shared cached binding | 2.708 / 14.750 us | 1,931 / 2,000 | 20.000 / 88.334 us |
+| Dirty FULL holder | 10.292 / 29.458 us | 1,766 / 2,000 | 72.250 / 155.584 us |
+
+Both medians satisfy the below-20-us target; the holder tail does not. Maximum
+samples were approximately 2.5 ms, reflecting the shared scheduling environment.
+These are the first measurements at this boundary, so there is no comparable
+pre-change kernel-round-trip number. They must not be compared as a speedup
+against the earlier daemon-service or whole-syscall figures.
+
+Reproduction: start `bpftrace -q scripts/cached-lookup-roundtrip.bt` as root in a
+privileged container in the same VM (mount tracefs there if needed), wait for
+`LOOKUP_PROBE_READY`, then run
+`PORTABLEFS_GO_TEST_FLAGS='-run ^TestCachedLookupKernelRoundTrip$' bash scripts/xfs-fuse-integration.sh`.
+Stop the tracer with SIGINT after both subtests pass. Group `LOOKUP_NS` rows by
+label, require exactly 2,000 distinct request IDs each, sort nanoseconds, and
+select indices 1,000 and 1,900 for p50/p95. Tracing is optional measurement
+infrastructure, not a dependency of the default or full gate. The focused wrapper
+exits 70 for omitted inventory. Logs: `/tmp/cv2-g2-lookup-exact-mounted2.log` and
+`/tmp/cv2-g2-lookup-kernel2.log`; bpftrace 0.17.0. The unchanged syscall and daemon
+service counters remain available alongside the kernel probe.
+
+## G2 integrated baseline before the profile-discovered follow-ups
+
+Commit `47a5487`, unprofiled full workload, `/tmp/cv2-g2-final-baseline.log`.
+All baseline subtests passed; the focused wrapper exited 70 for omitted gate
+inventory. [Raw observations](results-g2-after-11.jsonl) retain opcode and
+barrier/drain details. This precedes the shared registry conversion and the
+subsequent profile-discovered admission deadlock fix; final measurements follow
+separately. Other work was active on the shared VM.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | direct-xfs | 0.490248 | 0 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.472242 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 14.677395 | 82,851 | 1.972643 | 1.962310 |
+| install, 8 worker(s) | portablefs | 12.367337 | 82,775 | 1.970833 | 1.961667 |
+| git-status-cold | direct-xfs | 0.014091 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.016222 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.909183 | 40,626 | 2.031300 | 1.026000 |
+| git-status-warm | portablefs | 2.369603 | 20,469 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | direct-xfs | 0.051569 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 2.767217 | 84,633 | 21.158250 | 3.309750 |
+
+One-worker install issued one CREATE and one WRITE per file, plus 412 close
+batches and 412 delegation releases across 40,000 files. It issued one LOOKUP,
+16 Barriers and zero FLUSH, ChangeAck or control polls. Eight-worker install
+issued 53 LOOKUPs and 19 GETATTRs. Warm Git issued one LOOKUP but retained 20,104
+RECLAIMs; the peer workload retained 62,923 RECLAIMs and 3,672 change ACKs.
+These remaining costs are visible in the complete request totals.
+
+## G2 complete profile capture
+
+The successful full profile run at `50b44bb` (plus failure-diagnostic text only)
+passes in 113.07 seconds, including Git preparation at shipping cache capacity
+and all completion barriers. It precedes the final concurrent state index.
+[Raw observations](results-g2-profile.jsonl) and 26 artifacts are retained under
+`/tmp/cv2-g2-final-profiles3` with prefix `g2-final3`: the exact test executable and
+CPU/allocation-before/allocation-after/mutex/block profiles for five phases.
+Log: `/tmp/cv2-g2-final-profile3.log`. Timings include instrumentation overhead.
+
+| Profiled workload | Seconds | Authority requests | Requests/operation |
+| --- | ---: | ---: | ---: |
+| install, 1 worker(s) | 21.770078 | 83,174 | 1.980333 |
+| install, 8 worker(s) | 11.413452 | 91,028 | 2.167333 |
+| git-status-cold | 1.952416 | 40,626 | 2.031300 |
+| git-status-warm | 2.430362 | 20,469 | 1.023450 |
+| two-mount-write-list-read | 3.232395 | 100,880 | 25.220000 |
+
+The one-worker CPU profile contains 17.74 sample-seconds over 21.79 seconds:
+45.49% is in the common syscall leaf, 2.42% cumulatively in delegated FlushBatch,
+2.03% in the scatter mutation client path, and 0.56% in canonical WRITE metadata
+fingerprinting with the retained digest. These overlapping cumulative fractions
+are not additive. They do not establish per-file flush RPC overhead as the
+remaining dominant cost, so no speculative multi-identity flush message was
+added. Warm Git has 20,104 capability RECLAIM requests; its 1.62 sample-seconds
+contain 48.15% syscall leaf and 11.73% READDIR handler work. Capability cleanup
+remains an explicit optimization gap.
+
+The initial profile captured install artifacts but deadlocked in Git preparation;
+the nonblocking ownership fix addresses its captured lock cycle. A second run
+aborted an eight-worker mount without recording its initiating cause. Three
+focused eight-worker profile repetitions and this complete profile subsequently
+pass. The historical abort remains unexplained; it is not counted as successful
+measurement evidence. Failure diagnostics now include mount/session health.
+The final state-index change removes ownership misses caused by unrelated
+registry writers; its unprofiled results follow separately.
+
+## G2 state-index baseline
+
+The unprofiled run at `e15df61` passes all workloads in 120.40 seconds
+(`/tmp/cv2-g2-final-baseline2.log`); the focused wrapper exits 70 for omitted
+inventory. [Raw observations](results-g2-state-index.jsonl) include all opcode
+counts and completion timings. This precedes the subsequently diagnosed PLUS
+page cleanup-admission fix. It is retained separately from the final run.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | direct-xfs | 0.580798 | 0 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.356834 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 22.019743 | 83,135 | 1.979405 | 1.965548 |
+| install, 8 worker(s) | portablefs | 12.597974 | 83,202 | 1.981000 | 1.967905 |
+| git-status-cold | direct-xfs | 0.009597 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.007758 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.879047 | 40,626 | 2.031300 | 1.026000 |
+| git-status-warm | portablefs | 1.511553 | 20,469 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | direct-xfs | 0.056715 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.036862 | 93,536 | 23.384000 | 3.332750 |
+
+One-worker install issues zero LOOKUP, GETATTR, FLUSH, ChangeAck and control
+poll requests. Its 40,000 CREATE and 40,000 WRITE requests dominate; 549 close
+batches/releases and 23 Barriers are amortized. Eight-worker install issues 218
+LOOKUPs and 116 GETATTRs, down from 3,649 and 1,084 in the preceding profiled
+run; these are different instrumented conditions, not an isolated latency
+comparison. Cold and warm Git retain 20,104 RECLAIMs each. The peer workload
+observes 720 files during writing across eight scans, verifies all 2,000, and
+retains 71,127 RECLAIMs. Total traffic includes these cleanup costs.
+
+## G2 final baseline and qualification
+
+Measured production commit `bcc23eb` after the PLUS admission fix, using
+`PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' bash scripts/xfs-fuse-integration.sh`.
+All baseline subtests pass in 116.58s; the focused wrapper exits 70 for
+omitted gate inventory. Log: `/tmp/cv2-g2-final-baseline3.log`.
+[Raw final observations](results-g2-final.jsonl) preserve all ten rows.
+The exact same code passes `bash scripts/verify-local.sh --full`
+(`/tmp/cv2-g2-final-full5.log`, exit 0), including both privileged Linux suites.
+All 76 required XFS tests plus the root boundary pass. The coherence matrix
+passes 28 cases and its controls with the unchanged declared chown skip.
+
+| Workload | G before (s) | G2 final (s) | G requests/op | G2 requests/op | G2 filesystem requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | 21.028568 | 22.479856 | 7.480524 | 1.980643 | 1.966167 |
+| install, 8 worker(s) | 15.706301 | 11.717305 | 6.849524 | 1.979524 | 1.966929 |
+| git-status-cold | 1.379696 | 2.084653 | 1.027400 | 2.031300 | 1.026000 |
+| git-status-warm | 1.195970 | 2.372260 | 0.018600 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | 2.644504 | 3.229293 | 9.819500 | 23.142500 | 3.170500 |
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Barrier (s) | Close drain (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | direct-xfs | 0.584001 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.324973 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 22.479856 | 83,187 | 1.980643 | 0.007243 | 0.023609 |
+| install, 8 worker(s) | portablefs | 11.717305 | 83,140 | 1.979524 | 0.019560 | 0.013261 |
+| git-status-cold | direct-xfs | 0.009428 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006865 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 2.084653 | 40,626 | 2.031300 | 0.000178 | 0.025882 |
+| git-status-warm | portablefs | 2.372260 | 20,469 | 1.023450 | 0.000233 | 0.026229 |
+| two-mount-write-list-read | direct-xfs | 0.038674 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.229293 | 92,570 | 23.142500 | 0.000088 | 0.001319 |
+
+| Install opcode | 1 worker requests | Requests/file | 8 workers requests | Requests/file |
+| --- | ---: | ---: | ---: | ---: |
+| barrier | 23 | 0.000575 | 12 | 0.000300 |
+| change_ack | 0 | 0.000000 | 0 | 0.000000 |
+| close | 2 | 0.000050 | 2 | 0.000050 |
+| close_batch | 575 | 0.014375 | 314 | 0.007850 |
+| create | 40,000 | 1.000000 | 40,000 | 1.000000 |
+| delegation_release | 575 | 0.014375 | 314 | 0.007850 |
+| flush | 0 | 0.000000 | 0 | 0.000000 |
+| get_attr | 0 | 0.000000 | 94 | 0.002350 |
+| keep_alive | 3 | 0.000075 | 1 | 0.000025 |
+| lookup | 0 | 0.000000 | 199 | 0.004975 |
+| mkdir | 2,000 | 0.050000 | 2,000 | 0.050000 |
+| next_control_event | 0 | 0.000000 | 0 | 0.000000 |
+| open | 1 | 0.000025 | 1 | 0.000025 |
+| read_dir | 1 | 0.000025 | 1 | 0.000025 |
+| reclaim | 0 | 0.000000 | 199 | 0.004975 |
+| renew_subscription | 7 | 0.000175 | 3 | 0.000075 |
+| write | 40,000 | 1.000000 | 40,000 | 1.000000 |
+
+One-worker install retains one CREATE and one background WRITE per file;
+LOOKUP, GETATTR, FLUSH, ChangeAck and additional control polling are all zero. Directory
+creation and close/release batches are amortized. Eight-worker misses and every
+control request remain visible in the opcode table. The install denominator is
+42,000 operations (40,000 files plus 2,000 directories); opcode/file divides by
+40,000. These are different denominators.
+
+Cold and warm Git each issue 20,104 RECLAIMs;
+READDIRPLUS capability cleanup raises total RPC counts even though warm metadata
+is cached. The peer workload issues 69,257 RECLAIMs,
+performs 5 scans, observes 140 files during writing,
+and verifies all 2,000. G's preceding peer sample observed one file during
+writing; the overlap differs materially. These shared-VM timings are not an
+isolated speedup experiment, and Git/peer totals are explicit remaining costs.
+
+The full G2 implementation/test/file/interface report is [G2-report.md](G2-report.md).
+
+The separately invoked final `bash scripts/coherence-matrix-linux.sh` also
+exits 0 (`/tmp/cv2-g2-final-matrix.log`): 28 cases and all controls pass,
+with the unchanged declared chown skip and both mounts still serving.
+
+## G3b Authority baseline
+
+Measured `e856d54` on Linux `6.8.0-100-generic` with:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_PROFILE_DIR=/tmp/cv2-g3b-baseline \
+  PORTABLEFS_PROFILE_RUN=g3b-final \
+  PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' \
+  bash scripts/xfs-fuse-integration.sh
+```
+
+All baseline subtests passed in 121.65 seconds. The wrapper exited 70 because
+this focused invocation intentionally omitted the required full-gate inventory;
+it is not a full gate result. Profiles are under `/tmp/cv2-g3b-baseline`.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---|---:|---:|---:|---:|
+| install, 1 worker | direct-xfs | 0.695729 | 0 | 0.000000 | 0.000000 |
+| install, 8 workers | direct-xfs | 0.577609 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker | portablefs | 22.233231 | 83,149 | 1.979738 | 1.965714 |
+| install, 8 workers | portablefs | 11.740184 | 83,055 | 1.977500 | 1.965643 |
+| git-status-cold | direct-xfs | 0.008295 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006261 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.802987 | 40,628 | 2.031400 | 1.026050 |
+| git-status-warm | portablefs | 2.043918 | 20,471 | 1.023550 | 0.018150 |
+| two-mount-write-list-read | direct-xfs | 0.038529 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 2.990582 | 153,833 | 38.458250 | 3.152750 |
+
+The one-worker install issued 40,000 CREATEs, 40,000 WRITEs, 556 batched
+closes/releases, and no LOOKUPs. The eight-worker install issued 168 LOOKUPs
+and 72 GETATTRs. Cold Git issued 20,140 LOOKUPs; warm Git issued two. The peer
+workload's 130,308 RECLAIMs continue to dominate its request count. These
+measurements include profiling overhead and do not isolate the small G3b
+Authority correctness changes from run-to-run host variance.
+
+## G3 client final baseline
+
+The final G3a client baseline ran alone on Linux 6.8.0-100-generic. All baseline
+subtests passed in 116.27 seconds. The focused wrapper exited 70 only because its
+test filter deliberately omitted the full privileged inventory; the subsequent
+unfiltered `verify-local.sh --full` passed all 76 required XFS/FUSE tests. Log:
+`/tmp/cv2-g3a-final-baseline.log`.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---|---:|---:|---:|---:|
+| install, 1 worker | direct-xfs | 0.579639 | 0 | 0.000000 | 0.000000 |
+| install, 8 workers | direct-xfs | 0.330761 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker | portablefs | 21.825695 | 83,060 | 1.977619 | 1.964667 |
+| install, 8 workers | portablefs | 11.694983 | 83,161 | 1.980024 | 1.967095 |
+| git-status-cold | direct-xfs | 0.007606 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006981 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.921703 | 40,628 | 2.031400 | 1.026050 |
+| git-status-warm | portablefs | 2.232928 | 20,471 | 1.023550 | 0.018150 |
+| two-mount-write-list-read | direct-xfs | 0.039458 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.206865 | 112,028 | 28.007000 | 3.121750 |
+
+The one-worker install issued 40,000 CREATEs and WRITEs, 2,000 MKDIRs,
+512 `CloseBatch`/`DelegationRelease` pairs, and 22 barriers. The eight-worker
+install issued the same CREATE/WRITE/MKDIR core, 313 close/release pairs,
+13 barriers, 213 LOOKUP/RECLAIM pairs, and 88 GETATTRs. Compared with the G2
+intermediate baseline, PortableFS install wall time fell from 34.664636 to
+21.825695 seconds with one worker and from 15.408795 to 11.694983 seconds with
+eight. The bounded background pool preserves per-identity order; these figures
+are one machine observation rather than a general throughput claim.
+
+## G4 final baseline and qualification
+
+The final G4 baseline ran on Linux 6.8.0-100-generic with the same 4-CPU,
+8-GiB Docker VM, loopback TLS, tmpfs-backed loop XFS, workload sizes, and
+denominators as the v6 and G records. All subtests passed in 108.62 seconds.
+[Raw final observations](results-g4-final.jsonl) preserve all ten rows.
+
+| Workload | v6 wall (s) | G wall (s) | G4 wall (s) | v6 requests/op | G requests/op | G4 requests/op | G4 filesystem requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker | 386.762771 | 21.028568 | 21.089135 | 7.854381 | 7.480524 | 1.978286 | 1.965000 |
+| install, 8 workers | 273.738199 | 15.706301 | 11.512895 | 7.561476 | 6.849524 | 1.976857 | 1.967381 |
+| git-status-cold | 10.572948 | 1.379696 | 1.868078 | 1.040450 | 1.027400 | 1.027050 | 1.026000 |
+| git-status-warm | 2.042038 | 1.195970 | 2.260461 | 0.027650 | 0.018600 | 0.018250 | 0.018050 |
+| two-mount-write-list-read | 12.536042 | 2.644504 | 2.432345 | 7.877500 | 9.819500 | 8.127250 | 3.295750 |
+
+The warm-status regression target is met: LOOKUP + GETATTR is zero, RECLAIM is
+one (limit 64), and total traffic is 0.01825 requests per file (limit 0.02).
+The two-mount target is also met: 8.12725 requests per operation (limit 9.8),
+and 62 RECLAIM requests are no more than its 229 READDIR pages. The peer run
+performed five scans, observed 772 files while the writer was active, and
+verified all 2,000 files. Scheduling and overlap differ between historical
+runs, so these wall times remain observations rather than isolated speedups.
+
+| Warm-status opcode | Requests | Requests/op |
+| --- | ---: | ---: |
+| close | 120 | 0.006000 |
+| close_batch | 1 | 0.000050 |
+| create | 1 | 0.000050 |
+| flush | 16 | 0.000800 |
+| lookup + get_attr | 0 | 0.000000 |
+| open | 119 | 0.005950 |
+| read_dir | 103 | 0.005150 |
+| unlink | 1 | 0.000050 |
+| barrier | 1 | 0.000050 |
+| delegation_release | 1 | 0.000050 |
+| reclaim | 1 | 0.000050 |
+| renew_subscription | 1 | 0.000050 |
+
+| Two-mount opcode | Requests | Requests/op |
+| --- | ---: | ---: |
+| close | 2,006 | 0.501500 |
+| close_batch | 66 | 0.016500 |
+| create | 2,000 | 0.500000 |
+| flush | 2,000 | 0.500000 |
+| get_attr | 205 | 0.051250 |
+| lookup | 670 | 0.167500 |
+| open | 2,005 | 0.501250 |
+| read | 2,002 | 0.500500 |
+| read_dir | 229 | 0.057250 |
+| write | 2,000 | 0.500000 |
+| barrier | 4 | 0.001000 |
+| change_ack | 3,853 | 0.963250 |
+| delegation_break_ack | 5,728 | 1.432000 |
+| delegation_release | 66 | 0.016500 |
+| next_control_event | 9,613 | 2.403250 |
+| reclaim | 62 | 0.015500 |
+
+### One-worker CREATE latency profile
+
+One isolated profile sampled 100 evenly spaced `open(O_CREAT|O_EXCL)` calls
+from the 40,000-file, one-worker install. Temporary timestamp probes used one
+process monotonic clock at syscall entry, raw FUSE CREATE entry, Authority
+handler entry/exit, and syscall return; the probes were removed before final
+qualification. Values are microseconds per CREATE and exclude the subsequent
+1 KiB write and close.
+
+| Stage | Mean (us) | p50 (us) | p95 (us) |
+| --- | ---: | ---: | ---: |
+| kernel to daemon | 170 | 172 | 222 |
+| daemon to Authority | 33 | 29 | 77 |
+| Authority apply | 53 | 50 | 83 |
+| reply to syscall return | 79 | 75 | 115 |
+
+The stage means total 335 us per CREATE. The same profiled install completed in
+20.247920 seconds; the final uninstrumented run took 21.089135 seconds for
+40,000 create/write/close operations plus 2,000 directory creations. The
+remaining install wall time is therefore the namespace round-trip floor plus
+write, close, directory, and scheduling work. G4 deliberately does not add a
+new install optimization.
+
+## G6 final adversarial-fix baseline
+
+The final G6 baseline ran once on Linux 6.8.0-100-generic with the unchanged
+workloads and capacities:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 \
+PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' \
+bash scripts/xfs-fuse-integration.sh
+```
+
+Every `TestCoherenceBaseline` subtest passed in 109.89 seconds. The focused
+wrapper subsequently exited at its required-inventory check because the
+selector intentionally omitted the other privileged tests; the unfiltered
+78-test suite passed in the preceding full gate.
+
+| Workload | Target | Wall (s) | Authority requests | Requests/op | Filesystem requests/op |
+| --- | --- | ---: | ---: | ---: | ---: |
+| install, 1 worker | direct-xfs | 0.573902 | 0 | 0.000000 | 0.000000 |
+| install, 8 workers | direct-xfs | 0.314843 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker | portablefs | 21.321879 | 83,132 | 1.979333 | 1.965786 |
+| install, 8 workers | portablefs | 11.525351 | 83,082 | 1.978143 | 1.968310 |
+| git-status-cold | direct-xfs | 0.007169 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006457 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.907801 | 20,541 | 1.027050 | 1.026000 |
+| git-status-warm | portablefs | 2.327022 | 365 | 0.018250 | 0.018050 |
+| two-mount-write-list-read | direct-xfs | 0.032626 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.114409 | 26,891 | 6.722750 | 3.254500 |
+
+The additive visibility boundary appears explicitly in the filesystem meter.
+The one-worker and eight-worker installs issued 22 and 12 `wait_visibility`
+requests respectively; the two-mount workload issued five. Warm Git issued no
+visibility wait and remains at 0.01825 total requests per file. The two-mount
+run performed three directory scans, observed one file while the writer was
+active, and verified all 2,000 files.
+
+PortableFS request breakdowns:
+
+| Workload | Filesystem requests | Control requests |
+| --- | --- | --- |
+| install, 1 worker | close 2; close_batch 537; create 40,000; mkdir 2,000; open 1; read_dir 1; wait_visibility 22; write 40,000 | barrier 22; delegation_release 537; keep_alive 3; renew_subscription 7 |
+| install, 8 workers | close 2; close_batch 313; create 40,000; get_attr 113; lookup 227; mkdir 2,000; open 1; read_dir 1; wait_visibility 12; write 40,000 | barrier 12; delegation_release 313; keep_alive 1; reclaim 84; renew_subscription 3 |
+| git-status-cold | close 120; close_batch 1; create 1; flush 16; lookup 20,139; open 119; read 20; read_dir 103; unlink 1 | barrier 1; delegation_release 1; reclaim 19 |
+| git-status-warm | close 120; close_batch 1; create 1; flush 16; open 119; read_dir 103; unlink 1 | barrier 1; delegation_release 1; reclaim 1; renew_subscription 1 |
+| two-mount-write-list-read | close 2,004; close_batch 80; create 2,000; flush 2,000; get_attr 3; lookup 4; open 2,003; read 2,001; read_dir 918; wait_visibility 5; write 2,000 | barrier 5; change_ack 4,394; delegation_break_ack 2,384; delegation_release 80; next_control_event 6,784; reclaim 224; renew_subscription 2 |

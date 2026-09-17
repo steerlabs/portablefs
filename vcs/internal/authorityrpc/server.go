@@ -306,7 +306,7 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 	if entry.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && s.MaxInFlight < 3 {
 		return errors.New("authorityrpc: Linux max-in-flight must independently admit ordinary work, a delegated flush, and a blocking wait")
 	}
-	ordinaryLimit, blockingLimit, flushLimit := serverExecutionLanes(s.MaxInFlight, entry.profile)
+	ordinaryLimit, blockingLimit, flushLimit := serverExecutionLanes(s.MaxInFlight, entry.profile, entry.orderedFlush)
 	ordinary := make(chan struct{}, ordinaryLimit)
 	blocking := make(chan struct{}, blockingLimit)
 	flushes := make(chan struct{}, flushLimit)
@@ -475,7 +475,7 @@ func delegatedFlushRequest(request *authoritypb.Request) bool {
 	return false
 }
 
-func serverExecutionLanes(maxInFlight int, profile authoritypb.FrontendProfile) (ordinary, blocking, flush int) {
+func serverExecutionLanes(maxInFlight int, profile authoritypb.FrontendProfile, orderedMode ...bool) (ordinary, blocking, flush int) {
 	ordinary, blocking = blockingWaitLane(maxInFlight)
 	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
 		return ordinary, blocking, 0
@@ -484,6 +484,9 @@ func serverExecutionLanes(maxInFlight int, profile authoritypb.FrontendProfile) 
 	// the ordinary half is enough to break a cross-recall dependency while the
 	// remaining ordinary requests wait for holder acknowledgments.
 	flush = 1
-	ordinary--
+	if len(orderedMode) == 1 && orderedMode[0] && ordinary >= volumeserver.OrderedFlushWindow+1 {
+		flush = volumeserver.OrderedFlushWindow
+	}
+	ordinary -= flush
 	return ordinary, blocking, flush
 }

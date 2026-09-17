@@ -14,7 +14,10 @@ import (
 // Accounting belongs to the server description, not the RPC delivery. These
 // helpers run inside exact replay and cleanup removes the record atomically.
 func (h *VolumeHandler) coherenceAdmitOpen(id volumeserver.SessionID, handle xfsstore.Capability, identity [16]byte, requested, writeIntent bool) (bool, error) {
-	if !requested || writeIntent {
+	// Restore health is a volume-wide content admission decision. A cached
+	// page would bypass it after the hydrator disappears, including for files
+	// already hydrated. Active restore handles therefore remain direct I/O.
+	if !requested || writeIntent || h.Restore != nil && h.Restore.Active() {
 		return false, nil
 	}
 	token, err := h.coherenceToken(id)
@@ -29,7 +32,7 @@ func (h *VolumeHandler) coherenceAdmitOpen(id volumeserver.SessionID, handle xfs
 	resources := h.resources[id]
 	if resources == nil || resources.ended {
 		h.resourcesMu.Unlock()
-		_ = h.Coherence.CloseCacheCapable(token, identity)
+		h.Coherence.CloseCacheCapableSession(id, identity)
 		return false, volumeserver.ErrSessionExpired
 	}
 	if resources.cacheOpens == nil {
@@ -48,9 +51,7 @@ func (h *VolumeHandler) coherenceCloseAccounting(id volumeserver.SessionID, hand
 	}
 	h.resourcesMu.Unlock()
 	if identity != ([16]byte{}) {
-		if token, err := h.coherenceToken(id); err == nil {
-			_ = h.Coherence.CloseCacheCapable(token, identity)
-		}
+		h.Coherence.CloseCacheCapableSession(id, identity)
 	}
 }
 
@@ -84,8 +85,18 @@ func (h *VolumeHandler) coherenceReserveCreated(ctx context.Context, id volumese
 }
 
 func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential) *authoritypb.Response {
+	profile, err := h.sessionFrontendProfile(cred.ID)
+	if err != nil {
+		return h.coherenceError(req.GetRequestId(), err)
+	}
+	cacheless := profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER
+	if cacheless && (requestRequiresWrite(req) || req.GetOpen().GetWriteIntent() || req.GetOpen().GetCacheCapable()) {
+		return h.coherenceError(req.GetRequestId(), syscall.EPERM)
+	}
 	if req.GetOpen().GetWriteIntent() || req.GetOpen().GetFlags().GetWrite() {
-		h.coherenceProfileAdmission.RLock()
+		if err := h.coherenceProfileAdmission.RLockContext(ctx); err != nil {
+			return h.coherenceError(req.GetRequestId(), err)
+		}
 		defer h.coherenceProfileAdmission.RUnlock()
 		if err := h.Visibility.CheckCompatibilityWriter(cred.ID); err != nil {
 			return h.coherenceError(req.GetRequestId(), err)
@@ -104,9 +115,12 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 		if err != nil {
 			return h.coherenceError(0, err)
 		}
-		token, err := h.coherenceToken(cred.ID)
-		if err != nil {
-			return h.coherenceError(0, err)
+		var token volumeserver.SubscriptionToken
+		if !cacheless {
+			token, err = h.coherenceToken(cred.ID)
+			if err != nil {
+				return h.coherenceError(0, err)
+			}
 		}
 		var delegationReservation *volumeserver.DelegationReservation
 		if body.GetWriteIntent() {
@@ -117,7 +131,7 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 			defer reservation.Abort()
 			delegationReservation = reservation
 		}
-		guard, err := h.Coherence.DataConsumed(ctx, token, identity)
+		guard, err := h.coherenceReadAdmission(ctx, cred.ID, identity)
 		if err != nil {
 			return h.coherenceError(0, err)
 		}

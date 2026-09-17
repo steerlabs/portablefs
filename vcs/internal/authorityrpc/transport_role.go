@@ -34,7 +34,7 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		*authoritypb.Request_Mkdir, *authoritypb.Request_Unlink,
 		*authoritypb.Request_Rename, *authoritypb.Request_Link,
 		*authoritypb.Request_Symlink, *authoritypb.Request_Readlink,
-		*authoritypb.Request_Open, *authoritypb.Request_Close,
+		*authoritypb.Request_Open, *authoritypb.Request_Close, *authoritypb.Request_CloseBatch,
 		*authoritypb.Request_Read, *authoritypb.Request_Write,
 		*authoritypb.Request_FskitWrite,
 		*authoritypb.Request_Fallocate, *authoritypb.Request_CopyFileRange,
@@ -45,13 +45,11 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		*authoritypb.Request_ListXattr, *authoritypb.Request_RemoveXattr,
 		*authoritypb.Request_StatFs, *authoritypb.Request_SyncFs,
 		*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
-		*authoritypb.Request_ApplyRoutes, *authoritypb.Request_Barrier:
+		*authoritypb.Request_ApplyRoutes, *authoritypb.Request_Barrier,
+		*authoritypb.Request_WaitVisibility:
 		return transportRequestData, nil
 	case *authoritypb.Request_Activate, *authoritypb.Request_AbortAttach,
 		*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
-		*authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent,
-		*authoritypb.Request_RenewLeases,
-		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
 		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
 		*authoritypb.Request_Reauthorize, *authoritypb.Request_TerminalDeliveryReceipt,
 		*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,

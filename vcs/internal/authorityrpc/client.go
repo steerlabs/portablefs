@@ -167,57 +167,65 @@ type lane struct {
 }
 
 type Client struct {
-	cfg ClientConfig
+	batchedClose          atomic.Bool
+	orderedDelegatedFlush atomic.Bool
+	ordered               lane
+	cfg                   ClientConfig
 
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
 	// be able to reconnect and make progress independently.
-	lifecycle                sync.Mutex
-	data                     *clientTransport
-	control                  *clientTransport
-	connectionSetID          [32]byte
-	attachAttemptID          [32]byte
-	ordinary                 lane
-	blocking                 lane
-	repairControl            lane
-	controlPoll              lane
-	controlAck               lane
-	liveness                 lane
-	epoch                    []byte
-	helloFeatures            []string
-	negotiatedFrame          uint32
-	negotiatedInFlight       uint32
-	proof                    *authoritypb.SessionProof
-	root                     *authoritypb.Item
-	routesRevision           [32]byte
-	authorizationDeadline    time.Time
-	maxRead                  uint32
-	maxWrite                 uint32
-	maxFskitWrite            uint64
-	lease                    time.Duration
-	subscriptionMu           sync.Mutex
-	subscriptionSnapshot     []byte
-	subscriptionWatermark    uint64
-	subscriptionIncarnation  uint64
-	subscriptionHorizonNanos uint64
-	subscriptionDeadline     time.Time
-	fskitRepairCursor        *authoritypb.VisibilityCursor
-	sessionReauthorization   atomic.Bool
-	poisoned                 atomic.Bool
-	closed                   atomic.Bool
-	fatalMu                  sync.Mutex
-	fatalErr                 error
-	fatalDone                chan struct{}
-	fatalPendingDone         chan struct{}
-	fatalPending             bool
-	fatalPendingPublished    bool
-	fatalPublished           bool
-	localEnforcementDone     bool
-	fatalDrainTimer          *time.Timer
-	responseConsumptions     map[*responseConsumption]struct{}
-	preMountReleaseMu        sync.Mutex
-	preMountReleaseDone      chan struct{}
-	preMountReleaseErr       error
+	lifecycle                 sync.Mutex
+	data                      *clientTransport
+	control                   *clientTransport
+	connectionSetID           [32]byte
+	attachAttemptID           [32]byte
+	ordinary                  lane
+	blocking                  lane
+	repairControl             lane
+	controlPoll               lane
+	controlAck                lane
+	changeAck                 lane
+	liveness                  lane
+	epoch                     []byte
+	helloFeatures             []string
+	negotiatedFrame           uint32
+	negotiatedInFlight        uint32
+	proof                     *authoritypb.SessionProof
+	root                      *authoritypb.Item
+	routesRevision            [32]byte
+	authorizationDeadline     time.Time
+	maxRead                   uint32
+	maxWrite                  uint32
+	maxFskitWrite             uint64
+	lease                     time.Duration
+	releaseInvalidIncarnation atomic.Uint64
+	releaseIncarnation        uint64 // protected by the single controlAck permit
+	releaseSequence           uint64
+	releaseCompleted          uint64
+	subscriptionMu            sync.Mutex
+	subscriptionSnapshot      []byte
+	subscriptionWatermark     uint64
+	subscriptionIncarnation   uint64
+	subscriptionHorizonNanos  uint64
+	subscriptionDeadline      time.Time
+	fskitRepairCursor         *authoritypb.VisibilityCursor
+	sessionReauthorization    atomic.Bool
+	poisoned                  atomic.Bool
+	closed                    atomic.Bool
+	fatalMu                   sync.Mutex
+	fatalErr                  error
+	fatalDone                 chan struct{}
+	fatalPendingDone          chan struct{}
+	fatalPending              bool
+	fatalPendingPublished     bool
+	fatalPublished            bool
+	localEnforcementDone      bool
+	fatalDrainTimer           *time.Timer
+	responseConsumptions      map[*responseConsumption]struct{}
+	preMountReleaseMu         sync.Mutex
+	preMountReleaseDone       chan struct{}
+	preMountReleaseErr        error
 	// testAfterResponseParsed pauses the retained mutation path after readLoop
 	// has delivered a complete frame but before the frontend caller can consume
 	// it. Nil in production.
@@ -276,7 +284,7 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 			return nil, errors.New("authorityrpc: strict coherence requires an exact pre-kernel mount-absence observer")
 		}
 		switch cfg.FrontendProfile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 			if cfg.FskitCachedNameCapacity != 0 || cfg.FskitRepairBudget != 0 ||
 				cfg.FskitNamespaceRepair != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
 				return nil, errors.New("authorityrpc: Linux subscription profile cannot declare FSKit repair state")
@@ -314,15 +322,28 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	ordinaryLimit, blockingLimit := blockingWaitLane(cfg.MaxInFlight)
 	slots := make([]clientSlot, cfg.ReplaySlots)
 	split := cfg.ReplaySlots - uint32(blockingLimit)
-	c := &Client{
+	var orderedPermits chan struct{}
+	var orderedSlots []clientSlot
+	var orderedBase uint32
+	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && ordinaryLimit >= volumeserver.OrderedFlushWindow+1 {
+		ordinaryLimit -= volumeserver.OrderedFlushWindow
+		base := split - volumeserver.OrderedFlushWindow
+		orderedPermits = make(chan struct{}, volumeserver.OrderedFlushWindow)
+		orderedSlots = slots[base:split]
+		orderedBase = base
+		split = base
+	}
+	blockingBase := cfg.ReplaySlots - uint32(blockingLimit)
+	c := &Client{ordered: lane{permits: orderedPermits, slots: orderedSlots, base: orderedBase},
 		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 		data:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
 		ordinary:      lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
-		blocking:      lane{permits: make(chan struct{}, blockingLimit), slots: slots[split:], base: split},
+		blocking:      lane{permits: make(chan struct{}, blockingLimit), slots: slots[blockingBase:], base: blockingBase},
 		repairControl: lane{permits: make(chan struct{}, 1)},
 		controlPoll:   lane{permits: make(chan struct{}, 1)},
 		controlAck:    lane{permits: make(chan struct{}, 1)},
+		changeAck:     lane{permits: make(chan struct{}, 1)},
 		liveness:      lane{permits: make(chan struct{}, 1)},
 	}
 	connectionSetID, err := randomProtocolIdentity()
@@ -639,7 +660,7 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	}
 	fskitCursor := active.GetFskitRepairCursor()
 	switch c.cfg.FrontendProfile {
-	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 		if active.GetLeaseCursor() != nil || fskitCursor != nil {
 			return errors.New("authorityrpc: authority returned obsolete Linux lease activation state")
 		}
@@ -654,6 +675,8 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
+	c.batchedClose.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
+	c.orderedDelegatedFlush.Store(cap(c.ordered.permits) == volumeserver.OrderedFlushWindow && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature}) && hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}))
 	c.root = proto.Clone(root).(*authoritypb.Item)
 	c.routesRevision = c.cfg.RoutesRevision
 	c.lease = lease
@@ -1395,10 +1418,19 @@ func (c *Client) forceResponseConsumptionDrain() {
 }
 
 func (c *Client) laneFor(request *authoritypb.Request) *lane {
+	if c.SupportsOrderedFlush() && delegatedFlushRequest(request) {
+		// Match the server's entire flush lane, including metadata. Letting
+		// non-ordinal flushes bypass this bound could strand a predecessor
+		// behind successors which already occupy all server flush slots.
+		return &c.ordered
+	}
 	if request.GetNextControlEvent() != nil {
 		return &c.controlPoll
 	}
-	if request.GetSubscribe() != nil || request.GetChangeAck() != nil ||
+	if request.GetChangeAck() != nil {
+		return &c.changeAck
+	}
+	if request.GetSubscribe() != nil ||
 		request.GetDelegationRecallAck() != nil || request.GetDelegationBreakAck() != nil ||
 		request.GetDelegationModeChangeAck() != nil || request.GetDelegationRelease() != nil {
 		return &c.controlAck
@@ -1452,8 +1484,8 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 		request.GetActivate() != nil || request.GetAbortAttach() != nil || request.GetCancel() != nil {
 		return nil, syscall.EINVAL
 	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
-		obsoleteLinuxLeaseRequest(request) {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED &&
+		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
 		return nil, syscall.EOPNOTSUPP
 	}
 	if _, err := roleForRequest(request); err != nil {
@@ -1468,11 +1500,6 @@ func (c *Client) admitCall(ctx context.Context, request *authoritypb.Request) (*
 	return admitted, nil
 }
 
-func obsoleteLinuxLeaseRequest(request *authoritypb.Request) bool {
-	return request.GetNextLeaseEvent() != nil || request.GetAcknowledgeLeaseEvent() != nil ||
-		request.GetRenewLeases() != nil || request.GetAcknowledgeSourceLeaseDischarge() != nil
-}
-
 // dispatchOwned performs one round trip, stamping and sending a request the
 // client owns. Admission is the caller's responsibility so that a replay slot is
 // never taken before the permit that bounds it. Mutation dispatch assigns its
@@ -1485,8 +1512,8 @@ func (c *Client) dispatchOwned(ctx context.Context, request *authoritypb.Request
 }
 
 func (c *Client) dispatchOwnedFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
-		obsoleteLinuxLeaseRequest(request) {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED &&
+		!requestAllowedForFrontend(request, c.cfg.FrontendProfile) {
 		return nil, nil, syscall.EOPNOTSUPP
 	}
 	if c.cfg.Purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_MOUNT &&
@@ -1574,20 +1601,29 @@ func (c *Client) completeCall(request *authoritypb.Request, completed callResult
 }
 
 func (c *Client) validateResponseFrontendProfile(response *authoritypb.Response) error {
+	if response.GetSessionTerminal() && response.GetErrno() != int32(syscall.ESTALE) {
+		return fmt.Errorf("%w: terminal session response omitted ESTALE", ErrTransportBinding)
+	}
+
+	// The schema keeps historical tags to prevent accidental reuse. This is a
+	// rejection guard shared by every profile, not an executable v6 client.
+	if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil || response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil || response.GetSourceLeaseDischarge() != nil || response.GetAcknowledgeSourceLeaseDischarge() != nil {
+		return fmt.Errorf("%w: peer sent retired protocol state", ErrTransportBinding)
+	}
 	switch c.cfg.FrontendProfile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 || response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 || response.GetOpen().GetDelegation() != nil || response.GetOpen().GetCacheCapable() {
+			return fmt.Errorf("%w: cacheless reader received cache participation state", ErrTransportBinding)
+		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
-		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil ||
-			response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil ||
-			response.GetAcknowledgeSourceLeaseDischarge() != nil || response.GetSourceLeaseDischarge() != nil ||
-			response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
-			return fmt.Errorf("%w: Linux subscription session received obsolete lease or FSKit response state", ErrTransportBinding)
+		if response.GetFskitRepair() != nil || response.GetFskitWrite() != nil || response.GetFskitRepairRetrySequence() != 0 {
+			return fmt.Errorf("%w: Linux subscription session received FSKit response state", ErrTransportBinding)
 		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
-		if len(response.GetLeaseGrants()) != 0 || response.GetLeaseEvent() != nil ||
-			response.GetAcknowledgeLeaseEvent() != nil || response.GetRenewLeases() != nil ||
-			response.GetAcknowledgeSourceLeaseDischarge() != nil || response.GetSourceLeaseDischarge() != nil {
-			return fmt.Errorf("%w: FSKit repair session received Linux lease state", ErrTransportBinding)
+		if response.GetSubscribe() != nil || response.GetRenewSubscription() != nil || response.GetControlEvent() != nil || response.GetChangeAck() != nil || response.GetDelegationRecallAck() != nil || response.GetDelegationBreakAck() != nil || response.GetDelegationModeChangeAck() != nil || response.GetDelegationRelease() != nil || response.GetBarrier() != nil || response.GetWaitVisibility() != nil || response.GetVisibleSequence() != 0 {
+			return fmt.Errorf("%w: FSKit session received Linux subscription state", ErrTransportBinding)
 		}
+
 	}
 	return nil
 }
@@ -1632,6 +1668,9 @@ func (c *Client) writeRequest(ctx context.Context, transport *clientTransport, c
 	if err := conn.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
+	if bulk, ok := ctx.Value(segmentedWriteKey{}).(segmentedWrite); ok && bulk.request == request {
+		return writeFrameBulk(conn, transport.frameMax.Load(), request, bulk.segments)
+	}
 	return writeFrame(conn, transport.frameMax.Load(), request)
 }
 
@@ -1666,28 +1705,78 @@ func (c *Client) CallIdempotent(ctx context.Context, request *authoritypb.Reques
 	return detachResponseFrame(response, releaseFrame), err
 }
 
-func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, func(), error) {
+func (c *Client) callIdempotentFrame(ctx context.Context, request *authoritypb.Request) (response *authoritypb.Response, releaseFrame func(), err error) {
 	if c.poisoned.Load() {
 		return nil, nil, ErrTransportUncertain
 	}
-	response, releaseFrame, err := c.callFrame(ctx, request)
+	admitted, err := c.admitCall(ctx, request)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { <-admitted.permits }()
+	// One logical idempotent call owns its lane across reconnect and replay.
+	// A release result must be validated before any later release can receipt it.
+	if body := request.GetDelegationRelease(); body != nil {
+		if body.GetReleaseSequence() != 0 || body.GetCompletedReleaseThrough() != 0 || len(body.GetDelegations()) == 0 || len(body.GetDelegations()) > maxWireRepeatedElements {
+			return nil, nil, syscall.EINVAL
+		}
+		var previous []byte
+		for _, release := range body.GetDelegations() {
+			if release == nil || !validDelegationRef(release.GetDelegation()) || previous != nil && bytes.Compare(previous, release.GetDelegation().GetId()) >= 0 {
+				return nil, nil, syscall.EINVAL
+			}
+			previous = release.GetDelegation().GetId()
+		}
+		if body.GetIncarnation() == c.releaseInvalidIncarnation.Load() {
+			return nil, nil, ErrSubscriptionReset
+		}
+		if body.GetIncarnation() < c.releaseIncarnation || body.GetIncarnation() == 0 {
+			return nil, nil, syscall.EINVAL
+		}
+		if body.GetIncarnation() != c.releaseIncarnation {
+			c.releaseIncarnation, c.releaseSequence, c.releaseCompleted = body.GetIncarnation(), 0, 0
+		}
+		c.releaseSequence++
+		if c.releaseSequence == 0 {
+			panic("authorityrpc: delegation release sequence exhausted")
+		}
+		body.ReleaseSequence, body.CompletedReleaseThrough = c.releaseSequence, c.releaseCompleted
+		defer func() {
+			if err == nil && response != nil && (response.GetErrno() != 0 || response.GetDelegationRelease() != nil) {
+				c.releaseCompleted = body.ReleaseSequence
+				return
+			}
+			if err == nil {
+				err = errors.New("authorityrpc: malformed delegation release result")
+				c.signalSessionEnd(err)
+				return
+			}
+			// An uncertain release cannot surrender its replay receipt or issue
+			// another batch in this incarnation. Cold Subscribe retires that
+			// replay domain after local cache/buffer withdrawal, without ending
+			// the authenticated session or the kernel mount.
+			c.releaseInvalidIncarnation.Store(body.GetIncarnation())
+		}()
+	}
+	response, releaseFrame, err = c.dispatchOwnedFrame(ctx, request)
 	if !errors.Is(err, ErrTransportUncertain) {
 		return response, releaseFrame, err
 	}
 	if releaseFrame != nil {
 		releaseFrame()
+		releaseFrame = nil
 	}
 	role, roleErr := roleForRequest(request)
 	if roleErr != nil {
 		return nil, nil, syscall.EINVAL
 	}
 	if err := c.reconnectTransport(ctx, role); err != nil {
-		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
+		if role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 			c.signalSessionEnd(err)
 		}
 		return nil, nil, err
 	}
-	return c.callFrame(ctx, request)
+	return c.dispatchOwnedFrame(ctx, request)
 }
 
 // CallIdempotentRetained is the staged-write counterpart to
@@ -1750,6 +1839,38 @@ func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request)
 	return c.CallMutationWithIdentity(ctx, request, nil)
 }
 
+const orderedDelegatedFlushFeature = "ordered-delegated-flush-v1"
+
+// SupportsOrderedFlush is negotiated at activation for this exact session.
+func (c *Client) SupportsOrderedFlush() bool { return c.orderedDelegatedFlush.Load() }
+
+type segmentedWriteKey struct{}
+type segmentedWrite struct {
+	request  *authoritypb.Request
+	segments [][]byte
+}
+
+// CallMutationSegments sends retained WRITE spans without merging their bytes.
+// The caller owns the request and keeps every span immutable until return,
+// including reconnect/replay. Assignment observes the selected lane admission.
+func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned MutationAssigned) (*authoritypb.Response, error) {
+	if request == nil || request.GetWrite() == nil || len(request.GetWrite().GetData()) != 0 || segments == nil {
+		return nil, syscall.EINVAL
+	}
+	var size uint64
+	for _, segment := range segments {
+		size += uint64(len(segment))
+		if size > uint64(request.GetWrite().GetSize()) {
+			return nil, syscall.EINVAL
+		}
+	}
+	if size != uint64(request.GetWrite().GetSize()) {
+		return nil, syscall.EINVAL
+	}
+	ctx = context.WithValue(ctx, segmentedWriteKey{}, segmentedWrite{request, segments})
+	return c.CallMutationWithIdentity(ctx, request, assigned)
+}
+
 // CallMutationWithIdentity is CallMutation with one pre-dispatch identity
 // publication point. The callback is invoked exactly once, before the first
 // dispatch, and is not repeated if the same request is replayed after a
@@ -1776,6 +1897,9 @@ func (c *Client) CallMutationWithIdentityRetained(
 ) (*authoritypb.Response, ResponseConsumption, error) {
 	if c.poisoned.Load() {
 		return nil, nil, ErrTransportUncertain
+	}
+	if write := request.GetWrite(); write != nil && write.GetFlushSequence() != 0 && !c.SupportsOrderedFlush() {
+		return nil, nil, syscall.EOPNOTSUPP
 	}
 	role, err := roleForRequest(request)
 	if err != nil || role != authoritypb.TransportRole_TRANSPORT_ROLE_DATA {
@@ -1826,6 +1950,9 @@ func (c *Client) CallMutationWithIdentityRetained(
 			releaseFrame()
 		}
 		if reconnectErr := c.reconnectTransport(ctx, authoritypb.TransportRole_TRANSPORT_ROLE_DATA); reconnectErr != nil {
+			if !errors.Is(reconnectErr, ErrAuthorityChanged) && !errors.Is(reconnectErr, ErrSessionEnded) && !errors.Is(reconnectErr, ErrTransportBinding) {
+				reconnectErr = ErrTransportUncertain
+			}
 			c.signalSessionEnd(reconnectErr)
 			return nil, nil, reconnectErr
 		}
@@ -1894,6 +2021,13 @@ func (c *Client) readLoop(transport *clientTransport, conn net.Conn) {
 			c.failConnection(transport, conn, ErrAuthorityChanged)
 			return
 		}
+		if response.GetSessionTerminal() {
+			if response.GetErrno() != int32(syscall.ESTALE) {
+				c.signalSessionEnd(ErrTransportBinding)
+			} else {
+				c.signalSessionEnd(ErrSessionEnded)
+			}
+		}
 		if response.GetUncertain() {
 			c.signalSessionEnd(ErrTransportUncertain)
 		}
@@ -1947,9 +2081,10 @@ func (c *Client) failConnection(transport *clientTransport, conn net.Conn, err e
 	idle := len(pending) == 0 && !c.closed.Load()
 	// Losing an idle DATA socket is only a transport event: the next safe read
 	// or exact mutation replay lazily resumes that one role. CONTROL owns the
-	// visibility/liveness contract, so an idle loss still ends the mount under
-	// the existing fail-closed safety rule.
-	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL {
+	// v7 subscription horizon, which independently withdraws stale caches. An
+	// idle socket loss cannot prove an epoch or session outcome. Other profiles
+	// retain their existing terminal CONTROL contract.
+	if idle && transport.role == authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL && c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		c.signalSessionEnd(err)
 	}
 	transport.pendingMu.Unlock()
@@ -2008,3 +2143,6 @@ func equalBytes(a, b []byte) bool {
 	}
 	return different == 0
 }
+
+// SupportsBatchedClose reports the optional capability of this active epoch.
+func (c *Client) SupportsBatchedClose() bool { return c.batchedClose.Load() }

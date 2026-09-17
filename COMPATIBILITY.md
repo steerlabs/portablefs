@@ -7,13 +7,13 @@ mixed-major execution path; the protocol-7 handshake refuses protocol 6.
 Status: **verification candidate (pre-launch)**. PortableFS has not launched.
 The coherence v2 [design](./docs/coherence-v2/design.md) and protocol-7
 [wire contract](./docs/coherence-v2/wire.md) specify the replacement. Workstream
-A supplies the wire; coordinator and frontend integration remain separate
-workstreams under [PLAN.md](./docs/coherence-v2/PLAN.md). A protocol-7 build is
-not evidence that those state machines or the kernel proofs are complete.
-The surfaces below are reviewed as frozen; verification cannot silently alter
-them. The historical protocol-6 specification in
-[docs/portable-coherence.md](./docs/portable-coherence.md) does not define v7
-subscription/delegation semantics.
+A supplies the wire; integration and local real-mount qualification are recorded
+in [integration.md](./docs/coherence-v2/integration.md), with measurements in
+[results.md](./docs/coherence-v2/results.md). Production kernel and runner
+completion integration remain separate qualification boundaries. The surfaces
+below are reviewed as frozen; verification cannot silently alter them.
+[docs/portable-coherence.md](./docs/portable-coherence.md) describes the current
+protocol-7 subscription/delegation contract.
 
 ## v2 is gone
 
@@ -45,6 +45,27 @@ still a coordinated protocol-major change, not a silent edit. Pre-launch, pin
 against these knowing the draft specification can still move a detail; after it
 leaves draft they are frozen.
 
+### Frozen-surface release map
+
+Release 0.4.0 is the protocol-7 reset of 0.3.0's protocol 6. The release
+version, product generation v3, authority major, and local protocol version
+are separate identities. No mixed-major volume deployment is supported.
+
+| Frozen surface | Protocol 7 / release 0.4.0 | Retired protocol 6 surface |
+| --- | --- | --- |
+| Authority TLS / Hello | Exact `portablefs-authority-v7` / major `7` | `portablefs-authority-v6` / major `6`, refused at handshake |
+| Linux cache authority | Volume subscription, ordered changes, file write delegation; exact feature sets in [wire.md](docs/coherence-v2/wire.md#required-features) | N/A/D/E lease families; `lease-coherence-v1`, `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`, `open-by-identity-v1`, and unconditional Linux `write-through` |
+| Historical wire bodies | Tags and names retained and never reused; no executable old lease path | `Lease*`, `NextLeaseEvent`, `AcknowledgeLeaseEvent`, `RenewLeases`, `SourceLeaseDischarge`, `AcknowledgeSourceLeaseDischarge`, `lease_grants`, `source_lease_discharge`, `lease_cursor` |
+| Frontend enum | Frozen `LINUX_LEASES` spelling now has major-7 semantics; FSKit retains `FSKIT_SYNC_REPAIR`; gateway uses `CACHELESS_READER` | Linux lease execution and gateway use of FSKit repair |
+| Mac daemon / extension | `pfslocal` 1.15; nested authority major 7; shared Go/Swift Resolve golden, built from one commit | Nested authority major 6, refused even though the local major/minor is unchanged |
+| Completion | Root-directory FSYNCDIR barrier and per-handle loss observation; explicit fsync durability | Linux unconditional write-through; stock FUSE_SYNCFS is not a completion surface |
+| Retained identities | Existing cache-policy names, local-dirs syntax/hash, environment and CLI spellings, release archive names and signing identity | None renamed or repurposed by this release |
+
+The coordinated [rollout](docs/coherence-v2/rollout.md) covers Authorities,
+Linux mounts, the files gateway, and Mac clients. A signed Mac app must contain
+its CLI, Go daemon, and Swift extension from the same immutable commit; the
+shared golden is necessary evidence, not a live FSKit qualification.
+
 ### The authority wire
 
 - **Transport is mutually authenticated TLS 1.3**, with the single ALPN
@@ -64,7 +85,8 @@ leaves draft they are frozen.
   [wire.md, Required features](./docs/coherence-v2/wire.md#required-features).
   Linux requires `volume-subscription-v1`, `ordered-change-stream-v1`,
   `file-write-delegation-v1`, `delegation-control-v1`,
-  `session-durable-sequence-v1`, and `root-directory-barrier-v1` in addition
+  `session-durable-sequence-v1`, `root-directory-barrier-v1`, and
+  `bounded-control-replay-v1` in addition
   to the retained transport, replay, and filesystem assertions. Linux no longer
   advertises the N/A/D/E lease-family features, `open-by-identity-v1`, or
   unconditional `write-through`.
@@ -72,11 +94,14 @@ leaves draft they are frozen.
   The frozen enum spelling `LINUX_LEASES` still identifies the Linux frontend;
   protocol major 7 gives it subscription/delegation semantics. The historical
   lease messages and field numbers remain in the schema for inspection of
-  history, but v7 does not send or honour them. The integration workstream
-  deletes their old handler/client paths. FSKit retains `FSKIT_SYNC_REPAIR`,
+  history, but v7 does not send or honour them. Their old Linux handler/client
+  execution paths have been deleted. FSKit retains `FSKIT_SYNC_REPAIR`,
   its repair/source-publication/fragmented-write assertions, and writer
   exclusion for every attached Mac mount. A feature advertisement cannot
-  manufacture a callback the frontend does not expose.
+  manufacture a callback the frontend does not expose. The additive
+  `CACHELESS_READER` profile requires `cacheless-peer-reader-v1`, exactly read
+  access, no cache permission and no repair participation. Gateway reads break
+  delegated data for read without excluding Linux writers.
 
 - **One volume-wide subscription controls Linux caching.** Its authority
   horizon is 10 seconds, renewed every 3 seconds, with durations anchored
@@ -190,7 +215,7 @@ SDK-27 native adapter is selected only by an app built and signed with its exact
 compile-time capability stamp
 `sdk27-live-qualification-only` in the CLI and the compile-time
 `portablefs_macos27_qualification` packaging tag. The historical spelling is
-frozen even though protocol 6 admits the resulting stronger actuator; it is a
+frozen even though protocol 7 admits the resulting stronger actuator; it is a
 property of the signed artifact, not a runtime toggle or fallback. The stamp
 does not alter the ordinary v2 policy or automatically admit a future macOS
 release. An unsupported repair terminates the mount before COMPLETE.
@@ -271,6 +296,8 @@ Additive evolution with versioning; consumers tolerate additions.
   or not at all.
 - `pfslocal` minor version bumps. The local protocol between `portablefsd` and
   the FSKit extension is major 1, currently minor 15, and grows additively.
+  Its nested authority contract now requires exact major 7; major 6 is refused.
+  This does not change the local major/minor or any frozen field numbers.
 - New environment variables, where leaving one unset preserves previous
   behaviour.
 - New authority bounds and timeouts. Their defaults may change; a deployment that

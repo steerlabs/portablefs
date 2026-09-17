@@ -84,7 +84,11 @@ func (s *Server) acceptTransportHello(
 	response.GetHello().Role = hello.GetRole()
 	response.GetHello().ConnectionSetId = append([]byte(nil), hello.GetConnectionSetId()...)
 	response.GetHello().FrontendProfile = hello.GetFrontendProfile()
-	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close)
+	ordered := hasFeatures(response.GetHello().Features, []string{orderedDelegatedFlushFeature})
+	if ordered && (hello.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES || !hasFeatures(hello.Features, []string{orderedDelegatedFlushFeature}) || response.GetHello().GetMaxInFlight() < 9) {
+		return nil, nil, fmt.Errorf("%w: invalid ordered-flush negotiation", ErrTransportBinding)
+	}
+	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close, ordered)
 	if err != nil {
 		return nil, nil, err
 	}

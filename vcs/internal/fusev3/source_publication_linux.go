@@ -68,10 +68,13 @@ type namespaceBounds struct {
 // Unresolved counts validate reply completion only; they never widen the cut
 // beyond the identities and names in coordinates.
 type sourcePublicationLease struct {
+	completeParent       publicationIdentity
+	completeProof        *directoryCompleteness
 	r                    *rawFileSystem
 	coordinates          map[publicationCoordinate]struct{}
 	names                map[publicationNamespace]namespaceBounds
 	preBindings          map[publicationNamespace]publicationIdentity
+	renameBindings       map[publicationNamespace]publicationIdentity
 	unresolvedAttributes int
 	unresolvedData       int
 	assigned             bool
@@ -245,14 +248,26 @@ func coordinatesForSourceGate(gate *sourcePublicationGate) (map[publicationCoord
 		}
 		name := publicationNamespace{parent: namespace.parent, name: namespace.name}
 		coordinates[publicationCoordinate{kind: publicationNamespaceName, parent: namespace.parent, name: namespace.name}] = struct{}{}
+		coordinates[publicationCoordinate{kind: publicationItemEnumeration, item: namespace.parent}] = struct{}{}
 		names[name] = namespaceBounds{attributes: namespace.attributes, data: namespace.data}
 	}
 	return coordinates, names, nil
 }
 
+// A signal without waiters needs no allocation: every waiter checks its
+// predicate and takes this channel under the same mutex as the signaler.
+func (r *rawFileSystem) sourceChangedWaitLocked() <-chan struct{} {
+	if r.sourceChanged == nil {
+		r.sourceChanged = make(chan struct{})
+	}
+	return r.sourceChanged
+}
+
 func (r *rawFileSystem) signalSourceChangedLocked() {
-	close(r.sourceChanged)
-	r.sourceChanged = make(chan struct{})
+	if r.sourceChanged != nil {
+		close(r.sourceChanged)
+		r.sourceChanged = nil
+	}
 }
 
 func (r *rawFileSystem) sourceLeaseOverlapLocked(coordinates map[publicationCoordinate]struct{}, owner *sourcePublicationLease) bool {
@@ -308,6 +323,13 @@ func (r *rawFileSystem) supersedableNegativePublicationLocked(publication *negat
 }
 
 func (r *rawFileSystem) sourceCoordinateBusyLocked(coordinate publicationCoordinate, owner *sourcePublicationLease) bool {
+	for _, publication := range r.replyPublications {
+		for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
+			if cached == coordinate {
+				return true
+			}
+		}
+	}
 	publishing := r.sourcePublishing[coordinate]
 	if publishing == 0 {
 		return false
@@ -368,7 +390,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 		// This is an internal scheduling boundary: no synthetic EINTR escapes to
 		// applications for either namespace or inode mutations.
 		if r.leaseRecallHeldLocked(coordinates) {
-			changed := r.sourceChanged
+			changed := r.sourceChangedWaitLocked()
 			r.mu.Unlock()
 			select {
 			case <-changed:
@@ -378,7 +400,7 @@ func (r *rawFileSystem) acquireSourcePublication(ctx context.Context, gate *sour
 			}
 		}
 		if r.sourceLeaseOverlapLocked(coordinates, nil) {
-			changed := r.sourceChanged
+			changed := r.sourceChangedWaitLocked()
 			r.mu.Unlock()
 			select {
 			case <-changed:
@@ -429,7 +451,7 @@ func (l *sourcePublicationLease) refreshPreBindings(ctx context.Context) error {
 			}
 		}
 		if l.r.sourceLeaseOverlapLocked(additional, l) {
-			changed := l.r.sourceChanged
+			changed := l.r.sourceChangedWaitLocked()
 			l.r.mu.Unlock()
 			select {
 			case <-changed:
@@ -456,12 +478,12 @@ func (l *sourcePublicationLease) refreshPreBindings(ctx context.Context) error {
 func (l *sourcePublicationLease) drain(ctx context.Context) error {
 	for {
 		l.r.mu.Lock()
-		busy := l.r.sourcePublicationsBusyLocked(l.coordinates, l)
-		changed := l.r.sourceChanged
-		l.r.mu.Unlock()
-		if !busy {
+		if !l.r.sourcePublicationsBusyLocked(l.coordinates, l) {
+			l.r.mu.Unlock()
 			return nil
 		}
+		changed := l.r.sourceChangedWaitLocked()
+		l.r.mu.Unlock()
 		select {
 		case <-changed:
 		case <-ctx.Done():
@@ -525,12 +547,46 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 		return nil
 	}
 	l.r.mu.Lock()
-	defer l.r.mu.Unlock()
 	if l.released || l.revoked || l.ready || !l.assigned {
+		l.r.mu.Unlock()
 		return errors.New("fusev3: source publication lease has an invalid callback-publication transition")
 	}
 	if l.unresolvedAttributes != 0 || l.unresolvedData != 0 {
+		l.r.mu.Unlock()
 		return errors.New("fusev3: source callback publication retained unresolved namespace bindings")
+	}
+	// Own commits are omitted from the peer stream. Drain protects pending
+	// replies, but settled daemon attributes must also be withdrawn before the
+	// exact post-state can replace them at reply settlement. Kernel data records
+	// remain registered: they carry a separate invalidation obligation.
+	var directories []*dirHandle
+	for coordinate := range l.coordinates {
+		if coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData {
+			delete(l.r.cachedAttrs, coordinate.item)
+			delete(l.r.cachedAttrPayloads, coordinate.item)
+		}
+		if coordinate.kind == publicationItemEnumeration {
+			l.r.dropDirectoryPageHintsLocked(coordinate.item)
+			if coordinate.item != l.completeParent || l.r.completeDirectories[coordinate.item] != l.completeProof {
+				l.r.dropCompleteDirectoryLocked(coordinate.item)
+			}
+			for _, handle := range l.r.handles {
+				if handle != nil && handle.dir != nil && handle.inode != nil && handle.inode.identity == coordinate.item {
+					directories = append(directories, handle.dir)
+				}
+			}
+		}
+	}
+	// Directory cursor locks must never nest inside the inode-table lock. The
+	// source gate stays closed while buffered pages and in-flight fetches retire.
+	l.r.mu.Unlock()
+	for _, directory := range directories {
+		directory.invalidateEnumeration()
+	}
+	l.r.mu.Lock()
+	defer l.r.mu.Unlock()
+	if l.released || l.revoked || l.ready {
+		return errors.New("fusev3: source publication ended while retiring enumeration")
 	}
 	l.ready = true
 	return nil
@@ -679,9 +735,22 @@ func (l *sourcePublicationLease) attachRename(ctx context.Context, oldName, newN
 		if *oldPost == (publicationIdentity{}) {
 			return errors.New("fusev3: successful rename returned a zero retained-source identity")
 		}
-		return l.attachBinding(ctx, oldName, *oldPost)
+		if err := l.attachBinding(ctx, oldName, *oldPost); err != nil {
+			return err
+		}
+	} else {
+		l.resolveNoBinding(oldName)
 	}
-	l.resolveNoBinding(oldName)
+	bindings := map[publicationNamespace]publicationIdentity{newName: newPost}
+	if oldName != newName {
+		bindings[oldName] = publicationIdentity{}
+		if oldPost != nil {
+			bindings[oldName] = *oldPost
+		}
+	}
+	l.r.mu.Lock()
+	l.renameBindings = bindings
+	l.r.mu.Unlock()
 	return nil
 }
 

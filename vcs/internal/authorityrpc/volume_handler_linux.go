@@ -73,7 +73,7 @@ type volumeStore interface {
 	Fsync(xfsstore.Capability, bool) error
 	GetattrOpen(xfsstore.Capability) (xfsstore.Attr, error)
 	SyncFS() error
-	ReadDirOpen(xfsstore.Capability, uint64, [16]byte, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
+	ReadDirOpen(xfsstore.Capability, uint64, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
 	StatOpenDirChild(xfsstore.Capability, string) (xfsstore.Attr, error)
 	LookupOpen(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error)
 	Chmod(xfsstore.Capability, fs.FileMode) error
@@ -131,7 +131,6 @@ type VolumeHandler struct {
 	coherenceProfileAdmission coherenceProfileGate
 
 	Coherence                  *volumeserver.CoherenceCoordinator
-	CoherenceApplications      coherenceApplicationValidator
 	coherenceOnce              sync.Once
 	coherenceControlOnce       sync.Once
 	coherenceControl           *coherenceControlState
@@ -185,15 +184,11 @@ type VolumeHandler struct {
 	WriteAdmissionProgressTimeout       time.Duration
 	WriteAbsoluteTimeout                time.Duration
 	TerminalDeliveryTimeout             time.Duration
-	// Lifecycle durably records protocol-6 mounts and owns route-revision
-	// exclusion. Cache authority itself belongs exclusively to Leases.
+	// Lifecycle durably records mounts and owns route-revision exclusion.
 	Lifecycle *volumeserver.MountLifecycle
-	// Visibility owns the protocol-6 FSKit synchronous-repair participants. Linux
+	// Visibility owns the protocol-7 FSKit synchronous-repair participants. Linux
 	// sessions never enter it; composite mutations coordinate both profile sets.
 	Visibility *volumeserver.VisibilityCoordinator
-	// Leases retains route-administration bookkeeping until the routing layer
-	// removes its historical startup table. No v7 session enters the table.
-	Leases *volumeserver.LeaseCoordinator
 	// Routes owns the volume's active machine-local routing revision. It is
 	// required: a volume with no loaded revision cannot tell an agreeing mount
 	// from a disagreeing one, and admitting mounts in that state is exactly the
@@ -256,7 +251,7 @@ type sessionResources struct {
 	cacheOpens map[xfsstore.Capability][16]byte
 
 	ended bool
-	// attempt identifies the one protocol-6 attach transaction that owns these
+	// attempt identifies the one protocol-7 attach transaction that owns these
 	// resources. Attach retries may race, but the runtime binds an attempt ID to
 	// one canonical request before this record is installed, so an exact retry
 	// observes this same record instead of allocating a second reply table.
@@ -454,6 +449,21 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
 	defer use.End()
+	if write := req.GetWrite(); write != nil && write.GetFlushSequence() != 0 {
+		// Only an authenticated owner can retire a sequence with no replay
+		// outcome. Otherwise its already-dispatched successors could park
+		// behind a gap that can never be consumed.
+		defer func() {
+			if response.GetMutation() == nil {
+				if id, err := parseCoherenceDelegationID(write.GetDelegation().GetId()); err == nil {
+					h.Coherence.AbortOrderedFlushes(cred.ID, id, write.GetDelegation().GetGeneration())
+				}
+			}
+		}()
+		if entry, ok := transportConnectionFromContext(ctx); !ok || !entry.orderedFlush {
+			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
+		}
+	}
 	// Reauthorization is an ordinary ACTIVE-session operation. Pin the runtime
 	// first, before presenting its signed token to an external verifier: a
 	// provisional credential must not consume or validate anything beyond its
@@ -590,6 +600,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 	if req.GetBarrier() != nil {
 		return h.handleCoherenceBarrier(ctx, req, cred)
 	}
+	if req.GetWaitVisibility() != nil {
+		return h.handleCoherenceVisibility(ctx, req, cred)
+	}
 	ctx = context.WithValue(ctx, coherenceOperationKey{}, &coherenceOperation{})
 
 	switch body := req.GetBody().(type) {
@@ -661,6 +674,8 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		proof := mountAbsenceProof(body.Detach.GetMountAbsence())
 		if err := h.Lifecycle.CleanDetach(cred.ID, proof, func() error {
 			switch frontendProfile {
+			case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+				return nil
 			case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 				h.Coherence.ExpireSession(cred.ID)
 				return nil
@@ -785,12 +800,11 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if set.Mode != nil {
 				var valid bool
 				mode, valid = modeFromProtocol(set.GetMode())
-				if !valid || item == (xfsstore.Capability{}) {
+				if !valid {
 					return nil, syscall.EINVAL
 				}
 			}
-			if (set.Uid != nil || set.Gid != nil) && (item == (xfsstore.Capability{}) ||
-				(set.Uid != nil && set.GetUid() == ^uint32(0)) || (set.Gid != nil && set.GetGid() == ^uint32(0))) {
+			if (set.Uid != nil || set.Gid != nil) && ((set.Uid != nil && set.GetUid() == ^uint32(0)) || (set.Gid != nil && set.GetGid() == ^uint32(0))) {
 				return nil, syscall.EINVAL
 			}
 			if set.Size != nil && set.GetSize() < 0 {
@@ -799,9 +813,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if set.AtimeNs != nil && set.GetAtimeNow() || set.MtimeNs != nil && set.GetMtimeNow() {
 				return nil, syscall.EINVAL
 			}
-			if (set.AtimeNs != nil || set.MtimeNs != nil || set.GetAtimeNow() || set.GetMtimeNow()) && item == (xfsstore.Capability{}) {
-				return nil, syscall.EINVAL
-			}
+
 			if item != (xfsstore.Capability{}) && handle != (xfsstore.Capability{}) {
 				itemIdentity, identityErr := h.Store.Identity(item)
 				if identityErr != nil {
@@ -996,7 +1008,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 			existingCoordinate, existingSize, existed = resolvedName.coordinate, resolvedName.size, resolvedName.found
 			lockIdentities := [][16]byte{parentCoordinate.identity}
-			if existed {
+			if existed && !body.Create.GetExclusive() {
 				lockIdentities = append(lockIdentities, existingCoordinate.identity)
 			}
 			releaseMutation, err = lockMutationStore(h.Store, lockIdentities...)
@@ -1025,7 +1037,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if existed {
 				existingSize = lockedName.size
 			}
-			if !existed {
+			if !existed || body.Create.GetExclusive() {
+				// O_EXCL can only create a new binding or return EEXIST. Even if a
+				// peer installs the name after the first resolution, this operation
+				// cannot publish or mutate that peer's inode.
 				return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
 			}
 			// Existing-name CREATE publishes an exact name snapshot and both object
@@ -1668,23 +1683,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			releaseMutation()
 		}
 		return response
+	case *authoritypb.Request_CloseBatch:
+		return h.handleCloseBatch(ctx, req, cred)
 	case *authoritypb.Request_Close:
-		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			handle, err := h.open(cred.ID, body.Close.GetHandle())
-			if err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			if body.Close.GetFlockUnlock() {
-				if err := h.unlockOpenOwner(cred, handle, body.Close.GetLockOwner(), true); err != nil {
-					return h.errorResponse(0, err, false)
-				}
-			}
-			if err := h.Store.CloseOpen(handle); err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			h.untrackOpen(cred.ID, handle)
-			return h.success(0)
-		})
+		return h.mutate(ctx, req, cred, func() *authoritypb.Response { return h.closeForSession(cred, body.Close) })
 	case *authoritypb.Request_Flush:
 		handle, err := h.open(cred.ID, body.Flush.GetHandle())
 		if err != nil {
@@ -1767,6 +1769,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if body.ReadDir.GetMaxEntries() == 0 || body.ReadDir.GetMaxEntries() > 4096 {
 				return h.errorResponse(0, syscall.EINVAL, false)
 			}
+			heldIdentities, err := heldDirectoryIdentities(body.ReadDir)
+			if err != nil {
+				return h.errorResponse(0, err, false)
+			}
 			handle, err := h.open(cred.ID, body.ReadDir.GetHandle())
 			if err != nil {
 				return h.errorResponse(0, err, false)
@@ -1817,20 +1823,33 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			// A page carries at least one entry unless it is the final one: an
 			// empty non-final page advances no client cursor, so a batch whose
 			// every entry raced away is skipped over rather than published.
-			for batch := 0; ; batch++ {
+			for {
+				if err := ctx.Err(); err != nil {
+					forgetIssued()
+					return h.errorResponse(0, err, false)
+				}
 				var candidates []directoryPageCandidate
-				stabilized := false
-				for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, verifier, int(body.ReadDir.GetMaxEntries()))
+				for {
+					if err := ctx.Err(); err != nil {
+						forgetIssued()
+						return h.errorResponse(0, err, false)
+					}
+					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, int(body.ReadDir.GetMaxEntries()))
 					if err != nil {
+						if errors.Is(err, syscall.EAGAIN) {
+							continue
+						}
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
 					var conflict bool
 					candidates, budgetExhausted, conflict, err = h.constructDirectoryPage(
-						handle, entries, cookie, body.ReadDir.GetWantItems(), budget,
+						handle, entries, cookie, body.ReadDir.GetWantItems(), heldIdentities, budget,
 					)
 					if err != nil {
+						if errors.Is(err, syscall.EAGAIN) {
+							continue
+						}
 						forgetIssued()
 						return h.errorResponse(0, err, false)
 					}
@@ -1838,11 +1857,14 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 						continue
 					}
 					valid, verifyErr := h.revalidateDirectoryPage(
-						handle, directory, cookie, verifier, current,
+						handle, directory, cookie, current,
 						int(body.ReadDir.GetMaxEntries()), entries, eof, candidates,
 					)
 					if verifyErr != nil {
 						h.forgetDirectoryCandidates(candidates)
+						if errors.Is(verifyErr, syscall.EAGAIN) {
+							continue
+						}
 						forgetIssued()
 						return h.errorResponse(0, verifyErr, false)
 					}
@@ -1873,12 +1895,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 						continue
 					}
 					pageSnapshot = snapshot
-					stabilized = true
 					break
-				}
-				if !stabilized {
-					forgetIssued()
-					return h.errorResponse(0, syscall.EAGAIN, false)
 				}
 				result.Verifier, result.Eof = current[:], eof && !budgetExhausted
 				for _, candidate := range candidates {
@@ -1899,11 +1916,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				if len(entries) == 0 {
 					break
 				}
-				cookie += uint64(len(entries))
-				if batch+1 >= maxSkippedReaddirBatches {
-					forgetIssued()
-					return h.errorResponse(0, syscall.EAGAIN, false)
-				}
+				cookie = entries[len(entries)-1].NextCookie
 			}
 			if budgetExhausted && len(result.Entries) == 0 {
 				// A single entry larger than the whole budget would make this
@@ -1938,14 +1951,35 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		// state: if the first success reply is lost, re-executing a read-style
 		// retry would resolve an already-retired capability as ESTALE.
 		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			item, err := h.item(cred.ID, body.Reclaim.GetItem())
-			if err != nil {
-				return h.errorResponse(0, err, false)
+			rawItems := body.Reclaim.GetItems()
+			if legacy := body.Reclaim.GetItem(); len(legacy) != 0 {
+				if len(rawItems) != 0 {
+					return h.errorResponse(0, syscall.EINVAL, false)
+				}
+				rawItems = [][]byte{legacy}
 			}
-			if err := h.Store.Forget(item); err != nil && !errors.Is(err, xfsstore.ErrStaleObject) {
-				return h.errorResponse(0, err, false)
+			if len(rawItems) == 0 || len(rawItems) > MaxReclaimBatch {
+				return h.errorResponse(0, syscall.EINVAL, false)
 			}
-			h.untrackItem(cred.ID, item)
+			items := make([]xfsstore.Capability, 0, len(rawItems))
+			seen := make(map[xfsstore.Capability]struct{}, len(rawItems))
+			for _, raw := range rawItems {
+				item, err := h.item(cred.ID, raw)
+				if err != nil {
+					return h.errorResponse(0, err, false)
+				}
+				if _, duplicate := seen[item]; duplicate {
+					return h.errorResponse(0, syscall.EINVAL, false)
+				}
+				seen[item] = struct{}{}
+				items = append(items, item)
+			}
+			for _, item := range items {
+				if err := h.Store.Forget(item); err != nil && !errors.Is(err, xfsstore.ErrStaleObject) {
+					return h.errorResponse(0, err, false)
+				}
+				h.untrackItem(cred.ID, item)
+			}
 			return h.success(0)
 		})
 	case *authoritypb.Request_GetXattr:
@@ -2148,17 +2182,18 @@ func (h *VolumeHandler) constructDirectoryPage(
 	entries []xfsstore.Dirent,
 	cookie uint64,
 	wantItems bool,
+	heldIdentities map[[16]byte]struct{},
 	budget uint32,
 ) ([]directoryPageCandidate, bool, bool, error) {
 	candidates := make([]directoryPageCandidate, 0, len(entries))
 	used := uint64(0)
-	for i, entry := range entries {
+	for _, entry := range entries {
 		candidate := directoryPageCandidate{enumerated: entry}
 		attr := xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
 		if entry.Kind != xfsstore.KindOpaque {
 			item, itemAttr, err := h.Store.LookupOpen(handle, entry.Name)
 			switch {
-			case errors.Is(err, syscall.ENOENT), errors.Is(err, xfsstore.ErrStaleObject):
+			case errors.Is(err, syscall.ENOENT), errors.Is(err, syscall.EAGAIN), errors.Is(err, xfsstore.ErrStaleObject):
 				h.forgetDirectoryCandidates(candidates)
 				return nil, false, true, nil
 			case errors.Is(err, xfsstore.ErrForbiddenType), errors.Is(err, xfsstore.ErrProjectIsolation):
@@ -2184,11 +2219,12 @@ func (h *VolumeHandler) constructDirectoryPage(
 		}
 		dirent := &authoritypb.Dirent{
 			Name: []byte(entry.Name), Attr: attrProto(attr),
-			NextCookie: encodeCookie(cookie + uint64(i) + 1),
+			NextCookie: encodeCookie(entry.NextCookie),
 		}
 		if candidate.item != (xfsstore.Capability{}) {
 			dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, ^uint64(0))
-			if wantItems {
+			dirent.StableIdentity = append([]byte(nil), candidate.identity[:]...)
+			if _, held := heldIdentities[candidate.identity]; wantItems && !held {
 				dirent.Item = itemProto(candidate.item, candidate.attr, candidate.identity)
 			}
 		}
@@ -2206,6 +2242,28 @@ func (h *VolumeHandler) constructDirectoryPage(
 	return candidates, false, false, nil
 }
 
+func heldDirectoryIdentities(request *authoritypb.ReadDirRequest) (map[[16]byte]struct{}, error) {
+	held := request.GetHeldIdentities()
+	if len(held) == 0 {
+		return nil, nil
+	}
+	if !request.GetWantItems() || len(held) > MaxReadDirHeldIdentities {
+		return nil, syscall.EINVAL
+	}
+	result := make(map[[16]byte]struct{}, len(held))
+	var previous []byte
+	for _, raw := range held {
+		if len(raw) != 16 || (previous != nil && bytes.Compare(previous, raw) >= 0) {
+			return nil, syscall.EINVAL
+		}
+		var identity [16]byte
+		copy(identity[:], raw)
+		result[identity] = struct{}{}
+		previous = raw
+	}
+	return result, nil
+}
+
 func sameDirectoryEnumeration(left, right []xfsstore.Dirent) bool {
 	if len(left) != len(right) {
 		return false
@@ -2221,13 +2279,13 @@ func sameDirectoryEnumeration(left, right []xfsstore.Dirent) bool {
 func (h *VolumeHandler) revalidateDirectoryPage(
 	handle, directory xfsstore.Capability,
 	cookie uint64,
-	verifier, current [16]byte,
+	current [16]byte,
 	maxEntries int,
 	entries []xfsstore.Dirent,
 	eof bool,
 	candidates []directoryPageCandidate,
 ) (bool, error) {
-	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
+	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.Store.ReadDirOpen(handle, cookie, maxEntries)
 	if err != nil {
 		return false, err
 	}
@@ -2283,6 +2341,9 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 	}
 	bounds := h.Bounds()
 	features := append([]string(nil), required...)
+	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && h.MaxInFlight >= 9 && hasFeatures(hello.Features, []string{orderedDelegatedFlushFeature}) {
+		features = append(features, orderedDelegatedFlushFeature)
+	}
 	features = append(features, peerCompleteFIFOFeedbackFeature, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
 	resp := h.success(requestID)
 	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
@@ -2326,7 +2387,7 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 			return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
 		}
 		switch frontendProfile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 			if attach.GetFskitCachedNameCapacity() != 0 || attach.GetFskitRepairBudgetMillis() != 0 ||
 				attach.GetFskitNamespaceRepair() != authoritypb.NamespaceRepair_NAMESPACE_REPAIR_UNSPECIFIED {
 				return h.errorResponse(requestID, syscall.EINVAL, false)
@@ -2447,7 +2508,8 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 		return h.errorResponse(requestID, err, false)
 	}
 	access, err := h.Runtime.ProvisionalAccess(cred, attemptID)
-	if err != nil || purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN && access&volumeserver.AccessAdmin == 0 {
+	if err != nil || purpose == authoritypb.SessionPurpose_SESSION_PURPOSE_ROUTE_ADMIN && access&volumeserver.AccessAdmin == 0 ||
+		frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER && access != volumeserver.AccessRead {
 		_ = h.Runtime.AbortProvisional(ctx, cred, attemptID)
 		if err == nil {
 			err = syscall.EPERM
@@ -2622,16 +2684,27 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 		return h.errorResponse(requestID, errInternal, false)
 	}
 	if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		h.coherenceProfileAdmission.Lock()
+		activationCtx, cancelActivation := context.WithDeadline(ctx, resources.authorizationDeadline)
+		defer cancelActivation()
+		if err := h.coherenceProfileAdmission.LockContext(activationCtx); err != nil {
+			return h.coherenceError(requestID, err)
+		}
 		defer h.coherenceProfileAdmission.Unlock()
 		for _, identity := range h.Coherence.DelegatedIdentities() {
-			if err := h.Coherence.Recall(ctx, identity); err != nil {
+			if err := h.Coherence.Recall(activationCtx, identity); err != nil {
 				return h.coherenceError(requestID, err)
 			}
 		}
 	}
 	var reply *authoritypb.ActivateReply
-	err = h.Lifecycle.Activate(cred.ID, func() error {
+	membershipProfile := volumeserver.MembershipCompatibility
+	switch resources.profile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		membershipProfile = volumeserver.MembershipLinuxV7
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		membershipProfile = volumeserver.MembershipCacheless
+	}
+	err = h.Lifecycle.ActivateProfile(cred.ID, membershipProfile, func() error {
 		rootAttr, readErr := h.Store.Getattr(resources.root)
 		if readErr != nil {
 			return readErr
@@ -2641,7 +2714,7 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 			return readErr
 		}
 		switch resources.profile {
-		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
+		case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
 			reply = h.newActivationReply(resources, rootAttr, rootIdentity, volumeserver.VisibilityCursor{})
 			if retainErr := h.retainActivationReply(cred.ID, resources, reply); retainErr != nil {
 				return retainErr
@@ -2675,11 +2748,14 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 }
 
 func (h *VolumeHandler) newActivationReply(resources *sessionResources, rootAttr xfsstore.Attr, rootIdentity [16]byte, fskitCursor volumeserver.VisibilityCursor) *authoritypb.ActivateReply {
-	features, valid := activateFeatures(resources.profile)
+	features, valid := advertisedActivateFeatures(resources.profile)
 	if !valid {
 		return nil
 	}
 	features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
+	if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && h.MaxInFlight >= 9 {
+		features = append(features, orderedDelegatedFlushFeature)
+	}
 	reply := &authoritypb.ActivateReply{
 		Root: itemProto(resources.root, rootAttr, rootIdentity), Features: features,
 		SessionLeaseMilliseconds:       uint64(h.Runtime.SessionLease() / time.Millisecond),
@@ -3005,7 +3081,23 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 			h.releaseReplyReservation(reserved)
 		}
 	}()
+	var ordered *volumeserver.OrderedFlush
+	defer func() { ordered.Abort() }()
 	out, err := h.Runtime.ExecuteMutationAdmitted(ctx, cred, id, func() error {
+		if write := req.GetWrite(); write != nil && write.GetFlushSequence() != 0 {
+			token, tokenErr := h.coherenceToken(cred.ID)
+			if tokenErr != nil {
+				return tokenErr
+			}
+			grant, grantErr := parseCoherenceDelegationID(write.GetDelegation().GetId())
+			if grantErr != nil {
+				return volumeserver.ErrDelegationStale
+			}
+			ordered, grantErr = h.Coherence.BeginOrderedFlush(token, grant, write.GetDelegation().GetGeneration(), write.GetFlushSequence(), id)
+			if grantErr != nil {
+				return grantErr
+			}
+		}
 		var reserveErr error
 		reserved, reserveErr = h.reserveReplyBytes(cred.ID, id.Slot, reserve)
 		return reserveErr
@@ -3013,7 +3105,15 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		if executed != nil {
 			*executed = true
 		}
-		resp := apply(id)
+		var resp *authoritypb.Response
+		if ordered != nil {
+			if waitErr := ordered.Wait(ctx); waitErr != nil {
+				resp = h.coherenceError(req.GetRequestId(), waitErr)
+			}
+		}
+		if resp == nil {
+			resp = apply(id)
+		}
 		terminalDeliveryRequired := h.takeTerminalReceiptFrame(resp)
 		encoded, encodeErr := marshalOutcome(resp)
 		if encodeErr != nil || uint32(len(encoded)) > reserve {
@@ -3038,6 +3138,9 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		// carries no MutationState and the peer's slot stays where it is.
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
+	// Runtime has now published the predecessor's replay outcome. Waking the
+	// next ordinal from inside apply would expose storage without that proof.
+	ordered.Complete()
 	resp := new(authoritypb.Response)
 	if err := proto.Unmarshal(out.Reply, resp); err != nil {
 		return h.errorResponse(req.GetRequestId(), errInternal, true)
@@ -3388,6 +3491,12 @@ func (h *VolumeHandler) success(requestID uint64) *authoritypb.Response {
 }
 
 func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain bool) (response *authoritypb.Response) {
+	defer func() {
+		if response != nil && (errors.Is(err, volumeserver.ErrSessionExpired) || errors.Is(err, volumeserver.ErrSessionFenced)) {
+			response.SessionTerminal = true
+		}
+	}()
+
 	// Generic errors carry no exact applied state for a frontend to publish.
 	// They still start and fence the terminal drain, but only the structured
 	// WRITE/FALLOCATE/CFR post-apply paths may bind a cross-process delivery
@@ -3445,9 +3554,9 @@ func (h *VolumeHandler) errorResponse(requestID uint64, err error, uncertain boo
 		// AbortAttach is a provisional-only operation. Once ACTIVE, normal Detach
 		// is the sole lifecycle transition and carries the mount-absence proof.
 		errno = errnos.EBUSY
-	case errors.Is(err, volumeserver.ErrAdmission), errors.Is(err, volumeserver.ErrLeaseBlocked), errors.Is(err, volumeserver.ErrLeaseStartup):
+	case errors.Is(err, volumeserver.ErrAdmission):
 		errno = errnos.EAGAIN
-	case errors.Is(err, volumeserver.ErrLeaseRoutesLive):
+	case errors.Is(err, volumeserver.ErrRoutesLive):
 		errno = errnos.EBUSY
 	case errors.Is(err, volumeserver.ErrVisibilityInterrupted):
 		// This is a definite pre-apply interruption, not a coherence
@@ -4096,10 +4205,11 @@ func (h *VolumeHandler) startSessionResources(id volumeserver.SessionID, root xf
 
 // startSessionResourcesForProfile exists only for direct-runtime tests that do
 // not run the Attach/Activate transaction. It preserves the production profile
-// split: Linux sessions enter the lease table; FSKit sessions do not.
+// split: Linux sessions enter the subscription coordinator; FSKit sessions do not.
 func (h *VolumeHandler) startSessionResourcesForProfile(id volumeserver.SessionID, root xfsstore.Capability, slots uint32, routes [32]byte, frontend authoritypb.FrontendProfile) error {
 	if frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES &&
-		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
+		frontend != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return volumeserver.ErrVisibilityProfile
 	}
 	h.resourcesMu.Lock()
@@ -4162,11 +4272,6 @@ func (h *VolumeHandler) sessionPurpose(id volumeserver.SessionID) (authoritypb.S
 		return authoritypb.SessionPurpose_SESSION_PURPOSE_UNSPECIFIED, volumeserver.ErrSessionExpired
 	}
 	return resources.purpose, nil
-}
-
-func (h *VolumeHandler) strictSession(id volumeserver.SessionID) bool {
-	profile, err := h.sessionCoherence(id)
-	return err == nil && profile == volumeserver.CoherenceStrict
 }
 
 func (h *VolumeHandler) lookupCoordinate(parent xfsstore.Capability, name []byte) (visibilityCoordinate, bool, error) {

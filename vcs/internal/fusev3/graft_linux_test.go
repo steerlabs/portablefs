@@ -99,7 +99,11 @@ func newGraftFixture(t *testing.T, routes localroutes.RuleSet, strict bool) *gra
 	t.Cleanup(func() { _ = grafts.Close() })
 	mount.grafts, mount.backing = grafts, backing
 	root := &node{mount: mount, item: testItem(1, authoritypb.Attr_DIRECTORY, 0), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
-	return &graftFixture{raw: newRawFileSystem(mount, root), mount: mount, rpc: rpc, backing: backing}
+	raw := newRawFileSystem(mount, root)
+	if err := mount.subscription.subscribe(context.Background()); err != nil {
+		t.Fatalf("subscribe graft fixture: %v", err)
+	}
+	return &graftFixture{raw: raw, mount: mount, rpc: rpc, backing: backing}
 }
 
 func (f *graftFixture) calls() int {

@@ -74,7 +74,7 @@ const (
 	// the budget is sized for lock hand-off, not for I/O.
 	defaultRepairBudget = 15 * time.Second
 
-	// subscriptionControlReserve is the authority in-flight slot that only the lease
+	// subscriptionControlReserve is the authority in-flight slot that only the subscription
 	// CONTROL loop may occupy. Acknowledging is what releases the mutating
 	// machine, so this loop must never queue behind bulk kernel I/O.
 	subscriptionControlReserve = 1
@@ -393,17 +393,15 @@ func (k kernelMount) abortKernelConnection() error {
 	return os.WriteFile("/sys/fs/fuse/connections/"+minor+"/abort", []byte("1"), 0)
 }
 
-// errRepairBudgetExceeded classifies the one revocation cause a supervisor can
-// act on differently: this mount was healthy but too slow to repair. It is a
-// sentinel rather than a formatted string so classifyRevocationReason never has
-// to read prose.
-var errRepairBudgetExceeded = errors.New("fusev3: lease cache withdrawal exceeded its safety budget")
-
 // revokeCachedNames drops daemon-resident N payloads. The portable profile
 // gives kernel dentries zero validity, so there is no kernel namespace cache to
 // notify or drain at recall or teardown.
 func (r *rawFileSystem) revokeCachedNames(_ time.Time) {
 	r.mu.Lock()
+	clear(r.directoryPageHints)
+	for identity := range r.completeDirectories {
+		r.dropCompleteDirectoryLocked(identity)
+	}
 	for key := range r.cachedNames {
 		r.dropCachedNameLocked(key)
 	}
@@ -505,11 +503,15 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 // has lost every resident page; that stock-kernel residual remains explicit.
 func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 	r.mu.Lock()
+	clear(r.directoryPageHints)
+	for identity := range r.completeDirectories {
+		r.dropCompleteDirectoryLocked(identity)
+	}
 	r.cachedNames = make(map[nameKey]*inodeRecord)
 	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
 	r.cachedNameStable = make(map[nameKey]publicationNamespace)
 	r.cachedNameStamps = make(map[nameKey]subscriptionStamp)
-	r.cachedNegatives = make(map[nameKey]struct{})
+	r.cachedNegatives = make(map[nameKey]string)
 	r.cachedNegativeStamps = make(map[nameKey]subscriptionStamp)
 	r.cachedAttrs = make(map[publicationIdentity]*inodeRecord)
 	r.cachedAttrPayloads = make(map[publicationIdentity]cachedAttrPayload)
@@ -547,9 +549,6 @@ const (
 	// RevocationSessionTerminal: the authority session ended permanently, so
 	// nothing can repair this kernel's caches again.
 	RevocationSessionTerminal = "session-terminal"
-	// RevocationRepairBudgetExceeded: this mount was still connected but did
-	// not complete lease cache withdrawal inside the reserved safety interval.
-	RevocationRepairBudgetExceeded = "repair-budget-exceeded"
 	// RevocationRoutesChanged: the volume's machine-local route declaration
 	// moved under a mount whose topology is fixed for its lifetime.
 	RevocationRoutesChanged = "routes-changed"
@@ -566,8 +565,6 @@ func classifyRevocationReason(cause error) string {
 	switch {
 	case cause == nil:
 		return RevocationCoherenceViolation
-	case errors.Is(cause, errRepairBudgetExceeded):
-		return RevocationRepairBudgetExceeded
 	case errors.Is(cause, errRoutesChanged):
 		return RevocationRoutesChanged
 	case errors.Is(cause, authorityrpc.ErrSessionEnded):
@@ -688,7 +685,7 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	if m.raw != nil {
 		writersJoined = m.raw.terminalizeReplyCacheOwnership(deadline)
 		if !writersJoined {
-			out.record(0, "reply-writer-join", errRepairBudgetExceeded)
+			out.record(0, "reply-writer-join", errors.New("fusev3: reply writers did not drain before cache withdrawal deadline"))
 		}
 	}
 
@@ -793,7 +790,7 @@ func (m *Mount) isRevoked() bool { return m.revoked.Load() }
 
 // kernelNotifier is the reverse channel this frontend uses to take back what it
 // published. It is the stock go-fuse notification surface, named as an
-// interface so lease invalidation can be tested without a kernel; *fuse.Server
+// interface so cache invalidation can be tested without a kernel; *fuse.Server
 // is the only production implementation.
 type kernelNotifier interface {
 	EntryNotify(parent uint64, name string) fuse.Status

@@ -37,6 +37,7 @@ type baselineMeasurement struct {
 	AuthorityFilesystemPerOp float64        `json:"authority_filesystem_requests_per_operation"`
 	AuthorityFilesystemKinds map[string]int `json:"authority_filesystem_breakdown,omitempty"`
 	AuthorityControlKinds    map[string]int `json:"authority_control_breakdown,omitempty"`
+	AuthorityBarrierSeconds  float64        `json:"authority_barrier_seconds,omitempty"`
 	AuthorityDrainSeconds    float64        `json:"authority_drain_seconds,omitempty"`
 }
 
@@ -77,7 +78,7 @@ func TestCoherenceBaseline(t *testing.T) {
 			if err := os.Mkdir(root, 0o700); err != nil {
 				t.Fatalf("create mounted install root: %v", err)
 			}
-			measureBaseline(t, "portablefs", fixture.counter, func() (coherencebench.WorkloadResult, error) {
+			measureBaseline(t, "portablefs", "install", fixture, func() (coherencebench.WorkloadResult, error) {
 				return coherencebench.Install(root, baselineInstallFiles, baselineInstallDirs, workers)
 			})
 		})
@@ -101,12 +102,11 @@ func TestCoherenceBaseline(t *testing.T) {
 	})
 
 	t.Run("git-portablefs", func(t *testing.T) {
-		preparationConfig := baselineIntegrationConfig(1)
-		// The 20k setup disconnected during git add with the shipping cache.
-		// Prepare with the working integration cache, then recreate the Authority
-		// and mount with the shipping capacity before either measured status.
-		preparationConfig.CachedNameCapacity = integrationCachedNames
-		fixture := newIntegrationFixture(t, preparationConfig)
+		// Reproduce the v6 ENOTCONN at the shipping capacity from the first
+		// CREATE through git add and commit; no smaller-cache setup workaround.
+		fixture := newIntegrationFixture(t, baselineIntegrationConfig(1))
+		barrier := mustOpenFile(t, fixture.mountPath(0), os.O_RDONLY, 0)
+
 		root := fixture.join(0, "repo")
 		if err := os.Mkdir(root, 0o700); err != nil {
 			t.Fatalf("create mounted git repository: %v", err)
@@ -114,11 +114,20 @@ func TestCoherenceBaseline(t *testing.T) {
 		if err := coherencebench.PrepareGit(root, baselineGitFiles); err != nil {
 			t.Fatalf("prepare mounted git repository: %v; mount health: %s", err, fixture.sessionDiagnostics())
 		}
-		fixture.cfg.CachedNameCapacity = baselineNameCapacity
+		if err := barrier.Sync(); err != nil {
+			t.Fatalf("fresh 20000-file git barrier: %v", err)
+		}
+		if err := barrier.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if fixture.mounts[0].isRevoked() || fixture.clients[0].SessionEndCause() != nil || !isMounted(t, fixture.mountPath(0)) {
+			t.Fatalf("fresh 20000-file git lost mount: %s", fixture.sessionDiagnostics())
+		}
+		t.Logf("PORTABLEFS_GIT_ADD_REGRESSION files=%d cached_name_capacity=%d committed=true barrier=PASS mount=LIVE", baselineGitFiles, fixture.cfg.CachedNameCapacity)
 		fixture.remount()
 		enableBaselineOpenTracking(fixture.counter)
 		for _, temperature := range []string{"cold", "warm"} {
-			measureBaseline(t, "portablefs", fixture.counter, func() (coherencebench.WorkloadResult, error) {
+			measureBaseline(t, "portablefs", temperature, fixture, func() (coherencebench.WorkloadResult, error) {
 				return coherencebench.GitStatus(root, temperature, baselineGitFiles)
 			})
 		}
@@ -144,7 +153,7 @@ func TestCoherenceBaseline(t *testing.T) {
 		if err := waitForEnumeratedName(fixture.mountPath(1), "peer", 30*time.Second); err != nil {
 			t.Fatalf("discover peer root through mount B: %v", err)
 		}
-		measureBaseline(t, "portablefs", fixture.counter, func() (coherencebench.WorkloadResult, error) {
+		measureBaseline(t, "portablefs", "peer", fixture, func() (coherencebench.WorkloadResult, error) {
 			return coherencebench.PeerWriteRead(rootA, rootB, baselinePeerFiles)
 		})
 	})
@@ -190,15 +199,29 @@ func waitForEnumeratedName(root, name string, timeout time.Duration) error {
 	}
 }
 
-func measureBaseline(t *testing.T, target string, counter *countingHandler, run func() (coherencebench.WorkloadResult, error)) {
+func measureBaseline(t *testing.T, target, phase string, fixture *integrationFixture, run func() (coherencebench.WorkloadResult, error)) {
 	t.Helper()
+	counter := fixture.counter
 	drainBaselineOpens(t, counter)
+	barrier := mustOpenFile(t, fixture.mountPath(0), os.O_RDONLY, 0)
+	defer barrier.Close()
+	stopProfile := startBaselineProfile(t, phase)
+	defer stopProfile()
 	meter := &baselineRequestMeter{byKind: make(map[string]int)}
 	counter.setBeforeHandle(meter.observe)
 	result, err := run()
 	if err != nil {
 		counter.setBeforeHandle(nil)
-		t.Fatalf("%s %s: %v", target, result.Scenario, err)
+		t.Fatalf("%s %s: %v; mount health: %s", target, result.Scenario, err, fixture.sessionDiagnostics())
+	}
+
+	barrierStart := time.Now()
+	if err := barrier.Sync(); err != nil {
+		t.Fatalf("%s completion barrier: %v; mount health: %s", result.Scenario, err, fixture.sessionDiagnostics())
+	}
+	barrierSeconds := time.Since(barrierStart).Seconds()
+	if err := barrier.Close(); err != nil {
+		t.Fatal(err)
 	}
 	// close(2) can return before FUSE RELEASE reaches the daemon. Keep counting
 	// through the corresponding Authority CLOSE replies, without adding that
@@ -216,13 +239,31 @@ func measureBaseline(t *testing.T, target string, counter *countingHandler, run 
 		totalRate = float64(total) / float64(result.Operations)
 		filesystemRate = float64(filesystemTotal) / float64(result.Operations)
 	}
+	assertBaselineOpcodeBounds(t, target, result.Scenario, totalRate, filesystem, control)
 	recordBaseline(t, baselineMeasurement{
 		WorkloadResult: result, Target: target, AuthorityRequests: total,
 		AuthorityRequestsPerOp: totalRate, AuthorityFilesystem: filesystemTotal,
 		AuthorityFilesystemPerOp: filesystemRate, AuthorityFilesystemKinds: filesystem,
 		AuthorityControlKinds: control,
-		AuthorityDrainSeconds: drainSeconds,
+		AuthorityDrainSeconds: drainSeconds, AuthorityBarrierSeconds: barrierSeconds,
 	})
+}
+
+func assertBaselineOpcodeBounds(t *testing.T, target, scenario string, requestsPerOperation float64, filesystem, control map[string]int) {
+	t.Helper()
+	if target != "portablefs" {
+		return
+	}
+	switch scenario {
+	case "git-status-warm":
+		if control["reclaim"] > 64 || filesystem["lookup"]+filesystem["get_attr"] != 0 || requestsPerOperation > 0.02 {
+			t.Fatalf("warm status exceeded G4 opcode bounds: requests/op=%.6f filesystem=%v control=%v", requestsPerOperation, filesystem, control)
+		}
+	case "two-mount-write-list-read":
+		if requestsPerOperation > 9.8 || control["reclaim"] > filesystem["read_dir"] {
+			t.Fatalf("two-mount workload exceeded G4 opcode bounds: requests/op=%.6f filesystem=%v control=%v", requestsPerOperation, filesystem, control)
+		}
+	}
 }
 
 func enableBaselineOpenTracking(counter *countingHandler) {
@@ -302,7 +343,8 @@ func baselineControlRequest(kind string) bool {
 	switch kind {
 	case "hello", "attach", "resume", "keep_alive", "detach", "cancel", "reauthorize",
 		"reclaim", "activate", "abort_attach", "terminal_delivery_receipt", "apply_routes",
-		"next_lease_event", "acknowledge_lease_event", "renew_leases", "acknowledge_source_lease_discharge",
+		"subscribe", "renew_subscription", "next_control_event", "change_ack",
+		"delegation_recall_ack", "delegation_break_ack", "delegation_mode_change_ack", "delegation_release", "barrier",
 		"next_fskit_repair", "ack_fskit_repair":
 		return true
 	default:
@@ -389,5 +431,21 @@ func TestBaselineMeterFreezesAtDrainBoundary(t *testing.T) {
 	after, _, _ := meter.result()
 	if all["close"] != 1 || after["close"] != 1 {
 		t.Fatalf("late callback changed completed measurement: before=%v after=%v", all, after)
+	}
+}
+
+func TestBaselineOpcodeBoundsRejectReclaimRegression(t *testing.T) {
+	for _, test := range []struct {
+		name, scenario string
+		rate           float64
+		filesystem     map[string]int
+		control        map[string]int
+	}{
+		{name: "warm", scenario: "git-status-warm", rate: 0.018, filesystem: map[string]int{}, control: map[string]int{"reclaim": 64}},
+		{name: "peer", scenario: "two-mount-write-list-read", rate: 9.8, filesystem: map[string]int{"read_dir": 20}, control: map[string]int{"reclaim": 20}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assertBaselineOpcodeBounds(t, "portablefs", test.scenario, test.rate, test.filesystem, test.control)
+		})
 	}
 }

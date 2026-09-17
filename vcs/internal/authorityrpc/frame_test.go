@@ -503,30 +503,23 @@ func TestFrameBoundsRepeatedDecodedAllocationsBeforeUnmarshal(t *testing.T) {
 	if decoded.GetHello() != nil {
 		t.Fatal("repeated-field amplification reached protobuf decode")
 	}
-	// The sender runs the exact same grammar, so an internal producer cannot
-	// put a frame on the wire that every conforming receiver must reject.
-	if err := writeFrame(io.Discard, 4096, request); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("writeFrame oversized repeated field = %v, want ErrFrameEncoding", err)
+	// The typed outbound encoder does not repeat untrusted ingress validation.
+	var outbound bytes.Buffer
+	if err := writeFrame(&outbound, 4096, request); err != nil {
+		t.Fatal(err)
 	}
+	if err := readFrame(&outbound, 4096, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("encoded oversized repetition escaped ingress: %v", err)
+	}
+
 }
 
 func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
-	recalls := make([]*authoritypb.LeaseRecall, maxWireRepeatedElements+1)
-	for i := range recalls {
-		recalls[i] = &authoritypb.LeaseRecall{
-			Coordinate: &authoritypb.LeaseCoordinate{
-				Family:   authoritypb.LeaseFamily_LEASE_FAMILY_DATA,
-				Identity: bytes.Repeat([]byte{byte(i + 1)}, 16),
-			},
-			Right: authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ,
-		}
+	entries := make([]*authoritypb.ChangeEntry, maxWireRepeatedElements+1)
+	for i := range entries {
+		entries[i] = &authoritypb.ChangeEntry{Identity: bytes.Repeat([]byte{byte(i + 1)}, 16)}
 	}
-	response := &authoritypb.Response{
-		RequestId: 22,
-		Body: &authoritypb.Response_LeaseEvent{LeaseEvent: &authoritypb.LeaseEvent{
-			Recalls: recalls,
-		}},
-	}
+	response := &authoritypb.Response{RequestId: 22, Body: &authoritypb.Response_ControlEvent{ControlEvent: &authoritypb.ControlEvent{Event: &authoritypb.ControlEvent_ChangeBatch{ChangeBatch: &authoritypb.ChangeBatch{Entries: entries}}}}}
 	metadata, err := proto.Marshal(response)
 	if err != nil {
 		t.Fatal(err)
@@ -538,8 +531,12 @@ func TestFrameBoundsApplyAcrossNestedMessageTree(t *testing.T) {
 	if decoded.GetBody() != nil {
 		t.Fatal("nested allocation amplification reached protobuf decode")
 	}
-	if err := writeFrame(io.Discard, 1<<20, response); !errors.Is(err, ErrFrameEncoding) {
-		t.Fatalf("writeFrame nested allocation amplification = %v, want ErrFrameEncoding", err)
+	var outbound bytes.Buffer
+	if err := writeFrame(&outbound, 1<<20, response); err != nil {
+		t.Fatal(err)
+	}
+	if err := readFrame(&outbound, 1<<20, nil, 0, &decoded); !errors.Is(err, ErrFrameEncoding) {
+		t.Fatalf("encoded nested amplification escaped ingress: %v", err)
 	}
 }
 
@@ -1226,6 +1223,10 @@ func TestBlockingWaitClassification(t *testing.T) {
 	wait := &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Wait: true, Lock: &authoritypb.LockSpec{}}}}
 	if !blockingWait(wait) {
 		t.Fatal("a waiting SetLock must use the blocking lane")
+	}
+	visibility := &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: 1}}}
+	if !blockingWait(visibility) {
+		t.Fatal("a visibility completion must use the blocking lane")
 	}
 	for name, req := range map[string]*authoritypb.Request{
 		"unlock":  {Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Wait: true, Unlock: true}}},

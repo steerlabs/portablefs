@@ -18,6 +18,9 @@ const (
 	coherenceIdentityBytes     = 16
 )
 
+// ErrSubscriptionReset requires cold withdrawal before a new incarnation.
+var ErrSubscriptionReset = errors.New("authorityrpc: uncertain control result requires cold subscription")
+
 // Subscribe starts a cold volume subscription when snapshotID and
 // afterIdentity are empty, or fetches the next page of the frozen delegated
 // identity set when both are present. The returned deadline is anchored at the
@@ -77,6 +80,9 @@ func (c *Client) Subscribe(ctx context.Context, snapshotID, afterIdentity []byte
 // revive an expired subscription because the deadline is measured from the
 // request start rather than response receipt.
 func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (time.Time, error) {
+	if incarnation != 0 && incarnation == c.releaseInvalidIncarnation.Load() {
+		return time.Time{}, ErrSubscriptionReset
+	}
 	if !c.linuxSubscriptionProfile() {
 		return time.Time{}, syscall.EOPNOTSUPP
 	}
@@ -103,7 +109,10 @@ func (c *Client) RenewSubscription(ctx context.Context, incarnation uint64) (tim
 // NextControlEvent long-polls for exactly the successor of afterSequence.
 // Client admission allows only one such poll at a time, while renewal and
 // acknowledgment requests retain independent CONTROL capacity.
-func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequence uint64) (*authoritypb.ControlEvent, error) {
+func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequence, completedThrough uint64) (*authoritypb.ControlEvent, error) {
+	if incarnation != 0 && incarnation == c.releaseInvalidIncarnation.Load() {
+		return nil, ErrSubscriptionReset
+	}
 	if !c.linuxSubscriptionProfile() {
 		return nil, syscall.EOPNOTSUPP
 	}
@@ -111,7 +120,7 @@ func (c *Client) NextControlEvent(ctx context.Context, incarnation, afterSequenc
 		return nil, syscall.EINVAL
 	}
 	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{
-		NextControlEvent: &authoritypb.NextControlEventRequest{Incarnation: incarnation, AfterSequence: afterSequence},
+		NextControlEvent: &authoritypb.NextControlEventRequest{Incarnation: incarnation, AfterSequence: afterSequence, CompletedEventThrough: completedThrough},
 	}})
 	if err != nil {
 		return nil, err
@@ -278,6 +287,31 @@ func (c *Client) Barrier(ctx context.Context, cutSequence uint64) (*authoritypb.
 		return nil, errors.New("authorityrpc: barrier returned an invalid sequence proof")
 	}
 	return proto.Clone(reply).(*authoritypb.BarrierReply), nil
+}
+
+// WaitVisibility joins peer withdrawal through an already-issued application
+// ticket. It performs no durability operation and is safe to retry.
+func (c *Client) WaitVisibility(ctx context.Context, cutSequence uint64) (*authoritypb.WaitVisibilityReply, error) {
+	if !c.linuxSubscriptionProfile() {
+		return nil, syscall.EOPNOTSUPP
+	}
+	if cutSequence == 0 {
+		return nil, syscall.EINVAL
+	}
+	response, err := c.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{
+		WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: cutSequence},
+	}})
+	if err != nil {
+		return nil, err
+	}
+	if err := successfulControlResponse(response); err != nil {
+		return nil, err
+	}
+	reply := response.GetWaitVisibility()
+	if reply == nil || reply.GetAppliedSequence() < reply.GetVisibleSequence() || reply.GetVisibleSequence() < cutSequence || response.GetVisibleSequence() != reply.GetVisibleSequence() {
+		return nil, errors.New("authorityrpc: visibility wait returned an invalid sequence proof")
+	}
+	return proto.Clone(reply).(*authoritypb.WaitVisibilityReply), nil
 }
 
 func (c *Client) linuxSubscriptionProfile() bool {

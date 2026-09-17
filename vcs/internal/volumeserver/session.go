@@ -440,7 +440,7 @@ func (a *Authority) purgeAttachAttemptsLocked(now time.Time) {
 	}
 }
 
-// PrepareAttach creates one non-executable session for an exact protocol-6
+// PrepareAttach creates one non-executable session for an exact protocol-7
 // attach attempt. Admission is reserved before authorize is called, so a full
 // authority neither spends a single-use capability nor starts unbounded work.
 // The attempt record is installed before the call and retained through its
@@ -917,7 +917,7 @@ func (a *Authority) notifySessionEnd(id SessionID) {
 
 // AttachActiveForTest creates an immediately active session solely for direct
 // tests of post-activation runtime behavior. Its explicit name prevents a
-// production handler from accidentally bypassing protocol 6's provisional
+// production handler from accidentally bypassing protocol 7's provisional
 // receipt proof and lifecycle-transactional activation boundary.
 func (a *Authority) AttachActiveForTest(slots uint32, peer PeerIdentity, authorization Authorization) (SessionCredential, error) {
 	if err := a.ValidateAttachSlots(slots); err != nil {

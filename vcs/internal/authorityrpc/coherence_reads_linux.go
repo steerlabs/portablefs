@@ -21,7 +21,7 @@ func (h *VolumeHandler) coherenceRead(ctx context.Context, req *authoritypb.Requ
 		return nil, false
 	}
 	profile, err := h.sessionFrontendProfile(cred.ID)
-	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return nil, false
 	}
 	switch body := req.GetBody().(type) {
@@ -57,7 +57,7 @@ func (h *VolumeHandler) coherenceFsync(ctx context.Context, requestID uint64, se
 		return h.coherenceError(requestID, err)
 	}
 	defer guard.Release()
-	release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies(identity))
+	release, err := h.coherenceStorage.AcquireRead(ctx, coherenceInodeDependencies(identity))
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
@@ -102,11 +102,51 @@ func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volu
 	if h.Coherence == nil || h.coherenceStorage == nil {
 		return nil, errInternal
 	}
+	profile, err := h.sessionFrontendProfile(session)
+	if err != nil {
+		return nil, err
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+		return h.Coherence.BreakForReadSet(ctx, [][16]byte{identity})
+	}
 	token, err := h.coherenceToken(session)
 	if err != nil {
 		return nil, err
 	}
 	return h.Coherence.DataConsumed(ctx, token, identity)
+}
+
+func (h *VolumeHandler) coherenceReadSetAdmission(ctx context.Context, session volumeserver.SessionID, identities [][16]byte) (*volumeserver.DataGuard, error) {
+	if h.Coherence == nil || h.coherenceStorage == nil {
+		return nil, errInternal
+	}
+	profile, err := h.sessionFrontendProfile(session)
+	if err != nil {
+		return nil, err
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+		return h.Coherence.BreakForReadSet(ctx, identities)
+	}
+	token, err := h.coherenceToken(session)
+	if err != nil {
+		return nil, err
+	}
+	return h.Coherence.DataConsumedSet(ctx, token, identities)
+}
+
+func (h *VolumeHandler) coherenceTryReadAdmission(ctx context.Context, session volumeserver.SessionID, identity [16]byte) (*volumeserver.DataGuard, bool, error) {
+	profile, err := h.sessionFrontendProfile(session)
+	if err != nil {
+		return nil, false, err
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+		return nil, false, nil
+	}
+	token, err := h.coherenceToken(session)
+	if err != nil {
+		return nil, false, err
+	}
+	return h.Coherence.TryDataConsumed(ctx, token, identity)
 }
 
 func (h *VolumeHandler) coherenceReadData(ctx context.Context, requestID uint64, session volumeserver.SessionID, request *authoritypb.ReadRequest) *authoritypb.Response {
@@ -121,12 +161,16 @@ func (h *VolumeHandler) coherenceReadData(ctx context.Context, requestID uint64,
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
+	cacheToken, err := h.coherenceCacheToken(session)
+	if err != nil {
+		return h.coherenceError(requestID, err)
+	}
 	guard, err := h.coherenceReadAdmission(ctx, session, identity)
 	if err != nil {
 		return h.coherenceError(requestID, err)
 	}
 	defer guard.Release()
-	release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies(identity))
+	release, err := h.coherenceStorage.AcquireRead(ctx, coherenceInodeDependencies(identity))
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
@@ -140,6 +184,9 @@ func (h *VolumeHandler) coherenceReadData(ctx context.Context, requestID uint64,
 	n, err := h.Store.ReadAt(handle, buf, int64(request.GetOffset()))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return h.errorResponse(requestID, err, false)
+	}
+	if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Data: [][16]byte{identity}}); err != nil {
+		return h.coherenceError(requestID, err)
 	}
 	version := h.coherenceVersionNow()
 	response := h.success(requestID)
@@ -172,12 +219,16 @@ func (h *VolumeHandler) coherenceGetAttr(ctx context.Context, requestID uint64, 
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
+	cacheToken, err := h.coherenceCacheToken(session)
+	if err != nil {
+		return h.coherenceError(requestID, err)
+	}
 	guard, err := h.coherenceReadAdmission(ctx, session, identity)
 	if err != nil {
 		return h.coherenceError(requestID, err)
 	}
 	defer guard.Release()
-	release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies(identity))
+	release, err := h.coherenceStorage.AcquireRead(ctx, coherenceInodeDependencies(identity))
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
@@ -190,6 +241,9 @@ func (h *VolumeHandler) coherenceGetAttr(ctx context.Context, requestID uint64, 
 	}
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
+	}
+	if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Attributes: [][16]byte{identity}}); err != nil {
+		return h.coherenceError(requestID, err)
 	}
 	version := h.coherenceVersionNow()
 	response := h.success(requestID)
@@ -213,15 +267,28 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 		if err != nil {
 			return h.errorResponse(0, err, false)
 		}
+		cacheToken, err := h.coherenceCacheToken(cred.ID)
+		if err != nil {
+			return h.coherenceError(0, err)
+		}
 		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-			probeRelease, acquireErr := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies(parentIdentity, request.GetName(), [16]byte{}))
-			if acquireErr != nil {
-				return h.errorResponse(0, acquireErr, false)
+			binding := coherenceBindingDependencies(parentIdentity, request.GetName(), [16]byte{})
+			probeTurn, err := h.coherenceStorage.AcquireReadTurn(ctx, binding)
+			if err != nil {
+				return h.errorResponse(0, err, false)
 			}
-			probe, _, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
+			probeRelease := probeTurn.Release
+			// Only the stable capability is retained from this probe. Its
+			// attributes cannot be published before the child delegation break.
+			item, _, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
 			if errors.Is(lookupErr, syscall.ENOENT) {
+				release := probeRelease
+				if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Directories: [][16]byte{parentIdentity}}); err != nil {
+					release()
+					return h.coherenceError(0, err)
+				}
 				version := h.coherenceVersionNow()
-				probeRelease()
+				release()
 				response := h.success(0)
 				response.VolumeVersion = version
 				response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: version}}
@@ -231,49 +298,57 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 				probeRelease()
 				return h.errorResponse(0, lookupErr, false)
 			}
-			identity, identityErr := h.Store.Identity(probe)
-			forgetErr := h.Store.Forget(probe)
-			probeRelease()
-			if identityErr != nil || forgetErr != nil {
-				return h.errorResponse(0, errors.Join(identityErr, forgetErr), false)
+			identity, err := h.Store.Identity(item)
+			if err != nil {
+				probeRelease()
+				h.forgetItem(item)
+				return h.errorResponse(0, err, false)
 			}
-
-			guard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, identity)
-			if guardErr != nil {
-				return h.coherenceError(0, guardErr)
+			dependencies := coherenceBindingDependencies(parentIdentity, request.GetName(), identity)
+			guard, immediate, err := h.coherenceTryReadAdmission(ctx, cred.ID, identity)
+			if err != nil {
+				probeRelease()
+				h.forgetItem(item)
+				return h.coherenceError(0, err)
 			}
-			completeRelease, acquireErr := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies(parentIdentity, request.GetName(), identity))
-			if acquireErr != nil {
-				guard.Release()
-				return h.errorResponse(0, acquireErr, false)
-			}
-			item, attr, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
-			if lookupErr == nil {
-				current, currentErr := h.Store.Identity(item)
-				if currentErr != nil {
-					h.forgetItem(item)
-					completeRelease()
-					guard.Release()
-					return h.errorResponse(0, currentErr, false)
+			completeRelease := probeRelease
+			if !immediate || !probeTurn.TryExpand(dependencies) {
+				declaration := h.coherenceStorage.Declare(binding)
+				probeRelease()
+				if !immediate {
+					guard, err = h.coherenceReadAdmission(ctx, cred.ID, identity)
+					if err != nil {
+						declaration.Release()
+						h.forgetItem(item)
+						return h.coherenceError(0, err)
+					}
 				}
-				if current != identity {
+				var unchanged bool
+				completeRelease, unchanged, err = h.coherenceStorage.AcquireDeclared(ctx, dependencies, declaration)
+				if err != nil {
+					guard.Release()
 					h.forgetItem(item)
+					return h.errorResponse(0, err, false)
+				}
+				if !unchanged {
 					completeRelease()
 					guard.Release()
+					h.forgetItem(item)
 					continue
 				}
-				attr, lookupErr = h.getattrItemRestored(identity, item)
 			}
-			if lookupErr != nil {
-				if item != (xfsstore.Capability{}) {
-					h.forgetItem(item)
-				}
+			attr, err := h.getattrItemRestored(identity, item)
+			if err != nil {
 				completeRelease()
 				guard.Release()
-				if errors.Is(lookupErr, syscall.ENOENT) {
-					continue
-				}
-				return h.errorResponse(0, lookupErr, false)
+				h.forgetItem(item)
+				return h.errorResponse(0, err, false)
+			}
+			if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Directories: [][16]byte{parentIdentity}, Attributes: [][16]byte{identity}}); err != nil {
+				h.forgetItem(item)
+				completeRelease()
+				guard.Release()
+				return h.coherenceError(0, err)
 			}
 			version := h.coherenceVersionNow()
 			if err := h.trackItem(cred.ID, item, h.protectedChild(cred.ID, parent, request.GetName())); err != nil {
@@ -281,10 +356,11 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 				guard.Release()
 				return h.errorResponse(0, err, false)
 			}
+			objectVersion := h.sampledObjectVersion(identity, version)
 			completeRelease()
 			guard.Release()
 			itemReply := itemProto(item, attr, identity)
-			itemReply.ObjectVersion = h.sampledObjectVersion(identity, version)
+			itemReply.ObjectVersion = objectVersion
 			itemReply.SnapshotSequence = version
 			response := h.success(0)
 			response.VolumeVersion = version
@@ -300,6 +376,10 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 		if request == nil || request.GetMaxEntries() == 0 || request.GetMaxEntries() > 4096 {
 			return h.errorResponse(0, syscall.EINVAL, false)
 		}
+		heldIdentities, err := heldDirectoryIdentities(request)
+		if err != nil {
+			return h.errorResponse(0, err, false)
+		}
 		handle, err := h.open(cred.ID, request.GetHandle())
 		if err != nil {
 			return h.errorResponse(0, err, false)
@@ -312,29 +392,56 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 		if err != nil {
 			return h.errorResponse(0, err, false)
 		}
-		var verifier [16]byte
-		if len(request.GetVerifier()) != 0 {
-			if len(request.GetVerifier()) != len(verifier) {
-				return h.errorResponse(0, syscall.EINVAL, false)
-			}
-			copy(verifier[:], request.GetVerifier())
+		// The frozen wire field remains shape-checked. Continuation uses only
+		// the issued cookie; the current page stamp comes from storage.
+		if len(request.GetVerifier()) != 0 && len(request.GetVerifier()) != 16 {
+			return h.errorResponse(0, syscall.EINVAL, false)
 		}
 		budget := h.readDirEntryBudget(request.GetMaxEntries())
-		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-			entries, _, current, eof, directory, readErr := h.coherenceReadDirPage(handle, cookie, verifier, int(request.GetMaxEntries()))
+		cacheToken, err := h.coherenceCacheToken(cred.ID)
+		if err != nil {
+			return h.coherenceError(0, err)
+		}
+		for {
+			if err := ctx.Err(); err != nil {
+				return h.errorResponse(0, err, false)
+			}
+			directoryGuard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, directoryIdentity)
+			if guardErr != nil {
+				return h.coherenceError(0, guardErr)
+			}
+			directoryDependencies := coherenceInodeDependencies(directoryIdentity)
+			storageTurn, acquireErr := h.coherenceStorage.AcquireReadTurn(ctx, directoryDependencies)
+			if acquireErr != nil {
+				directoryGuard.Release()
+				return h.errorResponse(0, acquireErr, false)
+			}
+			entries, _, current, eof, directory, readErr := h.coherenceReadDirPage(handle, cookie, int(request.GetMaxEntries()))
 			if readErr != nil {
+				storageTurn.Release()
+				directoryGuard.Release()
+				if errors.Is(readErr, syscall.EAGAIN) {
+					continue
+				}
 				return h.errorResponse(0, readErr, false)
 			}
-			candidates, budgetExhausted, conflict, buildErr := h.constructDirectoryPage(handle, entries, cookie, request.GetWantItems(), budget)
+			candidates, budgetExhausted, conflict, buildErr := h.constructDirectoryPage(handle, entries, cookie, request.GetWantItems(), heldIdentities, budget)
 			if buildErr != nil {
+				storageTurn.Release()
+				directoryGuard.Release()
+				if errors.Is(buildErr, syscall.EAGAIN) {
+					continue
+				}
 				return h.errorResponse(0, buildErr, false)
 			}
 			if conflict {
+				storageTurn.Release()
+				directoryGuard.Release()
 				continue
 			}
 
-			identities := make([][16]byte, 0, len(candidates)+1)
-			identities = append(identities, directoryIdentity)
+			identities := make([][16]byte, 1, len(candidates)+1)
+			identities[0] = directoryIdentity
 			seen := map[[16]byte]struct{}{directoryIdentity: {}}
 			for _, candidate := range candidates {
 				if candidate.identity == ([16]byte{}) {
@@ -346,37 +453,82 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				seen[candidate.identity] = struct{}{}
 				identities = append(identities, candidate.identity)
 			}
-			for _, identity := range identities {
-				guard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, identity)
-				if guardErr != nil {
-					h.forgetDirectoryCandidates(candidates)
-					return h.coherenceError(0, guardErr)
-				}
-				guard.Release()
-			}
-
 			dependencies := h.coherenceDirectoryDependencies(directoryIdentity, candidates)
-			release, acquireErr := h.coherenceStorage.Acquire(ctx, dependencies)
-			if acquireErr != nil {
-				h.forgetDirectoryCandidates(candidates)
-				return h.errorResponse(0, acquireErr, false)
+			guards := []*volumeserver.DataGuard{directoryGuard}
+			immediate := true
+			for _, identity := range identities[1:] {
+				guard, ok, tryErr := h.coherenceTryReadAdmission(ctx, cred.ID, identity)
+				if tryErr != nil {
+					storageTurn.Release()
+					releaseDataGuards(guards)
+					h.forgetDirectoryCandidates(candidates)
+					return h.coherenceError(0, tryErr)
+				}
+				if !ok {
+					immediate = false
+					break
+				}
+				guards = append(guards, guard)
 			}
-			valid, verifyErr := h.coherenceRevalidateDirectoryPage(handle, directory, cookie, current, int(request.GetMaxEntries()), entries, eof, candidates)
+			storageRelease := storageTurn.Release
+			if !immediate || !storageTurn.TryExpand(dependencies) {
+				// Never wait for a delegation or a contended child while holding
+				// the directory turn. Queue the complete footprints, then verify
+				// that the probe still names the page we protected.
+				storageTurn.Release()
+				releaseDataGuards(guards)
+				pageGuard, setErr := h.coherenceReadSetAdmission(ctx, cred.ID, identities)
+				if setErr != nil {
+					h.forgetDirectoryCandidates(candidates)
+					return h.coherenceError(0, setErr)
+				}
+				guards = []*volumeserver.DataGuard{pageGuard}
+				release, readErr := h.coherenceStorage.AcquireRead(ctx, dependencies)
+				if readErr != nil {
+					releaseDataGuards(guards)
+					h.forgetDirectoryCandidates(candidates)
+					return h.errorResponse(0, readErr, false)
+				}
+				storageRelease = release
+			}
+			valid, revalidated, verifyErr := h.coherenceRevalidateDirectoryPage(handle, directory, cookie, int(request.GetMaxEntries()), entries, eof, candidates)
 			if verifyErr != nil || !valid {
-				release()
+				storageRelease()
+				releaseDataGuards(guards)
 				h.forgetDirectoryCandidates(candidates)
 				if verifyErr != nil {
+					if errors.Is(verifyErr, syscall.EAGAIN) {
+						continue
+					}
 					return h.errorResponse(0, verifyErr, false)
 				}
 				continue
 			}
+			current = revalidated
+			admission := volumeserver.CacheAdmission{Directories: [][16]byte{directoryIdentity}}
+			for _, candidate := range candidates {
+				if candidate.identity != ([16]byte{}) {
+					admission.Attributes = append(admission.Attributes, candidate.identity)
+				}
+			}
+			if err := h.admitCoherenceCache(cacheToken, admission); err != nil {
+				storageRelease()
+				releaseDataGuards(guards)
+				h.forgetDirectoryCandidates(candidates)
+				return h.coherenceError(0, err)
+			}
 			version := h.coherenceVersionNow()
-			release()
+			// The object stamp belongs to the same storage cut as its attributes.
+			// Sampling after release could observe a peer version beyond this snapshot.
+			for _, candidate := range candidates {
+				candidate.dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, version)
+			}
+			storageRelease()
+			releaseDataGuards(guards)
 
 			result := &authoritypb.ReadDirReply{Verifier: current[:], Eof: eof && !budgetExhausted}
 			issued := make([]directoryPageCandidate, 0, len(candidates))
 			for _, candidate := range candidates {
-				candidate.dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, version)
 				candidate.dirent.SnapshotSequence = version
 				if candidate.dirent.GetItem() != nil {
 					candidate.dirent.Item.ObjectVersion = candidate.dirent.ObjectVersion
@@ -407,8 +559,13 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			response.Body = &authoritypb.Response_ReadDir{ReadDir: result}
 			return response
 		}
-		return h.errorResponse(0, syscall.EAGAIN, false)
 	})
+}
+
+func releaseDataGuards(guards []*volumeserver.DataGuard) {
+	for index := len(guards) - 1; index >= 0; index-- {
+		guards[index].Release()
+	}
 }
 
 func (h *VolumeHandler) coherenceDirectoryDependencies(directory [16]byte, candidates []directoryPageCandidate) volumeserver.MutationDependencies {
@@ -430,18 +587,17 @@ func (h *VolumeHandler) coherenceDirectoryDependencies(directory [16]byte, candi
 func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 	handle, directory xfsstore.Capability,
 	cookie uint64,
-	verifier [16]byte,
 	maxEntries int,
 	entries []xfsstore.Dirent,
 	eof bool,
 	candidates []directoryPageCandidate,
-) (bool, error) {
-	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.coherenceReadDirPage(handle, cookie, verifier, maxEntries)
+) (bool, [16]byte, error) {
+	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.coherenceReadDirPage(handle, cookie, maxEntries)
 	if err != nil {
-		return false, err
+		return false, [16]byte{}, err
 	}
-	if checkDirectory != directory || checkVerifier != verifier || checkEOF != eof || !sameDirectoryEnumeration(checkEntries, entries) {
-		return false, nil
+	if checkDirectory != directory || checkEOF != eof || !sameDirectoryEnumeration(checkEntries, entries) {
+		return false, checkVerifier, nil
 	}
 	for _, candidate := range candidates {
 		if candidate.item == (xfsstore.Capability{}) {
@@ -450,70 +606,27 @@ func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 		item, attr, lookupErr := h.Store.LookupOpen(handle, candidate.enumerated.Name)
 		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
 			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
-			return false, nil
+			return false, checkVerifier, nil
+		}
+		if errors.Is(lookupErr, syscall.EAGAIN) {
+			return false, checkVerifier, nil
 		}
 		if lookupErr != nil {
-			return false, lookupErr
+			return false, checkVerifier, lookupErr
 		}
 		identity, identityErr := h.Store.Identity(item)
 		forgetErr := h.Store.Forget(item)
 		if identityErr != nil || forgetErr != nil {
-			return false, errors.Join(identityErr, forgetErr)
+			return false, checkVerifier, errors.Join(identityErr, forgetErr)
 		}
 		if identity != candidate.identity || attr != candidate.attr {
-			return false, nil
+			return false, checkVerifier, nil
 		}
 	}
-	return true, nil
+	return true, checkVerifier, nil
 }
 
-// coherenceReadDirPage converts the old verifier-bound ordinal cursor into the
-// protocol-7 continuation rule. A directory change discards the old snapshot,
-// replays the ordinal against the current directory, and returns whatever the
-// POSIX continuation now names. It may duplicate or omit concurrently changed
-// entries, but it never reports ESTALE solely because the directory changed.
-func (h *VolumeHandler) coherenceReadDirPage(
-	handle xfsstore.Capability,
-	cookie uint64,
-	verifier [16]byte,
-	maxEntries int,
-) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
-	entries, next, current, eof, directory, err := h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
-	if !errors.Is(err, syscall.ESTALE) {
-		return entries, next, current, eof, directory, err
-	}
-	for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-		position := uint64(0)
-		var fresh [16]byte
-		for position < cookie {
-			remaining := cookie - position
-			batch := uint64(4096)
-			if remaining < batch {
-				batch = remaining
-			}
-			_, advanced, observed, atEOF, parent, scanErr := h.Store.ReadDirOpen(handle, position, fresh, int(batch))
-			if scanErr != nil {
-				if errors.Is(scanErr, syscall.ESTALE) {
-					break
-				}
-				return nil, 0, observed, false, parent, scanErr
-			}
-			fresh, directory = observed, parent
-			if atEOF && advanced < cookie {
-				return nil, advanced, fresh, true, directory, nil
-			}
-			if advanced <= position {
-				return nil, 0, fresh, false, directory, syscall.EIO
-			}
-			position = advanced
-		}
-		if position != cookie {
-			continue
-		}
-		entries, next, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, fresh, maxEntries)
-		if !errors.Is(err, syscall.ESTALE) {
-			return entries, next, current, eof, directory, err
-		}
-	}
-	return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EAGAIN
+// coherenceReadDirPage uses the store's stable XFS continuation offsets.
+func (h *VolumeHandler) coherenceReadDirPage(handle xfsstore.Capability, cookie uint64, maxEntries int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	return h.Store.ReadDirOpen(handle, cookie, maxEntries)
 }

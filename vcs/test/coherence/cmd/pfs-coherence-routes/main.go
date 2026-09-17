@@ -58,9 +58,11 @@ type options struct {
 func run(arguments []string) error {
 	flags := flag.NewFlagSet("pfs-coherence-routes", flag.ExitOnError)
 	var (
-		o         options
-		applyFile = flags.String("apply-file", "", "install this file as the volume's route declaration (needs an admin capability)")
-		check     = flags.Bool("check-revision-contract", false,
+		o           options
+		gatewayPath = flags.String("gateway-probe-path", "", "relative file path for the live gateway/writer probe")
+		gatewayRoot = flags.String("gateway-mount-root", "", "kernel mount root used by the gateway probe writer")
+		applyFile   = flags.String("apply-file", "", "install this file as the volume's route declaration (needs an admin capability)")
+		check       = flags.Bool("check-revision-contract", false,
 			"attach with a deliberately wrong revision without adopting, then adopt and retry; print the observed contract")
 	)
 	flags.StringVar(&o.address, "authority", "", "authority host:port")
@@ -79,6 +81,8 @@ func run(arguments []string) error {
 		return errors.New("--authority, --volume-id and --access-token-file are required")
 	}
 	switch {
+	case *gatewayPath != "":
+		return probeGateway(o, *gatewayRoot, *gatewayPath)
 	case *applyFile != "" && *check:
 		return errors.New("--apply-file and --check-revision-contract are separate operations")
 	case *applyFile != "":

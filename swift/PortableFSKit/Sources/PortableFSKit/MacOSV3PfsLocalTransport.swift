@@ -256,11 +256,8 @@ public actor PfsLocalMacOSV3CoherenceTransport: PfsMacOSCoherenceTransport {
         _ wire: PfsV3CoherenceContract
     ) throws -> PfsMacOSV3LocalContract {
         // This is the authority protocol nested inside pfslocal, not the local
-        // UDS major. Protocol 7 keeps the explicit FSKit synchronous-repair
-        // profile alongside the Linux subscription and delegation contract; an
-        // older authority contract is not negotiated or translated. The Go
-        // daemon stamps authorityrpc.ProtocolMajor here, and a Go test pins that
-        // constant to this literal so the two sides cannot drift.
+        // UDS major. Protocol 7 retains the explicit FSKit synchronous-repair
+        // profile; an older authority contract is not negotiated or translated.
         guard wire.authorityProtocolMajor == 7 else {
             throw PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(
                 wire.authorityProtocolMajor

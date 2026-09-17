@@ -36,13 +36,14 @@ the inode stale and does not earn an acknowledgment. A successful cold
 withdrawal can repair a coherence-stale inode. It cannot revive an old-epoch
 inode or handle.
 
-Names retain zero kernel dentry validity. Their daemon payloads and directory
-page entries, including attributes, live under the subscription. This preserves
-the existing protection against a kernel rename moving a cached name into a
-coordinate which never authorized it. Entry and inode notifications still
-withdraw existing kernel state. READ replies which finish without permission
-receive a post-write purge before their physical publication drain completes.
-The implementation indexes pending data publications by stable identity;
+Names retain zero kernel dentry validity. Their daemon payloads and directory page
+entries, including attributes, live under the subscription. This preserves the existing
+protection against a kernel rename moving a cached name into a coordinate which never
+authorized it. Namespace withdrawal revokes or drains pending replies and purges daemon
+bindings; zero entry validity makes an entry notification unnecessary. Inode
+notifications still withdraw kernel data and attributes. READ replies which finish
+without permission receive a post-write purge before their physical publication drain
+completes. The implementation indexes pending data publications by stable identity;
 ordinary withdrawal does not scan unrelated pending reads.
 
 The exact-coordinate source gate remains in place. A buffered write closes the
@@ -61,8 +62,38 @@ Buffer supplies extent overlays, coalescing, cuts, and per-file application
 ordering. Its flusher sends at most the smaller of 1 MiB and the negotiated
 write limit per WRITE, with the exact delegation id and generation on WRITE
 and SETATTR. Split entries retain acknowledged-prefix progress across definite
-transient failures. Different identities can flush concurrently. Completed
-replay records retire at the durable prefix.
+transient failures. Explicit flushes of different identities remain concurrent;
+background timer/cap work uses a bounded worker pool while preserving
+per-identity order. Deferred close admission is bounded. Close batches wait for
+application and release visibility ownership without waiting for durability;
+completed replay records remain retained until the durable prefix advances.
+
+Pure Authority mounts negotiate READDIRPLUS. Each 256-entry Authority page
+admits daemon name and attribute payloads under its subscription stamp while
+kernel entry and attribute validity remain zero. Capability transfer and cursor
+advancement are provisional until the physical reply succeeds; failure rolls
+back lookup ownership and the cursor. Mixed local-route mounts retain READDIR.
+
+A physically accepted page also retains a bounded, subscription-stamped hint
+from its start cookie to its stable identities. A warm READDIRPLUS sends only
+that page's identities which still resolve in `nodesByIdentity`; a cold or
+unknown page sends none. For an Item-less reply entry, the client resolves
+`Dirent.stable_identity` through that table and takes a lookup reference with
+`addLookupExisting` before any Item path can run. A missing or mismatched record
+fails closed. Kernel FORGET drops lookup ownership but retains the daemon record
+and capability while a live subscribed binding fits the registry. Name
+eviction, horizon withdrawal, epoch replacement, or unmount retires it.
+
+Unavoidable capabilities are reclaimed in exact batches of at most 4,096.
+One collector coalesces same-epoch tokens until the cleanup watermark or a
+short timer; FORGET itself remains nonblocking. This bounds cleanup RPCs by
+pages or batches instead of entries without weakening replay or epoch fencing.
+
+Under FULL ownership, FUSE FLUSH returns locally after checking loss unless the
+closing POSIX lock owner may hold record locks on that identity. SETLK/SETLKW
+acquisition attempts record this obligation before dispatch; successful FLUSH
+clears only the generation it observed. The Authority remains responsible for
+synchronous record-lock release. RELEASE retains its deferred CLOSE obligation.
 
 Holder reads use `Buffer.Read`. GETATTR uses the holder's base attributes with
 the buffer's size and metadata overlay. A new ownership interval fetches its
@@ -84,10 +115,13 @@ admission, as specified by the writeback package, so retries retain the same
 timestamps.
 
 Recall retires admission, drains that identity's cache-installing replies,
-flushes the retirement cut, waits for its durability, and acknowledges the
-applied ticket. The extra durability wait retires the old overlay before a
-peer can change the file; it remains inside the recall budget. Release uses
-the same ownership handoff rule. Break flushes a captured cut without surrendering ownership. Mode downgrade fences admission
+flushes the retirement cut to application, detaches its read overlay, and
+acknowledges the applied ticket. Its applied records remain charged until the
+durable prefix arrives. Final-handle release uses the same separation of
+visibility ownership from durability. Synchronous range mutations detach the
+applied overlay and resume buffer admission before dispatch, preserving the
+prior records' durability obligation without masking the new Authority bytes. Break flushes a captured cut without
+surrendering ownership. Mode downgrade fences admission
 through the flush before installing WRITETHROUGH. Upgrade installs FULL before
 acknowledgment. A missed budget or an unprovable flush drops retained entries
 and advances Buffer's loss sequence. No retry invents a new replay identity for
@@ -96,16 +130,28 @@ an uncertain applied entry.
 Rename, link, and unlink flush the affected identities before dispatch. A cold
 namespace binding is resolved before this dependency check; daemon eviction
 cannot hide dirty data from F4. Last-close cleanup collects delegated handles
-for a short batch, keeps the server handles alive through flushing and sorted
-DelegationRelease, then closes them. Nondelegated close retains its existing
+for at most 25 milliseconds or 128 handles, keeps the server handles alive
+through application and sorted DelegationRelease, then sends one CloseBatch. Nondelegated close retains its existing
 synchronous error path.
 
 A mount-root OPENDIR records the mount loss sequence. FSYNCDIR on that exact
 handle flushes a Buffer cut, sends Barrier with the Authority application ticket,
-and waits for its durable prefix. Clean detach also performs a bounded barrier
+waits for targeted visibility completion, and then waits for its durable prefix.
+The frontend admission write lock is held only while the accepted cut and prior
+application-ticket floor are captured. It is released before flush, network I/O,
+or either completion wait, so later writes and CREATE grant installation on
+disjoint identities proceed outside the barrier and are not added to its cut.
+Clean detach also performs a bounded barrier
 before stopping the buffer when retained entries or non-durable tickets remain.
-FSYNCDIR returns EIO if the barrier fails or loss
-advanced since OPENDIR. FUSE_SYNCFS is not the completion mechanism.
+FSYNCDIR returns EIO if the barrier fails or a generic loss advanced since
+OPENDIR. A definite pre-apply capacity loss retains its original ENOSPC,
+EDQUOT, or EFBIG instead. FUSE_SYNCFS is not the completion mechanism.
+
+Application, visibility, and durability are separate client states. Early
+application receipts continue to release recall and read cycles. Foreground
+WRITETHROUGH writes, synchronous writes, and delegated metadata changes do not
+return from a successful flush until WaitVisibility proves the targeted peer
+withdrawal. A durability watermark alone cannot satisfy that boundary.
 
 ## Epoch replacement
 
@@ -246,12 +292,13 @@ bash scripts/verify-local.sh --full
 bash scripts/coherence-matrix-linux.sh
 ```
 
-The full gate passes its default portion, then fails the first real-mount
-activation in `TestConcurrentAppendersOnOneMountLoseNoRecord`:
-`authorityrpc: authority returned obsolete Linux lease activation state`.
-The separate coherence matrix fails mount 0 activation for the same reason.
-No real-mount coherence result is claimed. These gates must pass after F1 is
-integrated before this frontend change is merge evidence.
+Workstream G subsequently passed the full gate (run 156), including all 66
+required FUSE integration tests and the root-barrier probe. Its separate matrix
+run 157 passed all 28 applicable cases, with the existing unsupported chown case
+skipped and both controls matching. G2 restored those Docker gates after reversing
+the rejected EntryNotify acknowledgement path; see the dated evidence and later
+qualification results in [integration.md](./integration.md). The earlier obsolete
+lease activation failure is resolved.
 
 Hot-path benchmarks in Linux arm64 report zero allocations for subscription
 permission and both cold/live delegation ownership checks. Source publication
@@ -259,3 +306,16 @@ admission costs 12 allocations with either zero or 4,096 unrelated coordinates;
 its work does not grow with the unrelated coordinate count. Change admission
 costs two allocations. Benchmark timings are local observations, not workload
 performance claims.
+
+
+## G2 final-handle cleanup
+
+Final-handle release waits for buffered application, not durability. A logical
+release flight blocks same-identity admission while the per-state acquire,
+transition, and operation mutexes are free during RPC. Successful release
+removes the old overlay; applied records remain retained until a durable prefix.
+The next grant resumes a fresh overlay generation. Final descriptor cleanup uses
+one replayed `CloseBatch` for at most 128 handles and consumes its ordered
+`retired` outcomes. Unknown cleanup ends the mounted session so unresolved
+handles remain owned by terminal cleanup. See wire.md for the additive feature
+and encoding contract.

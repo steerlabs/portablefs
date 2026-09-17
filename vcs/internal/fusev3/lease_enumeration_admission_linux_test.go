@@ -51,18 +51,10 @@ func treeInstallFileBytes(pkg, file int) []byte {
 	return bytes.Repeat([]byte{byte('a' + pkg%26)}, 64+file)
 }
 
-// treeInstallTolerable reports whether an error a concurrent reader saw is one
-// the enumeration contract allows a racing reader to see.
-//
-// ESTALE is the documented answer to resuming an enumeration a peer mutation
-// invalidated (docs/portable-coherence.md §5.4; see
-// TestPagedReaddirRefusesToPageAcrossARemoteMutation), and ENOENT is the
-// ordinary answer to a name that the installer's rename had not published yet
-// or that was read between two of its steps. Everything else -- and ENOTCONN
-// above all, which is what a revoked mount returns for every subsequent
-// syscall -- is a genuine failure.
+// A racing path descent may lose a name. Directory continuation itself must
+// never return ESTALE under normal namespace mutation (design rule F3).
 func treeInstallTolerable(err error) bool {
-	return errors.Is(err, syscall.ESTALE) || errors.Is(err, syscall.ENOENT)
+	return errors.Is(err, syscall.ENOENT)
 }
 
 // firstDuplicateName reports a name one readdir pass returned more than once.

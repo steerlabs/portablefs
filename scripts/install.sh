@@ -8,7 +8,7 @@
 # The embedded CLI owns the exclusive, race-free bundle replacement.
 #
 # Environment:
-#   PORTABLEFS_VERSION       pin a release, e.g. v0.3.0 or 0.3.0 (default: latest)
+#   PORTABLEFS_VERSION       pin a release, e.g. v0.4.0 or 0.4.0 (default: latest)
 #   PORTABLEFS_GITHUB_REPO   owner/repo to install from (default: steerlabs/portablefs)
 #   PORTABLEFS_INSTALL_DIR   CLI activation-link directory on Linux or macOS
 #                            (must be an absolute path inside the canonical

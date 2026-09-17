@@ -60,25 +60,15 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 				Handle: cloneBytes(handle.token), Offset: input.Offset, Length: input.Length, Mode: input.Mode, Delegation: ref,
 			}}}
 		}
-		identity := held.inode.identity[:]
-		var response *authoritypb.Response
-		var errno syscall.Errno
-		if r.mount.delegations.Owns(identity) {
-			response, err = r.mount.delegations.Synchronous(ctx, identity, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
-				candidate, callErrno := handle.node.mutateWithSource(ctx, request(ref), gate)
-				if callErrno != 0 {
-					return candidate, callErrno
-				}
-				return candidate, nil
-			})
-			if err != nil {
-				return fuse.Status(delegationErrno(err))
+		response, err := handle.node.withWriteDelegation(ctx, handle, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+			candidate, callErrno := handle.node.mutateWithSource(ctx, request(ref), gate)
+			if callErrno != 0 {
+				return candidate, callErrno
 			}
-		} else {
-			return fuse.EIO
-		}
-		if errno != 0 {
-			return fuse.Status(errno)
+			return candidate, nil
+		})
+		if err != nil {
+			return fuse.Status(delegationErrno(err))
 		}
 		reply := response.GetFallocate()
 		if reply == nil || response.GetUncertain() {
@@ -201,8 +191,7 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 		return 0, fuse.EIO
 	}
 	sourceIdentity := sourceSharedRecord.inode.identity[:]
-	destinationIdentity := destinationSharedRecord.inode.identity[:]
-	response, err := r.mount.delegations.Synchronous(ctx, destinationIdentity, func(_ *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+	response, err := destinationShared.node.withWriteDelegation(ctx, destinationShared, func(_ *authoritypb.DelegationRef) (*authoritypb.Response, error) {
 		if r.mount.delegations.Owns(sourceIdentity) {
 			if _, flushErr := r.mount.delegations.flushIdentityInEpoch(ctx, sourceIdentity); flushErr != nil {
 				return nil, flushErr

@@ -27,6 +27,8 @@ const proofInode = 2
 type kernelProofFS struct {
 	fuse.RawFileSystem
 	reads   atomic.Int64
+	lookups atomic.Int64
+	removed atomic.Bool
 	mu      sync.Mutex
 	data    []byte
 	entered chan struct{}
@@ -45,7 +47,8 @@ func (f *kernelProofFS) attr(ino uint64) fuse.Attr {
 }
 
 func (f *kernelProofFS) Lookup(_ <-chan struct{}, _ *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
-	if name != "file" {
+	f.lookups.Add(1)
+	if name != "file" || f.removed.Load() {
 		return fuse.ENOENT
 	}
 	out.NodeId, out.Generation, out.Attr = proofInode, 1, f.attr(proofInode)
@@ -299,5 +302,42 @@ func awaitProofNotification(t *testing.T, tid int, done <-chan fuse.Status) bool
 				return false
 			}
 		}
+	}
+}
+
+// A held fd keeps the positive dentry in use. Purging the daemon binding alone
+// cannot withdraw its nonzero validity; the returned EntryNotify must do it.
+func TestKernelEntryInvalidationProof(t *testing.T) {
+	fs := &kernelProofFS{RawFileSystem: fuse.NewDefaultRawFileSystem()}
+	fs.replace('A')
+	server, root := mountKernelProof(t, fs)
+	path := filepath.Join(root, "file")
+	fd, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+	before := fs.lookups.Load()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	if fs.lookups.Load() != before {
+		t.Fatal("positive dentry was not cached")
+	}
+	fs.removed.Store(true)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("purge alone unexpectedly withdrew kernel dentry: %v", err)
+	}
+	if fs.lookups.Load() != before {
+		t.Fatal("daemon purge forced lookup without notification")
+	}
+	if status := server.EntryNotify(fuse.FUSE_ROOT_ID, "file"); !status.Ok() {
+		t.Fatal(status)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("post-notify lookup=%v, want ENOENT", err)
+	}
+	if fs.lookups.Load() != before+1 {
+		t.Fatal("EntryNotify did not force re-entry for in-use positive dentry")
 	}
 }

@@ -128,6 +128,11 @@ func runMatrix(arguments []string) error {
 		expectDisjoint = flags.Bool("expect-disjoint-namespace", false,
 			"control mode: the second root deliberately does not share the volume, so the shared-namespace probe must fail rather than pass")
 	)
+	var commands v7Commands
+	flags.StringVar(&commands.Pause, "pause-command", "", "stop mount B and arrange automatic resume after recall budget")
+	flags.StringVar(&commands.Resume, "resume-command", "", "resume mount B after a failed recall experiment")
+	flags.StringVar(&commands.Epoch, "epoch-command", "", "restart only the Authority on the same endpoint and credentials")
+	flags.StringVar(&commands.Gateway, "gateway-command", "", "authenticated gateway probe command prefix")
 	flags.Var(expects, "expect", "declared non-passing expectation: <case>=<FAIL|SKIP>:<reason> (repeatable)")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -190,6 +195,7 @@ func runMatrix(arguments []string) error {
 		Replaces:       *replaces,
 		LocalRoute:     *localRoute,
 		RoutesContract: *routesContract,
+		Commands:       commands,
 	}
 	// Even setup runs in an owned process. os.Stat on an unhealthy FUSE mount
 	// can block just as permanently as a syscall in a case, so doing this probe
@@ -229,6 +235,7 @@ func runMatrix(arguments []string) error {
 			replaces:       *replaces,
 			localRoute:     *localRoute,
 			routesContract: *routesContract,
+			commands:       commands,
 		}, *timeoutArg)
 		if err != nil {
 			return fmt.Errorf("case %s lost its process boundary: %w", entry.name, err)
@@ -260,6 +267,7 @@ type caseInputs struct {
 	replaces       int
 	localRoute     string
 	routesContract string
+	commands       v7Commands
 }
 
 func printCase(result outcome) {

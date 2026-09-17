@@ -23,9 +23,11 @@ identifier `requiredAttachFeatures`.
 |---|---|
 | Hello, every profile | `xfs-current-state`, `session-exact-epoch`, `framed-bulk-data-v1`, `authority-keyed-replay-fingerprint-v1`, `mandatory-dual-transport-v1`, `exact-resource-acquisition` |
 | Hello, Linux additions | `direct-write`, `volume-subscription-v1`, `ordered-change-stream-v1`, `file-write-delegation-v1` |
+| Hello, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Hello, FSKit additions | `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1` |
 | Activate, every profile | `no-history`, `no-branches`, `user-xattr-readonly`, `single-principal`, `stable-item-identity`, `volume-syncfs-barrier`, `exact-resource-acquisition` |
-| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1` |
+| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1`, `bounded-control-replay-v1` |
+| Activate, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Activate, FSKit additions | `write-through`, `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1`, `peer-complete-fifo-feedback` |
 
 `volume-subscription-v1` includes cold subscription, pagination, renewal,
@@ -34,8 +36,9 @@ includes the CONTROL delivery cursor, bounded batches, and cumulative proven
 withdrawal acks. `file-write-delegation-v1` includes CREATE/OPEN piggyback,
 cache-capable handle accounting, full and writethrough modes, and generation
 checks on every delegated flush. `delegation-control-v1` requires recall,
-break, mode changes, their acks, and batch release. The last two Linux features
-require session application/durability tickets and the root FSYNCDIR barrier.
+break, mode changes, their acks, and batch release. `session-durable-sequence-v1` and `root-directory-barrier-v1` require session
+application/durability tickets and the root FSYNCDIR barrier. Optional
+`batched-close-v1` advertises the bounded DATA close operation below.
 
 Linux no longer requires or advertises `lease-coherence-v1`,
 `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`,
@@ -49,6 +52,15 @@ The frozen enum spelling `FRONTEND_PROFILE_LINUX_LEASES = 1` remains the Linux
 frontend identifier. Major 7 determines its subscription/delegation contract;
 it is not a switch to a v6 execution path. FSKit retains its explicit repair
 profile and the design's compatibility writer exclusion for every Mac mount.
+`FRONTEND_PROFILE_CACHELESS_READER = 3` is an authenticated peer reader. Attach
+requires exactly read access. The profile admits lifecycle operations, LOOKUP,
+GETATTR, read-only OPEN/CLOSE, READ, READDIR and RECLAIM. It admits no mutation,
+cache-capable handle, subscription, delegation or FSKit repair operation. Each
+data-consuming operation uses BreakForRead before storage admission and binding
+revalidation. It neither recalls the Linux writer nor joins the Mac writer
+exclusion; no writer waits for a cacheless reader's acknowledgment. The files
+gateway uses this profile. Its transport loss leaves no cache withdrawal duty.
+
 Optional session and enrollment reauthorization feature names are unchanged.
 
 ## Framing, envelopes, and counter domains
@@ -63,7 +75,8 @@ It rejects unknown fields, maps, and fixed-width fields. No new message uses a
 map or fixed-width field. The write-data digest substitution is unchanged.
 Changing delegation id or generation changes a mutation's replay fingerprint.
 
-Every repeated collection has at most 4,096 elements and must also fit the
+Repeated collections have at most 4,096 elements, except `CloseBatchRequest`
+and replies, whose limit is 128. Every collection must also fit the
 negotiated frame byte bound; senders split batches/pages earlier when needed.
 Identities are exactly 16 bytes and nonzero. Delegation ids and snapshot ids
 are opaque 16-byte nonzero values. Raw names contain 1–255 bytes, no NUL or
@@ -77,6 +90,33 @@ but no mutation replay slot. DATA mutations and Barrier use the existing
 session-exact mutation replay header. A response echoes the request id and
 epoch; nonzero `errno` means the operation did not provide the successful
 contract below. Existing uncertainty and failure classification still apply.
+
+### Directory-page capability reuse and reclaim
+
+`ReadDirRequest.want_items` remains tag 5. The additive
+`held_identities` field (tag 6) is a sorted, unique list of nonzero 16-byte
+stable identities that the session already retains for the page beginning at
+the request cookie. It is a page-local optimization hint, never authority.
+It is legal only with `want_items`, contains at most 4,096 identities, and
+irrelevant identities have no effect. A cold page or an unknown cached page
+sends an empty list.
+
+Every resolvable `Dirent` carries `stable_identity` at tag 7 together with its
+attributes, object version, and snapshot sequence. When `want_items` is true,
+the Authority returns a fresh `Item` unless that exact stable identity appears
+in `held_identities`; for a held identity it omits `Item`. The client may use
+the identity only to find its already-retained capability. It must fail closed
+if that binding is absent or mismatched. The Authority still resolves and
+revalidates every entry under the page's storage cut and never turns the hint
+into access authority.
+
+`ReclaimRequest.item` remains the legacy singular tag 1. The additive `items`
+field at tag 2 carries 1–4,096 distinct item capabilities. Exactly one form is
+nonempty. The complete shape and every session capability are validated before
+retirement begins, and one mutation replay slot owns the whole ordered batch.
+The client batches lazily at its cleanup watermark or timer and never combines
+tokens from different Authority epochs. A negotiated frame bound may require a
+smaller batch.
 
 | Counter | Scope and meaning |
 |---|---|
@@ -113,7 +153,7 @@ reject an equal-version reply that predates delegation withdrawal.
 | `SubscribeReply`; response 57 | `watermark` (1): atomic snapshot volume version. `delegated_identities` (2): sorted unique identities excluded by a reservation or live delegation at that snapshot, in bytewise order across pages. `incarnation` (3): new nonzero incarnation. `horizon_nanos` (4): conservative validity duration, at most 10,000,000,000 ns, anchored at the initial request's monotonic start. `snapshot_id` (5): token binding every page to this snapshot/session/incarnation. `next_after_identity` (6): final identity on a nonfinal page; empty marks completion. |
 | `RenewSubscriptionRequest`; request 66 | `incarnation` (1): exact current subscription. |
 | `RenewSubscriptionReply`; response 58 | `incarnation` (1): exact echo. `horizon_nanos` (2): conservative duration, at most 10 seconds, anchored at renewal request start. |
-| `NextControlEventRequest`; request 67 | `incarnation` (1): exact subscription. `after_sequence` (2): last received CONTROL event sequence, initially zero. Long-polls for its successor. |
+| `NextControlEventRequest`; request 67 | `incarnation` (1): exact subscription. `after_sequence` (2): last received CONTROL event sequence, initially zero. `completed_event_through` (3): contiguous prefix whose ACK retries are surrendered. Long-polls for the delivered cursor's successor. |
 | `ControlEvent`; response 59 | `incarnation` (1), `sequence` (2), and exactly one of `change_batch` (3), `delegation_recall` (4), `delegation_break` (5), `delegation_mode_change` (6). The outer request id matches the poll; events are never unsolicited response frames. |
 | `ChangeBatch`; ControlEvent 3 | `incarnation` (1): equals the event envelope. `entries` (2): nonempty ordered list of `ChangeEntry`, contiguous with the preceding batch. |
 | `ChangeAck`; request 68 | `position` (1): greatest fully withdrawn change prefix; zero acknowledges nothing. `incarnation` (2): exact current subscription. |
@@ -142,14 +182,33 @@ all ordinary requests at expiry; only cold subscription and required transport/
 session recovery plumbing may establish a usable incarnation again. Renewal
 cannot revive an expired incarnation.
 
-Only one poll may be outstanding per incarnation. Retrying the same poll
-cursor returns the same event until a subsequent cursor proves receipt.
-Receipt is independent of ChangeAck and delegation acknowledgments. Retain
-outstanding obligations until ack or horizon/budget expiry. A poll can deliver
-a recall while an earlier ChangeBatch is still being withdrawn; this separation
-prevents an ack/flush dependency from stopping delivery of the event that can
-resolve it. C and F must reserve independent CONTROL execution capacity for
-renewal and acknowledgments while the poll is parked.
+Only one poll may be outstanding per incarnation. Retrying the same poll cursor returns
+the same event until a subsequent cursor proves receipt. Receipt is independent of
+ChangeAck and delegation acknowledgments. Retain adapter ACK replay records until
+`completed_event_through` explicitly surrenders retries. This receipt is distinct from
+delivery and is not a cut acknowledgment: failed handlers may surrender replay while
+coordinator deadlines still govern their unfinished cuts. The client advances the
+receipt only across a contiguous prefix of finished handlers. Completed records at or
+below the receipt are deleted; current grant tracking is deleted at recall or release. A
+poll can deliver a recall while an earlier ChangeBatch is still being withdrawn; this
+separation prevents an ack/flush dependency from stopping delivery of the event that can
+resolve it. C and F must reserve independent CONTROL execution capacity for renewal and
+acknowledgments while the poll is parked.
+
+Release operations share one serialized acknowledgment lane, held across reconnect and
+exact retry. A new release carries sequence H+1 and completion H, where H is the last
+accepted sequence. The Authority retains only the latest exact request fingerprint and
+result, including definite errors. An exact retry repeats both coordinates. A malformed final response ends the client session. An uncertain final response fences
+the subscription incarnation: no further release, renewal, or poll may use that incarnation.
+The client withdraws its caches before a cold subscription creates a new release replay
+domain; it cannot acknowledge or surrender the uncertain result in the old domain. Invalid local request shapes consume no sequence. Linux attach requires
+`bounded-control-replay-v1` so clients cannot silently omit these coordinates.
+
+Application tickets retain monotonic applied/durable counters and only the
+volume-version suffix above the session's durable prefix. Volume sync retires covered
+records for every session, including idle sessions. Exact delegation ACK validation uses
+the active cut's floor and tickets issued while that cut is pending, independent of
+retired durability history.
 
 ## Change entries and withdrawal
 
@@ -174,21 +233,34 @@ coordinates must be empty, and `byte_range` is legal only for DATA_CHANGED.
 Namespace operations emit all affected bindings/directories and object changes;
 a rename may therefore produce several entries at the same volume version.
 
-ChangeAck(N, I) means **every change through position N in incarnation I has
-finished local withdrawal**. Reverse notify has returned for all affected
-kernel state, and pending cache-installing replies on those coordinates have
-drained or been discarded. A client can process disjoint entries concurrently,
-but cannot acknowledge past a hole. An identical or older ack is an idempotent
-no-op within that incarnation; a future/undelivered position is invalid. An old
-incarnation is refused, never translated to a current cursor. Transient notify
-failure gets a bounded retry, not a premature ack.
+ChangeAck(N, I) means **every change through position N in incarnation I has finished
+local withdrawal**. Inode notification has returned for affected kernel data and
+attributes, and pending cache-installing replies on those coordinates have drained or
+been discarded. Authority-backed shared names always have zero kernel entry validity.
+Their withdrawal closes the coordinate, revokes or drains old replies, and purges daemon
+positive/negative bindings and stamps; no entry notification is required. The next
+forward lookup must re-enter FUSE. Retained kernel dentry objects used by reverse
+`d_path` remain outside the contract; machine-local graft names are separate. A client
+can process disjoint entries concurrently, but cannot acknowledge past a hole. An
+identical or older ack is an idempotent no-op within that incarnation; a
+future/undelivered position is invalid. An old incarnation is refused, never translated
+to a current cursor. Transient notify failure gets a bounded retry, not a premature ack.
 
 An operation/grant awaiting withdrawal from a subscriber waits for that
 subscriber's ack through the relevant position or its horizon. Change entries
 have no PREPARE/COMPLETE handshake. A committed namespace operation completes
 externally after its required deliveries/withdrawals. A delegation reservation
 becomes a grant only after peers' DELEGATION_GRANTED withdrawals finish. The
-initiating session handles its own publication boundary locally.
+initiating session handles its own publication boundary locally. Its source
+commits advance the coordinator cursor internally and produce no CONTROL event
+or ChangeAck. Delegation grant/release bookkeeping is likewise implicit for the
+exact owning subscription incarnation; a cold incarnation still receives a
+delayed old-generation release retained by its snapshot. An intervening peer
+change prevents implicit acknowledgement across that outstanding withdrawal.
+Its committed changes are omitted from its wire change stream: a reverse
+notification can otherwise wait on the initiating syscall's VFS locks and
+block acknowledgments needed by a concurrent peer mutation. Skipped internal
+positions do not create holes in the session's wire change positions.
 
 ## Delegations and flushes
 
@@ -207,7 +279,7 @@ invalidate the old reference even if the same session later reacquires it.
 | `CreateReply` | `delegation` (3), absent if no grant; `cache_capable` (4) is the admitted capability for this handle. `item` and `handle` retain tags 1 and 2. |
 | `OpenRequest` | `write_intent` (3), `cache_capable` (4), with the same meanings. `item` (1) and `flags` (2) are unchanged. |
 | `OpenReply` | `delegation` (2), `cache_capable` (3); `handle` remains 1. Identity comes from the opened item. |
-| `WriteRequest` | `delegation` (13), a DelegationRef required on each buffered flush. Payload stays out of line. |
+| `WriteRequest` | `delegation` (13), a DelegationRef required on each buffered flush. Optional `flush_sequence` (14) orders pipelined chunks as specified below. Payload stays out of line. |
 | `SetAttrRequest` | `delegation` (11), required when flushing buffered attributes or truncate. Optional size/mode/time presence remains unchanged. |
 | `FallocateRequest` | `delegation` (8), required when operating under a delegation. Reserved tags stay reserved. |
 | `WriteReply` | `durable_sequence` (8), the session's contiguous durable application prefix. The common response carries this operation's applied ticket. |
@@ -222,6 +294,12 @@ opens an already delegated identity gets `cache_capable = false`. Requests
 express a preference; only the reply authorizes kernel caching. A write-intent
 handle is direct-IO. A separate holder read handle can be cache-capable if the
 holder invalidates affected local kernel ranges on every accepted write.
+
+SETATTR mode, uid, gid, timestamps, and size require an item capability or an
+open handle owned by the session. A handle alone authorizes the operation even
+if the item capability has been reclaimed; when both are present they must name
+the same identity. Neither a stable identity nor a DelegationRef substitutes for
+these capabilities. Omitting both returns EINVAL before storage application.
 
 An absent DelegationRef is an ordinary synchronous operation, including a
 first write that needs authority ownership arbitration. It never authorizes
@@ -262,13 +340,13 @@ an authority timeout. The generation check remains decisive after a timeout.
 | `DelegationBreak` | `delegation` (1), `identity` (2), `budget_nanos` (3). Flush an accepted cut for a waiting peer read; retain ownership. |
 | `DelegationModeChange` | `delegation` (1), `identity` (2), target `mode` (3), `budget_nanos` (4). |
 | `DelegationRecallAck`; request 69 | `incarnation` (1), `event_sequence` (2), `delegation` (3), `applied_sequence` (4). |
-| `DelegationBreakAck`; request 70 | Same field names/numbers as RecallAck. |
-| `DelegationModeChangeAck`; request 71 | Same field names/numbers as RecallAck. |
+| `DelegationBreakAck`; request 70 | Same field names/numbers as `DelegationRecallAck`. |
+| `DelegationModeChangeAck`; request 71 | Same field names/numbers as `DelegationRecallAck`. |
 | `DelegationRecallAckReply`; response 61 | Empty success receipt. |
 | `DelegationBreakAckReply`; response 62 | Empty success receipt. |
 | `DelegationModeChangeAckReply`; response 63 | Empty success receipt. |
 | `DelegationRelease` | `delegation` (1), `applied_sequence` (2), naming the last flushed identity cut. |
-| `DelegationReleaseRequest`; request 73 | `incarnation` (1), nonempty `delegations` (2), sorted by id, each id exactly once, at most 4,096 entries. |
+| `DelegationReleaseRequest`; request 73 | `incarnation` (1), nonempty `delegations` (2), sorted by id, each id exactly once, at most 4,096 entries. `release_sequence` (3): contiguous logical operation starting at 1. `completed_release_through` (4): prior result received and no longer retried. |
 | `DelegationReleaseReply`; response 65 | Empty all-or-error success receipt; validate the whole batch before releasing any grant. |
 
 Recall is the two-phase ownership transition: authority withdrawal request,
@@ -309,6 +387,12 @@ are idempotent; changed generations are refused. Retain per-incarnation release
 completion records so a retry after removing the live grant remains distinguishable
 from a stale-generation request. After release the authority
 emits DELEGATION_RELEASED. Unmount/planned restart must still wait for durability.
+
+A release whose exact applied ticket covers the final storage application also
+completes any pending recall, break, or mode-change cut for that reference. All
+storage pins must have drained. The authority suppresses an undelivered event
+for the released reference; an already delivered event is completed by the
+release. A later exact acknowledgment of that completed cut is idempotent.
 
 ## Root directory barrier
 
@@ -361,7 +445,7 @@ storage mutation. No commit lock may span an ack, recall, horizon, or durability
 wait. The authority's existing mutation sequencer orders conflicting work.
 
 The historical v6 lease schema stays for inspection of stored wire history.
-`Lease*`, NextLeaseEvent, AcknowledgeLeaseEvent, RenewLeases,
+`Lease*`, `NextLeaseEventRequest`, `AcknowledgeLeaseEventRequest`, `RenewLeasesRequest`,
 SourceLeaseDischarge, AcknowledgeSourceLeaseDischarge, `lease_grants`,
 `source_lease_discharge`, and Activate's `lease_cursor` are not sent or honoured
 by the completed v7 implementation. F owns deletion of their executable
@@ -429,3 +513,99 @@ The separately invoked `bash scripts/coherence-matrix-linux.sh` passed with
 `remote_chown_visible` skip (23 total, zero unexpected results). Both
 falsifiability controls reached their declared expectations. This exercises
 the current frontend paths; it does not prove the new C/F state machines.
+
+## Integration ordering clarifications
+
+A new OPEN/CREATE grant remains reserved until the operation's synchronous
+withdrawal completes. Pending peer reads may sample storage under a reservation;
+grant activation drains those samples before the DATA reply. CONTROL may then
+overtake DATA, so the client still handles that ordering. A synchronous mutation
+under an already installed grant returns its application receipt before its
+visibility wait, allowing the holder to acknowledge a peer cut independently.
+
+Private synchronous generations exclude their source from grant/release reverse
+notifications; its exact publication gate and post-state repair those coordinates.
+Promotion to a visible grant restores the ordinary release notification. Normal
+client-visible grants remain broadcast to purge the holder's earlier cached pages.
+
+A new Authority process must also account for the preceding epoch's cache
+horizon. Durable membership distinguishes Linux v7, cacheless readers, and
+compatibility mounts. If any prior Linux v7 mount is recorded, the replacement
+waits a full SubscriptionTTL from coordinator creation before granting a writer
+delegation or applying a mutation. Cold Subscribe, ordinary reads, and barriers
+remain available during that interval. A canceled wait takes no storage or
+identity turn. This bound does not establish kernel mount absence: old durable
+records still block topology changes and archive proof. Prior compatibility or
+untyped legacy membership continues to require explicit fencing evidence.
+
+
+## Batched descriptor close
+
+Linux Activate optionally advertises `batched-close-v1`; absent advertisement
+selects individual CLOSE requests. The required feature set is unchanged. DATA carries
+`Request.close_batch` (tag 74) and `Response.close_batch` (tag 68); FSKit and
+CACHELESS_READER retain ordinary CLOSE. A request contains 1–128 distinct
+16-byte handle capabilities with each handle's lock owner and flock-unlock
+flag. The entire shape is validated before any close. The frame grammar bounds
+both request and reply lists to 128 before protobuf allocation.
+
+One mutation replay slot owns the complete ordered request and ordered results.
+Top-level success carries one result per input, including individual failures;
+all entries are attempted. Exact replay returns those outcomes without closing
+again. A changed order or handle is a replay mismatch. Callers retry only the
+identical whole request in its existing replay domain.
+
+A result carries errno, failure class, and `retired`. Once a session capability
+is validated, descriptor close is attempted even if explicit flock cleanup
+fails. The store consumes its capability before reporting a final close error;
+the Authority removes session accounting and sets `retired` even on that error.
+An already-stale session handle is also retired. Other pre-close refusal does
+not claim retirement. Clients remove retired handles while preserving the error
+for diagnostics. Unknown transport outcomes or malformed replies revoke the mounted session;
+terminal session cleanup owns its remaining descriptors. Malformed result count, errno, or failure classification is refused.
+
+Final-handle cleanup first applies each buffered cut and releases the grants in
+one CONTROL batch. It does not wait for durability. Applied records cease to
+participate in the read overlay after release, but their bytes and loss
+obligations remain retained until a durable prefix or fencing loss. No per-file
+acquire, transition, or operation lock spans the release or close RPC; a local
+release flight orders same-identity admissions through completion.
+
+
+## Optional ordered delegated flush
+
+Linux peers may negotiate `ordered-delegated-flush-v1`. It is an optional Hello
+feature: the client offers it only with four dedicated flush permits and replay
+slots plus at least one ordinary slot; the Authority echoes it only when its
+ordinary half can reserve those same five slots. DATA and CONTROL must agree,
+including replacement transports. Activate must also advertise it. The frozen
+required feature sets and protocol major are unchanged. Without negotiation,
+clients use the existing serial delegated flush.
+
+With negotiation, all delegated WRITE, SETATTR and FALLOCATE requests share the
+four flush permits on both endpoints. Each nonzero WRITE `flush_sequence` is a
+dense ordinal starting at one for the exact delegation ID and generation. At
+most four successors may be registered. The replay runtime resolves duplicates
+before registering an ordinal. A successor waits before acquiring storage or
+mutation dependencies; its predecessor releases it only after recording its
+exact replay outcome. Definite recorded errors consume their ordinal. An
+unrecorded refusal retires the authenticated owner's exact grant and wakes
+successors; it cannot leave an unfillable gap. Subscription loss, recall expiry,
+and runtime transport cancellation also terminate waiting ordinals. Ordinal zero
+retains the existing serial behavior; metadata flushes separate WRITE waves.
+
+The daemon admits each predecessor to its transport lane before launching the
+next chunk. It joins the wave before changing local ownership. Transport retries
+retain the same mutation identity, ordinal and immutable scatter spans; an
+unprovable wave result loses the delegation, while definite capacity errors keep
+the grant and report the errno. A partial acceptance record remains retained and
+is excluded from the applied acceptance cut until its final chunk succeeds.
+Scatter spans use the existing single bulk carrier and canonical frame bytes;
+there is no new bulk encoding or payload-copy requirement.
+
+`Response.session_terminal` (69) is an additive terminal-session witness. It is
+true only with envelope ESTALE when this exact Authority session expired or was
+fenced. The client starts local session enforcement before delivering that
+response, even if the transport remains connected. Ordinary stale item/handle
+ESTALE omits the field and remains nonterminal. Epoch mismatch retains the
+existing exact-epoch comparison; this field does not change its recovery path.

@@ -69,8 +69,8 @@ func (b *Buffer) Read(ctx context.Context, id Identity, off int64, length int, f
 
 // OverlayAttributes applies retained metadata in program order. Base must
 // reflect Authority state from the same delegation. Size uses the indexed size
-// summary; implicit write timestamps and privilege-bit changes remain the
-// frontend's responsibility and can be admitted as explicit SetAttr entries.
+// summary. Implicit timestamps are sampled once at admission and folded before
+// explicit attributes in the same operation, preserving program order.
 func (b *Buffer) OverlayAttributes(id Identity, base Attributes) Attributes {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -79,7 +79,23 @@ func (b *Buffer) OverlayAttributes(id Identity, base Attributes) Attributes {
 		return base
 	}
 	for r := f.head; r != nil; r = r.next {
+		if !r.inOverlay {
+			continue
+		}
 		a := r.attrs
+		if r.kind == Write && r.writeOptions.KillPrivileges && base.HasMode {
+			base.Mode &^= 0o4000
+			if base.Mode&0o0010 != 0 {
+				base.Mode &^= 0o2000
+			}
+			base.HasMode = true
+		}
+		if r.kind == Write || r.kind == Truncate || a.HasSize {
+			base.MTimeNS, base.HasMTime, base.MTimeNow = r.acceptedAt, true, false
+		}
+		if r.kind == Write || r.kind == Truncate || a.HasMode || a.HasUID || a.HasGID || a.HasSize || a.HasATime || a.HasMTime {
+			base.CTimeNS, base.HasCTime = r.acceptedAt, true
+		}
 		if a.HasMode {
 			base.Mode = a.Mode
 			base.HasMode = true

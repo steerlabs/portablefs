@@ -93,6 +93,8 @@ message Request {
     DelegationModeChangeAck delegation_mode_change_ack = 71;
     BarrierRequest barrier = 72;
     DelegationReleaseRequest delegation_release = 73;
+    CloseBatchRequest close_batch = 74;
+    WaitVisibilityRequest wait_visibility = 75;
   }
 }
 
@@ -173,6 +175,12 @@ message Response {
   // Version at which a cache-installing reply was served, including negative
   // LOOKUP and empty READDIR. Publication must compare with local withdrawals.
   uint64 volume_version = 67;
+  // This exact session expired or was fenced. Unlike an ordinary ESTALE
+  // capability error, it requires immediate local session enforcement.
+  bool session_terminal = 69; // present only with envelope errno ESTALE
+  // Largest contiguous session application prefix whose peer withdrawals have
+  // completed. Durability is reported separately and does not imply this cut.
+  uint64 visible_sequence = 70;
 
   oneof body {
     HelloReply hello = 10;
@@ -218,6 +226,8 @@ message Response {
     BarrierReply barrier = 64;
     DelegationReleaseReply delegation_release = 65;
     FsyncReply fsync = 66;
+    CloseBatchReply close_batch = 68;
+    WaitVisibilityReply wait_visibility = 71;
   }
 }
 
@@ -511,6 +521,8 @@ enum FrontendProfile {
   // Frozen profile spelling; v7 uses subscription/delegation semantics.
   FRONTEND_PROFILE_LINUX_LEASES = 1;
   FRONTEND_PROFILE_FSKIT_SYNC_REPAIR = 2;
+  // Authenticated non-subscribing reader; reads break delegated writeback.
+  FRONTEND_PROFILE_CACHELESS_READER = 3;
 }
 enum SessionPurpose {
   SESSION_PURPOSE_UNSPECIFIED = 0;
@@ -941,6 +953,10 @@ message CloseRequest {
   uint64 lock_owner = 2;
   bool flock_unlock = 3;
 }
+// One exact replay outcome for 1..128 unique handles. Results preserve input order.
+message CloseBatchRequest { repeated CloseRequest closes = 1; }
+message CloseBatchResult { int32 errno = 1; FailureClass failure = 2; bool retired = 3; }
+message CloseBatchReply { repeated CloseBatchResult results = 1; }
 message ReadRequest { bytes handle = 1; uint64 offset = 2; uint32 length = 3; }
 message ReadReply { bytes data = 1; uint64 volume_version = 2; }
 // WriteRequest is the stock FUSE_WRITE shape after kernel-side generic
@@ -974,6 +990,9 @@ message WriteRequest {
   bool sync = 11;
   bool data_sync = 12;
   DelegationRef delegation = 13; // required for a delegated flush
+  // Optional ordered-delegated-flush-v1 capability. Dense accepted WRITE
+  // ordinal within this exact delegation; absent/zero retains serial mode.
+  uint64 flush_sequence = 14;
 }
 
 // One stock write either reports the exact committed byte count, the offset the
@@ -1102,20 +1121,35 @@ message ReadDirRequest {
   bytes cookie = 2;
   bytes verifier = 3;
   uint32 max_entries = 4;
-  // Ask for a fresh usable Item capability for every returned entry. Linux
-  // readdir leaves this false; the macOS pfslocal contract requires Items.
+  // Ask for a usable Item capability for returned entries. READDIRPLUS may
+  // name capabilities it already retains in held_identities; the authority
+  // omits a fresh Item for those entries. Plain READDIR leaves this false;
+  // the macOS pfslocal contract requires Items and sends no held identities.
   bool want_items = 5;
+  // Sorted unique stable identities retained by this session for the page
+  // beginning at cookie. Each value is exactly 16 bytes and the collection is
+  // bounded by the ordinary repeated-field limit.
+  repeated bytes held_identities = 6;
 }
 message Dirent {
   bytes name = 1;
   Attr attr = 2;
   bytes next_cookie = 3;
-  Item item = 4; // present for every entry exactly when want_items is true
+  // Present for resolvable entries when want_items is true unless the entry's
+  // stable_identity was declared in held_identities.
+  Item item = 4;
   uint64 object_version = 5;
   uint64 snapshot_sequence = 6;
+  // Present for every resolvable entry, including one whose Item was omitted.
+  bytes stable_identity = 7;
 }
 message ReadDirReply { repeated Dirent entries = 1; bytes verifier = 2; bool eof = 3; }
-message ReclaimRequest { bytes item = 1; }
+message ReclaimRequest {
+  // Legacy singular form. Exactly one of item and items is nonempty.
+  bytes item = 1;
+  // Batched form: 1..4096 distinct item capabilities.
+  repeated bytes items = 2;
+}
 
 message GetXattrRequest { bytes item = 1; bytes handle = 2; bytes name = 3; }
 message GetXattrReply { bytes value = 1; }
@@ -1145,7 +1179,7 @@ message SetLockRequest { LockSpec lock = 1; bool wait = 2; bool unlock = 3; }
 
 // Protocol 7 coherence. Normative ordering and counter domains are specified in
 // docs/coherence-v2/wire.md. All these control requests use CONTROL except Barrier
-// (DATA). Stable identities are coordination keys, never capabilities.
+// and WaitVisibility (DATA). Stable identities are coordination keys, never capabilities.
 message SubscribeRequest {
   bytes snapshot_id = 1; // empty starts a cold subscription; otherwise pagination
   bytes after_identity = 2; // exact previous next_after_identity
@@ -1169,6 +1203,7 @@ message RenewSubscriptionReply {
 message NextControlEventRequest {
   uint64 incarnation = 1;
   uint64 after_sequence = 2; // last received ControlEvent.sequence; initially zero
+  uint64 completed_event_through = 3; // explicit surrender of further event ACK retries through this position; not a cut ACK
 }
 message ControlEvent {
   uint64 incarnation = 1;
@@ -1270,6 +1305,8 @@ message DelegationRelease {
 message DelegationReleaseRequest {
   uint64 incarnation = 1;
   repeated DelegationRelease delegations = 2; // unique, sorted by id
+  uint64 release_sequence = 3; // contiguous logical release operation, starts at 1
+  uint64 completed_release_through = 4; // received results, never retried after this receipt
 }
 message DelegationReleaseReply {}
 
@@ -1280,4 +1317,12 @@ message BarrierRequest { uint64 cut_sequence = 1; }
 message BarrierReply {
   uint64 applied_sequence = 1;
   uint64 durable_sequence = 2;
+}
+
+// Waits for peer cache withdrawal through one already-issued session
+// application ticket. It performs no storage or durability operation.
+message WaitVisibilityRequest { uint64 cut_sequence = 1; }
+message WaitVisibilityReply {
+  uint64 applied_sequence = 1;
+  uint64 visible_sequence = 2;
 }

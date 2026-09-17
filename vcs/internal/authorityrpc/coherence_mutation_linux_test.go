@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"context"
 	"io/fs"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -15,6 +16,20 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 	"google.golang.org/protobuf/proto"
 )
+
+type fenceOnArmedContext struct {
+	context.Context
+	armed atomic.Bool
+	once  sync.Once
+	fence func()
+}
+
+func (c *fenceOnArmedContext) Err() error {
+	if c.armed.Load() {
+		c.once.Do(c.fence)
+	}
+	return c.Context.Err()
+}
 
 func TestCoherenceStaleFlushRefusedWhole(t *testing.T) {
 	for _, kind := range []string{"write", "setattr", "fallocate"} {
@@ -76,6 +91,9 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := h.Coherence.AdmitCache(peer.Token, volumeserver.CacheAdmission{Data: [][16]byte{{0x41}}}); err != nil {
+		t.Fatal(err)
+	}
 	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
 	req.GetWrite().Delegation = coherenceDelegationRefProto(delegation)
 	done := make(chan *authoritypb.Response, 1)
@@ -89,6 +107,9 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 	if result.GetErrno() != 0 || result.GetAppliedSequence() != 1 || result.GetWrite().GetCommittedSize() != 4 {
 		t.Fatalf("applied result = %v", result)
 	}
+	if result.GetVisibleSequence() != 0 {
+		t.Fatalf("unwithdrawn application reported visible sequence %d", result.GetVisibleSequence())
+	}
 	events, err := h.Coherence.Poll(t.Context(), peer.Token, peer.Position, nil, 32)
 	if err != nil || len(events) == 0 {
 		t.Fatalf("changes=%v, err=%v", events, err)
@@ -101,6 +122,20 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 		t.Fatalf("unacked peer became visible: %v", err)
 	case <-time.After(10 * time.Millisecond):
 	}
+	visible := make(chan *authoritypb.Response, 1)
+	go func() {
+		visible <- h.handleCoherenceVisibility(t.Context(), &authoritypb.Request{
+			RequestId: 2,
+			Body: &authoritypb.Request_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityRequest{
+				CutSequence: result.GetAppliedSequence(),
+			}},
+		}, cred)
+	}()
+	select {
+	case reply := <-visible:
+		t.Fatalf("visibility completion preceded withdrawal: %v", reply)
+	case <-time.After(10 * time.Millisecond):
+	}
 	if err := h.Coherence.Ack(peer.Token, position); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +146,14 @@ func TestCoherenceAppliedReceiptPrecedesPeerWithdrawal(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("acked change did not become visible")
+	}
+	select {
+	case reply := <-visible:
+		if reply.GetErrno() != 0 || reply.GetVisibleSequence() != 1 || reply.GetWaitVisibility().GetAppliedSequence() != 1 || reply.GetWaitVisibility().GetVisibleSequence() != 1 {
+			t.Fatalf("visibility completion = %v", reply)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("visibility completion did not follow withdrawal")
 	}
 	replay := h.handleWrite(t.Context(), req, cred, req.GetWrite())
 	if replay.GetAppliedSequence() != 1 {
@@ -130,12 +173,20 @@ func TestCoherenceChangeCoordinates(t *testing.T) {
 	if len(entries) != 4 {
 		t.Fatalf("changes = %+v", entries)
 	}
+	counts := make(map[volumeserver.ChangeKind]int)
 	for _, e := range entries {
+		counts[e.Kind]++
 		if e.VolumeVersion != 8 {
 			t.Fatalf("wrong version %+v", e)
 		}
 		if e.Kind == volumeserver.DataChanged && (!e.HasRange || e.Offset != 3 || e.Length != 7) {
 			t.Fatalf("wrong range %+v", e)
+		}
+	}
+
+	for _, kind := range []volumeserver.ChangeKind{volumeserver.NamespaceChanged, volumeserver.DirectoryChanged, volumeserver.AttributesChanged, volumeserver.DataChanged} {
+		if counts[kind] != 1 {
+			t.Errorf("namespace operation change kind %v count = %d", kind, counts[kind])
 		}
 	}
 }
@@ -364,5 +415,270 @@ func TestCoherenceRecallFlushPassesPendingMacActivation(t *testing.T) {
 	}
 	if _, live := h.Coherence.LookupDelegation(identity); live {
 		t.Fatal("Mac activation left a live Linux delegation")
+	}
+}
+
+func TestLinuxV7MutationRefusedBeforeApplyByActiveMacCompatibilityWriter(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	mac, err := h.Runtime.AttachActiveForTest(4, volumeserver.PeerIdentity{2}, volumeserver.Authorization{Access: volumeserver.AccessRead | volumeserver.AccessWrite, Deadline: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := h.Runtime.SessionTerminal(mac.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Visibility.Register(mac.ID, volumeserver.CoherenceStrict, terminal, volumeserver.VisibilityCommitment{
+		CachedNameCapacity: 16, RepairBudget: time.Second, NamespaceRepair: volumeserver.NamespaceRepairCallbackSerializedPipelined, CompatibilityWriter: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	target := &writeTestTarget{committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0600, Nlink: 1}}
+	handle := prepareOneShotTarget(t, h, cred, store, target)
+	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	response := h.handleWrite(t.Context(), req, cred, req.GetWrite())
+	if response.GetErrno() != int32(syscall.EBUSY) || response.GetAppliedSequence() != 0 || response.GetMutation() != nil {
+		t.Fatalf("Mac exclusion=%v", response)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 0 {
+		t.Fatal("excluded Linux write reached storage")
+	}
+	h.Visibility.Fence(mac.ID, volumeserver.ErrVisibilityLost)
+	response = h.handleWrite(t.Context(), req, cred, req.GetWrite())
+	if response.GetErrno() != 0 || response.GetAppliedSequence() != 1 {
+		t.Fatalf("write after Mac departure=%v", response)
+	}
+	if calls, _ := target.commitSnapshot(); calls != 1 {
+		t.Fatalf("applies=%d", calls)
+	}
+	if h.strictCache(cred.ID) != nil {
+		t.Fatal("Linux entered Mac read repair")
+	}
+}
+
+func TestLinuxV7MutationHoldsMacAdmissionThroughStorageApply(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	target := &writeTestTarget{committed: 4, post: xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 7, Size: 4, Mode: 0600, Nlink: 1}, started: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-target.release:
+		default:
+			close(target.release)
+		}
+	}()
+	handle := prepareOneShotTarget(t, h, cred, store, target)
+	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	done := make(chan *authoritypb.Response, 1)
+	go func() { done <- h.handleWrite(t.Context(), req, cred, req.GetWrite()) }()
+	waitWriteTestSignal(t, target.started, "Linux storage apply")
+	admitted := make(chan struct{})
+	attempting := make(chan struct{})
+	go func() {
+		close(attempting)
+		h.coherenceProfileAdmission.Lock()
+		close(admitted)
+		h.coherenceProfileAdmission.Unlock()
+	}()
+	<-attempting
+	select {
+	case <-admitted:
+		t.Fatal("Mac activation passed live Linux apply")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(target.release)
+	select {
+	case response := <-done:
+		if response.GetErrno() != 0 {
+			t.Fatal(response)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Linux write did not finish")
+	}
+	waitWriteTestSignal(t, admitted, "Mac admission after Linux apply")
+}
+
+func TestLinuxV7MutationFenceBeforeApplyDoesNotCommitStorage(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	handle := prepareOneShotTarget(t, h, cred, store, &writeTestTarget{})
+	request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	ctx := &fenceOnArmedContext{Context: t.Context(), fence: func() { h.Runtime.FenceSession(cred.ID) }}
+	var applies atomic.Uint32
+	response := h.mutateCoherenceVisibleSequenceResolved(ctx, request, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+		ctx.armed.Store(true)
+		return []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityData, Identity: [16]byte{0x41}}}, nil
+	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		applies.Add(1)
+		return &authoritypb.Response{Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{}}}, nil
+	})
+	if response.GetErrno() == 0 || response.GetAppliedSequence() != 0 {
+		t.Fatalf("fenced mutation response = %+v", response)
+	}
+	if got := applies.Load(); got != 0 {
+		t.Fatalf("storage applies after source fence = %d, want 0", got)
+	}
+}
+
+func TestLinuxV7PreparationCannotEscapeStorageDependencies(t *testing.T) {
+	h, cred, store := newWriteHarness(t)
+	handle := prepareOneShotTarget(t, h, cred, store, &writeTestTarget{})
+	req := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
+	response := h.mutateCoherenceVisibleSequenceResolved(t.Context(), req, cred, func(*operationResolutionContext) ([]volumeserver.VisibilityTarget, error) {
+		return []volumeserver.VisibilityTarget{{Scope: volumeserver.VisibilityAttributes, Identity: [16]byte{0x99}}}, nil
+	}, func(uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
+		t.Fatal("uncovered preparation applied")
+		return nil, nil
+	})
+	if response.GetErrno() == 0 || response.GetAppliedSequence() != 0 {
+		t.Fatalf("uncovered preparation=%v", response)
+	}
+}
+
+func TestCoherenceSetAttrRequiresItemOrHandle(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		set  *authoritypb.SetAttrRequest
+	}{
+		{"mode", &authoritypb.SetAttrRequest{Mode: proto.Uint32(0600)}},
+		{"uid", &authoritypb.SetAttrRequest{Uid: proto.Uint32(1000)}},
+		{"gid", &authoritypb.SetAttrRequest{Gid: proto.Uint32(1000)}},
+		{"atime", &authoritypb.SetAttrRequest{AtimeNs: proto.Int64(1)}},
+		{"mtime", &authoritypb.SetAttrRequest{MtimeNs: proto.Int64(1)}},
+		{"atime-now", &authoritypb.SetAttrRequest{AtimeNow: true}},
+		{"mtime-now", &authoritypb.SetAttrRequest{MtimeNow: true}},
+		{"size", &authoritypb.SetAttrRequest{Size: proto.Int64(0)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &resourceAdmissionFaultStore{}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+			request := coherenceReadRequest(credential)
+			request.Mutation = &authoritypb.Mutation{Sequence: 1}
+			request.Body = &authoritypb.Request_SetAttr{SetAttr: test.set}
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != int32(syscall.EINVAL) || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
+				t.Fatalf("unauthorized SETATTR = %v, want unapplied EINVAL", response)
+			}
+		})
+	}
+}
+
+type coherenceRecallMutationStore struct {
+	resourceAdmissionFaultStore
+	applied atomic.Uint32
+}
+
+func (*coherenceRecallMutationStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(handle[0]), Size: 8, Mode: 0600, Nlink: 1, DeviceMinor: 1}, nil
+}
+func (s *coherenceRecallMutationStore) SetAttr(_ xfsstore.Capability, handle xfsstore.Capability, spec xfsstore.SetAttrSpec) (xfsstore.Attr, error) {
+	s.applied.Add(1)
+	attr, _ := s.GetattrOpen(handle)
+	attr.Size = *spec.Size
+	return attr, nil
+}
+func (s *coherenceRecallMutationStore) Fallocate(handle xfsstore.Capability, _ xfsstore.FallocateSpec) (xfsstore.Attr, error) {
+	s.applied.Add(1)
+	return s.GetattrOpen(handle)
+}
+func (s *coherenceRecallMutationStore) CopyFileRange(_, output xfsstore.Capability, _ xfsstore.CopyFileRangeSpec) (uint64, xfsstore.Attr, error) {
+	s.applied.Add(1)
+	attr, _ := s.GetattrOpen(output)
+	return 1, attr, nil
+}
+func (*coherenceRecallMutationStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestCoherenceMutationsRecallPeerDelegationBeforeStorage(t *testing.T) {
+	for _, kind := range []string{"setattr-size", "fallocate", "copy-destination"} {
+		t.Run(kind, func(t *testing.T) {
+			store := &coherenceRecallMutationStore{}
+			h, authCtx, cred, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+			input, output := xfsstore.Capability{0x21}, xfsstore.Capability{0x31}
+			for _, handle := range []xfsstore.Capability{input, output} {
+				if err := h.trackOpen(cred.ID, handle, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := coherenceReadRequest(cred)
+			identity := [16]byte{input[0]}
+			switch kind {
+			case "setattr-size":
+				request.Body = &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Handle: input[:], Size: proto.Int64(1)}}
+			case "fallocate":
+				request.Body = &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Handle: input[:], Length: 1}}
+			case "copy-destination":
+				request.Body = &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{InputHandle: input[:], OutputHandle: output[:], Length: 1}}
+				identity = [16]byte{output[0]}
+			}
+			stampMutation(t, request, 0, 1)
+			holder, grant, cursor, sourceCursor := grantPeerDelegationForReadTest(t, h, cred, root, identity)
+			source, err := h.coherenceToken(cred.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(authCtx, 2*time.Second)
+			defer cancel()
+			response := make(chan *authoritypb.Response, 1)
+			go func() { response <- h.Handle(ctx, request) }()
+			events, err := h.Coherence.Poll(ctx, holder, cursor, nil, 16)
+			if err != nil || len(events) == 0 {
+				t.Fatalf("recall events=%v err=%v", events, err)
+			}
+			var recall volumeserver.StreamEvent
+			for _, event := range events {
+				if event.Kind == volumeserver.StreamRecall && event.Delegation.Identity == identity {
+					recall = event
+					break
+				}
+			}
+			if recall.Kind != volumeserver.StreamRecall {
+				t.Fatalf("expected recall of mutation destination %x: %v", identity, events)
+			}
+			if store.applied.Load() != 0 {
+				t.Fatal("mutation reached storage before recall ack")
+			}
+			select {
+			case reply := <-response:
+				t.Fatalf("mutation completed before recall ack: %v", reply)
+			default:
+			}
+			if err := h.Coherence.AckDelegation(holder, identity, grant.ID, grant.Generation, recall.Request, recall.AppliedSequence); err != nil {
+				t.Fatal(err)
+			}
+			cursor = events[len(events)-1].Position
+			if err := h.Coherence.Ack(holder, cursor); err != nil {
+				t.Fatal(err)
+			}
+			drainErrors := make(chan error, 2)
+			drain := func(token volumeserver.SubscriptionToken, after uint64) {
+				for {
+					events, err := h.Coherence.Poll(ctx, token, after, nil, 16)
+					if err != nil {
+						if ctx.Err() == nil {
+							drainErrors <- err
+						}
+						return
+					}
+					if len(events) == 0 {
+						continue
+					}
+					after = events[len(events)-1].Position
+					if err := h.Coherence.Ack(token, after); err != nil {
+						drainErrors <- err
+						return
+					}
+				}
+			}
+			go drain(holder, cursor)
+			go drain(source, sourceCursor)
+			select {
+			case reply := <-response:
+				if reply.GetErrno() != 0 || reply.GetUncertain() || store.applied.Load() != 1 {
+					t.Fatalf("mutation after recall=%v applies=%d", reply, store.applied.Load())
+				}
+			case err := <-drainErrors:
+				t.Fatal(err)
+			case <-ctx.Done():
+				t.Fatal("mutation did not finish after recall ack")
+			}
+		})
 	}
 }

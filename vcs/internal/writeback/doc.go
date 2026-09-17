@@ -38,11 +38,9 @@
 // Every record follows accepted -> applied -> visible -> durable (retired), or
 // any retained state -> lost on Drop. Flush acknowledgments supply nonzero,
 // nondecreasing per-identity Authority sequences. VisibleSequence advances the
-// optional intermediate state. DurableSequence proves visibility as well as
-// durability: integration must delay that notification until change delivery
-// or subscriber horizons establish visibility through the watermark. Early,
-// duplicate, and reordered cumulative notifications are safe, including ones
-// delivered from inside Flusher.Flush before its reply. For a chunked write,
+// peer-withdrawal state, while DurableSequence advances the independent storage
+// watermark. Either may arrive first; retirement requires both. Early,
+// duplicate, and reordered cumulative notifications are safe. For a chunked write,
 // all chunks must apply before the original acceptance becomes applied; the
 // last chunk's sequence covers the complete write.
 //
@@ -84,6 +82,10 @@
 // cap is full. Background transient errors retain the batch for the next timer
 // or explicit retry; explicit flushes return wrapped errors. A permanent
 // rejection (including stale generation) requires Drop; record its report.
+// If Drop rebinds an in-flight batch before its transport returns, FlushIdentity
+// returns the recorded loss (ErrLost, or a preserved capacity errno) even when
+// that transport also failed: retryable transport status cannot describe data
+// whose retained generation no longer exists.
 // Never synchronously reenter a flush for the same identity from Flush.
 //
 // Drop fences results of an in-flight flush, reports retained bytes by identity,
@@ -104,8 +106,10 @@
 // Read snapshots immutable dirty slices before fetching. Fetch must read from
 // the coherent Authority view of the same delegation. Integration retains its
 // per-identity read/publication drain and invalidates local cached read handles
-// after each accepted mutation. OverlayAttributes covers explicit metadata;
-// integration supplies implicit write timestamps and privilege-bit changes.
+// after each accepted mutation. OverlayAttributes folds explicit metadata and
+// implicit write/truncate timestamps in admission order. Implicit timestamps
+// stay local until the exact Authority post-attributes replace retired entries;
+// integration supplies privilege-bit changes.
 // Now timestamps resolve once using the client clock at acceptance. Append
 // placement, lock-owner checks, access checks, handles, write flags, and wire
 // encoding belong to integration; this package admits only positioned writes.

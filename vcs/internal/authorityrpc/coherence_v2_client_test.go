@@ -84,6 +84,12 @@ func (h *coherenceV2ClientHandler) Handle(ctx context.Context, request *authorit
 		response.Body = &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{
 			AppliedSequence: body.Barrier.GetCutSequence(), DurableSequence: body.Barrier.GetCutSequence(),
 		}}
+	case *authoritypb.Request_WaitVisibility:
+		response.VisibleSequence = body.WaitVisibility.GetCutSequence()
+		response.Body = &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{
+			AppliedSequence: body.WaitVisibility.GetCutSequence(),
+			VisibleSequence: body.WaitVisibility.GetCutSequence(),
+		}}
 	default:
 		return h.clientTestHandler.Handle(ctx, request)
 	}
@@ -136,14 +142,14 @@ func TestSubscriptionRenewalAndAckProgressWhileControlPollIsParked(t *testing.T)
 	client := dialCoherenceV2TestClient(t, handler)
 
 	if client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}) != &client.controlPoll ||
-		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}) != &client.controlAck ||
+		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}) != &client.changeAck ||
 		client.laneFor(&authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{RenewSubscription: &authoritypb.RenewSubscriptionRequest{}}}) != &client.liveness {
 		t.Fatal("protocol-7 poll, acknowledgment, and renewal did not receive independent admission lanes")
 	}
 
 	pollResult := make(chan error, 1)
 	go func() {
-		event, err := client.NextControlEvent(context.Background(), 7, 0)
+		event, err := client.NextControlEvent(context.Background(), 7, 0, 0)
 		if err == nil && (event.GetSequence() != 1 || event.GetChangeBatch() == nil) {
 			err = errors.New("control poll returned the wrong event")
 		}
@@ -217,6 +223,10 @@ func TestCoherenceV2ClientMethodsValidateAndCloneWireResults(t *testing.T) {
 	barrier, err := client.Barrier(context.Background(), 9)
 	if err != nil || barrier.GetAppliedSequence() != 9 || barrier.GetDurableSequence() != 9 {
 		t.Fatalf("Barrier = %+v, %v", barrier, err)
+	}
+	visibility, err := client.WaitVisibility(context.Background(), 9)
+	if err != nil || visibility.GetAppliedSequence() != 9 || visibility.GetVisibleSequence() != 9 {
+		t.Fatalf("WaitVisibility = %+v, %v", visibility, err)
 	}
 
 	if _, _, err := client.Subscribe(context.Background(), bytes.Repeat([]byte{1}, 16), nil); !errors.Is(err, syscall.EINVAL) {

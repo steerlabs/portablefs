@@ -146,11 +146,12 @@ extension PfsLocalMockDaemonTests {
         try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
     }
 
-    // Protocol 6 was the previous FSKit contract; it is refused, not translated.
-    contract = v3Contract()
-    contract.authorityProtocolMajor = 6
-    #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(6)) {
-        try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
+    for major in [UInt32(6), UInt32(8)] {
+        contract = v3Contract()
+        contract.authorityProtocolMajor = major
+        #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(major)) {
+            try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
+        }
     }
 
     contract = v3Contract(epoch: Data(repeating: 1, count: 15))

@@ -225,7 +225,7 @@ func (*CoherenceCoordinator) LookupDelegation([16]byte) (Delegation, bool)
 type DelegationReservation struct { /* private state */ }
 func (*DelegationReservation) Grant(context.Context) (Delegation, error)
 func (*DelegationReservation) Abort()
-func (*DelegationFlush) RetainDelegation() (Delegation, error)
+func (*DelegationFlush) RetainDelegation() (*DelegationReservation, Delegation, error)
 type DataGuard struct { AppliedSequence uint64 /* plus private state */ }
 func (*DataGuard) Release()
 type DelegationFlush struct { /* private state */ }

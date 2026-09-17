@@ -77,9 +77,14 @@ uses a private generation that ends with the storage operation if the client did
 not already hold a grant. Peers wait for that local apply rather than receiving a
 recall for an unreported delegation. The coordinator exposes
 `BeginSynchronousMutation` for this required handler case. Existing-name CREATE
-and truncating OPEN promote that private generation with `RetainDelegation` only
-after successful storage application; a failed open cannot leak an unreported
-grant. The ordinary nontruncating OPEN keeps its reservation until storage and
+and truncating OPEN preserve that private generation with `RetainDelegation`
+after successful storage application. It returns to reserved state while peer
+withdrawal completes, then activates immediately before the DATA reply. A peer
+read already waiting on the private generation retries reserved-read admission.
+Activating earlier deadlocks an overtaking break against the withheld OPEN reply.
+An already installed same-holder grant stays active and returns its application
+receipt before the detached visibility wait, like an exact-reference flush.
+A failed open cannot leak an unreported grant. The ordinary nontruncating OPEN keeps its reservation until storage and
 handle tracking succeed, then grants after releasing storage admission.
 
 Delegation cuts occur before acquiring storage dependencies. Multi-identity
@@ -100,7 +105,27 @@ range operations that shift the remaining file invalidate the whole identity.
 The handler releases storage stripes and the dependency turn before waiting on
 peer withdrawal. It uses `context.WithoutCancel` after commit so cancellation
 cannot erase the obligation. Namespace operations and synchronous data mutations
-return after WaitWithdrawn. A delegation-bearing flush returns its application
+return after a targeted withdrawal cut. Each subscription records directory,
+attribute and data facts admitted since its cold watermark. Read admissions occur
+before releasing their storage dependencies; source post-state admission and the
+exact-token target snapshot occur atomically with commit publication. Namespace
+changes target parent-directory readers, attribute changes target identity readers
+(including hard-link aliases), and data changes target identities that may retain
+pages after handle close. Unrelated subscribers still receive the broadcast but
+do not delay the syscall. Delegation grant/recall uses its existing global proof.
+
+Each footprint scope is bounded at 65,536 identities. Overflow targets every
+coordinate in that scope until a proven cold boundary; entries are never evicted
+as a performance shortcut. Footprints are conservative since-watermark sets,
+not cleared on individual ACKs. Cold subscription preserves data obligations for
+surviving cached handles. Activation metadata supplies identity only: the Linux
+root needs a fresh GETATTR before caching attributes under the subscription.
+
+A cold successor cannot inherit its predecessor's source exemption. If it wins
+before commit, the old mutation reply is refused as uncertain because storage
+may already have changed. If it wins after commit, the frontend's original
+publication stamp prevents the old reply from installing into the new cache.
+A delegation-bearing flush returns its application
 receipt first and performs the visibility wait separately; this response promises
 application, not completion of peer withdrawal. F2 must let the holder acknowledge
 a break/recall from that receipt without waiting for change withdrawal.
@@ -156,9 +181,10 @@ session state only after handle retirement and horizon expiry. Cache resubscribe
 does not reset application tickets or manufacture durability.
 
 Every FSKit mount retains the macOS compatibility-writer exclusion, including a
-read-only Mac mount. This conservatively includes independent-repair FSKit
-sessions used by the current files gateway; that gateway cannot coexist with a
-Linux writer until it adopts a subscription-capable profile. Activation recalls
+read-only Mac mount. The files gateway instead uses the authenticated cacheless
+reader profile: exactly read access, no subscription or cache-capable handles,
+and BreakForRead before consuming delegated data or attributes. It never joins
+Mac exclusion or requires acknowledgment to let a writer proceed. FSKit Activation recalls
 existing Linux delegations before enabling the exclusion. Exact-generation holder
 flushes bypass the activation admission gate so those recalls can drain;
 BeginFlush still validates them, and activation waits for all pins to retire
@@ -175,29 +201,50 @@ cache-handle accounting, reserve-before-binding publication, guarded reads and
 copy sources, volume durability holes, and lifecycle sweeping. Guard and OnCommit
 benchmarks report allocations as well as time.
 
-F2 has not landed in this worktree. Full kernel-FUSE and coherence-matrix results
-are not evidence supplied by F1; historical frontend lease calls now fail as
-required. No files in `fusev3`, `portablefsd`, or `mountv3` change here.
+F1 originally stopped at the handler boundary. Workstream G has since
+integrated F2, deleted the old Linux lease paths, and qualified real mounts.
+The current evidence and remaining product gates are in [integration.md](integration.md).
 
-The current xfsstore directory iterator uses ordinal cookies and a ctime verifier.
-The v7 handler restarts/rescans after a changed verifier rather than returning a
-normal-concurrency ESTALE. This does not prove stable XFS-offset enumeration under
-concurrent namespace mutation; that store/frontend work remains separate.
+Integration replaces ordinal cookies with XFS getdents offsets. The store ReadDirOpen API takes only a cookie and page bound; it returns the
+current page stamp for publication revalidation. Continuation seeks to the
+store cookie without accepting an unused input verifier. The frozen wire
+verifier remains optional and shape-checked; it does not authorize continuation.
+The handler holds the directory's store read turn across the initial page read,
+child resolution, and revalidation. If a newly discovered child expands the
+dependency set, it reacquires that complete set and rereads; no bounded retry
+may surface `EAGAIN`. The reply publishes the page stamp sampled by the
+storage-turn revalidation, not the earlier probe's stamp. The concurrent peer
+creator/deleter regression requires every unchanged entry exactly once and refuses
+ESTALE or EAGAIN. A page retries legitimate enumeration, child-resolution, and
+revalidation races until it succeeds or its request context ends; the fixed
+stabilization budget does not escape as a directory errno.
 
-Per-session application records and completed control replay records persist
-until permanent session retirement. Their memory cost grows with a long-lived
-session's issued tickets/events; this implementation does not claim a bounded
-retention policy. Detached visibility waits also remain outstanding until peer
-acknowledgment or horizon expiry. These costs need workload measurement alongside
-F2 before production qualification.
+Linux READDIRPLUS may supply up to 4,096 sorted unique 16-byte held identities
+for the exact cached page. The handler still resolves each child, acquires the
+complete page footprint, and returns its stable identity, attributes, object
+version, and snapshot sequence. It omits the Item only when the returned
+identity is in that set, and immediately forgets the provisional store
+capability instead of charging it to the session. Reclaim accepts the frozen
+singular form or an additive batch of at most 4,096 distinct capabilities;
+the batch is shape-checked and resolved against session accounting before any
+retirement.
 
-FSKit still retains its existing storage admission across PREPARE repair waits.
-F1 releases it after OnCommit and before COMPLETE or subscription withdrawal.
-Releasing and reacquiring only that turn would invert lock order with Linux
-mutations, which acquire storage admission before entering visibility, and can
-deadlock both operations. Changing the earlier FSKit phase therefore requires
-one coordinated repair/storage sequencer; this work does not claim to remove
-that inherited pre-apply constraint.
+Application-ticket history is retired through each session's durable prefix, retaining
+only monotonic counters and undurable volume versions. Active delegation cuts validate
+their exact ticket floor and newly issued tickets independently. CONTROL ACK replay is
+surrendered by the explicit completed-event prefix, not the delivery cursor; release
+replay uses serialized contiguous operation/result receipts and retains one result.
+Coordinator deadlines still govern unfinished cuts whose adapter replay was surrendered.
+Long-lived session tests cover 100,000 application tickets and 10,000 delegation/control
+cycles.
+
+Detached change-delivery waits still end at acknowledgment or horizon expiry.
+Their workload costs are included in [results.md](results.md).
+
+FSKit retains its existing PREPARE/COMPLETE repair and compatibility-writer
+exclusion. Linux mutations now use only the protocol-7 storage turn; the
+ExecuteFromExternalSource bridge into the Mac coordinator is deleted. The
+pre-apply FSKit repair constraint remains a separate platform boundary.
 
 ## Test record
 

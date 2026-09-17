@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 	"golang.org/x/sys/unix"
 )
 
@@ -36,8 +38,8 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 	}
 	defer finish()
 	identity := handleRecord.inode.identity[:]
-	if handle.observeLoss() {
-		return 0, fuse.EIO
+	if errno := handle.observeLoss(); errno != 0 {
+		return 0, fuse.Status(errno)
 	}
 	if err := handle.node.ensureWriteDelegation(ctx, handle); err != nil {
 		return 0, fuse.Status(delegationErrno(err))
@@ -52,18 +54,38 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 		if callback == nil || r.mount.raw == nil {
 			return 0, fuse.EIO
 		}
-		lease, err := callback.acquireSource(ctx, r.mount.raw, gate)
+		var lease *sourcePublicationLease
+		ctx = context.WithValue(ctx, delegationPrepareContextKey{}, func() error {
+			var acquireErr error
+			lease, acquireErr = callback.acquireSource(ctx, r.mount.raw, gate)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			return lease.markAssigned()
+		})
+		for {
+			_, err = r.mount.delegations.WriteWithOptions(ctx, identity, int64(placement.position), data, syncWrite, writeback.WriteOptions{Flags: input.WriteFlags, LockOwner: input.LockOwner, KillPrivileges: input.WriteFlags&fuse.WRITE_KILL_SUIDGID != 0})
+			if !errors.Is(err, errDelegationNotOwned) {
+				break
+			}
+			if err = handle.node.ensureWriteDelegation(ctx, handle); err != nil {
+				break
+			}
+		}
 		if err != nil {
+			if lease != nil {
+				lease.resolveAllNoBinding()
+				_ = lease.markDefiniteNoChange()
+			}
 			return 0, fuse.Status(delegationErrno(err))
 		}
-		if err := lease.markAssigned(); err != nil {
-			lease.revoke()
+		if err := handleRecord.inode.acceptOwnWrite(ctx, int64(placement.position), int64(len(data))); err != nil {
+			_ = r.mount.delegations.DropIdentity(identity, "holder kernel range invalidation failed")
+			if completionErr := completeSourcePublication(ctx); completionErr != nil {
+				r.mount.revoke(completionErr)
+				return 0, fuse.Status(syscall.ENOTCONN)
+			}
 			return 0, fuse.EIO
-		}
-		if _, err := r.mount.delegations.Write(ctx, identity, int64(placement.position), data, syncWrite); err != nil {
-			lease.resolveAllNoBinding()
-			_ = lease.markDefiniteNoChange()
-			return 0, fuse.Status(delegationErrno(err))
 		}
 		if err := completeSourcePublication(ctx); err != nil {
 			_ = r.mount.delegations.DropIdentity(identity, "holder kernel range invalidation failed")
@@ -84,24 +106,15 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 			Delegation: ref,
 		}}}
 	}
-	var response *authoritypb.Response
-	var errno syscall.Errno
-	if r.mount.delegations.Owns(identity) {
-		response, err = r.mount.delegations.Synchronous(ctx, identity, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
-			candidate, callErrno := handle.node.mutateWithSource(ctx, request(ref), gate)
-			if callErrno != 0 {
-				return candidate, callErrno
-			}
-			return candidate, nil
-		})
-		if err != nil {
-			return 0, fuse.Status(delegationErrno(err))
+	response, err := handle.node.withWriteDelegation(ctx, handle, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+		candidate, callErrno := handle.node.mutateWithSource(ctx, request(ref), gate)
+		if callErrno != 0 {
+			return candidate, callErrno
 		}
-	} else {
-		response, errno = handle.node.mutateWithSource(ctx, request(nil), gate)
-	}
-	if errno != 0 {
-		return 0, fuse.Status(errno)
+		return candidate, nil
+	})
+	if err != nil {
+		return 0, fuse.Status(delegationErrno(err))
 	}
 	if response == nil || response.GetUncertain() || response.GetWrite() == nil {
 		r.mount.revoke(errors.New("fusev3: stock write returned no definite result"))

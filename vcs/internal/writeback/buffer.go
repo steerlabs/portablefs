@@ -5,16 +5,20 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"syscall"
 	"time"
 )
 
 type record struct {
+	inOverlay                  bool
 	next                       *record
 	seq, generation, applied   uint64
+	acceptedAt                 int64
 	kind                       Kind
 	off                        int64
 	data                       []byte
 	attrs                      Attributes
+	writeOptions               WriteOptions
 	state                      State
 	file                       *file
 	extents                    *extent
@@ -22,26 +26,39 @@ type record struct {
 	heapIndex                  int
 }
 type file struct {
-	batchStorage batch
-	entryStorage [1]Entry
-	id           Identity
-	generation   uint64
-	retiring     bool
-	head, tail   *record
-	extents      extentMap
-	size         int64
-	exact        bool
-	lastLoss     uint64
-	lost         bool
-	flushing     bool
-	pending      *batch
-	lastTruncate *record
-	accepted     *record
-	lastApplied  uint64
-	scheduled    bool
-	reschedule   bool
+	batchStorage    batch
+	entryStorage    [4]Entry
+	flushOffset     int
+	id              Identity
+	generation      uint64
+	retiring        bool
+	head, tail      *record
+	extents         extentMap
+	size            int64
+	exact           bool
+	lastLoss        uint64
+	lastErrno       syscall.Errno
+	lastGenericLoss uint64
+	lost            bool
+	flushing        bool
+	pending         *batch
+	lastTruncate    *record
+	accepted        *record
+	lastApplied     uint64
+	scheduled       bool
+	reschedule      bool
+}
+type barrierState struct {
+	cut     Cut
+	lost    bool
+	generic bool
+	errno   syscall.Errno
 }
 type Buffer struct {
+	batcher                                 BatchFlusher
+	batchWidth, batchPayload                int
+	maxFlushIdentities                      int
+	waitingAdmissions                       int
 	mu                                      sync.Mutex
 	files                                   map[Identity]*file
 	active                                  map[Identity]*file
@@ -54,6 +71,9 @@ type Buffer struct {
 	maxBytes                                int64
 	maxEntries                              int
 	sequence, loss, token, visible, durable uint64
+	lastErrno                               syscall.Errno
+	lastGenericLoss                         uint64
+	barriers                                map[*barrierState]struct{}
 	changed                                 chan struct{}
 	retiringAll, stopped                    bool
 	flusher                                 Flusher
@@ -65,7 +85,7 @@ type Buffer struct {
 }
 
 func New(flusher Flusher, opts Options) (*Buffer, error) {
-	if flusher == nil || opts.MaxBytes < 0 || opts.MaxEntries < 0 {
+	if flusher == nil || opts.MaxBytes < 0 || opts.MaxEntries < 0 || opts.MaxFlushIdentities < 0 {
 		return nil, ErrInvalid
 	}
 	if opts.MaxBytes == 0 {
@@ -77,9 +97,12 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 	if opts.FlushInterval == 0 {
 		opts.FlushInterval = time.Second
 	}
-	b := &Buffer{
+	if opts.MaxFlushIdentities == 0 {
+		opts.MaxFlushIdentities = 16
+	}
+	b := &Buffer{maxFlushIdentities: opts.MaxFlushIdentities,
 		loss:  opts.InitialLossSequence,
-		files: make(map[Identity]*file), active: make(map[Identity]*file),
+		files: make(map[Identity]*file), active: make(map[Identity]*file), barriers: make(map[*barrierState]struct{}),
 		appliedHeap: make(recordHeap, 0, opts.MaxEntries),
 		visibleHeap: make(recordHeap, 0, opts.MaxEntries),
 		records:     make([]record, opts.MaxEntries),
@@ -87,6 +110,15 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 		maxBytes:    opts.MaxBytes, maxEntries: opts.MaxEntries,
 		flusher: flusher, interval: opts.FlushInterval,
 		kick: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+	if batcher, ok := flusher.(BatchFlusher); ok {
+		width, payload := batcher.FlushBatchSize()
+		if width < 0 || width > 4 || width > 0 && (payload <= 0 || payload > MaxPayload) {
+			return nil, ErrInvalid
+		}
+		if width > 0 {
+			b.batcher, b.batchWidth, b.batchPayload = batcher, width, payload
+		}
 	}
 	for i := range b.records {
 		b.records[i].next = b.free
@@ -132,24 +164,31 @@ func (b *Buffer) trigger() {
 }
 
 func (b *Buffer) Write(ctx context.Context, id Identity, off int64, data []byte) (Cut, error) {
+	return b.WriteWithOptions(ctx, id, off, data, WriteOptions{})
+}
+func (b *Buffer) WriteWithOptions(ctx context.Context, id Identity, off int64, data []byte, opts WriteOptions) (Cut, error) {
 	if off < 0 || len(data) == 0 || int64(len(data)) > math.MaxInt64-off || int64(len(data)) > b.maxBytes {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, Write, off, data, Attributes{})
+	return b.admit(ctx, id, Write, off, data, Attributes{}, opts)
 }
 func (b *Buffer) Truncate(ctx context.Context, id Identity, size int64) (Cut, error) {
 	if size < 0 {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, Truncate, 0, nil, Attributes{Size: size, HasSize: true})
+	return b.admit(ctx, id, Truncate, 0, nil, Attributes{Size: size, HasSize: true}, WriteOptions{})
 }
 func (b *Buffer) SetAttr(ctx context.Context, id Identity, a Attributes) (Cut, error) {
-	if a.HasSize && a.Size < 0 || a.ATimeNow && a.HasATime || a.MTimeNow && a.HasMTime {
+	if a.HasCTime || a.HasSize && a.Size < 0 || a.ATimeNow && a.HasATime || a.MTimeNow && a.HasMTime {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, SetAttr, 0, nil, a)
+	return b.admit(ctx, id, SetAttr, 0, nil, a, WriteOptions{})
 }
-func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, data []byte, a Attributes) (Cut, error) {
+func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, data []byte, a Attributes, opts WriteOptions) (Cut, error) {
+	// The caller's payload becomes immutable before admission, but the copy is
+	// deliberately outside the global buffer mutex so a large write does not
+	// stall disjoint reads, acknowledgements, or capacity release.
+	copied := append([]byte(nil), data...)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for {
@@ -161,11 +200,8 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 		}
 		f := b.file(id)
 		if !b.retiringAll && !f.retiring && b.count < b.maxEntries && b.bytes < b.maxBytes && int64(len(data)) <= b.maxBytes-b.bytes {
-			// Copy is inside the admission fence: BeginRetire cannot miss a reserved
-			// operation, and cancellation never leaves an unreported accepted entry.
-			copied := append([]byte(nil), data...)
+			now := time.Now().UnixNano()
 			if a.ATimeNow || a.MTimeNow {
-				now := time.Now().UnixNano()
 				if a.ATimeNow {
 					a.ATimeNS = now
 					a.HasATime = true
@@ -180,7 +216,7 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 			r := b.free
 			b.free = r.next
 			b.sequence++
-			*r = record{file: f, seq: b.sequence, generation: f.generation, kind: kind, off: off, data: copied, attrs: a, state: Accepted}
+			*r = record{file: f, seq: b.sequence, generation: f.generation, kind: kind, off: off, data: copied, attrs: a, state: Accepted, acceptedAt: now, writeOptions: opts}
 			if f.tail == nil {
 				f.head = r
 			} else {
@@ -203,15 +239,18 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 			b.trigger()
 		}
 		ch := b.change()
+		b.waitingAdmissions++
 		b.mu.Unlock()
 		err := wait(ctx, ch)
 		b.mu.Lock()
+		b.waitingAdmissions--
 		if err != nil {
 			return Cut{}, err
 		}
 	}
 }
 func (b *Buffer) overlay(f *file, r *record) {
+	r.inOverlay = true
 	if r.kind == Write {
 		f.extents.set(r.off, r.off+int64(len(r.data)), r.data, r)
 	}
@@ -235,6 +274,36 @@ func (b *Buffer) sizeLocked(f *file) {
 	}
 }
 func (b *Buffer) Snapshot() Cut { b.mu.Lock(); defer b.mu.Unlock(); return Cut{b.sequence, b.loss} }
+
+// BeginBarrier captures a root completion cut. Callers hold their admission
+// fence only around this method, then pass the returned cut through flushing,
+// the remote barrier, and WaitBarrier. The registered state makes a later drop
+// fail this barrier only when the drop contains an operation in its prefix.
+func (b *Buffer) BeginBarrier(observedLoss uint64) BarrierCut {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cut := Cut{Sequence: b.sequence, LossSequence: b.loss}
+	state := &barrierState{cut: cut, lost: b.loss > observedLoss}
+	if state.lost {
+		if b.lastGenericLoss > observedLoss {
+			state.generic = true
+		} else {
+			state.errno = b.lastErrno
+		}
+	}
+	b.barriers[state] = struct{}{}
+	return BarrierCut{Cut: cut, state: state}
+}
+
+// EndBarrier releases a cut whose operation aborted before WaitBarrier.
+func (b *Buffer) EndBarrier(cut BarrierCut) {
+	if cut.state == nil {
+		return
+	}
+	b.mu.Lock()
+	delete(b.barriers, cut.state)
+	b.mu.Unlock()
+}
 func (b *Buffer) Size(id Identity, base int64) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -250,7 +319,7 @@ func (b *Buffer) Size(id Identity, base int64) int64 {
 func (b *Buffer) Stats() Stats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := Stats{Bytes: b.bytes, Entries: b.count, LossSequence: b.loss}
+	s := Stats{Bytes: b.bytes, Entries: b.count, LossSequence: b.loss, WaitingAdmissions: b.waitingAdmissions}
 	for _, f := range b.files {
 		for r := f.head; r != nil; r = r.next {
 			switch r.state {
@@ -295,14 +364,85 @@ func (b *Buffer) IdentityLoss(id Identity) uint64 {
 	}
 	return f.lastLoss
 }
-func (b *Buffer) Drop(id Identity, reason string) DropReport {
+
+func (b *Buffer) HasRetained(id Identity) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	f := b.files[id]
+	return f != nil && f.head != nil
+}
+
+// IdentityFailure returns the loss ticket and its errno as one observation.
+func (b *Buffer) IdentityFailure(id Identity, observed uint64) (uint64, syscall.Errno) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if f := b.files[id]; f != nil {
+		if f.lastGenericLoss > observed || f.lastLoss <= observed {
+			return f.lastLoss, 0
+		}
+		return f.lastLoss, f.lastErrno
+	}
+	return 0, 0
+}
+func (b *Buffer) ErrnoSince(observed uint64) syscall.Errno {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.loss > observed && b.lastGenericLoss <= observed {
+		return b.lastErrno
+	}
+	return 0
+}
+func (b *Buffer) Drop(id Identity, reason string) DropReport {
+	return b.DropWithErrno(id, reason, 0)
+}
+
+// DropWithErrno preserves a definite storage refusal for every open observer.
+func (b *Buffer) DropWithErrno(id Identity, reason string, errno syscall.Errno) DropReport {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dropLocked(id, reason, errno)
+}
+
+// DropAll reports exactly the identities that still retain non-durable records.
+func (b *Buffer) DropAll(reason string) []DropReport {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	reports := make([]DropReport, 0, len(b.active))
+	for id, f := range b.active {
+		if f.head != nil {
+			reports = append(reports, b.dropLocked(id, reason, 0))
+		}
+	}
+	return reports
+}
+
+func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) DropReport {
 	f := b.file(id)
+	for barrier := range b.barriers {
+		affected := false
+		for r := f.head; r != nil && r.seq <= barrier.cut.Sequence; r = r.next {
+			affected = true
+			break
+		}
+		if !affected {
+			continue
+		}
+		barrier.lost = true
+		if errno == 0 {
+			barrier.generic = true
+			barrier.errno = 0
+		} else if !barrier.generic {
+			barrier.errno = errno
+		}
+	}
 	b.loss++
 	f.lastLoss = b.loss
+	f.lastErrno, b.lastErrno = errno, errno
+	if errno == 0 {
+		f.lastGenericLoss, b.lastGenericLoss = b.loss, b.loss
+	}
 	f.lost = true
-	report := DropReport{Identity: id, Reason: reason, LossSequence: b.loss}
+	report := DropReport{Identity: id, Reason: reason, LossSequence: b.loss, Errno: errno}
 	f.extents.clear()
 	f.size = 0
 	f.exact = false
@@ -316,9 +456,10 @@ func (b *Buffer) Drop(id Identity, reason string) DropReport {
 	f.head = nil
 	f.tail = nil
 	f.pending = nil
+	f.flushOffset = 0
 	f.reschedule = false
 	f.batchStorage = batch{}
-	f.entryStorage[0] = Entry{}
+	clear(f.entryStorage[:])
 	f.accepted = nil
 	f.lastTruncate = nil
 	delete(b.active, id)
@@ -334,7 +475,7 @@ func (b *Buffer) release(r *record) {
 	}
 	f := r.file
 	f.extents.retire(r)
-	if r.attrs.HasSize {
+	if r.inOverlay && r.attrs.HasSize {
 		if r.prevTruncate != nil {
 			r.prevTruncate.nextTruncate = r.nextTruncate
 		}
@@ -350,20 +491,60 @@ func (b *Buffer) release(r *record) {
 	b.free = r
 }
 
-// Stop cancels background I/O and rejects further admission. It does not drop
-// retained entries. Drain via Barrier before Stop for a clean unmount.
-func (b *Buffer) Stop() {
+// FenceAdmissions wakes capacity waiters without joining a flush that may
+// itself need frontend admission locks. Retained records remain for Drop.
+func (b *Buffer) FenceAdmissions() {
 	b.mu.Lock()
 	b.stopped = true
 	b.signal()
 	b.mu.Unlock()
+}
+
+// Stop cancels background I/O and rejects further admission. It does not drop
+// retained entries. Drain via Barrier before Stop for a clean unmount.
+func (b *Buffer) Stop() {
+	b.FenceAdmissions()
 	b.cancel()
 	<-b.done
 }
+
+type backgroundFlush struct {
+	file *file
+	cut  Cut
+}
+
+// Background application uses a bounded pool so an unavailable identity does
+// not hold unrelated accepted data behind it. Explicit fsync, recall and close
+// flushes bypass the pool and can overtake locally queued jobs.
 func (b *Buffer) schedule() {
-	defer close(b.done)
-	var wg sync.WaitGroup
-	defer wg.Wait()
+	jobs := make(chan backgroundFlush, b.maxFlushIdentities)
+	var workers sync.WaitGroup
+	for range b.maxFlushIdentities {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for job := range jobs {
+				_, err := b.FlushIdentity(b.ctx, job.file.id, job.cut)
+				if err == nil {
+					if observer, ok := b.flusher.(FlushCycleObserver); ok {
+						observer.FlushCycleCompleted(b.ctx, job.file.id)
+					}
+				}
+				b.mu.Lock()
+				job.file.scheduled = false
+				if err == nil && job.file.reschedule && job.file.accepted != nil {
+					job.file.reschedule = false
+					b.trigger()
+				}
+				b.mu.Unlock()
+			}
+		}()
+	}
+	defer func() {
+		close(jobs)
+		workers.Wait()
+		close(b.done)
+	}()
 	var tick <-chan time.Time
 	if b.interval > 0 {
 		timer := time.NewTicker(b.interval)
@@ -379,6 +560,7 @@ func (b *Buffer) schedule() {
 		}
 		b.mu.Lock()
 		cut := Cut{b.sequence, b.loss}
+		var pending []backgroundFlush
 		for _, f := range b.active {
 			if f.scheduled || f.flushing {
 				f.reschedule = true
@@ -389,20 +571,16 @@ func (b *Buffer) schedule() {
 				continue
 			}
 			f.scheduled = true
-			wg.Add(1)
-			go func(f *file) {
-				defer wg.Done()
-				_, err := b.FlushIdentity(b.ctx, f.id, cut)
-				b.mu.Lock()
-				f.scheduled = false
-				if err == nil && f.reschedule && f.accepted != nil {
-					f.reschedule = false
-					b.trigger()
-				}
-				b.mu.Unlock()
-			}(f)
+			pending = append(pending, backgroundFlush{file: f, cut: cut})
 		}
 		b.mu.Unlock()
+		for _, job := range pending {
+			select {
+			case jobs <- job:
+			case <-b.ctx.Done():
+				return
+			}
+		}
 	}
 }
 
@@ -434,11 +612,12 @@ func (b *Buffer) Forget(id Identity) bool {
 // admission that finished copying before the fence. A nil identity fences the
 // whole mount, including identities first seen during retirement.
 type Retirement struct {
-	b       *Buffer
-	files   []*file
-	all     bool
-	cut     Cut
-	resumed bool
+	b        *Buffer
+	files    []*file
+	all      bool
+	cut      Cut
+	resumed  bool
+	detached bool
 }
 
 func (b *Buffer) BeginRetire(ctx context.Context, id *Identity) (*Retirement, error) {
@@ -507,4 +686,61 @@ func (r *Retirement) Resume() error {
 	r.resumed = true
 	b.signal()
 	return nil
+}
+
+func recordedLossError(errno syscall.Errno) error {
+	if errno != 0 {
+		return errno
+	}
+	return ErrLost
+}
+
+// DetachOverlay ends serving the retired ownership interval without discarding
+// its durability or loss obligation. A later owner starts with an Authority
+// base; the old records remain charged until their durable prefix arrives.
+func (r *Retirement) DetachOverlay() error {
+	b := r.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r.resumed {
+		return ErrInvalid
+	}
+	for _, f := range r.files {
+		if !f.retiring {
+			return ErrInvalid
+		}
+		if f.accepted != nil && f.accepted.seq <= r.cut.Sequence {
+			return ErrPending
+		}
+	}
+	for _, f := range r.files {
+		f.extents.clear()
+		for entry := f.head; entry != nil; entry = entry.next {
+			entry.inOverlay = false
+			entry.prevTruncate, entry.nextTruncate = nil, nil
+		}
+		f.lastTruncate = nil
+		f.size, f.exact = 0, false
+	}
+	r.detached = true
+	return nil
+}
+
+// Cancel reopens admission in the same ownership generation after an abandoned
+// retirement. Its caller must still own that generation at the Authority.
+func (r *Retirement) Cancel() {
+	b := r.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r.resumed || r.detached {
+		return
+	}
+	for _, f := range r.files {
+		f.retiring = false
+	}
+	if r.all {
+		b.retiringAll = false
+	}
+	r.resumed = true
+	b.signal()
 }

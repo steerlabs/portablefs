@@ -12,7 +12,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 )
 
-// Profile validates the retained CLI spelling for protocol 6's one exact
+// Profile validates the retained CLI spelling for protocol 7's one exact
 // frontend cache contract. The profile is no longer negotiated on the wire.
 func Profile(name string) (fusev3.CoherenceProfile, error) {
 	switch name {

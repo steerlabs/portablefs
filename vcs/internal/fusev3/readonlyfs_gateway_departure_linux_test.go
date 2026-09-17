@@ -21,10 +21,9 @@ import (
 // The gateway is a sidecar. In a deployment it restarts whenever its pod does,
 // which means both departures are ordinary events, not faults: a graceful stop
 // closes the session, and a SIGKILL just stops answering. Neither may cost the
-// mounts sharing the volume their writes. A departure that leaves the session in
-// the barrier audience does exactly that -- the next mutation waits the departed
-// session's whole repair budget for a phase nobody will acknowledge, and the
-// writer's own bounded-contact watchdog fires while it waits.
+// mounts sharing the volume their writes. The cacheless reader is never in a
+// subscription-withdrawal or compatibility-repair audience, even while its
+// authenticated session remains live after an abrupt departure.
 func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 	peer := fusev3.NewGatewayPeerFixture(t, 1)
 	const name = "served"
@@ -58,11 +57,9 @@ func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 		return gateway
 	}
 
-	// A cooperative departure costs a writer a round trip. The bound is far
-	// below the mount's own bounded-contact watchdog on purpose: a session that
-	// leaves without detaching costs a whole repair budget, so a bound anywhere
-	// near peer.RepairBudget() would pass while the detach quietly stopped
-	// happening.
+	// A gateway departure must not make a writer wait for a reader horizon.
+	// Keep the bound well below the fixture's repair budget to catch accidental
+	// compatibility-writer or subscription membership.
 	writeBound := 2 * time.Second
 	requireWrite := func(what string, content []byte) time.Duration {
 		t.Helper()
@@ -72,7 +69,7 @@ func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 		}
 		elapsed := time.Since(start)
 		if elapsed > writeBound {
-			t.Fatalf("%s took %s, past the %s a departed reader may cost a writer; the mount's own watchdog is %s (%s)",
+			t.Fatalf("%s took %s, past the %s a departed reader may cost a writer; the fixture repair budget is %s (%s)",
 				what, elapsed, writeBound, peer.RepairBudget(), peer.Diagnostics())
 		}
 		return elapsed
@@ -99,20 +96,17 @@ func TestFilesGatewayCloseDoesNotStallAMutatingMount(t *testing.T) {
 		t.Fatalf("the mount was revoked across a polite close: %v", cause)
 	}
 
-	// The sidecar's other departure -- being killed, which is what a pod restart
-	// actually does -- is deliberately not exercised here, because it is an open
-	// defect rather than a covered case. Measured with a proxy standing in for
-	// the process, severed and then refusing to accept again: the first peer
-	// write costs 20.02s and fails EIO, with the mount revoking itself and
-	// reporting an uncertain outcome, three runs out of three. Two budgets is
-	// where that comes from -- the phase deadline the dead session never
-	// acknowledges, plus a post-fence grace granted in full regardless of how
-	// long it had already been silent -- and the mount's own bounded-contact
-	// watchdog is one budget. Shortening the grace to what remains of the
-	// frontend's watchdog does fix it, and also breaks
-	// TestRepeatedOpenForReadRacingAPeerWriteKeepsBothMountsServing, so the fix
-	// needs to come with an explanation of that. Asserting the current cost here
-	// would cement it and asserting survival would be false.
+	// Abrupt process death cannot add a withdrawal obligation: this session
+	// never had cache permission or a compatibility-writer commitment.
+	proxy := newTransportProxy(t, peer.AuthorityAddress())
+	abrupt := dial("the gateway that disappears", proxy)
+	defer abrupt.Close()
+	requireGatewayContent(t, ctx, abrupt, servedKey, []byte("after polite close"), "before abrupt departure")
+	proxy.close()
+	requireWrite("write immediately after abrupt gateway death", []byte("after abrupt departure"))
+	if cause := peer.MountFatal(0); cause != nil {
+		t.Fatalf("gateway death revoked writer: %v", cause)
+	}
 
 	// The sidecar comes back. It caches nothing, so the guarantee is that a
 	// reattached session is a new participant reading current state, never one

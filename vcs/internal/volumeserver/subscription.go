@@ -80,9 +80,12 @@ const (
 // broadcast change. A private event becomes StreamAdvance in other outboxes.
 // Request identifies a break/recall independently of cumulative withdrawal ack.
 type StreamEvent struct {
-	Position                               uint64
-	Kind                                   StreamEventKind
-	Target                                 SessionID
+	Position uint64
+	Kind     StreamEventKind
+	Target   SessionID
+	Source   SessionID
+	// LocalOwner limits implicit delegation bookkeeping to one incarnation.
+	LocalOwner                             SubscriptionToken
 	Change                                 ChangeEntry
 	Delegation                             Delegation
 	Request, AppliedSequence, LossSequence uint64
@@ -101,22 +104,27 @@ type SubscriptionSnapshot struct {
 }
 
 type CoherenceConfig struct {
-	Clock CoherenceClock
+	PriorLinuxCaches bool
+	Clock            CoherenceClock
 	// MaxLogEntries bounds retention even if a live subscriber renews without
 	// acking. Overflow requires cold resubscription, but never shortens its old
 	// cache horizon: WaitWithdrawn still waits until that horizon or a cold reset.
 	MaxLogEntries int
+	// Per scope and subscription. Overflow conservatively targets every
+	// coordinate in that scope until the next proven cold subscription.
+	MaxCacheFootprint int
 }
 
 type changeSubscriber struct {
-	token               SubscriptionToken
-	acked, delivered    uint64
-	horizon             time.Time
-	fenced              bool
-	ackIndex, timeIndex int
-	loss                uint64
-	held                map[[16]byte]*delegationRecord
-	handles             map[[16]byte]uint64
+	directories, attributes, data cacheFootprint
+	token                         SubscriptionToken
+	acked, delivered              uint64
+	horizon                       time.Time
+	fenced                        bool
+	ackIndex, timeIndex           int
+	loss                          uint64
+	held                          map[[16]byte]*delegationRecord
+	handles                       map[[16]byte]uint64
 }
 
 // subscriberHeap is indexed, so renewal and ack cost O(log subscribers), with
@@ -172,8 +180,11 @@ func (h *subscriberHeap) Pop() any {
 // plus amortized reclamation of entries; lookup is O(1). Notification channels
 // are allocated only when somebody actually waits, never per appended entry.
 type CoherenceCoordinator struct {
+	delegationsByID                         map[uint64]*delegationRecord
+	maxCacheFootprint                       int
 	mu                                      sync.Mutex
 	clock                                   CoherenceClock
+	priorCacheUntil                         time.Time
 	subscribers                             map[SessionID]*changeSubscriber
 	acks, horizons                          subscriberHeap
 	log                                     []StreamEvent
@@ -190,13 +201,44 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 	if cfg.Clock == nil {
 		cfg.Clock = coherenceWallClock{}
 	}
+	if cfg.MaxCacheFootprint <= 0 {
+		cfg.MaxCacheFootprint = 65536
+	}
 	if cfg.MaxLogEntries <= 0 {
 		cfg.MaxLogEntries = 65536
 	}
-	return &CoherenceCoordinator{clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
-		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1,
-		requests: newMutationSequencer(), delegations: make(map[[16]byte]*delegationRecord), cacheHandles: make(map[[16]byte]*cacheHandleCounts)}
+	var priorCacheUntil time.Time
+	if cfg.PriorLinuxCaches {
+		priorCacheUntil = cfg.Clock.Now().Add(SubscriptionTTL)
+	}
+	return &CoherenceCoordinator{maxCacheFootprint: cfg.MaxCacheFootprint, priorCacheUntil: priorCacheUntil, clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
+		// The initial storage snapshot is version 1, matching the handler. A
+		// reservation can publish a cache withdrawal before the first commit.
+		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1, watermark: 1,
+		requests: newMutationSequencer(), delegationsByID: make(map[uint64]*delegationRecord), delegations: make(map[[16]byte]*delegationRecord), cacheHandles: make(map[[16]byte]*cacheHandleCounts)}
 }
+
+// WaitPriorCacheHorizon fences only prior Linux cache authority. Durable mount
+// records remain intact for topology/archive proof; unknown or Mac records are
+// separately subject to the compatibility coordinator's unbounded exclusion.
+func (c *CoherenceCoordinator) WaitPriorCacheHorizon(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("volumeserver: prior-cache wait needs a context")
+	}
+	remaining := c.priorCacheUntil.Sub(c.clock.Now())
+	if remaining <= 0 {
+		return ctx.Err()
+	}
+	timer := c.clock.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C():
+		return ctx.Err()
+	}
+}
+
 func (c *CoherenceCoordinator) signalLocked() {
 	if c.changed != nil {
 		close(c.changed)
@@ -217,6 +259,11 @@ func (c *CoherenceCoordinator) notificationLocked() <-chan struct{} {
 // pages does not change FOPEN_KEEP_CACHE on an existing open description. Their
 // counts remain conservative until close or permanent runtime session removal.
 func (c *CoherenceCoordinator) Subscribe(id SessionID) (SubscriptionSnapshot, error) {
+	return c.SubscribeWithCache(id, CacheAdmission{})
+}
+
+// SubscribeWithCache includes bootstrap facts in the same cut as registration.
+func (c *CoherenceCoordinator) SubscribeWithCache(id SessionID, initial CacheAdmission) (SubscriptionSnapshot, error) {
 	if id == (SessionID{}) {
 		return SubscriptionSnapshot{}, ErrSubscription
 	}
@@ -237,6 +284,10 @@ func (c *CoherenceCoordinator) Subscribe(id SessionID) (SubscriptionSnapshot, er
 	s := &changeSubscriber{token: SubscriptionToken{id, c.incarnation}, acked: c.position, delivered: c.position,
 		horizon: c.clock.Now().Add(SubscriptionTTL), ackIndex: -1, timeIndex: -1, loss: loss,
 		held: make(map[[16]byte]*delegationRecord), handles: handles}
+	s.admit(initial, c.maxCacheFootprint)
+	for identity := range handles {
+		s.data.add([][16]byte{identity}, c.maxCacheFootprint)
+	}
 	c.subscribers[id] = s
 	heap.Push(&c.acks, s)
 	heap.Push(&c.horizons, s)
@@ -295,6 +346,14 @@ func (c *CoherenceCoordinator) Renew(token SubscriptionToken) (time.Time, error)
 // Caller supplies immutable entries and monotonically published VolumeVersion;
 // disjoint operations may apply concurrently but must publish their cuts here.
 func (c *CoherenceCoordinator) OnCommit(entries []ChangeEntry) uint64 {
+	return c.OnCommitFrom(entries, SessionID{})
+}
+
+// OnCommitFrom excludes the initiating frontend from reverse notifications.
+// Its exact source publication gate repairs its local caches before replying;
+// notifying it while the syscall holds VFS locks can deadlock cumulative peer
+// acknowledgments against concurrent commits on another mount.
+func (c *CoherenceCoordinator) OnCommitFrom(entries []ChangeEntry, source SessionID) uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.expireLocked()
@@ -302,7 +361,7 @@ func (c *CoherenceCoordinator) OnCommit(entries []ChangeEntry) uint64 {
 		if entry.VolumeVersion > c.watermark {
 			c.watermark = entry.VolumeVersion
 		}
-		c.appendLocked(StreamEvent{Kind: StreamChange, Change: entry})
+		c.appendLocked(StreamEvent{Kind: StreamChange, Change: entry, Source: source})
 	}
 	return c.position
 }
@@ -342,33 +401,63 @@ func (c *CoherenceCoordinator) truncateLocked() {
 // an unacked cursor replays safely; Poll never waits for withdrawal acks, so a
 // recall behind a pending withdrawal can always reach the holder.
 func (c *CoherenceCoordinator) Poll(ctx context.Context, token SubscriptionToken, after uint64, dst []StreamEvent, limit int) ([]StreamEvent, error) {
+	events, _, err := c.poll(ctx, token, after, dst, limit, false)
+	return events, err
+}
+
+// PollControl silently retires source-only positions covered by the initiating
+// frontend's publication gate. A delivered or queued peer change still requires
+// its withdrawal receipt. The returned cursor must be saved even on cancellation.
+func (c *CoherenceCoordinator) PollControl(ctx context.Context, token SubscriptionToken, after uint64, dst []StreamEvent, limit int) ([]StreamEvent, uint64, error) {
+	return c.poll(ctx, token, after, dst, limit, true)
+}
+
+func (c *CoherenceCoordinator) poll(ctx context.Context, token SubscriptionToken, after uint64, dst []StreamEvent, limit int, implicitSource bool) ([]StreamEvent, uint64, error) {
 	if limit <= 0 {
-		return dst, ErrSubscriptionPosition
+		return dst, after, ErrSubscriptionPosition
 	}
 	for {
 		c.mu.Lock()
 		s, err := c.subscriberLocked(token)
 		if err != nil {
 			c.mu.Unlock()
-			return dst, err
+			return dst, after, err
 		}
 		if s.acked+1 < c.first {
 			s.fenced = true
 			c.mu.Unlock()
-			return dst, ErrSessionFenced
+			return dst, after, ErrSessionFenced
 		}
 		if after < s.acked || after > s.delivered {
 			c.mu.Unlock()
-			return dst, ErrSubscriptionPosition
+			return dst, after, ErrSubscriptionPosition
 		}
 		if after < c.position {
 			end := c.position
 			if end-after > uint64(limit) {
 				end = after + uint64(limit)
 			}
+			ownOnly := implicitSource && after == s.acked && after == s.delivered
+			base := len(dst)
+			needed := len(dst) + int(end-after)
+			if cap(dst) < needed {
+				// Grow amortized, but never retain more than one requested batch
+				// beyond the caller's existing prefix.
+				capacity := min(max(needed, 2*cap(dst)), len(dst)+limit)
+				grown := make([]StreamEvent, len(dst), capacity)
+				copy(grown, dst)
+				dst = grown
+			}
 			for pos := after + 1; pos <= end; pos++ {
 				event := c.log[(pos-1)%uint64(len(c.log))]
-				if event.Target != (SessionID{}) && event.Target != token.Session {
+				local := event.Source == token.Session
+				if implicitSource && event.LocalOwner != (SubscriptionToken{}) {
+					local = event.LocalOwner == token
+				}
+				if event.Kind != StreamChange || !local {
+					ownOnly = false
+				}
+				if local || event.Target != (SessionID{}) && event.Target != token.Session {
 					event = StreamEvent{Position: pos, Kind: StreamAdvance}
 				}
 				dst = append(dst, event)
@@ -376,14 +465,25 @@ func (c *CoherenceCoordinator) Poll(ctx context.Context, token SubscriptionToken
 			if end > s.delivered {
 				s.delivered = end
 			}
+			after = end
+			if ownOnly {
+				clear(dst[base:])
+				dst = dst[:base]
+				s.acked = end
+				heap.Fix(&c.acks, s.ackIndex)
+				c.truncateLocked()
+				c.signalLocked()
+				c.mu.Unlock()
+				continue
+			}
 			c.mu.Unlock()
-			return dst, nil
+			return dst, after, nil
 		}
 		changed := c.notificationLocked()
 		deadline := s.horizon
 		c.mu.Unlock()
 		if err := c.wait(ctx, changed, deadline); err != nil {
-			return dst, err
+			return dst, after, err
 		}
 	}
 }
@@ -477,6 +577,7 @@ func (c *CoherenceCoordinator) expireLocked() {
 }
 func (c *CoherenceCoordinator) retireSubscriberLocked(s *changeSubscriber) {
 	s.fenced = true
+	s.directories, s.attributes, s.data = cacheFootprint{}, cacheFootprint{}, cacheFootprint{}
 	if s.timeIndex >= 0 {
 		heap.Remove(&c.horizons, s.timeIndex)
 	}

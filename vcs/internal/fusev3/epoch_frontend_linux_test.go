@@ -63,9 +63,15 @@ func TestEpochRecoveryStalesOldHandlesAndAdmitsNewOpens(t *testing.T) {
 	raw.nodesByKey[fileRecord.key] = fileRecord
 	raw.nodesByIdentity[fileRecord.identity] = fileRecord
 	raw.nextNodeID = 3
-	raw.handles[10] = &handleRecord{inode: fileRecord, file: oldFileHandle, done: make(chan struct{})}
-	raw.handles[11] = &handleRecord{inode: raw.nodesByID[fuse.FUSE_ROOT_ID], dir: oldDirHandle, done: make(chan struct{})}
+	raw.nextHandle = 10
+	rootRecord := raw.nodesByID[fuse.FUSE_ROOT_ID]
 	raw.mu.Unlock()
+	if id, ok := raw.addHandle(fileRecord, &handleRecord{file: oldFileHandle}); !ok || id != 10 {
+		t.Fatalf("register old cached file handle: %d %v", id, ok)
+	}
+	if id, ok := raw.addHandle(rootRecord, &handleRecord{dir: oldDirHandle}); !ok || id != 11 {
+		t.Fatalf("register old root directory handle: %d %v", id, ok)
+	}
 
 	if err := mount.delegations.Install(oldItem.GetStableIdentity(), oldItem.GetToken(), oldFileHandle.token, testDelegation()); err != nil {
 		t.Fatal(err)
@@ -77,6 +83,11 @@ func TestEpochRecoveryStalesOldHandlesAndAdmitsNewOpens(t *testing.T) {
 
 	if err := mount.recoverEpoch(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	// Production's subscription runner performs this cold boundary after
+	// recoverEpoch resumes it. This fixture drives that runner step directly.
+	if err := mount.subscription.subscribe(context.Background()); err != nil {
+		t.Fatalf("cold-subscribe replacement epoch: %v", err)
 	}
 	if got := mount.delegations.LossSequence(); got <= lossBefore {
 		t.Fatalf("loss sequence after dirty epoch change = %d, want greater than %d", got, lossBefore)

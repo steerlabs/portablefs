@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,17 +16,41 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-type coherenceValidatorFunc func(volumeserver.SessionID, [16]byte, uint64) bool
-
-func (f coherenceValidatorFunc) ValidateCoherenceApplication(session volumeserver.SessionID, identity [16]byte, sequence uint64) bool {
-	return f(session, identity, sequence)
+func TestCoherenceChangesSkipInternalEventsWithoutCursorHoles(t *testing.T) {
+	for _, internal := range []volumeserver.StreamEventKind{volumeserver.StreamAdvance, volumeserver.StreamLoss} {
+		for _, trailing := range []bool{false, true} {
+			handler, _ := newCoherenceControlTestHandler(t, 1<<20)
+			change := func(position uint64) volumeserver.StreamEvent {
+				return volumeserver.StreamEvent{Position: position, Kind: volumeserver.StreamChange,
+					Change: volumeserver.ChangeEntry{VolumeVersion: 1, Kind: volumeserver.AttributesChanged, Identity: [16]byte{1}}}
+			}
+			session := &coherenceControlSession{token: volumeserver.SubscriptionToken{Session: volumeserver.SessionID{1}, Incarnation: 1},
+				queued: []volumeserver.StreamEvent{change(1), {Position: 2, Kind: internal}, {Position: 3, Kind: internal}}}
+			want := 1
+			if !trailing {
+				session.queued = append(session.queued, change(4))
+				want++
+			}
+			event, ok, err := handler.nextCoherenceControlEventLocked(session)
+			if err != nil || !ok || len(event.GetChangeBatch().GetEntries()) != want {
+				t.Fatalf("internal=%d trailing=%t: event=%v ok=%t err=%v", internal, trailing, event, ok, err)
+			}
+			for index, entry := range event.GetChangeBatch().GetEntries() {
+				if entry.GetPosition() != uint64(index+1) {
+					t.Fatalf("change position %d = %d", index, entry.GetPosition())
+				}
+			}
+			if len(session.queued) != 0 || session.changeDelivered != uint64(want) {
+				t.Fatalf("queue/cursor = %v/%d", session.queued, session.changeDelivered)
+			}
+		}
+	}
 }
 
 func newCoherenceControlTestHandler(t *testing.T, maxFrame uint32) (*VolumeHandler, *volumeserver.CoherenceCoordinator) {
 	t.Helper()
 	coordinator := volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{MaxLogEntries: 256})
 	handler := &VolumeHandler{Coherence: coordinator, MaxFrame: maxFrame}
-	handler.CoherenceApplications = coherenceValidatorFunc(func(volumeserver.SessionID, [16]byte, uint64) bool { return true })
 	state := handler.initCoherenceControlState()
 	state.random = bytes.NewReader(bytes.Repeat([]byte{0x7a}, 1024))
 	return handler, coordinator
@@ -185,21 +210,25 @@ func TestCoherenceChangeBatchesRespectReplyFrameLimit(t *testing.T) {
 			ParentIdentity: [16]byte{1}, Name: string(bytes.Repeat([]byte{byte('a' + i)}, 64)),
 		}
 	}
-	coordinator.OnCommit(changes)
-
 	after := uint64(0)
-	positions := make([]uint64, 0, len(changes))
-	for len(positions) < len(changes) {
-		response := pollCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), after)
-		if response.GetErrno() != 0 || response.GetControlEvent().GetChangeBatch() == nil {
-			t.Fatalf("bounded poll = %+v", response)
+	positions := make([]uint64, 0, 2*len(changes))
+	for round := 0; round < 2; round++ {
+		coordinator.OnCommit(changes)
+		for len(positions) < (round+1)*len(changes) {
+			response := pollCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), after)
+			if response.GetErrno() != 0 || response.GetControlEvent().GetChangeBatch() == nil {
+				t.Fatalf("bounded poll = %+v", response)
+			}
+			if proto.Size(response.GetControlEvent()) > handler.coherenceReplyLimit() {
+				t.Fatalf("control event size = %d, limit = %d", proto.Size(response.GetControlEvent()), handler.coherenceReplyLimit())
+			}
+			after = response.GetControlEvent().GetSequence()
+			for _, entry := range response.GetControlEvent().GetChangeBatch().GetEntries() {
+				positions = append(positions, entry.GetPosition())
+			}
 		}
-		if proto.Size(response.GetControlEvent()) > handler.coherenceReplyLimit() {
-			t.Fatalf("control event size = %d, limit = %d", proto.Size(response.GetControlEvent()), handler.coherenceReplyLimit())
-		}
-		after = response.GetControlEvent().GetSequence()
-		for _, entry := range response.GetControlEvent().GetChangeBatch().GetEntries() {
-			positions = append(positions, entry.GetPosition())
+		if ack := ackChangeCoherenceControlTest(t, handler, id, subscribe.Incarnation, uint64(len(positions))); ack.Errno != 0 {
+			t.Fatal(ack)
 		}
 	}
 	for i, position := range positions {
@@ -321,16 +350,14 @@ func TestCoherenceDelegationBreakRecallAcksValidateTicketIdentityAndReplay(t *te
 		t.Fatal(err)
 	}
 	flush.End(3)
-	handler.CoherenceApplications = coherenceValidatorFunc(func(gotSession volumeserver.SessionID, gotIdentity [16]byte, sequence uint64) bool {
-		return gotSession == id && gotIdentity == identity && (sequence == 0 || sequence == 3)
-	})
 
-	// The holder first receives the reservation's broadcast change.
+	// A peer change precedes the private break and requires an explicit receipt.
+	publishPeerControlChange(coordinator)
 	change := pollCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), 0).GetControlEvent()
 	if change.GetChangeBatch() == nil {
 		t.Fatalf("first event = %+v, want change batch", change)
 	}
-	if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), 1); response.GetErrno() != 0 {
+	if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.GetIncarnation(), change.GetChangeBatch().Entries[0].Position); response.GetErrno() != 0 {
 		t.Fatal(response)
 	}
 
@@ -413,6 +440,7 @@ func TestCoherenceDelegationModeAckControlsTransition(t *testing.T) {
 	if err := handler.rememberCoherenceDelegation(grant); err != nil {
 		t.Fatal(err)
 	}
+	publishPeerControlChange(coordinator)
 	grantEvent := pollCoherenceControlTest(t, handler, holder, holderSubscribe.GetIncarnation(), 0).GetControlEvent()
 	if grantEvent.GetChangeBatch() == nil {
 		t.Fatalf("grant event = %+v", grantEvent)
@@ -470,7 +498,7 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 	}
 	flush.End(5)
 	request := &authoritypb.Request{RequestId: 12, Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{
-		Incarnation: subscribe.GetIncarnation(), Delegations: releases,
+		Incarnation: subscribe.GetIncarnation(), Delegations: releases, ReleaseSequence: 1,
 	}}}
 	for _, stale := range []uint64{0, 3} {
 		request.GetDelegationRelease().Delegations[0].AppliedSequence = stale
@@ -483,6 +511,8 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 				t.Fatal("stale applied ticket partially released batch")
 			}
 		}
+		request.GetDelegationRelease().CompletedReleaseThrough = request.GetDelegationRelease().ReleaseSequence
+		request.GetDelegationRelease().ReleaseSequence++
 	}
 	request.GetDelegationRelease().Delegations[0].AppliedSequence = 5
 	for attempt := 0; attempt < 2; attempt++ {
@@ -504,6 +534,8 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 	}
 	stale := proto.Clone(request).(*authoritypb.Request)
 	stale.GetDelegationRelease().Delegations[0].Delegation.Generation++
+	stale.GetDelegationRelease().CompletedReleaseThrough = stale.GetDelegationRelease().ReleaseSequence
+	stale.GetDelegationRelease().ReleaseSequence++
 	response, _ = handler.handleCoherenceControl(t.Context(), stale, volumeserver.SessionCredential{ID: id})
 	if response.GetErrno() != errnos.EIO || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 		t.Fatalf("stale generation response = %+v", response)
@@ -537,5 +569,524 @@ func TestCoherenceDelegationIDEncodingRejectsForeignDomain(t *testing.T) {
 	raw[0] ^= 0xff
 	if _, err := parseCoherenceDelegationID(raw); err == nil {
 		t.Fatal("foreign delegation domain was accepted")
+	}
+}
+
+func TestCoherenceReleaseCompletesRacingBreak(t *testing.T) {
+	for _, delivered := range []bool{false, true} {
+		t.Run(fmt.Sprintf("delivered=%v", delivered), func(t *testing.T) {
+			handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+			id := volumeserver.SessionID{1}
+			subscribe, token := subscribeCoherenceControlTest(t, handler, id)
+			identity := [16]byte{93}
+			reservation, err := coordinator.ReserveNew(token, identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grant, err := reservation.Grant(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := handler.rememberCoherenceDelegation(grant); err != nil {
+				t.Fatal(err)
+			}
+			publishPeerControlChange(coordinator)
+			change := pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, 0).GetControlEvent()
+			if response := ackChangeCoherenceControlTest(t, handler, id, subscribe.Incarnation, change.GetChangeBatch().Entries[0].Position); response.Errno != 0 {
+				t.Fatal(response)
+			}
+			done := make(chan error, 1)
+			go func() { done <- coordinator.BreakForRead(t.Context(), identity) }()
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			state := handler.initCoherenceControlState()
+			state.mu.Lock()
+			cursor := state.sessions[id].coordinatorCursor
+			state.mu.Unlock()
+			for found := false; !found; {
+				events, err := coordinator.Poll(ctx, token, cursor, nil, 128)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, event := range events {
+					cursor = event.Position
+					if event.Kind == volumeserver.StreamBreakForRead {
+						found = true
+					}
+				}
+			}
+			var event *authoritypb.ControlEvent
+			if delivered {
+				event = pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, change.Sequence).GetControlEvent()
+				if event.GetDelegationBreak() == nil {
+					t.Fatal(event)
+				}
+			}
+			request := &authoritypb.DelegationReleaseRequest{Incarnation: subscribe.Incarnation, ReleaseSequence: 1, Delegations: []*authoritypb.DelegationRelease{{Delegation: coherenceDelegationRefProto(grant)}}}
+			for attempt := 0; attempt < 2; attempt++ {
+				if response := handler.handleCoherenceDelegationRelease(20, id, request); response.Errno != 0 {
+					t.Fatal(response)
+				}
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal("release did not complete peer break")
+			}
+			if delivered {
+				response := handler.handleCoherenceDelegationAck(21, id, coherenceControlBreak, subscribe.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0)
+				if response.Errno != 0 {
+					t.Fatal(response)
+				}
+			} else {
+				publishPeerControlChange(coordinator)
+				response := pollCoherenceControlTest(t, handler, id, subscribe.Incarnation, change.Sequence)
+				if response.Errno != 0 || response.GetControlEvent().GetChangeBatch() == nil {
+					t.Fatalf("released reference emitted control obligation: %v", response)
+				}
+			}
+			if coordinator.LossSequence(id) != 0 {
+				t.Fatal("release recorded loss")
+			}
+		})
+	}
+}
+
+func TestCoherenceSourceOnlyCommitsRetireInternalPositions(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribe, token := subscribeCoherenceControlTest(t, handler, id)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	done := make(chan *authoritypb.Response, 1)
+	go func() {
+		done <- handler.handleCoherencePoll(ctx, 1, id, &authoritypb.NextControlEventRequest{Incarnation: subscribe.Incarnation})
+	}()
+	for sequence := uint64(2); sequence < 1026; sequence++ {
+		position := coordinator.OnCommitFrom([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{2}, VolumeVersion: sequence}}, id)
+		if err := coordinator.WaitWithdrawn(ctx, position, volumeserver.SessionID{}); err != nil {
+			t.Fatalf("source-only position did not retire internally: %v", err)
+		}
+		select {
+		case response := <-done:
+			t.Fatalf("source-only poll ended: %v", response)
+		default:
+		}
+
+	}
+	if err := coordinator.CheckSession(token); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	<-done
+	state := handler.initCoherenceControlState()
+	state.mu.Lock()
+	cursor := state.sessions[id].coordinatorCursor
+	state.mu.Unlock()
+	if cursor < 1024 {
+		t.Fatalf("cancelled poll lost implicit cursor: %d", cursor)
+	}
+	// A replacement long poll resumes from the internally acknowledged cursor.
+	retry, stop := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer stop()
+	response := handler.handleCoherencePoll(retry, 2, id, &authoritypb.NextControlEventRequest{Incarnation: subscribe.Incarnation})
+	if response.GetErrno() == int32(errnos.EINVAL) {
+		t.Fatalf("retry rejected retained cursor: %v", response)
+	}
+}
+
+func TestCoherenceLongLivedControlReplayRetiresOnlyExplicitReceipts(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, token := subscribeCoherenceControlTest(t, handler, id)
+	var cursor, completed uint64
+	poll := func() *authoritypb.ControlEvent {
+		t.Helper()
+		response := handler.handleCoherencePoll(t.Context(), 1, id, &authoritypb.NextControlEventRequest{Incarnation: subscribed.Incarnation, AfterSequence: cursor, CompletedEventThrough: completed})
+		if response.Errno != 0 {
+			t.Fatal(response)
+		}
+		event := response.GetControlEvent()
+		cursor = event.Sequence
+		return event
+	}
+	ackChange := func(event *authoritypb.ControlEvent) {
+		t.Helper()
+		entries := event.GetChangeBatch().GetEntries()
+		if len(entries) == 0 {
+			t.Fatal(event)
+		}
+		if response := ackChangeCoherenceControlTest(t, handler, id, subscribed.Incarnation, entries[len(entries)-1].Position); response.Errno != 0 {
+			t.Fatal(response)
+		}
+		completed = event.Sequence
+	}
+	for sequence := uint64(1); sequence <= 10000; sequence++ {
+		if sequence%1000 == 0 {
+			if _, err := coordinator.Renew(token); err != nil {
+				t.Fatal(err)
+			}
+		}
+		reservation, err := coordinator.ReserveNew(token, [16]byte{1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		grant, err := reservation.Grant(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := handler.rememberCoherenceDelegation(grant); err != nil {
+			t.Fatal(err)
+		}
+		publishPeerControlChange(coordinator)
+		ackChange(poll())
+		done := make(chan error, 1)
+		go func() { done <- coordinator.BreakForRead(t.Context(), grant.Identity) }()
+		event := poll()
+		for range 2 {
+			response := handler.handleCoherenceDelegationAck(2, id, coherenceControlBreak, subscribed.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0)
+			if response.Errno != 0 {
+				t.Fatal(response)
+			}
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		release := &authoritypb.DelegationReleaseRequest{Incarnation: subscribed.Incarnation, ReleaseSequence: sequence, CompletedReleaseThrough: sequence - 1, Delegations: []*authoritypb.DelegationRelease{{Delegation: coherenceDelegationRefProto(grant)}}}
+		if sequence == 1 {
+			gap := proto.Clone(release).(*authoritypb.DelegationReleaseRequest)
+			gap.ReleaseSequence = 2
+			if response := handler.handleCoherenceDelegationRelease(3, id, gap); response.Errno == 0 {
+				t.Fatal("release sequence gap accepted")
+			}
+		}
+		for range 2 {
+			if response := handler.handleCoherenceDelegationRelease(3, id, release); response.Errno != 0 {
+				t.Fatal(response)
+			}
+		}
+		// Delivery can overtake an ACK retry; it must not discard that result.
+		publishPeerControlChange(coordinator)
+		released := poll()
+		if response := handler.handleCoherenceDelegationAck(4, id, coherenceControlBreak, subscribed.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0); response.Errno != 0 {
+			t.Fatal("poll delivery retired ACK replay", response)
+		}
+		ackChange(released)
+		state := handler.initCoherenceControlState().sessions[id]
+		if len(state.obligations) > 1 || len(state.delegations) != 0 || state.releaseReplay == nil || state.releaseReplay.sequence != sequence {
+			t.Fatalf("retained history: obligations=%d grants=%d replay=%v", len(state.obligations), len(state.delegations), state.releaseReplay)
+		}
+	}
+}
+
+func TestCoherenceCompletedEventReceiptCannotAcknowledgeFailedHandler(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, token := subscribeCoherenceControlTest(t, handler, id)
+	reservation, err := coordinator.ReserveNew(token, [16]byte{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	publishPeerControlChange(coordinator)
+	initial := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, 0).GetControlEvent()
+	entries := initial.GetChangeBatch().GetEntries()
+	if response := ackChangeCoherenceControlTest(t, handler, id, subscribed.Incarnation, entries[len(entries)-1].Position); response.Errno != 0 {
+		t.Fatal(response)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- coordinator.BreakForRead(ctx, grant.Identity) }()
+	event := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, initial.Sequence).GetControlEvent()
+	if event.GetDelegationBreak() == nil {
+		t.Fatal(event)
+	}
+	coordinator.OnCommit([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{2}, VolumeVersion: 1}})
+	response := handler.handleCoherencePoll(ctx, 4, id, &authoritypb.NextControlEventRequest{Incarnation: subscribed.Incarnation, AfterSequence: event.Sequence, CompletedEventThrough: event.Sequence})
+	if response.Errno != 0 {
+		t.Fatal(response)
+	}
+	if len(handler.initCoherenceControlState().sessions[id].obligations) != 0 {
+		t.Fatal("surrendered replay retained")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("receipt completed unacknowledged cut: %v", err)
+	default:
+	}
+	if response := handler.handleCoherenceDelegationAck(5, id, coherenceControlBreak, subscribed.Incarnation, event.Sequence, coherenceDelegationRefProto(grant), 0); response.Errno == 0 {
+		t.Fatal("surrendered ACK replay accepted")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if coordinator.LossSequence(id) == 0 {
+		t.Fatal("failed handler did not advance loss at recall deadline")
+	}
+	if _, live := coordinator.LookupDelegation(grant.Identity); live {
+		t.Fatal("failed handler retained grant")
+	}
+}
+
+func TestCoherencePollReusesBoundedStorageWithoutAliasingReplies(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, _ := subscribeCoherenceControlTest(t, handler, id)
+	var first *authoritypb.ControlEvent
+	var saved *authoritypb.ControlEvent
+	var backing *volumeserver.StreamEvent
+	var after uint64
+	for round := 0; round < 3; round++ {
+		changes := make([]volumeserver.ChangeEntry, 64)
+		for i := range changes {
+			changes[i] = volumeserver.ChangeEntry{VolumeVersion: uint64(round + 1), Kind: volumeserver.NamespaceChanged, ParentIdentity: [16]byte{1}, Name: fmt.Sprintf("round-%d-name-%d", round, i)}
+		}
+		coordinator.OnCommit(changes)
+		response := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, after)
+		event := response.GetControlEvent()
+		if response.Errno != 0 || len(event.GetChangeBatch().GetEntries()) != len(changes) {
+			t.Fatalf("round %d: %v", round, response)
+		}
+		for i, entry := range event.GetChangeBatch().GetEntries() {
+			if string(entry.Name) != changes[i].Name || entry.Position != uint64(round*64+i+1) {
+				t.Fatalf("round %d entry %d: %v", round, i, entry)
+			}
+		}
+		state := handler.initCoherenceControlState()
+		state.mu.Lock()
+		buffer := state.sessions[id].pollBuffer
+		if len(buffer) != 64 || cap(buffer) > coherenceControlBatchLimit {
+			t.Errorf("buffer len=%d cap=%d", len(buffer), cap(buffer))
+		}
+		if round == 0 {
+			backing = &buffer[0]
+		} else if backing != &buffer[0] {
+			t.Error("poll failed to reuse its bounded buffer")
+		}
+		state.mu.Unlock()
+		if round == 0 {
+			first = event
+			saved = proto.Clone(event).(*authoritypb.ControlEvent)
+		} else if !proto.Equal(first, saved) {
+			t.Fatal("buffer reuse changed an earlier wire response")
+		}
+		replay := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, after)
+		if !proto.Equal(event, replay.GetControlEvent()) {
+			t.Fatal("buffer reuse changed current replay")
+		}
+		after = event.Sequence
+		if ack := ackChangeCoherenceControlTest(t, handler, id, subscribed.Incarnation, uint64((round+1)*64)); ack.Errno != 0 {
+			t.Fatal(ack)
+		}
+	}
+}
+
+func TestCoherencePollDoesNotClearAliasedFrameLeftover(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, token := subscribeCoherenceControlTest(t, handler, id)
+	identity := [16]byte{0x71}
+	reservation, err := coordinator.ReserveNew(token, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.rememberCoherenceDelegation(grant); err != nil {
+		t.Fatal(err)
+	}
+	publishPeerControlChange(coordinator)
+	breakDone := make(chan error, 1)
+	go func() { breakDone <- coordinator.BreakForRead(t.Context(), identity) }()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	for found := false; !found; {
+		events, pollErr := coordinator.Poll(ctx, token, 0, nil, 16)
+		if pollErr != nil {
+			t.Fatal(pollErr)
+		}
+		for _, event := range events {
+			found = found || event.Kind == volumeserver.StreamBreakForRead
+		}
+	}
+
+	first := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, 0).GetControlEvent()
+	if first.GetChangeBatch() == nil {
+		t.Fatalf("first event = %+v, want change batch", first)
+	}
+	state := handler.initCoherenceControlState()
+	state.mu.Lock()
+	session := state.sessions[id]
+	aliased := false
+	if len(session.queued) == 1 {
+		for i := range session.pollBuffer {
+			aliased = aliased || &session.queued[0] == &session.pollBuffer[i]
+		}
+	}
+	if !aliased || session.queued[0].Kind != volumeserver.StreamBreakForRead {
+		state.mu.Unlock()
+		t.Fatalf("split queue does not alias retained poll buffer: queued=%+v buffer=%+v", session.queued, session.pollBuffer)
+	}
+	state.mu.Unlock()
+
+	second := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, first.Sequence).GetControlEvent()
+	if second.GetDelegationBreak() == nil || second.GetSequence() != first.GetSequence()+1 {
+		t.Fatalf("aliased leftover = %+v, want contiguous break", second)
+	}
+	response := handler.handleCoherenceDelegationAck(99, id, coherenceControlBreak, subscribed.Incarnation, second.Sequence, coherenceDelegationRefProto(grant), 0)
+	if response.GetErrno() != 0 {
+		t.Fatal(response)
+	}
+	select {
+	case err := <-breakDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("break did not complete after preserved leftover acknowledgment")
+	}
+}
+
+func TestCoherencePollBufferReuseRequiresDrainedQueue(t *testing.T) {
+	session := &coherenceControlSession{
+		queued:     []volumeserver.StreamEvent{{Kind: volumeserver.StreamChange}},
+		pollBuffer: []volumeserver.StreamEvent{{Kind: volumeserver.StreamChange}},
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("poll buffer reuse accepted an undrained aliased queue")
+		}
+	}()
+	reuseCoherencePollBufferLocked(session)
+}
+
+func TestCoherenceControlAutoAckRequiresDrainedQueue(t *testing.T) {
+	for _, state := range []string{"queued", "unacknowledged", "drained"} {
+		t.Run(state, func(t *testing.T) {
+			h, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+			_, token := subscribeCoherenceControlTest(t, h, volumeserver.SessionID{1})
+			position := coordinator.OnCommit([]volumeserver.ChangeEntry{{VolumeVersion: 1, Kind: volumeserver.AttributesChanged, Identity: [16]byte{1}}})
+			events, err := coordinator.Poll(t.Context(), token, 0, nil, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := &coherenceControlSession{token: token, coordinatorCursor: position}
+			switch state {
+			case "queued":
+				session.queued = events
+			case "unacknowledged":
+				session.changeDelivered = 1
+			case "drained":
+				session.changeDelivered, session.changeAcked = 1, 1
+			}
+			if err := h.retireCoherenceAdvancesLocked(session); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+			defer cancel()
+			err = coordinator.WaitWithdrawn(ctx, position, volumeserver.SessionID{})
+			if state == "drained" {
+				if err != nil {
+					t.Fatalf("drained position not retired: %v", err)
+				}
+			} else if err == nil {
+				t.Fatalf("%s change acknowledged without wire withdrawal", state)
+			}
+		})
+	}
+}
+
+func TestCoherencePeerAckRetiresTrailingSourceAdvance(t *testing.T) {
+	h, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, _ := subscribeCoherenceControlTest(t, h, id)
+	coordinator.OnCommit([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{3}, VolumeVersion: 2}})
+	last := coordinator.OnCommitFrom([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{4}, VolumeVersion: 3}}, id)
+	event := pollCoherenceControlTest(t, h, id, subscribed.Incarnation, 0).GetControlEvent()
+	entries := event.GetChangeBatch().GetEntries()
+	if len(entries) != 1 {
+		t.Fatalf("wire entries=%v, want exact peer change", entries)
+	}
+	before, cancelBefore := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancelBefore()
+	if err := coordinator.WaitWithdrawn(before, last, volumeserver.SessionID{}); err == nil {
+		t.Fatal("source advance acknowledged an unwithdrawn peer change")
+	}
+	if response := ackChangeCoherenceControlTest(t, h, id, subscribed.Incarnation, entries[0].Position); response.GetErrno() != 0 {
+		t.Fatal(response)
+	}
+	after, cancelAfter := context.WithTimeout(t.Context(), time.Second)
+	defer cancelAfter()
+	if err := coordinator.WaitWithdrawn(after, last, volumeserver.SessionID{}); err != nil {
+		t.Fatalf("peer ACK did not retire trailing source advance: %v", err)
+	}
+}
+
+// Real peer facts keep replay tests independent of holder-local bookkeeping.
+func publishPeerControlChange(c *volumeserver.CoherenceCoordinator) {
+	c.OnCommit([]volumeserver.ChangeEntry{{Kind: volumeserver.AttributesChanged, Identity: [16]byte{0xf0}, VolumeVersion: 1}})
+}
+
+func TestCoherenceBatchSizingPreservesLengthPrefixBoundaries(t *testing.T) {
+	for _, boundary := range []int{127, 128, 129, 16383, 16384, 16385} {
+		for _, limit := range []int{boundary - 1, boundary, boundary + 1} {
+			handler, _ := newCoherenceControlTestHandler(t, responseEnvelopeReserve+uint32(limit))
+			session := &coherenceControlSession{token: volumeserver.SubscriptionToken{Session: volumeserver.SessionID{1}, Incarnation: 128}}
+			for i := 0; i < 1000; i++ {
+				session.queued = append(session.queued, volumeserver.StreamEvent{Kind: volumeserver.StreamChange, Position: uint64(i + 1), Change: volumeserver.ChangeEntry{VolumeVersion: 16384, Kind: volumeserver.NamespaceChanged, ParentIdentity: [16]byte{1}, Name: "child"}})
+			}
+			event, ok, err := handler.nextCoherenceControlEventLocked(session)
+			if err != nil || !ok {
+				t.Fatalf("limit %d: %v", limit, err)
+			}
+			if size := proto.Size(event); size > limit {
+				t.Fatalf("limit %d: size=%d", limit, size)
+			}
+			if len(session.queued) == 0 {
+				t.Fatal("fixture did not reach frame boundary")
+			}
+			next, err := coherenceChangeEntryProto(session.queued[0].Change, session.changeDelivered+1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			event.GetChangeBatch().Entries = append(event.GetChangeBatch().Entries, next)
+			if proto.Size(event) <= limit {
+				t.Fatalf("limit %d unnecessarily truncated batch", limit)
+			}
+		}
+	}
+}
+
+func BenchmarkCoherenceBatchAssembly(b *testing.B) {
+	for _, count := range []int{64, 256, 1024, 4096} {
+		b.Run(fmt.Sprintf("entries-%d", count), func(b *testing.B) {
+			handler := &VolumeHandler{MaxFrame: 4 << 20}
+			events := make([]volumeserver.StreamEvent, count)
+			for i := range events {
+				events[i] = volumeserver.StreamEvent{Kind: volumeserver.StreamChange, Position: uint64(i + 1), Change: volumeserver.ChangeEntry{VolumeVersion: 1, Kind: volumeserver.AttributesChanged, Identity: [16]byte{1}}}
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				session := &coherenceControlSession{token: volumeserver.SubscriptionToken{Session: volumeserver.SessionID{1}, Incarnation: 1}, queued: append([]volumeserver.StreamEvent(nil), events...)}
+				event, ok, err := handler.nextCoherenceControlEventLocked(session)
+				if err != nil || !ok || len(event.GetChangeBatch().GetEntries()) != count {
+					b.Fatal("incomplete batch", err)
+				}
+			}
+		})
 	}
 }

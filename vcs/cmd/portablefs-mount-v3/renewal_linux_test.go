@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 	"github.com/steerlabs/portablefs/vcs/internal/volumecap"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
@@ -161,5 +162,73 @@ func TestStandaloneRenewalRequiresASessionAndAnUnexpiredAuthorization(t *testing
 	expired := &renewalSession{id: volumeserver.SessionID{5}, deadline: time.Now().Add(-time.Second), reached: make(chan struct{})}
 	if _, err := startCredentialRenewal(expired, path, attach); err == nil {
 		t.Fatal("renewal of an already expired authorization must be refused")
+	}
+}
+
+func (session *renewalSession) CurrentAuthorizationSession() (fusev3.AuthorizationSession, <-chan struct{}, error) {
+	return session, nil, nil
+}
+
+type switchingRenewalSession struct {
+	mu      sync.Mutex
+	current *renewalSession
+	changed chan struct{}
+}
+
+func (s *switchingRenewalSession) CurrentAuthorizationSession() (fusev3.AuthorizationSession, <-chan struct{}, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current, s.changed, nil
+}
+
+func TestStandaloneRenewalRestartsOnEpochWithoutSendingOldCapability(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Minute).Truncate(time.Second)
+	old := &renewalSession{id: volumeserver.SessionID{1}, deadline: deadline, reached: make(chan struct{})}
+	replacement := &renewalSession{id: volumeserver.SessionID{2}, deadline: deadline, reached: make(chan struct{})}
+	provider := &switchingRenewalSession{current: old, changed: make(chan struct{})}
+	path := filepath.Join(t.TempDir(), "access.token")
+	attach := mintRenewalCapability(t, key, "", 0, deadline)
+	oldID := base64.RawURLEncoding.EncodeToString(old.id[:])
+	writeRenewalCapability(t, path, mintRenewalCapability(t, key, oldID, 1, deadline.Add(10*time.Minute)))
+	renewal, err := startCredentialRenewal(provider, path, attach)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer renewal.Close()
+	select {
+	case <-old.reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old renewal never installed")
+	}
+	writeRenewalCapability(t, path, mintRenewalCapability(t, key, oldID, 2, deadline.Add(10*time.Minute)))
+	provider.mu.Lock()
+	provider.current = replacement
+	close(provider.changed)
+	provider.changed = make(chan struct{})
+	provider.mu.Unlock()
+	select {
+	case <-replacement.reached:
+		t.Fatal("old-session capability reached new session")
+	case err := <-renewal.failed:
+		t.Fatalf("replacement failed on old file: %v", err)
+	case <-time.After(750 * time.Millisecond):
+	}
+	newID := base64.RawURLEncoding.EncodeToString(replacement.id[:])
+	writeRenewalCapability(t, path, mintRenewalCapability(t, key, newID, 1, deadline.Add(10*time.Minute)))
+	select {
+	case <-replacement.reached:
+	case err := <-renewal.failed:
+		t.Fatalf("replacement failed: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("new renewal never installed")
+	}
+	replacement.mu.Lock()
+	defer replacement.mu.Unlock()
+	if len(replacement.sequences) != 1 || replacement.sequences[0] != 1 {
+		t.Fatalf("new sequence = %v", replacement.sequences)
 	}
 }

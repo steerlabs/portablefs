@@ -13,11 +13,13 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
 type subscriptionTestClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu     sync.Mutex
+	now    time.Time
+	timers chan<- *subscriptionTestTimer
 }
 
 func (c *subscriptionTestClock) Now() time.Time {
@@ -26,7 +28,20 @@ func (c *subscriptionTestClock) Now() time.Time {
 	return c.now
 }
 
+type subscriptionTestTimer struct {
+	duration time.Duration
+	fired    chan time.Time
+}
+
+func (t *subscriptionTestTimer) C() <-chan time.Time { return t.fired }
+func (*subscriptionTestTimer) Stop() bool            { return true }
+
 func (c *subscriptionTestClock) NewTimer(d time.Duration) subscriptionTimer {
+	if c.timers != nil {
+		timer := &subscriptionTestTimer{duration: d, fired: make(chan time.Time, 1)}
+		c.timers <- timer
+		return timer
+	}
 	return wallSubscriptionTimer{timer: time.NewTimer(d)}
 }
 
@@ -45,6 +60,7 @@ type subscriptionTestRPC struct {
 	events      []*authoritypb.ControlEvent
 	event       int
 	eventNotify chan struct{}
+	renewed     chan<- uint64
 	acks        []uint64
 	log         *[]string
 }
@@ -72,13 +88,16 @@ func (r *subscriptionTestRPC) Subscribe(_ context.Context, snapshotID, after []b
 	return reply, r.horizon, nil
 }
 
-func (r *subscriptionTestRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
+func (r *subscriptionTestRPC) RenewSubscription(_ context.Context, incarnation uint64) (time.Time, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.renewed != nil {
+		r.renewed <- incarnation
+	}
 	return r.horizon, nil
 }
 
-func (r *subscriptionTestRPC) NextControlEvent(ctx context.Context, _ uint64, _ uint64) (*authoritypb.ControlEvent, error) {
+func (r *subscriptionTestRPC) NextControlEvent(ctx context.Context, _ uint64, _ uint64, _ uint64) (*authoritypb.ControlEvent, error) {
 	r.mu.Lock()
 	if r.event < len(r.events) {
 		event := r.events[r.event]
@@ -197,7 +216,7 @@ func (c *subscriptionTestControl) SetIncarnation(incarnation uint64) {
 	c.mu.Unlock()
 }
 
-func (c *subscriptionTestControl) HandleControlEvent(_ context.Context, event *authoritypb.ControlEvent) {
+func (c *subscriptionTestControl) HandleControlEvent(_ context.Context, event *authoritypb.ControlEvent) <-chan struct{} {
 	c.mu.Lock()
 	c.events = append(c.events, event)
 	c.mu.Unlock()
@@ -207,6 +226,9 @@ func (c *subscriptionTestControl) HandleControlEvent(_ context.Context, event *a
 		default:
 		}
 	}
+	done := make(chan struct{})
+	close(done)
+	return done
 }
 
 func subscriptionIdentity(value byte) publicationIdentity {
@@ -313,7 +335,7 @@ func TestSubscriptionAckFollowsProvenWithdrawal(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	queue := newSubscriptionChangeQueue()
-	if err := queue.push(batch); err != nil {
+	if err := queue.push(batch, 0); err != nil {
 		t.Fatalf("queue: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -367,7 +389,7 @@ func TestSubscriptionFailedNotifyMarksIdentityStaleWithoutAck(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	queue := newSubscriptionChangeQueue()
-	if err := queue.push(batch); err != nil {
+	if err := queue.push(batch, 0); err != nil {
 		t.Fatalf("queue: %v", err)
 	}
 	if err := registry.changeLoop(context.Background(), 9, queue); err == nil {
@@ -521,7 +543,7 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 		t.Fatal("root inode")
 	}
 	defer fixture.raw.release(root)
-	negative := nameKey{parent: root.id, name: "absent"}
+	negative := nameKey{parent: root.key.inode, name: "absent"}
 	fixture.raw.mu.Lock()
 	fixture.raw.bindCachedNegativeLocked(negative, subscriptionStamp{incarnation: 1, generation: 1, version: 1})
 	fixture.raw.mu.Unlock()
@@ -563,7 +585,7 @@ func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {
 		}
 	}
 	if !foundNegativeNotify {
-		t.Fatal("cold subscription did not withdraw the kernel negative dentry")
+		t.Fatal("cold subscription omitted notification for a cached negative name")
 	}
 }
 
@@ -606,7 +628,7 @@ func TestUnlicensedReadRemainsIndexedUntilPostWritePurge(t *testing.T) {
 	closeDone := make(chan error, 1)
 	closeCtx, cancelClose := context.WithTimeout(context.Background(), time.Second)
 	defer cancelClose()
-	go func() { closeDone <- fixture.raw.closeCacheCoordinate(closeCtx, coordinate) }()
+	go func() { _, err := fixture.raw.closeCacheCoordinate(closeCtx, coordinate); closeDone <- err }()
 	replyDone := make(chan struct{})
 	go func() {
 		fixture.raw.ReplyWritten(unique, fuse.OK)
@@ -726,4 +748,275 @@ func BenchmarkSubscriptionChangeAdmission(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+func TestSubscriptionLocalPromotedOwnershipClosesCacheAdmission(t *testing.T) {
+	mount, _ := testMount(t, 8)
+	identity := delegationTestIdentity(24)
+	coordinate := publicationCoordinate{kind: publicationItemAttributes}
+	copy(coordinate.item[:], identity)
+	stamp := mount.subscription.stamp()
+	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got <= 0 {
+		t.Fatalf("initial permission=%v", got)
+	}
+	if err := mount.delegations.Install(identity, []byte{24, 1}, []byte{24, 2}, delegationTestGrant(56, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
+	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got != 0 {
+		t.Fatalf("locally owned identity retains cache permission=%v", got)
+	}
+
+	if _, present := mount.subscription.delegated[coordinate.item]; present {
+		t.Fatal("test depends on a holder-local grant event")
+	}
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := mount.delegations.state(id)
+	state.admission.Lock()
+	state.clearGrantLocked()
+	state.admission.Unlock()
+	if got := mount.subscription.remaining(coordinate, stamp, 1, time.Now()); got <= 0 {
+		t.Fatalf("released local grant retains cache exclusion=%v", got)
+	}
+}
+
+func TestControlCompletionReceiptWaitsForEveryEarlierHandler(t *testing.T) {
+	queue := newSubscriptionChangeQueue()
+	queue.complete(2)
+	if got := queue.completedThrough(); got != 0 {
+		t.Fatalf("receipt skipped unfinished event 1: %d", got)
+	}
+	queue.complete(1)
+	if got := queue.completedThrough(); got != 2 {
+		t.Fatalf("receipt=%d", got)
+	}
+	queue.complete(1)
+	for sequence := uint64(3); sequence <= 10000; sequence++ {
+		queue.complete(sequence)
+	}
+	if queue.completedThrough() != 10000 || len(queue.finished) != 0 {
+		t.Fatalf("completion retained history: %+v", queue)
+	}
+}
+
+func TestNamespaceWithdrawalPurgesBindingsWithoutEntryNotify(t *testing.T) {
+	fixture := newStrictFixture(t)
+	root := fixture.raw.acquire(1)
+	defer fixture.raw.release(root)
+	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: root.identity, name: "absent"}
+	key := nameKey{parent: root.key.inode, name: coordinate.name}
+	fixture.raw.mu.Lock()
+	fixture.raw.bindCachedNegativeLocked(key, fixture.mount.subscription.stamp())
+	fixture.raw.mu.Unlock()
+	fixture.notify.entryST = fuse.EIO
+	if err := fixture.raw.invalidateCacheCoordinateContext(context.Background(), coordinate, nil); err != nil {
+		t.Fatalf("zero-validity namespace withdrawal: %v", err)
+	}
+	fixture.raw.mu.Lock()
+	_, retained := fixture.raw.cachedNegatives[key]
+	fixture.raw.mu.Unlock()
+	if retained {
+		t.Fatal("withdrawal retained the negative binding")
+	}
+	fixture.notify.mu.Lock()
+	defer fixture.notify.mu.Unlock()
+	if len(fixture.notify.calls) != 0 {
+		t.Fatal("namespace withdrawal issued EntryNotify, which can wait on a CREATE parent lock")
+	}
+}
+
+func TestCachedLookupWaitsForFinalizedReplyCacheSettlement(t *testing.T) {
+	for _, kind := range []string{"negative", "positive", "attributes", "revoked", "superseded"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newStrictFixture(t)
+			parent := fixture.raw.acquire(fuse.FUSE_ROOT_ID)
+			defer fixture.raw.release(parent)
+			unique := fixture.unique.Add(2)
+			ctx, finish, status := fixture.raw.mutationContext(unique)
+			if !status.Ok() {
+				t.Fatal(status)
+			}
+			publication := replyPublicationFromContext(ctx)
+			publication.servedVersion = 1
+			publication.cacheStamp = &cacheSnapshot{SnapshotSequence: 1, ObjectVersion: 1}
+			item := testItem(80, authoritypb.Attr_REGULAR, 80)
+			record, errno := fixture.raw.intern(ctx, item)
+			if errno != 0 {
+				t.Fatal(errno)
+			}
+			opcode := uint32(1)
+			if kind == "attributes" {
+				var out fuse.AttrOut
+				fixture.raw.publishAttr(ctx, &out, record.identity, item.GetAttr())
+				opcode = 3
+			} else if kind == "positive" {
+				var out fuse.EntryOut
+				if err := fixture.raw.publishEntry(ctx, &out, parent, "name", record, item.GetAttr()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				var out fuse.EntryOut
+				if status, err := fixture.raw.publishNegativeEntry(ctx, &out, parent, "name"); !status.Ok() || err != nil {
+					t.Fatalf("publish negative: %v, %v", status, err)
+				}
+			}
+			finish()
+			if _, _, status := fixture.raw.PrepareReplyPayload(unique, parent.id, opcode, nil, nil, 0); !status.Ok() {
+				t.Fatal(status)
+			}
+			if kind == "revoked" || kind == "superseded" {
+				fixture.raw.mu.Lock()
+				if kind == "revoked" {
+					publication.names[0].reservation.revoked = true
+				} else {
+					publication.names[0].negativeState.superseded = true
+				}
+				fixture.raw.mu.Unlock()
+			}
+			// The kernel can re-enter before ReplyWritten settles the daemon cache.
+			nextUnique := fixture.unique.Add(2)
+			next, complete, status := fixture.raw.mutationContext(nextUnique)
+			if !status.Ok() {
+				t.Fatal(status)
+			}
+			defer func() { complete(); completeTestReply(t, fixture.raw, nextUnique, fuse.OK) }()
+			result := make(chan bool, 1)
+			go func() {
+				if kind == "attributes" {
+					attr, hit := fixture.raw.cachedAttrRecord(next, record)
+					result <- hit && attr.GetInode() == item.GetAttr().GetInode()
+				} else {
+					found, attr, negative := fixture.raw.cachedLookup(next, parent, "name")
+					result <- negative || found == record && attr.GetInode() == item.GetAttr().GetInode()
+				}
+			}()
+			if kind == "revoked" || kind == "superseded" {
+				select {
+				case hit := <-result:
+					if hit {
+						t.Error("revoked candidate served from cache")
+					}
+				case <-time.After(time.Second):
+					t.Error("revoked candidate stalled the cache miss")
+				}
+				fixture.raw.ReplyWritten(unique, fuse.OK)
+				return
+			}
+			select {
+			case hit := <-result:
+				fixture.raw.ReplyWritten(unique, fuse.OK)
+				t.Fatalf("lookup overtook finalized cache settlement: hit=%t", hit)
+			case <-time.After(20 * time.Millisecond):
+			}
+			fixture.raw.ReplyWritten(unique, fuse.OK)
+			select {
+			case hit := <-result:
+				if !hit {
+					t.Fatal("settled payload required another Authority request")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cache lookup did not resume after settlement")
+			}
+		})
+	}
+}
+
+func TestSubscriptionShutdownBudgetUsesLiveHorizon(t *testing.T) {
+	now := time.Unix(1234, 0)
+	for _, test := range []struct {
+		name    string
+		active  bool
+		horizon time.Time
+		want    time.Duration
+	}{
+		{"live", true, now.Add(700 * time.Millisecond), 700 * time.Millisecond},
+		{"expired", true, now.Add(-time.Millisecond), 0},
+		{"inactive", false, now.Add(time.Second), volumeserver.SubscriptionTTL},
+		{"no horizon", true, time.Time{}, volumeserver.SubscriptionTTL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := newSubscriptionRegistryWithConfig(nil, nil, nil, subscriptionConfig{clock: &subscriptionTestClock{now: now}})
+			registry.active, registry.horizon = test.active, test.horizon
+			if got := registry.shutdownBudget(); got != test.want {
+				t.Fatalf("budget=%s, want %s", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSubscriptionRenewLoopUsesCoordinatorInterval(t *testing.T) {
+	now := time.Unix(700, 0)
+	timers := make(chan *subscriptionTestTimer, 2)
+	renewed := make(chan uint64, 1)
+	clock := &subscriptionTestClock{now: now, timers: timers}
+	rpc := &subscriptionTestRPC{horizon: now.Add(volumeserver.SubscriptionTTL), renewed: renewed}
+	registry := newSubscriptionTestRegistry(clock, rpc, &subscriptionTestInvalidator{}, nil)
+	registry.mu.Lock()
+	registry.active, registry.incarnation = true, 17
+	registry.horizon = rpc.horizon
+	registry.cacheUntil = rpc.horizon.Add(-time.Second)
+	registry.mu.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- registry.renewLoop(ctx, 17) }()
+	var timer *subscriptionTestTimer
+	select {
+	case timer = <-timers:
+	case <-time.After(time.Second):
+		t.Fatal("renew loop did not arm its timer")
+	}
+	if timer.duration != volumeserver.SubscriptionRenewInterval {
+		t.Fatalf("renew timer=%s, want %s", timer.duration, volumeserver.SubscriptionRenewInterval)
+	}
+	clock.advance(volumeserver.SubscriptionRenewInterval)
+	nextHorizon := clock.Now().Add(volumeserver.SubscriptionTTL)
+	rpc.mu.Lock()
+	rpc.horizon = nextHorizon
+	rpc.mu.Unlock()
+	timer.fired <- clock.Now()
+	select {
+	case incarnation := <-renewed:
+		if incarnation != 17 {
+			t.Fatalf("renewed incarnation=%d, want 17", incarnation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renew loop did not renew on interval")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("renew loop stop=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renew loop did not stop")
+	}
+}
+
+type testCacheWithdrawal func()
+
+func (f testCacheWithdrawal) Open() { f() }
+func (i *subscriptionTestInvalidator) CloseCacheCoordinates(ctx context.Context, coordinates []publicationCoordinate) (cacheWithdrawal, error) {
+	for _, coordinate := range coordinates {
+		if err := i.CloseCacheCoordinate(ctx, coordinate); err != nil {
+			return nil, err
+		}
+	}
+	return testCacheWithdrawal(func() {
+		for _, coordinate := range coordinates {
+			i.OpenCacheCoordinate(coordinate)
+		}
+	}), nil
+}
+
+func (i *subscriptionTestInvalidator) InvalidateCacheCoordinates(ctx context.Context, withdrawals []subscriptionWithdrawal) error {
+	for _, w := range withdrawals {
+		if err := i.InvalidateCacheCoordinate(ctx, w.coordinate, w.byteRange); err != nil {
+			return err
+		}
+	}
+	return nil
 }

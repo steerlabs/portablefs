@@ -28,10 +28,6 @@ type CoordinationConfig struct {
 	MaxCachedNameCapacity uint64
 	MaxRepairBudget       time.Duration
 
-	CacheLeaseTTL            time.Duration
-	MaxCacheLeasesPerSession uint32
-	MaxCacheLeases           uint64
-
 	Now       func() time.Time
 	OnBarrier func(time.Duration, int)
 }
@@ -39,14 +35,12 @@ type CoordinationConfig struct {
 // Coordination is a volume's complete protocol-7 coordination assembly.
 //
 // Linux subscription state is epoch-local. FSKit repair and durable mount
-// membership retain their existing coordinators. The legacy lease table is
-// confined to route-controller startup and topology bookkeeping; protocol 7
-// does not activate Linux lease holders or dispatch lease requests.
+// membership retain their existing coordinators. Linux uses only the v7
+// subscription and delegation coordinator.
 type Coordination struct {
 	Store      *xfsstore.Volume
 	Lifecycle  *volumeserver.MountLifecycle
 	Visibility *volumeserver.VisibilityCoordinator
-	Leases     *volumeserver.LeaseCoordinator
 	Coherence  *volumeserver.CoherenceCoordinator
 	Routes     *RoutesController
 }
@@ -66,24 +60,21 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 	if err != nil {
 		return nil, err
 	}
+	compatibilityPrior, priorLinux := cfg.Prior, false
+	if typed, ok := cfg.Membership.(interface {
+		PriorCacheState() (volumeserver.PriorEpochDisposition, bool)
+	}); ok {
+		compatibilityPrior, priorLinux = typed.PriorCacheState()
+	}
 	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
-		Prior: cfg.Prior, ExternalMembership: true, Fencer: cfg.Fencer,
+		Prior: compatibilityPrior, ExternalMembership: true, Fencer: cfg.Fencer,
 		MaxCachedNameCapacity: cfg.MaxCachedNameCapacity, MaxRepairBudget: cfg.MaxRepairBudget,
 		MaxClockSkew: cfg.ClockSkew, Now: cfg.Now, OnBarrier: cfg.OnBarrier,
 	})
 	if err != nil {
 		return nil, err
 	}
-	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
-		TTL: cfg.CacheLeaseTTL, RecallBudget: cfg.MaxRepairBudget, StartupGrace: volumeserver.Protocol6MaxLeaseTTL,
-		PriorGrantsFenced: cfg.Prior == volumeserver.PriorEpochStrictMountsFenced,
-		MaxPerHolder:      cfg.MaxCacheLeasesPerSession, MaxTotal: cfg.MaxCacheLeases,
-		Now: cfg.Now, Fencer: cfg.Fencer, OnRecall: cfg.OnBarrier,
-	})
-	if err != nil {
-		return nil, err
-	}
-	routes, err := newRoutesController(cfg.Store, lifecycle, leases, cfg.Locks)
+	routes, err := newRoutesController(cfg.Store, lifecycle, cfg.Locks)
 	if err != nil {
 		return nil, err
 	}
@@ -91,13 +82,13 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 		return nil, fmt.Errorf("load machine-local routing declaration: %w", err)
 	}
 	return &Coordination{
-		Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{}), Store: cfg.Store, Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes,
+		Coherence: volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{PriorLinuxCaches: priorLinux}), Store: cfg.Store, Lifecycle: lifecycle, Visibility: visibility, Routes: routes,
 	}, nil
 }
 
 // Bind installs the volume assembly on its handler.
 func (c *Coordination) Bind(h *VolumeHandler) {
-	h.Lifecycle, h.Visibility, h.Leases, h.Routes = c.Lifecycle, c.Visibility, c.Leases, c.Routes
+	h.Lifecycle, h.Visibility, h.Routes = c.Lifecycle, c.Visibility, c.Routes
 	h.Coherence = c.Coherence
 	h.initCoherence()
 }

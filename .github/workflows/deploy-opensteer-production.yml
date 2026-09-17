@@ -39,9 +39,10 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Set up the OpenSteer Node runtime
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 24.13.0
+          package-manager-cache: false
 
       - name: Prove the successful commit is still the promotion branch head
         env:
@@ -135,7 +136,7 @@ jobs:
 
       - name: Retain the fencing and release evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           if-no-files-found: ignore
           name: opensteer-portablefs-${{ steps.release.outputs.release_id }}

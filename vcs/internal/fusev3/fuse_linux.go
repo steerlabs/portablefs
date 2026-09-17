@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os/exec"
 	"strings"
 	"sync"
@@ -54,6 +55,8 @@ const (
 	// fixed fraction of the same budget rather than as an independent knob that
 	// could be configured out of proportion with it.
 	reclaimLaneDivisor = 4
+	reclaimBatchDelay  = 50 * time.Millisecond
+	reclaimRetryDelay  = 100 * time.Millisecond
 
 	// livenessReserve is the number of authority in-flight slots that only
 	// session keepalive may occupy.
@@ -114,7 +117,7 @@ type RPC interface {
 	SessionID() []byte
 	Subscribe(context.Context, []byte, []byte) (*authoritypb.SubscribeReply, time.Time, error)
 	RenewSubscription(context.Context, uint64) (time.Time, error)
-	NextControlEvent(context.Context, uint64, uint64) (*authoritypb.ControlEvent, error)
+	NextControlEvent(context.Context, uint64, uint64, uint64) (*authoritypb.ControlEvent, error)
 	AcknowledgeChanges(context.Context, uint64, uint64) error
 	AcknowledgeDelegationRecall(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error
 	AcknowledgeDelegationBreak(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error
@@ -125,6 +128,9 @@ type RPC interface {
 	// kernel mount is gone.
 	DetachAfterUnmount(context.Context, MountAbsenceProof) error
 }
+
+// WritebackDropReport describes accepted data discarded before durability.
+type WritebackDropReport = writeback.DropReport
 
 type Config struct {
 	// MountInstanceID is the random identity created before attach. MountVolume
@@ -166,6 +172,8 @@ type Config struct {
 	// Debug enables the underlying FUSE request/reply trace. It is diagnostic
 	// only and leaves the negotiated protocol and serving semantics unchanged.
 	Debug bool
+	// latencies is installed before Serve for in-package kernel timing proofs.
+	latencies fuse.LatencyMap
 
 	// OnRevoked is called exactly once, from the teardown goroutine, when this
 	// mount self-revokes and its kernel-state withdrawal has finished. It is a
@@ -176,6 +184,9 @@ type Config struct {
 	// It must not block: the same goroutine goes on to unmount and release the
 	// authority session. Persisting one small state record is what it is for.
 	OnRevoked func(RevocationReport)
+	// OnWritebackDrop receives every discarded-buffer report, including shutdown
+	// and quota failures. It must not block or call back into this mount.
+	OnWritebackDrop func(WritebackDropReport)
 }
 
 // cleanStartupFailure is an error whose failed mount attempt has no remaining
@@ -202,7 +213,10 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
-	server *fuse.Server
+	posixMu       sync.Mutex
+	posixLocks    map[posixLockKey]uint64
+	posixSequence uint64
+	server        *fuse.Server
 	// kernelConnectionDone closes only after go-fuse has stopped every request
 	// loop, closed this mount's /dev/fuse descriptor, and run OnUnmount. Mount
 	// table absence alone is insufficient on Linux: MNT_DETACH can hide a mount
@@ -357,6 +371,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 		return nil, markCleanStartupFailure(cause)
 	}
 	m.server = server
+	server.RecordLatencies(cfg.latencies)
 	m.setNotifier(server)
 	if !m.raw.replyLifecycleReady() {
 		// NewServer has already installed the mount and consumed INIT, but Serve
@@ -528,7 +543,12 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	if err != nil {
 		panic(err)
 	} // validated configuration and constant buffer bounds
+	mount.delegations.SetDropReporter(cfg.OnWritebackDrop)
+	mount.delegations.SetCleanupFailureReporter(func(err error) {
+		mount.cleanupFailed("deferred close", err, nil)
+	})
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
+	mount.delegations.SetCleanupRetryWaiter(mount.subscription.waitActive)
 	return mount
 }
 
@@ -583,6 +603,10 @@ func (m *Mount) failedStartupKernelAbsent() error {
 // MaxReadAhead is bounded by one authority read so a kernel read-ahead request
 // never has to be split merely because the frontend chose a larger window.
 func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
+	var disabledPlus uint64
+	if !cfg.Routes.Empty() {
+		disabledPlus = fuse.CAP_READDIRPLUS | fuse.CAP_READDIRPLUS_AUTO
+	}
 	return &fuse.MountOptions{
 		FsName:        "portablefs:" + cfg.MountInstanceID,
 		Name:          "portablefs",
@@ -599,10 +623,9 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 		// control instead is what makes the ordered DATA publication the single
 		// thing that withdraws a page.
 		ExplicitDataCacheControl: true,
-		// Plain READDIR is the portable profile. Stock READDIRPLUS can install an
-		// entry after a concurrent invalidation, and FOPEN_CACHE_DIR has a
-		// position-zero-only validation hole; neither is part of the contract.
-		DisableReadDirPlus: true,
+		// Authority PLUS pages publish daemon caches through the physical reply
+		// transaction. Mixed local routes retain ordinary READDIR.
+		DisableReadDirPlus: !cfg.Routes.Empty(),
 		// Shared mmap is a decision of this mount, not an accident of which
 		// capabilities go-fuse happens to forward. A writable shared mapping
 		// would dirty pages that never travel the strict write transaction, and
@@ -623,7 +646,7 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 		DisabledCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP | fuse.CAP_PASSTHROUGH |
 			fuse.CAP_NO_OPEN_SUPPORT | fuse.CAP_NO_OPENDIR_SUPPORT |
 			fuse.CAP_AUTO_INVAL_DATA | fuse.CAP_WRITEBACK_CACHE |
-			fuse.CAP_READDIRPLUS | fuse.CAP_READDIRPLUS_AUTO |
+			disabledPlus |
 			fuse.CAP_CACHE_SYMLINKS | fuse.CAP_HAS_INODE_DAX,
 		Options: []string{"default_permissions"},
 	}
@@ -729,6 +752,11 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 			if errors.Is(err, authorityrpc.ErrAuthorityChanged) || errors.Is(m.rpc.SessionEndCause(), authorityrpc.ErrAuthorityChanged) {
 				continue
 			}
+			// A local timeout says nothing about the remote epoch or session.
+			// Subscription expiry independently withdraws every cached item.
+			if err != nil && m.rpc.SessionEndCause() == nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, authorityrpc.ErrTransportUncertain)) {
+				continue
+			}
 			if response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
 				m.subscription.deactivate()
 				continue
@@ -746,12 +774,9 @@ func (m *Mount) keepAlive(ctx context.Context, lease time.Duration) {
 	}
 }
 
-// keepAliveInterval makes the strict frontend's authority-contact failure
-// bound no larger than its cache-repair contract. The authority may fence a
-// participant whose lease CONTROL connection was lost; after that fence, this
-// lane is how the frontend learns it must abort even though it never received
-// the recall that would have started a withdrawal timer. One interval to start a renewal
-// plus one interval for its deadline is at most two thirds of RepairBudget.
+// keepAliveInterval reserves regular contact for runtime session and signed
+// authorization checks. Subscription horizons, not heartbeat transport errors,
+// govern Linux cache withdrawal.
 func keepAliveInterval(lease time.Duration, repairBudget time.Duration) time.Duration {
 	interval := lease / 3
 	if strict := repairBudget / 3; strict < interval {
@@ -775,29 +800,38 @@ func (m *Mount) watchSession(ctx context.Context, done <-chan struct{}) {
 // independent of how saturated ordinary filesystem I/O is.
 func (m *Mount) reclaimLoop(ctx context.Context) {
 	defer m.wg.Done()
+	rpc, ok := m.rpc.(*epochRPC)
+	if !ok {
+		m.recordFatalCause(errors.New("fusev3: reclaim worker requires the epoch RPC facade"))
+		return
+	}
 	for {
-		entry, ok := m.reclaim.pop(ctx)
+		batch, ok := m.reclaim.popBatch(ctx, authorityrpc.MaxReclaimBatch)
 		if !ok {
 			return
 		}
-		if entry.transport != m.rpc.(*epochRPC).current() {
+		transport := batch[0].transport
+		if transport != rpc.current() {
 			continue
 		}
-		callCtx, cancel := context.WithTimeout(ctx, m.requestTimeout)
-		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Item: entry.token}}}
-		response, consumption, err := entry.transport.CallMutationWithIdentityRetained(
-			callCtx, request, nil, m.forceTerminalResponseRevocation,
+		// Background cleanup has no syscall deadline. Retain its replay slot
+		// across a transport gap until exact resolution or mount shutdown.
+		tokens := make([][]byte, len(batch))
+		for i, entry := range batch {
+			tokens[i] = entry.token
+		}
+		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: tokens}}}
+		response, consumption, err := transport.CallMutationWithIdentityRetained(
+			ctx, request, nil, m.forceTerminalResponseRevocation,
 		)
-		cancel()
 		if ctx.Err() != nil {
 			if consumption != nil {
-				m.revoke(errors.New("fusev3: mount ended before an authority reclaim response was consumed"))
 				consumption.Consume()
 			}
 			return
 		}
-		if entry.transport != m.rpc.(*epochRPC).current() ||
-			errors.Is(entry.transport.SessionEndCause(), authorityrpc.ErrAuthorityChanged) ||
+		if transport != rpc.current() ||
+			errors.Is(transport.SessionEndCause(), authorityrpc.ErrAuthorityChanged) ||
 			errors.Is(err, authorityrpc.ErrAuthorityChanged) {
 			if consumption != nil {
 				consumption.Consume()
@@ -808,11 +842,36 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 			if err == nil {
 				err = fmt.Errorf("reclaim refused: %w", responseErrno(response))
 			}
-			m.cleanupFailed("object reclaim", err)
+			outcome := resourceCleanupError{cause: err}
+			if response != nil {
+				outcome.failure = response.GetFailure()
+			}
 			if consumption != nil {
 				consumption.Consume()
 			}
-			return
+			if m.cleanupFailed("object reclaim", outcome, nil) {
+				if waitErr := m.subscription.waitActive(ctx); waitErr != nil {
+					return
+				}
+				timer := time.NewTimer(reclaimRetryDelay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				}
+				if transport == rpc.current() {
+					for _, entry := range batch {
+						m.reclaim.push(entry)
+					}
+				}
+			}
+			continue
 		}
 		if consumption != nil {
 			consumption.Consume()
@@ -820,18 +879,86 @@ func (m *Mount) reclaimLoop(ctx context.Context) {
 	}
 }
 
-// cleanupFailed is the single policy this mount applies when the authority
-// refuses to release a resource the frontend has already given up locally
-// (a forgotten capability, or a file handle the kernel has closed). Both mean
-// the frontend and the authority no longer agree about who owns an object; the
-// session cannot continue correctly, and continuing would surface later as
-// unexplained per-session admission failures on ordinary open() calls.
-func (m *Mount) cleanupFailed(operation string, err error) {
+type cleanupClassified interface {
+	cleanupFailureClass() authoritypb.FailureClass
+	cleanupIsTerminal() bool
+}
+
+type resourceCleanupError struct {
+	cause    error
+	failure  authoritypb.FailureClass
+	terminal bool
+}
+
+func (e resourceCleanupError) Error() string {
+	if e.cause == nil {
+		return "resource cleanup failed"
+	}
+	return e.cause.Error()
+}
+func (e resourceCleanupError) Unwrap() error { return e.cause }
+func (e resourceCleanupError) cleanupFailureClass() authoritypb.FailureClass {
+	return e.failure
+}
+func (e resourceCleanupError) cleanupIsTerminal() bool { return e.terminal }
+func (e resourceCleanupError) failed() bool            { return e.cause != nil }
+func (e resourceCleanupError) errno() syscall.Errno {
+	if e.cause == nil {
+		return 0
+	}
+	if errno, ok := e.cause.(syscall.Errno); ok {
+		return errno
+	}
+	return bufferErrno(e.cause)
+}
+
+// cleanupFailed scopes definite cleanup refusals to the resource. Subscription
+// fencing triggers cold recovery; only an unresolved or already-terminal
+// session outcome revokes the mount. It returns true when cleanup should be
+// retried after the replacement subscription becomes active.
+func (m *Mount) cleanupFailed(operation string, err error, stale func()) bool {
 	if m.ctx != nil && m.ctx.Err() != nil {
 		// Teardown already released everything through Detach.
-		return
+		return false
 	}
-	m.revoke(fmt.Errorf("fusev3: authority refused %s of a frontend-owned resource: %w", operation, err))
+	var classified cleanupClassified
+	if errors.Is(err, authorityrpc.ErrSubscriptionReset) {
+		if m.subscription != nil {
+			m.subscription.deactivate()
+		}
+		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, err)
+		return true
+	}
+	if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+		if stale != nil {
+			stale()
+		}
+		if m.subscription != nil {
+			m.subscription.deactivate()
+		}
+		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, err)
+		return true
+	}
+	terminal := errors.As(err, &classified) && classified.cleanupIsTerminal()
+	if cause := m.rpc.SessionEndCause(); errors.Is(cause, authorityrpc.ErrAuthorityChanged) || errors.Is(cause, authorityrpc.ErrSubscriptionReset) {
+		if m.subscription != nil {
+			m.subscription.deactivate()
+		}
+		log.Printf("portablefs: deferred %s until cold resubscribe: %v", operation, errors.Join(err, cause))
+		return true
+	} else if cause != nil {
+		terminal = true
+		err = errors.Join(err, cause)
+	}
+	if terminal {
+		m.revoke(fmt.Errorf("fusev3: unresolved %s of a frontend-owned resource: %w", operation, err))
+		return false
+	}
+	if stale != nil {
+		stale()
+	}
+	log.Printf("portablefs: scoped cleanup failure operation=%q cause=%v", operation, err)
+	return false
 }
 
 // acquireBulk admits one kernel-driven authority call. The non-blocking attempt
@@ -902,10 +1029,12 @@ func (m *Mount) holdBulk(parent context.Context) (context.Context, func(), sysca
 // destroyed mount.
 //
 // The backlog is bounded even though push never fails: the only tokens that can
-// enter it are one per interned inode plus one per admitted duplicate lookup,
-// and interning is exactly what admission throttles.
+// enter it are retained inode capabilities, admitted duplicate lookups, and
+// unused PLUS page capabilities. Interning and PLUS page fetches both throttle
+// against this watermark before producing more cleanup debt.
 type reclaimQueue struct {
 	watermark int
+	batchMu   sync.Mutex
 
 	mu     sync.Mutex
 	tokens []queuedReclaim
@@ -950,19 +1079,7 @@ func (q *reclaimQueue) pop(ctx context.Context) (queuedReclaim, bool) {
 	for {
 		q.mu.Lock()
 		if q.head < len(q.tokens) {
-			entry := q.tokens[q.head]
-			q.tokens[q.head] = queuedReclaim{}
-			q.head++
-			if q.head == len(q.tokens) {
-				// Reset instead of resliding so the backing array is reused
-				// rather than growing without bound.
-				q.tokens, q.head = q.tokens[:0], 0
-			}
-			remaining := len(q.tokens) - q.head
-			if remaining < q.watermark && q.room != nil {
-				close(q.room)
-				q.room = nil
-			}
+			entry, remaining := q.popLocked()
 			q.mu.Unlock()
 			if remaining > 0 {
 				q.signal()
@@ -976,6 +1093,69 @@ func (q *reclaimQueue) pop(ctx context.Context) (queuedReclaim, bool) {
 			return queuedReclaim{}, false
 		}
 	}
+}
+
+func (q *reclaimQueue) popLocked() (queuedReclaim, int) {
+	entry := q.tokens[q.head]
+	q.tokens[q.head] = queuedReclaim{}
+	q.head++
+	if q.head == len(q.tokens) {
+		// Reset instead of resliding so the backing array is reused rather than
+		// growing without bound.
+		q.tokens, q.head = q.tokens[:0], 0
+	}
+	remaining := len(q.tokens) - q.head
+	if remaining < q.watermark && q.room != nil {
+		close(q.room)
+		q.room = nil
+	}
+	return entry, remaining
+}
+
+// popBatch leaves FORGET nonblocking while one collector coalesces cleanup
+// debt. A full admission watermark drains immediately; unavoidable residue is
+// sent after a short timer. The collector never combines authority epochs.
+func (q *reclaimQueue) popBatch(ctx context.Context, max int) ([]queuedReclaim, bool) {
+	q.batchMu.Lock()
+	defer q.batchMu.Unlock()
+	first, ok := q.pop(ctx)
+	if !ok {
+		return nil, false
+	}
+	batch := make([]queuedReclaim, 0, min(max, q.watermark))
+	batch = append(batch, first)
+	flushAt := min(max, q.watermark)
+	timer := time.NewTimer(reclaimBatchDelay)
+	defer timer.Stop()
+	for len(batch) < max {
+		q.mu.Lock()
+		if q.head < len(q.tokens) {
+			next := q.tokens[q.head]
+			if next.transport != first.transport {
+				q.mu.Unlock()
+				return batch, true
+			}
+			next, remaining := q.popLocked()
+			q.mu.Unlock()
+			batch = append(batch, next)
+			if remaining > 0 {
+				q.signal()
+			}
+			if len(batch) >= flushAt {
+				return batch, true
+			}
+			continue
+		}
+		q.mu.Unlock()
+		select {
+		case <-q.wake:
+		case <-timer.C:
+			return batch, true
+		case <-ctx.Done():
+			return batch, true
+		}
+	}
+	return batch, true
 }
 
 // admit blocks a producer that is about to create new cleanup debt until the
@@ -1097,12 +1277,19 @@ func (m *Mount) closeLocked() error {
 }
 
 func (m *Mount) flushDelegationsBeforeClose() error {
-	if m == nil || m.delegations == nil || m.revoked.Load() || m.rpc.SessionEndCause() != nil || !m.delegations.hasRetainedEntries() {
+	if m == nil || m.delegations == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), detachTimeout)
+	// A parked admission must wake before Barrier takes the frontend write lock,
+	// and no new admission may race the empty-buffer check below.
+	m.delegations.FenceAdmissions()
+	if !m.delegations.hasRetainedEntries() {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), m.subscription.shutdownBudget())
 	defer cancel()
 	if err := m.delegations.Barrier(ctx, m.delegations.LossSequence()); err != nil {
+		m.delegations.DropRetained(fmt.Sprintf("session detach barrier failed: %v", err))
 		return fmt.Errorf("fusev3: flush delegated writes before session detach: %w", err)
 	}
 	return nil
@@ -1143,6 +1330,7 @@ type fileHandle struct {
 	lossMu       sync.Mutex
 	lossObserved uint64
 	once         sync.Once
+	closeOutcome resourceCleanupError
 }
 
 type dirHandle struct {
@@ -1173,6 +1361,7 @@ type dirHandle struct {
 	pageWantItems bool
 	eof           bool
 	once          sync.Once
+	closeOutcome  resourceCleanupError
 	// plusReply serializes the directory cursor across the physical reply edge.
 	// READDIRPLUS transfers authority capabilities while building a page, but
 	// the kernel owns their lookup references only after /dev/fuse accepts the
@@ -1243,6 +1432,15 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 	requiresGate := requestRequiresSourcePublication(request)
 	if requiresGate != (gate != nil) {
 		return nil, errors.New("fusev3: mutation source-publication ownership does not match its operation")
+	}
+	// The local horizon is conservative: the Authority may still answer before
+	// its later deadline. Cold namespace reads and mutations must nevertheless
+	// fail until this mount installs a new subscription.
+	if m.subscription == nil {
+		return nil, errors.New("fusev3: mutation has no subscription registry")
+	}
+	if (requiresGate || request.GetLookup() != nil) && m.subscription.stamp() == (subscriptionStamp{}) {
+		return nil, syscall.EIO
 	}
 	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
 	if callback == nil || m.raw == nil {
@@ -1451,8 +1649,13 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 	if n.stale.Load() || (fh != nil && fh.stale.Load()) {
 		return syscall.EIO
 	}
-	if base, ok := n.mount.delegations.BaseAttr(n.item.GetStableIdentity()); ok {
-		return n.overlayAttr(base, out)
+	if owned, errno := n.publishHolderAttr(ctx, nil, 0, out); owned || errno != 0 {
+		return errno
+	}
+	if n.mount.raw == nil {
+		if base, ok := n.mount.delegations.BaseAttr(n.item.GetStableIdentity()); ok {
+			return n.overlayAttr(base, out)
+		}
 	}
 	req := &authoritypb.GetAttrRequest{Item: cloneBytes(n.item.GetToken())}
 	if fh != nil {
@@ -1475,8 +1678,11 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 		SnapshotSequence: snapshot, ObjectVersion: objectVersion,
 		BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags(),
 	}
-	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
-		n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), attr)
+	if owned, errno := n.publishHolderAttr(ctx, attr, objectVersion, out); owned || errno != 0 {
+		return errno
+	}
+	if n.mount.raw == nil && n.mount.delegations.Owns(n.item.GetStableIdentity()) {
+		n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), attr, objectVersion)
 		return n.overlayAttr(attr, out)
 	}
 	n.mount.publishAttr(ctx, out, n.item, attr)
@@ -1487,6 +1693,20 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	openFlags, errno := protocolOpenFlags(flags)
 	if errno != 0 {
 		return nil, 0, errno
+	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, 0, bufferErrno(err)
+	}
+	if openFlags.GetWrite() {
+		id, err := delegationIdentity(n.item.GetStableIdentity())
+		if err != nil {
+			return nil, 0, syscall.EIO
+		}
+		state := n.mount.delegations.state(id)
+		if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
+			return nil, 0, bufferErrno(err)
+		}
+		defer state.acquire.Unlock()
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: openFlags, WriteIntent: openFlags.GetWrite(), CacheCapable: !openFlags.GetWrite()}}}
 	var gate *sourcePublicationGate
@@ -1507,7 +1727,11 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 			}
 			return result, nil
 		})
-		errno = bufferErrno(callErr)
+		if errors.Is(callErr, errDelegationNotOwned) {
+			response, errno = n.mutateWithSource(ctx, request, gate)
+		} else {
+			errno = bufferErrno(callErr)
+		}
 	} else {
 		response, errno = n.mutateWithSource(ctx, request, gate)
 	}
@@ -1529,7 +1753,7 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 	}
 	if openFlags.GetTruncate() {
 		if object := postStateObject(response.GetPostState(), n.item.GetStableIdentity(), postStateRoleTarget); object != nil {
-			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), object.GetAttr())
+			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 		}
 	}
 	return handle, kernelFlags, 0
@@ -1542,6 +1766,13 @@ func (n *node) Read(ctx context.Context, handle *fileHandle, dest []byte, off in
 	if handle.stale.Load() || n.stale.Load() {
 		return nil, syscall.EIO
 	}
+	// Cold withdrawal closes read admission until the replacement subscription
+	// is installed. In particular, a kernel refault must not enter repeated
+	// network timeouts while the Authority has already fenced this incarnation.
+	if n.mount.subscription == nil || n.mount.subscription.stamp() == (subscriptionStamp{}) {
+		return nil, syscall.EIO
+	}
+
 	data, err := n.mount.delegations.Read(ctx, n.item.GetStableIdentity(), off, len(dest), func(fetchCtx context.Context, offset int64, length int) ([]byte, error) {
 		data := make([]byte, 0, length)
 		for len(data) < length {
@@ -1575,8 +1806,8 @@ func (n *node) Fsync(ctx context.Context, handle *fileHandle, flags uint32) sysc
 	if handle.stale.Load() || n.stale.Load() {
 		return syscall.EIO
 	}
-	if handle.observeLoss() {
-		return syscall.EIO
+	if errno := handle.observeLoss(); errno != 0 {
+		return errno
 	}
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
 		return bufferErrno(n.mount.delegations.Fsync(ctx, n.item.GetStableIdentity(), flags&fsyncDataOnly != 0))
@@ -1589,23 +1820,63 @@ func (n *node) Flush(ctx context.Context, handle *fileHandle, lockOwner uint64) 
 	if handle == nil {
 		return syscall.EBADF
 	}
-	if handle.stale.Load() || n.stale.Load() || handle.observeLoss() {
+	if handle.stale.Load() || n.stale.Load() {
 		return syscall.EIO
 	}
+	if errno := handle.observeLoss(); errno != 0 {
+		return errno
+	}
+	key := n.posixLockKey(lockOwner)
+	generation := n.mount.possiblePOSIXLock(key)
+	if generation == 0 {
+		if local, errno := handle.flushLocally(); local {
+			return errno
+		}
+	}
 	_, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_Flush{Flush: &authoritypb.FlushRequest{Handle: cloneBytes(handle.token), LockOwner: lockOwner}}})
+	if errno == 0 {
+		n.mount.dischargePOSIXLock(key, generation)
+	}
 	return errno
 }
 
-func (h *fileHandle) observeLoss() bool {
+func (h *fileHandle) observeLoss() syscall.Errno {
 	if h == nil || h.node == nil || h.node.mount == nil {
-		return false
+		return 0
 	}
 	h.lossMu.Lock()
 	defer h.lossMu.Unlock()
-	loss := h.node.mount.delegations.IdentityLoss(h.node.item.GetStableIdentity())
+	loss, errno := h.node.mount.delegations.IdentityFailure(h.node.item.GetStableIdentity(), h.lossObserved)
 	lost := loss != h.lossObserved
 	h.lossObserved = loss
-	return lost
+	if !lost {
+		return 0
+	}
+	if errno != 0 {
+		return errno
+	}
+	return syscall.EIO
+}
+
+func (h *fileHandle) flushLocally() (bool, syscall.Errno) {
+	if h == nil || h.node == nil || h.node.mount == nil {
+		return false, 0
+	}
+	h.lossMu.Lock()
+	defer h.lossMu.Unlock()
+	local, loss, errno := h.node.mount.delegations.localFullFlush(h.node.item.GetStableIdentity(), h.lossObserved)
+	if !local {
+		return false, 0
+	}
+	lost := loss != h.lossObserved
+	h.lossObserved = loss
+	if !lost {
+		return true, 0
+	}
+	if errno != 0 {
+		return true, errno
+	}
+	return true, syscall.EIO
 }
 
 func (n *node) Release(ctx context.Context, handle *fileHandle) syscall.Errno {
@@ -1616,23 +1887,42 @@ func (n *node) Release(ctx context.Context, handle *fileHandle) syscall.Errno {
 }
 
 func (h *fileHandle) close(ctx context.Context, lockOwner uint64, flockUnlock bool) syscall.Errno {
-	if h.stale.Load() || h.node.epochStale.Load() {
-		return syscall.EIO
+	return h.closeForCleanup(ctx, lockOwner, flockUnlock).errno()
+}
+
+func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, flockUnlock bool) resourceCleanupError {
+	if h != nil && h.node != nil && h.node.mount != nil {
+		// Closing any descriptor releases this owner's POSIX locks on the inode,
+		// even when the Authority close itself is refused or its result is lost.
+		h.node.mount.forgetPOSIXLock(h.node.posixLockKey(lockOwner))
 	}
-	var errno syscall.Errno
+	if h.stale.Load() || h.node.epochStale.Load() {
+		return resourceCleanupError{cause: syscall.EIO}
+	}
 	h.once.Do(func() {
-		if h.node.mount.delegations.Owns(h.node.item.GetStableIdentity()) {
-			errno = bufferErrno(h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock))
+		if h.node.mount.delegations.TracksHandle(h.node.item.GetStableIdentity(), h.token) {
+			if err := h.node.mount.delegations.QueueClose(h.node.item.GetStableIdentity(), h.token, lockOwner, flockUnlock); err != nil {
+				h.closeOutcome.cause = err
+			}
 			return
 		}
-		_, errno = h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token), LockOwner: lockOwner, FlockUnlock: flockUnlock}}})
+		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token), LockOwner: lockOwner, FlockUnlock: flockUnlock}}})
+		if errno != 0 {
+			h.closeOutcome.cause = errno
+			if response != nil {
+				h.closeOutcome.failure = response.GetFailure()
+			}
+		}
 	})
-	return errno
+	return h.closeOutcome
 }
 
 func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uint32, syscall.Errno) {
 	if flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY) {
 		return nil, 0, syscall.EISDIR
+	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, 0, bufferErrno(err)
 	}
 	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Read: true}}}})
 	if errno != 0 {
@@ -1654,7 +1944,7 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 
 // peek returns the next directory entry without consuming it, fetching another
 // authority page only when the buffered one is exhausted.
-func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *authoritypb.Dirent, syscall.Errno) {
+func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPlusPageBoundary) (*fuse.DirEntry, *authoritypb.Dirent, syscall.Errno) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.stale.Load() {
@@ -1667,20 +1957,30 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 			h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 			h.pageStamp = subscriptionStamp{}
 			h.eof = false
+			h.cursorGeneration++
 		}
 	}
-	if h.pending != nil && h.pageWantItems != wantItems {
+	if len(boundary) != 0 && boundary[0].changedLocked(h) {
+		return nil, nil, 0
+	}
+	if h.page != nil && h.pageWantItems != wantItems {
 		// Resume from the last consumed authority cookie. A kernel is allowed to
 		// alternate READDIR and READDIRPLUS on one handle; capabilities must only
 		// be minted for the PLUS page that will actually carry them.
 		h.discardPageItemsLocked()
-		h.page, h.index, h.pending, h.pendingDirent = nil, 0, nil, nil
+		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
+		h.pageStamp = subscriptionStamp{}
+		h.eof = false
+		h.cursorGeneration++
 	}
 	if h.pending != nil {
 		return h.pending, h.pendingDirent, 0
 	}
 	for {
 		for h.index >= len(h.page) {
+			if len(boundary) != 0 && boundary[0].changedLocked(h) {
+				return nil, nil, 0
+			}
 			if h.eof {
 				return h.peekLocalLocked(), nil, 0
 			}
@@ -1697,14 +1997,33 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 				continue
 			}
 			generation := h.cursorGeneration
+			pageStamp := h.node.mount.subscription.stamp()
+			requestCookie := cloneBytes(h.cookie)
+			directoryIdentity, identityOK := publicationIdentityFromItem(h.node.item)
+			var heldIdentities [][]byte
+			if wantItems && identityOK && h.node.mount.raw != nil {
+				heldIdentities = h.node.mount.raw.heldDirectoryPageIdentities(directoryIdentity, requestCookie)
+			}
 			request := &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
-				Handle: cloneBytes(h.token), Cookie: cloneBytes(h.cookie), MaxEntries: 256, WantItems: wantItems,
+				Handle: cloneBytes(h.token), Cookie: requestCookie, MaxEntries: 256, WantItems: wantItems, HeldIdentities: heldIdentities,
 			}}}
 			h.fetching = true
 			h.fetchDone = make(chan struct{})
 			done := h.fetchDone
 			h.mu.Unlock()
-			response, errno := h.node.mutate(ctx, request)
+			// A withdrawn PLUS page can discard every capability without
+			// reaching intern. Throttle replacement pages before minting more
+			// cleanup debt, outside the cursor lock needed by withdrawal.
+			var response *authoritypb.Response
+			var errno syscall.Errno
+			if wantItems {
+				admitCtx, cancel := context.WithTimeout(ctx, h.node.requestTimeout)
+				errno = contextErrno(h.node.mount.reclaim.admit(admitCtx))
+				cancel()
+			}
+			if errno == 0 {
+				response, errno = h.node.mutate(ctx, request)
+			}
 			h.mu.Lock()
 			h.fetching = false
 			h.fetchDone = nil
@@ -1724,8 +2043,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 			if page == nil {
 				return nil, nil, syscall.EIO
 			}
-			identity, ok := publicationIdentityFromItem(h.node.item)
-			if !ok {
+			if !identityOK {
 				for _, entry := range page.GetEntries() {
 					if item := entry.GetItem(); item != nil {
 						h.node.mount.deferReclaim(item.GetToken())
@@ -1734,10 +2052,17 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 				h.node.mount.revoke(errors.New("fusev3: READDIR answered for an item with no stable identity"))
 				return nil, nil, syscall.ENOTCONN
 			}
-			publication := replyPublicationFromContext(ctx)
 			h.page, h.index, h.eof = page.GetEntries(), 0, page.GetEof()
-			h.pageStamp = publication.subscriptionCacheStamp()
-			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: identity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0
+			// A callback can fetch several pages across a withdrawal. Its aggregate
+			// reply stamp keeps the oldest version, but each buffered page owns
+			// its own RPC admission stamp and served version.
+			h.pageStamp = pageStamp.withVersion(response.GetVolumeVersion())
+			if wantItems && h.node.mount.raw != nil {
+				if err := h.node.mount.raw.stageDirectoryPageHint(ctx, directoryIdentity, requestCookie, h.pageStamp, h.page); err != nil {
+					return nil, nil, syscall.EIO
+				}
+			}
+			h.uncovered = h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: directoryIdentity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0
 			h.pageWantItems = wantItems
 			h.verifier = cloneBytes(page.GetVerifier())
 			if len(h.page) == 0 && !h.eof {
@@ -1798,35 +2123,28 @@ func (h *dirHandle) peekLocalLocked() *fuse.DirEntry {
 // consume accepts the entry last returned by peek. Until it is called the entry
 // stays buffered, so an entry that did not fit in a READDIR reply is delivered
 // by the next one instead of being silently skipped.
-func (h *dirHandle) consume() {
+func (h *dirHandle) consume(delivered *fuse.DirEntry) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.pending == nil {
-		if h.localIndex < len(h.local) {
-			h.next = h.local[h.localIndex].Off
-			h.localIndex++
-		}
+	if delivered.Off&graftDirOffsetBase != 0 {
+		h.next = delivered.Off
+		h.localIndex = int(delivered.Off &^ graftDirOffsetBase)
 		return
 	}
-	h.index++
-	h.cookie = h.pendingCookie
-	h.next = h.pending.Off
-	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
-}
-
-func (h *dirHandle) consumePlus() *authoritypb.Item {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.pending == nil || h.pendingDirent == nil {
-		return nil
+	// Invalidation may discard pending between peek and AddDirEntry. The
+	// accepted entry still owns its continuation cookie; losing that receipt
+	// would return the same unmodified name again on the next page.
+	if h.pending == delivered {
+		h.index++
+	} else {
+		h.discardPageItemsLocked()
+		h.page, h.index, h.eof = nil, 0, false
+		h.pageStamp = subscriptionStamp{}
+		h.cursorGeneration++
 	}
-	item := h.pendingDirent.GetItem()
-	h.pendingDirent.Item = nil
-	h.index++
-	h.cookie = h.pendingCookie
-	h.next = h.pending.Off
+	h.cookie = encodeCookie(delivered.Off)
+	h.next = delivered.Off
 	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
-	return item
 }
 
 func (h *dirHandle) discardPageItemsLocked() {
@@ -1840,37 +2158,12 @@ func (h *dirHandle) discardPageItemsLocked() {
 	}
 }
 
-func (h *dirHandle) authorityPageExhausted() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.index >= len(h.page)
-}
-
 func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 	if h.uncovered {
-		// This handle is between kernel callbacks holding a page no lease covers,
-		// so no recall will arrive to invalidate it if the directory changed in
-		// the gap. Its entries were exact when the authority produced them and
-		// are not claimed to be exact now, so the page is retired here rather
-		// than served again.
-		//
-		// What is deliberately NOT dropped is the position. h.cookie is the
-		// authority cookie following the last entry this handle actually handed
-		// to the kernel, and h.verifier is the snapshot that cookie counts in.
-		// Keeping both is the whole of the exactness claim: the refetch resumes
-		// at exactly the next undelivered entry, so it repeats nothing and skips
-		// nothing, and if the directory moved in the gap the authority refuses
-		// the resume with ESTALE (xfsstore.Volume.ReadDirOpen) instead of
-		// silently repositioning. h.uncovered stays set for the same reason --
-		// clearing it here left a live cookie behind a zero lease stamp, which
-		// peek's guard then read as a dead lease and restarted from the
-		// beginning, re-delivering every entry the kernel already had.
-		//
-		// An end-of-stream this handle holds no authority over is retired with
-		// the rest of the page. Re-establishing it costs one authority round
-		// trip and is the difference between reporting a directory finished
-		// because it was finished and reporting it finished because a page that
-		// nothing was obliged to withdraw still said so.
+		// The page lost its subscription coverage between callbacks. Retire
+		// its entries and EOF, but preserve the last delivered XFS cookie.
+		// Stable offsets resume after that entry across directory mutations;
+		// the verifier only validates a newly fetched page for publication.
 		h.discardPageItemsLocked()
 		h.page, h.index, h.eof = nil, 0, false
 		h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
@@ -1904,7 +2197,7 @@ func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
 		// Starting the directory over abandons every position this handle held,
 		// so there is nothing left for the uncovered mark to protect. A seek to
 		// any other offset keeps it: that offset is itself an authority cookie
-		// and is still resumed under the verifier.
+		// and resumes from the same XFS continuation offset.
 		h.verifier = nil
 		h.uncovered = false
 	}
@@ -2003,23 +2296,46 @@ func (h *dirHandle) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
 }
 
 func (h *dirHandle) close(ctx context.Context) syscall.Errno {
+	return h.closeForCleanup(ctx).errno()
+}
+
+func (h *dirHandle) closeForCleanup(ctx context.Context) resourceCleanupError {
 	if h.stale.Load() || h.node.epochStale.Load() {
-		return syscall.EIO
+		return resourceCleanupError{cause: syscall.EIO}
 	}
-	var errno syscall.Errno
 	h.once.Do(func() {
 		h.mu.Lock()
 		h.discardPageItemsLocked()
 		h.mu.Unlock()
-		_, errno = h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
+		response, errno := h.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytes(h.token)}}})
+		if errno != 0 {
+			h.closeOutcome.cause = errno
+			if response != nil {
+				h.closeOutcome.failure = response.GetFailure()
+			}
+		}
 	})
-	return errno
+	return h.closeOutcome
 }
 
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*authoritypb.Item, *fileHandle, uint32, syscall.Errno) {
 	openFlags, errno := protocolOpenFlags(flags)
 	if errno != 0 {
 		return nil, nil, 0, errno
+	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, nil, 0, bufferErrno(err)
+	}
+	if identity, ok := n.cachedBoundIdentity(name); ok && openFlags.GetWrite() {
+		id, err := delegationIdentity(identity[:])
+		if err != nil {
+			return nil, nil, 0, syscall.EIO
+		}
+		state := n.mount.delegations.state(id)
+		if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
+			return nil, nil, 0, bufferErrno(err)
+		}
+		defer state.acquire.Unlock()
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777, Flags: openFlags, Exclusive: flags&uint32(syscall.O_EXCL) != 0, WriteIntent: openFlags.GetWrite(), CacheCapable: !openFlags.GetWrite()}}}
 	gate, err := namespaceSourceGate(n.item, name, openFlags.GetTruncate())
@@ -2037,7 +2353,11 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 			}
 			return result, nil
 		})
-		errno = bufferErrno(callErr)
+		if errors.Is(callErr, errDelegationNotOwned) {
+			response, errno = n.mutateWithSource(ctx, request, gate)
+		} else {
+			errno = bufferErrno(callErr)
+		}
 	} else {
 		response, errno = n.mutateWithSource(ctx, request, gate)
 	}
@@ -2074,7 +2394,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 		object = postStateObject(response.GetPostState(), item.GetStableIdentity(), postStateRoleCreated)
 	}
 	if object != nil {
-		n.mount.delegations.SetBaseAttr(item.GetStableIdentity(), object.GetAttr())
+		n.mount.delegations.SetBaseAttr(item.GetStableIdentity(), object.GetAttr(), object.GetObjectVersion())
 	}
 	return item, handle, kernelFlags, 0
 }
@@ -2087,13 +2407,13 @@ func (n *node) cachedBoundIdentity(name string) (publicationIdentity, bool) {
 	if !ok {
 		return publicationIdentity{}, false
 	}
-	n.mount.raw.mu.Lock()
+	n.mount.raw.mu.RLock()
 	record := n.mount.raw.cachedStableNames[publicationNamespace{parent: parent, name: name}]
 	var identity publicationIdentity
 	if record != nil && !record.reclaimed && record.node != nil && !record.node.epochStale.Load() {
 		identity = record.identity
 	}
-	n.mount.raw.mu.Unlock()
+	n.mount.raw.mu.RUnlock()
 	return identity, identity != (publicationIdentity{})
 }
 
@@ -2104,6 +2424,9 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 			errno = syscall.EINVAL
 		}
 		return nil, nil, 0, errno
+	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, nil, 0, bufferErrno(err)
 	}
 	gate, err := itemSourceGate(n.item, false)
 	if err != nil {
@@ -2152,6 +2475,9 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 	if rdev != 0 {
 		return nil, syscall.EPERM
 	}
+	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
+		return nil, bufferErrno(err)
+	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{
 		Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777,
 		Flags: &authoritypb.OpenFlags{Write: true}, Exclusive: true,
@@ -2178,9 +2504,13 @@ func (n *node) Mknod(ctx context.Context, name string, mode, rdev uint32) (*auth
 	// mknod(2) does not hand an open file description to the caller, so the one
 	// the authority just created is this frontend's to release immediately.
 	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle())}
-	if errno := handle.close(ctx, 0, false); errno != 0 {
-		n.mount.cleanupFailed("open-file close after mknod", errno)
-		return nil, errno
+	if outcome := handle.closeForCleanup(ctx, 0, false); outcome.failed() {
+		n.mount.cleanupFailed("open-file close after mknod", outcome, func() {
+			handle.stale.Store(true)
+			handle.node.stale.Store(true)
+			n.mount.delegations.failCleanupIdentity(handle.node.item.GetStableIdentity(), "mknod handle cleanup refused")
+		})
+		return nil, outcome.errno()
 	}
 	return item, 0
 }
@@ -2440,7 +2770,10 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 	if request.Mode == nil && request.Size == nil && request.AtimeNs == nil && request.MtimeNs == nil && !request.GetAtimeNow() && !request.GetMtimeNow() {
 		return n.Getattr(ctx, fh, out)
 	}
-	if n.item.GetAttr().GetKind() == authoritypb.Attr_REGULAR {
+	// Metadata on an unowned file uses the ordinary synchronous SETATTR path.
+	// Acquiring a data-write OPEN would wrongly require write permission for
+	// chmod by the owner of a mode-000 file.
+	if n.item.GetAttr().GetKind() == authoritypb.Attr_REGULAR && (request.Size != nil || n.mount.delegations.Owns(n.item.GetStableIdentity())) {
 		acquired := &acquiredDelegationHandle{}
 		ctx = context.WithValue(ctx, acquiredDelegationHandleKey{}, acquired)
 		defer func() {
@@ -2448,8 +2781,10 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 				_ = n.mount.delegations.QueueClose(n.item.GetStableIdentity(), acquired.token, 0, false)
 			}
 		}()
-		if err := n.ensureWriteDelegation(ctx, fh); err != nil {
-			return bufferErrno(err)
+		if request.Size != nil {
+			if err := n.ensureWriteDelegation(ctx, fh); err != nil {
+				return bufferErrno(err)
+			}
 		}
 		gate, gateErr := itemSourceGate(n.item, request.Size != nil)
 		if gateErr != nil {
@@ -2459,13 +2794,15 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 		if callback == nil {
 			return syscall.EIO
 		}
-		lease, gateErr := callback.acquireSource(ctx, n.mount.raw, gate)
-		if gateErr != nil {
-			return bufferErrno(gateErr)
-		}
-		if gateErr = lease.markAssigned(); gateErr != nil {
-			return syscall.EIO
-		}
+		var lease *sourcePublicationLease
+		ctx = context.WithValue(ctx, delegationPrepareContextKey{}, func() error {
+			var acquireErr error
+			lease, acquireErr = callback.acquireSource(ctx, n.mount.raw, gate)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			return lease.markAssigned()
+		})
 		attrs := writeback.Attributes{ATimeNow: request.AtimeNow, MTimeNow: request.MtimeNow}
 		if request.Mode != nil {
 			attrs.HasMode = true
@@ -2483,9 +2820,24 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 			attrs.HasMTime = true
 			attrs.MTimeNS = *request.MtimeNs
 		}
-		if _, err := n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs); err != nil {
-			_ = lease.markCallbackPublicationReady()
-			return bufferErrno(err)
+		var admissionErr error
+		for {
+			_, admissionErr = n.mount.delegations.SetAttr(ctx, n.item.GetStableIdentity(), attrs)
+			if !errors.Is(admissionErr, errDelegationNotOwned) {
+				break
+			}
+			if request.Size == nil {
+				goto synchronousSetattr
+			}
+			if admissionErr = n.ensureWriteDelegation(ctx, fh); admissionErr != nil {
+				break
+			}
+		}
+		if admissionErr != nil {
+			if lease != nil {
+				_ = lease.markCallbackPublicationReady()
+			}
+			return bufferErrno(admissionErr)
 		}
 		if err := n.invalidateOwnData(ctx, 0, 0); err != nil {
 			_ = lease.markCallbackPublicationReady()
@@ -2504,10 +2856,11 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 				return syscall.EIO
 			}
 			base = response.GetGetAttr().GetAttr()
-			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), base)
+			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), base, response.GetGetAttr().GetObjectVersion())
 		}
 		return n.overlayAttr(base, out)
 	}
+synchronousSetattr:
 	gate, err := itemSourceGate(n.item, request.Size != nil)
 	if err != nil {
 		return syscall.EIO
@@ -2654,9 +3007,22 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	if lock.Typ != syscall.F_RDLCK && lock.Typ != syscall.F_WRLCK && lock.Typ != syscall.F_UNLCK || flags&^uint32(fuse.FUSE_LK_FLOCK) != 0 {
 		return syscall.EINVAL
 	}
+	posix := flags&uint32(fuse.FUSE_LK_FLOCK) == 0
+	key := n.posixLockKey(owner)
+	generation := uint64(0)
+	if posix {
+		if lock.Typ == syscall.F_UNLCK {
+			generation = n.mount.possiblePOSIXLock(key)
+		} else {
+			n.mount.notePOSIXLock(key)
+		}
+	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: lockRequest(n.item.GetToken(), owner, lock, flags), Wait: wait, Unlock: lock.Typ == syscall.F_UNLCK}}}
 	if !wait {
 		_, errno := n.mutate(ctx, request)
+		if errno == 0 && lock.Typ == syscall.F_UNLCK && posix {
+			n.mount.dischargePOSIXLock(key, generation)
+		}
 		return errno
 	}
 	// A blocking lock request has no operation deadline: it is defined to wait
@@ -2668,7 +3034,11 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	}
 	defer releaseBulk()
 	response, err := n.mount.callMutation(ctx, request, nil)
-	return rpcErrno(response, err)
+	errno = rpcErrno(response, err)
+	if errno == 0 && lock.Typ == syscall.F_UNLCK && posix {
+		n.mount.dischargePOSIXLock(key, generation)
+	}
+	return errno
 }
 
 func protocolOpenFlags(flags uint32) (*authoritypb.OpenFlags, syscall.Errno) {

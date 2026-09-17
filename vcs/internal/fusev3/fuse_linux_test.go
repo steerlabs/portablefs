@@ -90,7 +90,11 @@ type fakeRPC struct {
 	closeFailure   syscall.Errno
 	mkdirFailure   syscall.Errno
 	reclaimFailure syscall.Errno
+	reclaimClass   authoritypb.FailureClass
+	subscribeGate  <-chan struct{}
+	subscribeCalls int
 	keepAliveErr   syscall.Errno
+	sessionEnd     error
 	xattrValue     []byte
 	xattrNames     [][]byte
 	fileData       []byte
@@ -167,15 +171,30 @@ func (f *fakeRPC) SessionLease() time.Duration        { return f.lease }
 func (f *fakeRPC) SessionDone() <-chan struct{}       { return f.done }
 func (f *fakeRPC) SessionError() error                { return nil }
 func (f *fakeRPC) SessionEndPending() <-chan struct{} { return f.done }
-func (f *fakeRPC) SessionEndCause() error             { return nil }
-func (f *fakeRPC) FinishLocalSessionEnforcement()     {}
+func (f *fakeRPC) SessionEndCause() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionEnd
+}
+func (f *fakeRPC) FinishLocalSessionEnforcement() {}
 func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+	f.mu.Lock()
+	f.subscribeCalls++
+	gate := f.subscribeGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, time.Time{}, ctx.Err()
+		}
+	}
 	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, time.Now().Add(10 * time.Second), nil
 }
 func (f *fakeRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
 	return time.Now().Add(10 * time.Second), nil
 }
-func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after uint64) (*authoritypb.ControlEvent, error) {
+func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after, completed uint64) (*authoritypb.ControlEvent, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -375,11 +394,19 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				result.GetOpen().Delegation = testDelegation()
 			}
 		}
-		if request.GetCreate() != nil && result.GetCreate() != nil && request.GetCreate().GetWriteIntent() {
-			result.GetCreate().Delegation = testDelegation()
+		if request.GetCreate() != nil && result.GetCreate() != nil {
+			result.GetCreate().CacheCapable = request.GetCreate().GetCacheCapable()
+			if request.GetCreate().GetWriteIntent() {
+				result.GetCreate().Delegation = testDelegation()
+			}
 		}
-		result.LeaseGrants = nil
 	}()
+	if wait := request.GetWaitVisibility(); wait != nil {
+		cut := wait.GetCutSequence()
+		return &authoritypb.Response{VisibleSequence: cut, Body: &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{
+			AppliedSequence: cut, VisibleSequence: cut,
+		}}}, nil
+	}
 	if f.replyOverride != nil {
 		return f.replyOverride(request)
 	}
@@ -390,10 +417,22 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 			return &authoritypb.Response{Errno: int32(f.keepAliveErr)}, nil
 		}
 	case request.GetReclaim() != nil:
-		f.reclaims = append(f.reclaims, cloneBytes(request.GetReclaim().GetItem()))
-		if f.reclaimFailure != 0 {
-			return &authoritypb.Response{Errno: int32(f.reclaimFailure)}, nil
+		if item := request.GetReclaim().GetItem(); len(item) != 0 {
+			f.reclaims = append(f.reclaims, cloneBytes(item))
 		}
+		for _, item := range request.GetReclaim().GetItems() {
+			f.reclaims = append(f.reclaims, cloneBytes(item))
+		}
+		if f.reclaimFailure != 0 {
+			return &authoritypb.Response{Errno: int32(f.reclaimFailure), Failure: f.reclaimClass}, nil
+		}
+	case request.GetCloseBatch() != nil:
+		results := make([]*authoritypb.CloseBatchResult, len(request.GetCloseBatch().Closes))
+		for i, close := range request.GetCloseBatch().Closes {
+			f.fileCloses = append(f.fileCloses, proto.Clone(close).(*authoritypb.CloseRequest))
+			results[i] = &authoritypb.CloseBatchResult{Errno: int32(f.closeFailure)}
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
 	case request.GetClose() != nil:
 		f.fileCloses = append(f.fileCloses, proto.Clone(request.GetClose()).(*authoritypb.CloseRequest))
 		if f.closeFailure != 0 {
@@ -443,7 +482,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				struct {
 					item  *authoritypb.Item
 					roles uint32
-				}{f.root, postStateRoleParent}),
+				}{f.itemForTokenLocked(request.GetMkdir().GetParent()), postStateRoleParent}),
 		}, nil
 	case request.GetSymlink() != nil:
 		created := f.namedItem(request.GetSymlink().GetName())
@@ -471,7 +510,8 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 		}
 		return response, nil
 	case request.GetCreate() != nil:
-		created := cloneItem(f.item)
+		created := f.namedItem(request.GetCreate().GetName())
+		delete(f.missingNames, string(request.GetCreate().GetName()))
 		return &authoritypb.Response{
 			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: created, Handle: cloneBytes(f.handle)}},
 			PostState: exactTestPostState(2,
@@ -482,7 +522,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				struct {
 					item  *authoritypb.Item
 					roles uint32
-				}{f.root, postStateRoleParent}),
+				}{f.itemForTokenLocked(request.GetCreate().GetParent()), postStateRoleParent}),
 		}, nil
 	case request.GetRead() != nil:
 		offset := int(request.GetRead().GetOffset())
@@ -535,6 +575,21 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				roles uint32
 			}{parent, postStateRoleParent},
 		)}, nil
+	case request.GetLink() != nil:
+		link := request.GetLink()
+		linked := f.itemForTokenLocked(link.GetExistingItem())
+		linked.Attr.Nlink++
+		parent := f.itemForTokenLocked(link.GetNewParent())
+		if f.byName != nil {
+			f.byName[string(link.GetNewName())] = linked
+		}
+		return &authoritypb.Response{PostState: exactTestPostState(2, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{linked, postStateRoleTarget}, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{parent, postStateRoleParent}), Body: &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: cloneItem(linked)}}}, nil
 	case request.GetRename() != nil:
 		rename := request.GetRename()
 		moved := f.itemForTokenLocked(nil)
@@ -829,8 +884,17 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	// The read-ahead window is paired with the authority read bound: reads are
 	// now served from the page cache, so the window is what decides how many
 	// authority round trips a sequential reader pays.
-	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
+	if !options.EnableLocks || options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
 		t.Fatalf("mount options = %#v", options)
+	}
+	routedConfig := testConfig(8)
+	routedConfig.Routes = mustRoutes(t, "local/\n")
+	routed := mountOptions(routedConfig, 128*1024, 64*1024)
+	if !routed.DisableReadDirPlus || routed.DisabledCapabilities&(fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO) != fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO {
+		t.Fatal("routed mount enabled unsupported PLUS")
+	}
+	if options.DisabledCapabilities&(fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO) != 0 {
+		t.Fatal("Authority mount disabled PLUS capabilities")
 	}
 	foundDefaultPermissions := false
 	for _, option := range options.Options {
@@ -1058,22 +1122,19 @@ func TestForgetNeverBlocksUnderCleanupPressure(t *testing.T) {
 	}
 }
 
-func TestReclaimDrainIsConcurrent(t *testing.T) {
+func TestReclaimDrainBatchesTimerResidue(t *testing.T) {
 	mount, rpc := testMount(t, 1024)
-	width := mount.reclaimWorkers
-	if width < 2 {
-		t.Fatalf("reclaim lane width = %d, want at least 2", width)
-	}
-	reached := make(chan struct{}, width)
+	reached := make(chan *authoritypb.ReclaimRequest, 2)
 	release := make(chan struct{})
 	rpc.hook = func(request *authoritypb.Request) {
-		if request.GetReclaim() == nil {
+		reclaim := request.GetReclaim()
+		if reclaim == nil {
 			return
 		}
-		reached <- struct{}{}
+		reached <- proto.Clone(reclaim).(*authoritypb.ReclaimRequest)
 		<-release
 	}
-	for id := uint64(1); id <= uint64(width); id++ {
+	for id := uint64(1); id <= 100; id++ {
 		mount.deferReclaim(testToken(id))
 	}
 	mount.start(time.Hour)
@@ -1081,12 +1142,38 @@ func TestReclaimDrainIsConcurrent(t *testing.T) {
 		close(release)
 		_ = mount.Close()
 	}()
-	for count := 0; count < width; count++ {
-		select {
-		case <-reached:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("only %d of %d reclaims were in flight at once; a serial drain cannot keep up with ordinary path walking", count, width)
+	select {
+	case request := <-reached:
+		if len(request.GetItem()) != 0 || len(request.GetItems()) != 100 {
+			t.Fatalf("reclaim request = legacy:%x batch:%d, want one 100-token batch", request.GetItem(), len(request.GetItems()))
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reclaim residue was not sent at the timer")
+	}
+	select {
+	case request := <-reached:
+		t.Fatalf("timer residue fragmented into another request: %+v", request)
+	case <-time.After(2 * reclaimBatchDelay):
+	}
+}
+
+func TestReclaimQueueFlushesAtWatermarkWithoutMixingEpochs(t *testing.T) {
+	oldTransport, newTransport := newFakeRPC(), newFakeRPC()
+	queue := newReclaimQueue(4)
+	for id := uint64(1); id <= 4; id++ {
+		queue.push(queuedReclaim{token: testToken(id), transport: oldTransport})
+	}
+	queue.push(queuedReclaim{token: testToken(5), transport: newTransport})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	batch, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
+	if !ok || len(batch) != 4 || batch[0].transport != oldTransport || time.Since(start) >= reclaimBatchDelay {
+		t.Fatalf("watermark batch = %d ok=%v transport=%T elapsed=%s", len(batch), ok, batch[0].transport, time.Since(start))
+	}
+	next, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
+	if !ok || len(next) != 1 || next[0].transport != newTransport {
+		t.Fatalf("replacement-epoch batch = %+v ok=%v", next, ok)
 	}
 }
 
@@ -1095,6 +1182,8 @@ func TestReclaimDrainIsConcurrent(t *testing.T) {
 func TestCancelledShutdownIsNotReportedAsFailure(t *testing.T) {
 	mount, rpc := testMount(t, 64)
 	rpc.block = make(chan struct{})
+	consumption := &recordingResponseConsumption{}
+	rpc.retainedConsumption = consumption
 	mount.start(time.Hour)
 	for id := uint64(1); id <= 8; id++ {
 		mount.deferReclaim(testToken(id))
@@ -1109,6 +1198,9 @@ func TestCancelledShutdownIsNotReportedAsFailure(t *testing.T) {
 	}
 	if err := mount.fatalError(); err != nil {
 		t.Fatalf("shutdown recorded a fatal error: %v", err)
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("cancelled reclaim response consumption = %d, want 1", got)
 	}
 }
 
@@ -1247,7 +1339,7 @@ func TestLivenessAndCleanupLanesAreReserved(t *testing.T) {
 	}
 }
 
-// --- Defect 9: a refused release is never discarded ------------------------
+// --- Defect 9: a refused release is scoped to the released resource --------
 
 func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	frontend, mount, rpc := testRawFileSystem(t, 8)
@@ -1265,12 +1357,11 @@ func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	if frontend.ReplyWriteTracked(unique) {
 		frontend.ReplyWritten(unique, fuse.OK)
 	}
-	err := mount.fatalError()
-	if err == nil {
-		t.Fatal("a refused close was discarded; the authority keeps the open file description until the session ends")
+	if err := mount.fatalError(); err != nil {
+		t.Fatalf("definite close refusal revoked mount: %v", err)
 	}
-	if !strings.Contains(err.Error(), "frontend-owned resource") {
-		t.Fatalf("diagnostic does not name the cause: %v", err)
+	if !record.node.stale.Load() {
+		t.Fatal("refused close did not stale the affected identity")
 	}
 }
 
@@ -1285,9 +1376,16 @@ func TestReleaseDirSurfacesARefusedClose(t *testing.T) {
 	if !ok {
 		t.Fatal("add handle")
 	}
-	frontend.ReleaseDir(&fuse.ReleaseIn{Fh: id})
-	if mount.fatalError() == nil {
-		t.Fatal("a refused directory close was discarded")
+	unique := nextTestRequestUnique()
+	frontend.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: unique}, Fh: id})
+	if frontend.ReplyWriteTracked(unique) {
+		frontend.ReplyWritten(unique, fuse.OK)
+	}
+	if err := mount.fatalError(); err != nil {
+		t.Fatalf("definite directory close refusal revoked mount: %v", err)
+	}
+	if !record.node.stale.Load() {
+		t.Fatal("refused directory close did not stale the affected identity")
 	}
 }
 
@@ -1576,7 +1674,7 @@ func TestDirHandleBuffersOneAuthorityPageAcrossEntries(t *testing.T) {
 			t.Fatalf("peek is not idempotent: %q then %q", entry.Name, again.Name)
 		}
 		names = append(names, entry.Name)
-		handle.consume()
+		handle.consume(entry)
 	}
 	entry, _, errno := handle.peek(ctx, false)
 	if errno != 0 || entry != nil {
@@ -1939,6 +2037,9 @@ func TestSetattrProjectsSinglePrincipal(t *testing.T) {
 func TestSetattrPreservesServerClockNowIntent(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	n := testNode(mount)
+	if err := mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), testToken(100), delegationTestGrant(44, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
 	in := &fuse.SetAttrIn{}
 	in.Valid = fuse.FATTR_ATIME_NOW | fuse.FATTR_MTIME_NOW
 	before := time.Now().UnixNano()
@@ -1996,6 +2097,26 @@ func TestLockRequestPreservesFlockNamespace(t *testing.T) {
 func TestUncertainResponseFailsClosed(t *testing.T) {
 	if got := responseErrno(&authoritypb.Response{Uncertain: true}); got != syscall.EIO {
 		t.Fatalf("uncertain errno = %v", got)
+	}
+}
+
+func TestMissingSubscriptionRegistryFailsClosed(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	n := testNode(mount)
+	handle := &fileHandle{node: n, token: testToken(100)}
+	ctx, finish := testMutationContext(t, mount)
+	mount.subscription = nil
+	before := rpc.calls
+	if _, errno := n.Read(t.Context(), handle, make([]byte, 1), 0); errno != syscall.EIO {
+		t.Fatalf("read errno=%v, want EIO", errno)
+	}
+	_, err := mount.callMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{}}}, nil)
+	finish(false)
+	if err == nil {
+		t.Fatal("mutation without subscription registry succeeded")
+	}
+	if rpc.calls != before {
+		t.Fatalf("missing registry reached Authority: calls=%d want %d", rpc.calls, before)
 	}
 }
 
@@ -2178,15 +2299,176 @@ func TestTerminalSessionSignalAbortsMount(t *testing.T) {
 	}
 }
 
-func TestRefusedReclaimIsTerminal(t *testing.T) {
+func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.T) {
 	mount, rpc := testMount(t, 64)
-	rpc.reclaimFailure = syscall.EIO
-	mount.start(time.Hour)
-	mount.deferReclaim(testToken(1))
+	mount.subscription.mu.Lock()
+	mount.subscription.active = true
+	mount.subscription.incarnation = 7
+	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.mu.Unlock()
+	coherence := resourceCleanupError{cause: syscall.EIO, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
+	if retry := mount.cleanupFailed("object reclaim", coherence, nil); !retry {
+		t.Fatal("coherence cleanup refusal was not deferred")
+	}
+	if mount.isRevoked() || mount.subscription.stamp() != (subscriptionStamp{}) {
+		t.Fatalf("coherence cleanup refusal revoked or retained subscription: revoked=%v stamp=%+v", mount.isRevoked(), mount.subscription.stamp())
+	}
+
+	if retry := mount.cleanupFailed("object reclaim", resourceCleanupError{cause: syscall.EIO}, nil); retry || mount.isRevoked() {
+		t.Fatalf("definite scoped refusal retry=%v revoked=%v", retry, mount.isRevoked())
+	}
+	mount.subscription.mu.Lock()
+	mount.subscription.active = true
+	mount.subscription.incarnation = 8
+	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.mu.Unlock()
+	rpc.mu.Lock()
+	rpc.sessionEnd = authorityrpc.ErrAuthorityChanged
+	rpc.mu.Unlock()
+	if retry := mount.cleanupFailed("deferred close", resourceCleanupError{cause: authorityrpc.ErrAuthorityChanged}, nil); !retry {
+		t.Fatal("epoch replacement cleanup was not deferred")
+	}
+	if mount.isRevoked() || mount.subscription.stamp() != (subscriptionStamp{}) {
+		t.Fatalf("epoch replacement revoked or retained subscription: revoked=%v stamp=%+v", mount.isRevoked(), mount.subscription.stamp())
+	}
+	rpc.mu.Lock()
+	rpc.sessionEnd = authorityrpc.ErrSessionEnded
+	rpc.mu.Unlock()
+	mount.cleanupFailed("object reclaim", resourceCleanupError{cause: syscall.EIO}, nil)
 	select {
 	case <-mount.ctx.Done():
 	case <-time.After(2 * time.Second):
-		t.Fatal("a refused reclaim left the frontend and the authority disagreeing about ownership")
+		t.Fatal("terminal session cleanup failure did not revoke mount")
+	}
+}
+
+func TestCleanupRecoveryWithoutSubscriptionRegistryDoesNotPanic(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		sessionEnd error
+	}{
+		{name: "subscription reset", err: authorityrpc.ErrSubscriptionReset},
+		{name: "coherence refusal", err: resourceCleanupError{cause: syscall.EIO, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}},
+		{name: "authority replacement", err: resourceCleanupError{cause: syscall.EIO}, sessionEnd: authorityrpc.ErrAuthorityChanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mount, rpc := testMount(t, 64)
+			mount.subscription = nil
+			rpc.mu.Lock()
+			rpc.sessionEnd = tc.sessionEnd
+			rpc.mu.Unlock()
+			if retry := mount.cleanupFailed("object reclaim", tc.err, nil); !retry {
+				t.Fatal("recoverable cleanup failure was not deferred")
+			}
+			if mount.isRevoked() {
+				t.Fatal("recoverable cleanup failure revoked mount without a subscription registry")
+			}
+		})
+	}
+}
+
+func TestRefusedReclaimRequeuesAfterColdSubscription(t *testing.T) {
+	mount, rpc := testMount(t, 64)
+	reactivate := make(chan struct{})
+	rpc.mu.Lock()
+	rpc.subscribeGate = reactivate
+	reclaimCalls := 0
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetReclaim() == nil {
+			return &authoritypb.Response{}, nil
+		}
+		reclaimCalls++
+		if reclaimCalls == 1 {
+			return &authoritypb.Response{
+				Errno:   int32(syscall.EIO),
+				Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
+			}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	rpc.mu.Unlock()
+
+	mount.start(time.Hour)
+	defer func() {
+		mount.cancel()
+		mount.wg.Wait()
+	}()
+	mount.deferReclaim(testToken(71))
+	waitFor(t, "refused reclaim and parked cold subscribe", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return reclaimCalls == 1 && rpc.subscribeCalls >= 2
+	})
+	if mount.isRevoked() {
+		t.Fatal("coherence reclaim refusal revoked the mount")
+	}
+	rpc.mu.Lock()
+	if reclaimCalls != 1 {
+		t.Fatalf("reclaim retried before subscription reactivation: %d", reclaimCalls)
+	}
+	rpc.mu.Unlock()
+
+	close(reactivate)
+	waitFor(t, "reclaim retry after cold subscription", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return reclaimCalls == 2
+	})
+	waitFor(t, "reclaim queue drain", func() bool { return mount.reclaim.pending() == 0 })
+	if mount.isRevoked() || mount.ctx.Err() != nil {
+		t.Fatalf("reclaim recovery stopped the worker: revoked=%v context=%v", mount.isRevoked(), mount.ctx.Err())
+	}
+}
+
+func TestReclaimWorkerRequiresEpochRPCFacade(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	mount := &Mount{rpc: newFakeRPC(), ctx: ctx, cancel: cancel, reclaim: newReclaimQueue(1)}
+	mount.wg.Add(1)
+	go mount.reclaimLoop(ctx)
+	mount.wg.Wait()
+	if err := mount.fatalError(); err == nil || !strings.Contains(err.Error(), "epoch RPC facade") {
+		t.Fatalf("reclaim worker invariant error = %v", err)
+	}
+}
+
+func TestPermanentReclaimRefusalIsBackedOff(t *testing.T) {
+	mount, rpc := testMount(t, 1)
+	var attempts []time.Time
+	rpc.mu.Lock()
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetReclaim() == nil {
+			return &authoritypb.Response{}, nil
+		}
+		attempts = append(attempts, time.Now())
+		return &authoritypb.Response{
+			Errno:   int32(syscall.EIO),
+			Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
+		}, nil
+	}
+	rpc.mu.Unlock()
+	mount.start(time.Hour)
+	defer func() {
+		mount.cancel()
+		mount.wg.Wait()
+	}()
+	mount.deferReclaim(testToken(72))
+	waitFor(t, "three backed-off reclaim attempts", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return len(attempts) >= 3
+	})
+	rpc.mu.Lock()
+	observed := append([]time.Time(nil), attempts[:3]...)
+	rpc.mu.Unlock()
+	for i := 1; i < len(observed); i++ {
+		if elapsed := observed[i].Sub(observed[i-1]); elapsed < reclaimRetryDelay*9/10 {
+			t.Fatalf("reclaim attempts %d and %d were separated by %s, want backoff near %s", i, i+1, elapsed, reclaimRetryDelay)
+		}
+	}
+	if mount.isRevoked() {
+		t.Fatal("permanent coherence reclaim refusal revoked the mount")
 	}
 }
 
@@ -2203,4 +2485,86 @@ func (f *fakeRPC) DetachAfterUnmount(_ context.Context, proof MountAbsenceProof)
 
 func testDelegation() *authoritypb.Delegation {
 	return &authoritypb.Delegation{Id: testToken(700), Generation: 1, Mode: authoritypb.DelegationMode_DELEGATION_MODE_FULL}
+}
+
+func TestLookupPublishesHolderBufferedSize(t *testing.T) {
+	raw, mount, rpc := testRawFileSystem(t, 8)
+	rpc.item.Attr.Size = 0
+	identity := rpc.item.GetStableIdentity()
+	if err := mount.delegations.Install(identity, rpc.item.GetToken(), testToken(100), delegationTestGrant(45, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mount.delegations.Write(t.Context(), identity, 0, make([]byte, 4096), false); err != nil {
+		t.Fatal(err)
+	}
+	out := &fuse.EntryOut{}
+	if status := testRawCall(t, raw, func(unique uint64) fuse.Status {
+		return raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "buffered", out)
+	}); !status.Ok() {
+		t.Fatal(status)
+	}
+	if out.Size != 4096 || out.AttrValid != 0 || out.AttrValidNsec != 0 {
+		t.Fatalf("holder lookup published stale size or cache lifetime: %+v", out)
+	}
+}
+
+func TestKeepAliveTransportTimeoutDoesNotRevokeMount(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	calls := make(chan struct{}, 8)
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetKeepAlive() != nil {
+			calls <- struct{}{}
+			return nil, context.DeadlineExceeded
+		}
+		return nil, nil
+	}
+	mount.wg.Add(1)
+	go mount.keepAlive(mount.ctx, 15*time.Millisecond)
+	for range 3 {
+		select {
+		case <-calls:
+		case <-mount.ctx.Done():
+			t.Fatal("transport timeout revoked mount")
+		case <-time.After(time.Second):
+			t.Fatal("keepalive did not retry")
+		}
+	}
+	select {
+	case <-mount.ctx.Done():
+		t.Fatal("transport timeout revoked mount")
+	default:
+	}
+	mount.cancel()
+	mount.wg.Wait()
+}
+
+func TestReadDuringColdSubscriptionFailsWithoutRPC(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired-%t", expired), func(t *testing.T) {
+			mount, rpc := testMount(t, 8)
+			n := testNode(mount)
+			mount.subscription.mu.Lock()
+			if expired {
+				mount.subscription.cacheUntil = time.Now().Add(-time.Second)
+			} else {
+				mount.subscription.active = false
+			}
+			mount.subscription.mu.Unlock()
+			before := 0
+			rpc.snapshot(func(f *fakeRPC) { before = f.calls })
+			handle := &fileHandle{node: n, token: []byte("handle")}
+			result, errno := n.Read(context.Background(), handle, make([]byte, 4096), 0)
+			if result != nil || errno != syscall.EIO {
+				t.Fatalf("cold read=%v,%v", result, errno)
+			}
+			rpc.snapshot(func(f *fakeRPC) {
+				if f.calls != before {
+					t.Fatal("cold read reached the transport")
+				}
+			})
+			if mount.isRevoked() {
+				t.Fatal("cold read revoked mount")
+			}
+		})
+	}
 }

@@ -3,6 +3,7 @@ package volumeserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -93,12 +94,18 @@ func cv2CutAck(t *testing.T, c *CoherenceCoordinator, token SubscriptionToken, e
 }
 
 func TestCoherenceDelegationCacheModes(t *testing.T) {
-	for _, peerHandles := range []int{0, 1, 3} {
-		t.Run(string(rune('0'+peerHandles)), func(t *testing.T) {
+	for _, test := range []struct{ holderHandles, peerHandles int }{{0, 0}, {0, 1}, {0, 3}, {1, 0}, {3, 0}, {3, 1}} {
+		peerHandles := test.peerHandles
+		t.Run(fmt.Sprintf("holder=%d/peer=%d", test.holderHandles, peerHandles), func(t *testing.T) {
 			c, _ := cv2Coordinator(t)
 			a := cv2Subscribe(t, c, 1)
 			b := cv2Subscribe(t, c, 2)
 			f := [16]byte{9}
+			for range test.holderHandles {
+				if ok, err := c.OpenCacheCapable(a, f); !ok || err != nil {
+					t.Fatalf("holder open = %v %v", ok, err)
+				}
+			}
 			for range peerHandles {
 				if ok, err := c.OpenCacheCapable(b, f); !ok || err != nil {
 					t.Fatalf("open = %v %v", ok, err)
@@ -142,6 +149,11 @@ func TestCoherenceDelegationCacheModes(t *testing.T) {
 			}
 			if _, ok := c.LookupDelegation(f); ok {
 				t.Fatal("released grant retained")
+			}
+			for range test.holderHandles {
+				if err := c.CloseCacheCapable(a, f); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if ok, err := c.OpenCacheCapable(b, f); !ok || err != nil {
 				t.Fatalf("released open=%v %v", ok, err)
@@ -353,6 +365,41 @@ func TestCoherenceSynchronousMutationPinsExistingHolderGrant(t *testing.T) {
 	}
 }
 
+func TestCoherenceHolderSynchronousMutationPassesPendingPeerCut(t *testing.T) {
+	for _, recall := range []bool{false, true} {
+		c, _ := cv2Coordinator(t)
+		holder := cv2Subscribe(t, c, 1)
+		identity := [16]byte{0x53}
+		grant := cv2Grant(t, c, holder, identity)
+		done := make(chan error, 1)
+		kind := StreamBreakForRead
+		if recall {
+			kind = StreamRecall
+		}
+		go func() {
+			if recall {
+				done <- c.Recall(t.Context(), identity)
+			} else {
+				done <- c.BreakForRead(t.Context(), identity)
+			}
+		}()
+		event := cv2Event(t, c, holder, kind)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		flush, err := c.BeginSynchronousMutation(ctx, holder, identity)
+		cancel()
+		if err != nil {
+			t.Fatalf("holder apply behind pending %v: %v", kind, err)
+		}
+		flush.End(23)
+		if err := c.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, 23); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestCoherenceSynchronousMutationRetainsSuccessfulGrant(t *testing.T) {
 	c, _ := cv2Coordinator(t)
 	holder := cv2Subscribe(t, c, 1)
@@ -389,18 +436,22 @@ func TestCoherenceSynchronousMutationRetainsSuccessfulGrant(t *testing.T) {
 		}
 	}
 	c.mu.Unlock()
-	grant, err := got.flush.RetainDelegation()
+	reservation, _, err := got.flush.RetainDelegation()
 	if err != nil {
 		t.Fatal(err)
 	}
 	got.flush.End(31)
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if live, ok := c.LookupDelegation(identity); !ok || live.ID != grant.ID || live.Generation != grant.Generation {
 		t.Fatalf("retained grant = %+v, %v", live, ok)
 	}
 	if grant.Mode != DelegationFull {
 		t.Fatalf("retained mode = %v, want current full mode", grant.Mode)
 	}
-	if _, err := got.flush.RetainDelegation(); !errors.Is(err, ErrDelegationStale) {
+	if _, _, err := got.flush.RetainDelegation(); !errors.Is(err, ErrDelegationStale) {
 		t.Fatalf("retain after End = %v", err)
 	}
 }
@@ -421,11 +472,15 @@ func TestCoherenceConcurrentSynchronousFailureCannotRetireRetainedGrant(t *testi
 	if _, ok := c.LookupDelegation(identity); !ok {
 		t.Fatal("failed operation retired a generation still pinned by its peer")
 	}
-	grant, err := second.RetainDelegation()
+	reservation, _, err := second.RetainDelegation()
 	if err != nil {
 		t.Fatal(err)
 	}
 	second.End(32)
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if live, ok := c.LookupDelegation(identity); !ok || live.ID != grant.ID {
 		t.Fatalf("concurrently retained grant = %+v, %v", live, ok)
 	}
@@ -840,5 +895,273 @@ func TestCoherencePermanentSessionEndDuringRecall(t *testing.T) {
 	}
 	if fresh.Token.Incarnation <= holder.Incarnation {
 		t.Fatal("forgotten incarnation was reused")
+	}
+}
+
+func TestCoherenceReleaseCompletesPendingPeerCut(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind StreamEventKind
+	}{
+		{"break", StreamBreakForRead},
+		{"recall", StreamRecall},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := cv2Coordinator(t)
+			holder := cv2Subscribe(t, c, 1)
+			identity := [16]byte{91}
+			grant := cv2Grant(t, c, holder, identity)
+			done := make(chan error, 1)
+			go func() {
+				if tc.kind == StreamRecall {
+					done <- c.Recall(t.Context(), identity)
+				} else {
+					done <- c.BreakForRead(t.Context(), identity)
+				}
+			}()
+			cv2Event(t, c, holder, tc.kind)
+			pin, err := c.BeginFlush(holder, identity, grant.ID, grant.Generation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{0}); !errors.Is(err, ErrDelegationBusy) {
+				t.Fatalf("active release = %v", err)
+			}
+			pin.End(13)
+			for _, ticket := range []uint64{0, 12, 14} {
+				if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{ticket}); !errors.Is(err, ErrDelegationAck) {
+					t.Fatalf("inexact release %d = %v", ticket, err)
+				}
+			}
+			if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{13}); err != nil {
+				t.Fatal(err)
+			}
+			if err := cv2Result(t, done); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := c.LookupDelegation(identity); exists {
+				t.Fatal("released grant remains live")
+			}
+			for _, event := range cv2AckAll(t, c, holder) {
+				if event.Kind == StreamLoss {
+					t.Fatal("release reported loss")
+				}
+			}
+		})
+	}
+}
+
+func TestCoherencePrivateMutationExcludesSourceUntilPromotion(t *testing.T) {
+	for _, promote := range []bool{false, true} {
+		c, _ := cv2Coordinator(t)
+		source, peer := cv2Subscribe(t, c, 1), cv2Subscribe(t, c, 2)
+		identity := [16]byte{94}
+		type result struct {
+			pin *DelegationFlush
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			pin, err := c.BeginSynchronousMutation(t.Context(), source, identity)
+			done <- result{pin, err}
+		}()
+		cv2Event(t, c, peer, StreamChange)
+		cv2AckAll(t, c, peer)
+		var pin *DelegationFlush
+		select {
+		case outcome := <-done:
+			if outcome.err != nil {
+				t.Fatal(outcome.err)
+			}
+			pin = outcome.pin
+		case <-time.After(time.Second):
+			t.Fatal("private mutation did not acquire")
+		}
+		var reservation *DelegationReservation
+		if promote {
+			var err error
+			reservation, _, err = pin.RetainDelegation()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		pin.End(7)
+		if promote {
+			grant, err := reservation.Grant(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := c.ReleaseAppliedBatch(source, []Delegation{grant}, []uint64{7}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		events, err := c.Poll(t.Context(), source, 0, nil, 8)
+		if err != nil || len(events) != 2 {
+			t.Fatalf("source events=%v err=%v", events, err)
+		}
+		if events[0].Kind != StreamAdvance {
+			t.Fatal("private grant notified its source")
+		}
+		want := StreamAdvance
+		if promote {
+			want = StreamChange
+		}
+		if events[1].Kind != want {
+			t.Fatalf("promote=%v release kind=%v", promote, events[1].Kind)
+		}
+		peerEvents := cv2AckAll(t, c, peer)
+		if len(peerEvents) != 1 || peerEvents[0].Change.Kind != DelegationReleased {
+			t.Fatalf("peer release=%v", peerEvents)
+		}
+	}
+}
+
+func TestCoherencePromotedPrivateGrantDrainsPendingReaders(t *testing.T) {
+	for _, beforePromotion := range []bool{false, true} {
+		t.Run(fmt.Sprint(beforePromotion), func(t *testing.T) {
+			c, clock := cv2Coordinator(t)
+			holder := cv2Subscribe(t, c, 1)
+			identity := [16]byte{0x61}
+			pin, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := cv2Subscribe(t, c, 2)
+			type result struct {
+				guard *DataGuard
+				err   error
+			}
+			read := make(chan result, 1)
+			startRead := func() {
+				go func() { guard, err := c.DataConsumed(t.Context(), peer, identity); read <- result{guard, err} }()
+			}
+			if beforePromotion {
+				startRead()
+				clock.waitForTimers(t, 1)
+			}
+			reservation, existing, err := pin.RetainDelegation()
+			if err != nil || reservation == nil || existing.ID != 0 {
+				t.Fatalf("retain=%v %v %v", reservation, existing, err)
+			}
+			pin.End(17)
+			if !beforePromotion {
+				startRead()
+			}
+			var guard *DataGuard
+			select {
+			case got := <-read:
+				if got.err != nil || got.guard.record == nil {
+					t.Fatalf("read admission=%+v", got)
+				}
+				guard = got.guard
+			case <-time.After(time.Second):
+				t.Fatal("reader waited for an unreported delegation break")
+			}
+			defer guard.Release()
+			granted := make(chan error, 1)
+			go func() { _, err := reservation.Grant(t.Context()); granted <- err }()
+			clock.waitForTimers(t, 1)
+			select {
+			case err := <-granted:
+				t.Fatalf("grant passed pinned reader: %v", err)
+			default:
+			}
+			guard.Release()
+			if err := cv2Result(t, granted); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestCoherenceCutValidatesExactTicketsWithoutHistoricalLedger(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	identity, other := [16]byte{71}, [16]byte{72}
+	grant := cv2Grant(t, c, holder, identity)
+	otherGrant := cv2Grant(t, c, holder, other)
+	apply := func(g Delegation, ticket uint64) {
+		pin, err := c.BeginFlush(holder, g.Identity, g.ID, g.Generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pin.End(ticket)
+	}
+	apply(grant, 1)
+	cv2AckAll(t, c, holder)
+	done := make(chan error, 1)
+	go func() { done <- c.BreakForRead(t.Context(), identity) }()
+	event := cv2Event(t, c, holder, StreamBreakForRead)
+	apply(grant, 3)
+	apply(otherGrant, 4)
+	apply(grant, 5)
+	if err := c.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, 4); !errors.Is(err, ErrDelegationAck) {
+		t.Fatalf("foreign identity ticket=%v", err)
+	}
+	// A later same-file application does not invalidate the reader's earlier cut.
+	cv2CutAck(t, c, holder, event, 3)
+	if err := cv2Result(t, done); err != nil {
+		t.Fatal(err)
+	}
+	cv2AckAll(t, c, holder)
+	go func() { done <- c.Recall(t.Context(), identity) }()
+	event = cv2Event(t, c, holder, StreamRecall)
+	apply(grant, 7)
+	if err := c.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, 5); !errors.Is(err, ErrDelegationAck) {
+		t.Fatalf("recall did not cover final application: %v", err)
+	}
+	cv2CutAck(t, c, holder, event, 7)
+	if err := cv2Result(t, done); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCoherenceReleaseCutCoversSynchronousMutationAdmittedAfterRecall(t *testing.T) {
+	c, _ := cv2Coordinator(t)
+	holder := cv2Subscribe(t, c, 1)
+	identity := [16]byte{92}
+	grant := cv2Grant(t, c, holder, identity)
+	c.mu.Lock()
+	record := c.delegations[identity]
+	c.mu.Unlock()
+	type result struct {
+		applied uint64
+		err     error
+	}
+	cut := make(chan result, 1)
+	go func() {
+		applied, err := c.cut(t.Context(), record, true)
+		cut <- result{applied, err}
+	}()
+	event := cv2Event(t, c, holder, StreamRecall)
+	if event.AppliedSequence != 0 {
+		t.Fatalf("recall floor = %d, want 0", event.AppliedSequence)
+	}
+	pin, err := c.BeginSynchronousMutation(t.Context(), holder, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin.End(17)
+	if _, err := c.ReleaseAppliedBatch(holder, []Delegation{grant}, []uint64{17}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	pending := record.pending
+	completed := pending != nil && pending.done
+	reported := uint64(0)
+	if pending != nil {
+		reported = pending.applied
+	}
+	c.mu.Unlock()
+	if !completed || reported != 17 {
+		t.Fatalf("completed release cut = done %v, applied %d; want true, 17", completed, reported)
+	}
+	select {
+	case got := <-cut:
+		if got.err != nil || got.applied != 17 {
+			t.Fatalf("cut = %+v, want applied 17", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("release did not complete recall cut")
 	}
 }

@@ -25,12 +25,15 @@ type epochRecoverableRPC interface {
 // epoch transport before dispatch. Recovery publishes its replacement with one
 // pointer swap, so no consumer can observe a mixture of old and new methods.
 type epochRPC struct {
-	mu        sync.RWMutex
-	recoverMu sync.Mutex
-	rpc       RPC
+	mu                   sync.RWMutex
+	recoverMu            sync.Mutex
+	rpc                  RPC
+	authorizationChanged chan struct{}
 }
 
-func newEpochRPC(rpc RPC) *epochRPC { return &epochRPC{rpc: rpc} }
+func newEpochRPC(rpc RPC) *epochRPC {
+	return &epochRPC{rpc: rpc, authorizationChanged: make(chan struct{})}
+}
 
 func (e *epochRPC) current() RPC {
 	e.mu.RLock()
@@ -79,6 +82,8 @@ func (e *epochRPC) recover(ctx context.Context) error {
 	old.FinishLocalSessionEnforcement()
 	e.mu.Lock()
 	e.rpc = replacement
+	close(e.authorizationChanged)
+	e.authorizationChanged = make(chan struct{})
 	e.mu.Unlock()
 	_ = old.Close()
 	return nil
@@ -130,8 +135,8 @@ func (e *epochRPC) RenewSubscription(ctx context.Context, incarnation uint64) (t
 	return e.current().RenewSubscription(ctx, incarnation)
 }
 
-func (e *epochRPC) NextControlEvent(ctx context.Context, incarnation, afterSequence uint64) (*authoritypb.ControlEvent, error) {
-	return e.current().NextControlEvent(ctx, incarnation, afterSequence)
+func (e *epochRPC) NextControlEvent(ctx context.Context, incarnation, afterSequence, completedThrough uint64) (*authoritypb.ControlEvent, error) {
+	return e.current().NextControlEvent(ctx, incarnation, afterSequence, completedThrough)
 }
 
 func (e *epochRPC) AcknowledgeChanges(ctx context.Context, incarnation, position uint64) error {
@@ -165,3 +170,21 @@ func (e *epochRPC) DetachAfterUnmount(ctx context.Context, proof MountAbsencePro
 func (e *epochRPC) Close() error { return e.current().Close() }
 
 var _ RPC = (*epochRPC)(nil)
+
+func (e *epochRPC) SupportsBatchedClose() bool {
+	capable, ok := e.current().(interface{ SupportsBatchedClose() bool })
+	return ok && capable.SupportsBatchedClose()
+}
+
+func (e *epochRPC) SupportsOrderedFlush() bool {
+	capable, ok := e.current().(interface{ SupportsOrderedFlush() bool })
+	return ok && capable.SupportsOrderedFlush()
+}
+func (e *epochRPC) CallMutationSegments(ctx context.Context, req *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	if capable, ok := e.current().(interface {
+		CallMutationSegments(context.Context, *authoritypb.Request, [][]byte, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
+	}); ok {
+		return capable.CallMutationSegments(ctx, req, segments, assigned)
+	}
+	return nil, syscall.EOPNOTSUPP
+}
