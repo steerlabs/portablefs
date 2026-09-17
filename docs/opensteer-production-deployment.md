@@ -8,6 +8,32 @@ boundary without adding isolation. The `opensteer-production` branch contains
 only reviewed promotion merges whose source tree exactly matches a commit on
 `main`; the deployment workflow verifies that invariant again before building.
 
+## Protocol 7 release 0.4.0
+
+Follow the [coherence v2 rollout](coherence-v2/rollout.md) for this wire reset
+and the [OpenSteer pin sheet](coherence-v2/opensteer-pins.md) for consumer edits.
+Major 7 refuses major 6. Authorities, Linux mounts, the files gateway, and
+Mac clients on each volume move together while admissions remain closed.
+The coordinator drains metadata-identified E2B sandboxes; it does not stop
+external mounts, replace the files gateway, update Mac apps, or lock product
+admissions. Complete those steps through their release owners.
+
+Require a pinned runner node kernel 5.10 or newer with FUSE 7.31 or newer and
+qualification on that exact kernel. The OpenSteer tree currently pins neither
+a node image nor a kernel. The Runner must retain a root-directory handle
+from run start and fsync it before declaring completion, exit, or detach.
+The current Authority metrics expose no active-delegation gauge; the rollout
+records that missing operational verification as a release prerequisite.
+
+Build the Mac CLI, Go daemon, and Swift extension from the same immutable
+commit. Their shared pfslocal Resolve golden checks the production nested
+major-7 contract; a major-6 extension is incompatible despite the unchanged
+local protocol 1.15. Install the complete signed app.
+
+Keep the previous verified artifact digests and the previous OpenSteer pin as
+a prepared revert commit. They are inputs for a reviewed forward recovery,
+not permission to downgrade one component of a volume.
+
 ## Normal release
 
 1. Merge a PortableFS change to `main` and let `ci` pass.
@@ -184,8 +210,8 @@ It proves:
   class previously reached a tenant's first mount instead of the gate.
 
 It does not prove anything about the authority, the wire protocol, visibility,
-durability, locking across mounts, leases, recalls, or any workload. A client
-that completes INIT can still be wrong about every one of those.
+durability, locking across mounts, subscriptions, delegations, or any workload.
+A client that completes INIT can still be wrong about every one of those.
 
 Full qualification is the real-workload corpus in
 `deploy/opensteer/staging-qualification.sh`, run against a live staging cell:

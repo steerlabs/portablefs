@@ -269,6 +269,10 @@ scripts/coherence-matrix-macos.sh --mount-a /path/a --remote user@host --remote-
   subscription/delegation contract, kernel proofs, and accepted residuals.
 - [docs/coherence-v2/integration.md](./docs/coherence-v2/integration.md) — the
   integration decisions, replacement-test map, deletion record, and gate results.
+- [docs/coherence-v2/rollout.md](./docs/coherence-v2/rollout.md) — the protocol-7
+  maintenance window, ordered fleet cutover, verification, and abort criteria.
+- [docs/coherence-v2/opensteer-pins.md](./docs/coherence-v2/opensteer-pins.md) —
+  exact OpenSteer artifact-pin edits and publication dependencies.
 - [docs/coherence-v2/results.md](./docs/coherence-v2/results.md) — v6/v7
   measurements, requests per operation, and profile-driven changes.
 - [docs/xfs-authority-deployment.md](./docs/xfs-authority-deployment.md) — running
