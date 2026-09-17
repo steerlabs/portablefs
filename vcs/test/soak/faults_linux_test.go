@@ -460,8 +460,8 @@ func testSoakDirtyUnmount(t *testing.T) {
 	if got[0].Bytes != int64(len(payload)) || got[0].Entries != 1 || got[0].LossSequence == 0 {
 		t.Fatalf("dirty unmount drop report = %+v", got[0])
 	}
-	if !strings.Contains(got[0].Reason, "barrier failed") && !strings.Contains(got[0].Reason, "cold subscription replacement") {
-		t.Fatalf("dirty unmount loss reason = %q, want bounded shutdown or horizon fence", got[0].Reason)
+	if got[0].Reason != "cold subscription replacement" {
+		t.Fatalf("dirty unmount loss reason = %q, want cold subscription replacement", got[0].Reason)
 	}
 	logFaultPass(t, f, "dirty-unmount", started)
 }
