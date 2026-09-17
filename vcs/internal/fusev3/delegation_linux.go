@@ -264,6 +264,30 @@ func (m *delegationManager) Owns(identity []byte) bool {
 	return s.ref != nil
 }
 
+// sharedCacheAllowed is called under the raw registry lock. A retirement may
+// already be waiting for a holder reply pinned until its raw-locked settlement.
+// Never wait for ownership here: uncertain ownership simply refuses caching.
+func (m *delegationManager) sharedCacheAllowed(identity []byte) bool {
+	id, err := delegationIdentity(identity)
+	if err != nil || m == nil || !m.epoch.TryRLock() {
+		return false
+	}
+	defer m.epoch.RUnlock()
+	if m.incarnation() == 0 || !m.mu.TryRLock() {
+		return false
+	}
+	s := m.byID[id]
+	m.mu.RUnlock()
+	if s == nil {
+		return true
+	}
+	if !s.admission.TryRLock() {
+		return false
+	}
+	defer s.admission.RUnlock()
+	return s.ref == nil
+}
+
 func (m *delegationManager) SetBaseAttr(identity []byte, attr *authoritypb.Attr, version uint64) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {

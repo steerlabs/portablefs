@@ -2105,3 +2105,27 @@ coherence matrix with its controls (`/tmp/cv2-g2-final-full2.log`). A concurrent
 longer profiling run subsequently exposed a Git-add lock cycle; that run was
 terminated with SIGQUIT after capturing its stacks and is not a passing baseline.
 The fix and another complete gate follow below.
+
+#### G2 profile-discovered cache admission lock cycle
+
+The first final profile run (`/tmp/cv2-g2-final-profile.log`) stopped in fresh
+Git add after 8,509 objects. Its SIGQUIT stacks prove the cycle: post-state
+attribute admission held raw.mu while `remaining` waited for a delegation
+admission reader; a queued retirer blocked that reader while waiting for a
+FULL-holder physical reply pin; settling the reply needed raw.mu.
+
+Shared ATTR/DATA cache admission now uses a nonblocking ownership predicate.
+A busy epoch, registry or admission lock, inactive incarnation, malformed
+identity or live grant refuses caching. Behavioral ownership decisions still
+use `Owns`. The conservative refusal cannot publish stale state and releases
+the raw lock so the physical reply and retirement can complete.
+
+A regression reproduces each blocking lock, including a queued retirement
+behind a physical-style reader pin. All three arms fail without the change
+(`/tmp/cv2-g2-ownership-fault.log`). Ten focused repetitions and five Linux race
+repetitions pass (`/tmp/cv2-g2-ownership.log`, `ownership-race.log`); an additional
+table proves absent/retired identities remain admissible and inactive/owned/
+malformed identities do not. Independent read-only review confirms the
+nonblocking path preserves the existing epoch and final subscription checks.
+The failed profile run retained completed install profiles but no Git results;
+it is not a passing baseline. Repeated baseline and full gates follow.
