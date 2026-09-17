@@ -1764,3 +1764,9 @@ the correct reply. Restoring pathname-only readiness fails that test
 race-enabled repetitions (`/tmp/cv2-g2-restore-readiness.log`). The original full
 gate failure remains in `/tmp/cv2-g2-through-item7a-full.log`; full qualification
 is still pending.
+
+The full rerun at `675839c` passes (`/tmp/cv2-g2-through-item7a-full2.log`):
+build/vet, vulnerability checks, native Go and race suites, physical-reply seam,
+Swift, release policy, stale-architecture checks, XFS integration, and all
+coherence matrix assertions and controls. This qualifies the changes through
+item 7a; the ordered chunk pipeline remains under development.
