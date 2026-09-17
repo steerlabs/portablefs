@@ -337,6 +337,18 @@ def table(title: str, rows: list[HotSpot], side: str) -> str:
     return "\n".join(lines)
 
 
+def profile_artifact(directory: Path, prefix: str, workload: str, suffix: str) -> Path:
+    stem = {
+        "install-1": "TestCoherenceBaseline-install-portablefs-workers-1-install",
+        "git-status-cold": "TestCoherenceBaseline-git-portablefs-cold",
+    }[workload]
+    run = f"{prefix}." if prefix else ""
+    current = directory / f"{run}{stem}.{suffix.replace('allocs.', 'allocs-')}.pprof"
+    if current.is_file():
+        return current
+    return directory / f"{run}{workload}.{suffix}.pprof"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profiles", type=Path, default=Path("/tmp/cv2-measure-profiles"))
@@ -347,23 +359,23 @@ def main() -> None:
 
     repository = Path(__file__).resolve().parent.parent
     profile_dir = args.profiles.absolute()
-    binary = profile_dir / f"{args.prefix}.fusev3.test"
+    binary = profile_dir / (f"{args.prefix}.fusev3.test" if args.prefix else "fusev3.test")
     inputs = [
-        ProfileInput("Install, 1 worker", "install-1", "cpu", profile_dir / f"{args.prefix}.install-1.cpu.pprof"),
+        ProfileInput("Install, 1 worker", "install-1", "cpu", profile_artifact(profile_dir, args.prefix, "install-1", "cpu")),
         ProfileInput(
             "Install, 1 worker",
             "install-1",
             "alloc_space",
-            profile_dir / f"{args.prefix}.install-1.allocs.after.pprof",
-            profile_dir / f"{args.prefix}.install-1.allocs.before.pprof",
+            profile_artifact(profile_dir, args.prefix, "install-1", "allocs.after"),
+            profile_artifact(profile_dir, args.prefix, "install-1", "allocs.before"),
         ),
-        ProfileInput("Cold Git status", "git-status-cold", "cpu", profile_dir / f"{args.prefix}.git-status-cold.cpu.pprof"),
+        ProfileInput("Cold Git status", "git-status-cold", "cpu", profile_artifact(profile_dir, args.prefix, "git-status-cold", "cpu")),
         ProfileInput(
             "Cold Git status",
             "git-status-cold",
             "alloc_space",
-            profile_dir / f"{args.prefix}.git-status-cold.allocs.after.pprof",
-            profile_dir / f"{args.prefix}.git-status-cold.allocs.before.pprof",
+            profile_artifact(profile_dir, args.prefix, "git-status-cold", "allocs.after"),
+            profile_artifact(profile_dir, args.prefix, "git-status-cold", "allocs.before"),
         ),
     ]
     missing = [str(path) for path in [binary] + [item.profile for item in inputs] + [item.base for item in inputs if item.base] if not path.is_file()]
@@ -423,21 +435,21 @@ def main() -> None:
         "",
         "The fixture runs the Linux FUSE frontend, loopback TLS transport, and in-process Authority in one `go test` process. Each raw profile is therefore a combined-process observation. The tables attribute a sample to the mount daemon or Authority when its stack matches the filters below. Percentages in each hot-spot table use `-relative_percentages`, so their denominator is the focused side rather than the whole process. Runtime work descended from a matched stack is charged to that side; runtime-only and other stacks that match neither filter remain unattributed. These are stack-filter shares, not exclusive process measurements. Intersection was measured by filtering the Authority profile protobuf through the daemon filter, and the residual uses `100 - daemon - Authority + intersection`.",
         "",
-        "The install profile covers the full 40,000-file, 2,000-directory, one-worker workload. The cold Git profile prepares and commits 20,000 files with the 4,096-name setup profile, recreates the complete Authority and mount at the shipping 65,536 name and item capacities, then runs the first clean `git status --porcelain=v1`. CPU capture remains active through asynchronous delegation application, release, and final Authority CLOSE drain. Allocation-space (`alloc_space`) results are sampled allocated bytes at Go's default 512 KiB memory-profile rate, not retained heap. They subtract a snapshot taken after two forced GCs immediately before the workload from another taken after two forced GCs following the CLOSE drain. The signed deltas contained no negative line samples, so no negative values were suppressed. Profiled wall times are not performance results.",
+        "The install profile covers the full 40,000-file, 2,000-directory, one-worker workload. The cold Git profile prepares and commits 20,000 files at the shipping 65,536-name capacity, recreates the complete Authority and mount at the shipping 65,536 name and item capacities, then runs the first clean `git status --porcelain=v1`. CPU capture remains active through asynchronous delegation application, release, and final Authority CLOSE drain. Allocation-space (`alloc_space`) results are sampled allocated bytes at Go's default 512 KiB memory-profile rate, not retained heap. They subtract a snapshot taken after two forced GCs immediately before the workload from another taken after two forced GCs following the CLOSE drain. The signed deltas contained no negative line samples, so no negative values were suppressed. Profiled wall times are not performance results.",
         "",
         f"CPU sampling uses 10 ms samples. The short cold-status window produced approximately {cold_cpu_samples.get('Mount daemon', 0)} daemon and {cold_cpu_samples.get('Authority', 0)} Authority samples; its ranks are correspondingly coarse, and equal percentages are sampling ties.",
         "",
-        "The exact capture command was:",
+        "Capture with the unified baseline harness:",
         "",
         "```sh",
         "PORTABLEFS_PERFORMANCE_TEST=1 \\",
         "PORTABLEFS_PROFILE_DIR=/tmp/cv2-measure-profiles \\",
         "PORTABLEFS_PROFILE_RUN=run1 \\",
-        "PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceProfiles$' \\",
+        "PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$/(install-portablefs-workers-1|git-portablefs)$' \\",
         "bash scripts/xfs-fuse-integration.sh",
         "```",
         "",
-        "`TestCoherenceProfiles` passed in 117.77 seconds; the focused wrapper then exited 70 because unrelated required tests were excluded by `-run`. The complete log is `/tmp/cv2-measure-profile-run.log`.",
+        "The focused wrapper exits 70 when required full-suite inventory is omitted. Profile artifacts alone are not full-gate evidence.",
         "",
         f"Authority focus: `{AUTHORITY_FOCUS}`.",
         "",

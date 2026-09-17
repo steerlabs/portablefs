@@ -1332,3 +1332,19 @@ is 4.417 us median, while the enclosing syscall with two permission GETATTRs is
 70.125 us; the full below-20-us round-trip target is not established. The focused
 wrapper exits 70 for omitted inventory, not a test failure
 (`/tmp/cv2-g2-cache-mounted7.log`). Final full qualification remains pending.
+
+### Part 2 item 0: one workload profile capture path
+
+Removed M's duplicate CPU/allocation capture implementation and optional
+TestCoherenceProfiles entry point. The baseline meter is now the sole capture
+path, including completion barrier and deferred CLOSE drain. It retains both
+PORTABLEFS_PROFILE_DIR and PORTABLEFS_PROFILE_RUN; the wrapper forwards the
+previously dropped run prefix. Each run exports its exact executable and all
+profile types. Allocation snapshots retain the two-GC accounting boundary.
+Historical profile artifacts remain readable by the analysis script.
+
+The artifact test fails against the former baseline capture because the run
+prefix is missing (`/tmp/cv2-g2-profile-before.log`) and passes with the unified
+path (`/tmp/cv2-g2-profile.log`). The wrapper passes bash syntax validation and
+the profile analysis script compiles. profiles.md distinguishes the historical
+measurement from the replacement command.

@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-var baselineProfileBinary sync.Once
+var baselineProfileBinaries sync.Map
 
 // Profiles cover the real frontend and Authority in this single test process.
 // CPU labels separate their inherited workers; allocation views use stack filters.
@@ -23,7 +23,8 @@ func startBaselineProfile(t *testing.T, phase string) func() {
 	if dir == "" {
 		return func() {}
 	}
-	baselineProfileBinary.Do(func() {
+	binaryPath := filepath.Join(dir, coherenceProfilePrefix("fusev3.test"))
+	if _, loaded := baselineProfileBinaries.LoadOrStore(binaryPath, true); !loaded {
 		executable, err := os.Executable()
 		if err != nil {
 			t.Fatal(err)
@@ -33,7 +34,7 @@ func startBaselineProfile(t *testing.T, phase string) func() {
 			t.Fatal(err)
 		}
 		defer source.Close()
-		destination, err := os.Create(filepath.Join(dir, "fusev3.test"))
+		destination, err := os.Create(binaryPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -44,8 +45,8 @@ func startBaselineProfile(t *testing.T, phase string) func() {
 		if err := destination.Close(); err != nil {
 			t.Fatal(err)
 		}
-	})
-	prefix := filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "-")+"-"+phase)
+	}
+	prefix := filepath.Join(dir, coherenceProfilePrefix(strings.ReplaceAll(t.Name(), "/", "-")+"-"+phase))
 	writeProfile := func(kind, suffix string) {
 		file, err := os.Create(prefix + "." + suffix + ".pprof")
 		if err != nil {
@@ -59,6 +60,8 @@ func startBaselineProfile(t *testing.T, phase string) func() {
 			t.Fatal(err)
 		}
 	}
+	runtime.GC()
+	runtime.GC()
 	writeProfile("allocs", "allocs-before")
 	cpu, err := os.Create(prefix + ".cpu.pprof")
 	if err != nil {
@@ -79,10 +82,27 @@ func startBaselineProfile(t *testing.T, phase string) func() {
 			}
 			runtime.SetMutexProfileFraction(previousMutex)
 			runtime.SetBlockProfileRate(0)
+			runtime.GC()
+			runtime.GC()
 			writeProfile("allocs", "allocs-after")
 			writeProfile("mutex", "mutex")
 			writeProfile("block", "block")
 			t.Logf("PORTABLEFS_PROFILE %s (timings include profiling overhead)", prefix)
 		})
+	}
+}
+
+func TestBaselineProfileUsesRunPrefix(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PORTABLEFS_PROFILE_DIR", dir)
+	t.Setenv("PORTABLEFS_PROFILE_RUN", "run/one")
+	stop := startBaselineProfile(t, "proof")
+	stop()
+	prefix := "run-one." + t.Name() + "-proof"
+	for _, name := range []string{"run-one.fusev3.test", prefix + ".cpu.pprof", prefix + ".allocs-before.pprof", prefix + ".allocs-after.pprof", prefix + ".mutex.pprof", prefix + ".block.pprof"} {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil || info.Size() == 0 {
+			t.Fatalf("profile artifact %s: %v (%v)", name, info, err)
+		}
 	}
 }

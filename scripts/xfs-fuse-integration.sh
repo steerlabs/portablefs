@@ -177,6 +177,7 @@ run_host() {
       -e "PORTABLEFS_GO_TEST_FLAGS=${PORTABLEFS_GO_TEST_FLAGS:-}" \
       -e "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
       -e "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
+      -e "PORTABLEFS_PROFILE_RUN=${PORTABLEFS_PROFILE_RUN:-}" \
       -w /work \
       "${PORTABLEFS_CI_IMAGE}" \
       bash /work/scripts/xfs-fuse-integration.sh --in-container
@@ -301,6 +302,7 @@ suite_command() {
     "PORTABLEFS_FUSE_DEBUG=${PORTABLEFS_FUSE_DEBUG:-}" \
     "PORTABLEFS_PERFORMANCE_TEST=${PORTABLEFS_PERFORMANCE_TEST:-}" \
     "PORTABLEFS_PROFILE_DIR=${PORTABLEFS_PROFILE_DIR:-}" \
+    "PORTABLEFS_PROFILE_RUN=${PORTABLEFS_PROFILE_RUN:-}" \
     go -C /work/vcs test -v -count=1 -failfast -p 1 -timeout 35m \
     "${extra_go_test_flags[@]}" "$@"
 }

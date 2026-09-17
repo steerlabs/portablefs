@@ -229,3 +229,23 @@ go tool pprof -top -lines -nodecount=15 -nodefraction=0 '-focus=authorityrpc\.\(
 go tool pprof -top -lines -nodecount=15 -nodefraction=0 '-focus=fusev3\.\(\*|authorityrpc\.\(\*Client\)|go-fuse/v2/fuse\.|internal/writeback\.' -relative_percentages '-ignore=countingHandler|integrationFixture' -sample_index=alloc_space -base=/tmp/cv2-measure-profiles/run1.git-status-cold.allocs.before.pprof /tmp/cv2-measure-profiles/run1.fusev3.test /tmp/cv2-measure-profiles/run1.git-status-cold.allocs.after.pprof
 go tool pprof -top -lines -nodecount=15 -nodefraction=0 '-focus=authorityrpc\.\(\*Server\)|authorityrpc\.\(\*VolumeHandler\)|internal/volumeserver\.|internal/xfsstore\.' -relative_percentages -sample_index=alloc_space -base=/tmp/cv2-measure-profiles/run1.git-status-cold.allocs.before.pprof /tmp/cv2-measure-profiles/run1.fusev3.test /tmp/cv2-measure-profiles/run1.git-status-cold.allocs.after.pprof
 ```
+
+## G2 capture path
+
+The tables above retain their historical capture boundary. G2 removes the
+separate `TestCoherenceProfiles` capture implementation. New profiles use the
+same workload, completion barrier, and CLOSE drain as `TestCoherenceBaseline`:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 \
+PORTABLEFS_PROFILE_DIR=/tmp/cv2-g2-profiles \
+PORTABLEFS_PROFILE_RUN=g2 \
+PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$/(install-portablefs-workers-[18]|git-portablefs)$' \
+bash scripts/xfs-fuse-integration.sh
+```
+
+Both profile environment names retain their meaning. The wrapper now forwards
+the run prefix to the unprivileged test process. Artifacts include that sanitized
+prefix, the test/phase name, CPU, allocation before/after, mutex, block, and the
+exact executable. The analysis script accepts this naming and historical M
+artifacts. New Git preparation uses shipping capacity from its first CREATE.
