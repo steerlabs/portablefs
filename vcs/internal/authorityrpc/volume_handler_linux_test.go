@@ -2434,6 +2434,7 @@ func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
 			}
 			h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
 			request := resourceAcquisitionRequest(t, "create", credential, root)
+			request.GetCreate().Exclusive = false
 			request.GetCreate().Flags.Truncate = truncate
 			for _, target := range request.GetFskitSourcePublication().GetTargets() {
 				if namespace := target.GetNamespace(); namespace != nil {
@@ -2474,7 +2475,9 @@ func TestExistingCreateBindingChangeRetriesBeforeApply(t *testing.T) {
 		replacement: xfsstore.Capability{0x74}, handle: xfsstore.Capability{0x75}, bindingChanges: true,
 	}
 	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
-	response := h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root))
+	request := resourceAcquisitionRequest(t, "create", credential, root)
+	request.GetCreate().Exclusive = false
+	response := h.Handle(ctx, request)
 	if response.GetErrno() != 0 || response.GetUncertain() || response.GetCreate() == nil {
 		t.Fatalf("binding-change response = %+v, want successful re-resolved CREATE", response)
 	}
