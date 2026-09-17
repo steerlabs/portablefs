@@ -95,7 +95,7 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationReadlink
 	case *authoritypb.Request_Open:
 		return authoritymetrics.OperationOpen
-	case *authoritypb.Request_Close:
+	case *authoritypb.Request_Close, *authoritypb.Request_CloseBatch:
 		return authoritymetrics.OperationClose
 	case *authoritypb.Request_Read:
 		return authoritymetrics.OperationRead

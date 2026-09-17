@@ -79,6 +79,9 @@ func (b *Buffer) OverlayAttributes(id Identity, base Attributes) Attributes {
 		return base
 	}
 	for r := f.head; r != nil; r = r.next {
+		if !r.inOverlay {
+			continue
+		}
 		a := r.attrs
 		if r.kind == Write && r.writeOptions.KillPrivileges && base.HasMode {
 			base.Mode &^= 0o4000

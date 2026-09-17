@@ -93,6 +93,7 @@ message Request {
     DelegationModeChangeAck delegation_mode_change_ack = 71;
     BarrierRequest barrier = 72;
     DelegationReleaseRequest delegation_release = 73;
+    CloseBatchRequest close_batch = 74;
   }
 }
 
@@ -218,6 +219,7 @@ message Response {
     BarrierReply barrier = 64;
     DelegationReleaseReply delegation_release = 65;
     FsyncReply fsync = 66;
+    CloseBatchReply close_batch = 68;
   }
 }
 
@@ -943,6 +945,10 @@ message CloseRequest {
   uint64 lock_owner = 2;
   bool flock_unlock = 3;
 }
+// One exact replay outcome for 1..128 unique handles. Results preserve input order.
+message CloseBatchRequest { repeated CloseRequest closes = 1; }
+message CloseBatchResult { int32 errno = 1; FailureClass failure = 2; bool retired = 3; }
+message CloseBatchReply { repeated CloseBatchResult results = 1; }
 message ReadRequest { bytes handle = 1; uint64 offset = 2; uint32 length = 3; }
 message ReadReply { bytes data = 1; uint64 volume_version = 2; }
 // WriteRequest is the stock FUSE_WRITE shape after kernel-side generic

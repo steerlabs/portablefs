@@ -66,7 +66,9 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 		return err
 	}
 	state := n.mount.delegations.state(id)
-	state.acquire.Lock()
+	if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
+		return err
+	}
 	defer state.acquire.Unlock()
 	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
 		return nil

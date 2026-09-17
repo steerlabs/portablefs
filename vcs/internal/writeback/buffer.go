@@ -10,6 +10,7 @@ import (
 )
 
 type record struct {
+	inOverlay                  bool
 	next                       *record
 	seq, generation, applied   uint64
 	acceptedAt                 int64
@@ -225,6 +226,7 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 	}
 }
 func (b *Buffer) overlay(f *file, r *record) {
+	r.inOverlay = true
 	if r.kind == Write {
 		f.extents.set(r.off, r.off+int64(len(r.data)), r.data, r)
 	}
@@ -394,7 +396,7 @@ func (b *Buffer) release(r *record) {
 	}
 	f := r.file
 	f.extents.retire(r)
-	if r.attrs.HasSize {
+	if r.inOverlay && r.attrs.HasSize {
 		if r.prevTruncate != nil {
 			r.prevTruncate.nextTruncate = r.nextTruncate
 		}
@@ -506,11 +508,12 @@ func (b *Buffer) Forget(id Identity) bool {
 // admission that finished copying before the fence. A nil identity fences the
 // whole mount, including identities first seen during retirement.
 type Retirement struct {
-	b       *Buffer
-	files   []*file
-	all     bool
-	cut     Cut
-	resumed bool
+	b        *Buffer
+	files    []*file
+	all      bool
+	cut      Cut
+	resumed  bool
+	detached bool
 }
 
 func (b *Buffer) BeginRetire(ctx context.Context, id *Identity) (*Retirement, error) {
@@ -586,4 +589,54 @@ func recordedLossError(errno syscall.Errno) error {
 		return errno
 	}
 	return ErrLost
+}
+
+// DetachOverlay ends serving the retired ownership interval without discarding
+// its durability or loss obligation. A later owner starts with an Authority
+// base; the old records remain charged until their durable prefix arrives.
+func (r *Retirement) DetachOverlay() error {
+	b := r.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r.resumed {
+		return ErrInvalid
+	}
+	for _, f := range r.files {
+		if !f.retiring {
+			return ErrInvalid
+		}
+		if f.accepted != nil && f.accepted.seq <= r.cut.Sequence {
+			return ErrPending
+		}
+	}
+	for _, f := range r.files {
+		f.extents.clear()
+		for entry := f.head; entry != nil; entry = entry.next {
+			entry.inOverlay = false
+			entry.prevTruncate, entry.nextTruncate = nil, nil
+		}
+		f.lastTruncate = nil
+		f.size, f.exact = 0, false
+	}
+	r.detached = true
+	return nil
+}
+
+// Cancel reopens admission in the same ownership generation after an abandoned
+// retirement. Its caller must still own that generation at the Authority.
+func (r *Retirement) Cancel() {
+	b := r.b
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if r.resumed || r.detached {
+		return
+	}
+	for _, f := range r.files {
+		f.retiring = false
+	}
+	if r.all {
+		b.retiringAll = false
+	}
+	r.resumed = true
+	b.signal()
 }

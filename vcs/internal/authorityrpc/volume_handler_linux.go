@@ -1662,23 +1662,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			releaseMutation()
 		}
 		return response
+	case *authoritypb.Request_CloseBatch:
+		return h.handleCloseBatch(ctx, req, cred)
 	case *authoritypb.Request_Close:
-		return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-			handle, err := h.open(cred.ID, body.Close.GetHandle())
-			if err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			if body.Close.GetFlockUnlock() {
-				if err := h.unlockOpenOwner(cred, handle, body.Close.GetLockOwner(), true); err != nil {
-					return h.errorResponse(0, err, false)
-				}
-			}
-			if err := h.Store.CloseOpen(handle); err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			h.untrackOpen(cred.ID, handle)
-			return h.success(0)
-		})
+		return h.mutate(ctx, req, cred, func() *authoritypb.Response { return h.closeForSession(cred, body.Close) })
 	case *authoritypb.Request_Flush:
 		handle, err := h.open(cred.ID, body.Flush.GetHandle())
 		if err != nil {

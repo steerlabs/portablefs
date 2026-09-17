@@ -65,7 +65,7 @@ leaves draft they are frozen.
   Linux requires `volume-subscription-v1`, `ordered-change-stream-v1`,
   `file-write-delegation-v1`, `delegation-control-v1`,
   `session-durable-sequence-v1`, `root-directory-barrier-v1`, and
-  `bounded-control-replay-v1` in addition
+  `bounded-control-replay-v1`, and `batched-close-v1` in addition
   to the retained transport, replay, and filesystem assertions. Linux no longer
   advertises the N/A/D/E lease-family features, `open-by-identity-v1`, or
   unconditional `write-through`.

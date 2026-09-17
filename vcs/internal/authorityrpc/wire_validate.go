@@ -104,6 +104,8 @@ func validateWireMessageDepth(raw []byte, descriptor protoreflect.MessageDescrip
 				limit = maxWireFeatureElements
 			} else if field.Name() == "targets" && descriptor.FullName() == "portablefs.authority.v1.SourcePublicationGate" {
 				limit = maxWireSourceTargets
+			} else if field.FullName() == "portablefs.authority.v1.CloseBatchRequest.closes" || field.FullName() == "portablefs.authority.v1.CloseBatchReply.results" {
+				limit = MaxCloseBatch
 			}
 			// occurrences includes this encoded field once. Replace that one
 			// occurrence with the number of logical values it carries (one for

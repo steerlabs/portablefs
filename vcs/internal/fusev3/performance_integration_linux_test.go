@@ -628,6 +628,7 @@ func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
 	defer barrier.Close()
 	before := f.counter.count("barrier")
 	flushBefore := f.counter.count("flush")
+	closeBefore, batchBefore := f.counter.count("close"), f.counter.count("close_batch")
 	ackBefore, pollBefore := f.counter.count("change-ack"), f.counter.count("next-control-event")
 	for i := 0; i < 1000; i++ {
 		if err := os.WriteFile(f.join(0, fmt.Sprintf("install-%04d", i)), []byte("payload"), 0o600); err != nil {
@@ -649,7 +650,25 @@ func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
 	if acks != 0 || polls > 3 {
 		t.Fatalf("lone writer control traffic: acknowledgements=%d polls=%d", acks, polls)
 	}
-	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d flush=%d change_ack=%d next_control_event=%d", count, flushes, acks, polls)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		manager := f.mounts[0].delegations
+		manager.closeMu.Lock()
+		pending := manager.closePending
+		manager.closeMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deferred closes did not drain: %d", pending)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closes, batches := f.counter.count("close")-closeBefore, f.counter.count("close_batch")-batchBefore
+	if closes != 0 || batches < 8 || batches > 64 {
+		t.Fatalf("install cleanup: serial=%d batches=%d", closes, batches)
+	}
+	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d flush=%d change_ack=%d next_control_event=%d close=%d close_batch=%d", count, flushes, acks, polls, closes, batches)
 }
 
 func TestReadDirPlusColdListingAvoidsLookupRPCs(t *testing.T) {

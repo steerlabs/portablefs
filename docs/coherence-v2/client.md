@@ -101,8 +101,10 @@ timestamps.
 Recall retires admission, drains that identity's cache-installing replies,
 flushes the retirement cut, waits for its durability, and acknowledges the
 applied ticket. The extra durability wait retires the old overlay before a
-peer can change the file; it remains inside the recall budget. Release uses
-the same ownership handoff rule. Break flushes a captured cut without surrendering ownership. Mode downgrade fences admission
+peer can change the file; it remains inside the recall budget. Final-handle
+release instead detaches the applied overlay while retaining its records until
+durability; it waits only for application. Break flushes a captured cut without
+surrendering ownership. Mode downgrade fences admission
 through the flush before installing WRITETHROUGH. Upgrade installs FULL before
 acknowledgment. A missed budget or an unprovable flush drops retained entries
 and advances Buffer's loss sequence. No retry invents a new replay identity for
@@ -111,8 +113,8 @@ an uncertain applied entry.
 Rename, link, and unlink flush the affected identities before dispatch. A cold
 namespace binding is resolved before this dependency check; daemon eviction
 cannot hide dirty data from F4. Last-close cleanup collects delegated handles
-for a short batch, keeps the server handles alive through flushing and sorted
-DelegationRelease, then closes them. Nondelegated close retains its existing
+for at most 25 milliseconds or 128 handles, keeps the server handles alive
+through application and sorted DelegationRelease, then sends one CloseBatch. Nondelegated close retains its existing
 synchronous error path.
 
 A mount-root OPENDIR records the mount loss sequence. FSYNCDIR on that exact
@@ -275,3 +277,16 @@ admission costs 12 allocations with either zero or 4,096 unrelated coordinates;
 its work does not grow with the unrelated coordinate count. Change admission
 costs two allocations. Benchmark timings are local observations, not workload
 performance claims.
+
+
+## G2 final-handle cleanup
+
+Final-handle release waits for buffered application, not durability. A logical
+release flight blocks same-identity admission while the per-state acquire,
+transition, and operation mutexes are free during RPC. Successful release
+removes the old overlay; applied records remain retained until a durable prefix.
+The next grant resumes a fresh overlay generation. Final descriptor cleanup uses
+one replayed `CloseBatch` for at most 128 handles and consumes its ordered
+`retired` outcomes. Unknown cleanup ends the mounted session so unresolved
+handles remain owned by terminal cleanup. See wire.md for the additive feature
+and encoding contract.

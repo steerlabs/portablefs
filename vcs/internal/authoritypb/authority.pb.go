@@ -1045,7 +1045,7 @@ func (x SetXattrRequest_Mode) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SetXattrRequest_Mode.Descriptor instead.
 func (SetXattrRequest_Mode) EnumDescriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{95, 0}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{98, 0}
 }
 
 type Request struct {
@@ -1117,6 +1117,7 @@ type Request struct {
 	//	*Request_DelegationModeChangeAck
 	//	*Request_Barrier
 	//	*Request_DelegationRelease
+	//	*Request_CloseBatch
 	Body          isRequest_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1705,6 +1706,15 @@ func (x *Request) GetDelegationRelease() *DelegationReleaseRequest {
 	return nil
 }
 
+func (x *Request) GetCloseBatch() *CloseBatchRequest {
+	if x != nil {
+		if x, ok := x.Body.(*Request_CloseBatch); ok {
+			return x.CloseBatch
+		}
+	}
+	return nil
+}
+
 type isRequest_Body interface {
 	isRequest_Body()
 }
@@ -1946,6 +1956,10 @@ type Request_DelegationRelease struct {
 	DelegationRelease *DelegationReleaseRequest `protobuf:"bytes,73,opt,name=delegation_release,json=delegationRelease,proto3,oneof"`
 }
 
+type Request_CloseBatch struct {
+	CloseBatch *CloseBatchRequest `protobuf:"bytes,74,opt,name=close_batch,json=closeBatch,proto3,oneof"`
+}
+
 func (*Request_Hello) isRequest_Body() {}
 
 func (*Request_Attach) isRequest_Body() {}
@@ -2057,6 +2071,8 @@ func (*Request_DelegationModeChangeAck) isRequest_Body() {}
 func (*Request_Barrier) isRequest_Body() {}
 
 func (*Request_DelegationRelease) isRequest_Body() {}
+
+func (*Request_CloseBatch) isRequest_Body() {}
 
 type FskitSourcePublication struct {
 	state         protoimpl.MessageState          `protogen:"open.v1"`
@@ -2401,6 +2417,7 @@ type Response struct {
 	//	*Response_Barrier
 	//	*Response_DelegationRelease
 	//	*Response_Fsync
+	//	*Response_CloseBatch
 	Body          isResponse_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2926,6 +2943,15 @@ func (x *Response) GetFsync() *FsyncReply {
 	return nil
 }
 
+func (x *Response) GetCloseBatch() *CloseBatchReply {
+	if x != nil {
+		if x, ok := x.Body.(*Response_CloseBatch); ok {
+			return x.CloseBatch
+		}
+	}
+	return nil
+}
+
 type isResponse_Body interface {
 	isResponse_Body()
 }
@@ -3099,6 +3125,10 @@ type Response_Fsync struct {
 	Fsync *FsyncReply `protobuf:"bytes,66,opt,name=fsync,proto3,oneof"`
 }
 
+type Response_CloseBatch struct {
+	CloseBatch *CloseBatchReply `protobuf:"bytes,68,opt,name=close_batch,json=closeBatch,proto3,oneof"`
+}
+
 func (*Response_Hello) isResponse_Body() {}
 
 func (*Response_Attach) isResponse_Body() {}
@@ -3182,6 +3212,8 @@ func (*Response_Barrier) isResponse_Body() {}
 func (*Response_DelegationRelease) isResponse_Body() {}
 
 func (*Response_Fsync) isResponse_Body() {}
+
+func (*Response_CloseBatch) isResponse_Body() {}
 
 // TerminalDeliveryReceipt is sent on CONTROL only after the frontend has
 // consumed an exact terminal mutation outcome: a no-change result reached its
@@ -7602,6 +7634,155 @@ func (x *CloseRequest) GetFlockUnlock() bool {
 	return false
 }
 
+// One exact replay outcome for 1..128 unique handles. Results preserve input order.
+type CloseBatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Closes        []*CloseRequest        `protobuf:"bytes,1,rep,name=closes,proto3" json:"closes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CloseBatchRequest) Reset() {
+	*x = CloseBatchRequest{}
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[74]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CloseBatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CloseBatchRequest) ProtoMessage() {}
+
+func (x *CloseBatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[74]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CloseBatchRequest.ProtoReflect.Descriptor instead.
+func (*CloseBatchRequest) Descriptor() ([]byte, []int) {
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{74}
+}
+
+func (x *CloseBatchRequest) GetCloses() []*CloseRequest {
+	if x != nil {
+		return x.Closes
+	}
+	return nil
+}
+
+type CloseBatchResult struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Errno         int32                  `protobuf:"varint,1,opt,name=errno,proto3" json:"errno,omitempty"`
+	Failure       FailureClass           `protobuf:"varint,2,opt,name=failure,proto3,enum=portablefs.authority.v1.FailureClass" json:"failure,omitempty"`
+	Retired       bool                   `protobuf:"varint,3,opt,name=retired,proto3" json:"retired,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CloseBatchResult) Reset() {
+	*x = CloseBatchResult{}
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[75]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CloseBatchResult) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CloseBatchResult) ProtoMessage() {}
+
+func (x *CloseBatchResult) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[75]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CloseBatchResult.ProtoReflect.Descriptor instead.
+func (*CloseBatchResult) Descriptor() ([]byte, []int) {
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{75}
+}
+
+func (x *CloseBatchResult) GetErrno() int32 {
+	if x != nil {
+		return x.Errno
+	}
+	return 0
+}
+
+func (x *CloseBatchResult) GetFailure() FailureClass {
+	if x != nil {
+		return x.Failure
+	}
+	return FailureClass_FAILURE_CLASS_UNSPECIFIED
+}
+
+func (x *CloseBatchResult) GetRetired() bool {
+	if x != nil {
+		return x.Retired
+	}
+	return false
+}
+
+type CloseBatchReply struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Results       []*CloseBatchResult    `protobuf:"bytes,1,rep,name=results,proto3" json:"results,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CloseBatchReply) Reset() {
+	*x = CloseBatchReply{}
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[76]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CloseBatchReply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CloseBatchReply) ProtoMessage() {}
+
+func (x *CloseBatchReply) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[76]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CloseBatchReply.ProtoReflect.Descriptor instead.
+func (*CloseBatchReply) Descriptor() ([]byte, []int) {
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{76}
+}
+
+func (x *CloseBatchReply) GetResults() []*CloseBatchResult {
+	if x != nil {
+		return x.Results
+	}
+	return nil
+}
+
 type ReadRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Handle        []byte                 `protobuf:"bytes,1,opt,name=handle,proto3" json:"handle,omitempty"`
@@ -7613,7 +7794,7 @@ type ReadRequest struct {
 
 func (x *ReadRequest) Reset() {
 	*x = ReadRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[74]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[77]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7625,7 +7806,7 @@ func (x *ReadRequest) String() string {
 func (*ReadRequest) ProtoMessage() {}
 
 func (x *ReadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[74]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[77]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7638,7 +7819,7 @@ func (x *ReadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadRequest.ProtoReflect.Descriptor instead.
 func (*ReadRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{74}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{77}
 }
 
 func (x *ReadRequest) GetHandle() []byte {
@@ -7672,7 +7853,7 @@ type ReadReply struct {
 
 func (x *ReadReply) Reset() {
 	*x = ReadReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[75]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[78]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7684,7 +7865,7 @@ func (x *ReadReply) String() string {
 func (*ReadReply) ProtoMessage() {}
 
 func (x *ReadReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[75]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[78]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7697,7 +7878,7 @@ func (x *ReadReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadReply.ProtoReflect.Descriptor instead.
 func (*ReadReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{75}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{78}
 }
 
 func (x *ReadReply) GetData() []byte {
@@ -7750,7 +7931,7 @@ type WriteRequest struct {
 
 func (x *WriteRequest) Reset() {
 	*x = WriteRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[76]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[79]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7762,7 +7943,7 @@ func (x *WriteRequest) String() string {
 func (*WriteRequest) ProtoMessage() {}
 
 func (x *WriteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[76]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[79]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7775,7 +7956,7 @@ func (x *WriteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteRequest.ProtoReflect.Descriptor instead.
 func (*WriteRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{76}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{79}
 }
 
 func (x *WriteRequest) GetHandle() []byte {
@@ -7867,7 +8048,7 @@ type WriteReply struct {
 
 func (x *WriteReply) Reset() {
 	*x = WriteReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[77]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[80]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7879,7 +8060,7 @@ func (x *WriteReply) String() string {
 func (*WriteReply) ProtoMessage() {}
 
 func (x *WriteReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[77]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[80]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7892,7 +8073,7 @@ func (x *WriteReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteReply.ProtoReflect.Descriptor instead.
 func (*WriteReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{77}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{80}
 }
 
 func (x *WriteReply) GetCommittedSize() uint64 {
@@ -7951,7 +8132,7 @@ type FskitWriteRequest struct {
 
 func (x *FskitWriteRequest) Reset() {
 	*x = FskitWriteRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[78]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[81]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -7963,7 +8144,7 @@ func (x *FskitWriteRequest) String() string {
 func (*FskitWriteRequest) ProtoMessage() {}
 
 func (x *FskitWriteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[78]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[81]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -7976,7 +8157,7 @@ func (x *FskitWriteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FskitWriteRequest.ProtoReflect.Descriptor instead.
 func (*FskitWriteRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{78}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{81}
 }
 
 func (x *FskitWriteRequest) GetTransactionId() uint64 {
@@ -8085,7 +8266,7 @@ type FskitWriteReply struct {
 
 func (x *FskitWriteReply) Reset() {
 	*x = FskitWriteReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[79]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[82]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8097,7 +8278,7 @@ func (x *FskitWriteReply) String() string {
 func (*FskitWriteReply) ProtoMessage() {}
 
 func (x *FskitWriteReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[79]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[82]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8110,7 +8291,7 @@ func (x *FskitWriteReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FskitWriteReply.ProtoReflect.Descriptor instead.
 func (*FskitWriteReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{79}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{82}
 }
 
 func (x *FskitWriteReply) GetTransactionId() uint64 {
@@ -8178,7 +8359,7 @@ type FallocateRequest struct {
 
 func (x *FallocateRequest) Reset() {
 	*x = FallocateRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[80]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[83]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8190,7 +8371,7 @@ func (x *FallocateRequest) String() string {
 func (*FallocateRequest) ProtoMessage() {}
 
 func (x *FallocateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[80]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[83]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8203,7 +8384,7 @@ func (x *FallocateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FallocateRequest.ProtoReflect.Descriptor instead.
 func (*FallocateRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{80}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{83}
 }
 
 func (x *FallocateRequest) GetHandle() []byte {
@@ -8259,7 +8440,7 @@ type CopyFileRangeRequest struct {
 
 func (x *CopyFileRangeRequest) Reset() {
 	*x = CopyFileRangeRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[81]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[84]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8271,7 +8452,7 @@ func (x *CopyFileRangeRequest) String() string {
 func (*CopyFileRangeRequest) ProtoMessage() {}
 
 func (x *CopyFileRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[81]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[84]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8284,7 +8465,7 @@ func (x *CopyFileRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyFileRangeRequest.ProtoReflect.Descriptor instead.
 func (*CopyFileRangeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{81}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{84}
 }
 
 func (x *CopyFileRangeRequest) GetInputHandle() []byte {
@@ -8351,7 +8532,7 @@ type FallocateReply struct {
 
 func (x *FallocateReply) Reset() {
 	*x = FallocateReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[82]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[85]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8363,7 +8544,7 @@ func (x *FallocateReply) String() string {
 func (*FallocateReply) ProtoMessage() {}
 
 func (x *FallocateReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[82]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[85]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8376,7 +8557,7 @@ func (x *FallocateReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FallocateReply.ProtoReflect.Descriptor instead.
 func (*FallocateReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{82}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{85}
 }
 
 func (x *FallocateReply) GetResultSize() uint64 {
@@ -8427,7 +8608,7 @@ type CopyFileRangeReply struct {
 
 func (x *CopyFileRangeReply) Reset() {
 	*x = CopyFileRangeReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[83]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[86]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8439,7 +8620,7 @@ func (x *CopyFileRangeReply) String() string {
 func (*CopyFileRangeReply) ProtoMessage() {}
 
 func (x *CopyFileRangeReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[83]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[86]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8452,7 +8633,7 @@ func (x *CopyFileRangeReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CopyFileRangeReply.ProtoReflect.Descriptor instead.
 func (*CopyFileRangeReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{83}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{86}
 }
 
 func (x *CopyFileRangeReply) GetResultSize() uint64 {
@@ -8505,7 +8686,7 @@ type TmpfileRequest struct {
 
 func (x *TmpfileRequest) Reset() {
 	*x = TmpfileRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[84]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[87]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8517,7 +8698,7 @@ func (x *TmpfileRequest) String() string {
 func (*TmpfileRequest) ProtoMessage() {}
 
 func (x *TmpfileRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[84]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[87]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8530,7 +8711,7 @@ func (x *TmpfileRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TmpfileRequest.ProtoReflect.Descriptor instead.
 func (*TmpfileRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{84}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{87}
 }
 
 func (x *TmpfileRequest) GetParent() []byte {
@@ -8571,7 +8752,7 @@ type TmpfileReply struct {
 
 func (x *TmpfileReply) Reset() {
 	*x = TmpfileReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[85]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[88]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8583,7 +8764,7 @@ func (x *TmpfileReply) String() string {
 func (*TmpfileReply) ProtoMessage() {}
 
 func (x *TmpfileReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[85]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[88]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8596,7 +8777,7 @@ func (x *TmpfileReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TmpfileReply.ProtoReflect.Descriptor instead.
 func (*TmpfileReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{85}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{88}
 }
 
 func (x *TmpfileReply) GetItem() *Item {
@@ -8623,7 +8804,7 @@ type FsyncRequest struct {
 
 func (x *FsyncRequest) Reset() {
 	*x = FsyncRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[86]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[89]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8635,7 +8816,7 @@ func (x *FsyncRequest) String() string {
 func (*FsyncRequest) ProtoMessage() {}
 
 func (x *FsyncRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[86]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[89]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8648,7 +8829,7 @@ func (x *FsyncRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FsyncRequest.ProtoReflect.Descriptor instead.
 func (*FsyncRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{86}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{89}
 }
 
 func (x *FsyncRequest) GetHandle() []byte {
@@ -8674,7 +8855,7 @@ type FsyncReply struct {
 
 func (x *FsyncReply) Reset() {
 	*x = FsyncReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[87]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[90]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8686,7 +8867,7 @@ func (x *FsyncReply) String() string {
 func (*FsyncReply) ProtoMessage() {}
 
 func (x *FsyncReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[87]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[90]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8699,7 +8880,7 @@ func (x *FsyncReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FsyncReply.ProtoReflect.Descriptor instead.
 func (*FsyncReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{87}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{90}
 }
 
 func (x *FsyncReply) GetDurableSequence() uint64 {
@@ -8719,7 +8900,7 @@ type FlushRequest struct {
 
 func (x *FlushRequest) Reset() {
 	*x = FlushRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[88]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[91]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8731,7 +8912,7 @@ func (x *FlushRequest) String() string {
 func (*FlushRequest) ProtoMessage() {}
 
 func (x *FlushRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[88]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[91]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8744,7 +8925,7 @@ func (x *FlushRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FlushRequest.ProtoReflect.Descriptor instead.
 func (*FlushRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{88}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{91}
 }
 
 func (x *FlushRequest) GetHandle() []byte {
@@ -8776,7 +8957,7 @@ type ReadDirRequest struct {
 
 func (x *ReadDirRequest) Reset() {
 	*x = ReadDirRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[89]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[92]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8788,7 +8969,7 @@ func (x *ReadDirRequest) String() string {
 func (*ReadDirRequest) ProtoMessage() {}
 
 func (x *ReadDirRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[89]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[92]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8801,7 +8982,7 @@ func (x *ReadDirRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadDirRequest.ProtoReflect.Descriptor instead.
 func (*ReadDirRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{89}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{92}
 }
 
 func (x *ReadDirRequest) GetHandle() []byte {
@@ -8853,7 +9034,7 @@ type Dirent struct {
 
 func (x *Dirent) Reset() {
 	*x = Dirent{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[90]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[93]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8865,7 +9046,7 @@ func (x *Dirent) String() string {
 func (*Dirent) ProtoMessage() {}
 
 func (x *Dirent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[90]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[93]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8878,7 +9059,7 @@ func (x *Dirent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Dirent.ProtoReflect.Descriptor instead.
 func (*Dirent) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{90}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{93}
 }
 
 func (x *Dirent) GetName() []byte {
@@ -8934,7 +9115,7 @@ type ReadDirReply struct {
 
 func (x *ReadDirReply) Reset() {
 	*x = ReadDirReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[91]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[94]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -8946,7 +9127,7 @@ func (x *ReadDirReply) String() string {
 func (*ReadDirReply) ProtoMessage() {}
 
 func (x *ReadDirReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[91]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[94]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -8959,7 +9140,7 @@ func (x *ReadDirReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadDirReply.ProtoReflect.Descriptor instead.
 func (*ReadDirReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{91}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{94}
 }
 
 func (x *ReadDirReply) GetEntries() []*Dirent {
@@ -8992,7 +9173,7 @@ type ReclaimRequest struct {
 
 func (x *ReclaimRequest) Reset() {
 	*x = ReclaimRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[92]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[95]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9004,7 +9185,7 @@ func (x *ReclaimRequest) String() string {
 func (*ReclaimRequest) ProtoMessage() {}
 
 func (x *ReclaimRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[92]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[95]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9017,7 +9198,7 @@ func (x *ReclaimRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReclaimRequest.ProtoReflect.Descriptor instead.
 func (*ReclaimRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{92}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{95}
 }
 
 func (x *ReclaimRequest) GetItem() []byte {
@@ -9038,7 +9219,7 @@ type GetXattrRequest struct {
 
 func (x *GetXattrRequest) Reset() {
 	*x = GetXattrRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[93]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[96]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9050,7 +9231,7 @@ func (x *GetXattrRequest) String() string {
 func (*GetXattrRequest) ProtoMessage() {}
 
 func (x *GetXattrRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[93]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[96]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9063,7 +9244,7 @@ func (x *GetXattrRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetXattrRequest.ProtoReflect.Descriptor instead.
 func (*GetXattrRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{93}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{96}
 }
 
 func (x *GetXattrRequest) GetItem() []byte {
@@ -9096,7 +9277,7 @@ type GetXattrReply struct {
 
 func (x *GetXattrReply) Reset() {
 	*x = GetXattrReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[94]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[97]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9108,7 +9289,7 @@ func (x *GetXattrReply) String() string {
 func (*GetXattrReply) ProtoMessage() {}
 
 func (x *GetXattrReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[94]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[97]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9121,7 +9302,7 @@ func (x *GetXattrReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetXattrReply.ProtoReflect.Descriptor instead.
 func (*GetXattrReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{94}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{97}
 }
 
 func (x *GetXattrReply) GetValue() []byte {
@@ -9144,7 +9325,7 @@ type SetXattrRequest struct {
 
 func (x *SetXattrRequest) Reset() {
 	*x = SetXattrRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[95]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[98]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9156,7 +9337,7 @@ func (x *SetXattrRequest) String() string {
 func (*SetXattrRequest) ProtoMessage() {}
 
 func (x *SetXattrRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[95]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[98]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9169,7 +9350,7 @@ func (x *SetXattrRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetXattrRequest.ProtoReflect.Descriptor instead.
 func (*SetXattrRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{95}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{98}
 }
 
 func (x *SetXattrRequest) GetItem() []byte {
@@ -9217,7 +9398,7 @@ type ListXattrRequest struct {
 
 func (x *ListXattrRequest) Reset() {
 	*x = ListXattrRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[96]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[99]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9229,7 +9410,7 @@ func (x *ListXattrRequest) String() string {
 func (*ListXattrRequest) ProtoMessage() {}
 
 func (x *ListXattrRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[96]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[99]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9242,7 +9423,7 @@ func (x *ListXattrRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListXattrRequest.ProtoReflect.Descriptor instead.
 func (*ListXattrRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{96}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{99}
 }
 
 func (x *ListXattrRequest) GetItem() []byte {
@@ -9268,7 +9449,7 @@ type ListXattrReply struct {
 
 func (x *ListXattrReply) Reset() {
 	*x = ListXattrReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[97]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[100]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9280,7 +9461,7 @@ func (x *ListXattrReply) String() string {
 func (*ListXattrReply) ProtoMessage() {}
 
 func (x *ListXattrReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[97]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[100]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9293,7 +9474,7 @@ func (x *ListXattrReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListXattrReply.ProtoReflect.Descriptor instead.
 func (*ListXattrReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{97}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{100}
 }
 
 func (x *ListXattrReply) GetNames() [][]byte {
@@ -9314,7 +9495,7 @@ type RemoveXattrRequest struct {
 
 func (x *RemoveXattrRequest) Reset() {
 	*x = RemoveXattrRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[98]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[101]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9326,7 +9507,7 @@ func (x *RemoveXattrRequest) String() string {
 func (*RemoveXattrRequest) ProtoMessage() {}
 
 func (x *RemoveXattrRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[98]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[101]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9339,7 +9520,7 @@ func (x *RemoveXattrRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveXattrRequest.ProtoReflect.Descriptor instead.
 func (*RemoveXattrRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{98}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{101}
 }
 
 func (x *RemoveXattrRequest) GetItem() []byte {
@@ -9371,7 +9552,7 @@ type StatFSRequest struct {
 
 func (x *StatFSRequest) Reset() {
 	*x = StatFSRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[99]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[102]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9383,7 +9564,7 @@ func (x *StatFSRequest) String() string {
 func (*StatFSRequest) ProtoMessage() {}
 
 func (x *StatFSRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[99]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[102]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9396,7 +9577,7 @@ func (x *StatFSRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatFSRequest.ProtoReflect.Descriptor instead.
 func (*StatFSRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{99}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{102}
 }
 
 type StatFSReply struct {
@@ -9414,7 +9595,7 @@ type StatFSReply struct {
 
 func (x *StatFSReply) Reset() {
 	*x = StatFSReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[100]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[103]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9426,7 +9607,7 @@ func (x *StatFSReply) String() string {
 func (*StatFSReply) ProtoMessage() {}
 
 func (x *StatFSReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[100]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[103]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9439,7 +9620,7 @@ func (x *StatFSReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatFSReply.ProtoReflect.Descriptor instead.
 func (*StatFSReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{100}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{103}
 }
 
 func (x *StatFSReply) GetBlockSize() uint64 {
@@ -9501,7 +9682,7 @@ type SyncFSRequest struct {
 
 func (x *SyncFSRequest) Reset() {
 	*x = SyncFSRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[101]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[104]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9513,7 +9694,7 @@ func (x *SyncFSRequest) String() string {
 func (*SyncFSRequest) ProtoMessage() {}
 
 func (x *SyncFSRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[101]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[104]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9526,7 +9707,7 @@ func (x *SyncFSRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncFSRequest.ProtoReflect.Descriptor instead.
 func (*SyncFSRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{101}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{104}
 }
 
 type SyncFSReply struct {
@@ -9538,7 +9719,7 @@ type SyncFSReply struct {
 
 func (x *SyncFSReply) Reset() {
 	*x = SyncFSReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[102]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[105]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9550,7 +9731,7 @@ func (x *SyncFSReply) String() string {
 func (*SyncFSReply) ProtoMessage() {}
 
 func (x *SyncFSReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[102]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[105]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9563,7 +9744,7 @@ func (x *SyncFSReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncFSReply.ProtoReflect.Descriptor instead.
 func (*SyncFSReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{102}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{105}
 }
 
 func (x *SyncFSReply) GetDurableSequence() uint64 {
@@ -9583,7 +9764,7 @@ type LockRange struct {
 
 func (x *LockRange) Reset() {
 	*x = LockRange{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[103]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[106]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9595,7 +9776,7 @@ func (x *LockRange) String() string {
 func (*LockRange) ProtoMessage() {}
 
 func (x *LockRange) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[103]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[106]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9608,7 +9789,7 @@ func (x *LockRange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LockRange.ProtoReflect.Descriptor instead.
 func (*LockRange) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{103}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{106}
 }
 
 func (x *LockRange) GetStart() uint64 {
@@ -9638,7 +9819,7 @@ type LockSpec struct {
 
 func (x *LockSpec) Reset() {
 	*x = LockSpec{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[104]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[107]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9650,7 +9831,7 @@ func (x *LockSpec) String() string {
 func (*LockSpec) ProtoMessage() {}
 
 func (x *LockSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[104]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[107]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9663,7 +9844,7 @@ func (x *LockSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LockSpec.ProtoReflect.Descriptor instead.
 func (*LockSpec) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{104}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{107}
 }
 
 func (x *LockSpec) GetItem() []byte {
@@ -9710,7 +9891,7 @@ type GetLockRequest struct {
 
 func (x *GetLockRequest) Reset() {
 	*x = GetLockRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[105]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[108]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9722,7 +9903,7 @@ func (x *GetLockRequest) String() string {
 func (*GetLockRequest) ProtoMessage() {}
 
 func (x *GetLockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[105]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[108]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9735,7 +9916,7 @@ func (x *GetLockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLockRequest.ProtoReflect.Descriptor instead.
 func (*GetLockRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{105}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{108}
 }
 
 func (x *GetLockRequest) GetLock() *LockSpec {
@@ -9755,7 +9936,7 @@ type GetLockReply struct {
 
 func (x *GetLockReply) Reset() {
 	*x = GetLockReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[106]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[109]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9767,7 +9948,7 @@ func (x *GetLockReply) String() string {
 func (*GetLockReply) ProtoMessage() {}
 
 func (x *GetLockReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[106]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[109]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9780,7 +9961,7 @@ func (x *GetLockReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetLockReply.ProtoReflect.Descriptor instead.
 func (*GetLockReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{106}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{109}
 }
 
 func (x *GetLockReply) GetConflict() bool {
@@ -9808,7 +9989,7 @@ type SetLockRequest struct {
 
 func (x *SetLockRequest) Reset() {
 	*x = SetLockRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[107]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[110]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9820,7 +10001,7 @@ func (x *SetLockRequest) String() string {
 func (*SetLockRequest) ProtoMessage() {}
 
 func (x *SetLockRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[107]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[110]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9833,7 +10014,7 @@ func (x *SetLockRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetLockRequest.ProtoReflect.Descriptor instead.
 func (*SetLockRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{107}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{110}
 }
 
 func (x *SetLockRequest) GetLock() *LockSpec {
@@ -9870,7 +10051,7 @@ type SubscribeRequest struct {
 
 func (x *SubscribeRequest) Reset() {
 	*x = SubscribeRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[108]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[111]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9882,7 +10063,7 @@ func (x *SubscribeRequest) String() string {
 func (*SubscribeRequest) ProtoMessage() {}
 
 func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[108]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[111]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9895,7 +10076,7 @@ func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{108}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{111}
 }
 
 func (x *SubscribeRequest) GetSnapshotId() []byte {
@@ -9926,7 +10107,7 @@ type SubscribeReply struct {
 
 func (x *SubscribeReply) Reset() {
 	*x = SubscribeReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[109]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[112]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -9938,7 +10119,7 @@ func (x *SubscribeReply) String() string {
 func (*SubscribeReply) ProtoMessage() {}
 
 func (x *SubscribeReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[109]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[112]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -9951,7 +10132,7 @@ func (x *SubscribeReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeReply.ProtoReflect.Descriptor instead.
 func (*SubscribeReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{109}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{112}
 }
 
 func (x *SubscribeReply) GetWatermark() uint64 {
@@ -10005,7 +10186,7 @@ type RenewSubscriptionRequest struct {
 
 func (x *RenewSubscriptionRequest) Reset() {
 	*x = RenewSubscriptionRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[110]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[113]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10017,7 +10198,7 @@ func (x *RenewSubscriptionRequest) String() string {
 func (*RenewSubscriptionRequest) ProtoMessage() {}
 
 func (x *RenewSubscriptionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[110]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[113]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10030,7 +10211,7 @@ func (x *RenewSubscriptionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewSubscriptionRequest.ProtoReflect.Descriptor instead.
 func (*RenewSubscriptionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{110}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{113}
 }
 
 func (x *RenewSubscriptionRequest) GetIncarnation() uint64 {
@@ -10050,7 +10231,7 @@ type RenewSubscriptionReply struct {
 
 func (x *RenewSubscriptionReply) Reset() {
 	*x = RenewSubscriptionReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[111]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[114]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10062,7 +10243,7 @@ func (x *RenewSubscriptionReply) String() string {
 func (*RenewSubscriptionReply) ProtoMessage() {}
 
 func (x *RenewSubscriptionReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[111]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[114]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10075,7 +10256,7 @@ func (x *RenewSubscriptionReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewSubscriptionReply.ProtoReflect.Descriptor instead.
 func (*RenewSubscriptionReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{111}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{114}
 }
 
 func (x *RenewSubscriptionReply) GetIncarnation() uint64 {
@@ -10105,7 +10286,7 @@ type NextControlEventRequest struct {
 
 func (x *NextControlEventRequest) Reset() {
 	*x = NextControlEventRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[112]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[115]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10117,7 +10298,7 @@ func (x *NextControlEventRequest) String() string {
 func (*NextControlEventRequest) ProtoMessage() {}
 
 func (x *NextControlEventRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[112]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[115]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10130,7 +10311,7 @@ func (x *NextControlEventRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NextControlEventRequest.ProtoReflect.Descriptor instead.
 func (*NextControlEventRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{112}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{115}
 }
 
 func (x *NextControlEventRequest) GetIncarnation() uint64 {
@@ -10171,7 +10352,7 @@ type ControlEvent struct {
 
 func (x *ControlEvent) Reset() {
 	*x = ControlEvent{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[113]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[116]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10183,7 +10364,7 @@ func (x *ControlEvent) String() string {
 func (*ControlEvent) ProtoMessage() {}
 
 func (x *ControlEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[113]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[116]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10196,7 +10377,7 @@ func (x *ControlEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ControlEvent.ProtoReflect.Descriptor instead.
 func (*ControlEvent) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{113}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{116}
 }
 
 func (x *ControlEvent) GetIncarnation() uint64 {
@@ -10294,7 +10475,7 @@ type ByteRange struct {
 
 func (x *ByteRange) Reset() {
 	*x = ByteRange{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[114]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[117]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10306,7 +10487,7 @@ func (x *ByteRange) String() string {
 func (*ByteRange) ProtoMessage() {}
 
 func (x *ByteRange) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[114]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[117]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10319,7 +10500,7 @@ func (x *ByteRange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ByteRange.ProtoReflect.Descriptor instead.
 func (*ByteRange) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{114}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{117}
 }
 
 func (x *ByteRange) GetOffset() uint64 {
@@ -10351,7 +10532,7 @@ type ChangeEntry struct {
 
 func (x *ChangeEntry) Reset() {
 	*x = ChangeEntry{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[115]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[118]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10363,7 +10544,7 @@ func (x *ChangeEntry) String() string {
 func (*ChangeEntry) ProtoMessage() {}
 
 func (x *ChangeEntry) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[115]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[118]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10376,7 +10557,7 @@ func (x *ChangeEntry) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeEntry.ProtoReflect.Descriptor instead.
 func (*ChangeEntry) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{115}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{118}
 }
 
 func (x *ChangeEntry) GetPosition() uint64 {
@@ -10438,7 +10619,7 @@ type ChangeBatch struct {
 
 func (x *ChangeBatch) Reset() {
 	*x = ChangeBatch{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[116]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[119]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10450,7 +10631,7 @@ func (x *ChangeBatch) String() string {
 func (*ChangeBatch) ProtoMessage() {}
 
 func (x *ChangeBatch) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[116]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[119]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10463,7 +10644,7 @@ func (x *ChangeBatch) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeBatch.ProtoReflect.Descriptor instead.
 func (*ChangeBatch) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{116}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{119}
 }
 
 func (x *ChangeBatch) GetIncarnation() uint64 {
@@ -10490,7 +10671,7 @@ type ChangeAck struct {
 
 func (x *ChangeAck) Reset() {
 	*x = ChangeAck{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[117]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[120]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10502,7 +10683,7 @@ func (x *ChangeAck) String() string {
 func (*ChangeAck) ProtoMessage() {}
 
 func (x *ChangeAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[117]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[120]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10515,7 +10696,7 @@ func (x *ChangeAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeAck.ProtoReflect.Descriptor instead.
 func (*ChangeAck) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{117}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{120}
 }
 
 func (x *ChangeAck) GetPosition() uint64 {
@@ -10540,7 +10721,7 @@ type ChangeAckReply struct {
 
 func (x *ChangeAckReply) Reset() {
 	*x = ChangeAckReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[118]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[121]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10552,7 +10733,7 @@ func (x *ChangeAckReply) String() string {
 func (*ChangeAckReply) ProtoMessage() {}
 
 func (x *ChangeAckReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[118]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[121]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10565,7 +10746,7 @@ func (x *ChangeAckReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChangeAckReply.ProtoReflect.Descriptor instead.
 func (*ChangeAckReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{118}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{121}
 }
 
 type DelegationRef struct {
@@ -10578,7 +10759,7 @@ type DelegationRef struct {
 
 func (x *DelegationRef) Reset() {
 	*x = DelegationRef{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[119]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[122]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10590,7 +10771,7 @@ func (x *DelegationRef) String() string {
 func (*DelegationRef) ProtoMessage() {}
 
 func (x *DelegationRef) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[119]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[122]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10603,7 +10784,7 @@ func (x *DelegationRef) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationRef.ProtoReflect.Descriptor instead.
 func (*DelegationRef) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{119}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{122}
 }
 
 func (x *DelegationRef) GetId() []byte {
@@ -10631,7 +10812,7 @@ type Delegation struct {
 
 func (x *Delegation) Reset() {
 	*x = Delegation{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[120]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[123]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10643,7 +10824,7 @@ func (x *Delegation) String() string {
 func (*Delegation) ProtoMessage() {}
 
 func (x *Delegation) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[120]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[123]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10656,7 +10837,7 @@ func (x *Delegation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Delegation.ProtoReflect.Descriptor instead.
 func (*Delegation) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{120}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{123}
 }
 
 func (x *Delegation) GetId() []byte {
@@ -10691,7 +10872,7 @@ type DelegationRecall struct {
 
 func (x *DelegationRecall) Reset() {
 	*x = DelegationRecall{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[121]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[124]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10703,7 +10884,7 @@ func (x *DelegationRecall) String() string {
 func (*DelegationRecall) ProtoMessage() {}
 
 func (x *DelegationRecall) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[121]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[124]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10716,7 +10897,7 @@ func (x *DelegationRecall) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationRecall.ProtoReflect.Descriptor instead.
 func (*DelegationRecall) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{121}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{124}
 }
 
 func (x *DelegationRecall) GetDelegation() *DelegationRef {
@@ -10751,7 +10932,7 @@ type DelegationBreak struct {
 
 func (x *DelegationBreak) Reset() {
 	*x = DelegationBreak{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[122]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[125]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10763,7 +10944,7 @@ func (x *DelegationBreak) String() string {
 func (*DelegationBreak) ProtoMessage() {}
 
 func (x *DelegationBreak) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[122]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[125]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10776,7 +10957,7 @@ func (x *DelegationBreak) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationBreak.ProtoReflect.Descriptor instead.
 func (*DelegationBreak) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{122}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{125}
 }
 
 func (x *DelegationBreak) GetDelegation() *DelegationRef {
@@ -10812,7 +10993,7 @@ type DelegationModeChange struct {
 
 func (x *DelegationModeChange) Reset() {
 	*x = DelegationModeChange{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[123]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[126]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10824,7 +11005,7 @@ func (x *DelegationModeChange) String() string {
 func (*DelegationModeChange) ProtoMessage() {}
 
 func (x *DelegationModeChange) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[123]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[126]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10837,7 +11018,7 @@ func (x *DelegationModeChange) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationModeChange.ProtoReflect.Descriptor instead.
 func (*DelegationModeChange) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{123}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{126}
 }
 
 func (x *DelegationModeChange) GetDelegation() *DelegationRef {
@@ -10880,7 +11061,7 @@ type DelegationRecallAck struct {
 
 func (x *DelegationRecallAck) Reset() {
 	*x = DelegationRecallAck{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[124]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[127]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10892,7 +11073,7 @@ func (x *DelegationRecallAck) String() string {
 func (*DelegationRecallAck) ProtoMessage() {}
 
 func (x *DelegationRecallAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[124]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[127]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10905,7 +11086,7 @@ func (x *DelegationRecallAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationRecallAck.ProtoReflect.Descriptor instead.
 func (*DelegationRecallAck) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{124}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{127}
 }
 
 func (x *DelegationRecallAck) GetIncarnation() uint64 {
@@ -10944,7 +11125,7 @@ type DelegationRecallAckReply struct {
 
 func (x *DelegationRecallAckReply) Reset() {
 	*x = DelegationRecallAckReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[125]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[128]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10956,7 +11137,7 @@ func (x *DelegationRecallAckReply) String() string {
 func (*DelegationRecallAckReply) ProtoMessage() {}
 
 func (x *DelegationRecallAckReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[125]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[128]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -10969,7 +11150,7 @@ func (x *DelegationRecallAckReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationRecallAckReply.ProtoReflect.Descriptor instead.
 func (*DelegationRecallAckReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{125}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{128}
 }
 
 type DelegationBreakAck struct {
@@ -10984,7 +11165,7 @@ type DelegationBreakAck struct {
 
 func (x *DelegationBreakAck) Reset() {
 	*x = DelegationBreakAck{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[126]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[129]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -10996,7 +11177,7 @@ func (x *DelegationBreakAck) String() string {
 func (*DelegationBreakAck) ProtoMessage() {}
 
 func (x *DelegationBreakAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[126]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[129]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11009,7 +11190,7 @@ func (x *DelegationBreakAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationBreakAck.ProtoReflect.Descriptor instead.
 func (*DelegationBreakAck) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{126}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{129}
 }
 
 func (x *DelegationBreakAck) GetIncarnation() uint64 {
@@ -11048,7 +11229,7 @@ type DelegationBreakAckReply struct {
 
 func (x *DelegationBreakAckReply) Reset() {
 	*x = DelegationBreakAckReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[127]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[130]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11060,7 +11241,7 @@ func (x *DelegationBreakAckReply) String() string {
 func (*DelegationBreakAckReply) ProtoMessage() {}
 
 func (x *DelegationBreakAckReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[127]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[130]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11073,7 +11254,7 @@ func (x *DelegationBreakAckReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationBreakAckReply.ProtoReflect.Descriptor instead.
 func (*DelegationBreakAckReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{127}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{130}
 }
 
 type DelegationModeChangeAck struct {
@@ -11088,7 +11269,7 @@ type DelegationModeChangeAck struct {
 
 func (x *DelegationModeChangeAck) Reset() {
 	*x = DelegationModeChangeAck{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[128]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[131]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11100,7 +11281,7 @@ func (x *DelegationModeChangeAck) String() string {
 func (*DelegationModeChangeAck) ProtoMessage() {}
 
 func (x *DelegationModeChangeAck) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[128]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[131]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11113,7 +11294,7 @@ func (x *DelegationModeChangeAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationModeChangeAck.ProtoReflect.Descriptor instead.
 func (*DelegationModeChangeAck) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{128}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{131}
 }
 
 func (x *DelegationModeChangeAck) GetIncarnation() uint64 {
@@ -11152,7 +11333,7 @@ type DelegationModeChangeAckReply struct {
 
 func (x *DelegationModeChangeAckReply) Reset() {
 	*x = DelegationModeChangeAckReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[129]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[132]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11164,7 +11345,7 @@ func (x *DelegationModeChangeAckReply) String() string {
 func (*DelegationModeChangeAckReply) ProtoMessage() {}
 
 func (x *DelegationModeChangeAckReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[129]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[132]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11177,7 +11358,7 @@ func (x *DelegationModeChangeAckReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationModeChangeAckReply.ProtoReflect.Descriptor instead.
 func (*DelegationModeChangeAckReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{129}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{132}
 }
 
 type DelegationRelease struct {
@@ -11190,7 +11371,7 @@ type DelegationRelease struct {
 
 func (x *DelegationRelease) Reset() {
 	*x = DelegationRelease{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[130]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[133]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11202,7 +11383,7 @@ func (x *DelegationRelease) String() string {
 func (*DelegationRelease) ProtoMessage() {}
 
 func (x *DelegationRelease) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[130]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[133]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11215,7 +11396,7 @@ func (x *DelegationRelease) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationRelease.ProtoReflect.Descriptor instead.
 func (*DelegationRelease) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{130}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{133}
 }
 
 func (x *DelegationRelease) GetDelegation() *DelegationRef {
@@ -11244,7 +11425,7 @@ type DelegationReleaseRequest struct {
 
 func (x *DelegationReleaseRequest) Reset() {
 	*x = DelegationReleaseRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[131]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[134]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11256,7 +11437,7 @@ func (x *DelegationReleaseRequest) String() string {
 func (*DelegationReleaseRequest) ProtoMessage() {}
 
 func (x *DelegationReleaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[131]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[134]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11269,7 +11450,7 @@ func (x *DelegationReleaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationReleaseRequest.ProtoReflect.Descriptor instead.
 func (*DelegationReleaseRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{131}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{134}
 }
 
 func (x *DelegationReleaseRequest) GetIncarnation() uint64 {
@@ -11308,7 +11489,7 @@ type DelegationReleaseReply struct {
 
 func (x *DelegationReleaseReply) Reset() {
 	*x = DelegationReleaseReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[132]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[135]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11320,7 +11501,7 @@ func (x *DelegationReleaseReply) String() string {
 func (*DelegationReleaseReply) ProtoMessage() {}
 
 func (x *DelegationReleaseReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[132]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[135]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11333,7 +11514,7 @@ func (x *DelegationReleaseReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DelegationReleaseReply.ProtoReflect.Descriptor instead.
 func (*DelegationReleaseReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{132}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{135}
 }
 
 // The client flushes its accepted-entry cut first, then supplies the largest
@@ -11348,7 +11529,7 @@ type BarrierRequest struct {
 
 func (x *BarrierRequest) Reset() {
 	*x = BarrierRequest{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[133]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[136]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11360,7 +11541,7 @@ func (x *BarrierRequest) String() string {
 func (*BarrierRequest) ProtoMessage() {}
 
 func (x *BarrierRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[133]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[136]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11373,7 +11554,7 @@ func (x *BarrierRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BarrierRequest.ProtoReflect.Descriptor instead.
 func (*BarrierRequest) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{133}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{136}
 }
 
 func (x *BarrierRequest) GetCutSequence() uint64 {
@@ -11393,7 +11574,7 @@ type BarrierReply struct {
 
 func (x *BarrierReply) Reset() {
 	*x = BarrierReply{}
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[134]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[137]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -11405,7 +11586,7 @@ func (x *BarrierReply) String() string {
 func (*BarrierReply) ProtoMessage() {}
 
 func (x *BarrierReply) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_authority_v1_authority_proto_msgTypes[134]
+	mi := &file_proto_authority_v1_authority_proto_msgTypes[137]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -11418,7 +11599,7 @@ func (x *BarrierReply) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BarrierReply.ProtoReflect.Descriptor instead.
 func (*BarrierReply) Descriptor() ([]byte, []int) {
-	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{134}
+	return file_proto_authority_v1_authority_proto_rawDescGZIP(), []int{137}
 }
 
 func (x *BarrierReply) GetAppliedSequence() uint64 {
@@ -11439,7 +11620,7 @@ var File_proto_authority_v1_authority_proto protoreflect.FileDescriptor
 
 const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\n" +
-	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xb0&\n" +
+	"\"proto/authority/v1/authority.proto\x12\x17portablefs.authority.v1\"\xff&\n" +
 	"\aRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -11508,7 +11689,9 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x14delegation_break_ack\x18F \x01(\v2+.portablefs.authority.v1.DelegationBreakAckH\x00R\x12delegationBreakAck\x12o\n" +
 	"\x1adelegation_mode_change_ack\x18G \x01(\v20.portablefs.authority.v1.DelegationModeChangeAckH\x00R\x17delegationModeChangeAck\x12C\n" +
 	"\abarrier\x18H \x01(\v2'.portablefs.authority.v1.BarrierRequestH\x00R\abarrier\x12b\n" +
-	"\x12delegation_release\x18I \x01(\v21.portablefs.authority.v1.DelegationReleaseRequestH\x00R\x11delegationReleaseB\x06\n" +
+	"\x12delegation_release\x18I \x01(\v21.portablefs.authority.v1.DelegationReleaseRequestH\x00R\x11delegationRelease\x12M\n" +
+	"\vclose_batch\x18J \x01(\v2*.portablefs.authority.v1.CloseBatchRequestH\x00R\n" +
+	"closeBatchB\x06\n" +
 	"\x04bodyJ\x04\b\x05\x10\x06J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\b\x10\tJ\x04\b\x10\x10\x11J\x04\b\x11\x10\x12J\x04\b!\x10\"J\x04\b.\x10/R\x15frontend_operation_idR\x16source_phase_queueableR\x17source_publication_gateR\x1fvisibility_retry_after_sequenceR\x0fnext_visibilityR\x0eack_visibilityR\x11write_transaction\"i\n" +
 	"\x16FskitSourcePublication\x12O\n" +
 	"\atargets\x18\x01 \x03(\v25.portablefs.authority.v1.FskitSourcePublicationTargetR\atargets\"\xd1\x01\n" +
@@ -11528,7 +11711,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x04name\x18\x02 \x01(\fR\x04name\x12)\n" +
 	"\x10bound_attributes\x18\x03 \x01(\bR\x0fboundAttributes\x12\x1d\n" +
 	"\n" +
-	"bound_data\x18\x04 \x01(\bR\tboundData\"\xcb \n" +
+	"bound_data\x18\x04 \x01(\bR\tboundData\"\x98!\n" +
 	"\bResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
@@ -11593,7 +11776,9 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x1adelegation_mode_change_ack\x18? \x01(\v25.portablefs.authority.v1.DelegationModeChangeAckReplyH\x00R\x17delegationModeChangeAck\x12A\n" +
 	"\abarrier\x18@ \x01(\v2%.portablefs.authority.v1.BarrierReplyH\x00R\abarrier\x12`\n" +
 	"\x12delegation_release\x18A \x01(\v2/.portablefs.authority.v1.DelegationReleaseReplyH\x00R\x11delegationRelease\x12;\n" +
-	"\x05fsync\x18B \x01(\v2#.portablefs.authority.v1.FsyncReplyH\x00R\x05fsyncB\x06\n" +
+	"\x05fsync\x18B \x01(\v2#.portablefs.authority.v1.FsyncReplyH\x00R\x05fsync\x12K\n" +
+	"\vclose_batch\x18D \x01(\v2(.portablefs.authority.v1.CloseBatchReplyH\x00R\n" +
+	"closeBatchB\x06\n" +
 	"\x04bodyJ\x04\b\x05\x10\x06J\x04\b+\x10,J\x04\b\x1a\x10\x1bJ\x04\b!\x10\"J\x04\b&\x10'R\tpost_attrR\x19visibility_retry_sequenceR\n" +
 	"visibilityR\x11write_transaction\"/\n" +
 	"\x17TerminalDeliveryReceipt\x12\x14\n" +
@@ -11946,7 +12131,15 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x06handle\x18\x01 \x01(\fR\x06handle\x12\x1d\n" +
 	"\n" +
 	"lock_owner\x18\x02 \x01(\x04R\tlockOwner\x12!\n" +
-	"\fflock_unlock\x18\x03 \x01(\bR\vflockUnlock\"U\n" +
+	"\fflock_unlock\x18\x03 \x01(\bR\vflockUnlock\"R\n" +
+	"\x11CloseBatchRequest\x12=\n" +
+	"\x06closes\x18\x01 \x03(\v2%.portablefs.authority.v1.CloseRequestR\x06closes\"\x83\x01\n" +
+	"\x10CloseBatchResult\x12\x14\n" +
+	"\x05errno\x18\x01 \x01(\x05R\x05errno\x12?\n" +
+	"\afailure\x18\x02 \x01(\x0e2%.portablefs.authority.v1.FailureClassR\afailure\x12\x18\n" +
+	"\aretired\x18\x03 \x01(\bR\aretired\"V\n" +
+	"\x0fCloseBatchReply\x12C\n" +
+	"\aresults\x18\x01 \x03(\v2).portablefs.authority.v1.CloseBatchResultR\aresults\"U\n" +
 	"\vReadRequest\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\fR\x06handle\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x04R\x06offset\x12\x16\n" +
@@ -12352,7 +12545,7 @@ func file_proto_authority_v1_authority_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_authority_v1_authority_proto_enumTypes = make([]protoimpl.EnumInfo, 18)
-var file_proto_authority_v1_authority_proto_msgTypes = make([]protoimpl.MessageInfo, 135)
+var file_proto_authority_v1_authority_proto_msgTypes = make([]protoimpl.MessageInfo, 138)
 var file_proto_authority_v1_authority_proto_goTypes = []any{
 	(FailureClass)(0),                              // 0: portablefs.authority.v1.FailureClass
 	(TransportRole)(0),                             // 1: portablefs.authority.v1.TransportRole
@@ -12446,67 +12639,70 @@ var file_proto_authority_v1_authority_proto_goTypes = []any{
 	(*OpenRequest)(nil),                            // 89: portablefs.authority.v1.OpenRequest
 	(*OpenReply)(nil),                              // 90: portablefs.authority.v1.OpenReply
 	(*CloseRequest)(nil),                           // 91: portablefs.authority.v1.CloseRequest
-	(*ReadRequest)(nil),                            // 92: portablefs.authority.v1.ReadRequest
-	(*ReadReply)(nil),                              // 93: portablefs.authority.v1.ReadReply
-	(*WriteRequest)(nil),                           // 94: portablefs.authority.v1.WriteRequest
-	(*WriteReply)(nil),                             // 95: portablefs.authority.v1.WriteReply
-	(*FskitWriteRequest)(nil),                      // 96: portablefs.authority.v1.FskitWriteRequest
-	(*FskitWriteReply)(nil),                        // 97: portablefs.authority.v1.FskitWriteReply
-	(*FallocateRequest)(nil),                       // 98: portablefs.authority.v1.FallocateRequest
-	(*CopyFileRangeRequest)(nil),                   // 99: portablefs.authority.v1.CopyFileRangeRequest
-	(*FallocateReply)(nil),                         // 100: portablefs.authority.v1.FallocateReply
-	(*CopyFileRangeReply)(nil),                     // 101: portablefs.authority.v1.CopyFileRangeReply
-	(*TmpfileRequest)(nil),                         // 102: portablefs.authority.v1.TmpfileRequest
-	(*TmpfileReply)(nil),                           // 103: portablefs.authority.v1.TmpfileReply
-	(*FsyncRequest)(nil),                           // 104: portablefs.authority.v1.FsyncRequest
-	(*FsyncReply)(nil),                             // 105: portablefs.authority.v1.FsyncReply
-	(*FlushRequest)(nil),                           // 106: portablefs.authority.v1.FlushRequest
-	(*ReadDirRequest)(nil),                         // 107: portablefs.authority.v1.ReadDirRequest
-	(*Dirent)(nil),                                 // 108: portablefs.authority.v1.Dirent
-	(*ReadDirReply)(nil),                           // 109: portablefs.authority.v1.ReadDirReply
-	(*ReclaimRequest)(nil),                         // 110: portablefs.authority.v1.ReclaimRequest
-	(*GetXattrRequest)(nil),                        // 111: portablefs.authority.v1.GetXattrRequest
-	(*GetXattrReply)(nil),                          // 112: portablefs.authority.v1.GetXattrReply
-	(*SetXattrRequest)(nil),                        // 113: portablefs.authority.v1.SetXattrRequest
-	(*ListXattrRequest)(nil),                       // 114: portablefs.authority.v1.ListXattrRequest
-	(*ListXattrReply)(nil),                         // 115: portablefs.authority.v1.ListXattrReply
-	(*RemoveXattrRequest)(nil),                     // 116: portablefs.authority.v1.RemoveXattrRequest
-	(*StatFSRequest)(nil),                          // 117: portablefs.authority.v1.StatFSRequest
-	(*StatFSReply)(nil),                            // 118: portablefs.authority.v1.StatFSReply
-	(*SyncFSRequest)(nil),                          // 119: portablefs.authority.v1.SyncFSRequest
-	(*SyncFSReply)(nil),                            // 120: portablefs.authority.v1.SyncFSReply
-	(*LockRange)(nil),                              // 121: portablefs.authority.v1.LockRange
-	(*LockSpec)(nil),                               // 122: portablefs.authority.v1.LockSpec
-	(*GetLockRequest)(nil),                         // 123: portablefs.authority.v1.GetLockRequest
-	(*GetLockReply)(nil),                           // 124: portablefs.authority.v1.GetLockReply
-	(*SetLockRequest)(nil),                         // 125: portablefs.authority.v1.SetLockRequest
-	(*SubscribeRequest)(nil),                       // 126: portablefs.authority.v1.SubscribeRequest
-	(*SubscribeReply)(nil),                         // 127: portablefs.authority.v1.SubscribeReply
-	(*RenewSubscriptionRequest)(nil),               // 128: portablefs.authority.v1.RenewSubscriptionRequest
-	(*RenewSubscriptionReply)(nil),                 // 129: portablefs.authority.v1.RenewSubscriptionReply
-	(*NextControlEventRequest)(nil),                // 130: portablefs.authority.v1.NextControlEventRequest
-	(*ControlEvent)(nil),                           // 131: portablefs.authority.v1.ControlEvent
-	(*ByteRange)(nil),                              // 132: portablefs.authority.v1.ByteRange
-	(*ChangeEntry)(nil),                            // 133: portablefs.authority.v1.ChangeEntry
-	(*ChangeBatch)(nil),                            // 134: portablefs.authority.v1.ChangeBatch
-	(*ChangeAck)(nil),                              // 135: portablefs.authority.v1.ChangeAck
-	(*ChangeAckReply)(nil),                         // 136: portablefs.authority.v1.ChangeAckReply
-	(*DelegationRef)(nil),                          // 137: portablefs.authority.v1.DelegationRef
-	(*Delegation)(nil),                             // 138: portablefs.authority.v1.Delegation
-	(*DelegationRecall)(nil),                       // 139: portablefs.authority.v1.DelegationRecall
-	(*DelegationBreak)(nil),                        // 140: portablefs.authority.v1.DelegationBreak
-	(*DelegationModeChange)(nil),                   // 141: portablefs.authority.v1.DelegationModeChange
-	(*DelegationRecallAck)(nil),                    // 142: portablefs.authority.v1.DelegationRecallAck
-	(*DelegationRecallAckReply)(nil),               // 143: portablefs.authority.v1.DelegationRecallAckReply
-	(*DelegationBreakAck)(nil),                     // 144: portablefs.authority.v1.DelegationBreakAck
-	(*DelegationBreakAckReply)(nil),                // 145: portablefs.authority.v1.DelegationBreakAckReply
-	(*DelegationModeChangeAck)(nil),                // 146: portablefs.authority.v1.DelegationModeChangeAck
-	(*DelegationModeChangeAckReply)(nil),           // 147: portablefs.authority.v1.DelegationModeChangeAckReply
-	(*DelegationRelease)(nil),                      // 148: portablefs.authority.v1.DelegationRelease
-	(*DelegationReleaseRequest)(nil),               // 149: portablefs.authority.v1.DelegationReleaseRequest
-	(*DelegationReleaseReply)(nil),                 // 150: portablefs.authority.v1.DelegationReleaseReply
-	(*BarrierRequest)(nil),                         // 151: portablefs.authority.v1.BarrierRequest
-	(*BarrierReply)(nil),                           // 152: portablefs.authority.v1.BarrierReply
+	(*CloseBatchRequest)(nil),                      // 92: portablefs.authority.v1.CloseBatchRequest
+	(*CloseBatchResult)(nil),                       // 93: portablefs.authority.v1.CloseBatchResult
+	(*CloseBatchReply)(nil),                        // 94: portablefs.authority.v1.CloseBatchReply
+	(*ReadRequest)(nil),                            // 95: portablefs.authority.v1.ReadRequest
+	(*ReadReply)(nil),                              // 96: portablefs.authority.v1.ReadReply
+	(*WriteRequest)(nil),                           // 97: portablefs.authority.v1.WriteRequest
+	(*WriteReply)(nil),                             // 98: portablefs.authority.v1.WriteReply
+	(*FskitWriteRequest)(nil),                      // 99: portablefs.authority.v1.FskitWriteRequest
+	(*FskitWriteReply)(nil),                        // 100: portablefs.authority.v1.FskitWriteReply
+	(*FallocateRequest)(nil),                       // 101: portablefs.authority.v1.FallocateRequest
+	(*CopyFileRangeRequest)(nil),                   // 102: portablefs.authority.v1.CopyFileRangeRequest
+	(*FallocateReply)(nil),                         // 103: portablefs.authority.v1.FallocateReply
+	(*CopyFileRangeReply)(nil),                     // 104: portablefs.authority.v1.CopyFileRangeReply
+	(*TmpfileRequest)(nil),                         // 105: portablefs.authority.v1.TmpfileRequest
+	(*TmpfileReply)(nil),                           // 106: portablefs.authority.v1.TmpfileReply
+	(*FsyncRequest)(nil),                           // 107: portablefs.authority.v1.FsyncRequest
+	(*FsyncReply)(nil),                             // 108: portablefs.authority.v1.FsyncReply
+	(*FlushRequest)(nil),                           // 109: portablefs.authority.v1.FlushRequest
+	(*ReadDirRequest)(nil),                         // 110: portablefs.authority.v1.ReadDirRequest
+	(*Dirent)(nil),                                 // 111: portablefs.authority.v1.Dirent
+	(*ReadDirReply)(nil),                           // 112: portablefs.authority.v1.ReadDirReply
+	(*ReclaimRequest)(nil),                         // 113: portablefs.authority.v1.ReclaimRequest
+	(*GetXattrRequest)(nil),                        // 114: portablefs.authority.v1.GetXattrRequest
+	(*GetXattrReply)(nil),                          // 115: portablefs.authority.v1.GetXattrReply
+	(*SetXattrRequest)(nil),                        // 116: portablefs.authority.v1.SetXattrRequest
+	(*ListXattrRequest)(nil),                       // 117: portablefs.authority.v1.ListXattrRequest
+	(*ListXattrReply)(nil),                         // 118: portablefs.authority.v1.ListXattrReply
+	(*RemoveXattrRequest)(nil),                     // 119: portablefs.authority.v1.RemoveXattrRequest
+	(*StatFSRequest)(nil),                          // 120: portablefs.authority.v1.StatFSRequest
+	(*StatFSReply)(nil),                            // 121: portablefs.authority.v1.StatFSReply
+	(*SyncFSRequest)(nil),                          // 122: portablefs.authority.v1.SyncFSRequest
+	(*SyncFSReply)(nil),                            // 123: portablefs.authority.v1.SyncFSReply
+	(*LockRange)(nil),                              // 124: portablefs.authority.v1.LockRange
+	(*LockSpec)(nil),                               // 125: portablefs.authority.v1.LockSpec
+	(*GetLockRequest)(nil),                         // 126: portablefs.authority.v1.GetLockRequest
+	(*GetLockReply)(nil),                           // 127: portablefs.authority.v1.GetLockReply
+	(*SetLockRequest)(nil),                         // 128: portablefs.authority.v1.SetLockRequest
+	(*SubscribeRequest)(nil),                       // 129: portablefs.authority.v1.SubscribeRequest
+	(*SubscribeReply)(nil),                         // 130: portablefs.authority.v1.SubscribeReply
+	(*RenewSubscriptionRequest)(nil),               // 131: portablefs.authority.v1.RenewSubscriptionRequest
+	(*RenewSubscriptionReply)(nil),                 // 132: portablefs.authority.v1.RenewSubscriptionReply
+	(*NextControlEventRequest)(nil),                // 133: portablefs.authority.v1.NextControlEventRequest
+	(*ControlEvent)(nil),                           // 134: portablefs.authority.v1.ControlEvent
+	(*ByteRange)(nil),                              // 135: portablefs.authority.v1.ByteRange
+	(*ChangeEntry)(nil),                            // 136: portablefs.authority.v1.ChangeEntry
+	(*ChangeBatch)(nil),                            // 137: portablefs.authority.v1.ChangeBatch
+	(*ChangeAck)(nil),                              // 138: portablefs.authority.v1.ChangeAck
+	(*ChangeAckReply)(nil),                         // 139: portablefs.authority.v1.ChangeAckReply
+	(*DelegationRef)(nil),                          // 140: portablefs.authority.v1.DelegationRef
+	(*Delegation)(nil),                             // 141: portablefs.authority.v1.Delegation
+	(*DelegationRecall)(nil),                       // 142: portablefs.authority.v1.DelegationRecall
+	(*DelegationBreak)(nil),                        // 143: portablefs.authority.v1.DelegationBreak
+	(*DelegationModeChange)(nil),                   // 144: portablefs.authority.v1.DelegationModeChange
+	(*DelegationRecallAck)(nil),                    // 145: portablefs.authority.v1.DelegationRecallAck
+	(*DelegationRecallAckReply)(nil),               // 146: portablefs.authority.v1.DelegationRecallAckReply
+	(*DelegationBreakAck)(nil),                     // 147: portablefs.authority.v1.DelegationBreakAck
+	(*DelegationBreakAckReply)(nil),                // 148: portablefs.authority.v1.DelegationBreakAckReply
+	(*DelegationModeChangeAck)(nil),                // 149: portablefs.authority.v1.DelegationModeChangeAck
+	(*DelegationModeChangeAckReply)(nil),           // 150: portablefs.authority.v1.DelegationModeChangeAckReply
+	(*DelegationRelease)(nil),                      // 151: portablefs.authority.v1.DelegationRelease
+	(*DelegationReleaseRequest)(nil),               // 152: portablefs.authority.v1.DelegationReleaseRequest
+	(*DelegationReleaseReply)(nil),                 // 153: portablefs.authority.v1.DelegationReleaseReply
+	(*BarrierRequest)(nil),                         // 154: portablefs.authority.v1.BarrierRequest
+	(*BarrierReply)(nil),                           // 155: portablefs.authority.v1.BarrierReply
 }
 var file_proto_authority_v1_authority_proto_depIdxs = []int32{
 	26,  // 0: portablefs.authority.v1.Request.session:type_name -> portablefs.authority.v1.SessionProof
@@ -12531,187 +12727,192 @@ var file_proto_authority_v1_authority_proto_depIdxs = []int32{
 	87,  // 19: portablefs.authority.v1.Request.readlink:type_name -> portablefs.authority.v1.ReadlinkRequest
 	89,  // 20: portablefs.authority.v1.Request.open:type_name -> portablefs.authority.v1.OpenRequest
 	91,  // 21: portablefs.authority.v1.Request.close:type_name -> portablefs.authority.v1.CloseRequest
-	92,  // 22: portablefs.authority.v1.Request.read:type_name -> portablefs.authority.v1.ReadRequest
-	104, // 23: portablefs.authority.v1.Request.fsync:type_name -> portablefs.authority.v1.FsyncRequest
-	107, // 24: portablefs.authority.v1.Request.read_dir:type_name -> portablefs.authority.v1.ReadDirRequest
-	110, // 25: portablefs.authority.v1.Request.reclaim:type_name -> portablefs.authority.v1.ReclaimRequest
-	106, // 26: portablefs.authority.v1.Request.flush:type_name -> portablefs.authority.v1.FlushRequest
-	111, // 27: portablefs.authority.v1.Request.get_xattr:type_name -> portablefs.authority.v1.GetXattrRequest
-	113, // 28: portablefs.authority.v1.Request.set_xattr:type_name -> portablefs.authority.v1.SetXattrRequest
-	114, // 29: portablefs.authority.v1.Request.list_xattr:type_name -> portablefs.authority.v1.ListXattrRequest
-	116, // 30: portablefs.authority.v1.Request.remove_xattr:type_name -> portablefs.authority.v1.RemoveXattrRequest
-	117, // 31: portablefs.authority.v1.Request.stat_fs:type_name -> portablefs.authority.v1.StatFSRequest
-	119, // 32: portablefs.authority.v1.Request.sync_fs:type_name -> portablefs.authority.v1.SyncFSRequest
-	98,  // 33: portablefs.authority.v1.Request.fallocate:type_name -> portablefs.authority.v1.FallocateRequest
-	99,  // 34: portablefs.authority.v1.Request.copy_file_range:type_name -> portablefs.authority.v1.CopyFileRangeRequest
-	102, // 35: portablefs.authority.v1.Request.tmpfile:type_name -> portablefs.authority.v1.TmpfileRequest
-	123, // 36: portablefs.authority.v1.Request.get_lock:type_name -> portablefs.authority.v1.GetLockRequest
-	125, // 37: portablefs.authority.v1.Request.set_lock:type_name -> portablefs.authority.v1.SetLockRequest
+	95,  // 22: portablefs.authority.v1.Request.read:type_name -> portablefs.authority.v1.ReadRequest
+	107, // 23: portablefs.authority.v1.Request.fsync:type_name -> portablefs.authority.v1.FsyncRequest
+	110, // 24: portablefs.authority.v1.Request.read_dir:type_name -> portablefs.authority.v1.ReadDirRequest
+	113, // 25: portablefs.authority.v1.Request.reclaim:type_name -> portablefs.authority.v1.ReclaimRequest
+	109, // 26: portablefs.authority.v1.Request.flush:type_name -> portablefs.authority.v1.FlushRequest
+	114, // 27: portablefs.authority.v1.Request.get_xattr:type_name -> portablefs.authority.v1.GetXattrRequest
+	116, // 28: portablefs.authority.v1.Request.set_xattr:type_name -> portablefs.authority.v1.SetXattrRequest
+	117, // 29: portablefs.authority.v1.Request.list_xattr:type_name -> portablefs.authority.v1.ListXattrRequest
+	119, // 30: portablefs.authority.v1.Request.remove_xattr:type_name -> portablefs.authority.v1.RemoveXattrRequest
+	120, // 31: portablefs.authority.v1.Request.stat_fs:type_name -> portablefs.authority.v1.StatFSRequest
+	122, // 32: portablefs.authority.v1.Request.sync_fs:type_name -> portablefs.authority.v1.SyncFSRequest
+	101, // 33: portablefs.authority.v1.Request.fallocate:type_name -> portablefs.authority.v1.FallocateRequest
+	102, // 34: portablefs.authority.v1.Request.copy_file_range:type_name -> portablefs.authority.v1.CopyFileRangeRequest
+	105, // 35: portablefs.authority.v1.Request.tmpfile:type_name -> portablefs.authority.v1.TmpfileRequest
+	126, // 36: portablefs.authority.v1.Request.get_lock:type_name -> portablefs.authority.v1.GetLockRequest
+	128, // 37: portablefs.authority.v1.Request.set_lock:type_name -> portablefs.authority.v1.SetLockRequest
 	40,  // 38: portablefs.authority.v1.Request.activate:type_name -> portablefs.authority.v1.ActivateRequest
 	42,  // 39: portablefs.authority.v1.Request.abort_attach:type_name -> portablefs.authority.v1.AbortAttachRequest
 	24,  // 40: portablefs.authority.v1.Request.terminal_delivery_receipt:type_name -> portablefs.authority.v1.TerminalDeliveryReceipt
 	53,  // 41: portablefs.authority.v1.Request.apply_routes:type_name -> portablefs.authority.v1.ApplyRoutesRequest
-	94,  // 42: portablefs.authority.v1.Request.write:type_name -> portablefs.authority.v1.WriteRequest
+	97,  // 42: portablefs.authority.v1.Request.write:type_name -> portablefs.authority.v1.WriteRequest
 	62,  // 43: portablefs.authority.v1.Request.next_lease_event:type_name -> portablefs.authority.v1.NextLeaseEventRequest
 	64,  // 44: portablefs.authority.v1.Request.acknowledge_lease_event:type_name -> portablefs.authority.v1.AcknowledgeLeaseEventRequest
 	67,  // 45: portablefs.authority.v1.Request.renew_leases:type_name -> portablefs.authority.v1.RenewLeasesRequest
 	70,  // 46: portablefs.authority.v1.Request.acknowledge_source_lease_discharge:type_name -> portablefs.authority.v1.AcknowledgeSourceLeaseDischargeRequest
 	55,  // 47: portablefs.authority.v1.Request.next_fskit_repair:type_name -> portablefs.authority.v1.NextVisibilityRequest
 	56,  // 48: portablefs.authority.v1.Request.ack_fskit_repair:type_name -> portablefs.authority.v1.AckVisibilityRequest
-	96,  // 49: portablefs.authority.v1.Request.fskit_write:type_name -> portablefs.authority.v1.FskitWriteRequest
-	126, // 50: portablefs.authority.v1.Request.subscribe:type_name -> portablefs.authority.v1.SubscribeRequest
-	128, // 51: portablefs.authority.v1.Request.renew_subscription:type_name -> portablefs.authority.v1.RenewSubscriptionRequest
-	130, // 52: portablefs.authority.v1.Request.next_control_event:type_name -> portablefs.authority.v1.NextControlEventRequest
-	135, // 53: portablefs.authority.v1.Request.change_ack:type_name -> portablefs.authority.v1.ChangeAck
-	142, // 54: portablefs.authority.v1.Request.delegation_recall_ack:type_name -> portablefs.authority.v1.DelegationRecallAck
-	144, // 55: portablefs.authority.v1.Request.delegation_break_ack:type_name -> portablefs.authority.v1.DelegationBreakAck
-	146, // 56: portablefs.authority.v1.Request.delegation_mode_change_ack:type_name -> portablefs.authority.v1.DelegationModeChangeAck
-	151, // 57: portablefs.authority.v1.Request.barrier:type_name -> portablefs.authority.v1.BarrierRequest
-	149, // 58: portablefs.authority.v1.Request.delegation_release:type_name -> portablefs.authority.v1.DelegationReleaseRequest
-	20,  // 59: portablefs.authority.v1.FskitSourcePublication.targets:type_name -> portablefs.authority.v1.FskitSourcePublicationTarget
-	21,  // 60: portablefs.authority.v1.FskitSourcePublicationTarget.item:type_name -> portablefs.authority.v1.FskitSourcePublicationItem
-	22,  // 61: portablefs.authority.v1.FskitSourcePublicationTarget.namespace:type_name -> portablefs.authority.v1.FskitSourcePublicationNamespace
-	28,  // 62: portablefs.authority.v1.Response.mutation:type_name -> portablefs.authority.v1.MutationState
-	0,   // 63: portablefs.authority.v1.Response.failure:type_name -> portablefs.authority.v1.FailureClass
-	29,  // 64: portablefs.authority.v1.Response.routes_mismatch:type_name -> portablefs.authority.v1.RoutesMismatch
-	32,  // 65: portablefs.authority.v1.Response.post_state:type_name -> portablefs.authority.v1.PostState
-	58,  // 66: portablefs.authority.v1.Response.lease_grants:type_name -> portablefs.authority.v1.LeaseGrant
-	69,  // 67: portablefs.authority.v1.Response.source_lease_discharge:type_name -> portablefs.authority.v1.SourceLeaseDischarge
-	35,  // 68: portablefs.authority.v1.Response.hello:type_name -> portablefs.authority.v1.HelloReply
-	37,  // 69: portablefs.authority.v1.Response.attach:type_name -> portablefs.authority.v1.AttachReply
-	39,  // 70: portablefs.authority.v1.Response.resume:type_name -> portablefs.authority.v1.ResumeReply
-	41,  // 71: portablefs.authority.v1.Response.activate:type_name -> portablefs.authority.v1.ActivateReply
-	43,  // 72: portablefs.authority.v1.Response.abort_attach:type_name -> portablefs.authority.v1.AbortAttachReply
-	73,  // 73: portablefs.authority.v1.Response.lookup:type_name -> portablefs.authority.v1.LookupReply
-	75,  // 74: portablefs.authority.v1.Response.get_attr:type_name -> portablefs.authority.v1.GetAttrReply
-	79,  // 75: portablefs.authority.v1.Response.create:type_name -> portablefs.authority.v1.CreateReply
-	88,  // 76: portablefs.authority.v1.Response.readlink:type_name -> portablefs.authority.v1.ReadlinkReply
-	90,  // 77: portablefs.authority.v1.Response.open:type_name -> portablefs.authority.v1.OpenReply
-	93,  // 78: portablefs.authority.v1.Response.read:type_name -> portablefs.authority.v1.ReadReply
-	109, // 79: portablefs.authority.v1.Response.read_dir:type_name -> portablefs.authority.v1.ReadDirReply
-	112, // 80: portablefs.authority.v1.Response.get_xattr:type_name -> portablefs.authority.v1.GetXattrReply
-	115, // 81: portablefs.authority.v1.Response.list_xattr:type_name -> portablefs.authority.v1.ListXattrReply
-	118, // 82: portablefs.authority.v1.Response.stat_fs:type_name -> portablefs.authority.v1.StatFSReply
-	124, // 83: portablefs.authority.v1.Response.get_lock:type_name -> portablefs.authority.v1.GetLockReply
-	85,  // 84: portablefs.authority.v1.Response.link:type_name -> portablefs.authority.v1.LinkReply
-	54,  // 85: portablefs.authority.v1.Response.apply_routes:type_name -> portablefs.authority.v1.ApplyRoutesReply
-	120, // 86: portablefs.authority.v1.Response.sync_fs:type_name -> portablefs.authority.v1.SyncFSReply
-	46,  // 87: portablefs.authority.v1.Response.reauthorize:type_name -> portablefs.authority.v1.ReauthorizeReply
-	83,  // 88: portablefs.authority.v1.Response.rename:type_name -> portablefs.authority.v1.RenameReply
-	100, // 89: portablefs.authority.v1.Response.fallocate:type_name -> portablefs.authority.v1.FallocateReply
-	101, // 90: portablefs.authority.v1.Response.copy_file_range:type_name -> portablefs.authority.v1.CopyFileRangeReply
-	103, // 91: portablefs.authority.v1.Response.tmpfile:type_name -> portablefs.authority.v1.TmpfileReply
-	25,  // 92: portablefs.authority.v1.Response.terminal_delivery_receipt:type_name -> portablefs.authority.v1.TerminalDeliveryReceiptReply
-	95,  // 93: portablefs.authority.v1.Response.write:type_name -> portablefs.authority.v1.WriteReply
-	61,  // 94: portablefs.authority.v1.Response.lease_event:type_name -> portablefs.authority.v1.LeaseEvent
-	65,  // 95: portablefs.authority.v1.Response.acknowledge_lease_event:type_name -> portablefs.authority.v1.AcknowledgeLeaseEventReply
-	68,  // 96: portablefs.authority.v1.Response.renew_leases:type_name -> portablefs.authority.v1.RenewLeasesReply
-	71,  // 97: portablefs.authority.v1.Response.acknowledge_source_lease_discharge:type_name -> portablefs.authority.v1.AcknowledgeSourceLeaseDischargeReply
-	52,  // 98: portablefs.authority.v1.Response.fskit_repair:type_name -> portablefs.authority.v1.VisibilityEvent
-	97,  // 99: portablefs.authority.v1.Response.fskit_write:type_name -> portablefs.authority.v1.FskitWriteReply
-	127, // 100: portablefs.authority.v1.Response.subscribe:type_name -> portablefs.authority.v1.SubscribeReply
-	129, // 101: portablefs.authority.v1.Response.renew_subscription:type_name -> portablefs.authority.v1.RenewSubscriptionReply
-	131, // 102: portablefs.authority.v1.Response.control_event:type_name -> portablefs.authority.v1.ControlEvent
-	136, // 103: portablefs.authority.v1.Response.change_ack:type_name -> portablefs.authority.v1.ChangeAckReply
-	143, // 104: portablefs.authority.v1.Response.delegation_recall_ack:type_name -> portablefs.authority.v1.DelegationRecallAckReply
-	145, // 105: portablefs.authority.v1.Response.delegation_break_ack:type_name -> portablefs.authority.v1.DelegationBreakAckReply
-	147, // 106: portablefs.authority.v1.Response.delegation_mode_change_ack:type_name -> portablefs.authority.v1.DelegationModeChangeAckReply
-	152, // 107: portablefs.authority.v1.Response.barrier:type_name -> portablefs.authority.v1.BarrierReply
-	150, // 108: portablefs.authority.v1.Response.delegation_release:type_name -> portablefs.authority.v1.DelegationReleaseReply
-	105, // 109: portablefs.authority.v1.Response.fsync:type_name -> portablefs.authority.v1.FsyncReply
-	31,  // 110: portablefs.authority.v1.Item.attr:type_name -> portablefs.authority.v1.Attr
-	16,  // 111: portablefs.authority.v1.Attr.kind:type_name -> portablefs.authority.v1.Attr.Kind
-	33,  // 112: portablefs.authority.v1.PostState.objects:type_name -> portablefs.authority.v1.ObjectPostState
-	31,  // 113: portablefs.authority.v1.ObjectPostState.attr:type_name -> portablefs.authority.v1.Attr
-	1,   // 114: portablefs.authority.v1.HelloRequest.role:type_name -> portablefs.authority.v1.TransportRole
-	3,   // 115: portablefs.authority.v1.HelloRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	1,   // 116: portablefs.authority.v1.HelloReply.role:type_name -> portablefs.authority.v1.TransportRole
-	3,   // 117: portablefs.authority.v1.HelloReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	4,   // 118: portablefs.authority.v1.AttachRequest.purpose:type_name -> portablefs.authority.v1.SessionPurpose
-	3,   // 119: portablefs.authority.v1.AttachRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	6,   // 120: portablefs.authority.v1.AttachRequest.fskit_namespace_repair:type_name -> portablefs.authority.v1.NamespaceRepair
-	1,   // 121: portablefs.authority.v1.ResumeReply.role:type_name -> portablefs.authority.v1.TransportRole
-	2,   // 122: portablefs.authority.v1.ResumeReply.state:type_name -> portablefs.authority.v1.SessionState
-	30,  // 123: portablefs.authority.v1.ActivateReply.root:type_name -> portablefs.authority.v1.Item
-	2,   // 124: portablefs.authority.v1.ActivateReply.state:type_name -> portablefs.authority.v1.SessionState
-	59,  // 125: portablefs.authority.v1.ActivateReply.lease_cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
-	4,   // 126: portablefs.authority.v1.ActivateReply.purpose:type_name -> portablefs.authority.v1.SessionPurpose
-	3,   // 127: portablefs.authority.v1.ActivateReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
-	50,  // 128: portablefs.authority.v1.ActivateReply.fskit_repair_cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	2,   // 129: portablefs.authority.v1.AbortAttachReply.state:type_name -> portablefs.authority.v1.SessionState
-	47,  // 130: portablefs.authority.v1.DetachRequest.mount_absence:type_name -> portablefs.authority.v1.MountAbsenceProof
-	7,   // 131: portablefs.authority.v1.VisibilityCursor.phase:type_name -> portablefs.authority.v1.VisibilityPhase
-	8,   // 132: portablefs.authority.v1.VisibilityTarget.scope:type_name -> portablefs.authority.v1.VisibilityScope
-	33,  // 133: portablefs.authority.v1.VisibilityTarget.exact_post_state:type_name -> portablefs.authority.v1.ObjectPostState
-	50,  // 134: portablefs.authority.v1.VisibilityEvent.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	51,  // 135: portablefs.authority.v1.VisibilityEvent.targets:type_name -> portablefs.authority.v1.VisibilityTarget
-	50,  // 136: portablefs.authority.v1.NextVisibilityRequest.after:type_name -> portablefs.authority.v1.VisibilityCursor
-	50,  // 137: portablefs.authority.v1.AckVisibilityRequest.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
-	9,   // 138: portablefs.authority.v1.LeaseCoordinate.family:type_name -> portablefs.authority.v1.LeaseFamily
-	57,  // 139: portablefs.authority.v1.LeaseGrant.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	10,  // 140: portablefs.authority.v1.LeaseGrant.right:type_name -> portablefs.authority.v1.LeaseRight
-	11,  // 141: portablefs.authority.v1.LeaseEventCursor.phase:type_name -> portablefs.authority.v1.LeaseEventPhase
-	57,  // 142: portablefs.authority.v1.LeaseRecall.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	10,  // 143: portablefs.authority.v1.LeaseRecall.right:type_name -> portablefs.authority.v1.LeaseRight
-	59,  // 144: portablefs.authority.v1.LeaseEvent.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
-	60,  // 145: portablefs.authority.v1.LeaseEvent.recalls:type_name -> portablefs.authority.v1.LeaseRecall
-	32,  // 146: portablefs.authority.v1.LeaseEvent.post_state:type_name -> portablefs.authority.v1.PostState
-	59,  // 147: portablefs.authority.v1.NextLeaseEventRequest.after:type_name -> portablefs.authority.v1.LeaseEventCursor
-	57,  // 148: portablefs.authority.v1.LeaseDischarge.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	12,  // 149: portablefs.authority.v1.LeaseDischarge.mode:type_name -> portablefs.authority.v1.LeaseDischargeMode
-	10,  // 150: portablefs.authority.v1.LeaseDischarge.successor_right:type_name -> portablefs.authority.v1.LeaseRight
-	59,  // 151: portablefs.authority.v1.AcknowledgeLeaseEventRequest.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
-	63,  // 152: portablefs.authority.v1.AcknowledgeLeaseEventRequest.discharges:type_name -> portablefs.authority.v1.LeaseDischarge
-	57,  // 153: portablefs.authority.v1.LeaseRenewal.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
-	66,  // 154: portablefs.authority.v1.RenewLeasesRequest.leases:type_name -> portablefs.authority.v1.LeaseRenewal
-	58,  // 155: portablefs.authority.v1.RenewLeasesReply.grants:type_name -> portablefs.authority.v1.LeaseGrant
-	66,  // 156: portablefs.authority.v1.RenewLeasesReply.withdrawn:type_name -> portablefs.authority.v1.LeaseRenewal
-	60,  // 157: portablefs.authority.v1.SourceLeaseDischarge.recalls:type_name -> portablefs.authority.v1.LeaseRecall
-	30,  // 158: portablefs.authority.v1.LookupReply.item:type_name -> portablefs.authority.v1.Item
-	31,  // 159: portablefs.authority.v1.GetAttrReply.attr:type_name -> portablefs.authority.v1.Attr
-	137, // 160: portablefs.authority.v1.SetAttrRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	77,  // 161: portablefs.authority.v1.CreateRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	30,  // 162: portablefs.authority.v1.CreateReply.item:type_name -> portablefs.authority.v1.Item
-	138, // 163: portablefs.authority.v1.CreateReply.delegation:type_name -> portablefs.authority.v1.Delegation
-	30,  // 164: portablefs.authority.v1.LinkReply.item:type_name -> portablefs.authority.v1.Item
-	77,  // 165: portablefs.authority.v1.OpenRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	138, // 166: portablefs.authority.v1.OpenReply.delegation:type_name -> portablefs.authority.v1.Delegation
-	137, // 167: portablefs.authority.v1.WriteRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	31,  // 168: portablefs.authority.v1.WriteReply.post_attr:type_name -> portablefs.authority.v1.Attr
-	13,  // 169: portablefs.authority.v1.FskitWriteRequest.phase:type_name -> portablefs.authority.v1.FskitWritePhase
-	137, // 170: portablefs.authority.v1.FallocateRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	77,  // 171: portablefs.authority.v1.TmpfileRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
-	30,  // 172: portablefs.authority.v1.TmpfileReply.item:type_name -> portablefs.authority.v1.Item
-	31,  // 173: portablefs.authority.v1.Dirent.attr:type_name -> portablefs.authority.v1.Attr
-	30,  // 174: portablefs.authority.v1.Dirent.item:type_name -> portablefs.authority.v1.Item
-	108, // 175: portablefs.authority.v1.ReadDirReply.entries:type_name -> portablefs.authority.v1.Dirent
-	17,  // 176: portablefs.authority.v1.SetXattrRequest.mode:type_name -> portablefs.authority.v1.SetXattrRequest.Mode
-	121, // 177: portablefs.authority.v1.LockSpec.range:type_name -> portablefs.authority.v1.LockRange
-	122, // 178: portablefs.authority.v1.GetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
-	122, // 179: portablefs.authority.v1.GetLockReply.held:type_name -> portablefs.authority.v1.LockSpec
-	122, // 180: portablefs.authority.v1.SetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
-	134, // 181: portablefs.authority.v1.ControlEvent.change_batch:type_name -> portablefs.authority.v1.ChangeBatch
-	139, // 182: portablefs.authority.v1.ControlEvent.delegation_recall:type_name -> portablefs.authority.v1.DelegationRecall
-	140, // 183: portablefs.authority.v1.ControlEvent.delegation_break:type_name -> portablefs.authority.v1.DelegationBreak
-	141, // 184: portablefs.authority.v1.ControlEvent.delegation_mode_change:type_name -> portablefs.authority.v1.DelegationModeChange
-	14,  // 185: portablefs.authority.v1.ChangeEntry.kind:type_name -> portablefs.authority.v1.ChangeKind
-	132, // 186: portablefs.authority.v1.ChangeEntry.byte_range:type_name -> portablefs.authority.v1.ByteRange
-	133, // 187: portablefs.authority.v1.ChangeBatch.entries:type_name -> portablefs.authority.v1.ChangeEntry
-	15,  // 188: portablefs.authority.v1.Delegation.mode:type_name -> portablefs.authority.v1.DelegationMode
-	137, // 189: portablefs.authority.v1.DelegationRecall.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	137, // 190: portablefs.authority.v1.DelegationBreak.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	137, // 191: portablefs.authority.v1.DelegationModeChange.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	15,  // 192: portablefs.authority.v1.DelegationModeChange.mode:type_name -> portablefs.authority.v1.DelegationMode
-	137, // 193: portablefs.authority.v1.DelegationRecallAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	137, // 194: portablefs.authority.v1.DelegationBreakAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	137, // 195: portablefs.authority.v1.DelegationModeChangeAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	137, // 196: portablefs.authority.v1.DelegationRelease.delegation:type_name -> portablefs.authority.v1.DelegationRef
-	148, // 197: portablefs.authority.v1.DelegationReleaseRequest.delegations:type_name -> portablefs.authority.v1.DelegationRelease
-	198, // [198:198] is the sub-list for method output_type
-	198, // [198:198] is the sub-list for method input_type
-	198, // [198:198] is the sub-list for extension type_name
-	198, // [198:198] is the sub-list for extension extendee
-	0,   // [0:198] is the sub-list for field type_name
+	99,  // 49: portablefs.authority.v1.Request.fskit_write:type_name -> portablefs.authority.v1.FskitWriteRequest
+	129, // 50: portablefs.authority.v1.Request.subscribe:type_name -> portablefs.authority.v1.SubscribeRequest
+	131, // 51: portablefs.authority.v1.Request.renew_subscription:type_name -> portablefs.authority.v1.RenewSubscriptionRequest
+	133, // 52: portablefs.authority.v1.Request.next_control_event:type_name -> portablefs.authority.v1.NextControlEventRequest
+	138, // 53: portablefs.authority.v1.Request.change_ack:type_name -> portablefs.authority.v1.ChangeAck
+	145, // 54: portablefs.authority.v1.Request.delegation_recall_ack:type_name -> portablefs.authority.v1.DelegationRecallAck
+	147, // 55: portablefs.authority.v1.Request.delegation_break_ack:type_name -> portablefs.authority.v1.DelegationBreakAck
+	149, // 56: portablefs.authority.v1.Request.delegation_mode_change_ack:type_name -> portablefs.authority.v1.DelegationModeChangeAck
+	154, // 57: portablefs.authority.v1.Request.barrier:type_name -> portablefs.authority.v1.BarrierRequest
+	152, // 58: portablefs.authority.v1.Request.delegation_release:type_name -> portablefs.authority.v1.DelegationReleaseRequest
+	92,  // 59: portablefs.authority.v1.Request.close_batch:type_name -> portablefs.authority.v1.CloseBatchRequest
+	20,  // 60: portablefs.authority.v1.FskitSourcePublication.targets:type_name -> portablefs.authority.v1.FskitSourcePublicationTarget
+	21,  // 61: portablefs.authority.v1.FskitSourcePublicationTarget.item:type_name -> portablefs.authority.v1.FskitSourcePublicationItem
+	22,  // 62: portablefs.authority.v1.FskitSourcePublicationTarget.namespace:type_name -> portablefs.authority.v1.FskitSourcePublicationNamespace
+	28,  // 63: portablefs.authority.v1.Response.mutation:type_name -> portablefs.authority.v1.MutationState
+	0,   // 64: portablefs.authority.v1.Response.failure:type_name -> portablefs.authority.v1.FailureClass
+	29,  // 65: portablefs.authority.v1.Response.routes_mismatch:type_name -> portablefs.authority.v1.RoutesMismatch
+	32,  // 66: portablefs.authority.v1.Response.post_state:type_name -> portablefs.authority.v1.PostState
+	58,  // 67: portablefs.authority.v1.Response.lease_grants:type_name -> portablefs.authority.v1.LeaseGrant
+	69,  // 68: portablefs.authority.v1.Response.source_lease_discharge:type_name -> portablefs.authority.v1.SourceLeaseDischarge
+	35,  // 69: portablefs.authority.v1.Response.hello:type_name -> portablefs.authority.v1.HelloReply
+	37,  // 70: portablefs.authority.v1.Response.attach:type_name -> portablefs.authority.v1.AttachReply
+	39,  // 71: portablefs.authority.v1.Response.resume:type_name -> portablefs.authority.v1.ResumeReply
+	41,  // 72: portablefs.authority.v1.Response.activate:type_name -> portablefs.authority.v1.ActivateReply
+	43,  // 73: portablefs.authority.v1.Response.abort_attach:type_name -> portablefs.authority.v1.AbortAttachReply
+	73,  // 74: portablefs.authority.v1.Response.lookup:type_name -> portablefs.authority.v1.LookupReply
+	75,  // 75: portablefs.authority.v1.Response.get_attr:type_name -> portablefs.authority.v1.GetAttrReply
+	79,  // 76: portablefs.authority.v1.Response.create:type_name -> portablefs.authority.v1.CreateReply
+	88,  // 77: portablefs.authority.v1.Response.readlink:type_name -> portablefs.authority.v1.ReadlinkReply
+	90,  // 78: portablefs.authority.v1.Response.open:type_name -> portablefs.authority.v1.OpenReply
+	96,  // 79: portablefs.authority.v1.Response.read:type_name -> portablefs.authority.v1.ReadReply
+	112, // 80: portablefs.authority.v1.Response.read_dir:type_name -> portablefs.authority.v1.ReadDirReply
+	115, // 81: portablefs.authority.v1.Response.get_xattr:type_name -> portablefs.authority.v1.GetXattrReply
+	118, // 82: portablefs.authority.v1.Response.list_xattr:type_name -> portablefs.authority.v1.ListXattrReply
+	121, // 83: portablefs.authority.v1.Response.stat_fs:type_name -> portablefs.authority.v1.StatFSReply
+	127, // 84: portablefs.authority.v1.Response.get_lock:type_name -> portablefs.authority.v1.GetLockReply
+	85,  // 85: portablefs.authority.v1.Response.link:type_name -> portablefs.authority.v1.LinkReply
+	54,  // 86: portablefs.authority.v1.Response.apply_routes:type_name -> portablefs.authority.v1.ApplyRoutesReply
+	123, // 87: portablefs.authority.v1.Response.sync_fs:type_name -> portablefs.authority.v1.SyncFSReply
+	46,  // 88: portablefs.authority.v1.Response.reauthorize:type_name -> portablefs.authority.v1.ReauthorizeReply
+	83,  // 89: portablefs.authority.v1.Response.rename:type_name -> portablefs.authority.v1.RenameReply
+	103, // 90: portablefs.authority.v1.Response.fallocate:type_name -> portablefs.authority.v1.FallocateReply
+	104, // 91: portablefs.authority.v1.Response.copy_file_range:type_name -> portablefs.authority.v1.CopyFileRangeReply
+	106, // 92: portablefs.authority.v1.Response.tmpfile:type_name -> portablefs.authority.v1.TmpfileReply
+	25,  // 93: portablefs.authority.v1.Response.terminal_delivery_receipt:type_name -> portablefs.authority.v1.TerminalDeliveryReceiptReply
+	98,  // 94: portablefs.authority.v1.Response.write:type_name -> portablefs.authority.v1.WriteReply
+	61,  // 95: portablefs.authority.v1.Response.lease_event:type_name -> portablefs.authority.v1.LeaseEvent
+	65,  // 96: portablefs.authority.v1.Response.acknowledge_lease_event:type_name -> portablefs.authority.v1.AcknowledgeLeaseEventReply
+	68,  // 97: portablefs.authority.v1.Response.renew_leases:type_name -> portablefs.authority.v1.RenewLeasesReply
+	71,  // 98: portablefs.authority.v1.Response.acknowledge_source_lease_discharge:type_name -> portablefs.authority.v1.AcknowledgeSourceLeaseDischargeReply
+	52,  // 99: portablefs.authority.v1.Response.fskit_repair:type_name -> portablefs.authority.v1.VisibilityEvent
+	100, // 100: portablefs.authority.v1.Response.fskit_write:type_name -> portablefs.authority.v1.FskitWriteReply
+	130, // 101: portablefs.authority.v1.Response.subscribe:type_name -> portablefs.authority.v1.SubscribeReply
+	132, // 102: portablefs.authority.v1.Response.renew_subscription:type_name -> portablefs.authority.v1.RenewSubscriptionReply
+	134, // 103: portablefs.authority.v1.Response.control_event:type_name -> portablefs.authority.v1.ControlEvent
+	139, // 104: portablefs.authority.v1.Response.change_ack:type_name -> portablefs.authority.v1.ChangeAckReply
+	146, // 105: portablefs.authority.v1.Response.delegation_recall_ack:type_name -> portablefs.authority.v1.DelegationRecallAckReply
+	148, // 106: portablefs.authority.v1.Response.delegation_break_ack:type_name -> portablefs.authority.v1.DelegationBreakAckReply
+	150, // 107: portablefs.authority.v1.Response.delegation_mode_change_ack:type_name -> portablefs.authority.v1.DelegationModeChangeAckReply
+	155, // 108: portablefs.authority.v1.Response.barrier:type_name -> portablefs.authority.v1.BarrierReply
+	153, // 109: portablefs.authority.v1.Response.delegation_release:type_name -> portablefs.authority.v1.DelegationReleaseReply
+	108, // 110: portablefs.authority.v1.Response.fsync:type_name -> portablefs.authority.v1.FsyncReply
+	94,  // 111: portablefs.authority.v1.Response.close_batch:type_name -> portablefs.authority.v1.CloseBatchReply
+	31,  // 112: portablefs.authority.v1.Item.attr:type_name -> portablefs.authority.v1.Attr
+	16,  // 113: portablefs.authority.v1.Attr.kind:type_name -> portablefs.authority.v1.Attr.Kind
+	33,  // 114: portablefs.authority.v1.PostState.objects:type_name -> portablefs.authority.v1.ObjectPostState
+	31,  // 115: portablefs.authority.v1.ObjectPostState.attr:type_name -> portablefs.authority.v1.Attr
+	1,   // 116: portablefs.authority.v1.HelloRequest.role:type_name -> portablefs.authority.v1.TransportRole
+	3,   // 117: portablefs.authority.v1.HelloRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	1,   // 118: portablefs.authority.v1.HelloReply.role:type_name -> portablefs.authority.v1.TransportRole
+	3,   // 119: portablefs.authority.v1.HelloReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	4,   // 120: portablefs.authority.v1.AttachRequest.purpose:type_name -> portablefs.authority.v1.SessionPurpose
+	3,   // 121: portablefs.authority.v1.AttachRequest.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	6,   // 122: portablefs.authority.v1.AttachRequest.fskit_namespace_repair:type_name -> portablefs.authority.v1.NamespaceRepair
+	1,   // 123: portablefs.authority.v1.ResumeReply.role:type_name -> portablefs.authority.v1.TransportRole
+	2,   // 124: portablefs.authority.v1.ResumeReply.state:type_name -> portablefs.authority.v1.SessionState
+	30,  // 125: portablefs.authority.v1.ActivateReply.root:type_name -> portablefs.authority.v1.Item
+	2,   // 126: portablefs.authority.v1.ActivateReply.state:type_name -> portablefs.authority.v1.SessionState
+	59,  // 127: portablefs.authority.v1.ActivateReply.lease_cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
+	4,   // 128: portablefs.authority.v1.ActivateReply.purpose:type_name -> portablefs.authority.v1.SessionPurpose
+	3,   // 129: portablefs.authority.v1.ActivateReply.frontend_profile:type_name -> portablefs.authority.v1.FrontendProfile
+	50,  // 130: portablefs.authority.v1.ActivateReply.fskit_repair_cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	2,   // 131: portablefs.authority.v1.AbortAttachReply.state:type_name -> portablefs.authority.v1.SessionState
+	47,  // 132: portablefs.authority.v1.DetachRequest.mount_absence:type_name -> portablefs.authority.v1.MountAbsenceProof
+	7,   // 133: portablefs.authority.v1.VisibilityCursor.phase:type_name -> portablefs.authority.v1.VisibilityPhase
+	8,   // 134: portablefs.authority.v1.VisibilityTarget.scope:type_name -> portablefs.authority.v1.VisibilityScope
+	33,  // 135: portablefs.authority.v1.VisibilityTarget.exact_post_state:type_name -> portablefs.authority.v1.ObjectPostState
+	50,  // 136: portablefs.authority.v1.VisibilityEvent.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	51,  // 137: portablefs.authority.v1.VisibilityEvent.targets:type_name -> portablefs.authority.v1.VisibilityTarget
+	50,  // 138: portablefs.authority.v1.NextVisibilityRequest.after:type_name -> portablefs.authority.v1.VisibilityCursor
+	50,  // 139: portablefs.authority.v1.AckVisibilityRequest.cursor:type_name -> portablefs.authority.v1.VisibilityCursor
+	9,   // 140: portablefs.authority.v1.LeaseCoordinate.family:type_name -> portablefs.authority.v1.LeaseFamily
+	57,  // 141: portablefs.authority.v1.LeaseGrant.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	10,  // 142: portablefs.authority.v1.LeaseGrant.right:type_name -> portablefs.authority.v1.LeaseRight
+	11,  // 143: portablefs.authority.v1.LeaseEventCursor.phase:type_name -> portablefs.authority.v1.LeaseEventPhase
+	57,  // 144: portablefs.authority.v1.LeaseRecall.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	10,  // 145: portablefs.authority.v1.LeaseRecall.right:type_name -> portablefs.authority.v1.LeaseRight
+	59,  // 146: portablefs.authority.v1.LeaseEvent.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
+	60,  // 147: portablefs.authority.v1.LeaseEvent.recalls:type_name -> portablefs.authority.v1.LeaseRecall
+	32,  // 148: portablefs.authority.v1.LeaseEvent.post_state:type_name -> portablefs.authority.v1.PostState
+	59,  // 149: portablefs.authority.v1.NextLeaseEventRequest.after:type_name -> portablefs.authority.v1.LeaseEventCursor
+	57,  // 150: portablefs.authority.v1.LeaseDischarge.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	12,  // 151: portablefs.authority.v1.LeaseDischarge.mode:type_name -> portablefs.authority.v1.LeaseDischargeMode
+	10,  // 152: portablefs.authority.v1.LeaseDischarge.successor_right:type_name -> portablefs.authority.v1.LeaseRight
+	59,  // 153: portablefs.authority.v1.AcknowledgeLeaseEventRequest.cursor:type_name -> portablefs.authority.v1.LeaseEventCursor
+	63,  // 154: portablefs.authority.v1.AcknowledgeLeaseEventRequest.discharges:type_name -> portablefs.authority.v1.LeaseDischarge
+	57,  // 155: portablefs.authority.v1.LeaseRenewal.coordinate:type_name -> portablefs.authority.v1.LeaseCoordinate
+	66,  // 156: portablefs.authority.v1.RenewLeasesRequest.leases:type_name -> portablefs.authority.v1.LeaseRenewal
+	58,  // 157: portablefs.authority.v1.RenewLeasesReply.grants:type_name -> portablefs.authority.v1.LeaseGrant
+	66,  // 158: portablefs.authority.v1.RenewLeasesReply.withdrawn:type_name -> portablefs.authority.v1.LeaseRenewal
+	60,  // 159: portablefs.authority.v1.SourceLeaseDischarge.recalls:type_name -> portablefs.authority.v1.LeaseRecall
+	30,  // 160: portablefs.authority.v1.LookupReply.item:type_name -> portablefs.authority.v1.Item
+	31,  // 161: portablefs.authority.v1.GetAttrReply.attr:type_name -> portablefs.authority.v1.Attr
+	140, // 162: portablefs.authority.v1.SetAttrRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	77,  // 163: portablefs.authority.v1.CreateRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	30,  // 164: portablefs.authority.v1.CreateReply.item:type_name -> portablefs.authority.v1.Item
+	141, // 165: portablefs.authority.v1.CreateReply.delegation:type_name -> portablefs.authority.v1.Delegation
+	30,  // 166: portablefs.authority.v1.LinkReply.item:type_name -> portablefs.authority.v1.Item
+	77,  // 167: portablefs.authority.v1.OpenRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	141, // 168: portablefs.authority.v1.OpenReply.delegation:type_name -> portablefs.authority.v1.Delegation
+	91,  // 169: portablefs.authority.v1.CloseBatchRequest.closes:type_name -> portablefs.authority.v1.CloseRequest
+	0,   // 170: portablefs.authority.v1.CloseBatchResult.failure:type_name -> portablefs.authority.v1.FailureClass
+	93,  // 171: portablefs.authority.v1.CloseBatchReply.results:type_name -> portablefs.authority.v1.CloseBatchResult
+	140, // 172: portablefs.authority.v1.WriteRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	31,  // 173: portablefs.authority.v1.WriteReply.post_attr:type_name -> portablefs.authority.v1.Attr
+	13,  // 174: portablefs.authority.v1.FskitWriteRequest.phase:type_name -> portablefs.authority.v1.FskitWritePhase
+	140, // 175: portablefs.authority.v1.FallocateRequest.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	77,  // 176: portablefs.authority.v1.TmpfileRequest.flags:type_name -> portablefs.authority.v1.OpenFlags
+	30,  // 177: portablefs.authority.v1.TmpfileReply.item:type_name -> portablefs.authority.v1.Item
+	31,  // 178: portablefs.authority.v1.Dirent.attr:type_name -> portablefs.authority.v1.Attr
+	30,  // 179: portablefs.authority.v1.Dirent.item:type_name -> portablefs.authority.v1.Item
+	111, // 180: portablefs.authority.v1.ReadDirReply.entries:type_name -> portablefs.authority.v1.Dirent
+	17,  // 181: portablefs.authority.v1.SetXattrRequest.mode:type_name -> portablefs.authority.v1.SetXattrRequest.Mode
+	124, // 182: portablefs.authority.v1.LockSpec.range:type_name -> portablefs.authority.v1.LockRange
+	125, // 183: portablefs.authority.v1.GetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
+	125, // 184: portablefs.authority.v1.GetLockReply.held:type_name -> portablefs.authority.v1.LockSpec
+	125, // 185: portablefs.authority.v1.SetLockRequest.lock:type_name -> portablefs.authority.v1.LockSpec
+	137, // 186: portablefs.authority.v1.ControlEvent.change_batch:type_name -> portablefs.authority.v1.ChangeBatch
+	142, // 187: portablefs.authority.v1.ControlEvent.delegation_recall:type_name -> portablefs.authority.v1.DelegationRecall
+	143, // 188: portablefs.authority.v1.ControlEvent.delegation_break:type_name -> portablefs.authority.v1.DelegationBreak
+	144, // 189: portablefs.authority.v1.ControlEvent.delegation_mode_change:type_name -> portablefs.authority.v1.DelegationModeChange
+	14,  // 190: portablefs.authority.v1.ChangeEntry.kind:type_name -> portablefs.authority.v1.ChangeKind
+	135, // 191: portablefs.authority.v1.ChangeEntry.byte_range:type_name -> portablefs.authority.v1.ByteRange
+	136, // 192: portablefs.authority.v1.ChangeBatch.entries:type_name -> portablefs.authority.v1.ChangeEntry
+	15,  // 193: portablefs.authority.v1.Delegation.mode:type_name -> portablefs.authority.v1.DelegationMode
+	140, // 194: portablefs.authority.v1.DelegationRecall.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 195: portablefs.authority.v1.DelegationBreak.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 196: portablefs.authority.v1.DelegationModeChange.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	15,  // 197: portablefs.authority.v1.DelegationModeChange.mode:type_name -> portablefs.authority.v1.DelegationMode
+	140, // 198: portablefs.authority.v1.DelegationRecallAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 199: portablefs.authority.v1.DelegationBreakAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 200: portablefs.authority.v1.DelegationModeChangeAck.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	140, // 201: portablefs.authority.v1.DelegationRelease.delegation:type_name -> portablefs.authority.v1.DelegationRef
+	151, // 202: portablefs.authority.v1.DelegationReleaseRequest.delegations:type_name -> portablefs.authority.v1.DelegationRelease
+	203, // [203:203] is the sub-list for method output_type
+	203, // [203:203] is the sub-list for method input_type
+	203, // [203:203] is the sub-list for extension type_name
+	203, // [203:203] is the sub-list for extension extendee
+	0,   // [0:203] is the sub-list for field type_name
 }
 
 func init() { file_proto_authority_v1_authority_proto_init() }
@@ -12776,6 +12977,7 @@ func file_proto_authority_v1_authority_proto_init() {
 		(*Request_DelegationModeChangeAck)(nil),
 		(*Request_Barrier)(nil),
 		(*Request_DelegationRelease)(nil),
+		(*Request_CloseBatch)(nil),
 	}
 	file_proto_authority_v1_authority_proto_msgTypes[2].OneofWrappers = []any{
 		(*FskitSourcePublicationTarget_Item)(nil),
@@ -12824,9 +13026,10 @@ func file_proto_authority_v1_authority_proto_init() {
 		(*Response_Barrier)(nil),
 		(*Response_DelegationRelease)(nil),
 		(*Response_Fsync)(nil),
+		(*Response_CloseBatch)(nil),
 	}
 	file_proto_authority_v1_authority_proto_msgTypes[58].OneofWrappers = []any{}
-	file_proto_authority_v1_authority_proto_msgTypes[113].OneofWrappers = []any{
+	file_proto_authority_v1_authority_proto_msgTypes[116].OneofWrappers = []any{
 		(*ControlEvent_ChangeBatch)(nil),
 		(*ControlEvent_DelegationRecall)(nil),
 		(*ControlEvent_DelegationBreak)(nil),
@@ -12838,7 +13041,7 @@ func file_proto_authority_v1_authority_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_authority_v1_authority_proto_rawDesc), len(file_proto_authority_v1_authority_proto_rawDesc)),
 			NumEnums:      18,
-			NumMessages:   135,
+			NumMessages:   138,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

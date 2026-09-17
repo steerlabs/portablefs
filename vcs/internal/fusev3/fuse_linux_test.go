@@ -393,6 +393,13 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 		if f.reclaimFailure != 0 {
 			return &authoritypb.Response{Errno: int32(f.reclaimFailure)}, nil
 		}
+	case request.GetCloseBatch() != nil:
+		results := make([]*authoritypb.CloseBatchResult, len(request.GetCloseBatch().Closes))
+		for i, close := range request.GetCloseBatch().Closes {
+			f.fileCloses = append(f.fileCloses, proto.Clone(close).(*authoritypb.CloseRequest))
+			results[i] = &authoritypb.CloseBatchResult{Errno: int32(f.closeFailure)}
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
 	case request.GetClose() != nil:
 		f.fileCloses = append(f.fileCloses, proto.Clone(request.GetClose()).(*authoritypb.CloseRequest))
 		if f.closeFailure != 0 {

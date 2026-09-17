@@ -38,8 +38,8 @@ const FramePayloadReserve uint32 = 1024
 // terminal-delivery token restored around a retained outcome.
 const responseEnvelopeReserve uint32 = 2048
 
-// fixedMutationReplyBytes bounds every mutation reply whose body has a fixed
-// shape (an Item, an Attr, a handle, a byte count). It is also the floor for a
+// fixedMutationReplyBytes bounds fixed-shape mutation replies and the bounded
+// 128-result CloseBatch reply. It is also the floor for a
 // directory-listing budget, which guarantees at least one directory entry fits.
 const fixedMutationReplyBytes uint32 = 4096
 
@@ -65,6 +65,11 @@ const cachelessReaderFeature = "cacheless-peer-reader-v1"
 const subscriptionFeature = "volume-subscription-v1"
 const changeStreamFeature = "ordered-change-stream-v1"
 const delegationFeature = "file-write-delegation-v1"
+const batchedCloseFeature = "batched-close-v1"
+
+// MaxCloseBatch bounds both the request and its retained per-handle outcome.
+const MaxCloseBatch = 128
+
 const boundedControlReplayFeature = "bounded-control-replay-v1"
 const delegationControlFeature = "delegation-control-v1"
 const durableSequenceFeature = "session-durable-sequence-v1"
@@ -92,7 +97,7 @@ var (
 	}
 	requiredLinuxAttachFeatures = []string{
 		"direct-io-no-file-mmap", "distributed-posix-locks",
-		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, boundedControlReplayFeature,
+		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, boundedControlReplayFeature, batchedCloseFeature,
 	}
 	requiredFskitAttachFeatures = []string{
 		"write-through",
@@ -273,7 +278,7 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 			return false
 		}
 		switch req.GetBody().(type) {
-		case *authoritypb.Request_Flush, *authoritypb.Request_Fallocate,
+		case *authoritypb.Request_CloseBatch, *authoritypb.Request_Flush, *authoritypb.Request_Fallocate,
 			*authoritypb.Request_CopyFileRange, *authoritypb.Request_Tmpfile,
 			*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
 			*authoritypb.Request_Write,

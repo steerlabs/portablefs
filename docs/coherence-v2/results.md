@@ -305,3 +305,25 @@ still does 20,140 LOOKUPs; warm Git does two, while both runs reclaim 20,105
 capabilities. READDIRPLUS eliminates LOOKUPs for the cold `ls -ln` test but does
 not eliminate cold Git's index-driven stat pass. The fresh 20,000-file git-add
 regression passes at the shipping 65,536-name capacity and leaves the mount live.
+
+### Applied release and batched close (item 4)
+
+The mounted 1,000-file conformance workload falls from 5.26 seconds after item 1
+to 0.69 and 0.64 seconds in two repeats. These are whole-test durations including
+fixture setup/teardown, not isolated install timers. The final close collection
+window is bounded at 25 milliseconds or 128 handles. The initial 10-millisecond
+window measured 1.08 seconds and 69 batches and failed the new amortization
+assertion; the final runs issue 19 and 16 batches. Logs:
+`/tmp/cv2-g2-close-mounted.log`, `/tmp/cv2-g2-close-mounted2.log`.
+
+| RPC per file, 1,000-file install | After item 1 | After item 4, repeats |
+|---|---:|---:|
+| Barrier | 0.007 | 0.002 / 0.002 |
+| FLUSH | 0 | 0 / 0 |
+| ChangeAck | 0 | 0 / 0 |
+| Additional control poll | 0 | 0 / 0 |
+| Serial CLOSE | unmeasured | 0 / 0 |
+| CloseBatch | unavailable | 0.019 / 0.016 |
+
+The full 40,000-file install and Git baseline will be rerun after the remaining
+new-name LOOKUP optimization. These focused results do not replace it.

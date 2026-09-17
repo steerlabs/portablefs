@@ -1076,7 +1076,7 @@ func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Reque
 	}
 	h.byKind[requestKind(request)]++
 	before := h.beforeHandle
-	track := h.trackOpens && (request.GetOpen() != nil || request.GetCreate() != nil || request.GetTmpfile() != nil || request.GetClose() != nil)
+	track := h.trackOpens && (request.GetOpen() != nil || request.GetCreate() != nil || request.GetTmpfile() != nil || request.GetClose() != nil || request.GetCloseBatch() != nil)
 	if track {
 		h.openOperations++
 	}
@@ -1100,6 +1100,13 @@ func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Reque
 			session := string(request.GetSession().GetId())
 			if len(opened) != 0 {
 				h.openHandles[integrationOpenKey{session, string(opened)}] = struct{}{}
+			}
+			if batch := request.GetCloseBatch(); batch != nil && len(response.GetCloseBatch().GetResults()) == len(batch.Closes) {
+				for i, result := range response.GetCloseBatch().Results {
+					if result != nil && (result.Retired || result.Errno == 0 && result.Failure == 0) {
+						delete(h.openHandles, integrationOpenKey{session, string(batch.Closes[i].Handle)})
+					}
+				}
 			}
 			if close := request.GetClose(); close != nil {
 				delete(h.openHandles, integrationOpenKey{session, string(close.GetHandle())})
@@ -1164,6 +1171,8 @@ func requestKind(request *authoritypb.Request) string {
 		return "rename"
 	case request.GetOpen() != nil:
 		return "open"
+	case request.GetCloseBatch() != nil:
+		return "close_batch"
 	case request.GetClose() != nil:
 		return "close"
 	case request.GetReadDir() != nil:

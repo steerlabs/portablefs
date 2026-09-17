@@ -1473,3 +1473,56 @@ Both rows fail with the boundary predicate disabled
 repetitions and two after the final pre-fetch check
 (`/tmp/cv2-g2-plus-peer3.log`, `/tmp/cv2-g2-plus-peer-final.log`). These filtered
 wrappers exit 70 for omitted required inventory; full gates remain pending.
+
+### Part 2 item 4: applied release and batched descriptor cleanup
+
+Final-handle cleanup now closes per-identity admission, captures the accepted
+cuts, and performs application, release, and descriptor-close RPCs without the
+states' acquire, transition, or operation locks. A shared release flight orders
+new same-identity operations; unrelated identities keep progressing. The epoch
+reader still pins the old transport and capabilities. Release waits for
+application only. Applied records detach from the read/attribute overlay but
+remain charged until durability or loss, including across a fresh grant;
+retirement of an older truncate cannot damage a successor's overlay.
+
+`CloseBatch` is additive (request 74, response 68), Linux DATA-only, and requires
+`batched-close-v1` at Activate. One replay slot retains up to 128 ordered outcomes.
+The ingress grammar and handler bound both lists. Each result states whether its
+handle was retired even if descriptor cleanup reported an error. A validated
+handle is closed and untracked even when explicit flock cleanup fails; exact
+replay never closes twice. Unknown/malformed cleanup outcomes revoke the mount
+so terminal session cleanup retains ownership of unresolved descriptors.
+
+Definite release refusal preserves the grant and reopens its unchanged
+admission generation. Uncertain release closes delegation admission, detaches
+the applied overlay, and retains durability obligations. A coherence rejection
+records loss. A valid atomic release finalizes every local grant even if one
+local detach invariant fails. Flights wake only after these decisions. Cancel
+cannot reopen a detached generation.
+
+The unit proof closes 128 dirty handles in one release and one close RPC while
+Barrier is blocked and verifies all 128 records remain retained. Tests also
+cover free per-state locks during RPC, same-identity join ordering, unrelated
+progress, definite/uncertain/malformed release outcomes, multi-grant detach
+failure, consumed-close errors, unlock failure, replay mismatch, malformed
+result semantics, canonical tags, and maximum frame sizes. Validation and
+mounted measurement results follow after the running checks.
+
+All unprivileged fusev3 and authorityrpc tests pass in Docker
+(`/tmp/cv2-g2-close-fuse-suite.log`, `/tmp/cv2-g2-close-authority-suite.log`);
+the frontend device probe is excluded and mounted tests self-skip in that unit
+run. The final outcome table and Authority close tests pass in
+`/tmp/cv2-g2-close-outcomes6.log` and `/tmp/cv2-g2-close-authority3.log`.
+Writeback passes with the race detector
+(`/tmp/cv2-g2-release-writeback-final.log`). Reintroducing the pre-release Fsync
+makes the blocked-durability test fail with its deadline
+(`/tmp/cv2-g2-close-durability-fault.log`).
+
+A 10-millisecond collection window completed the mounted 1,000-file test in
+1.08 seconds but produced 69 batches, exceeding its new amortization target.
+The final bounded 25-millisecond window passes twice: 0.69/0.64 seconds,
+19/16 CloseBatch calls, two Barriers, and zero serial CLOSE, FLUSH, ChangeAck,
+or additional control polls. Concurrent truncating opens and the cold
+1,000-entry PLUS listing also pass twice
+(`/tmp/cv2-g2-close-mounted2.log`). That selected wrapper exits 70 because the
+other required tests were omitted. No full-gate claim is made here.

@@ -166,6 +166,13 @@ func (f *delegationFakeRPC) CallMutation(ctx context.Context, request *authority
 	f.sequence++
 	f.mutations = append(f.mutations, proto.Clone(request).(*authoritypb.Request))
 	response := &authoritypb.Response{AppliedSequence: f.sequence, VolumeVersion: f.sequence}
+	if batch := request.GetCloseBatch(); batch != nil {
+		results := make([]*authoritypb.CloseBatchResult, len(batch.Closes))
+		for i := range results {
+			results[i] = &authoritypb.CloseBatchResult{}
+		}
+		response.Body = &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}
+	}
 	if write := request.GetWrite(); write != nil {
 		response.Body = &authoritypb.Response_Write{Write: &authoritypb.WriteReply{
 			CommittedSize: uint64(len(write.GetData())), AssignedOffset: write.GetPosition(),
@@ -234,7 +241,7 @@ func newDelegationTestManager(t *testing.T, fake delegationRPC) *delegationManag
 func installDelegationForTest(t *testing.T, m *delegationManager, seed byte, mode authoritypb.DelegationMode) []byte {
 	t.Helper()
 	id := delegationTestIdentity(seed)
-	if err := m.Install(id, []byte{seed, 1}, []byte{seed, 2}, delegationTestGrant(seed+32, mode)); err != nil {
+	if err := m.Install(id, delegationTestToken(seed, 1), delegationTestToken(seed, 2), delegationTestGrant(seed+32, mode)); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -443,14 +450,14 @@ func TestDelegationControlWaitsForGrantReplyAndRejectsResurrection(t *testing.T)
 		Event: &authoritypb.ControlEvent_DelegationRecall{DelegationRecall: &authoritypb.DelegationRecall{
 			Delegation: cloneDelegationRef(&authoritypb.DelegationRef{Id: grant.Id, Generation: grant.Generation}), Identity: id, BudgetNanos: uint64(time.Second),
 		}}})
-	if err := m.Install(id, []byte{19, 1}, []byte{19, 2}, grant); err != nil {
+	if err := m.Install(id, delegationTestToken(19, 1), delegationTestToken(19, 2), grant); err != nil {
 		t.Fatal(err)
 	}
 	m.controlWG.Wait()
 	if fakeControlCount(fake, func(r *authoritypb.Request) bool { return r.GetDelegationRecallAck() != nil }) != 1 {
 		t.Fatal("overtaking recall was not acknowledged")
 	}
-	if err := m.Install(id, []byte{19, 1}, []byte{19, 3}, grant); !errors.Is(err, errDelegationRetired) {
+	if err := m.Install(id, delegationTestToken(19, 1), delegationTestToken(19, 3), grant); !errors.Is(err, errDelegationRetired) {
 		t.Fatalf("retired grant reinstallation=%v", err)
 	}
 }
@@ -467,7 +474,7 @@ func TestDelegationSuccessorEmptyCutDoesNotReusePriorTicket(t *testing.T) {
 	}
 	grant := delegationTestGrant(53, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	grant.Generation = 2
-	if err := m.Install(id, []byte{20, 1}, []byte{20, 3}, grant); err != nil {
+	if err := m.Install(id, delegationTestToken(20, 1), delegationTestToken(20, 3), grant); err != nil {
 		t.Fatal(err)
 	}
 	m.HandleControlEvent(t.Context(), &authoritypb.ControlEvent{Incarnation: 7, Sequence: 1, Event: &authoritypb.ControlEvent_DelegationBreak{DelegationBreak: &authoritypb.DelegationBreak{
@@ -575,7 +582,7 @@ func TestDelegationReacquireCannotRevivePriorOverlay(t *testing.T) {
 	newGrant := &authoritypb.Delegation{
 		Id: bytes.Repeat([]byte{0x7f}, 16), Generation: 2, Mode: authoritypb.DelegationMode_DELEGATION_MODE_FULL,
 	}
-	if err := m.Install(id, []byte{31, 1}, []byte{31, 3}, newGrant); err != nil {
+	if err := m.Install(id, delegationTestToken(31, 1), delegationTestToken(31, 3), newGrant); err != nil {
 		t.Fatal(err)
 	}
 	got, err := m.Read(context.Background(), id, 0, 3, func(context.Context, int64, int) ([]byte, error) {
@@ -891,10 +898,10 @@ func TestDelegationQueueCloseBatchesFinalHandles(t *testing.T) {
 	if _, err := m.Write(context.Background(), idLow, 0, []byte("low"), false); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.QueueClose(idHigh, []byte{22, 2}, 17, true); err != nil {
+	if err := m.QueueClose(idHigh, delegationTestToken(22, 2), 17, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.QueueClose(idLow, []byte{21, 2}, 19, false); err != nil {
+	if err := m.QueueClose(idLow, delegationTestToken(21, 2), 19, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -909,8 +916,8 @@ func TestDelegationQueueCloseBatchesFinalHandles(t *testing.T) {
 			}
 		}
 		for _, request := range fake.mutations {
-			if request.GetClose() != nil {
-				closes = append(closes, request.GetClose())
+			if request.GetCloseBatch() != nil {
+				closes = append(closes, request.GetCloseBatch().Closes...)
 			}
 		}
 		fake.mu.Unlock()
@@ -934,7 +941,7 @@ func TestDelegationQueuedCloseIsFencedByEpochChange(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)
 	id := installDelegationForTest(t, m, 23, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	if err := m.QueueClose(id, []byte{23, 2}, 0, false); err != nil {
+	if err := m.QueueClose(id, delegationTestToken(23, 2), 0, false); err != nil {
 		t.Fatal(err)
 	}
 	m.EpochChanged("test epoch")
@@ -942,7 +949,7 @@ func TestDelegationQueuedCloseIsFencedByEpochChange(t *testing.T) {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	for _, request := range fake.mutations {
-		if request.GetClose() != nil {
+		if request.GetClose() != nil || request.GetCloseBatch() != nil {
 			t.Fatal("old-epoch close reached the replacement session")
 		}
 	}
@@ -985,7 +992,7 @@ func TestDelegationSubscriptionFenceDropsOldBufferAndAllowsColdGrant(t *testing.
 		t.Fatal("write admitted while subscription was fenced")
 	}
 	newGrant := &authoritypb.Delegation{Id: bytes.Repeat([]byte{0x6d}, 16), Generation: 2, Mode: authoritypb.DelegationMode_DELEGATION_MODE_FULL}
-	if err := m.Install(id, []byte{32, 1}, []byte{32, 3}, newGrant); err == nil {
+	if err := m.Install(id, delegationTestToken(32, 1), delegationTestToken(32, 3), newGrant); err == nil {
 		t.Fatal("grant installed before cold subscription incarnation")
 	}
 	m.SetIncarnation(8)
@@ -999,7 +1006,7 @@ func TestDelegationSubscriptionFenceDropsOldBufferAndAllowsColdGrant(t *testing.
 	if newHandle.observeLoss() != 0 {
 		t.Fatal("new handle did not start at retained identity loss")
 	}
-	if err := m.Install(id, []byte{32, 1}, []byte{32, 3}, newGrant); err != nil {
+	if err := m.Install(id, delegationTestToken(32, 1), delegationTestToken(32, 3), newGrant); err != nil {
 		t.Fatal(err)
 	}
 	got, err := m.Read(context.Background(), id, 0, 3, func(context.Context, int64, int) ([]byte, error) {
@@ -1057,7 +1064,7 @@ func BenchmarkDelegationOwns(b *testing.B) {
 			defer m.Stop()
 			id := delegationTestIdentity(33)
 			if hot {
-				if err := m.Install(id, []byte{33, 1}, []byte{33, 2}, delegationTestGrant(65, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+				if err := m.Install(id, delegationTestToken(33, 1), delegationTestToken(33, 2), delegationTestGrant(65, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -1074,8 +1081,8 @@ func TestDelegationFlushKeepsWritableCapabilityUntilApplication(t *testing.T) {
 	fake := &delegationFakeRPC{}
 	m := newDelegationTestManager(t, fake)
 	id := installDelegationForTest(t, m, 21, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-	writer, reader := []byte{21, 2}, []byte{1, 1}
-	if err := m.AddHandle(id, []byte{21, 1}, reader, false); err != nil {
+	writer, reader := delegationTestToken(21, 2), delegationTestToken(1, 1)
+	if err := m.AddHandle(id, delegationTestToken(21, 1), reader, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Write(t.Context(), id, 0, []byte("retained"), false); err != nil {
@@ -1108,12 +1115,12 @@ func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T)
 				id = installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 			}
 			if state == "retired" {
-				if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: []byte{22, 2}}}); err != nil {
+				if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: delegationTestToken(22, 2)}}); err != nil {
 					t.Fatal(err)
 				}
 			}
-			reader := []byte{22, 3}
-			err := m.AddHandle(id, []byte{22, 1}, reader, false)
+			reader := delegationTestToken(22, 3)
+			err := m.AddHandle(id, delegationTestToken(22, 1), reader, false)
 			if state == "retired" {
 				if !errors.Is(err, errDelegationRetired) {
 					t.Fatalf("retired generation registration = %v, want retirement sentinel", err)
@@ -1126,7 +1133,7 @@ func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T)
 			}
 			// The frontend preserves an Authority OPEN even if its local grant
 			// retired before registration; it closes as an ordinary handle.
-			n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: id, Token: []byte{22, 1}}}
+			n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: id, Token: delegationTestToken(22, 1)}}
 			if err := n.registerDelegatedHandle(&fileHandle{node: n, token: reader}, nil); err != nil {
 				t.Fatalf("successful read OPEN failed registration: %v", err)
 			}
@@ -1236,9 +1243,9 @@ func TestDelegationTruncationAlwaysFlushesThroughWritableHandle(t *testing.T) {
 			fake := &delegationFakeRPC{}
 			m := newDelegationTestManager(t, fake)
 			id := installDelegationForTest(t, m, 65, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-			writer := []byte{65, 2}
+			writer := delegationTestToken(65, 2)
 			for i := byte(3); i < 35; i++ {
-				if err := m.AddHandle(id, []byte{65, 1}, []byte{65, i}, false); err != nil {
+				if err := m.AddHandle(id, delegationTestToken(65, 1), delegationTestToken(65, i), false); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1273,61 +1280,46 @@ func TestDelegationTruncationAlwaysFlushesThroughWritableHandle(t *testing.T) {
 	}
 }
 
-func TestDelegationCloseBatchAppliesAllFilesBeforeWaitingForDurability(t *testing.T) {
+func TestDelegationCloseBatchRetainsAppliedRecordsWithoutWaitingForDurability(t *testing.T) {
 	fake := &delegationBlockedBarrierRPC{barrierStarted: make(chan struct{}), releaseBarrier: make(chan struct{})}
+	defer close(fake.releaseBarrier)
 	m := newDelegationTestManager(t, fake)
 	var closes []delegationClose
-	for i := byte(1); i <= 16; i++ {
+	for i := byte(1); i <= 128; i++ {
 		id := installDelegationForTest(t, m, i, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 		if _, err := m.Write(t.Context(), id, 0, []byte("batch"), false); err != nil {
 			t.Fatal(err)
 		}
-		closes = append(closes, delegationClose{identity: id, handle: []byte{i, 2}})
+		closes = append(closes, delegationClose{identity: id, handle: delegationTestToken(i, 2)})
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- m.CloseHandles(ctx, closes) }()
-	deadline := time.Now().Add(time.Second)
-	for {
-		fake.mu.Lock()
-		writes := 0
-		for _, request := range fake.mutations {
-			if request.GetWrite() != nil {
-				writes++
-			}
-		}
-		releases := len(fake.controls)
-		fake.mu.Unlock()
-		if releases != 0 {
-			t.Fatal("released ownership before durability")
-		}
-		if writes == len(closes) {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("only %d/%d writes applied while durability was blocked", writes, len(closes))
-		}
-		time.Sleep(time.Millisecond)
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("close returned before durability: %v", err)
-	default:
-	}
-	close(fake.releaseBarrier)
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-ctx.Done():
-		t.Fatal("close batch did not complete")
+	if err := m.CloseHandles(ctx, closes); err != nil {
+		t.Fatal(err)
 	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.controls) != 1 || len(fake.controls[0].GetDelegationRelease().GetDelegations()) != len(closes) {
-		t.Fatalf("release was not one complete batch: %v", fake.controls)
+	writes, batches, closesCount := 0, 0, 0
+	for _, request := range fake.mutations {
+		if request.GetWrite() != nil {
+			writes++
+		}
+		if request.GetClose() != nil {
+			t.Fatal("serial close escaped batch")
+		}
+		if batch := request.GetCloseBatch(); batch != nil {
+			batches++
+			closesCount += len(batch.Closes)
+		}
+	}
+	if writes != 128 || batches != 1 || closesCount != 128 {
+		t.Fatalf("writes=%d batches=%d closes=%d", writes, batches, closesCount)
+	}
+	if len(fake.controls) != 1 || len(fake.controls[0].GetDelegationRelease().GetDelegations()) != 128 {
+		t.Fatal("release not batched")
+	}
+	if stats := m.buf.Stats(); stats.Entries != 128 {
+		t.Fatalf("non-durable records lost: %+v", stats)
 	}
 }
 
@@ -1340,10 +1332,10 @@ func TestDeferredCloseBacklogBlocksNewHandleAdmissionUntilCleanup(t *testing.T) 
 	id := installDelegationForTest(t, m, 17, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	handles := make([][]byte, 0, deferredCloseAdmissionLimit)
 	for i := 0; i < deferredCloseAdmissionLimit; i++ {
-		handle := []byte{17, 2}
+		handle := delegationTestToken(17, 2)
 		if i != 0 {
-			handle = []byte{17, 3, byte(i)}
-			if err := m.AddHandle(id, []byte{17, 1}, handle, false); err != nil {
+			handle = delegationTestToken(17, 3, byte(i))
+			if err := m.AddHandle(id, delegationTestToken(17, 1), handle, false); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1391,7 +1383,7 @@ func TestDeferredCloseShutdownJoinsRacingEnqueues(t *testing.T) {
 				defer producers.Done()
 				<-start
 				for i := range 100 {
-					err := m.QueueClose(delegationTestIdentity(17), []byte{17, byte(worker), byte(i)}, 0, false)
+					err := m.QueueClose(delegationTestIdentity(17), delegationTestToken(17, byte(worker), byte(i)), 0, false)
 					if err != nil && !errors.Is(err, writeback.ErrClosed) {
 						t.Errorf("queue: %v", err)
 					}
@@ -1661,4 +1653,10 @@ func TestDelegationThousandAppliedWritesDoNotIssuePerFileBarriers(t *testing.T) 
 	if barriers > limit {
 		t.Fatalf("1000 applied writes issued %d Barriers, rate limit=%d", barriers, limit)
 	}
+}
+
+func delegationTestToken(prefix ...byte) []byte {
+	token := make([]byte, 16)
+	copy(token, prefix)
+	return token
 }

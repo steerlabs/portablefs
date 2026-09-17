@@ -34,7 +34,7 @@ func classifyTransportRequest(request *authoritypb.Request) (transportRequestCla
 		*authoritypb.Request_Mkdir, *authoritypb.Request_Unlink,
 		*authoritypb.Request_Rename, *authoritypb.Request_Link,
 		*authoritypb.Request_Symlink, *authoritypb.Request_Readlink,
-		*authoritypb.Request_Open, *authoritypb.Request_Close,
+		*authoritypb.Request_Open, *authoritypb.Request_Close, *authoritypb.Request_CloseBatch,
 		*authoritypb.Request_Read, *authoritypb.Request_Write,
 		*authoritypb.Request_FskitWrite,
 		*authoritypb.Request_Fallocate, *authoritypb.Request_CopyFileRange,

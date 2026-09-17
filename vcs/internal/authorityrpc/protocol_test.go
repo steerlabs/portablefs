@@ -38,6 +38,7 @@ func TestEveryAuthorityRequestBodyHasExplicitFrontendProfileClassification(t *te
 		{&authoritypb.Request_Readlink{}, true, true, false},
 		{&authoritypb.Request_Open{}, true, true, true},
 		{&authoritypb.Request_Close{}, true, true, true},
+		{&authoritypb.Request_CloseBatch{}, true, false, false},
 		{&authoritypb.Request_Read{}, true, true, true},
 		{&authoritypb.Request_Fsync{}, true, true, false},
 		{&authoritypb.Request_ReadDir{}, true, true, true},
@@ -200,7 +201,7 @@ func TestAuthorityProtocolV7RequiresSubscriptionAndDelegation(t *testing.T) {
 	if !hasFeatures(requiredHelloFeatures, []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", subscriptionFeature, changeStreamFeature, delegationFeature}) {
 		t.Fatalf("incomplete v7 Hello: %v", requiredHelloFeatures)
 	}
-	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature}) {
+	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, batchedCloseFeature}) {
 		t.Fatalf("incomplete v7 Activate: %v", requiredStrictAttachFeatures)
 	}
 	for _, retired := range []string{"lease-coherence-v1", "directory-enumeration-lease-v1", "lease-recall-v1", "lease-renewal-v1", "open-by-identity-v1", "write-through"} {

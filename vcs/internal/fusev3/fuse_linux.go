@@ -541,6 +541,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		panic(err)
 	} // validated configuration and constant buffer bounds
 	mount.delegations.SetDropReporter(cfg.OnWritebackDrop)
+	mount.delegations.SetCleanupFailureReporter(mount.revoke)
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
 	return mount
 }
@@ -1528,7 +1529,9 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 			return nil, 0, syscall.EIO
 		}
 		state := n.mount.delegations.state(id)
-		state.acquire.Lock()
+		if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
+			return nil, 0, bufferErrno(err)
+		}
 		defer state.acquire.Unlock()
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: openFlags, WriteIntent: openFlags.GetWrite(), CacheCapable: !openFlags.GetWrite()}}}
@@ -2085,7 +2088,9 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 			return nil, nil, 0, syscall.EIO
 		}
 		state := n.mount.delegations.state(id)
-		state.acquire.Lock()
+		if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
+			return nil, nil, 0, bufferErrno(err)
+		}
 		defer state.acquire.Unlock()
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_Create{Create: &authoritypb.CreateRequest{Parent: cloneBytes(n.item.GetToken()), Name: []byte(name), Mode: mode & 0o7777, Flags: openFlags, Exclusive: flags&uint32(syscall.O_EXCL) != 0, WriteIntent: openFlags.GetWrite(), CacheCapable: !openFlags.GetWrite()}}}

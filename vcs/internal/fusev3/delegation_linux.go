@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -36,6 +35,7 @@ type delegationBinding struct {
 }
 
 type delegationState struct {
+	releaseFlight     *delegationReleaseFlight // protected by transition
 	acquire           sync.Mutex
 	grantChanged      chan struct{}
 	retiredGeneration uint64
@@ -121,6 +121,7 @@ type delegationManager struct {
 	closeStopped   bool
 
 	dropReporter    func(writeback.DropReport)
+	cleanupFailure  func(error)
 	hookMu          sync.RWMutex
 	withdrawalDrain func(context.Context, []byte) error
 	acceptedWrite   func(context.Context, []byte, int64, int64) error
@@ -353,9 +354,10 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 	m.frontend.RLock()
 	defer m.frontend.RUnlock()
 	s := m.state(id)
-	s.transition.Lock()
+	if err := s.lockAfterRelease(m.ctx, delegationTransition|delegationOperation); err != nil {
+		return err
+	}
 	defer s.transition.Unlock()
-	s.operation.Lock()
 	defer s.operation.Unlock()
 	s.admission.Lock()
 	defer s.admission.Unlock()
@@ -412,7 +414,9 @@ func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bo
 	if s == nil {
 		return nil
 	}
-	s.transition.Lock()
+	if err := s.lockAfterRelease(m.ctx, delegationTransition); err != nil {
+		return err
+	}
 	defer s.transition.Unlock()
 	s.admission.Lock()
 	defer s.admission.Unlock()
@@ -492,7 +496,9 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	m.frontend.RLock()
 	defer m.frontend.RUnlock()
 	s := m.state(id)
-	s.operation.Lock()
+	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+		return writeback.Cut{}, err
+	}
 	defer s.operation.Unlock()
 	s, b, mode, err := m.modeAndBuffer(id)
 	if err != nil {
@@ -559,7 +565,9 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	m.frontend.RLock()
 	defer m.frontend.RUnlock()
 	s := m.state(id)
-	s.operation.Lock()
+	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+		return writeback.Cut{}, err
+	}
 	defer s.operation.Unlock()
 	s, b, mode, err := m.modeAndBuffer(id)
 	if err != nil {
@@ -681,9 +689,10 @@ func (m *delegationManager) DropIdentity(identity []byte, reason string) error {
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	s := m.state(id)
-	s.transition.Lock()
+	if err := s.lockAfterRelease(m.ctx, delegationTransition|delegationOperation); err != nil {
+		return err
+	}
 	defer s.transition.Unlock()
-	s.operation.Lock()
 	defer s.operation.Unlock()
 	m.loseDelegation(s, reason)
 	return nil
@@ -1065,7 +1074,9 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	m.frontend.RLock()
 	defer m.frontend.RUnlock()
 	s := m.state(id)
-	s.operation.Lock()
+	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+		return nil, err
+	}
 	defer s.operation.Unlock()
 	s.admission.RLock()
 	ref := cloneDelegationRef(s.ref)
@@ -1134,9 +1145,10 @@ func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	s := m.state(id)
-	s.transition.Lock()
+	if err := s.lockAfterRelease(ctx, delegationTransition|delegationOperation); err != nil {
+		return err
+	}
 	defer s.transition.Unlock()
-	s.operation.Lock()
 	defer s.operation.Unlock()
 	if err := m.buf.Fsync(ctx, id); err != nil {
 		return err
@@ -1260,8 +1272,9 @@ func (m *delegationManager) handleControlEvent(ctx context.Context, event *autho
 	// CONTROL may overtake the DATA reply carrying a newly activated grant.
 	// Wait without transition/operation locks: Install needs both to publish it.
 	for {
-		s.transition.Lock()
-		s.operation.Lock()
+		if err := s.lockAfterRelease(ctx, delegationTransition|delegationOperation); err != nil {
+			return
+		}
 		s.admission.RLock()
 		live, changed, retired := cloneDelegationRef(s.ref), s.grantChanged, s.retiredGeneration
 		s.admission.RUnlock()
@@ -1512,71 +1525,30 @@ func (m *delegationManager) ReleaseBatch(ctx context.Context, identities [][]byt
 	}
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
-	type pending struct {
-		s       *delegationState
-		release *authoritypb.DelegationRelease
-	}
-	items := make([]pending, 0, len(identities))
+	groups := make([]*delegationReleaseGroup, 0, len(identities))
 	seen := make(map[writeback.Identity]struct{}, len(identities))
-	ordered := make([][]byte, len(identities))
-	for i := range identities {
-		ordered[i] = cloneBytes(identities[i])
-	}
-	sort.Slice(ordered, func(i, j int) bool { return bytes.Compare(ordered[i], ordered[j]) < 0 })
-	for _, raw := range ordered {
-		id, err := delegationIdentity(raw)
+	for _, identity := range identities {
+		id, err := delegationIdentity(identity)
 		if err != nil {
 			return err
 		}
-		if _, ok := seen[id]; ok {
-			return errors.New("fusev3: duplicate delegation release identity")
+		if _, duplicate := seen[id]; duplicate {
+			return errors.New("fusev3: duplicate release identity")
 		}
 		seen[id] = struct{}{}
-		s := m.state(id)
-		s.transition.Lock()
-		defer s.transition.Unlock()
-		s.operation.Lock()
-		defer s.operation.Unlock()
-		if s.ref == nil {
-			return errors.New("fusev3: release has no live delegation")
-		}
-		retire, err := m.beginRetire(ctx, s)
-		if err != nil {
-			return err
-		}
-		applied, err := m.buf.FlushIdentity(ctx, id, retire.Cut())
-		if err != nil {
-			return err
-		}
-		applied = delegationApplied(s, applied)
-		if err := m.buf.Fsync(ctx, id); err != nil {
-			return err
-		}
-		items = append(items, pending{s: s, release: &authoritypb.DelegationRelease{Delegation: cloneDelegationRef(s.ref), AppliedSequence: applied}})
+		groups = append(groups, &delegationReleaseGroup{state: m.state(id), release: true})
 	}
-	sort.Slice(items, func(i, j int) bool {
-		return bytes.Compare(items[i].release.GetDelegation().GetId(), items[j].release.GetDelegation().GetId()) < 0
-	})
-	releases := make([]*authoritypb.DelegationRelease, len(items))
-	for i := range items {
-		releases[i] = items[i].release
-	}
-	response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{Incarnation: m.incarnation(), Delegations: releases}}})
+	batch, err := m.prepareReleaseBatch(ctx, groups)
 	if err != nil {
 		return err
 	}
-	if err := successfulDelegationResponse(response); err != nil {
-		return err
+	defer batch.finish()
+	for _, g := range groups {
+		if g.ref == nil {
+			return errDelegationNotOwned
+		}
 	}
-	if response.GetDelegationRelease() == nil {
-		return errors.New("fusev3: delegation release omitted reply")
-	}
-	for _, item := range items {
-		item.s.admission.Lock()
-		item.s.clearGrantLocked()
-		item.s.admission.Unlock()
-	}
-	return nil
+	return batch.applyAndRelease(ctx)
 }
 
 func (m *delegationManager) TracksHandle(identity, handle []byte) bool {
@@ -1600,7 +1572,9 @@ func (m *delegationManager) CloseHandle(ctx context.Context, identity, handle []
 		return err
 	}
 	s := m.state(id)
-	s.transition.Lock()
+	if err := s.lockAfterRelease(ctx, delegationTransition); err != nil {
+		return err
+	}
 	s.admission.RLock()
 	_, present := s.handles[string(handle)]
 	last := present && len(s.handles) == 1 && s.ref != nil
@@ -1674,13 +1648,13 @@ func (m *delegationManager) changePendingCloses(delta int) {
 // QueueClose transfers a FUSE RELEASE to the cleanup worker. RELEASE has no
 // kernel reply, so a short collection window can combine final-handle
 // delegation releases while keeping every server handle alive through its
-// flush. A later cleanup failure advances loss for the affected identity.
+// application. Unknown descriptor outcomes trigger terminal session cleanup.
 func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
 	if _, err := delegationIdentity(identity); err != nil {
 		return err
 	}
-	if len(handle) == 0 {
-		return errors.New("fusev3: cannot queue an empty server handle")
+	if len(handle) != 16 {
+		return errors.New("fusev3: invalid queued server handle")
 	}
 	m.epoch.RLock()
 	pending := delegationClose{
@@ -1717,9 +1691,9 @@ func (m *delegationManager) closeLoop() {
 			return
 		}
 		batch := []delegationClose{first}
-		timer := time.NewTimer(10 * time.Millisecond)
+		timer := time.NewTimer(25 * time.Millisecond)
 	collect:
-		for len(batch) < 128 {
+		for len(batch) < authorityrpc.MaxCloseBatch {
 			select {
 			case pending := <-m.closeQueue:
 				batch = append(batch, pending)
@@ -1753,7 +1727,7 @@ func (m *delegationManager) finishCloseQueue() {
 }
 
 func (m *delegationManager) drainCloseQueue() {
-	batch := make([]delegationClose, 0, 128)
+	batch := make([]delegationClose, 0, authorityrpc.MaxCloseBatch)
 	for {
 		select {
 		case pending := <-m.closeQueue:
@@ -1776,6 +1750,12 @@ func (m *delegationManager) processCloseBatch(batch []delegationClose) {
 	// A background close retains its exact replay identity through an outage.
 	// The queue is bounded, and mount shutdown cancels this work.
 	if err := m.CloseHandles(m.ctx, batch); err != nil {
+		var cleanup delegationCleanupError
+		var finalized delegationReleaseFinalizedError
+		if errors.As(err, &cleanup) || errors.As(err, &finalized) {
+			log.Printf("portablefs: deferred close failed: %v", err)
+			return
+		}
 		for _, pending := range batch {
 			id, parseErr := delegationIdentity(pending.identity)
 			if parseErr == nil {
@@ -1792,152 +1772,100 @@ func (m *delegationManager) processCloseBatch(batch []delegationClose) {
 // CloseHandles is the synchronous batch primitive behind QueueClose. It is
 // kept visible to tests and clean shutdown paths that already own a deadline.
 func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegationClose) error {
-	if len(closes) == 0 || len(closes) > 4096 {
+	if len(closes) == 0 || len(closes) > authorityrpc.MaxCloseBatch {
 		return errors.New("fusev3: invalid close batch size")
 	}
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
+	groupsByID := make(map[writeback.Identity]*delegationReleaseGroup)
 	current := make([]delegationClose, 0, len(closes))
+	requests := make([]*authoritypb.CloseRequest, 0, len(closes))
+	seen := make(map[string]struct{}, len(closes))
 	for _, pending := range closes {
-		if pending.epoch == 0 || pending.epoch == m.epochSerial {
-			current = append(current, pending)
+		if pending.epoch != 0 && pending.epoch != m.epochSerial {
+			continue
 		}
-	}
-	closes = current
-	if len(closes) == 0 {
-		return nil
-	}
-	type closeGroup struct {
-		id      writeback.Identity
-		state   *delegationState
-		closing map[string]struct{}
-	}
-	groupsByID := make(map[writeback.Identity]*closeGroup)
-	for _, pending := range closes {
 		id, err := delegationIdentity(pending.identity)
 		if err != nil {
 			return err
 		}
-		group := groupsByID[id]
-		if group == nil {
-			group = &closeGroup{id: id, state: m.state(id), closing: make(map[string]struct{})}
-			groupsByID[id] = group
+		g := groupsByID[id]
+		if g == nil {
+			g = &delegationReleaseGroup{state: m.state(id), closing: make(map[string]struct{})}
+			groupsByID[id] = g
 		}
-		if _, duplicate := group.closing[string(pending.handle)]; duplicate {
-			return errors.New("fusev3: duplicate handle in close batch")
+		key := string(pending.handle)
+		if len(pending.handle) != 16 {
+			return errors.New("fusev3: invalid close handle")
 		}
-		group.closing[string(pending.handle)] = struct{}{}
+		if _, duplicate := seen[key]; duplicate {
+			return errors.New("fusev3: duplicate close handle")
+		}
+		seen[key] = struct{}{}
+		g.closing[key] = struct{}{}
+		current = append(current, pending)
+		requests = append(requests, &authoritypb.CloseRequest{Handle: pending.handle, LockOwner: pending.lockOwner, FlockUnlock: pending.flockUnlock})
 	}
-	groups := make([]*closeGroup, 0, len(groupsByID))
-	for _, group := range groupsByID {
-		groups = append(groups, group)
+	if len(current) == 0 {
+		return nil
 	}
-	sort.Slice(groups, func(i, j int) bool { return bytes.Compare(groups[i].id[:], groups[j].id[:]) < 0 })
-	for _, group := range groups {
-		group.state.acquire.Lock()
-		defer group.state.acquire.Unlock()
+	groups := make([]*delegationReleaseGroup, 0, len(groupsByID))
+	for _, g := range groupsByID {
+		groups = append(groups, g)
 	}
-	for _, group := range groups {
-		group.state.transition.Lock()
-		defer group.state.transition.Unlock()
-		group.state.operation.Lock()
-		defer group.state.operation.Unlock()
+	batch, err := m.prepareReleaseBatch(ctx, groups)
+	if err != nil {
+		return err
 	}
-
-	type releasedGroup struct {
-		group   *closeGroup
-		release *authoritypb.DelegationRelease
+	defer batch.finish()
+	if err := batch.applyAndRelease(ctx); err != nil {
+		return err
 	}
-	var releasing []releasedGroup
-	for _, group := range groups {
-		s := group.state
-		s.admission.RLock()
-		allClosing := len(s.handles) != 0
-		for handle := range s.handles {
-			if _, closing := group.closing[handle]; !closing {
-				allClosing = false
-				break
-			}
-		}
-		ref := cloneDelegationRef(s.ref)
-		s.admission.RUnlock()
-		if ref == nil {
-			continue
-		}
-		if !allClosing {
-			// A read-only description may outlive the last writable one. Apply
-			// accepted bytes before closing their retained writable capability.
-			if _, err := m.buf.FlushIdentity(ctx, group.id, m.buf.Snapshot()); err != nil {
-				return err
-			}
-			continue
-		}
-		retire, err := m.beginRetire(ctx, s)
-		if err != nil {
-			return err
-		}
-		applied, err := m.buf.FlushIdentity(ctx, group.id, retire.Cut())
-		if err != nil {
-			return err
-		}
-		applied = delegationApplied(s, applied)
-		releasing = append(releasing, releasedGroup{group: group, release: &authoritypb.DelegationRelease{Delegation: ref, AppliedSequence: applied}})
+	response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: &authoritypb.CloseBatchRequest{Closes: requests}}})
+	if err == nil {
+		err = successfulDelegationResponse(response)
 	}
-	// Apply the whole close batch before waiting for durability. Waiting per
-	// file turns a batched release into one serialized storage barrier per
-	// handle and lets asynchronous closes exhaust the Authority's open table.
-	// Admission is retired and the operation locks remain held, so no accepted
-	// entry can slip past this cut before ownership is surrendered.
-	for _, released := range releasing {
-		if err := m.buf.Fsync(ctx, released.group.id); err != nil {
-			return err
+	if err != nil {
+		return m.unknownCloseOutcome(err)
+	}
+	results := response.GetCloseBatch().GetResults()
+	if len(results) != len(current) {
+		return m.unknownCloseOutcome(errors.New("fusev3: close batch omitted ordered outcomes"))
+	}
+	for _, result := range results {
+		if result == nil || result.Errno < 0 || result.Errno > 4095 || result.Errno == 0 && result.Failure != 0 {
+			return m.unknownCloseOutcome(errors.New("fusev3: malformed close outcome"))
+		}
+		if _, ok := authoritypb.FailureClass_name[int32(result.Failure)]; !ok {
+			return m.unknownCloseOutcome(errors.New("fusev3: unknown close failure class"))
 		}
 	}
-	if len(releasing) != 0 {
-		sort.Slice(releasing, func(i, j int) bool {
-			return bytes.Compare(releasing[i].release.GetDelegation().GetId(), releasing[j].release.GetDelegation().GetId()) < 0
-		})
-		releases := make([]*authoritypb.DelegationRelease, len(releasing))
-		for i := range releasing {
-			releases[i] = releasing[i].release
-		}
-		response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{Incarnation: m.incarnation(), Delegations: releases}}})
-		if err != nil {
-			return err
-		}
-		if err := successfulDelegationResponse(response); err != nil || response.GetDelegationRelease() == nil {
-			if err != nil {
-				return err
-			}
-			return errors.New("fusev3: batched delegation release omitted reply")
-		}
-		for _, released := range releasing {
-			released.group.state.admission.Lock()
-			released.group.state.clearGrantLocked()
-			released.group.state.admission.Unlock()
-		}
-	}
-
 	var firstErr error
-	for _, pending := range closes {
-		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{
-			Handle: pending.handle, LockOwner: pending.lockOwner, FlockUnlock: pending.flockUnlock,
-		}}})
-		if err == nil {
-			err = successfulDelegationResponse(response)
+	for i, result := range results {
+		errno := responseErrno(&authoritypb.Response{Errno: result.GetErrno(), Failure: result.GetFailure()})
+		if result == nil {
+			errno = syscall.EIO
 		}
-		id, _ := delegationIdentity(pending.identity)
+		if errno != 0 {
+			if firstErr == nil {
+				firstErr = errno
+			}
+			if !result.GetRetired() {
+				m.unknownCloseOutcome(errno)
+				continue
+			}
+		}
+		id, _ := delegationIdentity(current[i].identity)
 		s := groupsByID[id].state
-		if err == nil {
-			s.admission.Lock()
-			delete(s.handles, string(pending.handle))
-			delete(s.writers, string(pending.handle))
-			s.admission.Unlock()
-		} else if firstErr == nil {
-			firstErr = err
-		}
+		s.admission.Lock()
+		delete(s.handles, string(current[i].handle))
+		delete(s.writers, string(current[i].handle))
+		s.admission.Unlock()
 	}
-	return firstErr
+	if firstErr != nil {
+		return delegationCleanupError{firstErr}
+	}
+	return nil
 }
 
 // EpochChanged permanently withdraws all old grants, records loss only for

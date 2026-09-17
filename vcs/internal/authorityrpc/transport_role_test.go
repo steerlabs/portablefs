@@ -19,7 +19,7 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_Unlink{}}, {Body: &authoritypb.Request_Rename{}},
 		{Body: &authoritypb.Request_Link{}}, {Body: &authoritypb.Request_Symlink{}},
 		{Body: &authoritypb.Request_Readlink{}}, {Body: &authoritypb.Request_Open{}},
-		{Body: &authoritypb.Request_Close{}}, {Body: &authoritypb.Request_Read{}},
+		{Body: &authoritypb.Request_Close{}}, {Body: &authoritypb.Request_CloseBatch{}}, {Body: &authoritypb.Request_Read{}},
 		{Body: &authoritypb.Request_FskitWrite{}}, {Body: &authoritypb.Request_Write{}},
 		{Body: &authoritypb.Request_Fallocate{}},
 		{Body: &authoritypb.Request_CopyFileRange{}}, {Body: &authoritypb.Request_Tmpfile{}}, {Body: &authoritypb.Request_Fsync{}},
@@ -73,6 +73,7 @@ func TestTransportRoleAllowlistIsStrict(t *testing.T) {
 		control bool
 	}{
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Subscribe{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{}}, control: true},

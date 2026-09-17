@@ -26,7 +26,7 @@ identifier `requiredAttachFeatures`.
 | Hello, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Hello, FSKit additions | `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1` |
 | Activate, every profile | `no-history`, `no-branches`, `user-xattr-readonly`, `single-principal`, `stable-item-identity`, `volume-syncfs-barrier`, `exact-resource-acquisition` |
-| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1`, `bounded-control-replay-v1` |
+| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1`, `bounded-control-replay-v1`, `batched-close-v1` |
 | Activate, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Activate, FSKit additions | `write-through`, `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1`, `peer-complete-fifo-feedback` |
 
@@ -36,8 +36,9 @@ includes the CONTROL delivery cursor, bounded batches, and cumulative proven
 withdrawal acks. `file-write-delegation-v1` includes CREATE/OPEN piggyback,
 cache-capable handle accounting, full and writethrough modes, and generation
 checks on every delegated flush. `delegation-control-v1` requires recall,
-break, mode changes, their acks, and batch release. The last two Linux features
-require session application/durability tickets and the root FSYNCDIR barrier.
+break, mode changes, their acks, and batch release. `session-durable-sequence-v1` and `root-directory-barrier-v1` require session
+application/durability tickets and the root FSYNCDIR barrier. `batched-close-v1`
+requires the bounded DATA close operation below.
 
 Linux no longer requires or advertises `lease-coherence-v1`,
 `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`,
@@ -74,7 +75,8 @@ It rejects unknown fields, maps, and fixed-width fields. No new message uses a
 map or fixed-width field. The write-data digest substitution is unchanged.
 Changing delegation id or generation changes a mutation's replay fingerprint.
 
-Every repeated collection has at most 4,096 elements and must also fit the
+Repeated collections have at most 4,096 elements, except CloseBatch requests
+and replies, whose limit is 128. Every collection must also fit the
 negotiated frame byte bound; senders split batches/pages earlier when needed.
 Identities are exactly 16 bytes and nonzero. Delegation ids and snapshot ids
 are opaque 16-byte nonzero values. Raw names contain 1–255 bytes, no NUL or
@@ -508,3 +510,35 @@ remain available during that interval. A canceled wait takes no storage or
 identity turn. This bound does not establish kernel mount absence: old durable
 records still block topology changes and archive proof. Prior compatibility or
 untyped legacy membership continues to require explicit fencing evidence.
+
+
+## Batched descriptor close
+
+Linux Activate requires the additive `batched-close-v1` feature. DATA carries
+`Request.close_batch` (tag 74) and `Response.close_batch` (tag 68); FSKit and
+CACHELESS_READER retain ordinary CLOSE. A request contains 1–128 distinct
+16-byte handle capabilities with each handle's lock owner and flock-unlock
+flag. The entire shape is validated before any close. The frame grammar bounds
+both request and reply lists to 128 before protobuf allocation.
+
+One mutation replay slot owns the complete ordered request and ordered results.
+Top-level success carries one result per input, including individual failures;
+all entries are attempted. Exact replay returns those outcomes without closing
+again. A changed order or handle is a replay mismatch. Callers retry only the
+identical whole request in its existing replay domain.
+
+A result carries errno, failure class, and `retired`. Once a session capability
+is validated, descriptor close is attempted even if explicit flock cleanup
+fails. The store consumes its capability before reporting a final close error;
+the Authority removes session accounting and sets `retired` even on that error.
+An already-stale session handle is also retired. Other pre-close refusal does
+not claim retirement. Clients remove retired handles while preserving the error
+for diagnostics. Unknown transport outcomes or malformed replies revoke the mounted session;
+terminal session cleanup owns its remaining descriptors. Malformed result count, errno, or failure classification is refused.
+
+Final-handle cleanup first applies each buffered cut and releases the grants in
+one CONTROL batch. It does not wait for durability. Applied records cease to
+participate in the read overlay after release, but their bytes and loss
+obligations remain retained until a durable prefix or fencing loss. No per-file
+acquire, transition, or operation lock spans the release or close RPC; a local
+release flight orders same-identity admissions through completion.
