@@ -1700,3 +1700,8 @@ all workers are parked. Restoring the former one-goroutine-per-identity loop
 fails that test (`/tmp/cv2-g2-flush-pool-fault.log`); the writeback race suite
 passes (`/tmp/cv2-g2-flush-pool-root.log`). Four-chunk per-file dispatch and
 retained-record scatter transmission are the remaining portions of item 7.
+
+The full `bash scripts/xfs-fuse-integration.sh` gate at `b87a8f8` passes all 75
+required privileged tests and the one required root boundary test. Log:
+`/tmp/cv2-g2-after-handoff-xfs.log`. This covers the handoff and worker-pool
+follow-ups with the unchanged mounted race bound.
