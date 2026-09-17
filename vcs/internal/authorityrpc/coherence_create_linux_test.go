@@ -21,6 +21,19 @@ type coherenceExistingCreateStore struct {
 	openErr      error
 }
 
+type coherenceRacedExclusiveCreateStore struct {
+	coherenceExistingCreateStore
+	lookupCalls uint32
+}
+
+func (s *coherenceRacedExclusiveCreateStore) Lookup(_ xfsstore.Capability, _ string) (xfsstore.Capability, xfsstore.Attr, error) {
+	s.lookupCalls++
+	if s.lookupCalls == 1 {
+		return xfsstore.Capability{}, xfsstore.Attr{}, syscall.ENOENT
+	}
+	return s.item, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 2, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
 func (s *coherenceExistingCreateStore) Create(_ xfsstore.Capability, _ string, _ fs.FileMode, exclusive bool) (xfsstore.Capability, xfsstore.Attr, error) {
 	s.create.Add(1)
 	if exclusive {
@@ -186,6 +199,24 @@ func TestCoherenceExclusiveCreateDoesNotCutExistingDelegation(t *testing.T) {
 		}
 		drain(source, &sourceCursor)
 		drain(peer.Token, &peerCursor)
+	}
+}
+
+func TestCoherenceExclusiveCreateBindingRaceReturnsEEXIST(t *testing.T) {
+	item := xfsstore.Capability{0x37}
+	store := &coherenceRacedExclusiveCreateStore{coherenceExistingCreateStore: coherenceExistingCreateStore{
+		resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: item},
+		item:                        item, handle: xfsstore.Capability{0x48},
+	}}
+	h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+	request := coherenceExistingCreateRequest(credential, root)
+	request.GetCreate().Exclusive = true
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != int32(syscall.EEXIST) || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED || response.GetUncertain() {
+		t.Fatalf("raced exclusive CREATE = %+v", response)
+	}
+	if store.lookupCalls < 3 {
+		t.Fatalf("namespace lookups = %d, want initial absence followed by locked existing binding", store.lookupCalls)
 	}
 }
 
