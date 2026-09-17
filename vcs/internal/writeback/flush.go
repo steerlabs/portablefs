@@ -275,6 +275,41 @@ func (b *Buffer) DurableSequence(seq uint64) {
 	b.advanceLocked()
 	b.signal()
 }
+
+// DurableIdentity records a successful file FSYNC for the already-applied cut.
+// It cannot advance the volume prefix: another identity may still be dirty.
+func (b *Buffer) DurableIdentity(id Identity, cut Cut) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.files[id]
+	if f == nil {
+		return nil
+	}
+	if f.lastLoss > cut.LossSequence {
+		if f.lastGenericLoss > cut.LossSequence {
+			return ErrLost
+		}
+		return recordedLossError(f.lastErrno)
+	}
+	for r := f.head; r != nil && r.seq <= cut.Sequence; r = r.next {
+		if r.state == Accepted {
+			return ErrInvalid
+		}
+	}
+	for f.head != nil && f.head.seq <= cut.Sequence {
+		r := f.head
+		f.head = r.next
+		b.release(r)
+	}
+	if f.head == nil {
+		f.tail = nil
+		delete(b.active, id)
+	}
+	b.sizeLocked(f)
+	b.signal()
+	return nil
+}
+
 func (b *Buffer) advanceLocked() {
 	for len(b.appliedHeap) > 0 && b.appliedHeap[0].applied <= b.visible {
 		r := b.appliedHeap.remove(0)

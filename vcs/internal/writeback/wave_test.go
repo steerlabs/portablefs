@@ -280,3 +280,42 @@ func TestFlushWaveAdmissionOrderModel(t *testing.T) {
 		}
 	}
 }
+
+func TestFileDurabilityCannotRetireAnotherIdentityOrLaterCut(t *testing.T) {
+	f := &waveTestFlusher{width: 4, payload: 8}
+	var seq uint64
+	f.call = func(e []Entry) ([]uint64, error) {
+		r := make([]uint64, len(e))
+		for i := range r {
+			seq++
+			r[i] = seq
+		}
+		return r, nil
+	}
+	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	one, two := testIdentity(7), testIdentity(8)
+	mustWrite(t, b, two, 0, "earlier")
+	cut := mustWrite(t, b, one, 0, "first")
+	if err := b.DurableIdentity(one, cut); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("accepted record treated as durable: %v", err)
+	}
+	if _, err := b.FlushAll(t.Context(), cut); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, b, one, 5, "later")
+	if err := b.DurableIdentity(one, cut); err != nil {
+		t.Fatal(err)
+	}
+	if s := b.Stats(); s.Entries != 2 || s.Accepted != 1 || s.Applied != 1 {
+		t.Fatalf("file sync crossed identity/cut: %+v", s)
+	}
+	b.mu.Lock()
+	if b.durable != 0 || b.visible != 0 {
+		t.Error("file sync invented a volume prefix")
+	}
+	b.mu.Unlock()
+	b.Drop(one, "fence")
+	if err := b.DurableIdentity(one, cut); !errors.Is(err, ErrLost) {
+		t.Fatalf("file sync erased intervening loss: %v", err)
+	}
+}

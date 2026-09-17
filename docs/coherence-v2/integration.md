@@ -1827,3 +1827,21 @@ without the override it reaches the absent underlying client. Production code
 and horizon assertions are unchanged. Unit proof passes
 (`/tmp/cv2-g2-scatter-hook.log`); the original failure is retained in
 `/tmp/cv2-g2-item7-full-xfs.log`.
+
+#### G2 durability follow-up: file FSYNC precedes its wait
+
+File FSYNC and synchronous writes previously waited on Buffer.Fsync before
+sending the file FSYNC RPC, leaving them dependent on the one-second fallback
+volume barrier. They now flush the fixed accepted cut, send FSYNC, and retire
+only that identity through the cut. An inode's successful FSYNC does not invent
+a common durable prefix: an unrelated identity can still block that prefix.
+The buffer rejects an un-applied cut and preserves any intervening loss/errno.
+
+Tests hold the volume prefix at zero and refuse Barrier, then require fsync,
+fdatasync and synchronous WRITE to complete within 100 ms while retaining the
+other file's five bytes. All three time out on the old code
+(`/tmp/cv2-g2-file-durability-fault.log`) and pass ten repetitions on the fix
+(`/tmp/cv2-g2-file-durability2.log`). The buffer race suite and complete
+unprivileged FUSE suite pass (`file-durability-buffer.log`,
+`file-durability-full.log`, same prefix). Ordinary asynchronous writes still use
+reply prefixes and the bounded fallback; explicit file sync adds no Barrier RPC.

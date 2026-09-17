@@ -518,7 +518,7 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	if err == nil && syncWrite {
 		// The operation lock fixes the accepted cut. Release admission before a
 		// flush can record a refusal and rebind the successor buffer generation.
-		err = b.Fsync(ctx, id)
+		err = m.syncIdentityCut(ctx, s, b, cut, false)
 	}
 	if err != nil {
 		return cut, err
@@ -1154,6 +1154,18 @@ func (m *delegationManager) syncIdentity(ctx context.Context, s *delegationState
 	return nil
 }
 
+// The operation lock fixes this identity's accepted cut. FSYNC proves only
+// that file durable; its common prefix may remain behind an unrelated writer.
+func (m *delegationManager) syncIdentityCut(ctx context.Context, s *delegationState, b *writeback.Buffer, cut writeback.Cut, dataOnly bool) error {
+	if _, err := b.FlushIdentity(ctx, s.identity, cut); err != nil {
+		return err
+	}
+	if err := m.syncIdentity(ctx, s, dataOnly); err != nil {
+		return err
+	}
+	return b.DurableIdentity(s.identity, cut)
+}
+
 func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly bool) error {
 	id, err := delegationIdentity(identity)
 	if err != nil {
@@ -1167,10 +1179,7 @@ func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly
 	}
 	defer s.transition.Unlock()
 	defer s.operation.Unlock()
-	if err := m.buf.Fsync(ctx, id); err != nil {
-		return err
-	}
-	return m.syncIdentity(ctx, s, dataOnly)
+	return m.syncIdentityCut(ctx, s, m.buf, m.buf.Snapshot(), dataOnly)
 }
 
 // Barrier implements the root-directory completion barrier. Admission is
