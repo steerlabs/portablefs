@@ -1204,8 +1204,8 @@ func (r *rawFileSystem) finishDirPlusLookupCompletion(completion dirPlusLookupCo
 }
 
 // publishDirPlusPage reserves an authority page as one admission unit. The
-// page is already serialized with zero lifetimes; only a successful preflight
-// for every name and attr turns any of them on. This keeps the bounded registry
+// page is serialized with zero kernel lifetimes; a successful preflight
+// for every name and attr admits the daemon payloads. This keeps the bounded registry
 // invariant independent of READDIRPLUS concurrency and avoids a partially
 // cached page when one registry reaches capacity.
 func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRecord, candidates []dirPlusCandidate) error {
@@ -1261,17 +1261,36 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 		return nil
 	}
 
+	reservations := make([][2]*cacheInstallReservation, len(candidates))
+	for i, candidate := range candidates {
+		coordinates := [2]publicationCoordinate{
+			{kind: publicationNamespaceName, parent: parent.identity, name: string(candidate.dirent.GetName())},
+			{kind: publicationItemAttributes, item: candidate.record.identity},
+		}
+		for j, coordinate := range coordinates {
+			reservation, ok := r.reserveCacheCandidateLocked(publication, coordinate)
+			if !ok {
+				for _, pair := range reservations {
+					for _, prior := range pair {
+						r.removeCacheReservationLocked(prior)
+					}
+				}
+				return nil
+			}
+			reservations[i][j] = reservation
+		}
+	}
+	lease := publication.subscriptionCacheStamp()
 	reservedNames := make(map[nameKey]bool, len(newNames))
 	reservedAttrs := make(map[publicationIdentity]bool, len(newAttrs))
-	for _, candidate := range candidates {
+	for i, candidate := range candidates {
 		name := string(candidate.dirent.GetName())
 		key := nameKey{parent: parent.key.inode, name: name}
 		stable := publicationNamespace{parent: parent.identity, name: name}
 		nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: stable.parent, name: name}
 		attrCoordinate := publicationCoordinate{kind: publicationItemAttributes, item: candidate.record.identity}
-		nameReservation, _ := r.reserveCacheCandidateLocked(publication, nameCoordinate)
-		attrReservation, _ := r.reserveCacheCandidateLocked(publication, attrCoordinate)
-		namePublication := replyNamePublication{key: key, stable: stable, record: candidate.record, coordinate: nameCoordinate, reservation: nameReservation}
+		nameReservation, attrReservation := reservations[i][0], reservations[i][1]
+		namePublication := replyNamePublication{key: key, stable: stable, record: candidate.record, coordinate: nameCoordinate, reservation: nameReservation, stamp: lease}
 		if _, needed := newNames[key]; needed && !reservedNames[key] {
 			namePublication.reserved = true
 			reservedNames[key] = true
@@ -1289,7 +1308,8 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 		publication.names = append(publication.names, namePublication)
 		publication.attrs = append(publication.attrs, replyAttrPublication{
 			inode: candidate.record.key.inode, identity: candidate.record.identity, record: candidate.record,
-			coordinate: attrCoordinate, reservation: attrReservation,
+			coordinate: attrCoordinate, reservation: attrReservation, stamp: lease,
+			attr: proto.Clone(candidate.item.GetAttr()).(*authoritypb.Attr), objectVersion: candidate.dirent.GetObjectVersion(), snapshot: snapshot,
 		})
 		publication.dirPlus = append(publication.dirPlus, replyDirPlusPublication{
 			entry: candidate.entry, nameReservation: nameReservation, attrReservation: attrReservation,
@@ -3427,7 +3447,83 @@ func (r *rawFileSystem) ReadDir(_ <-chan struct{}, input *fuse.ReadIn, out *fuse
 }
 
 func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	return fuse.ENOSYS
+	if r.grafts != nil {
+		return fuse.ENOSYS
+	}
+	held, handle := r.acquireDirHandle(input.Fh)
+	if handle == nil {
+		return fuse.EBADF
+	}
+	attached := false
+	defer func() {
+		if !attached {
+			r.releaseHandleOperation(held)
+		}
+	}()
+	ctx, finish, lifecycle := r.mutationContext(input.Unique)
+	if !lifecycle.Ok() {
+		return lifecycle
+	}
+	defer finish()
+	cursor, errno := handle.beginDirPlus(ctx, input.Offset)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	if err := r.attachDirPlusLookupTransaction(ctx, cursor, held); err != nil {
+		cursor.finish(false)
+		return fuse.EIO
+	}
+	attached = true
+	candidates := make([]dirPlusCandidate, 0, 32)
+	emitted := 0
+	for {
+		entry, dirent, item, entryOut, stamp, errno := handle.takePlus(ctx, out)
+		if errno != 0 {
+			return fuse.Status(errno)
+		}
+		if entry == nil {
+			break
+		}
+		if entryOut == nil {
+			if emitted == 0 {
+				return fuse.Status(syscall.EOVERFLOW)
+			}
+			break
+		}
+		emitted++
+		if item != nil && entry.Name != "." && entry.Name != ".." {
+			if item.GetAttr() == nil || !proto.Equal(item.GetAttr(), dirent.GetAttr()) {
+				r.mount.deferReclaim(item.GetToken())
+				return fuse.EIO
+			}
+			record, errno := r.intern(ctx, item)
+			if errno != 0 {
+				r.mount.deferReclaim(item.GetToken())
+				return fuse.Status(errno)
+			}
+			if err := r.stageDirPlusLookup(ctx, record, held.inode, entry.Name); err != nil {
+				r.Forget(record.id, 1)
+				return fuse.EIO
+			}
+			entryOut.NodeId, entryOut.Generation = record.id, 1
+			fillAttr(item.GetAttr(), &entryOut.Attr, r.mount.uid, r.mount.gid)
+			candidates = append(candidates, dirPlusCandidate{entry: entryOut, dirent: dirent, item: item, record: record})
+		} else if item != nil {
+			r.mount.deferReclaim(item.GetToken())
+		}
+		p := replyPublicationFromContext(ctx)
+		p.stamp, p.servedVersion = stamp, stamp.version
+		if handle.authorityPageExhausted() {
+			break
+		}
+	}
+	if err := r.publishDirPlusPage(ctx, held.inode, candidates); err != nil {
+		return fuse.EIO
+	}
+	if err := r.commitDirPlusLookupTransaction(ctx); err != nil {
+		return fuse.EIO
+	}
+	return fuse.OK
 }
 
 func (r *rawFileSystem) FsyncDir(_ <-chan struct{}, input *fuse.FsyncIn) fuse.Status {

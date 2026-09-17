@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -648,4 +650,27 @@ func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
 		t.Fatalf("lone writer control traffic: acknowledgements=%d polls=%d", acks, polls)
 	}
 	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d flush=%d change_ack=%d next_control_event=%d", count, flushes, acks, polls)
+}
+
+func TestReadDirPlusColdListingAvoidsLookupRPCs(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	for i := 0; i < 1000; i++ {
+		if err := os.WriteFile(f.join(0, fmt.Sprintf("plus-%04d", i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.waitForDelegationReleases(t)
+	lookups, pages := f.counter.count("lookup"), f.counter.count("readdir")
+	output, err := exec.Command("ls", "-ln", f.mountPath(1)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("cold ls -ln: %v: %s", err, output)
+	}
+	if got := bytes.Count(output, []byte("plus-")); got != 1000 {
+		t.Fatalf("listed %d files, want 1000", got)
+	}
+	lookups, pages = f.counter.count("lookup")-lookups, f.counter.count("readdir")-pages
+	if lookups != 0 || pages != 4 {
+		t.Fatalf("cold 1000-entry listing: LOOKUP=%d READDIR=%d, want 0 and 4", lookups, pages)
+	}
+	t.Logf("PORTABLEFS_PLUS_1000 lookup=%d readdir=%d", lookups, pages)
 }

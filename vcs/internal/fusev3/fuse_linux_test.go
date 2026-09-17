@@ -843,8 +843,17 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	// The read-ahead window is paired with the authority read bound: reads are
 	// now served from the page cache, so the window is what decides how many
 	// authority round trips a sequential reader pays.
-	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
+	if !options.EnableLocks || options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
 		t.Fatalf("mount options = %#v", options)
+	}
+	routedConfig := testConfig(8)
+	routedConfig.Routes = mustRoutes(t, "local/\n")
+	routed := mountOptions(routedConfig, 128*1024, 64*1024)
+	if !routed.DisableReadDirPlus || routed.DisabledCapabilities&(fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO) != fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO {
+		t.Fatal("routed mount enabled unsupported PLUS")
+	}
+	if options.DisabledCapabilities&(fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO) != 0 {
+		t.Fatal("Authority mount disabled PLUS capabilities")
 	}
 	foundDefaultPermissions := false
 	for _, option := range options.Options {

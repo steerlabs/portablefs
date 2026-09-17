@@ -67,6 +67,12 @@ work uses one worker matching the Authority flush lane. Deferred close admission
 is bounded, and close batches apply all files before waiting for durability. Completed
 replay records retire at the durable prefix.
 
+Pure Authority mounts negotiate READDIRPLUS. Each 256-entry Authority page
+admits daemon name and attribute payloads under its subscription stamp while
+kernel entry and attribute validity remain zero. Capability transfer and cursor
+advancement are provisional until the physical reply succeeds; failure rolls
+back lookup ownership and the cursor. Mixed local-route mounts retain READDIR.
+
 Under FULL ownership, FUSE FLUSH returns locally after checking loss unless the
 closing POSIX lock owner may hold record locks on that identity. SETLK/SETLKW
 acquisition attempts record this obligation before dispatch; successful FLUSH

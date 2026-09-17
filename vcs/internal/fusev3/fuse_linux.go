@@ -596,6 +596,10 @@ func (m *Mount) failedStartupKernelAbsent() error {
 // MaxReadAhead is bounded by one authority read so a kernel read-ahead request
 // never has to be split merely because the frontend chose a larger window.
 func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
+	var disabledPlus uint64
+	if !cfg.Routes.Empty() {
+		disabledPlus = fuse.CAP_READDIRPLUS | fuse.CAP_READDIRPLUS_AUTO
+	}
 	return &fuse.MountOptions{
 		FsName:        "portablefs:" + cfg.MountInstanceID,
 		Name:          "portablefs",
@@ -612,10 +616,9 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 		// control instead is what makes the ordered DATA publication the single
 		// thing that withdraws a page.
 		ExplicitDataCacheControl: true,
-		// Plain READDIR is the portable profile. Stock READDIRPLUS can install an
-		// entry after a concurrent invalidation, and FOPEN_CACHE_DIR has a
-		// position-zero-only validation hole; neither is part of the contract.
-		DisableReadDirPlus: true,
+		// Authority PLUS pages publish daemon caches through the physical reply
+		// transaction. Mixed local routes retain ordinary READDIR.
+		DisableReadDirPlus: !cfg.Routes.Empty(),
 		// Shared mmap is a decision of this mount, not an accident of which
 		// capabilities go-fuse happens to forward. A writable shared mapping
 		// would dirty pages that never travel the strict write transaction, and
@@ -636,7 +639,7 @@ func mountOptions(cfg Config, maxRead, maxWrite uint32) *fuse.MountOptions {
 		DisabledCapabilities: fuse.CAP_DIRECT_IO_ALLOW_MMAP | fuse.CAP_PASSTHROUGH |
 			fuse.CAP_NO_OPEN_SUPPORT | fuse.CAP_NO_OPENDIR_SUPPORT |
 			fuse.CAP_AUTO_INVAL_DATA | fuse.CAP_WRITEBACK_CACHE |
-			fuse.CAP_READDIRPLUS | fuse.CAP_READDIRPLUS_AUTO |
+			disabledPlus |
 			fuse.CAP_CACHE_SYMLINKS | fuse.CAP_HAS_INODE_DAX,
 		Options: []string{"default_permissions"},
 	}
@@ -1894,21 +1897,6 @@ func (h *dirHandle) consume(delivered *fuse.DirEntry) {
 	h.cookie = encodeCookie(delivered.Off)
 	h.next = delivered.Off
 	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
-}
-
-func (h *dirHandle) consumePlus() *authoritypb.Item {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.pending == nil || h.pendingDirent == nil {
-		return nil
-	}
-	item := h.pendingDirent.GetItem()
-	h.pendingDirent.Item = nil
-	h.index++
-	h.cookie = h.pendingCookie
-	h.next = h.pending.Off
-	h.pending, h.pendingDirent, h.pendingCookie = nil, nil, nil
-	return item
 }
 
 func (h *dirHandle) discardPageItemsLocked() {

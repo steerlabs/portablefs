@@ -1423,3 +1423,29 @@ passes without retrying lock acquisition after close, and the 1,000-file install
 passes in 5.26 seconds with zero FLUSH, zero ChangeAck, zero additional control
 polls, and seven Barriers (`/tmp/cv2-g2-flush-mounted.log`). The focused wrapper
 omits the other required tests; the full gate remains pending.
+
+### Part 2 item 2: transactional READDIRPLUS
+
+Pure Authority mounts now negotiate stock READDIRPLUS and use the existing
+physical-reply transaction for lookup references, path bindings, and the directory
+cursor. Mixed local-route mounts remain on READDIR. A fitting entry transfers
+its capability from the buffered page under the directory lock before interning;
+concurrent invalidation cannot reclaim it. Buffer-full leaves ownership and the
+cursor unchanged. Dot/opaque records carry no inode lookup, and abandoned
+capabilities have one reclaim edge. Physical reply failure rolls back the
+provisional cursor and references.
+
+Page admission now supplies daemon name stamps and full attribute payloads and
+versions, while both kernel lifetimes stay zero. Every reservation is acquired
+before charging capacity; expiry cannot leave a partial page or dereference a
+failed reservation. Tests cover four pages for 1,000 entries, cached LOOKUP and
+GETATTR reuse, buffer-full and invalidation ownership, physical failure, expiry,
+and mount negotiation. The new page-count test fails with the former ENOSYS
+handler (`/tmp/cv2-g2-plus-before.log`). All unprivileged fusev3 tests pass in
+Docker, excluding the device-only probe; mounted tests self-skip in that run
+(`/tmp/cv2-g2-plus-suite.log`).
+
+The required mounted cold `ls -ln` lists 1,000 files with exactly four READDIR
+RPCs and zero LOOKUP RPCs (`/tmp/cv2-g2-plus-mounted.log`). The selected wrapper
+exits 70 for omitted inventory. The 1,000-entry callback proof and additional
+expiry proof pass (`/tmp/cv2-g2-plus-final.log`).

@@ -247,3 +247,21 @@ syscall costs 70.125 us median / 79.958 us p95 and also issues 4,000 permission
 GETATTRs because attribute validity is zero. These boundaries are reported
 separately; dividing syscall latency by its three requests would not prove a
 single-request round trip. The repeated Lstat sample is 74.209 / 84.417 us.
+
+## G2 first RPC reductions
+
+Targeted Docker/XFS measurements precede the full baseline below. The 1,000-file
+install includes an explicit root completion barrier; close drain still has its
+old durability wait at this stage.
+
+| Stage | Files | Seconds | Barrier/file | FLUSH/file | ChangeAck/file | Additional control polls/file |
+|---|---:|---:|---:|---:|---:|---:|
+| fallback Barrier cap (0a) | 1,000 | 5.36 | 0.007 | unmeasured | unmeasured | unmeasured |
+| implicit source progress (0b) | 1,000 | 5.37 | 0.007 | unmeasured | 0 | 0 |
+| local unlocked FULL FLUSH (1) | 1,000 | 5.26 | 0.007 | 0 | 0 | 0 |
+
+With READDIRPLUS (2), a cold mounted `ls -ln` over 1,000 entries issues four
+READDIR RPCs (0.004/entry) and zero LOOKUP RPCs. Its 0.57-second test duration
+includes setup and teardown and is not a listing latency measurement. Source
+logs: `/tmp/cv2-g2-durable-mounted2.log`, `/tmp/cv2-g2-own-mounted.log`,
+`/tmp/cv2-g2-flush-mounted.log`, and `/tmp/cv2-g2-plus-mounted.log`.
