@@ -434,10 +434,26 @@ assert_mounts_serving() {
 }
 
 # run_disjoint_control points the second mount at a directory that is not the
-# volume at all. Every single case must fail: a case that can pass without the
+# volume at all. Every selected case must fail: a case that can pass without the
 # two roots sharing one filesystem is not measuring cross-mount coherence and
 # would be reporting green for free. Together with the stale-view control below,
 # this is what makes the real matrix's green result mean something.
+# Both pathname controls exclude these protocol-7 process experiments:
+# - gateway_reads_delegated_data_without_obstructing_writer launches an external
+#   authenticated probe against the real mount-a and Authority. Replacing root B
+#   or replaying the actor's pathname answers does not intercept that subprocess;
+#   it can pass unchanged and consumes its own attach capability.
+# - recall_budget_loss_fails_barrier pauses/resumes the real mount-b daemon and
+#   checks retained-handle EIO plus root-barrier loss. In the disjoint control,
+#   the holder's ordinary-directory fd is not owned by the paused daemon. The
+#   stale-path actor does not model a missed CONTROL acknowledgment or fd loss.
+# - epoch_change_stales_handles_and_new_barrier_passes restarts the real Authority
+#   and checks epoch-scoped handles and recovery on the existing mount processes.
+#   An ordinary root B has no Authority epoch, and replayed pathname answers do
+#   not simulate stale server handles. Restarting also changes the shared fixture
+#   for later phases, so this destructive transition belongs to the real phase.
+# The real matrix still requires PASS for every experiment above; neither
+# pathname control is claimed as falsifiability evidence for those mechanisms.
 run_disjoint_control() {
   local arguments=() entry control_cases
   for entry in $(as_service /home/portablefs/bin/pfs-coherence-matrix --list | cut -f1); do
@@ -446,7 +462,8 @@ run_disjoint_control() {
       # routes_revision_mismatch asserts an attach-time authority contract
       # through a client that touches no mountpoint, so pointing the second root
       # at an unrelated directory cannot turn it red. It is expected to PASS
-      # here, which is why it is simply not declared.
+      # here, which is why it is simply not declared. The three protocol-7
+      # exclusions have separate process/handle rationales above.
       routes_revision_mismatch|gateway_reads_delegated_data_without_obstructing_writer|recall_budget_loss_fails_barrier|epoch_change_stales_handles_and_new_barrier_passes) continue ;;
     esac
     arguments+=(--expect "${entry}=FAIL:a mount that shares no namespace with the other must fail this case")
@@ -455,6 +472,7 @@ run_disjoint_control() {
   # observation. Neither control can perturb it, and its successful retry
   # consumes one single-use capability. Exclude it here so the final matrix is
   # the one phase that owns and spends that credential.
+  # Use the shared attach/process exclusions documented above run_disjoint_control.
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
     cut -f1 | grep -Ev '^(routes_revision_mismatch|gateway_reads_delegated_data_without_obstructing_writer|recall_budget_loss_fails_barrier|epoch_change_stales_handles_and_new_barrier_passes)$' | paste -sd, -)
   echo
@@ -489,6 +507,7 @@ run_falsifiability_control() {
   for name in "${FALSIFIABLE_CASES[@]}"; do
     arguments+=(--expect "${name}=FAIL:a replayed first-success pathname observation must be detected by this case")
   done
+  # Use the shared attach/process exclusions documented above run_disjoint_control.
   control_cases=$(as_service /home/portablefs/bin/pfs-coherence-matrix --list |
     cut -f1 | grep -Ev '^(routes_revision_mismatch|gateway_reads_delegated_data_without_obstructing_writer|recall_budget_loss_fails_barrier|epoch_change_stales_handles_and_new_barrier_passes)$' | paste -sd, -)
   echo

@@ -1034,3 +1034,20 @@ drained acknowledged position completes. The queued row fails before the queue
 guard and passes after it. Logs `/tmp/cv2-g2-r9-before.log` and
 `/tmp/cv2-g2-r9-after.log`, using the cross-compiled authorityrpc test binary in
 the pinned Docker image with `-test.run '^TestCoherenceControlAutoAckRequiresDrainedQueue$' -test.v`.
+
+### R10: per-case control exclusions
+
+The matrix script now documents each protocol-7 exclusion at both control
+filters. The gateway probe is an external authenticated subprocess that neither
+replacement root B nor actor-side stale pathname answers intercept. Recall loss
+pauses the real mount-b daemon and tests retained handles/barriers; an unrelated
+directory fd is not owned by that daemon, and pathname replay cannot model its
+missed CONTROL acknowledgment. Epoch replacement changes the real Authority and
+retained server handles; the disjoint directory has no Authority epoch, and the
+stale-path actor does not inject old-handle state. These process experiments run
+in the real phase, which still requires all three to PASS. No negative-control
+coverage is claimed for their process/handle mechanisms.
+
+This is a rationale-only change: selected cases and expectations are identical.
+`bash -n scripts/coherence-matrix-linux.sh` passes. The initial complete matrix
+runs above exercised these unchanged filters; the final matrix remains required.
