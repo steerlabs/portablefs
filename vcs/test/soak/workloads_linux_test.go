@@ -588,9 +588,20 @@ func serializedWorkloadCommandStart(start func() error) error {
 	return start()
 }
 
+func newWorkloadCommand(ctx context.Context, directory string, name string, args ...string) *exec.Cmd {
+	launcherArgs := make([]string, 0, len(args)+3)
+	launcherArgs = append(launcherArgs, "-C", directory, name)
+	launcherArgs = append(launcherArgs, args...)
+	command := exec.CommandContext(ctx, "/usr/bin/env", launcherArgs...)
+	// The child must exec before entering a FUSE directory served by this
+	// process. A pre-exec chdir can otherwise wait on its own parent while the
+	// runtime holds the fork critical section.
+	command.Dir = "/"
+	return command
+}
+
 func workloadCommand(ctx context.Context, directory string, environment map[string]string, name string, args ...string) ([]byte, error) {
-	command := exec.CommandContext(ctx, name, args...)
-	command.Dir = directory
+	command := newWorkloadCommand(ctx, directory, name, args...)
 	command.Env = os.Environ()
 	keys := make([]string, 0, len(environment))
 	for key := range environment {

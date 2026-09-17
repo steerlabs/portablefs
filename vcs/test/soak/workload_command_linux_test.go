@@ -3,10 +3,23 @@
 package soak
 
 import (
+	"context"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestWorkloadCommandEntersDirectoryAfterExec(t *testing.T) {
+	command := newWorkloadCommand(context.Background(), "/mounted/worktree", "git", "status", "--short")
+	if command.Dir != "/" {
+		t.Fatalf("pre-exec working directory = %q, want host root", command.Dir)
+	}
+	want := []string{"/usr/bin/env", "-C", "/mounted/worktree", "git", "status", "--short"}
+	if !reflect.DeepEqual(command.Args, want) {
+		t.Fatalf("launcher arguments = %q, want %q", command.Args, want)
+	}
+}
 
 func TestSerializedWorkloadCommandStartAllowsOnlyOneForkAtATime(t *testing.T) {
 	firstEntered := make(chan struct{})
