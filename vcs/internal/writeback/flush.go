@@ -362,6 +362,9 @@ func (b *Buffer) waitDurable(ctx context.Context, id *Identity, cut Cut) error {
 		if !pending {
 			return nil
 		}
+		if b.stopped {
+			return ErrLost
+		}
 		ch := b.change()
 		b.mu.Unlock()
 		err := wait(ctx, ch)

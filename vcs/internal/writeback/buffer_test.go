@@ -874,6 +874,22 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	b.DurableSequence(50)
 }
 
+func TestFenceAdmissionsInterruptsDurabilityWait(t *testing.T) {
+	b := newTestBuffer(t, &recordingFlusher{})
+	id := testIdentity(15)
+	cut := mustWrite(t, b, id, 0, "undurable")
+	if _, err := b.FlushIdentity(t.Context(), id, cut); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- b.waitDurable(context.Background(), &id, cut) }()
+	assertBlocked(t, done, "durability wait before fence")
+	b.FenceAdmissions()
+	if err := await(t, done, "fenced durability wait"); !errors.Is(err, ErrLost) {
+		t.Fatalf("waitDurable error = %v, want ErrLost", err)
+	}
+}
+
 func TestFlushCancellationRetainsStableRetry(t *testing.T) {
 	var mu sync.Mutex
 	var calls []Entry

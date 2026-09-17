@@ -82,14 +82,17 @@ type delegationReleaseGroup struct {
 }
 
 type delegationReleaseBatch struct {
-	manager *delegationManager
-	groups  []*delegationReleaseGroup
-	flight  *delegationReleaseFlight
+	manager     *delegationManager
+	buffer      *writeback.Buffer
+	epochSerial uint64
+	incarnation uint64
+	groups      []*delegationReleaseGroup
+	flight      *delegationReleaseFlight
 }
 
-// The caller retains the epoch reader until finish. Epoch replacement cannot
-// redirect old handle capabilities, and no flight waits for an epoch writer.
-func (m *delegationManager) prepareReleaseBatch(ctx context.Context, groups []*delegationReleaseGroup) (*delegationReleaseBatch, error) {
+// The batch is pinned to one captured epoch and buffer. Close cleanup does not
+// retain the epoch reader while it flushes or waits on the Authority.
+func (m *delegationManager) prepareReleaseBatch(ctx context.Context, buf *writeback.Buffer, epochSerial, incarnation uint64, groups []*delegationReleaseGroup) (*delegationReleaseBatch, error) {
 	sort.Slice(groups, func(i, j int) bool {
 		return bytes.Compare(groups[i].state.identity[:], groups[j].state.identity[:]) < 0
 	})
@@ -126,7 +129,7 @@ func (m *delegationManager) prepareReleaseBatch(ctx context.Context, groups []*d
 				return nil, ctx.Err()
 			}
 		}
-		batch := &delegationReleaseBatch{manager: m, groups: groups, flight: &delegationReleaseFlight{done: make(chan struct{})}}
+		batch := &delegationReleaseBatch{manager: m, buffer: buf, epochSerial: epochSerial, incarnation: incarnation, groups: groups, flight: &delegationReleaseFlight{done: make(chan struct{})}}
 		var prepareErr error
 		for _, g := range groups {
 			s := g.state
@@ -143,7 +146,7 @@ func (m *delegationManager) prepareReleaseBatch(ctx context.Context, groups []*d
 			}
 			s.admission.RUnlock()
 			if g.ref != nil {
-				g.retire, prepareErr = m.beginRetire(ctx, s)
+				g.retire, prepareErr = m.beginRetireBuffer(ctx, buf, s)
 				if prepareErr != nil {
 					break
 				}
@@ -188,7 +191,7 @@ func (b *delegationReleaseBatch) applyAndRelease(ctx context.Context) error {
 		if g.ref == nil {
 			continue
 		}
-		applied, err := m.buf.FlushIdentity(ctx, g.state.identity, g.retire.Cut())
+		applied, err := b.buffer.FlushIdentity(ctx, g.state.identity, g.retire.Cut())
 		if err != nil {
 			return err
 		}
@@ -201,9 +204,12 @@ func (b *delegationReleaseBatch) applyAndRelease(ctx context.Context) error {
 		return nil
 	}
 	sort.Slice(releases, func(i, j int) bool { return bytes.Compare(releases[i].Delegation.Id, releases[j].Delegation.Id) < 0 })
-	response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{Incarnation: m.incarnation(), Delegations: releases}}})
+	response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{DelegationRelease: &authoritypb.DelegationReleaseRequest{Incarnation: b.incarnation, Delegations: releases}}})
 
 	if err != nil || response == nil || response.GetUncertain() || response.GetFailure() != 0 || response.GetErrno() == 0 && response.GetDelegationRelease() == nil {
+		if !m.epochCurrent(b.epochSerial, b.buffer) {
+			return writeback.ErrLost
+		}
 		m.SetIncarnation(0)
 		if err == nil {
 			err = errors.New("fusev3: delegation release has no valid ownership outcome")
@@ -229,6 +235,9 @@ func (b *delegationReleaseBatch) applyAndRelease(ctx context.Context) error {
 	}
 	if err := successfulDelegationResponse(response); err != nil {
 		return err
+	}
+	if !m.epochCurrent(b.epochSerial, b.buffer) {
+		return writeback.ErrLost
 	}
 	// The Authority committed all releases. Complete every local transition even
 	// if one overlay invariant fails; none may reopen its surrendered grant.
@@ -289,10 +298,13 @@ func (m *delegationManager) SetCleanupFailureReporter(report func(error)) {
 
 // Peers without the optional capability retain the original CLOSE wire. The
 // release flight owns local transition state, without holding physical locks.
-func (m *delegationManager) closeSerial(ctx context.Context, current []delegationClose, requests []*authoritypb.CloseRequest, groups map[writeback.Identity]*delegationReleaseGroup) error {
+func (m *delegationManager) closeSerial(ctx context.Context, epochSerial uint64, buf *writeback.Buffer, current []delegationClose, requests []*authoritypb.CloseRequest, groups map[writeback.Identity]*delegationReleaseGroup) error {
 	var first error
 	for i, request := range requests {
 		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: request}})
+		if !m.epochCurrent(epochSerial, buf) {
+			return writeback.ErrLost
+		}
 		if err != nil || response == nil || response.GetUncertain() {
 			if err == nil {
 				err = errors.New("fusev3: CLOSE has no definite outcome")

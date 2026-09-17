@@ -88,6 +88,8 @@ type delegationManager struct {
 	maxWrite int
 
 	epoch    sync.RWMutex
+	epochCtx context.Context
+	epochEnd context.CancelFunc
 	frontend sync.RWMutex
 	mu       sync.Mutex
 	buf      *writeback.Buffer
@@ -152,6 +154,7 @@ func newDelegationManager(rpc delegationRPC, timeout time.Duration, incarnation 
 		}
 	}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.epochCtx, m.epochEnd = context.WithCancel(m.ctx)
 	b, err := writeback.New(m, opts)
 	if err != nil {
 		m.cancel()
@@ -1332,12 +1335,16 @@ func (m *delegationManager) handleControlEvent(ctx context.Context, event *autho
 }
 
 func (m *delegationManager) beginRetire(ctx context.Context, s *delegationState) (*writeback.Retirement, error) {
+	return m.beginRetireBuffer(ctx, m.buf, s)
+}
+
+func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writeback.Buffer, s *delegationState) (*writeback.Retirement, error) {
 	s.admission.Lock()
 	defer s.admission.Unlock()
 	if s.retire != nil {
 		return s.retire, nil
 	}
-	r, err := m.buf.BeginRetire(ctx, &s.identity)
+	r, err := buf.BeginRetire(ctx, &s.identity)
 	if err == nil {
 		s.retire = r
 	}
@@ -1564,7 +1571,7 @@ func (m *delegationManager) ReleaseBatch(ctx context.Context, identities [][]byt
 		seen[id] = struct{}{}
 		groups = append(groups, &delegationReleaseGroup{state: m.state(id), release: true})
 	}
-	batch, err := m.prepareReleaseBatch(ctx, groups)
+	batch, err := m.prepareReleaseBatch(ctx, m.buf, m.epochSerial, m.incarnation(), groups)
 	if err != nil {
 		return err
 	}
@@ -1802,18 +1809,23 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		return errors.New("fusev3: invalid close batch size")
 	}
 	m.epoch.RLock()
-	defer m.epoch.RUnlock()
+	buf := m.buf
+	epochSerial := m.epochSerial
+	epochCtx := m.epochCtx
+	incarnation := m.incarnation()
 	groupsByID := make(map[writeback.Identity]*delegationReleaseGroup)
 	current := make([]delegationClose, 0, len(closes))
 	requests := make([]*authoritypb.CloseRequest, 0, len(closes))
 	seen := make(map[string]struct{}, len(closes))
+	var snapshotErr error
 	for _, pending := range closes {
 		if pending.epoch != 0 && pending.epoch != m.epochSerial {
 			continue
 		}
 		id, err := delegationIdentity(pending.identity)
 		if err != nil {
-			return err
+			snapshotErr = err
+			break
 		}
 		g := groupsByID[id]
 		if g == nil {
@@ -1822,37 +1834,55 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		}
 		key := string(pending.handle)
 		if len(pending.handle) != 16 {
-			return errors.New("fusev3: invalid close handle")
+			snapshotErr = errors.New("fusev3: invalid close handle")
+			break
 		}
 		if _, duplicate := seen[key]; duplicate {
-			return errors.New("fusev3: duplicate close handle")
+			snapshotErr = errors.New("fusev3: duplicate close handle")
+			break
 		}
 		seen[key] = struct{}{}
 		g.closing[key] = struct{}{}
 		current = append(current, pending)
 		requests = append(requests, &authoritypb.CloseRequest{Handle: pending.handle, LockOwner: pending.lockOwner, FlockUnlock: pending.flockUnlock})
 	}
+	m.epoch.RUnlock()
+	if snapshotErr != nil {
+		return snapshotErr
+	}
 	if len(current) == 0 {
 		return nil
 	}
+	callCtx, cancel := context.WithCancel(ctx)
+	stopEpochCancel := context.AfterFunc(epochCtx, cancel)
+	defer func() {
+		stopEpochCancel()
+		cancel()
+	}()
 	groups := make([]*delegationReleaseGroup, 0, len(groupsByID))
 	for _, g := range groupsByID {
 		groups = append(groups, g)
 	}
-	batch, err := m.prepareReleaseBatch(ctx, groups)
+	batch, err := m.prepareReleaseBatch(callCtx, buf, epochSerial, incarnation, groups)
 	if err != nil {
+		if !m.epochCurrent(epochSerial, buf) {
+			return writeback.ErrLost
+		}
 		return err
 	}
 	defer batch.finish()
-	if err := batch.applyAndRelease(ctx); err != nil {
+	if err := batch.applyAndRelease(callCtx); err != nil {
 		return err
 	}
 	if capable, ok := m.rpc.(interface{ SupportsBatchedClose() bool }); !ok || !capable.SupportsBatchedClose() {
-		return m.closeSerial(ctx, current, requests, groupsByID)
+		return m.closeSerial(callCtx, epochSerial, buf, current, requests, groupsByID)
 	}
-	response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: &authoritypb.CloseBatchRequest{Closes: requests}}})
+	response, err := m.rpc.CallMutation(callCtx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: &authoritypb.CloseBatchRequest{Closes: requests}}})
 	if err == nil {
 		err = successfulDelegationResponse(response)
+	}
+	if !m.epochCurrent(epochSerial, buf) {
+		return writeback.ErrLost
 	}
 	if err != nil {
 		return m.unknownCloseOutcome(err)
@@ -1910,6 +1940,7 @@ func (m *delegationManager) EpochChanged(reason string) {
 		m.epoch.RLock()
 		old = m.buf
 		old.FenceAdmissions()
+		m.epochEnd()
 		m.epoch.RUnlock()
 		m.epoch.Lock()
 		if m.buf == old {
@@ -1967,11 +1998,18 @@ func (m *delegationManager) EpochChanged(reason string) {
 	}
 	m.mu.Lock()
 	m.buf = b
+	m.epochCtx, m.epochEnd = context.WithCancel(m.ctx)
 	m.durabilityMu.Lock()
 	m.durableBuffer = b
 	m.appliedHigh, m.durableHigh = 0, 0
 	m.durabilityMu.Unlock()
 	m.mu.Unlock()
+}
+
+func (m *delegationManager) epochCurrent(serial uint64, buf *writeback.Buffer) bool {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	return m.epochSerial == serial && m.buf == buf
 }
 
 func (m *delegationManager) Stop() {
