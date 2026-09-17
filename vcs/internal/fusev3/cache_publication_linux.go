@@ -134,3 +134,45 @@ func (r *rawFileSystem) publicationRemaining(p *replyPublication, coordinate pub
 	}
 	return r.mount.subscription.remaining(coordinate, p.stamp, p.servedVersion, time.Now())
 }
+
+// waitFinalizedCacheCoordinateLocked closes the interval between the kernel
+// waking a caller and ReplyWritten settling the preceding daemon payload. Only
+// finalized, unrevoked candidates can make this miss a hit; a callback still
+// constructing a reply might itself depend on the new request. Returns with
+// r.mu held, including on cancellation.
+func (r *rawFileSystem) waitFinalizedCacheCoordinateLocked(ctx context.Context, current *replyPublication, coordinate publicationCoordinate) bool {
+	for {
+		var done <-chan struct{}
+		for reservation := range r.cacheReservations[coordinate] {
+			prior := reservation.publication
+			if !reservation.revoked && prior != current && prior.originalFinalized && !prior.originalWrote {
+				superseded := false
+				for _, name := range prior.names {
+					if name.reservation == reservation && name.negativeState != nil && name.negativeState.superseded {
+						superseded = true
+						break
+					}
+				}
+				if superseded {
+					continue
+				}
+				done = prior.originalDone
+				break
+			}
+		}
+		if done == nil {
+			return true
+		}
+		r.mu.Unlock()
+		var canceled bool
+		select {
+		case <-done:
+		case <-ctx.Done():
+			canceled = true
+		}
+		r.mu.Lock()
+		if canceled {
+			return false
+		}
+	}
+}

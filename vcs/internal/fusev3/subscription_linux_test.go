@@ -792,3 +792,99 @@ func TestNamespaceWithdrawalPurgesBindingsWithoutEntryNotify(t *testing.T) {
 		t.Fatal("namespace withdrawal issued EntryNotify, which can wait on a CREATE parent lock")
 	}
 }
+
+func TestCachedLookupWaitsForFinalizedReplyCacheSettlement(t *testing.T) {
+	for _, kind := range []string{"negative", "positive", "attributes", "revoked", "superseded"} {
+		t.Run(kind, func(t *testing.T) {
+			fixture := newStrictFixture(t)
+			parent := fixture.raw.acquire(fuse.FUSE_ROOT_ID)
+			defer fixture.raw.release(parent)
+			unique := fixture.unique.Add(2)
+			ctx, finish, status := fixture.raw.mutationContext(unique)
+			if !status.Ok() {
+				t.Fatal(status)
+			}
+			publication := replyPublicationFromContext(ctx)
+			publication.servedVersion = 1
+			publication.cacheStamp = &cacheSnapshot{SnapshotSequence: 1, ObjectVersion: 1}
+			item := testItem(80, authoritypb.Attr_REGULAR, 80)
+			record, errno := fixture.raw.intern(ctx, item)
+			if errno != 0 {
+				t.Fatal(errno)
+			}
+			opcode := uint32(1)
+			if kind == "attributes" {
+				var out fuse.AttrOut
+				fixture.raw.publishAttr(ctx, &out, record.identity, item.GetAttr())
+				opcode = 3
+			} else if kind == "positive" {
+				var out fuse.EntryOut
+				if err := fixture.raw.publishEntry(ctx, &out, parent, "name", record, item.GetAttr()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				var out fuse.EntryOut
+				if status, err := fixture.raw.publishNegativeEntry(ctx, &out, parent, "name"); !status.Ok() || err != nil {
+					t.Fatalf("publish negative: %v, %v", status, err)
+				}
+			}
+			finish()
+			if _, _, status := fixture.raw.PrepareReplyPayload(unique, parent.id, opcode, nil, nil, 0); !status.Ok() {
+				t.Fatal(status)
+			}
+			if kind == "revoked" || kind == "superseded" {
+				fixture.raw.mu.Lock()
+				if kind == "revoked" {
+					publication.names[0].reservation.revoked = true
+				} else {
+					publication.names[0].negativeState.superseded = true
+				}
+				fixture.raw.mu.Unlock()
+			}
+			// The kernel can re-enter before ReplyWritten settles the daemon cache.
+			nextUnique := fixture.unique.Add(2)
+			next, complete, status := fixture.raw.mutationContext(nextUnique)
+			if !status.Ok() {
+				t.Fatal(status)
+			}
+			defer func() { complete(); completeTestReply(t, fixture.raw, nextUnique, fuse.OK) }()
+			result := make(chan bool, 1)
+			go func() {
+				if kind == "attributes" {
+					attr, hit := fixture.raw.cachedAttrRecord(next, record)
+					result <- hit && attr.GetInode() == item.GetAttr().GetInode()
+				} else {
+					found, attr, negative := fixture.raw.cachedLookup(next, parent, "name")
+					result <- negative || found == record && attr.GetInode() == item.GetAttr().GetInode()
+				}
+			}()
+			if kind == "revoked" || kind == "superseded" {
+				select {
+				case hit := <-result:
+					if hit {
+						t.Error("revoked candidate served from cache")
+					}
+				case <-time.After(time.Second):
+					t.Error("revoked candidate stalled the cache miss")
+				}
+				fixture.raw.ReplyWritten(unique, fuse.OK)
+				return
+			}
+			select {
+			case hit := <-result:
+				fixture.raw.ReplyWritten(unique, fuse.OK)
+				t.Fatalf("lookup overtook finalized cache settlement: hit=%t", hit)
+			case <-time.After(20 * time.Millisecond):
+			}
+			fixture.raw.ReplyWritten(unique, fuse.OK)
+			select {
+			case hit := <-result:
+				if !hit {
+					t.Fatal("settled payload required another Authority request")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("cache lookup did not resume after settlement")
+			}
+		})
+	}
+}

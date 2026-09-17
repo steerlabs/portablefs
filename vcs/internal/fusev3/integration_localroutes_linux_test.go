@@ -91,12 +91,28 @@ func (h *countingHandler) filesystem() map[string]int {
 	out := make(map[string]int, len(h.byKind))
 	for kind, count := range h.byKind {
 		switch kind {
-		case "keepalive", "next-visibility", "ack-visibility", "reclaim":
+		case "keepalive", "next-control-event", "change-ack", "reclaim":
 			continue
 		}
 		out[kind] = count
 	}
 	return out
+}
+
+func TestGraftRequestCounterExcludesOnlyBackgroundTraffic(t *testing.T) {
+	h := &countingHandler{byKind: map[string]int{
+		"keepalive": 1, "next-control-event": 2, "change-ack": 3, "reclaim": 4,
+		"lookup": 5, "getattr": 6, "create": 7, "write": 8, "other": 9,
+	}}
+	counts := h.filesystem()
+	if len(counts) != 5 {
+		t.Fatalf("filesystem requests include background traffic: %v", counts)
+	}
+	for kind, want := range map[string]int{"lookup": 5, "getattr": 6, "create": 7, "write": 8, "other": 9} {
+		if counts[kind] != want {
+			t.Fatalf("filesystem counter omitted %s: %v", kind, counts)
+		}
+	}
 }
 
 // warmVolumePath resolves a shared path so that walking through it costs

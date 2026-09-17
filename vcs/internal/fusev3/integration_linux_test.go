@@ -1110,8 +1110,13 @@ func testAuthorityHorizonWithdrawalAndRecovery(t *testing.T, payload []byte) {
 	}
 	assertHealthy()
 	f.resumeAuthority()
-	waitUntil(t, 20*time.Second, "cold subscription recovery", func() bool {
-		return f.mounts[1].subscription.stamp() != (subscriptionStamp{})
+	waitUntil(t, 20*time.Second, "both cold subscriptions recovered", func() bool {
+		for _, mount := range f.mounts {
+			if mount.subscription.stamp() == (subscriptionStamp{}) {
+				return false
+			}
+		}
+		return true
 	})
 	if got := readExactlyAt(t, retained, 0, len(payload), "retained handle after recovery"); !bytes.Equal(got, payload) {
 		t.Fatal("recovered retained handle returned wrong data")

@@ -2130,6 +2130,10 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 	key := nameKey{parent: parent.key.inode, name: name}
 	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: name}
 	r.mu.Lock()
+	if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) {
+		r.mu.Unlock()
+		return nil, nil, false
+	}
 	defer r.mu.Unlock()
 	record := r.cachedNames[key]
 	stamp := r.cachedNameStamps[key]
@@ -2147,9 +2151,17 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 	if record == nil || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 {
 		return nil, nil, false
 	}
-	payload := r.cachedAttrPayloads[record.identity]
 	attrCoord := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}
+	if !r.waitFinalizedCacheCoordinateLocked(ctx, p, attrCoord) {
+		return nil, nil, false
+	}
+	payload := r.cachedAttrPayloads[record.identity]
 	if payload.attr == nil || r.mount.subscription.remaining(attrCoord, payload.stamp, payload.stamp.version, time.Now()) <= 0 || r.repairingCoordinates[attrCoord] {
+		return nil, nil, false
+	}
+	// The attribute join may have released r.mu across a name withdrawal.
+	if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
+		r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
 		return nil, nil, false
 	}
 	record.lookups++
@@ -2256,8 +2268,11 @@ func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecor
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	payload := r.cachedAttrPayloads[record.identity]
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}
+	if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) {
+		return nil, false
+	}
+	payload := r.cachedAttrPayloads[record.identity]
 	if payload.attr == nil || r.repairingCoordinates[coordinate] || r.mount.subscription.remaining(coordinate, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
 		return nil, false
 	}

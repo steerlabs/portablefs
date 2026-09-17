@@ -910,3 +910,42 @@ XFS/FUSE run stops on a duplicate LOOKUP count after unlink; a focused repetitio
 also exposes an existing-name CREATE coherence refusal. Neither assertion was
 relaxed. Gate repair continues before R4. The no-EntryNotify regression and
 renamed kernel parent-lock proof pass in the focused repetition.
+
+### Gate restoration: physical reply cache settlement
+
+Zero kernel validity lets the kernel request a second lookup immediately after
+/dev/fuse wakes it, before ReplyWritten settles the preceding daemon cache
+candidate. This produced two LOOKUPs after an unlink and follow-up metadata
+RPCs after mkdir/SETATTR. Cached LOOKUP and GETATTR now join only finalized,
+unrevoked candidates for their exact coordinates, with the registry mutex
+released while waiting. They revalidate after waking; callbacks still building
+replies, superseded negatives, and revoked candidates never block a cache miss.
+No kernel validity changed.
+
+`TestCachedLookupWaitsForFinalizedReplyCacheSettlement` covers negative names,
+positive names, attributes, revoked candidates, and superseded negatives. Its
+initial negative arm failed before the fix (`negative=false` before settlement,
+`/tmp/cv2-g2-negative-settlement-before2.log`). The final table passes in Docker,
+`/tmp/cv2-g2-settlement-unit.log`. The real negative-name and mutation post-state
+regressions plus the initial settlement test pass 100 repetitions each, log
+`/tmp/cv2-g2-cache-settlement-diagnostic2.log`; the focused wrapper exits 70
+for intentionally unselected full-suite inventory.
+
+One isolated same-name CREATE returned EIO/COHERENCE during the earlier focused
+run. Its concrete server error was not captured and did not recur in those 100
+repetitions; this record does not assign it an unproven coordinator cause.
+
+Two test-harness corrections preserve their original contracts. Recovery now
+waits for both independent subscriptions before accessing both mounts, within
+the existing 20-second bound. The graft filesystem counter excludes protocol-7
+poll/ack names instead of their retired protocol-6 spellings; its new unit test
+retains counts for every filesystem and unknown request. The zero-filesystem-RPC
+assertion remains unchanged. Failing logs are `/tmp/cv2-g2-restored-xfs-3.log`
+and `/tmp/cv2-g2-restored-xfs-4.log` respectively.
+
+Both initial gates are green before R4: `bash scripts/xfs-fuse-integration.sh`
+exits 0 with all 66 required tests and the root boundary test passing
+(`/tmp/cv2-g2-restored-xfs-5.log`). `bash scripts/coherence-matrix-linux.sh`
+exits 0 with 28 PASS, the unchanged chown SKIP, and both controls matching
+(`/tmp/cv2-g2-restored-matrix-2.log`). The full local gate remains due after the
+remaining G2 work.
