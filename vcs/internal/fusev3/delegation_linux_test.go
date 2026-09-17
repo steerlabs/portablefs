@@ -1259,8 +1259,14 @@ func TestDelegationTruncationAlwaysFlushesThroughWritableHandle(t *testing.T) {
 			fake.mu.Lock()
 			defer fake.mu.Unlock()
 			for _, request := range fake.mutations {
-				if set := request.GetSetAttr(); set != nil && !bytes.Equal(set.GetHandle(), writer) {
-					t.Fatalf("truncate used read-only handle: %v", set)
+				if set := request.GetSetAttr(); set != nil {
+					if !bytes.Equal(set.GetHandle(), writer) {
+						t.Fatalf("truncate used read-only handle: %v", set)
+					}
+					grant := delegationTestGrant(65+32, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+					if set.GetDelegation() == nil || !bytes.Equal(set.GetDelegation().GetId(), grant.GetId()) || set.GetDelegation().GetGeneration() != grant.GetGeneration() {
+						t.Fatalf("buffered truncate omitted exact grant: %v", set)
+					}
 				}
 			}
 		})

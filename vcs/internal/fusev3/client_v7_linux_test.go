@@ -256,3 +256,37 @@ func TestV7BufferedWritePreservesKernelFlagsAndLockOwner(t *testing.T) {
 		}
 	})
 }
+
+func TestV7FallocateCarriesExactDelegationReference(t *testing.T) {
+	f := newStrictFixture(t)
+	entry := f.lookup(t, 1, "allocated")
+	opened := openV7Writer(t, f, entry.NodeId)
+	var captured *authoritypb.DelegationRef
+	f.rpc.mu.Lock()
+	f.rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if allocation := request.GetFallocate(); allocation != nil {
+			captured = cloneDelegationRef(allocation.GetDelegation())
+			item := cloneItem(f.rpc.item)
+			item.Attr.Size = 4096
+			return &authoritypb.Response{VolumeVersion: 2, PostState: exactTestPostState(2, struct {
+				item  *authoritypb.Item
+				roles uint32
+			}{item, postStateRoleTarget}), Body: &authoritypb.Response_Fallocate{Fallocate: &authoritypb.FallocateReply{Flags: rangeResultApplied, PostSize: 4096, VisibilitySequence: 2}}}, nil
+		}
+		return nil, syscall.EIO
+	}
+	f.rpc.mu.Unlock()
+	status := f.rawCall(func(unique uint64) fuse.Status {
+		return f.raw.Fallocate(nil, &fuse.FallocateIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Length: 4096})
+	})
+	f.rpc.mu.Lock()
+	f.rpc.replyOverride = nil
+	f.rpc.mu.Unlock()
+	if status != fuse.OK {
+		t.Fatalf("fallocate=%v", status)
+	}
+	expected := testDelegation()
+	if captured == nil || !bytes.Equal(captured.GetId(), expected.GetId()) || captured.GetGeneration() != expected.GetGeneration() {
+		t.Fatalf("fallocate grant=%v, want %v", captured, expected)
+	}
+}

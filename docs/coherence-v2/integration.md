@@ -1221,3 +1221,13 @@ is correct. The native table passes 20 repetitions (`/tmp/cv2-g2-c6.log`). A Go
 overlay replacing the holder-subtracted count with the total count fails both
 holder-only rows and the mixed-row upgrade (`/tmp/cv2-g2-c6-fault.log`). Command:
 `go -C vcs test ./internal/volumeserver -run '^TestCoherenceDelegationCacheModes$' -count=20`.
+
+### C7: preserve delegation references on truncate and fallocate
+
+Buffered truncate and size-SETATTR flush assertions now require the grant's exact
+ID and generation as well as a writable handle. A raw FALLOCATE test opens a
+FULL writer, captures the emitted request, and requires that same exact grant.
+Both paths were already correct. The tests pass (`/tmp/cv2-g2-c7.log`); an overlay
+removing the two reference fields fails both (`/tmp/cv2-g2-c7-fault.log`). Linux
+binaries ran in the pinned Docker image with
+`-test.run '^Test(DelegationTruncationAlwaysFlushesThroughWritableHandle|V7FallocateCarriesExactDelegationReference)$'`.
