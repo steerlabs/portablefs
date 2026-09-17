@@ -47,6 +47,7 @@ type file struct {
 	reschedule      bool
 }
 type Buffer struct {
+	waitingAdmissions                       int
 	mu                                      sync.Mutex
 	files                                   map[Identity]*file
 	active                                  map[Identity]*file
@@ -213,9 +214,11 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 			b.trigger()
 		}
 		ch := b.change()
+		b.waitingAdmissions++
 		b.mu.Unlock()
 		err := wait(ctx, ch)
 		b.mu.Lock()
+		b.waitingAdmissions--
 		if err != nil {
 			return Cut{}, err
 		}
@@ -260,7 +263,7 @@ func (b *Buffer) Size(id Identity, base int64) int64 {
 func (b *Buffer) Stats() Stats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := Stats{Bytes: b.bytes, Entries: b.count, LossSequence: b.loss}
+	s := Stats{Bytes: b.bytes, Entries: b.count, LossSequence: b.loss, WaitingAdmissions: b.waitingAdmissions}
 	for _, f := range b.files {
 		for r := f.head; r != nil; r = r.next {
 			switch r.state {
@@ -390,13 +393,19 @@ func (b *Buffer) release(r *record) {
 	b.free = r
 }
 
-// Stop cancels background I/O and rejects further admission. It does not drop
-// retained entries. Drain via Barrier before Stop for a clean unmount.
-func (b *Buffer) Stop() {
+// FenceAdmissions wakes capacity waiters without joining a flush that may
+// itself need frontend admission locks. Retained records remain for Drop.
+func (b *Buffer) FenceAdmissions() {
 	b.mu.Lock()
 	b.stopped = true
 	b.signal()
 	b.mu.Unlock()
+}
+
+// Stop cancels background I/O and rejects further admission. It does not drop
+// retained entries. Drain via Barrier before Stop for a clean unmount.
+func (b *Buffer) Stop() {
+	b.FenceAdmissions()
 	b.cancel()
 	<-b.done
 }

@@ -1872,7 +1872,22 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 // identities with retained non-durable entries, and replaces the epoch-scoped
 // Buffer while preserving the mount loss counter.
 func (m *delegationManager) EpochChanged(reason string) {
-	m.epoch.Lock()
+	// A capacity waiter holds an epoch reader until admission ends. Close and
+	// wake admission before waiting for the writer; joining the flusher here
+	// could instead wait on the same frontend locks. Concurrent epoch changes
+	// must fence the successor buffer before replacing it as well.
+	var old *writeback.Buffer
+	for {
+		m.epoch.RLock()
+		old = m.buf
+		old.FenceAdmissions()
+		m.epoch.RUnlock()
+		m.epoch.Lock()
+		if m.buf == old {
+			break
+		}
+		m.epoch.Unlock()
+	}
 	defer m.epoch.Unlock()
 	m.epochSerial++
 	for {
@@ -1884,7 +1899,6 @@ func (m *delegationManager) EpochChanged(reason string) {
 		}
 		break
 	}
-	old := m.buf
 	m.durabilityMu.Lock()
 	durable := m.durableHigh
 	m.durabilityMu.Unlock()

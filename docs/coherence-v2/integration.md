@@ -1109,3 +1109,35 @@ bindings. The broader unprivileged FUSE run passed after excluding only
 `TestKernelFUSEProbeCompletesInit`, whose required fusermount executable is absent
 from the base Go image; mounted tests self-skipped there. This is unit evidence,
 not a replacement for the unchanged privileged final gate.
+
+### C2: fence admissions parked at the writeback cap
+
+Epoch replacement closes buffer admission and wakes waiters before requesting
+the epoch write lock. It does not join the flusher under that read lock. A
+pointer-validation retry ensures concurrent replacements also fence a successor
+buffer before replacing it. Admission therefore either completes before the cut
+and is included in the drop, or wakes with ErrClosed, mapped to EIO. The buffer
+exposes its waiting-admission count so the tests prove an actual capacity wait.
+
+The deterministic manager regression fails before the change with a parked write
+that survives the fence; it passes 20 repetitions after the change. The mounted
+regression fills the real 64 MiB cap, stalls delegated DATA before replay-slot
+assignment, then kills the actual CONTROL transport and rejects reconnects. Its
+natural horizon wakes the kernel write with EIO, advances loss, and refuses a
+cold namespace request with EIO. Healing permits a cold resubscribe; the old root
+barrier reports loss and a new root barrier succeeds without revoking the mount.
+The pre-assignment DATA fault isolates admission fencing: an earlier draft that
+closed an already-assigned DATA socket correctly triggered the separate terminal
+uncertainty policy and ENOTCONN, so it could not prove this live-mount boundary.
+
+The mounted test also found that LOOKUP could reach the Authority during the
+conservative local horizon and return ENOENT. Shared LOOKUP and source mutations
+now refuse locally while the subscription is cold; resource CLOSE remains usable.
+A LOOKUP/MKDIR unit table requires EIO and zero Authority mutations. The real
+partition test is now required inventory in the privileged script.
+
+Validation: `/tmp/cv2-g2-c2-before.log`, `/tmp/cv2-g2-c2-after.log` (20 manager
+repetitions), `go -C vcs test -race ./internal/writeback` passes. The privileged
+selection `PORTABLEFS_GO_TEST_FLAGS='-run ^Test(TransportLossInterruptsWritebackCapacityWaitAtHorizon|NamespaceRequestsRefusedWhileSubscriptionCold)$' bash scripts/xfs-fuse-integration.sh`
+passes both selected tests, including the mounted horizon at 9.03 s; wrapper
+exit 70 names the unselected inventory. Log `/tmp/cv2-g2-c2-mounted-4.log`.

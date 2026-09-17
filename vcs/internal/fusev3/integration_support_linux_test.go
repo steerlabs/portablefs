@@ -233,10 +233,25 @@ func (m *recordingMembership) activeCount() int {
 // requires.
 type integrationTransport struct {
 	*authorityrpc.Client
-	session        []byte
-	hookMu         sync.Mutex
-	beforeMutation func(*authoritypb.Request)
-	afterMutation  func(*authoritypb.Request, *authoritypb.Response, error)
+	session                 []byte
+	hookMu                  sync.Mutex
+	beforeMutation          func(*authoritypb.Request)
+	beforeDelegatedMutation func(context.Context, *authoritypb.Request) error
+	afterMutation           func(*authoritypb.Request, *authoritypb.Response, error)
+}
+
+// The partition test can stall DATA admission before assigning a replay slot.
+// CONTROL still uses the actual TLS transport and its natural horizon.
+func (t *integrationTransport) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	t.hookMu.Lock()
+	before := t.beforeDelegatedMutation
+	t.hookMu.Unlock()
+	if before != nil {
+		if err := before(ctx, request); err != nil {
+			return nil, err
+		}
+	}
+	return t.Client.CallMutation(ctx, request)
 }
 
 func (t *integrationTransport) SessionID() []byte { return append([]byte(nil), t.session...) }

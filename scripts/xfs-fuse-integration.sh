@@ -51,6 +51,7 @@ REQUIRED_TESTS=(
   # unfixed it fails in under a second, three runs out of three.
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDependencyTreeInstallRacingEnumeratingReadersKeepsBothMountsServing"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestAuthorityLossFailsCleanlyInsteadOfHanging"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestTransportLossInterruptsWritebackCapacityWaitAtHorizon"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestSessionExpiryReleasesABlockedLockWait"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestUnmountRemountObservesDurableState"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestLazyUnmountWaitsForRetainedFUSEReferenceBeforeCleanDetach"

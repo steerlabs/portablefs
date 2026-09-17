@@ -1246,6 +1246,12 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 	if requiresGate != (gate != nil) {
 		return nil, errors.New("fusev3: mutation source-publication ownership does not match its operation")
 	}
+	// The local horizon is conservative: the Authority may still answer before
+	// its later deadline. Cold namespace reads and mutations must nevertheless
+	// fail until this mount installs a new subscription.
+	if (requiresGate || request.GetLookup() != nil) && m.subscription != nil && m.subscription.stamp() == (subscriptionStamp{}) {
+		return nil, syscall.EIO
+	}
 	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
 	if callback == nil || m.raw == nil {
 		return nil, errors.New("fusev3: strict mutation escaped its raw callback publication lifecycle")

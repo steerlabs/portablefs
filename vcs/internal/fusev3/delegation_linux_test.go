@@ -1522,3 +1522,48 @@ func TestUncertainCapacityRefusalLosesDelegation(t *testing.T) {
 		t.Fatal("uncertain quota reply preserved grant or failed to record loss")
 	}
 }
+
+func TestDelegationSubscriptionFenceWakesAdmissionParkedAtCapacity(t *testing.T) {
+	partition := make(chan struct{})
+	fake := &delegationFakeRPC{block: partition}
+	m, err := newDelegationManager(fake, time.Second, 7, writeback.Options{MaxEntries: 1, FlushInterval: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Stop)
+	id := installDelegationForTest(t, m, 34, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), id, 0, []byte("accepted"), false); err != nil {
+		t.Fatal(err)
+	}
+	old := m.buf
+	before := m.LossSequence()
+	written := make(chan error, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { _, err := m.Write(ctx, id, 8, []byte("parked"), false); written <- err }()
+	waitFor(t, "write admission at retained-entry cap", func() bool { return old.Stats().WaitingAdmissions == 1 })
+	fenced := make(chan struct{})
+	go func() { m.FenceSubscription("test partition horizon"); close(fenced) }()
+	select {
+	case err := <-written:
+		if !errors.Is(err, writeback.ErrClosed) || delegationErrno(err) != syscall.EIO {
+			t.Fatalf("parked write = %v (%v), want ErrClosed/EIO", err, delegationErrno(err))
+		}
+	case <-time.After(time.Second):
+		cancel()
+		<-written
+		<-fenced
+		t.Fatal("subscription fence did not release cap-blocked write")
+	}
+	select {
+	case <-fenced:
+	case <-time.After(time.Second):
+		t.Fatal("fence remained blocked behind admission")
+	}
+	if got := m.LossSequence(); got <= before {
+		t.Fatalf("mount loss = %d, want > %d", got, before)
+	}
+	if got := m.IdentityLoss(id); got <= before {
+		t.Fatalf("identity loss = %d, want > %d", got, before)
+	}
+}

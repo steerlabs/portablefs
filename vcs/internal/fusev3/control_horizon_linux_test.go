@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 // Initial pairs open DATA then CONTROL, and mounts attach sequentially. Reject
@@ -45,7 +47,7 @@ func (l *controlFaultListener) Accept() (net.Conn, error) {
 		return conn, nil
 	}
 }
-func (l *controlFaultListener) partition(t *testing.T, mount int) {
+func (l *controlFaultListener) partitionTransport(t *testing.T, mount, transport int) {
 	t.Helper()
 	l.mu.Lock()
 	if len(l.connections) != 4 {
@@ -53,12 +55,16 @@ func (l *controlFaultListener) partition(t *testing.T, mount int) {
 		t.Fatal("fixture did not establish exactly two transport pairs")
 	}
 	l.blocked = true
-	conn := l.connections[2*mount+1]
+	conn := l.connections[2*mount+transport]
 	l.mu.Unlock()
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
 }
+func (l *controlFaultListener) partition(t *testing.T, mount int) {
+	l.partitionTransport(t, mount, 1)
+}
+
 func (l *controlFaultListener) heal() { l.mu.Lock(); l.blocked = false; l.mu.Unlock() }
 
 type recordingKernelNotifier struct {
@@ -193,5 +199,131 @@ func TestControlTransportLossWithdrawsEveryCacheAtHorizon(t *testing.T) {
 	waitUntil(t, 15*time.Second, "cold resubscribe", func() bool { return mount.subscription.stamp().incarnation > incarnation })
 	if got := readExactlyAt(t, retained, 0, len(fresh), "read after cold resubscribe"); !bytes.Equal(got, fresh) {
 		t.Fatalf("stale after resubscribe: %q", got)
+	}
+}
+
+func TestTransportLossInterruptsWritebackCapacityWaitAtHorizon(t *testing.T) {
+	var listener *controlFaultListener
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2, wrapListener: func(l net.Listener) net.Listener { listener = &controlFaultListener{Listener: l}; return listener }})
+	mount := f.mounts[1]
+	writer := mustOpenFile(t, f.join(1, "capacity-writer"), os.O_CREATE|os.O_RDWR, 0600)
+	defer writer.Close()
+	if _, err := writer.WriteAt([]byte("seed"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	root := mustOpenFile(t, f.mountPath(1), os.O_RDONLY, 0)
+	defer root.Close()
+	defer listener.heal()
+	incarnation := mount.subscription.stamp().incarnation
+	loss := mount.delegations.LossSequence()
+	old := mount.delegations.buf
+	dataHeal := make(chan struct{})
+	defer close(dataHeal)
+	transport := f.transports[1]
+	transport.hookMu.Lock()
+	transport.beforeDelegatedMutation = func(ctx context.Context, request *authoritypb.Request) error {
+		if write := request.GetWrite(); write != nil && write.GetDelegation() != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-dataHeal:
+			}
+		}
+		return nil
+	}
+	transport.hookMu.Unlock()
+	defer func() { transport.hookMu.Lock(); transport.beforeDelegatedMutation = nil; transport.hookMu.Unlock() }()
+	type result struct {
+		n   int
+		err error
+	}
+	outcome := make(chan result, 1)
+	go func() {
+		payload := make([]byte, writeback.MaxPayload)
+		for retained := 0; retained <= writeback.DefaultMaxBytes; retained += len(payload) {
+			n, err := writer.WriteAt(payload, 0)
+			if err != nil || n != len(payload) {
+				outcome <- result{n, err}
+				return
+			}
+		}
+		outcome <- result{len(payload), nil}
+	}()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for old.Stats().WaitingAdmissions != 1 {
+		select {
+		case got := <-outcome:
+			t.Fatalf("write ended before capacity: n=%d err=%v stats=%+v", got.n, got.err, old.Stats())
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatalf("write did not park at capacity: %+v", old.Stats())
+		}
+	}
+	if stats := old.Stats(); stats.Bytes != writeback.DefaultMaxBytes {
+		t.Fatalf("parked below byte cap: %+v", stats)
+	}
+	if mount.subscription.stamp().incarnation != incarnation {
+		t.Fatal("DATA admission fault prematurely fenced subscription")
+	}
+	listener.partition(t, 1)
+	select {
+	case got := <-outcome:
+		if got.n != 0 || !errors.Is(got.err, syscall.EIO) {
+			t.Fatalf("parked write = %d,%v; want 0,EIO", got.n, got.err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("parked write survived subscription horizon")
+	}
+	waitUntil(t, time.Second, "complete capacity fence", func() bool { return mount.delegations.LossSequence() > loss && mount.delegations.incarnation() == 0 })
+	if mount.subscription.stamp() != (subscriptionStamp{}) {
+		t.Fatal("capacity write failed before subscription fence")
+	}
+	if _, err := os.Stat(f.join(1, "cold-while-partitioned")); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("post-horizon namespace = %v, want EIO; mount=%v session=%v", err, mount.fatalError(), f.clients[1].SessionEndCause())
+	}
+	if mount.isRevoked() || f.clients[1].SessionEndCause() != nil {
+		t.Fatalf("horizon ended mount/session: %v / %v", mount.fatalError(), f.clients[1].SessionEndCause())
+	}
+	listener.heal()
+	waitUntil(t, 20*time.Second, "cold resubscribe after capacity fence", func() bool { return mount.subscription.stamp().incarnation > incarnation })
+	if err := root.Sync(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("pre-loss root barrier = %v, want EIO", err)
+	}
+	freshRoot := mustOpenFile(t, f.mountPath(1), os.O_RDONLY, 0)
+	defer freshRoot.Close()
+	if err := freshRoot.Sync(); err != nil {
+		t.Fatalf("fresh root barrier: %v", err)
+	}
+}
+
+func TestNamespaceRequestsRefusedWhileSubscriptionCold(t *testing.T) {
+	for _, mutation := range []bool{false, true} {
+		t.Run(fmt.Sprint(mutation), func(t *testing.T) {
+			mount, rpc := testMount(t, 8)
+			mount.subscription.deactivate()
+			root := mount.raw.nodesByID[1].node
+			ctx, finish := testMutationContext(t, mount)
+			var errno syscall.Errno
+			if mutation {
+				_, errno = root.Mkdir(ctx, "cold", 0700)
+			} else {
+				_, errno = root.Lookup(ctx, "cold")
+			}
+			finish(false)
+			if errno != syscall.EIO {
+				t.Fatalf("cold namespace = %v, want EIO", errno)
+			}
+			rpc.mu.Lock()
+			defer rpc.mu.Unlock()
+			if rpc.mutationCalls != 0 {
+				t.Fatalf("cold namespace crossed Authority: %d", rpc.mutationCalls)
+			}
+		})
 	}
 }

@@ -104,6 +104,7 @@ type Options struct {
 }
 
 type Stats struct {
+	WaitingAdmissions          int
 	Bytes                      int64
 	Entries                    int
 	Accepted, Applied, Visible int
