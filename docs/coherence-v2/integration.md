@@ -1814,3 +1814,16 @@ The new mounted overlap test passes in 1.13 s
 required unrelated tests were not selected; it is not full-gate evidence. No
 multi-identity RPC is added without the final workload measurement establishing
 that remaining per-file RPC overhead dominates.
+
+#### G2 item 7 test-adapter follow-up
+
+The first full XFS run at `d4992f5` stopped at the capacity/horizon test: the new
+scatter transport method inherited directly from Client and bypassed the test
+adapter's DATA admission partition. The buffer briefly reached its cap but then
+drained through real RPCs, so the parked write succeeded. The adapter now applies
+the same pre-replay fault hook to serial and scatter mutations. A unit regression
+requires both methods to return the injected error before replay assignment;
+without the override it reaches the absent underlying client. Production code
+and horizon assertions are unchanged. Unit proof passes
+(`/tmp/cv2-g2-scatter-hook.log`); the original failure is retained in
+`/tmp/cv2-g2-item7-full-xfs.log`.

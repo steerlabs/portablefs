@@ -256,6 +256,33 @@ func (t *integrationTransport) CallMutation(ctx context.Context, request *author
 	return t.Client.CallMutation(ctx, request)
 }
 
+func (t *integrationTransport) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	t.hookMu.Lock()
+	before := t.beforeDelegatedMutation
+	t.hookMu.Unlock()
+	if before != nil {
+		if err := before(ctx, request); err != nil {
+			return nil, err
+		}
+	}
+	return t.Client.CallMutationSegments(ctx, request, segments, assigned)
+}
+
+func TestIntegrationPartitionHookCoversScatterFlush(t *testing.T) {
+	injected := errors.New("partition before replay admission")
+	transport := &integrationTransport{beforeDelegatedMutation: func(context.Context, *authoritypb.Request) error { return injected }}
+	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Size: 1, Delegation: &authoritypb.DelegationRef{}}}}
+	if _, err := transport.CallMutation(t.Context(), request); !errors.Is(err, injected) {
+		t.Fatal(err)
+	}
+	if _, err := transport.CallMutationSegments(t.Context(), request, [][]byte{{1}}, func(authorityrpc.MutationIdentity) error {
+		t.Error("partitioned flush assigned a replay slot")
+		return nil
+	}); !errors.Is(err, injected) {
+		t.Fatal(err)
+	}
+}
+
 func (t *integrationTransport) SessionID() []byte { return append([]byte(nil), t.session...) }
 
 func (t *integrationTransport) DetachAfterUnmount(ctx context.Context, proof MountAbsenceProof) error {
