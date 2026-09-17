@@ -3476,8 +3476,9 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 	attached = true
 	candidates := make([]dirPlusCandidate, 0, 32)
 	emitted := 0
+	var page dirPlusPageBoundary
 	for {
-		entry, dirent, item, entryOut, stamp, errno := handle.takePlus(ctx, out)
+		entry, dirent, item, entryOut, stamp, errno := handle.takePlus(ctx, out, &page)
 		if errno != 0 {
 			return fuse.Status(errno)
 		}
@@ -3513,7 +3514,7 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		}
 		p := replyPublicationFromContext(ctx)
 		p.stamp, p.servedVersion = stamp, stamp.version
-		if handle.authorityPageExhausted() {
+		if page.finished {
 			break
 		}
 	}

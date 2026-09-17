@@ -265,3 +265,43 @@ READDIR RPCs (0.004/entry) and zero LOOKUP RPCs. Its 0.57-second test duration
 includes setup and teardown and is not a listing latency measurement. Source
 logs: `/tmp/cv2-g2-durable-mounted2.log`, `/tmp/cv2-g2-own-mounted.log`,
 `/tmp/cv2-g2-flush-mounted.log`, and `/tmp/cv2-g2-plus-mounted.log`.
+
+### Baseline after items 0a, 0b, 1, 2, and amended 3/8
+
+Measured commit `68fd4cf` on Linux `6.8.0-100-generic` with:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' PORTABLEFS_PROFILE_RUN=g2-after-1-3 bash scripts/xfs-fuse-integration.sh
+```
+
+The install and Git subtests completed; the overall run failed on a peer
+READDIRPLUS EIO. This is intermediate measurement evidence, not a passing gate.
+The exact output is `/tmp/cv2-g2-baseline-1-3.log`.
+
+| Workload | Direct XFS seconds | PortableFS seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---:|---:|---:|---:|---:|
+| Install, 40,000 files + 2,000 directories, 1 worker | 0.624 | 277.050 | 164,750 | 3.9226 | 3.9049 |
+| Install, 40,000 files + 2,000 directories, 8 workers | 0.333 | 274.056 | 165,062 | 3.9300 | 3.9094 |
+| Git status cold, 20,000 files | 0.00844 | 1.910 | 40,628 | 2.0314 | 1.0261 |
+| Git status warm, 20,000 files | 0.00745 | 1.322 | 20,471 | 1.0236 | 0.0182 |
+
+| Install opcode, 1 worker | Requests | Requests/file |
+|---|---:|---:|
+| CREATE | 40,000 | 1 |
+| WRITE | 40,000 | 1 |
+| LOOKUP | 42,000 | 1.05 |
+| CLOSE | 40,002 | 1.00005 |
+| MKDIR | 2,000 | 0.05 |
+| OPEN / READDIR | 1 / 1 | 0.000025 each |
+| Barrier | 274 | 0.00685 |
+| DelegationRelease | 339 | 0.008475 |
+| KeepAlive / RenewSubscription | 41 / 92 | 0.001025 / 0.0023 |
+| FLUSH / ChangeAck / additional control polls | 0 / 0 / 0 | 0 |
+
+Install time regressed sharply despite fewer requests: the retained close path
+still waits for durability while the fallback Barrier now runs at most once per
+second. Item 4 must remove that wait before claiming an install speedup. Cold Git
+still does 20,140 LOOKUPs; warm Git does two, while both runs reclaim 20,105
+capabilities. READDIRPLUS eliminates LOOKUPs for the cold `ls -ln` test but does
+not eliminate cold Git's index-driven stat pass. The fresh 20,000-file git-add
+regression passes at the shipping 65,536-name capacity and leaves the mount live.

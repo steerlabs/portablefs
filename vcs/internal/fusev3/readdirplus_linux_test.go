@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -111,11 +112,11 @@ func TestReadDirPlusTakeOwnsCapabilityAcrossInvalidation(t *testing.T) {
 	ctx, finish := testMutationContext(t, mount)
 	defer finish(false)
 	small := fuse.NewDirEntryList(make([]byte, 1), 0)
-	entry, dirent, item, out, _, errno := handle.takePlus(ctx, small)
+	entry, dirent, item, out, _, errno := handle.takePlus(ctx, small, &dirPlusPageBoundary{})
 	if errno != 0 || entry == nil || dirent == nil || item != nil || out != nil || dirent.Item == nil || handle.next != 0 {
 		t.Fatal("full buffer consumed capability or cursor")
 	}
-	entry, dirent, item, out, _, errno = handle.takePlus(ctx, fuse.NewDirEntryList(make([]byte, 4096), 0))
+	entry, dirent, item, out, _, errno = handle.takePlus(ctx, fuse.NewDirEntryList(make([]byte, 4096), 0), &dirPlusPageBoundary{})
 	if errno != 0 || item == nil || out == nil || dirent.Item != nil {
 		t.Fatal("fitting entry did not transfer capability")
 	}
@@ -148,5 +149,78 @@ func TestReadDirPlusExpiredPageReservesNoPartialCache(t *testing.T) {
 	}
 	if len(p.names) != 0 || len(p.attrs) != 0 || raw.pendingAttrs != 0 || raw.pendingNames != 0 || len(raw.cacheReservations) != 0 {
 		t.Fatal("expired page retained partial reservations")
+	}
+}
+
+func TestReadDirPlusWithdrawalStopsTheCurrentReplyPage(t *testing.T) {
+	for _, expiry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expiry=%v", expiry), func(t *testing.T) {
+			raw, mount, rpc := testRawFileSystem(t, 16)
+			next := plusTestPages(2)[0]
+			next.Entries = next.Entries[1:]
+			id, _ := testDirHandle(t, raw, plusTestPages(2)[0], next)
+			held, handle := raw.acquireDirHandle(id)
+			unique := nextTestRequestUnique()
+			ctx, finish, status := raw.mutationContext(unique)
+			if status != fuse.OK {
+				t.Fatal(status)
+			}
+			defer finish()
+			cursor, errno := handle.beginDirPlus(ctx, 0)
+			if errno != 0 {
+				t.Fatal(errno)
+			}
+			if err := raw.attachDirPlusLookupTransaction(ctx, cursor, held); err != nil {
+				t.Fatal(err)
+			}
+			out := fuse.NewDirEntryList(make([]byte, 4096), 0)
+			var page dirPlusPageBoundary
+			entry, _, item, _, _, errno := handle.takePlus(ctx, out, &page)
+			if errno != 0 || entry == nil || item == nil || page.finished {
+				t.Fatal("first entry missing or page prematurely exhausted")
+			}
+			record, errno := raw.intern(ctx, item)
+			if errno != 0 {
+				t.Fatal(errno)
+			}
+			if err := raw.stageDirPlusLookup(ctx, record, held.inode, entry.Name); err != nil {
+				t.Fatal(err)
+			}
+			subscription := mount.subscription
+			subscription.mu.Lock()
+			cacheUntil := subscription.cacheUntil
+			if expiry {
+				subscription.cacheUntil = time.Now().Add(-time.Second)
+			}
+			subscription.mu.Unlock()
+			if !expiry {
+				handle.invalidateEnumeration()
+			}
+			entry, _, item, _, _, errno = handle.takePlus(ctx, out, &page)
+			if errno != 0 || entry != nil || item != nil || out.Offset != 1 {
+				t.Fatalf("reply crossed withdrawal: entry=%v item=%v offset=%d errno=%v", entry, item, out.Offset, errno)
+			}
+			if len(rpc.readdirs) != 1 {
+				t.Fatal("old reply fetched a replacement page")
+			}
+			if err := raw.commitDirPlusLookupTransaction(ctx); err != nil {
+				t.Fatal(err)
+			}
+			raw.PrepareReplyPayload(unique, 42, 44, nil, nil, 0)
+			completeTestReply(t, raw, unique, fuse.OK)
+			if handle.next != 1 || handle.plusReply != nil || record.lookups != 1 {
+				t.Fatal("accepted partial reply lost its cursor or lookup")
+			}
+			subscription.mu.Lock()
+			subscription.cacheUntil = cacheUntil
+			subscription.mu.Unlock()
+			nextOut := fuse.NewDirEntryList(make([]byte, 4096), 1)
+			testRawCall(t, raw, func(unique uint64) fuse.Status {
+				return raw.ReadDirPlus(nil, &fuse.ReadIn{InHeader: fuse.InHeader{Unique: unique}, Fh: id, Offset: 1}, nextOut)
+			})
+			if len(rpc.readdirs) != 2 || nextOut.Offset != 2 {
+				t.Fatal("next callback lost the replacement page")
+			}
+		})
 	}
 }

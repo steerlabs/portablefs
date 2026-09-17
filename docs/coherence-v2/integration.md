@@ -1449,3 +1449,27 @@ The required mounted cold `ls -ln` lists 1,000 files with exactly four READDIR
 RPCs and zero LOOKUP RPCs (`/tmp/cv2-g2-plus-mounted.log`). The selected wrapper
 exits 70 for omitted inventory. The 1,000-entry callback proof and additional
 expiry proof pass (`/tmp/cv2-g2-plus-final.log`).
+
+### Intermediate baseline and discovered PLUS churn failure
+
+The requested baseline after items 1–3 (amended 3/8 first) ran on `68fd4cf`.
+Both 40,000-file install cases and cold/warm Git completed; results.md records
+all measured values and the one-worker opcode table. Install regressed to
+277/274 seconds because close still waits for the now-amortized durability pump.
+The fresh 20,000-file git-add conformance case passes. The peer workload fails
+with READDIRPLUS EIO, so the overall run is not green
+(`/tmp/cv2-g2-baseline-1-3.log`). Close batching is being prepared separately;
+the PLUS churn failure is addressed first in this worktree.
+
+The failure combined entries from two Authority pages in one physical PLUS
+reply when withdrawal replaced the page between entries. Each reply now retains
+its first page generation and stamp, stops before fetching a replacement, and
+observes exhaustion atomically with capability transfer. Expiry advances the
+page generation too. The regression covers withdrawal and expiry, successful
+physical commit of the partial reply, and the next callback's continuation.
+Both rows fail with the boundary predicate disabled
+(`/tmp/cv2-g2-plus-fault.log`); all PLUS unit tests pass
+(`/tmp/cv2-g2-plus-fix.log`). The focused peer baseline passes three initial
+repetitions and two after the final pre-fetch check
+(`/tmp/cv2-g2-plus-peer3.log`, `/tmp/cv2-g2-plus-peer-final.log`). These filtered
+wrappers exit 70 for omitted required inventory; full gates remain pending.

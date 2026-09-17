@@ -1728,7 +1728,7 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 
 // peek returns the next directory entry without consuming it, fetching another
 // authority page only when the buffered one is exhausted.
-func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *authoritypb.Dirent, syscall.Errno) {
+func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPlusPageBoundary) (*fuse.DirEntry, *authoritypb.Dirent, syscall.Errno) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.stale.Load() {
@@ -1741,20 +1741,30 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool) (*fuse.DirEntry, *
 			h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
 			h.pageStamp = subscriptionStamp{}
 			h.eof = false
+			h.cursorGeneration++
 		}
 	}
-	if h.pending != nil && h.pageWantItems != wantItems {
+	if len(boundary) != 0 && boundary[0].changedLocked(h) {
+		return nil, nil, 0
+	}
+	if h.page != nil && h.pageWantItems != wantItems {
 		// Resume from the last consumed authority cookie. A kernel is allowed to
 		// alternate READDIR and READDIRPLUS on one handle; capabilities must only
 		// be minted for the PLUS page that will actually carry them.
 		h.discardPageItemsLocked()
-		h.page, h.index, h.pending, h.pendingDirent = nil, 0, nil, nil
+		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
+		h.pageStamp = subscriptionStamp{}
+		h.eof = false
+		h.cursorGeneration++
 	}
 	if h.pending != nil {
 		return h.pending, h.pendingDirent, 0
 	}
 	for {
 		for h.index >= len(h.page) {
+			if len(boundary) != 0 && boundary[0].changedLocked(h) {
+				return nil, nil, 0
+			}
 			if h.eof {
 				return h.peekLocalLocked(), nil, 0
 			}
@@ -1908,12 +1918,6 @@ func (h *dirHandle) discardPageItemsLocked() {
 			h.page[index].Item = nil
 		}
 	}
-}
-
-func (h *dirHandle) authorityPageExhausted() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.index >= len(h.page)
 }
 
 func (h *dirHandle) seekdirLocked(off uint64) syscall.Errno {
