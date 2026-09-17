@@ -91,12 +91,12 @@ this file is the human-curated summary.
 
 ### Measurements and qualification
 
-- The G4 baseline passes in 111.03 seconds. One/eight-worker 40,000-file installs
-  take 21.552428/11.839633 seconds at 1.977476/1.977357 requests per operation.
-  Warm status over 20,000 files takes 2.177457 seconds at 0.01825 requests per
+- The G4 baseline passes in 108.62 seconds. One/eight-worker 40,000-file installs
+  take 21.089135/11.512895 seconds at 1.978286/1.976857 requests per operation.
+  Warm status over 20,000 files takes 2.260461 seconds at 0.01825 requests per
   file, with zero LOOKUP/GETATTR and one RECLAIM. The two-mount workload takes
-  2.974838 seconds at 6.21675 requests per operation; 214 RECLAIMs are below its
-  858 READDIR pages.
+  2.432345 seconds at 8.12725 requests per operation; 62 RECLAIMs are below its
+  229 READDIR pages.
 - The exact all-case soak passes in 1,052.64 seconds. Full-size Git passes in
   906.12 seconds, and package, compiler, NPM, Git-lock, chaos, epoch, horizon,
   dirty-unmount, writeback-cap, and reduced long-run regressions all pass.

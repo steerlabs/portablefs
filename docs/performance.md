@@ -10,14 +10,14 @@ Linux VM and full-size workload as the historical v6 and G samples.
 
 | Workload | v6 wall (s) | G wall (s) | G4 wall (s) | v6 requests/op | G requests/op | G4 requests/op |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| install, 1 worker | 386.762771 | 21.028568 | 21.552428 | 7.854381 | 7.480524 | 1.977476 |
-| install, 8 workers | 273.738199 | 15.706301 | 11.839633 | 7.561476 | 6.849524 | 1.977357 |
-| git-status-cold | 10.572948 | 1.379696 | 1.751086 | 1.040450 | 1.027400 | 1.027050 |
-| git-status-warm | 2.042038 | 1.195970 | 2.177457 | 0.027650 | 0.018600 | 0.018250 |
-| two-mount-write-list-read | 12.536042 | 2.644504 | 2.974838 | 7.877500 | 9.819500 | 6.216750 |
+| install, 1 worker | 386.762771 | 21.028568 | 21.089135 | 7.854381 | 7.480524 | 1.978286 |
+| install, 8 workers | 273.738199 | 15.706301 | 11.512895 | 7.561476 | 6.849524 | 1.976857 |
+| git-status-cold | 10.572948 | 1.379696 | 1.868078 | 1.040450 | 1.027400 | 1.027050 |
+| git-status-warm | 2.042038 | 1.195970 | 2.260461 | 0.027650 | 0.018600 | 0.018250 |
+| two-mount-write-list-read | 12.536042 | 2.644504 | 2.432345 | 7.877500 | 9.819500 | 8.127250 |
 
 Warm status over 20,000 files issues zero LOOKUP/GETATTR requests and one
-RECLAIM. The two-mount run issues 214 RECLAIMs for 858 READDIR pages. The
+RECLAIM. The two-mount run issues 62 RECLAIMs for 229 READDIR pages. The
 per-opcode tables and the ten raw JSON observations are in
 [results.md](./coherence-v2/results.md#g4-final-baseline-and-qualification).
 

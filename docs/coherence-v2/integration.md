@@ -2496,8 +2496,8 @@ path. The fix is additive:
 
 The regression assertions use opcode counts rather than totals. Final warm Git
 has zero LOOKUP+GETATTR, one RECLAIM (limit 64), and 0.01825 requests per file
-(limit 0.02). The final peer run has 6.21675 requests per operation (limit 9.8)
-and 214 RECLAIMs for 858 READDIR pages. Commit `8032e11` contains the wire,
+(limit 0.02). The final peer run has 8.12725 requests per operation (limit 9.8)
+and 62 RECLAIMs for 229 READDIR pages. Commit `8032e11` contains the wire,
 Authority, client, batching, and baseline tests; `88ecb2f` contains the
 mutation-proven absence fix.
 
@@ -2555,15 +2555,15 @@ unchanged 20-minute budget.
 
 ### Final measurement and install decision
 
-The unprofiled final baseline passes in 111.03 seconds. Raw rows are in
+The unprofiled final baseline passes in 108.62 seconds. Raw rows are in
 `results-g4-final.jsonl`; the v6/G/G4 comparison and opcode tables are in
-`results.md`. Warm Git has 365 total requests; the peer workload has 24,867.
+`results.md`. Warm Git has 365 total requests; the peer workload has 32,509.
 
 One isolated 100-sample profile measured CREATE at 170 us mean from syscall to
 daemon, 33 us from daemon to Authority handler, 53 us in the handler, and 79 us
 from handler return to syscall return. The 335 us CREATE mean excludes the
 following write and close. The profiled one-worker install took 20.247920
-seconds; the final uninstrumented run took 21.552428 seconds for 40,000 files
+seconds; the final uninstrumented run took 21.089135 seconds for 40,000 files
 and 2,000 directories. G4 therefore accepts the namespace round-trip floor and
 does not add another install optimization.
 
@@ -2577,3 +2577,47 @@ turn; `wire.md` uses the exact protobuf message and field names. An identifier
 audit compared every documented protocol message and field with
 `proto/authority/v1/authority.proto`; the only initial differences were prose
 shorthands, which were expanded to their exact message names.
+
+### Final regression sweep and qualification
+
+The unfiltered Linux gate found two direct `takePlus` fixtures that fetched a
+READDIRPLUS page without the reply transaction that every real raw callback
+installs. Page-hint staging correctly rejected that impossible lifecycle. The
+fixtures now establish the cursor and lookup transaction before testing
+capability transfer or page discard; the complete READDIRPLUS-focused set
+passed 20 consecutive runs. Commits `cb9921a` and `d9ccf4b` contain only those
+fixture corrections.
+
+The same sweep found that the directory-churn fix had unnecessarily changed
+the raw registry from an `RWMutex` to a `Mutex`. G4 retains the atomic
+validate-and-increment write lock in `addLookupHeldDirent`, but restores shared
+admission for physical-reply lookup, lifecycle lookup, cache lookup, and held-
+identity scans. `TestRegistryReadersCanOverlap` fails with the exclusive lock
+and passed 20 consecutive runs with the correction. Commit `973f140` contains
+that fix.
+
+Final qualification on the committed implementation:
+
+- `bash scripts/xfs-fuse-integration.sh` passed all 76 required privileged
+  tests and the one required root-boundary test.
+- `bash scripts/coherence-matrix-linux.sh` passed twice standalone and once
+  inside the full gate. Each production phase passed 28 cases, skipped only the
+  declared single-principal `remote_chown_visible` case, and had no unexpected
+  result; both negative controls failed as declared.
+- `bash scripts/verify-local.sh --full` passed Darwin Foundation/cgo and static
+  Linux build/vet, dependency scanning, native Go and race suites, the
+  maintained go-fuse seam, all 345 Xcode-native Swift tests, release-trust and
+  architecture scans, the 76-test XFS/FUSE suite, its root-boundary test, and
+  the Linux coherence matrix.
+- The post-fix baseline test passed all subtests in 108.62 seconds. Its final
+  ten rows replace the earlier observation in `results-g4-final.jsonl`; the
+  focused wrapper's inventory warning is expected because its `-run` selector
+  deliberately omits the other required privileged tests, which passed in the
+  unfiltered and full gates above.
+
+The full gate names three intentionally separate qualifications it does not
+run: the on-demand package-manager Docker soak, the live macOS FSKit mount
+matrix, and deployed-cell staging qualification. G4 ran the prescribed
+all-case Linux soak instead of the package-manager-only matrix. The remaining
+macOS live-extension and deployed-staging work requires those external
+environments and is not evidence available from this worktree.

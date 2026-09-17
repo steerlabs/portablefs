@@ -161,8 +161,8 @@ including direct XFS and protocol 6 comparisons, are in
 [results.md](./coherence-v2/results.md).
 
 The final G4 baseline records 0.01825 Authority requests per file for warm Git
-status (zero LOOKUP/GETATTR and one RECLAIM) and 6.21675 requests per operation
-for the two-mount workload (214 RECLAIMs for 858 READDIR pages). The exact
+status (zero LOOKUP/GETATTR and one RECLAIM) and 8.12725 requests per operation
+for the two-mount workload (62 RECLAIMs for 229 READDIR pages). The exact
 all-case soak passes, including the full 5,000-file/200-commit Git workload and
 all fault cases. The additive directory contract lets a client name page-local
 stable identities whose capabilities it already retains; the Authority omits a

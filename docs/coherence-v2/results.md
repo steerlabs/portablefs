@@ -813,22 +813,22 @@ are one machine observation rather than a general throughput claim.
 
 The final G4 baseline ran on Linux 6.8.0-100-generic with the same 4-CPU,
 8-GiB Docker VM, loopback TLS, tmpfs-backed loop XFS, workload sizes, and
-denominators as the v6 and G records. All subtests passed in 111.03 seconds.
+denominators as the v6 and G records. All subtests passed in 108.62 seconds.
 [Raw final observations](results-g4-final.jsonl) preserve all ten rows.
 
 | Workload | v6 wall (s) | G wall (s) | G4 wall (s) | v6 requests/op | G requests/op | G4 requests/op | G4 filesystem requests/op |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| install, 1 worker | 386.762771 | 21.028568 | 21.552428 | 7.854381 | 7.480524 | 1.977476 | 1.964595 |
-| install, 8 workers | 273.738199 | 15.706301 | 11.839633 | 7.561476 | 6.849524 | 1.977357 | 1.967619 |
-| git-status-cold | 10.572948 | 1.379696 | 1.751086 | 1.040450 | 1.027400 | 1.027050 | 1.026000 |
-| git-status-warm | 2.042038 | 1.195970 | 2.177457 | 0.027650 | 0.018600 | 0.018250 | 0.018050 |
-| two-mount-write-list-read | 12.536042 | 2.644504 | 2.974838 | 7.877500 | 9.819500 | 6.216750 | 3.302750 |
+| install, 1 worker | 386.762771 | 21.028568 | 21.089135 | 7.854381 | 7.480524 | 1.978286 | 1.965000 |
+| install, 8 workers | 273.738199 | 15.706301 | 11.512895 | 7.561476 | 6.849524 | 1.976857 | 1.967381 |
+| git-status-cold | 10.572948 | 1.379696 | 1.868078 | 1.040450 | 1.027400 | 1.027050 | 1.026000 |
+| git-status-warm | 2.042038 | 1.195970 | 2.260461 | 0.027650 | 0.018600 | 0.018250 | 0.018050 |
+| two-mount-write-list-read | 12.536042 | 2.644504 | 2.432345 | 7.877500 | 9.819500 | 8.127250 | 3.295750 |
 
 The warm-status regression target is met: LOOKUP + GETATTR is zero, RECLAIM is
 one (limit 64), and total traffic is 0.01825 requests per file (limit 0.02).
-The two-mount target is also met: 6.21675 requests per operation (limit 9.8),
-and 214 RECLAIM requests are no more than its 858 READDIR pages. The peer run
-performed five scans, observed 173 files while the writer was active, and
+The two-mount target is also met: 8.12725 requests per operation (limit 9.8),
+and 62 RECLAIM requests are no more than its 229 READDIR pages. The peer run
+performed five scans, observed 772 files while the writer was active, and
 verified all 2,000 files. Scheduling and overlap differ between historical
 runs, so these wall times remain observations rather than isolated speedups.
 
@@ -850,22 +850,21 @@ runs, so these wall times remain observations rather than isolated speedups.
 | Two-mount opcode | Requests | Requests/op |
 | --- | ---: | ---: |
 | close | 2,006 | 0.501500 |
-| close_batch | 77 | 0.019250 |
+| close_batch | 66 | 0.016500 |
 | create | 2,000 | 0.500000 |
 | flush | 2,000 | 0.500000 |
-| get_attr | 65 | 0.016250 |
-| lookup | 193 | 0.048250 |
+| get_attr | 205 | 0.051250 |
+| lookup | 670 | 0.167500 |
 | open | 2,005 | 0.501250 |
-| read | 2,007 | 0.501750 |
-| read_dir | 858 | 0.214500 |
+| read | 2,002 | 0.500500 |
+| read_dir | 229 | 0.057250 |
 | write | 2,000 | 0.500000 |
 | barrier | 4 | 0.001000 |
-| change_ack | 4,268 | 1.067000 |
-| delegation_break_ack | 1,409 | 0.352250 |
-| delegation_release | 77 | 0.019250 |
-| next_control_event | 5,683 | 1.420750 |
-| reclaim | 214 | 0.053500 |
-| renew_subscription | 1 | 0.000250 |
+| change_ack | 3,853 | 0.963250 |
+| delegation_break_ack | 5,728 | 1.432000 |
+| delegation_release | 66 | 0.016500 |
+| next_control_event | 9,613 | 2.403250 |
+| reclaim | 62 | 0.015500 |
 
 ### One-worker CREATE latency profile
 
@@ -884,7 +883,7 @@ qualification. Values are microseconds per CREATE and exclude the subsequent
 | reply to syscall return | 79 | 75 | 115 |
 
 The stage means total 335 us per CREATE. The same profiled install completed in
-20.247920 seconds; the final uninstrumented run took 21.552428 seconds for
+20.247920 seconds; the final uninstrumented run took 21.089135 seconds for
 40,000 create/write/close operations plus 2,000 directory creations. The
 remaining install wall time is therefore the namespace round-trip floor plus
 write, close, directory, and scheduling work. G4 deliberately does not add a
