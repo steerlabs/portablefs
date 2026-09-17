@@ -1,8 +1,10 @@
 package volumeserver
 
 import (
+	"cmp"
 	"container/list"
 	"context"
+	"slices"
 	"sort"
 	"sync"
 )
@@ -169,16 +171,26 @@ func (d DependencyDeclaration) validFor(gate SourcePublicationGate, sequencer *m
 
 // mutationSequencer grants dependency sets atomically under one short registry
 // lock. A waiter never holds a subset of its requested keys: it either owns all
-// of them or none. Deadlock is therefore impossible. While scanning in ordinal
-// order, a blocked waiter reserves every key it requested; a later waiter may
-// pass only when disjoint. This is FIFO fairness on every key, and an operation
+// of them or none. Deadlock is therefore impossible. Per-key claim queues keep
+// every blocked waiter's ordinal reservation; a later waiter may pass only
+// when disjoint. This is FIFO fairness on every key, and an operation
 // waiting for several keys cannot be repeatedly overtaken on any one of them.
 type mutationSequencer struct {
-	mu          sync.Mutex
-	nextOrdinal uint64
-	held        map[string]*mutationSequencerWaiter
-	versions    map[string]dependencyVersion
-	waiters     list.List
+	mu                  sync.Mutex
+	nextOrdinal         uint64
+	held                map[string]*mutationSequencerWaiter
+	versions            map[string]dependencyVersion
+	waiters             list.List
+	claims              map[string]*mutationSequencerKeyQueue
+	candidateGeneration uint64
+	candidates          []*mutationSequencerWaiter
+}
+
+type mutationSequencerKeyQueue struct{ head, tail *mutationSequencerClaim }
+type mutationSequencerClaim struct {
+	waiter     *mutationSequencerWaiter
+	queue      *mutationSequencerKeyQueue
+	prev, next *mutationSequencerClaim
 }
 
 type dependencyVersion struct {
@@ -187,19 +199,22 @@ type dependencyVersion struct {
 }
 
 type mutationSequencerWaiter struct {
-	sequencer *mutationSequencer
-	ready     chan struct{}
-	element   *list.Element
-	keys      []string
-	ordinal   uint64
-	granted   bool
-	readOnly  bool
-	settled   bool
+	sequencer           *mutationSequencer
+	ready               chan struct{}
+	element             *list.Element
+	claims              []mutationSequencerClaim
+	candidateGeneration uint64
+	keys                []string
+	ordinal             uint64
+	granted             bool
+	readOnly            bool
+	settled             bool
 }
 
 func newMutationSequencer() *mutationSequencer {
 	return &mutationSequencer{
 		held:     make(map[string]*mutationSequencerWaiter),
+		claims:   make(map[string]*mutationSequencerKeyQueue),
 		versions: make(map[string]dependencyVersion),
 	}
 }
@@ -294,12 +309,14 @@ func (s *mutationSequencer) enqueueFor(dependencies MutationDependencies, reserv
 		w.ordinal = reserved
 	}
 	s.insertLocked(w)
-	s.grantEligibleLocked()
+	if s.eligibleLocked(w) {
+		s.grantLocked(w)
+	}
 	s.mu.Unlock()
 	return w
 }
 
-func (s *mutationSequencer) insertLocked(w *mutationSequencerWaiter) {
+func (s *mutationSequencer) insertGlobalLocked(w *mutationSequencerWaiter) {
 	if back := s.waiters.Back(); back == nil || back.Value.(*mutationSequencerWaiter).ordinal <= w.ordinal {
 		w.element = s.waiters.PushBack(w)
 		return
@@ -324,36 +341,124 @@ func (s *mutationSequencer) acquire(ctx context.Context, dependencies MutationDe
 	}
 }
 
-func (s *mutationSequencer) grantEligibleLocked() {
-	reserved := make(map[string]struct{})
-	for element := s.waiters.Front(); element != nil; {
-		next := element.Next()
-		w := element.Value.(*mutationSequencerWaiter)
-		eligible := true
-		for _, key := range w.keys {
-			if s.held[key] != nil {
-				eligible = false
-			}
-			if _, claimed := reserved[key]; claimed {
-				eligible = false
-			}
+// Claims are allocated at their final size before linking: queue pointers
+// must never point into a slice which can subsequently move on append.
+func (s *mutationSequencer) insertLocked(w *mutationSequencerWaiter) {
+	s.insertGlobalLocked(w)
+	w.claims = make([]mutationSequencerClaim, len(w.keys))
+	for i, key := range w.keys {
+		q := s.claims[key]
+		if q == nil {
+			q = &mutationSequencerKeyQueue{}
+			s.claims[key] = q
 		}
-		if !eligible {
-			for _, key := range w.keys {
-				reserved[key] = struct{}{}
+		claim := &w.claims[i]
+		claim.waiter = w
+		claim.queue = q
+		prior := q.tail
+		for prior != nil && prior.waiter.ordinal > w.ordinal {
+			prior = prior.prev
+		}
+		if prior == nil {
+			claim.next = q.head
+			if q.head != nil {
+				q.head.prev = claim
+			} else {
+				q.tail = claim
 			}
-			element = next
-			continue
+			q.head = claim
+		} else {
+			claim.prev = prior
+			claim.next = prior.next
+			if prior.next != nil {
+				prior.next.prev = claim
+			} else {
+				q.tail = claim
+			}
+			prior.next = claim
 		}
-		s.waiters.Remove(element)
-		w.element = nil
-		w.granted = true
-		for _, key := range w.keys {
-			s.held[key] = w
-		}
-		close(w.ready)
-		element = next
 	}
+}
+
+func (s *mutationSequencer) removeClaimsLocked(w *mutationSequencerWaiter) {
+	for i, key := range w.keys {
+		claim := &w.claims[i]
+		q := claim.queue
+		if claim.prev != nil {
+			claim.prev.next = claim.next
+		} else {
+			q.head = claim.next
+		}
+		if claim.next != nil {
+			claim.next.prev = claim.prev
+		} else {
+			q.tail = claim.prev
+		}
+		if q.head == nil {
+			delete(s.claims, key)
+		}
+		*claim = mutationSequencerClaim{}
+	}
+	w.claims = nil
+}
+
+func (s *mutationSequencer) eligibleLocked(w *mutationSequencerWaiter) bool {
+	if w == nil || w.settled || w.granted || w.element == nil {
+		return false
+	}
+	for i, key := range w.keys {
+		if s.held[key] != nil || s.claims[key].head != &w.claims[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *mutationSequencer) grantLocked(w *mutationSequencerWaiter) {
+	s.waiters.Remove(w.element)
+	w.element = nil
+	s.removeClaimsLocked(w)
+	w.granted = true
+	for _, key := range w.keys {
+		s.held[key] = w
+	}
+	close(w.ready)
+}
+
+func (s *mutationSequencer) beginCandidatesLocked() {
+	s.candidateGeneration++
+	if s.candidateGeneration == 0 {
+		panic("volumeserver: mutation candidate generation exhausted")
+	}
+}
+
+func (s *mutationSequencer) addCandidateLocked(w *mutationSequencerWaiter) {
+	if w == nil || w.settled || w.granted || w.candidateGeneration == s.candidateGeneration {
+		return
+	}
+	w.candidateGeneration = s.candidateGeneration
+	s.candidates = append(s.candidates, w)
+}
+
+func (s *mutationSequencer) addFrontCandidatesLocked(keys []string) {
+	for _, key := range keys {
+		if s.held[key] == nil {
+			if q := s.claims[key]; q != nil && q.head != nil {
+				s.addCandidateLocked(q.head.waiter)
+			}
+		}
+	}
+}
+
+func (s *mutationSequencer) grantCandidatesLocked() {
+	slices.SortFunc(s.candidates, func(a, b *mutationSequencerWaiter) int { return cmp.Compare(a.ordinal, b.ordinal) })
+	for _, w := range s.candidates {
+		if s.eligibleLocked(w) {
+			s.grantLocked(w)
+		}
+	}
+	clear(s.candidates)
+	s.candidates = s.candidates[:0]
 }
 
 func (s *mutationSequencer) releaseKeysLocked(w *mutationSequencerWaiter) {
@@ -388,11 +493,14 @@ func (w *mutationSequencerWaiter) requeue(dependencies MutationDependencies) {
 		s.mu.Unlock()
 		panic("volumeserver: invalid mutation-sequencer requeue")
 	}
+	s.beginCandidatesLocked()
 	s.releaseKeysLocked(w)
+	s.addFrontCandidatesLocked(w.keys)
 	w.keys = append(w.keys[:0], dependencies.keys...)
 	w.ready = make(chan struct{})
 	s.insertLocked(w)
-	s.grantEligibleLocked()
+	s.addCandidateLocked(w)
+	s.grantCandidatesLocked()
 	s.mu.Unlock()
 }
 
@@ -406,13 +514,16 @@ func (w *mutationSequencerWaiter) abandon() {
 		return
 	}
 	w.settled = true
+	s.beginCandidatesLocked()
 	if w.granted {
 		s.releaseKeysLocked(w)
 	} else if w.element != nil {
 		s.waiters.Remove(w.element)
 		w.element = nil
+		s.removeClaimsLocked(w)
 	}
-	s.grantEligibleLocked()
+	s.addFrontCandidatesLocked(w.keys)
+	s.grantCandidatesLocked()
 	s.mu.Unlock()
 }
 
@@ -424,8 +535,10 @@ func (w *mutationSequencerWaiter) release() {
 		panic("volumeserver: invalid mutation-sequencer release")
 	}
 	w.settled = true
+	s.beginCandidatesLocked()
 	s.releaseKeysLocked(w)
-	s.grantEligibleLocked()
+	s.addFrontCandidatesLocked(w.keys)
+	s.grantCandidatesLocked()
 	s.mu.Unlock()
 }
 
@@ -444,8 +557,10 @@ func (w *mutationSequencerWaiter) settle() {
 		panic("volumeserver: unsettled mutation waiter owns no dependency set")
 	}
 	w.settled = true
+	s.beginCandidatesLocked()
 	s.releaseKeysLocked(w)
-	s.grantEligibleLocked()
+	s.addFrontCandidatesLocked(w.keys)
+	s.grantCandidatesLocked()
 	s.mu.Unlock()
 }
 

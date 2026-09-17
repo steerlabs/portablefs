@@ -492,3 +492,29 @@ These isolate CPU work over an in-memory frame. They are not end-to-end write
 latencies or a new before/after implementation claim. Payload authentication
 still costs CPU; metadata canonicalization is below one percent of the digesting
 reader time. The existing digest-equivalence regression passes with these runs.
+
+## G2 mutation queue scaling
+
+Per-key claim queues replace the repeated global waiter scan. Actual before/after
+host binaries, Apple M5 Max, median of three one-iteration contended samples:
+
+| Pending mutations on one key | Former scan | Per-key queues |
+| ---: | ---: | ---: |
+| 64 | 106.333 us | 15.625 us |
+| 256 | 1,679.000 us | 38.916 us |
+| 1,024 | 26,856.750 us | 142.458 us |
+| 4,096 | 435,402.708 us | 548.375 us |
+
+At 4,096 waiters, retained claim bookkeeping increases this single-key case from
+1,016,432 to 1,278,984 allocated bytes, and from 16,393 to 20,495 allocations.
+For 256 waiters each reserving a common key plus its own distinct key, removing
+repeated reservation-map construction reduces allocation from 5,755,139 to
+122,162 bytes. The regression enforces a generous 524,288-byte linear budget.
+
+The existing disjoint workload is unchanged: three 500 ms samples have median
+3.731 us before and 3.741 us after for dependency keys, versus 67.990 and
+68.108 us for its global-turn reference model. Short one-iteration warmups of
+that benchmark were too noisy and are excluded. Logs:
+`/tmp/cv2-g2-sequencer-before.log`, `sequencer-after.log`,
+`disjoint-before.log`, `disjoint-after.log` (same prefix). These are coordinator
+CPU measurements, not RPC or mounted-workload timings.

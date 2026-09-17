@@ -2042,3 +2042,20 @@ publisher immediately retires the application ledger. The 100,000-ticket
 `TestCoherenceDurableTicketsDoNotAccumulateInLongLivedSessions` covers bounded
 retention, session isolation and sequence continuity. It remains in the full
 Authority gate; no second implementation is needed.
+
+#### G2 item 11: per-key mutation wait queues
+
+Each dependency key now retains its ordered claim queue. Enqueue examines only
+the new claimant; release and cancellation examine the newly exposed fronts,
+with deduplicated scratch storage. Multi-key admission remains atomic, FIFO on
+every key, and disjoint requests can pass. Requeue retains its original ordinal
+without an ownership gap. Read-turn expansion checks the new keys' oldest claims
+instead of scanning every waiter.
+
+New tests cover cancellation exposing an otherwise free key, multi-key FIFO,
+complete cleanup, and a linear allocation bound that fails on the former
+implementation (`/tmp/cv2-g2-sequencer-fault.log`). The complete coordinator race
+suite passes (`/tmp/cv2-g2-sequencer-race2.log`); independent read-only review ran
+the existing fairness/expansion cases 20 times without failure. The full Linux
+Authority suite passes (`/tmp/cv2-g2-sequencer-rpc.log`). Queue-size and disjoint
+measurements, including the single-key bookkeeping tradeoff, are in results.md.

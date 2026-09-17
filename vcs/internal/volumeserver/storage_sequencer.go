@@ -99,36 +99,28 @@ func (r *StorageReadTurn) TryExpand(deps MutationDependencies) bool {
 	if w.settled || !w.granted {
 		return false
 	}
-	contains := func(keys []string, key string) bool {
-		for _, k := range keys {
-			if k == key {
-				return true
-			}
-		}
-		return false
-	}
-	for _, key := range w.keys {
-		if !contains(deps.keys, key) {
+	i := 0
+	for _, key := range deps.keys {
+		if i < len(w.keys) && w.keys[i] < key {
 			return false
 		}
-	}
-	for _, key := range deps.keys {
+		existing := i < len(w.keys) && w.keys[i] == key
+		if existing {
+			i++
+		}
 		if owner := s.held[key]; owner != nil && owner != w {
 			return false
 		}
-		if contains(w.keys, key) {
-			continue
-		}
-		for e := s.waiters.Front(); e != nil; e = e.Next() {
-			older := e.Value.(*mutationSequencerWaiter)
-			if older.ordinal >= w.ordinal {
-				break
-			}
-			if contains(older.keys, key) {
+		if !existing {
+			if q := s.claims[key]; q != nil && q.head != nil && q.head.waiter.ordinal < w.ordinal {
 				return false
 			}
 		}
 	}
+	if i != len(w.keys) {
+		return false
+	}
+
 	for _, key := range deps.keys {
 		s.held[key] = w
 	}
