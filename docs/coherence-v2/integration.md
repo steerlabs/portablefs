@@ -1747,3 +1747,20 @@ Restoring the erroneous required feature fails the compatibility regression
 unprivileged FUSE suite pass; final focused serial/epoch tests also pass. Logs:
 `/tmp/cv2-g2-optional-close-host-race.log`, `optional-close-rpc.log`,
 `optional-close-fuse.log`, `optional-close-final.log` (same prefix).
+
+#### G2 local-gate follow-up: hydrator fixture readiness
+
+`verify-local.sh --full` at `331f194` failed the native Darwin restore/hydrator
+interop test before reaching Swift or Docker: INFO chunk size was zero. The
+fixture waited for the Unix socket pathname, which can become visible between
+bind and listen. A refused initial connection intentionally starts restore mode
+blocked and uninitialized; zero was the absent initialization, not a decoded
+wire value. The fixture now requires a decoded INFO with the expected volume,
+attempt, epoch and chunk size. Production blocked-startup behavior is unchanged.
+
+The readiness test refuses an unserved socket and a zero-size INFO, and accepts
+the correct reply. Restoring pathname-only readiness fails that test
+(`/tmp/cv2-g2-ready-fault.log`). Readiness and real hydrator integration pass ten
+race-enabled repetitions (`/tmp/cv2-g2-restore-readiness.log`). The original full
+gate failure remains in `/tmp/cv2-g2-through-item7a-full.log`; full qualification
+is still pending.
