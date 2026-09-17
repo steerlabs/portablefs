@@ -367,6 +367,25 @@ type coherenceRestampedEmptyDirectoryStore struct {
 	coherenceEmptyDirectoryStore
 }
 
+type coherenceBlockedEmptyDirectoryStore struct {
+	coherenceEmptyDirectoryStore
+	entered chan struct{}
+	release chan struct{}
+	blocked atomic.Bool
+}
+
+func (s *coherenceBlockedEmptyDirectoryStore) ReadDirOpen(
+	handle xfsstore.Capability,
+	cookie uint64,
+	maxEntries int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if s.blocked.CompareAndSwap(false, true) {
+		close(s.entered)
+		<-s.release
+	}
+	return s.coherenceEmptyDirectoryStore.ReadDirOpen(handle, cookie, maxEntries)
+}
+
 func (s *coherenceRestampedEmptyDirectoryStore) ReadDirOpen(
 	handle xfsstore.Capability,
 	cookie uint64,
@@ -399,6 +418,67 @@ func (s *coherenceEmptyDirectoryStore) ReadDirOpen(
 }
 
 func (*coherenceEmptyDirectoryStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestCoherenceReadDirOwnsTheDirectoryStorageTurnWhileEnumerating(t *testing.T) {
+	store := &coherenceBlockedEmptyDirectoryStore{
+		coherenceEmptyDirectoryStore: coherenceEmptyDirectoryStore{
+			handle: xfsstore.Capability{0x51}, directory: xfsstore.Capability{0x52},
+		},
+		entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := coherenceReadRequest(credential)
+	request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+		Handle: store.handle[:], MaxEntries: 8,
+	}}
+	stampMutation(t, request, 0, 1)
+	response := make(chan *authoritypb.Response, 1)
+	go func() { response <- h.Handle(ctx, request) }()
+	select {
+	case <-store.entered:
+	case <-ctx.Done():
+		t.Fatal("READDIR did not enter storage")
+	}
+
+	mutation := make(chan func(), 1)
+	go func() {
+		release, err := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies([16]byte{store.handle[0]}, []byte("index.lock"), [16]byte{}))
+		if err != nil {
+			mutation <- nil
+			return
+		}
+		mutation <- release
+	}()
+	select {
+	case release := <-mutation:
+		if release != nil {
+			release()
+		}
+		t.Fatal("directory mutation acquired while READDIR was constructing its page")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(store.release)
+	select {
+	case reply := <-response:
+		if reply.GetErrno() != 0 || reply.GetReadDir() == nil {
+			t.Fatalf("READDIR response = %+v", reply)
+		}
+	case <-ctx.Done():
+		t.Fatal("READDIR did not complete")
+	}
+	select {
+	case release := <-mutation:
+		if release == nil {
+			t.Fatal("queued directory mutation failed")
+		}
+		release()
+	case <-ctx.Done():
+		t.Fatal("queued directory mutation did not resume")
+	}
+}
 
 type coherenceLookupStore struct {
 	resourceAdmissionFaultStore

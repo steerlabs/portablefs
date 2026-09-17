@@ -414,7 +414,7 @@ type rawFileSystem struct {
 	grafts  *localdirs.Grafts
 	backing string
 
-	mu              sync.RWMutex
+	mu              sync.Mutex
 	nextNodeID      uint64
 	nodesByID       map[uint64]*inodeRecord
 	nodesByIdentity map[publicationIdentity]*inodeRecord
@@ -845,8 +845,8 @@ func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *ino
 // obligation directly rather than inferring it from a notification the
 // withdrawal happens to emit.
 func (r *rawFileSystem) cachedDataHolds(inode uint64) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.cachedData[inode] != nil
 }
 
@@ -1612,8 +1612,8 @@ func (r *rawFileSystem) byIdentityLocked(identity publicationIdentity) *inodeRec
 // ReplyWriteTracked joins cache/source-bearing replies to go-fuse's physical
 // write lifecycle.
 func (r *rawFileSystem) ReplyWriteTracked(unique uint64) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.replyTerminal || r.replyTerminalizing {
 		return false
 	}
@@ -1883,8 +1883,8 @@ func (r *rawFileSystem) Init(server *fuse.Server) {
 }
 
 func (r *rawFileSystem) replyLifecycleReady() bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.replyLifecycleArmed
 }
 
@@ -2017,11 +2017,15 @@ func (r *rawFileSystem) addLookupHeldDirent(dirent *authoritypb.Dirent) (*inodeR
 	}
 	var identity publicationIdentity
 	copy(identity[:], dirent.GetStableIdentity())
-	r.mu.RLock()
+	r.mu.Lock()
 	record := r.nodesByIdentity[identity]
-	valid := record != nil && !record.reclaimed && !record.stale.Load() && record.node != nil && !record.node.stale.Load() && record.key == itemKey(&authoritypb.Item{Attr: dirent.GetAttr()})
-	r.mu.RUnlock()
-	if !valid || !r.addLookupExisting(record) {
+	valid := record != nil && !record.reclaimed && !record.stale.Load() && record.node != nil && !record.node.stale.Load() && record.key == itemKey(&authoritypb.Item{Attr: dirent.GetAttr()}) && record.lookups != math.MaxUint64
+	if valid {
+		record.lookups++
+		r.identityIndexLocked(record)[record.key] = record
+	}
+	r.mu.Unlock()
+	if !valid {
 		return nil, nil, false
 	}
 	item := cloneItem(record.node.item)

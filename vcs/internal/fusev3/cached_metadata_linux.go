@@ -52,9 +52,9 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	key := nameKey{parent: parent.key.inode, name: name}
 	// Delegation ownership requires its own locks. Never nest those under the
 	// raw registry lock; revalidate the exact binding after observing ownership.
-	r.mu.RLock()
+	r.mu.Lock()
 	record := r.cachedNames[key]
-	r.mu.RUnlock()
+	r.mu.Unlock()
 	if record != nil && r.mount.delegations.Owns(record.identity[:]) {
 		var attr fuse.Attr
 		if hit, err := r.holderMetadata(r.opContext(), unique, parent, name, record, nil, 0, &attr, true); hit && err == nil {

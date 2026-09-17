@@ -410,8 +410,15 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			if guardErr != nil {
 				return h.coherenceError(0, guardErr)
 			}
+			directoryDependencies := coherenceInodeDependencies(directoryIdentity)
+			storageTurn, acquireErr := h.coherenceStorage.AcquireReadTurn(ctx, directoryDependencies)
+			if acquireErr != nil {
+				directoryGuard.Release()
+				return h.errorResponse(0, acquireErr, false)
+			}
 			entries, _, current, eof, directory, readErr := h.coherenceReadDirPage(handle, cookie, int(request.GetMaxEntries()))
 			if readErr != nil {
+				storageTurn.Release()
 				directoryGuard.Release()
 				if errors.Is(readErr, syscall.EAGAIN) {
 					continue
@@ -420,6 +427,7 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			}
 			candidates, budgetExhausted, conflict, buildErr := h.constructDirectoryPage(handle, entries, cookie, request.GetWantItems(), heldIdentities, budget)
 			if buildErr != nil {
+				storageTurn.Release()
 				directoryGuard.Release()
 				if errors.Is(buildErr, syscall.EAGAIN) {
 					continue
@@ -427,6 +435,7 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				return h.errorResponse(0, buildErr, false)
 			}
 			if conflict {
+				storageTurn.Release()
 				directoryGuard.Release()
 				continue
 			}
@@ -444,29 +453,48 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				seen[candidate.identity] = struct{}{}
 				identities = append(identities, candidate.identity)
 			}
-			pageGuard := directoryGuard
-			if len(identities) > 1 {
-				// Never nest identity guards: opposite-order pages must acquire
-				// one complete footprint. Empty pages retain their first cut.
-				directoryGuard.Release()
-				pageGuard, guardErr = h.coherenceReadSetAdmission(ctx, cred.ID, identities)
-				if guardErr != nil {
-					h.forgetDirectoryCandidates(candidates)
-					return h.coherenceError(0, guardErr)
-				}
-			}
-
 			dependencies := h.coherenceDirectoryDependencies(directoryIdentity, candidates)
-			release, acquireErr := h.coherenceStorage.AcquireRead(ctx, dependencies)
-			if acquireErr != nil {
-				pageGuard.Release()
-				h.forgetDirectoryCandidates(candidates)
-				return h.errorResponse(0, acquireErr, false)
+			guards := []*volumeserver.DataGuard{directoryGuard}
+			immediate := true
+			for _, identity := range identities[1:] {
+				guard, ok, tryErr := h.coherenceTryReadAdmission(ctx, cred.ID, identity)
+				if tryErr != nil {
+					storageTurn.Release()
+					releaseDataGuards(guards)
+					h.forgetDirectoryCandidates(candidates)
+					return h.coherenceError(0, tryErr)
+				}
+				if !ok {
+					immediate = false
+					break
+				}
+				guards = append(guards, guard)
+			}
+			storageRelease := storageTurn.Release
+			if !immediate || !storageTurn.TryExpand(dependencies) {
+				// Never wait for a delegation or a contended child while holding
+				// the directory turn. Queue the complete footprints, then verify
+				// that the probe still names the page we protected.
+				storageTurn.Release()
+				releaseDataGuards(guards)
+				pageGuard, setErr := h.coherenceReadSetAdmission(ctx, cred.ID, identities)
+				if setErr != nil {
+					h.forgetDirectoryCandidates(candidates)
+					return h.coherenceError(0, setErr)
+				}
+				guards = []*volumeserver.DataGuard{pageGuard}
+				release, readErr := h.coherenceStorage.AcquireRead(ctx, dependencies)
+				if readErr != nil {
+					releaseDataGuards(guards)
+					h.forgetDirectoryCandidates(candidates)
+					return h.errorResponse(0, readErr, false)
+				}
+				storageRelease = release
 			}
 			valid, revalidated, verifyErr := h.coherenceRevalidateDirectoryPage(handle, directory, cookie, int(request.GetMaxEntries()), entries, eof, candidates)
 			if verifyErr != nil || !valid {
-				release()
-				pageGuard.Release()
+				storageRelease()
+				releaseDataGuards(guards)
 				h.forgetDirectoryCandidates(candidates)
 				if verifyErr != nil {
 					if errors.Is(verifyErr, syscall.EAGAIN) {
@@ -484,8 +512,8 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				}
 			}
 			if err := h.admitCoherenceCache(cacheToken, admission); err != nil {
-				release()
-				pageGuard.Release()
+				storageRelease()
+				releaseDataGuards(guards)
 				h.forgetDirectoryCandidates(candidates)
 				return h.coherenceError(0, err)
 			}
@@ -495,8 +523,8 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			for _, candidate := range candidates {
 				candidate.dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, version)
 			}
-			release()
-			pageGuard.Release()
+			storageRelease()
+			releaseDataGuards(guards)
 
 			result := &authoritypb.ReadDirReply{Verifier: current[:], Eof: eof && !budgetExhausted}
 			issued := make([]directoryPageCandidate, 0, len(candidates))
@@ -532,6 +560,12 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			return response
 		}
 	})
+}
+
+func releaseDataGuards(guards []*volumeserver.DataGuard) {
+	for index := len(guards) - 1; index >= 0; index-- {
+		guards[index].Release()
+	}
 }
 
 func (h *VolumeHandler) coherenceDirectoryDependencies(directory [16]byte, candidates []directoryPageCandidate) volumeserver.MutationDependencies {

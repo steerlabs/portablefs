@@ -45,17 +45,19 @@ func (r *rawFileSystem) dropDirectoryPageHintsLocked(identity publicationIdentit
 }
 
 func (r *rawFileSystem) heldDirectoryPageIdentities(directory publicationIdentity, cookie []byte) [][]byte {
-	r.mu.RLock()
+	r.mu.Lock()
 	hint, ok := r.directoryPageHints[directoryPageKey{directory: directory, cookie: string(cookie)}]
+	identities := append([]publicationIdentity(nil), hint.identities...)
+	r.mu.Unlock()
 	if !ok || r.mount.subscription.remaining(
 		publicationCoordinate{kind: publicationItemEnumeration, item: directory}, hint.stamp, hint.stamp.version, time.Now(),
 	) <= 0 {
-		r.mu.RUnlock()
 		return nil
 	}
-	held := make([][]byte, 0, len(hint.identities))
-	seen := make(map[publicationIdentity]struct{}, len(hint.identities))
-	for _, identity := range hint.identities {
+	r.mu.Lock()
+	held := make([][]byte, 0, len(identities))
+	seen := make(map[publicationIdentity]struct{}, len(identities))
+	for _, identity := range identities {
 		record := r.nodesByIdentity[identity]
 		if record == nil || record.reclaimed || record.stale.Load() || record.node == nil || record.node.stale.Load() {
 			continue
@@ -66,7 +68,7 @@ func (r *rawFileSystem) heldDirectoryPageIdentities(directory publicationIdentit
 		seen[identity] = struct{}{}
 		held = append(held, append([]byte(nil), identity[:]...))
 	}
-	r.mu.RUnlock()
+	r.mu.Unlock()
 	sort.Slice(held, func(i, j int) bool { return bytes.Compare(held[i], held[j]) < 0 })
 	return held
 }

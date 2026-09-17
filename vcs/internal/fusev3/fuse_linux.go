@@ -2384,13 +2384,13 @@ func (n *node) cachedBoundIdentity(name string) (publicationIdentity, bool) {
 	if !ok {
 		return publicationIdentity{}, false
 	}
-	n.mount.raw.mu.RLock()
+	n.mount.raw.mu.Lock()
 	record := n.mount.raw.cachedStableNames[publicationNamespace{parent: parent, name: name}]
 	var identity publicationIdentity
 	if record != nil && !record.reclaimed && record.node != nil && !record.node.epochStale.Load() {
 		identity = record.identity
 	}
-	n.mount.raw.mu.RUnlock()
+	n.mount.raw.mu.Unlock()
 	return identity, identity != (publicationIdentity{})
 }
 

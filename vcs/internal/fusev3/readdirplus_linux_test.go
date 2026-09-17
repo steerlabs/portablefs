@@ -93,7 +93,7 @@ func TestWarmReadDirPlusReusesRetainedPageCapabilities(t *testing.T) {
 	completeTestReply(t, raw, firstUnique, fuse.OK)
 
 	var child *inodeRecord
-	raw.mu.RLock()
+	raw.mu.Lock()
 	for _, record := range raw.nodesByID {
 		if record != nil && record.key.inode == 100 {
 			child = record
@@ -104,7 +104,7 @@ func TestWarmReadDirPlusReusesRetainedPageCapabilities(t *testing.T) {
 	if handle := raw.handles[firstHandle]; handle != nil {
 		directory = handle.inode
 	}
-	raw.mu.RUnlock()
+	raw.mu.Unlock()
 	if child == nil || directory == nil {
 		t.Fatal("cold READDIRPLUS did not intern its directory and child")
 	}
@@ -112,12 +112,12 @@ func TestWarmReadDirPlusReusesRetainedPageCapabilities(t *testing.T) {
 	if mount.reclaim.pending() != 0 {
 		t.Fatal("kernel FORGET reclaimed a binding retained by the live subscription")
 	}
-	raw.mu.RLock()
+	raw.mu.Lock()
 	if raw.nodesByIdentity[child.identity] != child || raw.nodesByKey[child.key] != child {
-		raw.mu.RUnlock()
+		raw.mu.Unlock()
 		t.Fatal("FORGET removed a retained daemon binding from an identity index")
 	}
-	raw.mu.RUnlock()
+	raw.mu.Unlock()
 	heldIdentities := raw.heldDirectoryPageIdentities(directory.identity, nil)
 	if len(heldIdentities) != 1 || !bytes.Equal(heldIdentities[0], child.identity[:]) {
 		t.Fatalf("cached page held identities = %x, want %x", heldIdentities, child.identity)
