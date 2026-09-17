@@ -569,3 +569,112 @@ func TestCoherenceReadDirRefusesMalformedVerifierBeforeEnumeration(t *testing.T)
 		}
 	}
 }
+
+type declaredLookupStore struct {
+	coherenceLookupStore
+	afterProbe func()
+	size       int64
+}
+
+func (s *declaredLookupStore) Lookup(parent xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	item, attr, err := s.coherenceLookupStore.Lookup(parent, name)
+	if hook := s.afterProbe; hook != nil {
+		s.afterProbe = nil
+		hook()
+	}
+	return item, attr, err
+}
+func (s *declaredLookupStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	attr, err := s.coherenceLookupStore.Getattr(item)
+	if s.size != 0 {
+		attr.Size = s.size
+	}
+	return attr, err
+}
+func TestCoherenceLookupRetainsOneProbeAndRevalidatesBindingDeclaration(t *testing.T) {
+	for _, edge := range []string{"stable", "child setattr"} {
+		t.Run(edge, func(t *testing.T) {
+			store := &declaredLookupStore{coherenceLookupStore: coherenceLookupStore{resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x33}}}}
+			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+			h.initCoherence()
+			store.afterProbe = func() {
+				if edge == "stable" {
+					return
+				}
+				release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies([16]byte{0x33}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				store.size = 19
+				release()
+			}
+			request := coherenceReadRequest(cred)
+			request.Body = &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: root[:], Name: []byte("child")}}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || response.GetLookup().GetItem() == nil {
+				t.Fatalf("lookup: %v", response)
+			}
+			if got := store.lookup.Load(); got != 1 {
+				t.Fatalf("lookup probes=%d want 1", got)
+			}
+			if got := store.attr.Load(); got != 1 {
+				t.Fatalf("value-bearing attribute reads=%d want 1", got)
+			}
+			if got := response.GetLookup().GetItem().GetStableIdentity()[0]; got != store.lookupItem[0] {
+				t.Fatalf("stale binding identity=%x", got)
+			}
+			if edge == "child setattr" && response.GetLookup().GetItem().GetAttr().GetSize() != 19 {
+				t.Fatal("returned probe's stale attributes")
+			}
+		})
+	}
+}
+
+func TestCoherenceLookupRebindDuringBreakDiscardsRetainedProbe(t *testing.T) {
+	store := &coherenceLookupStore{resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x33}}}
+	h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+	identity := [16]byte{0x33}
+	holder, grant, cursor, _ := grantPeerDelegationForReadTest(t, h, cred, root, identity)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	request := coherenceReadRequest(cred)
+	request.Body = &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: root[:], Name: []byte("child")}}
+	stampMutation(t, request, 0, 1)
+	result := make(chan *authoritypb.Response, 1)
+	go func() { result <- h.Handle(ctx, request) }()
+	var event volumeserver.StreamEvent
+	for event.Kind != volumeserver.StreamBreakForRead {
+		events, err := h.Coherence.Poll(ctx, holder, cursor, nil, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range events {
+			cursor = e.Position
+			if e.Kind == volumeserver.StreamBreakForRead {
+				event = e
+			}
+		}
+	}
+	parent, _ := store.Identity(root)
+	release, err := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies(parent, []byte("child"), identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.lookupItem = xfsstore.Capability{0x44}
+	release()
+	if err := h.Coherence.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, event.AppliedSequence); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reply := <-result:
+		if reply.GetErrno() != 0 || reply.GetLookup().GetItem().GetStableIdentity()[0] != 0x44 {
+			t.Fatalf("stale binding after break: %v", reply)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if store.lookup.Load() != 2 || store.attr.Load() != 1 || store.forget.Load() != 1 {
+		t.Fatalf("probe/accounting: lookups=%d attrs=%d forgotten=%d", store.lookup.Load(), store.attr.Load(), store.forget.Load())
+	}
+}

@@ -1872,3 +1872,27 @@ root boundary test (`/tmp/cv2-g2-terminal-full-xfs.log`). This includes capacity
 partition, terminal session expiry, the ordered mounted overlap regression, and
 the existing stock synchronous-write split assertions. Full verify/matrix will
 be repeated after the remaining performance items.
+
+#### G2 item 9a: retain one LOOKUP probe and expand the read turn
+
+A positive LOOKUP now retains its first capability instead of forgetting it and
+performing a second Store.Lookup. The identity-only probe stays under the
+parent/name storage turn, preserving CREATE's publication exclusion. The common
+path takes a nonblocking child read guard and atomically expands that same turn
+to include the child, then samples fresh attributes. Expansion refuses held
+keys and older queued claims; it never waits while holding a partial footprint.
+
+If either try cannot complete, the handler records a binding declaration before
+releasing its read turn, performs the peer break, and reacquires the full set.
+An intervening binding mutation discards the capability and retries; reads do
+not spuriously change declaration versions. A negative result completes under
+the initial turn. No cached attribute is derived from the pre-break probe.
+
+The full Linux Authority suite passes (`/tmp/cv2-g2-lookup-expand.log`) and final
+LOOKUP, exact-replay, CREATE exclusion and break-before-storage tests pass ten
+repetitions (`/tmp/cv2-g2-lookup-root.log`). Coordinator race tests cover unchanged
+read declarations, mutation detection, cancellation cleanup, same-turn expansion,
+older/younger claims and nonblocking child admission
+(`/tmp/cv2-g2-lookup-expand-coordinator3.log`). Restoring the old handler fails
+the one-probe assertion (`/tmp/cv2-g2-lookup-fault.log`). The READDIR coordinator
+batch in the second half of item 9 remains pending.

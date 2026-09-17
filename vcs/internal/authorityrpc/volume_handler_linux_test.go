@@ -2614,11 +2614,10 @@ func TestLookupCapabilityTransferUsesExactReplay(t *testing.T) {
 		!bytes.Equal(replayed.GetLookup().GetItem().GetToken(), item[:]) {
 		t.Fatalf("replayed lookup=%+v", replayed)
 	}
-	// A positive Linux lookup resolves once under N, then re-resolves under the
-	// atomic N+A admission that authorizes its returned attributes. Exact replay
-	// reuses that retained result and performs neither read again.
-	if calls := store.lookup.Load(); calls != 2 {
-		t.Fatalf("lookup store calls=%d, want two-phase N then N+A acquisition", calls)
+	// The capability from the identity probe survives binding revalidation.
+	// Exact replay reuses the recorded result without another store lookup.
+	if calls := store.lookup.Load(); calls != 1 {
+		t.Fatalf("lookup store calls=%d, want one retained probe across replay", calls)
 	}
 	resources := h.resources[cred.ID]
 	if len(resources.items) != 1 || h.totalItems != 1 {

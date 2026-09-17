@@ -193,6 +193,7 @@ type mutationSequencerWaiter struct {
 	keys      []string
 	ordinal   uint64
 	granted   bool
+	readOnly  bool
 	settled   bool
 }
 
@@ -361,7 +362,7 @@ func (s *mutationSequencer) releaseKeysLocked(w *mutationSequencerWaiter) {
 			panic("volumeserver: mutation sequencer lost key ownership")
 		}
 		delete(s.held, key)
-		if version, watched := s.versions[key]; watched {
+		if version, watched := s.versions[key]; watched && !w.readOnly {
 			version.value++
 			if version.value == 0 {
 				panic("volumeserver: mutation dependency version exhausted")

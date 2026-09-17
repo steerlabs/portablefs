@@ -57,7 +57,7 @@ func (h *VolumeHandler) coherenceFsync(ctx context.Context, requestID uint64, se
 		return h.coherenceError(requestID, err)
 	}
 	defer guard.Release()
-	release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies(identity))
+	release, err := h.coherenceStorage.AcquireRead(ctx, coherenceInodeDependencies(identity))
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
@@ -116,6 +116,21 @@ func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volu
 	return h.Coherence.DataConsumed(ctx, token, identity)
 }
 
+func (h *VolumeHandler) coherenceTryReadAdmission(ctx context.Context, session volumeserver.SessionID, identity [16]byte) (*volumeserver.DataGuard, bool, error) {
+	profile, err := h.sessionFrontendProfile(session)
+	if err != nil {
+		return nil, false, err
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+		return nil, false, nil
+	}
+	token, err := h.coherenceToken(session)
+	if err != nil {
+		return nil, false, err
+	}
+	return h.Coherence.TryDataConsumed(ctx, token, identity)
+}
+
 func (h *VolumeHandler) coherenceReadData(ctx context.Context, requestID uint64, session volumeserver.SessionID, request *authoritypb.ReadRequest) *authoritypb.Response {
 	if request == nil || request.GetLength() > h.MaxRead {
 		return h.errorResponse(requestID, syscall.EINVAL, false)
@@ -137,7 +152,7 @@ func (h *VolumeHandler) coherenceReadData(ctx context.Context, requestID uint64,
 		return h.coherenceError(requestID, err)
 	}
 	defer guard.Release()
-	release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies(identity))
+	release, err := h.coherenceStorage.AcquireRead(ctx, coherenceInodeDependencies(identity))
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
@@ -195,7 +210,7 @@ func (h *VolumeHandler) coherenceGetAttr(ctx context.Context, requestID uint64, 
 		return h.coherenceError(requestID, err)
 	}
 	defer guard.Release()
-	release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies(identity))
+	release, err := h.coherenceStorage.AcquireRead(ctx, coherenceInodeDependencies(identity))
 	if err != nil {
 		return h.errorResponse(requestID, err, false)
 	}
@@ -239,18 +254,23 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 			return h.coherenceError(0, err)
 		}
 		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-			probeRelease, acquireErr := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies(parentIdentity, request.GetName(), [16]byte{}))
-			if acquireErr != nil {
-				return h.errorResponse(0, acquireErr, false)
+			binding := coherenceBindingDependencies(parentIdentity, request.GetName(), [16]byte{})
+			probeTurn, err := h.coherenceStorage.AcquireReadTurn(ctx, binding)
+			if err != nil {
+				return h.errorResponse(0, err, false)
 			}
-			probe, _, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
+			probeRelease := probeTurn.Release
+			// Only the stable capability is retained from this probe. Its
+			// attributes cannot be published before the child delegation break.
+			item, _, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
 			if errors.Is(lookupErr, syscall.ENOENT) {
+				release := probeRelease
 				if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Directories: [][16]byte{parentIdentity}}); err != nil {
-					probeRelease()
+					release()
 					return h.coherenceError(0, err)
 				}
 				version := h.coherenceVersionNow()
-				probeRelease()
+				release()
 				response := h.success(0)
 				response.VolumeVersion = version
 				response.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: version}}
@@ -260,49 +280,51 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 				probeRelease()
 				return h.errorResponse(0, lookupErr, false)
 			}
-			identity, identityErr := h.Store.Identity(probe)
-			forgetErr := h.Store.Forget(probe)
-			probeRelease()
-			if identityErr != nil || forgetErr != nil {
-				return h.errorResponse(0, errors.Join(identityErr, forgetErr), false)
+			identity, err := h.Store.Identity(item)
+			if err != nil {
+				probeRelease()
+				h.forgetItem(item)
+				return h.errorResponse(0, err, false)
 			}
-
-			guard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, identity)
-			if guardErr != nil {
-				return h.coherenceError(0, guardErr)
+			dependencies := coherenceBindingDependencies(parentIdentity, request.GetName(), identity)
+			guard, immediate, err := h.coherenceTryReadAdmission(ctx, cred.ID, identity)
+			if err != nil {
+				probeRelease()
+				h.forgetItem(item)
+				return h.coherenceError(0, err)
 			}
-			completeRelease, acquireErr := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies(parentIdentity, request.GetName(), identity))
-			if acquireErr != nil {
-				guard.Release()
-				return h.errorResponse(0, acquireErr, false)
-			}
-			item, attr, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
-			if lookupErr == nil {
-				current, currentErr := h.Store.Identity(item)
-				if currentErr != nil {
-					h.forgetItem(item)
-					completeRelease()
-					guard.Release()
-					return h.errorResponse(0, currentErr, false)
+			completeRelease := probeRelease
+			if !immediate || !probeTurn.TryExpand(dependencies) {
+				declaration := h.coherenceStorage.Declare(binding)
+				probeRelease()
+				if !immediate {
+					guard, err = h.coherenceReadAdmission(ctx, cred.ID, identity)
+					if err != nil {
+						declaration.Release()
+						h.forgetItem(item)
+						return h.coherenceError(0, err)
+					}
 				}
-				if current != identity {
+				var unchanged bool
+				completeRelease, unchanged, err = h.coherenceStorage.AcquireDeclared(ctx, dependencies, declaration)
+				if err != nil {
+					guard.Release()
 					h.forgetItem(item)
+					return h.errorResponse(0, err, false)
+				}
+				if !unchanged {
 					completeRelease()
 					guard.Release()
+					h.forgetItem(item)
 					continue
 				}
-				attr, lookupErr = h.getattrItemRestored(identity, item)
 			}
-			if lookupErr != nil {
-				if item != (xfsstore.Capability{}) {
-					h.forgetItem(item)
-				}
+			attr, err := h.getattrItemRestored(identity, item)
+			if err != nil {
 				completeRelease()
 				guard.Release()
-				if errors.Is(lookupErr, syscall.ENOENT) {
-					continue
-				}
-				return h.errorResponse(0, lookupErr, false)
+				h.forgetItem(item)
+				return h.errorResponse(0, err, false)
 			}
 			if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Directories: [][16]byte{parentIdentity}, Attributes: [][16]byte{identity}}); err != nil {
 				h.forgetItem(item)
@@ -400,7 +422,7 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			}
 
 			dependencies := h.coherenceDirectoryDependencies(directoryIdentity, candidates)
-			release, acquireErr := h.coherenceStorage.Acquire(ctx, dependencies)
+			release, acquireErr := h.coherenceStorage.AcquireRead(ctx, dependencies)
 			if acquireErr != nil {
 				h.forgetDirectoryCandidates(candidates)
 				return h.errorResponse(0, acquireErr, false)
