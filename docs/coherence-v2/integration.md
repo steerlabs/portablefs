@@ -1935,3 +1935,31 @@ The required coverage, per-entry/per-inode notifications, post-horizon refusal,
 peer write and cold-resubscribe checks are unchanged. The diagnostic isolated
 run passed three times even before the fix, consistent with a receipt race
 (`/tmp/cv2-g2-holder-horizon-diagnostic.log`, selected gate wrapper 70).
+
+The full XFS rerun at `9fd8104` passed all 76 privileged cases and the root
+boundary test (`/tmp/cv2-g2-holder-full-xfs2.log`).
+
+#### G2 item 9b: one retained read footprint per directory page
+
+READDIR now acquires one deduplicated directory-plus-child coordinator guard,
+retained through the full storage revalidation, cache admission and version
+sample. The old per-child loop released each guard before revalidation, allowing
+a new delegation into that gap. Empty pages retain their initial directory
+cut. Cacheless reads also retain their guard through storage sampling.
+
+Reserved generations bypass their own request key and hold reader pins instead;
+Grant waits for those pins. The wait loop reclassifies reservations that appear
+after enqueue, rebuilding the remaining footprint under the coordinator lock.
+Own generations are pinned while another identity delays the batch, so recall
+cannot permit replacement before the sample completes. No page nests guards.
+
+Tests cover one turn for a deduplicated page, every retained identity, existing
+and late reservations, both foreign breaks, opposite-order pages, cancellation
+cleanup and own-generation replacement. Ten race repetitions pass
+(`/tmp/cv2-g2-read-set-race3.log`); the full coordinator race suite also passes
+(`/tmp/cv2-g2-read-set-race.log`). A handler test blocks inside revalidation and
+proves neither directory nor child can be delegated until the sample ends. It
+fails with the old handler (`/tmp/cv2-g2-read-set-fault.log`). The final root
+Linux Authority suite passes (`/tmp/cv2-g2-read-set-root.log`), including the
+unchanged C4 break-before-storage table. Local page-admission measurements are
+recorded in results.md.

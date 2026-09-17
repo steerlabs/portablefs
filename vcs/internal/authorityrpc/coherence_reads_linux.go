@@ -107,13 +107,31 @@ func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volu
 		return nil, err
 	}
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
-		return nil, h.Coherence.BreakForRead(ctx, identity)
+		return h.Coherence.BreakForReadSet(ctx, [][16]byte{identity})
 	}
 	token, err := h.coherenceToken(session)
 	if err != nil {
 		return nil, err
 	}
 	return h.Coherence.DataConsumed(ctx, token, identity)
+}
+
+func (h *VolumeHandler) coherenceReadSetAdmission(ctx context.Context, session volumeserver.SessionID, identities [][16]byte) (*volumeserver.DataGuard, error) {
+	if h.Coherence == nil || h.coherenceStorage == nil {
+		return nil, errInternal
+	}
+	profile, err := h.sessionFrontendProfile(session)
+	if err != nil {
+		return nil, err
+	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+		return h.Coherence.BreakForReadSet(ctx, identities)
+	}
+	token, err := h.coherenceToken(session)
+	if err != nil {
+		return nil, err
+	}
+	return h.Coherence.DataConsumedSet(ctx, token, identities)
 }
 
 func (h *VolumeHandler) coherenceTryReadAdmission(ctx context.Context, session volumeserver.SessionID, identity [16]byte) (*volumeserver.DataGuard, bool, error) {
@@ -390,17 +408,17 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				return h.errorResponse(0, readErr, false)
 			}
 			candidates, budgetExhausted, conflict, buildErr := h.constructDirectoryPage(handle, entries, cookie, request.GetWantItems(), budget)
-			// Never nest identity guards: child breaks can visit the same directory
-			// in the opposite order. The storage turn below revalidates this page.
-			directoryGuard.Release()
 			if buildErr != nil {
+				directoryGuard.Release()
 				return h.errorResponse(0, buildErr, false)
 			}
 			if conflict {
+				directoryGuard.Release()
 				continue
 			}
 
-			identities := make([][16]byte, 0, len(candidates))
+			identities := make([][16]byte, 1, len(candidates)+1)
+			identities[0] = directoryIdentity
 			seen := map[[16]byte]struct{}{directoryIdentity: {}}
 			for _, candidate := range candidates {
 				if candidate.identity == ([16]byte{}) {
@@ -412,24 +430,29 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				seen[candidate.identity] = struct{}{}
 				identities = append(identities, candidate.identity)
 			}
-			for _, identity := range identities {
-				guard, guardErr := h.coherenceReadAdmission(ctx, cred.ID, identity)
+			pageGuard := directoryGuard
+			if len(identities) > 1 {
+				// Never nest identity guards: opposite-order pages must acquire
+				// one complete footprint. Empty pages retain their first cut.
+				directoryGuard.Release()
+				pageGuard, guardErr = h.coherenceReadSetAdmission(ctx, cred.ID, identities)
 				if guardErr != nil {
 					h.forgetDirectoryCandidates(candidates)
 					return h.coherenceError(0, guardErr)
 				}
-				guard.Release()
 			}
 
 			dependencies := h.coherenceDirectoryDependencies(directoryIdentity, candidates)
 			release, acquireErr := h.coherenceStorage.AcquireRead(ctx, dependencies)
 			if acquireErr != nil {
+				pageGuard.Release()
 				h.forgetDirectoryCandidates(candidates)
 				return h.errorResponse(0, acquireErr, false)
 			}
 			valid, verifyErr := h.coherenceRevalidateDirectoryPage(handle, directory, cookie, current, int(request.GetMaxEntries()), entries, eof, candidates)
 			if verifyErr != nil || !valid {
 				release()
+				pageGuard.Release()
 				h.forgetDirectoryCandidates(candidates)
 				if verifyErr != nil {
 					return h.errorResponse(0, verifyErr, false)
@@ -444,11 +467,13 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 			}
 			if err := h.admitCoherenceCache(cacheToken, admission); err != nil {
 				release()
+				pageGuard.Release()
 				h.forgetDirectoryCandidates(candidates)
 				return h.coherenceError(0, err)
 			}
 			version := h.coherenceVersionNow()
 			release()
+			pageGuard.Release()
 
 			result := &authoritypb.ReadDirReply{Verifier: current[:], Eof: eof && !budgetExhausted}
 			issued := make([]directoryPageCandidate, 0, len(candidates))

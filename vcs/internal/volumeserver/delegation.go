@@ -444,6 +444,7 @@ type DataGuard struct {
 	once            sync.Once
 	coordinator     *CoherenceCoordinator
 	record          *delegationRecord
+	records         []*delegationRecord
 	AppliedSequence uint64
 }
 
@@ -452,11 +453,17 @@ func (g *DataGuard) Release() {
 		return
 	}
 	g.once.Do(func() {
-		if g.record != nil {
+		if g.record != nil || len(g.records) != 0 {
 			c := g.coordinator
 			c.mu.Lock()
-			g.record.readers--
-			c.finishRetiredLocked(g.record)
+			if g.record != nil {
+				g.record.readers--
+				c.finishRetiredLocked(g.record)
+			}
+			for _, record := range g.records {
+				record.readers--
+				c.finishRetiredLocked(record)
+			}
 			c.signalLocked()
 			c.mu.Unlock()
 		}
@@ -467,9 +474,8 @@ func (g *DataGuard) Release() {
 }
 
 // DataConsumed covers READ, GETATTR, attribute-bearing LOOKUP/READDIR, FSYNC,
-// and COPY_FILE_RANGE source. Call separately for listing children; never hold
-// one guard while acquiring another (multi-identity storage ordering is the
-// handler's atomic MutationDependencies footprint). A holder's backing reads
+// and COPY_FILE_RANGE source. Use DataConsumedSet for a directory page; never
+// hold one guard while acquiring another. A holder's backing reads
 // bypass its own break and request queue: flushing can require these reads.
 func (c *CoherenceCoordinator) DataConsumed(ctx context.Context, token SubscriptionToken, identity [16]byte) (*DataGuard, error) {
 	if err := c.CheckSession(token); err != nil {

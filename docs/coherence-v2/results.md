@@ -439,3 +439,17 @@ number establishes an isolated kernel-to-daemon LOOKUP round trip below 20 us.
 The callback allocation regression has a direct before/after result: holder
 GETATTR was 13 allocations and is now zero; holder LOOKUP also has zero
 allocations. These unit measurements include physical reply settlement.
+
+## G2 READDIR page admission
+
+`BenchmarkReadPageAdmission256`, Apple M5 Max host, three 300 ms samples
+(`/tmp/cv2-g2-read-set-bench.log`):
+
+| 256-identity coordinator admission | Time per page | Bytes per page | Allocations | Request turns |
+| --- | ---: | ---: | ---: | ---: |
+| Former per-entry loop | 64.4–65.4 us | 92,160–92,166 | 1,792 | 256 |
+| Composite page guard | 19.0–19.2 us | 32,945 | 520 | 1 |
+
+This isolates coordinator work with no foreign delegation. It excludes storage,
+RPC and kernel time. The new guard also remains held through storage revalidation;
+the former loop did not provide that exclusion.
