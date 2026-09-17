@@ -1526,3 +1526,38 @@ or additional control polls. Concurrent truncating opens and the cold
 1,000-entry PLUS listing also pass twice
 (`/tmp/cv2-g2-close-mounted2.log`). That selected wrapper exits 70 because the
 other required tests were omitted. No full-gate claim is made here.
+
+### Part 2 item 0c: new-name absence from complete directories
+
+A successful MKDIR can establish an empty-directory proof at its physical reply.
+The daemon preserves that proof across its own CREATE/MKDIR only when the exact
+new positive binding also settles. Every extant member must remain in
+`cachedNames`; losing a member or discovering an untracked member invalidates
+completeness. Other local namespace mutations conservatively invalidate the
+proof through their source enumeration gate. Peer namespace/enumeration changes,
+cold subscription, teardown, and directory collection remove it as well.
+
+The proof consumes one name-capacity unit. Enumeration reservations make both
+new-child and preserved-parent candidates revocable before physical settlement.
+The existing source gate prevents serving an intermediate parent state. A new
+name absent from a complete directory returns a zero-validity negative reply
+locally, with both name and enumeration coordinates retained until physical
+write. The hit allocates nothing and issues no Authority RPC.
+
+Tests cover physical success/failure, zero allocations/RPCs, withdrawal waiting
+for an inferred absence reply, CREATE preservation, revoked candidates, peer
+and cold withdrawal, generic source mutation, capacity refusal, and member
+loss. All unprivileged fusev3 tests pass in Docker, with the device-only probe
+excluded and mounted tests self-skipping (`/tmp/cv2-g2-complete-suite.log`).
+Disabling completeness publication makes the physical-settlement regression
+fail (`/tmp/cv2-g2-complete-fault.log`). The required mounted new-directory test
+creates 1,000 names with zero LOOKUP RPCs in two runs. The existing root-directory
+amortization test also passes twice (`/tmp/cv2-g2-complete-mounted.log`); its
+filtered wrapper exits 70 for omitted inventory. Directory completeness learned
+from arbitrary READDIR snapshots is not implemented; preexisting unknown
+directories retain the ordinary lookup path.
+
+Independent read-only review found no false-absence or unbounded-bookkeeping
+path. The new-child regression also finalizes the MKDIR reply and proves its
+enumeration withdrawal waits for the physical write before refusing the proof
+(`/tmp/cv2-g2-complete-final.log`).

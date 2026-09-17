@@ -398,6 +398,9 @@ func (k kernelMount) abortKernelConnection() error {
 // notify or drain at recall or teardown.
 func (r *rawFileSystem) revokeCachedNames(_ time.Time) {
 	r.mu.Lock()
+	for identity := range r.completeDirectories {
+		r.dropCompleteDirectoryLocked(identity)
+	}
 	for key := range r.cachedNames {
 		r.dropCachedNameLocked(key)
 	}
@@ -499,6 +502,9 @@ func (r *rawFileSystem) revokeCachedData(deadline time.Time) []string {
 // has lost every resident page; that stock-kernel residual remains explicit.
 func (r *rawFileSystem) discardCachedOwnershipAfterConnectionGone() {
 	r.mu.Lock()
+	for identity := range r.completeDirectories {
+		r.dropCompleteDirectoryLocked(identity)
+	}
 	r.cachedNames = make(map[nameKey]*inodeRecord)
 	r.cachedStableNames = make(map[publicationNamespace]*inodeRecord)
 	r.cachedNameStable = make(map[nameKey]publicationNamespace)

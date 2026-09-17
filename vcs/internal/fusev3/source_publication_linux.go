@@ -68,6 +68,8 @@ type namespaceBounds struct {
 // Unresolved counts validate reply completion only; they never widen the cut
 // beyond the identities and names in coordinates.
 type sourcePublicationLease struct {
+	completeParent       publicationIdentity
+	completeProof        *directoryCompleteness
 	r                    *rawFileSystem
 	coordinates          map[publicationCoordinate]struct{}
 	names                map[publicationNamespace]namespaceBounds
@@ -564,6 +566,9 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 			delete(l.r.cachedAttrPayloads, coordinate.item)
 		}
 		if coordinate.kind == publicationItemEnumeration {
+			if coordinate.item != l.completeParent || l.r.completeDirectories[coordinate.item] != l.completeProof {
+				l.r.dropCompleteDirectoryLocked(coordinate.item)
+			}
 			for _, handle := range l.r.handles {
 				if handle != nil && handle.dir != nil && handle.inode != nil && handle.inode.identity == coordinate.item {
 					directories = append(directories, handle.dir)

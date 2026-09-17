@@ -327,3 +327,12 @@ assertion; the final runs issue 19 and 16 batches. Logs:
 
 The full 40,000-file install and Git baseline will be rerun after the remaining
 new-name LOOKUP optimization. These focused results do not replace it.
+
+### New-name lookup elimination (item 0c)
+
+The required mounted test creates 1,000 files beneath a newly created directory
+with zero LOOKUP RPCs in both repetitions (`/tmp/cv2-g2-complete-mounted.log`).
+This is 0 LOOKUP/file, compared with the 1.05 LOOKUP/file measured across the
+40,000-file/2,000-directory baseline before completeness caching. The different
+workload sizes are explicit; the full baseline below is the comparable result.
+Unknown preexisting directories still require an Authority lookup.

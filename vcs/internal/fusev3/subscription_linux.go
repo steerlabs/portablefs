@@ -1074,6 +1074,7 @@ func (r *rawFileSystem) invalidateCacheCoordinateContext(ctx context.Context, co
 	switch coordinate.kind {
 	case publicationNamespaceName:
 		r.mu.Lock()
+		r.dropCompleteDirectoryLocked(coordinate.parent)
 		parent := r.byIdentityLocked(coordinate.parent)
 		if parent == nil {
 			r.mu.Unlock()
@@ -1093,6 +1094,7 @@ func (r *rawFileSystem) invalidateCacheCoordinateContext(ctx context.Context, co
 		return nil
 	case publicationItemEnumeration:
 		r.mu.Lock()
+		r.dropCompleteDirectoryLocked(coordinate.item)
 		handles := make([]*dirHandle, 0)
 		for _, handle := range r.handles {
 			if handle != nil && handle.dir != nil && handle.inode != nil && handle.inode.identity == coordinate.item {
@@ -1159,6 +1161,9 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	// cold boundary.
 	r.mu.Lock()
 	coordinates := make(map[publicationCoordinate]struct{})
+	for identity := range r.completeDirectories {
+		coordinates[publicationCoordinate{kind: publicationItemEnumeration, item: identity}] = struct{}{}
+	}
 	for coordinate := range r.cacheReservations {
 		coordinates[coordinate] = struct{}{}
 	}
@@ -1220,6 +1225,9 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		if parent := r.directoryLocked(key.parent); parent != nil && !parent.reclaimed {
 			nameInvalidations = append(nameInvalidations, nameInvalidation{parent: parent.id, name: key.name})
 		}
+	}
+	for identity := range r.completeDirectories {
+		r.dropCompleteDirectoryLocked(identity)
 	}
 	for key := range r.cachedNames {
 		r.dropCachedNameLocked(key)

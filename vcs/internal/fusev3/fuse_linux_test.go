@@ -449,7 +449,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				struct {
 					item  *authoritypb.Item
 					roles uint32
-				}{f.root, postStateRoleParent}),
+				}{f.itemForTokenLocked(request.GetMkdir().GetParent()), postStateRoleParent}),
 		}, nil
 	case request.GetSymlink() != nil:
 		created := f.namedItem(request.GetSymlink().GetName())
@@ -477,7 +477,8 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 		}
 		return response, nil
 	case request.GetCreate() != nil:
-		created := cloneItem(f.item)
+		created := f.namedItem(request.GetCreate().GetName())
+		delete(f.missingNames, string(request.GetCreate().GetName()))
 		return &authoritypb.Response{
 			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: created, Handle: cloneBytes(f.handle)}},
 			PostState: exactTestPostState(2,
@@ -488,7 +489,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				struct {
 					item  *authoritypb.Item
 					roles uint32
-				}{f.root, postStateRoleParent}),
+				}{f.itemForTokenLocked(request.GetCreate().GetParent()), postStateRoleParent}),
 		}, nil
 	case request.GetRead() != nil:
 		offset := int(request.GetRead().GetOffset())

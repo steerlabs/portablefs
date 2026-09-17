@@ -65,6 +65,15 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	}
 	now := time.Now()
 	nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: name}
+	if record == nil {
+		if proof := r.completeDirectories[parent.identity]; proof != nil && proof.valid {
+			enumeration := publicationCoordinate{kind: publicationItemEnumeration, item: parent.identity}
+			if r.cachedCoordinateAllowedLocked(nameCoordinate, proof.stamp, now) && r.cachedCoordinateAllowedLocked(enumeration, proof.stamp, now) && r.registerCachedReplyLocked(unique, nameCoordinate, enumeration, 2) {
+				*out = fuse.EntryOut{}
+				return true
+			}
+		}
+	}
 	stamp := r.cachedNameStamps[key]
 	negativeName, negative := r.cachedNegatives[key]
 	if negative {

@@ -693,3 +693,20 @@ func TestReadDirPlusColdListingAvoidsLookupRPCs(t *testing.T) {
 	}
 	t.Logf("PORTABLEFS_PLUS_1000 lookup=%d readdir=%d", lookups, pages)
 }
+
+func TestNewDirectoryInstallAvoidsLookupRPCs(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	if err := os.Mkdir(f.join(0, "new-install"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	before := f.counter.count("lookup")
+	for i := 0; i < 1000; i++ {
+		if err := os.WriteFile(f.join(0, "new-install", fmt.Sprintf("file-%04d", i)), []byte("payload"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lookups := f.counter.count("lookup") - before; lookups != 0 {
+		t.Fatalf("1000 new names issued %d LOOKUP RPCs", lookups)
+	}
+	t.Log("PORTABLEFS_NEW_INSTALL_1000 lookup=0")
+}

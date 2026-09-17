@@ -61,6 +61,11 @@ func publicationInstallsCoordinate(publication *replyPublication, coordinate pub
 			return true
 		}
 	}
+	for _, candidate := range publication.completeDirectories[:publication.completeDirectoryCount] {
+		if coordinate == (publicationCoordinate{kind: publicationItemEnumeration, item: candidate.identity}) {
+			return true
+		}
+	}
 	for _, name := range publication.names {
 		if name.coordinate == coordinate {
 			return true
