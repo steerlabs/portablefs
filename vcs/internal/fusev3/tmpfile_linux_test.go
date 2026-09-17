@@ -35,6 +35,7 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 		Mode:     0o640,
 	}
 	out := &fuse.CreateOut{}
+	notifications := len(fixture.notify.snapshot())
 	if status := fixture.raw.Tmpfile(nil, in, "/", out); !status.Ok() {
 		t.Fatalf("shared TMPFILE = %v", status)
 	}
@@ -54,6 +55,14 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 		out.OpenFlags != fuse.FOPEN_DIRECT_IO || out.EntryTimeout() != 0 {
 		t.Fatalf("shared TMPFILE output = %+v", out)
 	}
+	if got := len(fixture.notify.snapshot()); got != notifications {
+		t.Fatalf("direct-I/O TMPFILE attempted own-cache notification: %d -> %d", notifications, got)
+	}
+	handleRecord, handle := fixture.raw.acquireFileHandle(out.Fh)
+	if handle == nil || handle.buffered {
+		t.Fatalf("TMPFILE handle buffered=%t", handle != nil && handle.buffered)
+	}
+	fixture.raw.releaseHandleOperation(handleRecord)
 	completeTestReply(t, fixture.raw, unique, fuse.OK)
 	if fixture.mount.isRevoked() {
 		t.Fatalf("valid shared TMPFILE revoked mount: %v", fixture.mount.fatalError())

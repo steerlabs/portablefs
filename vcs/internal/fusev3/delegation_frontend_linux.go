@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"syscall"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
@@ -204,7 +205,16 @@ func (n *node) invalidateOwnData(ctx context.Context, offset, length int64) erro
 	if offset >= 0 && length > 0 {
 		byteRange = &authoritypb.ByteRange{Offset: uint64(offset), Length: uint64(length)}
 	}
-	if err := r.invalidateCacheCoordinateContext(ctx, coordinate, byteRange); err != nil {
+	budget := n.mount.subscription.config.repairLead
+	if budget <= 0 {
+		budget = time.Second
+	}
+	repairCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	deadline := n.mount.subscription.config.clock.Now().Add(budget)
+	if err := n.mount.subscription.retry(repairCtx, deadline, func() error {
+		return r.invalidateCacheCoordinateContext(repairCtx, coordinate, byteRange)
+	}); err != nil {
 		r.markIdentityStale(identity)
 		return err
 	}

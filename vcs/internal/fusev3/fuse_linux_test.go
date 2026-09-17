@@ -394,10 +394,19 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 				result.GetOpen().Delegation = testDelegation()
 			}
 		}
-		if request.GetCreate() != nil && result.GetCreate() != nil && request.GetCreate().GetWriteIntent() {
-			result.GetCreate().Delegation = testDelegation()
+		if request.GetCreate() != nil && result.GetCreate() != nil {
+			result.GetCreate().CacheCapable = request.GetCreate().GetCacheCapable()
+			if request.GetCreate().GetWriteIntent() {
+				result.GetCreate().Delegation = testDelegation()
+			}
 		}
 	}()
+	if wait := request.GetWaitVisibility(); wait != nil {
+		cut := wait.GetCutSequence()
+		return &authoritypb.Response{VisibleSequence: cut, Body: &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{
+			AppliedSequence: cut, VisibleSequence: cut,
+		}}}, nil
+	}
 	if f.replyOverride != nil {
 		return f.replyOverride(request)
 	}

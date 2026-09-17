@@ -2693,7 +2693,6 @@ func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 	if handle.buffered {
 		if err := record.drainOwnWrites(ctx); err != nil {
 			r.discardUnpublishedFileHandle(ctx, id, record, false)
-			r.mount.revoke(err)
 			return fuse.EIO
 		}
 	}
@@ -2958,8 +2957,19 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 	}
 	if handle.buffered {
 		if err := record.drainOwnWrites(ctx); err != nil {
+			lease := sourceLeaseFromContext(ctx)
+			if lease != nil {
+				attachErr := lease.attachBinding(ctx, publicationNamespace{parent: parent.identity, name: name}, record.identity)
+				if attachErr == nil {
+					attachErr = completeSourcePublication(ctx)
+				}
+				if attachErr != nil {
+					r.discardUnpublishedFileHandle(ctx, id, record, true)
+					r.mount.revoke(attachErr)
+					return fuse.Status(syscall.ENOTCONN)
+				}
+			}
 			r.discardUnpublishedFileHandle(ctx, id, record, true)
-			r.mount.revoke(err)
 			return fuse.EIO
 		}
 	}
@@ -3047,8 +3057,12 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 	}
 	if handle.buffered {
 		if err := record.drainOwnWrites(ctx); err != nil {
+			if completionErr := completeSourcePublication(ctx); completionErr != nil {
+				r.discardUnpublishedFileHandle(ctx, id, record, true)
+				r.mount.revoke(completionErr)
+				return fuse.Status(syscall.ENOTCONN)
+			}
 			r.discardUnpublishedFileHandle(ctx, id, record, true)
-			r.mount.revoke(err)
 			return fuse.EIO
 		}
 	}

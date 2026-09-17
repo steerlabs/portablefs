@@ -5,10 +5,12 @@ package fusev3
 import (
 	"context"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
@@ -175,34 +177,121 @@ func TestOwnReadHandleCountIncludesClosingInFlightRead(t *testing.T) {
 	}
 }
 
-func TestOwnCacheOpenDrainFailureDischargesUnpublishedHandle(t *testing.T) {
-	f := newStrictFixture(t)
-	record, inode := ownCacheRecord(t, f)
+func preparePendingOwnCacheWrite(t *testing.T, record *inodeRecord) {
+	t.Helper()
 	record.readCache.addReader()
 	record.readCache.removeReader()
 	if err := record.acceptOwnWrite(context.Background(), 0, 4); err != nil {
 		t.Fatal(err)
 	}
-	f.raw.mu.Lock()
-	pins, handles := record.pins, len(f.raw.handles)
-	f.raw.mu.Unlock()
+}
+
+func TestOwnCachePublicationFailureIsInodeLocal(t *testing.T) {
+	for _, operation := range []string{"open", "create"} {
+		for _, persistent := range []bool{false, true} {
+			name := "transient"
+			if persistent {
+				name = "persistent"
+			}
+			t.Run(operation+"/"+name, func(t *testing.T) {
+				f := newStrictFixture(t)
+				f.rpc.mu.Lock()
+				f.rpc.byName = map[string]*authoritypb.Item{
+					"file":  cloneItem(f.rpc.item),
+					"other": testItem(92, authoritypb.Attr_REGULAR, 92),
+				}
+				f.rpc.mu.Unlock()
+				record, inode := ownCacheRecord(t, f)
+				preparePendingOwnCacheWrite(t, record)
+				f.raw.mu.Lock()
+				pins, handles := record.pins, len(f.raw.handles)
+				f.raw.mu.Unlock()
+				loss := f.mount.delegations.LossSequence()
+				f.mount.subscription.config.repairLead = 30 * time.Millisecond
+				f.mount.subscription.config.retryDelay = 2 * time.Millisecond
+
+				attempts := 0
+				f.notify.mu.Lock()
+				f.notify.onInode = func(_ uint64, _, _ int64) {
+					f.notify.mu.Lock()
+					defer f.notify.mu.Unlock()
+					attempts++
+					f.notify.inodeST = fuse.OK
+					if persistent || attempts == 1 {
+						f.notify.inodeST = fuse.EIO
+					}
+				}
+				f.notify.mu.Unlock()
+
+				status := f.rawCall(func(unique uint64) fuse.Status {
+					switch operation {
+					case "open":
+						return f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: inode}}, &fuse.OpenOut{})
+					case "create":
+						return f.raw.Create(nil, &fuse.CreateIn{InHeader: fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, Flags: uint32(syscall.O_CREAT | syscall.O_RDONLY), Mode: 0o600}, "file", &fuse.CreateOut{})
+					default:
+						panic("unknown operation")
+					}
+				})
+				if persistent {
+					if status != fuse.EIO || attempts < 2 || !record.stale.Load() {
+						t.Fatalf("persistent %s = %v attempts=%d stale=%t", operation, status, attempts, record.stale.Load())
+					}
+					f.raw.mu.Lock()
+					if record.pins != pins || len(f.raw.handles) != handles {
+						t.Fatalf("unpublished handle leaked: pins %d/%d handles %d/%d", record.pins, pins, len(f.raw.handles), handles)
+					}
+					f.raw.mu.Unlock()
+				} else if status != fuse.OK || attempts != 2 || record.stale.Load() {
+					t.Fatalf("transient %s = %v attempts=%d stale=%t", operation, status, attempts, record.stale.Load())
+				}
+				if f.mount.isRevoked() {
+					t.Fatalf("%s notification failure revoked mount: %v", operation, f.mount.fatalError())
+				}
+				if got := f.mount.delegations.LossSequence(); got != loss {
+					t.Fatalf("%s discarded no buffered entry but advanced loss %d -> %d", operation, loss, got)
+				}
+
+				other := f.lookup(t, fuse.FUSE_ROOT_ID, "other")
+				if out := f.openForData(t, other.NodeId); out.Fh == 0 {
+					t.Fatal("unrelated file did not remain usable")
+				}
+			})
+		}
+	}
+}
+
+func TestOwnCacheWriteFailureReportsDiscardedBuffer(t *testing.T) {
+	f := newStrictFixture(t)
+	record, inode := ownCacheRecord(t, f)
+	record.readCache.addReader()
+	writer := openV7Writer(t, f, inode)
+	f.mount.subscription.config.repairLead = 30 * time.Millisecond
+	f.mount.subscription.config.retryDelay = 2 * time.Millisecond
 	f.notify.mu.Lock()
 	f.notify.inodeST = fuse.EIO
 	f.notify.mu.Unlock()
-	out := &fuse.OpenOut{}
-	if status := f.rawCall(func(unique uint64) fuse.Status {
-		return f.raw.Open(nil, &fuse.OpenIn{InHeader: fuse.InHeader{Unique: unique, NodeId: inode}}, out)
-	}); status != fuse.EIO {
-		t.Fatalf("refused cached OPEN=%v", status)
+	var reports []writeback.DropReport
+	f.mount.delegations.SetDropReporter(func(report writeback.DropReport) {
+		reports = append(reports, report)
+	})
+	loss := f.mount.delegations.LossSequence()
+	status := f.rawCall(func(unique uint64) fuse.Status {
+		_, status := f.raw.Write(nil, &fuse.WriteIn{
+			InHeader: fuse.InHeader{Unique: unique, NodeId: inode},
+			Fh:       writer.Fh,
+			Size:     4,
+			Flags:    uint32(syscall.O_RDWR),
+		}, []byte("lost"))
+		return status
+	})
+	if status != fuse.EIO || f.mount.isRevoked() || !record.stale.Load() {
+		t.Fatalf("failed write = %v revoked=%t stale=%t", status, f.mount.isRevoked(), record.stale.Load())
 	}
-	f.raw.mu.Lock()
-	defer f.raw.mu.Unlock()
-	if record.pins != pins || len(f.raw.handles) != handles {
-		t.Fatalf("unpublished handle leaked: pins %d/%d handles %d/%d", record.pins, pins, len(f.raw.handles), handles)
+	if got := f.mount.delegations.LossSequence(); got <= loss {
+		t.Fatalf("discarded buffer did not advance loss: %d -> %d", loss, got)
 	}
-	record.readCache.mu.Lock()
-	defer record.readCache.mu.Unlock()
-	if record.readCache.readers != 0 {
-		t.Fatalf("unpublished reader retained: %d", record.readCache.readers)
+	if len(reports) != 1 || reports[0].Entries == 0 || reports[0].LossSequence <= loss {
+		t.Fatalf("discarded buffer reports = %+v", reports)
 	}
 }

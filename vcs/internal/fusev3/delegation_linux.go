@@ -541,10 +541,11 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
 		return writeback.Cut{}, err
 	}
+	lockedState := s
 	operationLocked := true
 	defer func() {
 		if operationLocked {
-			s.operation.Unlock()
+			lockedState.operation.Unlock()
 		}
 	}()
 	s, b, mode, err := m.modeAndBuffer(id)
@@ -581,7 +582,7 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 		return cut, err
 	}
 	if syncWrite || mode == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH {
-		s.operation.Unlock()
+		lockedState.operation.Unlock()
 		operationLocked = false
 		m.frontend.RUnlock()
 		frontendLocked = false
@@ -627,10 +628,11 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
 		return writeback.Cut{}, err
 	}
+	lockedState := s
 	operationLocked := true
 	defer func() {
 		if operationLocked {
-			s.operation.Unlock()
+			lockedState.operation.Unlock()
 		}
 	}()
 	s, b, mode, err := m.modeAndBuffer(id)
@@ -654,7 +656,7 @@ func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, 
 			var applied uint64
 			applied, err = b.FlushIdentity(ctx, id, cut)
 			if err == nil {
-				s.operation.Unlock()
+				lockedState.operation.Unlock()
 				operationLocked = false
 				m.frontend.RUnlock()
 				frontendLocked = false
@@ -1181,10 +1183,11 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
 		return nil, err
 	}
+	lockedState := s
 	operationLocked := true
 	defer func() {
 		if operationLocked {
-			s.operation.Unlock()
+			lockedState.operation.Unlock()
 		}
 	}()
 	s.admission.RLock()
@@ -1249,7 +1252,7 @@ func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, ca
 	m.updateBaseFromResponse(s, response)
 	if response.GetAppliedSequence() != 0 {
 		cut := m.buf.Snapshot()
-		s.operation.Unlock()
+		lockedState.operation.Unlock()
 		operationLocked = false
 		m.frontend.RUnlock()
 		frontendLocked = false
