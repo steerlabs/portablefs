@@ -122,8 +122,9 @@ A mount-root OPENDIR records the mount loss sequence. FSYNCDIR on that exact
 handle flushes a Buffer cut, sends Barrier with the Authority application ticket,
 and waits for its durable prefix. Clean detach also performs a bounded barrier
 before stopping the buffer when retained entries or non-durable tickets remain.
-FSYNCDIR returns EIO if the barrier fails or loss
-advanced since OPENDIR. FUSE_SYNCFS is not the completion mechanism.
+FSYNCDIR returns EIO if the barrier fails or a generic loss advanced since
+OPENDIR. A definite pre-apply capacity loss retains its original ENOSPC,
+EDQUOT, or EFBIG instead. FUSE_SYNCFS is not the completion mechanism.
 
 ## Epoch replacement
 
