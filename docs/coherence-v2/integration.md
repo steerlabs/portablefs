@@ -1283,3 +1283,14 @@ client.md now names G's successful integrated gates instead of its superseded
 lease-activation failure. Focused subscription, revocation, and withdrawal tests
 pass in the pinned Docker image (`/tmp/cv2-g2-c11.log`). These are targeted checks;
 the final full gate remains required after the performance changes.
+
+### C2 follow-up: unit fixtures cross the real cold-subscribe boundary
+
+The broader Linux suite exposed four fixtures which bypassed production's
+initial or replacement cold subscription and therefore correctly received EIO
+from C2's new namespace fence. The graft fixture now subscribes after creating
+its raw frontend. The direct epoch-recovery test performs the subscription
+runner's replacement subscribe explicitly. Old-handle rejection and routing
+assertions are unchanged. The unprivileged Docker fusev3 suite passes after
+these corrections, excluding only the FUSE-device probe; mounted tests retain
+their existing environment skips (`/tmp/cv2-g2-cache-suite2.log`).

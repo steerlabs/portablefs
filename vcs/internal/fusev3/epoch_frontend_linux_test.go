@@ -78,6 +78,11 @@ func TestEpochRecoveryStalesOldHandlesAndAdmitsNewOpens(t *testing.T) {
 	if err := mount.recoverEpoch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	// Production's subscription runner performs this cold boundary after
+	// recoverEpoch resumes it. This fixture drives that runner step directly.
+	if err := mount.subscription.subscribe(context.Background()); err != nil {
+		t.Fatalf("cold-subscribe replacement epoch: %v", err)
+	}
 	if got := mount.delegations.LossSequence(); got <= lossBefore {
 		t.Fatalf("loss sequence after dirty epoch change = %d, want greater than %d", got, lossBefore)
 	}
