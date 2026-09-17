@@ -336,3 +336,56 @@ This is 0 LOOKUP/file, compared with the 1.05 LOOKUP/file measured across the
 40,000-file/2,000-directory baseline before completeness caching. The different
 workload sizes are explicit; the full baseline below is the comparable result.
 Unknown preexisting directories still require an Authority lookup.
+
+### Baseline after items 0–4 (amended kernel-cache policy)
+
+Measured `7ca2d25`, Linux `6.8.0-100-generic`, with
+`PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' bash scripts/xfs-fuse-integration.sh`.
+All baseline subtests passed in 182.20 seconds. The wrapper exits 70 because
+this focused invocation omits the required full-gate inventory; it is not a
+full gate pass. Log: `/tmp/cv2-g2-baseline-0-4-plain.log`. Another Docker soak
+workload was active on the same VM. A preceding profile-enabled attempt failed
+in the second direct-XFS install with ENOSPC before PortableFS ran; the unchanged
+plain rerun passed. No cause is established and no profile was captured.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---|---:|---:|---:|---:|
+| install, 1 worker(s) | direct-xfs | 0.574807 | 0 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.429848 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 34.664636 | 84,043 | 2.001024 | 1.976143 |
+| install, 8 worker(s) | portablefs | 15.408795 | 82,976 | 1.975619 | 1.964333 |
+| git-status-cold | direct-xfs | 0.011487 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.011241 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 2.355368 | 40,628 | 2.031400 | 1.026050 |
+| git-status-warm | portablefs | 1.667565 | 20,471 | 1.023550 | 0.018150 |
+| two-mount-write-list-read | direct-xfs | 0.046432 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 5.722640 | 97,405 | 24.351250 | 3.154750 |
+
+| Install opcode | 1 worker requests | Requests/file | 8 workers requests | Requests/file |
+|---|---:|---:|---:|---:|
+| barrier | 35 | 0.000875 | 16 | 0.000400 |
+| change_ack | 0 | 0.000000 | 0 | 0.000000 |
+| close | 2 | 0.000050 | 2 | 0.000050 |
+| close_batch | 994 | 0.024850 | 313 | 0.007825 |
+| create | 40,000 | 1.000000 | 40,000 | 1.000000 |
+| delegation_release | 994 | 0.024850 | 313 | 0.007825 |
+| flush | 0 | 0.000000 | 0 | 0.000000 |
+| get_attr | 0 | 0.000000 | 47 | 0.001175 |
+| keep_alive | 5 | 0.000125 | 2 | 0.000050 |
+| lookup | 0 | 0.000000 | 138 | 0.003450 |
+| mkdir | 2,000 | 0.050000 | 2,000 | 0.050000 |
+| next_control_event | 0 | 0.000000 | 0 | 0.000000 |
+| open | 1 | 0.000025 | 1 | 0.000025 |
+| read_dir | 1 | 0.000025 | 1 | 0.000025 |
+| reclaim | 0 | 0.000000 | 138 | 0.003450 |
+| renew_subscription | 11 | 0.000275 | 5 | 0.000125 |
+| write | 40,000 | 1.000000 | 40,000 | 1.000000 |
+
+Compared with the preceding intermediate run, install time falls from
+277.050 to 34.665 seconds (one worker) and 274.056 to 15.409 seconds (eight).
+The one-worker path reaches one CREATE plus one background WRITE per file,
+with directory creation and close/release batches amortized. The eight-worker
+run retains 138 LOOKUPs and 47 GETATTRs. Cold Git still performs 20,140 LOOKUPs;
+warm Git performs two. Both Git runs issue 20,105 RECLAIMs. The peer workload
+now passes but still issues 73,709 RECLAIMs, 4,491 change ACKs and 5,467 control
+polls; its request count remains an optimization target.

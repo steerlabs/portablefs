@@ -1561,3 +1561,13 @@ Independent read-only review found no false-absence or unbounded-bookkeeping
 path. The new-child regression also finalizes the MKDIR reply and proves its
 enumeration withdrawal waits for the physical write before refusing the proof
 (`/tmp/cv2-g2-complete-final.log`).
+
+#### G2 intermediate baseline after items 0–4
+
+All baseline workloads at `7ca2d25` pass (182.20 seconds); focused wrapper
+exit 70 reflects omitted full-gate tests. The 40,000-file install measures
+34.665 seconds / 2.001024 requests per operation with one worker, and
+15.409 seconds / 1.975619 with eight. One worker has zero LOOKUP, FLUSH,
+change ACK and additional control poll RPCs. Full opcode tables, direct-XFS
+controls, Git results, peer results and the preceding direct-XFS ENOSPC
+attempt are recorded in results.md. No full-gate claim is made.
