@@ -89,7 +89,7 @@ type delegationManager struct {
 
 	epoch    sync.RWMutex
 	frontend sync.RWMutex
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	buf      *writeback.Buffer
 	byID     map[writeback.Identity]*delegationState
 	// identityLoss retains the latest loss ticket after an epoch-scoped Buffer
@@ -212,8 +212,8 @@ func (m *delegationManager) state(id writeback.Identity) *delegationState {
 }
 
 func (m *delegationManager) lookupState(id writeback.Identity) *delegationState {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.byID[id]
 }
 
@@ -651,9 +651,9 @@ func (m *delegationManager) IdentityLoss(identity []byte) uint64 {
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	current := m.buf.IdentityLoss(id)
-	m.mu.Lock()
+	m.mu.RLock()
 	historical := m.identityLoss[id]
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	return max(current, historical)
 }
 
@@ -665,9 +665,9 @@ func (m *delegationManager) IdentityFailure(identity []byte, observed uint64) (u
 	m.epoch.RLock()
 	defer m.epoch.RUnlock()
 	loss, errno := m.buf.IdentityFailure(id, observed)
-	m.mu.Lock()
+	m.mu.RLock()
 	historical := m.identityLoss[id]
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	if historical > loss {
 		return historical, 0
 	}

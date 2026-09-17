@@ -518,3 +518,18 @@ that benchmark were too noisy and are excluded. Logs:
 `/tmp/cv2-g2-sequencer-before.log`, `sequencer-after.log`,
 `disjoint-before.log`, `disjoint-after.log` (same prefix). These are coordinator
 CPU measurements, not RPC or mounted-workload timings.
+
+## G2 shared registry reads
+
+`BenchmarkPhysicalReplyRegistryRead`, Linux arm64 shared Docker VM, four workers,
+median of three 500 ms samples:
+
+| Read-only reply tracking | Time per lookup | Allocations |
+| --- | ---: | ---: |
+| Exclusive registry mutex | 42.75 ns | 0 |
+| Shared registry lock | 22.64 ns | 0 |
+
+Logs: `/tmp/cv2-g2-registry-bench-before.log` and `registry-bench-after.log`.
+The benchmark contains only readers; real callbacks also acquire exclusive
+publication and reference-accounting cuts. No mounted throughput claim follows
+from this isolated read-lock result.

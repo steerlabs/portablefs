@@ -2059,3 +2059,21 @@ suite passes (`/tmp/cv2-g2-sequencer-race2.log`); independent read-only review r
 the existing fairness/expansion cases 20 times without failure. The full Linux
 Authority suite passes (`/tmp/cv2-g2-sequencer-rpc.log`). Queue-size and disjoint
 measurements, including the single-key bookkeeping tradeoff, are in results.md.
+
+#### G2 item 8 registry read concurrency
+
+Raw binding observation, physical reply tracking, lifecycle readiness and cache
+obligation inspection use shared registry locking. Delegation state and retained
+loss lookup also use shared locking. Reply registration, cache installation,
+reference accounting and physical settlement still mutate state and retain the
+exclusive cut. This preserves the withdrawal proof while allowing independent
+read-only observations to overlap.
+
+The overlap test fails with the former exclusive registry
+(`/tmp/cv2-g2-registry-fault.log`). Five focused repetitions, the full unprivileged
+Linux FUSE suite and three Linux race repetitions pass (`registry-read.log`,
+`registry-root.log`, `registry-race.log`, all under `/tmp/cv2-g2-`). Existing
+FULL-holder LOOKUP/GETATTR zero-allocation and zero-RPC assertions remain green.
+The four-worker read-only registry microbenchmark median is 42.75 ns before and
+22.64 ns after, both zero allocations (three 500 ms samples on the shared VM).
+This is a registry microbenchmark, not a mounted latency result.

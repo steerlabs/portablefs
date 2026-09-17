@@ -403,7 +403,7 @@ type rawFileSystem struct {
 	grafts  *localdirs.Grafts
 	backing string
 
-	mu              sync.Mutex
+	mu              sync.RWMutex
 	nextNodeID      uint64
 	nodesByID       map[uint64]*inodeRecord
 	nodesByIdentity map[publicationIdentity]*inodeRecord
@@ -832,8 +832,8 @@ func (r *rawFileSystem) admitNegativeNameLocked(ctx context.Context, parent *ino
 // obligation directly rather than inferring it from a notification the
 // withdrawal happens to emit.
 func (r *rawFileSystem) cachedDataHolds(inode uint64) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.cachedData[inode] != nil
 }
 
@@ -1568,8 +1568,8 @@ func (r *rawFileSystem) byIdentityLocked(identity publicationIdentity) *inodeRec
 // ReplyWriteTracked joins cache/source-bearing replies to go-fuse's physical
 // write lifecycle.
 func (r *rawFileSystem) ReplyWriteTracked(unique uint64) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if r.replyTerminal || r.replyTerminalizing {
 		return false
 	}
@@ -1839,8 +1839,8 @@ func (r *rawFileSystem) Init(server *fuse.Server) {
 }
 
 func (r *rawFileSystem) replyLifecycleReady() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.replyLifecycleArmed
 }
 
