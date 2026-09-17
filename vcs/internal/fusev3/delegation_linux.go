@@ -92,6 +92,9 @@ type delegationManager struct {
 	mu       sync.RWMutex
 	buf      *writeback.Buffer
 	byID     map[writeback.Identity]*delegationState
+	// stateIndex mirrors creation and both epoch resets of byID. Shared cache
+	// admission must not miss merely because another identity is being created.
+	stateIndex sync.Map // writeback.Identity -> *delegationState
 	// identityLoss retains the latest loss ticket after an epoch-scoped Buffer
 	// is replaced. Existing handles compare against it once; newly registered
 	// handles start at the retained value.
@@ -210,6 +213,7 @@ func (m *delegationManager) state(id writeback.Identity) *delegationState {
 	if s == nil {
 		s = &delegationState{grantChanged: make(chan struct{}), identity: id, handles: make(map[string][]byte), writers: make(map[string][]byte), bindings: make(map[uint64]delegationBinding)}
 		m.byID[id] = s
+		m.stateIndex.Store(id, s)
 	}
 	return s
 }
@@ -273,14 +277,14 @@ func (m *delegationManager) sharedCacheAllowed(identity []byte) bool {
 		return false
 	}
 	defer m.epoch.RUnlock()
-	if m.incarnation() == 0 || !m.mu.TryRLock() {
+	if m.incarnation() == 0 {
 		return false
 	}
-	s := m.byID[id]
-	m.mu.RUnlock()
-	if s == nil {
+	value, present := m.stateIndex.Load(id)
+	if !present {
 		return true
 	}
+	s := value.(*delegationState)
 	if !s.admission.TryRLock() {
 		return false
 	}
@@ -1977,6 +1981,7 @@ func (m *delegationManager) EpochChanged(reason string) {
 	}
 	loss := old.LossSequence()
 	m.byID = make(map[writeback.Identity]*delegationState)
+	m.stateIndex.Clear()
 	m.mu.Unlock()
 	old.Stop()
 	// An in-flight old-buffer callback may have looked up its state after the
@@ -1984,6 +1989,7 @@ func (m *delegationManager) EpochChanged(reason string) {
 	// only after every old callback is gone.
 	m.mu.Lock()
 	m.byID = make(map[writeback.Identity]*delegationState)
+	m.stateIndex.Clear()
 	m.mu.Unlock()
 	m.tokenMu.Lock()
 	m.tokens = make(map[uint64]delegationFlushProgress)

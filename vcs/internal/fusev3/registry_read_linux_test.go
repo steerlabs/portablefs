@@ -18,8 +18,8 @@ type registryReadLocker interface {
 func TestRegistryReadersCanOverlap(t *testing.T) {
 	r := &rawFileSystem{replyLifecycleArmed: true, replyPublications: map[uint64]*replyPublication{1: {}}}
 	id := writeback.Identity{1}
-	s := &delegationState{}
-	m := &delegationManager{byID: map[writeback.Identity]*delegationState{id: s}, identityLoss: map[writeback.Identity]uint64{id: 7}}
+	m := &delegationManager{byID: make(map[writeback.Identity]*delegationState), identityLoss: map[writeback.Identity]uint64{id: 7}}
+	s := m.state(id)
 	var err error
 	m.buf, err = writeback.New(m, writeback.Options{MaxEntries: 1})
 	if err != nil {

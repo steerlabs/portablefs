@@ -86,9 +86,9 @@ func TestSharedCacheOwnershipRequiresKnownUnownedIdentity(t *testing.T) {
 			identity := id[:]
 			switch kind {
 			case "retired":
-				m.byID[id] = &delegationState{}
+				_ = m.state(id)
 			case "owned":
-				m.byID[id] = &delegationState{ref: &authoritypb.DelegationRef{}}
+				m.state(id).ref = &authoritypb.DelegationRef{}
 			case "inactive":
 				m.SetIncarnation(0)
 			case "invalid":
@@ -101,5 +101,60 @@ func TestSharedCacheOwnershipRequiresKnownUnownedIdentity(t *testing.T) {
 				t.Fatalf("allowed=%v want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestSharedCacheAdmissionSurvivesUnrelatedRegistryWriter(t *testing.T) {
+	for _, kind := range []string{"absent", "retired", "owned"} {
+		t.Run(kind, func(t *testing.T) {
+			m := newDelegationTestManager(t, &delegationFakeRPC{})
+			id := writeback.Identity{31}
+			if kind != "absent" {
+				s := m.state(id)
+				if kind == "owned" {
+					s.ref = &authoritypb.DelegationRef{}
+				}
+			}
+			m.mu.Lock()
+			done := make(chan bool, 1)
+			go func() { done <- m.sharedCacheAllowed(id[:]) }()
+			select {
+			case allowed := <-done:
+				m.mu.Unlock()
+				if allowed != (kind != "owned") {
+					t.Fatalf("unrelated registry writer changed ownership admission: allowed=%v", allowed)
+				}
+			case <-time.After(time.Second):
+				m.mu.Unlock()
+				<-done
+				t.Fatal("ownership observation waited for unrelated registry writer")
+			}
+		})
+	}
+}
+
+func TestSharedCacheStateIndexClearsOnEpochReplacement(t *testing.T) {
+	m := newDelegationTestManager(t, &delegationFakeRPC{})
+	id := writeback.Identity{32}
+	old := m.state(id)
+	if value, ok := m.stateIndex.Load(id); !ok || value != old {
+		t.Fatal("state was not indexed before publication")
+	}
+	m.EpochChanged("index epoch test")
+	if _, ok := m.stateIndex.Load(id); ok {
+		t.Fatal("old epoch state remains indexed")
+	}
+	if m.lookupState(id) != nil {
+		t.Fatal("old epoch remains in canonical registry")
+	}
+	current := m.state(id)
+	if current == old {
+		t.Fatal("epoch reused old state")
+	}
+	if value, ok := m.stateIndex.Load(id); !ok || value != current {
+		t.Fatal("new epoch index is inconsistent")
+	}
+	if allocations := testing.AllocsPerRun(1000, func() { _ = m.sharedCacheAllowed(id[:]) }); allocations != 0 {
+		t.Fatalf("indexed ownership allocated %g times", allocations)
 	}
 }

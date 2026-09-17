@@ -2157,3 +2157,25 @@ The harness now includes session/frontend health on workload or barrier failure.
 All three diagnostic eight-worker profile repetitions pass
 (`/tmp/cv2-g2-install8-diagnostic.log`). This does not establish the aborted run's
 cause; complete profiling and gate qualification continue below.
+
+#### G2 remove contention-induced ownership misses
+
+The complete profile rerun passes all baseline workloads in 113.07 seconds
+(`/tmp/cv2-g2-final-profile3.log`), including fresh Git add/commit and the root
+barrier. The nonblocking ownership check nevertheless introduced 3,649 LOOKUPs
+and 1,084 GETATTRs in the eight-worker install: unrelated state creation could
+make the shared-cache predicate refuse the manager registry lock.
+
+A separate concurrent state index now mirrors the sole state-creation site and
+both epoch resets. Publication occurs before the new state can receive a grant;
+an epoch reader protects a loaded pointer. Cache admission avoids the manager
+lock entirely while retaining nonblocking epoch/admission checks. The second
+index clear follows old-buffer callback shutdown, just like the canonical map.
+This preserves the deadlock fix without turning unrelated creation into a miss.
+
+The absent/retired-identity contention regression fails with the former predicate
+(`/tmp/cv2-g2-state-index-fault.log`). Ten focused repetitions and five Linux race
+repetitions pass (`/tmp/cv2-g2-state-index.log`, `state-index-race.log`). Tests also
+prove epoch pointer replacement and zero allocations per indexed ownership check.
+The full gate at `50b44bb` was green (`/tmp/cv2-g2-final-full3.log`); it is being
+repeated with this final index change.
