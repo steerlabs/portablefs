@@ -79,6 +79,10 @@ func (r *rawFileSystem) writeStock(input *fuse.WriteIn, data []byte) (uint32, fu
 			}
 			return 0, fuse.Status(delegationErrno(err))
 		}
+		if err := handleRecord.inode.acceptOwnWrite(ctx, int64(placement.position), int64(len(data))); err != nil {
+			_ = r.mount.delegations.DropIdentity(identity, "holder kernel range invalidation failed")
+			return 0, fuse.EIO
+		}
 		if err := completeSourcePublication(ctx); err != nil {
 			_ = r.mount.delegations.DropIdentity(identity, "holder kernel range invalidation failed")
 			return 0, fuse.EIO

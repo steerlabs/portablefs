@@ -389,3 +389,13 @@ run retains 138 LOOKUPs and 47 GETATTRs. Cold Git still performs 20,140 LOOKUPs;
 warm Git performs two. Both Git runs issue 20,105 RECLAIMs. The peer workload
 now passes but still issues 73,709 RECLAIMs, 4,491 change ACKs and 5,467 control
 polls; its request count remains an optimization target.
+
+### Reader-aware write invalidation (item 5)
+
+A deterministic 100-write daemon test compares the previous unconditional
+path with the new never-cached-inode path: InodeNotify calls fall from 100 to
+zero; the new invalidation fast path allocates zero objects per write. With a
+previously closed cached reader, three disjoint writes produce zero immediate
+notifications and one merged range at the flush/reopen boundary. Live-reader
+writes retain a synchronous notify before successful return. These are operation
+counts, not a new full-workload latency measurement.

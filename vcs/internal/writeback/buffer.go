@@ -467,6 +467,11 @@ func (b *Buffer) schedule() {
 		// single background worker; explicit flushes run independently.
 		for _, f := range jobs {
 			_, err := b.FlushIdentity(b.ctx, f.id, cut)
+			if err == nil {
+				if observer, ok := b.flusher.(FlushCycleObserver); ok {
+					observer.FlushCycleCompleted(b.ctx, f.id)
+				}
+			}
 			b.mu.Lock()
 			f.scheduled = false
 			if err == nil && f.reschedule && f.accepted != nil {

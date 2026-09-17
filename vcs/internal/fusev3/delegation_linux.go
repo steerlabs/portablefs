@@ -120,11 +120,11 @@ type delegationManager struct {
 	closeProducers sync.WaitGroup
 	closeStopped   bool
 
-	dropReporter    func(writeback.DropReport)
-	cleanupFailure  func(error)
-	hookMu          sync.RWMutex
-	withdrawalDrain func(context.Context, []byte) error
-	acceptedWrite   func(context.Context, []byte, int64, int64) error
+	dropReporter          func(writeback.DropReport)
+	cleanupFailure        func(error)
+	hookMu                sync.RWMutex
+	withdrawalDrain       func(context.Context, []byte) error
+	flushCycleInvalidator func(context.Context, []byte) error
 }
 
 type delegationClose struct {
@@ -235,9 +235,9 @@ func (m *delegationManager) SetWithdrawalDrain(drain func(context.Context, []byt
 	m.hookMu.Unlock()
 }
 
-func (m *delegationManager) SetAcceptedWriteInvalidator(invalidate func(context.Context, []byte, int64, int64) error) {
+func (m *delegationManager) SetFlushCycleInvalidator(invalidate func(context.Context, []byte) error) {
 	m.hookMu.Lock()
-	m.acceptedWrite = invalidate
+	m.flushCycleInvalidator = invalidate
 	m.hookMu.Unlock()
 }
 
@@ -520,15 +520,6 @@ func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byt
 	}
 	if err != nil {
 		return cut, err
-	}
-	m.hookMu.RLock()
-	invalidate := m.acceptedWrite
-	m.hookMu.RUnlock()
-	if invalidate != nil {
-		if err := invalidate(ctx, cloneBytes(identity), off, int64(len(data))); err != nil {
-			m.loseDelegation(s, "holder kernel data invalidation failed")
-			return cut, fmt.Errorf("fusev3: invalidate holder read cache: %w", err)
-		}
 	}
 	// Re-read the mode after admission: a writer waiting behind a downgrade
 	// fence may have entered under the successor generation.
@@ -1952,4 +1943,20 @@ func (m *delegationManager) Stop() {
 	m.epoch.Lock()
 	m.buf.Stop()
 	m.epoch.Unlock()
+}
+
+// FlushCycleCompleted runs outside the buffer's admission and flush locks.
+// An invalidation failure is a coherence loss, never a retriable WRITE error.
+func (m *delegationManager) FlushCycleCompleted(ctx context.Context, id writeback.Identity) {
+	m.hookMu.RLock()
+	invalidate := m.flushCycleInvalidator
+	m.hookMu.RUnlock()
+	if invalidate == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	if err := invalidate(ctx, id[:]); err != nil {
+		m.loseDelegation(m.state(id), "holder flush-cycle invalidation failed")
+	}
 }

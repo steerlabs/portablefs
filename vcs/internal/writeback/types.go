@@ -93,6 +93,14 @@ type Flusher interface {
 	Flush(context.Context, Identity, Entry) (uint64, error)
 }
 
+// FlushCycleObserver optionally coalesces frontend work after an identity's
+// background flush cut. It runs outside all buffer locks, once per cycle.
+// It does not order frontend publication after admission; frontends must
+// retain a separate boundary for work published after the flush completes.
+type FlushCycleObserver interface {
+	FlushCycleCompleted(context.Context, Identity)
+}
+
 type Options struct {
 	// InitialLossSequence carries the mount counter across an epoch replacement.
 	InitialLossSequence uint64

@@ -1571,3 +1571,35 @@ exit 70 reflects omitted full-gate tests. The 40,000-file install measures
 change ACK and additional control poll RPCs. Full opcode tables, direct-XFS
 controls, Git results, peer results and the preceding direct-XFS ENOSPC
 attempt are recorded in results.md. No full-gate claim is made.
+
+#### G2 Part 2 item 5: reader-aware own-write invalidation
+
+Buffered WRITE now uses its pinned raw inode directly, eliminating the global
+inode lookup, hook mutex and cloned identity from every accepted write. An inode
+that has never published KEEP_CACHE takes an atomic check and issues no notify;
+the new 100-write test proves zero notifications and zero invalidation-path
+allocations. The buffer still owns a copy of accepted user data.
+
+Live cached descriptions are counted through their last in-flight READ. With a
+live reader, WRITE drains its range before returning: deferring this to a timer
+would permit a later kernel-only read to serve an old folio. Closed descriptions
+can leave resident pages, so the inode retains a merged dirty interval. A
+background identity flush cycle drains that interval once, and every future
+cached OPEN drains before registering its physical publication. The latter is
+the correctness boundary across implicit local delegation release; the flush
+observer is amortization only because admission may race ahead of raw WRITE's
+range registration. Same-inode source publication serializes live-reader writes,
+so they cannot safely coalesce across successful syscall replies without a
+separate protocol change. Unpublished-handle drain failures discharge handles,
+pins and CREATE/TMPFILE lookups before revoking the mount.
+
+Validation: focused unit tests cover no-reader skips, merged ranges, concurrent
+notify/writer ordering, in-flight-close counts and OPEN failure cleanup. Restoring
+the old unconditional invalidation fails the 100-write regression
+(`/tmp/cv2-g2-own-cache-fault.log`). The full unprivileged FUSE suite passes, as
+does `go -C vcs test -race ./internal/writeback`. The new required mounted
+`TestSameMountWritesInvalidateLiveAndReopenedCachedReaders` passes three times
+(0.12/0.13/0.12 seconds), including retained live reads and close/write/local
+release/reopen. Focused wrapper exit 70 is expected for omitted gate inventory.
+Logs: `/tmp/cv2-g2-own-cache-suite.log`, `own-cache-final.log`,
+`own-cache-writeback.log`, `own-cache-mounted.log` (same `/tmp/cv2-g2-` prefix).

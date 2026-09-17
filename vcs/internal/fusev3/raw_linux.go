@@ -29,8 +29,9 @@ type inodeKey struct {
 }
 
 type inodeRecord struct {
-	id  uint64
-	key inodeKey
+	readCache ownReadCache
+	id        uint64
+	key       inodeKey
 	// identity is the stable filesystem identity used for coherence. Kernel
 	// inode numbers remain an implementation detail of the FUSE tables; source
 	// publication gates never key correctness on a number the kernel may reuse.
@@ -539,7 +540,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		r.cachedReplyFree = &r.cachedReplyArena[i]
 	}
 	mount.raw = r
-	mount.delegations.SetAcceptedWriteInvalidator(func(ctx context.Context, identity []byte, offset, length int64) error {
+	mount.delegations.SetFlushCycleInvalidator(func(ctx context.Context, identity []byte) error {
 		id, ok := publicationIdentityFromBytes(identity)
 		if !ok {
 			return syscall.EIO
@@ -550,7 +551,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		if record == nil {
 			return nil
 		}
-		return record.node.invalidateOwnData(ctx, offset, length)
+		return record.drainOwnWrites(ctx)
 	})
 	mount.delegations.SetWithdrawalDrain(func(ctx context.Context, identity []byte) error {
 		id, ok := publicationIdentityFromBytes(identity)
@@ -2068,6 +2069,9 @@ func (r *rawFileSystem) addHandle(record *inodeRecord, handle *handleRecord) (ui
 	handle.inode = record
 	handle.done = make(chan struct{})
 	r.handles[id] = handle
+	if handle.file != nil && handle.file.buffered {
+		record.readCache.addReader()
+	}
 	return id, true
 }
 
@@ -2145,6 +2149,9 @@ func (r *rawFileSystem) takeHandle(id uint64, kind handleKind) (*handleRecord, b
 	done := handle.done
 	r.mu.Unlock()
 	<-done
+	if handle.file != nil && handle.file.buffered {
+		handle.inode.readCache.removeReader()
+	}
 	return handle, true
 }
 
@@ -2596,29 +2603,30 @@ func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 	if errno != 0 {
 		return fuse.Status(errno)
 	}
-	// The publication is registered on return, not before the call. A READ has
-	// to register first, because its reply carries bytes a concurrent purge must
-	// be ordered against; an OPEN carries none, and its publication exists only
-	// to bind this reply's KEEP_CACHE decision to the grant the reply carries.
-	// Registering it across the authority call would put an open that is waiting
-	// on a recall into the very drain that recall performs.
+	id, ok := r.addHandle(record, &handleRecord{file: handle})
+	if !ok {
+		r.closeOrphanedFile(ctx, handle)
+		return fuse.EIO
+	}
+	if handle.buffered {
+		if err := record.drainOwnWrites(ctx); err != nil {
+			r.discardUnpublishedFileHandle(ctx, id, record, false)
+			r.mount.revoke(err)
+			return fuse.EIO
+		}
+	}
+	// Register after draining old folios: OPEN's own physical publication
+	// must not become part of the drain it is waiting to complete.
 	dataAdmitted := false
 	if readOnly {
 		dataAdmitted = r.beginBufferedRead(ctx, record)
 		if !dataAdmitted {
-			// The publication is this callback's own reply bookkeeping; missing
-			// it is an internal accounting failure, never a coherence answer.
+			if _, taken := r.takeHandle(id, handleAuthorityFile); taken {
+				r.unpin(record)
+			}
 			r.closeOrphanedFile(ctx, handle)
 			return fuse.EIO
 		}
-	}
-	id, ok := r.addHandle(record, &handleRecord{file: handle})
-	if !ok {
-		if dataAdmitted {
-			r.cancelBufferedRead(ctx, record)
-		}
-		r.closeOrphanedFile(ctx, handle)
-		return fuse.EIO
 	}
 	if flags&fuse.FOPEN_KEEP_CACHE == 0 && dataAdmitted {
 		r.cancelBufferedRead(ctx, record)
@@ -2629,6 +2637,17 @@ func (r *rawFileSystem) Open(_ <-chan struct{}, input *fuse.OpenIn, out *fuse.Op
 		return fuse.Status(syscall.ENOTCONN)
 	}
 	return fuse.OK
+}
+
+// A refused OPEN/CREATE reply will never receive RELEASE from the kernel.
+func (r *rawFileSystem) discardUnpublishedFileHandle(ctx context.Context, id uint64, record *inodeRecord, forget bool) {
+	if handle, ok := r.takeHandle(id, handleAuthorityFile); ok {
+		r.unpin(record)
+		r.closeOrphanedFile(ctx, handle.file)
+	}
+	if forget {
+		r.Forget(record.id, 1)
+	}
 }
 
 // closeOrphanedFile releases an authority open file description the frontend
@@ -2846,6 +2865,13 @@ func (r *rawFileSystem) Create(_ <-chan struct{}, input *fuse.CreateIn, name str
 		r.closeOrphanedFile(ctx, handle)
 		return fuse.EIO
 	}
+	if handle.buffered {
+		if err := record.drainOwnWrites(ctx); err != nil {
+			r.discardUnpublishedFileHandle(ctx, id, record, true)
+			r.mount.revoke(err)
+			return fuse.EIO
+		}
+	}
 	r.bindPath(record, parent, name)
 	if err := r.publishEntry(ctx, &out.EntryOut, parent, name, record, item.GetAttr()); err != nil {
 		r.mount.revoke(err)
@@ -2927,6 +2953,13 @@ func (r *rawFileSystem) Tmpfile(_ <-chan struct{}, input *fuse.CreateIn, name st
 		r.Forget(record.id, 1)
 		r.closeOrphanedFile(ctx, handle)
 		return fuse.EIO
+	}
+	if handle.buffered {
+		if err := record.drainOwnWrites(ctx); err != nil {
+			r.discardUnpublishedFileHandle(ctx, id, record, true)
+			r.mount.revoke(err)
+			return fuse.EIO
+		}
 	}
 	if err := r.publishAnonymousEntry(ctx, &out.EntryOut, record, item.GetAttr()); err != nil {
 		r.mount.revoke(err)
