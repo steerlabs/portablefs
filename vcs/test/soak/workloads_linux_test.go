@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -579,6 +580,14 @@ func workloadGit(ctx context.Context, directory string, args ...string) error {
 	return err
 }
 
+var workloadCommandStartMu sync.Mutex
+
+func serializedWorkloadCommandStart(start func() error) error {
+	workloadCommandStartMu.Lock()
+	defer workloadCommandStartMu.Unlock()
+	return start()
+}
+
 func workloadCommand(ctx context.Context, directory string, environment map[string]string, name string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, name, args...)
 	command.Dir = directory
@@ -591,9 +600,15 @@ func workloadCommand(ctx context.Context, directory string, environment map[stri
 	for _, key := range keys {
 		command.Env = append(command.Env, key+"="+environment[key])
 	}
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return output, fmt.Errorf("%s %v in %s: %w: %s", name, args, directory, err, bytes.TrimSpace(output))
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := serializedWorkloadCommandStart(command.Start); err != nil {
+		return output.Bytes(), fmt.Errorf("start %s %v in %s: %w: %s", name, args, directory, err, bytes.TrimSpace(output.Bytes()))
 	}
-	return output, nil
+	err := command.Wait()
+	if err != nil {
+		return output.Bytes(), fmt.Errorf("%s %v in %s: %w: %s", name, args, directory, err, bytes.TrimSpace(output.Bytes()))
+	}
+	return output.Bytes(), nil
 }
