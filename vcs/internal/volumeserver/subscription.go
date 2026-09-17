@@ -180,6 +180,7 @@ func (h *subscriberHeap) Pop() any {
 // plus amortized reclamation of entries; lookup is O(1). Notification channels
 // are allocated only when somebody actually waits, never per appended entry.
 type CoherenceCoordinator struct {
+	delegationsByID                         map[uint64]*delegationRecord
 	maxCacheFootprint                       int
 	mu                                      sync.Mutex
 	clock                                   CoherenceClock
@@ -214,7 +215,7 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 		// The initial storage snapshot is version 1, matching the handler. A
 		// reservation can publish a cache withdrawal before the first commit.
 		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1, watermark: 1,
-		requests: newMutationSequencer(), delegations: make(map[[16]byte]*delegationRecord), cacheHandles: make(map[[16]byte]*cacheHandleCounts)}
+		requests: newMutationSequencer(), delegationsByID: make(map[uint64]*delegationRecord), delegations: make(map[[16]byte]*delegationRecord), cacheHandles: make(map[[16]byte]*cacheHandleCounts)}
 }
 
 // WaitPriorCacheHorizon fences only prior Linux cache authority. Durable mount

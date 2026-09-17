@@ -27,7 +27,8 @@ type record struct {
 }
 type file struct {
 	batchStorage    batch
-	entryStorage    [1]Entry
+	entryStorage    [4]Entry
+	flushOffset     int
 	id              Identity
 	generation      uint64
 	retiring        bool
@@ -48,6 +49,8 @@ type file struct {
 	reschedule      bool
 }
 type Buffer struct {
+	batcher                                 BatchFlusher
+	batchWidth, batchPayload                int
 	maxFlushIdentities                      int
 	waitingAdmissions                       int
 	mu                                      sync.Mutex
@@ -100,6 +103,15 @@ func New(flusher Flusher, opts Options) (*Buffer, error) {
 		maxBytes:    opts.MaxBytes, maxEntries: opts.MaxEntries,
 		flusher: flusher, interval: opts.FlushInterval,
 		kick: make(chan struct{}, 1), done: make(chan struct{}),
+	}
+	if batcher, ok := flusher.(BatchFlusher); ok {
+		width, payload := batcher.FlushBatchSize()
+		if width < 0 || width > 4 || width > 0 && (payload <= 0 || payload > MaxPayload) {
+			return nil, ErrInvalid
+		}
+		if width > 0 {
+			b.batcher, b.batchWidth, b.batchPayload = batcher, width, payload
+		}
 	}
 	for i := range b.records {
 		b.records[i].next = b.free
@@ -382,9 +394,10 @@ func (b *Buffer) dropLocked(id Identity, reason string, errno syscall.Errno) Dro
 	f.head = nil
 	f.tail = nil
 	f.pending = nil
+	f.flushOffset = 0
 	f.reschedule = false
 	f.batchStorage = batch{}
-	f.entryStorage[0] = Entry{}
+	clear(f.entryStorage[:])
 	f.accepted = nil
 	f.lastTruncate = nil
 	delete(b.active, id)

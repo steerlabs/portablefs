@@ -35,6 +35,7 @@ type delegationBinding struct {
 }
 
 type delegationState struct {
+	flushOrdinal      uint64                   // meta; dense within the exact Authority grant
 	releaseFlight     *delegationReleaseFlight // protected by transition
 	acquire           sync.Mutex
 	grantChanged      chan struct{}
@@ -377,6 +378,7 @@ func (m *delegationManager) Install(identity, item, handle []byte, grant *author
 		// previous grant's last ticket into an empty successor break would
 		// acknowledge data never applied under the successor reference.
 		s.applied, s.appliedCut, s.acceptedCut, s.dirty = 0, 0, 0, false
+		s.flushOrdinal = 0
 		s.meta.Unlock()
 	}
 	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)

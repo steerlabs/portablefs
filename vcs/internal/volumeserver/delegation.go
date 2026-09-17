@@ -39,6 +39,8 @@ type Delegation struct {
 }
 
 type delegationRecord struct {
+	flushSequence  uint64
+	ordered        map[uint64]*OrderedFlush
 	grant          Delegation
 	owner          *changeSubscriber
 	position       uint64
@@ -224,6 +226,7 @@ func (c *CoherenceCoordinator) reserveLocked(s *changeSubscriber, identity [16]b
 	// A volume-global generation avoids retaining one counter per deleted file.
 	r := &delegationRecord{owner: s, ephemeral: ephemeral, grant: Delegation{ID: c.nextDelegation, Identity: identity, Holder: s.token.Session, Generation: c.nextDelegation, Mode: c.modeLocked(identity, s.token.Session), State: DelegationReserved}}
 	c.delegations[identity] = r
+	c.delegationsByID[r.grant.ID] = r
 	s.held[identity] = r
 	s.data.add([][16]byte{identity}, c.maxCacheFootprint)
 	var source SessionID
@@ -884,6 +887,7 @@ func (c *CoherenceCoordinator) finishRetiredLocked(r *delegationRecord) {
 	// Release follows the final pinned flush's OnCommit, so clients cannot start
 	// caching while an admitted old-generation write is still applying.
 	delete(c.delegations, r.grant.Identity)
+	delete(c.delegationsByID, r.grant.ID)
 	var source SessionID
 	if r.ephemeral {
 		source = r.owner.token.Session

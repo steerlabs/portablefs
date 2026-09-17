@@ -982,6 +982,9 @@ message WriteRequest {
   bool sync = 11;
   bool data_sync = 12;
   DelegationRef delegation = 13; // required for a delegated flush
+  // Optional ordered-delegated-flush-v1 capability. Dense accepted WRITE
+  // ordinal within this exact delegation; absent/zero retains serial mode.
+  uint64 flush_sequence = 14;
 }
 
 // One stock write either reports the exact committed byte count, the offset the

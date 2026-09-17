@@ -75,11 +75,16 @@ type WriteOptions struct {
 // they are mount-local, not Authority sequences. Data is borrowed for the call.
 type Entry struct {
 	Token, First, Last, Generation uint64
-	Kind                           Kind
-	Offset                         int64
-	Data                           []byte
-	Attributes                     Attributes
-	WriteOptions                   WriteOptions
+	// AppliedThrough excludes a final acceptance record split across waves.
+	// A complete metadata record uses Last.
+	AppliedThrough uint64
+	Kind           Kind
+	Offset         int64
+	Data           []byte
+	// Segments replaces Data for adjacent retained records without a merge copy.
+	Segments     [][]byte
+	Attributes   Attributes
+	WriteOptions WriteOptions
 }
 
 // Flusher applies one operation, returning its nonzero Authority sequence.
@@ -91,6 +96,15 @@ type Entry struct {
 // call Drop. No buffer lock is held while Flush executes.
 type Flusher interface {
 	Flush(context.Context, Identity, Entry) (uint64, error)
+}
+
+// BatchFlusher joins a bounded accepted-order wave before returning. Its result
+// is index-aligned and nondecreasing. On retry the immutable tokens are the
+// same; completed members must not be applied twice. A zero width selects the
+// original serial path. Both payloads and spans are borrowed until return.
+type BatchFlusher interface {
+	FlushBatchSize() (width, payload int)
+	FlushBatch(context.Context, Identity, []Entry) ([]uint64, error)
 }
 
 // FlushCycleObserver optionally coalesces frontend work after an identity's

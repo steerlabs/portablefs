@@ -175,3 +175,16 @@ func (e *epochRPC) SupportsBatchedClose() bool {
 	capable, ok := e.current().(interface{ SupportsBatchedClose() bool })
 	return ok && capable.SupportsBatchedClose()
 }
+
+func (e *epochRPC) SupportsOrderedFlush() bool {
+	capable, ok := e.current().(interface{ SupportsOrderedFlush() bool })
+	return ok && capable.SupportsOrderedFlush()
+}
+func (e *epochRPC) CallMutationSegments(ctx context.Context, req *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	if capable, ok := e.current().(interface {
+		CallMutationSegments(context.Context, *authoritypb.Request, [][]byte, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
+	}); ok {
+		return capable.CallMutationSegments(ctx, req, segments, assigned)
+	}
+	return nil, syscall.EOPNOTSUPP
+}

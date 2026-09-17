@@ -7922,9 +7922,12 @@ type WriteRequest struct {
 	// O_SYNC/O_DSYNC on the description and fcntl can change them, so they are a
 	// property of the call and are never inherited from the authority descriptor.
 	// sync is stronger than data_sync; both may not be set.
-	Sync          bool           `protobuf:"varint,11,opt,name=sync,proto3" json:"sync,omitempty"`
-	DataSync      bool           `protobuf:"varint,12,opt,name=data_sync,json=dataSync,proto3" json:"data_sync,omitempty"`
-	Delegation    *DelegationRef `protobuf:"bytes,13,opt,name=delegation,proto3" json:"delegation,omitempty"` // required for a delegated flush
+	Sync       bool           `protobuf:"varint,11,opt,name=sync,proto3" json:"sync,omitempty"`
+	DataSync   bool           `protobuf:"varint,12,opt,name=data_sync,json=dataSync,proto3" json:"data_sync,omitempty"`
+	Delegation *DelegationRef `protobuf:"bytes,13,opt,name=delegation,proto3" json:"delegation,omitempty"` // required for a delegated flush
+	// Optional ordered-delegated-flush-v1 capability. Dense accepted WRITE
+	// ordinal within this exact delegation; absent/zero retains serial mode.
+	FlushSequence uint64 `protobuf:"varint,14,opt,name=flush_sequence,json=flushSequence,proto3" json:"flush_sequence,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -8027,6 +8030,13 @@ func (x *WriteRequest) GetDelegation() *DelegationRef {
 		return x.Delegation
 	}
 	return nil
+}
+
+func (x *WriteRequest) GetFlushSequence() uint64 {
+	if x != nil {
+		return x.FlushSequence
+	}
+	return 0
 }
 
 // One stock write either reports the exact committed byte count, the offset the
@@ -12146,7 +12156,7 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\x06length\x18\x03 \x01(\rR\x06length\"F\n" +
 	"\tReadReply\x12\x12\n" +
 	"\x04data\x18\x01 \x01(\fR\x04data\x12%\n" +
-	"\x0evolume_version\x18\x02 \x01(\x04R\rvolumeVersion\"\xf1\x02\n" +
+	"\x0evolume_version\x18\x02 \x01(\x04R\rvolumeVersion\"\x98\x03\n" +
 	"\fWriteRequest\x12\x16\n" +
 	"\x06handle\x18\x01 \x01(\fR\x06handle\x12\x1a\n" +
 	"\bposition\x18\x02 \x01(\x04R\bposition\x12\x1d\n" +
@@ -12162,7 +12172,8 @@ const file_proto_authority_v1_authority_proto_rawDesc = "" +
 	"\tdata_sync\x18\f \x01(\bR\bdataSync\x12F\n" +
 	"\n" +
 	"delegation\x18\r \x01(\v2&.portablefs.authority.v1.DelegationRefR\n" +
-	"delegationJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\b\x10\tR\frlimit_fsizeR\rfile_max_sizeR\x05flags\"\x87\x02\n" +
+	"delegation\x12%\n" +
+	"\x0eflush_sequence\x18\x0e \x01(\x04R\rflushSequenceJ\x04\b\x03\x10\x04J\x04\b\x04\x10\x05J\x04\b\b\x10\tR\frlimit_fsizeR\rfile_max_sizeR\x05flags\"\x87\x02\n" +
 	"\n" +
 	"WriteReply\x12%\n" +
 	"\x0ecommitted_size\x18\x01 \x01(\x04R\rcommittedSize\x12:\n" +

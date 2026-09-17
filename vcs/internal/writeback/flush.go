@@ -7,6 +7,9 @@ import (
 )
 
 type batch struct {
+	wave                 bool
+	completedLast        *record
+	endOffset            int
 	entries              []Entry
 	next                 int
 	first, last, applied uint64
@@ -21,6 +24,9 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 			return nil
 		}
 		return f.pending
+	}
+	if b.batcher != nil {
+		return b.waveLocked(f, cut)
 	}
 	r := f.accepted
 	if r == nil || r.seq > cut.Sequence {
@@ -120,8 +126,35 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 			return applied, nil
 		}
 		entry := p.entries[p.next]
+		wave := p.wave
+		floor := max(p.applied, f.lastApplied)
+		var retained [4]Entry
+		entries := retained[:0]
+		if wave {
+			entries = retained[:len(p.entries)]
+			copy(entries, p.entries)
+		}
 		b.mu.Unlock()
-		seq, err := b.flusher.Flush(ctx, id, entry)
+		seq := floor
+		var err error
+		if wave {
+			var sequences []uint64
+			sequences, err = b.batcher.FlushBatch(ctx, id, entries)
+			if err == nil {
+				if len(sequences) != len(entries) {
+					err = ErrInvalid
+				}
+				for _, next := range sequences {
+					if next == 0 || next < seq {
+						err = ErrInvalid
+						break
+					}
+					seq = next
+				}
+			}
+		} else {
+			seq, err = b.flusher.Flush(ctx, id, entry)
+		}
 		b.mu.Lock()
 		if err != nil {
 			b.mu.Unlock()
@@ -139,8 +172,19 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 		p.applied = max(p.applied, seq)
 		applied = max(applied, seq)
 		p.next++
+		if p.wave {
+			p.next = len(p.entries)
+		}
 		if p.next == len(p.entries) {
-			for r := f.accepted; r != nil && r.seq <= p.last; r = r.next {
+			last := p.last
+			if p.wave {
+				last = 0
+				if p.completedLast != nil {
+					last = p.completedLast.seq
+				}
+				f.flushOffset = p.endOffset
+			}
+			for r := f.accepted; r != nil && r.seq <= last; r = r.next {
 				if r.seq >= p.first {
 					r.applied = p.applied
 					r.state = Applied
@@ -150,7 +194,7 @@ func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint6
 			}
 			f.pending = nil
 			*p = batch{}
-			f.entryStorage[0] = Entry{}
+			clear(f.entryStorage[:])
 			b.advanceLocked()
 			b.signal()
 		}

@@ -167,8 +167,10 @@ type lane struct {
 }
 
 type Client struct {
-	batchedClose atomic.Bool
-	cfg          ClientConfig
+	batchedClose          atomic.Bool
+	orderedDelegatedFlush atomic.Bool
+	ordered               lane
+	cfg                   ClientConfig
 
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
@@ -319,12 +321,20 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	ordinaryLimit, blockingLimit := blockingWaitLane(cfg.MaxInFlight)
 	slots := make([]clientSlot, cfg.ReplaySlots)
 	split := cfg.ReplaySlots - uint32(blockingLimit)
-	c := &Client{
+	var ordered lane
+	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && ordinaryLimit >= volumeserver.OrderedFlushWindow+1 {
+		ordinaryLimit -= volumeserver.OrderedFlushWindow
+		base := split - volumeserver.OrderedFlushWindow
+		ordered = lane{permits: make(chan struct{}, volumeserver.OrderedFlushWindow), slots: slots[base:split], base: base}
+		split = base
+	}
+	blockingBase := cfg.ReplaySlots - uint32(blockingLimit)
+	c := &Client{ordered: ordered,
 		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 		data:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
 		ordinary:      lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
-		blocking:      lane{permits: make(chan struct{}, blockingLimit), slots: slots[split:], base: split},
+		blocking:      lane{permits: make(chan struct{}, blockingLimit), slots: slots[blockingBase:], base: blockingBase},
 		repairControl: lane{permits: make(chan struct{}, 1)},
 		controlPoll:   lane{permits: make(chan struct{}, 1)},
 		controlAck:    lane{permits: make(chan struct{}, 1)},
@@ -660,6 +670,7 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
 	c.batchedClose.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
+	c.orderedDelegatedFlush.Store(cap(c.ordered.permits) == volumeserver.OrderedFlushWindow && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature}) && hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}))
 	c.root = proto.Clone(root).(*authoritypb.Item)
 	c.routesRevision = c.cfg.RoutesRevision
 	c.lease = lease
@@ -1401,6 +1412,12 @@ func (c *Client) forceResponseConsumptionDrain() {
 }
 
 func (c *Client) laneFor(request *authoritypb.Request) *lane {
+	if c.SupportsOrderedFlush() && delegatedFlushRequest(request) {
+		// Match the server's entire flush lane, including metadata. Letting
+		// non-ordinal flushes bypass this bound could strand a predecessor
+		// behind successors which already occupy all server flush slots.
+		return &c.ordered
+	}
 	if request.GetNextControlEvent() != nil {
 		return &c.controlPoll
 	}
@@ -1634,6 +1651,9 @@ func (c *Client) writeRequest(ctx context.Context, transport *clientTransport, c
 	if err := conn.SetWriteDeadline(deadline); err != nil {
 		return err
 	}
+	if bulk, ok := ctx.Value(segmentedWriteKey{}).(segmentedWrite); ok && bulk.request == request {
+		return writeFrameBulk(conn, transport.frameMax.Load(), request, bulk.segments)
+	}
 	return writeFrame(conn, transport.frameMax.Load(), request)
 }
 
@@ -1802,6 +1822,38 @@ func (c *Client) CallMutation(ctx context.Context, request *authoritypb.Request)
 	return c.CallMutationWithIdentity(ctx, request, nil)
 }
 
+const orderedDelegatedFlushFeature = "ordered-delegated-flush-v1"
+
+// SupportsOrderedFlush is negotiated at activation for this exact session.
+func (c *Client) SupportsOrderedFlush() bool { return c.orderedDelegatedFlush.Load() }
+
+type segmentedWriteKey struct{}
+type segmentedWrite struct {
+	request  *authoritypb.Request
+	segments [][]byte
+}
+
+// CallMutationSegments sends retained WRITE spans without merging their bytes.
+// The caller owns the request and keeps every span immutable until return,
+// including reconnect/replay. Assignment observes the selected lane admission.
+func (c *Client) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned MutationAssigned) (*authoritypb.Response, error) {
+	if request == nil || request.GetWrite() == nil || len(request.GetWrite().GetData()) != 0 || segments == nil {
+		return nil, syscall.EINVAL
+	}
+	var size uint64
+	for _, segment := range segments {
+		size += uint64(len(segment))
+		if size > uint64(request.GetWrite().GetSize()) {
+			return nil, syscall.EINVAL
+		}
+	}
+	if size != uint64(request.GetWrite().GetSize()) {
+		return nil, syscall.EINVAL
+	}
+	ctx = context.WithValue(ctx, segmentedWriteKey{}, segmentedWrite{request, segments})
+	return c.CallMutationWithIdentity(ctx, request, assigned)
+}
+
 // CallMutationWithIdentity is CallMutation with one pre-dispatch identity
 // publication point. The callback is invoked exactly once, before the first
 // dispatch, and is not repeated if the same request is replayed after a
@@ -1828,6 +1880,9 @@ func (c *Client) CallMutationWithIdentityRetained(
 ) (*authoritypb.Response, ResponseConsumption, error) {
 	if c.poisoned.Load() {
 		return nil, nil, ErrTransportUncertain
+	}
+	if write := request.GetWrite(); write != nil && write.GetFlushSequence() != 0 && !c.SupportsOrderedFlush() {
+		return nil, nil, syscall.EOPNOTSUPP
 	}
 	role, err := roleForRequest(request)
 	if err != nil || role != authoritypb.TransportRole_TRANSPORT_ROLE_DATA {

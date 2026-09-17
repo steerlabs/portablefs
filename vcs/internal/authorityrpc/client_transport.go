@@ -196,6 +196,9 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 		ConnectionSetId: append([]byte(nil), c.connectionSetID[:]...),
 		FrontendProfile: c.cfg.FrontendProfile,
 	}}}
+	if cap(c.ordered.permits) == volumeserver.OrderedFlushWindow {
+		request.GetHello().Features = append(request.GetHello().Features, orderedDelegatedFlushFeature)
+	}
 	if err := writeFrame(conn, c.cfg.MaxFrame, request); err != nil {
 		return fail(err)
 	}

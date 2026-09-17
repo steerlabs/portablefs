@@ -1770,3 +1770,47 @@ build/vet, vulnerability checks, native Go and race suites, physical-reply seam,
 Swift, release policy, stale-architecture checks, XFS integration, and all
 coherence matrix assertions and controls. This qualifies the changes through
 item 7a; the ordered chunk pipeline remains under development.
+
+#### G2 item 7b: four ordered chunks and retained-record scatter
+
+The buffer now builds waves of at most four WRITE chunks directly from retained
+record slices at the negotiated payload size. Adjacent records use scatter spans;
+overlapping records retain acceptance order. Metadata separates waves, retries
+retain immutable tokens, and a partly consumed record remains accepted until its
+last chunk succeeds. Applied-cut reporting excludes that incomplete tail. Drop
+cannot rewrite an in-flight wave, even when it clears the buffer's entry arena.
+The existing item 7a pool still bounds concurrent identities.
+
+`ordered-delegated-flush-v1` is optional on Hello and Activate. Both transport
+roles and replacements must agree. Four client permits and replay slots match
+four server flush slots; all delegated WRITE/SETATTR/FALLOCATE share that bound.
+The manager admits a predecessor before launching its successor. Per-grant dense
+ordinals order storage before dependency acquisition, after exact-replay
+admission. A recorded result consumes an ordinal; an unrecorded refusal retires
+the exact authenticated grant. Runtime terminal transport cancellation aborts
+parked tickets. Old peers retain serial flushing and unchanged required features.
+
+One joined wave decides capacity refusal or delegation loss. Definite ENOSPC,
+EDQUOT or EFBIG retains the grant and reports the first accepted-order errno;
+any unprovable sibling overrides that with generic loss. Transport retries keep
+the same ordinal and replay identity. A wave-level failure is terminal locally,
+so no fresh ordinal is used to retry an uncertain application. Scatter framing
+preserves the existing canonical metadata and single bulk carrier without an
+intermediate payload copy.
+
+Validation: host race suites for authorityrpc, writeback and volumeserver pass
+(`/tmp/cv2-g2-pipeline-host-all.log`); complete unprivileged Linux authorityrpc
+and fusev3 suites pass (`pipeline-linux-rpc.log`, `pipeline-linux-fuse.log`, same
+prefix; the FUSE INIT probe requires the privileged harness). Tests cover reverse
+2/3/4/1 socket arrival, storage exclusion, exact replay, lost-reply scatter,
+recorded capacity refusal, unrecorded admission/shape refusal, cold/horizon/recall
+retirement, partial records, randomized overlaps, and Drop during a borrowed
+wave. Review caught and fixed a cross-wave sequence-regression check and a
+client/server metadata lane mismatch. Restoring the one-slot flush lane fails
+the reverse-arrival socket regression (`/tmp/cv2-g2-pipeline-lane-fault.log`).
+
+The new mounted overlap test passes in 1.13 s
+(`/tmp/cv2-g2-pipeline-mounted.log`). This focused invocation exits 70 because
+required unrelated tests were not selected; it is not full-gate evidence. No
+multi-identity RPC is added without the final workload measurement establishing
+that remaining per-file RPC overhead dominates.

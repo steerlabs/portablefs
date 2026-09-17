@@ -449,6 +449,21 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
 	defer use.End()
+	if write := req.GetWrite(); write != nil && write.GetFlushSequence() != 0 {
+		// Only an authenticated owner can retire a sequence with no replay
+		// outcome. Otherwise its already-dispatched successors could park
+		// behind a gap that can never be consumed.
+		defer func() {
+			if response.GetMutation() == nil {
+				if id, err := parseCoherenceDelegationID(write.GetDelegation().GetId()); err == nil {
+					h.Coherence.AbortOrderedFlushes(cred.ID, id, write.GetDelegation().GetGeneration())
+				}
+			}
+		}()
+		if entry, ok := transportConnectionFromContext(ctx); !ok || !entry.orderedFlush {
+			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
+		}
+	}
 	// Reauthorization is an ordinary ACTIVE-session operation. Pin the runtime
 	// first, before presenting its signed token to an external verifier: a
 	// provisional credential must not consume or validate anything beyond its
@@ -2264,6 +2279,9 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 	}
 	bounds := h.Bounds()
 	features := append([]string(nil), required...)
+	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && h.MaxInFlight >= 9 && hasFeatures(hello.Features, []string{orderedDelegatedFlushFeature}) {
+		features = append(features, orderedDelegatedFlushFeature)
+	}
 	features = append(features, peerCompleteFIFOFeedbackFeature, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
 	resp := h.success(requestID)
 	resp.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
@@ -2669,6 +2687,9 @@ func (h *VolumeHandler) newActivationReply(resources *sessionResources, rootAttr
 		return nil
 	}
 	features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
+	if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && h.MaxInFlight >= 9 {
+		features = append(features, orderedDelegatedFlushFeature)
+	}
 	reply := &authoritypb.ActivateReply{
 		Root: itemProto(resources.root, rootAttr, rootIdentity), Features: features,
 		SessionLeaseMilliseconds:       uint64(h.Runtime.SessionLease() / time.Millisecond),
@@ -2994,7 +3015,23 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 			h.releaseReplyReservation(reserved)
 		}
 	}()
+	var ordered *volumeserver.OrderedFlush
+	defer func() { ordered.Abort() }()
 	out, err := h.Runtime.ExecuteMutationAdmitted(ctx, cred, id, func() error {
+		if write := req.GetWrite(); write != nil && write.GetFlushSequence() != 0 {
+			token, tokenErr := h.coherenceToken(cred.ID)
+			if tokenErr != nil {
+				return tokenErr
+			}
+			grant, grantErr := parseCoherenceDelegationID(write.GetDelegation().GetId())
+			if grantErr != nil {
+				return volumeserver.ErrDelegationStale
+			}
+			ordered, grantErr = h.Coherence.BeginOrderedFlush(token, grant, write.GetDelegation().GetGeneration(), write.GetFlushSequence(), id)
+			if grantErr != nil {
+				return grantErr
+			}
+		}
 		var reserveErr error
 		reserved, reserveErr = h.reserveReplyBytes(cred.ID, id.Slot, reserve)
 		return reserveErr
@@ -3002,7 +3039,15 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		if executed != nil {
 			*executed = true
 		}
-		resp := apply(id)
+		var resp *authoritypb.Response
+		if ordered != nil {
+			if waitErr := ordered.Wait(ctx); waitErr != nil {
+				resp = h.coherenceError(req.GetRequestId(), waitErr)
+			}
+		}
+		if resp == nil {
+			resp = apply(id)
+		}
 		terminalDeliveryRequired := h.takeTerminalReceiptFrame(resp)
 		encoded, encodeErr := marshalOutcome(resp)
 		if encodeErr != nil || uint32(len(encoded)) > reserve {
@@ -3027,6 +3072,9 @@ func (h *VolumeHandler) mutateOperation(ctx context.Context, req *authoritypb.Re
 		// carries no MutationState and the peer's slot stays where it is.
 		return h.errorResponse(req.GetRequestId(), err, false)
 	}
+	// Runtime has now published the predecessor's replay outcome. Waking the
+	// next ordinal from inside apply would expose storage without that proof.
+	ordered.Complete()
 	resp := new(authoritypb.Response)
 	if err := proto.Unmarshal(out.Reply, resp); err != nil {
 		return h.errorResponse(req.GetRequestId(), errInternal, true)

@@ -252,7 +252,7 @@ invalidate the old reference even if the same session later reacquires it.
 | `CreateReply` | `delegation` (3), absent if no grant; `cache_capable` (4) is the admitted capability for this handle. `item` and `handle` retain tags 1 and 2. |
 | `OpenRequest` | `write_intent` (3), `cache_capable` (4), with the same meanings. `item` (1) and `flags` (2) are unchanged. |
 | `OpenReply` | `delegation` (2), `cache_capable` (3); `handle` remains 1. Identity comes from the opened item. |
-| `WriteRequest` | `delegation` (13), a DelegationRef required on each buffered flush. Payload stays out of line. |
+| `WriteRequest` | `delegation` (13), a DelegationRef required on each buffered flush. Optional `flush_sequence` (14) orders pipelined chunks as specified below. Payload stays out of line. |
 | `SetAttrRequest` | `delegation` (11), required when flushing buffered attributes or truncate. Optional size/mode/time presence remains unchanged. |
 | `FallocateRequest` | `delegation` (8), required when operating under a delegation. Reserved tags stay reserved. |
 | `WriteReply` | `durable_sequence` (8), the session's contiguous durable application prefix. The common response carries this operation's applied ticket. |
@@ -543,3 +543,35 @@ participate in the read overlay after release, but their bytes and loss
 obligations remain retained until a durable prefix or fencing loss. No per-file
 acquire, transition, or operation lock spans the release or close RPC; a local
 release flight orders same-identity admissions through completion.
+
+
+## Optional ordered delegated flush
+
+Linux peers may negotiate `ordered-delegated-flush-v1`. It is an optional Hello
+feature: the client offers it only with four dedicated flush permits and replay
+slots plus at least one ordinary slot; the Authority echoes it only when its
+ordinary half can reserve those same five slots. DATA and CONTROL must agree,
+including replacement transports. Activate must also advertise it. The frozen
+required feature sets and protocol major are unchanged. Without negotiation,
+clients use the existing serial delegated flush.
+
+With negotiation, all delegated WRITE, SETATTR and FALLOCATE requests share the
+four flush permits on both endpoints. Each nonzero WRITE `flush_sequence` is a
+dense ordinal starting at one for the exact delegation ID and generation. At
+most four successors may be registered. The replay runtime resolves duplicates
+before registering an ordinal. A successor waits before acquiring storage or
+mutation dependencies; its predecessor releases it only after recording its
+exact replay outcome. Definite recorded errors consume their ordinal. An
+unrecorded refusal retires the authenticated owner's exact grant and wakes
+successors; it cannot leave an unfillable gap. Subscription loss, recall expiry,
+and runtime transport cancellation also terminate waiting ordinals. Ordinal zero
+retains the existing serial behavior; metadata flushes separate WRITE waves.
+
+The daemon admits each predecessor to its transport lane before launching the
+next chunk. It joins the wave before changing local ownership. Transport retries
+retain the same mutation identity, ordinal and immutable scatter spans; an
+unprovable wave result loses the delegation, while definite capacity errors keep
+the grant and report the errno. A partial acceptance record remains retained and
+is excluded from the applied acceptance cut until its final chunk succeeds.
+Scatter spans use the existing single bulk carrier and canonical frame bytes;
+there is no new bulk encoding or payload-copy requirement.
