@@ -110,3 +110,41 @@ func TestPOSIXFlushReceiptCannotEraseLaterAcquisition(t *testing.T) {
 		t.Fatal("generation reuse erased reacquisition")
 	}
 }
+
+func TestPOSIXLockOwnersDischargeOnUnlockAndClose(t *testing.T) {
+	const owners = 10_000
+	mount, _ := testMount(t, 8)
+	n := testNode(mount)
+	call := func(operation func(context.Context) syscall.Errno) syscall.Errno {
+		ctx, finish := testMutationContext(t, mount)
+		errno := operation(ctx)
+		finish(errno == 0)
+		return errno
+	}
+	for owner := uint64(1); owner <= owners; owner++ {
+		if errno := call(func(ctx context.Context) syscall.Errno {
+			return n.Setlk(ctx, owner, &fuse.FileLock{Typ: syscall.F_WRLCK, End: 1}, 0)
+		}); errno != 0 {
+			t.Fatalf("owner %d lock: %v", owner, errno)
+		}
+		if owner%2 == 0 {
+			if errno := call(func(ctx context.Context) syscall.Errno {
+				return n.Setlk(ctx, owner, &fuse.FileLock{Typ: syscall.F_UNLCK, End: 1}, 0)
+			}); errno != 0 {
+				t.Fatalf("owner %d unlock: %v", owner, errno)
+			}
+			continue
+		}
+		handle := &fileHandle{node: n, token: testToken(owner)}
+		if errno := call(func(ctx context.Context) syscall.Errno {
+			return handle.close(ctx, owner, false)
+		}); errno != 0 {
+			t.Fatalf("owner %d close: %v", owner, errno)
+		}
+	}
+	mount.posixMu.Lock()
+	defer mount.posixMu.Unlock()
+	if len(mount.posixLocks) != 0 {
+		t.Fatalf("POSIX lock owner map retained %d entries", len(mount.posixLocks))
+	}
+}

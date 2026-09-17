@@ -2818,6 +2818,7 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 	// Epoch recovery retired this capability; closing it on the new session
 	// cannot release any old resource and must not revoke the recovered mount.
 	if handle.file.stale.Load() || handle.file.node.epochStale.Load() {
+		handle.file.node.mount.forgetPOSIXLock(handle.file.node.posixLockKey(input.LockOwner))
 		return
 	}
 	// RELEASE has no reply, so the kernel has already forgotten this file

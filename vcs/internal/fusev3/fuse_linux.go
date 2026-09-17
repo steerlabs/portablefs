@@ -1792,6 +1792,11 @@ func (h *fileHandle) close(ctx context.Context, lockOwner uint64, flockUnlock bo
 }
 
 func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, flockUnlock bool) resourceCleanupError {
+	if h != nil && h.node != nil && h.node.mount != nil {
+		// Closing any descriptor releases this owner's POSIX locks on the inode,
+		// even when the Authority close itself is refused or its result is lost.
+		h.node.mount.forgetPOSIXLock(h.node.posixLockKey(lockOwner))
+	}
 	if h.stale.Load() || h.node.epochStale.Load() {
 		return resourceCleanupError{cause: syscall.EIO}
 	}
@@ -2881,12 +2886,22 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	if lock.Typ != syscall.F_RDLCK && lock.Typ != syscall.F_WRLCK && lock.Typ != syscall.F_UNLCK || flags&^uint32(fuse.FUSE_LK_FLOCK) != 0 {
 		return syscall.EINVAL
 	}
-	if flags&uint32(fuse.FUSE_LK_FLOCK) == 0 && lock.Typ != syscall.F_UNLCK {
-		n.mount.notePOSIXLock(n.posixLockKey(owner))
+	posix := flags&uint32(fuse.FUSE_LK_FLOCK) == 0
+	key := n.posixLockKey(owner)
+	generation := uint64(0)
+	if posix {
+		if lock.Typ == syscall.F_UNLCK {
+			generation = n.mount.possiblePOSIXLock(key)
+		} else {
+			n.mount.notePOSIXLock(key)
+		}
 	}
 	request := &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{Lock: lockRequest(n.item.GetToken(), owner, lock, flags), Wait: wait, Unlock: lock.Typ == syscall.F_UNLCK}}}
 	if !wait {
 		_, errno := n.mutate(ctx, request)
+		if errno == 0 && lock.Typ == syscall.F_UNLCK && posix {
+			n.mount.dischargePOSIXLock(key, generation)
+		}
 		return errno
 	}
 	// A blocking lock request has no operation deadline: it is defined to wait
@@ -2898,7 +2913,11 @@ func (n *node) setLock(ctx context.Context, owner uint64, lock *fuse.FileLock, f
 	}
 	defer releaseBulk()
 	response, err := n.mount.callMutation(ctx, request, nil)
-	return rpcErrno(response, err)
+	errno = rpcErrno(response, err)
+	if errno == 0 && lock.Typ == syscall.F_UNLCK && posix {
+		n.mount.dischargePOSIXLock(key, generation)
+	}
+	return errno
 }
 
 func protocolOpenFlags(flags uint32) (*authoritypb.OpenFlags, syscall.Errno) {

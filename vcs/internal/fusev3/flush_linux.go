@@ -49,6 +49,12 @@ func (m *Mount) dischargePOSIXLock(key posixLockKey, generation uint64) {
 	}
 }
 
+func (m *Mount) forgetPOSIXLock(key posixLockKey) {
+	m.posixMu.Lock()
+	delete(m.posixLocks, key)
+	m.posixMu.Unlock()
+}
+
 // localFullFlush samples the grant and the identity loss ticket under the same
 // admission read lock. Retirement takes the write side, so it either precedes
 // this sample and forces an Authority FLUSH or follows the local completion.
