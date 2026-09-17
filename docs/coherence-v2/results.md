@@ -471,3 +471,24 @@ Allocation counts are unchanged after descriptor warmup (278, 1,050, 4,128 and
 16,424 per batch respectively). The improvement removes repeated prefix walks;
 it does not change CONTROL wire bytes or event count. Logs:
 `/tmp/cv2-g2-control-bench-before.log` and `control-bench-after.log`.
+
+## G2 replay fingerprint accounting
+
+The production request reader already hashes bulk bytes during ingress and
+passes that digest into canonical metadata hashing (prior G commits `ad12b9c`
+and `04cdfab`). No second payload walk remains to remove. Three 750 ms samples
+on the Apple M5 Max host, median, `/tmp/cv2-g2-fingerprint-bench.log`:
+
+| 1 MiB WRITE path | Time | Bytes allocated | Allocations |
+| --- | ---: | ---: | ---: |
+| Standalone fingerprint, including payload SHA-256 | 331.101 us | 520 | 9 |
+| Production canonical fingerprint with ingress digest | 1.404 us | 520 | 9 |
+| Retained frame read with ingress digest | 329.866 us | 1,105 | 14 |
+| Retained frame read without digest | 13.787 us | 504–528 | 10 |
+| Protobuf clone | 54.933 us | 1,048,873–1,048,874 | 5 |
+| Protobuf marshal | 38.024 us | 1,056,792 | 2 |
+
+These isolate CPU work over an in-memory frame. They are not end-to-end write
+latencies or a new before/after implementation claim. Payload authentication
+still costs CPU; metadata canonicalization is below one percent of the digesting
+reader time. The existing digest-equivalence regression passes with these runs.

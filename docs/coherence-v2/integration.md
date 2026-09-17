@@ -2027,3 +2027,18 @@ The regression test blocks the version sample and proves that a conflicting
 storage mutation cannot enter. Both arms fail against the prior handler
 (`/tmp/cv2-g2-read-stamp-fault.log`); ten focused Linux repetitions pass
 (`/tmp/cv2-g2-read-stamp.log`).
+
+#### G2 items 11 fingerprint and 12: prior work verified
+
+The reported large-WRITE fingerprint benchmark includes the full payload hash.
+Production already consumes the ingress digest (`ad12b9c`, `04cdfab`) and hashes
+only canonical metadata afterward. Added separate benchmarks for the real
+request reader and retained-digest fingerprint; the existing streamed/one-shot
+fingerprint equivalence test passes. Results are in results.md. No duplicate
+payload walk was reintroduced or replaced speculatively.
+
+Item 12 was already completed in G (`224c829`): the sole production durable-cut
+publisher immediately retires the application ledger. The 100,000-ticket
+`TestCoherenceDurableTicketsDoNotAccumulateInLongLivedSessions` covers bounded
+retention, session isolation and sequence continuity. It remains in the full
+Authority gate; no second implementation is needed.
