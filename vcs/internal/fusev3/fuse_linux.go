@@ -546,8 +546,8 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	mount.delegations.SetCleanupFailureReporter(func(err error) {
 		mount.cleanupFailed("deferred close", err, nil)
 	})
-	mount.delegations.SetCleanupRetryWaiter(mount.subscription.waitActive)
 	mount.subscription = newSubscriptionRegistry(mount, mount.rpc, mount.delegations)
+	mount.delegations.SetCleanupRetryWaiter(mount.subscription.waitActive)
 	return mount
 }
 

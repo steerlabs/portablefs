@@ -274,6 +274,63 @@ func TestDeferredCoherenceCloseWaitsForColdSubscriptionAndRetries(t *testing.T) 
 	}
 }
 
+func TestMountDeferredCoherenceCloseUsesReplacementSubscription(t *testing.T) {
+	mount, rpc := testMount(t, 64)
+	id := installDelegationForTest(t, mount.delegations, 89, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+
+	closeCalls := 0
+	rpc.mu.Lock()
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetDelegationRelease() != nil {
+			return releaseSuccess(), nil
+		}
+		if request.GetClose() == nil {
+			return &authoritypb.Response{}, nil
+		}
+		closeCalls++
+		if closeCalls == 1 {
+			return &authoritypb.Response{
+				Errno:   int32(syscall.EIO),
+				Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
+			}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	rpc.mu.Unlock()
+
+	if err := mount.delegations.QueueClose(id, delegationTestToken(89, 2), 0, false); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, "coherence close refusal", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return closeCalls == 1
+	})
+	if stamp := mount.subscription.stamp(); stamp != (subscriptionStamp{}) {
+		t.Fatalf("coherence close refusal retained subscription %+v", stamp)
+	}
+	mount.delegations.closeMu.Lock()
+	pending := mount.delegations.closePending
+	mount.delegations.closeMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending close retired before replacement subscription: %d", pending)
+	}
+
+	if err := mount.subscription.subscribe(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, time.Second, "close retry after replacement subscription", func() bool {
+		mount.delegations.closeMu.Lock()
+		defer mount.delegations.closeMu.Unlock()
+		return mount.delegations.closePending == 0
+	})
+	rpc.mu.Lock()
+	defer rpc.mu.Unlock()
+	if closeCalls != 2 {
+		t.Fatalf("close calls = %d, want refusal plus retry", closeCalls)
+	}
+}
+
 func TestCloseBatchRejectsMalformedOutcomesBeforeRemovingHandles(t *testing.T) {
 	for name, results := range map[string][]*authoritypb.CloseBatchResult{
 		"nil": {nil}, "short": {}, "long": {{}, {}}, "negative": {{Errno: -1}}, "range": {{Errno: 4096}}, "failure with success": {{Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}}, "unknown class": {{Errno: 5, Failure: authoritypb.FailureClass(99)}},
