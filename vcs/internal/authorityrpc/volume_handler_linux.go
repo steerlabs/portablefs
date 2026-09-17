@@ -1005,7 +1005,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 			existingCoordinate, existingSize, existed = resolvedName.coordinate, resolvedName.size, resolvedName.found
 			lockIdentities := [][16]byte{parentCoordinate.identity}
-			if existed {
+			if existed && !body.Create.GetExclusive() {
 				lockIdentities = append(lockIdentities, existingCoordinate.identity)
 			}
 			releaseMutation, err = lockMutationStore(h.Store, lockIdentities...)
@@ -1034,7 +1034,10 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if existed {
 				existingSize = lockedName.size
 			}
-			if !existed {
+			if !existed || body.Create.GetExclusive() {
+				// O_EXCL can only create a new binding or return EEXIST. Even if a
+				// peer installs the name after the first resolution, this operation
+				// cannot publish or mutate that peer's inode.
 				return []volumeserver.VisibilityTarget{namespaceTarget(parentCoordinate, body.Create.GetName()), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0)}, nil
 			}
 			// Existing-name CREATE publishes an exact name snapshot and both object
@@ -4206,11 +4209,6 @@ func (h *VolumeHandler) sessionPurpose(id volumeserver.SessionID) (authoritypb.S
 		return authoritypb.SessionPurpose_SESSION_PURPOSE_UNSPECIFIED, volumeserver.ErrSessionExpired
 	}
 	return resources.purpose, nil
-}
-
-func (h *VolumeHandler) strictSession(id volumeserver.SessionID) bool {
-	profile, err := h.sessionCoherence(id)
-	return err == nil && profile == volumeserver.CoherenceStrict
 }
 
 func (h *VolumeHandler) lookupCoordinate(parent xfsstore.Capability, name []byte) (visibilityCoordinate, bool, error) {

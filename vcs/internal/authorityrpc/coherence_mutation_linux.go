@@ -120,7 +120,7 @@ func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb
 				identity = t.BoundIdentities[0]
 			}
 		}
-		if !intent && !b.Create.GetFlags().GetTruncate() {
+		if b.Create.GetExclusive() || (!intent && !b.Create.GetFlags().GetTruncate()) {
 			identity = [16]byte{}
 		}
 	}
@@ -132,6 +132,11 @@ func (h *VolumeHandler) coherencePreflight(ctx context.Context, req *authoritypb
 		// cuts are still necessary for attribute-bearing mutation post-state.
 		for _, t := range gate.Targets {
 			ids := t.BoundIdentities
+			if create := req.GetCreate(); create != nil && create.GetExclusive() {
+				// O_EXCL can never mutate the pre-existing object. The storage
+				// turn decides EEXIST without cutting the winner's delegation.
+				ids = nil
+			}
 			if t.Identity != ([16]byte{}) {
 				ids = append(append([][16]byte(nil), ids...), t.Identity)
 			}
@@ -261,28 +266,31 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				finishPin(0)
 				return h.coherenceError(0, err)
 			}
-			terminal, err := h.Runtime.SessionTerminal(cred.ID)
-			if err == nil {
-				select {
-				case <-terminal:
-					err = volumeserver.ErrSessionFenced
-				default:
-				}
-			}
-			if err != nil || ctx.Err() != nil {
+			if err := ctx.Err(); err != nil {
 				releaseStorage()
 				releaseTurn()
 				finishPin(0)
-				if err == nil {
-					err = ctx.Err()
-				}
+				return h.coherenceError(0, err)
+			}
+			applyUse, err := h.Runtime.Begin(cred)
+			if err != nil {
+				releaseStorage()
+				releaseTurn()
+				finishPin(0)
 				return h.coherenceError(0, err)
 			}
 			// Profile admission excludes Mac activation across ordinary Linux
 			// mutations. Recall flushes have an exact generation pin instead.
-			// The v7 storage turn is the sole mutation scheduler on this path.
+			// The fresh runtime pin is the atomic source-liveness cut: a fence
+			// either wins before it or follows an operation already admitted to
+			// apply. The v7 storage turn remains the sole mutation scheduler.
 			provisional := h.coherenceOperationSequence.Add(1) | uint64(1)<<63
-			response, changes := apply(provisional)
+			var response *authoritypb.Response
+			var changes []volumeserver.VisibilityTarget
+			func() {
+				defer applyUse.End()
+				response, changes = apply(provisional)
+			}()
 			if response == nil {
 				response = h.errorResponse(0, errInternal, true)
 			}

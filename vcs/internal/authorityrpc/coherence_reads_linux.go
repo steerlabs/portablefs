@@ -450,7 +450,7 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				h.forgetDirectoryCandidates(candidates)
 				return h.errorResponse(0, acquireErr, false)
 			}
-			valid, verifyErr := h.coherenceRevalidateDirectoryPage(handle, directory, cookie, current, int(request.GetMaxEntries()), entries, eof, candidates)
+			valid, revalidated, verifyErr := h.coherenceRevalidateDirectoryPage(handle, directory, cookie, int(request.GetMaxEntries()), entries, eof, candidates)
 			if verifyErr != nil || !valid {
 				release()
 				pageGuard.Release()
@@ -460,6 +460,7 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				}
 				continue
 			}
+			current = revalidated
 			admission := volumeserver.CacheAdmission{Directories: [][16]byte{directoryIdentity}}
 			for _, candidate := range candidates {
 				if candidate.identity != ([16]byte{}) {
@@ -537,18 +538,17 @@ func (h *VolumeHandler) coherenceDirectoryDependencies(directory [16]byte, candi
 func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 	handle, directory xfsstore.Capability,
 	cookie uint64,
-	verifier [16]byte,
 	maxEntries int,
 	entries []xfsstore.Dirent,
 	eof bool,
 	candidates []directoryPageCandidate,
-) (bool, error) {
+) (bool, [16]byte, error) {
 	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.coherenceReadDirPage(handle, cookie, maxEntries)
 	if err != nil {
-		return false, err
+		return false, [16]byte{}, err
 	}
-	if checkDirectory != directory || checkVerifier != verifier || checkEOF != eof || !sameDirectoryEnumeration(checkEntries, entries) {
-		return false, nil
+	if checkDirectory != directory || checkEOF != eof || !sameDirectoryEnumeration(checkEntries, entries) {
+		return false, checkVerifier, nil
 	}
 	for _, candidate := range candidates {
 		if candidate.item == (xfsstore.Capability{}) {
@@ -557,21 +557,21 @@ func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 		item, attr, lookupErr := h.Store.LookupOpen(handle, candidate.enumerated.Name)
 		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
 			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
-			return false, nil
+			return false, checkVerifier, nil
 		}
 		if lookupErr != nil {
-			return false, lookupErr
+			return false, checkVerifier, lookupErr
 		}
 		identity, identityErr := h.Store.Identity(item)
 		forgetErr := h.Store.Forget(item)
 		if identityErr != nil || forgetErr != nil {
-			return false, errors.Join(identityErr, forgetErr)
+			return false, checkVerifier, errors.Join(identityErr, forgetErr)
 		}
 		if identity != candidate.identity || attr != candidate.attr {
-			return false, nil
+			return false, checkVerifier, nil
 		}
 	}
-	return true, nil
+	return true, checkVerifier, nil
 }
 
 // coherenceReadDirPage uses the store's stable XFS continuation offsets.

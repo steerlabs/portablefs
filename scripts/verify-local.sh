@@ -191,12 +191,14 @@ then
   exit 1
 fi
 
-# Protocol 7 uses subscriptions and file delegations. The old non-participant profile
-# and both retired namespace-repair models keep their names reserved in the
+# Protocol 7 uses explicit frontend profiles, subscriptions and file delegations.
+# Broad cross-frontend profile predicates, the old non-participant profile and both
+# retired namespace-repair models keep their names reserved in the
 # source schema (and therefore in generated descriptor bytes), while docs and
 # the changelog may describe their retirement. None may re-enter executable
 # code, tests, scripts, or configuration.
 if rg --hidden -n \
+	-e '\bstrictSession\b' \
   -e 'CoherenceUncached' \
   -e 'COHERENCE_PROFILE_UNCACHED' \
   -e 'PORTABLEFS_COHERENCE' \

@@ -208,7 +208,9 @@ The current evidence and remaining product gates are in [integration.md](integra
 Integration replaces ordinal cookies with XFS getdents offsets. The store ReadDirOpen API takes only a cookie and page bound; it returns the
 current page stamp for publication revalidation. Continuation seeks to the
 store cookie without accepting an unused input verifier. The frozen wire
-verifier remains optional and shape-checked; it does not authorize continuation. The concurrent peer
+verifier remains optional and shape-checked; it does not authorize continuation.
+The reply publishes the page stamp sampled by the storage-turn revalidation,
+not the earlier probe's stamp. The concurrent peer
 creator/deleter regression requires every unchanged entry exactly once and refuses
 ESTALE.
 

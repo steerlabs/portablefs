@@ -743,3 +743,38 @@ The full G2 implementation/test/file/interface report is [G2-report.md](G2-repor
 The separately invoked final `bash scripts/coherence-matrix-linux.sh` also
 exits 0 (`/tmp/cv2-g2-final-matrix.log`): 28 cases and all controls pass,
 with the unchanged declared chown skip and both mounts still serving.
+
+## G3b Authority baseline
+
+Measured `e856d54` on Linux `6.8.0-100-generic` with:
+
+```sh
+PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_PROFILE_DIR=/tmp/cv2-g3b-baseline \
+  PORTABLEFS_PROFILE_RUN=g3b-final \
+  PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' \
+  bash scripts/xfs-fuse-integration.sh
+```
+
+All baseline subtests passed in 121.65 seconds. The wrapper exited 70 because
+this focused invocation intentionally omitted the required full-gate inventory;
+it is not a full gate result. Profiles are under `/tmp/cv2-g3b-baseline`.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+|---|---|---:|---:|---:|---:|
+| install, 1 worker | direct-xfs | 0.695729 | 0 | 0.000000 | 0.000000 |
+| install, 8 workers | direct-xfs | 0.577609 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker | portablefs | 22.233231 | 83,149 | 1.979738 | 1.965714 |
+| install, 8 workers | portablefs | 11.740184 | 83,055 | 1.977500 | 1.965643 |
+| git-status-cold | direct-xfs | 0.008295 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006261 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.802987 | 40,628 | 2.031400 | 1.026050 |
+| git-status-warm | portablefs | 2.043918 | 20,471 | 1.023550 | 0.018150 |
+| two-mount-write-list-read | direct-xfs | 0.038529 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 2.990582 | 153,833 | 38.458250 | 3.152750 |
+
+The one-worker install issued 40,000 CREATEs, 40,000 WRITEs, 556 batched
+closes/releases, and no LOOKUPs. The eight-worker install issued 168 LOOKUPs
+and 72 GETATTRs. Cold Git issued 20,140 LOOKUPs; warm Git issued two. The peer
+workload's 130,308 RECLAIMs continue to dominate its request count. These
+measurements include profiling overhead and do not isolate the small G3b
+Authority correctness changes from run-to-run host variance.
