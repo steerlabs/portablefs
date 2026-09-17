@@ -2330,6 +2330,7 @@ type existingCreateMutationLockStore struct {
 	identities [][16]byte
 	lookups    uint32
 	creates    uint32
+	opens      uint32
 }
 
 func (s *existingCreateMutationLockStore) LockMutation(identities [][16]byte) func() {
@@ -2372,7 +2373,7 @@ func (s *existingCreateMutationLockStore) CoordinateItem(item xfsstore.Capabilit
 	return xfsstore.ObjectCoordinate{Stable: [16]byte{item[0]}, Ino: uint64(item[0]), DeviceMinor: 1}, nil
 }
 
-func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, _ bool) (xfsstore.Capability, xfsstore.Attr, error) {
+func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ string, _ os.FileMode, exclusive bool) (xfsstore.Capability, xfsstore.Attr, error) {
 	s.requireLocked("existing CREATE apply")
 	s.mu.Lock()
 	s.creates++
@@ -2384,11 +2385,17 @@ func (s *existingCreateMutationLockStore) Create(parent xfsstore.Capability, _ s
 	if parent != s.parent {
 		s.t.Errorf("create parent = %x, want %x", parent, s.parent)
 	}
+	if exclusive {
+		return xfsstore.Capability{}, xfsstore.Attr{}, syscall.EEXIST
+	}
 	return target, xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(target[0]), Size: 17, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
 }
 
 func (s *existingCreateMutationLockStore) OpenFile(item xfsstore.Capability, flags xfsstore.OpenFlags) (xfsstore.Capability, error) {
 	s.requireLocked("existing CREATE open")
+	s.mu.Lock()
+	s.opens++
+	s.mu.Unlock()
 	target := s.target
 	if s.bindingChanges {
 		target = s.replacement
@@ -2466,6 +2473,50 @@ func TestExistingCreateLocksAndReturnsExactParentTargetState(t *testing.T) {
 				t.Fatalf("existing CREATE lock lifecycle/identities = locked:%v released:%v %x", store.locked, store.released, store.identities)
 			}
 		})
+	}
+}
+
+func TestExclusiveExistingCreateDoesNotWaitForFskitBoundIdentity(t *testing.T) {
+	store := &existingCreateMutationLockStore{
+		t: t, parent: xfsstore.Capability{0x72}, target: xfsstore.Capability{0x73},
+		handle: xfsstore.Capability{0x74},
+	}
+	h, ctx, credential, root := resourceAdmissionFskitRequestHarness(t, store, 2, 2)
+	release, err := h.coherenceStorage.Acquire(t.Context(), coherenceInodeDependencies([16]byte{store.target[0]}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	done := make(chan *authoritypb.Response, 1)
+	go func() { done <- h.Handle(ctx, resourceAcquisitionRequest(t, "create", credential, root)) }()
+	var response *authoritypb.Response
+	select {
+	case response = <-done:
+	case <-time.After(250 * time.Millisecond):
+		release()
+		released = true
+		response = <-done
+		t.Fatalf("exclusive existing CREATE waited for target identity turn: %+v", response)
+	}
+	if response.GetErrno() != int32(syscall.EEXIST) || response.GetUncertain() || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED {
+		t.Fatalf("exclusive existing CREATE response = %+v, want definite EEXIST", response)
+	}
+	if response.GetCreate() != nil || response.GetPostState() != nil {
+		t.Fatalf("exclusive existing CREATE published success state: %+v", response)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.creates != 1 || store.opens != 0 || store.locked || !store.released {
+		t.Fatalf("exclusive existing CREATE lifecycle: creates=%d opens=%d locked=%v released=%v", store.creates, store.opens, store.locked, store.released)
+	}
+	if len(store.identities) != 1 || store.identities[0] != [16]byte{store.parent[0]} {
+		t.Fatalf("exclusive existing CREATE lock set = %x, want parent only", store.identities)
 	}
 }
 
