@@ -233,10 +233,17 @@ func TestReadDirPlusTakeOwnsCapabilityAcrossInvalidation(t *testing.T) {
 	defer raw.releaseHandleOperation(held)
 	ctx, finish := testMutationContext(t, mount)
 	defer finish(false)
+	cursor, errno := handle.beginDirPlus(ctx, 0)
+	if errno != 0 {
+		t.Fatal(errno)
+	}
+	if err := raw.attachDirPlusLookupTransaction(ctx, cursor, held); err != nil {
+		t.Fatal(err)
+	}
 	small := fuse.NewDirEntryList(make([]byte, 1), 0)
 	entry, dirent, item, out, _, errno := handle.takePlus(ctx, small, &dirPlusPageBoundary{})
 	if errno != 0 || entry == nil || dirent == nil || item != nil || out != nil || dirent.Item == nil || handle.next != 0 {
-		t.Fatal("full buffer consumed capability or cursor")
+		t.Fatalf("full buffer consumed capability or cursor: errno=%v entry_nil=%t dirent_nil=%t item_nil=%t out_nil=%t dirent_item_nil=%t next=%d", errno, entry == nil, dirent == nil, item == nil, out == nil, dirent == nil || dirent.Item == nil, handle.next)
 	}
 	entry, dirent, item, out, _, errno = handle.takePlus(ctx, fuse.NewDirEntryList(make([]byte, 4096), 0), &dirPlusPageBoundary{})
 	if errno != 0 || item == nil || out == nil || dirent.Item != nil {
