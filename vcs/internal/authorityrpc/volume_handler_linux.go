@@ -4208,11 +4208,6 @@ func (h *VolumeHandler) sessionPurpose(id volumeserver.SessionID) (authoritypb.S
 	return resources.purpose, nil
 }
 
-func (h *VolumeHandler) strictSession(id volumeserver.SessionID) bool {
-	profile, err := h.sessionCoherence(id)
-	return err == nil && profile == volumeserver.CoherenceStrict
-}
-
 func (h *VolumeHandler) lookupCoordinate(parent xfsstore.Capability, name []byte) (visibilityCoordinate, bool, error) {
 	item, attr, err := h.Store.Lookup(parent, string(name))
 	if err != nil {
