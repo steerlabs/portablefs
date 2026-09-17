@@ -201,6 +201,9 @@ func sameDelegation(a, b *authoritypb.DelegationRef) bool {
 }
 
 func (m *delegationManager) state(id writeback.Identity) *delegationState {
+	if s := m.lookupState(id); s != nil {
+		return s
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := m.byID[id]

@@ -213,33 +213,51 @@ func TestFullHolderMetadataWithdrawalWaitsWithoutDelegationLocks(t *testing.T) {
 }
 
 func TestFullHolderMetadataTerminalizationJoinsPhysicalPin(t *testing.T) {
-	f, entry := dirtyHolderMetadataFixture(t)
-	unique := f.unique.Add(2)
-	if status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{}); status != fuse.OK {
-		t.Fatal(status)
-	}
-	f.raw.mu.Lock()
-	p := f.raw.replyPublications[unique]
-	s := p.holderAdmission
-	f.raw.mu.Unlock()
-	if s == nil {
-		t.Fatal("missing holder pin")
-	}
-	if f.raw.terminalizeReplyCacheOwnership(time.Now()) {
-		t.Fatal("terminalization crossed unwritten holder reply")
-	}
-	if s.admission.TryLock() {
-		s.admission.Unlock()
-		t.Fatal("terminalization dropped physical pin")
-	}
-	f.raw.ReplyWritten(unique, fuse.OK)
-	if !f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second)) {
-		t.Fatal("terminalization did not join holder reply")
-	}
-	f.raw.mu.Lock()
-	defer f.raw.mu.Unlock()
-	if len(f.raw.replyPublications) != 0 {
-		t.Fatal("terminalization leaked holder publication")
+	for _, connectionGone := range []bool{false, true} {
+		name := "reply-written"
+		if connectionGone {
+			name = "connection-gone"
+		}
+		t.Run(name, func(t *testing.T) {
+			f, entry := dirtyHolderMetadataFixture(t)
+			unique := f.unique.Add(2)
+			if status := f.raw.GetAttr(nil, &fuse.GetAttrIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}}, &fuse.AttrOut{}); status != fuse.OK {
+				t.Fatal(status)
+			}
+			f.raw.PrepareReplyPayload(unique, 1, 1, nil, nil, 0)
+			f.raw.mu.Lock()
+			p := f.raw.replyPublications[unique]
+			s := p.holderAdmission
+			f.raw.mu.Unlock()
+			if s == nil {
+				t.Fatal("missing holder pin")
+			}
+			if f.raw.terminalizeReplyCacheOwnership(time.Now()) {
+				t.Fatal("terminalization crossed unwritten holder reply")
+			}
+			if s.admission.TryLock() {
+				s.admission.Unlock()
+				t.Fatal("terminalization dropped physical pin")
+			}
+			if connectionGone {
+				f.raw.terminalizeReplyCacheOwnershipAfterConnectionGone()
+			} else {
+				f.raw.ReplyWritten(unique, fuse.OK)
+			}
+			if !f.raw.terminalizeReplyCacheOwnership(time.Now().Add(time.Second)) {
+				t.Fatal("terminalization did not join holder reply")
+			}
+			if !s.admission.TryLock() {
+				t.Fatal("physical completion retained holder pin")
+			}
+			s.admission.Unlock()
+			f.raw.mu.Lock()
+			defer f.raw.mu.Unlock()
+			if len(f.raw.replyPublications) != 0 {
+				t.Fatal("terminalization leaked holder publication")
+			}
+
+		})
 	}
 }
 

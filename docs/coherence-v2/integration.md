@@ -2086,3 +2086,22 @@ in its final Client field and only carries the channel, slot slice and base from
 configuration. `go -C vcs vet ./internal/authorityrpc` and three focused protocol
 lane/ordered-frame race repetitions pass (`/tmp/cv2-g2-lane-vet.log`). The failed
 full attempt is preserved as `/tmp/cv2-g2-final-full.log`; it is not gate evidence.
+
+#### G2 read-registry completion and terminal holder proof
+
+Review found two remaining exclusive read paths: stable binding observation and
+`state` when the delegation already exists. Both now use shared admission;
+creation still rechecks under the exclusive lock. The overlap test covers all
+converted readers, including data obligations and retained loss/error history.
+Both newly converted paths fail with the former implementation
+(`/tmp/cv2-g2-registry-complete-fault.log`). Ten focused repetitions pass
+(`/tmp/cv2-g2-registry-complete2.log`). The holder terminalization test now also
+proves that confirmed connection loss settles a finalized reply whose physical
+callback never arrives and releases its retirement pin.
+
+The full gate at `b2d9671` passed native builds/vet/Go/race, all 345 Swift tests,
+release checks, all 76 privileged XFS cases plus the root boundary, and the
+coherence matrix with its controls (`/tmp/cv2-g2-final-full2.log`). A concurrent
+longer profiling run subsequently exposed a Git-add lock cycle; that run was
+terminated with SIGQUIT after capturing its stacks and is not a passing baseline.
+The fix and another complete gate follow below.
