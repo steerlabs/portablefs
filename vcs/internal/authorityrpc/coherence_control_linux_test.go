@@ -893,6 +893,87 @@ func TestCoherencePollReusesBoundedStorageWithoutAliasingReplies(t *testing.T) {
 	}
 }
 
+func TestCoherencePollDoesNotClearAliasedFrameLeftover(t *testing.T) {
+	handler, coordinator := newCoherenceControlTestHandler(t, 1<<20)
+	id := volumeserver.SessionID{1}
+	subscribed, token := subscribeCoherenceControlTest(t, handler, id)
+	identity := [16]byte{0x71}
+	reservation, err := coordinator.ReserveNew(token, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.rememberCoherenceDelegation(grant); err != nil {
+		t.Fatal(err)
+	}
+	publishPeerControlChange(coordinator)
+	breakDone := make(chan error, 1)
+	go func() { breakDone <- coordinator.BreakForRead(t.Context(), identity) }()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	for found := false; !found; {
+		events, pollErr := coordinator.Poll(ctx, token, 0, nil, 16)
+		if pollErr != nil {
+			t.Fatal(pollErr)
+		}
+		for _, event := range events {
+			found = found || event.Kind == volumeserver.StreamBreakForRead
+		}
+	}
+
+	first := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, 0).GetControlEvent()
+	if first.GetChangeBatch() == nil {
+		t.Fatalf("first event = %+v, want change batch", first)
+	}
+	state := handler.initCoherenceControlState()
+	state.mu.Lock()
+	session := state.sessions[id]
+	aliased := false
+	if len(session.queued) == 1 {
+		for i := range session.pollBuffer {
+			aliased = aliased || &session.queued[0] == &session.pollBuffer[i]
+		}
+	}
+	if !aliased || session.queued[0].Kind != volumeserver.StreamBreakForRead {
+		state.mu.Unlock()
+		t.Fatalf("split queue does not alias retained poll buffer: queued=%+v buffer=%+v", session.queued, session.pollBuffer)
+	}
+	state.mu.Unlock()
+
+	second := pollCoherenceControlTest(t, handler, id, subscribed.Incarnation, first.Sequence).GetControlEvent()
+	if second.GetDelegationBreak() == nil || second.GetSequence() != first.GetSequence()+1 {
+		t.Fatalf("aliased leftover = %+v, want contiguous break", second)
+	}
+	response := handler.handleCoherenceDelegationAck(99, id, coherenceControlBreak, subscribed.Incarnation, second.Sequence, coherenceDelegationRefProto(grant), 0)
+	if response.GetErrno() != 0 {
+		t.Fatal(response)
+	}
+	select {
+	case err := <-breakDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("break did not complete after preserved leftover acknowledgment")
+	}
+}
+
+func TestCoherencePollBufferReuseRequiresDrainedQueue(t *testing.T) {
+	session := &coherenceControlSession{
+		queued:     []volumeserver.StreamEvent{{Kind: volumeserver.StreamChange}},
+		pollBuffer: []volumeserver.StreamEvent{{Kind: volumeserver.StreamChange}},
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("poll buffer reuse accepted an undrained aliased queue")
+		}
+	}()
+	reuseCoherencePollBufferLocked(session)
+}
+
 func TestCoherenceControlAutoAckRequiresDrainedQueue(t *testing.T) {
 	for _, state := range []string{"queued", "unacknowledged", "drained"} {
 		t.Run(state, func(t *testing.T) {

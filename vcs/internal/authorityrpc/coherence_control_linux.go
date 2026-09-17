@@ -490,10 +490,7 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 			state.mu.Unlock()
 			return h.coherenceError(requestID, err)
 		}
-		// The sole active poll owns this bounded batch. Wire events and replay
-		// have independent storage, and the queue is fully drained here.
-		clear(session.pollBuffer)
-		dst := session.pollBuffer[:0]
+		dst := reuseCoherencePollBufferLocked(session)
 		state.mu.Unlock()
 
 		events, nextCursor, pollErr := h.Coherence.PollControl(ctx, token, cursor, dst, coherenceControlBatchLimit)
@@ -513,6 +510,16 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 		}
 		state.mu.Unlock()
 	}
+}
+
+func reuseCoherencePollBufferLocked(session *coherenceControlSession) []volumeserver.StreamEvent {
+	// queued may be a subslice of pollBuffer. Reusing the backing array before
+	// every split wire frame is drained would erase the next event.
+	if len(session.queued) != 0 {
+		panic("authorityrpc: coherence poll buffer reused before queued events drained")
+	}
+	clear(session.pollBuffer)
+	return session.pollBuffer[:0]
 }
 
 func coherenceControlEventResponse(h *VolumeHandler, requestID uint64, event *authoritypb.ControlEvent) *authoritypb.Response {
