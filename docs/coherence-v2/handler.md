@@ -185,8 +185,10 @@ F1 originally stopped at the handler boundary. Workstream G has since
 integrated F2, deleted the old Linux lease paths, and qualified real mounts.
 The current evidence and remaining product gates are in [integration.md](integration.md).
 
-Integration replaces ordinal cookies with XFS getdents offsets. Continuation seeks to
-the store cookie without rejecting a changed verifier. The concurrent peer
+Integration replaces ordinal cookies with XFS getdents offsets. The store ReadDirOpen API takes only a cookie and page bound; it returns the
+current page stamp for publication revalidation. Continuation seeks to the
+store cookie without accepting an unused input verifier. The frozen wire
+verifier remains optional and shape-checked; it does not authorize continuation. The concurrent peer
 creator/deleter regression requires every unchanged entry exactly once and refuses
 ESTALE.
 

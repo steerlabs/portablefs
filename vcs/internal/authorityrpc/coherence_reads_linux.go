@@ -319,16 +319,14 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 		if err != nil {
 			return h.errorResponse(0, err, false)
 		}
-		var verifier [16]byte
-		if len(request.GetVerifier()) != 0 {
-			if len(request.GetVerifier()) != len(verifier) {
-				return h.errorResponse(0, syscall.EINVAL, false)
-			}
-			copy(verifier[:], request.GetVerifier())
+		// The frozen wire field remains shape-checked. Continuation uses only
+		// the issued cookie; the current page stamp comes from storage.
+		if len(request.GetVerifier()) != 0 && len(request.GetVerifier()) != 16 {
+			return h.errorResponse(0, syscall.EINVAL, false)
 		}
 		budget := h.readDirEntryBudget(request.GetMaxEntries())
 		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-			entries, _, current, eof, directory, readErr := h.coherenceReadDirPage(handle, cookie, verifier, int(request.GetMaxEntries()))
+			entries, _, current, eof, directory, readErr := h.coherenceReadDirPage(handle, cookie, int(request.GetMaxEntries()))
 			if readErr != nil {
 				return h.errorResponse(0, readErr, false)
 			}
@@ -443,7 +441,7 @@ func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 	eof bool,
 	candidates []directoryPageCandidate,
 ) (bool, error) {
-	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.coherenceReadDirPage(handle, cookie, verifier, maxEntries)
+	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.coherenceReadDirPage(handle, cookie, maxEntries)
 	if err != nil {
 		return false, err
 	}
@@ -475,6 +473,6 @@ func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 }
 
 // coherenceReadDirPage uses the store's stable XFS continuation offsets.
-func (h *VolumeHandler) coherenceReadDirPage(handle xfsstore.Capability, cookie uint64, verifier [16]byte, maxEntries int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
-	return h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
+func (h *VolumeHandler) coherenceReadDirPage(handle xfsstore.Capability, cookie uint64, maxEntries int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	return h.Store.ReadDirOpen(handle, cookie, maxEntries)
 }

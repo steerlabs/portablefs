@@ -963,3 +963,18 @@ Validation: cross-compiled `./internal/authorityrpc` with
 `CGO_ENABLED=0 GOOS=linux go -C vcs test -c`, then executed the test binary in
 the pinned Docker image with `-test.run '^TestCoherenceSetAttrRequiresItemOrHandle$'
 -test.v`. All eight cases pass; log `/tmp/cv2-g2-r4.log`.
+
+### R5: cookie-only store continuation
+
+Removed the unused input verifier from the store ReadDirOpen API, its handler
+interface, adapters, and callers. The returned page verifier still guards
+publication revalidation. Stable-cookie seek and concurrent-mutation tests keep
+their exact-once unchanged-entry assertions; callers cannot silently supply an
+ignored verifier to the store anymore. The frozen wire verifier remains
+optional, shape-checked, and independent of continuation authority. A new
+handler test refuses malformed lengths before any enumeration call.
+
+`PORTABLEFS_GO_TEST_FLAGS='-run ^Test(ReadDir|CoherenceReadDir|CoherenceLookupAndEmptyReadDir)'
+bash scripts/xfs-fuse-integration.sh` passes every selected test with no selected
+skip, including deep-cookie seeks and concurrent directory mutation. Exit 70
+reports only unselected full-suite inventory. Log: `/tmp/cv2-g2-r5.log`.

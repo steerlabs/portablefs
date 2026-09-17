@@ -18,14 +18,13 @@ func readDirAll(t *testing.T, v *Volume, handle Capability, page int) []Dirent {
 	t.Helper()
 	var all []Dirent
 	cookie := uint64(0)
-	var verifier [16]byte
 	for {
-		entries, next, current, eof, _, err := v.ReadDirOpen(handle, cookie, verifier, page)
+		entries, next, _, eof, _, err := v.ReadDirOpen(handle, cookie, page)
 		if err != nil {
 			t.Fatalf("ReadDirOpen(cookie=%d): %v", cookie, err)
 		}
 		all = append(all, entries...)
-		cookie, verifier = next, current
+		cookie = next
 		if eof {
 			return all
 		}
@@ -96,7 +95,7 @@ func TestReadDirSurvivesUnlinkAfterGetdents(t *testing.T) {
 	if kind, err := opened.entryKind(unix.DT_UNKNOWN, "victim"); err != nil || kind != KindOpaque {
 		t.Fatalf("unknown getdents type after unlink = %d, %v", kind, err)
 	}
-	if entries, _, _, _, _, err := v.ReadDirOpen(handle, 0, [16]byte{}, 1); err != nil || len(entries) != 0 {
+	if entries, _, _, _, _, err := v.ReadDirOpen(handle, 0, 1); err != nil || len(entries) != 0 {
 		t.Fatalf("emptied directory = %d entries, %v", len(entries), err)
 	}
 }
@@ -149,7 +148,7 @@ func TestReadDirListsForbiddenInodeTypes(t *testing.T) {
 	}
 }
 
-// A changed or omitted page stamp never invalidates an issued XFS position.
+// Directory mutations never invalidate an issued XFS position.
 func TestReadDirStableCookiesSurviveMutation(t *testing.T) {
 	v := openTestVolume(t)
 	root, _ := v.Root()
@@ -162,9 +161,8 @@ func TestReadDirStableCookiesSurviveMutation(t *testing.T) {
 	handle := mustOpenDir(t, v, root)
 	seen := make(map[string]int)
 	var cookie uint64
-	var verifier [16]byte
 	for page := 0; ; page++ {
-		entries, next, current, eof, _, err := v.ReadDirOpen(handle, cookie, verifier, 7)
+		entries, next, _, eof, _, err := v.ReadDirOpen(handle, cookie, 7)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -190,10 +188,6 @@ func TestReadDirStableCookiesSurviveMutation(t *testing.T) {
 			}
 		}
 		cookie = next
-		verifier = current
-		if page%2 == 0 {
-			verifier = [16]byte{}
-		}
 	}
 	for i := range total {
 		name := fmt.Sprintf("anchor-%04d", i)
@@ -219,7 +213,7 @@ func TestReadDirResumesDeepCookieExactly(t *testing.T) {
 	}
 	for _, index := range []int{1, 511, 512, 513, 1024, total - 1} {
 		cookie := all[index-1].NextCookie
-		page, next, _, _, _, err := v.ReadDirOpen(handle, cookie, [16]byte{}, 3)
+		page, next, _, _, _, err := v.ReadDirOpen(handle, cookie, 3)
 		if err != nil {
 			t.Fatalf("resume at %d: %v", cookie, err)
 		}
@@ -230,7 +224,7 @@ func TestReadDirResumesDeepCookieExactly(t *testing.T) {
 			t.Fatalf("resume cookie %d differs from final entry", next)
 		}
 	}
-	if _, _, _, _, _, err := v.ReadDirOpen(handle, 1<<63, [16]byte{}, 3); !errors.Is(err, syscall.EINVAL) {
+	if _, _, _, _, _, err := v.ReadDirOpen(handle, 1<<63, 3); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("negative offset = %v, want EINVAL", err)
 	}
 }
@@ -246,13 +240,13 @@ func TestReadDirParentIsNeverAStaleCapability(t *testing.T) {
 		t.Fatal(err)
 	}
 	handle := mustOpenDir(t, v, item)
-	if _, _, _, _, parent, err := v.ReadDirOpen(handle, 0, [16]byte{}, 4); err != nil || parent != item {
+	if _, _, _, _, parent, err := v.ReadDirOpen(handle, 0, 4); err != nil || parent != item {
 		t.Fatalf("parent = %v, %v, want the directory capability", parent, err)
 	}
 	if err := v.Forget(item); err != nil {
 		t.Fatal(err)
 	}
-	_, _, _, _, parent, err := v.ReadDirOpen(handle, 0, [16]byte{}, 4)
+	_, _, _, _, parent, err := v.ReadDirOpen(handle, 0, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +414,7 @@ func volumeWorkload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, _, _, err := v.ReadDirOpen(dirHandle, 0, [16]byte{}, 16); err != nil {
+	if _, _, _, _, _, err := v.ReadDirOpen(dirHandle, 0, 16); err != nil {
 		t.Fatal(err)
 	}
 	looked, _, err := v.Lookup(dir, "g")

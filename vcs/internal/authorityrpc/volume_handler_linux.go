@@ -73,7 +73,7 @@ type volumeStore interface {
 	Fsync(xfsstore.Capability, bool) error
 	GetattrOpen(xfsstore.Capability) (xfsstore.Attr, error)
 	SyncFS() error
-	ReadDirOpen(xfsstore.Capability, uint64, [16]byte, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
+	ReadDirOpen(xfsstore.Capability, uint64, int) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error)
 	StatOpenDirChild(xfsstore.Capability, string) (xfsstore.Attr, error)
 	LookupOpen(xfsstore.Capability, string) (xfsstore.Capability, xfsstore.Attr, error)
 	Chmod(xfsstore.Capability, fs.FileMode) error
@@ -1815,7 +1815,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				var candidates []directoryPageCandidate
 				stabilized := false
 				for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
-					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, verifier, int(body.ReadDir.GetMaxEntries()))
+					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, int(body.ReadDir.GetMaxEntries()))
 					if err != nil {
 						forgetIssued()
 						return h.errorResponse(0, err, false)
@@ -1832,7 +1832,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 						continue
 					}
 					valid, verifyErr := h.revalidateDirectoryPage(
-						handle, directory, cookie, verifier, current,
+						handle, directory, cookie, current,
 						int(body.ReadDir.GetMaxEntries()), entries, eof, candidates,
 					)
 					if verifyErr != nil {
@@ -2215,13 +2215,13 @@ func sameDirectoryEnumeration(left, right []xfsstore.Dirent) bool {
 func (h *VolumeHandler) revalidateDirectoryPage(
 	handle, directory xfsstore.Capability,
 	cookie uint64,
-	verifier, current [16]byte,
+	current [16]byte,
 	maxEntries int,
 	entries []xfsstore.Dirent,
 	eof bool,
 	candidates []directoryPageCandidate,
 ) (bool, error) {
-	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.Store.ReadDirOpen(handle, cookie, verifier, maxEntries)
+	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.Store.ReadDirOpen(handle, cookie, maxEntries)
 	if err != nil {
 		return false, err
 	}

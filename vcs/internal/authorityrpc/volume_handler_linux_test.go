@@ -2498,7 +2498,6 @@ type readdirPostStabilizationChangeStore struct {
 func (s *readdirPostStabilizationChangeStore) ReadDirOpen(
 	open xfsstore.Capability,
 	_ uint64,
-	_ [16]byte,
 	_ int,
 ) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
 	if open != s.handle {

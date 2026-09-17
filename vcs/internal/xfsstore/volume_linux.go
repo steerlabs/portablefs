@@ -1954,7 +1954,7 @@ func (c *dirCursor) next(fd int) (name string, ino uint64, off int64, typ byte, 
 // of the whole page - a local ls does not do that - and an inode this
 // authority never exposes is listed as KindOpaque instead of making the
 // directory permanently unreadable.
-func (v *Volume) ReadDirOpen(id Capability, cookie uint64, verifier [16]byte, max int) (entries []Dirent, next uint64, current [16]byte, eof bool, parent Capability, err error) {
+func (v *Volume) ReadDirOpen(id Capability, cookie uint64, max int) (entries []Dirent, next uint64, current [16]byte, eof bool, parent Capability, err error) {
 	if max <= 0 {
 		return nil, 0, current, false, parent, fs.ErrInvalid
 	}

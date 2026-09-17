@@ -284,7 +284,6 @@ func (s *coherenceEmptyDirectoryStore) IdentityOpen(handle xfsstore.Capability) 
 func (s *coherenceEmptyDirectoryStore) ReadDirOpen(
 	handle xfsstore.Capability,
 	cookie uint64,
-	_ [16]byte,
 	_ int,
 ) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
 	if handle != s.handle {
@@ -370,7 +369,6 @@ func TestCoherenceLookupAndEmptyReadDirCarrySampledVersion(t *testing.T) {
 func (s *coherenceChangingDirectoryStore) ReadDirOpen(
 	handle xfsstore.Capability,
 	cookie uint64,
-	verifier [16]byte,
 	max int,
 ) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
 	if handle != s.handle {
@@ -398,7 +396,7 @@ func TestCoherenceReadDirContinuesAfterDirectoryChangeWithoutESTALE(t *testing.T
 		handle: xfsstore.Capability{0x41}, directory: xfsstore.Capability{0x42},
 	}
 	h := &VolumeHandler{Store: store}
-	entries, next, verifier, eof, directory, err := h.coherenceReadDirPage(store.handle, 2, [16]byte{0x81}, 2)
+	entries, next, verifier, eof, directory, err := h.coherenceReadDirPage(store.handle, 2, 2)
 	if err != nil {
 		t.Fatalf("continued page: %v", err)
 	}
@@ -463,5 +461,22 @@ func BenchmarkCoherenceReadGuard(b *testing.B) {
 			b.Fatal(guardErr)
 		}
 		guard.Release()
+	}
+}
+
+func TestCoherenceReadDirRefusesMalformedVerifierBeforeEnumeration(t *testing.T) {
+	for _, size := range []int{1, 15, 17} {
+		store := &coherenceEmptyDirectoryStore{handle: xfsstore.Capability{0x51}, directory: xfsstore.Capability{0x52}}
+		h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+		if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+			t.Fatal(err)
+		}
+		request := coherenceReadRequest(credential)
+		request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: store.handle[:], MaxEntries: 8, Verifier: make([]byte, size)}}
+		stampMutation(t, request, 0, 1)
+		response := h.Handle(ctx, request)
+		if response.GetErrno() != int32(syscall.EINVAL) || store.calls.Load() != 0 {
+			t.Fatalf("verifier size %d: response=%v enumeration calls=%d", size, response, store.calls.Load())
+		}
 	}
 }
