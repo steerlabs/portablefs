@@ -17,8 +17,9 @@ import (
 )
 
 type subscriptionTestClock struct {
-	mu  sync.Mutex
-	now time.Time
+	mu     sync.Mutex
+	now    time.Time
+	timers chan<- *subscriptionTestTimer
 }
 
 func (c *subscriptionTestClock) Now() time.Time {
@@ -27,7 +28,20 @@ func (c *subscriptionTestClock) Now() time.Time {
 	return c.now
 }
 
+type subscriptionTestTimer struct {
+	duration time.Duration
+	fired    chan time.Time
+}
+
+func (t *subscriptionTestTimer) C() <-chan time.Time { return t.fired }
+func (*subscriptionTestTimer) Stop() bool            { return true }
+
 func (c *subscriptionTestClock) NewTimer(d time.Duration) subscriptionTimer {
+	if c.timers != nil {
+		timer := &subscriptionTestTimer{duration: d, fired: make(chan time.Time, 1)}
+		c.timers <- timer
+		return timer
+	}
 	return wallSubscriptionTimer{timer: time.NewTimer(d)}
 }
 
@@ -46,6 +60,7 @@ type subscriptionTestRPC struct {
 	events      []*authoritypb.ControlEvent
 	event       int
 	eventNotify chan struct{}
+	renewed     chan<- uint64
 	acks        []uint64
 	log         *[]string
 }
@@ -73,9 +88,12 @@ func (r *subscriptionTestRPC) Subscribe(_ context.Context, snapshotID, after []b
 	return reply, r.horizon, nil
 }
 
-func (r *subscriptionTestRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
+func (r *subscriptionTestRPC) RenewSubscription(_ context.Context, incarnation uint64) (time.Time, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.renewed != nil {
+		r.renewed <- incarnation
+	}
 	return r.horizon, nil
 }
 
@@ -910,5 +928,55 @@ func TestSubscriptionShutdownBudgetUsesLiveHorizon(t *testing.T) {
 				t.Fatalf("budget=%s, want %s", got, test.want)
 			}
 		})
+	}
+}
+
+func TestSubscriptionRenewLoopUsesCoordinatorInterval(t *testing.T) {
+	now := time.Unix(700, 0)
+	timers := make(chan *subscriptionTestTimer, 2)
+	renewed := make(chan uint64, 1)
+	clock := &subscriptionTestClock{now: now, timers: timers}
+	rpc := &subscriptionTestRPC{horizon: now.Add(volumeserver.SubscriptionTTL), renewed: renewed}
+	registry := newSubscriptionTestRegistry(clock, rpc, &subscriptionTestInvalidator{}, nil)
+	registry.mu.Lock()
+	registry.active, registry.incarnation = true, 17
+	registry.horizon = rpc.horizon
+	registry.cacheUntil = rpc.horizon.Add(-time.Second)
+	registry.mu.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- registry.renewLoop(ctx, 17) }()
+	var timer *subscriptionTestTimer
+	select {
+	case timer = <-timers:
+	case <-time.After(time.Second):
+		t.Fatal("renew loop did not arm its timer")
+	}
+	if timer.duration != volumeserver.SubscriptionRenewInterval {
+		t.Fatalf("renew timer=%s, want %s", timer.duration, volumeserver.SubscriptionRenewInterval)
+	}
+	clock.advance(volumeserver.SubscriptionRenewInterval)
+	nextHorizon := clock.Now().Add(volumeserver.SubscriptionTTL)
+	rpc.mu.Lock()
+	rpc.horizon = nextHorizon
+	rpc.mu.Unlock()
+	timer.fired <- clock.Now()
+	select {
+	case incarnation := <-renewed:
+		if incarnation != 17 {
+			t.Fatalf("renewed incarnation=%d, want 17", incarnation)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renew loop did not renew on interval")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("renew loop stop=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("renew loop did not stop")
 	}
 }

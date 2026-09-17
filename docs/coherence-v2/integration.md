@@ -1262,3 +1262,24 @@ behavior passes (`/tmp/cv2-g2-c10.log`). An overlay removing the FSKit commitmen
 fails the positive row (`/tmp/cv2-g2-c10-fault.log`). Linux binaries ran in the
 pinned Docker image with
 `-test.run '^TestReadOnlyAttachCompatibilityWriterExclusion$'`.
+
+### C11: remove retired lease residue and share renewal timing
+
+Commit 81b011c already removed authorityrpc's lease client and the old
+volumeserver lease coordinator, including ActivateHolder; those deletions are
+not repeated. The unused delegatedIdentity helper and the duplicate three-second
+renewal constant are now removed. renewLoop uses the coordinator constant and a
+manual-clock test requires a renewal of the exact incarnation when it fires.
+Changing only the coordinator interval to four seconds through a Go overlay
+fails the old client and passes the new one (`/tmp/cv2-g2-c11-before.log`,
+`/tmp/cv2-g2-c11-shared.log`).
+
+The repair-budget sentinel was still used by two live withdrawal timeout paths.
+Those paths retain their timeout, diagnostic, and fail-closed behavior; only the
+obsolete special revocation classification is removed. They now report the
+ordinary coherence-violation reason. Existing report-once and withdrawal-verdict
+assertions remain. The CLI still reads the historical persisted reason token.
+client.md now names G's successful integrated gates instead of its superseded
+lease-activation failure. Focused subscription, revocation, and withdrawal tests
+pass in the pinned Docker image (`/tmp/cv2-g2-c11.log`). These are targeted checks;
+the final full gate remains required after the performance changes.

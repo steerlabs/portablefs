@@ -393,12 +393,6 @@ func (k kernelMount) abortKernelConnection() error {
 	return os.WriteFile("/sys/fs/fuse/connections/"+minor+"/abort", []byte("1"), 0)
 }
 
-// errRepairBudgetExceeded classifies the one revocation cause a supervisor can
-// act on differently: this mount was healthy but too slow to repair. It is a
-// sentinel rather than a formatted string so classifyRevocationReason never has
-// to read prose.
-var errRepairBudgetExceeded = errors.New("fusev3: cache withdrawal exceeded its safety budget")
-
 // revokeCachedNames drops daemon-resident N payloads. The portable profile
 // gives kernel dentries zero validity, so there is no kernel namespace cache to
 // notify or drain at recall or teardown.
@@ -547,9 +541,6 @@ const (
 	// RevocationSessionTerminal: the authority session ended permanently, so
 	// nothing can repair this kernel's caches again.
 	RevocationSessionTerminal = "session-terminal"
-	// RevocationRepairBudgetExceeded: this mount was still connected but did
-	// not complete cache withdrawal inside the reserved safety interval.
-	RevocationRepairBudgetExceeded = "repair-budget-exceeded"
 	// RevocationRoutesChanged: the volume's machine-local route declaration
 	// moved under a mount whose topology is fixed for its lifetime.
 	RevocationRoutesChanged = "routes-changed"
@@ -566,8 +557,6 @@ func classifyRevocationReason(cause error) string {
 	switch {
 	case cause == nil:
 		return RevocationCoherenceViolation
-	case errors.Is(cause, errRepairBudgetExceeded):
-		return RevocationRepairBudgetExceeded
 	case errors.Is(cause, errRoutesChanged):
 		return RevocationRoutesChanged
 	case errors.Is(cause, authorityrpc.ErrSessionEnded):
@@ -688,7 +677,7 @@ func (m *Mount) withdrawKernelState() withdrawalOutcome {
 	if m.raw != nil {
 		writersJoined = m.raw.terminalizeReplyCacheOwnership(deadline)
 		if !writersJoined {
-			out.record(0, "reply-writer-join", errRepairBudgetExceeded)
+			out.record(0, "reply-writer-join", errors.New("fusev3: reply writers did not drain before cache withdrawal deadline"))
 		}
 	}
 

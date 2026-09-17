@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	subscriptionRenewInterval  = 3 * time.Second
 	subscriptionRetryDelay     = 10 * time.Millisecond
 	maxSubscriptionPages       = 1 << 20
 	maxSubscriptionCoordinates = 65_536
@@ -288,16 +287,6 @@ func (s *subscriptionRegistry) remaining(coordinate publicationCoordinate, stamp
 		return 0
 	}
 	return s.cacheUntil.Sub(now)
-}
-
-func (s *subscriptionRegistry) delegatedIdentity(identity publicationIdentity) bool {
-	if s == nil {
-		return true
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, delegated := s.delegated[identity]
-	return delegated
 }
 
 func (s *subscriptionRegistry) signalHorizonChangedLocked() {
@@ -988,7 +977,7 @@ func (s *subscriptionRegistry) ackChanges(ctx context.Context, incarnation, posi
 
 func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64) error {
 	for {
-		timer := s.config.clock.NewTimer(subscriptionRenewInterval)
+		timer := s.config.clock.NewTimer(volumeserver.SubscriptionRenewInterval)
 		select {
 		case <-timer.C():
 		case <-ctx.Done():

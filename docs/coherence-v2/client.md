@@ -249,12 +249,13 @@ bash scripts/verify-local.sh --full
 bash scripts/coherence-matrix-linux.sh
 ```
 
-The full gate passes its default portion, then fails the first real-mount
-activation in `TestConcurrentAppendersOnOneMountLoseNoRecord`:
-`authorityrpc: authority returned obsolete Linux lease activation state`.
-The separate coherence matrix fails mount 0 activation for the same reason.
-No real-mount coherence result is claimed. These gates must pass after F1 is
-integrated before this frontend change is merge evidence.
+Workstream G subsequently passed the full gate (run 156), including all 66
+required FUSE integration tests and the root-barrier probe. Its separate matrix
+run 157 passed all 28 applicable cases, with the existing unsupported chown case
+skipped and both controls matching. G2 restored those Docker gates after reversing
+the rejected EntryNotify acknowledgement path; see the dated evidence and later
+qualification results in [integration.md](./integration.md). The earlier obsolete
+lease activation failure is resolved.
 
 Hot-path benchmarks in Linux arm64 report zero allocations for subscription
 permission and both cold/live delegation ownership checks. Source publication

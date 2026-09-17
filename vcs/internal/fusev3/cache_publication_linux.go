@@ -4,6 +4,7 @@ package fusev3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -106,7 +107,7 @@ func (r *rawFileSystem) drainDataPublicationsContext(ctx context.Context, coordi
 			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
-			return fmt.Errorf("%w: buffered reads did not drain before a whole-file invalidation", errRepairBudgetExceeded)
+			return errors.New("fusev3: buffered reads did not drain before a whole-file invalidation deadline")
 		}
 		r.mu.Lock()
 	}
