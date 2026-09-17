@@ -1896,3 +1896,106 @@ older/younger claims and nonblocking child admission
 (`/tmp/cv2-g2-lookup-expand-coordinator3.log`). Restoring the old handler fails
 the one-probe assertion (`/tmp/cv2-g2-lookup-fault.log`). The READDIR coordinator
 batch in the second half of item 9 remains pending.
+
+## G3
+
+### G3a client scope and decisions
+
+This stream changed only the Linux client, writeback buffer, client RPC
+construction, client design text, and soak regressions. It did not change the
+Authority handlers, Linux coherence server files, or `volumeserver`.
+
+The design owner's approved DelegationRelease rule is retained: an uncertain
+release invalidates the incarnation and forces a cold resubscribe; it does not
+end the session. The same classification applies when deferred cleanup observes
+an authenticated Authority epoch replacement. A terminal session witness still
+revokes the mount.
+
+S1 and S3 shared one lock boundary. `CloseHandles` now snapshots its buffer,
+incarnation, epoch serial, and epoch context under a momentary epoch read lock,
+then performs application/release and RPC work without that lock. Epoch change
+cancels the captured context and rejects stale outcomes. A fenced Buffer wakes a
+pending durability cut with its recorded loss instead of waiting again. The
+RPC-parked regression requires epoch change, admission fencing, and close to
+finish within the shutdown budget with one retained-data loss report.
+
+S2 is client policy. Coherence-class RECLAIM/CLOSE refusal deactivates the
+subscription, retains or requeues ownership, and resumes after cold subscribe;
+it never revokes the mount. Definite nonterminal refusal stales only the scoped
+resource and records loss. `SessionEndCause` now treats `ErrAuthorityChanged`
+and `ErrSubscriptionReset` as recovery boundaries rather than terminal causes.
+The mounted control-horizon reproduction recovered in 15.05 seconds with a live
+mount and a later successful reclaim.
+
+The dirty-unmount reproduction now exercises both serial and scatter mutation
+hooks. It completed in 11.01 seconds and emitted exactly one report for one
+retained 42-byte entry. Zero-entry external drop reports are suppressed while
+the internal loss ticket still advances. The 1,000-iteration S5 rewrite loop
+completed in 2.645 seconds; G2 had already removed the delegated truncating-open
+durability wait, so G3 makes that performance contract an explicit regression.
+
+### G3a review follow-ups
+
+1. Each deferred close batch has a request-timeout context. Pending-close
+   admission has a bounded cap-relief wait and returns a bounded error if the
+   Authority cannot drain; admission resumes after drain.
+2. Timer/cap writeback uses a bounded identity worker pool. One identity remains
+   serial while independent identities flush concurrently; explicit flush,
+   close, and recall paths still bypass the background queue.
+3. G2 already removed close-path durability waits. Therefore there is no batch
+   Fsync failure to scope; `TestDelegationCloseBatchRetainsAppliedRecordsWithoutWaitingForDurability`
+   is the named replacement and no additional change was made.
+8. FULL-delegation FLUSH now samples ownership, retirement, and the handle loss
+   ticket under one admission lock. A concurrent retire forwards FLUSH so
+   close(2) observes the loss errno rather than returning zero.
+9. Every READDIRPLUS construction error aborts its provisional publication,
+   restores the cursor, and rolls back every lookup staged earlier in the page.
+10. Design rule F6 and the client contract now preserve ENOSPC, EDQUOT, or EFBIG
+    for definite pre-apply capacity loss; generic accepted-write loss is EIO.
+11. Successful F_UNLCK and RELEASE/CLOSE discharge generation-matched POSIX lock
+    owner bookkeeping. The 10,000-owner regression finishes with an empty map.
+12. A missing subscription registry fails closed before a read or mutation RPC.
+14. If Drop rebound a pending writeback batch, the recorded loss outranks a
+    simultaneous retryable transport error. The package documentation states
+    this precedence.
+
+Follow-ups 4, 5, 6, 7, and 13 and soak finding S4 belong to G3b and were not
+changed here. The ordered RPC lane also stopped copying a struct containing an
+atomic value; `go vet` is the regression gate for that constructor fix.
+
+### G3a soak and gate evidence
+
+The scoped mounted reproductions pass: authority-new-epoch (1.04 seconds),
+control-horizon (15.05 seconds), dirty-unmount (11.01 seconds), writeback-cap
+(2.99 seconds), asynchronous-close break (1.04 seconds), 1,000 rewrite loops
+(2.645 seconds), 200 seeded alias rounds (1.44 seconds), the 20,000-file/3,000-
+directory tree (48.36 seconds), compiler workload (49.52 seconds), and seeded
+chaos (0.12 seconds).
+
+The whole-soak invocation on the split G3a branch did not go green. The known
+G3b-owned exclusive CREATE defect failed `TestSoakGitLock` at race 85 with EIO
+and later held `TestSoakGit` to its containment deadline. The NPM workload itself
+passed in 10.53 seconds, but its peer observer received EAGAIN from READDIR after
+the server stabilization loop; an isolated rerun reproduced that server-read
+failure. These were not fixed across the ownership boundary. Artifacts are in
+`/tmp/portablefs-soak-g3a` and `/tmp/soak-npm-g3a`.
+
+The first unfiltered XFS attempts saw the pre-existing intermittent capability-
+table ENFILE in `TestPagedReaddirContinuesAcrossRemoteMutation`; the same failure
+reproduced at the pre-G3 `679be11` snapshot, while the test passed alone. The
+final full gate passed all 76 required privileged tests. The first matrix run
+found the nonterminal epoch-cleanup classification gap described above; after
+the fix, both the standalone matrix and the full gate passed 28 of 28 applicable
+live-mount cases, with the declared single-principal chown case skipped.
+
+Final evidence:
+
+- `go -C vcs test -race ./internal/writeback ./internal/authorityrpc ./internal/mountv3`
+  passed; the complete Linux `internal/fusev3` race suite passed in Docker.
+- `bash scripts/coherence-matrix-linux.sh` passed; log
+  `/tmp/cv2-g3a-final-matrix2.log`.
+- `bash scripts/verify-local.sh --full` passed, including build/vet, native Go
+  and race suites, Swift, release-trust/architecture scans, 76 XFS/FUSE tests,
+  and the Linux matrix; log `/tmp/cv2-g3a-verify-full2.log`.
+- The final focused baseline passed all subtests in 116.27 seconds. Its numbers
+  are recorded in `results.md`; log `/tmp/cv2-g3a-final-baseline.log`.
