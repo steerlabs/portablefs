@@ -573,3 +573,32 @@ infrastructure, not a dependency of the default or full gate. The focused wrappe
 exits 70 for omitted inventory. Logs: `/tmp/cv2-g2-lookup-exact-mounted2.log` and
 `/tmp/cv2-g2-lookup-kernel2.log`; bpftrace 0.17.0. The unchanged syscall and daemon
 service counters remain available alongside the kernel probe.
+
+## G2 integrated baseline before the profile-discovered follow-ups
+
+Commit `47a5487`, unprofiled full workload, `/tmp/cv2-g2-final-baseline.log`.
+All baseline subtests passed; the focused wrapper exited 70 for omitted gate
+inventory. [Raw observations](results-g2-after-11.jsonl) retain opcode and
+barrier/drain details. This precedes the shared registry conversion and the
+subsequent profile-discovered admission deadlock fix; final measurements follow
+separately. Other work was active on the shared VM.
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Filesystem requests/operation |
+| --- | --- | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | direct-xfs | 0.490248 | 0 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.472242 | 0 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 14.677395 | 82,851 | 1.972643 | 1.962310 |
+| install, 8 worker(s) | portablefs | 12.367337 | 82,775 | 1.970833 | 1.961667 |
+| git-status-cold | direct-xfs | 0.014091 | 0 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.016222 | 0 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 1.909183 | 40,626 | 2.031300 | 1.026000 |
+| git-status-warm | portablefs | 2.369603 | 20,469 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | direct-xfs | 0.051569 | 0 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 2.767217 | 84,633 | 21.158250 | 3.309750 |
+
+One-worker install issued one CREATE and one WRITE per file, plus 412 close
+batches and 412 delegation releases across 40,000 files. It issued one LOOKUP,
+16 Barriers and zero FLUSH, ChangeAck or control polls. Eight-worker install
+issued 53 LOOKUPs and 19 GETATTRs. Warm Git issued one LOOKUP but retained 20,104
+RECLAIMs; the peer workload retained 62,923 RECLAIMs and 3,672 change ACKs.
+These remaining costs are visible in the complete request totals.

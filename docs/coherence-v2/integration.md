@@ -2145,3 +2145,15 @@ The focused mounted test passes (`/tmp/cv2-g2-lookup-exact-mounted2.log`); its
 wrapper exits 70 because only this test was selected. The first ineffective
 `fuse_get_unique` probe produced zero samples and was discarded. No production
 cache lifetime or notification behavior changed for the measurement.
+
+#### G2 workload diagnostics and intermediate observations
+
+The complete unprofiled baseline at `47a5487` passed; results.md and
+results-g2-after-11.jsonl preserve all ten observations. The subsequent first
+profile run exposed the fixed cache-admission deadlock. A second profile run
+completed one-worker install but the eight-worker mount aborted at file 11,475;
+its log did not include the mount's terminal cause (`/tmp/cv2-g2-final-profile2.log`).
+The harness now includes session/frontend health on workload or barrier failure.
+All three diagnostic eight-worker profile repetitions pass
+(`/tmp/cv2-g2-install8-diagnostic.log`). This does not establish the aborted run's
+cause; complete profiling and gate qualification continue below.

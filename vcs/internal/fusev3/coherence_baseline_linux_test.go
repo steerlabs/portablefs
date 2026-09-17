@@ -212,12 +212,12 @@ func measureBaseline(t *testing.T, target, phase string, fixture *integrationFix
 	result, err := run()
 	if err != nil {
 		counter.setBeforeHandle(nil)
-		t.Fatalf("%s %s: %v", target, result.Scenario, err)
+		t.Fatalf("%s %s: %v; mount health: %s", target, result.Scenario, err, fixture.sessionDiagnostics())
 	}
 
 	barrierStart := time.Now()
 	if err := barrier.Sync(); err != nil {
-		t.Fatalf("%s completion barrier: %v", result.Scenario, err)
+		t.Fatalf("%s completion barrier: %v; mount health: %s", result.Scenario, err, fixture.sessionDiagnostics())
 	}
 	barrierSeconds := time.Since(barrierStart).Seconds()
 	if err := barrier.Close(); err != nil {
