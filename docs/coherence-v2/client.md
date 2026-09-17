@@ -136,11 +136,22 @@ synchronous error path.
 
 A mount-root OPENDIR records the mount loss sequence. FSYNCDIR on that exact
 handle flushes a Buffer cut, sends Barrier with the Authority application ticket,
-and waits for its durable prefix. Clean detach also performs a bounded barrier
+waits for targeted visibility completion, and then waits for its durable prefix.
+The frontend admission write lock is held only while the accepted cut and prior
+application-ticket floor are captured. It is released before flush, network I/O,
+or either completion wait, so later writes and CREATE grant installation on
+disjoint identities proceed outside the barrier and are not added to its cut.
+Clean detach also performs a bounded barrier
 before stopping the buffer when retained entries or non-durable tickets remain.
 FSYNCDIR returns EIO if the barrier fails or a generic loss advanced since
 OPENDIR. A definite pre-apply capacity loss retains its original ENOSPC,
 EDQUOT, or EFBIG instead. FUSE_SYNCFS is not the completion mechanism.
+
+Application, visibility, and durability are separate client states. Early
+application receipts continue to release recall and read cycles. Foreground
+WRITETHROUGH writes, synchronous writes, and delegated metadata changes do not
+return from a successful flush until WaitVisibility proves the targeted peer
+withdrawal. A durability watermark alone cannot satisfy that boundary.
 
 ## Epoch replacement
 

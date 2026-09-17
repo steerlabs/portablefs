@@ -2717,3 +2717,48 @@ The separately invoked `bash scripts/coherence-matrix-linux.sh` also exits 0
 matching controls. The package-manager soak, live macOS FSKit matrix, and
 deployed-cell staging qualification remain outside `--full` and are not claimed
 by G5.
+
+## G6
+
+G6 closes the final adversarial review in the order recorded in
+`FINAL-review.md`. Protocol major 7 remains exact. The wire change is additive:
+feature `foreground-visibility-completion-v1` and `WaitVisibility` expose a
+completion boundary distinct from the existing application and durability
+receipts.
+
+Foreground WRITETHROUGH writes, synchronous writes, and delegated metadata
+mutations now release their per-identity operation lock after application and
+then wait for the Authority's targeted withdrawal completion. Recall and
+read-break cycles retain their early application receipts. The two-mount
+regression `TestForegroundWritethroughWaitsForPeerVisibility` parks notification
+after physical READ publication and requires an already-open buffered peer to
+observe the new bytes after ordinary write, `O_SYNC` write, and delegated
+truncate completion (`472bb1c`).
+
+Own-cache drain failures no longer revoke a mount. OPEN and the equivalent
+CREATE/TMPFILE paths retry transient notification failure under the subscription
+repair budget. Persistent failure marks only the affected identity stale;
+discarded buffered entries retain loss reporting. The raw two-mount regression
+`TestReopenNotificationFailureIsInodeLocal` covers cached read, close, delegated
+write, release, and reopen for transient and persistent faults, then proves
+unrelated-file progress and TMPFILE containment (`0bc8a36`).
+
+The root barrier now captures one accepted/loss cut and the existing applied
+ticket floor under frontend admission, then releases admission before flush,
+the Authority barrier, visibility completion, and durability. A registered cut
+attributes a later drop only if it contains an operation in that prefix. The
+manager regression `TestDelegationBarrierReleasesAdmissionAndKeepsItsOriginalCut`
+parks the Authority barrier, completes a later write and CREATE grant on
+disjoint identities, and checks unrelated loss exclusion plus in-cut generic
+and `ENOSPC` failure (`b8547b9`).
+
+Delegation state locks and Mac profile admission have context-aware acquisition.
+Mac activation uses its authorization deadline. Targeted withdrawals retain a
+fixed ten-second deadline from issue and fence an unresponsive target even when
+that session continues renewing. Write payload copying no longer holds the
+buffer mutex. Application, visibility, and durability remain distinct states;
+the coalesced durability worker obtains visibility proof before retiring a
+durable prefix (`b5bc217`).
+
+Final full-gate, standalone matrix, complete soak, and post-fix baseline results
+follow after qualification.

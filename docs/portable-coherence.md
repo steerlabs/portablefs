@@ -148,6 +148,16 @@ The following three residuals are reproduced verbatim from the design:
 
   - **Contended files run at today's speed.** A file that a peer holds a cached handle on, or writes concurrently, is write-through with invalidation per commit. That is correct and it is what the current system does for every file.
 
+The implementation also has three explicit liveness limits. A local storage
+operation already pinned in the filesystem can outlive the five-second recall
+budget because cancellation cannot preempt the kernel operation. A synchronous
+reverse inode notification blocked in the kernel cannot be interrupted by the
+retry context; the context prevents another retry after the call returns. Mac
+FSKit activation globally excludes Linux writer admission while it recalls and
+activates the compatibility writer. Waiting to acquire that exclusion and the
+recalls issued under it use the activation authorization deadline, but an
+already-blocked kernel or local-storage operation retains the limits above.
+
 ## Qualification and remaining work
 
 The real-mount inventory includes invalidation of resident and privately mapped
