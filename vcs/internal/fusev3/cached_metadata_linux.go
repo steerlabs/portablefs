@@ -40,7 +40,7 @@ func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second p
 	p := r.cachedReplyFree
 	r.cachedReplyFree = p.cachedNext
 	p.cachedNext = nil
-	p.owner, p.requestUnique, p.originalFinalized = r, unique, true
+	p.owner, p.requestUnique, p.originalFinalized, p.cachedArena = r, unique, true, true
 	p.cachedCoordinates, p.cachedCount = [2]publicationCoordinate{first, second}, count
 	r.replyPublications[unique] = p
 	return true
@@ -56,6 +56,11 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	record := r.cachedNames[key]
 	r.mu.Unlock()
 	if record != nil && r.mount.delegations.Owns(record.identity[:]) {
+		var attr fuse.Attr
+		if hit, err := r.holderMetadata(r.opContext(), unique, parent, name, record, nil, 0, &attr, true); hit && err == nil {
+			*out = fuse.EntryOut{NodeId: record.id, Generation: 1, Attr: attr}
+			return true
+		}
 		return false
 	}
 	r.mu.Lock()
@@ -113,6 +118,11 @@ func (r *rawFileSystem) attrCachedReply(unique uint64, record *inodeRecord, out 
 	r.mount.epochMu.RLock()
 	defer r.mount.epochMu.RUnlock()
 	if r.mount.delegations.Owns(record.identity[:]) {
+		var attr fuse.Attr
+		if hit, err := r.holderMetadata(r.opContext(), unique, nil, "", record, nil, 0, &attr, true); hit && err == nil {
+			*out = fuse.AttrOut{Attr: attr}
+			return true
+		}
 		return false
 	}
 	r.mu.Lock()

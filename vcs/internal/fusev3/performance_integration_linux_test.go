@@ -554,13 +554,34 @@ func TestCachedMetadataKernelRoundTrip(t *testing.T) {
 }
 
 func TestCachedLookupKernelRoundTrip(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		name := "shared"
+		if full {
+			name = "full-holder"
+		}
+		t.Run(name, func(t *testing.T) { cachedLookupKernelRoundTrip(t, full) })
+	}
+}
+
+func cachedLookupKernelRoundTrip(t *testing.T, full bool) {
 	timings := &lookupLatencyRecorder{counts: make(map[string]int), lookups: make([]time.Duration, 0, 4096)}
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, latencies: timings})
 	path := f.join(0, "cached-lookup")
 	if err := os.WriteFile(path, []byte("cached"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	f.waitForDelegationReleases(t)
+	if full {
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if _, err := file.WriteAt([]byte("dirty"), 4096); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		f.waitForDelegationReleases(t)
+	}
 	if _, err := os.Lstat(path); err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +591,7 @@ func TestCachedLookupKernelRoundTrip(t *testing.T) {
 	}
 	defer dir.Close()
 	before, _ := timings.snapshot()
-	lookupBefore := f.counter.count("lookup")
+	lookupBefore, attrBefore := f.counter.count("lookup"), f.counter.count("getattr")
 	const n = 2000
 	latencies := make([]time.Duration, n)
 	for i := range latencies {
@@ -592,6 +613,9 @@ func TestCachedLookupKernelRoundTrip(t *testing.T) {
 
 	if got := f.counter.count("lookup") - lookupBefore; got != 0 {
 		t.Fatalf("cached LOOKUP Authority RPCs=%d", got)
+	}
+	if got := f.counter.count("getattr") - attrBefore; got != 0 {
+		t.Fatalf("cached LOOKUP permission GETATTR Authority RPCs=%d", got)
 	}
 	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
 	lookupTimes = lookupTimes[len(lookupTimes)-n:]

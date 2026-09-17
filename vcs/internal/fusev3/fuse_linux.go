@@ -1483,8 +1483,13 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 	if n.stale.Load() || (fh != nil && fh.stale.Load()) {
 		return syscall.EIO
 	}
-	if base, ok := n.mount.delegations.BaseAttr(n.item.GetStableIdentity()); ok {
-		return n.overlayAttr(base, out)
+	if owned, errno := n.publishHolderAttr(ctx, nil, 0, out); owned || errno != 0 {
+		return errno
+	}
+	if n.mount.raw == nil {
+		if base, ok := n.mount.delegations.BaseAttr(n.item.GetStableIdentity()); ok {
+			return n.overlayAttr(base, out)
+		}
 	}
 	req := &authoritypb.GetAttrRequest{Item: cloneBytes(n.item.GetToken())}
 	if fh != nil {
@@ -1507,7 +1512,10 @@ func (n *node) Getattr(ctx context.Context, fh *fileHandle, out *fuse.AttrOut) s
 		SnapshotSequence: snapshot, ObjectVersion: objectVersion,
 		BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags(),
 	}
-	if n.mount.delegations.Owns(n.item.GetStableIdentity()) {
+	if owned, errno := n.publishHolderAttr(ctx, attr, objectVersion, out); owned || errno != 0 {
+		return errno
+	}
+	if n.mount.raw == nil && n.mount.delegations.Owns(n.item.GetStableIdentity()) {
 		n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), attr, objectVersion)
 		return n.overlayAttr(attr, out)
 	}

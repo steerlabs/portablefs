@@ -421,3 +421,21 @@ The 20-second regression bound is unchanged. These are test wall times, not a
 full baseline or an isolated VM experiment; request counts were not collected.
 Logs: `/tmp/cv2-g2-after-item6-xfs2.log`, `/tmp/cv2-g2-recall-mounted.log`,
 `/tmp/cv2-g2-recall-mounted2.log`. Full gates remain required.
+
+## G2 FULL-holder metadata follow-up
+
+The same 2,000-call mounted LOOKUP probe now exercises a shared cached file and
+an open FULL holder with a dirty size extension. Both issue zero Authority
+LOOKUP and GETATTR requests. Measurements from `/tmp/cv2-g2-holder-mounted.log`:
+
+| Mode | Syscall p50 / p95, us | LOOKUP read-to-reply p50 / p95, us | FUSE permission GETATTRs |
+| --- | ---: | ---: | ---: |
+| Shared | 71.208 / 82.417 | 4.750 / 6.125 | 4,000 |
+| FULL holder | 71.208 / 81.625 | 4.792 / 6.167 | 4,000 |
+
+The syscall includes one LOOKUP and two permission GETATTRs. The daemon timer
+starts after reading /dev/fuse and excludes prior kernel scheduling. Neither
+number establishes an isolated kernel-to-daemon LOOKUP round trip below 20 us.
+The callback allocation regression has a direct before/after result: holder
+GETATTR was 13 allocations and is now zero; holder LOOKUP also has zero
+allocations. These unit measurements include physical reply settlement.

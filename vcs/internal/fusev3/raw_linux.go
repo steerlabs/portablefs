@@ -193,6 +193,8 @@ type replyDataPublication struct {
 // write, which is the stock-kernel publication edge available to userspace.
 type replyPublication struct {
 	cachedNext             *replyPublication
+	cachedArena            bool
+	holderAdmission        *delegationState
 	cachedCoordinates      [2]publicationCoordinate
 	cachedCount            int
 	completeDirectories    [2]completeDirectoryPublication
@@ -244,7 +246,7 @@ type replyPublication struct {
 
 func (p *replyPublication) empty() bool {
 	return p == nil || len(p.names) == 0 && len(p.attrs) == 0 && len(p.data) == 0 && p.source == nil &&
-		len(p.responseConsumptions) == 0 && p.completeDirectoryCount == 0 &&
+		len(p.responseConsumptions) == 0 && p.completeDirectoryCount == 0 && p.cachedCount == 0 && p.holderAdmission == nil &&
 		p.postState == nil && p.cacheStamp == nil && p.snapshotSequence == 0 && p.payloadError == nil && p.dirPlusLookups == nil
 }
 
@@ -1077,7 +1079,7 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 				}
 			}
 		}
-		attr, err = r.mount.overlayProtoAttr(record.identity[:], attr, version)
+		owned, err = r.holderMetadata(ctx, publication.requestUnique, nil, "", record, attr, version, &out.Attr, false)
 		if err != nil {
 			return err
 		}
@@ -1111,7 +1113,9 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	_ = entry
 	out.SetEntryTimeout(0)
 	out.SetAttrTimeout(0)
-	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	if !owned {
+		fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	}
 	return nil
 }
 
@@ -1460,6 +1464,11 @@ func (r *rawFileSystem) settleDataPublicationLocked(publication replyDataPublica
 }
 
 func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) responseConsumptionClaim {
+	if state := publication.holderAdmission; state != nil {
+		publication.holderAdmission = nil
+		state.admission.RUnlock()
+	}
+
 	if publication.cachedCount != 0 {
 		r.signalSourceChangedLocked()
 	}
@@ -1586,7 +1595,7 @@ func (r *rawFileSystem) PrepareReplyPayload(unique, _ uint64, opcode uint32, out
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
-	if publication.cachedCount != 0 {
+	if publication.cachedArena {
 		r.mu.Unlock()
 		return payloadSize, fuse.OK, fuse.OK
 	}
@@ -1804,7 +1813,7 @@ func (r *rawFileSystem) ReplyWritten(unique uint64, status fuse.Status) {
 	}
 
 	consumeClaimedAuthorityResponses(responseConsumption)
-	if publication.cachedCount != 0 {
+	if publication.cachedArena {
 		r.mu.Lock()
 		*publication = replyPublication{cachedNext: r.cachedReplyFree}
 		r.cachedReplyFree = publication

@@ -1896,3 +1896,32 @@ older/younger claims and nonblocking child admission
 (`/tmp/cv2-g2-lookup-expand-coordinator3.log`). Restoring the old handler fails
 the one-probe assertion (`/tmp/cv2-g2-lookup-fault.log`). The READDIR coordinator
 batch in the second half of item 9 remains pending.
+
+#### G2 item 8 follow-up: FULL-holder metadata replies
+
+The full XFS gate at `6e10d7b` passed all 76 privileged tests and the root
+boundary test (`/tmp/cv2-g2-lookup-full-xfs.log`).
+
+Cached LOOKUP and GETATTR now render the current delegation base plus retained
+metadata directly into a stack fuse.Attr. Both use the existing bounded reply
+arena, with zero allocations and zero Authority requests. Kernel entry and
+attribute validity remain zero. An exact grant admission reader stays with the
+physical reply; retirement, recall and source withdrawal join it. Operation,
+metadata and epoch locks are released before the callback returns. Ordinary
+publications used when the arena is exhausted retain the same physical proof
+without being recycled into the arena or bypassing payload finalization.
+
+An owned reply cannot fall back to shared metadata when its Authority base is
+older than an observed invalidation. Tests cover that refusal, dirty size,
+allocation/RPC counts, arena exhaustion, successful and failed physical writes,
+duplicate completion, withdrawal lock release and terminalization. Ten focused
+repetitions pass (`/tmp/cv2-g2-holder6.log`); the broader Linux FUSE unit suite
+passes (`/tmp/cv2-g2-holder-all.log`). The old implementation fails the new warm
+metadata test (GETATTR allocates 13 objects; LOOKUP cannot complete the repeated
+holder path, `/tmp/cv2-g2-holder-fault.log`).
+
+The mounted LOOKUP test now includes an open, dirty FULL holder and asserts zero
+Authority LOOKUP and permission-GETATTR requests in both modes. Both pass
+(`/tmp/cv2-g2-holder-mounted.log`, selected gate wrapper exits 70 because the
+other mandatory cases were not selected). Timing details and the remaining
+kernel-round-trip measurement limitation are recorded in results.md.
