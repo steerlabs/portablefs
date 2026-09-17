@@ -2199,3 +2199,50 @@ Linux race repetitions, and ten unchanged mounted churn repetitions pass
 `/tmp/cv2-g2-`). The focused mounted wrapper exits 70 for omitted inventory.
 Independent read-only review confirms server capability issue/rollback is
 balanced and the new wait holds no cursor or publication lock.
+
+#### G2 final qualification
+
+At production commit `bcc23eb`, `bash scripts/verify-local.sh --full` exits 0
+(`/tmp/cv2-g2-final-full5.log`). It includes Foundation/cgo Darwin and static Linux
+builds, native Go tests and race tests, vet, exact inventory equality for all 345
+Swift tests, release/workflow policy, architecture scans, and both privileged
+Docker suites. `scripts/xfs-fuse-integration.sh` passes all 76 required privileged
+cases plus the root boundary. `scripts/coherence-matrix-linux.sh` passes 28 cases,
+its disjoint/falsifiability controls, and retains the declared non-passing chown
+expectation for the single-principal volume model. No test or capacity was
+weakened to achieve this result. The previous `final-full4` failure is superseded
+by the diagnosed PLUS admission fix and its ten passing mounted repetitions.
+
+The full gate explicitly excludes the package-manager soak, live macOS FSKit
+matrix and live-cell staging qualification. Those are not claimed here. Final
+unprofiled workload observations and the PLAN report follow in results.md,
+performance.md and G2-report.md.
+
+The final unprofiled baseline at `bcc23eb` passes all workloads in 116.58 seconds
+(`/tmp/cv2-g2-final-baseline3.log`; focused wrapper 70 for omitted inventory).
+Install at one/eight workers takes 22.480/11.717 seconds and
+1.980643/1.979524 total Authority requests per operation. The one-worker path
+has zero LOOKUP, GETATTR, FLUSH, ChangeAck and control polls, with 40,000 CREATEs,
+40,000 WRITEs, 575 close/release batches and 23 Barriers. Eight workers retain
+199 LOOKUPs and 94 GETATTRs. Git status retains 20,104 RECLAIMs in both cold and
+warm runs; total requests/operation are 2.031300/1.023450. The peer run is
+3.229 seconds at 23.1425 requests/operation, including 69,257 RECLAIMs and five
+scans with 140 files observed during writing. Results and performance.md report
+these costs rather than claiming uniform speedup. `results-g2-final.jsonl`
+contains every opcode and the direct-XFS/barrier/drain observations.
+
+All requested review, conformance and amended performance items now have
+implementation and regression records above. Item 12 and ingress fingerprint
+reuse were already complete and were reverified. The measured flush profile
+does not justify the conditional multi-identity RPC, so it was not added.
+G2-report.md provides the PLAN file inventory, interfaces, exact qualification,
+measured comparisons and known gaps. One earlier profile mount abort remains
+unexplained; the later complete profile, three focused profile repetitions,
+final unprofiled baseline and full gate all pass. This limitation is retained
+in the report rather than silently treating the failed run as evidence.
+
+The separately invoked `bash scripts/coherence-matrix-linux.sh` also exits 0
+(`/tmp/cv2-g2-final-matrix.log`): 28 cases pass, the declared chown skip remains,
+and disjoint/stale-view controls detect their expected failures. Both mounts
+still serve after the matrix. This is additional final-code evidence alongside
+the matrix already included in the successful full gate.

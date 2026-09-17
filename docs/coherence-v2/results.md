@@ -669,3 +669,77 @@ run; these are different instrumented conditions, not an isolated latency
 comparison. Cold and warm Git retain 20,104 RECLAIMs each. The peer workload
 observes 720 files during writing across eight scans, verifies all 2,000, and
 retains 71,127 RECLAIMs. Total traffic includes these cleanup costs.
+
+## G2 final baseline and qualification
+
+Measured production commit `bcc23eb` after the PLUS admission fix, using
+`PORTABLEFS_PERFORMANCE_TEST=1 PORTABLEFS_GO_TEST_FLAGS='-run ^TestCoherenceBaseline$' bash scripts/xfs-fuse-integration.sh`.
+All baseline subtests pass in 116.58s; the focused wrapper exits 70 for
+omitted gate inventory. Log: `/tmp/cv2-g2-final-baseline3.log`.
+[Raw final observations](results-g2-final.jsonl) preserve all ten rows.
+The exact same code passes `bash scripts/verify-local.sh --full`
+(`/tmp/cv2-g2-final-full5.log`, exit 0), including both privileged Linux suites.
+All 76 required XFS tests plus the root boundary pass. The coherence matrix
+passes 28 cases and its controls with the unchanged declared chown skip.
+
+| Workload | G before (s) | G2 final (s) | G requests/op | G2 requests/op | G2 filesystem requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | 21.028568 | 22.479856 | 7.480524 | 1.980643 | 1.966167 |
+| install, 8 worker(s) | 15.706301 | 11.717305 | 6.849524 | 1.979524 | 1.966929 |
+| git-status-cold | 1.379696 | 2.084653 | 1.027400 | 2.031300 | 1.026000 |
+| git-status-warm | 1.195970 | 2.372260 | 0.018600 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | 2.644504 | 3.229293 | 9.819500 | 23.142500 | 3.170500 |
+
+| Workload | Target | Seconds | Authority requests | Requests/operation | Barrier (s) | Close drain (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | direct-xfs | 0.584001 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| install, 8 worker(s) | direct-xfs | 0.324973 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| install, 1 worker(s) | portablefs | 22.479856 | 83,187 | 1.980643 | 0.007243 | 0.023609 |
+| install, 8 worker(s) | portablefs | 11.717305 | 83,140 | 1.979524 | 0.019560 | 0.013261 |
+| git-status-cold | direct-xfs | 0.009428 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| git-status-warm | direct-xfs | 0.006865 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| git-status-cold | portablefs | 2.084653 | 40,626 | 2.031300 | 0.000178 | 0.025882 |
+| git-status-warm | portablefs | 2.372260 | 20,469 | 1.023450 | 0.000233 | 0.026229 |
+| two-mount-write-list-read | direct-xfs | 0.038674 | 0 | 0.000000 | 0.000000 | 0.000000 |
+| two-mount-write-list-read | portablefs | 3.229293 | 92,570 | 23.142500 | 0.000088 | 0.001319 |
+
+| Install opcode | 1 worker requests | Requests/file | 8 workers requests | Requests/file |
+| --- | ---: | ---: | ---: | ---: |
+| barrier | 23 | 0.000575 | 12 | 0.000300 |
+| change_ack | 0 | 0.000000 | 0 | 0.000000 |
+| close | 2 | 0.000050 | 2 | 0.000050 |
+| close_batch | 575 | 0.014375 | 314 | 0.007850 |
+| create | 40,000 | 1.000000 | 40,000 | 1.000000 |
+| delegation_release | 575 | 0.014375 | 314 | 0.007850 |
+| flush | 0 | 0.000000 | 0 | 0.000000 |
+| get_attr | 0 | 0.000000 | 94 | 0.002350 |
+| keep_alive | 3 | 0.000075 | 1 | 0.000025 |
+| lookup | 0 | 0.000000 | 199 | 0.004975 |
+| mkdir | 2,000 | 0.050000 | 2,000 | 0.050000 |
+| next_control_event | 0 | 0.000000 | 0 | 0.000000 |
+| open | 1 | 0.000025 | 1 | 0.000025 |
+| read_dir | 1 | 0.000025 | 1 | 0.000025 |
+| reclaim | 0 | 0.000000 | 199 | 0.004975 |
+| renew_subscription | 7 | 0.000175 | 3 | 0.000075 |
+| write | 40,000 | 1.000000 | 40,000 | 1.000000 |
+
+One-worker install retains one CREATE and one background WRITE per file;
+LOOKUP, GETATTR, FLUSH, ChangeAck and additional control polling are all zero. Directory
+creation and close/release batches are amortized. Eight-worker misses and every
+control request remain visible in the opcode table. The install denominator is
+42,000 operations (40,000 files plus 2,000 directories); opcode/file divides by
+40,000. These are different denominators.
+
+Cold and warm Git each issue 20,104 RECLAIMs;
+READDIRPLUS capability cleanup raises total RPC counts even though warm metadata
+is cached. The peer workload issues 69,257 RECLAIMs,
+performs 5 scans, observes 140 files during writing,
+and verifies all 2,000. G's preceding peer sample observed one file during
+writing; the overlap differs materially. These shared-VM timings are not an
+isolated speedup experiment, and Git/peer totals are explicit remaining costs.
+
+The full G2 implementation/test/file/interface report is [G2-report.md](G2-report.md).
+
+The separately invoked final `bash scripts/coherence-matrix-linux.sh` also
+exits 0 (`/tmp/cv2-g2-final-matrix.log`): 28 cases and all controls pass,
+with the unchanged declared chown skip and both mounts still serving.

@@ -2,7 +2,53 @@
 
 Status: **protocol-7 local engineering measurements; no production SLO**
 
-## September 16, 2026 protocol-7 measurement
+## September 17, 2026 G2 measurement
+
+G2 preserves zero Linux kernel entry and attribute validity. Daemon LOOKUP and
+GETATTR hits allocate nothing and issue no Authority RPCs. New-directory
+completeness, local FULL FLUSH, implicit source progress and batched close reduce
+install traffic to one CREATE and one background WRITE per file plus amortized
+work. This table compares the preceding G result with final G2 on the same
+shared Linux VM; counts include filesystem and control traffic.
+
+| Workload | G before (s) | G2 final (s) | G requests/op | G2 requests/op | G2 filesystem requests/op |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| install, 1 worker(s) | 21.028568 | 22.479856 | 7.480524 | 1.980643 | 1.966167 |
+| install, 8 worker(s) | 15.706301 | 11.717305 | 6.849524 | 1.979524 | 1.966929 |
+| git-status-cold | 1.379696 | 2.084653 | 1.027400 | 2.031300 | 1.026000 |
+| git-status-warm | 1.195970 | 2.372260 | 0.018600 | 1.023450 | 0.018100 |
+| two-mount-write-list-read | 2.644504 | 3.229293 | 9.819500 | 23.142500 | 3.170500 |
+
+One-worker install retains one CREATE and one background WRITE per file;
+LOOKUP, GETATTR, FLUSH, ChangeAck and additional control polling are all zero. Directory
+creation and close/release batches are amortized. Eight-worker misses and every
+control request remain visible in the linked full opcode table. The install denominator is
+42,000 operations (40,000 files plus 2,000 directories); opcode/file divides by
+40,000. These are different denominators.
+
+Cold and warm Git each issue 20,104 RECLAIMs;
+READDIRPLUS capability cleanup raises total RPC counts even though warm metadata
+is cached. The peer workload issues 69,257 RECLAIMs,
+performs 5 scans, observes 140 files during writing,
+and verifies all 2,000. G's preceding peer sample observed one file during
+writing; the overlap differs materially. These shared-VM timings are not an
+isolated speedup experiment, and Git/peer totals are explicit remaining costs.
+
+The exact kernel LOOKUP probe measures shared p50/p95 at 2.708/14.750 us and
+FULL-holder at 10.292/29.458 us. Both medians meet the below-20-us target; the
+holder tail does not. Each mode has 2,000 samples and zero Authority LOOKUP or
+GETATTR requests. The probe boundaries and overhead are stated in
+[results.md](./coherence-v2/results.md#g2-isolated-kernel-lookup-round-trip).
+
+`bash scripts/verify-local.sh --full` passes at the measured production commit,
+including the XFS and coherence suites. Complete opcode counts, direct-XFS
+comparisons, barrier/drain timing, profiles and failed intermediate runs are
+preserved in [results.md](./coherence-v2/results.md#g2-final-baseline-and-qualification).
+The [G2 report](./coherence-v2/G2-report.md) lists the implementation, regressions,
+interfaces and remaining gaps. No production-network or live macOS performance
+claim follows from these local measurements.
+
+## September 16, 2026 protocol-7 measurement (before G2)
 
 The same full-size harness as the protocol-6 reference runs on the shared
 4 CPU, 8 GiB Docker VM, kernel `6.8.0-100-generic`, loopback TLS, and real FUSE
