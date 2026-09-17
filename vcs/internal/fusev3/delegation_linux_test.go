@@ -1099,24 +1099,35 @@ func TestDelegationFlushKeepsWritableCapabilityUntilApplication(t *testing.T) {
 }
 
 func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T) {
-	for _, owned := range []bool{false, true} {
-		t.Run(fmt.Sprintf("owned=%t", owned), func(t *testing.T) {
+	for _, state := range []string{"unseen", "live", "retired"} {
+		t.Run(state, func(t *testing.T) {
 			m := newDelegationTestManager(t, &delegationFakeRPC{})
-			id := installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
-			if !m.Owns(id) {
-				t.Fatal("grant not installed")
+			id := delegationTestIdentity(22)
+			if state != "unseen" {
+				id = installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 			}
-			if !owned {
+			if state == "retired" {
 				if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: []byte{22, 2}}}); err != nil {
 					t.Fatal(err)
 				}
 			}
 			reader := []byte{22, 3}
-			if err := m.AddHandle(id, []byte{22, 1}, reader, false); err != nil {
-				t.Fatalf("successful read OPEN failed registration: %v", err)
+			err := m.AddHandle(id, []byte{22, 1}, reader, false)
+			if state == "retired" {
+				if !errors.Is(err, errDelegationRetired) {
+					t.Fatalf("retired generation registration = %v, want retirement sentinel", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
 			}
-			if got := m.TracksHandle(id, reader); got != owned {
-				t.Fatalf("reader tracking=%t, want %t", got, owned)
+			if got := m.TracksHandle(id, reader); got != (state == "live") {
+				t.Fatalf("reader tracking=%t for %s", got, state)
+			}
+			// The frontend preserves an Authority OPEN even if its local grant
+			// retired before registration; it closes as an ordinary handle.
+			n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: id, Token: []byte{22, 1}}}
+			if err := n.registerDelegatedHandle(&fileHandle{node: n, token: reader}, nil); err != nil {
+				t.Fatalf("successful read OPEN failed registration: %v", err)
 			}
 		})
 	}

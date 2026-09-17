@@ -44,7 +44,7 @@ func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.De
 			return err
 		}
 	} else {
-		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, handle.openFlags&syscall.O_ACCMODE != syscall.O_RDONLY); err != nil {
+		if err := manager.AddHandle(n.item.GetStableIdentity(), n.item.GetToken(), handle.token, handle.openFlags&syscall.O_ACCMODE != syscall.O_RDONLY); err != nil && !errors.Is(err, errDelegationRetired) {
 			return err
 		}
 	}

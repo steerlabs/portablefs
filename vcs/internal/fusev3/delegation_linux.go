@@ -419,7 +419,7 @@ func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bo
 	s.admission.Lock()
 	defer s.admission.Unlock()
 	if s.ref == nil {
-		return nil
+		return errDelegationRetired
 	}
 	if len(item) != 0 {
 		s.item = cloneBytes(item)
@@ -443,7 +443,7 @@ func prepareDelegationAdmission(ctx context.Context) error {
 	return nil
 }
 
-var errDelegationRetired = errors.New("fusev3: grant response names a retired generation")
+var errDelegationRetired = errors.New("fusev3: delegation retired before response registration")
 
 func (s *delegationState) clearGrantLocked() {
 	if s.ref != nil {

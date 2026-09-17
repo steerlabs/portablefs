@@ -1010,3 +1010,16 @@ through a Go build overlay makes the test fail with `applied 0; want 17`
 (`/tmp/cv2-g2-r7-before.log`), without modifying the working runtime source.
 The unmodified implementation passes 20 repetitions with
 `go -C vcs test ./internal/volumeserver -run '^TestCoherenceReleaseCutCoversSynchronousMutationAdmittedAfterRecall$' -count=20`.
+
+### R8: distinguish retired delegation registration
+
+AddHandle now returns errDelegationRetired for a known identity whose grant
+retired before registration. An identity that never had delegation state still
+returns nil and remains untracked. The frontend explicitly accepts the retired
+sentinel because the Authority OPEN remains valid as an ordinary handle. The
+table tests unseen, live, and retired identities and checks the frontend path.
+It fails before the change (`retired generation registration = <nil>`) and
+passes afterward in the pinned Docker image. Logs:
+`/tmp/cv2-g2-r8-before.log`, `/tmp/cv2-g2-r8-after.log`; the binary was built with
+`CGO_ENABLED=0 GOOS=linux go -C vcs test -c` and executed with
+`-test.run '^TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins$' -test.v`.
