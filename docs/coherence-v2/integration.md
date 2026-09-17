@@ -1231,3 +1231,13 @@ Both paths were already correct. The tests pass (`/tmp/cv2-g2-c7.log`); an overl
 removing the two reference fields fails both (`/tmp/cv2-g2-c7-fault.log`). Linux
 binaries ran in the pinned Docker image with
 `-test.run '^Test(DelegationTruncationAlwaysFlushesThroughWritableHandle|V7FallocateCarriesExactDelegationReference)$'`.
+
+### C8: coherence refusal loses the grant and advances loss
+
+The paired WRITE/SETATTR flush test injects an Authority coherence-class EIO and
+requires ErrLost, retired ownership, advanced identity and mount loss, an EIO
+handle observation, and an empty overlay. It passes alongside C1's capacity
+matrix (`/tmp/cv2-g2-c8.log`). An overlay omitting the permanent-refusal loss
+transition makes both rows fail (`/tmp/cv2-g2-c8-fault.log`). Existing production
+behavior was correct; this distinguishes coherence refusal from C1's recoverable
+capacity refusal. Linux binaries ran in the pinned Docker image.

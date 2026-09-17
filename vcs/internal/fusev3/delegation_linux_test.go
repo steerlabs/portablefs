@@ -1573,3 +1573,37 @@ func TestDelegationSubscriptionFenceWakesAdmissionParkedAtCapacity(t *testing.T)
 		t.Fatalf("identity loss = %d, want > %d", got, before)
 	}
 }
+
+func TestDelegationCoherenceRejectionLosesGrantAndAdvancesLoss(t *testing.T) {
+	for _, truncate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("truncate=%t", truncate), func(t *testing.T) {
+			fake := &delegationRefusalRPC{refusal: &authoritypb.Response{Errno: int32(syscall.EIO), Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}}
+			manager := newDelegationTestManager(t, fake)
+			id := installDelegationForTest(t, manager, 89, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+			n := &node{mount: &Mount{delegations: manager}, item: &authoritypb.Item{StableIdentity: cloneBytes(id)}}
+			handle := &fileHandle{node: n, lossObserved: manager.IdentityLoss(id)}
+			loss := manager.LossSequence()
+			var err error
+			if truncate {
+				_, err = manager.Truncate(t.Context(), id, 1)
+			} else {
+				_, err = manager.Write(t.Context(), id, 0, []byte("rejected"), false)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.FlushIdentity(t.Context(), id); !errors.Is(err, writeback.ErrLost) {
+				t.Fatalf("coherence flush=%v, want loss", err)
+			}
+			if manager.Owns(id) || manager.LossSequence() <= loss || manager.IdentityLoss(id) <= loss {
+				t.Fatal("coherence rejection retained grant or failed to advance loss")
+			}
+			if errno := handle.observeLoss(); errno != syscall.EIO {
+				t.Fatalf("coherence observer=%v, want EIO", errno)
+			}
+			if stats := manager.buf.Stats(); stats.Entries != 0 || stats.Bytes != 0 {
+				t.Fatalf("rejected overlay survived=%+v", stats)
+			}
+		})
+	}
+}
