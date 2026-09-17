@@ -356,10 +356,11 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 				guard.Release()
 				return h.errorResponse(0, err, false)
 			}
+			objectVersion := h.sampledObjectVersion(identity, version)
 			completeRelease()
 			guard.Release()
 			itemReply := itemProto(item, attr, identity)
-			itemReply.ObjectVersion = h.sampledObjectVersion(identity, version)
+			itemReply.ObjectVersion = objectVersion
 			itemReply.SnapshotSequence = version
 			response := h.success(0)
 			response.VolumeVersion = version
@@ -472,13 +473,17 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				return h.coherenceError(0, err)
 			}
 			version := h.coherenceVersionNow()
+			// The object stamp belongs to the same storage cut as its attributes.
+			// Sampling after release could observe a peer version beyond this snapshot.
+			for _, candidate := range candidates {
+				candidate.dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, version)
+			}
 			release()
 			pageGuard.Release()
 
 			result := &authoritypb.ReadDirReply{Verifier: current[:], Eof: eof && !budgetExhausted}
 			issued := make([]directoryPageCandidate, 0, len(candidates))
 			for _, candidate := range candidates {
-				candidate.dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, version)
 				candidate.dirent.SnapshotSequence = version
 				if candidate.dirent.GetItem() != nil {
 					candidate.dirent.Item.ObjectVersion = candidate.dirent.ObjectVersion

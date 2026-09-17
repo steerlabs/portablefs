@@ -2017,3 +2017,13 @@ ordering test (`/tmp/cv2-g2-batch-fault.log`). Ten focused repetitions pass
 (`/tmp/cv2-g2-batch-root.log`), and five Linux race repetitions of batch and
 cached-metadata ownership tests pass (`/tmp/cv2-g2-batch-linux-race.log`). Existing
 scalar proof tests retain their assertions and now release their exact lease.
+
+#### G2 read-stamp ordering follow-up
+
+LOOKUP and READDIR now capture object versions before releasing their storage
+read turn. Previously a peer could mutate between the attribute sample and the
+object-version sample, producing a version newer than the advertised snapshot.
+The regression test blocks the version sample and proves that a conflicting
+storage mutation cannot enter. Both arms fail against the prior handler
+(`/tmp/cv2-g2-read-stamp-fault.log`); ten focused Linux repetitions pass
+(`/tmp/cv2-g2-read-stamp.log`).
