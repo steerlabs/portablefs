@@ -1866,3 +1866,9 @@ handle leaves the session usable. Restoring the former client fails that test
 ten repetitions (`terminal-reply.log`, `terminal-reply-linux.log`, same prefix).
 Original full failure: `/tmp/cv2-g2-item7-full-xfs2.log`; isolated diagnostic:
 `/tmp/cv2-g2-item7-expiry-isolated.log` (selected test pass, wrapper 70).
+
+The full XFS rerun at `a6b5b60` passes all 76 required privileged tests and the
+root boundary test (`/tmp/cv2-g2-terminal-full-xfs.log`). This includes capacity
+partition, terminal session expiry, the ordered mounted overlap regression, and
+the existing stock synchronous-write split assertions. Full verify/matrix will
+be repeated after the remaining performance items.
