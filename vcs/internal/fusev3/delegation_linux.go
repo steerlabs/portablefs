@@ -125,6 +125,7 @@ type delegationManager struct {
 
 	dropReporter          func(writeback.DropReport)
 	cleanupFailure        func(error)
+	cleanupRetry          func(context.Context) error
 	hookMu                sync.RWMutex
 	withdrawalDrain       func(context.Context, []byte) error
 	flushCycleInvalidator func(context.Context, []byte) error
@@ -1434,6 +1435,28 @@ func (m *delegationManager) loseDelegation(s *delegationState, reason string) {
 	s.meta.Unlock()
 }
 
+func (m *delegationManager) failCleanupIdentity(identity []byte, reason string) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.lookupState(id)
+	if s == nil {
+		return
+	}
+	s.admission.Lock()
+	s.clearGrantLocked()
+	s.admission.Unlock()
+	if m.buf.HasRetained(id) {
+		m.reportDrop(m.buf.Drop(id, reason))
+	}
+	s.meta.Lock()
+	s.dirty = false
+	s.meta.Unlock()
+}
+
 func (m *delegationManager) recall(ctx context.Context, event *authoritypb.ControlEvent, s *delegationState) {
 	retire, err := m.beginRetire(ctx, s)
 	var applied uint64
@@ -1779,13 +1802,52 @@ func (m *delegationManager) drainCloseQueue() {
 }
 
 func (m *delegationManager) processCloseBatch(batch []delegationClose) {
-	defer m.changePendingCloses(-len(batch))
+	retirePending := true
+	defer func() {
+		if retirePending {
+			m.changePendingCloses(-len(batch))
+		}
+	}()
 	// A background close retains its exact replay identity through an outage.
 	// The queue is bounded, and mount shutdown cancels this work.
 	if err := m.CloseHandles(m.ctx, batch); err != nil {
 		var cleanup delegationCleanupError
 		var finalized delegationReleaseFinalizedError
 		if errors.As(err, &cleanup) || errors.As(err, &finalized) {
+			for _, pending := range batch {
+				m.epoch.RLock()
+				current := pending.epoch == m.epochSerial
+				m.epoch.RUnlock()
+				if current {
+					m.failCleanupIdentity(pending.identity, "deferred descriptor cleanup refused")
+				}
+			}
+			m.hookMu.RLock()
+			report := m.cleanupFailure
+			m.hookMu.RUnlock()
+			if report != nil {
+				report(err)
+			}
+			var classified cleanupClassified
+			m.hookMu.RLock()
+			waitRetry := m.cleanupRetry
+			m.hookMu.RUnlock()
+			if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && waitRetry != nil && waitRetry(m.ctx) == nil {
+				m.epoch.RLock()
+				for i := range batch {
+					batch[i].epoch = m.epochSerial
+				}
+				m.epoch.RUnlock()
+				for _, pending := range batch {
+					select {
+					case m.closeQueue <- pending:
+					case <-m.ctx.Done():
+						return
+					}
+				}
+				retirePending = false
+				return
+			}
 			log.Printf("portablefs: deferred close failed: %v", err)
 			return
 		}
@@ -1885,6 +1947,9 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		return writeback.ErrLost
 	}
 	if err != nil {
+		if response != nil && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			return delegationCleanupError{cause: err, failure: response.GetFailure()}
+		}
 		return m.unknownCloseOutcome(err)
 	}
 	results := response.GetCloseBatch().GetResults()
@@ -1900,6 +1965,7 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		}
 	}
 	var firstErr error
+	var firstFailure authoritypb.FailureClass
 	for i, result := range results {
 		errno := responseErrno(&authoritypb.Response{Errno: result.GetErrno(), Failure: result.GetFailure()})
 		if result == nil {
@@ -1908,9 +1974,9 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		if errno != 0 {
 			if firstErr == nil {
 				firstErr = errno
+				firstFailure = result.GetFailure()
 			}
 			if !result.GetRetired() {
-				m.unknownCloseOutcome(errno)
 				continue
 			}
 		}
@@ -1922,7 +1988,7 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 		s.admission.Unlock()
 	}
 	if firstErr != nil {
-		return delegationCleanupError{firstErr}
+		return delegationCleanupError{cause: firstErr, failure: firstFailure}
 	}
 	return nil
 }

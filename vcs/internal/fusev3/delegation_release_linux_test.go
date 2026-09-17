@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -209,6 +210,67 @@ func TestDelegationCloseFailureRetainsAppliedRecords(t *testing.T) {
 				t.Fatalf("retained record hid peer data: %q %v", data, err)
 			}
 		})
+	}
+}
+
+func TestDeferredCoherenceCloseWaitsForColdSubscriptionAndRetries(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	fake := &releaseOutcomeRPC{close: func(batch *authoritypb.CloseBatchRequest) (*authoritypb.Response, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		result := &authoritypb.CloseBatchResult{}
+		if calls == 1 {
+			result.Errno = int32(syscall.EIO)
+			result.Failure = authoritypb.FailureClass_FAILURE_CLASS_COHERENCE
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: []*authoritypb.CloseBatchResult{result}}}}, nil
+	}}
+	m := newDelegationTestManager(t, fake)
+	id := installDelegationForTest(t, m, 88, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	if _, err := m.Write(t.Context(), id, 0, []byte("retained"), false); err != nil {
+		t.Fatal(err)
+	}
+	retry := make(chan struct{})
+	m.SetCleanupRetryWaiter(func(ctx context.Context) error {
+		select {
+		case <-retry:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	reported := make(chan error, 1)
+	m.SetCleanupFailureReporter(func(err error) { reported <- err })
+	if err := m.QueueClose(id, delegationTestToken(88, 2), 0, false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-reported:
+		var classified cleanupClassified
+		if !errors.As(err, &classified) || classified.cleanupFailureClass() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			t.Fatalf("reported cleanup = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("coherence close refusal was not reported")
+	}
+	m.closeMu.Lock()
+	pending := m.closePending
+	m.closeMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending close retired before cold retry: %d", pending)
+	}
+	close(retry)
+	waitUntil(t, time.Second, "deferred close retry", func() bool {
+		m.closeMu.Lock()
+		defer m.closeMu.Unlock()
+		return m.closePending == 0
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("close calls = %d, want coherence refusal plus retry", calls)
 	}
 }
 

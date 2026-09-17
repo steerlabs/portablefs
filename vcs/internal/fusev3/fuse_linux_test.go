@@ -90,7 +90,9 @@ type fakeRPC struct {
 	closeFailure   syscall.Errno
 	mkdirFailure   syscall.Errno
 	reclaimFailure syscall.Errno
+	reclaimClass   authoritypb.FailureClass
 	keepAliveErr   syscall.Errno
+	sessionEnd     error
 	xattrValue     []byte
 	xattrNames     [][]byte
 	fileData       []byte
@@ -167,8 +169,12 @@ func (f *fakeRPC) SessionLease() time.Duration        { return f.lease }
 func (f *fakeRPC) SessionDone() <-chan struct{}       { return f.done }
 func (f *fakeRPC) SessionError() error                { return nil }
 func (f *fakeRPC) SessionEndPending() <-chan struct{} { return f.done }
-func (f *fakeRPC) SessionEndCause() error             { return nil }
-func (f *fakeRPC) FinishLocalSessionEnforcement()     {}
+func (f *fakeRPC) SessionEndCause() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionEnd
+}
+func (f *fakeRPC) FinishLocalSessionEnforcement() {}
 func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
 	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, time.Now().Add(10 * time.Second), nil
 }
@@ -391,7 +397,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Respo
 	case request.GetReclaim() != nil:
 		f.reclaims = append(f.reclaims, cloneBytes(request.GetReclaim().GetItem()))
 		if f.reclaimFailure != 0 {
-			return &authoritypb.Response{Errno: int32(f.reclaimFailure)}, nil
+			return &authoritypb.Response{Errno: int32(f.reclaimFailure), Failure: f.reclaimClass}, nil
 		}
 	case request.GetCloseBatch() != nil:
 		results := make([]*authoritypb.CloseBatchResult, len(request.GetCloseBatch().Closes))
@@ -1278,7 +1284,7 @@ func TestLivenessAndCleanupLanesAreReserved(t *testing.T) {
 	}
 }
 
-// --- Defect 9: a refused release is never discarded ------------------------
+// --- Defect 9: a refused release is scoped to the released resource --------
 
 func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	frontend, mount, rpc := testRawFileSystem(t, 8)
@@ -1296,12 +1302,11 @@ func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	if frontend.ReplyWriteTracked(unique) {
 		frontend.ReplyWritten(unique, fuse.OK)
 	}
-	err := mount.fatalError()
-	if err == nil {
-		t.Fatal("a refused close was discarded; the authority keeps the open file description until the session ends")
+	if err := mount.fatalError(); err != nil {
+		t.Fatalf("definite close refusal revoked mount: %v", err)
 	}
-	if !strings.Contains(err.Error(), "frontend-owned resource") {
-		t.Fatalf("diagnostic does not name the cause: %v", err)
+	if !record.node.stale.Load() {
+		t.Fatal("refused close did not stale the affected identity")
 	}
 }
 
@@ -1316,9 +1321,16 @@ func TestReleaseDirSurfacesARefusedClose(t *testing.T) {
 	if !ok {
 		t.Fatal("add handle")
 	}
-	frontend.ReleaseDir(&fuse.ReleaseIn{Fh: id})
-	if mount.fatalError() == nil {
-		t.Fatal("a refused directory close was discarded")
+	unique := nextTestRequestUnique()
+	frontend.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: unique}, Fh: id})
+	if frontend.ReplyWriteTracked(unique) {
+		frontend.ReplyWritten(unique, fuse.OK)
+	}
+	if err := mount.fatalError(); err != nil {
+		t.Fatalf("definite directory close refusal revoked mount: %v", err)
+	}
+	if !record.node.stale.Load() {
+		t.Fatal("refused directory close did not stale the affected identity")
 	}
 }
 
@@ -2212,15 +2224,32 @@ func TestTerminalSessionSignalAbortsMount(t *testing.T) {
 	}
 }
 
-func TestRefusedReclaimIsTerminal(t *testing.T) {
+func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.T) {
 	mount, rpc := testMount(t, 64)
-	rpc.reclaimFailure = syscall.EIO
-	mount.start(time.Hour)
-	mount.deferReclaim(testToken(1))
+	mount.subscription.mu.Lock()
+	mount.subscription.active = true
+	mount.subscription.incarnation = 7
+	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.mu.Unlock()
+	coherence := resourceCleanupError{cause: syscall.EIO, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
+	if retry := mount.cleanupFailed("object reclaim", coherence, nil); !retry {
+		t.Fatal("coherence cleanup refusal was not deferred")
+	}
+	if mount.isRevoked() || mount.subscription.stamp() != (subscriptionStamp{}) {
+		t.Fatalf("coherence cleanup refusal revoked or retained subscription: revoked=%v stamp=%+v", mount.isRevoked(), mount.subscription.stamp())
+	}
+
+	if retry := mount.cleanupFailed("object reclaim", resourceCleanupError{cause: syscall.EIO}, nil); retry || mount.isRevoked() {
+		t.Fatalf("definite scoped refusal retry=%v revoked=%v", retry, mount.isRevoked())
+	}
+	rpc.mu.Lock()
+	rpc.sessionEnd = authorityrpc.ErrSessionEnded
+	rpc.mu.Unlock()
+	mount.cleanupFailed("object reclaim", resourceCleanupError{cause: syscall.EIO}, nil)
 	select {
 	case <-mount.ctx.Done():
 	case <-time.After(2 * time.Second):
-		t.Fatal("a refused reclaim left the frontend and the authority disagreeing about ownership")
+		t.Fatal("terminal session cleanup failure did not revoke mount")
 	}
 }
 

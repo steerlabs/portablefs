@@ -327,6 +327,13 @@ func (b *Buffer) IdentityLoss(id Identity) uint64 {
 	return f.lastLoss
 }
 
+func (b *Buffer) HasRetained(id Identity) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.files[id]
+	return f != nil && f.head != nil
+}
+
 // IdentityFailure returns the loss ticket and its errno as one observation.
 func (b *Buffer) IdentityFailure(id Identity, observed uint64) (uint64, syscall.Errno) {
 	b.mu.Lock()

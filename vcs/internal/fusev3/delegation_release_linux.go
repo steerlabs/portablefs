@@ -231,7 +231,7 @@ func (b *delegationReleaseBatch) applyAndRelease(ctx context.Context) error {
 				g.state.transition.Unlock()
 			}
 		}
-		return delegationReleaseFinalizedError{err}
+		return delegationReleaseFinalizedError{cause: err, failure: response.GetFailure()}
 	}
 	if err := successfulDelegationResponse(response); err != nil {
 		return err
@@ -262,16 +262,37 @@ func (b *delegationReleaseBatch) applyAndRelease(ctx context.Context) error {
 		}
 	}
 	if firstErr != nil {
-		return delegationReleaseFinalizedError{firstErr}
+		return delegationReleaseFinalizedError{cause: firstErr}
 	}
 	return nil
 }
 
-type delegationReleaseFinalizedError struct{ error }
+type delegationReleaseFinalizedError struct {
+	cause   error
+	failure authoritypb.FailureClass
+}
+
+func (e delegationReleaseFinalizedError) Error() string { return e.cause.Error() }
+func (e delegationReleaseFinalizedError) Unwrap() error { return e.cause }
+func (e delegationReleaseFinalizedError) cleanupFailureClass() authoritypb.FailureClass {
+	return e.failure
+}
+func (e delegationReleaseFinalizedError) cleanupIsTerminal() bool { return false }
 
 // Descriptor cleanup failure cannot erase already-applied writeback records.
 // Their bytes remain charged until a durable receipt or a real fencing loss.
-type delegationCleanupError struct{ error }
+type delegationCleanupError struct {
+	cause    error
+	failure  authoritypb.FailureClass
+	terminal bool
+}
+
+func (e delegationCleanupError) Error() string { return e.cause.Error() }
+func (e delegationCleanupError) Unwrap() error { return e.cause }
+func (e delegationCleanupError) cleanupFailureClass() authoritypb.FailureClass {
+	return e.failure
+}
+func (e delegationCleanupError) cleanupIsTerminal() bool { return e.terminal }
 
 // Unknown cleanup owns an Authority descriptor until terminal session cleanup.
 // End the mounted session rather than silently discharging its admission debt.
@@ -280,19 +301,25 @@ func (m *delegationManager) unknownCloseOutcome(err error) error {
 		// The authenticated epoch replacement destroyed the old descriptor
 		// table. Recovery owns its local handles and retained-data loss; an
 		// asynchronous close must not turn that boundary into mount teardown.
-		return delegationCleanupError{err}
+		return delegationCleanupError{cause: err}
 	}
 	m.hookMu.RLock()
 	report := m.cleanupFailure
 	m.hookMu.RUnlock()
 	if report != nil {
-		report(fmt.Errorf("fusev3: unresolved frontend-owned descriptor cleanup: %w", err))
+		report(delegationCleanupError{cause: fmt.Errorf("fusev3: unresolved frontend-owned descriptor cleanup: %w", err), terminal: true})
 	}
-	return delegationCleanupError{err}
+	return delegationCleanupError{cause: err, terminal: true}
 }
 func (m *delegationManager) SetCleanupFailureReporter(report func(error)) {
 	m.hookMu.Lock()
 	m.cleanupFailure = report
+	m.hookMu.Unlock()
+}
+
+func (m *delegationManager) SetCleanupRetryWaiter(wait func(context.Context) error) {
+	m.hookMu.Lock()
+	m.cleanupRetry = wait
 	m.hookMu.Unlock()
 }
 
@@ -313,7 +340,7 @@ func (m *delegationManager) closeSerial(ctx context.Context, epochSerial uint64,
 		}
 		if err := successfulDelegationResponse(response); err != nil {
 			if first == nil {
-				first = err
+				first = delegationCleanupError{cause: err, failure: response.GetFailure()}
 			}
 			continue
 		}
@@ -325,7 +352,11 @@ func (m *delegationManager) closeSerial(ctx context.Context, epochSerial uint64,
 		s.admission.Unlock()
 	}
 	if first != nil {
-		return delegationCleanupError{first}
+		var cleanup delegationCleanupError
+		if errors.As(first, &cleanup) {
+			return cleanup
+		}
+		return delegationCleanupError{cause: first}
 	}
 	return nil
 }
