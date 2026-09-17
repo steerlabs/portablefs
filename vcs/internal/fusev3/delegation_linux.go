@@ -1836,6 +1836,9 @@ func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegatio
 	if err := batch.applyAndRelease(ctx); err != nil {
 		return err
 	}
+	if capable, ok := m.rpc.(interface{ SupportsBatchedClose() bool }); !ok || !capable.SupportsBatchedClose() {
+		return m.closeSerial(ctx, current, requests, groupsByID)
+	}
 	response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: &authoritypb.CloseBatchRequest{Closes: requests}}})
 	if err == nil {
 		err = successfulDelegationResponse(response)

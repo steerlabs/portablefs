@@ -26,7 +26,7 @@ identifier `requiredAttachFeatures`.
 | Hello, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Hello, FSKit additions | `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1` |
 | Activate, every profile | `no-history`, `no-branches`, `user-xattr-readonly`, `single-principal`, `stable-item-identity`, `volume-syncfs-barrier`, `exact-resource-acquisition` |
-| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1`, `bounded-control-replay-v1`, `batched-close-v1` |
+| Activate, Linux additions | `direct-io-no-file-mmap`, `distributed-posix-locks`, `delegation-control-v1`, `session-durable-sequence-v1`, `root-directory-barrier-v1`, `bounded-control-replay-v1` |
 | Activate, cacheless reader additions | `cacheless-peer-reader-v1` |
 | Activate, FSKit additions | `write-through`, `fskit-sync-repair-v1`, `fskit-source-publication-v1`, `fskit-fragmented-write-v1`, `peer-complete-fifo-feedback` |
 
@@ -37,8 +37,8 @@ withdrawal acks. `file-write-delegation-v1` includes CREATE/OPEN piggyback,
 cache-capable handle accounting, full and writethrough modes, and generation
 checks on every delegated flush. `delegation-control-v1` requires recall,
 break, mode changes, their acks, and batch release. `session-durable-sequence-v1` and `root-directory-barrier-v1` require session
-application/durability tickets and the root FSYNCDIR barrier. `batched-close-v1`
-requires the bounded DATA close operation below.
+application/durability tickets and the root FSYNCDIR barrier. Optional
+`batched-close-v1` advertises the bounded DATA close operation below.
 
 Linux no longer requires or advertises `lease-coherence-v1`,
 `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`,
@@ -514,7 +514,8 @@ untyped legacy membership continues to require explicit fencing evidence.
 
 ## Batched descriptor close
 
-Linux Activate requires the additive `batched-close-v1` feature. DATA carries
+Linux Activate optionally advertises `batched-close-v1`; absent advertisement
+selects individual CLOSE requests. The required feature set is unchanged. DATA carries
 `Request.close_batch` (tag 74) and `Response.close_batch` (tag 68); FSKit and
 CACHELESS_READER retain ordinary CLOSE. A request contains 1–128 distinct
 16-byte handle capabilities with each handle's lock owner and flock-unlock

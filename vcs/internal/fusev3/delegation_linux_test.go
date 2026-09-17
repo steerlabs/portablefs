@@ -29,6 +29,8 @@ type delegationFakeRPC struct {
 	omitPostAttr bool
 }
 
+func (f *delegationFakeRPC) SupportsBatchedClose() bool { return true }
+
 func (f *delegationFakeRPC) IOLimits() (uint32, uint32) {
 	if f.maxWrite == 0 {
 		return writeback.MaxPayload, writeback.MaxPayload

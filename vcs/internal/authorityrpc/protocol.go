@@ -97,7 +97,7 @@ var (
 	}
 	requiredLinuxAttachFeatures = []string{
 		"direct-io-no-file-mmap", "distributed-posix-locks",
-		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, boundedControlReplayFeature, batchedCloseFeature,
+		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, boundedControlReplayFeature,
 	}
 	requiredFskitAttachFeatures = []string{
 		"write-through",
@@ -141,6 +141,15 @@ func activateFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// Optional advertisements never alter protocol 7's frozen required sets.
+func advertisedActivateFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
+	features, valid := activateFeatures(profile)
+	if valid && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+		features = append(features, batchedCloseFeature)
+	}
+	return features, valid
 }
 
 func hasFeatures(advertised, required []string) bool {

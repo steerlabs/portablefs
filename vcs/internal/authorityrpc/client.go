@@ -167,7 +167,8 @@ type lane struct {
 }
 
 type Client struct {
-	cfg ClientConfig
+	batchedClose atomic.Bool
+	cfg          ClientConfig
 
 	// lifecycle protects shared session state and the reconnect TLS identity.
 	// Physical connection state is never placed under it: DATA and CONTROL must
@@ -658,6 +659,7 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
+	c.batchedClose.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
 	c.root = proto.Clone(root).(*authoritypb.Item)
 	c.routesRevision = c.cfg.RoutesRevision
 	c.lease = lease
@@ -2062,3 +2064,6 @@ func equalBytes(a, b []byte) bool {
 	}
 	return different == 0
 }
+
+// SupportsBatchedClose reports the optional capability of this active epoch.
+func (c *Client) SupportsBatchedClose() bool { return c.batchedClose.Load() }

@@ -170,3 +170,8 @@ func (e *epochRPC) DetachAfterUnmount(ctx context.Context, proof MountAbsencePro
 func (e *epochRPC) Close() error { return e.current().Close() }
 
 var _ RPC = (*epochRPC)(nil)
+
+func (e *epochRPC) SupportsBatchedClose() bool {
+	capable, ok := e.current().(interface{ SupportsBatchedClose() bool })
+	return ok && capable.SupportsBatchedClose()
+}

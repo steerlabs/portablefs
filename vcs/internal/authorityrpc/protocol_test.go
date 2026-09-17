@@ -201,7 +201,7 @@ func TestAuthorityProtocolV7RequiresSubscriptionAndDelegation(t *testing.T) {
 	if !hasFeatures(requiredHelloFeatures, []string{"exact-resource-acquisition", "mandatory-dual-transport-v1", subscriptionFeature, changeStreamFeature, delegationFeature}) {
 		t.Fatalf("incomplete v7 Hello: %v", requiredHelloFeatures)
 	}
-	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, batchedCloseFeature}) {
+	if !hasFeatures(requiredStrictAttachFeatures, []string{delegationControlFeature, durableSequenceFeature, directoryBarrierFeature}) {
 		t.Fatalf("incomplete v7 Activate: %v", requiredStrictAttachFeatures)
 	}
 	for _, retired := range []string{"lease-coherence-v1", "directory-enumeration-lease-v1", "lease-recall-v1", "lease-renewal-v1", "open-by-identity-v1", "write-through"} {

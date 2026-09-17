@@ -1485,8 +1485,8 @@ application only. Applied records detach from the read/attribute overlay but
 remain charged until durability or loss, including across a fresh grant;
 retirement of an older truncate cannot damage a successor's overlay.
 
-`CloseBatch` is additive (request 74, response 68), Linux DATA-only, and requires
-`batched-close-v1` at Activate. One replay slot retains up to 128 ordered outcomes.
+`CloseBatch` is additive (request 74, response 68), Linux DATA-only, and uses the optional
+`batched-close-v1` advertisement at Activate. One replay slot retains up to 128 ordered outcomes.
 The ingress grammar and handler bound both lists. Each result states whether its
 handle was retired even if descriptor cleanup reported an error. A validated
 handle is closed and untracked even when explicit flock cleanup fails; exact
@@ -1723,3 +1723,27 @@ check retained accounting; epoch recovery subsequently reports the old data
 loss once. Close/release/malformed-outcome tests pass 20 repetitions
 (`/tmp/cv2-g2-close-epoch-unit.log`). The failing matrix is retained at
 `/tmp/cv2-g2-after-handoff-matrix.log`; a full rerun is in progress.
+
+The full coherence matrix rerun passes all 28 asserted cases, with its existing
+unprivileged chown limitation unchanged (`/tmp/cv2-g2-close-epoch-matrix.log`).
+Both controls retain their declared failures. Authority replacement preserves
+both mounts and the subsequent peer-loss case passes.
+
+#### G2 item 4 compatibility follow-up: optional batched CLOSE
+
+Review caught that item 4 had appended `batched-close-v1` to protocol 7's frozen
+Linux required-feature set. The exact required set is restored. New Linux
+Activate replies advertise batched CLOSE optionally; other profiles do not.
+The client retains the advertisement, and the epoch facade reads it from the
+current transport after replacement. Peers without it use ordered individual
+CLOSE requests after the existing batched delegation release. Both paths keep
+RPCs outside state locks and retain applied records after cleanup failure.
+
+Tests cover old/new peer activation, the real handler advertisement by profile,
+serial order and lock-owner/flock fields, unchanged batched outcome validation,
+serial uncertainty, and capability replacement through the epoch facade.
+Restoring the erroneous required feature fails the compatibility regression
+(`/tmp/cv2-g2-optional-close-fault.log`). The host Authority race suite and full
+unprivileged FUSE suite pass; final focused serial/epoch tests also pass. Logs:
+`/tmp/cv2-g2-optional-close-host-race.log`, `optional-close-rpc.log`,
+`optional-close-fuse.log`, `optional-close-final.log` (same prefix).

@@ -2664,7 +2664,7 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 }
 
 func (h *VolumeHandler) newActivationReply(resources *sessionResources, rootAttr xfsstore.Attr, rootIdentity [16]byte, fskitCursor volumeserver.VisibilityCursor) *authoritypb.ActivateReply {
-	features, valid := activateFeatures(resources.profile)
+	features, valid := advertisedActivateFeatures(resources.profile)
 	if !valid {
 		return nil
 	}
