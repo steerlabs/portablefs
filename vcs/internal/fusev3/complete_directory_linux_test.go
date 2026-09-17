@@ -71,7 +71,7 @@ func TestCompleteDirectoryNewNameLookupIsAllocationFreeAndUsesNoRPC(t *testing.T
 		t.Fatal("inferred absence omitted enumeration withdrawal")
 	}
 	done := make(chan error, 1)
-	go func() { done <- raw.closeCacheCoordinate(t.Context(), p.cachedCoordinates[1]) }()
+	go func() { _, err := raw.closeCacheCoordinate(t.Context(), p.cachedCoordinates[1]); done <- err }()
 	select {
 	case err := <-done:
 		t.Fatalf("withdrawal passed unwritten absence: %v", err)
@@ -109,10 +109,11 @@ func TestCreatePreservesCompleteDirectoryOnlyWithAcceptedMember(t *testing.T) {
 			}
 			coordinate := publicationCoordinate{kind: publicationItemEnumeration, item: dir.identity}
 			if revoke {
-				if err := raw.closeCacheCoordinate(t.Context(), coordinate); err != nil {
+				lease, err := raw.closeCacheCoordinate(t.Context(), coordinate)
+				if err != nil {
 					t.Fatal(err)
 				}
-				raw.openCacheCoordinate(coordinate)
+				lease.Open()
 			}
 			completeTestReply(t, raw, unique, fuse.OK)
 			if got := raw.completeDirectories[dir.identity] != nil; got == revoke {
@@ -189,7 +190,8 @@ func TestMkdirCompletenessCandidateIsRevocableBeforePhysicalReply(t *testing.T) 
 		t.Fatal("candidate not finalized")
 	}
 	done := make(chan error, 1)
-	go func() { done <- raw.closeCacheCoordinate(t.Context(), coordinate) }()
+	var lease *cacheRepairLease
+	go func() { var err error; lease, err = raw.closeCacheCoordinate(t.Context(), coordinate); done <- err }()
 	select {
 	case err := <-done:
 		t.Fatalf("withdrawal passed finalized MKDIR: %v", err)
@@ -204,7 +206,7 @@ func TestMkdirCompletenessCandidateIsRevocableBeforePhysicalReply(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("withdrawal failed to join MKDIR")
 	}
-	raw.openCacheCoordinate(coordinate)
+	lease.Open()
 	if raw.completeDirectories[dir.identity] != nil {
 		t.Fatal("completed peer withdrawal was forgotten before MKDIR settlement")
 	}

@@ -6,33 +6,50 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
-func (r *rawFileSystem) closeCacheCoordinate(ctx context.Context, coordinate publicationCoordinate) error {
+func (r *rawFileSystem) closeCacheCoordinate(ctx context.Context, coordinate publicationCoordinate) (*cacheRepairLease, error) {
+	return r.closeCacheCoordinates(ctx, []publicationCoordinate{coordinate})
+}
+
+func (r *rawFileSystem) closeCacheCoordinates(ctx context.Context, coordinates []publicationCoordinate) (*cacheRepairLease, error) {
+	set := make(map[publicationCoordinate]struct{}, len(coordinates))
+	for _, coordinate := range coordinates {
+		set[coordinate] = struct{}{}
+	}
+	lease := &cacheRepairLease{raw: r, coordinates: make([]publicationCoordinate, 0, len(set))}
 	r.mu.Lock()
-	r.repairingCoordinates[coordinate] = true
 	pending := make([]<-chan struct{}, 0)
 	candidates := make(map[*replyPublication]struct{})
-	for reservation := range r.cacheReservations[coordinate] {
-		reservation.revoked = true
-		candidates[reservation.publication] = struct{}{}
-	}
-	if coordinate.kind == publicationItemData {
-		for publication := range r.dataPublications[coordinate.item] {
-			candidates[publication] = struct{}{}
+	for coordinate := range set {
+		r.repairingCoordinates[coordinate] = true
+		if r.repairOwners[coordinate] == nil {
+			r.repairOwners[coordinate] = make(map[*cacheRepairLease]struct{})
+		}
+		r.repairOwners[coordinate][lease] = struct{}{}
+		lease.coordinates = append(lease.coordinates, coordinate)
+		for reservation := range r.cacheReservations[coordinate] {
+			reservation.revoked = true
+			candidates[reservation.publication] = struct{}{}
+		}
+		if coordinate.kind == publicationItemData {
+			for publication := range r.dataPublications[coordinate.item] {
+				candidates[publication] = struct{}{}
+			}
 		}
 	}
 	for _, publication := range r.replyPublications {
 		for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
-			if cached == coordinate {
+			if _, ok := set[cached]; ok {
 				candidates[publication] = struct{}{}
 			}
 		}
 	}
 	for publication := range candidates {
 		for index := range publication.data {
-			if publication.data[index].coordinate == coordinate && !publication.originalFinalized {
+			if _, ok := set[publication.data[index].coordinate]; ok && !publication.originalFinalized {
 				publication.data[index].revoked = true
 			}
 		}
@@ -46,10 +63,10 @@ func (r *rawFileSystem) closeCacheCoordinate(ctx context.Context, coordinate pub
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return fmt.Errorf("fusev3: drain finalized cache reply for cache withdrawal: %w", ctx.Err())
+			return lease, fmt.Errorf("fusev3: drain finalized cache reply for cache withdrawal: %w", ctx.Err())
 		}
 	}
-	return nil
+	return lease, nil
 }
 
 func publicationInstallsCoordinate(publication *replyPublication, coordinate publicationCoordinate) bool {
@@ -98,10 +115,15 @@ func (r *rawFileSystem) drainDataPublications(coordinate publicationCoordinate) 
 }
 
 func (r *rawFileSystem) drainDataPublicationsContext(ctx context.Context, coordinate publicationCoordinate) error {
+	return r.drainDataPublicationsSet(ctx, []publicationCoordinate{coordinate})
+}
+func (r *rawFileSystem) drainDataPublicationsSet(ctx context.Context, coordinates []publicationCoordinate) error {
 	r.mu.Lock()
 	pending := make(map[*replyPublication]struct{})
-	for publication := range r.dataPublications[coordinate.item] {
-		pending[publication] = struct{}{}
+	for _, coordinate := range coordinates {
+		for publication := range r.dataPublications[coordinate.item] {
+			pending[publication] = struct{}{}
+		}
 	}
 	deadline := time.Now().Add(r.mount.repairBudget)
 	for {
@@ -130,11 +152,35 @@ func (r *rawFileSystem) drainDataPublicationsContext(ctx context.Context, coordi
 	}
 }
 
-func (r *rawFileSystem) openCacheCoordinate(coordinate publicationCoordinate) {
-	r.mu.Lock()
-	delete(r.repairingCoordinates, coordinate)
-	r.signalSourceChangedLocked()
-	r.mu.Unlock()
+// Exact owner identity survives a cold clear. A delayed local opener can
+// release only its own cut, never a successor subscription's withdrawal.
+type cacheRepairLease struct {
+	raw         *rawFileSystem
+	coordinates []publicationCoordinate
+	once        sync.Once
+}
+
+func (lease *cacheRepairLease) Open() {
+	if lease == nil {
+		return
+	}
+	lease.once.Do(func() {
+		r := lease.raw
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for _, coordinate := range lease.coordinates {
+			owners := r.repairOwners[coordinate]
+			if _, present := owners[lease]; !present {
+				continue
+			}
+			delete(owners, lease)
+			if len(owners) == 0 {
+				delete(r.repairOwners, coordinate)
+				delete(r.repairingCoordinates, coordinate)
+			}
+		}
+		r.signalSourceChangedLocked()
+	})
 }
 
 func (p *replyPublication) subscriptionCacheStamp() subscriptionStamp {

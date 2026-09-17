@@ -480,6 +480,7 @@ type rawFileSystem struct {
 	publishingNegativeNames map[publicationCoordinate]map[*negativeNamePublication]struct{}
 	sourceChanged           chan struct{}
 	repairingCoordinates    map[publicationCoordinate]bool
+	repairOwners            map[publicationCoordinate]map[*cacheRepairLease]struct{}
 	cacheReservations       map[publicationCoordinate]map[*cacheInstallReservation]struct{}
 }
 
@@ -535,6 +536,7 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		sourcePublishing:        make(map[publicationCoordinate]int),
 		publishingNegativeNames: make(map[publicationCoordinate]map[*negativeNamePublication]struct{}),
 		repairingCoordinates:    make(map[publicationCoordinate]bool),
+		repairOwners:            make(map[publicationCoordinate]map[*cacheRepairLease]struct{}),
 		cacheReservations:       make(map[publicationCoordinate]map[*cacheInstallReservation]struct{}),
 	}
 	for i := range r.cachedReplyArena {
@@ -562,13 +564,14 @@ func newRawFileSystem(mount *Mount, root *node) *rawFileSystem {
 		}
 		for _, kind := range []publicationCoordinateKind{publicationItemAttributes, publicationItemData} {
 			coordinate := publicationCoordinate{kind: kind, item: id}
-			if err := r.closeCacheCoordinate(ctx, coordinate); err != nil {
+			lease, err := r.closeCacheCoordinate(ctx, coordinate)
+			if err != nil {
 				return err
 			}
 			if err := r.invalidateCacheCoordinateContext(ctx, coordinate, nil); err != nil {
 				return err
 			}
-			r.openCacheCoordinate(coordinate)
+			lease.Open()
 		}
 		return nil
 	})

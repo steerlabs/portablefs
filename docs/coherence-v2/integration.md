@@ -1990,3 +1990,30 @@ length-prefix tests pass three repetitions. Actual old/new handler binaries
 were benchmarked on the same Docker VM; results.md records the batch-size table
 (`/tmp/cv2-g2-control-bench-before.log`, `control-bench-after.log`, same prefix).
 The client-side batch withdrawal portion of item 10 follows separately.
+
+#### G2 item 10b: one client withdrawal cut per change batch
+
+The change worker validates and deduplicates a batch, closes all affected
+coordinates under one registry lock, joins physical replies, and drops all
+payloads before its first reverse notification. Data notification subsumes an
+attribute notification for the same inode; repeated ranges widen conservatively
+to whole-file. One timeout bounds the entire batch. Failure leaves every
+coordinate closed/stale and sends no acknowledgment. EntryNotify remains outside
+the change-ack proof.
+
+Closures now carry exact owner leases. Overlapping local and subscription
+invalidations cannot reopen each other. A successful cold proof clears the old
+owner sets atomically; a delayed old lease cannot remove a new owner's cut.
+Failed inactive cold attempts release only their own lease. The delegated set
+also records each latest registered grant position, so applying an earlier
+release cannot erase a later grant already received by the poller.
+
+Tests prove all coordinates close before the first reply drain, all payloads
+drop before the first notify, range/attribute coalescing, overlap and cold-owner
+retirement, failed-cold cleanup, registered-ahead grant ordering, cumulative ACK
+ordering and all-or-nothing batch failure. The former worker fails the lifecycle
+ordering test (`/tmp/cv2-g2-batch-fault.log`). Ten focused repetitions pass
+(`/tmp/cv2-g2-batch4.log`), the full unprivileged Linux FUSE suite passes
+(`/tmp/cv2-g2-batch-root.log`), and five Linux race repetitions of batch and
+cached-metadata ownership tests pass (`/tmp/cv2-g2-batch-linux-race.log`). Existing
+scalar proof tests retain their assertions and now release their exact lease.

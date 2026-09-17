@@ -406,7 +406,7 @@ func TestV7CachedMetadataWithdrawalJoinsPhysicalReply(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 			defer cancel()
 			done := make(chan error, 1)
-			go func() { done <- f.raw.closeCacheCoordinate(ctx, coordinate) }()
+			go func() { _, err := f.raw.closeCacheCoordinate(ctx, coordinate); done <- err }()
 			// Observe the withdrawal's locked cut, including its installed receipt.
 			for {
 				f.raw.mu.Lock()

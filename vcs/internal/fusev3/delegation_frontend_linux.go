@@ -195,10 +195,11 @@ func (n *node) invalidateOwnData(ctx context.Context, offset, length int64) erro
 		return syscall.EIO
 	}
 	coordinate := publicationCoordinate{kind: publicationItemData, item: identity}
-	if err := r.closeCacheCoordinate(ctx, coordinate); err != nil {
+	lease, err := r.closeCacheCoordinate(ctx, coordinate)
+	if err != nil {
 		return err
 	}
-	defer r.openCacheCoordinate(coordinate)
+	defer lease.Open()
 	var byteRange *authoritypb.ByteRange
 	if offset >= 0 && length > 0 {
 		byteRange = &authoritypb.ByteRange{Offset: uint64(offset), Length: uint64(length)}

@@ -628,7 +628,7 @@ func TestUnlicensedReadRemainsIndexedUntilPostWritePurge(t *testing.T) {
 	closeDone := make(chan error, 1)
 	closeCtx, cancelClose := context.WithTimeout(context.Background(), time.Second)
 	defer cancelClose()
-	go func() { closeDone <- fixture.raw.closeCacheCoordinate(closeCtx, coordinate) }()
+	go func() { _, err := fixture.raw.closeCacheCoordinate(closeCtx, coordinate); closeDone <- err }()
 	replyDone := make(chan struct{})
 	go func() {
 		fixture.raw.ReplyWritten(unique, fuse.OK)
@@ -994,4 +994,29 @@ func TestSubscriptionRenewLoopUsesCoordinatorInterval(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("renew loop did not stop")
 	}
+}
+
+type testCacheWithdrawal func()
+
+func (f testCacheWithdrawal) Open() { f() }
+func (i *subscriptionTestInvalidator) CloseCacheCoordinates(ctx context.Context, coordinates []publicationCoordinate) (cacheWithdrawal, error) {
+	for _, coordinate := range coordinates {
+		if err := i.CloseCacheCoordinate(ctx, coordinate); err != nil {
+			return nil, err
+		}
+	}
+	return testCacheWithdrawal(func() {
+		for _, coordinate := range coordinates {
+			i.OpenCacheCoordinate(coordinate)
+		}
+	}), nil
+}
+
+func (i *subscriptionTestInvalidator) InvalidateCacheCoordinates(ctx context.Context, withdrawals []subscriptionWithdrawal) error {
+	for _, w := range withdrawals {
+		if err := i.InvalidateCacheCoordinate(ctx, w.coordinate, w.byteRange); err != nil {
+			return err
+		}
+	}
+	return nil
 }

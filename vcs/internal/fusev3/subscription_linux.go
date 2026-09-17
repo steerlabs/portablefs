@@ -64,9 +64,8 @@ type subscriptionControlHandler interface {
 }
 
 type subscriptionInvalidator interface {
-	CloseCacheCoordinate(context.Context, publicationCoordinate) error
-	InvalidateCacheCoordinate(context.Context, publicationCoordinate, *authoritypb.ByteRange) error
-	OpenCacheCoordinate(publicationCoordinate)
+	CloseCacheCoordinates(context.Context, []publicationCoordinate) (cacheWithdrawal, error)
+	InvalidateCacheCoordinates(context.Context, []subscriptionWithdrawal) error
 	InvalidateAllCaches(context.Context) error
 	MarkIdentityStale(publicationIdentity)
 }
@@ -122,7 +121,7 @@ type subscriptionRegistry struct {
 	watermark       uint64
 	horizon         time.Time
 	cacheUntil      time.Time
-	delegated       map[publicationIdentity]struct{}
+	delegated       map[publicationIdentity]uint64
 	stale           map[publicationIdentity]struct{}
 	coordinates     map[publicationCoordinate]subscriptionCoordinateState
 	generationFloor uint64
@@ -142,28 +141,6 @@ func (i mountSubscriptionInvalidator) raw() (*rawFileSystem, error) {
 		return nil, errors.New("fusev3: subscription invalidation has no kernel frontend")
 	}
 	return i.mount.raw, nil
-}
-
-func (i mountSubscriptionInvalidator) CloseCacheCoordinate(ctx context.Context, coordinate publicationCoordinate) error {
-	raw, err := i.raw()
-	if err != nil {
-		return err
-	}
-	return raw.closeCacheCoordinate(ctx, coordinate)
-}
-
-func (i mountSubscriptionInvalidator) InvalidateCacheCoordinate(ctx context.Context, coordinate publicationCoordinate, byteRange *authoritypb.ByteRange) error {
-	raw, err := i.raw()
-	if err != nil {
-		return err
-	}
-	return raw.invalidateCacheCoordinateContext(ctx, coordinate, byteRange)
-}
-
-func (i mountSubscriptionInvalidator) OpenCacheCoordinate(coordinate publicationCoordinate) {
-	if raw, err := i.raw(); err == nil {
-		raw.openCacheCoordinate(coordinate)
-	}
 }
 
 func (i mountSubscriptionInvalidator) InvalidateAllCaches(ctx context.Context) error {
@@ -211,7 +188,7 @@ func newSubscriptionRegistryWithConfig(mount *Mount, rpc subscriptionRPC, contro
 	close(serveDone)
 	return &subscriptionRegistry{
 		mount: mount, rpc: rpc, control: control, config: config,
-		delegated: make(map[publicationIdentity]struct{}), stale: make(map[publicationIdentity]struct{}),
+		delegated: make(map[publicationIdentity]uint64), stale: make(map[publicationIdentity]struct{}),
 		coordinates:    make(map[publicationCoordinate]subscriptionCoordinateState),
 		horizonChanged: make(chan struct{}),
 		pauseChanged:   make(chan struct{}),
@@ -473,9 +450,9 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 			if !cacheUntil.After(s.config.clock.Now()) {
 				return fmt.Errorf("%w: snapshot completed too near its horizon", errSubscriptionExpired)
 			}
-			set := make(map[publicationIdentity]struct{}, len(delegated))
+			set := make(map[publicationIdentity]uint64, len(delegated))
 			for _, identity := range delegated {
-				set[identity] = struct{}{}
+				set[identity] = 0
 			}
 			s.mu.Lock()
 			if s.paused {
@@ -816,7 +793,7 @@ func (s *subscriptionRegistry) registerChangeBatch(incarnation uint64, batch *au
 			s.coordinates[coordinate] = state
 		}
 		if change.grant {
-			s.delegated[change.identity] = struct{}{}
+			s.delegated[change.identity] = entry.GetPosition()
 		}
 		// Release is installed only by the ordered change worker, after every
 		// earlier withdrawal is proven. Registering it here could briefly reopen
@@ -887,10 +864,8 @@ func (s *subscriptionRegistry) changeLoop(ctx context.Context, incarnation uint6
 			return err
 		}
 		batch := work.batch
-		for _, entry := range batch.GetEntries() {
-			if err := s.applyChange(ctx, incarnation, entry); err != nil {
-				return err
-			}
+		if err := s.applyChangeBatch(ctx, incarnation, batch); err != nil {
+			return err
 		}
 		position := batch.GetEntries()[len(batch.GetEntries())-1].GetPosition()
 		if err := s.ackChanges(ctx, incarnation, position); err != nil {
@@ -906,56 +881,11 @@ func (s *subscriptionRegistry) changeLoop(ctx context.Context, incarnation uint6
 }
 
 func (s *subscriptionRegistry) applyChange(ctx context.Context, incarnation uint64, entry *authoritypb.ChangeEntry) error {
-	coordinates, identity, _, release, err := validateChangeEntry(entry)
-	if err != nil {
-		return fmt.Errorf("%w: %v", errSubscriptionInvalid, err)
-	}
-	if release {
-		s.mu.Lock()
-		if s.active && s.incarnation == incarnation {
-			delete(s.delegated, identity)
-		}
-		s.mu.Unlock()
-		return nil
-	}
-	if entry.GetKind() == authoritypb.ChangeKind_CHANGE_KIND_ATTRIBUTES_CHANGED || entry.GetKind() == authoritypb.ChangeKind_CHANGE_KIND_DATA_CHANGED {
-		if invalidator, ok := s.control.(interface{ InvalidateBaseAttr([]byte, uint64) }); ok {
-			invalidator.InvalidateBaseAttr(identity[:], entry.GetVolumeVersion())
-		}
-	}
-	for _, coordinate := range coordinates {
-		if err := s.withdrawCoordinate(ctx, coordinate, entry.GetByteRange()); err != nil {
-			s.markChangeStale(coordinate)
-			return err
-		}
-	}
-	return nil
+	return s.applyChangeBatch(ctx, incarnation, &authoritypb.ChangeBatch{Incarnation: incarnation, Entries: []*authoritypb.ChangeEntry{entry}})
 }
 
 func (s *subscriptionRegistry) withdrawCoordinate(ctx context.Context, coordinate publicationCoordinate, byteRange *authoritypb.ByteRange) error {
-	deadline := s.config.clock.Now().Add(s.config.repairLead)
-	s.mu.RLock()
-	if s.cacheUntil.Before(deadline) {
-		deadline = s.cacheUntil
-	}
-	s.mu.RUnlock()
-	remaining := deadline.Sub(s.config.clock.Now())
-	if remaining <= 0 {
-		return errSubscriptionExpired
-	}
-	repairCtx, cancel := context.WithTimeout(ctx, remaining)
-	defer cancel()
-	if err := s.config.invalidator.CloseCacheCoordinate(repairCtx, coordinate); err != nil {
-		return fmt.Errorf("fusev3: close cache coordinate: %w", err)
-	}
-	err := s.retry(repairCtx, deadline, func() error {
-		return s.config.invalidator.InvalidateCacheCoordinate(repairCtx, coordinate, byteRange)
-	})
-	if err != nil {
-		return fmt.Errorf("fusev3: invalidate cache coordinate: %w", err)
-	}
-	s.config.invalidator.OpenCacheCoordinate(coordinate)
-	return nil
+	return s.withdrawCoordinates(ctx, []subscriptionWithdrawal{{coordinate: coordinate, byteRange: byteRange}})
 }
 
 func (s *subscriptionRegistry) markChangeStale(coordinate publicationCoordinate) {
@@ -1068,83 +998,7 @@ func (r *rawFileSystem) invalidateCacheCoordinate(coordinate publicationCoordina
 }
 
 func (r *rawFileSystem) invalidateCacheCoordinateContext(ctx context.Context, coordinate publicationCoordinate, byteRange *authoritypb.ByteRange) error {
-	if r == nil {
-		return errors.New("fusev3: cache invalidation has no frontend")
-	}
-	switch coordinate.kind {
-	case publicationNamespaceName:
-		r.mu.Lock()
-		r.dropCompleteDirectoryLocked(coordinate.parent)
-		parent := r.byIdentityLocked(coordinate.parent)
-		if parent == nil {
-			r.mu.Unlock()
-			return nil
-		}
-		key := nameKey{parent: parent.key.inode, name: coordinate.name}
-		child := r.cachedNames[key]
-		r.dropCachedNameLocked(key)
-		r.dropCachedNegativeLocked(key)
-		reclaim := r.collectLocked(child)
-		r.mu.Unlock()
-		r.mount.deferReclaim(reclaim)
-		// Every Authority-backed kernel name reply has entry_valid=0. Purging daemon bindings
-		// after the exact reply drain fully withdraws namespace permission.
-		// EntryNotify adds no validity proof and can deadlock on a parent lock
-		// held by a mutation callback that has not reached our source gate yet.
-		return nil
-	case publicationItemEnumeration:
-		r.mu.Lock()
-		r.dropCompleteDirectoryLocked(coordinate.item)
-		handles := make([]*dirHandle, 0)
-		for _, handle := range r.handles {
-			if handle != nil && handle.dir != nil && handle.inode != nil && handle.inode.identity == coordinate.item {
-				handles = append(handles, handle.dir)
-			}
-		}
-		r.mu.Unlock()
-		for _, handle := range handles {
-			handle.invalidateEnumeration()
-		}
-		return nil
-	case publicationItemAttributes, publicationItemData:
-		notifier := r.mount.notifier()
-		if notifier == nil {
-			return errors.New("fusev3: cache invalidation has no kernel notification channel")
-		}
-		if coordinate.kind == publicationItemData {
-			if err := r.drainDataPublicationsContext(ctx, coordinate); err != nil {
-				return err
-			}
-		}
-		r.mu.Lock()
-		record := r.byIdentityLocked(coordinate.item)
-		// Whole/range data invalidation also withdraws kernel attributes. Drop
-		// the daemon payload in both cases so a later LOOKUP cannot reuse size or
-		// timestamps from before the data mutation.
-		delete(r.cachedAttrs, coordinate.item)
-		delete(r.cachedAttrPayloads, coordinate.item)
-		r.mu.Unlock()
-		if record == nil {
-			return nil
-		}
-		if coordinate.kind == publicationItemAttributes {
-			if status := notifier.InodeNotify(record.id, -1, 0); !status.Ok() && status != fuse.ENOENT {
-				return fmt.Errorf("fusev3: invalidate attributes for inode %d: %v", record.id, status)
-			}
-			return nil
-		}
-		offset, length := int64(0), int64(0)
-		if byteRange != nil && byteRange.GetOffset() <= math.MaxInt64 && byteRange.GetLength() <= math.MaxInt64 &&
-			byteRange.GetOffset() <= math.MaxInt64-byteRange.GetLength() {
-			offset, length = int64(byteRange.GetOffset()), int64(byteRange.GetLength())
-		}
-		if status := notifier.InodeNotify(record.id, offset, length); !status.Ok() && status != fuse.ENOENT {
-			return fmt.Errorf("fusev3: invalidate data for inode %d: %v", record.id, status)
-		}
-		return nil
-	default:
-		return errors.New("fusev3: invalidate unknown cache coordinate")
-	}
+	return r.invalidateCacheCoordinatesContext(ctx, []subscriptionWithdrawal{{coordinate: coordinate, byteRange: byteRange}})
 }
 
 // invalidateAllCaches proves a cold boundary. Data records remain indexed:
@@ -1204,10 +1058,26 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		}
 	}
 	r.mu.Unlock()
+	closed := make([]publicationCoordinate, 0, len(coordinates))
 	for coordinate := range coordinates {
-		if err := r.closeCacheCoordinate(ctx, coordinate); err != nil {
-			return fmt.Errorf("fusev3: close cache coordinate for cold subscription: %w", err)
+		closed = append(closed, coordinate)
+	}
+	inactive := false
+	if r.mount != nil && r.mount.subscription != nil {
+		r.mount.subscription.mu.RLock()
+		inactive = !r.mount.subscription.active
+		r.mount.subscription.mu.RUnlock()
+	}
+	lease, err := r.closeCacheCoordinates(ctx, closed)
+	defer func() {
+		// Production cold invalidation runs with subscription admission inactive.
+		// A failed attempt retires only its own owner, preserving every local cut.
+		if inactive {
+			lease.Open()
 		}
+	}()
+	if err != nil {
+		return fmt.Errorf("fusev3: close cache coordinates for cold subscription: %w", err)
 	}
 
 	r.mu.Lock()
@@ -1326,6 +1196,7 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	}
 	for coordinate := range r.repairingCoordinates {
 		delete(r.repairingCoordinates, coordinate)
+		delete(r.repairOwners, coordinate)
 	}
 	r.signalSourceChangedLocked()
 	r.mu.Unlock()

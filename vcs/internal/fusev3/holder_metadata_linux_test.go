@@ -153,7 +153,8 @@ func TestFullHolderMetadataWithdrawalWaitsWithoutDelegationLocks(t *testing.T) {
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: f.raw.nodesByID[entry.NodeId].identity}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	if err := f.raw.closeCacheCoordinate(ctx, coordinate); err != nil {
+	lease, err := f.raw.closeCacheCoordinate(ctx, coordinate)
+	if err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan fuse.Status, 1)
@@ -199,7 +200,7 @@ func TestFullHolderMetadataWithdrawalWaitsWithoutDelegationLocks(t *testing.T) {
 		t.Fatalf("closed coordinate returned %v", status)
 	default:
 	}
-	f.raw.openCacheCoordinate(coordinate)
+	lease.Open()
 	select {
 	case status := <-done:
 		if status != fuse.OK {
