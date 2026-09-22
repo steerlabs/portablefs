@@ -401,3 +401,43 @@ func (m *delegationManager) closeSerial(ctx context.Context, epochSerial uint64,
 	}
 	return nil
 }
+
+// A failed deferred close is consumed after its transition flight has ended.
+// Keep the original ownership alongside the error so a newly opened grant is
+// never charged for the old descriptor's refusal or lost response.
+type delegationCloseScope struct {
+	identity writeback.Identity
+	ref      *authoritypb.DelegationRef
+	epoch    uint64
+	buffer   *writeback.Buffer
+}
+
+func (m *delegationManager) failCloseScopes(scopes []delegationCloseScope, reason string, retainedOnly bool) {
+	for _, scope := range scopes {
+		m.epoch.RLock()
+		if scope.epoch != m.epochSerial || scope.buffer != m.buf {
+			m.epoch.RUnlock()
+			continue
+		}
+		state := m.retainState(scope.identity, false)
+		if state == nil {
+			m.epoch.RUnlock()
+			continue
+		}
+		state.admission.Lock()
+		current := sameDelegation(state.ref, scope.ref)
+		// A successful release cleared the old grant but may still retain its
+		// nondurable records. They remain in this scope until a successor opens.
+		retired := state.ref == nil && state.retiredGeneration == scope.ref.GetGeneration()
+		var report writeback.DropReport
+		if (current || retired) && (m.buf.HasRetained(scope.identity) || current && !retainedOnly) {
+			report = m.loseDelegationLocked(state, reason)
+		}
+		state.admission.Unlock()
+		m.releaseState(state)
+		m.epoch.RUnlock()
+		if report.Reason != "" {
+			m.reportDrop(report)
+		}
+	}
+}

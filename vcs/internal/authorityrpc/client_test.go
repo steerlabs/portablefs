@@ -145,7 +145,7 @@ func TestMutationIdentityIsPublishedOnceBeforeDispatch(t *testing.T) {
 	slot.mu.Lock()
 	recorded := slot.sequence
 	slot.mu.Unlock()
-	if recorded != 0 {
+	if recorded != refused.Sequence-1 {
 		t.Fatalf("assignment refusal advanced slot %d to sequence %d", refused.Slot, recorded)
 	}
 }
@@ -384,8 +384,8 @@ func TestStrictClientReservesIndependentProtocol7ControlLanes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if cap(client.ordinary.permits) != 3 || cap(client.controlPoll.permits) != 1 || cap(client.controlAck.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 2 {
-		t.Fatalf("strict lanes ordinary/poll/ack/liveness/blocking = %d/%d/%d/%d/%d, want 3/1/1/1/2",
+	if cap(client.ordinary.permits) != 2 || cap(client.flush.permits) != 1 || cap(client.controlPoll.permits) != 1 || cap(client.controlAck.permits) != 1 || cap(client.liveness.permits) != 1 || cap(client.blocking.permits) != 2 {
+		t.Fatalf("strict lanes ordinary/poll/ack/liveness/blocking = %d/%d/%d/%d/%d, want 2/1/1/1/2",
 			cap(client.ordinary.permits), cap(client.controlPoll.permits), cap(client.controlAck.permits), cap(client.liveness.permits), cap(client.blocking.permits))
 	}
 	next := &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
@@ -2817,10 +2817,10 @@ func TestReadOnlyRejectionKeepsReplaySlotsSynchronized(t *testing.T) {
 	handler := &replayHandler{runtime: runtime, access: volumeserver.AccessRead}
 	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 	defer stop()
-	// Two replay slots and two in-flight permits put every ordinary mutation on
+	// Three slots reserve independent flush and blocking lanes, putting every ordinary mutation on
 	// the same slot, which is what makes the desynchronization observable
 	// immediately instead of after a full slot cycle.
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "read-only-volume", 2, 2))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "read-only-volume", 3, 3))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2865,7 +2865,7 @@ func TestSuppressedSlotStateStillCannotDesynchronize(t *testing.T) {
 	handler := &replayHandler{runtime: runtime, access: volumeserver.AccessRead | volumeserver.AccessWrite, suppressState: true}
 	address, clientTLS, stop := startTestServer(t, handler, testMaxInFlight, time.Minute)
 	defer stop()
-	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "suppressed-volume", 2, 2))
+	client, err := DialClient(context.Background(), coherentTestClientConfig(address, clientTLS, "suppressed-volume", 3, 3))
 	if err != nil {
 		t.Fatal(err)
 	}

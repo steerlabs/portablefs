@@ -1,8 +1,9 @@
 # Failure modes
 
 Protocol 7 scopes coherence failures to permissions, identities, or handles.
-The mount survives subscription recovery, recall budget loss, and Authority
-epoch replacement. Authentication, exact replay, and storage invariants still
+The mount survives subscription recovery and recall budget loss. Shipping
+mounts withdraw on Authority epoch replacement and require fresh authorization.
+Authentication, exact replay, and storage invariants still
 fail closed. The full contract and accepted residuals are in
 [portable-coherence.md](./portable-coherence.md).
 
@@ -30,12 +31,19 @@ a client journal. READY uses XFS; RESTORING also loads its verified sealed base
 and durable hydration map. These are state-selected representations, not
 competing writable truths.
 
-Authority restart creates a new epoch. Every old handle stays EIO, including
-root-directory barrier handles, and volatile locks are lost. The mount
-reattaches with its configured attach grant, subscribes cold, and restarts
-session-bound reauthorization; new opens can work if that grant is still valid.
-Replacement-grant acquisition is not wired into this recovery path. An expired
-or refused grant keeps recovery cold and retrying.
+Authority restart creates a new epoch. Every old handle stays unusable,
+including root-directory barrier handles, and volatile locks are lost. Shipping
+`portablefs mount` keeps its authority session, renewal owner, enrollment and
+persisted mount instance bound for their whole lifetime. It revokes and withdraws
+on an epoch change. The product supervisor proves exact withdrawal, obtains a
+fresh Host-authorized enrollment and attach grant, and verifies a successful
+renewal before admitting work on the replacement. An expired original grant
+cannot be reused to recover, and a new grant cannot override revoked access.
+
+The standalone `portablefs-mount-v3` helper and core callers with an epoch-aware
+grant source can still cold-reattach within one kernel mount, permanently staling
+every old handle and restarting renewal for the new session. That path requires
+a still-valid configured attach grant; it does not acquire fresh Host authority.
 Old Linux membership is fenced through its subscription horizon. Unproven
 membership still blocks route/archive transitions until absence is established;
 old Mac membership requires its compatibility-cache fence.
@@ -61,6 +69,12 @@ before proceeding. Renewal cannot revive a fenced incarnation. CONTROL polls,
 renewal, and acknowledgments have independent lanes; assigned mutation replay
 still preserves exact outcomes across a same-epoch reconnect.
 
+Cold reset first interrupts old admission, waking writers parked on buffer
+capacity, then drains callbacks and physical replies before replacing ownership.
+Reversing that order would wait for a callback whose capacity cannot be released
+until reset. Metadata interrupted at this boundary returns EIO without revoking
+the recoverable mount or retaining an unreturned lookup reference.
+
 Cache-installing replies drain by exact identity/name coordinates. Shared
 kernel name validity is zero; inode notifications withdraw data and attributes.
 Failed invalidation stales the affected inode, not the whole mount. A stopped
@@ -82,6 +96,21 @@ A run opens the mount root before starting and fsyncs that exact handle before
 reporting success, including sandbox exit and detach. Loss since that open
 fails the barrier. New handles after epoch recovery start a new observation;
 they cannot make an old run's failed barrier succeed.
+
+Linux teardown retains the original open fusectl abort descriptor from mount
+startup. Numeric mount IDs and anonymous device numbers can be reused after
+unmount, so they cannot authorize reopening a connection's control file later.
+Startup temporarily pins the mounted root while validating its mountinfo
+identity and opening that control descriptor, before serving requests. Cleanup
+writes only the retained descriptor and closes it after the withdrawal ladder.
+It checks the full filesystem identity before detaching a path and refuses moved
+or ambiguous targets. Namespace replacement must serialize with the owning
+supervisor's detach operation.
+
+The mount owner must have writable access to the mounted fusectl filesystem at
+`/sys/fs/fuse/connections`. Missing control access refuses startup; the client
+never substitutes a weaker teardown mechanism. Container setup must establish
+this prerequisite as well as exposing `/dev/fuse`.
 
 ## Capacity, quota, and routing
 

@@ -80,6 +80,13 @@ func (b *Buffer) batchLocked(f *file, cut Cut) *batch {
 func (b *Buffer) FlushIdentity(ctx context.Context, id Identity, cut Cut) (uint64, error) {
 	b.mu.Lock()
 	f := b.file(id)
+	f.flushUsers++
+	defer func() {
+		b.mu.Lock()
+		f.flushUsers--
+		b.mu.Unlock()
+		b.notifyIdle(id)
+	}()
 	for f.flushing {
 		ch := b.change()
 		b.mu.Unlock()

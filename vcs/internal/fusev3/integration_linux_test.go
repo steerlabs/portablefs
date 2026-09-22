@@ -1212,7 +1212,21 @@ func TestUnmountRemountObservesDurableState(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	oldAbortFiles := make([]*kernelAbortFile, len(f.mounts))
+	for i, mount := range f.mounts {
+		oldAbortFiles[i] = mount.kernelMount.abortFile
+		if oldAbortFiles[i] == nil {
+			t.Fatal("serving mount lacks its original abort descriptor")
+		}
+	}
+
 	f.remount()
+
+	for _, abort := range oldAbortFiles {
+		if _, err := abort.file.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("normal Mount close leaked its abort descriptor: %v", err)
+		}
+	}
 
 	for i := range 2 {
 		what := fmt.Sprintf("mount %d after remount", i)

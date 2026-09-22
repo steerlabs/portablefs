@@ -26,6 +26,16 @@ and JSON measurements in the profile directory. `SOAK_RESULT` reports a phase;
 Go PASS establishes whole-case success. Counts include background CONTROL and
 keepalive traffic, including during direct-XFS comparison phases.
 
+Setting `PORTABLEFS_PROFILE_DIR` also captures CPU and blocking profiles for each
+measured workload in its isolated child process. Each `.profile.json` manifest
+names the exact content-addressed `.test` executable and its profiles; preserve
+them together when comparing source revisions. `PORTABLEFS_PROFILE_RUN` optionally
+prefixes the phase artifacts. `SOAK_RESULT.profiled` marks timings with profiling
+overhead. Unset the profile directory for timing runs without instrumentation.
+Use `go tool pprof -top <binary> <cpu-profile>` for CPU work and
+`go tool pprof -top -base=<block-before-profile> <binary> <block-profile>` for
+phase-specific blocking; the block profile is cumulative within each child.
+
 For a focused reproduction, replace the `-run` expression with its test name.
 The script intentionally still checks the full required inventory: a passing
 focused selection can exit 70 for omitted tests. An actual failing test exits

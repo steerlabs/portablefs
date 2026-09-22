@@ -109,7 +109,7 @@ func TestCoherenceOpenStorageFailurePreservesExistingDelegation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := h.rememberCoherenceDelegation(grant); err != nil {
+	if err := h.validateCoherenceDelegation(grant); err != nil {
 		t.Fatal(err)
 	}
 

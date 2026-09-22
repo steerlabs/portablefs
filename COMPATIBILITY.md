@@ -66,6 +66,15 @@ Linux mounts, the files gateway, and Mac clients. A signed Mac app must contain
 its CLI, Go daemon, and Swift extension from the same immutable commit; the
 shared golden is necessary evidence, not a live FSKit qualification.
 
+### Linux mount prerequisites
+
+A Linux mount needs `/dev/fuse` and a mounted fusectl filesystem at
+`/sys/fs/fuse/connections`, with the connection's abort file writable by its
+mount owner. Startup retains that exact control descriptor before serving.
+Teardown never reopens a numeric connection path, since the kernel can reuse
+both mount IDs and device numbers. Container and service supervisors must
+establish these prerequisites before launching the mount.
+
 ### The authority wire
 
 - **Transport is mutually authenticated TLS 1.3**, with the single ALPN
@@ -104,8 +113,11 @@ shared golden is necessary evidence, not a live FSKit qualification.
   delegated data for read without excluding Linux writers.
 
 - **One volume-wide subscription controls Linux caching.** Its authority
-  horizon is 10 seconds, renewed every 3 seconds, with durations anchored
-  conservatively at client request start. Expiry fences the subscriber until
+  horizon is at most 10 seconds, renewed every 3 seconds, with durations
+  anchored conservatively at client request start. Unacknowledged withdrawals
+  cap renewal at their issue time plus 10 seconds; an already issued horizon
+  is never shortened. Writers wait for the actual promised horizon, a proven
+  withdrawal ack, or a cold reset. Expiry fences the subscriber until
   it invalidates everything and subscribes cold in a new incarnation.
   Subscribe returns an atomic version watermark and paginated delegated
   identity set. Ordered ChangeBatch entries travel on CONTROL; an ack position

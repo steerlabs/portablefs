@@ -1079,12 +1079,17 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return h.errorResponse(0, err, false), nil
 			}
 			defer reservation.release()
+			delegationCapacity, err := h.coherenceCreateCapacity(cred.ID, body.Create, existed)
+			if err != nil {
+				return h.coherenceError(0, err), nil
+			}
+			defer delegationCapacity.Release()
 			item, attr, err := h.Store.Create(parent, string(body.Create.GetName()), mode, body.Create.GetExclusive())
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, createdTargets(xfsstore.Capability{}))
 			}
-			if err := h.coherenceReserveCreated(ctx, cred.ID, item, body.Create, existed); err != nil {
+			if err := h.coherenceReserveCreated(ctx, cred.ID, item, body.Create, existed, delegationCapacity); err != nil {
 				h.forgetItem(item)
 				return h.coherenceError(0, err), createdTargets(item)
 			}

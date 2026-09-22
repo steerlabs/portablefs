@@ -90,6 +90,10 @@ type StreamEvent struct {
 	Delegation                             Delegation
 	Request, AppliedSequence, LossSequence uint64
 	Deadline                               time.Time
+	// cacheDeadline bounds renewal while this change remains unwithdrawn.
+	// It is authority-local; it does not add a protocol field.
+	cacheDeadline time.Time
+	cacheTargeted bool
 }
 
 type SubscriptionToken struct {
@@ -113,6 +117,10 @@ type CoherenceConfig struct {
 	// Per scope and subscription. Overflow conservatively targets every
 	// coordinate in that scope until the next proven cold subscription.
 	MaxCacheFootprint int
+	// Charges include grants, outstanding capacity reservations, and retired
+	// generations whose storage/read pins have not drained yet.
+	MaxDelegationsPerSession int
+	MaxDelegations           int
 }
 
 type changeSubscriber struct {
@@ -176,25 +184,30 @@ func (h *subscriberHeap) Pop() any {
 // flush and CONTROL ack must run while a peer owns a delegation request turn.
 //
 // The log ring doubles as each subscriber's outbox, indexed by delivered. One
-// append is O(1), independent of subscriber count. Ack is O(log subscribers)
-// plus amortized reclamation of entries; lookup is O(1). Notification channels
+// append is O(1), independent of subscriber count; targeted commits additionally
+// match subscriber footprints. Ack is O(log subscribers) plus amortized log
+// reclamation; renewal scans at most the bounded unacked log; lookup is O(1).
+// Notification channels
 // are allocated only when somebody actually waits, never per appended entry.
 type CoherenceCoordinator struct {
-	delegationsByID                         map[uint64]*delegationRecord
-	maxCacheFootprint                       int
-	mu                                      sync.Mutex
-	clock                                   CoherenceClock
-	priorCacheUntil                         time.Time
-	subscribers                             map[SessionID]*changeSubscriber
-	acks, horizons                          subscriberHeap
-	log                                     []StreamEvent
-	first, position, watermark, incarnation uint64
-	changed                                 chan struct{}
-	durable                                 atomic.Uint64
-	requests                                *mutationSequencer
-	delegations                             map[[16]byte]*delegationRecord
-	cacheHandles                            map[[16]byte]*cacheHandleCounts
-	nextDelegation, nextRequest             uint64
+	maxDelegationsPerSession, maxDelegations int
+	delegationCharges                        map[SessionID]int
+	stats                                    CoherenceStats
+	delegationsByID                          map[uint64]*delegationRecord
+	maxCacheFootprint                        int
+	mu                                       sync.Mutex
+	clock                                    CoherenceClock
+	priorCacheUntil                          time.Time
+	subscribers                              map[SessionID]*changeSubscriber
+	acks, horizons                           subscriberHeap
+	log                                      []StreamEvent
+	first, position, watermark, incarnation  uint64
+	changed                                  chan struct{}
+	durable                                  atomic.Uint64
+	requests                                 *mutationSequencer
+	delegations                              map[[16]byte]*delegationRecord
+	cacheHandles                             map[[16]byte]*cacheHandleCounts
+	nextDelegation, nextRequest              uint64
 }
 
 func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
@@ -207,11 +220,17 @@ func NewCoherenceCoordinator(cfg CoherenceConfig) *CoherenceCoordinator {
 	if cfg.MaxLogEntries <= 0 {
 		cfg.MaxLogEntries = 65536
 	}
+	if cfg.MaxDelegationsPerSession <= 0 {
+		cfg.MaxDelegationsPerSession = 65536
+	}
+	if cfg.MaxDelegations <= 0 {
+		cfg.MaxDelegations = 262144
+	}
 	var priorCacheUntil time.Time
 	if cfg.PriorLinuxCaches {
 		priorCacheUntil = cfg.Clock.Now().Add(SubscriptionTTL)
 	}
-	return &CoherenceCoordinator{maxCacheFootprint: cfg.MaxCacheFootprint, priorCacheUntil: priorCacheUntil, clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
+	return &CoherenceCoordinator{maxDelegationsPerSession: cfg.MaxDelegationsPerSession, maxDelegations: cfg.MaxDelegations, delegationCharges: make(map[SessionID]int), maxCacheFootprint: cfg.MaxCacheFootprint, priorCacheUntil: priorCacheUntil, clock: cfg.Clock, subscribers: make(map[SessionID]*changeSubscriber),
 		// The initial storage snapshot is version 1, matching the handler. A
 		// reservation can publish a cache withdrawal before the first commit.
 		horizons: subscriberHeap{byTime: true}, log: make([]StreamEvent, cfg.MaxLogEntries), first: 1, watermark: 1,
@@ -273,6 +292,7 @@ func (c *CoherenceCoordinator) SubscribeWithCache(id SessionID, initial CacheAdm
 	loss := uint64(0)
 	handles := make(map[[16]byte]uint64)
 	if old := c.subscribers[id]; old != nil {
+		c.stats.SubscriptionResets++
 		c.retireSubscriberLocked(old)
 		loss = old.loss
 		handles = old.handles
@@ -334,7 +354,22 @@ func (c *CoherenceCoordinator) Renew(token SubscriptionToken) (time.Time, error)
 	if err != nil {
 		return time.Time{}, err
 	}
-	s.horizon = c.clock.Now().Add(SubscriptionTTL)
+	// A renewal cannot extend cache permission past an outstanding withdrawal's
+	// deadline. Otherwise a writer could either wait forever for a renewing
+	// non-acknowledging reader, or complete while that reader still has permission.
+	// The bounded shared log is the obligation ledger; no per-subscriber queues
+	// or per-commit subscriber fanout are required for this lifetime proof.
+	horizon := c.clock.Now().Add(SubscriptionTTL)
+	for position := s.acked + 1; position <= c.position; position++ {
+		event := c.log[(position-1)%uint64(len(c.log))]
+		if event.Kind == StreamChange && !event.localTo(token) && (!event.cacheTargeted || s.couldCache(event.Change)) {
+			// Cache admission after an older change can make a formerly irrelevant
+			// entry conservative. Never retract a promise already sent to a client.
+			horizon = maxTime(s.horizon, minTime(horizon, event.cacheDeadline))
+			break
+		}
+	}
+	s.horizon = horizon
 	heap.Fix(&c.horizons, s.timeIndex)
 	c.signalLocked()
 	return s.horizon, nil
@@ -373,6 +408,7 @@ func (c *CoherenceCoordinator) appendLocked(event StreamEvent) uint64 {
 	event.Position = c.position
 	if event.Kind == StreamChange {
 		event.Change.Position = c.position
+		event.cacheDeadline = c.clock.Now().Add(SubscriptionTTL)
 	}
 	// Overrun does not discard an outstanding withdrawal obligation. A lagging
 	// subscriber is fenced lazily at request admission; its heap entry remains
@@ -384,6 +420,20 @@ func (c *CoherenceCoordinator) appendLocked(event StreamEvent) uint64 {
 	c.signalLocked()
 	c.truncateLocked()
 	return c.position
+}
+
+func (event StreamEvent) localTo(token SubscriptionToken) bool {
+	if event.LocalOwner != (SubscriptionToken{}) {
+		return event.LocalOwner == token
+	}
+	return event.Source == token.Session
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
 }
 func (c *CoherenceCoordinator) truncateLocked() {
 	through := c.position
@@ -572,6 +622,7 @@ func (c *CoherenceCoordinator) expireLocked() {
 	now := c.clock.Now()
 	for c.horizons.Len() > 0 && !now.Before(c.horizons.items[0].horizon) {
 		s := c.horizons.items[0]
+		c.stats.SubscriptionExpirations++
 		c.retireSubscriberLocked(s)
 	}
 }

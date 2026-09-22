@@ -169,7 +169,7 @@ type lane struct {
 type Client struct {
 	batchedClose          atomic.Bool
 	orderedDelegatedFlush atomic.Bool
-	ordered               lane
+	flush                 lane
 	cfg                   ClientConfig
 
 	// lifecycle protects shared session state and the reconnect TLS identity.
@@ -270,6 +270,9 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	if cfg.MaxInFlight < 2 {
 		return nil, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
 	}
+	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && cfg.MaxInFlight < 3 {
+		return nil, errors.New("authorityrpc: Linux max-in-flight must independently admit ordinary work, a delegated flush, and a blocking wait")
+	}
 	if uint64(cfg.ReplaySlots) < uint64(cfg.MaxInFlight) {
 		return nil, errors.New("authorityrpc: replay slots must cover every possible in-flight mutation")
 	}
@@ -319,27 +322,10 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 	cfg.TLS.NextProtos = []string{protocolALPN}
 	cfg.TLS.DynamicRecordSizingDisabled = true
 	cfg.TLS.ClientSessionCache = tls.NewLRUClientSessionCache(clientSessionCacheEntries)
-	ordinaryLimit, blockingLimit := blockingWaitLane(cfg.MaxInFlight)
-	slots := make([]clientSlot, cfg.ReplaySlots)
-	split := cfg.ReplaySlots - uint32(blockingLimit)
-	var orderedPermits chan struct{}
-	var orderedSlots []clientSlot
-	var orderedBase uint32
-	if cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && ordinaryLimit >= volumeserver.OrderedFlushWindow+1 {
-		ordinaryLimit -= volumeserver.OrderedFlushWindow
-		base := split - volumeserver.OrderedFlushWindow
-		orderedPermits = make(chan struct{}, volumeserver.OrderedFlushWindow)
-		orderedSlots = slots[base:split]
-		orderedBase = base
-		split = base
-	}
-	blockingBase := cfg.ReplaySlots - uint32(blockingLimit)
-	c := &Client{ordered: lane{permits: orderedPermits, slots: orderedSlots, base: orderedBase},
+	c := &Client{
 		cfg: cfg, fatalDone: make(chan struct{}), fatalPendingDone: make(chan struct{}),
 		data:          newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_DATA),
 		control:       newClientTransport(authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL),
-		ordinary:      lane{permits: make(chan struct{}, ordinaryLimit), slots: slots[:split], base: 0},
-		blocking:      lane{permits: make(chan struct{}, blockingLimit), slots: slots[blockingBase:], base: blockingBase},
 		repairControl: lane{permits: make(chan struct{}, 1)},
 		controlPoll:   lane{permits: make(chan struct{}, 1)},
 		controlAck:    lane{permits: make(chan struct{}, 1)},
@@ -361,6 +347,26 @@ func dialClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// Execution lanes are installed once, after negotiation and before the client
+// is published. Both peers use the same partition: a flush must never wait for
+// ordinary work whose completion depends on that flush.
+func (c *Client) initializeExecutionLanes() {
+	ordinary, blocking, flush := serverExecutionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, c.SupportsOrderedFlush())
+	slots := make([]clientSlot, c.cfg.ReplaySlots)
+	blockingBase := len(slots) - blocking
+	flushBase := blockingBase - flush
+	c.ordinary = lane{permits: make(chan struct{}, ordinary), slots: slots[:flushBase]}
+	c.blocking = lane{permits: make(chan struct{}, blocking), slots: slots[blockingBase:], base: uint32(blockingBase)}
+	if flush != 0 {
+		c.flush = lane{permits: make(chan struct{}, flush), slots: slots[flushBase:blockingBase], base: uint32(flushBase)}
+	}
+}
+
+func (c *Client) canPipelineFlushes() bool {
+	_, _, flush := serverExecutionLanes(c.cfg.MaxInFlight, c.cfg.FrontendProfile, true)
+	return flush == volumeserver.OrderedFlushWindow
 }
 
 // attachBody builds the attach request for exactly one session purpose. The
@@ -511,6 +517,7 @@ func (c *Client) publishCommittedActivation(
 	if err := c.installActiveState(active); err != nil {
 		return c.releaseCommittedBeforePublication(err, control, cleanupRequestID)
 	}
+	c.initializeExecutionLanes()
 	if err := c.publishInitialPair(data, control, dataGeneration, controlGeneration); err != nil {
 		return c.releaseCommittedBeforePublication(err, control, cleanupRequestID)
 	}
@@ -676,7 +683,11 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
 	c.batchedClose.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
-	c.orderedDelegatedFlush.Store(cap(c.ordered.permits) == volumeserver.OrderedFlushWindow && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature}) && hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}))
+	ordered := c.canPipelineFlushes() && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature})
+	if ordered && !hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}) {
+		return errors.New("authorityrpc: activation changed the negotiated flush admission mode")
+	}
+	c.orderedDelegatedFlush.Store(ordered)
 	c.root = proto.Clone(root).(*authoritypb.Item)
 	c.routesRevision = c.cfg.RoutesRevision
 	c.lease = lease
@@ -1418,11 +1429,11 @@ func (c *Client) forceResponseConsumptionDrain() {
 }
 
 func (c *Client) laneFor(request *authoritypb.Request) *lane {
-	if c.SupportsOrderedFlush() && delegatedFlushRequest(request) {
-		// Match the server's entire flush lane, including metadata. Letting
-		// non-ordinal flushes bypass this bound could strand a predecessor
-		// behind successors which already occupy all server flush slots.
-		return &c.ordered
+	if c.flush.permits != nil && delegatedFlushRequest(request) {
+		// Flush progress is independent of ordinary calls waiting on recall,
+		// even without ordered pipelining. Metadata shares the server's flush
+		// bound so it cannot strand an ordered predecessor behind successors.
+		return &c.flush
 	}
 	if request.GetNextControlEvent() != nil {
 		return &c.controlPoll

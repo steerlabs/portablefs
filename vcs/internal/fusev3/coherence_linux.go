@@ -31,28 +31,16 @@ func (p CoherenceProfile) String() string {
 }
 
 const (
-	// strictEntryTimeout is retained as a policy ceiling, but protocol 7 always
-	// publishes kernel entry validity as zero. strictAttrTimeout is likewise
-	// only a ceiling; the subscription horizon supplies the real lifetime.
-	//
-	// One minute is chosen as the largest value that still bounds the blast
-	// radius of a future repair defect to a single human-noticeable interval.
-	// It is far longer than any metadata-heavy workload's own reuse distance:
-	// a `git status` over 5,000 files re-walks the same names within
-	// milliseconds, so one minute collapses that walk from one LOOKUP per name
-	// per traversal to one LOOKUP per name for the whole run. Raising it
-	// further would buy nothing measurable and would widen that blast radius;
-	// lowering it would reintroduce the RPC multiplier this design removes.
+	// These policy ceilings bound daemon cache reuse. Protocol 7 publishes
+	// zero kernel entry and attribute validity; subscription horizons supply
+	// the shorter daemon lifetime. Warm path walks still cross FUSE, but the
+	// daemon can answer them without another Authority metadata RPC.
 	strictEntryTimeout = 60 * time.Second
 	strictAttrTimeout  = 60 * time.Second
 
-	// defaultCachedNameCapacity is the number of (parent, name) resolutions a
-	// strict mount is willing to leave resident in its kernel. It is declared
-	// to the authority because it is exactly the amount of state this mount
-	// promises it can repair, and therefore also the amount it must be able to
-	// walk during self-revocation. Absences count against it exactly like
-	// bindings: a name the kernel answers from cache is a repair obligation
-	// whether the cached answer is "here it is" or "it is not there".
+	// defaultCachedNameCapacity bounds daemon (parent, name) resolutions,
+	// including proven absences. It is declared to the Authority because
+	// every retained name is a targeted repair obligation.
 	defaultCachedNameCapacity = 1 << 16
 
 	// negativeNameShare bounds the part of that capacity spent on absences.
@@ -215,8 +203,20 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 		cancel()
 		return ctx, func() {}, fuse.Status(syscall.ENOTCONN)
 	}
+	// Metadata responses can discover their identity only after a concurrent
+	// final close retires it. Keep that interval's transition history until
+	// callback publication has pinned each discovered inode.
+	history, err := r.mount.delegations.beginGrantRequest()
+	if err != nil {
+		r.mount.revoke(err)
+		r.mount.epochMu.RUnlock()
+		cancel()
+		return ctx, func() {}, fuse.Status(syscall.ENOTCONN)
+	}
+	callback.publication.metadataSample = r.mount.delegations.metadataClock.Load()
 	ctx = context.WithValue(ctx, mutationCallbackKey{}, callback)
 	return ctx, func() {
+		defer r.mount.delegations.endGrantRequest(history)
 		defer r.mount.epochMu.RUnlock()
 		defer cancel()
 		r.publishPostStateAttrs(ctx)
@@ -225,14 +225,15 @@ func (r *rawFileSystem) mutationContext(unique uint64) (context.Context, func(),
 	}, fuse.OK
 }
 
-// kernelMount is the identity of the installed FUSE mount, read once from
-// /proc/self/mountinfo. The mount ID is the only field the kernel guarantees is
-// unique for the lifetime of the mount, which is what makes its later absence
-// an exact observation rather than a guess about a path.
+// kernelMount records the installed filesystem as well as its owned abort inode.
+// Mount IDs and anonymous device numbers can both be recycled after unmount.
 type kernelMount struct {
-	id     string
-	device string
-	point  string
+	id         string
+	device     string
+	point      string
+	filesystem string
+	source     string
+	abortFile  *kernelAbortFile
 }
 
 const mountInfoPath = "/proc/self/mountinfo"
@@ -242,16 +243,14 @@ var readMountInfo = func() ([]byte, error) { return os.ReadFile(mountInfoPath) }
 // observeKernelMount records the installed mount so its later disappearance can
 // be proven. It is called once, after the kernel has answered INIT.
 func observeKernelMount(mountpoint string) (kernelMount, error) {
-	data, err := readMountInfo()
+	records, err := readKernelMounts()
 	if err != nil {
-		return kernelMount{}, fmt.Errorf("fusev3: read %s: %w", mountInfoPath, err)
+		return kernelMount{}, err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 5 || unescapeMountField(fields[4]) != mountpoint {
-			continue
+	for _, record := range records {
+		if record.point == mountpoint {
+			return record, nil
 		}
-		return kernelMount{id: fields[0], device: fields[2], point: mountpoint}, nil
 	}
 	return kernelMount{}, fmt.Errorf("fusev3: %s does not list a mount at %s", mountInfoPath, mountpoint)
 }
@@ -325,36 +324,24 @@ func observePlannedKernelMountAbsent(fsName, mountpoint string) (MountAbsencePro
 	return ObservePlannedKernelMountAbsent(fsName, mountpoint)
 }
 
-// absent reports whether this exact mount is no longer installed, and returns
-// the observation that says so. The recorded mount ID is compared, not the
-// path: a different filesystem mounted at the same path afterwards must not be
-// mistaken for this one still being there.
-//
-// A lazily detached mount leaves mountinfo while processes that were already
-// inside it may retain references, so this function alone is not authorization
-// to report clean detach. Mount.detach additionally waits for the exact go-fuse
-// serving connection to terminate, then calls absent again for the final
-// timestamped observation.
+// absent reports disappearance of this filesystem, including a moved mount or
+// retained bind alias. Numeric mount IDs alone are not lifetime identities.
+// A lazy detach still requires the independent serving-connection join.
 func (k kernelMount) absent() (MountAbsenceProof, error) {
-	data, err := readMountInfo()
+	records, err := readKernelMounts()
 	if err != nil {
-		return MountAbsenceProof{}, fmt.Errorf("fusev3: read %s: %w", mountInfoPath, err)
+		return MountAbsenceProof{}, err
 	}
-	lines := 0
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 5 {
-			continue
+	for _, record := range records {
+		matches, err := k.matches(record)
+		if err != nil {
+			return MountAbsenceProof{}, err
 		}
-		lines++
-		if fields[0] == k.id {
-			return MountAbsenceProof{}, fmt.Errorf("fusev3: mount %s (%s) is still installed at %s", k.id, k.device, unescapeMountField(fields[4]))
+		if matches {
+			return MountAbsenceProof{}, fmt.Errorf("fusev3: mount %s (%s, %s) is still installed at %s", record.id, k.device, k.source, record.point)
 		}
 	}
-	if lines == 0 {
-		return MountAbsenceProof{}, fmt.Errorf("fusev3: %s produced no mount records; absence cannot be observed", mountInfoPath)
-	}
-	observation := fmt.Sprintf("mount-id=%s device=%s mountpoint=%s present=false records=%d", k.id, k.device, k.point, lines)
+	observation := fmt.Sprintf("mount-id=%s device=%s mountpoint=%s filesystem=%s source=%s present=false records=%d", k.id, k.device, k.point, k.filesystem, k.source, len(records))
 	return MountAbsenceProof{ObservedUnixNanos: time.Now().UnixNano(), Observation: []byte(observation), Component: mountInfoPath}, nil
 }
 
@@ -386,11 +373,10 @@ func unescapeMountField(field string) string {
 // processes. fusectl gives the abort file to the mount owner, so this needs no
 // privilege beyond having made the mount.
 func (k kernelMount) abortKernelConnection() error {
-	_, minor, ok := strings.Cut(k.device, ":")
-	if !ok {
-		return fmt.Errorf("fusev3: mount device %q is not major:minor", k.device)
+	if k.abortFile == nil {
+		return errors.New("fusev3: original FUSE abort descriptor was not retained")
 	}
-	return os.WriteFile("/sys/fs/fuse/connections/"+minor+"/abort", []byte("1"), 0)
+	return k.abortFile.abort()
 }
 
 // revokeCachedNames drops daemon-resident N payloads. The portable profile
@@ -567,7 +553,7 @@ func classifyRevocationReason(cause error) string {
 		return RevocationCoherenceViolation
 	case errors.Is(cause, errRoutesChanged):
 		return RevocationRoutesChanged
-	case errors.Is(cause, authorityrpc.ErrSessionEnded):
+	case errors.Is(cause, authorityrpc.ErrSessionEnded), errors.Is(cause, authorityrpc.ErrAuthorityChanged):
 		return RevocationSessionTerminal
 	default:
 		return RevocationCoherenceViolation
@@ -641,6 +627,10 @@ type kernelWithdrawal struct {
 func (m *Mount) productionKernelWithdrawal() kernelWithdrawal {
 	return kernelWithdrawal{
 		detach: func(string) error {
+			installed, err := m.kernelMount.detachTargetInstalled()
+			if err != nil || !installed {
+				return err
+			}
 			if m.server == nil {
 				return errors.New("fusev3: lazy detach has no FUSE server")
 			}
@@ -673,6 +663,12 @@ func (m *Mount) withdrawalOps() kernelWithdrawal {
 // repair budget. Whatever it proves is returned, so the caller can persist a
 // truthful verdict either way.
 func (m *Mount) withdrawKernelState() withdrawalOutcome {
+	m.kernelWithdrawalMu.Lock()
+	defer m.kernelWithdrawalMu.Unlock()
+	if m.kernelWithdrawalClosed {
+		_, err := m.kernelMount.absent()
+		return withdrawalOutcome{installed: m.kernelMount.point != "", withdrawn: err == nil}
+	}
 	m.revoked.Store(true)
 	ops := m.withdrawalOps()
 	installed := m.kernelMount

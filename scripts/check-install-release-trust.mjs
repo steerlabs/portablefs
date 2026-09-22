@@ -1123,6 +1123,18 @@ for (const gateContract of [
 ]) {
   requireText(xcodeSwiftGate, gateContract, `Xcode-native Swift contract ${gateContract}`);
 }
+requireText(packager, "-onlyUsePackageVersionsFromResolvedFile", "locked macOS app archive dependencies");
+const [kitResolution, appResolution] = await Promise.all([
+  "swift/PortableFSKit/Package.resolved",
+  "swift/PortableFSApp/PortableFSApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+].map(async (relativePath) => JSON.parse(await readFile(path.join(root, relativePath), "utf8"))));
+const kitProtobuf = kitResolution.pins.find((pin) => pin.identity === "swift-protobuf");
+const appProtobuf = appResolution.pins.find((pin) => pin.identity === "swift-protobuf");
+if (!kitProtobuf || !appProtobuf ||
+    kitProtobuf.state.version !== appProtobuf.state.version ||
+    kitProtobuf.state.revision !== appProtobuf.state.revision) {
+  failures.push("shipping app and tested Swift package must pin the same SwiftProtobuf revision");
+}
 for (const evidenceContract of [
   'EXPECTED_TEST_MODULES = frozenset({"PortableFSAppCoreTests", "PortableFSKitTests"})',
   'value.get("disabledTests") != []',

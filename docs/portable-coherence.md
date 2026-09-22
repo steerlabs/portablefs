@@ -40,6 +40,16 @@ The maintained go-fuse reply lifecycle and inode notifications are part of this
 publication proof, not substitutes for a kernel acknowledgment that FUSE does
 not expose.
 
+Metadata sampling also retains its ownership interval. If a grant changes or
+retires before publication, the client resamples under the original request
+deadline; a clean release cannot make an older storage size current again.
+Directory replies prepare all rows without physical publication pins, then
+validate and pin the deduplicated identities together. No row retains a pin
+while another row makes a remote request. Local writes are excluded between
+the final sample and publication admission, and all pins remain until the
+physical reply settles. Mutation replies preserve the Authority's versioned
+post-state when no local ownership overlay is needed.
+
 ## Delegated writes and peer reads
 
 CREATE and writable OPEN can return a file delegation with the ordinary reply.
@@ -111,14 +121,20 @@ invalidation. During withdrawal, new uncached reads fail rather than return byte
 under an expired permission. Authentication and exact assigned-mutation outcome
 invariants still fail closed; operator unmount remains explicit.
 
-An Authority epoch change permanently stales every old file and directory
-handle, capability, and lock. The mount reattaches using its configured attach credential, subscribes cold,
-and restarts session-bound reauthorization. Recovery needs that attach grant
-to remain valid: there is no replacement-grant installer on this path yet.
-An expired or refused grant leaves recovery cold and retrying. Old handles and
-their root barrier fail EIO; newly opened
-handles can work and pass a new barrier. There is no open-by-identity recovery
-or claim that an interrupted application transaction resumes transparently.
+An Authority epoch change invalidates every old file and directory handle,
+capability, and lock. Shipping `portablefs mount` withdraws the old mount and
+retains its exact session identity in durable inventory until cleanup is proven.
+Its supervisor must obtain fresh authorization and prove the replacement's
+renewal before admitting new work. A Host-managed enrollment never moves to a
+different session. This works after the original attach grant expires and still
+subjects every replacement to current Host access checks.
+
+The standalone helper and core callers with epoch-aware renewal can instead
+reattach using their configured, still-valid attach credential and subscribe
+cold. An expired or refused grant leaves that standalone path cold and retrying.
+Old handles and their root barrier fail EIO; new handles after recovery can work
+and pass a new barrier. There is no open-by-identity recovery or claim that an
+interrupted application transaction resumes transparently.
 Prior Linux membership is fenced through its old horizon on restart. Persisted
 membership still needs an absence proof before route changes or archival;
 historical records are not permission to assume an old mount has vanished.

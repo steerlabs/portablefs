@@ -57,11 +57,6 @@ type coherenceControlObligation struct {
 	appliedSequence    uint64
 }
 
-type coherenceTrackedDelegation struct {
-	identity   [16]byte
-	generation uint64
-}
-
 type coherenceReleaseReplay struct {
 	sequence uint64
 	digest   [32]byte
@@ -82,7 +77,6 @@ type coherenceControlSession struct {
 	replay                 *authoritypb.ControlEvent
 	pollActive             bool
 	obligations            map[uint64]*coherenceControlObligation
-	delegations            map[uint64]*coherenceTrackedDelegation
 	completedEventThrough  uint64
 	obligationByDelegation map[uint64]uint64
 	releaseCompleted       uint64
@@ -144,7 +138,7 @@ func coherenceDelegationModeProto(mode volumeserver.DelegationMode) authoritypb.
 	}
 }
 
-func (h *VolumeHandler) rememberCoherenceDelegation(grant volumeserver.Delegation) error {
+func (h *VolumeHandler) validateCoherenceDelegation(grant volumeserver.Delegation) error {
 	if grant.ID == 0 || grant.Generation == 0 || grant.Identity == ([16]byte{}) || grant.Holder == (volumeserver.SessionID{}) {
 		return syscall.EINVAL
 	}
@@ -155,10 +149,13 @@ func (h *VolumeHandler) rememberCoherenceDelegation(grant volumeserver.Delegatio
 	if session == nil || session.token.Session != grant.Holder {
 		return volumeserver.ErrSubscription
 	}
-	if old := session.delegations[grant.ID]; old != nil && (old.identity != grant.Identity || old.generation != grant.Generation) {
+	current, err := h.Coherence.LookupOwnedDelegation(session.token, grant.ID, grant.Generation)
+	if err != nil {
+		return err
+	}
+	if current.Identity != grant.Identity {
 		return errInternal
 	}
-	session.delegations[grant.ID] = &coherenceTrackedDelegation{identity: grant.Identity, generation: grant.Generation}
 	return nil
 }
 
@@ -186,6 +183,10 @@ func (h *VolumeHandler) coherenceError(requestID uint64, err error) *authoritypb
 	case errors.Is(err, volumeserver.ErrSubscriptionPosition), errors.Is(err, volumeserver.ErrCoherenceIdentity),
 		errors.Is(err, volumeserver.ErrDelegationAck), errors.Is(err, volumeserver.ErrDelegationBusy):
 		response.Errno = errnos.EINVAL
+	case errors.Is(err, volumeserver.ErrSessionDelegationLimit):
+		response.Errno = errnos.EMFILE
+	case errors.Is(err, volumeserver.ErrVolumeDelegationLimit):
+		response.Errno = errnos.ENFILE
 	default:
 		return h.errorResponse(requestID, err, false)
 	}
@@ -261,7 +262,6 @@ func (h *VolumeHandler) handleCoherenceSubscribe(requestID uint64, id volumeserv
 		session := &coherenceControlSession{
 			token: snapshot.Token, coordinatorCursor: snapshot.Position,
 			obligations:            make(map[uint64]*coherenceControlObligation),
-			delegations:            make(map[uint64]*coherenceTrackedDelegation),
 			obligationByDelegation: make(map[uint64]uint64),
 			snapshot: &coherenceSnapshotState{
 				id: snapshotID, watermark: snapshot.Watermark, horizonNanos: uint64(duration),
@@ -439,9 +439,6 @@ func (h *VolumeHandler) handleCoherencePoll(ctx context.Context, requestID uint6
 				delete(session.obligations, sequence)
 				if session.obligationByDelegation[obligation.id] == sequence {
 					delete(session.obligationByDelegation, obligation.id)
-				}
-				if live, ok := h.Coherence.LookupDelegation(obligation.identity); !ok || live.ID != obligation.id {
-					delete(session.delegations, obligation.id)
 				}
 			}
 		}
@@ -641,9 +638,6 @@ func (h *VolumeHandler) nextCoherenceControlEventLocked(session *coherenceContro
 				kind: kind, identity: first.Delegation.Identity, id: first.Delegation.ID,
 				generation: first.Delegation.Generation, coordinatorRequest: first.Request,
 			}
-			session.delegations[first.Delegation.ID] = &coherenceTrackedDelegation{
-				identity: first.Delegation.Identity, generation: first.Delegation.Generation,
-			}
 			return event, true, nil
 		default:
 			return nil, false, errInternal
@@ -799,9 +793,6 @@ func (h *VolumeHandler) handleCoherenceDelegationAck(
 	}
 	obligation.completed = true
 	obligation.appliedSequence = applied
-	if kind == coherenceControlRecall {
-		delete(session.delegations, delegationID)
-	}
 	return coherenceDelegationAckResponse(h, requestID, kind)
 }
 
@@ -867,18 +858,17 @@ func (h *VolumeHandler) handleCoherenceDelegationRelease(requestID uint64, id vo
 		if parseErr != nil || ref.GetGeneration() == 0 {
 			return h.coherenceError(requestID, syscall.EINVAL)
 		}
-		tracked := session.delegations[delegationID]
-		if tracked == nil || tracked.generation != ref.GetGeneration() {
-			return h.coherenceError(requestID, volumeserver.ErrDelegationStale)
+		grant, err := h.Coherence.LookupOwnedDelegation(token, delegationID, ref.GetGeneration())
+		if err != nil {
+			return h.coherenceError(requestID, err)
 		}
-		grants[i] = volumeserver.Delegation{ID: delegationID, Identity: tracked.identity, Holder: id, Generation: tracked.generation}
+		grants[i] = grant
 		applied[i] = release.GetAppliedSequence()
 	}
 	if _, err := h.Coherence.ReleaseAppliedBatch(token, grants, applied); err != nil {
 		return h.coherenceError(requestID, err)
 	}
 	for i, grant := range grants {
-		delete(session.delegations, grant.ID)
 		sequence := session.obligationByDelegation[grant.ID]
 		if obligation := session.obligations[sequence]; obligation != nil && !obligation.completed {
 			obligation.completed = true

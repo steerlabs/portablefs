@@ -5,6 +5,7 @@ package fusev3
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
@@ -44,8 +45,11 @@ func (m *Mount) recoverEpoch(ctx context.Context) error {
 	// writer boundary first lets every callback admitted in the old epoch finish,
 	// then prevents any later callback from retaining old capabilities or
 	// entering the old delegation buffer while state is retired.
-	m.epochMu.Lock()
 	m.subscription.suspend()
+	// Capacity-blocked admissions own callback readers. Wake them before
+	// waiting for that boundary; retire their retained bytes only afterward.
+	m.delegations.InterruptSubscription()
+	m.epochMu.Lock()
 	m.raw.mu.Lock()
 	for _, record := range m.raw.nodesByID {
 		if record != nil {
@@ -142,6 +146,13 @@ func (m *Mount) watchEpochSession(ctx context.Context, done <-chan struct{}) {
 		}
 		cause := m.rpc.SessionEndCause()
 		if errors.Is(cause, authorityrpc.ErrAuthorityChanged) {
+			if m.requireRemountOnEpochChange {
+				// A hosted enrollment cannot authorize another session, and its
+				// original attach grant may already have expired. Never publish a
+				// replacement behind a supervisor's persisted session identity.
+				m.revoke(fmt.Errorf("fusev3: remount with fresh authorization after authority epoch change: %w", cause))
+				return
+			}
 			err := m.recoverEpoch(ctx)
 			if err == nil {
 				done = m.rpc.SessionEndPending()

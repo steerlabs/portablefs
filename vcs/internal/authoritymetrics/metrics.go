@@ -2,6 +2,7 @@ package authoritymetrics
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,6 +56,16 @@ const (
 	OperationSyncFS
 	OperationGetLock
 	OperationSetLock
+	OperationSubscribe
+	OperationRenewSubscription
+	OperationNextControlEvent
+	OperationChangeAck
+	OperationDelegationRecallAck
+	OperationDelegationBreakAck
+	OperationDelegationModeChangeAck
+	OperationDelegationRelease
+	OperationBarrier
+	OperationWaitVisibility
 	operationCount
 )
 
@@ -65,6 +76,7 @@ var operationNames = [...]string{
 	"fskit_write_data", "fskit_write_commit", "fskit_write_abort", "fallocate", "copy_file_range", "tmpfile",
 	"fsync", "readdir", "reclaim", "flush", "getxattr", "setxattr", "listxattr", "removexattr", "statfs", "syncfs",
 	"getlock", "setlock",
+	"subscribe", "renew_subscription", "next_control_event", "change_ack", "delegation_recall_ack", "delegation_break_ack", "delegation_mode_change_ack", "delegation_release", "barrier", "wait_visibility",
 }
 
 func (o Operation) String() string {
@@ -132,6 +144,7 @@ type rpcSeries struct {
 // Arrays make operation/outcome selection a direct index into precomputed
 // handles rather than a label map lookup.
 type Metrics struct {
+	coherenceSource      atomic.Pointer[coherenceSource]
 	volume               string
 	registry             *Registry
 	rpc                  [operationCount][outcomeCount]rpcSeries
@@ -245,6 +258,9 @@ func New(volume string) (*Metrics, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+	if err := metrics.registerCoherenceMetrics(base); err != nil {
+		return nil, err
 	}
 	return metrics, nil
 }

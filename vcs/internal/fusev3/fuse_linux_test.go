@@ -2044,6 +2044,9 @@ func TestSetattrPreservesServerClockNowIntent(t *testing.T) {
 	in.Valid = fuse.FATTR_ATIME_NOW | fuse.FATTR_MTIME_NOW
 	before := time.Now().UnixNano()
 	_, errno := testVisibleMutation(t, mount, func(ctx context.Context) (struct{}, syscall.Errno) {
+		if _, errno := mount.raw.intern(ctx, n.item); errno != 0 {
+			return struct{}{}, errno
+		}
 		return struct{}{}, n.Setattr(ctx, nil, in, &fuse.AttrOut{})
 	})
 	if errno != 0 {

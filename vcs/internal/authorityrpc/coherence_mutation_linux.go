@@ -29,6 +29,7 @@ func (h *VolumeHandler) initCoherence() {
 		}
 		h.coherenceStorage = volumeserver.NewStorageSequencer()
 		h.coherenceVersion = 1
+		h.Metrics.BindCoherence(h.Coherence.Stats)
 
 	})
 }
@@ -357,7 +358,7 @@ func (h *VolumeHandler) mutateCoherenceVisibleSequenceResolved(ctx context.Conte
 				if op.reservation != nil {
 					grant, grantErr = op.reservation.Grant(context.WithoutCancel(ctx))
 					if grantErr == nil {
-						grantErr = h.rememberCoherenceDelegation(grant)
+						grantErr = h.validateCoherenceDelegation(grant)
 					}
 				}
 				op.reservation = nil

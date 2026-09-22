@@ -43,12 +43,17 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 	if !ok || !rpc.SupportsOrderedFlush() {
 		return nil, writeback.ErrInvalid
 	}
-	s := m.state(id)
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
 	s.admission.RLock()
 	binding, ok := s.bindings[entries[0].Generation]
+	current := ok && sameDelegation(s.ref, binding.ref)
 	handle := firstDelegatedHandle(s.writers)
 	s.admission.RUnlock()
-	if !ok || binding.ref == nil || len(handle) == 0 {
+	if !current {
+		return nil, writeback.ErrLost
+	}
+	if len(handle) == 0 {
 		return nil, errors.New("fusev3: ordered flush lost its generation binding")
 	}
 	type callResult struct {
@@ -94,10 +99,17 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 			Handle: handle, Position: uint64(e.Offset), Size: uint32(size), WriteFlags: e.WriteOptions.Flags, LockOwner: e.WriteOptions.LockOwner, Delegation: cloneDelegationRef(binding.ref),
 		}}}
 	}
+	s.admission.Lock()
+	if !sameDelegation(s.ref, binding.ref) {
+		s.admission.Unlock()
+		return nil, writeback.ErrLost
+	}
 	s.meta.Lock()
 	if uint64(missing) > math.MaxUint64-s.flushOrdinal {
 		s.meta.Unlock()
-		m.loseDelegation(s, "delegated flush ordinal exhausted")
+		report := m.loseDelegationLocked(s, "delegated flush ordinal exhausted")
+		s.admission.Unlock()
+		m.reportDrop(report)
 		return nil, writeback.ErrLost
 	}
 	for _, request := range requests {
@@ -107,6 +119,7 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		}
 	}
 	s.meta.Unlock()
+	s.admission.Unlock()
 	var joined sync.WaitGroup
 	for i, request := range requests {
 		if request == nil {
@@ -137,6 +150,13 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		}
 	}
 	joined.Wait()
+	s.admission.Lock()
+	if !sameDelegation(s.ref, binding.ref) {
+		s.admission.Unlock()
+		return nil, writeback.ErrLost
+	}
+	completion := delegationFlushResult{buffer: m.buf}
+	defer m.finishFlushResult(s, &completion)
 	sequences := make([]uint64, len(entries))
 	var capacity syscall.Errno
 	lost := false
@@ -165,7 +185,8 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		seq := response.GetAppliedSequence()
 		sequences[i] = seq
 		m.tokenMu.Lock()
-		m.tokens[e.Token] = delegationFlushProgress{sequence: seq, complete: true}
+		m.tokens[e.Token] = delegationFlushProgress{owner: s, sequence: seq, complete: true}
+		s.trackFlushTokenLocked(e.Token)
 		m.tokenMu.Unlock()
 		s.meta.Lock()
 		s.applied = max(s.applied, seq)
@@ -175,9 +196,7 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		m.appliedHigh = max(m.appliedHigh, seq)
 		m.durabilityMu.Unlock()
 		m.updateBaseFromResponse(s, response)
-		if reply.GetDurableSequence() != 0 {
-			m.durableCurrent(reply.GetDurableSequence())
-		}
+		completion.durable = max(completion.durable, reply.GetDurableSequence())
 	}
 	var previous uint64
 	for _, seq := range sequences {
@@ -189,11 +208,11 @@ func (m *delegationManager) FlushBatch(ctx context.Context, id writeback.Identit
 		}
 	}
 	if lost {
-		m.loseDelegation(s, "ordered delegated wave outcome unprovable")
+		completion.dropped = m.loseDelegationLocked(s, "ordered delegated wave outcome unprovable")
 		return nil, writeback.ErrLost
 	}
 	if capacity != 0 {
-		m.refuseBufferedMutation(s, capacity)
+		completion.dropped = m.refuseBufferedMutationLocked(s, capacity)
 		return nil, capacity
 	}
 	select {

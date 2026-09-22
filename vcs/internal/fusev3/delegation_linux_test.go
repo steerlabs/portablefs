@@ -1072,7 +1072,8 @@ func TestDelegationSubscriptionFenceDropsOldBufferAndAllowsColdGrant(t *testing.
 	m := newDelegationTestManager(t, fake)
 	id := installDelegationForTest(t, m, 32, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 	n := &node{mount: &Mount{delegations: m}, item: &authoritypb.Item{StableIdentity: cloneBytes(id)}}
-	existing := &fileHandle{node: n, lossObserved: m.IdentityLoss(id)}
+	existing := &fileHandle{node: n, lossObserved: m.beginLossObserver(id)}
+	defer m.endLossObserver(id)
 	if _, err := m.Write(context.Background(), id, 0, []byte("old"), false); err != nil {
 		t.Fatal(err)
 	}
@@ -1285,7 +1286,7 @@ func TestDelegationFlushKeepsWritableCapabilityUntilApplication(t *testing.T) {
 }
 
 func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T) {
-	for _, state := range []string{"unseen", "live", "retired"} {
+	for _, state := range []string{"unseen", "live", "retired", "collected"} {
 		t.Run(state, func(t *testing.T) {
 			m := newDelegationTestManager(t, &delegationFakeRPC{})
 			id := delegationTestIdentity(22)
@@ -1293,9 +1294,17 @@ func TestDelegationReaderOpenRemainsValidWhenLastWriterReleaseWins(t *testing.T)
 				id = installDelegationForTest(t, m, 22, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
 			}
 			if state == "retired" {
+				identity, _ := delegationIdentity(id)
+				retained := m.retainState(identity, false)
+				defer m.releaseState(retained)
+			}
+			if state == "retired" || state == "collected" {
 				if err := m.CloseHandles(t.Context(), []delegationClose{{identity: id, handle: delegationTestToken(22, 2)}}); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if state == "collected" {
+				awaitDelegationCollection(t, m, id)
 			}
 			reader := delegationTestToken(22, 3)
 			err := m.AddHandle(id, delegationTestToken(22, 1), reader, false)
@@ -1734,6 +1743,8 @@ func TestDelegationSubscriptionFenceWakesAdmissionParkedAtCapacity(t *testing.T)
 	}
 	t.Cleanup(m.Stop)
 	id := installDelegationForTest(t, m, 34, authoritypb.DelegationMode_DELEGATION_MODE_FULL)
+	m.beginLossObserver(id)
+	defer m.endLossObserver(id)
 	if _, err := m.Write(t.Context(), id, 0, []byte("accepted"), false); err != nil {
 		t.Fatal(err)
 	}

@@ -562,12 +562,21 @@ trap 'echo "epoch restart failed at line $LINENO" >&2' ERR
 before_a=$(findmnt -n -r -o ID,SOURCE --target /home/portablefs/mount-a)
 before_b=$(findmnt -n -r -o ID,SOURCE --target /home/portablefs/mount-b)
 old=$(cat /home/portablefs/authority.pid)
+[[ $(readlink "/proc/$old/exe") == /home/portablefs/bin/portablefs-authority ]]
+started=$SECONDS
+exited=false
 kill -TERM "$old"
 for ((i=0; i<200; i++)); do
-  if ! kill -0 "$old" 2>/dev/null || [[ $(ps -o stat= -p "$old") == Z* ]]; then break; fi
+  if ! kill -0 "$old" 2>/dev/null || [[ $(ps -o stat= -p "$old") == Z* ]]; then exited=true; break; fi
   sleep 0.05
 done
-if kill -0 "$old" 2>/dev/null && [[ $(ps -o stat= -p "$old") != Z* ]]; then exit 1; fi
+# Exit is monotonic. Rechecking a zombie can observe kill -0 before reaping and
+# an empty ps result afterward, incorrectly turning a completed wait into failure.
+if [[ $exited != true ]]; then
+  echo "epoch restart: fixture Authority $old did not exit after $((SECONDS - started))s (200 observations)" >&2
+  ps -o pid,ppid,stat,wchan,args -p "$old" >&2 || echo "epoch restart: Authority $old exited at the timeout boundary" >&2
+  exit 1
+fi
 setsid /home/portablefs/launch-authority.sh </dev/null >>/home/portablefs/logs/authority.log 2>&1 &
 for ((i=0; i<200; i++)); do
   new=$(cat /home/portablefs/authority.pid)

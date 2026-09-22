@@ -39,6 +39,8 @@ func newCoherenceBenchmarkCoordinator(maxLogEntries int) *CoherenceCoordinator {
 	return NewCoherenceCoordinator(CoherenceConfig{
 		Clock:         coherenceBenchmarkClock{now: time.Unix(1, 0)},
 		MaxLogEntries: maxLogEntries,
+		// The synthetic 100K lookup workload exceeds the production session cap.
+		MaxDelegationsPerSession: coherenceBenchmarkDelegations,
 	})
 }
 
@@ -226,4 +228,37 @@ func BenchmarkCoherenceDelegationLookup100K(b *testing.B) {
 	coherenceDelegationBenchmarkSink = sink
 	b.ReportMetric(float64(coherenceBenchmarkDelegations), "active_delegations")
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "lookups/s")
+}
+
+// Renewals must not move a writer's pending withdrawal indefinitely. Measure
+// both the first relevant entry and the bounded worst case (a full retained
+// ring of unrelated targeted changes), rather than only empty-log renewal.
+func BenchmarkCoherenceRenewalRetainedLog(b *testing.B) {
+	for _, relevant := range []bool{true, false} {
+		name := "first-relevant"
+		if !relevant {
+			name = "65536-unrelated"
+		}
+		b.Run(name, func(b *testing.B) {
+			c := newCoherenceBenchmarkCoordinator(65_536)
+			identity := [16]byte{1}
+			if !relevant {
+				identity = [16]byte{2}
+			}
+			peer, err := c.SubscribeWithCache(SessionID{1}, CacheAdmission{Attributes: [][16]byte{identity}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			for range 65_536 {
+				c.OnCommitTargeted([]ChangeEntry{{Kind: AttributesChanged, Identity: [16]byte{1}}}, SubscriptionToken{}, CacheAdmission{})
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := c.Renew(peer.Token); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
 }

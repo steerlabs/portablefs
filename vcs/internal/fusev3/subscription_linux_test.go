@@ -198,6 +198,15 @@ type subscriptionTestControl struct {
 	log         *[]string
 }
 
+func (c *subscriptionTestControl) InterruptSubscription() {
+	c.mu.Lock()
+	c.incarnation = 0
+	if c.log != nil {
+		*c.log = append(*c.log, "interrupt")
+	}
+	c.mu.Unlock()
+}
+
 func (c *subscriptionTestControl) FenceSubscription(reason string) {
 	c.mu.Lock()
 	c.fences = append(c.fences, reason)
@@ -277,7 +286,7 @@ func TestSubscriptionColdPaginationWatermarkAndStaleReply(t *testing.T) {
 	if len(control.fences) != 1 || control.fences[0] != "cold subscription replacement" {
 		t.Fatalf("delegation fences = %v, want one cold replacement", control.fences)
 	}
-	wantControlLog := []string{"fence", "subscribe", "subscribe", "incarnation"}
+	wantControlLog := []string{"interrupt", "fence", "subscribe", "subscribe", "incarnation"}
 	if !slices.Equal(controlLog, wantControlLog) {
 		t.Fatalf("cold subscription order = %v, want %v", controlLog, wantControlLog)
 	}

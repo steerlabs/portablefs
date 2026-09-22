@@ -206,6 +206,9 @@ type replyPublication struct {
 	cachedNext             *replyPublication
 	cachedArena            bool
 	holderAdmission        *delegationState
+	holderAdmissions       []*delegationState
+	metadataSample         uint64
+	metadataResampled      bool
 	cachedCoordinates      [2]publicationCoordinate
 	cachedCount            int
 	completeDirectories    [2]completeDirectoryPublication
@@ -1080,8 +1083,8 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	// A holder's LOOKUP can return storage metadata older than its accepted
 	// write buffer. Publishing that size can truncate the kernel inode and
 	// make a private page fault SIGBUS before background application.
-	owned := r.mount.delegations.Owns(record.identity[:])
-	if owned {
+	prepared, owned := false, false
+	{
 		var err error
 		version := uint64(0)
 		if publication.cacheStamp != nil {
@@ -1095,7 +1098,7 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 				}
 			}
 		}
-		owned, err = r.holderMetadata(ctx, publication.requestUnique, nil, "", record, attr, version, &out.Attr, false)
+		prepared, owned, err = r.holderMetadata(ctx, publication.requestUnique, nil, "", record, attr, version, &out.Attr, false)
 		if err != nil {
 			return err
 		}
@@ -1105,7 +1108,7 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	inode := attr.GetInode()
 	var attrCoordinate publicationCoordinate
 	cachedAttr := false
-	if cachedName && publication.postState == nil && !owned {
+	if cachedName && publication.postState == nil && !owned && !publication.metadataResampled {
 		var attrReservation *cacheInstallReservation
 		_, attrCoordinate, attrReservation, cachedAttr = r.admitAttrLocked(ctx, inode, record.identity)
 		if cachedAttr {
@@ -1129,17 +1132,18 @@ func (r *rawFileSystem) publishEntry(ctx context.Context, out *fuse.EntryOut, pa
 	_ = entry
 	out.SetEntryTimeout(0)
 	out.SetAttrTimeout(0)
-	if !owned {
+	if !prepared {
 		fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
 	}
 	return nil
 }
 
 type dirPlusCandidate struct {
-	entry  *fuse.EntryOut
-	dirent *authoritypb.Dirent
-	item   *authoritypb.Item
-	record *inodeRecord
+	privateAttr bool
+	entry       *fuse.EntryOut
+	dirent      *authoritypb.Dirent
+	item        *authoritypb.Item
+	record      *inodeRecord
 }
 
 type dirPlusLookupCompletion struct {
@@ -1299,8 +1303,10 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 		if _, exists := r.cachedNames[key]; !exists {
 			newNames[key] = struct{}{}
 		}
-		if _, exists := r.cachedAttrs[candidate.record.identity]; !exists {
-			newAttrs[candidate.record.identity] = struct{}{}
+		if !candidate.privateAttr && !publication.metadataResampled {
+			if _, exists := r.cachedAttrs[candidate.record.identity]; !exists {
+				newAttrs[candidate.record.identity] = struct{}{}
+			}
 		}
 	}
 	if r.cachedNameTotalLocked()+len(newNames) > r.nameCapacity || len(r.cachedAttrs)+r.pendingAttrs+len(newAttrs) > r.attrCapacity {
@@ -1317,6 +1323,9 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 			{kind: publicationItemAttributes, item: candidate.record.identity},
 		}
 		for j, coordinate := range coordinates {
+			if j == 1 && (candidate.privateAttr || publication.metadataResampled) {
+				continue
+			}
 			reservation, ok := r.reserveCacheCandidateLocked(publication, coordinate)
 			if !ok {
 				for _, pair := range reservations {
@@ -1345,21 +1354,26 @@ func (r *rawFileSystem) publishDirPlusPage(ctx context.Context, parent *inodeRec
 			reservedNames[key] = true
 			r.pendingNames++
 		}
-		if _, needed := newAttrs[candidate.record.identity]; needed && !reservedAttrs[candidate.record.identity] {
+		if _, needed := newAttrs[candidate.record.identity]; attrReservation != nil && needed && !reservedAttrs[candidate.record.identity] {
 			attrReservation.capacityReserved = true
 			reservedAttrs[candidate.record.identity] = true
 			r.pendingAttrs++
 		}
 		r.publishingNames[key]++
-		r.publishingInodes[candidate.record.key.inode]++
 		r.admitSourcePublicationLocked(nameCoordinate)
-		r.admitSourcePublicationLocked(attrCoordinate)
 		publication.names = append(publication.names, namePublication)
-		publication.attrs = append(publication.attrs, replyAttrPublication{
-			inode: candidate.record.key.inode, identity: candidate.record.identity, record: candidate.record,
-			coordinate: attrCoordinate, reservation: attrReservation, stamp: lease,
-			attr: proto.Clone(candidate.item.GetAttr()).(*authoritypb.Attr), objectVersion: candidate.dirent.GetObjectVersion(), snapshot: snapshot,
-		})
+		// A holder row renders a private overlay, not the page storage image.
+		// Preserve page names independently; never make that older attribute
+		// image reusable after clean ownership release.
+		if attrReservation != nil {
+			r.publishingInodes[candidate.record.key.inode]++
+			r.admitSourcePublicationLocked(attrCoordinate)
+			publication.attrs = append(publication.attrs, replyAttrPublication{
+				inode: candidate.record.key.inode, identity: candidate.record.identity, record: candidate.record,
+				coordinate: attrCoordinate, reservation: attrReservation, stamp: lease,
+				attr: proto.Clone(candidate.item.GetAttr()).(*authoritypb.Attr), objectVersion: candidate.dirent.GetObjectVersion(), snapshot: snapshot,
+			})
+		}
 		publication.dirPlus = append(publication.dirPlus, replyDirPlusPublication{
 			entry: candidate.entry, nameReservation: nameReservation, attrReservation: attrReservation,
 		})
@@ -1443,7 +1457,22 @@ func (r *rawFileSystem) publishAnonymousEntry(ctx context.Context, out *fuse.Ent
 	out.NodeId, out.Generation = record.id, 1
 	out.SetEntryTimeout(0)
 	out.SetAttrTimeout(0)
-	fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	version := record.node.item.GetObjectVersion()
+	if publication.postState != nil {
+		for _, object := range publication.postState.GetObjects() {
+			if bytes.Equal(object.GetStableIdentity(), record.identity[:]) {
+				version = object.GetObjectVersion()
+				break
+			}
+		}
+	}
+	prepared, _, err := r.holderMetadata(ctx, publication.requestUnique, nil, "", record, attr, version, &out.Attr, false)
+	if err != nil {
+		return err
+	}
+	if !prepared {
+		fillAttr(attr, &out.Attr, r.mount.uid, r.mount.gid)
+	}
 	return nil
 }
 
@@ -1511,11 +1540,22 @@ func (r *rawFileSystem) settleDataPublicationLocked(publication replyDataPublica
 }
 
 func (r *rawFileSystem) settleReplyPublicationLocked(publication *replyPublication, successful bool) responseConsumptionClaim {
-	if state := publication.holderAdmission; state != nil {
-		publication.holderAdmission = nil
+	if publication.holderAdmission != nil {
+		publication.holderAdmission.admission.RUnlock()
+	}
+	for _, state := range publication.holderAdmissions {
 		state.admission.RUnlock()
 	}
-
+	// Epoch reset holds the index writer while waiting for these readers.
+	// Unlock the entire page before releasing any indexed reference.
+	if publication.holderAdmission != nil {
+		r.mount.delegations.releaseState(publication.holderAdmission)
+		publication.holderAdmission = nil
+	}
+	for _, state := range publication.holderAdmissions {
+		r.mount.delegations.releaseState(state)
+	}
+	publication.holderAdmissions = nil
 	if publication.cachedCount != 0 {
 		r.signalSourceChangedLocked()
 	}
@@ -2288,47 +2328,74 @@ func (r *rawFileSystem) cachedLookup(ctx context.Context, parent *inodeRecord, n
 	}
 	key := nameKey{parent: parent.key.inode, name: name}
 	coordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: name}
-	r.mu.Lock()
-	if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) {
+	for {
+		if ctx.Err() != nil {
+			return nil, nil, false
+		}
+		r.mu.Lock()
+		if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) {
+			r.mu.Unlock()
+			return nil, nil, false
+		}
+		record := r.cachedNames[key]
+		stamp := r.cachedNameStamps[key]
+		_, negative := r.cachedNegatives[key]
+		if negative {
+			stamp = r.cachedNegativeStamps[key]
+		}
+		if r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
+			r.mu.Unlock()
+			return nil, nil, false
+		}
+		if negative {
+			p.servedVersion = stamp.version
+			r.mu.Unlock()
+			return nil, nil, true
+		}
+		if record == nil || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 {
+			r.mu.Unlock()
+			return nil, nil, false
+		}
+		attrCoord := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}
+		if !r.waitFinalizedCacheCoordinateLocked(ctx, p, attrCoord) {
+			r.mu.Unlock()
+			return nil, nil, false
+		}
 		r.mu.Unlock()
-		return nil, nil, false
+		var attr *authoritypb.Attr
+		retry := false
+		hit := r.mount.delegations.sampleUnownedCache(record.identity, func() bool {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			// A new finalized installer may have appeared while ownership was
+			// being sampled. Join it only after dropping this identity's pin.
+			if r.finalizedCacheCoordinateLocked(p, coordinate) != nil || r.finalizedCacheCoordinateLocked(p, attrCoord) != nil {
+				retry = true
+				return false
+			}
+			if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
+				r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
+				return false
+			}
+			payload := r.cachedAttrPayloads[record.identity]
+			if payload.attr == nil || r.cachedAttrs[record.identity] != record || r.repairingCoordinates[attrCoord] ||
+				r.mount.subscription.remainingAfterOwnershipCheck(attrCoord, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
+				return false
+			}
+			record.lookups++
+			r.identityIndexLocked(record)[record.key] = record
+			attr = proto.Clone(payload.attr).(*authoritypb.Attr)
+			p.servedVersion = min(stamp.version, payload.stamp.version)
+			p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
+			return true
+		})
+		if hit {
+			return record, attr, false
+		}
+		if !retry {
+			return nil, nil, false
+		}
 	}
-	defer r.mu.Unlock()
-	record := r.cachedNames[key]
-	stamp := r.cachedNameStamps[key]
-	_, negative := r.cachedNegatives[key]
-	if negative {
-		stamp = r.cachedNegativeStamps[key]
-	}
-	if r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
-		return nil, nil, false
-	}
-	if negative {
-		p.servedVersion = stamp.version
-		return nil, nil, true
-	}
-	if record == nil || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 {
-		return nil, nil, false
-	}
-	attrCoord := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}
-	if !r.waitFinalizedCacheCoordinateLocked(ctx, p, attrCoord) {
-		return nil, nil, false
-	}
-	payload := r.cachedAttrPayloads[record.identity]
-	if payload.attr == nil || r.mount.subscription.remaining(attrCoord, payload.stamp, payload.stamp.version, time.Now()) <= 0 || r.repairingCoordinates[attrCoord] {
-		return nil, nil, false
-	}
-	// The attribute join may have released r.mu across a name withdrawal.
-	if r.cachedNames[key] != record || record.stale.Load() || record.reclaimed || record.lookups == math.MaxUint64 ||
-		r.mount.subscription.remaining(coordinate, stamp, stamp.version, time.Now()) <= 0 || r.repairingCoordinates[coordinate] {
-		return nil, nil, false
-	}
-	record.lookups++
-	r.identityIndexLocked(record)[record.key] = record
-	attr := proto.Clone(payload.attr).(*authoritypb.Attr)
-	p.servedVersion = min(stamp.version, payload.stamp.version)
-	p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
-	return record, attr, false
 }
 
 // publishRenameBindings admits fresh coordinate stamps from authoritative
@@ -2412,9 +2479,6 @@ func (r *rawFileSystem) publishPostStateAttrs(ctx context.Context) {
 // cachedAttrRecord answers one GETATTR from the daemon attribute cache under a
 // live subscription. Kernel attribute validity is always zero.
 func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecord) (*authoritypb.Attr, bool) {
-	if record != nil && r.mount.delegations.Owns(record.identity[:]) {
-		return nil, false
-	}
 	if record == nil || record.graft || record.stale.Load() {
 		return nil, false
 	}
@@ -2422,20 +2486,40 @@ func (r *rawFileSystem) cachedAttrRecord(ctx context.Context, record *inodeRecor
 	if p == nil || p.cacheStamp != nil {
 		return nil, false
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	coordinate := publicationCoordinate{kind: publicationItemAttributes, item: record.identity}
-	if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) {
-		return nil, false
+	for {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		r.mu.Lock()
+		if !r.waitFinalizedCacheCoordinateLocked(ctx, p, coordinate) || r.cachedAttrPayloads[record.identity].attr == nil {
+			r.mu.Unlock()
+			return nil, false
+		}
+		r.mu.Unlock()
+		var attr *authoritypb.Attr
+		retry := false
+		hit := r.mount.delegations.sampleUnownedCache(record.identity, func() bool {
+			r.mu.Lock()
+			defer r.mu.Unlock()
+			if r.finalizedCacheCoordinateLocked(p, coordinate) != nil {
+				retry = true
+				return false
+			}
+			payload := r.cachedAttrPayloads[record.identity]
+			if record.stale.Load() || record.reclaimed || payload.attr == nil || r.cachedAttrs[record.identity] != record || r.repairingCoordinates[coordinate] ||
+				r.mount.subscription.remainingAfterOwnershipCheck(coordinate, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
+				return false
+			}
+			attr = proto.Clone(payload.attr).(*authoritypb.Attr)
+			p.servedVersion = payload.stamp.version
+			p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
+			return true
+		})
+		if hit || !retry {
+			return attr, hit
+		}
 	}
-	payload := r.cachedAttrPayloads[record.identity]
-	if payload.attr == nil || r.repairingCoordinates[coordinate] || r.mount.subscription.remaining(coordinate, payload.stamp, payload.stamp.version, time.Now()) <= 0 {
-		return nil, false
-	}
-	attr := proto.Clone(payload.attr).(*authoritypb.Attr)
-	p.servedVersion = payload.stamp.version
-	p.cacheStamp = &cacheSnapshot{SnapshotSequence: payload.snapshot, ObjectVersion: payload.objectVersion, BirthTimeNS: attr.GetBirthTimeNs(), InodeFlags: attr.GetFlags()}
-	return attr, true
 }
 
 func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
@@ -2464,6 +2548,10 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	} else if record != nil {
 		r.bindPath(record, parent, name)
 		if err := r.publishEntry(ctx, out, parent, name, record, attr); err != nil {
+			if errors.Is(err, errMetadataInterrupted) {
+				r.Forget(record.id, 1)
+				return fuse.EIO
+			}
 			r.mount.revoke(err)
 			return fuse.Status(syscall.ENOTCONN)
 		}
@@ -2491,6 +2579,12 @@ func (r *rawFileSystem) Lookup(_ <-chan struct{}, header *fuse.InHeader, name st
 	}
 	r.bindPath(record, parent, name)
 	if err := r.publishEntry(ctx, out, parent, name, record, item.GetAttr()); err != nil {
+		if errors.Is(err, errMetadataInterrupted) {
+			// The failed LOOKUP transfers no kernel lookup reference. Its
+			// retained Authority response is still consumed by normal settlement.
+			r.Forget(record.id, 1)
+			return fuse.EIO
+		}
 		r.mount.revoke(err)
 		return fuse.Status(syscall.ENOTCONN)
 	}
@@ -2552,6 +2646,10 @@ func (r *rawFileSystem) GetAttr(_ <-chan struct{}, input *fuse.GetAttrIn, out *f
 	}
 	defer finish()
 	if attr, cached := r.cachedAttrRecord(ctx, record); cached {
+		p := replyPublicationFromContext(ctx)
+		if prepared, errno := record.node.publishHolderAttr(ctx, attr, p.cacheStamp.ObjectVersion, out); prepared || errno != 0 {
+			return fuse.Status(errno)
+		}
 		r.publishAttr(ctx, out, record.identity, attr)
 		return fuse.OK
 	}
@@ -2883,6 +2981,7 @@ func (r *rawFileSystem) Release(_ <-chan struct{}, input *fuse.ReleaseIn) {
 		return
 	}
 	defer r.unpin(handle.inode)
+	defer handle.file.endLossObservation()
 	ctx, finish, lifecycle := r.mutationContext(input.Unique)
 	if !lifecycle.Ok() {
 		return
@@ -3685,7 +3784,6 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 				return fuse.EIO
 			}
 			entryOut.NodeId, entryOut.Generation = record.id, 1
-			fillAttr(item.GetAttr(), &entryOut.Attr, r.mount.uid, r.mount.gid)
 			candidates = append(candidates, dirPlusCandidate{entry: entryOut, dirent: dirent, item: item, record: record})
 		} else if item != nil {
 			r.mount.deferReclaim(item.GetToken())
@@ -3695,6 +3793,9 @@ func (r *rawFileSystem) ReadDirPlus(_ <-chan struct{}, input *fuse.ReadIn, out *
 		if page.finished {
 			break
 		}
+	}
+	if err := r.publishDirectoryMetadata(ctx, candidates); err != nil {
+		return fuse.Status(bufferErrno(err))
 	}
 	if err := r.publishDirPlusPage(ctx, held.inode, candidates); err != nil {
 		return fuse.EIO

@@ -460,8 +460,13 @@ func testSoakDirtyUnmount(t *testing.T) {
 	if got[0].Bytes != int64(len(payload)) || got[0].Entries != 1 || got[0].LossSequence == 0 {
 		t.Fatalf("dirty unmount drop report = %+v", got[0])
 	}
-	if got[0].Reason != "cold subscription replacement" {
-		t.Fatalf("dirty unmount loss reason = %q, want cold subscription replacement", got[0].Reason)
+	// The failed close, its in-flight flush, and CONTROL withdrawal race to
+	// detect the same loss. The byte count, single report, and failed unmount
+	// above are the contract; scheduling does not determine the first detector.
+	switch got[0].Reason {
+	case "cold subscription replacement", "asynchronous delegated close failed", "ordered delegated wave outcome unprovable":
+	default:
+		t.Fatalf("unexpected dirty unmount loss reason = %q", got[0].Reason)
 	}
 	logFaultPass(t, f, "dirty-unmount", started)
 }

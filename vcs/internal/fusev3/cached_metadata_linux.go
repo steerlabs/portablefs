@@ -7,7 +7,26 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
+
+// Slow cache readers join a finalized physical reply before reaching here.
+// Retain one identity outside raw.mu so idle collection cannot turn its valid
+// payload into a remote miss. The reader also excludes a concurrent new grant
+// throughout the local cache snapshot; an absent state needs the same pin.
+// sample may take raw.mu but cannot wait for a reply or perform remote I/O.
+func (m *delegationManager) sampleUnownedCache(identity publicationIdentity, sample func() bool) bool {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.retainState(writeback.Identity(identity), true)
+	defer m.releaseState(s)
+	s.admission.RLock()
+	defer s.admission.RUnlock()
+	if m.incarnation() == 0 || s.ref != nil {
+		return false
+	}
+	return sample()
+}
 
 // Waiters create the receipt only while holding raw.mu. A cached hit with no
 // concurrent withdrawal therefore needs neither a context nor a channel.
@@ -57,7 +76,7 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	r.mu.RUnlock()
 	if record != nil && r.mount.delegations.Owns(record.identity[:]) {
 		var attr fuse.Attr
-		if hit, err := r.holderMetadata(r.opContext(), unique, parent, name, record, nil, 0, &attr, true); hit && err == nil {
+		if hit, _, err := r.holderMetadata(r.opContext(), unique, parent, name, record, nil, 0, &attr, true); hit && err == nil {
 			*out = fuse.EntryOut{NodeId: record.id, Generation: 1, Attr: attr}
 			return true
 		}
@@ -119,7 +138,7 @@ func (r *rawFileSystem) attrCachedReply(unique uint64, record *inodeRecord, out 
 	defer r.mount.epochMu.RUnlock()
 	if r.mount.delegations.Owns(record.identity[:]) {
 		var attr fuse.Attr
-		if hit, err := r.holderMetadata(r.opContext(), unique, nil, "", record, nil, 0, &attr, true); hit && err == nil {
+		if hit, _, err := r.holderMetadata(r.opContext(), unique, nil, "", record, nil, 0, &attr, true); hit && err == nil {
 			*out = fuse.AttrOut{Attr: attr}
 			return true
 		}

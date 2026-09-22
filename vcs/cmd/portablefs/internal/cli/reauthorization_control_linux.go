@@ -13,9 +13,12 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountid"
 
 	"golang.org/x/sys/unix"
 )
@@ -25,12 +28,16 @@ const maxLocalReauthorizationRequestBytes = (32 << 10) + maxClientIdentityBytes 
 const fuseReauthorizationSocketPrefix = "@portablefs-reauthorization-"
 
 type localReauthorizationRequest struct {
+	Operation            string `json:"operation,omitempty"`
+	MountInstanceID      string `json:"mountInstanceId,omitempty"`
 	Capability           string `json:"capability"`
 	ClientCertificatePEM string `json:"clientCertificatePem"`
 	Sequence             uint64 `json:"sequence"`
 }
 
 type localReauthorizationResponse struct {
+	MountInstanceID             string `json:"mountInstanceId,omitempty"`
+	LossSequence                string `json:"lossSequence,omitempty"`
 	AuthorizationDeadlineUnixMs int64  `json:"authorizationDeadlineUnixMs,omitempty"`
 	Error                       string `json:"error,omitempty"`
 	OK                          bool   `json:"ok"`
@@ -38,16 +45,17 @@ type localReauthorizationResponse struct {
 }
 
 type unixReauthorizationControl struct {
-	done     chan struct{}
-	handler  fuseReauthorizationHandler
-	listener *net.UnixListener
-	once     sync.Once
-	path     string
+	done         chan struct{}
+	handler      fuseReauthorizationHandler
+	lossSnapshot fuseLossSnapshotHandler
+	listener     *net.UnixListener
+	once         sync.Once
+	path         string
 }
 
-func startFuseReauthorizationControl(handler fuseReauthorizationHandler) (fuseReauthorizationControl, error) {
-	if handler == nil {
-		return nil, errors.New("reauthorization handler is required")
+func startFuseReauthorizationControl(handler fuseReauthorizationHandler, lossSnapshot fuseLossSnapshotHandler) (fuseReauthorizationControl, error) {
+	if handler == nil && lossSnapshot == nil {
+		return nil, errors.New("mount control handler is required")
 	}
 	path, err := newFuseReauthorizationSocketName()
 	if err != nil {
@@ -58,7 +66,7 @@ func startFuseReauthorizationControl(handler fuseReauthorizationHandler) (fuseRe
 		return nil, fmt.Errorf("listen on reauthorization control socket: %w", err)
 	}
 	control := &unixReauthorizationControl{
-		done: make(chan struct{}), handler: handler, listener: listener, path: path,
+		done: make(chan struct{}), handler: handler, lossSnapshot: lossSnapshot, listener: listener, path: path,
 	}
 	go control.serve()
 	return control, nil
@@ -132,13 +140,30 @@ func (c *unixReauthorizationControl) handle(connection *net.UnixConn) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var request localReauthorizationRequest
-	if err := decoder.Decode(&request); err != nil || request.Sequence == 0 || request.Capability == "" || len(request.Capability) > 32<<10 || request.ClientCertificatePEM == "" || len(request.ClientCertificatePEM) > maxClientIdentityBytes {
+	if err := decoder.Decode(&request); err != nil {
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request", OK: false})
 		return
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid request", OK: false})
+		return
+	}
+	if request.Operation == "loss-snapshot" {
+		if c.lossSnapshot == nil || !mountid.ValidMountInstance(request.MountInstanceID) || request.Sequence != 0 || request.Capability != "" || request.ClientCertificatePEM != "" {
+			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "invalid loss snapshot request"})
+			return
+		}
+		snapshot, err := c.lossSnapshot()
+		if err != nil || snapshot.MountInstanceID != request.MountInstanceID || !validLossSequence(snapshot.LossSequence) {
+			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "exact live mount loss snapshot unavailable"})
+			return
+		}
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{OK: true, MountInstanceID: snapshot.MountInstanceID, LossSequence: snapshot.LossSequence})
+		return
+	}
+	if request.Operation != "" || request.MountInstanceID != "" || c.handler == nil || request.Sequence == 0 || request.Capability == "" || len(request.Capability) > 32<<10 || request.ClientCertificatePEM == "" || len(request.ClientCertificatePEM) > maxClientIdentityBytes {
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "reauthorization unavailable or invalid request"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -154,6 +179,10 @@ func (c *unixReauthorizationControl) handle(connection *net.UnixConn) {
 }
 
 func requireSameUserPeer(connection *net.UnixConn) error {
+	return requireUserPeer(connection, uint32(os.Geteuid()))
+}
+
+func requireUserPeer(connection *net.UnixConn, uid uint32) error {
 	raw, err := connection.SyscallConn()
 	if err != nil {
 		return err
@@ -168,7 +197,7 @@ func requireSameUserPeer(connection *net.UnixConn) error {
 	if controlErr != nil {
 		return controlErr
 	}
-	if credential == nil || credential.Uid != uint32(os.Geteuid()) {
+	if credential == nil || credential.Uid != uid {
 		return errors.New("reauthorization peer uid mismatch")
 	}
 	return nil
@@ -217,4 +246,48 @@ func reauthorizeFuseMount(ctx context.Context, state *mountState, token string, 
 		return time.Time{}, errors.New("mount supervisor refused reauthorization")
 	}
 	return time.UnixMilli(response.AuthorizationDeadlineUnixMs), nil
+}
+
+// mountLoss reads one exact supervisor, not mount inventory or a sampled log.
+func readFuseMountLoss(ctx context.Context, state *mountState, instance string) (mountLossSnapshot, error) {
+	if state == nil || state.Strategy != "fuse" || state.MountInstanceID != instance || !mountid.ValidMountInstance(instance) || !validReauthorizationControlAddress(state.ReauthorizationControlSocket) {
+		return mountLossSnapshot{}, errors.New("exact FUSE mount has no live loss snapshot endpoint")
+	}
+	connection, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "unix", state.ReauthorizationControlSocket)
+	if err != nil {
+		return mountLossSnapshot{}, fmt.Errorf("connect to exact mount loss snapshot: %w", err)
+	}
+	defer connection.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = connection.SetDeadline(deadline)
+	}
+	if err := json.NewEncoder(connection).Encode(localReauthorizationRequest{Operation: "loss-snapshot", MountInstanceID: instance}); err != nil {
+		return mountLossSnapshot{}, err
+	}
+	if err := connection.(*net.UnixConn).CloseWrite(); err != nil {
+		return mountLossSnapshot{}, err
+	}
+	body, err := io.ReadAll(io.LimitReader(connection, 4097))
+	if err != nil || len(body) > 4096 {
+		return mountLossSnapshot{}, errors.New("mount loss snapshot response unavailable or oversized")
+	}
+	var response localReauthorizationResponse
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&response); err != nil {
+		return mountLossSnapshot{}, fmt.Errorf("decode mount loss snapshot: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return mountLossSnapshot{}, errors.New("trailing mount loss snapshot response")
+	}
+	if !response.OK || response.Error != "" || response.MountInstanceID != instance || !validLossSequence(response.LossSequence) || response.Sequence != 0 || response.AuthorizationDeadlineUnixMs != 0 {
+		return mountLossSnapshot{}, errors.New("exact live mount loss snapshot refused")
+	}
+	return mountLossSnapshot{MountInstanceID: response.MountInstanceID, LossSequence: response.LossSequence}, nil
+}
+
+func validLossSequence(value string) bool {
+	n, err := strconv.ParseUint(value, 10, 64)
+	return err == nil && strconv.FormatUint(n, 10) == value
 }

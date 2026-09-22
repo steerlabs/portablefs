@@ -233,22 +233,41 @@ authorization. A skipped phase 9 is not a pass for durability. Test gateway
 reads against that volume's known canary bytes using OpenSteer's authenticated
 files interface; a healthy HTTP process alone proves no Authority attachment.
 
-**Active delegation metric: unavailable in this snapshot.**
-`vcs/internal/authoritymetrics/metrics.go` defines no delegation gauge, and
-`vcs/internal/authorityrpc/server_metrics.go` maps new control bodies to
-`opcode="unknown"`. `portablefs_authority_active_sessions` counts sessions;
-`portablefs_authority_write_transactions_active` counts staged FSKit writes.
-Neither measures Linux delegations. The `active_delegations` value in the
-coordinator benchmark is test output, not a production scrape series.
+**Delegation and subscription telemetry.** The Authority's `/metrics` endpoint
+exports `portablefs_authority_delegations{volume,state}` with the bounded states
+`reserved`, `active`, `recalling`, and `retiring`. Retiring records still hold
+storage/read pins and continue consuming the grant budget. Capacity reserved
+before CREATE has its own `portablefs_authority_delegation_capacity_reservations`
+gauge. `portablefs_authority_subscription_horizons` counts retained horizons,
+including fenced horizons until their normal expiry sweep; it is not a count of
+currently healthy clients.
 
-Before promotion, the product owner must expose an active-delegation gauge
-and document its exact name/labels. Hold an uncontended Linux writer open,
-scrape that gauge and require a positive value for the canary volume, then
-close/barrier and prove it returns to baseline. Until that instrumented
-artifact and check exist, the requested operational delegation verification
-is a **release blocker**. REL does not invent a metric or modify product code.
-Existing `/readyz`, `/metrics`, session activation logs, and workload results
-remain useful evidence but cannot replace this check.
+`portablefs_authority_delegation_recalls_total{volume,outcome}` and
+`portablefs_authority_delegation_breaks_total{volume,outcome}` distinguish
+`completed` from `lost` acknowledgments. Loss includes budget expiry, horizon
+expiry, or session retirement; it does not by itself establish lost file bytes.
+Subscription cold replacements and expirations appear separately as
+`portablefs_authority_subscription_resets_total` and
+`portablefs_authority_subscription_expirations_total`. The bounded stream's
+retained size is `portablefs_authority_change_log_entries`.
+
+Protocol-7 control operations, `barrier`, and `wait_visibility` have dedicated
+`opcode` labels in the existing RPC request and latency series. None of these
+series labels an inode, pathname, session, or grant.
+
+The Linux mount's existing `renewal.*` JSON log records include a `writeback`
+snapshot: dirty and retained bytes/entries, pending admissions and closes,
+flushing/scheduled identities, tracked state, durability lag, and loss sequence.
+Sampling follows enrollment renewal events; it adds no timer or per-I/O logging.
+The counters are diagnostic snapshots, not atomic durability receipts. A root
+barrier remains the completion proof.
+
+Before promotion, hold an uncontended Linux writer open and require a positive
+`portablefs_authority_delegations{state="active"}` for the canary volume. Close
+and barrier, wait for release completion, then prove it returns to baseline.
+Sample recall/break outcomes during conflicting access and ensure the canary's
+barrier latency fits the deployment's budget. Unit and kernel tests establish
+the implementation; this exact deployed-artifact scrape remains a rollout gate.
 
 ## Abort and recovery
 

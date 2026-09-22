@@ -174,8 +174,14 @@ page so a large snapshot cannot prevent liveness, but must stage later changes
 until it has installed the whole snapshot, then apply them in order.
 
 Renew every 3 seconds, independently of polls and acks. The authority horizon
-is its last accepted renewal plus 10 seconds; the client anchors the returned
-duration at request start, so transit delay only shortens local permission.
+is at most its last accepted renewal plus 10 seconds. An outstanding relevant
+change caps renewal at its issue time plus 10 seconds, without shortening any
+horizon already issued. The earliest unacknowledged relevant change supplies
+that cap; source-owned and unrelated targeted changes do not. Writers wait for
+the actual issued horizon, a complete withdrawal ack, or a cold reset, never
+an independent timeout that could precede promised permission. The client
+anchors the returned duration at request start, so transit delay only shortens
+local permission.
 The client must stop serving and finish invalidating caches by its conservative
 horizon. A late response cannot revive expired permission. The authority fences
 all ordinary requests at expiry; only cold subscription and required transport/

@@ -135,16 +135,20 @@ func (f *fixture) counts() map[string]int {
 }
 func (f *fixture) measure(t *testing.T, name string, run func() error) {
 	t.Helper()
+	stopProfile, profiled := startSoakProfile(t, name)
+	defer stopProfile()
 	before := f.counts()
 	start := time.Now()
 	err := run()
+	elapsed := time.Since(start).Seconds()
 	after := f.counts()
+	stopProfile()
 	total := 0
 	for k, v := range after {
 		after[k] = v - before[k]
 		total += after[k]
 	}
-	result := map[string]any{"workload": name, "seconds": time.Since(start).Seconds(), "requests": after, "total_requests": total, "pass": err == nil}
+	result := map[string]any{"workload": name, "seconds": elapsed, "profiled": profiled, "requests": after, "total_requests": total, "pass": err == nil}
 	if err != nil {
 		result["error"] = err.Error()
 	}

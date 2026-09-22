@@ -160,6 +160,11 @@ func (a integrationAuthorizer) Authorize(_ context.Context, _ string, token []by
 
 type integrationConfig struct {
 	latencies fuse.LatencyMap
+	// The shipping CLI lifecycle test owns its mounts and uses signed hosted
+	// grants, while sharing this fixture's actual XFS/authority assembly.
+	skipMounts    bool
+	listenAddress string
+	authorizer    func() authorityrpc.Authorizer
 	// Mounts is the number of independent kernel FUSE mounts of the same
 	// volume. Defaults to two, the minimum needed to observe coherence.
 	Mounts int
@@ -235,11 +240,13 @@ func (m *recordingMembership) activeCount() int {
 // requires.
 type integrationTransport struct {
 	*authorityrpc.Client
-	session                 []byte
-	hookMu                  sync.Mutex
-	beforeMutation          func(*authoritypb.Request)
-	beforeDelegatedMutation func(context.Context, *authoritypb.Request) error
-	afterMutation           func(*authoritypb.Request, *authoritypb.Response, error)
+	session                  []byte
+	hookMu                   sync.Mutex
+	beforeMutation           func(*authoritypb.Request)
+	beforeDelegatedMutation  func(context.Context, *authoritypb.Request) error
+	afterMutation            func(*authoritypb.Request, *authoritypb.Response, error)
+	afterControlEvent        func(context.Context, *authoritypb.ControlEvent) error
+	afterSubscriptionRenewal func(time.Time, error)
 }
 
 // The partition test can stall DATA admission before assigning a replay slot.
@@ -516,7 +523,11 @@ func (f *integrationFixture) start() {
 		t.Fatalf("create authority epoch: %v", err)
 	}
 	f.authority = authority
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	address := f.cfg.listenAddress
+	if address == "" {
+		address = "127.0.0.1:0"
+	}
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
@@ -583,6 +594,9 @@ func (f *integrationFixture) start() {
 		FskitWriteProgressTimeout:           integrationWriteProgressTimeout,
 		FskitWriteAbsoluteTimeout:           integrationWriteAbsoluteTimeout,
 	}
+	if f.cfg.authorizer != nil {
+		handler.Authorizer = f.cfg.authorizer()
+	}
 	coordination.Bind(handler)
 	f.counter = &countingHandler{inner: handler}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -598,7 +612,9 @@ func (f *integrationFixture) start() {
 		pprof.Do(ctx, pprof.Labels("component", "authority"), func(ctx context.Context) { served <- f.server.Serve(ctx, listener, f.serverTLS) })
 	}()
 
-	pprof.Do(ctx, pprof.Labels("component", "frontend"), func(context.Context) { f.mountAll() })
+	if !f.cfg.skipMounts {
+		pprof.Do(ctx, pprof.Labels("component", "frontend"), func(context.Context) { f.mountAll() })
+	}
 }
 
 // mountAll installs every mountpoint against the running authority, each
@@ -1014,6 +1030,8 @@ type integrationCredentials struct {
 	ClientPrivateKeyPEM  []byte
 	// ServerName is the name the authority's leaf certificate carries.
 	ServerName string
+	issuer     *x509.Certificate
+	issuerKey  ed25519.PrivateKey
 }
 
 func integrationTLS(t *testing.T) (*tls.Config, *tls.Config, integrationCredentials) {
@@ -1063,6 +1081,8 @@ func integrationTLS(t *testing.T) (*tls.Config, *tls.Config, integrationCredenti
 		ClientCertificatePEM: clientCertPEM,
 		ClientPrivateKeyPEM:  clientKeyPEM,
 		ServerName:           "localhost",
+		issuer:               ca,
+		issuerKey:            caKey,
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{serverCertificate}},
 		&tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{clientCertificate}, ServerName: "localhost"},

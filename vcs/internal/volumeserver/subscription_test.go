@@ -318,6 +318,7 @@ func TestSubscriptionColdSnapshotIncludesDelegatedSet(t *testing.T) {
 		t.Fatalf("subscribe observer: %v", err)
 	}
 	clock.Advance(8 * time.Second)
+	cv2AckAll(t, coordinator, holder.Token)
 	if _, err := coordinator.Renew(holder.Token); err != nil {
 		t.Fatalf("renew holder: %v", err)
 	}

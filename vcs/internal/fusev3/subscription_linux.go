@@ -58,6 +58,7 @@ type subscriptionRPC interface {
 // waiting on a cache-installing reply can never stop the poll that delivers the
 // delegation event needed to release that reply.
 type subscriptionControlHandler interface {
+	InterruptSubscription()
 	FenceSubscription(string)
 	SetIncarnation(uint64)
 	HandleControlEvent(context.Context, *authoritypb.ControlEvent) <-chan struct{}
@@ -405,7 +406,21 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 	// the wire; SetIncarnation re-enables grant admission only after the complete
 	// snapshot has been installed.
 	if s.control != nil {
+		// Wake buffered admissions which own callback readers before waiting
+		// for those readers. Final retirement still follows their completion.
+		s.control.InterruptSubscription()
+		// A metadata callback may pin several inode admission readers until
+		// its physical reply. Finish sampling every row before reset takes
+		// manager epoch/index writers; otherwise a later row can wait behind
+		// a reset which is itself waiting for the earlier row's reply.
+		// Physical reply settlement does not require this callback fence.
+		if s.mount != nil {
+			s.mount.epochMu.Lock()
+		}
 		s.control.FenceSubscription("cold subscription replacement")
+		if s.mount != nil {
+			s.mount.epochMu.Unlock()
+		}
 	}
 
 	var (

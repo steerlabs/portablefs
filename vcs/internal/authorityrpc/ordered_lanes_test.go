@@ -3,6 +3,7 @@ package authorityrpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"google.golang.org/protobuf/proto"
 	"sync"
 	"syscall"
@@ -13,9 +14,81 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
+type recallProgressHandler struct {
+	orderedCapabilityHandler
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *recallProgressHandler) Handle(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
+	if r.GetRead() != nil {
+		h.entered <- struct{}{}
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+		}
+		return &authoritypb.Response{RequestId: r.RequestId, Epoch: h.Epoch(), Errno: int32(syscall.EIO)}
+	}
+	if r.GetWrite() != nil {
+		return &authoritypb.Response{RequestId: r.RequestId, Epoch: h.Epoch(), Mutation: &authoritypb.MutationState{Slot: r.GetMutation().GetSlot(), AcceptedSequence: r.GetMutation().GetSequence()}, Body: &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: 1}}}
+	}
+	return h.orderedCapabilityHandler.Handle(ctx, r)
+}
+
+func TestDelegatedFlushProgressUnderOrdinarySaturation(t *testing.T) {
+	for _, limit := range []int{3, 8, 9, 128} {
+		for _, ordered := range []bool{false, true} {
+			t.Run(fmt.Sprintf("slots=%d/ordered=%t", limit, ordered), func(t *testing.T) {
+				h := &recallProgressHandler{
+					orderedCapabilityHandler: orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: limit}, enabled: ordered},
+					entered:                  make(chan struct{}, limit), release: make(chan struct{}),
+				}
+				address, tls, stop := startTestServer(t, h, limit, time.Minute)
+				defer stop()
+				c, err := DialClient(t.Context(), coherentTestClientConfig(address, tls, "volume", uint32(limit), limit))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer c.Close()
+				var reads sync.WaitGroup
+				defer func() { close(h.release); reads.Wait() }()
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				for range cap(c.ordinary.permits) {
+					reads.Go(func() {
+						_, _ = c.Call(ctx, &authoritypb.Request{Body: &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{Handle: make([]byte, 16), Length: 1}}})
+					})
+					select {
+					case <-h.entered:
+					case <-ctx.Done():
+						t.Fatal("ordinary calls exceeded the server's matching lane")
+					}
+				}
+				for _, request := range []*authoritypb.Request{
+					{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Delegation: &authoritypb.DelegationRef{}}}},
+					{Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Delegation: &authoritypb.DelegationRef{}}}},
+				} {
+					if c.laneFor(request) != &c.flush {
+						t.Fatal("delegated metadata did not share independent flush admission")
+					}
+				}
+				reply, err := c.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Handle: make([]byte, 16), Data: []byte("x"), Size: 1, Delegation: &authoritypb.DelegationRef{Id: make([]byte, 16), Generation: 1}}}})
+				if err != nil || reply.GetWrite().GetCommittedSize() != 1 {
+					t.Fatalf("flush could not progress while ordinary calls waited: %v, %v", reply, err)
+				}
+				ordinary, blocking, flush := serverExecutionLanes(limit, c.cfg.FrontendProfile, c.SupportsOrderedFlush())
+				if cap(c.ordinary.permits) != ordinary || cap(c.blocking.permits) != blocking || cap(c.flush.permits) != flush || ordinary+blocking+flush != limit {
+					t.Fatal("client and server execution budgets differ")
+				}
+			})
+		}
+	}
+}
+
 type orderedCapabilityHandler struct {
 	clientTestHandler
-	enabled bool
+	enabled        bool
+	omitActivation bool
 }
 
 func (h *orderedCapabilityHandler) Handle(ctx context.Context, r *authoritypb.Request) *authoritypb.Response {
@@ -24,11 +97,24 @@ func (h *orderedCapabilityHandler) Handle(ctx context.Context, r *authoritypb.Re
 		if hello := response.GetHello(); hello != nil && hasFeatures(r.GetHello().Features, []string{orderedDelegatedFlushFeature}) {
 			hello.Features = append(hello.Features, orderedDelegatedFlushFeature)
 		}
-		if active := response.GetActivate(); active != nil {
+		if active := response.GetActivate(); active != nil && !h.omitActivation {
 			active.Features = append(active.Features, orderedDelegatedFlushFeature)
 		}
 	}
 	return response
+}
+
+func TestActivationCannotChangeNegotiatedFlushCapacity(t *testing.T) {
+	h := &orderedCapabilityHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 9}, enabled: true, omitActivation: true}
+	address, tls, stop := startTestServer(t, h, 9, time.Minute)
+	defer stop()
+	client, err := DialClient(t.Context(), coherentTestClientConfig(address, tls, "volume", 9, 9))
+	if client != nil {
+		_ = client.Close()
+	}
+	if err == nil {
+		t.Fatal("published mismatched client and server flush partitions")
+	}
 }
 func TestOrderedFlushNegotiatesIsolatedClientAndServerLanes(t *testing.T) {
 	for _, tc := range []struct {
@@ -55,11 +141,11 @@ func TestOrderedFlushNegotiatesIsolatedClientAndServerLanes(t *testing.T) {
 					{Body: &authoritypb.Request_SetAttr{SetAttr: &authoritypb.SetAttrRequest{Delegation: &authoritypb.DelegationRef{}}}},
 					{Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{Delegation: &authoritypb.DelegationRef{}}}},
 				} {
-					if c.laneFor(metadata) != &c.ordered {
+					if c.laneFor(metadata) != &c.flush {
 						t.Fatal("metadata bypassed shared server flush bound")
 					}
 				}
-				if c.laneFor(request) != &c.ordered || cap(c.ordered.permits) != 4 || len(c.ordered.slots) != 4 || cap(c.ordinary.permits) != 1 || cap(c.blocking.permits) != 4 {
+				if c.laneFor(request) != &c.flush || cap(c.flush.permits) != 4 || len(c.flush.slots) != 4 || cap(c.ordinary.permits) != 1 || cap(c.blocking.permits) != 4 {
 					t.Fatal("client lanes overlap or exceed negotiated bound")
 				}
 			} else if _, err := c.CallMutation(t.Context(), request); !errors.Is(err, syscall.EOPNOTSUPP) {

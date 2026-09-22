@@ -200,11 +200,11 @@ func TestBufferStateTransitionsAndPartialOverlayRetirement(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertStats(t, b, Stats{Bytes: 8, Entries: 1, Accepted: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 8, AcceptedBytes: 8, Entries: 1, Accepted: 1})
 	if seq, err := b.FlushIdentity(ctx, id, first); err != nil || seq != 10 {
 		t.Fatalf("first flush = (%d, %v), want (10, nil)", seq, err)
 	}
-	assertStats(t, b, Stats{Bytes: 8, Entries: 1, Applied: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 8, Entries: 1, Applied: 1})
 
 	second, err := b.Write(ctx, id, 2, []byte("xy"))
 	if err != nil {
@@ -216,21 +216,21 @@ func TestBufferStateTransitionsAndPartialOverlayRetirement(t *testing.T) {
 	assertRead(t, b, id, 0, 8, []byte("........"), []byte("ABxyEFGH"))
 
 	b.VisibleSequence(9)
-	assertStats(t, b, Stats{Bytes: 10, Entries: 2, Applied: 2})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 10, Entries: 2, Applied: 2})
 	b.VisibleSequence(10)
-	assertStats(t, b, Stats{Bytes: 10, Entries: 2, Applied: 1, Visible: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 10, Entries: 2, Applied: 1, Visible: 1})
 	b.VisibleSequence(10)
 	b.DurableSequence(10)
-	assertStats(t, b, Stats{Bytes: 2, Entries: 1, Applied: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 2, Entries: 1, Applied: 1})
 	// The old extent is now in the Authority image. The newer dirty extent must
 	// remain indexed after the old record and its owned AVL nodes retire.
 	assertRead(t, b, id, 0, 8, []byte("ABCDEFGH"), []byte("ABxyEFGH"))
 
 	b.VisibleSequence(20)
-	assertStats(t, b, Stats{Bytes: 2, Entries: 1, Visible: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 2, Entries: 1, Visible: 1})
 	b.VisibleSequence(20)
 	b.DurableSequence(20)
-	assertStats(t, b, Stats{})
+	assertStats(t, b, Stats{Identities: 1})
 	assertRead(t, b, id, 0, 8, []byte("ABxyEFGH"), []byte("ABxyEFGH"))
 }
 
@@ -249,7 +249,7 @@ func TestDurabilityCannotStandInForVisibility(t *testing.T) {
 	if _, err := b.FlushIdentity(context.Background(), id, cut); err != nil {
 		t.Fatal(err)
 	}
-	assertStats(t, b, Stats{Bytes: 1, Entries: 1, Applied: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 1, Entries: 1, Applied: 1})
 	visible := make(chan error, 1)
 	go func() { visible <- b.WaitVisible(context.Background(), id, cut) }()
 	select {
@@ -261,7 +261,7 @@ func TestDurabilityCannotStandInForVisibility(t *testing.T) {
 	if err := await(t, visible, "visibility wait"); err != nil {
 		t.Fatal(err)
 	}
-	assertStats(t, b, Stats{})
+	assertStats(t, b, Stats{Identities: 1})
 }
 
 func TestPartialDurabilityRetiresOldWriteAndTruncateButKeepsLaterWrite(t *testing.T) {
@@ -290,18 +290,18 @@ func TestPartialDurabilityRetiresOldWriteAndTruncateButKeepsLaterWrite(t *testin
 
 	b.VisibleSequence(10)
 	b.DurableSequence(10)
-	assertStats(t, b, Stats{Bytes: 1, Entries: 2, Applied: 2})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 1, Entries: 2, Applied: 2})
 	assertRead(t, b, id, 0, 20, []byte("ABCDEFGH"), want)
 	b.VisibleSequence(20)
 	b.DurableSequence(20)
-	assertStats(t, b, Stats{Bytes: 1, Entries: 1, Applied: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 1, Entries: 1, Applied: 1})
 	assertRead(t, b, id, 0, 20, []byte("ABC"), want)
 	if got := b.Size(id, 3); got != 6 {
 		t.Fatalf("size after truncate retirement with later write = %d, want 6", got)
 	}
 	b.VisibleSequence(30)
 	b.DurableSequence(30)
-	assertStats(t, b, Stats{})
+	assertStats(t, b, Stats{Identities: 1})
 }
 
 func TestCumulativeNotificationsNeverRegress(t *testing.T) {
@@ -318,12 +318,12 @@ func TestCumulativeNotificationsNeverRegress(t *testing.T) {
 	}
 	b.VisibleSequence(20)
 	b.VisibleSequence(5)
-	assertStats(t, b, Stats{Bytes: 2, Entries: 2, Visible: 2})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 2, Entries: 2, Visible: 2})
 	b.DurableSequence(10)
 	b.DurableSequence(3)
-	assertStats(t, b, Stats{Bytes: 1, Entries: 1, Visible: 1})
+	assertStats(t, b, Stats{Identities: 1, Bytes: 1, Entries: 1, Visible: 1})
 	b.DurableSequence(20)
-	assertStats(t, b, Stats{})
+	assertStats(t, b, Stats{Identities: 1})
 }
 
 func TestFlushCoalescingAndOrderingBarriers(t *testing.T) {
@@ -874,7 +874,7 @@ func TestDropDuringSuccessfulFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	if err := await(t, result, "dropped successful flush"); !errors.Is(err, ErrLost) {
 		t.Fatalf("FlushIdentity error = %v, want ErrLost", err)
 	}
-	assertStats(t, b, Stats{LossSequence: 1})
+	assertStats(t, b, Stats{Identities: 1, LossSequence: 1})
 	assertRead(t, b, id, 0, 7, []byte("clean!!"), []byte("clean!!"))
 	if !b.Lost(id) || b.IdentityLoss(id) != 1 {
 		t.Fatalf("loss state = (%v, %d), want (true, 1)", b.Lost(id), b.IdentityLoss(id))
@@ -921,7 +921,7 @@ func TestDropDuringFlushInvalidatesBatchAndOverlay(t *testing.T) {
 	} else if errors.Is(err, transportErr) {
 		t.Fatalf("rebinding loss was hidden by transport error: %v", err)
 	}
-	assertStats(t, b, Stats{LossSequence: 1})
+	assertStats(t, b, Stats{Identities: 1, LossSequence: 1})
 	assertRead(t, b, id, 0, 7, []byte("clean!!"), []byte("clean!!"))
 	if !b.Lost(id) || b.IdentityLoss(id) != 1 {
 		t.Fatalf("loss state = (%v, %d), want (true, 1)", b.Lost(id), b.IdentityLoss(id))
@@ -1274,7 +1274,7 @@ func TestReadSnapshotSurvivesConcurrentDurableRetirement(t *testing.T) {
 	await(t, fetchEntered, "blocked fetch after overlay snapshot")
 	b.VisibleSequence(10)
 	b.DurableSequence(10)
-	assertStats(t, b, Stats{})
+	assertStats(t, b, Stats{Identities: 1})
 	close(fetchRelease)
 	got := await(t, result, "read after concurrent retirement")
 	if got.err != nil || string(got.data) != "dirty" {

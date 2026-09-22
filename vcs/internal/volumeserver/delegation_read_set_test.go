@@ -83,8 +83,11 @@ func TestDataConsumedSetPinsReservedReadersIncludingLateReservations(t *testing.
 					c.mu.Unlock()
 					t.Fatal(checkErr)
 				}
-				reservation = c.reserveLocked(subscriber, id, ahead, false)
+				reservation, err = c.reserveLocked(subscriber, id, ahead, false)
 				c.mu.Unlock()
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			var got result
 			select {

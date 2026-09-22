@@ -40,6 +40,7 @@ type file struct {
 	lastErrno       syscall.Errno
 	lastGenericLoss uint64
 	lost            bool
+	flushUsers      int // includes callers waiting for the active flusher
 	flushing        bool
 	pending         *batch
 	lastTruncate    *record
@@ -167,24 +168,55 @@ func (b *Buffer) Write(ctx context.Context, id Identity, off int64, data []byte)
 	return b.WriteWithOptions(ctx, id, off, data, WriteOptions{})
 }
 func (b *Buffer) WriteWithOptions(ctx context.Context, id Identity, off int64, data []byte, opts WriteOptions) (Cut, error) {
+	return b.writeInGeneration(ctx, id, 0, off, data, opts)
+}
+
+// Generation-bound admission lets an owner release its own admission lock
+// while waiting for capacity. A concurrent drop or ownership transition must
+// fail the old waiter instead of accepting it into the replacement generation.
+func (b *Buffer) WriteInGeneration(ctx context.Context, id Identity, generation uint64, off int64, data []byte, opts WriteOptions) (Cut, error) {
+	if generation == 0 {
+		return Cut{}, ErrInvalid
+	}
+	return b.writeInGeneration(ctx, id, generation, off, data, opts)
+}
+func (b *Buffer) writeInGeneration(ctx context.Context, id Identity, generation uint64, off int64, data []byte, opts WriteOptions) (Cut, error) {
 	if off < 0 || len(data) == 0 || int64(len(data)) > math.MaxInt64-off || int64(len(data)) > b.maxBytes {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, Write, off, data, Attributes{}, opts)
+	return b.admit(ctx, id, generation, Write, off, data, Attributes{}, opts)
 }
 func (b *Buffer) Truncate(ctx context.Context, id Identity, size int64) (Cut, error) {
+	return b.truncateInGeneration(ctx, id, 0, size)
+}
+func (b *Buffer) TruncateInGeneration(ctx context.Context, id Identity, generation uint64, size int64) (Cut, error) {
+	if generation == 0 {
+		return Cut{}, ErrInvalid
+	}
+	return b.truncateInGeneration(ctx, id, generation, size)
+}
+func (b *Buffer) truncateInGeneration(ctx context.Context, id Identity, generation uint64, size int64) (Cut, error) {
 	if size < 0 {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, Truncate, 0, nil, Attributes{Size: size, HasSize: true}, WriteOptions{})
+	return b.admit(ctx, id, generation, Truncate, 0, nil, Attributes{Size: size, HasSize: true}, WriteOptions{})
 }
 func (b *Buffer) SetAttr(ctx context.Context, id Identity, a Attributes) (Cut, error) {
+	return b.setAttrInGeneration(ctx, id, 0, a)
+}
+func (b *Buffer) SetAttrInGeneration(ctx context.Context, id Identity, generation uint64, a Attributes) (Cut, error) {
+	if generation == 0 {
+		return Cut{}, ErrInvalid
+	}
+	return b.setAttrInGeneration(ctx, id, generation, a)
+}
+func (b *Buffer) setAttrInGeneration(ctx context.Context, id Identity, generation uint64, a Attributes) (Cut, error) {
 	if a.HasCTime || a.HasSize && a.Size < 0 || a.ATimeNow && a.HasATime || a.MTimeNow && a.HasMTime {
 		return Cut{}, ErrInvalid
 	}
-	return b.admit(ctx, id, SetAttr, 0, nil, a, WriteOptions{})
+	return b.admit(ctx, id, generation, SetAttr, 0, nil, a, WriteOptions{})
 }
-func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, data []byte, a Attributes, opts WriteOptions) (Cut, error) {
+func (b *Buffer) admit(ctx context.Context, id Identity, generation uint64, kind Kind, off int64, data []byte, a Attributes, opts WriteOptions) (Cut, error) {
 	// The caller's payload becomes immutable before admission, but the copy is
 	// deliberately outside the global buffer mutex so a large write does not
 	// stall disjoint reads, acknowledgements, or capacity release.
@@ -199,6 +231,9 @@ func (b *Buffer) admit(ctx context.Context, id Identity, kind Kind, off int64, d
 			return Cut{}, ErrClosed
 		}
 		f := b.file(id)
+		if generation != 0 && f.generation != generation {
+			return Cut{}, ErrLost
+		}
 		if !b.retiringAll && !f.retiring && b.count < b.maxEntries && b.bytes < b.maxBytes && int64(len(data)) <= b.maxBytes-b.bytes {
 			now := time.Now().UnixNano()
 			if a.ATimeNow || a.MTimeNow {
@@ -319,12 +354,19 @@ func (b *Buffer) Size(id Identity, base int64) int64 {
 func (b *Buffer) Stats() Stats {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s := Stats{Bytes: b.bytes, Entries: b.count, LossSequence: b.loss, WaitingAdmissions: b.waitingAdmissions}
+	s := Stats{Bytes: b.bytes, Entries: b.count, LossSequence: b.loss, WaitingAdmissions: b.waitingAdmissions, Identities: len(b.files)}
 	for _, f := range b.files {
+		if f.flushing {
+			s.Flushing++
+		}
+		if f.scheduled {
+			s.Scheduled++
+		}
 		for r := f.head; r != nil; r = r.next {
 			switch r.state {
 			case Accepted:
 				s.Accepted++
+				s.AcceptedBytes += int64(len(r.data))
 			case Applied:
 				s.Applied++
 			case Visible:
@@ -370,6 +412,36 @@ func (b *Buffer) HasRetained(id Identity) bool {
 	defer b.mu.Unlock()
 	f := b.files[id]
 	return f != nil && f.head != nil
+}
+
+// RetainedGeneration is the oldest generation still needed by retained records,
+// or the current admission generation if no records remain. It never creates
+// identity metadata. Admission and generations are monotonically ordered.
+func (b *Buffer) RetainedGeneration(id Identity) (uint64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if f := b.files[id]; f != nil {
+		if f.head != nil {
+			return f.head.generation, true
+		}
+		return f.generation, false
+	}
+	return 0, false
+}
+
+// Quiescent reports whether no record or internal flush reference remains.
+// The owner must separately exclude new admissions before retiring metadata.
+func (b *Buffer) Quiescent(id Identity) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := b.files[id]
+	return f == nil || f.head == nil && f.flushUsers == 0 && !f.flushing && !f.scheduled && f.pending == nil
+}
+
+func (b *Buffer) notifyIdle(id Identity) {
+	if observer, ok := b.flusher.(IdleObserver); ok {
+		observer.BufferIdle(id)
+	}
 }
 
 // IdentityFailure returns the loss ticket and its errno as one observation.
@@ -537,6 +609,7 @@ func (b *Buffer) schedule() {
 					b.trigger()
 				}
 				b.mu.Unlock()
+				b.notifyIdle(job.file.id)
 			}
 		}()
 	}
@@ -601,7 +674,7 @@ func (b *Buffer) Forget(id Identity) bool {
 	if f == nil {
 		return true
 	}
-	if f.head != nil || f.retiring || f.flushing || f.scheduled || f.lost || b.retiringAll {
+	if f.head != nil || f.retiring || f.flushUsers != 0 || f.flushing || f.scheduled || f.lost || b.retiringAll {
 		return false
 	}
 	delete(b.files, id)

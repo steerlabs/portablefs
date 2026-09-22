@@ -33,3 +33,35 @@ func TestBackgroundFlushObserverRunsAfterAppliedCutWithoutBufferLock(t *testing.
 	case <-time.After(20 * time.Millisecond):
 	}
 }
+
+type idleObservedFlusher struct {
+	recordingFlusher
+	buffer *Buffer
+	idle   chan bool
+}
+
+func (f *idleObservedFlusher) BufferIdle(id Identity) {
+	// An idle notification must follow both the active flush and any queued job
+	// reference. Taking the buffer lock here also proves callback lock ordering.
+	f.buffer.VisibleSequence(^uint64(0))
+	f.buffer.DurableSequence(^uint64(0))
+	f.idle <- f.buffer.Forget(id)
+}
+
+func TestIdleObserverCanForgetAfterFinalBackgroundReference(t *testing.T) {
+	f := &idleObservedFlusher{idle: make(chan bool, 2)}
+	b := newTestBuffer(t, f, Options{FlushInterval: -1})
+	f.buffer = b
+	id := testIdentity(1)
+	mustWrite(t, b, id, 0, "retained")
+	b.trigger()
+	if await(t, f.idle, "flush reference") {
+		t.Fatal("forgot identity while background job still retained it")
+	}
+	if !await(t, f.idle, "job reference") {
+		t.Fatal("idle identity remained pinned after final background reference")
+	}
+	if generation, retained := b.RetainedGeneration(id); generation != 0 || retained {
+		t.Fatalf("forgotten identity generation=%d retained=%v", generation, retained)
+	}
+}

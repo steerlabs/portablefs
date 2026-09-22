@@ -138,8 +138,15 @@ type Config struct {
 	// when several clients mount the same volume. Product supervisors persist it
 	// as part of their recoverable mounting intent.
 	MountInstanceID string
-	RequestTimeout  time.Duration
-	MaxBackground   int
+	// RequireRemountOnEpochChange keeps the authorization session immutable for
+	// supervisors whose enrollment and durable mount record name one session.
+	// An authority restart withdraws this mount; its owner must obtain fresh
+	// authorization before installing a replacement. Standalone callers that
+	// own an epoch-aware grant source may leave this false for cold recovery.
+	RequireRemountOnEpochChange bool
+
+	RequestTimeout time.Duration
+	MaxBackground  int
 	// MaxInFlight must be the same concurrent-call bound the RPC transport was
 	// configured with. The frontend subtracts its liveness and cleanup lanes
 	// from this number and admits bulk kernel work only against the remainder,
@@ -236,6 +243,8 @@ type Mount struct {
 	fatalErr                error
 	reclaim                 *reclaimQueue
 	reclaimWorkers          int
+
+	requireRemountOnEpochChange bool
 	// bulk admits kernel-driven authority calls. Its capacity is strictly less
 	// than the transport's own in-flight bound, so a keepalive or a reclaim can
 	// never be queued behind saturated bulk I/O.
@@ -252,6 +261,9 @@ type Mount struct {
 	repairBudget time.Duration
 	raw          *rawFileSystem
 	kernelMount  kernelMount
+	// The withdrawal ladder must finish before its owned abort descriptor closes.
+	kernelWithdrawalMu     sync.Mutex
+	kernelWithdrawalClosed bool
 	// plannedFSName is the unique source identity for this mount attempt and
 	// plannedMountpoint is its validated target. They let failed startup prove
 	// that this exact mount was never installed even when no kernel mount ID was
@@ -384,7 +396,7 @@ func MountVolume(parent context.Context, mountpoint string, rpc RPC, cfg Config)
 	// identity is recorded before anything can use the mount: its later absence
 	// is the only thing that authorises a clean strict detach, and
 	// self-revocation needs its device to abort the connection.
-	installed, err := observeKernelMount(mountpoint)
+	installed, err := captureKernelMount(fsName, mountpoint)
 	if err != nil {
 		// go-fuse prepares one request-loop reference in NewServer, so even an
 		// unserved mount needs Serve to consume it before Unmount can finish. The
@@ -478,7 +490,7 @@ func observeExactPlannedKernelMount(fsName, mountpoint string) (kernelMount, err
 			sourceElsewhere = true
 		}
 		if point == mountpoint {
-			atPath = append(atPath, kernelMount{id: fields[0], device: fields[2], point: point})
+			atPath = append(atPath, kernelMount{id: fields[0], device: fields[2], point: point, filesystem: fields[separator+1], source: source})
 			if fields[separator+1] != "fuse.portablefs" || source != fsName {
 				return kernelMount{}, fmt.Errorf("fusev3: mountpoint %s has an unexpected kernel identity", mountpoint)
 			}
@@ -536,6 +548,8 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 		repairBudget:         cfg.RepairBudget,
 		routesRevision:       cfg.Routes.Revision(),
 		onRevoked:            cfg.OnRevoked,
+
+		requireRemountOnEpochChange: cfg.RequireRemountOnEpochChange,
 	}
 
 	var err error
@@ -579,7 +593,7 @@ func (m *Mount) start(lease time.Duration) {
 // then releases the authority session. Only exact absence plus a clean session
 // close upgrades the original error to a clean-startup verdict.
 func (m *Mount) abortMount(cause error) error {
-	_ = m.server.Unmount()
+	_ = m.unmountOwnedKernelMount()
 	m.Wait()
 	absenceErr := m.failedStartupKernelAbsent()
 	closeErr := m.Close()
@@ -1224,7 +1238,7 @@ func (m *Mount) Unmount() error {
 	if m.closed {
 		return nil
 	}
-	if err := m.server.Unmount(); err != nil {
+	if err := m.unmountOwnedKernelMount(); err != nil {
 		return err
 	}
 	return m.closeLocked()
@@ -1272,7 +1286,11 @@ func (m *Mount) closeLocked() error {
 	// boundary. A terminal revocation already finished this idempotently from
 	// scheduleAbort before it reached Close.
 	m.rpc.FinishLocalSessionEnforcement()
-	m.closeErr = errors.Join(m.fatalError(), barrierErr, replyOwnershipErr, detachErr, m.grafts.Close(), m.rpc.Close())
+	m.kernelWithdrawalMu.Lock()
+	m.kernelWithdrawalClosed = true
+	abortCloseErr := m.kernelMount.abortFile.close()
+	m.kernelWithdrawalMu.Unlock()
+	m.closeErr = errors.Join(m.fatalError(), barrierErr, replyOwnershipErr, detachErr, abortCloseErr, m.grafts.Close(), m.rpc.Close())
 	return m.closeErr
 }
 
@@ -1322,32 +1340,35 @@ type node struct {
 }
 
 type fileHandle struct {
-	node         *node
-	token        []byte
-	openFlags    uint32
-	buffered     bool
-	stale        atomic.Bool
-	lossMu       sync.Mutex
-	lossObserved uint64
-	once         sync.Once
-	closeOutcome resourceCleanupError
+	node             *node
+	token            []byte
+	openFlags        uint32
+	buffered         bool
+	stale            atomic.Bool
+	lossMu           sync.Mutex
+	lossObserved     uint64
+	lossObserver     func()
+	lossObserverOnce sync.Once
+	once             sync.Once
+	closeOutcome     resourceCleanupError
 }
 
 type dirHandle struct {
-	node             *node
-	stale            atomic.Bool
-	barrierLoss      uint64
-	rootBarrier      bool
-	token            []byte
-	mu               sync.Mutex
-	cookie           []byte
-	verifier         []byte
-	page             []*authoritypb.Dirent
-	pageStamp        subscriptionStamp
-	index            int
-	cursorGeneration uint64
-	fetching         bool
-	fetchDone        chan struct{}
+	node              *node
+	stale             atomic.Bool
+	barrierLoss       uint64
+	rootBarrier       bool
+	token             []byte
+	mu                sync.Mutex
+	cookie            []byte
+	verifier          []byte
+	page              []*authoritypb.Dirent
+	pageStamp         subscriptionStamp
+	pageMetadataClock uint64
+	index             int
+	cursorGeneration  uint64
+	fetching          bool
+	fetchDone         chan struct{}
 	// next is the kernel offset this handle will resume from. A READDIR that
 	// asks for exactly this offset continues out of the buffered page instead
 	// of discarding it and re-fetching from the authority.
@@ -1702,7 +1723,8 @@ func (n *node) Open(ctx context.Context, flags uint32) (*fileHandle, uint32, sys
 		if err != nil {
 			return nil, 0, syscall.EIO
 		}
-		state := n.mount.delegations.state(id)
+		state := n.mount.delegations.retainState(id, true)
+		defer n.mount.delegations.releaseState(state)
 		if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
 			return nil, 0, bufferErrno(err)
 		}
@@ -1891,6 +1913,7 @@ func (h *fileHandle) close(ctx context.Context, lockOwner uint64, flockUnlock bo
 }
 
 func (h *fileHandle) closeForCleanup(ctx context.Context, lockOwner uint64, flockUnlock bool) resourceCleanupError {
+	defer h.endLossObservation()
 	if h != nil && h.node != nil && h.node.mount != nil {
 		// Closing any descriptor releases this owner's POSIX locks on the inode,
 		// even when the Authority close itself is refused or its result is lost.
@@ -1950,6 +1973,16 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 	if h.stale.Load() {
 		return nil, nil, syscall.EIO
 	}
+	if wantItems && h.page != nil && h.pageMetadataClock != h.node.mount.delegations.metadataClock.Load() {
+		// A buffered PLUS page can outlive a local grant's clean release;
+		// own writes are omitted from this mount's change stream. Resume its
+		// remaining names from storage after any ownership transition.
+		h.discardPageItemsLocked()
+		h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
+		h.pageStamp = subscriptionStamp{}
+		h.eof = false
+		h.cursorGeneration++
+	}
 	if h.pageStamp.incarnation != 0 {
 		identity, _ := publicationIdentityFromItem(h.node.item)
 		if h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemEnumeration, item: identity}, h.pageStamp, h.pageStamp.version, time.Now()) <= 0 {
@@ -1998,6 +2031,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			}
 			generation := h.cursorGeneration
 			pageStamp := h.node.mount.subscription.stamp()
+			metadataClock := h.node.mount.delegations.metadataClock.Load()
 			requestCookie := cloneBytes(h.cookie)
 			directoryIdentity, identityOK := publicationIdentityFromItem(h.node.item)
 			var heldIdentities [][]byte
@@ -2057,6 +2091,7 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			// reply stamp keeps the oldest version, but each buffered page owns
 			// its own RPC admission stamp and served version.
 			h.pageStamp = pageStamp.withVersion(response.GetVolumeVersion())
+			h.pageMetadataClock = metadataClock
 			if wantItems && h.node.mount.raw != nil {
 				if err := h.node.mount.raw.stageDirectoryPageHint(ctx, directoryIdentity, requestCookie, h.pageStamp, h.page); err != nil {
 					return nil, nil, syscall.EIO
@@ -2319,6 +2354,11 @@ func (h *dirHandle) closeForCleanup(ctx context.Context) resourceCleanupError {
 }
 
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*authoritypb.Item, *fileHandle, uint32, syscall.Errno) {
+	grantRequest, err := n.mount.delegations.beginGrantRequest()
+	if err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	defer n.mount.delegations.endGrantRequest(grantRequest)
 	openFlags, errno := protocolOpenFlags(flags)
 	if errno != 0 {
 		return nil, nil, 0, errno
@@ -2331,7 +2371,8 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32) (*au
 		if err != nil {
 			return nil, nil, 0, syscall.EIO
 		}
-		state := n.mount.delegations.state(id)
+		state := n.mount.delegations.retainState(id, true)
+		defer n.mount.delegations.releaseState(state)
 		if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
 			return nil, nil, 0, bufferErrno(err)
 		}
@@ -2453,7 +2494,11 @@ func (n *node) Tmpfile(ctx context.Context, flags, mode uint32) (*authoritypb.It
 		return nil, nil, 0, syscall.EIO
 	}
 	child := &node{mount: n.mount, item: item, requestTimeout: n.requestTimeout, maxRead: n.maxRead, maxWrite: n.maxWrite}
-	return item, &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags}, portableOpenFlags(flags, false), 0
+	handle := &fileHandle{node: child, token: cloneBytes(created.GetHandle()), openFlags: flags}
+	if err := child.registerDelegatedHandle(handle, nil); err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	return item, handle, portableOpenFlags(flags, false), 0
 }
 
 // Mknod exists so that mkfifo(3) and bind(2) on a unix domain socket inside the
@@ -2843,22 +2888,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 			_ = lease.markCallbackPublicationReady()
 			return syscall.EIO
 		}
-		base, ok := n.mount.delegations.BaseAttr(n.item.GetStableIdentity())
-		if !ok {
-			// LOOKUP attributes can predate the delegation's ownership interval.
-			// Preserve untouched fields from the current Authority image.
-			response, errno := n.read(ctx, &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Item: cloneBytes(n.item.GetToken())}}})
-			if errno != 0 || response.GetGetAttr().GetAttr() == nil {
-				_ = lease.markCallbackPublicationReady()
-				if errno != 0 {
-					return errno
-				}
-				return syscall.EIO
-			}
-			base = response.GetGetAttr().GetAttr()
-			n.mount.delegations.SetBaseAttr(n.item.GetStableIdentity(), base, response.GetGetAttr().GetObjectVersion())
-		}
-		return n.overlayAttr(base, out)
+		return n.Getattr(ctx, fh, out)
 	}
 synchronousSetattr:
 	gate, err := itemSourceGate(n.item, request.Size != nil)
@@ -2881,6 +2911,9 @@ synchronousSetattr:
 	object := postStateObject(state, identity, postStateRoleTarget)
 	if object == nil {
 		return syscall.EIO
+	}
+	if prepared, errno := n.publishHolderAttr(ctx, object.GetAttr(), object.GetObjectVersion(), out); prepared || errno != 0 {
+		return errno
 	}
 	fillAttr(object.GetAttr(), &out.Attr, n.mount.uid, n.mount.gid)
 	out.SetTimeout(0)

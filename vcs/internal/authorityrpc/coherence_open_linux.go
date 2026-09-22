@@ -55,7 +55,25 @@ func (h *VolumeHandler) coherenceCloseAccounting(id volumeserver.SessionID, hand
 	}
 }
 
-func (h *VolumeHandler) coherenceReserveCreated(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability, request *authoritypb.CreateRequest, existed bool) error {
+func (h *VolumeHandler) coherenceCreateCapacity(id volumeserver.SessionID, request *authoritypb.CreateRequest, existed bool) (*volumeserver.DelegationCapacity, error) {
+	if existed || !request.GetWriteIntent() {
+		return nil, nil
+	}
+	profile, err := h.sessionFrontendProfile(id)
+	if err != nil {
+		return nil, err
+	}
+	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES || !request.GetFlags().GetWrite() {
+		return nil, syscall.EINVAL
+	}
+	token, err := h.coherenceToken(id)
+	if err != nil {
+		return nil, err
+	}
+	return h.Coherence.ReserveDelegationCapacity(token)
+}
+
+func (h *VolumeHandler) coherenceReserveCreated(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability, request *authoritypb.CreateRequest, existed bool, capacity *volumeserver.DelegationCapacity) error {
 	if !request.GetWriteIntent() {
 		return nil
 	}
@@ -73,11 +91,7 @@ func (h *VolumeHandler) coherenceReserveCreated(ctx context.Context, id volumese
 	if err != nil {
 		return err
 	}
-	token, err := h.coherenceToken(id)
-	if err != nil {
-		return err
-	}
-	reservation, err := h.Coherence.ReserveNew(token, identity)
+	reservation, err := capacity.ReserveNew(identity)
 	if err == nil {
 		ctx.Value(coherenceOperationKey{}).(*coherenceOperation).reservation = reservation
 	}
@@ -181,7 +195,7 @@ func (h *VolumeHandler) coherenceOpen(ctx context.Context, req *authoritypb.Requ
 		if delegationReservation != nil {
 			grant, err = delegationReservation.Grant(ctx)
 			if err == nil {
-				err = h.rememberCoherenceDelegation(grant)
+				err = h.validateCoherenceDelegation(grant)
 			}
 			if err != nil {
 				if grant.ID != 0 {

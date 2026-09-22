@@ -177,8 +177,8 @@ func TestTargetedWithdrawalDeadlineDoesNotMoveWithRenewal(t *testing.T) {
 	go func() { done <- c.WaitTargeted(t.Context(), w) }()
 	for range 3 {
 		clock.Advance(3 * time.Second)
-		if _, err := c.Renew(peer.Token); err != nil {
-			t.Fatal(err)
+		if horizon, err := c.Renew(peer.Token); err != nil || !horizon.Equal(peer.Horizon) {
+			t.Fatalf("outstanding withdrawal renewal = %v, %v; want original promise %v", horizon, err, peer.Horizon)
 		}
 	}
 	select {

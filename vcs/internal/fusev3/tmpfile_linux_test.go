@@ -59,8 +59,8 @@ func TestSharedTmpfileMapsSlashAndExclusiveThenPublishesAnonymousInode(t *testin
 		t.Fatalf("direct-I/O TMPFILE attempted own-cache notification: %d -> %d", notifications, got)
 	}
 	handleRecord, handle := fixture.raw.acquireFileHandle(out.Fh)
-	if handle == nil || handle.buffered {
-		t.Fatalf("TMPFILE handle buffered=%t", handle != nil && handle.buffered)
+	if handle == nil || handle.buffered || handle.lossObserver == nil {
+		t.Fatalf("TMPFILE handle buffered=%t, missing loss observer=%t", handle != nil && handle.buffered, handle == nil || handle.lossObserver == nil)
 	}
 	fixture.raw.releaseHandleOperation(handleRecord)
 	completeTestReply(t, fixture.raw, unique, fuse.OK)

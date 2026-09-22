@@ -41,6 +41,11 @@ func (r *rawFileSystem) closeCacheCoordinates(ctx context.Context, coordinates [
 		}
 	}
 	for _, publication := range r.replyPublications {
+		for _, state := range publication.holderAdmissions {
+			if _, ok := set[publicationCoordinate{kind: publicationItemAttributes, item: publicationIdentity(state.identity)}]; ok {
+				candidates[publication] = struct{}{}
+			}
+		}
 		for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
 			if _, ok := set[cached]; ok {
 				candidates[publication] = struct{}{}
@@ -206,24 +211,7 @@ func (r *rawFileSystem) publicationRemaining(p *replyPublication, coordinate pub
 // r.mu held, including on cancellation.
 func (r *rawFileSystem) waitFinalizedCacheCoordinateLocked(ctx context.Context, current *replyPublication, coordinate publicationCoordinate) bool {
 	for {
-		var done <-chan struct{}
-		for reservation := range r.cacheReservations[coordinate] {
-			prior := reservation.publication
-			if !reservation.revoked && prior != current && prior.originalFinalized && !prior.originalWrote {
-				superseded := false
-				for _, name := range prior.names {
-					if name.reservation == reservation && name.negativeState != nil && name.negativeState.superseded {
-						superseded = true
-						break
-					}
-				}
-				if superseded {
-					continue
-				}
-				done = prior.originalDoneLocked()
-				break
-			}
-		}
+		done := r.finalizedCacheCoordinateLocked(current, coordinate)
 		if done == nil {
 			return true
 		}
@@ -239,4 +227,23 @@ func (r *rawFileSystem) waitFinalizedCacheCoordinateLocked(ctx context.Context, 
 			return false
 		}
 	}
+}
+
+func (r *rawFileSystem) finalizedCacheCoordinateLocked(current *replyPublication, coordinate publicationCoordinate) <-chan struct{} {
+	for reservation := range r.cacheReservations[coordinate] {
+		prior := reservation.publication
+		if !reservation.revoked && prior != current && prior.originalFinalized && !prior.originalWrote {
+			superseded := false
+			for _, name := range prior.names {
+				if name.reservation == reservation && name.negativeState != nil && name.negativeState.superseded {
+					superseded = true
+					break
+				}
+			}
+			if !superseded {
+				return prior.originalDoneLocked()
+			}
+		}
+	}
+	return nil
 }

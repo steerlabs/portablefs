@@ -67,7 +67,7 @@ func TestReauthorizeCommandDeliversCredentialToExactLiveFuseSupervisor(t *testin
 		func(_ context.Context, token string, sequence uint64, certificate []byte) (time.Time, error) {
 			observed <- observedRequest{token: token, sequence: sequence, certificate: string(certificate)}
 			return deadline, nil
-		},
+		}, nil,
 	)
 	if err != nil {
 		t.Fatal(err)

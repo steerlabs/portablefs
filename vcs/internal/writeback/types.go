@@ -123,6 +123,12 @@ type FlushCycleObserver interface {
 	FlushCycleCompleted(context.Context, Identity)
 }
 
+// IdleObserver is notified outside buffer locks after internal flush references
+// are released. Owners may then reclaim an otherwise unreferenced identity.
+type IdleObserver interface {
+	BufferIdle(Identity)
+}
+
 type Options struct {
 	// InitialLossSequence carries the mount counter across an epoch replacement.
 	InitialLossSequence uint64
@@ -137,11 +143,13 @@ type Options struct {
 }
 
 type Stats struct {
-	WaitingAdmissions          int
-	Bytes                      int64
-	Entries                    int
-	Accepted, Applied, Visible int
-	LossSequence               uint64
+	WaitingAdmissions               int
+	Bytes                           int64
+	AcceptedBytes                   int64
+	Entries                         int
+	Accepted, Applied, Visible      int
+	Identities, Flushing, Scheduled int
+	LossSequence                    uint64
 }
 
 type DropReport struct {

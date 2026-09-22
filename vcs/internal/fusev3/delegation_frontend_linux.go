@@ -49,7 +49,8 @@ func (n *node) registerDelegatedHandle(handle *fileHandle, grant *authoritypb.De
 			return err
 		}
 	}
-	handle.lossObserved = manager.IdentityLoss(n.item.GetStableIdentity())
+	handle.lossObserved = manager.beginLossObserver(n.item.GetStableIdentity())
+	handle.lossObserver = func() { manager.endLossObserver(n.item.GetStableIdentity()) }
 	return nil
 }
 
@@ -66,7 +67,8 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 	if err != nil {
 		return err
 	}
-	state := n.mount.delegations.state(id)
+	state := n.mount.delegations.retainState(id, true)
+	defer n.mount.delegations.releaseState(state)
 	if err := state.lockAfterRelease(ctx, delegationAcquire); err != nil {
 		return err
 	}
@@ -135,7 +137,8 @@ func (m *Mount) overlayProtoAttr(identity []byte, base *authoritypb.Attr, versio
 	}
 	manager.epoch.RLock()
 	defer manager.epoch.RUnlock()
-	state := manager.lookupState(id)
+	state := manager.retainState(id, false)
+	defer manager.releaseState(state)
 	if manager.incarnation() == 0 || state == nil {
 		return proto.Clone(base).(*authoritypb.Attr), nil
 	}

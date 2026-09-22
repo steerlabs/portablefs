@@ -165,9 +165,16 @@ func TestReadDirPlusPhysicalFailureRollsBackCursorAndLookups(t *testing.T) {
 		t.Fatal("cursor did not advance provisionally")
 	}
 	raw.ReplyWritten(unique, fuse.EIO)
-	if handle.next != 0 || handle.plusReply != nil {
-		t.Fatalf("failed reply retained cursor: next=%d tx=%v", handle.next, handle.plusReply)
+	handle.mu.Lock()
+	next, pending := handle.next, handle.plusReply
+	handle.mu.Unlock()
+	if next != 0 || pending != nil {
+		t.Fatalf("failed reply retained cursor: next=%d tx=%v", next, pending)
 	}
+	// Failed physical publication also starts asynchronous mount withdrawal.
+	// Inspect the registry under its lock while that withdrawal drains caches.
+	raw.mu.RLock()
+	defer raw.mu.RUnlock()
 	if len(raw.cachedNames) != 0 || len(raw.cachedAttrs) != 0 {
 		t.Fatal("failed reply installed daemon metadata")
 	}

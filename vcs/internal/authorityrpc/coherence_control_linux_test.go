@@ -5,6 +5,7 @@ package authorityrpc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -342,7 +343,7 @@ func TestCoherenceDelegationBreakRecallAcksValidateTicketIdentityAndReplay(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.rememberCoherenceDelegation(grant); err != nil {
+	if err := handler.validateCoherenceDelegation(grant); err != nil {
 		t.Fatal(err)
 	}
 	flush, err := coordinator.BeginFlush(token, identity, grant.ID, grant.Generation)
@@ -437,7 +438,7 @@ func TestCoherenceDelegationModeAckControlsTransition(t *testing.T) {
 	if grant.Mode != volumeserver.DelegationWritethrough {
 		t.Fatalf("grant mode = %v", grant.Mode)
 	}
-	if err := handler.rememberCoherenceDelegation(grant); err != nil {
+	if err := handler.validateCoherenceDelegation(grant); err != nil {
 		t.Fatal(err)
 	}
 	publishPeerControlChange(coordinator)
@@ -483,7 +484,7 @@ func TestCoherenceDelegationReleaseIsAtomicReplaySafeAndGenerationChecked(t *tes
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := handler.rememberCoherenceDelegation(grant); err != nil {
+		if err := handler.validateCoherenceDelegation(grant); err != nil {
 			t.Fatal(err)
 		}
 		grants = append(grants, grant)
@@ -587,7 +588,7 @@ func TestCoherenceReleaseCompletesRacingBreak(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := handler.rememberCoherenceDelegation(grant); err != nil {
+			if err := handler.validateCoherenceDelegation(grant); err != nil {
 				t.Fatal(err)
 			}
 			publishPeerControlChange(coordinator)
@@ -738,7 +739,7 @@ func TestCoherenceLongLivedControlReplayRetiresOnlyExplicitReceipts(t *testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := handler.rememberCoherenceDelegation(grant); err != nil {
+		if err := handler.validateCoherenceDelegation(grant); err != nil {
 			t.Fatal(err)
 		}
 		publishPeerControlChange(coordinator)
@@ -775,9 +776,12 @@ func TestCoherenceLongLivedControlReplayRetiresOnlyExplicitReceipts(t *testing.T
 			t.Fatal("poll delivery retired ACK replay", response)
 		}
 		ackChange(released)
+		if _, err := coordinator.LookupOwnedDelegation(token, grant.ID, grant.Generation); !errors.Is(err, volumeserver.ErrDelegationStale) {
+			t.Fatalf("released grant retained: %v", err)
+		}
 		state := handler.initCoherenceControlState().sessions[id]
-		if len(state.obligations) > 1 || len(state.delegations) != 0 || state.releaseReplay == nil || state.releaseReplay.sequence != sequence {
-			t.Fatalf("retained history: obligations=%d grants=%d replay=%v", len(state.obligations), len(state.delegations), state.releaseReplay)
+		if len(state.obligations) > 1 || state.releaseReplay == nil || state.releaseReplay.sequence != sequence {
+			t.Fatalf("retained history: obligations=%d replay=%v", len(state.obligations), state.releaseReplay)
 		}
 	}
 }
@@ -906,7 +910,7 @@ func TestCoherencePollDoesNotClearAliasedFrameLeftover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := handler.rememberCoherenceDelegation(grant); err != nil {
+	if err := handler.validateCoherenceDelegation(grant); err != nil {
 		t.Fatal(err)
 	}
 	publishPeerControlChange(coordinator)

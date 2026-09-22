@@ -68,7 +68,8 @@ func (m *delegationManager) localFullFlush(identity []byte, observed uint64) (bo
 	if m.incarnation() == 0 {
 		return false, observed, 0
 	}
-	s := m.lookupState(id)
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
 	if s == nil {
 		return false, observed, 0
 	}
