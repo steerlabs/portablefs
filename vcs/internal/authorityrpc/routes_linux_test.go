@@ -61,7 +61,6 @@ func newTestCoordination(store *xfsstore.Volume, fencer volumeserver.SessionFenc
 		Store: store, Fencer: fencer, Locks: locks, Membership: noopMembership{},
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Second,
 		MaxCachedNameCapacity: 1 << 16, MaxRepairBudget: time.Minute,
-		CacheLeaseTTL: time.Second, MaxCacheLeasesPerSession: 4096, MaxCacheLeases: 16384,
 	})
 }
 
@@ -153,18 +152,12 @@ func loadedCoordinationFor(rules string, fencer volumeserver.SessionFencer,
 	if err != nil {
 		panic(err)
 	}
-	leases, err := volumeserver.NewLeaseCoordinator(volumeserver.LeaseConfig{
-		TTL: time.Second, RecallBudget: time.Second, MaxPerHolder: 4096, MaxTotal: 16384,
-		PriorGrantsFenced: true, Fencer: fencer,
-	})
-	if err != nil {
-		panic(err)
-	}
+
 	routes := &RoutesController{
-		Mounts: lifecycle, Leases: leases, Locks: volumeserver.NewLockTable(1024, 1024, time.Now),
+		Mounts: lifecycle, Locks: volumeserver.NewLockTable(1024, 1024, time.Now),
 		loaded: true, revision: parsed.Revision(), canonical: parsed.Canonical(),
 	}
-	return &Coordination{Lifecycle: lifecycle, Visibility: visibility, Leases: leases, Routes: routes}
+	return &Coordination{Lifecycle: lifecycle, Visibility: visibility, Routes: routes}
 }
 
 func routesRevisionOf(rules string) [32]byte {
@@ -719,7 +712,7 @@ func TestRoutesControllerTreatsRenameAsPublishedWhenDirectorySyncFails(t *testin
 	if !errors.Is(err, xfsstore.ErrOutcomeUncertain) {
 		t.Fatalf("post-rename sync failure = %v, want ErrOutcomeUncertain", err)
 	}
-	// A protocol-6 route change runs only at clean mount absence, so there is no
+	// A protocol-7 route change runs only at clean mount absence, so there is no
 	// barrier audience to carry an "applied anyway" flag: the durable commit's own
 	// uncertainty is the whole error surface, and the active revision below is
 	// what an operator re-reads to learn the change took.

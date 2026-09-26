@@ -22,7 +22,7 @@ func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
 	if proofs != 0 {
 		t.Fatalf("strict mount detached with %d proofs and no exact observation", proofs)
 	}
-	fixture.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent-portablefs-mount"}
+	fixture.mount.kernelMount = kernelMount{id: "999999999", device: "0:999", point: "/nonexistent-portablefs-mount", filesystem: "fuse.portablefs", source: "portablefs:unit-lifecycle"}
 	done := make(chan struct{})
 	close(done)
 	fixture.mount.kernelConnectionDone = done
@@ -42,7 +42,7 @@ func TestStrictDetachRequiresObservedMountAbsence(t *testing.T) {
 
 func TestStrictDetachWaitsForTheExactFUSEConnection(t *testing.T) {
 	fixture := newStrictFixture(t)
-	fixture.mount.kernelMount = kernelMount{id: "999999998", device: "0:998", point: "/nonexistent-portablefs-lazy-mount"}
+	fixture.mount.kernelMount = kernelMount{id: "999999998", device: "0:998", point: "/nonexistent-portablefs-lazy-mount", filesystem: "fuse.portablefs", source: "portablefs:unit-lifecycle"}
 	fixture.mount.kernelConnectionDone = make(chan struct{})
 	result := make(chan error, 1)
 	go func() { result <- fixture.mount.detach() }()
@@ -66,7 +66,7 @@ func TestStrictDetachWaitsForTheExactFUSEConnection(t *testing.T) {
 
 func TestStrictClosePreservesDetachDeliveryFailure(t *testing.T) {
 	fixture := newStrictFixture(t)
-	fixture.mount.kernelMount = kernelMount{id: "999999997", device: "0:997", point: "/nonexistent-portablefs-detach-failure"}
+	fixture.mount.kernelMount = kernelMount{id: "999999997", device: "0:997", point: "/nonexistent-portablefs-detach-failure", filesystem: "fuse.portablefs", source: "portablefs:unit-lifecycle"}
 	done := make(chan struct{})
 	close(done)
 	fixture.mount.kernelConnectionDone = done

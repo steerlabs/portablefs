@@ -66,7 +66,7 @@ private func makeWiringHarness(
     let registry = PfsMacOS26RepairArmRegistry(authenticator: authenticator)
     let contract = cachePolicy.map { policy in
         PfsMacOSV3LocalContract(
-            authorityProtocolMajor: 6,
+            authorityProtocolMajor: 7,
             epoch: wiringEpoch,
             sessionID: wiringLocalSession,
             cachePolicy: policy,
@@ -1093,7 +1093,7 @@ extension PfsLocalMockDaemonTests {
 
 private func wiringV3Contract(repairBudgetMillis: UInt64 = 2_500) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 6
+    contract.authorityProtocolMajor = 7
     contract.authorityEpoch = wiringEpoch
     contract.sessionID = wiringLocalSession
     contract.cachePolicy = PfsMacOSCachePolicy.synchronousVFSRepairV2.rawValue

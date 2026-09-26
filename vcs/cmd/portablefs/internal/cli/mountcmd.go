@@ -1759,20 +1759,27 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			initialAuthorizationDeadline = authorityDeadline
 		}
 		state.AuthorizationSessionID = authorizationSessionID
+		var externalReauthorization fuseReauthorizationHandler
 		if enrollmentClient == nil {
-			reauthorizationControl, err = startFuseReauthorizationControl(
-				func(ctx context.Context, token string, sequence uint64, certificatePEM []byte) (time.Time, error) {
-					return m.Reauthorize(ctx, token, sequence, certificatePEM)
-				},
-			)
-			if err != nil {
-				return cleanupMountedFUSE(err)
-			}
-			state.ReauthorizationControlSocket = reauthorizationControl.SocketPath()
+			externalReauthorization = m.Reauthorize
 		} else {
 			state.MountEnrollmentID = o.enrollmentID
 			state.AuthorizationDeadlineAtMs = initialAuthorizationDeadline.UnixMilli()
 		}
+		// Every Linux supervisor exposes the exact live loss counter. Automatic
+		// enrollment still owns renewal exclusively; a nil renewal handler makes
+		// that policy hold at the socket as well as the public CLI.
+		reauthorizationControl, err = startFuseReauthorizationControl(externalReauthorization, func() (mountLossSnapshot, error) {
+			stats := m.WritebackStats()
+			if stats == nil {
+				return mountLossSnapshot{}, errors.New("live writeback state unavailable")
+			}
+			return mountLossSnapshot{MountInstanceID: mountInstanceID, LossSequence: strconv.FormatUint(stats.LossSequence, 10)}, nil
+		})
+		if err != nil {
+			return cleanupMountedFUSE(err)
+		}
+		state.ReauthorizationControlSocket = reauthorizationControl.SocketPath()
 		ready.AuthorizationSessionID = authorizationSessionID
 		if err := writeMountState(stateDir, state); err != nil {
 			return cleanupMountedFUSE(err)
@@ -1788,7 +1795,7 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 			renewer := &mountenrollment.Renewer{
 				Source: enrollmentClient,
 				Observe: func(event mountenrollment.RenewalEvent) {
-					recordFUSERenewalEvent(renewalEvents, stateDir, mountPath, o.enrollmentID, event)
+					recordFUSERenewalEvent(renewalEvents, stateDir, mountPath, o.enrollmentID, event, m.WritebackStats())
 				},
 			}
 			go func() {
@@ -2171,8 +2178,8 @@ func (e *cmdEnv) runMountForeground(o *mountOpts, volumeID, mountPath, stateDir 
 	}
 }
 
-func recordFUSERenewalEvent(events *mountlog.Writer, stateDir, mountPath, enrollmentID string, event mountenrollment.RenewalEvent) {
-	if err := events.WriteRenewal(event); err != nil {
+func recordFUSERenewalEvent(events *mountlog.Writer, stateDir, mountPath, enrollmentID string, event mountenrollment.RenewalEvent, writeback *mountlog.WritebackStats) {
+	if err := events.WriteRenewal(event, writeback); err != nil {
 		log.Printf("portablefs mount: write renewal event: %v", err)
 	}
 	status := event.Status
@@ -3637,6 +3644,7 @@ func stopMountDaemon(st *mountState) error {
 // cannot be named cannot be tested.
 type mountInventoryRow struct {
 	MountPath              string   `json:"mountPath"`
+	MountInstanceID        string   `json:"mountInstanceId,omitempty"`
 	VolumeID               string   `json:"volumeId"`
 	Branch                 string   `json:"branch"`
 	PID                    int      `json:"pid"`
@@ -3733,6 +3741,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			AuthorityURL:              st.AuthorityURL,
 			AttachRef:                 st.AttachRef,
 			AuthorizationSessionID:    st.AuthorizationSessionID,
+			MountInstanceID:           st.MountInstanceID,
 			StartedAtMs:               st.StartedAtMs,
 			LocalDirs:                 st.LocalDirs,
 			LocalRoutes:               st.LocalRoutes,
@@ -3778,6 +3787,7 @@ func cmdMounts(e *cmdEnv, args []string) int {
 			Health:          "cleanup-required",
 			CleanupRequired: true,
 			OperationPhase:  intent.Phase,
+			MountInstanceID: intent.MountInstanceID,
 		})
 	}
 	if o.jsonOut {

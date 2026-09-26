@@ -47,6 +47,26 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationUnknown
 	}
 	switch request.GetBody().(type) {
+	case *authoritypb.Request_Subscribe:
+		return authoritymetrics.OperationSubscribe
+	case *authoritypb.Request_RenewSubscription:
+		return authoritymetrics.OperationRenewSubscription
+	case *authoritypb.Request_NextControlEvent:
+		return authoritymetrics.OperationNextControlEvent
+	case *authoritypb.Request_ChangeAck:
+		return authoritymetrics.OperationChangeAck
+	case *authoritypb.Request_DelegationRecallAck:
+		return authoritymetrics.OperationDelegationRecallAck
+	case *authoritypb.Request_DelegationBreakAck:
+		return authoritymetrics.OperationDelegationBreakAck
+	case *authoritypb.Request_DelegationModeChangeAck:
+		return authoritymetrics.OperationDelegationModeChangeAck
+	case *authoritypb.Request_DelegationRelease:
+		return authoritymetrics.OperationDelegationRelease
+	case *authoritypb.Request_Barrier:
+		return authoritymetrics.OperationBarrier
+	case *authoritypb.Request_WaitVisibility:
+		return authoritymetrics.OperationWaitVisibility
 	case *authoritypb.Request_Hello:
 		return authoritymetrics.OperationHello
 	case *authoritypb.Request_Attach:
@@ -95,7 +115,7 @@ func requestOperation(request *authoritypb.Request) authoritymetrics.Operation {
 		return authoritymetrics.OperationReadlink
 	case *authoritypb.Request_Open:
 		return authoritymetrics.OperationOpen
-	case *authoritypb.Request_Close:
+	case *authoritypb.Request_Close, *authoritypb.Request_CloseBatch:
 		return authoritymetrics.OperationClose
 	case *authoritypb.Request_Read:
 		return authoritymetrics.OperationRead

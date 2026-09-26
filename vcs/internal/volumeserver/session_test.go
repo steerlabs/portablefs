@@ -863,6 +863,46 @@ func TestIndependentReplaySlotsExecuteConcurrently(t *testing.T) {
 	}
 }
 
+func TestSweepHooksRunAfterExpiredSessionCleanup(t *testing.T) {
+	a, now := testAuthority(t)
+	cred, err := a.AttachActiveForTest(1, PeerIdentity{1}, testAuthorization(AccessRead))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := false
+	a.OnSessionEnd(func(id SessionID) {
+		if id == cred.ID {
+			ended = true
+		}
+	})
+	called := 0
+	a.OnSweep(nil)
+	a.OnSweep(func() {
+		called++
+		if !ended {
+			t.Error("sweep hook ran before expired-session cleanup")
+		}
+		// Reentry proves the hook runs outside the Authority mutex.
+		if state, ok := a.SessionStateByID(cred.ID); ok || state != SessionStateUnknown {
+			t.Errorf("expired session remains visible to sweep hook: (%v, %t)", state, ok)
+		}
+	})
+
+	*now = now.Add(3 * time.Minute)
+	if swept := a.Sweep(); swept != 1 {
+		t.Fatalf("Sweep = %d, want 1", swept)
+	}
+	if called != 1 {
+		t.Fatalf("sweep hook calls = %d, want 1", called)
+	}
+
+	ended = true
+	a.Sweep()
+	if called != 2 {
+		t.Fatalf("sweep hook calls after idle sweep = %d, want 2", called)
+	}
+}
+
 // TestBlockingLockAcrossASweepIsNotGranted is the sequence the authority is
 // deployed into: the connection idle timeout is required to exceed the session
 // lease, so a swept session's connection and request contexts stay alive for

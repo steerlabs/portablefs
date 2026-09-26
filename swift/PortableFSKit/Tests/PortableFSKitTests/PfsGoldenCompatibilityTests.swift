@@ -108,6 +108,25 @@ private func assertFrameRoundTrip(_ envelope: PfsEnvelope, golden: Data) throws 
     try assertFrameRoundTrip(expectedEnvelope, golden: frame)
 }
 
+@Test func goV7ResolveContractGoldenIsAcceptedByTheShippingParser() throws {
+    let frame = try goldenFrame("v7_resolve_contract.hex")
+    let envelope = try decodeSingleGoldenEnvelope(frame)
+    #expect(envelope.requestID == 7)
+    guard case let .resolveReply(reply)? = envelope.body else {
+        Issue.record("expected ResolveReply carrying the daemon coherence contract")
+        return
+    }
+    #expect(reply.hasV3Coherence)
+    let parsed = try PfsLocalMacOSV3CoherenceTransport.parseContract(reply.v3Coherence)
+    #expect(parsed.authorityProtocolMajor == 7)
+    #expect(parsed.epoch == Data(repeating: 0x11, count: 16))
+    #expect(parsed.sessionID == Data(repeating: 0x22, count: 16))
+    #expect(parsed.cachePolicy.rawValue == "fskit-native-revocation-v1")
+    #expect(parsed.repairBudgetMillis == 60_000)
+    #expect(parsed.initialAcknowledgedCursor == .init(sequence: 10, phase: .complete))
+    try assertFrameRoundTrip(envelope, golden: frame)
+}
+
 /// Protocol minor 6's retraction bit is an ENVELOPE field, so unlike every
 /// other cross-language fixture its whole job is to pin the four scalars that
 /// precede the body: request_id, publication_ack_required, operation_id,

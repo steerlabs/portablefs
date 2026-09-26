@@ -91,12 +91,28 @@ func (h *countingHandler) filesystem() map[string]int {
 	out := make(map[string]int, len(h.byKind))
 	for kind, count := range h.byKind {
 		switch kind {
-		case "keepalive", "next-visibility", "ack-visibility", "reclaim":
+		case "keepalive", "next-control-event", "change-ack", "reclaim":
 			continue
 		}
 		out[kind] = count
 	}
 	return out
+}
+
+func TestGraftRequestCounterExcludesOnlyBackgroundTraffic(t *testing.T) {
+	h := &countingHandler{byKind: map[string]int{
+		"keepalive": 1, "next-control-event": 2, "change-ack": 3, "reclaim": 4,
+		"lookup": 5, "getattr": 6, "create": 7, "write": 8, "other": 9,
+	}}
+	counts := h.filesystem()
+	if len(counts) != 5 {
+		t.Fatalf("filesystem requests include background traffic: %v", counts)
+	}
+	for kind, want := range map[string]int{"lookup": 5, "getattr": 6, "create": 7, "write": 8, "other": 9} {
+		if counts[kind] != want {
+			t.Fatalf("filesystem counter omitted %s: %v", kind, counts)
+		}
+	}
 }
 
 // warmVolumePath resolves a shared path so that walking through it costs
@@ -397,8 +413,8 @@ func TestARoutingChangeIsRefusedWhileAnyMountIsLive(t *testing.T) {
 	// The operator path is refused too, and for a different reason: the mounts
 	// are live. The refusal names clean mount absence, and it is an ordinary
 	// retryable answer rather than a half-applied topology.
-	if _, err := f.routes.Apply(t.Context(), changed.Canonical(), current); !errors.Is(err, volumeserver.ErrLeaseRoutesLive) {
-		t.Fatalf("ApplyRoutes with live mounts = %v, want %v", err, volumeserver.ErrLeaseRoutesLive)
+	if _, err := f.routes.Apply(t.Context(), changed.Canonical(), current); !errors.Is(err, volumeserver.ErrRoutesLive) {
+		t.Fatalf("ApplyRoutes with live mounts = %v, want %v", err, volumeserver.ErrRoutesLive)
 	}
 	if active, err := f.routes.Revision(); err != nil {
 		t.Fatal(err)

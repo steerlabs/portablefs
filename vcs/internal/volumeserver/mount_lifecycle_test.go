@@ -53,7 +53,7 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := leaseTestID(9)
+	id := SessionID{9}
 	terminal := fencer.attach(id)
 	if err := lifecycle.Activate(id, func() error {
 		_, activateErr := visibility.ActivateParticipantInMemory(
@@ -76,7 +76,7 @@ func TestMountLifecycleSolelyOwnsFskitDurableMembership(t *testing.T) {
 		t.Fatalf("durable Deactivate calls = %d, want exactly 1", membership.deactivates)
 	}
 
-	failingID := leaseTestID(10)
+	failingID := SessionID{10}
 	failingTerminal := fencer.attach(failingID)
 	publishErr := errors.New("retain activation reply")
 	if err := lifecycle.Activate(failingID, func() error {
@@ -99,12 +99,12 @@ func TestMountLifecyclePriorUnprovenOnlyBlocksRouteChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := leaseTestID(1)
+	id := SessionID{1}
 	if err := lifecycle.Activate(id, func() error { return nil }); err != nil {
 		t.Fatalf("Activate during prior uncertainty: %v", err)
 	}
-	if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrLeaseRoutesLive) {
-		t.Fatalf("route absence = %v, want %v", err, ErrLeaseRoutesLive)
+	if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrRoutesLive) {
+		t.Fatalf("route absence = %v, want %v", err, ErrRoutesLive)
 	}
 	if _, ok := membership.active[id]; !ok {
 		t.Fatal("new activation was not durably recorded")
@@ -120,7 +120,7 @@ func TestMountLifecycleActivationRollbackAndExactCleanDetach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := leaseTestID(1)
+	id := SessionID{1}
 	publishErr := errors.New("publish failed")
 	if err := lifecycle.Activate(id, func() error { return publishErr }); !errors.Is(err, publishErr) {
 		t.Fatalf("failed Activate = %v, want %v", err, publishErr)
@@ -158,10 +158,10 @@ func TestMountLifecycleFailedDurableActivationRollbackBlocksRoutes(t *testing.T)
 	}
 	membership.removeErr = errors.New("durable deactivate failed")
 	publishErr := errors.New("runtime publish failed")
-	if err := lifecycle.Activate(leaseTestID(1), func() error { return publishErr }); !errors.Is(err, publishErr) || !errors.Is(err, membership.removeErr) {
+	if err := lifecycle.Activate(SessionID{1}, func() error { return publishErr }); !errors.Is(err, publishErr) || !errors.Is(err, membership.removeErr) {
 		t.Fatalf("Activate error = %v, want joined publish and rollback failures", err)
 	}
-	if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrLeaseRoutesLive) {
-		t.Fatalf("route absence after failed durable rollback = %v, want %v", err, ErrLeaseRoutesLive)
+	if err := lifecycle.RequireCleanRouteAbsence(); !errors.Is(err, ErrRoutesLive) {
+		t.Fatalf("route absence after failed durable rollback = %v, want %v", err, ErrRoutesLive)
 	}
 }

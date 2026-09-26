@@ -286,7 +286,7 @@ func TestRevocationReportClassifiesItsCause(t *testing.T) {
 		cause error
 		want  string
 	}{
-		{"repair budget", fmt.Errorf("%w (15s)", errRepairBudgetExceeded), RevocationRepairBudgetExceeded},
+		{"repair budget", errors.New("fusev3: cache withdrawal deadline exceeded (15s)"), RevocationCoherenceViolation},
 		{"routes changed", routesChangeCause(make([]byte, 32), make([]byte, 32)), RevocationRoutesChanged},
 		{"session ended", fmt.Errorf("fusev3: %w", authorityrpc.ErrSessionEnded), RevocationSessionTerminal},
 		{"anything else", errors.New("fusev3: publication lost its ownership"), RevocationCoherenceViolation},
@@ -310,7 +310,7 @@ func TestRevocationIsReportedOnceWithTheWithdrawalVerdict(t *testing.T) {
 	mount := revokingMount(t, fake)
 	var reports []RevocationReport
 	mount.onRevoked = func(r RevocationReport) { reports = append(reports, r) }
-	mount.recordFatalCause(fmt.Errorf("%w (15s)", errRepairBudgetExceeded))
+	mount.recordFatalCause(errors.New("fusev3: cache withdrawal deadline exceeded (15s)"))
 
 	out := mount.withdrawKernelState()
 	mount.reportRevocation(out)
@@ -321,8 +321,8 @@ func TestRevocationIsReportedOnceWithTheWithdrawalVerdict(t *testing.T) {
 		t.Fatalf("reports = %d, want exactly 1", len(reports))
 	}
 	report := reports[0]
-	if report.Reason != RevocationRepairBudgetExceeded {
-		t.Fatalf("reason = %q, want %q", report.Reason, RevocationRepairBudgetExceeded)
+	if report.Reason != RevocationCoherenceViolation {
+		t.Fatalf("reason = %q, want %q", report.Reason, RevocationCoherenceViolation)
 	}
 	if report.KernelStateWithdrawn {
 		t.Fatal("a stranded kernel mount was reported as withdrawn; this is the exact lie being removed")

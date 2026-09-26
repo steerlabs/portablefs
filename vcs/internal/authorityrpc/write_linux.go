@@ -133,23 +133,28 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 		}
 	}()
 
-	prepare := func() ([]volumeserver.VisibilityTarget, error) {
+	admit := func() error {
 		if metadataErr != nil {
-			return nil, metadataErr
+			return metadataErr
 		}
 		var err error
 		resources, err = h.sessionResources(credential.ID)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		terminal, err := h.Runtime.SessionTerminal(credential.ID)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		if err := h.reserveWriteAdmission(ctx, terminal, resources, metadata.requestedSize); err != nil {
-			return nil, err
+		if err = h.reserveWriteAdmission(ctx, terminal, resources, metadata.requestedSize); err != nil {
+			return err
 		}
 		reserved = true
+		return nil
+	}
+	ctx = context.WithValue(ctx, coherenceOperationKey{}, &coherenceOperation{beforeAdmission: admit})
+	prepare := func() ([]volumeserver.VisibilityTarget, error) {
+		var err error
 		store, ok := h.Store.(writeStore)
 		if !ok {
 			return nil, syscall.EOPNOTSUPP
@@ -276,7 +281,7 @@ func (h *VolumeHandler) handleWrite(ctx context.Context, request *authoritypb.Re
 			inodeTarget(volumeserver.VisibilityData, coordinate, post.Size),
 			inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0),
 		}
-	})
+	}, &releaseMutation)
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) && response != nil && response.GetErrno() == 0 && response.GetWrite() == nil {
 		return h.errorResponse(request.GetRequestId(), syscall.ETIMEDOUT, false)
 	}

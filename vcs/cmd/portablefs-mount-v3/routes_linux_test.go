@@ -162,7 +162,6 @@ func newAttachFixture(t *testing.T, declaration string) *attachFixture {
 		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: noMembership{},
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
 		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
-		CacheLeaseTTL: volumeserver.Protocol6MaxLeaseTTL, MaxCacheLeasesPerSession: 65536, MaxCacheLeases: 1 << 20,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)

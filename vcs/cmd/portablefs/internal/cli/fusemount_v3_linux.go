@@ -14,6 +14,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
 	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
+	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 	"github.com/steerlabs/portablefs/vcs/internal/mountv3"
 )
 
@@ -91,6 +92,17 @@ type fuseV3Mount struct {
 func (m *fuseV3Mount) Unmount() error { return m.mount.Unmount() }
 func (m *fuseV3Mount) Wait()          { m.mount.Wait() }
 func (m *fuseV3Mount) Close() error   { return m.mount.Close() }
+func (m *fuseV3Mount) WritebackStats() *mountlog.WritebackStats {
+	s := m.mount.WritebackStats()
+	return &mountlog.WritebackStats{
+		DirtyBytes: s.DirtyBytes, DirtyEntries: s.DirtyEntries,
+		RetainedBytes: s.RetainedBytes, RetainedEntries: s.RetainedEntries,
+		PendingAdmissions: s.PendingAdmissions, FlushingIdentities: s.FlushingIdentities,
+		ScheduledIdentities: s.ScheduledIdentities, TrackedIdentities: s.TrackedIdentities,
+		BufferIdentities: s.BufferIdentities, PendingCloses: s.PendingCloses,
+		DurabilityLag: s.DurabilityLag, LossSequence: s.LossSequence,
+	}
+}
 func (m *fuseV3Mount) AuthorizationSessionID() string {
 	id := m.client.AuthorizationSessionID()
 	empty := true
@@ -163,7 +175,11 @@ func mountFUSEv3(cfg fuseV3Config) (_ *fuseV3Mount, authorityAttached bool, _ er
 		// The mount core derives "portablefs:<mountInstanceID>", the same
 		// instance-bound kernel source mount_identity_linux.go verifies.
 		MountInstanceID: cfg.mountInstanceID, RequestTimeout: mountv3.RequestTimeout,
-		MaxBackground: mountv3.MaxInFlight, MaxInFlight: mountv3.MaxInFlight, ReclaimQueue: mountv3.ReclaimQueue,
+		// The published record, local renewal socket, and Manager enrollment
+		// all belong to this exact session. Replacement requires fresh owner
+		// authorization, after this mount proves its own withdrawal.
+		RequireRemountOnEpochChange: true,
+		MaxBackground:               mountv3.MaxInFlight, MaxInFlight: mountv3.MaxInFlight, ReclaimQueue: mountv3.ReclaimQueue,
 		PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
 		Coherence: profile, CachedNameCapacity: mountv3.CachedNameCapacity, RepairBudget: mountv3.RepairBudget,
 		Routes: rules, LocalBacking: backing,

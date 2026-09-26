@@ -244,9 +244,10 @@ type WriteTarget interface {
 }
 
 type Dirent struct {
-	Name string
-	Kind Kind
-	Ino  uint64
+	NextCookie uint64
+	Name       string
+	Kind       Kind
+	Ino        uint64
 }
 
 type FSStat struct {

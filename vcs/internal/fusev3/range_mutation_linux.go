@@ -40,22 +40,35 @@ func (r *rawFileSystem) Fallocate(_ <-chan struct{}, input *fuse.FallocateIn) fu
 		if held.inode == nil || held.inode.id != input.NodeId || handle.node != held.inode.node {
 			return fuse.EBADF
 		}
+		if handle.stale.Load() || handle.node.stale.Load() {
+			return fuse.EIO
+		}
 		ctx, finish, lifecycle := r.mutationContext(input.Unique)
 		if !lifecycle.Ok() {
 			return lifecycle
 		}
 		defer finish()
+		if err := handle.node.ensureWriteDelegation(ctx, handle); err != nil {
+			return fuse.Status(delegationErrno(err))
+		}
 		gate, err := itemSourceGate(handle.node.item, true)
 		if err != nil {
 			return fuse.EIO
 		}
-		response, errno := handle.node.mutateWithSource(ctx, &authoritypb.Request{
-			Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{
-				Handle: cloneBytes(handle.token), Offset: input.Offset, Length: input.Length, Mode: input.Mode,
-			}},
-		}, gate)
-		if errno != 0 {
-			return fuse.Status(errno)
+		request := func(ref *authoritypb.DelegationRef) *authoritypb.Request {
+			return &authoritypb.Request{Body: &authoritypb.Request_Fallocate{Fallocate: &authoritypb.FallocateRequest{
+				Handle: cloneBytes(handle.token), Offset: input.Offset, Length: input.Length, Mode: input.Mode, Delegation: ref,
+			}}}
+		}
+		response, err := handle.node.withWriteDelegation(ctx, handle, func(ref *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+			candidate, callErrno := handle.node.mutateWithSource(ctx, request(ref), gate)
+			if callErrno != 0 {
+				return candidate, callErrno
+			}
+			return candidate, nil
+		})
+		if err != nil {
+			return fuse.Status(delegationErrno(err))
 		}
 		reply := response.GetFallocate()
 		if reply == nil || response.GetUncertain() {
@@ -139,6 +152,10 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 	if sourceInode.inode == nil || destinationInode.inode == nil || sourceInode.inode.id != input.NodeId || destinationInode.inode.id != input.NodeIdOut {
 		return 0, fuse.EBADF
 	}
+	if sourceShared != nil && (sourceShared.stale.Load() || sourceShared.node.stale.Load()) ||
+		destinationShared != nil && (destinationShared.stale.Load() || destinationShared.node.stale.Load()) {
+		return 0, fuse.EIO
+	}
 	if sourceLocal != nil && destinationLocal != nil {
 		offIn, offOut := int64(input.OffIn), int64(input.OffOut)
 		copied, err := unix.CopyFileRange(sourceLocal.fd, &offIn, destinationLocal.fd, &offOut, int(input.Len), 0)
@@ -158,6 +175,9 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 		return 0, lifecycle
 	}
 	defer finish()
+	if err := destinationShared.node.ensureWriteDelegation(ctx, destinationShared); err != nil {
+		return 0, fuse.Status(delegationErrno(err))
+	}
 	sourceSpec, err := sourceItem(sourceShared.node.item, true, false)
 	if err != nil {
 		return 0, fuse.EIO
@@ -170,13 +190,29 @@ func (r *rawFileSystem) CopyFileRange(_ <-chan struct{}, input *fuse.CopyFileRan
 	if err != nil {
 		return 0, fuse.EIO
 	}
-	response, errno := destinationShared.node.mutateWithSource(ctx, &authoritypb.Request{
-		Body: &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{
-			InputHandle: cloneBytes(sourceShared.token), InputOffset: input.OffIn,
-			OutputHandle: cloneBytes(destinationShared.token), OutputOffset: input.OffOut,
-			Length: input.Len, Flags: uint32(input.Flags),
-		}},
-	}, gate)
+	sourceIdentity := sourceSharedRecord.inode.identity[:]
+	response, err := destinationShared.node.withWriteDelegation(ctx, destinationShared, func(_ *authoritypb.DelegationRef) (*authoritypb.Response, error) {
+		if r.mount.delegations.Owns(sourceIdentity) {
+			if _, flushErr := r.mount.delegations.flushIdentityInEpoch(ctx, sourceIdentity); flushErr != nil {
+				return nil, flushErr
+			}
+		}
+		candidate, callErrno := destinationShared.node.mutateWithSource(ctx, &authoritypb.Request{
+			Body: &authoritypb.Request_CopyFileRange{CopyFileRange: &authoritypb.CopyFileRangeRequest{
+				InputHandle: cloneBytes(sourceShared.token), InputOffset: input.OffIn,
+				OutputHandle: cloneBytes(destinationShared.token), OutputOffset: input.OffOut,
+				Length: input.Len, Flags: uint32(input.Flags),
+			}},
+		}, gate)
+		if callErrno != 0 {
+			return candidate, callErrno
+		}
+		return candidate, nil
+	})
+	if err != nil {
+		return 0, fuse.Status(delegationErrno(err))
+	}
+	var errno syscall.Errno
 	if errno != 0 {
 		return 0, fuse.Status(errno)
 	}

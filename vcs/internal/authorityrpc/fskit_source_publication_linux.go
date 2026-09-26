@@ -73,13 +73,13 @@ func (b *sourceGateBuilder) finish() volumeserver.SourcePublicationGate {
 
 func (resolver *operationResolutionContext) deriveSourcePublicationGate(req *authoritypb.Request, resolveBindings bool) (volumeserver.SourcePublicationGate, error) {
 	var builder sourceGateBuilder
-	addNamespace := func(parentRaw, name []byte, boundAttributes, boundData bool) error {
+	addNamespace := func(parentRaw, name []byte, boundAttributes, boundData, resolveBound bool) error {
 		parent, err := resolver.item(parentRaw)
 		if err != nil {
 			return err
 		}
 		builder.addItem(parent.identity, true, false)
-		if !resolveBindings {
+		if !resolveBindings || !resolveBound {
 			builder.addNamespace(parent.identity, name, boundAttributes, boundData)
 			return nil
 		}
@@ -157,26 +157,26 @@ func (resolver *operationResolutionContext) deriveSourcePublicationGate(req *aut
 		builder.addItem(resolved.identity, true, true)
 	case *authoritypb.Request_Create:
 		truncate := body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate()
-		if err := addNamespace(body.Create.GetParent(), body.Create.GetName(), true, truncate); err != nil {
+		if err := addNamespace(body.Create.GetParent(), body.Create.GetName(), true, truncate, !body.Create.GetExclusive()); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
 	case *authoritypb.Request_Mkdir:
-		if err := addNamespace(body.Mkdir.GetParent(), body.Mkdir.GetName(), true, false); err != nil {
+		if err := addNamespace(body.Mkdir.GetParent(), body.Mkdir.GetName(), true, false, true); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
 	case *authoritypb.Request_Unlink:
-		if err := addNamespace(body.Unlink.GetParent(), body.Unlink.GetName(), true, false); err != nil {
+		if err := addNamespace(body.Unlink.GetParent(), body.Unlink.GetName(), true, false, true); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
 	case *authoritypb.Request_Symlink:
-		if err := addNamespace(body.Symlink.GetParent(), body.Symlink.GetName(), true, false); err != nil {
+		if err := addNamespace(body.Symlink.GetParent(), body.Symlink.GetName(), true, false, true); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
 	case *authoritypb.Request_Rename:
-		if err := addNamespace(body.Rename.GetOldParent(), body.Rename.GetOldName(), true, false); err != nil {
+		if err := addNamespace(body.Rename.GetOldParent(), body.Rename.GetOldName(), true, false, true); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
-		if err := addNamespace(body.Rename.GetNewParent(), body.Rename.GetNewName(), true, false); err != nil {
+		if err := addNamespace(body.Rename.GetNewParent(), body.Rename.GetNewName(), true, false, true); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
 	case *authoritypb.Request_Link:
@@ -185,7 +185,7 @@ func (resolver *operationResolutionContext) deriveSourcePublicationGate(req *aut
 			return volumeserver.SourcePublicationGate{}, err
 		}
 		builder.addItem(source.identity, true, false)
-		if err := addNamespace(body.Link.GetNewParent(), body.Link.GetNewName(), true, false); err != nil {
+		if err := addNamespace(body.Link.GetNewParent(), body.Link.GetNewName(), true, false, true); err != nil {
 			return volumeserver.SourcePublicationGate{}, err
 		}
 	case *authoritypb.Request_Tmpfile:

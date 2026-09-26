@@ -264,7 +264,31 @@ type frameBoundaryWriter interface {
 	endFrameWrite() error
 }
 
-func writeFrame(w io.Writer, max uint32, message proto.Message) (err error) {
+func writeFrame(w io.Writer, max uint32, message proto.Message) error {
+	return writeFrameBulk(w, max, message, nil)
+}
+
+// writeFrameBulk borrows immutable WRITE spans across a single frame boundary.
+// The wire bytes are identical to a contiguous bulk body. No transport may
+// interleave frames between spans, including on same-epoch replay.
+func writeFrameBulk(w io.Writer, max uint32, message proto.Message, segments [][]byte) (err error) {
+	var segmentedBytes uint64
+	if segments != nil {
+		request, ok := message.(*authoritypb.Request)
+		if !ok || request.GetWrite() == nil || len(request.GetWrite().GetData()) != 0 {
+			return fmt.Errorf("%w: segmented bulk requires an empty WRITE carrier", ErrFramePayload)
+		}
+		for _, segment := range segments {
+			segmentedBytes += uint64(len(segment))
+			if segmentedBytes > uint64(max) {
+				return ErrFrameBounds
+			}
+		}
+		if segmentedBytes != uint64(request.GetWrite().GetSize()) {
+			return fmt.Errorf("%w: segmented WRITE size mismatch", ErrFramePayload)
+		}
+	}
+
 	carrier, err := frameBulkCarrier(message)
 	if err != nil {
 		return err
@@ -289,15 +313,18 @@ func writeFrame(w io.Writer, max uint32, message proto.Message) (err error) {
 		return fmt.Errorf("encode protobuf frame: %w", err)
 	}
 	metadata := prefix[frameHeaderBytes:]
-	if err := validateWireMessage(metadata, message.ProtoReflect().Descriptor()); err != nil {
-		return err
+	// Canonical encoding is produced by the typed deterministic marshaler.
+	// Reflective grammar and allocation bounds are checked once, on ingress.
+	bulkBytes := uint64(len(bulk))
+	if segments != nil {
+		bulkBytes = segmentedBytes
 	}
-	total := uint64(len(metadata)) + uint64(len(bulk))
-	if len(metadata) == 0 || total > uint64(max) || len(metadata) > int(^uint32(0)) || len(bulk) > int(^uint32(0)) {
-		return fmt.Errorf("%w: metadata %d + bulk %d (max %d)", ErrFrameBounds, len(metadata), len(bulk), max)
+	total := uint64(len(metadata)) + bulkBytes
+	if len(metadata) == 0 || total > uint64(max) || len(metadata) > int(^uint32(0)) || bulkBytes > uint64(^uint32(0)) {
+		return fmt.Errorf("%w: metadata %d + bulk %d (max %d)", ErrFrameBounds, len(metadata), bulkBytes, max)
 	}
 	binary.BigEndian.PutUint32(prefix[:4], uint32(len(metadata)))
-	binary.BigEndian.PutUint32(prefix[4:8], uint32(len(bulk)))
+	binary.BigEndian.PutUint32(prefix[4:8], uint32(bulkBytes))
 	if buffered, ok := w.(frameBoundaryWriter); ok {
 		if err := buffered.beginFrameWrite(); err != nil {
 			return err
@@ -310,6 +337,14 @@ func writeFrame(w io.Writer, max uint32, message proto.Message) (err error) {
 	}
 	if err := writeAll(w, prefix); err != nil {
 		return err
+	}
+	if segments != nil {
+		for _, segment := range segments {
+			if err := writeAll(w, segment); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return writeAll(w, bulk)
 }

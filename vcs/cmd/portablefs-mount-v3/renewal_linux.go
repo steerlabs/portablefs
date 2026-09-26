@@ -10,19 +10,14 @@ import (
 	"log"
 	"time"
 
+	"github.com/steerlabs/portablefs/vcs/internal/fusev3"
 	"github.com/steerlabs/portablefs/vcs/internal/mountenrollment"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
-// authorizedSession is the part of the authority client renewal owns: which
-// session the authority admitted, how long its signed authorization lasts, and
-// the one call that replaces it. The mount holds the client directly, so a
-// renewal reaches the live session through the session itself; there is no
-// second process and no control socket in the path.
-type authorizedSession interface {
-	AuthorizationSessionID() volumeserver.SessionID
-	InitialAuthorizationDeadline() time.Time
-	Reauthorize(context.Context, []byte, uint64) (time.Time, error)
+// The provider publishes a session and its retirement edge atomically.
+type authorizedSessionProvider interface {
+	CurrentAuthorizationSession() (fusev3.AuthorizationSession, <-chan struct{}, error)
 }
 
 // credentialRenewal is the running renewal for one mount. Failed reports the
@@ -45,40 +40,88 @@ type credentialRenewal struct {
 // nothing to get wrong; a mount whose file is rotated keeps running. The
 // authority assigns the session, the credential manager mints against it, and
 // the mount is the only party that can present the result to its own session.
-func startCredentialRenewal(session authorizedSession, capabilityFile string, attachCapability []byte) (*credentialRenewal, error) {
-	if session == nil {
+func startCredentialRenewal(provider authorizedSessionProvider, capabilityFile string, attachCapability []byte) (*credentialRenewal, error) {
+	if provider == nil {
 		return nil, errors.New("automatic renewal requires the authority session")
 	}
-	id := session.AuthorizationSessionID()
-	if id == (volumeserver.SessionID{}) {
-		return nil, errors.New("authority attach returned no reauthorization session identity")
-	}
-	sessionID := base64.RawURLEncoding.EncodeToString(id[:])
-	deadline := session.InitialAuthorizationDeadline()
-	if !deadline.After(time.Now()) {
-		return nil, fmt.Errorf("authority installed authorization deadline %s, which is not in the future", deadline.UTC().Format(time.RFC3339))
-	}
-	source, err := mountenrollment.NewFileGrantSource(capabilityFile, attachCapability, nil)
+	session, changed, err := provider.CurrentAuthorizationSession()
 	if err != nil {
-		return nil, fmt.Errorf("bind rotating capability source: %w", err)
+		return nil, err
 	}
-	renewer := &mountenrollment.Renewer{
-		Source:  source,
-		Observe: func(event mountenrollment.RenewalEvent) { logRenewalEvent(sessionID, event) },
+	validate := func(session fusev3.AuthorizationSession) error {
+		if session == nil || session.AuthorizationSessionID() == (volumeserver.SessionID{}) {
+			return errors.New("authority attach returned no reauthorization session identity")
+		}
+		if !session.InitialAuthorizationDeadline().After(time.Now()) {
+			return fmt.Errorf("authority installed expired authorization deadline %s", session.InitialAuthorizationDeadline())
+		}
+		return nil
+	}
+	if err := validate(session); err != nil {
+		return nil, err
+	}
+	// Validate the source synchronously; every replacement needs a fresh pin.
+	if _, err := mountenrollment.NewFileGrantSource(capabilityFile, attachCapability, nil); err != nil {
+		return nil, fmt.Errorf("bind rotating capability source: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	renewal := &credentialRenewal{failed: make(chan error, 1), stop: cancel, done: make(chan struct{})}
-	log.Printf("authorization session %s expires %s; write the capability for sequence 1 of this session to %s to extend it",
-		sessionID, deadline.UTC().Format(time.RFC3339), capabilityFile)
 	go func() {
 		defer close(renewal.done)
-		if err := renewer.Run(ctx, sessionID, deadline, func(ctx context.Context, capability string, sequence uint64, certificatePEM []byte) (time.Time, error) {
-			if len(certificatePEM) != 0 {
-				return time.Time{}, errors.New("a file-rotated capability does not carry a replacement client certificate")
+		for ctx.Err() == nil {
+			source, sourceErr := mountenrollment.NewFileGrantSource(capabilityFile, attachCapability, nil)
+			if sourceErr != nil {
+				renewal.failed <- sourceErr
+				return
 			}
-			return session.Reauthorize(ctx, []byte(capability), sequence)
-		}); err != nil {
-			renewal.failed <- err
+			id := session.AuthorizationSessionID()
+			sessionID := base64.RawURLEncoding.EncodeToString(id[:])
+			deadline := session.InitialAuthorizationDeadline()
+			log.Printf("authorization session %s expires %s; write the capability for sequence 1 of this session to %s to extend it", sessionID, deadline.UTC().Format(time.RFC3339), capabilityFile)
+			renewer := &mountenrollment.Renewer{Source: source, Observe: func(event mountenrollment.RenewalEvent) { logRenewalEvent(sessionID, event) }}
+			child, stop := context.WithCancel(ctx)
+			result := make(chan error, 1)
+			exact := session
+			go func() {
+				result <- renewer.Run(child, sessionID, deadline, func(ctx context.Context, capability string, sequence uint64, certificatePEM []byte) (time.Time, error) {
+					if len(certificatePEM) != 0 {
+						return time.Time{}, errors.New("a file-rotated capability does not carry a replacement client certificate")
+					}
+					return exact.Reauthorize(ctx, []byte(capability), sequence)
+				})
+			}()
+			var runErr error
+			select {
+			case <-ctx.Done():
+				stop()
+				<-result
+				return
+			case <-changed:
+				stop()
+				<-result
+			case runErr = <-result:
+				stop()
+			}
+			if ctx.Err() != nil {
+				return
+			}
+			// A closed retirement edge wins even when an old call failed concurrently.
+			select {
+			case <-changed:
+				session, changed, err = provider.CurrentAuthorizationSession()
+				if err == nil {
+					err = validate(session)
+				}
+				if err != nil {
+					renewal.failed <- err
+					return
+				}
+			default:
+				if runErr != nil {
+					renewal.failed <- runErr
+				}
+				return
+			}
 		}
 	}()
 	return renewal, nil

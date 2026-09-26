@@ -169,7 +169,7 @@ func run() error {
 	// alive and one that does not still fails closed.
 	done := make(chan struct{})
 	go func() { mount.Wait(); close(done) }()
-	renewal, err := startCredentialRenewal(client, *accessTokenFile, token)
+	renewal, err := startCredentialRenewal(mount, *accessTokenFile, token)
 	if err != nil {
 		return errors.Join(err, shutdown(mount, done, absoluteMount))
 	}

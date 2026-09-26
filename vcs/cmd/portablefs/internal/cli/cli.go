@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/steerlabs/portablefs/vcs/internal/daemonctl"
@@ -19,6 +20,7 @@ import (
 
 const hostedMountReauthorizationFeature = "hosted-mount-reauthorization-v1"
 const hostedAutomaticMountReauthorizationFeature = "hosted-automatic-mount-reauthorization-v2"
+const linuxMountLossObservationFeature = "linux-mount-loss-observation-v1"
 
 // cmdEnv carries the process environment a command runs in; tests substitute
 // writers, env lookups, the config path, and the poll sleeper.
@@ -138,6 +140,7 @@ func commands() []command {
 		{"reauthorize", "rotate a hosted live mount authorization", cmdReauthorize},
 		{"umount", "cleanly unmount a mounted volume", cmdUmount},
 		{"mounts", "list active mounts on this machine", cmdMounts},
+		{"mount-loss", "read an exact live Linux mount writeback loss counter", cmdMountLoss},
 		{"route", "explain whether a path is served machine-locally or by the volume", cmdRoute},
 		{"prune-local", "reclaim machine-local backing that no route can reach", cmdPruneLocal},
 		{"daemon", "stop the per-user daemon only when it is atomically proven idle", cmdDaemon},
@@ -221,10 +224,14 @@ func cmdVersion(e *cmdEnv, args []string) int {
 		return e.handleParseError("version", err)
 	}
 	if o.jsonOut {
+		features := []string{hostedMountReauthorizationFeature, hostedAutomaticMountReauthorizationFeature}
+		if runtime.GOOS == "linux" {
+			features = append(features, linuxMountLossObservationFeature)
+		}
 		return e.printJSON(struct {
 			Features []string `json:"features"`
 			Version  string   `json:"version"`
-		}{Features: []string{hostedMountReauthorizationFeature, hostedAutomaticMountReauthorizationFeature}, Version: e.version})
+		}{Features: features, Version: e.version})
 	}
 	fmt.Fprintf(e.stdout, "portablefs %s\n", e.version)
 	return 0

@@ -55,11 +55,11 @@ func TestStorageFatalTeardownWaitsForExactFrontendReceipt(t *testing.T) {
 	if h.beginTerminalRequest(ordinary) {
 		t.Fatal("post-fence filesystem request was admitted")
 	}
-	// Lease CONTROL must remain live while the already-applied operation
-	// finishes its peer COMPLETE barrier.
-	control := &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{AcknowledgeLeaseEvent: &authoritypb.AcknowledgeLeaseEventRequest{}}}
+	// Coherence acknowledgments must remain live while an already-applied
+	// operation finishes its peer withdrawal barrier.
+	control := &authoritypb.Request{Body: &authoritypb.Request_ChangeAck{ChangeAck: &authoritypb.ChangeAck{}}}
 	if !h.beginTerminalRequest(control) {
-		t.Fatal("terminal lease control was refused")
+		t.Fatal("terminal coherence acknowledgment was refused")
 	}
 	h.endTerminalRequest()
 
@@ -372,9 +372,9 @@ func TestTerminalQuiesceEdgeClosesOnceAndLeavesControlAdmissible(t *testing.T) {
 	if h.beginTerminalRequest(ordinary) {
 		t.Fatal("ordinary request was admitted after quiesce")
 	}
-	control := &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{AcknowledgeLeaseEvent: &authoritypb.AcknowledgeLeaseEventRequest{}}}
+	control := &authoritypb.Request{Body: &authoritypb.Request_DelegationRecallAck{DelegationRecallAck: &authoritypb.DelegationRecallAck{}}}
 	if !h.beginTerminalRequest(control) {
-		t.Fatal("lease control was refused during quiesce")
+		t.Fatal("coherence acknowledgment was refused during quiesce")
 	}
 	h.endTerminalRequest()
 	h.endTerminalRequest()
@@ -390,11 +390,11 @@ func TestTerminalQuiesceRefusesNewParkableControlWithoutWaiting(t *testing.T) {
 		t.Fatal("ordinary request was not admitted before fence")
 	}
 	h.deferStorageFailure(nil, errors.Join(xfsstore.ErrWritePrivilege, syscall.EPERM))
-	next := &authoritypb.Request{RequestId: 9, Body: &authoritypb.Request_NextLeaseEvent{NextLeaseEvent: &authoritypb.NextLeaseEventRequest{}}}
+	next := &authoritypb.Request{RequestId: 9, Body: &authoritypb.Request_NextControlEvent{NextControlEvent: &authoritypb.NextControlEventRequest{}}}
 	response := h.Handle(t.Context(), next)
 	if response.GetErrno() != int32(syscall.EIO) || !response.GetUncertain() ||
 		response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_STORAGE {
-		t.Fatalf("post-quiesce NextLeaseEvent = %+v, want immediate fenced response", response)
+		t.Fatalf("post-quiesce NextControlEvent = %+v, want immediate fenced response", response)
 	}
 	h.endTerminalRequest()
 }

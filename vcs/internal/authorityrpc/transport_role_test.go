@@ -19,7 +19,7 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_Unlink{}}, {Body: &authoritypb.Request_Rename{}},
 		{Body: &authoritypb.Request_Link{}}, {Body: &authoritypb.Request_Symlink{}},
 		{Body: &authoritypb.Request_Readlink{}}, {Body: &authoritypb.Request_Open{}},
-		{Body: &authoritypb.Request_Close{}}, {Body: &authoritypb.Request_Read{}},
+		{Body: &authoritypb.Request_Close{}}, {Body: &authoritypb.Request_CloseBatch{}}, {Body: &authoritypb.Request_Read{}},
 		{Body: &authoritypb.Request_FskitWrite{}}, {Body: &authoritypb.Request_Write{}},
 		{Body: &authoritypb.Request_Fallocate{}},
 		{Body: &authoritypb.Request_CopyFileRange{}}, {Body: &authoritypb.Request_Tmpfile{}}, {Body: &authoritypb.Request_Fsync{}},
@@ -34,6 +34,16 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		{Body: &authoritypb.Request_NextLeaseEvent{}}, {Body: &authoritypb.Request_AcknowledgeLeaseEvent{}},
 		{Body: &authoritypb.Request_RenewLeases{}},
 		{Body: &authoritypb.Request_AcknowledgeSourceLeaseDischarge{}},
+		{Body: &authoritypb.Request_Subscribe{}},
+		{Body: &authoritypb.Request_RenewSubscription{}},
+		{Body: &authoritypb.Request_NextControlEvent{}},
+		{Body: &authoritypb.Request_ChangeAck{}},
+		{Body: &authoritypb.Request_DelegationRecallAck{}},
+		{Body: &authoritypb.Request_DelegationBreakAck{}},
+		{Body: &authoritypb.Request_DelegationModeChangeAck{}},
+		{Body: &authoritypb.Request_DelegationRelease{}},
+		{Body: &authoritypb.Request_Barrier{}},
+		{Body: &authoritypb.Request_WaitVisibility{}},
 	}
 	descriptorBodies := (&authoritypb.Request{}).ProtoReflect().Descriptor().Oneofs().ByName("body").Fields().Len()
 	if len(requests) != descriptorBodies {
@@ -48,6 +58,10 @@ func TestEveryAuthorityRequestBodyHasOneExactTransportClass(t *testing.T) {
 		seen[typeOf] = struct{}{}
 		class, err := classifyTransportRequest(request)
 		if err != nil || class == transportRequestInvalid {
+			switch request.GetBody().(type) {
+			case *authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent, *authoritypb.Request_RenewLeases, *authoritypb.Request_AcknowledgeSourceLeaseDischarge:
+				continue // Frozen schema tombstones have no executable transport lane.
+			}
 			t.Fatalf("%T class=%d err=%v", request.GetBody(), class, err)
 		}
 	}
@@ -60,12 +74,23 @@ func TestTransportRoleAllowlistIsStrict(t *testing.T) {
 		control bool
 	}{
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Fallocate{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_Subscribe{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_ChangeAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationRecallAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationBreakAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationModeChangeAck{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_Barrier{}}, data: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Write{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_ApplyRoutes{}}, data: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_NextFskitRepair{}}, control: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{}}, control: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{}}, control: true},
-		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewLeases{}}, control: true},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_NextLeaseEvent{}}},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_AcknowledgeLeaseEvent{}}},
+		{request: &authoritypb.Request{Body: &authoritypb.Request_RenewLeases{}}},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_Activate{}}, control: true},
 		{request: &authoritypb.Request{Body: &authoritypb.Request_TerminalDeliveryReceipt{}}, control: true},

@@ -576,7 +576,7 @@ func (a *attach) runAutomaticMountRenewal(cfg *v3AttachConfig, d *v3DataPlane, e
 	renewer := &mountenrollment.Renewer{
 		Source: cfg.enrollmentClient, MinimumSafetyMargin: cfg.repairBudget,
 		Observe: func(event mountenrollment.RenewalEvent) {
-			if err := events.WriteRenewal(event); err != nil {
+			if err := events.WriteRenewal(event, nil); err != nil {
 				log.Printf("portablefsd: attach %s write renewal event: %v", a.ref, err)
 			}
 			status := event.Status

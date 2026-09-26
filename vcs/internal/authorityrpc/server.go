@@ -172,10 +172,10 @@ func (s *Server) validate() (TransportBounds, error) {
 		return TransportBounds{}, errors.New("authorityrpc: handler, admission bounds, allocation budget, and connection timeouts are required")
 	}
 	if s.MaxInFlight < 2 {
-		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must admit an ordinary request and a blocking lock wait independently")
+		return TransportBounds{}, errors.New("authorityrpc: max-in-flight must independently admit ordinary work and a blocking wait")
 	}
 	if s.MaxConnections < 2 {
-		return TransportBounds{}, errors.New("authorityrpc: protocol 6 requires capacity for one DATA/CONTROL connection pair")
+		return TransportBounds{}, errors.New("authorityrpc: protocol 7 requires capacity for one DATA/CONTROL connection pair")
 	}
 	bounds := s.Handler.Bounds()
 	if bounds.MaxFrame != s.MaxFrame || bounds.MaxInFlight != s.MaxInFlight {
@@ -303,9 +303,13 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 	if err != nil {
 		return err
 	}
-	ordinaryLimit, blockingLimit := blockingWaitLane(s.MaxInFlight)
+	if entry.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && s.MaxInFlight < 3 {
+		return errors.New("authorityrpc: Linux max-in-flight must independently admit ordinary work, a delegated flush, and a blocking wait")
+	}
+	ordinaryLimit, blockingLimit, flushLimit := serverExecutionLanes(s.MaxInFlight, entry.profile, entry.orderedFlush)
 	ordinary := make(chan struct{}, ordinaryLimit)
 	blocking := make(chan struct{}, blockingLimit)
+	flushes := make(chan struct{}, flushLimit)
 	var writers sync.Mutex
 	writeResponse := func(request *authoritypb.Request, response *authoritypb.Response) error {
 		writers.Lock()
@@ -391,8 +395,10 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 		// lock. It gets its own lane so it can never occupy the last ordinary
 		// slot, which is what the client's keepalive needs to stay live.
 		lane := ordinary
-		if blockingWait(request) {
+		if serverParkedRequest(request) {
 			lane = blocking
+		} else if flushLimit > 0 && delegatedFlushRequest(request) {
+			lane = flushes
 		}
 		admissionTimer := time.NewTimer(s.WriteTimeout)
 		select {
@@ -443,4 +449,44 @@ func (s *Server) serveSession(ctx context.Context, cancel context.CancelFunc, co
 			}
 		}(request, opCtx, opCancel, lane, releaseFrame)
 	}
+}
+
+// serverParkedRequest reserves the blocking half of a connection's execution
+// bound for requests which may wait on another participant. A CONTROL poll
+// must never occupy the capacity needed to renew or acknowledge the event that
+// will wake it.
+func serverParkedRequest(request *authoritypb.Request) bool {
+	return blockingWait(request) || request != nil && request.GetNextControlEvent() != nil
+}
+
+func delegatedFlushRequest(request *authoritypb.Request) bool {
+	if request == nil {
+		return false
+	}
+	if write := request.GetWrite(); write != nil {
+		return write.GetDelegation() != nil
+	}
+	if setattr := request.GetSetAttr(); setattr != nil {
+		return setattr.GetDelegation() != nil
+	}
+	if fallocate := request.GetFallocate(); fallocate != nil {
+		return fallocate.GetDelegation() != nil
+	}
+	return false
+}
+
+func serverExecutionLanes(maxInFlight int, profile authoritypb.FrontendProfile, orderedMode ...bool) (ordinary, blocking, flush int) {
+	ordinary, blocking = blockingWaitLane(maxInFlight)
+	if profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+		return ordinary, blocking, 0
+	}
+	// Preserve the protocol's half-capacity blocking-lock lane. One slot from
+	// the ordinary half is enough to break a cross-recall dependency while the
+	// remaining ordinary requests wait for holder acknowledgments.
+	flush = 1
+	if len(orderedMode) == 1 && orderedMode[0] && ordinary >= volumeserver.OrderedFlushWindow+1 {
+		flush = volumeserver.OrderedFlushWindow
+	}
+	ordinary -= flush
+	return ordinary, blocking, flush
 }

@@ -36,7 +36,8 @@ func TestWriteRenewalProducesOneStructuredBoundedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.WriteRenewal(testRenewalEvent()); err != nil {
+	writeback := &WritebackStats{DirtyBytes: 7, DirtyEntries: 1, RetainedBytes: 11, RetainedEntries: 2, DurabilityLag: 3, LossSequence: 4}
+	if err := writer.WriteRenewal(testRenewalEvent(), writeback); err != nil {
 		t.Fatal(err)
 	}
 	lines := bytes.Split(bytes.TrimSpace(output.Bytes()), []byte{'\n'})
@@ -51,6 +52,12 @@ func TestWriteRenewalProducesOneStructuredBoundedRecord(t *testing.T) {
 		record.MountIdentity != "mount0123456789abcdef" || record.Sequence != 2 || record.ConsecutiveFailures != 1 ||
 		!strings.Contains(record.Error, "without record injection") {
 		t.Fatalf("renewal record = %+v", record)
+	}
+	if record.Writeback == nil || *record.Writeback != *writeback {
+		t.Fatalf("writeback snapshot = %+v, want %+v", record.Writeback, writeback)
+	}
+	if len(output.Bytes()) > maxRecordBytes {
+		t.Fatalf("renewal record exceeds bound: %d", len(output.Bytes()))
 	}
 }
 
@@ -67,7 +74,7 @@ func TestOpenAppendUsesThePrivatePathDerivedMountLog(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.WriteRenewal(testRenewalEvent()); err != nil {
+	if err := writer.WriteRenewal(testRenewalEvent(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := writer.Close(); err != nil {

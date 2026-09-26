@@ -1,0 +1,26 @@
+// Run as root in the same Linux VM as TestCachedLookupKernelRoundTrip.
+// Requires bpftrace, kernel BTF and the two named kprobe symbols. The test labels
+// only its pinned syscall thread; unrelated mounts and permission GETATTRs are
+// excluded. Pair by the live fuse_req address, removed at reply completion.
+// Linux v6.8 fs/fuse/dev.c: queue_request_and_unlock precedes queue insertion;
+// fuse_request_end follows response copy and precedes requester wakeup.
+// https://github.com/torvalds/linux/blob/v6.8/fs/fuse/dev.c
+// Each mode must produce exactly 2,000 rows with distinct request IDs. Lost
+// events, missing pairs or a failed mounted test invalidate the measurement.
+// The interval includes probe overhead after the first timestamp, but excludes
+// request allocation and the caller's final wakeup. It is not syscall latency.
+BEGIN { printf("LOOKUP_PROBE_READY\n"); }
+kprobe:queue_request_and_unlock /comm == "pfs-look-share" || comm == "pfs-look-full"/ {
+  $req = (struct fuse_req *)arg1;
+  if ($req->in.h.opcode == 1) {
+    @start[arg1] = nsecs;
+    @kind[arg1] = comm;
+  }
+}
+kprobe:fuse_request_end /@start[arg0]/ {
+  $end = nsecs;
+  $req = (struct fuse_req *)arg0;
+  printf("LOOKUP_NS %s %llu %llu\n", @kind[arg0], $req->in.h.unique, $end - @start[arg0]);
+  delete(@start[arg0]); delete(@kind[arg0]);
+}
+END { clear(@start); clear(@kind); }

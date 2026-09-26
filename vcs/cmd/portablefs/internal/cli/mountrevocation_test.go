@@ -208,9 +208,10 @@ func TestMountsJSONCarriesTheRevocationVerdict(t *testing.T) {
 	// An agent reading --json must be able to branch on the class without
 	// parsing prose, and must never see this row as live.
 	for field, want := range map[string]any{
-		"status":       mountStatusRevoked,
-		"statusReason": mountRevokedRoutesChanged,
-		"health":       mountStatusRevoked,
+		"mountInstanceId": st.MountInstanceID,
+		"status":          mountStatusRevoked,
+		"statusReason":    mountRevokedRoutesChanged,
+		"health":          mountStatusRevoked,
 	} {
 		if row[field] != want {
 			t.Fatalf("--json %s = %v, want %v (row: %v)", field, row[field], want, row)

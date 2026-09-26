@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -119,7 +120,7 @@ func testInteropConvergence(t *testing.T) {
 	t.Cleanup(func() { _ = mode.Close() })
 
 	if got := mode.ChunkSize(); got != interopChunkSize {
-		t.Fatalf("INFO chunk size crossed the wire as %d, want %d", got, interopChunkSize)
+		t.Fatalf("INFO chunk size is %d, want %d; content error: %v", got, interopChunkSize, mode.ContentError())
 	}
 	if got := mode.Bindings().Len(); got != interopEntries {
 		t.Fatalf("bindings cover %d entries, the manifest has %d", got, interopEntries)
@@ -428,17 +429,98 @@ func (f *interopFixture) startServe(t *testing.T) {
 	})
 	socket := filepath.Join(f.stateRoot, hydrator.SocketName)
 	deadline := time.Now().Add(10 * time.Second)
+	want := hydrator.Info{VolumeID: rawInteropUUID(t, interopVolume), SealedEpoch: interopEpoch, Attempt: rawInteropUUID(t, interopAttempt), ChunkSizeBytes: interopChunkSize}
 	for {
-		if _, err := os.Stat(socket); err == nil {
+		err := probeInteropHydrator(socket, want)
+		if err == nil {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the hydrator never created its socket")
+			t.Fatalf("the hydrator never answered its readiness INFO: %v", err)
 		}
 		select {
 		case err := <-done:
 			t.Fatalf("serve exited before it listened: %v", err)
 		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// A Unix socket pathname exists after bind and before listen. Only a decoded
+// INFO proves this fixture is ready for Open's initial bootstrap transaction.
+func probeInteropHydrator(socket string, want hydrator.Info) error {
+	conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return err
+	}
+	if err := hydrator.WriteFrame(conn, hydrator.TypeInfo, nil); err != nil {
+		return err
+	}
+	kind, payload, err := hydrator.ReadFrame(conn)
+	if err != nil {
+		return err
+	}
+	if kind != hydrator.TypeInfoOK {
+		return fmt.Errorf("unexpected readiness reply %v", kind)
+	}
+	info, err := hydrator.DecodeInfo(payload)
+	if err != nil {
+		return err
+	}
+	if info.VolumeID != want.VolumeID || info.Attempt != want.Attempt || info.SealedEpoch != want.SealedEpoch || info.ChunkSizeBytes != want.ChunkSizeBytes {
+		return fmt.Errorf("readiness INFO identity or chunk size mismatch: %+v", info)
+	}
+	return nil
+}
+
+func TestInteropReadinessRequiresProtocolReply(t *testing.T) {
+	socket := filepath.Join(shortDir(t, "pfs-ready-"), "socket")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	want := hydrator.Info{VolumeID: [16]byte{1}, Attempt: [16]byte{2}, SealedEpoch: 3, ChunkSizeBytes: interopChunkSize}
+	if _, err := os.Stat(socket); err != nil {
+		t.Fatal(err)
+	}
+	// The pathname and even listen are insufficient while no INFO is served.
+	if err := probeInteropHydrator(socket, want); err == nil {
+		t.Fatal("unserved socket was treated as ready")
+	}
+	stale, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.Close()
+	for _, valid := range []bool{false, true} {
+		done := make(chan error, 1)
+		go func() {
+			conn, err := listener.Accept()
+			if err != nil {
+				done <- err
+				return
+			}
+			defer conn.Close()
+			_, _, err = hydrator.ReadFrame(conn)
+			if err == nil {
+				reply := want
+				if !valid {
+					reply.ChunkSizeBytes = 0
+				}
+				err = hydrator.WriteFrame(conn, hydrator.TypeInfoOK, reply.Encode())
+			}
+			done <- err
+		}()
+		if err := probeInteropHydrator(socket, want); (err == nil) != valid {
+			t.Fatalf("valid=%v readiness=%v", valid, err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
 		}
 	}
 }

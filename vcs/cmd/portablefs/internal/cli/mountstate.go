@@ -63,7 +63,8 @@ type mountState struct {
 	AttachRef string `json:"attachRef,omitempty"`
 	// AuthorizationSessionID is the non-secret authority session identity a
 	// hosted product binds its exact next reauthorization grant to. The Linux
-	// supervisor additionally publishes a private local control socket; macOS
+	// supervisor publishes a same-user local control socket for live loss
+	// snapshots and, without automatic enrollment, reauthorization; macOS
 	// routes the same operation through portablefsd's existing control socket.
 	AuthorizationSessionID       string `json:"authorizationSessionId,omitempty"`
 	ReauthorizationControlSocket string `json:"reauthorizationControlSocket,omitempty"`
@@ -558,7 +559,7 @@ func validateMountStateRecord(path string, st *mountState) error {
 		if !validStateString(st.MountEnrollmentID, 256) || st.AuthorizationSessionID == "" ||
 			st.AuthorizationDeadlineAtMs <= 0 ||
 			st.LastReauthorizationAtMs < 0 || st.NextReauthorizationAtMs < 0 ||
-			st.ReauthorizationError != "" && !validStateString(st.ReauthorizationError, 2048) || st.ReauthorizationControlSocket != "" {
+			st.ReauthorizationError != "" && !validStateString(st.ReauthorizationError, 2048) {
 			return fmt.Errorf("mount state %s has invalid automatic mount enrollment state", path)
 		}
 	} else if st.AuthorizationDeadlineAtMs != 0 ||
