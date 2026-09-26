@@ -60,6 +60,192 @@ func TestFuseMountControlSnapshotRunsDuringRenewal(t *testing.T) {
 	}
 }
 
+func waitForFuseMountControlConnections(t *testing.T, control fuseReauthorizationControl, want int) {
+	t.Helper()
+	c := control.(*unixReauthorizationControl)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.mu.Lock()
+		got := len(c.connections)
+		c.mu.Unlock()
+		if got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("accepted control connections = %d, want at least %d", got, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForQueuedRenewal(t *testing.T, control fuseReauthorizationControl, entered <-chan uint64) {
+	t.Helper()
+	c := control.(*unixReauthorizationControl)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		select {
+		case sequence := <-entered:
+			t.Fatalf("renewal %d overtook an earlier accepted renewal", sequence)
+		default:
+		}
+		c.mu.Lock()
+		accepted := len(c.connections)
+		c.mu.Unlock()
+		if accepted >= 2 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("second renewal was not retained behind the first (active connections=%d)", accepted)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestFuseMountControlOrdersConcurrentRenewalsWithoutBlockingLoss(t *testing.T) {
+	entered := make(chan uint64, 2)
+	releaseFirst := make(chan struct{})
+	control, err := startFuseReauthorizationControl(func(ctx context.Context, _ string, sequence uint64, _ []byte) (time.Time, error) {
+		entered <- sequence
+		if sequence == 1 {
+			select {
+			case <-releaseFirst:
+			case <-ctx.Done():
+				return time.Time{}, ctx.Err()
+			}
+		}
+		return time.Now().Add(time.Hour), nil
+	}, func() (mountLossSnapshot, error) {
+		return mountLossSnapshot{MountInstanceID: lossTestInstance, LossSequence: "9"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseFirst) })
+	state := &mountState{Strategy: "fuse", MountInstanceID: lossTestInstance, ReauthorizationControlSocket: control.SocketPath()}
+	renewed := make(chan error, 2)
+	startRenewal := func(sequence uint64) {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			_, err := reauthorizeFuseMount(ctx, state, "capability", sequence, []byte("certificate"))
+			renewed <- err
+		}()
+	}
+	startRenewal(1)
+	select {
+	case sequence := <-entered:
+		if sequence != 1 {
+			t.Fatalf("first callback sequence = %d", sequence)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first renewal did not enter")
+	}
+	startRenewal(2)
+	waitForQueuedRenewal(t, control, entered)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	snapshot, err := readFuseMountLoss(ctx, state, lossTestInstance)
+	if err != nil || snapshot.LossSequence != "9" {
+		t.Fatalf("snapshot during queued renewal = %+v, %v", snapshot, err)
+	}
+	select {
+	case sequence := <-entered:
+		t.Fatalf("renewal %d overtook unfinished renewal 1", sequence)
+	case <-time.After(150 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(releaseFirst) })
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-renewed:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("ordered renewal did not complete")
+		}
+	}
+	select {
+	case sequence := <-entered:
+		if sequence != 2 {
+			t.Fatalf("second callback sequence = %d", sequence)
+		}
+	default:
+		t.Fatal("second renewal completed without entering its callback")
+	}
+}
+
+func TestFuseMountControlPreservesAcceptedRenewalOrderAcrossPartialRequest(t *testing.T) {
+	entered := make(chan uint64, 2)
+	control, err := startFuseReauthorizationControl(func(_ context.Context, _ string, sequence uint64, _ []byte) (time.Time, error) {
+		entered <- sequence
+		return time.Now().Add(time.Hour), nil
+	}, func() (mountLossSnapshot, error) {
+		return mountLossSnapshot{MountInstanceID: lossTestInstance, LossSequence: "10"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	state := &mountState{Strategy: "fuse", MountInstanceID: lossTestInstance, ReauthorizationControlSocket: control.SocketPath()}
+	first, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: control.SocketPath(), Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if err := first.SetDeadline(time.Now().Add(4 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Write([]byte(`{"capability":"capability","clientCertificatePem":"certificate","sequence":`)); err != nil {
+		t.Fatal(err)
+	}
+	waitForFuseMountControlConnections(t, control, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if snapshot, err := readFuseMountLoss(ctx, state, lossTestInstance); err != nil || snapshot.LossSequence != "10" {
+		t.Fatalf("snapshot behind partial renewal = %+v, %v", snapshot, err)
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		_, err := reauthorizeFuseMount(ctx, state, "capability", 2, []byte("certificate"))
+		secondDone <- err
+	}()
+	waitForQueuedRenewal(t, control, entered)
+	select {
+	case sequence := <-entered:
+		t.Fatalf("renewal %d overtook an earlier accepted partial renewal", sequence)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if _, err := first.Write([]byte("1}")); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case sequence := <-entered:
+		if sequence != 1 {
+			t.Fatalf("first accepted callback sequence = %d, want 1", sequence)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first accepted renewal did not enter")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case sequence := <-entered:
+		if sequence != 2 {
+			t.Fatalf("second callback sequence = %d, want 2", sequence)
+		}
+	default:
+		t.Fatal("second renewal completed without entering")
+	}
+}
+
 func TestFuseMountControlCloseInterruptsIncompleteClient(t *testing.T) {
 	control, err := startFuseReauthorizationControl(nil, func() (mountLossSnapshot, error) {
 		return mountLossSnapshot{MountInstanceID: lossTestInstance, LossSequence: "0"}, nil
@@ -149,34 +335,30 @@ func TestFuseMountControlBoundsConcurrentHandlers(t *testing.T) {
 	const slots = 8
 	entered, release := make(chan struct{}, slots+1), make(chan struct{})
 	var active, peak atomic.Int32
-	control, err := startFuseReauthorizationControl(func(ctx context.Context, _ string, _ uint64, _ []byte) (time.Time, error) {
+	control, err := startFuseReauthorizationControl(nil, func() (mountLossSnapshot, error) {
 		current := active.Add(1)
 		for previous := peak.Load(); current > previous && !peak.CompareAndSwap(previous, current); previous = peak.Load() {
 		}
 		defer active.Add(-1)
 		entered <- struct{}{}
-		select {
-		case <-release:
-			return time.Now().Add(time.Hour), nil
-		case <-ctx.Done():
-			return time.Time{}, ctx.Err()
-		}
-	}, nil)
+		<-release
+		return mountLossSnapshot{MountInstanceID: lossTestInstance, LossSequence: "0"}, nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer control.Close()
 	var releaseOnce sync.Once
 	defer releaseOnce.Do(func() { close(release) })
-	state := &mountState{ReauthorizationControlSocket: control.SocketPath()}
+	state := &mountState{Strategy: "fuse", MountInstanceID: lossTestInstance, ReauthorizationControlSocket: control.SocketPath()}
 	finished := make(chan error, slots)
-	for i := 1; i <= slots; i++ {
-		go func(sequence uint64) {
+	for i := 0; i < slots; i++ {
+		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_, err := reauthorizeFuseMount(ctx, state, "capability", sequence, []byte("certificate"))
+			_, err := readFuseMountLoss(ctx, state, lossTestInstance)
 			finished <- err
-		}(uint64(i))
+		}()
 	}
 	for i := 0; i < slots; i++ {
 		select {
@@ -189,7 +371,7 @@ func TestFuseMountControlBoundsConcurrentHandlers(t *testing.T) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
-		_, err := reauthorizeFuseMount(ctx, state, "capability", slots+1, []byte("certificate"))
+		_, err := readFuseMountLoss(ctx, state, lossTestInstance)
 		overflow <- err
 	}()
 	select {

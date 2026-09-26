@@ -53,7 +53,9 @@ type unixReauthorizationControl struct {
 	lossSnapshot fuseLossSnapshotHandler
 	listener     *net.UnixListener
 	mu           sync.Mutex
-	connections  map[*net.UnixConn]struct{}
+	connections  map[*net.UnixConn]uint64
+	nextArrival  uint64
+	changed      chan struct{}
 	workers      sync.WaitGroup
 	closed       bool
 	closeErr     error
@@ -77,7 +79,7 @@ func startFuseReauthorizationControl(handler fuseReauthorizationHandler, lossSna
 	control := &unixReauthorizationControl{
 		done: make(chan struct{}), ctx: ctx, cancel: cancel,
 		handler: handler, lossSnapshot: lossSnapshot, listener: listener,
-		connections: make(map[*net.UnixConn]struct{}), path: path,
+		connections: make(map[*net.UnixConn]uint64), changed: make(chan struct{}), path: path,
 	}
 	go control.serve()
 	return control, nil
@@ -152,22 +154,55 @@ func (c *unixReauthorizationControl) serve() {
 			_ = connection.Close()
 			continue
 		}
-		// Parallel bounded handlers keep renewal and incomplete peers from
-		// delaying the mount's live loss observation.
-		c.connections[connection] = struct{}{}
+		if c.nextArrival == ^uint64(0) {
+			c.mu.Unlock()
+			_ = connection.Close()
+			continue
+		}
+		// Accept order fixes renewal order even when an earlier peer has only
+		// sent a partial request. Snapshots may still pass those waiting peers.
+		c.nextArrival++
+		arrival := c.nextArrival
+		c.connections[connection] = arrival
 		c.workers.Add(1)
 		c.mu.Unlock()
 		go func() {
 			defer c.workers.Done()
-			c.handle(connection)
+			c.handle(connection, arrival)
 			c.mu.Lock()
 			delete(c.connections, connection)
+			close(c.changed)
+			c.changed = make(chan struct{})
 			c.mu.Unlock()
 		}()
 	}
 }
 
-func (c *unixReauthorizationControl) handle(connection *net.UnixConn) {
+func (c *unixReauthorizationControl) waitForEarlierConnections(ctx context.Context, arrival uint64) error {
+	for {
+		c.mu.Lock()
+		var earlier bool
+		for _, accepted := range c.connections {
+			if accepted < arrival {
+				earlier = true
+				break
+			}
+		}
+		if !earlier {
+			c.mu.Unlock()
+			return ctx.Err()
+		}
+		changed := c.changed
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (c *unixReauthorizationControl) handle(connection *net.UnixConn, arrival uint64) {
 	defer connection.Close()
 	_ = connection.SetDeadline(time.Now().Add(35 * time.Second))
 	if err := requireSameUserPeer(connection); err != nil {
@@ -210,6 +245,10 @@ func (c *unixReauthorizationControl) handle(connection *net.UnixConn) {
 	}
 	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
+	if err := c.waitForEarlierConnections(ctx, arrival); err != nil {
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "reauthorization unavailable", OK: false})
+		return
+	}
 	deadline, err := c.handler(ctx, request.Capability, request.Sequence, []byte(request.ClientCertificatePEM))
 	if err != nil {
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "authority refused reauthorization", OK: false})
