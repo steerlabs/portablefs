@@ -1,20 +1,19 @@
 # The FSKit mount (macOS)
 
-Status: **supported protocol-6 FSKit profile with explicitly weaker cache,
+Status: **supported protocol-7 FSKit profile with explicitly weaker cache,
 append, and lock guarantees than Linux**
 
 PortableFS ships the app, daemon, and FSKit extension for macOS 26 and 27. A
 mount declares the immutable `FSKIT_SYNC_REPAIR` frontend profile before Attach;
-it never claims or negotiates the Linux N/A/D/E lease profile.
+it never claims or negotiates the Linux subscription/delegation profile.
 
 ## Platform contract
 
-Protocol 6 permits cache only under authority N/A/D/E leases. Before a
-conflicting mutation returns, every peer must prove it discharged the affected
-name binding, attributes, clean data, and directory-enumeration state. Append
-also requires the frontend to preserve `O_APPEND` intent so the authority can
-place each write at true EOF, and the product requires distributed POSIX record
-and `flock` operations.
+Protocol 7 gives Linux exact cache withdrawal through Authority subscriptions
+and per-file delegations. Before a conflicting mutation returns, affected peers
+must prove they discharged the relevant name binding, attributes, clean data,
+and directory-enumeration state. Linux also preserves `O_APPEND` intent for
+authority-placed writes and forwards POSIX record and `flock` operations.
 
 Current public FSKit does not expose all of those primitives:
 
@@ -40,7 +39,7 @@ session. It does not issue lease grants or accept lease-control requests.
 The frozen policy spellings `macos26-synchronous-vfs-repair-v1`,
 `macos26-synchronous-vfs-repair-v2`, and `fskit-native-revocation-v1` remain
 exact. They choose the host actuator inside the FSKit profile; none selects the
-Linux lease profile.
+Linux subscription/delegation profile.
 
 ## Qualification topology
 
@@ -63,7 +62,7 @@ Ordinary macOS 27 selects the same shipping v2 synchronous-repair actuator as
 macOS 26. The stronger SDK-27 native actuator remains build-stamped; runtime
 flags cannot promote an older signed app into it or silently reinterpret an
 unknown OS. The historical qualification spelling is retained as release
-identity, not as a statement that protocol-6 mounting is disabled.
+identity; it does not permit a protocol-6 handshake.
 
 ## Install and lifecycle
 
@@ -114,7 +113,7 @@ current best-effort profile and labels its protocol-5 measurements as dated
 evidence.
 [protocol5-hosted-qualification-2026-08-16.md](./protocol5-hosted-qualification-2026-08-16.md)
 records the hosted protocol-5 qualification. That receipt remains dated
-evidence, not a protocol-6 result.
+evidence, not a protocol-7 result.
 
 [macos-27-native-coherence.md](./macos-27-native-coherence.md) tracks the SDK-27
 API audit and the remaining gaps. New host primitives can strengthen the

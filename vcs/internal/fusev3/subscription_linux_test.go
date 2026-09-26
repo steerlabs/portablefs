@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -501,48 +502,50 @@ func TestSubscriptionSuspendDrainsWorkersBeforeResume(t *testing.T) {
 }
 
 func TestSubscriptionHorizonInvalidatesAllCaches(t *testing.T) {
-	now := time.Now()
-	rpc := &subscriptionTestRPC{
-		horizon: now.Add(time.Minute),
-		pages: []*authoritypb.SubscribeReply{{
-			Watermark: 2, Incarnation: 24, HorizonNanos: uint64(time.Minute), SnapshotId: []byte("replacement"),
-		}},
-	}
-	invalidator := &subscriptionTestInvalidator{}
-	control := &subscriptionTestControl{}
-	registry := newSubscriptionRegistryWithConfig(nil, rpc, control, subscriptionConfig{
-		clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: time.Millisecond,
-		maxPages: 2, invalidator: invalidator,
-	})
-	registry.mu.Lock()
-	registry.active, registry.incarnation = true, 23
-	registry.horizon = now.Add(30 * time.Millisecond)
-	registry.cacheUntil = now.Add(15 * time.Millisecond)
-	registry.mu.Unlock()
+	synctest.Test(t, func(t *testing.T) {
+		now := time.Now()
+		rpc := &subscriptionTestRPC{
+			horizon: now.Add(time.Minute),
+			pages: []*authoritypb.SubscribeReply{{
+				Watermark: 2, Incarnation: 24, HorizonNanos: uint64(time.Minute), SnapshotId: []byte("replacement"),
+			}},
+		}
+		invalidator := &subscriptionTestInvalidator{}
+		control := &subscriptionTestControl{}
+		registry := newSubscriptionRegistryWithConfig(nil, rpc, control, subscriptionConfig{
+			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: time.Millisecond,
+			maxPages: 2, invalidator: invalidator,
+		})
+		registry.mu.Lock()
+		registry.active, registry.incarnation = true, 23
+		registry.horizon = now.Add(30 * time.Millisecond)
+		registry.cacheUntil = now.Add(15 * time.Millisecond)
+		registry.mu.Unlock()
 
-	err := registry.serveIncarnation(context.Background())
-	if !errors.Is(err, errSubscriptionExpired) {
-		t.Fatalf("serve at horizon = %v, want subscription expiry", err)
-	}
-	invalidator.mu.Lock()
-	invalidations := invalidator.all
-	invalidator.mu.Unlock()
-	if invalidations != 1 {
-		t.Fatalf("cold invalidations after horizon = %d, want 1", invalidations)
-	}
-	if stamp := registry.stamp(); stamp != (subscriptionStamp{}) {
-		t.Fatalf("expired subscription issued stamp %+v", stamp)
-	}
-	if err := registry.subscribe(context.Background()); err != nil {
-		t.Fatalf("cold subscribe after horizon: %v", err)
-	}
-	control.mu.Lock()
-	fences := slices.Clone(control.fences)
-	incarnation := control.incarnation
-	control.mu.Unlock()
-	if len(fences) != 1 || incarnation != 24 {
-		t.Fatalf("cold recovery delegation fence/incarnation = %v/%d, want one fence then 24", fences, incarnation)
-	}
+		err := registry.serveIncarnation(context.Background())
+		if !errors.Is(err, errSubscriptionExpired) {
+			t.Fatalf("serve at horizon = %v, want subscription expiry", err)
+		}
+		invalidator.mu.Lock()
+		invalidations := invalidator.all
+		invalidator.mu.Unlock()
+		if invalidations != 1 {
+			t.Fatalf("cold invalidations after horizon = %d, want 1", invalidations)
+		}
+		if stamp := registry.stamp(); stamp != (subscriptionStamp{}) {
+			t.Fatalf("expired subscription issued stamp %+v", stamp)
+		}
+		if err := registry.subscribe(context.Background()); err != nil {
+			t.Fatalf("cold subscribe after horizon: %v", err)
+		}
+		control.mu.Lock()
+		fences := slices.Clone(control.fences)
+		incarnation := control.incarnation
+		control.mu.Unlock()
+		if len(fences) != 1 || incarnation != 24 {
+			t.Fatalf("cold recovery delegation fence/incarnation = %v/%d, want one fence then 24", fences, incarnation)
+		}
+	})
 }
 
 func TestColdSubscriptionNeverClearsEpochStaleness(t *testing.T) {

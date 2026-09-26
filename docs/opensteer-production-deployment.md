@@ -8,7 +8,7 @@ boundary without adding isolation. The `opensteer-production` branch contains
 only reviewed promotion merges whose source tree exactly matches a commit on
 `main`; the deployment workflow verifies that invariant again before building.
 
-## Protocol 7 release 0.4.0
+## Protocol 7 release 0.4.1
 
 Follow the [coherence v2 rollout](coherence-v2/rollout.md) for this wire reset
 and the [OpenSteer pin sheet](coherence-v2/opensteer-pins.md) for consumer edits.

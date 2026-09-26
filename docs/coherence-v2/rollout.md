@@ -1,6 +1,6 @@
 # Protocol 7 fleet rollout
 
-Release candidate: **0.4.0**, product generation v3, authority major **7**,
+Release candidate: **0.4.1**, product generation v3, authority major **7**,
 ALPN `portablefs-authority-v7`. Major 6 cannot attach. Upgrade every Authority,
 every Linux mount, the files gateway, and every Mac client on each volume in
 one maintenance window. A rolling mixed-major upgrade is not supported.
@@ -15,11 +15,11 @@ prerequisites.
 ## Inputs and stop conditions before scheduling
 
 Use one immutable PortableFS source commit for all components. Tag that exact
-commit `v0.4.0` after review and complete CI. `release.yml` publishes
-`portablefs_0.4.0_linux_{amd64,arm64}.tar.gz`,
-`portablefs-server_0.4.0_linux_{amd64,arm64}.tar.gz`, their offline attestation
+commit `v0.4.1` after review and complete CI. `release.yml` publishes
+`portablefs_0.4.1_linux_{amd64,arm64}.tar.gz`,
+`portablefs-server_0.4.1_linux_{amd64,arm64}.tar.gz`, their offline attestation
 bundles and `checksums.txt`, plus
-`portablefs_0.4.0_darwin_universal_app.zip` and its checksum. Each Linux client
+`portablefs_0.4.1_darwin_universal_app.zip` and its checksum. Each Linux client
 archive contains exactly `portablefs` and `portablefsd`; the server archive
 contains `portablefs-authority`.
 

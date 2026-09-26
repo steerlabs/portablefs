@@ -116,7 +116,7 @@ Desktop packaging is another external pin surface, although it is outside the
 requested production Linux path. No current value is checked in. For a Desktop
 build that carries PortableFS, set these build inputs together:
 
-- `OPENSTEER_PORTABLEFS_RELEASE_VERSION=0.4.0`;
+- `OPENSTEER_PORTABLEFS_RELEASE_VERSION=0.4.1`;
 - `OPENSTEER_PORTABLEFS_INSTALLER_SOURCE=<PATH_TO_V7_INSTALL_SH>` from the same
   PortableFS source commit;
 - `OPENSTEER_PORTABLEFS_INSTALLER_SHA256=<UNISSUED_V7_INSTALL_SH_SHA256>`.
@@ -184,7 +184,7 @@ metric.
 
 ## One-change-set procedure after publication
 
-1. Record `<V7_SOURCE_COMMIT>`, `0.4.0`, the immutable
+1. Record `<V7_SOURCE_COMMIT>`, `0.4.1`, the immutable
    `portablefs-files` digest, the aggregate `portablefs-release` digest, the
    capsule's `hosted/bin/portablefs` SHA-256, and the materializer image digest
    from release evidence.
