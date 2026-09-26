@@ -5,13 +5,215 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestFuseMountControlSnapshotRunsDuringRenewal(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	control, err := startFuseReauthorizationControl(func(ctx context.Context, _ string, _ uint64, _ []byte) (time.Time, error) {
+		close(entered)
+		select {
+		case <-release:
+			return time.Now().Add(time.Hour), nil
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		}
+	}, func() (mountLossSnapshot, error) {
+		return mountLossSnapshot{MountInstanceID: lossTestInstance, LossSequence: "7"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	state := &mountState{Strategy: "fuse", MountInstanceID: lossTestInstance, ReauthorizationControlSocket: control.SocketPath()}
+	renewed := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, err := reauthorizeFuseMount(ctx, state, "capability", 1, []byte("certificate"))
+		renewed <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("renewal did not reach the control handler")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	snapshot, err := readFuseMountLoss(ctx, state, lossTestInstance)
+	if err != nil || snapshot.LossSequence != "7" {
+		t.Fatalf("snapshot while renewal is blocked = %+v, %v", snapshot, err)
+	}
+	releaseOnce.Do(func() { close(release) })
+	if err := <-renewed; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFuseMountControlCloseInterruptsIncompleteClient(t *testing.T) {
+	control, err := startFuseReauthorizationControl(nil, func() (mountLossSnapshot, error) {
+		return mountLossSnapshot{MountInstanceID: lossTestInstance, LossSequence: "0"}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection, err := net.Dial("unix", control.SocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.Write([]byte(`{"operation":`)); err != nil {
+		t.Fatal(err)
+	}
+	state := &mountState{Strategy: "fuse", MountInstanceID: lossTestInstance, ReauthorizationControlSocket: control.SocketPath()}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := readFuseMountLoss(ctx, state, lossTestInstance); err != nil {
+		connection.Close()
+		control.Close()
+		t.Fatalf("incomplete peer blocked a later loss snapshot: %v", err)
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- control.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		connection.Close()
+		<-closed
+		t.Fatal("control close waited for an incomplete client request")
+	}
+}
+
+func TestFuseMountControlCloseCancelsActiveRenewal(t *testing.T) {
+	entered, cancelled := make(chan struct{}), make(chan struct{})
+	control, err := startFuseReauthorizationControl(func(ctx context.Context, _ string, _ uint64, _ []byte) (time.Time, error) {
+		close(entered)
+		<-ctx.Done()
+		close(cancelled)
+		return time.Time{}, ctx.Err()
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &mountState{ReauthorizationControlSocket: control.SocketPath()}
+	renewed := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_, err := reauthorizeFuseMount(ctx, state, "capability", 1, []byte("certificate"))
+		renewed <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("renewal did not reach the control handler")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- control.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("control close did not cancel the active renewal")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("renewal handler did not receive cancellation")
+	}
+	if err := <-renewed; err == nil {
+		t.Fatal("renewal succeeded after control shutdown")
+	}
+	if connection, err := net.Dial("unix", control.SocketPath()); err == nil {
+		connection.Close()
+		t.Fatal("closed control socket still accepts connections")
+	}
+}
+
+func TestFuseMountControlBoundsConcurrentHandlers(t *testing.T) {
+	const slots = 8
+	entered, release := make(chan struct{}, slots+1), make(chan struct{})
+	var active, peak atomic.Int32
+	control, err := startFuseReauthorizationControl(func(ctx context.Context, _ string, _ uint64, _ []byte) (time.Time, error) {
+		current := active.Add(1)
+		for previous := peak.Load(); current > previous && !peak.CompareAndSwap(previous, current); previous = peak.Load() {
+		}
+		defer active.Add(-1)
+		entered <- struct{}{}
+		select {
+		case <-release:
+			return time.Now().Add(time.Hour), nil
+		case <-ctx.Done():
+			return time.Time{}, ctx.Err()
+		}
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	state := &mountState{ReauthorizationControlSocket: control.SocketPath()}
+	finished := make(chan error, slots)
+	for i := 1; i <= slots; i++ {
+		go func(sequence uint64) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_, err := reauthorizeFuseMount(ctx, state, "capability", sequence, []byte("certificate"))
+			finished <- err
+		}(uint64(i))
+	}
+	for i := 0; i < slots; i++ {
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of %d bounded handlers entered", i, slots)
+		}
+	}
+	overflow := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		_, err := reauthorizeFuseMount(ctx, state, "capability", slots+1, []byte("certificate"))
+		overflow <- err
+	}()
+	select {
+	case err := <-overflow:
+		if err == nil {
+			t.Fatal("control admitted a ninth renewal beyond its handler capacity")
+		}
+	case <-entered:
+		t.Fatal("server admitted more than its bounded handler capacity")
+	case <-time.After(2 * time.Second):
+		t.Fatal("over-capacity connection was neither refused nor served")
+	}
+	if got := peak.Load(); got != slots {
+		t.Fatalf("peak concurrent handlers = %d, want %d", got, slots)
+	}
+	releaseOnce.Do(func() { close(release) })
+	for i := 0; i < slots; i++ {
+		select {
+		case <-finished:
+		case <-time.After(3 * time.Second):
+			t.Fatal("client did not finish after bounded handlers released")
+		}
+	}
+}
 
 func TestFuseReauthorizationControlUsesLifetimeScopedBoundedAddress(t *testing.T) {
 	first, err := newFuseReauthorizationSocketName()

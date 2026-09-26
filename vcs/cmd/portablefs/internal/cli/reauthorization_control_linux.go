@@ -24,6 +24,7 @@ import (
 )
 
 const maxLocalReauthorizationRequestBytes = (32 << 10) + maxClientIdentityBytes + 4096
+const maxFuseMountControlConnections = 8
 
 const fuseReauthorizationSocketPrefix = "@portablefs-reauthorization-"
 
@@ -46,9 +47,16 @@ type localReauthorizationResponse struct {
 
 type unixReauthorizationControl struct {
 	done         chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
 	handler      fuseReauthorizationHandler
 	lossSnapshot fuseLossSnapshotHandler
 	listener     *net.UnixListener
+	mu           sync.Mutex
+	connections  map[*net.UnixConn]struct{}
+	workers      sync.WaitGroup
+	closed       bool
+	closeErr     error
 	once         sync.Once
 	path         string
 }
@@ -65,8 +73,11 @@ func startFuseReauthorizationControl(handler fuseReauthorizationHandler, lossSna
 	if err != nil {
 		return nil, fmt.Errorf("listen on reauthorization control socket: %w", err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	control := &unixReauthorizationControl{
-		done: make(chan struct{}), handler: handler, lossSnapshot: lossSnapshot, listener: listener, path: path,
+		done: make(chan struct{}), ctx: ctx, cancel: cancel,
+		handler: handler, lossSnapshot: lossSnapshot, listener: listener,
+		connections: make(map[*net.UnixConn]struct{}), path: path,
 	}
 	go control.serve()
 	return control, nil
@@ -103,25 +114,56 @@ func validReauthorizationControlAddress(address string) bool {
 func (c *unixReauthorizationControl) SocketPath() string { return c.path }
 
 func (c *unixReauthorizationControl) Close() error {
-	var closeErr error
 	c.once.Do(func() {
-		closeErr = c.listener.Close()
+		c.mu.Lock()
+		c.closed = true
+		c.cancel()
+		c.closeErr = c.listener.Close()
+		for connection := range c.connections {
+			_ = connection.Close()
+		}
+		c.mu.Unlock()
 		<-c.done
 	})
-	if errors.Is(closeErr, net.ErrClosed) {
+	if errors.Is(c.closeErr, net.ErrClosed) {
 		return nil
 	}
-	return closeErr
+	return c.closeErr
 }
 
 func (c *unixReauthorizationControl) serve() {
-	defer close(c.done)
+	defer func() {
+		c.workers.Wait()
+		close(c.done)
+	}()
 	for {
 		connection, err := c.listener.AcceptUnix()
 		if err != nil {
 			return
 		}
-		c.handle(connection)
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			_ = connection.Close()
+			return
+		}
+		if len(c.connections) >= maxFuseMountControlConnections {
+			c.mu.Unlock()
+			_ = connection.Close()
+			continue
+		}
+		// Parallel bounded handlers keep renewal and incomplete peers from
+		// delaying the mount's live loss observation.
+		c.connections[connection] = struct{}{}
+		c.workers.Add(1)
+		c.mu.Unlock()
+		go func() {
+			defer c.workers.Done()
+			c.handle(connection)
+			c.mu.Lock()
+			delete(c.connections, connection)
+			c.mu.Unlock()
+		}()
 	}
 }
 
@@ -166,7 +208,7 @@ func (c *unixReauthorizationControl) handle(connection *net.UnixConn) {
 		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "reauthorization unavailable or invalid request"})
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
 	deadline, err := c.handler(ctx, request.Capability, request.Sequence, []byte(request.ClientCertificatePEM))
 	if err != nil {

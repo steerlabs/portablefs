@@ -5,11 +5,12 @@ ALPN `portablefs-authority-v7`. Major 6 cannot attach. Upgrade every Authority,
 every Linux mount, the files gateway, and every Mac client on each volume in
 one maintenance window. A rolling mixed-major upgrade is not supported.
 
-This is a preparation runbook, not deployment evidence. The latest G2 entries
-in [integration.md](integration.md) still require final full qualification;
-run 156 and the full-size figures in [results.md](results.md) precede those
-changes. REL runs the default local gate only. Publication, production kernel
-proofs, and live staging/Mac tests remain release prerequisites.
+This is a preparation runbook, not deployment evidence. The G6 entries in
+[integration.md](integration.md) record a full local gate, complete Linux soak,
+and baseline for the earlier G6 tree. The subsequent `20f12da` ownership and
+mount-lifetime changes require qualification on that exact release commit.
+Publication, production kernel proofs, and live staging/Mac tests remain release
+prerequisites.
 
 ## Inputs and stop conditions before scheduling
 
@@ -35,13 +36,12 @@ before publication. The release-trust gate checks this effective packaging
 boundary and consistent project defaults; it does not require release work to
 rewrite the Swift projects.
 
-The REL Xcode settings preflight found a product-owned lockfile mismatch:
-`swift/PortableFSApp/PortableFSApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
-still pins SwiftProtobuf 1.29.0, while `swift/PortableFSKit/Package.swift` requires
-exact 1.38.1 and its package lock records that version. Strict locked resolution
-refuses the app project. The product owner must reconcile the app lock before
-publication; REL does not edit `swift/`. Passing native Swift tests does not
-prove that the shipping app archives with locked dependencies.
+The 2026-09-16 REL Xcode settings preflight found that the shipping app pinned
+SwiftProtobuf 1.29.0 while `swift/PortableFSKit/Package.swift` required exact
+1.38.1. Commit `20f12da` aligned the app and Kit lockfiles at 1.38.1 and made
+the app packager require resolved package versions. Passing native Swift tests
+and matching lockfiles do not prove that the shipping app archives under locked
+resolution. Verify that archive for the exact release commit before publication.
 
 `files-image.yml` on `main` publishes the verified files image followed by the
 aggregate capsule under
@@ -308,7 +308,8 @@ go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.10 .github/workflows/*.ym
 The gate also passed release trust, deployment inventory, registry tests, and
 architecture scans. An isolated Xcode settings check confirmed effective
 `MARKETING_VERSION=0.4.0` and build 400 for the app and extension; it was not
-a signed archive and did not resolve the checked-in lockfile mismatch.
+a signed archive. The app lockfile mismatch observed in this dated receipt was
+resolved later by `20f12da` and still requires archive verification as above.
 The first invocation stopped at the old source-default
 version check; the complete repeat passed after the release policy checked the
 packager's VERSION override and exact output versions instead. REL made no
