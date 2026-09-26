@@ -36,6 +36,7 @@ MOUNTS (this machine)
   reauthorize <path>           rotate a hosted mount's exact live authorization
   umount <path>                drain and detach one mounted volume
   mounts                       list this machine's mounts and their health
+  mount-loss <path>            read an exact live Linux writeback loss counter
   route <path>                 is this path machine-local or shared, and by which rule
   prune-local                  reclaim machine-local backing no route can reach
   daemon stop                  stop an idle daemon (Linux; host-owned update only on macOS)
@@ -280,6 +281,16 @@ mounted. Never edit ~/.local/state/portablefs/mounts by hand.
 Every probe of the mount path and every external unmount helper is bounded, so
 umount always reaches a verdict even when the filesystem has stopped answering,
 and no umount path — including --force — ever reads standard input.
+`,
+		"mount-loss": `USAGE
+  portablefs mount-loss <mountPath> --mount-instance <id> [--json]
+
+Read the exact live Linux mount's monotonically increasing writeback loss counter.
+The response names the mount instance and encodes lossSequence as a decimal
+string, preserving its full uint64 range. Missing, replaced, unsupported, and
+unreachable supervisors fail; persisted health and log samples are never used.
+This observation does not flush data. Retain a verified root descriptor before
+querying and fsync that same descriptor to finish a durability boundary.
 `,
 		"mounts": `USAGE
   portablefs mounts [--json]

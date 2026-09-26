@@ -410,34 +410,45 @@ func TestCopyFileRangeLocksResolvedIdentitiesThroughBothSnapshots(t *testing.T) 
 	}
 }
 
-func TestCopyFileRangeRecallsLeasesHeldOnlyOnSource(t *testing.T) {
+func TestCopyFileRangeBreaksDelegationHeldOnlyOnSource(t *testing.T) {
 	h, source, store, input, output := newRangeMutationHarness(t)
 	store.copyCount = 5
 	store.copyPost = xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 0x31, Size: 20, Mode: 0o600, Nlink: 1}
-	observer, err := h.Runtime.AttachActiveForTest(2, volumeserver.PeerIdentity{0x72}, volumeserver.Authorization{
-		Access: volumeserver.AccessRead, Deadline: time.Now().Add(time.Hour),
-	})
+	observer := volumeserver.SessionID{0x72}
+	if err := h.startSessionResources(observer, xfsstore.Capability{0x11}, 2, [32]byte{}); err != nil {
+		t.Fatal(err)
+	}
+	sourceToken, err := h.coherenceToken(source.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := h.Runtime.SessionTerminal(observer.ID)
+	observerToken, err := h.coherenceToken(observer)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Leases.ActivateHolder(observer.ID, terminal); err != nil {
 		t.Fatal(err)
 	}
 	sourceIdentity := [16]byte{input[0]}
-	for _, grant := range []struct {
-		coordinate volumeserver.LeaseCoordinate
-		right      volumeserver.LeaseRight
-	}{
-		{volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyData, Identity: sourceIdentity}, volumeserver.LeaseRightDataRead},
-		{volumeserver.LeaseCoordinate{Family: volumeserver.LeaseFamilyAttributes, Identity: sourceIdentity}, volumeserver.LeaseRightAttributesRead},
-	} {
-		if _, err := h.Leases.Grant(t.Context(), observer.ID, grant.coordinate, grant.right); err != nil {
-			t.Fatal(err)
-		}
+	reservation, err := h.Coherence.Reserve(t.Context(), observerToken, sourceIdentity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceEvents, err := h.Coherence.Poll(t.Context(), sourceToken, 0, nil, 16)
+	if err != nil || len(sourceEvents) == 0 {
+		t.Fatalf("source withdrawal events = %+v, err %v", sourceEvents, err)
+	}
+	if err := h.Coherence.Ack(sourceToken, sourceEvents[len(sourceEvents)-1].Position); err != nil {
+		t.Fatal(err)
+	}
+	grant, err := reservation.Grant(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	observerEvents, err := h.Coherence.Poll(t.Context(), observerToken, 0, nil, 16)
+	if err != nil || len(observerEvents) == 0 {
+		t.Fatalf("holder grant events = %+v, err %v", observerEvents, err)
+	}
+	after := observerEvents[len(observerEvents)-1].Position
+	if err := h.Coherence.Ack(observerToken, after); err != nil {
+		t.Fatal(err)
 	}
 
 	request := copyMutationRequest(1, input, output)
@@ -447,54 +458,67 @@ func TestCopyFileRangeRecallsLeasesHeldOnlyOnSource(t *testing.T) {
 	}()
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	revoke, err := h.Leases.Next(ctx, observer.ID, volumeserver.LeaseEventCursor{})
+	events, err := h.Coherence.Poll(ctx, observerToken, after, nil, 16)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if revoke.Cursor.Phase != volumeserver.LeaseEventRevoke || len(revoke.Recalls) != 2 {
-		t.Fatalf("source-only REVOKE = %#v", revoke)
-	}
-	for _, recall := range revoke.Recalls {
-		if recall.Coordinate.Identity != sourceIdentity ||
-			(recall.Coordinate.Family != volumeserver.LeaseFamilyData && recall.Coordinate.Family != volumeserver.LeaseFamilyAttributes) {
-			t.Fatalf("source-only recall = %#v", recall)
+	var breakEvent volumeserver.StreamEvent
+	for _, event := range events {
+		if event.Kind == volumeserver.StreamBreakForRead {
+			breakEvent = event
+			break
 		}
 	}
-	if err := h.Leases.AcknowledgeRevoke(observer.ID, revoke.Cursor); err != nil {
+	if breakEvent.Kind != volumeserver.StreamBreakForRead || breakEvent.Delegation.Identity != sourceIdentity {
+		t.Fatalf("source-only break events = %+v", events)
+	}
+	if store.copyCalls.Load() != 0 {
+		t.Fatal("COPY_FILE_RANGE reached storage before the source break acknowledgment")
+	}
+	if err := h.Coherence.AckDelegation(
+		observerToken, sourceIdentity, grant.ID, grant.Generation,
+		breakEvent.Request, breakEvent.AppliedSequence,
+	); err != nil {
 		t.Fatal(err)
 	}
-	complete, err := h.Leases.Next(ctx, observer.ID, revoke.Cursor)
-	if err != nil {
+	if err := h.Coherence.Ack(observerToken, events[len(events)-1].Position); err != nil {
 		t.Fatal(err)
 	}
-	if complete.Cursor.Phase != volumeserver.LeaseEventComplete || len(complete.PostState) != 2 {
-		t.Fatalf("source-only COMPLETE = %#v", complete)
-	}
-	var sourceState *volumeserver.VisibilityObjectPostState
-	for index := range complete.PostState {
-		if complete.PostState[index].StableIdentity == sourceIdentity {
-			sourceState = &complete.PostState[index]
+
+	drainCtx, stopDrains := context.WithCancel(ctx)
+	defer stopDrains()
+	drainErrors := make(chan error, 2)
+	drain := func(token volumeserver.SubscriptionToken, cursor uint64) {
+		for {
+			batch, pollErr := h.Coherence.Poll(drainCtx, token, cursor, nil, 16)
+			if pollErr != nil {
+				if drainCtx.Err() == nil {
+					drainErrors <- pollErr
+				}
+				return
+			}
+			cursor = batch[len(batch)-1].Position
+			if ackErr := h.Coherence.Ack(token, cursor); ackErr != nil {
+				drainErrors <- ackErr
+				return
+			}
 		}
 	}
-	if sourceState == nil || sourceState.Roles != postStateRoleSource || sourceState.Attr.Inode != uint64(input[0]) || sourceState.ObjectVersion != 1 {
-		t.Fatalf("source-only exact post-state = %#v", sourceState)
-	}
-	discharges := make([]volumeserver.LeaseDischarge, len(complete.Recalls))
-	for index, recall := range complete.Recalls {
-		discharges[index] = volumeserver.LeaseDischarge{
-			Coordinate: recall.Coordinate, RevokeEpoch: recall.RevokeEpoch, Mode: volumeserver.LeaseDischargeToNone,
-		}
-	}
-	if err := h.Leases.Discharge(observer.ID, complete.Cursor, discharges); err != nil {
-		t.Fatal(err)
-	}
+	go drain(sourceToken, sourceEvents[len(sourceEvents)-1].Position)
+	go drain(observerToken, events[len(events)-1].Position)
 	select {
 	case got := <-response:
+		stopDrains()
 		if got.GetErrno() != 0 || got.GetUncertain() {
 			t.Fatalf("COPY_FILE_RANGE = %+v", got)
 		}
+		if _, held := h.Coherence.LookupDelegation(sourceIdentity); !held {
+			t.Fatal("source break retired ownership instead of retaining it")
+		}
+	case drainErr := <-drainErrors:
+		t.Fatal(drainErr)
 	case <-ctx.Done():
-		t.Fatal("COPY_FILE_RANGE did not finish after source-only repair")
+		t.Fatal(ctx.Err())
 	}
 }
 

@@ -133,3 +133,25 @@ func TestServerServingObserverTracksTLSAcceptLoop(t *testing.T) {
 		t.Fatal("TLS accept loop did not clear readiness")
 	}
 }
+
+func TestProtocolSevenOperationMetrics(t *testing.T) {
+	for _, tc := range []struct {
+		request *authoritypb.Request
+		want    authoritymetrics.Operation
+	}{
+		{&authoritypb.Request{Body: &authoritypb.Request_Subscribe{}}, authoritymetrics.OperationSubscribe},
+		{&authoritypb.Request{Body: &authoritypb.Request_RenewSubscription{}}, authoritymetrics.OperationRenewSubscription},
+		{&authoritypb.Request{Body: &authoritypb.Request_NextControlEvent{}}, authoritymetrics.OperationNextControlEvent},
+		{&authoritypb.Request{Body: &authoritypb.Request_ChangeAck{}}, authoritymetrics.OperationChangeAck},
+		{&authoritypb.Request{Body: &authoritypb.Request_DelegationRecallAck{}}, authoritymetrics.OperationDelegationRecallAck},
+		{&authoritypb.Request{Body: &authoritypb.Request_DelegationBreakAck{}}, authoritymetrics.OperationDelegationBreakAck},
+		{&authoritypb.Request{Body: &authoritypb.Request_DelegationModeChangeAck{}}, authoritymetrics.OperationDelegationModeChangeAck},
+		{&authoritypb.Request{Body: &authoritypb.Request_DelegationRelease{}}, authoritymetrics.OperationDelegationRelease},
+		{&authoritypb.Request{Body: &authoritypb.Request_Barrier{}}, authoritymetrics.OperationBarrier},
+		{&authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{}}, authoritymetrics.OperationWaitVisibility},
+	} {
+		if got := requestOperation(tc.request); got != tc.want || got.String() == "unknown" {
+			t.Errorf("%T mapped to %v, want %v", tc.request.Body, got, tc.want)
+		}
+	}
+}

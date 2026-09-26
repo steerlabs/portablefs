@@ -127,6 +127,7 @@ trap 'exit 143' TERM
 set -- xcodebuild \
   -project "$project" \
   -scheme PortableFSApp \
+  -onlyUsePackageVersionsFromResolvedFile \
   -configuration "$configuration" \
   -destination "generic/platform=macOS" \
   -archivePath "$archive" \

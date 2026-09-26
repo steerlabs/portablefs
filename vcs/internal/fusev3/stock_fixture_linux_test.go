@@ -121,11 +121,14 @@ func newStrictFixture(t *testing.T) *strictFixture {
 	cfg.CachedNameCapacity = 32
 	cfg.RepairBudget = 5 * time.Second
 	mount := newMount(context.Background(), rpc, cfg)
-	t.Cleanup(mount.cancel)
+	t.Cleanup(func() { mount.cancel(); mount.delegations.Stop() })
 	root := &node{mount: mount, item: testItem(1, authoritypb.Attr_DIRECTORY, 0), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
 	raw := newRawFileSystem(mount, root)
 	notify := &fakeNotifier{}
 	mount.setNotifier(notify)
+	if err := mount.subscription.subscribe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	fixture := &strictFixture{t: t, raw: raw, mount: mount, rpc: rpc, notify: notify}
 	fixture.unique.Store(2)
 	return fixture

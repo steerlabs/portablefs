@@ -13,11 +13,13 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"math/big"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
@@ -127,10 +129,6 @@ const (
 	// The strict cache commitment every mount in this fixture declares.
 	integrationCachedNames  = 4096
 	integrationRepairBudget = 20 * time.Second
-	// The protocol-6 cache-authority bounds, at the production defaults.
-	integrationCacheLeaseTTL         = volumeserver.Protocol6MaxLeaseTTL
-	integrationCacheLeasesPerSession = 65536
-	integrationCacheLeases           = 1 << 20
 
 	// Match the production authority's bounded standard-WRITE admission
 	// profile without making the integration fixture a weaker peer than the
@@ -146,17 +144,27 @@ const (
 
 type integrationAuthorizer struct{ now func() time.Time }
 
-func (a integrationAuthorizer) Authorize(context.Context, string, []byte) (volumeserver.Authorization, error) {
+func (a integrationAuthorizer) Authorize(_ context.Context, _ string, token []byte) (volumeserver.Authorization, error) {
+	access := volumeserver.AccessRead | volumeserver.AccessWrite
+	if string(token) == "gateway-read-capability" {
+		access = volumeserver.AccessRead
+	}
 	// The signed authorization deadline is deliberately far beyond anything a
 	// test advances the clock to, so lease expiry is what the session tests
 	// observe rather than an incidentally expired grant.
 	return volumeserver.Authorization{
-		Access:   volumeserver.AccessRead | volumeserver.AccessWrite,
+		Access:   access,
 		Deadline: a.now().Add(24 * time.Hour),
 	}, nil
 }
 
 type integrationConfig struct {
+	latencies fuse.LatencyMap
+	// The shipping CLI lifecycle test owns its mounts and uses signed hosted
+	// grants, while sharing this fixture's actual XFS/authority assembly.
+	skipMounts    bool
+	listenAddress string
+	authorizer    func() authorityrpc.Authorizer
 	// Mounts is the number of independent kernel FUSE mounts of the same
 	// volume. Defaults to two, the minimum needed to observe coherence.
 	Mounts int
@@ -167,6 +175,15 @@ type integrationConfig struct {
 	// activates, in the syntax the volume file carries. Empty means the volume
 	// declares nothing and every path is served from the authority.
 	Routes string
+	// MaxItemsPerSession and MaxItems override the descriptor-backed item
+	// table bounds for workloads whose deliberate working set exceeds the
+	// fixture's compact default. Zero preserves the normal integration limits.
+	MaxItemsPerSession uint32
+	MaxItems           uint32
+	// CachedNameCapacity overrides the compact integration cache. Zero keeps
+	// the existing 4,096-name test profile.
+	CachedNameCapacity int
+	wrapListener       func(net.Listener) net.Listener
 
 	// rules is the compiled form of Routes, derived in newIntegrationFixture.
 	rules localroutes.RuleSet
@@ -223,10 +240,54 @@ func (m *recordingMembership) activeCount() int {
 // requires.
 type integrationTransport struct {
 	*authorityrpc.Client
-	session        []byte
-	hookMu         sync.Mutex
-	beforeMutation func(*authoritypb.Request)
-	afterMutation  func(*authoritypb.Request, *authoritypb.Response, error)
+	session                  []byte
+	hookMu                   sync.Mutex
+	beforeMutation           func(*authoritypb.Request)
+	beforeDelegatedMutation  func(context.Context, *authoritypb.Request) error
+	afterMutation            func(*authoritypb.Request, *authoritypb.Response, error)
+	afterControlEvent        func(context.Context, *authoritypb.ControlEvent) error
+	afterSubscriptionRenewal func(time.Time, error)
+}
+
+// The partition test can stall DATA admission before assigning a replay slot.
+// CONTROL still uses the actual TLS transport and its natural horizon.
+func (t *integrationTransport) CallMutation(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
+	t.hookMu.Lock()
+	before := t.beforeDelegatedMutation
+	t.hookMu.Unlock()
+	if before != nil {
+		if err := before(ctx, request); err != nil {
+			return nil, err
+		}
+	}
+	return t.Client.CallMutation(ctx, request)
+}
+
+func (t *integrationTransport) CallMutationSegments(ctx context.Context, request *authoritypb.Request, segments [][]byte, assigned authorityrpc.MutationAssigned) (*authoritypb.Response, error) {
+	t.hookMu.Lock()
+	before := t.beforeDelegatedMutation
+	t.hookMu.Unlock()
+	if before != nil {
+		if err := before(ctx, request); err != nil {
+			return nil, err
+		}
+	}
+	return t.Client.CallMutationSegments(ctx, request, segments, assigned)
+}
+
+func TestIntegrationPartitionHookCoversScatterFlush(t *testing.T) {
+	injected := errors.New("partition before replay admission")
+	transport := &integrationTransport{beforeDelegatedMutation: func(context.Context, *authoritypb.Request) error { return injected }}
+	request := &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{Size: 1, Delegation: &authoritypb.DelegationRef{}}}}
+	if _, err := transport.CallMutation(t.Context(), request); !errors.Is(err, injected) {
+		t.Fatal(err)
+	}
+	if _, err := transport.CallMutationSegments(t.Context(), request, [][]byte{{1}}, func(authorityrpc.MutationIdentity) error {
+		t.Error("partitioned flush assigned a replay slot")
+		return nil
+	}); !errors.Is(err, injected) {
+		t.Fatal(err)
+	}
 }
 
 func (t *integrationTransport) SessionID() []byte { return append([]byte(nil), t.session...) }
@@ -312,10 +373,12 @@ type integrationFixture struct {
 	store        *xfsstore.Volume
 	routes       *authorityrpc.RoutesController
 	authority    *volumeserver.Authority
+	coherence    *volumeserver.CoherenceCoordinator
 	fskitStaging *authorityrpc.FskitWriteStaging
 	membership   *recordingMembership
 	fencer       *recordingFencer
 	counter      *countingHandler
+	server       *authorityrpc.Server
 	listener     net.Listener
 	stopServe    context.CancelFunc
 	served       chan error
@@ -333,6 +396,15 @@ func newIntegrationFixture(t *testing.T, cfg integrationConfig) *integrationFixt
 	}
 	if cfg.SessionLease <= 0 {
 		cfg.SessionLease = time.Minute
+	}
+	if cfg.MaxItemsPerSession == 0 {
+		cfg.MaxItemsPerSession = 4096
+	}
+	if cfg.MaxItems == 0 {
+		cfg.MaxItems = 16384
+	}
+	if cfg.CachedNameCapacity == 0 {
+		cfg.CachedNameCapacity = integrationCachedNames
 	}
 	rules, err := ActivateRoutes([]byte(cfg.Routes))
 	if err != nil {
@@ -451,19 +523,24 @@ func (f *integrationFixture) start() {
 		t.Fatalf("create authority epoch: %v", err)
 	}
 	f.authority = authority
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	address := f.cfg.listenAddress
+	if address == "" {
+		address = "127.0.0.1:0"
+	}
+	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
+	}
+	if f.cfg.wrapListener != nil {
+		listener = f.cfg.wrapListener(listener)
 	}
 	f.listener = listener
 	f.membership = newRecordingMembership()
 	f.fencer = &recordingFencer{inner: authority}
 	// The FSKit-write bounds are what makes this authority able to accept a
 	// synchronous-repair frontend at all: HELLO refuses that profile outright
-	// unless they are complete. Nothing in this fixture issues an FSKit write --
-	// the only sync-repair participant here is the read-only files gateway --
-	// but an authority that could not have accepted one would be answering a
-	// handshake production never runs.
+	// unless they are complete. The cacheless gateway never enters that profile;
+	// keeping the Mac bounds here matches the production authority assembly.
 	fskitStaging, err := authorityrpc.OpenFskitWriteStaging(f.writeStagingRoot)
 	if err != nil {
 		t.Fatalf("open FSKit write staging: %v", err)
@@ -477,13 +554,12 @@ func (f *integrationFixture) start() {
 	coordination, err := authorityrpc.NewCoordination(authorityrpc.CoordinationConfig{
 		Store: store, Fencer: f.fencer, Locks: authority.Locks(), Membership: f.membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
-		MaxCachedNameCapacity: integrationCachedNames, MaxRepairBudget: time.Minute,
-		CacheLeaseTTL: integrationCacheLeaseTTL, MaxCacheLeasesPerSession: integrationCacheLeasesPerSession,
-		MaxCacheLeases: integrationCacheLeases, Now: f.now,
+		MaxCachedNameCapacity: uint64(f.cfg.CachedNameCapacity), MaxRepairBudget: time.Minute, Now: f.now,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)
 	}
+	f.coherence = coordination.Coherence
 	routes := coordination.Routes
 	active, err := routes.Revision()
 	if err != nil {
@@ -497,7 +573,8 @@ func (f *integrationFixture) start() {
 		Store: store, Runtime: authority, Authorizer: integrationAuthorizer{now: f.now},
 		MaxFrame: integrationMaxFrame, MaxRead: 1 << 20, MaxWrite: 1 << 20,
 		MaxInFlight:        integrationServerInFlight,
-		MaxItemsPerSession: 4096, MaxOpensPerSession: 4096, MaxItems: 16384, MaxOpens: 16384,
+		MaxItemsPerSession: f.cfg.MaxItemsPerSession, MaxOpensPerSession: 4096,
+		MaxItems: f.cfg.MaxItems, MaxOpens: 16384,
 		MaxRetainedReplyBytes:         integrationAllocationBudget,
 		WriteAdmission:                f.writeAdmission,
 		MaxWriteBytesPerSession:       integrationWriteBytesPerSession,
@@ -517,21 +594,27 @@ func (f *integrationFixture) start() {
 		FskitWriteProgressTimeout:           integrationWriteProgressTimeout,
 		FskitWriteAbsoluteTimeout:           integrationWriteAbsoluteTimeout,
 	}
+	if f.cfg.authorizer != nil {
+		handler.Authorizer = f.cfg.authorizer()
+	}
 	coordination.Bind(handler)
 	f.counter = &countingHandler{inner: handler}
 	ctx, cancel := context.WithCancel(context.Background())
 	f.stopServe, f.served, f.stopped = cancel, make(chan error, 1), false
 	served := f.served
+	f.server = &authorityrpc.Server{
+		Handler: f.counter, MaxFrame: integrationMaxFrame,
+		MaxInFlight: integrationServerInFlight, MaxConnections: 16,
+		MaxFrameBytesInFlight: integrationAllocationBudget,
+		HandshakeTimeout:      5 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second,
+	}
 	go func() {
-		served <- (&authorityrpc.Server{
-			Handler: f.counter, MaxFrame: integrationMaxFrame,
-			MaxInFlight: integrationServerInFlight, MaxConnections: 16,
-			MaxFrameBytesInFlight: integrationAllocationBudget,
-			HandshakeTimeout:      5 * time.Second, IdleTimeout: 2 * time.Minute, WriteTimeout: 30 * time.Second,
-		}).Serve(ctx, listener, f.serverTLS)
+		pprof.Do(ctx, pprof.Labels("component", "authority"), func(ctx context.Context) { served <- f.server.Serve(ctx, listener, f.serverTLS) })
 	}()
 
-	f.mountAll()
+	if !f.cfg.skipMounts {
+		pprof.Do(ctx, pprof.Labels("component", "frontend"), func(context.Context) { f.mountAll() })
+	}
 }
 
 // mountAll installs every mountpoint against the running authority, each
@@ -552,10 +635,10 @@ func (f *integrationFixture) mountAll() {
 			// out of this number, so it must be exactly the transport's bound.
 			MaxInFlight:  integrationMaxInFlight,
 			PresentedUID: uint32(os.Geteuid()), PresentedGID: uint32(os.Getegid()),
-			Coherence: CoherenceStrict, CachedNameCapacity: integrationCachedNames,
+			Coherence: CoherenceStrict, CachedNameCapacity: f.cfg.CachedNameCapacity,
 			RepairBudget: integrationRepairBudget,
 			Routes:       f.cfg.rules, LocalBacking: f.backing[i],
-			Debug: os.Getenv(envFUSEDebug) == "1",
+			Debug: os.Getenv(envFUSEDebug) == "1", latencies: f.cfg.latencies,
 		})
 		if err != nil {
 			t.Fatalf("mount %s: %v", f.paths[i], err)
@@ -623,6 +706,22 @@ func (f *integrationFixture) stopAuthority() {
 	if err := f.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Errorf("close authority listener: %v", err)
 	}
+}
+
+// resumeAuthority retains the epoch, sessions, and transport replay registry.
+func (f *integrationFixture) resumeAuthority() {
+	f.t.Helper()
+	listener, err := net.Listen("tcp", f.listener.Addr().String())
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.listener = listener
+	ctx, cancel := context.WithCancel(context.Background())
+	f.stopServe, f.served, f.stopped = cancel, make(chan error, 1), false
+	served := f.served
+	go func() {
+		pprof.Do(ctx, pprof.Labels("component", "authority"), func(ctx context.Context) { served <- f.server.Serve(ctx, listener, f.serverTLS) })
+	}()
 }
 
 func (f *integrationFixture) closeStore() {
@@ -931,6 +1030,8 @@ type integrationCredentials struct {
 	ClientPrivateKeyPEM  []byte
 	// ServerName is the name the authority's leaf certificate carries.
 	ServerName string
+	issuer     *x509.Certificate
+	issuerKey  ed25519.PrivateKey
 }
 
 func integrationTLS(t *testing.T) (*tls.Config, *tls.Config, integrationCredentials) {
@@ -980,6 +1081,8 @@ func integrationTLS(t *testing.T) (*tls.Config, *tls.Config, integrationCredenti
 		ClientCertificatePEM: clientCertPEM,
 		ClientPrivateKeyPEM:  clientKeyPEM,
 		ServerName:           "localhost",
+		issuer:               ca,
+		issuerKey:            caKey,
 	}
 	return &tls.Config{MinVersion: tls.VersionTLS13, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: pool, Certificates: []tls.Certificate{serverCertificate}},
 		&tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, Certificates: []tls.Certificate{clientCertificate}, ServerName: "localhost"},
@@ -995,7 +1098,14 @@ type countingHandler struct {
 	mu           sync.Mutex
 	byKind       map[string]int
 	beforeHandle func(*authoritypb.Request)
+	// Benchmarks opt in before opening workload descriptors so asynchronous
+	// FUSE RELEASE calls can be drained across measurement boundaries.
+	trackOpens     bool
+	openOperations int
+	openHandles    map[integrationOpenKey]struct{}
 }
+
+type integrationOpenKey struct{ session, handle string }
 
 func (h *countingHandler) Epoch() []byte                        { return h.inner.Epoch() }
 func (h *countingHandler) Bounds() authorityrpc.TransportBounds { return h.inner.Bounds() }
@@ -1013,11 +1123,46 @@ func (h *countingHandler) Handle(ctx context.Context, request *authoritypb.Reque
 	}
 	h.byKind[requestKind(request)]++
 	before := h.beforeHandle
+	track := h.trackOpens && (request.GetOpen() != nil || request.GetCreate() != nil || request.GetTmpfile() != nil || request.GetClose() != nil || request.GetCloseBatch() != nil)
+	if track {
+		h.openOperations++
+	}
 	h.mu.Unlock()
 	if before != nil {
 		before(request)
 	}
-	return h.inner.Handle(ctx, request)
+	response := h.inner.Handle(ctx, request)
+	if track {
+		h.mu.Lock()
+		if response != nil && response.GetErrno() == 0 && !response.GetUncertain() {
+			var opened []byte
+			switch {
+			case response.GetOpen() != nil:
+				opened = response.GetOpen().GetHandle()
+			case response.GetCreate() != nil:
+				opened = response.GetCreate().GetHandle()
+			case response.GetTmpfile() != nil:
+				opened = response.GetTmpfile().GetHandle()
+			}
+			session := string(request.GetSession().GetId())
+			if len(opened) != 0 {
+				h.openHandles[integrationOpenKey{session, string(opened)}] = struct{}{}
+			}
+			if batch := request.GetCloseBatch(); batch != nil && len(response.GetCloseBatch().GetResults()) == len(batch.Closes) {
+				for i, result := range response.GetCloseBatch().Results {
+					if result != nil && (result.Retired || result.Errno == 0 && result.Failure == 0) {
+						delete(h.openHandles, integrationOpenKey{session, string(batch.Closes[i].Handle)})
+					}
+				}
+			}
+			if close := request.GetClose(); close != nil {
+				delete(h.openHandles, integrationOpenKey{session, string(close.GetHandle())})
+			}
+		}
+		h.openOperations--
+		h.mu.Unlock()
+	}
+	return response
 }
 
 func (h *countingHandler) setBeforeHandle(before func(*authoritypb.Request)) {
@@ -1038,14 +1183,18 @@ func (h *countingHandler) count(kind string) int {
 // coherence.
 func requestKind(request *authoritypb.Request) string {
 	switch {
+	case request.GetFlush() != nil:
+		return "flush"
+	case request.GetBarrier() != nil:
+		return "barrier"
 	case request.GetLookup() != nil:
 		return "lookup"
 	case request.GetGetAttr() != nil:
 		return "getattr"
-	case request.GetNextLeaseEvent() != nil:
-		return "next-lease-event"
-	case request.GetAcknowledgeLeaseEvent() != nil:
-		return "ack-lease-event"
+	case request.GetNextControlEvent() != nil:
+		return "next-control-event"
+	case request.GetChangeAck() != nil:
+		return "change-ack"
 	case request.GetReclaim() != nil:
 		return "reclaim"
 	case request.GetKeepAlive() != nil:
@@ -1069,6 +1218,8 @@ func requestKind(request *authoritypb.Request) string {
 		return "rename"
 	case request.GetOpen() != nil:
 		return "open"
+	case request.GetCloseBatch() != nil:
+		return "close_batch"
 	case request.GetClose() != nil:
 		return "close"
 	case request.GetReadDir() != nil:
@@ -1098,4 +1249,57 @@ func (f *integrationFixture) countRequests(kind string, fn func()) int {
 	before := f.counter.count(kind)
 	fn()
 	return f.counter.count(kind) - before
+}
+
+// Cache-reuse proofs must open their reader after the asynchronous RELEASE
+// completes. An open while a delegation exists is deliberately direct-I/O.
+func (f *integrationFixture) waitForDelegationReleases(t *testing.T) {
+	t.Helper()
+	waitUntil(t, 2*time.Second, "closed writable handles to release delegations", func() bool {
+		for _, mount := range f.mounts {
+			m := mount.delegations
+			m.mu.Lock()
+			states := make([]*delegationState, 0, len(m.byID))
+			for _, state := range m.byID {
+				states = append(states, state)
+			}
+			m.mu.Unlock()
+			for _, state := range states {
+				state.admission.RLock()
+				owned := state.ref != nil
+				state.admission.RUnlock()
+				if owned {
+					return false
+				}
+			}
+			mount.subscription.mu.RLock()
+			pending := len(mount.subscription.delegated)
+			mount.subscription.mu.RUnlock()
+			if pending != 0 {
+				return false
+			}
+		}
+		return true
+	})
+	// Local ref removal precedes delivery of the grant/release stream pair.
+	// Drain the Authority's exact current prefix before warming any cache.
+	position := f.coherence.OnCommit(nil)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	if err := f.coherence.WaitWithdrawn(ctx, position, volumeserver.SessionID{}); err != nil {
+		t.Fatalf("drain delegation release changes through %d: %v", position, err)
+	}
+}
+
+// countLookupName isolates the withdrawn component from parent attribute misses.
+func (f *integrationFixture) countLookupName(name string, fn func()) int {
+	var calls atomic.Int32
+	f.counter.setBeforeHandle(func(request *authoritypb.Request) {
+		if lookup := request.GetLookup(); lookup != nil && string(lookup.GetName()) == name {
+			calls.Add(1)
+		}
+	})
+	defer f.counter.setBeforeHandle(nil)
+	fn()
+	return int(calls.Load())
 }

@@ -1,0 +1,868 @@
+//go:build linux
+
+package authorityrpc
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"os"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
+	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
+)
+
+type coherenceReadPathStore struct {
+	resourceAdmissionFaultStore
+	handle xfsstore.Capability
+	data   []byte
+	read   atomic.Uint32
+	attr   atomic.Uint32
+	fsync  atomic.Uint32
+}
+
+func (s *coherenceReadPathStore) IdentityOpen(handle xfsstore.Capability) ([16]byte, error) {
+	if handle != s.handle {
+		return [16]byte{}, syscall.EBADF
+	}
+	return [16]byte{handle[0]}, nil
+}
+
+func (s *coherenceReadPathStore) ReadAt(handle xfsstore.Capability, dst []byte, offset int64) (int, error) {
+	if handle != s.handle || offset < 0 {
+		return 0, syscall.EBADF
+	}
+	s.read.Add(1)
+	if offset >= int64(len(s.data)) {
+		return 0, io.EOF
+	}
+	n := copy(dst, s.data[offset:])
+	if n < len(dst) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (s *coherenceReadPathStore) GetattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	if handle != s.handle {
+		return xfsstore.Attr{}, syscall.EBADF
+	}
+	s.attr.Add(1)
+	return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: uint64(handle[0]), Size: int64(len(s.data)), Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+}
+
+func (s *coherenceReadPathStore) Fsync(handle xfsstore.Capability, _ bool) error {
+	if handle != s.handle {
+		return syscall.EBADF
+	}
+	s.fsync.Add(1)
+	return nil
+}
+
+func (*coherenceReadPathStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func coherenceReadRequest(cred volumeserver.SessionCredential) *authoritypb.Request {
+	return &authoritypb.Request{
+		RequestId: 71,
+		Epoch:     cred.Epoch[:],
+		Session: &authoritypb.SessionProof{
+			Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:],
+		},
+	}
+}
+
+func TestCoherenceReadGetattrAndFsyncReturnSampledVersion(t *testing.T) {
+	store := &coherenceReadPathStore{handle: xfsstore.Capability{0x44}, data: []byte("coherent")}
+	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		request func() *authoritypb.Request
+		check   func(*testing.T, *authoritypb.Response)
+	}{
+		{
+			name: "read",
+			request: func() *authoritypb.Request {
+				request := coherenceReadRequest(credential)
+				request.Body = &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{Handle: store.handle[:], Length: 8}}
+				return request
+			},
+			check: func(t *testing.T, response *authoritypb.Response) {
+				if string(response.GetRead().GetData()) != "coherent" || response.GetRead().GetVolumeVersion() != response.GetVolumeVersion() {
+					t.Fatalf("READ response = %+v", response)
+				}
+			},
+		},
+		{
+			name: "getattr",
+			request: func() *authoritypb.Request {
+				request := coherenceReadRequest(credential)
+				request.Body = &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Handle: store.handle[:]}}
+				return request
+			},
+			check: func(t *testing.T, response *authoritypb.Response) {
+				if response.GetGetAttr().GetAttr().GetSize() != 8 || response.GetGetAttr().GetSnapshotSequence() != response.GetVolumeVersion() {
+					t.Fatalf("GETATTR response = %+v", response)
+				}
+			},
+		},
+		{
+			name: "fsync",
+			request: func() *authoritypb.Request {
+				request := coherenceReadRequest(credential)
+				request.Body = &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: store.handle[:]}}
+				return request
+			},
+			check: func(t *testing.T, response *authoritypb.Response) {
+				if response.GetFsync() == nil || response.GetVolumeVersion() == 0 {
+					t.Fatalf("FSYNC response = %+v", response)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := h.Handle(ctx, test.request())
+			if response.GetErrno() != 0 || response.GetVolumeVersion() == 0 {
+				t.Fatalf("response = %+v", response)
+			}
+			test.check(t, response)
+		})
+	}
+	if store.read.Load() != 1 || store.attr.Load() != 1 || store.fsync.Load() != 1 {
+		t.Fatalf("storage calls = read %d attr %d fsync %d", store.read.Load(), store.attr.Load(), store.fsync.Load())
+	}
+}
+
+func TestCoherenceReadPathsRefuseExpiredSubscriptionBeforeStorage(t *testing.T) {
+	tests := []struct {
+		name    string
+		request func(volumeserver.SessionCredential, xfsstore.Capability) *authoritypb.Request
+	}{
+		{"read", func(credential volumeserver.SessionCredential, handle xfsstore.Capability) *authoritypb.Request {
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_Read{Read: &authoritypb.ReadRequest{Handle: handle[:], Length: 1}}
+			return request
+		}},
+		{"getattr", func(credential volumeserver.SessionCredential, handle xfsstore.Capability) *authoritypb.Request {
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Handle: handle[:]}}
+			return request
+		}},
+		{"fsync", func(credential volumeserver.SessionCredential, handle xfsstore.Capability) *authoritypb.Request {
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: handle[:]}}
+			return request
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &coherenceReadPathStore{handle: xfsstore.Capability{0x45}, data: []byte("x")}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+			if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+				t.Fatal(err)
+			}
+			h.Coherence.ExpireSession(credential.ID)
+			response := h.Handle(ctx, test.request(credential, store.handle))
+			if response.GetErrno() != int32(syscall.EIO) || response.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+				t.Fatalf("expired response = %+v", response)
+			}
+			if store.read.Load()+store.attr.Load()+store.fsync.Load() != 0 {
+				t.Fatal("expired subscription reached storage")
+			}
+		})
+	}
+}
+
+func grantPeerDelegationForReadTest(t *testing.T, h *VolumeHandler, reader volumeserver.SessionCredential, root xfsstore.Capability, identity [16]byte) (volumeserver.SubscriptionToken, volumeserver.Delegation, uint64, uint64) {
+	t.Helper()
+	holder := volumeserver.SessionID{0x92}
+	if err := h.startSessionResources(holder, root, 2, routesRevisionOf("")); err != nil {
+		t.Fatal(err)
+	}
+	readerToken, err := h.coherenceToken(reader.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderToken, err := h.coherenceToken(holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := h.Coherence.Reserve(context.Background(), holderToken, identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerEvents, err := h.Coherence.Poll(context.Background(), readerToken, 0, nil, 8)
+	if err != nil || len(readerEvents) == 0 {
+		t.Fatalf("reader grant withdrawal = events %+v err %v", readerEvents, err)
+	}
+	if err := h.Coherence.Ack(readerToken, readerEvents[len(readerEvents)-1].Position); err != nil {
+		t.Fatal(err)
+	}
+	holderEvents, err := h.Coherence.Poll(context.Background(), holderToken, 0, nil, 8)
+	if err != nil || len(holderEvents) == 0 {
+		t.Fatalf("holder grant stream = events %+v err %v", holderEvents, err)
+	}
+	grant, err := reservation.Grant(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return holderToken, grant, holderEvents[len(holderEvents)-1].Position, readerEvents[len(readerEvents)-1].Position
+}
+
+func TestCoherenceReadWaitsForDelegationBreakBeforeStorage(t *testing.T) {
+	for _, kind := range []string{"read", "getattr", "lookup", "readdir", "fsync"} {
+		t.Run(kind, func(t *testing.T) {
+			path := &coherenceReadPathStore{handle: xfsstore.Capability{0x46}, data: []byte("x")}
+			lookup := &coherenceLookupStore{resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x48}}}
+			directory := &coherenceEmptyDirectoryStore{handle: xfsstore.Capability{0x49}, directory: xfsstore.Capability{0x4a}}
+			var store volumeStore = path
+			handle := path.handle
+			identity := [16]byte{handle[0]}
+			switch kind {
+			case "lookup":
+				store = lookup
+				identity = [16]byte{lookup.lookupItem[0]}
+			case "readdir":
+				store = directory
+				handle = directory.handle
+				identity = [16]byte{handle[0]}
+			}
+			h, _, reader, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+			if kind != "lookup" {
+				if err := h.trackOpen(reader.ID, handle, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			holder, grant, cursor, _ := grantPeerDelegationForReadTest(t, h, reader, root, identity)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			var run func() *authoritypb.Response
+			var calls func() uint32
+			wantCalls := uint32(1)
+			switch kind {
+			case "read":
+				run = func() *authoritypb.Response {
+					return h.coherenceReadData(ctx, 73, reader.ID, &authoritypb.ReadRequest{Handle: handle[:], Length: 1})
+				}
+				calls = path.read.Load
+			case "getattr":
+				run = func() *authoritypb.Response {
+					return h.coherenceGetAttr(ctx, 74, reader.ID, &authoritypb.GetAttrRequest{Handle: handle[:]})
+				}
+				calls = path.attr.Load
+			case "fsync":
+				run = func() *authoritypb.Response {
+					return h.coherenceFsync(ctx, 75, reader.ID, &authoritypb.FsyncRequest{Handle: handle[:]})
+				}
+				calls = path.fsync.Load
+			case "lookup":
+				request := coherenceReadRequest(reader)
+				request.Body = &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: root[:], Name: []byte("child")}}
+				stampMutation(t, request, 0, 1)
+				run = func() *authoritypb.Response { return h.coherenceLookup(ctx, request, reader, request.GetLookup()) }
+				calls = lookup.attr.Load
+			case "readdir":
+				request := coherenceReadRequest(reader)
+				request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: handle[:], MaxEntries: 8}}
+				stampMutation(t, request, 0, 1)
+				run = func() *authoritypb.Response { return h.coherenceReadDir(ctx, request, reader, request.GetReadDir()) }
+				calls = directory.calls.Load
+				wantCalls = 2
+			}
+			response := make(chan *authoritypb.Response, 1)
+			go func() { response <- run() }()
+			var event volumeserver.StreamEvent
+			for event.Kind != volumeserver.StreamBreakForRead {
+				events, err := h.Coherence.Poll(ctx, holder, cursor, nil, 8)
+				if err != nil || len(events) == 0 {
+					t.Fatalf("break events=%v err=%v", events, err)
+				}
+				cursor = events[len(events)-1].Position
+				for _, candidate := range events {
+					if candidate.Kind == volumeserver.StreamBreakForRead && candidate.Delegation.Identity == identity {
+						event = candidate
+						break
+					}
+				}
+			}
+			select {
+			case reply := <-response:
+				t.Fatalf("operation completed before break ack: %v", reply)
+			default:
+			}
+			if got := calls(); got != 0 {
+				t.Fatalf("value-bearing storage calls before break ack=%d, want 0", got)
+			}
+			// LOOKUP must discover the child identity before requesting its break.
+			// Its initial binding probe is discarded; no attributes can be sampled yet.
+			if kind == "lookup" && lookup.lookup.Load() != 1 {
+				t.Fatalf("identity probes=%d, want 1", lookup.lookup.Load())
+			}
+			if err := h.Coherence.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, event.AppliedSequence); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.Coherence.Ack(holder, cursor); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case reply := <-response:
+				if reply.GetErrno() != 0 {
+					t.Fatalf("operation after break=%v", reply)
+				}
+				if got := calls(); got != wantCalls {
+					t.Fatalf("storage calls after break=%d, want %d", got, wantCalls)
+				}
+				switch kind {
+				case "read":
+					if string(reply.GetRead().GetData()) != "x" {
+						t.Fatal(reply)
+					}
+				case "getattr":
+					if reply.GetGetAttr().GetAttr().GetSize() != 1 {
+						t.Fatal(reply)
+					}
+				case "lookup":
+					if reply.GetLookup().GetItem().GetAttr().GetSize() != 7 {
+						t.Fatal(reply)
+					}
+				case "readdir":
+					if !reply.GetReadDir().GetEof() {
+						t.Fatal(reply)
+					}
+				case "fsync":
+					if reply.GetFsync() == nil {
+						t.Fatal(reply)
+					}
+				}
+			case <-ctx.Done():
+				t.Fatal("operation did not resume after break ack")
+			}
+		})
+	}
+}
+
+type coherenceChangingDirectoryStore struct {
+	resourceAdmissionFaultStore
+	handle, directory xfsstore.Capability
+	calls             atomic.Uint32
+}
+
+type coherenceEmptyDirectoryStore struct {
+	resourceAdmissionFaultStore
+	handle, directory xfsstore.Capability
+	calls             atomic.Uint32
+}
+
+type coherenceRestampedEmptyDirectoryStore struct {
+	coherenceEmptyDirectoryStore
+}
+
+type coherenceBlockedEmptyDirectoryStore struct {
+	coherenceEmptyDirectoryStore
+	entered chan struct{}
+	release chan struct{}
+	blocked atomic.Bool
+}
+
+func (s *coherenceBlockedEmptyDirectoryStore) ReadDirOpen(
+	handle xfsstore.Capability,
+	cookie uint64,
+	maxEntries int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if s.blocked.CompareAndSwap(false, true) {
+		close(s.entered)
+		<-s.release
+	}
+	return s.coherenceEmptyDirectoryStore.ReadDirOpen(handle, cookie, maxEntries)
+}
+
+func (s *coherenceRestampedEmptyDirectoryStore) ReadDirOpen(
+	handle xfsstore.Capability,
+	cookie uint64,
+	_ int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if handle != s.handle {
+		return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EBADF
+	}
+	call := s.calls.Add(1)
+	return nil, cookie, [16]byte{byte(call)}, true, s.directory, nil
+}
+
+func (s *coherenceEmptyDirectoryStore) IdentityOpen(handle xfsstore.Capability) ([16]byte, error) {
+	if handle != s.handle {
+		return [16]byte{}, syscall.EBADF
+	}
+	return [16]byte{handle[0]}, nil
+}
+
+func (s *coherenceEmptyDirectoryStore) ReadDirOpen(
+	handle xfsstore.Capability,
+	cookie uint64,
+	_ int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if handle != s.handle {
+		return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EBADF
+	}
+	s.calls.Add(1)
+	return nil, cookie, [16]byte{0x73}, true, s.directory, nil
+}
+
+func (*coherenceEmptyDirectoryStore) CloseOpen(xfsstore.Capability) error { return nil }
+
+func TestCoherenceReadDirOwnsTheDirectoryStorageTurnWhileEnumerating(t *testing.T) {
+	store := &coherenceBlockedEmptyDirectoryStore{
+		coherenceEmptyDirectoryStore: coherenceEmptyDirectoryStore{
+			handle: xfsstore.Capability{0x51}, directory: xfsstore.Capability{0x52},
+		},
+		entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := coherenceReadRequest(credential)
+	request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+		Handle: store.handle[:], MaxEntries: 8,
+	}}
+	stampMutation(t, request, 0, 1)
+	response := make(chan *authoritypb.Response, 1)
+	go func() { response <- h.Handle(ctx, request) }()
+	select {
+	case <-store.entered:
+	case <-ctx.Done():
+		t.Fatal("READDIR did not enter storage")
+	}
+
+	mutation := make(chan func(), 1)
+	go func() {
+		release, err := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies([16]byte{store.handle[0]}, []byte("index.lock"), [16]byte{}))
+		if err != nil {
+			mutation <- nil
+			return
+		}
+		mutation <- release
+	}()
+	select {
+	case release := <-mutation:
+		if release != nil {
+			release()
+		}
+		t.Fatal("directory mutation acquired while READDIR was constructing its page")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(store.release)
+	select {
+	case reply := <-response:
+		if reply.GetErrno() != 0 || reply.GetReadDir() == nil {
+			t.Fatalf("READDIR response = %+v", reply)
+		}
+	case <-ctx.Done():
+		t.Fatal("READDIR did not complete")
+	}
+	select {
+	case release := <-mutation:
+		if release == nil {
+			t.Fatal("queued directory mutation failed")
+		}
+		release()
+	case <-ctx.Done():
+		t.Fatal("queued directory mutation did not resume")
+	}
+}
+
+type coherenceLookupStore struct {
+	resourceAdmissionFaultStore
+	attr atomic.Uint32
+}
+
+func (s *coherenceLookupStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	if item == s.lookupItem {
+		s.attr.Add(1)
+		return xfsstore.Attr{Kind: xfsstore.KindRegular, Ino: 2, Size: 7, Mode: 0o600, Nlink: 1, DeviceMinor: 1}, nil
+	}
+	return s.resourceAdmissionFaultStore.Getattr(item)
+}
+
+func TestCoherenceLookupAndEmptyReadDirCarrySampledVersion(t *testing.T) {
+	t.Run("positive lookup", func(t *testing.T) {
+		store := &coherenceLookupStore{resourceAdmissionFaultStore: resourceAdmissionFaultStore{
+			lookupItem: xfsstore.Capability{0x33},
+		}}
+		h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+		request := coherenceReadRequest(credential)
+		request.Body = &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: root[:], Name: []byte("child")}}
+		stampMutation(t, request, 0, 1)
+
+		response := h.Handle(ctx, request)
+		item := response.GetLookup().GetItem()
+		if response.GetErrno() != 0 || response.GetVolumeVersion() == 0 || item == nil {
+			t.Fatalf("LOOKUP response = %+v", response)
+		}
+		if item.GetSnapshotSequence() != response.GetVolumeVersion() || item.GetObjectVersion() == 0 || item.GetAttr().GetSize() != 7 {
+			t.Fatalf("LOOKUP item = %+v, envelope version %d", item, response.GetVolumeVersion())
+		}
+	})
+
+	t.Run("negative lookup", func(t *testing.T) {
+		store := &coherenceLookupStore{}
+		h, ctx, credential, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+		request := coherenceReadRequest(credential)
+		request.Body = &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: root[:], Name: []byte("missing")}}
+		stampMutation(t, request, 0, 1)
+
+		response := h.Handle(ctx, request)
+		lookup := response.GetLookup()
+		if response.GetErrno() != 0 || response.GetVolumeVersion() == 0 || lookup == nil || lookup.GetItem() != nil {
+			t.Fatalf("negative LOOKUP response = %+v", response)
+		}
+		if lookup.GetNegativeSnapshotSequence() != response.GetVolumeVersion() {
+			t.Fatalf("negative sequence = %d, envelope version %d", lookup.GetNegativeSnapshotSequence(), response.GetVolumeVersion())
+		}
+	})
+
+	t.Run("empty readdir", func(t *testing.T) {
+		store := &coherenceEmptyDirectoryStore{
+			handle: xfsstore.Capability{0x51}, directory: xfsstore.Capability{0x52},
+		}
+		h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+		if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+			t.Fatal(err)
+		}
+		request := coherenceReadRequest(credential)
+		request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: store.handle[:], MaxEntries: 8}}
+		stampMutation(t, request, 0, 1)
+
+		response := h.Handle(ctx, request)
+		page := response.GetReadDir()
+		if response.GetErrno() != 0 || response.GetVolumeVersion() == 0 || page == nil || !page.GetEof() || len(page.GetEntries()) != 0 {
+			t.Fatalf("empty READDIR response = %+v", response)
+		}
+		if calls := store.calls.Load(); calls != 2 {
+			t.Fatalf("ReadDirOpen calls = %d, want initial read and locked revalidation", calls)
+		}
+	})
+}
+
+func TestCoherenceReadDirPublishesRevalidatedPageStamp(t *testing.T) {
+	store := &coherenceRestampedEmptyDirectoryStore{coherenceEmptyDirectoryStore: coherenceEmptyDirectoryStore{
+		handle: xfsstore.Capability{0x53}, directory: xfsstore.Capability{0x54},
+	}}
+	h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+	if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+		t.Fatal(err)
+	}
+	request := coherenceReadRequest(credential)
+	request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: store.handle[:], MaxEntries: 8}}
+	stampMutation(t, request, 0, 1)
+
+	response := h.Handle(ctx, request)
+	if response.GetErrno() != 0 || response.GetReadDir() == nil {
+		t.Fatalf("READDIR response = %+v", response)
+	}
+	if got, want := response.GetReadDir().GetVerifier(), []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; !bytes.Equal(got, want) {
+		t.Fatalf("published verifier = %x, want locked revalidation stamp %x", got, want)
+	}
+	if calls := store.calls.Load(); calls != 2 {
+		t.Fatalf("ReadDirOpen calls = %d, want initial read and locked revalidation", calls)
+	}
+}
+
+type coherenceChurningDirectoryStore struct {
+	readdirPostStabilizationChangeStore
+	lookupCalls atomic.Uint32
+	unstableFor uint32
+	eagainFor   uint32
+}
+
+func (s *coherenceChurningDirectoryStore) LookupOpen(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	call := s.lookupCalls.Add(1)
+	if call <= s.eagainFor {
+		return xfsstore.Capability{}, xfsstore.Attr{}, syscall.EAGAIN
+	}
+	mode := os.FileMode(0o640)
+	if call <= s.eagainFor+s.unstableFor {
+		if (call-s.eagainFor)%2 == 1 {
+			mode = 0o600
+		}
+	}
+	return s.child, xfsstore.Attr{
+		Kind: xfsstore.KindRegular, Ino: uint64(s.child[0]), Mode: mode,
+		Nlink: 1, DeviceMinor: 1,
+	}, nil
+}
+
+func TestCoherenceReadDirNeverSurfacesEAGAINUnderContinuousMutation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		unstable uint32
+		eagain   uint32
+	}{
+		{name: "revalidation changes", unstable: 2 * maxStabilizeAttempts},
+		{name: "openat2 retry", eagain: maxStabilizeAttempts + 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &coherenceChurningDirectoryStore{
+				readdirPostStabilizationChangeStore: readdirPostStabilizationChangeStore{
+					root: xfsstore.Capability{0x72}, handle: xfsstore.Capability{0x74}, child: xfsstore.Capability{0x75},
+				},
+				unstableFor: test.unstable, eagainFor: test.eagain,
+			}
+			h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 64, 4)
+			if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+				t.Fatal(err)
+			}
+			request := coherenceReadRequest(credential)
+			request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
+				Handle: store.handle[:], MaxEntries: 16, WantItems: true,
+			}}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || len(response.GetReadDir().GetEntries()) != 1 || response.GetReadDir().GetEntries()[0].GetAttr().GetMode() != 0o640 {
+				t.Fatalf("READDIR under churn = %+v", response)
+			}
+			if calls := store.lookupCalls.Load(); calls <= maxStabilizeAttempts {
+				t.Fatalf("lookup calls=%d, regression did not cross the former retry bound", calls)
+			}
+			if got := len(h.resources[credential.ID].items); got != 1 {
+				t.Fatalf("tracked capabilities=%d, want only the published candidate", got)
+			}
+			if forgotten := store.forget.Load(); forgotten+1 != store.lookupCalls.Load()-store.eagainFor {
+				t.Fatalf("forgotten capabilities=%d successful lookups=%d", forgotten, store.lookupCalls.Load()-store.eagainFor)
+			}
+		})
+	}
+}
+
+func (s *coherenceChangingDirectoryStore) ReadDirOpen(
+	handle xfsstore.Capability,
+	cookie uint64,
+	max int,
+) ([]xfsstore.Dirent, uint64, [16]byte, bool, xfsstore.Capability, error) {
+	if handle != s.handle {
+		return nil, 0, [16]byte{}, false, xfsstore.Capability{}, syscall.EBADF
+	}
+	s.calls.Add(1)
+	fresh := [16]byte{0x91}
+	all := []xfsstore.Dirent{
+		{Name: "a", Kind: xfsstore.KindRegular, Ino: 1, NextCookie: 1},
+		{Name: "b", Kind: xfsstore.KindRegular, Ino: 2, NextCookie: 2},
+		{Name: "c", Kind: xfsstore.KindRegular, Ino: 3, NextCookie: 3},
+	}
+	if cookie > uint64(len(all)) {
+		return nil, uint64(len(all)), fresh, true, s.directory, nil
+	}
+	end := cookie + uint64(max)
+	if end > uint64(len(all)) {
+		end = uint64(len(all))
+	}
+	return append([]xfsstore.Dirent(nil), all[cookie:end]...), end, fresh, end == uint64(len(all)), s.directory, nil
+}
+
+func TestCoherenceReadDirContinuesAfterDirectoryChangeWithoutESTALE(t *testing.T) {
+	store := &coherenceChangingDirectoryStore{
+		handle: xfsstore.Capability{0x41}, directory: xfsstore.Capability{0x42},
+	}
+	h := &VolumeHandler{Store: store}
+	entries, next, verifier, eof, directory, err := h.coherenceReadDirPage(store.handle, 2, 2)
+	if err != nil {
+		t.Fatalf("continued page: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "c" || next != 3 || !eof {
+		t.Fatalf("continued page = entries=%+v next=%d eof=%v", entries, next, eof)
+	}
+	if verifier != ([16]byte{0x91}) || directory != store.directory {
+		t.Fatalf("continued coordinates = verifier=%x directory=%x", verifier, directory)
+	}
+	if calls := store.calls.Load(); calls != 1 {
+		t.Fatalf("ReadDirOpen calls = %d, want direct stable-cookie continuation", calls)
+	}
+}
+
+func TestCoherenceReadDependenciesCoverBindingsAndObjects(t *testing.T) {
+	parent := [16]byte{0x11}
+	child := [16]byte{0x22}
+	got := coherenceBindingDependencies(parent, []byte("child"), child)
+	want := volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{
+		{
+			Scope: volumeserver.VisibilityNamespace, ParentIdentity: parent, Name: []byte("child"),
+			RelatedIdentities: [][16]byte{child},
+		},
+	})
+	if !got.Equal(want) {
+		t.Fatal("lookup did not acquire the complete parent/name/child footprint")
+	}
+
+	h := &VolumeHandler{}
+	directory := [16]byte{0x31}
+	candidates := []directoryPageCandidate{{
+		identity: child,
+		dirent:   &authoritypb.Dirent{Name: []byte("child")},
+	}}
+	got = h.coherenceDirectoryDependencies(directory, candidates)
+	want = volumeserver.MutationDependenciesForTargets([]volumeserver.VisibilityTarget{
+		{Scope: volumeserver.VisibilityAttributes, Identity: directory},
+		{
+			Scope: volumeserver.VisibilityNamespace, ParentIdentity: directory, Name: []byte("child"),
+			RelatedIdentities: [][16]byte{child},
+		},
+		{Scope: volumeserver.VisibilityAttributes, Identity: child},
+	})
+	if !got.Equal(want) {
+		t.Fatal("readdir did not acquire the complete directory/name/child footprint")
+	}
+}
+
+func BenchmarkCoherenceReadGuard(b *testing.B) {
+	coordinator := volumeserver.NewCoherenceCoordinator(volumeserver.CoherenceConfig{})
+	snapshot, err := coordinator.Subscribe(volumeserver.SessionID{0x51})
+	if err != nil {
+		b.Fatal(err)
+	}
+	identity := [16]byte{0x61}
+	ctx := context.Background()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		guard, guardErr := coordinator.DataConsumed(ctx, snapshot.Token, identity)
+		if guardErr != nil {
+			b.Fatal(guardErr)
+		}
+		guard.Release()
+	}
+}
+
+func TestCoherenceReadDirRefusesMalformedVerifierBeforeEnumeration(t *testing.T) {
+	for _, size := range []int{1, 15, 17} {
+		store := &coherenceEmptyDirectoryStore{handle: xfsstore.Capability{0x51}, directory: xfsstore.Capability{0x52}}
+		h, ctx, credential, _ := resourceAdmissionRequestHarness(t, store, 8, 8)
+		if err := h.trackOpen(credential.ID, store.handle, false); err != nil {
+			t.Fatal(err)
+		}
+		request := coherenceReadRequest(credential)
+		request.Body = &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{Handle: store.handle[:], MaxEntries: 8, Verifier: make([]byte, size)}}
+		stampMutation(t, request, 0, 1)
+		response := h.Handle(ctx, request)
+		if response.GetErrno() != int32(syscall.EINVAL) || store.calls.Load() != 0 {
+			t.Fatalf("verifier size %d: response=%v enumeration calls=%d", size, response, store.calls.Load())
+		}
+	}
+}
+
+type declaredLookupStore struct {
+	coherenceLookupStore
+	afterProbe func()
+	size       int64
+}
+
+func (s *declaredLookupStore) Lookup(parent xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	item, attr, err := s.coherenceLookupStore.Lookup(parent, name)
+	if hook := s.afterProbe; hook != nil {
+		s.afterProbe = nil
+		hook()
+	}
+	return item, attr, err
+}
+func (s *declaredLookupStore) Getattr(item xfsstore.Capability) (xfsstore.Attr, error) {
+	attr, err := s.coherenceLookupStore.Getattr(item)
+	if s.size != 0 {
+		attr.Size = s.size
+	}
+	return attr, err
+}
+func TestCoherenceLookupRetainsOneProbeAndRevalidatesBindingDeclaration(t *testing.T) {
+	for _, edge := range []string{"stable", "child setattr"} {
+		t.Run(edge, func(t *testing.T) {
+			store := &declaredLookupStore{coherenceLookupStore: coherenceLookupStore{resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x33}}}}
+			h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+			h.initCoherence()
+			store.afterProbe = func() {
+				if edge == "stable" {
+					return
+				}
+				release, err := h.coherenceStorage.Acquire(ctx, coherenceInodeDependencies([16]byte{0x33}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				store.size = 19
+				release()
+			}
+			request := coherenceReadRequest(cred)
+			request.Body = &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: root[:], Name: []byte("child")}}
+			stampMutation(t, request, 0, 1)
+			response := h.Handle(ctx, request)
+			if response.GetErrno() != 0 || response.GetLookup().GetItem() == nil {
+				t.Fatalf("lookup: %v", response)
+			}
+			if got := store.lookup.Load(); got != 1 {
+				t.Fatalf("lookup probes=%d want 1", got)
+			}
+			if got := store.attr.Load(); got != 1 {
+				t.Fatalf("value-bearing attribute reads=%d want 1", got)
+			}
+			if got := response.GetLookup().GetItem().GetStableIdentity()[0]; got != store.lookupItem[0] {
+				t.Fatalf("stale binding identity=%x", got)
+			}
+			if edge == "child setattr" && response.GetLookup().GetItem().GetAttr().GetSize() != 19 {
+				t.Fatal("returned probe's stale attributes")
+			}
+		})
+	}
+}
+
+func TestCoherenceLookupRebindDuringBreakDiscardsRetainedProbe(t *testing.T) {
+	store := &coherenceLookupStore{resourceAdmissionFaultStore: resourceAdmissionFaultStore{lookupItem: xfsstore.Capability{0x33}}}
+	h, ctx, cred, root := resourceAdmissionRequestHarness(t, store, 8, 8)
+	identity := [16]byte{0x33}
+	holder, grant, cursor, _ := grantPeerDelegationForReadTest(t, h, cred, root, identity)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	request := coherenceReadRequest(cred)
+	request.Body = &authoritypb.Request_Lookup{Lookup: &authoritypb.LookupRequest{Parent: root[:], Name: []byte("child")}}
+	stampMutation(t, request, 0, 1)
+	result := make(chan *authoritypb.Response, 1)
+	go func() { result <- h.Handle(ctx, request) }()
+	var event volumeserver.StreamEvent
+	for event.Kind != volumeserver.StreamBreakForRead {
+		events, err := h.Coherence.Poll(ctx, holder, cursor, nil, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range events {
+			cursor = e.Position
+			if e.Kind == volumeserver.StreamBreakForRead {
+				event = e
+			}
+		}
+	}
+	parent, _ := store.Identity(root)
+	release, err := h.coherenceStorage.Acquire(ctx, coherenceBindingDependencies(parent, []byte("child"), identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.lookupItem = xfsstore.Capability{0x44}
+	release()
+	if err := h.Coherence.AckDelegation(holder, identity, grant.ID, grant.Generation, event.Request, event.AppliedSequence); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case reply := <-result:
+		if reply.GetErrno() != 0 || reply.GetLookup().GetItem().GetStableIdentity()[0] != 0x44 {
+			t.Fatalf("stale binding after break: %v", reply)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if store.lookup.Load() != 2 || store.attr.Load() != 1 || store.forget.Load() != 1 {
+		t.Fatalf("probe/accounting: lookups=%d attrs=%d forgotten=%d", store.lookup.Load(), store.attr.Load(), store.forget.Load())
+	}
+}

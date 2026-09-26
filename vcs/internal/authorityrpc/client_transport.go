@@ -17,7 +17,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 )
 
-// clientTransport is one physical protocol-6 lane. Everything whose identity
+// clientTransport is one physical protocol-7 lane. Everything whose identity
 // is scoped to a TCP/TLS connection lives here: publication, serialization,
 // request IDs, waiters, reconnect exclusion, and negotiated frame accounting.
 // Session identity is deliberately not duplicated here; both transports prove
@@ -196,6 +196,9 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 		ConnectionSetId: append([]byte(nil), c.connectionSetID[:]...),
 		FrontendProfile: c.cfg.FrontendProfile,
 	}}}
+	if c.canPipelineFlushes() {
+		request.GetHello().Features = append(request.GetHello().Features, orderedDelegatedFlushFeature)
+	}
 	if err := writeFrame(conn, c.cfg.MaxFrame, request); err != nil {
 		return fail(err)
 	}
@@ -253,7 +256,7 @@ func (c *Client) openTransport(ctx context.Context, role authoritypb.TransportRo
 			hello.GetMaxReadBytes(), hello.GetMaxWriteBytes(),
 		))
 	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hello.GetMaxFskitWriteBytes() != 0 {
+	if c.cfg.FrontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR && hello.GetMaxFskitWriteBytes() != 0 {
 		return fail(errors.New("authorityrpc: Linux profile received FSKit write capacity"))
 	}
 	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
@@ -472,7 +475,39 @@ func (c *Client) publishInitialPair(data, control *transportNegotiation, dataGen
 	return nil
 }
 
+// A refused TCP connection during restart proves no session outcome. Keep the
+// caller's replay identity and retry transport establishment until its deadline
+// or an authenticated Hello/Resume establishes the epoch and session verdict.
+// Even a caller without a deadline cannot retry beyond one subscription TTL.
 func (c *Client) reconnectTransport(ctx context.Context, role authoritypb.TransportRole) error {
+	caller := ctx
+	ctx, cancel := context.WithTimeout(ctx, volumeserver.SubscriptionTTL)
+	defer cancel()
+	boundedError := func() error {
+		if caller.Err() != nil {
+			return caller.Err()
+		}
+		return fmt.Errorf("%w: reconnect exceeded subscription horizon", ErrTransportUncertain)
+	}
+	for {
+		err := c.reconnectTransportOnce(ctx, role)
+		if ctx.Err() != nil {
+			return boundedError()
+		}
+		if err == nil || c.closed.Load() || c.poisoned.Load() {
+			return err
+		}
+		var networkError *net.OpError
+		if !errors.As(err, &networkError) && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if err := waitTransportRetry(ctx); err != nil {
+			return boundedError()
+		}
+	}
+}
+
+func (c *Client) reconnectTransportOnce(ctx context.Context, role authoritypb.TransportRole) error {
 	transport := c.transportForRole(role)
 	if transport == nil {
 		return ErrTransportBinding

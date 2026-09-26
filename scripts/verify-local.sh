@@ -107,7 +107,7 @@ step "go race suite (native)"
 go -C vcs test -race ./...
 
 # The maintained go-fuse fork is a nested module, so the suite above does not
-# enter it. Protocol 6 retains one stock-FUSE-neutral seam: ReplyWriteLifecycle
+# enter it. Protocol 7 retains one stock-FUSE-neutral seam: ReplyWriteLifecycle
 # tracks selected physical replies while descriptor lifetime is shared with
 # notifications. Gate that lifecycle without running the retired private-ABI tests.
 step "maintained go-fuse physical reply seam"
@@ -153,18 +153,16 @@ fi
 # 7. Stale-architecture scan. v3 is the direct-store system: a Go data plane
 # addressing an XFS-backed authority, with the FSKit frontend on top. The
 # journal-era v2 architecture (a remote append-only journal, a TypeScript
-# control plane, and the client/writeback/history stack layered on them) was
+# control plane, and the clientcore/history stack layered on them) was
 # deleted wholesale. These identifiers are that architecture's actual API and
 # package surface, so a match means it is growing back rather than that a
 # comment mentions history.
 #
 # The package identifiers are matched as import paths (internal/<pkg>), not as
-# bare words: "writeback" and "fsproto" are also ordinary nouns in the current
-# system's vocabulary — pfsbench has a -writeback flag for the kernel writeback
-# cache, pfslocal.proto's prose refers to the retired fsproto wire, and Go
-# comments legitimately explain "no fallback to the retired clientcore engine"
-# — so package terms are matched as import paths, which is what resurrection
-# actually looks like.
+# bare words. Protocol 7 deliberately has an internal/writeback client buffer;
+# that package is unrelated to the removed journal client and is covered by its
+# own tests. fsproto remains retired, while pfslocal.proto's prose may still
+# refer to that retired wire.
 #
 # Excluded: docs/ and CHANGELOG.md (history is supposed to name the thing it
 # replaced), this script, and the two harnesses that really do drive pnpm as
@@ -176,7 +174,6 @@ if rg --hidden -n \
   -e '\bremotejournal\b' \
   -e 'internal/clientcore\b' \
   -e 'internal/fsproto\b' \
-  -e 'internal/writeback\b' \
   -e '\bhistworker\b' \
   -e '\bpfj3\b' \
   -e 'volume-api' \
@@ -194,12 +191,14 @@ then
   exit 1
 fi
 
-# Protocol 6 has one coherent lease contract. The old non-participant profile
-# and both retired namespace-repair models keep their names reserved in the
+# Protocol 7 uses explicit frontend profiles, subscriptions and file delegations.
+# Broad cross-frontend profile predicates, the old non-participant profile and both
+# retired namespace-repair models keep their names reserved in the
 # source schema (and therefore in generated descriptor bytes), while docs and
 # the changelog may describe their retirement. None may re-enter executable
 # code, tests, scripts, or configuration.
 if rg --hidden -n \
+	-e '\bstrictSession\b' \
   -e 'CoherenceUncached' \
   -e 'COHERENCE_PROFILE_UNCACHED' \
   -e 'PORTABLEFS_COHERENCE' \
@@ -222,7 +221,7 @@ then
   exit 1
 fi
 
-# Active product material must describe the protocol-6 stock-FUSE architecture.
+# Active product material must describe the protocol-7 stock-FUSE architecture.
 # Historical qualification receipts are intentionally outside this list: they
 # remain evidence, not a build or runtime dependency. The patch series for the
 # retired private ABI is no longer in the tree at all; git history holds it.

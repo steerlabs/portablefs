@@ -1,21 +1,22 @@
 # Architecture
 
-Status: **protocol-6 target contract; writable Linux is blocked from production
-by unobservable `RWF_APPEND`, while FSKit remains supported under an explicitly
-weaker synchronous-repair profile**
+Status: **protocol-7 local full-gate qualified on stock Linux FUSE; detailed
+results and production qualification boundaries are recorded in
+[coherence-v2/integration.md](./coherence-v2/integration.md).**
 
 PortableFS exposes one serving XFS project directory through multiple Linux
 mounts. A volume has one canonical representation selected by `(State,
 ArchiveCycleStep)`: READY uses XFS, ARCHIVED uses one sealed immutable archive,
 and RESTORING composes that sealed base, a monotone hydration map, and XFS.
 PortableFS adds authentication, object capabilities, replay protection,
-distributed locks, and lease-governed caching; it does not add a second writable
-inode tree, mutation journal, or client write-back storage.
+distributed locks, subscription-governed caching, and volatile delegated file
+write-back. It adds no second namespace, durable mutation journal, or offline
+reconciliation. XFS remains the durable truth.
 
 ```text
 stock Linux FUSE 7.31+ mounts
              |
-        portablefsd
+    portablefs-mount-v3
              |
 mutually authenticated TLS 1.3
   DATA + CONTROL connection pair
@@ -34,19 +35,22 @@ mutually authenticated TLS 1.3
    placement or authority and is represented by its sealed archive. During
    RESTORING, a hydration mark selects XFS for that chunk; otherwise the sealed
    base is authoritative. No state has two writable truths.
-2. **Mutations are write-through.** A successful Linux mutation response means
-   the authority applied the operation to XFS and discharged every conflicting
-   peer cache lease. `fsync` and `fdatasync` remain the durability barriers.
-3. **Caching is a revocable right.** The authority grants TTL-bounded leases for
-   a name binding N(parent,name), attributes A(inode), clean whole-file data
-   D(inode), and complete directory enumeration E(directory). A cache entry
-   without a live covering lease is not served.
-4. **The syscall response is the visibility boundary.** An acquisition that
-   begins after a successful mutation returns observes that mutation or a later
-   one. An overlapping operation may linearize on either side.
-5. **The wire is exact.** Authority protocol 6 uses ALPN
-   `portablefs-authority-v6`, paired authenticated transports, exact feature
-   assertions, and session-bound replay. Protocol 5 is refused; there is no
+2. **Namespace and data have distinct acceptance boundaries.** Namespace
+   mutations execute at the Authority. Uncontended file delegations permit
+   daemon-buffered data and attributes; fsync/O_SYNC wait for durability.
+   A run opens the mount root at start and fsyncs that handle at completion.
+3. **Cache permission excludes a peer's buffered writes.** A volume subscription
+   covers undelegated identities. Granting a delegation first withdraws peer
+   cache permission; a peer data/attribute read breaks the holder for read.
+   A pre-existing cache-capable peer handle forces write-through.
+4. **Visibility follows the acceptance boundary.** Namespace and synchronous
+   mutations establish peer visibility before returning. Delegated writes are
+   visible through a successful break-for-read while the holder survives; an
+   accepted non-durable tail can be lost under the declared failure rules.
+   An overlapping operation may linearize on either side.
+5. **The wire is exact.** Authority protocol 7 uses ALPN
+   `portablefs-authority-v7`, paired authenticated transports, exact feature
+   assertions, and session-bound replay. Protocol 6 is refused; there is no
    compatibility path.
 6. **The kernel interface is upstream FUSE.** Linux requires FUSE protocol 7.31
    or newer and uses no PortableFS capability bit, opcode, notification, cache
@@ -55,7 +59,7 @@ mutually authenticated TLS 1.3
    already-applied mutation into a weaker answer. Storage failure fences the
    volume epoch. Unknown outcomes across authority death are reported as
    uncertain, never guessed or replayed automatically.
-8. **Unsupported is explicit.** Shared file-backed `mmap`, user xattr writes,
+8. **Unsupported is explicit.** Shared writable file-backed `mmap`, user xattr writes,
    device nodes, FIFOs, sockets, and cross-volume rename are refused with a real
    errno rather than emulated with divergent semantics.
 9. **Lifecycle control stays outside ordinary I/O.** The manager records
@@ -65,57 +69,42 @@ mutually authenticated TLS 1.3
 
 ## Linux cache and I/O profile
 
-Kernel name validity is always zero. Attribute validity ends at a conservative
-cache deadline computed from the authority TTL minus the frozen five-second
-withdrawal interval and anchored at the client request start, so time spent in
-flight can only shorten the installed validity. The
-daemon may retain a name answer under its N lease. Plain READDIR is cached by the daemon
-only under an E lease; kernel directory caching and READDIRPLUS are not used. Read-only file
-opens may preserve clean kernel pages under a D lease. Write-capable opens use
-direct I/O, writeback caching is disabled, and shared writable mappings are
-refused.
+The volume subscription lasts ten seconds on the Authority clock and renews
+every three. The client anchors its horizon at request start and begins cache
+withdrawal early. Replies carry served versions and drain through exact
+identity/name publication gates before acknowledgment. Shared kernel names
+have zero validity; the daemon caches their bindings. Inode notifications
+withdraw clean pages and attributes. Directory iteration continues from XFS
+cookies across mutation, returning every unmodified entry once without ESTALE.
 
-The daemon orders cache-installing replies and invalidation notifications at
-the per-coordinate admission and settlement cut; their `/dev/fuse` syscalls may
-overlap so a blocked invalidation cannot withhold a reply needed for progress.
-Metadata replies may use a separate zero-validity lane. Buffered
-READ has no validity field: an already-admitted reply drains before recall
-acknowledgment, while a new request at a closed cut proceeds on the data lane,
-is answered from applied authority state, and is included when the invalidation
-takes its pre-purge snapshot. A later reply carries only post-apply bytes. A peer
-discharges a recall only after the full purge. Range-successor continuity is not
-part of v1. The mutating mount purges A/D/E and daemon N state before its reply.
-Kernel entry validity is always zero, including under N-R, so stock rename cannot
-transplant an old leased timeout and no post-write namespace receipt is required.
+Write-capable handles use direct I/O and kernel write-back stays off. The daemon
+buffer is bounded at 64 MiB and 10,000 entries; timer, cap, recall, fsync,
+namespace dependencies, and root-directory barriers trigger flushing. Entries
+remain until durability is confirmed. A missed recall advances loss and stales
+the affected handles instead of aborting the mount. An epoch change stales all
+old handles; cold reattachment permits new opens, not recovery of old handles.
 
-The namespace contract covers forward pathname resolution and directory
-enumeration. Reverse rendering of an already-held dentry (`getcwd`,
-`/proc/*/fd`, and other `d_path` users) is not coherent across remote renames:
-stock Linux does not revalidate that observation and exposes no FUSE completion
-receipt for it. This boundary is explicit rather than inferred from a zero
-entry timeout.
+The namespace contract covers forward pathname resolution and enumeration.
+Reverse rendering of retained dentries (`getcwd`, `/proc/*/fd`, and `d_path`)
+is outside it. Append uses the Authority's true EOF; stock FUSE does not expose
+per-call RWF_APPEND/RWF_NOAPPEND, which remain disclosed deviations.
 
-Stock FUSE preserves enough open intent to refuse `O_APPEND`, but does not
-forward `RWF_APPEND` at all. That path cannot be detected or refused by the
-daemon. It is a hard correctness blocker for declaring the writable protocol-6
-profile production-ready; an upstream ABI or different proven architecture is
-required.
-
-The complete normative model, including the two disclosed stock-FUSE data-cache
-residuals, is [portable-coherence.md](./portable-coherence.md). Filesystem-level
-semantics are summarized in [consistency-model.md](./consistency-model.md).
+The normative model and verbatim design residuals are in
+[portable-coherence.md](./portable-coherence.md). Application behavior is in
+[consistency-model.md](./consistency-model.md).
 
 ## Platform status
 
 | Platform | Status |
 | --- | --- |
-| Linux FUSE 7.31+ | The protocol-6 implementation target. Read-only/metadata work remains under qualification; the writable profile is blocked from production by unobservable `RWF_APPEND`. |
-| macOS 26/27 FSKit | Supported through the explicit protocol-6 `FSKIT_SYNC_REPAIR` profile. It uses ordered PREPARE/COMPLETE repair rather than N/A/D/E grants and is intentionally weaker at host-cache, append, and lock edges. |
-| Windows | No declared transport. A future frontend must prove the same locks, invalidation, and lease-discharge contract before admission. |
+| Linux FUSE 7.31+ | Protocol-7 local real-mount qualification; broader kernel and deployed-runner qualification remain separate. |
+| macOS 26/27 FSKit | Explicit `FSKIT_SYNC_REPAIR` profile with compatibility-writer exclusion for every attached Mac mount. Host cache, append, and lock edges remain weaker than Linux. |
+| Files gateway | Authenticated cacheless peer reader; breaks delegated files for read and does not exclude Linux writers. |
+| Windows | No declared transport or production frontend. |
 
-The FSKit profile is not silently promoted to Linux semantics. A TTL, polling
-loop, or policy label cannot manufacture a missing host-filesystem primitive;
-the differences are part of the declared platform contract.
+A TTL, polling loop, or policy label cannot supply missing host-filesystem
+primitives. No FSKit or Windows production qualification is inferred from the
+Linux gates.
 
 ## Security and routing
 
@@ -129,7 +118,7 @@ are not charged to project quota.
 matched subtrees live on each Linux machine and never reach the authority. Its
 canonical rule revision is authority-controlled and must match at Attach.
 Route CAS uses a separate admin-only session purpose. It has no filesystem
-root, leases, or durable mount membership and is authority-enforced to
+root, subscriptions, delegations, or durable mount membership and is authority-enforced to
 route/session operations. ApplyRoutes still returns `EBUSY` while any active,
 fenced, or durably unproven mount may retain an older LOCAL topology.
 
@@ -150,7 +139,7 @@ Neither mechanism creates a live mutation log or a second writable truth.
 | Subject | Document |
 | --- | --- |
 | Frozen wire, CLI, routing, and release surfaces | [COMPATIBILITY.md](../COMPATIBILITY.md) |
-| Lease protocol and stock-FUSE proof obligations | [portable-coherence.md](./portable-coherence.md) |
+| Subscription/delegation protocol and stock-FUSE proofs | [portable-coherence.md](./portable-coherence.md) |
 | Visibility, durability, replay, locks, mmap, and xattrs | [consistency-model.md](./consistency-model.md) |
 | Failure and fencing | [failure-modes.md](./failure-modes.md) |
 | XFS confinement and storage implementation | [xfs-authority-architecture.md](./xfs-authority-architecture.md) |
@@ -165,4 +154,4 @@ Neither mechanism creates a live mutation log or a second writable truth.
 Protocol-5 qualification receipts, the Linux 6.12.100 private ABI description,
 and the private-kernel vNext specification are retained as historical
 implementation records; the ABI's kernel patch series itself is only in git
-history. None of them defines the protocol-6 product.
+history. None of them defines the protocol-7 product.

@@ -19,31 +19,8 @@ import (
 	"github.com/steerlabs/portablefs/vcs/readonlyfs"
 )
 
-// TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer is the files
-// gateway's first handshake with the real volume handler.
-//
-// vcs/readonlyfs is dialled only by cmd/portablefs-files, and every test it had
-// drove a fake that satisfied the client's own interface. A fake can prove op
-// ordering and handle release, and nothing else: not that the authority accepts
-// FRONTEND_PROFILE_FSKIT_SYNC_REPAIR from a Linux participant, not that a
-// session which discharges every repair phase the instant it arrives is a
-// lawful member of a barrier, and not that such a session is harmless to the
-// mounts it shares a volume with.
-//
-// That last claim is the load-bearing one. The gateway declares sync-repair
-// because it caches nothing, so it can answer a repair phase immediately. The
-// reason that matters is the converse: a frontend that answered slowly would
-// hold every barrier open for as long as it took, and one that never answered
-// would be fenced only after RecallBudget elapsed -- by which time the mutating
-// mount has waited that entire budget. A reader that can stall a writer is not
-// a read-only client, whatever profile it declares. The mutation loop below is
-// what turns that argument into an observation, and the fence count is what
-// distinguishes "discharged" from "escaped through the budget".
-//
-// It lives in package fusev3_test rather than package fusev3 because readonlyfs
-// depends on mountv3 and mountv3 depends on fusev3: importing the gateway from
-// inside the package is an import cycle even in a test file. The fixture
-// reaches it through fusev3.GatewayPeerFixture.
+// The gateway reads buffered bytes through BreakForRead while retaining neither
+// cache permission nor Mac compatibility-writer participation.
 func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing.T) {
 	// One kernel mount is the mutator. The gateway is the second participant,
 	// and it is deliberately not a mount: it projects no namespace at all.
@@ -54,7 +31,17 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 		listing = "listing"
 	)
 	initial := bytes.Repeat([]byte{'a'}, 48*1024)
-	mustWriteFile(t, peer.Join(0, name), initial)
+	writer, err := os.OpenFile(peer.Join(0, name), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Write(initial); err != nil {
+		t.Fatal(err)
+	}
+	if peer.DelegatedIdentityCount() == 0 {
+		t.Fatal("writer has no delegation")
+	}
 	if err := os.Mkdir(peer.Join(0, listing), 0o700); err != nil {
 		t.Fatalf("create a directory through the mount: %v", err)
 	}
@@ -90,59 +77,63 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 	// readonlyfs.Dial. What had never been proven is what the authority
 	// receives and accepts; the mount's own attach is already behind us, so the
 	// most recent one is the gateway's.
-	if got := peer.LastAttachProfile(); got != fusev3.SyncRepairProfile() {
-		t.Fatalf("the authority accepted the gateway under frontend profile %v, want %v", got, fusev3.SyncRepairProfile())
+	if got := peer.LastAttachProfile(); got != fusev3.CachelessReaderProfile() {
+		t.Fatalf("the authority accepted the gateway under frontend profile %v, want %v", got, fusev3.CachelessReaderProfile())
 	}
 	if count := peer.ActiveParticipants(); count != 2 {
 		t.Fatalf("the volume has %d visibility participants, want the mount and the gateway", count)
 	}
 
+	if peer.DelegatedIdentityCount() == 0 {
+		t.Fatal("gateway activation recalled the writer")
+	}
 	ctx := context.Background()
 	servedKey := mustEncodePath(t, name)
 	// The root is the empty key.
 	rootPathKey := mustEncodePath(t)
 
+	page, err := gateway.List(ctx, rootPathKey, 100, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range page.Entries {
+		if string(entry.Name) == name {
+			found = true
+			if entry.Attr.Size != uint64(len(initial)) {
+				t.Fatalf("gateway listing size=%d", entry.Attr.Size)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("gateway listing omitted delegated file")
+	}
+	if peer.DelegatedIdentityCount() == 0 {
+		t.Fatal("gateway listing retired the writer")
+	}
 	// Reads: the gateway resolves an opaque path, opens, and reads bytes that
 	// came out of real XFS through the real handler.
 	requireGatewayContent(t, ctx, gateway, servedKey, initial, "the gateway's first read")
 
-	// Enumeration over the same session, of a directory a Linux-lease mount
-	// wrote. This is the assertion the version-domain defect broke: readdir
-	// discards any page carrying an entry whose ObjectVersion is ahead of the
-	// snapshot it stabilized at, and a sync-repair session used to stabilize
-	// against the visibility coordinator's barrier sequence while those versions
-	// were stamped from the storage cut. On any volume a lease mount had written
-	// to -- which is this one -- every entry looked like it came from the future
-	// and the page could never stabilize, so the gateway answered EAGAIN to every
-	// List. Both profiles now stabilize against the storage cut.
-	requireGatewayListing(t, ctx, gateway, mustEncodePath(t, listing), []string{"one", "two"}, "the gateway's listing of a lease-written directory")
+	// Attribute versions and the directory cut use the same storage domain.
+	requireGatewayListing(t, ctx, gateway, mustEncodePath(t, listing), []string{"one", "two"}, "the gateway's listing of a peer-written directory")
 
-	// A peer mount's mutation, observed through the gateway after apply. The
-	// gateway caches nothing, so this is not a cache-invalidation assertion --
-	// it is the assertion that the mutation's barrier closed at all, which
-	// requires the gateway to have polled its repair phase and acknowledged it.
-	// A gateway that never answered would leave the barrier open and this write
-	// would not return until the recall budget fenced it.
+	// No gateway acknowledgment is needed for this write to complete.
 	mutated := bytes.Repeat([]byte{'b'}, 72*1024)
 	writeStart := time.Now()
 	if err := os.WriteFile(peer.Join(0, name), mutated, 0o600); err != nil {
 		t.Fatalf("peer mount rewrite while the gateway is attached: %v (%s)", err, peer.Diagnostics())
 	}
 	writeElapsed := time.Since(writeStart)
-	// The budget the mount declared is what fences a frontend that will not
-	// discharge. A write that consumed a meaningful fraction of it did not fail,
-	// but it did not demonstrate immediate discharge either.
+	// Keep a bound well below recall expiry so waiting for a nonexistent
+	// gateway repair worker cannot satisfy the test.
 	if writeElapsed > peer.RepairBudget()/4 {
-		t.Fatalf("a rewrite beside the attached gateway took %s, more than a quarter of the %s repair budget: the gateway is not discharging on arrival (%s)",
+		t.Fatalf("a rewrite beside the attached gateway took %s, more than a quarter of the %s recall budget: the gateway obstructed the writer (%s)",
 			writeElapsed, peer.RepairBudget(), peer.Diagnostics())
 	}
 	requireGatewayContent(t, ctx, gateway, servedKey, mutated, "the gateway's read after the peer mutation")
 
-	// The gateway cannot block a writer. A continuous read loop runs against the
-	// same inode the mutation loop rewrites, so rounds land inside the window
-	// each recall covers. What is asserted is not throughput: it is that no
-	// round was ever answered by the escape hatch. No session was fenced, and
-	// neither participant ended.
+	// Exercise breaks while the peer repeatedly truncates and rewrites.
 	const rounds = 24
 	payloads := [2][]byte{mutated, initial}
 	readContext, stopReads := context.WithCancel(ctx)
@@ -188,6 +179,7 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 
 	loopStart := time.Now()
 	for round := range rounds {
+		before := reads.Load()
 		// Every few rounds, enumerate the directory the rewrite is happening in.
 		// A page whose own entry is being rewritten underneath it is the case
 		// stabilization exists for, and the assertion is that it terminates with
@@ -199,6 +191,10 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 			stopReads()
 			reading.Wait()
 			t.Fatalf("round %d: peer mount write while the gateway reads: %v (%s)", round, err, peer.Diagnostics())
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for reads.Load() <= before && readFailure.Load() == nil && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
 		}
 		if recorded := readFailure.Load(); recorded != nil {
 			stopReads()
@@ -215,11 +211,9 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 	if completed := reads.Load(); completed < rounds {
 		t.Fatalf("only %d gateway reads overlapped %d peer rewrites; the window this test exists for was not entered", completed, rounds)
 	}
-	// Per-round cost is the point: a writer waiting on this reader waits for one
-	// repair phase, and a phase discharged on arrival costs a round trip, not a
-	// budget.
+	// Expiry must not be the mechanism that lets the writer proceed.
 	if perRound := loopElapsed / rounds; perRound > peer.RepairBudget()/4 {
-		t.Fatalf("%d rewrites beside a continuously reading gateway averaged %s each, more than a quarter of the %s repair budget (%s)",
+		t.Fatalf("%d rewrites beside a continuously reading gateway averaged %s each, more than a quarter of the %s recall budget (%s)",
 			rounds, perRound, peer.RepairBudget(), peer.Diagnostics())
 	}
 	if fenced := peer.FencedSessions(); fenced != 0 {
@@ -236,8 +230,7 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 	// returned observes what that write left.
 	requireGatewayContent(t, ctx, gateway, servedKey, payloads[(rounds-1)%2], "the gateway's read after the mutation loop")
 
-	// Detach. Close joins the keepalive and visibility workers, so a clean
-	// return is also the statement that neither of them had already failed.
+	// A clean authenticated detach leaves no terminal error.
 	if err := gateway.Close(); err != nil {
 		t.Fatalf("close the gateway session: %v", err)
 	}
@@ -246,12 +239,7 @@ func TestFilesGatewayAttachesToRealXFSWithoutObstructingAMountingPeer(t *testing
 		t.Fatalf("the gateway reported a terminal cause across a clean close: %v", err)
 	}
 
-	// A departure that left an obligation behind shows up as a barrier the next
-	// mutation cannot close. Close sends an authenticated Detach, so the session
-	// leaves the audience before its transport drops and this write costs a
-	// round trip. Without it the write waits the gateway's whole repair budget
-	// for a phase nobody will acknowledge, plus a budget of post-fence grace,
-	// and the mount's own watchdog revokes it in the meantime.
+	// Departure must leave no outstanding reader obligation.
 	afterDetach := time.Now()
 	if err := os.WriteFile(peer.Join(0, name), initial, 0o600); err != nil {
 		t.Fatalf("peer mount write after the gateway detached: %v (%s)", err, peer.Diagnostics())

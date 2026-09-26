@@ -11,11 +11,15 @@ import (
 	"syscall"
 )
 
+// The optional portablefs_e2e build replaces only account lookup. Production
+// binaries always use the operating system's account database here.
+var lookupID = user.LookupId
+
 // Home resolves the euid's account-database home and validates that it is an
 // absolute, real directory owned by that uid.
 func Home() (string, error) {
 	uid := os.Geteuid()
-	entry, err := user.LookupId(strconv.Itoa(uid))
+	entry, err := lookupID(strconv.Itoa(uid))
 	if err != nil {
 		return "", fmt.Errorf("resolve account database entry for uid %d: %w; provision a real passwd/NSS account before using PortableFS", uid, err)
 	}

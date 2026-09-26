@@ -25,7 +25,7 @@ private func v3Contract(
     initialCursor: PfsVisibilityCursor? = nil
 ) -> PfsV3CoherenceContract {
     var contract = PfsV3CoherenceContract()
-    contract.authorityProtocolMajor = 6
+    contract.authorityProtocolMajor = 7
     contract.authorityEpoch = epoch
     contract.sessionID = sessionID
     contract.cachePolicy = policy
@@ -122,7 +122,7 @@ extension PfsLocalMockDaemonTests {
     let parsed = try PfsLocalMacOSV3CoherenceTransport.parseContract(
         v3Contract(initialCursor: complete)
     )
-    #expect(parsed.authorityProtocolMajor == 6)
+    #expect(parsed.authorityProtocolMajor == 7)
     #expect(parsed.epoch == v3Epoch)
     #expect(parsed.sessionID == v3LocalSession)
     #expect(parsed.cachePolicy == .synchronousVFSRepairV1)
@@ -144,6 +144,14 @@ extension PfsLocalMockDaemonTests {
     contract.authorityProtocolMajor = 5
     #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(5)) {
         try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
+    }
+
+    for major in [UInt32(6), UInt32(8)] {
+        contract = v3Contract()
+        contract.authorityProtocolMajor = major
+        #expect(throws: PfsMacOSCoherenceError.invalidAuthorityProtocolMajor(major)) {
+            try PfsLocalMacOSV3CoherenceTransport.parseContract(contract)
+        }
     }
 
     contract = v3Contract(epoch: Data(repeating: 1, count: 15))

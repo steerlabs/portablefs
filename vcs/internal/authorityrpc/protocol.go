@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
@@ -14,14 +15,13 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
-// ProtocolMajor 6 is the stock-kernel lease architecture. It is intentionally
-// incompatible with the previous private-kernel publication profile; there is no
-// negotiated downgrade or second execution path.
-const ProtocolMajor uint32 = 6
+// ProtocolMajor 7 replaces per-coordinate leases with volume subscriptions and
+// file delegations. There is no negotiated downgrade or mixed-major execution.
+const ProtocolMajor uint32 = 7
 
 // ProtocolALPN is exported so the production authority listener and the RPC
 // server package cannot drift onto different exact protocols.
-const ProtocolALPN = "portablefs-authority-v6"
+const ProtocolALPN = "portablefs-authority-v7"
 
 const protocolALPN = ProtocolALPN
 
@@ -32,14 +32,14 @@ const protocolALPN = ProtocolALPN
 // configuration against it, and both read the same constant.
 const FramePayloadReserve uint32 = 1024
 
-// responseEnvelopeReserve is the protocol-6 retained-response allowance. It
+// responseEnvelopeReserve is the protocol-7 retained-response allowance. It
 // covers the maximum four-object post-state envelope, including field 45's
 // two-byte tag, as well as the request, epoch, errno, mutation state, and
 // terminal-delivery token restored around a retained outcome.
 const responseEnvelopeReserve uint32 = 2048
 
-// fixedMutationReplyBytes bounds every mutation reply whose body has a fixed
-// shape (an Item, an Attr, a handle, a byte count). It is also the floor for a
+// fixedMutationReplyBytes bounds fixed-shape mutation replies and the bounded
+// 128-result CloseBatch reply. It is also the floor for a
 // directory-listing budget, which guarantees at least one directory entry fits.
 const fixedMutationReplyBytes uint32 = 4096
 
@@ -61,11 +61,27 @@ const RequiredFskitWriteBytes uint64 = 0x7ffff000
 const peerCompleteFIFOFeedbackFeature = "peer-complete-fifo-feedback"
 const sessionReauthorizationFeature = "session-reauthorization-v1"
 const mountEnrollmentReauthorizationFeature = "mount-enrollment-reauthorization-v1"
-const leaseCoherenceFeature = "lease-coherence-v1"
-const leaseRecallFeature = "lease-recall-v1"
-const leaseRenewalFeature = "lease-renewal-v1"
-const directoryEnumerationLeaseFeature = "directory-enumeration-lease-v1"
-const openByIdentityFeature = "open-by-identity-v1"
+const cachelessReaderFeature = "cacheless-peer-reader-v1"
+const subscriptionFeature = "volume-subscription-v1"
+const changeStreamFeature = "ordered-change-stream-v1"
+const delegationFeature = "file-write-delegation-v1"
+const batchedCloseFeature = "batched-close-v1"
+
+// MaxCloseBatch bounds both the request and its retained per-handle outcome.
+const MaxCloseBatch = 128
+
+const (
+	// MaxReadDirHeldIdentities is the largest page-local capability reuse hint.
+	MaxReadDirHeldIdentities = 4096
+	// MaxReclaimBatch bounds one exact cleanup mutation.
+	MaxReclaimBatch = 4096
+)
+
+const boundedControlReplayFeature = "bounded-control-replay-v1"
+const delegationControlFeature = "delegation-control-v1"
+const durableSequenceFeature = "session-durable-sequence-v1"
+const directoryBarrierFeature = "root-directory-barrier-v1"
+const visibilityCompletionFeature = "foreground-visibility-completion-v1"
 const fskitSyncRepairFeature = "fskit-sync-repair-v1"
 const fskitSourcePublicationFeature = "fskit-source-publication-v1"
 const fskitFragmentedWriteFeature = "fskit-fragmented-write-v1"
@@ -77,21 +93,23 @@ var (
 	}
 	requiredLinuxHelloFeatures = []string{
 		"direct-write",
-		leaseCoherenceFeature, directoryEnumerationLeaseFeature,
+		subscriptionFeature, changeStreamFeature, delegationFeature,
 	}
 	requiredFskitHelloFeatures = []string{
 		fskitSyncRepairFeature, fskitSourcePublicationFeature, fskitFragmentedWriteFeature,
 	}
 	requiredCommonAttachFeatures = []string{
-		"write-through", "no-history", "no-branches", "user-xattr-readonly",
+		"no-history", "no-branches", "user-xattr-readonly",
 		"single-principal", "stable-item-identity", "volume-syncfs-barrier",
 		"exact-resource-acquisition",
 	}
 	requiredLinuxAttachFeatures = []string{
 		"direct-io-no-file-mmap", "distributed-posix-locks",
-		leaseRenewalFeature, leaseRecallFeature, openByIdentityFeature,
+		delegationControlFeature, durableSequenceFeature, directoryBarrierFeature, boundedControlReplayFeature,
+		visibilityCompletionFeature,
 	}
 	requiredFskitAttachFeatures = []string{
+		"write-through",
 		fskitSyncRepairFeature, fskitSourcePublicationFeature, fskitFragmentedWriteFeature,
 		peerCompleteFIFOFeedbackFeature,
 	}
@@ -107,6 +125,8 @@ func helloFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
 	switch profile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED:
 		return features, true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		return append(features, cachelessReaderFeature), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		return append(features, requiredLinuxHelloFeatures...), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
@@ -121,6 +141,8 @@ func activateFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
 	switch profile {
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_UNSPECIFIED:
 		return features, true
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		return append(features, cachelessReaderFeature), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		return append(features, requiredLinuxAttachFeatures...), true
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR:
@@ -128,6 +150,15 @@ func activateFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// Optional advertisements never alter protocol 7's frozen required sets.
+func advertisedActivateFeatures(profile authoritypb.FrontendProfile) ([]string, bool) {
+	features, valid := activateFeatures(profile)
+	if valid && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES {
+		features = append(features, batchedCloseFeature)
+	}
+	return features, valid
 }
 
 func hasFeatures(advertised, required []string) bool {
@@ -148,6 +179,9 @@ func hasFeatures(advertised, required []string) bool {
 // admission lane on both peers so they can never consume the last ordinary
 // execution slot, which is what a keepalive needs to stay live.
 func blockingWait(req *authoritypb.Request) bool {
+	if req.GetWaitVisibility() != nil {
+		return true
+	}
 	lock := req.GetSetLock()
 	return lock != nil && lock.GetWait() && !lock.GetUnlock()
 }
@@ -161,7 +195,7 @@ func terminalQuiesceCancelable(req *authoritypb.Request) bool {
 	if req == nil {
 		return false
 	}
-	if blockingWait(req) || req.GetNextLeaseEvent() != nil || req.GetNextFskitRepair() != nil || req.GetApplyRoutes() != nil {
+	if blockingWait(req) || req.GetNextControlEvent() != nil || req.GetNextFskitRepair() != nil || req.GetApplyRoutes() != nil {
 		return true
 	}
 	return false
@@ -191,7 +225,7 @@ func requestRequiresWrite(req *authoritypb.Request) bool {
 		return true
 	case *authoritypb.Request_Open:
 		flags := body.Open.GetFlags()
-		return flags != nil && (flags.GetWrite() || flags.GetAppend() || flags.GetTruncate())
+		return body.Open.GetWriteIntent() || flags != nil && (flags.GetWrite() || flags.GetAppend() || flags.GetTruncate())
 	case *authoritypb.Request_SetLock:
 		return !body.SetLock.GetUnlock() && body.SetLock.GetLock() != nil && body.SetLock.GetLock().GetWrite()
 	case *authoritypb.Request_Write:
@@ -241,17 +275,39 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 		}
 	}
 	switch profile {
+	case authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER:
+		if req.GetFskitSourcePublication() != nil || req.GetFskitFrontendOperationId() != 0 {
+			return false
+		}
+		switch req.GetBody().(type) {
+		case *authoritypb.Request_Hello, *authoritypb.Request_Attach,
+			*authoritypb.Request_Resume, *authoritypb.Request_Activate,
+			*authoritypb.Request_AbortAttach, *authoritypb.Request_TerminalDeliveryReceipt,
+			*authoritypb.Request_KeepAlive, *authoritypb.Request_Detach,
+			*authoritypb.Request_Cancel, *authoritypb.Request_Reauthorize,
+			*authoritypb.Request_Lookup, *authoritypb.Request_GetAttr,
+			*authoritypb.Request_Close, *authoritypb.Request_Read,
+			*authoritypb.Request_ReadDir, *authoritypb.Request_Reclaim:
+			return true
+		case *authoritypb.Request_Open:
+			return !requestRequiresWrite(req) && !req.GetOpen().GetWriteIntent() && !req.GetOpen().GetCacheCapable()
+		default:
+			return false
+		}
 	case authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES:
 		if req.GetFskitSourcePublication() != nil || req.GetFskitFrontendOperationId() != 0 {
 			return false
 		}
 		switch req.GetBody().(type) {
-		case *authoritypb.Request_Flush, *authoritypb.Request_Fallocate,
+		case *authoritypb.Request_CloseBatch, *authoritypb.Request_Flush, *authoritypb.Request_Fallocate,
 			*authoritypb.Request_CopyFileRange, *authoritypb.Request_Tmpfile,
 			*authoritypb.Request_GetLock, *authoritypb.Request_SetLock,
-			*authoritypb.Request_Write, *authoritypb.Request_NextLeaseEvent,
-			*authoritypb.Request_AcknowledgeLeaseEvent, *authoritypb.Request_RenewLeases,
-			*authoritypb.Request_AcknowledgeSourceLeaseDischarge:
+			*authoritypb.Request_Write,
+			*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,
+			*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
+			*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
+			*authoritypb.Request_DelegationModeChangeAck, *authoritypb.Request_DelegationRelease,
+			*authoritypb.Request_Barrier, *authoritypb.Request_WaitVisibility:
 			return true
 		default:
 			return common()
@@ -402,10 +458,12 @@ func requestUsesTopology(req *authoritypb.Request) bool {
 		*authoritypb.Request_Reauthorize,
 		*authoritypb.Request_Detach, *authoritypb.Request_Cancel,
 		*authoritypb.Request_TerminalDeliveryReceipt,
-		*authoritypb.Request_NextLeaseEvent, *authoritypb.Request_AcknowledgeLeaseEvent,
-		*authoritypb.Request_RenewLeases,
-		*authoritypb.Request_AcknowledgeSourceLeaseDischarge,
 		*authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
+		*authoritypb.Request_Subscribe, *authoritypb.Request_RenewSubscription,
+		*authoritypb.Request_NextControlEvent, *authoritypb.Request_ChangeAck,
+		*authoritypb.Request_DelegationRecallAck, *authoritypb.Request_DelegationBreakAck,
+		*authoritypb.Request_DelegationModeChangeAck, *authoritypb.Request_DelegationRelease,
+		*authoritypb.Request_WaitVisibility,
 		*authoritypb.Request_ApplyRoutes:
 		return false
 	case *authoritypb.Request_SetLock:
@@ -529,11 +587,14 @@ func canonicalWrite(writer io.Writer, message protoreflect.Message) error {
 }
 
 func canonicalWriteWithOptions(writer io.Writer, message protoreflect.Message, options canonicalWriteOptions) error {
-	fields, err := canonicalPresentFields(message)
+	fields, err := canonicalOrderedFields(message)
 	if err != nil {
 		return err
 	}
 	for _, field := range fields {
+		if !message.Has(field) {
+			continue
+		}
 		value := message.Get(field)
 		if field.IsMap() {
 			return fmt.Errorf("%w: map fields have no canonical order", errNonCanonical)
@@ -554,33 +615,42 @@ func canonicalWriteWithOptions(writer io.Writer, message protoreflect.Message, o
 	return nil
 }
 
-func canonicalPresentFields(message protoreflect.Message) ([]protoreflect.FieldDescriptor, error) {
+// Descriptors are immutable and come from the fixed protocol schema, not peer
+// input. Cache their numeric order once; presence remains message-specific.
+var canonicalFieldOrder sync.Map // protoreflect.MessageDescriptor -> []protoreflect.FieldDescriptor
+
+func canonicalOrderedFields(message protoreflect.Message) ([]protoreflect.FieldDescriptor, error) {
 	if len(message.GetUnknown()) != 0 {
 		return nil, fmt.Errorf("%w: unknown fields are not part of this protocol", errNonCanonical)
 	}
-	fields := message.Descriptor().Fields()
-	present := make([]protoreflect.FieldDescriptor, 0, fields.Len())
-	for i := 0; i < fields.Len(); i++ {
-		field := fields.Get(i)
-		if message.Has(field) {
-			present = append(present, field)
+	descriptor := message.Descriptor()
+	if cached, ok := canonicalFieldOrder.Load(descriptor); ok {
+		return cached.([]protoreflect.FieldDescriptor), nil
+	}
+	fields := descriptor.Fields()
+	ordered := make([]protoreflect.FieldDescriptor, fields.Len())
+	for i := range ordered {
+		ordered[i] = fields.Get(i)
+	}
+	for i := 1; i < len(ordered); i++ {
+		for j := i; j > 0 && ordered[j].Number() < ordered[j-1].Number(); j-- {
+			ordered[j], ordered[j-1] = ordered[j-1], ordered[j]
 		}
 	}
-	for i := 1; i < len(present); i++ {
-		for j := i; j > 0 && present[j].Number() < present[j-1].Number(); j-- {
-			present[j], present[j-1] = present[j-1], present[j]
-		}
-	}
-	return present, nil
+	cached, _ := canonicalFieldOrder.LoadOrStore(descriptor, ordered)
+	return cached.([]protoreflect.FieldDescriptor), nil
 }
 
 func canonicalMessageSize(message protoreflect.Message, options canonicalWriteOptions) (int, error) {
-	fields, err := canonicalPresentFields(message)
+	fields, err := canonicalOrderedFields(message)
 	if err != nil {
 		return 0, err
 	}
 	total := 0
 	for _, field := range fields {
+		if !message.Has(field) {
+			continue
+		}
 		value := message.Get(field)
 		if field.IsMap() {
 			return 0, fmt.Errorf("%w: map fields have no canonical order", errNonCanonical)

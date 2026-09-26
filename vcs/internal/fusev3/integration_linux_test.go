@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -511,32 +513,35 @@ func TestCrossMountPositiveDentryInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	requireAbsent(t, fileB, "file after a remote unlink")
-	requireAbsent(t, directoryB, "directory after a remote rmdir")
+	if calls := f.countLookupName("victim", func() { requireAbsent(t, fileB, "file after a remote unlink") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
+	if calls := f.countLookupName("victim-dir", func() { requireAbsent(t, directoryB, "directory after a remote rmdir") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 	_, err := os.Open(fileB)
 	requireErrno(t, err, syscall.ENOENT, "open after a remote unlink")
 	requireDirectoryNames(t, f.mountPath(1), nil, "after the remote removals")
 }
 
-// TestCrossMountNegativeDentryInvalidation is the counterpart, and the one this
-// project calls out as a platform hazard: a name that was looked up and found
-// missing must start resolving as soon as the other mount creates it. A cached
-// negative dentry makes the second stat below fail.
-//
-// The repeated probes below are not defensive any more. A strict mount
-// publishes an absence with a real lifetime, so after the first miss the
-// following two are answered by this kernel with no upcall at all, and the only
-// thing that can make the later stat succeed is the creating mount's barrier
-// expiring this entry before its own create(2) returns.
+// TestCrossMountNegativeDentryInvalidation proves cached daemon absences are
+// withdrawn before a peer CREATE returns. Shared kernel names have zero entry
+// validity: every forward lookup re-enters FUSE, but unchanged names can reuse
+// subscription-backed daemon payloads without an Authority request.
 func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	ghostA, ghostB := f.join(0, "ghost"), f.join(1, "ghost")
 	directoryA, directoryB := f.join(0, "ghost-dir"), f.join(1, "ghost-dir")
 
-	// Look the names up repeatedly so any negative caching is well established.
-	for range 3 {
-		requireAbsent(t, ghostB, "before the remote create")
-		requireAbsent(t, directoryB, "before the remote mkdir")
+	requireAbsent(t, ghostB, "before the remote create")
+	requireAbsent(t, directoryB, "before the remote mkdir")
+	if calls := f.countRequests("lookup", func() {
+		for range 2 {
+			requireAbsent(t, ghostB, "repeated absent file")
+			requireAbsent(t, directoryB, "repeated absent directory")
+		}
+	}); calls != 0 {
+		t.Fatalf("unchanged negative names required %d Authority lookups", calls)
 	}
 
 	mustWrite(t, ghostA, []byte("materialised"), 0o600)
@@ -544,7 +549,9 @@ func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	requireContent(t, ghostB, []byte("materialised"), "after the remote create")
+	if calls := f.countLookupName("ghost", func() { requireContent(t, ghostB, []byte("materialised"), "after the remote create") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 	info, err := os.Stat(directoryB)
 	if err != nil || !info.IsDir() {
 		t.Fatalf("stat after the remote mkdir = %v, %v", info, err)
@@ -555,16 +562,22 @@ func TestCrossMountNegativeDentryInvalidation(t *testing.T) {
 	if err := os.Remove(ghostA); err != nil {
 		t.Fatal(err)
 	}
-	requireAbsent(t, ghostB, "after the second remote unlink")
+	if calls := f.countLookupName("ghost", func() { requireAbsent(t, ghostB, "after the second remote unlink") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 	mustWrite(t, ghostA, []byte("again"), 0o600)
-	requireContent(t, ghostB, []byte("again"), "after the second remote create")
+	if calls := f.countLookupName("ghost", func() { requireContent(t, ghostB, []byte("again"), "after the second remote create") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 
 	// A name inside a remotely created directory must resolve without the
 	// observing mount having ever listed that directory.
 	nestedA, nestedB := filepath.Join(directoryA, "nested"), filepath.Join(directoryB, "nested")
 	requireAbsent(t, nestedB, "before the nested remote create")
 	mustWrite(t, nestedA, []byte("deep"), 0o600)
-	requireContent(t, nestedB, []byte("deep"), "after the nested remote create")
+	if calls := f.countLookupName("nested", func() { requireContent(t, nestedB, []byte("deep"), "after the nested remote create") }); calls != 1 {
+		t.Fatalf("first peer lookup after namespace withdrawal: %d Authority requests, want 1", calls)
+	}
 }
 
 // TestCrossMountRenameCoherence asserts both halves of a remote rename: the old
@@ -790,54 +803,106 @@ func TestPagedReaddirReturnsEveryNameExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestPagedReaddirRefusesToPageAcrossARemoteMutation asserts the verifier
-// contract: an enumeration cursor is invalidated by a concurrent directory
-// mutation and reports ESTALE, rather than silently returning a listing that
-// mixes two different directory states.
-func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
+// TestPagedReaddirContinuesAcrossRemoteMutation preserves every unchanged
+// entry exactly once while the other mount creates and removes transient names.
+func TestPagedReaddirContinuesAcrossRemoteMutation(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	directoryA, directoryB := f.join(0, "paged"), f.join(1, "paged")
 	mustMkdir(t, directoryA)
-	for i := range pagedEntryCount {
-		mustWrite(t, filepath.Join(directoryA, pagedEntryName(i)), nil, 0o600)
+	const anchors = 600
+	const slots = 64
+	padding := strings.Repeat("x", 180)
+	anchorName := func(i int) string { return fmt.Sprintf("anchor-%04d-%s", i, padding) }
+	churnName := func(i int) string { return fmt.Sprintf("churn-%06d-%s", i, padding[:160+i%20]) }
+	mutable := make([]string, slots)
+	for i := range anchors {
+		mustWrite(t, filepath.Join(directoryA, anchorName(i)), nil, 0o600)
+		if i < slots {
+			mutable[i] = churnName(i)
+			mustWrite(t, filepath.Join(directoryA, mutable[i]), nil, 0o600)
+		}
 	}
-
 	directory, err := os.Open(directoryB)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer directory.Close()
-
-	// One kernel READDIR carries at most a page of entries, so consuming a single
-	// entry guarantees the enumeration is started but not finished.
-	if _, err := directory.ReadDir(1); err != nil {
-		t.Fatalf("start the enumeration: %v", err)
+	first, err := directory.Readdirnames(1)
+	if err != nil {
+		t.Fatal(err)
 	}
-	mustWrite(t, filepath.Join(directoryA, "inserted-midway"), nil, 0o600)
-
-	var consumed int
-	var readErr error
-	for {
-		batch, err := directory.ReadDir(1)
-		consumed += len(batch)
-		if err != nil {
-			readErr = err
+	seen := map[string]int{first[0]: 1}
+	stop, done := make(chan struct{}), make(chan struct{})
+	failures := make(chan error, 1)
+	var cycles atomic.Int64
+	go func() {
+		defer close(done)
+		for i := slots; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			slot := i % slots
+			if err := os.Remove(filepath.Join(directoryA, mutable[slot])); err != nil {
+				failures <- err
+				return
+			}
+			name := churnName(i)
+			if err := os.WriteFile(filepath.Join(directoryA, name), nil, 0o600); err != nil {
+				failures <- err
+				return
+			}
+			mutable[slot] = name
+			cycles.Add(1)
+		}
+	}()
+	defer func() { close(stop); <-done }()
+	for page := 0; ; page++ {
+		// Force overlap across many kernel callbacks without coupling mutation to
+		// any individual cookie. Long names defeat the userspace getdents buffer.
+		wantCycles := int64(1 + page/5)
+		deadline := time.Now().Add(2 * time.Second)
+		for cycles.Load() < wantCycles && time.Now().Before(deadline) {
+			select {
+			case err := <-failures:
+				t.Fatalf("peer mutation: %v", err)
+			default:
+			}
+			time.Sleep(time.Millisecond)
+		}
+		names, err := directory.Readdirnames(5)
+		for _, name := range names {
+			seen[name]++
+		}
+		if errors.Is(err, io.EOF) {
 			break
 		}
+		if err != nil {
+			t.Fatalf("continued enumeration (ESTALE forbidden): %v", err)
+		}
+		if page > 2*anchors {
+			t.Fatal("enumeration did not terminate")
+		}
 	}
-	if errors.Is(readErr, io.EOF) {
-		t.Fatalf("enumeration completed across a concurrent remote create after %d entries; "+
-			"the readdir verifier did not invalidate the cursor", consumed)
+	select {
+	case err := <-failures:
+		t.Fatalf("peer mutation: %v", err)
+	default:
 	}
-	requireErrno(t, readErr, syscall.ESTALE, "paging across a concurrent remote directory mutation")
-
-	// The invalidation must be recoverable: a fresh enumeration sees the new set.
-	entries, err := os.ReadDir(directoryB)
-	if err != nil {
-		t.Fatalf("re-enumerate after the invalidation: %v", err)
+	if cycles.Load() < 16 {
+		t.Fatalf("only %d concurrent mutation cycles", cycles.Load())
 	}
-	if len(entries) != pagedEntryCount+1 {
-		t.Fatalf("re-enumeration returned %d entries, want %d", len(entries), pagedEntryCount+1)
+	for i := range anchors {
+		name := anchorName(i)
+		if seen[name] != 1 {
+			t.Errorf("unchanged entry %q returned %d times", name, seen[name])
+		}
+	}
+	for name, count := range seen {
+		if count != 1 {
+			t.Errorf("entry %q returned %d times", name, count)
+		}
 	}
 }
 
@@ -848,7 +913,9 @@ func TestPagedReaddirRefusesToPageAcrossARemoteMutation(t *testing.T) {
 func TestStockWriteRequestSplitting(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
 	path := f.join(0, "write-size-classes")
-	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR, 0o600)
+	// Synchronous writes expose each kernel split at the authority. Ordinary
+	// v7 positioned writes can coalesce before background application.
+	file := mustOpenFile(t, path, os.O_CREATE|os.O_RDWR|syscall.O_SYNC, 0o600)
 	defer file.Close()
 
 	countWrite := func(write func() error) int {
@@ -993,74 +1060,78 @@ func TestConcurrentCrossMountWritersToOneFile(t *testing.T) {
 	}
 }
 
-// TestAuthorityLossFailsCleanlyInsteadOfHanging asserts that losing the volume
-// authority is a bounded, diagnosable mount failure rather than a wedged mount
-// point or an indefinitely blocked syscall.
+// Authority loss expires cache permission and fails an affected operation within
+// its bound. It must not revoke either kernel mount; epoch recovery is qualified
+// separately by the real two-mount matrix.
 func TestAuthorityLossFailsCleanlyInsteadOfHanging(t *testing.T) {
+	testAuthorityHorizonWithdrawalAndRecovery(t, []byte("pre-outage payload"))
+}
+
+func testAuthorityHorizonWithdrawalAndRecovery(t *testing.T, payload []byte) {
+	t.Helper()
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
-	payload := []byte("pre-outage payload")
-	mustWrite(t, f.join(0, "payload"), payload, 0o600)
-	requireContent(t, f.join(1, "payload"), payload, "before the authority outage")
+	enableBaselineOpenTracking(f.counter)
+	mustWrite(t, f.join(0, "payload"), payload, 0600)
+	drainBaselineOpens(t, f.counter)
+	requireContent(t, f.join(1, "payload"), payload, "before authority outage")
+	drainBaselineOpens(t, f.counter)
+	f.waitForDelegationReleases(t)
 	retained := mustOpenFile(t, f.join(1, "payload"), os.O_RDONLY, 0)
-	if got := readExactlyAt(t, retained, 0, len(payload), "before the authority outage"); !bytes.Equal(got, payload) {
-		t.Fatal("retained descriptor did not serve the payload before the outage")
+	defer retained.Close()
+	if got := readExactlyAt(t, retained, 0, len(payload), "prime retained pages"); !bytes.Equal(got, payload) {
+		t.Fatal("bad initial data")
 	}
-	if !isMounted(t, f.mountPath(1)) {
-		t.Fatalf("%s is not a mount point before the outage", f.mountPath(1))
-	}
-
 	f.stopAuthority()
-
-	for i := range 2 {
-		cause := f.requireSessionEnded(i, 30*time.Second)
-		t.Logf("mount %d terminal cause: %v", i, cause)
-	}
-	// The mount nothing is holding open must remove itself rather than linger as
-	// a path that fails or blocks every process that later touches it.
-	waitUntil(t, 30*time.Second, "the idle mount to tear itself down", func() bool {
-		return !isMounted(t, f.mountPath(0))
+	waitUntil(t, 20*time.Second, "subscription withdrawal", func() bool {
+		return f.mounts[1].subscription.stamp() == (subscriptionStamp{}) && f.mounts[1].delegations.incarnation() == 0
 	})
-
-	// The mount this test still holds a descriptor on cannot be unmounted while
-	// it is busy, which is ordinary POSIX. What must hold is that it fails
-	// immediately and never serves the pre-outage bytes again.
 	outcome := make(chan error, 1)
-	go func() {
-		_, err := retained.ReadAt(make([]byte, len(payload)), 0)
-		outcome <- err
-	}()
+	buf := make([]byte, len(payload))
+	go func() { _, err := retained.ReadAt(buf, 0); outcome <- err }()
 	select {
 	case err := <-outcome:
-		if err == nil {
-			t.Fatal("a read through a descriptor of a destroyed authority succeeded")
+		if !errors.Is(err, syscall.EIO) {
+			t.Fatalf("post-horizon retained read=%v, want scoped EIO", err)
 		}
-		// Losing the authority means this frontend can no longer be told that
-		// what it cached has changed, so it revokes itself and stops being a
-		// filesystem rather than failing only this operation.
-		//
-		// This read is served through a descriptor whose pages the earlier read
-		// left resident, so with FOPEN_KEEP_CACHE it is also the assertion that
-		// the revocation ladder's whole-inode data withdrawal actually ran: the
-		// kernel could otherwise answer it without any request reaching this
-		// frontend, and neither the revoked check nor the connection abort
-		// would see it.
-		if !errors.Is(err, syscall.ENOTCONN) {
-			t.Fatalf("read through a descriptor of a destroyed authority = %v, want ENOTCONN (revoked)", err)
+	case <-time.After(integrationRequestTimeout + 5*time.Second):
+		buf := make([]byte, 2<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("post-horizon read hung\n%s", buf[:n])
+	}
+	if bytes.Equal(buf, payload) {
+		t.Fatal("post-horizon failed read returned retained bytes")
+	}
+	assertHealthy := func() {
+		for i, mount := range f.mounts {
+			if !isMounted(t, f.mountPath(i)) || mount.isRevoked() || f.clients[i].SessionEndCause() != nil {
+				t.Fatalf("mount %d ended after transport outage: mount=%v session=%v", i, mount.fatalError(), f.clients[i].SessionEndCause())
+			}
 		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("a read through a descriptor of a destroyed authority hung")
 	}
-
-	// Releasing the last reference must let the aborted mount disappear too. A
-	// mount that stays installed after its authority died, and that Unmount can
-	// no longer remove because the session was already closed, is a permanently
-	// EIO path that only an administrator can clear.
-	if err := retained.Close(); err != nil {
-		t.Logf("closing the retained descriptor reported %v", err)
-	}
-	waitUntil(t, 30*time.Second, "the busy mount to tear itself down once its last descriptor is closed", func() bool {
-		return !isMounted(t, f.mountPath(1))
+	assertHealthy()
+	f.resumeAuthority()
+	waitUntil(t, 20*time.Second, "both cold subscriptions recovered", func() bool {
+		for _, mount := range f.mounts {
+			if mount.subscription.stamp() == (subscriptionStamp{}) {
+				return false
+			}
+		}
+		return true
 	})
+	if got := readExactlyAt(t, retained, 0, len(payload), "retained handle after recovery"); !bytes.Equal(got, payload) {
+		t.Fatal("recovered retained handle returned wrong data")
+	}
+	requireContent(t, f.join(0, "payload"), payload, "fresh read after recovery")
+	for i := range f.mounts {
+		root := mustOpenFile(t, f.mountPath(i), os.O_RDONLY, 0)
+		if err := root.Sync(); err != nil {
+			t.Fatalf("mount %d recovered barrier: %v", i, err)
+		}
+		if err := root.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertHealthy()
 }
 
 // TestSessionExpiryReleasesABlockedLockWait asserts that an operation parked in
@@ -1141,7 +1212,21 @@ func TestUnmountRemountObservesDurableState(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	oldAbortFiles := make([]*kernelAbortFile, len(f.mounts))
+	for i, mount := range f.mounts {
+		oldAbortFiles[i] = mount.kernelMount.abortFile
+		if oldAbortFiles[i] == nil {
+			t.Fatal("serving mount lacks its original abort descriptor")
+		}
+	}
+
 	f.remount()
+
+	for _, abort := range oldAbortFiles {
+		if _, err := abort.file.Stat(); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("normal Mount close leaked its abort descriptor: %v", err)
+		}
+	}
 
 	for i := range 2 {
 		what := fmt.Sprintf("mount %d after remount", i)
@@ -1330,6 +1415,8 @@ func requireSQLiteRollbackJournalHandoff(t *testing.T, f *integrationFixture) {
 	}
 
 	holder := exec.Command("sqlite3", databaseA)
+	var holderOutput bytes.Buffer
+	holder.Stdout, holder.Stderr = &holderOutput, &holderOutput
 	stdin, err := holder.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -1337,8 +1424,17 @@ func requireSQLiteRollbackJournalHandoff(t *testing.T, f *integrationFixture) {
 	if err := holder.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = holder.Wait() }()
-	if _, err := io.WriteString(stdin, "PRAGMA busy_timeout=0;\nBEGIN IMMEDIATE;\nINSERT INTO items VALUES('holder');\n"); err != nil {
+	holderWaited := false
+	defer func() {
+		if !holderWaited {
+			_ = holder.Process.Kill()
+			_ = holder.Wait()
+		}
+	}()
+	// The contender briefly takes SHARED while attempting RESERVED. COMMIT
+	// must be allowed to wait for that reader when upgrading to EXCLUSIVE;
+	// busy_timeout=0 can legally abort this transaction before lock handoff.
+	if _, err := io.WriteString(stdin, "PRAGMA busy_timeout=60000;\nBEGIN IMMEDIATE;\nINSERT INTO items VALUES('holder');\n"); err != nil {
 		t.Fatal(err)
 	}
 	// The rollback journal appearing on the *other* mount is the observable proof
@@ -1395,11 +1491,16 @@ func requireSQLiteRollbackJournalHandoff(t *testing.T, f *integrationFixture) {
 		t.Fatal("the waiting writer never acquired the write lock after the holder committed")
 	}
 
+	holderErr := holder.Wait()
+	holderWaited = true
+	if holderErr != nil {
+		t.Fatalf("the holding writer failed to commit: %v\n%s", holderErr, holderOutput.String())
+	}
 	for _, database := range []string{databaseA, databaseB} {
 		output, err := exec.Command("sqlite3", database,
-			"PRAGMA integrity_check; SELECT count(*) FROM items;").CombinedOutput()
-		if err != nil || strings.TrimSpace(string(output)) != "ok\n3" {
-			t.Fatalf("sqlite state at %s = %q, %v; want integrity ok and 3 rows", database, output, err)
+			"PRAGMA integrity_check; SELECT count(*) FROM items; SELECT value FROM items ORDER BY value;").CombinedOutput()
+		if err != nil || strings.TrimSpace(string(output)) != "ok\n3\nholder\nportable\nwaiter" {
+			t.Fatalf("sqlite state at %s = %q, %v; want integrity ok and all 3 committed rows", database, output, err)
 		}
 	}
 }
@@ -1502,6 +1603,7 @@ func TestStrictMountAnswersRepeatedPathWalksWithoutTheAuthority(t *testing.T) {
 	for i := range files {
 		mustWrite(t, filepath.Join(directory, fmt.Sprintf("file-%03d", i)), []byte("x"), 0o600)
 	}
+	f.waitForDelegationReleases(t)
 	observed := filepath.Join(f.mountPath(1), "tree")
 	walk := func() {
 		for i := range files {
@@ -1552,6 +1654,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 		open, tmpfile, fallocate, copyFileRange, removeXattr                                 int
 	}
 	measure := func(operation string, fn func()) counts {
+		loss := f.mounts[0].delegations.LossSequence()
 		before := counts{
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
 			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
@@ -1563,6 +1666,12 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			removeXattr: f.counter.count("remove-xattr"),
 		}
 		fn()
+		// v7 can answer the stat from the accepted overlay before application.
+		// Measure the authority operations after a durable cut while retaining
+		// the zero-follow-up-GETATTR assertion for the operation and its stat.
+		if err := f.mounts[0].delegations.Barrier(t.Context(), loss); err != nil {
+			t.Fatalf("%s durability barrier: %v", operation, err)
+		}
 		after := counts{
 			lookup: f.counter.count("lookup"), getattr: f.counter.count("getattr"),
 			create: f.counter.count("create"), mkdir: f.counter.count("mkdir"),
@@ -1591,8 +1700,15 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	}
 	requireCounts := func(operation string, got, want counts) {
 		t.Helper()
+		// The kernel may reuse a negative dentry instead of repeating LOOKUP.
+		// Fewer lookups strengthen the bound; every other operation stays exact.
+		lookup := got.lookup
+		if lookup <= want.lookup {
+			got.lookup = want.lookup
+		}
 		if got != want {
-			t.Fatalf("%s RPCs = %+v, want %+v", operation, got, want)
+			got.lookup = lookup
+			t.Fatalf("%s RPCs = %+v, want at most lookup=%d and other counts %+v", operation, got, want.lookup, want)
 		}
 	}
 
@@ -1607,11 +1723,8 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	var created *os.File
 	createRPCs := measure("create plus child/parent stat", func() {
 		var err error
-		// Linux always performs one fresh LOOKUP for a negative dentry before
-		// CREATE, including the ordinary non-exclusive path. It precedes the
-		// mutation and therefore says nothing about post-state completeness; the
-		// child and parent stats below are the follow-up requests this assertion
-		// requires the CREATE post-state to eliminate.
+		// The kernel's LOOKUP before CREATE is answered by the warmed daemon
+		// absence. CREATE post-state also eliminates child/parent metadata RPCs.
 		created, err = os.OpenFile(createdPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if err != nil {
 			t.Fatalf("create: %v", err)
@@ -1638,6 +1751,10 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	requireCounts("write plus warm fstat", writeRPCs, counts{write: 1})
 	if err := created.Close(); err != nil {
 		t.Fatalf("close created file: %v", err)
+	}
+	f.waitForDelegationReleases(t)
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("warm metadata after delegation release: %v", err)
 	}
 
 	setattrRPCs := measure("setattr plus warm stat", func() {
@@ -1683,6 +1800,11 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	requireCounts("fallocate plus warm fstat", fallocateRPCs, counts{fallocate: 1})
 	if err := fallocateFile.Close(); err != nil {
 		t.Fatalf("close fallocate target: %v", err)
+	}
+
+	f.waitForDelegationReleases(t)
+	if _, err := os.Lstat(createdPath); err != nil {
+		t.Fatalf("warm metadata after fallocate delegation release: %v", err)
 	}
 
 	const removableXattr = "user.portablefs-post-state-remove"
@@ -1794,6 +1916,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	copySourcePath, copyDestinationPath := filepath.Join(root, "post-state-copy-source"), filepath.Join(root, "post-state-copy-destination")
 	mustWrite(t, copySourcePath, []byte("copy"), 0o600)
 	mustWrite(t, copyDestinationPath, nil, 0o600)
+	f.waitForDelegationReleases(t)
 	copySource, err := os.Open(copySourcePath)
 	if err != nil {
 		t.Fatalf("open copy source: %v", err)
@@ -1896,6 +2019,11 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	})
 	defer f.transports[0].setAfterMutation(nil)
 	var existingOpenErr error
+	existingStart := time.Now()
+	existingIncarnations := make([]uint64, len(f.mounts))
+	for i, mount := range f.mounts {
+		existingIncarnations[i], _, _, _ = mount.subscription.currentIncarnation()
+	}
 	existingCreateRPCs := measure("existing create plus child/parent stat", func() {
 		file, openErr := os.OpenFile(existingPath, os.O_CREATE|os.O_RDWR, 0o600)
 		if openErr != nil {
@@ -1924,6 +2052,14 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 	if injectionErr != nil {
 		t.Fatalf("materialize existing-create race through the peer mount: %v", injectionErr)
 	}
+	if elapsed := time.Since(existingStart); elapsed > 2*time.Second {
+		t.Fatalf("same-name CREATE waited %v for subscription expiry", elapsed)
+	}
+	for i, mount := range f.mounts {
+		if incarnation, _, _, active := mount.subscription.currentIncarnation(); incarnation != existingIncarnations[i] || !active {
+			t.Fatal("same-name CREATE expired a subscription")
+		}
+	}
 	var rpcResults []existingCreateResult
 	for len(results) != 0 {
 		rpcResults = append(rpcResults, <-results)
@@ -1950,6 +2086,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 
 	unlinkedPath := filepath.Join(root, "post-state-unlinked")
 	mustWrite(t, unlinkedPath, []byte("unlink"), 0o600)
+	f.waitForDelegationReleases(t)
 	if _, err := os.Lstat(unlinkedPath); err != nil {
 		t.Fatalf("warm unlink source: %v", err)
 	}
@@ -1964,13 +2101,14 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			t.Fatalf("stat parent after unlink: %v", err)
 		}
 	})
-	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{lookup: 1, unlink: 1})
+	requireCounts("unlink plus child/parent stat", unlinkRPCs, counts{unlink: 1})
 
 	oldParent, newParent := filepath.Join(root, "old-parent"), filepath.Join(root, "new-parent")
 	mustMkdir(t, oldParent)
 	mustMkdir(t, newParent)
 	source, destination := filepath.Join(oldParent, "source"), filepath.Join(newParent, "destination")
 	mustWrite(t, source, []byte("rename"), 0o600)
+	f.waitForDelegationReleases(t)
 	for _, path := range []string{oldParent, newParent, source} {
 		if _, err := os.Lstat(path); err != nil {
 			t.Fatalf("warm rename path %s: %v", path, err)
@@ -1989,9 +2127,9 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 			}
 		}
 	})
-	// The warmed source name resolves inside the daemon under its N lease, so
-	// only the destination's absence -- which carries no cacheable fact -- costs
-	// the kernel's pre-rename LOOKUP a round trip.
+	// F4 reuses the known source identity and resolves the destination once.
+	// Exact rename post-state supplies fresh name and attribute payloads, so
+	// all follow-up stats complete without Authority metadata requests.
 	requireCounts("rename plus child/parent stats", renameRPCs, counts{lookup: 1, rename: 1})
 }
 
@@ -2003,6 +2141,7 @@ func TestMutationPostStateEliminatesFollowupMetadataRPCs(t *testing.T) {
 func TestRemoteRemovalIsRepairedBeforeTheMutatorsCallReturns(t *testing.T) {
 	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
 	mustWrite(t, f.join(0, "cached"), []byte("payload"), 0o600)
+	f.waitForDelegationReleases(t)
 	requireContent(t, f.join(1, "cached"), []byte("payload"), "establishing the cached binding")
 	// Prove it really is cached: a second resolution must not reach the wire.
 	if reached := f.countRequests("lookup", func() {
@@ -2189,6 +2328,7 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 		payload[i] = byte('a' + i%26)
 	}
 	mustWrite(t, nameA, payload, 0o600)
+	f.waitForDelegationReleases(t)
 
 	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
 	defer reader.Close()
@@ -2218,6 +2358,10 @@ func TestCachedPagesSurviveRereadsAndDieAtTheBarrier(t *testing.T) {
 	mustWrite(t, nameA, rewritten, 0o600)
 	if got := readExactlyAt(t, reader, 0, size, "re-read after a same-length remote rewrite"); !bytes.Equal(got, rewritten) {
 		t.Fatal("a same-length remote rewrite left this mount serving pre-write pages from its kernel; the DATA repair did not withdraw them")
+	}
+	f.waitForDelegationReleases(t)
+	if got := readExactlyAt(t, reader, 0, size, "repopulate after delegation release"); !bytes.Equal(got, rewritten) {
+		t.Fatal("delegation release restored stale cached pages")
 	}
 
 	// And the cache is repopulated rather than disabled: reuse must survive a
@@ -2271,65 +2415,9 @@ func TestPrivateMappingsAreTornDownByTheDataBarrier(t *testing.T) {
 	}
 }
 
-// TestRevokedMountCannotServeRetainedPages is the fencing half, and it is the
-// assertion that separates this platform from the macOS defect recorded in
-// docs/failure-modes.md.
-//
-// Every other kind of stale service a revoked mount could commit is bounded by
-// refusing requests. A retained page is not: with FOPEN_KEEP_CACHE the read is
-// answered inside the kernel and never becomes a request, so neither the
-// frontend's revoked check nor the FUSE connection abort can see it. What
-// closes it is the explicit whole-inode withdrawal the revocation ladder issues
-// before the abort closes its notification channel. If that regressed, this
-// reader would keep observing
-// pre-fence bytes for as long as it held the file open.
-//
-// REQUIRES THE PRIVILEGED RUNNER: revocation is only observable against a real
-// kernel mount, and the reader has to be a real process holding a real mapping
-// of a real page cache.
+// TestRevokedMountCannotServeRetainedPages preserves the retained-page proof
+// under the v7 withdrawal contract: the mount stays installed, resident bytes
+// cannot satisfy reads after the horizon, and the same open handle recovers.
 func TestRevokedMountCannotServeRetainedPages(t *testing.T) {
-	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
-	nameA, nameB := f.join(0, "fenced"), f.join(1, "fenced")
-
-	const size = 8 * 1024
-	payload := bytes.Repeat([]byte{'z'}, size)
-	mustWrite(t, nameA, payload, 0o600)
-
-	reader := mustOpenFile(t, nameB, os.O_RDONLY, 0)
-	defer reader.Close()
-	if got := readExactlyAt(t, reader, 0, size, "pre-revocation read"); !bytes.Equal(got, payload) {
-		t.Fatal("pre-revocation read returned the wrong bytes")
-	}
-
-	// The pages are now resident on mount B. Losing the authority is what fences
-	// it: it can no longer be told that what it holds has changed, so it revokes
-	// itself. Then read through the descriptor that is already open -- the exact
-	// case the mount-namespace detach cannot reach.
-	f.stopAuthority()
-	for i := range 2 {
-		t.Logf("mount %d terminal cause: %v", i, f.requireSessionEnded(i, 30*time.Second))
-	}
-
-	outcome := make(chan error, 1)
-	buf := make([]byte, size)
-	go func() {
-		_, err := reader.ReadAt(buf, 0)
-		outcome <- err
-	}()
-	select {
-	case err := <-outcome:
-		if err == nil {
-			t.Fatal("a fenced mount served its retained pages; this is the stale-read window the withdrawal pass exists to close")
-		}
-		// ENOTCONN from the aborted connection, or EIO from a refaulted page
-		// that cannot be filled. Which one depends on where in the teardown the
-		// read landed; pinning that would pin a race rather than a contract.
-		// What must never happen is a successful read.
-		t.Logf("fenced-mount read failed as required: %v", err)
-	case <-time.After(30 * time.Second):
-		t.Fatal("a read of retained pages on a fenced mount hung")
-	}
-	if bytes.Equal(buf, payload) {
-		t.Fatal("the fenced read filled the caller's buffer with pre-fence bytes even though it reported an error")
-	}
+	testAuthorityHorizonWithdrawalAndRecovery(t, bytes.Repeat([]byte{'z'}, 8*1024))
 }

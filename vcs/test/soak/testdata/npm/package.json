@@ -1,0 +1,13 @@
+{
+  "name": "portablefs-coherence-soak",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned real dependency graph for the PortableFS coherence soak",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "eslint": "9.35.0",
+    "jest": "30.1.3",
+    "typescript": "5.9.2",
+    "vite": "5.4.20"
+  }
+}

@@ -183,6 +183,12 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 	} else if handleID != (Capability{}) && coordinate.Stable != opened.coordinate.Stable {
 		return Attr{}, fs.ErrInvalid
 	}
+	metadataFD, metadataKind := -1, Kind(0)
+	if opened != nil {
+		metadataFD, metadataKind = opened.fd(), opened.kind
+	} else {
+		metadataFD, metadataKind = obj.fd(), obj.kind
+	}
 	changed := false
 	apply := func(operation func() error) error {
 		if err := operation(); err != nil {
@@ -199,10 +205,10 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 		if modeErr != nil {
 			return Attr{}, modeErr
 		}
-		if itemID == (Capability{}) || obj.kind == KindSymlink {
+		if metadataKind == KindSymlink {
 			return Attr{}, syscall.EOPNOTSUPP
 		}
-		if err := apply(func() error { return v.chmodCapability(obj.fd(), obj.kind, unixMode) }); err != nil {
+		if err := apply(func() error { return v.chmodCapability(metadataFD, metadataKind, unixMode) }); err != nil {
 			return v.setAttrPost(obj, opened, itemID, err)
 		}
 	}
@@ -220,11 +226,8 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 			}
 			gid = int(*spec.GID)
 		}
-		if itemID == (Capability{}) {
-			return Attr{}, fs.ErrInvalid
-		}
 		if err := apply(func() error {
-			return unix.Fchownat(obj.fd(), "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+			return unix.Fchownat(metadataFD, "", uid, gid, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 		}); err != nil {
 			return v.setAttrPost(obj, opened, itemID, err)
 		}
@@ -263,7 +266,7 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 		}
 	}
 	if spec.ATimeNS != nil || spec.MTimeNS != nil || spec.ATimeNow || spec.MTimeNow {
-		if itemID == (Capability{}) || spec.ATimeNS != nil && spec.ATimeNow || spec.MTimeNS != nil && spec.MTimeNow {
+		if spec.ATimeNS != nil && spec.ATimeNow || spec.MTimeNS != nil && spec.MTimeNow {
 			return Attr{}, fs.ErrInvalid
 		}
 		times := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, {Nsec: unix.UTIME_OMIT}}
@@ -278,7 +281,7 @@ func (v *Volume) SetAttr(itemID, handleID Capability, spec SetAttrSpec) (Attr, e
 			times[1] = unix.NsecToTimespec(*spec.MTimeNS)
 		}
 		if err := apply(func() error {
-			return unix.UtimesNanoAt(obj.fd(), "", times, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+			return unix.UtimesNanoAt(metadataFD, "", times, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
 		}); err != nil {
 			return v.setAttrPost(obj, opened, itemID, err)
 		}

@@ -3,6 +3,7 @@
 package fusev3
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -11,11 +12,15 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/hanwen/go-fuse/v2/benchmark"
 	"golang.org/x/sys/unix"
 )
 
@@ -491,4 +496,265 @@ func requestDelta(before, after map[string]int) map[string]int {
 		result[kind] = count - before[kind]
 	}
 	return result
+}
+
+type lookupLatencyRecorder struct {
+	mu      sync.Mutex
+	counts  map[string]int
+	lookups []time.Duration
+}
+
+func (r *lookupLatencyRecorder) Add(name string, elapsed time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.counts[name]++
+	if name == "LOOKUP" {
+		r.lookups = append(r.lookups, elapsed)
+	}
+}
+func (r *lookupLatencyRecorder) snapshot() (map[string]int, []time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	counts := make(map[string]int, len(r.counts))
+	for kind, count := range r.counts {
+		counts[kind] = count
+	}
+	return counts, append([]time.Duration(nil), r.lookups...)
+}
+
+// This measures the complete cached metadata syscall, including the kernel /
+// daemon round trip. It is not an Authority RPC latency or a pure callback timer.
+func TestCachedMetadataKernelRoundTrip(t *testing.T) {
+	timings := benchmark.NewLatencyMap()
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, latencies: timings})
+	path := f.join(0, "cached-metadata")
+	if err := os.WriteFile(path, []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.waitForDelegationReleases(t)
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatal(err)
+	}
+	lookupBefore, attrBefore := f.counter.count("lookup"), f.counter.count("getattr")
+	const n = 2000
+	latencies := make([]time.Duration, n)
+	for i := range latencies {
+		start := time.Now()
+		info, err := os.Lstat(path)
+		latencies[i] = time.Since(start)
+		if err != nil || info.Size() != 6 {
+			t.Fatalf("cached stat=%v, %v", info, err)
+		}
+	}
+	lookups, attrs := f.counter.count("lookup")-lookupBefore, f.counter.count("getattr")-attrBefore
+	if lookups != 0 || attrs != 0 {
+		t.Fatalf("warm metadata Authority RPCs: LOOKUP=%d GETATTR=%d", lookups, attrs)
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	t.Logf("PORTABLEFS_CACHED_METADATA n=%d p50_us=%.3f p95_us=%.3f lookup_rpc=%d getattr_rpc=%d", n, float64(latencies[n/2])/float64(time.Microsecond), float64(latencies[n*95/100])/float64(time.Microsecond), lookups, attrs)
+}
+
+func TestCachedLookupKernelRoundTrip(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		name := "shared"
+		if full {
+			name = "full-holder"
+		}
+		t.Run(name, func(t *testing.T) { cachedLookupKernelRoundTrip(t, full) })
+	}
+}
+
+func cachedLookupKernelRoundTrip(t *testing.T, full bool) {
+	timings := &lookupLatencyRecorder{counts: make(map[string]int), lookups: make([]time.Duration, 0, 4096)}
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1, latencies: timings})
+	path := f.join(0, "cached-lookup")
+	if err := os.WriteFile(path, []byte("cached"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if full {
+		file, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		if _, err := file.WriteAt([]byte("dirty"), 4096); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		f.waitForDelegationReleases(t)
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.Open(f.mountPath(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	before, _ := timings.snapshot()
+	lookupBefore, attrBefore := f.counter.count("lookup"), f.counter.count("getattr")
+	const n = 2000
+	latencies := make([]time.Duration, n)
+	// A kernel kprobe can identify only this workload thread, then pair unique
+	// request IDs to exclude permission GETATTRs from the LOOKUP round trip.
+	runtime.LockOSThread()
+	threadComm := fmt.Sprintf("/proc/self/task/%d/comm", unix.Gettid())
+	oldComm, err := os.ReadFile(threadComm)
+	if err != nil {
+		runtime.UnlockOSThread()
+		t.Fatal(err)
+	}
+	label := "pfs-look-share"
+	if full {
+		label = "pfs-look-full"
+	}
+	if err := os.WriteFile(threadComm, []byte(label), 0o600); err != nil {
+		runtime.UnlockOSThread()
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.WriteFile(threadComm, oldComm, 0o600); err != nil {
+			t.Error(err)
+		}
+		runtime.UnlockOSThread()
+	}()
+	for i := range latencies {
+		start := time.Now()
+		err := unix.Faccessat(int(dir.Fd()), "cached-lookup", unix.F_OK, 0)
+		latencies[i] = time.Since(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitUntil(t, time.Second, "final LOOKUP timing receipt", func() bool {
+		counts, _ := timings.snapshot()
+		return counts["LOOKUP"]-before["LOOKUP"] >= n
+	})
+	after, lookupTimes := timings.snapshot()
+	if got := after["LOOKUP"] - before["LOOKUP"]; got != n {
+		t.Fatalf("kernel LOOKUPs=%d, want %d", got, n)
+	}
+
+	if got := f.counter.count("lookup") - lookupBefore; got != 0 {
+		t.Fatalf("cached LOOKUP Authority RPCs=%d", got)
+	}
+	if got := f.counter.count("getattr") - attrBefore; got != 0 {
+		t.Fatalf("cached LOOKUP permission GETATTR Authority RPCs=%d", got)
+	}
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	lookupTimes = lookupTimes[len(lookupTimes)-n:]
+	sort.Slice(lookupTimes, func(i, j int) bool { return lookupTimes[i] < lookupTimes[j] })
+	// go-fuse timestamps after reading /dev/fuse and after the reply write.
+	// This isolates daemon service, excluding scheduling before the read;
+	// faccessat also performs permission GETATTRs, reported separately.
+	t.Logf("PORTABLEFS_CACHED_LOOKUP n=%d syscall_p50_us=%.3f syscall_p95_us=%.3f lookup_read_to_reply_p50_us=%.3f lookup_read_to_reply_p95_us=%.3f permission_getattrs=%d authority_lookup_rpc=0", n, float64(latencies[n/2])/float64(time.Microsecond), float64(latencies[n*95/100])/float64(time.Microsecond), float64(lookupTimes[n/2])/float64(time.Microsecond), float64(lookupTimes[n*95/100])/float64(time.Microsecond), after["GETATTR"]-before["GETATTR"])
+}
+
+func TestCreateUsesSubscribedNegativeWithoutLookupRPC(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	path := f.join(0, "cached-absence")
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("warm absence: %v", err)
+	}
+	before := f.counter.count("lookup")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delta := f.counter.count("lookup") - before
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if delta != 0 {
+		t.Fatalf("CREATE with subscribed negative issued %d LOOKUP RPCs", delta)
+	}
+}
+
+func TestThousandFileInstallAmortizesDurabilityBarriers(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	barrier := mustOpenFile(t, f.mountPath(0), os.O_RDONLY, 0)
+	defer barrier.Close()
+	before := f.counter.count("barrier")
+	flushBefore := f.counter.count("flush")
+	closeBefore, batchBefore := f.counter.count("close"), f.counter.count("close_batch")
+	ackBefore, pollBefore := f.counter.count("change-ack"), f.counter.count("next-control-event")
+	for i := 0; i < 1000; i++ {
+		if err := os.WriteFile(f.join(0, fmt.Sprintf("install-%04d", i)), []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := barrier.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	count := f.counter.count("barrier") - before
+	if count < 1 || count > 8 {
+		t.Fatalf("1000-file install issued %d Barriers, want 1 through 8 including explicit completion", count)
+	}
+	flushes := f.counter.count("flush") - flushBefore
+	if flushes != 0 {
+		t.Fatalf("unlocked FULL install issued %d FLUSH requests", flushes)
+	}
+	acks, polls := f.counter.count("change-ack")-ackBefore, f.counter.count("next-control-event")-pollBefore
+	if acks != 0 || polls > 3 {
+		t.Fatalf("lone writer control traffic: acknowledgements=%d polls=%d", acks, polls)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		manager := f.mounts[0].delegations
+		manager.closeMu.Lock()
+		pending := manager.closePending
+		manager.closeMu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deferred closes did not drain: %d", pending)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closes, batches := f.counter.count("close")-closeBefore, f.counter.count("close_batch")-batchBefore
+	if closes != 0 || batches < 8 || batches > 64 {
+		t.Fatalf("install cleanup: serial=%d batches=%d", closes, batches)
+	}
+	t.Logf("PORTABLEFS_INSTALL_1000 barrier=%d flush=%d change_ack=%d next_control_event=%d close=%d close_batch=%d", count, flushes, acks, polls, closes, batches)
+}
+
+func TestReadDirPlusColdListingAvoidsLookupRPCs(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 2})
+	for i := 0; i < 1000; i++ {
+		if err := os.WriteFile(f.join(0, fmt.Sprintf("plus-%04d", i)), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.waitForDelegationReleases(t)
+	lookups, pages := f.counter.count("lookup"), f.counter.count("readdir")
+	output, err := exec.Command("ls", "-ln", f.mountPath(1)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("cold ls -ln: %v: %s", err, output)
+	}
+	if got := bytes.Count(output, []byte("plus-")); got != 1000 {
+		t.Fatalf("listed %d files, want 1000", got)
+	}
+	lookups, pages = f.counter.count("lookup")-lookups, f.counter.count("readdir")-pages
+	if lookups != 0 || pages != 4 {
+		t.Fatalf("cold 1000-entry listing: LOOKUP=%d READDIR=%d, want 0 and 4", lookups, pages)
+	}
+	t.Logf("PORTABLEFS_PLUS_1000 lookup=%d readdir=%d", lookups, pages)
+}
+
+func TestNewDirectoryInstallAvoidsLookupRPCs(t *testing.T) {
+	f := newIntegrationFixture(t, integrationConfig{Mounts: 1})
+	if err := os.Mkdir(f.join(0, "new-install"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	before := f.counter.count("lookup")
+	for i := 0; i < 1000; i++ {
+		if err := os.WriteFile(f.join(0, "new-install", fmt.Sprintf("file-%04d", i)), []byte("payload"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lookups := f.counter.count("lookup") - before; lookups != 0 {
+		t.Fatalf("1000 new names issued %d LOOKUP RPCs", lookups)
+	}
+	t.Log("PORTABLEFS_NEW_INSTALL_1000 lookup=0")
 }

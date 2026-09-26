@@ -60,20 +60,38 @@ func OpenAppend(dir, mountPath, component, mountIdentity string) (*Writer, error
 }
 
 type renewalRecord struct {
-	SchemaVersion           int    `json:"schemaVersion"`
-	Kind                    string `json:"kind"`
-	Component               string `json:"component"`
-	MountIdentity           string `json:"mountIdentity"`
-	ObservedAtMs            int64  `json:"observedAtMs"`
-	Sequence                uint64 `json:"sequence"`
-	AuthorizationDeadlineMs int64  `json:"authorizationDeadlineMs"`
-	LastSuccessMs           int64  `json:"lastSuccessMs,omitempty"`
-	NextAttemptMs           int64  `json:"nextAttemptMs,omitempty"`
-	ConsecutiveFailures     uint64 `json:"consecutiveFailures,omitempty"`
-	Error                   string `json:"error,omitempty"`
+	SchemaVersion           int             `json:"schemaVersion"`
+	Kind                    string          `json:"kind"`
+	Component               string          `json:"component"`
+	MountIdentity           string          `json:"mountIdentity"`
+	ObservedAtMs            int64           `json:"observedAtMs"`
+	Sequence                uint64          `json:"sequence"`
+	AuthorizationDeadlineMs int64           `json:"authorizationDeadlineMs"`
+	LastSuccessMs           int64           `json:"lastSuccessMs,omitempty"`
+	NextAttemptMs           int64           `json:"nextAttemptMs,omitempty"`
+	ConsecutiveFailures     uint64          `json:"consecutiveFailures,omitempty"`
+	Error                   string          `json:"error,omitempty"`
+	Writeback               *WritebackStats `json:"writeback,omitempty"`
 }
 
-func (writer *Writer) WriteRenewal(event mountenrollment.RenewalEvent) error {
+// WritebackStats is sampled only at existing renewal events. It is diagnostic
+// backlog, not a durability receipt, and carries no per-file identifiers.
+type WritebackStats struct {
+	DirtyBytes          int64  `json:"dirtyBytes"`
+	DirtyEntries        int    `json:"dirtyEntries"`
+	RetainedBytes       int64  `json:"retainedBytes"`
+	RetainedEntries     int    `json:"retainedEntries"`
+	PendingAdmissions   int    `json:"pendingAdmissions"`
+	FlushingIdentities  int    `json:"flushingIdentities"`
+	ScheduledIdentities int    `json:"scheduledIdentities"`
+	TrackedIdentities   int    `json:"trackedIdentities"`
+	BufferIdentities    int    `json:"bufferIdentities"`
+	PendingCloses       int    `json:"pendingCloses"`
+	DurabilityLag       uint64 `json:"durabilityLag"`
+	LossSequence        uint64 `json:"lossSequence"`
+}
+
+func (writer *Writer) WriteRenewal(event mountenrollment.RenewalEvent, writeback *WritebackStats) error {
 	if writer == nil {
 		return fmt.Errorf("mount event writer is closed")
 	}
@@ -90,6 +108,7 @@ func (writer *Writer) WriteRenewal(event mountenrollment.RenewalEvent) error {
 		AuthorizationDeadlineMs: event.Status.AuthorizationDeadline.UnixMilli(),
 		ConsecutiveFailures:     event.Status.ConsecutiveFailures,
 		Error:                   event.Status.LastError,
+		Writeback:               writeback,
 	}
 	if !event.Status.LastSuccess.IsZero() {
 		record.LastSuccessMs = event.Status.LastSuccess.UnixMilli()

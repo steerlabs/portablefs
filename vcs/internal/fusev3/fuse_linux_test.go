@@ -19,7 +19,6 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
-	"github.com/steerlabs/portablefs/vcs/internal/volumeserver"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
@@ -91,7 +90,11 @@ type fakeRPC struct {
 	closeFailure   syscall.Errno
 	mkdirFailure   syscall.Errno
 	reclaimFailure syscall.Errno
+	reclaimClass   authoritypb.FailureClass
+	subscribeGate  <-chan struct{}
+	subscribeCalls int
 	keepAliveErr   syscall.Errno
+	sessionEnd     error
 	xattrValue     []byte
 	xattrNames     [][]byte
 	fileData       []byte
@@ -130,6 +133,7 @@ type fakeRPC struct {
 	// response is returned to the frontend, allowing ordering tests to place a
 	// raw callback precisely on either side of transport delivery.
 	mutationStates       []*authoritypb.MutationState
+	applied              uint64
 	mutationSeq          uint64
 	afterMutation        func()
 	retainedConsumption  authorityrpc.ResponseConsumption
@@ -152,7 +156,7 @@ func newFakeRPC() *fakeRPC {
 		maxRead:      64 * 1024,
 		maxWrite:     64 * 1024,
 		readSequence: 1,
-		lease:        volumeserver.Protocol6MaxLeaseTTL,
+		lease:        10 * time.Second,
 		leaseEpoch:   1,
 		leaseIssued:  1,
 		missingNames: make(map[string]bool),
@@ -167,42 +171,48 @@ func (f *fakeRPC) SessionLease() time.Duration        { return f.lease }
 func (f *fakeRPC) SessionDone() <-chan struct{}       { return f.done }
 func (f *fakeRPC) SessionError() error                { return nil }
 func (f *fakeRPC) SessionEndPending() <-chan struct{} { return f.done }
-func (f *fakeRPC) SessionEndCause() error             { return nil }
-func (f *fakeRPC) FinishLocalSessionEnforcement()     {}
-func (f *fakeRPC) InitialLeaseCursor() *authoritypb.LeaseEventCursor {
-	return &authoritypb.LeaseEventCursor{}
+func (f *fakeRPC) SessionEndCause() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sessionEnd
 }
-func (f *fakeRPC) NextLeaseEvent(ctx context.Context, _ *authoritypb.LeaseEventCursor) (*authoritypb.LeaseEvent, error) {
+func (f *fakeRPC) FinishLocalSessionEnforcement() {}
+func (f *fakeRPC) Subscribe(ctx context.Context, snapshot, after []byte) (*authoritypb.SubscribeReply, time.Time, error) {
+	f.mu.Lock()
+	f.subscribeCalls++
+	gate := f.subscribeGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, time.Time{}, ctx.Err()
+		}
+	}
+	return &authoritypb.SubscribeReply{Incarnation: 1, Watermark: 1, SnapshotId: []byte("fixture-snapshot"), HorizonNanos: uint64(10 * time.Second)}, time.Now().Add(10 * time.Second), nil
+}
+func (f *fakeRPC) RenewSubscription(context.Context, uint64) (time.Time, error) {
+	return time.Now().Add(10 * time.Second), nil
+}
+func (f *fakeRPC) NextControlEvent(ctx context.Context, inc, after, completed uint64) (*authoritypb.ControlEvent, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
-func (f *fakeRPC) AcknowledgeLeaseEvent(context.Context, *authoritypb.LeaseEventCursor, []*authoritypb.LeaseDischarge) error {
+func (f *fakeRPC) AcknowledgeChanges(context.Context, uint64, uint64) error { return nil }
+func (f *fakeRPC) AcknowledgeDelegationRecall(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error {
 	return nil
 }
-func (f *fakeRPC) AcknowledgeSourceLeaseDischarge(_ context.Context, sequence uint64) error {
-	f.mu.Lock()
-	f.sourceAcks = append(f.sourceAcks, sequence)
-	f.mu.Unlock()
+func (f *fakeRPC) AcknowledgeDelegationBreak(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error {
 	return nil
 }
-func (f *fakeRPC) RenewLeases(_ context.Context, renewals []*authoritypb.LeaseRenewal) (authorityrpc.LeaseRenewalOutcome, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	grants := make([]*authoritypb.LeaseGrant, 0, len(renewals))
-	for _, renewal := range renewals {
-		right := authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ
-		switch renewal.GetCoordinate().GetFamily() {
-		case authoritypb.LeaseFamily_LEASE_FAMILY_NAME:
-			right = authoritypb.LeaseRight_LEASE_RIGHT_NAME_READ
-		case authoritypb.LeaseFamily_LEASE_FAMILY_ATTRIBUTES:
-			right = authoritypb.LeaseRight_LEASE_RIGHT_ATTRIBUTES_READ
-		case authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION:
-			right = authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ
-		}
-		grants = append(grants, &authoritypb.LeaseGrant{Coordinate: proto.Clone(renewal.GetCoordinate()).(*authoritypb.LeaseCoordinate), Right: right, Epoch: renewal.GetEpoch(), ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued})
-	}
-	timed, err := authorityrpc.TimedLeaseGrants(grants, time.Now())
-	return authorityrpc.LeaseRenewalOutcome{Grants: timed}, err
+func (f *fakeRPC) AcknowledgeDelegationModeChange(context.Context, uint64, uint64, *authoritypb.DelegationRef, uint64) error {
+	return nil
+}
+func (f *fakeRPC) ReleaseDelegations(context.Context, uint64, []*authoritypb.DelegationRelease) error {
+	return nil
+}
+func (f *fakeRPC) Barrier(ctx context.Context, cut uint64) (*authoritypb.BarrierReply, error) {
+	return &authoritypb.BarrierReply{AppliedSequence: cut, DurableSequence: cut}, nil
 }
 
 func (f *fakeRPC) Close() error {
@@ -361,9 +371,42 @@ func (f *fakeRPC) noteCancel(ctx context.Context) error {
 	return ctx.Err()
 }
 
-func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, error) {
+func (f *fakeRPC) reply(request *authoritypb.Request) (result *authoritypb.Response, resultErr error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	defer func() {
+		if result == nil {
+			return
+		}
+		if result.VolumeVersion == 0 {
+			result.VolumeVersion = max(f.readSequence, uint64(2))
+		}
+		if result.GetRead() != nil && result.GetRead().VolumeVersion == 0 {
+			result.GetRead().VolumeVersion = result.VolumeVersion
+		}
+		if result.AppliedSequence == 0 && (request.GetWrite() != nil || request.GetSetAttr() != nil || request.GetFallocate() != nil) {
+			f.applied++
+			result.AppliedSequence = f.applied
+		}
+		if f.replyOverride == nil && request.GetOpen() != nil && result.GetOpen() != nil {
+			result.GetOpen().CacheCapable = request.GetOpen().GetCacheCapable()
+			if request.GetOpen().GetWriteIntent() {
+				result.GetOpen().Delegation = testDelegation()
+			}
+		}
+		if request.GetCreate() != nil && result.GetCreate() != nil {
+			result.GetCreate().CacheCapable = request.GetCreate().GetCacheCapable()
+			if request.GetCreate().GetWriteIntent() {
+				result.GetCreate().Delegation = testDelegation()
+			}
+		}
+	}()
+	if wait := request.GetWaitVisibility(); wait != nil {
+		cut := wait.GetCutSequence()
+		return &authoritypb.Response{VisibleSequence: cut, Body: &authoritypb.Response_WaitVisibility{WaitVisibility: &authoritypb.WaitVisibilityReply{
+			AppliedSequence: cut, VisibleSequence: cut,
+		}}}, nil
+	}
 	if f.replyOverride != nil {
 		return f.replyOverride(request)
 	}
@@ -374,10 +417,22 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 			return &authoritypb.Response{Errno: int32(f.keepAliveErr)}, nil
 		}
 	case request.GetReclaim() != nil:
-		f.reclaims = append(f.reclaims, cloneBytes(request.GetReclaim().GetItem()))
-		if f.reclaimFailure != 0 {
-			return &authoritypb.Response{Errno: int32(f.reclaimFailure)}, nil
+		if item := request.GetReclaim().GetItem(); len(item) != 0 {
+			f.reclaims = append(f.reclaims, cloneBytes(item))
 		}
+		for _, item := range request.GetReclaim().GetItems() {
+			f.reclaims = append(f.reclaims, cloneBytes(item))
+		}
+		if f.reclaimFailure != 0 {
+			return &authoritypb.Response{Errno: int32(f.reclaimFailure), Failure: f.reclaimClass}, nil
+		}
+	case request.GetCloseBatch() != nil:
+		results := make([]*authoritypb.CloseBatchResult, len(request.GetCloseBatch().Closes))
+		for i, close := range request.GetCloseBatch().Closes {
+			f.fileCloses = append(f.fileCloses, proto.Clone(close).(*authoritypb.CloseRequest))
+			results[i] = &authoritypb.CloseBatchResult{Errno: int32(f.closeFailure)}
+		}
+		return &authoritypb.Response{Body: &authoritypb.Response_CloseBatch{CloseBatch: &authoritypb.CloseBatchReply{Results: results}}}, nil
 	case request.GetClose() != nil:
 		f.fileCloses = append(f.fileCloses, proto.Clone(request.GetClose()).(*authoritypb.CloseRequest))
 		if f.closeFailure != 0 {
@@ -387,6 +442,9 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		f.flushes = append(f.flushes, proto.Clone(request.GetFlush()).(*authoritypb.FlushRequest))
 	case request.GetFsync() != nil:
 		f.fsyncs = append(f.fsyncs, proto.Clone(request.GetFsync()).(*authoritypb.FsyncRequest))
+		return &authoritypb.Response{Body: &authoritypb.Response_Fsync{Fsync: &authoritypb.FsyncReply{DurableSequence: f.applied}}}, nil
+	case request.GetBarrier() != nil:
+		return &authoritypb.Response{Body: &authoritypb.Response_Barrier{Barrier: &authoritypb.BarrierReply{AppliedSequence: f.applied, DurableSequence: f.applied}}}, nil
 	case request.GetSyncFs() != nil:
 		f.syncFS++
 		return &authoritypb.Response{Body: &authoritypb.Response_SyncFs{SyncFs: &authoritypb.SyncFSReply{}}}, nil
@@ -424,7 +482,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 				struct {
 					item  *authoritypb.Item
 					roles uint32
-				}{f.root, postStateRoleParent}),
+				}{f.itemForTokenLocked(request.GetMkdir().GetParent()), postStateRoleParent}),
 		}, nil
 	case request.GetSymlink() != nil:
 		created := f.namedItem(request.GetSymlink().GetName())
@@ -443,17 +501,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 	case request.GetOpen() != nil:
 		response := &authoritypb.Response{Body: &authoritypb.Response_Open{Open: &authoritypb.OpenReply{Handle: cloneBytes(f.handle)}}}
 		target := f.itemForTokenLocked(request.GetOpen().GetItem())
-		if request.GetOpen().GetFlags().GetRead() && !request.GetOpen().GetFlags().GetWrite() && target != nil {
-			family, right := authoritypb.LeaseFamily_LEASE_FAMILY_DATA, authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ
-			if target.GetAttr().GetKind() == authoritypb.Attr_DIRECTORY {
-				family, right = authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ
-			}
-			response.LeaseGrants = []*authoritypb.LeaseGrant{{
-				Coordinate: &authoritypb.LeaseCoordinate{Family: family, Identity: cloneBytes(target.GetStableIdentity())},
-				Right:      right, Epoch: f.leaseEpoch,
-				ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
-			}}
-		}
+
 		if request.GetOpen().GetFlags().GetTruncate() {
 			response.PostState = exactTestPostState(2, struct {
 				item  *authoritypb.Item
@@ -462,7 +510,8 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}
 		return response, nil
 	case request.GetCreate() != nil:
-		created := cloneItem(f.item)
+		created := f.namedItem(request.GetCreate().GetName())
+		delete(f.missingNames, string(request.GetCreate().GetName()))
 		return &authoritypb.Response{
 			Body: &authoritypb.Response_Create{Create: &authoritypb.CreateReply{Item: created, Handle: cloneBytes(f.handle)}},
 			PostState: exactTestPostState(2,
@@ -473,7 +522,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 				struct {
 					item  *authoritypb.Item
 					roles uint32
-				}{f.root, postStateRoleParent}),
+				}{f.itemForTokenLocked(request.GetCreate().GetParent()), postStateRoleParent}),
 		}, nil
 	case request.GetRead() != nil:
 		offset := int(request.GetRead().GetOffset())
@@ -484,23 +533,15 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		}
 		return &authoritypb.Response{
 			Body: &authoritypb.Response_Read{Read: &authoritypb.ReadReply{Data: data}},
-			LeaseGrants: []*authoritypb.LeaseGrant{{
-				Coordinate: &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_DATA, Identity: cloneBytes(f.item.GetStableIdentity())},
-				Right:      authoritypb.LeaseRight_LEASE_RIGHT_DATA_READ, Epoch: f.leaseEpoch, ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
-			}},
 		}, nil
 	case request.GetReadDir() != nil:
 		f.readdirs = append(f.readdirs, proto.Clone(request.GetReadDir()).(*authoritypb.ReadDirRequest))
-		enumerationGrants := []*authoritypb.LeaseGrant{{
-			Coordinate: &authoritypb.LeaseCoordinate{Family: authoritypb.LeaseFamily_LEASE_FAMILY_ENUMERATION, Identity: cloneBytes(f.root.GetStableIdentity())},
-			Right:      authoritypb.LeaseRight_LEASE_RIGHT_ENUMERATION_READ, Epoch: f.leaseEpoch, ValidForNanos: uint64(volumeserver.Protocol6MaxLeaseTTL), IssuedSequence: f.leaseIssued,
-		}}
 		if f.dirPageIndex >= len(f.dirPages) {
-			return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{Verifier: testToken(5), Eof: true}}, LeaseGrants: enumerationGrants}, nil
+			return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: &authoritypb.ReadDirReply{Verifier: testToken(5), Eof: true}}}, nil
 		}
 		page := f.dirPages[f.dirPageIndex]
 		f.dirPageIndex++
-		return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: proto.Clone(page).(*authoritypb.ReadDirReply)}, LeaseGrants: enumerationGrants}, nil
+		return &authoritypb.Response{Body: &authoritypb.Response_ReadDir{ReadDir: proto.Clone(page).(*authoritypb.ReadDirReply)}}, nil
 	case request.GetWrite() != nil:
 		f.writeRequests = append(f.writeRequests, proto.Clone(request).(*authoritypb.Request))
 		writeRequest := proto.Clone(request.GetWrite()).(*authoritypb.WriteRequest)
@@ -509,7 +550,7 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 		postAttr := &authoritypb.Attr{Inode: f.item.GetAttr().GetInode(), Kind: authoritypb.Attr_REGULAR, Mode: 0o600, Size: int64(postSize)}
 		return &authoritypb.Response{
 			PostState: testMutationPostState(postAttr),
-			Body:      &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(writeRequest.GetSize()), PostAttr: postAttr}},
+			Body:      &authoritypb.Response_Write{Write: &authoritypb.WriteReply{CommittedSize: uint64(writeRequest.GetSize()), AssignedOffset: writeRequest.GetPosition(), PostAttr: postAttr}},
 		}, nil
 	case request.GetSetAttr() != nil:
 		f.setattrs = append(f.setattrs, request.GetSetAttr())
@@ -534,6 +575,21 @@ func (f *fakeRPC) reply(request *authoritypb.Request) (*authoritypb.Response, er
 				roles uint32
 			}{parent, postStateRoleParent},
 		)}, nil
+	case request.GetLink() != nil:
+		link := request.GetLink()
+		linked := f.itemForTokenLocked(link.GetExistingItem())
+		linked.Attr.Nlink++
+		parent := f.itemForTokenLocked(link.GetNewParent())
+		if f.byName != nil {
+			f.byName[string(link.GetNewName())] = linked
+		}
+		return &authoritypb.Response{PostState: exactTestPostState(2, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{linked, postStateRoleTarget}, struct {
+			item  *authoritypb.Item
+			roles uint32
+		}{parent, postStateRoleParent}), Body: &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: cloneItem(linked)}}}, nil
 	case request.GetRename() != nil:
 		rename := request.GetRename()
 		moved := f.itemForTokenLocked(nil)
@@ -637,7 +693,11 @@ func testMount(t *testing.T, watermark int) (*Mount, *fakeRPC) {
 	mount.plannedMountpoint = t.TempDir()
 	root := &node{mount: mount, item: testItem(1, authoritypb.Attr_DIRECTORY, 0), requestTimeout: time.Second, maxRead: 64 * 1024, maxWrite: 64 * 1024}
 	newRawFileSystem(mount, root)
-	t.Cleanup(mount.cancel)
+	mount.setNotifier(&fakeNotifier{})
+	if err := mount.subscription.subscribe(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { mount.cancel(); mount.delegations.Stop() })
 	return mount, rpc
 }
 
@@ -721,11 +781,11 @@ func popReclaim(t *testing.T, mount *Mount) []byte {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	token, ok := mount.reclaim.pop(ctx)
+	entry, ok := mount.reclaim.pop(ctx)
 	if !ok {
 		t.Fatal("expected a queued reclaim")
 	}
-	return token
+	return entry.token
 }
 
 func waitFor(t *testing.T, what string, condition func() bool) {
@@ -764,14 +824,14 @@ func TestOpenCacheModeFollowsDataLeaseAndWriteCapability(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("Open errno = %v", errno)
 	}
-	if flags != 0 {
-		t.Fatalf("first D-R-backed read-only OPEN flags = %#x, want buffered purge-on-open", flags)
+	if flags != fuse.FOPEN_KEEP_CACHE {
+		t.Fatalf("cache-capable read-only OPEN flags = %#x, want KEEP_CACHE", flags)
 	}
 	secondCtx, finishSecond := testMutationContext(t, mount)
 	_, secondFlags, errno := n.Open(secondCtx, syscall.O_RDONLY)
 	finishSecond(errno == 0)
 	if errno != 0 || secondFlags != fuse.FOPEN_KEEP_CACHE {
-		t.Fatalf("warm D-R-backed OPEN = (%#x, %v), want KEEP_CACHE", secondFlags, errno)
+		t.Fatalf("warm cache-capable OPEN = (%#x, %v), want KEEP_CACHE", secondFlags, errno)
 	}
 	ctx, finish := testMutationContext(t, mount)
 	_, _, createFlags, errno := n.Create(ctx, "child", syscall.O_RDWR|syscall.O_CREAT, 0o644)
@@ -824,8 +884,17 @@ func TestMountOptionsRefuseSharedMmapAsADecision(t *testing.T) {
 	// The read-ahead window is paired with the authority read bound: reads are
 	// now served from the page cache, so the window is what decides how many
 	// authority round trips a sequential reader pays.
-	if !options.EnableLocks || !options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
+	if !options.EnableLocks || options.DisableReadDirPlus || options.MaxWrite != 64*1024 || options.MaxReadAhead != 128*1024 {
 		t.Fatalf("mount options = %#v", options)
+	}
+	routedConfig := testConfig(8)
+	routedConfig.Routes = mustRoutes(t, "local/\n")
+	routed := mountOptions(routedConfig, 128*1024, 64*1024)
+	if !routed.DisableReadDirPlus || routed.DisabledCapabilities&(fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO) != fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO {
+		t.Fatal("routed mount enabled unsupported PLUS")
+	}
+	if options.DisabledCapabilities&(fuse.CAP_READDIRPLUS|fuse.CAP_READDIRPLUS_AUTO) != 0 {
+		t.Fatal("Authority mount disabled PLUS capabilities")
 	}
 	foundDefaultPermissions := false
 	for _, option := range options.Options {
@@ -994,6 +1063,30 @@ func TestCleanupPressureThrottlesInterningAndNeverDestroysTheMount(t *testing.T)
 	}
 }
 
+func TestReclaimQueueBindsCapabilityToAuthorityEpoch(t *testing.T) {
+	oldTransport := newFakeRPC()
+	newTransport := newFakeRPC()
+	facade := newEpochRPC(oldTransport)
+	mount := &Mount{rpc: facade, reclaim: newReclaimQueue(4)}
+
+	mount.deferReclaim(testToken(1))
+	facade.mu.Lock()
+	facade.rpc = newTransport
+	facade.mu.Unlock()
+	mount.deferReclaim(testToken(2))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	first, ok := mount.reclaim.pop(ctx)
+	if !ok || first.transport != oldTransport {
+		t.Fatalf("old capability transport = %T, want original epoch", first.transport)
+	}
+	second, ok := mount.reclaim.pop(ctx)
+	if !ok || second.transport != newTransport {
+		t.Fatalf("new capability transport = %T, want replacement epoch", second.transport)
+	}
+}
+
 func TestForgetNeverBlocksUnderCleanupPressure(t *testing.T) {
 	frontend, mount, _ := testRawFileSystem(t, 1)
 	records := make([]*inodeRecord, 0, 64)
@@ -1029,22 +1122,19 @@ func TestForgetNeverBlocksUnderCleanupPressure(t *testing.T) {
 	}
 }
 
-func TestReclaimDrainIsConcurrent(t *testing.T) {
+func TestReclaimDrainBatchesTimerResidue(t *testing.T) {
 	mount, rpc := testMount(t, 1024)
-	width := mount.reclaimWorkers
-	if width < 2 {
-		t.Fatalf("reclaim lane width = %d, want at least 2", width)
-	}
-	reached := make(chan struct{}, width)
+	reached := make(chan *authoritypb.ReclaimRequest, 2)
 	release := make(chan struct{})
 	rpc.hook = func(request *authoritypb.Request) {
-		if request.GetReclaim() == nil {
+		reclaim := request.GetReclaim()
+		if reclaim == nil {
 			return
 		}
-		reached <- struct{}{}
+		reached <- proto.Clone(reclaim).(*authoritypb.ReclaimRequest)
 		<-release
 	}
-	for id := uint64(1); id <= uint64(width); id++ {
+	for id := uint64(1); id <= 100; id++ {
 		mount.deferReclaim(testToken(id))
 	}
 	mount.start(time.Hour)
@@ -1052,12 +1142,38 @@ func TestReclaimDrainIsConcurrent(t *testing.T) {
 		close(release)
 		_ = mount.Close()
 	}()
-	for count := 0; count < width; count++ {
-		select {
-		case <-reached:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("only %d of %d reclaims were in flight at once; a serial drain cannot keep up with ordinary path walking", count, width)
+	select {
+	case request := <-reached:
+		if len(request.GetItem()) != 0 || len(request.GetItems()) != 100 {
+			t.Fatalf("reclaim request = legacy:%x batch:%d, want one 100-token batch", request.GetItem(), len(request.GetItems()))
 		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reclaim residue was not sent at the timer")
+	}
+	select {
+	case request := <-reached:
+		t.Fatalf("timer residue fragmented into another request: %+v", request)
+	case <-time.After(2 * reclaimBatchDelay):
+	}
+}
+
+func TestReclaimQueueFlushesAtWatermarkWithoutMixingEpochs(t *testing.T) {
+	oldTransport, newTransport := newFakeRPC(), newFakeRPC()
+	queue := newReclaimQueue(4)
+	for id := uint64(1); id <= 4; id++ {
+		queue.push(queuedReclaim{token: testToken(id), transport: oldTransport})
+	}
+	queue.push(queuedReclaim{token: testToken(5), transport: newTransport})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	start := time.Now()
+	batch, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
+	if !ok || len(batch) != 4 || batch[0].transport != oldTransport || time.Since(start) >= reclaimBatchDelay {
+		t.Fatalf("watermark batch = %d ok=%v transport=%T elapsed=%s", len(batch), ok, batch[0].transport, time.Since(start))
+	}
+	next, ok := queue.popBatch(ctx, authorityrpc.MaxReclaimBatch)
+	if !ok || len(next) != 1 || next[0].transport != newTransport {
+		t.Fatalf("replacement-epoch batch = %+v ok=%v", next, ok)
 	}
 }
 
@@ -1066,6 +1182,8 @@ func TestReclaimDrainIsConcurrent(t *testing.T) {
 func TestCancelledShutdownIsNotReportedAsFailure(t *testing.T) {
 	mount, rpc := testMount(t, 64)
 	rpc.block = make(chan struct{})
+	consumption := &recordingResponseConsumption{}
+	rpc.retainedConsumption = consumption
 	mount.start(time.Hour)
 	for id := uint64(1); id <= 8; id++ {
 		mount.deferReclaim(testToken(id))
@@ -1080,6 +1198,9 @@ func TestCancelledShutdownIsNotReportedAsFailure(t *testing.T) {
 	}
 	if err := mount.fatalError(); err != nil {
 		t.Fatalf("shutdown recorded a fatal error: %v", err)
+	}
+	if got := consumption.calls.Load(); got != 1 {
+		t.Fatalf("cancelled reclaim response consumption = %d, want 1", got)
 	}
 }
 
@@ -1193,8 +1314,8 @@ func TestGenericTerminalCauseCannotMaskAnExistingRouteCause(t *testing.T) {
 func TestLivenessAndCleanupLanesAreReserved(t *testing.T) {
 	cfg := testConfig(8)
 	mount, rpc := testMount(t, 8)
-	if cap(mount.bulk)+mount.reclaimWorkers+livenessReserve+leaseControlReserve != cfg.MaxInFlight {
-		t.Fatalf("bulk %d + cleanup %d + liveness %d + lease control %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, livenessReserve, leaseControlReserve, cfg.MaxInFlight)
+	if cap(mount.bulk)+mount.reclaimWorkers+livenessReserve+subscriptionControlReserve != cfg.MaxInFlight {
+		t.Fatalf("bulk %d + cleanup %d + liveness %d + lease control %d != authority in-flight budget %d", cap(mount.bulk), mount.reclaimWorkers, livenessReserve, subscriptionControlReserve, cfg.MaxInFlight)
 	}
 	for range cap(mount.bulk) {
 		mount.bulk <- struct{}{}
@@ -1218,7 +1339,7 @@ func TestLivenessAndCleanupLanesAreReserved(t *testing.T) {
 	}
 }
 
-// --- Defect 9: a refused release is never discarded ------------------------
+// --- Defect 9: a refused release is scoped to the released resource --------
 
 func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	frontend, mount, rpc := testRawFileSystem(t, 8)
@@ -1236,12 +1357,11 @@ func TestReleaseSurfacesARefusedClose(t *testing.T) {
 	if frontend.ReplyWriteTracked(unique) {
 		frontend.ReplyWritten(unique, fuse.OK)
 	}
-	err := mount.fatalError()
-	if err == nil {
-		t.Fatal("a refused close was discarded; the authority keeps the open file description until the session ends")
+	if err := mount.fatalError(); err != nil {
+		t.Fatalf("definite close refusal revoked mount: %v", err)
 	}
-	if !strings.Contains(err.Error(), "frontend-owned resource") {
-		t.Fatalf("diagnostic does not name the cause: %v", err)
+	if !record.node.stale.Load() {
+		t.Fatal("refused close did not stale the affected identity")
 	}
 }
 
@@ -1256,9 +1376,16 @@ func TestReleaseDirSurfacesARefusedClose(t *testing.T) {
 	if !ok {
 		t.Fatal("add handle")
 	}
-	frontend.ReleaseDir(&fuse.ReleaseIn{Fh: id})
-	if mount.fatalError() == nil {
-		t.Fatal("a refused directory close was discarded")
+	unique := nextTestRequestUnique()
+	frontend.ReleaseDir(&fuse.ReleaseIn{InHeader: fuse.InHeader{Unique: unique}, Fh: id})
+	if frontend.ReplyWriteTracked(unique) {
+		frontend.ReplyWritten(unique, fuse.OK)
+	}
+	if err := mount.fatalError(); err != nil {
+		t.Fatalf("definite directory close refusal revoked mount: %v", err)
+	}
+	if !record.node.stale.Load() {
+		t.Fatal("refused directory close did not stale the affected identity")
 	}
 }
 
@@ -1304,8 +1431,8 @@ func TestOpendirWithoutAnEnumerationLeaseOpensUncached(t *testing.T) {
 	if mount.isRevoked() {
 		t.Fatalf("OPENDIR without an E lease revoked the mount: %v", mount.fatalError())
 	}
-	if handle.pageLease != (leaseStamp{}) {
-		t.Fatalf("uncovered directory handle carries lease stamp %+v, want none", handle.pageLease)
+	if handle.pageStamp != (subscriptionStamp{}) {
+		t.Fatalf("uncovered directory handle carries lease stamp %+v, want none", handle.pageStamp)
 	}
 }
 
@@ -1502,7 +1629,7 @@ func testDirHandle(t *testing.T, frontend *rawFileSystem, pages ...*authoritypb.
 	if errno != 0 {
 		t.Fatal(errno)
 	}
-	rpc := frontend.mount.rpc.(*fakeRPC)
+	rpc := frontend.mount.rpc.(*epochRPC).current().(*fakeRPC)
 	rpc.dirPages = pages
 	rpc.root = cloneItem(record.node.item)
 	id, ok := frontend.addHandle(record, &handleRecord{dir: &dirHandle{node: record.node, token: testToken(100)}})
@@ -1547,7 +1674,7 @@ func TestDirHandleBuffersOneAuthorityPageAcrossEntries(t *testing.T) {
 			t.Fatalf("peek is not idempotent: %q then %q", entry.Name, again.Name)
 		}
 		names = append(names, entry.Name)
-		handle.consume()
+		handle.consume(entry)
 	}
 	entry, _, errno := handle.peek(ctx, false)
 	if errno != 0 || entry != nil {
@@ -1895,6 +2022,9 @@ func TestSetattrProjectsSinglePrincipal(t *testing.T) {
 	if errno != 0 {
 		t.Fatal(errno)
 	}
+	if _, err := mount.delegations.FlushIdentity(context.Background(), n.item.GetStableIdentity()); err != nil {
+		t.Fatal(err)
+	}
 	if len(rpc.setattrs) != 1 || rpc.setattrs[0].Uid != nil || rpc.setattrs[0].Gid != nil || rpc.setattrs[0].GetMode() != 0o600 {
 		t.Fatalf("projected setattr = %#v", rpc.setattrs)
 	}
@@ -1907,20 +2037,32 @@ func TestSetattrProjectsSinglePrincipal(t *testing.T) {
 func TestSetattrPreservesServerClockNowIntent(t *testing.T) {
 	mount, rpc := testMount(t, 8)
 	n := testNode(mount)
+	if err := mount.delegations.Install(n.item.GetStableIdentity(), n.item.GetToken(), testToken(100), delegationTestGrant(44, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
 	in := &fuse.SetAttrIn{}
 	in.Valid = fuse.FATTR_ATIME_NOW | fuse.FATTR_MTIME_NOW
+	before := time.Now().UnixNano()
 	_, errno := testVisibleMutation(t, mount, func(ctx context.Context) (struct{}, syscall.Errno) {
+		if _, errno := mount.raw.intern(ctx, n.item); errno != 0 {
+			return struct{}{}, errno
+		}
 		return struct{}{}, n.Setattr(ctx, nil, in, &fuse.AttrOut{})
 	})
 	if errno != 0 {
 		t.Fatal(errno)
 	}
+	if _, err := mount.delegations.FlushIdentity(context.Background(), n.item.GetStableIdentity()); err != nil {
+		t.Fatal(err)
+	}
 	if len(rpc.setattrs) != 1 {
 		t.Fatalf("setattr calls = %d, want 1", len(rpc.setattrs))
 	}
 	request := rpc.setattrs[0]
-	if !request.GetAtimeNow() || !request.GetMtimeNow() || request.AtimeNs != nil || request.MtimeNs != nil {
-		t.Fatalf("server-clock setattr intent lost: %#v", request)
+	// Writeback resolves NOW once at admission; retrying the immutable entry
+	// must retain those timestamps instead of moving them to flush time.
+	if request.GetAtimeNow() || request.GetMtimeNow() || request.AtimeNs == nil || request.MtimeNs == nil || request.GetAtimeNs() < before || request.GetMtimeNs() < before || request.GetAtimeNs() > time.Now().UnixNano() {
+		t.Fatalf("buffered timestamp intent lost: %#v", request)
 	}
 }
 
@@ -1958,6 +2100,26 @@ func TestLockRequestPreservesFlockNamespace(t *testing.T) {
 func TestUncertainResponseFailsClosed(t *testing.T) {
 	if got := responseErrno(&authoritypb.Response{Uncertain: true}); got != syscall.EIO {
 		t.Fatalf("uncertain errno = %v", got)
+	}
+}
+
+func TestMissingSubscriptionRegistryFailsClosed(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	n := testNode(mount)
+	handle := &fileHandle{node: n, token: testToken(100)}
+	ctx, finish := testMutationContext(t, mount)
+	mount.subscription = nil
+	before := rpc.calls
+	if _, errno := n.Read(t.Context(), handle, make([]byte, 1), 0); errno != syscall.EIO {
+		t.Fatalf("read errno=%v, want EIO", errno)
+	}
+	_, err := mount.callMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_SetLock{SetLock: &authoritypb.SetLockRequest{}}}, nil)
+	finish(false)
+	if err == nil {
+		t.Fatal("mutation without subscription registry succeeded")
+	}
+	if rpc.calls != before {
+		t.Fatalf("missing registry reached Authority: calls=%d want %d", rpc.calls, before)
 	}
 }
 
@@ -2140,15 +2302,176 @@ func TestTerminalSessionSignalAbortsMount(t *testing.T) {
 	}
 }
 
-func TestRefusedReclaimIsTerminal(t *testing.T) {
+func TestCleanupFailurePolicyScopesCoherenceAndRequiresTerminalCause(t *testing.T) {
 	mount, rpc := testMount(t, 64)
-	rpc.reclaimFailure = syscall.EIO
-	mount.start(time.Hour)
-	mount.deferReclaim(testToken(1))
+	mount.subscription.mu.Lock()
+	mount.subscription.active = true
+	mount.subscription.incarnation = 7
+	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.mu.Unlock()
+	coherence := resourceCleanupError{cause: syscall.EIO, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}
+	if retry := mount.cleanupFailed("object reclaim", coherence, nil); !retry {
+		t.Fatal("coherence cleanup refusal was not deferred")
+	}
+	if mount.isRevoked() || mount.subscription.stamp() != (subscriptionStamp{}) {
+		t.Fatalf("coherence cleanup refusal revoked or retained subscription: revoked=%v stamp=%+v", mount.isRevoked(), mount.subscription.stamp())
+	}
+
+	if retry := mount.cleanupFailed("object reclaim", resourceCleanupError{cause: syscall.EIO}, nil); retry || mount.isRevoked() {
+		t.Fatalf("definite scoped refusal retry=%v revoked=%v", retry, mount.isRevoked())
+	}
+	mount.subscription.mu.Lock()
+	mount.subscription.active = true
+	mount.subscription.incarnation = 8
+	mount.subscription.cacheUntil = time.Now().Add(time.Minute)
+	mount.subscription.mu.Unlock()
+	rpc.mu.Lock()
+	rpc.sessionEnd = authorityrpc.ErrAuthorityChanged
+	rpc.mu.Unlock()
+	if retry := mount.cleanupFailed("deferred close", resourceCleanupError{cause: authorityrpc.ErrAuthorityChanged}, nil); !retry {
+		t.Fatal("epoch replacement cleanup was not deferred")
+	}
+	if mount.isRevoked() || mount.subscription.stamp() != (subscriptionStamp{}) {
+		t.Fatalf("epoch replacement revoked or retained subscription: revoked=%v stamp=%+v", mount.isRevoked(), mount.subscription.stamp())
+	}
+	rpc.mu.Lock()
+	rpc.sessionEnd = authorityrpc.ErrSessionEnded
+	rpc.mu.Unlock()
+	mount.cleanupFailed("object reclaim", resourceCleanupError{cause: syscall.EIO}, nil)
 	select {
 	case <-mount.ctx.Done():
 	case <-time.After(2 * time.Second):
-		t.Fatal("a refused reclaim left the frontend and the authority disagreeing about ownership")
+		t.Fatal("terminal session cleanup failure did not revoke mount")
+	}
+}
+
+func TestCleanupRecoveryWithoutSubscriptionRegistryDoesNotPanic(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		sessionEnd error
+	}{
+		{name: "subscription reset", err: authorityrpc.ErrSubscriptionReset},
+		{name: "coherence refusal", err: resourceCleanupError{cause: syscall.EIO, failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}},
+		{name: "authority replacement", err: resourceCleanupError{cause: syscall.EIO}, sessionEnd: authorityrpc.ErrAuthorityChanged},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mount, rpc := testMount(t, 64)
+			mount.subscription = nil
+			rpc.mu.Lock()
+			rpc.sessionEnd = tc.sessionEnd
+			rpc.mu.Unlock()
+			if retry := mount.cleanupFailed("object reclaim", tc.err, nil); !retry {
+				t.Fatal("recoverable cleanup failure was not deferred")
+			}
+			if mount.isRevoked() {
+				t.Fatal("recoverable cleanup failure revoked mount without a subscription registry")
+			}
+		})
+	}
+}
+
+func TestRefusedReclaimRequeuesAfterColdSubscription(t *testing.T) {
+	mount, rpc := testMount(t, 64)
+	reactivate := make(chan struct{})
+	rpc.mu.Lock()
+	rpc.subscribeGate = reactivate
+	reclaimCalls := 0
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetReclaim() == nil {
+			return &authoritypb.Response{}, nil
+		}
+		reclaimCalls++
+		if reclaimCalls == 1 {
+			return &authoritypb.Response{
+				Errno:   int32(syscall.EIO),
+				Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
+			}, nil
+		}
+		return &authoritypb.Response{}, nil
+	}
+	rpc.mu.Unlock()
+
+	mount.start(time.Hour)
+	defer func() {
+		mount.cancel()
+		mount.wg.Wait()
+	}()
+	mount.deferReclaim(testToken(71))
+	waitFor(t, "refused reclaim and parked cold subscribe", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return reclaimCalls == 1 && rpc.subscribeCalls >= 2
+	})
+	if mount.isRevoked() {
+		t.Fatal("coherence reclaim refusal revoked the mount")
+	}
+	rpc.mu.Lock()
+	if reclaimCalls != 1 {
+		t.Fatalf("reclaim retried before subscription reactivation: %d", reclaimCalls)
+	}
+	rpc.mu.Unlock()
+
+	close(reactivate)
+	waitFor(t, "reclaim retry after cold subscription", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return reclaimCalls == 2
+	})
+	waitFor(t, "reclaim queue drain", func() bool { return mount.reclaim.pending() == 0 })
+	if mount.isRevoked() || mount.ctx.Err() != nil {
+		t.Fatalf("reclaim recovery stopped the worker: revoked=%v context=%v", mount.isRevoked(), mount.ctx.Err())
+	}
+}
+
+func TestReclaimWorkerRequiresEpochRPCFacade(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	mount := &Mount{rpc: newFakeRPC(), ctx: ctx, cancel: cancel, reclaim: newReclaimQueue(1)}
+	mount.wg.Add(1)
+	go mount.reclaimLoop(ctx)
+	mount.wg.Wait()
+	if err := mount.fatalError(); err == nil || !strings.Contains(err.Error(), "epoch RPC facade") {
+		t.Fatalf("reclaim worker invariant error = %v", err)
+	}
+}
+
+func TestPermanentReclaimRefusalIsBackedOff(t *testing.T) {
+	mount, rpc := testMount(t, 1)
+	var attempts []time.Time
+	rpc.mu.Lock()
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetReclaim() == nil {
+			return &authoritypb.Response{}, nil
+		}
+		attempts = append(attempts, time.Now())
+		return &authoritypb.Response{
+			Errno:   int32(syscall.EIO),
+			Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE,
+		}, nil
+	}
+	rpc.mu.Unlock()
+	mount.start(time.Hour)
+	defer func() {
+		mount.cancel()
+		mount.wg.Wait()
+	}()
+	mount.deferReclaim(testToken(72))
+	waitFor(t, "three backed-off reclaim attempts", func() bool {
+		rpc.mu.Lock()
+		defer rpc.mu.Unlock()
+		return len(attempts) >= 3
+	})
+	rpc.mu.Lock()
+	observed := append([]time.Time(nil), attempts[:3]...)
+	rpc.mu.Unlock()
+	for i := 1; i < len(observed); i++ {
+		if elapsed := observed[i].Sub(observed[i-1]); elapsed < reclaimRetryDelay*9/10 {
+			t.Fatalf("reclaim attempts %d and %d were separated by %s, want backoff near %s", i, i+1, elapsed, reclaimRetryDelay)
+		}
+	}
+	if mount.isRevoked() {
+		t.Fatal("permanent coherence reclaim refusal revoked the mount")
 	}
 }
 
@@ -2161,4 +2484,90 @@ func (f *fakeRPC) DetachAfterUnmount(_ context.Context, proof MountAbsenceProof)
 	defer f.mu.Unlock()
 	f.detachProofs = append(f.detachProofs, proof)
 	return f.detachErr
+}
+
+func testDelegation() *authoritypb.Delegation {
+	return &authoritypb.Delegation{Id: testToken(700), Generation: 1, Mode: authoritypb.DelegationMode_DELEGATION_MODE_FULL}
+}
+
+func TestLookupPublishesHolderBufferedSize(t *testing.T) {
+	raw, mount, rpc := testRawFileSystem(t, 8)
+	rpc.item.Attr.Size = 0
+	identity := rpc.item.GetStableIdentity()
+	if err := mount.delegations.Install(identity, rpc.item.GetToken(), testToken(100), delegationTestGrant(45, authoritypb.DelegationMode_DELEGATION_MODE_FULL)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mount.delegations.Write(t.Context(), identity, 0, make([]byte, 4096), false); err != nil {
+		t.Fatal(err)
+	}
+	out := &fuse.EntryOut{}
+	if status := testRawCall(t, raw, func(unique uint64) fuse.Status {
+		return raw.Lookup(nil, &fuse.InHeader{Unique: unique, NodeId: fuse.FUSE_ROOT_ID}, "buffered", out)
+	}); !status.Ok() {
+		t.Fatal(status)
+	}
+	if out.Size != 4096 || out.AttrValid != 0 || out.AttrValidNsec != 0 {
+		t.Fatalf("holder lookup published stale size or cache lifetime: %+v", out)
+	}
+}
+
+func TestKeepAliveTransportTimeoutDoesNotRevokeMount(t *testing.T) {
+	mount, rpc := testMount(t, 8)
+	calls := make(chan struct{}, 8)
+	rpc.replyOverride = func(request *authoritypb.Request) (*authoritypb.Response, error) {
+		if request.GetKeepAlive() != nil {
+			calls <- struct{}{}
+			return nil, context.DeadlineExceeded
+		}
+		return nil, nil
+	}
+	mount.wg.Add(1)
+	go mount.keepAlive(mount.ctx, 15*time.Millisecond)
+	for range 3 {
+		select {
+		case <-calls:
+		case <-mount.ctx.Done():
+			t.Fatal("transport timeout revoked mount")
+		case <-time.After(time.Second):
+			t.Fatal("keepalive did not retry")
+		}
+	}
+	select {
+	case <-mount.ctx.Done():
+		t.Fatal("transport timeout revoked mount")
+	default:
+	}
+	mount.cancel()
+	mount.wg.Wait()
+}
+
+func TestReadDuringColdSubscriptionFailsWithoutRPC(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expired-%t", expired), func(t *testing.T) {
+			mount, rpc := testMount(t, 8)
+			n := testNode(mount)
+			mount.subscription.mu.Lock()
+			if expired {
+				mount.subscription.cacheUntil = time.Now().Add(-time.Second)
+			} else {
+				mount.subscription.active = false
+			}
+			mount.subscription.mu.Unlock()
+			before := 0
+			rpc.snapshot(func(f *fakeRPC) { before = f.calls })
+			handle := &fileHandle{node: n, token: []byte("handle")}
+			result, errno := n.Read(context.Background(), handle, make([]byte, 4096), 0)
+			if result != nil || errno != syscall.EIO {
+				t.Fatalf("cold read=%v,%v", result, errno)
+			}
+			rpc.snapshot(func(f *fakeRPC) {
+				if f.calls != before {
+					t.Fatal("cold read reached the transport")
+				}
+			})
+			if mount.isRevoked() {
+				t.Fatal("cold read revoked mount")
+			}
+		})
+	}
 }

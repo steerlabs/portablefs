@@ -1,0 +1,2551 @@
+//go:build linux
+
+package fusev3
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/authorityrpc"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
+	"google.golang.org/protobuf/proto"
+)
+
+// delegationRPC is deliberately smaller than RPC. It lets the write-back
+// state machine be tested without reproducing the mount/session transport.
+// DATA mutations use the replay-slot API; CONTROL acknowledgements and the
+// barrier use their protocol-defined idempotent request path.
+type delegationRPC interface {
+	CallMutation(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
+	CallIdempotent(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
+}
+
+type delegationBinding struct {
+	ref        *authoritypb.DelegationRef
+	item       []byte
+	generation uint64
+}
+
+// delegationMutex preserves ordinary mutex semantics while allowing request
+// paths to abandon lock acquisition when their coherence budget expires.
+type delegationMutex struct {
+	mu      sync.Mutex
+	held    bool
+	changed chan struct{}
+}
+
+func (m *delegationMutex) LockContext(ctx context.Context) error {
+	for {
+		m.mu.Lock()
+		if !m.held {
+			m.held = true
+			m.mu.Unlock()
+			return nil
+		}
+		if m.changed == nil {
+			m.changed = make(chan struct{})
+		}
+		changed := m.changed
+		m.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (m *delegationMutex) Lock() { _ = m.LockContext(context.Background()) }
+
+func (m *delegationMutex) TryLock() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.held {
+		return false
+	}
+	m.held = true
+	return true
+}
+
+func (m *delegationMutex) Unlock() {
+	m.mu.Lock()
+	if !m.held {
+		m.mu.Unlock()
+		panic("fusev3: unlock of unlocked delegation mutex")
+	}
+	m.held = false
+	if m.changed != nil {
+		close(m.changed)
+		m.changed = nil
+	}
+	m.mu.Unlock()
+}
+
+type delegationState struct {
+	manager          *delegationManager
+	ownershipVersion uint64       // admission; clocks grant installation and retirement
+	users            atomic.Int64 // index read lock joins; scoped operations and physical reply publications
+	collected        bool         // admission; refuses cache admission through a removed index entry
+	collectThrough   uint64       // manager.mu; grant requests already started when idle
+	collectCut       bool         // manager.mu
+
+	flushOrdinal      uint64                   // meta; dense within the exact Authority grant
+	releaseFlight     *delegationReleaseFlight // protected by transition
+	acquire           delegationMutex
+	grantChanged      chan struct{}
+	retiredGeneration uint64
+	// transition serializes recall, break, mode changes, release, and grant
+	// installation for one identity. No network operation holds manager.mu.
+	transition delegationMutex
+	// operation orders frontend admissions and synchronous operations for one
+	// file. An append or fallocate flushes the accepted prefix while holding it,
+	// so no later local admission can overtake the wire mutation.
+	operation delegationMutex
+	// admission closes the race between checking the mode and Buffer accepting
+	// an entry. It is held only across local Buffer calls, never network I/O.
+	admission sync.RWMutex
+	controlMu sync.Mutex
+	// controlTail orders CONTROL transitions in stream receipt order without
+	// making the long-poll loop wait for a flush or acknowledgment.
+	controlTail <-chan struct{}
+
+	identity                            writeback.Identity
+	ref                                 *authoritypb.DelegationRef
+	mode                                authoritypb.DelegationMode
+	item                                []byte
+	handles                             map[string][]byte
+	writers                             map[string][]byte
+	bindings                            map[uint64]delegationBinding
+	flushTokens                         map[uint64]struct{} // manager.tokenMu
+	retire                              *writeback.Retirement
+	base                                *authoritypb.Attr
+	baseVersion, baseInvalidatedThrough uint64
+
+	meta        sync.Mutex
+	acceptedCut uint64
+	appliedCut  uint64
+	applied     uint64
+	dirty       bool
+}
+
+type delegationFlushProgress struct {
+	owner    *delegationState
+	bytes    int
+	sequence uint64
+	complete bool
+}
+
+// delegationManager owns the epoch-scoped write buffer and delegation table.
+// Its methods return ordinary errors so the raw FUSE layer can make the errno
+// policy at the callback boundary.
+type delegationManager struct {
+	rpc      delegationRPC
+	timeout  time.Duration
+	maxWrite int
+
+	epoch    sync.RWMutex
+	epochCtx context.Context
+	epochEnd context.CancelFunc
+	frontend sync.RWMutex
+	mu       sync.RWMutex
+	// A CREATE may receive its stable identity only after CONTROL retires its grant.
+	// Keep tombstones until every such response has been registered.
+	grantRequests  map[uint64]struct{}
+	grantSerial    uint64
+	metadataClock  atomic.Uint64
+	reclaim        map[*delegationState]struct{}
+	retainedStates map[*delegationState]struct{}
+	reclaimKick    chan struct{}
+	observers      map[writeback.Identity]int
+	buf            *writeback.Buffer
+	byID           map[writeback.Identity]*delegationState
+	// stateIndex mirrors creation, collection and both epoch resets of byID. Shared cache
+	// admission must not miss merely because another identity is being created.
+	stateIndex sync.Map // writeback.Identity -> *delegationState
+	// identityLoss retains the latest loss ticket after an epoch-scoped Buffer
+	// is replaced. Existing handles compare against it once; newly registered
+	// handles start at the retained value.
+	identityLoss map[writeback.Identity]uint64
+	inc          atomic.Uint64
+	// epochSerial rejects server handles queued before an Authority epoch
+	// replacement. It is protected by epoch rather than mu because it fences
+	// network use of those capabilities with buffer replacement.
+	epochSerial uint64
+
+	ctx       context.Context
+	cancel    context.CancelFunc
+	controlWG sync.WaitGroup
+	workerWG  sync.WaitGroup
+
+	durabilityMu   sync.Mutex
+	durableBuffer  *writeback.Buffer
+	appliedHigh    uint64
+	durableHigh    uint64
+	durableKick    chan struct{}
+	tokenMu        sync.Mutex
+	tokens         map[uint64]delegationFlushProgress
+	closeQueue     chan delegationClose
+	closeMu        sync.Mutex
+	closePending   int
+	closeChanged   chan struct{}
+	closeProducers sync.WaitGroup
+	closeStopped   bool
+
+	dropReporter          func(writeback.DropReport)
+	cleanupFailure        func(error)
+	cleanupRetry          func(context.Context) error
+	hookMu                sync.RWMutex
+	withdrawalDrain       func(context.Context, []byte) error
+	flushCycleInvalidator func(context.Context, []byte) error
+}
+
+type delegationClose struct {
+	identity    []byte
+	handle      []byte
+	lockOwner   uint64
+	flockUnlock bool
+	epoch       uint64
+}
+
+func newDelegationManager(rpc delegationRPC, timeout time.Duration, incarnation uint64, opts writeback.Options) (*delegationManager, error) {
+	if rpc == nil || timeout <= 0 {
+		return nil, errors.New("fusev3: delegation manager requires an authority and request timeout")
+	}
+	m := &delegationManager{
+		rpc: rpc, timeout: timeout, byID: make(map[writeback.Identity]*delegationState), identityLoss: make(map[writeback.Identity]uint64), epochSerial: 1,
+		maxWrite: writeback.MaxPayload, durableKick: make(chan struct{}, 1), tokens: make(map[uint64]delegationFlushProgress), closeQueue: make(chan delegationClose, 4096),
+	}
+	m.grantRequests = make(map[uint64]struct{})
+	m.reclaim = make(map[*delegationState]struct{})
+	m.retainedStates = make(map[*delegationState]struct{})
+	m.reclaimKick = make(chan struct{}, 1)
+	m.observers = make(map[writeback.Identity]int)
+	m.inc.Store(incarnation)
+	if limits, ok := rpc.(interface{ IOLimits() (uint32, uint32) }); ok {
+		_, maxWrite := limits.IOLimits()
+		if maxWrite != 0 && maxWrite < uint32(m.maxWrite) {
+			m.maxWrite = int(maxWrite)
+		}
+	}
+	m.ctx, m.cancel = context.WithCancel(context.Background())
+	m.epochCtx, m.epochEnd = context.WithCancel(m.ctx)
+	b, err := writeback.New(m, opts)
+	if err != nil {
+		m.cancel()
+		return nil, fmt.Errorf("fusev3: create delegation write buffer: %w", err)
+	}
+	m.buf = b
+	m.durableBuffer = b
+	m.workerWG.Add(1)
+	go m.durabilityLoop()
+	m.workerWG.Add(1)
+	go m.closeLoop()
+	m.workerWG.Add(1)
+	go m.reclaimLoop()
+	return m, nil
+}
+
+func delegationIdentity(raw []byte) (writeback.Identity, error) {
+	var id writeback.Identity
+	if len(raw) != len(id) {
+		return id, errors.New("fusev3: delegation identity must be 16 bytes")
+	}
+	copy(id[:], raw)
+	if id == (writeback.Identity{}) {
+		return id, errors.New("fusev3: delegation identity must be nonzero")
+	}
+	return id, nil
+}
+
+func cloneDelegationRef(ref *authoritypb.DelegationRef) *authoritypb.DelegationRef {
+	if ref == nil {
+		return nil
+	}
+	return &authoritypb.DelegationRef{Id: cloneBytes(ref.GetId()), Generation: ref.GetGeneration()}
+}
+
+func delegationRefFromGrant(grant *authoritypb.Delegation) (*authoritypb.DelegationRef, error) {
+	if grant == nil || len(grant.GetId()) != 16 || bytes.Equal(grant.GetId(), make([]byte, 16)) || grant.GetGeneration() == 0 {
+		return nil, errors.New("fusev3: malformed delegation grant")
+	}
+	if grant.GetMode() != authoritypb.DelegationMode_DELEGATION_MODE_FULL &&
+		grant.GetMode() != authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH {
+		return nil, errors.New("fusev3: delegation grant has invalid mode")
+	}
+	return &authoritypb.DelegationRef{Id: cloneBytes(grant.GetId()), Generation: grant.GetGeneration()}, nil
+}
+
+func sameDelegation(a, b *authoritypb.DelegationRef) bool {
+	return a != nil && b != nil && a.GetGeneration() == b.GetGeneration() && bytes.Equal(a.GetId(), b.GetId())
+}
+
+func (m *delegationManager) SetIncarnation(incarnation uint64) {
+	m.inc.Store(incarnation)
+}
+
+// FenceSubscription synchronously abandons every grant and buffered entry
+// from the expired subscription before a cold Subscribe. Open server handles
+// remain frontend-owned and can reacquire grants after SetIncarnation installs
+// the new nonzero incarnation.
+func (m *delegationManager) FenceSubscription(reason string) {
+	m.InterruptSubscription()
+	m.EpochChanged(reason)
+}
+
+// InterruptSubscription closes old admission without joining callbacks or
+// physical replies. A capacity-blocked WRITE owns a callback reader, so it
+// must wake before the cold reset waits for that callback to finish. Retained
+// bytes and grants remain intact until FenceSubscription records their loss.
+func (m *delegationManager) InterruptSubscription() {
+	m.SetIncarnation(0)
+	m.epoch.RLock()
+	m.buf.FenceAdmissions()
+	m.epochEnd()
+	m.epoch.RUnlock()
+}
+
+func (m *delegationManager) SetWithdrawalDrain(drain func(context.Context, []byte) error) {
+	m.hookMu.Lock()
+	m.withdrawalDrain = drain
+	m.hookMu.Unlock()
+}
+
+func (m *delegationManager) SetFlushCycleInvalidator(invalidate func(context.Context, []byte) error) {
+	m.hookMu.Lock()
+	m.flushCycleInvalidator = invalidate
+	m.hookMu.Unlock()
+}
+
+func (m *delegationManager) Owns(identity []byte) bool {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return false
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	if m.incarnation() == 0 {
+		return false
+	}
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if s == nil {
+		return false
+	}
+	s.admission.RLock()
+	defer s.admission.RUnlock()
+	return s.ref != nil
+}
+
+// sharedCacheAllowed is called under the raw registry lock. A retirement may
+// already be waiting for a holder reply pinned until its raw-locked settlement.
+// Never wait for ownership here: uncertain ownership simply refuses caching.
+func (m *delegationManager) sharedCacheAllowed(identity []byte) bool {
+	id, err := delegationIdentity(identity)
+	if err != nil || m == nil || !m.epoch.TryRLock() {
+		return false
+	}
+	defer m.epoch.RUnlock()
+	if m.incarnation() == 0 {
+		return false
+	}
+	value, present := m.stateIndex.Load(id)
+	if !present {
+		return true
+	}
+	s := value.(*delegationState)
+	if !s.admission.TryRLock() {
+		return false
+	}
+	// Collection may have deferred this idle state while our read lock was held.
+	// Wake it after releasing the lock; owned states cannot be collected.
+	if s.ref == nil {
+		defer m.kickReclaim()
+	}
+	defer s.admission.RUnlock()
+	return !s.collected && s.ref == nil
+}
+
+func (m *delegationManager) SetBaseAttr(identity []byte, attr *authoritypb.Attr, version uint64) error {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return err
+	}
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if s == nil {
+		return nil
+	}
+	s.meta.Lock()
+	s.installBaseLocked(attr, version)
+	s.meta.Unlock()
+	return nil
+}
+
+// installBaseLocked compares object versions, never snapshot watermarks.
+func (s *delegationState) installBaseLocked(attr *authoritypb.Attr, version uint64) {
+	if attr != nil && version != 0 && version >= s.baseVersion && version >= s.baseInvalidatedThrough {
+		s.base, s.baseVersion = proto.Clone(attr).(*authoritypb.Attr), version
+	}
+}
+
+func (m *delegationManager) InvalidateBaseAttr(identity []byte, version uint64) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	state := m.retainState(id, false)
+	defer m.releaseState(state)
+	if state == nil {
+		return
+	}
+	state.meta.Lock()
+	defer state.meta.Unlock()
+	state.baseInvalidatedThrough = max(state.baseInvalidatedThrough, version)
+	if state.baseVersion < version {
+		state.base = nil
+	}
+}
+
+func (m *delegationManager) BaseAttr(identity []byte) (*authoritypb.Attr, bool) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return nil, false
+	}
+	if m.incarnation() == 0 {
+		return nil, false
+	}
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if s == nil {
+		return nil, false
+	}
+	s.admission.RLock()
+	owned := s.ref != nil
+	s.admission.RUnlock()
+	if !owned {
+		return nil, false
+	}
+	s.meta.Lock()
+	defer s.meta.Unlock()
+	if s.base == nil {
+		return nil, false
+	}
+	return proto.Clone(s.base).(*authoritypb.Attr), true
+}
+
+func (m *delegationManager) incarnation() uint64 {
+	return m.inc.Load()
+}
+
+// Install records a grant returned by CREATE or OPEN. handle and item are the
+// server capabilities used by later flushes; at least one live handle is
+// required for writes. Repeated installation of the exact grant is harmless.
+func (m *delegationManager) Install(identity, item, handle []byte, grant *authoritypb.Delegation) error {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return err
+	}
+	ref, err := delegationRefFromGrant(grant)
+	if err != nil {
+		return err
+	}
+	if len(handle) == 0 || len(item) == 0 {
+		return errors.New("fusev3: delegated open requires item and handle capabilities")
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	if m.incarnation() == 0 {
+		return errors.New("fusev3: cannot install delegation while subscription is fenced")
+	}
+	m.frontend.RLock()
+	defer m.frontend.RUnlock()
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	if err := s.lockAfterRelease(m.ctx, delegationTransition|delegationOperation); err != nil {
+		return err
+	}
+	defer s.transition.Unlock()
+	defer s.operation.Unlock()
+	s.admission.Lock()
+	defer s.admission.Unlock()
+	if ref.GetGeneration() <= s.retiredGeneration {
+		return errDelegationRetired
+	}
+	if s.ref != nil && !sameDelegation(s.ref, ref) {
+		return errors.New("fusev3: identity received a second live delegation")
+	}
+	m.mu.Lock()
+	s.collectCut = false
+	m.mu.Unlock()
+	if s.ref == nil {
+		s.ownershipVersion = m.metadataClock.Add(1)
+		// Item attributes predate OPEN arbitration and may belong to an earlier
+		// ownership interval. Fetch a current base before caching it again.
+		s.meta.Lock()
+		s.base = nil
+		s.baseVersion, s.baseInvalidatedThrough = 0, 0
+		// A cut receipt belongs to this ownership generation. Carrying the
+		// previous grant's last ticket into an empty successor break would
+		// acknowledge data never applied under the successor reference.
+		s.applied, s.appliedCut, s.acceptedCut, s.dirty = 0, 0, 0, false
+		s.flushOrdinal = 0
+		s.meta.Unlock()
+	}
+	s.ref, s.mode, s.item = ref, grant.GetMode(), cloneBytes(item)
+	close(s.grantChanged)
+	s.grantChanged = make(chan struct{})
+	s.handles[string(handle)] = cloneBytes(handle)
+	s.writers[string(handle)] = cloneBytes(handle)
+	if s.retire != nil {
+		generation := m.buf.Generation(id) + 1
+		s.bindings[generation] = delegationBinding{ref: cloneDelegationRef(ref), item: cloneBytes(item), generation: generation}
+		if err := s.retire.Resume(); err != nil {
+			delete(s.bindings, generation)
+			return fmt.Errorf("fusev3: resume delegated identity: %w", err)
+		}
+		s.retire = nil
+	} else {
+		generation := m.buf.Generation(id)
+		s.bindings[generation] = delegationBinding{ref: cloneDelegationRef(ref), item: cloneBytes(item), generation: generation}
+	}
+	return nil
+}
+
+// AddHandle joins a currently owned generation if one remains. A read-only
+// OPEN can race last-handle release; a successful Authority open stays valid
+// when that release wins and must then close as an ordinary handle.
+func (m *delegationManager) AddHandle(identity, item, handle []byte, writable bool) error {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return err
+	}
+	if len(handle) == 0 {
+		return errors.New("fusev3: empty delegated handle")
+	}
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if s == nil {
+		return nil
+	}
+	if err := s.lockAfterRelease(m.ctx, delegationTransition); err != nil {
+		return err
+	}
+	defer s.transition.Unlock()
+	s.admission.Lock()
+	defer s.admission.Unlock()
+	if s.ref == nil {
+		return errDelegationRetired
+	}
+	if len(item) != 0 {
+		s.item = cloneBytes(item)
+	}
+	s.handles[string(handle)] = cloneBytes(handle)
+	if writable {
+		s.writers[string(handle)] = cloneBytes(handle)
+	}
+	return nil
+}
+
+// A frontend closes its publication coordinates inside the same operation turn
+// that checks ownership and admits the entry. A failed ownership check must not
+// leave a source gate held while reacquisition waits for a recall.
+type delegationPrepareContextKey struct{}
+
+func prepareDelegationAdmission(ctx context.Context) error {
+	if prepare, ok := ctx.Value(delegationPrepareContextKey{}).(func() error); ok {
+		return prepare()
+	}
+	return nil
+}
+
+var errDelegationRetired = errors.New("fusev3: delegation retired before response registration")
+
+func (s *delegationState) clearGrantLocked() {
+	if s.ref != nil {
+		if s.manager != nil {
+			s.ownershipVersion = s.manager.metadataClock.Add(1)
+		}
+		s.retiredGeneration = max(s.retiredGeneration, s.ref.GetGeneration())
+	}
+	s.ref = nil
+	s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
+	close(s.grantChanged)
+	s.grantChanged = make(chan struct{})
+}
+
+var errDelegationNotOwned = errors.New("fusev3: mutation has no write delegation")
+
+func (m *delegationManager) modeAndBuffer(s *delegationState) (*delegationState, *writeback.Buffer, authoritypb.DelegationMode, error) {
+	if m.incarnation() == 0 {
+		return nil, nil, 0, errors.New("fusev3: delegated mutation while subscription is fenced")
+	}
+	s.admission.RLock()
+	if s.ref == nil {
+		s.admission.RUnlock()
+		return nil, nil, 0, errDelegationNotOwned
+	}
+	mode := s.mode
+	return s, m.buf, mode, nil
+}
+
+func (m *delegationManager) markAccepted(s *delegationState, cut writeback.Cut) {
+	s.meta.Lock()
+	defer s.meta.Unlock()
+	s.acceptedCut = max(s.acceptedCut, cut.Sequence)
+	m.durabilityMu.Lock()
+	durable := m.durableHigh
+	m.durabilityMu.Unlock()
+	s.dirty = s.appliedCut < cut.Sequence || s.applied == 0 || s.applied > durable
+}
+
+func (m *delegationManager) Write(ctx context.Context, identity []byte, off int64, data []byte, syncWrite bool) (writeback.Cut, error) {
+	return m.WriteWithOptions(ctx, identity, off, data, syncWrite, writeback.WriteOptions{})
+}
+func (m *delegationManager) WriteWithOptions(ctx context.Context, identity []byte, off int64, data []byte, syncWrite bool, opts writeback.WriteOptions) (writeback.Cut, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return writeback.Cut{}, err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	m.frontend.RLock()
+	frontendLocked := true
+	defer func() {
+		if frontendLocked {
+			m.frontend.RUnlock()
+		}
+	}()
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+		return writeback.Cut{}, err
+	}
+	lockedState := s
+	operationLocked := true
+	defer func() {
+		if operationLocked {
+			lockedState.operation.Unlock()
+		}
+	}()
+	s, b, mode, err := m.modeAndBuffer(s)
+	if err != nil {
+		return writeback.Cut{}, err
+	}
+	if err := prepareDelegationAdmission(ctx); err != nil {
+		s.admission.RUnlock()
+		return writeback.Cut{}, err
+	}
+	ref, generation := s.ref, b.Generation(id)
+	s.admission.RUnlock()
+	cut, err := b.WriteInGeneration(ctx, id, generation, off, data, opts)
+	s.admission.RLock()
+	if err == nil {
+		if sameDelegation(s.ref, ref) && b.Generation(id) == generation {
+			m.markAccepted(s, cut)
+		} else {
+			err = writeback.ErrLost
+		}
+	}
+	s.admission.RUnlock()
+	var applied uint64
+	if err == nil && syncWrite {
+		// The operation lock fixes the accepted cut. Release admission before a
+		// flush can record a refusal and rebind the successor buffer generation.
+		applied, err = m.syncIdentityCut(ctx, s, b, cut, false)
+	}
+	if err != nil {
+		return cut, err
+	}
+	// Re-read the mode after admission: a writer waiting behind a downgrade
+	// fence may have entered under the successor generation.
+	s.admission.RLock()
+	mode = s.mode
+	s.admission.RUnlock()
+	if mode == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH && !syncWrite {
+		applied, err = b.FlushIdentity(ctx, id, cut)
+	}
+	if err != nil {
+		return cut, err
+	}
+	if syncWrite || mode == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH {
+		lockedState.operation.Unlock()
+		operationLocked = false
+		m.frontend.RUnlock()
+		frontendLocked = false
+		if err := m.waitVisibility(ctx, b, id, cut, applied); err != nil {
+			return cut, err
+		}
+		if syncWrite {
+			if err := b.DurableIdentity(id, cut); err != nil {
+				return cut, err
+			}
+		}
+	}
+	return cut, nil
+}
+
+func (m *delegationManager) Truncate(ctx context.Context, identity []byte, size int64) (writeback.Cut, error) {
+	return m.admitMetadata(ctx, identity, func(b *writeback.Buffer, id writeback.Identity, generation uint64) (writeback.Cut, error) {
+		return b.TruncateInGeneration(ctx, id, generation, size)
+	})
+}
+
+func (m *delegationManager) SetAttr(ctx context.Context, identity []byte, attrs writeback.Attributes) (writeback.Cut, error) {
+	return m.admitMetadata(ctx, identity, func(b *writeback.Buffer, id writeback.Identity, generation uint64) (writeback.Cut, error) {
+		return b.SetAttrInGeneration(ctx, id, generation, attrs)
+	})
+}
+
+func (m *delegationManager) admitMetadata(ctx context.Context, identity []byte, admit func(*writeback.Buffer, writeback.Identity, uint64) (writeback.Cut, error)) (writeback.Cut, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return writeback.Cut{}, err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	m.frontend.RLock()
+	frontendLocked := true
+	defer func() {
+		if frontendLocked {
+			m.frontend.RUnlock()
+		}
+	}()
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+		return writeback.Cut{}, err
+	}
+	lockedState := s
+	operationLocked := true
+	defer func() {
+		if operationLocked {
+			lockedState.operation.Unlock()
+		}
+	}()
+	s, b, mode, err := m.modeAndBuffer(s)
+	if err != nil {
+		return writeback.Cut{}, err
+	}
+	if err := prepareDelegationAdmission(ctx); err != nil {
+		s.admission.RUnlock()
+		return writeback.Cut{}, err
+	}
+	ref, generation := s.ref, b.Generation(id)
+	s.admission.RUnlock()
+	cut, err := admit(b, id, generation)
+	s.admission.RLock()
+	if err == nil {
+		if sameDelegation(s.ref, ref) && b.Generation(id) == generation {
+			m.markAccepted(s, cut)
+		} else {
+			err = writeback.ErrLost
+		}
+	}
+	s.admission.RUnlock()
+	if err == nil {
+		s.admission.RLock()
+		mode = s.mode
+		s.admission.RUnlock()
+		if mode == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH {
+			var applied uint64
+			applied, err = b.FlushIdentity(ctx, id, cut)
+			if err == nil {
+				lockedState.operation.Unlock()
+				operationLocked = false
+				m.frontend.RUnlock()
+				frontendLocked = false
+				err = m.waitVisibility(ctx, b, id, cut, applied)
+			}
+		}
+	}
+	return cut, err
+}
+
+func (m *delegationManager) Read(ctx context.Context, identity []byte, off int64, length int, fetch writeback.Fetch) ([]byte, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return nil, err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+		if off < 0 || length < 0 || fetch == nil {
+			return nil, writeback.ErrInvalid
+		}
+		return fetch(ctx, off, length)
+	}
+	return m.buf.Read(ctx, id, off, length, fetch)
+}
+
+func (m *delegationManager) Size(identity []byte, base int64) (int64, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return 0, err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+		return base, nil
+	}
+	return m.buf.Size(id, base), nil
+}
+
+func (m *delegationManager) OverlayAttributes(identity []byte, base writeback.Attributes) (writeback.Attributes, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return base, err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if m.incarnation() == 0 || s == nil || !delegationStateOwned(s) {
+		return base, nil
+	}
+	return m.buf.OverlayAttributes(id, base), nil
+}
+
+func delegationStateOwned(s *delegationState) bool {
+	s.admission.RLock()
+	defer s.admission.RUnlock()
+	return s.ref != nil
+}
+
+func (m *delegationManager) LossSequence() uint64 {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	return m.buf.LossSequence()
+}
+
+func (m *delegationManager) IdentityLoss(identity []byte) uint64 {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return 0
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	current := m.buf.IdentityLoss(id)
+	m.mu.RLock()
+	historical := m.identityLoss[id]
+	m.mu.RUnlock()
+	return max(current, historical)
+}
+
+func (m *delegationManager) IdentityFailure(identity []byte, observed uint64) (uint64, syscall.Errno) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return 0, 0
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	loss, errno := m.buf.IdentityFailure(id, observed)
+	m.mu.RLock()
+	historical := m.identityLoss[id]
+	m.mu.RUnlock()
+	if historical > loss {
+		return historical, 0
+	}
+	return loss, errno
+}
+
+func (m *delegationManager) DropIdentity(identity []byte, reason string) error {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	if err := s.lockAfterRelease(m.ctx, delegationTransition|delegationOperation); err != nil {
+		return err
+	}
+	defer s.transition.Unlock()
+	defer s.operation.Unlock()
+	m.loseDelegation(s, reason)
+	return nil
+}
+
+func (m *delegationManager) VisibleSequence(sequence uint64) {
+	m.epoch.RLock()
+	m.buf.VisibleSequence(sequence)
+	m.epoch.RUnlock()
+	m.reconsiderRetained()
+}
+
+func (m *delegationManager) DurableSequence(sequence uint64) {
+	m.epoch.RLock()
+	m.durableCurrent(sequence)
+	m.epoch.RUnlock()
+}
+
+// durableCurrent is used by Flush callbacks, which already run against the
+// current epoch buffer and must not recursively take epoch.RLock while an epoch
+// writer is queued.
+func (m *delegationManager) durableCurrent(sequence uint64) {
+	m.durabilityMu.Lock()
+	buffer := m.durableBuffer
+	m.durabilityMu.Unlock()
+	if buffer != nil {
+		m.durableForBuffer(buffer, sequence)
+	}
+}
+
+func (m *delegationManager) durableForBuffer(buffer *writeback.Buffer, sequence uint64) {
+	defer m.reconsiderRetained()
+	buffer.DurableSequence(sequence)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.durabilityMu.Lock()
+	if m.durableBuffer != buffer {
+		m.durabilityMu.Unlock()
+		return
+	}
+	m.durableHigh = max(m.durableHigh, sequence)
+	m.durabilityMu.Unlock()
+	m.tokenMu.Lock()
+	for token, progress := range m.tokens {
+		if progress.complete && progress.sequence <= sequence {
+			delete(m.tokens, token)
+			if progress.owner != nil {
+				delete(progress.owner.flushTokens, token)
+				if len(progress.owner.flushTokens) == 0 {
+					progress.owner.flushTokens = nil
+				}
+			}
+		}
+	}
+	m.tokenMu.Unlock()
+}
+
+func (m *delegationManager) visibleForBuffer(buffer *writeback.Buffer, sequence uint64) {
+	if sequence != 0 {
+		buffer.VisibleSequence(sequence)
+		m.reconsiderRetained()
+	}
+}
+
+func (m *delegationManager) waitVisibility(ctx context.Context, buffer *writeback.Buffer, id writeback.Identity, cut writeback.Cut, applied uint64) error {
+	visible, err := m.visibilityCompletion(ctx, applied)
+	if err != nil {
+		return err
+	}
+	m.visibleForBuffer(buffer, visible)
+	return buffer.WaitVisible(ctx, id, cut)
+}
+
+func (m *delegationManager) visibilityCompletion(ctx context.Context, applied uint64) (uint64, error) {
+	if applied == 0 {
+		return 0, errors.New("fusev3: visibility wait has no application ticket")
+	}
+	response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_WaitVisibility{
+		WaitVisibility: &authoritypb.WaitVisibilityRequest{CutSequence: applied},
+	}})
+	if err != nil {
+		return 0, err
+	}
+	if err := successfulDelegationResponse(response); err != nil {
+		return 0, err
+	}
+	reply := response.GetWaitVisibility()
+	if reply == nil || reply.GetAppliedSequence() < reply.GetVisibleSequence() || reply.GetVisibleSequence() < applied || response.GetVisibleSequence() != reply.GetVisibleSequence() {
+		return 0, errors.New("fusev3: malformed visibility completion reply")
+	}
+	return reply.GetVisibleSequence(), nil
+}
+
+const durabilityFallbackInterval = time.Second
+
+// Reply-carried prefixes retire entries immediately. The fallback is only for
+// a stalled nondurable prefix; bursts of application kicks cannot turn it into
+// a volume syncfs per file. The first stalled cut can make progress immediately.
+type durabilityFallback struct {
+	durable     uint64
+	lastAttempt time.Time
+	quietUntil  time.Time
+}
+
+func (f *durabilityFallback) due(now time.Time, applied, durable uint64) bool {
+	if durable > f.durable {
+		f.durable = durable
+		f.quietUntil = now.Add(durabilityFallbackInterval)
+		return false
+	}
+	if applied <= durable || now.Before(f.quietUntil) || !f.lastAttempt.IsZero() && now.Sub(f.lastAttempt) < durabilityFallbackInterval {
+		return false
+	}
+	f.lastAttempt = now
+	return true
+}
+
+func (m *delegationManager) durabilityLoop() {
+	defer m.workerWG.Done()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var fallback durabilityFallback
+	var fallbackBuffer *writeback.Buffer
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.durableKick:
+		case <-ticker.C:
+		}
+		m.durabilityMu.Lock()
+		applied, durable, buffer := m.appliedHigh, m.durableHigh, m.durableBuffer
+		m.durabilityMu.Unlock()
+		if fallbackBuffer != buffer {
+			fallback, fallbackBuffer = durabilityFallback{}, buffer
+		}
+		if fallback.due(time.Now(), applied, durable) {
+			m.advanceDurability()
+			m.durabilityMu.Lock()
+			fallback.durable = m.durableHigh
+			m.durabilityMu.Unlock()
+		}
+	}
+}
+
+func (m *delegationManager) advanceDurability() {
+	m.durabilityMu.Lock()
+	buffer := m.durableBuffer
+	cut := m.appliedHigh
+	durable := m.durableHigh
+	m.durabilityMu.Unlock()
+	if buffer == nil || cut == 0 || cut <= durable {
+		return
+	}
+	ctx, cancel := context.WithTimeout(m.ctx, m.timeout)
+	response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{CutSequence: cut}}})
+	if err != nil || successfulDelegationResponse(response) != nil {
+		cancel()
+		return
+	}
+	reply := response.GetBarrier()
+	if reply == nil || reply.GetAppliedSequence() < reply.GetDurableSequence() || reply.GetDurableSequence() < cut {
+		cancel()
+		return
+	}
+	visible, err := m.visibilityCompletion(ctx, cut)
+	cancel()
+	if err != nil {
+		return
+	}
+	m.visibleForBuffer(buffer, visible)
+	m.durableForBuffer(buffer, reply.GetDurableSequence())
+}
+
+// Flush implements writeback.Flusher. Buffer itself serializes these calls per
+// identity and pipelines disjoint identities. Its batches are bounded by
+// writeback.MaxPayload, so every WRITE is at most 1 MiB.
+func (m *delegationManager) Flush(ctx context.Context, id writeback.Identity, entry writeback.Entry) (uint64, error) {
+	if entry.Kind == writeback.Write && (len(entry.Data) == 0 || len(entry.Data) > writeback.MaxPayload) {
+		return 0, errors.New("fusev3: invalid delegated write chunk")
+	}
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	s.admission.RLock()
+	binding, ok := s.bindings[entry.Generation]
+	current := ok && sameDelegation(s.ref, binding.ref)
+	handle := firstDelegatedHandle(s.handles)
+	// ftruncate requires a writable descriptor just like pwrite. A read-only
+	// handle can join the holder while a buffered size change awaits flush.
+	if entry.Kind == writeback.Write || entry.Kind == writeback.Truncate || entry.Attributes.HasSize {
+		handle = firstDelegatedHandle(s.writers)
+	}
+	s.admission.RUnlock()
+	if !current {
+		return 0, writeback.ErrLost
+	}
+	m.tokenMu.Lock()
+	progress := m.tokens[entry.Token]
+	m.tokenMu.Unlock()
+	if progress.sequence != 0 && progress.complete {
+		return progress.sequence, nil
+	}
+	if len(handle) == 0 {
+		return 0, errors.New("fusev3: delegated flush has no live server handle")
+	}
+	if entry.Kind == writeback.Write {
+		return m.flushWrite(ctx, s, binding, handle, entry, progress)
+	}
+	// Generated oneof interfaces are package-private, so construct the request
+	// in each branch instead of storing the body interface.
+	var request *authoritypb.Request
+	switch entry.Kind {
+	case writeback.Truncate, writeback.SetAttr:
+		a := entry.Attributes
+		set := &authoritypb.SetAttrRequest{Handle: cloneBytes(handle), Delegation: cloneDelegationRef(binding.ref), AtimeNow: a.ATimeNow, MtimeNow: a.MTimeNow}
+		if a.HasMode {
+			set.Mode = &a.Mode
+		}
+		if a.HasUID {
+			set.Uid = &a.UID
+		}
+		if a.HasGID {
+			set.Gid = &a.GID
+		}
+		if a.HasSize {
+			set.Size = &a.Size
+		}
+		if a.HasATime {
+			set.AtimeNs = &a.ATimeNS
+		}
+		if a.HasMTime {
+			set.MtimeNs = &a.MTimeNS
+		}
+		request = &authoritypb.Request{Body: &authoritypb.Request_SetAttr{SetAttr: set}}
+	default:
+		return 0, errors.New("fusev3: unsupported writeback entry kind")
+	}
+	response, err := m.rpc.CallMutation(ctx, request)
+	s.admission.Lock()
+	if !sameDelegation(s.ref, binding.ref) {
+		s.admission.Unlock()
+		return 0, writeback.ErrLost
+	}
+	result := delegationFlushResult{buffer: m.buf}
+	defer m.finishFlushResult(s, &result)
+	if err != nil {
+		if errors.Is(err, authorityrpc.ErrTransportUncertain) || errors.Is(err, authorityrpc.ErrAuthorityChanged) ||
+			errors.Is(err, authorityrpc.ErrReplayDesynchronized) || errors.Is(err, authorityrpc.ErrSessionEnded) {
+			result.dropped = m.loseDelegationLocked(s, "delegated mutation outcome uncertain")
+			return 0, writeback.ErrLost
+		}
+		return 0, err
+	}
+	if errno := definiteDelegationCapacityRefusal(response, false); errno != 0 {
+		result.dropped = m.refuseBufferedMutationLocked(s, errno)
+		return 0, errno
+	}
+	if err := successfulDelegationResponse(response); err != nil {
+		result.dropped = m.loseDelegationLocked(s, "delegated mutation permanently refused")
+		return 0, writeback.ErrLost
+	}
+	result.visible = response.GetVisibleSequence()
+	if !m.updateBaseFromResponse(s, response) {
+		result.dropped = m.loseDelegationLocked(s, "delegated metadata omitted exact post attributes")
+		return 0, writeback.ErrLost
+	}
+	sequence := response.GetAppliedSequence()
+	if sequence == 0 {
+		result.dropped = m.loseDelegationLocked(s, "delegated flush omitted application ticket")
+		return 0, writeback.ErrLost
+	}
+	s.meta.Lock()
+	s.applied = max(s.applied, sequence)
+	s.appliedCut = max(s.appliedCut, entry.Last)
+	s.meta.Unlock()
+	m.tokenMu.Lock()
+	m.tokens[entry.Token] = delegationFlushProgress{owner: s, sequence: sequence, complete: true}
+	s.trackFlushTokenLocked(entry.Token)
+	m.tokenMu.Unlock()
+	m.durabilityMu.Lock()
+	m.appliedHigh = max(m.appliedHigh, sequence)
+	m.durabilityMu.Unlock()
+	select {
+	case m.durableKick <- struct{}{}:
+	default:
+	}
+	return sequence, nil
+}
+
+func (m *delegationManager) flushWrite(ctx context.Context, s *delegationState, binding delegationBinding, handle []byte, entry writeback.Entry, progress delegationFlushProgress) (uint64, error) {
+	if progress.bytes < 0 || progress.bytes > len(entry.Data) {
+		m.loseDelegationIfCurrent(s, binding.ref, "invalid delegated write replay progress")
+		return 0, writeback.ErrLost
+	}
+	for progress.bytes < len(entry.Data) {
+		end := min(len(entry.Data), progress.bytes+m.maxWrite)
+		position := entry.Offset + int64(progress.bytes)
+		chunk := entry.Data[progress.bytes:end]
+		response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Write{Write: &authoritypb.WriteRequest{
+			Handle: handle, Position: uint64(position), Size: uint32(len(chunk)), Data: chunk,
+			WriteFlags: entry.WriteOptions.Flags, LockOwner: entry.WriteOptions.LockOwner,
+			Delegation: cloneDelegationRef(binding.ref),
+		}}})
+		progress, err = m.finishWriteChunk(s, binding, entry, progress, end, response, err)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return progress.sequence, nil
+}
+
+// A recall may expire and a successor may be installed while a DATA reply is
+// delayed. The reference check and every local consequence of that reply share
+// one admission lock; neither successful receipts nor loss can cross grants.
+// No network operation runs while this lock is held.
+func (m *delegationManager) finishWriteChunk(s *delegationState, binding delegationBinding, entry writeback.Entry, progress delegationFlushProgress, end int, response *authoritypb.Response, err error) (delegationFlushProgress, error) {
+	s.admission.Lock()
+	if !sameDelegation(s.ref, binding.ref) {
+		s.admission.Unlock()
+		return progress, writeback.ErrLost
+	}
+	result := delegationFlushResult{buffer: m.buf}
+	defer m.finishFlushResult(s, &result)
+	if err != nil {
+		if errors.Is(err, authorityrpc.ErrTransportUncertain) || errors.Is(err, authorityrpc.ErrAuthorityChanged) ||
+			errors.Is(err, authorityrpc.ErrReplayDesynchronized) || errors.Is(err, authorityrpc.ErrSessionEnded) {
+			result.dropped = m.loseDelegationLocked(s, "delegated mutation outcome uncertain")
+			return progress, writeback.ErrLost
+		}
+		return progress, err
+	}
+	if errno := definiteDelegationCapacityRefusal(response, true); errno != 0 {
+		result.dropped = m.refuseBufferedMutationLocked(s, errno)
+		return progress, errno
+	}
+	if err := successfulDelegationResponse(response); err != nil {
+		result.dropped = m.loseDelegationLocked(s, "delegated mutation permanently refused")
+		return progress, writeback.ErrLost
+	}
+	position := entry.Offset + int64(progress.bytes)
+	size := end - progress.bytes
+	reply := response.GetWrite()
+	if reply == nil || response.GetVolumeVersion() == 0 || reply.GetPostAttr() == nil || reply.GetPostAttr().GetKind() != authoritypb.Attr_REGULAR || reply.GetPostAttr().GetSize() < position+int64(size) || reply.GetCommittedSize() != uint64(size) || reply.GetAssignedOffset() != uint64(position) || reply.GetError() != 0 || response.GetAppliedSequence() == 0 || response.GetAppliedSequence() < progress.sequence {
+		result.dropped = m.loseDelegationLocked(s, "malformed delegated write success")
+		return progress, writeback.ErrLost
+	}
+	progress.bytes = end
+	progress.sequence = response.GetAppliedSequence()
+	progress.complete = progress.bytes == len(entry.Data)
+	m.tokenMu.Lock()
+	progress.owner = s
+	m.tokens[entry.Token] = progress
+	s.trackFlushTokenLocked(entry.Token)
+	m.tokenMu.Unlock()
+	s.meta.Lock()
+	s.applied = max(s.applied, progress.sequence)
+	if progress.complete {
+		s.appliedCut = max(s.appliedCut, entry.Last)
+	}
+	s.meta.Unlock()
+	m.durabilityMu.Lock()
+	m.appliedHigh = max(m.appliedHigh, progress.sequence)
+	m.durabilityMu.Unlock()
+	// Retiring the overlay must expose the exact applied attributes, never
+	// the pre-write base that the buffered timestamp temporarily covered.
+	m.updateBaseFromResponse(s, response)
+	result.durable = reply.GetDurableSequence()
+	select {
+	case m.durableKick <- struct{}{}:
+	default:
+	}
+	return progress, nil
+}
+
+type delegationFlushResult struct {
+	buffer           *writeback.Buffer
+	dropped          writeback.DropReport
+	visible, durable uint64
+}
+
+func (m *delegationManager) finishFlushResult(s *delegationState, result *delegationFlushResult) {
+	s.admission.Unlock()
+	// Session-wide progress takes the registry lock, so publish it after
+	// releasing admission. The captured buffer keeps it in the old epoch if
+	// a reset is concurrently joining this callback.
+	if result.visible != 0 {
+		m.visibleForBuffer(result.buffer, result.visible)
+	}
+	if result.durable != 0 {
+		m.durableForBuffer(result.buffer, result.durable)
+	}
+	if result.dropped.Reason != "" {
+		m.reportDrop(result.dropped)
+	}
+}
+
+func (m *delegationManager) updateBaseFromResponse(s *delegationState, response *authoritypb.Response) bool {
+	var attr *authoritypb.Attr
+	version := response.GetVolumeVersion()
+	if response.GetWrite() != nil {
+		attr = response.GetWrite().GetPostAttr()
+	}
+	if attr == nil && response.GetPostState() != nil {
+		for _, object := range response.GetPostState().GetObjects() {
+			if bytes.Equal(object.GetStableIdentity(), s.identity[:]) {
+				attr = object.GetAttr()
+				version = object.GetObjectVersion()
+				break
+			}
+		}
+	}
+	if attr == nil || version == 0 {
+		return false
+	}
+	s.meta.Lock()
+	s.installBaseLocked(attr, version)
+	s.meta.Unlock()
+	return true
+}
+
+func delegationApplied(s *delegationState, _ uint64) uint64 {
+	s.meta.Lock()
+	defer s.meta.Unlock()
+	// Buffer retains an identity's application high-water across generations.
+	// CONTROL receipts must name only this grant's applications; each flusher
+	// updates s.applied before returning its receipt to Buffer.
+	return s.applied
+}
+
+func firstDelegatedHandle(handles map[string][]byte) []byte {
+	for _, handle := range handles {
+		return cloneBytes(handle)
+	}
+	return nil
+}
+
+func successfulDelegationResponse(response *authoritypb.Response) error {
+	if response == nil || response.GetUncertain() {
+		return errors.New("fusev3: delegated request has no definite outcome")
+	}
+	if response.GetErrno() != 0 {
+		return syscall.Errno(response.GetErrno())
+	}
+	return nil
+}
+
+func (m *delegationManager) FlushIdentity(ctx context.Context, identity []byte) (uint64, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return 0, err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	state := m.retainState(id, true)
+	defer m.releaseState(state)
+	return m.buf.FlushIdentity(ctx, id, m.buf.Snapshot())
+}
+
+// flushIdentityInEpoch is for a Synchronous callback, which already holds the
+// manager epoch read fence. Taking it recursively can deadlock behind an epoch
+// writer because sync.RWMutex gives queued writers preference.
+func (m *delegationManager) flushIdentityInEpoch(ctx context.Context, identity []byte) (uint64, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return 0, err
+	}
+	state := m.retainState(id, true)
+	defer m.releaseState(state)
+	return m.buf.FlushIdentity(ctx, id, m.buf.Snapshot())
+}
+
+// Synchronous orders an Authority mutation after every locally accepted entry
+// for the identity. It is used for append (whose position only the Authority
+// can choose), fallocate, copy destinations, and other delegated operations
+// that the positioned-write Buffer cannot represent.
+func (m *delegationManager) Synchronous(ctx context.Context, identity []byte, call func(*authoritypb.DelegationRef) (*authoritypb.Response, error)) (*authoritypb.Response, error) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return nil, err
+	}
+	if call == nil {
+		return nil, errors.New("fusev3: nil delegated synchronous operation")
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	m.frontend.RLock()
+	frontendLocked := true
+	defer func() {
+		if frontendLocked {
+			m.frontend.RUnlock()
+		}
+	}()
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	if err := s.lockAfterRelease(ctx, delegationOperation); err != nil {
+		return nil, err
+	}
+	lockedState := s
+	operationLocked := true
+	defer func() {
+		if operationLocked {
+			lockedState.operation.Unlock()
+		}
+	}()
+	s.admission.RLock()
+	ref := cloneDelegationRef(s.ref)
+	s.admission.RUnlock()
+	if ref == nil {
+		return nil, errDelegationNotOwned
+	}
+	// An external range mutation can replace bytes represented by retained
+	// applied extents. Retire the prior cut before dispatch so the holder's
+	// overlay cannot hide the operation's new Authority contents afterward.
+	retire, err := m.beginRetire(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = m.buf.FlushIdentity(ctx, id, retire.Cut()); err == nil {
+		err = retire.DetachOverlay()
+	}
+	s.admission.Lock()
+	finished := err != nil
+	if err == nil {
+		next := m.buf.Generation(id) + 1
+		s.bindings[next] = delegationBinding{ref: cloneDelegationRef(ref), item: cloneBytes(s.item), generation: next}
+		err = retire.Resume()
+		finished = err == nil
+		if err != nil {
+			delete(s.bindings, next)
+		}
+	} else {
+		retire.Cancel()
+	}
+	if finished && s.retire == retire {
+		s.retire = nil
+	}
+	s.admission.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	response, err := call(ref)
+	if err != nil {
+		return response, err
+	}
+	if err := successfulDelegationResponse(response); err != nil {
+		return response, err
+	}
+	m.visibleForBuffer(m.buf, response.GetVisibleSequence())
+	if response.GetAppliedSequence() != 0 {
+		s.meta.Lock()
+		s.applied = max(s.applied, response.GetAppliedSequence())
+		s.meta.Unlock()
+		m.durabilityMu.Lock()
+		m.appliedHigh = max(m.appliedHigh, response.GetAppliedSequence())
+		m.durabilityMu.Unlock()
+		select {
+		case m.durableKick <- struct{}{}:
+		default:
+		}
+	}
+	if response.GetWrite() != nil && response.GetWrite().GetDurableSequence() != 0 {
+		m.durableCurrent(response.GetWrite().GetDurableSequence())
+	}
+	m.updateBaseFromResponse(s, response)
+	if response.GetAppliedSequence() != 0 {
+		cut := m.buf.Snapshot()
+		lockedState.operation.Unlock()
+		operationLocked = false
+		m.frontend.RUnlock()
+		frontendLocked = false
+		if err := m.waitVisibility(ctx, m.buf, id, cut, response.GetAppliedSequence()); err != nil {
+			return response, err
+		}
+	}
+	return response, nil
+}
+
+func (m *delegationManager) syncIdentity(ctx context.Context, s *delegationState, dataOnly bool) error {
+	s.admission.RLock()
+	handle := firstDelegatedHandle(s.handles)
+	s.admission.RUnlock()
+	if len(handle) == 0 {
+		return errors.New("fusev3: delegated fsync has no live server handle")
+	}
+	response, err := m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: handle, DataOnly: dataOnly}}})
+	if err != nil {
+		return err
+	}
+	if err := successfulDelegationResponse(response); err != nil {
+		return err
+	}
+	if response.GetFsync() == nil {
+		return errors.New("fusev3: delegated fsync omitted reply")
+	}
+	m.durableCurrent(response.GetFsync().GetDurableSequence())
+	return nil
+}
+
+// The operation lock fixes this identity's accepted cut. FSYNC proves only
+// that file durable; its common prefix may remain behind an unrelated writer.
+func (m *delegationManager) syncIdentityCut(ctx context.Context, s *delegationState, b *writeback.Buffer, cut writeback.Cut, dataOnly bool) (uint64, error) {
+	applied, err := b.FlushIdentity(ctx, s.identity, cut)
+	if err != nil {
+		return applied, err
+	}
+	if err := m.syncIdentity(ctx, s, dataOnly); err != nil {
+		return applied, err
+	}
+	return applied, nil
+}
+
+func (m *delegationManager) Fsync(ctx context.Context, identity []byte, dataOnly bool) error {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return err
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	if err := s.lockAfterRelease(ctx, delegationTransition|delegationOperation); err != nil {
+		return err
+	}
+	cut := m.buf.Snapshot()
+	applied, err := m.syncIdentityCut(ctx, s, m.buf, cut, dataOnly)
+	s.operation.Unlock()
+	s.transition.Unlock()
+	if err != nil {
+		return err
+	}
+	if applied != 0 {
+		if err := m.waitVisibility(ctx, m.buf, id, cut, applied); err != nil {
+			return err
+		}
+	}
+	return m.buf.DurableIdentity(id, cut)
+}
+
+// Barrier implements the root-directory completion barrier. Admission is
+// fenced only while the local cut and the already-applied ticket floor are
+// captured. Flush, remote visibility and durability do not block later work.
+func (m *delegationManager) Barrier(ctx context.Context, observedLoss uint64) error {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	m.frontend.Lock()
+	barrier := m.buf.BeginBarrier(observedLoss)
+	m.durabilityMu.Lock()
+	appliedFloor := m.appliedHigh
+	m.durabilityMu.Unlock()
+	m.frontend.Unlock()
+	completed := false
+	defer func() {
+		if !completed {
+			m.buf.EndBarrier(barrier)
+		}
+	}()
+	applied, err := m.buf.FlushBarrier(ctx, barrier)
+	if err != nil {
+		return err
+	}
+	applied = max(applied, appliedFloor)
+	response, err := m.rpc.CallMutation(ctx, &authoritypb.Request{Body: &authoritypb.Request_Barrier{Barrier: &authoritypb.BarrierRequest{CutSequence: applied}}})
+	if err != nil {
+		return err
+	}
+	if err := successfulDelegationResponse(response); err != nil {
+		return err
+	}
+	reply := response.GetBarrier()
+	if reply == nil || reply.GetAppliedSequence() < reply.GetDurableSequence() || reply.GetDurableSequence() < applied {
+		return errors.New("fusev3: malformed barrier reply")
+	}
+	m.durableCurrent(reply.GetDurableSequence())
+	if applied != 0 {
+		var visible uint64
+		visible, err = m.visibilityCompletion(ctx, applied)
+		if err != nil {
+			return err
+		}
+		m.visibleForBuffer(m.buf, visible)
+	}
+	lost, err := m.buf.WaitBarrier(ctx, barrier)
+	completed = true
+	if err != nil {
+		return err
+	}
+	if lost {
+		return writeback.ErrLost
+	}
+	return nil
+}
+
+func (m *delegationManager) HandleControlEvent(parent context.Context, event *authoritypb.ControlEvent) <-chan struct{} {
+	done := make(chan struct{})
+	started := false
+	defer func() {
+		if !started {
+			close(done)
+		}
+	}()
+	if event == nil {
+		return done
+	}
+	cloned := proto.Clone(event).(*authoritypb.ControlEvent)
+	if cloned.GetIncarnation() == 0 || cloned.GetIncarnation() != m.incarnation() || cloned.GetSequence() == 0 {
+		return done
+	}
+	if cloned.GetDelegationRecall() == nil && cloned.GetDelegationBreak() == nil && cloned.GetDelegationModeChange() == nil {
+		return done
+	}
+	var rawID []byte
+	var budget uint64
+	switch {
+	case cloned.GetDelegationRecall() != nil:
+		rawID, budget = cloned.GetDelegationRecall().GetIdentity(), cloned.GetDelegationRecall().GetBudgetNanos()
+	case cloned.GetDelegationBreak() != nil:
+		rawID, budget = cloned.GetDelegationBreak().GetIdentity(), cloned.GetDelegationBreak().GetBudgetNanos()
+	case cloned.GetDelegationModeChange() != nil:
+		rawID, budget = cloned.GetDelegationModeChange().GetIdentity(), cloned.GetDelegationModeChange().GetBudgetNanos()
+	}
+	id, err := delegationIdentity(rawID)
+	if err != nil || budget == 0 || budget > uint64(5*time.Second) {
+		return done
+	}
+	// The local budget begins at receipt, including time spent behind an
+	// earlier transition for this identity.
+	ctx, cancel := context.WithTimeout(parent, time.Duration(budget))
+	m.epoch.RLock()
+	if cloned.GetIncarnation() != m.incarnation() {
+		m.epoch.RUnlock()
+		cancel()
+		return done
+	}
+	epoch := m.epochSerial
+	s := m.retainState(id, true)
+	m.epoch.RUnlock()
+	s.controlMu.Lock()
+	predecessor := s.controlTail
+	s.controlTail = done
+	s.controlMu.Unlock()
+	m.controlWG.Add(1)
+	started = true
+	go func() {
+		defer m.releaseState(s)
+		defer m.controlWG.Done()
+		defer cancel()
+		defer close(done)
+		if predecessor != nil {
+			<-predecessor
+		}
+		m.handleControlEvent(ctx, cloned, s, epoch)
+	}()
+	return done
+}
+
+func (m *delegationManager) handleControlEvent(ctx context.Context, event *authoritypb.ControlEvent, s *delegationState, epoch uint64) {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	if epoch != m.epochSerial || event.GetIncarnation() != m.incarnation() {
+		return
+	}
+	var ref *authoritypb.DelegationRef
+	switch {
+	case event.GetDelegationRecall() != nil:
+		ref = event.GetDelegationRecall().GetDelegation()
+	case event.GetDelegationBreak() != nil:
+		ref = event.GetDelegationBreak().GetDelegation()
+	case event.GetDelegationModeChange() != nil:
+		ref = event.GetDelegationModeChange().GetDelegation()
+	}
+	// CONTROL may overtake the DATA reply carrying a newly activated grant.
+	// Wait without transition/operation locks: Install needs both to publish it.
+	for {
+		if err := s.lockAfterRelease(ctx, delegationTransition|delegationOperation); err != nil {
+			m.retireTimedOutControl(s, ref)
+			return
+		}
+		s.admission.RLock()
+		live, changed, retired := cloneDelegationRef(s.ref), s.grantChanged, s.retiredGeneration
+		s.admission.RUnlock()
+		if sameDelegation(live, ref) {
+			break
+		}
+		s.operation.Unlock()
+		s.transition.Unlock()
+		if retired >= ref.GetGeneration() || live != nil && live.GetGeneration() > ref.GetGeneration() {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			m.retireTimedOutControl(s, ref)
+			return
+		}
+	}
+	defer s.transition.Unlock()
+	defer s.operation.Unlock()
+	if event.GetDelegationRecall() != nil {
+		m.recall(ctx, event, s)
+		return
+	}
+	if event.GetDelegationBreak() != nil {
+		m.breakDelegation(ctx, event, s)
+		return
+	}
+	m.changeMode(ctx, event, s)
+}
+
+// Expiring before DATA registration or while waiting for an operation still
+// retires the Authority's exact grant. Otherwise a delayed successful OPEN can
+// resurrect authority the server has already abandoned. Admission keeps any
+// racing installation and its accepted writes on the same side of the drop;
+// a newer reference is never cleared by this older control event.
+func (m *delegationManager) retireTimedOutControl(s *delegationState, ref *authoritypb.DelegationRef) {
+	if ref == nil || ref.GetGeneration() == 0 {
+		return
+	}
+	s.admission.Lock()
+	newTombstone := ref.GetGeneration() > s.retiredGeneration
+	s.retiredGeneration = max(s.retiredGeneration, ref.GetGeneration())
+	matched := sameDelegation(s.ref, ref)
+	var report writeback.DropReport
+	if matched {
+		s.clearGrantLocked()
+		report = m.buf.Drop(s.identity, "delegation control expired before its transition")
+		s.meta.Lock()
+		s.dirty = false
+		s.meta.Unlock()
+	} else if newTombstone {
+		close(s.grantChanged)
+		s.grantChanged = make(chan struct{})
+	}
+	s.admission.Unlock()
+	if newTombstone {
+		m.mu.Lock()
+		s.collectCut = false
+		m.mu.Unlock()
+	}
+	if matched {
+		m.reportDrop(report)
+	}
+}
+
+func (m *delegationManager) beginRetire(ctx context.Context, s *delegationState) (*writeback.Retirement, error) {
+	return m.beginRetireBuffer(ctx, m.buf, s)
+}
+
+func (m *delegationManager) beginRetireBuffer(ctx context.Context, buf *writeback.Buffer, s *delegationState) (*writeback.Retirement, error) {
+	s.admission.Lock()
+	defer s.admission.Unlock()
+	if s.retire != nil {
+		return s.retire, nil
+	}
+	r, err := buf.BeginRetire(ctx, &s.identity)
+	if err == nil {
+		s.retire = r
+	}
+	return r, err
+}
+
+// Only a definite, unapplied capacity refusal preserves the grant. A reply
+// with a ticket or partial write is an uncertain application, even with ENOSPC.
+func definiteDelegationCapacityRefusal(response *authoritypb.Response, write bool) syscall.Errno {
+	if response == nil || response.GetUncertain() || response.GetFailure() != 0 || response.GetAppliedSequence() != 0 || response.GetPostState() != nil {
+		return 0
+	}
+	errno := syscall.Errno(response.GetErrno())
+	if response.GetBody() != nil {
+		reply := response.GetWrite()
+		if !write || reply == nil || errno != 0 || reply.GetCommittedSize() != 0 || reply.GetAssignedOffset() != 0 || reply.GetPostAttr() != nil || reply.GetDurableSequence() != 0 || reply.GetError() >= 0 || reply.GetError() < -4095 {
+			return 0
+		}
+		errno = syscall.Errno(-reply.GetError())
+	}
+	switch errno {
+	case syscall.ENOSPC, syscall.EDQUOT, syscall.EFBIG:
+		return errno
+	}
+	return 0
+}
+
+// Caller holds admission through the drop and replacement buffer binding.
+func (m *delegationManager) refuseBufferedMutationLocked(s *delegationState, errno syscall.Errno) writeback.DropReport {
+	report := m.buf.DropWithErrno(s.identity, "delegated mutation capacity refusal", errno)
+	generation := m.buf.Generation(s.identity)
+	clear(s.bindings)
+	if s.ref != nil {
+		s.bindings[generation] = delegationBinding{ref: cloneDelegationRef(s.ref), item: cloneBytes(s.item), generation: generation}
+	}
+	s.meta.Lock()
+	s.dirty = false
+	s.meta.Unlock()
+	return report
+}
+
+func (m *delegationManager) SetDropReporter(reporter func(writeback.DropReport)) {
+	m.hookMu.Lock()
+	m.dropReporter = reporter
+	m.hookMu.Unlock()
+}
+
+func (m *delegationManager) reportDrop(report writeback.DropReport) {
+	log.Printf("portablefs: dropped delegated writeback identity=%x bytes=%d entries=%d loss_sequence=%d errno=%d reason=%q", report.Identity, report.Bytes, report.Entries, report.LossSequence, report.Errno, report.Reason)
+	// Drop also advances an identity ticket when an uncertain operation loses a
+	// clean delegation. That is observable by handles, but it is not a retained
+	// writeback loss and must not produce a zero-entry data-loss report.
+	if report.Entries == 0 {
+		return
+	}
+	m.hookMu.RLock()
+	reporter := m.dropReporter
+	m.hookMu.RUnlock()
+	if reporter != nil {
+		reporter(report)
+	}
+}
+
+// FenceAdmissions begins shutdown before inspecting its final retained cut.
+func (m *delegationManager) FenceAdmissions() {
+	m.epoch.RLock()
+	m.buf.FenceAdmissions()
+	m.epoch.RUnlock()
+}
+
+// DropRetained closes final admission before reporting each shutdown loss.
+func (m *delegationManager) DropRetained(reason string) {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	m.buf.FenceAdmissions()
+	m.frontend.Lock()
+	defer m.frontend.Unlock()
+	for _, report := range m.buf.DropAll(reason) {
+		m.reportDrop(report)
+	}
+}
+
+func (m *delegationManager) loseDelegation(s *delegationState, reason string) {
+	s.admission.Lock()
+	report := m.loseDelegationLocked(s, reason)
+	s.admission.Unlock()
+	m.reportDrop(report)
+}
+
+func (m *delegationManager) loseDelegationIfCurrent(s *delegationState, ref *authoritypb.DelegationRef, reason string) {
+	s.admission.Lock()
+	if !sameDelegation(s.ref, ref) {
+		s.admission.Unlock()
+		return
+	}
+	report := m.loseDelegationLocked(s, reason)
+	s.admission.Unlock()
+	m.reportDrop(report)
+}
+
+// Closing admission and dropping the buffer form one retirement boundary.
+// Releasing admission between them would let a successor install and lose its
+// writes to this grant's drop. A flusher cannot BeginRetire: it would join itself.
+func (m *delegationManager) loseDelegationLocked(s *delegationState, reason string) writeback.DropReport {
+	s.clearGrantLocked()
+	report := m.buf.Drop(s.identity, reason)
+	s.meta.Lock()
+	s.dirty = false
+	s.meta.Unlock()
+	return report
+}
+
+func (m *delegationManager) failCleanupIdentity(identity []byte, reason string) {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return
+	}
+	m.epoch.RLock()
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if s == nil {
+		m.epoch.RUnlock()
+		return
+	}
+	s.admission.Lock()
+	s.clearGrantLocked()
+	var report writeback.DropReport
+	dropped := false
+	if m.buf.HasRetained(id) {
+		report = m.buf.Drop(id, reason)
+		dropped = true
+	}
+	s.meta.Lock()
+	s.dirty = false
+	s.meta.Unlock()
+	s.admission.Unlock()
+	m.epoch.RUnlock()
+	if dropped {
+		m.reportDrop(report)
+	}
+}
+
+func (m *delegationManager) recall(ctx context.Context, event *authoritypb.ControlEvent, s *delegationState) {
+	retire, err := m.beginRetire(ctx, s)
+	var applied uint64
+	if err == nil {
+		m.hookMu.RLock()
+		drain := m.withdrawalDrain
+		m.hookMu.RUnlock()
+		if drain != nil {
+			err = drain(ctx, cloneBytes(s.identity[:]))
+		}
+	}
+	if err == nil {
+		applied, err = m.buf.FlushIdentity(ctx, s.identity, retire.Cut())
+		applied = delegationApplied(s, applied)
+	}
+	if err == nil {
+		// A recall transfers visibility, not durability. Stop serving the old
+		// overlay before ACK while retaining its applied records until the
+		// durable prefix arrives; a peer can replace these ranges meanwhile.
+		err = retire.DetachOverlay()
+	}
+	if err == nil {
+		ack := &authoritypb.DelegationRecallAck{Incarnation: event.GetIncarnation(), EventSequence: event.GetSequence(), Delegation: cloneDelegationRef(s.ref), AppliedSequence: applied}
+		var response *authoritypb.Response
+		response, err = m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_DelegationRecallAck{DelegationRecallAck: ack}})
+		if err == nil {
+			err = successfulDelegationResponse(response)
+		}
+		if err == nil && response.GetDelegationRecallAck() == nil {
+			err = errors.New("fusev3: recall acknowledgment omitted reply")
+		}
+	}
+	if err != nil {
+		m.loseDelegation(s, "delegation recall budget missed")
+		return
+	}
+	s.admission.Lock()
+	s.clearGrantLocked()
+	s.admission.Unlock()
+}
+
+func (m *delegationManager) breakDelegation(ctx context.Context, event *authoritypb.ControlEvent, s *delegationState) {
+	s.admission.Lock()
+	cut := m.buf.Snapshot()
+	s.admission.Unlock()
+	applied, err := m.buf.FlushIdentity(ctx, s.identity, cut)
+	applied = delegationApplied(s, applied)
+	if err == nil {
+		ack := &authoritypb.DelegationBreakAck{Incarnation: event.GetIncarnation(), EventSequence: event.GetSequence(), Delegation: cloneDelegationRef(s.ref), AppliedSequence: applied}
+		var response *authoritypb.Response
+		response, err = m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_DelegationBreakAck{DelegationBreakAck: ack}})
+		if err == nil {
+			err = successfulDelegationResponse(response)
+		}
+		if err == nil && response.GetDelegationBreakAck() == nil {
+			err = errors.New("fusev3: break acknowledgment omitted reply")
+		}
+	}
+	if err != nil {
+		m.loseDelegation(s, "delegation break budget missed")
+	}
+}
+
+func (m *delegationManager) changeMode(ctx context.Context, event *authoritypb.ControlEvent, s *delegationState) {
+	change := event.GetDelegationModeChange()
+	target := change.GetMode()
+	if target != authoritypb.DelegationMode_DELEGATION_MODE_FULL && target != authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH {
+		return
+	}
+	var applied uint64
+	var err error
+	s.admission.RLock()
+	oldMode := s.mode
+	s.admission.RUnlock()
+	if target == authoritypb.DelegationMode_DELEGATION_MODE_WRITETHROUGH && oldMode != target {
+		var retire *writeback.Retirement
+		retire, err = m.beginRetire(ctx, s)
+		if err == nil {
+			applied, err = m.buf.FlushIdentity(ctx, s.identity, retire.Cut())
+			applied = delegationApplied(s, applied)
+		}
+		if err == nil {
+			s.admission.Lock()
+			next := m.buf.Generation(s.identity) + 1
+			s.bindings[next] = delegationBinding{ref: cloneDelegationRef(s.ref), item: cloneBytes(s.item), generation: next}
+			s.mode = target
+			err = retire.Resume()
+			if err == nil {
+				s.retire = nil
+			}
+			s.admission.Unlock()
+		}
+	} else {
+		s.admission.Lock()
+		s.mode = target
+		s.admission.Unlock()
+		s.meta.Lock()
+		applied = s.applied
+		s.meta.Unlock()
+	}
+	if err == nil {
+		ack := &authoritypb.DelegationModeChangeAck{Incarnation: event.GetIncarnation(), EventSequence: event.GetSequence(), Delegation: cloneDelegationRef(s.ref), AppliedSequence: applied}
+		var response *authoritypb.Response
+		response, err = m.rpc.CallIdempotent(ctx, &authoritypb.Request{Body: &authoritypb.Request_DelegationModeChangeAck{DelegationModeChangeAck: ack}})
+		if err == nil {
+			err = successfulDelegationResponse(response)
+		}
+		if err == nil && response.GetDelegationModeChangeAck() == nil {
+			err = errors.New("fusev3: mode-change acknowledgment omitted reply")
+		}
+	}
+	if err != nil {
+		m.loseDelegation(s, "delegation mode-change budget missed")
+	}
+}
+
+// ReleaseBatch flushes and releases identities after their final local handle
+// closes. The wire batch is sorted by delegation id as required by protocol 7.
+func (m *delegationManager) ReleaseBatch(ctx context.Context, identities [][]byte) error {
+	if len(identities) == 0 || len(identities) > 4096 {
+		return errors.New("fusev3: invalid delegation release batch size")
+	}
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	groups := make([]*delegationReleaseGroup, 0, len(identities))
+	seen := make(map[writeback.Identity]struct{}, len(identities))
+	for _, identity := range identities {
+		id, err := delegationIdentity(identity)
+		if err != nil {
+			return err
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return errors.New("fusev3: duplicate release identity")
+		}
+		seen[id] = struct{}{}
+		state := m.retainState(id, true)
+		defer m.releaseState(state)
+		groups = append(groups, &delegationReleaseGroup{state: state, release: true})
+	}
+	batch, err := m.prepareReleaseBatch(ctx, m.buf, m.epochSerial, m.incarnation(), groups)
+	if err != nil {
+		return err
+	}
+	defer batch.finish()
+	for _, g := range groups {
+		if g.ref == nil {
+			return errDelegationNotOwned
+		}
+	}
+	return batch.applyAndRelease(ctx)
+}
+
+func (m *delegationManager) TracksHandle(identity, handle []byte) bool {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return false
+	}
+	s := m.retainState(id, false)
+	defer m.releaseState(s)
+	if s == nil {
+		return false
+	}
+	s.admission.RLock()
+	_, tracked := s.handles[string(handle)]
+	s.admission.RUnlock()
+	return tracked
+}
+
+func (m *delegationManager) CloseHandle(ctx context.Context, identity, handle []byte) error {
+	id, err := delegationIdentity(identity)
+	if err != nil {
+		return err
+	}
+	s := m.retainState(id, true)
+	defer m.releaseState(s)
+	if err := s.lockAfterRelease(ctx, delegationTransition); err != nil {
+		return err
+	}
+	s.admission.RLock()
+	_, present := s.handles[string(handle)]
+	last := present && len(s.handles) == 1 && s.ref != nil
+	s.admission.RUnlock()
+	if present && !last {
+		s.admission.Lock()
+		delete(s.handles, string(handle))
+		delete(s.writers, string(handle))
+		s.admission.Unlock()
+	}
+	s.transition.Unlock()
+	if !present || !last {
+		return nil
+	}
+	// The final server handle remains registered until every buffered entry has
+	// used it. The caller invokes CloseHandle before sending CLOSE, so a
+	// successful release leaves no flush that can refer to the capability.
+	if err := m.ReleaseBatch(ctx, [][]byte{cloneBytes(identity)}); err != nil {
+		return err
+	}
+	s.admission.Lock()
+	delete(s.handles, string(handle))
+	delete(s.writers, string(handle))
+	s.admission.Unlock()
+	return nil
+}
+
+// Bound deferred cleanup well below the Authority's normal open table. New
+// handle admission waits before acquiring any per-identity operation locks;
+// cleanup must remain able to flush and release the handles it already owns.
+const deferredCloseAdmissionLimit = 256
+
+func deferredCloseReliefBound(requestTimeout time.Duration) time.Duration {
+	const maximum = time.Second
+	bound := requestTimeout / 4
+	if bound <= 0 || bound > maximum {
+		return maximum
+	}
+	return bound
+}
+
+func (m *delegationManager) waitCloseCapacity(ctx context.Context) error {
+	if m == nil {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, deferredCloseReliefBound(m.timeout))
+	defer cancel()
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	for m.closePending >= deferredCloseAdmissionLimit {
+		if m.closeChanged == nil {
+			m.closeChanged = make(chan struct{})
+		}
+		changed := m.closeChanged
+		m.closeMu.Unlock()
+		var err error
+		select {
+		case <-changed:
+		case <-waitCtx.Done():
+			err = waitCtx.Err()
+		case <-m.ctx.Done():
+			err = writeback.ErrClosed
+		}
+		m.closeMu.Lock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *delegationManager) changePendingCloses(delta int) {
+	m.closeMu.Lock()
+	defer m.closeMu.Unlock()
+	m.closePending += delta
+	if delta < 0 && m.closeChanged != nil {
+		close(m.closeChanged)
+		m.closeChanged = nil
+	}
+}
+
+// QueueClose transfers a FUSE RELEASE to the cleanup worker. RELEASE has no
+// kernel reply, so a short collection window can combine final-handle
+// delegation releases while keeping every server handle alive through its
+// application. Unknown descriptor outcomes trigger terminal session cleanup.
+func (m *delegationManager) QueueClose(identity, handle []byte, lockOwner uint64, flockUnlock bool) error {
+	if _, err := delegationIdentity(identity); err != nil {
+		return err
+	}
+	if len(handle) != 16 {
+		return errors.New("fusev3: invalid queued server handle")
+	}
+	m.epoch.RLock()
+	pending := delegationClose{
+		identity: cloneBytes(identity), handle: cloneBytes(handle), lockOwner: lockOwner,
+		flockUnlock: flockUnlock, epoch: m.epochSerial,
+	}
+	m.epoch.RUnlock()
+	m.closeMu.Lock()
+	if m.closeStopped || m.ctx.Err() != nil {
+		m.closeMu.Unlock()
+		return writeback.ErrClosed
+	}
+	m.closePending++
+	m.closeProducers.Add(1)
+	m.closeMu.Unlock()
+	defer m.closeProducers.Done()
+	select {
+	case m.closeQueue <- pending:
+		return nil
+	case <-m.ctx.Done():
+		m.changePendingCloses(-1)
+		return writeback.ErrClosed
+	}
+}
+
+func (m *delegationManager) closeLoop() {
+	defer m.workerWG.Done()
+	defer m.finishCloseQueue()
+	for {
+		var first delegationClose
+		select {
+		case first = <-m.closeQueue:
+		case <-m.ctx.Done():
+			return
+		}
+		batch := []delegationClose{first}
+		timer := time.NewTimer(25 * time.Millisecond)
+	collect:
+		for len(batch) < authorityrpc.MaxCloseBatch {
+			select {
+			case pending := <-m.closeQueue:
+				batch = append(batch, pending)
+			case <-timer.C:
+				break collect
+			case <-m.ctx.Done():
+				timer.Stop()
+				m.processCloseBatch(batch)
+				return
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		m.processCloseBatch(batch)
+	}
+}
+
+// A canceled select can still choose a ready enqueue. Seal producers and
+// join those already admitted before the final drain, so Stop cannot strand
+// a late close after its cleanup worker has exited.
+func (m *delegationManager) finishCloseQueue() {
+	m.closeMu.Lock()
+	m.closeStopped = true
+	m.closeMu.Unlock()
+	m.closeProducers.Wait()
+	m.drainCloseQueue()
+}
+
+func (m *delegationManager) drainCloseQueue() {
+	batch := make([]delegationClose, 0, authorityrpc.MaxCloseBatch)
+	for {
+		select {
+		case pending := <-m.closeQueue:
+			batch = append(batch, pending)
+			if len(batch) == cap(batch) {
+				m.processCloseBatch(batch)
+				batch = batch[:0]
+			}
+		default:
+			if len(batch) != 0 {
+				m.processCloseBatch(batch)
+			}
+			return
+		}
+	}
+}
+
+func (m *delegationManager) processCloseBatch(batch []delegationClose) {
+	retirePending := true
+	defer func() {
+		if retirePending {
+			m.changePendingCloses(-len(batch))
+		}
+	}()
+	// A background close retains its exact replay identity through an outage.
+	// The queue is bounded, and mount shutdown cancels this work.
+	ctx, cancel := context.WithTimeout(m.ctx, m.timeout)
+	defer cancel()
+	var scopes []delegationCloseScope
+	if err := m.closeHandles(ctx, batch, &scopes); err != nil {
+		var cleanup delegationCleanupError
+		var finalized delegationReleaseFinalizedError
+		if errors.As(err, &cleanup) || errors.As(err, &finalized) {
+			m.failCloseScopes(scopes, "deferred descriptor cleanup refused", true)
+			m.hookMu.RLock()
+			report := m.cleanupFailure
+			m.hookMu.RUnlock()
+			if report != nil {
+				report(err)
+			}
+			var classified cleanupClassified
+			m.hookMu.RLock()
+			waitRetry := m.cleanupRetry
+			m.hookMu.RUnlock()
+			if errors.As(err, &classified) && classified.cleanupFailureClass() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE && waitRetry != nil && waitRetry(m.ctx) == nil {
+				m.epoch.RLock()
+				for i := range batch {
+					batch[i].epoch = m.epochSerial
+				}
+				m.epoch.RUnlock()
+				for _, pending := range batch {
+					select {
+					case m.closeQueue <- pending:
+					case <-m.ctx.Done():
+						return
+					}
+				}
+				retirePending = false
+				return
+			}
+			log.Printf("portablefs: deferred close failed: %v", err)
+			return
+		}
+		m.failCloseScopes(scopes, "asynchronous delegated close failed", false)
+	}
+}
+
+// CloseHandles is the synchronous batch primitive behind QueueClose. It is
+// kept visible to tests and clean shutdown paths that already own a deadline.
+func (m *delegationManager) CloseHandles(ctx context.Context, closes []delegationClose) error {
+	return m.closeHandles(ctx, closes, nil)
+}
+
+// scopes captures the ownership actually used by this close, before any RPC.
+// Deferred cleanup runs after releaseFlight ends and must not touch a successor.
+func (m *delegationManager) closeHandles(ctx context.Context, closes []delegationClose, scopes *[]delegationCloseScope) error {
+	if len(closes) == 0 || len(closes) > authorityrpc.MaxCloseBatch {
+		return errors.New("fusev3: invalid close batch size")
+	}
+	m.epoch.RLock()
+	buf := m.buf
+	epochSerial := m.epochSerial
+	epochCtx := m.epochCtx
+	incarnation := m.incarnation()
+	groupsByID := make(map[writeback.Identity]*delegationReleaseGroup)
+	current := make([]delegationClose, 0, len(closes))
+	requests := make([]*authoritypb.CloseRequest, 0, len(closes))
+	seen := make(map[string]struct{}, len(closes))
+	var snapshotErr error
+	for _, pending := range closes {
+		if pending.epoch != 0 && pending.epoch != m.epochSerial {
+			continue
+		}
+		id, err := delegationIdentity(pending.identity)
+		if err != nil {
+			snapshotErr = err
+			break
+		}
+		g := groupsByID[id]
+		if g == nil {
+			state := m.retainState(id, true)
+			defer m.releaseState(state)
+			g = &delegationReleaseGroup{state: state, closing: make(map[string]struct{})}
+			groupsByID[id] = g
+		}
+		key := string(pending.handle)
+		if len(pending.handle) != 16 {
+			snapshotErr = errors.New("fusev3: invalid close handle")
+			break
+		}
+		if _, duplicate := seen[key]; duplicate {
+			snapshotErr = errors.New("fusev3: duplicate close handle")
+			break
+		}
+		seen[key] = struct{}{}
+		g.closing[key] = struct{}{}
+		current = append(current, pending)
+		requests = append(requests, &authoritypb.CloseRequest{Handle: pending.handle, LockOwner: pending.lockOwner, FlockUnlock: pending.flockUnlock})
+	}
+	m.epoch.RUnlock()
+	if snapshotErr != nil {
+		return snapshotErr
+	}
+	if len(current) == 0 {
+		return nil
+	}
+	callCtx, cancel := context.WithCancel(ctx)
+	stopEpochCancel := context.AfterFunc(epochCtx, cancel)
+	defer func() {
+		stopEpochCancel()
+		cancel()
+	}()
+	groups := make([]*delegationReleaseGroup, 0, len(groupsByID))
+	for _, g := range groupsByID {
+		groups = append(groups, g)
+	}
+	batch, err := m.prepareReleaseBatch(callCtx, buf, epochSerial, incarnation, groups)
+	if err != nil {
+		if !m.epochCurrent(epochSerial, buf) {
+			return writeback.ErrLost
+		}
+		return err
+	}
+	if scopes != nil {
+		for _, group := range groups {
+			if group.ref != nil {
+				*scopes = append(*scopes, delegationCloseScope{identity: group.state.identity, ref: group.ref, epoch: epochSerial, buffer: buf})
+			}
+		}
+	}
+	defer batch.finish()
+	if err := batch.applyAndRelease(callCtx); err != nil {
+		return err
+	}
+	if capable, ok := m.rpc.(interface{ SupportsBatchedClose() bool }); !ok || !capable.SupportsBatchedClose() {
+		return m.closeSerial(callCtx, epochSerial, buf, current, requests, groupsByID)
+	}
+	response, err := m.rpc.CallMutation(callCtx, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: &authoritypb.CloseBatchRequest{Closes: requests}}})
+	if err == nil {
+		err = successfulDelegationResponse(response)
+	}
+	if !m.epochCurrent(epochSerial, buf) {
+		return writeback.ErrLost
+	}
+	if err != nil {
+		if response != nil && response.GetFailure() == authoritypb.FailureClass_FAILURE_CLASS_COHERENCE {
+			return delegationCleanupError{cause: err, failure: response.GetFailure()}
+		}
+		return m.unknownCloseOutcome(err)
+	}
+	results := response.GetCloseBatch().GetResults()
+	if len(results) != len(current) {
+		return m.unknownCloseOutcome(errors.New("fusev3: close batch omitted ordered outcomes"))
+	}
+	for _, result := range results {
+		if result == nil || result.Errno < 0 || result.Errno > 4095 || result.Errno == 0 && result.Failure != 0 {
+			return m.unknownCloseOutcome(errors.New("fusev3: malformed close outcome"))
+		}
+		if _, ok := authoritypb.FailureClass_name[int32(result.Failure)]; !ok {
+			return m.unknownCloseOutcome(errors.New("fusev3: unknown close failure class"))
+		}
+	}
+	var firstErr error
+	var firstFailure authoritypb.FailureClass
+	for i, result := range results {
+		errno := responseErrno(&authoritypb.Response{Errno: result.GetErrno(), Failure: result.GetFailure()})
+		if result == nil {
+			errno = syscall.EIO
+		}
+		if errno != 0 {
+			if firstErr == nil {
+				firstErr = errno
+				firstFailure = result.GetFailure()
+			}
+			if !result.GetRetired() {
+				continue
+			}
+		}
+		id, _ := delegationIdentity(current[i].identity)
+		s := groupsByID[id].state
+		s.admission.Lock()
+		delete(s.handles, string(current[i].handle))
+		delete(s.writers, string(current[i].handle))
+		s.admission.Unlock()
+	}
+	if firstErr != nil {
+		return delegationCleanupError{cause: firstErr, failure: firstFailure}
+	}
+	return nil
+}
+
+// EpochChanged permanently withdraws all old grants, records loss only for
+// identities with retained non-durable entries, and replaces the epoch-scoped
+// Buffer while preserving the mount loss counter.
+func (m *delegationManager) EpochChanged(reason string) {
+	// A capacity waiter holds an epoch reader until admission ends. Close and
+	// wake admission before waiting for the writer; joining the flusher here
+	// could instead wait on the same frontend locks. Concurrent epoch changes
+	// must fence the successor buffer before replacing it as well.
+	var old *writeback.Buffer
+	for {
+		m.epoch.RLock()
+		old = m.buf
+		old.FenceAdmissions()
+		m.epochEnd()
+		m.epoch.RUnlock()
+		m.epoch.Lock()
+		if m.buf == old {
+			break
+		}
+		m.epoch.Unlock()
+	}
+	defer m.epoch.Unlock()
+	m.epochSerial++
+	for {
+		select {
+		case <-m.closeQueue:
+			m.changePendingCloses(-1)
+			continue
+		default:
+		}
+		break
+	}
+	m.durabilityMu.Lock()
+	durable := m.durableHigh
+	m.durabilityMu.Unlock()
+	m.mu.Lock()
+	for _, s := range m.byID {
+		s.meta.Lock()
+		atRisk := s.dirty && (s.appliedCut < s.acceptedCut || s.applied == 0 || s.applied > durable)
+		if atRisk {
+			m.reportDrop(old.Drop(s.identity, reason))
+		}
+		if loss := max(m.identityLoss[s.identity], old.IdentityLoss(s.identity)); loss != 0 && m.observers[s.identity] != 0 {
+			m.identityLoss[s.identity] = loss
+		}
+		s.meta.Unlock()
+		s.admission.Lock()
+		s.ref = nil
+		s.mode = authoritypb.DelegationMode_DELEGATION_MODE_UNSPECIFIED
+		s.admission.Unlock()
+		s.meta.Lock()
+		s.dirty = false
+		s.meta.Unlock()
+	}
+	loss := old.LossSequence()
+	m.byID = make(map[writeback.Identity]*delegationState)
+	m.stateIndex.Clear()
+	m.reclaim = make(map[*delegationState]struct{})
+	m.retainedStates = make(map[*delegationState]struct{})
+	m.mu.Unlock()
+	old.Stop()
+	// An in-flight old-buffer callback may have looked up its state after the
+	// first reset while Stop was joining it. Discard that epoch-scoped residue
+	// only after every old callback is gone.
+	m.mu.Lock()
+	m.byID = make(map[writeback.Identity]*delegationState)
+	m.stateIndex.Clear()
+	m.reclaim = make(map[*delegationState]struct{})
+	m.retainedStates = make(map[*delegationState]struct{})
+	m.mu.Unlock()
+	m.tokenMu.Lock()
+	m.tokens = make(map[uint64]delegationFlushProgress)
+	m.tokenMu.Unlock()
+	b, err := writeback.New(m, writeback.Options{InitialLossSequence: loss})
+	if err != nil {
+		panic(fmt.Sprintf("fusev3: replace epoch write buffer: %v", err))
+	}
+	m.mu.Lock()
+	m.buf = b
+	m.epochCtx, m.epochEnd = context.WithCancel(m.ctx)
+	m.durabilityMu.Lock()
+	m.durableBuffer = b
+	m.appliedHigh, m.durableHigh = 0, 0
+	m.durabilityMu.Unlock()
+	m.mu.Unlock()
+}
+
+func (m *delegationManager) epochCurrent(serial uint64, buf *writeback.Buffer) bool {
+	m.epoch.RLock()
+	defer m.epoch.RUnlock()
+	return m.epochSerial == serial && m.buf == buf
+}
+
+func (m *delegationManager) Stop() {
+	m.cancel()
+	m.controlWG.Wait()
+	m.workerWG.Wait()
+	m.epoch.Lock()
+	m.buf.Stop()
+	m.epoch.Unlock()
+}
+
+// FlushCycleCompleted runs outside the buffer's admission and flush locks.
+// An invalidation failure is a coherence loss, never a retriable WRITE error.
+func (m *delegationManager) FlushCycleCompleted(ctx context.Context, id writeback.Identity) {
+	m.hookMu.RLock()
+	invalidate := m.flushCycleInvalidator
+	m.hookMu.RUnlock()
+	if invalidate == nil {
+		return
+	}
+	state := m.retainState(id, false)
+	defer m.releaseState(state)
+	var ref *authoritypb.DelegationRef
+	if state != nil {
+		state.admission.RLock()
+		ref = cloneDelegationRef(state.ref)
+		state.admission.RUnlock()
+	}
+	ctx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	if err := invalidate(ctx, id[:]); err != nil && ref != nil {
+		m.loseDelegationIfCurrent(state, ref, "holder flush-cycle invalidation failed")
+	}
+}

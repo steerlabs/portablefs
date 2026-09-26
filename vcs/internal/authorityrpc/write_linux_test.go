@@ -369,7 +369,7 @@ func TestWriteResolvesAppendPlacementAtTheAuthority(t *testing.T) {
 			request := stockWriteTestRequest(1, 0, 1, handle, []byte("data"), 0, 0)
 			mutate(request.GetWrite())
 			response := h.handleWrite(t.Context(), request, credential, request.GetWrite())
-			if response.GetWrite().GetError() != -int32(syscall.EINVAL) {
+			if response.GetErrno() != int32(syscall.EINVAL) || response.GetAppliedSequence() != 0 {
 				t.Fatalf("contradictory write request = %+v, want EINVAL", response)
 			}
 			if direct, _ := target.directSnapshot(); direct != 0 {

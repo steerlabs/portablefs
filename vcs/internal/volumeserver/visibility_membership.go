@@ -8,11 +8,21 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
-const visibilityMembershipHeader = "PFS-VISIBILITY-1"
+const visibilityMembershipHeader = "PFS-VISIBILITY-2"
+
+// Unknown legacy mounts retain the unbounded Mac fencing requirement.
+type MountMembershipProfile string
+
+const (
+	MembershipCompatibility MountMembershipProfile = "compatibility"
+	MembershipLinuxV7       MountMembershipProfile = "linux-v7"
+	MembershipCacheless     MountMembershipProfile = "cacheless"
+)
 
 // FileVisibilityMembership is the small durable control-plane record that
 // survives authority-process loss. It is bound to one volume and contains only
@@ -20,15 +30,18 @@ const visibilityMembershipHeader = "PFS-VISIBILITY-1"
 // prove old hosts/mounts fenced before it asks OpenFileVisibilityMembership to
 // clear old records.
 type FileVisibilityMembership struct {
-	mu           sync.Mutex
-	path         string
-	volumeID     string
-	lockFile     *os.File
-	active       map[SessionID]struct{}
-	cleared      []SessionID
-	quiesceNonce string
-	quiesceProof func() error
-	proofWritten bool
+	mu                 sync.Mutex
+	path               string
+	volumeID           string
+	lockFile           *os.File
+	active             map[SessionID]struct{}
+	profiles           map[SessionID]MountMembershipProfile
+	priorCompatibility PriorEpochDisposition
+	priorLinux         bool
+	cleared            []SessionID
+	quiesceNonce       string
+	quiesceProof       func() error
+	proofWritten       bool
 }
 
 // visibilityMembershipAuditSuffix names the append-only record of operator
@@ -58,7 +71,7 @@ func OpenFileVisibilityMembership(path, volumeID string, priorFenced bool) (*Fil
 	if err != nil {
 		return nil, PriorEpochUnproven, err
 	}
-	m := &FileVisibilityMembership{path: path, volumeID: volumeID, lockFile: lockFile, active: make(map[SessionID]struct{})}
+	m := &FileVisibilityMembership{path: path, volumeID: volumeID, lockFile: lockFile, active: make(map[SessionID]struct{}), profiles: make(map[SessionID]MountMembershipProfile)}
 	closeOnError := func(err error) (*FileVisibilityMembership, PriorEpochDisposition, error) {
 		_ = m.Close()
 		return nil, PriorEpochUnproven, err
@@ -72,6 +85,7 @@ func OpenFileVisibilityMembership(path, volumeID string, priorFenced bool) (*Fil
 			return closeOnError(err)
 		}
 		m.active = make(map[SessionID]struct{})
+		m.profiles = make(map[SessionID]MountMembershipProfile)
 		if err := m.persistLocked(); err != nil {
 			return closeOnError(err)
 		}
@@ -80,6 +94,16 @@ func OpenFileVisibilityMembership(path, volumeID string, priorFenced bool) (*Fil
 	disposition := PriorEpochStrictMountsFenced
 	if len(m.active) != 0 {
 		disposition = PriorEpochUnproven
+	}
+	m.priorCompatibility = PriorEpochStrictMountsFenced
+	for id := range m.active {
+		switch m.profiles[id] {
+		case MembershipLinuxV7:
+			m.priorLinux = true
+		case MembershipCacheless:
+		default:
+			m.priorCompatibility = PriorEpochUnproven
+		}
 	}
 	return m, disposition, nil
 }
@@ -125,7 +149,20 @@ func sortedSessionIDs(set map[SessionID]struct{}) []SessionID {
 	return ids
 }
 
+// PriorCacheState separates bounded v7 cache horizons from unrevocable Mac
+// caches. Neither result clears the durable topology or archive obligation.
+func (m *FileVisibilityMembership) PriorCacheState() (PriorEpochDisposition, bool) {
+	return m.priorCompatibility, m.priorLinux
+}
+
 func (m *FileVisibilityMembership) Activate(id SessionID) error {
+	return m.ActivateProfile(id, MembershipCompatibility)
+}
+
+func (m *FileVisibilityMembership) ActivateProfile(id SessionID, profile MountMembershipProfile) error {
+	if profile != MembershipCompatibility && profile != MembershipLinuxV7 && profile != MembershipCacheless {
+		return errors.New("volumeserver: invalid membership profile")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.lockFile == nil {
@@ -135,11 +172,16 @@ func (m *FileVisibilityMembership) Activate(id SessionID) error {
 		return ErrQuiescing
 	}
 	if _, exists := m.active[id]; exists {
+		if m.profiles[id] != profile {
+			return errors.New("volumeserver: membership profile cannot change for a live session")
+		}
 		return nil
 	}
 	m.active[id] = struct{}{}
+	m.profiles[id] = profile
 	if err := m.persistLocked(); err != nil {
 		delete(m.active, id)
+		delete(m.profiles, id)
 		return err
 	}
 	return nil
@@ -154,9 +196,12 @@ func (m *FileVisibilityMembership) Deactivate(id SessionID) error {
 	if _, exists := m.active[id]; !exists {
 		return nil
 	}
+	profile := m.profiles[id]
 	delete(m.active, id)
+	delete(m.profiles, id)
 	if err := m.persistLocked(); err != nil {
 		m.active[id] = struct{}{}
+		m.profiles[id] = profile
 		return err
 	}
 	if len(m.active) == 0 && m.quiesceNonce != "" && !m.proofWritten {
@@ -222,14 +267,30 @@ func (m *FileVisibilityMembership) load() error {
 		return errors.New("volumeserver: visibility membership must be a private regular file")
 	}
 	scanner := bufio.NewScanner(file)
-	if !scanner.Scan() || scanner.Text() != visibilityMembershipHeader {
+	if !scanner.Scan() {
+		return errors.New("volumeserver: missing visibility membership header")
+	}
+	legacy := scanner.Text() == "PFS-VISIBILITY-1"
+	if !legacy && scanner.Text() != visibilityMembershipHeader {
 		return errors.New("volumeserver: invalid visibility membership header")
 	}
 	if !scanner.Scan() || scanner.Text() != hex.EncodeToString([]byte(m.volumeID)) {
 		return errors.New("volumeserver: visibility membership belongs to a different volume")
 	}
 	for scanner.Scan() {
-		raw, err := hex.DecodeString(scanner.Text())
+		record := scanner.Text()
+		profile := MembershipCompatibility
+		if !legacy {
+			fields := strings.Split(record, "\t")
+			if len(fields) != 2 {
+				return errors.New("volumeserver: invalid profiled membership record")
+			}
+			record, profile = fields[0], MountMembershipProfile(fields[1])
+			if profile != MembershipCompatibility && profile != MembershipLinuxV7 && profile != MembershipCacheless {
+				return errors.New("volumeserver: unknown membership profile")
+			}
+		}
+		raw, err := hex.DecodeString(record)
 		if err != nil || len(raw) != len(SessionID{}) {
 			return errors.New("volumeserver: invalid visibility membership record")
 		}
@@ -242,6 +303,7 @@ func (m *FileVisibilityMembership) load() error {
 			return errors.New("volumeserver: duplicate visibility membership record")
 		}
 		m.active[id] = struct{}{}
+		m.profiles[id] = profile
 	}
 	if err := scanner.Err(); err != nil {
 		return err
@@ -272,7 +334,7 @@ func (m *FileVisibilityMembership) persistLocked() error {
 		return err
 	}
 	for _, id := range ids {
-		if _, err := fmt.Fprintln(writer, hex.EncodeToString(id[:])); err != nil {
+		if _, err := fmt.Fprintf(writer, "%s\t%s\n", hex.EncodeToString(id[:]), m.profiles[id]); err != nil {
 			cleanup()
 			return err
 		}

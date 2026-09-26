@@ -145,7 +145,7 @@ func TestFUSERenewalEventUpdatesSnapshotAndPerMountLog(t *testing.T) {
 			LastError:             "temporary Manager failure",
 		},
 	}
-	recordFUSERenewalEvent(events, dir, st.MountPath, st.MountEnrollmentID, event)
+	recordFUSERenewalEvent(events, dir, st.MountPath, st.MountEnrollmentID, event, nil)
 	got, err := readMountState(dir, st.MountPath)
 	if err != nil || got == nil {
 		t.Fatalf("read renewed mount state: %+v, %v", got, err)

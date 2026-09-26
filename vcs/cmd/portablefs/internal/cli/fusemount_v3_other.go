@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/steerlabs/portablefs/vcs/internal/mountlog"
 )
 
 // The v3 FUSE engine mounts through vcs/internal/fusev3, which exists only on
@@ -33,11 +35,12 @@ type fuseV3Mount struct {
 	backing string
 }
 
-func (m *fuseV3Mount) Unmount() error                          { return fmt.Errorf("the v3 FUSE engine requires Linux") }
-func (m *fuseV3Mount) Wait()                                   {}
-func (m *fuseV3Mount) Close() error                            { return fmt.Errorf("the v3 FUSE engine requires Linux") }
-func (m *fuseV3Mount) AuthorizationSessionID() string          { return "" }
-func (m *fuseV3Mount) InitialAuthorizationDeadline() time.Time { return time.Time{} }
+func (m *fuseV3Mount) Unmount() error                           { return fmt.Errorf("the v3 FUSE engine requires Linux") }
+func (m *fuseV3Mount) Wait()                                    {}
+func (m *fuseV3Mount) Close() error                             { return fmt.Errorf("the v3 FUSE engine requires Linux") }
+func (m *fuseV3Mount) WritebackStats() *mountlog.WritebackStats { return nil }
+func (m *fuseV3Mount) AuthorizationSessionID() string           { return "" }
+func (m *fuseV3Mount) InitialAuthorizationDeadline() time.Time  { return time.Time{} }
 func (m *fuseV3Mount) Reauthorize(context.Context, string, uint64, []byte) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("the v3 FUSE engine requires Linux")
 }

@@ -383,7 +383,6 @@ func startServing(t *testing.T, env privilegedEnv, volumeID, volumeRoot string,
 		Store: store, Fencer: authority, Locks: authority.Locks(), Membership: membership,
 		Prior: volumeserver.PriorEpochStrictMountsFenced, ClockSkew: time.Minute,
 		MaxCachedNameCapacity: 4096, MaxRepairBudget: time.Minute,
-		CacheLeaseTTL: time.Second, MaxCacheLeasesPerSession: 4096, MaxCacheLeases: 16384,
 	})
 	if err != nil {
 		t.Fatalf("assemble authority coordination: %v", err)
