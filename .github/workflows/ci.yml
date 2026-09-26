@@ -69,6 +69,8 @@ jobs:
           persist-credentials: false
       - name: Xcode-native complete Swift suite
         run: bash scripts/test-swift-xcode.sh
+      - name: Exercise macOS installer ZIP boundary
+        run: sh scripts/test-macos-installer-zip-namespace.sh
 
   go:
     runs-on: ubuntu-24.04

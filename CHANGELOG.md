@@ -10,6 +10,11 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+### Fixed
+
+- The macOS installer accepts normal trailing slashes on signed app ZIP
+  directory entries while still rejecting repeated separators and traversal.
+
 ## [0.4.1] - 2026-09-26
 
 ### Fixed

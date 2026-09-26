@@ -177,7 +177,10 @@ the download is corrupt or has been tampered with; nothing was installed"
       PortableFS.app | PortableFS.app/ | PortableFS.app/*) ;;
       *) die "$archive contains an out-of-bundle member: $member" ;;
     esac
-    case "/$member/" in
+    # ZIP directory entries conventionally end in one slash. Strip only that
+    # terminator for component checks; a second slash remains unsafe.
+    checked_member=${member%/}
+    case "/$checked_member/" in
       *"/../"* | *"/./"* | *"//"* | *\\*)
         die "$archive contains an unsafe member name: $member"
         ;;

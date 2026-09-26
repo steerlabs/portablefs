@@ -137,6 +137,9 @@ go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.10 .github/workflows/*.ym
 if [ -f scripts/install.sh ]; then
   sh -n scripts/install.sh
 fi
+if [[ "$(uname -s)" == Darwin ]]; then
+  sh scripts/test-macos-installer-zip-namespace.sh
+fi
 if [ -f scripts/check-workflow-pins.mjs ]; then
   node scripts/check-workflow-pins.mjs .github/workflows
 fi
