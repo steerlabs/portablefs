@@ -409,6 +409,13 @@ jobs:
           export PORTABLEFS_GO="$portablefs_go"
           scripts/package-macos-app.sh "${GITHUB_REF_NAME#v}"
 
+      - name: Verify the signed app reaches the installer extraction boundary
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          sh scripts/test-macos-installer-zip-namespace.sh \
+            "dist/macos/portablefs_${version}_darwin_universal_app.zip"
+
       - name: Upload notarized app
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

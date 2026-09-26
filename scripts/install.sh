@@ -177,7 +177,10 @@ the download is corrupt or has been tampered with; nothing was installed"
       PortableFS.app | PortableFS.app/ | PortableFS.app/*) ;;
       *) die "$archive contains an out-of-bundle member: $member" ;;
     esac
-    case "/$member/" in
+    # ZIP directory entries conventionally end in one slash. Strip only that
+    # terminator for component checks; a second slash remains unsafe.
+    checked_member=${member%/}
+    case "/$checked_member/" in
       *"/../"* | *"/./"* | *"//"* | *\\*)
         die "$archive contains an unsafe member name: $member"
         ;;
@@ -377,7 +380,9 @@ the download is corrupt or has been tampered with; nothing was installed"
   service_exact_entitlements="$tmp/service-exact-entitlements.plist"
   codesign -d --entitlements :- "$source_service" >"$service_exact_entitlements" ||
     die "could not read the signed daemon service entitlements"
-  /usr/bin/plutil -remove com.apple.security.application-groups "$service_exact_entitlements" ||
+  /usr/libexec/PlistBuddy \
+    -c "Delete :com.apple.security.application-groups" \
+    "$service_exact_entitlements" ||
     die "daemon service has no exact app-group entitlement"
   service_remaining_entitlements=$(/usr/bin/plutil -convert json -o - "$service_exact_entitlements") ||
     die "could not prove exact daemon service entitlements"
