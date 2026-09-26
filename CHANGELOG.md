@@ -10,7 +10,20 @@ this file is the human-curated summary.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-26
+
+### Fixed
+
+- Use virtual time for the Linux subscription-horizon tests so CI scheduling
+  cannot consume their 1 ms test repair budget before cache invalidation starts.
+  The production withdrawal algorithm and protocol-7 wire contract are unchanged.
+- Correct the FSKit guide's protocol-7 version and Linux
+  subscription/delegation terminology.
+
 ## [0.4.0] - 2026-09-16
+
+The immutable `v0.4.0` tag failed release validation before publication. This
+section records the protocol-7 feature baseline carried into 0.4.1.
 
 ### Compatibility
 

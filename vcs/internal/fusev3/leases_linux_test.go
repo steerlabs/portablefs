@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -115,35 +116,37 @@ func TestRenewalSelectionIsFrameBounded(t *testing.T) {
 }
 
 func TestLeaseHorizonWatchdogSurvivesSharedMountCancellation(t *testing.T) {
-	// Protocol 7 has no hard-deadline mount-abort watchdog. Its stronger
-	// replacement is the subscription horizon worker, which retains its own
-	// progress while the CONTROL poll is parked and withdraws every cache before
-	// returning the incarnation for cold recovery.
-	now := time.Now()
-	rpc := &subscriptionTestRPC{horizon: now.Add(time.Minute)}
-	invalidator := &subscriptionTestInvalidator{}
-	registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{
-		clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: time.Millisecond,
-		maxPages: 2, invalidator: invalidator,
-	})
-	registry.mu.Lock()
-	registry.active, registry.incarnation = true, 141
-	registry.horizon = now.Add(30 * time.Millisecond)
-	registry.cacheUntil = now.Add(15 * time.Millisecond)
-	registry.mu.Unlock()
+	synctest.Test(t, func(t *testing.T) {
+		// Protocol 7 has no hard-deadline mount-abort watchdog. Its stronger
+		// replacement is the subscription horizon worker, which retains its own
+		// progress while the CONTROL poll is parked and withdraws every cache before
+		// returning the incarnation for cold recovery.
+		now := time.Now()
+		rpc := &subscriptionTestRPC{horizon: now.Add(time.Minute)}
+		invalidator := &subscriptionTestInvalidator{}
+		registry := newSubscriptionRegistryWithConfig(nil, rpc, nil, subscriptionConfig{
+			clock: wallSubscriptionClock{}, retryDelay: time.Millisecond, repairLead: time.Millisecond,
+			maxPages: 2, invalidator: invalidator,
+		})
+		registry.mu.Lock()
+		registry.active, registry.incarnation = true, 141
+		registry.horizon = now.Add(30 * time.Millisecond)
+		registry.cacheUntil = now.Add(15 * time.Millisecond)
+		registry.mu.Unlock()
 
-	if err := registry.serveIncarnation(context.Background()); !errors.Is(err, errSubscriptionExpired) {
-		t.Fatalf("serve at subscription horizon = %v, want expiration", err)
-	}
-	invalidator.mu.Lock()
-	invalidations := invalidator.all
-	invalidator.mu.Unlock()
-	if invalidations != 1 {
-		t.Fatalf("full cache withdrawals = %d, want 1", invalidations)
-	}
-	if stamp := registry.stamp(); stamp != (subscriptionStamp{}) {
-		t.Fatalf("horizon worker left cache admission active: %+v", stamp)
-	}
+		if err := registry.serveIncarnation(context.Background()); !errors.Is(err, errSubscriptionExpired) {
+			t.Fatalf("serve at subscription horizon = %v, want expiration", err)
+		}
+		invalidator.mu.Lock()
+		invalidations := invalidator.all
+		invalidator.mu.Unlock()
+		if invalidations != 1 {
+			t.Fatalf("full cache withdrawals = %d, want 1", invalidations)
+		}
+		if stamp := registry.stamp(); stamp != (subscriptionStamp{}) {
+			t.Fatalf("horizon worker left cache admission active: %+v", stamp)
+		}
+	})
 }
 
 func TestLeaseCompleteValidatesExactPostStateBeforeDischarge(t *testing.T) {

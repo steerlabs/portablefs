@@ -47,11 +47,11 @@ leaves draft they are frozen.
 
 ### Frozen-surface release map
 
-Release 0.4.0 is the protocol-7 reset of 0.3.0's protocol 6. The release
+Release 0.4.1 is the protocol-7 reset of 0.3.0's protocol 6. The release
 version, product generation v3, authority major, and local protocol version
 are separate identities. No mixed-major volume deployment is supported.
 
-| Frozen surface | Protocol 7 / release 0.4.0 | Retired protocol 6 surface |
+| Frozen surface | Protocol 7 / release 0.4.1 | Retired protocol 6 surface |
 | --- | --- | --- |
 | Authority TLS / Hello | Exact `portablefs-authority-v7` / major `7` | `portablefs-authority-v6` / major `6`, refused at handshake |
 | Linux cache authority | Volume subscription, ordered changes, file write delegation; exact feature sets in [wire.md](docs/coherence-v2/wire.md#required-features) | N/A/D/E lease families; `lease-coherence-v1`, `directory-enumeration-lease-v1`, `lease-renewal-v1`, `lease-recall-v1`, `open-by-identity-v1`, and unconditional Linux `write-through` |
