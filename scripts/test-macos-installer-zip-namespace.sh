@@ -1,5 +1,5 @@
 #!/bin/sh
-# Drive the real installer through checksum and ZIP inspection without extraction.
+# Drive the real installer through signed-package checks without installation.
 set -eu
 
 [ "$(uname -s)" = Darwin ] || { echo "macOS ZIP namespace test requires Darwin" >&2; exit 2; }
@@ -34,6 +34,14 @@ touch "$PFS_TEST_EXTRACT_MARKER"
 exit 77
 SH
 chmod +x "$work/shims/curl" "$work/shims/ditto"
+mkdir "$work/preinstall-shims"
+cp "$work/shims/curl" "$work/preinstall-shims/curl"
+cat >"$work/preinstall-shims/plutil" <<'SH'
+#!/bin/sh
+touch "$PFS_TEST_PREINSTALL_MARKER"
+exit 79
+SH
+chmod +x "$work/preinstall-shims/plutil"
 
 run_case() {
   name=$1
@@ -86,16 +94,17 @@ if [ "$#" -gt 0 ]; then
     echo "signed archive and sidecar are required for the optional public-asset check" >&2
     exit 2
   }
-  marker="$work/public-extraction-attempted"
+  marker="$work/public-preinstall-reached"
   output="$work/public.log"
   status=0
-  PFS_TEST_ARCHIVE="$archive" PFS_TEST_EXTRACT_MARKER="$marker" \
-    PORTABLEFS_VERSION="v$version" PATH="$work/shims:$PATH" \
+  PFS_TEST_ARCHIVE="$archive" PFS_TEST_PREINSTALL_MARKER="$marker" \
+    PORTABLEFS_VERSION="v$version" PATH="$work/preinstall-shims:$PATH" \
     sh "$repo_root/scripts/install.sh" >"$output" 2>&1 || status=$?
-  [ "$status" -ne 0 ] && [ -f "$marker" ] || {
-    echo "public signed archive did not reach extraction boundary" >&2
+  [ "$status" -ne 0 ] && [ -f "$marker" ] && \
+    grep -F 'could not decode the CLI app-group identity' "$output" >/dev/null || {
+    echo "public signed archive did not reach the pre-install identity boundary" >&2
     cat "$output" >&2
     exit 1
   }
-  printf '%s\n' 'public_signed_archive: PASS'
+  printf '%s\n' 'public_signed_preinstall: PASS'
 fi

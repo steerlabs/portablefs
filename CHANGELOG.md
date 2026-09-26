@@ -14,6 +14,8 @@ this file is the human-curated summary.
 
 - The macOS installer accepts normal trailing slashes on signed app ZIP
   directory entries while still rejecting repeated separators and traversal.
+  It also reads the daemon service's dotted app-group entitlement key literally
+  before checking that no extra entitlement remains.
 
 ## [0.4.1] - 2026-09-26
 
