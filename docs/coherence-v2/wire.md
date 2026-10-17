@@ -578,12 +578,56 @@ volume root. Any error from that sync is an uncertain EIO with
 FAILURE_CLASS_STORAGE and fences the epoch. Visibility publication may precede
 durability; the reply may not.
 
+## FSKit versioned metadata
+
+`fskit-versioned-metadata-v1` is offered by an FSKit client in Hello, echoed
+in the Hello reply, and confirmed in Activate. It joins no frozen required set.
+A current Mac client requires it, together with `batched-close-v1`, and
+refuses an authority that does not confirm both.
+
+Under the feature, every FSKit read stamp is in the committed storage
+sequence that also numbers PostState: `Item.object_version` and
+`snapshot_sequence` on Lookup and create replies, `GetAttrReply`, every
+`Dirent`, and `LookupReply.negative_snapshot_sequence`. The authority samples
+existence, attributes, the object's actual last-change version `v`, and the
+snapshot `s` under one storage read dependency set, so `0 < v <= s` and a
+negative observation has `s > 0`. The FSKit repair-barrier counter remains a
+separate ordering domain and is never exposed as a storage snapshot.
+
+Hydration in restore mode preserves an inode's current logical mtime across
+every installed chunk, including after a user write or an explicit timestamp
+change, and every attribute sample honours the hydration lock. Allocation
+(`Attr.blocks`) and restore-mode ctime remain observational.
+
+A successful KeepAlive reply to a negotiated session carries
+`Response.session_valid_for_nanos` (tag 72): the remaining duration, sampled
+after renewal under the session admission lock and rounded down, of
+`min(lease remaining, authorization remaining, advertised lease, MaxCacheProof)`.
+`MaxCacheProof` is a frozen 60 seconds. A terminal session receives no
+positive value, and no other reply or non-negotiated session carries the
+field. The client anchors the duration at the KeepAlive's local start on a
+clock that advances across sleep and serves cached metadata only until
+`t0 + R - (1 s + ceil(R / 1000))`; it rejects a value above the advertised
+lease or `MaxCacheProof` as a protocol defect.
+
+The authority registers each proof before its reply can escape and retains
+the session's compatibility-writer exclusion until the latest granted proof
+has expired, even if the session is fenced earlier. An ordinary request that
+renews a longer session lease grants no cache permission. The exclusion is
+released at that deadline only after every admitted storage application of
+the old session has drained; an exact clean detach releases it at once.
+After a restart that finds unproven compatibility membership, foreign visible
+mutations and write-intent opens are refused for `MaxCacheProof + 1.06 s`
+after safe takeover of the store, measured on a clock that includes suspend.
+Mac activation against that membership still requires operator reconciliation.
+
 ## Batched descriptor close
 
 Linux Activate optionally advertises `batched-close-v1`; absent advertisement
-selects individual CLOSE requests. The required feature set is unchanged. DATA carries
-`Request.close_batch` (tag 74) and `Response.close_batch` (tag 68); FSKit and
-CACHELESS_READER retain ordinary CLOSE. A request contains 1–128 distinct
+selects individual CLOSE requests. FSKit Activate advertises it as well, and a
+current Mac client requires it. The required feature sets are unchanged. DATA
+carries `Request.close_batch` (tag 74) and `Response.close_batch` (tag 68);
+CACHELESS_READER retains ordinary CLOSE. A request contains 1–128 distinct
 16-byte handle capabilities with each handle's lock owner and flock-unlock
 flag. The entire shape is validated before any close. The frame grammar bounds
 both request and reply lists to 128 before protobuf allocation.

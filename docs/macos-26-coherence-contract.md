@@ -61,6 +61,15 @@ new authority state. Only one macOS 26 compatibility writer can attach at a
 time; a second is refused with `EBUSY` before durable membership or runtime
 activation. This explicit handoff is the intended macOS 26 operating envelope.
 
+If the Mac's session ends without that clean unmount, the authority keeps
+refusing Linux visible mutations until every metadata-cache proof it granted
+the session has expired (at most 60 seconds) and the session's admitted
+storage work has drained; then Linux can write. After an authority restart
+that finds an unproven Mac mount, Linux writes wait 61.06 seconds after safe
+takeover of the store. In both cases a new Mac still needs the existing
+operator reconciliation. None of this withdraws state the old Mac's kernel
+may still hold; it bounds only what its daemon may serve.
+
 ## The macOS 26 limit
 
 FSKit 26 has no documented module-initiated namespace or inode-attribute cache
@@ -104,6 +113,10 @@ protocol bookkeeping:
   ABORT share one lifetime);
 - every applied mutation is durable on authority storage before its reply,
   because FSKit delivers no fsync callback that could carry durability later;
+- the daemon answers metadata from its cache only under the writer
+  exclusion, in authority storage-sequence order, and only within the
+  KeepAlive proof window; that is daemon state, not FSKit kernel
+  invalidation;
 - a terminal authority response cannot be acknowledged before the local reply
   boundary it represents;
 - a definite pre-apply rejection publishes no mutation, while an assigned or

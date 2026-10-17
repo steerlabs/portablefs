@@ -109,14 +109,23 @@ establish these prerequisites before launching the mount.
   exclusion for every attached Mac mount. A feature advertisement cannot
   manufacture a callback the frontend does not expose.
 
-  Two optional FSKit features are additive. `fskit-direct-write-v1` (Hello)
+  Three optional FSKit features are additive. `fskit-direct-write-v1` (Hello)
   admits the ordinary one-frame `WRITE` body for FSKit sessions, limited to
   positioned writes without append, sync intent, delegation, flush sequence, or
   lock owner. `fskit-durable-mutations-v1` (Activate) states that every
   successful FSKit mutation reply, fragmented COMMIT included, is durable on
-  authority storage before it is sent or retained for replay. Current Mac clients
-  require both and refuse an older authority at the handshake; older Mac
-  clients keep using the fragmented bodies, which the authority still serves. The additive
+  authority storage before it is sent or retained for replay.
+  `fskit-versioned-metadata-v1` (offered in Hello by both peers, confirmed in
+  Activate) states that FSKit read replies carry coherent storage-sequence
+  stamps, that hydration never changes logical mtime, that the authority
+  retains compatibility-writer exclusion for every cache proof it granted, and
+  that a successful KeepAlive carries `Response.session_valid_for_nanos`. Every
+  such proof is capped at the frozen `MaxCacheProof` of 60 seconds; the cap is
+  part of the feature's meaning and is not configurable. `batched-close-v1` is
+  also admitted for FSKit sessions. Current Mac clients require all four and
+  refuse an older authority at the handshake; older Mac clients keep using the
+  fragmented bodies and individual CLOSE, which the authority still serves, and
+  never receive the new response field. The additive
   `CACHELESS_READER` profile requires `cacheless-peer-reader-v1`, exactly read
   access, no cache permission and no repair participation. Gateway reads break
   delegated data for read without excluding Linux writers.
@@ -210,7 +219,8 @@ frontend profile. It is selected before Attach, pinned into the canonical
 session fingerprint, and cannot change on replay or resume. The authority does
 not issue N/A/D/E grants to it; it retains the FSKit PREPARE/COMPLETE,
 source-publication, and fragmented-write bodies, plus the ordinary one-frame
-write under `fskit-direct-write-v1`, behind a strict profile allowlist. Linux
+write under `fskit-direct-write-v1` and `CLOSE_BATCH` under `batched-close-v1`,
+behind a strict profile allowlist. Linux
 sessions cannot invoke the FSKit-specific bodies, and FSKit sessions cannot
 invoke Linux subscription/delegation control. This is a declared platform contract, not probing,
 fallback to an older protocol major, or local-filesystem substitution.
@@ -251,6 +261,9 @@ macOS 27 `FSVolume.Handler` adds most source result attributes, but current
 FSKit still has no documented exact namespace or inode-attribute invalidation
 API for peer changes; its data-cache handler covers only retained item data. A
 TTL change, polling loop, or hidden retry cannot manufacture those primitives.
+The daemon's metadata cache does not claim them either: it answers only from
+versioned authority state its own session received, and only while the
+authority's KeepAlive proof says this Mac still holds the writer exclusion.
 See
 [docs/macos-26-coherence-contract.md](./docs/macos-26-coherence-contract.md) and
 [docs/macos-27-native-coherence.md](./docs/macos-27-native-coherence.md).

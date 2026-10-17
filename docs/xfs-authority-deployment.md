@@ -298,6 +298,16 @@ with an unknown prior lease. Do not shorten or bypass this grace merely because 
 old authority process is gone. Fencing a host can make the old cache unservable,
 but it does not rewrite the configured lease bound.
 
+A Mac mount that did not end with a clean unmount leaves unproven
+compatibility membership. The restarted authority then refuses Linux visible
+mutations and write-intent opens for 61.06 seconds after it has exclusively
+taken over the volume root and membership file: the frozen 60-second maximum
+metadata-cache proof plus its clock margin, measured on `CLOCK_BOOTTIME`.
+Linux reads continue during that window. The wait restarts with every
+authority restart and is not shortened by configuration. Mac activation still
+requires the operator reconciliation described below; the timer never clears
+that membership.
+
 ### Service hardening
 
 The service manager should additionally provide a read-only root filesystem,
