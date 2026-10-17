@@ -33,6 +33,11 @@ type fakeV3DataClient struct {
 	sequence       uint64
 	readCalls      int
 	keepErr        error
+	proof          time.Duration // KeepAlive proof; zero means min(lease, MaxCacheProof)
+	keepAlive      func(context.Context) (time.Duration, error)
+	keepAlives     int
+	authorization  time.Time
+	poisoned       atomic.Bool
 	read           func(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	beforeAssigned func(*authoritypb.Request) error
 	mutation       func(context.Context, authorityrpc.MutationIdentity, *authoritypb.Request) (*authoritypb.Response, error)
@@ -182,6 +187,40 @@ func (f *fakeV3DataClient) IOLimits() (uint32, uint32)   { return 4096, f.maxWri
 func (f *fakeV3DataClient) SessionLease() time.Duration  { return f.lease }
 func (f *fakeV3DataClient) DataPlaneOperationLimit() int { return f.limit }
 func (f *fakeV3DataClient) SupportsBatchedClose() bool   { return true }
+func (f *fakeV3DataClient) KeepAlive(ctx context.Context) (time.Duration, error) {
+	f.mu.Lock()
+	f.keepAlives++
+	keepErr, proof, hook := f.keepErr, f.proof, f.keepAlive
+	f.mu.Unlock()
+	if hook != nil {
+		return hook(ctx)
+	}
+	if keepErr != nil {
+		return 0, keepErr
+	}
+	if proof == 0 {
+		proof = min(f.lease, authorityrpc.MaxCacheProof)
+	}
+	return proof, nil
+}
+func (f *fakeV3DataClient) AuthorizationDeadline() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.authorization
+}
+func (f *fakeV3DataClient) BeginLocalPublication(force func(error)) (authorityrpc.ResponseConsumption, error) {
+	if f.poisoned.Load() {
+		return nil, authorityrpc.ErrSessionEnded
+	}
+	f.mu.Lock()
+	newConsumption := f.newConsumption
+	f.mu.Unlock()
+	if newConsumption != nil {
+		return newConsumption(force), nil
+	}
+	return &fakeV3ResponseConsumption{consume: func() {}}, nil
+}
+func (f *fakeV3DataClient) LocalAdmissionOpen() bool { return !f.poisoned.Load() }
 func (f *fakeV3DataClient) CallRead(ctx context.Context, request *authoritypb.Request) (*authoritypb.Response, error) {
 	f.mu.Lock()
 	f.readCalls++
@@ -193,11 +232,6 @@ func (f *fakeV3DataClient) CallRead(ctx context.Context, request *authoritypb.Re
 	switch request.GetBody().(type) {
 	case *authoritypb.Request_StatFs:
 		return &authoritypb.Response{Body: &authoritypb.Response_StatFs{StatFs: &authoritypb.StatFSReply{BlockSize: 4096, NameMax: 255}}}, nil
-	case *authoritypb.Request_KeepAlive:
-		if f.keepErr != nil {
-			return nil, f.keepErr
-		}
-		return &authoritypb.Response{}, nil
 	case *authoritypb.Request_GetAttr:
 		if bytes.Equal(request.GetGetAttr().GetItem(), f.root.GetToken()) {
 			return &authoritypb.Response{Body: &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{Attr: proto.Clone(f.root.GetAttr()).(*authoritypb.Attr)}}}, nil
@@ -1742,9 +1776,10 @@ func TestV3KeepAliveIntervalAndFailureAreTerminal(t *testing.T) {
 	if got := v3KeepAliveInterval(time.Minute, 12*time.Second); got != 4*time.Second {
 		t.Fatalf("repair interval=%s", got)
 	}
+	if got := v3KeepAliveInterval(10*time.Minute, 10*time.Minute); got != authorityrpc.MaxCacheProof/3 {
+		t.Fatalf("large lease and budget interval=%s, want MaxCacheProof/3", got)
+	}
 	client := newFakeV3DataClient()
-	client.lease = 6 * time.Millisecond
-	client.budget = 6 * time.Millisecond
 	client.keepErr = errors.New("fenced")
 	d := testV3DataPlane(t, client)
 	select {

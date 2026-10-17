@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -159,6 +160,7 @@ type v3TestAuthority struct {
 	omitDirectWrite              bool
 	omitDurableMutations         bool
 	omitBatchedClose             bool
+	omitVersionedMetadata        bool
 	initialAuthorizationDeadline int64
 	renewedAuthorizationDeadline int64
 
@@ -254,6 +256,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
 		}
+		if !h.omitVersionedMetadata && slices.Contains(req.GetHello().GetFeatures(), "fskit-versioned-metadata-v1") {
+			features = append(features, "fskit-versioned-metadata-v1")
+		}
 		response.Body = &authoritypb.Response_Hello{Hello: &authoritypb.HelloReply{
 			ProtocolMajor: authorityrpc.ProtocolMajor, Features: features,
 			Role: req.GetHello().GetRole(), ConnectionSetId: append([]byte(nil), req.GetHello().GetConnectionSetId()...),
@@ -282,6 +287,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		}
 		if !h.omitBatchedClose {
 			features = append(features, "batched-close-v1")
+		}
+		if !h.omitVersionedMetadata {
+			features = append(features, "fskit-versioned-metadata-v1")
 		}
 		if h.mountEnrollment {
 			features = append(features, "session-reauthorization-v1", "mount-enrollment-reauthorization-v1")
@@ -315,6 +323,9 @@ func (h *v3TestAuthority) Handle(ctx context.Context, req *authoritypb.Request) 
 		h.mu.Lock()
 		response.Errno = h.keepAliveErrno
 		h.mu.Unlock()
+		if response.Errno == 0 {
+			response.SessionValidForNanos = uint64(min(time.Duration(h.leaseMillis)*time.Millisecond, authorityrpc.MaxCacheProof))
+		}
 	case *authoritypb.Request_StatFs:
 		h.mu.Lock()
 		h.statfsCalls++
@@ -810,6 +821,7 @@ func TestV3AttachRefusesAnAuthorityWithoutARequiredFSKitContract(t *testing.T) {
 		{name: "no-direct-write", mutate: func(h *v3TestAuthority) { h.omitDirectWrite = true }},
 		{name: "no-durable-mutations", mutate: func(h *v3TestAuthority) { h.omitDurableMutations = true }},
 		{name: "no-batched-close", mutate: func(h *v3TestAuthority) { h.omitBatchedClose = true }},
+		{name: "no-versioned-metadata", mutate: func(h *v3TestAuthority) { h.omitVersionedMetadata = true }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pki := newV3TestPKI(t)

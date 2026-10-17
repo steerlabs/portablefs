@@ -58,6 +58,15 @@ type v3DataPlaneClient interface {
 	SessionLease() time.Duration
 	DataPlaneOperationLimit() int
 	SupportsBatchedClose() bool
+	// KeepAlive renews the session and returns its validated relative cache
+	// proof (see authorityrpc.Client.KeepAlive).
+	KeepAlive(context.Context) (time.Duration, error)
+	// AuthorizationDeadline is the currently installed signed deadline.
+	AuthorizationDeadline() time.Time
+	// BeginLocalPublication and LocalAdmissionOpen are the client's immediate
+	// admission boundary for replies served from daemon state.
+	BeginLocalPublication(func(error)) (authorityrpc.ResponseConsumption, error)
+	LocalAdmissionOpen() bool
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallReadRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 	CallMutationWithIdentity(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
@@ -73,6 +82,9 @@ type v3DataPlaneConfig struct {
 	PrincipalUID   uint32
 	PrincipalGID   uint32
 	CachePolicy    string
+	// Clock reads the sleep-inclusive continuous clock in nanoseconds; nil is
+	// the platform clock. Tests inject a controlled one.
+	Clock func() (uint64, error)
 }
 
 // v3ItemRecord is one retained authority item capability. A record is live
@@ -232,6 +244,18 @@ type v3DataPlane struct {
 	maxWrite        uint32
 	reauthMu        sync.Mutex
 	reauthSequence  uint64
+	// The cache-serving horizon, on the continuous clock. horizon is the latest
+	// instant an explicit KeepAlive proof of this session/epoch makes safe; zero
+	// means no usable proof. authGeneration advances when a reauthorization
+	// starts and when it ends, and authorizing marks one in progress, so no
+	// proof sampled under an earlier authorization can reopen eligibility.
+	// authorizationDeadline is the installed signed deadline, an additional
+	// wall-clock denial check (zero: none). All are protected by mu.
+	clock                 func() (uint64, error)
+	horizon               uint64
+	authGeneration        uint64
+	authorizing           bool
+	authorizationDeadline time.Time
 
 	failOnce sync.Once
 }
@@ -266,14 +290,33 @@ func (d *v3DataPlane) reauthorize(ctx context.Context, token []byte, sequence ui
 	if sequence < d.reauthSequence || sequence > d.reauthSequence+1 {
 		return time.Time{}, errors.New("reauthorization sequence is not current or exactly next")
 	}
+	// A replacement decision can shorten the session's remaining validity, so
+	// every proof sampled against the current one stops counting before the
+	// request is admitted, and none sampled while it is in flight ever counts.
+	d.mu.Lock()
+	d.horizon = 0
+	d.authGeneration++
+	d.authorizing = true
+	d.mu.Unlock()
 	deadline, err := client.Reauthorize(ctx, token, sequence)
+	if err == nil && !deadline.After(time.Now()) {
+		err = errors.New("reauthorization returned an expired deadline")
+	}
+	d.mu.Lock()
+	d.authGeneration++
+	d.authorizing = false
+	if err == nil {
+		d.authorizationDeadline = deadline
+	}
+	d.mu.Unlock()
 	if err != nil {
 		return time.Time{}, err
 	}
-	if !deadline.After(time.Now()) {
-		return time.Time{}, errors.New("reauthorization returned an expired deadline")
-	}
 	d.reauthSequence = sequence
+	// The replacement authorization earns its own proof before any hit.
+	if err := d.renewHorizon(ctx); err != nil {
+		return time.Time{}, d.fail(fmt.Errorf("portablefsd: keepalive after reauthorization failed: %w", err))
+	}
 	return deadline, nil
 }
 
@@ -290,15 +333,26 @@ func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane
 	if maxRead == 0 || maxWrite == 0 {
 		return nil, errors.New("portablefsd: v3 authority omitted I/O limits")
 	}
+	clock := cfg.Clock
+	if clock == nil {
+		clock = v3ContinuousNanos
+	}
+	if _, err := clock(); err != nil {
+		return nil, fmt.Errorf("portablefsd: v3 data plane needs a sleep-inclusive continuous clock: %w", err)
+	}
+	if _, usable := v3HorizonCandidate(0, min(cfg.Client.SessionLease(), authorityrpc.MaxCacheProof)); !usable {
+		return nil, fmt.Errorf("portablefsd: v3 session lease %s cannot carry a usable cache proof", cfg.Client.SessionLease())
+	}
 	ctx, cancel := context.WithCancel(parent)
 	d := &v3DataPlane{
-		client: cfg.Client, cfg: cfg, ctx: ctx, cancel: cancel,
+		client: cfg.Client, cfg: cfg, ctx: ctx, cancel: cancel, clock: clock,
 		ops: make(chan struct{}, limit), itemsByID: make(map[uint64]*v3ItemRecord),
 		itemsByIdentity: make(map[[16]byte]*v3ItemRecord), nextItemID: v3FirstItemID,
 		names: make(map[v3NameKey]*v3ItemRecord), handles: make(map[uint64]*v3HandleRecord), nextHandleID: 1,
 		cookies: make(map[uint64]v3CookieRecord), cookieBatches: make(map[uint64]*v3CookieBatch),
 		nextCookieID: v3CookieFloor, nextCookieBatch: 1,
 		nameMax: 255, maxRead: maxRead, maxWrite: maxWrite,
+		authorizationDeadline: cfg.Client.AuthorizationDeadline(),
 	}
 	if !cfg.Client.SupportsBatchedClose() {
 		cancel()
@@ -481,10 +535,8 @@ func (d *v3DataPlane) v3Liveness(ctx context.Context, request *pfslocal.V3Livene
 	if d.terminalError() != nil {
 		return nil, darwinEIO
 	}
-	response, errno := d.callRead(ctx, 0, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
-	if errno != 0 || response == nil || response.GetUncertain() || response.GetErrno() != 0 ||
-		response.GetRoutesMismatch().GetSessionRefused() {
-		_ = d.fail(errors.New("portablefsd: authority liveness proof was refused"))
+	if err := d.renewHorizon(ctx); err != nil {
+		_ = d.fail(fmt.Errorf("portablefsd: authority liveness proof was refused: %w", err))
 		return nil, darwinEIO
 	}
 	return &pfslocal.V3LivenessReply{
@@ -2505,7 +2557,10 @@ func (d *v3DataPlane) terminalError() error { d.mu.Lock(); defer d.mu.Unlock(); 
 func (d *v3DataPlane) recordTerminal(err error) {
 	d.failOnce.Do(func() {
 		d.mu.Lock()
+		// Terminal is irreversible: no later proof, hit, or connection revives
+		// cache eligibility for this data plane.
 		d.terminal = err
+		d.horizon = 0
 		d.mu.Unlock()
 		// Session cleanup, not item-by-item replay, owns every release this
 		// data plane has not already put in flight.
@@ -2555,6 +2610,23 @@ func (d *v3DataPlane) keepAlive() {
 		_ = d.fail(errors.New("portablefsd: invalid authority liveness interval"))
 		return
 	}
+	// Local admission may already be terminal while the supervisor is proving
+	// kernel absence. Liveness belongs to this original authority transport
+	// until detach or a genuine transport failure closes it, and any refused
+	// renewal is terminal.
+	renew := func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), interval)
+		defer cancel()
+		if err := d.renewHorizon(ctx); err != nil {
+			_ = d.fail(err)
+			return false
+		}
+		return true
+	}
+	// The first proof is requested at once; no local hit is admitted before it.
+	if !renew() {
+		return
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -2562,28 +2634,79 @@ func (d *v3DataPlane) keepAlive() {
 		case <-d.client.SessionDone():
 			return
 		case <-ticker.C:
-			// Local admission may already be terminal while the supervisor is
-			// proving kernel absence. Liveness belongs to this original authority
-			// transport until detach or a genuine transport failure closes it.
-			ctx, cancel := context.WithTimeout(context.Background(), interval)
-			response, err := d.client.CallRead(ctx, &authoritypb.Request{Body: &authoritypb.Request_KeepAlive{KeepAlive: &authoritypb.KeepAliveRequest{}}})
-			cancel()
-			if err != nil || response == nil || response.GetUncertain() || response.GetErrno() != 0 {
-				if err == nil {
-					err = errors.New("authority keepalive refused")
-				}
-				_ = d.fail(err)
+			if !renew() {
 				return
 			}
 		}
 	}
 }
 
+// v3KeepAliveInterval renews at least three times per lease, per repair
+// budget, and per MaxCacheProof, so a large configured lease or budget cannot
+// schedule normal renewal beyond the frozen proof cap.
 func v3KeepAliveInterval(lease, repairBudget time.Duration) time.Duration {
 	if lease <= 0 || repairBudget <= 0 {
 		return 0
 	}
-	return min(lease/3, repairBudget/3)
+	return min(lease/3, repairBudget/3, authorityrpc.MaxCacheProof/3)
+}
+
+// renewHorizon issues one explicit KeepAlive and adopts its proof. The start
+// instant is captured before the request can queue, so queueing, transport,
+// and reply delay all consume the promise rather than extend it. Only these
+// explicit receipts advance the horizon; a refused renewal is the caller's
+// terminal error.
+func (d *v3DataPlane) renewHorizon(ctx context.Context) error {
+	start, clockErr := d.clock()
+	d.mu.Lock()
+	generation, authorizing := d.authGeneration, d.authorizing
+	d.mu.Unlock()
+	proof, err := d.client.KeepAlive(ctx)
+	if err != nil {
+		return err
+	}
+	if clockErr != nil || authorizing {
+		return nil
+	}
+	candidate, usable := v3HorizonCandidate(start, proof)
+	if !usable {
+		return nil
+	}
+	now, err := d.clock()
+	if err != nil || now >= candidate {
+		// A legitimate proof consumed by delay supplies no horizon; it is not a
+		// protocol defect.
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// A receipt of an older generation, or one arriving out of order, can
+	// neither resurrect a terminal data plane nor move the horizon backwards.
+	if d.terminal == nil && !d.authorizing && d.authGeneration == generation && candidate > d.horizon {
+		d.horizon = candidate
+	}
+	return nil
+}
+
+// v3HorizonCandidate is start + R - epsilon(R) with
+// epsilon(R) = 1s + ceil(R/1000), in checked arithmetic. The rate term budgets
+// 1,000 ppm of aggregate relative clock-rate error between this Mac and the
+// authority; the one-second term budgets measurement and rounding uncertainty.
+// These are explicit supported-clock assumptions, not an RTT estimate. A proof
+// no longer than its own epsilon is unusable.
+func v3HorizonCandidate(start uint64, proof time.Duration) (uint64, bool) {
+	if proof <= 0 {
+		return 0, false
+	}
+	r := uint64(proof)
+	epsilon := uint64(time.Second) + r/1000
+	if r%1000 != 0 {
+		epsilon++
+	}
+	if r <= epsilon || start > math.MaxUint64-(r-epsilon) {
+		return 0, false
+	}
+	return start + (r - epsilon), true
 }
 func authorityIdentity(item *authoritypb.Item) ([16]byte, error) {
 	var out [16]byte

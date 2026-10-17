@@ -13,6 +13,9 @@ import (
 type fskitFeatureTestHandler struct {
 	clientTestHandler
 	omit string
+	// omitActivate drops a feature from Activate only, modelling an authority
+	// whose Hello and Activate disagree.
+	omitActivate string
 }
 
 func (h fskitFeatureTestHandler) Handle(ctx context.Context, req *authoritypb.Request) *authoritypb.Response {
@@ -20,6 +23,9 @@ func (h fskitFeatureTestHandler) Handle(ctx context.Context, req *authoritypb.Re
 	if hello := reply.GetHello(); hello != nil {
 		hello.Features, _ = helloFeatures(authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
 		hello.Features = append(hello.Features, fskitDirectWriteFeature)
+		if slices.Contains(req.GetHello().GetFeatures(), fskitVersionedMetadataFeature) {
+			hello.Features = append(hello.Features, fskitVersionedMetadataFeature)
+		}
 		hello.MaxFskitWriteBytes = RequiredFskitWriteBytes
 		hello.Features = slices.DeleteFunc(hello.Features, func(feature string) bool { return feature == h.omit })
 	}
@@ -27,17 +33,21 @@ func (h fskitFeatureTestHandler) Handle(ctx context.Context, req *authoritypb.Re
 		active.Features, _ = advertisedActivateFeatures(authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
 		// The current FSKit client also requires the optional FSKit CloseBatch
 		// admission; an authority that serves it advertises it here.
-		if !slices.Contains(active.Features, batchedCloseFeature) {
-			active.Features = append(active.Features, batchedCloseFeature)
+		for _, feature := range []string{batchedCloseFeature, fskitVersionedMetadataFeature} {
+			if !slices.Contains(active.Features, feature) {
+				active.Features = append(active.Features, feature)
+			}
 		}
-		active.Features = slices.DeleteFunc(active.Features, func(feature string) bool { return feature == h.omit })
+		active.Features = slices.DeleteFunc(active.Features, func(feature string) bool {
+			return feature == h.omit || feature == h.omitActivate
+		})
 		active.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
 		active.FskitRepairCursor = &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE}
 	}
 	return reply
 }
 func TestFskitClientRequiresAdditiveWriteAndDurabilityFeatures(t *testing.T) {
-	for _, omit := range []string{"", fskitDirectWriteFeature, fskitDurableMutationsFeature, fskitFragmentedWriteFeature, batchedCloseFeature} {
+	for _, omit := range []string{"", fskitDirectWriteFeature, fskitDurableMutationsFeature, fskitFragmentedWriteFeature, batchedCloseFeature, fskitVersionedMetadataFeature} {
 		t.Run("omit_"+omit, func(t *testing.T) {
 			handler := fskitFeatureTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 4}, omit: omit}
 			address, tls, stop := startTestServer(t, handler, 4, time.Minute)
