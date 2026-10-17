@@ -625,7 +625,8 @@ func TestRecallCapQueuesAndDeadlineIsNamed(t *testing.T) {
 
 func TestRecallSaturationDoesNotBlockSessionKeepAlive(t *testing.T) {
 	authority, err := volumeserver.New("12345678-1234-1234-1234-123456789abc", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  time.Minute, MaxReplaySlots: 2, MaxSessions: 2, MaxLockRecords: 8,
 	})
 	if err != nil {
 		t.Fatal(err)

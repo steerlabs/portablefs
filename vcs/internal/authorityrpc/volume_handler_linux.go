@@ -2038,7 +2038,6 @@ func (h *VolumeHandler) constructDirectoryPage(
 			NextCookie: encodeCookie(entry.NextCookie),
 		}
 		if candidate.item != (xfsstore.Capability{}) {
-			dirent.ObjectVersion = h.sampledObjectVersion(candidate.identity, ^uint64(0))
 			dirent.StableIdentity = append([]byte(nil), candidate.identity[:]...)
 			if _, held := heldIdentities[candidate.identity]; wantItems && !held {
 				dirent.Item = itemProto(candidate.item, candidate.attr, candidate.identity)

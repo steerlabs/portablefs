@@ -160,7 +160,12 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			}
 			_, _, applyErr = h.Restore.Write(ctx, coordinate.identity, body.GetOffset(), length, apply)
 		} else {
-			_, _, applyErr = apply()
+			// Allocation-only modes still update and sample inode metadata.
+			// Keep both inside the hydration lock without recalling file data.
+			applyErr = h.Restore.WithAttrLock(coordinate.identity, func() error {
+				_, _, err := apply()
+				return err
+			})
 		}
 		if applyErr != nil && !dispatched {
 			return h.errorResponse(0, applyErr, false), nil
@@ -275,7 +280,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			})
 			return int(copied), -1, applyErr
 		}
-		if h.Restore != nil && h.Restore.Active() && copyLength != 0 {
+		if h.Restore != nil && h.Restore.Active() {
 			var n int
 			n, _, applyErr = h.Restore.Write(ctx, destinationCoordinate.identity, body.GetOutputOffset(), copyLength, apply)
 			copied = uint64(n)

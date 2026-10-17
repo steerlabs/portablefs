@@ -24,6 +24,8 @@ set -euo pipefail
 # Every test that must actually run and pass. A rename or deletion here fails
 # the job instead of quietly shrinking privileged coverage.
 REQUIRED_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilityPriorMembershipMappingOnXFS"
+  "github.com/steerlabs/portablefs/vcs/internal/authorityrpc:TestCompatibilitySafeTakeoverWaitsForPendingApplyOnXFS"
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestHydrationPreservesCurrentMtimeOnXFS"
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSProjectGate"
   "github.com/steerlabs/portablefs/vcs/internal/xfsstore:TestProductionXFSGateRefusesAForeignProjectID"

@@ -143,6 +143,7 @@ func TestProtocolV7FeatureSetsAreExact(t *testing.T) {
 
 func TestDelegationReferenceIsPartOfMutationFingerprint(t *testing.T) {
 	runtime, err := volumeserver.New("protocol-v7-delegation-fingerprint", volumeserver.Config{
+		ContinuousNow:  func() (time.Duration, error) { return 0, nil },
 		SessionLease:   time.Minute,
 		MaxReplaySlots: 1,
 		MaxSessions:    1,

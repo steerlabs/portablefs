@@ -35,7 +35,10 @@ func (s *lookupStampCutStore) CloseOpen(xfsstore.Capability) error { return nil 
 
 func TestCoherenceMetadataStampsStayInsideStorageReadTurn(t *testing.T) {
 	for _, profile := range []authoritypb.FrontendProfile{authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR} {
-		for _, kind := range []string{"lookup", "readdir", "item getattr", "handle getattr"} {
+		for _, kind := range []string{"lookup", "readdir", "item getattr", "handle getattr", "item and handle getattr"} {
+			if kind == "item and handle getattr" && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+				continue
+			}
 			t.Run(profile.String()+"/"+kind, func(t *testing.T) {
 				sampled, proceed := make(chan struct{}), make(chan struct{})
 				var store volumeStore
@@ -56,11 +59,18 @@ func TestCoherenceMetadataStampsStayInsideStorageReadTurn(t *testing.T) {
 						t.Fatal(err)
 					}
 					request.Body = &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Item: child[:]}}
-				} else if kind == "handle getattr" {
+				} else if kind == "handle getattr" || kind == "item and handle getattr" {
 					if err := h.trackOpen(credential.ID, child, false); err != nil {
 						t.Fatal(err)
 					}
-					request.Body = &authoritypb.Request_GetAttr{GetAttr: &authoritypb.GetAttrRequest{Handle: child[:]}}
+					get := &authoritypb.GetAttrRequest{Handle: child[:]}
+					if kind == "item and handle getattr" {
+						if err := h.trackItem(credential.ID, child, false); err != nil {
+							t.Fatal(err)
+						}
+						get.Item = child[:]
+					}
+					request.Body = &authoritypb.Request_GetAttr{GetAttr: get}
 				} else {
 					if err := h.trackOpen(credential.ID, directory.handle, false); err != nil {
 						t.Fatal(err)

@@ -105,7 +105,7 @@ func TestRestoreTruncatePostApplyFailureFencesStorage(t *testing.T) {
 				h.Store = backend
 				h.OnStorageFailure = func(error) {}
 				restoreStore := &restoreTruncateSyncFailure{syncErr: failure.err}
-				h.Restore = newFailingRestoreTruncateMode(t, restoreStore, failure.name == "map")
+				h.Restore = newRestoreTruncateMode(t, restoreStore, failure.name == "map", failure.name == "map")
 				item := xfsstore.Capability{0x70}
 				req := &authoritypb.Request{RequestId: 1, Epoch: cred.Epoch[:], Session: &authoritypb.SessionProof{Id: cred.ID[:], Generation: cred.Generation, ResumeSecret: cred.Secret[:]}}
 				switch operation {
@@ -161,7 +161,7 @@ func TestRestoreTruncatePostApplyFailureFencesStorage(t *testing.T) {
 	}
 }
 
-func newFailingRestoreTruncateMode(t *testing.T, store *restoreTruncateSyncFailure, mapFailure bool) *restoremode.Mode {
+func newRestoreTruncateMode(t *testing.T, store *restoreTruncateSyncFailure, mapFailure, initialize bool) *restoremode.Mode {
 	t.Helper()
 	root, err := os.MkdirTemp("", "pfs-restore-")
 	if err != nil {
@@ -199,6 +199,8 @@ func newFailingRestoreTruncateMode(t *testing.T, store *restoreTruncateSyncFailu
 		if err := os.WriteFile(filepath.Join(root, restoremode.MapFilename), raw, 0600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if initialize {
 		// Keep this empty-drain fixture RESTORING: convergence cannot replace a
 		// directory with its marker file, and the failed marker does not affect map IO.
 		if err := os.Mkdir(filepath.Join(root, restoremode.ConvergedFilename), 0700); err != nil {

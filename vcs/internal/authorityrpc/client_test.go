@@ -2753,7 +2753,7 @@ func (h *replayHandler) Handle(ctx context.Context, req *authoritypb.Request) *a
 }
 
 func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
-	runtime, err := volumeserver.New("reclaim-replay-volume", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	runtime, err := volumeserver.New("reclaim-replay-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2810,7 +2810,7 @@ func TestReclaimLostReplyReplaysExactOutcome(t *testing.T) {
 // the authority raised a sequence gap, fenced the session, and every later
 // request returned ESTALE until the mount was torn down.
 func TestReadOnlyRejectionKeepsReplaySlotsSynchronized(t *testing.T) {
-	runtime, err := volumeserver.New("read-only-volume", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	runtime, err := volumeserver.New("read-only-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2858,7 +2858,7 @@ func TestReadOnlyRejectionKeepsReplaySlotsSynchronized(t *testing.T) {
 // original failure, which is what makes the fix load-bearing rather than
 // incidental: without the reported state the client has to guess.
 func TestSuppressedSlotStateStillCannotDesynchronize(t *testing.T) {
-	runtime, err := volumeserver.New("suppressed-volume", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
+	runtime, err := volumeserver.New("suppressed-volume", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 8, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3018,7 +3018,7 @@ func TestDialClientRefusesLanelessAdmission(t *testing.T) {
 }
 
 func TestCanonicalFingerprintIsIndependentOfTheEnvelope(t *testing.T) {
-	runtime, err := volumeserver.New("fingerprint", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
+	runtime, err := volumeserver.New("fingerprint", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3054,7 +3054,7 @@ func TestCanonicalFingerprintIsIndependentOfTheEnvelope(t *testing.T) {
 // which is documented as unstable across library versions. The encoding is now
 // this package's own, so it can be pinned by value.
 func TestCanonicalFormIsPinnedByValue(t *testing.T) {
-	runtime, err := volumeserver.New("canonical-form", volumeserver.Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
+	runtime, err := volumeserver.New("canonical-form", volumeserver.Config{ContinuousNow: func() (time.Duration, error) { return 0, nil }, SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

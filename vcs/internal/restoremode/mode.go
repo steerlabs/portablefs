@@ -329,11 +329,21 @@ func (m *Mode) WithAttrLock(identity [16]byte, fn func() error) error {
 // state locks. Every stored chunk in the requested range is durably hydrated
 // before apply, so the accepted range cannot affect restore map state.
 func (m *Mode) Write(ctx context.Context, identity [16]byte, offset, length uint64, apply func() (int, int64, error)) (int, int64, error) {
-	// A zero-length write is a POSIX no-op: it moves no bytes and no mtime,
-	// so it must not record the entry as user-modified — that record would
-	// permanently suppress archived-mtime restoration for an untouched file.
-	if m == nil || m.converged.Load() || length == 0 {
+	if m == nil || m.converged.Load() {
 		return apply()
+	}
+	if length == 0 {
+		// No bytes change, so do not mark user modification. Range operations
+		// may still sample post-state (or fail after metadata changed); that
+		// sample must wait for hydration's transient mtime to be restored.
+		var n int
+		var assigned int64
+		err := m.WithAttrLock(identity, func() error {
+			var err error
+			n, assigned, err = apply()
+			return err
+		})
+		return n, assigned, err
 	}
 	entry, ok := m.bindings.Entry(identity)
 	if !ok {

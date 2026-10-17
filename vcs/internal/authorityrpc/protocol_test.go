@@ -136,7 +136,8 @@ func BenchmarkWriteMutationEncoding(b *testing.B) {
 		Handle: bytes.Repeat([]byte{1}, 16), Position: 4096, Size: 1 << 20, Data: make([]byte, 1<<20),
 	}}}
 	runtime, err := volumeserver.New("benchmark", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
 	})
 	if err != nil {
 		b.Fatal(err)

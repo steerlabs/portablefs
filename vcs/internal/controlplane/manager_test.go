@@ -459,7 +459,8 @@ func TestVolumeProvisioningMountAuthorizationAndRestart(t *testing.T) {
 		t.Fatalf("hosted authority refused manager grant: %v", err)
 	}
 	runtimeAuthority, err := volumeserver.New(volume.ID, volumeserver.Config{
-		SessionLease: 10 * time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 16,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  10 * time.Minute, MaxReplaySlots: 4, MaxSessions: 4, MaxLockRecords: 16,
 		Now: func() time.Time { return *h.now },
 	})
 	if err != nil {

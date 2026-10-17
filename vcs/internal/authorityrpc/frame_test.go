@@ -309,7 +309,8 @@ func TestStreamedFrameDigestMatchesOneShotReplayFingerprint(t *testing.T) {
 		t.Fatalf("streamed payload digest = %x, want %x", streamed, wantDigest)
 	}
 	runtime, err := volumeserver.New("streamed-frame-digest", volumeserver.Config{
-		SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
+		ContinuousNow: func() (time.Duration, error) { return 0, nil },
+		SessionLease:  time.Minute, MaxReplaySlots: 1, MaxSessions: 1, MaxLockRecords: 1,
 	})
 	if err != nil {
 		t.Fatal(err)

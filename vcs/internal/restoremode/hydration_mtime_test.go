@@ -113,7 +113,7 @@ func errorName(err error) string {
 	return err.Error()
 }
 
-func TestHydrationMtimeRestoreFailurePermanentlyStopsSamplesAndDrain(t *testing.T) {
+func TestHydrationMtimeRestoreFailurePermanentlyStopsSamples(t *testing.T) {
 	store := &hydrationMtimeStore{fakeStore: newFakeStore(map[uint32]int64{0: 4}), restoreErr: syscall.EPERM}
 	var failures atomic.Int32
 	mode, _, identity := openTestMode(t, store.fakeStore, testInfo([2]uint32{0, 0}), map[chunkKey]Chunk{{0, 0}: {Extents: []Extent{{Data: []byte("data")}}}}, func(c *Config) {

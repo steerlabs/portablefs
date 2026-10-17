@@ -229,3 +229,20 @@ func TestCompatibilityLastMomentProofRetainsGrantTimeDespiteLateDelivery(t *test
 		t.Fatal(err)
 	}
 }
+
+func TestCompatibilityOldDaemonExclusionEndsOnlyAfterApplyDrain(t *testing.T) {
+	a, cred, c, _, clock := compatibilitySession(t, time.Minute, time.Hour)
+	apply, err := a.Begin(cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Fence(cred.ID, nil)
+	clock.elapsed.Store(int64(24 * time.Hour))
+	if err := c.CheckCompatibilityWriter(SessionID{2}); !errors.Is(err, ErrCompatibilityWriterLease) {
+		t.Fatalf("old daemon apply escaped fence: %v", err)
+	}
+	apply.End()
+	if err := c.CheckCompatibilityWriter(SessionID{2}); err != nil {
+		t.Fatalf("old daemon retained an ungranted time promise: %v", err)
+	}
+}

@@ -13,11 +13,14 @@ import (
 	"time"
 )
 
+func testContinuousNow() (time.Duration, error) { return 0, nil }
+
 func testAuthority(t *testing.T) (*Authority, *time.Time) {
 	t.Helper()
 	now := time.Unix(1_000, 0)
 	a, err := New("volume-a", Config{
-		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64,
+		ContinuousNow: testContinuousNow,
+		SessionLease:  time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64,
 		Now: func() time.Time { return now },
 	})
 	if err != nil {
@@ -34,7 +37,8 @@ func TestSessionLifecycleObserversTrackExactActiveBoundary(t *testing.T) {
 	var active, terminal atomic.Int64
 	now := time.Unix(1_000, 0)
 	authority, err := New("observed", Config{
-		SessionLease: time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64,
+		ContinuousNow: testContinuousNow,
+		SessionLease:  time.Minute, MaxReplaySlots: 4, MaxSessions: 8, MaxLockRecords: 64,
 		Now:               func() time.Time { return now },
 		OnSessionActive:   func(SessionID) { active.Add(1) },
 		OnSessionTerminal: func(SessionID) { terminal.Add(1) },
@@ -222,7 +226,8 @@ func TestPrepareAttachConcurrentDuplicateAuthorizesExactlyOnce(t *testing.T) {
 func TestPrepareAttachReservesAdmissionBeforeAuthorization(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	a, err := New("bounded-prepare", Config{
-		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 1, MaxLockRecords: 8,
+		ContinuousNow: testContinuousNow,
+		SessionLease:  time.Minute, MaxReplaySlots: 2, MaxSessions: 1, MaxLockRecords: 8,
 		Now: func() time.Time { return now },
 	})
 	if err != nil {
@@ -257,7 +262,8 @@ func TestPrepareAttachReservesAdmissionBeforeAuthorization(t *testing.T) {
 func TestPrepareAttachPublishesAuthorizationDeadlineDuringConcurrentSweep(t *testing.T) {
 	now := time.Unix(1_000, 0)
 	a, err := New("atomic-prepare-publication", Config{
-		SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 8, MaxLockRecords: 64,
+		ContinuousNow: testContinuousNow,
+		SessionLease:  time.Minute, MaxReplaySlots: 2, MaxSessions: 8, MaxLockRecords: 64,
 		Now: func() time.Time { return now },
 	})
 	if err != nil {
@@ -1037,27 +1043,27 @@ func TestCredentialGenerationIsVerified(t *testing.T) {
 }
 
 func TestPerSessionLockBudgetDefaultsToAnEqualShare(t *testing.T) {
-	a, err := New("shares", Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16})
+	a, err := New("shares", Config{ContinuousNow: testContinuousNow, SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := a.cfg.MaxLockRecordsPerSession; got != 4 {
 		t.Fatalf("derived per-session lock budget = %d, want 4", got)
 	}
-	explicit, err := New("explicit", Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16, MaxLockRecordsPerSession: 12})
+	explicit, err := New("explicit", Config{ContinuousNow: testContinuousNow, SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16, MaxLockRecordsPerSession: 12})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := explicit.cfg.MaxLockRecordsPerSession; got != 12 {
 		t.Fatalf("explicit per-session lock budget = %d", got)
 	}
-	if _, err := New("oversized", Config{SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16, MaxLockRecordsPerSession: 17}); err == nil {
+	if _, err := New("oversized", Config{ContinuousNow: testContinuousNow, SessionLease: time.Minute, MaxReplaySlots: 1, MaxSessions: 4, MaxLockRecords: 16, MaxLockRecordsPerSession: 17}); err == nil {
 		t.Fatal("a per-session budget larger than the table was accepted")
 	}
 }
 
 func TestSessionAdmissionIsBoundedAndReleased(t *testing.T) {
-	a, err := New("bounded", Config{SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 1, MaxLockRecords: 8})
+	a, err := New("bounded", Config{ContinuousNow: testContinuousNow, SessionLease: time.Minute, MaxReplaySlots: 2, MaxSessions: 1, MaxLockRecords: 8})
 	if err != nil {
 		t.Fatal(err)
 	}

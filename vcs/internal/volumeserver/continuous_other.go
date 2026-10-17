@@ -2,10 +2,13 @@
 
 package volumeserver
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
-// The authority ships only on Linux. Other platforms exercise coordination in
-// unit tests; controlled-clock tests inject ContinuousNow explicitly.
-var continuousOrigin = time.Now()
-
-func continuousNow() (time.Duration, error) { return time.Since(continuousOrigin), nil }
+// Only the shipping Linux authority has a qualified sleep-aware clock.
+// Coordination tests on other platforms must inject their clock explicitly.
+func continuousNow() (time.Duration, error) {
+	return 0, errors.New("volumeserver: sleep-aware authority clock requires Linux")
+}

@@ -28,8 +28,9 @@ type CoordinationConfig struct {
 	MaxCachedNameCapacity uint64
 	MaxRepairBudget       time.Duration
 
-	Now       func() time.Time
-	OnBarrier func(time.Duration, int)
+	ContinuousNow func() (time.Duration, error)
+	Now           func() time.Time
+	OnBarrier     func(time.Duration, int)
 }
 
 // Coordination is a volume's complete protocol-7 coordination assembly.
@@ -69,7 +70,7 @@ func NewCoordination(cfg CoordinationConfig) (*Coordination, error) {
 	visibility, err := volumeserver.NewVisibilityCoordinator(volumeserver.VisibilityConfig{
 		Prior: compatibilityPrior, ExternalMembership: true, Fencer: cfg.Fencer,
 		MaxCachedNameCapacity: cfg.MaxCachedNameCapacity, MaxRepairBudget: cfg.MaxRepairBudget,
-		MaxClockSkew: cfg.ClockSkew, Now: cfg.Now, OnBarrier: cfg.OnBarrier,
+		MaxClockSkew: cfg.ClockSkew, Now: cfg.Now, ContinuousNow: cfg.ContinuousNow, OnBarrier: cfg.OnBarrier,
 	})
 	if err != nil {
 		return nil, err

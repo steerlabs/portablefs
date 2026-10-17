@@ -2,6 +2,7 @@ package authorityrpc
 
 import (
 	"fmt"
+	"time"
 
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -15,7 +16,7 @@ import (
 // grammar rather than a receiver-only filter.
 const (
 	maxWireMessageDepth     = 16
-	maxWireDescriptorFields = 128
+	maxWireDescriptorFields = 64
 	// A maximal legal ReadDirReply may contain 4,096 Dirent messages, each
 	// carrying both an Item and two fully populated Attr messages. That is about
 	// 140K scalar/message fields. Repeated allocations are bounded separately
@@ -157,7 +158,7 @@ func consumeWireField(raw []byte, field protoreflect.FieldDescriptor, wireType p
 	}
 	if field.FullName() == "portablefs.authority.v1.Response.session_valid_for_nanos" {
 		value, n := protowire.ConsumeVarint(raw)
-		if n < 0 || value == 0 || value > uint64(MaxCacheProof) || value%1000000 != 0 {
+		if n < 0 || value == 0 || value > uint64(MaxCacheProof) || value%uint64(time.Millisecond) != 0 {
 			return 0, 0, fmt.Errorf("invalid KeepAlive validity proof")
 		}
 	}

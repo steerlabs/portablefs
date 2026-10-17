@@ -138,7 +138,7 @@ func (h *VolumeHandler) takePostStateChanges(sequence uint64) map[[16]byte]struc
 	return changed
 }
 
-func (h *VolumeHandler) sampledObjectVersion(identity [16]byte, snapshot uint64) uint64 {
+func (h *VolumeHandler) sampledObjectVersion(identity [16]byte) uint64 {
 	h.postStateMu.Lock()
 	defer h.postStateMu.Unlock()
 	version := h.objectVersions[identity]

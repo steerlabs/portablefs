@@ -184,6 +184,7 @@ message Response {
   // Present only on a successful KEEPALIVE reply to a session that negotiated
   // fskit-versioned-metadata-v1. It is the authority-relative duration, sampled
   // after renewal under the session lock and rounded down to whole milliseconds.
+  // Receivers reject values that are not whole milliseconds.
   // It promises this session's compatibility-writer exclusion for no more than the
   // remaining lease, authorization, advertised millisecond lease, or the frozen
   // MaxCacheProof (60,000,000,000 ns), and never positive for a terminal

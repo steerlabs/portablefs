@@ -103,6 +103,8 @@ func (a *Authority) CompatibilityExclusion(id SessionID) (*CompatibilityExclusio
 	if s.fenced || s.ending {
 		return nil, ErrSessionFenced
 	}
+	// Old FSKit daemons receive no negotiated daemon-cache proof. They still
+	// need this obligation through admitted-apply drain, with no time promise.
 	if s.exclusion == nil {
 		s.exclusion = &CompatibilityExclusion{now: a.cfg.ContinuousNow}
 	}

@@ -43,11 +43,9 @@ func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.Vis
 	return h.Visibility
 }
 
-// stabilizeItem guards one read-path answer about an inode this session already
-// holds a capability for. The coordinate is known before anything is read, so
-// a classified visibility retry can unwind the authority request before state
-// is published. The daemon consumes that internal response, waits for the exact
-// pending repair, and reissues the request inside the same FUSE callback.
+// stabilizeItem registers the retained inode before sampling it. Production
+// FSKit admission excludes foreign writers, so it cannot encounter the pending
+// peer PREPARE cycle that produces ErrVisibilityRetry; see coherenceRead.
 func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) error {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {

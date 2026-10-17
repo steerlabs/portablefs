@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
-// CheckCompatibilityWriter refuses a writer while another FSKit mount owns
-// the compatibility exclusion. The handler holds its activation admission
-// guard across this check and the operation which can establish write intent.
+// CheckCompatibilityWriter refuses foreign writers during prior-epoch grace,
+// active FSKit ownership, and retained cache-proof or admitted-apply obligations.
+// The handler holds its profile admission guard across this check and any
+// operation which can establish write intent.
 func (c *VisibilityCoordinator) CheckCompatibilityWriter(source SessionID) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

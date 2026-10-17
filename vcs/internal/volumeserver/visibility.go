@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 )
@@ -754,14 +755,15 @@ type VisibilityCoordinator struct {
 	// PREPARE/apply/COMPLETE barriers in flight.
 	sequencer *mutationSequencer
 
-	cfg                   VisibilityConfig
-	startupReady          bool
+	cfg          VisibilityConfig
+	startupReady bool
+
+	mu                    sync.Mutex
 	writerRestartDeadline time.Duration
 	writerRestartLast     time.Duration
 	writerRestartStarted  bool
 	writerRestartFailed   bool
 
-	mu           sync.Mutex
 	participants map[SessionID]*visibilityParticipant
 	exclusions   map[SessionID]*CompatibilityExclusion
 	fairness     map[SessionID]mutationFairnessDebt
@@ -915,6 +917,7 @@ func (c *VisibilityCoordinator) activateParticipant(
 	if commitment.CompatibilityWriter {
 		if c.compatibilityExcludedLocked(id) {
 			c.mu.Unlock()
+			log.Printf("portablefs-authority: refusing FSKit activation: retained compatibility exclusion is pending")
 			return VisibilityCursor{}, ErrCompatibilityWriterLease
 		}
 		for _, participant := range c.participants {
@@ -2100,14 +2103,6 @@ func (c *VisibilityCoordinator) finishBarrier(sequence uint64, audience visibili
 // then means that read raced the mutation: the caller must discard it and try
 // again.
 func (c *VisibilityCoordinator) Stabilize(ctx context.Context, id SessionID, resolutions ...VisibilityResolution) (bool, error) {
-	waited, _, err := c.StabilizeSequence(ctx, id, resolutions...)
-	return waited, err
-}
-
-// StabilizeSequence returns the authority cursor from the same critical
-// section that registers every supplied cache coordinate. A cacheable read
-// samples after this return and stamps the result with that cursor.
-func (c *VisibilityCoordinator) StabilizeSequence(ctx context.Context, id SessionID, resolutions ...VisibilityResolution) (bool, uint64, error) {
 	waited := false
 	for {
 		c.mu.Lock()
@@ -2116,7 +2111,7 @@ func (c *VisibilityCoordinator) StabilizeSequence(ctx context.Context, id Sessio
 			// Not a strict participant: this mount holds no cache the barrier
 			// has to reason about.
 			c.mu.Unlock()
-			return waited, 0, nil
+			return waited, nil
 		}
 		var blocked *visibilityMutationState
 		for _, state := range c.mutations {
@@ -2157,9 +2152,8 @@ func (c *VisibilityCoordinator) StabilizeSequence(ctx context.Context, id Sessio
 					p.index.add(key)
 				}
 			}
-			sequence := c.next
 			c.mu.Unlock()
-			return waited, sequence, nil
+			return waited, nil
 		}
 		if blocked.audience[id] != p && p.pending != nil && p.pending.event.Cursor.Phase == VisibilityPrepare {
 			// Concurrent barriers cannot share a participant lane. This participant
@@ -2168,7 +2162,7 @@ func (c *VisibilityCoordinator) StabilizeSequence(ctx context.Context, id Sessio
 			// any resolution to the monotone index: the caller must discard the read.
 			sequence := p.pending.event.Cursor.Sequence
 			c.mu.Unlock()
-			return true, 0, &VisibilityRetryError{Sequence: sequence}
+			return true, &VisibilityRetryError{Sequence: sequence}
 		}
 		done := blocked.done
 		c.mu.Unlock()
@@ -2176,7 +2170,7 @@ func (c *VisibilityCoordinator) StabilizeSequence(ctx context.Context, id Sessio
 		select {
 		case <-done:
 		case <-ctx.Done():
-			return waited, 0, ctx.Err()
+			return waited, ctx.Err()
 		}
 	}
 }

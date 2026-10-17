@@ -356,6 +356,8 @@ func New(volumeID string, cfg Config) (*Authority, error) {
 	if cfg.ContinuousNow == nil {
 		cfg.ContinuousNow = continuousNow
 	}
+	// Require the qualified clock even with fenced prior membership: this
+	// epoch may later grant a proof whose retention depends on that clock.
 	if _, err := cfg.ContinuousNow(); err != nil {
 		return nil, fmt.Errorf("initialize continuous authority clock: %w", err)
 	}
