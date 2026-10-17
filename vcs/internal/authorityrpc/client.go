@@ -648,9 +648,15 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	if !ok || !hasFeatures(active.GetFeatures(), required) {
 		return errors.New("authorityrpc: authority omitted required frontend-profile features")
 	}
-	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR &&
-		!hasFeatures(active.GetFeatures(), []string{fskitDurableMutationsFeature}) {
-		return errors.New("authorityrpc: FSKit authority omitted fskit-durable-mutations-v1")
+	if c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		if !hasFeatures(active.GetFeatures(), []string{fskitDurableMutationsFeature}) {
+			return errors.New("authorityrpc: FSKit authority omitted fskit-durable-mutations-v1")
+		}
+		// The daemon's one release owner retires closes through CloseBatch's
+		// exact replay; there is no per-handle Close fallback to negotiate down to.
+		if !hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}) {
+			return errors.New("authorityrpc: FSKit authority omitted batched-close-v1")
+		}
 	}
 	if c.cfg.RequireMountEnrollmentReauthorization && !hasFeatures(
 		active.GetFeatures(), []string{mountEnrollmentReauthorizationFeature},
@@ -686,7 +692,10 @@ func (c *Client) installActiveState(active *authoritypb.ActivateReply) error {
 	}
 	c.lifecycle.Lock()
 	defer c.lifecycle.Unlock()
-	c.batchedClose.Store(c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
+	// Linux treats CloseBatch as optional; FSKit required it above.
+	c.batchedClose.Store((c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES ||
+		c.cfg.FrontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR) &&
+		hasFeatures(active.GetFeatures(), []string{batchedCloseFeature}))
 	ordered := c.canPipelineFlushes() && hasFeatures(c.helloFeatures, []string{orderedDelegatedFlushFeature})
 	if ordered && !hasFeatures(active.GetFeatures(), []string{orderedDelegatedFlushFeature}) {
 		return errors.New("authorityrpc: activation changed the negotiated flush admission mode")

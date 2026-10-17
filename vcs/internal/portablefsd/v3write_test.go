@@ -62,7 +62,7 @@ func TestV3WriteSendsOneExactWritePerChunk(t *testing.T) {
 		t.Fatalf("write sent %d authority mutations, want exactly one", len(sent))
 	}
 	want := &authoritypb.WriteRequest{
-		Handle: bytes.Repeat([]byte{0x51}, 16), Position: 7, Size: 5,
+		Handle: d.handles[handle].token, Position: 7, Size: 5,
 		Data: []byte("abcde"), WriteFlags: v3WriteFlagKillSUIDGID,
 	}
 	if !proto.Equal(sent[0].GetWrite(), want) || sent[0].GetFskitFrontendOperationId() != operationID {

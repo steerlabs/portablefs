@@ -23,6 +23,8 @@ func lookupByName(client *fakeV3DataClient, names map[string]*authoritypb.Item) 
 		switch request.GetBody().(type) {
 		case *authoritypb.Request_Reclaim:
 			return client.reclaim(identity, request), nil
+		case *authoritypb.Request_CloseBatch:
+			return client.closeBatch(identity, request), nil
 		case *authoritypb.Request_Lookup:
 			template := names[string(request.GetLookup().GetName())]
 			response := exactTestMutationReply(identity)
@@ -125,6 +127,7 @@ func TestV3HardLinksShareFileIDWithDistinctParentBindings(t *testing.T) {
 	}
 	// The second lookup's capability duplicated the held one and was retired in
 	// one exact batched Reclaim; the canonical capability stays live.
+	waitV3ReleasesIdle(t, d)
 	batches := client.reclaimBatches()
 	if len(batches) != 1 || len(batches[0]) != 1 {
 		t.Fatalf("reclaim batches = %x, want one duplicate retirement", batches)
@@ -147,6 +150,7 @@ func TestV3FileIDSurvivesReclaimAndRelookupUnderANewHandle(t *testing.T) {
 	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.ReclaimRequest{Item: before.Item}); errno != 0 {
 		t.Fatalf("reclaim errno=%d", errno)
 	}
+	waitV3ReleasesIdle(t, d)
 	if live := client.liveTokens(); live != 1 {
 		t.Fatalf("live capabilities after reclaim = %d, want only the root", live)
 	}
@@ -349,6 +353,7 @@ func TestV3LookupDuringReclaimGetsAFreshHandleTheOldCompletionCannotTouch(t *tes
 	if errno := <-reclaimed; errno != 0 {
 		t.Fatalf("reclaim errno=%d", errno)
 	}
+	waitV3ReleasesIdle(t, d)
 	d.mu.Lock()
 	record := d.itemsByID[fresh.Item.ItemID]
 	canonical := d.itemsByIdentity[fresh.Item.StableIdentity]
@@ -400,6 +405,7 @@ func TestV3InternedItemIsOwnedBeforeReclaimCanObserveIt(t *testing.T) {
 	if cleanup, err := d.applyReplyResourceDisposition(resources, false, 1); err != nil || cleanup.required() {
 		t.Fatalf("accept cleanup=%+v err=%v", cleanup, err)
 	}
+	waitV3ReleasesIdle(t, d)
 	if !record.accepted || client.liveTokens() != 2 {
 		t.Fatal("accepting the overlapping reply did not keep the item and its one capability")
 	}
@@ -433,6 +439,7 @@ func TestV3ConcurrentLookupAndReclaimRetireEveryCapabilityExactlyOnce(t *testing
 		}()
 	}
 	wg.Wait()
+	waitV3ReleasesIdle(t, d)
 	if err := d.terminalError(); err != nil {
 		t.Fatalf("ownership race was terminal: %v", err)
 	}
@@ -443,13 +450,13 @@ func TestV3ConcurrentLookupAndReclaimRetireEveryCapabilityExactlyOnce(t *testing
 		t.Fatalf("after the race items=%d identities=%d live=%d, want only the root", items, identities, client.liveTokens())
 	}
 	for _, batch := range client.reclaimBatches() {
-		if len(batch) > d.reclaimer.maxBatch {
-			t.Fatalf("reclaim batch of %d exceeds the bound %d", len(batch), d.reclaimer.maxBatch)
+		if len(batch) > d.releases.limit {
+			t.Fatalf("reclaim batch of %d exceeds the bound %d", len(batch), d.releases.limit)
 		}
 	}
 }
 
-func TestV3AbandonedItemIsRetiredThroughTheBatchedReclaimer(t *testing.T) {
+func TestV3AbandonedItemIsRetiredThroughTheReleaseOwner(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
 	collector := &v3ReplyResourceCollector{d: d}
@@ -468,6 +475,7 @@ func TestV3AbandonedItemIsRetiredThroughTheBatchedReclaimer(t *testing.T) {
 	if err := cleanup.finish(); err != nil {
 		t.Fatal(err)
 	}
+	waitV3ReleasesIdle(t, d)
 	batches := client.reclaimBatches()
 	if len(batches) != 1 || len(batches[0]) != 1 || client.liveTokens() != 1 {
 		t.Fatalf("abandon reclaim batches=%x live=%d, want one batched retirement", batches, client.liveTokens())
@@ -483,19 +491,24 @@ func TestV3ReclaimBatchFailureIsTerminalForTheDataPlane(t *testing.T) {
 		response.Errno = errnos.ESTALE
 		return response, nil
 	}
-	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.ReclaimRequest{Item: file.Item}); errno != darwinEIO {
-		t.Fatalf("failed reclaim errno=%d, want EIO", errno)
+	// The reply follows local retirement; the release failure that arrives
+	// afterwards ends the mount instead.
+	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.ReclaimRequest{Item: file.Item}); errno != 0 {
+		t.Fatalf("reclaim errno=%d", errno)
 	}
+	waitV3ReleasesIdle(t, d)
 	if d.terminalError() == nil {
 		t.Fatal("a failed reclaim batch left the data plane serving")
 	}
 }
 
-func TestV3DrainedReclaimerLeavesRetirementToTheDetach(t *testing.T) {
+func TestV3DrainedReleaseOwnerLeavesRetirementToTheDetach(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
 	file := lookupTestAttr(t, d, d.resolveReply().Root, "file")
-	d.reclaimer.drain()
+	if err := d.releases.drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	before := len(client.mutationRequests())
 	if _, errno := dispatchV3Test(d, context.Background(), 0, &pfslocal.ReclaimRequest{Item: file.Item}); errno != 0 {
 		t.Fatalf("reclaim after drain errno=%d", errno)

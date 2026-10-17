@@ -1,7 +1,6 @@
 package portablefsd
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"net"
@@ -17,10 +16,15 @@ import (
 // called, then lets the fake authority apply them.
 func blockV3Reclaims(client *fakeV3DataClient) func() {
 	release := make(chan struct{})
+	client.mu.Lock()
+	defer client.mu.Unlock()
 	client.mutation = func(_ context.Context, identity authorityrpc.MutationIdentity, request *authoritypb.Request) (*authoritypb.Response, error) {
-		if request.GetReclaim() != nil {
+		switch request.GetBody().(type) {
+		case *authoritypb.Request_Reclaim:
 			<-release
 			return client.reclaim(identity, request), nil
+		case *authoritypb.Request_CloseBatch:
+			return client.closeBatch(identity, request), nil
 		}
 		return exactTestMutationReply(identity), nil
 	}
@@ -51,9 +55,9 @@ func abandonV3TestItem(t *testing.T, d *v3DataPlane, client *fakeV3DataClient, i
 	}()
 }
 
-func provisionalTestOpen(t *testing.T, d *v3DataPlane) *v3ProvisionalResources {
+func provisionalTestOpen(t *testing.T, d *v3DataPlane, client *fakeV3DataClient) *v3ProvisionalResources {
 	t.Helper()
-	handle, err := d.installHandle(bytes.Repeat([]byte{0x5a}, 16), d.resolveReply().Root, false)
+	handle, err := d.installHandle(client.issueHandle(), d.resolveReply().Root, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,22 +81,24 @@ func waitV3CleanupDebt(t *testing.T, d *v3DataPlane, want int) {
 	}
 }
 
-// Abandoned resources whose cleanup is stuck behind a slow reclaim share the
-// provisional-reply bound. At the bound registration is refused, which the
-// handler turns into stopping the mount (a terminal capacity guard, not
-// backpressure); the accounting itself returns to zero once cleanup drains.
+// Abandoned resources still waiting for release capacity behind a slow
+// reclaim share the provisional-reply bound. At the bound registration is
+// refused, which the handler turns into stopping the mount (a terminal capacity
+// guard, not backpressure); the accounting itself returns to zero once the
+// release owner accepts them.
 func TestV3AbandonedCleanupDebtBoundsProvisionalRegistration(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
 	release := blockV3Reclaims(client)
+	// With one batch in flight and the forming batch full, every abandonment
+	// is pre-enqueue debt.
+	saturateV3Releases(t, d, client)
 	for index := range maxProvisionalResourcesPerConnection {
 		abandonV3TestItem(t, d, client, index)
 	}
-	if debt := d.outstandingCleanup(); debt != maxProvisionalResourcesPerConnection {
-		t.Fatalf("cleanup debt = %d, want every abandoned item counted", debt)
-	}
+	waitV3CleanupDebt(t, d, maxProvisionalResourcesPerConnection)
 	c := &frontendConn{}
-	open := provisionalTestOpen(t, d)
+	open := provisionalTestOpen(t, d, client)
 	if c.registerProvisionalResource(1, open) {
 		t.Fatal("a provisional reply registered past the cleanup-debt bound")
 	}
@@ -105,16 +111,18 @@ func TestV3AbandonedCleanupDebtBoundsProvisionalRegistration(t *testing.T) {
 	go func() { _ = cleanup.finish() }()
 	release()
 	waitV3CleanupDebt(t, d, 0)
-	if !c.registerProvisionalResource(2, provisionalTestOpen(t, d)) {
-		t.Fatal("registration did not resume after the cleanup debt drained")
-	}
+	waitV3ReleasesIdle(t, d)
 	if live := client.liveTokens(); live != 1 {
 		t.Fatalf("live capabilities after drain = %d, want only the root", live)
+	}
+	if !c.registerProvisionalResource(2, provisionalTestOpen(t, d, client)) {
+		t.Fatal("registration did not resume after the cleanup debt drained")
 	}
 }
 
 // A connection that closes with provisional replies orphans them; their
-// cleanup is debt like any other abandonment until it finishes.
+// cleanup is debt like any other abandonment until the release owner accepts
+// it.
 func TestV3OrphanedProvisionalCleanupIsCountedUntilFinished(t *testing.T) {
 	client := newFakeV3DataClient()
 	d := testV3DataPlane(t, client)
@@ -135,10 +143,12 @@ func TestV3OrphanedProvisionalCleanupIsCountedUntilFinished(t *testing.T) {
 		t.Fatal("provisional lookup was not registered")
 	}
 	release := blockV3Reclaims(client)
+	saturateV3Releases(t, d, client)
 	c.close()
 	waitV3CleanupDebt(t, d, 1)
 	release()
 	waitV3CleanupDebt(t, d, 0)
+	waitV3ReleasesIdle(t, d)
 	if live := client.liveTokens(); live != 1 || d.terminalError() != nil {
 		t.Fatalf("orphan cleanup left live=%d terminal=%v", live, d.terminalError())
 	}

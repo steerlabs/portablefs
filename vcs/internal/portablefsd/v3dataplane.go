@@ -57,6 +57,7 @@ type v3DataPlaneClient interface {
 	IOLimits() (uint32, uint32)
 	SessionLease() time.Duration
 	DataPlaneOperationLimit() int
+	SupportsBatchedClose() bool
 	CallRead(context.Context, *authoritypb.Request) (*authoritypb.Response, error)
 	CallReadRetained(context.Context, *authoritypb.Request, func(error)) (*authoritypb.Response, authorityrpc.ResponseConsumption, error)
 	CallMutationWithIdentity(context.Context, *authoritypb.Request, authorityrpc.MutationAssigned) (*authoritypb.Response, error)
@@ -191,12 +192,23 @@ type v3DataPlane struct {
 
 	// rootIdentity is fixed before the data plane is shared.
 	rootIdentity [16]byte
-	reclaimer    *v3Reclaimer
-	// abandonedDebt counts abandoned resources whose authority cleanup has not
-	// finished. Registration counts it against the provisional-reply bound as
-	// a terminal capacity guard: once outstanding cleanup and provisional
-	// replies reach the bound, registration fails and the mount stops serving.
-	// It does not throttle capability acquisition.
+	releases     *v3ReleaseOwner
+	// abandonedDebt counts abandoned resources that left local ownership but
+	// have not yet been accepted by the release owner (or explicitly left to
+	// terminal session cleanup). Registration counts it against the
+	// provisional-reply bound as a terminal capacity guard: once pre-enqueue
+	// debt and provisional replies reach the bound, registration fails and the
+	// mount stops serving. It does not throttle capability acquisition.
+	//
+	// Together with duplicate capabilities held by active handlers (at most one
+	// per admitted operation, so at most DataPlaneOperationLimit), this is the
+	// pre-enqueue half of the release lag. Close and Reclaim reserve owner
+	// capacity before they detach, so they add none. Each abandoned reply owns
+	// at most one item and one handle, and every attached connection holds at
+	// most maxProvisionalResourcesPerConnection provisional replies, so the
+	// total lag behind local retirement is bounded by
+	// 2*B + DataPlaneOperationLimit + 2*maxProvisionalResourcesPerConnection
+	// per attached frontend connection.
 	abandonedDebt atomic.Int64
 
 	mu              sync.Mutex
@@ -288,13 +300,11 @@ func newV3DataPlane(parent context.Context, cfg v3DataPlaneConfig) (*v3DataPlane
 		nextCookieID: v3CookieFloor, nextCookieBatch: 1,
 		nameMax: 255, maxRead: maxRead, maxWrite: maxWrite,
 	}
-	// The authority client admitted maxWrite payload bytes beside the request
-	// envelope reserve in one negotiated frame, so a batch whose tokens fit in
-	// maxWrite bytes fits in a frame too.
-	d.reclaimer = newV3Reclaimer(
-		min(authorityrpc.MaxReclaimBatch, int(maxWrite)/v3ReclaimTokenWireBytes),
-		d.sendReclaimBatch,
-	)
+	if !cfg.Client.SupportsBatchedClose() {
+		cancel()
+		return nil, errors.New("portablefsd: v3 authority did not negotiate batched-close-v1 for this FSKit session")
+	}
+	d.releases = newV3ReleaseOwner(v3ReleaseLimit(maxWrite), d.sendReleaseBatch)
 	bridge, err := newV3CoherenceBridge(cfg.Client, cfg.CachePolicy, d.recordTerminal)
 	if err != nil {
 		cancel()
@@ -535,30 +545,45 @@ func (d *v3DataPlane) getattr(ctx context.Context, operationID uint64, request *
 	if errno != 0 {
 		return nil, errno
 	}
-	query := &authoritypb.GetAttrRequest{Item: cloneBytesV3(item.token)}
 	var handle *v3HandleRecord
 	if request.Handle != 0 {
-		handle, errno = d.handle(request.Handle, item)
+		var release func()
+		handle, release, errno = d.acquireHandle(request.Handle, item)
 		if errno != 0 {
 			return nil, errno
 		}
-		handle.mu.RLock()
-		defer handle.mu.RUnlock()
+		defer release()
+	}
+	attr, errno := d.currentAttr(ctx, operationID, item, handle)
+	if errno != 0 {
+		return nil, errno
+	}
+	return &pfslocal.GetAttrReply{Attr: attr}, 0
+}
+
+// currentAttr is the one attribute retrieval path for GetAttr, a no-op
+// SetAttr, and a zero-length Write. A non-nil handle is held under its shared
+// lock by the caller, so no path here reacquires it behind a waiting Close.
+func (d *v3DataPlane) currentAttr(ctx context.Context, operationID uint64, item *v3ItemRecord, handle *v3HandleRecord) (pfslocal.Attr, int32) {
+	query := &authoritypb.GetAttrRequest{Item: cloneBytesV3(item.token)}
+	if handle != nil {
 		query.Handle = cloneBytesV3(handle.token)
 	}
 	response, errno := d.callRead(ctx, operationID, &authoritypb.Request{Body: &authoritypb.Request_GetAttr{GetAttr: query}})
 	if errno != 0 {
-		return nil, errno
+		return pfslocal.Attr{}, errno
 	}
 	if response.GetGetAttr() == nil || response.GetGetAttr().GetAttr() == nil {
-		return d.malformed("getattr omitted attr")
+		_, errno := d.malformed("getattr omitted attr")
+		return pfslocal.Attr{}, errno
 	}
 	attr, err := d.localAttr(item, response.GetGetAttr().GetAttr(), d.parentOf(item))
 	if err != nil {
-		return d.malformed(err.Error())
+		_, errno := d.malformed(err.Error())
+		return pfslocal.Attr{}, errno
 	}
 	d.updateAttr(item, response.GetGetAttr().GetAttr())
-	return &pfslocal.GetAttrReply{Attr: attr}, 0
+	return attr, 0
 }
 
 func (d *v3DataPlane) setattr(ctx context.Context, operationID uint64, request *pfslocal.SetAttrRequest) (any, int32) {
@@ -598,16 +623,20 @@ func (d *v3DataPlane) setattr(ctx context.Context, operationID uint64, request *
 	}
 	var handle *v3HandleRecord
 	if request.Handle != 0 {
-		handle, errno = d.handle(request.Handle, item)
+		var release func()
+		handle, release, errno = d.acquireHandle(request.Handle, item)
 		if errno != 0 {
 			return nil, errno
 		}
-		handle.mu.RLock()
-		defer handle.mu.RUnlock()
+		defer release()
 		set.Handle = cloneBytesV3(handle.token)
 	}
 	if set.Mode == nil && set.Size == nil && set.MtimeNs == nil && set.AtimeNs == nil {
-		return d.getattr(ctx, operationID, &pfslocal.GetAttrRequest{Item: request.Item, Handle: request.Handle})
+		attr, errno := d.currentAttr(ctx, operationID, item, handle)
+		if errno != 0 {
+			return nil, errno
+		}
+		return &pfslocal.SetAttrReply{Attr: attr}, 0
 	}
 	gate, err := v3ItemSourceGate(item.item, set.Size != nil)
 	if err != nil {
@@ -652,6 +681,10 @@ func (d *v3DataPlane) open(ctx context.Context, _ uint64, request *pfslocal.Open
 	return &pfslocal.OpenReply{Handle: handle.id}, 0
 }
 
+// closeHandle ends local handle ownership and transfers the authority close to
+// the release owner. Close is not fsync: a successful reply means the handle is
+// retired locally and its release was accepted; a later release failure ends
+// the mount instead of being reported against this callback.
 func (d *v3DataPlane) closeHandle(ctx context.Context, _ uint64, request *pfslocal.CloseRequest) (any, int32) {
 	d.mu.Lock()
 	handle := d.handles[request.Handle]
@@ -663,36 +696,64 @@ func (d *v3DataPlane) closeHandle(ctx context.Context, _ uint64, request *pfsloc
 		}
 		return nil, darwinEBADF
 	}
+	// The exclusive lock waits for every admitted call on this handle. Each of
+	// them revalidated liveness under its shared lock, so none can use the token
+	// after it leaves the index below.
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
-	response, errno := d.callNonVisibleMutation(ctx, 0, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytesV3(handle.token)}}})
-	if errno != 0 {
-		return nil, errno
+	reservation, err := d.releases.reserve(ctx, 1)
+	if err != nil && !errors.Is(err, errV3ReleaseClosed) {
+		return nil, v3ReleaseErrno(err)
 	}
-	_ = response
+	if !d.detachHandle(handle) {
+		// A duplicate Close or an abandoned disposition already retired it.
+		reservation.cancel()
+		return &pfslocal.CloseReply{Retired: true}, 0
+	}
+	reservation.commit([][]byte{handle.token}, nil)
+	return &pfslocal.CloseReply{Retired: true}, 0
+}
+
+// detachHandle removes a live handle and its directory cookies from every
+// local index, exactly once.
+func (d *v3DataPlane) detachHandle(handle *v3HandleRecord) bool {
 	d.mu.Lock()
-	if d.handles[request.Handle] == handle {
-		delete(d.handles, request.Handle)
-		for batchID, batch := range d.cookieBatches {
-			if batch.handleID == request.Handle {
-				d.removeCookieBatchLocked(batchID)
-			}
+	defer d.mu.Unlock()
+	return d.detachHandleLocked(handle)
+}
+
+func (d *v3DataPlane) detachHandleLocked(handle *v3HandleRecord) bool {
+	if d.handles[handle.id] != handle {
+		return false
+	}
+	delete(d.handles, handle.id)
+	for batchID, batch := range d.cookieBatches {
+		if batch.handleID == handle.id {
+			d.removeCookieBatchLocked(batchID)
 		}
 	}
-	d.mu.Unlock()
-	return &pfslocal.CloseReply{Retired: true}, 0
+	return true
+}
+
+// v3ReleaseErrno maps a refused release reservation. Nothing was detached, so
+// a canceled or expired callback may retry; the remaining refusal is the
+// owner's sticky failure, which has already ended the mount.
+func v3ReleaseErrno(err error) int32 {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return v3LocalErrno(err)
+	}
+	return darwinEIO
 }
 
 func (d *v3DataPlane) read(ctx context.Context, operationID uint64, request *pfslocal.ReadRequest) (any, int32) {
 	if request.Length > v3MaxLocalRead {
 		return nil, darwinEOVERFLOW
 	}
-	handle, errno := d.handle(request.Handle, nil)
+	handle, release, errno := d.acquireHandle(request.Handle, nil)
 	if errno != 0 {
 		return nil, errno
 	}
-	handle.mu.RLock()
-	defer handle.mu.RUnlock()
+	defer release()
 	remaining := request.Length
 	offset := request.Offset
 	out := make([]byte, 0, request.Length)
@@ -731,29 +792,24 @@ func (d *v3DataPlane) write(ctx context.Context, operationID uint64, request *pf
 	if request.Offset >= math.MaxInt64 || size > math.MaxInt64-request.Offset {
 		return nil, darwinEFBIG
 	}
-	handle, errno := d.handle(request.Handle, nil)
+	handle, release, errno := d.acquireHandle(request.Handle, nil)
 	if errno != 0 {
 		return nil, errno
 	}
+	defer release()
 	item, errno := d.item(handle.item)
 	if errno != 0 {
 		return d.malformed("write handle lost its item")
 	}
 	if size == 0 {
 		// A zero-length write has no mutation or append-position semantics.
-		// Ask the authority for the current attributes so the FSKit reply
-		// remains exact without a mutation.
-		getattrAny, errno := d.getattr(ctx, operationID, &pfslocal.GetAttrRequest{
-			Item:   item.item,
-			Handle: request.Handle,
-		})
+		// The current attributes keep the FSKit reply exact without a mutation.
+		attr, errno := d.currentAttr(ctx, operationID, item, handle)
 		if errno != 0 {
 			return nil, errno
 		}
-		return &pfslocal.WriteReply{Attr: getattrAny.(*pfslocal.GetAttrReply).Attr}, 0
+		return &pfslocal.WriteReply{Attr: attr}, 0
 	}
-	handle.mu.RLock()
-	defer handle.mu.RUnlock()
 	if handle.append || request.Append {
 		// FSKit supplies only a kernel-chosen position here; it cannot carry
 		// the authority-owned append intent required for atomic cross-client
@@ -856,12 +912,11 @@ func v3WriteCommitted(item *v3ItemRecord, position, size uint64, response *autho
 }
 
 func (d *v3DataPlane) fsync(ctx context.Context, request *pfslocal.FsyncRequest) (any, int32) {
-	handle, errno := d.handle(request.Handle, nil)
+	handle, release, errno := d.acquireHandle(request.Handle, nil)
 	if errno != 0 {
 		return nil, errno
 	}
-	handle.mu.RLock()
-	defer handle.mu.RUnlock()
+	defer release()
 	response, errno := d.callRead(ctx, 0, &authoritypb.Request{Body: &authoritypb.Request_Fsync{Fsync: &authoritypb.FsyncRequest{Handle: cloneBytesV3(handle.token)}}})
 	if errno != 0 {
 		return nil, errno
@@ -1147,19 +1202,16 @@ func (d *v3DataPlane) hardlink(ctx context.Context, operationID uint64, request 
 }
 
 func (d *v3DataPlane) xattrGet(ctx context.Context, operationID uint64, request *pfslocal.XattrGetRequest) (any, int32) {
-	item, handle, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
+	item, handle, release, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
 	if errno != 0 {
 		return nil, errno
 	}
+	defer release()
 	if !validXattrName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	if errno := v3StaticXattrErrno(request.Name); errno != 0 {
 		return nil, errno
-	}
-	if handle != nil {
-		handle.mu.RLock()
-		defer handle.mu.RUnlock()
 	}
 	query := &authoritypb.GetXattrRequest{Item: cloneBytesV3(item.token), Name: []byte(request.Name)}
 	if handle != nil {
@@ -1181,7 +1233,9 @@ func (d *v3DataPlane) xattrGet(ctx context.Context, operationID uint64, request 
 // project quota. The authority's EOPNOTSUPP crosses the same wire mapping a
 // round trip would use, and no mutation or publication gate is involved.
 func (d *v3DataPlane) xattrSet(request *pfslocal.XattrSetRequest) (any, int32) {
-	if _, _, errno := d.itemAndOptionalHandle(request.Item, request.Handle); errno != 0 {
+	_, _, release, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
+	release()
+	if errno != 0 {
 		return nil, errno
 	}
 	if !validXattrName(request.Name) || request.CreateOnly && request.ReplaceOnly {
@@ -1191,14 +1245,11 @@ func (d *v3DataPlane) xattrSet(request *pfslocal.XattrSetRequest) (any, int32) {
 }
 
 func (d *v3DataPlane) xattrList(ctx context.Context, operationID uint64, request *pfslocal.XattrListRequest) (any, int32) {
-	item, handle, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
+	item, handle, release, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
 	if errno != 0 {
 		return nil, errno
 	}
-	if handle != nil {
-		handle.mu.RLock()
-		defer handle.mu.RUnlock()
-	}
+	defer release()
 	query := &authoritypb.ListXattrRequest{Item: cloneBytesV3(item.token)}
 	if handle != nil {
 		query.Handle = cloneBytesV3(handle.token)
@@ -1221,19 +1272,16 @@ func (d *v3DataPlane) xattrList(ctx context.Context, operationID uint64, request
 }
 
 func (d *v3DataPlane) xattrRemove(ctx context.Context, operationID uint64, request *pfslocal.XattrRemoveRequest) (any, int32) {
-	item, handle, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
+	item, handle, release, errno := d.itemAndOptionalHandle(request.Item, request.Handle)
 	if errno != 0 {
 		return nil, errno
 	}
+	defer release()
 	if !validXattrName(request.Name) {
 		return nil, darwinEINVAL
 	}
 	if errno := v3StaticXattrErrno(request.Name); errno != 0 {
 		return nil, errno
-	}
-	if handle != nil {
-		handle.mu.RLock()
-		defer handle.mu.RUnlock()
 	}
 	query := &authoritypb.RemoveXattrRequest{Item: cloneBytesV3(item.token), Name: []byte(request.Name)}
 	if handle != nil {
@@ -1273,7 +1321,10 @@ func (d *v3DataPlane) syncVolume(ctx context.Context) (any, int32) {
 	return &pfslocal.SyncVolumeReply{Degraded: false}, 0
 }
 
-func (d *v3DataPlane) reclaim(_ context.Context, request *pfslocal.ReclaimRequest) (any, int32) {
+// reclaim retires the frontend's ownership of an item. The reply follows local
+// retirement and the release owner's acceptance of the capability, not its
+// authority round trip, so serial kernel reclamation proceeds at local speed.
+func (d *v3DataPlane) reclaim(ctx context.Context, request *pfslocal.ReclaimRequest) (any, int32) {
 	record, errno := d.item(request.Item)
 	if errno != 0 {
 		if errno == darwinESTALE {
@@ -1284,9 +1335,14 @@ func (d *v3DataPlane) reclaim(_ context.Context, request *pfslocal.ReclaimReques
 	if record.root {
 		return &pfslocal.ReclaimReply{}, 0
 	}
+	reservation, err := d.releases.reserve(ctx, 1)
+	if err != nil && !errors.Is(err, errV3ReleaseClosed) {
+		return nil, v3ReleaseErrno(err)
+	}
 	d.mu.Lock()
 	if d.itemsByID[record.item.ItemID] != record {
 		d.mu.Unlock()
+		reservation.cancel()
 		return &pfslocal.ReclaimReply{}, 0
 	}
 	if record.provisional != 0 {
@@ -1296,13 +1352,12 @@ func (d *v3DataPlane) reclaim(_ context.Context, request *pfslocal.ReclaimReques
 		// final abandon reclaims it, while an accept becomes its new owner.
 		record.accepted = false
 		d.mu.Unlock()
+		reservation.cancel()
 		return &pfslocal.ReclaimReply{}, 0
 	}
 	d.detachItemLocked(record)
 	d.mu.Unlock()
-	if err := d.reclaimer.retire(record.token); err != nil {
-		return nil, darwinEIO
-	}
+	reservation.commit(nil, [][]byte{record.token})
 	return &pfslocal.ReclaimReply{}, 0
 }
 
@@ -1333,18 +1388,17 @@ func (d *v3DataPlane) enumerateEntries(ctx context.Context, operationID uint64, 
 	if request.MaxEntries == 0 || request.MaxEntries > 4096 {
 		return nil, darwinEINVAL
 	}
-	handle, errno := d.handle(request.Handle, dir)
+	handle, release, errno := d.acquireHandle(request.Handle, dir)
 	if errno != 0 {
 		return nil, errno
 	}
+	defer release()
 	// Authority enumeration cookies are positions on one retained XFS open
 	// directory description. Keep that exact handle alive and immutable across
 	// the read: opening a fresh authority handle for each pfslocal page resets
 	// its cursor high-water mark to zero, so every nonzero continuation is
 	// correctly rejected as ESTALE. FSKit already gives directory walks an
 	// open/close lifecycle; VolumeCore carries that existing read handle here.
-	handle.mu.RLock()
-	defer handle.mu.RUnlock()
 	var position v3CookieRecord
 	if request.Cookie != 0 {
 		var ok bool
@@ -1814,7 +1868,7 @@ func (d *v3DataPlane) intern(ctx context.Context, candidate *authoritypb.Item, p
 	collector.items = append(collector.items, record)
 	d.mu.Unlock()
 	if duplicate {
-		if err := d.reclaimer.retire(parsed.token); err != nil {
+		if err := d.releases.submit(nil, [][]byte{parsed.token}); err != nil {
 			return nil, darwinEIO
 		}
 	}
@@ -1824,7 +1878,7 @@ func (d *v3DataPlane) intern(ctx context.Context, candidate *authoritypb.Item, p
 // bindAlias records a new hard-link binding of an item the frontend already
 // owns. LINK returns the same stable identity, so the canonical record must
 // still be the one the callback named; the reply's capability is either that
-// record's own or a duplicate the reclaimer retires.
+// record's own or a duplicate the release owner retires.
 func (d *v3DataPlane) bindAlias(item *v3ItemRecord, linked *authoritypb.Item, parent *v3ItemRecord, name []byte) int32 {
 	parsed, err := d.recordFromAuthority(linked, 0)
 	if err != nil {
@@ -1843,7 +1897,7 @@ func (d *v3DataPlane) bindAlias(item *v3ItemRecord, linked *authoritypb.Item, pa
 	duplicate := !bytes.Equal(item.token, parsed.token)
 	d.mu.Unlock()
 	if duplicate {
-		if err := d.reclaimer.retire(parsed.token); err != nil {
+		if err := d.releases.submit(nil, [][]byte{parsed.token}); err != nil {
 			return darwinEIO
 		}
 	}
@@ -2044,16 +2098,42 @@ func (d *v3DataPlane) handle(id uint64, owner *v3ItemRecord) (*v3HandleRecord, i
 	return handle, 0
 }
 
-func (d *v3DataPlane) itemAndOptionalHandle(itemValue pfslocal.Item, handleID uint64) (*v3ItemRecord, *v3HandleRecord, int32) {
+// itemAndOptionalHandle resolves an item and, when named, acquires its live
+// handle; release is always callable.
+func (d *v3DataPlane) itemAndOptionalHandle(itemValue pfslocal.Item, handleID uint64) (*v3ItemRecord, *v3HandleRecord, func(), int32) {
 	item, errno := d.item(itemValue)
+	if errno != 0 {
+		return nil, nil, func() {}, errno
+	}
+	if handleID == 0 {
+		return item, nil, func() {}, 0
+	}
+	handle, release, errno := d.acquireHandle(handleID, item)
+	if errno != 0 {
+		return nil, nil, func() {}, errno
+	}
+	return item, handle, release, 0
+}
+
+// acquireHandle resolves a live handle and takes its shared lock, then
+// revalidates liveness under that lock. Close detaches a handle only while
+// holding the exclusive lock, and abandoned cleanup takes it before releasing
+// the token, so a call admitted here owns a live token until release; resolving
+// the pointer before the lock is not enough when a competing Close wins.
+func (d *v3DataPlane) acquireHandle(id uint64, owner *v3ItemRecord) (*v3HandleRecord, func(), int32) {
+	handle, errno := d.handle(id, owner)
 	if errno != 0 {
 		return nil, nil, errno
 	}
-	if handleID == 0 {
-		return item, nil, 0
+	handle.mu.RLock()
+	d.mu.Lock()
+	live := d.handles[id] == handle
+	d.mu.Unlock()
+	if !live {
+		handle.mu.RUnlock()
+		return nil, nil, darwinEBADF
 	}
-	handle, errno := d.handle(handleID, item)
-	return item, handle, errno
+	return handle, handle.mu.RUnlock, 0
 }
 
 func (d *v3DataPlane) installHandle(token []byte, item pfslocal.Item, appendMode bool) (*v3HandleRecord, error) {
@@ -2320,19 +2400,13 @@ func (d *v3DataPlane) applyReplyResourceDisposition(
 	}
 	if !acceptHandles {
 		for _, handle := range resources.handles {
-			if d.handles[handle.id] == handle {
-				delete(d.handles, handle.id)
-				for batchID, batch := range d.cookieBatches {
-					if batch.handleID == handle.id {
-						d.removeCookieBatchLocked(batchID)
-					}
-				}
+			if d.detachHandleLocked(handle) {
 				cleanup.handles = append(cleanup.handles, handle)
 			}
 		}
 	}
 	// Abandoned resources are debt from the moment they leave their owner until
-	// their authority cleanup finishes.
+	// the release owner accepts them.
 	cleanup.debt = int64(len(cleanup.items) + len(cleanup.handles))
 	d.abandonedDebt.Add(cleanup.debt)
 	d.mu.Unlock()
@@ -2344,6 +2418,10 @@ func (d *v3DataPlane) applyReplyResourceDisposition(
 	return cleanup, nil
 }
 
+// finish transfers the abandoned resources to the release owner. It runs off
+// the serial frontend reader, which never waits for release capacity; the debt
+// it carries ends at accepted transfer, or at explicit transfer to terminal
+// session cleanup when the owner is closed or failed.
 func (cleanup *v3ResourceCleanup) finish() error {
 	if cleanup == nil || cleanup.d == nil {
 		return nil
@@ -2352,56 +2430,69 @@ func (cleanup *v3ResourceCleanup) finish() error {
 		cleanup.d.abandonedDebt.Add(-cleanup.debt)
 		cleanup.debt = 0
 	}()
-	if cleanup.terminalReason != nil || cleanup.d.terminalError() != nil {
-		// Terminal retirement releases capabilities with the session. Starting
-		// compensation against its canceled admission context would turn local
-		// frontend loss into an authority transport failure.
-		return nil
-	}
 	if len(cleanup.handles) == 0 && len(cleanup.items) == 0 {
 		return nil
 	}
-	d := cleanup.d
-	// An admitted cleanup owns an authority replay assignment just like a
-	// foreground request. Local withdrawal cannot cancel that assignment.
+	closes := make([][]byte, 0, len(cleanup.handles))
+	for _, handle := range cleanup.handles {
+		// A call admitted before the abandonment holds the shared lock and keeps
+		// using the token until it unlocks; later calls fail revalidation.
+		handle.mu.Lock()
+		handle.mu.Unlock()
+		closes = append(closes, handle.token)
+	}
+	reclaims := make([][]byte, 0, len(cleanup.items))
+	for _, item := range cleanup.items {
+		reclaims = append(reclaims, item.token)
+	}
+	return cleanup.d.releases.submit(closes, reclaims)
+}
+
+// sendReleaseBatch is the release owner's work batch: at most one CloseBatch,
+// then at most one Reclaim. Each request owns an exact replay assignment, so it
+// runs on the data plane's lifetime rather than any caller's: a lost reply
+// replays the same mutation inside the client, and local withdrawal cannot
+// cancel it. Every outcome other than complete success is terminal.
+func (d *v3DataPlane) sendReleaseBatch(closes, reclaims [][]byte) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), operationAdmissionBudgetValue())
 	defer cancel()
-	for _, handle := range cleanup.handles {
-		handle.mu.Lock()
-		response, errno := d.callNonVisibleMutation(ctx, 0, &authoritypb.Request{Body: &authoritypb.Request_Close{Close: &authoritypb.CloseRequest{Handle: cloneBytesV3(handle.token)}}})
-		handle.mu.Unlock()
-		if errno != 0 {
-			return d.fail(fmt.Errorf("portablefsd: abandon provisional handle %d failed with errno %d", handle.id, errno))
+	if len(closes) != 0 {
+		batch := &authoritypb.CloseBatchRequest{Closes: make([]*authoritypb.CloseRequest, len(closes))}
+		for index, token := range closes {
+			batch.Closes[index] = &authoritypb.CloseRequest{Handle: cloneBytesV3(token)}
 		}
-		_ = response
+		response, errno := d.callNonVisibleMutation(ctx, 0, &authoritypb.Request{Body: &authoritypb.Request_CloseBatch{CloseBatch: batch}})
+		if errno != 0 {
+			return d.fail(fmt.Errorf("portablefsd: batched close of %d handles failed with errno %d", len(closes), errno))
+		}
+		if err := v3CloseBatchSucceeded(response, len(closes)); err != nil {
+			return d.fail(err)
+		}
 	}
-	if len(cleanup.items) == 0 {
-		return nil
-	}
-	tokens := make([][]byte, len(cleanup.items))
-	for index, item := range cleanup.items {
-		tokens[index] = item.token
-	}
-	if err := d.reclaimer.retire(tokens...); err != nil && d.terminalError() == nil {
-		return err
+	if len(reclaims) != 0 {
+		request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: reclaims}}}
+		if _, errno := d.callNonVisibleMutation(ctx, 0, request); errno != 0 {
+			return d.fail(fmt.Errorf("portablefsd: batched reclaim of %d item capabilities failed with errno %d", len(reclaims), errno))
+		}
 	}
 	return nil
 }
 
-// sendReclaimBatch is the reclaimer's one authority round trip. The batch owns
-// an exact replay assignment, so it runs on the data plane's lifetime rather
-// than any caller's: a lost reply replays the same mutation inside the client,
-// and local withdrawal cannot cancel it. A terminal session releases its
-// capabilities itself, so nothing is sent once the data plane is terminal.
-func (d *v3DataPlane) sendReclaimBatch(tokens [][]byte) error {
-	if err := d.terminalError(); err != nil {
-		return err
+// v3CloseBatchSucceeded requires one ordered result per close, each retired
+// with no errno or failure class. CloseBatch consumes descriptor ownership even
+// when a close reports an error, so an error is never retried; it is a release
+// failure that ends the mount.
+func v3CloseBatchSucceeded(response *authoritypb.Response, closes int) error {
+	results := response.GetCloseBatch().GetResults()
+	if response.GetCloseBatch() == nil || len(results) != closes {
+		return fmt.Errorf("portablefsd: batched close of %d handles returned %d results", closes, len(results))
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.ctx), operationAdmissionBudgetValue())
-	defer cancel()
-	request := &authoritypb.Request{Body: &authoritypb.Request_Reclaim{Reclaim: &authoritypb.ReclaimRequest{Items: tokens}}}
-	if _, errno := d.callNonVisibleMutation(ctx, 0, request); errno != 0 {
-		return d.fail(fmt.Errorf("portablefsd: batched reclaim of %d item capabilities failed with errno %d", len(tokens), errno))
+	for index, result := range results {
+		if result == nil || !result.GetRetired() || result.GetErrno() != 0 ||
+			result.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED {
+			return fmt.Errorf("portablefsd: batched close entry %d of %d failed: retired=%t errno=%d failure=%d",
+				index, closes, result.GetRetired(), result.GetErrno(), result.GetFailure())
+		}
 	}
 	return nil
 }
@@ -2412,7 +2503,17 @@ func (d *v3DataPlane) malformed(detail string) (any, int32) {
 }
 func (d *v3DataPlane) terminalError() error { d.mu.Lock(); defer d.mu.Unlock(); return d.terminal }
 func (d *v3DataPlane) recordTerminal(err error) {
-	d.failOnce.Do(func() { d.mu.Lock(); d.terminal = err; d.mu.Unlock(); d.cancel() })
+	d.failOnce.Do(func() {
+		d.mu.Lock()
+		d.terminal = err
+		d.mu.Unlock()
+		// Session cleanup, not item-by-item replay, owns every release this
+		// data plane has not already put in flight.
+		if d.releases != nil {
+			d.releases.abandon()
+		}
+		d.cancel()
+	})
 }
 
 func (d *v3DataPlane) abandonBeforeMount(err error) {

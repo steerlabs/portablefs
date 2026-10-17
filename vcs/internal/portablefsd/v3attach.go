@@ -1040,11 +1040,15 @@ func (r *registry) detachV3(a *attach, force bool, ops fskitKernelOps) error {
 		select {
 		case <-d.client.SessionDone():
 		default:
-			// Retirements already submitted settle on the live session; the
-			// detach itself releases every capability retired after this point.
-			d.reclaimer.drain()
+			// Releases already accepted settle on the live session. Draining closes
+			// release admission, which explicitly hands every later token to this
+			// detach: ending the session releases every capability it still holds.
+			// A failed or unfinished drain must not become a clean detach.
 			proofCtx, cancel := context.WithTimeout(context.Background(), v3DetachProofBudget)
-			deliverErr := session.DetachAfterUnmount(proofCtx, proof)
+			deliverErr := d.releases.drain(proofCtx)
+			if deliverErr == nil {
+				deliverErr = session.DetachAfterUnmount(proofCtx, proof)
+			}
 			cancel()
 			if deliverErr != nil {
 				// The proof exists but the authority did not accept it. Ending the

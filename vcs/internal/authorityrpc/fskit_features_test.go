@@ -25,6 +25,11 @@ func (h fskitFeatureTestHandler) Handle(ctx context.Context, req *authoritypb.Re
 	}
 	if active := reply.GetActivate(); active != nil {
 		active.Features, _ = advertisedActivateFeatures(authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR)
+		// The current FSKit client also requires the optional FSKit CloseBatch
+		// admission; an authority that serves it advertises it here.
+		if !slices.Contains(active.Features, batchedCloseFeature) {
+			active.Features = append(active.Features, batchedCloseFeature)
+		}
 		active.Features = slices.DeleteFunc(active.Features, func(feature string) bool { return feature == h.omit })
 		active.FrontendProfile = authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR
 		active.FskitRepairCursor = &authoritypb.VisibilityCursor{Sequence: 1, Phase: authoritypb.VisibilityPhase_VISIBILITY_PHASE_COMPLETE}
@@ -32,7 +37,7 @@ func (h fskitFeatureTestHandler) Handle(ctx context.Context, req *authoritypb.Re
 	return reply
 }
 func TestFskitClientRequiresAdditiveWriteAndDurabilityFeatures(t *testing.T) {
-	for _, omit := range []string{"", fskitDirectWriteFeature, fskitDurableMutationsFeature, fskitFragmentedWriteFeature} {
+	for _, omit := range []string{"", fskitDirectWriteFeature, fskitDurableMutationsFeature, fskitFragmentedWriteFeature, batchedCloseFeature} {
 		t.Run("omit_"+omit, func(t *testing.T) {
 			handler := fskitFeatureTestHandler{clientTestHandler: clientTestHandler{epoch: make([]byte, 16), maxInFlight: 4}, omit: omit}
 			address, tls, stop := startTestServer(t, handler, 4, time.Minute)
@@ -50,6 +55,9 @@ func TestFskitClientRequiresAdditiveWriteAndDurabilityFeatures(t *testing.T) {
 				defer client.Close()
 				if _, max := client.IOLimits(); max != 1<<20 {
 					t.Fatalf("max write=%d", max)
+				}
+				if !client.SupportsBatchedClose() {
+					t.Fatal("negotiated FSKit session does not report batched close")
 				}
 			} else {
 				if err == nil {
