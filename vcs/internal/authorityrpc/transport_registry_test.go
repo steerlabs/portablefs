@@ -73,7 +73,7 @@ func testTransportRegistrationForProfile(
 	closed := new(atomic.Int32)
 	entry, err := registry.register(
 		volumeserver.PeerIdentity{peer}, setID, role, profile,
-		func() {}, func() error { closed.Add(1); return nil },
+		func() {}, func() error { closed.Add(1); return nil }, false, false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +93,7 @@ func TestTransportRegistryRequiresExactPairAndRefusesUnprovedDuplicateRole(t *te
 	}
 	var set connectionSetID
 	set[0] = 2
-	if _, err := registry.register(volumeserver.PeerIdentity{1}, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, func() {}, func() error { return nil }); !errors.Is(err, ErrTransportBinding) {
+	if _, err := registry.register(volumeserver.PeerIdentity{1}, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES, func() {}, func() error { return nil }, false, false); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("duplicate DATA = %v, want ErrTransportBinding", err)
 	}
 	control, _ := testTransportRegistration(t, registry, 1, 2, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL)
@@ -322,7 +322,7 @@ func TestTransportRegistryTerminalCleanupHasOnePhysicalCompletionBarrier(t *test
 			close(dataCloseEntered)
 			<-releaseDataClose
 			return nil
-		},
+		}, false, false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -331,7 +331,7 @@ func TestTransportRegistryTerminalCleanupHasOnePhysicalCompletionBarrier(t *test
 	_, err = registry.register(
 		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL,
 		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		func() {}, func() error { controlClosed.Add(1); return nil },
+		func() {}, func() error { controlClosed.Add(1); return nil }, false, false,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -373,7 +373,7 @@ func TestTransportRegistryTerminalCleanupHasOnePhysicalCompletionBarrier(t *test
 	if _, err := registry.register(
 		peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA,
 		authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES,
-		func() {}, func() error { return nil },
+		func() {}, func() error { return nil }, false, false,
 	); !errors.Is(err, ErrTransportBinding) {
 		t.Fatalf("terminating connection set admitted a replacement: %v", err)
 	}

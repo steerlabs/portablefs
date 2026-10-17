@@ -15,7 +15,7 @@ import (
 
 const visibilityMembershipHeader = "PFS-VISIBILITY-2"
 
-// Unknown legacy mounts retain the unbounded Mac fencing requirement.
+// Unknown legacy mounts retain the Mac activation and topology fencing requirement.
 type MountMembershipProfile string
 
 const (

@@ -122,7 +122,7 @@ func (h *VolumeHandler) handleFallocate(ctx context.Context, req *authoritypb.Re
 			return nil, err
 		}
 		coordinate = rangeCoordinate(resolved)
-		before, err = h.Store.GetattrOpen(handle)
+		before, err = h.getattrOpen(handle)
 		if err != nil {
 			return nil, err
 		}
@@ -226,7 +226,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 		if err != nil {
 			return nil, err
 		}
-		sourceBefore, err = h.Store.GetattrOpen(input)
+		sourceBefore, err = h.getattrOpen(input)
 		if err != nil {
 			return nil, err
 		}
@@ -312,7 +312,7 @@ func (h *VolumeHandler) handleCopyFileRange(ctx context.Context, req *authorityp
 			flags |= rangeReplyPostApply
 			resultErr = rangeResultError(applyErr)
 		}
-		sourcePost, sourceErr := h.Store.GetattrOpen(input)
+		sourcePost, sourceErr := h.getattrOpen(input)
 		if sourceErr != nil {
 			return h.errorResponse(0, sourceErr, true), []volumeserver.VisibilityTarget{}
 		}

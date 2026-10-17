@@ -464,6 +464,7 @@ const (
 // are admitted against an explicit deployment bound rather than clamped, so a
 // mount can never be running against limits it did not agree to.
 type VisibilityCommitment struct {
+	Exclusion *CompatibilityExclusion
 	// CachedNameCapacity is how many distinct resolutions the frontend's kernel
 	// cache is expected to hold. It sizes the per-session resolved index and
 	// nothing else: the index never drops a coordinate, so an understated
@@ -552,6 +553,7 @@ type visibilityParticipant struct {
 	index               *resolvedIndex
 	repair              NamespaceRepair
 	compatibilityWriter bool
+	exclusion           *CompatibilityExclusion
 }
 
 // mutationFairnessDebt is an off-list, one-shot effective per-key FIFO
@@ -717,8 +719,9 @@ type VisibilityConfig struct {
 	MaxRepairBudget time.Duration
 	// MaxClockSkew bounds the disagreement tolerated between this authority's
 	// clock and a frontend's when a mount-absence observation is timestamped.
-	MaxClockSkew time.Duration
-	Now          func() time.Time
+	MaxClockSkew  time.Duration
+	Now           func() time.Time
+	ContinuousNow func() (time.Duration, error)
 	// OnFence observes participant-scoped fencing. It exists so an operator can
 	// see which mount left and why without the event being escalated into an
 	// epoch-wide failure.
@@ -751,11 +754,16 @@ type VisibilityCoordinator struct {
 	// PREPARE/apply/COMPLETE barriers in flight.
 	sequencer *mutationSequencer
 
-	cfg          VisibilityConfig
-	startupReady bool
+	cfg                   VisibilityConfig
+	startupReady          bool
+	writerRestartDeadline time.Duration
+	writerRestartLast     time.Duration
+	writerRestartStarted  bool
+	writerRestartFailed   bool
 
 	mu           sync.Mutex
 	participants map[SessionID]*visibilityParticipant
+	exclusions   map[SessionID]*CompatibilityExclusion
 	fairness     map[SessionID]mutationFairnessDebt
 	next         uint64
 	poisoned     error
@@ -782,6 +790,9 @@ func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, err
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.ContinuousNow == nil {
+		cfg.ContinuousNow = continuousNow
+	}
 	var seed [8]byte
 	if _, err := rand.Read(seed[:]); err != nil {
 		return nil, fmt.Errorf("seed visibility resolved index: %w", err)
@@ -789,6 +800,7 @@ func NewVisibilityCoordinator(cfg VisibilityConfig) (*VisibilityCoordinator, err
 	return &VisibilityCoordinator{
 		cfg: cfg, sequencer: newMutationSequencer(),
 		participants: make(map[SessionID]*visibilityParticipant),
+		exclusions:   make(map[SessionID]*CompatibilityExclusion),
 		fairness:     make(map[SessionID]mutationFairnessDebt),
 		mutations:    make(map[uint64]*visibilityMutationState),
 		laneWaiters:  make(map[uint64]*visibilityLaneWaiter),
@@ -901,6 +913,10 @@ func (c *VisibilityCoordinator) activateParticipant(
 		return VisibilityCursor{}, ErrAdmission
 	}
 	if commitment.CompatibilityWriter {
+		if c.compatibilityExcludedLocked(id) {
+			c.mu.Unlock()
+			return VisibilityCursor{}, ErrCompatibilityWriterLease
+		}
 		for _, participant := range c.participants {
 			if participant.compatibilityWriter {
 				c.mu.Unlock()
@@ -935,7 +951,7 @@ func (c *VisibilityCoordinator) activateParticipant(
 		changed: make(chan struct{}), left: make(chan struct{}),
 		budget: commitment.RepairBudget, registered: c.cfg.Now(),
 		index: index, repair: commitment.NamespaceRepair,
-		compatibilityWriter: commitment.CompatibilityWriter,
+		compatibilityWriter: commitment.CompatibilityWriter, exclusion: commitment.Exclusion,
 	}
 	c.participants[id] = p
 	c.mu.Unlock()
@@ -1099,6 +1115,7 @@ func (c *VisibilityCoordinator) cleanDetach(id SessionID, proof MountAbsenceProo
 		c.mu.Unlock()
 		return err
 	}
+	c.retainExclusionLocked(p, true)
 	delete(c.participants, id)
 	delete(c.fairness, id)
 	pending := p.pending
@@ -1166,6 +1183,7 @@ func (c *VisibilityCoordinator) fence(id SessionID, expected *visibilityDelivery
 		c.mu.Unlock()
 		return false
 	}
+	c.retainExclusionLocked(p, false)
 	delete(c.participants, id)
 	delete(c.fairness, id)
 	// Ending the authority session is immediate, but it is not evidence that the
@@ -1309,7 +1327,7 @@ func (c *VisibilityCoordinator) execute(ctx context.Context, source SessionID, m
 	strict := len(c.participants) != 0
 	sourceParticipant := c.participants[source]
 	sourceStrict := sourceParticipant != nil
-	compatibilityWriterBlocked := false
+	compatibilityWriterBlocked := c.compatibilityExcludedLocked(source)
 	for id, participant := range c.participants {
 		if id != source && participant.compatibilityWriter {
 			compatibilityWriterBlocked = true

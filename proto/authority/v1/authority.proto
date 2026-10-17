@@ -183,9 +183,10 @@ message Response {
   uint64 visible_sequence = 70;
   // Present only on a successful KEEPALIVE reply to a session that negotiated
   // fskit-versioned-metadata-v1. It is the authority-relative duration, sampled
-  // after renewal under the session lock and rounded down, for which this
-  // session's compatibility-writer exclusion is promised: never more than the
-  // remaining lease or authorization, and never positive for a terminal
+  // after renewal under the session lock and rounded down to whole milliseconds.
+  // It promises this session's compatibility-writer exclusion for no more than the
+  // remaining lease, authorization, advertised millisecond lease, or the frozen
+  // MaxCacheProof (60,000,000,000 ns), and never positive for a terminal
   // session. The authority retains that exclusion for the whole promise even if
   // the session is fenced earlier. A client anchors it at the request's local
   // send time on a clock that advances across sleep; it is never compared with

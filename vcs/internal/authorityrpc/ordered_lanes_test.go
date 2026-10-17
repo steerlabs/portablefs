@@ -171,16 +171,16 @@ func TestTransportPairRefusesOrderedLaneModeMismatch(t *testing.T) {
 	}
 	peer, set := volumeserver.PeerIdentity{1}, connectionSetID{1}
 	profile := authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, profile, func() {}, func() error { return nil }, true); err != nil {
+	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, profile, func() {}, func() error { return nil }, true, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL, profile, func() {}, func() error { return nil }, false); !errors.Is(err, ErrTransportBinding) {
+	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL, profile, func() {}, func() error { return nil }, false, false); !errors.Is(err, ErrTransportBinding) {
 		t.Fatal("CONTROL changed ordered mode", err)
 	}
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL, profile, func() {}, func() error { return nil }, true); err != nil {
+	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_CONTROL, profile, func() {}, func() error { return nil }, true, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, profile, func() {}, func() error { return nil }, false); !errors.Is(err, ErrTransportBinding) {
+	if _, err := r.register(peer, set, authoritypb.TransportRole_TRANSPORT_ROLE_DATA, profile, func() {}, func() error { return nil }, false, false); !errors.Is(err, ErrTransportBinding) {
 		t.Fatal("replacement changed ordered mode", err)
 	}
 }

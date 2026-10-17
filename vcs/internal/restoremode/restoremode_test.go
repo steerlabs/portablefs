@@ -23,6 +23,7 @@ type fakeStore struct {
 	events        []string
 	linked        bool
 	mtimeRestores int
+	mtime         int64
 }
 
 func newFakeStore(sizes map[uint32]int64) *fakeStore {
@@ -63,10 +64,16 @@ func (s *fakeStore) bytes(entry uint32) []byte {
 	return append([]byte(nil), s.data[entry]...)
 }
 func (s *fakeStore) Fdatasync(uint32) error { s.event("fdatasync"); return nil }
-func (s *fakeStore) RestoreMtime(uint32) error {
+func (s *fakeStore) Mtime(uint32) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.mtime, nil
+}
+func (s *fakeStore) RestoreMtime(_ uint32, nanos int64) error {
 	s.mu.Lock()
 	s.events = append(s.events, "mtime")
 	s.mtimeRestores++
+	s.mtime = nanos
 	s.mu.Unlock()
 	return nil
 }
@@ -820,7 +827,7 @@ func TestTruncateZeroIsFetchFreeAndShorteningRecallsBoundary(t *testing.T) {
 	}
 }
 
-func TestUserModifiedSuppressesLaterMtimeRestore(t *testing.T) {
+func TestUserModifiedPreservesLaterHydrationMtime(t *testing.T) {
 	store := newFakeStore(map[uint32]int64{0: 8})
 	mode, _, identity := openTestMode(t, store, testInfo([2]uint32{0, 0}, [2]uint32{0, 1}), map[chunkKey]Chunk{{0, 0}: {Extents: []Extent{{Data: []byte("abcd")}}}, {0, 1}: {Extents: []Extent{{Data: []byte("efgh")}}}}, func(c *Config) { c.disableDrain = true })
 	if err := mode.EnsureHydrated(context.Background(), identity, 0, 4); err != nil {
@@ -835,8 +842,8 @@ func TestUserModifiedSuppressesLaterMtimeRestore(t *testing.T) {
 	store.mu.Lock()
 	restores := store.mtimeRestores
 	store.mu.Unlock()
-	if restores != 1 {
-		t.Fatalf("mtime restores=%d want 1", restores)
+	if restores != 2 {
+		t.Fatalf("mtime restores=%d want 2", restores)
 	}
 }
 

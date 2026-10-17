@@ -281,6 +281,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// Root and membership locks now belong to this process. The shipping
+	// predecessor drains Serve and restore workers before releasing them.
+	if err := coordination.Visibility.StartCompatibilityWriterGrace(); err != nil {
+		return fmt.Errorf("establish compatibility writer takeover: %w", err)
+	}
 	if revision, err := coordination.Routes.Revision(); err == nil {
 		fmt.Fprintf(os.Stderr, "portablefs-authority: volume %s routing revision %x\n", o.volumeID, revision)
 	}
@@ -322,6 +328,7 @@ func run() error {
 	}
 	defer quiesce.Close()
 
+	storageFailure := make(chan error, 1)
 	var restore *restoremode.Mode
 	var restoreFiles *xfsstore.RestoreFiles
 	restoreActive, err := restoremode.Active(stateRoot)
@@ -342,13 +349,20 @@ func run() error {
 		restore, err = restoremode.Open(ctx, restoremode.Config{
 			StateRoot: stateRoot, VolumeID: o.volumeID, AuthorityEpoch: o.authorityGeneration,
 			Store: restoreFiles, Bindings: bindings,
+			OnStorageFailure: func(err error) {
+				store.Fence(err)
+				select {
+				case storageFailure <- err:
+				default:
+				}
+				stop()
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("start restore mode: %w", err)
 		}
 		defer restore.Close()
 	}
-	storageFailure := make(chan error, 1)
 	coherenceFailure := make(chan error, 1)
 	// The transport bound and the advertised bound are one value here, and
 	// Serve refuses to start if the handler ever advertises anything else.

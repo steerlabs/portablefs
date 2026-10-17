@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -39,18 +40,19 @@ type Mode struct {
 	entryLocks  []sync.RWMutex
 	chunkLocks  [chunkLockShards]sync.Mutex
 
-	stateMu       sync.RWMutex
-	state         State
-	stateDetail   string
-	converged     atomic.Bool
-	recalls       chan struct{}
-	recalledBytes atomic.Uint64
-	drainedBytes  atomic.Uint64
-	lastRecallNS  atomic.Int64
-	drainCancelMu sync.Mutex
-	drainCancels  map[uint64]context.CancelFunc
-	drainCancelID atomic.Uint64
-	closeOnce     sync.Once
+	stateMu        sync.RWMutex
+	state          State
+	stateDetail    string
+	storageFailure error
+	converged      atomic.Bool
+	recalls        chan struct{}
+	recalledBytes  atomic.Uint64
+	drainedBytes   atomic.Uint64
+	lastRecallNS   atomic.Int64
+	drainCancelMu  sync.Mutex
+	drainCancels   map[uint64]context.CancelFunc
+	drainCancelID  atomic.Uint64
+	closeOnce      sync.Once
 }
 
 func Open(ctx context.Context, cfg Config) (*Mode, error) {
@@ -305,6 +307,9 @@ func (m *Mode) EnsureHydrated(ctx context.Context, identity [16]byte, offset, le
 }
 
 func (m *Mode) WithAttrLock(identity [16]byte, fn func() error) error {
+	if err := m.StorageError(); err != nil {
+		return err
+	}
 	if m == nil || m.converged.Load() {
 		return fn()
 	}
@@ -314,6 +319,9 @@ func (m *Mode) WithAttrLock(identity [16]byte, fn func() error) error {
 	}
 	m.entryLocks[entry].RLock()
 	defer m.entryLocks[entry].RUnlock()
+	if err := m.StorageError(); err != nil {
+		return err
+	}
 	return fn()
 }
 
@@ -352,8 +360,8 @@ func (m *Mode) Write(ctx context.Context, identity [16]byte, offset, length uint
 		}
 		cancel()
 	}
-	// A failed apply can conservatively suppress archived mtime restoration;
-	// recording the user mutation before apply keeps later hydration invisible.
+	// Record user modification before apply so durability bookkeeping remains
+	// conservative even when the write fails.
 	if err := m.hmap.markDurable(nil, &entry); err != nil {
 		return 0, 0, err
 	}
@@ -518,17 +526,41 @@ func (m *Mode) fetchChunk(ctx context.Context, key chunkKey) (Chunk, error) {
 
 // installFetchedChunkLocked runs with the entry lock held.
 func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool) error {
-	chunkStart := uint64(key.chunk) * uint64(m.ChunkSize())
-	for _, extent := range chunk.Extents {
-		start := chunkStart + extent.Offset
-		if err := m.cfg.Store.PWrite(key.entry, int64(start), extent.Data); err != nil {
-			return err
-		}
+	if err := m.StorageError(); err != nil {
+		return err
 	}
-	if !m.hmap.isModified(key.entry) {
-		if err := m.cfg.Store.RestoreMtime(key.entry); err != nil {
-			return err
+	mtime, err := m.cfg.Store.Mtime(key.entry)
+	if err != nil {
+		return err
+	}
+	installErr := func() error {
+		chunkStart := uint64(key.chunk) * uint64(m.ChunkSize())
+		for _, extent := range chunk.Extents {
+			if err := m.cfg.Store.PWrite(key.entry, int64(chunkStart+extent.Offset), extent.Data); err != nil {
+				return err
+			}
 		}
+		return nil
+	}()
+	// PWrite may have moved mtime even when it reports a partial failure. The
+	// inode stays exclusively locked until the exact pre-install value is back.
+	if err := m.cfg.Store.RestoreMtime(key.entry, mtime); err != nil {
+		failure := fmt.Errorf("restoremode: restore hydration mtime: %w", errors.Join(syscall.EIO, installErr, err))
+		m.stateMu.Lock()
+		first := m.storageFailure == nil
+		if first {
+			m.storageFailure = failure
+			m.state, m.stateDetail = StateCorrupt, failure.Error()
+		}
+		failure = m.storageFailure
+		m.stateMu.Unlock()
+		if first && m.cfg.OnStorageFailure != nil {
+			m.cfg.OnStorageFailure(failure)
+		}
+		return failure
+	}
+	if installErr != nil {
+		return installErr
 	}
 	if durable {
 		if err := m.cfg.Store.Fdatasync(key.entry); err != nil {
@@ -541,6 +573,17 @@ func (m *Mode) installFetchedChunkLocked(key chunkKey, chunk Chunk, durable bool
 		m.hmap.markLazy(key)
 	}
 	return nil
+}
+
+// StorageError is sticky: a failed timestamp restoration makes even otherwise
+// successful metadata samples unsafe for the remainder of this epoch.
+func (m *Mode) StorageError() error {
+	if m == nil {
+		return nil
+	}
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.storageFailure
 }
 
 // UserMutation protects a user-visible metadata mutation whose mtime must win

@@ -70,6 +70,9 @@ const batchedCloseFeature = "batched-close-v1"
 // MaxCloseBatch bounds both the request and its retained per-handle outcome.
 const MaxCloseBatch = 128
 
+// MaxCacheProof is the frozen maximum fskit-versioned-metadata-v1 grant.
+const MaxCacheProof = volumeserver.MaxCacheProof
+
 const (
 	// MaxReadDirHeldIdentities is the largest page-local capability reuse hint.
 	MaxReadDirHeldIdentities = 4096
@@ -168,7 +171,7 @@ func advertisedActivateFeatures(profile authoritypb.FrontendProfile) ([]string, 
 		features = append(features, batchedCloseFeature)
 	}
 	if valid && profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-		features = append(features, fskitDurableMutationsFeature)
+		features = append(features, fskitDurableMutationsFeature, batchedCloseFeature)
 	}
 	return features, valid
 }
@@ -329,7 +332,7 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 			return false
 		}
 		switch req.GetBody().(type) {
-		case *authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
+		case *authoritypb.Request_CloseBatch, *authoritypb.Request_NextFskitRepair, *authoritypb.Request_AckFskitRepair,
 			*authoritypb.Request_FskitWrite, *authoritypb.Request_Write:
 			return true
 		default:

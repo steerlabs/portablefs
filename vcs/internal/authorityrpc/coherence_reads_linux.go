@@ -13,19 +13,22 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/xfsstore"
 )
 
-// coherenceRead owns the protocol-7 Linux cache-installing read paths. The
-// caller has already authenticated the runtime session and checked the current
-// subscription incarnation. FSKit remains on its existing repair path.
+// coherenceRead shares storage sampling across profiles. Admission remains
+// profile-specific: FSKit records repair coordinates, Linux consumes its
+// subscription/delegations, and cacheless readers break delegated data.
 func (h *VolumeHandler) coherenceRead(ctx context.Context, req *authoritypb.Request, cred volumeserver.SessionCredential) (*authoritypb.Response, bool) {
 	if req == nil {
 		return nil, false
 	}
 	profile, err := h.sessionFrontendProfile(cred.ID)
-	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+	if err != nil || profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER && profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return nil, false
 	}
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_Read:
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			return nil, false
+		}
 		return h.coherenceReadData(ctx, req.GetRequestId(), cred.ID, body.Read), true
 	case *authoritypb.Request_GetAttr:
 		return h.coherenceGetAttr(ctx, req.GetRequestId(), cred.ID, body.GetAttr), true
@@ -34,6 +37,9 @@ func (h *VolumeHandler) coherenceRead(ctx context.Context, req *authoritypb.Requ
 	case *authoritypb.Request_ReadDir:
 		return h.coherenceReadDir(ctx, req, cred, body.ReadDir), true
 	case *authoritypb.Request_Fsync:
+		if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+			return nil, false
+		}
 		return h.coherenceFsync(ctx, req.GetRequestId(), cred.ID, body.Fsync), true
 	default:
 		return nil, false
@@ -106,6 +112,10 @@ func (h *VolumeHandler) coherenceReadAdmission(ctx context.Context, session volu
 	if err != nil {
 		return nil, err
 	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		_, _, err := h.Visibility.StabilizeSequence(ctx, session, volumeserver.VisibilityResolution{Identity: identity})
+		return nil, err
+	}
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return h.Coherence.BreakForReadSet(ctx, [][16]byte{identity})
 	}
@@ -124,6 +134,14 @@ func (h *VolumeHandler) coherenceReadSetAdmission(ctx context.Context, session v
 	if err != nil {
 		return nil, err
 	}
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		resolutions := make([]volumeserver.VisibilityResolution, 0, len(identities))
+		for _, identity := range identities {
+			resolutions = append(resolutions, volumeserver.VisibilityResolution{Identity: identity})
+		}
+		_, _, err := h.Visibility.StabilizeSequence(ctx, session, resolutions...)
+		return nil, err
+	}
 	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
 		return h.Coherence.BreakForReadSet(ctx, identities)
 	}
@@ -139,7 +157,7 @@ func (h *VolumeHandler) coherenceTryReadAdmission(ctx context.Context, session v
 	if err != nil {
 		return nil, false, err
 	}
-	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER || profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return nil, false, nil
 	}
 	token, err := h.coherenceToken(session)
@@ -271,6 +289,11 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 		if err != nil {
 			return h.coherenceError(0, err)
 		}
+		if coordinator := h.strictCache(cred.ID); coordinator != nil {
+			if _, _, err := coordinator.StabilizeSequence(ctx, cred.ID, volumeserver.VisibilityResolution{Parent: parentIdentity, Name: request.GetName()}); err != nil {
+				return h.errorResponse(0, err, false)
+			}
+		}
 		for attempt := 0; attempt < maxStabilizeAttempts; attempt++ {
 			binding := coherenceBindingDependencies(parentIdentity, request.GetName(), [16]byte{})
 			probeTurn, err := h.coherenceStorage.AcquireReadTurn(ctx, binding)
@@ -280,7 +303,7 @@ func (h *VolumeHandler) coherenceLookup(ctx context.Context, req *authoritypb.Re
 			probeRelease := probeTurn.Release
 			// Only the stable capability is retained from this probe. Its
 			// attributes cannot be published before the child delegation break.
-			item, _, lookupErr := h.Store.Lookup(parent, string(request.GetName()))
+			item, _, lookupErr := h.lookupRestored(parent, string(request.GetName()))
 			if errors.Is(lookupErr, syscall.ENOENT) {
 				release := probeRelease
 				if err := h.admitCoherenceCache(cacheToken, volumeserver.CacheAdmission{Directories: [][16]byte{parentIdentity}}); err != nil {
@@ -477,6 +500,16 @@ func (h *VolumeHandler) coherenceReadDir(ctx context.Context, req *authoritypb.R
 				// that the probe still names the page we protected.
 				storageTurn.Release()
 				releaseDataGuards(guards)
+				if coordinator := h.strictCache(cred.ID); coordinator != nil {
+					resolutions := make([]volumeserver.VisibilityResolution, 0, len(candidates))
+					for _, candidate := range candidates {
+						resolutions = append(resolutions, volumeserver.VisibilityResolution{Parent: directoryIdentity, Name: candidate.dirent.GetName(), Identity: candidate.identity})
+					}
+					if _, _, err := coordinator.StabilizeSequence(ctx, cred.ID, resolutions...); err != nil {
+						h.forgetDirectoryCandidates(candidates)
+						return h.errorResponse(0, err, false)
+					}
+				}
 				pageGuard, setErr := h.coherenceReadSetAdmission(ctx, cred.ID, identities)
 				if setErr != nil {
 					h.forgetDirectoryCandidates(candidates)
@@ -603,7 +636,7 @@ func (h *VolumeHandler) coherenceRevalidateDirectoryPage(
 		if candidate.item == (xfsstore.Capability{}) {
 			continue
 		}
-		item, attr, lookupErr := h.Store.LookupOpen(handle, candidate.enumerated.Name)
+		item, attr, lookupErr := h.lookupOpenRestored(handle, candidate.enumerated.Name)
 		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
 			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
 			return false, checkVerifier, nil

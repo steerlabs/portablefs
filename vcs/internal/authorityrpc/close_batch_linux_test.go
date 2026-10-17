@@ -125,3 +125,33 @@ func TestCloseBatchUnlockFailureStillRetiresDescriptor(t *testing.T) {
 		t.Fatal("retired descriptor remained accounted")
 	}
 }
+
+func TestFskitCloseBatchAdmissionAndExactReplay(t *testing.T) {
+	store := &closeBatchTestStore{}
+	h, ctx, cred, _ := resourceAdmissionFskitRequestHarness(t, store, 8, MaxCloseBatch)
+	batch := &authoritypb.CloseBatchRequest{}
+	for i := 1; i <= MaxCloseBatch; i++ {
+		handle := xfsstore.Capability{byte(i)}
+		if err := h.trackOpen(cred.ID, handle, false); err != nil {
+			t.Fatal(err)
+		}
+		batch.Closes = append(batch.Closes, &authoritypb.CloseRequest{Handle: handle[:]})
+	}
+	request := coherenceReadRequest(cred)
+	request.Body = &authoritypb.Request_CloseBatch{CloseBatch: batch}
+	stampMutation(t, request, 0, 1)
+	first := h.Handle(ctx, request)
+	if first.GetErrno() != 0 || len(first.GetCloseBatch().GetResults()) != MaxCloseBatch {
+		t.Fatalf("FSKit batch=%v", first)
+	}
+	for _, result := range first.GetCloseBatch().GetResults() {
+		if result.GetErrno() != 0 || !result.GetRetired() {
+			t.Fatalf("FSKit retirement=%v", result)
+		}
+	}
+	assertFrameRoundTrip(t, first)
+	again := h.Handle(ctx, request)
+	if !proto.Equal(first, again) || len(store.calls) != MaxCloseBatch {
+		t.Fatalf("FSKit replay retired %d handles", len(store.calls))
+	}
+}

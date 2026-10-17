@@ -1031,10 +1031,20 @@ func (s *diskStore) Fdatasync(entry uint32) error {
 	return file.Sync()
 }
 
-func (s *diskStore) RestoreMtime(entry uint32) error {
+func (s *diskStore) Mtime(entry uint32) (int64, error) {
+	s.mu.Lock()
+	path := s.paths[entry]
+	s.mu.Unlock()
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.ModTime().UnixNano(), nil
+}
+
+func (s *diskStore) RestoreMtime(entry uint32, nanos int64) error {
 	s.mu.Lock()
 	path, ok := s.paths[entry]
-	nanos := s.mtimes[entry]
 	s.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("entry %d is not a restored regular file", entry)

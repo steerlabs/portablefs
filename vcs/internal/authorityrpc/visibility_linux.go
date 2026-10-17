@@ -49,150 +49,29 @@ func (h *VolumeHandler) strictCache(id volumeserver.SessionID) *volumeserver.Vis
 // is published. The daemon consumes that internal response, waits for the exact
 // pending repair, and reissues the request inside the same FUSE callback.
 func (h *VolumeHandler) stabilizeItem(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) error {
-	_, err := h.stabilizeItemSequence(ctx, id, item)
-	return err
-}
-
-func (h *VolumeHandler) stabilizeItemSequence(ctx context.Context, id volumeserver.SessionID, item xfsstore.Capability) (uint64, error) {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return 1, nil
+		return nil
 	}
 	identity, err := h.Store.Identity(item)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	_, sequence, err := coordinator.StabilizeSequence(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
-	return sequence, err
-}
-
-func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) error {
-	_, err := h.stabilizeOpenSequence(ctx, id, handle)
+	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
 	return err
 }
 
-func (h *VolumeHandler) stabilizeOpenSequence(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) (uint64, error) {
+func (h *VolumeHandler) stabilizeOpen(ctx context.Context, id volumeserver.SessionID, handle xfsstore.Capability) error {
 	coordinator := h.strictCache(id)
 	if coordinator == nil {
-		return 1, nil
+		return nil
 	}
 	identity, err := h.Store.IdentityOpen(handle)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	_, sequence, err := coordinator.StabilizeSequence(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
-	return sequence, err
-}
-
-// lookupForSession answers one name resolution. For a strict mount the answer
-// is what the kernel will cache - including a negative one, which the kernel
-// caches too - so the binding is recorded either way, and the inode the name
-// resolved to is recorded as well because it is only knowable after the read.
-// A read that raced a mutation on either coordinate is discarded and retried.
-func (h *VolumeHandler) lookupForSession(ctx context.Context, id volumeserver.SessionID, parent xfsstore.Capability, name []byte) (xfsstore.Capability, xfsstore.Attr, uint64, error) {
-	coordinator := h.strictCache(id)
-	if coordinator == nil {
-		item, attr, err := h.Store.Lookup(parent, string(name))
-		return item, attr, 1, err
-	}
-	parentIdentity, err := h.Store.Identity(parent)
-	if err != nil {
-		return xfsstore.Capability{}, xfsstore.Attr{}, 0, err
-	}
-	for range maxStabilizeAttempts {
-		item, attr, lookupErr := h.Store.Lookup(parent, string(name))
-		resolution := volumeserver.VisibilityResolution{Parent: parentIdentity, Name: name}
-		if lookupErr == nil {
-			identity, identityErr := h.Store.Identity(item)
-			if identityErr != nil {
-				_ = h.Store.Forget(item)
-				return xfsstore.Capability{}, xfsstore.Attr{}, 0, identityErr
-			}
-			resolution.Identity = identity
-		}
-		waited, sequence, err := coordinator.StabilizeSequence(ctx, id, resolution)
-		if errors.Is(err, volumeserver.ErrVisibilityRetry) {
-			// Lookup already owns a bounded discard-and-reread loop. Unlike item
-			// reads, no answer has left this authority request, so let the concurrent
-			// CONTROL Ack clear the pending phase before the next attempt.
-			waited, err = true, nil
-		}
-		if err == nil && !waited {
-			return item, attr, sequence, lookupErr
-		}
-		if lookupErr == nil {
-			_ = h.Store.Forget(item)
-		}
-		if err != nil {
-			return xfsstore.Capability{}, xfsstore.Attr{}, 0, err
-		}
-	}
-	return xfsstore.Capability{}, xfsstore.Attr{}, 0, syscall.EAGAIN
-}
-
-// stabilizeDirectoryPage takes one cut over the complete candidate page. The
-// caller has already sampled every name, identity, attr, and object version;
-// after this cut it revalidates those same facts before publishing any of them.
-//
-// Two things happen here and they are separate. The visibility coordinator
-// decides *when* the cut may be taken: it blocks while a conflicting barrier is
-// in flight and records the page's resolutions in this participant's monotone
-// index. The cut's *value* is the volume's storage cut, which is a different
-// counter and deliberately not the coordinator's own barrier sequence -- the
-// caller compares it against each entry's ObjectVersion, and those are stamped
-// from the storage cut. Returning the barrier sequence here made a sync-repair
-// readdir compare two unrelated counters, so on any volume a Linux mount had
-// written to, every entry looked like it was from the future and the page could
-// never stabilize.
-func (h *VolumeHandler) stabilizeDirectoryPage(ctx context.Context, id volumeserver.SessionID, dir xfsstore.Capability, candidates []directoryPageCandidate) (bool, uint64, error) {
-	coordinator := h.strictCache(id)
-	if coordinator == nil {
-		return false, h.storageCut(), nil
-	}
-	directory, err := h.Store.IdentityOpen(dir)
-	if err != nil {
-		return false, 0, err
-	}
-	resolutions := make([]volumeserver.VisibilityResolution, 0, len(candidates)+1)
-	resolutions = append(resolutions, volumeserver.VisibilityResolution{Identity: directory})
-	for _, candidate := range candidates {
-		resolution := volumeserver.VisibilityResolution{
-			Parent: directory, Name: []byte(candidate.enumerated.Name),
-			Identity: candidate.identity,
-		}
-		resolutions = append(resolutions, resolution)
-	}
-	waited, _, err := coordinator.StabilizeSequence(ctx, id, resolutions...)
-	if errors.Is(err, volumeserver.ErrVisibilityRetry) {
-		// Readdir's caller discards the page and repeats this bounded loop while
-		// the independent CONTROL lane acknowledges the pending PREPARE.
-		return true, 0, nil
-	}
-	if err != nil || waited {
-		return waited, 0, err
-	}
-	// Sampled here rather than before the wait: StabilizeSequence returns only
-	// once no barrier conflicting with this page is in flight, so the cut read
-	// at this point is one no covered entry can already be ahead of. Sampling
-	// before the wait would let a mutation commit during it and make a
-	// legitimate entry look like an ordering defect.
-	return false, h.storageCut(), nil
-}
-
-// storageCut is the volume's object-version domain: the latest coherence
-// publication cut. Object versions are stamped from this same ordered domain,
-// so a page stabilized against it is directly comparable to the versions its
-// entries carry for either frontend profile.
-//
-// It floors at 1 for the same reason sampledObjectVersion floors an unstamped
-// object at 1: before anything has committed, the domain's first value is 1.
-// Returning 0 would make every unstamped entry look like it came from the
-// future on a volume nothing had written to yet.
-func (h *VolumeHandler) storageCut() uint64 {
-	if cut := h.coherenceVersionNow(); cut != 0 {
-		return cut
-	}
-	return 1
+	_, err = coordinator.Stabilize(ctx, id, volumeserver.VisibilityResolution{Identity: identity})
+	return err
 }
 
 func coherenceProfile(profile authoritypb.CoherenceProfile) (volumeserver.CoherenceProfile, error) {

@@ -100,7 +100,7 @@ func (r *operationResolutionContext) namespace(parent xfsstore.Capability, name 
 	if resolved, ok := r.namespaces[key]; ok {
 		return resolved, nil
 	}
-	item, attr, err := r.h.Store.Lookup(parent, string(name))
+	item, attr, err := r.h.lookupRestored(parent, string(name))
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOENT) {
 		resolved := namespaceResolution{}
 		r.namespaces[key] = resolved

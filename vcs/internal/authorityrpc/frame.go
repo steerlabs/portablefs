@@ -409,6 +409,10 @@ func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 			return &write.Data, nil
 		}
 	case *authoritypb.Response:
+		if proof := typed.GetSessionValidForNanos(); proof != 0 &&
+			(proof > uint64(MaxCacheProof) || proof%uint64(time.Millisecond) != 0 || typed.GetErrno() != 0 || typed.GetBody() != nil || typed.GetUncertain() || typed.GetSessionTerminal() || typed.GetFailure() != authoritypb.FailureClass_FAILURE_CLASS_UNSPECIFIED) {
+			return nil, fmt.Errorf("%w: invalid KeepAlive validity proof", ErrFrameEncoding)
+		}
 		if read := typed.GetRead(); read != nil {
 			return &read.Data, nil
 		}

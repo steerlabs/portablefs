@@ -274,10 +274,11 @@ type sessionResources struct {
 	reservedOpens uint32
 	// reply holds the retained reply size for each of this session's replay
 	// slots. Its length is the slot count the runtime admitted.
-	reply      []uint32
-	coherence  volumeserver.CoherenceProfile
-	profile    authoritypb.FrontendProfile
-	commitment volumeserver.VisibilityCommitment
+	reply             []uint32
+	coherence         volumeserver.CoherenceProfile
+	profile           authoritypb.FrontendProfile
+	versionedMetadata bool
+	commitment        volumeserver.VisibilityCommitment
 	// authorizationDeadline comes from the runtime's retained result, never
 	// from the local Authorize invocation: on an exact concurrent Attach replay
 	// only the first caller executes that invocation.
@@ -613,10 +614,19 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 
 	switch body := req.GetBody().(type) {
 	case *authoritypb.Request_KeepAlive:
-		if err := h.Runtime.Resume(cred); err != nil {
+		resources, err := h.sessionResources(cred.ID)
+		if err != nil {
 			return h.errorResponse(req.GetRequestId(), err, false)
 		}
-		return h.success(req.GetRequestId())
+		resp := h.success(req.GetRequestId())
+		if resources.versionedMetadata {
+			remaining, err := use.RenewalProof()
+			if err != nil {
+				return h.errorResponse(req.GetRequestId(), err, false)
+			}
+			resp.SessionValidForNanos = uint64(remaining)
+		}
+		return resp
 	case *authoritypb.Request_NextFskitRepair:
 		if h.Visibility == nil {
 			return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
@@ -719,63 +729,6 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 		resp := h.success(req.GetRequestId())
 		resp.Body = &authoritypb.Response_ApplyRoutes{ApplyRoutes: reply}
 		return resp
-	case *authoritypb.Request_Lookup:
-		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
-		if profileErr != nil {
-			return h.errorResponse(req.GetRequestId(), profileErr, false)
-		}
-		if frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-			return h.mutate(ctx, req, cred, func() *authoritypb.Response {
-				parent, err := h.item(cred.ID, body.Lookup.GetParent())
-				if err != nil {
-					return h.errorResponse(0, err, false)
-				}
-				protected := h.protectedChild(cred.ID, parent, body.Lookup.GetName())
-				item, attr, snapshot, err := h.lookupForSession(ctx, cred.ID, parent, body.Lookup.GetName())
-				if errors.Is(err, syscall.ENOENT) {
-					resp := h.success(0)
-					resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{NegativeSnapshotSequence: snapshot}}
-					return resp
-				}
-				if err != nil {
-					return h.errorResponse(0, err, false)
-				}
-				if err := h.trackItem(cred.ID, item, protected); err != nil {
-					h.forgetItem(item)
-					return h.errorResponse(0, err, false)
-				}
-				identity, err := h.Store.Identity(item)
-				if err != nil {
-					h.untrackItem(cred.ID, item)
-					h.forgetItem(item)
-					return h.errorResponse(0, err, false)
-				}
-				itemReply := itemProto(item, attr, identity)
-				itemReply.SnapshotSequence = snapshot
-				itemReply.ObjectVersion = h.sampledObjectVersion(identity, snapshot)
-				resp := h.success(0)
-				resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
-				return resp
-			})
-		}
-		return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
-	case *authoritypb.Request_GetAttr:
-		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
-		if profileErr != nil {
-			return h.errorResponse(req.GetRequestId(), profileErr, false)
-		}
-		if frontendProfile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
-			attr, identity, snapshot, err := h.getattr(ctx, cred.ID, body.GetAttr)
-			if err != nil {
-				return h.errorResponse(req.GetRequestId(), err, false)
-			}
-			resp := h.success(req.GetRequestId())
-			resp.Body = &authoritypb.Response_GetAttr{GetAttr: &authoritypb.GetAttrReply{
-				Attr: attrProto(attr), ObjectVersion: h.sampledObjectVersion(identity, snapshot), SnapshotSequence: snapshot,
-			}}
-			return resp
-		}
-		return h.errorResponse(req.GetRequestId(), syscall.EOPNOTSUPP, false)
 	case *authoritypb.Request_SetAttr:
 		set := body.SetAttr
 		var item, handle xfsstore.Capability
@@ -848,9 +801,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if set.Size != nil {
 				var attr xfsstore.Attr
 				if handle != (xfsstore.Capability{}) {
-					attr, err = h.Store.GetattrOpen(handle)
+					attr, err = h.getattrOpen(handle)
 				} else {
-					attr, err = h.Store.Getattr(item)
+					attr, err = h.getattrItem(item)
 				}
 				if err != nil {
 					return nil, err
@@ -893,7 +846,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			} else if h.Restore != nil && h.Restore.Active() && (set.MtimeNs != nil || set.GetMtimeNow()) {
 				err = h.Restore.UserMutation(coordinate.identity, apply)
 			} else {
-				err = apply()
+				err = h.Restore.WithAttrLock(coordinate.identity, apply)
 			}
 			if err != nil {
 				uncertain := applied || uncertainFailure(err)
@@ -979,7 +932,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			resp.Body = &authoritypb.Response_Tmpfile{Tmpfile: &authoritypb.TmpfileReply{
 				Item: itemReply, Handle: append([]byte(nil), handle[:]...),
 			}}
-			parentAttr, parentErr := h.Store.Getattr(parent)
+			parentAttr, parentErr := h.getattrItem(parent)
 			if parentErr != nil {
 				cleanupUndeliverable()
 				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
@@ -1071,7 +1024,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if body.Create.GetFlags() == nil || !body.Create.GetFlags().GetTruncate() {
 				return nil
 			}
-			attr, err := h.Store.Getattr(item)
+			attr, err := h.getattrItem(item)
 			if err != nil {
 				return []volumeserver.VisibilityTarget{}
 			}
@@ -1120,8 +1073,8 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				if existed && handle != (xfsstore.Capability{}) && errors.As(err, &durability) {
 					// Existing-name CREATE also opens with O_TRUNC. Snapshot both
 					// records before the typed restore failure fences the store.
-					postAttr, postErr := h.Store.Getattr(item)
-					parentAttr, parentErr := h.Store.Getattr(parent)
+					postAttr, postErr := h.getattrItem(item)
+					parentAttr, parentErr := h.getattrItem(parent)
 					if postErr == nil && parentErr == nil {
 						post = h.mutationPostState(sequence,
 							postStateSnapshot{identity: existingCoordinate.identity, attr: postAttr, roles: postStateRoleTarget, changed: true},
@@ -1155,7 +1108,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				h.forgetItem(item)
 			}
 			if existed || body.Create.GetFlags() != nil && body.Create.GetFlags().GetTruncate() {
-				post, snapshotErr := h.Store.GetattrOpen(handle)
+				post, snapshotErr := h.getattrOpen(handle)
 				if snapshotErr != nil {
 					targets := createdTargets(item)
 					cleanupUndeliverable()
@@ -1180,7 +1133,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 
 			if existed {
-				parentAttr, parentErr := h.Store.Getattr(parent)
+				parentAttr, parentErr := h.getattrItem(parent)
 				if parentErr != nil {
 					cleanupUndeliverable()
 					return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
@@ -1205,7 +1158,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				}
 				return resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, existingCoordinate, attr.Size), inodeTarget(volumeserver.VisibilityAttributes, existingCoordinate, 0)}
 			}
-			parentAttr, parentErr := h.Store.Getattr(parent)
+			parentAttr, parentErr := h.getattrItem(parent)
 			if parentErr != nil {
 				cleanupUndeliverable()
 				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
@@ -1272,7 +1225,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			itemReply := itemProto(item, attr, itemIdentity)
 			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
 			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
-			parentAttr, parentErr := h.Store.Getattr(parent)
+			parentAttr, parentErr := h.getattrItem(parent)
 			if parentErr != nil {
 				h.untrackItem(cred.ID, item)
 				h.forgetItem(item)
@@ -1315,7 +1268,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			return []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}, err
 		}
 		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-			removed, _, lookupErr := h.Store.Lookup(parent, string(body.Unlink.GetName()))
+			removed, _, lookupErr := h.lookupRestored(parent, string(body.Unlink.GetName()))
 			if lookupErr != nil {
 				return h.errorResponse(0, lookupErr, false), nil
 			}
@@ -1326,8 +1279,8 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				return resp, uncertainVisibilityTargets(resp, targets)
 			}
 			targets := []volumeserver.VisibilityTarget{namespaceTargetRelated(parentCoordinate, body.Unlink.GetName(), removedCoordinate), inodeTarget(volumeserver.VisibilityAttributes, parentCoordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, removedCoordinate, 0)}
-			removedAttr, removedErr := h.Store.Getattr(removed)
-			parentAttr, parentErr := h.Store.Getattr(parent)
+			removedAttr, removedErr := h.getattrItem(removed)
+			parentAttr, parentErr := h.getattrItem(parent)
 			if err := errors.Join(removedErr, parentErr); err != nil {
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
@@ -1392,14 +1345,14 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if body.Rename.GetExchange() {
 				flags |= xfsstore.RenameExchange
 			}
-			moved, _, lookupErr := h.Store.Lookup(oldParent, string(body.Rename.GetOldName()))
+			moved, _, lookupErr := h.lookupRestored(oldParent, string(body.Rename.GetOldName()))
 			if lookupErr != nil {
 				return h.errorResponse(0, lookupErr, false), nil
 			}
 			defer h.forgetItem(moved)
 			var overwritten xfsstore.Capability
 			if replaced && (body.Rename.GetExchange() || replacedCoordinate.identity != movedCoordinate.identity) {
-				overwritten, _, lookupErr = h.Store.Lookup(newParent, string(body.Rename.GetNewName()))
+				overwritten, _, lookupErr = h.lookupRestored(newParent, string(body.Rename.GetNewName()))
 				if lookupErr != nil {
 					return h.errorResponse(0, lookupErr, false), nil
 				}
@@ -1433,9 +1386,9 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 			resp := h.success(0)
 			resp.Body = &authoritypb.Response_Rename{Rename: rename}
-			movedAttr, movedErr := h.Store.Getattr(moved)
-			oldParentAttr, oldParentErr := h.Store.Getattr(oldParent)
-			newParentAttr, newParentErr := h.Store.Getattr(newParent)
+			movedAttr, movedErr := h.getattrItem(moved)
+			oldParentAttr, oldParentErr := h.getattrItem(oldParent)
+			newParentAttr, newParentErr := h.getattrItem(newParent)
 			if err := errors.Join(movedErr, oldParentErr, newParentErr); err != nil {
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
@@ -1446,7 +1399,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				{identity: newParentCoordinate.identity, attr: newParentAttr, roles: postStateRoleNewParent, changed: !noChange},
 			}
 			if replaced && (body.Rename.GetExchange() || replacedCoordinate.identity != movedCoordinate.identity) {
-				replacedAttr, replacedErr := h.Store.Getattr(overwritten)
+				replacedAttr, replacedErr := h.getattrItem(overwritten)
 				if replacedErr != nil {
 					return h.errorResponse(0, replacedErr, true), []volumeserver.VisibilityTarget{}
 				}
@@ -1488,7 +1441,12 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			return linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, false), err
 		}
 		response := h.mutateVisibleSequenceResolved(ctx, req, cred, prepare, func(sequence uint64) (*authoritypb.Response, []volumeserver.VisibilityTarget) {
-			attr, err := h.Store.Link(source, parent, string(body.Link.GetNewName()))
+			var attr xfsstore.Attr
+			err := h.Restore.WithAttrLock(sourceCoordinate.identity, func() error {
+				var err error
+				attr, err = h.Store.Link(source, parent, string(body.Link.GetNewName()))
+				return err
+			})
 			if err != nil {
 				resp := h.errorResponse(0, err, false)
 				targets := linkVisibilityTargets(body.Link.GetNewName(), parentCoordinate, sourceCoordinate, false)
@@ -1498,7 +1456,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			itemReply := itemProto(source, attr, sourceCoordinate.identity)
 			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
 			resp.Body = &authoritypb.Response_Link{Link: &authoritypb.LinkReply{Item: itemReply}}
-			parentAttr, parentErr := h.Store.Getattr(parent)
+			parentAttr, parentErr := h.getattrItem(parent)
 			if parentErr != nil {
 				return h.errorResponse(0, parentErr, true), []volumeserver.VisibilityTarget{}
 			}
@@ -1554,7 +1512,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			itemReply := itemProto(item, attr, itemIdentity)
 			itemReply.ObjectVersion, itemReply.SnapshotSequence = sequence, sequence
 			resp.Body = &authoritypb.Response_Lookup{Lookup: &authoritypb.LookupReply{Item: itemReply}}
-			parentAttr, parentErr := h.Store.Getattr(parent)
+			parentAttr, parentErr := h.getattrItem(parent)
 			if parentErr != nil {
 				h.untrackItem(cred.ID, item)
 				h.forgetItem(item)
@@ -1672,7 +1630,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			}
 			if err == nil {
 				var attr xfsstore.Attr
-				attr, err = h.Store.Getattr(item)
+				attr, err = h.getattrItem(item)
 				oldSize = attr.Size
 			}
 			return []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityData, coordinate, 0), inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)}, err
@@ -1699,7 +1657,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 					}
 					// Capture the applied truncate before errorResponse fences the
 					// store; a successful later sync cannot repair a failed map mark.
-					attr, attrErr := h.Store.Getattr(item)
+					attr, attrErr := h.getattrItem(item)
 					cleanupOpenedHandle()
 					resp = h.errorResponse(0, errors.Join(err, attrErr), true)
 					if attrErr != nil {
@@ -1716,7 +1674,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			if !visibilityChanged(resp) {
 				return resp, nil
 			}
-			attr, err := h.Store.Getattr(item)
+			attr, err := h.getattrItem(item)
 			if err != nil {
 				cleanupOpenedHandle()
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
@@ -1807,191 +1765,6 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 			return h.errorResponse(req.GetRequestId(), err, true)
 		}
 		return h.success(req.GetRequestId())
-	case *authoritypb.Request_ReadDir:
-		frontendProfile, profileErr := h.sessionFrontendProfile(cred.ID)
-		if profileErr != nil {
-			return h.errorResponse(req.GetRequestId(), profileErr, false)
-		}
-		response, _ := h.mutateExecution(ctx, req, cred, func() *authoritypb.Response {
-			if body.ReadDir.GetMaxEntries() == 0 || body.ReadDir.GetMaxEntries() > 4096 {
-				return h.errorResponse(0, syscall.EINVAL, false)
-			}
-			heldIdentities, err := heldDirectoryIdentities(body.ReadDir)
-			if err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			handle, err := h.open(cred.ID, body.ReadDir.GetHandle())
-			if err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			directoryIdentity, err := h.Store.IdentityOpen(handle)
-			if err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			if frontendProfile != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR || h.Visibility == nil {
-				return h.errorResponse(0, errInternal, false)
-			}
-			_ = directoryIdentity
-
-			cookie, err := decodeCookie(body.ReadDir.GetCookie())
-			if err != nil {
-				return h.errorResponse(0, err, false)
-			}
-			var verifier [16]byte
-			if len(body.ReadDir.GetVerifier()) != 0 {
-				if len(body.ReadDir.GetVerifier()) != len(verifier) {
-					return h.errorResponse(0, syscall.EINVAL, false)
-				}
-				copy(verifier[:], body.ReadDir.GetVerifier())
-			}
-			var entries []xfsstore.Dirent
-			var current [16]byte
-			var eof bool
-			var directory xfsstore.Capability
-			var pageSnapshot uint64
-			result := &authoritypb.ReadDirReply{}
-			// The reply is built to the same byte budget that was reserved for
-			// it, so a directory listing can never be the reply that does not
-			// fit in a frame. Stopping early is an ordinary short readdir: the
-			// caller resumes from the last entry's cookie.
-			budget := h.readDirEntryBudget(body.ReadDir.GetMaxEntries())
-			type issuedItem struct {
-				item xfsstore.Capability
-				name []byte
-			}
-			var issued []issuedItem
-			forgetIssued := func() {
-				for _, held := range issued {
-					h.forgetItem(held.item)
-				}
-				issued = nil
-			}
-			budgetExhausted := false
-			// A page carries at least one entry unless it is the final one: an
-			// empty non-final page advances no client cursor, so a batch whose
-			// every entry raced away is skipped over rather than published.
-			for {
-				if err := ctx.Err(); err != nil {
-					forgetIssued()
-					return h.errorResponse(0, err, false)
-				}
-				var candidates []directoryPageCandidate
-				for {
-					if err := ctx.Err(); err != nil {
-						forgetIssued()
-						return h.errorResponse(0, err, false)
-					}
-					entries, _, current, eof, directory, err = h.Store.ReadDirOpen(handle, cookie, int(body.ReadDir.GetMaxEntries()))
-					if err != nil {
-						if errors.Is(err, syscall.EAGAIN) {
-							continue
-						}
-						forgetIssued()
-						return h.errorResponse(0, err, false)
-					}
-					var conflict bool
-					candidates, budgetExhausted, conflict, err = h.constructDirectoryPage(
-						handle, entries, cookie, body.ReadDir.GetWantItems(), heldIdentities, budget,
-					)
-					if err != nil {
-						if errors.Is(err, syscall.EAGAIN) {
-							continue
-						}
-						forgetIssued()
-						return h.errorResponse(0, err, false)
-					}
-					if conflict {
-						continue
-					}
-					valid, verifyErr := h.revalidateDirectoryPage(
-						handle, directory, cookie, current,
-						int(body.ReadDir.GetMaxEntries()), entries, eof, candidates,
-					)
-					if verifyErr != nil {
-						h.forgetDirectoryCandidates(candidates)
-						if errors.Is(verifyErr, syscall.EAGAIN) {
-							continue
-						}
-						forgetIssued()
-						return h.errorResponse(0, verifyErr, false)
-					}
-					if !valid {
-						h.forgetDirectoryCandidates(candidates)
-						continue
-					}
-
-					waited, snapshot, stabilizeErr := h.stabilizeDirectoryPage(ctx, cred.ID, handle, candidates)
-					if stabilizeErr != nil {
-						h.forgetDirectoryCandidates(candidates)
-						forgetIssued()
-						return h.errorResponse(0, stabilizeErr, false)
-					}
-					if waited {
-						h.forgetDirectoryCandidates(candidates)
-						continue
-					}
-					futureVersion := false
-					for _, candidate := range candidates {
-						if candidate.item != (xfsstore.Capability{}) && candidate.dirent.GetObjectVersion() > snapshot {
-							futureVersion = true
-							break
-						}
-					}
-					if futureVersion {
-						h.forgetDirectoryCandidates(candidates)
-						continue
-					}
-					pageSnapshot = snapshot
-					break
-				}
-				result.Verifier, result.Eof = current[:], eof && !budgetExhausted
-				for _, candidate := range candidates {
-					candidate.dirent.ObjectVersion = pageSnapshot
-					candidate.dirent.SnapshotSequence = pageSnapshot
-					if candidate.dirent.GetItem() != nil {
-						candidate.dirent.Item.ObjectVersion = candidate.dirent.GetObjectVersion()
-						candidate.dirent.Item.SnapshotSequence = pageSnapshot
-						issued = append(issued, issuedItem{item: candidate.item, name: candidate.dirent.GetName()})
-					} else if candidate.item != (xfsstore.Capability{}) {
-						h.forgetItem(candidate.item)
-					}
-					result.Entries = append(result.Entries, candidate.dirent)
-				}
-				if len(result.Entries) != 0 || result.Eof || budgetExhausted {
-					break
-				}
-				if len(entries) == 0 {
-					break
-				}
-				cookie = entries[len(entries)-1].NextCookie
-			}
-			if budgetExhausted && len(result.Entries) == 0 {
-				// A single entry larger than the whole budget would make this
-				// directory unreadable at any cookie. Say so instead of
-				// returning an empty page forever.
-				forgetIssued()
-				return h.errorResponse(0, syscall.EOVERFLOW, false)
-			}
-
-			tracked := 0
-			for i, held := range issued {
-				if err := h.trackItem(cred.ID, held.item, h.protectedChild(cred.ID, directory, held.name)); err != nil {
-					for _, prior := range issued[:tracked] {
-						h.untrackItem(cred.ID, prior.item)
-						h.forgetItem(prior.item)
-					}
-					for _, unheld := range issued[i+1:] {
-						h.forgetItem(unheld.item)
-					}
-					return h.errorResponse(0, err, false)
-				}
-				tracked++
-			}
-			resp := h.success(0)
-			resp.Body = &authoritypb.Response_ReadDir{ReadDir: result}
-			return resp
-		})
-		return response
 	case *authoritypb.Request_Reclaim:
 		// Reclaim changes the session's retained-capability accounting. It must
 		// use exact replay even though it does not change visible filesystem
@@ -2070,7 +1843,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)})
 			}
-			attr, err := h.Store.Getattr(item)
+			attr, err := h.getattrItem(item)
 			if err != nil {
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
@@ -2102,7 +1875,7 @@ func (h *VolumeHandler) handle(ctx context.Context, req *authoritypb.Request, re
 				resp := h.errorResponse(0, err, false)
 				return resp, uncertainVisibilityTargets(resp, []volumeserver.VisibilityTarget{inodeTarget(volumeserver.VisibilityAttributes, coordinate, 0)})
 			}
-			attr, err := h.Store.Getattr(item)
+			attr, err := h.getattrItem(item)
 			if err != nil {
 				return h.errorResponse(0, err, true), []volumeserver.VisibilityTarget{}
 			}
@@ -2204,10 +1977,6 @@ func encodeCookie(value uint64) []byte {
 	return raw[:]
 }
 
-func verifierMatches(verifier [16]byte, attr xfsstore.Attr) bool {
-	return binary.BigEndian.Uint64(verifier[0:8]) == attr.Ino && binary.BigEndian.Uint64(verifier[8:16]) == uint64(attr.CTimeNS)
-}
-
 type directoryPageCandidate struct {
 	enumerated xfsstore.Dirent
 	dirent     *authoritypb.Dirent
@@ -2238,7 +2007,7 @@ func (h *VolumeHandler) constructDirectoryPage(
 		candidate := directoryPageCandidate{enumerated: entry}
 		attr := xfsstore.Attr{Kind: xfsstore.KindOpaque, Ino: entry.Ino}
 		if entry.Kind != xfsstore.KindOpaque {
-			item, itemAttr, err := h.Store.LookupOpen(handle, entry.Name)
+			item, itemAttr, err := h.lookupOpenRestored(handle, entry.Name)
 			switch {
 			case errors.Is(err, syscall.ENOENT), errors.Is(err, syscall.EAGAIN), errors.Is(err, xfsstore.ErrStaleObject):
 				h.forgetDirectoryCandidates(candidates)
@@ -2323,56 +2092,6 @@ func sameDirectoryEnumeration(left, right []xfsstore.Dirent) bool {
 	return true
 }
 
-func (h *VolumeHandler) revalidateDirectoryPage(
-	handle, directory xfsstore.Capability,
-	cookie uint64,
-	current [16]byte,
-	maxEntries int,
-	entries []xfsstore.Dirent,
-	eof bool,
-	candidates []directoryPageCandidate,
-) (bool, error) {
-	checkEntries, _, checkVerifier, checkEOF, checkDirectory, err := h.Store.ReadDirOpen(handle, cookie, maxEntries)
-	if err != nil {
-		return false, err
-	}
-	if checkDirectory != directory || checkVerifier != current || checkEOF != eof || !sameDirectoryEnumeration(checkEntries, entries) {
-		return false, nil
-	}
-	parentAttr, err := h.Store.GetattrOpen(handle)
-	if err != nil {
-		return false, err
-	}
-	if !verifierMatches(current, parentAttr) {
-		return false, nil
-	}
-	for _, candidate := range candidates {
-		if candidate.item == (xfsstore.Capability{}) {
-			continue
-		}
-		item, attr, lookupErr := h.Store.LookupOpen(handle, candidate.enumerated.Name)
-		if errors.Is(lookupErr, syscall.ENOENT) || errors.Is(lookupErr, xfsstore.ErrStaleObject) ||
-			errors.Is(lookupErr, xfsstore.ErrForbiddenType) || errors.Is(lookupErr, xfsstore.ErrProjectIsolation) {
-			return false, nil
-		}
-		if lookupErr != nil {
-			return false, lookupErr
-		}
-		identity, identityErr := h.Store.Identity(item)
-		forgetErr := h.Store.Forget(item)
-		if identityErr != nil {
-			return false, identityErr
-		}
-		if forgetErr != nil {
-			return false, forgetErr
-		}
-		if identity != candidate.identity || attr != candidate.attr {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest) *authoritypb.Response {
 	if hello.GetProtocolMajor() != ProtocolMajor {
 		return h.errorResponse(requestID, syscall.EOPNOTSUPP, false)
@@ -2390,6 +2109,9 @@ func (h *VolumeHandler) hello(requestID uint64, hello *authoritypb.HelloRequest)
 	features := append([]string(nil), required...)
 	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && h.MaxInFlight >= 9 && hasFeatures(hello.Features, []string{orderedDelegatedFlushFeature}) {
 		features = append(features, orderedDelegatedFlushFeature)
+	}
+	if hello.GetFrontendProfile() == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR && hasFeatures(hello.Features, []string{fskitVersionedMetadataFeature}) {
+		features = append(features, fskitVersionedMetadataFeature)
 	}
 	features = append(features, peerCompleteFIFOFeedbackFeature, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
 	resp := h.success(requestID)
@@ -2576,10 +2298,14 @@ func (h *VolumeHandler) attach(ctx context.Context, req *authoritypb.Request) *a
 	// accounting has the same length as the session's replay slots. Concurrent
 	// exact Attach deliveries converge on one resource record; a changed reuse
 	// was already rejected by PrepareAttach before this point.
+	metadata := false
+	if entry, ok := transportConnectionFromContext(ctx); ok {
+		metadata = entry.versionedMetadata
+	}
 	if _, err := h.ensureProvisionalSessionResources(sessionResourceSpec{
 		credential: cred, id: cred.ID, attempt: attemptID, root: root,
 		slots: attach.GetReplaySlots(), routes: presented,
-		coherence: profile, profile: frontendProfile, purpose: purpose, commitment: commitment, authorizationDeadline: authorizationDeadline,
+		coherence: profile, profile: frontendProfile, versionedMetadata: metadata, purpose: purpose, commitment: commitment, authorizationDeadline: authorizationDeadline,
 	}); err != nil {
 		// No ACTIVE transition is possible on the transport while Attach owns the
 		// pair transaction. Releasing this failed provisional allocation is the
@@ -2731,7 +2457,13 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 	if resources.coherence != volumeserver.CoherenceStrict || h.Lifecycle == nil {
 		return h.errorResponse(requestID, errInternal, false)
 	}
+	commitment := resources.commitment
 	if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
+		exclusion, err := h.Runtime.CompatibilityExclusion(cred.ID)
+		if err != nil {
+			return h.errorResponse(requestID, err, false)
+		}
+		commitment.Exclusion = exclusion
 		activationCtx, cancelActivation := context.WithDeadline(ctx, resources.authorizationDeadline)
 		defer cancelActivation()
 		if err := h.coherenceProfileAdmission.LockContext(activationCtx); err != nil {
@@ -2753,7 +2485,7 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 		membershipProfile = volumeserver.MembershipCacheless
 	}
 	err = h.Lifecycle.ActivateProfile(cred.ID, membershipProfile, func() error {
-		rootAttr, readErr := h.Store.Getattr(resources.root)
+		rootAttr, readErr := h.getattrItem(resources.root)
 		if readErr != nil {
 			return readErr
 		}
@@ -2774,7 +2506,7 @@ func (h *VolumeHandler) activate(ctx context.Context, requestID uint64, cred vol
 				return errInternal
 			}
 			_, activateErr := h.Visibility.ActivateParticipantInMemory(
-				cred.ID, volumeserver.CoherenceStrict, terminal, resources.commitment,
+				cred.ID, volumeserver.CoherenceStrict, terminal, commitment,
 				func(cursor volumeserver.VisibilityCursor) ([][16]byte, error) {
 					reply = h.newActivationReply(resources, rootAttr, rootIdentity, cursor)
 					return nil, h.retainActivationReply(cred.ID, resources, reply)
@@ -2801,6 +2533,9 @@ func (h *VolumeHandler) newActivationReply(resources *sessionResources, rootAttr
 		return nil
 	}
 	features = append(features, sessionReauthorizationFeature, mountEnrollmentReauthorizationFeature)
+	if resources.versionedMetadata {
+		features = append(features, fskitVersionedMetadataFeature)
+	}
 	if resources.profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES && h.MaxInFlight >= 9 {
 		features = append(features, orderedDelegatedFlushFeature)
 	}
@@ -3409,41 +3144,42 @@ func modeToProtocol(mode fs.FileMode) uint32 {
 	return result
 }
 
-// getattr answers under the restore mode's per-inode attribute lock while a
-// restore is active. Installing a fetched chunk writes archived bytes and then
-// restores archived mtime; the lock prevents either frontend profile from
-// observing the transient hydration timestamp.
-func (h *VolumeHandler) getattr(ctx context.Context, id volumeserver.SessionID, req *authoritypb.GetAttrRequest) (xfsstore.Attr, [16]byte, uint64, error) {
-	if len(req.GetHandle()) != 0 {
-		handle, err := h.open(id, req.GetHandle())
-		if err != nil {
-			return xfsstore.Attr{}, [16]byte{}, 0, err
-		}
-		snapshot, err := h.stabilizeOpenSequence(ctx, id, handle)
-		if err != nil {
-			return xfsstore.Attr{}, [16]byte{}, 0, err
-		}
-		identity, err := h.Store.IdentityOpen(handle)
-		if err != nil {
-			return xfsstore.Attr{}, [16]byte{}, 0, err
-		}
-		attr, err := h.getattrOpenRestored(identity, handle)
-		return attr, identity, snapshot, err
-	}
-	item, err := h.item(id, req.GetItem())
-	if err != nil {
-		return xfsstore.Attr{}, [16]byte{}, 0, err
-	}
-	snapshot, err := h.stabilizeItemSequence(ctx, id, item)
-	if err != nil {
-		return xfsstore.Attr{}, [16]byte{}, 0, err
-	}
+func (h *VolumeHandler) getattrItem(item xfsstore.Capability) (xfsstore.Attr, error) {
 	identity, err := h.Store.Identity(item)
 	if err != nil {
-		return xfsstore.Attr{}, [16]byte{}, 0, err
+		return xfsstore.Attr{}, err
 	}
-	attr, err := h.getattrItemRestored(identity, item)
-	return attr, identity, snapshot, err
+	return h.getattrItemRestored(identity, item)
+}
+
+func (h *VolumeHandler) getattrOpen(handle xfsstore.Capability) (xfsstore.Attr, error) {
+	identity, err := h.Store.IdentityOpen(handle)
+	if err != nil {
+		return xfsstore.Attr{}, err
+	}
+	return h.getattrOpenRestored(identity, handle)
+}
+
+func (h *VolumeHandler) lookupRestored(parent xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	item, attr, err := h.Store.Lookup(parent, name)
+	return h.lookupAttrRestored(item, attr, err)
+}
+
+func (h *VolumeHandler) lookupOpenRestored(handle xfsstore.Capability, name string) (xfsstore.Capability, xfsstore.Attr, error) {
+	item, attr, err := h.Store.LookupOpen(handle, name)
+	return h.lookupAttrRestored(item, attr, err)
+}
+
+func (h *VolumeHandler) lookupAttrRestored(item xfsstore.Capability, attr xfsstore.Attr, err error) (xfsstore.Capability, xfsstore.Attr, error) {
+	if err != nil || h.Restore == nil || !h.Restore.Active() {
+		return item, attr, err
+	}
+	attr, err = h.getattrItem(item)
+	if err != nil {
+		h.forgetItem(item)
+		return xfsstore.Capability{}, xfsstore.Attr{}, err
+	}
+	return item, attr, nil
 }
 
 func (h *VolumeHandler) getattrOpenRestored(identity [16]byte, handle xfsstore.Capability) (xfsstore.Attr, error) {
@@ -4158,6 +3894,7 @@ type sessionResourceSpec struct {
 	routes                [32]byte
 	coherence             volumeserver.CoherenceProfile
 	profile               authoritypb.FrontendProfile
+	versionedMetadata     bool
 	purpose               authoritypb.SessionPurpose
 	commitment            volumeserver.VisibilityCommitment
 	authorizationDeadline time.Time
@@ -4178,7 +3915,7 @@ func (h *VolumeHandler) ensureProvisionalSessionResources(spec sessionResourceSp
 		existing := resources
 		if existing.ended || existing.attempt != spec.attempt || existing.root != spec.root ||
 			uint32(len(existing.reply)) != spec.slots || existing.routes != spec.routes ||
-			existing.coherence != spec.coherence || existing.profile != spec.profile || existing.purpose != spec.purpose || existing.commitment != spec.commitment ||
+			existing.coherence != spec.coherence || existing.profile != spec.profile || existing.versionedMetadata != spec.versionedMetadata || existing.purpose != spec.purpose || existing.commitment != spec.commitment ||
 			!existing.authorizationDeadline.Equal(spec.authorizationDeadline) {
 			h.resourcesMu.Unlock()
 			return nil, volumeserver.ErrRequestMismatch
@@ -4187,7 +3924,7 @@ func (h *VolumeHandler) ensureProvisionalSessionResources(spec sessionResourceSp
 		resources = &sessionResources{
 			attempt: spec.attempt, root: spec.root, items: make(map[xfsstore.Capability]bool),
 			opens: make(map[xfsstore.Capability]bool), reply: make([]uint32, spec.slots),
-			coherence: spec.coherence, profile: spec.profile, commitment: spec.commitment, routes: spec.routes,
+			coherence: spec.coherence, profile: spec.profile, versionedMetadata: spec.versionedMetadata, commitment: spec.commitment, routes: spec.routes,
 			purpose:               spec.purpose,
 			authorizationDeadline: spec.authorizationDeadline,
 		}
@@ -4352,7 +4089,7 @@ func (h *VolumeHandler) sessionPurpose(id volumeserver.SessionID) (authoritypb.S
 }
 
 func (h *VolumeHandler) lookupCoordinate(parent xfsstore.Capability, name []byte) (visibilityCoordinate, bool, error) {
-	item, attr, err := h.Store.Lookup(parent, string(name))
+	item, attr, err := h.lookupRestored(parent, string(name))
 	if err != nil {
 		return visibilityCoordinate{}, false, err
 	}

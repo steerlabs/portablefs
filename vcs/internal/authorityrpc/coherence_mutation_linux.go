@@ -40,6 +40,9 @@ func (h *VolumeHandler) coherenceVersionNow() uint64 {
 	return h.coherenceVersion
 }
 func (h *VolumeHandler) SweepCoherence() {
+	if h.Visibility != nil {
+		h.Visibility.SweepCompatibilityExclusions()
+	}
 	if h.Coherence == nil {
 		return
 	}

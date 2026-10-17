@@ -12,7 +12,7 @@ func (h *VolumeHandler) coherenceCacheToken(id volumeserver.SessionID) (volumese
 	if err != nil {
 		return volumeserver.SubscriptionToken{}, err
 	}
-	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER {
+	if profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_CACHELESS_READER || profile == authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR {
 		return volumeserver.SubscriptionToken{}, nil
 	}
 	return h.coherenceToken(id)

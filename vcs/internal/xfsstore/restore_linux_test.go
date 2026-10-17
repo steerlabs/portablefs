@@ -246,13 +246,17 @@ func TestRestoreHydratesInodesTheirOwnerMayNotOpen(t *testing.T) {
 	payload := bytes.Repeat([]byte("hydrated."), 64)
 	for entry, want := range restored.modes {
 		name := restored.names[entry]
+		mtime, err := files.Mtime(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := files.PWrite(entry, 0, payload); err != nil {
 			t.Fatalf("PWrite into %q (mode %#o): %v", name, want, err)
 		}
 		if err := files.Fdatasync(entry); err != nil {
 			t.Fatalf("Fdatasync %q (mode %#o): %v", name, want, err)
 		}
-		if err := files.RestoreMtime(entry); err != nil {
+		if err := files.RestoreMtime(entry, mtime); err != nil {
 			t.Fatalf("RestoreMtime %q (mode %#o): %v", name, want, err)
 		}
 		if mode := restored.modeOf(t, name, restored.caps[entry]); mode != want {
@@ -319,13 +323,17 @@ func TestAUserChmodDuringServingSurvivesHydration(t *testing.T) {
 		if err := restored.volume.Chmod(restored.caps[step.entry], step.mode); err != nil {
 			t.Fatalf("chmod %q to %#o: %v", name, step.mode, err)
 		}
+		mtime, err := files.Mtime(step.entry)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := files.PWrite(step.entry, 0, []byte("hydration after a user chmod")); err != nil {
 			t.Fatalf("PWrite into %q at user mode %#o: %v", name, step.mode, err)
 		}
 		if err := files.Fdatasync(step.entry); err != nil {
 			t.Fatalf("Fdatasync %q at user mode %#o: %v", name, step.mode, err)
 		}
-		if err := files.RestoreMtime(step.entry); err != nil {
+		if err := files.RestoreMtime(step.entry, mtime); err != nil {
 			t.Fatalf("RestoreMtime %q at user mode %#o: %v", name, step.mode, err)
 		}
 		if mode := restored.modeOf(t, name, restored.caps[step.entry]); mode != uint32(step.mode) {
@@ -400,13 +408,17 @@ func TestTheBindingWalkOpensAndRestoresAReadOnlyMode(t *testing.T) {
 		t.Fatalf("open %q for writing after the walk = %v, want EACCES", readOnlyName, err)
 	}
 	payload := []byte("bytes the archive holds for a file its owner may not write")
+	archivedMtime, err := files.Mtime(entryReadOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := files.PWrite(entryReadOnly, 0, payload); err != nil {
 		t.Fatalf("PWrite into a 0444 file: %v", err)
 	}
 	if err := files.Fdatasync(entryReadOnly); err != nil {
 		t.Fatalf("Fdatasync a 0444 file: %v", err)
 	}
-	if err := files.RestoreMtime(entryReadOnly); err != nil {
+	if err := files.RestoreMtime(entryReadOnly, archivedMtime); err != nil {
 		t.Fatalf("RestoreMtime on a 0444 file: %v", err)
 	}
 	attr, err := volume.Getattr(published)
@@ -422,5 +434,67 @@ func TestTheBindingWalkOpensAndRestoresAReadOnlyMode(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("the file holds %q, not the bytes the hydration write supplied", got)
+	}
+}
+
+func TestHydrationPreservesCurrentMtimeOnXFS(t *testing.T) {
+	v, _, _ := projectVolume(t)
+	root, err := v.Root()
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, _, err := v.Create(root, "hydration-current-mtime", 0600, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := v.OpenFile(item, OpenFlags{Read: true, Write: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.CloseOpen(handle)
+	identity, err := v.Identity(item)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := v.ResolveRestoreFiles(map[[16]byte]uint32{identity: 0}, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer files.Close()
+	for _, change := range []string{"write", "explicit timestamp", "truncate", "unlink-open"} {
+		t.Run(change, func(t *testing.T) {
+			switch change {
+			case "write":
+				_, err = v.WriteAt(handle, []byte("user"), 0)
+			case "explicit timestamp":
+				mtime := int64(123456789123456789)
+				_, err = v.SetAttr(item, handle, SetAttrSpec{MTimeNS: &mtime})
+			case "truncate":
+				size := int64(16384)
+				_, err = v.SetAttr(item, handle, SetAttrSpec{Size: &size})
+			case "unlink-open":
+				err = v.Unlink(root, "hydration-current-mtime", false)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := files.Mtime(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := files.PWrite(0, 8192, []byte("hydrated different chunk")); err != nil {
+				t.Fatal(err)
+			}
+			if err := files.RestoreMtime(0, before); err != nil {
+				t.Fatal(err)
+			}
+			attr, err := v.GetattrOpen(handle)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if attr.MTimeNS != before {
+				t.Fatalf("mtime=%d, want %d", attr.MTimeNS, before)
+			}
+		})
 	}
 }

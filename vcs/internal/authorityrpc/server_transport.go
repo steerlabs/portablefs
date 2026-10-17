@@ -88,7 +88,11 @@ func (s *Server) acceptTransportHello(
 	if ordered && (hello.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX_LEASES || !hasFeatures(hello.Features, []string{orderedDelegatedFlushFeature}) || response.GetHello().GetMaxInFlight() < 9) {
 		return nil, nil, fmt.Errorf("%w: invalid ordered-flush negotiation", ErrTransportBinding)
 	}
-	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close, ordered)
+	metadata := hasFeatures(response.GetHello().Features, []string{fskitVersionedMetadataFeature})
+	if metadata && (hello.GetFrontendProfile() != authoritypb.FrontendProfile_FRONTEND_PROFILE_FSKIT_SYNC_REPAIR || !hasFeatures(hello.Features, []string{fskitVersionedMetadataFeature})) {
+		return nil, nil, fmt.Errorf("%w: invalid versioned-metadata negotiation", ErrTransportBinding)
+	}
+	entry, err := s.registry.register(peer, setID, hello.GetRole(), hello.GetFrontendProfile(), cancel, conn.Close, ordered, metadata)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -99,6 +99,7 @@ type Config struct {
 	// over-commits the table and gives up that guarantee.
 	MaxLockRecordsPerSession uint32
 	Now                      func() time.Time
+	ContinuousNow            func() (time.Duration, error)
 	// Lifecycle observers run under the authority/session locks at the exact
 	// state transition. They must be nonblocking and must not call back into the
 	// Authority; production uses atomic gauges only.
@@ -171,6 +172,7 @@ type session struct {
 	ending         bool
 	active         uint64
 	cleanupStarted bool
+	exclusion      *CompatibilityExclusion
 	terminal       chan struct{}
 	slots          []replaySlot
 	activation     *ActivationToken
@@ -316,6 +318,7 @@ func (u *SessionUse) End() {
 		cleanup := s.ending && s.active == 0 && !s.cleanupStarted
 		if cleanup {
 			s.cleanupStarted = true
+			s.exclusion.drain()
 		}
 		s.mu.Unlock()
 		if cleanup {
@@ -349,6 +352,12 @@ func New(volumeID string, cfg Config) (*Authority, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.ContinuousNow == nil {
+		cfg.ContinuousNow = continuousNow
+	}
+	if _, err := cfg.ContinuousNow(); err != nil {
+		return nil, fmt.Errorf("initialize continuous authority clock: %w", err)
 	}
 	perSession := cfg.MaxLockRecordsPerSession
 	if perSession == 0 {
@@ -1028,7 +1037,7 @@ func (a *Authority) begin(cred SessionCredential, renew bool) (*SessionUse, erro
 		return nil, ErrSessionExpired
 	}
 	s.mu.Lock()
-	if s.fenced || s.ending {
+	if s.fenced || s.ending || renew && s.exclusion.closed() {
 		cleanup := a.endSessionLocked(cred.ID, s)
 		s.mu.Unlock()
 		a.mu.Unlock()
@@ -1140,6 +1149,7 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 	}
 	if !s.ending {
 		wasActive := s.state == SessionStateActive
+		s.exclusion.stop(false)
 		s.ending = true
 		s.fenced = true
 		if s.state != SessionStateAborted {
@@ -1155,6 +1165,7 @@ func (a *Authority) endSessionLocked(id SessionID, s *session) bool {
 		}
 	}
 	if s.active == 0 && !s.cleanupStarted {
+		s.exclusion.drain()
 		s.cleanupStarted = true
 		return true
 	}
@@ -1222,7 +1233,7 @@ func (a *Authority) Reauthorize(cred SessionCredential, authorization Authorizat
 		}
 		return err
 	}
-	if s.fenced || s.ending {
+	if s.fenced || s.ending || s.exclusion.closed() {
 		return fail(ErrSessionFenced, true)
 	}
 	if cred.Generation != sessionCredentialGeneration || subtle.ConstantTimeCompare(s.secret[:], cred.Secret[:]) != 1 {
